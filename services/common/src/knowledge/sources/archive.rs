@@ -466,6 +466,7 @@ mod tests {
             embedder: &WordEmbedder,
             team: "t",
             now: &|| 1_000,
+            used: None,
         };
         let first = sync::run(&ctx, "kb", "arch").await;
         assert_eq!((first.fetched, first.indexed, first.failed), (2, 2, 0));

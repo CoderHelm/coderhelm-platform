@@ -345,6 +345,7 @@ fn base_json(
         "ready": count(FileStatus::Ready),
         "processing": count(FileStatus::Processing) + count(FileStatus::Uploading),
         "failed": count(FileStatus::Failed),
+        "passages": files.iter().filter(|f| f.ready_version > 0).map(|f| u64::from(f.chunks)).sum::<u64>(),
     })
 }
 
@@ -666,20 +667,222 @@ pub async fn list_bases(
     })))
 }
 
-/// GET /api/knowledge/:kb_id — one base and its files.
-pub async fn get_base(
-    State(state): State<Arc<AppState>>,
-    Extension(claims): Extension<Claims>,
-    Path(kb_id): Path<String>,
-) -> Reply {
-    let base = get_base_record(&state, &claims.team_id, &kb_id)
+/// One base the caller may read, or 404 (never "forbidden": a base they
+/// can't read doesn't exist for them).
+pub(crate) async fn readable_base(
+    state: &AppState,
+    claims: &Claims,
+    kb_id: &str,
+) -> Result<Base, (StatusCode, Json<Value>)> {
+    get_base_record(state, &claims.team_id, kb_id)
         .await
         .map_err(|e| internal("knowledge base", e))?
         .filter(|b| {
             b.readable_by(reader_role(&claims.holder()))
-                && (claims.holder().holds("knowledge_manage") || b.open_to(&person(&claims)))
+                && (claims.holder().holds("knowledge_manage") || b.open_to(&person(claims)))
         })
-        .ok_or_else(|| fail(StatusCode::NOT_FOUND, "No such knowledge base."))?;
+        .ok_or_else(|| fail(StatusCode::NOT_FOUND, "No such knowledge base."))
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct BaseQuery {
+    /// `none`: leave the items out (the page pages them from `/items`).
+    #[serde(default)]
+    pub items: String,
+}
+
+/// GET /api/knowledge/:kb_id/sources — what the page polls while anything
+/// syncs: the base's counts and its sources, without its items.
+pub async fn poll_sources(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Path(kb_id): Path<String>,
+) -> Reply {
+    let base = readable_base(&state, &claims, &kb_id).await?;
+    let files = store(&state)
+        .files(&claims.team_id, &base.id)
+        .await
+        .map_err(|e| internal("knowledge files", e))?;
+    let sources = super::knowledge_sources::sources_of(&state, &claims.team_id, &base.id).await;
+    let now = chrono::Utc::now().timestamp();
+    Ok(Json(json!({
+        "base": base_json(&base, &files, &sources),
+        "sources": sources.iter().map(|s| super::knowledge_sources::source_json(s, now)).collect::<Vec<_>>(),
+        "uploads_working": files.iter().any(|f| !f.is_synced() && matches!(f.shown_status(chrono::Utc::now()).0, FileStatus::Processing | FileStatus::Uploading)),
+    })))
+}
+
+/// Items one page of `/items` holds at most.
+pub const MAX_ITEMS_PAGE: usize = 200;
+
+#[derive(Debug, Default, Deserialize)]
+pub struct ItemsQuery {
+    /// Words in the title or breadcrumb.
+    #[serde(default)]
+    pub q: String,
+    /// `searchable`, `working`, `failed`, `skipped`, `cut_short`, or empty.
+    #[serde(default)]
+    pub status: String,
+    /// A source id, `upload`, or empty.
+    #[serde(default)]
+    pub source: String,
+    /// One group of the tree: `<source>|<top of the breadcrumb>`.
+    #[serde(default)]
+    pub group: String,
+    /// `7d`, `30d`, `90d`, `older`, or empty.
+    #[serde(default)]
+    pub updated: String,
+    #[serde(default)]
+    pub cursor: String,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+/// The state an item shows, as one word the filters use.
+pub fn item_state(f: &FileMeta, now: chrono::DateTime<chrono::Utc>) -> &'static str {
+    match f.shown_status(now).0 {
+        FileStatus::Ready if f.truncated => "cut_short",
+        FileStatus::Ready => "searchable",
+        FileStatus::Failed => "failed",
+        FileStatus::Processing | FileStatus::Uploading => "working",
+    }
+}
+
+/// The tree group an item is in: its source (or `upload`) and the first
+/// step of its breadcrumb (the space or folder).
+pub fn item_group(f: &FileMeta) -> (String, String) {
+    let source = if f.is_synced() {
+        f.source_id.clone()
+    } else {
+        "upload".to_string()
+    };
+    let top = f.path.split(" / ").next().unwrap_or("").trim().to_string();
+    (source, top)
+}
+
+/// Does `f` pass `q`'s filters (all but the group and paging)?
+pub fn item_matches(
+    f: &FileMeta,
+    q: &ItemsQuery,
+    now: chrono::DateTime<chrono::Utc>,
+    with_status: bool,
+) -> bool {
+    let (source, _) = item_group(f);
+    if !q.source.is_empty() && q.source != source {
+        return false;
+    }
+    if with_status && !q.status.is_empty() && item_state(f, now) != q.status {
+        return false;
+    }
+    if !q.updated.is_empty() {
+        let days = chrono::NaiveDate::parse_from_str(f.as_of.get(..10).unwrap_or(""), "%Y-%m-%d")
+            .map(|d| (now.date_naive() - d).num_days())
+            .unwrap_or(i64::MAX);
+        let ok = match q.updated.as_str() {
+            "7d" => days <= 7,
+            "30d" => days <= 30,
+            "90d" => days <= 90,
+            "older" => days > 90,
+            _ => true,
+        };
+        if !ok {
+            return false;
+        }
+    }
+    let term = q.q.trim().to_lowercase();
+    term.is_empty()
+        || term
+            .split_whitespace()
+            .all(|w| f.name.to_lowercase().contains(w) || f.path.to_lowercase().contains(w))
+}
+
+/// One page of a base's items with the filters applied, the count of each
+/// state and the tree's groups (each filter's counts ignore that filter).
+pub fn items_page(files: &[FileMeta], q: &ItemsQuery, now: chrono::DateTime<chrono::Utc>) -> Value {
+    let mut states: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    let mut groups: std::collections::BTreeMap<(String, String), (usize, usize, String)> =
+        std::collections::BTreeMap::new();
+    let mut matching: Vec<&FileMeta> = Vec::new();
+    let (want_source, want_top) = q.group.split_once('|').unwrap_or(("", ""));
+    for f in files {
+        if !item_matches(f, q, now, false) {
+            continue;
+        }
+        let state = item_state(f, now);
+        *states.entry(state).or_default() += 1;
+        if !q.status.is_empty() && state != q.status {
+            continue;
+        }
+        let g = item_group(f);
+        let e = groups.entry(g.clone()).or_default();
+        e.0 += 1;
+        if state == "failed" {
+            e.1 += 1;
+        }
+        if f.as_of > e.2 {
+            e.2 = f.as_of.clone();
+        }
+        if !q.group.is_empty() && (g.0 != want_source || g.1 != want_top) {
+            continue;
+        }
+        matching.push(f);
+    }
+    matching.sort_by(|a, b| {
+        (a.path.to_lowercase(), a.name.to_lowercase())
+            .cmp(&(b.path.to_lowercase(), b.name.to_lowercase()))
+    });
+    let limit = q.limit.unwrap_or(100).clamp(1, MAX_ITEMS_PAGE);
+    let start = q.cursor.parse::<usize>().unwrap_or(0).min(matching.len());
+    let page: Vec<Value> = matching
+        .iter()
+        .skip(start)
+        .take(limit)
+        .map(|f| file_json(f))
+        .collect();
+    let end = start + page.len();
+    json!({
+        "items": page,
+        "total": matching.len(),
+        "next": if end < matching.len() { Some(end.to_string()) } else { None },
+        "states": states,
+        "groups": groups.into_iter().map(|((source, top), (n, failed, newest))| json!({
+            "key": format!("{source}|{top}"),
+            "source": source,
+            "top": top,
+            "items": n,
+            "failed": failed,
+            "newest": newest,
+        })).collect::<Vec<_>>(),
+        "all": files.len(),
+    })
+}
+
+/// GET /api/knowledge/:kb_id/items — one page of the base's items, filtered
+/// and searched here, with the counts the filters and the tree show.
+pub async fn list_items(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Path(kb_id): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<ItemsQuery>,
+) -> Reply {
+    let base = readable_base(&state, &claims, &kb_id).await?;
+    let files = store(&state)
+        .files(&claims.team_id, &base.id)
+        .await
+        .map_err(|e| internal("knowledge files", e))?;
+    Ok(Json(items_page(&files, &q, chrono::Utc::now())))
+}
+
+/// GET /api/knowledge/:kb_id — one base and its files (`?items=none`
+/// leaves the files out).
+pub async fn get_base(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Path(kb_id): Path<String>,
+    q: Option<axum::extract::Query<BaseQuery>>,
+) -> Reply {
+    let base = readable_base(&state, &claims, &kb_id).await?;
+    let with_items = q.map(|q| q.0.items != "none").unwrap_or(true);
     let mut files = store(&state)
         .files(&claims.team_id, &base.id)
         .await
@@ -689,7 +892,7 @@ pub async fn get_base(
     let now = chrono::Utc::now().timestamp();
     Ok(Json(json!({
         "base": base_json(&base, &files, &sources),
-        "files": files.iter().map(file_json).collect::<Vec<_>>(),
+        "files": if with_items { Some(files.iter().map(file_json).collect::<Vec<_>>()) } else { None },
         "sources": sources.iter().map(|s| super::knowledge_sources::source_json(s, now)).collect::<Vec<_>>(),
         "visibility_note": super::knowledge_sources::VISIBILITY_NOTE,
         "can_manage": claims.holder().holds("knowledge_manage"),
@@ -1777,5 +1980,100 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(input.connect.unwrap().provider, "bedrock_kb");
+    }
+
+    fn item(id: &str, source: &str, path: &str, status: FileStatus, as_of: &str) -> FileMeta {
+        FileMeta {
+            id: id.into(),
+            kb_id: "kb".into(),
+            name: format!("Page {id}"),
+            source_id: source.into(),
+            external_id: if source.is_empty() {
+                String::new()
+            } else {
+                id.into()
+            },
+            path: path.into(),
+            status,
+            ready_version: u32::from(status == FileStatus::Ready),
+            as_of: as_of.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn items_are_paged_filtered_and_grouped_here() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-11T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let mut files = vec![
+            item("a", "s1", "Ops / Runbooks", FileStatus::Ready, "2026-11-09"),
+            item(
+                "b",
+                "s1",
+                "Ops / Runbooks",
+                FileStatus::Failed,
+                "2026-01-02",
+            ),
+            item("c", "s1", "Data", FileStatus::Ready, "2026-10-20"),
+            item("d", "", "", FileStatus::Processing, "2026-11-10"),
+        ];
+        files[2].truncated = true;
+        let q = |f: &dyn Fn(&mut ItemsQuery)| {
+            let mut q = ItemsQuery::default();
+            f(&mut q);
+            items_page(&files, &q, now)
+        };
+        let all = q(&|_| {});
+        assert_eq!(all["total"], 4);
+        assert_eq!(all["all"], 4);
+        assert_eq!(all["states"]["searchable"], 1);
+        assert_eq!(all["states"]["failed"], 1);
+        assert_eq!(all["states"]["cut_short"], 1);
+        assert_eq!(all["states"]["working"], 1);
+        let groups = all["groups"].as_array().unwrap();
+        let ops = groups.iter().find(|g| g["key"] == "s1|Ops").unwrap();
+        assert_eq!(
+            (ops["items"].as_u64(), ops["failed"].as_u64()),
+            (Some(2), Some(1))
+        );
+        assert_eq!(ops["newest"], "2026-11-09");
+        assert!(groups.iter().any(|g| g["key"] == "upload|"));
+        // Sorted by breadcrumb then title, so a page reads like the tree.
+        let names: Vec<&str> = all["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["d", "c", "a", "b"]);
+
+        let failed = q(&|q| q.status = "failed".into());
+        assert_eq!(failed["total"], 1);
+        // The state counts ignore the state filter, so every chip keeps its number.
+        assert_eq!(failed["states"]["searchable"], 1);
+        assert_eq!(q(&|q| q.group = "s1|Ops".into())["total"], 2);
+        assert_eq!(q(&|q| q.source = "upload".into())["total"], 1);
+        assert_eq!(q(&|q| q.q = "runbooks page".into())["total"], 2);
+        assert_eq!(q(&|q| q.updated = "7d".into())["total"], 2);
+        assert_eq!(q(&|q| q.updated = "older".into())["total"], 1);
+
+        let first = q(&|q| q.limit = Some(3));
+        assert_eq!(first["items"].as_array().unwrap().len(), 3);
+        assert_eq!(first["next"], "3");
+        let second = q(&|q| {
+            q.limit = Some(3);
+            q.cursor = "3".into();
+        });
+        assert_eq!(second["items"].as_array().unwrap().len(), 1);
+        assert!(second["next"].is_null());
+        // A page is never bigger than the cap, whatever is asked.
+        assert_eq!(
+            q(&|q| q.limit = Some(100_000))["items"]
+                .as_array()
+                .unwrap()
+                .len(),
+            4
+        );
     }
 }

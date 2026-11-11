@@ -132,6 +132,21 @@ pub enum Via {
     Upload,
 }
 
+impl Via {
+    /// The word the page and the stored record use.
+    pub fn key(self) -> &'static str {
+        match self {
+            Via::OAuth => "oauth",
+            Via::SignIn => "sign_in",
+            Via::SavedKey => "saved_key",
+            Via::GithubApp => "github_app",
+            Via::Public => "public",
+            Via::AwsRole => "aws_role",
+            Via::Upload => "upload",
+        }
+    }
+}
+
 /// A connector ready to call, and the settings it worked out on the way
 /// (Confluence: which site a sign-in reaches).
 pub struct Opened<'a> {
@@ -271,6 +286,17 @@ pub async fn open<'a>(
     kind: Kind,
     options: &Value,
 ) -> Result<Opened<'a>, ConnectorError> {
+    open_as(env, kind, options, false).await
+}
+
+/// [`open`], with the team's saved API key instead of its sign-in when
+/// `use_key` (Notion, Confluence: a source switched to the saved key).
+pub async fn open_as<'a>(
+    env: &'a Env,
+    kind: Kind,
+    options: &Value,
+    use_key: bool,
+) -> Result<Opened<'a>, ConnectorError> {
     let http = env.http.as_ref();
     let mut opts = if options.is_object() {
         options.clone()
@@ -279,7 +305,12 @@ pub async fn open<'a>(
     };
     let (connector, via): (Box<dyn Connector + 'a>, Via) = match kind {
         Kind::Notion => {
-            if let Some(h) = env.oauth_header(kind).await? {
+            let oauth = if use_key {
+                None
+            } else {
+                env.oauth_header(kind).await?
+            };
+            if let Some(h) = oauth {
                 (Box::new(notion::Notion { http, auth: h }), Via::OAuth)
             } else {
                 let key = env
@@ -298,7 +329,12 @@ pub async fn open<'a>(
             }
         }
         Kind::Confluence => {
-            if let Some(h) = env.oauth_header(kind).await? {
+            let oauth = if use_key {
+                None
+            } else {
+                env.oauth_header(kind).await?
+            };
+            if let Some(h) = oauth {
                 let cloud = opts["cloud_id"].as_str().unwrap_or("").to_string();
                 let (cloud, site) = if cloud.is_empty() {
                     let sites = confluence::accessible_sites(http, &h).await?;
@@ -620,7 +656,7 @@ pub async fn open_source<'a>(env: &'a Env, src: &Source) -> Result<Opened<'a>, C
         .kind
         .ok_or_else(|| ConnectorError::Config("This source has no kind.".into()))?;
     let Some(si) = &src.signin else {
-        return open(env, kind, &src.options).await;
+        return open_as(env, kind, &src.options, src.use_saved_key).await;
     };
     let rt = env.runtime();
     let gone = || {
@@ -646,6 +682,57 @@ pub async fn open_source<'a>(env: &'a Env, src: &Source) -> Result<Opened<'a>, C
         via: Via::SignIn,
         options: src.options.clone(),
     })
+}
+
+/// What a sync records about the connection it opened: how, as whom,
+/// and which account. For the team's sign-in, who connected it and when
+/// come from the sign-in's own record.
+pub async fn used_connection(
+    env: &Env,
+    src: &Source,
+    opened: &Opened<'_>,
+    now: &str,
+) -> super::UsedConnection {
+    let kind = src.kind.unwrap_or(Kind::Web);
+    let opts = &opened.options;
+    let text = |k: &str| opts[k].as_str().unwrap_or("").to_string();
+    let mut used = super::UsedConnection {
+        via: opened.via.key().to_string(),
+        owner: "team".into(),
+        used_at: now.to_string(),
+        ..Default::default()
+    };
+    match opened.via {
+        Via::SignIn => {
+            if let Some(si) = &src.signin {
+                used.owner = si.owner.clone();
+                used.by = si.email.clone();
+                used.account = si.account.clone();
+            }
+        }
+        Via::OAuth => {
+            if let Ok(Some(t)) = env
+                .runtime()
+                .store
+                .get_token(&env.team, &connection_id(kind), &Owner::Team)
+                .await
+            {
+                used.by = t.connected_by;
+                used.connected_at = t.connected_at;
+            }
+            used.account = text("site");
+        }
+        Via::SavedKey => {
+            used.account = match kind {
+                Kind::Sanity => text("project_id"),
+                _ => text("site"),
+            };
+        }
+        Via::GithubApp => used.account = text("repo"),
+        Via::AwsRole => used.account = text("account"),
+        Via::Public | Via::Upload => {}
+    }
+    used
 }
 
 /// How a kind stands for this team, for the "Add source" cards.

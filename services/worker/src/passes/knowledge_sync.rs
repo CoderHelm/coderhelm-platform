@@ -116,12 +116,15 @@ pub async fn sync(state: &WorkerState, msg: &SyncMessage) -> Value {
         client: &state.bedrock,
         meter: &meter,
     };
+    let used =
+        connect::used_connection(&env, &src, &opened, &chrono::Utc::now().to_rfc3339()).await;
     let ctx = sync::Ctx {
         store: &st,
         connector: opened.connector.as_ref(),
         embedder: &titan,
         team: &msg.team_id,
         now: &now,
+        used: Some(used),
     };
     let out = sync::run(&ctx, &msg.kb_id, &msg.source_id).await;
     if src.signin.is_some() {
