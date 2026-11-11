@@ -27,6 +27,9 @@ pub mod review_description;
 pub mod actions_jobs;
 /// The code graph's per-repo switch and build status (gateway and worker).
 pub mod code_graph;
+/// GitHub Code Quality findings on a pull request's files, as reviewer
+/// context.
+pub mod code_quality;
 /// A repository's public codegen environment: what may be kept, and what
 /// a failed generator is missing.
 pub mod codegen_env;
