@@ -353,6 +353,7 @@ mod tests {
             trigger_author: "alice".into(),
             defer_count: 2,
             model_retries: 0,
+            security_ticket: String::new(),
             round_attempt: 1,
         });
         let json = serde_json::to_string(&msg).unwrap();

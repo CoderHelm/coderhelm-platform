@@ -531,6 +531,7 @@ pub async fn overview(
     let permission_missing = matches!(dependabot, "no_permission" | "not_accepted");
     out["enabled"] = json!(cfg.enabled);
     out["dry_run"] = json!(cfg.dry_run);
+    out["bundle"] = json!(cfg.bundle);
     out["sources"] = json!({
         "dependabot": dependabot,
         "dependabot_reason": opt(&team_state, "dependabot_reason"),
@@ -1054,6 +1055,11 @@ pub struct FixBody {
     /// Raise today's fix-run limit for this request (recorded in the audit log).
     #[serde(default)]
     pub raise_limit: bool,
+    /// `one_pr`: one pull request per repository for everything picked,
+    /// whatever the policy says; `per_package`: one per package; `policy`
+    /// (the default): as the policy's `bundle` says.
+    #[serde(default)]
+    pub combine: sec::Combine,
 }
 
 /// POST /api/security/fix `{finding_ids, raise_limit?}`: fix pull requests
@@ -1076,7 +1082,20 @@ pub async fn fix(
     let findings = load_findings(&state, &claims.team_id).await.map_err(code)?;
     let now = chrono::Utc::now();
     let day = sec::limit_day(now);
-    let (mut units, skipped) = sec::manual_units(&findings, &body.finding_ids, &cfg, now);
+    let (mut units, skipped) =
+        sec::manual_units_as(&findings, &body.finding_ids, &cfg, now, body.combine);
+    let joins: Vec<Option<u64>> = units
+        .iter()
+        .map(|u| {
+            sec::open_bundle_pr(&findings, u, body.combine == sec::Combine::OnePr)
+                .map(|(p, _)| p.number)
+        })
+        .collect();
+    let join_of: std::collections::HashMap<String, u64> = units
+        .iter()
+        .zip(&joins)
+        .filter_map(|(u, j)| j.map(|n| (u.ticket.clone(), n)))
+        .collect();
     let slots = sec::DynamoSlots {
         dynamo: &state.dynamo,
         settings_table: &state.config.settings_table_name,
@@ -1111,6 +1130,7 @@ pub async fn fix(
             kind: "fix".into(),
             finding_ids: started_ids,
             requested_by: claims.email.clone(),
+            combine: body.combine,
             ..Default::default()
         };
         if queue(&state, msg).await.is_err() {
@@ -1136,6 +1156,7 @@ pub async fn fix(
             let (mut f, mut st) = (f.clone(), st.clone());
             if waiting.is_some() {
                 st.requested_by = Some(claims.email.clone());
+                st.requested_as = body.combine;
             }
             f.waiting = waiting.clone();
             f.updated_at = now.to_rfc3339();
@@ -1169,6 +1190,7 @@ pub async fn fix(
             "unit": r.unit, "ticket": r.ticket, "repo": r.repo, "package": r.package,
             "finding_ids": r.finding_ids, "run_id": null,
             "runs_url": format!("/?q={}", r.ticket),
+            "joins": join_of.get(&r.ticket),
         })).collect::<Vec<_>>(),
         "queued": queued,
         "skipped": skipped,
@@ -1194,7 +1216,8 @@ pub async fn fix_plan(
         .unwrap_or_default();
     let findings = load_findings(&state, &claims.team_id).await.map_err(code)?;
     let now = chrono::Utc::now();
-    let (units, skipped) = sec::manual_units(&findings, &body.finding_ids, &cfg, now);
+    let (units, skipped) =
+        sec::manual_units_as(&findings, &body.finding_ids, &cfg, now, body.combine);
     let runs_today = get_item(
         &state,
         &claims.team_id,
@@ -1204,18 +1227,55 @@ pub async fn fix_plan(
     .map_err(code)?
     .map(|i| num(&i, "runs"))
     .unwrap_or(0);
-    Ok(Json(json!({
-        "units": units.iter().map(|u| json!({
-            "unit": u.key, "repo": u.repo,
-            "package": u.bumps.first().map(|b| b.package.clone()).unwrap_or_default(),
-            "from": u.bumps.first().map(|b| b.from.clone()).unwrap_or_default(),
-            "to": u.bumps.first().map(|b| b.to.clone()).unwrap_or_default(),
-            "finding_ids": u.finding_ids, "title": u.title,
-        })).collect::<Vec<_>>(),
+    let tokens_today = feature_tokens(
+        &state,
+        &claims.team_id,
+        &format!("DAY#{}", now.format("%Y-%m-%d")),
+        common::usage::feature::SECURITY_FIX,
+    )
+    .await;
+    Ok(Json(fix_plan_json(
+        &units,
+        &skipped,
+        &findings,
+        &cfg,
+        body.combine,
+        runs_today,
+        tokens_today,
+    )))
+}
+
+/// Pure: what the confirmation shows. Each unit with its bumps and the
+/// open pull request it joins; how many new pull requests that makes; the
+/// runs and the token guess against today's limits.
+pub fn fix_plan_json(
+    units: &[sec::FixUnit],
+    skipped: &[sec::Skipped],
+    findings: &[(sec::Finding, sec::FindingState)],
+    cfg: &SecurityConfig,
+    combine: sec::Combine,
+    runs_today: u64,
+    tokens_today: u64,
+) -> Value {
+    let plans: Vec<Value> = units
+        .iter()
+        .map(|u| sec::unit_plan(u, findings, combine == sec::Combine::OnePr))
+        .collect();
+    let new_prs = plans.iter().filter(|p| p["joins"].is_null()).count();
+    let estimated: u64 = units.iter().map(sec::estimate_tokens).sum();
+    json!({
+        "units": plans,
         "skipped": skipped,
+        "combine": combine,
+        "bundle": cfg.bundle,
+        "pr_count": new_prs,
+        "joins": plans.len() - new_prs,
         "runs_today": runs_today,
         "runs_limit": cfg.max_fix_runs_per_day,
-    })))
+        "tokens_today": tokens_today,
+        "tokens_limit": cfg.max_fix_tokens_per_day,
+        "estimated_tokens": estimated,
+    })
 }
 
 // ── Settings ────────────────────────────────────────────────────────────
@@ -1590,6 +1650,97 @@ mod tests {
         assert!(!push_touches_dependencies(
             &json!({"commits": [{"modified": ["src/a.ts"]}]})
         ));
+    }
+
+    /// What the confirmation shows for picked rows: one PR per repo for
+    /// "one PR" whatever the policy says, the open PR it joins, and the
+    /// runs and tokens against today's limits.
+    #[test]
+    fn the_fix_plan_counts_prs_joins_and_the_limits() {
+        let mk = |id: &str, repo: &str, pkg: &str| {
+            let mut f = Finding {
+                id: id.into(),
+                repo: repo.into(),
+                ecosystem: "npm".into(),
+                package: pkg.into(),
+                version: "1.0.0".into(),
+                fixed_version: Some("2.0.0".into()),
+                tier: Some(Tier::P1),
+                status: Status::Open,
+                ..Default::default()
+            };
+            f.advisory.primary = format!("GHSA-{id}");
+            f.advisory.ids = vec![f.advisory.primary.clone()];
+            (f, sec::FindingState::default())
+        };
+        let mut findings = vec![
+            mk("a", "acme/web", "tar"),
+            mk("b", "acme/web", "ws"),
+            mk("c", "acme/api", "qs"),
+            mk("open", "acme/api", "undici"),
+        ];
+        findings[3].0.status = Status::PrOpen;
+        findings[3].0.pr = Some(sec::PrRef {
+            number: 812,
+            url: "https://github.com/acme/api/pull/812".into(),
+            state: "open".into(),
+            ..Default::default()
+        });
+        findings[3].1.bundled = true;
+        findings[3].1.ticket = Some("SEC-OPEN".into());
+        let cfg = SecurityConfig {
+            bundle: sec::Bundle::PerPackage,
+            ..Default::default()
+        };
+        let ids: Vec<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+        let now = chrono::Utc::now();
+        let (units, skipped) =
+            sec::manual_units_as(&findings, &ids, &cfg, now, sec::Combine::OnePr);
+        let plan = fix_plan_json(
+            &units,
+            &skipped,
+            &findings,
+            &cfg,
+            sec::Combine::OnePr,
+            1,
+            310_000,
+        );
+        assert_eq!(
+            plan["units"].as_array().unwrap().len(),
+            2,
+            "one per repo, whatever the policy"
+        );
+        assert_eq!(plan["pr_count"], 1, "the api fix joins its open PR");
+        assert_eq!(plan["joins"], 1);
+        let api = plan["units"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|u| u["repo"] == "acme/api")
+            .unwrap();
+        assert_eq!(api["joins"]["number"], 812);
+        let web = plan["units"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|u| u["repo"] == "acme/web")
+            .unwrap();
+        assert_eq!(web["bumps"].as_array().unwrap().len(), 2);
+        assert_eq!(web["majors"], 2);
+        assert_eq!(
+            (plan["runs_today"].as_u64(), plan["runs_limit"].as_u64()),
+            (Some(1), Some(3))
+        );
+        assert_eq!(plan["tokens_today"], 310_000);
+        assert_eq!(plan["tokens_limit"], 2_000_000);
+        assert!(plan["estimated_tokens"].as_u64().unwrap() > 0);
+        // Per package: three units, nothing joins.
+        let (units, _) = sec::manual_units_as(&findings, &ids, &cfg, now, sec::Combine::PerPackage);
+        let plan = fix_plan_json(&units, &[], &findings, &cfg, sec::Combine::PerPackage, 0, 0);
+        assert_eq!(
+            (plan["pr_count"].as_u64(), plan["joins"].as_u64()),
+            (Some(3), Some(0))
+        );
     }
 
     #[test]

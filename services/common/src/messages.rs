@@ -411,6 +411,9 @@ impl WorkerMessage {
                 f::SECURITY_FIX
             }
             WorkerMessage::Ticket(t) if matches!(t.source, TicketSource::Alert) => f::ALERT,
+            WorkerMessage::Feedback(m) if crate::security_fixes::is_ticket(&m.security_ticket) => {
+                f::SECURITY_FIX
+            }
             WorkerMessage::Ticket(_)
             | WorkerMessage::Resume(_)
             | WorkerMessage::MarkReady(_)
@@ -616,6 +619,9 @@ pub struct SecurityEventMessage {
     /// `fix`: who asked (their email).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub requested_by: String,
+    /// `fix`: how the picked findings combine into pull requests.
+    #[serde(default)]
+    pub combine: crate::security_fixes::Combine,
 }
 
 /// One repository's stale pull request preview (`common::stale_prs`).
@@ -1284,6 +1290,11 @@ pub struct FeedbackMessage {
     /// the next step (see `run_round`).
     #[serde(default)]
     pub round_attempt: u32,
+    /// Set when the round adds fixes to (or takes major bumps out of) a
+    /// security bundle's pull request: its tokens count as that security
+    /// ticket's fix run (`crate::security_fixes`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub security_ticket: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]

@@ -212,6 +212,28 @@ pub enum MajorBumps {
     IssueOnly,
 }
 
+/// How many pull requests the fixes make.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Bundle {
+    /// One pull request per package (P0 and P1), with P2 and P3 grouped
+    /// per repository and ecosystem on their cadence.
+    PerPackage,
+    /// One pull request per repository with every due fix in it; the most
+    /// urgent member sets when it starts (a P0 at once, otherwise daily).
+    #[default]
+    PerRepo,
+    /// The same, one per repository and ecosystem.
+    PerRepoEcosystem,
+}
+
+impl Bundle {
+    /// A policy saved before the choice existed keeps one PR per package.
+    fn saved_before() -> Bundle {
+        Bundle::PerPackage
+    }
+}
+
 // ── The finding (the API's shape) ───────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -345,6 +367,14 @@ pub struct FindingState {
     /// A person asked for its fix pull request (their email): it starts on
     /// the next tick with room under the day's limits, dry run or not.
     pub requested_by: Option<String>,
+    /// How the person asked it to be combined (while it waits).
+    pub requested_as: Combine,
+    /// Its fix is in a bundle pull request (one per repository, or per
+    /// repository and ecosystem): new fixes for the repository join it.
+    pub bundled: bool,
+    /// Taken out of a bundle because its major version bump failed the
+    /// bundle's CI: it gets a pull request of its own.
+    pub split: bool,
 }
 
 // ── Settings ────────────────────────────────────────────────────────────
@@ -440,6 +470,10 @@ pub struct SecurityConfig {
     pub reachability_labels: bool,
     pub ecosystem_labels: bool,
     pub major_bumps: MajorBumps,
+    /// How fixes become pull requests. New teams get one per repository;
+    /// a policy saved before this choice keeps one per package.
+    #[serde(default = "Bundle::saved_before")]
+    pub bundle: Bundle,
     pub adopt_bot_prs: bool,
     pub repos: Repos,
     pub ignore: Vec<Ignore>,
@@ -503,6 +537,7 @@ impl Default for SecurityConfig {
             reachability_labels: true,
             ecosystem_labels: true,
             major_bumps: MajorBumps::FixInPr,
+            bundle: Bundle::PerRepo,
             adopt_bot_prs: true,
             repos: Repos::All,
             ignore: vec![],
@@ -1864,11 +1899,7 @@ pub async fn admit_request<S: DailySlots>(
             unit: u.key.clone(),
             ticket: u.ticket.clone(),
             repo: u.repo.clone(),
-            package: u
-                .bumps
-                .first()
-                .map(|b| b.package.clone())
-                .unwrap_or_default(),
+            package: unit_packages(u),
             finding_ids: u.finding_ids.clone(),
             reason,
         };
@@ -1908,9 +1939,25 @@ pub struct Skipped {
     pub pr_url: Option<String>,
 }
 
-/// The fix units for the findings a person picked: one pull request per
-/// repository, package and version (every advisory it has, bumped to the
-/// version that clears them all), never one per advisory. Dry run doesn't
+/// How a person's picked findings become pull requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Combine {
+    /// As the team's policy says (`bundle`).
+    #[default]
+    Policy,
+    /// One pull request per repository for everything picked, whatever the
+    /// policy says (a pull request lives in one repository).
+    OnePr,
+    /// One pull request per package, whatever the policy says.
+    PerPackage,
+}
+
+/// The fix units for the findings a person picked. Per package: one pull
+/// request per repository, package and version (every advisory it has,
+/// bumped to the version that clears them all), never one per advisory.
+/// Bundled (the policy's `per_repo` or `per_repo_ecosystem`, or
+/// [`Combine::OnePr`]): one per repository (and ecosystem). Dry run doesn't
 /// matter here: the person asked. Each finding that can't be fixed is
 /// skipped with the reason.
 pub fn manual_units(
@@ -1918,6 +1965,17 @@ pub fn manual_units(
     ids: &[String],
     cfg: &SecurityConfig,
     now: DateTime<Utc>,
+) -> (Vec<FixUnit>, Vec<Skipped>) {
+    manual_units_as(findings, ids, cfg, now, Combine::Policy)
+}
+
+/// [`manual_units`] with the person's choice of how to combine them.
+pub fn manual_units_as(
+    findings: &[(Finding, FindingState)],
+    ids: &[String],
+    cfg: &SecurityConfig,
+    now: DateTime<Utc>,
+    combine: Combine,
 ) -> (Vec<FixUnit>, Vec<Skipped>) {
     let mut skipped = vec![];
     let mut picked: Vec<&(Finding, FindingState)> = vec![];
@@ -1941,6 +1999,9 @@ pub fn manual_units(
             (Status::Fixed, _) => Some("already fixed"),
             (Status::Fixing, _) => Some("a fix run is already working on it"),
             _ if f.fixed_version.is_none() => Some("no fixed version"),
+            _ if f.private_report || f.ecosystem == OWN_CODE => {
+                Some("a private report is never fixed in a public PR")
+            }
             _ => None,
         };
         match reason {
@@ -1956,13 +2017,37 @@ pub fn manual_units(
             None => picked.push(pair),
         }
     }
-    // One unit per group (repository, package, version).
+    let mode = match combine {
+        Combine::Policy => cfg.bundle,
+        Combine::OnePr => Bundle::PerRepo,
+        Combine::PerPackage => Bundle::PerPackage,
+    };
+    if mode == Bundle::PerPackage {
+        return (package_units(&picked, cfg, now), skipped);
+    }
+    // A person who asked for one PR gets every bump in it; otherwise what
+    // the policy keeps apart (split-out majors, issue-only majors) stays apart.
+    let (alone, together): (Vec<_>, Vec<_>) = picked
+        .into_iter()
+        .partition(|(f, st)| combine != Combine::OnePr && stands_alone(f, st, cfg));
+    let mut units = package_units(&alone, cfg, now);
+    let together: Vec<&Finding> = together.iter().map(|(f, _)| f).collect();
+    units.extend(bundle_units(&together, findings, cfg, mode, true, now));
+    (units, skipped)
+}
+
+/// One unit per (repository, package, version): every advisory it has,
+/// bumped to the version that clears them all.
+fn package_units(
+    picked: &[&(Finding, FindingState)],
+    cfg: &SecurityConfig,
+    now: DateTime<Utc>,
+) -> Vec<FixUnit> {
     let mut by: BTreeMap<String, Vec<&(Finding, FindingState)>> = BTreeMap::new();
     for p in picked {
         by.entry(group_key(&p.0)).or_default().push(p);
     }
-    let units = by
-        .into_values()
+    by.into_values()
         .map(|members| {
             let first = &members[0].0;
             let to = members
@@ -2001,23 +2086,32 @@ pub fn manual_units(
             u.labels = labels(cfg, &pairs, u.bumps[0].major);
             u
         })
-        .collect();
-    (units, skipped)
+        .collect()
 }
 
 /// The findings a person asked a fix for that still wait (queued past a
-/// daily limit): their units, the most urgent first.
+/// daily limit): their units, the most urgent first, combined as asked.
 pub fn requested_units(
     findings: &[(Finding, FindingState)],
     cfg: &SecurityConfig,
     now: DateTime<Utc>,
 ) -> Vec<FixUnit> {
-    let ids: Vec<String> = findings
-        .iter()
-        .filter(|(f, st)| st.requested_by.is_some() && f.status == Status::Open && f.pr.is_none())
-        .map(|(f, _)| f.id.clone())
-        .collect();
-    let mut units = manual_units(findings, &ids, cfg, now).0;
+    let mut units = vec![];
+    for combine in [Combine::Policy, Combine::OnePr, Combine::PerPackage] {
+        let ids: Vec<String> = findings
+            .iter()
+            .filter(|(f, st)| {
+                st.requested_by.is_some()
+                    && st.requested_as == combine
+                    && f.status == Status::Open
+                    && f.pr.is_none()
+            })
+            .map(|(f, _)| f.id.clone())
+            .collect();
+        if !ids.is_empty() {
+            units.extend(manual_units_as(findings, &ids, cfg, now, combine).0);
+        }
+    }
     order_units(&mut units, findings);
     units
 }
@@ -2051,6 +2145,11 @@ pub struct FixUnit {
     pub branch: String,
     pub title: String,
     pub labels: Vec<String>,
+    /// One pull request for a repository's fixes (or a repository's and
+    /// ecosystem's): new fixes join it while it is open.
+    pub bundle: bool,
+    /// A bundle's cadence, from its most urgent member: `now` or `daily`.
+    pub cadence: Option<Cadence>,
 }
 
 /// The batch period a cadence opens in: the day, or the ISO week.
@@ -2086,7 +2185,25 @@ pub fn ticket_id(repo: &str, key: &str) -> String {
 /// `coderhelm/security-<pkg>-<version>`, or `coderhelm/security-<eco>-<period>`
 /// for a grouped one.
 pub fn branch(unit: &FixUnit, cadence: Option<Cadence>, now: DateTime<Utc>) -> String {
-    let name = if unit.grouped {
+    let name = if unit.bundle {
+        // `coderhelm/security-updates-<day>-<ticket>`, with the ecosystem
+        // for a bundle per ecosystem; the ticket keeps two bundles of one
+        // day apart.
+        let eco = if unit.ecosystem.is_empty() || !unit.key.starts_with("bundle:eco:") {
+            String::new()
+        } else {
+            format!("{}-", slug_part(&unit.ecosystem))
+        };
+        format!(
+            "coderhelm/security-{eco}updates-{}-{}",
+            now.format("%Y-%m-%d"),
+            unit.ticket
+                .trim_start_matches(TICKET_PREFIX)
+                .get(..6)
+                .unwrap_or("")
+                .to_ascii_lowercase()
+        )
+    } else if unit.grouped {
         let c = match cadence {
             Some(Cadence::Weekly) => "weekly",
             _ => "daily",
@@ -2195,9 +2312,10 @@ pub fn labels(
         push("breaking");
     }
     if cfg.ecosystem_labels {
-        if let Some(e) = findings
-            .first()
-            .and_then(|(f, _)| ecosystem_label(&f.ecosystem))
+        // Every ecosystem a bundle bumps, in the order they come.
+        for e in findings
+            .iter()
+            .filter_map(|(f, _)| ecosystem_label(&f.ecosystem))
         {
             push(e);
         }
@@ -2226,25 +2344,64 @@ pub fn fixable(f: &Finding, st: &FindingState, cfg: &SecurityConfig, now: DateTi
         && f.tier.is_some_and(|t| cfg.open_prs.get(t) != Cadence::Off)
 }
 
-/// The fix units the findings make: P0 and P1 one per (repository,
-/// package, target version); P2 and P3 grouped per repository and
-/// ecosystem. Every finding a unit clears is in it.
+/// The fix units the findings make. Per package (`bundle: per_package`): P0
+/// and P1 one per (repository, package, target version); P2 and P3 grouped
+/// per repository and ecosystem. Bundled: one per repository (or repository
+/// and ecosystem) with every fixable finding in it, opening at once when a
+/// member's tier opens at once (a P0) and once a day otherwise; findings
+/// the policy keeps apart (a major bump split out after it failed the
+/// bundle's CI, or a major bump the policy only opens issues for) get their
+/// own. Every finding a unit clears is in it.
 pub fn plan_units(
     findings: &[(Finding, FindingState)],
     cfg: &SecurityConfig,
     now: DateTime<Utc>,
 ) -> Vec<FixUnit> {
-    let mut units: BTreeMap<(String, String), FixUnit> = BTreeMap::new();
-    let eligible: Vec<&Finding> = findings
+    let eligible: Vec<&(Finding, FindingState)> = findings
         .iter()
         .filter(|(f, st)| fixable(f, st, cfg, now))
-        .map(|(f, _)| f)
         .collect();
+    if cfg.bundle == Bundle::PerPackage {
+        let only: Vec<&Finding> = eligible.iter().map(|(f, _)| f).collect();
+        return per_package_units(&only, findings, cfg, now, false);
+    }
+    let (alone, together): (Vec<_>, Vec<_>) = eligible
+        .into_iter()
+        .partition(|(f, st)| stands_alone(f, st, cfg));
+    let alone: Vec<&Finding> = alone.iter().map(|(f, _)| f).collect();
+    let together: Vec<&Finding> = together.iter().map(|(f, _)| f).collect();
+    let mut units = per_package_units(&alone, findings, cfg, now, true);
+    units.extend(bundle_units(
+        &together, findings, cfg, cfg.bundle, false, now,
+    ));
+    units
+}
+
+/// A finding a bundle leaves to a pull request (or issue) of its own: its
+/// major bump was split out after it failed the bundle's CI, or the policy
+/// opens only an issue for a major bump.
+pub fn stands_alone(f: &Finding, st: &FindingState, cfg: &SecurityConfig) -> bool {
+    st.split
+        || (cfg.major_bumps == MajorBumps::IssueOnly
+            && f.fixed_version
+                .as_deref()
+                .is_some_and(|to| is_major_bump(&f.version, to)))
+}
+
+fn per_package_units(
+    eligible: &[&Finding],
+    findings: &[(Finding, FindingState)],
+    cfg: &SecurityConfig,
+    now: DateTime<Utc>,
+    all_single: bool,
+) -> Vec<FixUnit> {
+    let mut units: BTreeMap<(String, String), FixUnit> = BTreeMap::new();
     let single = |f: &Finding| {
-        !matches!(
-            cfg.open_prs.get(f.tier.unwrap_or(Tier::P3)),
-            Cadence::Daily | Cadence::Weekly
-        )
+        all_single
+            || !matches!(
+                cfg.open_prs.get(f.tier.unwrap_or(Tier::P3)),
+                Cadence::Daily | Cadence::Weekly
+            )
     };
     // Urgent ones first: a package with a fix of its own takes the
     // package's lower-tier findings too, so nothing bumps it twice.
@@ -2253,7 +2410,6 @@ pub fn plan_units(
     for f in ordered {
         let tier = f.tier.unwrap_or(Tier::P3);
         let cadence = cfg.open_prs.get(tier);
-        let to = f.fixed_version.clone().unwrap_or_default();
         let repo = f.repo.to_ascii_lowercase();
         let own = format!("pkg:{}", f.package.to_ascii_lowercase());
         let grouped = !single(f) && !units.contains_key(&(repo.clone(), own.clone()));
@@ -2280,44 +2436,14 @@ pub fn plan_units(
         });
         u.tier = Some(u.tier.map_or(tier, |t| t.min(tier)));
         u.finding_ids.push(f.id.clone());
-        match u
-            .bumps
-            .iter_mut()
-            .find(|b| b.package.eq_ignore_ascii_case(&f.package))
-        {
-            Some(b) => {
-                if compare_versions(&to, &b.to) == std::cmp::Ordering::Greater {
-                    b.to = to.clone();
-                    b.major = is_major_bump(&b.from, &to);
-                }
-            }
-            None => u.bumps.push(Bump {
-                package: f.package.clone(),
-                from: f.version.clone(),
-                to: to.clone(),
-                major: is_major_bump(&f.version, &to),
-                manifest: f.manifest.clone(),
-            }),
-        }
+        add_bump(&mut u.bumps, f);
     }
-    let by_id: HashMap<&str, (&Finding, &FindingState)> = findings
-        .iter()
-        .map(|(f, s)| (f.id.as_str(), (f, s)))
-        .collect();
+    let by_id = by_id(findings);
     units
         .into_values()
         .map(|mut u| {
-            let members: Vec<(&Finding, &FindingState)> = u
-                .finding_ids
-                .iter()
-                .filter_map(|id| by_id.get(id.as_str()).copied())
-                .collect();
-            let mut primaries: Vec<String> = members
-                .iter()
-                .map(|(f, _)| f.advisory.primary.clone())
-                .collect();
-            primaries.sort();
-            primaries.dedup();
+            let members = members_of(&u, &by_id);
+            let primaries = primaries(&members);
             let major = u.bumps.iter().any(|b| b.major);
             if !u.grouped {
                 if let Some(b) = u.bumps.first() {
@@ -2334,9 +2460,322 @@ pub fn plan_units(
         .collect()
 }
 
+/// Adds a finding's bump to a unit's: one per package, to the highest
+/// version any of its advisories needs.
+fn add_bump(bumps: &mut Vec<Bump>, f: &Finding) {
+    let to = f.fixed_version.clone().unwrap_or_default();
+    match bumps
+        .iter_mut()
+        .find(|b| b.package.eq_ignore_ascii_case(&f.package))
+    {
+        Some(b) => {
+            if compare_versions(&to, &b.to) == std::cmp::Ordering::Greater {
+                b.to = to.clone();
+                b.major = is_major_bump(&b.from, &to);
+            }
+        }
+        None => bumps.push(Bump {
+            package: f.package.clone(),
+            from: f.version.clone(),
+            to: to.clone(),
+            major: is_major_bump(&f.version, &to),
+            manifest: f.manifest.clone(),
+        }),
+    }
+}
+
+fn by_id(findings: &[(Finding, FindingState)]) -> HashMap<&str, (&Finding, &FindingState)> {
+    findings
+        .iter()
+        .map(|(f, s)| (f.id.as_str(), (f, s)))
+        .collect()
+}
+
+fn members_of<'a>(
+    u: &FixUnit,
+    by_id: &HashMap<&str, (&'a Finding, &'a FindingState)>,
+) -> Vec<(&'a Finding, &'a FindingState)> {
+    u.finding_ids
+        .iter()
+        .filter_map(|id| by_id.get(id.as_str()).copied())
+        .collect()
+}
+
+fn primaries(members: &[(&Finding, &FindingState)]) -> Vec<String> {
+    let mut p: Vec<String> = members
+        .iter()
+        .map(|(f, _)| f.advisory.primary.clone())
+        .collect();
+    p.sort();
+    p.dedup();
+    p
+}
+
+/// The bundles the findings make: one per repository (per repository and
+/// ecosystem for `per_repo_ecosystem`). A member whose tier opens at once
+/// starts it now; otherwise it opens daily. `asked`: a person picked them,
+/// so it starts now and its key comes from what was picked.
+fn bundle_units(
+    members: &[&Finding],
+    findings: &[(Finding, FindingState)],
+    cfg: &SecurityConfig,
+    mode: Bundle,
+    asked: bool,
+    now: DateTime<Utc>,
+) -> Vec<FixUnit> {
+    let mut by: BTreeMap<(String, String), Vec<&Finding>> = BTreeMap::new();
+    for f in members {
+        let eco = if mode == Bundle::PerRepoEcosystem {
+            f.ecosystem.to_ascii_lowercase()
+        } else {
+            String::new()
+        };
+        by.entry((f.repo.to_ascii_lowercase(), eco))
+            .or_default()
+            .push(f);
+    }
+    let by_id = by_id(findings);
+    by.into_iter()
+        .map(|((_, eco), fs)| {
+            let urgent = asked
+                || fs
+                    .iter()
+                    .any(|f| cfg.open_prs.get(f.tier.unwrap_or(Tier::P3)) == Cadence::Now);
+            let scope = if eco.is_empty() {
+                "bundle:".to_string()
+            } else {
+                format!("bundle:eco:{eco}:")
+            };
+            let key = if asked {
+                let mut ids: Vec<&str> = fs.iter().map(|f| f.id.as_str()).collect();
+                ids.sort();
+                format!("{scope}ask:{}", &crate::sha256_hex(&ids)[..12])
+            } else if urgent {
+                format!("{scope}now:{}", now.format("%Y-%m-%d-%H"))
+            } else {
+                format!("{scope}daily:{}", now.format("%Y-%m-%d"))
+            };
+            let mut ecos: Vec<String> = fs.iter().map(|f| f.ecosystem.clone()).collect();
+            ecos.sort();
+            ecos.dedup();
+            let mut u = FixUnit {
+                repo: fs[0].repo.clone(),
+                ecosystem: if ecos.len() == 1 {
+                    ecos[0].clone()
+                } else {
+                    String::new()
+                },
+                // A daily bundle opens once a day (the caller claims the day).
+                grouped: !urgent,
+                key,
+                tier: fs.iter().filter_map(|f| f.tier).min(),
+                finding_ids: fs.iter().map(|f| f.id.clone()).collect(),
+                bundle: true,
+                cadence: Some(if urgent { Cadence::Now } else { Cadence::Daily }),
+                ..Default::default()
+            };
+            for f in &fs {
+                add_bump(&mut u.bumps, f);
+            }
+            u.bumps.sort_by_key(|b| b.package.to_ascii_lowercase());
+            u.ticket = ticket_id(&u.repo, &u.key);
+            u.branch = branch(&u, u.cadence, now);
+            let members = members_of(&u, &by_id);
+            finish_bundle(&mut u, &members, cfg);
+            u
+        })
+        .collect()
+}
+
+/// A bundle's title and labels, from its members.
+fn finish_bundle(u: &mut FixUnit, members: &[(&Finding, &FindingState)], cfg: &SecurityConfig) {
+    u.title = bundle_title(u, primaries(members).len());
+    u.labels = labels(cfg, members, u.bumps.iter().any(|b| b.major));
+}
+
+/// `fix(deps): security updates for <repo> (14 packages, 31 advisories)`;
+/// a bundle per ecosystem names it: `fix(deps): npm security updates for ...`.
+pub fn bundle_title(u: &FixUnit, advisories: usize) -> String {
+    let name = u.repo.rsplit('/').next().unwrap_or(&u.repo);
+    let eco = if u.key.starts_with("bundle:eco:") && !u.ecosystem.is_empty() {
+        format!("{} ", u.ecosystem)
+    } else {
+        String::new()
+    };
+    let n = u.bumps.len();
+    format!(
+        "fix(deps): {eco}security updates for {name} ({n} package{}, {advisories} advisor{})",
+        if n == 1 { "" } else { "s" },
+        if advisories == 1 { "y" } else { "ies" }
+    )
+}
+
+/// "tar" for one package, "14 packages" for a bundle.
+pub fn unit_packages(u: &FixUnit) -> String {
+    match u.bumps.as_slice() {
+        [b] => b.package.clone(),
+        bumps => format!("{} packages", bumps.len()),
+    }
+}
+
+/// The open bundle pull request a unit's fixes join instead of opening
+/// another: the repository's (and, per ecosystem, the ecosystem's) open
+/// CoderHelm security pull request, with the ticket it was opened on.
+/// `any`: a person asked for one PR, so any open CoderHelm security pull
+/// request of the repository takes it, bundle or not.
+pub fn open_bundle_pr(
+    findings: &[(Finding, FindingState)],
+    unit: &FixUnit,
+    any: bool,
+) -> Option<(PrRef, String)> {
+    if !unit.bundle {
+        return None;
+    }
+    let per_eco = unit.key.starts_with("bundle:eco:");
+    let fits = |f: &Finding, st: &FindingState| {
+        f.repo.eq_ignore_ascii_case(&unit.repo)
+            && f.status == Status::PrOpen
+            && st.ticket.is_some()
+            && f.pr
+                .as_ref()
+                .is_some_and(|p| p.state == "open" && !p.adopted)
+            && (!per_eco || f.ecosystem.eq_ignore_ascii_case(&unit.ecosystem))
+    };
+    findings
+        .iter()
+        .filter(|(f, st)| fits(f, st))
+        .find(|(_, st)| st.bundled)
+        .or_else(|| {
+            any.then(|| findings.iter().find(|(f, st)| fits(f, st)))
+                .flatten()
+        })
+        .map(|(f, st)| {
+            (
+                f.pr.clone().unwrap_or_default(),
+                st.ticket.clone().unwrap_or_default(),
+            )
+        })
+}
+
+/// The open bundle with a unit's fixes added: its ticket, branch and key
+/// stay; findings and bumps join (each package to the highest version
+/// needed); the title and labels count them all.
+pub fn join_unit(
+    open: &FixUnit,
+    add: &FixUnit,
+    findings: &[(Finding, FindingState)],
+    cfg: &SecurityConfig,
+) -> FixUnit {
+    let mut u = open.clone();
+    let by_id = by_id(findings);
+    for id in &add.finding_ids {
+        if !u.finding_ids.contains(id) {
+            u.finding_ids.push(id.clone());
+        }
+        if let Some((f, _)) = by_id.get(id.as_str()) {
+            add_bump(&mut u.bumps, f);
+        }
+    }
+    u.bumps.sort_by_key(|b| b.package.to_ascii_lowercase());
+    u.tier = match (u.tier, add.tier) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    };
+    u.bundle = true;
+    let members = members_of(&u, &by_id);
+    finish_bundle(&mut u, &members, cfg);
+    u
+}
+
+/// The members of an open bundle whose package's bump is a major version:
+/// they leave it when its CI can't be made to pass. Empty when every
+/// member would leave (the pull request is then only the major bumps, and
+/// stays as it is for a person).
+pub fn split_out(unit: &FixUnit, findings: &[(Finding, FindingState)]) -> Vec<String> {
+    let majors: Vec<&str> = unit
+        .bumps
+        .iter()
+        .filter(|b| b.major)
+        .map(|b| b.package.as_str())
+        .collect();
+    let out: Vec<String> = findings
+        .iter()
+        .filter(|(f, _)| unit.finding_ids.contains(&f.id))
+        .filter(|(f, _)| majors.iter().any(|p| p.eq_ignore_ascii_case(&f.package)))
+        .map(|(f, _)| f.id.clone())
+        .collect();
+    let stays = unit.finding_ids.iter().any(|id| !out.contains(id));
+    if stays {
+        out
+    } else {
+        vec![]
+    }
+}
+
+/// The bundle without the split-out findings and their bumps.
+pub fn without(
+    unit: &FixUnit,
+    gone: &[String],
+    findings: &[(Finding, FindingState)],
+    cfg: &SecurityConfig,
+) -> FixUnit {
+    let mut u = unit.clone();
+    u.finding_ids.retain(|id| !gone.contains(id));
+    let by_id = by_id(findings);
+    let members = members_of(&u, &by_id);
+    u.bumps.retain(|b| {
+        members
+            .iter()
+            .any(|(f, _)| f.package.eq_ignore_ascii_case(&b.package))
+    });
+    u.tier = members.iter().filter_map(|(f, _)| f.tier).min();
+    finish_bundle(&mut u, &members, cfg);
+    u
+}
+
+/// What a follow-up run on the open bundle is asked to add.
+pub fn join_note(add: &FixUnit, members: &[&Finding], cfg: &SecurityConfig) -> String {
+    let mut s = String::from(
+        "Add these security fixes to this pull request, on its branch. Keep every bump already in it.\n\n",
+    );
+    let plan = ticket_body(add, members, cfg);
+    // The plan without its marker lines: they belong to the first ticket.
+    s.push_str(
+        plan.split("\n\n")
+            .skip(1)
+            .collect::<Vec<_>>()
+            .join("\n\n")
+            .trim(),
+    );
+    s.push('\n');
+    s
+}
+
+/// What a follow-up run is asked when major bumps leave a bundle.
+pub fn split_note(bumps: &[&Bump]) -> String {
+    let mut s = String::from(
+        "CI could not be made to pass with these major version bumps. Revert them on this branch (the manifest and lockfile changes, and any code changed only for them) and keep every other bump. They move to pull requests of their own.\n\n",
+    );
+    for b in bumps {
+        s.push_str(&format!("- `{}` {} to {}\n", b.package, b.from, b.to));
+    }
+    s
+}
+
+/// A rough guess of a unit's model tokens, for the confirmation: a run,
+/// a little more per package, more for each major version.
+pub fn estimate_tokens(u: &FixUnit) -> u64 {
+    let majors = u.bumps.iter().filter(|b| b.major).count() as u64;
+    let n = u.bumps.len().max(1) as u64;
+    120_000 + 20_000 * (n - 1) + 60_000 * majors
+}
+
 /// Whether a unit opens on this tick: now and hourly at once, daily and
 /// weekly once per period (the caller claims the period).
 pub fn unit_due(unit: &FixUnit, cfg: &SecurityConfig) -> bool {
+    if let Some(c) = unit.cadence {
+        return c != Cadence::Off;
+    }
     unit.tier
         .map(|t| cfg.open_prs.get(t))
         .is_some_and(|c| c != Cadence::Off)
@@ -2353,7 +2792,13 @@ pub fn ticket_body(unit: &FixUnit, members: &[&Finding], cfg: &SecurityConfig) -
         "{MARKER}\n<!-- coderhelm:security-branch {} -->\n\n",
         unit.branch
     ));
-    s.push_str("Fix these security advisories in the dependencies. Change only what the fix needs.\n\n## Bumps\n");
+    s.push_str(
+        "Fix these security advisories in the dependencies. Change only what the fix needs.\n\n",
+    );
+    if unit.bundle && unit.bumps.len() > 1 {
+        s.push_str("Every bump below goes in this one pull request.\n\n");
+    }
+    s.push_str("## Bumps\n");
     for b in &unit.bumps {
         s.push_str(&format!(
             "- `{}` {} to {} ({}){}\n",
@@ -2424,6 +2869,56 @@ fn fmt_num(n: f64) -> String {
 /// Reachability, Change (the run's own description), Proof, Closes, and the
 /// data's credit. Public advisory facts only: how exposed the team's own
 /// production is stays in the dashboard and the card.
+/// A bundle's table: every package bump with its advisories, reachability
+/// and due date.
+pub fn bump_table(unit: &FixUnit, members: &[(&Finding, &FindingState)]) -> String {
+    let cell = |s: &str| s.replace('|', "\\|").replace('\n', " ");
+    let mut s = String::from(
+        "| Package | Version | Advisories | Reachability | Due |\n| --- | --- | --- | --- | --- |\n",
+    );
+    for b in &unit.bumps {
+        let mine: Vec<&Finding> = members
+            .iter()
+            .map(|(f, _)| *f)
+            .filter(|f| f.package.eq_ignore_ascii_case(&b.package))
+            .collect();
+        let mut ids: Vec<&str> = mine.iter().map(|f| f.advisory.primary.as_str()).collect();
+        ids.sort();
+        ids.dedup();
+        let verdict = mine
+            .iter()
+            .map(|f| f.verdict)
+            .min_by_key(|v| verdict_rank(*v))
+            .map(|v| match v {
+                Verdict::Reachable => "Reachable",
+                Verdict::NotReachable => "Present, not reachable",
+                Verdict::NotLoaded => "Not loaded at runtime",
+                Verdict::Unknown | Verdict::Pending => "Unknown",
+            })
+            .unwrap_or("Unknown");
+        let due = mine
+            .iter()
+            .filter_map(|f| parse_time(&f.due_at))
+            .min()
+            .map(|d| d.format("%b %-d").to_string())
+            .unwrap_or_default();
+        let tier = mine.iter().filter_map(|f| f.tier).min();
+        s.push_str(&format!(
+            "| `{}` | {} to {}{} | {} | {} | {}{} |\n",
+            cell(&b.package),
+            cell(&b.from),
+            cell(&b.to),
+            if b.major { " (major)" } else { "" },
+            cell(&ids.join(", ")),
+            verdict,
+            tier.map(|t| format!("{} ", t.as_str())).unwrap_or_default(),
+            due
+        ));
+    }
+    s.push('\n');
+    s
+}
+
 pub fn pr_body(unit: &FixUnit, members: &[(&Finding, &FindingState)], change: &str) -> String {
     let mut s = String::new();
     let top = members
@@ -2450,12 +2945,26 @@ pub fn pr_body(unit: &FixUnit, members: &[(&Finding, &FindingState)], change: &s
             }
         })
         .collect();
-    s.push_str(&format!(
-        "## Summary\n\nFixes {}. {}{}.\n\n",
-        what.join("; "),
+    let when = format!(
+        "{}{}",
         top.as_str(),
         due.map(|d| format!(", due {d}")).unwrap_or_default()
-    ));
+    );
+    if unit.bundle {
+        let advisories = primaries(members).len();
+        s.push_str(&format!(
+            "## Summary\n\nFixes {advisories} advisor{} in {} package{}. {when}.\n\n",
+            if advisories == 1 { "y" } else { "ies" },
+            unit.bumps.len(),
+            if unit.bumps.len() == 1 { "" } else { "s" },
+        ));
+        s.push_str(&bump_table(unit, members));
+    } else {
+        s.push_str(&format!(
+            "## Summary\n\nFixes {}. {when}.\n\n",
+            what.join("; ")
+        ));
+    }
     s.push_str("## Advisory\n\n");
     for (f, st) in members {
         let a = &f.advisory;
@@ -4537,7 +5046,60 @@ pub fn preview(
             json!({"finding_id": f.id, "repo": f.repo, "title": format!("{} security · {} is affected by {}", f.tier.map(Tier::as_str).unwrap_or(""), f.repo, f.advisory.primary), "tier": f.tier.map(Tier::as_str)})
         })
         .collect();
-    json!({ "would_open": would_open, "would_post": would_post })
+    let prs: Vec<Value> = units
+        .iter()
+        .map(|u| unit_plan(u, findings, false))
+        .collect();
+    let pr_count = prs.iter().filter(|p| p["joins"].is_null()).count();
+    json!({ "would_open": would_open, "would_post": would_post, "prs": prs, "pr_count": pr_count })
+}
+
+/// One unit as the dashboard shows it before anything starts: its title,
+/// branch and labels, each package bump with its advisories and
+/// reachability, the open pull request it joins, and a token guess.
+/// `any`: a person asked for one PR (see [`open_bundle_pr`]).
+pub fn unit_plan(u: &FixUnit, findings: &[(Finding, FindingState)], any: bool) -> Value {
+    let by_id = by_id(findings);
+    let members = members_of(u, &by_id);
+    let bumps: Vec<Value> = u
+        .bumps
+        .iter()
+        .map(|b| {
+            let mine: Vec<&Finding> = members
+                .iter()
+                .map(|(f, _)| *f)
+                .filter(|f| f.package.eq_ignore_ascii_case(&b.package))
+                .collect();
+            let verdict = mine
+                .iter()
+                .map(|f| f.verdict)
+                .min_by_key(|v| verdict_rank(*v))
+                .unwrap_or(Verdict::Unknown);
+            json!({
+                "package": b.package, "from": b.from, "to": b.to, "major": b.major,
+                "manifest": b.manifest, "verdict": verdict,
+                "tier": mine.iter().filter_map(|f| f.tier).min().map(Tier::as_str),
+                "finding_ids": mine.iter().map(|f| f.id.clone()).collect::<Vec<_>>(),
+                "advisories": mine.iter().map(|f| f.advisory.primary.clone()).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    let joins =
+        open_bundle_pr(findings, u, any).map(|(p, _)| json!({"number": p.number, "url": p.url}));
+    json!({
+        "unit": u.key, "ticket": u.ticket, "repo": u.repo, "title": u.title,
+        "branch": u.branch, "labels": u.labels, "tier": u.tier.map(Tier::as_str),
+        "bundle": u.bundle, "finding_ids": u.finding_ids,
+        "advisories": primaries(&members).len(),
+        "majors": u.bumps.iter().filter(|b| b.major).count(),
+        "bumps": bumps,
+        "joins": joins,
+        "estimated_tokens": estimate_tokens(u),
+        // The first bump, for older dashboards.
+        "package": unit_packages(u),
+        "from": u.bumps.first().map(|b| b.from.clone()).unwrap_or_default(),
+        "to": u.bumps.first().map(|b| b.to.clone()).unwrap_or_default(),
+    })
 }
 
 /// The withdrawn ids' findings: what to do with each. A pull request that
@@ -5081,6 +5643,7 @@ mod tests {
         let cfg = SecurityConfig {
             enabled: true,
             dry_run: false,
+            bundle: Bundle::PerPackage,
             ..Default::default()
         };
         let now = t("2026-11-10T10:00:00Z");
@@ -5156,6 +5719,7 @@ mod tests {
         let cfg = SecurityConfig {
             enabled: true,
             dry_run: true,
+            bundle: Bundle::PerPackage,
             ..Default::default()
         };
         assert!(!cfg.acts(), "preview first opens and posts nothing");
@@ -6300,10 +6864,14 @@ mod tests {
     #[test]
     fn picked_findings_become_one_pr_per_package_version() {
         let fs = asked();
+        let per_package = SecurityConfig {
+            bundle: Bundle::PerPackage,
+            ..Default::default()
+        };
         let (units, skipped) = manual_units(
             &fs,
             &ids(&["t1", "t2", "t3", "p1"]),
-            &SecurityConfig::default(),
+            &per_package,
             Utc::now(),
         );
         assert_eq!(units.len(), 2);
@@ -6689,5 +7257,396 @@ mod tests {
         );
         assert!(e.summary.contains("untrusted input"), "{}", e.summary);
         assert!(e.checked.contains("`@aws-sdk/client-s3`"));
+    }
+
+    // ── Bundles: the fewest pull requests ──────────────────────────────
+
+    fn eco_finding(
+        id: &str,
+        repo: &str,
+        eco: &str,
+        pkg: &str,
+        tier: Tier,
+    ) -> (Finding, FindingState) {
+        let mut f = adv_finding(
+            id,
+            pkg,
+            "1.0.0",
+            Some("1.0.1"),
+            tier,
+            "2026-12-10T00:00:00Z",
+        );
+        f.0.repo = repo.into();
+        f.0.ecosystem = eco.into();
+        f
+    }
+
+    /// 57 package fixes in one repository: one PR per package before, one
+    /// bundle now, across every tier and ecosystem.
+    #[test]
+    fn a_repo_with_57_fixes_opens_one_pr() {
+        let tiers = [Tier::P1, Tier::P2, Tier::P3];
+        let ecos = ["npm", "pip", "cargo"];
+        let fs: Vec<(Finding, FindingState)> = (0..57)
+            .map(|i| {
+                eco_finding(
+                    &format!("f{i}"),
+                    "acme/web",
+                    ecos[i % 3],
+                    &format!("pkg{i}"),
+                    tiers[i % 3],
+                )
+            })
+            .collect();
+        let now = t("2026-11-11T10:00:00Z");
+        let per_package = SecurityConfig {
+            bundle: Bundle::PerPackage,
+            ..Default::default()
+        };
+        // Per package: a PR for each of the 19 P1 packages (npm), one daily
+        // group for the P2s (pip) and one weekly group for the P3s (cargo).
+        assert_eq!(plan_units(&fs, &per_package, now).len(), 19 + 1 + 1);
+        let cfg = SecurityConfig::default();
+        assert_eq!(cfg.bundle, Bundle::PerRepo, "the default for a new team");
+        let units = plan_units(&fs, &cfg, now);
+        assert_eq!(units.len(), 1);
+        let u = &units[0];
+        assert!(u.bundle && u.grouped, "no P0: it opens once a day");
+        assert_eq!(u.cadence, Some(Cadence::Daily));
+        assert_eq!(u.bumps.len(), 57);
+        assert_eq!(u.finding_ids.len(), 57);
+        assert_eq!(u.tier, Some(Tier::P1), "the most urgent member");
+        assert_eq!(
+            u.title,
+            "fix(deps): security updates for web (57 packages, 57 advisories)"
+        );
+        assert!(
+            u.branch
+                .starts_with("coderhelm/security-updates-2026-11-11-"),
+            "{}",
+            u.branch
+        );
+        for l in ["javascript", "python", "rust"] {
+            assert!(
+                u.labels.contains(&l.to_string()),
+                "every ecosystem: {:?}",
+                u.labels
+            );
+        }
+        // Per ecosystem: three.
+        let eco = SecurityConfig {
+            bundle: Bundle::PerRepoEcosystem,
+            ..Default::default()
+        };
+        let units = plan_units(&fs, &eco, now);
+        assert_eq!(units.len(), 3);
+        assert!(units.iter().all(|u| u.bumps.len() == 19));
+        assert!(units.iter().any(|u| u
+            .title
+            .starts_with("fix(deps): npm security updates for web (19 packages")));
+        // Two repositories: two.
+        let mut two = fs.clone();
+        two[0].0.repo = "acme/api".into();
+        assert_eq!(plan_units(&two, &cfg, now).len(), 2);
+        // A saved policy without the choice keeps one PR per package.
+        let old: SecurityConfig = serde_json::from_str(r#"{"enabled":true}"#).unwrap();
+        assert_eq!(old.bundle, Bundle::PerPackage);
+    }
+
+    /// A P0 starts its bundle at once, with everything else due in the repo.
+    #[test]
+    fn a_p0_starts_the_bundle_now() {
+        let mut fs = vec![
+            eco_finding("a", "acme/web", "npm", "tar", Tier::P3),
+            eco_finding("b", "acme/web", "pip", "django", Tier::P2),
+        ];
+        let now = t("2026-11-11T10:00:00Z");
+        let cfg = SecurityConfig::default();
+        let daily = plan_units(&fs, &cfg, now);
+        assert_eq!(daily[0].cadence, Some(Cadence::Daily));
+        assert!(daily[0].key.starts_with("bundle:daily:2026-11-11"));
+        fs.push(eco_finding("c", "acme/web", "npm", "undici", Tier::P0));
+        let units = plan_units(&fs, &cfg, now);
+        assert_eq!(units.len(), 1);
+        let u = &units[0];
+        assert_eq!(u.cadence, Some(Cadence::Now));
+        assert!(!u.grouped, "no daily claim holds it");
+        assert_eq!(u.finding_ids.len(), 3);
+        assert_eq!(u.tier, Some(Tier::P0));
+        assert!(unit_due(u, &cfg));
+        assert!(
+            u.labels.contains(&"severity:critical".to_string()),
+            "{:?}",
+            u.labels
+        );
+    }
+
+    fn open_bundle(fs: &mut [(Finding, FindingState)], ids_in: &[&str], number: u64) {
+        for (f, st) in fs
+            .iter_mut()
+            .filter(|(f, _)| ids_in.contains(&f.id.as_str()))
+        {
+            f.status = Status::PrOpen;
+            f.pr = Some(PrRef {
+                number,
+                url: format!("https://github.com/acme/web/pull/{number}"),
+                ci: Some("pending".into()),
+                state: "open".into(),
+                adopted: false,
+            });
+            st.bundled = true;
+            st.ticket = Some("SEC-OPEN".into());
+        }
+    }
+
+    /// One open security PR per repository: new fixes join it.
+    #[test]
+    fn new_fixes_join_the_open_bundle() {
+        let mut fs = vec![
+            eco_finding("a", "acme/web", "npm", "tar", Tier::P2),
+            eco_finding("b", "acme/web", "npm", "ws", Tier::P2),
+            eco_finding("c", "acme/web", "pip", "django", Tier::P1),
+            eco_finding("d", "acme/api", "npm", "qs", Tier::P2),
+        ];
+        let cfg = SecurityConfig::default();
+        let now = t("2026-11-11T10:00:00Z");
+        let first = plan_units(&fs, &cfg, now)
+            .into_iter()
+            .find(|u| u.repo == "acme/web")
+            .unwrap();
+        open_bundle(&mut fs, &["a", "b"], 812);
+        let units = plan_units(&fs, &cfg, now);
+        let web = units.iter().find(|u| u.repo == "acme/web").unwrap();
+        assert_eq!(
+            web.finding_ids,
+            vec!["c"],
+            "what is in the PR isn't planned again"
+        );
+        let (pr, ticket) = open_bundle_pr(&fs, web, false).expect("joins the open PR");
+        assert_eq!((pr.number, ticket.as_str()), (812, "SEC-OPEN"));
+        let api = units.iter().find(|u| u.repo == "acme/api").unwrap();
+        assert!(
+            open_bundle_pr(&fs, api, false).is_none(),
+            "another repo opens its own"
+        );
+        let opened = without(&first, &ids(&["c"]), &fs, &cfg);
+        let joined = join_unit(&opened, web, &fs, &cfg);
+        assert_eq!(
+            joined.ticket, first.ticket,
+            "the open PR's ticket and branch stay"
+        );
+        assert_eq!(joined.branch, first.branch);
+        assert_eq!(joined.finding_ids, ids(&["a", "b", "c"]));
+        assert_eq!(joined.bumps.len(), 3);
+        assert_eq!(joined.tier, Some(Tier::P1));
+        assert_eq!(
+            joined.title,
+            "fix(deps): security updates for web (3 packages, 3 advisories)"
+        );
+        assert!(join_note(web, &[&fs[2].0], &cfg).contains("`django` 1.0.0 to 1.0.1"));
+        // Per ecosystem: only the same ecosystem's open PR takes it.
+        let eco = SecurityConfig {
+            bundle: Bundle::PerRepoEcosystem,
+            ..Default::default()
+        };
+        let pip = plan_units(&fs, &eco, now)
+            .into_iter()
+            .find(|u| u.repo == "acme/web")
+            .unwrap();
+        assert!(open_bundle_pr(&fs, &pip, false).is_none());
+        // An adopted bot PR or a per-package PR isn't a bundle to join...
+        let mut per_pkg = fs.clone();
+        for (_, st) in per_pkg.iter_mut() {
+            st.bundled = false;
+        }
+        assert!(open_bundle_pr(&per_pkg, web, false).is_none());
+        // ...unless a person asked for one PR.
+        assert_eq!(open_bundle_pr(&per_pkg, web, true).unwrap().0.number, 812);
+    }
+
+    /// A major bump stays in the bundle; it leaves only when the bundle's
+    /// CI can't be made to pass, and then gets its own PR.
+    #[test]
+    fn a_failing_major_bump_is_split_out() {
+        let mut fs = vec![
+            eco_finding("a", "acme/web", "npm", "tar", Tier::P2),
+            eco_finding("b", "acme/web", "npm", "ws", Tier::P2),
+        ];
+        fs[1].0.fixed_version = Some("2.0.0".into());
+        let cfg = SecurityConfig::default();
+        let now = t("2026-11-11T10:00:00Z");
+        let units = plan_units(&fs, &cfg, now);
+        assert_eq!(units.len(), 1, "the major bump is in the bundle");
+        let u = &units[0];
+        assert!(u.bumps.iter().any(|b| b.major));
+        assert!(u.labels.contains(&"breaking".to_string()));
+        assert_eq!(split_out(u, &fs), ids(&["b"]));
+        let left = without(u, &ids(&["b"]), &fs, &cfg);
+        assert_eq!(left.bumps.len(), 1);
+        assert!(!left.labels.contains(&"breaking".to_string()));
+        assert!(split_note(&[&u.bumps[1]]).contains("`ws` 1.0.0 to 2.0.0"));
+        // Split: it plans alone next time, one PR of its own.
+        fs[1].1.split = true;
+        let units = plan_units(&fs, &cfg, now);
+        assert_eq!(units.len(), 2);
+        let alone = units.iter().find(|u| !u.bundle).unwrap();
+        assert_eq!(alone.finding_ids, ids(&["b"]));
+        assert_eq!(alone.key, "ws@2.0.0");
+        // A bundle of only major bumps stays as it is.
+        let only = FixUnit {
+            finding_ids: ids(&["b"]),
+            bumps: vec![u.bumps[1].clone()],
+            ..u.clone()
+        };
+        assert!(split_out(&only, &fs).is_empty());
+        // Issue-only majors never enter a bundle.
+        fs[1].1.split = false;
+        let issues = SecurityConfig {
+            major_bumps: MajorBumps::IssueOnly,
+            ..Default::default()
+        };
+        assert_eq!(plan_units(&fs, &issues, now).len(), 2);
+    }
+
+    /// A bundle is one fix run against the day's limit, whatever its size.
+    #[tokio::test]
+    async fn a_bundle_counts_as_one_run() {
+        let fs: Vec<(Finding, FindingState)> = (0..14)
+            .map(|i| {
+                eco_finding(
+                    &format!("f{i}"),
+                    "acme/web",
+                    "npm",
+                    &format!("p{i}"),
+                    Tier::P1,
+                )
+            })
+            .chain((0..4).map(|i| {
+                eco_finding(
+                    &format!("g{i}"),
+                    &format!("acme/r{i}"),
+                    "npm",
+                    "x",
+                    Tier::P2,
+                )
+            }))
+            .collect();
+        let cfg = SecurityConfig::default();
+        let all: Vec<String> = fs.iter().map(|(f, _)| f.id.clone()).collect();
+        let slots = MemorySlots::default();
+        let (mut units, skipped) = manual_units(&fs, &all, &cfg, Utc::now());
+        assert!(skipped.is_empty());
+        assert_eq!(units.len(), 5, "one per repository");
+        let (started, queued) =
+            admit_request(&slots, &cfg, "20261111", &mut units, &fs, false).await;
+        assert_eq!((started.len(), queued.len()), (3, 2));
+        assert_eq!(*slots.runs.lock().unwrap().get("20261111").unwrap(), 3);
+        let web = started.iter().find(|r| r.repo == "acme/web").unwrap();
+        assert_eq!(
+            (web.finding_ids.len(), web.package.as_str()),
+            (14, "14 packages")
+        );
+        // The token limit stops a bundle like any run.
+        slots
+            .tokens
+            .lock()
+            .unwrap()
+            .insert("20261112".into(), cfg.max_fix_tokens_per_day);
+        assert!(matches!(
+            admit_run(&slots, &cfg, "20261112", false).await,
+            Admit::Wait(_)
+        ));
+        assert!(estimate_tokens(&units[0]) > estimate_tokens(&FixUnit::default()));
+    }
+
+    /// Picked rows: one PR per repository when the policy bundles or the
+    /// person asks for one PR; per package when they ask for that.
+    #[test]
+    fn picked_findings_follow_the_choice() {
+        let fs = vec![
+            eco_finding("a", "acme/web", "npm", "tar", Tier::P2),
+            eco_finding("b", "acme/web", "pip", "django", Tier::P1),
+            eco_finding("c", "acme/api", "npm", "qs", Tier::P3),
+        ];
+        let picked = ids(&["a", "b", "c"]);
+        let per_package = SecurityConfig {
+            bundle: Bundle::PerPackage,
+            ..Default::default()
+        };
+        let now = Utc::now();
+        assert_eq!(manual_units(&fs, &picked, &per_package, now).0.len(), 3);
+        // One PR beats the policy: one per repository (a PR lives in one).
+        let (one, _) = manual_units_as(&fs, &picked, &per_package, now, Combine::OnePr);
+        assert_eq!(one.len(), 2);
+        assert!(one
+            .iter()
+            .all(|u| u.bundle && u.cadence == Some(Cadence::Now)));
+        let web = one.iter().find(|u| u.repo == "acme/web").unwrap();
+        assert_eq!(web.bumps.len(), 2);
+        // The key comes from what was picked: the gateway and the worker agree.
+        let (again, _) = manual_units_as(&fs, &picked, &per_package, now, Combine::OnePr);
+        assert_eq!(
+            one.iter().map(|u| &u.ticket).collect::<Vec<_>>(),
+            again.iter().map(|u| &u.ticket).collect::<Vec<_>>()
+        );
+        // Removing a row changes the request.
+        let (fewer, _) = manual_units_as(&fs, &ids(&["a", "c"]), &per_package, now, Combine::OnePr);
+        let web2 = fewer.iter().find(|u| u.repo == "acme/web").unwrap();
+        assert_eq!(web2.bumps.len(), 1);
+        assert_ne!(web2.ticket, web.ticket);
+        // The policy bundles; one per package beats it.
+        let cfg = SecurityConfig::default();
+        assert_eq!(manual_units(&fs, &picked, &cfg, now).0.len(), 2);
+        assert_eq!(
+            manual_units_as(&fs, &picked, &cfg, now, Combine::PerPackage)
+                .0
+                .len(),
+            3
+        );
+        // A one-PR request that waited keeps its choice.
+        let mut waiting = fs.clone();
+        for (_, st) in waiting.iter_mut() {
+            st.requested_by = Some("a@b".into());
+            st.requested_as = Combine::OnePr;
+        }
+        assert_eq!(requested_units(&waiting, &per_package, now).len(), 2);
+        // The plan the confirmation shows.
+        let plan = unit_plan(web, &fs, true);
+        assert_eq!(plan["bumps"].as_array().unwrap().len(), 2);
+        assert_eq!(plan["advisories"], 2);
+        assert!(plan["joins"].is_null());
+    }
+
+    /// The bundle's description: a table of every bump.
+    #[test]
+    fn a_bundle_body_has_the_bump_table() {
+        let mut fs = vec![
+            eco_finding("a", "acme/web", "npm", "tar", Tier::P2),
+            eco_finding("b", "acme/web", "npm", "ws", Tier::P1),
+        ];
+        fs[1].0.fixed_version = Some("2.0.0".into());
+        let u = &plan_units(&fs, &SecurityConfig::default(), t("2026-11-11T10:00:00Z"))[0];
+        let pairs: Vec<(&Finding, &FindingState)> = fs.iter().map(|(f, s)| (f, s)).collect();
+        let body = pr_body(u, &pairs, "");
+        assert!(
+            body.contains("Fixes 2 advisories in 2 packages. P1, due Dec 10."),
+            "{body}"
+        );
+        assert!(body.contains("| Package | Version | Advisories | Reachability | Due |"));
+        assert!(
+            body.contains("| `ws` | 1.0.0 to 2.0.0 (major) | GHSA-b | Reachable | P1 Dec 10 |"),
+            "{body}"
+        );
+        let p = preview(
+            &fs,
+            &SecurityConfig {
+                enabled: true,
+                dry_run: true,
+                ..Default::default()
+            },
+            t("2026-11-11T10:00:00Z"),
+        );
+        assert_eq!(p["pr_count"], 1);
+        assert_eq!(p["would_open"].as_array().unwrap().len(), 2);
     }
 }
