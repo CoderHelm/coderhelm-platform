@@ -72,6 +72,13 @@ pub struct PermissionCheck {
     /// Checked on the install's own read role (its stack keeps it current).
     #[serde(default)]
     pub install_role: bool,
+    /// Actions of optional abilities ([`log_reader::OPTIONAL`]) the role
+    /// lacks. They never make the role need an update by themselves.
+    #[serde(default)]
+    pub optional_missing: Vec<String>,
+    /// The optional abilities were checked (the simulator answered).
+    #[serde(default)]
+    pub optional_checked: bool,
 }
 
 /// What the page shows for one account.
@@ -98,7 +105,36 @@ impl PermissionCheck {
             error: String::new(),
             install_account: false,
             install_role: false,
+            optional_missing: Vec::new(),
+            optional_checked: false,
         }
+    }
+
+    /// Whether the role can do optional ability `key`: `None` when it
+    /// wasn't checked (an older role answered with probes).
+    pub fn optional_ability(&self, key: &str) -> Option<bool> {
+        if !self.works || !self.optional_checked {
+            return None;
+        }
+        let a = log_reader::ability(key)?;
+        Some(
+            !a.actions
+                .iter()
+                .any(|x| self.optional_missing.iter().any(|m| m == x)),
+        )
+    }
+
+    /// The optional ability's actions the role lacks.
+    pub fn optional_missing_for(&self, key: &str) -> Vec<&str> {
+        log_reader::ability(key)
+            .map(|a| {
+                a.actions
+                    .iter()
+                    .copied()
+                    .filter(|x| self.optional_missing.iter().any(|m| m == x))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// `up_to_date`, `update_needed` or `error`.
@@ -248,11 +284,15 @@ impl PermissionCheck {
         let abilities: Vec<Value> = ABILITIES
             .iter()
             .map(|a| {
+                let optional = log_reader::OPTIONAL.contains(&a.key);
                 let gone: Vec<&str> = a
                     .actions
                     .iter()
                     .copied()
-                    .filter(|x| self.missing.iter().any(|m| m == x))
+                    .filter(|x| {
+                        self.missing.iter().any(|m| m == x)
+                            || (optional && self.optional_missing.iter().any(|m| m == x))
+                    })
                     .collect();
                 json!({
                     "key": a.key,
@@ -260,6 +300,7 @@ impl PermissionCheck {
                     "why": a.why,
                     "actions": a.actions,
                     "missing": gone,
+                    "optional": optional,
                 })
             })
             .collect();
@@ -289,6 +330,7 @@ impl PermissionCheck {
             "abilities": abilities,
             "update": update,
             "install_account": self.install_account,
+            "optional_missing": self.optional_missing,
             "problem": self.problem(pressed),
         })
     }
@@ -301,7 +343,14 @@ fn failed(status: &str) -> bool {
 /// Pure: the simulator's answers folded into a check.
 pub fn apply_simulation(c: &mut PermissionCheck, results: &[Simulated]) {
     c.method = "simulate".into();
+    c.optional_checked = true;
     for r in results {
+        if !r.allowed && log_reader::is_optional(&r.action) {
+            if !c.optional_missing.contains(&r.action) {
+                c.optional_missing.push(r.action.clone());
+            }
+            continue;
+        }
         if r.allowed || c.missing.contains(&r.action) {
             continue;
         }
@@ -354,6 +403,10 @@ pub fn simulated_resource(action: &str, role_arn: &str, region: &str, account: &
             format!("arn:aws:airflow:{region}:{account}:role/coderhelm-permission-check/Viewer")
         }
         "iam:SimulatePrincipalPolicy" => role_arn.to_string(),
+        // Public parameters only.
+        "ssm:GetParameters" => format!(
+            "arn:aws:ssm:{region}::parameter/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64"
+        ),
         // Allowed on CoderHelm's own update stacks only.
         "cloudformation:DescribeStacks" => format!(
             "arn:aws:cloudformation:{region}:{account}:stack/{}/coderhelm-permission-check",
@@ -400,7 +453,7 @@ async fn simulate(s: &Session, target: &AwsTarget) -> Result<Vec<Simulated>, boo
     let iam = client!(aws_sdk_iam, s, "us-east-1".to_string());
     let account = target.account();
     let mut groups: Vec<(String, Vec<String>)> = Vec::new();
-    for a in log_reader::checked_actions() {
+    for a in log_reader::simulated_actions() {
         let r = simulated_resource(a, &target.role_arn, &target.region, account);
         match groups.iter_mut().find(|(res, _)| *res == r) {
             Some((_, v)) => v.push(a.to_string()),
@@ -692,6 +745,51 @@ mod tests {
         let p = b.problem(false).unwrap();
         assert_eq!(p.code, "boundary");
         assert!(p.message.contains("permissions boundary"));
+    }
+
+    #[test]
+    fn missing_infrastructure_reads_never_need_an_update_by_themselves() {
+        let mut c = checked();
+        let infra = log_reader::ability("infra").unwrap();
+        let mut results: Vec<Simulated> = log_reader::checked_actions()
+            .iter()
+            .map(|a| sim(a, true))
+            .collect();
+        results.extend(infra.actions.iter().map(|a| sim(a, false)));
+        apply_simulation(&mut c, &results);
+        assert_eq!(c.status(), "up_to_date");
+        assert_eq!(c.optional_ability("infra"), Some(false));
+        assert_eq!(c.optional_missing_for("infra").len(), infra.actions.len());
+        let v = c.view(false, "https://b/launch/v1/coderhelm-log-reader.yaml");
+        let row = v["abilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["key"] == "infra")
+            .unwrap();
+        assert_eq!(row["optional"], true);
+        assert_eq!(
+            row["missing"].as_array().unwrap().len(),
+            infra.actions.len()
+        );
+        // Granted: the ability is there.
+        let mut ok = checked();
+        apply_simulation(&mut ok, &[sim("ec2:DescribeInstances", true)]);
+        assert_eq!(ok.optional_ability("infra"), Some(true));
+        // Probes can't tell.
+        let mut p = checked();
+        apply_probes(&mut p, &[("logs", Some(true))]);
+        assert_eq!(p.optional_ability("infra"), None);
+        // A check saved before optional abilities still reads.
+        let mut old = serde_json::to_value(checked()).unwrap();
+        old.as_object_mut().unwrap().remove("optional_missing");
+        old.as_object_mut().unwrap().remove("optional_checked");
+        let back: PermissionCheck = serde_json::from_value(old).unwrap();
+        assert_eq!(back.optional_ability("infra"), None);
+        assert!(
+            simulated_resource("ssm:GetParameters", "r", "eu-west-1", "a")
+                .starts_with("arn:aws:ssm:eu-west-1::parameter/aws/service/")
+        );
     }
 
     #[test]

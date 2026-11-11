@@ -53,6 +53,9 @@ pub struct Abilities {
     pub airflow_skip: Vec<String>,
     /// When old metrics or Airflow connections were folded in.
     pub migrated_at: String,
+    /// An admin switched infrastructure vulnerabilities on for this
+    /// account (off by default: the role needs the optional permissions).
+    pub infra_on: bool,
 }
 
 /// One connected AWS account.
@@ -81,6 +84,37 @@ impl AwsAccount {
     /// What the team chose for the role here.
     pub fn chosen(&self) -> crate::log_reader::Chosen<'_> {
         crate::log_reader::Chosen::new(&self.knowledge_bases, &self.import_buckets)
+            .with_infrastructure(self.abilities.infra_on)
+    }
+
+    /// Infrastructure vulnerabilities is on here.
+    pub fn infra_on(&self) -> bool {
+        self.abilities.infra_on
+    }
+
+    /// Whether the role has the infrastructure reads: `None` until a
+    /// permission check by the simulator says.
+    pub fn infra_available(&self) -> Option<bool> {
+        self.permissions
+            .as_ref()
+            .and_then(|p| p.optional_ability("infra"))
+    }
+
+    /// Switched on, but the role lacks some of the reads: the
+    /// infrastructure reads it lacks (a warning that names the feature).
+    pub fn infra_missing(&self) -> Vec<String> {
+        if !self.infra_on() {
+            return Vec::new();
+        }
+        self.permissions
+            .as_ref()
+            .map(|p| {
+                p.optional_missing_for("infra")
+                    .into_iter()
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -147,6 +181,7 @@ impl AwsAccount {
                 airflow_found: strings(item, "airflow_found"),
                 airflow_skip: strings(item, "airflow_skip"),
                 migrated_at: s(item, "abilities_migrated_at"),
+                infra_on: b(item, "infra_on"),
             },
         })
     }
@@ -168,6 +203,7 @@ impl AwsAccount {
             ("airflow_found", Some(av_list(&a.airflow_found))),
             ("airflow_skip", Some(av_list(&a.airflow_skip))),
             ("abilities_migrated_at", text(&a.migrated_at)),
+            ("infra_on", Some(AttributeValue::Bool(a.infra_on))),
         ]
     }
 
@@ -319,6 +355,11 @@ impl AwsAccount {
                 "found": a.airflow_found,
                 "skipped": a.airflow_skip,
                 "environments": self.airflow_environments(),
+            },
+            "infrastructure": {
+                "available": self.infra_available(),
+                "on": self.infra_on(),
+                "missing": self.infra_missing(),
             },
             "permissions": self.permissions.as_ref().map(|p| p.view_with(false, &crate::public_urls::log_reader_template_url(), &self.chosen())),
         })
@@ -592,6 +633,40 @@ mod tests {
         let old = AwsAccount::from_item(&item(&account())).unwrap();
         assert_eq!(old.abilities.can_metrics, None);
         assert!(!old.metrics_on());
+    }
+
+    #[test]
+    fn infrastructure_is_off_until_an_admin_turns_it_on() {
+        let mut a = account();
+        assert!(!a.infra_on());
+        assert!(!a.chosen().infrastructure);
+        a.abilities.infra_on = true;
+        assert!(
+            a.chosen().infrastructure,
+            "the update link asks for the reads"
+        );
+        assert!(AwsAccount::from_item(&item(&a)).unwrap().abilities.infra_on);
+        // On, and the role lacks the reads: they're named.
+        let mut c = super::super::permissions::PermissionCheck::new(&a.target(), "t");
+        c.works = true;
+        super::super::permissions::apply_simulation(
+            &mut c,
+            &[super::super::permissions::Simulated {
+                action: "ec2:DescribeInstances".into(),
+                allowed: false,
+                boundary_allows: None,
+                org_allows: None,
+            }],
+        );
+        a.permissions = Some(c);
+        assert_eq!(a.infra_available(), Some(false));
+        assert_eq!(a.infra_missing(), vec!["ec2:DescribeInstances"]);
+        assert_eq!(
+            a.public_json()["infrastructure"]["missing"][0],
+            "ec2:DescribeInstances"
+        );
+        a.abilities.infra_on = false;
+        assert!(a.infra_missing().is_empty(), "off: nothing to warn about");
     }
 
     #[test]

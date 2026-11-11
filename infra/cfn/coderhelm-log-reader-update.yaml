@@ -6,7 +6,9 @@ Description: >
   documents in the S3 buckets named in ImportBuckets. Every permission is
   read-only (list, describe and query), except one you opt into: copying
   your chosen CoderHelm knowledge bases into the Bedrock knowledge bases
-  named in SyncKnowledgeBases.
+  named in SyncKnowledgeBases. With InfrastructureVulnerabilities "on" it
+  also reads, read-only, which versions your EC2, EKS, RDS, ElastiCache and
+  OpenSearch resources run, for matching against security advisories.
   It only adds: to drop a permission an older release granted, update the
   CoderHelmLogReader stack itself with the current role template.
   Created from the dashboard's Update link; you can delete older
@@ -51,12 +53,27 @@ Parameters:
     AllowedPattern: "^(|all|arn:aws:bedrock:[a-z0-9-]+:[0-9]{12}:knowledge-base/[A-Z0-9]{10}(,arn:aws:bedrock:[a-z0-9-]+:[0-9]{12}:knowledge-base/[A-Z0-9]{10})*)$"
     ConstraintDescription: Knowledge base ARNs separated by commas, "all", or empty.
 
+  InfrastructureVulnerabilities:
+    Type: String
+    Default: "off"
+    AllowedValues: ["off", "on"]
+    Description: >
+      "on" lets CoderHelm read, read-only, what runs in this account so it can
+      match it against security advisories: EC2 instances and their AMIs,
+      Auto Scaling groups and the load balancers in front of them, EKS
+      clusters and node groups, RDS and Aurora pending maintenance,
+      ElastiCache service updates, OpenSearch software updates, ECR scan
+      results, kernels from SSM inventory and AWS's public AMI parameters.
+      Never Lambda function settings, launch template user data or
+      environment variables.
+
 Conditions:
   ReadsKnowledgeBases: !Not [!Equals [!Ref KnowledgeBases, ""]]
   ReadsEveryKnowledgeBase: !Equals [!Ref KnowledgeBases, "all"]
   ReadsImportBuckets: !Not [!Equals [!Ref ImportBuckets, ""]]
   SyncsKnowledgeBases: !Not [!Equals [!Ref SyncKnowledgeBases, ""]]
   SyncsEveryKnowledgeBase: !Equals [!Ref SyncKnowledgeBases, "all"]
+  ReadsInfrastructure: !Equals [!Ref InfrastructureVulnerabilities, "on"]
 
 Resources:
   CoderHelmReadOnlyUpdate:
@@ -236,4 +253,45 @@ Resources:
                 - SyncsEveryKnowledgeBase
                 - !Sub "arn:aws:bedrock:*:${AWS::AccountId}:knowledge-base/*"
                 - !Split [",", !Ref SyncKnowledgeBases]
+            - !Ref AWS::NoValue
+          # Infrastructure vulnerabilities, only when InfrastructureVulnerabilities
+          # is "on": describe and list calls that say which versions run (AMIs,
+          # node group releases, engine versions), whether a resource is reachable
+          # from the internet, and what AWS has pending for it. Nothing here
+          # returns user data, environment variables or secrets, and nothing is
+          # changed: CoderHelm opens pull requests in your code and shows the AWS
+          # steps for a person to run.
+          - !If
+            - ReadsInfrastructure
+            - Sid: ReadInfrastructureVersions
+              Effect: Allow
+              Action:
+                - "ec2:DescribeInstances"
+                - "ec2:DescribeImages"
+                - "autoscaling:DescribeAutoScalingGroups"
+                - "elasticloadbalancing:DescribeTargetGroups"
+                - "elasticloadbalancing:DescribeLoadBalancers"
+                - "eks:ListClusters"
+                - "eks:DescribeCluster"
+                - "eks:ListNodegroups"
+                - "eks:DescribeNodegroup"
+                - "rds:DescribeDBClusters"
+                - "rds:DescribeDBInstances"
+                - "rds:DescribePendingMaintenanceActions"
+                - "elasticache:DescribeServiceUpdates"
+                - "elasticache:DescribeUpdateActions"
+                - "es:ListDomainNames"
+                - "es:DescribeDomains"
+                - "ecr:DescribeImageScanFindings"
+                - "ssm:ListInventoryEntries"
+              Resource: "*"
+            - !Ref AWS::NoValue
+          # AWS's public "latest AMI" parameters only (the AMI a fix points to).
+          - !If
+            - ReadsInfrastructure
+            - Sid: ReadPublicAmiParameters
+              Effect: Allow
+              Action:
+                - "ssm:GetParameters"
+              Resource: "arn:aws:ssm:*::parameter/aws/service/*"
             - !Ref AWS::NoValue

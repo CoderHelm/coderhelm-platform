@@ -194,7 +194,9 @@ test("self-host: the gateway and worker read the install's own account with this
     const next = src.indexOf("Ability {", at);
     return src.slice(0, start) + (next > 0 ? src.slice(next) : "");
   };
-  const abilities = without(without(all, "imports"), "sync");
+  // Infrastructure vulnerabilities isn't on the install's own role yet: its reads wait for the
+  // permissions boundary to allow them (own-account-read.ts, ReadsInfrastructure).
+  const abilities = without(without(without(all, "imports"), "sync"), "infra");
   const needed = [...new Set([...abilities.matchAll(/"([a-z0-9-]+:[A-Za-z]+)"/g)].map((m) => m[1]))];
   assert.ok(needed.length > 20, `${needed.length} actions`);
   for (const [stack, fn] of [
@@ -208,6 +210,7 @@ test("self-host: the gateway and worker read the install's own account with this
     const doc = JSON.stringify(policies[0].Properties.PolicyDocument);
     for (const a of needed) assert.ok(doc.includes(`"${a}"`), `${fn} lacks ${a}`);
     for (const a of ["s3:GetObject", "s3:ListBucket", "kms:Decrypt"]) assert.ok(!doc.includes(`"${a}"`), `${fn} must not read buckets with ${a}`);
+    for (const a of ["ec2:DescribeInstances", "rds:DescribePendingMaintenanceActions"]) assert.ok(!doc.includes(`"${a}"`), `${fn}: ${a} waits for the boundary`);
     // Only reads: list, describe, get, query, never a write.
     const actions: string[] = policies[0].Properties.PolicyDocument.Statement.flatMap((s: any) => ([] as string[]).concat(s.Action));
     for (const a of actions) assert.match(a, /^[a-z0-9-]+:(List|Describe|Get|Filter|Start(Query)?$|Stop(Query)?$|BatchGet|Simulate|InvokeRestApi|Retrieve$)/, a);

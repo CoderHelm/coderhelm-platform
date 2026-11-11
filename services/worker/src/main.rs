@@ -581,6 +581,9 @@ async fn handle_message(state: Arc<WorkerState>, message: models::WorkerMessage)
             if sec.teams > 0 {
                 passes::infra_feeds::sweep(&state).await;
             }
+            // What each account an admin switched infrastructure
+            // vulnerabilities on for runs, read once a day.
+            passes::infra_inventory::sweep(&state).await;
         }
         models::WorkerMessage::SecurityEvent(msg) => {
             info!(team_id = %msg.team_id, kind = %msg.kind, repo = %msg.repo, "Security event");
