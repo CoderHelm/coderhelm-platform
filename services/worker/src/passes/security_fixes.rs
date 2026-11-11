@@ -213,6 +213,7 @@ async fn save_deps(
     deps: &[Dep],
     status: &sec::InventoryStatus,
     unpinned: usize,
+    branch: &str,
 ) {
     let (text, kept) = deps_to_keep(deps);
     if kept < deps.len() {
@@ -233,7 +234,8 @@ async fn save_deps(
         .key("sk", attr_s(&sec::deps_sk(repo)))
         .update_expression(
             "SET #repo = :r, deps = :d, #count = :c, kept = :k, ecosystems = :e, unpinned = :u, \
-             inventory_state = :s, inventory_reason = :why, updated_at = :t, read_at = :t",
+             inventory_state = :s, inventory_reason = :why, updated_at = :t, read_at = :t, \
+             branch = :b",
         )
         .expression_attribute_names("#repo", "repo")
         .expression_attribute_names("#count", "count")
@@ -245,6 +247,7 @@ async fn save_deps(
         .expression_attribute_values(":u", attr_n(unpinned))
         .expression_attribute_values(":s", attr_s(&status.state))
         .expression_attribute_values(":why", attr_s(&status.reason))
+        .expression_attribute_values(":b", attr_s(branch))
         .expression_attribute_values(":t", attr_s(&Utc::now().to_rfc3339()))
         .send()
         .await
@@ -491,7 +494,7 @@ async fn refresh_inventory(
             }
         }
     }
-    save_deps(state, team_id, repo, &deps, &status, unpinned).await;
+    save_deps(state, team_id, repo, &deps, &status, unpinned, &branch).await;
     Ok(deps)
 }
 
@@ -3080,91 +3083,247 @@ fn withdrawn_observations(findings: &[(Finding, FindingState)], ghsa: &str) -> V
         .collect()
 }
 
-/// Pages of GitHub's advisory database one poll reads at most.
-const ADVISORY_POLL_PAGES: usize = 10;
+/// What an advisory poll reads and writes: GitHub's advisory database, the
+/// team's row (its checkpoint and status), and the findings each page's
+/// matches become. A trait so the paging can be tested on a fake GitHub.
+#[async_trait::async_trait]
+trait AdvisoryPollIo: Send {
+    /// The poll's fields on the team's row (empty strings when unset).
+    async fn poll_fields(&self) -> HashMap<String, String>;
+    async fn save_poll_fields(&self, fields: &[(&'static str, String)]);
+    /// One `GET`: status, body and `Link` header.
+    async fn page(&self, path: &str) -> Result<(u16, Value, Option<String>), String>;
+    /// Matches one page against the dependency lists and applies it:
+    /// (matched, created).
+    async fn apply(&mut self, advisories: &[Value]) -> (usize, usize);
+    fn out_of_time(&self) -> bool;
+}
 
-/// The backstop for the `security_advisory` webhook (which a quiet day, or
-/// an install the hosted relay doesn't forward global events to, never
-/// sees): GitHub's advisories updated since the last poll, matched against
-/// every repository's dependency list. Records `advisory_polled_at` only
-/// when the whole window was read, so a failed poll is read again.
-async fn poll_advisories(cx: &Ctx<'_>, findings: &mut Vec<(Finding, FindingState)>) -> usize {
-    let now = Utc::now();
-    let last = get_team_state(cx.state, cx.team_id)
-        .await
-        .map(|i| s(&i, "advisory_polled_at"))
-        .filter(|t| !t.is_empty());
-    let since = sec::advisory_poll_since(last.as_deref(), now);
-    let mut advisories: Vec<Value> = vec![];
-    let mut after: Option<String> = None;
-    let mut complete = false;
-    for _ in 0..ADVISORY_POLL_PAGES {
-        let path = sec::advisories_poll_path(&since, after.as_deref());
-        match cx.gh.get_status_link(&path).await {
+/// Fields of the team's row the advisory poll keeps.
+const POLL_FIELDS: [&str; 6] = [
+    "advisory_polled_at",
+    "advisory_poll_from",
+    "advisory_poll_after",
+    "advisory_poll_run_at",
+    "advisory_poll_caught_up",
+    "advisory_poll_error",
+];
+
+/// What one advisory poll did.
+#[derive(Debug, Default)]
+struct AdvisoryPollReport {
+    since: String,
+    pages: usize,
+    read: usize,
+    matched: usize,
+    created: usize,
+    caught_up: bool,
+    error: Option<String>,
+}
+
+/// One advisory poll: from the checkpoint (or the last poll that reached
+/// the end), page by page in `updated_at` order. Each page is matched and
+/// applied before the checkpoint moves past it, so a run stopped by its
+/// page budget, its time budget or a failed request goes on from there next
+/// time instead of starting over. Reaching the end records
+/// `advisory_polled_at` (the run's start) and clears the checkpoint.
+async fn run_advisory_poll(
+    io: &mut dyn AdvisoryPollIo,
+    now: chrono::DateTime<Utc>,
+) -> AdvisoryPollReport {
+    let f = io.poll_fields().await;
+    let get = |k: &str| f.get(k).map(String::as_str).filter(|v| !v.is_empty());
+    let start = sec::advisory_poll_start(
+        get("advisory_polled_at"),
+        get("advisory_poll_from"),
+        get("advisory_poll_after"),
+        now,
+    );
+    let budget = if start.behind {
+        sec::ADVISORY_POLL_PAGES_BEHIND
+    } else {
+        sec::ADVISORY_POLL_PAGES
+    };
+    let mut report = AdvisoryPollReport {
+        since: start.since.clone(),
+        ..Default::default()
+    };
+    let mut after = start.after.clone();
+    let mut saved_cursor = after.is_some();
+    while report.pages < budget {
+        if report.pages > 0 && io.out_of_time() {
+            break;
+        }
+        let path = sec::advisories_poll_path(&start.since, after.as_deref());
+        let answer = io.page(&path).await;
+        report.pages += 1;
+        match answer {
             Ok((code, body, link)) if (200..300).contains(&code) => {
-                advisories.extend(body.as_array().cloned().unwrap_or_default());
-                after = sec::dependabot_next_cursor(link.as_deref());
-                if after.is_none() {
-                    complete = true;
+                saved_cursor = false;
+                let page = body.as_array().cloned().unwrap_or_default();
+                report.read += page.len();
+                let (matched, created) = io.apply(&page).await;
+                report.matched += matched;
+                report.created += created;
+                let Some(next) = sec::dependabot_next_cursor(link.as_deref()) else {
+                    report.caught_up = true;
                     break;
-                }
+                };
+                let (from, cursor) = sec::advisory_poll_checkpoint(&start.since, &page, &next);
+                io.save_poll_fields(&[
+                    ("advisory_poll_from", from),
+                    ("advisory_poll_after", cursor.unwrap_or_default()),
+                ])
+                .await;
+                after = Some(next);
+            }
+            // A kept cursor GitHub no longer takes: the same time without it.
+            Ok((code, _, _)) if saved_cursor && matches!(code, 400 | 404 | 422) => {
+                saved_cursor = false;
+                after = None;
             }
             Ok((code, body, _)) => {
-                warn!(
-                    team_id = cx.team_id,
-                    status = code,
-                    github = body["message"].as_str().unwrap_or(""),
-                    "security: the advisory poll was turned down"
-                );
+                let why = body["message"].as_str().unwrap_or("").trim();
+                report.error = Some(if why.is_empty() {
+                    format!("GitHub answered {code}")
+                } else {
+                    format!("GitHub answered {code}: {}", common::truncate_str(why, 200))
+                });
                 break;
             }
             Err(e) => {
-                warn!(team_id = cx.team_id, error = %e, "security: the advisory poll got no answer");
+                report.error = Some(format!(
+                    "GitHub didn't answer: {}",
+                    common::truncate_str(&e, 200)
+                ));
                 break;
             }
         }
     }
-    let mut obs = vec![];
-    if !advisories.is_empty() {
-        let mut lists = vec![];
-        for repo in team_repos(cx.state, cx.team_id, cx.cfg).await {
-            if let Some((deps, _)) = load_deps(cx.state, cx.team_id, &repo).await {
-                lists.push((repo, deps));
-            }
+    let run_at = now.to_rfc3339();
+    let mut fields: Vec<(&'static str, String)> = vec![
+        ("advisory_poll_run_at", run_at.clone()),
+        ("advisory_poll_caught_up", report.caught_up.to_string()),
+        (
+            "advisory_poll_error",
+            report.error.clone().unwrap_or_default(),
+        ),
+    ];
+    if report.caught_up {
+        fields.extend([
+            ("advisory_polled_at", run_at),
+            ("advisory_poll_from", String::new()),
+            ("advisory_poll_after", String::new()),
+        ]);
+    }
+    io.save_poll_fields(&fields).await;
+    report
+}
+
+/// The live [`AdvisoryPollIo`]: the team's GitHub token, its row, its
+/// dependency lists (read once a poll) and its findings.
+struct LiveAdvisoryPoll<'a, 'b> {
+    cx: &'a Ctx<'b>,
+    findings: &'a mut Vec<(Finding, FindingState)>,
+    lists: Option<Vec<(String, Vec<Dep>)>>,
+}
+
+#[async_trait::async_trait]
+impl AdvisoryPollIo for LiveAdvisoryPoll<'_, '_> {
+    async fn poll_fields(&self) -> HashMap<String, String> {
+        let row = get_team_state(self.cx.state, self.cx.team_id)
+            .await
+            .unwrap_or_default();
+        POLL_FIELDS
+            .iter()
+            .map(|k| (k.to_string(), s(&row, k)))
+            .collect()
+    }
+
+    async fn save_poll_fields(&self, fields: &[(&'static str, String)]) {
+        let attrs: Vec<(&str, AttributeValue)> =
+            fields.iter().map(|(k, v)| (*k, attr_s(v))).collect();
+        set_team_state(self.cx.state, self.cx.team_id, &attrs).await;
+    }
+
+    async fn page(&self, path: &str) -> Result<(u16, Value, Option<String>), String> {
+        self.cx
+            .gh
+            .get_status_link(path)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn apply(&mut self, advisories: &[Value]) -> (usize, usize) {
+        if advisories.is_empty() {
+            return (0, 0);
         }
-        for adv in &advisories {
-            for (repo, deps) in &lists {
+        if self.lists.is_none() {
+            let mut lists = vec![];
+            for repo in team_repos(self.cx.state, self.cx.team_id, self.cx.cfg).await {
+                if let Some((deps, _)) = load_deps(self.cx.state, self.cx.team_id, &repo).await {
+                    lists.push((repo, deps));
+                }
+            }
+            self.lists = Some(lists);
+        }
+        let lists = self.lists.as_deref().unwrap_or_default();
+        let mut obs = vec![];
+        for adv in advisories {
+            for (repo, deps) in lists {
                 obs.extend(sec::match_github_advisory(repo, adv, deps));
             }
             if adv["withdrawn_at"].is_string() {
                 if let Some(ghsa) = adv["ghsa_id"].as_str() {
-                    obs.extend(withdrawn_observations(findings, ghsa));
+                    obs.extend(withdrawn_observations(self.findings, ghsa));
                 }
             }
         }
-    }
-    let matched = obs.len();
-    let created = upsert(cx.state, cx.team_id, cx.cfg, findings, obs)
+        let matched = obs.len();
+        if obs.is_empty() {
+            return (0, 0);
+        }
+        let created = upsert(
+            self.cx.state,
+            self.cx.team_id,
+            self.cx.cfg,
+            self.findings,
+            obs,
+        )
         .await
         .created;
-    info!(
-        team_id = cx.team_id,
-        since,
-        read = advisories.len(),
-        matched,
-        created,
-        complete,
-        "security: advisory poll"
-    );
-    if complete {
-        set_team_state(
-            cx.state,
-            cx.team_id,
-            &[("advisory_polled_at", attr_s(&now.to_rfc3339()))],
-        )
-        .await;
+        (matched, created)
     }
-    created
+
+    fn out_of_time(&self) -> bool {
+        self.cx.out_of_time()
+    }
+}
+
+/// The backstop for the `security_advisory` webhook (which a quiet day, or
+/// an install the hosted relay doesn't forward global events to, never
+/// sees): GitHub's advisories updated since the last poll, matched against
+/// every repository's dependency list ([`run_advisory_poll`]).
+async fn poll_advisories(cx: &Ctx<'_>, findings: &mut Vec<(Finding, FindingState)>) -> usize {
+    let mut io = LiveAdvisoryPoll {
+        cx,
+        findings,
+        lists: None,
+    };
+    let r = run_advisory_poll(&mut io, Utc::now()).await;
+    let line = |r: &AdvisoryPollReport| {
+        format!(
+            "since={} pages={} read={} matched={} created={} caught_up={}",
+            r.since, r.pages, r.read, r.matched, r.created, r.caught_up
+        )
+    };
+    match &r.error {
+        Some(e) => {
+            warn!(team_id = cx.team_id, error = %e, poll = %line(&r), "security: advisory poll failed")
+        }
+        None => info!(team_id = cx.team_id, poll = %line(&r), "security: advisory poll"),
+    }
+    r.created
 }
 
 /// The scheduled sweep (on the review-reminder tick).
@@ -3707,5 +3866,326 @@ mod tests {
         );
         assert_eq!(deps[1].scope, Scope::Runtime);
         assert!(is_lockfile_or_manifest("go.sum") && !is_lockfile_or_manifest("src/a.ts"));
+    }
+}
+
+#[cfg(test)]
+mod advisory_poll_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    const PER_PAGE: usize = 100;
+
+    fn at(t: &str) -> chrono::DateTime<Utc> {
+        chrono::DateTime::parse_from_rfc3339(t)
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    /// GitHub's `/advisories?updated=>=X&sort=updated&direction=asc`: each
+    /// cursor is bound to the query's time (another time answers 422), and
+    /// requests can be made to fail.
+    struct FakeGitHub {
+        /// (index, updated_at), ascending.
+        advisories: Vec<(usize, chrono::DateTime<Utc>)>,
+        row: Mutex<HashMap<String, String>>,
+        /// Every path asked for, and the index of each advisory read.
+        paths: Mutex<Vec<String>>,
+        read: Mutex<Vec<usize>>,
+        /// This run's requests, and the one that fails (1-based).
+        requests: Mutex<usize>,
+        fail_at: Option<usize>,
+        /// Requests after which the sweep's time is up.
+        time_for: Option<usize>,
+    }
+
+    impl FakeGitHub {
+        fn new(advisories: Vec<(usize, chrono::DateTime<Utc>)>) -> Self {
+            Self {
+                advisories,
+                row: Mutex::new(HashMap::new()),
+                paths: Mutex::new(vec![]),
+                read: Mutex::new(vec![]),
+                requests: Mutex::new(0),
+                fail_at: None,
+                time_for: None,
+            }
+        }
+
+        /// A new run: the row is kept, the run's counters reset.
+        fn next_run(&mut self, time_for: Option<usize>, fail_at: Option<usize>) {
+            *self.requests.lock().unwrap() = 0;
+            self.paths.lock().unwrap().clear();
+            self.read.lock().unwrap().clear();
+            self.time_for = time_for;
+            self.fail_at = fail_at;
+        }
+
+        fn field(&self, k: &str) -> String {
+            self.row.lock().unwrap().get(k).cloned().unwrap_or_default()
+        }
+
+        fn read(&self) -> Vec<usize> {
+            self.read.lock().unwrap().clone()
+        }
+    }
+
+    fn query(path: &str) -> (String, Option<String>) {
+        let q = path.split_once('?').unwrap().1;
+        let mut since = String::new();
+        let mut after = None;
+        for kv in q.split('&') {
+            let (k, v) = kv.split_once('=').unwrap();
+            let v = urlencoding::decode(v).unwrap().into_owned();
+            match k {
+                "updated" => since = v.trim_start_matches(">=").to_string(),
+                "after" => after = Some(v),
+                _ => {}
+            }
+        }
+        (since, after)
+    }
+
+    #[async_trait::async_trait]
+    impl AdvisoryPollIo for FakeGitHub {
+        async fn poll_fields(&self) -> HashMap<String, String> {
+            self.row.lock().unwrap().clone()
+        }
+
+        async fn save_poll_fields(&self, fields: &[(&'static str, String)]) {
+            let mut row = self.row.lock().unwrap();
+            for (k, v) in fields {
+                row.insert(k.to_string(), v.clone());
+            }
+        }
+
+        async fn page(&self, path: &str) -> Result<(u16, Value, Option<String>), String> {
+            self.paths.lock().unwrap().push(path.to_string());
+            let n = {
+                let mut r = self.requests.lock().unwrap();
+                *r += 1;
+                *r
+            };
+            if self.fail_at == Some(n) {
+                return Ok((502, json!({ "message": "Server Error" }), None));
+            }
+            let (since, after) = query(path);
+            let from = at(&since);
+            let matching: Vec<&(usize, chrono::DateTime<Utc>)> =
+                self.advisories.iter().filter(|(_, t)| *t >= from).collect();
+            let offset = match after {
+                None => 0,
+                Some(c) => {
+                    let (o, bound) = c.split_once('@').unwrap();
+                    if bound != since {
+                        return Ok((422, json!({ "message": "Invalid cursor" }), None));
+                    }
+                    o.parse::<usize>().unwrap()
+                }
+            };
+            let page: Vec<&&(usize, chrono::DateTime<Utc>)> =
+                matching.iter().skip(offset).take(PER_PAGE).collect();
+            self.read
+                .lock()
+                .unwrap()
+                .extend(page.iter().map(|(i, _)| *i));
+            let body: Vec<Value> = page
+                .iter()
+                .map(|(i, t)| json!({ "ghsa_id": format!("GHSA-{i}"), "updated_at": poll_t(t) }))
+                .collect();
+            let next = offset + PER_PAGE;
+            let link = (next < matching.len()).then(|| {
+                format!(
+                    "<https://api.github.com/advisories?per_page=100&after={}>; rel=\"next\"",
+                    urlencoding::encode(&format!("{next}@{since}"))
+                )
+            });
+            Ok((200, Value::Array(body), link))
+        }
+
+        async fn apply(&mut self, advisories: &[Value]) -> (usize, usize) {
+            (advisories.len(), 0)
+        }
+
+        fn out_of_time(&self) -> bool {
+            self.time_for
+                .is_some_and(|n| *self.requests.lock().unwrap() >= n)
+        }
+    }
+
+    fn poll_t(t: &chrono::DateTime<Utc>) -> String {
+        t.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+    }
+
+    /// `n` advisories updated over the last day, one every 30 seconds.
+    fn spread(n: usize, now: chrono::DateTime<Utc>) -> Vec<(usize, chrono::DateTime<Utc>)> {
+        let first = now - Duration::hours(23);
+        (0..n)
+            .map(|i| (i, first + Duration::seconds(30 * i as i64)))
+            .collect()
+    }
+
+    const NOW: &str = "2026-11-11T06:00:00Z";
+
+    /// A team whose last full poll was a day ago: a caught-up run (10 pages).
+    fn caught_up_a_day_ago(gh: &FakeGitHub) {
+        gh.row.lock().unwrap().insert(
+            "advisory_polled_at".into(),
+            (at(NOW) - Duration::hours(23) - Duration::minutes(5)).to_rfc3339(),
+        );
+    }
+
+    #[tokio::test]
+    async fn a_busy_day_is_read_across_runs_without_starting_over() {
+        let now = at(NOW);
+        let mut gh = FakeGitHub::new(spread(25 * PER_PAGE, now));
+        caught_up_a_day_ago(&gh);
+
+        // Run 1: caught up last time, so 10 pages; the checkpoint is saved.
+        gh.next_run(None, None);
+        let r1 = run_advisory_poll(&mut gh, now).await;
+        assert_eq!((r1.pages, r1.read), (10, 1000));
+        assert!(!r1.caught_up && r1.error.is_none());
+        assert_eq!(
+            gh.field("advisory_poll_from"),
+            poll_t(&gh.advisories[999].1)
+        );
+        assert_eq!(gh.field("advisory_poll_caught_up"), "false");
+        assert_eq!(
+            gh.field("advisory_polled_at"),
+            (now - Duration::hours(23) - Duration::minutes(5)).to_rfc3339()
+        );
+        assert_eq!(gh.field("advisory_poll_run_at"), now.to_rfc3339());
+
+        // Run 2 (the sweep's time is up after 10 requests): it goes on from
+        // the last advisory read, never from page 1 again.
+        gh.next_run(Some(10), None);
+        let r2 = run_advisory_poll(&mut gh, now + Duration::hours(1)).await;
+        let read = gh.read();
+        assert_eq!(read.first(), Some(&999), "starts at the checkpoint");
+        assert!(read.iter().all(|i| *i >= 999), "page 1 isn't read again");
+        assert_eq!((r2.pages, r2.read), (10, 1000));
+        assert!(!r2.caught_up);
+        assert_eq!(
+            gh.field("advisory_poll_from"),
+            poll_t(&gh.advisories[1998].1)
+        );
+
+        // Run 3: behind, so up to 30 pages; it reaches the end.
+        gh.next_run(None, None);
+        let r3 = run_advisory_poll(&mut gh, now + Duration::hours(2)).await;
+        assert_eq!(gh.read().first(), Some(&1998));
+        assert_eq!(gh.read().last(), Some(&2499));
+        assert!(r3.caught_up && r3.error.is_none());
+        assert_eq!(gh.field("advisory_poll_caught_up"), "true");
+        assert_eq!(
+            gh.field("advisory_polled_at"),
+            (now + Duration::hours(2)).to_rfc3339()
+        );
+        assert_eq!(gh.field("advisory_poll_from"), "");
+        assert_eq!(gh.field("advisory_poll_after"), "");
+
+        // Run 4: caught up, from the last full poll (with the overlap).
+        gh.next_run(None, None);
+        let r4 = run_advisory_poll(&mut gh, now + Duration::hours(3)).await;
+        assert_eq!(r4.since, "2026-11-11T07:50:00Z");
+        assert!(r4.caught_up);
+    }
+
+    #[tokio::test]
+    async fn a_run_that_is_behind_reads_up_to_30_pages() {
+        let now = at(NOW);
+        let mut gh = FakeGitHub::new(spread(45 * PER_PAGE, now));
+        // Never reached the end.
+        gh.next_run(None, None);
+        let r = run_advisory_poll(&mut gh, now).await;
+        assert_eq!(r.pages, sec::ADVISORY_POLL_PAGES_BEHIND);
+        assert!(!r.caught_up);
+        let r = run_advisory_poll(&mut gh, now).await;
+        assert!(r.caught_up, "{r:?}");
+    }
+
+    #[tokio::test]
+    async fn a_block_of_one_updated_at_across_pages_does_not_loop() {
+        let now = at(NOW);
+        let t0 = now - Duration::hours(20);
+        // 50 spread out, 2,000 (20 pages) updated in the same second, 450 more.
+        let mut advs = vec![];
+        for i in 0..2500 {
+            let t = match i {
+                0..=49 => t0 - Duration::minutes(60 - i as i64),
+                50..=2049 => t0,
+                _ => t0 + Duration::minutes(i as i64 - 2049),
+            };
+            advs.push((i, t));
+        }
+        let mut gh = FakeGitHub::new(advs);
+        caught_up_a_day_ago(&gh);
+        let mut seen = HashSet::new();
+        let mut runs = 0;
+        loop {
+            runs += 1;
+            assert!(runs <= 6, "the poll never got past the block");
+            gh.next_run(Some(10), None);
+            let r = run_advisory_poll(&mut gh, now).await;
+            assert!(r.error.is_none(), "{r:?}");
+            seen.extend(gh.read());
+            if r.caught_up {
+                break;
+            }
+        }
+        assert_eq!(seen.len(), 2500, "every advisory read");
+        assert_eq!(runs, 4);
+    }
+
+    #[tokio::test]
+    async fn a_failed_page_keeps_the_checkpoint() {
+        let now = at(NOW);
+        let mut gh = FakeGitHub::new(spread(25 * PER_PAGE, now));
+        caught_up_a_day_ago(&gh);
+        gh.next_run(None, None);
+        run_advisory_poll(&mut gh, now).await;
+        let checkpoint = gh.field("advisory_poll_from");
+        assert_eq!(checkpoint, poll_t(&gh.advisories[999].1));
+
+        // Run 2: two pages, then GitHub fails.
+        gh.next_run(None, Some(3));
+        let r = run_advisory_poll(&mut gh, now + Duration::hours(1)).await;
+        assert!(!r.caught_up);
+        assert_eq!(
+            r.error.as_deref(),
+            Some("GitHub answered 502: Server Error")
+        );
+        assert_eq!(
+            gh.field("advisory_poll_error"),
+            "GitHub answered 502: Server Error"
+        );
+        assert_eq!(gh.field("advisory_poll_caught_up"), "false");
+        // The two pages read before the failure count.
+        let kept = gh.field("advisory_poll_from");
+        assert_eq!(kept, poll_t(&gh.advisories[1198].1));
+
+        // Run 3 starts there, and clears the error once it reaches the end.
+        gh.next_run(None, None);
+        let r = run_advisory_poll(&mut gh, now + Duration::hours(2)).await;
+        assert_eq!(gh.read().first(), Some(&1198));
+        assert!(r.caught_up);
+        assert_eq!(gh.field("advisory_poll_error"), "");
+    }
+
+    #[tokio::test]
+    async fn a_cursor_github_no_longer_takes_starts_that_time_again() {
+        let now = at(NOW);
+        let mut gh = FakeGitHub::new(spread(3 * PER_PAGE, now));
+        let from = poll_t(&gh.advisories[100].1);
+        gh.save_poll_fields(&[
+            ("advisory_poll_from", from.clone()),
+            ("advisory_poll_after", "100@another-time".into()),
+        ])
+        .await;
+        gh.next_run(None, None);
+        let r = run_advisory_poll(&mut gh, now).await;
+        assert!(r.caught_up && r.error.is_none(), "{r:?}");
+        assert_eq!(gh.read().first(), Some(&100));
     }
 }
