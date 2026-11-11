@@ -1,13 +1,13 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
   Lets a self-hosted Coderhelm install copy the knowledge bases you choose into
-  an S3 folder in this account, for an Amazon Bedrock knowledge base to read.
-  Creates the bucket (encrypted, private, TLS only) and lets only the install's
-  own worker and gateway write to it. Optionally adds an S3 data source to an
-  existing Bedrock knowledge base (or names one it already has), lets that
-  knowledge base's service role read the folder, and syncs the data source
-  every 15 minutes so added, changed and deleted documents reach Bedrock.
-  Deploy it in the install's account and region.
+  an Amazon Bedrock knowledge base in this account. Creates the bucket only the
+  install's own worker and gateway write (encrypted, private, TLS only) and, by
+  default, a Bedrock knowledge base that reads it: S3 Vectors storage, Amazon
+  Titan Text Embeddings V2, an S3 data source and a schedule that syncs it every
+  15 minutes. Or adds the data source to a knowledge base you already have. When
+  launched from Coderhelm, it tells the install what it made, so nothing is
+  copied by hand. Deploy it in the install's account and region.
 
 Parameters:
   InstallPrefix:
@@ -24,12 +24,21 @@ Parameters:
     Description: The folder Coderhelm writes to inside the bucket. Ends with a slash.
     AllowedPattern: "^([A-Za-z0-9._-]+/)+$"
 
+  CreateKnowledgeBase:
+    Type: String
+    Default: "yes"
+    AllowedValues: ["yes", "no"]
+    Description: >
+      yes: make a Bedrock knowledge base for the copies (S3 Vectors storage,
+      Titan Text Embeddings V2). Ignored when KnowledgeBaseId names one you
+      already have. no, without KnowledgeBaseId: only the bucket.
+
   KnowledgeBaseId:
     Type: String
     Default: ""
     Description: >
       Optional: an existing Bedrock knowledge base (its 10 character ID) to add
-      an S3 data source to, reading the folder. Empty: no data source is made.
+      an S3 data source to, reading the folder, instead of making one.
     AllowedPattern: "^(|[A-Z0-9]{10})$"
 
   ExistingDataSourceId:
@@ -48,18 +57,52 @@ Parameters:
       (on its page in the Bedrock console). It is given read access to the folder.
     AllowedPattern: "^(|[\\w+=,.@-]{1,64})$"
 
+  InstallAccount:
+    Type: String
+    Default: ""
+    Description: >
+      Filled in by Coderhelm's Set up in AWS button: the install's AWS account.
+      The stack stops at once in any other account.
+    AllowedPattern: "^(|[0-9]{12})$"
+
+  CoderHelmUrl:
+    Type: String
+    Default: ""
+    Description: >
+      Filled in by Coderhelm's Set up in AWS button: where the stack reports
+      its progress and what it made. Empty: it reports nothing, and you enter
+      the outputs in Coderhelm yourself.
+    AllowedPattern: "^(|https://[A-Za-z0-9.:/_-]{1,300})$"
+
+  SetupToken:
+    Type: String
+    Default: ""
+    NoEcho: true
+    Description: >
+      Filled in by Coderhelm's Set up in AWS button: a one-time token that
+      works for one setup of one team, for two hours.
+    AllowedPattern: "^(|chbs_[A-Za-z0-9_-]{40,64})$"
+
 Conditions:
-  SyncsDataSource: !Not [!Equals [!Ref KnowledgeBaseId, ""]]
+  UsesExistingKnowledgeBase: !Not [!Equals [!Ref KnowledgeBaseId, ""]]
+  CreatesKnowledgeBase: !And
+    - !Equals [!Ref KnowledgeBaseId, ""]
+    - !Equals [!Ref CreateKnowledgeBase, "yes"]
+  SyncsDataSource: !Or
+    - !Condition UsesExistingKnowledgeBase
+    - !Condition CreatesKnowledgeBase
   CreatesDataSource: !And
     - !Condition SyncsDataSource
     - !Equals [!Ref ExistingDataSourceId, ""]
   GrantsKnowledgeBaseRole: !And
-    - !Condition SyncsDataSource
+    - !Condition UsesExistingKnowledgeBase
     - !Not [!Equals [!Ref KnowledgeBaseRoleName, ""]]
 
 Resources:
   ExportBucket:
     Type: AWS::S3::Bucket
+    # Made only once the account and the token are known to be right.
+    DependsOn: ReportStarted
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Properties:
@@ -143,8 +186,109 @@ Resources:
               StringLike:
                 s3:prefix: !Sub "${Prefix}*"
 
-  # The knowledge base's service role reads the folder (Bedrock's S3 data
-  # source needs ListBucket on the bucket and GetObject on its objects).
+  # ── The knowledge base, unless one you have is named ─────────────────
+  # Vectors are kept in S3 Vectors, the cheapest store Bedrock knowledge bases
+  # use: you pay for what is stored and searched, nothing while idle. Titan
+  # Text Embeddings V2 at 1,024 dimensions turns the text into vectors.
+  VectorBucket:
+    Type: AWS::S3Vectors::VectorBucket
+    Condition: CreatesKnowledgeBase
+    Properties:
+      VectorBucketName: !Sub "${InstallPrefix}-kb-vectors-${AWS::AccountId}"
+
+  VectorIndex:
+    Type: AWS::S3Vectors::Index
+    Condition: CreatesKnowledgeBase
+    Properties:
+      VectorBucketArn: !GetAtt VectorBucket.VectorBucketArn
+      IndexName: coderhelm
+      DataType: float32
+      Dimension: 1024
+      DistanceMetric: cosine
+      # Bedrock keeps each chunk's text and its own metadata in these two
+      # keys, too large to filter on (Bedrock's S3 Vectors setup guide).
+      MetadataConfiguration:
+        NonFilterableMetadataKeys:
+          - AMAZON_BEDROCK_TEXT
+          - AMAZON_BEDROCK_METADATA
+
+  # What Bedrock acts as for this knowledge base: reads the folder, embeds
+  # with the one model, and writes and searches the one index.
+  KnowledgeBaseRole:
+    Type: AWS::IAM::Role
+    Condition: CreatesKnowledgeBase
+    Properties:
+      Description: Lets the Coderhelm knowledge base read the folder, embed it and keep its vectors.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: "sts:AssumeRole"
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:knowledge-base/*"
+      Policies:
+        - PolicyName: ReadEmbedAndStore
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: Embed
+                Effect: Allow
+                Action:
+                  - "bedrock:InvokeModel"
+                Resource: !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v2:0"
+              - Sid: ListTheFolder
+                Effect: Allow
+                Action:
+                  - "s3:ListBucket"
+                Resource: !GetAtt ExportBucket.Arn
+                Condition:
+                  StringEquals:
+                    aws:ResourceAccount: !Ref AWS::AccountId
+              - Sid: ReadTheFolder
+                Effect: Allow
+                Action:
+                  - "s3:GetObject"
+                Resource: !Sub "${ExportBucket.Arn}/${Prefix}*"
+                Condition:
+                  StringEquals:
+                    aws:ResourceAccount: !Ref AWS::AccountId
+              - Sid: KeepTheVectors
+                Effect: Allow
+                Action:
+                  - "s3vectors:PutVectors"
+                  - "s3vectors:GetVectors"
+                  - "s3vectors:DeleteVectors"
+                  - "s3vectors:QueryVectors"
+                  - "s3vectors:GetIndex"
+                Resource: !GetAtt VectorIndex.IndexArn
+
+  KnowledgeBase:
+    Type: AWS::Bedrock::KnowledgeBase
+    Condition: CreatesKnowledgeBase
+    Properties:
+      Name: !Sub "${InstallPrefix}-coderhelm"
+      Description: Coderhelm knowledge bases, copied by the install. Everyone with Bedrock access to it reads all of it.
+      RoleArn: !GetAtt KnowledgeBaseRole.Arn
+      KnowledgeBaseConfiguration:
+        Type: VECTOR
+        VectorKnowledgeBaseConfiguration:
+          EmbeddingModelArn: !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v2:0"
+          EmbeddingModelConfiguration:
+            BedrockEmbeddingModelConfiguration:
+              Dimensions: 1024
+              EmbeddingDataType: FLOAT32
+      StorageConfiguration:
+        Type: S3_VECTORS
+        S3VectorsConfiguration:
+          IndexArn: !GetAtt VectorIndex.IndexArn
+
+  # An existing knowledge base's service role reads the folder (Bedrock's S3
+  # data source needs ListBucket on the bucket and GetObject on its objects).
   KnowledgeBaseReadsTheFolder:
     Type: AWS::IAM::RolePolicy
     Condition: GrantsKnowledgeBaseRole
@@ -174,9 +318,9 @@ Resources:
     Condition: CreatesDataSource
     DependsOn: ExportBucketPolicy
     Properties:
-      KnowledgeBaseId: !Ref KnowledgeBaseId
+      KnowledgeBaseId: !If [CreatesKnowledgeBase, !GetAtt KnowledgeBase.KnowledgeBaseId, !Ref KnowledgeBaseId]
       Name: !Sub "${InstallPrefix}-coderhelm"
-      Description: Coderhelm knowledge bases, copied by the install. Synced by Coderhelm after each change.
+      Description: Coderhelm knowledge bases, copied by the install. Synced every 15 minutes.
       # A document removed from the folder is removed from the vector store.
       DataDeletionPolicy: DELETE
       DataSourceConfiguration:
@@ -212,7 +356,9 @@ Resources:
             Statement:
               - Effect: Allow
                 Action: "bedrock:StartIngestionJob"
-                Resource: !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:knowledge-base/${KnowledgeBaseId}"
+                Resource: !Sub
+                  - "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:knowledge-base/${Kb}"
+                  - Kb: !If [CreatesKnowledgeBase, !GetAtt KnowledgeBase.KnowledgeBaseId, !Ref KnowledgeBaseId]
 
   SyncSchedule:
     Type: AWS::Scheduler::Schedule
@@ -226,14 +372,159 @@ Resources:
         Arn: "arn:aws:scheduler:::aws-sdk:bedrockagent:startIngestionJob"
         RoleArn: !GetAtt SyncRole.Arn
         Input: !Sub
-          - '{"KnowledgeBaseId":"${KnowledgeBaseId}","DataSourceId":"${DataSourceId}","Description":"Coderhelm: scheduled sync"}'
-          - DataSourceId: !If [CreatesDataSource, !GetAtt ExportDataSource.DataSourceId, !Ref ExistingDataSourceId]
+          - '{"KnowledgeBaseId":"${Kb}","DataSourceId":"${DataSourceId}","Description":"Coderhelm: scheduled sync"}'
+          - Kb: !If [CreatesKnowledgeBase, !GetAtt KnowledgeBase.KnowledgeBaseId, !Ref KnowledgeBaseId]
+            DataSourceId: !If [CreatesDataSource, !GetAtt ExportDataSource.DataSourceId, !Ref ExistingDataSourceId]
         RetryPolicy:
           MaximumRetryAttempts: 0
 
+  # ── Telling Coderhelm ────────────────────────────────────────────────
+  # Launched from Coderhelm's Set up in AWS button, the stack reports each
+  # step to the install with the one-time SetupToken, and what it made at
+  # the end, so nobody copies an output by hand. The install accepts a
+  # report only with a live token of the team that asked, from a stack in
+  # its own account, and checks every output against what it expects. A
+  # stack launched without the token reports nothing. If the install can't
+  # be reached or refuses, the stack stops and says why.
+  ReporterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Reports the Coderhelm export stack's progress to the install.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: ReadThisStackAndLog
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Only this stack: on a rollback, why it failed.
+              - Effect: Allow
+                Action:
+                  - "cloudformation:DescribeStacks"
+                  - "cloudformation:DescribeStackEvents"
+                Resource: !Ref AWS::StackId
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*"
+
+  Reporter:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Reports the Coderhelm export stack's progress to the install, with the one-time token.
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 60
+      MemorySize: 128
+      Role: !GetAtt ReporterRole.Arn
+      Code:
+        ZipFile: |
+          import json, urllib.request, urllib.error, boto3
+          def call(url, body, method="POST", ct="application/json"):
+              r = urllib.request.Request(url, data=json.dumps(body).encode(), method=method, headers={"Content-Type": ct})
+              with urllib.request.urlopen(r, timeout=25) as a:
+                  return a.read()
+          def respond(ev, ok, reason=""):
+              call(ev["ResponseURL"], {"Status": "SUCCESS" if ok else "FAILED", "Reason": (reason or "See the stack's events.")[:500],
+                  "PhysicalResourceId": ev.get("PhysicalResourceId") or ev["LogicalResourceId"], "StackId": ev["StackId"],
+                  "RequestId": ev["RequestId"], "LogicalResourceId": ev["LogicalResourceId"], "Data": {}}, "PUT", "")
+          def why(stack):
+              out = ""
+              for e in boto3.client("cloudformation").describe_stack_events(StackName=stack)["StackEvents"]:
+                  r = e.get("ResourceStatusReason") or ""
+                  if e.get("ResourceStatus") == "CREATE_FAILED" and "cancelled" not in r.lower():
+                      out = e["LogicalResourceId"] + ": " + r
+              return out[:900]
+          def report(p, ev, step, **more):
+              body = {"token": p["Token"], "step": step, "stack_id": ev["StackId"]}
+              body.update(more)
+              try:
+                  call(p["Url"], body)
+                  return ""
+              except urllib.error.HTTPError as e:
+                  try:
+                      m = json.loads(e.read()).get("error", "")
+                  except Exception:
+                      m = ""
+                  return "Coderhelm refused the report: " + (m or str(e.code))
+              except Exception as e:
+                  return "The stack couldn't reach Coderhelm at " + p["Url"] + " (" + str(e) + ")."
+          def handler(ev, ctx):
+              p, kind = ev["ResourceProperties"], ev["RequestType"]
+              try:
+                  live = bool(p.get("Url") and p.get("Token"))
+                  if kind == "Create":
+                      acct = ev["StackId"].split(":")[4]
+                      if p.get("Account") and p["Account"] != acct:
+                          return respond(ev, False, "Create this stack in AWS account " + p["Account"] + ", the Coderhelm install's own, not " + acct + ".")
+                      err = report(p, ev, p["Step"], outputs=p.get("Outputs", {})) if live else ""
+                      return respond(ev, not err, err)
+                  if kind == "Delete" and live and p["Step"] == "started":
+                      cf = boto3.client("cloudformation")
+                      if cf.describe_stacks(StackName=ev["StackId"])["Stacks"][0]["StackStatus"].startswith("ROLLBACK"):
+                          report(p, ev, "failed", reason=why(ev["StackId"]))
+                  respond(ev, True)
+              except Exception as e:
+                  respond(ev, kind != "Create", str(e))
+
+  # First: the account is right and the token is live, before anything is made.
+  ReportStarted:
+    Type: Custom::CoderhelmReport
+    Properties:
+      ServiceToken: !GetAtt Reporter.Arn
+      Step: started
+      Account: !Ref InstallAccount
+      Url: !Ref CoderHelmUrl
+      Token: !Ref SetupToken
+
+  ReportBucket:
+    Type: Custom::CoderhelmReport
+    DependsOn: ExportBucketPolicy
+    Properties:
+      ServiceToken: !GetAtt Reporter.Arn
+      Step: bucket
+      Url: !Ref CoderHelmUrl
+      Token: !Ref SetupToken
+
+  # Last: everything is made; what Coderhelm needs to start copying.
+  ReportReady:
+    Type: Custom::CoderhelmReport
+    DependsOn: [ReportBucket]
+    Properties:
+      ServiceToken: !GetAtt Reporter.Arn
+      Step: ready
+      Url: !Ref CoderHelmUrl
+      Token: !Ref SetupToken
+      # Waits for the schedule, so the knowledge base is synced from now on.
+      Scheduled: !If [SyncsDataSource, !Ref SyncSchedule, "none"]
+      Outputs:
+        BucketName: !Ref ExportBucket
+        Prefix: !Ref Prefix
+        Region: !Ref AWS::Region
+        KnowledgeBaseArn: !If
+          - SyncsDataSource
+          - !Sub
+            - "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:knowledge-base/${Kb}"
+            - Kb: !If [CreatesKnowledgeBase, !GetAtt KnowledgeBase.KnowledgeBaseId, !Ref KnowledgeBaseId]
+          - ""
+        DataSourceId: !If
+          - SyncsDataSource
+          - !If [CreatesDataSource, !GetAtt ExportDataSource.DataSourceId, !Ref ExistingDataSourceId]
+          - ""
+
 Outputs:
   BucketName:
-    Description: Paste into Coderhelm, Knowledge, Use in Bedrock, S3 folder.
+    Description: The bucket Coderhelm copies into.
     Value: !Ref ExportBucket
   Prefix:
     Description: The folder inside the bucket.
@@ -244,5 +535,11 @@ Outputs:
     Value: !If [CreatesDataSource, !GetAtt ExportDataSource.DataSourceId, !Ref ExistingDataSourceId]
   KnowledgeBaseArn:
     Condition: SyncsDataSource
-    Description: Paste into Coderhelm with the data source ID.
-    Value: !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:knowledge-base/${KnowledgeBaseId}"
+    Description: The knowledge base that reads the folder.
+    Value: !Sub
+      - "arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:knowledge-base/${Kb}"
+      - Kb: !If [CreatesKnowledgeBase, !GetAtt KnowledgeBase.KnowledgeBaseId, !Ref KnowledgeBaseId]
+  VectorBucketName:
+    Condition: CreatesKnowledgeBase
+    Description: The S3 vector bucket the new knowledge base keeps its vectors in.
+    Value: !Ref VectorBucket

@@ -442,7 +442,7 @@ jobs:
           # (.github/scripts/publish-once.sh: one conditional PutObject per
           # file, in parallel, the parent coderhelm.json last).
           L="$RUNNER_TEMP/publish-list" && : > "$L"
-          for f in coderhelm-log-reader.yaml coderhelm-log-reader-update.yaml; do printf '%s\t%s\t%s\n' "$d/$f" "launch/$TAG/$f" text/yaml >> "$L"; done
+          for f in coderhelm-log-reader.yaml coderhelm-log-reader-update.yaml coderhelm-bedrock-export.yaml; do printf '%s\t%s\t%s\n' "$d/$f" "launch/$TAG/$f" text/yaml >> "$L"; done
           # The native files (infra/lib/native), each checked against the
           # sha256 the signed coderhelm.json pins, then the parent last.
           mkdir -p "$RUNNER_TEMP/native" && tar -xzf "$d/coderhelm-native.tar.gz" -C "$RUNNER_TEMP/native"

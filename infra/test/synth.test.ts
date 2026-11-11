@@ -414,12 +414,15 @@ test("AWS connections: a self-hosted install's roles trust its own account, from
 
 test("AWS connections: the role and update templates are released with each version", () => {
   const wf = fs.readFileSync(path.join(INFRA, "..", ".github", "workflows", "release.yml"), "utf8");
-  for (const f of ["coderhelm-log-reader.yaml", "coderhelm-log-reader-update.yaml"]) {
+  for (const f of ["coderhelm-log-reader.yaml", "coderhelm-log-reader-update.yaml", "coderhelm-bedrock-export.yaml"]) {
     assert.ok(wf.includes(`cp infra/cfn/${f} dist/${f}`), `${f} is built into the release`);
     assert.ok(wf.includes(`dist/${f}`) && wf.includes(f + " "), `${f} is in SHA256SUMS`);
   }
   // Published write-once under launch/<tag>/, which the publisher role may write.
-  assert.ok(wf.includes(`for f in coderhelm-log-reader.yaml coderhelm-log-reader-update.yaml; do printf '%s\\t%s\\t%s\\n' "dist/$f" "launch/$TAG/$f" text/yaml >> "$L"; done`));
+  assert.ok(wf.includes(`for f in coderhelm-log-reader.yaml coderhelm-log-reader-update.yaml coderhelm-bedrock-export.yaml; do printf '%s\\t%s\\t%s\\n' "dist/$f" "launch/$TAG/$f" text/yaml >> "$L"; done`));
+  // The auto release publishes the same files.
+  const auto = fs.readFileSync(path.join(INFRA, "..", ".github", "workflows", "auto-release.yml"), "utf8");
+  assert.ok(auto.includes(`for f in coderhelm-log-reader.yaml coderhelm-log-reader-update.yaml coderhelm-bedrock-export.yaml; do printf '%s\\t%s\\t%s\\n' "$d/$f" "launch/$TAG/$f" text/yaml >> "$L"; done`));
   assert.ok(wf.includes(`printf '%s\\t%s\\t%s\\n' dist/coderhelm.json "launch/$TAG/coderhelm.json" application/json >> "$L"\n          bash .github/scripts/publish-once.sh "$L"`), "the native parent template is published, last");
   const publish = fs.readFileSync(path.join(INFRA, "..", ".github", "scripts", "publish-once.sh"), "utf8");
   assert.ok(publish.includes("--if-none-match '*'"), "never replaced");

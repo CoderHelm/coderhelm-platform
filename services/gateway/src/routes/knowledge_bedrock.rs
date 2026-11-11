@@ -376,6 +376,11 @@ pub async fn get_sync(
         "self_hosted": self_hosted(),
         "warning": bs::ACCESS_WARNING,
         "role_update": role_update(&state, &claims.team_id, &cfg).await,
+        "setup": setup_view(&state, &claims.team_id).await,
+        "one_click": match launch_facts() {
+            Ok(f) => json!({ "available": true, "region": f.region, "account": f.account }),
+            Err(m) => json!({ "available": false, "reason": m }),
+        },
     })))
 }
 
@@ -408,8 +413,17 @@ pub fn check_sync(
         return Err(format!("Confirm the warning first: {}", bs::ACCESS_WARNING));
     }
     let target = bs::check_target(&body.target, self_hosted)?;
+    Ok((target, check_bases(&body.bases, team_bases)?))
+}
+
+/// The bases chosen to copy: the team's own, kept here, each once, at
+/// least one.
+pub fn check_bases(
+    chosen: &[String],
+    team_bases: &[common::knowledge::Base],
+) -> Result<Vec<String>, String> {
     let mut bases = Vec::new();
-    for id in &body.bases {
+    for id in chosen {
         let Some(b) = team_bases.iter().find(|b| &b.id == id) else {
             return Err("Pick knowledge bases of this team.".into());
         };
@@ -426,7 +440,7 @@ pub fn check_sync(
     if bases.is_empty() {
         return Err("Pick at least one knowledge base to copy.".into());
     }
-    Ok((target, bases))
+    Ok(bases)
 }
 
 /// The team's name for each document's metadata.
@@ -607,6 +621,326 @@ pub async fn run_sync(
         .await
         .map_err(|e| internal("bedrock sync start", e))?;
     Ok(Json(json!({ "status": "queued" })))
+}
+
+// ── "Set up in AWS" (crate::bedrock_setup) ──────────────────────────
+
+/// What a setup link needs from the install, or why it can't make one.
+pub struct LaunchFacts {
+    pub template_url: String,
+    pub region: String,
+    pub prefix: String,
+    pub account: String,
+    pub report_url: String,
+}
+
+/// The install's facts for a setup link, or what is missing in plain words.
+pub fn launch_facts() -> Result<LaunchFacts, String> {
+    let own = common::live::aws::install_read_role()
+        .ok_or("Setting up in AWS with one button is for self-hosted installs.")?;
+    let account = own.split(':').nth(4).unwrap_or("").to_string();
+    let prefix = std::env::var("RESOURCE_PREFIX")
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let region = std::env::var("AWS_REGION").unwrap_or_default();
+    let template_url =
+        crate::bedrock_setup::template_url(&common::public_urls::log_reader_template_url())
+            .ok_or("This install's release doesn't publish the export stack's template.")?;
+    let api = common::public_urls::api_url_from_env().trim_end_matches('/');
+    if account.len() != 12 || prefix.is_empty() || region.is_empty() || !api.starts_with("https://")
+    {
+        return Err(
+            "This install doesn't know its own account, prefix, region or address yet.".into(),
+        );
+    }
+    Ok(LaunchFacts {
+        template_url,
+        region,
+        prefix,
+        account,
+        report_url: format!("{api}{}", crate::bedrock_setup::REPORT_PATH),
+    })
+}
+
+/// A knowledge base's service role's name (`bedrock:GetKnowledgeBase` with
+/// the install's own role), or `None` when it can't be read.
+async fn kb_role_name(region: &str, id: &str) -> Option<String> {
+    let s = common::live::aws::own_session(region)?;
+    let kb = bs::agent_client(&s, region)
+        .get_knowledge_base()
+        .knowledge_base_id(id)
+        .send()
+        .await
+        .ok()?;
+    let arn = kb.knowledge_base()?.role_arn().to_string();
+    arn.rsplit('/')
+        .next()
+        .map(str::to_string)
+        .filter(|r| !r.is_empty())
+}
+
+/// The team's current setup, as the page shows it.
+async fn setup_view(state: &AppState, team: &str) -> Value {
+    use crate::bedrock_setup::SetupStore;
+    let st = crate::bedrock_setup::store(state);
+    let now = chrono::Utc::now().timestamp();
+    match st.current(team).await {
+        Ok(h) if !h.is_empty() => match st.by_hash(&h).await {
+            Ok(Some(s)) if s.team_id == team => crate::bedrock_setup::view(&s, now),
+            _ => Value::Null,
+        },
+        _ => Value::Null,
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SetupBody {
+    #[serde(default)]
+    pub bases: Vec<String>,
+    #[serde(default)]
+    pub acknowledged: bool,
+    /// Make a new knowledge base (the default), or only the bucket.
+    #[serde(default = "yes")]
+    pub create_knowledge_base: bool,
+    /// An existing knowledge base to add the data source to instead.
+    #[serde(default)]
+    pub knowledge_base_id: String,
+    #[serde(default)]
+    pub knowledge_base_role_name: String,
+}
+
+fn yes() -> bool {
+    true
+}
+
+/// An existing knowledge base's id and role name, checked.
+pub fn check_existing(id: &str, role: &str) -> Result<Option<(String, String)>, String> {
+    let id = id.trim();
+    let role = role.trim();
+    if id.is_empty() {
+        return Ok(None);
+    }
+    if id.len() != 10
+        || !id
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+    {
+        return Err("Pick a knowledge base from the list.".into());
+    }
+    if role.len() > 64
+        || !role
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "+=,.@_-".contains(c))
+    {
+        return Err("That isn't an IAM role name.".into());
+    }
+    Ok(Some((id.to_string(), role.to_string())))
+}
+
+/// POST /api/knowledge/bedrock-sync/setup — "Set up in AWS": a one-time
+/// link that opens the export stack with everything filled in. Copying
+/// starts when the stack reports it is ready.
+pub async fn start_setup(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<SetupBody>,
+) -> Result<Json<Value>, ApiError> {
+    admin(&claims)?;
+    signed_in(&claims)?;
+    if !body.acknowledged {
+        return Err(fail(
+            StatusCode::BAD_REQUEST,
+            &format!("Confirm the warning first: {}", bs::ACCESS_WARNING),
+        ));
+    }
+    let team_bases = super::knowledge::store(&state)
+        .bases(&claims.team_id)
+        .await
+        .map_err(|e| internal("knowledge bases", e))?;
+    let bases =
+        check_bases(&body.bases, &team_bases).map_err(|m| fail(StatusCode::BAD_REQUEST, &m))?;
+    let existing = check_existing(&body.knowledge_base_id, &body.knowledge_base_role_name)
+        .map_err(|m| fail(StatusCode::BAD_REQUEST, &m))?;
+    let facts = launch_facts().map_err(|m| {
+        fail(
+            StatusCode::CONFLICT,
+            &format!("{m} Enter the stack's outputs yourself instead."),
+        )
+    })?;
+    // An existing knowledge base's service role, read with the install's
+    // own role when the admin didn't name it, so the stack can let it read
+    // the folder.
+    let existing = match existing {
+        Some((id, role)) if role.is_empty() => {
+            let role = kb_role_name(&facts.region, &id).await.unwrap_or_default();
+            Some((id, role))
+        }
+        e => e,
+    };
+    let cfg = bs::load(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        &claims.team_id,
+    )
+    .await
+    .map_err(|e| internal("bedrock sync", e))?
+    .unwrap_or_default();
+    if cfg.enabled && cfg.status.documents > 0 {
+        return Err(fail(
+            StatusCode::CONFLICT,
+            "Copying is on. Turn it off and wait for its copies to be removed before you set up a new knowledge base.",
+        ));
+    }
+    let (token, hash) = crate::bedrock_setup::generate();
+    let now = chrono::Utc::now();
+    let creates = existing.is_none() && body.create_knowledge_base;
+    let setup = crate::bedrock_setup::Setup {
+        team_id: claims.team_id.clone(),
+        token_hash: hash,
+        created_at: now_str(now),
+        created_by: claims.email.clone(),
+        expires_at: now.timestamp() + crate::bedrock_setup::TOKEN_TTL_SECS,
+        stack_name: format!("{}{}", facts.prefix, crate::bedrock_setup::STACK_SUFFIX),
+        region: facts.region.clone(),
+        bases: bases.clone(),
+        acknowledged_by: claims.email.clone(),
+        creates_knowledge_base: creates,
+        knowledge_base_id: existing.as_ref().map(|e| e.0.clone()).unwrap_or_default(),
+        state: crate::bedrock_setup::WAITING.into(),
+        updated_at: now_str(now),
+        ..Default::default()
+    };
+    let names: Vec<String> = team_bases
+        .iter()
+        .filter(|b| bases.contains(&b.id))
+        .map(|b| b.name.clone())
+        .collect();
+    roles::record(
+        &state,
+        &claims,
+        AuditEntry {
+            action: "bedrock_sync_setup",
+            role_id: "bedrock-sync",
+            role_name: "Copy to Bedrock",
+            detail: format!(
+                "Started a setup in AWS ({}) to copy {} once the stack reports it is ready. Confirmed that everyone with Bedrock access to it reads them.",
+                if creates { "a new knowledge base" } else if existing.is_some() { "an existing knowledge base" } else { "a bucket only" },
+                common::truncate_str(&names.join(", "), 400),
+            ),
+        },
+    )
+    .await?;
+    crate::bedrock_setup::start(&crate::bedrock_setup::store(&state), &setup)
+        .await
+        .map_err(|e| internal("bedrock setup", e))?;
+    let url = crate::bedrock_setup::launch_url(
+        &facts.template_url,
+        &facts.region,
+        &facts.prefix,
+        &facts.account,
+        &facts.report_url,
+        &token,
+        creates,
+        existing.as_ref().map(|(k, r)| (k.as_str(), r.as_str())),
+    );
+    info!(team_id = %claims.team_id, "Bedrock setup link made");
+    Ok(Json(json!({
+        "setup": crate::bedrock_setup::view(&setup, now.timestamp()),
+        "launch_url": url,
+    })))
+}
+
+/// DELETE /api/knowledge/bedrock-sync/setup — the link stops working.
+pub async fn cancel_setup(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<Value>, ApiError> {
+    use crate::bedrock_setup::SetupStore;
+    admin(&claims)?;
+    signed_in(&claims)?;
+    let st = crate::bedrock_setup::store(&state);
+    let h = st
+        .current(&claims.team_id)
+        .await
+        .map_err(|e| internal("bedrock setup", e))?;
+    if let Some(mut s) = st
+        .by_hash(&h)
+        .await
+        .map_err(|e| internal("bedrock setup", e))?
+    {
+        if !s.done() {
+            s.state = crate::bedrock_setup::REPLACED.into();
+            s.version += 1;
+            s.updated_at = now_str(chrono::Utc::now());
+            let _ = st
+                .save(&s)
+                .await
+                .map_err(|e| internal("bedrock setup", e))?;
+        }
+    }
+    st.set_current(&claims.team_id, "")
+        .await
+        .map_err(|e| internal("bedrock setup", e))?;
+    Ok(Json(json!({ "status": "cancelled" })))
+}
+
+/// POST /api/knowledge/bedrock-setup/report — the export stack's reporter,
+/// with the one-time token (no session: the token is the proof). On
+/// `ready`, copying starts with what the stack made.
+pub async fn report_setup(
+    State(state): State<Arc<AppState>>,
+    Json(r): Json<crate::bedrock_setup::Report>,
+) -> Result<Json<Value>, ApiError> {
+    let own = common::live::aws::install_read_role().unwrap_or_default();
+    let account = own.split(':').nth(4).unwrap_or("").to_string();
+    let prefix = std::env::var("RESOURCE_PREFIX")
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let now = chrono::Utc::now();
+    let st = crate::bedrock_setup::store(&state);
+    let (setup, target) = match crate::bedrock_setup::receive(
+        &st,
+        &r,
+        &account,
+        &prefix,
+        now.timestamp(),
+        &now_str(now),
+    )
+    .await
+    .map_err(|e| internal("bedrock setup", e))?
+    {
+        Ok(x) => x,
+        Err(refused) => {
+            warn!(step = %common::truncate_str(&r.step, 20), "Bedrock setup report refused");
+            return Err(fail(StatusCode::CONFLICT, &refused.message()));
+        }
+    };
+    info!(team_id = %setup.team_id, state = %setup.state, "Bedrock setup report");
+    if let Some(target) = target {
+        let table = &state.config.settings_table_name;
+        let mut cfg = bs::load(&state.dynamo, table, &setup.team_id)
+            .await
+            .map_err(|e| internal("bedrock sync", e))?
+            .unwrap_or_default();
+        let at = now_str(now);
+        cfg.enabled = true;
+        cfg.target = target;
+        cfg.bases = setup.bases.clone();
+        cfg.acknowledged_at = setup.created_at.clone();
+        cfg.acknowledged_by = setup.acknowledged_by.clone();
+        cfg.updated_at = at;
+        cfg.updated_by = setup.created_by.clone();
+        cfg.team_name = team_name(&state, &setup.team_id).await;
+        bs::save(&state.dynamo, table, &setup.team_id, &cfg)
+            .await
+            .map_err(|e| internal("bedrock sync save", e))?;
+        if let Err(e) = start(&state, &setup.team_id).await {
+            warn!(error = %e, "Bedrock sync not started; the sweep runs it");
+        }
+    }
+    Ok(Json(json!({ "status": setup.state })))
 }
 
 #[cfg(test)]

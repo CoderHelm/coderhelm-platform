@@ -368,6 +368,8 @@ pub const CAPABILITIES: &[Capability] = &[
             "knowledge_bedrock::save_sync",
             "knowledge_bedrock::run_sync",
             "knowledge_bedrock::export_template",
+            "knowledge_bedrock::start_setup",
+            "knowledge_bedrock::cancel_setup",
             "knowledge::bedrock_import",
             "knowledge::search_tools",
             "knowledge::start_archive",
