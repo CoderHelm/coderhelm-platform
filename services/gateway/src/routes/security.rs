@@ -254,21 +254,50 @@ fn latest(a: Option<String>, b: Option<String>) -> Option<String> {
     }
 }
 
-/// What the advisory feed row says: nothing once a webhook arrived; until
-/// then, that the poll is what keeps it current.
-fn advisory_feed_reason(webhook_at: Option<&str>, polled_at: Option<&str>) -> String {
+/// A time as the sources panel shows it in words.
+fn shown_time(t: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(t)
+        .map(|t| {
+            t.with_timezone(&chrono::Utc)
+                .format("%b %-d, %H:%M UTC")
+                .to_string()
+        })
+        .unwrap_or_else(|_| t.to_string())
+}
+
+/// The advisory poll as the team's row keeps it (the worker's
+/// `run_advisory_poll`): its last run, the checkpoint it reads on from while
+/// it is behind, and the last run's failure.
+#[derive(Debug, Default)]
+struct AdvisoryPoll {
+    run_at: Option<String>,
+    read_up_to: Option<String>,
+    error: Option<String>,
+}
+
+/// What the advisory feed row says: a failed poll, a poll still catching
+/// up; else nothing once a webhook arrived, and until then that the poll is
+/// what keeps it current.
+fn advisory_feed_reason(
+    webhook_at: Option<&str>,
+    polled_at: Option<&str>,
+    poll: &AdvisoryPoll,
+) -> String {
+    if let Some(e) = &poll.error {
+        return format!("The last read of GitHub's advisory database failed ({e}); it is tried again within the hour.");
+    }
+    if let Some(t) = &poll.read_up_to {
+        return format!(
+            "Catching up on GitHub's advisory database: read up to {}.",
+            shown_time(t)
+        );
+    }
     match (webhook_at, polled_at) {
         (Some(_), _) => String::new(),
-        (None, Some(p)) => {
-            let shown = chrono::DateTime::parse_from_rfc3339(p)
-                .map(|t| {
-                    t.with_timezone(&chrono::Utc)
-                        .format("%b %-d, %H:%M UTC")
-                        .to_string()
-                })
-                .unwrap_or_else(|_| p.to_string());
-            format!("Waiting for GitHub's first webhook; checked by polling at {shown}.")
-        }
+        (None, Some(p)) => format!(
+            "Waiting for GitHub's first webhook; checked by polling at {}.",
+            shown_time(p)
+        ),
         (None, None) => "Waiting for GitHub's first webhook; GitHub's advisory database is also polled about hourly, starting on the next check.".into(),
     }
 }
@@ -295,6 +324,17 @@ pub fn source_rows(team_state: &Item, kev: &Item, findings: &[(Finding, FindingS
     let osv_synced = opt(team_state, "osv_synced_at");
     let adv_at = opt(team_state, "advisory_event_at");
     let adv_polled = opt(team_state, "advisory_polled_at");
+    let poll = AdvisoryPoll {
+        run_at: opt(team_state, "advisory_poll_run_at"),
+        read_up_to: opt(team_state, "advisory_poll_from"),
+        error: opt(team_state, "advisory_poll_error"),
+    };
+    // The poll has read something: it finished once, or keeps a checkpoint.
+    let poll_read = adv_polled.is_some() || poll.read_up_to.is_some();
+    let poll_synced = latest(
+        adv_polled.clone(),
+        poll.run_at.clone().filter(|_| poll.read_up_to.is_some()),
+    );
     let kev_at = opt(kev, "synced_at");
     let epss_at = opt(team_state, "epss_synced_at");
     json!([
@@ -325,11 +365,18 @@ pub fn source_rows(team_state: &Item, kev: &Item, findings: &[(Finding, FindingS
             "id": "github_advisory",
             "name": "GitHub advisory feed",
             "gives": "New and changed GitHub advisories (the security_advisory webhook, and GitHub's advisory database read about hourly), matched against the dependency lists.",
-            "state": if adv_at.is_some() || adv_polled.is_some() { "ok" } else { "never" },
-            "reason": advisory_feed_reason(adv_at.as_deref(), adv_polled.as_deref()),
-            "synced_at": latest(adv_at.clone(), adv_polled.clone()),
+            "state": if poll.error.is_some() { "error" } else if adv_at.is_some() || poll_read { "ok" } else { "never" },
+            "reason": advisory_feed_reason(adv_at.as_deref(), adv_polled.as_deref(), &poll),
+            "synced_at": latest(adv_at.clone(), poll_synced.clone()),
             "webhook_at": adv_at,
             "polled_at": adv_polled,
+            "poll": {
+                "run_at": poll.run_at,
+                "synced_at": poll_synced,
+                "caught_up": adv_polled.is_some() && poll.read_up_to.is_none() && poll.error.is_none(),
+                "read_up_to": poll.read_up_to,
+                "error": poll.error,
+            },
             "count": from("github_advisory"),
         },
         {
@@ -358,8 +405,8 @@ pub fn source_rows(team_state: &Item, kev: &Item, findings: &[(Finding, FindingS
 /// couldn't be read.
 /// When a read dependency list is read again (a push to the default branch
 /// that changes a dependency file queues a read; the daily check is the
-/// backstop).
-pub const NEXT_READ: &str = "Next read on the next dependency change or within 24 h.";
+/// backstop), and what is checked against it in between.
+pub const NEXT_READ: &str = "Read again whenever a dependency file changes on the default branch, and daily; new GitHub advisories are checked against it as they arrive.";
 
 /// `team_state`: the team's row, whose Dependabot state a repository's is
 /// shown only when it differs from.
@@ -391,6 +438,7 @@ pub fn repo_rows(deps: &[Item], cfg: &SecurityConfig, team_state: &Item) -> Valu
                 "ecosystems": ecos,
                 "next_read": if read_at.is_some() { NEXT_READ } else { "" },
                 "read_at": read_at,
+                "branch": Some(s(i, "branch")).filter(|v| !v.is_empty()),
                 "state": state,
                 "reason": s(i, "inventory_reason"),
                 "unpinned": num(i, "unpinned"),
@@ -1740,7 +1788,11 @@ pub(crate) async fn on_security_advisory(
     queue(state, msg).await
 }
 
-/// A push to a default branch that changed a dependency file.
+/// How long after a push that changed a dependency file its list is read.
+const PUSH_READ_DELAY_SECS: i32 = 120;
+
+/// A push to a default branch that changed a dependency file: its list is
+/// read again two minutes later.
 pub(crate) async fn on_default_branch_push(
     state: &AppState,
     payload: &Value,
@@ -1758,7 +1810,16 @@ pub(crate) async fn on_default_branch_push(
         repo: repo.to_string(),
         ..Default::default()
     };
-    if let Err(e) = queue(state, msg).await {
+    // GitHub rebuilds the dependency graph after the push lands; reading at
+    // once can still get the list from before it.
+    if let Err(e) = super::github_webhook::send_to_queue_after(
+        state,
+        &state.config.ticket_queue_url,
+        &WorkerMessage::SecurityEvent(msg),
+        PUSH_READ_DELAY_SECS,
+    )
+    .await
+    {
         warn!(team_id, repo, code = %e, "security: could not queue the inventory refresh");
     }
 }
@@ -2203,6 +2264,60 @@ mod tests {
             ("advisory_polled_at", "2026-11-11T06:00:00Z"),
         ]));
         assert_eq!(hook_last["synced_at"], "2026-11-11T07:00:00Z");
+        assert_eq!(polled["poll"]["caught_up"], true);
+    }
+
+    #[test]
+    fn the_advisory_feed_shows_a_poll_catching_up_or_failing() {
+        let row = |st: &Item| {
+            source_rows(st, &Item::new(), &[])
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["id"] == "github_advisory")
+                .unwrap()
+                .clone()
+        };
+        // Never reached the end yet, but read up to a checkpoint: never
+        // "not synced".
+        let behind = row(&item(&[
+            ("advisory_poll_run_at", "2026-11-11T06:00:00Z"),
+            ("advisory_poll_from", "2026-11-10T17:42:00Z"),
+            ("advisory_poll_caught_up", "false"),
+        ]));
+        assert_eq!(behind["state"], "ok");
+        assert_eq!(behind["synced_at"], "2026-11-11T06:00:00Z");
+        assert_eq!(behind["poll"]["caught_up"], false);
+        assert_eq!(behind["poll"]["read_up_to"], "2026-11-10T17:42:00Z");
+        assert_eq!(
+            behind["reason"],
+            "Catching up on GitHub's advisory database: read up to Nov 10, 17:42 UTC."
+        );
+        // Caught up: the last full poll.
+        let caught = row(&item(&[
+            ("advisory_poll_run_at", "2026-11-11T07:00:00Z"),
+            ("advisory_polled_at", "2026-11-11T07:00:00Z"),
+            ("advisory_poll_from", ""),
+            ("advisory_poll_caught_up", "true"),
+            ("advisory_poll_error", ""),
+        ]));
+        assert_eq!(caught["state"], "ok");
+        assert_eq!(caught["poll"]["caught_up"], true);
+        assert_eq!(caught["poll"]["synced_at"], "2026-11-11T07:00:00Z");
+        // A failed run: its error, the checkpoint still kept.
+        let failed = row(&item(&[
+            ("advisory_poll_run_at", "2026-11-11T08:00:00Z"),
+            ("advisory_polled_at", "2026-11-11T07:00:00Z"),
+            ("advisory_poll_from", "2026-11-11T06:55:00Z"),
+            ("advisory_poll_error", "GitHub answered 502: Server Error"),
+        ]));
+        assert_eq!(failed["state"], "error");
+        assert_eq!(failed["poll"]["caught_up"], false);
+        assert_eq!(failed["poll"]["error"], "GitHub answered 502: Server Error");
+        assert_eq!(
+            failed["reason"],
+            "The last read of GitHub's advisory database failed (GitHub answered 502: Server Error); it is tried again within the hour."
+        );
     }
 
     #[test]

@@ -4519,6 +4519,88 @@ pub fn advisory_poll_since(last: Option<&str>, now: chrono::DateTime<Utc>) -> St
     start.format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
+/// Pages one advisory poll reads when the last poll reached the end.
+pub const ADVISORY_POLL_PAGES: usize = 10;
+/// Pages one advisory poll reads while it is behind (a checkpoint is kept,
+/// or no poll has reached the end yet): GitHub updates more than 1,000
+/// advisories on a busy day.
+pub const ADVISORY_POLL_PAGES_BEHIND: usize = 30;
+
+/// Where an advisory poll starts, from what the team's row keeps.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AdvisoryPollStart {
+    /// The `updated>=` time.
+    pub since: String,
+    /// GitHub's cursor for that same time, kept only when a block of
+    /// advisories with one `updated_at` ran past the end of a run.
+    pub after: Option<String>,
+    /// The poll hasn't reached the end since its checkpoint (or ever).
+    pub behind: bool,
+}
+
+fn rfc3339_utc(t: &str) -> Option<chrono::DateTime<Utc>> {
+    chrono::DateTime::parse_from_rfc3339(t)
+        .ok()
+        .map(|t| t.with_timezone(&Utc))
+}
+
+fn poll_time(t: chrono::DateTime<Utc>) -> String {
+    t.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
+/// Where the next advisory poll starts: at its checkpoint (`from`, the
+/// `updated_at` of the last advisory a run read, and `after` when that
+/// time's block went on past the run) when one is kept, else a little before
+/// the last poll that reached the end ([`advisory_poll_since`]). Never more
+/// than a week back; a checkpoint older than that drops its cursor.
+pub fn advisory_poll_start(
+    polled_at: Option<&str>,
+    from: Option<&str>,
+    after: Option<&str>,
+    now: chrono::DateTime<Utc>,
+) -> AdvisoryPollStart {
+    let floor = now - chrono::Duration::days(7);
+    if let Some(t) = from.and_then(rfc3339_utc) {
+        let (since, after) = if t < floor {
+            (floor, None)
+        } else {
+            (t, after.filter(|c| !c.is_empty()).map(String::from))
+        };
+        return AdvisoryPollStart {
+            since: poll_time(since),
+            after,
+            behind: true,
+        };
+    }
+    AdvisoryPollStart {
+        since: advisory_poll_since(polled_at, now),
+        after: None,
+        behind: polled_at.and_then(rfc3339_utc).is_none(),
+    }
+}
+
+/// The checkpoint after a page read with `updated>=since` that has a next
+/// page (`next`, its cursor): the latest `updated_at` on the page, so the
+/// next run reads again from there (`>=` and idempotent upserts make the
+/// overlap safe). When the whole page carries `since` itself, starting
+/// from that time again would read the same page forever, so the cursor
+/// is kept with it.
+pub fn advisory_poll_checkpoint(
+    since: &str,
+    page: &[Value],
+    next: &str,
+) -> (String, Option<String>) {
+    let start = rfc3339_utc(since);
+    let latest = page
+        .iter()
+        .filter_map(|a| a["updated_at"].as_str().and_then(rfc3339_utc))
+        .max();
+    match (start, latest) {
+        (Some(s), Some(l)) if l > s => (poll_time(l), None),
+        _ => (since.to_string(), Some(next.to_string())),
+    }
+}
+
 /// The `after` cursor of the next page, from a response's `Link` header
 /// (`<...&after=X>; rel="next"`). None on the last page.
 pub fn dependabot_next_cursor(link: Option<&str>) -> Option<String> {
@@ -6450,6 +6532,64 @@ mod tests {
             "/advisories?updated=%3E%3D2026-11-11T04%3A50%3A00Z&per_page=100&sort=updated&direction=asc"
         );
         assert!(advisories_poll_path("x", Some("abc")).ends_with("&after=abc"));
+    }
+
+    #[test]
+    fn the_advisory_poll_resumes_at_its_checkpoint() {
+        let now = DateTime::parse_from_rfc3339("2026-11-11T06:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        // Never reached the end: a day back, behind.
+        let first = advisory_poll_start(None, None, None, now);
+        assert_eq!(first.since, "2026-11-10T06:00:00Z");
+        assert!(first.behind && first.after.is_none());
+        // Reached the end last hour: caught up, with the overlap.
+        let caught = advisory_poll_start(Some("2026-11-11T05:00:00Z"), None, Some(""), now);
+        assert_eq!(caught.since, "2026-11-11T04:50:00Z");
+        assert!(!caught.behind);
+        // A checkpoint wins over the last full poll, and keeps its cursor.
+        let resumed = advisory_poll_start(
+            Some("2026-11-09T00:00:00Z"),
+            Some("2026-11-10T14:03:07Z"),
+            Some("Y3Vy"),
+            now,
+        );
+        assert_eq!(resumed.since, "2026-11-10T14:03:07Z");
+        assert_eq!(resumed.after.as_deref(), Some("Y3Vy"));
+        assert!(resumed.behind);
+        // Older than a week: from the floor, the cursor (for another time) dropped.
+        let old = advisory_poll_start(None, Some("2026-10-01T00:00:00Z"), Some("Y3Vy"), now);
+        assert_eq!(old.since, "2026-11-04T06:00:00Z");
+        assert_eq!(old.after, None);
+    }
+
+    #[test]
+    fn the_advisory_checkpoint_moves_forward_or_keeps_the_cursor() {
+        let page = |times: &[&str]| -> Vec<Value> {
+            times.iter().map(|t| json!({ "updated_at": t })).collect()
+        };
+        // Moved past `since`: the last time read, no cursor needed.
+        assert_eq!(
+            advisory_poll_checkpoint(
+                "2026-11-10T06:00:00Z",
+                &page(&["2026-11-10T06:00:00Z", "2026-11-10T07:30:00Z"]),
+                "c2"
+            ),
+            ("2026-11-10T07:30:00Z".to_string(), None)
+        );
+        // A whole page at `since`: the same time with the cursor, or it loops.
+        assert_eq!(
+            advisory_poll_checkpoint(
+                "2026-11-10T06:00:00Z",
+                &page(&["2026-11-10T06:00:00Z", "2026-11-10T06:00:00Z"]),
+                "c2"
+            ),
+            ("2026-11-10T06:00:00Z".to_string(), Some("c2".to_string()))
+        );
+        assert_eq!(
+            advisory_poll_checkpoint("2026-11-10T06:00:00Z", &[], "c2"),
+            ("2026-11-10T06:00:00Z".to_string(), Some("c2".to_string()))
+        );
     }
 
     #[test]
