@@ -1,0 +1,30 @@
+{
+ "results": [
+  {
+   "vulns": [
+    {
+     "id": "DEBIAN-CVE-2010-4756",
+     "modified": "x"
+    },
+    {
+     "id": "DEBIAN-CVE-2023-4911",
+     "modified": "x"
+    },
+    {
+     "id": "DSA-5514-1",
+     "modified": "x"
+    }
+   ]
+  },
+  {
+   "vulns": [
+    {
+     "id": "DEBIAN-CVE-2024-5535",
+     "modified": "x"
+    }
+   ]
+  },
+  {},
+  {}
+ ]
+}

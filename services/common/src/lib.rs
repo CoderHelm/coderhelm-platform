@@ -66,6 +66,9 @@ pub mod alert_notify;
 /// channel, sealed webhook URLs.
 pub mod notify;
 
+/// Dockerfile base images: their package lists matched against OSV's
+/// distribution data, fixed by pinning the same tag to a newer digest.
+pub mod base_images;
 /// Why a finished run's pull request is still a draft, on the run record.
 pub mod draft_hold;
 /// Read-only lookups against a team's own systems (their API today). Shared so

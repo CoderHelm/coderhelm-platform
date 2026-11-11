@@ -1,0 +1,71 @@
+{
+ "manifests": [
+  {
+   "annotations": {
+    "com.docker.official-images.bashbrew.arch": "amd64",
+    "org.opencontainers.image.base.name": "scratch",
+    "org.opencontainers.image.created": "2026-11-04T00:00:00Z",
+    "org.opencontainers.image.revision": "373f61a386722a989c79f0c11f23fcf379b56e94",
+    "org.opencontainers.image.source": "https://github.com/debuerreotype/docker-debian-artifacts.git",
+    "org.opencontainers.image.url": "https://hub.docker.com/_/debian",
+    "org.opencontainers.image.version": "bookworm-slim"
+   },
+   "digest": "sha256:c67e92c8099ba22853ab4cfda7cfb494d253d6012ca82dee98ba8976772af018",
+   "mediaType": "application/vnd.oci.image.manifest.v1+json",
+   "platform": {
+    "architecture": "amd64",
+    "os": "linux"
+   },
+   "size": 1021
+  },
+  {
+   "annotations": {
+    "com.docker.official-images.bashbrew.arch": "amd64",
+    "vnd.docker.reference.digest": "sha256:c67e92c8099ba22853ab4cfda7cfb494d253d6012ca82dee98ba8976772af018",
+    "vnd.docker.reference.type": "attestation-manifest"
+   },
+   "digest": "sha256:4ed59d39c83da6de2e4fa578d0e02380a8618c32f2b3bbbae4db9cbd64fef323",
+   "mediaType": "application/vnd.oci.image.manifest.v1+json",
+   "platform": {
+    "architecture": "unknown",
+    "os": "unknown"
+   },
+   "size": 562
+  },
+  {
+   "annotations": {
+    "com.docker.official-images.bashbrew.arch": "arm64v8",
+    "org.opencontainers.image.base.name": "scratch",
+    "org.opencontainers.image.created": "2026-11-04T00:00:00Z",
+    "org.opencontainers.image.revision": "3b26c3995c7fae47d95ba678632a3520e97054f7",
+    "org.opencontainers.image.source": "https://github.com/debuerreotype/docker-debian-artifacts.git",
+    "org.opencontainers.image.url": "https://hub.docker.com/_/debian",
+    "org.opencontainers.image.version": "bookworm-slim"
+   },
+   "digest": "sha256:ec8534cda2cb30f29f44f23e135297af7a1496f2990fd8e4e84aa36b081a757a",
+   "mediaType": "application/vnd.oci.image.manifest.v1+json",
+   "platform": {
+    "architecture": "arm64",
+    "os": "linux",
+    "variant": "v8"
+   },
+   "size": 1041
+  },
+  {
+   "annotations": {
+    "com.docker.official-images.bashbrew.arch": "arm64v8",
+    "vnd.docker.reference.digest": "sha256:ec8534cda2cb30f29f44f23e135297af7a1496f2990fd8e4e84aa36b081a757a",
+    "vnd.docker.reference.type": "attestation-manifest"
+   },
+   "digest": "sha256:6d8f92ec7a7fda87c8377a794ceda0640e3eb0cb3c40c087b29ac8b1a37455f8",
+   "mediaType": "application/vnd.oci.image.manifest.v1+json",
+   "platform": {
+    "architecture": "unknown",
+    "os": "unknown"
+   },
+   "size": 562
+  }
+ ],
+ "mediaType": "application/vnd.oci.image.index.v1+json",
+ "schemaVersion": 2
+}

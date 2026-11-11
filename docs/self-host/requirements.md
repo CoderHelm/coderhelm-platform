@@ -42,6 +42,7 @@ Besides GitHub and your model provider, the worker calls these hosts over HTTPS,
 | `api.osv.dev` | Advisories for each dependency (`/v1/querybatch`, then `/v1/vulns/<id>`) | Package names and versions from the repository's dependency list. No code |
 | `www.cisa.gov` | CISA's list of exploited vulnerabilities, once a day | Nothing about your install |
 | `api.first.org` | EPSS scores for the CVEs your findings name, once a day | CVE ids |
+| `auth.docker.io`, `registry-1.docker.io`, `production.cloudflare.docker.com` (and the registry a `FROM` line names, such as `public.ecr.aws` or `ghcr.io`) | A Dockerfile base image's manifest and its published package list (SBOM attestation), anonymous pulls only, once a day per repository | The image names and tags in your Dockerfiles. No code, no credentials |
 | `alas.aws.amazon.com` | Amazon Linux 2 and 2023 security advisories (RSS, and the page of each kernel or important advisory), once a day | Nothing about your install |
 | `advisories.bottlerocket.aws` | Bottlerocket's security advisories (`updateinfo.xml.gz`), once a day | Nothing about your install |
 | `aws.amazon.com` | AWS security bulletins (RSS, and each bulletin's page for its per-service status), once a day | Nothing about your install |
