@@ -678,6 +678,8 @@ pub const CAPABILITIES: &[Capability] = &[
         min_role: "admin",
         handlers: &[
             "security::put_config",
+            "infra_security::check",
+            "infra_security::fix",
             "security::dismiss",
             "security::reopen",
             "security::scan",
