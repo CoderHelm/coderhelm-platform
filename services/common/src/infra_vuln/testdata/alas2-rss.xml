@@ -1,0 +1,210 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<rss version="2.0" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:atom="http://www.w3.org/2005/Atom">
+<channel>
+    <title>Amazon Linux AMI Security Bulletins</title>
+    <description>Amazon Linux AMI Security Bulletins</description>
+    <link>https://alas.aws.amazon.com</link>
+    <language>en-us</language>
+    <ttl>35</ttl>
+    
+    <item>
+        <title>ALAS2DOCKER-2026-161 (important): runfinch-finch</title>
+        <description>
+            CVE-2026-93450
+        </description>
+        <pubDate>Mon, 09 Nov 2026 22:34:00 GMT</pubDate>
+        <lastBuildDate>Mon, 09 Nov 2026 22:34:00 GMT</lastBuildDate>
+        <guid>https://alas.aws.amazon.com/AL2/ALAS2DOCKER-2026-161.html</guid>
+        <link>https://alas.aws.amazon.com/AL2/ALAS2DOCKER-2026-161.html</link>
+    </item><item>
+        <title>ALAS2DOCKER-2026-162 (important): docker</title>
+        <description>
+            CVE-2026-71482, CVE-2026-78661, CVE-2026-93318, CVE-2026-97045
+        </description>
+        <pubDate>Mon, 09 Nov 2026 22:34:00 GMT</pubDate>
+        <lastBuildDate>Mon, 09 Nov 2026 22:34:00 GMT</lastBuildDate>
+        <guid>https://alas.aws.amazon.com/AL2/ALAS2DOCKER-2026-162.html</guid>
+        <link>https://alas.aws.amazon.com/AL2/ALAS2DOCKER-2026-162.html</link>
+    </item><item>
+        <title>ALAS2ECS-2026-157 (important): docker</title>
+        <description>
+            CVE-2026-71482, CVE-2026-78661, CVE-2026-93318, CVE-2026-97045
+        </description>
+        <pubDate>Mon, 09 Nov 2026 22:34:00 GMT</pubDate>
+        <lastBuildDate>Mon, 09 Nov 2026 22:34:00 GMT</lastBuildDate>
+        <guid>https://alas.aws.amazon.com/AL2/ALAS2ECS-2026-157.html</guid>
+        <link>https://alas.aws.amazon.com/AL2/ALAS2ECS-2026-157.html</link>
+    </item><item>
+        <title>ALAS2KERNEL-5.10-2026-138 (important): kernel</title>
+        <description>
+            CVE-2026-72318, CVE-2026-74752, CVE-2026-89530, CVE-2026-89633, CVE-2026-89659, CVE-2026-89912, CVE-2026-90036, CVE-2026-97563, CVE-2026-98167, CVE-2026-98365, CVE-2026-98454, CVE-2026-98715, CVE-2026-98805, CVE-2026-98846, CVE-2026-99053, CVE-2026-99082
+        </description>
+        <pubDate>Mon, 09 Nov 2026 22:34:00 GMT</pubDate>
+        <lastBuildDate>Mon, 09 Nov 2026 22:34:00 GMT</lastBuildDate>
+        <guid>https://alas.aws.amazon.com/AL2/ALAS2KERNEL-5.10-2026-138.html</guid>
+        <link>https://alas.aws.amazon.com/AL2/ALAS2KERNEL-5.10-2026-138.html</link>
+    </item><item>
+        <title>ALAS2KERNEL-5.4-2026-136 (medium): kernel</title>
+        <description>
+            CVE-2026-72435
+        </description>
+        <pubDate>Mon, 09 Nov 2026 22:34:00 GMT</pubDate>
+        <lastBuildDate>Mon, 09 Nov 2026 22:34:00 GMT</lastBuildDate>
+        <guid>https://alas.aws.amazon.com/AL2/ALAS2KERNEL-5.4-2026-136.html</guid>
+        <link>https://alas.aws.amazon.com/AL2/ALAS2KERNEL-5.4-2026-136.html</link>
+    </item><item>
+        <title>ALAS2MOCK2-2026-003 (important): rpm</title>
+        <description>
+            CVE-2026-103242, CVE-2026-84837, CVE-2026-95519
+        </description>
+        <pubDate>Mon, 09 Nov 2026 22:34:00 GMT</pubDate>
+        <lastBuildDate>Mon, 09 Nov 2026 22:34:00 GMT</lastBuildDate>
+        <guid>https://alas.aws.amazon.com/AL2/ALAS2MOCK2-2026-003.html</guid>
+        <link>https://alas.aws.amazon.com/AL2/ALAS2MOCK2-2026-003.html</link>
+    </item><item>
+        <title>ALAS2MOCK2-2026-004 (important): compat-rpm-411</title>
+        <description>
+            CVE-2026-78367, CVE-2026-95519
+        </description>
+        <pubDate>Mon, 09 Nov 2026 22:34:00 GMT</pubDate>
+        <lastBuildDate>Mon, 09 Nov 2026 22:34:00 GMT</lastBuildDate>
+        <guid>https://alas.aws.amazon.com/AL2/ALAS2MOCK2-2026-004.html</guid>
+        <link>https://alas.aws.amazon.com/AL2/ALAS2MOCK2-2026-004.html</link>
+    </item><item>
+        <title>ALAS2GIMP-2026-022 (important): gimp</title>
+        <description>
+            CVE-2026-106061, CVE-2026-106063, CVE-2026-112257, CVE-2026-119528
+        </description>
+        <pubDate>Mon, 09 Nov 2026 22:34:00 GMT</pubDate>
+        <lastBuildDate>Mon, 09 Nov 2026 22:34:00 GMT</lastBuildDate>
+        <guid>https://alas.aws.amazon.com/AL2/ALAS2GIMP-2026-022.html</guid>
+        <link>https://alas.aws.amazon.com/AL2/ALAS2GIMP-2026-022.html</link>
+    </item><item>
+        <title>ALAS2-2026-4069 (important): amazon-efs-utils</title>
+        <description>
+            CVE-2026-111943, CVE-2026-16317, CVE-2026-93599, CVE-2026-93600, CVE-2026-93601
+        </description>
+        <pubDate>Mon, 09 Nov 2026 22:33:00 GMT</pubDate>
+        <lastBuildDate>Mon, 09 Nov 2026 22:33:00 GMT</lastBuildDate>
+        <guid>https://alas.aws.amazon.com/AL2/ALAS2-2026-4069.html</guid>
+        <link>https://alas.aws.amazon.com/AL2/ALAS2-2026-4069.html</link>
+    </item><item>
+        <title>ALAS2-2026-4070 (important): librsvg2</title>
+        <description>
+            CVE-2026-96889
+        </description>
+        <pubDate>Mon, 09 Nov 2026 22:33:00 GMT</pubDate>
+        <lastBuildDate>Mon, 09 Nov 2026 22:33:00 GMT</lastBuildDate>
+        <guid>https://alas.aws.amazon.com/AL2/ALAS2-2026-4070.html</guid>
+        <link>https://alas.aws.amazon.com/AL2/ALAS2-2026-4070.html</link>
+    </item><item>
+        <title>ALAS2-2026-4071 (medium): rust</title>
+        <description>
+            CVE-2026-82250
+        </description>
+        <pubDate>Mon, 09 Nov 2026 22:33:00 GMT</pubDate>
+        <lastBuildDate>Mon, 09 Nov 2026 22:33:00 GMT</lastBuildDate>
+        <guid>https://alas.aws.amazon.com/AL2/ALAS2-2026-4071.html</guid>
+        <link>https://alas.aws.amazon.com/AL2/ALAS2-2026-4071.html</link>
+    </item><item>
+        <title>ALAS2-2026-4072 (medium): rust</title>
+        <description>
+            CVE-2026-82247, CVE-2026-82249
+        </description>
+        <pubDate>Mon, 09 Nov 2026 22:33:00 GMT</pubDate>
+        <lastBuildDate>Mon, 09 Nov 2026 22:33:00 GMT</lastBuildDate>
+        <guid>https://alas.aws.amazon.com/AL2/ALAS2-2026-4072.html</guid>
+        <link>https://alas.aws.amazon.com/AL2/ALAS2-2026-4072.html</link>
+    </item><item>
+        <title>ALAS2-2026-4073 (medium): lvm2</title>
+        <description>
+            CVE-2026-19617
+        </description>
+        <pubDate>Mon, 09 Nov 2026 22:33:00 GMT</pubDate>
+        <lastBuildDate>Mon, 09 Nov 2026 22:33:00 GMT</lastBuildDate>
+        <guid>https://alas.aws.amazon.com/AL2/ALAS2-2026-4073.html</guid>
+        <link>https://alas.aws.amazon.com/AL2/ALAS2-2026-4073.html</link>
+    </item><item>
+        <title>ALAS2-2026-4074 (important): python-twisted-words</title>
+        <description>
+            CVE-2026-115775, CVE-2026-115776
+        </description>
+        <pubDate>Mon, 09 Nov 2026 22:33:00 GMT</pubDate>
+        <lastBuildDate>Mon, 09 Nov 2026 22:33:00 GMT</lastBuildDate>
+        <guid>https://alas.aws.amazon.com/AL2/ALAS2-2026-4074.html</guid>
+        <link>https://alas.aws.amazon.com/AL2/ALAS2-2026-4074.html</link>
+    </item><item>
+        <title>ALAS2-2026-4075 (important): python-pillow</title>
+        <description>
+            CVE-2026-112392, CVE-2026-112398, CVE-2026-112901
+        </description>
+        <pubDate>Mon, 09 Nov 2026 22:33:00 GMT</pubDate>
+        <lastBuildDate>Mon, 09 Nov 2026 22:33:00 GMT</lastBuildDate>
+        <guid>https://alas.aws.amazon.com/AL2/ALAS2-2026-4075.html</guid>
+        <link>https://alas.aws.amazon.com/AL2/ALAS2-2026-4075.html</link>
+    </item><item>
+        <title>ALAS2-2026-4076 (important): rpm</title>
+        <description>
+            CVE-2026-84837, CVE-2026-95519
+        </description>
+        <pubDate>Mon, 09 Nov 2026 22:33:00 GMT</pubDate>
+        <lastBuildDate>Mon, 09 Nov 2026 22:33:00 GMT</lastBuildDate>
+        <guid>https://alas.aws.amazon.com/AL2/ALAS2-2026-4076.html</guid>
+        <link>https://alas.aws.amazon.com/AL2/ALAS2-2026-4076.html</link>
+    </item><item>
+        <title>ALAS2-2026-4077 (medium): perl-DBI</title>
+        <description>
+            CVE-2026-108518, CVE-2026-111879, CVE-2026-88815, CVE-2026-88816
+        </description>
+        <pubDate>Mon, 09 Nov 2026 22:33:00 GMT</pubDate>
+        <lastBuildDate>Mon, 09 Nov 2026 22:33:00 GMT</lastBuildDate>
+        <guid>https://alas.aws.amazon.com/AL2/ALAS2-2026-4077.html</guid>
+        <link>https://alas.aws.amazon.com/AL2/ALAS2-2026-4077.html</link>
+    </item><item>
+        <title>ALAS2-2026-4078 (important): glibc</title>
+        <description>
+            CVE-2026-86805
+        </description>
+        <pubDate>Mon, 09 Nov 2026 22:33:00 GMT</pubDate>
+        <lastBuildDate>Mon, 09 Nov 2026 22:33:00 GMT</lastBuildDate>
+        <guid>https://alas.aws.amazon.com/AL2/ALAS2-2026-4078.html</guid>
+        <link>https://alas.aws.amazon.com/AL2/ALAS2-2026-4078.html</link>
+    </item><item>
+        <title>ALAS2-2026-4079 (important): mariadb</title>
+        <description>
+            CVE-2026-85746, CVE-2026-86047
+        </description>
+        <pubDate>Mon, 09 Nov 2026 22:33:00 GMT</pubDate>
+        <lastBuildDate>Mon, 09 Nov 2026 22:33:00 GMT</lastBuildDate>
+        <guid>https://alas.aws.amazon.com/AL2/ALAS2-2026-4079.html</guid>
+        <link>https://alas.aws.amazon.com/AL2/ALAS2-2026-4079.html</link>
+    </item><item>
+        <title>ALAS2-2026-4080 (medium): perl-podlators</title>
+        <description>
+            CVE-2026-82560
+        </description>
+        <pubDate>Mon, 09 Nov 2026 22:33:00 GMT</pubDate>
+        <lastBuildDate>Mon, 09 Nov 2026 22:33:00 GMT</lastBuildDate>
+        <guid>https://alas.aws.amazon.com/AL2/ALAS2-2026-4080.html</guid>
+        <link>https://alas.aws.amazon.com/AL2/ALAS2-2026-4080.html</link>
+    </item><item>
+        <title>ALAS2-2026-4065 (important): kernel</title>
+        <description>
+            CVE-2026-98432
+        </description>
+        <pubDate>Fri, 30 Oct 2026 23:19:00 GMT</pubDate>
+        <lastBuildDate>Mon, 02 Nov 2026 09:00:00 GMT</lastBuildDate>
+        <guid>https://alas.aws.amazon.com/AL2/ALAS2-2026-4065.html</guid>
+        <link>https://alas.aws.amazon.com/AL2/ALAS2-2026-4065.html</link>
+    </item><item>
+        <title>ALAS2-2026-3365 (important): openssl</title>
+        <description>
+            CVE-2026-34180, CVE-2026-42766, CVE-2026-45447, CVE-2026-7383, CVE-2026-9076
+        </description>
+        <pubDate>Mon, 22 Jun 2026 19:53:00 GMT</pubDate>
+        <lastBuildDate>Mon, 22 Jun 2026 19:53:00 GMT</lastBuildDate>
+        <guid>https://alas.aws.amazon.com/AL2/ALAS2-2026-3365.html</guid>
+        <link>https://alas.aws.amazon.com/AL2/ALAS2-2026-3365.html</link>
+    </item>
+</channel>
+</rss>

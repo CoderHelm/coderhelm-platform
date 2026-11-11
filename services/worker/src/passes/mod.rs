@@ -1085,6 +1085,7 @@ pub(crate) mod implement;
 #[cfg(test)]
 mod incidents;
 pub mod infra_analyze;
+pub mod infra_feeds;
 mod infra_repo;
 pub mod jira_comment;
 pub mod knowledge;

@@ -42,6 +42,12 @@ Besides GitHub and your model provider, the worker calls these hosts over HTTPS,
 | `api.osv.dev` | Advisories for each dependency (`/v1/querybatch`, then `/v1/vulns/<id>`) | Package names and versions from the repository's dependency list. No code |
 | `www.cisa.gov` | CISA's list of exploited vulnerabilities, once a day | Nothing about your install |
 | `api.first.org` | EPSS scores for the CVEs your findings name, once a day | CVE ids |
+| `alas.aws.amazon.com` | Amazon Linux 2 and 2023 security advisories (RSS, and the page of each kernel or important advisory), once a day | Nothing about your install |
+| `advisories.bottlerocket.aws` | Bottlerocket's security advisories (`updateinfo.xml.gz`), once a day | Nothing about your install |
+| `aws.amazon.com` | AWS security bulletins (RSS, and each bulletin's page for its per-service status), once a day | Nothing about your install |
+| `docs.aws.amazon.com` | The Lambda runtime deprecation table, once a day | Nothing about your install |
+
+The worker also reads AWS's public "latest image" parameters for ECS, EKS and Bottlerocket (`ssm:GetParameters` on `/aws/service/*` in us-east-1) with its own role. These public reads run only while a team has security fixes on.
 
 OSV is read through its API ("api" mode on the Security page). A local copy of OSV's data, so that no dependency names leave your account, is not built yet.
 

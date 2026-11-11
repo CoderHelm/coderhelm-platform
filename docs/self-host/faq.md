@@ -5,7 +5,7 @@ order: 14
 ---
 
 **Does any of my code or data go to CoderHelm the company?**
-No. Everything runs in your account. The only outbound calls are to GitHub, to the model provider you chose, to services your teams connect, and, only if you turn telemetry on, one anonymous ping per install or upgrade. A team that turns on security fixes also has the worker call `api.osv.dev` (package names and versions), `www.cisa.gov` and `api.first.org` (CVE ids): see [Outbound calls](./requirements.md#outbound-calls).
+No. Everything runs in your account. The only outbound calls are to GitHub, to the model provider you chose, to services your teams connect, and, only if you turn telemetry on, one anonymous ping per install or upgrade. A team that turns on security fixes also has the worker call `api.osv.dev` (package names and versions), `www.cisa.gov` and `api.first.org` (CVE ids), and reads the public Amazon Linux, Bottlerocket and AWS security bulletin feeds (nothing about your install is sent): see [Outbound calls](./requirements.md#outbound-calls).
 
 **Do I need Docker, Kubernetes or a server?**
 No. It is all serverless AWS: nothing to patch, nothing running when nobody uses it.

@@ -213,6 +213,15 @@ export class WorkerStack extends cdk.Stack {
         conditions: { Null: { "sts:ExternalId": "false" } },
       }),
     );
+    // Infrastructure vulnerabilities: AWS's public "latest image" parameters
+    // (ECS, EKS and Bottlerocket releases), read once a day for every team
+    // (services/worker/src/passes/infra_feeds.rs). Public parameters only.
+    this.workerFunction.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ["ssm:GetParameters"],
+        resources: ["arn:aws:ssm:us-east-1::parameter/aws/service/*"],
+      }),
+    );
     // On a hardened install the boundary lets only the gateway's and the
     // worker's roles take on these two roles in the install's own account
     // (infra/lib/access.ts, ReadRolesHereOnlyCoderHelmRuntime): this tag

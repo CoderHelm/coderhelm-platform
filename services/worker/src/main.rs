@@ -575,6 +575,12 @@ async fn handle_message(state: Arc<WorkerState>, message: models::WorkerMessage)
                 cards = sec.cards,
                 "Security sweep done"
             );
+            // Infrastructure vulnerabilities: the public AWS feeds, read
+            // once a day for every team, while any team has security fixes
+            // on (a self-hosted install makes no such calls otherwise).
+            if sec.teams > 0 {
+                passes::infra_feeds::sweep(&state).await;
+            }
         }
         models::WorkerMessage::SecurityEvent(msg) => {
             info!(team_id = %msg.team_id, kind = %msg.kind, repo = %msg.repo, "Security event");
