@@ -22,6 +22,9 @@ pub mod claim;
 pub mod prose;
 pub mod review_description;
 
+/// A workflow run's jobs across attempts: what fails now, where, and what
+/// passed when re-run.
+pub mod actions_jobs;
 /// The code graph's per-repo switch and build status (gateway and worker).
 pub mod code_graph;
 /// A repository's public codegen environment: what may be kept, and what

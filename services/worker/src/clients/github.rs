@@ -575,6 +575,15 @@ pub fn reset_decision(
     }
 }
 
+/// The plain sentence a CI fix gets when the installation can't read
+/// Actions (its job logs).
+pub fn actions_unreadable() -> String {
+    common::github_grants::limit_note(
+        "actions",
+        "CI failures are read from check annotations and check names, not the job logs,",
+    )
+}
+
 /// GitHub REST API client using installation token auth.
 pub struct GitHubClient {
     app_id: String,
@@ -3901,47 +3910,45 @@ impl GitHubClient {
         Ok(resp.text().await?)
     }
 
-    /// Download logs for a workflow run. GitHub returns a zip; we extract the first
-    /// failed job's log text (or concat all logs if no clear failure).
+    /// The failing jobs' logs of a workflow run's newest attempt, each headed
+    /// by its job and the step that failed, after a line naming jobs that
+    /// failed on an earlier attempt and passed when re-run (flaky). An error
+    /// when the run's jobs can't be read; without the Actions permission the
+    /// error is [`actions_unreadable`]'s sentence, and no request is made
+    /// once that is known.
     pub async fn get_workflow_run_logs(
         &self,
         owner: &str,
         repo: &str,
         run_id: u64,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        // First, list jobs for this run and find the failed one(s)
-        let jobs_url =
-            format!("{API_BASE}/repos/{owner}/{repo}/actions/runs/{run_id}/jobs?filter=latest");
-        let jobs: serde_json::Value = self.get(&jobs_url).await?;
-        let failed_jobs: Vec<u64> = jobs["jobs"]
-            .as_array()
-            .unwrap_or(&vec![])
-            .iter()
-            .filter(|j| j["conclusion"].as_str() == Some("failure"))
-            .filter_map(|j| j["id"].as_u64())
-            .collect();
-
-        if failed_jobs.is_empty() {
-            return Ok("(no failed jobs found)".to_string());
+        let path =
+            format!("/repos/{owner}/{repo}/actions/runs/{run_id}/jobs?filter=all&per_page=100");
+        let Some(listing) = self.get_granted("actions", &path).await? else {
+            return Err(actions_unreadable().into());
+        };
+        let jobs = common::actions_jobs::read(&listing);
+        let mut out = String::new();
+        if let Some(line) = common::actions_jobs::flaky_line(&jobs) {
+            out.push_str(&line);
+            out.push_str("\n\n");
         }
-
-        // Download logs for each failed job (typically just 1)
-        let mut all_logs = String::new();
-        for job_id in failed_jobs.iter().take(3) {
-            match self.get_check_run_logs(owner, repo, *job_id).await {
-                Ok(log) => {
-                    if !all_logs.is_empty() {
-                        all_logs.push_str("\n---\n");
-                    }
-                    all_logs.push_str(&log);
-                }
-                Err(e) => {
-                    all_logs.push_str(&format!("(failed to download job {job_id} logs: {e})\n"));
-                }
+        if jobs.failed.is_empty() {
+            out.push_str("(no failed jobs found)");
+            return Ok(out);
+        }
+        for (n, job) in jobs.failed.iter().take(3).enumerate() {
+            if n > 0 {
+                out.push_str("\n---\n");
+            }
+            out.push_str(&common::actions_jobs::log_header(job));
+            out.push('\n');
+            match self.get_check_run_logs(owner, repo, job.id).await {
+                Ok(log) => out.push_str(&log),
+                Err(e) => out.push_str(&format!("(failed to download job {} logs: {e})\n", job.id)),
             }
         }
-
-        Ok(all_logs)
+        Ok(out)
     }
 
     /// List check runs for a git ref (branch name or SHA).
