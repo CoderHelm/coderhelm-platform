@@ -703,7 +703,7 @@ async fn record_dependabot(cx: &Ctx<'_>, repo: &str, access: &sec::DependabotAcc
 
 /// OSV's matches for some packages: `(index, vulnerability id)`, following
 /// each result's `next_page_token` (a package with many records).
-async fn osv_query(
+pub(super) async fn osv_query(
     state: &WorkerState,
     queries: Vec<Value>,
 ) -> Result<Vec<(usize, String)>, String> {
@@ -1259,7 +1259,9 @@ async fn triage_group(
 async fn triage_tick(cx: &Ctx<'_>, findings: &mut [(Finding, FindingState)]) -> usize {
     let mut groups: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     for (i, (f, st)) in findings.iter().enumerate() {
+        // Base images are not searched in code (common::base_images).
         if f.status.is_open()
+            && f.ecosystem != common::base_images::ECOSYSTEM
             && cx.cfg.repos.includes(&f.repo)
             && (f.verdict == Verdict::Pending
                 || st.triaged.as_deref() != Some(triage_key(f).as_str()))
@@ -1452,6 +1454,12 @@ async fn sync_repo(
         let mut cache = cx.osv.lock().await;
         osv_observations(cx.state, repo, &deps, &mut cache).await
     };
+    // Dockerfile base images: their package lists against OSV's distribution data.
+    let (base_obs, base_reads) = {
+        let mut cache = cx.osv.lock().await;
+        super::base_images::sync(cx.state, repo, &deps, &mut cache).await
+    };
+    obs.extend(base_obs);
     let now = Utc::now().to_rfc3339();
     match osv {
         Ok(o) => {
@@ -1482,6 +1490,7 @@ async fn sync_repo(
         }
     }
     let applied = upsert(cx.state, cx.team_id, cx.cfg, findings, obs).await;
+    base_images_settle(cx, repo, findings, &base_reads).await;
     // The dependency list now shows some fixed: a merged bump, a removal.
     for (f, st) in findings.iter_mut() {
         if f.repo.eq_ignore_ascii_case(repo)
@@ -1511,6 +1520,43 @@ async fn sync_repo(
         }
     }
     applied.created
+}
+
+/// Base image findings after a read: fixed when the image no longer has
+/// the version, else their pinned-digest fix; never triaged in code.
+async fn base_images_settle(
+    cx: &Ctx<'_>,
+    repo: &str,
+    findings: &mut [(Finding, FindingState)],
+    reads: &[common::base_images::Resolution],
+) {
+    use common::base_images::{self as bi, Change};
+    if !reads.is_empty() {
+        let summary: Vec<Value> = reads
+            .iter()
+            .map(|r| json!({ "manifest": r.manifest, "image": format!("{}:{}", r.package, r.version), "release": r.release, "read": r.read, "packages": r.packages, "note": r.note }))
+            .collect();
+        set_repo_fields(
+            cx.state,
+            cx.team_id,
+            repo,
+            &[("base_images", attr_s(&Value::Array(summary).to_string()))],
+        )
+        .await;
+    }
+    for (i, change) in bi::apply_resolutions(findings, repo, reads, cx.cfg) {
+        let (f, st) = &findings[i];
+        save_finding(cx.state, cx.team_id, f, st).await;
+        let line = match (&change, &f.fixed_version) {
+            (Change::Fixed, _) => {
+                "Fixed: the Dockerfile's base image no longer has the vulnerable package"
+                    .to_string()
+            }
+            (Change::Updated, Some(to)) => format!("Fix found: pin {} to {to}", f.package),
+            (Change::Updated, None) => continue,
+        };
+        add_event(cx.state, cx.team_id, &f.id, &line, None).await;
+    }
 }
 
 /// The tick's per-finding work: the CISA list, EPSS, expired dismissals,

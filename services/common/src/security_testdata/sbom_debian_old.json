@@ -1,0 +1,106 @@
+{
+ "_type": "https://in-toto.io/Statement/v0.1",
+ "predicateType": "https://spdx.dev/Document",
+ "subject": [],
+ "predicate": {
+  "spdxVersion": "SPDX-2.3",
+  "dataLicense": "CC0-1.0",
+  "SPDXID": "SPDXRef-DOCUMENT",
+  "name": "sbom",
+  "documentNamespace": "https://docker.com/docker-scout/fs/sbom-7967ffcc-3e0d-4092-878e-24997a7c70a8",
+  "creationInfo": {
+   "creators": [
+    "Organization: Docker, Inc",
+    "Tool: docker-scout-1.18.1",
+    "Tool: buildkit-0.16.0-tianon"
+   ],
+   "created": "2026-11-05T06:15:48Z"
+  },
+  "packages": [
+   {
+    "name": "sbom",
+    "SPDXID": "SPDXRef-DocumentRoot",
+    "supplier": "NOASSERTION",
+    "downloadLocation": "NOASSERTION",
+    "filesAnalyzed": false,
+    "licenseConcluded": "NOASSERTION",
+    "licenseDeclared": "NOASSERTION",
+    "primaryPackagePurpose": "FILE"
+   },
+   {
+    "name": "libc6",
+    "SPDXID": "SPDXRef-Package-c0097d6f78e392e378edbb2523a8128c",
+    "versionInfo": "2.36-9+deb12u1",
+    "supplier": "Person: GNU Libc Maintainers \\u003cdebian-glibc@lists.debian.org\\u003e",
+    "originator": "Person: GNU Libc Maintainers \\u003cdebian-glibc@lists.debian.org\\u003e",
+    "downloadLocation": "NOASSERTION",
+    "filesAnalyzed": true,
+    "licenseConcluded": "NOASSERTION",
+    "licenseDeclared": "GPL-2.0-only OR LGPL-2.1-only",
+    "externalRefs": [
+     {
+      "referenceCategory": "PACKAGE-MANAGER",
+      "referenceType": "purl",
+      "referenceLocator": "pkg:deb/debian/libc6@2.36-9%2Bdeb12u1?os_distro=bookworm&os_name=debian&os_version=12"
+     }
+    ]
+   },
+   {
+    "name": "libssl3",
+    "SPDXID": "SPDXRef-Package-ssl",
+    "versionInfo": "3.0.11-1~deb12u1",
+    "supplier": "Person: GNU Libc Maintainers \\u003cdebian-glibc@lists.debian.org\\u003e",
+    "originator": "Person: GNU Libc Maintainers \\u003cdebian-glibc@lists.debian.org\\u003e",
+    "downloadLocation": "NOASSERTION",
+    "filesAnalyzed": true,
+    "licenseConcluded": "NOASSERTION",
+    "licenseDeclared": "GPL-2.0-only OR LGPL-2.1-only",
+    "externalRefs": [
+     {
+      "referenceCategory": "PACKAGE-MANAGER",
+      "referenceType": "purl",
+      "referenceLocator": "pkg:deb/debian/libssl3@3.0.11-1~deb12u1?os_distro=bookworm&os_name=debian&os_version=12"
+     }
+    ]
+   },
+   {
+    "name": "bash",
+    "SPDXID": "SPDXRef-Package-f38b11e0835c33642ab059815caea8e2",
+    "versionInfo": "5.2.15-2+b13",
+    "supplier": "Person: Matthias Klose \\u003cdoko@debian.org\\u003e",
+    "originator": "Person: Matthias Klose \\u003cdoko@debian.org\\u003e",
+    "downloadLocation": "NOASSERTION",
+    "filesAnalyzed": true,
+    "licenseConcluded": "NOASSERTION",
+    "licenseDeclared": "BSD-4-Clause-UC OR GFDL-1.3-only OR GPL-2.0-only OR GPL-2.0-or-later OR GPL-3.0-only OR GPL-3.0-or-later OR Latex2e",
+    "externalRefs": [
+     {
+      "referenceCategory": "PACKAGE-MANAGER",
+      "referenceType": "purl",
+      "referenceLocator": "pkg:deb/debian/bash@5.2.15-2%2Bb13?os_distro=bookworm&os_name=debian&os_version=12"
+     }
+    ]
+   },
+   {
+    "name": "zlib1g",
+    "SPDXID": "SPDXRef-Package-360f0c46ae3dd36e4b4834b1663a7067",
+    "versionInfo": "1:1.2.13.dfsg-1",
+    "supplier": "Person: Mark Brown \\u003cbroonie@debian.org\\u003e",
+    "originator": "Person: Mark Brown \\u003cbroonie@debian.org\\u003e",
+    "downloadLocation": "NOASSERTION",
+    "filesAnalyzed": true,
+    "licenseConcluded": "NOASSERTION",
+    "licenseDeclared": "Zlib",
+    "externalRefs": [
+     {
+      "referenceCategory": "PACKAGE-MANAGER",
+      "referenceType": "purl",
+      "referenceLocator": "pkg:deb/debian/zlib1g@1%3A1.2.13.dfsg-1?os_distro=bookworm&os_name=debian&os_version=12"
+     }
+    ]
+   }
+  ],
+  "files": [],
+  "relationships": []
+ }
+}

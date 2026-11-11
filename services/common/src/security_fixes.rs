@@ -2287,6 +2287,9 @@ pub fn unit_due(unit: &FixUnit, cfg: &SecurityConfig) -> bool {
 /// The plan a fix run follows, given to the agent as the ticket's body. The
 /// marker line carries the branch.
 pub fn ticket_body(unit: &FixUnit, members: &[&Finding], cfg: &SecurityConfig) -> String {
+    if unit.ecosystem == crate::base_images::ECOSYSTEM {
+        return crate::base_images::ticket_body(unit, members);
+    }
     let mut s = String::new();
     s.push_str(&format!(
         "{MARKER}\n<!-- coderhelm:security-branch {} -->\n\n",
