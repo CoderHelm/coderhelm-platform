@@ -575,6 +575,7 @@ fn source_name(source: &str) -> &'static str {
     match source {
         "dependabot" => "a Dependabot alert",
         "github_advisory" => "a GitHub advisory",
+        sec::REPOSITORY_ADVISORY => "the repository's own security advisory",
         _ => "OSV",
     }
 }
@@ -647,6 +648,24 @@ async fn dependabot_alerts(
         out,
         sec::dependabot_access(200, &Value::Null, Some(true), false),
     )
+}
+
+/// The repository's own security advisories, with how they were read:
+/// `ok`, `no_permission` (the installation hasn't granted Repository
+/// security advisories; nothing is asked again until a token carries it) or
+/// `error`.
+async fn repo_advisories(gh: &GitHubClient, repo: &str) -> (Vec<Value>, &'static str) {
+    match gh
+        .get_granted("repository_advisories", &sec::repo_advisories_path(repo))
+        .await
+    {
+        Ok(Some(v)) => (v.as_array().cloned().unwrap_or_default(), "ok"),
+        Ok(None) => (Vec::new(), "no_permission"),
+        Err(e) => {
+            warn!(repo, error = %e, "security: could not read the repository's advisories");
+            (Vec::new(), "error")
+        }
+    }
 }
 
 /// Saves what reading Dependabot said, for the repository and the team.
@@ -1416,6 +1435,18 @@ async fn sync_repo(
                 obs.push(o);
             }
         }
+        let (advisories, access) = repo_advisories(&cx.gh, repo).await;
+        set_team_state(
+            cx.state,
+            cx.team_id,
+            &[("repository_advisories", attr_s(access))],
+        )
+        .await;
+        obs.extend(
+            advisories
+                .iter()
+                .filter_map(|a| sec::observation_from_repo_advisory(repo, a)),
+        );
     }
     let osv = {
         let mut cache = cx.osv.lock().await;
