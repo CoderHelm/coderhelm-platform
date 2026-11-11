@@ -330,10 +330,10 @@ async fn evaluate_ci_verdict(
     name: &str,
     branch: &str,
 ) -> CiVerdict {
-    match github.list_check_runs_for_ref(owner, name, branch).await {
+    match github.list_ci_for_ref(owner, name, branch).await {
         Ok(checks) => ci_verdict_from_checks(&checks),
         Err(e) => {
-            warn!(owner, name, branch, error = %e, "check-runs query failed — treating CI as pending");
+            warn!(owner, name, branch, error = %e, "CI query failed — treating CI as pending");
             CiVerdict::Pending
         }
     }
@@ -1454,10 +1454,7 @@ pub async fn run(
             &state.http,
         ) {
             let git_ref = branch_head.as_deref().unwrap_or(&branch).to_string();
-            match gh
-                .list_check_runs_for_ref(&repo_owner, &repo_name, &git_ref)
-                .await
-            {
+            match gh.list_ci_for_ref(&repo_owner, &repo_name, &git_ref).await {
                 Ok(checks) => match ci_verdict_from_checks(&checks) {
                     CiVerdict::Pending if !waited_long_for_full_ci(&events, chrono::Utc::now()) => {
                         info!(
@@ -1481,7 +1478,7 @@ pub async fn run(
                     CiVerdict::Failed => {
                         let head_failing = failing_check_names(&checks);
                         let base_failing = match gh
-                            .list_check_runs_for_ref(&repo_owner, &repo_name, &base_branch)
+                            .list_ci_for_ref(&repo_owner, &repo_name, &base_branch)
                             .await
                         {
                             Ok(b) => failing_check_names(&b),

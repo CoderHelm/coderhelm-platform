@@ -1112,6 +1112,19 @@ pub fn ci_standing(check_runs: &[serde_json::Value], statuses: &[serde_json::Val
     }
 }
 
+/// Why CI isn't green, when commit statuses couldn't be read: a head with no
+/// check runs may still have CI that reports through statuses.
+fn without_statuses(ci: &Ci) -> String {
+    if ci.green || ci.why.is_empty() {
+        return ci.why.clone();
+    }
+    format!(
+        "{}. {}",
+        ci.why,
+        common::github_grants::limit_note("statuses", "CI was read from check runs only")
+    )
+}
+
 async fn ci_on(
     gh: &GitHubClient,
     owner: &str,
@@ -1119,11 +1132,18 @@ async fn ci_on(
     sha: &str,
 ) -> Result<Ci, Box<dyn std::error::Error + Send + Sync>> {
     let runs = gh.list_check_runs_for_ref(owner, repo, sha).await?;
-    let statuses = gh.get_commit_status(owner, repo, sha).await?;
-    Ok(ci_standing(
+    let statuses = gh.commit_statuses(owner, repo, sha).await?;
+    let mut ci = ci_standing(
         runs["check_runs"].as_array().map_or(&[][..], |a| a),
-        statuses["statuses"].as_array().map_or(&[][..], |a| a),
-    ))
+        statuses
+            .as_ref()
+            .and_then(|s| s["statuses"].as_array())
+            .map_or(&[][..], |a| a),
+    );
+    if statuses.is_none() {
+        ci.why = without_statuses(&ci);
+    }
+    Ok(ci)
 }
 
 /// Marks the draft ready: the "Partial" title marker goes, the run's
@@ -1785,6 +1805,34 @@ pub async fn sweep(state: &WorkerState) -> SweepReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unread_statuses_are_named_where_ci_reads_as_missing() {
+        let ci = ci_standing(&[], &[]);
+        assert!(!ci.green);
+        let why = without_statuses(&ci);
+        assert!(why.starts_with("the repository reports no CI checks on this head. "));
+        assert!(why.contains(
+            "CI was read from check runs only because CoderHelm can't read Commit statuses"
+        ));
+        assert!(why.contains("add Commit statuses: read"));
+        let green = Ci {
+            green: true,
+            why: String::new(),
+        };
+        assert_eq!(without_statuses(&green), "");
+    }
+
+    #[test]
+    fn a_red_commit_status_keeps_ci_from_green() {
+        let runs = vec![
+            serde_json::json!({"name": "lint", "status": "completed", "conclusion": "success"}),
+        ];
+        let statuses = vec![serde_json::json!({"context": "ci/jenkins", "state": "failure"})];
+        let ci = ci_standing(&runs, &statuses);
+        assert!(!ci.green);
+        assert!(ci.why.contains("`ci/jenkins`"));
+    }
     use serde_json::json;
 
     fn green_approved() -> Facts {

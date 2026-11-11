@@ -232,6 +232,7 @@ pub async fn github_token(
         .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
         .map(|t| t.timestamp())
         .unwrap_or(now + 3600);
+    crate::github_grants::record(installation_id, &v["permissions"]);
     if let Some(login) = v["bot_login"].as_str().filter(|l| !l.is_empty()) {
         if let Ok(mut g) = BOT_LOGIN.write() {
             *g = Some(login.to_string());

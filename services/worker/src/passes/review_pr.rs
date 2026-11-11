@@ -2652,7 +2652,7 @@ async fn run_once(
     // green install job on the same head — that signal must be in front of the
     // model, not discoverable-in-theory. Best-effort: absent on API failure.
     let ci_context = match github
-        .list_check_runs_for_ref(&msg.repo_owner, &msg.repo_name, &head_sha)
+        .list_ci_for_ref(&msg.repo_owner, &msg.repo_name, &head_sha)
         .await
     {
         Ok(v) => {
@@ -2691,7 +2691,7 @@ async fn run_once(
         Vec::new()
     } else {
         match github
-            .list_check_runs_for_ref(&msg.repo_owner, &msg.repo_name, base)
+            .list_ci_for_ref(&msg.repo_owner, &msg.repo_name, base)
             .await
         {
             Ok(v) => super::review_policy::failing_checks(&v),
@@ -5183,12 +5183,12 @@ async fn read_fingerprint(
         .await
         .ok()
         .map(|t| fp::threads_part(t.iter().map(|t| (t.id.clone(), t.resolved))));
-    let head_runs = github.list_check_runs_for_ref(owner, repo, head).await.ok();
+    let head_runs = github.list_ci_for_ref(owner, repo, head).await.ok();
     let base_failing = if base.is_empty() {
         Some(Vec::new())
     } else {
         github
-            .list_check_runs_for_ref(owner, repo, base)
+            .list_ci_for_ref(owner, repo, base)
             .await
             .ok()
             .map(|v| super::review_policy::failing_checks(&v))

@@ -3770,7 +3770,7 @@ async fn run_passes(
 
             // Check CI status on the PR's head commit
             let checks = github
-                .list_check_runs_for_ref(&msg.repo_owner, &msg.repo_name, &check_ref)
+                .list_ci_for_ref(&msg.repo_owner, &msg.repo_name, &check_ref)
                 .await
                 .unwrap_or_default();
             let failed_conclusions = ["failure", "action_required", "timed_out", "startup_failure"];
@@ -3830,13 +3830,7 @@ async fn run_passes(
                                         .as_str()
                                         .is_some_and(|c| failed_conclusions.contains(&c))
                                 })
-                                .filter_map(|r| {
-                                    r["details_url"]
-                                        .as_str()
-                                        .and_then(|u| u.split("/runs/").nth(1))
-                                        .and_then(|s| s.split('/').next())
-                                        .and_then(|s| s.parse::<u64>().ok())
-                                })
+                                .filter_map(common::commit_ci::actions_run_id)
                                 .next_back()
                         })
                         .unwrap_or(0);
@@ -3878,7 +3872,24 @@ async fn run_passes(
                                 .await
                                 .unwrap_or_else(|_| "(failed to download logs)".to_string())
                         } else {
-                            "(no failed check runs found)".to_string()
+                            // CI outside Actions (commit statuses): what
+                            // each said and where its log is.
+                            let failed: Vec<&serde_json::Value> = checks["check_runs"]
+                                .as_array()
+                                .map(|a| a.as_slice())
+                                .unwrap_or(&[])
+                                .iter()
+                                .filter(|r| {
+                                    r["conclusion"]
+                                        .as_str()
+                                        .is_some_and(|c| failed_conclusions.contains(&c))
+                                })
+                                .collect();
+                            if failed.is_empty() {
+                                "(no failed check runs found)".to_string()
+                            } else {
+                                feedback::failed_check_lines(&failed)
+                            }
                         }
                     };
 
