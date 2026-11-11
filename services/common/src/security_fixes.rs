@@ -804,6 +804,24 @@ fn major_of(v: &str) -> (u64, u64) {
     }
 }
 
+/// The version line a version belongs to (`4` for 4.5.3, `0.12` for
+/// 0.12.1): the copies of a package on different lines are different
+/// locations, each fixed on its own line. Empty for an empty version.
+pub fn version_line(v: &str) -> String {
+    if v.trim().is_empty() {
+        return String::new();
+    }
+    match major_of(v) {
+        (0, m) => format!("0.{m}"),
+        (a, _) => a.to_string(),
+    }
+}
+
+/// Two versions on the same line, or one of them unknown.
+pub fn same_line(a: &str, b: &str) -> bool {
+    a.trim().is_empty() || b.trim().is_empty() || version_line(a) == version_line(b)
+}
+
 /// Moving from `a` to `b` crosses a major version.
 pub fn is_major_bump(a: &str, b: &str) -> bool {
     !a.is_empty() && !b.is_empty() && major_of(a) != major_of(b)
@@ -912,6 +930,31 @@ pub fn finding_id(cluster_ids: &[String], repo: &str, manifest: &str, package: &
         .to_string()
 }
 
+/// The id of a finding first seen from now on: [`finding_id`] with the
+/// version line, so two lines of one package in one manifest (5.2.5 at the
+/// top, 4.5.3 under another package) are two findings. Findings made before
+/// keep their id (lookups go by [`merges_into_at`], never by id).
+pub fn finding_id_at(
+    cluster_ids: &[String],
+    repo: &str,
+    manifest: &str,
+    package: &str,
+    version: &str,
+) -> String {
+    let line = version_line(version);
+    if line.is_empty() {
+        return finding_id(cluster_ids, repo, manifest, package);
+    }
+    crate::sha256_hex(&[
+        &primary_id(cluster_ids),
+        &repo.to_ascii_lowercase(),
+        manifest,
+        &package.to_ascii_lowercase(),
+        &line,
+    ])[..24]
+        .to_string()
+}
+
 /// A manifest of "sbom" (the dependency graph, which doesn't say which
 /// lockfile) matches any manifest of the same repository.
 fn same_manifest(a: &str, b: &str) -> bool {
@@ -942,6 +985,21 @@ pub fn merges_into(f: &Finding, ids: &[String], repo: &str, manifest: &str, pack
             .ids
             .iter()
             .any(|i| ids.iter().any(|o| o.trim().eq_ignore_ascii_case(i.trim())))
+}
+
+/// [`merges_into`] for one installed `version`: a copy on another version
+/// line is its own finding (base images, whose tags aren't version lines,
+/// merge as before).
+pub fn merges_into_at(
+    f: &Finding,
+    ids: &[String],
+    repo: &str,
+    manifest: &str,
+    package: &str,
+    version: &str,
+) -> bool {
+    merges_into(f, ids, repo, manifest, package)
+        && (f.ecosystem == "docker" || same_line(&f.version, version))
 }
 
 // ── What a source saw ──────────────────────────────────────────────────
@@ -1006,7 +1064,7 @@ pub fn apply(
         let ids = &o.advisory.ids;
         (
             Finding {
-                id: finding_id(ids, &o.repo, &o.manifest, &o.package),
+                id: finding_id_at(ids, &o.repo, &o.manifest, &o.package, &o.version),
                 repo: o.repo.clone(),
                 manifest: o.manifest.clone(),
                 ecosystem: o.ecosystem.clone(),
@@ -2539,6 +2597,11 @@ pub struct Dep {
     pub version: String,
     pub manifest: String,
     pub scope: Scope,
+    /// How the manifest pulls it in, from the direct dependency to this
+    /// package (`["@aws-sdk/client-s3", "@aws-sdk/core", "fast-xml-parser"]`);
+    /// one entry for a direct dependency, empty when not known.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub path: Vec<String>,
 }
 
 /// OSV's ecosystem for a package URL type.
@@ -2690,6 +2753,7 @@ pub fn inventory_from_sbom(sbom: &Value) -> (Vec<Dep>, usize) {
             version,
             manifest: SBOM_MANIFEST.to_string(),
             scope: Scope::Unknown,
+            path: vec![],
         };
         if !out.contains(&d) {
             out.push(d);
@@ -2809,6 +2873,181 @@ pub fn npm_lock_scopes(lock: &Value) -> HashMap<String, Scope> {
             .or_insert(scope);
     }
     out
+}
+
+/// One installed copy of a package in a lockfile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LockCopy {
+    pub name: String,
+    pub version: String,
+    pub scope: Scope,
+    /// From the direct dependency to this package (see [`Dep::path`]).
+    pub path: Vec<String>,
+}
+
+/// The package name at an npm lockfile location
+/// (`node_modules/a/node_modules/@s/b` is `@s/b`).
+fn npm_location_name(loc: &str) -> Option<&str> {
+    loc.rsplit_once("node_modules/")
+        .map(|(_, n)| n)
+        .filter(|n| !n.is_empty())
+}
+
+/// Where `name`, required from `from`, resolves in an npm lockfile: the
+/// nearest `node_modules/<name>` up the tree, as Node looks it up.
+fn npm_resolve<'a>(
+    packages: &'a serde_json::Map<String, Value>,
+    from: &str,
+    name: &str,
+) -> Option<&'a str> {
+    let mut base = from.to_string();
+    loop {
+        let candidate = if base.is_empty() {
+            format!("node_modules/{name}")
+        } else {
+            format!("{base}/node_modules/{name}")
+        };
+        if let Some((k, _)) = packages.get_key_value(&candidate) {
+            return Some(k.as_str());
+        }
+        if base.is_empty() {
+            return None;
+        }
+        // Up one package: drop the last `node_modules/<pkg>`.
+        base = match base.rfind("/node_modules/") {
+            Some(i) => base[..i].to_string(),
+            None if base.starts_with("node_modules/") => String::new(),
+            // A workspace folder: its parent is the root.
+            None => String::new(),
+        };
+    }
+}
+
+/// Every installed copy in npm's `package-lock.json` (v2 and v3
+/// `packages`), with its version, scope and the shortest path from a
+/// direct dependency of the root (or of a workspace) to it.
+pub fn npm_lock_copies(lock: &Value) -> Vec<LockCopy> {
+    let Some(packages) = lock["packages"].as_object() else {
+        return vec![];
+    };
+    // Breadth first from the root and the workspaces: the first path to a
+    // location is a shortest one.
+    let mut path_of: HashMap<&str, Vec<String>> = HashMap::new();
+    let mut queue: std::collections::VecDeque<&str> = std::collections::VecDeque::new();
+    for (loc, _) in packages.iter() {
+        if npm_location_name(loc).is_none() {
+            path_of.insert(loc.as_str(), vec![]);
+            queue.push_back(loc.as_str());
+        }
+    }
+    while let Some(loc) = queue.pop_front() {
+        let here = path_of.get(loc).cloned().unwrap_or_default();
+        let p = &packages[loc];
+        for field in [
+            "dependencies",
+            "optionalDependencies",
+            "peerDependencies",
+            "devDependencies",
+        ] {
+            // A package's own devDependencies aren't installed; the root's are.
+            if field == "devDependencies" && npm_location_name(loc).is_some() {
+                continue;
+            }
+            for (dep, _) in p[field].as_object().into_iter().flatten() {
+                let Some(target) = npm_resolve(packages, loc, dep) else {
+                    continue;
+                };
+                if path_of.contains_key(target) {
+                    continue;
+                }
+                let mut next = here.clone();
+                next.push(dep.clone());
+                path_of.insert(target, next);
+                queue.push_back(target);
+            }
+        }
+    }
+    let mut out = vec![];
+    for (loc, p) in packages.iter() {
+        let Some(name) = npm_location_name(loc) else {
+            continue;
+        };
+        // A linked workspace package is the repo's own code.
+        if p["link"].as_bool() == Some(true) {
+            continue;
+        }
+        let Some(version) = p["version"].as_str().filter(|v| !v.is_empty()) else {
+            continue;
+        };
+        let dev = p["dev"].as_bool() == Some(true) || p["devOptional"].as_bool() == Some(true);
+        let path = path_of.get(loc.as_str()).cloned().unwrap_or_else(|| {
+            // Not reached from the root: what its location says.
+            loc.split("node_modules/")
+                .map(|s| s.trim_end_matches('/'))
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect()
+        });
+        out.push(LockCopy {
+            name: name.to_string(),
+            version: version.to_string(),
+            scope: if dev { Scope::Dev } else { Scope::Runtime },
+            path,
+        });
+    }
+    out
+}
+
+/// Gives each npm dependency the lockfile that installs that exact version,
+/// its scope there and how it is pulled in. A version installed by several
+/// lockfiles becomes one dependency per lockfile (each is its own fix).
+/// Returns how many dependencies it placed.
+pub fn place_npm_copies(deps: &mut Vec<Dep>, manifest: &str, copies: &[LockCopy]) -> usize {
+    let mut placed = 0;
+    let mut extra: Vec<Dep> = vec![];
+    for d in deps.iter_mut().filter(|d| d.ecosystem == "npm") {
+        // Shortest path among this lockfile's copies of this version; a
+        // runtime copy makes it runtime.
+        let mut mine: Vec<&LockCopy> = copies
+            .iter()
+            .filter(|c| c.name == d.name && c.version == d.version)
+            .collect();
+        if mine.is_empty() {
+            continue;
+        }
+        mine.sort_by_key(|c| c.path.len());
+        let scope = if mine.iter().any(|c| c.scope == Scope::Runtime) {
+            Scope::Runtime
+        } else {
+            Scope::Dev
+        };
+        let path = mine[0].path.clone();
+        if d.manifest == SBOM_MANIFEST || d.manifest == manifest {
+            d.manifest = manifest.to_string();
+            d.scope = scope;
+            d.path = path;
+        } else {
+            extra.push(Dep {
+                manifest: manifest.to_string(),
+                scope,
+                path,
+                ..d.clone()
+            });
+        }
+        placed += 1;
+    }
+    for e in extra {
+        if !deps.contains(&e) {
+            deps.push(e);
+        }
+    }
+    placed
+}
+
+/// The package that brings a transitive dependency in: the direct
+/// dependency at the head of its path. None for a direct one.
+pub fn direct_parent(path: &[String]) -> Option<&str> {
+    (path.len() > 1).then(|| path[0].as_str())
 }
 
 /// Scopes from `poetry.lock` (`category = "dev"` on older lockfiles).
@@ -3324,13 +3563,24 @@ pub fn fixed_by_inventory(f: &Finding, deps: &[Dep]) -> bool {
     {
         return false;
     }
-    let copies: Vec<&Dep> = deps
+    // This finding's version line only: a copy on another line is its own
+    // finding. Its own manifest's copies when it has any; else every copy
+    // on the line (a finding named for the wrong lockfile before locations
+    // were read per version is never closed while its copy is still there).
+    let on_line: Vec<&Dep> = deps
         .iter()
         .filter(|d| {
             d.ecosystem.eq_ignore_ascii_case(&f.ecosystem)
                 && same_package(&f.ecosystem, &d.name, &f.package)
+                && same_line(&d.version, &f.version)
         })
         .collect();
+    let own: Vec<&Dep> = on_line
+        .iter()
+        .copied()
+        .filter(|d| same_manifest(&d.manifest, &f.manifest))
+        .collect();
+    let copies = if own.is_empty() { on_line } else { own };
     match (&f.fixed_version, copies.is_empty()) {
         (_, true) => true,
         (Some(to), false) => copies
@@ -3838,7 +4088,19 @@ pub fn settle_without_model(
         ));
     }
     if hits == 0 {
-        let why = if st.symbols.is_empty() {
+        let why = if let Some(parent) = direct_parent(&f.path) {
+            format!(
+                "{} comes in through {} ({}), and no file in the repo's code names {} or {}. Check whether the code loads {} some other way (a dynamic import, a bundled layer) and whether it passes untrusted input to the part of {} that uses {}.",
+                f.package,
+                parent,
+                f.path.join(" > "),
+                f.package,
+                parent,
+                parent,
+                parent,
+                f.package,
+            )
+        } else if st.symbols.is_empty() {
             format!(
                 "No file in the repo's code names {}, so it comes in through another package, and the advisory names no functions to look for.",
                 f.package
@@ -4036,6 +4298,20 @@ pub fn triage_prompt(
         f.fixed_version.as_deref().unwrap_or("none yet"),
         if st.symbols.is_empty() { "none".to_string() } else { st.symbols.join(", ") },
     );
+    if let Some(parent) = direct_parent(&f.path) {
+        s.insert_str(
+            s.find("\n\nCode search results:").unwrap_or(s.len()),
+            &format!(
+                "\nDependency path: {} (in {}). The repository's code never imports {} itself; it comes in through {}. The search includes {}: judge whether the code's calls to it reach the vulnerable feature of {} (for example, whether it parses untrusted input that way).",
+                f.path.join(" > "),
+                f.manifest,
+                f.package,
+                parent,
+                parent,
+                f.package,
+            ),
+        );
+    }
     if hits.is_empty() {
         s.push_str("(no matches in the repository's code)\n");
     }
@@ -4122,6 +4398,13 @@ pub fn search_terms(f: &Finding, st: &FindingState) -> Vec<String> {
         _ => f.package.clone(),
     };
     let mut out = vec![pkg];
+    // A transitive dependency is never imported by name: search for the
+    // direct dependency that brings it in, and how the code calls it.
+    if let Some(parent) = direct_parent(&f.path) {
+        if !out.iter().any(|t| t == parent) {
+            out.push(parent.to_string());
+        }
+    }
     for sym in &st.symbols {
         let last = sym
             .rsplit(['.', ':', ')'])
@@ -4132,7 +4415,7 @@ pub fn search_terms(f: &Finding, st: &FindingState) -> Vec<String> {
         if last.len() >= 3 && !out.contains(&last) {
             out.push(last);
         }
-        if out.len() >= 4 {
+        if out.len() >= 5 {
             break;
         }
     }
@@ -5132,6 +5415,7 @@ mod tests {
                 version: "6.19.2".into(),
                 manifest: "sbom".into(),
                 scope: Scope::Unknown,
+                path: vec![],
             },
             Dep {
                 ecosystem: "npm".into(),
@@ -5139,6 +5423,7 @@ mod tests {
                 version: "6.21.1".into(),
                 manifest: "web/package-lock.json".into(),
                 scope: Scope::Runtime,
+                path: vec![],
             },
         ];
         let adv = json!({"ghsa_id": "GHSA-q9fx-2w5c-8m4r", "vulnerabilities": [{"package": {"ecosystem": "npm", "name": "undici"}, "vulnerable_version_range": "< 6.21.1", "first_patched_version": "6.21.1"}]});
@@ -5205,6 +5490,7 @@ mod tests {
             version: v.into(),
             manifest: "sbom".into(),
             scope: Scope::Unknown,
+            path: vec![],
         };
         assert!(fixed_by_inventory(&f, &[dep("6.21.1")]));
         assert!(!fixed_by_inventory(&f, &[dep("6.21.1"), dep("6.19.2")]));
@@ -6137,5 +6423,271 @@ mod tests {
         .await;
         assert!(started.is_empty());
         assert_eq!(queued[0].reason.as_deref(), Some(WAITING_REPO));
+    }
+
+    // ── Locations: one finding per lockfile and version line ───────────
+
+    /// A lockfile like the one that showed both bugs: fast-xml-parser 5.2.5
+    /// hoisted for one direct dependency, 4.5.3 nested under the AWS SDK.
+    fn two_copies_lock() -> Value {
+        json!({
+            "lockfileVersion": 3,
+            "packages": {
+                "": {"name": "video-uploader", "dependencies": {"@aws-sdk/client-s3": "^3.0.0", "xml-tools": "^1.0.0"}},
+                "node_modules/@aws-sdk/client-s3": {"version": "3.700.0", "dependencies": {"@aws-sdk/core": "3.700.0"}},
+                "node_modules/@aws-sdk/core": {"version": "3.700.0", "dependencies": {"fast-xml-parser": "4.5.3"}},
+                "node_modules/@aws-sdk/core/node_modules/fast-xml-parser": {"version": "4.5.3"},
+                "node_modules/xml-tools": {"version": "1.2.0", "dependencies": {"fast-xml-parser": "^5.2.0"}},
+                "node_modules/fast-xml-parser": {"version": "5.2.5"},
+                "node_modules/jest": {"version": "29.0.0", "dev": true}
+            }
+        })
+    }
+
+    #[test]
+    fn the_lockfile_names_each_copy_and_the_package_that_brings_it_in() {
+        let copies = npm_lock_copies(&two_copies_lock());
+        let get = |v: &str| {
+            copies
+                .iter()
+                .find(|c| c.name == "fast-xml-parser" && c.version == v)
+                .unwrap()
+        };
+        assert_eq!(
+            get("4.5.3").path,
+            vec!["@aws-sdk/client-s3", "@aws-sdk/core", "fast-xml-parser"]
+        );
+        assert_eq!(get("5.2.5").path, vec!["xml-tools", "fast-xml-parser"]);
+        assert_eq!(get("4.5.3").scope, Scope::Runtime);
+        let jest = copies.iter().find(|c| c.name == "jest").unwrap();
+        assert_eq!(jest.scope, Scope::Dev);
+        assert_eq!(
+            direct_parent(&get("4.5.3").path),
+            Some("@aws-sdk/client-s3")
+        );
+        assert_eq!(direct_parent(&["xml-tools".to_string()]), None);
+    }
+
+    #[test]
+    fn each_version_goes_to_the_lockfile_that_installs_it() {
+        let sbom = |v: &str| Dep {
+            ecosystem: "npm".into(),
+            name: "fast-xml-parser".into(),
+            version: v.into(),
+            manifest: SBOM_MANIFEST.into(),
+            ..Default::default()
+        };
+        let mut deps = vec![sbom("5.2.5"), sbom("4.5.3")];
+        // The root lockfile installs only 5.2.5; the lambda's both.
+        let root = json!({"packages": {"": {"dependencies": {"fast-xml-parser": "^5"}}, "node_modules/fast-xml-parser": {"version": "5.2.5"}}});
+        place_npm_copies(&mut deps, "package-lock.json", &npm_lock_copies(&root));
+        place_npm_copies(
+            &mut deps,
+            "lambdas/video-uploader/package-lock.json",
+            &npm_lock_copies(&two_copies_lock()),
+        );
+        let at = |m: &str, v: &str| {
+            deps.iter()
+                .find(|d| d.manifest == m && d.version == v)
+                .cloned()
+        };
+        assert_eq!(
+            at("package-lock.json", "5.2.5").unwrap().path,
+            vec!["fast-xml-parser"]
+        );
+        assert!(
+            at("package-lock.json", "4.5.3").is_none(),
+            "never named for a lockfile without it"
+        );
+        let lambda = "lambdas/video-uploader/package-lock.json";
+        assert_eq!(
+            at(lambda, "4.5.3").unwrap().path,
+            vec!["@aws-sdk/client-s3", "@aws-sdk/core", "fast-xml-parser"]
+        );
+        assert_eq!(
+            at(lambda, "5.2.5").unwrap().path,
+            vec!["xml-tools", "fast-xml-parser"]
+        );
+        assert_eq!(deps.len(), 3, "5.2.5 is in two lockfiles: two locations");
+    }
+
+    fn fxp_obs(manifest: &str, version: &str) -> Observation {
+        Observation {
+            repo: "acme/web".into(),
+            manifest: manifest.into(),
+            ecosystem: "npm".into(),
+            package: "fast-xml-parser".into(),
+            version: version.into(),
+            advisory: AdvisoryRecord {
+                ids: vec!["CVE-2026-25896".into(), "GHSA-m7jm-9gc2-mpf2".into()],
+                fixed: vec!["5.3.5".into(), "4.5.4".into()],
+                source: "osv".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// What the worker's upsert does: the finding an observation merges
+    /// into, else a new one.
+    fn upsert_all(obs: &[Observation]) -> Vec<(Finding, FindingState)> {
+        let mut out: Vec<(Finding, FindingState)> = vec![];
+        for o in obs {
+            let i = out.iter().position(|(f, _)| {
+                merges_into_at(
+                    f,
+                    &o.advisory.ids,
+                    &o.repo,
+                    &o.manifest,
+                    &o.package,
+                    &o.version,
+                )
+            });
+            let (f, st, _) = apply(i.map(|i| out[i].clone()), o, t("2026-11-11T02:27:15Z"));
+            match i {
+                Some(i) => out[i] = (f, st),
+                None => out.push((f, st)),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn two_version_lines_in_one_lockfile_are_two_findings_each_with_its_own_fix() {
+        let m = "lambdas/video-uploader/package-lock.json";
+        // Before: one finding for both copies; its version is whichever
+        // came last, and the fix was computed for that one.
+        let o5 = fxp_obs(m, "5.2.5");
+        let o4 = fxp_obs(m, "4.5.3");
+        let (f, st, _) = apply(None, &o5, t("2026-11-11T02:27:15Z"));
+        assert!(merges_into(
+            &f,
+            &o4.advisory.ids,
+            &o4.repo,
+            &o4.manifest,
+            &o4.package
+        ));
+        let (old, _, _) = apply(Some((f, st)), &o4, t("2026-11-11T02:30:00Z"));
+        assert_eq!(
+            (old.version.as_str(), old.fixed_version.as_deref()),
+            ("4.5.3", Some("4.5.4")),
+            "the bug: seen as 5.2.5, fixed as 4.5.3"
+        );
+        // Now: one per line, each fixed on its own line.
+        let fs = upsert_all(&[o5, o4]);
+        assert_eq!(fs.len(), 2);
+        let by = |v: &str| fs.iter().find(|(f, _)| f.version == v).unwrap().0.clone();
+        assert_eq!(by("5.2.5").fixed_version.as_deref(), Some("5.3.5"));
+        assert_eq!(by("4.5.3").fixed_version.as_deref(), Some("4.5.4"));
+        assert_ne!(by("5.2.5").id, by("4.5.3").id);
+        // A later version on the same line updates its finding.
+        let fs = upsert_all(&[fxp_obs(m, "4.5.1"), fxp_obs(m, "4.5.3")]);
+        assert_eq!(fs.len(), 1);
+        assert_eq!(fs[0].0.version, "4.5.3");
+    }
+
+    #[test]
+    fn a_finding_made_before_keeps_its_id_and_takes_its_own_line() {
+        let m = "lambdas/video-uploader/package-lock.json";
+        let ids = vec![
+            "CVE-2026-25896".to_string(),
+            "GHSA-m7jm-9gc2-mpf2".to_string(),
+        ];
+        let legacy = finding_id(&ids, "acme/web", m, "fast-xml-parser");
+        let (mut f, st, _) = apply(None, &fxp_obs(m, "4.5.3"), t("2026-11-11T02:27:15Z"));
+        f.id = legacy.clone();
+        let mut fs = vec![(f, st)];
+        for o in [fxp_obs(m, "4.5.3"), fxp_obs(m, "5.2.5")] {
+            let i = fs.iter().position(|(f, _)| {
+                merges_into_at(
+                    f,
+                    &o.advisory.ids,
+                    &o.repo,
+                    &o.manifest,
+                    &o.package,
+                    &o.version,
+                )
+            });
+            let (f, st, _) = apply(i.map(|i| fs[i].clone()), &o, t("2026-11-11T06:00:00Z"));
+            match i {
+                Some(i) => fs[i] = (f, st),
+                None => fs.push((f, st)),
+            }
+        }
+        assert_eq!(fs.len(), 2);
+        assert_eq!(fs[0].0.id, legacy);
+        assert_eq!(fs[0].0.version, "4.5.3");
+        assert_ne!(
+            fs[1].0.id, legacy,
+            "the new line never overwrites the old record"
+        );
+        assert_eq!(
+            fs[1].0.id,
+            finding_id_at(&ids, "acme/web", m, "fast-xml-parser", "5.2.5")
+        );
+    }
+
+    #[test]
+    fn a_bump_on_one_line_fixes_that_line_only() {
+        let m = "lambdas/video-uploader/package-lock.json";
+        let fs = upsert_all(&[fxp_obs(m, "5.2.5"), fxp_obs(m, "4.5.3")]);
+        let by = |v: &str| fs.iter().find(|(f, _)| f.version == v).unwrap().0.clone();
+        let dep = |v: &str| Dep {
+            ecosystem: "npm".into(),
+            name: "fast-xml-parser".into(),
+            version: v.into(),
+            manifest: m.into(),
+            ..Default::default()
+        };
+        // 4.5.3 bumped to 4.5.4; 5.2.5 still there.
+        let after = vec![dep("4.5.4"), dep("5.2.5")];
+        assert!(fixed_by_inventory(&by("4.5.3"), &after));
+        assert!(
+            !fixed_by_inventory(&by("5.2.5"), &after),
+            "the 5.x copy is still vulnerable"
+        );
+        // A copy only in another lockfile still keeps a finding open when
+        // its own lockfile was named wrongly before.
+        let elsewhere = vec![Dep {
+            manifest: "package-lock.json".into(),
+            ..dep("4.5.3")
+        }];
+        assert!(!fixed_by_inventory(&by("4.5.3"), &elsewhere));
+    }
+
+    #[test]
+    fn a_transitive_dependency_is_triaged_through_its_parent() {
+        let mut f = finding("fxp");
+        f.package = "fast-xml-parser".into();
+        f.version = "4.5.3".into();
+        f.manifest = "lambdas/video-uploader/package-lock.json".into();
+        f.relation = Relation::Transitive;
+        f.path = vec![
+            "@aws-sdk/client-s3".into(),
+            "@aws-sdk/core".into(),
+            "fast-xml-parser".into(),
+        ];
+        let st = FindingState::default();
+        let terms = search_terms(&f, &st);
+        assert_eq!(
+            terms[..2],
+            [
+                "fast-xml-parser".to_string(),
+                "@aws-sdk/client-s3".to_string()
+            ]
+        );
+        let p = triage_prompt(&f, &st, &[], 10_000);
+        assert!(p.contains("Dependency path: @aws-sdk/client-s3 > @aws-sdk/core > fast-xml-parser (in lambdas/video-uploader/package-lock.json)"), "{p}");
+        assert!(p.find("Dependency path").unwrap() < p.find("Code search results").unwrap());
+        // Nothing names either: the reason says which parent and what to check.
+        let (v, e) = settle_without_model(&f, &st, 0, 0, &terms).unwrap();
+        assert_eq!(v, Verdict::Unknown);
+        assert!(
+            e.summary.contains("comes in through @aws-sdk/client-s3"),
+            "{}",
+            e.summary
+        );
+        assert!(e.summary.contains("untrusted input"), "{}", e.summary);
+        assert!(e.checked.contains("`@aws-sdk/client-s3`"));
     }
 }
