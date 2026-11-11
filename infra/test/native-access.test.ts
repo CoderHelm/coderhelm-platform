@@ -53,15 +53,16 @@ const sha = (v: unknown) => crypto.createHash("sha256").update(canon(v)).digest(
 
 /**
  * Today's boundary and deploy role policy, as their sha256. Last changed for
- * bedrock:Retrieve (a Bedrock knowledge base connected in place, searched with
- * the install's own role). A change here
+ * the infrastructure vulnerability reads in the install's own account
+ * (describe and list calls on EC2, Auto Scaling, load balancers, EKS, RDS,
+ * ElastiCache, OpenSearch and ECR scans; own-account-read.ts). A change here
  * reaches no install by itself: an AWS admin applies it through the access
  * stack (Settings, System, Permissions). Before changing these two values,
  * batch it with whatever else needs the same admin step, and say so in the
  * release notes; the dashboard then offers it as one optional item.
  */
 const ACCESS_DOCS = {
-  boundary: "1dfff5e344b055bba2eb45e611d86466018eff191525cbbffab7fdf33b841141",
+  boundary: "7237e83df9c0440b1dddb449f04a1f37761f4cd9fa08bdd508690368415cd35c",
   deployRole: "d11f40637e639812ba5408d153351341bc593cb604726f6cb4193861c2dd7b1f",
 };
 

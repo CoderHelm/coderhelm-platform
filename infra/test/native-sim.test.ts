@@ -36,6 +36,7 @@ const REFUSED: Record<string, Verdict> = {
   "kms:ScheduleKeyDeletion": "explicitDeny", // it never deletes data
   "iam:CreateServiceLinkedRole": "explicitDeny", // no replicas in other regions, no SES email for Cognito
   "secretsmanager:CreateSecret": "implicitDeny", // the secret is made at launch with the admin's permissions
+  "secretsmanager:PutResourcePolicy": "implicitDeny", // part of the secret's create handler, made at launch with the admin's permissions; it sets no resource policy
   "secretsmanager:DeleteSecret": "implicitDeny", // it never deletes data
   "secretsmanager:ReplicateSecretToRegions": "implicitDeny",
   "secretsmanager:RemoveRegionsFromReplication": "implicitDeny",

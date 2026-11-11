@@ -208,6 +208,21 @@ export const BOUNDARY_SERVICES = [
   "ecr:BatchGetImage",
   "ecr:List*",
   "apigateway:*",
+  // Infrastructure vulnerabilities in the install's own account
+  // (own-account-read.ts): which versions run and what AWS has pending,
+  // describe and list calls only. Like bedrock:Retrieve, they reach an
+  // install only through the access stack an AWS admin applies.
+  "autoscaling:Describe*",
+  // DescribeImages and DescribeInstances (one pattern: IAM's 6,144 characters).
+  "ec2:DescribeI*",
+  "ecr:Describe*",
+  "eks:Describe*",
+  "eks:List*",
+  "elasticache:Describe*",
+  "elasticloadbalancing:Describe*",
+  "es:Describe*",
+  "es:List*",
+  "rds:Describe*",
   "bedrock:InvokeModel",
   "bedrock:InvokeModelWithResponseStream",
   "bedrock:Get*",
