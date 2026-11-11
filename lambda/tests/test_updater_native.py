@@ -22,6 +22,40 @@ u = importlib.util.module_from_spec(spec)
 sys.modules["updater_native"] = u
 spec.loader.exec_module(u)
 
+
+class Answer:
+    """What GET /api/me answers: a status, or an HTTPError as urllib raises it."""
+
+    def __init__(self, status):
+        self.status = status
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def answers(*statuses):
+    """An opener for api_status: each call takes the next status (the last repeats);
+    an int >= 400 is raised as urllib does, an exception is raised as is."""
+    seen = []
+
+    def opener(req, timeout):
+        seen.append(req.full_url)
+        s = statuses[min(len(seen), len(statuses)) - 1]
+        if isinstance(s, Exception):
+            raise s
+        if s >= 400:
+            raise u.urllib.error.HTTPError(req.full_url, s, "x", {}, None)
+        return Answer(s)
+    opener.seen = seen
+    return opener
+
+
+# No test reaches the network: an install's API answers 401 (up, not signed in) unless a test says otherwise.
+u.API_OPENER = answers(401)
+
 NOW = datetime(2026, 10, 31, 12, 0, tzinfo=timezone.utc)
 TEMPLATE = json.dumps({"Parameters": {"Stage": {}, "AdminEmail": {}, "KeepDataOnDelete": {}, "Hostname": {}, "DomainCertificateArn": {}, "DomainZoneId": {}}}).encode()
 SHA = hashlib.sha256(TEMPLATE).hexdigest()
@@ -1480,3 +1514,98 @@ class ModelCheckTruth(unittest.TestCase):
         self.assertTrue(rec["stalled"])
         self.assertIn("bad signature", rec["note"])
         self.assertTrue(u.blocking(rec, "v0.8.39"))
+
+
+class AnswersAfterUpdate(unittest.TestCase):
+    """After UPDATE_COMPLETE the new release must answer GET /api/me with 401
+    or 200 (as `coderhelm-selfhost update` checks it), within about 2 minutes.
+    One that doesn't is a failed update with a plain reason, never rolled back
+    by itself; when the updater can't reach the install, it couldn't check."""
+
+    def setUp(self):
+        self.store = u.Store(FakeDynamo(), "t")
+        self.cfn = ManyChangeSets()
+        self.cfn.nested["nested-api"] = {"Changes": IAM_CHANGE}
+        u._clients["cloudformation"] = self.cfn
+        u._clients["lambda"] = FakeLambda()
+        self._saved = (u.fetch_template, u.notify, u.API_OPENER, u._sleep, u._clock)
+        u.fetch_template = lambda url, opener=None: TEMPLATE
+        u.notify = lambda *a, **k: None
+        self.t = [0.0]
+        u._clock = lambda: self.t[0]
+        u._sleep = lambda s: self.t.__setitem__(0, self.t[0] + s)
+        self.env = dict(ENV, DEPLOY_ROLE_ARN=ROLE, CODERHELM_VERSION="v0.8.32")
+        self.store.put("MANIFEST#v0.8.39", {"verified": True, "manifest": None, "template_sha256": SHA})
+
+    def tearDown(self):
+        u.fetch_template, u.notify, u.API_OPENER, u._sleep, u._clock = self._saved
+        u._clients.pop("cloudformation", None)
+        u._clients.pop("lambda", None)
+
+    def finished(self, opener, at=NOW.replace(minute=25)):
+        """v0.8.39 ran to UPDATE_COMPLETE; the scheduled poll follows it with `opener`."""
+        e = u.begin(self.store, self.env, NOW, "v0.8.39", "owner@example.org", "update")
+        self.cfn.per[e["change_set_id"]] = {"Status": "CREATE_COMPLETE", "ExecutionStatus": "EXECUTE_COMPLETE"}
+        self.cfn.stack_status = "UPDATE_COMPLETE"
+        self.cfn.outputs = [{"OutputKey": "Version", "OutputValue": "v0.8.39"}]
+        u.API_OPENER = opener
+        u.handle({"action": "native_poll"}, self.env, self.store, at)
+        return self.store.get(e["id"])
+
+    def test_401_is_a_success(self):
+        opener = answers(401)
+        row = self.finished(opener)
+        self.assertEqual(row["status"], "succeeded")
+        self.assertEqual(row["reason"], "")
+        self.assertEqual(opener.seen, ["https://x.example.com/api/me"])
+
+    def test_a_500_after_a_moment_then_401_is_a_success(self):
+        row = self.finished(answers(502, 502, 401))
+        self.assertEqual(row["status"], "succeeded")
+        self.assertEqual(self.t[0], 2 * u.API_PAUSE)
+
+    def test_500_for_the_whole_window_is_a_failure_with_roll_back_kept(self):
+        opener = answers(500)
+        row = self.finished(opener)
+        self.assertEqual(row["status"], "failed")
+        self.assertEqual(row["reason"], "The update finished but the new version doesn't answer: HTTP 500. Use Roll back to return to v0.8.32.")
+        self.assertEqual(row["fix"], "Use Roll back to return to v0.8.32.")
+        self.assertEqual(row["from_version"], "v0.8.32")
+        # It kept asking for about 2 minutes, and rolled nothing back by itself.
+        self.assertGreaterEqual(self.t[0], u.API_WINDOW)
+        self.assertLessEqual(self.t[0], u.API_WINDOW + u.API_PAUSE)
+        self.assertGreater(len(opener.seen), 10)
+        self.assertEqual(len(self.cfn.created), 1)
+        self.assertFalse(getattr(self.cfn, "continued", None))
+        # Roll back (no version given) goes to where the update came from.
+        self.env["CODERHELM_VERSION"] = "v0.8.39"
+        self.store.put("MANIFEST#v0.8.32", {"verified": True, "manifest": None, "template_sha256": SHA})
+        back = u.handle({"action": "rollback", "actor": "owner@example.org"}, self.env, self.store, NOW.replace(minute=30))
+        self.assertEqual(self.store.get(back["id"])["version"], "v0.8.32")
+
+    def test_the_status_route_asks_once_and_never_waits(self):
+        e = u.begin(self.store, self.env, NOW, "v0.8.39", "owner@example.org", "update")
+        self.cfn.per[e["change_set_id"]] = {"Status": "CREATE_COMPLETE", "ExecutionStatus": "EXECUTE_COMPLETE"}
+        self.cfn.stack_status = "UPDATE_COMPLETE"
+        self.cfn.outputs = [{"OutputKey": "Version", "OutputValue": "v0.8.39"}]
+        u.API_OPENER = answers(500)
+        self.assertEqual(u.native_poll(self.store, self.env, NOW.replace(minute=25))["native"], "checking")
+        self.assertEqual(self.t[0], 0)
+        self.assertEqual(self.store.get(e["id"])["status"], "running")
+        # The next poll, past the window, ends it.
+        u.native_poll(self.store, self.env, NOW.replace(minute=28))
+        self.assertEqual(self.store.get(e["id"])["status"], "failed")
+
+    def test_unreachable_is_a_success_that_says_it_couldnt_check(self):
+        row = self.finished(answers(u.urllib.error.URLError("timed out")))
+        self.assertEqual(row["status"], "succeeded")
+        self.assertIn("couldn't check that the new version answers", row["reason"])
+        self.assertIn("https://x.example.com/api/me", row["reason"])
+
+    def test_no_public_url_skips_the_check_and_says_so(self):
+        self.env["APP_URL"] = ""
+        opener = answers(500)
+        row = self.finished(opener)
+        self.assertEqual(row["status"], "succeeded")
+        self.assertIn("wasn't checked", row["reason"])
+        self.assertEqual(opener.seen, [])
