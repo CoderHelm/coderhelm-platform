@@ -2944,6 +2944,24 @@ pub const OWN_CODE: &str = "repository";
 /// The manifest of a finding in the repository's own code.
 pub const OWN_CODE_MANIFEST: &str = "(this repository's code)";
 
+/// How the repositories' own advisories were last read (the team state's
+/// `repository_advisories`), for the Security page: `ok`, `no_permission`,
+/// `error` or `unread`, and when CoderHelm can't read them, a sentence saying
+/// so and how to add the permission.
+pub fn repo_advisories_source(state: &str) -> Value {
+    let state = match state {
+        "ok" | "no_permission" | "error" => state,
+        _ => "unread",
+    };
+    json!({
+        "state": state,
+        "note": (state == "no_permission").then(|| crate::github_grants::limit_note(
+            "repository_advisories",
+            "Your repositories' own advisories and private vulnerability reports aren't read",
+        )),
+    })
+}
+
 /// The repository's own advisories (`GET /repos/{o}/{r}/security-advisories`,
 /// the `repository_advisories` permission).
 pub fn repo_advisories_path(repo: &str) -> String {
@@ -4176,6 +4194,18 @@ mod tests {
         );
         // Inventory never calls own code fixed.
         assert!(!fixed_by_inventory(&f, &[]));
+    }
+
+    #[test]
+    fn the_page_says_when_own_advisories_cant_be_read() {
+        let v = repo_advisories_source("no_permission");
+        assert_eq!(v["state"], "no_permission");
+        assert!(v["note"]
+            .as_str()
+            .unwrap()
+            .contains("add Repository security advisories: read"));
+        assert!(repo_advisories_source("ok")["note"].is_null());
+        assert_eq!(repo_advisories_source("")["state"], "unread");
     }
 
     #[test]
