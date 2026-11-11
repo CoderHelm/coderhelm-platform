@@ -709,7 +709,8 @@ pub async fn run(
         "coder",
         super::requester_email(msg),
     )
-    .await;
+    .await
+    .map(|k| k.for_run(run_id.unwrap_or_default()));
     if let Some(k) = &knowledge {
         tools.extend(k.tools());
         full_system.push_str(&k.prompt_section());

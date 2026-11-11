@@ -130,6 +130,36 @@ pub async fn search_base(
         )
     })?;
     super::knowledge::reembed(&state, &claims.team_id, &found.stale).await;
+    {
+        use common::knowledge::usage;
+        let hits: Vec<(String, String, String)> = found
+            .hits
+            .iter()
+            .map(|h| (h.kb_id.clone(), h.file_id.clone(), h.file_name.clone()))
+            .collect();
+        let evs = usage::events(
+            std::slice::from_ref(&base.id),
+            usage::surface::PAGE,
+            &claims.email,
+            "",
+            query,
+            &hits,
+            &[],
+            if hits.is_empty() {
+                usage::outcome::NO_HITS
+            } else {
+                usage::outcome::FOUND
+            },
+            &chrono::Utc::now().to_rfc3339(),
+        );
+        usage::log(
+            &state.dynamo,
+            &state.config.settings_table_name,
+            &claims.team_id,
+            &evs,
+        )
+        .await;
+    }
     info!(team_id = %claims.team_id, kb = %base.id, hits = found.hits.len(), "Knowledge page search");
     Ok(Json(json!({
         "passages": ask::passages(&found.hits, k),
@@ -187,6 +217,48 @@ async fn model_questions(
         .unwrap_or_default();
     let q = ask::parse_questions(&text);
     (!q.is_empty()).then_some(q)
+}
+
+/// GET /api/knowledge/:kb_id/usage — what the base is used for: searches
+/// this week (per day and per surface), its most cited pages, the pages no
+/// search found, the runs and chats that used it, and the questions it had
+/// no good answer for (their words for managers only).
+pub async fn usage(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Path(kb_id): Path<String>,
+) -> Reply {
+    let base = super::knowledge::readable_base(&state, &claims, &kb_id).await?;
+    let evs = common::knowledge::usage::read(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        &claims.team_id,
+        &base.id,
+    )
+    .await
+    .map_err(|e| {
+        warn!(error = %e, "Knowledge usage unreadable");
+        fail(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Something went wrong. Try again.",
+        )
+    })?;
+    let files = super::knowledge::store(&state)
+        .files(&claims.team_id, &base.id)
+        .await
+        .unwrap_or_default();
+    let searchable: Vec<(String, String)> = files
+        .iter()
+        .filter(|f| f.ready_version > 0)
+        .map(|f| (f.id.clone(), f.name.clone()))
+        .collect();
+    Ok(Json(common::knowledge::usage::summarize(
+        &evs,
+        &searchable,
+        chrono::Utc::now().timestamp(),
+        &claims.email,
+        claims.holder().holds("knowledge_manage"),
+    )))
 }
 
 /// GET /api/knowledge/:kb_id/suggestions — questions to try. Kept per base

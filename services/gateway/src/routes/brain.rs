@@ -997,6 +997,58 @@ pub async fn rate_message(
     put(&state, &claims.team_id, &message_sk(&t.id, seq), &m)
         .await
         .map_err(|e| internal("chat message save", e))?;
+    // A rated answer from named knowledge bases counts in their usage (a
+    // thumbs down lists the question under "no good answer").
+    if let Some(r) = m.feedback.as_deref() {
+        let asked = state
+            .dynamo
+            .get_item()
+            .table_name(&state.config.settings_table_name)
+            .key("pk", AttributeValue::S(claims.team_id.clone()))
+            .key(
+                "sk",
+                AttributeValue::S(message_sk(&t.id, seq.saturating_sub(1))),
+            )
+            .send()
+            .await
+            .ok()
+            .and_then(|o| o.item().and_then(read_data::<Message>));
+        if let Some(q) = asked {
+            use common::knowledge::usage;
+            let kbs: Vec<String> = q
+                .mentions
+                .iter()
+                .filter(|x| x.kind == "knowledge")
+                .map(|x| x.id.clone())
+                .collect();
+            let evs = usage::events(
+                &kbs,
+                if t.origin == ORIGIN_KB_PAGE {
+                    usage::surface::PAGE
+                } else {
+                    usage::surface::CHAT
+                },
+                &claims.email,
+                &t.id,
+                &q.content,
+                &[],
+                &[],
+                if r == "down" {
+                    usage::outcome::RATED_DOWN
+                } else {
+                    usage::outcome::RATED_UP
+                },
+                &now(),
+            );
+            usage::log(
+                &state.dynamo,
+                &state.config.settings_table_name,
+                &claims.team_id,
+                &evs,
+            )
+            .await;
+        }
+    }
     info!(
         team_id = %claims.team_id,
         thread = %t.id,
@@ -1202,6 +1254,20 @@ struct Run {
     is_admin: bool,
     /// What the runs the question is about are doing (from `run` mentions).
     run_note: String,
+    /// What the knowledge searches found (`(base, item, title)`), for the
+    /// bases' usage.
+    found: std::sync::Mutex<Vec<(String, String, String)>>,
+}
+
+impl Run {
+    fn note_found(&self, hits: &[common::knowledge::search::Hit]) {
+        if let Ok(mut f) = self.found.lock() {
+            f.extend(
+                hits.iter()
+                    .map(|h| (h.kb_id.clone(), h.file_id.clone(), h.file_name.clone())),
+            );
+        }
+    }
 }
 
 /// Most runs one question carries as context.
@@ -1512,6 +1578,7 @@ async fn run_tool(
             .await
             {
                 Ok(found) if !found.hits.is_empty() => {
+                    run.note_found(&found.hits);
                     super::knowledge::reembed(state, &run.team_id, &found.stale).await;
                     let ids = reg.add_hits(&found.hits);
                     (
@@ -2105,12 +2172,14 @@ pub async fn brain_stream(
             .await,
         is_admin: claims.holder().holds("integrations"),
         run_note: run_note(&state, &claims.team_id, &mentioned_runs(&body.mentions)).await,
+        found: std::sync::Mutex::new(Vec::new()),
     };
 
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(256);
     let user_id = claims.sub.clone();
     let attachments = body.attachments.clone();
     let mentions = body.mentions.clone();
+    let origin_page = from_page;
     info!(
         team_id = %claims.team_id,
         thread = %thread.id,
@@ -2190,6 +2259,55 @@ pub async fn brain_stream(
         .await;
         if let Err(e) = saved {
             error!(error = %e, "Chat answer not saved");
+        }
+        if !run.kb_ids.is_empty() {
+            use common::knowledge::usage;
+            let found = run.found.lock().map(|f| f.clone()).unwrap_or_default();
+            let cited: Vec<String> = fin
+                .citations
+                .iter()
+                .filter(|c| !c.base.is_empty())
+                .map(|c| c.title.clone())
+                .collect();
+            let outcome = if found.is_empty() {
+                usage::outcome::NO_HITS
+            } else if fin.grounded {
+                usage::outcome::ANSWERED
+            } else {
+                usage::outcome::NO_SOURCE
+            };
+            // Only the bases something came from, or the one the page asked.
+            let mut kbs: Vec<String> = run
+                .kb_ids
+                .iter()
+                .filter(|k| found.iter().any(|(b, _, _)| b == *k))
+                .cloned()
+                .collect();
+            if kbs.is_empty() && run.kb_ids.len() == 1 {
+                kbs = run.kb_ids.clone();
+            }
+            let evs = usage::events(
+                &kbs,
+                if origin_page {
+                    usage::surface::PAGE
+                } else {
+                    usage::surface::CHAT
+                },
+                &run.user_email,
+                &thread.id,
+                &question,
+                &found,
+                &cited,
+                outcome,
+                &now(),
+            );
+            usage::log(
+                &run.state.dynamo,
+                &run.state.config.settings_table_name,
+                &run.team_id,
+                &evs,
+            )
+            .await;
         }
         sink.send("done", json!({})).await;
     });
@@ -2296,6 +2414,7 @@ async fn answer(
         .await
         {
             Ok(found) => {
+                run.note_found(&found.hits);
                 super::knowledge::reembed(state, &run.team_id, &found.stale).await;
                 first_ids.extend(reg.add_hits(&found.hits));
             }

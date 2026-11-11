@@ -143,6 +143,7 @@ pub const CAPABILITIES: &[Capability] = &[
             "knowledge::list_runs",
             "knowledge_ask::search_base",
             "knowledge_ask::suggestions",
+            "knowledge_ask::usage",
             "brain::list_threads",
             "brain::get_thread",
             "brain::sources",

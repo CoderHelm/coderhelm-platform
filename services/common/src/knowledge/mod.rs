@@ -38,6 +38,7 @@ pub mod remote;
 pub mod remote_mcp;
 pub mod search;
 pub mod sources;
+pub mod usage;
 
 use serde::{Deserialize, Serialize};
 

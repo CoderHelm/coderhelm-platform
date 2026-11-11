@@ -177,7 +177,7 @@ pub async fn run_search(
     args: &Value,
     app_url: &str,
     now: chrono::DateTime<chrono::Utc>,
-) -> Result<(Value, Vec<kb::search::Stale>), String> {
+) -> Result<(Value, Vec<kb::search::Stale>, Searched), String> {
     let query = args
         .get("query")
         .and_then(Value::as_str)
@@ -197,6 +197,7 @@ pub async fn run_search(
         return Ok((
             json!({ "passages": [], "note": "You can't read any knowledge base yet." }),
             Vec::new(),
+            Searched::default(),
         ));
     }
     let found = search(
@@ -222,7 +223,25 @@ pub async fn run_search(
     if !unreached.is_empty() {
         out["unreached"] = Value::Array(unreached);
     }
-    Ok((out, found.stale))
+    let searched = Searched {
+        kb_ids: ids,
+        query: query.to_string(),
+        hits: found
+            .hits
+            .iter()
+            .map(|h| (h.kb_id.clone(), h.file_id.clone(), h.file_name.clone()))
+            .collect(),
+    };
+    Ok((out, found.stale, searched))
+}
+
+/// What a search covered and found, for the bases' usage.
+#[derive(Debug, Default)]
+pub struct Searched {
+    pub kb_ids: Vec<String>,
+    pub query: String,
+    /// `(base, item, title)`.
+    pub hits: Vec<(String, String, String)>,
 }
 
 #[cfg(test)]
@@ -301,7 +320,7 @@ mod tests {
             "kbp",
             Ok(vec![remote_hit("glean/doc", "The deploy plan from Glean.")]),
         );
-        let (v, _) = run_search(
+        let (v, _, _) = run_search(
             st,
             &WordEmbedder,
             &fr,
@@ -420,7 +439,7 @@ mod tests {
     async fn passages_carry_title_link_time_and_score() {
         let st = team();
         let fr = FakeRetriever::default();
-        let (v, _) = run_search(
+        let (v, _, _) = run_search(
             &st,
             &WordEmbedder,
             &fr,
