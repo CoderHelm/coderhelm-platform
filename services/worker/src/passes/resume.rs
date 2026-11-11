@@ -1726,6 +1726,9 @@ pub async fn run(
             .collect();
 
         let mut all_logs = Vec::new();
+        // Set when the installation can't read Actions: said once, in the
+        // fix's context, instead of a failed download per run.
+        let mut logs_note: Option<String> = None;
         for wf_run_id in &failed_run_ids {
             match github
                 .get_workflow_run_logs(&repo_owner, &repo_name, *wf_run_id)
@@ -1737,6 +1740,10 @@ pub async fn run(
                     // compile cascades put the root cause at the head.
                     let budget = MAX_LOG_CHARS / failed_run_ids.len().max(1);
                     all_logs.push(focus_failing_log(&l, budget));
+                }
+                Err(e) if e.to_string() == crate::clients::github::actions_unreadable() => {
+                    logs_note = Some(e.to_string());
+                    break;
                 }
                 Err(e) => {
                     warn!(
@@ -1751,8 +1758,10 @@ pub async fn run(
             all_logs.join("\n\n--- Next workflow ---\n\n")
         } else {
             // Fallback: fetch annotations from failed check runs (uses checks:read, not actions:read)
-            warn!("No workflow logs available — falling back to check run annotations");
-            match github
+            if logs_note.is_none() {
+                warn!("No workflow logs available — falling back to check run annotations");
+            }
+            let found = match github
                 .get_check_run_annotations(&repo_owner, &repo_name, &branch)
                 .await
             {
@@ -1765,6 +1774,10 @@ pub async fn run(
                     format!("{failure_logs}\n\nCheck run annotations:\n{annotations}")
                 }
                 _ => failure_logs.clone(),
+            };
+            match &logs_note {
+                Some(note) => format!("{note}\n\n{found}"),
+                None => found,
             }
         };
 
