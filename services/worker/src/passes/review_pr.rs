@@ -2720,7 +2720,8 @@ async fn run_once(
     // where the fix belongs, so a diff that overrides source data can be
     // judged against it.
     let plan_context = plan_evidence_for_pr(state, &msg).await;
-    let extra_context = format!("{graph_context}{ci_context}{plan_context}");
+    let quality_context = code_quality_context(&github, &msg, &compare).await;
+    let extra_context = format!("{graph_context}{ci_context}{quality_context}{plan_context}");
 
     // CoderHelm's own threads from earlier reviews, with the replies under them.
     // Still-open ones: the re-review reports each as fixed or answered (→ resolved
@@ -4621,6 +4622,39 @@ async fn load_learning_context(
         "\n\n## Past reviewer feedback from this team (learn from it — don't repeat rejected styles)\n{}",
         notes.join("\n")
     )
+}
+
+/// GitHub Code Quality's open findings on the files the pull request
+/// changes, as a prompt section (see `common::code_quality`). Empty when
+/// there are none, when the installation can't read Code quality (no
+/// request once that is known), or when the repository doesn't run it.
+async fn code_quality_context(
+    github: &GitHubClient,
+    msg: &ReviewMessage,
+    compare: &serde_json::Value,
+) -> String {
+    let changed: Vec<String> = compare["files"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|f| f["filename"].as_str().map(str::to_string))
+        .collect();
+    if changed.is_empty() {
+        return String::new();
+    }
+    let path = common::code_quality::list_path(&msg.repo_owner, &msg.repo_name);
+    match github.get_granted("code_quality", &path).await {
+        Ok(Some(v)) => {
+            let all = v.as_array().map(|a| a.as_slice()).unwrap_or(&[]);
+            common::code_quality::context(&common::code_quality::on_changed_files(all, &changed))
+        }
+        Ok(None) => String::new(),
+        // Code quality off for the repository (a 404) is the common case.
+        Err(e) => {
+            tracing::debug!(pr = msg.pr_number, error = %e, "No code quality findings read");
+            String::new()
+        }
+    }
 }
 
 /// What the planner of CoderHelm's run behind this PR found about where the
