@@ -3658,8 +3658,93 @@ pub fn dependabot_access(
             "off",
             "GitHub didn't find Dependabot alerts for this repo; turn on the dependency graph and Dependabot alerts in the repo's Settings, Code security.",
         ),
-        _ => a("error", "GitHub didn't answer for Dependabot's alerts; it is tried again on the next check."),
+        _ => {
+            let said = body["message"].as_str().unwrap_or("").trim();
+            let said = if said.is_empty() {
+                String::new()
+            } else {
+                format!(": {said}")
+            };
+            let reason = if code >= 500 {
+                format!("GitHub returned a server error ({code}{said}) for Dependabot's alerts; it is tried again on the next check.")
+            } else {
+                format!("GitHub turned down the request for Dependabot's alerts ({code}{said}); it is tried again on the next check.")
+            };
+            DependabotAccess {
+                state: "error".into(),
+                reason,
+            }
+        }
     }
+}
+
+/// Why a request for Dependabot's alerts got no answer from GitHub at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DependabotUnreached {
+    /// The installation token couldn't be had (CoderHelm's hosted token
+    /// service, or GitHub's token endpoint), with what it said.
+    Token(String),
+    /// GitHub didn't answer in time.
+    TimedOut,
+    /// No connection to GitHub could be made.
+    Connect(String),
+    /// Anything else on the way, with what it was.
+    Other(String),
+}
+
+/// The state for a read of Dependabot's alerts that got no HTTP answer,
+/// naming the cause.
+pub fn dependabot_unreached(why: &DependabotUnreached) -> DependabotAccess {
+    let reason = match why {
+        DependabotUnreached::Token(e) => format!(
+            "The token service refused a GitHub token for Dependabot's alerts: {e}; it is tried again on the next check."
+        ),
+        DependabotUnreached::TimedOut => {
+            "GitHub timed out on Dependabot's alerts; it is tried again on the next check.".into()
+        }
+        DependabotUnreached::Connect(e) => format!(
+            "CoderHelm couldn't connect to GitHub for Dependabot's alerts: {e}; it is tried again on the next check."
+        ),
+        DependabotUnreached::Other(e) => format!(
+            "Reading Dependabot's alerts failed before GitHub answered: {e}; it is tried again on the next check."
+        ),
+    };
+    DependabotAccess {
+        state: "error".into(),
+        reason,
+    }
+}
+
+/// `GET /repos/{repo}/dependabot/alerts` for open alerts, 100 a page. This
+/// endpoint pages by cursor only: GitHub answers 400 to a `page` parameter.
+/// `after` is the cursor of the page before ([`dependabot_next_cursor`]).
+pub fn dependabot_alerts_path(repo: &str, after: Option<&str>) -> String {
+    let mut p = format!("/repos/{repo}/dependabot/alerts?state=open&per_page=100");
+    if let Some(c) = after.filter(|c| !c.is_empty()) {
+        p.push_str("&after=");
+        p.push_str(&urlencoding::encode(c));
+    }
+    p
+}
+
+/// The `after` cursor of the next page, from a response's `Link` header
+/// (`<...&after=X>; rel="next"`). None on the last page.
+pub fn dependabot_next_cursor(link: Option<&str>) -> Option<String> {
+    link?.split(',').find_map(|part| {
+        let (url, rels) = part.split_once(';')?;
+        if !rels.split(';').any(|r| r.trim() == "rel=\"next\"") {
+            return None;
+        }
+        let url = url.trim().trim_start_matches('<').trim_end_matches('>');
+        let query = url.split_once('?')?.1;
+        query.split('&').find_map(|kv| {
+            let (k, v) = kv.split_once('=')?;
+            (k == "after")
+                .then(|| urlencoding::decode(v).ok().map(|s| s.into_owned()))
+                .flatten()
+                .filter(|s| !s.is_empty())
+        })
+    })
 }
 
 /// The team's Dependabot state from each repository's: the one that needs a
@@ -5412,6 +5497,73 @@ mod tests {
         // The team shows the one that needs a person first.
         let t = team_dependabot([&off, &lacks]).unwrap();
         assert_eq!(t.state, "not_accepted");
+    }
+
+    const VAGUE: &str = "didn't answer";
+
+    #[test]
+    fn dependabot_errors_name_what_github_said() {
+        // What GitHub answers to a `page` parameter on this endpoint.
+        let bad = dependabot_access(
+            400,
+            &json!({"message": "Pagination using the `page` parameter is not supported."}),
+            Some(true),
+            false,
+        );
+        assert_eq!(bad.state, "error");
+        assert!(bad.reason.contains("400"), "{}", bad.reason);
+        assert!(bad.reason.contains("`page` parameter"), "{}", bad.reason);
+        assert!(!bad.reason.contains(VAGUE));
+        let down = dependabot_access(502, &Value::Null, None, false);
+        assert!(
+            down.reason.contains("server error (502)"),
+            "{}",
+            down.reason
+        );
+        assert!(!down.reason.contains(VAGUE));
+    }
+
+    #[test]
+    fn dependabot_unreached_names_the_cause() {
+        let token = dependabot_unreached(&DependabotUnreached::Token(
+            "the link doesn't cover this installation (broker_refused)".into(),
+        ));
+        assert_eq!(token.state, "error");
+        assert!(token.reason.starts_with("The token service refused"));
+        assert!(token.reason.contains("broker_refused"));
+        let slow = dependabot_unreached(&DependabotUnreached::TimedOut);
+        assert!(slow.reason.contains("timed out"));
+        let conn = dependabot_unreached(&DependabotUnreached::Connect("dns error".into()));
+        assert!(conn.reason.contains("couldn't connect") && conn.reason.contains("dns error"));
+        let other = dependabot_unreached(&DependabotUnreached::Other("bad header".into()));
+        assert!(other.reason.contains("bad header"));
+        for a in [token, slow, conn, other] {
+            assert!(!a.reason.contains(VAGUE), "{}", a.reason);
+        }
+    }
+
+    #[test]
+    fn dependabot_pages_by_cursor_never_by_page_number() {
+        let first = dependabot_alerts_path("o/r", None);
+        assert_eq!(
+            first,
+            "/repos/o/r/dependabot/alerts?state=open&per_page=100"
+        );
+        assert!(!first.contains("&page="));
+        let next = dependabot_alerts_path("o/r", Some("Y3Vyc29y+/=="));
+        assert!(!next.contains("&page="));
+        assert!(next.ends_with("&after=Y3Vyc29y%2B%2F%3D%3D"), "{next}");
+        // The cursor round-trips through GitHub's Link header.
+        let link = "<https://api.github.com/repositories/1/dependabot/alerts?state=open&per_page=100&after=Y3Vyc29y%2B%2F%3D%3D>; rel=\"next\", <https://api.github.com/repositories/1/dependabot/alerts?per_page=100&before=Zm9v>; rel=\"prev\"";
+        assert_eq!(
+            dependabot_next_cursor(Some(link)).as_deref(),
+            Some("Y3Vyc29y+/==")
+        );
+        // The last page: only prev, or no header.
+        let last =
+            "<https://api.github.com/repositories/1/dependabot/alerts?before=Zm9v>; rel=\"prev\"";
+        assert_eq!(dependabot_next_cursor(Some(last)), None);
+        assert_eq!(dependabot_next_cursor(None), None);
     }
 
     // ── Triage without the model ───────────────────────────────────────

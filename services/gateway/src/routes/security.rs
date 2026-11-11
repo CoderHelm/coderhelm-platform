@@ -256,7 +256,7 @@ pub fn source_rows(team_state: &Item, kev: &Item, findings: &[(Finding, FindingS
         "on" => ("ok", String::new()),
         "off" => ("off", opt(team_state, "dependabot_reason").unwrap_or_else(|| "Dependabot alerts are turned off for a repository; turn them on in its Settings, Code security.".into())),
         "not_accepted" | "no_permission" => ("needs_permission", opt(team_state, "dependabot_reason").unwrap_or_else(|| "The GitHub App needs Dependabot alerts: read.".into())),
-        _ => ("error", opt(team_state, "dependabot_reason").unwrap_or_else(|| "GitHub didn't answer; tried again on the next check.".into())),
+        _ => ("error", opt(team_state, "dependabot_reason").unwrap_or_else(|| "The last read of Dependabot's alerts failed; the next check records why.".into())),
     };
     let osv_error = opt(team_state, "osv_error");
     let osv_synced = opt(team_state, "osv_synced_at");

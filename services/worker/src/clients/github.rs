@@ -900,6 +900,17 @@ impl GitHubClient {
         &self,
         path: &str,
     ) -> Result<(u16, serde_json::Value), Box<dyn std::error::Error + Send + Sync>> {
+        let (status, body, _) = self.get_status_link(path).await?;
+        Ok((status, body))
+    }
+
+    /// [`Self::get_status`], with the response's `Link` header (how a
+    /// cursor-paged endpoint names its next page).
+    pub async fn get_status_link(
+        &self,
+        path: &str,
+    ) -> Result<(u16, serde_json::Value, Option<String>), Box<dyn std::error::Error + Send + Sync>>
+    {
         let headers = self.auth_headers().await?;
         let mut req = self.http.get(format!("{API_BASE}{path}"));
         for (k, v) in headers {
@@ -907,8 +918,13 @@ impl GitHubClient {
         }
         let resp = self.send_tracked(req).await?;
         let status = resp.status().as_u16();
+        let link = resp
+            .headers()
+            .get(reqwest::header::LINK)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
         let body = resp.json().await.unwrap_or(serde_json::Value::Null);
-        Ok((status, body))
+        Ok((status, body, link))
     }
 
     /// GET an API path that needs `permission`. None when the installation
