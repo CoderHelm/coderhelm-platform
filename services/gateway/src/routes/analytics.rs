@@ -124,6 +124,21 @@ pub struct RunRow {
     pub ci_reruns: u64,
     /// CI went green after such a re-run.
     pub ci_flaky: bool,
+    /// What a run waiting on a person waits for, in a word a team can act
+    /// on (`common::run_wait::WaitingOn`'s action, else its questions).
+    /// Empty when the record names nothing.
+    pub waiting_for: String,
+}
+
+/// What a `needs_input` run waits for, from its record.
+fn waiting_for(i: &Item) -> String {
+    if let Some(w) = common::run_wait::WaitingOn::of_item(i) {
+        return w.action;
+    }
+    if common::run_wait::asks_something(i) {
+        return "Answer CoderHelm's questions on the run page".to_string();
+    }
+    String::new()
 }
 
 impl RunRow {
@@ -170,7 +185,27 @@ impl RunRow {
             ci_red_on_base: list_s(i, "ci_red_on_base"),
             ci_reruns: n(i, "ci_reruns") as u64,
             ci_flaky: b(i, "ci_flaky").unwrap_or(false),
+            waiting_for: waiting_for(i),
         }
+    }
+    /// The run failed. A failed run a person then retried or started over
+    /// is `retried` now, and still failed: every failure records the pass it
+    /// failed in (`common::run_fail`), and nothing else writes that field.
+    /// Counting `failed` alone hid most failures, since a person retries
+    /// the ones worth retrying.
+    pub fn failed(&self) -> bool {
+        self.status == common::run_status::FAILED || self.failed_then_retried()
+    }
+    /// The run failed and a person retried it (or started it over).
+    pub fn failed_then_retried(&self) -> bool {
+        self.status == common::run_status::RETRIED && !self.failed_pass.trim().is_empty()
+    }
+    /// The run ended waiting on a person, and still does.
+    pub fn waiting(&self) -> bool {
+        matches!(
+            self.status.as_str(),
+            common::run_status::NEEDS_INPUT | common::run_status::NEEDS_OUTSIDE_CHANGE
+        )
     }
     fn merged(&self) -> bool {
         self.status == "merged" || self.pr_outcome == "merged"
@@ -399,6 +434,22 @@ pub fn failure_reason(msg: &str) -> String {
         return "No reason recorded".to_string();
     }
     let first = msg.lines().next().unwrap_or(msg);
+    // Commit hashes and other hex ids read as one number, not "#e#b".
+    let first: String = first
+        .split(' ')
+        .map(|w| {
+            let core = w.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+            let hex_id = core.len() >= 7
+                && core.chars().all(|c| c.is_ascii_hexdigit())
+                && core.chars().any(|c| c.is_ascii_digit());
+            if hex_id {
+                w.replace(core, "0")
+            } else {
+                w.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
     let mut out = String::new();
     let mut in_quote: Option<char> = None;
     let mut last_hash = false;
@@ -425,8 +476,34 @@ pub fn failure_reason(msg: &str) -> String {
         last_hash = false;
         out.push(c);
     }
-    let out: String = out.split_whitespace().collect::<Vec<_>>().join(" ");
-    common::truncate_str(&out, 120).to_string()
+    let mut out: String = out.split_whitespace().collect::<Vec<_>>().join(" ");
+    // A list of quoted names is one placeholder however long it was, so the
+    // same failure on two files and on five groups together.
+    for (from, to) in [
+        ("…, …", "…"),
+        ("… and …", "…"),
+        ("… or …", "…"),
+        ("…, and …", "…"),
+        ("… and # more", "…"),
+        ("#, #", "#"),
+    ] {
+        while out.contains(from) {
+            out = out.replace(from, to);
+        }
+    }
+    common::truncate_str(&out, 160).to_string()
+}
+
+/// A wait's action without the numbers that differ per run ("Review pull
+/// request #12" and "#13" are one kind of wait).
+fn without_numbers(s: &str) -> String {
+    s.split_whitespace()
+        .filter(|w| {
+            let core = w.trim_start_matches('#');
+            !(w.starts_with('#') && !core.is_empty() && core.chars().all(|c| c.is_ascii_digit()))
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Values of `current_pass` that name a state, not a pass.
@@ -637,6 +714,121 @@ pub fn loops_stopped(runs: &[&RunRow]) -> Value {
     json!({"total": total, "reasons": reasons})
 }
 
+/// Failure groups shown before the rest are summed into one line.
+const FAILURE_GROUPS_SHOWN: usize = 8;
+
+/// The pass a failed run failed in, for its group's stage: the pass it
+/// recorded, else the last its history or traces name. Empty when none.
+pub fn failed_stage(r: &RunRow, trace_pass: Option<&str>) -> String {
+    [
+        r.failed_pass.as_str(),
+        r.last_pass.as_str(),
+        trace_pass.unwrap_or(""),
+    ]
+    .into_iter()
+    .map(|p| p.split(':').next().unwrap_or(p).trim())
+    .find(|p| !p.is_empty() && !NOT_A_PASS.contains(p) && *p != common::run_fail::BEFORE_FIRST_PASS)
+    .unwrap_or_default()
+    .to_string()
+}
+
+/// Failed runs grouped by reason, most runs first: each group with the stage
+/// most of its runs failed in, how many a person retried, and its latest
+/// run. Past [`FAILURE_GROUPS_SHOWN`] groups, the rest are summed in the
+/// second value (`{"reasons", "runs"}`) instead of dropped unseen.
+pub fn failure_groups(
+    failed: &[&RunRow],
+    reason_of: &dyn Fn(&RunRow) -> String,
+    stage_of: &dyn Fn(&RunRow) -> String,
+) -> (Vec<Value>, Value) {
+    struct Group<'a> {
+        count: usize,
+        retried: usize,
+        stages: BTreeMap<String, usize>,
+        last: &'a RunRow,
+    }
+    let mut groups: HashMap<String, Group> = HashMap::new();
+    for r in failed.iter().copied() {
+        let g = groups.entry(reason_of(r)).or_insert(Group {
+            count: 0,
+            retried: 0,
+            stages: BTreeMap::new(),
+            last: r,
+        });
+        g.count += 1;
+        if r.failed_then_retried() {
+            g.retried += 1;
+        }
+        *g.stages.entry(stage_of(r)).or_default() += 1;
+        if r.created_at > g.last.created_at {
+            g.last = r;
+        }
+    }
+    let mut out: Vec<(String, Group)> = groups.into_iter().collect();
+    out.sort_by(|a, b| {
+        b.1.count
+            .cmp(&a.1.count)
+            .then_with(|| b.1.last.created_at.cmp(&a.1.last.created_at))
+    });
+    let rest: Vec<&(String, Group)> = out.iter().skip(FAILURE_GROUPS_SHOWN).collect();
+    let more = json!({
+        "reasons": rest.len(),
+        "runs": rest.iter().map(|(_, g)| g.count).sum::<usize>(),
+    });
+    let shown = out
+        .iter()
+        .take(FAILURE_GROUPS_SHOWN)
+        .map(|(reason, g)| {
+            // The stage most of the group's runs failed in; ties go to the
+            // pass named first in the alphabet so the answer is stable.
+            let stage = g
+                .stages
+                .iter()
+                .max_by(|a, b| a.1.cmp(b.1).then_with(|| b.0.cmp(a.0)))
+                .map(|(s, _)| s.clone())
+                .unwrap_or_default();
+            json!({"reason": reason, "count": g.count, "retried": g.retried, "stage": stage,
+                   "last_run_id": g.last.run_id, "last_at": g.last.created_at})
+        })
+        .collect();
+    (shown, more)
+}
+
+/// Runs in the period that ended waiting on a person and still wait, by what
+/// they wait for, most first. A run whose record names nothing is counted
+/// under "Nothing recorded": a wait no one can act on.
+pub fn waiting_groups(runs: &[&RunRow]) -> Value {
+    let mut groups: HashMap<String, (usize, &RunRow)> = HashMap::new();
+    for r in runs.iter().copied().filter(|r| r.waiting()) {
+        let what = if r.status == common::run_status::NEEDS_OUTSIDE_CHANGE {
+            "Make the change outside the code the run page describes".to_string()
+        } else if r.waiting_for.trim().is_empty() {
+            "Nothing recorded".to_string()
+        } else {
+            without_numbers(&r.waiting_for)
+        };
+        let e = groups.entry(what).or_insert((0, r));
+        e.0 += 1;
+        if r.created_at > e.1.created_at {
+            e.1 = r;
+        }
+    }
+    let total: usize = groups.values().map(|g| g.0).sum();
+    let mut reasons: Vec<Value> = groups
+        .into_iter()
+        .map(|(reason, (count, last))| {
+            json!({"reason": reason, "count": count, "last_run_id": last.run_id, "last_at": last.created_at})
+        })
+        .collect();
+    reasons.sort_by(|a, b| {
+        b["count"]
+            .as_u64()
+            .cmp(&a["count"].as_u64())
+            .then_with(|| a["reason"].as_str().cmp(&b["reason"].as_str()))
+    });
+    json!({"total": total, "reasons": reasons})
+}
+
 /// One row per pull request among `runs`: a rerun that pushed to the same PR
 /// does not open another. The row kept knows the most: a merged one first,
 /// then the latest run.
@@ -669,10 +861,8 @@ pub fn summary(runs: &[&RunRow], reviews: &[&ReviewRow]) -> Value {
         .count();
     // A run a person closed on purpose is not a failure; it is counted on
     // its own.
-    let failed = runs
-        .iter()
-        .filter(|r| r.status == common::run_status::FAILED)
-        .count();
+    let failed = runs.iter().filter(|r| r.failed()).count();
+    let failed_then_retried = runs.iter().filter(|r| r.failed_then_retried()).count();
     let closed_by_person = runs
         .iter()
         .filter(|r| r.status == common::run_status::CLOSED)
@@ -690,7 +880,7 @@ pub fn summary(runs: &[&RunRow], reviews: &[&ReviewRow]) -> Value {
         .count();
     let durations: Vec<f64> = runs
         .iter()
-        .filter(|r| r.status != "failed" && r.duration_s > 0.0)
+        .filter(|r| !r.failed() && r.duration_s > 0.0)
         .map(|r| r.duration_s / 60.0)
         .collect();
     let posted = reviews.iter().filter(|r| r.is_posted_review()).count();
@@ -703,6 +893,7 @@ pub fn summary(runs: &[&RunRow], reviews: &[&ReviewRow]) -> Value {
         "merge_rate": ratio(merged.len() as f64, with_pr.len() as f64),
         "failed_runs": failed,
         "failure_rate": ratio(failed as f64, total),
+        "failed_then_retried": failed_then_retried,
         "closed_runs": closed_by_person,
         "cost_usd": round2(cost),
         "cost_per_run": ratio(cost, total).map(round2),
@@ -1358,7 +1549,7 @@ pub fn build(
     for r in &cur_runs {
         if let Some(e) = day(&r.created_at).and_then(|k| daily.get_mut(&k)) {
             e[0] += 1.0;
-            if r.status == "failed" {
+            if r.failed() {
                 e[3] += 1.0;
             }
             e[4] += r.cost_usd;
@@ -1417,7 +1608,7 @@ pub fn build(
         by_source.entry(src).or_default()[0] += 1.0;
         let e = by_repo.entry(r.repo.clone()).or_default();
         e[0] += 1.0;
-        if r.status == "failed" {
+        if r.failed() {
             e[3] += 1.0;
         }
         e[4] += r.cost_usd;
@@ -1498,20 +1689,10 @@ pub fn build(
         |r: &RunRow| run_failure_reason(r, trace_pass.get(r.run_id.as_str()).map(|e| e.1));
 
     // Failures, grouped by reason.
-    let mut failures: HashMap<String, (usize, &RunRow)> = HashMap::new();
-    for r in cur_runs.iter().filter(|r| r.status == "failed") {
-        let e = failures.entry(reason_of(r)).or_insert((0, r));
-        e.0 += 1;
-        if r.created_at > e.1.created_at {
-            e.1 = r;
-        }
-    }
-    let mut failures: Vec<Value> = failures
-        .into_iter()
-        .map(|(reason, (count, last))| json!({"reason": reason, "count": count, "last_run_id": last.run_id, "last_at": last.created_at}))
-        .collect();
-    failures.sort_by(|a, b| b["count"].as_u64().cmp(&a["count"].as_u64()));
-    failures.truncate(8);
+    let stage_of = |r: &RunRow| failed_stage(r, trace_pass.get(r.run_id.as_str()).map(|e| e.1));
+    let failed_runs: Vec<&RunRow> = cur_runs.iter().copied().filter(|r| r.failed()).collect();
+    let (failures, failures_more) = failure_groups(&failed_runs, &reason_of, &stage_of);
+    let waiting = waiting_groups(&cur_runs);
 
     // CI self-fixes, with how each red run ended.
     let ci = ci_outcomes(&cur_runs);
@@ -1603,13 +1784,13 @@ pub fn build(
         .map(|r| json!({"run_id": r.run_id, "title": r.title, "repo": r.repo, "pr_number": r.pr_number, "pr_url": r.pr_url,
                         "hours_to_merge": r.hours_to_merge().map(round2), "human_commits": r.human_commits}))
         .collect();
-    let mut failed_recent: Vec<&&RunRow> =
-        cur_runs.iter().filter(|r| r.status == "failed").collect();
+    let mut failed_recent: Vec<&RunRow> = failed_runs.clone();
     failed_recent.sort_by(|a, b| b.created_at.cmp(&a.created_at));
     let failed_recent: Vec<Value> = failed_recent
         .iter()
         .take(10)
-        .map(|r| json!({"run_id": r.run_id, "title": r.title, "repo": r.repo, "reason": reason_of(r), "at": r.created_at}))
+        .map(|r| json!({"run_id": r.run_id, "title": r.title, "repo": r.repo, "reason": reason_of(r),
+                        "stage": stage_of(r), "retried": r.failed_then_retried(), "at": r.created_at}))
         .collect();
 
     let mut repo_names: Vec<String> = runs
@@ -1632,6 +1813,8 @@ pub fn build(
         "repos": repos,
         "people": people,
         "failures": failures,
+        "failures_more": failures_more,
+        "waiting": waiting,
         "ci": ci,
         "loops_stopped": loops_stopped(&cur_runs),
         "reviews": reviews_json,
@@ -1672,7 +1855,8 @@ async fn load_runs(state: &AppState, team: &str, w: Window) -> Result<Vec<RunRow
                  cache_read_tokens, cache_write_tokens, \
                  duration_s, pr_number, pr_url, error_message, ci_fix_attempts, ci_fix_commits, ci_last, \
                  pr_outcome, merged_at, pr_opened_at, human_commits, #err, failed_pass, current_pass, \
-                 pass_history, ci_end, loop_stop_reason, ci_red_on_base, ci_reruns, ci_flaky",
+                 pass_history, ci_end, loop_stop_reason, ci_red_on_base, ci_reruns, ci_flaky, \
+                 waiting_on, questions",
             )
             .expression_attribute_names("#s", "status")
             .expression_attribute_names("#err", "error")
@@ -3019,6 +3203,166 @@ mod tests {
             ..old_failed("5")
         };
         assert_eq!(run_failure_reason(&r, None), "Feedback pass failed: boom");
+    }
+
+    /// A failed run a person retried is `retried` now. The page counted
+    /// `failed` only, so on one install 6 failures showed where 16 runs had
+    /// failed: most failures worth retrying were retried.
+    #[test]
+    fn a_failure_a_person_retried_is_still_a_failure() {
+        let failed = RunRow {
+            error_message: "Stopped before opening a pull request: boom".into(),
+            failed_pass: "pr".into(),
+            ..run("1", 3, "failed")
+        };
+        let retried = RunRow {
+            error_message: "Stopped before opening a pull request: boom".into(),
+            failed_pass: "pr".into(),
+            ..run("2", 2, "retried")
+        };
+        // Answered questions also leave a run `retried`: not a failure.
+        let answered = run("3", 2, "retried");
+        let done = run("4", 1, "completed");
+        let (w, p) = windows();
+        let out = build(
+            w,
+            p,
+            None,
+            &[failed, retried, answered, done],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+        );
+        let sm = &out["summary"];
+        assert_eq!(sm["failed_runs"], 2);
+        assert_eq!(sm["failed_then_retried"], 1);
+        assert_eq!(out["failures"].as_array().unwrap().len(), 1);
+        let g = &out["failures"][0];
+        assert_eq!(g["count"], 2);
+        assert_eq!(g["retried"], 1);
+        assert_eq!(g["stage"], "pr");
+        assert_eq!(g["last_run_id"], "2");
+        assert_eq!(out["failed_recent"].as_array().unwrap().len(), 2);
+        assert_eq!(out["failed_recent"][0]["retried"], true);
+        assert_eq!(
+            out["daily"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|d| d["failed"].as_f64().unwrap())
+                .sum::<f64>(),
+            2.0
+        );
+        assert_eq!(out["repos"][0]["failed"], 2.0);
+    }
+
+    /// The same failure on other files, or with other commit hashes, is one
+    /// group: a list of names was a group per list length.
+    #[test]
+    fn one_failure_on_other_files_and_commits_is_one_reason() {
+        let a = failure_reason(
+            "Stopped before opening a pull request: The change edits `src/a.ts`, `src/b.ts` \
+             (read by `npm run gen`), but its generated files (`gen/types.ts`) were not regenerated.",
+        );
+        let b = failure_reason(
+            "Stopped before opening a pull request: The change edits `src/a.ts`, `src/b.ts`, \
+             `src/c.ts`, `src/d.ts` (read by `npm run gen`), but its generated files \
+             (`gen/types.ts`, `gen/schema.json`) were not regenerated.",
+        );
+        assert_eq!(a, b);
+        assert!(a.ends_with("were not regenerated."), "{a}");
+        let c = failure_reason(
+            "Stopped before opening a pull request: the branch re-creates 4 commit(s) of open \
+             pull request #1470 under new hashes (599e18b, f036d85, 0fdd258, ded46d2).",
+        );
+        let d = failure_reason(
+            "Stopped before opening a pull request: the branch re-creates 7 commit(s) of open \
+             pull request #1474 under new hashes (86f5835, 641347a, 97ebc42, a488bc4, 4d17cbb).",
+        );
+        assert_eq!(c, d);
+        assert!(!c.contains("#e#"), "{c}");
+        // A plain number still reads as one.
+        assert_eq!(failure_reason("Timed out after 900s"), "Timed out after #s");
+    }
+
+    /// Past the groups shown, the rest are summed, not dropped unseen.
+    #[test]
+    fn failure_groups_past_the_shown_ones_are_summed() {
+        let runs: Vec<RunRow> = (0..11)
+            .map(|i| RunRow {
+                error_message: format!(
+                    "Reason {}",
+                    ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k"][i]
+                ),
+                failed_pass: "implement".into(),
+                ..run(&i.to_string(), 2, "failed")
+            })
+            .collect();
+        let (w, p) = windows();
+        let out = build(w, p, None, &runs, &[], &[], &[], &[], None);
+        assert_eq!(out["failures"].as_array().unwrap().len(), 8);
+        assert_eq!(out["failures_more"]["reasons"], 3);
+        assert_eq!(out["failures_more"]["runs"], 3);
+        assert_eq!(out["summary"]["failed_runs"], 11);
+    }
+
+    /// Runs that stopped for a person, by what they wait for: the struggles
+    /// that never fail, and the waits that name nothing.
+    #[test]
+    fn waiting_runs_group_by_what_they_wait_for() {
+        let wait = |id: &str, what: &str| RunRow {
+            waiting_for: what.into(),
+            ..run(id, 2, "needs_input")
+        };
+        let runs = vec![
+            wait("1", "Review pull request #12"),
+            wait("2", "Review pull request #13"),
+            wait("3", ""),
+            RunRow {
+                ..run("4", 2, "needs_outside_change")
+            },
+            wait("5", "Answer CoderHelm's question on the run page"),
+            run("6", 2, "completed"),
+        ];
+        let (w, p) = windows();
+        let out = build(w, p, None, &runs, &[], &[], &[], &[], None);
+        let wt = &out["waiting"];
+        assert_eq!(wt["total"], 5);
+        assert_eq!(wt["reasons"][0]["reason"], "Review pull request");
+        assert_eq!(wt["reasons"][0]["count"], 2);
+        let names: Vec<&str> = wt["reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["reason"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"Nothing recorded"));
+        assert!(names.contains(&"Make the change outside the code the run page describes"));
+    }
+
+    #[test]
+    fn a_wait_is_read_from_its_record() {
+        let mut item: Item = HashMap::new();
+        item.insert("status".into(), av("needs_input"));
+        assert_eq!(RunRow::from_item(&item).waiting_for, "");
+        item.insert(
+            "questions".into(),
+            av(r#"{"questions":[{"id":"q1","question":"Which page?"}]}"#),
+        );
+        assert_eq!(
+            RunRow::from_item(&item).waiting_for,
+            "Answer CoderHelm's questions on the run page"
+        );
+        item.insert(
+            "waiting_on".into(),
+            av(r#"{"action":"Review pull request #7","detail":"x","since":"2026-11-01T00:00:00Z"}"#),
+        );
+        assert_eq!(
+            RunRow::from_item(&item).waiting_for,
+            "Review pull request #7"
+        );
     }
 
     #[test]

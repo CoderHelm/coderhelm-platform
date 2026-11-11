@@ -934,9 +934,30 @@ pub fn set_fallback(f: Arc<dyn UsageFallback>) {
 }
 
 /// Add a held call: the worker's `usage_record` handler. Counted once, ever:
-/// replaying the same message again adds nothing.
+/// replaying the same message again adds nothing. A write that loses a race
+/// is tried again the way [`UsageMeter::record_call`] does before the message
+/// fails: a held call usually comes back while the calls that crowded it
+/// out are still writing.
 pub async fn replay(store: &dyn UsageStore, rec: &CallRecord) -> Result<Added, String> {
-    store.add(rec, true).await
+    replay_with(store, rec, &WRITE_RETRY_MS).await
+}
+
+async fn replay_with(
+    store: &dyn UsageStore,
+    rec: &CallRecord,
+    retry_ms: &[u64],
+) -> Result<Added, String> {
+    let mut last = String::new();
+    for attempt in 0..=retry_ms.len() {
+        match store.add(rec, true).await {
+            Ok(a) => return Ok(a),
+            Err(e) => last = e,
+        }
+        if let Some(ms) = retry_ms.get(attempt) {
+            tokio::time::sleep(std::time::Duration::from_millis(jittered(*ms))).await;
+        }
+    }
+    Err(last)
 }
 
 // ── The limit check before each call ───────────────────────────────────────
@@ -974,8 +995,23 @@ impl LimitCheck for FixedLimit {
 
 // ── The meter ───────────────────────────────────────────────────────────────
 
-/// Waits (ms) before each retry of a failed counter write.
-const WRITE_RETRY_MS: [u64; 3] = [100, 400, 1_600];
+/// Waits (ms) before each retry of a failed counter write, each one
+/// [`jittered`]. Every call of a team adds to the same day, month and year
+/// items in one transaction, so calls made side by side (parallel reviewers,
+/// a bulk triage) cancel each other with `TransactionConflict`. Three retries
+/// at the same fixed waits put them side by side again: 399 calls in one day
+/// on one install fell back to the queue, and their replays conflicted too.
+const WRITE_RETRY_MS: [u64; 6] = [50, 150, 300, 600, 1_200, 2_400];
+
+/// A wait spread over half to one and a half times `ms`, so writers that
+/// lost the same race don't meet again at the next try.
+pub fn jittered(ms: u64) -> u64 {
+    if ms == 0 {
+        return 0;
+    }
+    use rand::Rng;
+    rand::rng().random_range(ms / 2..=ms + ms / 2)
+}
 
 /// A team's meter: what every model client holds so each call is counted.
 #[derive(Clone)]
@@ -1106,7 +1142,7 @@ impl UsageMeter {
                 Err(e) => last = e,
             }
             if let Some(ms) = self.retry_ms.get(attempt) {
-                tokio::time::sleep(std::time::Duration::from_millis(*ms)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(jittered(*ms))).await;
             }
         }
         let fallback = self.fallback.clone().or_else(|| FALLBACK.get().cloned());
@@ -1314,6 +1350,87 @@ pub fn counts_cache_enabled(team_setting: Option<bool>, env_default: Option<&str
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// A store whose first `conflicts` writes lose a transaction race.
+    struct Crowded {
+        conflicts: usize,
+        inner: MemoryStore,
+    }
+
+    #[async_trait::async_trait]
+    impl UsageStore for Crowded {
+        async fn add(&self, rec: &CallRecord, recovered: bool) -> Result<Added, String> {
+            use std::sync::atomic::Ordering;
+            let n = self.inner.attempts.load(Ordering::SeqCst);
+            if n < self.conflicts {
+                self.inner.attempts.fetch_add(1, Ordering::SeqCst);
+                return Err(
+                    "TransactionCanceledException: [None, TransactionConflict, None, None]".into(),
+                );
+            }
+            self.inner.add(rec, recovered).await
+        }
+    }
+
+    fn crowded(conflicts: usize) -> Arc<Crowded> {
+        Arc::new(Crowded {
+            conflicts,
+            inner: MemoryStore::default(),
+        })
+    }
+
+    /// Calls side by side conflicted four times in a row; three fixed
+    /// retries sent each one to the queue. The jittered retries count it.
+    #[tokio::test]
+    async fn a_call_that_loses_four_races_is_still_counted_now() {
+        let store = crowded(4);
+        let fallback = Arc::new(MemoryFallback::default());
+        let meter = UsageMeter::with_store("TEAM#t", store.clone()).with_fallback(fallback.clone());
+        let rec = CallRecord::now(
+            "TEAM#t",
+            "implement",
+            "claude-sonnet-5-5",
+            CallUsage {
+                uncached_input: 10,
+                output: 5,
+                ..Default::default()
+            },
+        );
+        meter.record_call(rec).await;
+        assert_eq!(store.inner.calls.lock().unwrap().len(), 1);
+        assert!(fallback.held.lock().unwrap().is_empty());
+    }
+
+    /// A held call whose replay loses a race is tried again in the same
+    /// delivery, not failed back to the queue at once.
+    #[tokio::test]
+    async fn a_replay_that_loses_a_race_is_tried_again() {
+        let store = crowded(2);
+        let rec = CallRecord::now(
+            "TEAM#t",
+            "review",
+            "claude-sonnet-5-5",
+            CallUsage {
+                uncached_input: 1,
+                output: 1,
+                ..Default::default()
+            },
+        );
+        assert_eq!(replay(&*store, &rec).await, Ok(Added::Counted));
+        assert!(store.inner.calls.lock().unwrap()[0].recovered);
+        // Still bounded: a table that is down fails the message.
+        let down = crowded(usize::MAX);
+        assert!(replay_with(&*down, &rec, &[0, 0]).await.is_err());
+    }
+
+    #[test]
+    fn waits_are_spread_around_their_base() {
+        assert_eq!(jittered(0), 0);
+        for _ in 0..200 {
+            let w = jittered(100);
+            assert!((50..=150).contains(&w), "{w}");
+        }
+    }
 
     #[test]
     fn price_table_parses_and_has_every_model_in_use() {

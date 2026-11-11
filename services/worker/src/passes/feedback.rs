@@ -2525,10 +2525,7 @@ impl<'a> ToolExecutor for FeedbackToolExecutor<'a> {
                     );
                     return Ok(json!(super::write_guard::ScopeGuard::reject_msg(path)));
                 }
-                let edits = input
-                    .get("edits")
-                    .and_then(|v| v.as_array())
-                    .ok_or("Missing edits array")?;
+                let edits = &super::implement::tool_edits(input)?;
                 let message = input
                     .get("message")
                     .and_then(|v| v.as_str())
