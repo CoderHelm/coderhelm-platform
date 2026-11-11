@@ -1284,6 +1284,19 @@ pub struct OnboardMessage {
     pub team_id: String,
     pub installation_id: u64,
     pub repos: Vec<OnboardRepo>,
+    /// Why the files are written (`common::agent_file::Reason`): empty for
+    /// an install or a repository turned on, `manual` for the regenerate
+    /// button, `push` or `age` for the sweep's automatic regeneration (the
+    /// agent file only, never the voice a person may have edited).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reason: String,
+    /// For an automatic regeneration: what changed on the default branch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changed: Vec<String>,
+    /// When the sweep queued it (RFC 3339); a file written after this needs
+    /// nothing more.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub queued_at: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]

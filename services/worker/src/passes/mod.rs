@@ -1052,6 +1052,7 @@ fn has_time_for_remediation(start: &Instant) -> bool {
     remaining_secs(start) >= MIN_TIME_FOR_REMEDIATION_SECS
 }
 
+pub mod agent_file;
 pub mod agent_tools;
 pub mod alert_episodes;
 pub mod await_merge;
