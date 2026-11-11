@@ -25,8 +25,13 @@ use crate::mcp_remote::http::{Http, HttpRequest, Limit, Method};
 
 pub const API: &str = "https://api.notion.com/v1";
 pub const VERSION: &str = "2022-06-28";
-/// Search pages read per listing at most (100 each).
-const MAX_SEARCH_PAGES: usize = 60;
+/// Search pages read per listing at most (100 each): twice what the
+/// source's limit needs (search returns everything the connection sees,
+/// not only what is picked), at least 60. Real: Notion allows about three
+/// requests a second, so this bounds how long a listing takes.
+fn search_pages(limit: usize) -> usize {
+    (limit.div_ceil(100) * 2).max(60)
+}
 /// How deep nested blocks are read.
 const MAX_BLOCK_DEPTH: usize = 4;
 /// Block reads per page at most (100 blocks each).
@@ -650,7 +655,7 @@ impl Connector for Notion<'_> {
     }
 
     async fn list(&self, source: &Source) -> Result<Listing, ConnectorError> {
-        let (entries, complete) = self.search("", MAX_SEARCH_PAGES).await?;
+        let (entries, complete) = self.search("", search_pages(source.limit())).await?;
         let selection: Vec<(String, bool)> = source
             .selection
             .iter()
@@ -668,15 +673,16 @@ impl Connector for Notion<'_> {
                 hint: json!({ "props": e.props }),
             })
             .collect();
-        let truncated = items.len() > super::MAX_ITEMS_PER_SOURCE;
-        items.truncate(super::MAX_ITEMS_PER_SOURCE);
+        let (cut, found) = super::keep_within(&mut items, source.limit());
         Ok(Listing {
             items,
             deleted: Vec::new(),
             // A search cut short can't prove anything is gone.
-            complete: complete && !truncated,
+            complete: complete && !cut,
             cursor: String::new(),
-            truncated,
+            // A search cut short may have missed picked pages: say so.
+            truncated: cut || !complete,
+            total: (complete && !cut).then_some(found),
             ..Default::default()
         })
     }
@@ -978,5 +984,66 @@ mod tests {
         }});
         assert_eq!(props_text(&row), "Done: Yes\nStatus: Done\nTags: a, b");
         assert_eq!(title_of(&row), "T");
+    }
+
+    /// 1,500 pages under one page, 100 a search page: every one is listed
+    /// (no cap at 1,000), and a lower limit says the source holds less.
+    #[tokio::test]
+    async fn a_big_workspace_lists_past_a_thousand_pages_and_says_when_it_hits_the_limit() {
+        let http = Fake::default();
+        let mut all = vec![page(
+            "root1",
+            "Handbook",
+            json!({"type":"workspace","workspace":true}),
+            "2026-10-01T00:00:00.000Z",
+        )];
+        for i in 0..1_500 {
+            all.push(page(
+                &format!("p{i:05}"),
+                &format!("Page {i}"),
+                json!({"type":"page_id","page_id":"root1"}),
+                "2026-10-02T00:00:00.000Z",
+            ));
+        }
+        let all = std::sync::Arc::new(all);
+        let pages = all.clone();
+        http.with(move |r| {
+            if !r.url.ends_with("/search") {
+                return None;
+            }
+            let body: Value =
+                serde_json::from_slice(r.body.as_deref().unwrap_or_default()).unwrap_or_default();
+            let at: usize = body["start_cursor"]
+                .as_str()
+                .and_then(|c| c.parse().ok())
+                .unwrap_or(0);
+            let end = (at + 100).min(pages.len());
+            let more = end < pages.len();
+            Some(fjson(
+                200,
+                json!({
+                    "results": pages[at..end],
+                    "has_more": more,
+                    "next_cursor": if more { json!(end.to_string()) } else { Value::Null },
+                }),
+            ))
+        });
+        let n = Notion {
+            http: &http,
+            auth: "Bearer t".into(),
+        };
+        let l = n.list(&source(&[("root1", true)])).await.unwrap();
+        assert_eq!(l.items.len(), 1_501);
+        assert!(l.complete && !l.truncated);
+        assert_eq!(l.total, Some(1_501));
+        assert_eq!(http.sent().len(), 16, "every search page was read");
+        let mut small = source(&[("root1", true)]);
+        small.item_limit = Some(1_000);
+        let l = n.list(&small).await.unwrap();
+        assert_eq!(l.items.len(), 1_000);
+        assert!(
+            l.truncated && !l.complete,
+            "a source over its limit says so"
+        );
     }
 }

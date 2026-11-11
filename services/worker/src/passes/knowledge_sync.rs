@@ -7,6 +7,12 @@
 //! member's connection, embeds with Titan on the team's usage meter, and
 //! runs it.
 //!
+//! A big sync is done in runs ([`sync::RUN_BUDGET_SECS`] each): when a run
+//! hands over, the next one is queued at once, so a 5,000 document dataset
+//! syncs in a few back to back runs. The source keeps up to the team's
+//! per-source limit, or what its base has left of its own; embeddings count
+//! against the team's monthly token limit.
+//!
 //! A sign-in source whose member left the team stops with one sentence and
 //! "Sign in again" (their sign-in is never used after they leave). When a
 //! sign-in source stops for want of a new sign-in, the team's owner and
@@ -18,9 +24,9 @@ use serde_json::{json, Value};
 use tracing::{info, warn};
 
 use common::knowledge::search::Titan;
-use common::knowledge::sources::store::{registry, AwsSyncStore, SyncStore};
+use common::knowledge::sources::store::{base_sources, registry, AwsSyncStore, SyncStore};
 use common::knowledge::sources::{
-    alert, connect, parse_registry_sk, signin_error, sync, Kind, Source, SyncMessage,
+    alert, connect, limits, parse_registry_sk, signin_error, sync, Kind, Source, SyncMessage,
 };
 use common::mcp_remote::store::Owner;
 
@@ -136,6 +142,14 @@ pub async fn sync(state: &WorkerState, msg: &SyncMessage) -> Value {
     };
     let used =
         connect::used_connection(&env, &src, &opened, &chrono::Utc::now().to_rfc3339()).await;
+    let (limit, why) = item_limit(state, &msg.team_id, &msg.kb_id, &msg.source_id).await;
+    let room = limits::token_room(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        &state.config.analytics_table_name,
+        &msg.team_id,
+    )
+    .await;
     let ctx = sync::Ctx {
         store: &st,
         connector: opened.connector.as_ref(),
@@ -144,8 +158,14 @@ pub async fn sync(state: &WorkerState, msg: &SyncMessage) -> Value {
         now: &now,
         used: Some(used),
         trigger: &msg.trigger,
+        budget_secs: sync::RUN_BUDGET_SECS,
+        token_room: room.map(|r| r.left),
+        limit: Some((limit, why)),
     };
     let out = sync::run(&ctx, &msg.kb_id, &msg.source_id).await;
+    if out.more {
+        continue_later(state, msg, out.wait_secs).await;
+    }
     if src.signin.is_some() {
         after_sync(state, &st, msg).await;
     }
@@ -161,15 +181,67 @@ pub async fn sync(state: &WorkerState, msg: &SyncMessage) -> Value {
         reused = out.reused_chunks,
         removed = out.removed,
         failed = out.failed,
+        more = out.more,
+        awaiting = out.awaiting,
+        over_budget = out.over_budget,
         "Knowledge source sync"
     );
     json!({
-        "ok": out.error.is_none(),
+        "ok": out.error.is_none() && !out.over_budget,
         "ran": out.ran,
         "indexed": out.indexed,
         "removed": out.removed,
+        "more": out.more,
         "error": out.error.map(|e| e.to_string()),
     })
+}
+
+/// The most items the source keeps now: the team's per-source limit, or
+/// what its base has left when its other sources hold the rest.
+async fn item_limit(
+    state: &WorkerState,
+    team: &str,
+    kb_id: &str,
+    source_id: &str,
+) -> (u32, &'static str) {
+    let table = &state.config.settings_table_name;
+    let team_limit = limits::load(&state.dynamo, table, team)
+        .await
+        .map_err(|e| warn!(error = %e, "Knowledge settings unreadable; the default limit applies"))
+        .unwrap_or_default()
+        .items_per_source();
+    let others: u64 = base_sources(&state.dynamo, table, team, kb_id)
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|s| s.id != source_id)
+        .map(|s| u64::from(s.items))
+        .sum();
+    limits::effective(team_limit, others)
+}
+
+/// Queues the next run of a sync that handed over (after `wait_secs` when
+/// the provider asked us to slow down). The source is also due at that
+/// time, so the sweep starts it if this message is lost.
+async fn continue_later(state: &WorkerState, msg: &SyncMessage, wait_secs: i64) {
+    let body = json!({
+        "type": "knowledge_sync",
+        "team_id": msg.team_id,
+        "kb_id": msg.kb_id,
+        "source_id": msg.source_id,
+        "trigger": msg.trigger,
+    });
+    let sent = state
+        .sqs
+        .send_message()
+        .queue_url(&state.config.ticket_queue_url)
+        .message_body(body.to_string())
+        .delay_seconds(wait_secs.clamp(0, 900) as i32)
+        .send()
+        .await;
+    if let Err(e) = sent {
+        warn!(error = %e, source = %msg.source_id, "Next knowledge sync run not queued; the sweep starts it");
+    }
 }
 
 /// Is `email` still a member of the team? `None` when the team's records

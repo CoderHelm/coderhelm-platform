@@ -631,12 +631,27 @@ pub(crate) async fn grant_for(
     })
 }
 
-fn limits() -> Value {
+/// Synced items a base's own reply lists at most, so it stays well under
+/// the gateway's 6 MB reply limit; the rest are read a page at a time
+/// ([`list_items`]).
+pub const LISTED_ITEMS: usize = 2_000;
+
+/// The team's per-source limit, or the default when it can't be read.
+async fn items_per_source(state: &AppState, team: &str) -> u32 {
+    kb::sources::limits::load(&state.dynamo, &state.config.settings_table_name, team)
+        .await
+        .unwrap_or_default()
+        .items_per_source()
+}
+
+fn limits(items_per_source: u32) -> Value {
     json!({
         "max_file_bytes": MAX_FILE_BYTES,
         "max_files": MAX_FILES_PER_BASE,
-        "max_items_per_import": kb::sources::MAX_ITEMS_PER_IMPORT,
-        "max_items_per_source": kb::sources::MAX_ITEMS_PER_SOURCE,
+        "max_items_per_import": items_per_source,
+        "max_items_per_source": items_per_source,
+        "default_items_per_source": kb::sources::DEFAULT_ITEMS_PER_SOURCE,
+        "items_per_base": kb::sources::MAX_ITEMS_PER_BASE,
         "max_archive_bytes": kb::sources::archive::MAX_ARCHIVE_BYTES,
         "max_readers": kb::MAX_READERS,
         "extensions": EXTENSIONS,
@@ -671,7 +686,7 @@ pub async fn list_bases(
     Ok(Json(json!({
         "bases": out,
         "can_manage": claims.holder().holds("knowledge_manage"),
-        "limits": limits(),
+        "limits": limits(items_per_source(&state, &claims.team_id).await),
     })))
 }
 
@@ -946,14 +961,33 @@ pub async fn get_base(
     files.sort_by(|a, b| b.uploaded_at.cmp(&a.uploaded_at));
     let sources = super::knowledge_sources::sources_of(&state, &claims.team_id, &base.id).await;
     let now = chrono::Utc::now().timestamp();
+    let (shown, more) = listed_files(&files);
     Ok(Json(json!({
         "base": base_json(&base, &files, &sources),
-        "files": if with_items { Some(files.iter().map(file_json).collect::<Vec<_>>()) } else { None },
+        "files": if with_items { Some(shown.iter().map(|f| file_json(f)).collect::<Vec<_>>()) } else { None },
+        "items_more": more,
         "sources": sources.iter().map(|s| super::knowledge_sources::source_json(s, now)).collect::<Vec<_>>(),
         "visibility_note": super::knowledge_sources::VISIBILITY_NOTE,
         "can_manage": claims.holder().holds("knowledge_manage"),
-        "limits": limits(),
+        "limits": limits(items_per_source(&state, &claims.team_id).await),
     })))
+}
+
+/// What a base's page lists: every uploaded file, and the newest
+/// [`LISTED_ITEMS`] synced items; with how many synced items are left out.
+pub fn listed_files(files: &[FileMeta]) -> (Vec<&FileMeta>, usize) {
+    let mut synced = 0usize;
+    let mut out = Vec::new();
+    for f in files {
+        if !f.is_synced() {
+            out.push(f);
+        } else if synced < LISTED_ITEMS {
+            synced += 1;
+            out.push(f);
+        }
+    }
+    let all = files.iter().filter(|f| f.is_synced()).count();
+    (out, all - synced)
 }
 
 // ── Managing (admins) ───────────────────────────────────────────────────────
@@ -2012,9 +2046,11 @@ mod tests {
             .contains("isn't a person or a role"));
         // Not attached: no note.
         assert_eq!(Base::default().agent_access_note(), "");
-        // Limits say what imports take.
-        let l = limits();
-        assert_eq!(l["max_items_per_import"], kb::sources::MAX_ITEMS_PER_IMPORT);
+        // Limits say what sources and imports take: the team's setting.
+        let l = limits(20_000);
+        assert_eq!(l["max_items_per_import"], 20_000);
+        assert_eq!(l["max_items_per_source"], 20_000);
+        assert_eq!(l["items_per_base"], kb::sources::MAX_ITEMS_PER_BASE);
         assert_eq!(
             l["max_archive_bytes"],
             kb::sources::archive::MAX_ARCHIVE_BYTES
@@ -2137,5 +2173,25 @@ mod tests {
                 .len(),
             4
         );
+    }
+
+    #[test]
+    fn a_big_base_lists_its_newest_items_and_leaves_the_rest_to_the_pages() {
+        let f = |id: &str, src: &str| FileMeta {
+            id: id.into(),
+            source_id: src.into(),
+            ..Default::default()
+        };
+        let mut files = vec![f("u1", "")];
+        for i in 0..(LISTED_ITEMS + 5) {
+            files.push(f(&format!("i{i}"), "s1"));
+        }
+        let (shown, more) = listed_files(&files);
+        assert_eq!(
+            shown.len(),
+            LISTED_ITEMS + 1,
+            "every upload and the newest items"
+        );
+        assert_eq!(more, 5);
     }
 }

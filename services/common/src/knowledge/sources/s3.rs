@@ -31,8 +31,12 @@ pub const SIDECAR: &str = ".metadata.json";
 pub const WHOLE: &str = "/";
 /// The largest sidecar read (Bedrock allows about 10 KB).
 const MAX_SIDECAR_BYTES: u64 = 64 * 1024;
-/// Listing pages one sync reads at most (1,000 objects each).
-const MAX_PAGES: usize = 50;
+/// Listing pages (1,000 keys each) one folder is read for at most: enough
+/// for the source's limit with room for keys that aren't documents. Real
+/// only as time.
+fn max_pages(limit: usize) -> usize {
+    (limit.div_ceil(1_000) + 1) * 4
+}
 
 /// One object in a listing.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -179,7 +183,8 @@ pub struct S3<'a> {
     pub objects: Box<dyn Objects + 'a>,
     pub bucket: String,
     pub region: String,
-    /// Items one source keeps.
+    /// A ceiling on top of the source's own limit ([`Source::limit`]);
+    /// `usize::MAX` in production.
     pub max_items: usize,
 }
 
@@ -189,7 +194,7 @@ impl S3<'_> {
     async fn all_under(&self, prefix: &str, limit: usize) -> Result<Vec<Object>, ConnectorError> {
         let mut out = Vec::new();
         let mut token = None;
-        for _ in 0..MAX_PAGES {
+        for _ in 0..max_pages(limit) {
             let page = self.objects.list(prefix, false, token.take()).await?;
             out.extend(page.objects);
             match page.next {
@@ -260,7 +265,7 @@ impl Connector for S3<'_> {
     }
 
     async fn list(&self, source: &Source) -> Result<Listing, ConnectorError> {
-        let limit = self.max_items;
+        let limit = source.limit().min(self.max_items);
         let mut objects: Vec<Object> = Vec::new();
         for sel in &source.selection {
             let prefix = if sel.id == WHOLE { "" } else { sel.id.as_str() };
@@ -301,12 +306,13 @@ impl Connector for S3<'_> {
                 hint: json!({ "sidecar": sidecar.is_some(), "size": o.size }),
             });
         }
-        let truncated = items.len() > limit;
-        items.truncate(limit);
+        let (truncated, found) = super::keep_within(&mut items, limit);
         Ok(Listing {
             items,
             complete: true,
             truncated,
+            // A folder read only up to the limit is a lower bound.
+            total: (!truncated).then_some(found),
             ..Default::default()
         })
     }
@@ -982,6 +988,9 @@ mod tests {
             now: &|| 1_000,
             used: None,
             trigger: "manual",
+            budget_secs: 0,
+            token_room: None,
+            limit: None,
         };
         let first = sync::run(&ctx, "kb", "src").await;
         assert_eq!((first.fetched, first.indexed), (3, 3));
@@ -1027,6 +1036,9 @@ mod tests {
             now: &|| 1_000,
             used: None,
             trigger: "manual",
+            budget_secs: 0,
+            token_room: None,
+            limit: None,
         };
         let out = sync::run(&ctx, "kb", "src").await;
         assert!(matches!(out.error, Some(ConnectorError::Forbidden(_))));

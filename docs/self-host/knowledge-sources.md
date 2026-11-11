@@ -198,7 +198,16 @@ The bucket is always read with that account's `CoderHelmLogReader` role (connect
 
 ### Limits
 
-An import keeps up to 2,500 documents per source (other sources keep 1,000). CoderHelm ranks its own bases in memory, so a bigger corpus is better connected in place; the page says so when an import is cut short. Each search reads up to 16 indexes at once and keeps recently used indexes in memory (up to 160 MB per process).
+A source, imports included, keeps up to 50,000 items by default. Admins change the number for the team under **Sync limits** on the Knowledge page (from 1,000 to 100,000), and a knowledge base holds up to 100,000 synced items across its sources. A source that covers more says so on its card, with the real total, and keeps what it has; raising the limit syncs it again to bring the rest in.
+
+How the limits were chosen:
+
+- **Embedding cost.** An item takes about 800 Titan embedding tokens, so a full first sync of 50,000 items is about 40M tokens, well under a dollar at Titan's price. A first sync of more than 2,000 items samples a few of them, shows the estimate on the card and waits for an admin to start it. Every sync's embeddings count against the team's monthly token limit; when it is reached the sync stops, says so, and continues from where it stopped once there is room.
+- **Search.** CoderHelm ranks its own bases in memory. A source with 500 items or more keeps a search pack: per passage, its vector's sign bits and its words' hashes (about 430 bytes), in 16 shards. Each search scores the pack and reads only the best few dozen items' indexes for the full ranking, instead of every item's. A 50,000 item pack is about 43 MB and stays cached (48 MB per process). An item changed since its pack was written is read on its own, so a stale pack is slower, never wrong.
+- **Item records.** Each search still reads every item record of the bases it asks (about 700 bytes each), which is what the 100,000 per base bounds.
+- **Time.** A worker run stops after 11 minutes (a Lambda stops at 15), saves what is left of its sync in the data bucket, and queues the next run at once. A 5,000 document dataset syncs in a few back to back runs; the card shows how many are searchable already ("Syncing (265 of 4,812)"). A provider that asks us to slow down pauses the sync for a minute.
+
+Each search reads up to 16 indexes at once and keeps recently used indexes in memory (up to 160 MB per process). A base's page lists its newest 2,000 synced items and finds the rest with its search box.
 
 ## Who sees what
 

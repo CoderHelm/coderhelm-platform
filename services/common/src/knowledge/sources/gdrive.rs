@@ -24,8 +24,13 @@ const FOLDER: &str = "application/vnd.google-apps.folder";
 /// (only the picker uses it).
 const FIELDS: &str =
     "nextPageToken,files(id,name,mimeType,modifiedTime,webViewLink,parents,size,iconLink)";
-/// Folder listings per sync at most.
-const MAX_FOLDER_CALLS: usize = 300;
+/// Folder listings one sync reads at most: at least 300, and more for a
+/// bigger limit (a folder holds a few items on average), so the limit, not
+/// this, decides how much is kept. Real: each call takes time and counts
+/// against Drive's per-user rate limit.
+fn folder_calls(limit: usize) -> usize {
+    (limit / 4).max(300)
+}
 
 pub struct Drive<'a> {
     pub http: &'a dyn Http,
@@ -265,7 +270,7 @@ impl Connector for Drive<'_> {
                 vec![(id.to_string(), s.title.clone(), 0)];
             while let Some((folder, path, depth)) = stack.pop() {
                 calls += 1;
-                if calls > MAX_FOLDER_CALLS || items.len() > super::MAX_ITEMS_PER_SOURCE {
+                if calls > folder_calls(source.limit()) || items.len() > source.limit() {
                     complete = false;
                     break;
                 }
@@ -294,14 +299,14 @@ impl Connector for Drive<'_> {
                 }
             }
         }
-        let truncated = items.len() > super::MAX_ITEMS_PER_SOURCE;
-        items.truncate(super::MAX_ITEMS_PER_SOURCE);
+        let (truncated, found) = super::keep_within(&mut items, source.limit());
         Ok(Listing {
             items,
             deleted: Vec::new(),
             complete: complete && !truncated,
             cursor: String::new(),
             truncated: truncated || !complete,
+            total: (complete && !truncated).then_some(found),
             ..Default::default()
         })
     }

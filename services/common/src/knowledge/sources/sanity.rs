@@ -28,6 +28,9 @@ use crate::knowledge::chunk::Section;
 use crate::mcp_remote::http::{Http, HttpRequest, Limit};
 
 pub const API_VERSION: &str = "v2023-08-01";
+/// Documents per listing query (ids and markers only, well under the
+/// answer size cap).
+pub const PAGE: usize = 1_000;
 
 pub struct Sanity<'a> {
     pub http: &'a dyn Http,
@@ -277,47 +280,75 @@ impl Connector for Sanity<'_> {
                 (Some(_), None) => {}
             }
         }
-        let limit = super::MAX_ITEMS_PER_SOURCE;
+        let limit = source.limit();
+        let projection = format!("{{_id, _type, _rev, _updatedAt, \"title\": {TITLE_FIELDS}}}");
         let mut items = Vec::new();
-        let mut truncated = false;
+        let mut filters: Vec<(String, String, Vec<(&str, Value)>)> = Vec::new();
         for (ds, types) in &sets {
-            let projection = format!("{{_id, _type, _rev, _updatedAt, \"title\": {TITLE_FIELDS}}}");
-            let (groq, params) = match types {
+            let (filter, params) = match types {
                 Some(t) => (
-                    format!("*[_type in $types && !(_id in path(\"drafts.**\"))] | order(_updatedAt desc) [0...{}] {projection}", limit + 1),
+                    "_type in $types && !(_id in path(\"drafts.**\"))".to_string(),
                     vec![("types", json!(t))],
                 ),
                 None => (
-                    format!("*[!(_id in path(\"drafts.**\")) && !(_type match \"sanity.*\") && !(_type match \"system.*\") && !(_type match \"assist.*\")] | order(_updatedAt desc) [0...{}] {projection}", limit + 1),
+                    "!(_id in path(\"drafts.**\")) && !(_type match \"sanity.*\") && !(_type match \"system.*\") && !(_type match \"assist.*\")".to_string(),
                     vec![],
                 ),
             };
-            let v = self.query(ds, &groq, &params).await?;
-            for d in v.as_array().into_iter().flatten() {
-                let (Some(id), Some(ty)) = (d["_id"].as_str(), d["_type"].as_str()) else {
-                    continue;
-                };
-                items.push(Listed {
-                    external_id: format!("{ds}:{id}"),
-                    title: d["title"].as_str().unwrap_or(id).to_string(),
-                    url: String::new(),
-                    updated_at: d["_updatedAt"].as_str().unwrap_or("").to_string(),
-                    version: d["_rev"].as_str().unwrap_or("").to_string(),
-                    path: format!("{ds} / {ty}"),
-                    hint: json!({ "dataset": ds, "id": id, "type": ty }),
-                });
+            // A page at a time by `_id`, until the limit (and one more).
+            let mut after = String::new();
+            while items.len() <= limit {
+                let mut p = params.clone();
+                p.push(("after", json!(after)));
+                let groq = format!(
+                    "*[{filter} && _id > $after] | order(_id asc) [0...{PAGE}] {projection}"
+                );
+                let v = self.query(ds, &groq, &p).await?;
+                let page = v.as_array().cloned().unwrap_or_default();
+                for d in &page {
+                    let (Some(id), Some(ty)) = (d["_id"].as_str(), d["_type"].as_str()) else {
+                        continue;
+                    };
+                    items.push(Listed {
+                        external_id: format!("{ds}:{id}"),
+                        title: d["title"].as_str().unwrap_or(id).to_string(),
+                        url: String::new(),
+                        updated_at: d["_updatedAt"].as_str().unwrap_or("").to_string(),
+                        version: d["_rev"].as_str().unwrap_or("").to_string(),
+                        path: format!("{ds} / {ty}"),
+                        hint: json!({ "dataset": ds, "id": id, "type": ty }),
+                    });
+                }
+                match page.last().and_then(|d| d["_id"].as_str()) {
+                    Some(last) if page.len() >= PAGE && last > after.as_str() => {
+                        after = last.to_string()
+                    }
+                    _ => break,
+                }
             }
+            filters.push((ds.clone(), filter, params));
         }
-        if items.len() > limit {
-            truncated = true;
-            items.truncate(limit);
-        }
+        let (truncated, found) = super::keep_within(&mut items, limit);
+        // Past the limit, Sanity still counts what the selection covers.
+        let total = if truncated {
+            let mut n = 0u64;
+            for (ds, filter, params) in &filters {
+                let v = self
+                    .query(ds, &format!("count(*[{filter}])"), params)
+                    .await?;
+                n += v.as_u64().unwrap_or(0);
+            }
+            Some(n.max(found))
+        } else {
+            Some(found)
+        };
         Ok(Listing {
             items,
             deleted: Vec::new(),
             complete: !truncated,
             cursor: String::new(),
             truncated,
+            total,
             ..Default::default()
         })
     }

@@ -40,7 +40,7 @@ use sha2::{Digest, Sha256};
 use super::connector::{matches, Connector, ConnectorError, Document, Listed, Listing, Node};
 use super::mcp::{self, find_key, objects, result_json, scoped_args};
 use super::sanity::{doc_sections, doc_url, type_map, valid_name, valid_project};
-use super::{Kind, Source, MAX_ITEMS_PER_SOURCE};
+use super::{Kind, Source};
 
 /// The only tools this connector calls.
 pub const READ_TOOLS: &[&str] = &[
@@ -794,6 +794,26 @@ impl SanityMcp {
         Ok((items, false))
     }
 
+    /// How many documents one dataset's pick covers.
+    async fn count(
+        &self,
+        project: &str,
+        (ds, types): &DatasetScope,
+    ) -> Result<u64, ConnectorError> {
+        let (filter, params) = Self::filter(types);
+        let v = self
+            .query(
+                project,
+                ds,
+                "chCount",
+                &format!("count(*[{filter}])"),
+                params,
+            )
+            .await?;
+        v.as_u64()
+            .ok_or_else(|| ConnectorError::Temporary("Sanity's count wasn't a number.".into()))
+    }
+
     /// One dataset's documents changed after `since`, oldest first. `None`
     /// when more than `room` changed (a complete listing is due then).
     async fn list_changed(
@@ -1000,6 +1020,11 @@ impl Connector for SanityMcp {
         let mut partial: Vec<String> = Vec::new();
         let mut failed: Vec<(String, ConnectorError)> = Vec::new();
         let (mut any_full, mut truncated, mut sets) = (false, false, 0usize);
+        // Every set listed in full: the source's total is known (sets past
+        // the limit are counted below).
+        let (mut all_full, mut found) = (true, 0u64);
+        let mut to_count: Vec<(String, DatasetScope)> = Vec::new();
+        let limit = source.limit();
         for p in &scope {
             for set in &p.sets {
                 sets += 1;
@@ -1011,17 +1036,19 @@ impl Connector for SanityMcp {
                         next.sets.insert(key.clone(), c.clone());
                     }
                 };
-                let room = MAX_ITEMS_PER_SOURCE.saturating_sub(items.len());
+                let room = limit.saturating_sub(items.len());
                 if room == 0 {
                     // The source is full: what is stored here stays.
                     truncated = true;
                     partial.push(prefix);
                     keep_old(&mut next);
+                    to_count.push((p.project.clone(), set.clone()));
                     continue;
                 }
                 let sel = set_hash(source, &p.project, &set.0);
                 match self.list_set(&p.project, set, many, old, &sel, room).await {
                     Ok(SetListing::Changed(changed)) => {
+                        all_full = false;
                         let c = old.cloned().unwrap_or_default();
                         next.sets.insert(
                             key,
@@ -1048,10 +1075,14 @@ impl Connector for SanityMcp {
                             // is removed by this listing.
                             truncated = true;
                             partial.push(prefix);
+                            to_count.push((p.project.clone(), set.clone()));
+                        } else {
+                            found += all.len() as u64;
                         }
                         items.extend(all);
                     }
                     Err(e) => {
+                        all_full = false;
                         tracing::warn!(
                             provider = PROVIDER,
                             project = %p.project,
@@ -1075,6 +1106,16 @@ impl Connector for SanityMcp {
         if !any_full {
             truncated = truncated || source.truncated;
         }
+        // What the selection covers in all: the sets listed in full, and a
+        // count of each set past the limit.
+        let mut total = all_full.then_some(found);
+        for (project, set) in &to_count {
+            let (Some(t), Ok(n)) = (total, self.count(project, set).await) else {
+                total = None;
+                break;
+            };
+            total = Some(t + n);
+        }
         Ok(Listing {
             items,
             deleted: Vec::new(),
@@ -1082,6 +1123,7 @@ impl Connector for SanityMcp {
             partial,
             cursor: serde_json::to_string(&next).unwrap_or_default(),
             truncated,
+            total,
             problem: (!failed.is_empty()).then(|| projects_failed(&failed)),
         })
     }
@@ -1982,6 +2024,9 @@ mod tests {
             now: &now,
             used: None,
             trigger: "manual",
+            budget_secs: 0,
+            token_room: None,
+            limit: None,
         };
         run(&ctx, "kb1", "s1").await
     }
@@ -2108,5 +2153,201 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(e, ConnectorError::Reconnect(_)));
+    }
+
+    /// A Sanity project with `n` documents spread over datasets, answering
+    /// the listing, changed-since, count and document queries the connector
+    /// sends, like Sanity's GROQ would. Every call moves `clock` a second.
+    struct Fixture {
+        docs: std::sync::Mutex<std::collections::BTreeMap<String, Vec<Value>>>,
+        clock: Arc<std::sync::atomic::AtomicI64>,
+        doc_reads: std::sync::atomic::AtomicUsize,
+    }
+
+    fn fixture(datasets: &[&str], n: usize) -> Arc<Fixture> {
+        let mut docs = std::collections::BTreeMap::new();
+        for (d, ds) in datasets.iter().enumerate() {
+            let list: Vec<Value> = (0..n / datasets.len())
+                .map(|i| {
+                    json!({
+                        "_id": format!("doc-{d}-{i:05}"), "_type": "article", "_rev": "r1",
+                        "_updatedAt": format!("2026-10-01T00:{:02}:{:02}Z", (i / 60) % 60, i % 60),
+                        "title": format!("Article {i} of {ds}"),
+                        "body": [{"_type": "block", "style": "normal", "children": [{"text": format!("Body of article {i} in {ds}.")}]}]
+                    })
+                })
+                .collect();
+            docs.insert(ds.to_string(), list);
+        }
+        Arc::new(Fixture {
+            docs: std::sync::Mutex::new(docs),
+            clock: Arc::new(std::sync::atomic::AtomicI64::new(1_000)),
+            doc_reads: Default::default(),
+        })
+    }
+
+    fn groq(fx: Arc<Fixture>) -> Arc<FakeMcp> {
+        server(move |name, args| {
+            use std::sync::atomic::Ordering;
+            fx.clock.fetch_add(1, Ordering::SeqCst);
+            if name != "query_documents" {
+                return Ok(text_result(&json!({})));
+            }
+            let q = args["query"].as_str().unwrap_or("");
+            let p = &args["params"];
+            let all = fx.docs.lock().unwrap();
+            let list = all
+                .get(args["dataset"].as_str().unwrap_or(""))
+                .cloned()
+                .unwrap_or_default();
+            let s = |v: &Value, k: &str| v[k].as_str().unwrap_or("").to_string();
+            let thin = |d: &Value| json!({"_id": d["_id"], "_type": d["_type"], "_rev": d["_rev"], "_updatedAt": d["_updatedAt"], "title": d["title"]});
+            if q.contains("chDoc") {
+                fx.doc_reads.fetch_add(1, Ordering::SeqCst);
+                let id = s(p, "id");
+                let d = list
+                    .iter()
+                    .find(|d| s(d, "_id") == id)
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                return Ok(text_result(&json!({ "chDoc": d })));
+            }
+            if q.contains("chCount") {
+                return Ok(text_result(&json!({ "chCount": list.len() })));
+            }
+            let after = s(p, "after");
+            let mut page: Vec<&Value> = if q.contains("$since") {
+                let since = s(p, "since");
+                let mut v: Vec<&Value> = list
+                    .iter()
+                    .filter(|d| {
+                        let u = s(d, "_updatedAt");
+                        u > since || (u == since && s(d, "_id") > after)
+                    })
+                    .collect();
+                v.sort_by_key(|d| (s(d, "_updatedAt"), s(d, "_id")));
+                v
+            } else {
+                let mut v: Vec<&Value> = list.iter().filter(|d| s(d, "_id") > after).collect();
+                v.sort_by_key(|d| s(d, "_id"));
+                v
+            };
+            page.truncate(PAGE);
+            Ok(text_result(
+                &json!({ "chPage": page.into_iter().map(thin).collect::<Vec<_>>() }),
+            ))
+        })
+    }
+
+    #[tokio::test]
+    async fn five_thousand_documents_in_four_datasets_sync_in_runs_with_no_cap() {
+        use super::super::store::memory::MemSyncStore;
+        use super::super::{sync, Status};
+        use crate::knowledge::search::testing::WordEmbedder;
+        use std::sync::atomic::Ordering;
+        let sets = ["production", "staging", "blog", "docs"];
+        let fx = fixture(&sets, 5_000);
+        let conn = SanityMcp {
+            tools: groq(fx.clone()),
+            now: 1_000,
+            hints: Vec::new(),
+        };
+        let store = MemSyncStore::default();
+        let mut src = source(&[
+            "dataset:abc123:production",
+            "dataset:abc123:staging",
+            "dataset:abc123:blog",
+            "dataset:abc123:docs",
+        ]);
+        src.id = "s1".into();
+        src.kb_id = "kb1".into();
+        src.kind = Some(Kind::Sanity);
+        store.sources.lock().unwrap().insert("s1".into(), src);
+        let clock = fx.clock.clone();
+        let now = move || clock.load(Ordering::SeqCst);
+        let ctx = sync::Ctx {
+            store: &store,
+            connector: &conn,
+            embedder: &WordEmbedder,
+            team: "TEAM#t",
+            now: &now,
+            // About 1,000 calls a run (a call takes a second here).
+            budget_secs: 1_000,
+            token_room: None,
+            limit: None,
+            used: None,
+            trigger: "manual",
+        };
+        let get = || store.sources.lock().unwrap()["s1"].clone();
+        // First: the estimate, and nothing embedded until it is started.
+        let o = sync::run(&ctx, "kb1", "s1").await;
+        assert!(o.awaiting);
+        let s = get();
+        assert_eq!(s.status, Status::Approval);
+        assert_eq!(s.total, Some(5_000), "the real total, not 1,000");
+        assert_eq!(s.estimate.as_ref().unwrap().items, 5_000);
+        store
+            .sources
+            .lock()
+            .unwrap()
+            .get_mut("s1")
+            .unwrap()
+            .approved_at = 1;
+        let mut runs = 0;
+        loop {
+            runs += 1;
+            let o = sync::run(&ctx, "kb1", "s1").await;
+            let s = get();
+            if o.more {
+                // Between runs the page shows real numbers.
+                assert_eq!(s.status, Status::Syncing);
+                assert_eq!(s.total, Some(5_000));
+                assert_eq!(s.progress.as_ref().unwrap().total, 5_000);
+                assert!(s.items > 0 && s.items < 5_000);
+            } else {
+                assert!(o.error.is_none(), "{:?}", o.error);
+                break;
+            }
+            assert!(runs < 50);
+        }
+        assert!(runs >= 3, "5,000 documents took {runs} runs");
+        let s = get();
+        assert_eq!(
+            (s.status, s.items, s.truncated),
+            (Status::Ready, 5_000, false)
+        );
+        assert_eq!(
+            fx.doc_reads.load(Ordering::SeqCst),
+            5_000 + 8,
+            "each document read once (and the estimate's sample)"
+        );
+        // Every dataset keeps its own cursor.
+        let cur: Cursors = serde_json::from_str(&s.cursor).unwrap();
+        assert_eq!(cur.sets.len(), 4);
+        // Seven documents change: the next sync asks only for what changed
+        // and reads those seven.
+        {
+            let mut all = fx.docs.lock().unwrap();
+            for (ds, i) in [
+                ("production", 3),
+                ("staging", 10),
+                ("blog", 0),
+                ("blog", 1),
+                ("docs", 7),
+                ("docs", 8),
+                ("docs", 9),
+            ] {
+                let d = &mut all.get_mut(ds).unwrap()[i];
+                d["_rev"] = json!("r2");
+                d["_updatedAt"] = json!("2026-10-09T00:00:00Z");
+                d["body"][0]["children"][0]["text"] = json!(format!("Edited article {i} in {ds}."));
+            }
+        }
+        let before = fx.doc_reads.load(Ordering::SeqCst);
+        let o = sync::run(&ctx, "kb1", "s1").await;
+        assert!(!o.more && o.error.is_none());
+        assert_eq!((o.fetched, o.indexed), (7, 7));
+        assert_eq!(fx.doc_reads.load(Ordering::SeqCst) - before, 7);
+        assert_eq!(get().items, 5_000);
     }
 }

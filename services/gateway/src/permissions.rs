@@ -394,6 +394,8 @@ pub const CAPABILITIES: &[Capability] = &[
             "knowledge_sources::source_signin",
             "knowledge_sources::source_connection",
             "knowledge_sources::retry_items",
+            "knowledge_sources::approve_source",
+            "knowledge_sources::put_settings",
             "knowledge_sources::delete_source",
         ],
     },

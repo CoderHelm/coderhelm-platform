@@ -38,6 +38,10 @@ pub trait SyncStore: Send + Sync {
     async fn read_index(&self, team: &str, key: &str) -> Result<Option<Arc<Index>>, String>;
     async fn write_index(&self, team: &str, key: &str, index: &Index) -> Result<(), String>;
     async fn delete_object(&self, team: &str, key: &str);
+    /// An object of the team's knowledge folder (a sync's work list, a pack
+    /// shard), or `None` when there is none.
+    async fn read_bytes(&self, team: &str, key: &str) -> Result<Option<Vec<u8>>, String>;
+    async fn write_bytes(&self, team: &str, key: &str, bytes: Vec<u8>) -> Result<(), String>;
     /// Records when the source is next due, for the sweep.
     async fn put_registry(&self, team: &str, s: &Source) -> Result<(), String>;
     /// Keeps one sync's record for the history (and drops the oldest past
@@ -435,6 +439,53 @@ impl SyncStore for AwsSyncStore {
         }
         Ok(())
     }
+    async fn read_bytes(&self, team: &str, key: &str) -> Result<Option<Vec<u8>>, String> {
+        if !kb::owns_key(team, key) {
+            return Err("that object isn't this team's".into());
+        }
+        let obj = match self
+            .s3
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+        {
+            Ok(o) => o,
+            Err(e) => {
+                let missing = e.as_service_error().is_some_and(|se| se.is_no_such_key());
+                return if missing {
+                    Ok(None)
+                } else {
+                    Err(format!("object read: {e}"))
+                };
+            }
+        };
+        let bytes = obj
+            .body
+            .collect()
+            .await
+            .map_err(|e| format!("object read: {e}"))?
+            .into_bytes();
+        Ok(Some(bytes.to_vec()))
+    }
+
+    async fn write_bytes(&self, team: &str, key: &str, bytes: Vec<u8>) -> Result<(), String> {
+        if !kb::owns_key(team, key) {
+            return Err("that object isn't this team's".into());
+        }
+        self.s3
+            .put_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .content_type("application/octet-stream")
+            .body(bytes.into())
+            .send()
+            .await
+            .map(|_| ())
+            .map_err(|e| format!("object save: {e}"))
+    }
+
     async fn put_registry(&self, team: &str, src: &Source) -> Result<(), String> {
         self.dynamo
             .put_item()
@@ -499,6 +550,8 @@ pub mod memory {
         pub registry: Mutex<HashMap<String, (i64, bool)>>,
         pub source_writes: Mutex<Vec<Source>>,
         pub runs: Mutex<Vec<super::super::runs::SyncRun>>,
+        /// Other objects (work lists, pack shards), by key.
+        pub bytes: Mutex<HashMap<String, Vec<u8>>>,
     }
 
     #[async_trait::async_trait]
@@ -571,6 +624,16 @@ pub mod memory {
         }
         async fn delete_object(&self, _team: &str, key: &str) {
             self.objects.lock().unwrap().remove(key);
+            self.bytes.lock().unwrap().remove(key);
+        }
+        async fn read_bytes(&self, team: &str, key: &str) -> Result<Option<Vec<u8>>, String> {
+            assert!(kb::owns_key(team, key));
+            Ok(self.bytes.lock().unwrap().get(key).cloned())
+        }
+        async fn write_bytes(&self, team: &str, key: &str, bytes: Vec<u8>) -> Result<(), String> {
+            assert!(kb::owns_key(team, key));
+            self.bytes.lock().unwrap().insert(key.to_string(), bytes);
+            Ok(())
         }
         async fn put_registry(&self, _team: &str, s: &Source) -> Result<(), String> {
             self.registry

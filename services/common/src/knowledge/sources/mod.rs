@@ -46,9 +46,11 @@ pub mod connect;
 pub mod connector;
 pub mod gdrive;
 pub mod github;
+pub mod limits;
 pub mod mcp;
 pub mod notion;
 pub mod oauth;
+pub mod pending;
 pub mod runs;
 pub mod s3;
 pub mod sanity;
@@ -112,13 +114,26 @@ pub mod trigger {
 
 /// Sources one knowledge base holds.
 pub const MAX_SOURCES_PER_BASE: usize = 10;
-/// Items one source keeps; a bigger selection syncs its first ones and says
-/// so.
-pub const MAX_ITEMS_PER_SOURCE: usize = 1_000;
-/// Items one import keeps (an S3 bucket, an archive). Higher than a synced
-/// app's, still bounded: every local base is ranked in memory, so a bigger
-/// corpus is connected in place instead (the page says so).
-pub const MAX_ITEMS_PER_IMPORT: usize = 2_500;
+/// Items one source keeps unless the team's admins set another number
+/// ([`limits::Settings`]). Picked from what it costs and what search can
+/// hold: about 800 embedding tokens an item makes a full first sync of
+/// 50,000 items about 40M Titan tokens (well under a dollar), and its search
+/// pack ([`crate::knowledge::pack`], about 430 bytes a passage) about 43 MB,
+/// which one search still reads in one go.
+pub const DEFAULT_ITEMS_PER_SOURCE: u32 = 50_000;
+/// The lowest per-source limit an admin can set.
+pub const MIN_ITEMS_PER_SOURCE: u32 = 1_000;
+/// The highest per-source limit an admin can set: one source can fill a
+/// whole base ([`MAX_ITEMS_PER_BASE`]).
+pub const MAX_ITEMS_PER_SOURCE: u32 = 100_000;
+/// Synced items one knowledge base holds across its sources. Real: every
+/// search reads each item's record of the bases it asks (about 700 bytes
+/// each, so about 70 MB and a few seconds at this size), and ranks them in
+/// the gateway's memory.
+pub const MAX_ITEMS_PER_BASE: u32 = 100_000;
+/// A first sync bringing in more items than this waits for an admin to see
+/// its embedding estimate and start it.
+pub const LARGE_SYNC_ITEMS: usize = 2_000;
 /// Entries one selection holds (each may cover a whole tree).
 pub const MAX_SELECTED: usize = 100;
 /// How often a source is synced on schedule without webhooks.
@@ -207,17 +222,19 @@ impl Kind {
         }
     }
 
-    /// An import of an existing knowledge base (higher limits).
+    /// An import of an existing knowledge base.
     pub fn is_import(self) -> bool {
         matches!(self, Kind::S3 | Kind::Archive)
     }
 
-    /// Items one source of this kind keeps.
-    pub fn max_items(self) -> usize {
-        if self.is_import() {
-            MAX_ITEMS_PER_IMPORT
-        } else {
-            MAX_ITEMS_PER_SOURCE
+    /// Items fetched at once in a sync: enough to keep a slow provider
+    /// busy, few enough to stay inside its rate limit (Notion allows about
+    /// three requests a second, and a page takes several).
+    pub fn fetch_concurrency(self) -> usize {
+        match self {
+            Kind::Notion => 2,
+            Kind::Confluence | Kind::Sanity | Kind::GoogleDrive | Kind::Github | Kind::Web => 4,
+            Kind::S3 | Kind::Archive => 8,
         }
     }
 
@@ -258,6 +275,9 @@ pub enum Status {
     Queued,
     Syncing,
     Ready,
+    /// A large first sync waits for an admin to see its embedding estimate
+    /// ([`Source::estimate`]) and start it.
+    Approval,
     /// The last sync stopped; [`Source::error`] says why and how to fix it.
     Error,
 }
@@ -367,10 +387,29 @@ pub struct UsedConnection {
 /// Progress of the sync running now.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Progress {
-    /// `listing`, `fetching`, `removing`.
+    /// `listing`, `fetching`, `removing`, or `waiting` (the provider asked
+    /// us to slow down; the sync continues by itself).
     pub phase: String,
+    /// While fetching: items of this sync handled so far, across every
+    /// worker run it takes.
     pub done: u32,
+    /// While fetching: items this sync brings in (new and changed).
     pub total: u32,
+}
+
+/// What a large first sync will cost to embed, shown before it starts.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Estimate {
+    pub items: u64,
+    /// Embedding tokens, from a sample of the items' text.
+    pub tokens: u64,
+    pub usd: f64,
+    /// Tokens left this month under the team's token limit when it was
+    /// worked out (`None`: no limit).
+    #[serde(default)]
+    pub token_left: Option<u64>,
+    #[serde(default)]
+    pub at: String,
 }
 
 /// A knowledge base's connected source.
@@ -405,9 +444,39 @@ pub struct Source {
     /// large), each saying why.
     #[serde(default)]
     pub skipped_items: u32,
-    /// The selection covers more than [`MAX_ITEMS_PER_SOURCE`] items.
+    /// The selection covers more than [`Source::item_limit`] items: only
+    /// that many are kept, and the page says so.
     #[serde(default)]
     pub truncated: bool,
+    /// The most items this source keeps now: the team's per-source limit,
+    /// or what is left of its base's [`MAX_ITEMS_PER_BASE`]. `None` until
+    /// the first sync works it out ([`DEFAULT_ITEMS_PER_SOURCE`] applies).
+    #[serde(default)]
+    pub item_limit: Option<u32>,
+    /// Why `truncated` is set: `source` (the per-source limit) or `base`
+    /// (the base's own limit).
+    #[serde(default)]
+    pub limit_reason: String,
+    /// Items the selection covers, when the provider can count them (past
+    /// the limit too). `None`: not listed yet, or not countable.
+    #[serde(default)]
+    pub total: Option<u64>,
+    /// Items kept from the latest listing.
+    #[serde(default)]
+    pub listed: u32,
+    /// The embedding estimate a large first sync waits on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimate: Option<Estimate>,
+    /// When an admin started a large first sync (unix seconds).
+    #[serde(default)]
+    pub approved_at: i64,
+    /// This sync has more to do: the next worker run continues it.
+    #[serde(default)]
+    pub continuing: bool,
+    /// Versions of this source's search pack shards (empty: no pack, every
+    /// item is searched from its own index).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pack: Vec<u32>,
     /// The connector's own position for the next sync (opaque).
     #[serde(default)]
     pub cursor: String,
@@ -473,11 +542,29 @@ impl Source {
     pub fn kind_key(&self) -> &'static str {
         self.kind.map(Kind::key).unwrap_or("")
     }
+
+    /// The most items this source keeps now. Connectors stop listing past
+    /// it (one more tells them there is more).
+    pub fn limit(&self) -> usize {
+        self.item_limit.unwrap_or(DEFAULT_ITEMS_PER_SOURCE) as usize
+    }
 }
 
+/// How long a sync that has more to do still shows as syncing while it
+/// waits for its next worker run.
+pub const CONTINUE_SHOWN_SECS: i64 = 30 * 60;
+
 /// The status a source shows: a sync whose hold ran out is not syncing any
-/// more, whatever its record says.
+/// more, whatever its record says, unless it handed over to its next run
+/// (and that run is due soon).
 pub fn shown_status(s: &Source, now: i64) -> Status {
+    if s.status == Status::Syncing
+        && s.lease_until < now
+        && s.continuing
+        && s.next_sync_at + CONTINUE_SHOWN_SECS > now
+    {
+        return Status::Syncing;
+    }
     if s.status == Status::Syncing && s.lease_until < now {
         if s.error.is_some() {
             Status::Error
@@ -633,6 +720,16 @@ pub fn plan_sync(stored: &[FileMeta], listing: &Listing) -> Plan {
         }
     }
     plan
+}
+
+/// Cuts a listing to the source's limit. Returns whether it was cut and
+/// how many items the listing found before the cut (all of them when the
+/// listing was complete).
+pub fn keep_within(items: &mut Vec<Listed>, limit: usize) -> (bool, u64) {
+    let found = items.len() as u64;
+    let cut = items.len() > limit;
+    items.truncate(limit);
+    (cut, found)
 }
 
 /// The next scheduled sync after one that ended at `now`: sooner after a
@@ -901,6 +998,34 @@ mod tests {
         };
         assert_eq!(shown_status(&s, 5), Status::Syncing);
         assert_eq!(shown_status(&s, 11), Status::Ready);
+        // Handed over to its next run: still syncing while that is due.
+        let s = Source {
+            continuing: true,
+            next_sync_at: 20,
+            ..s
+        };
+        assert_eq!(shown_status(&s, 11), Status::Syncing);
+        assert_eq!(
+            shown_status(&s, 20 + CONTINUE_SHOWN_SECS + 1),
+            Status::Ready
+        );
+    }
+
+    #[test]
+    fn a_source_keeps_the_default_until_its_limit_is_worked_out() {
+        let mut s = Source::default();
+        assert_eq!(s.limit(), DEFAULT_ITEMS_PER_SOURCE as usize);
+        s.item_limit = Some(1_234);
+        assert_eq!(s.limit(), 1_234);
+        // A full base keeps nothing more (not the default).
+        s.item_limit = Some(0);
+        assert_eq!(s.limit(), 0);
+        let old: Source = serde_json::from_str(
+            r#"{"id":"a","kb_id":"b","kind":"notion","name":"n","selection":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(old.limit(), DEFAULT_ITEMS_PER_SOURCE as usize);
+        assert_eq!(serde_json::to_value(Status::Approval).unwrap(), "approval");
     }
 
     #[test]
@@ -913,7 +1038,6 @@ mod tests {
         assert_eq!(Kind::parse("s3"), Some(Kind::S3));
         assert_eq!(Kind::parse("archive"), Some(Kind::Archive));
         assert!(!Kind::S3.has_webhooks() && !Kind::Archive.has_webhooks());
-        assert!(Kind::S3.max_items() > Kind::Notion.max_items());
-        assert_eq!(Kind::Archive.max_items(), MAX_ITEMS_PER_IMPORT);
+        assert!(Kind::S3.fetch_concurrency() > Kind::Notion.fetch_concurrency());
     }
 }

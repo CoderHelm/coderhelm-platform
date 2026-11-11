@@ -902,6 +902,10 @@ async fn main() -> Result<(), Error> {
             get(routes::knowledge_sources::browse),
         )
         .route(
+            "/knowledge/:kb_id/items",
+            get(routes::knowledge::list_items),
+        )
+        .route(
             "/knowledge/:kb_id/sources",
             get(routes::knowledge::poll_sources).post(routes::knowledge_sources::create_source),
         )
@@ -925,6 +929,15 @@ async fn main() -> Result<(), Error> {
         .route(
             "/knowledge/:kb_id/sources/:source_id/connection",
             get(routes::knowledge_sources::source_connection),
+        )
+        .route(
+            "/knowledge/:kb_id/sources/:source_id/approve",
+            post(routes::knowledge_sources::approve_source),
+        )
+        .route(
+            "/knowledge/settings",
+            get(routes::knowledge_sources::get_settings)
+                .put(routes::knowledge_sources::put_settings),
         )
         // The company brain chat (asking streams from /api/brain/stream)
         .route("/brain/threads", get(routes::brain::list_threads))

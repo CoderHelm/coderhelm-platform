@@ -109,7 +109,8 @@ pub trait ArchiveBytes: Send + Sync {
 /// The archive connector, reading one uploaded archive.
 pub struct Archive<'a> {
     pub bytes: Box<dyn ArchiveBytes + 'a>,
-    /// Items one source keeps.
+    /// A ceiling on top of the source's own limit ([`Source::limit`]);
+    /// `usize::MAX` in production.
     pub max_items: usize,
     loaded: OnceCell<Arc<Vec<u8>>>,
 }
@@ -178,12 +179,12 @@ pub fn entries(bytes: &[u8], max_items: usize) -> Result<Listing, ConnectorError
             ..Default::default()
         });
     }
-    let truncated = items.len() > max_items;
-    items.truncate(max_items);
+    let (truncated, found) = super::keep_within(&mut items, max_items);
     Ok(Listing {
         items,
         complete: true,
         truncated,
+        total: Some(found),
         ..Default::default()
     })
 }
@@ -230,9 +231,9 @@ impl Connector for Archive<'_> {
         Ok(Vec::new())
     }
 
-    async fn list(&self, _source: &Source) -> Result<Listing, ConnectorError> {
+    async fn list(&self, source: &Source) -> Result<Listing, ConnectorError> {
         let data = self.data().await?;
-        let max = self.max_items;
+        let max = source.limit().min(self.max_items);
         tokio::task::spawn_blocking(move || entries(&data, max))
             .await
             .map_err(|_| ConnectorError::Temporary("The archive couldn't be read.".into()))?
@@ -468,6 +469,9 @@ mod tests {
             now: &|| 1_000,
             used: None,
             trigger: "manual",
+            budget_secs: 0,
+            token_room: None,
+            limit: None,
         };
         let first = sync::run(&ctx, "kb", "arch").await;
         assert_eq!((first.fetched, first.indexed, first.failed), (2, 2, 0));

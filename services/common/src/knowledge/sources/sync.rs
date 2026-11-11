@@ -3,39 +3,76 @@
 //!
 //! The same for every connector. One sync holds the source ([`super::LEASE_SECS`])
 //! so a webhook, the schedule and "Sync now" never run two at once; a change
-//! that arrives meanwhile sets `again` and the running sync goes round once
-//! more. Progress is saved as it goes, so the page shows "12 of 40".
+//! that arrives meanwhile sets `again` and the sync goes round once more
+//! when it is done.
+//!
+//! A sync is done in steps. One worker run lists the selection, plans the
+//! sync and keeps the plan ([`super::pending`]), then fetches and indexes
+//! until its time budget ([`Ctx::budget_secs`]) is spent; what is left is
+//! saved and the next run continues it (the worker queues that run at
+//! once; the scheduled sweep is the backstop). The source shows how far it
+//! is ("265 of 4,812") and how many items are searchable already, the whole
+//! way through. No listing is cut at a fixed number: a source keeps up to
+//! its limit ([`Source::limit`]) and says when it holds less than its
+//! selection covers.
 //!
 //! Re-indexing is as small as the change:
 //!
-//! - an item whose version marker is unchanged is not fetched;
+//! - an item whose version marker is unchanged is not fetched (and a
+//!   connector with a cursor lists only what changed since it);
 //! - a fetched item whose text hashes the same as before is not embedded
 //!   (only its title, link or place are updated);
 //! - a changed item re-embeds only the passages whose text changed; the
 //!   others keep their vectors from the previous index.
 //!
+//! Items are fetched a few at a time ([`super::Kind::fetch_concurrency`]);
+//! a provider that asks us to slow down pauses the sync for a minute, and
+//! it continues where it stopped. A large first sync waits for an admin to
+//! see what it will cost ([`super::LARGE_SYNC_ITEMS`]), and every embedding
+//! counts against the team's monthly token limit ([`Ctx::token_room`]).
+//!
 //! Every embedding goes through the [`Embedder`] given (Titan, metered on
-//! the team's usage in production).
+//! the team's usage in production). A source big enough keeps a search pack
+//! ([`crate::knowledge::pack`]), updated at the end of each run.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use futures::StreamExt;
 
 use super::super::chunk::chunk;
+use super::super::pack;
 use super::super::search::{Embedder, Index, IndexedChunk};
 use super::super::{self as kb, FileMeta, FileStatus};
 use super::connector::{Connector, ConnectorError, Document, Listed};
+use super::pending::{self, Pending};
 use super::store::SyncStore;
 use super::{
-    chunk_key, content_hash, item_id, next_sync, plan_sync, Progress, Source, Status, LEASE_SECS,
+    chunk_key, content_hash, item_id, limits, next_sync, plan_sync, Kind, Progress, Source,
+    SourceError, Status, LARGE_SYNC_ITEMS, LEASE_SECS,
 };
 
 /// Embedding calls in flight at once for one item.
 const EMBED_CONCURRENCY: usize = 6;
-/// Progress is saved after this many items.
-const PROGRESS_EVERY: u32 = 5;
+/// Progress is saved at most this often while items are fetched (seconds).
+const PROGRESS_SECS: i64 = 5;
+/// The list left is saved after this many items, so a run that stops
+/// without saving repeats little.
+const SAVE_LIST_EVERY: u32 = 250;
 /// Rounds one sync runs at most when changes keep arriving.
 const MAX_ROUNDS: usize = 3;
+/// Items fetched to estimate a large first sync.
+const SAMPLE: usize = 8;
+/// How long a sync pauses after a provider asks us to slow down.
+pub const RATE_WAIT_SECS: i64 = 60;
+/// How long a large first sync waits for an admin before it looks again.
+const APPROVAL_RECHECK_SECS: i64 = 24 * 60 * 60;
+/// Older items' indexes read at most in one run to add them to the pack.
+const PACK_BACKFILL: usize = 2_000;
+/// One worker run's time budget in production: the Lambda stops at 15
+/// minutes and the hold lasts 14, which leaves room to save the list and
+/// the pack after the last item.
+pub const RUN_BUDGET_SECS: i64 = 11 * 60;
 
 /// What a sync did.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -63,6 +100,13 @@ pub struct Outcome {
     pub failed: usize,
     /// Why the sync stopped, when it did.
     pub error: Option<ConnectorError>,
+    /// The team's monthly token limit stopped it.
+    pub over_budget: bool,
+    /// More is left: the next run continues after [`Self::wait_secs`].
+    pub more: bool,
+    pub wait_secs: i64,
+    /// A large first sync waits for an admin to start it.
+    pub awaiting: bool,
 }
 
 /// What the sync needs.
@@ -77,12 +121,31 @@ pub struct Ctx<'a> {
     pub used: Option<super::UsedConnection>,
     /// What started it ([`super::trigger`]), for the history.
     pub trigger: &'a str,
+    /// Seconds one run spends before it hands over to the next (0: no
+    /// limit). [`RUN_BUDGET_SECS`] in production.
+    pub budget_secs: i64,
+    /// Embedding tokens the team may still use this month (`None`: no
+    /// limit).
+    pub token_room: Option<u64>,
+    /// The most items the source keeps now and which limit that is
+    /// (`source` or `base`); `None` keeps what the source has.
+    pub limit: Option<(u32, &'a str)>,
 }
 
 fn rfc3339(secs: i64) -> String {
     chrono::DateTime::from_timestamp(secs, 0)
         .unwrap_or_default()
         .to_rfc3339()
+}
+
+/// What a source shows when the team's monthly token limit stopped it.
+pub fn budget_error() -> SourceError {
+    SourceError {
+        message: "Your team's monthly token limit is reached, so nothing more can be embedded this month.".into(),
+        fix: "Raise the monthly token limit in Settings, or wait for next month. What is already brought in stays searchable, and the sync continues from where it stopped.".into(),
+        action: "budget".into(),
+        at: chrono::Utc::now().to_rfc3339(),
+    }
 }
 
 /// Syncs the source `id` of base `kb_id`, unless another sync holds it (then
@@ -119,22 +182,29 @@ pub async fn run(ctx: &Ctx<'_>, kb_id: &str, id: &str) -> Outcome {
         let Ok(Some(mut src)) = ctx.store.source(ctx.team, kb_id, id).await else {
             return out;
         };
+        if let Some((limit, why)) = ctx.limit {
+            src.item_limit = Some(limit);
+            src.limit_reason = why.to_string();
+        }
         src.again = false;
         src.status = Status::Syncing;
-        src.progress = Some(Progress {
-            phase: "listing".into(),
-            done: 0,
-            total: 0,
-        });
+        if !src.continuing {
+            src.progress = Some(Progress {
+                phase: "listing".into(),
+                done: 0,
+                total: 0,
+            });
+        }
         src.lease_until = (ctx.now)() + LEASE_SECS;
         let _ = ctx.store.put_source(ctx.team, &src).await;
-        let round = one_round(ctx, &mut src).await;
-        out.listed = round.listed;
+        let round = one_round(ctx, &mut src, started).await;
+        out.listed = round.listed.max(out.listed);
         out.fetched += round.fetched;
         out.added += round.added;
         out.updated += round.updated;
-        out.skipped = round.skipped;
-        out.problems = round.problems.clone();
+        out.skipped += round.skipped;
+        out.problems.extend(round.problems.iter().cloned());
+        out.problems.truncate(super::runs::MAX_RUN_PROBLEMS);
         out.same_text += round.same_text;
         out.indexed += round.indexed;
         out.embedded_chunks += round.embedded_chunks;
@@ -142,11 +212,16 @@ pub async fn run(ctx: &Ctx<'_>, kb_id: &str, id: &str) -> Outcome {
         out.removed += round.removed;
         out.failed = round.failed;
         out.error = round.error.clone();
+        out.over_budget = round.over_budget;
+        out.more = round.more;
+        out.wait_secs = round.wait_secs;
+        out.awaiting = round.awaiting;
         let again = finish(ctx, kb_id, id, &src, &round).await;
         if !again || round.error.is_some() {
             break;
         }
     }
+    // Every run of a sync is in the history, a sync done in steps too.
     if let Ok(Some(src)) = ctx.store.source(ctx.team, kb_id, id).await {
         let via = ctx.used.as_ref().map(|u| u.via.as_str()).unwrap_or("");
         let run = super::runs::from_outcome(&src, ctx.trigger, started, (ctx.now)(), &out, via);
@@ -159,7 +234,7 @@ pub async fn run(ctx: &Ctx<'_>, kb_id: &str, id: &str) -> Outcome {
 
 /// Saves the outcome onto the freshest copy of the source (someone may have
 /// edited its name or selection meanwhile), releases the hold, and says
-/// whether a change arrived during the sync.
+/// whether to go round again (a change arrived during a sync that is done).
 async fn finish(ctx: &Ctx<'_>, kb_id: &str, id: &str, ran: &Source, r: &Outcome) -> bool {
     let now = (ctx.now)();
     let mut s = match ctx.store.source(ctx.team, kb_id, id).await {
@@ -181,31 +256,60 @@ async fn finish(ctx: &Ctx<'_>, kb_id: &str, id: &str, ran: &Source, r: &Outcome)
     s.skipped_items = items.iter().filter(|f| !f.skipped.is_empty()).count() as u32;
     s.truncated = ran.truncated;
     s.cursor = ran.cursor.clone();
+    s.item_limit = ran.item_limit;
+    s.limit_reason = ran.limit_reason.clone();
+    s.total = ran.total;
+    s.listed = ran.listed;
+    s.estimate = ran.estimate.clone();
+    s.pack = ran.pack.clone();
+    s.continuing = r.more;
     s.last_sync_at = rfc3339(now);
-    s.progress = None;
     s.lease_until = 0;
     if let Some(used) = &ctx.used {
         s.used = Some(used.clone());
     }
-    match &r.error {
-        None => {
-            s.status = Status::Ready;
-            s.error = None;
-            s.last_success_at = rfc3339(now);
-            s.next_sync_at = next_sync(&s, now, false);
-        }
-        Some(e) => {
-            s.status = Status::Error;
-            s.error = Some(super::source_error(&s, e));
-            s.next_sync_at = next_sync(&s, now, true);
+    if r.awaiting {
+        s.status = Status::Approval;
+        s.error = None;
+        s.progress = None;
+        s.next_sync_at = now + APPROVAL_RECHECK_SECS;
+    } else if r.more {
+        // Handed over: the next run continues (the worker queues it now;
+        // the sweep finds it due as a backstop).
+        s.status = Status::Syncing;
+        s.error = None;
+        s.progress = ran.progress.clone();
+        s.next_sync_at = now + r.wait_secs;
+    } else if r.over_budget {
+        s.status = Status::Error;
+        s.error = Some(budget_error());
+        s.progress = None;
+        s.next_sync_at = next_sync(&s, now, true);
+    } else {
+        s.progress = None;
+        match &r.error {
+            None => {
+                s.status = Status::Ready;
+                s.error = None;
+                s.last_success_at = rfc3339(now);
+                s.next_sync_at = next_sync(&s, now, false);
+            }
+            Some(e) => {
+                s.status = Status::Error;
+                s.error = Some(super::source_error(&s, e));
+                s.next_sync_at = next_sync(&s, now, true);
+            }
         }
     }
-    if again {
+    // A change that arrived while a sync is still working through its
+    // list is kept for when the list is done.
+    let done = !r.more && !r.awaiting;
+    if again && done {
         s.again = false;
     }
     let _ = ctx.store.put_source(ctx.team, &s).await;
     let _ = ctx.store.put_registry(ctx.team, &s).await;
-    again && r.error.is_none()
+    again && done && r.error.is_none() && !r.over_budget
 }
 
 /// Records that a source couldn't be synced at all (its connection
@@ -246,21 +350,20 @@ pub async fn fail_with(
     s.status = Status::Error;
     s.error = Some(error);
     s.progress = None;
+    s.continuing = false;
     s.last_sync_at = rfc3339(now);
     s.next_sync_at = next_sync(&s, now, true);
     let _ = store.put_source(team, &s).await;
     let _ = store.put_registry(team, &s).await;
 }
 
-async fn save_progress(ctx: &Ctx<'_>, src: &mut Source, phase: &str, done: u32, total: u32) {
-    let progress = Progress {
-        phase: phase.into(),
-        done,
-        total,
-    };
+/// What the page sees while a run works: progress, and how many items are
+/// searchable already.
+async fn save_progress(ctx: &Ctx<'_>, src: &mut Source, progress: Progress, live: u32) {
     let lease = (ctx.now)() + LEASE_SECS;
     src.progress = Some(progress.clone());
     src.lease_until = lease;
+    src.items = live;
     // Onto the freshest copy, so an edit made meanwhile (a new name, a
     // pause) isn't overwritten by this sync's older copy.
     let mut fresh = match ctx.store.source(ctx.team, &src.kb_id, &src.id).await {
@@ -270,20 +373,218 @@ async fn save_progress(ctx: &Ctx<'_>, src: &mut Source, phase: &str, done: u32, 
     fresh.status = Status::Syncing;
     fresh.progress = Some(progress);
     fresh.lease_until = lease;
+    fresh.items = live;
+    fresh.total = src.total;
+    fresh.listed = src.listed;
+    fresh.truncated = src.truncated;
+    fresh.item_limit = src.item_limit;
+    fresh.limit_reason = src.limit_reason.clone();
     let _ = ctx.store.put_source(ctx.team, &fresh).await;
 }
 
-async fn one_round(ctx: &Ctx<'_>, src: &mut Source) -> Outcome {
-    let mut out = Outcome::default();
-    let listing = match ctx.connector.list(src).await {
-        Ok(l) => l,
-        Err(e) => {
-            out.error = Some(e);
-            return out;
+/// Embedding tokens left under the team's monthly limit, shared by the
+/// items fetched at once.
+struct Room(Option<AtomicU64>);
+
+impl Room {
+    /// Takes `n` tokens; false (and nothing taken) when they don't fit.
+    fn take(&self, n: u64) -> bool {
+        match &self.0 {
+            None => true,
+            Some(left) => left
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |l| l.checked_sub(n))
+                .is_ok(),
         }
+    }
+}
+
+/// How one item went.
+enum Step {
+    Indexed {
+        embedded: usize,
+        reused: usize,
+        sketch: pack::Item,
+        new: bool,
+    },
+    SameText,
+    Failed {
+        fetched: bool,
+        why: String,
+    },
+    /// Left out, saying why (`empty`, `unsupported`, `too_large`).
+    Skipped {
+        fetched: bool,
+        why: String,
+    },
+    Removed {
+        was_ready: bool,
+    },
+    /// Nothing more can be read now (a refused sign-in, a rate limit): the
+    /// item goes back on the list.
+    Stop(ConnectorError),
+    /// The team's token limit: the item goes back on the list.
+    OverBudget,
+}
+
+async fn one_item(
+    ctx: &Ctx<'_>,
+    src: &Source,
+    item: &Listed,
+    prev: Option<&FileMeta>,
+    room: &Room,
+) -> Step {
+    match ctx.connector.fetch(src, item).await {
+        Ok(doc) if doc.is_empty() => {
+            let why = "It has no text to read.";
+            mark_failed(ctx, src, item, prev, why, "empty").await;
+            Step::Skipped {
+                fetched: true,
+                why: why.into(),
+            }
+        }
+        Ok(doc) => match index_item(ctx, src, item, prev, &doc, room).await {
+            Ok(Indexed::SameText) => Step::SameText,
+            Ok(Indexed::New {
+                embedded,
+                reused,
+                sketch,
+            }) => Step::Indexed {
+                embedded,
+                reused,
+                sketch,
+                new: !prev.is_some_and(|p| p.ready_version > 0),
+            },
+            Err(IndexError::OverBudget) => Step::OverBudget,
+            Err(IndexError::Failed(why)) => {
+                mark_failed(ctx, src, item, prev, &why, "").await;
+                Step::Failed { fetched: true, why }
+            }
+        },
+        Err(ConnectorError::Config(why)) => {
+            // Settings that are wrong for this one item: its size or kind.
+            // It is left out, and says why.
+            let reason = if why.to_lowercase().contains("large") {
+                "too_large"
+            } else {
+                "unsupported"
+            };
+            mark_failed(ctx, src, item, prev, &why, reason).await;
+            Step::Skipped {
+                fetched: false,
+                why,
+            }
+        }
+        Err(e) if e.item_gone() => {
+            // Deleted, or the connection may no longer see it: its
+            // content goes too.
+            let was_ready = prev.is_some_and(|p| p.ready_version > 0);
+            match prev {
+                Some(p) if ctx.store.delete_item(ctx.team, p).await.is_ok() => {
+                    Step::Removed { was_ready }
+                }
+                Some(_) => Step::Failed {
+                    fetched: false,
+                    why: "The removed item's content couldn't be deleted.".into(),
+                },
+                None => Step::Removed { was_ready: false },
+            }
+        }
+        Err(e @ ConnectorError::Reconnect(_)) | Err(e @ ConnectorError::RateLimited(_)) => {
+            Step::Stop(e)
+        }
+        Err(e) => {
+            let why = e.to_string();
+            mark_failed(ctx, src, item, prev, &why, "").await;
+            Step::Failed {
+                fetched: false,
+                why,
+            }
+        }
+    }
+}
+
+/// Lists and plans a sync, or picks up the plan an earlier run left.
+async fn plan(
+    ctx: &Ctx<'_>,
+    src: &mut Source,
+    stored: &[FileMeta],
+    live: u32,
+) -> Result<Pending, ConnectorError> {
+    let key = pending::key(ctx.team, &src.kb_id, &src.id);
+    let plan_key = pending::plan_key(src);
+    if let Ok(Some(bytes)) = ctx.store.read_bytes(ctx.team, &key).await {
+        if let Some(p) = Pending::decode(&bytes).filter(|p| p.plan == plan_key) {
+            return Ok(p);
+        }
+    }
+    save_progress(
+        ctx,
+        src,
+        Progress {
+            phase: "listing".into(),
+            done: 0,
+            total: 0,
+        },
+        live,
+    )
+    .await;
+    let listing = ctx.connector.list(src).await?;
+    let plan = plan_sync(stored, &listing);
+    let n = listing.items.len() as u32;
+    // A listing of only what changed says nothing of the whole: the totals
+    // of the last complete one stay.
+    let whole = listing.complete || listing.truncated;
+    let total = match listing.total {
+        Some(t) => Some(t),
+        None if listing.complete && !listing.truncated => Some(n as u64),
+        None if whole => None,
+        None => src.total,
     };
-    out.listed = listing.items.len();
-    src.truncated = listing.truncated;
+    let listed = if whole { n } else { src.listed.max(n) };
+    Ok(Pending {
+        plan: plan_key,
+        planned: plan.fetch.len() as u32,
+        done: 0,
+        fetch: plan.fetch,
+        remove: plan.remove.into_iter().map(|f| f.external_id).collect(),
+        cursor: listing.cursor,
+        truncated: listing.truncated,
+        total,
+        listed,
+        problem: listing.problem.as_ref().map(pending::keep_error),
+        at: (ctx.now)(),
+    })
+}
+
+/// Embedding tokens of a few items spread over the list, for a large
+/// first sync's estimate.
+async fn sample_tokens(ctx: &Ctx<'_>, src: &Source, list: &[Listed]) -> Vec<u64> {
+    let step = (list.len() / SAMPLE).max(1);
+    let picks: Vec<&Listed> = list.iter().step_by(step).take(SAMPLE).collect();
+    let docs: Vec<Result<Document, ConnectorError>> = futures::stream::iter(picks)
+        .map(|item| ctx.connector.fetch(src, item))
+        .buffered(4)
+        .collect()
+        .await;
+    docs.into_iter()
+        .filter_map(Result::ok)
+        .map(|d| {
+            chunk(&d.sections)
+                .iter()
+                .take(kb::MAX_CHUNKS_PER_FILE)
+                .map(|c| limits::tokens_of(c.loc.len() + 1 + c.text.len()))
+                .sum()
+        })
+        .collect()
+}
+
+async fn one_round(ctx: &Ctx<'_>, src: &mut Source, started: i64) -> Outcome {
+    let mut out = Outcome::default();
+    let deadline = if ctx.budget_secs > 0 {
+        started + ctx.budget_secs
+    } else {
+        i64::MAX
+    };
     let mut stored = match ctx.store.items(ctx.team, &src.kb_id, &src.id).await {
         Ok(s) => s,
         Err(e) => {
@@ -294,99 +595,300 @@ async fn one_round(ctx: &Ctx<'_>, src: &mut Source) -> Outcome {
         }
     };
     rename_stored(ctx, src, &mut stored).await;
+    let mut live = stored.iter().filter(|f| f.ready_version > 0).count() as u32;
+    let first = live == 0;
+    let mut pending = match plan(ctx, src, &stored, live).await {
+        Ok(p) => p,
+        Err(e) => {
+            out.error = Some(e);
+            return out;
+        }
+    };
     let by_ext: HashMap<String, FileMeta> = stored
         .iter()
         .map(|f| (f.external_id.clone(), f.clone()))
         .collect();
-    let plan = plan_sync(&stored, &listing);
-    let total = plan.fetch.len() as u32;
-    save_progress(ctx, src, "fetching", 0, total).await;
-    for (i, item) in plan.fetch.iter().enumerate() {
-        let prev = by_ext.get(&item.external_id);
-        match ctx.connector.fetch(src, item).await {
-            Ok(doc) if doc.is_empty() => {
-                out.fetched += 1;
-                skip(
-                    ctx,
-                    src,
-                    item,
-                    prev,
-                    "empty",
-                    "It has no text to read.",
-                    &mut out,
-                )
+    // Items a run that stopped without saving already brought in.
+    pending.fetch.retain(|item| {
+        !by_ext.get(&item.external_id).is_some_and(|f| {
+            !item.version.is_empty()
+                && f.remote_version == item.version
+                && f.ready_version > 0
+                && f.status == FileStatus::Ready
+        })
+    });
+    pending.done = pending.planned.saturating_sub(pending.fetch.len() as u32);
+    out.listed = pending.listed as usize;
+    src.truncated = pending.truncated;
+    src.total = pending.total;
+    src.listed = pending.listed;
+    let list_key = pending::key(ctx.team, &src.kb_id, &src.id);
+
+    // A large first sync shows what it will cost before anything is
+    // embedded, and waits for an admin.
+    if first && src.approved_at == 0 && pending.fetch.len() > LARGE_SYNC_ITEMS {
+        let sample = sample_tokens(ctx, src, &pending.fetch).await;
+        src.estimate = Some(limits::estimate(
+            pending.fetch.len() as u64,
+            &sample,
+            ctx.token_room,
+            &rfc3339((ctx.now)()),
+        ));
+        let _ = ctx
+            .store
+            .write_bytes(ctx.team, &list_key, pending.encode())
+            .await;
+        out.awaiting = true;
+        return out;
+    }
+
+    let room = Room(ctx.token_room.map(AtomicU64::new));
+    let conc = src.kind.map(Kind::fetch_concurrency).unwrap_or(4);
+    let mut queue: std::collections::VecDeque<Listed> = pending.fetch.drain(..).collect();
+    let mut back: Vec<Listed> = Vec::new();
+    let mut stop: Option<ConnectorError> = None;
+    let mut sketches: HashMap<String, pack::Item> = HashMap::new();
+    let (mut last_progress, mut saved_at) = (0i64, pending.done);
+    let progress = |done: u32, planned: u32| Progress {
+        phase: "fetching".into(),
+        done,
+        total: planned,
+    };
+    save_progress(ctx, src, progress(pending.done, pending.planned), live).await;
+    while !queue.is_empty() && stop.is_none() && !out.over_budget {
+        if (ctx.now)() >= deadline {
+            break;
+        }
+        let batch: Vec<Listed> = (0..conc * 2).map_while(|_| queue.pop_front()).collect();
+        let shared: &Source = src;
+        let steps: Vec<(Listed, Step)> = futures::stream::iter(batch)
+            .map(|item| {
+                let prev = by_ext.get(&item.external_id);
+                let room = &room;
+                async move {
+                    let step = one_item(ctx, shared, &item, prev, room).await;
+                    (item, step)
+                }
+            })
+            .buffered(conc)
+            .collect()
+            .await;
+        for (item, step) in steps {
+            match step {
+                Step::Stop(e) => {
+                    back.push(item);
+                    stop.get_or_insert(e);
+                    continue;
+                }
+                Step::OverBudget => {
+                    back.push(item);
+                    out.over_budget = true;
+                    continue;
+                }
+                Step::Indexed {
+                    embedded,
+                    reused,
+                    sketch,
+                    new,
+                } => {
+                    out.fetched += 1;
+                    out.indexed += 1;
+                    out.embedded_chunks += embedded;
+                    out.reused_chunks += reused;
+                    if new {
+                        live += 1;
+                        out.added += 1;
+                    } else {
+                        out.updated += 1;
+                    }
+                    sketches.insert(sketch.file_id.clone(), sketch);
+                }
+                Step::SameText => {
+                    out.fetched += 1;
+                    out.same_text += 1;
+                }
+                Step::Failed { fetched, why } => {
+                    out.failed += 1;
+                    out.fetched += usize::from(fetched);
+                    problem(&mut out, &item, "failed", &why);
+                }
+                Step::Skipped { fetched, why } => {
+                    out.skipped += 1;
+                    out.fetched += usize::from(fetched);
+                    problem(&mut out, &item, "skipped", &why);
+                }
+                Step::Removed { was_ready } => {
+                    out.removed += 1;
+                    live -= u32::from(was_ready && live > 0);
+                }
+            }
+            pending.done += 1;
+        }
+        let now = (ctx.now)();
+        if now - last_progress >= PROGRESS_SECS {
+            last_progress = now;
+            save_progress(ctx, src, progress(pending.done, pending.planned), live).await;
+        }
+        if pending.done - saved_at >= SAVE_LIST_EVERY {
+            saved_at = pending.done;
+            let mut left = pending.clone();
+            left.fetch = back.iter().chain(queue.iter()).cloned().collect();
+            let _ = ctx
+                .store
+                .write_bytes(ctx.team, &list_key, left.encode())
                 .await;
-            }
-            Ok(doc) => {
-                out.fetched += 1;
-                let was_ready = prev.is_some_and(|p| p.ready_version > 0);
-                match index_item(ctx, src, item, prev, &doc).await {
-                    Ok(Indexed::SameText) => out.same_text += 1,
-                    Ok(Indexed::New { embedded, reused }) => {
-                        out.indexed += 1;
-                        if was_ready {
-                            out.updated += 1;
-                        } else {
-                            out.added += 1;
-                        }
-                        out.embedded_chunks += embedded;
-                        out.reused_chunks += reused;
-                    }
-                    Err(why) => {
-                        out.failed += 1;
-                        problem(&mut out, item, "failed", &why);
-                        mark_failed(ctx, src, item, prev, &why, "").await;
-                    }
-                }
-            }
-            Err(ConnectorError::Config(why)) => {
-                // Settings that are wrong for this one item: its size or
-                // kind. It is left out, and says why.
-                let reason = if why.to_lowercase().contains("large") {
-                    "too_large"
-                } else {
-                    "unsupported"
-                };
-                skip(ctx, src, item, prev, reason, &why, &mut out).await;
-            }
-            Err(e) if e.item_gone() => {
-                // Deleted, or the connection may no longer see it: its
-                // content goes too.
-                if let Some(p) = prev {
-                    if ctx.store.delete_item(ctx.team, p).await.is_ok() {
-                        out.removed += 1;
-                    }
-                }
-            }
-            Err(e @ ConnectorError::Reconnect(_)) | Err(e @ ConnectorError::RateLimited(_)) => {
-                // Nothing more can be read now; what was done is kept.
-                out.error = Some(e);
-                return out;
-            }
-            Err(e) => {
-                out.failed += 1;
-                problem(&mut out, item, "failed", &e.to_string());
-                mark_failed(ctx, src, item, prev, &e.to_string(), "").await;
-            }
-        }
-        let done = i as u32 + 1;
-        if done.is_multiple_of(PROGRESS_EVERY) && done < total {
-            save_progress(ctx, src, "fetching", done, total).await;
         }
     }
-    if !plan.remove.is_empty() {
-        save_progress(ctx, src, "removing", 0, plan.remove.len() as u32).await;
+    back.extend(queue);
+    pending.fetch = back;
+
+    if !pending.fetch.is_empty() {
+        // Not done: keep the list for the next run.
+        let _ = ctx
+            .store
+            .write_bytes(ctx.team, &list_key, pending.encode())
+            .await;
+        update_pack(ctx, src, &sketches, deadline).await;
+        let mut p = progress(pending.done, pending.planned);
+        match stop {
+            Some(ConnectorError::RateLimited(_)) => {
+                p.phase = "waiting".into();
+                out.more = true;
+                out.wait_secs = RATE_WAIT_SECS;
+            }
+            Some(e) => out.error = Some(e),
+            None if out.over_budget => {}
+            None => out.more = true,
+        }
+        src.progress = Some(p);
+        src.items = live;
+        return out;
     }
-    for f in &plan.remove {
-        if ctx.store.delete_item(ctx.team, f).await.is_ok() {
-            out.removed += 1;
+
+    // Everything is fetched: what is gone goes, and the listing's cursor
+    // is committed.
+    if !pending.remove.is_empty() {
+        save_progress(
+            ctx,
+            src,
+            Progress {
+                phase: "removing".into(),
+                done: 0,
+                total: pending.remove.len() as u32,
+            },
+            live,
+        )
+        .await;
+    }
+    for ext in &pending.remove {
+        if let Some(f) = by_ext.get(ext) {
+            if ctx.store.delete_item(ctx.team, f).await.is_ok() {
+                out.removed += 1;
+            }
         }
     }
-    src.cursor = listing.cursor;
+    src.cursor = std::mem::take(&mut pending.cursor);
+    src.estimate = None;
+    ctx.store.delete_object(ctx.team, &list_key).await;
+    update_pack(ctx, src, &sketches, deadline).await;
     if out.error.is_none() {
-        out.error = listing.problem;
+        out.error = pending.problem.as_ref().map(pending::read_error);
     }
     out
+}
+
+/// Brings the source's search pack up to date: this run's new sketches go
+/// in, items that changed or went come out, and items searchable now but
+/// missing from it (an older source, a pack shard lost) are read from their
+/// indexes, a bounded number a run. Only shards that changed are written.
+async fn update_pack(
+    ctx: &Ctx<'_>,
+    src: &mut Source,
+    fresh: &HashMap<String, pack::Item>,
+    deadline: i64,
+) {
+    let Ok(items) = ctx.store.items(ctx.team, &src.kb_id, &src.id).await else {
+        return;
+    };
+    let ready: Vec<&FileMeta> = items.iter().filter(|f| f.ready_version > 0).collect();
+    if src.pack.is_empty() && ready.len() < pack::PACK_FROM {
+        return;
+    }
+    let current: HashMap<&str, u32> = ready
+        .iter()
+        .map(|f| (f.id.as_str(), f.ready_version))
+        .collect();
+    if src.pack.len() != pack::SHARDS {
+        for k in pack::keys(ctx.team, &src.kb_id, &src.id, &src.pack) {
+            ctx.store.delete_object(ctx.team, &k).await;
+        }
+        src.pack = vec![0; pack::SHARDS];
+    }
+    let model = ctx.embedder.model().to_string();
+    let mut backfill = PACK_BACKFILL;
+    for no in 0..pack::SHARDS {
+        let v = src.pack[no];
+        let old_key = pack::shard_key(ctx.team, &src.kb_id, &src.id, no, v);
+        let old = if v > 0 {
+            match ctx.store.read_bytes(ctx.team, &old_key).await {
+                Ok(Some(b)) => pack::decode(&b).ok(),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let mut shard = match old {
+            Some(s) if s.model == model => s,
+            _ => pack::Shard {
+                model: model.clone(),
+                ..Default::default()
+            },
+        };
+        let mut changed = v == 0 || shard.model != model;
+        changed |= pack::apply(&mut shard, fresh, &current, no);
+        // Items searchable now but not in the pack.
+        let have: HashSet<String> = shard.items.iter().map(|i| i.file_id.clone()).collect();
+        let missing: Vec<&FileMeta> = ready
+            .iter()
+            .copied()
+            .filter(|f| pack::shard_of(&f.id) == no && !have.contains(&f.id))
+            .take(backfill)
+            .collect();
+        if !missing.is_empty() && (ctx.now)() < deadline.saturating_add(LEASE_SECS / 4) {
+            let read: Vec<Option<pack::Item>> = futures::stream::iter(missing)
+                .map(|f| async move {
+                    let key = f.searchable_index(ctx.team)?;
+                    let idx = ctx.store.read_index(ctx.team, &key).await.ok()??;
+                    (idx.model == ctx.embedder.model())
+                        .then(|| pack::sketch(&f.id, f.ready_version, &idx))
+                })
+                .buffered(16)
+                .collect()
+                .await;
+            backfill = backfill.saturating_sub(read.len());
+            let found: HashMap<String, pack::Item> = read
+                .into_iter()
+                .flatten()
+                .map(|i| (i.file_id.clone(), i))
+                .collect();
+            changed |= pack::apply(&mut shard, &found, &current, no);
+        }
+        if !changed {
+            continue;
+        }
+        let key = pack::shard_key(ctx.team, &src.kb_id, &src.id, no, v + 1);
+        if ctx
+            .store
+            .write_bytes(ctx.team, &key, pack::encode(&shard))
+            .await
+            .is_ok()
+        {
+            if v > 0 {
+                ctx.store.delete_object(ctx.team, &old_key).await;
+            }
+            src.pack[no] = v + 1;
+        }
+    }
 }
 
 /// Stored items saved under an id the connector names differently now are
@@ -423,7 +925,22 @@ async fn rename_stored(ctx: &Ctx<'_>, src: &Source, stored: &mut Vec<FileMeta>) 
 
 enum Indexed {
     SameText,
-    New { embedded: usize, reused: usize },
+    New {
+        embedded: usize,
+        reused: usize,
+        sketch: pack::Item,
+    },
+}
+
+enum IndexError {
+    Failed(String),
+    OverBudget,
+}
+
+impl From<String> for IndexError {
+    fn from(s: String) -> Self {
+        IndexError::Failed(s)
+    }
 }
 
 fn as_of(updated: &str, now: i64) -> String {
@@ -459,7 +976,8 @@ async fn index_item(
     item: &Listed,
     prev: Option<&FileMeta>,
     doc: &Document,
-) -> Result<Indexed, String> {
+    room: &Room,
+) -> Result<Indexed, IndexError> {
     let now = (ctx.now)();
     let hash = content_hash(doc);
     let mut f = base_item(src, item, prev, now);
@@ -495,9 +1013,6 @@ async fn index_item(
         ctx.store.put_item(ctx.team, &f).await?;
         return Ok(Indexed::SameText);
     }
-    if doc.is_empty() {
-        return Err("This page has no text to index.".into());
-    }
     let mut chunks = chunk(&doc.sections);
     f.truncated = chunks.len() > kb::MAX_CHUNKS_PER_FILE;
     chunks.truncate(kb::MAX_CHUNKS_PER_FILE);
@@ -530,6 +1045,14 @@ async fn index_item(
                 },
             )),
         }
+    }
+    // What this item embeds counts against the team's monthly limit.
+    let tokens: u64 = todo
+        .iter()
+        .map(|(_, t)| limits::tokens_of(crate::truncate_str(t, 8_000).len()))
+        .sum();
+    if !room.take(tokens) {
+        return Err(IndexError::OverBudget);
     }
     let embedded = todo.len();
     let results: Vec<(usize, Result<Vec<f32>, String>)> = futures::stream::iter(todo)
@@ -581,7 +1104,11 @@ async fn index_item(
             )
             .await;
     }
-    Ok(Indexed::New { embedded, reused })
+    Ok(Indexed::New {
+        embedded,
+        reused,
+        sketch: pack::sketch(&f.id, f.ready_version, &index),
+    })
 }
 
 /// Notes an item the run couldn't read or left out, for the history.
@@ -595,21 +1122,6 @@ fn problem(out: &mut Outcome, item: &Listed, kind: &str, why: &str) {
             fix: super::runs::item_fix(why, kind),
         });
     }
-}
-
-/// Leaves an item out, saying why (`empty`, `unsupported`, `too_large`).
-async fn skip(
-    ctx: &Ctx<'_>,
-    src: &Source,
-    item: &Listed,
-    prev: Option<&FileMeta>,
-    reason: &str,
-    why: &str,
-    out: &mut Outcome,
-) {
-    out.skipped += 1;
-    problem(out, item, "skipped", why);
-    mark_failed(ctx, src, item, prev, why, reason).await;
 }
 
 /// Records why an item couldn't be read. A version that was searchable
@@ -643,7 +1155,7 @@ mod tests {
 
     use super::super::connector::{Listing, Node};
     use super::super::store::memory::MemSyncStore;
-    use super::super::{Kind, Selected};
+    use super::super::{shown_status, Kind, Selected};
     use super::*;
     use crate::knowledge::chunk::Section;
     use crate::knowledge::search::testing::WordEmbedder;
@@ -657,6 +1169,10 @@ mod tests {
         too_big: Mutex<Vec<String>>,
         fail_list: Mutex<Option<ConnectorError>>,
         fetches: AtomicUsize,
+        /// Each fetch takes this many seconds on the rig's clock.
+        clock: Mutex<Option<(Arc<AtomicI64>, i64)>>,
+        /// These ids answer "slow down" once each.
+        limited: Mutex<Vec<String>>,
     }
 
     impl FakeProvider {
@@ -703,6 +1219,16 @@ mod tests {
             })
         }
         async fn fetch(&self, _: &Source, item: &Listed) -> Result<Document, ConnectorError> {
+            if let Some((c, secs)) = self.clock.lock().unwrap().as_ref() {
+                c.fetch_add(*secs, Ordering::SeqCst);
+            }
+            {
+                let mut l = self.limited.lock().unwrap();
+                if let Some(i) = l.iter().position(|x| *x == item.external_id) {
+                    l.remove(i);
+                    return Err(ConnectorError::RateLimited("slow down".into()));
+                }
+            }
             self.fetches.fetch_add(1, Ordering::SeqCst);
             if self.gone.lock().unwrap().contains(&item.external_id) {
                 return Err(ConnectorError::Forbidden("no access".into()));
@@ -749,6 +1275,8 @@ mod tests {
         provider: Arc<FakeProvider>,
         embedder: Arc<Counting>,
         clock: Arc<AtomicI64>,
+        budget: Mutex<i64>,
+        room: Mutex<Option<u64>>,
     }
 
     fn rig() -> Rig {
@@ -772,7 +1300,13 @@ mod tests {
             provider: Arc::new(FakeProvider::default()),
             embedder: Arc::new(Counting(AtomicUsize::new(0))),
             clock: Arc::new(AtomicI64::new(1_800_000_000)),
+            budget: Mutex::new(0),
+            room: Mutex::new(None),
         }
+    }
+
+    fn source(r: &Rig) -> Source {
+        r.store.sources.lock().unwrap()["s1"].clone()
     }
 
     async fn sync(r: &Rig) -> Outcome {
@@ -786,8 +1320,25 @@ mod tests {
             now: &now,
             used: None,
             trigger: "manual",
+            budget_secs: *r.budget.lock().unwrap(),
+            token_room: *r.room.lock().unwrap(),
+            limit: None,
         };
         run(&ctx, "kb1", "s1").await
+    }
+
+    /// Runs until the sync has nothing more to do (as the worker queues the
+    /// next run), and says how many runs it took.
+    async fn sync_all(r: &Rig) -> (usize, Outcome) {
+        let mut runs = 0;
+        loop {
+            runs += 1;
+            let o = sync(r).await;
+            if !o.more || runs > 500 {
+                return (runs, o);
+            }
+            r.clock.fetch_add(o.wait_secs, Ordering::SeqCst);
+        }
     }
 
     fn items(r: &Rig) -> Vec<FileMeta> {
@@ -958,6 +1509,9 @@ mod tests {
             now: &now,
             used: Some(used.clone()),
             trigger: "manual",
+            budget_secs: 0,
+            token_room: None,
+            limit: None,
         };
         run(&ctx, "kb1", "s1").await;
         assert_eq!(r.store.sources.lock().unwrap()["s1"].used, Some(used));
@@ -1079,5 +1633,216 @@ mod tests {
         assert!(o.ran);
         assert_eq!(items(&r).len(), 1);
         assert!(!r.store.sources.lock().unwrap()["s1"].again);
+    }
+
+    #[tokio::test]
+    async fn a_big_sync_is_done_in_runs_that_continue_where_the_last_stopped() {
+        let r = rig();
+        for i in 0..1_500 {
+            r.provider
+                .set(&format!("p{i:05}"), "1", &format!("Page number {i} text."));
+        }
+        // Approved up front: this test is about the steps, not the estimate.
+        r.store
+            .sources
+            .lock()
+            .unwrap()
+            .get_mut("s1")
+            .unwrap()
+            .approved_at = 1;
+        *r.provider.clock.lock().unwrap() = Some((r.clock.clone(), 1));
+        *r.budget.lock().unwrap() = 200;
+        let first = sync(&r).await;
+        assert!(first.more, "one run doesn't finish 1,500 items in 200 s");
+        let s = source(&r);
+        assert_eq!(s.status, Status::Syncing);
+        assert!(s.continuing);
+        assert_eq!(s.lease_until, 0, "the hold is released for the next run");
+        assert_eq!(s.total, Some(1_500), "the real total, not a cap");
+        assert!(
+            s.items > 0 && s.items < 1_500,
+            "searchable so far: {}",
+            s.items
+        );
+        let p = s.progress.clone().unwrap();
+        assert_eq!((p.phase.as_str(), p.total), ("fetching", 1_500));
+        assert_eq!(p.done, s.items);
+        assert_eq!(
+            shown_status(&s, r.clock.load(Ordering::SeqCst)),
+            Status::Syncing
+        );
+        // The page saw searchable items climb while the run worked.
+        assert!(r
+            .store
+            .source_writes
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|w| w.status == Status::Syncing && w.items > 0 && w.items < s.items));
+        let (runs, last) = sync_all(&r).await;
+        assert!(runs >= 3, "{runs} more runs");
+        assert!(!last.more && last.error.is_none());
+        let s = source(&r);
+        assert_eq!(
+            (s.status, s.items, s.continuing),
+            (Status::Ready, 1_500, false)
+        );
+        assert!(!s.truncated);
+        // Nothing was fetched twice, and the list is gone.
+        assert_eq!(r.provider.fetches.load(Ordering::SeqCst), 1_500);
+        assert!(r
+            .store
+            .bytes
+            .lock()
+            .unwrap()
+            .keys()
+            .all(|k| !k.ends_with("pending.json")));
+        // A re-sync with two edits fetches those two only.
+        r.provider.set("p00007", "2", "Edited.");
+        r.provider.set("p01234", "2", "Edited too.");
+        let o = sync(&r).await;
+        assert_eq!((o.fetched, o.indexed, o.more), (2, 2, false));
+        assert_eq!(r.provider.fetches.load(Ordering::SeqCst), 1_502);
+    }
+
+    #[tokio::test]
+    async fn a_large_first_sync_waits_for_an_admin_with_its_estimate() {
+        let r = rig();
+        for i in 0..(LARGE_SYNC_ITEMS + 5) {
+            r.provider
+                .set(&format!("p{i:05}"), "1", "Some words to embed here.");
+        }
+        let o = sync(&r).await;
+        assert!(o.awaiting && !o.more);
+        assert_eq!(embeds(&r), 0, "nothing embedded before it is started");
+        let s = source(&r);
+        assert_eq!(s.status, Status::Approval);
+        let e = s.estimate.clone().unwrap();
+        assert_eq!(e.items, (LARGE_SYNC_ITEMS + 5) as u64);
+        assert!(e.tokens >= e.items, "{e:?}");
+        assert!(r.provider.fetches.load(Ordering::SeqCst) <= SAMPLE);
+        // Started: it picks up the kept list without listing again.
+        r.store
+            .sources
+            .lock()
+            .unwrap()
+            .get_mut("s1")
+            .unwrap()
+            .approved_at = 1;
+        let (_, last) = sync_all(&r).await;
+        assert!(last.error.is_none());
+        let s = source(&r);
+        assert_eq!(
+            (s.status, s.items as usize),
+            (Status::Ready, LARGE_SYNC_ITEMS + 5)
+        );
+        assert!(s.estimate.is_none());
+    }
+
+    #[tokio::test]
+    async fn the_token_limit_stops_a_sync_and_it_continues_once_there_is_room() {
+        let r = rig();
+        for i in 0..20 {
+            r.provider.set(&format!("p{i:02}"), "1", "Twelve chars");
+        }
+        // Room for about five items.
+        *r.room.lock().unwrap() = Some(5 * 8);
+        let o = sync(&r).await;
+        assert!(o.over_budget && !o.more);
+        let s = source(&r);
+        assert_eq!(s.status, Status::Error);
+        assert_eq!(s.error.as_ref().unwrap().action, "budget");
+        assert!(s.items > 0 && s.items < 20, "{}", s.items);
+        *r.room.lock().unwrap() = None;
+        let o = sync(&r).await;
+        assert!(o.error.is_none() && !o.over_budget);
+        assert_eq!(source(&r).items, 20);
+    }
+
+    #[tokio::test]
+    async fn a_provider_asking_to_slow_down_pauses_and_the_sync_continues() {
+        let r = rig();
+        for i in 0..10 {
+            r.provider.set(&format!("p{i}"), "1", "Text.");
+        }
+        r.provider.limited.lock().unwrap().push("p5".into());
+        let o = sync(&r).await;
+        assert!(o.more && o.error.is_none());
+        assert_eq!(o.wait_secs, RATE_WAIT_SECS);
+        let s = source(&r);
+        assert_eq!(s.progress.as_ref().unwrap().phase, "waiting");
+        assert!(s.error.is_none());
+        assert!(s.next_sync_at >= r.clock.load(Ordering::SeqCst) + RATE_WAIT_SECS);
+        let (_, last) = sync_all(&r).await;
+        assert!(last.error.is_none());
+        assert_eq!(source(&r).items, 10);
+    }
+
+    #[tokio::test]
+    async fn a_big_source_keeps_a_search_pack_and_rewrites_only_touched_shards() {
+        let r = rig();
+        for i in 0..(pack::PACK_FROM + 20) {
+            r.provider
+                .set(&format!("p{i:04}"), "1", &format!("Runbook {i} words"));
+        }
+        r.store
+            .sources
+            .lock()
+            .unwrap()
+            .get_mut("s1")
+            .unwrap()
+            .approved_at = 1;
+        sync_all(&r).await;
+        let s = source(&r);
+        assert_eq!(s.pack.len(), pack::SHARDS);
+        assert!(s.pack.iter().all(|v| *v == 1), "{:?}", s.pack);
+        let mut packed = 0;
+        for k in pack::keys("TEAM#t", "kb1", "s1", &s.pack) {
+            let b = r.store.bytes.lock().unwrap()[&k].clone();
+            packed += pack::decode(&b).unwrap().items.len();
+        }
+        assert_eq!(packed, pack::PACK_FROM + 20, "every item is in the pack");
+        // One edit rewrites one shard.
+        r.provider.set("p0003", "2", "Edited runbook words");
+        sync(&r).await;
+        let after = source(&r).pack;
+        assert_eq!(after.iter().filter(|v| **v == 2).count(), 1, "{after:?}");
+        // A lost shard is rebuilt from the items' own indexes.
+        let lost = pack::keys("TEAM#t", "kb1", "s1", &after)[0].clone();
+        r.store.bytes.lock().unwrap().remove(&lost);
+        r.provider.set("p0004", "2", "Another edit");
+        sync(&r).await;
+        let mut packed = 0;
+        for k in pack::keys("TEAM#t", "kb1", "s1", &source(&r).pack) {
+            let b = r.store.bytes.lock().unwrap()[&k].clone();
+            packed += pack::decode(&b).unwrap().items.len();
+        }
+        assert_eq!(packed, pack::PACK_FROM + 20);
+    }
+
+    #[tokio::test]
+    async fn the_limit_given_is_kept_on_the_source() {
+        let r = rig();
+        r.provider.set("a", "1", "Text.");
+        let clock = r.clock.clone();
+        let now = move || clock.load(Ordering::SeqCst);
+        let ctx = Ctx {
+            store: r.store.as_ref(),
+            connector: r.provider.as_ref(),
+            embedder: r.embedder.as_ref(),
+            team: "TEAM#t",
+            now: &now,
+            budget_secs: 0,
+            token_room: None,
+            limit: Some((30_000, "base")),
+            used: None,
+            trigger: "manual",
+        };
+        run(&ctx, "kb1", "s1").await;
+        let s = source(&r);
+        assert_eq!(
+            (s.item_limit, s.limit_reason.as_str()),
+            (Some(30_000), "base")
+        );
     }
 }
