@@ -63,7 +63,7 @@ async fn fetch(state: &WorkerState, url: &str) -> Result<Vec<u8>, String> {
         .get(url)
         .header(
             "user-agent",
-            "CoderHelm security feeds (+https://coderhelm.com)",
+            "CoderHelm security feeds",
         )
         .timeout(std::time::Duration::from_secs(40))
         .send()
