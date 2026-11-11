@@ -14,6 +14,8 @@
 //!   what the team has reviewed, and the team's Setup settings.
 //! - [`apply`]: applying a run (idempotent, per repo, one audit event per
 //!   change, `before` values kept) and undoing it.
+//! - [`view`]: one repo's features as the Setup page lists them, each
+//!   with its state and the reason for it.
 //!
 //! Storage (settings table, `pk` = team): `SETUP_RUN#<id>`,
 //! `SETUP_RUN_REPO#<id>#<repo>`, `SETUP_APPLIED#<repo>`, `SETUP_SEEN#TEAM`,
@@ -26,6 +28,7 @@ pub mod plan;
 pub mod registry;
 pub mod runs;
 pub mod store;
+pub mod view;
 
 use serde::{Deserialize, Serialize};
 

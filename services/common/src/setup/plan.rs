@@ -34,6 +34,12 @@ pub enum Choice {
     /// recommendation.
     #[default]
     KeepMine,
+    /// "Do it for me": every setting takes the recommendation unless a
+    /// person deliberately chose its value for this repo ([`is_deliberate`]);
+    /// a value an earlier Setup run wrote, a default, or a repo missing
+    /// from a team list is not a choice. A deliberate choice the repo's
+    /// facts contradict is kept and listed as worth a look.
+    Smart,
     /// Every setting takes the recommendation (Review lists each overwrite).
     UseRecommended,
     /// Each setting where yours and the recommendation differ is picked one
@@ -65,6 +71,19 @@ pub struct CurrentView {
     pub value: Value,
     /// Someone set it (not only the default).
     pub set: bool,
+    /// A person chose this value for this repo ([`is_deliberate`]). Older
+    /// plans don't have it: then it is `set`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deliberate: Option<bool>,
+    /// Who saved it and when, where the row says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub set_by: Option<registry::SetBy>,
+}
+
+impl CurrentView {
+    pub fn deliberate(&self) -> bool {
+        self.deliberate.unwrap_or(self.set)
+    }
 }
 
 /// One setting of one repo's plan.
@@ -101,6 +120,10 @@ pub struct PlanItem {
     /// The capability the viewer lacks to change it (filled per viewer).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub needs: Option<String>,
+    /// A deliberate choice the repo's facts argue against ([`worth_a_look`]),
+    /// filled when the run is shown.
+    #[serde(default)]
+    pub worth_a_look: bool,
 }
 
 fn rec(value: Value, source: Source, evidence: Vec<Evidence>) -> Rec {
@@ -200,12 +223,20 @@ pub fn recommend(
                 }
                 let (marked, closed) =
                     facts::stale_effect(&cfg, &f.open, now, facts::STALE_WINDOW_DAYS);
+                // The numbers are the ones this recommendation applies.
+                let days = |n: u32| {
+                    if n == 1 {
+                        "1 day".to_string()
+                    } else {
+                        format!("{n} days")
+                    }
+                };
                 let mut ev = vec![Evidence::text(format!(
-                    "Over the last {} days this would have marked {marked} and closed {closed} of the {} open pull requests ({} days quiet, then {})",
+                    "Over the last {} days this would have marked {marked} and closed {closed} of the {} open pull requests ({} with no activity, then closed {} later)",
                     facts::STALE_WINDOW_DAYS,
                     f.open.len() + f.open_not_read,
-                    cfg.stale_days,
-                    cfg.close_days
+                    days(cfg.stale_days),
+                    days(cfg.close_days)
                 ))];
                 if let Some(h) = f.median_hours_to_merge() {
                     ev.push(Evidence::text(format!(
@@ -273,6 +304,10 @@ pub struct Applied {
     /// creating their row; they don't count as set while still default.
     #[serde(default)]
     pub filled: BTreeSet<String>,
+    /// Values a person picked or edited in Review (not the recommendation
+    /// Setup chose on its own): they count as that person's choice.
+    #[serde(default)]
+    pub chosen: BTreeSet<String>,
     #[serde(default)]
     pub run_id: String,
     #[serde(default)]
@@ -284,6 +319,25 @@ pub fn is_set(e: &Entry, cur: &Current, applied: Option<&Applied>) -> bool {
     cur.stored
         && !(applied.is_some_and(|a| a.filled.contains(e.id))
             && cur.value == registry::default_value(e))
+}
+
+/// A person chose this value for this repo: it is set ([`is_set`]), and it
+/// isn't the value an earlier Setup run wrote on its own.
+pub fn is_deliberate(e: &Entry, cur: &Current, applied: Option<&Applied>) -> bool {
+    is_set(e, cur, applied)
+        && !applied
+            .is_some_and(|a| a.values.get(e.id) == Some(&cur.value) && !a.chosen.contains(e.id))
+}
+
+/// A deliberate value the repo's own facts argue against: kept, and listed
+/// first as worth a look. Only detected evidence counts (a file, a
+/// workflow, a GitHub setting), never a default or a guess.
+pub fn worth_a_look(item: &PlanItem) -> bool {
+    item.current.deliberate()
+        && item.current.value != item.recommended
+        && item.source == super::Source::Detected
+        && item.evidence.iter().any(|e| !e.text.is_empty())
+        && !registry::get(&item.setting_id).is_some_and(|e| e.preview_only)
 }
 
 /// The value differs from what the last Setup run applied.
@@ -336,6 +390,8 @@ pub fn items(
             current: CurrentView {
                 value: cur.value.clone(),
                 set,
+                deliberate: Some(is_deliberate(e, cur, applied)),
+                set_by: None,
             },
             recommended: r.value,
             source: r.source,
@@ -346,6 +402,7 @@ pub fn items(
             value: None,
             diff,
             needs: None,
+            worth_a_look: false,
         };
         item.decision = decide(&item, Choice::KeepMine, None).0;
         out.push(item);
@@ -375,6 +432,7 @@ pub fn decide(
     }
     let use_it = match choice {
         Choice::UseRecommended => true,
+        Choice::Smart => !item.current.deliberate(),
         Choice::KeepMine | Choice::Decide => !item.current.set,
     };
     if use_it {
@@ -467,10 +525,11 @@ mod tests {
         assert!(r["stale_prs.enabled"].evidence[0]
             .text
             .contains("would have marked 1 and closed 0"));
-        // The default timing: 7 days quiet, then 7 more after the warning.
+        // The default timing, read from the values it recommends: 7 days
+        // quiet, then 7 more after the warning.
         assert!(r["stale_prs.enabled"].evidence[0]
             .text
-            .contains("(7 days quiet, then 7)"));
+            .contains("(7 days with no activity, then closed 7 days later)"));
         assert_eq!(r["stale_prs.stale_days"].value, 7);
         assert_eq!(r["stale_prs.close_days"].value, 7);
         // The cleanup only previews.

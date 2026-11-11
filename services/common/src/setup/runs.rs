@@ -180,6 +180,19 @@ pub struct Summary {
     pub kept: usize,
     /// Settings that act and start as a preview you can switch on.
     pub previews: usize,
+    /// Settings someone chose that the repo's own facts argue against: kept,
+    /// and listed first.
+    #[serde(default)]
+    pub worth: usize,
+    /// The settings behind each count, so the lists always agree with it.
+    #[serde(default)]
+    pub changed_ids: Vec<String>,
+    #[serde(default)]
+    pub kept_ids: Vec<String>,
+    #[serde(default)]
+    pub preview_ids: Vec<String>,
+    #[serde(default)]
+    pub worth_ids: Vec<String>,
     pub text: String,
 }
 
@@ -192,22 +205,24 @@ impl Summary {
                 format!("{k} {many}")
             }
         };
-        let mut parts = vec![format!(
-            "Turned on {}",
-            n(self.changed, "setting", "settings")
-        )];
-        if self.kept > 0 {
-            parts.push(format!("kept {} of yours", self.kept));
+        let mut parts = vec![if self.changed == 0 {
+            "Changed nothing".to_string()
+        } else {
+            format!("Turned on {}", self.changed)
+        }];
+        if self.worth > 0 {
+            parts.push(format!("{} worth a look", self.worth));
         }
         if self.previews > 0 {
             parts.push(format!(
-                "{} {} you can switch on",
-                self.previews,
-                if self.previews == 1 {
-                    "is a preview"
-                } else {
-                    "are previews"
-                }
+                "{} to switch on",
+                n(self.previews, "preview", "previews")
+            ));
+        }
+        if self.kept > 0 {
+            parts.push(format!(
+                "kept {} someone chose",
+                n(self.kept, "setting", "settings")
             ));
         }
         parts.join(", ")
@@ -502,11 +517,12 @@ mod tests {
             changed: 9,
             kept: 3,
             previews: 2,
-            text: String::new(),
+            worth: 2,
+            ..Default::default()
         };
         assert_eq!(
             s.words(),
-            "Turned on 9 settings, kept 3 of yours, 2 are previews you can switch on"
+            "Turned on 9, 2 worth a look, 2 previews to switch on, kept 3 settings someone chose"
         );
     }
 }

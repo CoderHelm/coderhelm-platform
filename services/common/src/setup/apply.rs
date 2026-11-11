@@ -139,15 +139,16 @@ async fn record(kv: &dyn Kv, team: &str, actor: &Actor<'_>, act: &str, run: &str
 
 /// The previews a repo has: a setting that acts is on as a preview, or
 /// recommended and waiting to be switched on.
-async fn previews(store: &dyn Store, repo: &str, items: &[PlanItem]) -> usize {
-    let mut n = 0;
+async fn previews(store: &dyn Store, repo: &str, items: &[PlanItem]) -> Vec<String> {
+    let mut n = Vec::new();
     for i in items {
         let Some(e) = registry::get(&i.setting_id).filter(|e| e.preview_only) else {
             continue;
         };
         let now = registry::read(store, e, repo).await.ok().map(|c| c.value);
-        if now.as_ref() != Some(&i.recommended) {
-            n += 1;
+        // Recommended on and still off: waiting to be switched on.
+        if i.recommended == Value::Bool(true) && now.as_ref() != Some(&i.recommended) {
+            n.push(e.id.to_string());
         }
     }
     for (on, preview, preview_when) in [
@@ -160,10 +161,50 @@ async fn previews(store: &dyn Store, repo: &str, items: &[PlanItem]) -> usize {
         let on = registry::read(store, a, repo).await.ok().map(|c| c.value);
         let pv = registry::read(store, b, repo).await.ok().map(|c| c.value);
         if on == Some(Value::Bool(true)) && pv == Some(Value::Bool(preview_when)) {
-            n += 1;
+            n.push(a.id.to_string());
         }
     }
     n
+}
+
+/// The run's counts and lists for one repo, so the sentence and the lists
+/// under it always agree: a setting is in exactly one list.
+pub fn summarize(
+    changes: &[Change],
+    kept: Vec<String>,
+    worth: Vec<String>,
+    previews: Vec<String>,
+) -> Summary {
+    let mut changed: Vec<String> = Vec::new();
+    for c in changes.iter().filter(|c| !c.undone) {
+        // A dry run switch is the state of its feature's preview, and a
+        // preview is listed with the previews.
+        if c.setting_id.ends_with(".dry_run") || previews.contains(&c.setting_id) {
+            continue;
+        }
+        if !changed.contains(&c.setting_id) {
+            changed.push(c.setting_id.clone());
+        }
+    }
+    let not_in = |l: &[String], x: &String| !l.contains(x);
+    let worth: Vec<String> = worth.into_iter().filter(|x| not_in(&changed, x)).collect();
+    let kept: Vec<String> = kept
+        .into_iter()
+        .filter(|x| not_in(&changed, x) && not_in(&worth, x) && not_in(&previews, x))
+        .collect();
+    let mut s = Summary {
+        changed: changed.len(),
+        kept: kept.len(),
+        previews: previews.len(),
+        worth: worth.len(),
+        changed_ids: changed,
+        kept_ids: kept,
+        preview_ids: previews,
+        worth_ids: worth,
+        text: String::new(),
+    };
+    s.text = s.words();
+    s
 }
 
 /// Applies one repo's plan. Saves the repo record and `SETUP_APPLIED`.
@@ -181,7 +222,8 @@ pub async fn apply_repo(
     let mut applied = prior.clone().unwrap_or_default();
     let mut failed: Vec<ItemError> = Vec::new();
     let mut effects = Vec::new();
-    let (mut changed, mut kept) = (0, 0);
+    let mut changed = 0;
+    let (mut kept, mut worth): (Vec<String>, Vec<String>) = (vec![], vec![]);
     let now = crate::plugins::now_rfc3339();
     let ctx = Ctx {
         repo: &repo,
@@ -209,6 +251,8 @@ pub async fn apply_repo(
                 value: cur.value.clone(),
                 // What this apply has filled so far counts too.
                 set: plan::is_set(e, &cur, Some(&applied)),
+                deliberate: Some(plan::is_deliberate(e, &cur, Some(&applied))),
+                set_by: None,
             },
             ..item.clone()
         };
@@ -218,12 +262,20 @@ pub async fn apply_repo(
             .find(|d| d.repo == repo && d.setting_id == e.id);
         let (decision, target) = plan::decide(&fresh, run.choice, explicit);
         let Some(target) = target else {
+            let theirs = match run.choice {
+                plan::Choice::Smart => fresh.current.deliberate(),
+                _ => fresh.current.set,
+            };
             if decision == Decision::Keep
                 && !e.preview_only
-                && fresh.current.set
+                && theirs
                 && cur.value != item.recommended
             {
-                kept += 1;
+                if plan::worth_a_look(&fresh) {
+                    worth.push(e.id.to_string());
+                } else {
+                    kept.push(e.id.to_string());
+                }
             }
             continue;
         };
@@ -267,6 +319,14 @@ pub async fn apply_repo(
         }
         applied.filled.remove(e.id);
         applied.values.insert(e.id.into(), target.clone());
+        // A value a person picked in Review is theirs from now on.
+        if decision == Decision::Edit
+            || explicit.is_some_and(|d| d.decision == Decision::Use && target != item.recommended)
+        {
+            applied.chosen.insert(e.id.into());
+        } else {
+            applied.chosen.remove(e.id);
+        }
         record(
             kv,
             &team,
@@ -303,13 +363,12 @@ pub async fn apply_repo(
             error: format!("Couldn't record what was applied: {err}"),
         });
     }
-    let mut summary = Summary {
-        changed,
+    let summary = summarize(
+        &doc.changes,
         kept,
-        previews: previews(store, &repo, &items).await,
-        text: String::new(),
-    };
-    summary.text = summary.words();
+        worth,
+        previews(store, &repo, &items).await,
+    );
     let result = RepoResult {
         repo: repo.clone(),
         state: if failed.is_empty() {
@@ -344,6 +403,104 @@ pub async fn apply_repo(
     (result, effects)
 }
 
+/// Writes one setting of one repo of a run to `target` after the run was
+/// applied (Switch on, Use recommended): the same validation, one audit
+/// event, and a change with its `before` value, so single-item undo puts it
+/// back. `None` when it already has that value.
+#[allow(clippy::too_many_arguments)]
+async fn change_one(
+    store: &dyn Store,
+    kv: &dyn Kv,
+    run_id: &str,
+    doc: &mut RepoDoc,
+    e: &'static registry::Entry,
+    target: Value,
+    verb: &str,
+    all_repos: &[String],
+    actor: &Actor<'_>,
+) -> Result<Option<Change>, String> {
+    let team = store.team().to_string();
+    let repo = doc.repo.clone();
+    if let Some(need) = (actor.missing)(e.capability) {
+        return Err(format!("Needs the \"{need}\" permission"));
+    }
+    let target = registry::check(e, &target)?;
+    let cur = registry::read(store, e, &repo).await?;
+    if cur.value == target {
+        return Ok(None);
+    }
+    let now = crate::plugins::now_rfc3339();
+    let ctx = Ctx {
+        repo: &repo,
+        all_repos,
+        by: actor.email,
+        now: now.clone(),
+    };
+    registry::write(store, e, &ctx, &target)
+        .await
+        .map_err(|x| x.to_string())?;
+    record(
+        kv,
+        &team,
+        actor,
+        action::SETUP_APPLIED,
+        run_id,
+        format!(
+            "{repo}: {} {verb}, from {} to {}",
+            e.title,
+            show(&cur.value),
+            show(&target)
+        ),
+    )
+    .await;
+    let evidence = doc
+        .items
+        .iter()
+        .find(|i| i.setting_id == e.id)
+        .map(|i| i.evidence.clone())
+        .unwrap_or_default();
+    let change = Change {
+        setting_id: e.id.into(),
+        row_created: !cur.row,
+        before: cur,
+        after: target.clone(),
+        at: now.clone(),
+        evidence,
+        undone: false,
+    };
+    doc.changes.push(change.clone());
+    let mut applied = runs::applied(kv, &team, &repo).await?.unwrap_or_default();
+    applied.values.insert(e.id.into(), target);
+    applied.filled.remove(e.id);
+    applied.chosen.remove(e.id);
+    applied.at = now;
+    runs::put_applied(kv, &team, &repo, &applied).await?;
+    if let Some(r) = doc.result.as_mut() {
+        r.changed += 1;
+    }
+    Ok(Some(change))
+}
+
+/// The repo's counts again after a change made from its result.
+async fn resummarize(store: &dyn Store, doc: &mut RepoDoc) {
+    let Some(r) = doc.result.as_ref() else {
+        return;
+    };
+    let old = r.summary.clone();
+    let previews = previews(store, &doc.repo, &doc.items).await;
+    let s = summarize(&doc.changes, old.kept_ids, old.worth_ids, previews);
+    if let Some(r) = doc.result.as_mut() {
+        r.summary = s;
+    }
+}
+
+fn applied_run(run: &Run) -> Result<(), String> {
+    if run.state == Some(RunState::Undone) {
+        return Err("This run was undone.".into());
+    }
+    Ok(())
+}
+
 /// Turns one repo's preview into the real setting (stale cleanup leaves its
 /// dry run, security fixes open pull requests, auto-merge goes on), through
 /// the same validation, audit and `before` record as applying, so undo puts
@@ -361,74 +518,107 @@ pub async fn switch_on(
     let (run, _) = runs::get_run(kv, &team, run_id)
         .await?
         .ok_or("No such run.")?;
-    if run.state == Some(RunState::Undone) {
-        return Err("This run was undone.".into());
-    }
+    applied_run(&run)?;
     let mut doc = runs::get_repo(kv, &team, run_id, repo)
         .await?
         .ok_or("That repo isn't in this run.")?;
     let (e, target) = registry::switch_on_target(setting_id)
         .ok_or("That setting has no preview to switch on.")?;
-    if let Some(need) = (actor.missing)(e.capability) {
-        return Err(format!("Needs the \"{need}\" permission"));
-    }
-    let cur = registry::read(store, e, repo).await?;
-    if cur.value == target {
-        return Ok(None);
-    }
-    let now = crate::plugins::now_rfc3339();
-    let ctx = Ctx {
-        repo,
-        all_repos,
-        by: actor.email,
-        now: now.clone(),
-    };
-    registry::write(store, e, &ctx, &target)
-        .await
-        .map_err(|x| x.to_string())?;
-    record(
+    let change = change_one(
+        store,
         kv,
-        &team,
-        actor,
-        action::SETUP_APPLIED,
         run_id,
-        format!(
-            "{repo}: {} switched on, from {} to {}",
-            e.title,
-            show(&cur.value),
-            show(&target)
-        ),
+        &mut doc,
+        e,
+        target,
+        "switched on",
+        all_repos,
+        actor,
     )
-    .await;
-    let evidence = doc
-        .items
-        .iter()
-        .find(|i| i.setting_id == setting_id || i.setting_id == e.id)
-        .map(|i| i.evidence.clone())
-        .unwrap_or_default();
-    let change = Change {
-        setting_id: e.id.into(),
-        row_created: !cur.row,
-        before: cur,
-        after: target.clone(),
-        at: now.clone(),
-        evidence,
-        undone: false,
-    };
-    doc.changes.push(change.clone());
-    let mut applied = runs::applied(kv, &team, repo).await?.unwrap_or_default();
-    applied.values.insert(e.id.into(), target);
-    applied.filled.remove(e.id);
-    applied.at = now;
-    runs::put_applied(kv, &team, repo, &applied).await?;
-    if let Some(r) = doc.result.as_mut() {
-        r.changed += 1;
-        r.summary.changed += 1;
-        r.summary.previews = r.summary.previews.saturating_sub(1);
-        r.summary.text = r.summary.words();
+    .await?;
+    if change.is_some() {
+        resummarize(store, &mut doc).await;
+        runs::put_repo(kv, &team, &doc).await?;
     }
-    runs::put_repo(kv, &team, &doc).await?;
-    Ok(Some(change))
+    Ok(change)
+}
+
+/// "Use recommended" on settings a run kept: each one takes its
+/// recommendation, audited and recorded like any change, so its own undo
+/// puts it back. Returns the changes made; one that fails stops nothing
+/// else and comes back in the second list.
+pub async fn use_recommended(
+    store: &dyn Store,
+    kv: &dyn Kv,
+    run_id: &str,
+    items: &[(String, String)],
+    all_repos: &[String],
+    actor: &Actor<'_>,
+) -> Result<(Vec<(String, Change)>, Vec<Skipped>), String> {
+    let team = store.team().to_string();
+    let (run, _) = runs::get_run(kv, &team, run_id)
+        .await?
+        .ok_or("No such run.")?;
+    applied_run(&run)?;
+    if run.applied_at.is_none() {
+        return Err("Apply the run first; until then, pick Use in Review.".into());
+    }
+    let mut done = Vec::new();
+    let mut skipped = Vec::new();
+    let mut repos: Vec<&str> = items.iter().map(|(r, _)| r.as_str()).collect();
+    repos.sort_unstable();
+    repos.dedup();
+    for repo in repos {
+        let mut doc = runs::get_repo(kv, &team, run_id, repo)
+            .await?
+            .ok_or_else(|| format!("{repo} isn't in this run."))?;
+        let mut touched = false;
+        for (_, sid) in items.iter().filter(|(r, _)| r == repo) {
+            let skip = |reason: String| Skipped {
+                repo: repo.to_string(),
+                setting_id: sid.clone(),
+                reason,
+            };
+            let Some(item) = doc.items.iter().find(|i| &i.setting_id == sid).cloned() else {
+                skipped.push(skip("It isn't in this run's plan.".into()));
+                continue;
+            };
+            let Some(e) = registry::get(sid) else {
+                skipped.push(skip("Unknown setting.".into()));
+                continue;
+            };
+            // Anything that merges goes on only through Switch on.
+            if e.preview_only {
+                skipped.push(skip("Use Switch on for a preview.".into()));
+                continue;
+            }
+            match change_one(
+                store,
+                kv,
+                run_id,
+                &mut doc,
+                e,
+                item.recommended.clone(),
+                "set to the recommendation",
+                all_repos,
+                actor,
+            )
+            .await
+            {
+                Ok(Some(c)) => {
+                    touched = true;
+                    done.push((repo.to_string(), c));
+                }
+                Ok(None) => {}
+                Err(m) => skipped.push(skip(m)),
+            }
+        }
+        if touched {
+            resummarize(store, &mut doc).await;
+            runs::put_repo(kv, &team, &doc).await?;
+        }
+    }
+    Ok((done, skipped))
 }
 
 /// Why a run can't be applied now.

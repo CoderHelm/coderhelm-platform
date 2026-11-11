@@ -715,3 +715,325 @@ async fn auto_merge_starts_as_a_preview_and_switch_on_is_undoable() {
     apply_repo(&store, &kv, &run, &mut doc, &all, &admin()).await;
     assert_eq!(registry::read(&store, am, REPO).await.unwrap().value, true);
 }
+
+// ── Whose value is it ───────────────────────────────────────────────────
+
+fn rec_map(over: &[(&'static str, Value, Source, &str)]) -> HashMap<&'static str, Rec> {
+    let mut m: HashMap<&'static str, Rec> = REGISTRY
+        .iter()
+        .map(|e| {
+            (
+                e.id,
+                Rec {
+                    value: registry::default_value(e),
+                    source: Source::Default,
+                    evidence: vec![Evidence::text("default")],
+                },
+            )
+        })
+        .collect();
+    for (id, v, s, ev) in over {
+        m.insert(
+            id,
+            Rec {
+                value: v.clone(),
+                source: *s,
+                evidence: vec![Evidence::file(*ev, ".github/workflows/ci.yml")],
+            },
+        );
+    }
+    m
+}
+
+/// Security fixes and tests on for another repo only: for this repo, "off"
+/// is just "not in the list", which nobody chose.
+async fn team_lists_for_another_repo(store: &MemoryStore, all: &[String]) {
+    for id in ["security.enabled", "tests.e2e"] {
+        let e = registry::get(id).unwrap();
+        registry::write(store, e, &ctx("acme/api", all), &json!(true))
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn a_repo_missing_from_a_team_list_is_not_a_choice_and_gets_the_recommendation() {
+    let store = MemoryStore::new(T);
+    let kv = Memory::new();
+    let all = all_repos();
+    team_lists_for_another_repo(&store, &all).await;
+    for id in ["security.enabled", "tests.e2e"] {
+        let c = registry::read(&store, registry::get(id).unwrap(), REPO)
+            .await
+            .unwrap();
+        assert_eq!(c.value, false, "{id}");
+        assert!(c.row, "{id}: the team row exists");
+        assert!(!c.stored, "{id}: but nobody chose it for {REPO}");
+        let other = registry::read(&store, registry::get(id).unwrap(), "acme/api")
+            .await
+            .unwrap();
+        assert!(other.stored, "{id}: the listed repo's value is a choice");
+    }
+    let recs = rec_map(&[
+        (
+            "security.enabled",
+            json!(true),
+            Source::Detected,
+            "npm lockfile package-lock.json",
+        ),
+        (
+            "tests.e2e",
+            json!(true),
+            Source::Detected,
+            "Workflow ci.yml runs jest tests",
+        ),
+    ]);
+    let run = mk_run(Choice::KeepMine, Mode::Auto, &[REPO]);
+    let mut doc = plan_repo(&store, &kv, &run, REPO, &recs).await;
+    let (res, _) = apply_repo(&store, &kv, &run, &mut doc, &all, &admin()).await;
+    for id in ["security.enabled", "tests.e2e"] {
+        let e = registry::get(id).unwrap();
+        assert_eq!(
+            registry::read(&store, e, REPO).await.unwrap().value,
+            true,
+            "{id}"
+        );
+        // The other repo stays on.
+        assert_eq!(
+            registry::read(&store, e, "acme/api").await.unwrap().value,
+            true,
+            "{id}"
+        );
+        assert!(res.summary.changed_ids.iter().any(|x| x == id), "{id}");
+        assert!(!res.summary.kept_ids.iter().any(|x| x == id), "{id}");
+    }
+}
+
+#[tokio::test]
+async fn a_real_choice_for_the_repo_is_kept_and_says_who_set_it() {
+    let store = MemoryStore::new(T);
+    let kv = Memory::new();
+    let all = all_repos();
+    let label = registry::get("reviewer.label").unwrap();
+    registry::write(&store, label, &ctx(REPO, &all), &json!("needs-review"))
+        .await
+        .unwrap();
+    let recs = rec_map(&[("reviewer.label", json!("ch-review"), Source::Default, "x")]);
+    for choice in [Choice::KeepMine, Choice::Smart] {
+        let run = mk_run(choice, Mode::Auto, &[REPO]);
+        let mut doc = plan_repo(&store, &kv, &run, REPO, &recs).await;
+        let (res, _) = apply_repo(&store, &kv, &run, &mut doc, &all, &admin()).await;
+        assert_eq!(
+            registry::read(&store, label, REPO).await.unwrap().value,
+            "needs-review"
+        );
+        assert_eq!(
+            res.summary.kept_ids,
+            vec!["reviewer.label".to_string()],
+            "{choice:?}"
+        );
+        assert_eq!(res.summary.kept, res.summary.kept_ids.len());
+        assert!(
+            res.summary.text.contains("kept 1 setting someone chose"),
+            "{}",
+            res.summary.text
+        );
+    }
+    let by = registry::set_by(&store, label, REPO).await;
+    assert_eq!(by.page, "Reviewer settings");
+}
+
+#[tokio::test]
+async fn smart_updates_what_setup_wrote_and_flags_a_choice_the_repo_argues_against() {
+    let store = MemoryStore::new(T);
+    let kv = Memory::new();
+    let all = all_repos();
+    // An earlier run wrote a reviewer label of its own.
+    let label = registry::get("reviewer.label").unwrap();
+    let first = rec_map(&[("reviewer.label", json!("ch-review"), Source::Default, "x")]);
+    let run = mk_run(Choice::KeepMine, Mode::Auto, &[REPO]);
+    let mut doc = plan_repo(&store, &kv, &run, REPO, &first).await;
+    apply_repo(&store, &kv, &run, &mut doc, &all, &admin()).await;
+    // Someone turned the reviewer's test check off by hand.
+    let verify = registry::get("tests.verify_tests").unwrap();
+    let off = !registry::default_value(verify).as_bool().unwrap();
+    registry::write(&store, verify, &ctx(REPO, &all), &json!(off))
+        .await
+        .unwrap();
+    let second = rec_map(&[
+        (
+            "reviewer.label",
+            json!("review-me"),
+            Source::Detected,
+            "Label review-me exists",
+        ),
+        (
+            "tests.verify_tests",
+            json!(!off),
+            Source::Detected,
+            "package.json depends on jest",
+        ),
+    ]);
+    // Keep my settings keeps both: Setup's own value counts as set.
+    let keep = mk_run(Choice::KeepMine, Mode::Auto, &[REPO]);
+    let mut d = plan_repo(&store, &kv, &keep, REPO, &second).await;
+    let (r, _) = apply_repo(&store, &kv, &keep, &mut d, &all, &admin()).await;
+    assert_eq!(
+        registry::read(&store, label, REPO).await.unwrap().value,
+        "ch-review"
+    );
+    assert!(r.summary.kept_ids.contains(&"reviewer.label".to_string()));
+    // Smart takes the new recommendation over Setup's own earlier value,
+    // and keeps the hand choice but lists it first, with its evidence.
+    let smart = mk_run(Choice::Smart, Mode::Auto, &[REPO]);
+    let mut d = plan_repo(&store, &kv, &smart, REPO, &second).await;
+    let (r, _) = apply_repo(&store, &kv, &smart, &mut d, &all, &admin()).await;
+    assert_eq!(
+        registry::read(&store, label, REPO).await.unwrap().value,
+        "review-me"
+    );
+    assert_eq!(
+        registry::read(&store, verify, REPO).await.unwrap().value,
+        off
+    );
+    assert_eq!(r.summary.worth_ids, vec!["tests.verify_tests".to_string()]);
+    assert!(!r
+        .summary
+        .kept_ids
+        .contains(&"tests.verify_tests".to_string()));
+    assert!(
+        r.summary.text.contains("1 worth a look"),
+        "{}",
+        r.summary.text
+    );
+    let item = d.items.iter().find(|i| i.setting_id == verify.id).unwrap();
+    assert!(plan::worth_a_look(item));
+    assert!(item.evidence[0].file.is_some());
+    // The sentence counts exactly the lists.
+    assert_eq!(r.summary.changed, r.summary.changed_ids.len());
+    assert_eq!(r.summary.previews, r.summary.preview_ids.len());
+}
+
+#[tokio::test]
+async fn use_recommended_on_kept_settings_is_audited_and_undoable() {
+    let store = MemoryStore::new(T);
+    let kv = Memory::new();
+    let all = all_repos();
+    let label = registry::get("reviewer.label").unwrap();
+    let cool = registry::get("reminders.cooldown_hours").unwrap();
+    registry::write(&store, label, &ctx(REPO, &all), &json!("mine"))
+        .await
+        .unwrap();
+    registry::write(&store, cool, &ctx(REPO, &all), &json!(48))
+        .await
+        .unwrap();
+    let recs = rec_map(&[
+        ("reviewer.label", json!("ch-review"), Source::Default, "x"),
+        ("reminders.cooldown_hours", json!(12), Source::Default, "x"),
+    ]);
+    let run = mk_run(Choice::KeepMine, Mode::Auto, &[REPO]);
+    runs::put_run(&kv, T, &run, crate::plugins::kv::Expect::Absent)
+        .await
+        .unwrap();
+    plan_repo(&store, &kv, &run, REPO, &recs).await;
+    let (_, results, _) = apply_run(&store, &kv, &run.run_id, None, &all, &admin())
+        .await
+        .unwrap();
+    assert_eq!(results[0].summary.kept, 2);
+    // Before the run is applied it is refused; here it is applied.
+    let one = vec![(REPO.to_string(), label.id.to_string())];
+    let (done, skipped) = use_recommended(&store, &kv, &run.run_id, &one, &all, &admin())
+        .await
+        .unwrap();
+    assert_eq!((done.len(), skipped.len()), (1, 0));
+    assert_eq!(
+        registry::read(&store, label, REPO).await.unwrap().value,
+        "ch-review"
+    );
+    let doc = runs::get_repo(&kv, T, &run.run_id, REPO)
+        .await
+        .unwrap()
+        .unwrap();
+    let s = &doc.result.as_ref().unwrap().summary;
+    assert_eq!(s.kept_ids, vec![cool.id.to_string()]);
+    assert!(s.changed_ids.contains(&label.id.to_string()));
+    assert_eq!((s.kept, s.changed), (s.kept_ids.len(), s.changed_ids.len()));
+    // The group: the rest at once; a preview is refused.
+    let group = vec![
+        (REPO.to_string(), cool.id.to_string()),
+        (REPO.to_string(), "auto_merge.enabled".to_string()),
+    ];
+    let (done, skipped) = use_recommended(&store, &kv, &run.run_id, &group, &all, &admin())
+        .await
+        .unwrap();
+    assert_eq!((done.len(), skipped.len()), (1, 1));
+    assert_eq!(registry::read(&store, cool, REPO).await.unwrap().value, 12);
+    // Each change is in the audit stream.
+    let events = kv.query(T, "AUDIT#", false, None, None).await.unwrap();
+    let text: Vec<String> = events.iter().map(|e| e.data.to_string()).collect();
+    assert!(
+        text.iter()
+            .any(|t| t.contains("Review label set to the recommendation")),
+        "{text:?}"
+    );
+    // Single-item undo puts it back.
+    let pick = vec![(REPO.to_string(), label.id.to_string())];
+    let rep = undo(&store, &kv, &run.run_id, Some(&pick), &all, &admin())
+        .await
+        .unwrap();
+    assert_eq!(rep.restored, 1);
+    assert_eq!(
+        registry::read(&store, label, REPO).await.unwrap().value,
+        "mine"
+    );
+    assert_eq!(registry::read(&store, cool, REPO).await.unwrap().value, 12);
+}
+
+#[tokio::test]
+async fn stale_cleanup_applied_by_setup_is_the_row_the_sweep_and_page_read() {
+    let store = MemoryStore::new(T);
+    let kv = Memory::new();
+    let all = all_repos();
+    let recs = rec_map(&[
+        (
+            "stale_prs.enabled",
+            json!(true),
+            Source::Detected,
+            "would have marked 1",
+        ),
+        ("stale_prs.dry_run", json!(true), Source::Default, "preview"),
+    ]);
+    let run = mk_run(Choice::Smart, Mode::Auto, &[REPO]);
+    runs::put_run(&kv, T, &run, crate::plugins::kv::Expect::Absent)
+        .await
+        .unwrap();
+    plan_repo(&store, &kv, &run, REPO, &recs).await;
+    let (_, results, _) = apply_run(&store, &kv, &run.run_id, None, &all, &admin())
+        .await
+        .unwrap();
+    // The record the stale page (`GET /api/reviewer/stale/config?repo=`)
+    // and the sweep (`STALE_PR_CONFIG#` query, `repo_of_sk`) read.
+    let sk = crate::stale_prs::repo_sk(REPO);
+    assert!(sk.starts_with(crate::stale_prs::CONFIG_PREFIX));
+    assert_eq!(crate::stale_prs::repo_of_sk(&sk), Some(REPO));
+    let item = store
+        .get(&sk)
+        .await
+        .unwrap()
+        .expect("Setup wrote the repo's stale settings");
+    let cfg = crate::stale_prs::StaleConfig::from_json(
+        item.get(crate::stale_prs::ATTR_CONFIG)
+            .unwrap()
+            .as_s()
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(cfg.enabled && cfg.dry_run);
+    assert_eq!(item.get("pk").unwrap().as_s().unwrap(), T);
+    assert_eq!(crate::stale_prs::effective(None, Some(&cfg)), cfg);
+    // It is a preview, listed once, and not also as "turned on".
+    let s = &results[0].summary;
+    assert_eq!(s.preview_ids, vec!["stale_prs.enabled".to_string()]);
+    assert!(!s.changed_ids.contains(&"stale_prs.enabled".to_string()));
+    assert!(!s.changed_ids.contains(&"stale_prs.dry_run".to_string()));
+}
