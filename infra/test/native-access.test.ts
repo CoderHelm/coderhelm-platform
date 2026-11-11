@@ -53,16 +53,17 @@ const sha = (v: unknown) => crypto.createHash("sha256").update(canon(v)).digest(
 
 /**
  * Today's boundary and deploy role policy, as their sha256. Last changed for
- * the infrastructure vulnerability reads in the install's own account
- * (describe and list calls on EC2, Auto Scaling, load balancers, EKS, RDS,
- * ElastiCache, OpenSearch and ECR scans; own-account-read.ts). A change here
+ * Amazon Inspector's findings and AWS Health events in the install's own
+ * account (inspector2 list calls and BatchGetAccountStatus, health describe
+ * calls; own-account-read.ts, OWN_OPTIONS), batched with the infrastructure
+ * vulnerability reads before it, which no release has offered an admin yet. A change here
  * reaches no install by itself: an AWS admin applies it through the access
  * stack (Settings, System, Permissions). Before changing these two values,
  * batch it with whatever else needs the same admin step, and say so in the
  * release notes; the dashboard then offers it as one optional item.
  */
 const ACCESS_DOCS = {
-  boundary: "7237e83df9c0440b1dddb449f04a1f37761f4cd9fa08bdd508690368415cd35c",
+  boundary: "46394a7a0b5a06f96c0c42a5ca3b99e8f29539754420681b0baf60e5c71c75ea",
   deployRole: "d11f40637e639812ba5408d153351341bc593cb604726f6cb4193861c2dd7b1f",
 };
 
@@ -175,5 +176,17 @@ test("searching a connected Bedrock knowledge base arrives with the access stack
   // Listing and reading a cited document were already allowed (bedrock:List*, bedrock:Get*).
   for (const action of ["bedrock:ListKnowledgeBases", "bedrock:GetDocumentContent"]) {
     assert.equal(decision([anything], pinned, { ...kb, action }), "allowed", action);
+  }
+});
+
+test("the install's optional reads are parent parameters fed to the parts that read its own account, so a parameter-only change set switches them", () => {
+  const P = rel.parent.Parameters;
+  assert.equal(P.InfrastructureVulnerabilities.Default, "on");
+  assert.equal(P.InspectorFindings.Default, "off");
+  assert.equal(P.HealthEvents.Default, "off");
+  for (const part of ["Api", "Worker"]) {
+    for (const k of ["InfrastructureVulnerabilities", "InspectorFindings", "HealthEvents"]) {
+      assert.deepEqual(R[part].Properties.Parameters[k], { Ref: k }, `${part}.${k}`);
+    }
   }
 });

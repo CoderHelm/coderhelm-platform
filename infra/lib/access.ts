@@ -223,6 +223,12 @@ export const BOUNDARY_SERVICES = [
   "es:Describe*",
   "es:List*",
   "rds:Describe*",
+  // Amazon Inspector's findings and AWS Health events in the install's own
+  // account, when an admin switches them on (own-account-read.ts, OWN_OPTIONS).
+  // ListFindings, ListCoverage and BatchGetAccountStatus (short: IAM's 6,144 characters).
+  "inspector2:List*",
+  "inspector2:BatchGetA*",
+  "health:Describe*",
   "bedrock:InvokeModel",
   "bedrock:InvokeModelWithResponseStream",
   "bedrock:Get*",

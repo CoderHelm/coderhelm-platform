@@ -168,6 +168,11 @@ export function parameters(): Json {
     StatusKey: { Type: "String", Default: "", NoEcho: true, AllowedPattern: "^$|^[A-Za-z0-9]{32,64}$", Description: "The install guide's key for its progress (see StatusId). Empty for none." },
     DomainCertificateArn: { Type: "String", Default: "", Description: "Set by CoderHelm's stack update once your domain's certificate is issued. Leave empty." },
     DomainZoneId: { Type: "String", Default: "", Description: "No longer used: CoderHelm never changes DNS (kept so older stacks update). Leave empty." },
+    // What CoderHelm reads in this account (own-account-read.ts). Changed from
+    // Settings, Integrations, AWS: the updater changes only these on the running release.
+    InfrastructureVulnerabilities: { Type: "String", Default: "on", AllowedValues: ["off", "on"], Description: "on lets CoderHelm read, read-only, which versions run in this account (EC2, Auto Scaling, load balancers, EKS, RDS, ElastiCache, OpenSearch, ECR scans) to match them against security advisories. Change it later in Settings, Integrations, AWS." },
+    InspectorFindings: { Type: "String", Default: "off", AllowedValues: ["off", "on"], Description: "on lets CoderHelm read Amazon Inspector's findings in this account (read-only), when you run Inspector. Inspector is billed by AWS; CoderHelm never turns it on." },
+    HealthEvents: { Type: "String", Default: "off", AllowedValues: ["off", "on"], Description: "on lets CoderHelm read this account's AWS Health events through the Health API (read-only), which needs AWS Business Support or higher." },
   };
 }
 
@@ -204,6 +209,11 @@ export function installValue(name: string): Json {
     case "DomainName": return { "Fn::If": ["HasDomainCert", { Ref: "Hostname" }, ""] };
     case "DomainCertificateArn": return { "Fn::If": ["HasDomainCert", { Ref: "DomainCertificateArn" }, ""] };
     case "DomainZoneId": return { "Fn::If": ["HasDomainCert", { Ref: "DomainZoneId" }, ""] };
+    // The optional reads of the install's own account (own-account-read.ts, OWN_OPTIONS).
+    case "InfrastructureVulnerabilities":
+    case "InspectorFindings":
+    case "HealthEvents":
+      return { Ref: name };
     default: throw new Error(`no parent value for ${name}`);
   }
 }
@@ -559,6 +569,7 @@ export function buildParent(input: ParentInput): Json {
           { Label: { default: "Who may join" }, Parameters: ["SignupDomain", "RequireTwoFactor"] },
           { Label: { default: "Optional" }, Parameters: ["EmailTransport", "EmailFrom", "BedrockInferencePrefix"] },
           { Label: { default: "Optional: updates" }, Parameters: ["AutoUpdate", "UpdateDay", "UpdateHour", "UpdateTimezone"] },
+          { Label: { default: "Optional: what CoderHelm reads in this account" }, Parameters: ["InfrastructureVulnerabilities", "InspectorFindings", "HealthEvents"] },
           { Label: { default: "Filled in by the install guide or by CoderHelm (leave as they are)" }, Parameters: ["StatusId", "StatusKey", "SetupToken", "DomainCertificateArn", "DomainZoneId"] },
         ],
       },

@@ -1117,7 +1117,7 @@ def remind_waiting(store, env, now, current):
     state = store.get("UPDATE_STATE", {}) or {}
     hid = state.get("review_id")
     entry = (store.get(hid, {}) or {}) if hid else {}
-    if entry.get("status") == "review" and entry.get("version"):
+    if entry.get("status") == "review" and entry.get("version") and entry.get("mode") != "options":
         version = entry["version"]
         since = when(entry.get("review_at") or entry.get("started_at"))
         how = (f"Open Settings, then System, check what it changes and press Apply: {app_url(env)}/settings/system/#version"
@@ -2233,6 +2233,8 @@ def native_parameters(stack, template, overrides=None):
 def native_propose(store, env, version, mode, extra=None, cfn=None, opener=None):
     """Creates the change set. Returns {change_set_id, apply}."""
     cfn = cfn or client("cloudformation")
+    if mode == "options":
+        return options_propose(env, version, (extra or {}).get("options") or {}, cfn)
     url = native_template_url(env, version)
     try:
         body = fetch_template(url, opener)
@@ -2325,6 +2327,124 @@ def native_propose(store, env, version, mode, extra=None, cfn=None, opener=None)
     # the entry records it: apply checks it against the deploy role.
     return {"change_set_id": r["Id"], "apply": bool(role), "role_arn": role, "template_canonical": canonical_sha(proposed), "held": held,
             "deployed_access": deployed_access}
+
+
+# ── What the install reads in its own account: stack parameters ──────────
+#
+# Infrastructure vulnerabilities, Amazon Inspector findings and AWS Health
+# events are parameters of the install's stack (infra/lib/own-account-read.ts,
+# OWN_OPTIONS): each adds or removes its read-only statements on the
+# install's own roles. An admin switches one from the AWS card; the change
+# set keeps the running release's template exactly (UsePreviousTemplate)
+# and changes only those parameters. It goes the way a version update goes:
+# the same preflight of the deploy role, the same review of what it changes
+# about permissions (never applied without an admin's confirmation), the
+# same history row, and CloudFormation's own rollback when it fails.
+
+OPTION_PARAMS = ("InfrastructureVulnerabilities", "InspectorFindings", "HealthEvents")
+OPTION_VALUES = ("on", "off")
+OPTION_NAMES = {"InfrastructureVulnerabilities": "infrastructure vulnerabilities",
+                "InspectorFindings": "Amazon Inspector findings", "HealthEvents": "AWS Health events"}
+
+
+def stack_options(stack):
+    """{parameter: "on" | "off" | None}: None when the stack's release has no such parameter yet."""
+    have = {p.get("ParameterKey"): p.get("ParameterValue") for p in stack.get("Parameters") or []}
+    return {k: (have[k] if have.get(k) in OPTION_VALUES else None) if k in have else None for k in OPTION_PARAMS}
+
+
+def install_options(env, cfn=None):
+    """The install's switches as its stack has them now, or None when unreadable."""
+    if not is_native(env):
+        return None
+    try:
+        stack = (cfn or client("cloudformation")).describe_stacks(StackName=env["NATIVE_STACK"])["Stacks"][0]
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"install options not read: {e}")
+        return None
+    return stack_options(stack)
+
+
+def clean_options(raw):
+    """{parameter: "on" | "off"} from a request, or ValueError."""
+    if not isinstance(raw, dict) or not raw:
+        raise ValueError("options must name at least one of " + ", ".join(OPTION_PARAMS))
+    out = {}
+    for k, v in raw.items():
+        if k not in OPTION_PARAMS:
+            raise ValueError(f"{k} is not a switch this install has (one of {', '.join(OPTION_PARAMS)})")
+        if v not in OPTION_VALUES:
+            raise ValueError(f"{k} must be on or off")
+        out[k] = v
+    return out
+
+
+def options_text(changes):
+    """"turn on Amazon Inspector findings" and the like, for history and notices."""
+    return "; ".join(f"turn {c['to']} {OPTION_NAMES.get(k, k)}" for k, c in sorted(changes.items()))
+
+
+def options_propose(env, version, wanted, cfn):
+    """The parameter-only change set on the running release."""
+    current = env.get("CODERHELM_VERSION", "")
+    if version != current:
+        raise ValueError(f"a switch keeps the running release ({current}), not {version}")
+    stack = cfn.describe_stacks(StackName=env["NATIVE_STACK"])["Stacks"][0]
+    st = stack.get("StackStatus") or ""
+    if st == STUCK:
+        raise ValueError("the install's stack is still stuck after an earlier update's rollback stopped; CoderHelm finishes that rollback by itself first")
+    if st.endswith("_IN_PROGRESS"):
+        raise ValueError(f"AWS is still working on the install's stack ({st}); try again once it has finished")
+    have = stack_options(stack)
+    missing = [k for k in wanted if have.get(k) is None]
+    if missing:
+        raise ValueError(f"{current} doesn't have the {', '.join(OPTION_NAMES[k] for k in missing)} switch yet: it arrives with the next version update")
+    changes = {k: {"from": have[k], "to": v} for k, v in wanted.items() if have[k] != v}
+    if not changes:
+        raise ValueError("already set that way: nothing to change")
+    deployed = deployed_template(cfn, env["NATIVE_STACK"])
+    if not deployed:
+        raise ValueError("the install's stack template couldn't be read, so nothing was proposed")
+    name = f"coderhelm-options-{uuid.uuid4().hex[:8]}"
+    kwargs = {
+        "StackName": env["NATIVE_STACK"],
+        "ChangeSetName": name,
+        "ChangeSetType": "UPDATE",
+        # The running release, exactly: only parameters change.
+        "UsePreviousTemplate": True,
+        "Parameters": native_parameters(stack, deployed, {k: c["to"] for k, c in changes.items()}),
+        "Capabilities": NATIVE_CAPABILITIES,
+        "Description": f"CoderHelm: {options_text(changes)}"[:1024],
+        "IncludeNestedStacks": True,
+    }
+    role = env.get("DEPLOY_ROLE_ARN") or ""
+    if role:
+        kwargs["RoleARN"] = role
+    r = cfn.create_change_set(**kwargs)
+    return {"change_set_id": r["Id"], "apply": bool(role), "role_arn": role,
+            # The template the change set must keep: checked before it is offered (native_poll).
+            "template_canonical": canonical_sha(deployed), "held": [],
+            "deployed_access": {k: v for k, v in (deployed.get("Resources") or {}).items() if k in HELD},
+            "options": changes}
+
+
+def set_options(store, env, now, event):
+    """An admin switches what the install reads in its own account: a
+    parameter-only change set, reviewed and confirmed like any update."""
+    if not is_native(env):
+        raise ValueError("only a one-stack install switches these from here")
+    wanted = clean_options(event.get("options"))
+    state = store.get("UPDATE_STATE", {})
+    hid = state.get("running_id") or state.get("review_id")
+    live = (store.get(hid, {}) or {}) if hid else {}
+    if hid and live.get("status") in ("preparing", "review", "running") and live.get("mode") != "options":
+        # Never replaces a version update an admin is reviewing or AWS is applying.
+        raise ValueError(f"the update to {live.get('version') or 'a new version'} is {'waiting for your OK' if live.get('status') == 'review' else 'in progress'}; "
+                         "finish it first (Settings, System), then switch this")
+    current = env.get("CODERHELM_VERSION", "")
+    actor = event.get("actor") or DIRECT_ACTOR
+    # Never with the press's consent: the change to who may do what is always confirmed (native_hold).
+    return begin(store, env, now, current, actor, "options", extra={"options": wanted})
 
 
 # ── The deploy role's own access ──────────────────────────────────────────
@@ -3331,7 +3451,9 @@ def native_status(store, env, state):
                        applied_by=entry.get("applied_by"), executed_at=entry.get("executed_at"),
                        # The install's own deploy role and boundaries, kept as they are (a newer
                        # version of them is the separate `access` item below).
-                       held=entry.get("held") or [])
+                       held=entry.get("held") or [],
+                       # A switch (parameter-only change set): what it turns on or off.
+                       mode=entry.get("mode"), options=entry.get("options"))
         if entry.get("status") == "review":
             # What an admin confirms in Settings, System before it applies.
             pending.update({
@@ -3355,6 +3477,8 @@ def native_status(store, env, state):
         "access": (store.get("ACCESS") or {}).get("view"),
         # A stack whose rollback stopped, and what CoderHelm did about it.
         "recovery": state.get("recovery"),
+        # What the install reads in its own account, as its stack has it (None: not readable).
+        "options": install_options(env),
     }
 
 
@@ -3542,6 +3666,9 @@ def native_poll(store, env, now, cfn=None, wait=False):
                 how = f"Open Settings, then System, check what it changes and press Apply:\n{app_url(env)}/settings/system/#version"
             else:
                 how = f"CoderHelm can't apply this one for you. Review it and choose Execute in the AWS console:\n{summary['link']}"
+            if entry.get("mode") == "options":
+                # A switch an admin just pressed on the AWS card: the card asks them, no email.
+                return {"native": "review"}
             notify_once(store, f"review:{entry.get('version')}", now, f"update to {entry.get('version')} needs your OK",
                         f"The stack update is prepared. {entry.get('reason') or ''}\n{how}".replace(". \n", ".\n"),
                         env, what="review", version=entry.get("version"),
@@ -4341,6 +4468,9 @@ def handle(event, env, store, now, fetch=fetch_releases, probe=None, hint=None):
     if action == "apply_update":
         return native_apply(store, env, now, event)
 
+    if action == "set_options":
+        return set_options(store, env, now, event)
+
     if action == "open_window":
         return open_window(store, env, now, event)
 
@@ -4359,6 +4489,11 @@ def handle(event, env, store, now, fetch=fetch_releases, probe=None, hint=None):
         state.pop("running_since", None)
         state.pop("running_id", None)
         version = entry.get("version") or event.get("version")
+        if entry.get("mode") == "options":
+            # A switch keeps the release: it says nothing about the version, and
+            # the card shows how it ended (history keeps the row).
+            store.put("UPDATE_STATE", state)
+            return {"status": status, "version": version, "options": entry.get("options")}
         if entry.get("mode") == "domain":
             # A domain change redeploys the same release: it says nothing
             # about the release, so it never marks the version as failed.

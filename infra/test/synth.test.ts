@@ -6,6 +6,7 @@
 //
 //   npm test   (compiles with tsc, then runs node --test)
 
+import { plainStatements } from "../lib/own-account-read";
 import { test } from "node:test";
 import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
@@ -194,8 +195,9 @@ test("self-host: the gateway and worker read the install's own account with this
     const next = src.indexOf("Ability {", at);
     return src.slice(0, start) + (next > 0 ? src.slice(next) : "");
   };
-  // Inspector and Health are a team's choice, read through its own role.
-  const abilities = ["imports", "sync", "inspector", "health"].reduce(without, all);
+  // Inspector and Health are switches (off by default) like infrastructure
+  // vulnerabilities (on by default): their statements are there, each behind its condition.
+  const abilities = ["imports", "sync"].reduce(without, all);
   const needed = [...new Set([...abilities.matchAll(/"([a-z0-9-]+:[A-Za-z]+)"/g)].map((m) => m[1]))];
   assert.ok(needed.length > 20, `${needed.length} actions`);
   for (const [stack, fn] of [
@@ -210,11 +212,25 @@ test("self-host: the gateway and worker read the install's own account with this
     for (const a of needed) assert.ok(doc.includes(`"${a}"`), `${fn} lacks ${a}`);
     for (const a of ["s3:GetObject", "s3:ListBucket", "kms:Decrypt"]) assert.ok(!doc.includes(`"${a}"`), `${fn} must not read buckets with ${a}`);
     // Only reads: list, describe, get, query, never a write.
-    const actions: string[] = policies[0].Properties.PolicyDocument.Statement.flatMap((s: any) => ([] as string[]).concat(s.Action));
+    const actions: string[] = plainStatements(policies[0].Properties.PolicyDocument.Statement).flatMap((s: any) => ([] as string[]).concat(s.Action));
     for (const a of actions) assert.match(a, /^[a-z0-9-]+:(List|Describe|Get|Filter|Start(Query)?$|Stop(Query)?$|BatchGet|Simulate|InvokeRestApi|Retrieve$)/, a);
     // It checks its own permissions on its own role only.
-    const sim = policies[0].Properties.PolicyDocument.Statement.find((s: any) => ([] as string[]).concat(s.Action).includes("iam:SimulatePrincipalPolicy"));
+    const sim = plainStatements(policies[0].Properties.PolicyDocument.Statement).find((s: any) => ([] as string[]).concat(s.Action).includes("iam:SimulatePrincipalPolicy"));
     assert.ok(JSON.stringify(sim.Resource).includes("Fn::GetAtt"), "its own role's ARN");
+    // Each optional read is one statement behind the stack's own switch, whose parameter has the default.
+    const raw = policies[0].Properties.PolicyDocument.Statement as any[];
+    const switched = raw.filter((x) => x["Fn::If"]).map((x) => [x["Fn::If"][0], x["Fn::If"][1].Sid]);
+    assert.deepEqual(switched, [
+      ["OwnReadsInfrastructure", "ReadInfrastructureVersions"],
+      ["OwnReadsInfrastructure", "ReadPublicAmiParameters"],
+      ["OwnReadsInspector", "ReadInspectorFindings"],
+      ["OwnReadsHealth", "ReadHealthEvents"],
+    ]);
+    const params = t[stack].toJSON().Parameters;
+    assert.equal(params.InfrastructureVulnerabilities.Default, "on");
+    assert.equal(params.InspectorFindings.Default, "off");
+    assert.equal(params.HealthEvents.Default, "off");
+    assert.deepEqual(t[stack].toJSON().Conditions.OwnReadsInspector, { "Fn::Equals": [{ Ref: "InspectorFindings" }, "on"] });
     // The function knows its role, so it reads its own account with it.
     const env = envOf(t[stack], fn);
     assert.ok(env.INSTALL_OWN_ROLE_ARN, `${fn} names its own role`);
@@ -284,7 +300,7 @@ test("the sandbox build role has no S3 access: builds use the URLs the worker si
   assert.ok(roleId, role);
   for (const [id, pol] of Object.entries(t.findResources("AWS::IAM::Policy"))) {
     if (!JSON.stringify(pol.Properties.Roles ?? []).includes(roleId!)) continue;
-    const actions = JSON.stringify(pol.Properties.PolicyDocument.Statement.map((st: { Action: unknown }) => st.Action));
+    const actions = JSON.stringify(plainStatements(pol.Properties.PolicyDocument.Statement).map((st: { Action: unknown }) => st.Action));
     assert.ok(!/s3:/i.test(actions), `${id} gives the sandbox build role S3 actions: ${actions}`);
   }
   // The buildspec fetches and uploads through presigned URLs, never the CLI.
@@ -596,7 +612,7 @@ test("the release roles: only release.yml on a v* tag in the approved release en
     assert.ok(!JSON.stringify(sts).includes("StringLike\":{\"token.actions.githubusercontent.com:sub"), "no wildcard sub");
     const mine = policies.filter((p) => JSON.stringify(p.Properties.Roles).includes(logicalPrefix));
     assert.equal(mine.length, 1);
-    return mine[0].Properties.PolicyDocument.Statement;
+    return plainStatements(mine[0].Properties.PolicyDocument.Statement);
   };
   assert.deepEqual(statementsOf("coderhelm-prod-release-publisher", "ReleasePublisherRole"), [
     {
@@ -757,7 +773,7 @@ test("a self-host that starts on Anthropic keys may still call Bedrock, and noth
   for (const stack of ["coderhelm-prod-api", "coderhelm-prod-worker", "coderhelm-prod-streaming", "coderhelm-prod-log-analyzer"]) {
     const policies = Object.values(t[stack].findResources("AWS::IAM::Policy"));
     const st = policies
-      .flatMap((p: any) => p.Properties.PolicyDocument.Statement)
+      .flatMap((p: any) => plainStatements(p.Properties.PolicyDocument.Statement))
       .find((s: any) => s.Sid === "CallClaudeOnBedrock");
     assert.ok(st, `${stack} may call Claude on Bedrock`);
     assert.deepEqual(st.Action, ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"]);
@@ -811,7 +827,7 @@ test("the release check reads models.json only after the signature check, and ca
   const check = Object.entries(roles).find(([, r]: any) => r.Properties.RoleName === "coderhelm-prod-release-check");
   assert.ok(check, "its own role");
   const policies = Object.values(u.findResources("AWS::IAM::Policy")).filter((p: any) => JSON.stringify(p.Properties.Roles).includes(check![0]));
-  const actions = policies.flatMap((p: any) => p.Properties.PolicyDocument.Statement.flatMap((s: any) => [].concat(s.Action)));
+  const actions = policies.flatMap((p: any) => plainStatements(p.Properties.PolicyDocument.Statement).flatMap((s: any) => ([] as string[]).concat(s.Action)));
   // Only reporting back (plus CodeBuild's own logs and reports): no deploy, no secret, no assumed role.
   assert.ok(actions.every((a) => a === "lambda:InvokeFunction" || a.startsWith("logs:") || /^codebuild:(Create|Update|BatchPut)/.test(a)), JSON.stringify(actions));
   assert.ok(!actions.some((a) => /sts:|secretsmanager:|ssm:|cloudformation:|bedrock:/.test(a)));
@@ -882,7 +898,7 @@ test("sign-in: self-host checks every new account in Cognito (pre-sign-up trigge
   const preRolePolicy = Object.values(api.findResources("AWS::IAM::Policy")).find((p: any) =>
     JSON.stringify(p.Properties.Roles).includes(fn.Properties.Role["Fn::GetAtt"][0]),
   ) as any;
-  const actions = JSON.stringify(preRolePolicy.Properties.PolicyDocument.Statement.map((s: any) => s.Action));
+  const actions = JSON.stringify(plainStatements(preRolePolicy.Properties.PolicyDocument.Statement).map((s: any) => s.Action));
   assert.ok(actions.includes("dynamodb:GetItem") && actions.includes("dynamodb:Query"), actions);
   assert.ok(!/PutItem|UpdateItem|DeleteItem|BatchWrite/.test(actions), `pre-sign-up may only read: ${actions}`);
   assert.ok(policies.length > 0);
@@ -963,7 +979,7 @@ test("outbound webhooks: one queue, wired to the worker, sendable by every emitt
 
 test("the update build may run the installer's model check: ask the worker, read the SYSTEM setting only", () => {
   const u = synth(selfHost())["coderhelm-prod-updates"];
-  const statements = Object.values(u.findResources("AWS::IAM::Policy")).flatMap((p: any) => p.Properties.PolicyDocument.Statement);
+  const statements = Object.values(u.findResources("AWS::IAM::Policy")).flatMap((p: any) => plainStatements(p.Properties.PolicyDocument.Statement));
   const invoke = statements.find((s: any) => s.Sid === "InstallerModelCheck" && JSON.stringify(s.Resource).includes("coderhelm-prod-worker"));
   assert.ok(invoke);
   const read = statements.find((s: any) => s.Sid === "ModelCheckSetting");
@@ -1063,7 +1079,7 @@ test("hosted: the weekly summary stays on for everyone, and the mail relay sends
     });
   }
   const brake = Object.values(api.findResources("AWS::IAM::Policy"))
-    .flatMap((p: any) => p.Properties.PolicyDocument.Statement)
+    .flatMap((p: any) => plainStatements(p.Properties.PolicyDocument.Statement))
     .filter((st: any) => [st.Action].flat().includes("ses:PutConfigurationSetSendingOptions"));
   assert.equal(brake.length, 1, "only the brake may turn relay sending off");
   assert.ok(JSON.stringify(brake[0].Resource).includes("configuration-set/coderhelm-prod-relay"), "and only the relay's set");
@@ -1092,7 +1108,7 @@ test("hosted: the weekly summary stays on for everyone, and the mail relay sends
   api.hasResourceProperties("AWS::SNS::Subscription", { Protocol: "sqs", RawMessageDelivery: true });
   // Sending as the relay: only its identity and configuration set, only from its address.
   for (const [stack, role] of [["coderhelm-prod-api", api], ["coderhelm-prod-worker", t["coderhelm-prod-worker"]]] as const) {
-    const sts = Object.values(role.findResources("AWS::IAM::Policy")).flatMap((p: any) => p.Properties.PolicyDocument.Statement);
+    const sts = Object.values(role.findResources("AWS::IAM::Policy")).flatMap((p: any) => plainStatements(p.Properties.PolicyDocument.Statement));
     const relay = sts.filter((st: any) => st.Sid === "MailRelaySendsOnlyAsTheRelay");
     assert.equal(relay.length, 1, stack);
     assert.deepEqual(relay[0].Condition, { StringEquals: { "ses:FromAddress": "notifications@notify.coderhelm.com" } });
@@ -1174,7 +1190,7 @@ test("hosted SES templates escape every value (double braces, never triple)", ()
 // it; opening one needs only Decrypt.
 test("sealing: the gateway and the worker may make data keys for envelopes, hosted and self-hosted", () => {
   const kmsStatements = (t: Template) =>
-    ([...Object.values(t.findResources("AWS::IAM::Policy")), ...Object.values(t.findResources("AWS::IAM::ManagedPolicy"))] as any[]).flatMap((p) => p.Properties.PolicyDocument.Statement as any[]).filter((s) => ([] as string[]).concat(s.Action).some((a) => a.startsWith("kms:")));
+    ([...Object.values(t.findResources("AWS::IAM::Policy")), ...Object.values(t.findResources("AWS::IAM::ManagedPolicy"))] as any[]).flatMap((p) => plainStatements(p.Properties.PolicyDocument.Statement) as any[]).filter((s) => ([] as string[]).concat(s.Action).some((a) => a.startsWith("kms:")));
   for (const t of [synth(loadConfigFile(path.join(INFRA, "config", "hosted.prod.json"), { CDK_DEFAULT_ACCOUNT: "654654210434" }), zoneContext("654654210434", "us-east-1", "coderhelm.com")), synth(selfHost())]) {
     const worker = kmsStatements(t["coderhelm-prod-worker"]);
     const seal = worker.find((s) => JSON.stringify(s.Condition ?? {}).includes("mcp-oauth-token"));

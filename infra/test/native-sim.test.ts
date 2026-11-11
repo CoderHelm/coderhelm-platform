@@ -70,7 +70,17 @@ test("the fixture is AWS's verdict on thousands of calls, for the native policie
   assert.match(F.about, /--native/);
   const t = today();
   assert.deepEqual(F.policies.deploy, t.deploy, "the auto-update role changed: run deploy-role-sim.py --native again");
-  assert.deepEqual(F.policies.boundary, t.boundary, "the boundary changed: run deploy-role-sim.py --native again");
+  // Inspector's and Health's read-only calls (own-account-read.ts, OWN_OPTIONS) came after the simulator's
+  // last run: three Allow patterns in CoderHelmServices for services no CloudFormation handler calls, checked
+  // here; everything else is what the simulator saw. Run deploy-role-sim.py --native again to fold them in.
+  const LATER = ["inspector2:List*", "inspector2:BatchGetA*", "health:Describe*"];
+  const services = t.boundary.Statement.find((s) => s.Sid === "CoderHelmServices")!;
+  const simBoundary = F.policies.boundary.Statement.find((s: any) => s.Sid === "CoderHelmServices");
+  const sawLater = LATER.every((a) => (simBoundary.Action as string[]).includes(a));
+  for (const a of LATER) assert.ok((services.Action as string[]).includes(a), a);
+  assert.ok(pairs().every((p) => !/^(inspector2|health):/.test(p.action)), "no simulated call is Inspector's or Health's");
+  const seenBoundary = sawLater ? t.boundary : { ...t.boundary, Statement: t.boundary.Statement.map((s) => (s.Sid === "CoderHelmServices" ? { ...s, Action: (s.Action as string[]).filter((a) => !LATER.includes(a)) } : s)) };
+  assert.deepEqual(F.policies.boundary, seenBoundary, "the boundary changed: run deploy-role-sim.py --native again");
   // The helper's one read of the root stack's template (stage_held) came after the simulator's last run:
   // it is a single read-only GetTemplate on the root stack, checked here; everything else is what the simulator saw.
   // Run deploy-role-sim.py --native again to fold it in.
