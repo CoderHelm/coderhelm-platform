@@ -3727,6 +3727,39 @@ pub fn dependabot_alerts_path(repo: &str, after: Option<&str>) -> String {
     p
 }
 
+/// `GET /advisories` (GitHub's global advisory database, no repository
+/// permission needed) for advisories updated since `since`, 100 a page,
+/// cursor-paged like Dependabot's ([`dependabot_next_cursor`]).
+pub fn advisories_poll_path(since: &str, after: Option<&str>) -> String {
+    let mut p = format!(
+        "/advisories?updated={}&per_page=100&sort=updated&direction=asc",
+        urlencoding::encode(&format!(">={since}"))
+    );
+    if let Some(c) = after.filter(|c| !c.is_empty()) {
+        p.push_str("&after=");
+        p.push_str(&urlencoding::encode(c));
+    }
+    p
+}
+
+/// How far back the first advisory poll reads.
+pub const ADVISORY_POLL_FIRST_HOURS: i64 = 24;
+/// Each poll re-reads this much before the last one, so an advisory
+/// updated while a poll ran isn't missed.
+pub const ADVISORY_POLL_OVERLAP_MINS: i64 = 10;
+
+/// Where an advisory poll starts: a little before the last poll, or a day
+/// back on the first; never more than a week back.
+pub fn advisory_poll_since(last: Option<&str>, now: chrono::DateTime<Utc>) -> String {
+    let floor = now - chrono::Duration::days(7);
+    let start = last
+        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+        .map(|t| t.with_timezone(&Utc) - chrono::Duration::minutes(ADVISORY_POLL_OVERLAP_MINS))
+        .unwrap_or_else(|| now - chrono::Duration::hours(ADVISORY_POLL_FIRST_HOURS))
+        .max(floor);
+    start.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
 /// The `after` cursor of the next page, from a response's `Link` header
 /// (`<...&after=X>; rel="next"`). None on the last page.
 pub fn dependabot_next_cursor(link: Option<&str>) -> Option<String> {
@@ -5540,6 +5573,33 @@ mod tests {
         for a in [token, slow, conn, other] {
             assert!(!a.reason.contains(VAGUE), "{}", a.reason);
         }
+    }
+
+    #[test]
+    fn the_advisory_poll_reads_from_the_last_poll_with_an_overlap() {
+        let now = DateTime::parse_from_rfc3339("2026-11-11T06:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(advisory_poll_since(None, now), "2026-11-10T06:00:00Z");
+        assert_eq!(
+            advisory_poll_since(Some("2026-11-11T05:00:00+00:00"), now),
+            "2026-11-11T04:50:00Z"
+        );
+        // A long-stopped install reads a week at most.
+        assert_eq!(
+            advisory_poll_since(Some("2026-10-01T00:00:00Z"), now),
+            "2026-11-04T06:00:00Z"
+        );
+        assert_eq!(
+            advisory_poll_since(Some("garbage"), now),
+            "2026-11-10T06:00:00Z"
+        );
+        let p = advisories_poll_path("2026-11-11T04:50:00Z", None);
+        assert_eq!(
+            p,
+            "/advisories?updated=%3E%3D2026-11-11T04%3A50%3A00Z&per_page=100&sort=updated&direction=asc"
+        );
+        assert!(advisories_poll_path("x", Some("abc")).ends_with("&after=abc"));
     }
 
     #[test]

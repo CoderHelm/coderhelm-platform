@@ -240,6 +240,39 @@ fn num(i: &Item, k: &str) -> u64 {
         .unwrap_or(0)
 }
 
+/// The later of two RFC 3339 times (either may be missing).
+fn latest(a: Option<String>, b: Option<String>) -> Option<String> {
+    let at = |t: &Option<String>| {
+        t.as_deref()
+            .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+    };
+    match (at(&a), at(&b)) {
+        (Some(x), Some(y)) if y > x => b,
+        (Some(_), _) => a,
+        (None, Some(_)) => b,
+        (None, None) => a.or(b),
+    }
+}
+
+/// What the advisory feed row says: nothing once a webhook arrived; until
+/// then, that the poll is what keeps it current.
+fn advisory_feed_reason(webhook_at: Option<&str>, polled_at: Option<&str>) -> String {
+    match (webhook_at, polled_at) {
+        (Some(_), _) => String::new(),
+        (None, Some(p)) => {
+            let shown = chrono::DateTime::parse_from_rfc3339(p)
+                .map(|t| {
+                    t.with_timezone(&chrono::Utc)
+                        .format("%b %-d, %H:%M UTC")
+                        .to_string()
+                })
+                .unwrap_or_else(|_| p.to_string());
+            format!("Waiting for GitHub's first webhook; checked by polling at {shown}.")
+        }
+        (None, None) => "Waiting for GitHub's first webhook; GitHub's advisory database is also polled about hourly, starting on the next check.".into(),
+    }
+}
+
 /// One row per source: what it gives, its state in plain words, when it
 /// last synced, and how many findings came from it.
 pub fn source_rows(team_state: &Item, kev: &Item, findings: &[(Finding, FindingState)]) -> Value {
@@ -261,6 +294,7 @@ pub fn source_rows(team_state: &Item, kev: &Item, findings: &[(Finding, FindingS
     let osv_error = opt(team_state, "osv_error");
     let osv_synced = opt(team_state, "osv_synced_at");
     let adv_at = opt(team_state, "advisory_event_at");
+    let adv_polled = opt(team_state, "advisory_polled_at");
     let kev_at = opt(kev, "synced_at");
     let epss_at = opt(team_state, "epss_synced_at");
     json!([
@@ -290,10 +324,12 @@ pub fn source_rows(team_state: &Item, kev: &Item, findings: &[(Finding, FindingS
         {
             "id": "github_advisory",
             "name": "GitHub advisory feed",
-            "gives": "New and changed GitHub advisories (the security_advisory webhook), matched against the dependency lists as they are published.",
-            "state": if adv_at.is_some() { "ok" } else { "never" },
-            "reason": if adv_at.is_some() { String::new() } else { "No advisory has arrived since Security was turned on. GitHub sends one when an advisory is published or changed.".into() },
-            "synced_at": adv_at,
+            "gives": "New and changed GitHub advisories (the security_advisory webhook, and GitHub's advisory database read about hourly), matched against the dependency lists.",
+            "state": if adv_at.is_some() || adv_polled.is_some() { "ok" } else { "never" },
+            "reason": advisory_feed_reason(adv_at.as_deref(), adv_polled.as_deref()),
+            "synced_at": latest(adv_at.clone(), adv_polled.clone()),
+            "webhook_at": adv_at,
+            "polled_at": adv_polled,
             "count": from("github_advisory"),
         },
         {
@@ -320,23 +356,46 @@ pub fn source_rows(team_state: &Item, kev: &Item, findings: &[(Finding, FindingS
 
 /// The dependency inventory per repository, and the reason a repository's
 /// couldn't be read.
-pub fn repo_rows(deps: &[Item], cfg: &SecurityConfig) -> Value {
+/// When a read dependency list is read again (a push to the default branch
+/// that changes a dependency file queues a read; the daily check is the
+/// backstop).
+pub const NEXT_READ: &str = "Next read on the next dependency change or within 24 h.";
+
+/// `team_state`: the team's row, whose Dependabot state a repository's is
+/// shown only when it differs from.
+pub fn repo_rows(deps: &[Item], cfg: &SecurityConfig, team_state: &Item) -> Value {
+    let team_dependabot = (
+        s(team_state, "dependabot"),
+        s(team_state, "dependabot_reason"),
+    );
     let mut rows: Vec<Value> = deps
         .iter()
         .map(|i| {
             let ecos: BTreeMap<String, u64> =
                 serde_json::from_str(&s(i, "ecosystems")).unwrap_or_default();
-            let state = Some(s(i, "inventory_state")).filter(|v| !v.is_empty()).unwrap_or_else(|| "ok".into());
+            let state = Some(s(i, "inventory_state"))
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| "ok".into());
+            let read_at = Some(s(i, "read_at"))
+                .filter(|v| !v.is_empty())
+                .or_else(|| Some(s(i, "updated_at")).filter(|v| !v.is_empty()));
+            let own = (s(i, "dependabot"), s(i, "dependabot_reason"));
+            let (dependabot, dependabot_reason) = if own.0.is_empty() || own == team_dependabot {
+                (None, String::new())
+            } else {
+                (Some(own.0), own.1)
+            };
             json!({
                 "repo": s(i, "repo"),
                 "packages": num(i, "count"),
                 "ecosystems": ecos,
-                "read_at": Some(s(i, "read_at")).filter(|v| !v.is_empty()).or_else(|| Some(s(i, "updated_at")).filter(|v| !v.is_empty())),
+                "next_read": if read_at.is_some() { NEXT_READ } else { "" },
+                "read_at": read_at,
                 "state": state,
                 "reason": s(i, "inventory_reason"),
                 "unpinned": num(i, "unpinned"),
-                "dependabot": Some(s(i, "dependabot")).filter(|v| !v.is_empty()),
-                "dependabot_reason": s(i, "dependabot_reason"),
+                "dependabot": dependabot,
+                "dependabot_reason": dependabot_reason,
                 "osv_error": Some(s(i, "osv_error")).filter(|v| !v.is_empty()),
             })
         })
@@ -351,7 +410,7 @@ pub fn repo_rows(deps: &[Item], cfg: &SecurityConfig) -> Value {
                 rows.push(json!({
                     "repo": r, "packages": 0, "ecosystems": {}, "read_at": null, "state": "not_read",
                     "reason": "Not read yet: its first check runs within 20 minutes of turning Security on.",
-                    "unpinned": 0, "dependabot": null, "dependabot_reason": "", "osv_error": null,
+                    "unpinned": 0, "dependabot": null, "dependabot_reason": "", "osv_error": null, "next_read": "",
                 }));
             }
         }
@@ -500,7 +559,7 @@ pub async fn overview(
         ],
     )
     .await?;
-    out["repos"] = repo_rows(&deps, &cfg);
+    out["repos"] = repo_rows(&deps, &cfg, &team_state);
     out["spend"] = spend(&state, &claims.team_id, &cfg).await?;
     out["permission_missing"] = json!(permission_missing);
     Ok(Json(out))
@@ -1641,9 +1700,11 @@ mod tests {
             ]),
             ..Default::default()
         };
-        let rows = repo_rows(&deps, &cfg);
+        let rows = repo_rows(&deps, &cfg, &Item::new());
         let r = rows.as_array().unwrap();
         assert_eq!(r.len(), 3);
+        assert_eq!(r[0]["next_read"], NEXT_READ);
+        assert_eq!(r[1]["next_read"], "", "not read yet: no next read to name");
         assert_eq!(r[0]["repo"], "acme/api");
         assert_eq!(r[0]["packages"], 1304);
         assert_eq!(r[0]["ecosystems"]["npm"], 1301);
@@ -1654,6 +1715,80 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("Settings, Code security"));
+    }
+
+    #[test]
+    fn a_repos_dependabot_state_shows_only_when_it_differs_from_the_teams() {
+        let why = "GitHub turned down the request for Dependabot's alerts (400: x); it is tried again on the next check.";
+        let team = item(&[("dependabot", "error"), ("dependabot_reason", why)]);
+        let deps = vec![
+            item(&[
+                ("repo", "acme/api"),
+                ("read_at", "2026-11-11T05:38:55Z"),
+                ("dependabot", "error"),
+                ("dependabot_reason", why),
+            ]),
+            item(&[
+                ("repo", "acme/web"),
+                ("read_at", "2026-11-11T05:38:55Z"),
+                ("dependabot", "off"),
+                (
+                    "dependabot_reason",
+                    "Dependabot alerts are turned off for this repo.",
+                ),
+            ]),
+        ];
+        let rows = repo_rows(&deps, &SecurityConfig::default(), &team);
+        let r = rows.as_array().unwrap();
+        assert_eq!(
+            r[0]["dependabot"],
+            Value::Null,
+            "same as the team's row: not repeated"
+        );
+        assert_eq!(r[0]["dependabot_reason"], "");
+        assert_eq!(r[1]["dependabot"], "off");
+        assert!(r[1]["dependabot_reason"]
+            .as_str()
+            .unwrap()
+            .contains("turned off"));
+    }
+
+    #[test]
+    fn the_advisory_feed_counts_the_poll_until_a_webhook_arrives() {
+        let row = |st: &Item| {
+            source_rows(st, &Item::new(), &[])
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["id"] == "github_advisory")
+                .unwrap()
+                .clone()
+        };
+        let none = row(&Item::new());
+        assert_eq!(none["state"], "never");
+        assert!(none["reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("Waiting for GitHub's first webhook"));
+        let polled = row(&item(&[("advisory_polled_at", "2026-11-11T06:00:00Z")]));
+        assert_eq!(polled["state"], "ok");
+        assert_eq!(polled["synced_at"], "2026-11-11T06:00:00Z");
+        assert_eq!(
+            polled["reason"],
+            "Waiting for GitHub's first webhook; checked by polling at Nov 11, 06:00 UTC."
+        );
+        // Last read is whichever ran last; a webhook clears the note.
+        let both = row(&item(&[
+            ("advisory_event_at", "2026-11-11T05:14:15Z"),
+            ("advisory_polled_at", "2026-11-11T06:00:00Z"),
+        ]));
+        assert_eq!(both["synced_at"], "2026-11-11T06:00:00Z");
+        assert_eq!(both["reason"], "");
+        let hook_last = row(&item(&[
+            ("advisory_event_at", "2026-11-11T07:00:00Z"),
+            ("advisory_polled_at", "2026-11-11T06:00:00Z"),
+        ]));
+        assert_eq!(hook_last["synced_at"], "2026-11-11T07:00:00Z");
     }
 
     #[test]

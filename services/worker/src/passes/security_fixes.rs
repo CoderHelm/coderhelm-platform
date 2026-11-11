@@ -2635,6 +2635,11 @@ async fn team_tick(
         report.new_findings += sync_repo(&cx, &repo, &mut findings, true).await;
         report.repos_synced += 1;
     }
+    // GitHub's advisory database, about hourly: the webhook's backstop.
+    let hour = Utc::now().format("%Y%m%d%H").to_string();
+    if !cx.out_of_time() && claim(state, team_id, &format!("SECADVPOLL#{hour}"), 2 * 3600).await {
+        report.new_findings += poll_advisories(&cx, &mut findings).await;
+    }
     let daily = claim(state, team_id, &format!("SECDAILY#{day}"), 2 * 86_400).await;
     tend(&cx, &mut findings, kev_map, daily, &mut report).await;
     if cfg.acts() {
@@ -2652,6 +2657,115 @@ pub struct SweepReport {
     pub triaged: usize,
     pub runs: usize,
     pub cards: usize,
+}
+
+/// An observation withdrawing `ghsa` from every finding that names it,
+/// whatever its version now.
+fn withdrawn_observations(findings: &[(Finding, FindingState)], ghsa: &str) -> Vec<Observation> {
+    findings
+        .iter()
+        .filter(|(f, _)| f.advisory.ids.iter().any(|i| i.eq_ignore_ascii_case(ghsa)))
+        .map(|(f, _)| Observation {
+            repo: f.repo.clone(),
+            manifest: f.manifest.clone(),
+            ecosystem: f.ecosystem.clone(),
+            package: f.package.clone(),
+            advisory: sec::AdvisoryRecord {
+                ids: vec![ghsa.to_string()],
+                withdrawn: true,
+                source: "github_advisory".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .collect()
+}
+
+/// Pages of GitHub's advisory database one poll reads at most.
+const ADVISORY_POLL_PAGES: usize = 10;
+
+/// The backstop for the `security_advisory` webhook (which a quiet day, or
+/// an install the hosted relay doesn't forward global events to, never
+/// sees): GitHub's advisories updated since the last poll, matched against
+/// every repository's dependency list. Records `advisory_polled_at` only
+/// when the whole window was read, so a failed poll is read again.
+async fn poll_advisories(cx: &Ctx<'_>, findings: &mut Vec<(Finding, FindingState)>) -> usize {
+    let now = Utc::now();
+    let last = get_team_state(cx.state, cx.team_id)
+        .await
+        .map(|i| s(&i, "advisory_polled_at"))
+        .filter(|t| !t.is_empty());
+    let since = sec::advisory_poll_since(last.as_deref(), now);
+    let mut advisories: Vec<Value> = vec![];
+    let mut after: Option<String> = None;
+    let mut complete = false;
+    for _ in 0..ADVISORY_POLL_PAGES {
+        let path = sec::advisories_poll_path(&since, after.as_deref());
+        match cx.gh.get_status_link(&path).await {
+            Ok((code, body, link)) if (200..300).contains(&code) => {
+                advisories.extend(body.as_array().cloned().unwrap_or_default());
+                after = sec::dependabot_next_cursor(link.as_deref());
+                if after.is_none() {
+                    complete = true;
+                    break;
+                }
+            }
+            Ok((code, body, _)) => {
+                warn!(
+                    team_id = cx.team_id,
+                    status = code,
+                    github = body["message"].as_str().unwrap_or(""),
+                    "security: the advisory poll was turned down"
+                );
+                break;
+            }
+            Err(e) => {
+                warn!(team_id = cx.team_id, error = %e, "security: the advisory poll got no answer");
+                break;
+            }
+        }
+    }
+    let mut obs = vec![];
+    if !advisories.is_empty() {
+        let mut lists = vec![];
+        for repo in team_repos(cx.state, cx.team_id, cx.cfg).await {
+            if let Some((deps, _)) = load_deps(cx.state, cx.team_id, &repo).await {
+                lists.push((repo, deps));
+            }
+        }
+        for adv in &advisories {
+            for (repo, deps) in &lists {
+                obs.extend(sec::match_github_advisory(repo, adv, deps));
+            }
+            if adv["withdrawn_at"].is_string() {
+                if let Some(ghsa) = adv["ghsa_id"].as_str() {
+                    obs.extend(withdrawn_observations(findings, ghsa));
+                }
+            }
+        }
+    }
+    let matched = obs.len();
+    let created = upsert(cx.state, cx.team_id, cx.cfg, findings, obs)
+        .await
+        .created;
+    info!(
+        team_id = cx.team_id,
+        since,
+        read = advisories.len(),
+        matched,
+        created,
+        complete,
+        "security: advisory poll"
+    );
+    if complete {
+        set_team_state(
+            cx.state,
+            cx.team_id,
+            &[("advisory_polled_at", attr_s(&now.to_rfc3339()))],
+        )
+        .await;
+    }
+    created
 }
 
 /// The scheduled sweep (on the review-reminder tick).
@@ -2804,25 +2918,7 @@ async fn event_for_team(
                 }
             }
             if msg.action == "withdrawn" || adv["withdrawn_at"].is_string() {
-                // Every finding that names it, whatever its version now.
-                let ghsa = msg.ghsa_id.to_ascii_uppercase();
-                for (f, _) in findings.iter() {
-                    if f.advisory.ids.iter().any(|i| i.eq_ignore_ascii_case(&ghsa)) {
-                        obs.push(Observation {
-                            repo: f.repo.clone(),
-                            manifest: f.manifest.clone(),
-                            ecosystem: f.ecosystem.clone(),
-                            package: f.package.clone(),
-                            advisory: sec::AdvisoryRecord {
-                                ids: vec![msg.ghsa_id.clone()],
-                                withdrawn: true,
-                                source: "github_advisory".into(),
-                                ..Default::default()
-                            },
-                            ..Default::default()
-                        });
-                    }
-                }
+                obs.extend(withdrawn_observations(&findings, &msg.ghsa_id));
             }
             let applied = upsert(state, team_id, cfg, &mut findings, obs).await;
             set_team_state(
