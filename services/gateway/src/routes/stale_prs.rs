@@ -6,8 +6,9 @@
 //!   repository's own (when it has them) and what applies.
 //! - `PUT /api/reviewer/stale/config` — save the team's settings, or one
 //!   repository's (`config: null` drops them so it follows the team). Admin.
-//! - `GET /api/reviewer/stale?repo=` — the latest plan for the repository,
-//!   the actions taken and the pull requests kept open.
+//! - `GET /api/reviewer/stale?repo=` — the latest plan for the repository
+//!   (every repository's without one), the actions taken and the pull
+//!   requests kept open.
 //! - `POST /api/reviewer/stale/preview` — work the plan out again now,
 //!   without changing anything on GitHub.
 //! - `PUT /api/reviewer/stale/keep-open` — keep one pull request open, or let
@@ -178,30 +179,134 @@ pub async fn put_config(
 }
 
 /// GET /api/reviewer/stale?repo=owner/name
+///
+/// With a repository: its latest plan (`plan`), the log and its kept-open
+/// pull requests. Without one: every repository's latest plan (`plans`),
+/// the log and every kept-open pull request, so one page can list them all.
+/// Each plan item carries its `repo`, `days_quiet` and, when it is marked or
+/// about to be, `closes_at`.
 pub async fn get_activity(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
     Query(q): Query<RepoQuery>,
 ) -> Result<Json<Value>, StatusCode> {
     let repo = repo_param(q.repo.as_deref())?;
+    let now = chrono::Utc::now();
     let plan = match &repo {
-        Some(r) => get(&state, &claims.team_id, &stale::preview_sk(r)).await?.map(|i| {
-            let items: Value = serde_json::from_str(&s(&i, "plan")).unwrap_or(json!([]));
-            json!({
-                "computed_at": s(&i, "computed_at"),
-                "dry_run": i.get("dry_run").and_then(|v| v.as_bool().ok()).copied().unwrap_or(true),
-                "stopped": s(&i, "stopped"),
-                "items": items,
-            })
-        }),
+        Some(r) => get(&state, &claims.team_id, &stale::preview_sk(r))
+            .await?
+            .map(|i| plan_json(&i, r, &now)),
         None => None,
     };
-    let log = read_log(&state, &claims.team_id, repo.as_deref(), 50).await?;
-    let kept = match &repo {
-        Some(r) => read_kept(&state, &claims.team_id, r).await?,
-        None => vec![],
+    let plans = match &repo {
+        Some(_) => plan.iter().cloned().collect::<Vec<_>>(),
+        None => read_prefix(&state, &claims.team_id, stale::PREVIEW_PREFIX)
+            .await?
+            .iter()
+            .filter_map(|i| {
+                let r = s(i, "sk").strip_prefix(stale::PREVIEW_PREFIX)?.to_string();
+                (!r.is_empty()).then(|| plan_json(i, &r, &now))
+            })
+            .collect(),
     };
-    Ok(Json(json!({ "plan": plan, "log": log, "kept_open": kept })))
+    let log = read_log(&state, &claims.team_id, repo.as_deref(), 50).await?;
+    let pfx = match &repo {
+        Some(r) => stale::exempt_prefix(r),
+        None => stale::EXEMPT_PREFIX.to_string(),
+    };
+    let kept: Vec<Value> = read_prefix(&state, &claims.team_id, &pfx)
+        .await?
+        .iter()
+        .map(kept_json)
+        .collect();
+    Ok(Json(
+        json!({ "plan": plan, "plans": plans, "log": log, "kept_open": kept }),
+    ))
+}
+
+/// One repository's saved plan, its items with the repository, the days
+/// without activity and the closing date.
+fn plan_json(i: &Item, repo: &str, now: &chrono::DateTime<chrono::Utc>) -> Value {
+    let items: Vec<Value> = serde_json::from_str::<Vec<Value>>(&s(i, "plan"))
+        .unwrap_or_default()
+        .into_iter()
+        .map(|it| plan_item_json(it, repo, now))
+        .collect();
+    json!({
+        "repo": repo,
+        "computed_at": s(i, "computed_at"),
+        "dry_run": i.get("dry_run").and_then(|v| v.as_bool().ok()).copied().unwrap_or(true),
+        "enabled": i.get("enabled").and_then(|v| v.as_bool().ok()).copied().unwrap_or(false),
+        "stopped": s(i, "stopped"),
+        "items": items,
+    })
+}
+
+/// Pure: one plan item with `repo`, `days_quiet` (whole days since the last
+/// activity, as of now) and `closes_at` (when it closes: the date it was
+/// marked plus the grace period, or now for one closing on this sweep).
+fn plan_item_json(mut it: Value, repo: &str, now: &chrono::DateTime<chrono::Utc>) -> Value {
+    let days_quiet = it["last_activity"]
+        .as_str()
+        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+        .map(|t| (*now - t.with_timezone(&chrono::Utc)).num_days().max(0));
+    let closes_at = match it["action"].as_str() {
+        Some("wait" | "mark" | "close") => it["next_at"].as_str().unwrap_or("").to_string(),
+        _ => String::new(),
+    };
+    if let Some(o) = it.as_object_mut() {
+        o.insert("repo".into(), json!(repo));
+        o.insert("days_quiet".into(), json!(days_quiet));
+        o.insert(
+            "closes_at".into(),
+            if closes_at.is_empty() {
+                Value::Null
+            } else {
+                json!(closes_at)
+            },
+        );
+    }
+    it
+}
+
+fn kept_json(i: &Item) -> Value {
+    json!({
+        "repo": s(i, "repo"),
+        "pr": n(i, "pr_number"),
+        "title": s(i, "title"),
+        "url": s(i, "url"),
+        "by": s(i, "by"),
+        "via": s(i, "via"),
+        "at": s(i, "at"),
+    })
+}
+
+/// Every record under a sort key prefix, paged (bounded).
+async fn read_prefix(state: &AppState, team_id: &str, pfx: &str) -> Result<Vec<Item>, StatusCode> {
+    let mut out = vec![];
+    let mut start = None;
+    for _ in 0..20 {
+        let resp = state
+            .dynamo
+            .query()
+            .table_name(&state.config.settings_table_name)
+            .key_condition_expression("pk = :p AND begins_with(sk, :pfx)")
+            .expression_attribute_values(":p", attr_s(team_id))
+            .expression_attribute_values(":pfx", attr_s(pfx))
+            .set_exclusive_start_key(start.take())
+            .send()
+            .await
+            .map_err(|e| {
+                error!(pfx, error = %e, "stale PRs: could not read");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+        out.extend(resp.items().iter().cloned());
+        match resp.last_evaluated_key() {
+            Some(k) if !k.is_empty() => start = Some(k.clone()),
+            _ => break,
+        }
+    }
+    Ok(out)
 }
 
 async fn read_log(
@@ -257,36 +362,6 @@ async fn read_log(
     }
     out.truncate(want);
     Ok(out)
-}
-
-async fn read_kept(state: &AppState, team_id: &str, repo: &str) -> Result<Vec<Value>, StatusCode> {
-    let resp = state
-        .dynamo
-        .query()
-        .table_name(&state.config.settings_table_name)
-        .key_condition_expression("pk = :p AND begins_with(sk, :pfx)")
-        .expression_attribute_values(":p", attr_s(team_id))
-        .expression_attribute_values(":pfx", attr_s(&stale::exempt_prefix(repo)))
-        .send()
-        .await
-        .map_err(|e| {
-            error!(error = %e, "stale PRs: could not read the kept-open list");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-    Ok(resp
-        .items()
-        .iter()
-        .map(|i| {
-            json!({
-                "pr": n(i, "pr_number"),
-                "title": s(i, "title"),
-                "url": s(i, "url"),
-                "by": s(i, "by"),
-                "via": s(i, "via"),
-                "at": s(i, "at"),
-            })
-        })
-        .collect())
 }
 
 #[derive(Deserialize)]
@@ -572,6 +647,51 @@ mod tests {
         assert!(repo_param(Some("acme")).is_err());
         assert!(repo_param(Some("acme/../x")).is_err());
         assert!(repo_param(Some("acme/web#1")).is_err());
+    }
+
+    #[test]
+    fn plan_items_carry_their_repo_days_quiet_and_closing_date() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-11T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let wait = plan_item_json(
+            json!({"pr": 4, "action": "wait", "last_activity": "2026-10-20T11:00:00Z", "next_at": "2026-11-14T09:00:00Z"}),
+            "acme/web",
+            &now,
+        );
+        assert_eq!(wait["repo"], "acme/web");
+        assert_eq!(wait["days_quiet"], 22);
+        assert_eq!(wait["closes_at"], "2026-11-14T09:00:00Z");
+        let exempt = plan_item_json(
+            json!({"pr": 5, "action": "exempt", "last_activity": "2026-11-12T00:00:00Z", "next_at": "x"}),
+            "acme/web",
+            &now,
+        );
+        assert_eq!(exempt["days_quiet"], 0, "a clock ahead never goes negative");
+        assert!(exempt["closes_at"].is_null());
+        let bad = plan_item_json(json!({"pr": 6, "action": "mark"}), "acme/api", &now);
+        assert!(bad["days_quiet"].is_null() && bad["closes_at"].is_null());
+    }
+
+    #[test]
+    fn a_saved_plan_names_its_repo_and_state() {
+        let mut i = Item::new();
+        i.insert(
+            "plan".into(),
+            attr_s(r#"[{"pr":1,"action":"close","next_at":"2026-11-11T12:00:00Z"}]"#),
+        );
+        i.insert("dry_run".into(), AttributeValue::Bool(false));
+        i.insert("enabled".into(), AttributeValue::Bool(true));
+        let now = chrono::Utc::now();
+        let p = plan_json(&i, "acme/web", &now);
+        assert_eq!(p["repo"], "acme/web");
+        assert_eq!(p["dry_run"], false);
+        assert_eq!(p["enabled"], true);
+        assert_eq!(p["items"][0]["repo"], "acme/web");
+        assert_eq!(p["items"][0]["closes_at"], "2026-11-11T12:00:00Z");
+        let empty = plan_json(&Item::new(), "acme/x", &now);
+        assert_eq!(empty["dry_run"], true);
+        assert_eq!(empty["items"], json!([]));
     }
 
     #[test]
