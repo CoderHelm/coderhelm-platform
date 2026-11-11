@@ -305,6 +305,8 @@ fn file_json(f: &FileMeta) -> Value {
         "source_id": f.source_id,
         "url": common::knowledge::answer::original_url(&f.url),
         "path": f.path,
+        "skipped": f.skipped,
+        "indexed_at": f.indexed_at,
     })
 }
 
@@ -314,7 +316,12 @@ fn base_json(
     sources: &[common::knowledge::sources::Source],
 ) -> Value {
     let now = chrono::Utc::now();
-    let count = |s: FileStatus| files.iter().filter(|f| f.shown_status(now).0 == s).count();
+    let count = |s: FileStatus| {
+        files
+            .iter()
+            .filter(|f| f.skipped.is_empty() && f.shown_status(now).0 == s)
+            .count()
+    };
     let secs = now.timestamp();
     json!({
         "sources": sources.iter().map(|s| json!({
@@ -345,6 +352,7 @@ fn base_json(
         "ready": count(FileStatus::Ready),
         "processing": count(FileStatus::Processing) + count(FileStatus::Uploading),
         "failed": count(FileStatus::Failed),
+        "skipped": files.iter().filter(|f| !f.skipped.is_empty()).count(),
         "passages": files.iter().filter(|f| f.ready_version > 0).map(|f| u64::from(f.chunks)).sum::<u64>(),
     })
 }
@@ -740,6 +748,9 @@ pub struct ItemsQuery {
 
 /// The state an item shows, as one word the filters use.
 pub fn item_state(f: &FileMeta, now: chrono::DateTime<chrono::Utc>) -> &'static str {
+    if !f.skipped.is_empty() {
+        return "skipped";
+    }
     match f.shown_status(now).0 {
         FileStatus::Ready if f.truncated => "cut_short",
         FileStatus::Ready => "searchable",
@@ -871,6 +882,51 @@ pub async fn list_items(
         .await
         .map_err(|e| internal("knowledge files", e))?;
     Ok(Json(items_page(&files, &q, chrono::Utc::now())))
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct RunsQuery {
+    /// One source, or every source of the base.
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+/// GET /api/knowledge/:kb_id/runs — the sync history of the base's sources,
+/// newest first: what started each sync, how long it took, what it added,
+/// changed and removed, and what it couldn't read (with the fix).
+pub async fn list_runs(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Path(kb_id): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<RunsQuery>,
+) -> Reply {
+    let base = readable_base(&state, &claims, &kb_id).await?;
+    let sources = super::knowledge_sources::sources_of(&state, &claims.team_id, &base.id).await;
+    let limit = q.limit.unwrap_or(50).clamp(1, 200);
+    let mut runs = Vec::new();
+    for s in sources
+        .iter()
+        .filter(|s| q.source.is_empty() || s.id == q.source)
+    {
+        let mut mine = kb::sources::store::runs(
+            &state.dynamo,
+            &state.config.settings_table_name,
+            &claims.team_id,
+            &base.id,
+            &s.id,
+            limit,
+        )
+        .await
+        .map_err(|e| internal("sync runs", e))?;
+        runs.append(&mut mine);
+    }
+    runs.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+    runs.truncate(limit);
+    Ok(Json(
+        json!({ "runs": runs, "kept_days": kb::sources::runs::RUN_TTL_SECS / 86_400 }),
+    ))
 }
 
 /// GET /api/knowledge/:kb_id — one base and its files (`?items=none`
@@ -1269,8 +1325,14 @@ pub async fn finish_archive(
     if let Some(old) = old.filter(|o| *o != key) {
         st.delete_object(&claims.team_id, &old).await;
     }
-    if let Err(e) =
-        super::knowledge_sources::start_sync(&state, &claims.team_id, &kb_id, &source_id).await
+    if let Err(e) = super::knowledge_sources::start_sync(
+        &state,
+        &claims.team_id,
+        &kb_id,
+        &source_id,
+        common::knowledge::sources::trigger::ADDED,
+    )
+    .await
     {
         warn!(error = %e, "Archive import not started; the sweep starts it");
     }

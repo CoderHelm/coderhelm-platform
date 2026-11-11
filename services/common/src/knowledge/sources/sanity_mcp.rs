@@ -1981,6 +1981,7 @@ mod tests {
             team: "TEAM#t",
             now: &now,
             used: None,
+            trigger: "manual",
         };
         run(&ctx, "kb1", "s1").await
     }

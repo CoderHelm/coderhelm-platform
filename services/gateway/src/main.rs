@@ -849,6 +849,7 @@ async fn main() -> Result<(), Error> {
             "/knowledge/:kb_id/items",
             get(routes::knowledge::list_items),
         )
+        .route("/knowledge/:kb_id/runs", get(routes::knowledge::list_runs))
         .route(
             "/knowledge/:kb_id/files",
             post(routes::knowledge::start_upload),
@@ -902,6 +903,10 @@ async fn main() -> Result<(), Error> {
         .route(
             "/knowledge/:kb_id/sources/:source_id/signin",
             post(routes::knowledge_sources::source_signin),
+        )
+        .route(
+            "/knowledge/:kb_id/sources/:source_id/retry",
+            post(routes::knowledge_sources::retry_items),
         )
         .route(
             "/knowledge/:kb_id/sources/:source_id/connection",

@@ -93,7 +93,16 @@ pub async fn sync(state: &WorkerState, msg: &SyncMessage) -> Value {
                 true,
             );
             info!(team_id = %msg.team_id, source = %msg.source_id, "Knowledge source's member left; asking for a new sign-in");
-            sync::fail_with(&st, &msg.team_id, &msg.kb_id, &msg.source_id, e, now()).await;
+            sync::fail_with(
+                &st,
+                &msg.team_id,
+                &msg.kb_id,
+                &msg.source_id,
+                e,
+                now(),
+                &msg.trigger,
+            )
+            .await;
             after_sync(state, &st, msg).await;
             return json!({ "ok": false, "error": "member left" });
         }
@@ -102,7 +111,16 @@ pub async fn sync(state: &WorkerState, msg: &SyncMessage) -> Value {
         Ok(o) => o,
         Err(e) => {
             warn!(team_id = %msg.team_id, source = %msg.source_id, error = %e, "Knowledge source not opened");
-            sync::fail(&st, &msg.team_id, &msg.kb_id, &msg.source_id, &e, now()).await;
+            sync::fail(
+                &st,
+                &msg.team_id,
+                &msg.kb_id,
+                &msg.source_id,
+                &e,
+                now(),
+                &msg.trigger,
+            )
+            .await;
             after_sync(state, &st, msg).await;
             return json!({ "ok": false, "error": e.to_string() });
         }
@@ -125,6 +143,7 @@ pub async fn sync(state: &WorkerState, msg: &SyncMessage) -> Value {
         team: &msg.team_id,
         now: &now,
         used: Some(used),
+        trigger: &msg.trigger,
     };
     let out = sync::run(&ctx, &msg.kb_id, &msg.source_id).await;
     if src.signin.is_some() {
@@ -346,6 +365,7 @@ pub async fn sweep(state: &WorkerState) -> usize {
             "team_id": team_id,
             "kb_id": kb_id,
             "source_id": source_id,
+            "trigger": common::knowledge::sources::trigger::SCHEDULE,
         });
         let sent = state
             .sqs

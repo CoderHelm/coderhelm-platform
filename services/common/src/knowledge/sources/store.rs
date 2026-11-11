@@ -40,6 +40,38 @@ pub trait SyncStore: Send + Sync {
     async fn delete_object(&self, team: &str, key: &str);
     /// Records when the source is next due, for the sweep.
     async fn put_registry(&self, team: &str, s: &Source) -> Result<(), String>;
+    /// Keeps one sync's record for the history (and drops the oldest past
+    /// [`super::runs::MAX_RUNS_PER_SOURCE`]).
+    async fn put_run(&self, _team: &str, _run: &super::runs::SyncRun) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// A source's sync history, newest first, at most `limit`.
+pub async fn runs(
+    dynamo: &aws_sdk_dynamodb::Client,
+    table: &str,
+    team: &str,
+    kb_id: &str,
+    source_id: &str,
+    limit: usize,
+) -> Result<Vec<super::runs::SyncRun>, String> {
+    let out = dynamo
+        .query()
+        .table_name(table)
+        .key_condition_expression("pk = :pk AND begins_with(sk, :p)")
+        .expression_attribute_values(":pk", s(team))
+        .expression_attribute_values(":p", s(&super::runs::run_prefix(kb_id, source_id)))
+        .scan_index_forward(false)
+        .limit(i32::try_from(limit.clamp(1, super::runs::MAX_RUNS_PER_SOURCE)).unwrap_or(50))
+        .send()
+        .await
+        .map_err(|e| format!("sync runs: {e}"))?;
+    Ok(out
+        .items()
+        .iter()
+        .filter_map(kb::read_data::<super::runs::SyncRun>)
+        .collect())
 }
 
 /// The settings table and the data bucket.
@@ -362,6 +394,47 @@ impl SyncStore for AwsSyncStore {
         }
     }
 
+    async fn put_run(&self, team: &str, run: &super::runs::SyncRun) -> Result<(), String> {
+        self.dynamo
+            .put_item()
+            .table_name(&self.table)
+            .set_item(Some(super::runs::run_record(team, run)))
+            .send()
+            .await
+            .map_err(|e| format!("sync run: {e}"))?;
+        // Past the cap, the oldest go (the TTL takes the rest after 90 days).
+        let keys = self
+            .dynamo
+            .query()
+            .table_name(&self.table)
+            .key_condition_expression("pk = :pk AND begins_with(sk, :p)")
+            .expression_attribute_values(":pk", s(team))
+            .expression_attribute_values(
+                ":p",
+                s(&super::runs::run_prefix(&run.kb_id, &run.source_id)),
+            )
+            .projection_expression("sk")
+            .scan_index_forward(false)
+            .send()
+            .await
+            .map_err(|e| format!("sync runs: {e}"))?;
+        for old in keys
+            .items()
+            .iter()
+            .skip(super::runs::MAX_RUNS_PER_SOURCE)
+            .filter_map(|i| i.get("sk").and_then(|v| v.as_s().ok()).cloned())
+        {
+            let _ = self
+                .dynamo
+                .delete_item()
+                .table_name(&self.table)
+                .key("pk", s(team))
+                .key("sk", s(&old))
+                .send()
+                .await;
+        }
+        Ok(())
+    }
     async fn put_registry(&self, team: &str, src: &Source) -> Result<(), String> {
         self.dynamo
             .put_item()
@@ -425,6 +498,7 @@ pub mod memory {
         pub objects: Mutex<HashMap<String, Arc<Index>>>,
         pub registry: Mutex<HashMap<String, (i64, bool)>>,
         pub source_writes: Mutex<Vec<Source>>,
+        pub runs: Mutex<Vec<super::super::runs::SyncRun>>,
     }
 
     #[async_trait::async_trait]
@@ -503,6 +577,21 @@ pub mod memory {
                 .lock()
                 .unwrap()
                 .insert(s.id.clone(), (s.next_sync_at, s.paused));
+            Ok(())
+        }
+        async fn put_run(
+            &self,
+            _team: &str,
+            run: &super::super::runs::SyncRun,
+        ) -> Result<(), String> {
+            let mut all = self.runs.lock().unwrap();
+            all.push(run.clone());
+            let mine = all.iter().filter(|r| r.source_id == run.source_id).count();
+            if mine > super::super::runs::MAX_RUNS_PER_SOURCE {
+                if let Some(i) = all.iter().position(|r| r.source_id == run.source_id) {
+                    all.remove(i);
+                }
+            }
             Ok(())
         }
     }
