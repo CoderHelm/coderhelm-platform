@@ -1187,6 +1187,7 @@ pub(crate) mod terraform;
 mod test;
 pub mod test_bug;
 pub mod test_fix;
+pub mod ticket_base;
 pub mod ticket_history;
 pub mod tool_proposals;
 mod triage;
@@ -2059,6 +2060,29 @@ async fn run_passes(
     if let Some(d) = &kept_stack {
         info!(run_id, base = %d.branch, pr = d.number, "Continuation: keeping the stacked base");
         msg.base_branch = d.branch.clone();
+    }
+    // The base branch the ticket itself asks for ("open the PR against
+    // `release-2`"), when the repository has it: a long-lived feature or
+    // release branch with no open pull request, which `stack` never sees.
+    if kept_stack.is_none() && !is_internal_ticket(&msg.ticket_id) {
+        let outcome = ticket_base::for_ticket(
+            &github,
+            &msg.repo_owner,
+            &msg.repo_name,
+            &msg.title,
+            &msg.body,
+            &msg.base_branch,
+        )
+        .await;
+        if !msg.same_run() {
+            if let Some(note) = outcome.note(&msg.base_branch) {
+                add_progress_note(state, &msg.team_id, run_id, &note).await;
+            }
+        }
+        if let ticket_base::Outcome::Use(branch) = outcome {
+            info!(run_id, base = %branch, "The ticket names its base branch");
+            msg.base_branch = branch;
+        }
     }
 
     // create_run_record() ran BEFORE run_passes and persisted the UNRESOLVED
