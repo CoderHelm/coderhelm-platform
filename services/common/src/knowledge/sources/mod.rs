@@ -49,6 +49,7 @@ pub mod github;
 pub mod mcp;
 pub mod notion;
 pub mod oauth;
+pub mod runs;
 pub mod s3;
 pub mod sanity;
 pub mod sanity_mcp;
@@ -400,6 +401,10 @@ pub struct Source {
     /// Items that couldn't be read last time (each says why).
     #[serde(default)]
     pub failed_items: u32,
+    /// Items left out last time (no text, a file it doesn't read, too
+    /// large), each saying why.
+    #[serde(default)]
+    pub skipped_items: u32,
     /// The selection covers more than [`MAX_ITEMS_PER_SOURCE`] items.
     #[serde(default)]
     pub truncated: bool,

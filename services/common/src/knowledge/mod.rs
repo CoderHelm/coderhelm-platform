@@ -469,6 +469,13 @@ pub struct FileMeta {
     /// unchanged is not embedded again.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub content_hash: String,
+    /// Why it was left out (`empty`, `unsupported`, `too_large`); empty
+    /// when it wasn't. A left-out item also has status `Failed` and why.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub skipped: String,
+    /// When its text was last indexed (RFC 3339).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub indexed_at: String,
 }
 
 impl FileMeta {

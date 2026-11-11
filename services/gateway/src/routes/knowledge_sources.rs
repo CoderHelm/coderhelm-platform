@@ -163,6 +163,7 @@ pub fn source_json(s: &Source, now: i64) -> Value {
         "progress": if status == Status::Syncing { serde_json::to_value(&s.progress).unwrap_or(Value::Null) } else { Value::Null },
         "items": s.items,
         "failed_items": s.failed_items,
+        "skipped_items": s.skipped_items,
         "truncated": s.truncated,
         "last_sync_at": s.last_sync_at,
         "last_success_at": s.last_success_at,
@@ -352,12 +353,13 @@ pub(crate) async fn start_sync(
     team: &str,
     kb_id: &str,
     id: &str,
+    trigger: &str,
 ) -> Result<(), String> {
     let name = &state.config.worker_function_name;
     if name.is_empty() {
         return Err("no worker configured".into());
     }
-    let payload = json!({ "knowledge_sync": { "team_id": team, "kb_id": kb_id, "source_id": id } });
+    let payload = json!({ "knowledge_sync": { "team_id": team, "kb_id": kb_id, "source_id": id, "trigger": trigger } });
     state
         .lambda
         .invoke()
@@ -1112,7 +1114,7 @@ pub(crate) async fn add_source(
     st.put_registry(&claims.team_id, &src)
         .await
         .map_err(|e| internal("register knowledge source", e))?;
-    if let Err(e) = start_sync(state, &claims.team_id, kb_id, &src.id).await {
+    if let Err(e) = start_sync(state, &claims.team_id, kb_id, &src.id, ks::trigger::ADDED).await {
         warn!(error = %e, "First knowledge sync not started; the sweep starts it");
     }
     info!(team = %claims.team_id, kb = %kb_id, source = %src.id, kind = kind.key(), "Knowledge source added");
@@ -1186,7 +1188,7 @@ async fn add_signin_source(
     st.put_registry(&claims.team_id, &src)
         .await
         .map_err(|e| internal("register knowledge source", e))?;
-    if let Err(e) = start_sync(state, &claims.team_id, kb_id, &src.id).await {
+    if let Err(e) = start_sync(state, &claims.team_id, kb_id, &src.id, ks::trigger::ADDED).await {
         warn!(error = %e, "First knowledge sync not started; the sweep starts it");
     }
     info!(team = %claims.team_id, kb = %kb_id, source = %src.id, kind = kind.key(), "Knowledge source added through a sign-in");
@@ -1397,7 +1399,15 @@ pub async fn update_source(
         .await
         .map_err(|e| internal("register knowledge source", e))?;
     if resync && !src.paused {
-        if let Err(e) = start_sync(&state, &claims.team_id, &kb_id, &source_id).await {
+        if let Err(e) = start_sync(
+            &state,
+            &claims.team_id,
+            &kb_id,
+            &source_id,
+            ks::trigger::EDITED,
+        )
+        .await
+        {
             warn!(error = %e, "Knowledge sync not started");
         }
     }
@@ -1454,7 +1464,15 @@ pub async fn source_signin(
     st.put_registry(&claims.team_id, &src)
         .await
         .map_err(|e| internal("register knowledge source", e))?;
-    if let Err(e) = start_sync(&state, &claims.team_id, &kb_id, &source_id).await {
+    if let Err(e) = start_sync(
+        &state,
+        &claims.team_id,
+        &kb_id,
+        &source_id,
+        ks::trigger::SIGN_IN,
+    )
+    .await
+    {
         warn!(error = %e, "Knowledge sync not started after signing in again");
     }
     info!(team = %claims.team_id, kb = %kb_id, source = %source_id, "Knowledge source signed in again");
@@ -1470,9 +1488,15 @@ pub async fn sync_source(
 ) -> Reply {
     claims.require_role(3).map_err(forbidden)?;
     let mut src = load_source(&state, &claims.team_id, &kb_id, &source_id).await?;
-    start_sync(&state, &claims.team_id, &kb_id, &source_id)
-        .await
-        .map_err(|e| internal("start knowledge sync", e))?;
+    start_sync(
+        &state,
+        &claims.team_id,
+        &kb_id,
+        &source_id,
+        ks::trigger::MANUAL,
+    )
+    .await
+    .map_err(|e| internal("start knowledge sync", e))?;
     if shown_status(&src, now_secs()) != Status::Syncing {
         src.status = Status::Syncing;
         src.progress = Some(ks::Progress {
@@ -1482,6 +1506,71 @@ pub async fn sync_source(
         });
     }
     Ok(Json(json!({ "source": source_json(&src, now_secs()) })))
+}
+
+/// Items one "read these again" names at most.
+pub const MAX_RETRY: usize = 500;
+
+#[derive(Debug, Deserialize)]
+pub struct RetryBody {
+    pub item_ids: Vec<String>,
+}
+
+/// POST /api/knowledge/:kb_id/sources/:source_id/retry — read chosen items
+/// again on a sync now (items that couldn't be read or were left out):
+/// their version marker is forgotten, so the sync fetches them whatever the
+/// app says changed.
+pub async fn retry_items(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Path((kb_id, source_id)): Path<(String, String)>,
+    Json(body): Json<RetryBody>,
+) -> Reply {
+    use common::knowledge::sources::store::SyncStore;
+    claims.require_role(3).map_err(forbidden)?;
+    if body.item_ids.is_empty() || body.item_ids.len() > MAX_RETRY {
+        return Err(fail(
+            StatusCode::BAD_REQUEST,
+            &format!("Pick between 1 and {MAX_RETRY} pages to read again."),
+        ));
+    }
+    let src = load_source(&state, &claims.team_id, &kb_id, &source_id).await?;
+    let st = sync_store(&state);
+    let wanted: std::collections::HashSet<&str> =
+        body.item_ids.iter().map(String::as_str).collect();
+    let mut queued = 0;
+    for mut f in st
+        .items(&claims.team_id, &kb_id, &source_id)
+        .await
+        .map_err(|e| internal("knowledge items", e))?
+        .into_iter()
+        .filter(|f| wanted.contains(f.id.as_str()))
+    {
+        f.remote_version.clear();
+        st.put_item(&claims.team_id, &f)
+            .await
+            .map_err(|e| internal("knowledge item", e))?;
+        queued += 1;
+    }
+    if queued == 0 {
+        return Err(fail(
+            StatusCode::NOT_FOUND,
+            "None of those pages are in this source.",
+        ));
+    }
+    start_sync(
+        &state,
+        &claims.team_id,
+        &kb_id,
+        &source_id,
+        ks::trigger::RETRY,
+    )
+    .await
+    .map_err(|e| internal("start knowledge sync", e))?;
+    info!(team = %claims.team_id, kb = %kb_id, source = %source_id, queued, "Knowledge items read again");
+    Ok(Json(
+        json!({ "queued": queued, "source": source_json(&src, now_secs()) }),
+    ))
 }
 
 /// Removes every trace of a source: its items and their indexes, its
@@ -1683,7 +1772,7 @@ pub async fn webhook(
     let paused = src.paused;
     let _ = st.put_source(&team, &src).await;
     if !paused {
-        if let Err(e) = start_sync(&state, &team, &kb_id, &source_id).await {
+        if let Err(e) = start_sync(&state, &team, &kb_id, &source_id, ks::trigger::CHANGE).await {
             warn!(error = %e, "Knowledge sync not started from webhook");
         }
     }
@@ -1725,7 +1814,7 @@ async fn notion_event(state: &AppState, signature: &str, body: &[u8]) -> StatusC
         .filter(|r| r.kind == "notion" && r.account == ws && !r.paused)
     {
         if let Some((team, kb_id, id)) = ks::parse_registry_sk(&row.sk) {
-            let _ = start_sync(state, &team, &kb_id, &id).await;
+            let _ = start_sync(state, &team, &kb_id, &id, ks::trigger::CHANGE).await;
         }
     }
     StatusCode::OK
@@ -1750,7 +1839,7 @@ pub(crate) async fn on_push(state: &AppState, team: &str, repo: &str) {
                 ks::github::split_id(&sel.id).is_some_and(|(_, r, _)| r.eq_ignore_ascii_case(repo))
             });
             if reads {
-                let _ = start_sync(state, team, &b.id, &s.id).await;
+                let _ = start_sync(state, team, &b.id, &s.id, ks::trigger::CHANGE).await;
             }
         }
     }

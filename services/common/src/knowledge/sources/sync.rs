@@ -40,6 +40,14 @@ const MAX_ROUNDS: usize = 3;
 /// What a sync did.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Outcome {
+    /// Items indexed for the first time.
+    pub added: usize,
+    /// Items indexed again because their text changed.
+    pub updated: usize,
+    /// Items left out (no text, a file it doesn't read, too large).
+    pub skipped: usize,
+    /// The items it couldn't read or left out, with why (the first few).
+    pub problems: Vec<super::runs::ItemProblem>,
     /// It ran (another sync didn't hold the source).
     pub ran: bool,
     pub listed: usize,
@@ -67,6 +75,8 @@ pub struct Ctx<'a> {
     pub now: &'a (dyn Fn() -> i64 + Send + Sync),
     /// The connection this sync opened, saved on the source when it ends.
     pub used: Option<super::UsedConnection>,
+    /// What started it ([`super::trigger`]), for the history.
+    pub trigger: &'a str,
 }
 
 fn rfc3339(secs: i64) -> String {
@@ -104,6 +114,7 @@ pub async fn run(ctx: &Ctx<'_>, kb_id: &str, id: &str) -> Outcome {
         }
     }
     out.ran = true;
+    let started = now;
     for _ in 0..MAX_ROUNDS {
         let Ok(Some(mut src)) = ctx.store.source(ctx.team, kb_id, id).await else {
             return out;
@@ -120,6 +131,10 @@ pub async fn run(ctx: &Ctx<'_>, kb_id: &str, id: &str) -> Outcome {
         let round = one_round(ctx, &mut src).await;
         out.listed = round.listed;
         out.fetched += round.fetched;
+        out.added += round.added;
+        out.updated += round.updated;
+        out.skipped = round.skipped;
+        out.problems = round.problems.clone();
         out.same_text += round.same_text;
         out.indexed += round.indexed;
         out.embedded_chunks += round.embedded_chunks;
@@ -130,6 +145,13 @@ pub async fn run(ctx: &Ctx<'_>, kb_id: &str, id: &str) -> Outcome {
         let again = finish(ctx, kb_id, id, &src, &round).await;
         if !again || round.error.is_some() {
             break;
+        }
+    }
+    if let Ok(Some(src)) = ctx.store.source(ctx.team, kb_id, id).await {
+        let via = ctx.used.as_ref().map(|u| u.via.as_str()).unwrap_or("");
+        let run = super::runs::from_outcome(&src, ctx.trigger, started, (ctx.now)(), &out, via);
+        if let Err(e) = ctx.store.put_run(ctx.team, &run).await {
+            tracing::warn!(error = %e, "Knowledge sync run not recorded");
         }
     }
     out
@@ -154,8 +176,9 @@ async fn finish(ctx: &Ctx<'_>, kb_id: &str, id: &str, ran: &Source, r: &Outcome)
     s.items = items.iter().filter(|f| f.ready_version > 0).count() as u32;
     s.failed_items = items
         .iter()
-        .filter(|f| f.status == FileStatus::Failed)
+        .filter(|f| f.status == FileStatus::Failed && f.skipped.is_empty())
         .count() as u32;
+    s.skipped_items = items.iter().filter(|f| !f.skipped.is_empty()).count() as u32;
     s.truncated = ran.truncated;
     s.cursor = ran.cursor.clone();
     s.last_sync_at = rfc3339(now);
@@ -194,12 +217,13 @@ pub async fn fail(
     id: &str,
     err: &ConnectorError,
     now: i64,
+    trigger: &str,
 ) {
     let Ok(Some(s)) = store.source(team, kb_id, id).await else {
         return;
     };
     let error = super::source_error(&s, err);
-    fail_with(store, team, kb_id, id, error, now).await;
+    fail_with(store, team, kb_id, id, error, now, trigger).await;
 }
 
 /// [`fail`] with the error already worded.
@@ -210,10 +234,15 @@ pub async fn fail_with(
     id: &str,
     error: super::SourceError,
     now: i64,
+    trigger: &str,
 ) {
     let Ok(Some(mut s)) = store.source(team, kb_id, id).await else {
         return;
     };
+    let run = super::runs::stopped(&s, trigger, now, error.clone());
+    if let Err(e) = store.put_run(team, &run).await {
+        tracing::warn!(error = %e, "Knowledge sync run not recorded");
+    }
     s.status = Status::Error;
     s.error = Some(error);
     s.progress = None;
@@ -275,20 +304,50 @@ async fn one_round(ctx: &Ctx<'_>, src: &mut Source) -> Outcome {
     for (i, item) in plan.fetch.iter().enumerate() {
         let prev = by_ext.get(&item.external_id);
         match ctx.connector.fetch(src, item).await {
+            Ok(doc) if doc.is_empty() => {
+                out.fetched += 1;
+                skip(
+                    ctx,
+                    src,
+                    item,
+                    prev,
+                    "empty",
+                    "It has no text to read.",
+                    &mut out,
+                )
+                .await;
+            }
             Ok(doc) => {
                 out.fetched += 1;
+                let was_ready = prev.is_some_and(|p| p.ready_version > 0);
                 match index_item(ctx, src, item, prev, &doc).await {
                     Ok(Indexed::SameText) => out.same_text += 1,
                     Ok(Indexed::New { embedded, reused }) => {
                         out.indexed += 1;
+                        if was_ready {
+                            out.updated += 1;
+                        } else {
+                            out.added += 1;
+                        }
                         out.embedded_chunks += embedded;
                         out.reused_chunks += reused;
                     }
                     Err(why) => {
                         out.failed += 1;
-                        mark_failed(ctx, src, item, prev, &why).await;
+                        problem(&mut out, item, "failed", &why);
+                        mark_failed(ctx, src, item, prev, &why, "").await;
                     }
                 }
+            }
+            Err(ConnectorError::Config(why)) => {
+                // Settings that are wrong for this one item: its size or
+                // kind. It is left out, and says why.
+                let reason = if why.to_lowercase().contains("large") {
+                    "too_large"
+                } else {
+                    "unsupported"
+                };
+                skip(ctx, src, item, prev, reason, &why, &mut out).await;
             }
             Err(e) if e.item_gone() => {
                 // Deleted, or the connection may no longer see it: its
@@ -306,7 +365,8 @@ async fn one_round(ctx: &Ctx<'_>, src: &mut Source) -> Outcome {
             }
             Err(e) => {
                 out.failed += 1;
-                mark_failed(ctx, src, item, prev, &e.to_string()).await;
+                problem(&mut out, item, "failed", &e.to_string());
+                mark_failed(ctx, src, item, prev, &e.to_string(), "").await;
             }
         }
         let done = i as u32 + 1;
@@ -428,6 +488,7 @@ async fn index_item(
         now,
     );
     // The same text as what is searchable now: nothing to embed.
+    f.skipped.clear();
     if prev.is_some_and(|p| p.content_hash == hash && p.ready_version > 0) {
         f.status = FileStatus::Ready;
         f.error.clear();
@@ -510,6 +571,7 @@ async fn index_item(
     f.chunks = index.chunks.len() as u32;
     f.size = doc.sections.iter().map(|s| s.text.len() as u64).sum();
     f.content_hash = hash;
+    f.indexed_at = rfc3339(now);
     ctx.store.put_item(ctx.team, &f).await?;
     if old_ready > 0 && old_ready != f.ready_version {
         ctx.store
@@ -522,6 +584,34 @@ async fn index_item(
     Ok(Indexed::New { embedded, reused })
 }
 
+/// Notes an item the run couldn't read or left out, for the history.
+fn problem(out: &mut Outcome, item: &Listed, kind: &str, why: &str) {
+    if out.problems.len() < super::runs::MAX_RUN_PROBLEMS {
+        out.problems.push(super::runs::ItemProblem {
+            name: item.title.clone(),
+            url: item.url.clone(),
+            kind: kind.into(),
+            error: crate::truncate_str(why, 300).to_string(),
+            fix: super::runs::item_fix(why, kind),
+        });
+    }
+}
+
+/// Leaves an item out, saying why (`empty`, `unsupported`, `too_large`).
+async fn skip(
+    ctx: &Ctx<'_>,
+    src: &Source,
+    item: &Listed,
+    prev: Option<&FileMeta>,
+    reason: &str,
+    why: &str,
+    out: &mut Outcome,
+) {
+    out.skipped += 1;
+    problem(out, item, "skipped", why);
+    mark_failed(ctx, src, item, prev, why, reason).await;
+}
+
 /// Records why an item couldn't be read. A version that was searchable
 /// stays searchable.
 async fn mark_failed(
@@ -530,8 +620,10 @@ async fn mark_failed(
     item: &Listed,
     prev: Option<&FileMeta>,
     why: &str,
+    skipped: &str,
 ) {
     let mut f = base_item(src, item, prev, (ctx.now)());
+    f.skipped = skipped.to_string();
     if f.name.is_empty() {
         f.name = item.title.clone();
     }
@@ -562,6 +654,7 @@ mod tests {
         /// id -> (version, title, text)
         pages: Mutex<Vec<(String, String, String, String)>>,
         gone: Mutex<Vec<String>>,
+        too_big: Mutex<Vec<String>>,
         fail_list: Mutex<Option<ConnectorError>>,
         fetches: AtomicUsize,
     }
@@ -613,6 +706,11 @@ mod tests {
             self.fetches.fetch_add(1, Ordering::SeqCst);
             if self.gone.lock().unwrap().contains(&item.external_id) {
                 return Err(ConnectorError::Forbidden("no access".into()));
+            }
+            if self.too_big.lock().unwrap().contains(&item.external_id) {
+                return Err(ConnectorError::Config(
+                    "The file is larger than 25 MB.".into(),
+                ));
             }
             let p = self.pages.lock().unwrap();
             let (_, _, title, text) = p.iter().find(|x| x.0 == item.external_id).cloned().unwrap();
@@ -687,6 +785,7 @@ mod tests {
             team: "TEAM#t",
             now: &now,
             used: None,
+            trigger: "manual",
         };
         run(&ctx, "kb1", "s1").await
     }
@@ -739,6 +838,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn every_sync_is_recorded_with_what_it_did_and_what_it_left_out() {
+        let r = rig();
+        r.provider.set("a", "1", "Deploys run on Fridays.");
+        r.provider.set("b", "1", "Onboarding checklist.");
+        r.provider.set("c", "1", "  ");
+        r.provider.set("d", "1", "A huge export.");
+        r.provider.too_big.lock().unwrap().push("d".into());
+        let o = sync(&r).await;
+        assert_eq!((o.added, o.updated, o.skipped, o.failed), (2, 0, 2, 0));
+        let run = r.store.runs.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(run.trigger, "manual");
+        assert_eq!(
+            run.result, "done",
+            "left-out items aren't a problem with the sync"
+        );
+        assert_eq!(
+            (run.listed, run.added, run.skipped, run.unchanged),
+            (4, 2, 2, 0)
+        );
+        assert!(run.embedded > 0);
+        let kinds: Vec<&str> = run.problems.iter().map(|p| p.kind.as_str()).collect();
+        assert_eq!(kinds, ["skipped", "skipped"]);
+        assert!(run.problems.iter().any(|p| p.fix.contains("Split it")));
+        // Left-out items say why, and aren't counted as failed.
+        let it = items(&r);
+        let c = it.iter().find(|f| f.external_id == "c").unwrap();
+        assert_eq!(
+            (c.skipped.as_str(), c.status),
+            ("empty", FileStatus::Failed)
+        );
+        assert_eq!(
+            it.iter().find(|f| f.external_id == "d").unwrap().skipped,
+            "too_large"
+        );
+        assert!(it
+            .iter()
+            .find(|f| f.external_id == "a")
+            .unwrap()
+            .indexed_at
+            .starts_with("20"));
+        let s = r.store.sources.lock().unwrap()["s1"].clone();
+        assert_eq!((s.failed_items, s.skipped_items), (0, 2));
+
+        // A changed page is an update; a page with text now is read again.
+        r.provider.set("a", "2", "Deploys run on Mondays.");
+        r.provider.set("c", "2", "Now it has text.");
+        let o = sync(&r).await;
+        assert_eq!((o.added, o.updated), (1, 1));
+        let run = r.store.runs.lock().unwrap().last().cloned().unwrap();
+        assert_eq!((run.added, run.updated, run.unchanged), (1, 1, 1));
+        assert!(items(&r)
+            .iter()
+            .find(|f| f.external_id == "c")
+            .unwrap()
+            .skipped
+            .is_empty());
+        assert_eq!(r.store.runs.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_sync_that_cant_start_is_recorded_as_stopped_with_its_fix() {
+        let r = rig();
+        let err = ConnectorError::Reconnect("Notion refused the sign-in.".into());
+        fail(
+            r.store.as_ref(),
+            "TEAM#t",
+            "kb1",
+            "s1",
+            &err,
+            1_800_000_000,
+            "schedule",
+        )
+        .await;
+        let run = r.store.runs.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(
+            (run.result.as_str(), run.trigger.as_str()),
+            ("stopped", "schedule")
+        );
+        assert!(run.error.unwrap().fix.contains("Reconnect"));
+    }
+
+    #[tokio::test]
+    async fn a_source_keeps_its_newest_runs_only() {
+        let store = MemSyncStore::default();
+        for i in 0..(super::super::runs::MAX_RUNS_PER_SOURCE + 5) {
+            let run = super::super::runs::SyncRun {
+                source_id: "s1".into(),
+                started_at: format!("{i}"),
+                ..Default::default()
+            };
+            store.put_run("t", &run).await.unwrap();
+        }
+        let runs = store.runs.lock().unwrap();
+        assert_eq!(runs.len(), super::super::runs::MAX_RUNS_PER_SOURCE);
+        assert_eq!(runs[0].started_at, "5", "the oldest went first");
+    }
+
+    #[tokio::test]
     async fn a_sync_saves_the_connection_it_used() {
         let r = rig();
         r.provider.set("a", "1", "Deploys run on Fridays.");
@@ -760,6 +957,7 @@ mod tests {
             team: "TEAM#t",
             now: &now,
             used: Some(used.clone()),
+            trigger: "manual",
         };
         run(&ctx, "kb1", "s1").await;
         assert_eq!(r.store.sources.lock().unwrap()["s1"].used, Some(used));
