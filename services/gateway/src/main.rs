@@ -499,6 +499,8 @@ async fn main() -> Result<(), Error> {
         // Security fixes: findings, the settings, a check now, the preview
         .route("/security/overview", get(routes::security::overview))
         .route("/security/findings", get(routes::security::list_findings))
+        .route("/security/groups", get(routes::security::list_groups))
+        .route("/security/insights", get(routes::security::insights))
         .route("/security/findings/:id", get(routes::security::get_finding))
         .route(
             "/security/findings/:id/dismiss",
@@ -509,6 +511,8 @@ async fn main() -> Result<(), Error> {
             post(routes::security::reopen),
         )
         .route("/security/scan", post(routes::security::scan))
+        .route("/security/fix", post(routes::security::fix))
+        .route("/security/fix/plan", post(routes::security::fix_plan))
         .route(
             "/security/config",
             get(routes::security::get_config).put(routes::security::put_config),

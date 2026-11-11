@@ -25,7 +25,7 @@
 //! dependency list, [`STATE_SK`] the team's source status, [`ticket_sk`] a
 //! fix run's plan. Global data (the CISA list) lives under [`GLOBAL_PK`].
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
@@ -299,6 +299,11 @@ pub struct Finding {
     pub verdict: Verdict,
     pub evidence: Option<Evidence>,
     pub tier: Option<Tier>,
+    /// The verdict is still being checked, so the tier may change once it is.
+    pub tier_provisional: bool,
+    /// Why its fix hasn't started though it is due (a daily limit), in
+    /// plain words; None when nothing holds it.
+    pub waiting: Option<String>,
     pub due_at: String,
     pub status: Status,
     pub pr: Option<PrRef>,
@@ -331,6 +336,11 @@ pub struct FindingState {
     pub merged_at: Option<String>,
     /// Stages whose card posted (`new`, `half`, `deadline`, ...).
     pub cards: Vec<String>,
+    /// When its fix pull request opened (or was adopted).
+    pub pr_opened_at: Option<String>,
+    /// A person asked for its fix pull request (their email): it starts on
+    /// the next tick with room under the day's limits, dry run or not.
+    pub requested_by: Option<String>,
 }
 
 // ── Settings ────────────────────────────────────────────────────────────
@@ -429,13 +439,41 @@ pub struct SecurityConfig {
     pub adopt_bot_prs: bool,
     pub repos: Repos,
     pub ignore: Vec<Ignore>,
+    /// Model tokens reachability checks may spend per day (the agent reads
+    /// how the code uses a vulnerable package). Past it, the rest wait for
+    /// the next day's check.
+    pub triage_tokens_per_day: u64,
+    /// Fix runs (coding runs that open a pull request) started per day, at
+    /// most; the rest wait, the most urgent first. Adopting a bot's pull
+    /// request or opening an issue doesn't count.
+    pub max_fix_runs_per_day: u32,
+    /// Model tokens fix runs may spend per day; past it, no new run starts.
+    pub max_fix_tokens_per_day: u64,
+    /// Cards posted per day, at most; past it, one digest card says how
+    /// many more are waiting.
+    pub max_cards_per_day: u32,
 }
+
+pub const MAX_FIX_RUNS_PER_DAY: u32 = 3;
+pub const MAX_FIX_RUNS_LIMIT: u32 = 20;
+pub const MAX_FIX_TOKENS_PER_DAY: u64 = 2_000_000;
+pub const MAX_FIX_TOKENS_LIMIT: u64 = 50_000_000;
+pub const MAX_CARDS_PER_DAY: u32 = 10;
+pub const MAX_CARDS_LIMIT: u32 = 100;
+
+/// The default daily limit for reachability checks.
+pub const TRIAGE_TOKENS_PER_DAY: u64 = 400_000;
+/// The most a team may set it to.
+pub const MAX_TRIAGE_TOKENS_PER_DAY: u64 = 5_000_000;
 
 impl Default for SecurityConfig {
     fn default() -> Self {
+        // Off until a team turns it on. Turned on, it opens fix pull
+        // requests and posts cards per the policy (the recommended choice);
+        // a team that wants to look first picks "Preview first".
         SecurityConfig {
             enabled: false,
-            dry_run: true,
+            dry_run: false,
             open_prs: TierMap {
                 p0: Cadence::Now,
                 p1: Cadence::Hour,
@@ -464,6 +502,10 @@ impl Default for SecurityConfig {
             adopt_bot_prs: true,
             repos: Repos::All,
             ignore: vec![],
+            triage_tokens_per_day: TRIAGE_TOKENS_PER_DAY,
+            max_fix_runs_per_day: MAX_FIX_RUNS_PER_DAY,
+            max_fix_tokens_per_day: MAX_FIX_TOKENS_PER_DAY,
+            max_cards_per_day: MAX_CARDS_PER_DAY,
         }
     }
 }
@@ -498,6 +540,22 @@ impl SecurityConfig {
             if l.len() > 500 || l.iter().any(|r| !valid_repo(r)) {
                 return Err("repos is \"all\" or a list of owner/name".into());
             }
+        }
+        if self.triage_tokens_per_day > MAX_TRIAGE_TOKENS_PER_DAY {
+            return Err(format!(
+                "triage_tokens_per_day is 0 to {MAX_TRIAGE_TOKENS_PER_DAY}"
+            ));
+        }
+        if self.max_fix_runs_per_day > MAX_FIX_RUNS_LIMIT {
+            return Err(format!("max_fix_runs_per_day is 0 to {MAX_FIX_RUNS_LIMIT}"));
+        }
+        if self.max_fix_tokens_per_day > MAX_FIX_TOKENS_LIMIT {
+            return Err(format!(
+                "max_fix_tokens_per_day is 0 to {MAX_FIX_TOKENS_LIMIT}"
+            ));
+        }
+        if self.max_cards_per_day > MAX_CARDS_LIMIT {
+            return Err(format!("max_cards_per_day is 0 to {MAX_CARDS_LIMIT}"));
         }
         if self.ignore.len() > MAX_IGNORES {
             return Err(format!("at most {MAX_IGNORES} ignores"));
@@ -985,6 +1043,9 @@ pub fn apply(
             f.advisory.cvss = Some(c);
             f.advisory.cvss_vector = a.cvss_vector.clone().or(f.advisory.cvss_vector.take());
         }
+    } else if f.advisory.cvss_vector.is_none() {
+        // OSV gives the vector without a score: keep it.
+        f.advisory.cvss_vector = a.cvss_vector.clone();
     }
     if a.severity.is_some() && st.severity.is_none() {
         st.severity = a.severity.clone();
@@ -1100,40 +1161,55 @@ pub fn severity_word(score: f64) -> &'static str {
 }
 
 /// The tier, from the verdict, scope, score, the exploited list and EPSS.
-/// `internet_facing`: an unknown verdict counts as reachable (CoderHelm
-/// doesn't yet know which services face the internet, so it assumes they
-/// do: unknown is not proof of safety).
-pub fn tier_of(f: &Finding, st: &FindingState, internet_facing: bool) -> Tier {
+/// P0 needs evidence: malware; on CISA's exploited list and loaded at
+/// runtime (reachable, or a runtime dependency not yet read); or CVSS 9+ and
+/// reachable. A verdict not yet known ("unknown", or "pending" while it is
+/// checked) is never P0 on its score alone: at most P1, when the score is
+/// high and the dependency is a runtime one (or EPSS is 0.1+), otherwise P2
+/// or P3. A pending verdict's tier is provisional ([`Finding::tier_provisional`]).
+pub fn tier_of(f: &Finding, st: &FindingState) -> Tier {
     let a = &f.advisory;
     if a.malware {
         return Tier::P0;
     }
-    let not_loaded = f.verdict == Verdict::NotLoaded || f.scope == Scope::Dev;
-    if not_loaded {
+    if f.verdict == Verdict::NotLoaded || f.scope == Scope::Dev {
         return Tier::P3;
     }
     let s = score(f, st);
-    let reachable = match f.verdict {
-        Verdict::Reachable => true,
-        Verdict::Unknown | Verdict::Pending => internet_facing,
-        _ => false,
-    };
-    if a.kev {
-        return Tier::P0;
+    let runtime = f.scope == Scope::Runtime;
+    let likely = a.epss.is_some_and(|e| e >= 0.1);
+    match f.verdict {
+        Verdict::Reachable => {
+            if a.kev || s >= 9.0 {
+                Tier::P0
+            } else if s >= 7.0 || likely {
+                Tier::P1
+            } else if s >= 4.0 {
+                Tier::P2
+            } else {
+                Tier::P3
+            }
+        }
+        Verdict::NotReachable => {
+            if a.kev || likely || s >= 9.0 {
+                Tier::P2
+            } else {
+                Tier::P3
+            }
+        }
+        // Unknown or still being checked: no evidence either way yet.
+        _ => {
+            if a.kev && runtime {
+                Tier::P0
+            } else if a.kev || likely || (s >= 7.0 && runtime) {
+                Tier::P1
+            } else if s >= 4.0 {
+                Tier::P2
+            } else {
+                Tier::P3
+            }
+        }
     }
-    if s >= 9.0 && reachable {
-        return Tier::P0;
-    }
-    if s >= 7.0 && reachable {
-        return Tier::P1;
-    }
-    if a.epss.is_some_and(|e| e >= 0.1) {
-        return Tier::P1;
-    }
-    if (s >= 4.0 && reachable) || s >= 7.0 {
-        return Tier::P2;
-    }
-    Tier::P3
 }
 
 /// When a finding is due: its first sighting plus the tier's days, or the
@@ -1161,7 +1237,8 @@ pub fn due_at(f: &Finding, tier: Tier, cfg: &SecurityConfig) -> DateTime<Utc> {
 /// Applies the policy to a finding: its tier and due date. Returns whether
 /// the tier rose.
 pub fn retier(f: &mut Finding, st: &FindingState, cfg: &SecurityConfig) -> bool {
-    let t = tier_of(f, st, true);
+    let t = tier_of(f, st);
+    f.tier_provisional = f.verdict == Verdict::Pending;
     let rose = f.tier.is_some_and(|old| t < old);
     f.tier = Some(t);
     f.due_at = due_at(f, t, cfg).to_rfc3339();
@@ -1288,9 +1365,7 @@ pub fn card(f: &Finding, stage: Stage, finding_url: &str, now: DateTime<Utc>) ->
     };
     match f.verdict {
         Verdict::Reachable => line.push_str(&format!(" {repo_name} calls the vulnerable code.")),
-        Verdict::Unknown | Verdict::Pending => {
-            line.push_str(" Reachability not settled yet, so it is treated as reachable.")
-        }
+        Verdict::Unknown | Verdict::Pending => line.push_str(" Reachability not settled yet."),
         Verdict::NotReachable => line.push_str(" Present, but nothing calls the vulnerable code."),
         Verdict::NotLoaded => line.push_str(" Not loaded at runtime."),
     }
@@ -1352,6 +1427,532 @@ pub fn card(f: &Finding, stage: Stage, finding_url: &str, now: DateTime<Utc>) ->
         buttons,
         full_width: true,
     }
+}
+
+/// The one card that stands for the cards past the day's limit.
+pub fn digest_card(waiting: &[&Finding], security_url: &str, limit: u32) -> Message {
+    let mut tiers: BTreeMap<Tier, usize> = BTreeMap::new();
+    for f in waiting {
+        *tiers.entry(f.tier.unwrap_or(Tier::P3)).or_default() += 1;
+    }
+    let by = tiers
+        .iter()
+        .map(|(t, n)| format!("{n} {}", t.as_str()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let head = format!(
+        "🟠 Security · {} more finding{} today",
+        waiting.len(),
+        if waiting.len() == 1 { "" } else { "s" }
+    );
+    let mut lines: Vec<String> = waiting
+        .iter()
+        .take(5)
+        .map(|f| {
+            format!(
+                "{} {} {} in {} ({})",
+                f.tier.map(Tier::as_str).unwrap_or("P3"),
+                f.package,
+                f.version,
+                f.repo.split('/').nth(1).unwrap_or(&f.repo),
+                f.advisory.primary
+            )
+        })
+        .collect();
+    if waiting.len() > 5 {
+        lines.push(format!("and {} more", waiting.len() - 5));
+    }
+    Message {
+        summary: head.clone(),
+        blocks: vec![
+            Block::Banner {
+                text: head,
+                tone: Tone::Warning,
+                size: Size::Medium,
+            },
+            Block::Text(
+                Text::new(format!(
+                    "Today's {limit} cards are posted, so these are in one card: {by}.\n{}",
+                    lines.join("\n")
+                ))
+                .spacing(Spacing::Small),
+            ),
+        ],
+        buttons: vec![Button::new("See them all", security_url)],
+        full_width: true,
+    }
+}
+
+/// The note a finding carries while a daily fix limit holds it.
+pub fn waiting_runs(limit: u32) -> String {
+    format!(
+        "Waiting: today's {limit} fix run{} {} used. Next starts tomorrow.",
+        if limit == 1 { "" } else { "s" },
+        if limit == 1 { "is" } else { "are" }
+    )
+}
+
+pub fn waiting_tokens(limit: u64) -> String {
+    format!(
+        "Waiting: today's fix runs used their {} tokens. Next starts tomorrow.",
+        fmt_tokens(limit)
+    )
+}
+
+pub const WAITING_REPO: &str =
+    "Waiting: a fix run for this repo is in progress. Next starts when it ends.";
+pub const WAITING_TRIAGE: &str =
+    "Waiting for tomorrow's check: today's reachability limit is used.";
+
+/// `400k`, `2M`.
+pub fn fmt_tokens(n: u64) -> String {
+    if n >= 1_000_000 && n.is_multiple_of(1_000_000) {
+        format!("{}M", n / 1_000_000)
+    } else if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1000 {
+        format!("{}k", n / 1000)
+    } else {
+        n.to_string()
+    }
+}
+
+/// Fix units in the order they start: tier, then due date. P0 always first.
+pub fn order_units(units: &mut [FixUnit], findings: &[(Finding, FindingState)]) {
+    let key = |u: &FixUnit| {
+        let members: Vec<&Finding> = u
+            .finding_ids
+            .iter()
+            .filter_map(|id| findings.iter().find(|(f, _)| &f.id == id).map(|(f, _)| f))
+            .collect();
+        let tier = members
+            .iter()
+            .filter_map(|f| f.tier)
+            .min()
+            .unwrap_or(Tier::P3);
+        let due = members
+            .iter()
+            .filter_map(|f| parse_time(&f.due_at))
+            .min()
+            .unwrap_or_else(|| Utc::now() + Duration::days(3650));
+        (tier, due)
+    };
+    units.sort_by_key(|u| key(u));
+}
+
+// ── Daily limits ────────────────────────────────────────────────────────
+
+/// How a due fix unit is handled: a full coding run, or work that costs no
+/// run (adopting a bot's pull request, opening an issue).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunKind {
+    Run,
+    Adopt,
+    IssueOnly,
+}
+
+impl RunKind {
+    /// Only a coding run counts against the day's limits.
+    pub fn counts(self) -> bool {
+        self == RunKind::Run
+    }
+}
+
+/// Whether a run may start now, or why it waits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Admit {
+    Start,
+    Wait(String),
+}
+
+/// The day's counters, shared by every tick: taking a run slot is atomic
+/// (DynamoDB's conditional ADD on `SECRUNS#<yyyymmdd>`), so ticks running
+/// at once never start more than the limit.
+pub trait DailySlots {
+    /// Takes one of today's `limit` run slots; false when none is left.
+    fn take_run(&self, day: &str, limit: u32) -> impl std::future::Future<Output = bool> + Send;
+    /// Gives a slot back (the run could not be queued).
+    fn give_back(&self, day: &str) -> impl std::future::Future<Output = ()> + Send;
+    /// Tokens fix runs spent today.
+    fn fix_tokens(&self, day: &str) -> impl std::future::Future<Output = u64> + Send;
+    /// Takes a slot past the limit: an admin raised today's limit for one
+    /// request (the caller records it in the audit log).
+    fn take_run_over_limit(&self, day: &str) -> impl std::future::Future<Output = bool> + Send;
+}
+
+/// The day key of the limits (UTC).
+pub fn limit_day(now: DateTime<Utc>) -> String {
+    now.format("%Y%m%d").to_string()
+}
+
+/// Decides one coding run against the day's limits: one run in progress per
+/// repository, the token limit, then a run slot.
+pub async fn admit_run<S: DailySlots>(
+    slots: &S,
+    cfg: &SecurityConfig,
+    day: &str,
+    repo_busy: bool,
+) -> Admit {
+    if repo_busy {
+        return Admit::Wait(WAITING_REPO.into());
+    }
+    if cfg.max_fix_runs_per_day == 0 {
+        return Admit::Wait("Waiting: fix runs are set to 0 a day in the policy.".into());
+    }
+    if slots.fix_tokens(day).await >= cfg.max_fix_tokens_per_day {
+        return Admit::Wait(waiting_tokens(cfg.max_fix_tokens_per_day));
+    }
+    if !slots.take_run(day, cfg.max_fix_runs_per_day).await {
+        return Admit::Wait(waiting_runs(cfg.max_fix_runs_per_day));
+    }
+    Admit::Start
+}
+
+/// In-memory [`DailySlots`] with the same conditional semantics, for tests
+/// and previews.
+#[derive(Default)]
+pub struct MemorySlots {
+    pub runs: std::sync::Mutex<HashMap<String, u32>>,
+    pub tokens: std::sync::Mutex<HashMap<String, u64>>,
+}
+
+impl DailySlots for MemorySlots {
+    async fn take_run(&self, day: &str, limit: u32) -> bool {
+        // Yield first, so tasks running at once interleave here.
+        tokio::task::yield_now().await;
+        let mut g = self.runs.lock().unwrap();
+        let n = g.entry(day.to_string()).or_insert(0);
+        if *n < limit {
+            *n += 1;
+            true
+        } else {
+            false
+        }
+    }
+    async fn give_back(&self, day: &str) {
+        let mut g = self.runs.lock().unwrap();
+        if let Some(n) = g.get_mut(day) {
+            *n = n.saturating_sub(1);
+        }
+    }
+    async fn fix_tokens(&self, day: &str) -> u64 {
+        *self.tokens.lock().unwrap().get(day).unwrap_or(&0)
+    }
+    async fn take_run_over_limit(&self, day: &str) -> bool {
+        *self
+            .runs
+            .lock()
+            .unwrap()
+            .entry(day.to_string())
+            .or_insert(0) += 1;
+        true
+    }
+}
+
+/// Which findings' cards post today and which go into the digest, given
+/// how many posted already: the most urgent first.
+pub fn card_budget(
+    due: Vec<&Finding>,
+    posted_today: u32,
+    limit: u32,
+) -> (Vec<&Finding>, Vec<&Finding>) {
+    let mut due = due;
+    due.sort_by(|a, b| {
+        (a.tier.unwrap_or(Tier::P3), &a.due_at).cmp(&(b.tier.unwrap_or(Tier::P3), &b.due_at))
+    });
+    let room = limit.saturating_sub(posted_today) as usize;
+    let rest = due.split_off(room.min(due.len()));
+    (due, rest)
+}
+
+/// [`DailySlots`] on DynamoDB: `SECRUNS#<yyyymmdd>` in the settings table
+/// (a conditional ADD, so ticks and requests at once never pass the limit)
+/// and the analytics day item for the tokens fix runs spent.
+pub struct DynamoSlots<'a> {
+    pub dynamo: &'a aws_sdk_dynamodb::Client,
+    pub settings_table: &'a str,
+    pub analytics_table: &'a str,
+    pub team_id: &'a str,
+}
+
+fn n_attr(n: i64) -> aws_sdk_dynamodb::types::AttributeValue {
+    aws_sdk_dynamodb::types::AttributeValue::N(n.to_string())
+}
+
+fn s_attr(s: &str) -> aws_sdk_dynamodb::types::AttributeValue {
+    aws_sdk_dynamodb::types::AttributeValue::S(s.to_string())
+}
+
+impl DynamoSlots<'_> {
+    async fn take_over(&self, day: &str) -> bool {
+        self.dynamo
+            .update_item()
+            .table_name(self.settings_table)
+            .key("pk", s_attr(self.team_id))
+            .key("sk", s_attr(&format!("SECRUNS#{day}")))
+            .update_expression("SET #ttl = if_not_exists(#ttl, :ttl) ADD runs :one, raised :one")
+            .expression_attribute_names("#ttl", "ttl")
+            .expression_attribute_values(":one", n_attr(1))
+            .expression_attribute_values(":ttl", n_attr(Utc::now().timestamp() + 400 * 86_400))
+            .send()
+            .await
+            .is_ok()
+    }
+}
+
+impl DailySlots for DynamoSlots<'_> {
+    async fn take_run(&self, day: &str, limit: u32) -> bool {
+        // Fails closed: a failed write is no slot.
+        self.dynamo
+            .update_item()
+            .table_name(self.settings_table)
+            .key("pk", s_attr(self.team_id))
+            .key("sk", s_attr(&format!("SECRUNS#{day}")))
+            .update_expression("SET #ttl = if_not_exists(#ttl, :ttl) ADD runs :one")
+            .condition_expression("attribute_not_exists(runs) OR runs < :cap")
+            .expression_attribute_names("#ttl", "ttl")
+            .expression_attribute_values(":one", n_attr(1))
+            .expression_attribute_values(":cap", n_attr(limit as i64))
+            .expression_attribute_values(":ttl", n_attr(Utc::now().timestamp() + 400 * 86_400))
+            .send()
+            .await
+            .is_ok()
+    }
+    async fn give_back(&self, day: &str) {
+        let _ = self
+            .dynamo
+            .update_item()
+            .table_name(self.settings_table)
+            .key("pk", s_attr(self.team_id))
+            .key("sk", s_attr(&format!("SECRUNS#{day}")))
+            .update_expression("ADD runs :minus")
+            .condition_expression("runs > :zero")
+            .expression_attribute_values(":minus", n_attr(-1))
+            .expression_attribute_values(":zero", n_attr(0))
+            .send()
+            .await;
+    }
+    async fn fix_tokens(&self, day: &str) -> u64 {
+        if day.len() != 8 {
+            return u64::MAX;
+        }
+        let date = format!("{}-{}-{}", &day[..4], &day[4..6], &day[6..8]);
+        match self
+            .dynamo
+            .get_item()
+            .table_name(self.analytics_table)
+            .key("team_id", s_attr(self.team_id))
+            .key("period", s_attr(&format!("DAY#{date}")))
+            .send()
+            .await
+        {
+            Ok(o) => crate::usage::feature_totals(o.item())
+                .into_iter()
+                .find(|(f, _)| f == crate::usage::feature::SECURITY_FIX)
+                .map(|(_, u)| u.total())
+                .unwrap_or(0),
+            // Can't be read: count it as used up.
+            Err(_) => u64::MAX,
+        }
+    }
+    async fn take_run_over_limit(&self, day: &str) -> bool {
+        self.take_over(day).await
+    }
+}
+
+/// What a person's request for fix pull requests did: the units that start
+/// now and those that wait for a daily limit, with the reason.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Requested {
+    pub unit: String,
+    pub ticket: String,
+    pub repo: String,
+    pub package: String,
+    pub finding_ids: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Decides which units of a person's request start now: the most urgent
+/// first, within the day's run and token limits and one run per repository
+/// at a time, unless an admin raised today's limit for this request (then
+/// only the repository rule holds). Dry run never holds them: the person asked.
+pub async fn admit_request<S: DailySlots>(
+    slots: &S,
+    cfg: &SecurityConfig,
+    day: &str,
+    units: &mut [FixUnit],
+    findings: &[(Finding, FindingState)],
+    raise: bool,
+) -> (Vec<Requested>, Vec<Requested>) {
+    order_units(units, findings);
+    let mut busy: HashSet<String> = findings
+        .iter()
+        .filter(|(f, _)| f.status == Status::Fixing)
+        .map(|(f, _)| f.repo.to_ascii_lowercase())
+        .collect();
+    let (mut started, mut queued) = (vec![], vec![]);
+    for u in units.iter() {
+        let r = |reason: Option<String>| Requested {
+            unit: u.key.clone(),
+            ticket: u.ticket.clone(),
+            repo: u.repo.clone(),
+            package: u
+                .bumps
+                .first()
+                .map(|b| b.package.clone())
+                .unwrap_or_default(),
+            finding_ids: u.finding_ids.clone(),
+            reason,
+        };
+        let repo_busy = busy.contains(&u.repo.to_ascii_lowercase());
+        let admit = if raise && !repo_busy {
+            if slots.take_run_over_limit(day).await {
+                Admit::Start
+            } else {
+                Admit::Wait(
+                    "Waiting: the day's counter couldn't be written; it starts on the next check."
+                        .into(),
+                )
+            }
+        } else {
+            admit_run(slots, cfg, day, repo_busy).await
+        };
+        match admit {
+            Admit::Start => {
+                busy.insert(u.repo.to_ascii_lowercase());
+                started.push(r(None));
+            }
+            Admit::Wait(why) => queued.push(r(Some(why))),
+        }
+    }
+    (started, queued)
+}
+
+// ── Fix PRs a person asks for ───────────────────────────────────────────
+
+/// Why a finding a person picked can't get a fix pull request now; with the
+/// open pull request's link when that is why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Skipped {
+    pub finding_id: String,
+    pub reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pr_url: Option<String>,
+}
+
+/// The fix units for the findings a person picked: one pull request per
+/// repository, package and version (every advisory it has, bumped to the
+/// version that clears them all), never one per advisory. Dry run doesn't
+/// matter here: the person asked. Each finding that can't be fixed is
+/// skipped with the reason.
+pub fn manual_units(
+    findings: &[(Finding, FindingState)],
+    ids: &[String],
+    cfg: &SecurityConfig,
+    now: DateTime<Utc>,
+) -> (Vec<FixUnit>, Vec<Skipped>) {
+    let mut skipped = vec![];
+    let mut picked: Vec<&(Finding, FindingState)> = vec![];
+    let mut seen = HashSet::new();
+    for id in ids {
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        let Some(pair) = findings.iter().find(|(f, _)| &f.id == id) else {
+            skipped.push(Skipped {
+                finding_id: id.clone(),
+                reason: "not found".into(),
+                pr_url: None,
+            });
+            continue;
+        };
+        let f = &pair.0;
+        let reason = match (f.status, &f.pr) {
+            (_, Some(p)) if p.state == "open" => Some("already has an open PR"),
+            (Status::Dismissed | Status::Withdrawn, _) => Some("dismissed"),
+            (Status::Fixed, _) => Some("already fixed"),
+            (Status::Fixing, _) => Some("a fix run is already working on it"),
+            _ if f.fixed_version.is_none() => Some("no fixed version"),
+            _ => None,
+        };
+        match reason {
+            Some(r) => skipped.push(Skipped {
+                finding_id: id.clone(),
+                reason: r.into(),
+                pr_url: f
+                    .pr
+                    .as_ref()
+                    .filter(|p| p.state == "open")
+                    .map(|p| p.url.clone()),
+            }),
+            None => picked.push(pair),
+        }
+    }
+    // One unit per group (repository, package, version).
+    let mut by: BTreeMap<String, Vec<&(Finding, FindingState)>> = BTreeMap::new();
+    for p in picked {
+        by.entry(group_key(&p.0)).or_default().push(p);
+    }
+    let units = by
+        .into_values()
+        .map(|members| {
+            let first = &members[0].0;
+            let to = members
+                .iter()
+                .filter_map(|(f, _)| f.fixed_version.clone())
+                .max_by(|a, b| compare_versions(a, b))
+                .unwrap_or_default();
+            let tier = members.iter().filter_map(|(f, _)| f.tier).min();
+            let mut u = FixUnit {
+                repo: first.repo.clone(),
+                ecosystem: first.ecosystem.clone(),
+                grouped: false,
+                key: format!("{}@{}", first.package.to_ascii_lowercase(), to),
+                tier,
+                finding_ids: members.iter().map(|(f, _)| f.id.clone()).collect(),
+                bumps: vec![Bump {
+                    package: first.package.clone(),
+                    from: first.version.clone(),
+                    to: to.clone(),
+                    major: is_major_bump(&first.version, &to),
+                    manifest: first.manifest.clone(),
+                }],
+                ..Default::default()
+            };
+            let mut primaries: Vec<String> = members
+                .iter()
+                .map(|(f, _)| f.advisory.primary.clone())
+                .collect();
+            primaries.sort();
+            primaries.dedup();
+            let pairs: Vec<(&Finding, &FindingState)> =
+                members.iter().map(|(f, s)| (f, s)).collect();
+            u.ticket = ticket_id(&u.repo, &u.key);
+            u.branch = branch(&u, None, now);
+            u.title = pr_title("fix(deps)", &u, &primaries);
+            u.labels = labels(cfg, &pairs, u.bumps[0].major);
+            u
+        })
+        .collect();
+    (units, skipped)
+}
+
+/// The findings a person asked a fix for that still wait (queued past a
+/// daily limit): their units, the most urgent first.
+pub fn requested_units(
+    findings: &[(Finding, FindingState)],
+    cfg: &SecurityConfig,
+    now: DateTime<Utc>,
+) -> Vec<FixUnit> {
+    let ids: Vec<String> = findings
+        .iter()
+        .filter(|(f, st)| st.requested_by.is_some() && f.status == Status::Open && f.pr.is_none())
+        .map(|(f, _)| f.id.clone())
+        .collect();
+    let mut units = manual_units(findings, &ids, cfg, now).0;
+    order_units(&mut units, findings);
+    units
 }
 
 // ── Fix units: what one pull request fixes ──────────────────────────────
@@ -1939,7 +2540,7 @@ pub fn osv_ecosystem(purl_type: &str) -> Option<&'static str> {
         "composer" => "Packagist",
         "hex" => "Hex",
         "pub" => "Pub",
-        "githubactions" | "github" => "GitHub Actions",
+        "githubactions" => "GitHub Actions",
         "swift" => "SwiftURL",
         _ => return None,
     })
@@ -1998,11 +2599,52 @@ pub fn parse_purl(purl: &str) -> Option<(String, String, String)> {
 /// response of `GET /repos/{o}/{r}/dependency-graph/sbom`). The repository's
 /// own package and anything without a version are left out.
 pub fn deps_from_sbom(sbom: &Value) -> Vec<Dep> {
-    let packages = sbom["sbom"]["packages"]
+    inventory_from_sbom(sbom).0
+}
+
+/// Whether a version is one exact release (not a range, a branch or a
+/// partial like `3`): OSV matches only those. npm needs all three parts.
+pub fn exact_version(ecosystem: &str, v: &str) -> bool {
+    if v.is_empty() || v.contains(['<', '>', '^', '~', '*', ' ', '|', '=']) {
+        return false;
+    }
+    let v = v.strip_prefix('v').unwrap_or(v);
+    if ecosystem == "npm" {
+        let core = v.split(['-', '+']).next().unwrap_or("");
+        let parts: Vec<&str> = core.split('.').collect();
+        return parts.len() == 3
+            && parts
+                .iter()
+                .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()));
+    }
+    v.chars().next().is_some_and(|c| c.is_ascii_digit())
+}
+
+/// [`deps_from_sbom`], and how many packages were left out for having no
+/// exact version (a range or a partial one, which OSV can't match).
+pub fn inventory_from_sbom(sbom: &Value) -> (Vec<Dep>, usize) {
+    let doc = if sbom["sbom"].is_object() {
+        &sbom["sbom"]
+    } else {
+        sbom
+    };
+    let packages = doc["packages"].as_array();
+    // The repository itself: what the document describes.
+    let described: Vec<&str> = doc["documentDescribes"]
         .as_array()
-        .or_else(|| sbom["packages"].as_array());
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
     let mut out: Vec<Dep> = vec![];
+    let mut skipped = 0;
     for p in packages.into_iter().flatten() {
+        if p["SPDXID"]
+            .as_str()
+            .is_some_and(|id| described.contains(&id))
+        {
+            continue;
+        }
         let purl = p["externalRefs"]
             .as_array()
             .into_iter()
@@ -2012,6 +2654,10 @@ pub fn deps_from_sbom(sbom: &Value) -> Vec<Dep> {
         let Some((ty, name, version)) = purl.and_then(parse_purl) else {
             continue;
         };
+        // `pkg:github/...` is the repository's own package, not an Action.
+        if ty == "github" {
+            continue;
+        }
         let Some(eco) = osv_ecosystem(&ty) else {
             continue;
         };
@@ -2020,7 +2666,8 @@ pub fn deps_from_sbom(sbom: &Value) -> Vec<Dep> {
         } else {
             version
         };
-        if version.is_empty() || version.contains(['<', '>', '^', '~', '*', ' ']) {
+        if !exact_version(eco, &version) {
+            skipped += 1;
             continue;
         }
         let d = Dep {
@@ -2034,7 +2681,7 @@ pub fn deps_from_sbom(sbom: &Value) -> Vec<Dep> {
             out.push(d);
         }
     }
-    out
+    (out, skipped)
 }
 
 /// The base images of a Dockerfile: each `FROM` that isn't `scratch` or an
@@ -2664,6 +3311,505 @@ pub fn index_spec() -> crate::settings_index::Spec<'static> {
     }
 }
 
+// ── Groups: one fix, one row ───────────────────────────────────────────
+
+/// The findings one package bump fixes: a repository's package at one
+/// version, with every advisory it clears.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Group {
+    pub key: String,
+    pub repo: String,
+    pub ecosystem: String,
+    pub package: String,
+    pub version: String,
+    /// The version that clears every advisory in the group (the highest any
+    /// of them needs), when each has one.
+    pub fixed_version: Option<String>,
+    /// How many advisories have no fixed version yet.
+    pub no_fix: usize,
+    /// The worst member's tier and the soonest due date.
+    pub tier: Option<Tier>,
+    pub tier_provisional: bool,
+    pub due_at: String,
+    /// The group's state: the most active member's.
+    pub status: Status,
+    pub verdict: Verdict,
+    pub scope: Scope,
+    pub kev: bool,
+    pub malware: bool,
+    pub epss: Option<f64>,
+    pub manifests: Vec<String>,
+    pub pr: Option<PrRef>,
+    pub finding_ids: Vec<String>,
+    pub advisories: Vec<GroupAdvisory>,
+}
+
+/// One advisory in a group, for the expanded row.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct GroupAdvisory {
+    pub finding_id: String,
+    pub primary: String,
+    pub ids: Vec<String>,
+    pub title: String,
+    pub tier: Option<Tier>,
+    pub fixed_version: Option<String>,
+    pub status: Status,
+}
+
+/// The key of a finding's group: repository, ecosystem, package, version.
+pub fn group_key(f: &Finding) -> String {
+    format!(
+        "{}|{}|{}|{}",
+        f.repo.to_ascii_lowercase(),
+        f.ecosystem.to_ascii_lowercase(),
+        if f.ecosystem.eq_ignore_ascii_case("pypi") {
+            f.package.to_ascii_lowercase().replace(['_', '.'], "-")
+        } else {
+            f.package.to_ascii_lowercase()
+        },
+        f.version
+    )
+}
+
+fn status_rank(s: Status) -> u8 {
+    match s {
+        Status::PrOpen => 0,
+        Status::Fixing => 1,
+        Status::Open => 2,
+        Status::NoFix => 3,
+        Status::Fixed => 4,
+        Status::Dismissed => 5,
+        Status::Withdrawn => 6,
+    }
+}
+
+fn verdict_rank(v: Verdict) -> u8 {
+    match v {
+        Verdict::Reachable => 0,
+        Verdict::Pending => 1,
+        Verdict::Unknown => 2,
+        Verdict::NotReachable => 3,
+        Verdict::NotLoaded => 4,
+    }
+}
+
+/// The findings as groups, the worst first (tier, then due date, then
+/// package). Open members decide an open group's tier and due date.
+pub fn groups(findings: &[(Finding, FindingState)]) -> Vec<Group> {
+    let mut by: BTreeMap<String, Vec<&Finding>> = BTreeMap::new();
+    for (f, _) in findings {
+        by.entry(group_key(f)).or_default().push(f);
+    }
+    let mut out: Vec<Group> = by
+        .into_iter()
+        .map(|(key, members)| {
+            let status = members
+                .iter()
+                .map(|f| f.status)
+                .min_by_key(|s| status_rank(*s))
+                .unwrap_or(Status::Open);
+            let live: Vec<&&Finding> = members
+                .iter()
+                .filter(|f| f.status.is_open() == status.is_open())
+                .collect();
+            let tier = live.iter().filter_map(|f| f.tier).min();
+            let due_at = live
+                .iter()
+                .filter_map(|f| parse_time(&f.due_at).map(|d| (d, f.due_at.clone())))
+                .min_by_key(|(d, _)| *d)
+                .map(|(_, s)| s)
+                .unwrap_or_default();
+            let fixes: Vec<Option<&String>> =
+                live.iter().map(|f| f.fixed_version.as_ref()).collect();
+            let no_fix = fixes.iter().filter(|x| x.is_none()).count();
+            let fixed_version = fixes
+                .iter()
+                .flatten()
+                .max_by(|a, b| compare_versions(a, b))
+                .map(|s| (*s).clone());
+            let first = members[0];
+            let mut manifests: Vec<String> = members.iter().map(|f| f.manifest.clone()).collect();
+            manifests.sort();
+            manifests.dedup();
+            let mut advisories: Vec<GroupAdvisory> = members
+                .iter()
+                .map(|f| GroupAdvisory {
+                    finding_id: f.id.clone(),
+                    primary: f.advisory.primary.clone(),
+                    ids: f.advisory.ids.clone(),
+                    title: f.advisory.title.clone(),
+                    tier: f.tier,
+                    fixed_version: f.fixed_version.clone(),
+                    status: f.status,
+                })
+                .collect();
+            advisories.sort_by(|a, b| (a.tier, &a.primary).cmp(&(b.tier, &b.primary)));
+            Group {
+                key,
+                repo: first.repo.clone(),
+                ecosystem: first.ecosystem.clone(),
+                package: first.package.clone(),
+                version: first.version.clone(),
+                fixed_version,
+                no_fix,
+                tier,
+                tier_provisional: live
+                    .iter()
+                    .filter(|f| f.tier == tier)
+                    .all(|f| f.tier_provisional),
+                due_at,
+                status,
+                verdict: live
+                    .iter()
+                    .map(|f| f.verdict)
+                    .min_by_key(|v| verdict_rank(*v))
+                    .unwrap_or(Verdict::Pending),
+                scope: first.scope,
+                kev: live.iter().any(|f| f.advisory.kev),
+                malware: live.iter().any(|f| f.advisory.malware),
+                epss: live
+                    .iter()
+                    .filter_map(|f| f.advisory.epss)
+                    .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)),
+                manifests,
+                pr: members.iter().find_map(|f| f.pr.clone()),
+                finding_ids: members.iter().map(|f| f.id.clone()).collect(),
+                advisories,
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        (a.tier.unwrap_or(Tier::P3), &a.due_at, &a.package).cmp(&(
+            b.tier.unwrap_or(Tier::P3),
+            &b.due_at,
+            &b.package,
+        ))
+    });
+    out
+}
+
+// ── Inventory status ────────────────────────────────────────────────────
+
+/// What reading a repository's dependency list said, in plain words.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct InventoryStatus {
+    /// `ok`, `graph_off`, `error`.
+    pub state: String,
+    pub reason: String,
+}
+
+/// A failed dependency-graph SBOM read, as a state and a reason with the fix.
+pub fn sbom_failure(code: u16, body: &Value) -> InventoryStatus {
+    let msg = body["message"].as_str().unwrap_or("").to_string();
+    let lower = msg.to_ascii_lowercase();
+    if code == 404 || lower.contains("not enabled") || lower.contains("disabled") {
+        return InventoryStatus {
+            state: "graph_off".into(),
+            reason: "GitHub's dependency graph is off for this repo; turn it on in the repo's Settings, Code security.".into(),
+        };
+    }
+    if code == 403 {
+        return InventoryStatus {
+            state: "error".into(),
+            reason: format!("GitHub refused the dependency list (403{}); the app needs Contents: read on this repo.", if msg.is_empty() { String::new() } else { format!(": {msg}") }),
+        };
+    }
+    InventoryStatus {
+        state: "error".into(),
+        reason: format!(
+            "GitHub couldn't build the dependency list ({code}{}); it is tried again on the next check.",
+            if msg.is_empty() { String::new() } else { format!(": {msg}") }
+        ),
+    }
+}
+
+/// Packages per ecosystem in a dependency list.
+pub fn ecosystems(deps: &[Dep]) -> BTreeMap<String, usize> {
+    let mut out = BTreeMap::new();
+    for d in deps {
+        *out.entry(d.ecosystem.clone()).or_insert(0) += 1;
+    }
+    out
+}
+
+// ── Dependabot access ───────────────────────────────────────────────────
+
+/// What reading a repository's Dependabot alerts said: `on`, `off` (turned
+/// off for the repo), `not_accepted` (the app asks for it, the installation
+/// hasn't accepted it yet), `no_permission` (the app doesn't have it), or
+/// `error`; with a reason and its fix in plain words.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct DependabotAccess {
+    pub state: String,
+    pub reason: String,
+}
+
+/// Classifies an answer of `GET /repos/{o}/{r}/dependabot/alerts`.
+/// `token_has`: whether the token carries Dependabot alerts (None: unknown).
+/// `installation_lacks`: the installation is known not to have granted it.
+pub fn dependabot_access(
+    code: u16,
+    body: &Value,
+    token_has: Option<bool>,
+    installation_lacks: bool,
+) -> DependabotAccess {
+    let msg = body["message"].as_str().unwrap_or("").to_ascii_lowercase();
+    let a = |state: &str, reason: &str| DependabotAccess {
+        state: state.into(),
+        reason: reason.into(),
+    };
+    match code {
+        200..=299 => a("on", ""),
+        403 | 404 if msg.contains("disabled") || msg.contains("not enabled") => a(
+            "off",
+            "Dependabot alerts are turned off for this repo; turn them on in the repo's Settings, Code security.",
+        ),
+        403 | 404 if installation_lacks || token_has == Some(false) => a(
+            "not_accepted",
+            "The GitHub App asks for Dependabot alerts: read, but the organization hasn't accepted it yet; an owner accepts it in the organization's Settings, GitHub Apps, then Review request.",
+        ),
+        403 if msg.contains("not accessible by integration") => a(
+            "no_permission",
+            "The GitHub App doesn't have Dependabot alerts: read; add it on the app's Permissions and events page, then accept it on the installation.",
+        ),
+        403 => a(
+            "no_permission",
+            "GitHub refused Dependabot's alerts for this repo; the app needs Dependabot alerts: read.",
+        ),
+        404 => a(
+            "off",
+            "GitHub didn't find Dependabot alerts for this repo; turn on the dependency graph and Dependabot alerts in the repo's Settings, Code security.",
+        ),
+        _ => a("error", "GitHub didn't answer for Dependabot's alerts; it is tried again on the next check."),
+    }
+}
+
+/// The team's Dependabot state from each repository's: the one that needs a
+/// person's action first.
+pub fn team_dependabot<'a>(
+    per_repo: impl IntoIterator<Item = &'a DependabotAccess>,
+) -> Option<DependabotAccess> {
+    let rank = |s: &str| match s {
+        "not_accepted" => 0,
+        "no_permission" => 1,
+        "error" => 2,
+        "off" => 3,
+        _ => 4,
+    };
+    per_repo.into_iter().min_by_key(|a| rank(&a.state)).cloned()
+}
+
+// ── Triage without the model ────────────────────────────────────────────
+
+/// A verdict that needs no model call: dev-only, withdrawn, or no code line
+/// names the package or the advisory's functions (the model would only be
+/// reading nothing). None: ask the model.
+pub fn settle_without_model(
+    f: &Finding,
+    st: &FindingState,
+    hits: usize,
+    files: usize,
+    searched: &[String],
+) -> Option<(Verdict, Evidence)> {
+    let checked = format!(
+        "Searched the code for {}.",
+        searched
+            .iter()
+            .map(|t| format!("`{t}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    if f.scope == Scope::Dev {
+        return Some((
+            Verdict::NotLoaded,
+            Evidence {
+                summary: "A development dependency only (the lockfile or Dependabot says so), so it isn't loaded at runtime.".into(),
+                lines: vec![],
+                checked: "The dependency's scope.".into(),
+                confidence: "high".into(),
+            },
+        ));
+    }
+    if f.status == Status::Withdrawn {
+        return Some((
+            Verdict::Unknown,
+            Evidence {
+                summary: "The advisory was withdrawn, so it isn't checked.".into(),
+                lines: vec![],
+                checked: "The advisory's status.".into(),
+                confidence: "high".into(),
+            },
+        ));
+    }
+    if hits == 0 {
+        let why = if st.symbols.is_empty() {
+            format!(
+                "No file in the repo's code names {}, so it comes in through another package, and the advisory names no functions to look for.",
+                f.package
+            )
+        } else {
+            format!(
+                "No file in the repo's code names {} or the functions the advisory names, so it comes in through another package; whether that package calls the vulnerable code isn't known.",
+                f.package
+            )
+        };
+        return Some((
+            Verdict::Unknown,
+            Evidence {
+                summary: why,
+                lines: vec![],
+                checked,
+                confidence: "low".into(),
+            },
+        ));
+    }
+    let _ = files;
+    None
+}
+
+/// The reason an "unknown" verdict from the model carries, from what the
+/// search found.
+pub fn unknown_reason(package: &str, files: usize, symbols: &[String]) -> String {
+    let where_ = match files {
+        0 => format!("{package} isn't named in the repo's code"),
+        1 => format!("{package} is imported in 1 file"),
+        n => format!("{package} is imported in {n} files"),
+    };
+    if symbols.is_empty() {
+        format!("{where_}, but the advisory names no functions to look for.")
+    } else {
+        format!(
+            "{where_}, but no line shows whether {} is called with untrusted input.",
+            symbols
+                .iter()
+                .take(3)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
+}
+
+/// The triage key of a group: what the verdict depends on (the advisories,
+/// the version, the scope and the code lines that name the package). The
+/// same key again reuses the verdict without a model call.
+pub fn group_triage_key(members: &[&Finding], hits: &[EvidenceLine]) -> String {
+    let mut ids: Vec<String> = members
+        .iter()
+        .flat_map(|f| f.advisory.ids.iter().cloned())
+        .collect();
+    ids.sort();
+    ids.dedup();
+    let lines: Vec<String> = hits
+        .iter()
+        .map(|h| format!("{}:{}", h.file, h.text))
+        .collect();
+    crate::content_hash(&format!(
+        "{}|{}|{:?}|{}",
+        ids.join(","),
+        members.first().map(|f| f.version.as_str()).unwrap_or(""),
+        members.first().map(|f| f.scope).unwrap_or_default(),
+        lines.join("\n")
+    ))
+}
+
+// ── Insights ────────────────────────────────────────────────────────────
+
+/// Analytics' security section: findings opened and fixed per day, fix pull
+/// requests opened and merged per day, the median hours to fix per tier,
+/// and the model tokens spent per day (`spend`: day `YYYY-MM-DD` to tokens).
+pub fn insights(
+    findings: &[(Finding, FindingState)],
+    spend: &BTreeMap<String, u64>,
+    now: DateTime<Utc>,
+    days: i64,
+) -> Value {
+    let start = (now - Duration::days(days - 1)).date_naive();
+    let day_of = |s: &str| parse_time(s).map(|t| t.date_naive());
+    let mut series: BTreeMap<NaiveDate, [u64; 5]> = BTreeMap::new();
+    let mut d = start;
+    while d <= now.date_naive() {
+        series.insert(d, [0; 5]);
+        d += Duration::days(1);
+    }
+    let mut bump = |day: Option<NaiveDate>, i: usize, n: u64| {
+        if let Some(e) = day.and_then(|d| series.get_mut(&d)) {
+            e[i] += n;
+        }
+    };
+    let mut prs_seen: HashSet<(String, u64)> = HashSet::new();
+    let mut hours: BTreeMap<Tier, Vec<f64>> = BTreeMap::new();
+    for (f, st) in findings {
+        bump(day_of(&f.first_seen_at), 0, 1);
+        if f.status == Status::Fixed {
+            let at = st.merged_at.clone().unwrap_or_else(|| f.updated_at.clone());
+            bump(day_of(&at), 1, 1);
+            if let (Some(t), Some(m), Some(s)) =
+                (f.tier, parse_time(&at), parse_time(&f.first_seen_at))
+            {
+                if m >= s && day_of(&at).is_some_and(|d| d >= start) {
+                    hours
+                        .entry(t)
+                        .or_default()
+                        .push((m - s).num_minutes() as f64 / 60.0);
+                }
+            }
+        }
+        if let Some(pr) = &f.pr {
+            if prs_seen.insert((f.repo.to_ascii_lowercase(), pr.number)) {
+                if let Some(o) = st.pr_opened_at.as_deref() {
+                    bump(day_of(o), 2, 1);
+                }
+                if pr.state == "merged" {
+                    if let Some(m) = st.merged_at.as_deref() {
+                        bump(day_of(m), 3, 1);
+                    }
+                }
+            }
+        }
+    }
+    for (day, tokens) in spend {
+        if let Ok(d) = NaiveDate::parse_from_str(day, "%Y-%m-%d") {
+            bump(Some(d), 4, *tokens);
+        }
+    }
+    let median = |v: &mut Vec<f64>| -> Value {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        match v.len() {
+            0 => Value::Null,
+            n if n % 2 == 1 => json!((v[n / 2] * 10.0).round() / 10.0),
+            n => json!(((v[n / 2 - 1] + v[n / 2]) / 2.0 * 10.0).round() / 10.0),
+        }
+    };
+    let mut by_tier = serde_json::Map::new();
+    for t in Tier::ALL {
+        let mut v = hours.remove(&t).unwrap_or_default();
+        by_tier.insert(
+            t.as_str().into(),
+            json!({ "fixed": v.len(), "median_hours": median(&mut v) }),
+        );
+    }
+    let month = now.format("%Y-%m").to_string();
+    let rows: Vec<Value> = series
+        .iter()
+        .map(|(d, v)| json!({
+            "date": d.format("%Y-%m-%d").to_string(),
+            "opened": v[0], "fixed": v[1], "prs_opened": v[2], "prs_merged": v[3], "tokens": v[4],
+        }))
+        .collect();
+    let sum = |i: usize| series.values().map(|v| v[i]).sum::<u64>();
+    json!({
+        "days": rows,
+        "totals": {
+            "opened": sum(0), "fixed": sum(1), "prs_opened": sum(2), "prs_merged": sum(3), "tokens": sum(4),
+            "tokens_month": spend.iter().filter(|(d, _)| d.starts_with(&month)).map(|(_, t)| *t).sum::<u64>(),
+        },
+        "median_hours_to_fix": Value::Object(by_tier),
+    })
+}
+
 // ── Triage ──────────────────────────────────────────────────────────────
 
 /// The agent's instructions for a reachability verdict.
@@ -2844,7 +3990,31 @@ pub fn overview_counts(findings: &[(Finding, FindingState)], now: DateTime<Utc>)
         .iter()
         .filter(|(f, _)| matches!(f.verdict, Verdict::NotReachable | Verdict::NotLoaded))
         .count();
+    let open_groups: Vec<Group> = groups(findings)
+        .into_iter()
+        .filter(|g| g.status.is_open())
+        .collect();
+    let gtier = |t: Tier| open_groups.iter().filter(|g| g.tier == Some(t)).count();
+    let settled = open
+        .iter()
+        .filter(|f| !matches!(f.verdict, Verdict::Pending))
+        .count();
     json!({
+        "groups": {
+            "open": open_groups.len(),
+            "p0": gtier(Tier::P0),
+            "p1": gtier(Tier::P1),
+            "p2": gtier(Tier::P2),
+            "p3": gtier(Tier::P3),
+            "due_7d": open_groups
+                .iter()
+                .filter(|g| parse_time(&g.due_at).is_some_and(|d| d <= week))
+                .count(),
+        },
+        "verdicts": {
+            "settled": settled,
+            "checking": open.len() - settled,
+        },
         "counts": {
             "open": open.len(),
             "p0": tier(Tier::P0),
@@ -3082,37 +4252,33 @@ mod tests {
     fn tiers_follow_the_policy() {
         let st = FindingState::default();
         let mut f = finding("a");
-        assert_eq!(tier_of(&f, &st, true), Tier::P0, "CVSS 9+ and reachable");
+        f.verdict = Verdict::Reachable;
+        f.advisory.cvss = Some(9.8);
+        assert_eq!(tier_of(&f, &st), Tier::P0, "CVSS 9+ and reachable");
         f.advisory.cvss = Some(7.5);
-        assert_eq!(tier_of(&f, &st, true), Tier::P1, "CVSS 7+ and reachable");
+        assert_eq!(tier_of(&f, &st), Tier::P1, "CVSS 7+ and reachable");
         f.verdict = Verdict::NotReachable;
-        assert_eq!(tier_of(&f, &st, true), Tier::P2, "high, not reachable");
+        assert_eq!(tier_of(&f, &st), Tier::P3, "high, not reachable");
         f.advisory.epss = Some(0.23);
-        assert_eq!(tier_of(&f, &st, true), Tier::P1, "EPSS 0.1+ at runtime");
+        assert_eq!(
+            tier_of(&f, &st),
+            Tier::P2,
+            "likely exploited, not reachable"
+        );
         f.advisory.epss = None;
+        f.verdict = Verdict::Reachable;
         f.advisory.kev = true;
-        assert_eq!(tier_of(&f, &st, true), Tier::P0, "exploited and loaded");
+        assert_eq!(tier_of(&f, &st), Tier::P0, "exploited and loaded");
         f.scope = Scope::Dev;
-        assert_eq!(
-            tier_of(&f, &st, true),
-            Tier::P3,
-            "dev only: lowest, no agent"
-        );
+        assert_eq!(tier_of(&f, &st), Tier::P3, "dev only: lowest, no agent");
         f.advisory.malware = true;
-        assert_eq!(tier_of(&f, &st, true), Tier::P0, "malware anywhere");
+        assert_eq!(tier_of(&f, &st), Tier::P0, "malware anywhere");
         let mut g = finding("b");
+        g.verdict = Verdict::Reachable;
         g.advisory.cvss = Some(5.0);
-        assert_eq!(tier_of(&g, &st, true), Tier::P2, "reachable medium");
+        assert_eq!(tier_of(&g, &st), Tier::P2, "reachable medium");
         g.verdict = Verdict::NotReachable;
-        assert_eq!(tier_of(&g, &st, true), Tier::P3, "medium, not reachable");
-        g.verdict = Verdict::Unknown;
-        g.advisory.cvss = Some(9.8);
-        assert_eq!(
-            tier_of(&g, &st, true),
-            Tier::P0,
-            "unknown counts as reachable when internet facing"
-        );
-        assert_eq!(tier_of(&g, &st, false), Tier::P2);
+        assert_eq!(tier_of(&g, &st), Tier::P3, "medium, not reachable");
         // A severity word stands in for a missing score.
         g.advisory.cvss = None;
         let high = FindingState {
@@ -3120,7 +4286,63 @@ mod tests {
             ..Default::default()
         };
         g.verdict = Verdict::Reachable;
-        assert_eq!(tier_of(&g, &high, true), Tier::P1);
+        assert_eq!(tier_of(&g, &high), Tier::P1);
+    }
+
+    /// An unknown or still-checking verdict is no evidence: a critical score
+    /// alone never makes it P0, and a missing score is never treated as high.
+    #[test]
+    fn an_unknown_verdict_is_never_p0_on_its_score_alone() {
+        let st = FindingState::default();
+        let crit = FindingState {
+            severity: Some("critical".into()),
+            ..Default::default()
+        };
+        for v in [Verdict::Unknown, Verdict::Pending] {
+            let mut f = finding("u");
+            f.verdict = v;
+            f.advisory.cvss = Some(9.8);
+            f.advisory.epss = Some(0.01);
+            f.scope = Scope::Unknown;
+            assert_eq!(tier_of(&f, &st), Tier::P2, "{v:?}: critical, scope unknown");
+            f.scope = Scope::Runtime;
+            assert_eq!(tier_of(&f, &st), Tier::P1, "{v:?}: critical, runtime");
+            f.advisory.cvss = None;
+            assert_eq!(
+                tier_of(&f, &crit),
+                Tier::P1,
+                "{v:?}: critical word, runtime"
+            );
+            assert_eq!(
+                tier_of(&f, &st),
+                Tier::P3,
+                "{v:?}: no score is not a high score"
+            );
+            f.advisory.kev = true;
+            assert_eq!(
+                tier_of(&f, &st),
+                Tier::P0,
+                "{v:?}: exploited and a runtime dependency"
+            );
+            f.scope = Scope::Unknown;
+            assert_eq!(
+                tier_of(&f, &st),
+                Tier::P1,
+                "{v:?}: exploited, scope unknown"
+            );
+        }
+        let mut f = finding("p");
+        f.verdict = Verdict::Pending;
+        f.advisory.cvss = Some(9.8);
+        retier(&mut f, &st, &SecurityConfig::default());
+        assert!(
+            f.tier_provisional,
+            "a pending verdict's tier is provisional"
+        );
+        f.verdict = Verdict::Reachable;
+        retier(&mut f, &st, &SecurityConfig::default());
+        assert!(!f.tier_provisional);
+        assert_eq!(f.tier, Some(Tier::P0));
     }
 
     #[test]
@@ -3378,10 +4600,11 @@ mod tests {
     fn a_dry_run_previews_and_opens_nothing() {
         let cfg = SecurityConfig {
             enabled: true,
+            dry_run: true,
             ..Default::default()
         };
-        assert!(!cfg.acts(), "dry run is on by default");
-        assert!(!SecurityConfig::default().acts());
+        assert!(!cfg.acts(), "preview first opens and posts nothing");
+        assert!(!SecurityConfig::default().acts(), "off until turned on");
         let mut f = finding("a");
         f.tier = Some(Tier::P0);
         let p = preview(
@@ -3511,14 +4734,17 @@ mod tests {
     #[test]
     fn settings_defaults_and_validation() {
         let c = SecurityConfig::default();
-        assert!(!c.enabled && c.dry_run);
+        assert!(!c.enabled && !c.dry_run);
         let v = serde_json::to_value(&c).unwrap();
         assert_eq!(v["open_prs"]["P1"], "hour");
         assert_eq!(v["repos"], "all");
         assert_eq!(v["major_bumps"], "fix_in_pr");
         let back: SecurityConfig =
             serde_json::from_value(json!({"enabled": true, "repos": ["acme/web"]})).unwrap();
-        assert!(back.enabled && back.dry_run);
+        // Turned on without naming a choice: open PRs (the recommended
+        // one), within the day's run, token and card limits.
+        assert!(back.enabled && !back.dry_run);
+        assert_eq!(back.max_fix_runs_per_day, MAX_FIX_RUNS_PER_DAY);
         assert_eq!(back.repos, Repos::List(vec!["acme/web".into()]));
         assert!(back.repos.includes("ACME/web") && !back.repos.includes("acme/api"));
         assert!(c.validate().is_ok());
@@ -3767,5 +4993,783 @@ mod tests {
             .summary
             .contains("P0 security · web is affected by CVE-2026-31337"));
         assert!(!m.summary.contains('→'));
+    }
+
+    // ── Inventory to OSV, on GitHub's real shapes ──────────────────────
+
+    const SBOM: &str = include_str!("security_testdata/github_sbom.json");
+    const OSV_BATCH: &str = include_str!("security_testdata/osv_querybatch.json");
+    const OSV_LODASH: &str = include_str!("security_testdata/osv_GHSA-35jh-r3h4-6jhm.json");
+    const OSV_AXIOS: &str = include_str!("security_testdata/osv_GHSA-cph5-m8f7-6c5x.json");
+
+    /// GitHub's SBOM (SPDX JSON with purl external refs): the repository's
+    /// own package (`pkg:github/...`) is not a dependency, and versions that
+    /// are ranges or partial (`3`, `^1.2.0`, `4.*.*`) are counted, not queried.
+    #[test]
+    fn github_sbom_lists_the_packages_and_leaves_out_the_repo_itself() {
+        let sbom: Value = serde_json::from_str(SBOM).unwrap();
+        let (deps, unpinned) = inventory_from_sbom(&sbom);
+        let names: Vec<(&str, &str, &str)> = deps
+            .iter()
+            .map(|d| (d.ecosystem.as_str(), d.name.as_str(), d.version.as_str()))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                ("npm", "lodash", "4.17.20"),
+                ("npm", "axios", "0.21.0"),
+                ("npm", "left-pad", "1.3.0"),
+                ("GitHub Actions", "example/deploy-action", "2.6.2"),
+            ]
+        );
+        assert_eq!(
+            unpinned, 3,
+            "@scope/partial 3, ranged ^1.2.0, checkout 4.*.*"
+        );
+        assert!(!deps.iter().any(|d| d.name.contains("example-org/web")));
+        let q = osv_queries(&deps);
+        assert_eq!(
+            q[0],
+            json!({"package": {"name": "lodash", "ecosystem": "npm"}, "version": "4.17.20"})
+        );
+        assert!(
+            exact_version("npm", "1.4.4-lts.1")
+                && !exact_version("npm", "3")
+                && !exact_version("npm", "main")
+        );
+    }
+
+    /// The recorded answers of OSV's API (`querybatch`, then each record)
+    /// for lodash 4.17.20 and axios 0.21.0 make findings: known vulnerable
+    /// versions are matched, and an unaffected package gets nothing.
+    #[test]
+    fn known_vulnerable_versions_match_osvs_recorded_answers() {
+        let sbom: Value = serde_json::from_str(SBOM).unwrap();
+        let deps = deps_from_sbom(&sbom);
+        let npm: Vec<Dep> = deps
+            .iter()
+            .filter(|d| d.ecosystem == "npm")
+            .cloned()
+            .collect();
+        // The recorded batch was asked for lodash, axios, left-pad in order.
+        let batch: Value = serde_json::from_str(OSV_BATCH).unwrap();
+        let ids = |i: usize| -> Vec<String> {
+            batch["results"][i]["vulns"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v["id"].as_str().map(String::from))
+                .collect()
+        };
+        assert!(
+            ids(0).contains(&"GHSA-35jh-r3h4-6jhm".to_string()),
+            "lodash command injection"
+        );
+        assert!(
+            ids(1).contains(&"GHSA-cph5-m8f7-6c5x".to_string()),
+            "axios ReDoS"
+        );
+        assert!(ids(1).len() >= 20, "axios 0.21.0 has many advisories");
+        assert!(ids(2).is_empty(), "left-pad 1.3.0 has none");
+        let lodash: Value = serde_json::from_str(OSV_LODASH).unwrap();
+        let axios: Value = serde_json::from_str(OSV_AXIOS).unwrap();
+        let mut findings: Vec<(Finding, FindingState)> = vec![];
+        for (dep, rec) in [(&npm[0], &lodash), (&npm[1], &axios)] {
+            let adv = advisory_from_osv(rec, &dep.ecosystem, &dep.name)
+                .expect("the record names the package");
+            let affected = rec["affected"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|a| a["package"]["name"] == dep.name.as_str())
+                .unwrap();
+            assert!(
+                osv_affects(affected, &dep.version),
+                "{} {}",
+                dep.name,
+                dep.version
+            );
+            let o = Observation {
+                repo: "example-org/web".into(),
+                manifest: dep.manifest.clone(),
+                ecosystem: dep.ecosystem.clone(),
+                package: dep.name.clone(),
+                version: dep.version.clone(),
+                advisory: adv,
+                scope: dep.scope,
+                ..Default::default()
+            };
+            let (f, st, created) = apply(None, &o, Utc::now());
+            assert!(created);
+            findings.push((f, st));
+        }
+        let (l, _) = &findings[0];
+        assert!(l.advisory.ids.contains(&"CVE-2021-23337".to_string()));
+        assert_eq!(l.fixed_version.as_deref(), Some("4.17.21"));
+        assert!(
+            l.advisory
+                .cvss_vector
+                .as_deref()
+                .is_some_and(|v| v.starts_with("CVSS:3.1/")),
+            "OSV's vector is kept without a score"
+        );
+        let (a, _) = &findings[1];
+        assert_eq!(a.fixed_version.as_deref(), Some("0.21.2"));
+        assert_eq!(a.advisory.source, "osv");
+        // Not yet read for reachability: high, but never P0 on its own.
+        let cfg = SecurityConfig::default();
+        for (f, st) in findings.iter_mut() {
+            retier(f, st, &cfg);
+            assert_ne!(f.tier, Some(Tier::P0));
+            assert!(f.tier_provisional);
+        }
+    }
+
+    /// The live call, for a person to run: `cargo test -p common -- --ignored osv_live`.
+    #[tokio::test]
+    #[ignore]
+    async fn osv_live_matches_lodash_and_axios() {
+        let r: Value = reqwest::Client::new()
+            .post(format!("{OSV_API}/v1/querybatch"))
+            .json(&json!({"queries": [
+                {"package": {"name": "lodash", "ecosystem": "npm"}, "version": "4.17.20"},
+                {"package": {"name": "axios", "ecosystem": "npm"}, "version": "0.21.0"}]}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let has = |i: usize, id: &str| {
+            r["results"][i]["vulns"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v["id"] == id)
+        };
+        assert!(has(0, "GHSA-35jh-r3h4-6jhm") && has(1, "GHSA-cph5-m8f7-6c5x"));
+    }
+
+    #[test]
+    fn a_failed_sbom_read_says_why_in_plain_words() {
+        let off = sbom_failure(404, &json!({"message": "Not Found"}));
+        assert_eq!(off.state, "graph_off");
+        assert!(off.reason.contains("Settings, Code security"));
+        let slow = sbom_failure(500, &json!({"message": "Request timed out"}));
+        assert_eq!(slow.state, "error");
+        assert!(slow.reason.contains("500") && slow.reason.contains("timed out"));
+    }
+
+    // ── Groups ─────────────────────────────────────────────────────────
+
+    fn adv_finding(
+        id: &str,
+        pkg: &str,
+        ver: &str,
+        fixed: Option<&str>,
+        tier: Tier,
+        due: &str,
+    ) -> (Finding, FindingState) {
+        let mut f = finding(id);
+        f.package = pkg.into();
+        f.version = ver.into();
+        f.fixed_version = fixed.map(String::from);
+        f.advisory.primary = format!("GHSA-{id}");
+        f.advisory.ids = vec![format!("GHSA-{id}")];
+        f.tier = Some(tier);
+        f.due_at = due.into();
+        (f, FindingState::default())
+    }
+
+    /// One fix is one row: a package at one version with every advisory the
+    /// bump clears; the worst advisory sets the tier and the due date, and
+    /// the fix is the highest version any advisory needs.
+    #[test]
+    fn findings_group_by_package_version_with_the_worst_tier() {
+        let fs = vec![
+            adv_finding(
+                "a",
+                "tar",
+                "6.2.1",
+                Some("6.2.2"),
+                Tier::P2,
+                "2026-12-10T00:00:00Z",
+            ),
+            adv_finding(
+                "b",
+                "tar",
+                "6.2.1",
+                Some("7.5.21"),
+                Tier::P1,
+                "2026-11-17T00:00:00Z",
+            ),
+            adv_finding("c", "tar", "6.2.1", None, Tier::P3, "2027-02-08T00:00:00Z"),
+            adv_finding(
+                "d",
+                "qs",
+                "6.14.0",
+                Some("6.14.2"),
+                Tier::P3,
+                "2027-02-08T00:00:00Z",
+            ),
+        ];
+        let g = groups(&fs);
+        assert_eq!(g.len(), 2);
+        assert_eq!(g[0].package, "tar");
+        assert_eq!(g[0].tier, Some(Tier::P1));
+        assert_eq!(g[0].due_at, "2026-11-17T00:00:00Z");
+        assert_eq!(g[0].fixed_version.as_deref(), Some("7.5.21"));
+        assert_eq!(g[0].no_fix, 1);
+        assert_eq!(g[0].advisories.len(), 3);
+        assert_eq!(
+            g[0].advisories[0].tier,
+            Some(Tier::P1),
+            "worst advisory first"
+        );
+        let o = overview_counts(&fs, Utc::now());
+        assert_eq!(o["groups"]["open"], 2);
+        assert_eq!(o["groups"]["p1"], 1);
+        assert_eq!(o["counts"]["open"], 4, "advisories still counted second");
+    }
+
+    // ── Dependabot access ──────────────────────────────────────────────
+
+    #[test]
+    fn dependabot_access_tells_the_three_causes_apart() {
+        let not_accessible = json!({"message": "Resource not accessible by integration"});
+        let lacks = dependabot_access(403, &not_accessible, Some(false), true);
+        assert_eq!(lacks.state, "not_accepted");
+        assert!(lacks.reason.contains("hasn't accepted"));
+        let app = dependabot_access(403, &not_accessible, None, false);
+        assert_eq!(app.state, "no_permission");
+        assert!(app.reason.contains("Permissions and events"));
+        let off = dependabot_access(
+            403,
+            &json!({"message": "Dependabot alerts are disabled for this repository."}),
+            Some(true),
+            false,
+        );
+        assert_eq!(off.state, "off");
+        assert!(off.reason.contains("turned off for this repo"));
+        assert_eq!(
+            dependabot_access(200, &Value::Null, Some(true), false).state,
+            "on"
+        );
+        // The team shows the one that needs a person first.
+        let t = team_dependabot([&off, &lacks]).unwrap();
+        assert_eq!(t.state, "not_accepted");
+    }
+
+    // ── Triage without the model ───────────────────────────────────────
+
+    #[test]
+    fn triage_settles_without_the_model_where_it_can() {
+        let st = FindingState::default();
+        let mut f = finding("t");
+        f.scope = Scope::Dev;
+        assert_eq!(
+            settle_without_model(&f, &st, 5, 2, &[]).unwrap().0,
+            Verdict::NotLoaded
+        );
+        f.scope = Scope::Unknown;
+        let (v, e) = settle_without_model(&f, &st, 0, 0, &["undici".into()]).unwrap();
+        assert_eq!(v, Verdict::Unknown);
+        assert!(e.summary.contains("names no functions"), "{}", e.summary);
+        assert!(
+            settle_without_model(&f, &st, 3, 2, &["undici".into()]).is_none(),
+            "code names it: the model reads it"
+        );
+        assert_eq!(
+            unknown_reason("tar", 3, &[]),
+            "tar is imported in 3 files, but the advisory names no functions to look for."
+        );
+        // The same advisories and code lines give the same key; new code doesn't.
+        let a = finding("k");
+        let line = |t: &str| EvidenceLine {
+            file: "src/a.ts".into(),
+            line: 1,
+            text: t.into(),
+        };
+        assert_eq!(
+            group_triage_key(&[&a], &[line("import x")]),
+            group_triage_key(&[&a], &[line("import x")])
+        );
+        assert_ne!(
+            group_triage_key(&[&a], &[line("import x")]),
+            group_triage_key(&[&a], &[line("import y")])
+        );
+    }
+
+    // ── Daily limits ───────────────────────────────────────────────────
+
+    /// Two sweeps at once never start more runs than the day's limit: the
+    /// slot is taken atomically (a conditional ADD in DynamoDB).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sweeps_at_once_never_start_more_than_the_limit() {
+        let slots = std::sync::Arc::new(MemorySlots::default());
+        let cfg = std::sync::Arc::new(SecurityConfig::default());
+        let mut tasks = vec![];
+        for _ in 0..2 {
+            let (slots, cfg) = (slots.clone(), cfg.clone());
+            tasks.push(tokio::spawn(async move {
+                let mut started = 0;
+                for _ in 0..20 {
+                    if admit_run(slots.as_ref(), &cfg, "20261111", false).await == Admit::Start {
+                        started += 1;
+                    }
+                }
+                started
+            }));
+        }
+        let mut total = 0;
+        for t in tasks {
+            total += t.await.unwrap();
+        }
+        assert_eq!(total, MAX_FIX_RUNS_PER_DAY as usize);
+        // A new day starts again.
+        assert_eq!(
+            admit_run(slots.as_ref(), &cfg, "20261112", false).await,
+            Admit::Start
+        );
+        assert_eq!(
+            admit_run(slots.as_ref(), &cfg, "20261111", false).await,
+            Admit::Wait("Waiting: today's 3 fix runs are used. Next starts tomorrow.".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn the_token_limit_and_a_busy_repo_stop_new_runs() {
+        let slots = MemorySlots::default();
+        let cfg = SecurityConfig::default();
+        slots
+            .tokens
+            .lock()
+            .unwrap()
+            .insert("20261111".into(), MAX_FIX_TOKENS_PER_DAY);
+        let w = admit_run(&slots, &cfg, "20261111", false).await;
+        assert_eq!(w, Admit::Wait(waiting_tokens(MAX_FIX_TOKENS_PER_DAY)));
+        assert_eq!(
+            *slots.runs.lock().unwrap().get("20261111").unwrap_or(&0),
+            0,
+            "no slot taken"
+        );
+        assert_eq!(
+            admit_run(&slots, &cfg, "20261112", true).await,
+            Admit::Wait(WAITING_REPO.into())
+        );
+        let none = SecurityConfig {
+            max_fix_runs_per_day: 0,
+            ..Default::default()
+        };
+        assert!(matches!(
+            admit_run(&slots, &none, "20261113", false).await,
+            Admit::Wait(_)
+        ));
+        assert!(
+            !RunKind::Adopt.counts() && !RunKind::IssueOnly.counts() && RunKind::Run.counts(),
+            "adopting or an issue costs no run"
+        );
+    }
+
+    #[test]
+    fn p0_runs_first_then_the_soonest_due() {
+        let fs = vec![
+            adv_finding(
+                "p2",
+                "qs",
+                "6.14.0",
+                Some("6.14.2"),
+                Tier::P2,
+                "2026-11-12T00:00:00Z",
+            ),
+            adv_finding(
+                "p0",
+                "tar",
+                "6.2.1",
+                Some("7.5.21"),
+                Tier::P0,
+                "2026-11-14T00:00:00Z",
+            ),
+            adv_finding(
+                "p1",
+                "undici",
+                "6.19.2",
+                Some("6.21.1"),
+                Tier::P1,
+                "2026-11-13T00:00:00Z",
+            ),
+        ];
+        let mut units: Vec<FixUnit> = fs
+            .iter()
+            .map(|(f, _)| FixUnit {
+                finding_ids: vec![f.id.clone()],
+                key: f.id.clone(),
+                ..Default::default()
+            })
+            .collect();
+        order_units(&mut units, &fs);
+        let order: Vec<&str> = units.iter().map(|u| u.key.as_str()).collect();
+        assert_eq!(order, vec!["p0", "p1", "p2"]);
+    }
+
+    #[test]
+    fn cards_past_the_days_limit_go_into_one_digest() {
+        let fs: Vec<(Finding, FindingState)> = (0..14)
+            .map(|i| {
+                adv_finding(
+                    &format!("c{i}"),
+                    "pkg",
+                    &format!("1.0.{i}"),
+                    None,
+                    if i < 2 { Tier::P0 } else { Tier::P1 },
+                    "2026-11-17T00:00:00Z",
+                )
+            })
+            .collect();
+        let refs: Vec<&Finding> = fs.iter().rev().map(|(f, _)| f).collect();
+        let (now, later) = card_budget(refs, 0, MAX_CARDS_PER_DAY);
+        assert_eq!(now.len(), 10);
+        assert_eq!(later.len(), 4);
+        assert!(
+            now.iter().take(2).all(|f| f.tier == Some(Tier::P0)),
+            "P0 cards first"
+        );
+        let (now2, later2) =
+            card_budget(fs.iter().map(|(f, _)| f).collect(), 10, MAX_CARDS_PER_DAY);
+        assert!(now2.is_empty() && later2.len() == 14);
+        let d = digest_card(&later, "https://app.example.com/security", 10);
+        assert!(d.summary.contains("4 more findings"));
+    }
+
+    #[test]
+    fn the_policy_bounds_the_limits_and_defaults_to_opening_prs() {
+        let d = SecurityConfig::default();
+        assert!(!d.enabled, "off until a team turns it on");
+        assert!(!d.dry_run, "turned on, it opens fix PRs (recommended)");
+        assert_eq!(
+            (
+                d.max_fix_runs_per_day,
+                d.max_fix_tokens_per_day,
+                d.triage_tokens_per_day,
+                d.max_cards_per_day
+            ),
+            (3, 2_000_000, 400_000, 10)
+        );
+        assert!(SecurityConfig {
+            max_fix_runs_per_day: 21,
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
+        assert!(SecurityConfig {
+            max_fix_runs_per_day: 20,
+            ..Default::default()
+        }
+        .validate()
+        .is_ok());
+        assert!(SecurityConfig {
+            triage_tokens_per_day: MAX_TRIAGE_TOKENS_PER_DAY + 1,
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
+        // A config saved before the limits existed reads with the defaults.
+        let old = SecurityConfig::from_json(r#"{"enabled": true, "dry_run": false}"#).unwrap();
+        assert_eq!(old.max_fix_runs_per_day, 3);
+    }
+
+    #[test]
+    fn insights_count_opened_fixed_prs_and_spend_per_day() {
+        let now = DateTime::parse_from_rfc3339("2026-11-20T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut a = adv_finding(
+            "i1",
+            "tar",
+            "6.2.1",
+            Some("7.5.21"),
+            Tier::P1,
+            "2026-11-17T00:00:00Z",
+        );
+        a.0.first_seen_at = "2026-11-10T10:00:00Z".into();
+        a.0.status = Status::Fixed;
+        a.0.pr = Some(PrRef {
+            number: 7,
+            url: String::new(),
+            ci: None,
+            state: "merged".into(),
+            adopted: false,
+        });
+        a.1.pr_opened_at = Some("2026-11-10T12:00:00Z".into());
+        a.1.merged_at = Some("2026-11-11T10:00:00Z".into());
+        let mut b = adv_finding("i2", "qs", "6.14.0", None, Tier::P3, "2027-02-08T00:00:00Z");
+        b.0.first_seen_at = "2026-11-10T11:00:00Z".into();
+        let spend = BTreeMap::from([("2026-11-10".to_string(), 13_516u64)]);
+        let v = insights(&[a, b], &spend, now, 30);
+        let day = |d: &str| {
+            v["days"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|x| x["date"] == d)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(day("2026-11-10")["opened"], 2);
+        assert_eq!(day("2026-11-10")["prs_opened"], 1);
+        assert_eq!(day("2026-11-10")["tokens"], 13_516);
+        assert_eq!(day("2026-11-11")["fixed"], 1);
+        assert_eq!(day("2026-11-11")["prs_merged"], 1);
+        assert_eq!(v["median_hours_to_fix"]["P1"]["median_hours"], 24.0);
+        assert_eq!(v["totals"]["tokens_month"], 13_516);
+    }
+
+    /// A replay of stored findings (a DynamoDB query's JSON, with `finding`
+    /// and `state` strings) through today's tiering:
+    /// `SECFIX_REPLAY=findings.json cargo test -p common -- --ignored replay --nocapture`.
+    #[test]
+    #[ignore]
+    fn replay_stored_findings_through_the_tiers() {
+        let Ok(path) = std::env::var("SECFIX_REPLAY") else {
+            return;
+        };
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let mut fs: Vec<(Finding, FindingState)> = vec![];
+        for i in v["Items"].as_array().unwrap() {
+            let f: Finding = serde_json::from_str(i["finding"]["S"].as_str().unwrap()).unwrap();
+            let st: FindingState =
+                serde_json::from_str(i["state"]["S"].as_str().unwrap_or("{}")).unwrap_or_default();
+            fs.push((f, st));
+        }
+        let cfg = SecurityConfig::default();
+        let mut repos: Vec<String> = fs.iter().map(|(f, _)| f.repo.clone()).collect();
+        repos.sort();
+        repos.dedup();
+        for repo in repos {
+            let mut before: BTreeMap<String, usize> = BTreeMap::new();
+            let mut after: BTreeMap<String, usize> = BTreeMap::new();
+            let mut mine: Vec<(Finding, FindingState)> = vec![];
+            for (f, st) in fs.iter().filter(|(f, _)| f.repo == repo) {
+                *before
+                    .entry(f.tier.map(|t| t.as_str()).unwrap_or("-").to_string())
+                    .or_default() += 1;
+                let mut f2 = f.clone();
+                retier(&mut f2, st, &cfg);
+                *after
+                    .entry(f2.tier.map(|t| t.as_str()).unwrap_or("-").to_string())
+                    .or_default() += 1;
+                mine.push((f2, st.clone()));
+            }
+            let g = groups(&mine);
+            let mut gt: BTreeMap<String, usize> = BTreeMap::new();
+            for x in &g {
+                *gt.entry(x.tier.map(|t| t.as_str()).unwrap_or("-").to_string())
+                    .or_default() += 1;
+            }
+            println!(
+                "{repo}: advisories before {before:?} after {after:?}; groups {} {gt:?}",
+                g.len()
+            );
+        }
+    }
+
+    // ── Fix PRs a person asks for ──────────────────────────────────────
+
+    fn asked() -> Vec<(Finding, FindingState)> {
+        let mut v = vec![
+            adv_finding(
+                "t1",
+                "tar",
+                "6.2.1",
+                Some("6.2.2"),
+                Tier::P2,
+                "2026-12-10T00:00:00Z",
+            ),
+            adv_finding(
+                "t2",
+                "tar",
+                "6.2.1",
+                Some("7.5.21"),
+                Tier::P1,
+                "2026-11-17T00:00:00Z",
+            ),
+            adv_finding(
+                "t3",
+                "tar",
+                "6.2.1",
+                Some("6.2.2"),
+                Tier::P3,
+                "2027-02-08T00:00:00Z",
+            ),
+            adv_finding(
+                "p1",
+                "protobufjs",
+                "7.4.0",
+                Some("7.5.4"),
+                Tier::P2,
+                "2026-12-10T00:00:00Z",
+            ),
+            adv_finding("nf", "qs", "6.14.0", None, Tier::P3, "2027-02-08T00:00:00Z"),
+            adv_finding(
+                "pr",
+                "undici",
+                "6.19.2",
+                Some("6.21.1"),
+                Tier::P1,
+                "2026-11-17T00:00:00Z",
+            ),
+            adv_finding(
+                "dm",
+                "minimist",
+                "1.2.5",
+                Some("1.2.6"),
+                Tier::P3,
+                "2027-02-08T00:00:00Z",
+            ),
+        ];
+        v[5].0.pr = Some(PrRef {
+            number: 123,
+            url: "https://github.com/acme/web/pull/123".into(),
+            ci: Some("passing".into()),
+            state: "open".into(),
+            adopted: false,
+        });
+        v[5].0.status = Status::PrOpen;
+        v[6].0.status = Status::Dismissed;
+        v
+    }
+
+    fn ids(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Five advisories picked become two PRs: one per repository, package
+    /// and version, bumped to the version that clears them all.
+    #[test]
+    fn picked_findings_become_one_pr_per_package_version() {
+        let fs = asked();
+        let (units, skipped) = manual_units(
+            &fs,
+            &ids(&["t1", "t2", "t3", "p1"]),
+            &SecurityConfig::default(),
+            Utc::now(),
+        );
+        assert_eq!(units.len(), 2);
+        let tar = units.iter().find(|u| u.bumps[0].package == "tar").unwrap();
+        assert_eq!(tar.finding_ids, ids(&["t1", "t2", "t3"]));
+        assert_eq!(
+            tar.bumps[0].to, "7.5.21",
+            "the version that clears every advisory"
+        );
+        assert_eq!(tar.key, "tar@7.5.21");
+        assert!(tar.ticket.starts_with(TICKET_PREFIX));
+        assert!(skipped.is_empty());
+    }
+
+    /// An open PR is linked instead of a new one; no fix, dismissed and fixed
+    /// are skipped with the reason.
+    #[test]
+    fn picked_findings_that_cant_get_a_pr_are_skipped_with_why() {
+        let fs = asked();
+        let (units, skipped) = manual_units(
+            &fs,
+            &ids(&["pr", "nf", "dm", "gone"]),
+            &SecurityConfig::default(),
+            Utc::now(),
+        );
+        assert!(units.is_empty());
+        assert_eq!(
+            skipped,
+            vec![
+                Skipped {
+                    finding_id: "pr".into(),
+                    reason: "already has an open PR".into(),
+                    pr_url: Some("https://github.com/acme/web/pull/123".into())
+                },
+                Skipped {
+                    finding_id: "nf".into(),
+                    reason: "no fixed version".into(),
+                    pr_url: None
+                },
+                Skipped {
+                    finding_id: "dm".into(),
+                    reason: "dismissed".into(),
+                    pr_url: None
+                },
+                Skipped {
+                    finding_id: "gone".into(),
+                    reason: "not found".into(),
+                    pr_url: None
+                },
+            ]
+        );
+    }
+
+    /// A person's request starts even in a dry run, within the day's limit:
+    /// past it the units are queued with the reason, unless an admin raised
+    /// today's limit for the request.
+    #[tokio::test]
+    async fn a_request_bypasses_dry_run_but_not_the_limit() {
+        let fs: Vec<(Finding, FindingState)> = ["a", "b", "c", "d"]
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let mut f = adv_finding(
+                    p,
+                    p,
+                    "1.0.0",
+                    Some("1.0.1"),
+                    Tier::P2,
+                    "2026-12-10T00:00:00Z",
+                );
+                f.0.repo = format!("acme/r{i}");
+                f
+            })
+            .collect();
+        let cfg = SecurityConfig {
+            enabled: true,
+            dry_run: true,
+            ..Default::default()
+        };
+        let all = ids(&["a", "b", "c", "d"]);
+        let slots = MemorySlots::default();
+        let (mut units, _) = manual_units(&fs, &all, &cfg, Utc::now());
+        let (started, queued) =
+            admit_request(&slots, &cfg, "20261111", &mut units, &fs, false).await;
+        assert_eq!(started.len(), 3, "dry run doesn't hold an explicit request");
+        assert_eq!(queued.len(), 1);
+        assert_eq!(
+            queued[0].reason.as_deref(),
+            Some("Waiting: today's 3 fix runs are used. Next starts tomorrow.")
+        );
+        // Raised for this request: it starts, past the limit.
+        let (mut again, _) = manual_units(&fs, &ids(&["d"]), &cfg, Utc::now());
+        let (started, queued) =
+            admit_request(&slots, &cfg, "20261111", &mut again, &fs, true).await;
+        assert_eq!((started.len(), queued.len()), (1, 0));
+        assert_eq!(*slots.runs.lock().unwrap().get("20261111").unwrap(), 4);
+        // The automatic path still respects dry run.
+        assert!(!cfg.acts());
+    }
+
+    /// One run per repository at a time, even for a request.
+    #[tokio::test]
+    async fn a_request_waits_for_a_repo_with_a_run_in_progress() {
+        let mut fs = asked();
+        fs[3].0.status = Status::Fixing;
+        fs[3].0.package = "other".into();
+        let (mut units, _) =
+            manual_units(&fs, &ids(&["t2"]), &SecurityConfig::default(), Utc::now());
+        let (started, queued) = admit_request(
+            &MemorySlots::default(),
+            &SecurityConfig::default(),
+            "20261111",
+            &mut units,
+            &fs,
+            true,
+        )
+        .await;
+        assert!(started.is_empty());
+        assert_eq!(queued[0].reason.as_deref(), Some(WAITING_REPO));
     }
 }

@@ -34,8 +34,8 @@ use std::time::Instant;
 use aws_sdk_dynamodb::types::AttributeValue;
 use chrono::{Duration, Utc};
 use common::security_fixes::{
-    self as sec, Dep, Evidence, EvidenceLine, Finding, FindingState, FixUnit, Observation, Scope,
-    SecurityConfig, Stage, Status, Verdict,
+    self as sec, DailySlots, Dep, Evidence, EvidenceLine, Finding, FindingState, FixUnit,
+    Observation, Scope, SecurityConfig, Stage, Status, Verdict,
 };
 use serde_json::{json, Value};
 use tracing::{info, warn};
@@ -50,14 +50,21 @@ type Item = HashMap<String, AttributeValue>;
 
 /// Time one tick may spend on security work.
 const TICK_BUDGET_SECS: u64 = 300;
-/// Findings triaged per team per tick.
+/// Model calls triage makes per team per tick (one call reads one package
+/// at one version, with every advisory it has).
 const TRIAGE_PER_TICK: usize = 6;
-/// Model tokens triage may spend per team per day.
-const TRIAGE_TOKENS_PER_DAY: u64 = 400_000;
+/// Groups whose code is searched per tick: those that settle without the
+/// model (or reuse an earlier verdict) cost no tokens.
+const TRIAGE_SEARCH_PER_TICK: usize = 40;
 /// Characters of evidence one triage question carries.
 const TRIAGE_MAX_CHARS: usize = 12_000;
-/// OSV records read per repository sync.
-const OSV_HYDRATE_MAX: usize = 300;
+/// OSV records read per sync (shared by every repository in the tick).
+const OSV_HYDRATE_MAX: usize = 1_500;
+/// OSV records read at once.
+const OSV_PARALLEL: usize = 8;
+/// Bytes of dependency list kept per repository (DynamoDB items stop at
+/// 400 KB). Matching always uses the whole list.
+const MAX_DEPS_BYTES: usize = 340_000;
 /// Findings read per team.
 const MAX_FINDINGS: usize = 5_000;
 /// Dependencies kept per repository.
@@ -187,24 +194,94 @@ async fn load_deps(state: &WorkerState, team_id: &str, repo: &str) -> Option<(Ve
     Some((deps, s(i, "updated_at")))
 }
 
-async fn save_deps(state: &WorkerState, team_id: &str, repo: &str, deps: &[Dep]) {
-    let Ok(text) = serde_json::to_string(&deps[..deps.len().min(MAX_DEPS)]) else {
-        return;
-    };
+/// The dependency list kept for a repository: whole, or cut to fit an item.
+fn deps_to_keep(deps: &[Dep]) -> (String, usize) {
+    let mut n = deps.len().min(MAX_DEPS);
+    loop {
+        let text = serde_json::to_string(&deps[..n]).unwrap_or_else(|_| "[]".into());
+        if text.len() <= MAX_DEPS_BYTES || n == 0 {
+            return (text, n);
+        }
+        n = n * 9 / 10;
+    }
+}
+
+async fn save_deps(
+    state: &WorkerState,
+    team_id: &str,
+    repo: &str,
+    deps: &[Dep],
+    status: &sec::InventoryStatus,
+    unpinned: usize,
+) {
+    let (text, kept) = deps_to_keep(deps);
+    if kept < deps.len() {
+        warn!(
+            team_id,
+            repo,
+            total = deps.len(),
+            kept,
+            "security: the dependency list was cut to fit one record"
+        );
+    }
+    let ecos = serde_json::to_string(&sec::ecosystems(deps)).unwrap_or_default();
     if let Err(e) = state
         .dynamo
-        .put_item()
+        .update_item()
         .table_name(&state.config.settings_table_name)
-        .item("pk", attr_s(team_id))
-        .item("sk", attr_s(&sec::deps_sk(repo)))
-        .item("repo", attr_s(repo))
-        .item("deps", attr_s(&text))
-        .item("count", attr_n(deps.len()))
-        .item("updated_at", attr_s(&Utc::now().to_rfc3339()))
+        .key("pk", attr_s(team_id))
+        .key("sk", attr_s(&sec::deps_sk(repo)))
+        .update_expression(
+            "SET #repo = :r, deps = :d, #count = :c, kept = :k, ecosystems = :e, unpinned = :u, \
+             inventory_state = :s, inventory_reason = :why, updated_at = :t, read_at = :t",
+        )
+        .expression_attribute_names("#repo", "repo")
+        .expression_attribute_names("#count", "count")
+        .expression_attribute_values(":r", attr_s(repo))
+        .expression_attribute_values(":d", attr_s(&text))
+        .expression_attribute_values(":c", attr_n(deps.len()))
+        .expression_attribute_values(":k", attr_n(kept))
+        .expression_attribute_values(":e", attr_s(&ecos))
+        .expression_attribute_values(":u", attr_n(unpinned))
+        .expression_attribute_values(":s", attr_s(&status.state))
+        .expression_attribute_values(":why", attr_s(&status.reason))
+        .expression_attribute_values(":t", attr_s(&Utc::now().to_rfc3339()))
         .send()
         .await
     {
         warn!(team_id, repo, error = %aws_sdk_dynamodb::error::DisplayErrorContext(&e), "security: could not save the dependency list");
+    }
+}
+
+/// Sets fields of a repository's dependency record (its read state, its
+/// Dependabot access) without touching the list.
+async fn set_repo_fields(
+    state: &WorkerState,
+    team_id: &str,
+    repo: &str,
+    fields: &[(&str, AttributeValue)],
+) {
+    let mut expr = vec!["#repo = :repo".to_string()];
+    let mut req = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(team_id))
+        .key("sk", attr_s(&sec::deps_sk(repo)))
+        .expression_attribute_names("#repo", "repo")
+        .expression_attribute_values(":repo", attr_s(repo));
+    for (i, (k, v)) in fields.iter().enumerate() {
+        expr.push(format!("#k{i} = :v{i}"));
+        req = req
+            .expression_attribute_names(format!("#k{i}"), *k)
+            .expression_attribute_values(format!(":v{i}"), v.clone());
+    }
+    if let Err(e) = req
+        .update_expression(format!("SET {}", expr.join(", ")))
+        .send()
+        .await
+    {
+        warn!(team_id, repo, error = %e, "security: could not save the repository's state");
     }
 }
 
@@ -311,17 +388,31 @@ async fn refresh_inventory(
 ) -> Result<Vec<Dep>, Error> {
     let (owner, name) = repo.split_once('/').ok_or("bad repo")?;
     let mut deps: Vec<Dep> = vec![];
-    let (code, sbom) = gh
+    let mut unpinned = 0;
+    let status = match gh
         .get_status(&format!("/repos/{owner}/{name}/dependency-graph/sbom"))
-        .await?;
-    if code < 300 {
-        deps = sec::deps_from_sbom(&sbom);
-    } else {
-        info!(
-            team_id,
-            repo, code, "security: no dependency graph SBOM (graph off or empty)"
-        );
-    }
+        .await
+    {
+        Ok((code, sbom)) if code < 300 => {
+            (deps, unpinned) = sec::inventory_from_sbom(&sbom);
+            sec::InventoryStatus {
+                state: "ok".into(),
+                reason: String::new(),
+            }
+        }
+        Ok((code, body)) => {
+            let s = sec::sbom_failure(code, &body);
+            info!(team_id, repo, code, reason = %s.reason, "security: no dependency graph SBOM");
+            s
+        }
+        Err(e) => {
+            warn!(team_id, repo, error = %e, "security: the dependency graph SBOM could not be read");
+            sec::InventoryStatus {
+                state: "error".into(),
+                reason: "GitHub didn't answer for the dependency list; it is tried again on the next check.".into(),
+            }
+        }
+    };
     let branch = gh.get_default_branch(owner, name).await?;
     let tree = gh
         .get_status(&format!(
@@ -376,7 +467,7 @@ async fn refresh_inventory(
             }
         }
     }
-    save_deps(state, team_id, repo, &deps).await;
+    save_deps(state, team_id, repo, &deps, &status, unpinned).await;
     Ok(deps)
 }
 
@@ -518,97 +609,190 @@ fn fill_version(o: &mut Observation, deps: &[Dep]) {
 
 // ── Sources ─────────────────────────────────────────────────────────────
 
-/// Dependabot's open alerts for a repository, and what access says.
-async fn dependabot_alerts(gh: &GitHubClient, repo: &str) -> (Vec<Value>, &'static str) {
+/// Dependabot's open alerts for a repository (`pages` of 100 at most), and
+/// what access says, in plain words.
+async fn dependabot_alerts(
+    gh: &GitHubClient,
+    repo: &str,
+    pages: u32,
+) -> (Vec<Value>, sec::DependabotAccess) {
     let mut out = vec![];
-    for page in 1..=5 {
-        let path = format!("/repos/{repo}/dependabot/alerts?state=open&per_page=100&page={page}");
+    let per_page = if pages == 0 { 1 } else { 100 };
+    for page in 1..=pages.max(1) {
+        let path =
+            format!("/repos/{repo}/dependabot/alerts?state=open&per_page={per_page}&page={page}");
         let (code, body) = match gh.get_status(&path).await {
             Ok(r) => r,
-            Err(_) => return (out, "on"),
+            Err(_) => return (out, sec::dependabot_access(599, &Value::Null, None, false)),
         };
-        match code {
-            200..=299 => {
-                let items = body.as_array().cloned().unwrap_or_default();
-                let n = items.len();
-                out.extend(items);
-                if n < 100 {
-                    break;
-                }
+        if !(200..300).contains(&code) {
+            let p = gh.permission_state("vulnerability_alerts").await;
+            let mut access = sec::dependabot_access(code, &body, p.token_has, p.installation_lacks);
+            if p.broker_unaware && access.state != "off" {
+                access = sec::DependabotAccess {
+                    state: "no_permission".into(),
+                    reason: "CoderHelm's hosted token service doesn't pass Dependabot alerts to this install yet; it does from its next release, with nothing to change here.".into(),
+                };
             }
-            403 => {
-                let msg = body["message"].as_str().unwrap_or("").to_ascii_lowercase();
-                return (
-                    vec![],
-                    if msg.contains("disabled") {
-                        "off"
-                    } else {
-                        "no_permission"
-                    },
-                );
-            }
-            404 => return (vec![], "off"),
-            _ => break,
+            return (vec![], access);
+        }
+        let items = body.as_array().cloned().unwrap_or_default();
+        let n = items.len();
+        out.extend(items);
+        if n < 100 || pages == 0 {
+            break;
         }
     }
-    (out, "on")
+    (
+        out,
+        sec::dependabot_access(200, &Value::Null, Some(true), false),
+    )
 }
 
-/// OSV's records for a repository's dependencies, as observations.
-async fn osv_observations(state: &WorkerState, repo: &str, deps: &[Dep]) -> Vec<Observation> {
-    let lookup: Vec<&Dep> = deps.iter().filter(|d| d.ecosystem != "docker").collect();
-    let mut hits: Vec<(usize, String)> = vec![];
-    for (chunk_i, chunk) in lookup.chunks(500).enumerate() {
-        let owned: Vec<Dep> = chunk.iter().map(|d| (*d).clone()).collect();
-        let body = json!({ "queries": sec::osv_queries(&owned) });
+/// Saves what reading Dependabot said, for the repository and the team.
+async fn record_dependabot(cx: &Ctx<'_>, repo: &str, access: &sec::DependabotAccess) {
+    let now = Utc::now().to_rfc3339();
+    set_repo_fields(
+        cx.state,
+        cx.team_id,
+        repo,
+        &[
+            ("dependabot", attr_s(&access.state)),
+            ("dependabot_reason", attr_s(&access.reason)),
+            ("dependabot_checked_at", attr_s(&now)),
+        ],
+    )
+    .await;
+    set_team_state(
+        cx.state,
+        cx.team_id,
+        &[
+            ("dependabot", attr_s(&access.state)),
+            ("dependabot_reason", attr_s(&access.reason)),
+            ("dependabot_checked_at", attr_s(&now)),
+            (
+                "permission_missing",
+                AttributeValue::Bool(matches!(
+                    access.state.as_str(),
+                    "no_permission" | "not_accepted"
+                )),
+            ),
+        ],
+    )
+    .await;
+}
+
+/// OSV's matches for some packages: `(index, vulnerability id)`, following
+/// each result's `next_page_token` (a package with many records).
+async fn osv_query(
+    state: &WorkerState,
+    queries: Vec<Value>,
+) -> Result<Vec<(usize, String)>, String> {
+    let mut hits = vec![];
+    let mut pending: Vec<(usize, Value)> = queries.into_iter().enumerate().collect();
+    for _ in 0..10 {
+        if pending.is_empty() {
+            break;
+        }
+        let body = json!({ "queries": pending.iter().map(|(_, q)| q.clone()).collect::<Vec<_>>() });
         let resp = state
             .http
             .post(format!("{}/v1/querybatch", sec::OSV_API))
             .json(&body)
             .timeout(std::time::Duration::from_secs(30))
             .send()
-            .await;
-        let Ok(resp) = resp else {
-            warn!(repo, "security: OSV didn't answer");
-            return vec![];
-        };
-        let Ok(v) = resp.json::<Value>().await else {
-            return vec![];
-        };
-        for (i, r) in v["results"].as_array().into_iter().flatten().enumerate() {
+            .await
+            .map_err(|e| format!("OSV didn't answer ({})", e.without_url()))?;
+        let code = resp.status().as_u16();
+        if !(200..300).contains(&code) {
+            return Err(format!("OSV answered {code}"));
+        }
+        let v = resp
+            .json::<Value>()
+            .await
+            .map_err(|_| "OSV's answer couldn't be read".to_string())?;
+        let results = v["results"].as_array().cloned().unwrap_or_default();
+        if results.len() != pending.len() {
+            return Err("OSV's answer didn't match the question".into());
+        }
+        let mut next = vec![];
+        for ((i, q), r) in pending.into_iter().zip(results) {
             for vuln in r["vulns"].as_array().into_iter().flatten() {
                 if let Some(id) = vuln["id"].as_str() {
-                    hits.push((chunk_i * 500 + i, id.to_string()));
+                    hits.push((i, id.to_string()));
                 }
             }
+            if let Some(tok) = r["next_page_token"].as_str().filter(|t| !t.is_empty()) {
+                let mut q = q;
+                q["page_token"] = json!(tok);
+                next.push((i, q));
+            }
+        }
+        pending = next;
+    }
+    Ok(hits)
+}
+
+/// OSV's records for a repository's dependencies, as observations. `cache`
+/// holds the records read this tick (repositories share packages).
+async fn osv_observations(
+    state: &WorkerState,
+    repo: &str,
+    deps: &[Dep],
+    cache: &mut HashMap<String, Value>,
+) -> Result<Vec<Observation>, String> {
+    use futures::StreamExt;
+    let lookup: Vec<&Dep> = deps.iter().filter(|d| d.ecosystem != "docker").collect();
+    let mut hits: Vec<(usize, String)> = vec![];
+    for (chunk_i, chunk) in lookup.chunks(500).enumerate() {
+        let owned: Vec<Dep> = chunk.iter().map(|d| (*d).clone()).collect();
+        for (i, id) in osv_query(state, sec::osv_queries(&owned)).await? {
+            hits.push((chunk_i * 500 + i, id));
         }
     }
-    let ids: Vec<String> = {
-        let mut seen = HashSet::new();
-        hits.iter()
-            .filter(|(_, id)| seen.insert(id.clone()))
-            .map(|(_, id)| id.clone())
-            .take(OSV_HYDRATE_MAX)
+    let mut seen = HashSet::new();
+    let wanted: Vec<String> = hits
+        .iter()
+        .filter(|(_, id)| seen.insert(id.clone()))
+        .map(|(_, id)| id.clone())
+        .filter(|id| !cache.contains_key(id))
+        .collect();
+    let room = OSV_HYDRATE_MAX.saturating_sub(cache.len());
+    if wanted.len() > room {
+        warn!(
+            repo,
+            wanted = wanted.len(),
+            room,
+            "security: more OSV records than one sync reads; the rest are read on the next sync"
+        );
+    }
+    let fetched: Vec<(String, Option<Value>)> =
+        futures::stream::iter(wanted.into_iter().take(room))
+            .map(|id| async move {
+                let url = format!("{}/v1/vulns/{}", sec::OSV_API, urlencoding::encode(&id));
+                let v = match state
+                    .http
+                    .get(url)
+                    .timeout(std::time::Duration::from_secs(20))
+                    .send()
+                    .await
+                {
+                    Ok(r) if r.status().is_success() => r.json::<Value>().await.ok(),
+                    _ => None,
+                };
+                (id, v)
+            })
+            .buffer_unordered(OSV_PARALLEL)
             .collect()
-    };
-    let mut records: HashMap<String, Value> = HashMap::new();
-    for id in ids {
-        let url = format!("{}/v1/vulns/{}", sec::OSV_API, urlencoding::encode(&id));
-        if let Ok(r) = state
-            .http
-            .get(url)
-            .timeout(std::time::Duration::from_secs(20))
-            .send()
-            .await
-        {
-            if let Ok(v) = r.json::<Value>().await {
-                records.insert(id, v);
-            }
+            .await;
+    for (id, v) in fetched {
+        if let Some(v) = v {
+            cache.insert(id, v);
         }
     }
     let mut out = vec![];
     for (i, id) in hits {
-        let (Some(d), Some(v)) = (lookup.get(i), records.get(&id)) else {
+        let (Some(d), Some(v)) = (lookup.get(i), cache.get(&id)) else {
             continue;
         };
         let Some(adv) = sec::advisory_from_osv(v, &d.ecosystem, &d.name) else {
@@ -625,7 +809,7 @@ async fn osv_observations(state: &WorkerState, repo: &str, deps: &[Dep]) -> Vec<
             ..Default::default()
         });
     }
-    out
+    Ok(out)
 }
 
 /// The CISA list, read once a day for everyone.
@@ -661,6 +845,7 @@ async fn kev(state: &WorkerState) -> BTreeMap<String, String> {
                     .item("pk", attr_s(sec::GLOBAL_PK))
                     .item("sk", attr_s(sec::KEV_SK))
                     .item("map", attr_s(&text))
+                    .item("count", attr_n(map.len()))
                     .item("synced_at", attr_s(&Utc::now().to_rfc3339()))
                     .send()
                     .await;
@@ -719,27 +904,26 @@ fn triage_key(f: &Finding) -> String {
 }
 
 /// The code lines that mention the search terms: code search for the
-/// files, then each file read for its line numbers.
-async fn code_hits(gh: &GitHubClient, repo: &str, terms: &[String]) -> (Vec<EvidenceLine>, usize) {
-    let Some((owner, name)) = repo.split_once('/') else {
-        return (vec![], 0);
-    };
-    let Ok(branch) = gh.get_default_branch(owner, name).await else {
-        return (vec![], 0);
-    };
+/// files, then each file read for its line numbers. Also the number of
+/// files that matched. An error when a search failed (then nothing can be
+/// concluded from "no matches").
+async fn code_hits(
+    gh: &GitHubClient,
+    repo: &str,
+    terms: &[String],
+) -> Result<(Vec<EvidenceLine>, usize), Error> {
+    let (owner, name) = repo.split_once('/').ok_or("bad repo")?;
+    let branch = gh.get_default_branch(owner, name).await?;
     let mut files: Vec<(String, String)> = vec![];
-    let mut searched = 0;
     for t in terms {
-        searched += 1;
         let q = format!("\"{t}\"");
-        if let Ok(results) = gh.search_code(owner, name, &branch, &q).await {
-            for r in results.into_iter().take(4) {
-                if is_lockfile_or_manifest(&r.path) {
-                    continue;
-                }
-                if !files.iter().any(|(p, _)| *p == r.path) {
-                    files.push((r.path, t.clone()));
-                }
+        let results = gh.search_code(owner, name, &branch, &q).await?;
+        for r in results.into_iter().take(4) {
+            if is_lockfile_or_manifest(&r.path) {
+                continue;
+            }
+            if !files.iter().any(|(p, _)| *p == r.path) {
+                files.push((r.path, t.clone()));
             }
         }
     }
@@ -756,20 +940,21 @@ async fn code_hits(gh: &GitHubClient, repo: &str, terms: &[String]) -> (Vec<Evid
                     text: common::truncate_str(line.trim(), 240).to_string(),
                 });
                 if out.len() >= 30 {
-                    return (out, searched);
+                    return Ok((out, files.len()));
                 }
             }
         }
     }
-    (out, searched)
+    Ok((out, files.len()))
 }
 
 fn is_lockfile_or_manifest(path: &str) -> bool {
     sec::is_dependency_file(path) || path.ends_with(".lock") || path.ends_with(".sum")
 }
 
-/// Today's triage tokens for the team; adds `add` and returns the total.
-async fn triage_tokens(state: &WorkerState, team_id: &str, add: u64) -> u64 {
+/// Today's triage spend for the team: adds `add` tokens and `packages`
+/// packages checked, and returns today's tokens. Kept 400 days (Analytics).
+async fn triage_tokens(state: &WorkerState, team_id: &str, add: u64, packages: u64) -> u64 {
     let day = Utc::now().format("%Y%m%d").to_string();
     let r = state
         .dynamo
@@ -777,10 +962,11 @@ async fn triage_tokens(state: &WorkerState, team_id: &str, add: u64) -> u64 {
         .table_name(&state.config.settings_table_name)
         .key("pk", attr_s(team_id))
         .key("sk", attr_s(&format!("SECTRIAGE#{day}")))
-        .update_expression("ADD tokens :n SET #ttl = :ttl")
+        .update_expression("ADD tokens :n, packages :p SET #ttl = :ttl")
         .expression_attribute_names("#ttl", "ttl")
         .expression_attribute_values(":n", attr_n(add))
-        .expression_attribute_values(":ttl", attr_n(Utc::now().timestamp() + 3 * 86_400))
+        .expression_attribute_values(":p", attr_n(packages))
+        .expression_attribute_values(":ttl", attr_n(Utc::now().timestamp() + 400 * 86_400))
         .return_values(aws_sdk_dynamodb::types::ReturnValue::UpdatedNew)
         .send()
         .await;
@@ -790,85 +976,235 @@ async fn triage_tokens(state: &WorkerState, team_id: &str, add: u64) -> u64 {
         .unwrap_or(u64::MAX)
 }
 
-/// Works out one finding's verdict. Dev-only needs no agent.
-async fn triage(
-    state: &WorkerState,
-    team_id: &str,
-    gh: &GitHubClient,
-    f: &mut Finding,
-    st: &mut FindingState,
-) {
-    st.triaged = Some(triage_key(f));
-    if f.scope == Scope::Dev {
-        f.verdict = Verdict::NotLoaded;
-        f.evidence = Some(Evidence {
-            summary: "A development dependency only (the lockfile or Dependabot says so), so it isn't loaded at runtime.".into(),
-            lines: vec![],
-            checked: "The dependency's scope.".into(),
-            confidence: "high".into(),
-        });
-        return;
+/// How one group's triage went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Triaged {
+    /// The same advisories and the same code lines as last time: that verdict.
+    Reused,
+    /// Settled without the model (dev only, withdrawn, no code names it).
+    Settled,
+    /// One model call.
+    Model,
+    /// No model call left this tick, or today's limit is used.
+    Waiting,
+    /// The search or the model failed; tried again next tick.
+    Failed,
+}
+
+fn group_verdict_sk(group_key: &str) -> String {
+    format!("SECGROUPV#{}", common::content_hash(group_key))
+}
+
+async fn load_group_verdict(cx: &Ctx<'_>, gk: &str, key: &str) -> Option<(Verdict, Evidence)> {
+    let i = cx
+        .state
+        .dynamo
+        .get_item()
+        .table_name(&cx.state.config.settings_table_name)
+        .key("pk", attr_s(cx.team_id))
+        .key("sk", attr_s(&group_verdict_sk(gk)))
+        .send()
+        .await
+        .ok()?
+        .item()
+        .cloned()?;
+    if s(&i, "key") != key {
+        return None;
     }
-    let terms = sec::search_terms(f, st);
-    let (hits, searched) = code_hits(gh, &f.repo, &terms).await;
-    let mut checked = format!(
-        "Searched the code for {} ({} searches), {} matching lines.",
+    Some((
+        serde_json::from_str(&s(&i, "verdict")).ok()?,
+        serde_json::from_str(&s(&i, "evidence")).ok()?,
+    ))
+}
+
+async fn save_group_verdict(cx: &Ctx<'_>, gk: &str, key: &str, v: Verdict, e: &Evidence) {
+    let _ = cx
+        .state
+        .dynamo
+        .put_item()
+        .table_name(&cx.state.config.settings_table_name)
+        .item("pk", attr_s(cx.team_id))
+        .item("sk", attr_s(&group_verdict_sk(gk)))
+        .item("key", attr_s(key))
+        .item(
+            "verdict",
+            attr_s(&serde_json::to_string(&v).unwrap_or_default()),
+        )
+        .item(
+            "evidence",
+            attr_s(&serde_json::to_string(e).unwrap_or_default()),
+        )
+        .item("checked_at", attr_s(&Utc::now().to_rfc3339()))
+        .item("ttl", attr_n(Utc::now().timestamp() + 90 * 86_400))
+        .send()
+        .await;
+}
+
+/// Gives every member of a group the verdict, saves them and notes it.
+async fn apply_verdict(
+    cx: &Ctx<'_>,
+    findings: &mut [(Finding, FindingState)],
+    idxs: &[usize],
+    v: Verdict,
+    e: &Evidence,
+) {
+    for i in idxs {
+        let (f, st) = &mut findings[*i];
+        let changed = f.verdict != v;
+        f.verdict = v;
+        f.evidence = Some(e.clone());
+        f.waiting = None;
+        st.triaged = Some(triage_key(f));
+        sec::retier(f, st, cx.cfg);
+        f.updated_at = Utc::now().to_rfc3339();
+        save_finding(cx.state, cx.team_id, f, st).await;
+        if changed {
+            add_event(
+                cx.state,
+                cx.team_id,
+                &f.id,
+                &format!("Verdict: {}", verdict_word(v)),
+                None,
+            )
+            .await;
+        }
+    }
+}
+
+/// Marks a group's members as waiting for tomorrow's check.
+async fn mark_waiting(
+    cx: &Ctx<'_>,
+    findings: &mut [(Finding, FindingState)],
+    idxs: &[usize],
+    why: &str,
+) {
+    for i in idxs {
+        let (f, st) = &mut findings[*i];
+        if f.waiting.as_deref() == Some(why) {
+            continue;
+        }
+        f.waiting = Some(why.to_string());
+        st.triaged = None;
+        save_finding(cx.state, cx.team_id, f, st).await;
+    }
+}
+
+/// Works out one group's verdict (a package at one version, every advisory
+/// it has): one code search, then an earlier verdict for the same code, a
+/// verdict without the model, or one model call for the whole group.
+async fn triage_group(
+    cx: &Ctx<'_>,
+    findings: &mut [(Finding, FindingState)],
+    idxs: &[usize],
+    calls_left: usize,
+) -> Triaged {
+    let Some(&lead_i) = idxs.iter().min_by_key(|i| findings[**i].0.tier) else {
+        return Triaged::Failed;
+    };
+    let lead = findings[lead_i].0.clone();
+    let gk = sec::group_key(&lead);
+    // What every member's advisories name, together.
+    let mut st_all = findings[lead_i].1.clone();
+    for i in idxs {
+        for sym in &findings[*i].1.symbols {
+            if !st_all.symbols.contains(sym) {
+                st_all.symbols.push(sym.clone());
+            }
+        }
+    }
+    if lead.scope == Scope::Dev {
+        if let Some((v, e)) = sec::settle_without_model(&lead, &st_all, 1, 1, &[]) {
+            apply_verdict(cx, findings, idxs, v, &e).await;
+            return Triaged::Settled;
+        }
+    }
+    let mut terms: Vec<String> = vec![];
+    for i in idxs {
+        for t in sec::search_terms(&findings[*i].0, &findings[*i].1) {
+            if !terms.contains(&t) {
+                terms.push(t);
+            }
+        }
+    }
+    terms.truncate(6);
+    let (hits, files) = match code_hits(&cx.gh, &lead.repo, &terms).await {
+        Ok(h) => h,
+        Err(e) => {
+            warn!(team_id = cx.team_id, repo = %lead.repo, error = %e, "security: the code search failed; triage is tried again next tick");
+            return Triaged::Failed;
+        }
+    };
+    let members: Vec<&Finding> = idxs.iter().map(|i| &findings[*i].0).collect();
+    let key = sec::group_triage_key(&members, &hits);
+    if let Some((v, e)) = load_group_verdict(cx, &gk, &key).await {
+        apply_verdict(cx, findings, idxs, v, &e).await;
+        return Triaged::Reused;
+    }
+    if let Some((v, e)) = sec::settle_without_model(&lead, &st_all, hits.len(), files, &terms) {
+        save_group_verdict(cx, &gk, &key, v, &e).await;
+        apply_verdict(cx, findings, idxs, v, &e).await;
+        return Triaged::Settled;
+    }
+    if calls_left == 0 {
+        return Triaged::Waiting;
+    }
+    let checked = format!(
+        "Searched the code for {}: {} file{}, {} matching line{}.",
         terms
             .iter()
             .map(|t| format!("`{t}`"))
             .collect::<Vec<_>>()
             .join(", "),
-        searched,
-        hits.len()
+        files,
+        if files == 1 { "" } else { "s" },
+        hits.len(),
+        if hits.len() == 1 { "" } else { "s" }
     );
-    if f.ecosystem == "Go" {
-        checked.push_str(
-            " govulncheck isn't available here, so the advisory's symbols were searched instead.",
-        );
-    }
-    if let Some(why) = super::check_budget_exceeded(state, team_id).await {
-        f.verdict = Verdict::Unknown;
-        f.evidence = Some(Evidence {
+    if let Some(why) = super::check_budget_exceeded(cx.state, cx.team_id).await {
+        let e = Evidence {
             summary: format!("Not read by the agent: {why}."),
             lines: hits.into_iter().take(5).collect(),
             checked,
             confidence: "low".into(),
-        });
-        // Read again once the team has budget.
-        st.triaged = None;
-        return;
+        };
+        mark_waiting(cx, findings, idxs, &e.summary).await;
+        return Triaged::Waiting;
     }
-    if triage_tokens(state, team_id, 0).await >= TRIAGE_TOKENS_PER_DAY {
-        f.verdict = Verdict::Unknown;
-        f.evidence = Some(Evidence {
-            summary: "Not read by the agent: today's triage budget is used up. It is read again tomorrow.".into(),
-            lines: hits.into_iter().take(5).collect(),
-            checked,
-            confidence: "low".into(),
-        });
-        st.triaged = None;
-        return;
+    if triage_tokens(cx.state, cx.team_id, 0, 0).await >= cx.cfg.triage_tokens_per_day {
+        mark_waiting(cx, findings, idxs, sec::WAITING_TRIAGE).await;
+        return Triaged::Waiting;
     }
-    let provider = crate::agent::provider::ModelProvider::load_for_team(
-        &state.dynamo,
-        &state.config.settings_table_name,
-        team_id,
+    let Ok(provider) = crate::agent::provider::ModelProvider::load_for_team(
+        &cx.state.dynamo,
+        &cx.state.config.settings_table_name,
+        cx.team_id,
     )
-    .await;
-    let Ok(provider) = provider else {
-        f.verdict = Verdict::Unknown;
-        f.evidence = Some(Evidence {
+    .await
+    else {
+        let e = Evidence {
             summary: "No model is set up for this team, so only the code search ran.".into(),
             lines: hits.into_iter().take(5).collect(),
             checked,
             confidence: "low".into(),
-        });
-        return;
+        };
+        apply_verdict(cx, findings, idxs, Verdict::Unknown, &e).await;
+        return Triaged::Settled;
     };
-    let prompt = sec::triage_prompt(f, st, &hits, TRIAGE_MAX_CHARS);
+    let mut prompt = sec::triage_prompt(&lead, &st_all, &hits, TRIAGE_MAX_CHARS);
+    if idxs.len() > 1 {
+        prompt.push_str("\n\nThe same package and version also has these advisories; one verdict covers them all:\n");
+        for i in idxs.iter().filter(|i| **i != lead_i).take(20) {
+            let f = &findings[*i].0;
+            prompt.push_str(&format!(
+                "- {}: {}\n",
+                f.advisory.primary,
+                common::truncate_str(&f.advisory.title, 160)
+            ));
+        }
+    }
     let mut usage = TokenUsage::default();
     let answer = crate::agent::provider::converse_simple(
-        state,
+        cx.state,
         &provider,
         provider.primary_model_id(),
         sec::TRIAGE_SYSTEM,
@@ -876,19 +1212,82 @@ async fn triage(
         &mut usage,
     )
     .await;
-    triage_tokens(state, team_id, usage.total_tokens()).await;
+    triage_tokens(cx.state, cx.team_id, usage.total_tokens(), 1).await;
     match answer {
         Ok(text) => {
             let (v, mut e) = sec::parse_triage(&text, &hits);
             e.checked = checked;
-            f.verdict = v;
-            f.evidence = Some(e);
+            if v == Verdict::Unknown {
+                e.summary = format!(
+                    "{} {}",
+                    sec::unknown_reason(&lead.package, files, &st_all.symbols),
+                    e.summary
+                );
+            }
+            save_group_verdict(cx, &gk, &key, v, &e).await;
+            apply_verdict(cx, findings, idxs, v, &e).await;
+            Triaged::Model
         }
         Err(err) => {
-            warn!(team_id, finding = %f.id, error = %err, "security: triage call failed");
-            st.triaged = None;
+            warn!(team_id = cx.team_id, group = %gk, error = %err, "security: triage call failed");
+            Triaged::Failed
         }
     }
+}
+
+/// Triage for the tick: the groups whose verdict is missing or stale, the
+/// most urgent first. Returns how many groups got a verdict.
+async fn triage_tick(cx: &Ctx<'_>, findings: &mut [(Finding, FindingState)]) -> usize {
+    let mut groups: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (i, (f, st)) in findings.iter().enumerate() {
+        if f.status.is_open()
+            && cx.cfg.repos.includes(&f.repo)
+            && (f.verdict == Verdict::Pending
+                || st.triaged.as_deref() != Some(triage_key(f).as_str()))
+        {
+            groups.entry(sec::group_key(f)).or_default().push(i);
+        }
+    }
+    let mut order: Vec<(Option<sec::Tier>, String)> = groups
+        .iter()
+        .map(|(k, idxs)| {
+            (
+                idxs.iter().filter_map(|i| findings[*i].0.tier).min(),
+                k.clone(),
+            )
+        })
+        .collect();
+    order.sort();
+    let (mut calls_left, mut done) = (TRIAGE_PER_TICK, 0);
+    let mut tally: BTreeMap<&'static str, usize> = BTreeMap::new();
+    for (_, k) in order.into_iter().take(TRIAGE_SEARCH_PER_TICK) {
+        if cx.out_of_time() {
+            break;
+        }
+        let idxs = groups.get(&k).cloned().unwrap_or_default();
+        let r = triage_group(cx, findings, &idxs, calls_left).await;
+        *tally
+            .entry(match r {
+                Triaged::Reused => "reused",
+                Triaged::Settled => "settled",
+                Triaged::Model => "model",
+                Triaged::Waiting => "waiting",
+                Triaged::Failed => "failed",
+            })
+            .or_default() += 1;
+        match r {
+            Triaged::Model => {
+                calls_left = calls_left.saturating_sub(1);
+                done += 1;
+            }
+            Triaged::Reused | Triaged::Settled => done += 1,
+            Triaged::Waiting | Triaged::Failed => {}
+        }
+    }
+    if !tally.is_empty() {
+        info!(team_id = cx.team_id, ?tally, "security: triage");
+    }
+    done
 }
 
 // ── Cards ───────────────────────────────────────────────────────────────
@@ -980,6 +1379,8 @@ struct Ctx<'a> {
     cfg: &'a SecurityConfig,
     gh: GitHubClient,
     started: Instant,
+    /// OSV records read this tick (repositories share packages).
+    osv: tokio::sync::Mutex<HashMap<String, Value>>,
 }
 
 impl Ctx<'_> {
@@ -1007,19 +1408,8 @@ async fn sync_repo(
     };
     let mut obs: Vec<Observation> = vec![];
     if with_alerts {
-        let (alerts, access) = dependabot_alerts(&cx.gh, repo).await;
-        set_team_state(
-            cx.state,
-            cx.team_id,
-            &[
-                ("dependabot", attr_s(access)),
-                (
-                    "permission_missing",
-                    AttributeValue::Bool(access == "no_permission"),
-                ),
-            ],
-        )
-        .await;
+        let (alerts, access) = dependabot_alerts(&cx.gh, repo, 5).await;
+        record_dependabot(cx, repo, &access).await;
         for a in &alerts {
             if let Some(mut o) = sec::observation_from_alert(repo, a) {
                 fill_version(&mut o, &deps);
@@ -1027,13 +1417,39 @@ async fn sync_repo(
             }
         }
     }
-    obs.extend(osv_observations(cx.state, repo, &deps).await);
-    set_team_state(
-        cx.state,
-        cx.team_id,
-        &[("osv_synced_at", attr_s(&Utc::now().to_rfc3339()))],
-    )
-    .await;
+    let osv = {
+        let mut cache = cx.osv.lock().await;
+        osv_observations(cx.state, repo, &deps, &mut cache).await
+    };
+    let now = Utc::now().to_rfc3339();
+    match osv {
+        Ok(o) => {
+            set_repo_fields(
+                cx.state,
+                cx.team_id,
+                repo,
+                &[("osv_synced_at", attr_s(&now)), ("osv_error", attr_s(""))],
+            )
+            .await;
+            set_team_state(
+                cx.state,
+                cx.team_id,
+                &[("osv_synced_at", attr_s(&now)), ("osv_error", attr_s(""))],
+            )
+            .await;
+            obs.extend(o);
+        }
+        Err(why) => {
+            warn!(team_id = cx.team_id, repo, error = %why, "security: OSV couldn't be read");
+            set_repo_fields(cx.state, cx.team_id, repo, &[("osv_error", attr_s(&why))]).await;
+            set_team_state(
+                cx.state,
+                cx.team_id,
+                &[("osv_error", attr_s(&why)), ("osv_error_at", attr_s(&now))],
+            )
+            .await;
+        }
+    }
     let applied = upsert(cx.state, cx.team_id, cx.cfg, findings, obs).await;
     // The dependency list now shows some fixed: a merged bump, a removal.
     for (f, st) in findings.iter_mut() {
@@ -1102,26 +1518,10 @@ async fn tend(
     } else {
         HashMap::new()
     };
-    // The most urgent first: which findings this tick triages.
-    let mut wanted: Vec<(Option<sec::Tier>, usize)> = findings
-        .iter()
-        .enumerate()
-        .filter(|(_, (f, st))| {
-            f.status.is_open()
-                && cx.cfg.repos.includes(&f.repo)
-                && (f.verdict == Verdict::Pending
-                    || st.triaged.as_deref() != Some(triage_key(f).as_str()))
-        })
-        .map(|(i, (f, _))| (f.tier, i))
-        .collect();
-    wanted.sort();
-    let to_triage: HashSet<usize> = wanted
-        .into_iter()
-        .take(TRIAGE_PER_TICK)
-        .map(|(_, i)| i)
-        .collect();
-    let mut triaged = 0;
-    for (i, (f, st)) in findings.iter_mut().enumerate() {
+    // Triage by group: one search and at most one model call per package
+    // version, the most urgent first.
+    report.triaged += triage_tick(cx, findings).await;
+    for (f, st) in findings.iter_mut() {
         let before = (f.clone(), st.clone());
         let was_kev = f.advisory.kev;
         // An empty list is a failed read, never "nothing is exploited".
@@ -1179,28 +1579,15 @@ async fn tend(
                 .await;
             }
         }
-        if to_triage.contains(&i) && !cx.out_of_time() {
-            triage(cx.state, cx.team_id, &cx.gh, f, st).await;
-            triaged += 1;
-            if f.verdict != Verdict::Pending {
-                add_event(
-                    cx.state,
-                    cx.team_id,
-                    &f.id,
-                    &format!("Verdict: {}", verdict_word(f.verdict)),
-                    None,
-                )
-                .await;
-            }
-        }
         sec::retier(f, st, cx.cfg);
         if (f.clone(), st.clone()) != before {
             f.updated_at = now.to_rfc3339();
             save_finding(cx.state, cx.team_id, f, st).await;
         }
     }
-    report.triaged += triaged;
     track_prs(cx, findings).await;
+    // Fixes a person asked for start whatever the dry run says.
+    report.runs += start_requested(cx, findings).await;
     if cx.cfg.acts() {
         report.cards += cards(cx, findings).await;
         report.runs += start_fixes(cx, findings).await;
@@ -1409,15 +1796,39 @@ async fn ticket_branch(state: &WorkerState, team_id: &str, ticket: &str) -> Opti
     out.item().map(|i| s(i, "branch")).filter(|b| !b.is_empty())
 }
 
-/// New cards and escalations.
+/// Cards posted today, from the day's counter; `add` adds to it.
+async fn cards_today(state: &WorkerState, team_id: &str, add: u32) -> u32 {
+    let day = sec::limit_day(Utc::now());
+    let r = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(team_id))
+        .key("sk", attr_s(&format!("SECCARDS#{day}")))
+        .update_expression("ADD cards :n SET #ttl = if_not_exists(#ttl, :ttl)")
+        .expression_attribute_names("#ttl", "ttl")
+        .expression_attribute_values(":n", attr_n(add))
+        .expression_attribute_values(":ttl", attr_n(Utc::now().timestamp() + 3 * 86_400))
+        .return_values(aws_sdk_dynamodb::types::ReturnValue::UpdatedNew)
+        .send()
+        .await;
+    r.ok()
+        .and_then(|o| o.attributes().and_then(|a| a.get("cards").cloned()))
+        .and_then(|v| v.as_n().ok().and_then(|n| n.parse().ok()))
+        // Can't be read: as if the day's cards are used.
+        .unwrap_or(u32::MAX)
+}
+
+/// New cards and escalations, at most `max_cards_per_day` a day; the rest
+/// go into one digest card a day.
 async fn cards(cx: &Ctx<'_>, findings: &mut [(Finding, FindingState)]) -> usize {
     let channels = team_channels(cx.state, cx.team_id).await;
     if channels.is_empty() {
         return 0;
     }
     let now = Utc::now();
-    let mut posted = 0;
-    for (f, st) in findings.iter_mut() {
+    let mut due: Vec<(usize, Stage)> = vec![];
+    for (i, (f, st)) in findings.iter().enumerate() {
         if !f.status.is_open()
             || !sec::posts(f, cx.cfg)
             || !cx.cfg.repos.includes(&f.repo)
@@ -1431,8 +1842,30 @@ async fn cards(cx: &Ctx<'_>, findings: &mut [(Finding, FindingState)]) -> usize 
         } else {
             sec::escalation(f, st, cx.cfg, now)
         };
-        let Some(stage) = stage else { continue };
+        if let Some(stage) = stage {
+            due.push((i, stage));
+        }
+    }
+    if due.is_empty() {
+        return 0;
+    }
+    let posted_today = cards_today(cx.state, cx.team_id, 0).await;
+    let refs: Vec<&Finding> = due.iter().map(|(i, _)| &findings[*i].0).collect();
+    let (now_ids, later): (Vec<String>, Vec<String>) = {
+        let (a, b) = sec::card_budget(refs, posted_today, cx.cfg.max_cards_per_day);
+        (
+            a.iter().map(|f| f.id.clone()).collect(),
+            b.iter().map(|f| f.id.clone()).collect(),
+        )
+    };
+    let mut posted = 0;
+    for (i, stage) in due {
+        if !now_ids.contains(&findings[i].0.id) {
+            continue;
+        }
+        let (f, st) = &mut findings[i];
         if post_card(cx.state, cx.team_id, &channels, &f.id, stage, f).await {
+            cards_today(cx.state, cx.team_id, 1).await;
             st.cards.push(stage.key().to_string());
             posted += 1;
             add_event(
@@ -1444,6 +1877,43 @@ async fn cards(cx: &Ctx<'_>, findings: &mut [(Finding, FindingState)]) -> usize 
             )
             .await;
             save_finding(cx.state, cx.team_id, f, st).await;
+        }
+    }
+    if !later.is_empty() {
+        let day = sec::limit_day(now);
+        if claim(
+            cx.state,
+            cx.team_id,
+            &format!("SECDIGEST#{day}"),
+            2 * 86_400,
+        )
+        .await
+        {
+            let waiting: Vec<&Finding> = findings
+                .iter()
+                .filter(|(f, _)| later.contains(&f.id))
+                .map(|(f, _)| f)
+                .collect();
+            let url = format!(
+                "{}/security",
+                super::skills::app_url(&cx.state.config.stage)
+            );
+            let msg = sec::digest_card(&waiting, &url, cx.cfg.max_cards_per_day);
+            let sent = common::notify::deliver_recorded(
+                &common::notify::Http(&cx.state.http),
+                &channels,
+                &msg,
+                "security",
+                &cx.state.dynamo,
+                &cx.state.config.settings_table_name,
+                cx.team_id,
+            )
+            .await;
+            if sent.any_ok() {
+                posted += 1;
+            } else {
+                release(cx.state, cx.team_id, &format!("SECDIGEST#{day}")).await;
+            }
         }
     }
     posted
@@ -1461,22 +1931,90 @@ fn stage_words(stage: Stage) -> &'static str {
     }
 }
 
-/// Fix runs (or adoptions) for the units due now.
-async fn start_fixes(cx: &Ctx<'_>, findings: &mut [(Finding, FindingState)]) -> usize {
+fn slots<'a>(cx: &'a Ctx<'_>) -> sec::DynamoSlots<'a> {
+    sec::DynamoSlots {
+        dynamo: &cx.state.dynamo,
+        settings_table: &cx.state.config.settings_table_name,
+        analytics_table: &cx.state.config.analytics_table_name,
+        team_id: cx.team_id,
+    }
+}
+
+/// Fix runs a person asked for that a daily limit held: they start as room
+/// opens, the most urgent first, dry run or not (the person asked).
+async fn start_requested(cx: &Ctx<'_>, findings: &mut [(Finding, FindingState)]) -> usize {
     let now = Utc::now();
-    let units = sec::plan_units(findings, cx.cfg, now);
+    let units = sec::requested_units(findings, cx.cfg, now);
+    if units.is_empty() {
+        return 0;
+    }
+    let day = sec::limit_day(now);
+    let slots = slots(cx);
+    let mut busy: HashSet<String> = findings
+        .iter()
+        .filter(|(f, _)| f.status == Status::Fixing)
+        .map(|(f, _)| f.repo.to_ascii_lowercase())
+        .collect();
     let mut started = 0;
-    let mut open_pulls: HashMap<String, Vec<Value>> = HashMap::new();
     for unit in units {
-        if cx.out_of_time() || !sec::unit_due(&unit, cx.cfg) {
+        if cx.out_of_time() {
+            break;
+        }
+        let members: Vec<usize> = unit
+            .finding_ids
+            .iter()
+            .filter_map(|id| findings.iter().position(|(f, _)| &f.id == id))
+            .collect();
+        let repo_busy = busy.contains(&unit.repo.to_ascii_lowercase());
+        if let sec::Admit::Wait(why) = sec::admit_run(&slots, cx.cfg, &day, repo_busy).await {
+            hold(cx, findings, &members, &why).await;
             continue;
         }
-        if unit.grouped {
-            let sk = format!("SEC_BATCH#{}#{}", unit.repo.to_ascii_lowercase(), unit.key);
-            if !claim(cx.state, cx.team_id, &sk, 8 * 86_400).await {
-                continue;
+        if !claim(
+            cx.state,
+            cx.team_id,
+            &format!("SEC_RUN#{}", unit.ticket),
+            3600,
+        )
+        .await
+        {
+            slots.give_back(&day).await;
+            continue;
+        }
+        match enqueue(cx, &unit, findings, &members).await {
+            Ok(()) => {
+                started += 1;
+                busy.insert(unit.repo.to_ascii_lowercase());
+                for i in &members {
+                    findings[*i].1.requested_by = None;
+                }
+            }
+            Err(e) => {
+                warn!(team_id = cx.team_id, ticket = %unit.ticket, error = %e, "security: could not start the requested fix run");
+                slots.give_back(&day).await;
+                release(cx.state, cx.team_id, &format!("SEC_RUN#{}", unit.ticket)).await;
             }
         }
+    }
+    started
+}
+
+/// The `fix` event: the gateway took the run slots for these findings when a
+/// person asked; start their runs now.
+async fn start_asked(
+    cx: &Ctx<'_>,
+    findings: &mut [(Finding, FindingState)],
+    ids: &[String],
+    by: &str,
+) -> usize {
+    let (units, _) = sec::manual_units(findings, ids, cx.cfg, Utc::now());
+    let mut started = 0;
+    for unit in units {
+        let members: Vec<usize> = unit
+            .finding_ids
+            .iter()
+            .filter_map(|id| findings.iter().position(|(f, _)| &f.id == id))
+            .collect();
         if !claim(
             cx.state,
             cx.team_id,
@@ -1487,12 +2025,56 @@ async fn start_fixes(cx: &Ctx<'_>, findings: &mut [(Finding, FindingState)]) -> 
         {
             continue;
         }
+        match enqueue(cx, &unit, findings, &members).await {
+            Ok(()) => started += 1,
+            Err(e) => {
+                warn!(team_id = cx.team_id, ticket = %unit.ticket, by, error = %e, "security: could not start the asked fix run");
+                release(cx.state, cx.team_id, &format!("SEC_RUN#{}", unit.ticket)).await;
+                // Its slot is given back and the request waits for the next tick.
+                sec::DailySlots::give_back(&slots(cx), &sec::limit_day(Utc::now())).await;
+                for i in &members {
+                    let (f, st) = &mut findings[*i];
+                    st.requested_by = Some(by.to_string());
+                    f.waiting = Some(
+                        "Waiting: the fix run couldn't start; it is tried again on the next check."
+                            .into(),
+                    );
+                    save_finding(cx.state, cx.team_id, f, st).await;
+                }
+            }
+        }
+    }
+    started
+}
+
+/// Fix runs (or adoptions) for the units due now, within the day's limits:
+/// at most `max_fix_runs_per_day` runs and `max_fix_tokens_per_day` tokens,
+/// one run in progress per repository, the most urgent first. Adopting a
+/// bot's pull request or opening an issue costs no run.
+async fn start_fixes(cx: &Ctx<'_>, findings: &mut [(Finding, FindingState)]) -> usize {
+    let now = Utc::now();
+    let day = sec::limit_day(now);
+    let slots = slots(cx);
+    let mut units = sec::plan_units(findings, cx.cfg, now);
+    sec::order_units(&mut units, findings);
+    let mut busy: HashSet<String> = findings
+        .iter()
+        .filter(|(f, _)| f.status == Status::Fixing)
+        .map(|(f, _)| f.repo.to_ascii_lowercase())
+        .collect();
+    let mut started = 0;
+    let mut open_pulls: HashMap<String, Vec<Value>> = HashMap::new();
+    for unit in units {
+        if cx.out_of_time() || !sec::unit_due(&unit, cx.cfg) {
+            continue;
+        }
         let members: Vec<usize> = unit
             .finding_ids
             .iter()
             .filter_map(|id| findings.iter().position(|(f, _)| &f.id == id))
             .collect();
         // An open Dependabot or Renovate pull request for the package.
+        let mut bot_pr = None;
         if cx.cfg.adopt_bot_prs && !unit.grouped {
             let pulls = match open_pulls.get(&unit.repo) {
                 Some(p) => p.clone(),
@@ -1509,31 +2091,86 @@ async fn start_fixes(cx: &Ctx<'_>, findings: &mut [(Finding, FindingState)]) -> 
                     p
                 }
             };
-            if let Some(pr) = bot_pr_for(&pulls, &unit) {
-                adopt(cx, &unit, &pr, findings, &members).await;
-                started += 1;
+            bot_pr = bot_pr_for(&pulls, &unit);
+        }
+        let major = unit.bumps.iter().any(|b| b.major);
+        let kind = if bot_pr.is_some() {
+            sec::RunKind::Adopt
+        } else if major && cx.cfg.major_bumps == sec::MajorBumps::IssueOnly {
+            sec::RunKind::IssueOnly
+        } else {
+            sec::RunKind::Run
+        };
+        if kind.counts() {
+            if let Some(why) = super::check_budget_exceeded(cx.state, cx.team_id).await {
+                info!(team_id = cx.team_id, ticket = %unit.ticket, why, "security: fix run not started (budget)");
+                hold(cx, findings, &members, &format!("Waiting: {why}.")).await;
+                continue;
+            }
+            let repo_busy = busy.contains(&unit.repo.to_ascii_lowercase());
+            if let sec::Admit::Wait(why) = sec::admit_run(&slots, cx.cfg, &day, repo_busy).await {
+                hold(cx, findings, &members, &why).await;
                 continue;
             }
         }
-        let major = unit.bumps.iter().any(|b| b.major);
-        if major && cx.cfg.major_bumps == sec::MajorBumps::IssueOnly {
-            issue_only(cx, &unit, findings, &members).await;
-            continue;
-        }
-        if let Some(why) = super::check_budget_exceeded(cx.state, cx.team_id).await {
-            info!(team_id = cx.team_id, ticket = %unit.ticket, why, "security: fix run not started (budget)");
-            release(cx.state, cx.team_id, &format!("SEC_RUN#{}", unit.ticket)).await;
-            continue;
-        }
-        match enqueue(cx, &unit, findings, &members).await {
-            Ok(()) => started += 1,
-            Err(e) => {
-                warn!(team_id = cx.team_id, ticket = %unit.ticket, error = %e, "security: could not start the fix run");
-                release(cx.state, cx.team_id, &format!("SEC_RUN#{}", unit.ticket)).await;
+        if unit.grouped {
+            let sk = format!("SEC_BATCH#{}#{}", unit.repo.to_ascii_lowercase(), unit.key);
+            if !claim(cx.state, cx.team_id, &sk, 8 * 86_400).await {
+                if kind.counts() {
+                    slots.give_back(&day).await;
+                }
+                continue;
             }
+        }
+        if !claim(
+            cx.state,
+            cx.team_id,
+            &format!("SEC_RUN#{}", unit.ticket),
+            3600,
+        )
+        .await
+        {
+            if kind.counts() {
+                slots.give_back(&day).await;
+            }
+            continue;
+        }
+        match (kind, bot_pr) {
+            (sec::RunKind::Adopt, Some(pr)) => {
+                adopt(cx, &unit, &pr, findings, &members).await;
+                started += 1;
+            }
+            (sec::RunKind::IssueOnly, _) => issue_only(cx, &unit, findings, &members).await,
+            _ => match enqueue(cx, &unit, findings, &members).await {
+                Ok(()) => {
+                    started += 1;
+                    busy.insert(unit.repo.to_ascii_lowercase());
+                }
+                Err(e) => {
+                    warn!(team_id = cx.team_id, ticket = %unit.ticket, error = %e, "security: could not start the fix run");
+                    slots.give_back(&day).await;
+                    release(cx.state, cx.team_id, &format!("SEC_RUN#{}", unit.ticket)).await;
+                }
+            },
         }
     }
     started
+}
+
+/// Notes on a unit's findings why its fix hasn't started.
+async fn hold(
+    cx: &Ctx<'_>,
+    findings: &mut [(Finding, FindingState)],
+    members: &[usize],
+    why: &str,
+) {
+    for i in members {
+        let (f, st) = &mut findings[*i];
+        if f.waiting.as_deref() != Some(why) {
+            f.waiting = Some(why.to_string());
+            save_finding(cx.state, cx.team_id, f, st).await;
+        }
+    }
 }
 
 /// A bot's pull request that already bumps the unit's package.
@@ -1609,6 +2246,9 @@ async fn adopt(
             state: "open".into(),
             adopted: true,
         });
+        f.waiting = None;
+        st.pr_opened_at
+            .get_or_insert_with(|| Utc::now().to_rfc3339());
         f.updated_at = Utc::now().to_rfc3339();
         save_finding(cx.state, cx.team_id, f, st).await;
         add_event(
@@ -1717,6 +2357,8 @@ async fn enqueue(
     for i in members {
         let (f, st) = &mut findings[*i];
         f.status = Status::Fixing;
+        f.waiting = None;
+        st.requested_by = None;
         st.ticket = Some(unit.ticket.clone());
         f.updated_at = Utc::now().to_rfc3339();
         save_finding(cx.state, cx.team_id, f, st).await;
@@ -1788,6 +2430,49 @@ async fn close_withdrawn(cx: &Ctx<'_>, findings: &mut [(Finding, FindingState)])
     }
 }
 
+async fn get_team_state(state: &WorkerState, team_id: &str) -> Option<Item> {
+    state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(team_id))
+        .key("sk", attr_s(sec::STATE_SK))
+        .send()
+        .await
+        .ok()?
+        .item()
+        .cloned()
+}
+
+/// Dependabot only: reads a repository's alerts (when access was missing,
+/// to see whether it works now) and applies them.
+async fn dependabot_sync(
+    cx: &Ctx<'_>,
+    repo: &str,
+    findings: &mut Vec<(Finding, FindingState)>,
+) -> usize {
+    let (alerts, access) = dependabot_alerts(&cx.gh, repo, 5).await;
+    record_dependabot(cx, repo, &access).await;
+    if alerts.is_empty() {
+        return 0;
+    }
+    let deps = load_deps(cx.state, cx.team_id, repo)
+        .await
+        .map(|(d, _)| d)
+        .unwrap_or_default();
+    let obs: Vec<Observation> = alerts
+        .iter()
+        .filter_map(|a| sec::observation_from_alert(repo, a))
+        .map(|mut o| {
+            fill_version(&mut o, &deps);
+            o
+        })
+        .collect();
+    upsert(cx.state, cx.team_id, cx.cfg, findings, obs)
+        .await
+        .created
+}
+
 async fn team_tick(
     state: &WorkerState,
     team_id: &str,
@@ -1802,10 +2487,17 @@ async fn team_tick(
         cfg,
         gh: github(state, installation_id)?,
         started,
+        osv: Default::default(),
     };
     let mut report = TeamReport::default();
     let mut findings = load_findings(state, team_id).await;
     let day = Utc::now().format("%Y%m%d").to_string();
+    // Dependabot access is read again every sweep until it works, so a
+    // permission accepted on GitHub shows within one sweep.
+    let access_off = get_team_state(state, team_id)
+        .await
+        .map(|i| s(&i, "dependabot"))
+        .is_some_and(|d| !d.is_empty() && d != "on");
     for repo in team_repos(state, team_id, cfg).await {
         if cx.out_of_time() {
             break;
@@ -1818,6 +2510,9 @@ async fn team_tick(
         )
         .await
         {
+            if access_off {
+                report.new_findings += dependabot_sync(&cx, &repo, &mut findings).await;
+            }
             continue;
         }
         report.new_findings += sync_repo(&cx, &repo, &mut findings, true).await;
@@ -1946,6 +2641,7 @@ async fn event_for_team(
         cfg,
         gh: github(state, installation_id)?,
         started: Instant::now(),
+        osv: Default::default(),
     };
     let mut findings = load_findings(state, team_id).await;
     let mut report = TeamReport::default();
@@ -2011,7 +2707,14 @@ async fn event_for_team(
                     }
                 }
             }
-            upsert(state, team_id, cfg, &mut findings, obs).await;
+            let applied = upsert(state, team_id, cfg, &mut findings, obs).await;
+            set_team_state(
+                state,
+                team_id,
+                &[("advisory_event_at", attr_s(&Utc::now().to_rfc3339()))],
+            )
+            .await;
+            report.new_findings += applied.created;
         }
         "push" => {
             if sec::valid_repo(&msg.repo) && cfg.repos.includes(&msg.repo) {
@@ -2024,12 +2727,25 @@ async fn event_for_team(
             } else {
                 vec![msg.repo.clone()]
             };
+            let day = Utc::now().format("%Y%m%d").to_string();
             for repo in repos {
                 if cx.out_of_time() {
                     break;
                 }
                 report.new_findings += sync_repo(&cx, &repo, &mut findings, true).await;
+                // Read now: the day's sweep needn't read it again.
+                claim(
+                    state,
+                    team_id,
+                    &format!("SECSYNC#{}#{day}", repo.to_ascii_lowercase()),
+                    2 * 86_400,
+                )
+                .await;
             }
+        }
+        "fix" => {
+            report.runs +=
+                start_asked(&cx, &mut findings, &msg.finding_ids, &msg.requested_by).await;
         }
         other => {
             info!(kind = other, "security: unknown event kind");
@@ -2134,6 +2850,8 @@ pub async fn on_pr_opened(
             state: "open".into(),
             adopted: false,
         });
+        st.pr_opened_at
+            .get_or_insert_with(|| Utc::now().to_rfc3339());
         f.updated_at = Utc::now().to_rfc3339();
         save_finding(state, &msg.team_id, f, st).await;
         add_event(

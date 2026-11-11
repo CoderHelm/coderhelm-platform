@@ -672,7 +672,7 @@ pub const CAPABILITIES: &[Capability] = &[
     },
     Capability {
         key: "security",
-        label: "Change security fix settings, dismiss or reopen findings, check repositories now and preview what would open",
+        label: "Change security fix settings, dismiss or reopen findings, open fix PRs, check repositories now and preview what would open",
 
         short_label: "Manage security fixes",
         min_role: "admin",
@@ -682,6 +682,7 @@ pub const CAPABILITIES: &[Capability] = &[
             "security::reopen",
             "security::scan",
             "security::preview",
+            "security::fix",
         ],
     },
     Capability {
@@ -1777,6 +1778,20 @@ mod tests {
         let mut sorted = levels.clone();
         sorted.sort();
         assert_eq!(levels, sorted);
+    }
+
+    #[test]
+    fn opening_fix_prs_is_for_admins() {
+        let c = handler_capability("security::fix").expect("security::fix is in the table");
+        assert_eq!((c.key, c.min_role), ("security", "admin"));
+        assert_eq!(
+            routed_handler("POST", "/api/security/fix"),
+            Some("security::fix")
+        );
+        assert!(
+            handler_capability("security::fix_plan").is_none(),
+            "the plan only reads"
+        );
     }
 
     #[test]
