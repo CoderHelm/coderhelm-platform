@@ -1639,7 +1639,7 @@ pub fn order_units(units: &mut [FixUnit], findings: &[(Finding, FindingState)]) 
             .unwrap_or_else(|| Utc::now() + Duration::days(3650));
         (tier, due)
     };
-    units.sort_by_key(|u| key(u));
+    units.sort_by_cached_key(|u| key(u));
 }
 
 // ── Daily limits ────────────────────────────────────────────────────────
