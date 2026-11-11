@@ -69,6 +69,8 @@ const CAP_DELAY_SECS: u64 = 60;
 /// Passes in a row that end in an error (no installation, a marker that
 /// can't be written) before the sweep stops starting new ones.
 const MAX_FAILED_PASSES: i64 = 8;
+/// The most deployments of one commit read for a run's deploys.
+const MAX_DEPLOYMENTS: usize = 10;
 /// The most progress items one sweep reads.
 const SWEEP_MAX_PAGES: usize = 50;
 
@@ -280,6 +282,9 @@ pub trait Source: Send + Sync {
     /// A workflow file's jobs, None when it can't be read. An error only for
     /// GitHub's rate limit.
     async fn workflow_jobs(&self, path: &str) -> Result<Option<Vec<JobDef>>, GhError>;
+    /// GitHub's deployments of a commit, each with its statuses (newest
+    /// first). None when the installation can't read deployments.
+    async fn deployments(&self, sha: &str) -> Result<Option<Vec<(Value, Vec<Value>)>>, GhError>;
     /// Writes one deploy record.
     async fn save_deploy(&self, item: Item) -> bool;
     /// Saves where the repository's backfill stands.
@@ -416,12 +421,37 @@ impl<S: Source> RepoReads<S> {
         // When the workflow file alone says where the run deployed, the jobs
         // that ran can't change it: no request for them, and a run that
         // deployed nothing (cancelled, skipped) costs none at all.
-        let settled = ds::jobs_settle(run, jobs.as_deref(), &self.setting);
-        let known = settled.then(|| ds::run_targets(run, jobs.as_deref(), None, &self.setting));
-        if known.as_ref().is_some_and(|t| t.is_empty()) {
+        let run_id = run["id"].as_u64().unwrap_or(0);
+        if queue_push && !self.merged_by_us(run).await? {
             return Ok(0);
         }
-        if queue_push && !self.merged_by_us(run).await? {
+        // GitHub's own record of where the run deployed comes first; the
+        // workflow is read only when it has none.
+        let sha = run["head_sha"].as_str().unwrap_or("");
+        let recorded = if sha.is_empty() {
+            Some(Vec::new())
+        } else {
+            self.src.deployments(sha).await?
+        };
+        let from_deployments = recorded
+            .as_deref()
+            .map(|d| ds::deployment_targets(run_id, d))
+            .unwrap_or_default();
+        let known_by = if !from_deployments.is_empty() {
+            ds::Known::Deployments
+        } else if recorded.is_some() {
+            ds::Known::Workflow
+        } else {
+            ds::Known::WorkflowNoAccess
+        };
+        let settled =
+            !from_deployments.is_empty() || ds::jobs_settle(run, jobs.as_deref(), &self.setting);
+        let known = if !from_deployments.is_empty() {
+            Some(from_deployments)
+        } else {
+            settled.then(|| ds::run_targets(run, jobs.as_deref(), None, &self.setting))
+        };
+        if known.as_ref().is_some_and(|t| t.is_empty()) {
             return Ok(0);
         }
         let is_tag = event == "push"
@@ -429,7 +459,6 @@ impl<S: Source> RepoReads<S> {
             && !ds::pushed_a_branch(run)
             && self.is_tag(&branch).await?;
         let cause = ds::cause_of(run, &self.default_branch, is_tag);
-        let run_id = run["id"].as_u64().unwrap_or(0);
         let targets = match known {
             Some(t) => t,
             None => {
@@ -450,7 +479,7 @@ impl<S: Source> RepoReads<S> {
         };
         let mut written = 0;
         for t in &targets {
-            let item = ds::stat_item(&self.team_id, &self.repo, run, cause, t);
+            let item = ds::stat_item_from(&self.team_id, &self.repo, run, cause, t, known_by);
             if self.src.save_deploy(item).await {
                 written += 1;
             }
@@ -563,6 +592,40 @@ impl Source for Live<'_> {
         self.github
             .get_repo_path(&self.owner, &self.name, rest)
             .await
+    }
+
+    async fn deployments(&self, sha: &str) -> Result<Option<Vec<(Value, Vec<Value>)>>, GhError> {
+        let base = format!("/repos/{}/{}/deployments", self.owner, self.name);
+        self.requests.fetch_add(1, Ordering::Relaxed);
+        let Some(list) = self
+            .github
+            .get_granted(
+                "deployments",
+                &format!("{base}?sha={sha}&per_page={MAX_DEPLOYMENTS}"),
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        let mut out = Vec::new();
+        for d in list.as_array().into_iter().flatten().take(MAX_DEPLOYMENTS) {
+            let Some(id) = d["id"].as_u64() else { continue };
+            self.requests.fetch_add(1, Ordering::Relaxed);
+            let statuses = match self
+                .github
+                .get_granted("deployments", &format!("{base}/{id}/statuses?per_page=10"))
+                .await
+            {
+                Ok(Some(v)) => v.as_array().cloned().unwrap_or_default(),
+                Ok(None) => return Ok(None),
+                Err(e) => {
+                    only_pause(e)?;
+                    Vec::new()
+                }
+            };
+            out.push((d.clone(), statuses));
+        }
+        Ok(Some(out))
     }
 
     async fn workflow_jobs(&self, path: &str) -> Result<Option<Vec<JobDef>>, GhError> {
@@ -1511,6 +1574,10 @@ mod tests {
         budget: Mutex<Option<crate::clients::github::Budget>>,
         /// Requests the pass made before this repository.
         extra_requests: usize,
+        /// The commit's deployments; None: no access to deployments.
+        deployments: Option<Vec<(Value, Vec<Value>)>>,
+        /// Every deploy record written.
+        items: Mutex<Vec<Item>>,
     }
 
     fn limited() -> GhError {
@@ -1549,8 +1616,16 @@ mod tests {
             Ok(self.workflows.get(path).cloned())
         }
 
-        async fn save_deploy(&self, _item: Item) -> bool {
+        async fn deployments(
+            &self,
+            _sha: &str,
+        ) -> Result<Option<Vec<(Value, Vec<Value>)>>, GhError> {
+            Ok(self.deployments.clone())
+        }
+
+        async fn save_deploy(&self, item: Item) -> bool {
             self.deploys.fetch_add(1, Ordering::SeqCst);
+            self.items.lock().unwrap().push(item);
             true
         }
 
@@ -1586,6 +1661,88 @@ mod tests {
             "main".into(),
             HashMap::new(),
         )
+    }
+
+    fn saved(f: &Fake, key: &str) -> Vec<String> {
+        f.items
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|i| i[key].as_s().unwrap().clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn deployments_say_where_a_run_went_before_its_jobs_are_read() {
+        let log = "https://github.com/acme/web/actions/runs/41/job/3";
+        let f = Fake {
+            deployments: Some(vec![(
+                json!({"environment": "prod-us"}),
+                vec![json!({"state": "success", "log_url": log})],
+            )]),
+            ..Default::default()
+        };
+        // The workflow's name says production; GitHub's record says prod-us,
+        // and no jobs are read.
+        let n = reads(&f)
+            .record(&bot_run(
+                41,
+                "push",
+                "main",
+                "Deploy",
+                ".github/workflows/deploy.yml",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(saved(&f, "environment_name"), ["prod-us"]);
+        assert_eq!(saved(&f, "environment"), ["production"]);
+        assert_eq!(saved(&f, "source"), ["deployments"]);
+        assert!(f.asked.lock().unwrap().iter().all(|a| !a.contains("/jobs")));
+    }
+
+    #[tokio::test]
+    async fn without_deployments_access_the_workflow_still_says() {
+        let f = Fake::default();
+        let n = reads(&f)
+            .record(&bot_run(
+                42,
+                "push",
+                "main",
+                "Deploy production",
+                ".github/workflows/deploy.yml",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(saved(&f, "environment"), ["production"]);
+        assert_eq!(saved(&f, "source"), ["workflow_no_deployments_access"]);
+    }
+
+    #[tokio::test]
+    async fn deployments_for_other_runs_leave_the_workflow_to_say() {
+        let f = Fake {
+            deployments: Some(vec![(
+                json!({"environment": "staging"}),
+                vec![
+                    json!({"state": "success", "log_url": "https://github.com/acme/web/actions/runs/9/job/1"}),
+                ],
+            )]),
+            ..Default::default()
+        };
+        let n = reads(&f)
+            .record(&bot_run(
+                43,
+                "push",
+                "main",
+                "Deploy production",
+                ".github/workflows/deploy.yml",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(saved(&f, "environment"), ["production"]);
+        assert_eq!(saved(&f, "source"), ["workflow"]);
     }
 
     #[tokio::test]
