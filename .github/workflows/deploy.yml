@@ -183,6 +183,26 @@ jobs:
           CDK_DEFAULT_ACCOUNT: ${{ secrets.AWS_ACCOUNT_ID }}
           CDK_DEFAULT_REGION: ${{ env.AWS_REGION }}
           MODEL_ID: claude-opus-4-8
+      # CloudFormation reports success once the new Lambda code is in place,
+      # not once it starts: a gateway that panics at cold start (a route
+      # registered twice, a bad secret) answers 500 to everything while the
+      # stack is green. POST /mcp with no credential is answered by the
+      # router itself with 401, so a 401 means the new gateway started and
+      # routes requests. Anything else for two minutes fails the deploy (and
+      # holds the stable release below).
+      - name: The deployed gateway answers
+        env:
+          GATEWAY_URL: https://api.coderhelm.com
+        run: |
+          for i in $(seq 1 24); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
+              -X POST -H 'content-type: application/json' -d '{}' "$GATEWAY_URL/mcp" || true)
+            echo "try $i: POST /mcp answered ${code:-nothing}"
+            if [ "$code" = 401 ]; then exit 0; fi
+            sleep 5
+          done
+          echo "::error::The gateway at $GATEWAY_URL did not answer POST /mcp with 401 within two minutes of the deploy (last answer: ${code:-nothing}). Read its CloudWatch logs for the cold start error."
+          exit 1
 
   # Run by hand with "stable release": a stable self-host release of exactly
   # the commit it deployed (.github/workflows/auto-release.yml), in this same

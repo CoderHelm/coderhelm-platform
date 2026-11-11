@@ -136,7 +136,25 @@ async fn main() -> Result<(), Error> {
         routes::plugins::sync_catalog_to_s3(&state).await;
     }
 
-    // Build router
+    let app = build_app(state);
+
+    // In streaming mode the Lambda Web Adapter proxies requests to port 8080,
+    // so we run a plain TCP server instead of the Lambda Runtime API handler.
+    if std::env::var("STREAMING_MODE").is_ok() {
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
+        tracing::info!("Streaming mode: listening on 0.0.0.0:8080");
+        axum::serve(listener, app).await?;
+        Ok(())
+    } else {
+        run(app).await
+    }
+}
+
+/// Every route the gateway serves, on `state`. Built from main() and from
+/// the tests (with a fake state), so a route registered twice fails `cargo
+/// test` instead of the Lambda's cold start: axum panics on an overlapping
+/// route while the router is built.
+fn build_app(state: Arc<AppState>) -> Router {
     // Protected API routes — require valid JWT with team scoping
     let api_routes = Router::new()
         .route("/me", get(routes::api::me))
@@ -1596,7 +1614,7 @@ async fn main() -> Result<(), Error> {
             .with_state(state.clone()),
     );
 
-    let app = Router::new()
+    Router::new()
         // Root health/info
         .route(
             "/",
@@ -1733,18 +1751,7 @@ async fn main() -> Result<(), Error> {
         // Cross-origin answers for browsers (middleware::cors): outermost,
         // so preflights are answered before routing.
         .layer(axum_middleware::from_fn(middleware::cors::cors))
-        .with_state(state);
-
-    // In streaming mode the Lambda Web Adapter proxies requests to port 8080,
-    // so we run a plain TCP server instead of the Lambda Runtime API handler.
-    if std::env::var("STREAMING_MODE").is_ok() {
-        let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
-        tracing::info!("Streaming mode: listening on 0.0.0.0:8080");
-        axum::serve(listener, app).await?;
-        Ok(())
-    } else {
-        run(app).await
-    }
+        .with_state(state)
 }
 
 /// The hosted side of hybrid: what self-hosted installs call, signed with
@@ -1862,6 +1869,15 @@ mod tests {
             },
             cognito_client_secret: String::new(),
         })
+    }
+
+    /// The whole router main() serves builds. axum panics while building on
+    /// a method registered twice for one path (or two nests that collide),
+    /// which in production is a gateway that can't start; here it is a
+    /// failed test.
+    #[test]
+    fn the_gateway_router_builds_with_no_route_registered_twice() {
+        let _ = build_app(hosted_state());
     }
 
     /// A request signed exactly as `common::hybrid::client::call` signs it,
