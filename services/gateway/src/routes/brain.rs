@@ -267,7 +267,14 @@ pub struct Thread {
     pub updated_at: String,
     #[serde(default)]
     pub messages: u32,
+    /// Where it was asked from: empty for Chat, `kb_page` for a knowledge
+    /// base page's "Ask this knowledge base".
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub origin: String,
 }
+
+/// The one place besides Chat a thread can start: a knowledge base page.
+pub const ORIGIN_KB_PAGE: &str = "kb_page";
 
 /// One message of a thread.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -409,6 +416,7 @@ fn thread_json(t: &Thread, user_id: &str) -> Value {
         "created_at": t.created_at,
         "updated_at": t.updated_at,
         "messages": t.messages,
+        "origin": t.origin,
     })
 }
 
@@ -1132,6 +1140,10 @@ pub struct AskBody {
     pub mentions: Vec<Mention>,
     #[serde(default)]
     pub attachments: Vec<AttachmentRef>,
+    /// `kb_page`: asked from a knowledge base page (counted against the
+    /// page's hourly limit, and marked on a new thread).
+    #[serde(default)]
+    pub origin: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1950,6 +1962,11 @@ pub async fn brain_stream(
         ));
     }
 
+    let from_page = body.origin.as_deref() == Some(ORIGIN_KB_PAGE);
+    if from_page {
+        super::knowledge_ask::count_ask(&state, &claims.team_id, &claims.email).await?;
+    }
+
     // The thread: the asker's own, or a new one.
     let (mut thread, history) = match body.thread_id.as_deref().filter(|s| !s.is_empty()) {
         Some(id) => {
@@ -1975,6 +1992,11 @@ pub async fn brain_stream(
                 created_at: now(),
                 updated_at: now(),
                 messages: 0,
+                origin: if from_page {
+                    ORIGIN_KB_PAGE.to_string()
+                } else {
+                    String::new()
+                },
             };
             put(&state, &claims.team_id, &thread_sk(&t.id), &t)
                 .await
@@ -2461,6 +2483,30 @@ mod tests {
             pinned,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn a_question_from_a_knowledge_base_page_is_marked_on_its_thread() {
+        let body: AskBody = serde_json::from_value(json!({
+            "question": "How do we backfill?",
+            "mentions": [{"kind": "knowledge", "id": "kb1"}],
+            "origin": "kb_page",
+        }))
+        .unwrap();
+        assert_eq!(body.origin.as_deref(), Some(ORIGIN_KB_PAGE));
+        let older: AskBody = serde_json::from_value(json!({"question": "q"})).unwrap();
+        assert!(older.origin.is_none());
+        let t = Thread {
+            origin: ORIGIN_KB_PAGE.into(),
+            ..thread("u1", false)
+        };
+        assert_eq!(thread_json(&t, "u1")["origin"], "kb_page");
+        let saved: Thread =
+            serde_json::from_str(&serde_json::to_string(&thread("u1", false)).unwrap()).unwrap();
+        assert!(
+            saved.origin.is_empty(),
+            "Chat's own threads stay as they were"
+        );
     }
 
     #[test]

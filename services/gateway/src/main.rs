@@ -857,6 +857,14 @@ async fn main() -> Result<(), Error> {
         )
         .route("/knowledge/:kb_id/runs", get(routes::knowledge::list_runs))
         .route(
+            "/knowledge/:kb_id/search",
+            post(routes::knowledge_ask::search_base),
+        )
+        .route(
+            "/knowledge/:kb_id/suggestions",
+            get(routes::knowledge_ask::suggestions),
+        )
+        .route(
             "/knowledge/:kb_id/files",
             post(routes::knowledge::start_upload),
         )
