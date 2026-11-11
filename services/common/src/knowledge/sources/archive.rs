@@ -154,7 +154,9 @@ pub fn entries(bytes: &[u8], max_items: usize) -> Result<Listing, ConnectorError
     let mut items: Vec<Listed> = Vec::new();
     for i in 0..zip.len().min(MAX_ENTRIES) {
         let Ok(f) = zip.by_index_raw(i) else { continue };
-        let path = f.name().replace('\\', "/");
+        // zip 9 checks the raw name: an entry whose name is not valid text is skipped.
+        let Ok(name) = f.name() else { continue };
+        let path = name.replace('\\', "/");
         if !readable(&path) {
             continue;
         }

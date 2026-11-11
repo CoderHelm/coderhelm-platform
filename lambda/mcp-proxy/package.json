@@ -8,7 +8,7 @@
     "package": "npm run build && cd dist && zip -r ../mcp-proxy.zip ."
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.12.1"
+    "@modelcontextprotocol/sdk": "^1.32.0"
   },
   "devDependencies": {
     "esbuild": "^0.25.0"

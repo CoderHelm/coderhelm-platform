@@ -9,9 +9,9 @@ sha2 = "0.10"
 # unsubscribe: signed links in emails
 hmac = "0.12"
 # memlock: the shared memory fencing lock (worker runs + gateway deletes)
-aws-sdk-dynamodb = "1"
+aws-sdk-dynamodb = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 # mail: one send layer for SES and the hybrid email relay
-aws-sdk-sesv2 = "1"
+aws-sdk-sesv2 = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 chrono = "0.4"
 ulid = "1"
 tracing = "0.1"
@@ -21,22 +21,22 @@ reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"], defau
 # model_stream: Anthropic SSE responses read as they arrive
 futures = "0.3"
 # usage: a call whose counters could not be written waits on the tickets queue
-aws-sdk-sqs = "1"
+aws-sdk-sqs = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 # plugins: one-off and recurring schedules (publish at a time, schedule triggers)
-aws-sdk-scheduler = "1"
+aws-sdk-scheduler = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 # plugins: Slack request signatures
 hex = "0.4"
 # embed: Titan embeddings on CoderHelm's own AWS account, metered
-aws-sdk-bedrockruntime = "1"
+aws-sdk-bedrockruntime = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 # knowledge: a Bedrock knowledge base connected in place, searched live in
 # the team's own account (Retrieve), and listed on a self-hosted install
-aws-sdk-bedrockagentruntime = "1"
-aws-sdk-bedrockagent = "1"
+aws-sdk-bedrockagentruntime = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-bedrockagent = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 tokio = { version = "1", features = ["macros", "time", "net", "rt", "sync"] }
 # live: read-only lookups against a team's own systems
 graphql-parser = "0.4"
 url = "2"
-aws-sdk-kms = "1"
+aws-sdk-kms = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 # envelope: AES-256-GCM for sealed values larger than KMS encrypts directly
 ring = "0.17"
 zeroize = "1"
@@ -46,21 +46,21 @@ ed25519-dalek = { version = "2", default-features = false, features = ["std", "z
 rand = "0.9"
 serde = { version = "1", features = ["derive"] }
 # live: a team's AWS account (logs and databases), through a role it creates
-aws-sdk-sts = "1"
-aws-sdk-rdsdata = "1"
-aws-sdk-redshiftdata = "1"
-aws-sdk-cloudwatchlogs = "1"
+aws-sdk-sts = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-rdsdata = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-redshiftdata = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-cloudwatchlogs = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 # live: CloudWatch metrics and Airflow (MWAA) through the team's log reader role
-aws-sdk-cloudwatch = "1"
+aws-sdk-cloudwatch = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 # log_repo: which repo a log group's code lives in (read-only lookups)
-aws-sdk-ecs = "1"
-aws-sdk-lambda = "1"
-aws-sdk-cloudformation = "1"
-aws-sdk-ecr = "1"
-aws-sdk-iam = "1"
-aws-sdk-mwaa = "1"
+aws-sdk-ecs = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-lambda = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-cloudformation = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-ecr = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-iam = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-mwaa = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 # public_urls: the deployment's URL when CloudFront picked it (single origin)
-aws-sdk-ssm = "1"
+aws-sdk-ssm = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-smithy-types = "1"
 # live: fakes stand in for the HTTP and AWS calls in tests
 async-trait = "0.1"
@@ -69,12 +69,12 @@ regex = "1"
 # agent_policy: links in approval and sign-in messages
 urlencoding = "2"
 # e2e: Playwright HTML reports carry their results as an embedded zip
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "9.0.5", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 # live::tools: tool definitions written as YAML in a repo
 serde_yaml = "0.9"
 # e2e: JUnit XML test reports
 quick-xml = "0.37"
-aws-sdk-s3 = "1"
+aws-sdk-s3 = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio", "sigv4a", "http-1x"] }
 lopdf = { version = "0.46", default-features = false }
 yaml-rust2 = "0.10"
 

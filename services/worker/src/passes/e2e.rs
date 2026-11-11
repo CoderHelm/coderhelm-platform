@@ -93,7 +93,9 @@ fn reports_in_zip(bytes: &[u8]) -> Vec<(String, Vec<u8>)> {
     let mut out = Vec::new();
     for i in 0..zip.len() {
         let Ok(mut f) = zip.by_index(i) else { continue };
-        let name = f.name().to_string();
+        let Ok(name) = f.name().map(|n| n.to_string()) else {
+            continue;
+        };
         let lower = name.to_lowercase();
         // A Playwright HTML report's results are embedded in its index.html.
         let wanted = (lower.ends_with(".json") || lower.ends_with(".xml") || lower.ends_with("index.html"))

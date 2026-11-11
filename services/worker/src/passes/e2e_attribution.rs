@@ -193,7 +193,7 @@ fn trace_paths(zip_bytes: &[u8]) -> Vec<String> {
     let mut out = Vec::new();
     for i in 0..zip.len() {
         let Ok(f) = zip.by_index(i) else { continue };
-        if !f.name().ends_with(".network") {
+        if !f.name().is_ok_and(|n| n.ends_with(".network")) {
             continue;
         }
         let mut text = String::new();
