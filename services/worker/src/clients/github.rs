@@ -681,9 +681,11 @@ impl GitHubClient {
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         // A hybrid install without its own app: CoderHelm's broker (it caches).
         if common::hybrid::client::github_via_broker(&self.private_key) {
+            // Kept as the broker's error, so callers can tell an outage on
+            // CoderHelm's side from GitHub's own refusal.
             return common::hybrid::client::github_token(&self.http, self.installation_id)
                 .await
-                .map_err(|e| e.to_string().into());
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>);
         }
         // Check cache
         {

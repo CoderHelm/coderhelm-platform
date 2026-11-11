@@ -381,6 +381,7 @@ const REASONS: &[Reason] = &[
     Reason { code: "broker_repository_not_allowed", message: "That repository isn't one this install was given.", fix: "Add it on GitHub and in Settings, System, Hybrid." },
     Reason { code: "broker_refused", message: "CoderHelm's token broker refused the request.", fix: "Open Settings, System, Hybrid: it shows the link's state and how to fix it." },
     Reason { code: "broker_unreachable", message: "CoderHelm's token broker didn't answer.", fix: "Usually temporary; the next request retries. status.coderhelm.com shows any outage." },
+    Reason { code: "broker_unavailable", message: "CoderHelm's servers failed to answer (an outage on CoderHelm's side, not a refusal of this install).", fix: "Nothing to change here: CoderHelm asks again by itself, waiting longer each time. status.coderhelm.com shows any outage." },
     Reason { code: "jira_signature", message: "The Jira webhook's signature didn't match.", fix: "Copy the webhook secret from Settings, Integrations, Jira into Jira's webhook again." },
     Reason { code: "webhook_unreachable", message: "Your webhook endpoint couldn't be reached (the connection failed or its name didn't resolve).", fix: "Check the endpoint's address and that it is up. CoderHelm keeps retrying for about a day." },
     Reason { code: "webhook_timeout", message: "Your webhook endpoint didn't answer within 10 seconds.", fix: "Answer with a 2xx at once and do the work afterwards (queue it). CoderHelm retries meanwhile." },

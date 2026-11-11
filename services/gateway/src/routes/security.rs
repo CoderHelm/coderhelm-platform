@@ -2616,12 +2616,13 @@ mod tests {
         };
         // One run used today: two repos start, three wait for tomorrow.
         let plan = plan_for(&fs, 1, 0);
-        let runs = Some(sec::waiting_runs(3));
+        let words = sec::waiting_runs(3);
+        let runs = Some(words.clone());
         assert_eq!(
             waits(&plan),
             vec![None, None, runs.clone(), runs.clone(), runs.clone()]
         );
-        assert!(runs.unwrap().contains("Next starts tomorrow"));
+        assert!(words.contains("Next starts tomorrow"));
         assert_eq!(
             (plan["starting_now"].as_u64(), plan["waiting"].as_u64()),
             (Some(2), Some(3))

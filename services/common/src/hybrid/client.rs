@@ -72,6 +72,56 @@ impl std::fmt::Display for CallError {
     }
 }
 
+impl std::error::Error for CallError {}
+
+/// CoderHelm's servers failed (a 5xx or 429 that carries no reason, such as
+/// a gateway that couldn't start) or never answered: an outage on
+/// CoderHelm's side, not a refusal of this install.
+pub const UNAVAILABLE: &str = "broker_unavailable";
+
+impl CallError {
+    /// An outage on CoderHelm's side ([`UNAVAILABLE`], or no answer at all):
+    /// asking again later works without anyone changing anything.
+    pub fn is_outage(&self) -> bool {
+        matches!(self.code.as_str(), UNAVAILABLE | "broker_unreachable")
+    }
+}
+
+/// The error for an answer outside 2xx. CoderHelm's own refusals carry a
+/// `code` and an `error` sentence. An answer without them came from in front
+/// of CoderHelm's handlers (its API gateway answering for a function that
+/// failed, or a proxy): a 5xx or 429 is an outage, anything else a refusal
+/// that names its HTTP status, never a bare "refused".
+pub fn answer_error(status: u16, v: &Value) -> CallError {
+    if let Some(code) = v["code"].as_str().filter(|c| !c.is_empty()) {
+        return CallError {
+            status: Some(status),
+            code: code.to_string(),
+            message: v["error"]
+                .as_str()
+                .unwrap_or("CoderHelm's servers refused the request.")
+                .to_string(),
+        };
+    }
+    if status >= 500 || status == 429 {
+        return CallError {
+            status: Some(status),
+            code: UNAVAILABLE.into(),
+            message: format!(
+                "CoderHelm's servers failed to answer (HTTP {status}): an outage on CoderHelm's \
+                 side, not a refusal of this install. CoderHelm asks again by itself."
+            ),
+        };
+    }
+    CallError {
+        status: Some(status),
+        code: "broker_refused".into(),
+        message: format!(
+            "CoderHelm's servers refused the request (HTTP {status}) without saying why."
+        ),
+    }
+}
+
 /// A signed request to the hosted platform. `path` starts with `/hybrid/`.
 pub async fn call(
     http: &reqwest::Client,
@@ -107,7 +157,7 @@ pub async fn call(
     let status = resp.status().as_u16();
     let headers = resp.headers().clone();
     let raw = resp.bytes().await.unwrap_or_default();
-    check_answer(
+    let signed = check_answer(
         hosted_sig::trusted(),
         &creds.install_id,
         &request_id,
@@ -117,19 +167,18 @@ pub async fn call(
         &headers,
         &raw,
         chrono::Utc::now().timestamp(),
-    )?;
+    );
     let v: Value = serde_json::from_slice(&raw).unwrap_or(Value::Null);
+    if let Err(e) = signed {
+        // A failing gateway in front of CoderHelm answers 5xx unsigned: that
+        // is an outage, and nothing in it is used either way.
+        let out = answer_error(status, &Value::Null);
+        return Err(if out.is_outage() { out } else { e });
+    }
     if (200..300).contains(&status) {
         return Ok(v);
     }
-    Err(CallError {
-        status: Some(status),
-        code: v["code"].as_str().unwrap_or("broker_refused").to_string(),
-        message: v["error"]
-            .as_str()
-            .unwrap_or("CoderHelm's servers refused the request.")
-            .to_string(),
-    })
+    Err(answer_error(status, &v))
 }
 
 /// Checks that an answer from CoderHelm's servers carries CoderHelm's
@@ -229,6 +278,113 @@ pub fn token_grant(installation_id: u64) -> Option<TokenGrant> {
 static TOKENS: Mutex<Option<HashMap<u64, Cached>>> = Mutex::new(None);
 static BOT_LOGIN: RwLock<Option<String>> = RwLock::new(None);
 
+/// An installation the broker gave no token for: asked again only after
+/// `until`, so sweeps over many repositories ask once, not once a repository
+/// a tick.
+#[derive(Debug, Clone)]
+struct Failing {
+    error: CallError,
+    failures: u32,
+    until: i64,
+}
+
+static FAILING: Mutex<Option<HashMap<u64, Failing>>> = Mutex::new(None);
+
+/// How long to wait before asking the broker again after `failures` failures
+/// in a row: an outage from 30 seconds doubling to 10 minutes, a refusal
+/// (which needs someone to change something) from 5 minutes to an hour.
+pub fn retry_after_secs(e: &CallError, failures: u32) -> i64 {
+    let (first, most) = if e.is_outage() {
+        (30, 600)
+    } else {
+        (300, 3600)
+    };
+    (first << failures.saturating_sub(1).min(10)).min(most)
+}
+
+/// The broker's last refusal for an installation while it is not asked
+/// again, with when it will be. None when a token may be asked for now.
+pub fn token_backoff(installation_id: u64) -> Option<CallError> {
+    token_backoff_at(installation_id, chrono::Utc::now().timestamp())
+}
+
+fn token_backoff_at(installation_id: u64, now: i64) -> Option<CallError> {
+    let f = FAILING
+        .lock()
+        .ok()?
+        .as_ref()?
+        .get(&installation_id)
+        .cloned()?;
+    if now >= f.until {
+        return None;
+    }
+    let at = chrono::DateTime::from_timestamp(f.until, 0)
+        .map(|t| t.format("%H:%M UTC").to_string())
+        .unwrap_or_default();
+    let mut e = f.error;
+    e.message = format!("{} CoderHelm asks again at {at}.", e.message.trim_end());
+    Some(e)
+}
+
+/// Records the broker's answer for an installation: a failure starts or
+/// extends its wait (logged once, when it starts or its reason changes), a
+/// token ends it.
+fn note_token_answer(installation_id: u64, answer: Result<(), &CallError>, now: i64) {
+    let Ok(mut g) = FAILING.lock() else {
+        return;
+    };
+    let all = g.get_or_insert_with(HashMap::new);
+    match answer {
+        Ok(()) => {
+            if let Some(f) = all.remove(&installation_id) {
+                tracing::info!(
+                    installation_id,
+                    failures = f.failures,
+                    "hybrid: CoderHelm's broker gives tokens again"
+                );
+            }
+        }
+        Err(e) => {
+            let prev = all.get(&installation_id);
+            let same = prev.is_some_and(|p| p.error.code == e.code);
+            let failures = if same {
+                prev.map_or(1, |p| p.failures + 1)
+            } else {
+                1
+            };
+            let wait = retry_after_secs(e, failures);
+            if !same {
+                tracing::warn!(
+                    installation_id,
+                    code = %e.code,
+                    status = ?e.status,
+                    retry_in_secs = wait,
+                    error = %e.message,
+                    "hybrid: no GitHub token from CoderHelm's broker; asking again later"
+                );
+            }
+            all.insert(
+                installation_id,
+                Failing {
+                    error: e.clone(),
+                    failures,
+                    until: now + wait,
+                },
+            );
+        }
+    }
+}
+
+/// Forgets an installation's wait, so the next ask goes to the broker (a
+/// person re-checking the Status page after fixing the cause).
+pub fn forget_token_backoff(installation_id: u64) {
+    if let Ok(mut g) = FAILING.lock() {
+        if let Some(all) = g.as_mut() {
+            all.remove(&installation_id);
+        }
+    }
+}
+
 /// A GitHub installation token from the hosted broker (cached until five
 /// minutes before it expires).
 pub async fn github_token(
@@ -245,27 +401,36 @@ pub async fn github_token(
             return Ok(c.token);
         }
     }
+    if let Some(e) = token_backoff_at(installation_id, now) {
+        return Err(e);
+    }
     let creds = credentials().ok_or_else(|| CallError {
         status: None,
         code: "broker_not_linked".into(),
         message: "This install isn't registered with CoderHelm's apps.".into(),
     })?;
-    let v = call(
+    let answer = call(
         http,
         &creds,
         "POST",
         "/hybrid/github/token",
         Some(&serde_json::json!({ "installation_id": installation_id })),
     )
-    .await?;
+    .await
+    .and_then(|v| {
+        if v["token"].as_str().unwrap_or_default().is_empty() {
+            Err(CallError {
+                status: None,
+                code: "broker_refused".into(),
+                message: "The broker answered without a token.".into(),
+            })
+        } else {
+            Ok(v)
+        }
+    });
+    note_token_answer(installation_id, answer.as_ref().map(|_| ()), now);
+    let v = answer?;
     let token = v["token"].as_str().unwrap_or_default().to_string();
-    if token.is_empty() {
-        return Err(CallError {
-            status: None,
-            code: "broker_refused".into(),
-            message: "The broker answered without a token.".into(),
-        });
-    }
     let expires_at = v["expires_at"]
         .as_str()
         .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
@@ -322,6 +487,103 @@ mod tests {
         // An older broker says neither.
         let old = TokenGrant::from_answer(&serde_json::json!({"token": "t"}));
         assert!(old.withheld.is_empty() && !old.installation_known);
+    }
+
+    /// 11/11: CoderHelm's hosted gateway couldn't start for five and a half
+    /// hours, and its API gateway answered every call `502
+    /// {"message":"Internal Server Error"}`. That read as "CoderHelm's servers
+    /// refused the request (broker_refused)": a refusal of this install. It
+    /// is an outage, named as one.
+    #[test]
+    fn an_answer_without_coderhelms_reason_is_an_outage_or_names_its_status() {
+        let gw = serde_json::json!({"message": "Internal Server Error"});
+        for status in [500, 502, 503, 504, 429] {
+            let e = answer_error(status, &gw);
+            assert_eq!(e.code, UNAVAILABLE, "{status}");
+            assert!(e.is_outage());
+            assert!(
+                e.message.contains(&format!("HTTP {status}")),
+                "{}",
+                e.message
+            );
+            assert!(!e.message.contains("refused"), "{}", e.message);
+        }
+        let e = answer_error(403, &serde_json::json!({"message": "Forbidden"}));
+        assert_eq!(e.code, "broker_refused");
+        assert!(
+            e.message.contains("HTTP 403") && !e.is_outage(),
+            "{}",
+            e.message
+        );
+        assert!(answer_error(502, &Value::Null).is_outage());
+        // CoderHelm's own refusal keeps its code and sentence, whatever the status.
+        let own = answer_error(
+            403,
+            &serde_json::json!({"code": "broker_not_linked", "error": "That GitHub installation isn't linked to this install."}),
+        );
+        assert_eq!(own.code, "broker_not_linked");
+        assert_eq!(
+            own.message,
+            "That GitHub installation isn't linked to this install."
+        );
+        let mint = answer_error(
+            502,
+            &serde_json::json!({"code": "broker_refused", "error": "GitHub refused the token: 422"}),
+        );
+        assert_eq!(mint.code, "broker_refused");
+        assert!(!mint.is_outage());
+        assert!(CallError {
+            status: None,
+            code: "broker_unreachable".into(),
+            message: String::new()
+        }
+        .is_outage());
+    }
+
+    /// One installation the broker can't serve is asked once, then again
+    /// after a wait that grows, not once a repository each sweep: the
+    /// sweeps' 282 failed asks in a day and a half become a handful.
+    #[test]
+    fn a_failed_token_is_asked_for_again_only_after_a_growing_wait() {
+        let iid = 9_100_001;
+        let down = answer_error(502, &Value::Null);
+        assert!(token_backoff_at(iid, 1_000).is_none());
+        note_token_answer(iid, Err(&down), 1_000);
+        let e = token_backoff_at(iid, 1_000).expect("waits");
+        assert_eq!(e.code, UNAVAILABLE);
+        assert!(e.message.contains("asks again at"), "{}", e.message);
+        assert!(token_backoff_at(iid, 1_029).is_some());
+        assert!(
+            token_backoff_at(iid, 1_030).is_none(),
+            "30 s after the first outage"
+        );
+        note_token_answer(iid, Err(&down), 1_030);
+        assert!(token_backoff_at(iid, 1_089).is_some(), "then 60 s");
+        assert!(token_backoff_at(iid, 1_090).is_none());
+        // Outages wait at most 10 minutes; refusals 5 minutes to an hour.
+        assert_eq!(retry_after_secs(&down, 1), 30);
+        assert_eq!(retry_after_secs(&down, 30), 600);
+        let refused = answer_error(
+            403,
+            &serde_json::json!({"code": "broker_not_linked", "error": "x"}),
+        );
+        assert_eq!(retry_after_secs(&refused, 1), 300);
+        assert_eq!(retry_after_secs(&refused, 2), 600);
+        assert_eq!(retry_after_secs(&refused, 30), 3600);
+        // Another reason starts its own wait; a token ends it.
+        note_token_answer(iid, Err(&refused), 1_090);
+        assert_eq!(
+            token_backoff_at(iid, 1_100).unwrap().code,
+            "broker_not_linked"
+        );
+        assert!(token_backoff_at(iid, 1_389).is_some() && token_backoff_at(iid, 1_390).is_none());
+        note_token_answer(iid, Ok(()), 1_400);
+        assert!(token_backoff_at(iid, 1_400).is_none());
+        // Other installations are not held by this one.
+        note_token_answer(iid, Err(&refused), 2_000);
+        assert!(token_backoff_at(iid + 1, 2_000).is_none());
+        forget_token_backoff(iid);
+        assert!(token_backoff_at(iid, 2_000).is_none());
     }
 
     #[test]

@@ -66,7 +66,9 @@ jobs:
           workspaces: services
           cache-on-failure: true
       - run: cargo fmt --check --all
-      - run: cargo clippy --workspace -- -D warnings
+      # --all-targets: tests are linted too (a test-only lint once failed
+      # only on a local --all-targets run).
+      - run: cargo clippy --workspace --all-targets -- -D warnings
 
   rust-test:
     name: Rust (tests)

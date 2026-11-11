@@ -299,6 +299,7 @@ pub async fn run(
         ..Default::default()
     };
     let mut installs: HashMap<String, Option<u64>> = HashMap::new();
+    let mut held = super::review_reminder::BrokerHeld::default();
     let now = chrono::Utc::now();
     for r in repos {
         let iid = match installs.get(&r.team_id) {
@@ -312,10 +313,14 @@ pub async fn run(
         let Some(iid) = iid else {
             continue;
         };
+        if held.skip(iid) {
+            continue;
+        }
         if let Err(e) = sweep_repo(state, &r, iid, now, &mut report).await {
             warn!(repo = %r.repo, error = %e, "Stuck-review sweep failed for repo");
         }
     }
+    held.log("Stuck-review sweep");
     Ok(report)
 }
 

@@ -72,6 +72,7 @@ pub async fn run(state: &WorkerState) -> Result<(), Box<dyn std::error::Error + 
     );
 
     let mut install_cache: HashMap<String, u64> = HashMap::new();
+    let mut held = BrokerHeld::default();
     for cfg in configs {
         let iid = match install_cache.get(&cfg.team_id) {
             Some(v) => *v,
@@ -86,11 +87,63 @@ pub async fn run(state: &WorkerState) -> Result<(), Box<dyn std::error::Error + 
                 }
             },
         };
+        if held.skip(iid) {
+            continue;
+        }
         if let Err(e) = sweep_repo(state, &cfg, iid).await {
             warn!(repo = %cfg.repo, error = %e, "Reminder sweep failed for repo");
         }
     }
+    held.log("Reminder sweep");
     Ok(())
+}
+
+/// The repositories a sweep leaves for its next tick because CoderHelm's
+/// broker gave their installation no token a moment ago (a hybrid install;
+/// `hybrid::client::token_backoff`). The broker's answer was logged once
+/// when its wait began; asking again for every repository, every tick, only
+/// repeated it (282 warnings in a day and a half during one outage).
+#[derive(Default)]
+pub struct BrokerHeld {
+    by_installation: HashMap<u64, (usize, common::hybrid::client::CallError)>,
+}
+
+impl BrokerHeld {
+    /// True when this installation's repositories wait for the next tick.
+    pub fn skip(&mut self, installation_id: u64) -> bool {
+        self.skip_with(
+            installation_id,
+            common::hybrid::client::token_backoff(installation_id),
+        )
+    }
+
+    fn skip_with(
+        &mut self,
+        installation_id: u64,
+        waiting: Option<common::hybrid::client::CallError>,
+    ) -> bool {
+        let Some(e) = waiting else {
+            return false;
+        };
+        self.by_installation
+            .entry(installation_id)
+            .or_insert((0, e))
+            .0 += 1;
+        true
+    }
+
+    /// One line for the whole sweep, not one a repository.
+    pub fn log(&self, sweep: &str) {
+        for (installation_id, (repos, e)) in &self.by_installation {
+            info!(
+                installation_id,
+                repos,
+                code = %e.code,
+                reason = %e.message,
+                "{sweep}: repositories left for the next tick (no GitHub token from CoderHelm's broker)"
+            );
+        }
+    }
 }
 
 /// Reviewer configs with reminders on and a saved channel (Teams or Slack
@@ -314,6 +367,17 @@ fn human_age(created_at: &str, now_ts: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::should_notify;
+
+    #[test]
+    fn a_sweep_skips_an_installation_the_broker_is_holding_and_says_so_once() {
+        let mut held = super::BrokerHeld::default();
+        let e = common::hybrid::client::answer_error(502, &serde_json::Value::Null);
+        assert!(!held.skip_with(1, None));
+        assert!(held.skip_with(2, Some(e.clone())));
+        assert!(held.skip_with(2, Some(e)));
+        assert_eq!(held.by_installation.len(), 1);
+        assert_eq!(held.by_installation[&2].0, 2);
+    }
 
     const COOLDOWN: i64 = 4 * 3600;
 
