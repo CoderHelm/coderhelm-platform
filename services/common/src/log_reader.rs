@@ -199,12 +199,34 @@ pub const ABILITIES: &[Ability] = &[
         ],
         chosen: true,
     },
+    Ability {
+        key: "inspector",
+        name: "Amazon Inspector findings",
+        why: "Reads Amazon Inspector's findings (which packages are vulnerable on each instance, image and function, whether an exploit is known and whether the network can reach it) when a team runs Inspector. Only when the stack's InspectorFindings parameter is on. Inspector is billed by AWS; CoderHelm never turns it on.",
+        actions: &[
+            "inspector2:ListFindings",
+            "inspector2:ListCoverage",
+            "inspector2:BatchGetAccountStatus",
+        ],
+        chosen: true,
+    },
+    Ability {
+        key: "health",
+        name: "AWS Health events",
+        why: "Reads the account's AWS Health events (security notifications, scheduled maintenance, retirements) and the resources they name, through the Health API, which needs AWS Business Support or higher. Only when the stack's HealthEvents parameter is on.",
+        actions: &[
+            "health:DescribeEvents",
+            "health:DescribeAffectedEntities",
+            "health:DescribeEventDetails",
+        ],
+        chosen: true,
+    },
 ];
 
 /// Optional abilities a team switches on per account: the live check
 /// asks about them too, but a missing one never makes the role "need an
 /// update" unless the team switched it on (`AwsAccount::infra_on`).
-pub const OPTIONAL: &[&str] = &["infra"];
+pub const OPTIONAL: &[&str] = &["infra", "inspector", "health"];
 
 /// The only actions that change anything, all in [`ability`] `sync` and
 /// granted only on the knowledge bases a team names in SyncKnowledgeBases.
@@ -225,6 +247,10 @@ pub struct Chosen<'a> {
     pub sync_knowledge_bases: &'a [String],
     /// The team switched infrastructure vulnerabilities on in this account.
     pub infrastructure: bool,
+    /// The team reads Amazon Inspector's findings, and AWS Health through
+    /// its API.
+    pub inspector: bool,
+    pub health: bool,
 }
 
 impl<'a> Chosen<'a> {
@@ -234,6 +260,17 @@ impl<'a> Chosen<'a> {
             buckets,
             sync_knowledge_bases: &[],
             infrastructure: false,
+            inspector: false,
+            health: false,
+        }
+    }
+
+    /// The same, also reading Inspector's findings and Health events.
+    pub fn with_optin(self, inspector: bool, health: bool) -> Chosen<'a> {
+        Chosen {
+            inspector,
+            health,
+            ..self
         }
     }
 
@@ -258,6 +295,8 @@ impl<'a> Chosen<'a> {
             && self.buckets.is_empty()
             && self.sync_knowledge_bases.is_empty()
             && !self.infrastructure
+            && !self.inspector
+            && !self.health
     }
 }
 
@@ -479,6 +518,12 @@ pub fn update_url(update_template_url: &str, region: &str, chosen: &Chosen) -> S
     if chosen.infrastructure {
         u.push_str("&param_InfrastructureVulnerabilities=on");
     }
+    if chosen.inspector {
+        u.push_str("&param_InspectorFindings=on");
+    }
+    if chosen.health {
+        u.push_str("&param_HealthEvents=on");
+    }
     u
 }
 
@@ -510,6 +555,12 @@ pub fn update_stack_name_for(chosen: &Chosen) -> String {
     // Infrastructure reads are their own part too.
     if chosen.infrastructure {
         seed.push_str("|infra");
+    }
+    if chosen.inspector {
+        seed.push_str("|inspector");
+    }
+    if chosen.health {
+        seed.push_str("|health");
     }
     format!(
         "{}-kb{}",
@@ -764,8 +815,8 @@ mod tests {
         assert!(checked.contains(&"logs:StartQuery"));
         // Knowledge bases (6), imports (4), copying into Bedrock (6 more:
         // its Get calls are the knowledge bases' too) and infrastructure
-        // reads (19).
-        assert_eq!(checked.len() + 35, all_actions().len());
+        // reads (19), Inspector (3) and Health (3).
+        assert_eq!(checked.len() + 41, all_actions().len());
         assert!(!checked.contains(&"bedrock:IngestKnowledgeBaseDocuments"));
         // Copying into Bedrock rides along as its own parameter and stack.
         let sync = ["arn:aws:bedrock:us-east-1:111122223333:knowledge-base/SYNC123456".to_string()];
@@ -828,6 +879,37 @@ mod tests {
             !update_url("https://b/x/y.yaml", "us-east-1", &Chosen::default())
                 .contains("Infrastructure")
         );
+    }
+
+    #[test]
+    fn inspector_and_health_are_optional_reads_that_ride_on_the_update() {
+        let on = Chosen::default().with_infrastructure(true);
+        let both = on.with_optin(true, true);
+        let u = update_url("https://b/x/y.yaml", "us-east-1", &both);
+        assert!(
+            u.contains("&param_InspectorFindings=on") && u.contains("&param_HealthEvents=on"),
+            "{u}"
+        );
+        assert_ne!(update_stack_name_for(&both), update_stack_name_for(&on));
+        for key in ["inspector", "health"] {
+            let a = ability(key).unwrap();
+            assert!(a.chosen && OPTIONAL.contains(&key));
+            for x in a.actions {
+                assert!(is_optional(x), "{x}");
+                let verb = x.split(':').nth(1).unwrap();
+                assert!(
+                    ["Describe", "List", "BatchGet"]
+                        .iter()
+                        .any(|v| verb.starts_with(v)),
+                    "{x}"
+                );
+            }
+        }
+        for t in [ROLE_TEMPLATE, UPDATE_TEMPLATE] {
+            assert!(t.contains("ReadsInspector: !Equals [!Ref InspectorFindings, \"on\"]"));
+            assert!(t.contains("ReadsHealth: !Equals [!Ref HealthEvents, \"on\"]"));
+            assert!(t.contains("$1.25 per instance"), "the cost is stated");
+        }
     }
 
     #[test]

@@ -64,6 +64,9 @@ const OWN_CONDITIONS: Record<string, boolean> = {
   // with other boundary changes. Accounts a team connects with their own
   // CoderHelmLogReader role aren't limited by this install's boundary.
   ReadsInfrastructure: false,
+  // Inspector and Health are team choices, read through a team's own role.
+  ReadsInspector: false,
+  ReadsHealth: false,
 };
 
 type Statement = { Sid?: string; Effect: string; Action: string | string[]; Resource: unknown };
@@ -91,7 +94,7 @@ export function decideConditions(v: unknown, conditions: Record<string, boolean>
 /** The update template's statements for the install's own role: its knowledge bases are every one in its account. */
 export function updateTemplateStatements(): Statement[] {
   const scratch = new cdk.Stack(new cdk.App(), "Scratch");
-  const inc = new CfnInclude(scratch, "T", { templateFile: repoPath(UPDATE_TEMPLATE), parameters: { RoleName: ROLE_NAME_MARK, KnowledgeBases: OWN_KNOWLEDGE_BASES, ImportBuckets: "", SyncKnowledgeBases: "", InfrastructureVulnerabilities: "off" } });
+  const inc = new CfnInclude(scratch, "T", { templateFile: repoPath(UPDATE_TEMPLATE), parameters: { RoleName: ROLE_NAME_MARK, KnowledgeBases: OWN_KNOWLEDGE_BASES, ImportBuckets: "", SyncKnowledgeBases: "", InfrastructureVulnerabilities: "off", InspectorFindings: "off", HealthEvents: "off" } });
   const p = inc.getResource(UPDATE_POLICY_ID) as iam.CfnPolicy;
   return decideConditions(scratch.resolve(p.policyDocument).Statement, OWN_CONDITIONS) as Statement[];
 }

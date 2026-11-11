@@ -679,6 +679,7 @@ pub const CAPABILITIES: &[Capability] = &[
         handlers: &[
             "security::put_config",
             "infra_security::check",
+            "infra_security::put_config",
             "infra_security::fix",
             "security::dismiss",
             "security::reopen",

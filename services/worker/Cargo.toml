@@ -42,6 +42,10 @@ aws-sdk-elasticache = "1"
 aws-sdk-opensearch = "1"
 aws-sdk-ssm = "1"
 aws-sdk-ecr = "1"
+# infra_inventory, when a team turns them on: Amazon Inspector findings and
+# AWS Health events (read-only)
+aws-sdk-inspector2 = "1"
+aws-sdk-health = "1"
 aws-smithy-types = "1"
 
 # HTTP client (GitHub API, Jira API)

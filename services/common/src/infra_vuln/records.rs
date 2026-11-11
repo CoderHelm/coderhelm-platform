@@ -21,6 +21,32 @@ pub const UNIT_ECOSYSTEM: &str = "infrastructure";
 /// Fixed findings are kept this long.
 pub const FIXED_KEEP_DAYS: i64 = 180;
 
+/// How the team reads AWS Health.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HealthMode {
+    #[default]
+    Off,
+    /// The Health API (Business Support or higher).
+    Api,
+    /// The EventBridge rule template, forwarding to a queue the role reads.
+    Eventbridge,
+}
+
+/// The team's opt-in switches. Both cost or need something from the team,
+/// so both start off.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct InfraConfig {
+    /// Read Amazon Inspector's findings (billed by AWS to the team).
+    pub inspector: bool,
+    pub health: HealthMode,
+}
+
+/// What the switches say, for the page.
+pub const INSPECTOR_COST: &str = "Amazon Inspector is billed by AWS, to your account: about $1.25 per instance a month, $0.09 per container image scan and $0.30 per Lambda function a month. CoderHelm only reads its findings; it never turns Inspector on.";
+pub const HEALTH_PLAN: &str = "The AWS Health API needs AWS Business Support or higher. Without it, deploy the EventBridge rule template in the account: it forwards the account's Health events to a queue the read-only role may read.";
+
 pub fn finding_sk(id: &str) -> String {
     format!("{FINDING_PREFIX}{id}")
 }
@@ -51,13 +77,6 @@ pub struct PrRef {
     pub state: String,
 }
 
-/// What Inspector adds when the team turned it on.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct InspectorFacts {
-    pub exploit_available: bool,
-    pub reachable: Option<bool>,
-}
-
 /// One stored finding.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Record {
@@ -68,8 +87,6 @@ pub struct Record {
     pub pr: Option<PrRef>,
     #[serde(default)]
     pub ticket: String,
-    #[serde(default)]
-    pub inspector: Option<InspectorFacts>,
     pub first_seen_at: String,
     pub updated_at: String,
     #[serde(default)]
@@ -96,7 +113,6 @@ impl Record {
             status,
             pr: None,
             ticket: String::new(),
-            inspector: None,
             first_seen_at: now.into(),
             updated_at: now.into(),
             fixed_at: None,
@@ -113,7 +129,7 @@ impl Record {
         if let Some(o) = v.as_object_mut() {
             o.insert("status".into(), json!(self.status));
             o.insert("pr".into(), json!(self.pr));
-            o.insert("inspector".into(), json!(self.inspector));
+            o.insert("inspector".into(), json!(self.finding.inspector));
             o.insert("first_seen_at".into(), json!(self.first_seen_at));
             o.insert("updated_at".into(), json!(self.updated_at));
             o.insert("fixed_at".into(), json!(self.fixed_at));

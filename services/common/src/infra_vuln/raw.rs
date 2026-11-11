@@ -164,6 +164,65 @@ pub struct RawScan {
     pub cves: Vec<String>,
 }
 
+/// One Amazon Inspector finding, as read (only the fields kept).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RawInspector {
+    /// The resource it is on: an instance id, an ECR image's digest, a
+    /// function ARN.
+    pub resource_id: String,
+    /// `AWS_EC2_INSTANCE`, `AWS_ECR_CONTAINER_IMAGE`, `AWS_LAMBDA_FUNCTION`.
+    pub resource_type: String,
+    pub hit: super::inventory::InspectorHit,
+}
+
+/// One AWS Health event and the resources it names.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RawHealth {
+    pub arn: String,
+    pub service: String,
+    /// `AWS_EC2_INSTANCE_RETIREMENT_SCHEDULED`, `AWS_RDS_SECURITY_NOTIFICATION`.
+    pub event_type: String,
+    /// `issue`, `accountNotification`, `scheduledChange`.
+    pub category: String,
+    pub status: String,
+    pub start: String,
+    pub description: String,
+    /// Instance ids, ARNs or names of the affected resources.
+    pub entities: Vec<String>,
+}
+
+/// An AWS Health event as EventBridge delivers it (`source: aws.health`).
+pub fn parse_health_event(body: &str) -> Option<RawHealth> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    if v["source"].as_str() != Some("aws.health") {
+        return None;
+    }
+    let d = &v["detail"];
+    let s = |k: &str| d[k].as_str().unwrap_or("").to_string();
+    Some(RawHealth {
+        arn: s("eventArn"),
+        service: s("service"),
+        event_type: s("eventTypeCode"),
+        category: s("eventTypeCategory"),
+        status: s("statusCode"),
+        start: s("startTime"),
+        description: d["eventDescription"][0]["latestDescription"]
+            .as_str()
+            .unwrap_or("")
+            .to_string(),
+        entities: d["affectedEntities"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|e| e["entityValue"].as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default(),
+    })
+}
+
 /// One read of one account in one region.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -186,6 +245,10 @@ pub struct RawAccount {
     /// `(instance id, running kernel)` from SSM inventory.
     pub kernels: Vec<(String, String)>,
     pub scans: Vec<RawScan>,
+    /// Amazon Inspector's active findings (when the team runs it).
+    pub inspector: Vec<RawInspector>,
+    /// AWS Health events (the Health API, or the EventBridge queue).
+    pub health: Vec<RawHealth>,
     /// AWS's latest AL2023 AMI in this region, by architecture.
     pub latest_al2023: BTreeMap<String, String>,
     /// Calls that failed: `(call, why)`. A refused call names the
@@ -282,6 +345,12 @@ impl RawAccount {
                     .unwrap_or_default(),
                 ..Default::default()
             };
+            r.inspector = self
+                .inspector
+                .iter()
+                .filter(|x| x.resource_id == i.id)
+                .map(|x| x.hit.clone())
+                .collect();
             r.exposure = if i.public_ip {
                 Exposure {
                     public: true,
@@ -547,7 +616,8 @@ impl RawAccount {
             out.push(r);
         }
 
-        // Container images with scan results (ECR).
+        // Container images with scan results (ECR), and Inspector's
+        // findings on images that run.
         for s in &self.scans {
             let mut r = base(
                 &format!("{}@{}", s.repository, s.digest),
@@ -570,6 +640,31 @@ impl RawAccount {
             r.tags
                 .insert("coderhelm:scan-high".into(), s.high.to_string());
             out.push(r);
+        }
+        // AWS Health events land on the resources they name.
+        for e in self.health.iter().filter(|e| e.status != "closed") {
+            for r in out.iter_mut() {
+                let named = e.entities.iter().any(|x| {
+                    x == &r.id
+                        || x == &r.name
+                        || r.id.ends_with(&format!("/{x}"))
+                        || r.id.ends_with(&format!(":{x}"))
+                });
+                if named && !r.pending.iter().any(|p| p.name == e.event_type) {
+                    r.pending.push(Pending {
+                        kind: "health".into(),
+                        name: e.event_type.clone(),
+                        description: crate::truncate_str(&e.description, 400).to_string(),
+                        apply_by: e.start.chars().take(10).collect(),
+                        auto_applied_after: if e.category == "scheduledChange" {
+                            e.start.chars().take(10).collect()
+                        } else {
+                            String::new()
+                        },
+                        status: e.status.clone(),
+                    });
+                }
+            }
         }
         out
     }
@@ -612,6 +707,12 @@ pub const CALLS: &[(&str, &str)] = &[
     ("DescribeImageScanFindings", "ecr:DescribeImageScanFindings"),
     ("GetParameters", "ssm:GetParameters"),
     ("ListInventoryEntries", "ssm:ListInventoryEntries"),
+    ("ListFindings (Inspector)", "inspector2:ListFindings"),
+    ("DescribeEvents (Health)", "health:DescribeEvents"),
+    (
+        "DescribeAffectedEntities (Health)",
+        "health:DescribeAffectedEntities",
+    ),
 ];
 
 #[cfg(test)]
@@ -678,15 +779,62 @@ mod tests {
     }
 
     #[test]
-    fn every_call_names_a_permission_of_the_ability() {
+    fn every_call_names_a_permission_of_the_abilities() {
         for (_, action) in CALLS {
-            assert!(
-                crate::log_reader::ability("infra")
+            let found = ["infra", "inspector", "health"].iter().any(|k| {
+                crate::log_reader::ability(k)
                     .unwrap()
                     .actions
-                    .contains(action),
-                "{action}"
-            );
+                    .contains(action)
+            });
+            assert!(found, "{action}");
         }
+    }
+
+    #[test]
+    fn a_health_event_from_eventbridge_reads_its_entities() {
+        let body = r#"{"version":"0","source":"aws.health","detail-type":"AWS Health Event","detail":{"eventArn":"arn:aws:health:us-east-1::event/EC2/AWS_EC2_INSTANCE_RETIREMENT_SCHEDULED/x","service":"EC2","eventTypeCode":"AWS_EC2_INSTANCE_RETIREMENT_SCHEDULED","eventTypeCategory":"scheduledChange","statusCode":"upcoming","startTime":"Sat, 21 Nov 2026 00:00:00 GMT","eventDescription":[{"language":"en_US","latestDescription":"Your instance will be retired."}],"affectedEntities":[{"entityValue":"i-0a1b2c3d4e5f60001"}]}}"#;
+        let e = parse_health_event(body).unwrap();
+        assert_eq!(e.event_type, "AWS_EC2_INSTANCE_RETIREMENT_SCHEDULED");
+        assert_eq!(e.entities, vec!["i-0a1b2c3d4e5f60001"]);
+        assert!(parse_health_event(r#"{"source":"aws.ec2"}"#).is_none());
+    }
+
+    #[test]
+    fn inspector_and_health_land_on_the_resources_they_name() {
+        let mut raw = read();
+        raw.inspector.push(RawInspector {
+            resource_id: "i-0a1b2c3d4e5f60002".into(),
+            resource_type: "AWS_EC2_INSTANCE".into(),
+            hit: super::super::inventory::InspectorHit {
+                id: "f1".into(),
+                vulnerability: "CVE-2026-98432".into(),
+                severity: "HIGH".into(),
+                exploit_available: true,
+                reachable: Some(true),
+                ..Default::default()
+            },
+        });
+        raw.health.push(RawHealth {
+            arn: "arn:aws:health:us-east-1::event/RDS/AWS_RDS_SECURITY_NOTIFICATION/x".into(),
+            event_type: "AWS_RDS_SECURITY_NOTIFICATION".into(),
+            category: "accountNotification".into(),
+            status: "open".into(),
+            start: "2026-11-01T00:00:00Z".into(),
+            entities: vec!["orders".into()],
+            ..Default::default()
+        });
+        let r = raw.resources();
+        let asg = r.iter().find(|x| x.kind == Kind::AutoScalingGroup).unwrap();
+        assert_eq!(
+            asg.inspector.len(),
+            1,
+            "the group carries its instances' Inspector findings"
+        );
+        let db = r.iter().find(|x| x.kind == Kind::RdsCluster).unwrap();
+        assert!(db
+            .pending
+            .iter()
+            .any(|p| p.kind == "health" && p.name == "AWS_RDS_SECURITY_NOTIFICATION"));
     }
 }

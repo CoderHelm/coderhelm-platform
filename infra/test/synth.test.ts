@@ -196,7 +196,8 @@ test("self-host: the gateway and worker read the install's own account with this
   };
   // Infrastructure vulnerabilities isn't on the install's own role yet: its reads wait for the
   // permissions boundary to allow them (own-account-read.ts, ReadsInfrastructure).
-  const abilities = without(without(without(all, "imports"), "sync"), "infra");
+  // Inspector and Health are a team's choice, read through its own role.
+  const abilities = ["imports", "sync", "infra", "inspector", "health"].reduce(without, all);
   const needed = [...new Set([...abilities.matchAll(/"([a-z0-9-]+:[A-Za-z]+)"/g)].map((m) => m[1]))];
   assert.ok(needed.length > 20, `${needed.length} actions`);
   for (const [stack, fn] of [
