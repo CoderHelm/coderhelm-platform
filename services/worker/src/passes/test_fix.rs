@@ -2629,9 +2629,10 @@ pub async fn ready_gate(
         .and_then(|v| v["check_runs"].as_array().cloned())
         .unwrap_or_default();
     let statuses = github
-        .get_commit_status(owner, repo, &sha)
+        .commit_statuses(owner, repo, &sha)
         .await
         .ok()
+        .flatten()
         .and_then(|v| v["statuses"].as_array().cloned())
         .unwrap_or_default();
     let checks = check_gate::checks(&runs, &statuses);

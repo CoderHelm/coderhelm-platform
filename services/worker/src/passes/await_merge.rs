@@ -208,8 +208,10 @@ async fn ci_summary(
     let runs = github.list_check_runs_for_ref(owner, repo, sha).await?;
     let runs = runs["check_runs"].as_array().cloned().unwrap_or_default();
     let mut summary = classify_check_runs(&runs);
-    let status = github.get_commit_status(owner, repo, sha).await?;
-    add_commit_statuses(&mut summary, &status);
+    // Without the statuses permission the check runs alone decide.
+    if let Some(status) = github.commit_statuses(owner, repo, sha).await? {
+        add_commit_statuses(&mut summary, &status);
+    }
     summary.pending.sort();
     summary.failing.sort();
     Ok(summary)

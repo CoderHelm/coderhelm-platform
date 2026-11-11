@@ -607,14 +607,15 @@ pub fn tick_message(msg: &HealthCheckMessage, delay: i64) -> Option<(String, i32
     Some((v.to_string(), delay.clamp(0, MAX_DELAY_SECS) as i32))
 }
 
-/// Names of base-branch check runs currently in a failing conclusion.
+/// Names of base-branch checks (check runs and commit statuses) currently
+/// in a failing conclusion.
 pub async fn failing_checks(
     github: &GitHubClient,
     owner: &str,
     repo: &str,
     git_ref: &str,
 ) -> Vec<String> {
-    let Ok(v) = github.list_check_runs_for_ref(owner, repo, git_ref).await else {
+    let Ok(v) = github.list_ci_for_ref(owner, repo, git_ref).await else {
         return vec![];
     };
     v["check_runs"]

@@ -27,6 +27,8 @@ pub mod code_graph;
 /// A repository's public codegen environment: what may be kept, and what
 /// a failed generator is missing.
 pub mod codegen_env;
+/// A commit's check runs and commit statuses as one CI listing.
+pub mod commit_ci;
 /// Every delivery in and out (webhooks, relay forwards, notifications,
 /// email), with what happened, for the Deliveries page.
 pub mod deliveries;
@@ -65,6 +67,9 @@ pub mod draft_hold;
 pub mod e2e;
 /// A team's branch, commit and PR title templates, and how they render.
 pub mod git_conventions;
+/// What an installation's token may read: permissions a feature uses when
+/// granted and does without otherwise.
+pub mod github_grants;
 pub mod github_wait;
 pub mod live;
 /// Log findings and the fix runs started from them.

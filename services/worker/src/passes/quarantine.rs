@@ -190,7 +190,7 @@ pub async fn gate(
         return Gate::Real;
     }
     // A failing legacy commit status isn't a test run.
-    if let Ok(v) = github.get_commit_status(owner, repo, git_ref).await {
+    if let Ok(Some(v)) = github.commit_statuses(owner, repo, git_ref).await {
         let any = v["statuses"].as_array().is_some_and(|s| !s.is_empty());
         if any && matches!(v["state"].as_str(), Some("failure" | "error")) {
             return Gate::Real;

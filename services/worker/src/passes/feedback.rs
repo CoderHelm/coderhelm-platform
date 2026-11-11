@@ -3353,6 +3353,42 @@ fn resume_owns_ci(run_status: &str) -> bool {
     matches!(run_status, "awaiting_ci" | "running")
 }
 
+/// The failed checks as lines: a check run's name, a commit status's name
+/// with its description and link (its log lives outside GitHub).
+pub(crate) fn failed_check_lines(failed: &[&serde_json::Value]) -> String {
+    let mut runs: Vec<&str> = Vec::new();
+    let mut statuses: Vec<String> = Vec::new();
+    for r in failed {
+        let name = r["name"].as_str().unwrap_or("check");
+        if common::commit_ci::is_status(r) {
+            let said = r["output"]["summary"].as_str().unwrap_or("").trim();
+            let url = r["details_url"].as_str().unwrap_or("").trim();
+            let mut line = format!("- {name} (commit status)");
+            if !said.is_empty() {
+                line.push_str(&format!(": {said}"));
+            }
+            if !url.is_empty() {
+                line.push_str(&format!(" ({url})"));
+            }
+            statuses.push(line);
+        } else {
+            runs.push(name);
+        }
+    }
+    let mut out = String::new();
+    if !runs.is_empty() {
+        out.push_str(&format!("Failed checks: {}", runs.join(", ")));
+    }
+    if !statuses.is_empty() {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str("Failed commit statuses (CI outside GitHub Actions):\n");
+        out.push_str(&statuses.join("\n"));
+    }
+    out
+}
+
 /// Check CI status for a PR branch. Returns Some(logs) if there are failures, None if CI is green or absent.
 async fn fetch_ci_failures(
     github: &GitHubClient,
@@ -3364,7 +3400,7 @@ async fn fetch_ci_failures(
     }
 
     let checks = github
-        .list_check_runs_for_ref(&msg.repo_owner, &msg.repo_name, branch)
+        .list_ci_for_ref(&msg.repo_owner, &msg.repo_name, branch)
         .await
         .ok()?;
 
@@ -3384,14 +3420,7 @@ async fn fetch_ci_failures(
     // Try to get workflow run logs for the first failed check
     let workflow_run_id = failed
         .iter()
-        .filter_map(|r| {
-            r["details_url"]
-                .as_str()
-                .and_then(|u| u.split("/runs/").nth(1))
-                .and_then(|s| s.split('/').next())
-                .and_then(|s| s.parse::<u64>().ok())
-        })
-        .next()
+        .find_map(|r| common::commit_ci::actions_run_id(r))
         .unwrap_or(0);
 
     if workflow_run_id > 0 {
@@ -3413,9 +3442,9 @@ async fn fetch_ci_failures(
         }
     }
 
-    // Last resort: just list the failed check names
-    let names: Vec<&str> = failed.iter().filter_map(|r| r["name"].as_str()).collect();
-    Some(format!("Failed checks: {}", names.join(", ")))
+    // Last resort: the failed checks' names, and for a commit status (CI
+    // outside GitHub Actions) what it said and where its log is.
+    Some(failed_check_lines(&failed))
 }
 
 /// Make sure the run's PR is open before feedback work starts, reattaching or
@@ -3751,6 +3780,27 @@ async fn ensure_pr_open(
 #[cfg(test)]
 mod review_request_tests {
     use super::*;
+
+    #[test]
+    fn failed_commit_statuses_say_what_they_said_and_where() {
+        let merged = common::commit_ci::merge(
+            serde_json::json!({"total_count": 1, "check_runs": [
+                {"name": "unit", "status": "completed", "conclusion": "failure"}
+            ]}),
+            Some(&serde_json::json!({"statuses": [{
+                "context": "ci/circleci: build", "state": "failure",
+                "description": "Your tests failed on CircleCI",
+                "target_url": "https://ci.example.com/b/1"
+            }]})),
+        );
+        let failed: Vec<&serde_json::Value> =
+            merged["check_runs"].as_array().unwrap().iter().collect();
+        assert_eq!(
+            failed_check_lines(&failed),
+            "Failed checks: unit\nFailed commit statuses (CI outside GitHub Actions):\n\
+             - ci/circleci: build (commit status): Your tests failed on CircleCI (https://ci.example.com/b/1)"
+        );
+    }
 
     fn comment(path: &str, line: u64, body: &str, context: bool) -> ReviewComment {
         ReviewComment {

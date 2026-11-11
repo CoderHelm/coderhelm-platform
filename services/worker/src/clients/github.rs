@@ -597,6 +597,9 @@ struct JwtClaims {
 #[derive(Deserialize)]
 struct TokenResponse {
     token: String,
+    /// What the installation granted this token (see `common::github_grants`).
+    #[serde(default)]
+    permissions: serde_json::Value,
 }
 
 /// True when the issue/PR was closed by a bot account (the app's own push),
@@ -684,6 +687,7 @@ impl GitHubClient {
             req = req.header(common::STATELESS_S2S_TOKEN_HEADER, mode);
         }
         let resp: TokenResponse = req.send().await?.error_for_status()?.json().await?;
+        common::github_grants::record(self.installation_id, &resp.permissions);
 
         let mut cache = self.token_cache.lock().unwrap();
         *cache = Some(CachedToken {
@@ -841,6 +845,44 @@ impl GitHubClient {
         let status = resp.status().as_u16();
         let body = resp.json().await.unwrap_or(serde_json::Value::Null);
         Ok((status, body))
+    }
+
+    /// GET an API path that needs `permission`. None when the installation
+    /// lacks it: known from its token (no request is made), or refused now
+    /// (remembered, and logged once per installation). Any other failure is
+    /// an error.
+    pub async fn get_granted(
+        &self,
+        permission: &str,
+        path: &str,
+    ) -> Result<Option<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
+        if common::github_grants::lacks(self.installation_id, permission) {
+            return Ok(None);
+        }
+        // The token's permissions are learned when it is minted.
+        self.auth_headers().await?;
+        if common::github_grants::lacks(self.installation_id, permission) {
+            return Ok(None);
+        }
+        let (status, body) = self.get_status(path).await?;
+        if (200..300).contains(&status) {
+            return Ok(Some(body));
+        }
+        if common::github_grants::is_refusal(status, &body) {
+            if common::github_grants::refused(self.installation_id, permission) {
+                tracing::info!(
+                    installation = self.installation_id,
+                    permission,
+                    "GitHub refused a read this installation hasn't granted; reading without it"
+                );
+            }
+            return Ok(None);
+        }
+        Err(format!(
+            "GitHub API error {status} for {path}: {}",
+            body["message"].as_str().unwrap_or("")
+        )
+        .into())
     }
 
     /// GET an API path; an error unless GitHub answers 2xx.
@@ -3953,17 +3995,42 @@ impl GitHubClient {
         self.patch(&url, body).await.map(|_| ())
     }
 
-    /// Combined legacy commit-status (external CI that posts statuses rather than
-    /// check-runs — e.g. a Terraform staging-apply status). Returns the roll-up
-    /// `state` ("success" | "pending" | "failure" | "error") + the per-context list.
-    pub async fn get_commit_status(
+    /// The combined commit status on a ref (`statuses` holds the newest of
+    /// each context). None when the installation can't read commit statuses.
+    pub async fn commit_statuses(
+        &self,
+        owner: &str,
+        repo: &str,
+        git_ref: &str,
+    ) -> Result<Option<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
+        self.get_granted(
+            "statuses",
+            &format!("/repos/{owner}/{repo}/commits/{git_ref}/status?per_page=100"),
+        )
+        .await
+    }
+
+    /// A ref's CI: its check runs with its commit statuses folded in, in the
+    /// `check-runs` listing's shape (see `common::commit_ci`). Every "is CI
+    /// green" decision reads this, so a repository that reports CI through
+    /// statuses is never read as green or as having no CI. Statuses the
+    /// installation can't read are left out; a status read that fails
+    /// otherwise is too, since the check runs alone are still an answer.
+    pub async fn list_ci_for_ref(
         &self,
         owner: &str,
         repo: &str,
         git_ref: &str,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
-        let url = format!("{API_BASE}/repos/{owner}/{repo}/commits/{git_ref}/status");
-        self.get(&url).await
+        let runs = self.list_check_runs_for_ref(owner, repo, git_ref).await?;
+        let statuses = match self.commit_statuses(owner, repo, git_ref).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(owner, repo, git_ref, error = %e, "Could not read commit statuses");
+                None
+            }
+        };
+        Ok(common::commit_ci::merge(runs, statuses.as_ref()))
     }
 
     /// Fetch annotations from failed check runs on a branch — useful as fallback

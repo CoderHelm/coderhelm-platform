@@ -52,7 +52,7 @@ pub async fn run(
         }
 
         let check_data = match github
-            .list_check_runs_for_ref(&msg.repo_owner, &msg.repo_name, branch)
+            .list_ci_for_ref(&msg.repo_owner, &msg.repo_name, branch)
             .await
         {
             Ok(data) => data,

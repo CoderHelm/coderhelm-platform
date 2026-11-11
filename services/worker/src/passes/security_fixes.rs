@@ -1370,7 +1370,7 @@ async fn pr_state(gh: &GitHubClient, repo: &str, number: u64) -> (String, Option
         return ("closed".into(), None);
     }
     let sha = pr["head"]["sha"].as_str().unwrap_or("");
-    let ci = match gh.list_check_runs_for_ref(o, n, sha).await {
+    let ci = match gh.list_ci_for_ref(o, n, sha).await {
         Ok(v) => {
             let runs = v["check_runs"].as_array().cloned().unwrap_or_default();
             if runs.is_empty() {
