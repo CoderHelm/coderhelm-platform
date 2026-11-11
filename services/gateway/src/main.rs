@@ -903,10 +903,6 @@ async fn main() -> Result<(), Error> {
             get(routes::knowledge_sources::browse),
         )
         .route(
-            "/knowledge/:kb_id/items",
-            get(routes::knowledge::list_items),
-        )
-        .route(
             "/knowledge/:kb_id/sources",
             get(routes::knowledge::poll_sources).post(routes::knowledge_sources::create_source),
         )
