@@ -457,7 +457,8 @@ mod tests {
         let mut f = web_app();
         let now = Utc::now();
         f.open = vec![(
-            json!({"number": 9, "created_at": (now - chrono::Duration::days(25)).to_rfc3339(),
+            // Quiet 10 days: marked on day 7, closes on day 14.
+            json!({"number": 9, "created_at": (now - chrono::Duration::days(10)).to_rfc3339(),
                    "user": {"login": "dev"}, "labels": []}),
             vec![],
         )];
