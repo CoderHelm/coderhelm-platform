@@ -2016,6 +2016,80 @@ mod tests {
         assert!(!t.contains('\u{2192}'));
     }
 
+    /// The template's resources and outputs, by logical id.
+    fn export_template() -> serde_yaml::Mapping {
+        // CloudFormation's short tags (!Ref, !Sub...) read as plain values.
+        let v: serde_yaml::Value = serde_yaml::from_str(EXPORT_TEMPLATE).unwrap();
+        v.as_mapping().unwrap().clone()
+    }
+
+    fn section<'a>(t: &'a serde_yaml::Mapping, name: &str) -> &'a serde_yaml::Mapping {
+        t.get(name).and_then(|v| v.as_mapping()).unwrap()
+    }
+
+    #[test]
+    fn the_export_stack_makes_a_knowledge_base_on_s3_vectors_by_default() {
+        let t = export_template();
+        let params = section(&t, "Parameters");
+        let p = |k: &str| params.get(k).unwrap().as_mapping().unwrap();
+        assert_eq!(
+            p("CreateKnowledgeBase").get("Default").unwrap().as_str(),
+            Some("yes")
+        );
+        assert_eq!(p("SetupToken").get("NoEcho").unwrap().as_bool(), Some(true));
+        assert_eq!(p("SetupToken").get("Default").unwrap().as_str(), Some(""));
+        let res = section(&t, "Resources");
+        let kind = |k: &str| {
+            res.get(k)
+                .and_then(|r| r.get("Type"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_else(|| panic!("{k} missing"))
+                .to_string()
+        };
+        assert_eq!(kind("VectorBucket"), "AWS::S3Vectors::VectorBucket");
+        assert_eq!(kind("VectorIndex"), "AWS::S3Vectors::Index");
+        assert_eq!(kind("KnowledgeBase"), "AWS::Bedrock::KnowledgeBase");
+        assert_eq!(kind("KnowledgeBaseRole"), "AWS::IAM::Role");
+        assert_eq!(kind("Reporter"), "AWS::Lambda::Function");
+        for r in ["ReportStarted", "ReportBucket", "ReportReady"] {
+            assert_eq!(kind(r), "Custom::CoderhelmReport");
+        }
+        // The new knowledge base and its parts only when asked for.
+        for r in [
+            "VectorBucket",
+            "VectorIndex",
+            "KnowledgeBase",
+            "KnowledgeBaseRole",
+        ] {
+            assert_eq!(
+                res.get(r).unwrap().get("Condition").unwrap().as_str(),
+                Some("CreatesKnowledgeBase"),
+                "{r}"
+            );
+        }
+        let t = EXPORT_TEMPLATE;
+        assert!(t.contains("Type: S3_VECTORS"));
+        assert!(t.contains("foundation-model/amazon.titan-embed-text-v2:0"));
+        assert!(t.contains("Dimension: 1024") && t.contains("Dimensions: 1024"));
+        assert!(t.contains("- AMAZON_BEDROCK_TEXT") && t.contains("- AMAZON_BEDROCK_METADATA"));
+        // Bedrock's role: only this account's knowledge bases take it on, and
+        // it reaches the one index and model.
+        assert!(t.contains("Service: bedrock.amazonaws.com"));
+        assert!(t.contains("Resource: !GetAtt VectorIndex.IndexArn"));
+        // The reporter reads only its own stack.
+        assert!(t.contains("Resource: !Ref AWS::StackId"));
+        let outs = section(&export_template(), "Outputs").clone();
+        for o in [
+            "BucketName",
+            "Prefix",
+            "DataSourceId",
+            "KnowledgeBaseArn",
+            "VectorBucketName",
+        ] {
+            assert!(outs.contains_key(o), "{o}");
+        }
+    }
+
     #[test]
     fn a_connected_base_is_never_copied() {
         let b = super::super::search::testing::remote_base("r", "Remote", "111122223333");

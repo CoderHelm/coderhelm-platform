@@ -302,6 +302,9 @@ jobs:
           # self-hosted install's Launch Stack links match its code.
           cp infra/cfn/coderhelm-log-reader.yaml dist/coderhelm-log-reader.yaml
           cp infra/cfn/coderhelm-log-reader-update.yaml dist/coderhelm-log-reader-update.yaml
+          # The Bedrock export stack its Set up in AWS button opens
+          # (services/gateway/src/bedrock_setup.rs), beside the role's.
+          cp infra/cfn/coderhelm-bedrock-export.yaml dist/coderhelm-bedrock-export.yaml
           # The models this release calls, read from the code, with their
           # Bedrock ids per inference profile prefix. In the signed
           # SHA256SUMS: the updater reads it only through the update build,
@@ -346,7 +349,7 @@ jobs:
           tar -czf ../dist/coderhelm-native.tar.gz -C "$RUNNER_TEMP/native" access.json stacks assets
       - name: Checksums
         run: |
-          (cd dist && sha256sum gateway.zip worker.zip mcp-proxy.zip dashboard.tar.gz source.tar.gz coderhelm-selfhost.tgz install.sh coderhelm.json coderhelm-native.tar.gz models.json coderhelm-log-reader.yaml coderhelm-log-reader-update.yaml > SHA256SUMS)
+          (cd dist && sha256sum gateway.zip worker.zip mcp-proxy.zip dashboard.tar.gz source.tar.gz coderhelm-selfhost.tgz install.sh coderhelm.json coderhelm-native.tar.gz models.json coderhelm-log-reader.yaml coderhelm-log-reader-update.yaml coderhelm-bedrock-export.yaml > SHA256SUMS)
           cat dist/SHA256SUMS
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -419,6 +422,7 @@ jobs:
             dist/models.json
             dist/coderhelm-log-reader.yaml
             dist/coderhelm-log-reader-update.yaml
+            dist/coderhelm-bedrock-export.yaml
 
       # A published release's files are never replaced (and with immutable
       # releases on, GitHub refuses any upload to one): a re-run confirms the
@@ -484,7 +488,7 @@ jobs:
           # (.github/scripts/publish-once.sh: one conditional PutObject per
           # file, in parallel, the parent coderhelm.json last).
           L="$RUNNER_TEMP/publish-list" && : > "$L"
-          for f in coderhelm-log-reader.yaml coderhelm-log-reader-update.yaml; do printf '%s\t%s\t%s\n' "dist/$f" "launch/$TAG/$f" text/yaml >> "$L"; done
+          for f in coderhelm-log-reader.yaml coderhelm-log-reader-update.yaml coderhelm-bedrock-export.yaml; do printf '%s\t%s\t%s\n' "dist/$f" "launch/$TAG/$f" text/yaml >> "$L"; done
           # The native files, each checked against the sha256 coderhelm.json pins, then the parent last.
           mkdir -p "$RUNNER_TEMP/native" && tar -xzf dist/coderhelm-native.tar.gz -C "$RUNNER_TEMP/native"
           # shellcheck disable=SC2016 # JavaScript, not shell

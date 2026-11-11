@@ -12,6 +12,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 
 mod api_keys;
 mod auth;
+mod bedrock_setup;
 mod clients;
 mod knowledge_keys;
 mod mcp_knowledge;
@@ -820,6 +821,11 @@ async fn main() -> Result<(), Error> {
             get(routes::knowledge_bedrock::export_template),
         )
         .route(
+            "/knowledge/bedrock-sync/setup",
+            post(routes::knowledge_bedrock::start_setup)
+                .delete(routes::knowledge_bedrock::cancel_setup),
+        )
+        .route(
             "/knowledge/bedrock/import",
             get(routes::knowledge::bedrock_import),
         )
@@ -1581,6 +1587,13 @@ async fn main() -> Result<(), Error> {
         // with a key only the guide and the stack have, so nothing in the
         // install's account is public (routes::install_progress). 404 on a
         // self-hosted install.
+        // The Bedrock export stack's reports, with the one-time token made
+        // by "Set up in AWS" (bedrock_setup): no session, the token is the
+        // proof.
+        .route(
+            "/api/knowledge/bedrock-setup/report",
+            post(routes::knowledge_bedrock::report_setup),
+        )
         .route(
             "/api/install-progress",
             post(routes::install_progress::create),
