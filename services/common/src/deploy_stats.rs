@@ -361,6 +361,69 @@ pub fn run_targets(
     out
 }
 
+/// Whether a deployment status links to workflow run `run_id` (an Actions
+/// job that names an `environment:` records its run in `log_url` or
+/// `target_url`).
+fn status_links_run(status: &Value, run_id: u64) -> bool {
+    let needle = format!("/actions/runs/{run_id}");
+    ["log_url", "target_url"].iter().any(|k| {
+        status[*k].as_str().is_some_and(|u| {
+            u.match_indices(&needle).any(|(i, m)| {
+                u[i + m.len()..]
+                    .chars()
+                    .next()
+                    .is_none_or(|c| !c.is_ascii_digit())
+            })
+        })
+    })
+}
+
+/// A deployment status's state as a deploy outcome. `inactive` is a deploy
+/// that succeeded and was later replaced; still running is no outcome yet.
+fn deployment_outcome(state: &str) -> Option<&'static str> {
+    match state {
+        "success" | "inactive" => Some("succeeded"),
+        "failure" | "error" => Some("failed"),
+        _ => None,
+    }
+}
+
+/// What workflow run `run_id` deployed, read from GitHub's deployments of
+/// its commit (each with its statuses, newest first): every deployment one
+/// of whose statuses links to the run went to that deployment's
+/// environment, with the newest status's outcome. This is GitHub's own
+/// record, so it names environments a workflow picks at run time and deploys
+/// made by reusable workflows, which the workflow file can't show. Empty
+/// when no deployment links to the run: the caller reads the workflow.
+pub fn deployment_targets(run_id: u64, deployments: &[(Value, Vec<Value>)]) -> Vec<Target> {
+    let mut out: Vec<Target> = Vec::new();
+    for (d, statuses) in deployments {
+        if run_id == 0 || !statuses.iter().any(|s| status_links_run(s, run_id)) {
+            continue;
+        }
+        let name = d["environment"].as_str().unwrap_or("").trim();
+        if name.is_empty() {
+            continue;
+        }
+        let newest = statuses.first().and_then(|s| s["state"].as_str());
+        let Some(o) = newest.and_then(deployment_outcome) else {
+            continue;
+        };
+        match out.iter_mut().find(|t| t.name.eq_ignore_ascii_case(name)) {
+            // Two deployments to one environment: a failure in either is
+            // the run's outcome there.
+            Some(t) if o == "failed" => t.outcome = o,
+            Some(_) => {}
+            None => out.push(Target {
+                name: name.to_string(),
+                env: env_or_other(name),
+                outcome: o,
+            }),
+        }
+    }
+    out
+}
+
 /// Whether the workflow file alone settles a run's deploy targets, so
 /// [`run_targets`] gives the same answer whatever jobs ran and reading them
 /// would cost a request for nothing: the repository's setting names the
@@ -447,12 +510,128 @@ pub fn stat_item(
     ])
 }
 
+/// How a deploy record's environment was known (`source` on the record).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Known {
+    /// GitHub's deployments named it.
+    Deployments,
+    /// The workflow (its jobs' environments, names, the setting) said, and
+    /// the repository's deployments were read and named none for the run.
+    Workflow,
+    /// The workflow said, because CoderHelm can't read deployments here.
+    WorkflowNoAccess,
+}
+
+impl Known {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Known::Deployments => "deployments",
+            Known::Workflow => "workflow",
+            Known::WorkflowNoAccess => "workflow_no_deployments_access",
+        }
+    }
+}
+
+/// [`stat_item`] with how its environment was known.
+pub fn stat_item_from(
+    team_id: &str,
+    repo: &str,
+    run: &Value,
+    cause: Cause,
+    target: &Target,
+    known: Known,
+) -> HashMap<String, AttributeValue> {
+    let mut item = stat_item(team_id, repo, run, cause, target);
+    item.insert("source".to_string(), s(known.as_str()));
+    item
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
 
     const BOT: &str = "coderhelm[bot]";
+
+    fn dep(env: &str, states: &[(&str, &str)]) -> (Value, Vec<Value>) {
+        (
+            json!({"environment": env}),
+            states
+                .iter()
+                .map(|(st, log)| json!({"state": st, "log_url": log}))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn deployments_name_where_a_run_went() {
+        let run_log = "https://github.com/o/r/actions/runs/77/job/5";
+        let deps = vec![
+            dep("prod-eu", &[("success", run_log), ("in_progress", run_log)]),
+            dep("qa-7", &[("failure", run_log)]),
+            // Another run (770 shares the prefix) and a deploy still going.
+            dep(
+                "staging",
+                &[("success", "https://github.com/o/r/actions/runs/770/job/1")],
+            ),
+            dep("preview", &[("in_progress", run_log)]),
+        ];
+        let t = deployment_targets(77, &deps);
+        assert_eq!(
+            t,
+            vec![
+                Target {
+                    name: "prod-eu".into(),
+                    env: Env::Production,
+                    outcome: "succeeded"
+                },
+                Target {
+                    name: "qa-7".into(),
+                    env: Env::Other,
+                    outcome: "failed"
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_replaced_deploy_still_counts_and_a_failure_in_either_wins() {
+        let log = "https://github.com/o/r/actions/runs/9";
+        let deps = vec![
+            dep("production", &[("inactive", log), ("success", log)]),
+            dep("Production", &[("error", log)]),
+        ];
+        let t = deployment_targets(9, &deps);
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].outcome, "failed");
+    }
+
+    #[test]
+    fn no_deployment_for_the_run_leaves_the_workflow_to_say() {
+        assert!(deployment_targets(5, &[]).is_empty());
+        assert!(deployment_targets(5, &[dep("production", &[("success", "")])]).is_empty());
+    }
+
+    #[test]
+    fn a_record_says_how_its_environment_was_known() {
+        let r = run(
+            "push",
+            "main",
+            (BOT, "Bot"),
+            "Deploy",
+            ".github/workflows/deploy.yml",
+        );
+        let t = Target {
+            name: "production".into(),
+            env: Env::Production,
+            outcome: "succeeded",
+        };
+        let item = stat_item_from("t", "o/r", &r, Cause::Merge, &t, Known::WorkflowNoAccess);
+        assert_eq!(
+            item["source"].as_s().unwrap(),
+            "workflow_no_deployments_access"
+        );
+    }
 
     fn run(event: &str, branch: &str, by: (&str, &str), name: &str, path: &str) -> Value {
         json!({
