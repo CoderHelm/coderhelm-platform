@@ -283,6 +283,11 @@ pub struct KnowledgeTools {
     /// The team member who started the run, when known: bases read with
     /// each person's own sign-in search as them.
     person: Option<kb::Person>,
+    /// The agent searching (`planner`, `coder`, `reviewer`, `plan_chat`),
+    /// for the base's usage.
+    agent: String,
+    /// The run searching, to link to from the base's usage.
+    run_id: String,
 }
 
 /// The team member with `email`, with their role (an invited person who
@@ -367,7 +372,15 @@ impl KnowledgeTools {
             team_id: team_id.to_string(),
             bases,
             person,
+            agent: agent.to_string(),
+            run_id: String::new(),
         })
+    }
+
+    /// The same tools, for one run (its searches link to it).
+    pub fn for_run(mut self, run_id: &str) -> Self {
+        self.run_id = run_id.to_string();
+        self
     }
 
     pub fn tools(&self) -> Vec<ToolDefinition> {
@@ -464,6 +477,35 @@ impl KnowledgeTools {
             query,
             limit,
             chrono::Utc::now(),
+        )
+        .await;
+        let at = chrono::Utc::now().to_rfc3339();
+        let usage = |hits: &[Hit], outcome: &str| {
+            common::knowledge::usage::events(
+                &ids,
+                &common::knowledge::usage::surface::run(&self.agent),
+                self.person.as_ref().map(|p| p.email.as_str()).unwrap_or(""),
+                &self.run_id,
+                query,
+                &hits
+                    .iter()
+                    .map(|h| (h.kb_id.clone(), h.file_id.clone(), h.file_name.clone()))
+                    .collect::<Vec<_>>(),
+                &[],
+                outcome,
+                &at,
+            )
+        };
+        let evs = match &hits {
+            Ok(f) if f.hits.is_empty() => usage(&[], common::knowledge::usage::outcome::NO_HITS),
+            Ok(f) => usage(&f.hits, common::knowledge::usage::outcome::FOUND),
+            Err(_) => Vec::new(),
+        };
+        common::knowledge::usage::log(
+            &state.dynamo,
+            &state.config.settings_table_name,
+            &self.team_id,
+            &evs,
         )
         .await;
         Some(match hits {

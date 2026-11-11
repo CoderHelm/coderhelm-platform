@@ -864,6 +864,7 @@ async fn main() -> Result<(), Error> {
             "/knowledge/:kb_id/suggestions",
             get(routes::knowledge_ask::suggestions),
         )
+        .route("/knowledge/:kb_id/usage", get(routes::knowledge_ask::usage))
         .route(
             "/knowledge/:kb_id/files",
             post(routes::knowledge::start_upload),

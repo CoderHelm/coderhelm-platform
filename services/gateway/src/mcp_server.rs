@@ -1190,8 +1190,31 @@ async fn knowledge_call(
         )
         .await
         {
-            Ok((v, stale)) => {
+            Ok((v, stale, searched)) => {
                 crate::routes::knowledge::reembed(state, &reader.team_id, &stale).await;
+                use common::knowledge::usage;
+                let evs = usage::events(
+                    &searched.kb_ids,
+                    usage::surface::MCP,
+                    &reader.person.email,
+                    "",
+                    &searched.query,
+                    &searched.hits,
+                    &[],
+                    if searched.hits.is_empty() {
+                        usage::outcome::NO_HITS
+                    } else {
+                        usage::outcome::FOUND
+                    },
+                    &chrono::Utc::now().to_rfc3339(),
+                );
+                usage::log(
+                    &state.dynamo,
+                    &state.config.settings_table_name,
+                    &reader.team_id,
+                    &evs,
+                )
+                .await;
                 Ok(v)
             }
             Err(e) => Err(e),

@@ -690,7 +690,8 @@ Then the ```fix_location.json block described above."#,
         "planner",
         super::requester_email(msg),
     )
-    .await;
+    .await
+    .map(|k| k.for_run(run_id));
     if let Some(k) = &knowledge {
         tools.extend(k.tools());
         full_system.push_str(&k.prompt_section());
