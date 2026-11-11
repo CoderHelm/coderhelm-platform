@@ -357,6 +357,11 @@ pub struct FindingState {
     pub ticket: Option<String>,
     /// What the last triage read (so it isn't read twice).
     pub triaged: Option<String>,
+    /// When the last triage ran: verdicts are read again weekly (the code
+    /// changes; an unchanged read reuses the verdict at no cost).
+    pub triaged_at: Option<String>,
+    /// The tier its first card posted at: a later rise to P0 posts again.
+    pub carded_tier: Option<Tier>,
     /// A person closed its pull request unmerged: not opened again until.
     pub hold_until: Option<String>,
     pub merged_at: Option<String>,
@@ -1146,8 +1151,15 @@ pub fn apply(
         // OSV gives the vector without a score: keep it.
         f.advisory.cvss_vector = a.cvss_vector.clone();
     }
-    if a.severity.is_some() && st.severity.is_none() {
-        st.severity = a.severity.clone();
+    // A raised severity (an advisory update) wins, as the higher score does.
+    if let Some(new) = &a.severity {
+        if st
+            .severity
+            .as_deref()
+            .is_none_or(|old| severity_rank(new) > severity_rank(old))
+        {
+            st.severity = Some(new.clone());
+        }
     }
     if a.epss.is_some() {
         f.advisory.epss = a.epss;
@@ -1229,6 +1241,17 @@ fn union(into: &mut Vec<String>, more: &[String]) {
 }
 
 // ── Policy ──────────────────────────────────────────────────────────────
+
+/// GHSA's severity words, lowest first.
+fn severity_rank(word: &str) -> u8 {
+    match word.to_ascii_lowercase().as_str() {
+        "critical" => 4,
+        "high" => 3,
+        "moderate" | "medium" => 2,
+        "low" => 1,
+        _ => 0,
+    }
+}
 
 /// The CVSS score a finding is judged by: its own, else its severity word.
 pub fn score(f: &Finding, st: &FindingState) -> f64 {
@@ -1365,6 +1388,8 @@ pub enum Stage {
     Half,
     Deadline,
     Withdrawn,
+    /// Its tier rose to P0 after its first card posted at a lower one.
+    RaisedP0,
 }
 
 impl Stage {
@@ -1377,6 +1402,7 @@ impl Stage {
             Stage::Half => "half",
             Stage::Deadline => "deadline",
             Stage::Withdrawn => "withdrawn",
+            Stage::RaisedP0 => "p0",
         }
     }
 }
@@ -1386,9 +1412,10 @@ pub fn posts(f: &Finding, cfg: &SecurityConfig) -> bool {
     !f.private_report && f.tier.is_some_and(|t| cfg.post_alerts.get(t))
 }
 
-/// The escalation a finding is due now, if any: at the deadline, or at half
-/// of it (when the team asked for that). Only for an open finding whose new
-/// card posted, and never one already posted.
+/// The escalation a finding is due now, if any: its tier rose to P0 after
+/// its first card posted lower, at the deadline, or at half of it (when the
+/// team asked for that). Only for an open finding whose new card posted,
+/// and never one already posted.
 pub fn escalation(
     f: &Finding,
     st: &FindingState,
@@ -1397,6 +1424,12 @@ pub fn escalation(
 ) -> Option<Stage> {
     if !f.status.is_open() || !posts(f, cfg) || !st.cards.iter().any(|c| c == "new") {
         return None;
+    }
+    if f.tier == Some(Tier::P0)
+        && st.carded_tier.is_some_and(|t| t != Tier::P0)
+        && !st.cards.iter().any(|c| c == "p0")
+    {
+        return Some(Stage::RaisedP0);
     }
     let (seen, due) = (parse_time(&f.first_seen_at)?, parse_time(&f.due_at)?);
     if now >= due && !st.cards.iter().any(|c| c == "deadline") {
@@ -1455,6 +1488,10 @@ pub fn card(f: &Finding, stage: Stage, finding_url: &str, now: DateTime<Utc>) ->
             format!("🔴 {tier} security · {id} is past its deadline"),
         ),
         Stage::Withdrawn => (Tone::Good, format!("✅ {id} was withdrawn")),
+        Stage::RaisedP0 => (
+            Tone::Attention,
+            format!("🔴 P0 security · {repo_name} {id} is now P0"),
+        ),
     };
     let mut line = if f.advisory.title.is_empty() {
         format!("{} in {}.", id, f.package)
@@ -3467,7 +3504,7 @@ fn npm_location_name(loc: &str) -> Option<&str> {
 
 /// Where `name`, required from `from`, resolves in an npm lockfile: the
 /// nearest `node_modules/<name>` up the tree, as Node looks it up.
-fn npm_resolve<'a>(
+pub(crate) fn npm_resolve<'a>(
     packages: &'a serde_json::Map<String, Value>,
     from: &str,
     name: &str,
@@ -4924,10 +4961,10 @@ pub fn insights(
 
 /// The agent's instructions for a reachability verdict.
 pub const TRIAGE_SYSTEM: &str = "You decide whether a repository is affected by a published vulnerability in one of its dependencies. \
-You get the advisory, the package and the code search results from the repository (file, line, text). \
+You get the advisory, the package, what a check of every source file found, and the repository's lines that import and use the package (or the package that brings it in): file, line, text. \
 Answer with one JSON object and nothing else: {\"verdict\": \"reachable\" | \"not_reachable\" | \"unknown\", \"summary\": \"two sentences at most\", \"lines\": [{\"file\": \"...\", \"line\": 1}], \"confidence\": \"high\" | \"medium\" | \"low\"}. \
 reachable: the repository's own code calls the vulnerable function or turns on the vulnerable feature, and the lines show it. \
-not_reachable: the package is used, but nothing shown calls the vulnerable part. \
+not_reachable: the package is used, but the lines show the code uses only other parts of it: when the advisory names no function, judge from the vulnerable feature its summary describes (an option, a parser, a protocol, a kind of input) against what the lines call; input that comes only from trusted services (the cloud provider's own API responses, the repository's own files) doesn't reach it. \
 unknown: the evidence is missing or the use is dynamic. Never guess reachable or not_reachable without lines that show it. \
 Only cite lines from the search results given.";
 

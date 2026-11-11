@@ -1043,6 +1043,17 @@ impl GitHubClient {
         built.map(|c| c.snap)
     }
 
+    /// The repository's files at a ref, downloaded once (one tarball) and
+    /// kept for this client; None when it is too large or GitHub refused.
+    pub async fn code_snapshot(
+        &self,
+        owner: &str,
+        repo: &str,
+        git_ref: &str,
+    ) -> Option<Arc<RepoSnapshot>> {
+        self.snapshot(owner, repo, git_ref).await
+    }
+
     /// Snapshot for a ref if one was already built (never triggers a download).
     async fn existing_snapshot(
         &self,
