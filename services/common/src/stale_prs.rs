@@ -40,7 +40,8 @@ use serde_json::Value;
 pub const TEAM_SK: &str = "STALE_PR_CONFIG#TEAM";
 /// Every settings record starts with this.
 pub const CONFIG_PREFIX: &str = "STALE_PR_CONFIG#";
-const REPO_PREFIX: &str = "STALE_PR_CONFIG#REPO#";
+/// A repository's own settings (Setup writes these, one per repository).
+pub const REPO_PREFIX: &str = "STALE_PR_CONFIG#REPO#";
 /// A kept-open pull request.
 pub const EXEMPT_PREFIX: &str = "STALE_PR_EXEMPT#";
 /// One action the sweep took.
@@ -94,7 +95,7 @@ pub enum Scope {
     Own,
 }
 
-pub const DEFAULT_STALE_DAYS: u32 = 21;
+pub const DEFAULT_STALE_DAYS: u32 = 7;
 pub const DEFAULT_CLOSE_DAYS: u32 = 7;
 pub const DEFAULT_LABEL: &str = "stale";
 pub const DEFAULT_MAX_CLOSES: u32 = 10;
@@ -664,7 +665,8 @@ mod tests {
         let c = StaleConfig::default();
         assert!(!c.enabled);
         assert!(c.dry_run);
-        assert_eq!((c.stale_days, c.close_days), (21, 7));
+        // 7 days quiet, then 7 more after the warning: closed after 14.
+        assert_eq!((c.stale_days, c.close_days), (7, 7));
         assert!(c.exempt_drafts);
         assert!(!c.delete_branch);
         assert_eq!(
@@ -673,7 +675,10 @@ mod tests {
         );
         // A record missing fields takes the defaults for them.
         let c = StaleConfig::from_json(r#"{"enabled":true}"#).unwrap();
-        assert!(c.enabled && c.dry_run && c.stale_days == 21);
+        assert!(c.enabled && c.dry_run && c.stale_days == 7);
+        // A saved record keeps its own number; only the default changed.
+        let c = StaleConfig::from_json(r#"{"enabled":true,"stale_days":21}"#).unwrap();
+        assert_eq!(c.stale_days, 21);
     }
 
     #[test]
@@ -717,7 +722,7 @@ mod tests {
     fn messages_fill_in_their_numbers_and_say_how_to_reopen() {
         let c = StaleConfig::default();
         let w = c.warn_comment();
-        assert!(w.contains("21 days") && w.contains("7 days") && w.contains("`stale`"));
+        assert!(w.contains("7 days") && !w.contains("21") && w.contains("`stale`"));
         assert!(w.contains("@coderhelm keep open") && w.ends_with(MARKER));
         let close = c.close_comment(false);
         assert!(close.contains("reopen this pull request"));
@@ -809,7 +814,10 @@ mod tests {
 
     #[test]
     fn warned_after_the_quiet_days_then_closed_after_the_grace() {
-        let c = StaleConfig::default();
+        let c = StaleConfig {
+            stale_days: 21,
+            ..Default::default()
+        };
         // 20 days quiet: left alone. 21: marked.
         assert_eq!(
             decide(
@@ -842,6 +850,27 @@ mod tests {
                 &c,
                 &facts("2026-09-29T00:00:00Z", "2026-09-01T00:00:00Z", marked)
             ),
+            Plan::Close
+        );
+    }
+
+    #[test]
+    fn by_default_marked_after_7_quiet_days_and_closed_7_days_later() {
+        let c = StaleConfig::default();
+        let last = "2026-09-01T00:00:00Z";
+        // 6 days quiet: left alone. 7: marked.
+        assert_eq!(
+            decide(&c, &facts("2026-09-07T00:00:00Z", last, None)).action(),
+            "leave"
+        );
+        assert_eq!(
+            decide(&c, &facts("2026-09-08T00:00:00Z", last, None)),
+            Plan::Mark
+        );
+        // Marked on day 7: closed on day 14 with no activity.
+        let marked = Some(("2026-09-08T00:00:00Z", true));
+        assert_eq!(
+            decide(&c, &facts("2026-09-15T00:00:00Z", last, marked)),
             Plan::Close
         );
     }

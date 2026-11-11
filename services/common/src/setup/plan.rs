@@ -457,7 +457,8 @@ mod tests {
         let mut f = web_app();
         let now = Utc::now();
         f.open = vec![(
-            json!({"number": 9, "created_at": (now - chrono::Duration::days(25)).to_rfc3339(),
+            // Quiet 10 days: marked on day 7, closes on day 14.
+            json!({"number": 9, "created_at": (now - chrono::Duration::days(10)).to_rfc3339(),
                    "user": {"login": "dev"}, "labels": []}),
             vec![],
         )];
@@ -466,6 +467,12 @@ mod tests {
         assert!(r["stale_prs.enabled"].evidence[0]
             .text
             .contains("would have marked 1 and closed 0"));
+        // The default timing: 7 days quiet, then 7 more after the warning.
+        assert!(r["stale_prs.enabled"].evidence[0]
+            .text
+            .contains("(7 days quiet, then 7)"));
+        assert_eq!(r["stale_prs.stale_days"].value, 7);
+        assert_eq!(r["stale_prs.close_days"].value, 7);
         // The cleanup only previews.
         assert_eq!(r["stale_prs.dry_run"].value, true);
         assert!(r["security.open_prs"]

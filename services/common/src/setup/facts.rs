@@ -803,7 +803,10 @@ jobs:
     #[test]
     fn the_stale_effect_counts_marks_and_closes_in_the_window() {
         let now = Utc::now();
-        let cfg = StaleConfig::default(); // 21 days, then 7
+        let cfg = StaleConfig {
+            stale_days: 21,
+            ..StaleConfig::default()
+        }; // 21 days, then 7
         let open = vec![
             // Quiet 25 days: marked 4 days ago, not closed yet.
             (pr(1, 25, now, &[], false), vec![]),

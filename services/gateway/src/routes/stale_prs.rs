@@ -106,13 +106,37 @@ pub async fn get_config(
         None => None,
     };
     let effective = stale::effective(team.as_ref(), own.as_ref());
+    // Every repository with its own settings, so "all repositories" can say
+    // which ones are not off (Setup saves the settings per repository).
+    let repo_configs = match &repo {
+        Some(_) => vec![],
+        None => repo_configs_of(&read_prefix(&state, &claims.team_id, stale::REPO_PREFIX).await?),
+    };
     Ok(Json(json!({
         "team": team.clone().unwrap_or_default(),
         "team_saved": team.is_some(),
         "repo": own,
+        "repo_saved": own.is_some(),
         "effective": effective,
+        "repo_configs": repo_configs,
         "defaults": StaleConfig::default(),
     })))
+}
+
+/// Pure: `{repo, config}` for each stored repository settings record, by repository.
+fn repo_configs_of(items: &[Item]) -> Vec<Value> {
+    let mut out: Vec<(String, StaleConfig)> = items
+        .iter()
+        .filter_map(|i| {
+            let sk = s(i, "sk");
+            let repo = stale::repo_of_sk(&sk)?.to_string();
+            Some((repo, config_of(Some(i))?))
+        })
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out.into_iter()
+        .map(|(repo, config)| json!({ "repo": repo, "config": config }))
+        .collect()
 }
 
 #[derive(Deserialize)]
@@ -635,6 +659,37 @@ pub(crate) async fn on_keep_open_comment(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cfg_item(sk: &str, json_text: &str) -> Item {
+        HashMap::from([
+            ("pk".to_string(), attr_s("t_1")),
+            ("sk".to_string(), attr_s(sk)),
+            (stale::ATTR_CONFIG.to_string(), attr_s(json_text)),
+        ])
+    }
+
+    #[test]
+    fn repo_configs_list_each_repository_with_its_own_settings() {
+        let items = vec![
+            cfg_item(
+                "STALE_PR_CONFIG#REPO#acme/web",
+                r#"{"enabled":true,"dry_run":true}"#,
+            ),
+            cfg_item("STALE_PR_CONFIG#REPO#acme/api", r#"{"enabled":false}"#),
+            // The team's record and a broken one are not repositories.
+            cfg_item(stale::TEAM_SK, r#"{"enabled":true}"#),
+            cfg_item("STALE_PR_CONFIG#REPO#acme/bad", "not json"),
+        ];
+        let v = repo_configs_of(&items);
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0]["repo"], "acme/api");
+        assert_eq!(v[0]["config"]["enabled"], false);
+        assert_eq!(v[1]["repo"], "acme/web");
+        assert_eq!(v[1]["config"]["enabled"], true);
+        assert_eq!(v[1]["config"]["dry_run"], true);
+        // A record without a stale_days keeps the new default, 7.
+        assert_eq!(v[1]["config"]["stale_days"], 7);
+    }
 
     #[test]
     fn repo_params_are_checked() {
