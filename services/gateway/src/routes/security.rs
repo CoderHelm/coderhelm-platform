@@ -568,7 +568,7 @@ pub async fn overview(
 
 // ── Groups ──────────────────────────────────────────────────────────────
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Default, Clone, Debug)]
 pub struct GroupQuery {
     #[serde(default)]
     pub status: Option<String>,
@@ -586,11 +586,54 @@ pub struct GroupQuery {
     pub cursor: Option<String>,
 }
 
+/// One page of the list: its groups, how many match, the next page's
+/// cursor and how many of the matching groups can get a fix PR now (what
+/// "select all that match" selects).
+#[derive(Debug)]
+pub struct GroupPage {
+    pub page: Vec<sec::Group>,
+    pub total: usize,
+    pub next: Option<String>,
+    pub fixable: usize,
+}
+
 /// Pure: the groups a query shows, in order, and the next page's cursor.
 pub fn group_page(
     findings: &[(Finding, FindingState)],
     q: &GroupQuery,
-) -> Result<(Vec<sec::Group>, usize, Option<String>), StatusCode> {
+) -> Result<GroupPage, StatusCode> {
+    let offset: usize = match q.cursor.as_deref().filter(|c| !c.is_empty()) {
+        Some(c) => c.parse().map_err(|_| StatusCode::BAD_REQUEST)?,
+        None => 0,
+    };
+    let list = matching_groups(findings, q)?;
+    let total = list.len();
+    let fixable = list.iter().filter(|g| group_fixable(g)).count();
+    let page: Vec<sec::Group> = list.into_iter().skip(offset).take(PAGE).collect();
+    let next = (offset + PAGE < total).then(|| (offset + PAGE).to_string());
+    Ok(GroupPage {
+        page,
+        total,
+        next,
+        fixable,
+    })
+}
+
+/// Whether a group can get a fix PR now: the dashboard's checkbox is on
+/// exactly for these (open, a fixed version, no open PR, no run on it).
+pub fn group_fixable(g: &sec::Group) -> bool {
+    matches!(g.status, Status::Open | Status::NoFix)
+        && g.fixed_version.is_some()
+        && !g.pr.as_ref().is_some_and(|p| p.state == "open")
+}
+
+/// Pure: every group the list's filters match, in the list's order (the
+/// cursor is ignored). The list and "select all that match" both read it,
+/// so they never disagree.
+pub fn matching_groups(
+    findings: &[(Finding, FindingState)],
+    q: &GroupQuery,
+) -> Result<Vec<sec::Group>, StatusCode> {
     let status = q.status.as_deref().unwrap_or("open");
     if !matches!(status, "open" | "fixed" | "dismissed" | "all") {
         return Err(StatusCode::BAD_REQUEST);
@@ -603,10 +646,6 @@ pub fn group_page(
     if repo.is_some_and(|r| !sec::valid_repo(r)) {
         return Err(StatusCode::BAD_REQUEST);
     }
-    let offset: usize = match q.cursor.as_deref().filter(|c| !c.is_empty()) {
-        Some(c) => c.parse().map_err(|_| StatusCode::BAD_REQUEST)?,
-        None => 0,
-    };
     let needle =
         q.q.as_deref()
             .map(|s| s.trim().to_ascii_lowercase())
@@ -642,10 +681,7 @@ pub fn group_page(
         }),
         _ => return Err(StatusCode::BAD_REQUEST),
     }
-    let total = list.len();
-    let page: Vec<sec::Group> = list.into_iter().skip(offset).take(PAGE).collect();
-    let next = (offset + PAGE < total).then(|| (offset + PAGE).to_string());
-    Ok((page, total, next))
+    Ok(list)
 }
 
 /// GET /api/security/groups: one row per fix (a package at one version),
@@ -656,7 +692,12 @@ pub async fn list_groups(
     Query(q): Query<GroupQuery>,
 ) -> Result<Json<Value>, StatusCode> {
     let findings = load_findings(&state, &claims.team_id).await?;
-    let (page, total, next) = group_page(&findings, &q)?;
+    let GroupPage {
+        page,
+        total,
+        next,
+        fixable,
+    } = group_page(&findings, &q)?;
     let advisories: usize = page.iter().map(|g| g.advisories.len()).sum();
     let waiting: HashMap<String, Option<String>> = findings
         .iter()
@@ -678,7 +719,7 @@ pub async fn list_groups(
         })
         .collect();
     Ok(Json(
-        json!({ "groups": rows, "total": total, "advisories_on_page": advisories, "next_cursor": next }),
+        json!({ "groups": rows, "total": total, "fixable_total": fixable, "advisories_on_page": advisories, "next_cursor": next }),
     ))
 }
 
@@ -1049,9 +1090,38 @@ pub async fn scan(
 
 // ── Fix PRs a person asks for ───────────────────────────────────────────
 
-#[derive(Deserialize)]
+/// Finding ids a request may name one by one. More is "every fix that
+/// matches these filters" ([`SelectAll`]): the server resolves that set.
+pub const MAX_PICKED_IDS: usize = 200;
+/// The findings one request takes when it selects by filters; past it the
+/// plan says which fixes go now and that the rest are left for the next
+/// request (the most urgent go first). It bounds one request's writes and
+/// the worker's message, never what a person can select.
+pub const MAX_SELECTED_FINDINGS: usize = 1000;
+
+/// "Every fix the list's filters match": the same filters
+/// `GET /api/security/groups` takes (`status`, `tier`, `repo`, `q`; the
+/// cursor and sort don't change the set), less the findings in `except_ids`.
+/// Only fixes that can get a PR now count (open, a fixed version, no open
+/// PR, no run on them), and only the team's own findings.
+#[derive(Deserialize, Default, Clone, Debug)]
+pub struct SelectAll {
+    #[serde(default)]
+    pub all: bool,
+    #[serde(default)]
+    pub filters: GroupQuery,
+    #[serde(default)]
+    pub except_ids: Vec<String>,
+}
+
+#[derive(Deserialize, Default)]
 pub struct FixBody {
+    /// The findings a person picked, at most [`MAX_PICKED_IDS`].
+    #[serde(default)]
     pub finding_ids: Vec<String>,
+    /// Instead of `finding_ids`: every fix the filters match.
+    #[serde(default)]
+    pub select: Option<SelectAll>,
     /// Raise today's fix-run limit for this request (recorded in the audit log).
     #[serde(default)]
     pub raise_limit: bool,
@@ -1062,28 +1132,145 @@ pub struct FixBody {
     pub combine: sec::Combine,
 }
 
-/// POST /api/security/fix `{finding_ids, raise_limit?}`: fix pull requests
-/// for the findings a person picked, one per repository, package and
-/// version, started now whatever the dry run says, within the day's limits
-/// (an admin may raise today's limit for the request). Admin.
+/// The findings a request asks for, resolved, with what a filter selection
+/// matched and what it left for the next request.
+#[derive(Debug, Default, PartialEq)]
+pub struct Selection {
+    pub ids: Vec<String>,
+    /// Filter form: the fixes (groups) this request takes.
+    pub fixes: usize,
+    /// Filter form: the fixes the filters matched (less the excepted ones).
+    pub matched: usize,
+    /// Filter form: matched fixes past [`MAX_SELECTED_FINDINGS`], and their findings.
+    pub left_fixes: usize,
+    pub left_findings: usize,
+    pub by_filter: bool,
+}
+
+impl Selection {
+    /// What the plan says about the selection: plain words, and a note when
+    /// the request took only the first part of it.
+    pub fn json(&self) -> Value {
+        let plural =
+            |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+        let note = (self.left_fixes > 0).then(|| {
+            format!(
+                "This request takes the first {} ({}), the most urgent first. The other {} ({}) are left for the next request: select every fix that matches again once these have started.",
+                plural(self.fixes, "fix", "fixes"),
+                plural(self.ids.len(), "finding", "findings"),
+                plural(self.left_fixes, "fix", "fixes"),
+                plural(self.left_findings, "finding", "findings"),
+            )
+        });
+        json!({
+            "by_filter": self.by_filter,
+            "fixes": self.fixes,
+            "findings": self.ids.len(),
+            "matched": self.matched,
+            "left_fixes": self.left_fixes,
+            "left_findings": self.left_findings,
+            "limit": MAX_SELECTED_FINDINGS,
+            "note": note,
+        })
+    }
+}
+
+/// Pure: the findings a fix request names. `finding_ids` as sent (at most
+/// [`MAX_PICKED_IDS`]), or the filter form resolved here exactly as the list
+/// resolves it: the matching fixes that can get a PR now, in the list's
+/// order, their open findings less `except_ids`, up to
+/// [`MAX_SELECTED_FINDINGS`] findings.
+pub fn resolve_selection(
+    findings: &[(Finding, FindingState)],
+    body: &FixBody,
+) -> Result<Selection, String> {
+    let Some(sel) = &body.select else {
+        if body.finding_ids.len() > MAX_PICKED_IDS {
+            return Err(format!(
+                "finding_ids is at most {MAX_PICKED_IDS} finding ids; to ask for more, send select with the list's filters"
+            ));
+        }
+        return Ok(Selection {
+            ids: body.finding_ids.clone(),
+            ..Default::default()
+        });
+    };
+    if !body.finding_ids.is_empty() {
+        return Err("send finding_ids or select, not both".into());
+    }
+    if !sel.all {
+        return Err("select.all is true: every fix the filters match".into());
+    }
+    if sel.except_ids.len() > MAX_FINDINGS {
+        return Err(format!(
+            "select.except_ids is at most {MAX_FINDINGS} finding ids"
+        ));
+    }
+    let filters = GroupQuery {
+        cursor: None,
+        ..sel.filters.clone()
+    };
+    let groups = matching_groups(findings, &filters)
+        .map_err(|_| "select.filters aren't filters the list knows".to_string())?;
+    let except: std::collections::HashSet<&str> =
+        sel.except_ids.iter().map(String::as_str).collect();
+    let status: HashMap<&str, Status> = findings
+        .iter()
+        .map(|(f, _)| (f.id.as_str(), f.status))
+        .collect();
+    let mut out = Selection {
+        by_filter: true,
+        ..Default::default()
+    };
+    for g in groups.iter().filter(|g| group_fixable(g)) {
+        let ids: Vec<&String> = g
+            .finding_ids
+            .iter()
+            .filter(|id| !except.contains(id.as_str()))
+            .filter(|id| status.get(id.as_str()).is_some_and(|s| s.is_open()))
+            .collect();
+        if ids.is_empty() {
+            continue;
+        }
+        out.matched += 1;
+        if out.left_fixes > 0
+            || (!out.ids.is_empty() && out.ids.len() + ids.len() > MAX_SELECTED_FINDINGS)
+        {
+            out.left_fixes += 1;
+            out.left_findings += ids.len();
+            continue;
+        }
+        out.fixes += 1;
+        out.ids.extend(ids.into_iter().cloned());
+    }
+    Ok(out)
+}
+
+/// POST /api/security/fix `{finding_ids | select, raise_limit?, combine?}`:
+/// fix pull requests for the findings a person picked (or every fix the
+/// list's filters match), one per repository and package or one per
+/// repository, started now whatever the dry run says, within the day's
+/// limits (an admin may raise today's limit for the request); past them
+/// they wait for tomorrow. Admin.
 pub async fn fix(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
     Json(body): Json<FixBody>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     claims.require_role(3).map_err(code)?;
-    if body.finding_ids.is_empty() || body.finding_ids.len() > 200 {
-        return Err(bad("finding_ids is 1 to 200 finding ids"));
+    if body.select.is_none() && body.finding_ids.is_empty() {
+        return Err(bad("pick at least one finding"));
     }
     let cfg = load_config(&state, &claims.team_id)
         .await
         .map_err(code)?
         .unwrap_or_default();
     let findings = load_findings(&state, &claims.team_id).await.map_err(code)?;
+    let selection = resolve_selection(&findings, &body).map_err(|e| bad(&e))?;
     let now = chrono::Utc::now();
     let day = sec::limit_day(now);
     let (mut units, skipped) =
-        sec::manual_units_as(&findings, &body.finding_ids, &cfg, now, body.combine);
+        sec::manual_units_as(&findings, &selection.ids, &cfg, now, body.combine);
     let joins: Vec<Option<u64>> = units
         .iter()
         .map(|u| {
@@ -1144,41 +1331,55 @@ pub async fn fix(
         }
     }
     // Every asked finding notes who asked; the queued ones wait with why.
-    for (r, waiting) in started
+    // A selection by filters can name hundreds: written a few at a time.
+    let by_id: HashMap<&str, &(Finding, FindingState)> =
+        findings.iter().map(|p| (p.0.id.as_str(), p)).collect();
+    let writes: Vec<(Finding, FindingState, Option<String>)> = started
         .iter()
         .map(|r| (r, None))
         .chain(queued.iter().map(|r| (r, r.reason.clone())))
+        .flat_map(|(r, waiting)| {
+            r.finding_ids
+                .iter()
+                .filter_map(|id| by_id.get(id.as_str()))
+                .map(move |(f, st)| (f.clone(), st.clone(), waiting.clone()))
+                .collect::<Vec<_>>()
+        })
+        .collect();
     {
-        for id in &r.finding_ids {
-            let Some((f, st)) = findings.iter().find(|(f, _)| &f.id == id) else {
-                continue;
-            };
-            let (mut f, mut st) = (f.clone(), st.clone());
-            if waiting.is_some() {
-                st.requested_by = Some(claims.email.clone());
-                st.requested_as = body.combine;
-            }
-            f.waiting = waiting.clone();
-            f.updated_at = now.to_rfc3339();
-            let _ = save_finding(&state, &claims.team_id, &f, &st).await;
-            add_event(
-                &state,
-                &claims.team_id,
-                &f.id,
-                &format!(
-                    "Fix PR requested by {}{}",
-                    claims.email,
-                    waiting
-                        .as_deref()
-                        .map(|w| format!(". {w}"))
-                        .unwrap_or_default()
-                ),
-                None,
-            )
+        use futures::stream::{self, StreamExt};
+        let (state, claims) = (&state, &claims);
+        let combine = body.combine;
+        stream::iter(writes)
+            .map(|(mut f, mut st, waiting)| async move {
+                if waiting.is_some() {
+                    st.requested_by = Some(claims.email.clone());
+                    st.requested_as = combine;
+                }
+                f.waiting = waiting.clone();
+                f.updated_at = now.to_rfc3339();
+                let _ = save_finding(state, &claims.team_id, &f, &st).await;
+                add_event(
+                    state,
+                    &claims.team_id,
+                    &f.id,
+                    &format!(
+                        "Fix PR requested by {}{}",
+                        claims.email,
+                        waiting
+                            .as_deref()
+                            .map(|w| format!(". {w}"))
+                            .unwrap_or_default()
+                    ),
+                    None,
+                )
+                .await;
+            })
+            .buffer_unordered(16)
+            .collect::<Vec<()>>()
             .await;
-        }
     }
-    info!(team = %claims.team_id, by = %claims.email, started = started.len(), queued = queued.len(), skipped = skipped.len(), raise = body.raise_limit, "Security fix PRs requested");
+    info!(team = %claims.team_id, by = %claims.email, started = started.len(), queued = queued.len(), skipped = skipped.len(), by_filter = selection.by_filter, findings = selection.ids.len(), raise = body.raise_limit, "Security fix PRs requested");
     let runs_today = get_item(&state, &claims.team_id, &format!("SECRUNS#{day}"))
         .await
         .ok()
@@ -1196,28 +1397,27 @@ pub async fn fix(
         "skipped": skipped,
         "runs_today": runs_today,
         "runs_limit": cfg.max_fix_runs_per_day,
+        "selection": selection.json(),
     })))
 }
 
-/// POST /api/security/fix/plan `{finding_ids}`: what asking would do, before
-/// anyone confirms: the units (one PR each) and the findings it skips, with
-/// today's runs against the limit. Any team member.
+/// POST /api/security/fix/plan `{finding_ids | select, combine?}`: what
+/// asking would do, before anyone confirms: the units (one PR each), which
+/// start now and which wait for tomorrow's limit, the findings it skips,
+/// and today's runs and tokens against the limits. Any team member.
 pub async fn fix_plan(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
     Json(body): Json<FixBody>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    if body.finding_ids.len() > 200 {
-        return Err(bad("finding_ids is at most 200 finding ids"));
-    }
     let cfg = load_config(&state, &claims.team_id)
         .await
         .map_err(code)?
         .unwrap_or_default();
     let findings = load_findings(&state, &claims.team_id).await.map_err(code)?;
+    let selection = resolve_selection(&findings, &body).map_err(|e| bad(&e))?;
     let now = chrono::Utc::now();
-    let (units, skipped) =
-        sec::manual_units_as(&findings, &body.finding_ids, &cfg, now, body.combine);
+    let (units, skipped) = sec::manual_units_as(&findings, &selection.ids, &cfg, now, body.combine);
     let runs_today = get_item(
         &state,
         &claims.team_id,
@@ -1234,7 +1434,7 @@ pub async fn fix_plan(
         common::usage::feature::SECURITY_FIX,
     )
     .await;
-    Ok(Json(fix_plan_json(
+    let mut out = fix_plan_json(
         &units,
         &skipped,
         &findings,
@@ -1242,12 +1442,53 @@ pub async fn fix_plan(
         body.combine,
         runs_today,
         tokens_today,
-    )))
+    );
+    out["selection"] = selection.json();
+    Ok(Json(out))
 }
 
-/// Pure: what the confirmation shows. Each unit with its bumps and the
-/// open pull request it joins; how many new pull requests that makes; the
-/// runs and the token guess against today's limits.
+/// Pure: whether each unit starts now or waits, in the order a request
+/// admits them ([`sec::admit_request`] without raising the limit): a repo
+/// with a fix run in progress waits for it; then the token limit; then
+/// today's run slots. The reason is the note the waiting findings carry.
+pub fn unit_starts(
+    units: &[sec::FixUnit],
+    findings: &[(Finding, FindingState)],
+    cfg: &SecurityConfig,
+    runs_today: u64,
+    tokens_today: u64,
+) -> Vec<Option<String>> {
+    let mut busy: std::collections::HashSet<String> = findings
+        .iter()
+        .filter(|(f, _)| f.status == Status::Fixing)
+        .map(|(f, _)| f.repo.to_ascii_lowercase())
+        .collect();
+    let mut left = u64::from(cfg.max_fix_runs_per_day).saturating_sub(runs_today);
+    units
+        .iter()
+        .map(|u| {
+            let repo = u.repo.to_ascii_lowercase();
+            if busy.contains(&repo) {
+                Some(sec::WAITING_REPO.to_string())
+            } else if cfg.max_fix_runs_per_day == 0 {
+                Some("Waiting: fix runs are set to 0 a day in the policy.".into())
+            } else if tokens_today >= cfg.max_fix_tokens_per_day {
+                Some(sec::waiting_tokens(cfg.max_fix_tokens_per_day))
+            } else if left == 0 {
+                Some(sec::waiting_runs(cfg.max_fix_runs_per_day))
+            } else {
+                left -= 1;
+                busy.insert(repo);
+                None
+            }
+        })
+        .collect()
+}
+
+/// Pure: what the confirmation shows. Each unit with its bumps, the open
+/// pull request it joins and whether it starts now or waits (and why); how
+/// many new pull requests that makes; the runs and the token guess against
+/// today's limits; the skipped findings' package names.
 pub fn fix_plan_json(
     units: &[sec::FixUnit],
     skipped: &[sec::Skipped],
@@ -1257,19 +1498,41 @@ pub fn fix_plan_json(
     runs_today: u64,
     tokens_today: u64,
 ) -> Value {
-    let plans: Vec<Value> = units
+    let mut ordered = units.to_vec();
+    sec::order_units(&mut ordered, findings);
+    let starts = unit_starts(&ordered, findings, cfg, runs_today, tokens_today);
+    let plans: Vec<Value> = ordered
         .iter()
-        .map(|u| sec::unit_plan(u, findings, combine == sec::Combine::OnePr))
+        .zip(&starts)
+        .map(|(u, waits)| {
+            let mut p = sec::unit_plan(u, findings, combine == sec::Combine::OnePr);
+            p["starts_now"] = json!(waits.is_none());
+            p["waits"] = json!(waits);
+            p
+        })
         .collect();
     let new_prs = plans.iter().filter(|p| p["joins"].is_null()).count();
     let estimated: u64 = units.iter().map(sec::estimate_tokens).sum();
+    let starting = starts.iter().filter(|w| w.is_none()).count();
+    let names: BTreeMap<&str, &str> = skipped
+        .iter()
+        .filter_map(|s| {
+            findings
+                .iter()
+                .find(|(f, _)| f.id == s.finding_id)
+                .map(|(f, _)| (s.finding_id.as_str(), f.package.as_str()))
+        })
+        .collect();
     json!({
         "units": plans,
         "skipped": skipped,
+        "names": names,
         "combine": combine,
         "bundle": cfg.bundle,
         "pr_count": new_prs,
         "joins": plans.len() - new_prs,
+        "starting_now": starting,
+        "waiting": plans.len() - starting,
         "runs_today": runs_today,
         "runs_limit": cfg.max_fix_runs_per_day,
         "tokens_today": tokens_today,
@@ -1957,24 +2220,357 @@ mod tests {
             mk("b", "tar", "6.2.1", Tier::P2, "2026-12-10T00:00:00Z"),
             mk("c", "axios", "1.8.3", Tier::P2, "2026-11-20T00:00:00Z"),
         ];
-        let (page, total, next) = group_page(&fs, &GroupQuery::default()).unwrap();
+        let GroupPage {
+            page,
+            total,
+            next,
+            fixable,
+        } = group_page(&fs, &GroupQuery::default()).unwrap();
         assert_eq!((total, next), (2, None));
+        assert_eq!(fixable, 0, "no fixed version yet: nothing to select");
         assert_eq!(page[0].package, "tar");
         assert_eq!(page[0].advisories.len(), 2);
         let q = GroupQuery {
             q: Some("GHSA-c".into()),
             ..Default::default()
         };
-        assert_eq!(group_page(&fs, &q).unwrap().0[0].package, "axios");
+        assert_eq!(group_page(&fs, &q).unwrap().page[0].package, "axios");
         let q = GroupQuery {
             sort: Some("package".into()),
             ..Default::default()
         };
-        assert_eq!(group_page(&fs, &q).unwrap().0[0].package, "axios");
+        assert_eq!(group_page(&fs, &q).unwrap().page[0].package, "axios");
         let q = GroupQuery {
             sort: Some("sideways".into()),
             ..Default::default()
         };
         assert!(group_page(&fs, &q).is_err());
+    }
+
+    fn fixable(id: &str, repo: &str, pkg: &str, tier: Tier) -> (Finding, FindingState) {
+        let mut x = f(id, tier, Status::Open, "2026-12-01T00:00:00Z", repo);
+        x.ecosystem = "npm".into();
+        x.package = pkg.into();
+        x.version = "1.0.0".into();
+        x.fixed_version = Some("1.0.1".into());
+        x.advisory.primary = format!("GHSA-{id}");
+        x.advisory.ids = vec![x.advisory.primary.clone()];
+        x.advisory.title = format!("{pkg} issue");
+        (x, FindingState::default())
+    }
+
+    fn select(filters: GroupQuery, except: &[&str]) -> FixBody {
+        FixBody {
+            select: Some(SelectAll {
+                all: true,
+                filters,
+                except_ids: except.iter().map(|s| s.to_string()).collect(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// "Select all that match" takes exactly the rows the list shows with
+    /// a checkbox: the same filters, only fixes that can get a PR now,
+    /// less the rows unticked by hand.
+    #[test]
+    fn select_all_resolves_the_same_set_as_the_list() {
+        let mut fs = vec![
+            fixable("a1", "acme/web", "tar", Tier::P1),
+            fixable("a2", "acme/web", "tar", Tier::P2),
+            fixable("b", "acme/web", "ws", Tier::P1),
+            fixable("c", "acme/api", "qs", Tier::P1),
+            fixable("d", "acme/api", "undici", Tier::P2),
+            fixable("nofix", "acme/api", "left-pad", Tier::P1),
+            fixable("pr", "acme/api", "minimist", Tier::P1),
+            fixable("run", "acme/docs", "marked", Tier::P1),
+            fixable("gone", "acme/docs", "lodash", Tier::P1),
+            fixable("done", "acme/docs", "semver", Tier::P1),
+        ];
+        let at = |fs: &mut Vec<(Finding, FindingState)>, id: &str| {
+            fs.iter().position(|(f, _)| f.id == id).unwrap()
+        };
+        let i = at(&mut fs, "nofix");
+        fs[i].0.fixed_version = None;
+        let i = at(&mut fs, "pr");
+        fs[i].0.status = Status::PrOpen;
+        fs[i].0.pr = Some(sec::PrRef {
+            number: 9,
+            url: "https://github.com/acme/api/pull/9".into(),
+            state: "open".into(),
+            ..Default::default()
+        });
+        let i = at(&mut fs, "run");
+        fs[i].0.status = Status::Fixing;
+        let i = at(&mut fs, "gone");
+        fs[i].0.status = Status::Dismissed;
+        let i = at(&mut fs, "done");
+        fs[i].0.status = Status::Fixed;
+
+        // The list's own answer: every matching group with a checkbox.
+        let listed = |q: &GroupQuery| -> Vec<String> {
+            let mut ids: Vec<String> = matching_groups(&fs, q)
+                .unwrap()
+                .into_iter()
+                .filter(group_fixable)
+                .flat_map(|g| g.finding_ids)
+                .collect();
+            ids.sort();
+            ids
+        };
+        let resolved = |b: &FixBody| {
+            let mut s = resolve_selection(&fs, b).unwrap();
+            s.ids.sort();
+            s
+        };
+        for q in [
+            GroupQuery::default(),
+            GroupQuery {
+                tier: Some("P1".into()),
+                ..Default::default()
+            },
+            GroupQuery {
+                repo: Some("acme/api".into()),
+                ..Default::default()
+            },
+            GroupQuery {
+                q: Some("tar".into()),
+                ..Default::default()
+            },
+            GroupQuery {
+                status: Some("all".into()),
+                sort: Some("package".into()),
+                cursor: Some("50".into()),
+                ..Default::default()
+            },
+        ] {
+            assert_eq!(resolved(&select(q.clone(), &[])).ids, listed(&q), "{q:?}");
+        }
+        let all = resolved(&select(GroupQuery::default(), &[]));
+        assert_eq!(
+            all,
+            Selection {
+                ids: ["a1", "a2", "b", "c", "d"].map(String::from).to_vec(),
+                fixes: 4,
+                matched: 4,
+                left_fixes: 0,
+                left_findings: 0,
+                by_filter: true,
+            }
+        );
+        assert_eq!(
+            group_page(&fs, &GroupQuery::default()).unwrap().fixable,
+            all.fixes,
+            "the count the list offers is the count it selects"
+        );
+        // Unticked rows stay out; a group with every finding unticked is gone.
+        let less = resolved(&select(GroupQuery::default(), &["b", "a2", "a1"]));
+        assert_eq!(less.ids, vec!["c", "d"]);
+        assert_eq!((less.fixes, less.matched), (2, 2));
+        // The picked form is unchanged; the forms don't mix; the list's
+        // filters are checked as the list checks them.
+        let picked = FixBody {
+            finding_ids: vec!["a1".into()],
+            ..Default::default()
+        };
+        assert_eq!(resolve_selection(&fs, &picked).unwrap().ids, vec!["a1"]);
+        let too_many = FixBody {
+            finding_ids: (0..201).map(|i| i.to_string()).collect(),
+            ..Default::default()
+        };
+        assert!(resolve_selection(&fs, &too_many)
+            .unwrap_err()
+            .contains("send select with the list's filters"));
+        let both = FixBody {
+            finding_ids: vec!["a1".into()],
+            ..select(GroupQuery::default(), &[])
+        };
+        assert!(resolve_selection(&fs, &both).is_err());
+        let mut off = select(GroupQuery::default(), &[]);
+        off.select.as_mut().unwrap().all = false;
+        assert!(resolve_selection(&fs, &off).is_err());
+        let weird = select(
+            GroupQuery {
+                tier: Some("P9".into()),
+                ..Default::default()
+            },
+            &[],
+        );
+        assert!(resolve_selection(&fs, &weird).is_err());
+        let body: FixBody = serde_json::from_value(json!({
+            "select": {"all": true, "filters": {"status": "open", "tier": "P1", "repo": "", "q": ""}, "except_ids": ["b"]},
+            "combine": "one_pr"
+        }))
+        .unwrap();
+        assert_eq!(resolved(&body).ids, vec!["a1", "a2", "c"]);
+    }
+
+    /// 350 fixes in three repos, every one selected by filter: one PR per
+    /// repo with every bump in it, as the picked form makes them.
+    #[test]
+    fn select_all_groups_one_pr_per_repo() {
+        let repos = ["acme/web", "acme/api", "acme/docs"];
+        let fs: Vec<(Finding, FindingState)> = (0..350)
+            .map(|i| {
+                fixable(
+                    &format!("f{i:03}"),
+                    repos[i % 3],
+                    &format!("pkg-{i:03}"),
+                    Tier::P2,
+                )
+            })
+            .collect();
+        let sel = resolve_selection(&fs, &select(GroupQuery::default(), &["f000"])).unwrap();
+        assert_eq!((sel.fixes, sel.ids.len(), sel.left_fixes), (349, 349, 0));
+        let cfg = SecurityConfig {
+            bundle: sec::Bundle::PerPackage,
+            max_fix_runs_per_day: 10,
+            ..Default::default()
+        };
+        let now = chrono::Utc::now();
+        let (units, skipped) = sec::manual_units_as(&fs, &sel.ids, &cfg, now, sec::Combine::OnePr);
+        assert!(skipped.is_empty());
+        let plan = fix_plan_json(&units, &skipped, &fs, &cfg, sec::Combine::OnePr, 0, 0);
+        let mut by_repo: Vec<(String, usize)> = plan["units"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|u| {
+                (
+                    u["repo"].as_str().unwrap().to_string(),
+                    u["bumps"].as_array().unwrap().len(),
+                )
+            })
+            .collect();
+        by_repo.sort();
+        assert_eq!(
+            by_repo,
+            vec![
+                ("acme/api".to_string(), 117),
+                ("acme/docs".to_string(), 116),
+                ("acme/web".to_string(), 116),
+            ]
+        );
+        assert_eq!(
+            (
+                plan["pr_count"].as_u64(),
+                plan["starting_now"].as_u64(),
+                plan["waiting"].as_u64()
+            ),
+            (Some(3), Some(3), Some(0))
+        );
+    }
+
+    /// The day's limits never turn a request down: the plan says which
+    /// repos start now and which wait for tomorrow, and why.
+    #[test]
+    fn the_daily_limits_make_repos_wait_for_tomorrow_not_an_error() {
+        let repos = ["acme/a", "acme/b", "acme/c", "acme/d", "acme/e"];
+        let mut fs: Vec<(Finding, FindingState)> = repos
+            .iter()
+            .enumerate()
+            .map(|(i, r)| fixable(&format!("f{i}"), r, &format!("pkg-{i}"), Tier::P1))
+            .collect();
+        let cfg = SecurityConfig {
+            max_fix_runs_per_day: 3,
+            max_fix_tokens_per_day: 2_000_000,
+            ..Default::default()
+        };
+        let sel = resolve_selection(&fs, &select(GroupQuery::default(), &[])).unwrap();
+        let now = chrono::Utc::now();
+        let plan_for = |fs: &[(Finding, FindingState)], runs: u64, tokens: u64| {
+            let (units, skipped) =
+                sec::manual_units_as(fs, &sel.ids, &cfg, now, sec::Combine::OnePr);
+            fix_plan_json(
+                &units,
+                &skipped,
+                fs,
+                &cfg,
+                sec::Combine::OnePr,
+                runs,
+                tokens,
+            )
+        };
+        let waits = |plan: &Value| -> Vec<Option<String>> {
+            plan["units"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|u| u["waits"].as_str().map(String::from))
+                .collect()
+        };
+        // One run used today: two repos start, three wait for tomorrow.
+        let plan = plan_for(&fs, 1, 0);
+        let runs = Some(sec::waiting_runs(3));
+        assert_eq!(
+            waits(&plan),
+            vec![None, None, runs.clone(), runs.clone(), runs.clone()]
+        );
+        assert!(runs.unwrap().contains("Next starts tomorrow"));
+        assert_eq!(
+            (plan["starting_now"].as_u64(), plan["waiting"].as_u64()),
+            (Some(2), Some(3))
+        );
+        assert!(plan["units"][0]["starts_now"].as_bool().unwrap());
+        // The token limit used up: every repo waits.
+        let plan = plan_for(&fs, 0, 2_000_000);
+        assert_eq!(waits(&plan), vec![Some(sec::waiting_tokens(2_000_000)); 5]);
+        // A repo with a run in progress waits for it; the next repo takes the slot.
+        let busy = fixable("busy", "acme/a", "other", Tier::P3);
+        fs.push((
+            Finding {
+                status: Status::Fixing,
+                ..busy.0
+            },
+            busy.1,
+        ));
+        let plan = plan_for(&fs, 0, 0);
+        let first = &plan["units"][0];
+        assert_eq!(first["repo"], "acme/a");
+        assert_eq!(first["waits"], sec::WAITING_REPO);
+        assert_eq!(plan["starting_now"], 3);
+    }
+
+    /// A filter selection past the bound is a plan with a note, never a
+    /// validation error: the most urgent fixes go, the rest wait for the
+    /// next request.
+    #[test]
+    fn a_selection_past_the_bound_is_a_note_not_an_error() {
+        let n = MAX_SELECTED_FINDINGS + 150;
+        let fs: Vec<(Finding, FindingState)> = (0..n)
+            .map(|i| {
+                let tier = if i % 2 == 0 { Tier::P3 } else { Tier::P0 };
+                fixable(
+                    &format!("f{i:05}"),
+                    "acme/web",
+                    &format!("pkg-{i:05}"),
+                    tier,
+                )
+            })
+            .collect();
+        let sel = resolve_selection(&fs, &select(GroupQuery::default(), &[])).unwrap();
+        assert_eq!(sel.ids.len(), MAX_SELECTED_FINDINGS);
+        assert_eq!(
+            (sel.fixes, sel.left_fixes, sel.left_findings),
+            (1000, 150, 150)
+        );
+        assert_eq!(sel.matched, n);
+        let p0 = fs
+            .iter()
+            .filter(|(f, _)| f.tier == Some(Tier::P0))
+            .map(|(f, _)| f.id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        assert!(
+            p0.iter().all(|id| sel.ids.contains(id)),
+            "every P0 is in the part that goes"
+        );
+        let j = sel.json();
+        assert_eq!(j["left_fixes"], 150);
+        assert!(j["note"]
+            .as_str()
+            .unwrap()
+            .starts_with("This request takes the first 1000 fixes (1000 findings)"));
+        let small = resolve_selection(&fs[..3], &select(GroupQuery::default(), &[])).unwrap();
+        assert_eq!(small.json()["note"], Value::Null);
     }
 }
