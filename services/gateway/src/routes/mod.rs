@@ -57,6 +57,7 @@ pub mod plan_chat_tools;
 pub mod plans;
 pub mod plugin_pkgs;
 pub mod plugins;
+pub mod repo_setup;
 pub mod review_lessons;
 pub mod reviewer;
 pub mod roles;

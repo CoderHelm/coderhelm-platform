@@ -60,6 +60,10 @@ pub enum WorkerMessage {
     /// rides on the review-reminder tick.
     #[serde(rename = "stale_prs_preview")]
     StalePrsPreview(StalePrsPreviewMessage),
+    /// Setup: read one repo of a run and plan its settings (`crate::setup`);
+    /// a run in auto mode applies the plan when it is made.
+    #[serde(rename = "setup_analyze")]
+    SetupAnalyze(SetupAnalyzeMessage),
     /// Security fixes (`common::security_fixes`): a Dependabot alert or a
     /// GitHub advisory arrived, a default branch's dependencies changed, or
     /// a person asked for a check now. The scheduled work rides on the
@@ -413,7 +417,7 @@ impl WorkerMessage {
             | WorkerMessage::Restack(_) => f::RUN,
             WorkerMessage::Feedback(_) | WorkerMessage::JiraComment(_) => f::FEEDBACK,
             WorkerMessage::Lesson(_) | WorkerMessage::RewardOutcome(_) => f::MEMORY,
-            WorkerMessage::Onboard(_) => f::ONBOARD,
+            WorkerMessage::Onboard(_) | WorkerMessage::SetupAnalyze(_) => f::ONBOARD,
             WorkerMessage::PlanExecute(_) | WorkerMessage::PlanTaskContinue(_) => f::PLAN,
             WorkerMessage::InfraAnalyze(_) => f::INFRA,
             WorkerMessage::Review(_)
@@ -488,6 +492,7 @@ impl WorkerMessage {
             | WorkerMessage::ReviewReminder
             | WorkerMessage::ReviewSweep
             | WorkerMessage::StalePrsPreview(_)
+            | WorkerMessage::SetupAnalyze(_)
             | WorkerMessage::SecurityEvent(_)
             | WorkerMessage::HealthCheck(_)
             | WorkerMessage::AwaitMerge(_)
@@ -617,6 +622,15 @@ pub struct SecurityEventMessage {
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct StalePrsPreviewMessage {
     pub team_id: String,
+    /// `owner/name`.
+    pub repo: String,
+}
+
+/// One repo of a Setup run to analyze.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct SetupAnalyzeMessage {
+    pub team_id: String,
+    pub run_id: String,
     /// `owner/name`.
     pub repo: String,
 }

@@ -4762,10 +4762,6 @@ fn attr_bool(val: bool) -> aws_sdk_dynamodb::types::AttributeValue {
     aws_sdk_dynamodb::types::AttributeValue::Bool(val)
 }
 
-/// Teams keep their working playbooks here (testing, logging, PR and commit
-/// conventions), which run past 10 KB; every agent in a run reads them.
-const MAX_INSTRUCTIONS_BYTES: usize = 32_768; // 32 KB limit
-
 /// GET /api/instructions/global — get global custom instructions.
 pub async fn get_global_instructions(
     State(state): State<Arc<AppState>>,
@@ -4956,35 +4952,25 @@ async fn get_instructions_inner(
             error!("Failed to fetch instructions: {e}");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
-
-    let content = result
-        .item()
-        .and_then(|item| item.get("content"))
-        .and_then(|v| v.as_s().ok())
-        .cloned()
-        .unwrap_or_default();
-
+    let content = common::instructions::content_of(result.item());
     Ok(Json(json!({ "content": content })))
 }
 
+/// One text setting saved (`common::instructions`, the same item Setup
+/// writes).
 async fn update_instructions_inner(
     state: &AppState,
     team_id: &str,
     sk: &str,
     content: &str,
 ) -> Result<StatusCode, StatusCode> {
-    if content.len() > MAX_INSTRUCTIONS_BYTES {
-        return Err(StatusCode::PAYLOAD_TOO_LARGE);
-    }
-
+    let item = common::instructions::item(team_id, sk, content, &chrono::Utc::now().to_rfc3339())
+        .map_err(|_| StatusCode::PAYLOAD_TOO_LARGE)?;
     state
         .dynamo
         .put_item()
         .table_name(&state.config.settings_table_name)
-        .item("pk", attr_s(team_id))
-        .item("sk", attr_s(sk))
-        .item("content", attr_s(content))
-        .item("updated_at", attr_s(&chrono::Utc::now().to_rfc3339()))
+        .set_item(Some(item))
         .send()
         .await
         .map_err(|e| {
@@ -5220,7 +5206,7 @@ pub async fn update_repo_agents(
     let repo = format!("{owner}/{name}");
     validate_repo_name(&repo)?;
     let content = body["content"].as_str().unwrap_or("");
-    if content.len() > MAX_INSTRUCTIONS_BYTES {
+    if content.len() > common::instructions::MAX_BYTES {
         return Err(StatusCode::PAYLOAD_TOO_LARGE);
     }
     // Saved as an edit: the sweep never replaces it by itself, it marks it
@@ -5802,22 +5788,13 @@ pub async fn update_git_conventions(
             Json(json!({ "error": error, "field": field })),
         )
     })?;
-    let mut put = state
+    let put = state
         .dynamo
         .put_item()
         .table_name(&state.config.settings_table_name)
-        .item("pk", attr_s(&claims.team_id))
-        .item("sk", attr_s(common::git_conventions::SETTINGS_SK))
-        .item("updated_at", attr_s(&chrono::Utc::now().to_rfc3339()));
-    for (k, v) in [
-        ("branch", &c.branch),
-        ("commit", &c.commit),
-        ("pr_title", &c.pr_title),
-    ] {
-        if let Some(v) = v {
-            put = put.item(k, attr_s(v));
-        }
-    }
+        .set_item(Some(
+            c.to_item(&claims.team_id, &chrono::Utc::now().to_rfc3339()),
+        ));
     put.send().await.map_err(|e| {
         error!("Failed to save git conventions: {e}");
         (

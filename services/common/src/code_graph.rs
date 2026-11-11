@@ -248,6 +248,28 @@ pub async fn switches(
         .collect())
 }
 
+/// The switch item a save writes (the graph route and Setup).
+pub fn config_item(
+    team_id: &str,
+    repo: &str,
+    enabled: bool,
+    by: &str,
+    now: &str,
+) -> HashMap<String, AttributeValue> {
+    HashMap::from([
+        ("pk".to_string(), s(team_id)),
+        ("sk".to_string(), s(&config_sk(repo))),
+        ("enabled".to_string(), AttributeValue::Bool(enabled)),
+        ("updated_by".to_string(), s(by)),
+        ("updated_at".to_string(), s(now)),
+    ])
+}
+
+/// A repo's own switch from its item: `None` when it has none.
+pub fn own_switch(item: Option<&HashMap<String, AttributeValue>>) -> Option<bool> {
+    item.and_then(|it| item_bool(it, "enabled"))
+}
+
 /// Turn the graph on or off for `repo`.
 pub async fn set_enabled(
     dynamo: &DynamoClient,
@@ -260,11 +282,13 @@ pub async fn set_enabled(
     dynamo
         .put_item()
         .table_name(table)
-        .item("pk", s(team_id))
-        .item("sk", s(&config_sk(repo)))
-        .item("enabled", AttributeValue::Bool(enabled))
-        .item("updated_by", s(by))
-        .item("updated_at", s(&chrono::Utc::now().to_rfc3339()))
+        .set_item(Some(config_item(
+            team_id,
+            repo,
+            enabled,
+            by,
+            &chrono::Utc::now().to_rfc3339(),
+        )))
         .send()
         .await
         .map(|_| ())

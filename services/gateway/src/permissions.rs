@@ -122,6 +122,11 @@ pub const CAPABILITIES: &[Capability] = &[
             "tests::list_tests",
             "api::get_usage",
             "tests_setup::status",
+            "repo_setup::home",
+            "repo_setup::get_registry",
+            "repo_setup::list_runs",
+            "repo_setup::get_run",
+            "repo_setup::estimate",
         ],
     },
     Capability {
@@ -490,6 +495,22 @@ pub const CAPABILITIES: &[Capability] = &[
             "stale_prs::put_config",
             "stale_prs::put_keep_open",
             "review_lessons::delete_lesson",
+        ],
+    },
+    Capability {
+        key: "setup",
+        label: "Run Setup: analyze repos, review and apply recommended settings, undo a Setup run, and set up new repos automatically. Each change also needs the permission of its setting",
+
+        short_label: "Run Setup",
+        min_role: "admin",
+        handlers: &[
+            "repo_setup::create_run",
+            "repo_setup::put_decisions",
+            "repo_setup::apply_run",
+            "repo_setup::undo_run",
+            "repo_setup::put_settings",
+            "repo_setup::mark_seen",
+            "repo_setup::switch_on",
         ],
     },
     Capability {

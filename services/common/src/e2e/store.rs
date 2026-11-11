@@ -220,15 +220,32 @@ impl<'a> Store<'a> {
     // ── settings and repos ──────────────────────────────────────────────
 
     pub async fn settings(&self, team: &str) -> Result<Settings, String> {
+        Ok(self.saved_settings(team).await?.unwrap_or_default())
+    }
+
+    /// The settings the team saved, `None` when it never saved any.
+    pub async fn saved_settings(&self, team: &str) -> Result<Option<Settings>, String> {
         Ok(self
             .get(&team_pk(team), "SETTINGS")
             .await?
-            .and_then(|i| data(&i))
-            .unwrap_or_default())
+            .and_then(|i| data(&i)))
     }
 
     pub async fn put_settings(&self, team: &str, settings: &Settings) -> Result<(), String> {
         self.put(&team_pk(team), "SETTINGS", settings, vec![]).await
+    }
+
+    /// Removes the team's saved settings (they read as the defaults again).
+    pub async fn delete_settings(&self, team: &str) -> Result<(), String> {
+        self.dynamo
+            .delete_item()
+            .table_name(self.table)
+            .key("pk", s(&team_pk(team)))
+            .key("sk", s("SETTINGS"))
+            .send()
+            .await
+            .map(|_| ())
+            .map_err(|e| format!("e2e delete: {e}"))
     }
 
     /// Records that a repo of the team has results, and lets CI calls signed

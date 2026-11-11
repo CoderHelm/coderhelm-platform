@@ -50,11 +50,8 @@ const REPEAT_WINDOW_SECS: u64 = 6 * 3600;
 const MAX_RUNS_PER_RULE_PER_DAY: u64 = 5;
 /// Team setting: most tokens alert runs may use per rolling day, counted like
 /// the team's monthly token limit (input + output).
-const BUDGET_SK: &str = "ALERT_BUDGET";
-/// Daily alert token budget when a team hasn't set one.
-pub const DEFAULT_DAILY_TOKENS: u64 = 500_000;
-/// Most a team may set.
-const MAX_DAILY_TOKENS: u64 = 100_000_000;
+/// (`common::alert_budget` has the key, the default and the cap.)
+pub use common::alert_budget::DEFAULT_DAILY_TOKENS;
 /// Tokens an alert run still in progress is assumed to use, since its usage is
 /// only recorded when it finishes (about the 90th percentile of a run).
 const OPEN_RUN_RESERVE_TOKENS: u64 = 50_000;
@@ -1724,13 +1721,11 @@ async fn daily_budget(state: &AppState, team_id: &str) -> u64 {
         .get_item()
         .table_name(&state.config.settings_table_name)
         .key("pk", attr_s(team_id))
-        .key("sk", attr_s(BUDGET_SK))
+        .key("sk", attr_s(common::alert_budget::SK))
         .send()
         .await
         .ok()
-        .and_then(|o| o.item().cloned())
-        .and_then(|i| i.get("daily_tokens").and_then(|v| v.as_n().ok()).cloned())
-        .and_then(|n| n.parse::<u64>().ok())
+        .and_then(|o| common::alert_budget::saved(o.item()))
         .unwrap_or(DEFAULT_DAILY_TOKENS)
 }
 
@@ -2495,21 +2490,18 @@ pub async fn put_budget(
     Json(req): Json<PutBudgetRequest>,
 ) -> Result<Json<Value>, StatusCode> {
     claims.require_role(3)?;
-    if req.daily_tokens > MAX_DAILY_TOKENS {
-        return Err(StatusCode::BAD_REQUEST);
-    }
+    let item = common::alert_budget::item(
+        &claims.team_id,
+        req.daily_tokens,
+        &claims.email,
+        &chrono::Utc::now().to_rfc3339(),
+    )
+    .map_err(|_| StatusCode::BAD_REQUEST)?;
     state
         .dynamo
         .put_item()
         .table_name(&state.config.settings_table_name)
-        .item("pk", attr_s(&claims.team_id))
-        .item("sk", attr_s(BUDGET_SK))
-        .item(
-            "daily_tokens",
-            AttributeValue::N(req.daily_tokens.to_string()),
-        )
-        .item("updated_at", attr_s(&chrono::Utc::now().to_rfc3339()))
-        .item("updated_by", attr_s(&claims.email))
+        .set_item(Some(item))
         .send()
         .await
         .map_err(|e| {

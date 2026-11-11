@@ -1175,6 +1175,7 @@ pub mod security_fixes;
 #[cfg(test)]
 mod selfhost_links;
 mod series;
+pub mod setup;
 pub mod skill_compat;
 pub mod skill_suggest;
 pub mod skills;

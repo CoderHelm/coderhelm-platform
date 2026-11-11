@@ -476,6 +476,27 @@ async fn main() -> Result<(), Error> {
             "/analytics/decisions/export",
             get(routes::decisions::export_decisions),
         )
+        // Setup: recommended settings for many repos, applied at once
+        .route("/setup", get(routes::repo_setup::home))
+        .route("/setup/registry", get(routes::repo_setup::get_registry))
+        .route(
+            "/setup/runs",
+            get(routes::repo_setup::list_runs).post(routes::repo_setup::create_run),
+        )
+        .route("/setup/runs/:id", get(routes::repo_setup::get_run))
+        .route(
+            "/setup/runs/:id/decisions",
+            put(routes::repo_setup::put_decisions),
+        )
+        .route("/setup/runs/:id/apply", post(routes::repo_setup::apply_run))
+        .route("/setup/runs/:id/undo", post(routes::repo_setup::undo_run))
+        .route("/setup/settings", put(routes::repo_setup::put_settings))
+        .route("/setup/seen", post(routes::repo_setup::mark_seen))
+        .route("/setup/estimate", post(routes::repo_setup::estimate))
+        .route(
+            "/setup/runs/:id/switch-on",
+            post(routes::repo_setup::switch_on),
+        )
         // Reviewer agent — per-repo config, reviews list/detail, ratings
         .route(
             "/reviewer/org-config",

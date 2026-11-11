@@ -66,6 +66,8 @@ pub mod alert_notify;
 /// channel, sealed webhook URLs.
 pub mod notify;
 
+/// The team's daily alert token budget (alerts route and Setup).
+pub mod alert_budget;
 /// Dockerfile base images: their package lists matched against OSV's
 /// distribution data, fixed by pinning the same tag to a newer digest.
 pub mod base_images;
@@ -83,12 +85,18 @@ pub mod github_wait;
 /// Infrastructure vulnerabilities: public AWS feeds, a team's AWS inventory,
 /// and matching by version (no model calls).
 pub mod infra_vuln;
+/// Custom instructions, voice and agent context rows (routes and Setup).
+pub mod instructions;
 pub mod live;
 /// Log findings and the fix runs started from them.
 pub mod log_findings;
+/// One repo's reviewer settings: the page's view and the saved item.
+pub mod review_config;
 /// Security fixes: advisories, triage, fix runs and cards (gateway and worker).
 pub mod security_fixes;
 pub mod settings_index;
+/// Setup: the settings registry, the repo analysis, runs, apply and undo.
+pub mod setup;
 // Which repo a log group's or alarm's code lives in, from evidence.
 /// Sealed credentials for a team's MCP servers (KMS, bound to team and server).
 pub mod envelope;

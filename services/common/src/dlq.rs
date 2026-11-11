@@ -41,6 +41,7 @@ pub const WORKER_MESSAGE_TYPES: &[&str] = &[
     "review_reminder",
     "review_sweep",
     "stale_prs_preview",
+    "setup_analyze",
     // Security fixes: an alert, an advisory, a push or a check now.
     "security_event",
     "health_check",

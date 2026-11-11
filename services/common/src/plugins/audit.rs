@@ -72,6 +72,10 @@ pub mod action {
     pub const RESULTS: &str = "results.recorded";
     pub const CHAT_BRIEF: &str = "chat.brief";
     pub const CHAT_REFUSED: &str = "chat.refused";
+    /// Setup changed one setting (`crate::setup`).
+    pub const SETUP_APPLIED: &str = "setup.applied";
+    /// Setup put one setting back (undo).
+    pub const SETUP_UNDONE: &str = "setup.undone";
 }
 
 /// One event.
