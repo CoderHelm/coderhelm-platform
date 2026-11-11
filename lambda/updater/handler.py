@@ -3425,10 +3425,12 @@ def first_failure(cfn, stack_name, since):
     return f"{e.get('LogicalResourceId')}: {e.get('ResourceStatusReason') or e.get('ResourceStatus')}"[:500]
 
 
-def native_poll(store, env, now, cfn=None):
+def native_poll(store, env, now, cfn=None, wait=False):
     """Moves a proposed or running stack update along; returns what happened.
     What CloudFormation says decides, the stored entry only follows it: a
-    change set executed in the AWS console is followed like one applied here."""
+    change set executed in the AWS console is followed like one applied here.
+    `wait` (the scheduled poll only): after UPDATE_COMPLETE it keeps asking the
+    new release to answer for up to API_WINDOW; the status route asks once."""
     cfn = cfn or client("cloudformation")
     state = store.get("UPDATE_STATE", {})
     hid = state.get("running_id") or state.get("review_id")
@@ -3590,7 +3592,12 @@ def native_poll(store, env, now, cfn=None):
             if ran and entry.get("version") and ran != entry.get("version"):
                 return native_finish(store, env, now, hid, "failed",
                                      f"the stack finished, but it reports {ran}, not {entry.get('version')}")
-            return native_finish(store, env, now, hid, "succeeded", "")
+            result, note = answers_after(store, env, now, hid, entry, wait)
+            if result is None:
+                return {"native": "checking", "api": note}
+            if result == "failed":
+                return native_finish(store, env, now, hid, "failed", note, UNANSWERED)
+            return native_finish(store, env, now, hid, "succeeded", note)
         reason = first_failure(cfn, env["NATIVE_STACK"], entry.get("executed_at")) or f"the stack ended {st}"
         result = "rolled_back" if "ROLLBACK_COMPLETE" in st else "failed"
         return native_finish(store, env, now, hid, result, reason)
@@ -3628,6 +3635,59 @@ def never_runs(entry):
     if not calls:
         return ""
     return (f"{PREFLIGHT_MARK}: " + "; ".join(calls))[:900]
+
+
+# After UPDATE_COMPLETE the new release must answer, as `coderhelm-selfhost
+# update` checks it (installer/lib/commands.mjs, health): GET /api/me is 401
+# (up, not signed in) or 200. The updater runs outside any VPC and reaches the
+# internet as it does for the release templates; when it can't reach the
+# install at all, that says nothing about the release, so it isn't a failure.
+API_WINDOW = 120   # seconds the new release has to answer
+API_PAUSE = 10     # between two asks
+API_OPENER = None  # tests replace it; None is urllib's
+_sleep, _clock = time.sleep, time.monotonic
+
+
+def api_status(url, opener=None):
+    """GET {url}/api/me: its HTTP status, or None when it couldn't be reached."""
+    req = urllib.request.Request(f"{url}/api/me", headers={"User-Agent": "coderhelm-updater"})
+    try:
+        with (opener or API_OPENER or urllib.request.urlopen)(req, timeout=5) as r:
+            return r.status
+    except urllib.error.HTTPError as e:
+        return e.code
+    except Exception as e:  # noqa: BLE001 (DNS, refused, timeout, no route)
+        logger.warning(f"couldn't reach {url}/api/me: {e}")
+        return None
+
+
+def answers_after(store, env, now, hid, entry, wait):
+    """(result, note) once the stack is UPDATE_COMPLETE: ("succeeded", note),
+    ("failed", what it answered), or (None, what it answered) while the window
+    is still open and this call doesn't wait. Never rolls anything back."""
+    url = app_url(env)
+    if not url:
+        return "succeeded", "the stack finished; whether the new version answers wasn't checked (the updater knows no public URL for this install)"
+    if not entry.get("api_since"):
+        entry["api_since"] = now.isoformat()
+        store.put(hid, entry)
+    before = (now - datetime.fromisoformat(entry["api_since"])).total_seconds()
+    start = _clock()
+    while True:
+        code = api_status(url)
+        if code in (200, 401):
+            return "succeeded", ""
+        if code is None:
+            return "succeeded", (f"the stack finished, but the updater couldn't reach {url}/api/me, so it couldn't check that "
+                                 "the new version answers. Open CoderHelm to check it does")
+        if before + (_clock() - start) >= API_WINDOW:
+            entry = store.get(hid, {}) or entry
+            entry["unanswered"] = f"HTTP {code}"
+            store.put(hid, entry)
+            return "failed", f"HTTP {code}"
+        if not wait:
+            return None, f"HTTP {code}"
+        _sleep(API_PAUSE)
 
 
 def stack_version(stack):
@@ -3864,6 +3924,7 @@ def reconcile(store, env, now, cfn=None):
 PREPARE = "prepare"      # the change set: nothing ran
 ROLLED_BACK = "rolled_back"
 STOPPED = "stopped"      # ran, and didn't end cleanly
+UNANSWERED = "unanswered"  # ran to UPDATE_COMPLETE, and the new release doesn't answer
 
 _NOT_ALLOWED = re.compile(r"is not authorized to perform:?\s*([\w-]+:[\w*]+)", re.I)
 _TRANSFORM = re.compile(r":transform/[\w-]+", re.I)
@@ -3910,6 +3971,11 @@ def explain_failure(raw, version, from_version, phase):
     what, fix = _cause(raw)
     part = re.match(r"([A-Za-z][A-Za-z0-9]{0,63}): ", raw)
     broken = f"the {part.group(1)} part of the install could not be updated" if part else "a part of the install could not be updated"
+    if phase == UNANSWERED:
+        # Never rolled back by itself: from_version stays in the history for Roll back.
+        summary = f"The update finished but the new version doesn't answer: {raw}."
+        return {"summary": summary, "fix": f"Use Roll back to return to {was}.", "technical": f"GET /api/me answered {raw}",
+                "reason": f"{summary} Use Roll back to return to {was}."}
     if phase == PREPARE:
         summary = f"The update couldn't start: {what or 'AWS could not prepare the change this release needs'}. Nothing changed: your install stayed on {was}."
         fix = fix or "Press Update again. " + _SAME_AGAIN
@@ -4258,7 +4324,8 @@ def handle(event, env, store, now, fetch=fetch_releases, probe=None, hint=None):
     if action == "rollback":
         target = event.get("version")
         if not target:
-            done = [h for h in store.history(50) if h.get("status") == "succeeded" and h.get("from_version")]
+            # A finished update whose release doesn't answer goes back to where it came from too.
+            done = [h for h in store.history(50) if (h.get("status") == "succeeded" or h.get("unanswered")) and h.get("from_version")]
             if not done:
                 raise ValueError("no earlier version to roll back to")
             target = done[0]["from_version"]
@@ -4333,7 +4400,7 @@ def handle(event, env, store, now, fetch=fetch_releases, probe=None, hint=None):
     if action == "native_poll":
         if not is_native(env):
             raise ValueError("native_poll: not a native install")
-        return native_poll(store, env, now)
+        return native_poll(store, env, now, wait=True)
 
     if action == "domain_set":
         return domain_set(store, env, now, event.get("hostname"), event.get("actor") or DIRECT_ACTOR)
