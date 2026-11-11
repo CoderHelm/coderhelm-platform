@@ -163,6 +163,8 @@ pub fn source_json(s: &Source, now: i64) -> Value {
         "progress": if status == Status::Syncing { serde_json::to_value(&s.progress).unwrap_or(Value::Null) } else { Value::Null },
         "items": s.items,
         "failed_items": s.failed_items,
+        "waiting_items": s.waiting_items,
+        "next_retry_at": if s.waiting_items > 0 && s.next_retry_at > 0 { ts(s.next_retry_at) } else { String::new() },
         "skipped_items": s.skipped_items,
         "truncated": s.truncated,
         "total": s.total,
@@ -1629,9 +1631,10 @@ pub struct RetryBody {
 }
 
 /// POST /api/knowledge/:kb_id/sources/:source_id/retry — read chosen items
-/// again on a sync now (items that couldn't be read or were left out):
-/// their version marker is forgotten, so the sync fetches them whatever the
-/// app says changed.
+/// again on a sync now (items that couldn't be read, were left out or wait
+/// to be read again): their version marker is forgotten and they are due
+/// now, so the sync fetches them whatever the app says changed (also when
+/// it lists only what changed).
 pub async fn retry_items(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
@@ -1659,6 +1662,13 @@ pub async fn retry_items(
         .filter(|f| wanted.contains(f.id.as_str()))
     {
         f.remote_version.clear();
+        if f.status == common::knowledge::FileStatus::Failed {
+            // Due now: the sync reads it even when the app lists only what
+            // changed, and the page shows it waiting until then.
+            f.skipped.clear();
+            f.reason = "requested".into();
+            f.retry_at = chrono::Utc::now().to_rfc3339();
+        }
         st.put_item(&claims.team_id, &f)
             .await
             .map_err(|e| internal("knowledge item", e))?;

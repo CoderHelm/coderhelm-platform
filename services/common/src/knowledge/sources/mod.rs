@@ -50,6 +50,7 @@ pub mod limits;
 pub mod mcp;
 pub mod notion;
 pub mod oauth;
+pub mod pace;
 pub mod pending;
 pub mod runs;
 pub mod s3;
@@ -440,6 +441,13 @@ pub struct Source {
     /// Items that couldn't be read last time (each says why).
     #[serde(default)]
     pub failed_items: u32,
+    /// Items the provider refused for a passing reason (a rate limit, an
+    /// overloaded server), waiting to be read again on their own.
+    #[serde(default)]
+    pub waiting_items: u32,
+    /// When the first of them is read again (unix seconds; 0: none).
+    #[serde(default)]
+    pub next_retry_at: i64,
     /// Items left out last time (no text, a file it doesn't read, too
     /// large), each saying why.
     #[serde(default)]

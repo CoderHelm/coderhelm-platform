@@ -12,7 +12,20 @@
 //! - `list_datasets` (`projectId`): a project's datasets;
 //! - `query_documents` (`projectId`, `dataset`, `query`, `params`,
 //!   `perspective`): document types, listings and documents, in GROQ;
-//! - `whoami`: the account a sign-in belongs to, for "Connected as".
+//! - `whoami`: the account a sign-in belongs to, for "Connected as";
+//! - `get_schema` (`projectId`, `dataset`): the deployed schema's field
+//!   names, only to read a document too large for one answer (below).
+//!
+//! Large documents: the server refuses an answer over 64 KiB ("The query
+//! result exceeds the 64 KiB size limit"). A document that big (a long
+//! policy page, a page builder with many nested components) is read in
+//! pieces ([`Pieces`]): which fields it has and how long each array and
+//! text is, then the fields in groups, big arrays in GROQ slices
+//! (`body[0...20]`, halved until a slice fits), a single element too big
+//! for a slice field by field, and text too long for one answer line by
+//! line. The pieces are put back together and read like any document, so
+//! Portable Text inside nested components still becomes passages. Only a
+//! document that hits the limit is read this way.
 //!
 //! The picker is project, then dataset, then document type. Ids carry the
 //! project (`dataset:<project>:<dataset>`, `type:<project>:<dataset>:<type>`)
@@ -48,6 +61,7 @@ pub const READ_TOOLS: &[&str] = &[
     "list_datasets",
     "query_documents",
     "whoami",
+    "get_schema",
 ];
 /// The hosted server's address. Tokens from its sign-in go here only.
 pub const MCP_URL: &str = "https://mcp.sanity.io";
@@ -335,7 +349,421 @@ fn in_project(project: &str, e: ConnectorError) -> ConnectorError {
         ConnectorError::RateLimited(s) => ConnectorError::RateLimited(m(s)),
         ConnectorError::Config(s) => ConnectorError::Config(m(s)),
         ConnectorError::Temporary(s) => ConnectorError::Temporary(m(s)),
+        ConnectorError::Busy(b) => ConnectorError::Busy(super::connector::Busy {
+            message: m(b.message),
+            ..b
+        }),
     }
+}
+
+/// The one document a fetch asks for.
+const DOC: &str = "*[_id == $id][0]";
+/// Elements a first slice of a large array asks for.
+const FIRST_SLICE: usize = 20;
+/// The largest slice asked for after slices fit.
+const MAX_SLICE: usize = 200;
+/// Calls one large document may take at most.
+const MAX_PIECE_CALLS: usize = 400;
+/// How deep a large document is split at most.
+const MAX_PIECE_DEPTH: usize = 8;
+/// Field names asked about at once.
+const MAX_VOCAB: usize = 800;
+/// Names Sanity documents and components often use, asked about with the
+/// schema's own (a schema may not be deployed).
+const COMMON_FIELDS: &[&str] = &[
+    "_type",
+    "_key",
+    "_ref",
+    "_id",
+    "_rev",
+    "_createdAt",
+    "_updatedAt",
+    "title",
+    "name",
+    "heading",
+    "subheading",
+    "label",
+    "slug",
+    "current",
+    "description",
+    "excerpt",
+    "summary",
+    "intro",
+    "body",
+    "content",
+    "text",
+    "richText",
+    "copy",
+    "blocks",
+    "sections",
+    "modules",
+    "components",
+    "pageBuilder",
+    "builder",
+    "items",
+    "columns",
+    "cards",
+    "rows",
+    "faqs",
+    "faq",
+    "question",
+    "answer",
+    "questions",
+    "answers",
+    "seo",
+    "metaTitle",
+    "metaDescription",
+    "hero",
+    "header",
+    "footer",
+    "cta",
+    "link",
+    "links",
+    "url",
+    "href",
+    "children",
+    "marks",
+    "markDefs",
+    "style",
+    "listItem",
+    "level",
+    "caption",
+    "alt",
+    "image",
+    "images",
+    "gallery",
+    "tabs",
+    "panels",
+    "accordion",
+    "steps",
+    "features",
+    "list",
+    "entries",
+    "eyebrow",
+    "subtitle",
+    "tagline",
+    "quote",
+    "author",
+    "date",
+    "publishedAt",
+    "category",
+    "categories",
+    "tags",
+    "policy",
+    "terms",
+    "notes",
+    "details",
+    "value",
+    "values",
+    "data",
+    "settings",
+    "media",
+    "video",
+    "file",
+    "button",
+    "buttons",
+    "content_blocks",
+];
+
+/// Is `s` a field name a GROQ path can carry as is?
+fn plain_field(s: &str) -> bool {
+    let mut c = s.chars();
+    s.len() <= 64
+        && c.next()
+            .is_some_and(|f| f.is_ascii_alphabetic() || f == '_')
+        && c.all(|x| x.is_ascii_alphanumeric() || x == '_')
+}
+
+/// Every name a schema text gives (`name: "body"`, `"name":"body"`,
+/// `<name>body</name>`), added to `out` once each.
+fn names_in_text(text: &str, out: &mut Vec<String>) {
+    let mut rest = text;
+    while let Some(i) = rest.find("name") {
+        let after = &rest[i + 4..];
+        let skipped = after
+            .char_indices()
+            .take_while(|(_, c)| " \"':=>\t".contains(*c))
+            .last()
+            .map(|(j, c)| j + c.len_utf8())
+            .unwrap_or(0);
+        let tail = &after[skipped..];
+        let end = tail
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(tail.len());
+        let word = &tail[..end];
+        if skipped > 0 && plain_field(word) && !out.iter().any(|w| w == word) {
+            out.push(word.to_string());
+        }
+        rest = after;
+    }
+}
+
+/// Every object key under `v`, added to `out` once each.
+fn keys_in(v: &Value, out: &mut Vec<String>, depth: usize) {
+    if depth > MAX_PIECE_DEPTH || out.len() >= MAX_VOCAB {
+        return;
+    }
+    match v {
+        Value::Object(m) => {
+            for (k, x) in m {
+                if plain_field(k) && !out.iter().any(|w| w == k) {
+                    out.push(k.clone());
+                }
+                keys_in(x, out, depth + 1);
+            }
+        }
+        Value::Array(a) => a.iter().for_each(|x| keys_in(x, out, depth + 1)),
+        _ => {}
+    }
+}
+
+/// What a value is, from `[count(v), length(v)]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Shape {
+    Array(usize),
+    Text(usize),
+    /// An object, a number or a boolean.
+    Other,
+}
+
+fn shape_of(v: &Value) -> Option<Shape> {
+    let a = v.as_array()?;
+    let n = |i: usize| a.get(i).and_then(Value::as_u64).map(|n| n as usize);
+    Some(match (n(0), n(1)) {
+        (Some(c), _) => Shape::Array(c),
+        (None, Some(l)) => Shape::Text(l),
+        _ => Shape::Other,
+    })
+}
+
+/// Reading one document too large for one answer, a piece at a time.
+struct Pieces<'a> {
+    c: &'a SanityMcp,
+    project: &'a str,
+    dataset: &'a str,
+    id: &'a str,
+    /// Field names to ask about: the schema's, common ones, and every key
+    /// seen in pieces read so far.
+    vocab: Vec<String>,
+    calls: usize,
+}
+
+impl<'a> Pieces<'a> {
+    fn new(
+        c: &'a SanityMcp,
+        project: &'a str,
+        dataset: &'a str,
+        id: &'a str,
+        schema: Vec<String>,
+    ) -> Self {
+        let mut vocab: Vec<String> = Vec::new();
+        for n in schema
+            .into_iter()
+            .chain(COMMON_FIELDS.iter().map(|s| s.to_string()))
+        {
+            if vocab.len() < MAX_VOCAB && plain_field(&n) && !vocab.contains(&n) {
+                vocab.push(n);
+            }
+        }
+        Pieces {
+            c,
+            project,
+            dataset,
+            id,
+            vocab,
+            calls: 0,
+        }
+    }
+
+    /// One query for a piece (`groq` is built here from checked names and
+    /// numbers only).
+    async fn ask(&mut self, groq: String) -> Result<Value, ConnectorError> {
+        self.calls += 1;
+        if self.calls > MAX_PIECE_CALLS {
+            return Err(too_big());
+        }
+        let v = self
+            .c
+            .query(
+                self.project,
+                self.dataset,
+                "chPart",
+                &groq,
+                json!({ "id": self.id }),
+            )
+            .await?;
+        keys_in(&v, &mut self.vocab, 0);
+        Ok(v)
+    }
+
+    async fn document(mut self) -> Result<Value, ConnectorError> {
+        let doc = self.object(DOC.to_string(), 0).await?;
+        if doc.is_null() {
+            return Ok(Value::Null);
+        }
+        tracing::info!(calls = self.calls, "large Sanity document read in pieces");
+        Ok(doc)
+    }
+
+    /// What each known field under `path` is (absent fields left out).
+    async fn fields(&mut self, path: &str) -> Result<Vec<(String, Shape)>, ConnectorError> {
+        let mut found: Vec<(String, Shape)> = Vec::new();
+        let mut asked: Vec<String> = Vec::new();
+        // Keys seen while asking widen the vocabulary; ask about those too.
+        loop {
+            let todo: Vec<String> = self
+                .vocab
+                .iter()
+                .filter(|k| !asked.contains(k))
+                .take(200)
+                .cloned()
+                .collect();
+            if todo.is_empty() {
+                break;
+            }
+            let probe = todo
+                .iter()
+                .map(|k| format!("\"{k}\": select(defined({k}) => [count({k}), length({k})])"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let v = self.ask(format!("{path}{{{probe}}}")).await?;
+            if v.is_null() {
+                return Ok(Vec::new());
+            }
+            for k in &todo {
+                if let Some(sh) =
+                    shape_of(&v[k]).or(v.get(k).filter(|x| !x.is_null()).map(|_| Shape::Other))
+                {
+                    found.push((k.clone(), sh));
+                }
+            }
+            asked.extend(todo);
+        }
+        Ok(found)
+    }
+
+    /// The object at `path`, its fields read in groups that fit.
+    async fn object(&mut self, path: String, depth: usize) -> Result<Value, ConnectorError> {
+        if depth > MAX_PIECE_DEPTH {
+            return Err(too_big());
+        }
+        let fields = self.fields(&path).await?;
+        if fields.is_empty() {
+            // Nothing known under it: the whole thing, if it fits.
+            return self.ask(path).await;
+        }
+        let mut out = serde_json::Map::new();
+        let mut groups: Vec<Vec<(String, Shape)>> = vec![fields];
+        while let Some(group) = groups.pop() {
+            let names: Vec<&str> = group.iter().map(|(k, _)| k.as_str()).collect();
+            match self.ask(format!("{path}{{{}}}", names.join(", "))).await {
+                Ok(v) => {
+                    for (k, _) in &group {
+                        if let Some(x) = v.get(k) {
+                            out.insert(k.clone(), x.clone());
+                        }
+                    }
+                }
+                Err(e) if mcp::too_large(&e) && group.len() > 1 => {
+                    let mut a = group;
+                    let b = a.split_off(a.len() / 2);
+                    groups.push(a);
+                    groups.push(b);
+                }
+                Err(e) if mcp::too_large(&e) => {
+                    let (k, sh) = group[0].clone();
+                    let v = self.value(format!("{path}.{k}"), sh, depth + 1).await?;
+                    out.insert(k, v);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(Value::Object(out))
+    }
+
+    /// The value at `path` of a known shape, too large for one answer.
+    fn value(
+        &mut self,
+        path: String,
+        shape: Shape,
+        depth: usize,
+    ) -> futures::future::BoxFuture<'_, Result<Value, ConnectorError>> {
+        Box::pin(async move { self.value_now(path, shape, depth).await })
+    }
+
+    async fn value_now(
+        &mut self,
+        path: String,
+        shape: Shape,
+        depth: usize,
+    ) -> Result<Value, ConnectorError> {
+        match shape {
+            Shape::Array(n) => self.array(path, n, depth).await.map(Value::Array),
+            Shape::Text(_) => {
+                let lines = format!("string::split({path}, \"\\n\")");
+                let n = self
+                    .ask(format!("count({lines})"))
+                    .await?
+                    .as_u64()
+                    .unwrap_or(0) as usize;
+                let parts = self.array(lines, n, depth).await?;
+                Ok(Value::String(
+                    parts
+                        .iter()
+                        .map(|l| l.as_str().unwrap_or(""))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ))
+            }
+            Shape::Other => self.object(path, depth).await,
+        }
+    }
+
+    /// The `n` elements of the array at `path`, in slices halved until they
+    /// fit; an element too large alone is read by its own shape.
+    async fn array(
+        &mut self,
+        path: String,
+        n: usize,
+        depth: usize,
+    ) -> Result<Vec<Value>, ConnectorError> {
+        if depth > MAX_PIECE_DEPTH {
+            return Err(too_big());
+        }
+        let mut out = Vec::with_capacity(n);
+        let (mut i, mut size) = (0usize, FIRST_SLICE);
+        while i < n {
+            let j = (i + size).min(n);
+            match self.ask(format!("{path}[{i}...{j}]")).await {
+                Ok(v) => {
+                    let got = v.as_array().cloned().unwrap_or_default();
+                    if got.is_empty() {
+                        break;
+                    }
+                    i += got.len();
+                    out.extend(got);
+                    size = (size * 2).min(MAX_SLICE);
+                }
+                Err(e) if mcp::too_large(&e) && size > 1 => size = (size / 2).max(1),
+                Err(e) if mcp::too_large(&e) => {
+                    let el = format!("{path}[{i}]");
+                    let sh = self.ask(format!("[count({el}), length({el})]")).await?;
+                    let sh = shape_of(&sh).unwrap_or(Shape::Other);
+                    out.push(self.value(el, sh, depth + 1).await?);
+                    i += 1;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// A document that can't be read even in pieces.
+fn too_big() -> ConnectorError {
+    ConnectorError::Config(
+        "The Sanity document is too large to read, even in pieces. Split it into smaller documents.".into(),
+    )
 }
 
 /// What a source shows when some of its projects couldn't be read and the
@@ -358,6 +786,11 @@ fn projects_failed(failed: &[(String, ConnectorError)]) -> ConnectorError {
     match failed.first().map(|(_, e)| e) {
         Some(ConnectorError::RateLimited(_)) => ConnectorError::RateLimited(msg),
         Some(ConnectorError::Temporary(_)) => ConnectorError::Temporary(msg),
+        // Busy, not refused: the sync waits and reads it again.
+        Some(ConnectorError::Busy(b)) => ConnectorError::Busy(super::connector::Busy {
+            message: msg,
+            ..b.clone()
+        }),
         _ => ConnectorError::Forbidden(msg),
     }
 }
@@ -563,6 +996,59 @@ impl SanityMcp {
                 "Sanity's answer didn't include the documents asked for.".into(),
             )
         })
+    }
+
+    /// One document, read whole, or in pieces when the server refuses it
+    /// for its size.
+    pub async fn read_doc(
+        &self,
+        project: &str,
+        dataset: &str,
+        id: &str,
+    ) -> Result<Value, ConnectorError> {
+        match self
+            .query(project, dataset, "chDoc", DOC, json!({ "id": id }))
+            .await
+        {
+            Err(e) if mcp::too_large(&e) => {
+                tracing::info!(
+                    project,
+                    dataset,
+                    "Sanity document too large for one answer; reading it in pieces"
+                );
+                let vocab = self.field_names(project, dataset).await;
+                Pieces::new(self, project, dataset, id, vocab)
+                    .document()
+                    .await
+            }
+            r => r,
+        }
+    }
+
+    /// Field names the deployed schema has (every type's), for asking a
+    /// large document which fields it holds; empty when the server has no
+    /// schema tool or no schema is deployed.
+    async fn field_names(&self, project: &str, dataset: &str) -> Vec<String> {
+        let Ok(t) = self.find_tool("get_schema").await else {
+            return Vec::new();
+        };
+        let args = scoped_args(&t, project, Some(dataset), json!({}));
+        let Ok(r) = self.tools.call(&t, &args).await else {
+            return Vec::new();
+        };
+        if r["isError"].as_bool() == Some(true) {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for c in r["content"].as_array().into_iter().flatten() {
+            if let Some(t) = c["text"].as_str() {
+                names_in_text(t, &mut out);
+            }
+        }
+        if let Some(sc) = r.get("structuredContent") {
+            names_in_text(&sc.to_string(), &mut out);
+        }
+        out
     }
 
     pub async fn projects(&self) -> Result<Vec<(String, String)>, ConnectorError> {
@@ -1150,15 +1636,7 @@ impl Connector for SanityMcp {
             .as_str()
             .or(from_id.map(|(_, _, i)| i))
             .unwrap_or("");
-        let v = self
-            .query(
-                project,
-                ds,
-                "chDoc",
-                "*[_id == $id][0]",
-                json!({ "id": id }),
-            )
-            .await?;
+        let v = self.read_doc(project, ds, id).await?;
         if v.is_null() {
             return Err(ConnectorError::NotFound("The document was deleted.".into()));
         }
@@ -2162,6 +2640,8 @@ mod tests {
         docs: std::sync::Mutex<std::collections::BTreeMap<String, Vec<Value>>>,
         clock: Arc<std::sync::atomic::AtomicI64>,
         doc_reads: std::sync::atomic::AtomicUsize,
+        /// Documents whose reads Sanity answers `429` (with a wait).
+        limited: std::sync::Mutex<std::collections::HashSet<String>>,
     }
 
     fn fixture(datasets: &[&str], n: usize) -> Arc<Fixture> {
@@ -2183,6 +2663,7 @@ mod tests {
             docs: std::sync::Mutex::new(docs),
             clock: Arc::new(std::sync::atomic::AtomicI64::new(1_000)),
             doc_reads: Default::default(),
+            limited: Default::default(),
         })
     }
 
@@ -2205,6 +2686,12 @@ mod tests {
             if q.contains("chDoc") {
                 fx.doc_reads.fetch_add(1, Ordering::SeqCst);
                 let id = s(p, "id");
+                if fx.limited.lock().unwrap().contains(&id) {
+                    return Err(ConnectorError::rate_limited(
+                        "Sanity is limiting how fast Coderhelm reads. The server asked Coderhelm to slow down (429).",
+                        Some(2),
+                    ));
+                }
                 let d = list
                     .iter()
                     .find(|d| s(d, "_id") == id)
@@ -2349,5 +2836,435 @@ mod tests {
         assert_eq!((o.fetched, o.indexed), (7, 7));
         assert_eq!(fx.doc_reads.load(Ordering::SeqCst) - before, 7);
         assert_eq!(get().items, 5_000);
+    }
+
+    /// The engine over a [`Fixture`] through the pacing a real sign-in has.
+    fn paced(fx: Arc<Fixture>, key: &str) -> SanityMcp {
+        let inner: mcp::Tools = groq(fx);
+        SanityMcp {
+            tools: Arc::new(super::super::pace::Paced::new(
+                inner,
+                super::super::pace::Policy::SANITY,
+                key,
+            )),
+            now: 1_000,
+            hints: Vec::new(),
+        }
+    }
+
+    /// A document Sanity keeps answering `429` for: it waits to be read
+    /// again (never "couldn't read"), the sync comes back to it on its own,
+    /// and once Sanity answers it is read, also by a later sync whose
+    /// listing doesn't name it because it didn't change.
+    #[tokio::test(start_paused = true)]
+    async fn a_document_sanity_keeps_rate_limiting_waits_and_is_read_later() {
+        use super::super::store::memory::MemSyncStore;
+        use super::super::{sync, Status};
+        use crate::knowledge::search::testing::WordEmbedder;
+        use std::sync::atomic::Ordering;
+        let fx = fixture(&["production"], 6);
+        let conn = paced(fx.clone(), "https://mcp.example.com/limited");
+        let store = MemSyncStore::default();
+        let mut src = source(&["dataset:abc123:production"]);
+        src.id = "s1".into();
+        src.kb_id = "kb1".into();
+        src.kind = Some(Kind::Sanity);
+        store.sources.lock().unwrap().insert("s1".into(), src);
+        let clock = fx.clock.clone();
+        let now = move || clock.load(Ordering::SeqCst);
+        let ctx = sync::Ctx {
+            store: &store,
+            connector: &conn,
+            embedder: &WordEmbedder,
+            team: "TEAM#t",
+            now: &now,
+            budget_secs: 0,
+            token_room: None,
+            limit: None,
+            used: None,
+            trigger: "schedule",
+        };
+        let limited = "doc-0-00003".to_string();
+        fx.limited.lock().unwrap().insert(limited.clone());
+        let item = |store: &MemSyncStore| {
+            store
+                .items
+                .lock()
+                .unwrap()
+                .values()
+                .find(|f| f.external_id.ends_with(&limited))
+                .cloned()
+                .unwrap()
+        };
+        // Run 1: five read, the sixth waits; the sync pauses at least the
+        // minute a rate limit costs.
+        let o = sync::run(&ctx, "kb1", "s1").await;
+        assert!(o.more, "{o:?}");
+        assert!(o.wait_secs >= sync::RATE_WAIT_SECS);
+        assert_eq!((o.failed, o.waiting), (0, 1));
+        let f = item(&store);
+        assert!(f.is_waiting(), "{f:?}");
+        assert_eq!(f.reason, "rate_limited");
+        let s = store.sources.lock().unwrap()["s1"].clone();
+        assert_eq!((s.failed_items, s.waiting_items), (0, 1));
+        assert_eq!(s.status, Status::Syncing);
+        // Sanity was asked again with backoff inside the call before that.
+        assert!(
+            fx.doc_reads.load(Ordering::SeqCst) >= 6 + super::super::pace::Policy::SANITY.retries
+        );
+        // Runs 2 and 3 still limited: after its tries this sync is done,
+        // and the item waits for the next one, which is brought forward.
+        let mut o = sync::run(&ctx, "kb1", "s1").await;
+        while o.more {
+            fx.clock.fetch_add(o.wait_secs, Ordering::SeqCst);
+            o = sync::run(&ctx, "kb1", "s1").await;
+        }
+        assert!(o.error.is_none(), "{:?}", o.error);
+        let s = store.sources.lock().unwrap()["s1"].clone();
+        assert_eq!(
+            (s.status, s.items, s.failed_items, s.waiting_items),
+            (Status::Ready, 5, 0, 1)
+        );
+        let f = item(&store);
+        assert!(f.is_waiting());
+        let due = chrono::DateTime::parse_from_rfc3339(&f.retry_at)
+            .unwrap()
+            .timestamp();
+        assert!(
+            s.next_sync_at <= due,
+            "the next sync comes when the item is due"
+        );
+        assert_eq!(s.next_retry_at, due);
+        // Sanity answers again; the next sync lists only what changed
+        // (nothing) and still reads the waiting document.
+        fx.limited.lock().unwrap().clear();
+        fx.clock.store(due + 1, Ordering::SeqCst);
+        let o = sync::run(&ctx, "kb1", "s1").await;
+        assert!(!o.more && o.error.is_none(), "{o:?}");
+        assert_eq!((o.fetched, o.indexed, o.waiting), (1, 1, 0));
+        let f = item(&store);
+        assert_eq!(f.status, FileStatus::Ready);
+        assert!(f.retry_at.is_empty() && f.reason.is_empty());
+        let s = store.sources.lock().unwrap()["s1"].clone();
+        assert_eq!((s.items, s.failed_items, s.waiting_items), (6, 0, 0));
+    }
+
+    /// Items an older version left as "couldn't read" for a 429, a server
+    /// that stopped answering or the 64 KiB limit are read again by the
+    /// next sync on their own, though nothing changed in Sanity.
+    #[tokio::test(start_paused = true)]
+    async fn items_left_unread_by_passing_errors_are_read_by_the_next_sync() {
+        use super::super::store::memory::MemSyncStore;
+        use super::super::sync;
+        use crate::knowledge::search::testing::WordEmbedder;
+        use std::sync::atomic::Ordering;
+        let fx = fixture(&["production"], 5);
+        let conn = paced(fx.clone(), "https://mcp.example.com/legacy");
+        let store = MemSyncStore::default();
+        let mut src = source(&["dataset:abc123:production"]);
+        src.id = "s1".into();
+        src.kb_id = "kb1".into();
+        src.kind = Some(Kind::Sanity);
+        store.sources.lock().unwrap().insert("s1".into(), src);
+        let clock = fx.clock.clone();
+        let now = move || clock.load(Ordering::SeqCst);
+        let ctx = sync::Ctx {
+            store: &store,
+            connector: &conn,
+            embedder: &WordEmbedder,
+            team: "TEAM#t",
+            now: &now,
+            budget_secs: 0,
+            token_room: None,
+            limit: None,
+            used: None,
+            trigger: "schedule",
+        };
+        let o = sync::run(&ctx, "kb1", "s1").await;
+        assert_eq!(o.indexed, 5);
+        // What the old version saved for three of them.
+        let old = [
+            "The server answered 429 to an MCP request.",
+            "The server stopped answering MCP requests.",
+            "Sanity said: Error executing GROQ query: The query result exceeds the 64 KiB size limit. Select fewer fields, add filters, or fetch smaller pages using GROQ slices.",
+        ];
+        {
+            let mut items = store.items.lock().unwrap();
+            // The three oldest: the listing of what changed never names them.
+            let mut ids: Vec<(String, String)> = items
+                .iter()
+                .map(|(k, f)| (f.external_id.clone(), k.clone()))
+                .collect();
+            ids.sort();
+            let ids: Vec<String> = ids.into_iter().map(|(_, k)| k).collect();
+            for (id, why) in ids.iter().zip(old) {
+                let f = items.get_mut(id).unwrap();
+                f.status = FileStatus::Failed;
+                f.error = why.into();
+                f.remote_version.clear();
+                f.reason.clear();
+            }
+        }
+        let before = fx.doc_reads.load(Ordering::SeqCst);
+        fx.clock.fetch_add(60, Ordering::SeqCst);
+        let o = sync::run(&ctx, "kb1", "s1").await;
+        assert!(o.error.is_none() && !o.more, "{o:?}");
+        assert_eq!(
+            fx.doc_reads.load(Ordering::SeqCst) - before,
+            3,
+            "only those three are read"
+        );
+        assert!(store
+            .items
+            .lock()
+            .unwrap()
+            .values()
+            .all(|f| f.status == FileStatus::Ready));
+        // A real "couldn't read" (no access) isn't asked again unasked.
+        {
+            let mut items = store.items.lock().unwrap();
+            // Not the newest document: the listing of what changed names
+            // that one again each time (from its `_updatedAt`).
+            let f = items
+                .values_mut()
+                .find(|f| f.external_id.ends_with("doc-0-00000"))
+                .unwrap();
+            f.status = FileStatus::Failed;
+            f.error = "The Sanity connection can't see this.".into();
+            f.reason = "forbidden".into();
+        }
+        let before = fx.doc_reads.load(Ordering::SeqCst);
+        fx.clock.fetch_add(60, Ordering::SeqCst);
+        sync::run(&ctx, "kb1", "s1").await;
+        assert_eq!(fx.doc_reads.load(Ordering::SeqCst), before);
+    }
+
+    // ── Large documents ─────────────────────────────────────────────────
+
+    /// What Sanity's server says when an answer is over its limit.
+    const TOO_LARGE: &str = "Error executing GROQ query: The query result exceeds the 64 KiB size limit. Select fewer fields, add filters, or fetch smaller pages using GROQ slices. Limit large nested arrays too.";
+
+    fn block(text: &str) -> Value {
+        json!({"_type": "block", "_key": "k", "style": "normal", "markDefs": [], "children": [{"_type": "span", "_key": "s", "text": text, "marks": []}]})
+    }
+
+    /// A long policy page: Portable Text far over 64 KiB, a page builder
+    /// whose components carry their own Portable Text (one component alone
+    /// over the limit), and fine print too long for one answer, in a field
+    /// only the deployed schema names.
+    fn huge_policy() -> Value {
+        let filler = "Members agree to the facility rules described in this section, including guest passes and locker use. ".repeat(3);
+        let body: Vec<Value> = (0..400)
+            .map(|i| {
+                if i == 399 {
+                    block("FINAL-CLAUSE: refunds are issued within thirty days.")
+                } else {
+                    block(&format!("Clause {i}. {filler}"))
+                }
+            })
+            .collect();
+        let mut sections: Vec<Value> = (0..30)
+            .map(|i| {
+                json!({"_type": "accordion", "_key": format!("c{i}"), "heading": format!("Topic {i}"),
+                    "panels": (0..12).map(|j| json!({"_type": "panel", "_key": format!("p{j}"), "question": format!("Question {i}.{j}?"),
+                        "content": [block(&format!("Answer {i}.{j}. {filler}"))]})).collect::<Vec<_>>()})
+            })
+            .collect();
+        sections.push(json!({"_type": "richSection", "_key": "giant", "heading": "Giant",
+            "content": (0..320).map(|i| block(&if i == 319 { "GIANT-COMPONENT-END: the last words of the giant component.".to_string() } else { format!("Giant line {i}. {filler}") })).collect::<Vec<_>>()}));
+        let fineprint: String = (0..1_500)
+            .map(|i| format!("Fine print line {i}: subject to change without notice."))
+            .chain(std::iter::once(
+                "FINEPRINT-END: governed by the laws of the state.".to_string(),
+            ))
+            .collect::<Vec<_>>()
+            .join("\n");
+        json!({"_id": "policy-1", "_type": "policy", "_rev": "r1", "_updatedAt": "2026-10-01T00:00:00Z",
+            "title": "Membership policy", "body": body, "sections": sections, "fineprint": fineprint})
+    }
+
+    /// The value at a GROQ path the piece reader writes
+    /// (`*[_id == $id][0]`, then `.field`, `[n]`, `[i...j]`), and the rest.
+    fn walk(doc: &Value, mut p: &str) -> (Value, String) {
+        p = p.strip_prefix("*[_id == $id][0]").expect("a document path");
+        let mut cur = doc.clone();
+        loop {
+            if let Some(r) = p.strip_prefix('.') {
+                let end = r
+                    .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .unwrap_or(r.len());
+                cur = cur.get(&r[..end]).cloned().unwrap_or(Value::Null);
+                p = &r[end..];
+            } else if let Some(r) = p.strip_prefix('[') {
+                let end = r.find(']').unwrap();
+                let inner = &r[..end];
+                cur = match inner.split_once("...") {
+                    Some((a, b)) => {
+                        let (a, b): (usize, usize) = (a.parse().unwrap(), b.parse().unwrap());
+                        let arr = cur.as_array().cloned().unwrap_or_default();
+                        json!(arr[a.min(arr.len())..b.min(arr.len())])
+                    }
+                    None => cur[inner.parse::<usize>().unwrap()].clone(),
+                };
+                p = &r[end + 1..];
+            } else {
+                return (cur, p.to_string());
+            }
+        }
+    }
+
+    fn count_len(v: &Value) -> Value {
+        json!([
+            v.as_array().map(Vec::len),
+            v.as_array()
+                .map(Vec::len)
+                .or(v.as_str().map(|s| s.chars().count()))
+        ])
+    }
+
+    /// Sanity's server for one document, answering the queries the
+    /// connector sends and refusing any answer over 64 KiB, as Sanity does.
+    fn limited_server(doc: Value, calls: Arc<std::sync::atomic::AtomicUsize>) -> Arc<FakeMcp> {
+        Arc::new(FakeMcp::new(
+            vec![
+                tool_with(
+                    "query_documents",
+                    &["projectId", "dataset", "query", "params", "perspective"],
+                ),
+                tool_with("get_schema", &["projectId", "dataset"]),
+            ],
+            move |name, args| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if name == "get_schema" {
+                    return Ok(
+                        json!({"content": [{"type": "text", "text": "Schema: [{\"name\":\"policy\",\"type\":\"document\",\"fields\":[{\"name\":\"title\",\"type\":\"string\"},{\"name\":\"fineprint\",\"type\":\"text\"}]}]"}]}),
+                    );
+                }
+                let q = args["query"].as_str().unwrap();
+                let (key, inner) = q
+                    .strip_prefix("{\"")
+                    .and_then(|r| r.split_once("\": "))
+                    .map(|(k, r)| (k.to_string(), r.strip_suffix('}').unwrap().to_string()))
+                    .unwrap();
+                let answer = if let Some(r) = inner.strip_prefix("count(string::split(") {
+                    let (v, _) = walk(&doc, r.strip_suffix(", \"\\n\"))").unwrap());
+                    json!(v.as_str().unwrap().split('\n').count())
+                } else if let Some(r) = inner.strip_prefix("string::split(") {
+                    let (path, slice) = r.split_once(", \"\\n\")").unwrap();
+                    let (v, _) = walk(&doc, path);
+                    let lines: Vec<Value> =
+                        v.as_str().unwrap().split('\n').map(|l| json!(l)).collect();
+                    let (a, b) = slice
+                        .trim_start_matches('[')
+                        .trim_end_matches(']')
+                        .split_once("...")
+                        .unwrap();
+                    let (a, b): (usize, usize) = (a.parse().unwrap(), b.parse().unwrap());
+                    json!(lines[a.min(lines.len())..b.min(lines.len())])
+                } else if let Some(r) = inner.strip_prefix("[count(") {
+                    let path = r.split_once("), length(").unwrap().0;
+                    count_len(&walk(&doc, path).0)
+                } else {
+                    let (v, rest) = walk(&doc, &inner);
+                    if rest.is_empty() {
+                        v
+                    } else {
+                        // A projection: a probe of known names, or picked fields.
+                        let body = rest.strip_prefix('{').unwrap().strip_suffix('}').unwrap();
+                        let mut out = serde_json::Map::new();
+                        if body.contains("select(") {
+                            for part in body.split("]), ") {
+                                let k = part.trim_start_matches('"').split('"').next().unwrap();
+                                if let Some(x) = v.get(k).filter(|x| !x.is_null()) {
+                                    out.insert(k.into(), count_len(x));
+                                }
+                            }
+                        } else {
+                            for k in body.split(", ") {
+                                if let Some(x) = v.get(k) {
+                                    out.insert(k.into(), x.clone());
+                                }
+                            }
+                        }
+                        Value::Object(out)
+                    }
+                };
+                let whole = json!({ key: answer });
+                let text = format!("Query executed successfully. Found 1 total document, returning 1: \n<documents>\n  <document>{whole}</document>\n</documents>\n");
+                if whole.to_string().len() > 64 * 1024 {
+                    return Ok(
+                        json!({"isError": true, "content": [{"type": "text", "text": TOO_LARGE}]}),
+                    );
+                }
+                Ok(json!({"content": [{"type": "text", "text": text}]}))
+            },
+        ))
+    }
+
+    /// A document over Sanity's 64 KiB answer limit is read in slices and
+    /// put back together: its passages hold the last clause of its body
+    /// (the last slice), the end of a component too large for any slice,
+    /// and the end of fine print too long for one answer, in a field only
+    /// the deployed schema names.
+    #[tokio::test]
+    async fn a_document_over_the_64_kib_limit_is_read_in_slices() {
+        let doc = huge_policy();
+        assert!(
+            doc.to_string().len() > 64 * 1024 * 4,
+            "the fixture is far over the limit"
+        );
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = SanityMcp {
+            tools: limited_server(doc.clone(), calls.clone()),
+            now: 0,
+            hints: Vec::new(),
+        };
+        let src = source(&["dataset:abc123:production"]);
+        let item = Listed {
+            external_id: stable_id("abc123", "production", "policy-1"),
+            title: "Membership policy".into(),
+            ..Default::default()
+        };
+        let d = c.fetch(&src, &item).await.expect("read in pieces");
+        let text: String = d
+            .sections
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for want in [
+            "Clause 0.",
+            "FINAL-CLAUSE: refunds are issued within thirty days.",
+            "Question 29.11?",
+            "Answer 29.11.",
+            "GIANT-COMPONENT-END: the last words of the giant component.",
+            "Fine print line 0:",
+            "FINEPRINT-END: governed by the laws of the state.",
+        ] {
+            assert!(text.contains(want), "{want:?} missing from the passages");
+        }
+        assert_eq!(d.title, "Membership policy");
+        assert_eq!(d.updated_at, "2026-10-01T00:00:00Z");
+        // Put back together exactly: the same text a whole read would give.
+        let map = type_map(&json!({}), "policy");
+        let whole: String = doc_sections(&doc, "Membership policy", &map)
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(text, whole);
+        let n = calls.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(n < MAX_PIECE_CALLS, "{n} calls");
+
+        // A small document is still one query, never pieces.
+        calls.store(0, std::sync::atomic::Ordering::SeqCst);
+        let small = json!({"_id": "policy-1", "_type": "policy", "title": "Short", "body": [block("Short body.")]});
+        let c = SanityMcp {
+            tools: limited_server(small, calls.clone()),
+            now: 0,
+            hints: Vec::new(),
+        };
+        c.fetch(&src, &item).await.unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }

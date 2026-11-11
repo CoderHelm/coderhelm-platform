@@ -505,7 +505,18 @@ impl Servers for RuntimeServers {
         Ok(Opened {
             name,
             personal,
-            tools: Arc::new(RuntimeTools::new(self.rt.clone(), server, owner, label)),
+            tools: {
+                // Paced like every source, with the short waits a person
+                // waiting for a search can afford.
+                let key = format!("search#{}#{owner:?}", server.url);
+                let inner: super::sources::mcp::Tools =
+                    Arc::new(RuntimeTools::new(self.rt.clone(), server, owner, label));
+                Arc::new(super::sources::pace::Paced::new(
+                    inner,
+                    super::sources::pace::Policy::SEARCH,
+                    &key,
+                ))
+            },
         })
     }
 }
@@ -531,9 +542,17 @@ fn conn_refusal(name: &str, e: ConnectorError) -> Refusal {
             format!("{name} no longer answers at its address."),
             "Check the server's address on Settings, Connected apps.",
         ),
-        ConnectorError::RateLimited(_) => refusal(
+        ConnectorError::RateLimited(_)
+        | ConnectorError::Busy(super::sources::connector::Busy {
+            rate_limited: true, ..
+        }) => refusal(
             "busy",
             format!("{name} is limiting searches right now."),
+            "Try again in a minute.",
+        ),
+        ConnectorError::Busy(_) => refusal(
+            "reach",
+            format!("{name} didn't answer in time."),
             "Try again in a minute.",
         ),
         ConnectorError::Temporary(m) => refusal(

@@ -34,8 +34,9 @@ fn search_pages(limit: usize) -> usize {
 }
 /// How deep nested blocks are read.
 const MAX_BLOCK_DEPTH: usize = 4;
-/// Block reads per page at most (100 blocks each).
-const MAX_BLOCK_CALLS: usize = 40;
+/// Block reads per page at most (100 blocks each): a long page is read in
+/// pages of blocks until it ends, up to 40,000 blocks.
+const MAX_BLOCK_CALLS: usize = 400;
 
 pub struct Notion<'a> {
     pub http: &'a dyn Http,
@@ -724,7 +725,7 @@ pub async fn workspace(http: &dyn Http, auth: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::knowledge::sources::Selected;
-    use crate::mcp_remote::http::fake::{json as fjson, Fake};
+    use crate::mcp_remote::http::fake::{json as fjson, resp, Fake};
 
     fn page(id: &str, title: &str, parent: Value, edited: &str) -> Value {
         json!({
@@ -736,6 +737,12 @@ mod tests {
 
     fn rig() -> Fake {
         let http = Fake::default();
+        rig_into(&http);
+        http
+    }
+
+    /// The rig's pages and blocks, added after any route a test put first.
+    fn rig_into(http: &Fake) {
         let mut eng = page(
             "aaaa-1",
             "Engineering",
@@ -785,7 +792,6 @@ mod tests {
                 }))
             })
         });
-        http
     }
 
     fn source(sel: &[(&str, bool)]) -> Source {
@@ -1045,5 +1051,89 @@ mod tests {
             l.truncated && !l.complete,
             "a source over its limit says so"
         );
+    }
+
+    /// End to end, not Sanity: Notion answers `429` with a `Retry-After`
+    /// for one page's blocks. After the shared retries the page waits to be
+    /// read again (never "couldn't read"), the sync pauses at least the
+    /// wait, and the next run reads it once Notion answers.
+    #[tokio::test(start_paused = true)]
+    async fn a_page_notion_rate_limits_waits_and_the_next_run_reads_it() {
+        use super::super::store::memory::MemSyncStore;
+        use super::super::sync;
+        use crate::knowledge::search::testing::WordEmbedder;
+        use crate::knowledge::FileStatus;
+        use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+        use std::sync::Arc;
+        let limited = Arc::new(AtomicBool::new(true));
+        let http = Fake::default();
+        let l = limited.clone();
+        http.with(move |r| {
+            (l.load(Ordering::SeqCst) && r.url.contains("/blocks/cccc3/children"))
+                .then(|| resp(429, &[("retry-after", "2")], "{\"code\":\"rate_limited\"}"))
+        });
+        rig_into(&http);
+        let n = Notion {
+            http: &http,
+            auth: "Bearer t".into(),
+        };
+        let store = MemSyncStore::default();
+        let mut src = source(&[("aaaa1", true)]);
+        src.kb_id = "kb".into();
+        src.kind = Some(Kind::Notion);
+        store.sources.lock().unwrap().insert("s".into(), src);
+        let clock = Arc::new(AtomicI64::new(1_000));
+        let c = clock.clone();
+        let now = move || c.load(Ordering::SeqCst);
+        let ctx = sync::Ctx {
+            store: &store,
+            connector: &n,
+            embedder: &WordEmbedder,
+            team: "TEAM#t",
+            now: &now,
+            budget_secs: 0,
+            token_room: None,
+            limit: None,
+            used: None,
+            trigger: "schedule",
+        };
+        let deploy = |store: &MemSyncStore| {
+            store
+                .items
+                .lock()
+                .unwrap()
+                .values()
+                .find(|f| f.external_id == "cccc3")
+                .cloned()
+                .unwrap()
+        };
+        let o = sync::run(&ctx, "kb", "s").await;
+        assert!(o.more && o.wait_secs >= sync::RATE_WAIT_SECS, "{o:?}");
+        assert_eq!((o.failed, o.waiting), (0, 1));
+        let f = deploy(&store);
+        assert!(f.is_waiting(), "{f:?}");
+        assert_eq!(f.reason, "rate_limited");
+        let s = store.sources.lock().unwrap()["s"].clone();
+        assert_eq!((s.failed_items, s.waiting_items), (0, 1));
+        let tries = http
+            .sent()
+            .iter()
+            .filter(|r| r.url.contains("/blocks/cccc3/children"))
+            .count();
+        assert_eq!(
+            tries,
+            super::super::pace::Policy::NOTION.retries + 1,
+            "asked again before waiting"
+        );
+
+        limited.store(false, Ordering::SeqCst);
+        clock.fetch_add(o.wait_secs, Ordering::SeqCst);
+        let o = sync::run(&ctx, "kb", "s").await;
+        assert!(!o.more && o.error.is_none(), "{o:?}");
+        let f = deploy(&store);
+        assert_eq!(f.status, FileStatus::Ready);
+        assert!(f.retry_at.is_empty() && !f.is_waiting());
+        let s = store.sources.lock().unwrap()["s"].clone();
+        assert_eq!((s.failed_items, s.waiting_items), (0, 0));
     }
 }

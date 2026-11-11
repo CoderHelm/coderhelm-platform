@@ -641,9 +641,17 @@ pub async fn signin_target(rt: &Runtime, kind: Kind) -> Result<ServerRecord, Str
 }
 
 /// The Sanity connector reading through `server` with `owner`'s sign-in.
+/// Its calls are paced ([`super::pace`]): two at once per server and
+/// sign-in, slower after a `429`, and asked again when Sanity is busy.
 pub fn sanity_signin(rt: Runtime, server: ServerRecord, owner: Owner) -> SanityMcp {
+    let key = format!("{}#{owner:?}", server.url);
+    let inner: super::mcp::Tools = Arc::new(RuntimeTools::new(rt, server, owner, "Sanity"));
     SanityMcp {
-        tools: Arc::new(RuntimeTools::new(rt, server, owner, "Sanity")),
+        tools: Arc::new(super::pace::Paced::new(
+            inner,
+            super::pace::Policy::SANITY,
+            &key,
+        )),
         now: chrono::Utc::now().timestamp(),
         hints: Vec::new(),
     }

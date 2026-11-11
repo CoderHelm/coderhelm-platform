@@ -455,13 +455,22 @@ pub fn s3_error(code: &str, message: &str, bucket: &str, account: &str) -> Conne
                 "Bucket {bucket} is in another region. Edit the source and pick the bucket's region."
             ))
         }
-        "SlowDown" | "ThrottlingException" | "RequestLimitExceeded" => {
-            ConnectorError::RateLimited("S3 asked us to slow down.".into())
+        "SlowDown" | "ThrottlingException" | "RequestLimitExceeded" | "TooManyRequestsException" => {
+            ConnectorError::rate_limited("S3 asked us to slow down.", None)
         }
-        "" => ConnectorError::Temporary(format!(
-            "Coderhelm couldn't reach S3 ({}). An install in a private network needs a VPC endpoint for S3.",
-            crate::truncate_str(message, 160)
-        )),
+        "InternalError" | "ServiceUnavailable" | "RequestTimeout" | "RequestTimeoutException" => {
+            ConnectorError::unavailable(format!("S3 is busy right now ({code})."), None)
+        }
+        // No answer at all (a timeout, a dropped connection): passing, so
+        // the file waits to be read again; the words keep the hint for a
+        // private network that has no way to S3.
+        "" => ConnectorError::unavailable(
+            format!(
+                "Coderhelm couldn't reach S3 ({}). An install in a private network needs a VPC endpoint for S3.",
+                crate::truncate_str(message, 160)
+            ),
+            None,
+        ),
         other => ConnectorError::Temporary(format!(
             "S3 couldn't read bucket {bucket} ({other})."
         )),
@@ -946,10 +955,15 @@ mod tests {
             s3_error("PermanentRedirect", "", "b1x", "1"),
             ConnectorError::Config(_)
         ));
-        assert!(matches!(
-            s3_error("SlowDown", "", "b1x", "1"),
-            ConnectorError::RateLimited(_)
-        ));
+        assert_eq!(
+            s3_error("SlowDown", "", "b1x", "1").busy_reason(),
+            Some("rate_limited")
+        );
+        assert_eq!(
+            s3_error("ServiceUnavailable", "", "b1x", "1").busy_reason(),
+            Some("unavailable")
+        );
+        assert!(s3_error("", "dispatch failure", "b1x", "1").is_busy());
         assert!(s3_error("", "dispatch failure", "b1x", "1")
             .to_string()
             .contains("VPC endpoint"));

@@ -83,10 +83,11 @@ pub fn notion_error(e: &ConnectorError) -> TokenError {
         ConnectorError::Forbidden(_) => {
             "Notion says the token can't read content: tick Read content under Capabilities on the Configuration tab, save, and try again.".into()
         }
-        ConnectorError::RateLimited(_) => {
-            "Notion asked us to slow down: try again in a minute.".into()
-        }
-        ConnectorError::NotFound(_) | ConnectorError::Temporary(_) => {
+        ConnectorError::RateLimited(_)
+        | ConnectorError::Busy(super::connector::Busy {
+            rate_limited: true, ..
+        }) => "Notion asked us to slow down: try again in a minute.".into(),
+        ConnectorError::NotFound(_) | ConnectorError::Temporary(_) | ConnectorError::Busy(_) => {
             "Notion didn't answer just now: try again in a minute.".into()
         }
     })

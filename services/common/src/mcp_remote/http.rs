@@ -289,8 +289,10 @@ impl Http for GuardedHttps {
                     Err(e) => return Err(HttpError::Unreachable(reach_text(&ep.host, &e))),
                 };
                 if buf.len() + chunk.len() > cap {
-                    return Err(HttpError::Unreachable(format!(
-                        "{} sent more than {} KB, so we stopped reading.",
+                    // Too large is final, never "try again": asking again
+                    // gets the same answer.
+                    return Err(HttpError::Refused(format!(
+                        "{} sent an answer larger than {} KB, so we stopped reading.",
                         ep.host,
                         cap / 1024
                     )));

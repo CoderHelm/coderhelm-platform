@@ -474,15 +474,14 @@ impl Connector for Confluence<'_> {
         if !item.external_id.chars().all(|c| c.is_ascii_digit()) {
             return Err(ConnectorError::NotFound("Not a Confluence page id.".into()));
         }
-        let v = send_json(
-            self.http,
-            self.get(&format!(
-                "/wiki/api/v2/pages/{}?body-format=storage",
-                item.external_id
-            )),
-            "Confluence",
-        )
-        .await?;
+        // A page body can be far larger than a listing: read it with the
+        // limit a document has.
+        let mut req = self.get(&format!(
+            "/wiki/api/v2/pages/{}?body-format=storage",
+            item.external_id
+        ));
+        req.limit = Limit::Document;
+        let v = send_json(self.http, req, "Confluence").await?;
         let title = v["title"].as_str().unwrap_or(&item.title).to_string();
         let body = storage_to_text(v["body"]["storage"]["value"].as_str().unwrap_or(""));
         Ok(Document {

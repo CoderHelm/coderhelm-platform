@@ -33,6 +33,33 @@ pub struct ItemProblem {
     /// What fixes it, in one sentence.
     #[serde(default)]
     pub fix: String,
+    /// Why, as one word the page groups by ([`crate::knowledge::FileMeta::reason_code`]).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reason: String,
+}
+
+/// How many items of a run had one kind of problem for one reason.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReasonCount {
+    /// `failed`, `skipped` or `waiting`.
+    pub kind: String,
+    pub reason: String,
+    pub count: u32,
+}
+
+/// Counts one more item under `kind` and `reason`.
+pub fn count_reason(counts: &mut Vec<ReasonCount>, kind: &str, reason: &str) {
+    match counts
+        .iter_mut()
+        .find(|c| c.kind == kind && c.reason == reason)
+    {
+        Some(c) => c.count += 1,
+        None => counts.push(ReasonCount {
+            kind: kind.to_string(),
+            reason: reason.to_string(),
+            count: 1,
+        }),
+    }
 }
 
 /// One sync of a source.
@@ -45,7 +72,8 @@ pub struct SyncRun {
     pub started_at: String,
     pub ended_at: String,
     pub took_secs: i64,
-    /// `done`, `problems` (done, some items not read) or `stopped`.
+    /// `done`, `problems` (done, some items not read), `waiting` (done,
+    /// some items read again later on their own) or `stopped`.
     pub result: String,
     pub listed: u32,
     pub added: u32,
@@ -55,6 +83,12 @@ pub struct SyncRun {
     pub removed: u32,
     pub failed: u32,
     pub skipped: u32,
+    /// Items refused for a passing reason, read again on their own.
+    #[serde(default)]
+    pub waiting: u32,
+    /// Every problem item counted by kind and reason, most first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasons: Vec<ReasonCount>,
     pub embedded: u32,
     pub reused: u32,
     /// How it connected (`oauth`, `saved_key`...), when it opened a connection.
@@ -82,7 +116,9 @@ pub fn run_sk(kb_id: &str, source_id: &str, started_secs: i64) -> String {
 /// The fix for an item that couldn't be read, from what went wrong.
 pub fn item_fix(error: &str, kind: &str) -> String {
     let e = error.to_lowercase();
-    if kind == "skipped" && (e.contains("no text") || e.contains("empty")) {
+    if kind == "waiting" {
+        "Nothing to do: it's read again on its own.".into()
+    } else if kind == "skipped" && (e.contains("no text") || e.contains("empty")) {
         "Nothing to search in it. Add text to the page, or leave it out.".into()
     } else if e.contains("scanned") || e.contains("text recognition") {
         "Upload a version with selectable text (export it again, or run text recognition on it)."
@@ -120,9 +156,13 @@ pub fn from_outcome(
         "stopped"
     } else if out.failed > 0 {
         "problems"
+    } else if out.waiting > 0 {
+        "waiting"
     } else {
         "done"
     };
+    let mut reasons = out.reasons.clone();
+    reasons.sort_by(|a, b| b.count.cmp(&a.count).then(a.reason.cmp(&b.reason)));
     SyncRun {
         kb_id: src.kb_id.clone(),
         source_id: src.id.clone(),
@@ -138,6 +178,8 @@ pub fn from_outcome(
         removed: n(out.removed),
         failed: n(out.failed),
         skipped: n(out.skipped),
+        waiting: n(out.waiting),
+        reasons,
         embedded: n(out.embedded_chunks),
         reused: n(out.reused_chunks),
         via: via.to_string(),

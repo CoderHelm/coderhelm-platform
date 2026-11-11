@@ -49,6 +49,11 @@ pub struct Pending {
     /// When it was planned (unix seconds).
     #[serde(default)]
     pub at: i64,
+    /// Items refused for a passing reason during this sync, and how many
+    /// times: each goes back on the list until [`super::sync::MAX_TRIES`],
+    /// then waits for the next sync.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub tries: std::collections::BTreeMap<String, u32>,
 }
 
 /// The key a plan belongs to: what is picked, the settings, and the limit.
@@ -76,6 +81,8 @@ pub fn keep_error(e: &ConnectorError) -> (String, String) {
         ConnectorError::RateLimited(_) => "rate_limited",
         ConnectorError::Config(_) => "config",
         ConnectorError::Temporary(_) => "temporary",
+        ConnectorError::Busy(b) if b.rate_limited => "rate_limited",
+        ConnectorError::Busy(_) => "unavailable",
     };
     (kind.to_string(), e.to_string())
 }
@@ -89,6 +96,7 @@ pub fn read_error((kind, m): &(String, String)) -> ConnectorError {
         "not_found" => ConnectorError::NotFound(m),
         "rate_limited" => ConnectorError::RateLimited(m),
         "config" => ConnectorError::Config(m),
+        "unavailable" => ConnectorError::unavailable(m, None),
         _ => ConnectorError::Temporary(m),
     }
 }
