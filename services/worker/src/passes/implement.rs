@@ -2034,10 +2034,7 @@ impl<'a> WriteToolExecutor<'a> {
                     ));
                     return Ok(json!(super::write_guard::ScopeGuard::reject_msg(path)));
                 }
-                let edits = input
-                    .get("edits")
-                    .and_then(|v| v.as_array())
-                    .ok_or("Missing edits array")?;
+                let edits = &tool_edits(input)?;
                 let message = input
                     .get("message")
                     .and_then(|v| v.as_str())
@@ -3062,6 +3059,63 @@ fn generated_file_reject(path: &str) -> String {
          `run_codegen` to regenerate it. If you already changed the source, just \
          call `run_codegen` now."
     )
+}
+
+/// The `edits` of an `edit_file` call. The model sometimes sends the array
+/// as a JSON string; that string is read as the array it holds. A string
+/// that isn't one, or no `edits` at all, gets an answer that says what was
+/// wrong with the call ("Missing edits array" read as if nothing was sent,
+/// and the model wrote the same call again).
+pub(crate) fn tool_edits(input: &serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    let shape = "Send `edits` as an array of {\"old_text\": ..., \"new_text\": ...} objects, \
+                 not as a string. For a large change, use write_file instead.";
+    match input.get("edits") {
+        Some(serde_json::Value::Array(a)) => Ok(a.clone()),
+        Some(serde_json::Value::String(s)) => match serde_json::from_str::<serde_json::Value>(s) {
+            Ok(serde_json::Value::Array(a)) => Ok(a),
+            _ => Err(format!(
+                "edit_file not applied: `edits` was a string that isn't a JSON array. {shape}"
+            )),
+        },
+        Some(_) => Err(format!(
+            "edit_file not applied: `edits` isn't an array. {shape}"
+        )),
+        None => Err(format!(
+            "edit_file not applied: the call has no `edits`. {shape}"
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tool_edits_tests {
+    use super::{apply_text_edits, tool_edits};
+    use serde_json::json;
+
+    /// A model sent `edits` as a JSON string. The call failed "Missing edits
+    /// array" (16 times in nine days on one install) and the turn was lost.
+    #[test]
+    fn edits_sent_as_a_json_string_are_applied() {
+        let input = json!({
+            "path": "src/a.ts",
+            "message": "m",
+            "edits": "[{\"old_text\": \"one\", \"new_text\": \"two\"}]",
+        });
+        let edits = tool_edits(&input).unwrap();
+        assert_eq!(apply_text_edits("one\n", &edits).unwrap(), "two\n");
+        let as_array = json!({"edits": [{"old_text": "one", "new_text": "two"}]});
+        assert_eq!(tool_edits(&as_array).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_broken_edits_string_says_what_to_send() {
+        let garbled = json!({"edits": "[{\"old_text\">/** a */\", \"new_text\": \"b\"}]"});
+        let e = tool_edits(&garbled).unwrap_err();
+        assert!(e.contains("string that isn't a JSON array"), "{e}");
+        assert!(e.contains("array of"), "{e}");
+        let none = tool_edits(&json!({"path": "a"})).unwrap_err();
+        assert!(none.contains("no `edits`"), "{none}");
+        assert!(tool_edits(&json!({"edits": 3})).is_err());
+    }
 }
 
 /// Apply a sequence of `old_text` → `new_text` search/replace edits to
