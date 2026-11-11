@@ -16,7 +16,7 @@
 //! approval nobody answered) still ends the run as it did.
 
 use crate::clients::github::GitHubClient;
-use crate::models::{TicketMessage, TicketSource};
+use crate::models::TicketMessage;
 use crate::WorkerState;
 use common::run_status::EndedValues;
 use common::run_wait::{NeedsInput, WaitingOn};
@@ -28,19 +28,95 @@ pub fn opens_pr(last_pass: &str) -> bool {
     matches!(last_pass, "implement_started" | "implement" | "security")
 }
 
-/// The ticket line: `Closes #n` for a GitHub issue, else the ticket id.
-fn ticket_line(msg: &TicketMessage) -> String {
-    if matches!(msg.source, TicketSource::Github) && msg.issue_number > 0 {
-        format!("Closes #{}", msg.issue_number)
-    } else {
-        format!("Source ticket: {}", msg.ticket_id)
+/// What the run did of its plan when it stopped: the tasks done and the
+/// tasks left, each as the plan wrote it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Progress {
+    pub done: Vec<String>,
+    pub remaining: Vec<String>,
+}
+
+impl Progress {
+    /// From the plan check's coverage of the branch.
+    pub fn of(cov: &super::plan_coverage::Coverage) -> Progress {
+        let line = |t: &super::plan_coverage::PlanTask| format!("`{}`: {}", t.path, t.task);
+        Progress {
+            done: cov.done.iter().map(line).collect(),
+            remaining: cov.required_missing().into_iter().map(line).collect(),
+        }
     }
 }
 
-/// The draft pull request's body: the ticket line, why the run stopped, what
-/// is left as the open item, and what the checks left open (`open`, already
-/// rendered with its own heading, or empty).
-pub fn body(ticket: &str, reason: &str, files: &[String], open: &str) -> String {
+/// The "Not finished" section of a run stopped before its work was done:
+/// why it stopped (the recorded reason, in plain words), what is done, what
+/// is left, and what a person can do. It keeps the pull request a draft
+/// (`proof::holds_unfinished`).
+pub fn not_finished(stop: &super::outcome::Stop, progress: &Progress, run_link: &str) -> String {
+    let total = progress.done.len() + progress.remaining.len();
+    let mut lines = vec![format!("- **Why it stopped:** {}.", stop.words())];
+    if total > 0 {
+        let done = if progress.done.is_empty() {
+            "none".to_string()
+        } else {
+            progress.done.join("; ")
+        };
+        lines.push(format!(
+            "- **Done ({} of {total}):** {}",
+            progress.done.len(),
+            common::truncate_str(&done, 1500)
+        ));
+        if !progress.remaining.is_empty() {
+            lines.push(format!("- **Not done ({}):**", progress.remaining.len()));
+            for (i, r) in progress.remaining.iter().take(15).enumerate() {
+                lines.push(format!(
+                    "  - [ ] task {} of {total}: {}",
+                    progress.done.len() + i + 1,
+                    common::truncate_str(r, 300)
+                ));
+            }
+        }
+    }
+    lines.push(
+        "- **What you can do:** finish what is left on this branch (CoderHelm picks up a push \
+         or a comment here), comment with what to change, or delete this section if the work \
+         left isn't needed. Then mark the pull request ready."
+            .to_string(),
+    );
+    if !run_link.is_empty() {
+        lines.push(format!("- **Run:** {run_link}"));
+    }
+    format!(
+        "{}\n## Not finished\nThis pull request stays a draft: the run stopped before its work \
+         was done.\n{}\n{}",
+        super::proof::UNFINISHED_START,
+        lines.join("\n"),
+        super::proof::UNFINISHED_END
+    )
+}
+
+/// `body` with the "Not finished" section in place: an older one replaced,
+/// else right after the ticket line (or at the top).
+pub fn with_unfinished(body: &str, section: &str) -> String {
+    let (start, end) = (super::proof::UNFINISHED_START, super::proof::UNFINISHED_END);
+    if let (Some(a), Some(b)) = (body.find(start), body.find(end)) {
+        if b > a {
+            return format!("{}{}{}", &body[..a], section.trim(), &body[b + end.len()..]);
+        }
+    }
+    let first = body.lines().next().unwrap_or("").trim();
+    if first.starts_with("Source ticket:") || first.starts_with("Closes #") {
+        let rest = body[body.find('\n').unwrap_or(body.len())..].trim_start();
+        format!("{first}\n\n{}\n\n{rest}", section.trim())
+    } else {
+        format!("{}\n\n{}", section.trim(), body.trim_start())
+    }
+}
+
+/// The draft pull request's body: the ticket line, what is not finished
+/// (when the run stopped mid-work), why the run stopped, the changes, what
+/// was verified, and what the checks left open (`open`, already rendered
+/// with its own heading, or empty).
+pub fn body(ticket: &str, reason: &str, files: &[String], open: &str, unfinished: &str) -> String {
     let reason = reason.split_whitespace().collect::<Vec<_>>().join(" ");
     let shown: Vec<String> = files.iter().take(20).map(|f| format!("- `{f}`")).collect();
     let more = files.len().saturating_sub(shown.len());
@@ -49,9 +125,16 @@ pub fn body(ticket: &str, reason: &str, files: &[String], open: &str) -> String 
     } else {
         open.trim().to_string()
     };
+    let top = if unfinished.trim().is_empty() {
+        String::new()
+    } else {
+        format!("{}\n\n", unfinished.trim())
+    };
     format!(
-        "{ticket}\n\n## Summary\n\nCoderHelm did this ticket's work on this branch and stopped \
-         before marking it ready: {reason}\n\n## Changes\n\n{}{}\n\n{open_items}\n\n\
+        "{ticket}\n\n{top}## Summary\n\nCoderHelm worked on this ticket on this branch and \
+         stopped before marking it ready: {reason}\n\n## Changes\n\n{}{}\n\n## Verification\n\n\
+         Not yet verified as a whole: the run stopped before its checks after the work finished. \
+         The repository's CI runs on this pull request.\n\n{open_items}\n\n\
          This is a draft. Push to this branch or comment on this pull request, and CoderHelm picks \
          it up from here.",
         shown.join("\n"),
@@ -61,6 +144,41 @@ pub fn body(ticket: &str, reason: &str, files: &[String], open: &str) -> String 
             String::new()
         }
     )
+}
+
+/// The plan's progress on the branch, when the run has a plan with tasks.
+async fn progress(
+    state: &WorkerState,
+    msg: &TicketMessage,
+    github: &GitHubClient,
+    branch: &str,
+) -> Progress {
+    let Some(plan) = super::run_plan_files(state, msg).await else {
+        return Progress::default();
+    };
+    let tasks = super::plan_coverage::tasks_for(
+        github,
+        &msg.repo_owner,
+        &msg.repo_name,
+        branch,
+        &plan.tasks,
+    )
+    .await;
+    if tasks.is_empty() {
+        return Progress::default();
+    }
+    match super::plan_coverage::plan_changes(
+        github,
+        &msg.repo_owner,
+        &msg.repo_name,
+        &msg.base_branch,
+        branch,
+    )
+    .await
+    {
+        Some(c) => Progress::of(&c.coverage(&tasks)),
+        None => Progress::default(),
+    }
 }
 
 /// Opens (or finds) the draft pull request for a stopped run's branch and
@@ -140,12 +258,56 @@ pub async fn open_with(
     .filter(|s| !s.is_empty())
     .collect::<Vec<_>>()
     .join("\n\n");
+    // A stop before the work was done says so at the top, with what is done
+    // and what is left; the section keeps the pull request a draft.
+    let stop = super::outcome::Stop::from_recorded(reason);
+    let progress = progress(state, msg, &github, branch).await;
+    let mid_work = !progress.remaining.is_empty()
+        || matches!(
+            stop,
+            super::outcome::Stop::NoProgress { .. } | super::outcome::Stop::OutOfTime(_)
+        );
+    let unfinished = if mid_work {
+        not_finished(
+            &stop,
+            &progress,
+            &format!(
+                "{}/runs/detail?id={run_id}",
+                common::public_urls::app_url(&state.config.stage)
+            ),
+        )
+    } else {
+        String::new()
+    };
+    // The standard body's rules (`outcome::body_problems`): a slip is said
+    // loudly, never sent silently.
+    let draft_body = body(
+        &super::outcome::ticket_line_for(msg),
+        reason,
+        &work,
+        &open_text,
+        &unfinished,
+    );
+    let problems = super::outcome::body_problems(&draft_body, &msg.ticket_id);
+    if !problems.is_empty() {
+        tracing::error!(run_id, problems = ?problems, "The stopped run's pull request body breaks the body rules");
+    }
     let existing = github
         .find_open_pr_for_branch(&msg.repo_owner, &msg.repo_name, branch)
         .await?;
     let (number, url) = match existing {
         Some(p) => {
             let number = p["number"].as_u64().unwrap_or(0);
+            // The pull request already open says what is not finished too.
+            if !unfinished.is_empty() {
+                let now = with_unfinished(p["body"].as_str().unwrap_or(""), &unfinished);
+                if let Err(e) = github
+                    .update_pr_body(&msg.repo_owner, &msg.repo_name, number, &now)
+                    .await
+                {
+                    tracing::warn!(run_id, error = %e, "Could not say what is not finished on the open pull request");
+                }
+            }
             if !items.is_empty() {
                 super::pr::put_open_items(
                     &github,
@@ -168,7 +330,7 @@ pub async fn open_with(
                     &msg.repo_owner,
                     &msg.repo_name,
                     common::truncate_str(&title, 72),
-                    &body(&ticket_line(msg), reason, &work, &open_text),
+                    &draft_body,
                     branch,
                     &msg.base_branch,
                     true,
@@ -260,6 +422,7 @@ mod tests {
             "Stopped before opening a pull request: 2 of 9 planned tasks are not done",
             &["web/a.tsx".into()],
             "",
+            "",
         );
         assert!(b.starts_with("Source ticket: T-1"));
         assert!(b.contains("## Open items\n\n- [ ] Stopped before opening a pull request: 2 of 9"));
@@ -271,8 +434,73 @@ mod tests {
             "It kept continuing",
             &[],
             "## Open items\n- the vendor sends cents",
+            "",
         );
         assert!(b.contains("## Open items\n- the vendor sends cents"));
         assert_eq!(b.matches("## Open items").count(), 1);
+    }
+
+    /// The stopped Jira run: seven of eight tasks done, two steps changed
+    /// nothing. Its draft is the standard one: the ticket line, a specific
+    /// "Not finished" section, Summary, Changes and Verification; never
+    /// "Closes #0", "Partial" or "ran out of time".
+    #[test]
+    fn a_run_stopped_mid_work_gets_the_standard_draft_with_what_is_left() {
+        let reason = "Stopped: steps 2 and 3 made no progress. The branch stayed at a8c8814 and \
+                      the run was stuck at the implement work (planned tasks) while working on \
+                      task 8 of 8 (`web/hooks/useStickyScroll.ts`: adapt the scroll offset). The \
+                      work so far is kept on branch `coderhelm-wip/coderhelm/web-12`.";
+        let progress = Progress {
+            done: (1..=7)
+                .map(|i| format!("`web/f{i}.tsx`: task {i}"))
+                .collect(),
+            remaining: vec!["`web/hooks/useStickyScroll.ts`: adapt the scroll offset".into()],
+        };
+        let stop = super::super::outcome::Stop::from_recorded(reason);
+        let nf = not_finished(
+            &stop,
+            &progress,
+            "https://app.example.com/runs/detail?id=r1",
+        );
+        let b = body(
+            &super::super::outcome::ticket_line(false, 0, "WEB-12"),
+            reason,
+            &["web/f1.tsx".into()],
+            "",
+            &nf,
+        );
+        assert!(b.starts_with("Source ticket: WEB-12\n"), "{b}");
+        assert!(super::super::proof::holds_unfinished(&b));
+        assert!(b.contains("## Not finished"));
+        assert!(b.contains("**Why it stopped:** steps 2 and 3 made no change to the branch while working on task 8 of 8"));
+        assert!(b.contains("**Done (7 of 8):**"));
+        assert!(b.contains("task 8 of 8: `web/hooks/useStickyScroll.ts`: adapt the scroll offset"));
+        assert!(b.contains("**What you can do:**"));
+        assert!(b.contains("https://app.example.com/runs/detail?id=r1"));
+        assert!(
+            super::super::outcome::body_problems(&b, "WEB-12").is_empty(),
+            "{:?}",
+            super::super::outcome::body_problems(&b, "WEB-12")
+        );
+        for never in ["#0", "Partial", "ran out of time"] {
+            assert!(!b.contains(never), "{never}");
+        }
+    }
+
+    #[test]
+    fn an_open_pull_request_gets_the_section_once() {
+        let nf = not_finished(
+            &super::super::outcome::Stop::Other("A check errored".into()),
+            &Progress::default(),
+            "",
+        );
+        let b = with_unfinished("Source ticket: WEB-3\n\n## Summary\nx", &nf);
+        assert!(
+            b.starts_with("Source ticket: WEB-3\n\n<!-- coderhelm:unfinished -->"),
+            "{b}"
+        );
+        let again = with_unfinished(&b, &nf);
+        assert_eq!(again.matches("## Not finished").count(), 1);
+        assert!(again.contains("## Summary\nx"));
     }
 }

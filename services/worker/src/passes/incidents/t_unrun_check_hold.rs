@@ -129,14 +129,19 @@ fn the_decision_reads_ci_when_only_a_tooling_line_holds() {
     };
     assert!(f.feature.is_none(), "no feature findings, as in the run");
     assert!(ready::reads_ci(&f), "CI settles the line, so it is read");
-    // A description with no line CI settles, and no feature findings, needs
-    // no CI read.
+    // Every open draft's CI is read now (a failing check holds any pull
+    // request); a closed one, or one a person put back to draft, is not.
     let plain = Facts {
         draft: true,
         body: "## Summary\nx\n".into(),
         ..Default::default()
     };
-    assert!(!ready::reads_ci(&plain));
+    assert!(ready::reads_ci(&plain));
+    let closed = Facts {
+        closed: true,
+        ..plain.clone()
+    };
+    assert!(!ready::reads_ci(&closed));
     // A check the change really didn't pass is not settled by CI: no read
     // needed for it, and it still holds whatever CI says.
     let real = format!(

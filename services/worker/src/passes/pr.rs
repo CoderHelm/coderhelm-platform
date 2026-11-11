@@ -573,18 +573,13 @@ Return ONLY the markdown body text."#,
         None => clean_body.to_string(),
     };
     let clean_body = clean_body.as_str();
-    let full_body = if matches!(msg.source, TicketSource::Github) && msg.issue_number > 0 {
-        format!(
-            "Closes #{number}\n\n{clean_body}",
-            number = msg.issue_number,
-        )
+    // One ticket line for every body (`outcome::ticket_line`): `Closes #N`
+    // only for a real GitHub issue.
+    let ticket = super::outcome::ticket_line_for(msg);
+    let full_body = if clean_body.contains(&ticket) {
+        clean_body.to_string()
     } else {
-        // Avoid duplicating "Source ticket:" if it's already in the body
-        if clean_body.contains(&format!("Source ticket: {}", msg.ticket_id)) {
-            clean_body.to_string()
-        } else {
-            format!("Source ticket: {}\n\n{clean_body}", msg.ticket_id)
-        }
+        format!("{ticket}\n\n{clean_body}")
     };
     // CoderHelm's own sections go in their places around the writer's: the
     // blocks the change copied (under Changes), every step outside this PR

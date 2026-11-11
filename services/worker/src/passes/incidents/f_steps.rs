@@ -57,7 +57,7 @@ fn run_steps(heads: &[&str], at: Gate) -> (Ending, Vec<TicketMessage>) {
         if msg.continuation > 0 {
             stalled = steps::stalled_after(mark.as_deref(), &now, stalled);
             if steps::stops_for_stall(stalled) {
-                end.said(steps::stall_reason(step, head, at.as_str(), BRANCH));
+                end.said(steps::stall_reason(step, head, at.as_str(), BRANCH, None));
                 end.status = common::run_status::FAILED.into();
                 return (end, sent);
             }
