@@ -1311,7 +1311,7 @@ async fn triage_tick(cx: &Ctx<'_>, findings: &mut [(Finding, FindingState)]) -> 
 
 // ── Cards ───────────────────────────────────────────────────────────────
 
-async fn team_channels(state: &WorkerState, team_id: &str) -> common::notify::Channels {
+pub(crate) async fn team_channels(state: &WorkerState, team_id: &str) -> common::notify::Channels {
     let item = state
         .dynamo
         .get_item()
@@ -1828,7 +1828,7 @@ async fn ticket_branch(state: &WorkerState, team_id: &str, ticket: &str) -> Opti
 }
 
 /// Cards posted today, from the day's counter; `add` adds to it.
-async fn cards_today(state: &WorkerState, team_id: &str, add: u32) -> u32 {
+pub(crate) async fn cards_today(state: &WorkerState, team_id: &str, add: u32) -> u32 {
     let day = sec::limit_day(Utc::now());
     let r = state
         .dynamo
@@ -2842,6 +2842,9 @@ async fn unit_findings(
 /// under Change. `None` for any other run.
 pub async fn pr_body(state: &WorkerState, msg: &TicketMessage, change: &str) -> Option<String> {
     let unit = load_unit(state, &msg.team_id, &msg.ticket_id).await?;
+    if unit.ecosystem == common::infra_vuln::records::UNIT_ECOSYSTEM {
+        return super::infra_findings::pr_body(state, &msg.team_id, &unit, change).await;
+    }
     let members = unit_findings(state, &msg.team_id, &unit).await;
     let pairs: Vec<(&Finding, &FindingState)> = members.iter().map(|(f, s)| (f, s)).collect();
     Some(sec::pr_body(&unit, &pairs, change))
@@ -2863,6 +2866,10 @@ pub async fn on_pr_opened(
         .await
     {
         warn!(number, error = %e, "security: could not label the pull request");
+    }
+    if unit.ecosystem == common::infra_vuln::records::UNIT_ECOSYSTEM {
+        super::infra_findings::on_pr_opened(state, &msg.team_id, &unit, number, url).await;
+        return;
     }
     let mut members = unit_findings(state, &msg.team_id, &unit).await;
     let cfg = load_config(state, &msg.team_id).await.unwrap_or_default();

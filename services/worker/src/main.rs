@@ -584,10 +584,18 @@ async fn handle_message(state: Arc<WorkerState>, message: models::WorkerMessage)
             // What each account an admin switched infrastructure
             // vulnerabilities on for runs, read once a day.
             passes::infra_inventory::sweep(&state).await;
+            // ...and matched against the feeds, once a day per team.
+            passes::infra_findings::sweep(&state).await;
         }
         models::WorkerMessage::SecurityEvent(msg) => {
             info!(team_id = %msg.team_id, kind = %msg.kind, repo = %msg.repo, "Security event");
-            passes::security_fixes::on_event(&state, &msg).await;
+            if msg.kind == passes::infra_findings::CHECK_KIND
+                || msg.kind == passes::infra_findings::FIX_KIND
+            {
+                passes::infra_findings::on_event(&state, &msg).await;
+            } else {
+                passes::security_fixes::on_event(&state, &msg).await;
+            }
         }
         models::WorkerMessage::StalePrsPreview(msg) => {
             info!(team_id = %msg.team_id, repo = %msg.repo, "Stale PR preview");

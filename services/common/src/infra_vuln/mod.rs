@@ -15,11 +15,17 @@
 //!   the optional "Infrastructure vulnerabilities" permissions of its
 //!   CoderHelmLogReader role (`RES#` records in the AWS insights table).
 //!
+//! - [`matching`] and [`records`]: one finding per fix (a PR, a runbook
+//!   step in AWS, or AWS-managed), closed only when a new read of the
+//!   account shows the fix running.
+//!
 //! Nothing here calls a model: every match is a version comparison.
 
 pub mod feeds;
 pub mod inventory;
+pub mod matching;
 pub mod raw;
+pub mod records;
 pub mod store;
 
 /// Global records live under the same partition as the CISA list.

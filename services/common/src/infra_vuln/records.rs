@@ -1,0 +1,496 @@
+//! Stored infrastructure findings and their life: `INFRAFINDING#<id>` in
+//! the settings table, one per fix ([`super::matching`] decides them).
+//!
+//! - A finding a read no longer produces is **fixed**, with the time:
+//!   only a new read of the account closes one, never a merged PR.
+//! - A merged PR without the new version running stays open and says so.
+//! - AWS-managed rows are kept as `aws_managed` and never count as open.
+
+use chrono::{DateTime, Duration, Utc};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+
+use super::matching::{FixKind, InfraFinding};
+use crate::security_fixes::Tier;
+
+pub const FINDING_PREFIX: &str = "INFRAFINDING#";
+/// Teams' infrastructure settings (Inspector, Health).
+pub const CONFIG_SK: &str = "INFRA_SECURITY_CONFIG";
+/// The ecosystem of an infrastructure fix run's unit (`SEC_TICKET#`).
+pub const UNIT_ECOSYSTEM: &str = "infrastructure";
+/// Fixed findings are kept this long.
+pub const FIXED_KEEP_DAYS: i64 = 180;
+
+pub fn finding_sk(id: &str) -> String {
+    format!("{FINDING_PREFIX}{id}")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Status {
+    #[default]
+    Open,
+    Fixing,
+    PrOpen,
+    Fixed,
+    AwsManaged,
+    Dismissed,
+}
+
+impl Status {
+    pub fn is_open(self) -> bool {
+        matches!(self, Status::Open | Status::Fixing | Status::PrOpen)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrRef {
+    pub number: u64,
+    pub url: String,
+    /// `open`, `merged` or `closed`.
+    pub state: String,
+}
+
+/// What Inspector adds when the team turned it on.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InspectorFacts {
+    pub exploit_available: bool,
+    pub reachable: Option<bool>,
+}
+
+/// One stored finding.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Record {
+    #[serde(flatten)]
+    pub finding: InfraFinding,
+    pub status: Status,
+    #[serde(default)]
+    pub pr: Option<PrRef>,
+    #[serde(default)]
+    pub ticket: String,
+    #[serde(default)]
+    pub inspector: Option<InspectorFacts>,
+    pub first_seen_at: String,
+    pub updated_at: String,
+    #[serde(default)]
+    pub fixed_at: Option<String>,
+    /// A line for the timeline when something changed (not stored).
+    #[serde(skip)]
+    pub event: Option<String>,
+}
+
+impl Record {
+    pub fn new(f: InfraFinding, now: &str) -> Record {
+        let status = if f.is_open() {
+            Status::Open
+        } else {
+            Status::AwsManaged
+        };
+        Record {
+            event: Some(if status == Status::AwsManaged {
+                "AWS-managed: nothing to do".into()
+            } else {
+                format!("Found: {}", f.title)
+            }),
+            finding: f,
+            status,
+            pr: None,
+            ticket: String::new(),
+            inspector: None,
+            first_seen_at: now.into(),
+            updated_at: now.into(),
+            fixed_at: None,
+        }
+    }
+
+    pub fn tier(&self) -> Option<Tier> {
+        self.finding.tier
+    }
+
+    /// What the page shows.
+    pub fn view(&self) -> Value {
+        let mut v = serde_json::to_value(&self.finding).unwrap_or(Value::Null);
+        if let Some(o) = v.as_object_mut() {
+            o.insert("status".into(), json!(self.status));
+            o.insert("pr".into(), json!(self.pr));
+            o.insert("inspector".into(), json!(self.inspector));
+            o.insert("first_seen_at".into(), json!(self.first_seen_at));
+            o.insert("updated_at".into(), json!(self.updated_at));
+            o.insert("fixed_at".into(), json!(self.fixed_at));
+            // The fix's kind as the contract names it.
+            o["fix"]["kind"] = json!(self.finding.fix.kind);
+            if self.status == Status::PrOpen
+                && self.pr.as_ref().is_some_and(|p| p.state == "merged")
+            {
+                o.insert("note".into(), json!("PR merged: waiting for the new version to run. It closes when CoderHelm reads the account again and sees it."));
+            }
+        }
+        v
+    }
+}
+
+/// A new read's findings against the stored ones: the records that
+/// changed (new, updated, or fixed). Dismissed ones stay dismissed while
+/// they still match.
+pub fn reconcile(stored: &[Record], fresh: Vec<InfraFinding>, now: DateTime<Utc>) -> Vec<Record> {
+    let now_s = now.to_rfc3339();
+    let mut out = Vec::new();
+    for f in &fresh {
+        match stored.iter().find(|r| r.finding.id == f.id) {
+            None => out.push(Record::new(f.clone(), &now_s)),
+            Some(r) => {
+                let mut r2 = r.clone();
+                let reopened = r.status == Status::Fixed;
+                r2.finding = f.clone();
+                if reopened {
+                    r2.status = if f.is_open() {
+                        Status::Open
+                    } else {
+                        Status::AwsManaged
+                    };
+                    r2.fixed_at = None;
+                    r2.pr = None;
+                    r2.ticket.clear();
+                    r2.event = Some("Found again in the latest read".into());
+                }
+                if r2 != *r {
+                    r2.updated_at = now_s.clone();
+                    out.push(r2);
+                }
+            }
+        }
+    }
+    for r in stored
+        .iter()
+        .filter(|r| r.status != Status::Fixed && r.status != Status::Dismissed)
+    {
+        if fresh.iter().any(|f| f.id == r.finding.id) {
+            continue;
+        }
+        let mut r2 = r.clone();
+        r2.status = Status::Fixed;
+        r2.fixed_at = Some(now_s.clone());
+        r2.updated_at = now_s.clone();
+        r2.event = Some(if r.status == Status::AwsManaged {
+            "No longer applies (the resource or the bulletin changed)".into()
+        } else {
+            "Fixed: the latest read of the account shows the fix running".into()
+        });
+        if let Some(p) = &mut r2.pr {
+            if p.state == "open" {
+                p.state = "merged".into();
+            }
+        }
+        out.push(r2);
+    }
+    out
+}
+
+/// The overview counts.
+pub fn counts(records: &[Record], now: DateTime<Utc>) -> Value {
+    let open: Vec<&Record> = records.iter().filter(|r| r.status.is_open()).collect();
+    let n = |t: Tier| open.iter().filter(|r| r.tier() == Some(t)).count();
+    let since = now - Duration::days(30);
+    let fixed_30d = records
+        .iter()
+        .filter(|r| r.status == Status::Fixed && r.finding.fix.kind != Some(FixKind::Aws))
+        .filter(|r| {
+            r.fixed_at
+                .as_deref()
+                .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
+                .is_some_and(|t| t > since)
+        })
+        .count();
+    json!({
+        "open": open.len(),
+        "p0": n(Tier::P0), "p1": n(Tier::P1), "p2": n(Tier::P2), "p3": n(Tier::P3),
+        "prs": open.iter().filter(|r| r.finding.fix.kind == Some(FixKind::Pr)).count(),
+        "runbooks": open.iter().filter(|r| r.finding.fix.kind == Some(FixKind::Runbook)).count(),
+        "aws_managed": records.iter().filter(|r| r.status == Status::AwsManaged).count(),
+        "fixed_30d": fixed_30d,
+    })
+}
+
+/// Insights › Analytics: opened and fixed in 30 days, time to fix.
+pub fn insights(records: &[Record], now: DateTime<Utc>) -> Value {
+    let since = now - Duration::days(30);
+    let at = |s: &str| {
+        DateTime::parse_from_rfc3339(s)
+            .ok()
+            .map(|t| t.with_timezone(&Utc))
+    };
+    let actionable: Vec<&Record> = records
+        .iter()
+        .filter(|r| r.finding.fix.kind != Some(FixKind::Aws))
+        .collect();
+    let mut days: Vec<f64> = actionable
+        .iter()
+        .filter(|r| r.status == Status::Fixed)
+        .filter_map(|r| {
+            Some((at(r.fixed_at.as_deref()?)? - at(&r.first_seen_at)?).num_hours() as f64 / 24.0)
+        })
+        .collect();
+    days.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = (!days.is_empty()).then(|| days[days.len() / 2]);
+    let open: Vec<&&Record> = actionable.iter().filter(|r| r.status.is_open()).collect();
+    let by = |t: Tier| open.iter().filter(|r| r.tier() == Some(t)).count();
+    json!({
+        "open": open.len(),
+        "by_tier": { "P0": by(Tier::P0), "P1": by(Tier::P1), "P2": by(Tier::P2), "P3": by(Tier::P3) },
+        "opened_30d": actionable.iter().filter(|r| at(&r.first_seen_at).is_some_and(|t| t > since)).count(),
+        "fixed_30d": actionable.iter().filter(|r| r.fixed_at.as_deref().and_then(at).is_some_and(|t| t > since)).count(),
+        "median_days_to_fix": median,
+        "prs_opened_30d": actionable.iter().filter(|r| r.pr.is_some() && at(&r.updated_at).is_some_and(|t| t > since)).count(),
+        "runbooks_open": open.iter().filter(|r| r.finding.fix.kind == Some(FixKind::Runbook)).count(),
+        "aws_managed": records.iter().filter(|r| r.status == Status::AwsManaged).count(),
+    })
+}
+
+/// The fix run's ticket: exactly what to change, where, and how to roll it
+/// out. The run edits only the file named.
+pub fn ticket_body(r: &Record) -> String {
+    let f = &r.finding;
+    let mut out = format!("{}\n\n", f.title);
+    out.push_str(&format!("Fix: {}\n", f.fix.summary));
+    if let Some(l) = &f.fix.location {
+        out.push_str(&format!(
+            "Where: `{}`{}{}\n",
+            l.file,
+            if l.address.is_empty() {
+                String::new()
+            } else {
+                format!(", `{}`", l.address)
+            },
+            if l.line > 0 {
+                format!(" (line {})", l.line)
+            } else {
+                String::new()
+            }
+        ));
+    }
+    out.push_str(&format!("From `{}` to `{}`.\n\n", f.fix.from, f.fix.to));
+    match f.kind {
+        Some(super::inventory::Kind::AutoScalingGroup)
+        | Some(super::inventory::Kind::Ec2Instance) => {
+            out.push_str("Change only the AMI. Prefer AWS's public parameter over a fixed AMI ID, so the next release is picked up too: in Terraform, `data \"aws_ssm_parameter\" \"al2023\" { name = \"/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64\" }` and `image_id = data.aws_ssm_parameter.al2023.value` (the matching `-arm64` parameter for Graviton). Keep the launch template's other settings as they are. If the AMI comes from `data \"aws_ami\"` with `most_recent = true`, the code is already current: change nothing and say so; rolling the instances is the fix.\n");
+        }
+        Some(super::inventory::Kind::EksNodegroup) => {
+            out.push_str(&format!("Set `release_version` on the node group (or the module input that feeds it) to `{}`. Change nothing else.\n", f.fix.to));
+        }
+        Some(super::inventory::Kind::LambdaFunction) => {
+            out.push_str(&format!("Set `runtime` to `{}`, and check the handler code for anything the newer runtime changed.\n", f.fix.to));
+        }
+        _ => {}
+    }
+    if !f.cves.is_empty() {
+        out.push_str(&format!("\nFixes: {}.\n", f.cves.join(", ")));
+    }
+    if !f.fix.cli.is_empty() {
+        out.push_str("\nAfter it merges and is applied, the running resources still need to move to the new version (not part of this change; for the PR description):\n");
+        for c in &f.fix.cli {
+            out.push_str(&format!("    {c}\n"));
+        }
+    }
+    out
+}
+
+/// The PR's description.
+pub fn pr_body(r: &Record, change: &str) -> String {
+    let f = &r.finding;
+    let mut out = String::new();
+    out.push_str(&format!("{}\n\n", crate::security_fixes::MARKER));
+    out.push_str("## Summary\n\n");
+    out.push_str(&format!("{}.\n\n", f.title));
+    out.push_str(&format!(
+        "It runs on {} {} ({}).\n\n",
+        f.count.max(1),
+        if f.count == 1 {
+            "resource"
+        } else {
+            "resources"
+        },
+        f.exposure.why
+    ));
+    out.push_str("## Changes\n\n");
+    out.push_str(&format!("{change}\n\n"));
+    out.push_str("## Advisories\n\n");
+    for s in &f.sources {
+        if s.url.is_empty() {
+            out.push_str(&format!("- {}\n", s.id));
+        } else {
+            out.push_str(&format!("- [{}]({})\n", s.id, s.url));
+        }
+    }
+    if !f.cves.is_empty() {
+        out.push_str(&format!("\nCVEs: {}\n", f.cves.join(", ")));
+    }
+    if !f.fix.cli.is_empty() {
+        out.push_str("\n## After merge\n\nThe new version runs only once the resources roll. CoderHelm closes this finding when it reads the account again and sees it running.\n\n```\n");
+        for c in &f.fix.cli {
+            out.push_str(&format!("{c}\n"));
+        }
+        out.push_str("```\n");
+    }
+    out
+}
+
+/// The alert card for a new urgent finding (P0 or P1), posted once.
+pub fn card(r: &Record, url: &str) -> crate::notify::Message {
+    use crate::notify::{Block, Button, Message, Size, Spacing, Text, Tone};
+    let f = &r.finding;
+    let tier = f.tier.map(Tier::as_str).unwrap_or("P3");
+    let head = format!("🔴 {tier} infrastructure · {}", f.title);
+    let what = match f.fix.kind {
+        Some(FixKind::Pr) => format!(
+            "Fix: {}. CoderHelm opens the PR within the day's limits.",
+            f.fix.summary
+        ),
+        Some(FixKind::Runbook) => format!(
+            "Fix in AWS: {}{}. CoderHelm never runs it.",
+            f.fix.summary,
+            if f.fix.apply_by.is_empty() {
+                String::new()
+            } else {
+                format!(", AWS applies it after {}", f.fix.apply_by)
+            }
+        ),
+        _ => f.fix.reason.clone(),
+    };
+    let mut facts = vec![
+        (
+            "Account".to_string(),
+            format!("{} ({})", f.account, f.region),
+        ),
+        (
+            "Runs on".to_string(),
+            format!("{} ({})", f.count.max(1), f.exposure.why),
+        ),
+    ];
+    if !f.cves.is_empty() {
+        facts.push(("CVEs".into(), f.cves.join(", ")));
+    }
+    Message {
+        summary: head.clone(),
+        blocks: vec![
+            Block::Banner {
+                text: head,
+                tone: Tone::Attention,
+                size: Size::Medium,
+            },
+            Block::Text(Text::new(what).spacing(Spacing::Small)),
+            Block::Facts {
+                facts,
+                spacing: Spacing::Small,
+            },
+        ],
+        buttons: vec![Button::new("See the fix", url)],
+        full_width: true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::infra_vuln::matching::{Fix, FixKind};
+
+    fn f(id: &str, kind: FixKind) -> InfraFinding {
+        InfraFinding {
+            id: id.into(),
+            title: format!("finding {id}"),
+            tier: (kind != FixKind::Aws).then_some(Tier::P1),
+            fix: Fix {
+                kind: Some(kind),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn now() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-11-10T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn only_a_new_read_closes_a_finding() {
+        let first = reconcile(&[], vec![f("a", FixKind::Pr), f("b", FixKind::Aws)], now());
+        assert_eq!(first.len(), 2);
+        assert_eq!(first[0].status, Status::Open);
+        assert_eq!(first[1].status, Status::AwsManaged);
+        // The PR merged, but the next read still finds the old AMI: open.
+        let mut stored = first.clone();
+        stored[0].status = Status::PrOpen;
+        stored[0].pr = Some(PrRef {
+            number: 7,
+            url: "u".into(),
+            state: "merged".into(),
+        });
+        let again = reconcile(
+            &stored,
+            vec![f("a", FixKind::Pr), f("b", FixKind::Aws)],
+            now(),
+        );
+        assert!(again.is_empty(), "nothing changed: {again:?}");
+        assert!(stored[0].view()["note"]
+            .as_str()
+            .unwrap()
+            .contains("waiting for the new version"));
+        // The read no longer finds it: fixed, with the time.
+        let later = reconcile(&stored, vec![f("b", FixKind::Aws)], now());
+        assert_eq!(later.len(), 1);
+        assert_eq!(later[0].status, Status::Fixed);
+        assert!(later[0].event.as_ref().unwrap().contains("latest read"));
+        // Found again: open again.
+        let back = reconcile(&later, vec![f("a", FixKind::Pr)], now());
+        assert!(back
+            .iter()
+            .any(|r| r.finding.id == "a" && r.status == Status::Open));
+    }
+
+    #[test]
+    fn aws_managed_rows_never_count_as_open() {
+        let r = reconcile(
+            &[],
+            vec![
+                f("a", FixKind::Pr),
+                f("b", FixKind::Aws),
+                f("c", FixKind::Runbook),
+            ],
+            now(),
+        );
+        let c = counts(&r, now());
+        assert_eq!(c["open"], 2);
+        assert_eq!(c["aws_managed"], 1);
+        assert_eq!(c["runbooks"], 1);
+        assert_eq!(c["p1"], 2);
+        let i = insights(&r, now());
+        assert_eq!(i["open"], 2);
+        assert_eq!(i["opened_30d"], 2);
+    }
+
+    #[test]
+    fn the_ticket_says_exactly_what_to_change() {
+        let mut x = f("a", FixKind::Pr);
+        x.kind = Some(crate::infra_vuln::inventory::Kind::AutoScalingGroup);
+        x.fix.from = "2023.12.20261020".into();
+        x.fix.to = "2023.12.20261102".into();
+        x.fix.location = Some(crate::infra_vuln::inventory::Location {
+            repo: "acme/infra".into(),
+            file: "envs/prod/main.tf".into(),
+            address: "aws_launch_template.web".into(),
+            line: 3,
+            how: "search".into(),
+        });
+        x.fix.cli =
+            vec!["aws autoscaling start-instance-refresh --auto-scaling-group-name web-asg".into()];
+        let r = Record::new(x, "t");
+        let t = ticket_body(&r);
+        assert!(t.contains("`envs/prod/main.tf`, `aws_launch_template.web` (line 3)"));
+        assert!(t.contains("aws_ssm_parameter"));
+        let b = pr_body(&r, "Pointed the launch template at the AL2023 parameter.");
+        assert!(b.starts_with(crate::security_fixes::MARKER));
+        assert!(b.contains("## After merge"));
+        assert!(!b.contains('\u{2192}'));
+    }
+}

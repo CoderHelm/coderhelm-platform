@@ -528,6 +528,22 @@ async fn main() -> Result<(), Error> {
             get(routes::infra_security::resources),
         )
         .route(
+            "/security/infrastructure",
+            get(routes::infra_security::findings),
+        )
+        .route(
+            "/security/infrastructure/insights",
+            get(routes::infra_security::insights),
+        )
+        .route(
+            "/security/infrastructure/check",
+            post(routes::infra_security::check),
+        )
+        .route(
+            "/security/infrastructure/findings/:id/fix",
+            post(routes::infra_security::fix),
+        )
+        .route(
             "/alert-routes",
             get(routes::alerts::list_routes)
                 .put(routes::alerts::put_route)

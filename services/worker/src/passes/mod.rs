@@ -1086,6 +1086,7 @@ pub(crate) mod implement;
 mod incidents;
 pub mod infra_analyze;
 pub mod infra_feeds;
+pub mod infra_findings;
 pub mod infra_inventory;
 mod infra_repo;
 pub mod jira_comment;
