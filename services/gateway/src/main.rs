@@ -514,6 +514,11 @@ async fn main() -> Result<(), Error> {
             get(routes::security::get_config).put(routes::security::put_config),
         )
         .route("/security/preview", get(routes::security::preview))
+        // Infrastructure vulnerabilities: the public AWS feeds
+        .route(
+            "/security/infrastructure/sources",
+            get(routes::infra_security::sources),
+        )
         .route(
             "/alert-routes",
             get(routes::alerts::list_routes)

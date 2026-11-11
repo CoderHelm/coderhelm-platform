@@ -1,0 +1,210 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<rss version="2.0" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:atom="http://www.w3.org/2005/Atom">
+<channel>
+    <title>Amazon Linux 2023 Security Bulletins</title>
+    <description>Amazon Linux 2023 Security Bulletins</description>
+    <link>https://alas.aws.amazon.com</link>
+    <language>en-us</language>
+    <ttl>35</ttl>
+    
+    <item>
+        <title>ALAS2023LIVEPATCH-2026-424 (important): kernel-livepatch-6.18.51-120.163</title>
+        <description>
+            CVE-2026-98432
+        </description>
+        <pubDate>Mon, 09 Nov 2026 23:27:00 GMT</pubDate>
+        <lastBuildDate>Mon, 09 Nov 2026 23:27:00 GMT</lastBuildDate>
+        <guid>https://alas.aws.amazon.com/AL2023/ALAS2023LIVEPATCH-2026-424.html</guid>
+        <link>https://alas.aws.amazon.com/AL2023/ALAS2023LIVEPATCH-2026-424.html</link>
+    </item><item>
+        <title>ALAS2023LIVEPATCH-2026-425 (important): kernel-livepatch-6.18.48-107.148</title>
+        <description>
+            CVE-2026-98432
+        </description>
+        <pubDate>Mon, 09 Nov 2026 23:27:00 GMT</pubDate>
+        <lastBuildDate>Mon, 09 Nov 2026 23:27:00 GMT</lastBuildDate>
+        <guid>https://alas.aws.amazon.com/AL2023/ALAS2023LIVEPATCH-2026-425.html</guid>
+        <link>https://alas.aws.amazon.com/AL2023/ALAS2023LIVEPATCH-2026-425.html</link>
+    </item><item>
+        <title>ALAS2023LIVEPATCH-2026-426 (important): kernel-livepatch-6.18.54-121.166</title>
+        <description>
+            CVE-2026-98432
+        </description>
+        <pubDate>Mon, 09 Nov 2026 23:27:00 GMT</pubDate>
+        <lastBuildDate>Mon, 09 Nov 2026 23:27:00 GMT</lastBuildDate>
+        <guid>https://alas.aws.amazon.com/AL2023/ALAS2023LIVEPATCH-2026-426.html</guid>
+        <link>https://alas.aws.amazon.com/AL2023/ALAS2023LIVEPATCH-2026-426.html</link>
+    </item><item>
+        <title>ALAS2023LIVEPATCH-2026-427 (important): kernel-livepatch-6.18.48-109.150</title>
+        <description>
+            CVE-2026-98432
+        </description>
+        <pubDate>Mon, 09 Nov 2026 23:27:00 GMT</pubDate>
+        <lastBuildDate>Mon, 09 Nov 2026 23:27:00 GMT</lastBuildDate>
+        <guid>https://alas.aws.amazon.com/AL2023/ALAS2023LIVEPATCH-2026-427.html</guid>
+        <link>https://alas.aws.amazon.com/AL2023/ALAS2023LIVEPATCH-2026-427.html</link>
+    </item><item>
+        <title>ALAS2023LIVEPATCH-2026-428 (important): kernel-livepatch-6.18.41-94.142</title>
+        <description>
+            CVE-2026-98432
+        </description>
+        <pubDate>Mon, 09 Nov 2026 23:27:00 GMT</pubDate>
+        <lastBuildDate>Mon, 09 Nov 2026 23:27:00 GMT</lastBuildDate>
+        <guid>https://alas.aws.amazon.com/AL2023/ALAS2023LIVEPATCH-2026-428.html</guid>
+        <link>https://alas.aws.amazon.com/AL2023/ALAS2023LIVEPATCH-2026-428.html</link>
+    </item><item>
+        <title>ALAS2023LIVEPATCH-2026-429 (important): kernel-livepatch-6.12.110-135.202</title>
+        <description>
+            CVE-2026-98432
+        </description>
+        <pubDate>Mon, 09 Nov 2026 23:27:00 GMT</pubDate>
+        <lastBuildDate>Mon, 09 Nov 2026 23:27:00 GMT</lastBuildDate>
+        <guid>https://alas.aws.amazon.com/AL2023/ALAS2023LIVEPATCH-2026-429.html</guid>
+        <link>https://alas.aws.amazon.com/AL2023/ALAS2023LIVEPATCH-2026-429.html</link>
+    </item><item>
+        <title>ALAS2023LIVEPATCH-2026-430 (important): kernel-livepatch-6.12.100-125.179</title>
+        <description>
+            CVE-2026-98432
+        </description>
+        <pubDate>Mon, 09 Nov 2026 23:27:00 GMT</pubDate>
+        <lastBuildDate>Mon, 09 Nov 2026 23:27:00 GMT</lastBuildDate>
+        <guid>https://alas.aws.amazon.com/AL2023/ALAS2023LIVEPATCH-2026-430.html</guid>
+        <link>https://alas.aws.amazon.com/AL2023/ALAS2023LIVEPATCH-2026-430.html</link>
+    </item><item>
+        <title>ALAS2023LIVEPATCH-2026-431 (important): kernel-livepatch-6.12.110-135.201</title>
+        <description>
+            CVE-2026-98432
+        </description>
+        <pubDate>Mon, 09 Nov 2026 23:27:00 GMT</pubDate>
+        <lastBuildDate>Mon, 09 Nov 2026 23:27:00 GMT</lastBuildDate>
+        <guid>https://alas.aws.amazon.com/AL2023/ALAS2023LIVEPATCH-2026-431.html</guid>
+        <link>https://alas.aws.amazon.com/AL2023/ALAS2023LIVEPATCH-2026-431.html</link>
+    </item><item>
+        <title>ALAS2023LIVEPATCH-2026-432 (important): kernel-livepatch-6.12.103-129.197</title>
+        <description>
+            CVE-2026-98432
+        </description>
+        <pubDate>Mon, 09 Nov 2026 23:27:00 GMT</pubDate>
+        <lastBuildDate>Mon, 09 Nov 2026 23:27:00 GMT</lastBuildDate>
+        <guid>https://alas.aws.amazon.com/AL2023/ALAS2023LIVEPATCH-2026-432.html</guid>
+        <link>https://alas.aws.amazon.com/AL2023/ALAS2023LIVEPATCH-2026-432.html</link>
+    </item><item>
+        <title>ALAS2023LIVEPATCH-2026-433 (important): kernel-livepatch-6.12.103-127.188</title>
+        <description>
+            CVE-2026-98432
+        </description>
+        <pubDate>Mon, 09 Nov 2026 23:27:00 GMT</pubDate>
+        <lastBuildDate>Mon, 09 Nov 2026 23:27:00 GMT</lastBuildDate>
+        <guid>https://alas.aws.amazon.com/AL2023/ALAS2023LIVEPATCH-2026-433.html</guid>
+        <link>https://alas.aws.amazon.com/AL2023/ALAS2023LIVEPATCH-2026-433.html</link>
+    </item><item>
+        <title>ALAS2023LIVEPATCH-2026-434 (important): kernel-livepatch-6.18.44-99.149</title>
+        <description>
+            CVE-2026-98432
+        </description>
+        <pubDate>Mon, 09 Nov 2026 23:27:00 GMT</pubDate>
+        <lastBuildDate>Mon, 09 Nov 2026 23:27:00 GMT</lastBuildDate>
+        <guid>https://alas.aws.amazon.com/AL2023/ALAS2023LIVEPATCH-2026-434.html</guid>
+        <link>https://alas.aws.amazon.com/AL2023/ALAS2023LIVEPATCH-2026-434.html</link>
+    </item><item>
+        <title>ALAS2023LIVEPATCH-2026-435 (important): kernel-livepatch-6.18.51-120.162</title>
+        <description>
+            CVE-2026-98432
+        </description>
+        <pubDate>Mon, 09 Nov 2026 23:27:00 GMT</pubDate>
+        <lastBuildDate>Mon, 09 Nov 2026 23:27:00 GMT</lastBuildDate>
+        <guid>https://alas.aws.amazon.com/AL2023/ALAS2023LIVEPATCH-2026-435.html</guid>
+        <link>https://alas.aws.amazon.com/AL2023/ALAS2023LIVEPATCH-2026-435.html</link>
+    </item><item>
+        <title>ALAS2023LIVEPATCH-2026-436 (important): kernel-livepatch-6.12.111-136.204</title>
+        <description>
+            CVE-2026-98432
+        </description>
+        <pubDate>Mon, 09 Nov 2026 23:27:00 GMT</pubDate>
+        <lastBuildDate>Mon, 09 Nov 2026 23:27:00 GMT</lastBuildDate>
+        <guid>https://alas.aws.amazon.com/AL2023/ALAS2023LIVEPATCH-2026-436.html</guid>
+        <link>https://alas.aws.amazon.com/AL2023/ALAS2023LIVEPATCH-2026-436.html</link>
+    </item><item>
+        <title>ALAS2023LIVEPATCH-2026-437 (important): kernel-livepatch-6.1.182-227.379</title>
+        <description>
+            CVE-2026-98432
+        </description>
+        <pubDate>Mon, 09 Nov 2026 23:27:00 GMT</pubDate>
+        <lastBuildDate>Mon, 09 Nov 2026 23:27:00 GMT</lastBuildDate>
+        <guid>https://alas.aws.amazon.com/AL2023/ALAS2023LIVEPATCH-2026-437.html</guid>
+        <link>https://alas.aws.amazon.com/AL2023/ALAS2023LIVEPATCH-2026-437.html</link>
+    </item><item>
+        <title>ALAS2023LIVEPATCH-2026-438 (important): kernel-livepatch-6.1.188-233.385</title>
+        <description>
+            CVE-2026-98432
+        </description>
+        <pubDate>Mon, 09 Nov 2026 23:27:00 GMT</pubDate>
+        <lastBuildDate>Mon, 09 Nov 2026 23:27:00 GMT</lastBuildDate>
+        <guid>https://alas.aws.amazon.com/AL2023/ALAS2023LIVEPATCH-2026-438.html</guid>
+        <link>https://alas.aws.amazon.com/AL2023/ALAS2023LIVEPATCH-2026-438.html</link>
+    </item><item>
+        <title>ALAS2023LIVEPATCH-2026-439 (important): kernel-livepatch-6.1.180-225.360</title>
+        <description>
+            CVE-2026-98432
+        </description>
+        <pubDate>Mon, 09 Nov 2026 23:27:00 GMT</pubDate>
+        <lastBuildDate>Mon, 09 Nov 2026 23:27:00 GMT</lastBuildDate>
+        <guid>https://alas.aws.amazon.com/AL2023/ALAS2023LIVEPATCH-2026-439.html</guid>
+        <link>https://alas.aws.amazon.com/AL2023/ALAS2023LIVEPATCH-2026-439.html</link>
+    </item><item>
+        <title>ALAS2023LIVEPATCH-2026-440 (important): kernel-livepatch-6.1.186-228.374</title>
+        <description>
+            CVE-2026-98432
+        </description>
+        <pubDate>Mon, 09 Nov 2026 23:27:00 GMT</pubDate>
+        <lastBuildDate>Mon, 09 Nov 2026 23:27:00 GMT</lastBuildDate>
+        <guid>https://alas.aws.amazon.com/AL2023/ALAS2023LIVEPATCH-2026-440.html</guid>
+        <link>https://alas.aws.amazon.com/AL2023/ALAS2023LIVEPATCH-2026-440.html</link>
+    </item><item>
+        <title>ALAS2023LIVEPATCH-2026-441 (important): kernel-livepatch-6.1.186-228.376</title>
+        <description>
+            CVE-2026-98432
+        </description>
+        <pubDate>Mon, 09 Nov 2026 23:27:00 GMT</pubDate>
+        <lastBuildDate>Mon, 09 Nov 2026 23:27:00 GMT</lastBuildDate>
+        <guid>https://alas.aws.amazon.com/AL2023/ALAS2023LIVEPATCH-2026-441.html</guid>
+        <link>https://alas.aws.amazon.com/AL2023/ALAS2023LIVEPATCH-2026-441.html</link>
+    </item><item>
+        <title>ALAS2023LIVEPATCH-2026-442 (important): kernel-livepatch-6.1.188-233.386</title>
+        <description>
+            CVE-2026-98432
+        </description>
+        <pubDate>Mon, 09 Nov 2026 23:27:00 GMT</pubDate>
+        <lastBuildDate>Mon, 09 Nov 2026 23:27:00 GMT</lastBuildDate>
+        <guid>https://alas.aws.amazon.com/AL2023/ALAS2023LIVEPATCH-2026-442.html</guid>
+        <link>https://alas.aws.amazon.com/AL2023/ALAS2023LIVEPATCH-2026-442.html</link>
+    </item><item>
+        <title>ALAS2023LIVEPATCH-2026-443 (important): kernel-livepatch-6.1.189-236.399</title>
+        <description>
+            CVE-2026-98432
+        </description>
+        <pubDate>Mon, 09 Nov 2026 23:27:00 GMT</pubDate>
+        <lastBuildDate>Mon, 09 Nov 2026 23:27:00 GMT</lastBuildDate>
+        <guid>https://alas.aws.amazon.com/AL2023/ALAS2023LIVEPATCH-2026-443.html</guid>
+        <link>https://alas.aws.amazon.com/AL2023/ALAS2023LIVEPATCH-2026-443.html</link>
+    </item><item>
+        <title>ALAS2023-2026-3365 (important): kernel</title>
+        <description>
+            CVE-2026-98432
+        </description>
+        <pubDate>Fri, 30 Oct 2026 21:00:00 GMT</pubDate>
+        <lastBuildDate>Mon, 02 Nov 2026 09:00:00 GMT</lastBuildDate>
+        <guid>https://alas.aws.amazon.com/AL2023/ALAS2023-2026-3365.html</guid>
+        <link>https://alas.aws.amazon.com/AL2023/ALAS2023-2026-3365.html</link>
+    </item><item>
+        <title>ALAS2023-2026-2057 (important): kernel6.12</title>
+        <description>
+            CVE-2026-45944, CVE-2026-46093, CVE-2026-53005, CVE-2026-53027, CVE-2026-53365, CVE-2026-53392, CVE-2026-53402, CVE-2026-63970, CVE-2026-64024, CVE-2026-64077, CVE-2026-64187, CVE-2026-64189, CVE-2026-64192, CVE-2026-64227, CVE-2026-64265, CVE-2026-64266, CVE-2026-64279, CVE-2026-64284, CVE-2026-64286, CVE-2026-64287, CVE-2026-64294, CVE-2026-64296, CVE-2026-64298, CVE-2026-64299, CVE-2026-64306, CVE-2026-64312, CVE-2026-64313, CVE-2026-64317, CVE-2026-64322, CVE-2026-64323, CVE-2026-64324, CVE-2026-64326, CVE-2026-64352, CVE-2026-64354, CVE-2026-64355, CVE-2026-64357, CVE-2026-64364, CVE-2026-64368, CVE-2026-64370, CVE-2026-64371, CVE-2026-64372, CVE-2026-64373, CVE-2026-64374, CVE-2026-64375, CVE-2026-64380, CVE-2026-64381, CVE-2026-64382, CVE-2026-64383, CVE-2026-64384, CVE-2026-64385, CVE-2026-64386, CVE-2026-64387, CVE-2026-64411, CVE-2026-64412, CVE-2026-64413, CVE-2026-64414, CVE-2026-64415, CVE-2026-64416, CVE-2026-64418, CVE-2026-64422, CVE-2026-64423, CVE-2026-64425, CVE-2026-64432, CVE-2026-64435, CVE-2026-64436, CVE-2026-64448, CVE-2026-64450, CVE-2026-64456, CVE-2026-64457, CVE-2026-64458, CVE-2026-64465, CVE-2026-64472, CVE-2026-64474, CVE-2026-64475, CVE-2026-64476, CVE-2026-64507, CVE-2026-64508, CVE-2026-64512, CVE-2026-64514, CVE-2026-64530, CVE-2026-64532, CVE-2026-64533, CVE-2026-64538, CVE-2026-64542, CVE-2026-64543, CVE-2026-64544, CVE-2026-64545, CVE-2026-64546, CVE-2026-64548, CVE-2026-64551, CVE-2026-64552, CVE-2026-64553, CVE-2026-64555, CVE-2026-64556, CVE-2026-64560, CVE-2026-64561, CVE-2026-64589, CVE-2026-64593, CVE-2026-64597, CVE-2026-64598, CVE-2026-64604, CVE-2026-68086, CVE-2026-68090, CVE-2026-68092, CVE-2026-68454, CVE-2026-68461, CVE-2026-68476, CVE-2026-68477, CVE-2026-72010, CVE-2026-72012, CVE-2026-72014, CVE-2026-72020, CVE-2026-72021, CVE-2026-72027, CVE-2026-72034, CVE-2026-72035, CVE-2026-72036, CVE-2026-72041, CVE-2026-72052, CVE-2026-72053, CVE-2026-72054, CVE-2026-72055, CVE-2026-72057, CVE-2026-72061, CVE-2026-72063, CVE-2026-72066, CVE-2026-72067, CVE-2026-72068, CVE-2026-72071, CVE-2026-72072, CVE-2026-72083, CVE-2026-72084, CVE-2026-72096, CVE-2026-72097, CVE-2026-72099, CVE-2026-72100, CVE-2026-72102, CVE-2026-72105, CVE-2026-72106, CVE-2026-72108, CVE-2026-72110, CVE-2026-72120, CVE-2026-72122, CVE-2026-72123, CVE-2026-72127, CVE-2026-72132, CVE-2026-72135, CVE-2026-72136, CVE-2026-72138, CVE-2026-72151, CVE-2026-72152, CVE-2026-72155, CVE-2026-72172, CVE-2026-72174, CVE-2026-72176, CVE-2026-72177, CVE-2026-72178, CVE-2026-72191, CVE-2026-72192, CVE-2026-72193, CVE-2026-72194, CVE-2026-72195, CVE-2026-72196, CVE-2026-72197, CVE-2026-72212, CVE-2026-72217, CVE-2026-72218, CVE-2026-72219, CVE-2026-72221, CVE-2026-72222, CVE-2026-72223, CVE-2026-72224, CVE-2026-72225, CVE-2026-72227, CVE-2026-72242, CVE-2026-72243, CVE-2026-72247, CVE-2026-72250, CVE-2026-72251, CVE-2026-72252, CVE-2026-72255, CVE-2026-72256, CVE-2026-72266, CVE-2026-72273, CVE-2026-72274, CVE-2026-72275, CVE-2026-72276, CVE-2026-72280, CVE-2026-72282, CVE-2026-72284, CVE-2026-72286, CVE-2026-72289, CVE-2026-72290, CVE-2026-72296, CVE-2026-72310, CVE-2026-72317, CVE-2026-72318, CVE-2026-72319, CVE-2026-72320, CVE-2026-72322, CVE-2026-72323, CVE-2026-72325, CVE-2026-72326, CVE-2026-72330, CVE-2026-72338, CVE-2026-72342, CVE-2026-72343, CVE-2026-72347, CVE-2026-72348, CVE-2026-72349, CVE-2026-72350, CVE-2026-72351, CVE-2026-72352, CVE-2026-72356, CVE-2026-72364, CVE-2026-72379, CVE-2026-72389, CVE-2026-72390, CVE-2026-72392, CVE-2026-72400, CVE-2026-72405, CVE-2026-72416, CVE-2026-72418, CVE-2026-72419, CVE-2026-72420, CVE-2026-72421, CVE-2026-72425, CVE-2026-72427, CVE-2026-72428, CVE-2026-72433, CVE-2026-72434, CVE-2026-72435, CVE-2026-72436, CVE-2026-72437, CVE-2026-72444, CVE-2026-72447, CVE-2026-72450, CVE-2026-72451, CVE-2026-72452, CVE-2026-72466, CVE-2026-72470, CVE-2026-72472, CVE-2026-72476, CVE-2026-72478, CVE-2026-72487, CVE-2026-72502, CVE-2026-74255, CVE-2026-74256, CVE-2026-74259, CVE-2026-74262, CVE-2026-74267, CVE-2026-74270, CVE-2026-74271, CVE-2026-74281, CVE-2026-74282, CVE-2026-74283, CVE-2026-74284, CVE-2026-74286, CVE-2026-74287, CVE-2026-74288, CVE-2026-74290, CVE-2026-74296, CVE-2026-74297, CVE-2026-74305, CVE-2026-74307, CVE-2026-74308, CVE-2026-74310, CVE-2026-74316, CVE-2026-74318, CVE-2026-74321, CVE-2026-74327, CVE-2026-74329, CVE-2026-74330, CVE-2026-74331, CVE-2026-74346, CVE-2026-74356, CVE-2026-74359, CVE-2026-74363, CVE-2026-74365, CVE-2026-74376, CVE-2026-74379, CVE-2026-74380, CVE-2026-74382, CVE-2026-74384, CVE-2026-74393, CVE-2026-74395, CVE-2026-74397, CVE-2026-74398, CVE-2026-74399, CVE-2026-74406, CVE-2026-74417, CVE-2026-74424, CVE-2026-74439, CVE-2026-74578, CVE-2026-80598, CVE-2026-80602, CVE-2026-80603, CVE-2026-80604, CVE-2026-80611, CVE-2026-80613, CVE-2026-80620, CVE-2026-80630, CVE-2026-80636, CVE-2026-80637, CVE-2026-80646, CVE-2026-80664, CVE-2026-80667, CVE-2026-80669, CVE-2026-80676, CVE-2026-80677, CVE-2026-80865, CVE-2026-80867, CVE-2026-80875, CVE-2026-80876, CVE-2026-80880
+        </description>
+        <pubDate>Mon, 17 Aug 2026 20:50:00 GMT</pubDate>
+        <lastBuildDate>Wed, 09 Sep 2026 02:08:00 GMT</lastBuildDate>
+        <guid>https://alas.aws.amazon.com/AL2023/ALAS2023-2026-2057.html</guid>
+        <link>https://alas.aws.amazon.com/AL2023/ALAS2023-2026-2057.html</link>
+    </item>
+</channel>
+</rss>

@@ -33,6 +33,7 @@ pub mod hybrid_email;
 pub mod hybrid_install;
 pub mod hybrid_jira;
 pub mod hybrid_support;
+pub mod infra_security;
 pub mod infrastructure;
 pub mod install_progress;
 pub mod installation_owner;

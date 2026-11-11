@@ -71,6 +71,9 @@ pub mod git_conventions;
 /// granted and does without otherwise.
 pub mod github_grants;
 pub mod github_wait;
+/// Infrastructure vulnerabilities: public AWS feeds, a team's AWS inventory,
+/// and matching by version (no model calls).
+pub mod infra_vuln;
 pub mod live;
 /// Log findings and the fix runs started from them.
 pub mod log_findings;
