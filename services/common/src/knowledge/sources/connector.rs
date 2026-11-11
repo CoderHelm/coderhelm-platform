@@ -111,9 +111,13 @@ pub struct Listing {
     /// Where the next listing starts (opaque, the connector's own).
     #[serde(default)]
     pub cursor: String,
-    /// More items exist than a source keeps.
+    /// More items exist than the source keeps ([`Source::limit`]).
     #[serde(default)]
     pub truncated: bool,
+    /// Items the selection covers, when the provider can count them (more
+    /// than were listed when `truncated`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total: Option<u64>,
     /// With `complete`: external id prefixes this listing didn't cover in
     /// full (listed only from a cursor, or not read this time). Stored items
     /// under them stay unless named in `deleted`.
@@ -235,10 +239,12 @@ pub trait Connector: Send + Sync {
 
 // ── HTTP shared by the connectors ───────────────────────────────────────────
 
-/// Retries a rate-limited request this many times before giving up.
+/// Retries a rate-limited request this many times before giving up (the
+/// sync then pauses and continues where it stopped).
 const MAX_RETRIES: usize = 3;
-/// Longest wait between retries.
-const MAX_WAIT_SECS: u64 = 10;
+/// Longest wait between retries: a provider's `Retry-After` is honoured up
+/// to this; longer waits pause the sync instead of holding a worker.
+const MAX_WAIT_SECS: u64 = 30;
 
 /// Sends `req`; a 429 or 503 is retried after the provider's
 /// `Retry-After` (capped). Anything outside 2xx becomes a

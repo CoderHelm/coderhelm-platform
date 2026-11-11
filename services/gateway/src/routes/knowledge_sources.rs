@@ -154,7 +154,7 @@ pub fn source_json(s: &Source, now: i64) -> Value {
         "id": s.id,
         "kind": s.kind_key(),
         "label": s.kind.map(Kind::label).unwrap_or(""),
-        "name": s.name,
+        "name": shown_name(s),
         "selection": s.selection,
         "options": public_options(&s.options),
         "paused": s.paused,
@@ -165,6 +165,11 @@ pub fn source_json(s: &Source, now: i64) -> Value {
         "failed_items": s.failed_items,
         "skipped_items": s.skipped_items,
         "truncated": s.truncated,
+        "total": s.total,
+        "listed": s.listed,
+        "item_limit": s.limit(),
+        "limit_reason": if s.truncated { s.limit_reason.as_str() } else { "" },
+        "estimate": if status == Status::Approval { serde_json::to_value(&s.estimate).unwrap_or(Value::Null) } else { Value::Null },
         "last_sync_at": s.last_sync_at,
         "last_success_at": s.last_success_at,
         "next_sync_at": if s.paused { String::new() } else { ts(s.next_sync_at) },
@@ -887,6 +892,17 @@ pub struct SourceInput {
 
 /// The name a source gets when none is given: what was picked.
 pub fn suggested_name(kind: Kind, sel: &[Selected]) -> String {
+    if kind == Kind::Sanity {
+        if let Some(n) = sanity_name(sel) {
+            return n;
+        }
+    }
+    old_suggested_name(kind, sel)
+}
+
+/// The name sources were given before Sanity sources were named by their
+/// project ("production and 3 more").
+fn old_suggested_name(kind: Kind, sel: &[Selected]) -> String {
     match sel {
         [] => kind.label().to_string(),
         [one] => common::truncate_str(&one.title, 80).to_string(),
@@ -895,6 +911,99 @@ pub fn suggested_name(kind: Kind, sel: &[Selected]) -> String {
             common::truncate_str(&first.title, 60),
             rest.len()
         ),
+    }
+}
+
+/// A Sanity source's name from its project and datasets: "Acme Sanity:
+/// production, staging +2". The project is named by its title (the first
+/// entry of a pick's path in the picker), else its id; a source reading
+/// several projects lists the projects instead. `None` for a pick that
+/// isn't Sanity's.
+pub fn sanity_name(sel: &[Selected]) -> Option<String> {
+    // (project id, its title, datasets in pick order)
+    let mut projects: Vec<(String, String, Vec<String>)> = Vec::new();
+    for s in sel {
+        let (project, dataset) = match sanity_mcp::parse_ref(&s.id) {
+            Some(sanity_mcp::Ref::Dataset { project, dataset })
+            | Some(sanity_mcp::Ref::Type {
+                project, dataset, ..
+            }) => (project.to_string(), dataset.to_string()),
+            // A token source's ids carry no project.
+            _ => match sanity::split_id(&s.id) {
+                Some((ds, _)) => (String::new(), ds.to_string()),
+                None => return None,
+            },
+        };
+        let title = s
+            .path
+            .first()
+            .map(|t| t.trim())
+            .filter(|t| !t.is_empty() && *t != dataset)
+            .unwrap_or("")
+            .to_string();
+        match projects.iter_mut().find(|p| p.0 == project) {
+            Some(p) => {
+                if p.1.is_empty() {
+                    p.1 = title;
+                }
+                if !p.2.contains(&dataset) {
+                    p.2.push(dataset);
+                }
+            }
+            None => projects.push((project, title, vec![dataset])),
+        }
+    }
+    let label = |p: &(String, String, Vec<String>)| {
+        let base = if !p.1.is_empty() {
+            p.1.clone()
+        } else {
+            p.0.clone()
+        };
+        if base.is_empty() {
+            "Sanity".to_string()
+        } else if base.to_lowercase().contains("sanity") {
+            base
+        } else {
+            format!("{base} Sanity")
+        }
+    };
+    let list = |names: &[String]| match names {
+        [] => String::new(),
+        [a] => a.clone(),
+        [a, b] => format!("{a}, {b}"),
+        [a, b, rest @ ..] => format!("{a}, {b} +{}", rest.len()),
+    };
+    let name = match projects.as_slice() {
+        [] => return None,
+        [one] => format!("{}: {}", label(one), list(&one.2)),
+        many => {
+            let titles: Vec<String> = many
+                .iter()
+                .map(|p| {
+                    if p.1.is_empty() {
+                        p.0.clone()
+                    } else {
+                        p.1.clone()
+                    }
+                })
+                .collect();
+            format!("Sanity: {}", list(&titles))
+        }
+    };
+    Some(common::truncate_str(&name, 80).to_string())
+}
+
+/// The name a source shows: its own, unless it is still the old default
+/// for a Sanity pick, which now reads by project.
+pub fn shown_name(s: &Source) -> String {
+    match s.kind {
+        Some(Kind::Sanity)
+            if s.selection.len() > 1
+                && s.name == old_suggested_name(Kind::Sanity, &s.selection) =>
+        {
+            sanity_name(&s.selection).unwrap_or_else(|| s.name.clone())
+        }
+        _ => s.name.clone(),
     }
 }
 
@@ -1497,7 +1606,10 @@ pub async fn sync_source(
     )
     .await
     .map_err(|e| internal("start knowledge sync", e))?;
-    if shown_status(&src, now_secs()) != Status::Syncing {
+    if !matches!(
+        shown_status(&src, now_secs()),
+        Status::Syncing | Status::Approval
+    ) {
         src.status = Status::Syncing;
         src.progress = Some(ks::Progress {
             phase: "listing".into(),
@@ -1573,6 +1685,180 @@ pub async fn retry_items(
     ))
 }
 
+/// POST /api/knowledge/:kb_id/sources/:source_id/approve — an admin starts
+/// a large first sync after seeing its embedding estimate. Refused when the
+/// estimate is more than the team has left under its monthly token limit.
+pub async fn approve_source(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Path((kb_id, source_id)): Path<(String, String)>,
+) -> Reply {
+    claims.require_role(3).map_err(forbidden)?;
+    let src = load_source(&state, &claims.team_id, &kb_id, &source_id).await?;
+    let room = ks::limits::token_room(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        &state.config.analytics_table_name,
+        &claims.team_id,
+    )
+    .await;
+    if let Some(m) = approval_refused(src.estimate.as_ref(), room) {
+        return Err(fail(StatusCode::BAD_REQUEST, &m));
+    }
+    use common::knowledge::sources::store::SyncStore;
+    let st = sync_store(&state);
+    // Onto the record as it is now (a sync may hold it), so only these
+    // fields change.
+    let mut fresh = load_source(&state, &claims.team_id, &kb_id, &source_id).await?;
+    fresh.approved_at = now_secs();
+    if fresh.status == Status::Approval {
+        fresh.status = Status::Queued;
+    }
+    fresh.next_sync_at = now_secs();
+    st.put_source(&claims.team_id, &fresh)
+        .await
+        .map_err(|e| internal("approve knowledge source", e))?;
+    st.put_registry(&claims.team_id, &fresh)
+        .await
+        .map_err(|e| internal("register knowledge source", e))?;
+    if let Err(e) = start_sync(
+        &state,
+        &claims.team_id,
+        &kb_id,
+        &source_id,
+        ks::trigger::MANUAL,
+    )
+    .await
+    {
+        warn!(error = %e, "Approved knowledge sync not started; the sweep starts it");
+    }
+    info!(team = %claims.team_id, kb = %kb_id, source = %source_id, tokens = src.estimate.as_ref().map(|e| e.tokens).unwrap_or(0), "Large knowledge sync started");
+    Ok(Json(json!({ "source": source_json(&fresh, now_secs()) })))
+}
+
+/// Why a large first sync can't start now: its estimate is more than the
+/// tokens left this month.
+pub fn approval_refused(
+    estimate: Option<&ks::Estimate>,
+    room: Option<ks::limits::TokenRoom>,
+) -> Option<String> {
+    let (e, r) = (estimate?, room?);
+    (e.tokens > r.left).then(|| {
+        format!(
+            "This sync needs about {} embedding tokens and {} are left of your team's monthly token limit. Raise the limit in Settings, or lower this source's limit so it brings in fewer items.",
+            common::token_limits::short_tokens(e.tokens),
+            common::token_limits::short_tokens(r.left)
+        )
+    })
+}
+
+/// The knowledge settings as the page shows them.
+pub fn settings_json(
+    s: &ks::limits::Settings,
+    room: Option<ks::limits::TokenRoom>,
+    can_edit: bool,
+) -> Value {
+    json!({
+        "items_per_source": s.items_per_source(),
+        "default_items_per_source": ks::DEFAULT_ITEMS_PER_SOURCE,
+        "min_items_per_source": ks::MIN_ITEMS_PER_SOURCE,
+        "max_items_per_source": ks::MAX_ITEMS_PER_SOURCE,
+        "items_per_base": ks::MAX_ITEMS_PER_BASE,
+        "large_sync_items": ks::LARGE_SYNC_ITEMS,
+        "embedding": {
+            "model": common::embed::TITAN_V2,
+            "usd_per_million_tokens": ks::limits::usd_per_million(),
+            "tokens_per_item": ks::limits::TOKENS_PER_ITEM,
+        },
+        "token_budget": room.map(|r| json!({ "limit": r.limit, "used": r.used, "left": r.left })),
+        "updated_at": s.updated_at,
+        "updated_by": s.updated_by,
+        "can_edit": can_edit,
+    })
+}
+
+async fn settings_reply(state: &AppState, claims: &Claims, s: &ks::limits::Settings) -> Value {
+    let room = ks::limits::token_room(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        &state.config.analytics_table_name,
+        &claims.team_id,
+    )
+    .await;
+    settings_json(s, room, claims.require_role(3).is_ok())
+}
+
+/// GET /api/knowledge/settings — how many items a source keeps, what
+/// embedding costs, and the team's token budget.
+pub async fn get_settings(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+) -> Reply {
+    let s = ks::limits::load(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        &claims.team_id,
+    )
+    .await
+    .map_err(|e| internal("knowledge settings", e))?;
+    Ok(Json(settings_reply(&state, &claims, &s).await))
+}
+
+#[derive(Deserialize)]
+pub struct SettingsInput {
+    pub items_per_source: i64,
+}
+
+/// PUT /api/knowledge/settings — admins set how many items a source keeps.
+/// Sources that hold less than their selection covers sync again now, so
+/// a raised limit brings the rest in.
+pub async fn put_settings(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Json(input): Json<SettingsInput>,
+) -> Reply {
+    claims.require_role(3).map_err(forbidden)?;
+    let n = ks::limits::check_items(input.items_per_source)
+        .map_err(|m| fail(StatusCode::BAD_REQUEST, &m))?;
+    let table = &state.config.settings_table_name;
+    let mut s = ks::limits::load(&state.dynamo, table, &claims.team_id)
+        .await
+        .map_err(|e| internal("knowledge settings", e))?;
+    let raised = n > s.items_per_source();
+    s.items_per_source = n;
+    s.updated_at = now();
+    s.updated_by = claims.email.clone();
+    ks::limits::save(&state.dynamo, table, &claims.team_id, &s)
+        .await
+        .map_err(|e| internal("save knowledge settings", e))?;
+    if raised {
+        let all = store::team_sources(&state.dynamo, table, &claims.team_id)
+            .await
+            .unwrap_or_default();
+        use common::knowledge::sources::store::SyncStore;
+        let st = sync_store(&state);
+        for mut src in all.into_iter().filter(|s| s.truncated && !s.paused) {
+            // Only the schedule changes; the source's record stays as its
+            // sync left it.
+            src.next_sync_at = now_secs();
+            let _ = st.put_registry(&claims.team_id, &src).await;
+            if let Err(e) = start_sync(
+                &state,
+                &claims.team_id,
+                &src.kb_id,
+                &src.id,
+                ks::trigger::EDITED,
+            )
+            .await
+            {
+                warn!(error = %e, "Knowledge sync after a raised limit not started; the sweep starts it");
+            }
+        }
+    }
+    info!(team = %claims.team_id, items_per_source = n, "Knowledge settings saved");
+    Ok(Json(settings_reply(&state, &claims, &s).await))
+}
+
 /// Removes every trace of a source: its items and their indexes, its
 /// webhook (here and, for Sanity, in the project), its schedule, its record.
 pub(crate) async fn remove_source(
@@ -1586,6 +1872,12 @@ pub(crate) async fn remove_source(
     for f in &items {
         st.delete_item(team, f).await?;
     }
+    // Its search pack and any sync still in progress.
+    for k in kb::pack::keys(team, &src.kb_id, &src.id, &src.pack) {
+        st.delete_object(team, &k).await;
+    }
+    st.delete_object(team, &ks::pending::key(team, &src.kb_id, &src.id))
+        .await;
     if src.kind == Some(Kind::Archive) {
         // Every upload of the archive goes too.
         let v = src.options["version"]
@@ -2117,5 +2409,158 @@ mod tests {
         }
         assert!(switchable(Kind::Notion) && switchable(Kind::Confluence));
         assert!(!switchable(Kind::Sanity) && !switchable(Kind::GoogleDrive));
+    }
+
+    fn pick(id: &str, path: &[&str]) -> Selected {
+        Selected {
+            id: id.into(),
+            title: id.rsplit(':').next().unwrap_or(id).into(),
+            kind: "dataset".into(),
+            path: path.iter().map(|p| p.to_string()).collect(),
+            include_children: true,
+        }
+    }
+
+    #[test]
+    fn a_multi_dataset_sanity_source_is_named_by_its_project() {
+        let sel = vec![
+            pick("dataset:abc123:production", &["Acme"]),
+            pick("dataset:abc123:staging", &["Acme"]),
+            pick("dataset:abc123:blog", &["Acme"]),
+            pick("type:abc123:docs:article", &["Acme", "docs"]),
+        ];
+        assert_eq!(
+            suggested_name(Kind::Sanity, &sel),
+            "Acme Sanity: production, staging +2"
+        );
+        // No project title: its id; two datasets: both named.
+        assert_eq!(
+            suggested_name(
+                Kind::Sanity,
+                &sel[..2]
+                    .iter()
+                    .map(|s| Selected {
+                        path: vec![],
+                        ..s.clone()
+                    })
+                    .collect::<Vec<_>>()
+            ),
+            "abc123 Sanity: production, staging"
+        );
+        // A title that already says Sanity isn't doubled.
+        assert_eq!(
+            suggested_name(
+                Kind::Sanity,
+                &[pick("dataset:abc123:production", &["Acme Sanity"])]
+            ),
+            "Acme Sanity: production"
+        );
+        // Several projects: the projects.
+        assert_eq!(
+            suggested_name(
+                Kind::Sanity,
+                &[
+                    pick("dataset:abc123:production", &["Acme"]),
+                    pick("dataset:def456:production", &["Blog"])
+                ]
+            ),
+            "Sanity: Acme, Blog"
+        );
+        // A token source (no project in its ids).
+        assert_eq!(
+            suggested_name(
+                Kind::Sanity,
+                &[
+                    pick("dataset:production", &[]),
+                    pick("dataset:staging", &[])
+                ]
+            ),
+            "Sanity: production, staging"
+        );
+        // Other apps keep their names.
+        assert_eq!(
+            suggested_name(Kind::Notion, &[pick("page:a", &[]), pick("page:b", &[])]),
+            "a and 1 more"
+        );
+        // A source still named the old way shows the new name.
+        let src = Source {
+            kind: Some(Kind::Sanity),
+            name: "production and 3 more".into(),
+            selection: sel.clone(),
+            ..Default::default()
+        };
+        assert_eq!(shown_name(&src), "Acme Sanity: production, staging +2");
+        let renamed = Source {
+            name: "Marketing site".into(),
+            ..src
+        };
+        assert_eq!(shown_name(&renamed), "Marketing site");
+    }
+
+    #[test]
+    fn a_large_first_sync_is_refused_only_past_the_tokens_left() {
+        let e = ks::Estimate {
+            items: 4_812,
+            tokens: 3_900_000,
+            usd: 0.08,
+            ..Default::default()
+        };
+        let room = |left| {
+            Some(ks::limits::TokenRoom {
+                limit: 10_000_000,
+                used: 10_000_000 - left,
+                left,
+            })
+        };
+        assert_eq!(approval_refused(Some(&e), None), None, "no limit");
+        assert_eq!(approval_refused(Some(&e), room(5_000_000)), None);
+        let m = approval_refused(Some(&e), room(1_200_000)).unwrap();
+        assert!(m.contains("3.9M") && m.contains("1.2M"), "{m}");
+        assert_eq!(approval_refused(None, room(0)), None);
+    }
+
+    #[test]
+    fn the_source_and_its_settings_show_real_numbers() {
+        let s = Source {
+            kind: Some(Kind::Sanity),
+            status: Status::Syncing,
+            lease_until: i64::MAX,
+            items: 265,
+            total: Some(4_812),
+            listed: 4_812,
+            truncated: false,
+            limit_reason: "source".into(),
+            progress: Some(ks::Progress {
+                phase: "fetching".into(),
+                done: 265,
+                total: 4_812,
+            }),
+            ..Default::default()
+        };
+        let j = source_json(&s, 0);
+        assert_eq!(
+            (j["items"].as_u64(), j["total"].as_u64()),
+            (Some(265), Some(4_812))
+        );
+        assert_eq!(j["item_limit"], ks::DEFAULT_ITEMS_PER_SOURCE);
+        assert_eq!(j["limit_reason"], "", "not over its limit");
+        assert_eq!(j["progress"]["total"], 4_812);
+        let full = Source {
+            truncated: true,
+            item_limit: Some(30_000),
+            limit_reason: "base".into(),
+            ..s
+        };
+        let j = source_json(&full, 0);
+        assert_eq!(
+            (j["item_limit"].as_u64(), j["limit_reason"].as_str()),
+            (Some(30_000), Some("base"))
+        );
+        let set = settings_json(&ks::limits::Settings::default(), None, false);
+        assert_eq!(set["items_per_source"], 50_000);
+        assert_eq!(set["max_items_per_source"], 100_000);
+        assert_eq!(set["can_edit"], false);
+        assert!(set["token_budget"].is_null());
+        assert!(set["embedding"]["usd_per_million_tokens"].as_f64().unwrap() > 0.0);
     }
 }

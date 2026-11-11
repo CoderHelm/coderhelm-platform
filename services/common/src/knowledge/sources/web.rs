@@ -187,14 +187,14 @@ impl Connector for Web<'_> {
                 });
             }
         }
-        let truncated = items.len() > super::MAX_ITEMS_PER_SOURCE;
-        items.truncate(super::MAX_ITEMS_PER_SOURCE);
+        let (truncated, found) = super::keep_within(&mut items, source.limit());
         Ok(Listing {
             items,
             deleted: Vec::new(),
             complete: complete && !truncated,
             cursor: String::new(),
             truncated,
+            total: complete.then_some(found),
             ..Default::default()
         })
     }

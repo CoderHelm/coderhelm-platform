@@ -22,8 +22,15 @@ use super::{text, Kind, Source};
 use crate::live::confluence::storage_to_text;
 use crate::mcp_remote::http::{Http, HttpRequest, Limit};
 
-/// Pages listed per space at most (250 per call).
-const MAX_CALLS_PER_SPACE: usize = 40;
+/// Pages the picker reads of one space to show its tree (250 a call).
+const BROWSE_CALLS: usize = 40;
+
+/// Space listing calls one sync makes at most (250 pages each): enough for
+/// the source's limit, plus one to see there is more. Real only as time:
+/// each call is one request against Confluence's rate limit.
+fn list_calls(limit: usize) -> usize {
+    limit.div_ceil(250) + 1
+}
 
 pub struct Confluence<'a> {
     pub http: &'a dyn Http,
@@ -223,8 +230,13 @@ impl Confluence<'_> {
         Ok(out)
     }
 
-    /// Every current page of a space.
-    pub async fn space_pages(&self, space: &str) -> Result<(Vec<Page>, bool), ConnectorError> {
+    /// Every current page of a space, reading at most `max_calls` pages of
+    /// results (`false`: there were more).
+    pub async fn space_pages(
+        &self,
+        space: &str,
+        max_calls: usize,
+    ) -> Result<(Vec<Page>, bool), ConnectorError> {
         let mut out = Vec::new();
         let mut path = Some(format!(
             "/wiki/api/v2/spaces/{space}/pages?limit=250&status=current"
@@ -232,7 +244,7 @@ impl Confluence<'_> {
         let mut calls = 0;
         while let Some(p) = path.take() {
             calls += 1;
-            if calls > MAX_CALLS_PER_SPACE {
+            if calls > max_calls {
                 return Ok((out, false));
             }
             let v = send_json(self.http, self.get(&p), "Confluence").await?;
@@ -367,7 +379,7 @@ impl Connector for Confluence<'_> {
                 Ok(out)
             }
             Some(("space", space, _)) => {
-                let (pages, complete) = self.space_pages(space).await?;
+                let (pages, complete) = self.space_pages(space, BROWSE_CALLS).await?;
                 let ids: HashSet<&str> = pages.iter().map(|p| p.id.as_str()).collect();
                 let counts = Counts::new(&pages);
                 // The space's top pages: those whose parent isn't a page of it,
@@ -424,7 +436,7 @@ impl Connector for Confluence<'_> {
         let mut items: Vec<Listed> = Vec::new();
         let mut complete = true;
         for (space, whole, picks) in &spaces {
-            let (pages, all) = match self.space_pages(space).await {
+            let (pages, all) = match self.space_pages(space, list_calls(source.limit())).await {
                 Ok(p) => p,
                 // A space that is gone (or no longer visible) covers nothing.
                 Err(ConnectorError::NotFound(_)) | Err(ConnectorError::Forbidden(_)) => {
@@ -445,14 +457,15 @@ impl Connector for Confluence<'_> {
                 });
             }
         }
-        let truncated = items.len() > super::MAX_ITEMS_PER_SOURCE;
-        items.truncate(super::MAX_ITEMS_PER_SOURCE);
+        let (cut, found) = super::keep_within(&mut items, source.limit());
         Ok(Listing {
             items,
             deleted: Vec::new(),
-            complete: complete && !truncated,
+            complete: complete && !cut,
             cursor: String::new(),
-            truncated,
+            // A space read only in part may hold picked pages not listed.
+            truncated: cut || !complete,
+            total: (complete && !cut).then_some(found),
             ..Default::default()
         })
     }
@@ -688,5 +701,67 @@ mod tests {
         assert_eq!(split_id("page:5@77"), Some(("page", "5", "77")));
         assert_eq!(split_id("page:5"), None);
         assert_eq!(split_id("space:../x"), None);
+    }
+
+    /// A space of 3,000 pages, 250 a call: every one is listed (no cap at
+    /// 1,000), a lower limit reads only what it needs and says it holds
+    /// less, and a re-listing finds which page changed by its version.
+    #[tokio::test]
+    async fn a_big_space_lists_past_a_thousand_pages_and_only_changed_pages_are_fetched_again() {
+        let http = Fake::default();
+        let version = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(1));
+        let v = version.clone();
+        http.with(move |r| {
+            if !r.url.contains("/spaces/77/pages") {
+                return None;
+            }
+            let at: usize = r.url.split("cursor=").nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
+            let end = (at + 250).min(3_000);
+            let results: Vec<Value> = (at..end)
+                .map(|i| {
+                    let ver = if i == 42 { v.load(std::sync::atomic::Ordering::SeqCst) } else { 1 };
+                    pg(&format!("{}", 1_000 + i), &format!("Page {i}"), "", ver)
+                })
+                .collect();
+            let links = if end < 3_000 {
+                json!({"next": format!("/wiki/api/v2/spaces/77/pages?limit=250&status=current&cursor={end}")})
+            } else {
+                json!({})
+            };
+            Some(fjson(200, json!({"results": results, "_links": links})))
+        });
+        let c = conn(&http);
+        let whole = source(&[("space:77", true)]);
+        let l = c.list(&whole).await.unwrap();
+        assert_eq!(l.items.len(), 3_000);
+        assert!(l.complete && !l.truncated);
+        assert_eq!(l.total, Some(3_000));
+        assert_eq!(http.sent().len(), 12);
+        // Stored as listed; one page is edited: only it is planned again.
+        let stored: Vec<crate::knowledge::FileMeta> = l
+            .items
+            .iter()
+            .map(|i| crate::knowledge::FileMeta {
+                external_id: i.external_id.clone(),
+                remote_version: i.version.clone(),
+                status: crate::knowledge::FileStatus::Ready,
+                ready_version: 1,
+                ..Default::default()
+            })
+            .collect();
+        version.store(2, std::sync::atomic::Ordering::SeqCst);
+        let again = c.list(&whole).await.unwrap();
+        let plan = crate::knowledge::sources::plan_sync(&stored, &again);
+        let fetch: Vec<&str> = plan.fetch.iter().map(|i| i.external_id.as_str()).collect();
+        assert_eq!(fetch, ["1042"]);
+        assert!(plan.remove.is_empty());
+        // A limit of 1,000 reads five calls and says the space holds more.
+        let mut small = whole.clone();
+        small.item_limit = Some(1_000);
+        let before = http.sent().len();
+        let l = c.list(&small).await.unwrap();
+        assert_eq!(l.items.len(), 1_000);
+        assert!(l.truncated && !l.complete);
+        assert_eq!(http.sent().len() - before, 5);
     }
 }

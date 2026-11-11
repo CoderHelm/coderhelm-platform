@@ -182,7 +182,26 @@ pub trait Store: Send + Sync {
     async fn files(&self, team_id: &str, kb_id: &str) -> Result<Vec<FileMeta>, String>;
     /// The index at `key`, which must be inside the team's folder.
     async fn index(&self, team_id: &str, key: &str) -> Result<Arc<Index>, String>;
+    /// The search packs of one base's synced sources ([`super::pack`]):
+    /// per source, its shard keys. None by default (every file is ranked
+    /// from its own index).
+    async fn packs(&self, _team_id: &str, _kb_id: &str) -> Result<Vec<PackRef>, String> {
+        Ok(Vec::new())
+    }
+    /// The pack shard at `key`, which must be inside the team's folder.
+    async fn pack_shard(&self, _team_id: &str, _key: &str) -> Result<Arc<Shard>, String> {
+        Err("no search packs here".into())
+    }
 }
+
+/// One synced source's search pack.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PackRef {
+    pub source_id: String,
+    pub keys: Vec<String>,
+}
+
+pub use super::pack::Shard;
 
 /// Searches a base connected in place ([`super::Backend::Remote`]) where it
 /// lives: the provider ranks, Coderhelm only merges. Takes the team, like
@@ -284,6 +303,9 @@ pub const CACHE_BYTES: usize = 160 * 1024 * 1024;
 pub const CACHE_ENTRIES: usize = 4_096;
 /// Indexes read at once for one search.
 pub const LOAD_CONCURRENCY: usize = 16;
+/// Memory cached pack shards may take in one process: a 50,000 item
+/// source's pack (about 43 MB) stays whole.
+pub const PACK_CACHE_BYTES: usize = 48 * 1024 * 1024;
 
 /// About how much memory an index takes.
 pub fn index_bytes(i: &Index) -> usize {
@@ -348,6 +370,55 @@ fn cache() -> &'static Mutex<IndexCache> {
     C.get_or_init(|| Mutex::new(IndexCache::default()))
 }
 
+/// Pack shards kept in memory, least recently used first out. A key names
+/// one shard version, so a cached shard is never stale.
+#[derive(Default)]
+struct PackCache {
+    map: HashMap<String, (Arc<Shard>, usize, u64)>,
+    bytes: usize,
+    tick: u64,
+}
+
+impl PackCache {
+    fn get(&mut self, key: &str) -> Option<Arc<Shard>> {
+        self.tick += 1;
+        let tick = self.tick;
+        self.map.get_mut(key).map(|e| {
+            e.2 = tick;
+            e.0.clone()
+        })
+    }
+
+    fn put(&mut self, key: &str, shard: Arc<Shard>) {
+        let size = super::pack::shard_bytes(&shard);
+        if size > PACK_CACHE_BYTES {
+            return;
+        }
+        if let Some((_, old, _)) = self.map.remove(key) {
+            self.bytes -= old;
+        }
+        while !self.map.is_empty() && self.bytes + size > PACK_CACHE_BYTES {
+            let oldest = self
+                .map
+                .iter()
+                .min_by_key(|(_, e)| e.2)
+                .map(|(k, _)| k.clone())
+                .unwrap_or_default();
+            if let Some((_, b, _)) = self.map.remove(&oldest) {
+                self.bytes -= b;
+            }
+        }
+        self.tick += 1;
+        self.bytes += size;
+        self.map.insert(key.to_string(), (shard, size, self.tick));
+    }
+}
+
+fn pack_cache() -> &'static Mutex<PackCache> {
+    static C: OnceLock<Mutex<PackCache>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(PackCache::default()))
+}
+
 #[async_trait::async_trait]
 impl Store for AwsStore {
     async fn bases(&self, team_id: &str) -> Result<Vec<Base>, String> {
@@ -409,6 +480,50 @@ impl Store for AwsStore {
             c.put(key, index.clone(), CACHE_BYTES, CACHE_ENTRIES);
         }
         Ok(index)
+    }
+
+    async fn packs(&self, team_id: &str, kb_id: &str) -> Result<Vec<PackRef>, String> {
+        if !super::valid_id(kb_id) {
+            return Ok(Vec::new());
+        }
+        let sources =
+            super::sources::store::base_sources(&self.dynamo, &self.table, team_id, kb_id).await?;
+        Ok(sources
+            .into_iter()
+            .filter(|s| !s.pack.is_empty())
+            .map(|s| PackRef {
+                keys: super::pack::keys(team_id, kb_id, &s.id, &s.pack),
+                source_id: s.id,
+            })
+            .collect())
+    }
+
+    async fn pack_shard(&self, team_id: &str, key: &str) -> Result<Arc<Shard>, String> {
+        if !super::owns_key(team_id, key) {
+            return Err("that pack isn't this team's".into());
+        }
+        if let Some(hit) = pack_cache().lock().ok().and_then(|mut c| c.get(key)) {
+            return Ok(hit);
+        }
+        let obj = self
+            .s3
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(|e| format!("pack read: {e}"))?;
+        let bytes = obj
+            .body
+            .collect()
+            .await
+            .map_err(|e| format!("pack read: {e}"))?
+            .into_bytes();
+        let shard = Arc::new(super::pack::decode(&bytes)?);
+        if let Ok(mut c) = pack_cache().lock() {
+            c.put(key, shard.clone());
+        }
+        Ok(shard)
     }
 }
 
@@ -703,6 +818,7 @@ pub async fn search(
     }
     let mut files: Vec<(Base, FileMeta, String)> = Vec::new();
     let mut remote: Vec<Base> = Vec::new();
+    let mut pack_keys: Vec<String> = Vec::new();
     for id in kb_ids {
         let Some(base) = store.base(team_id, id).await? else {
             continue;
@@ -712,6 +828,12 @@ pub async fn search(
                 remote.push(base);
             }
             continue;
+        }
+        match store.packs(team_id, &base.id).await {
+            Ok(p) => pack_keys.extend(p.into_iter().flat_map(|p| p.keys)),
+            Err(e) => {
+                tracing::warn!(kb = %base.id, error = %e, "Knowledge packs unreadable; every file is read")
+            }
         }
         for f in store.files(team_id, &base.id).await? {
             if f.kb_id != base.id {
@@ -742,6 +864,7 @@ pub async fn search(
         let qv = embedder.embed(crate::truncate_str(query, 8_000)).await?;
         let mut loaded: Vec<(Base, FileMeta, Arc<Index>)> = Vec::new();
         let mut stale = Vec::new();
+        let files = shortlisted(store, embedder, team_id, &pack_keys, &files, &qv, query).await;
         // Many files at once (an import holds thousands), in a steady order.
         let mut read = Vec::with_capacity(files.len());
         for group in files.chunks(LOAD_CONCURRENCY) {
@@ -896,6 +1019,59 @@ pub async fn search(
     Ok(found)
 }
 
+/// The files to rank in full: every file a pack doesn't cover at its
+/// current version, and of the packed ones only those the packs shortlist
+/// for this question ([`super::pack::shortlist`]). Without packs, all of
+/// them.
+async fn shortlisted<'f>(
+    store: &dyn Store,
+    embedder: &dyn Embedder,
+    team_id: &str,
+    pack_keys: &[String],
+    files: &'f [(Base, FileMeta, String)],
+    qv: &[f32],
+    query: &str,
+) -> Vec<&'f (Base, FileMeta, String)> {
+    if pack_keys.is_empty() {
+        return files.iter().collect();
+    }
+    let mut shards: Vec<Arc<Shard>> = Vec::new();
+    for group in pack_keys.chunks(LOAD_CONCURRENCY) {
+        let got =
+            futures::future::join_all(group.iter().map(|k| store.pack_shard(team_id, k))).await;
+        for s in got {
+            match s {
+                Ok(s) if s.model == embedder.model() && s.dims as usize == qv.len() => {
+                    shards.push(s)
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, "Knowledge pack shard unreadable; its files are read one by one")
+                }
+            }
+        }
+    }
+    let current: HashMap<&str, u32> = files
+        .iter()
+        .map(|f| (f.1.id.as_str(), f.1.ready_version))
+        .collect();
+    let mut packed: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for s in &shards {
+        for it in &s.items {
+            if current.get(it.file_id.as_str()) == Some(&it.version) {
+                packed.insert(it.file_id.as_str());
+            }
+        }
+    }
+    let refs: Vec<&Shard> = shards.iter().map(Arc::as_ref).collect();
+    let wanted = |id: &str, v: u32| current.get(id) == Some(&v);
+    let short = super::pack::shortlist(&refs, qv, query, &wanted);
+    files
+        .iter()
+        .filter(|f| !packed.contains(f.1.id.as_str()) || short.contains(f.1.id.as_str()))
+        .collect()
+}
+
 /// An in-memory store and a word-hashing embedder, for tests here and in
 /// the services.
 pub mod testing {
@@ -907,6 +1083,11 @@ pub mod testing {
         pub bases: Mutex<HashMap<String, Vec<Base>>>,
         pub files: Mutex<HashMap<String, Vec<FileMeta>>>,
         pub indexes: Mutex<HashMap<String, Arc<Index>>>,
+        /// Search packs per base id.
+        pub packs: Mutex<HashMap<String, Vec<PackRef>>>,
+        pub shards: Mutex<HashMap<String, Arc<Shard>>>,
+        /// Index reads, for tests that count them.
+        pub index_reads: std::sync::atomic::AtomicUsize,
     }
 
     #[async_trait::async_trait]
@@ -941,12 +1122,34 @@ pub mod testing {
             if !crate::knowledge::owns_key(team_id, key) {
                 return Err("that index isn't this team's".into());
             }
+            self.index_reads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.indexes
                 .lock()
                 .unwrap()
                 .get(key)
                 .cloned()
                 .ok_or_else(|| "no index".into())
+        }
+        async fn packs(&self, _team_id: &str, kb_id: &str) -> Result<Vec<PackRef>, String> {
+            Ok(self
+                .packs
+                .lock()
+                .unwrap()
+                .get(kb_id)
+                .cloned()
+                .unwrap_or_default())
+        }
+        async fn pack_shard(&self, team_id: &str, key: &str) -> Result<Arc<Shard>, String> {
+            if !crate::knowledge::owns_key(team_id, key) {
+                return Err("that pack isn't this team's".into());
+            }
+            self.shards
+                .lock()
+                .unwrap()
+                .get(key)
+                .cloned()
+                .ok_or_else(|| "no shard".into())
         }
     }
 
@@ -1291,6 +1494,110 @@ mod tests {
         assert!(decode_index(&serde_json::to_vec(&other).unwrap())
             .unwrap_err()
             .contains("mixed models"));
+    }
+
+    #[tokio::test]
+    async fn a_packed_source_reads_only_its_shortlisted_items_and_still_finds_the_answer() {
+        use crate::knowledge::pack;
+        use std::sync::atomic::Ordering;
+        let store = MemoryStore::default();
+        let b = base("kb", "Docs");
+        for i in 0..3_000 {
+            let text = format!("Weekly report {i} for the marketing team");
+            store.add_file(
+                "t",
+                &b,
+                &format!("f{i}"),
+                &format!("Report {i}.md"),
+                "2026-01-01",
+                &[&text],
+            );
+        }
+        store.add_file(
+            "t",
+            &b,
+            "answer",
+            "Leave.md",
+            "2026-01-01",
+            &["Parental leave is sixteen weeks of paid time."],
+        );
+        // A newer version of one item than its pack entry: read in full.
+        store.add_file(
+            "t",
+            &b,
+            "changed",
+            "Changed.md",
+            "2026-01-01",
+            &["Parental leave policy changed this year."],
+        );
+        let mut shards: Vec<pack::Shard> = (0..pack::SHARDS)
+            .map(|_| pack::Shard {
+                model: TEST_MODEL.into(),
+                dims: 1024,
+                items: vec![],
+            })
+            .collect();
+        for f in store.files.lock().unwrap()["t"].iter() {
+            let key = f.searchable_index("t").unwrap();
+            let idx = store.indexes.lock().unwrap()[&key].clone();
+            let v = if f.id == "changed" {
+                0
+            } else {
+                f.ready_version
+            };
+            shards[pack::shard_of(&f.id)]
+                .items
+                .push(pack::sketch(&f.id, v, &idx));
+        }
+        let mut keys = Vec::new();
+        for (i, sh) in shards.into_iter().enumerate() {
+            let k = pack::shard_key("t", "kb", "src", i, 1);
+            store.shards.lock().unwrap().insert(k.clone(), Arc::new(sh));
+            keys.push(k);
+        }
+        store.packs.lock().unwrap().insert(
+            "kb".into(),
+            vec![PackRef {
+                source_id: "src".into(),
+                keys,
+            }],
+        );
+        store.index_reads.store(0, Ordering::SeqCst);
+        let found = search(
+            &store,
+            &WordEmbedder,
+            &FakeRetriever::default(),
+            "t",
+            &["kb".into()],
+            "parental leave weeks",
+            3,
+            now(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(found.hits[0].file_id, "answer", "{:?}", found.hits);
+        assert!(found.hits.iter().any(|h| h.file_id == "changed"));
+        let reads = store.index_reads.load(Ordering::SeqCst);
+        assert!(
+            reads <= 2 * pack::SHORTLIST + 1,
+            "{reads} index reads of 3,002 files"
+        );
+        // Without packs every file is read.
+        store.packs.lock().unwrap().clear();
+        store.index_reads.store(0, Ordering::SeqCst);
+        search(
+            &store,
+            &WordEmbedder,
+            &FakeRetriever::default(),
+            "t",
+            &["kb".into()],
+            "parental leave weeks",
+            3,
+            now(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(store.index_reads.load(Ordering::SeqCst), 3_002);
     }
 
     #[tokio::test]

@@ -14,8 +14,9 @@
 //! One index object per file version means a file's ingest never contends
 //! with another's, a delete is a prefix delete, and a new version replaces
 //! the old one only once it is ready. Search loads the indexes of the bases
-//! asked for (cached per version) and ranks passages in memory, which is
-//! comfortably fast at the limits below.
+//! asked for (cached per version) and ranks passages in memory; a big
+//! synced source also keeps a search pack ([`pack`]) so only its likely
+//! items' indexes are read.
 //!
 //! A base can instead be **connected in place** ([`Backend::Remote`]): an
 //! Amazon Bedrock knowledge base in the team's own AWS account ([`remote`]),
@@ -34,6 +35,7 @@ pub mod ask;
 pub mod bedrock_sync;
 pub mod chunk;
 pub mod extract;
+pub mod pack;
 pub mod remote;
 pub mod remote_mcp;
 pub mod search;

@@ -453,7 +453,7 @@ pub async fn open_as<'a>(
                     objects: Box::new(objects),
                     bucket: w.bucket,
                     region,
-                    max_items: Kind::S3.max_items(),
+                    max_items: usize::MAX,
                 }),
                 Via::AwsRole,
             )
@@ -475,7 +475,7 @@ pub async fn open_as<'a>(
                         bucket: a.bucket.clone(),
                         key,
                     }),
-                    Kind::Archive.max_items(),
+                    usize::MAX,
                 )),
                 Via::Upload,
             )
