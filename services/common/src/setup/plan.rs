@@ -466,6 +466,12 @@ mod tests {
         assert!(r["stale_prs.enabled"].evidence[0]
             .text
             .contains("would have marked 1 and closed 0"));
+        // The default timing: 7 days quiet, then 7 more after the warning.
+        assert!(r["stale_prs.enabled"].evidence[0]
+            .text
+            .contains("(7 days quiet, then 7)"));
+        assert_eq!(r["stale_prs.stale_days"].value, 7);
+        assert_eq!(r["stale_prs.close_days"].value, 7);
         // The cleanup only previews.
         assert_eq!(r["stale_prs.dry_run"].value, true);
         assert!(r["security.open_prs"]
