@@ -67,6 +67,24 @@ Parameters:
       Never Lambda function settings, launch template user data or
       environment variables.
 
+  InspectorFindings:
+    Type: String
+    Default: "off"
+    AllowedValues: ["off", "on"]
+    Description: >
+      "on" lets CoderHelm read Amazon Inspector's findings in this account
+      (read-only), when you run Inspector. Inspector is billed by AWS, about
+      $1.25 per instance a month, $0.09 per image scan and $0.30 per
+      function a month; CoderHelm never turns it on.
+
+  HealthEvents:
+    Type: String
+    Default: "off"
+    AllowedValues: ["off", "on"]
+    Description: >
+      "on" lets CoderHelm read this account's AWS Health events through the
+      Health API (read-only), which needs AWS Business Support or higher.
+
 Conditions:
   ReadsKnowledgeBases: !Not [!Equals [!Ref KnowledgeBases, ""]]
   ReadsEveryKnowledgeBase: !Equals [!Ref KnowledgeBases, "all"]
@@ -74,6 +92,8 @@ Conditions:
   SyncsKnowledgeBases: !Not [!Equals [!Ref SyncKnowledgeBases, ""]]
   SyncsEveryKnowledgeBase: !Equals [!Ref SyncKnowledgeBases, "all"]
   ReadsInfrastructure: !Equals [!Ref InfrastructureVulnerabilities, "on"]
+  ReadsInspector: !Equals [!Ref InspectorFindings, "on"]
+  ReadsHealth: !Equals [!Ref HealthEvents, "on"]
 
 Resources:
   CoderHelmReadOnlyUpdate:
@@ -294,4 +314,28 @@ Resources:
               Action:
                 - "ssm:GetParameters"
               Resource: "arn:aws:ssm:*::parameter/aws/service/*"
+            - !Ref AWS::NoValue
+          # Amazon Inspector's findings, only when InspectorFindings is "on" (the
+          # team runs Inspector and pays AWS for it). Read-only.
+          - !If
+            - ReadsInspector
+            - Sid: ReadInspectorFindings
+              Effect: Allow
+              Action:
+                - "inspector2:ListFindings"
+                - "inspector2:ListCoverage"
+                - "inspector2:BatchGetAccountStatus"
+              Resource: "*"
+            - !Ref AWS::NoValue
+          # AWS Health events, only when HealthEvents is "on" (the Health API needs
+          # Business Support or higher). Read-only.
+          - !If
+            - ReadsHealth
+            - Sid: ReadHealthEvents
+              Effect: Allow
+              Action:
+                - "health:DescribeEvents"
+                - "health:DescribeAffectedEntities"
+                - "health:DescribeEventDetails"
+              Resource: "*"
             - !Ref AWS::NoValue

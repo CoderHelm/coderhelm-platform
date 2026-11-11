@@ -1,0 +1,78 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Forwards this account's AWS Health events (security notifications,
+  scheduled maintenance, retirements) to an SQS queue that CoderHelm's
+  read-only CoderHelmLogReader role may read, for accounts without the AWS
+  Health API (which needs Business Support or higher). Rules see only this
+  account's own events. CoderHelm only receives messages from the queue: it
+  never deletes, sends or changes anything, and messages expire after 14
+  days. Delete this stack to stop.
+
+Parameters:
+  RoleName:
+    Type: String
+    Default: CoderHelmLogReader
+    Description: The CoderHelm role that reads the queue (do not change this value).
+    AllowedPattern: "^CoderHelmLogReader$"
+
+Resources:
+  HealthEventsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: coderhelm-health-events
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  HealthEventsQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref HealthEventsQueue
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: EventBridgeSendsHealthEvents
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: "sqs:SendMessage"
+            Resource: !GetAtt HealthEventsQueue.Arn
+            Condition:
+              ArnEquals:
+                "aws:SourceArn": !GetAtt HealthEventsRule.Arn
+
+  HealthEventsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: coderhelm-health-events
+      Description: AWS Health events for CoderHelm's infrastructure vulnerabilities (read-only).
+      EventPattern:
+        source:
+          - aws.health
+        detail-type:
+          - AWS Health Event
+      Targets:
+        - Arn: !GetAtt HealthEventsQueue.Arn
+          Id: CoderHelmHealthEvents
+
+  ReadHealthEvents:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: CoderHelmReadHealthEvents
+      Roles:
+        - !Ref RoleName
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          # Receive only: CoderHelm never deletes or sends a message.
+          - Sid: ReceiveHealthEvents
+            Effect: Allow
+            Action:
+              - "sqs:ReceiveMessage"
+              - "sqs:GetQueueUrl"
+            Resource: !GetAtt HealthEventsQueue.Arn
+
+Outputs:
+  QueueUrl:
+    Description: The queue CoderHelm reads.
+    Value: !Ref HealthEventsQueue

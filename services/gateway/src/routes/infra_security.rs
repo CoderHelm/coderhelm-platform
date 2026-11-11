@@ -16,6 +16,12 @@
 //!   account again now. Admin.
 //! - `POST /api/security/infrastructure/findings/{id}/fix` — open the fix
 //!   PR now, within the day's limits. Admin.
+//! - `GET`/`PUT /api/security/infrastructure/config` — the opt-in switches
+//!   (Amazon Inspector, AWS Health), with what each costs or needs. Saving
+//!   is Admin.
+//! - `GET /api/security/infrastructure/health-template` — the EventBridge
+//!   rule template that forwards an account's Health events, for accounts
+//!   without the Health API.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -160,7 +166,96 @@ pub fn resources_view_with(
     })
 }
 
+/// The CloudFormation template that forwards an account's AWS Health events
+/// to a queue the read-only role may read.
+pub const HEALTH_TEMPLATE: &str =
+    include_str!("../../../../infra/cfn/coderhelm-health-events.yaml");
+
+async fn load_infra_config(state: &AppState, team_id: &str) -> records::InfraConfig {
+    state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", AttributeValue::S(team_id.into()))
+        .key("sk", AttributeValue::S(records::CONFIG_SK.into()))
+        .send()
+        .await
+        .ok()
+        .and_then(|o| o.item().map(|i| json_of(i).to_string()))
+        .and_then(|j| serde_json::from_str(&j).ok())
+        .unwrap_or_default()
+}
+
+fn config_view(cfg: &records::InfraConfig) -> Value {
+    json!({
+        "config": cfg,
+        "inspector_cost": records::INSPECTOR_COST,
+        "health_plan": records::HEALTH_PLAN,
+    })
+}
+
+/// GET /api/security/infrastructure/config
+pub async fn get_config(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<Value>, StatusCode> {
+    Ok(Json(config_view(
+        &load_infra_config(&state, &claims.team_id).await,
+    )))
+}
+
+/// PUT /api/security/infrastructure/config
+pub async fn put_config(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<records::InfraConfig>,
+) -> Result<Json<Value>, StatusCode> {
+    claims.require_role(3)?;
+    let text = serde_json::to_string(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
+    state
+        .dynamo
+        .put_item()
+        .table_name(&state.config.settings_table_name)
+        .item("pk", AttributeValue::S(claims.team_id.clone()))
+        .item("sk", AttributeValue::S(records::CONFIG_SK.into()))
+        .item("json", AttributeValue::S(text))
+        .send()
+        .await
+        .map_err(|e| {
+            warn!(error = %e, "infrastructure: settings could not be saved");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    tracing::info!(team = %claims.team_id, by = %claims.email, inspector = body.inspector, health = ?body.health, "Infrastructure settings saved");
+    Ok(Json(config_view(&body)))
+}
+
+/// GET /api/security/infrastructure/health-template
+pub async fn health_template(
+    Extension(_claims): Extension<Claims>,
+) -> impl axum::response::IntoResponse {
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, "text/yaml; charset=utf-8"),
+            (
+                axum::http::header::CONTENT_DISPOSITION,
+                "attachment; filename=\"coderhelm-health-events.yaml\"",
+            ),
+        ],
+        HEALTH_TEMPLATE,
+    )
+}
+
 fn account_states(accounts: &[aws_account::AwsAccount], reads: &[Value]) -> Vec<Value> {
+    account_states_with(accounts, reads, &records::InfraConfig::default())
+}
+
+/// Each account's state; the update link also asks for Inspector's and
+/// Health's reads when the team turned them on.
+fn account_states_with(
+    accounts: &[aws_account::AwsAccount],
+    reads: &[Value],
+    cfg: &records::InfraConfig,
+) -> Vec<Value> {
     accounts
         .iter()
         .map(|a| {
@@ -171,11 +266,21 @@ fn account_states(accounts: &[aws_account::AwsAccount], reads: &[Value]) -> Vec<
                 "on": a.infra_on(),
                 "available": a.infra_available(),
                 "missing": missing,
-                "update_url": (!missing.is_empty()).then(|| super::connectors::update_stack_url(&a.region, &a.chosen())).flatten(),
+                "update_url": (!missing.is_empty() || optin_missing(a, cfg))
+                    .then(|| super::connectors::update_stack_url(&a.region, &a.chosen().with_optin(cfg.inspector, cfg.health == records::HealthMode::Api)))
+                    .flatten(),
                 "read": reads.iter().find(|r| r["account"] == a.account.as_str()),
             })
         })
         .collect()
+}
+
+/// The team turned Inspector or the Health API on, and the role can't read it yet.
+fn optin_missing(a: &aws_account::AwsAccount, cfg: &records::InfraConfig) -> bool {
+    let lacks = |k: &str| a.permissions.as_ref().and_then(|p| p.optional_ability(k)) == Some(false);
+    a.infra_on()
+        && ((cfg.inspector && lacks("inspector"))
+            || (cfg.health == records::HealthMode::Api && lacks("health")))
 }
 
 /// The Infrastructure tab (pure, for tests).
@@ -434,5 +539,34 @@ mod tests {
         };
         let rv = resources_view_with(vec![r], vec![], &[], &recs);
         assert_eq!(rv["resources"][0]["findings"][0], "pr");
+    }
+
+    #[test]
+    fn the_switches_say_what_they_cost_and_the_template_only_receives() {
+        let v = config_view(&records::InfraConfig::default());
+        assert_eq!(v["config"]["inspector"], false);
+        assert_eq!(v["config"]["health"], "off");
+        assert!(v["inspector_cost"]
+            .as_str()
+            .unwrap()
+            .contains("$1.25 per instance"));
+        assert!(v["inspector_cost"].as_str().unwrap().contains("$0.09"));
+        assert!(v["inspector_cost"].as_str().unwrap().contains("$0.30"));
+        assert!(v["health_plan"]
+            .as_str()
+            .unwrap()
+            .contains("Business Support"));
+        assert!(HEALTH_TEMPLATE.contains("source:\n          - aws.health"));
+        assert!(HEALTH_TEMPLATE.contains("\"sqs:ReceiveMessage\""));
+        for no in [
+            "sqs:DeleteMessage",
+            "sqs:SendMessage\"\n            Resource: \"*\"",
+            "sqs:*",
+        ] {
+            assert!(!HEALTH_TEMPLATE.contains(no), "{no}");
+        }
+        let c: records::InfraConfig =
+            serde_json::from_str(r#"{"inspector":true,"health":"eventbridge"}"#).unwrap();
+        assert!(c.inspector && c.health == records::HealthMode::Eventbridge);
     }
 }

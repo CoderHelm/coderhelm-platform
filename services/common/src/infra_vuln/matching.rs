@@ -96,6 +96,19 @@ pub struct InfraFinding {
     /// P0 to P3; empty for AWS-managed rows.
     pub tier: Option<Tier>,
     pub fix: Fix,
+    /// What Amazon Inspector adds, when the team runs it: its findings
+    /// replace CoderHelm's own matching for the resource.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inspector: Option<InspectorFacts>,
+}
+
+/// Amazon Inspector's facts on a finding.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InspectorFacts {
+    pub exploit_available: bool,
+    /// Inspector's network reachability: `None` when it didn't say.
+    pub reachable: Option<bool>,
+    pub findings: usize,
 }
 
 impl InfraFinding {
@@ -247,10 +260,19 @@ impl Hits {
     }
 }
 
+/// Sources shown per finding: bulletins first, then the newest advisories.
+const MAX_SOURCES: usize = 20;
+
 fn finding(r: &Resource, key: &str, title: String, hits: Hits, fix: Fix) -> InfraFinding {
     let open = fix.kind != Some(FixKind::Aws);
     let mut cves = hits.cves;
     cves.sort();
+    let mut hits = Hits {
+        cves: Vec::new(),
+        ..hits
+    };
+    hits.sources.sort_by_key(|s| s.kind != "bulletin");
+    hits.sources.truncate(MAX_SOURCES);
     InfraFinding {
         id: short_id(&[&r.account, &r.region, &r.group, key]),
         account: r.account.clone(),
@@ -268,6 +290,7 @@ fn finding(r: &Resource, key: &str, title: String, hits: Hits, fix: Fix) -> Infr
         kev: hits.kev,
         exposure: r.exposure.clone(),
         fix,
+        inspector: None,
     }
 }
 
@@ -664,7 +687,7 @@ fn runbook(
         .to_string(),
         location: None,
         from: r.versions.engine_version.clone(),
-        to: pending.name.clone(),
+        to: String::new(),
         cli: vec![cli],
         console,
         apply_by: pending.apply_by.clone(),
@@ -712,6 +735,21 @@ fn match_managed(r: &Resource, feeds: &Feeds, out: &mut Vec<InfraFinding>) {
                 let console = format!("ElastiCache > Service updates > {} > Apply now", p.name);
                 runbook(r, p, cli, console, "elasticache", feeds, out);
             }
+            _ if p.kind == "health" => {
+                let cli = format!(
+                    "aws health describe-events --filter eventTypeCodes={} --region us-east-1",
+                    p.name
+                );
+                let console = format!(
+                    "AWS Health Dashboard > Your account health > {}",
+                    if p.auto_applied_after.is_empty() {
+                        "Open and recent issues"
+                    } else {
+                        "Scheduled changes"
+                    }
+                );
+                runbook(r, p, cli, console, "", feeds, out);
+            }
             Kind::OpensearchDomain if p.kind == "service-software" => {
                 let cli = format!("aws opensearch start-service-software-update --domain-name {} --schedule-at OFF_PEAK_WINDOW --region {}", r.name, r.region);
                 let console = format!(
@@ -725,10 +763,156 @@ fn match_managed(r: &Resource, feeds: &Feeds, out: &mut Vec<InfraFinding>) {
     }
 }
 
+fn inspector_rank(s: &str) -> &'static str {
+    match s.to_ascii_uppercase().as_str() {
+        "CRITICAL" => "critical",
+        "HIGH" => "important",
+        "MEDIUM" => "medium",
+        _ => "low",
+    }
+}
+
+/// Amazon Inspector's findings on a resource replace CoderHelm's own
+/// matching for it: one finding for the resource's fix, with Inspector's
+/// CVEs, exploit status and network reachability. CoderHelm's own fix (an
+/// AMI bump, a node group release) is kept when it found one; otherwise the
+/// fix is the packages Inspector names.
+fn with_inspector(r: &Resource, own: Vec<InfraFinding>, feeds: &Feeds) -> Vec<InfraFinding> {
+    let hits = &r.inspector;
+    let mut hit_sources = Hits::new();
+    let mut exploit = false;
+    let mut reachable: Option<bool> = None;
+    for h in hits {
+        if !hit_sources.sources.iter().any(|s| s.id == h.id) {
+            hit_sources.sources.push(Source {
+                id: h.id.clone(),
+                kind: "inspector".into(),
+                url: String::new(),
+                severity: h.severity.to_ascii_lowercase(),
+            });
+        }
+        if h.vulnerability.starts_with("CVE-") {
+            hit_sources.add_cves(std::slice::from_ref(&h.vulnerability), feeds.kev);
+        }
+        hit_sources.severity(inspector_rank(&h.severity));
+        exploit |= h.exploit_available;
+        reachable = match (reachable, h.reachable) {
+            (Some(true), _) | (_, Some(true)) => Some(true),
+            (None, x) => x,
+            (x, None) => x,
+            _ => Some(false),
+        };
+    }
+    let facts = InspectorFacts {
+        exploit_available: exploit,
+        reachable,
+        findings: hits.len(),
+    };
+    let public = reachable.unwrap_or(r.exposure.public);
+    let mut exposure = r.exposure.clone();
+    if let Some(reach) = reachable {
+        exposure = Exposure {
+            public: reach,
+            why: if reach {
+                "Inspector: reachable from the internet".into()
+            } else {
+                "Inspector: no path from the internet".into()
+            },
+        };
+    }
+    let mut base = own.into_iter().find(|f| f.fix.kind == Some(FixKind::Pr));
+    let mut f = match base.take() {
+        Some(mut f) => {
+            for s in hit_sources.sources.drain(..) {
+                f.sources.push(s);
+            }
+            for c in &hit_sources.cves {
+                if !f.cves.contains(c) {
+                    f.cves.push(c.clone());
+                }
+            }
+            f.cves.sort();
+            if sev_rank(&hit_sources.severity) > sev_rank(&f.severity) {
+                f.severity = hit_sources.severity.clone();
+            }
+            f.kev |= hit_sources.kev;
+            f
+        }
+        None => {
+            let packages: Vec<String> = hits
+                .iter()
+                .flat_map(|h| h.packages.clone())
+                .take(12)
+                .collect();
+            let fix = Fix {
+                kind: Some(FixKind::Runbook),
+                summary: if hits.iter().any(|h| h.fix_available) {
+                    "Update the packages Amazon Inspector names, or move to an image with them fixed".into()
+                } else {
+                    "No fixed version yet: Amazon Inspector reports no fix available".into()
+                },
+                cli: if matches!(r.ami().map(|a| a.os), Some(Os::Al2023)) {
+                    vec!["sudo dnf upgrade --security -y && sudo reboot".into()]
+                } else {
+                    Vec::new()
+                },
+                console: "Amazon Inspector > Findings > By instance".into(),
+                reason: hits
+                    .iter()
+                    .map(|h| h.remediation.clone())
+                    .find(|t| !t.is_empty())
+                    .unwrap_or_default(),
+                from: packages.join(", "),
+                ..Default::default()
+            };
+            let mut f = finding(
+                r,
+                "inspector",
+                format!(
+                    "{} {}: {} Amazon Inspector findings",
+                    r.kind.label(),
+                    r.name,
+                    hits.len()
+                ),
+                hit_sources,
+                fix,
+            );
+            f.cves.sort();
+            f
+        }
+    };
+    f.exposure = exposure;
+    f.inspector = Some(facts);
+    // A known exploit counts like the CISA list.
+    f.tier = Some(tier(&f.severity, f.kev || exploit, public));
+    vec![f]
+}
+
 /// Every finding for a team's resources, one per fix, sorted by tier.
 pub fn findings(resources: &[Resource], feeds: &Feeds) -> Vec<InfraFinding> {
     let mut out = Vec::new();
     for r in resources {
+        if !r.inspector.is_empty()
+            && matches!(
+                r.kind,
+                Kind::AutoScalingGroup
+                    | Kind::Ec2Instance
+                    | Kind::EksNodegroup
+                    | Kind::ContainerImage
+                    | Kind::LambdaFunction
+            )
+        {
+            let mut own = Vec::new();
+            match r.kind {
+                Kind::AutoScalingGroup | Kind::Ec2Instance => match_ami(r, feeds, &mut own),
+                Kind::EksNodegroup => match_nodegroup(r, feeds, &mut own),
+                Kind::LambdaFunction => match_lambda(r, feeds, &mut own),
+                _ => {}
+            }
+            out.extend(with_inspector(r, own, feeds));
+            match_managed(r, feeds, &mut out);
+            continue;
+        }
         match r.kind {
             Kind::AutoScalingGroup | Kind::Ec2Instance => match_ami(r, feeds, &mut out),
             Kind::EksNodegroup => match_nodegroup(r, feeds, &mut out),
@@ -957,6 +1141,101 @@ mod tests {
             },
         );
         assert!(!still_open(&asg, &after));
+    }
+
+    #[test]
+    fn inspector_findings_replace_own_matching_and_raise_the_tier() {
+        let raw: RawAccount = serde_json::from_str(ACCOUNT).unwrap();
+        let mut resources = raw.resources();
+        let ng = resources
+            .iter_mut()
+            .find(|r| r.kind == Kind::EksNodegroup)
+            .unwrap();
+        ng.inspector = vec![inventory::InspectorHit {
+            id: "finding-1".into(),
+            vulnerability: "CVE-2026-98432".into(),
+            severity: "HIGH".into(),
+            exploit_available: true,
+            fix_available: true,
+            reachable: Some(false),
+            ..Default::default()
+        }];
+        let b = feeds::parse_bulletin(BULLETIN, "u").unwrap();
+        let kev = BTreeMap::new();
+        let latest = BTreeMap::new();
+        let f = findings(
+            &resources,
+            &Feeds {
+                advisories: &[],
+                bulletins: std::slice::from_ref(&b),
+                runtimes: &[],
+                latest: &[],
+                kev: &kev,
+                latest_al2023: &latest,
+                today: "2026-11-10",
+            },
+        );
+        let ng = f
+            .iter()
+            .find(|x| x.kind == Some(Kind::EksNodegroup))
+            .unwrap();
+        assert_eq!(
+            ng.fix.kind,
+            Some(FixKind::Pr),
+            "CoderHelm's node group fix is kept"
+        );
+        assert!(ng.sources.iter().any(|s| s.kind == "inspector"));
+        let facts = ng.inspector.as_ref().unwrap();
+        assert!(facts.exploit_available && facts.reachable == Some(false));
+        assert_eq!(
+            ng.tier,
+            Some(Tier::P0),
+            "a known exploit counts like the CISA list"
+        );
+        assert!(ng.exposure.why.starts_with("Inspector"));
+        assert_eq!(
+            f.iter()
+                .filter(|x| x.kind == Some(Kind::EksNodegroup))
+                .count(),
+            1,
+            "one row per fix"
+        );
+    }
+
+    #[test]
+    fn a_health_event_on_a_resource_is_a_runbook_card() {
+        let r = Resource {
+            id: "arn:aws:rds:us-east-1:111122223333:cluster:orders".into(),
+            kind: Kind::RdsCluster,
+            name: "orders".into(),
+            group: "orders".into(),
+            pending: vec![inventory::Pending {
+                kind: "health".into(),
+                name: "AWS_RDS_SECURITY_NOTIFICATION".into(),
+                description: "Apply the OS update".into(),
+                apply_by: "2026-11-20".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let kev = BTreeMap::new();
+        let latest = BTreeMap::new();
+        let f = findings(
+            &[r],
+            &Feeds {
+                advisories: &[],
+                bulletins: &[],
+                runtimes: &[],
+                latest: &[],
+                kev: &kev,
+                latest_al2023: &latest,
+                today: "2026-11-10",
+            },
+        );
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].fix.kind, Some(FixKind::Runbook));
+        assert!(f[0].fix.cli[0].contains("eventTypeCodes=AWS_RDS_SECURITY_NOTIFICATION"));
+        assert!(f[0].fix.console.starts_with("AWS Health Dashboard"));
     }
 
     #[test]

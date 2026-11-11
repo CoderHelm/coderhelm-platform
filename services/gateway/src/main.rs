@@ -540,6 +540,14 @@ async fn main() -> Result<(), Error> {
             post(routes::infra_security::check),
         )
         .route(
+            "/security/infrastructure/config",
+            get(routes::infra_security::get_config).put(routes::infra_security::put_config),
+        )
+        .route(
+            "/security/infrastructure/health-template",
+            get(routes::infra_security::health_template),
+        )
+        .route(
             "/security/infrastructure/findings/:id/fix",
             post(routes::infra_security::fix),
         )

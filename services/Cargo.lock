@@ -638,6 +638,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-health"
+version = "1.101.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1569d6f33d5c34f400ad4a44e180070727cc6809f91c39b1880f1053618db79e"
+dependencies = [
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http 0.2.12",
+ "http 1.4.0",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-iam"
 version = "1.107.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -655,6 +679,30 @@ dependencies = [
  "aws-smithy-types",
  "aws-smithy-xml",
  "aws-types",
+ "fastrand",
+ "http 0.2.12",
+ "http 1.4.0",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
+name = "aws-sdk-inspector2"
+version = "1.110.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "db6c3d23af8508b787d613687fda7874cc6b8b22895975eb12850ef261155530"
+dependencies = [
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
  "fastrand",
  "http 0.2.12",
  "http 1.4.0",
@@ -5868,6 +5916,8 @@ dependencies = [
  "aws-sdk-eks",
  "aws-sdk-elasticache",
  "aws-sdk-elasticloadbalancingv2",
+ "aws-sdk-health",
+ "aws-sdk-inspector2",
  "aws-sdk-kms",
  "aws-sdk-lambda",
  "aws-sdk-opensearch",

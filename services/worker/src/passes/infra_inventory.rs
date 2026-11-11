@@ -806,8 +806,216 @@ async fn read_scans(s: &Session, raw: &mut RawAccount) {
     }
 }
 
-/// Reads the account (describe and list calls only).
-pub async fn read(s: &Session, account: &str) -> RawAccount {
+/// Amazon Inspector's active findings on instances, images and functions.
+async fn read_inspector(s: &Session, raw: &mut RawAccount) {
+    use aws_sdk_inspector2::types::{FilterCriteria, StringComparison, StringFilter};
+    let ins = client!(aws_sdk_inspector2, s);
+    let f =
+        |c: StringComparison, v: &str| StringFilter::builder().comparison(c).value(v).build().ok();
+    let criteria = FilterCriteria::builder()
+        .set_finding_status(f(StringComparison::Equals, "ACTIVE").map(|x| vec![x]))
+        .set_resource_type(Some(
+            [
+                "AWS_EC2_INSTANCE",
+                "AWS_ECR_CONTAINER_IMAGE",
+                "AWS_LAMBDA_FUNCTION",
+            ]
+            .iter()
+            .filter_map(|t| f(StringComparison::Equals, t))
+            .collect(),
+        ))
+        .build();
+    let mut token: Option<String> = None;
+    for _ in 0..MAX_PAGES {
+        match ins
+            .list_findings()
+            .filter_criteria(criteria.clone())
+            .max_results(100)
+            .set_next_token(token.take())
+            .send()
+            .await
+        {
+            Ok(o) => {
+                for x in o.findings() {
+                    let Some(res) = x.resources().first() else {
+                        continue;
+                    };
+                    let resource_type = res.r#type().as_str().to_string();
+                    let resource_id = match res.details().and_then(|d| d.aws_ecr_container_image())
+                    {
+                        Some(img) => img.image_hash().to_string(),
+                        None => res.id().to_string(),
+                    };
+                    let pv = x.package_vulnerability_details();
+                    let packages = pv
+                        .map(|p| {
+                            p.vulnerable_packages()
+                                .iter()
+                                .map(|v| match v.fixed_in_version() {
+                                    Some(fx) if !fx.is_empty() => {
+                                        format!("{} {} (fixed in {fx})", v.name(), v.version())
+                                    }
+                                    _ => format!("{} {}", v.name(), v.version()),
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    raw.inspector.push(common::infra_vuln::raw::RawInspector {
+                        resource_id,
+                        resource_type,
+                        hit: inv::InspectorHit {
+                            id: x.finding_arn().rsplit('/').next().unwrap_or("").to_string(),
+                            vulnerability: pv
+                                .map(|p| p.vulnerability_id().to_string())
+                                .unwrap_or_else(|| x.title().unwrap_or("").to_string()),
+                            severity: x.severity().as_str().to_string(),
+                            exploit_available: x
+                                .exploit_available()
+                                .is_some_and(|e| e.as_str() == "YES"),
+                            fix_available: x.fix_available().is_some_and(|e| e.as_str() != "NO"),
+                            reachable: x.network_reachability_details().map(|_| true),
+                            packages,
+                            remediation: x
+                                .remediation()
+                                .and_then(|r| r.recommendation())
+                                .and_then(|r| r.text())
+                                .map(|t| common::truncate_str(t, 300).to_string())
+                                .unwrap_or_default(),
+                        },
+                    });
+                }
+                token = o.next_token().map(String::from);
+                if token.is_none() {
+                    break;
+                }
+            }
+            Err(e) => {
+                note!(raw, "ListFindings (Inspector)", e);
+                return;
+            }
+        }
+    }
+}
+
+/// AWS Health events through the API (Business Support or higher).
+async fn read_health_api(s: &Session, raw: &mut RawAccount) {
+    use aws_sdk_health::types::{EntityFilter, EventFilter, EventStatusCode, EventTypeCategory};
+    let global = Session {
+        region: "us-east-1".into(),
+        ..s.clone()
+    };
+    let h = client!(aws_sdk_health, &global);
+    let filter = EventFilter::builder()
+        .event_status_codes(EventStatusCode::Open)
+        .event_status_codes(EventStatusCode::Upcoming)
+        .event_type_categories(EventTypeCategory::AccountNotification)
+        .event_type_categories(EventTypeCategory::ScheduledChange)
+        .event_type_categories(EventTypeCategory::Issue)
+        .build();
+    let events = match h
+        .describe_events()
+        .filter(filter)
+        .max_results(100)
+        .send()
+        .await
+    {
+        Ok(o) => o.events().to_vec(),
+        Err(e) => {
+            note!(raw, "DescribeEvents (Health)", e);
+            return;
+        }
+    };
+    for e in events.iter().take(50) {
+        let arn = e.arn().unwrap_or("").to_string();
+        let entities = match EntityFilter::builder().event_arns(&arn).build() {
+            Ok(f) => match h.describe_affected_entities().filter(f).send().await {
+                Ok(o) => o
+                    .entities()
+                    .iter()
+                    .filter_map(|x| x.entity_value().map(String::from))
+                    .collect(),
+                Err(err) => {
+                    note!(raw, "DescribeAffectedEntities (Health)", err);
+                    Vec::new()
+                }
+            },
+            Err(_) => Vec::new(),
+        };
+        raw.health.push(common::infra_vuln::raw::RawHealth {
+            arn,
+            service: e.service().unwrap_or("").into(),
+            event_type: e.event_type_code().unwrap_or("").into(),
+            category: e
+                .event_type_category()
+                .map(|c| c.as_str().to_string())
+                .unwrap_or_default(),
+            status: e
+                .status_code()
+                .map(|c| c.as_str().to_string())
+                .unwrap_or_default(),
+            start: e
+                .start_time()
+                .and_then(|t| t.fmt(aws_smithy_types::date_time::Format::DateTime).ok())
+                .unwrap_or_default(),
+            description: String::new(),
+            entities,
+        });
+    }
+}
+
+/// AWS Health events from the EventBridge template's queue (receive only:
+/// messages expire on their own; nothing is deleted).
+async fn read_health_queue(s: &Session, raw: &mut RawAccount) {
+    let sqs = client!(aws_sdk_sqs, s);
+    let url = match sqs
+        .get_queue_url()
+        .queue_name("coderhelm-health-events")
+        .send()
+        .await
+    {
+        Ok(o) => o.queue_url().unwrap_or("").to_string(),
+        Err(e) => {
+            note!(raw, "GetQueueUrl (Health events)", e);
+            return;
+        }
+    };
+    let mut seen = BTreeSet::new();
+    for _ in 0..10 {
+        let Ok(o) = sqs
+            .receive_message()
+            .queue_url(&url)
+            .max_number_of_messages(10)
+            .visibility_timeout(0)
+            .send()
+            .await
+        else {
+            break;
+        };
+        if o.messages().is_empty() {
+            break;
+        }
+        let mut new = 0;
+        for m in o.messages() {
+            if let Some(e) = common::infra_vuln::raw::parse_health_event(m.body().unwrap_or("")) {
+                if seen.insert(e.arn.clone()) {
+                    raw.health.push(e);
+                    new += 1;
+                }
+            }
+        }
+        if new == 0 {
+            break;
+        }
+    }
+}
+
+/// Reads the account (describe and list calls only), with what the team
+/// turned on (Inspector, Health).
+pub async fn read_with(
+    s: &Session,
+    account: &str,
+    cfg: &common::infra_vuln::records::InfraConfig,
+) -> RawAccount {
     let mut raw = RawAccount {
         account: account.to_string(),
         region: s.region.clone(),
@@ -824,7 +1032,41 @@ pub async fn read(s: &Session, account: &str) -> RawAccount {
     read_opensearch(s, &mut raw).await;
     read_ssm(s, &mut raw).await;
     read_scans(s, &mut raw).await;
+    if cfg.inspector {
+        read_inspector(s, &mut raw).await;
+    }
+    match cfg.health {
+        common::infra_vuln::records::HealthMode::Api => read_health_api(s, &mut raw).await,
+        common::infra_vuln::records::HealthMode::Eventbridge => {
+            read_health_queue(s, &mut raw).await
+        }
+        common::infra_vuln::records::HealthMode::Off => {}
+    }
     raw
+}
+
+/// The team's opt-in switches (Inspector, Health).
+pub async fn infra_config(
+    state: &WorkerState,
+    team_id: &str,
+) -> common::infra_vuln::records::InfraConfig {
+    state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(team_id))
+        .key("sk", attr_s(common::infra_vuln::records::CONFIG_SK))
+        .send()
+        .await
+        .ok()
+        .and_then(|o| {
+            o.item()
+                .and_then(|i| i.get("json"))
+                .and_then(|v| v.as_s().ok())
+                .cloned()
+        })
+        .and_then(|j| serde_json::from_str(&j).ok())
+        .unwrap_or_default()
 }
 
 /// Places each resource in the team's code, and adds the Lambda functions
@@ -999,7 +1241,8 @@ pub async fn read_account(
     let session = common::live::aws::assume(&state.sts, &a.target(), "infra-inventory")
         .await
         .map_err(|e| e.message)?;
-    let raw = read(&session, &a.account).await;
+    let cfg = infra_config(state, team_id).await;
+    let raw = read_with(&session, &a.account, &cfg).await;
     let mut resources = raw.resources();
     place(state, team_id, &a.account, &a.region, &mut resources).await;
     Ok(save(state, team_id, &raw, &resources).await)

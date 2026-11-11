@@ -268,6 +268,25 @@ pub struct Pending {
     pub status: String,
 }
 
+/// One Amazon Inspector finding on a resource (when the team runs it).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InspectorHit {
+    /// The finding's id (the end of its ARN).
+    pub id: String,
+    /// `CVE-...` or another vulnerability id.
+    pub vulnerability: String,
+    /// CRITICAL, HIGH, MEDIUM, LOW, as Inspector rates it.
+    pub severity: String,
+    pub exploit_available: bool,
+    pub fix_available: bool,
+    /// Inspector's network reachability: `Some(true)` when a path from
+    /// the internet reaches an open port.
+    pub reachable: Option<bool>,
+    /// `kernel 6.1.155 (fixed in 6.1.189)`.
+    pub packages: Vec<String>,
+    pub remediation: String,
+}
+
 /// Where a resource is defined in the team's code.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Location {
@@ -311,6 +330,9 @@ pub struct Resource {
     /// Auto Scaling group, nodes in a node group, tasks of a service).
     #[serde(default)]
     pub count: u32,
+    /// Amazon Inspector's findings on it, when the team runs Inspector.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inspector: Vec<InspectorHit>,
 }
 
 impl Resource {
@@ -591,6 +613,15 @@ pub fn group_instances(instances: Vec<Resource>) -> Vec<Resource> {
                 };
                 if older {
                     g.versions = i.versions.clone();
+                }
+                for h in i.inspector {
+                    if !g
+                        .inspector
+                        .iter()
+                        .any(|x| x.vulnerability == h.vulnerability)
+                    {
+                        g.inspector.push(h);
+                    }
                 }
             }
             None => {
