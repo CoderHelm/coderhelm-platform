@@ -1312,8 +1312,9 @@ mod tests {
         f.timelines.insert(
             8,
             vec![
-                our_label("2026-11-01T00:00:00Z"),
-                json!({"event": "unlabeled", "actor": {"login": "ana", "type": "User"}, "label": {"name": "stale"}, "created_at": "2026-11-03T00:00:00Z"}),
+                our_label("2026-11-06T00:00:00Z"),
+                // Two days ago: within the 7 quiet days, so it isn't marked again.
+                json!({"event": "unlabeled", "actor": {"login": "ana", "type": "User"}, "label": {"name": "stale"}, "created_at": "2026-11-08T00:00:00Z"}),
             ],
         );
         let out = run_repo(&f, &inputs(true)).await.unwrap();
