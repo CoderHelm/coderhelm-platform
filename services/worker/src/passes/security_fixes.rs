@@ -618,15 +618,31 @@ async fn dependabot_alerts(
     pages: u32,
 ) -> (Vec<Value>, sec::DependabotAccess) {
     let mut out = vec![];
-    let per_page = if pages == 0 { 1 } else { 100 };
-    for page in 1..=pages.max(1) {
-        let path =
-            format!("/repos/{repo}/dependabot/alerts?state=open&per_page={per_page}&page={page}");
-        let (code, body) = match gh.get_status(&path).await {
+    // The token first, so its refusal is told apart from GitHub not answering.
+    if let Err(e) = gh.installation_token().await {
+        let why = sec::DependabotUnreached::Token(e.to_string());
+        warn!(repo, error = %e, "security: no GitHub token for Dependabot's alerts");
+        return (out, sec::dependabot_unreached(&why));
+    }
+    // This endpoint pages by cursor; a `page` parameter is answered 400.
+    let mut after: Option<String> = None;
+    for _ in 0..pages.max(1) {
+        let path = sec::dependabot_alerts_path(repo, after.as_deref());
+        let (code, body, link) = match gh.get_status_link(&path).await {
             Ok(r) => r,
-            Err(_) => return (out, sec::dependabot_access(599, &Value::Null, None, false)),
+            Err(e) => {
+                let why = unreached(e.as_ref());
+                warn!(repo, error = %e, cause = ?why, "security: GitHub didn't answer for Dependabot's alerts");
+                return (out, sec::dependabot_unreached(&why));
+            }
         };
         if !(200..300).contains(&code) {
+            warn!(
+                repo,
+                status = code,
+                github = body["message"].as_str().unwrap_or(""),
+                "security: GitHub turned down Dependabot's alerts"
+            );
             let p = gh.permission_state("vulnerability_alerts").await;
             let mut access = sec::dependabot_access(code, &body, p.token_has, p.installation_lacks);
             if p.broker_unaware && access.state != "off" {
@@ -637,10 +653,9 @@ async fn dependabot_alerts(
             }
             return (vec![], access);
         }
-        let items = body.as_array().cloned().unwrap_or_default();
-        let n = items.len();
-        out.extend(items);
-        if n < 100 || pages == 0 {
+        out.extend(body.as_array().cloned().unwrap_or_default());
+        after = sec::dependabot_next_cursor(link.as_deref());
+        if after.is_none() {
             break;
         }
     }
@@ -648,6 +663,31 @@ async fn dependabot_alerts(
         out,
         sec::dependabot_access(200, &Value::Null, Some(true), false),
     )
+}
+
+/// What kept a request from getting any answer from GitHub.
+fn unreached(e: &(dyn std::error::Error + Send + Sync + 'static)) -> sec::DependabotUnreached {
+    match e.downcast_ref::<reqwest::Error>() {
+        Some(r) if r.is_timeout() => sec::DependabotUnreached::TimedOut,
+        Some(r) if r.is_connect() => sec::DependabotUnreached::Connect(error_chain(r)),
+        Some(r) => sec::DependabotUnreached::Other(error_chain(r)),
+        None => sec::DependabotUnreached::Other(e.to_string()),
+    }
+}
+
+/// An error with its causes, without the URL.
+fn error_chain(e: &reqwest::Error) -> String {
+    let mut s = e.to_string();
+    if let Some(u) = e.url() {
+        s = s.replace(&format!(" for url ({u})"), "");
+    }
+    let mut src = std::error::Error::source(e);
+    while let Some(c) = src {
+        s.push_str(": ");
+        s.push_str(&c.to_string());
+        src = c.source();
+    }
+    s
 }
 
 /// The repository's own security advisories, with how they were read:
