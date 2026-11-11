@@ -159,6 +159,62 @@ pub enum ConnectorError {
     Config(String),
     /// Anything else; the next sync tries again.
     Temporary(String),
+    /// The provider is overloaded, rate limiting, timed out or dropped the
+    /// connection, and asking again later works. An item that hits this is
+    /// never "couldn't read": it waits and is read again
+    /// ([`super::sync`]).
+    Busy(Busy),
+}
+
+/// A passing refusal: how long the provider asked to wait, and whether it
+/// was a rate limit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Busy {
+    pub message: String,
+    /// Seconds the provider asked to wait (`Retry-After`), when it said.
+    pub retry_after: Option<u64>,
+    /// A rate limit (`429`), as opposed to an overloaded or silent server.
+    pub rate_limited: bool,
+}
+
+impl ConnectorError {
+    /// A rate limit, with the wait the provider named.
+    pub fn rate_limited(message: impl Into<String>, retry_after: Option<u64>) -> Self {
+        ConnectorError::Busy(Busy {
+            message: message.into(),
+            retry_after,
+            rate_limited: true,
+        })
+    }
+
+    /// An overloaded server, a timeout or a dropped connection.
+    pub fn unavailable(message: impl Into<String>, retry_after: Option<u64>) -> Self {
+        ConnectorError::Busy(Busy {
+            message: message.into(),
+            retry_after,
+            rate_limited: false,
+        })
+    }
+
+    /// Passing: asking again later works (a rate limit, an overloaded or
+    /// silent server).
+    pub fn is_busy(&self) -> bool {
+        matches!(
+            self,
+            ConnectorError::Busy(_) | ConnectorError::RateLimited(_)
+        )
+    }
+
+    /// The reason word an item that hit this shows and is grouped by
+    /// (`rate_limited`, `unavailable`).
+    pub fn busy_reason(&self) -> Option<&'static str> {
+        match self {
+            ConnectorError::RateLimited(_) => Some("rate_limited"),
+            ConnectorError::Busy(b) if b.rate_limited => Some("rate_limited"),
+            ConnectorError::Busy(_) => Some("unavailable"),
+            _ => None,
+        }
+    }
 }
 
 impl std::fmt::Display for ConnectorError {
@@ -169,7 +225,8 @@ impl std::fmt::Display for ConnectorError {
             | ConnectorError::NotFound(m)
             | ConnectorError::RateLimited(m)
             | ConnectorError::Config(m)
-            | ConnectorError::Temporary(m) => f.write_str(m),
+            | ConnectorError::Temporary(m)
+            | ConnectorError::Busy(Busy { message: m, .. }) => f.write_str(m),
         }
     }
 }
@@ -200,6 +257,14 @@ impl ConnectorError {
             ConnectorError::Config(_) => ("Edit the source to fix its settings.".to_string(), "edit"),
             ConnectorError::RateLimited(_) => (
                 format!("{name} asked us to slow down. The next sync picks up where this one stopped."),
+                "retry",
+            ),
+            ConnectorError::Busy(b) if b.rate_limited => (
+                format!("{name} asked us to slow down. The sync picks up where it stopped on its own."),
+                "retry",
+            ),
+            ConnectorError::Busy(_) => (
+                format!("{name} didn't answer in time. The sync tries again on its own."),
                 "retry",
             ),
             ConnectorError::Temporary(_) => ("Sync again in a few minutes.".to_string(), "retry"),
@@ -239,39 +304,40 @@ pub trait Connector: Send + Sync {
 
 // ── HTTP shared by the connectors ───────────────────────────────────────────
 
-/// Retries a rate-limited request this many times before giving up (the
-/// sync then pauses and continues where it stopped).
-const MAX_RETRIES: usize = 3;
-/// Longest wait between retries: a provider's `Retry-After` is honoured up
-/// to this; longer waits pause the sync instead of holding a worker.
-const MAX_WAIT_SECS: u64 = 30;
-
-/// Sends `req`; a 429 or 503 is retried after the provider's
-/// `Retry-After` (capped). Anything outside 2xx becomes a
-/// [`ConnectorError`] named for `provider`.
+/// Sends `req` through the provider's [`super::pace::Gate`] (one per
+/// provider and API host): a few calls at a time at the provider's pace,
+/// and a passing refusal (`429`, `500` and `502` to `504`, a quota `403`,
+/// a timeout or a dropped connection) asked again after `Retry-After` or a
+/// backoff with jitter. Anything else outside 2xx becomes a
+/// [`ConnectorError`] named for `provider`; a refusal still passing after
+/// the retries comes back as [`ConnectorError::Busy`] with the wait to keep.
 pub async fn send(
     http: &dyn Http,
     req: HttpRequest,
     provider: &str,
 ) -> Result<HttpResponse, ConnectorError> {
-    let mut attempt = 0;
-    loop {
-        let resp = http.send(req.clone()).await.map_err(|e| match e {
-            HttpError::Refused(m) => ConnectorError::Config(m),
-            HttpError::Unreachable(m) => ConnectorError::Temporary(m),
-        })?;
-        if matches!(resp.status, 429 | 503) && attempt < MAX_RETRIES {
-            attempt += 1;
-            let wait = resp
-                .header("retry-after")
-                .and_then(|v| v.trim().parse::<u64>().ok())
-                .unwrap_or(attempt as u64)
-                .min(MAX_WAIT_SECS);
-            tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
-            continue;
+    let host = url::Url::parse(&req.url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+        .unwrap_or_default();
+    let gate = super::pace::gate_for(
+        &format!("http#{provider}#{host}"),
+        &super::pace::Policy::for_provider(provider),
+    );
+    gate.run(provider, || {
+        let req = req.clone();
+        async move {
+            let resp = http.send(req).await.map_err(|e| match e {
+                HttpError::Refused(m) => ConnectorError::Config(m),
+                HttpError::Unreachable(m) => ConnectorError::unavailable(
+                    format!("{provider} didn't answer in time ({m})."),
+                    None,
+                ),
+            })?;
+            check(resp, provider)
         }
-        return check(resp, provider);
-    }
+    })
+    .await
 }
 
 /// [`send`] and the reply as JSON.
@@ -288,6 +354,26 @@ pub async fn send_json(
     })
 }
 
+/// A `403` that is a quota or rate limit, not a refusal of access: Google's
+/// `rateLimitExceeded`, `userRateLimitExceeded` and `RESOURCE_EXHAUSTED`,
+/// GitHub's secondary rate limit or spent quota, Atlassian's "rate limit".
+fn quota_403(resp: &HttpResponse) -> bool {
+    if resp.header("x-ratelimit-remaining") == Some("0") {
+        return true;
+    }
+    let body = resp.text().to_lowercase();
+    [
+        "ratelimitexceeded",
+        "userratelimitexceeded",
+        "resource_exhausted",
+        "quotaexceeded",
+        "rate limit",
+        "secondary rate limit",
+    ]
+    .iter()
+    .any(|w| body.contains(w))
+}
+
 /// A reply's status as a result.
 pub fn check(resp: HttpResponse, provider: &str) -> Result<HttpResponse, ConnectorError> {
     match resp.status {
@@ -295,19 +381,28 @@ pub fn check(resp: HttpResponse, provider: &str) -> Result<HttpResponse, Connect
         401 => Err(ConnectorError::Reconnect(format!(
             "{provider} didn't accept the saved sign-in."
         ))),
+        403 | 429 if resp.status == 429 || quota_403(&resp) => Err(ConnectorError::rate_limited(
+            format!("{provider} is limiting how fast Coderhelm reads ({}).", resp.status),
+            super::pace::retry_after_of(&resp),
+        )),
+        // Google exports a document up to 10 MB: final, and not about access.
+        403 if resp.text().contains("exportSizeLimitExceeded") => Err(ConnectorError::Config(format!(
+            "{provider} exports documents up to 10 MB and this one is larger. Split it into smaller documents."
+        ))),
         403 => Err(ConnectorError::Forbidden(format!(
             "The {provider} connection can't see this."
         ))),
         404 | 410 => Err(ConnectorError::NotFound(format!(
             "{provider} has no such page, or the connection can't see it."
         ))),
-        429 => Err(ConnectorError::RateLimited(format!(
-            "{provider} is limiting how fast we read."
-        ))),
         400 | 422 => Err(ConnectorError::Config(format!(
             "{provider} refused the request ({}).",
             crate::truncate_str(&provider_message(&resp), 200)
         ))),
+        s @ (500 | 502..=504) => Err(ConnectorError::unavailable(
+            format!("{provider} is busy right now ({s})."),
+            super::pace::retry_after_of(&resp),
+        )),
         s => Err(ConnectorError::Temporary(format!(
             "{provider} answered {s}."
         ))),
@@ -342,7 +437,7 @@ mod tests {
     use super::*;
     use crate::mcp_remote::http::fake::{json as fjson, resp, Fake};
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn statuses_become_plain_errors() {
         let http = Fake::default();
         for (status, want) in [
@@ -350,7 +445,8 @@ mod tests {
             (403, "Forbidden"),
             (404, "NotFound"),
             (422, "Config"),
-            (500, "Temporary"),
+            (500, "Busy"),
+            (501, "Temporary"),
         ] {
             let url = format!("https://api.example.com/{status}");
             http.on(
@@ -398,6 +494,135 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(n.load(Ordering::SeqCst), 2);
+    }
+
+    /// An HTTP server answering from a script (the last answer repeats):
+    /// `None` is a connection that timed out.
+    struct Script {
+        answers: std::sync::Mutex<Vec<Option<HttpResponse>>>,
+        sent: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Script {
+        fn new(answers: Vec<Option<HttpResponse>>) -> Self {
+            Script {
+                answers: std::sync::Mutex::new(answers),
+                sent: Default::default(),
+            }
+        }
+        fn sent(&self) -> usize {
+            self.sent.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Http for Script {
+        async fn send(&self, _: HttpRequest) -> Result<HttpResponse, HttpError> {
+            self.sent.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let mut a = self.answers.lock().unwrap();
+            let next = if a.len() > 1 {
+                a.remove(0)
+            } else {
+                a[0].clone()
+            };
+            next.ok_or_else(|| HttpError::Unreachable("timed out".into()))
+        }
+    }
+
+    fn google_quota() -> HttpResponse {
+        fjson(
+            403,
+            serde_json::json!({"error": {"code": 403, "message": "User rate limit exceeded.", "errors": [{"domain": "usageLimits", "reason": "userRateLimitExceeded"}]}}),
+        )
+    }
+
+    /// Every source's HTTP calls share one retry path: each passing shape
+    /// (a 429 with Retry-After, a 503, a timeout, Google's 403
+    /// rateLimitExceeded) is asked again and the answer comes back; a
+    /// real 403 is not asked again.
+    #[tokio::test(start_paused = true)]
+    async fn every_passing_refusal_is_asked_again_until_it_answers() {
+        let ok = || Some(resp(200, &[], "{\"ok\": true}"));
+        for (name, first, provider) in [
+            (
+                "429 with Retry-After",
+                Some(resp(429, &[("retry-after", "3")], "")),
+                "Notion",
+            ),
+            ("503", Some(resp(503, &[], "")), "Confluence"),
+            ("timeout", None, "Google Drive"),
+            (
+                "Google 403 rateLimitExceeded",
+                Some(google_quota()),
+                "Google Drive",
+            ),
+            (
+                "GitHub spent quota",
+                Some(resp(
+                    403,
+                    &[("x-ratelimit-remaining", "0"), ("x-ratelimit-reset", "5")],
+                    "",
+                )),
+                "GitHub",
+            ),
+        ] {
+            let http = Script::new(vec![first.clone(), first, ok()]);
+            let started = tokio::time::Instant::now();
+            let url = format!("https://api.example.com/{}", name.replace(' ', "-"));
+            let v = send_json(&http, HttpRequest::get(&url), provider).await;
+            assert_eq!(v.unwrap()["ok"], true, "{name}");
+            assert_eq!(http.sent(), 3, "{name}");
+            if name.starts_with("429") {
+                assert!(
+                    started.elapsed() >= std::time::Duration::from_secs(6),
+                    "{name}: each Retry-After waited"
+                );
+            }
+        }
+        // A 403 that is about access is final at once.
+        let http = Script::new(vec![Some(fjson(
+            403,
+            serde_json::json!({"message": "no access"}),
+        ))]);
+        let e = send(
+            &http,
+            HttpRequest::get("https://api.example.com/denied"),
+            "Confluence",
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(e, ConnectorError::Forbidden(_)), "{e:?}");
+        assert_eq!(http.sent(), 1);
+    }
+
+    /// Still refused after its tries: a passing error with the wait to keep,
+    /// which a sync shows as "waiting to retry", never "couldn't read".
+    #[tokio::test(start_paused = true)]
+    async fn a_refusal_that_lasts_comes_back_busy_with_a_wait() {
+        for (first, rate) in [
+            (Some(google_quota()), true),
+            (Some(resp(429, &[("retry-after", "2")], "")), true),
+            (Some(resp(502, &[], "")), false),
+            (None, false),
+        ] {
+            let http = Script::new(vec![first]);
+            let e = send(
+                &http,
+                HttpRequest::get("https://api.example.com/x"),
+                "Google Drive",
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(http.sent(), super::super::pace::Policy::DEFAULT.retries + 1);
+            match e {
+                ConnectorError::Busy(b) => {
+                    assert_eq!(b.rate_limited, rate, "{b:?}");
+                    assert!(b.retry_after.is_some_and(|w| w >= 1));
+                }
+                other => panic!("{other:?}"),
+            }
+        }
     }
 
     #[test]

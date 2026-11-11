@@ -25,9 +25,18 @@
 //! - a changed item re-embeds only the passages whose text changed; the
 //!   others keep their vectors from the previous index.
 //!
-//! Items are fetched a few at a time ([`super::Kind::fetch_concurrency`]);
-//! a provider that asks us to slow down pauses the sync for a minute, and
-//! it continues where it stopped. A large first sync waits for an admin to
+//! Items are fetched a few at a time ([`super::Kind::fetch_concurrency`]).
+//! A refusal that is passing ([`ConnectorError::is_busy`]: a rate limit, an
+//! overloaded server, a timeout, a dropped connection) never makes an item
+//! "couldn't read": the item shows "waiting to retry" with when, and goes
+//! back on the list. A rate limit pauses the whole sync for at least a
+//! minute (or the wait the provider named) and it continues where it
+//! stopped; an item an overloaded server didn't answer goes to the end of
+//! the list, and the run waits [`RETRY_WAIT_SECS`] before asking again.
+//! After [`MAX_TRIES`] in one sync, the item waits [`WAITING_SECS`] for a
+//! later sync, which reads it whether or not the provider lists it as
+//! changed ([`retry_due`]). Only permanent refusals (deleted, no access,
+//! a bad item) are "couldn't read". A large first sync waits for an admin to
 //! see what it will cost ([`super::LARGE_SYNC_ITEMS`]), and every embedding
 //! counts against the team's monthly token limit ([`Ctx::token_room`]).
 //!
@@ -65,6 +74,17 @@ const MAX_ROUNDS: usize = 3;
 const SAMPLE: usize = 8;
 /// How long a sync pauses after a provider asks us to slow down.
 pub const RATE_WAIT_SECS: i64 = 60;
+/// Tries one sync gives an item refused for a passing reason before it
+/// waits for a later sync.
+pub const MAX_TRIES: u32 = 3;
+/// How long a run waits before asking again for items an overloaded or
+/// silent server didn't answer.
+pub const RETRY_WAIT_SECS: i64 = 90;
+/// How long an item refused through a whole sync waits for the next one.
+pub const WAITING_SECS: i64 = 15 * 60;
+/// Items in a row refused for a passing reason that pause the whole run:
+/// the server is down, not one document.
+const BUSY_IN_A_ROW: usize = 6;
 /// How long a large first sync waits for an admin before it looks again.
 const APPROVAL_RECHECK_SECS: i64 = 24 * 60 * 60;
 /// Older items' indexes read at most in one run to add them to the pack.
@@ -98,6 +118,11 @@ pub struct Outcome {
     pub reused_chunks: usize,
     pub removed: usize,
     pub failed: usize,
+    /// Items refused for a passing reason, waiting to be read again.
+    pub waiting: usize,
+    /// Every problem item counted by kind and reason (`waiting`,
+    /// `rate_limited`: 165), beyond the first few kept in full.
+    pub reasons: Vec<super::runs::ReasonCount>,
     /// Why the sync stopped, when it did.
     pub error: Option<ConnectorError>,
     /// The team's monthly token limit stopped it.
@@ -205,12 +230,18 @@ pub async fn run(ctx: &Ctx<'_>, kb_id: &str, id: &str) -> Outcome {
         out.skipped += round.skipped;
         out.problems.extend(round.problems.iter().cloned());
         out.problems.truncate(super::runs::MAX_RUN_PROBLEMS);
+        for r in &round.reasons {
+            for _ in 0..r.count {
+                super::runs::count_reason(&mut out.reasons, &r.kind, &r.reason);
+            }
+        }
         out.same_text += round.same_text;
         out.indexed += round.indexed;
         out.embedded_chunks += round.embedded_chunks;
         out.reused_chunks += round.reused_chunks;
         out.removed += round.removed;
         out.failed = round.failed;
+        out.waiting = round.waiting;
         out.error = round.error.clone();
         out.over_budget = round.over_budget;
         out.more = round.more;
@@ -251,8 +282,15 @@ async fn finish(ctx: &Ctx<'_>, kb_id: &str, id: &str, ran: &Source, r: &Outcome)
     s.items = items.iter().filter(|f| f.ready_version > 0).count() as u32;
     s.failed_items = items
         .iter()
-        .filter(|f| f.status == FileStatus::Failed && f.skipped.is_empty())
+        .filter(|f| f.status == FileStatus::Failed && f.skipped.is_empty() && !f.is_waiting())
         .count() as u32;
+    s.waiting_items = items.iter().filter(|f| f.is_waiting()).count() as u32;
+    s.next_retry_at = items
+        .iter()
+        .filter(|f| f.is_waiting())
+        .filter_map(|f| secs_of(&f.retry_at))
+        .min()
+        .unwrap_or(0);
     s.skipped_items = items.iter().filter(|f| !f.skipped.is_empty()).count() as u32;
     s.truncated = ran.truncated;
     s.cursor = ran.cursor.clone();
@@ -299,6 +337,10 @@ async fn finish(ctx: &Ctx<'_>, kb_id: &str, id: &str, ran: &Source, r: &Outcome)
                 s.error = Some(super::source_error(&s, e));
                 s.next_sync_at = next_sync(&s, now, true);
             }
+        }
+        // Items waiting to be read again bring the next sync forward.
+        if s.next_retry_at > 0 && !s.paused {
+            s.next_sync_at = s.next_sync_at.min(s.next_retry_at.max(now + 1));
         }
     }
     // A change that arrived while a sync is still working through its
@@ -415,13 +457,17 @@ enum Step {
     Skipped {
         fetched: bool,
         why: String,
+        code: &'static str,
     },
     Removed {
         was_ready: bool,
     },
-    /// Nothing more can be read now (a refused sign-in, a rate limit): the
-    /// item goes back on the list.
+    /// Nothing more can be read now (a refused sign-in): the item goes back
+    /// on the list.
     Stop(ConnectorError),
+    /// Refused for a passing reason (a rate limit, an overloaded or silent
+    /// server): the item waits and is read again.
+    Busy(ConnectorError),
     /// The team's token limit: the item goes back on the list.
     OverBudget,
 }
@@ -440,6 +486,7 @@ async fn one_item(
             Step::Skipped {
                 fetched: true,
                 why: why.into(),
+                code: "empty",
             }
         }
         Ok(doc) => match index_item(ctx, src, item, prev, &doc, room).await {
@@ -472,6 +519,7 @@ async fn one_item(
             Step::Skipped {
                 fetched: false,
                 why,
+                code: reason,
             }
         }
         Err(e) if e.item_gone() => {
@@ -489,9 +537,8 @@ async fn one_item(
                 None => Step::Removed { was_ready: false },
             }
         }
-        Err(e @ ConnectorError::Reconnect(_)) | Err(e @ ConnectorError::RateLimited(_)) => {
-            Step::Stop(e)
-        }
+        Err(e @ ConnectorError::Reconnect(_)) => Step::Stop(e),
+        Err(e) if e.is_busy() => Step::Busy(e),
         Err(e) => {
             let why = e.to_string();
             mark_failed(ctx, src, item, prev, &why, "").await;
@@ -529,7 +576,29 @@ async fn plan(
     )
     .await;
     let listing = ctx.connector.list(src).await?;
-    let plan = plan_sync(stored, &listing);
+    let mut plan = plan_sync(stored, &listing);
+    // Items waiting to be read again (and items an older version gave up
+    // on for a passing reason) are read now, even when the listing names
+    // only what changed.
+    let now = (ctx.now)();
+    let planned: HashSet<String> = plan
+        .fetch
+        .iter()
+        .map(|i| i.external_id.clone())
+        .chain(plan.remove.iter().map(|f| f.external_id.clone()))
+        .collect();
+    for f in stored {
+        if !planned.contains(&f.external_id) && retry_due(f, now) {
+            plan.fetch.push(Listed {
+                external_id: f.external_id.clone(),
+                title: f.name.clone(),
+                url: f.url.clone(),
+                path: f.path.clone(),
+                hint: f.hint.clone(),
+                ..Default::default()
+            });
+        }
+    }
     let n = listing.items.len() as u32;
     // A listing of only what changed says nothing of the whole: the totals
     // of the last complete one stay.
@@ -553,7 +622,33 @@ async fn plan(
         listed,
         problem: listing.problem.as_ref().map(pending::keep_error),
         at: (ctx.now)(),
+        tries: Default::default(),
     })
+}
+
+/// Unix seconds of an RFC 3339 time.
+fn secs_of(t: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(t)
+        .ok()
+        .map(|d| d.timestamp())
+}
+
+/// Is a stored item due to be read again now: it waits and its time has
+/// come, or an older version marked it "couldn't read" for what is
+/// passing (a `429`, a server that stopped answering, an answer too large
+/// for the server's limit, which is now read in pieces)?
+pub fn retry_due(f: &FileMeta, now: i64) -> bool {
+    if !f.is_synced() || f.status != FileStatus::Failed || !f.skipped.is_empty() {
+        return false;
+    }
+    if !f.retry_at.is_empty() {
+        return secs_of(&f.retry_at).is_none_or(|t| t <= now);
+    }
+    f.reason.is_empty()
+        && matches!(
+            kb::reason_of(&f.error),
+            "rate_limited" | "unavailable" | "too_large"
+        )
 }
 
 /// Embedding tokens of a few items spread over the list, for a large
@@ -647,6 +742,11 @@ async fn one_round(ctx: &Ctx<'_>, src: &mut Source, started: i64) -> Outcome {
     let mut queue: std::collections::VecDeque<Listed> = pending.fetch.drain(..).collect();
     let mut back: Vec<Listed> = Vec::new();
     let mut stop: Option<ConnectorError> = None;
+    // Items refused for a passing reason (with why), and the longest wait
+    // a provider named.
+    let mut parked: Vec<(Listed, ConnectorError)> = Vec::new();
+    let mut retry: Vec<Listed> = Vec::new();
+    let (mut busy_run, mut named_wait, mut timed_out) = (0usize, 0i64, false);
     let mut sketches: HashMap<String, pack::Item> = HashMap::new();
     let (mut last_progress, mut saved_at) = (0i64, pending.done);
     let progress = |done: u32, planned: u32| Progress {
@@ -657,6 +757,7 @@ async fn one_round(ctx: &Ctx<'_>, src: &mut Source, started: i64) -> Outcome {
     save_progress(ctx, src, progress(pending.done, pending.planned), live).await;
     while !queue.is_empty() && stop.is_none() && !out.over_budget {
         if (ctx.now)() >= deadline {
+            timed_out = true;
             break;
         }
         let batch: Vec<Listed> = (0..conc * 2).map_while(|_| queue.pop_front()).collect();
@@ -674,10 +775,28 @@ async fn one_round(ctx: &Ctx<'_>, src: &mut Source, started: i64) -> Outcome {
             .collect()
             .await;
         for (item, step) in steps {
+            if !matches!(step, Step::Busy(_)) {
+                busy_run = 0;
+            }
             match step {
                 Step::Stop(e) => {
                     back.push(item);
                     stop.get_or_insert(e);
+                    continue;
+                }
+                Step::Busy(e) => {
+                    busy_run += 1;
+                    if let ConnectorError::Busy(b) = &e {
+                        named_wait = named_wait.max(b.retry_after.unwrap_or(0) as i64);
+                    }
+                    let rate = e.busy_reason() == Some("rate_limited");
+                    if rate || busy_run >= BUSY_IN_A_ROW {
+                        // The provider's limit, or a server that is down:
+                        // the whole run waits.
+                        stop.get_or_insert(e.clone());
+                    }
+                    retry.push(item.clone());
+                    parked.push((item, e));
                     continue;
                 }
                 Step::OverBudget => {
@@ -710,12 +829,16 @@ async fn one_round(ctx: &Ctx<'_>, src: &mut Source, started: i64) -> Outcome {
                 Step::Failed { fetched, why } => {
                     out.failed += 1;
                     out.fetched += usize::from(fetched);
-                    problem(&mut out, &item, "failed", &why);
+                    let reason = match kb::reason_of(&why) {
+                        "rate_limited" | "unavailable" => "failed",
+                        r => r,
+                    };
+                    problem(&mut out, &item, "failed", &why, reason);
                 }
-                Step::Skipped { fetched, why } => {
+                Step::Skipped { fetched, why, code } => {
                     out.skipped += 1;
                     out.fetched += usize::from(fetched);
-                    problem(&mut out, &item, "skipped", &why);
+                    problem(&mut out, &item, "skipped", &why, code);
                 }
                 Step::Removed { was_ready } => {
                     out.removed += 1;
@@ -732,15 +855,69 @@ async fn one_round(ctx: &Ctx<'_>, src: &mut Source, started: i64) -> Outcome {
         if pending.done - saved_at >= SAVE_LIST_EVERY {
             saved_at = pending.done;
             let mut left = pending.clone();
-            left.fetch = back.iter().chain(queue.iter()).cloned().collect();
+            left.fetch = back
+                .iter()
+                .chain(retry.iter())
+                .chain(queue.iter())
+                .cloned()
+                .collect();
             let _ = ctx
                 .store
                 .write_bytes(ctx.team, &list_key, left.encode())
                 .await;
         }
     }
-    back.extend(queue);
-    pending.fetch = back;
+    // Refused items go back on the list (a rate-limited one first, where
+    // it was; one an overloaded server didn't answer at the end) until
+    // they've had their tries this sync; then they wait for a later one.
+    let mut given_up: HashSet<String> = HashSet::new();
+    let mut front: Vec<Listed> = Vec::new();
+    let mut end: Vec<Listed> = Vec::new();
+    let stopped_busy = stop.as_ref().is_some_and(ConnectorError::is_busy);
+    for item in retry {
+        let n = pending.tries.entry(item.external_id.clone()).or_default();
+        *n += 1;
+        if *n >= MAX_TRIES {
+            given_up.insert(item.external_id.clone());
+            pending.done += 1;
+        } else if stopped_busy {
+            front.push(item);
+        } else {
+            end.push(item);
+        }
+    }
+    let mut left: Vec<Listed> = front;
+    left.extend(back);
+    left.extend(queue);
+    left.extend(end);
+    pending.fetch = left;
+    // When the list goes on: after the provider's wait, a minute for a rate
+    // limit, a little longer for a server that didn't answer.
+    let run_wait = if stopped_busy {
+        RATE_WAIT_SECS.max(named_wait)
+    } else if !timed_out && stop.is_none() && !out.over_budget {
+        RETRY_WAIT_SECS.max(named_wait)
+    } else {
+        0
+    };
+    let now = (ctx.now)();
+    for (item, e) in &parked {
+        let later = given_up.contains(&item.external_id);
+        let at = if later {
+            now + WAITING_SECS.max(named_wait)
+        } else {
+            now + run_wait.max(1)
+        };
+        mark_waiting(ctx, src, item, by_ext.get(&item.external_id), e, at).await;
+        out.waiting += 1;
+        problem(
+            &mut out,
+            item,
+            "waiting",
+            &e.to_string(),
+            e.busy_reason().unwrap_or("unavailable"),
+        );
+    }
 
     if !pending.fetch.is_empty() {
         // Not done: keep the list for the next run.
@@ -751,14 +928,21 @@ async fn one_round(ctx: &Ctx<'_>, src: &mut Source, started: i64) -> Outcome {
         update_pack(ctx, src, &sketches, deadline).await;
         let mut p = progress(pending.done, pending.planned);
         match stop {
-            Some(ConnectorError::RateLimited(_)) => {
+            Some(e) if e.is_busy() => {
                 p.phase = "waiting".into();
                 out.more = true;
-                out.wait_secs = RATE_WAIT_SECS;
+                out.wait_secs = run_wait;
             }
             Some(e) => out.error = Some(e),
             None if out.over_budget => {}
-            None => out.more = true,
+            None => {
+                out.more = true;
+                if run_wait > 0 {
+                    // Only items that weren't answered are left: wait first.
+                    p.phase = "waiting".into();
+                    out.wait_secs = run_wait;
+                }
+            }
         }
         src.progress = Some(p);
         src.items = live;
@@ -1007,6 +1191,9 @@ async fn index_item(
     );
     // The same text as what is searchable now: nothing to embed.
     f.skipped.clear();
+    f.retry_at.clear();
+    f.reason.clear();
+    f.hint = serde_json::Value::Null;
     if prev.is_some_and(|p| p.content_hash == hash && p.ready_version > 0) {
         f.status = FileStatus::Ready;
         f.error.clear();
@@ -1112,7 +1299,8 @@ async fn index_item(
 }
 
 /// Notes an item the run couldn't read or left out, for the history.
-fn problem(out: &mut Outcome, item: &Listed, kind: &str, why: &str) {
+fn problem(out: &mut Outcome, item: &Listed, kind: &str, why: &str, reason: &str) {
+    super::runs::count_reason(&mut out.reasons, kind, reason);
     if out.problems.len() < super::runs::MAX_RUN_PROBLEMS {
         out.problems.push(super::runs::ItemProblem {
             name: item.title.clone(),
@@ -1120,6 +1308,7 @@ fn problem(out: &mut Outcome, item: &Listed, kind: &str, why: &str) {
             kind: kind.into(),
             error: crate::truncate_str(why, 300).to_string(),
             fix: super::runs::item_fix(why, kind),
+            reason: reason.to_string(),
         });
     }
 }
@@ -1143,7 +1332,45 @@ async fn mark_failed(
     f.path = item.path.clone();
     f.status = FileStatus::Failed;
     f.error = crate::truncate_str(why, 300).to_string();
+    f.retry_at.clear();
+    f.hint = serde_json::Value::Null;
+    f.reason = if skipped.is_empty() {
+        kb::reason_of(why).to_string()
+    } else {
+        skipped.to_string()
+    };
+    if f.reason == "rate_limited" || f.reason == "unavailable" {
+        // Permanent here: the words only sound passing.
+        f.reason = "failed".into();
+    }
     // Fetch it again next time even though its marker is unchanged.
+    f.remote_version.clear();
+    let _ = ctx.store.put_item(ctx.team, &f).await;
+}
+
+/// Records that an item was refused for a passing reason and is read again
+/// at `at` (unix seconds). A version that was searchable stays searchable;
+/// it never counts as "couldn't read".
+async fn mark_waiting(
+    ctx: &Ctx<'_>,
+    src: &Source,
+    item: &Listed,
+    prev: Option<&FileMeta>,
+    e: &ConnectorError,
+    at: i64,
+) {
+    let mut f = base_item(src, item, prev, (ctx.now)());
+    if f.name.is_empty() {
+        f.name = item.title.clone();
+    }
+    f.url = item.url.clone();
+    f.path = item.path.clone();
+    f.skipped.clear();
+    f.status = FileStatus::Failed;
+    f.error = crate::truncate_str(&e.to_string(), 300).to_string();
+    f.reason = e.busy_reason().unwrap_or("unavailable").to_string();
+    f.retry_at = rfc3339(at);
+    f.hint = item.hint.clone();
     f.remote_version.clear();
     let _ = ctx.store.put_item(ctx.team, &f).await;
 }

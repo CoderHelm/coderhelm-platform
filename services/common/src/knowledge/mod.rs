@@ -480,6 +480,80 @@ pub struct FileMeta {
     /// When its text was last indexed (RFC 3339).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub indexed_at: String,
+    /// A synced item the provider refused for a passing reason (a rate
+    /// limit, an overloaded or silent server): when it is read again (RFC
+    /// 3339). It shows "waiting to retry", never "couldn't read".
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub retry_at: String,
+    /// Why it isn't searchable now, as one word the page groups by
+    /// ([`FileMeta::reason_code`]); empty when nothing is wrong.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reason: String,
+    /// What the connector needs again to fetch it ([`sources::connector::Listed::hint`]),
+    /// kept while it waits to be read again.
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub hint: serde_json::Value,
+}
+
+/// Reasons an item waits and is read again on its own.
+pub const PASSING_REASONS: &[&str] = &["rate_limited", "unavailable"];
+
+impl FileMeta {
+    /// Read again on its own later: refused for a passing reason.
+    pub fn is_waiting(&self) -> bool {
+        self.status == FileStatus::Failed && self.skipped.is_empty() && !self.retry_at.is_empty()
+    }
+
+    /// Why it isn't searchable, as one word: `rate_limited`, `unavailable`,
+    /// `too_large`, `empty`, `unsupported`, `forbidden`, `not_found` or
+    /// `failed`; empty when it is fine. Items saved before reasons were
+    /// kept are read from their error.
+    pub fn reason_code(&self) -> &str {
+        if !self.reason.is_empty() {
+            return &self.reason;
+        }
+        if !self.skipped.is_empty() {
+            return &self.skipped;
+        }
+        if self.status != FileStatus::Failed {
+            return "";
+        }
+        reason_of(&self.error)
+    }
+}
+
+/// The reason word for an error in plain words (for items saved before
+/// reasons were kept).
+pub fn reason_of(error: &str) -> &'static str {
+    let e = error.to_lowercase();
+    if e.contains("answered 429")
+        || e.contains("rate limit")
+        || e.contains("too many requests")
+        || e.contains("slow down")
+        || e.contains("limiting how fast")
+    {
+        "rate_limited"
+    } else if e.contains("stopped answering")
+        || e.contains("answered 502")
+        || e.contains("answered 503")
+        || e.contains("answered 504")
+        || e.contains("timed out")
+        || e.contains("timeout")
+        || e.contains("didn't answer")
+        || e.contains("overloaded")
+    {
+        "unavailable"
+    } else if e.contains("64 kib")
+        || e.contains("size limit")
+        || e.contains("too large")
+        || e.contains("larger than")
+    {
+        "too_large"
+    } else if e.contains("access") || e.contains("permission") || e.contains("forbidden") {
+        "forbidden"
+    } else {
+        "failed"
+    }
 }
 
 impl FileMeta {

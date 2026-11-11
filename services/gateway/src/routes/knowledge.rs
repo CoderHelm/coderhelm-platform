@@ -307,6 +307,8 @@ fn file_json(f: &FileMeta) -> Value {
         "path": f.path,
         "skipped": f.skipped,
         "indexed_at": f.indexed_at,
+        "reason": f.reason_code(),
+        "retry_at": if f.is_waiting() { f.retry_at.as_str() } else { "" },
     })
 }
 
@@ -319,7 +321,7 @@ fn base_json(
     let count = |s: FileStatus| {
         files
             .iter()
-            .filter(|f| f.skipped.is_empty() && f.shown_status(now).0 == s)
+            .filter(|f| f.skipped.is_empty() && !f.is_waiting() && f.shown_status(now).0 == s)
             .count()
     };
     let secs = now.timestamp();
@@ -352,6 +354,7 @@ fn base_json(
         "ready": count(FileStatus::Ready),
         "processing": count(FileStatus::Processing) + count(FileStatus::Uploading),
         "failed": count(FileStatus::Failed),
+        "waiting": files.iter().filter(|f| f.is_waiting()).count(),
         "skipped": files.iter().filter(|f| !f.skipped.is_empty()).count(),
         "passages": files.iter().filter(|f| f.ready_version > 0).map(|f| u64::from(f.chunks)).sum::<u64>(),
     })
@@ -743,7 +746,8 @@ pub struct ItemsQuery {
     /// Words in the title or breadcrumb.
     #[serde(default)]
     pub q: String,
-    /// `searchable`, `working`, `failed`, `skipped`, `cut_short`, or empty.
+    /// `searchable`, `working`, `waiting`, `failed`, `skipped`, `cut_short`,
+    /// or empty.
     #[serde(default)]
     pub status: String,
     /// A source id, `upload`, or empty.
@@ -765,6 +769,9 @@ pub struct ItemsQuery {
 pub fn item_state(f: &FileMeta, now: chrono::DateTime<chrono::Utc>) -> &'static str {
     if !f.skipped.is_empty() {
         return "skipped";
+    }
+    if f.is_waiting() {
+        return "waiting";
     }
     match f.shown_status(now).0 {
         FileStatus::Ready if f.truncated => "cut_short",
@@ -823,10 +830,15 @@ pub fn item_matches(
 }
 
 /// One page of a base's items with the filters applied, the count of each
-/// state and the tree's groups (each filter's counts ignore that filter).
+/// state and the tree's groups (each filter's counts ignore that filter),
+/// and the items that aren't searchable grouped by source and reason
+/// ("165 waiting: rate limited"), with the soonest retry.
 pub fn items_page(files: &[FileMeta], q: &ItemsQuery, now: chrono::DateTime<chrono::Utc>) -> Value {
     let mut states: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
     let mut groups: std::collections::BTreeMap<(String, String), (usize, usize, String)> =
+        std::collections::BTreeMap::new();
+    // (source, state, reason) -> (items, soonest retry)
+    let mut reasons: std::collections::BTreeMap<(String, &str, String), (usize, String)> =
         std::collections::BTreeMap::new();
     let mut matching: Vec<&FileMeta> = Vec::new();
     let (want_source, want_top) = q.group.split_once('|').unwrap_or(("", ""));
@@ -836,6 +848,15 @@ pub fn items_page(files: &[FileMeta], q: &ItemsQuery, now: chrono::DateTime<chro
         }
         let state = item_state(f, now);
         *states.entry(state).or_default() += 1;
+        if matches!(state, "waiting" | "failed" | "skipped") {
+            let e = reasons
+                .entry((item_group(f).0, state, f.reason_code().to_string()))
+                .or_default();
+            e.0 += 1;
+            if state == "waiting" && (e.1.is_empty() || f.retry_at < e.1) {
+                e.1 = f.retry_at.clone();
+            }
+        }
         if !q.status.is_empty() && state != q.status {
             continue;
         }
@@ -866,6 +887,23 @@ pub fn items_page(files: &[FileMeta], q: &ItemsQuery, now: chrono::DateTime<chro
         .map(|f| file_json(f))
         .collect();
     let end = start + page.len();
+    let mut reasons: Vec<(usize, Value)> = reasons
+        .into_iter()
+        .map(|((source, state, reason), (n, next))| {
+            (
+                n,
+                json!({
+                    "source": source,
+                    "state": state,
+                    "reason": reason,
+                    "items": n,
+                    "next_try_at": next,
+                }),
+            )
+        })
+        .collect();
+    reasons.sort_by_key(|(n, _)| std::cmp::Reverse(*n));
+    let reasons: Vec<Value> = reasons.into_iter().map(|(_, v)| v).collect();
     json!({
         "items": page,
         "total": matching.len(),
@@ -879,6 +917,7 @@ pub fn items_page(files: &[FileMeta], q: &ItemsQuery, now: chrono::DateTime<chro
             "failed": failed,
             "newest": newest,
         })).collect::<Vec<_>>(),
+        "reasons": reasons,
         "all": files.len(),
     })
 }
@@ -2097,6 +2136,83 @@ mod tests {
             as_of: as_of.into(),
             ..Default::default()
         }
+    }
+
+    /// Items an app refused for a passing reason show "waiting", never
+    /// "failed", and the items that aren't searchable are summed up by
+    /// source and reason with the soonest retry: one line for 165 rate
+    /// limited documents, not 165 rows.
+    #[test]
+    fn waiting_items_are_their_own_state_and_reasons_are_summed_up() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-11T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let mut files: Vec<FileMeta> = (0..165)
+            .map(|i| {
+                let mut f = item(
+                    &format!("w{i}"),
+                    "s1",
+                    "Site",
+                    FileStatus::Failed,
+                    "2026-11-01",
+                );
+                f.error = "Sanity is limiting how fast Coderhelm reads.".into();
+                f.reason = "rate_limited".into();
+                f.retry_at = format!("2026-11-11T12:{:02}:00+00:00", 10 + i % 40);
+                f
+            })
+            .collect();
+        let mut gone = item("x", "s1", "Site", FileStatus::Failed, "2026-11-01");
+        gone.error = "The Sanity connection can't see this.".into();
+        gone.reason = "forbidden".into();
+        files.push(gone);
+        // Saved before reasons were kept: read from its words.
+        let mut old = item("y", "s1", "Site", FileStatus::Failed, "2026-11-01");
+        old.error = "The server answered 429 to an MCP request.".into();
+        files.push(old);
+        files.push(item("z", "s1", "Site", FileStatus::Ready, "2026-11-01"));
+        let page = items_page(&files, &ItemsQuery::default(), now);
+        assert_eq!(page["states"]["waiting"], 165);
+        assert_eq!(page["states"]["failed"], 2);
+        let reasons = page["reasons"].as_array().unwrap();
+        assert_eq!(reasons.len(), 3);
+        assert_eq!(reasons[0]["state"], "waiting");
+        assert_eq!(reasons[0]["reason"], "rate_limited");
+        assert_eq!(reasons[0]["items"], 165);
+        assert_eq!(reasons[0]["next_try_at"], "2026-11-11T12:10:00+00:00");
+        assert!(reasons
+            .iter()
+            .any(|r| r["state"] == "failed" && r["reason"] == "forbidden" && r["items"] == 1));
+        assert!(reasons
+            .iter()
+            .any(|r| r["state"] == "failed" && r["reason"] == "rate_limited" && r["items"] == 1));
+        let groups = page["groups"].as_array().unwrap();
+        assert_eq!(
+            groups[0]["failed"], 2,
+            "waiting items aren't counted as failed"
+        );
+        // The filter, and what an item says.
+        let q = ItemsQuery {
+            status: "waiting".into(),
+            ..Default::default()
+        };
+        let w = items_page(&files, &q, now);
+        assert_eq!(w["total"], 165);
+        assert_eq!(w["items"][0]["reason"], "rate_limited");
+        assert!(w["items"][0]["retry_at"]
+            .as_str()
+            .unwrap()
+            .starts_with("2026-11-11T12:"));
+        // The base's tiles: waiting apart from couldn't read.
+        let base = Base {
+            id: "kb".into(),
+            ..Default::default()
+        };
+        let b = base_json(&base, &files, &[]);
+        assert_eq!(
+            (b["failed"].as_u64(), b["waiting"].as_u64()),
+            (Some(2), Some(165))
+        );
     }
 
     #[test]

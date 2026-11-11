@@ -93,6 +93,16 @@ pub enum CallError {
     Unreachable(String),
     /// The server answered, but not with a usable reply.
     Protocol(String),
+    /// The server is overloaded or asks Coderhelm to slow down (`429`,
+    /// `502` to `504`, or a JSON-RPC error that says so). Passing: the
+    /// caller waits and asks again, `retry_after` seconds when the server
+    /// says how long.
+    Busy {
+        why: String,
+        retry_after: Option<u64>,
+        /// A rate limit (`429`), as opposed to an overloaded server.
+        rate_limited: bool,
+    },
 }
 
 impl std::fmt::Display for CallError {
@@ -104,14 +114,94 @@ impl std::fmt::Display for CallError {
                 None => f.write_str("The server refused this request (forbidden)."),
             },
             CallError::Unreachable(m) | CallError::Protocol(m) => f.write_str(m),
+            CallError::Busy { why, .. } => f.write_str(why),
         }
     }
 }
 
 impl From<HttpError> for CallError {
     fn from(e: HttpError) -> Self {
-        CallError::Unreachable(e.to_string())
+        match e {
+            // Our own guard refused the address: asking again changes nothing.
+            HttpError::Refused(m) => CallError::Protocol(m),
+            HttpError::Unreachable(m) => CallError::Unreachable(m),
+        }
     }
+}
+
+/// Longest `Retry-After` taken as given (seconds); a longer one is cut to
+/// this, so a wrong header can't park a sync for days.
+pub const MAX_RETRY_AFTER_SECS: u64 = 15 * 60;
+
+/// How long the server asks Coderhelm to wait: `Retry-After` in seconds or
+/// as an HTTP date, else a `retryAfter` (seconds) or `retryAfterMs` in the
+/// JSON-RPC error's data.
+pub fn retry_after_secs(r: &HttpResponse) -> Option<u64> {
+    let from_header = r.header("retry-after").and_then(|v| {
+        let v = v.trim();
+        v.parse::<u64>().ok().or_else(|| {
+            chrono::DateTime::parse_from_rfc2822(v)
+                .ok()
+                .map(|t| (t.timestamp() - chrono::Utc::now().timestamp()).max(0) as u64)
+        })
+    });
+    from_header
+        .or_else(|| {
+            r.json()
+                .and_then(|v| rpc_retry_after(&v["error"]).or_else(|| rpc_retry_after(&v)))
+        })
+        .map(|s| s.min(MAX_RETRY_AFTER_SECS))
+}
+
+/// A wait named in a JSON-RPC error's `data` (or the object itself).
+fn rpc_retry_after(e: &Value) -> Option<u64> {
+    let d = if e["data"].is_object() { &e["data"] } else { e };
+    let secs = ["retryAfter", "retry_after", "retryAfterSeconds"]
+        .iter()
+        .find_map(|k| d.get(*k).and_then(Value::as_f64));
+    let ms = ["retryAfterMs", "retry_after_ms"]
+        .iter()
+        .find_map(|k| d.get(*k).and_then(Value::as_f64))
+        .map(|ms| ms / 1000.0);
+    secs.or(ms)
+        .filter(|s| s.is_finite() && *s >= 0.0)
+        .map(|s| (s.ceil() as u64).min(MAX_RETRY_AFTER_SECS))
+}
+
+/// A reply that says the server is overloaded or rate limiting: `429`,
+/// `502`, `503` or `504`.
+fn busy_status(r: &HttpResponse) -> Option<CallError> {
+    let rate_limited = match r.status {
+        429 => true,
+        502..=504 => false,
+        _ => return None,
+    };
+    Some(CallError::Busy {
+        why: if rate_limited {
+            "The server asked Coderhelm to slow down (429).".into()
+        } else {
+            format!("The server is overloaded right now ({}).", r.status)
+        },
+        retry_after: retry_after_secs(r),
+        rate_limited,
+    })
+}
+
+/// A JSON-RPC error that says to slow down: code `429` or `-32029`, words
+/// like "rate limit", or a wait in its data.
+fn rpc_busy(e: &Value) -> Option<CallError> {
+    let code = e["code"].as_i64().unwrap_or(0);
+    let msg = e["message"].as_str().unwrap_or("").to_lowercase();
+    let rate_limited = code == 429
+        || code == -32029
+        || msg.contains("rate limit")
+        || msg.contains("too many requests");
+    let retry_after = rpc_retry_after(e);
+    (rate_limited || retry_after.is_some()).then(|| CallError::Busy {
+        why: rpc_error_text(e),
+        retry_after,
+        rate_limited,
+    })
 }
 
 /// How to sign each request: a header name and value (`Authorization:
@@ -355,9 +445,12 @@ impl Conn<'_> {
                 CallError::Protocol("The server's reply had no answer in it.".into())
             })?;
             if let Some(e) = resp.get("error") {
-                return Err(CallError::Protocol(rpc_error_text(e)));
+                return Err(rpc_busy(e).unwrap_or_else(|| CallError::Protocol(rpc_error_text(e))));
             }
             return Ok(Modern::Done(resp["result"].clone()));
+        }
+        if let Some(e) = busy_status(&r) {
+            return Err(e);
         }
         if matches!(r.status, 400 | 404 | 405) {
             let err = r.json().and_then(|v| v.get("error").cloned());
@@ -407,6 +500,9 @@ impl Conn<'_> {
         if let Some(e) = auth_failure(&r) {
             return Err(e);
         }
+        if let Some(e) = busy_status(&r) {
+            return Err(e);
+        }
         if !(200..300).contains(&r.status) {
             return Err(CallError::Protocol(format!(
                 "The server answered {} when Coderhelm said hello. Check that this is the MCP endpoint (often ending in /mcp).",
@@ -416,7 +512,7 @@ impl Conn<'_> {
         let resp = find_response(&r, 0)
             .ok_or_else(|| CallError::Protocol("The server didn't answer the hello.".into()))?;
         if let Some(e) = resp.get("error") {
-            return Err(CallError::Protocol(rpc_error_text(e)));
+            return Err(rpc_busy(e).unwrap_or_else(|| CallError::Protocol(rpc_error_text(e))));
         }
         let version = resp["result"]["protocolVersion"]
             .as_str()
@@ -459,6 +555,9 @@ impl Conn<'_> {
         if let Some(e) = auth_failure(&r) {
             return Err(e);
         }
+        if let Some(e) = busy_status(&r) {
+            return Err(e);
+        }
         if !(200..300).contains(&r.status) {
             return Err(CallError::Protocol(format!(
                 "The server answered {} to {method}.",
@@ -468,7 +567,7 @@ impl Conn<'_> {
         let resp = find_response(&r, 1)
             .ok_or_else(|| CallError::Protocol("The server's reply had no answer in it.".into()))?;
         if let Some(e) = resp.get("error") {
-            return Err(CallError::Protocol(rpc_error_text(e)));
+            return Err(rpc_busy(e).unwrap_or_else(|| CallError::Protocol(rpc_error_text(e))));
         }
         Ok(resp["result"].clone())
     }
@@ -781,6 +880,70 @@ mod tests {
         );
         // The session is closed afterwards.
         assert!(f.sent().iter().any(|r| r.method == Method::Delete));
+    }
+
+    /// A `429` is a slow-down with the server's wait, never a final error;
+    /// so is a `503`, and a JSON-RPC error that names a wait.
+    #[tokio::test]
+    async fn overload_and_rate_limits_are_busy_with_their_wait() {
+        let f = Fake::default();
+        f.with(|_| Some(resp(429, &[("retry-after", "7")], "")));
+        match conn(&f, None).list_tools().await.unwrap_err() {
+            CallError::Busy {
+                retry_after,
+                rate_limited,
+                ..
+            } => assert_eq!((retry_after, rate_limited), (Some(7), true)),
+            other => panic!("{other:?}"),
+        }
+        let f = Fake::default();
+        f.with(|_| Some(resp(503, &[], "")));
+        assert!(matches!(
+            conn(&f, None).list_tools().await.unwrap_err(),
+            CallError::Busy {
+                rate_limited: false,
+                retry_after: None,
+                ..
+            }
+        ));
+        let f = Fake::default();
+        f.with(|_| Some(fjson(200, json!({"jsonrpc": "2.0", "id": 1, "error": {"code": -32000, "message": "Rate limit exceeded", "data": {"retryAfterMs": 2500}}}))));
+        assert!(matches!(
+            conn(&f, None).list_tools().await.unwrap_err(),
+            CallError::Busy {
+                rate_limited: true,
+                retry_after: Some(3),
+                ..
+            }
+        ));
+        // A wait as an HTTP date, and one far too long, cut to the cap.
+        let at = (chrono::Utc::now() + chrono::Duration::seconds(30)).to_rfc2822();
+        let r = resp(429, &[("retry-after", &at)], "");
+        assert!(retry_after_secs(&r).is_some_and(|s| (25..=30).contains(&s)));
+        let r = resp(429, &[("retry-after", "999999")], "");
+        assert_eq!(retry_after_secs(&r), Some(MAX_RETRY_AFTER_SECS));
+    }
+
+    /// A server remembered as legacy that answers its hello with `429` is
+    /// rate limiting, not "no longer answering" (what a sync showed for a
+    /// few documents in a burst of 429s).
+    #[tokio::test]
+    async fn a_legacy_hello_refused_with_429_is_a_rate_limit() {
+        let f = Fake::default();
+        f.with(|_| Some(resp(429, &[("retry-after", "2")], "")));
+        let e = conn(&f, Some(Era::Legacy)).list_tools().await.unwrap_err();
+        assert!(
+            matches!(
+                e,
+                CallError::Busy {
+                    rate_limited: true,
+                    retry_after: Some(2),
+                    ..
+                }
+            ),
+            "{e:?}"
+        );
+        assert!(!e.to_string().contains("stopped answering"));
     }
 
     #[tokio::test]

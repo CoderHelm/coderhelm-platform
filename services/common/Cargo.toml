@@ -79,7 +79,8 @@ lopdf = { version = "0.46", default-features = false }
 yaml-rust2 = "0.10"
 
 [dev-dependencies]
-# model_retry: a local fake server in the tests
-tokio = { version = "1", features = ["macros", "time", "net", "rt", "rt-multi-thread", "io-util", "sync"] }
+# model_retry: a local fake server in the tests; test-util: paused clocks
+# for the knowledge sources' backoff tests
+tokio = { version = "1", features = ["macros", "time", "net", "rt", "rt-multi-thread", "io-util", "sync", "test-util"] }
 # live: the ignored tests against a real AWS account
 aws-config = { version = "1", features = ["behavior-version-latest"] }

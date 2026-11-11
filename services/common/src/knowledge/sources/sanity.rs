@@ -104,7 +104,9 @@ impl Sanity<'_> {
         }
         let mut r = HttpRequest::get(&self.query_url(dataset, groq, params))
             .header("Authorization", &self.auth);
-        r.limit = Limit::Mcp;
+        // A large document comes whole from the API (no answer size limit
+        // like the MCP server's): read it with a document's limit.
+        r.limit = Limit::Document;
         let v = send_json(self.http, r, "Sanity").await?;
         Ok(v["result"].clone())
     }

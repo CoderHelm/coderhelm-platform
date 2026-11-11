@@ -282,8 +282,23 @@ impl ArchiveBytes for StoredArchive {
             .key(&self.key)
             .send()
             .await
-            .map_err(|_| {
-                ConnectorError::Config("The uploaded archive wasn't found. Upload it again.".into())
+            .map_err(|e| {
+                use aws_sdk_s3::error::ProvideErrorMetadata;
+                match e.as_service_error().and_then(|se| se.code()) {
+                    Some("NoSuchKey" | "NotFound" | "NoSuchBucket") | Some("AccessDenied") => {
+                        ConnectorError::Config(
+                            "The uploaded archive wasn't found. Upload it again.".into(),
+                        )
+                    }
+                    // A throttle, a busy S3 or no answer: read it again later.
+                    Some("SlowDown" | "ThrottlingException" | "RequestLimitExceeded") => {
+                        ConnectorError::rate_limited("S3 asked us to slow down.", None)
+                    }
+                    _ => ConnectorError::unavailable(
+                        "The uploaded archive couldn't be read just now.",
+                        None,
+                    ),
+                }
             })?;
         if out.content_length().unwrap_or(0).max(0) as u64 > MAX_ARCHIVE_BYTES {
             return Err(ConnectorError::Config("The archive is too large.".into()));
@@ -292,7 +307,7 @@ impl ArchiveBytes for StoredArchive {
             .body
             .collect()
             .await
-            .map_err(|_| ConnectorError::Temporary("The archive couldn't be read.".into()))?
+            .map_err(|_| ConnectorError::unavailable("The archive's download was cut off.", None))?
             .into_bytes()
             .to_vec())
     }

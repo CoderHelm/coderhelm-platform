@@ -70,6 +70,20 @@ pub fn conn_error(provider: &str, e: ConnError) -> ConnectorError {
         }
         ConnError::NeedsReconnect(why) | ConnError::Failed(why) => ConnectorError::Reconnect(why),
         ConnError::Temporary(why) => ConnectorError::Temporary(why),
+        ConnError::Busy {
+            why,
+            retry_after,
+            rate_limited: true,
+        } => ConnectorError::rate_limited(
+            format!("{provider} is limiting how fast Coderhelm reads. {why}"),
+            retry_after,
+        ),
+        ConnError::Busy {
+            why, retry_after, ..
+        } => ConnectorError::unavailable(
+            format!("{provider} didn't answer in time. {why}"),
+            retry_after,
+        ),
     }
 }
 
@@ -134,11 +148,25 @@ pub fn result_json(provider: &str, result: &Value) -> Result<Value, ConnectorErr
         .collect();
     if result["isError"].as_bool() == Some(true) {
         let said = crate::truncate_str(texts.join(" ").trim(), 300).to_string();
-        return Err(ConnectorError::Temporary(if said.is_empty() {
+        let message = if said.is_empty() {
             format!("{provider} reported an error.")
         } else {
             format!("{provider} said: {said}")
-        }));
+        };
+        let lower = said.to_lowercase();
+        // A tool that answers "slow down" or "timed out" in words is as
+        // passing as a 429 or a 503.
+        if lower.contains("rate limit")
+            || lower.contains("too many requests")
+            || lower.contains("429")
+        {
+            return Err(ConnectorError::rate_limited(message, None));
+        }
+        if lower.contains("timed out") || lower.contains("timeout") || lower.contains("overloaded")
+        {
+            return Err(ConnectorError::unavailable(message, None));
+        }
+        return Err(ConnectorError::Temporary(message));
     }
     if let Some(s) = result.get("structuredContent").filter(|s| !s.is_null()) {
         return Ok(s.clone());
@@ -161,6 +189,16 @@ pub fn result_json(provider: &str, result: &Value) -> Result<Value, ConnectorErr
     Err(ConnectorError::Temporary(format!(
         "{provider}'s answer couldn't be read. Try again in a minute; if it keeps happening, disconnect {provider} and connect it again."
     )))
+}
+
+/// Did the server refuse an answer for its size (Sanity's "The query
+/// result exceeds the 64 KiB size limit")? Such a read works in smaller
+/// pieces.
+pub fn too_large(e: &ConnectorError) -> bool {
+    let m = e.to_string().to_lowercase();
+    m.contains("exceeds the") && (m.contains("size limit") || m.contains("kib"))
+        || m.contains("result too large")
+        || m.contains("response too large")
 }
 
 /// The data in one text: JSON when it is, or starts with, a JSON value;

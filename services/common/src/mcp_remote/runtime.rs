@@ -86,15 +86,49 @@ pub enum ConnError {
     Failed(String),
     /// Something passing (the server is down, a refresh is under way).
     Temporary(String),
+    /// The server is overloaded, rate limiting, timed out or dropped the
+    /// connection: asking again later works. `retry_after` is the wait the
+    /// server named, in seconds.
+    Busy {
+        why: String,
+        retry_after: Option<u64>,
+        rate_limited: bool,
+    },
+}
+
+impl ConnError {
+    /// A failed call as a connection error: the server's overload and a
+    /// dropped connection are [`ConnError::Busy`], anything else passing is
+    /// [`ConnError::Temporary`].
+    fn of_call(e: CallError) -> Self {
+        match e {
+            CallError::Busy {
+                why,
+                retry_after,
+                rate_limited,
+            } => ConnError::Busy {
+                why,
+                retry_after,
+                rate_limited,
+            },
+            CallError::Unreachable(why) => ConnError::Busy {
+                why,
+                retry_after: None,
+                rate_limited: false,
+            },
+            other => ConnError::Temporary(other.to_string()),
+        }
+    }
 }
 
 impl std::fmt::Display for ConnError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ConnError::NotConnected => f.write_str("Not connected yet."),
-            ConnError::NeedsReconnect(r) | ConnError::Failed(r) | ConnError::Temporary(r) => {
-                f.write_str(r)
-            }
+            ConnError::NeedsReconnect(r)
+            | ConnError::Failed(r)
+            | ConnError::Temporary(r)
+            | ConnError::Busy { why: r, .. } => f.write_str(r),
         }
     }
 }
@@ -636,7 +670,7 @@ impl Runtime {
                 Err(e @ (CallError::Unauthorized(_) | CallError::Forbidden(_))) => {
                     return Err(self.refused(s, owner, &e).await)
                 }
-                Err(e) => return Err(ConnError::Temporary(e.to_string())),
+                Err(e) => return Err(ConnError::of_call(e)),
             }
         }
         Err(ConnError::Temporary("The server didn't answer.".into()))
@@ -777,7 +811,7 @@ impl Runtime {
                 Err(e @ (CallError::Unauthorized(_) | CallError::Forbidden(Some(_)))) => {
                     return Err(self.refused(s, owner, &e).await)
                 }
-                Err(e) => return Err(ConnError::Temporary(e.to_string())),
+                Err(e) => return Err(ConnError::of_call(e)),
             }
         }
         Err(ConnError::Temporary("The server didn't answer.".into()))
