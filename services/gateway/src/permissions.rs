@@ -141,6 +141,8 @@ pub const CAPABILITIES: &[Capability] = &[
             "knowledge::poll_sources",
             "knowledge::list_items",
             "knowledge::list_runs",
+            "knowledge_ask::search_base",
+            "knowledge_ask::suggestions",
             "brain::list_threads",
             "brain::get_thread",
             "brain::sources",

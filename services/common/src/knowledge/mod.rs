@@ -30,6 +30,7 @@
 //! search with that person's access in the tool itself.
 
 pub mod answer;
+pub mod ask;
 pub mod bedrock_sync;
 pub mod chunk;
 pub mod extract;
