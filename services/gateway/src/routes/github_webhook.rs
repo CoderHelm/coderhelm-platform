@@ -288,6 +288,12 @@ pub async fn handle(
 
     info!(event_type, installation_id, "GitHub webhook received");
 
+    // An installation changed (new permissions accepted, suspended, ...):
+    // the broker reads its permissions again before the next token.
+    if event_type == "installation" {
+        super::hybrid::forget_installation_permissions(&state, installation_id).await;
+    }
+
     // Hosted side of hybrid: an installation linked to a self-hosted install
     // is forwarded there (re-signed) instead of being handled here.
     let action = payload["action"].as_str().unwrap_or("");

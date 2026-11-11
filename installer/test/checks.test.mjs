@@ -12,7 +12,7 @@ import path from "node:path";
 import * as C from "../lib/checks.mjs";
 import { gate, BACK, CheckFailed } from "../lib/gate.mjs";
 import { main } from "../lib/cli.mjs";
-import { PERMISSIONS, EVENTS } from "../lib/github-app.mjs";
+import { PERMISSIONS, EVENTS, OPTIONAL_WHY } from "../lib/github-app.mjs";
 import { FakeRunner } from "./fake.mjs";
 
 const ACCOUNT = "111122223333";
@@ -251,6 +251,15 @@ test("GitHub: no app, refused keys, missing permissions, wrong webhook, bad secr
   assert.match(securityWarn.what, /Dependabot alerts: read/);
   assert.match(securityWarn.what, /dependabot_alert event/);
   assert.match(securityWarn.why, /Security fixes/);
+
+  // Every optional permission a new app asks for warns with what it limits.
+  for (const [key, why] of Object.entries(OPTIONAL_WHY)) {
+    const lacking = { ...APP, permissions: { ...PERMISSIONS, [key]: key === "checks" ? "read" : undefined } };
+    if (key !== "checks") delete lacking.permissions[key];
+    const r = (await C.checkGithubApp({ fetchImpl: github({ "/app": json(200, lacking) }).fetchImpl }, SECRET, "https://helm.example.org")).find((x) => x.id === "github_permissions");
+    assert.equal(r.status, C.WARN, key);
+    assert.ok(r.why.includes(why), `${key}: ${r.why}`);
+  }
 
   const hook = (await C.checkGithubApp({ fetchImpl: github({ "/app/hook/config": json(200, { url: "https://old.example.org/webhooks/github" }) }).fetchImpl }, SECRET, "https://helm.example.org")).find((r) => r.id === "github_webhook");
   assertExplained(hook);

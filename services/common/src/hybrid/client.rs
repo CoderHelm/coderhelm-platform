@@ -185,6 +185,45 @@ pub fn check_answer(
 struct Cached {
     token: String,
     expires_at: i64,
+    grant: TokenGrant,
+}
+
+/// What the broker's last token for an installation carries.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TokenGrant {
+    /// Permission name to level, as minted.
+    pub permissions: std::collections::BTreeMap<String, String>,
+    /// Permissions CoderHelm's app carries that the installation hasn't
+    /// granted (its owner hasn't accepted them yet).
+    pub withheld: Vec<String>,
+    /// Whether the broker read the installation's permissions (false: an
+    /// older broker, or GitHub couldn't say).
+    pub installation_known: bool,
+}
+
+impl TokenGrant {
+    /// Reads the broker's token answer.
+    pub fn from_answer(v: &serde_json::Value) -> Self {
+        TokenGrant {
+            permissions: crate::hybrid::broker::granted_permissions(v),
+            withheld: v["withheld"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|w| w.as_str().map(String::from))
+                .collect(),
+            installation_known: v["installation_permissions_known"].as_bool() == Some(true),
+        }
+    }
+}
+
+/// The permissions of the broker's current token for an installation, once
+/// one was minted.
+pub fn token_grant(installation_id: u64) -> Option<TokenGrant> {
+    TOKENS.lock().ok().and_then(|g| {
+        g.as_ref()
+            .and_then(|m| m.get(&installation_id).map(|c| c.grant.clone()))
+    })
 }
 
 static TOKENS: Mutex<Option<HashMap<u64, Cached>>> = Mutex::new(None);
@@ -244,6 +283,7 @@ pub async fn github_token(
             Cached {
                 token: token.clone(),
                 expires_at,
+                grant: TokenGrant::from_answer(&v),
             },
         );
     }
@@ -264,6 +304,25 @@ pub fn github_via_broker(own_private_key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_brokers_answer_says_what_the_token_carries_and_lacks() {
+        let g = TokenGrant::from_answer(&serde_json::json!({
+            "token": "t",
+            "permissions": {"contents": "write", "metadata": "read"},
+            "withheld": ["vulnerability_alerts"],
+            "installation_permissions_known": true,
+        }));
+        assert_eq!(
+            g.permissions.get("contents").map(String::as_str),
+            Some("write")
+        );
+        assert_eq!(g.withheld, vec!["vulnerability_alerts"]);
+        assert!(g.installation_known);
+        // An older broker says neither.
+        let old = TokenGrant::from_answer(&serde_json::json!({"token": "t"}));
+        assert!(old.withheld.is_empty() && !old.installation_known);
+    }
 
     #[test]
     fn credentials_need_all_three_parts_and_a_real_id() {

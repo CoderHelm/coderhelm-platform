@@ -97,7 +97,44 @@ pub const MAX_PERMISSIONS: &[(&str, &str)] = &[
     ("statuses", "read"),
     ("workflows", "write"),
     ("metadata", "read"),
+    // Added later: an installation made before has them only once its owner
+    // accepts them, so they are asked for only when the installation has
+    // them ([`ONLY_WHEN_GRANTED`]).
+    // Security fixes read Dependabot's alerts.
+    ("vulnerability_alerts", "read"),
+    // Deployments and their statuses (what shipped where).
+    ("deployments", "read"),
+    // The repository's own security advisories.
+    ("repository_advisories", "read"),
+    // GitHub's code quality findings.
+    ("code_quality", "read"),
 ];
+
+/// Permissions an installation may not have (added to the app after it was
+/// installed, and not yet accepted by its owner): asked for only when the
+/// installation's own permissions are known to include them. Every other
+/// one in [`MAX_PERMISSIONS`] is one every installation has.
+pub const ONLY_WHEN_GRANTED: &[&str] = &[
+    "vulnerability_alerts",
+    "deployments",
+    "repository_advisories",
+    "code_quality",
+];
+
+/// An installation's granted permissions, from GitHub's
+/// `GET /app/installations/{id}` (its `permissions` object).
+pub fn granted_permissions(
+    installation: &serde_json::Value,
+) -> std::collections::BTreeMap<String, String> {
+    installation["permissions"]
+        .as_object()
+        .map(|o| {
+            o.iter()
+                .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
 
 /// Why the broker refused, as a code and one plain sentence with the fix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,6 +187,11 @@ pub struct MintBody {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub repositories: Vec<String>,
     pub permissions: std::collections::BTreeMap<String, String>,
+    /// Permissions the app may carry that this token goes without because the
+    /// installation hasn't granted them (or they couldn't be read). Never sent
+    /// to GitHub; the install is told, so it can say why.
+    #[serde(skip)]
+    pub withheld: Vec<String>,
 }
 
 fn level(p: &str) -> u8 {
@@ -160,9 +202,23 @@ fn level(p: &str) -> u8 {
     }
 }
 
-/// Decides one token request: which installation, narrowed to which
-/// repositories and permissions. Never wider than the link or the app.
+/// [`plan_token_granted`] without the installation's permissions: the
+/// permissions every installation has, nothing in [`ONLY_WHEN_GRANTED`].
 pub fn plan_token(links: &[GithubLink], ask: &TokenAsk) -> Result<MintBody, BrokerRefusal> {
+    plan_token_granted(links, ask, None)
+}
+
+/// Decides one token request: which installation, narrowed to which
+/// repositories and permissions. Never wider than the link or the app, and,
+/// when `granted` (the installation's own permissions) is known, never wider
+/// than those either: a permission the installation lacks is left out of the
+/// token instead of failing the mint. Asking for one the app never carries
+/// is refused.
+pub fn plan_token_granted(
+    links: &[GithubLink],
+    ask: &TokenAsk,
+    granted: Option<&std::collections::BTreeMap<String, String>>,
+) -> Result<MintBody, BrokerRefusal> {
     let link = links
         .iter()
         .find(|l| l.installation_id == ask.installation_id)
@@ -208,10 +264,10 @@ pub fn plan_token(links: &[GithubLink], ask: &TokenAsk) -> Result<MintBody, Brok
     if repositories.is_empty() && allowed.len() <= 500 {
         repositories = allowed;
     }
-    let mut permissions = std::collections::BTreeMap::new();
+    let mut wanted: Vec<(String, String)> = vec![];
     if ask.permissions.is_empty() {
         for (k, v) in MAX_PERMISSIONS {
-            permissions.insert((*k).to_string(), (*v).to_string());
+            wanted.push(((*k).to_string(), (*v).to_string()));
         }
     } else {
         for (k, v) in &ask.permissions {
@@ -221,15 +277,40 @@ pub fn plan_token(links: &[GithubLink], ask: &TokenAsk) -> Result<MintBody, Brok
                 .map(|(_, l)| *l);
             match max {
                 Some(m) if level(v) >= 1 && level(v) <= level(m) => {
-                    permissions.insert(k.clone(), v.clone());
+                    wanted.push((k.clone(), v.clone()));
                 }
                 _ => return Err(BrokerRefusal::PermissionNotAllowed),
             }
         }
     }
+    let mut permissions = std::collections::BTreeMap::new();
+    let mut withheld = vec![];
+    for (k, v) in wanted {
+        let level_now = match granted {
+            // The installation's own level caps the token's.
+            Some(g) => {
+                let have = g.get(&k).map(|l| level(l)).unwrap_or(0);
+                match have.min(level(&v)) {
+                    0 => None,
+                    1 => Some("read"),
+                    _ => Some("write"),
+                }
+            }
+            // Unknown: only what every installation of the app has.
+            None if ONLY_WHEN_GRANTED.contains(&k.as_str()) => None,
+            None => Some(if level(&v) >= 2 { "write" } else { "read" }),
+        };
+        match level_now {
+            Some(l) => {
+                permissions.insert(k, l.to_string());
+            }
+            None => withheld.push(k),
+        }
+    }
     Ok(MintBody {
         repositories,
         permissions,
+        withheld,
     })
 }
 
@@ -498,6 +579,143 @@ mod tests {
             );
             assert_eq!(r, Err(BrokerRefusal::PermissionNotAllowed), "{k}:{v}");
         }
+    }
+
+    fn granted(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn whole_app() -> std::collections::BTreeMap<String, String> {
+        MAX_PERMISSIONS
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// An installation that granted Dependabot alerts gets a token that can
+    /// read them.
+    #[test]
+    fn dependabot_alerts_are_in_the_token_when_the_installation_granted_them() {
+        let ask = TokenAsk {
+            installation_id: 22,
+            ..Default::default()
+        };
+        let t = plan_token_granted(&links(), &ask, Some(&whole_app())).unwrap();
+        assert_eq!(
+            t.permissions
+                .get("vulnerability_alerts")
+                .map(String::as_str),
+            Some("read")
+        );
+        assert!(t.withheld.is_empty());
+        let j = serde_json::to_value(&t).unwrap();
+        assert_eq!(j["permissions"]["vulnerability_alerts"], "read");
+        assert!(j.get("withheld").is_none(), "never sent to GitHub");
+    }
+
+    /// An installation that never accepted Dependabot alerts (or a lower
+    /// level of anything) still gets its token, without them: GitHub refuses
+    /// the whole mint when it is asked for a permission the installation lacks.
+    #[test]
+    fn a_permission_the_installation_lacks_is_dropped_never_failing_the_mint() {
+        let ask = TokenAsk {
+            installation_id: 22,
+            ..Default::default()
+        };
+        let mut g = whole_app();
+        g.remove("vulnerability_alerts");
+        g.insert("checks".into(), "read".into());
+        let t = plan_token_granted(&links(), &ask, Some(&g)).unwrap();
+        assert!(!t.permissions.contains_key("vulnerability_alerts"));
+        assert_eq!(t.withheld, vec!["vulnerability_alerts"]);
+        assert_eq!(
+            t.permissions.get("deployments").map(String::as_str),
+            Some("read")
+        );
+        assert_eq!(
+            t.permissions.get("checks").map(String::as_str),
+            Some("read")
+        );
+        assert_eq!(
+            t.permissions.get("contents").map(String::as_str),
+            Some("write")
+        );
+        // An explicit ask for it is narrowed the same way, not refused.
+        let explicit = TokenAsk {
+            installation_id: 22,
+            permissions: granted(&[("vulnerability_alerts", "read"), ("contents", "read")]),
+            ..Default::default()
+        };
+        let t = plan_token_granted(&links(), &explicit, Some(&g)).unwrap();
+        assert_eq!(t.permissions, granted(&[("contents", "read")]));
+        // Unknown installation permissions: only what every installation has.
+        let t = plan_token(&links(), &ask).unwrap();
+        assert!(!t.permissions.contains_key("vulnerability_alerts"));
+        assert_eq!(t.withheld.len(), ONLY_WHEN_GRANTED.len());
+        for k in ONLY_WHEN_GRANTED {
+            assert!(t.withheld.iter().any(|w| w == k), "{k}");
+        }
+    }
+
+    /// Whatever the installation granted, a token carries nothing outside both
+    /// the app's list and the installation's.
+    #[test]
+    fn the_mint_never_asks_outside_both_lists() {
+        let ask = TokenAsk {
+            installation_id: 22,
+            ..Default::default()
+        };
+        let wide = granted(&[
+            ("administration", "write"),
+            ("secrets", "write"),
+            ("contents", "write"),
+            ("vulnerability_alerts", "write"),
+            ("security_events", "write"),
+            ("checks", "write"),
+        ]);
+        let t = plan_token_granted(&links(), &ask, Some(&wide)).unwrap();
+        for (k, v) in &t.permissions {
+            let app = MAX_PERMISSIONS
+                .iter()
+                .find(|(n, _)| n == k)
+                .map(|(_, l)| *l);
+            assert!(
+                app.is_some_and(|m| level(v) <= level(m)),
+                "{k}:{v} past the app"
+            );
+            assert!(
+                level(v) <= level(wide.get(k).map(String::as_str).unwrap_or("")),
+                "{k}:{v} past the installation"
+            );
+        }
+        assert_eq!(
+            t.permissions
+                .get("vulnerability_alerts")
+                .map(String::as_str),
+            Some("read"),
+            "the app asks for read, so a wider grant is still read"
+        );
+        assert!(!t.permissions.contains_key("administration"));
+        // Asking for one the app never carries is still refused.
+        let r = plan_token_granted(
+            &links(),
+            &TokenAsk {
+                installation_id: 22,
+                permissions: granted(&[("security_events", "read")]),
+                ..Default::default()
+            },
+            Some(&wide),
+        );
+        assert_eq!(r, Err(BrokerRefusal::PermissionNotAllowed));
+        assert_eq!(
+            granted_permissions(
+                &serde_json::json!({"permissions": {"contents": "write", "vulnerability_alerts": "read"}})
+            ),
+            granted(&[("contents", "write"), ("vulnerability_alerts", "read")])
+        );
     }
 
     #[test]

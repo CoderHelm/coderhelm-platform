@@ -165,13 +165,42 @@ pub const REQUIRED_PERMISSIONS: &[(&str, &str, &str)] = &[
 ];
 
 /// What a new app asks for beyond [`REQUIRED_PERMISSIONS`]
-/// (installer/lib/github-app.mjs PERMISSIONS): CoderHelm works without it,
-/// so an app created before it was asked for is warned, never failed.
-/// Checks: write lets a review show its "CoderHelm review" check run;
-/// Dependabot alerts: read lets security fixes read Dependabot's alerts.
-pub const OPTIONAL_PERMISSIONS: &[(&str, &str, &str)] = &[
-    ("checks", "write", "Checks"),
-    ("vulnerability_alerts", "read", "Dependabot alerts"),
+/// (installer/lib/github-app.mjs PERMISSIONS and OPTIONAL_WHY): CoderHelm
+/// works without each, so an app created before it was asked for is warned,
+/// never failed, with the feature it limits. (key, level, name, what is
+/// limited without it.)
+pub const OPTIONAL_PERMISSIONS: &[(&str, &str, &str, &str)] = &[
+    (
+        "checks",
+        "write",
+        "Checks",
+        "Reviews work without Checks: write, but pull requests don't show the \
+         \"CoderHelm review\" check that links to each review's session.",
+    ),
+    (
+        "vulnerability_alerts",
+        "read",
+        "Dependabot alerts",
+        "Security fixes work without Dependabot alerts, using OSV and GitHub's advisories only.",
+    ),
+    (
+        "deployments",
+        "read",
+        "Deployments",
+        "Without Deployments, what shipped where is worked out from workflow names instead of GitHub's deployments.",
+    ),
+    (
+        "repository_advisories",
+        "read",
+        "Repository security advisories",
+        "Without Repository security advisories, security fixes don't see a repository's own advisories and private vulnerability reports.",
+    ),
+    (
+        "code_quality",
+        "read",
+        "Code quality",
+        "Without Code quality, reviews don't see GitHub's code quality findings on the changed files.",
+    ),
 ];
 
 /// Events a new app subscribes to that CoderHelm works without (security
@@ -365,8 +394,13 @@ pub fn github_permissions(app: &Value) -> Check {
     if problems.is_empty() && missing_events.is_empty() {
         let mut optional: Vec<String> = OPTIONAL_PERMISSIONS
             .iter()
-            .filter(|(key, need, _)| level(have[*key].as_str().unwrap_or("none")) < level(need))
-            .map(|(_, need, name)| format!("{name}: {need}"))
+            .filter(|(key, need, _, _)| level(have[*key].as_str().unwrap_or("none")) < level(need))
+            .map(|(_, need, name, _)| format!("{name}: {need}"))
+            .collect();
+        let mut why: Vec<&str> = OPTIONAL_PERMISSIONS
+            .iter()
+            .filter(|(key, need, _, _)| level(have[*key].as_str().unwrap_or("none")) < level(need))
+            .map(|(_, _, _, why)| *why)
             .collect();
         optional.extend(
             OPTIONAL_EVENTS
@@ -375,21 +409,12 @@ pub fn github_permissions(app: &Value) -> Check {
                 .map(|e| format!("the {e} event")),
         );
         if !optional.is_empty() {
-            let mut why: Vec<&str> = vec![];
-            if optional.iter().any(|o| o.starts_with("Checks")) {
+            if OPTIONAL_EVENTS.iter().any(|e| !events.contains(e))
+                && !why.iter().any(|w| w.starts_with("Security fixes"))
+            {
                 why.push(
-                    "Reviews work without Checks: write, but pull requests don't show the \
-                     \"CoderHelm review\" check that links to each review's session.",
-                );
-            }
-            if optional.iter().any(|o| {
-                o.starts_with("Dependabot")
-                    || o.contains("dependabot_alert")
-                    || o.contains("security_advisory")
-            }) {
-                why.push(
-                    "Security fixes work without Dependabot alerts and their events, using \
-                     OSV and GitHub's advisories only.",
+                    "Security fixes work without the dependabot_alert and security_advisory \
+                     events, reading the sources on their daily check instead.",
                 );
             }
             return Check::not_ok(
@@ -2795,7 +2820,10 @@ mod tests {
 
     fn full() -> Value {
         let mut p = serde_json::Map::new();
-        for (k, v, _) in REQUIRED_PERMISSIONS.iter().chain(OPTIONAL_PERMISSIONS) {
+        for (k, v, _) in REQUIRED_PERMISSIONS {
+            p.insert((*k).into(), json!(v));
+        }
+        for (k, v, _, _) in OPTIONAL_PERMISSIONS {
             p.insert((*k).into(), json!(v));
         }
         let events: Vec<&str> = REQUIRED_EVENTS
@@ -2824,6 +2852,37 @@ mod tests {
         );
         assert!(c.why.contains("Security fixes"), "{}", c.why);
         assert_eq!(github_permissions(&full()).status, Status::Pass);
+    }
+
+    /// Each optional permission missing is a warning that names what it
+    /// limits, never a failure.
+    #[test]
+    fn each_missing_optional_permission_warns_with_the_feature_it_limits() {
+        for (key, need, name, why) in OPTIONAL_PERMISSIONS {
+            let mut a = full();
+            if *key == "checks" {
+                // Read is required; only write is optional.
+                a["permissions"]["checks"] = json!("read");
+            } else {
+                a["permissions"].as_object_mut().unwrap().remove(*key);
+            }
+            let c = github_permissions(&a);
+            assert_eq!(c.status, Status::Warn, "{key}");
+            assert!(
+                c.detail.contains(&format!("{name}: {need}")),
+                "{}",
+                c.detail
+            );
+            assert!(c.why.contains(why), "{key}: {}", c.why);
+        }
+        // The installer asks a new app for every one of them.
+        let manifest = include_str!("../../../../installer/lib/github-app.mjs");
+        for (key, need, _, _) in OPTIONAL_PERMISSIONS {
+            assert!(
+                manifest.contains(&format!("  {key}: \"{need}\",")),
+                "installer/lib/github-app.mjs doesn't ask for {key}: {need}"
+            );
+        }
     }
 
     #[test]

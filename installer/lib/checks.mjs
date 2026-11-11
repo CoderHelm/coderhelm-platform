@@ -11,7 +11,7 @@
 // anything; a few offer an action (such as running `cdk bootstrap`) that the
 // guided install asks about first.
 import crypto from "node:crypto";
-import { PERMISSIONS, REQUIRED_PERMISSIONS, EVENTS, OPTIONAL_EVENTS } from "./github-app.mjs";
+import { PERMISSIONS, REQUIRED_PERMISSIONS, EVENTS, OPTIONAL_EVENTS, OPTIONAL_WHY } from "./github-app.mjs";
 import { readSecret } from "./secrets.mjs";
 import { derived } from "./util.mjs";
 
@@ -459,7 +459,8 @@ const LEVEL = { none: 0, read: 1, write: 2, admin: 3 };
 const PERMISSION_NAMES = {
   contents: "Contents", pull_requests: "Pull requests", issues: "Issues", checks: "Checks", actions: "Actions",
   statuses: "Commit statuses", workflows: "Workflows", metadata: "Metadata", email_addresses: "Email addresses",
-  vulnerability_alerts: "Dependabot alerts",
+  vulnerability_alerts: "Dependabot alerts", deployments: "Deployments",
+  repository_advisories: "Repository security advisories", code_quality: "Code quality",
 };
 
 export function appSettingsUrl(app) {
@@ -489,11 +490,12 @@ export function permissionGaps(app) {
 /** Why an optional permission or event matters, for the warning. */
 export function optionalWhy(optional) {
   const why = [];
-  if (optional.some((o) => o.startsWith("Checks"))) {
-    why.push("Reviews work without Checks: write, but pull requests don't show the \"CoderHelm review\" check that links to each review's session.");
+  for (const [k, text] of Object.entries(OPTIONAL_WHY)) {
+    const name = PERMISSION_NAMES[k] ?? k;
+    if (optional.some((o) => o.startsWith(`${name}:`))) why.push(text);
   }
-  if (optional.some((o) => o.startsWith("Dependabot alerts") || o.includes("dependabot_alert") || o.includes("security_advisory"))) {
-    why.push("Security fixes work without Dependabot alerts and their events, using OSV and GitHub's advisories only.");
+  if (optional.some((o) => o.includes("dependabot_alert") || o.includes("security_advisory")) && !why.some((w) => w.startsWith("Security fixes"))) {
+    why.push("Security fixes work without the dependabot_alert and security_advisory events, reading the sources on their daily check instead.");
   }
   return why.join(" ");
 }
