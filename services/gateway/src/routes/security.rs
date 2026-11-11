@@ -19,7 +19,7 @@
 //!   a default branch that touches a dependency file, queue a
 //!   `security_event` for the worker when the team turned this on.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use aws_sdk_dynamodb::types::AttributeValue;
@@ -195,6 +195,254 @@ async fn add_event(state: &AppState, team_id: &str, id: &str, text: &str, link: 
 
 // ── Overview ────────────────────────────────────────────────────────────
 
+/// The items of one partition whose sort key starts with `prefix`, only the
+/// named attributes.
+async fn query_prefix(
+    state: &AppState,
+    pk: &str,
+    prefix: &str,
+    attrs: &[&str],
+) -> Result<Vec<Item>, StatusCode> {
+    let mut out = vec![];
+    let mut start: Option<Item> = None;
+    let names: Vec<String> = (0..attrs.len()).map(|i| format!("#a{i}")).collect();
+    for _ in 0..20 {
+        let mut q = state
+            .dynamo
+            .query()
+            .table_name(&state.config.settings_table_name)
+            .key_condition_expression("pk = :p AND begins_with(sk, :pfx)")
+            .expression_attribute_values(":p", attr_s(pk))
+            .expression_attribute_values(":pfx", attr_s(prefix))
+            .projection_expression(names.join(", "))
+            .set_exclusive_start_key(start.take());
+        for (n, a) in names.iter().zip(attrs) {
+            q = q.expression_attribute_names(n, *a);
+        }
+        let resp = q.send().await.map_err(|e| {
+            error!(prefix, error = %e, "security: read failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        out.extend(resp.items().iter().cloned());
+        match resp.last_evaluated_key() {
+            Some(k) if !k.is_empty() => start = Some(k.clone()),
+            _ => break,
+        }
+    }
+    Ok(out)
+}
+
+fn num(i: &Item, k: &str) -> u64 {
+    i.get(k)
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse::<f64>().ok())
+        .map(|f| f.max(0.0) as u64)
+        .unwrap_or(0)
+}
+
+/// One row per source: what it gives, its state in plain words, when it
+/// last synced, and how many findings came from it.
+pub fn source_rows(team_state: &Item, kev: &Item, findings: &[(Finding, FindingState)]) -> Value {
+    let opt = |i: &Item, k: &str| Some(s(i, k)).filter(|v| !v.is_empty());
+    let open: Vec<&Finding> = findings
+        .iter()
+        .map(|(f, _)| f)
+        .filter(|f| f.status.is_open())
+        .collect();
+    let from = |src: &str| open.iter().filter(|f| f.advisory.source == src).count();
+    let dependabot_state = s(team_state, "dependabot");
+    let (d_state, d_reason) = match dependabot_state.as_str() {
+        "" => ("never", "Read on the first check of each repository.".to_string()),
+        "on" => ("ok", String::new()),
+        "off" => ("off", opt(team_state, "dependabot_reason").unwrap_or_else(|| "Dependabot alerts are turned off for a repository; turn them on in its Settings, Code security.".into())),
+        "not_accepted" | "no_permission" => ("needs_permission", opt(team_state, "dependabot_reason").unwrap_or_else(|| "The GitHub App needs Dependabot alerts: read.".into())),
+        _ => ("error", opt(team_state, "dependabot_reason").unwrap_or_else(|| "GitHub didn't answer; tried again on the next check.".into())),
+    };
+    let osv_error = opt(team_state, "osv_error");
+    let osv_synced = opt(team_state, "osv_synced_at");
+    let adv_at = opt(team_state, "advisory_event_at");
+    let kev_at = opt(kev, "synced_at");
+    let epss_at = opt(team_state, "epss_synced_at");
+    json!([
+        {
+            "id": "dependabot",
+            "name": "Dependabot alerts",
+            "gives": "GitHub's own alerts for each repository's dependencies, with scope and the dependency path.",
+            "state": d_state,
+            "access": if dependabot_state.is_empty() { "on" } else { dependabot_state.as_str() },
+            "reason": d_reason,
+            "synced_at": opt(team_state, "dependabot_checked_at"),
+            "count": open.iter().filter(|f| f.dependabot_alert.is_some() || f.advisory.source == "dependabot").count(),
+        },
+        {
+            "id": "osv",
+            "name": "OSV (by API)",
+            "gives": "Open Source Vulnerabilities: every package and version in the dependency lists, matched against advisories from GitHub, PyPI, Go, RustSec and more.",
+            "state": match (&osv_error, &osv_synced) {
+                (Some(_), _) => "error",
+                (None, Some(_)) => "ok",
+                _ => "never",
+            },
+            "reason": osv_error.clone().map(|e| format!("{e}; tried again on the next check.")).unwrap_or_default(),
+            "synced_at": osv_synced,
+            "count": from("osv"),
+        },
+        {
+            "id": "github_advisory",
+            "name": "GitHub advisory feed",
+            "gives": "New and changed GitHub advisories (the security_advisory webhook), matched against the dependency lists as they are published.",
+            "state": if adv_at.is_some() { "ok" } else { "never" },
+            "reason": if adv_at.is_some() { String::new() } else { "No advisory has arrived since Security was turned on. GitHub sends one when an advisory is published or changed.".into() },
+            "synced_at": adv_at,
+            "count": from("github_advisory"),
+        },
+        {
+            "id": "kev",
+            "name": "CISA known exploited list",
+            "gives": "Vulnerabilities attackers are using now, with CISA's due date. On the list and loaded at runtime is P0.",
+            "state": if kev_at.is_some() { "ok" } else { "never" },
+            "reason": if kev_at.is_some() { String::new() } else { "Read once a day on the first check.".into() },
+            "synced_at": kev_at,
+            "count": open.iter().filter(|f| f.advisory.kev).count(),
+            "listed": num(kev, "count"),
+        },
+        {
+            "id": "epss",
+            "name": "FIRST EPSS",
+            "gives": "The chance each vulnerability is exploited in the next 30 days. 0.1 or more raises the tier.",
+            "state": if epss_at.is_some() { "ok" } else { "never" },
+            "reason": if epss_at.is_some() { String::new() } else { "Read once a day for open findings.".into() },
+            "synced_at": epss_at,
+            "count": open.iter().filter(|f| f.advisory.epss.is_some()).count(),
+        },
+    ])
+}
+
+/// The dependency inventory per repository, and the reason a repository's
+/// couldn't be read.
+pub fn repo_rows(deps: &[Item], cfg: &SecurityConfig) -> Value {
+    let mut rows: Vec<Value> = deps
+        .iter()
+        .map(|i| {
+            let ecos: BTreeMap<String, u64> =
+                serde_json::from_str(&s(i, "ecosystems")).unwrap_or_default();
+            let state = Some(s(i, "inventory_state")).filter(|v| !v.is_empty()).unwrap_or_else(|| "ok".into());
+            json!({
+                "repo": s(i, "repo"),
+                "packages": num(i, "count"),
+                "ecosystems": ecos,
+                "read_at": Some(s(i, "read_at")).filter(|v| !v.is_empty()).or_else(|| Some(s(i, "updated_at")).filter(|v| !v.is_empty())),
+                "state": state,
+                "reason": s(i, "inventory_reason"),
+                "unpinned": num(i, "unpinned"),
+                "dependabot": Some(s(i, "dependabot")).filter(|v| !v.is_empty()),
+                "dependabot_reason": s(i, "dependabot_reason"),
+                "osv_error": Some(s(i, "osv_error")).filter(|v| !v.is_empty()),
+            })
+        })
+        .collect();
+    if let sec::Repos::List(l) = &cfg.repos {
+        for r in l {
+            if !rows.iter().any(|x| {
+                x["repo"]
+                    .as_str()
+                    .is_some_and(|x| x.eq_ignore_ascii_case(r))
+            }) {
+                rows.push(json!({
+                    "repo": r, "packages": 0, "ecosystems": {}, "read_at": null, "state": "not_read",
+                    "reason": "Not read yet: its first check runs within 20 minutes of turning Security on.",
+                    "unpinned": 0, "dependabot": null, "dependabot_reason": "", "osv_error": null,
+                }));
+            }
+        }
+    }
+    rows.sort_by(|a, b| {
+        a["repo"]
+            .as_str()
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .cmp(&b["repo"].as_str().unwrap_or("").to_ascii_lowercase())
+    });
+    Value::Array(rows)
+}
+
+/// Tokens spent by one feature in an analytics period item.
+async fn feature_tokens(state: &AppState, team_id: &str, period: &str, feature: &str) -> u64 {
+    let item = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.analytics_table_name)
+        .key("team_id", attr_s(team_id))
+        .key("period", attr_s(period))
+        .send()
+        .await
+        .ok()
+        .and_then(|o| o.item().cloned());
+    common::usage::feature_totals(item.as_ref())
+        .into_iter()
+        .find(|(f, _)| f == feature)
+        .map(|(_, u)| u.total())
+        .unwrap_or(0)
+}
+
+/// Today's and this month's spend and the day's limits.
+async fn spend(state: &AppState, team_id: &str, cfg: &SecurityConfig) -> Result<Value, StatusCode> {
+    let now = chrono::Utc::now();
+    let day = now.format("%Y%m%d").to_string();
+    let month = now.format("%Y%m").to_string();
+    let triage = query_prefix(
+        state,
+        team_id,
+        &format!("SECTRIAGE#{month}"),
+        &["sk", "tokens", "packages"],
+    )
+    .await?;
+    let today = triage
+        .iter()
+        .find(|i| s(i, "sk") == format!("SECTRIAGE#{day}"));
+    let runs = get_item(state, team_id, &format!("SECRUNS#{day}"))
+        .await?
+        .unwrap_or_default();
+    let cards = get_item(state, team_id, &format!("SECCARDS#{day}"))
+        .await?
+        .unwrap_or_default();
+    let fix_day = feature_tokens(
+        state,
+        team_id,
+        &format!("DAY#{}", now.format("%Y-%m-%d")),
+        common::usage::feature::SECURITY_FIX,
+    )
+    .await;
+    let fix_month = feature_tokens(
+        state,
+        team_id,
+        &now.format("%Y-%m").to_string(),
+        common::usage::feature::SECURITY_FIX,
+    )
+    .await;
+    let triage_month: u64 = triage.iter().map(|i| num(i, "tokens")).sum();
+    Ok(json!({
+        "triage": {
+            "packages_today": today.map(|i| num(i, "packages")).unwrap_or(0),
+            "tokens_today": today.map(|i| num(i, "tokens")).unwrap_or(0),
+            "tokens_limit": cfg.triage_tokens_per_day,
+            "tokens_month": triage_month,
+        },
+        "fix": {
+            "runs_today": num(&runs, "runs"),
+            "runs_limit": cfg.max_fix_runs_per_day,
+            "tokens_today": fix_day,
+            "tokens_limit": cfg.max_fix_tokens_per_day,
+            "tokens_month": fix_month,
+        },
+        "cards": {
+            "today": num(&cards, "cards"),
+            "limit": cfg.max_cards_per_day,
+        },
+        "tokens_month": triage_month + fix_month,
+    }))
+}
+
 /// GET /api/security/overview
 pub async fn overview(
     State(state): State<Arc<AppState>>,
@@ -216,24 +464,207 @@ pub async fn overview(
     let dependabot = match s(&team_state, "dependabot").as_str() {
         "off" => "off",
         "no_permission" => "no_permission",
-        "on" => "on",
+        "not_accepted" => "not_accepted",
+        "error" => "error",
         // Not read yet: "on" until a read says otherwise.
         _ => "on",
     };
-    let permission_missing = team_state
-        .get("permission_missing")
-        .and_then(|v| v.as_bool().ok())
-        .copied()
-        .unwrap_or(false);
+    let permission_missing = matches!(dependabot, "no_permission" | "not_accepted");
     out["enabled"] = json!(cfg.enabled);
     out["dry_run"] = json!(cfg.dry_run);
     out["sources"] = json!({
         "dependabot": dependabot,
+        "dependabot_reason": opt(&team_state, "dependabot_reason"),
         "osv": { "synced_at": opt(&team_state, "osv_synced_at"), "mode": "api" },
         "kev_synced_at": opt(&kev, "synced_at"),
         "epss_synced_at": opt(&team_state, "epss_synced_at"),
     });
+    out["source_rows"] = source_rows(&team_state, &kev, &findings);
+    let deps = query_prefix(
+        &state,
+        &claims.team_id,
+        sec::DEPS_PREFIX,
+        &[
+            "repo",
+            "count",
+            "ecosystems",
+            "read_at",
+            "updated_at",
+            "inventory_state",
+            "inventory_reason",
+            "unpinned",
+            "dependabot",
+            "dependabot_reason",
+            "osv_error",
+        ],
+    )
+    .await?;
+    out["repos"] = repo_rows(&deps, &cfg);
+    out["spend"] = spend(&state, &claims.team_id, &cfg).await?;
     out["permission_missing"] = json!(permission_missing);
+    Ok(Json(out))
+}
+
+// ── Groups ──────────────────────────────────────────────────────────────
+
+#[derive(Deserialize, Default)]
+pub struct GroupQuery {
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub tier: Option<String>,
+    #[serde(default)]
+    pub repo: Option<String>,
+    /// Matches the package, an advisory id or title.
+    #[serde(default)]
+    pub q: Option<String>,
+    /// `tier` (default), `due`, `package`.
+    #[serde(default)]
+    pub sort: Option<String>,
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
+
+/// Pure: the groups a query shows, in order, and the next page's cursor.
+pub fn group_page(
+    findings: &[(Finding, FindingState)],
+    q: &GroupQuery,
+) -> Result<(Vec<sec::Group>, usize, Option<String>), StatusCode> {
+    let status = q.status.as_deref().unwrap_or("open");
+    if !matches!(status, "open" | "fixed" | "dismissed" | "all") {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let tier = match q.tier.as_deref().filter(|t| !t.is_empty()) {
+        Some(t) => Some(Tier::parse(t).ok_or(StatusCode::BAD_REQUEST)?),
+        None => None,
+    };
+    let repo = q.repo.as_deref().filter(|r| !r.is_empty());
+    if repo.is_some_and(|r| !sec::valid_repo(r)) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let offset: usize = match q.cursor.as_deref().filter(|c| !c.is_empty()) {
+        Some(c) => c.parse().map_err(|_| StatusCode::BAD_REQUEST)?,
+        None => 0,
+    };
+    let needle =
+        q.q.as_deref()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty());
+    let mut list: Vec<sec::Group> = sec::groups(findings)
+        .into_iter()
+        .filter(|g| match status {
+            "open" => g.status.is_open(),
+            "fixed" => g.status == Status::Fixed,
+            "dismissed" => matches!(g.status, Status::Dismissed | Status::Withdrawn),
+            _ => true,
+        })
+        .filter(|g| tier.is_none_or(|t| g.tier == Some(t)))
+        .filter(|g| repo.is_none_or(|r| g.repo.eq_ignore_ascii_case(r)))
+        .filter(|g| {
+            needle.as_ref().is_none_or(|n| {
+                g.package.to_ascii_lowercase().contains(n)
+                    || g.advisories.iter().any(|a| {
+                        a.title.to_ascii_lowercase().contains(n)
+                            || a.ids.iter().any(|i| i.to_ascii_lowercase().contains(n))
+                    })
+            })
+        })
+        .collect();
+    match q.sort.as_deref().unwrap_or("tier") {
+        "tier" => {}
+        "due" => list.sort_by(|a, b| a.due_at.cmp(&b.due_at).then_with(|| a.tier.cmp(&b.tier))),
+        "package" => list.sort_by(|a, b| {
+            a.package
+                .to_ascii_lowercase()
+                .cmp(&b.package.to_ascii_lowercase())
+                .then_with(|| a.version.cmp(&b.version))
+        }),
+        _ => return Err(StatusCode::BAD_REQUEST),
+    }
+    let total = list.len();
+    let page: Vec<sec::Group> = list.into_iter().skip(offset).take(PAGE).collect();
+    let next = (offset + PAGE < total).then(|| (offset + PAGE).to_string());
+    Ok((page, total, next))
+}
+
+/// GET /api/security/groups: one row per fix (a package at one version),
+/// with every advisory it clears.
+pub async fn list_groups(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Query(q): Query<GroupQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    let findings = load_findings(&state, &claims.team_id).await?;
+    let (page, total, next) = group_page(&findings, &q)?;
+    let advisories: usize = page.iter().map(|g| g.advisories.len()).sum();
+    let waiting: HashMap<String, Option<String>> = findings
+        .iter()
+        .map(|(f, _)| (f.id.clone(), f.waiting.clone()))
+        .collect();
+    let rows: Vec<Value> = page
+        .iter()
+        .map(|g| {
+            let mut v = serde_json::to_value(g).unwrap_or_default();
+            v["waiting"] = json!(g
+                .finding_ids
+                .iter()
+                .find_map(|id| waiting.get(id).cloned().flatten()));
+            v["evidence"] = json!(findings
+                .iter()
+                .find(|(f, _)| g.finding_ids.first() == Some(&f.id))
+                .and_then(|(f, _)| f.evidence.clone()));
+            v
+        })
+        .collect();
+    Ok(Json(
+        json!({ "groups": rows, "total": total, "advisories_on_page": advisories, "next_cursor": next }),
+    ))
+}
+
+// ── Insights ────────────────────────────────────────────────────────────
+
+#[derive(Deserialize, Default)]
+pub struct InsightsQuery {
+    #[serde(default)]
+    pub days: Option<i64>,
+}
+
+/// GET /api/security/insights?days=30: Analytics' security section.
+pub async fn insights(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Query(q): Query<InsightsQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    let days = q.days.unwrap_or(30).clamp(7, 365);
+    let findings = load_findings(&state, &claims.team_id).await?;
+    let now = chrono::Utc::now();
+    let from = (now - chrono::Duration::days(days))
+        .format("%Y%m%d")
+        .to_string();
+    let triage = query_prefix(&state, &claims.team_id, "SECTRIAGE#", &["sk", "tokens"]).await?;
+    let mut spend: BTreeMap<String, u64> = BTreeMap::new();
+    for i in &triage {
+        let d = s(i, "sk").trim_start_matches("SECTRIAGE#").to_string();
+        if d.len() == 8 && d >= from {
+            spend.insert(
+                format!("{}-{}-{}", &d[..4], &d[4..6], &d[6..8]),
+                num(i, "tokens"),
+            );
+        }
+    }
+    let mut out = sec::insights(&findings, &spend, now, days);
+    out["fix_tokens_month"] = json!(
+        feature_tokens(
+            &state,
+            &claims.team_id,
+            &now.format("%Y-%m").to_string(),
+            common::usage::feature::SECURITY_FIX
+        )
+        .await
+    );
+    out["enabled"] = json!(load_config(&state, &claims.team_id)
+        .await?
+        .is_some_and(|c| c.enabled));
     Ok(Json(out))
 }
 
@@ -555,6 +986,178 @@ pub async fn scan(
     Ok((StatusCode::ACCEPTED, Json(json!({ "status": "queued" }))))
 }
 
+// ── Fix PRs a person asks for ───────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct FixBody {
+    pub finding_ids: Vec<String>,
+    /// Raise today's fix-run limit for this request (recorded in the audit log).
+    #[serde(default)]
+    pub raise_limit: bool,
+}
+
+/// POST /api/security/fix `{finding_ids, raise_limit?}`: fix pull requests
+/// for the findings a person picked, one per repository, package and
+/// version, started now whatever the dry run says, within the day's limits
+/// (an admin may raise today's limit for the request). Admin.
+pub async fn fix(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<FixBody>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    claims.require_role(3).map_err(code)?;
+    if body.finding_ids.is_empty() || body.finding_ids.len() > 200 {
+        return Err(bad("finding_ids is 1 to 200 finding ids"));
+    }
+    let cfg = load_config(&state, &claims.team_id)
+        .await
+        .map_err(code)?
+        .unwrap_or_default();
+    let findings = load_findings(&state, &claims.team_id).await.map_err(code)?;
+    let now = chrono::Utc::now();
+    let day = sec::limit_day(now);
+    let (mut units, skipped) = sec::manual_units(&findings, &body.finding_ids, &cfg, now);
+    let slots = sec::DynamoSlots {
+        dynamo: &state.dynamo,
+        settings_table: &state.config.settings_table_name,
+        analytics_table: &state.config.analytics_table_name,
+        team_id: &claims.team_id,
+    };
+    let (started, queued) =
+        sec::admit_request(&slots, &cfg, &day, &mut units, &findings, body.raise_limit).await;
+    if body.raise_limit && !started.is_empty() {
+        let _ = super::roles::record(
+            &state,
+            &claims,
+            super::roles::AuditEntry {
+                action: "security_fix_limit_raised",
+                role_id: "",
+                role_name: "",
+                detail: format!(
+                    "Raised today's fix-run limit ({}) for {} requested fix PR{}",
+                    cfg.max_fix_runs_per_day,
+                    started.len(),
+                    if started.len() == 1 { "" } else { "s" }
+                ),
+            },
+        )
+        .await;
+    }
+    // The started units' runs: the worker opens them (it reads the code).
+    let started_ids: Vec<String> = started.iter().flat_map(|r| r.finding_ids.clone()).collect();
+    if !started_ids.is_empty() {
+        let msg = SecurityEventMessage {
+            team_id: claims.team_id.clone(),
+            kind: "fix".into(),
+            finding_ids: started_ids,
+            requested_by: claims.email.clone(),
+            ..Default::default()
+        };
+        if queue(&state, msg).await.is_err() {
+            for _ in &started {
+                sec::DailySlots::give_back(&slots, &day).await;
+            }
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": "The request couldn't be queued. Try again." })),
+            ));
+        }
+    }
+    // Every asked finding notes who asked; the queued ones wait with why.
+    for (r, waiting) in started
+        .iter()
+        .map(|r| (r, None))
+        .chain(queued.iter().map(|r| (r, r.reason.clone())))
+    {
+        for id in &r.finding_ids {
+            let Some((f, st)) = findings.iter().find(|(f, _)| &f.id == id) else {
+                continue;
+            };
+            let (mut f, mut st) = (f.clone(), st.clone());
+            if waiting.is_some() {
+                st.requested_by = Some(claims.email.clone());
+            }
+            f.waiting = waiting.clone();
+            f.updated_at = now.to_rfc3339();
+            let _ = save_finding(&state, &claims.team_id, &f, &st).await;
+            add_event(
+                &state,
+                &claims.team_id,
+                &f.id,
+                &format!(
+                    "Fix PR requested by {}{}",
+                    claims.email,
+                    waiting
+                        .as_deref()
+                        .map(|w| format!(". {w}"))
+                        .unwrap_or_default()
+                ),
+                None,
+            )
+            .await;
+        }
+    }
+    info!(team = %claims.team_id, by = %claims.email, started = started.len(), queued = queued.len(), skipped = skipped.len(), raise = body.raise_limit, "Security fix PRs requested");
+    let runs_today = get_item(&state, &claims.team_id, &format!("SECRUNS#{day}"))
+        .await
+        .ok()
+        .flatten()
+        .map(|i| num(&i, "runs"))
+        .unwrap_or(0);
+    Ok(Json(json!({
+        "started": started.iter().map(|r| json!({
+            "unit": r.unit, "ticket": r.ticket, "repo": r.repo, "package": r.package,
+            "finding_ids": r.finding_ids, "run_id": null,
+            "runs_url": format!("/?q={}", r.ticket),
+        })).collect::<Vec<_>>(),
+        "queued": queued,
+        "skipped": skipped,
+        "runs_today": runs_today,
+        "runs_limit": cfg.max_fix_runs_per_day,
+    })))
+}
+
+/// POST /api/security/fix/plan `{finding_ids}`: what asking would do, before
+/// anyone confirms: the units (one PR each) and the findings it skips, with
+/// today's runs against the limit. Any team member.
+pub async fn fix_plan(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<FixBody>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if body.finding_ids.len() > 200 {
+        return Err(bad("finding_ids is at most 200 finding ids"));
+    }
+    let cfg = load_config(&state, &claims.team_id)
+        .await
+        .map_err(code)?
+        .unwrap_or_default();
+    let findings = load_findings(&state, &claims.team_id).await.map_err(code)?;
+    let now = chrono::Utc::now();
+    let (units, skipped) = sec::manual_units(&findings, &body.finding_ids, &cfg, now);
+    let runs_today = get_item(
+        &state,
+        &claims.team_id,
+        &format!("SECRUNS#{}", sec::limit_day(now)),
+    )
+    .await
+    .map_err(code)?
+    .map(|i| num(&i, "runs"))
+    .unwrap_or(0);
+    Ok(Json(json!({
+        "units": units.iter().map(|u| json!({
+            "unit": u.key, "repo": u.repo,
+            "package": u.bumps.first().map(|b| b.package.clone()).unwrap_or_default(),
+            "from": u.bumps.first().map(|b| b.from.clone()).unwrap_or_default(),
+            "to": u.bumps.first().map(|b| b.to.clone()).unwrap_or_default(),
+            "finding_ids": u.finding_ids, "title": u.title,
+        })).collect::<Vec<_>>(),
+        "skipped": skipped,
+        "runs_today": runs_today,
+        "runs_limit": cfg.max_fix_runs_per_day,
+    })))
+}
+
 // ── Settings ────────────────────────────────────────────────────────────
 
 /// GET /api/security/config
@@ -672,6 +1275,7 @@ pub fn dependabot_event(
             .as_str()
             .unwrap_or("")
             .to_string(),
+        ..Default::default()
     })
 }
 
@@ -929,10 +1533,158 @@ mod tests {
     fn a_saved_config_is_validated() {
         let ok: SecurityConfig =
             serde_json::from_value(json!({"enabled": true, "labels": ["security"]})).unwrap();
-        assert!(ok.validate().is_ok() && ok.dry_run);
+        assert!(
+            ok.validate().is_ok() && !ok.dry_run,
+            "turned on: opens PRs within the limits"
+        );
         let bad: SecurityConfig =
             serde_json::from_value(json!({"due_days": {"P0": 0, "P1": 7, "P2": 30, "P3": 90}}))
                 .unwrap();
         assert!(bad.validate().is_err());
+    }
+
+    fn item(pairs: &[(&str, &str)]) -> Item {
+        pairs
+            .iter()
+            .map(|(k, v)| {
+                let a = if v.chars().all(|c| c.is_ascii_digit()) && !v.is_empty() {
+                    AttributeValue::N(v.to_string())
+                } else {
+                    attr_s(v)
+                };
+                (k.to_string(), a)
+            })
+            .collect()
+    }
+
+    /// The Sources panel: one row per source with its state in plain words,
+    /// a last sync and the findings that came from it.
+    #[test]
+    fn sources_say_their_state_and_what_came_from_them() {
+        let mut osv = f(
+            "o",
+            Tier::P2,
+            Status::Open,
+            "2026-12-01T00:00:00Z",
+            "acme/web",
+        );
+        osv.advisory.source = "osv".into();
+        let mut kev = f(
+            "k",
+            Tier::P0,
+            Status::Open,
+            "2026-11-14T00:00:00Z",
+            "acme/web",
+        );
+        kev.advisory.source = "github_advisory".into();
+        kev.advisory.kev = true;
+        let fs = vec![
+            (osv, FindingState::default()),
+            (kev, FindingState::default()),
+        ];
+        let st = item(&[
+            ("dependabot", "not_accepted"),
+            ("dependabot_reason", "The GitHub App asks for Dependabot alerts: read, but the organization hasn't accepted it yet."),
+            ("osv_synced_at", "2026-11-11T02:27:15Z"),
+        ]);
+        let rows = source_rows(
+            &st,
+            &item(&[("synced_at", "2026-11-11T02:22:00Z"), ("count", "1484")]),
+            &fs,
+        );
+        let by = |id: &str| {
+            rows.as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["id"] == id)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(by("dependabot")["state"], "needs_permission");
+        assert!(by("dependabot")["reason"]
+            .as_str()
+            .unwrap()
+            .contains("hasn't accepted"));
+        assert_eq!(by("osv")["state"], "ok");
+        assert_eq!(by("osv")["count"], 1);
+        assert_eq!(by("github_advisory")["count"], 1);
+        assert_eq!(by("kev")["count"], 1);
+        assert_eq!(by("kev")["listed"], 1484);
+        assert_eq!(by("epss")["state"], "never");
+        let err = source_rows(
+            &item(&[("osv_error", "OSV answered 503")]),
+            &Item::new(),
+            &fs,
+        );
+        assert_eq!(err[1]["state"], "error");
+        assert_eq!(
+            err[1]["reason"],
+            "OSV answered 503; tried again on the next check."
+        );
+    }
+
+    #[test]
+    fn the_inventory_lists_each_repo_or_why_it_couldnt_be_read() {
+        let deps = vec![
+            item(&[("repo", "acme/api"), ("count", "1304"), ("ecosystems", r#"{"npm":1301,"docker":1}"#), ("read_at", "2026-11-11T02:26:24Z"), ("inventory_state", "ok")]),
+            item(&[("repo", "acme/web"), ("count", "1"), ("ecosystems", r#"{"docker":1}"#), ("inventory_state", "graph_off"), ("inventory_reason", "GitHub's dependency graph is off for this repo; turn it on in the repo's Settings, Code security.")]),
+        ];
+        let cfg = SecurityConfig {
+            repos: sec::Repos::List(vec![
+                "acme/api".into(),
+                "acme/web".into(),
+                "acme/docs".into(),
+            ]),
+            ..Default::default()
+        };
+        let rows = repo_rows(&deps, &cfg);
+        let r = rows.as_array().unwrap();
+        assert_eq!(r.len(), 3);
+        assert_eq!(r[0]["repo"], "acme/api");
+        assert_eq!(r[0]["packages"], 1304);
+        assert_eq!(r[0]["ecosystems"]["npm"], 1301);
+        assert_eq!(r[1]["repo"], "acme/docs");
+        assert_eq!(r[1]["state"], "not_read");
+        assert_eq!(r[2]["state"], "graph_off");
+        assert!(r[2]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("Settings, Code security"));
+    }
+
+    #[test]
+    fn groups_page_filters_searches_and_sorts() {
+        let mk = |id: &str, pkg: &str, ver: &str, tier: Tier, due: &str| {
+            let mut x = f(id, tier, Status::Open, due, "acme/web");
+            x.package = pkg.into();
+            x.version = ver.into();
+            x.advisory.ids = vec![format!("GHSA-{id}")];
+            x.advisory.title = format!("{pkg} issue");
+            (x, FindingState::default())
+        };
+        let fs = vec![
+            mk("a", "tar", "6.2.1", Tier::P1, "2026-11-17T00:00:00Z"),
+            mk("b", "tar", "6.2.1", Tier::P2, "2026-12-10T00:00:00Z"),
+            mk("c", "axios", "1.8.3", Tier::P2, "2026-11-20T00:00:00Z"),
+        ];
+        let (page, total, next) = group_page(&fs, &GroupQuery::default()).unwrap();
+        assert_eq!((total, next), (2, None));
+        assert_eq!(page[0].package, "tar");
+        assert_eq!(page[0].advisories.len(), 2);
+        let q = GroupQuery {
+            q: Some("GHSA-c".into()),
+            ..Default::default()
+        };
+        assert_eq!(group_page(&fs, &q).unwrap().0[0].package, "axios");
+        let q = GroupQuery {
+            sort: Some("package".into()),
+            ..Default::default()
+        };
+        assert_eq!(group_page(&fs, &q).unwrap().0[0].package, "axios");
+        let q = GroupQuery {
+            sort: Some("sideways".into()),
+            ..Default::default()
+        };
+        assert!(group_page(&fs, &q).is_err());
     }
 }

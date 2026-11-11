@@ -403,6 +403,9 @@ impl WorkerMessage {
     pub fn usage_feature(&self) -> &'static str {
         use crate::usage::feature as f;
         match self {
+            WorkerMessage::Ticket(t) if crate::security_fixes::is_ticket(&t.ticket_id) => {
+                f::SECURITY_FIX
+            }
             WorkerMessage::Ticket(t) if matches!(t.source, TicketSource::Alert) => f::ALERT,
             WorkerMessage::Ticket(_)
             | WorkerMessage::Resume(_)
@@ -589,7 +592,7 @@ pub struct SecurityEventMessage {
     pub team_id: String,
     #[serde(default)]
     pub installation_id: u64,
-    /// `dependabot_alert`, `security_advisory`, `push` or `scan`.
+    /// `dependabot_alert`, `security_advisory`, `push`, `scan` or `fix`.
     pub kind: String,
     /// `owner/name`; empty for a scan of every repository.
     #[serde(default)]
@@ -601,6 +604,13 @@ pub struct SecurityEventMessage {
     pub alert_number: u64,
     #[serde(default)]
     pub ghsa_id: String,
+    /// `fix`: the findings a person asked fix pull requests for, whose run
+    /// slots the gateway already took.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub finding_ids: Vec<String>,
+    /// `fix`: who asked (their email).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub requested_by: String,
 }
 
 /// One repository's stale pull request preview (`common::stale_prs`).

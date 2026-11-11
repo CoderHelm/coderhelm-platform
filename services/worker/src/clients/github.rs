@@ -19,6 +19,8 @@ const MAX_TARBALL_BYTES: usize = 150 * 1024 * 1024;
 struct CachedToken {
     token: String,
     expires_at: u64,
+    /// What GitHub granted the token.
+    permissions: std::collections::BTreeMap<String, String>,
 }
 
 /// A repo snapshot plus the commit SHA it reflects. `base_sha` starts as the
@@ -611,6 +613,19 @@ struct TokenResponse {
     permissions: serde_json::Value,
 }
 
+/// Whether an installation token carries a permission, and whether the
+/// installation is known not to have granted it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PermissionState {
+    /// None: not known (no token read yet).
+    pub token_has: Option<bool>,
+    /// The installation hasn't granted it (its owner hasn't accepted it).
+    pub installation_lacks: bool,
+    /// Through CoderHelm's hosted token service, which didn't say what the
+    /// installation has (a release before it did).
+    pub broker_unaware: bool,
+}
+
 /// True when the issue/PR was closed by a bot account (the app's own push),
 /// false when a person closed it or the closer is unknown.
 pub fn closed_by_a_bot(issue: &serde_json::Value) -> bool {
@@ -702,9 +717,49 @@ impl GitHubClient {
         *cache = Some(CachedToken {
             token: resp.token.clone(),
             expires_at: Self::now_epoch() + 3600,
+            permissions: common::hybrid::broker::granted_permissions(&serde_json::json!({
+                "permissions": resp.permissions
+            })),
         });
 
         Ok(resp.token)
+    }
+
+    /// Whether this installation's token carries `permission` (GitHub's key,
+    /// e.g. `vulnerability_alerts`), read from the token's own grant.
+    pub async fn permission_state(&self, permission: &str) -> PermissionState {
+        if self.get_installation_token().await.is_err() {
+            return PermissionState::default();
+        }
+        if common::hybrid::client::github_via_broker(&self.private_key) {
+            let Some(g) = common::hybrid::client::token_grant(self.installation_id) else {
+                return PermissionState::default();
+            };
+            let has = g.permissions.contains_key(permission);
+            return PermissionState {
+                token_has: Some(has),
+                installation_lacks: !has
+                    && (g.withheld.iter().any(|w| w == permission) || g.installation_known),
+                broker_unaware: !has && !g.installation_known,
+            };
+        }
+        let perms = self
+            .token_cache
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|c| c.permissions.clone())
+            .unwrap_or_default();
+        if perms.is_empty() {
+            return PermissionState::default();
+        }
+        let has = perms.contains_key(permission);
+        PermissionState {
+            token_has: Some(has),
+            // An unnarrowed token has all the installation granted.
+            installation_lacks: !has,
+            broker_unaware: false,
+        }
     }
 
     /// This app's bot login ("{slug}[bot]"), when it can be read: who

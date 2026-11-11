@@ -43,6 +43,8 @@ pub mod feature {
     pub const ALERT: &str = "alert";
     /// Security fixes: reachability triage of advisories.
     pub const SECURITY: &str = "security";
+    /// Security fixes: the coding runs that open their pull requests.
+    pub const SECURITY_FIX: &str = "security_fix";
     /// Repository onboarding.
     pub const ONBOARD: &str = "onboard";
     /// Infrastructure analysis.
