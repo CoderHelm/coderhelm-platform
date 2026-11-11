@@ -516,6 +516,14 @@ fn build_app(state: Arc<AppState>) -> Router {
             "/setup/runs/:id/switch-on",
             post(routes::repo_setup::switch_on),
         )
+        .route(
+            "/setup/runs/:id/use-recommended",
+            post(routes::repo_setup::use_recommended),
+        )
+        .route(
+            "/setup/repos/:owner/:name",
+            get(routes::repo_setup::repo_view),
+        )
         // Reviewer agent — per-repo config, reviews list/detail, ratings
         .route(
             "/reviewer/org-config",

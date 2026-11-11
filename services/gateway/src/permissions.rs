@@ -127,6 +127,7 @@ pub const CAPABILITIES: &[Capability] = &[
             "repo_setup::list_runs",
             "repo_setup::get_run",
             "repo_setup::estimate",
+            "repo_setup::repo_view",
         ],
     },
     Capability {
@@ -523,6 +524,7 @@ pub const CAPABILITIES: &[Capability] = &[
             "repo_setup::put_settings",
             "repo_setup::mark_seen",
             "repo_setup::switch_on",
+            "repo_setup::use_recommended",
         ],
     },
     Capability {

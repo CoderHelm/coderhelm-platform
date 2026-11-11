@@ -888,31 +888,55 @@ fn security_of(item: Option<&Item>) -> Option<SecurityConfig> {
         .and_then(|t| SecurityConfig::from_json(t))
 }
 
+/// Whether someone chose a value for this repo in the team's security
+/// policy: the repo named in its list, or the policy on for every repo. A
+/// repo missing from a list another repo is in was never chosen for; nor
+/// was a team switch still at its default.
 fn security_value(cfg: Option<&SecurityConfig>, binding: Binding, repo: &str) -> Current {
     let c = cfg.cloned().unwrap_or_default();
-    let value = match binding {
-        B::SecurityRepo => c.enabled && c.repos.includes(repo),
-        _ => !c.dry_run,
+    let d = SecurityConfig::default();
+    let (value, chosen) = match binding {
+        B::SecurityRepo => (
+            c.enabled && c.repos.includes(repo),
+            match &c.repos {
+                Repos::All => c.enabled,
+                Repos::List(l) => c.enabled && l.iter().any(|r| r.eq_ignore_ascii_case(repo)),
+            },
+        ),
+        _ => (!c.dry_run, c.dry_run != d.dry_run),
     };
     Current {
         value: Value::Bool(value),
-        stored: cfg.is_some(),
+        stored: cfg.is_some() && chosen,
         row: cfg.is_some(),
     }
 }
 
+/// The same for the team's E2E settings: the repo named in `repos`, or the
+/// settings on for every repo (an empty list); a team switch counts as
+/// chosen once it differs from its default.
 fn tests_value(s: Option<&E2eSettings>, binding: Binding, repo: &str) -> Current {
     let st = s.cloned().unwrap_or_default();
-    let value = match binding {
-        B::TestsRepo => st.covers(repo),
-        B::Tests(field) => serde_json::to_value(&st).unwrap_or(Value::Null)[field]
-            .as_bool()
-            .unwrap_or(false),
-        _ => false,
+    let (value, chosen) = match binding {
+        B::TestsRepo => (
+            st.covers(repo),
+            st.enabled
+                && (st.repos.is_empty() || st.repos.iter().any(|r| r.eq_ignore_ascii_case(repo))),
+        ),
+        B::Tests(field) => {
+            let read = |x: &E2eSettings| {
+                serde_json::to_value(x).unwrap_or(Value::Null)[field]
+                    .as_bool()
+                    .unwrap_or(false)
+            };
+            let v = read(&st);
+            (v, v != read(&E2eSettings::default()))
+        }
+        _ => (false, false),
     };
     Current {
         value: Value::Bool(value),
-        stored: s.is_some(),
+        stored: s.is_some() && chosen,
         row: s.is_some(),
     }
 }
@@ -1316,6 +1340,52 @@ pub fn same_row(e: &Entry) -> Vec<&'static Entry> {
     let probe = "o/r";
     let mine = row(e, probe);
     REGISTRY.iter().filter(|x| row(x, probe) == mine).collect()
+}
+
+/// Who last saved the row a value lives in, and when, where the row keeps
+/// it (`updated_by`, `updated_at`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct SetBy {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<String>,
+    /// The page the value is saved on, for "Set on the Tests page".
+    pub page: String,
+}
+
+/// The page a setting is saved on, in words.
+pub fn page_name(e: &Entry) -> &'static str {
+    match e.binding {
+        B::Reviewer(_) => "Reviewer settings",
+        B::Stale(_) => "Stale pull requests",
+        B::SecurityRepo | B::SecurityOpenPrs => "Security policy",
+        B::TestsRepo | B::Tests(_) => "Tests",
+        B::Instructions => "Instructions",
+        B::GitConvention(_) => "Workflow",
+        B::CodeGraph => "Code graph",
+        B::AlertBudget => "Alerts",
+    }
+}
+
+/// Who last saved `e`'s row for `repo`, when the row says.
+pub async fn set_by(store: &dyn Store, e: &Entry, repo: &str) -> SetBy {
+    let item = match e.binding {
+        B::TestsRepo | B::Tests(_) => None,
+        _ => store.get(&row(e, repo)).await.ok().flatten(),
+    };
+    let attr = |k: &str| {
+        item.as_ref()
+            .and_then(|i| i.get(k))
+            .and_then(|v| v.as_s().ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    SetBy {
+        by: attr("updated_by"),
+        at: attr("updated_at"),
+        page: page_name(e).to_string(),
+    }
 }
 
 /// Every entry's current value for one repo, reading each row once.

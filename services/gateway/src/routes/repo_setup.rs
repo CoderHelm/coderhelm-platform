@@ -26,6 +26,7 @@ use common::setup::plan::{self, Choice, Decision, ItemDecision};
 use common::setup::registry::{self, Effect, REGISTRY};
 use common::setup::runs::{self, Mode, RepoDoc, Run, RunState};
 use common::setup::store::{Cached, DynamoStore};
+use common::setup::view;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tracing::{error, info, warn};
@@ -165,6 +166,18 @@ fn state_word(s: RunState) -> Value {
 
 /// A run as the dashboard reads it, for the person viewing.
 fn run_view(run: &Run, docs: &[RepoDoc], claims: &Claims) -> Value {
+    run_view_with(run, docs, claims, &HashMap::new(), 0)
+}
+
+/// A run with who saved each kept value (`set_by`, keyed by repo and
+/// setting) and the team's repo count, for the team-wide section.
+fn run_view_with(
+    run: &Run,
+    docs: &[RepoDoc],
+    claims: &Claims,
+    set_by: &HashMap<(String, String), registry::SetBy>,
+    team_repo_count: usize,
+) -> Value {
     let missing = missing_for(claims);
     let state = runs::state_of(run, docs);
     let mut overwrites = Vec::new();
@@ -184,6 +197,10 @@ fn run_view(run: &Run, docs: &[RepoDoc], claims: &Claims) -> Value {
                     i.decision = decision;
                     i.value = (decision == Decision::Edit).then_some(value).flatten();
                     i.needs = missing(&i.capability);
+                    if let Some(b) = set_by.get(&(d.repo.clone(), i.setting_id.clone())) {
+                        i.current.set_by = Some(b.clone());
+                    }
+                    i.worth_a_look = plan::worth_a_look(&i);
                     serde_json::to_value(i).unwrap_or(Value::Null)
                 })
                 .collect();
@@ -227,7 +244,45 @@ fn run_view(run: &Run, docs: &[RepoDoc], claims: &Claims) -> Value {
         "overwrites": overwrites,
         "undo": run.undo,
         "applied_at": run.applied_at,
+        "team": team_section(run, docs, team_repo_count),
     })
+}
+
+/// The team-wide settings of a run, once: one value for every repository,
+/// so they are shown and undone apart from any one repo. Each lists the
+/// repo whose record holds its change (that's the repo undo names).
+fn team_section(run: &Run, docs: &[RepoDoc], repo_count: usize) -> Value {
+    let mut items: Vec<Value> = Vec::new();
+    for e in REGISTRY.iter().filter(|e| e.scope == registry::Scope::Team) {
+        if !run.scope.iter().any(|s| s == e.id) {
+            continue;
+        }
+        let change = docs.iter().find_map(|d| {
+            d.changes
+                .iter()
+                .rev()
+                .find(|c| c.setting_id == e.id)
+                .map(|c| (d.repo.clone(), c.clone()))
+        });
+        let Some(item) = docs
+            .iter()
+            .find_map(|d| d.items.iter().find(|i| i.setting_id == e.id))
+        else {
+            continue;
+        };
+        items.push(json!({
+            "setting_id": e.id,
+            "title": e.title,
+            "feature": e.feature,
+            "current": item.current,
+            "recommended": item.recommended,
+            "source": item.source,
+            "evidence": item.evidence,
+            "changed_in": change.as_ref().map(|(r, _)| r),
+            "change": change.map(|(_, c)| c),
+        }));
+    }
+    json!({ "repo_count": repo_count, "items": items })
 }
 
 /// A run in the history: no plans, just where it stands.
@@ -301,6 +356,23 @@ pub async fn home(
                 })
         };
         let features_on = features.iter().filter(|f| on(f)).count();
+        let planned = last_plan(
+            &kv,
+            &team,
+            repo,
+            &history,
+            applied.as_ref(),
+            latest.get(repo),
+        )
+        .await;
+        let missing = missing_for(&claims);
+        let v = view::repo_view(
+            repo,
+            &current,
+            applied.as_ref(),
+            planned.as_ref().map(plan_ref),
+            &missing,
+        );
         let custom_count = REGISTRY
             .iter()
             .filter(|e| plan::is_custom(e, &current[e.id], applied.as_ref()))
@@ -342,6 +414,8 @@ pub async fn home(
             "new_count": new_count,
             "custom_count": custom_count,
             "error": error,
+            "counts": v.counts,
+            "summary": v.summary,
         }));
     }
     let last_run = match history.first() {
@@ -399,7 +473,9 @@ pub struct CreateRun {
     pub only_new: bool,
     #[serde(default)]
     pub mode: Mode,
-    /// `keep_mine` (default) or `use_recommended`.
+    /// `smart` (the default for Do it for me: the recommendation wherever
+    /// nobody chose the value for this repo), `keep_mine` (the default for a
+    /// guided run) or `use_recommended`.
     #[serde(default)]
     pub overwrite: Option<Choice>,
 }
@@ -543,11 +619,14 @@ pub async fn create_run(
             Json(json!({ "error": why, "estimate_tokens": estimate })),
         ));
     }
-    let choice = body.overwrite.unwrap_or_default();
+    let choice = body.overwrite.unwrap_or(match body.mode {
+        Mode::Auto => Choice::Smart,
+        Mode::Guided => Choice::KeepMine,
+    });
     if choice == Choice::Decide && body.mode == Mode::Auto {
         return Err(fail(
             StatusCode::BAD_REQUEST,
-            "Do it for me takes keep_mine or use_recommended.",
+            "Do it for me takes smart, keep_mine or use_recommended.",
         ));
     }
     let mut run = Run::new(
@@ -645,7 +724,24 @@ pub async fn get_run(
     Path(id): Path<String>,
 ) -> Reply {
     let (run, docs) = load(&state, &claims.team_id, &id).await?;
-    Ok(Json(run_view(&run, &docs, &claims)))
+    let st = store(&state, &claims.team_id);
+    let cached = Cached::new(&st);
+    let mut by = HashMap::new();
+    for d in &docs {
+        for i in d.items.iter().filter(|i| i.current.set) {
+            if let Some(e) = registry::get(&i.setting_id) {
+                by.insert(
+                    (d.repo.clone(), i.setting_id.clone()),
+                    registry::set_by(&cached, e, &d.repo).await,
+                );
+            }
+        }
+    }
+    let count = team_repos(&state, &claims.team_id)
+        .await
+        .map(|r| r.len())
+        .unwrap_or(0);
+    Ok(Json(run_view_with(&run, &docs, &claims, &by, count)))
 }
 
 #[derive(Deserialize)]
@@ -947,6 +1043,165 @@ pub async fn switch_on(
     Ok(Json(v))
 }
 
+#[derive(Deserialize)]
+pub struct UseRecommendedBody {
+    pub items: Vec<UndoItem>,
+}
+
+/// POST /api/setup/runs/:id/use-recommended: settings the run kept take
+/// their recommendation now (one, or a whole group). Each change is audited
+/// and recorded with its `before` value, so its own undo puts it back.
+pub async fn use_recommended(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Path(id): Path<String>,
+    Json(body): Json<UseRecommendedBody>,
+) -> Reply {
+    let allowed = claims.require_role(3); // admin+
+    allowed.map_err(|c| fail(c, "Only admins can change a Setup run."))?;
+    if body.items.is_empty() || body.items.len() > 500 {
+        return Err(fail(StatusCode::BAD_REQUEST, "Pick at least one setting."));
+    }
+    let team = claims.team_id.clone();
+    load(&state, &team, &id).await?;
+    let all = team_repos(&state, &team)
+        .await
+        .map_err(|e| internal("setup repos", e))?;
+    let st = store(&state, &team);
+    let kv = kv(&state);
+    let missing = missing_for(&claims);
+    let who = actor(&claims, &missing);
+    let items: Vec<(String, String)> = body
+        .items
+        .into_iter()
+        .map(|i| (i.repo, i.setting_id))
+        .collect();
+    let (done, skipped) = apply::use_recommended(&st, &kv, &id, &items, &all, &who)
+        .await
+        .map_err(|e| fail(StatusCode::BAD_REQUEST, &e))?;
+    let effects: Vec<Effect> = done
+        .iter()
+        .filter(|(_, c)| {
+            c.setting_id.starts_with("reviewer.") || c.setting_id == "code_graph.enabled"
+        })
+        .map(|(r, _)| Effect::BuildGraph { repo: r.clone() })
+        .collect();
+    run_effects(&state, &team, &effects).await;
+    info!(team = %team, run = %id, changed = done.len(), skipped = skipped.len(), by = %claims.email, "Setup: kept settings set to the recommendation");
+    let (run, docs) = load(&state, &team, &id).await?;
+    let mut v = run_view(&run, &docs, &claims);
+    v["used"] = json!(done
+        .iter()
+        .map(|(r, c)| json!({"repo": r, "change": c}))
+        .collect::<Vec<_>>());
+    v["skipped"] = json!(skipped);
+    Ok(Json(v))
+}
+
+/// The newest plan Setup made for `repo` among `history` (newest first):
+/// the record with items, and its run. Falls back to the run that last
+/// applied to it (`SETUP_APPLIED#`), which may be older than `history`.
+async fn last_plan(
+    kv: &DynamoKv,
+    team: &str,
+    repo: &str,
+    history: &[Run],
+    applied: Option<&plan::Applied>,
+    known: Option<&(Run, RepoDoc)>,
+) -> Option<(Run, RepoDoc)> {
+    if let Some((r, d)) = known.filter(|(_, d)| !d.items.is_empty()) {
+        return Some((r.clone(), d.clone()));
+    }
+    for run in history.iter().filter(|r| r.repos.iter().any(|x| x == repo)) {
+        if let Ok(Some(d)) = runs::get_repo(kv, team, &run.run_id, repo).await {
+            if !d.items.is_empty() {
+                return Some((run.clone(), d));
+            }
+        }
+    }
+    let id = applied
+        .map(|a| a.run_id.as_str())
+        .filter(|s| !s.is_empty())?;
+    let (run, _) = runs::get_run(kv, team, id).await.ok().flatten()?;
+    let d = runs::get_repo(kv, team, id, repo).await.ok().flatten()?;
+    (!d.items.is_empty()).then_some((run, d))
+}
+
+fn plan_ref<'a>(p: &'a (Run, RepoDoc)) -> view::LastPlan<'a> {
+    let (run, d) = p;
+    view::LastPlan {
+        run_id: &run.run_id,
+        at: run.applied_at.as_deref().unwrap_or(&run.created_at),
+        choice: run.choice,
+        decisions: &run.decisions,
+        items: &d.items,
+        applied: run.applied_at.is_some()
+            && run.state != Some(RunState::Undone)
+            && d.result.is_some(),
+        warning: d.warning.as_deref(),
+    }
+}
+
+/// GET /api/setup/repos/:owner/:name: one repo's features, each on, a
+/// preview, off or not used here, with its settings in words and why.
+pub async fn repo_view(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Path((owner, name)): Path<(String, String)>,
+) -> Reply {
+    let repo = format!("{owner}/{name}");
+    let team = claims.team_id.clone();
+    let repos = team_repos(&state, &team)
+        .await
+        .map_err(|e| internal("setup repos", e))?;
+    let Some(repo) = repos
+        .iter()
+        .find(|r| r.eq_ignore_ascii_case(&repo))
+        .cloned()
+    else {
+        return Err(fail(StatusCode::NOT_FOUND, "That repo isn't connected."));
+    };
+    let kv = kv(&state);
+    let st = store(&state, &team);
+    let cached = Cached::new(&st);
+    let current = registry::read_all(&cached, &repo)
+        .await
+        .map_err(|e| internal("setup read", e))?;
+    let applied = runs::applied(&kv, &team, &repo)
+        .await
+        .map_err(|e| internal("setup applied", e))?;
+    let history = runs::list(&kv, &team, 10)
+        .await
+        .map_err(|e| internal("setup runs", e))?;
+    let last = last_plan(&kv, &team, &repo, &history, applied.as_ref(), None).await;
+    let missing = missing_for(&claims);
+    let v = view::repo_view(
+        &repo,
+        &current,
+        applied.as_ref(),
+        last.as_ref().map(plan_ref),
+        &missing,
+    );
+    let mut out = serde_json::to_value(v).unwrap_or(Value::Null);
+    out["team_repo_count"] = json!(repos.len());
+    // Each feature's settings say whether they are this repo's own or the
+    // team's (one value for every repository).
+    if let Some(fs) = out["features"].as_array_mut() {
+        for f in fs {
+            if let Some(ss) = f["settings"].as_array_mut() {
+                for s in ss {
+                    let scope = s["setting_id"]
+                        .as_str()
+                        .and_then(registry::get)
+                        .map(|e| e.scope);
+                    s["scope"] = json!(scope);
+                }
+            }
+        }
+    }
+    Ok(Json(out))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -986,6 +1241,7 @@ mod tests {
             ("PUT", "/setup/settings"),
             ("POST", "/setup/seen"),
             ("POST", "/setup/runs/:id/switch-on"),
+            ("POST", "/setup/runs/:id/use-recommended"),
         ] {
             let h = routed_handler(method, path).unwrap_or_else(|| panic!("{method} {path}"));
             for role in ["viewer", "member"] {
@@ -1007,6 +1263,7 @@ mod tests {
             "/setup/runs",
             "/setup/runs/:id",
             "/setup/registry",
+            "/setup/repos/:owner/:name",
         ] {
             let h = routed_handler("GET", path).unwrap();
             assert!(matches!(
