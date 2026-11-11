@@ -27,6 +27,11 @@
  * (infra/cfn/coderhelm-bedrock-export.yaml, a bucket named with the install's prefix),
  * and that stack's own schedule starts the data source's syncs.
  *
+ * Infrastructure vulnerabilities (services/worker/src/passes/infra_inventory.rs)
+ * never use the install's own role yet: the template's
+ * InfrastructureVulnerabilities is "off" here. A team reads another account
+ * through its CoderHelmLogReader role there, whose stack has the switch.
+ *
  * Knowledge imports from S3 (services/common/src/knowledge/sources/s3.rs) never
  * use the install's own role: the template's ImportBuckets is empty here, so
  * the role gains no read on the account's buckets. An import reads a bucket
@@ -53,6 +58,12 @@ const OWN_CONDITIONS: Record<string, boolean> = {
   ReadsImportBuckets: false,
   SyncsKnowledgeBases: false,
   SyncsEveryKnowledgeBase: false,
+  // Infrastructure vulnerabilities: not on the install's own role yet. Its
+  // reads need the permissions boundary to allow them, which reaches an
+  // install only through the access stack an AWS admin applies, batched
+  // with other boundary changes. Accounts a team connects with their own
+  // CoderHelmLogReader role aren't limited by this install's boundary.
+  ReadsInfrastructure: false,
 };
 
 type Statement = { Sid?: string; Effect: string; Action: string | string[]; Resource: unknown };
@@ -80,7 +91,7 @@ export function decideConditions(v: unknown, conditions: Record<string, boolean>
 /** The update template's statements for the install's own role: its knowledge bases are every one in its account. */
 export function updateTemplateStatements(): Statement[] {
   const scratch = new cdk.Stack(new cdk.App(), "Scratch");
-  const inc = new CfnInclude(scratch, "T", { templateFile: repoPath(UPDATE_TEMPLATE), parameters: { RoleName: ROLE_NAME_MARK, KnowledgeBases: OWN_KNOWLEDGE_BASES, ImportBuckets: "", SyncKnowledgeBases: "" } });
+  const inc = new CfnInclude(scratch, "T", { templateFile: repoPath(UPDATE_TEMPLATE), parameters: { RoleName: ROLE_NAME_MARK, KnowledgeBases: OWN_KNOWLEDGE_BASES, ImportBuckets: "", SyncKnowledgeBases: "", InfrastructureVulnerabilities: "off" } });
   const p = inc.getResource(UPDATE_POLICY_ID) as iam.CfnPolicy;
   return decideConditions(scratch.resolve(p.policyDocument).Statement, OWN_CONDITIONS) as Statement[];
 }

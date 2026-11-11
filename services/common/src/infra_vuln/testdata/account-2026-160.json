@@ -1,0 +1,60 @@
+{
+  "account": "111122223333",
+  "region": "us-east-1",
+  "read_at": "2026-11-10T08:00:00Z",
+  "instances": [
+    { "id": "i-0a1b2c3d4e5f60001", "image_id": "ami-0web20261020aaaa1", "launch_time": "2026-10-22T10:00:00Z", "public_ip": false,
+      "tags": [["Name", "web"], ["aws:autoscaling:groupName", "web-asg"], ["aws:ec2launchtemplate:id", "lt-0web00000000000a1"]] },
+    { "id": "i-0a1b2c3d4e5f60002", "image_id": "ami-0web20261020aaaa1", "launch_time": "2026-10-22T10:00:00Z", "public_ip": false,
+      "tags": [["Name", "web"], ["aws:autoscaling:groupName", "web-asg"], ["aws:ec2launchtemplate:id", "lt-0web00000000000a1"]] },
+    { "id": "i-0a1b2c3d4e5f60003", "image_id": "ami-0web20261020aaaa1", "launch_time": "2026-10-23T10:00:00Z", "public_ip": false,
+      "tags": [["Name", "web"], ["aws:autoscaling:groupName", "web-asg"], ["aws:ec2launchtemplate:id", "lt-0web00000000000a1"]] },
+    { "id": "i-0e0e0e0e0e0e00001", "image_id": "ami-0eks20261015bbbb1", "launch_time": "2026-10-18T10:00:00Z", "public_ip": false,
+      "tags": [["eks:nodegroup-name", "prod-ng"], ["eks:cluster-name", "prod"]] }
+  ],
+  "images": [
+    { "id": "ami-0web20261020aaaa1", "name": "al2023-ami-2023.12.20261020.0-kernel-6.1-x86_64", "creation_date": "2026-10-20T19:00:00.000Z" },
+    { "id": "ami-0eks20261015bbbb1", "name": "amazon-eks-node-al2023-x86_64-standard-1.31-v20261015", "creation_date": "2026-10-15T19:00:00.000Z" }
+  ],
+  "asgs": [
+    { "name": "web-asg", "arn": "arn:aws:autoscaling:us-east-1:111122223333:autoScalingGroup:0000:autoScalingGroupName/web-asg",
+      "launch_template_id": "lt-0web00000000000a1", "launch_template_name": "web",
+      "target_groups": ["arn:aws:elasticloadbalancing:us-east-1:111122223333:targetgroup/web-tg/abc"], "desired": 3,
+      "tags": [["Repo", "acme/infra"]] }
+  ],
+  "load_balancers": [
+    { "arn": "arn:aws:elasticloadbalancing:us-east-1:111122223333:loadbalancer/app/web-alb/def", "name": "web-alb", "scheme": "internet-facing",
+      "target_groups": ["arn:aws:elasticloadbalancing:us-east-1:111122223333:targetgroup/web-tg/abc", "arn:aws:elasticloadbalancing:us-east-1:111122223333:targetgroup/api-tg/123"] }
+  ],
+  "clusters": [
+    { "name": "prod", "arn": "arn:aws:eks:us-east-1:111122223333:cluster/prod", "version": "1.31", "platform_version": "eks.30", "public_endpoint": true, "auto_mode": false, "tags": [] }
+  ],
+  "nodegroups": [
+    { "cluster": "prod", "name": "prod-ng", "arn": "arn:aws:eks:us-east-1:111122223333:nodegroup/prod/prod-ng/0000", "release_version": "1.31.0-20261015",
+      "version": "1.31", "ami_type": "AL2023_x86_64_STANDARD", "desired": 4, "launch_template_id": "", "tags": [] }
+  ],
+  "services": [
+    { "cluster": "prod-ecs", "name": "api", "arn": "arn:aws:ecs:us-east-1:111122223333:service/prod-ecs/api", "launch_type": "FARGATE", "platform_version": "1.4.0",
+      "public_ip": false, "target_groups": ["arn:aws:elasticloadbalancing:us-east-1:111122223333:targetgroup/api-tg/123"], "tasks": 3,
+      "oldest_task_started": "2026-10-28T14:00:00Z",
+      "images": [["111122223333.dkr.ecr.us-east-1.amazonaws.com/api:1.42.0", "sha256:1111111111111111111111111111111111111111111111111111111111111111"]],
+      "tags": [] }
+  ],
+  "db_clusters": [
+    { "id": "orders", "arn": "arn:aws:rds:us-east-1:111122223333:cluster:orders", "engine": "aurora-postgresql", "engine_version": "16.4", "public": false, "cluster": "", "tags": [] }
+  ],
+  "db_instances": [
+    { "id": "orders-1", "arn": "arn:aws:rds:us-east-1:111122223333:db:orders-1", "engine": "aurora-postgresql", "engine_version": "16.4", "public": false, "cluster": "orders", "tags": [] },
+    { "id": "orders-2", "arn": "arn:aws:rds:us-east-1:111122223333:db:orders-2", "engine": "aurora-postgresql", "engine_version": "16.4", "public": false, "cluster": "orders", "tags": [] }
+  ],
+  "pending": [
+    { "resource_arn": "arn:aws:rds:us-east-1:111122223333:db:orders-1", "action": "system-update", "description": "New Operating System update is available",
+      "auto_applied_after": "", "forced_apply": "2026-12-01T00:00:00Z", "current_apply": "" }
+  ],
+  "cache_updates": [],
+  "domains": [],
+  "kernels": [],
+  "scans": [],
+  "latest_al2023": { "x86_64": "ami-0latest20261102cc1" },
+  "errors": []
+}

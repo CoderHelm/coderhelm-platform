@@ -240,6 +240,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-autoscaling"
+version = "1.114.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ea9a6d9a51b48f104fb7cac393cc638b17586f040f3baecb64a73831991cf722"
+dependencies = [
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-query",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "aws-smithy-xml",
+ "aws-types",
+ "fastrand",
+ "http 0.2.12",
+ "http 1.4.0",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-bedrockagent"
 version = "1.129.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -466,6 +491,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-ec2"
+version = "1.221.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a69e9d56d1e78b55a38db4bf5bb302fb975a21d888e2782330dce7dfb89c148f"
+dependencies = [
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-query",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "aws-smithy-xml",
+ "aws-types",
+ "fastrand",
+ "http 0.2.12",
+ "http 1.4.0",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-ecr"
 version = "1.114.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -506,6 +556,80 @@ dependencies = [
  "aws-smithy-types",
  "aws-types",
  "bytes",
+ "fastrand",
+ "http 0.2.12",
+ "http 1.4.0",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
+name = "aws-sdk-eks"
+version = "1.128.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf3a0b18199ec360fd62b705197f0422071c8fc6eca39bd8643f859f0feb943a"
+dependencies = [
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http 0.2.12",
+ "http 1.4.0",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
+name = "aws-sdk-elasticache"
+version = "1.104.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b063cb931292d26338cd16efc0d1f432e9cafa586e84ada69ed90cc809ad8b0f"
+dependencies = [
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-query",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "aws-smithy-xml",
+ "aws-types",
+ "fastrand",
+ "http 0.2.12",
+ "http 1.4.0",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
+name = "aws-sdk-elasticloadbalancingv2"
+version = "1.110.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e044046a7bfd8bc3978f46216f4afddef01a9c43e98e9898ab7065141690af0a"
+dependencies = [
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-query",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "aws-smithy-xml",
+ "aws-types",
  "fastrand",
  "http 0.2.12",
  "http 1.4.0",
@@ -609,6 +733,57 @@ dependencies = [
  "http 1.4.0",
  "regex-lite",
  "tracing",
+]
+
+[[package]]
+name = "aws-sdk-opensearch"
+version = "1.122.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7959cc19bfe6d7cad9c185bc6e8ad6fbbc435fe4443fa6de5ec510707aff3594"
+dependencies = [
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http 0.2.12",
+ "http 1.4.0",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
+name = "aws-sdk-rds"
+version = "1.131.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9c6ff32bc4551ed7affa64b1879099d2e3fed457d2a2f064ac9b385cb1ae4ab5"
+dependencies = [
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-sigv4",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-query",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
+ "aws-smithy-xml",
+ "aws-types",
+ "fastrand",
+ "http 0.2.12",
+ "http 1.4.0",
+ "regex-lite",
+ "tracing",
+ "url",
 ]
 
 [[package]]
@@ -5682,18 +5857,27 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "aws-config",
+ "aws-sdk-autoscaling",
  "aws-sdk-bedrockruntime",
  "aws-sdk-cloudwatchlogs",
  "aws-sdk-codebuild",
  "aws-sdk-dynamodb",
+ "aws-sdk-ec2",
+ "aws-sdk-ecr",
  "aws-sdk-ecs",
+ "aws-sdk-eks",
+ "aws-sdk-elasticache",
+ "aws-sdk-elasticloadbalancingv2",
  "aws-sdk-kms",
  "aws-sdk-lambda",
+ "aws-sdk-opensearch",
+ "aws-sdk-rds",
  "aws-sdk-route53",
  "aws-sdk-s3",
  "aws-sdk-secretsmanager",
  "aws-sdk-sesv2",
  "aws-sdk-sqs",
+ "aws-sdk-ssm",
  "aws-sdk-sts",
  "aws-smithy-types",
  "aws_lambda_events",

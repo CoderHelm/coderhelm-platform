@@ -265,6 +265,19 @@ pub fn aws_state(a: &AwsAccount) -> CardState {
             "manage",
         );
     }
+    // Switched on, but the role lacks the reads: a warning that names it.
+    let infra = a.infra_missing();
+    if !infra.is_empty() {
+        let n = infra.len();
+        return cs(
+            "connected",
+            format!(
+                "Infrastructure vulnerabilities is on, but the role lacks {n} read-only permission{} it needs. Update the role.",
+                if n == 1 { "" } else { "s" }
+            ),
+            "manage",
+        );
+    }
     cs("connected", "", "manage")
 }
 
@@ -276,6 +289,9 @@ pub fn aws_missing(a: &AwsAccount) -> Vec<&'static str> {
     }
     if a.abilities.can_airflow == Some(false) {
         out.push("airflow");
+    }
+    if !a.infra_missing().is_empty() {
+        out.push("infra");
     }
     out
 }
@@ -899,6 +915,9 @@ pub async fn check_aws_permissions(
 pub struct AbilityChange {
     pub metrics: Option<bool>,
     pub airflow: Option<bool>,
+    /// Infrastructure vulnerabilities: may be switched on before the role
+    /// has the reads (the one-click update then asks for them).
+    pub infrastructure: Option<bool>,
     /// Environments agents may read; the rest of what was found is skipped.
     pub airflow_environments: Option<Vec<String>>,
 }
@@ -928,6 +947,7 @@ impl AbilityChange {
         Ok(AbilityChange {
             metrics: flag("metrics")?,
             airflow: flag("airflow")?,
+            infrastructure: flag("infrastructure")?,
             airflow_environments: envs,
         })
     }
@@ -945,6 +965,9 @@ impl AbilityChange {
                 return Err("The role can't read Airflow yet. Add the permissions with the stack link, then check again.".into());
             }
             a.abilities.airflow_off = !on;
+        }
+        if let Some(on) = self.infrastructure {
+            a.abilities.infra_on = on;
         }
         if let Some(keep) = &self.airflow_environments {
             if let Some(bad) = keep.iter().find(|e| !a.abilities.airflow_found.contains(e)) {

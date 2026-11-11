@@ -172,7 +172,39 @@ pub const ABILITIES: &[Ability] = &[
         ],
         chosen: true,
     },
+    Ability {
+        key: "infra",
+        name: "Infrastructure vulnerabilities",
+        why: "Reads which versions run in the account so they can be matched against security advisories: EC2 instances and their AMIs, Auto Scaling groups and the load balancers in front of them, EKS clusters and node groups, RDS and Aurora pending maintenance, ElastiCache service updates, OpenSearch software updates, ECR scan results, kernels from SSM inventory, and AWS's public latest-AMI parameters. Only when the stack's InfrastructureVulnerabilities parameter is on. Never Lambda function settings, launch template user data or environment variables, and nothing is changed.",
+        actions: &[
+            "ec2:DescribeInstances",
+            "ec2:DescribeImages",
+            "autoscaling:DescribeAutoScalingGroups",
+            "elasticloadbalancing:DescribeTargetGroups",
+            "elasticloadbalancing:DescribeLoadBalancers",
+            "eks:ListClusters",
+            "eks:DescribeCluster",
+            "eks:ListNodegroups",
+            "eks:DescribeNodegroup",
+            "rds:DescribeDBClusters",
+            "rds:DescribeDBInstances",
+            "rds:DescribePendingMaintenanceActions",
+            "elasticache:DescribeServiceUpdates",
+            "elasticache:DescribeUpdateActions",
+            "es:ListDomainNames",
+            "es:DescribeDomains",
+            "ecr:DescribeImageScanFindings",
+            "ssm:ListInventoryEntries",
+            "ssm:GetParameters",
+        ],
+        chosen: true,
+    },
 ];
+
+/// Optional abilities a team switches on per account: the live check
+/// asks about them too, but a missing one never makes the role "need an
+/// update" unless the team switched it on (`AwsAccount::infra_on`).
+pub const OPTIONAL: &[&str] = &["infra"];
 
 /// The only actions that change anything, all in [`ability`] `sync` and
 /// granted only on the knowledge bases a team names in SyncKnowledgeBases.
@@ -191,6 +223,8 @@ pub struct Chosen<'a> {
     pub buckets: &'a [String],
     /// Knowledge bases Coderhelm copies a team's knowledge into.
     pub sync_knowledge_bases: &'a [String],
+    /// The team switched infrastructure vulnerabilities on in this account.
+    pub infrastructure: bool,
 }
 
 impl<'a> Chosen<'a> {
@@ -199,6 +233,15 @@ impl<'a> Chosen<'a> {
             knowledge_bases,
             buckets,
             sync_knowledge_bases: &[],
+            infrastructure: false,
+        }
+    }
+
+    /// The same, also reading infrastructure versions (`infra`).
+    pub fn with_infrastructure(self, on: bool) -> Chosen<'a> {
+        Chosen {
+            infrastructure: on,
+            ..self
         }
     }
 
@@ -214,6 +257,7 @@ impl<'a> Chosen<'a> {
         self.knowledge_bases.is_empty()
             && self.buckets.is_empty()
             && self.sync_knowledge_bases.is_empty()
+            && !self.infrastructure
     }
 }
 
@@ -242,6 +286,28 @@ pub fn checked_actions() -> Vec<&'static str> {
         }
     }
     out
+}
+
+/// What the live check simulates: [`checked_actions`] and the optional
+/// abilities' (kept apart: `PermissionCheck::optional_missing`).
+pub fn simulated_actions() -> Vec<&'static str> {
+    let mut out = checked_actions();
+    for a in ABILITIES.iter().filter(|a| OPTIONAL.contains(&a.key)) {
+        for x in a.actions {
+            if !out.contains(x) {
+                out.push(x);
+            }
+        }
+    }
+    out
+}
+
+/// The action belongs only to optional abilities.
+pub fn is_optional(action: &str) -> bool {
+    !checked_actions().contains(&action)
+        && ABILITIES
+            .iter()
+            .any(|a| OPTIONAL.contains(&a.key) && a.actions.contains(&action))
 }
 
 /// A short id of this release's set of permissions: changes exactly when an
@@ -410,6 +476,9 @@ pub fn update_url(update_template_url: &str, region: &str, chosen: &Chosen) -> S
             urlencoding::encode(&chosen.sync_knowledge_bases.join(","))
         ));
     }
+    if chosen.infrastructure {
+        u.push_str("&param_InfrastructureVulnerabilities=on");
+    }
     u
 }
 
@@ -437,6 +506,10 @@ pub fn update_stack_name_for(chosen: &Chosen) -> String {
     if !chosen.sync_knowledge_bases.is_empty() {
         seed.push_str("|sync:");
         seed.push_str(&sorted(chosen.sync_knowledge_bases).join(","));
+    }
+    // Infrastructure reads are their own part too.
+    if chosen.infrastructure {
+        seed.push_str("|infra");
     }
     format!(
         "{}-kb{}",
@@ -689,9 +762,10 @@ mod tests {
         assert!(!checked.contains(&"bedrock:Retrieve"));
         assert!(!checked.contains(&"s3:GetObject"));
         assert!(checked.contains(&"logs:StartQuery"));
-        // Knowledge bases (6), imports (4) and copying into Bedrock (6 more:
-        // its Get calls are the knowledge bases' too).
-        assert_eq!(checked.len() + 16, all_actions().len());
+        // Knowledge bases (6), imports (4), copying into Bedrock (6 more:
+        // its Get calls are the knowledge bases' too) and infrastructure
+        // reads (19).
+        assert_eq!(checked.len() + 35, all_actions().len());
         assert!(!checked.contains(&"bedrock:IngestKnowledgeBaseDocuments"));
         // Copying into Bedrock rides along as its own parameter and stack.
         let sync = ["arn:aws:bedrock:us-east-1:111122223333:knowledge-base/SYNC123456".to_string()];
@@ -703,6 +777,57 @@ mod tests {
             update_stack_name_for(&Chosen::new(kbs, &buckets))
         );
         assert!(!Chosen::new(&[], &[]).with_sync(&sync).is_empty());
+    }
+
+    #[test]
+    fn infrastructure_reads_are_optional_read_only_and_never_lambda_settings() {
+        let infra = ability("infra").unwrap();
+        assert!(infra.chosen);
+        assert!(OPTIONAL.contains(&"infra"));
+        for a in infra.actions {
+            assert!(!checked_actions().contains(a), "{a} is never required");
+            assert!(simulated_actions().contains(a), "{a} is still checked");
+            assert!(is_optional(a));
+            let verb = a.split(':').nth(1).unwrap();
+            assert!(
+                ["Describe", "List", "Get"]
+                    .iter()
+                    .any(|v| verb.starts_with(v)),
+                "{a} is not a read"
+            );
+        }
+        assert!(!is_optional("logs:StartQuery"));
+        for no in [
+            "ec2:DescribeLaunchTemplateVersions",
+            "ec2:DescribeInstanceAttribute",
+            "lambda:ListFunctions",
+            "lambda:GetFunctionConfiguration",
+            "ec2:Describe*",
+        ] {
+            assert!(!infra.actions.contains(&no), "{no}");
+        }
+        for t in [ROLE_TEMPLATE, UPDATE_TEMPLATE] {
+            assert!(t.contains(
+                "ReadsInfrastructure: !Equals [!Ref InfrastructureVulnerabilities, \"on\"]"
+            ));
+            assert!(t.contains("Sid: ReadInfrastructureVersions"));
+            // The public parameters only.
+            let at = t.find("\"ssm:GetParameters\"").unwrap();
+            assert!(t[at..]
+                .lines()
+                .nth(1)
+                .unwrap()
+                .contains("arn:aws:ssm:*::parameter/aws/service/*"));
+        }
+        // The update link carries the switch, and it is its own stack.
+        let on = Chosen::default().with_infrastructure(true);
+        let u = update_url("https://b/x/y.yaml", "us-east-1", &on);
+        assert!(u.contains("&param_InfrastructureVulnerabilities=on"), "{u}");
+        assert_ne!(update_stack_name_for(&on), update_stack_name());
+        assert!(
+            !update_url("https://b/x/y.yaml", "us-east-1", &Chosen::default())
+                .contains("Infrastructure")
+        );
     }
 
     #[test]
