@@ -260,10 +260,19 @@ impl Hits {
     }
 }
 
+/// Sources shown per finding: bulletins first, then the newest advisories.
+const MAX_SOURCES: usize = 20;
+
 fn finding(r: &Resource, key: &str, title: String, hits: Hits, fix: Fix) -> InfraFinding {
     let open = fix.kind != Some(FixKind::Aws);
     let mut cves = hits.cves;
     cves.sort();
+    let mut hits = Hits {
+        cves: Vec::new(),
+        ..hits
+    };
+    hits.sources.sort_by_key(|s| s.kind != "bulletin");
+    hits.sources.truncate(MAX_SOURCES);
     InfraFinding {
         id: short_id(&[&r.account, &r.region, &r.group, key]),
         account: r.account.clone(),
