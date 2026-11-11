@@ -254,6 +254,21 @@ pub fn recommend(
                 r.evidence.push(Evidence::text(security_schedule()));
                 r
             }
+            // Automatic fix PRs for log findings: on once a log group's code
+            // is known to live in this repo.
+            "logs.autofix.enabled" if !f.log_groups.is_empty() => rec(
+                json!(true),
+                Source::Detected,
+                vec![
+                    Evidence::text(format!(
+                        "The Logs page has this repo saved for {}",
+                        f.log_groups.join(", ")
+                    )),
+                    Evidence::text(
+                        "Fix PRs open for critical findings only, up to 3 a day, and post to the alerts channel; nothing merges without a person's approval",
+                    ),
+                ],
+            ),
             id => match (found.get(id), inferred.get(id)) {
                 (_, Some(i)) if e.recommend == registry::Recommend::Ai => from_ai(i),
                 (Some(d), _) => from_found(d),
@@ -499,6 +514,19 @@ mod tests {
                 assert!(registry::check(e, &x.value).is_ok(), "{} {}", f.repo, e.id);
             }
         }
+    }
+
+    #[test]
+    fn log_fix_prs_are_recommended_once_a_log_group_maps_here() {
+        let r = recs(&web_app());
+        assert_eq!(r["logs.autofix.enabled"].value, false);
+        let mut f = web_app();
+        f.log_groups = vec!["/aws/lambda/orbit-api".into()];
+        let r = recs(&f);
+        let x = &r["logs.autofix.enabled"];
+        assert_eq!(x.value, true);
+        assert_eq!(x.source, Source::Detected);
+        assert!(x.evidence[0].text.contains("/aws/lambda/orbit-api"));
     }
 
     #[test]

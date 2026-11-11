@@ -13,7 +13,12 @@
 //! - Settings-table items under the team: [`AUTOFIX_SK`] (the automatic-fix
 //!   setting), `LOG_TICKET#<ticket>` (what the worker needs to label the PR and
 //!   post the follow-up), `LOGFIX#<fingerprint hash>` (a short claim so two
-//!   starts can't race) and `LOG_AUTOFIX_RUNS#<day>` (the daily cap counter).
+//!   starts can't race), `LOG_AUTOFIX_RUNS#<day>` (the daily cap counter) and
+//!   `LOG_FIX_CARD#<finding hash>` (the fix PR card posted, so it posts once
+//!   and its merged or closed follow-up posts once).
+//! - Where findings and fix PR cards post: `REC_NOTIFY` when a person saved
+//!   it, otherwise the team's alert channel (`ALERT_NOTIFY`), see
+//!   [`effective_mode`].
 //!
 //! Every rule that decides whether a run may start is here, so the gateway
 //! (a person's "Create fix PR") and the worker (the automatic sweep) apply the
@@ -1464,23 +1469,88 @@ pub async fn teams_with_autofix(
 
 // ─── Chat ───────────────────────────────────────────────────────────────────
 
+/// Pure: the findings' notify mode in effect. A setting never saved (no
+/// `REC_NOTIFY`, or no `notify_mode` on it) follows the team's alert channel,
+/// so findings and their fix PRs post where production alerts post; a saved
+/// "off" or "custom" stands. The log analyzer Lambda has the same rule
+/// (`effective_mode` in `lambda/log-analyzer/handler.py`).
+pub fn effective_mode(saved: &str) -> &str {
+    match saved.trim() {
+        "" => crate::alert_notify::MODE_TEAM,
+        m => m,
+    }
+}
+
 /// Pure: where findings post, from the findings setting (`notify_mode`) and
 /// the team's alert channel (`enabled`), each already opened.
 pub fn pick_channels(mode: &str, own: Channels, team: Channels, team_enabled: bool) -> Channels {
-    match mode {
+    match effective_mode(mode) {
         crate::alert_notify::MODE_CUSTOM => own,
         crate::alert_notify::MODE_TEAM if team_enabled => team,
         _ => Channels::default(),
     }
 }
 
-/// The channels new findings post to (Teams, Slack), opened. Empty = none.
-pub async fn channels(
+/// Where findings and their fix PRs post, in words (never a webhook URL).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct PostsTo {
+    /// The mode in effect: `team`, `custom` or `off`.
+    pub mode: String,
+    /// Whether a person saved the findings' own setting; false means the
+    /// default (the team's alert channel).
+    pub saved: bool,
+    /// The chat apps it posts to ("Microsoft Teams", "Slack"); empty = none.
+    pub channels: Vec<&'static str>,
+    /// The team's alert channel is on and has a channel set.
+    pub team_alerts: bool,
+}
+
+fn kinds_set(item: &Item) -> Vec<&'static str> {
+    crate::notify::ChannelKind::ALL
+        .iter()
+        .filter(|k| crate::notify::store::stored(item, **k).is_set())
+        .map(|k| k.label())
+        .collect()
+}
+
+fn enabled(item: &Item) -> bool {
+    item.get("enabled")
+        .and_then(|v| v.as_bool().ok())
+        .copied()
+        .unwrap_or(false)
+}
+
+/// Pure: [`PostsTo`] from the findings' setting and the team's alert channel.
+pub fn posts_to(own: Option<&Item>, team: Option<&Item>) -> PostsTo {
+    let empty = Item::new();
+    let own_item = own.unwrap_or(&empty);
+    let team_item = team.unwrap_or(&empty);
+    let saved_mode = s(own_item, "notify_mode");
+    let mode = effective_mode(&saved_mode).to_string();
+    let team_kinds = if enabled(team_item) {
+        kinds_set(team_item)
+    } else {
+        vec![]
+    };
+    let channels = match mode.as_str() {
+        crate::alert_notify::MODE_CUSTOM => kinds_set(own_item),
+        crate::alert_notify::MODE_TEAM => team_kinds.clone(),
+        _ => vec![],
+    };
+    PostsTo {
+        mode,
+        saved: !saved_mode.trim().is_empty(),
+        channels,
+        team_alerts: !team_kinds.is_empty(),
+    }
+}
+
+/// The findings' notify setting and the team's alert channel, as stored.
+async fn notify_items(
     dynamo: &DynamoClient,
-    cipher: &dyn crate::mcp_credentials::Cipher,
     settings_table: &str,
     team_id: &str,
-) -> Channels {
+) -> (Option<Item>, Option<Item>) {
     let get = |sk: &'static str| {
         dynamo
             .get_item()
@@ -1493,25 +1563,40 @@ pub async fn channels(
         get(REC_NOTIFY_SK),
         get(crate::alert_notify::TEAM_SETTINGS_SK)
     );
-    let own = own.ok().and_then(|o| o.item().cloned()).unwrap_or_default();
-    let team = team
-        .ok()
-        .and_then(|o| o.item().cloned())
-        .unwrap_or_default();
+    (
+        own.ok().and_then(|o| o.item().cloned()),
+        team.ok().and_then(|o| o.item().cloned()),
+    )
+}
+
+/// Where findings post, in words, for the Logs page.
+pub async fn load_posts_to(dynamo: &DynamoClient, settings_table: &str, team_id: &str) -> PostsTo {
+    let (own, team) = notify_items(dynamo, settings_table, team_id).await;
+    posts_to(own.as_ref(), team.as_ref())
+}
+
+/// The channels new findings post to (Teams, Slack), opened. Empty = none.
+/// Every sender of a findings message (the repo check, the fix PR card and
+/// its follow-up, AWS permission notes) reads its channels here.
+pub async fn channels(
+    dynamo: &DynamoClient,
+    cipher: &dyn crate::mcp_credentials::Cipher,
+    settings_table: &str,
+    team_id: &str,
+) -> Channels {
+    let (own, team) = notify_items(dynamo, settings_table, team_id).await;
+    let own = own.unwrap_or_default();
+    let team = team.unwrap_or_default();
     let mode = s(&own, "notify_mode");
-    let enabled = team
-        .get("enabled")
-        .and_then(|v| v.as_bool().ok())
-        .copied()
-        .unwrap_or(false);
+    let team_on = enabled(&team);
     let opened =
         |item: Item| async move { crate::notify::store::open_all(cipher, team_id, &item).await };
-    match mode.as_str() {
+    match effective_mode(&mode) {
         crate::alert_notify::MODE_CUSTOM => {
-            pick_channels(&mode, opened(own).await, Channels::default(), enabled)
+            pick_channels(&mode, opened(own).await, Channels::default(), team_on)
         }
-        crate::alert_notify::MODE_TEAM if enabled => {
-            pick_channels(&mode, Channels::default(), opened(team).await, enabled)
+        crate::alert_notify::MODE_TEAM if team_on => {
+            pick_channels(&mode, Channels::default(), opened(team).await, team_on)
         }
         _ => Channels::default(),
     }
@@ -1569,33 +1654,173 @@ pub fn repo_check_message(
     }
 }
 
-/// Pure: the message when a fix run opens its pull request.
+// ─── Fix PR cards ───────────────────────────────────────────────────────────
+//
+// When a fix run from a finding opens its pull request (started automatically
+// or by a person), one card posts where the findings post. Chat webhooks
+// (Teams Workflows, Slack incoming webhooks) can't reply in a thread or edit
+// a card, so when the PR merges or closes the follow-up is its own card that
+// names the first one, as alert recoveries do (`crate::alert_notify`). A
+// card record (`LOG_FIX_CARD#<finding>`) makes each finding's PR post once
+// and its follow-up post once.
+
+/// The pull request a fix run opened.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FixPr {
+    pub repo: String,
+    pub number: u64,
+    pub title: String,
+    pub url: String,
+    /// One line on what the change does (from the PR description).
+    pub change: String,
+}
+
+fn card_time(v: &str) -> Option<String> {
+    parse_time(v).map(|t| t.format("%b %-d, %H:%M UTC").to_string())
+}
+
+/// Pure: how often and when the finding's error happened, in words.
+pub fn seen_words(f: &Finding) -> Option<String> {
+    let count = match (f.events_seen(), f.error_count) {
+        (Some(n), _) if n > 0 => Some(format!(
+            "{} {} since first seen",
+            thousands(n),
+            if n == 1 { "line" } else { "lines" }
+        )),
+        (_, Some(n)) if n > 0 => Some(format!(
+            "{} {} in the last analysis",
+            thousands(n),
+            if n == 1 { "line" } else { "lines" }
+        )),
+        _ => None,
+    };
+    let first = card_time(&f.first_seen_at);
+    let last = card_time(&f.last_seen_at);
+    let when = match (first, last) {
+        (Some(a), Some(b)) if a != b => Some(format!("first {a}, last {b}")),
+        (_, Some(b)) => Some(format!("last {b}")),
+        (Some(a), None) => Some(format!("first {a}")),
+        _ => None,
+    };
+    match (count, when) {
+        (Some(c), Some(w)) => Some(format!("{c} ({w})")),
+        (Some(c), None) => Some(c),
+        (None, Some(w)) => Some(w),
+        _ => None,
+    }
+}
+
+fn thousands(n: u64) -> String {
+    let d = n.to_string();
+    let mut out = String::new();
+    for (i, c) in d.chars().enumerate() {
+        if i > 0 && (d.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+fn severity_word(s: Severity) -> &'static str {
+    match s {
+        Severity::Critical => "Critical",
+        Severity::Warning => "Warning",
+        Severity::Info => "Info",
+    }
+}
+
+/// Pure: the one line of a PR description that says what the change does:
+/// its first plain sentence, skipping headings, the origin line, the source
+/// ticket and list markers. Empty when there is none.
+pub fn change_line(body: &str) -> String {
+    let line = body
+        .lines()
+        .map(str::trim)
+        .map(|l| l.trim_start_matches(['-', '*', '>']).trim())
+        .find(|l| {
+            !l.is_empty()
+                && !l.starts_with('#')
+                && !l.starts_with("<!--")
+                && !l.starts_with("```")
+                && !l.starts_with('|')
+                && !l.starts_with("Started automatically from log finding")
+                && !l.starts_with("Started from log finding")
+                && !l.starts_with("Source ticket:")
+                && !l.to_ascii_lowercase().starts_with("closes #")
+        })
+        .unwrap_or("");
+    let line = line.replace("**", "").replace('`', "");
+    // The first sentence is enough.
+    let first = match line.find(". ") {
+        Some(i) => &line[..=i],
+        None => line.as_str(),
+    };
+    crate::truncate_str(first.trim(), 240).to_string()
+}
+
+/// Pure: the card when a fix run opens its pull request: the finding (title,
+/// severity, log group, how often and when), the PR and its repo, what it
+/// changes, and links to the PR and the finding.
 pub fn fix_message(
     t: &TicketRecord,
-    repo: &str,
-    pr_number: u64,
-    pr_title: &str,
-    pr_url: &str,
+    f: Option<&Finding>,
+    pr: &FixPr,
     finding_url: &str,
 ) -> Message {
-    let title = format!("🛠️ Fix proposed · PR #{pr_number}");
-    let mut buttons = vec![Button::new("Open PR", pr_url)];
+    let title = format!("🛠️ Fix proposed · PR #{}", pr.number);
+    let mut buttons = vec![Button::new("Open PR", &pr.url)];
     if !finding_url.is_empty() {
         buttons.push(Button::new("View finding", finding_url));
     }
-    let mut facts = vec![("Repository".to_string(), repo.to_string())];
-    if !t.log_group.is_empty() {
+    let finding_title = f
+        .map(|f| f.title.as_str())
+        .filter(|t| !t.trim().is_empty())
+        .unwrap_or(&t.title);
+    let mut facts = Vec::new();
+    if let Some(f) = f {
+        facts.push((
+            "Severity".to_string(),
+            severity_word(f.severity).to_string(),
+        ));
+    }
+    let log_group = f
+        .map(|f| f.source_log_group.as_str())
+        .filter(|g| !g.is_empty())
+        .unwrap_or(&t.log_group);
+    if !log_group.is_empty() {
         facts.push((
             "Log group".into(),
-            crate::truncate_str(&t.log_group, 200).into(),
+            crate::truncate_str(log_group, 200).into(),
+        ));
+    }
+    if let Some(seen) = f.and_then(seen_words) {
+        facts.push(("Seen".into(), seen));
+    }
+    facts.push((
+        "Pull request".into(),
+        format!(
+            "#{} {}",
+            pr.number,
+            crate::truncate_str(pr.title.trim(), 200).replace('\n', " ")
+        ),
+    ));
+    facts.push(("Repository".to_string(), pr.repo.clone()));
+    if !pr.change.trim().is_empty() {
+        facts.push((
+            "What it changes".into(),
+            crate::truncate_str(pr.change.trim(), 300).replace('\n', " "),
         ));
     }
     facts.push((
         "Status".into(),
-        "Waiting for review — nothing merges without a person's approval".into(),
+        "Waiting for review. Nothing merges without a person's approval".into(),
     ));
     Message {
-        summary: format!("{title}: {}", crate::truncate_str(pr_title, 200)),
+        summary: format!(
+            "{title}: {}",
+            crate::truncate_str(finding_title.trim(), 200).replace('\n', " ")
+        ),
         blocks: vec![
             Block::Banner {
                 text: title,
@@ -1603,14 +1828,14 @@ pub fn fix_message(
                 size: Size::Medium,
             },
             Block::Text(
-                Text::new(origin_line(t.auto, &t.title))
-                    .subtle()
+                Text::new(crate::truncate_str(finding_title.trim(), 300).replace('\n', " "))
+                    .bold()
                     .spacing(Spacing::Small),
             ),
             Block::Text(
-                Text::new(crate::truncate_str(pr_title, 300))
-                    .bold()
-                    .spacing(Spacing::Medium),
+                Text::new(origin_line(t.auto, &t.title))
+                    .subtle()
+                    .spacing(Spacing::Small),
             ),
             Block::Facts {
                 facts,
@@ -1619,6 +1844,240 @@ pub fn fix_message(
         ],
         buttons,
         full_width: true,
+    }
+}
+
+/// Pure: the follow-up card when the fix PR merges or closes, naming the card
+/// it follows (chat webhooks can't reply in its thread).
+pub fn fix_closed_message(
+    t: &TicketRecord,
+    repo: &str,
+    number: u64,
+    pr_url: &str,
+    merged: bool,
+    posted_at: &str,
+    finding_url: &str,
+) -> Message {
+    let (title, tone) = if merged {
+        (format!("✅ Fix merged · PR #{number}"), Tone::Good)
+    } else {
+        (
+            format!("Fix PR closed without merging · PR #{number}"),
+            Tone::Warning,
+        )
+    };
+    let when = card_time(posted_at).unwrap_or_else(|| "earlier".into());
+    let name = crate::truncate_str(t.title.trim(), 200).replace('\n', " ");
+    let line = if merged {
+        format!("The fix for \"{name}\" merged. Follows the fix PR card posted {when}.")
+    } else {
+        format!(
+            "The fix PR for \"{name}\" was closed without merging. The finding stays open. Follows the fix PR card posted {when}."
+        )
+    };
+    let mut facts = vec![("Repository".to_string(), repo.to_string())];
+    if !t.log_group.is_empty() {
+        facts.push((
+            "Log group".into(),
+            crate::truncate_str(&t.log_group, 200).into(),
+        ));
+    }
+    let mut buttons = Vec::new();
+    if !pr_url.is_empty() {
+        buttons.push(Button::new("Open PR", pr_url));
+    }
+    if !finding_url.is_empty() {
+        buttons.push(Button::new("View finding", finding_url));
+    }
+    Message {
+        summary: format!("{title}: {name}"),
+        blocks: vec![
+            Block::Banner {
+                text: title,
+                tone,
+                size: Size::Medium,
+            },
+            Block::Text(Text::new(line).spacing(Spacing::Small)),
+            Block::Facts {
+                facts,
+                spacing: Spacing::Default,
+            },
+        ],
+        buttons,
+        full_width: true,
+    }
+}
+
+const FIX_CARD_PREFIX: &str = "LOG_FIX_CARD#";
+
+/// Settings-table key of a finding's fix PR card.
+pub fn fix_card_sk(key: &str) -> String {
+    format!("{FIX_CARD_PREFIX}{}", crate::content_hash(key))
+}
+
+/// Pure: what a fix PR card is keyed on: the finding, or (for a ticket from
+/// before findings were recorded on it) the PR itself.
+pub fn card_key(t: &TicketRecord, repo: &str, number: u64) -> String {
+    if t.rec_id.is_empty() {
+        format!("{}#{number}", repo.to_ascii_lowercase())
+    } else {
+        t.rec_id.clone()
+    }
+}
+
+/// Where fix PR cards are recorded, so each posts once.
+#[async_trait::async_trait]
+pub trait FixCards: Send + Sync {
+    /// Record the card for `key` before it posts; false when one is already
+    /// recorded (it posted, or another post is under way). An error reads as
+    /// recorded: a missed card beats a duplicate.
+    async fn claim(&self, team_id: &str, key: &str, repo: &str, number: u64, at: &str) -> bool;
+    /// Drop a claim whose post reached no channel.
+    async fn forget(&self, team_id: &str, key: &str);
+    /// Take the card recorded for this PR, returning when it posted. Only one
+    /// caller gets it, so the follow-up posts once. None when no card posted
+    /// for this PR.
+    async fn take(&self, team_id: &str, key: &str, repo: &str, number: u64) -> Option<String>;
+}
+
+/// [`FixCards`] in the settings table.
+pub struct DynamoFixCards<'a> {
+    pub dynamo: &'a DynamoClient,
+    pub table: &'a str,
+}
+
+#[async_trait::async_trait]
+impl FixCards for DynamoFixCards<'_> {
+    async fn claim(&self, team_id: &str, key: &str, repo: &str, number: u64, at: &str) -> bool {
+        let ttl = Utc::now().timestamp().max(0) as u64 + TICKET_RECORD_SECS;
+        let out = self
+            .dynamo
+            .put_item()
+            .table_name(self.table)
+            .item("pk", attr(team_id))
+            .item("sk", attr(&fix_card_sk(key)))
+            .item("repo", attr(&repo.to_ascii_lowercase()))
+            .item("pr_number", AttributeValue::N(number.to_string()))
+            .item("posted_at", attr(at))
+            .item("ttl", AttributeValue::N(ttl.to_string()))
+            .condition_expression("attribute_not_exists(pk)")
+            .send()
+            .await;
+        match out {
+            Ok(_) => true,
+            Err(e) => {
+                let taken = e
+                    .as_service_error()
+                    .is_some_and(|se| se.is_conditional_check_failed_exception());
+                if !taken {
+                    tracing::warn!(team_id, error = %e, "Could not record the fix PR card; not posting it");
+                }
+                false
+            }
+        }
+    }
+
+    async fn forget(&self, team_id: &str, key: &str) {
+        let _ = self
+            .dynamo
+            .delete_item()
+            .table_name(self.table)
+            .key("pk", attr(team_id))
+            .key("sk", attr(&fix_card_sk(key)))
+            .send()
+            .await;
+    }
+
+    async fn take(&self, team_id: &str, key: &str, repo: &str, number: u64) -> Option<String> {
+        let out = self
+            .dynamo
+            .delete_item()
+            .table_name(self.table)
+            .key("pk", attr(team_id))
+            .key("sk", attr(&fix_card_sk(key)))
+            .condition_expression("repo = :r AND pr_number = :n")
+            .expression_attribute_values(":r", attr(&repo.to_ascii_lowercase()))
+            .expression_attribute_values(":n", AttributeValue::N(number.to_string()))
+            .return_values(aws_sdk_dynamodb::types::ReturnValue::AllOld)
+            .send()
+            .await;
+        match out {
+            Ok(o) => o.attributes.map(|a| s(&a, "posted_at")),
+            Err(e) => {
+                let missing = e
+                    .as_service_error()
+                    .is_some_and(|se| se.is_conditional_check_failed_exception());
+                if !missing {
+                    tracing::warn!(team_id, error = %e, "Could not read the fix PR card; not posting its follow-up");
+                }
+                None
+            }
+        }
+    }
+}
+
+/// Post the fix PR card once per finding. None when there is nowhere to post
+/// or the card already posted.
+#[allow(clippy::too_many_arguments)]
+pub async fn announce_fix_pr(
+    cards: &dyn FixCards,
+    poster: &dyn crate::notify::Poster,
+    channels: &Channels,
+    team_id: &str,
+    t: &TicketRecord,
+    f: Option<&Finding>,
+    pr: &FixPr,
+    finding_url: &str,
+    now: DateTime<Utc>,
+) -> Option<crate::notify::Delivery> {
+    if channels.is_empty() {
+        return None;
+    }
+    let key = card_key(t, &pr.repo, pr.number);
+    if !cards
+        .claim(team_id, &key, &pr.repo, pr.number, &now.to_rfc3339())
+        .await
+    {
+        return None;
+    }
+    let msg = fix_message(t, f, pr, finding_url);
+    let sent = crate::notify::deliver(poster, channels, &msg, "log_fix_pr").await;
+    if !sent.any_ok() {
+        cards.forget(team_id, &key).await;
+    }
+    Some(sent)
+}
+
+/// Post the follow-up when a fix PR merges or closes: only for a PR whose
+/// card posted, and only once.
+#[allow(clippy::too_many_arguments)]
+pub async fn announce_fix_closed(
+    cards: &dyn FixCards,
+    poster: &dyn crate::notify::Poster,
+    channels: &Channels,
+    team_id: &str,
+    t: &TicketRecord,
+    repo: &str,
+    number: u64,
+    pr_url: &str,
+    merged: bool,
+    finding_url: &str,
+) -> Option<crate::notify::Delivery> {
+    if channels.is_empty() {
+        return None;
+    }
+    let key = card_key(t, repo, number);
+    let posted_at = cards.take(team_id, &key, repo, number).await?;
+    let msg = fix_closed_message(t, repo, number, pr_url, merged, &posted_at, finding_url);
+    Some(crate::notify::deliver(poster, channels, &msg, "log_fix_pr_closed").await)
+}
+
+/// Pure: the finding's page on the dashboard.
+pub fn finding_url(base: &str, rec_id: &str) -> String {
+    if rec_id.is_empty() {
+        format!("{base}/logs")
+    } else {
+        format!("{base}/logs?finding={rec_id}")
     }
 }
 
@@ -2820,7 +3279,13 @@ mod tests {
         );
         assert_eq!(pick_channels("team", own.clone(), team.clone(), true), team);
         assert!(pick_channels("team", own.clone(), team.clone(), false).is_empty());
-        assert!(pick_channels("off", own, team, true).is_empty());
+        assert!(pick_channels("off", own.clone(), team.clone(), true).is_empty());
+        // Never saved: the team's alert channel, when it is on.
+        assert_eq!(pick_channels("", own.clone(), team.clone(), true), team);
+        assert!(pick_channels("", own.clone(), team.clone(), false).is_empty());
+        assert_eq!(effective_mode(""), "team");
+        assert_eq!(effective_mode("off"), "off");
+        assert_eq!(effective_mode("custom"), "custom");
         let m = fix_message(
             &TicketRecord {
                 title: "Checkout timeouts".into(),
@@ -2828,15 +3293,19 @@ mod tests {
                 auto: true,
                 ..Default::default()
             },
-            "acme/shop",
-            12,
-            "Raise the checkout timeout",
-            "https://github.com/acme/shop/pull/12",
+            None,
+            &FixPr {
+                repo: "acme/shop".into(),
+                number: 12,
+                title: "Raise the checkout timeout".into(),
+                url: "https://github.com/acme/shop/pull/12".into(),
+                change: String::new(),
+            },
             "https://app/logs?finding=01abc",
         );
         assert!(m.summary.starts_with("🛠️ Fix proposed · PR #12"));
         assert!(
-            matches!(&m.blocks[1], Block::Text(t) if t.text == "Started automatically from log finding \"Checkout timeouts\".")
+            matches!(&m.blocks[2], Block::Text(t) if t.text == "Started automatically from log finding \"Checkout timeouts\".")
         );
         assert_eq!(m.buttons.len(), 2);
     }
@@ -2878,5 +3347,433 @@ mod autofix_index_tests {
         assert_eq!(spec.name, AUTOFIX_INDEX);
         assert_eq!(spec.filter, "sk = :sk");
         assert_eq!(spec.values[0].1, attr(AUTOFIX_SK));
+    }
+}
+
+#[cfg(test)]
+mod fix_card_tests {
+    use super::*;
+    use crate::notify::{Delivery, Poster};
+    use std::sync::Mutex;
+
+    const TEAMS: &str = "https://acme.webhook.office.com/webhookb2/abc";
+    const SLACK: &str = "https://hooks.slack.com/services/T000/B000/XXXX";
+
+    fn sv(v: &str) -> AttributeValue {
+        AttributeValue::S(v.into())
+    }
+
+    /// A stored channel item: webhooks saved (sealed) for the given kinds.
+    fn channel_item(kinds: &[&str], extra: &[(&str, AttributeValue)]) -> Item {
+        let mut i = Item::new();
+        for k in kinds {
+            i.insert(format!("{k}_webhook_sealed"), sv("sealed"));
+            i.insert(format!("{k}_webhook_hint"), sv("hint"));
+        }
+        for (k, v) in extra {
+            i.insert(k.to_string(), v.clone());
+        }
+        i
+    }
+
+    fn team_on(kinds: &[&str]) -> Item {
+        channel_item(kinds, &[("enabled", AttributeValue::Bool(true))])
+    }
+
+    #[test]
+    fn never_saved_posts_to_the_team_alert_channel() {
+        let team = team_on(&["teams", "slack"]);
+        let p = posts_to(None, Some(&team));
+        assert_eq!(p.mode, "team");
+        assert!(!p.saved);
+        assert_eq!(p.channels, vec!["Microsoft Teams", "Slack"]);
+        assert!(p.team_alerts);
+        // A record without a mode is the same as none.
+        let blank = channel_item(&[], &[("updated_at", sv("x"))]);
+        assert_eq!(posts_to(Some(&blank), Some(&team)).channels.len(), 2);
+    }
+
+    #[test]
+    fn a_saved_choice_stands() {
+        let team = team_on(&["teams"]);
+        let off = channel_item(&[], &[("notify_mode", sv("off"))]);
+        let p = posts_to(Some(&off), Some(&team));
+        assert_eq!((p.mode.as_str(), p.saved), ("off", true));
+        assert!(p.channels.is_empty());
+        let own = channel_item(&["slack"], &[("notify_mode", sv("custom"))]);
+        let p = posts_to(Some(&own), Some(&team));
+        assert_eq!(p.mode, "custom");
+        assert_eq!(p.channels, vec!["Slack"]);
+    }
+
+    #[test]
+    fn no_alert_channel_posts_nowhere() {
+        assert!(posts_to(None, None).channels.is_empty());
+        let disabled = channel_item(&["teams"], &[("enabled", AttributeValue::Bool(false))]);
+        let p = posts_to(None, Some(&disabled));
+        assert!(p.channels.is_empty() && !p.team_alerts);
+        // On, but no channel saved.
+        assert!(!posts_to(None, Some(&team_on(&[]))).team_alerts);
+    }
+
+    #[derive(Default)]
+    struct Cards(Mutex<HashMap<String, (String, u64, String)>>);
+
+    #[async_trait::async_trait]
+    impl FixCards for Cards {
+        async fn claim(&self, team: &str, key: &str, repo: &str, n: u64, at: &str) -> bool {
+            let mut m = self.0.lock().unwrap();
+            let k = format!("{team}/{key}");
+            if m.contains_key(&k) {
+                return false;
+            }
+            m.insert(k, (repo.to_ascii_lowercase(), n, at.into()));
+            true
+        }
+        async fn forget(&self, team: &str, key: &str) {
+            self.0.lock().unwrap().remove(&format!("{team}/{key}"));
+        }
+        async fn take(&self, team: &str, key: &str, repo: &str, n: u64) -> Option<String> {
+            let mut m = self.0.lock().unwrap();
+            let k = format!("{team}/{key}");
+            match m.get(&k) {
+                Some((r, num, _)) if *r == repo.to_ascii_lowercase() && *num == n => {
+                    m.remove(&k).map(|v| v.2)
+                }
+                _ => None,
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct Fake {
+        posts: Mutex<Vec<(String, serde_json::Value)>>,
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl Poster for Fake {
+        async fn post(&self, url: &str, body: &serde_json::Value) -> Result<(), String> {
+            self.posts
+                .lock()
+                .unwrap()
+                .push((url.to_string(), body.clone()));
+            if self.fail {
+                Err("webhook returned 500".into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn ticket() -> TicketRecord {
+        TicketRecord {
+            rec_id: "01kfinding".into(),
+            title: "Payment webhook times out".into(),
+            log_group: "/aws/lambda/orbit-payments".into(),
+            auto: true,
+        }
+    }
+
+    fn finding() -> Finding {
+        Finding {
+            rec_id: "01kfinding".into(),
+            severity: Severity::Critical,
+            title: "Payment webhook times out".into(),
+            source_log_group: "/aws/lambda/orbit-payments".into(),
+            seen_count: Some(1240),
+            count_basis: "events".into(),
+            first_seen_at: "2026-11-10T08:00:00Z".into(),
+            last_seen_at: "2026-11-11T09:12:00Z".into(),
+            ..Default::default()
+        }
+    }
+
+    fn pr() -> FixPr {
+        FixPr {
+            repo: "orbit/payments".into(),
+            number: 41,
+            title: "Retry the payment webhook with a shorter timeout".into(),
+            url: "https://github.com/orbit/payments/pull/41".into(),
+            change: "Retries the webhook call twice with a 5 second timeout.".into(),
+        }
+    }
+
+    fn slack_text(v: &serde_json::Value) -> String {
+        v.to_string()
+    }
+
+    #[test]
+    fn the_card_names_the_finding_the_pr_and_what_it_changes() {
+        let m = fix_message(
+            &ticket(),
+            Some(&finding()),
+            &pr(),
+            "https://app/logs?finding=01kfinding",
+        );
+        let facts = m
+            .blocks
+            .iter()
+            .find_map(|b| match b {
+                Block::Facts { facts, .. } => Some(facts.clone()),
+                _ => None,
+            })
+            .unwrap();
+        let get = |k: &str| facts.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+        assert_eq!(get("Severity").as_deref(), Some("Critical"));
+        assert_eq!(
+            get("Log group").as_deref(),
+            Some("/aws/lambda/orbit-payments")
+        );
+        assert_eq!(
+            get("Seen").as_deref(),
+            Some("1,240 lines since first seen (first Nov 10, 08:00 UTC, last Nov 11, 09:12 UTC)")
+        );
+        assert_eq!(get("Repository").as_deref(), Some("orbit/payments"));
+        assert_eq!(
+            get("Pull request").as_deref(),
+            Some("#41 Retry the payment webhook with a shorter timeout")
+        );
+        assert_eq!(
+            get("What it changes").as_deref(),
+            Some("Retries the webhook call twice with a 5 second timeout.")
+        );
+        assert!(matches!(&m.blocks[1], Block::Text(t) if t.text == "Payment webhook times out"));
+        let urls: Vec<&str> = m.buttons.iter().map(|b| b.url.as_str()).collect();
+        assert_eq!(
+            urls,
+            [
+                "https://github.com/orbit/payments/pull/41",
+                "https://app/logs?finding=01kfinding"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_change_line_is_the_first_plain_sentence() {
+        let body = "Started automatically from log finding \"x\".\n\nSource ticket: LOG-1\n\n## Summary\n\n- Retries the **webhook** call twice. Then logs it.\n";
+        assert_eq!(change_line(body), "Retries the webhook call twice.");
+        assert_eq!(change_line("## Only a heading\n"), "");
+    }
+
+    #[tokio::test]
+    async fn a_fix_pr_posts_once_with_its_link() {
+        let cards = Cards::default();
+        let poster = Fake::default();
+        let to = Channels {
+            teams: Some(TEAMS.into()),
+            slack: Some(SLACK.into()),
+        };
+        let now = Utc::now();
+        let url = finding_url("https://app", "01kfinding");
+        let first = announce_fix_pr(
+            &cards,
+            &poster,
+            &to,
+            "T1",
+            &ticket(),
+            Some(&finding()),
+            &pr(),
+            &url,
+            now,
+        )
+        .await;
+        assert!(first.is_some_and(|d| d.any_ok()));
+        // A retry, a continuation, or the same PR seen again: no second card.
+        let again = announce_fix_pr(
+            &cards,
+            &poster,
+            &to,
+            "T1",
+            &ticket(),
+            Some(&finding()),
+            &pr(),
+            &url,
+            now,
+        )
+        .await;
+        assert!(again.is_none());
+        let posts = poster.posts.lock().unwrap();
+        assert_eq!(posts.len(), 2, "one card per channel, once");
+        for (_, body) in posts.iter() {
+            let t = slack_text(body);
+            assert!(
+                t.contains("https://github.com/orbit/payments/pull/41"),
+                "{t}"
+            );
+            assert!(t.contains("logs?finding=01kfinding"), "{t}");
+        }
+    }
+
+    #[tokio::test]
+    async fn nowhere_to_post_claims_nothing() {
+        let cards = Cards::default();
+        let poster = Fake::default();
+        let d = announce_fix_pr(
+            &cards,
+            &poster,
+            &Channels::default(),
+            "T1",
+            &ticket(),
+            None,
+            &pr(),
+            "",
+            Utc::now(),
+        )
+        .await;
+        assert!(d.is_none());
+        assert!(cards.0.lock().unwrap().is_empty());
+        assert!(poster.posts.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_post_that_reached_no_channel_can_post_again() {
+        let cards = Cards::default();
+        let failing = Fake {
+            fail: true,
+            ..Default::default()
+        };
+        let to = Channels {
+            teams: Some(TEAMS.into()),
+            slack: None,
+        };
+        let d: Option<Delivery> = announce_fix_pr(
+            &cards,
+            &failing,
+            &to,
+            "T1",
+            &ticket(),
+            None,
+            &pr(),
+            "",
+            Utc::now(),
+        )
+        .await;
+        assert!(d.is_some_and(|d| !d.any_ok()));
+        assert!(cards.0.lock().unwrap().is_empty());
+        let ok = Fake::default();
+        assert!(announce_fix_pr(
+            &cards,
+            &ok,
+            &to,
+            "T1",
+            &ticket(),
+            None,
+            &pr(),
+            "",
+            Utc::now()
+        )
+        .await
+        .is_some());
+    }
+
+    #[tokio::test]
+    async fn merged_and_closed_follow_up_once_and_only_for_a_posted_card() {
+        let to = Channels {
+            teams: None,
+            slack: Some(SLACK.into()),
+        };
+        // No card posted for this PR: no follow-up.
+        let cards = Cards::default();
+        let poster = Fake::default();
+        let none = announce_fix_closed(
+            &cards,
+            &poster,
+            &to,
+            "T1",
+            &ticket(),
+            "orbit/payments",
+            41,
+            &pr().url,
+            true,
+            "",
+        )
+        .await;
+        assert!(none.is_none());
+
+        let at = "2026-11-11T09:30:00Z".parse::<DateTime<Utc>>().unwrap();
+        announce_fix_pr(
+            &cards,
+            &poster,
+            &to,
+            "T1",
+            &ticket(),
+            Some(&finding()),
+            &pr(),
+            "",
+            at,
+        )
+        .await;
+        // Another PR number for the same finding doesn't take this card.
+        assert!(announce_fix_closed(
+            &cards,
+            &poster,
+            &to,
+            "T1",
+            &ticket(),
+            "orbit/payments",
+            99,
+            "",
+            true,
+            ""
+        )
+        .await
+        .is_none());
+        let merged = announce_fix_closed(
+            &cards,
+            &poster,
+            &to,
+            "T1",
+            &ticket(),
+            "Orbit/Payments",
+            41,
+            &pr().url,
+            true,
+            "https://app/logs?finding=01kfinding",
+        )
+        .await;
+        assert!(merged.is_some_and(|d| d.any_ok()));
+        let again = announce_fix_closed(
+            &cards,
+            &poster,
+            &to,
+            "T1",
+            &ticket(),
+            "orbit/payments",
+            41,
+            &pr().url,
+            true,
+            "",
+        )
+        .await;
+        assert!(again.is_none(), "the follow-up posts once");
+        let posts = poster.posts.lock().unwrap();
+        assert_eq!(posts.len(), 2);
+        let follow = slack_text(&posts[1].1);
+        assert!(follow.contains("Fix merged · PR #41"), "{follow}");
+        assert!(
+            follow.contains("Follows the fix PR card posted Nov 11, 09:30 UTC"),
+            "{follow}"
+        );
+    }
+
+    #[test]
+    fn a_closed_pr_says_the_finding_stays_open() {
+        let m = fix_closed_message(
+            &ticket(),
+            "orbit/payments",
+            41,
+            "https://github.com/orbit/payments/pull/41",
+            false,
+            "",
+            "",
+        );
+        assert!(m
+            .summary
+            .starts_with("Fix PR closed without merging · PR #41"));
+        assert!(
+            matches!(&m.blocks[1], Block::Text(t) if t.text.contains("The finding stays open") && t.text.contains("posted earlier"))
+        );
+        assert_eq!(m.buttons.len(), 1);
     }
 }

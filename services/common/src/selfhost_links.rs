@@ -101,15 +101,29 @@ fn every_link_and_message_points_at_the_install() {
             .map(|s| ("log repo card", s)),
     );
     let ticket = crate::log_findings::TicketRecord::default();
-    let log_fix = crate::log_findings::fix_message(
+    let pr = crate::log_findings::FixPr {
+        repo: "acme/web".into(),
+        number: 7,
+        title: "Fix the loop".into(),
+        url: "https://github.com/acme/web/pull/7".into(),
+        change: String::new(),
+    };
+    let log_fix = crate::log_findings::fix_message(&ticket, Some(&finding), &pr, &url);
+    out.extend(rendered(&log_fix).into_iter().map(|s| ("log fix card", s)));
+    let log_fix_closed = crate::log_findings::fix_closed_message(
         &ticket,
         "acme/web",
         7,
-        "Fix the loop",
         "https://github.com/acme/web/pull/7",
+        true,
+        "2026-11-11T09:00:00Z",
         &url,
     );
-    out.extend(rendered(&log_fix).into_iter().map(|s| ("log fix card", s)));
+    out.extend(
+        rendered(&log_fix_closed)
+            .into_iter()
+            .map(|s| ("log fix closed card", s)),
+    );
 
     override_for_this_thread(None);
     for (what, o) in &out {

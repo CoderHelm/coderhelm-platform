@@ -63,6 +63,20 @@ fn by_person(user: &Value) -> bool {
     user["type"].as_str() != Some("Bot") && !user["login"].as_str().unwrap_or("").ends_with("[bot]")
 }
 
+/// Log groups the Logs page saved this repo for. Best effort.
+async fn mapped_log_groups(state: &WorkerState, team: &str, repo: &str) -> Vec<String> {
+    common::log_findings::load_autofix(&state.dynamo, &state.config.settings_table_name, team)
+        .await
+        .map(|cfg| {
+            cfg.overrides
+                .into_iter()
+                .filter(|o| o.repo.eq_ignore_ascii_case(repo))
+                .map(|o| o.log_group)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Reads one repo's facts. Every read past the repo itself is best effort:
 /// what can't be read is simply missing from the facts.
 async fn gather(gh: &GitHubClient, repo: &str) -> Result<RepoFacts, Error> {
@@ -313,7 +327,8 @@ async fn analyze_repo(
         iid,
         &state.http,
     )?;
-    let f = gather(&gh, &doc.repo).await?;
+    let mut f = gather(&gh, &doc.repo).await?;
+    f.log_groups = mapped_log_groups(state, &team, &doc.repo).await;
     let ids: Vec<&str> = run.scope.iter().map(String::as_str).collect();
     let over = super::check_budget_exceeded(state, &team).await;
     let mode = if run.automatic { Mode::Auto } else { run.mode };

@@ -414,6 +414,12 @@ class Slack(unittest.TestCase):
         self.assertEqual(h.pick_channels("team", {}, both, False), {})
         self.assertEqual(h.pick_channels("custom", {"slack": self.SLACK}, both, False), {"slack": self.SLACK})
         self.assertEqual(h.pick_channels("off", both, both, True), {})
+        # Never saved: the team's alert channel, when it is on.
+        self.assertEqual(h.pick_channels("", {}, both, True), both)
+        self.assertEqual(h.pick_channels(None, {}, both, True), both)
+        self.assertEqual(h.pick_channels("", {}, both, False), {})
+        self.assertEqual(h.effective_mode(None), "team")
+        self.assertEqual(h.effective_mode("off"), "off")
 
     def test_a_failing_slack_post_does_not_stop_teams(self):
         posted = []
