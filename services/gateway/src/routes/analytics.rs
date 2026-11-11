@@ -929,6 +929,9 @@ pub struct DeployRow {
     pub environment_name: String,
     /// `succeeded` or `failed`.
     pub outcome: String,
+    /// How the environment was known (`common::deploy_stats::Known`);
+    /// empty on records from before it was kept.
+    pub source: String,
 }
 
 impl DeployRow {
@@ -940,6 +943,7 @@ impl DeployRow {
             environment: s(i, "environment"),
             environment_name: s(i, "environment_name"),
             outcome: s(i, "outcome"),
+            source: s(i, "source"),
         }
     }
     fn key(&self) -> String {
@@ -990,6 +994,22 @@ pub fn deploy_counts(rows: &[&DeployRow]) -> Value {
             .filter(|r| r.outcome == "failed")
             .filter(|r| !matches!(r.environment.as_str(), "preview" | "staging" | "production"))
             .count(),
+    })
+}
+
+/// How the period's deploys were known: how many GitHub's deployments named,
+/// and, when some were read from workflows because CoderHelm can't read
+/// deployments, a sentence saying so and how to lift it.
+pub fn deploy_sources(rows: &[&DeployRow]) -> Value {
+    let d = distinct_deploys(rows);
+    let from = |src: &str| d.iter().filter(|r| r.source == src).count();
+    let no_access = from(common::deploy_stats::Known::WorkflowNoAccess.as_str());
+    json!({
+        "deploys_from_deployments": from(common::deploy_stats::Known::Deployments.as_str()),
+        "deploys_source_note": (no_access > 0).then(|| common::github_grants::limit_note(
+            "deployments",
+            "Deploys are inferred from workflow names and jobs",
+        )),
     })
 }
 
@@ -1132,6 +1152,9 @@ pub fn add_deploys(
     } else {
         "known"
     };
+    let sources = deploy_sources(&cur);
+    compared["current"]["deploys_from_deployments"] = sources["deploys_from_deployments"].clone();
+    compared["deploys_source_note"] = sources["deploys_source_note"].clone();
     compared["deploys_since"] = json!(backfill.since);
     compared["deploys_previous_state"] = json!(previous_state);
     compared["deploys_comparable"] = json!(previous_state == "known");
@@ -2477,7 +2500,26 @@ mod tests {
             environment: env.into(),
             environment_name: env.into(),
             outcome: outcome.into(),
+            source: String::new(),
         }
+    }
+
+    #[test]
+    fn deploys_say_how_they_were_known() {
+        let mut a = dep(1, 1, "production", "succeeded");
+        a.source = "deployments".into();
+        let mut b = dep(1, 2, "staging", "succeeded");
+        b.source = "workflow".into();
+        let v = deploy_sources(&[&a, &b]);
+        assert_eq!(v["deploys_from_deployments"], 1);
+        assert!(v["deploys_source_note"].is_null());
+        // A deploy read without access to deployments says so, in plain words.
+        let mut c = dep(1, 3, "production", "succeeded");
+        c.source = "workflow_no_deployments_access".into();
+        let v = deploy_sources(&[&a, &c]);
+        let note = v["deploys_source_note"].as_str().unwrap();
+        assert!(note.starts_with("Deploys are inferred from workflow names and jobs because"));
+        assert!(note.contains("add Deployments: read"));
     }
 
     fn known(days_ago: i64) -> DeployBackfill {
