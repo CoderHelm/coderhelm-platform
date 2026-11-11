@@ -1783,6 +1783,7 @@ fn verdict_word(v: Verdict) -> &'static str {
 async fn track_prs(cx: &Ctx<'_>, findings: &mut [(Finding, FindingState)]) {
     let now = Utc::now();
     let mut seen: HashMap<(String, u64), (String, Option<String>)> = HashMap::new();
+    let mut refreshed: HashSet<((String, u64), Option<String>)> = HashSet::new();
     let channels = if cx.cfg.acts() {
         Some(team_channels(cx.state, cx.team_id).await)
     } else {
@@ -1892,6 +1893,27 @@ async fn track_prs(cx: &Ctx<'_>, findings: &mut [(Finding, FindingState)]) {
                         Some(&p.url),
                     )
                     .await;
+                }
+                if p.ci != pr.ci && p.ci.as_deref() == Some("failing") {
+                    add_event(
+                        cx.state,
+                        cx.team_id,
+                        &f.id,
+                        &format!("CI fails on PR #{}", p.number),
+                        Some(&p.url),
+                    )
+                    .await;
+                }
+                // CI ended one way or the other: the description says so,
+                // once per pull request and result.
+                if p.ci != pr.ci
+                    && matches!(p.ci.as_deref(), Some("passing" | "failing"))
+                    && !p.adopted
+                    && refreshed.insert((key.clone(), p.ci.clone()))
+                {
+                    if let Some(ticket) = st.ticket.clone() {
+                        refresh_ci_sections(cx, &f.repo, p.number, &ticket).await;
+                    }
                 }
             }
         }
@@ -2452,16 +2474,24 @@ async fn refresh_pr(
     let Some((o, n)) = unit.repo.split_once('/') else {
         return;
     };
-    let change = ticket_item(cx.state, cx.team_id, ticket)
-        .await
-        .map(|i| s(&i, "change"))
-        .unwrap_or_default();
+    let item = ticket_item(cx.state, cx.team_id, ticket).await;
+    let change = item.as_ref().map(|i| s(i, "change")).unwrap_or_default();
     let pairs: Vec<(&Finding, &FindingState)> = findings
         .iter()
         .filter(|(f, _)| unit.finding_ids.contains(&f.id))
         .map(|(f, st)| (f, st))
         .collect();
-    let body = sec::pr_body(unit, &pairs, &change);
+    let check = what_to_check(
+        &cx.gh,
+        unit,
+        item.as_ref()
+            .map(|i| s(i, "notes"))
+            .unwrap_or_default()
+            .as_str(),
+        Some(pr),
+    )
+    .await;
+    let body = sec::pr_body_with(unit, &pairs, &change, &check);
     if let Err(e) = cx.gh.update_pr_body(o, n, pr, &body).await {
         warn!(repo = %unit.repo, pr, error = %e, "security: could not write the bundle's description");
     }
@@ -2489,9 +2519,23 @@ async fn join(
         .ok_or("the open bundle's plan is gone")?;
     let merged = sec::join_unit(&open, add, findings, cx.cfg);
     let member_refs: Vec<&Finding> = members.iter().map(|i| &findings[*i].0).collect();
-    let ask = sec::join_note(add, &member_refs, cx.cfg);
+    let (o, n) = add.repo.split_once('/').ok_or("bad repo")?;
+    let base = cx.gh.get_default_branch(o, n).await?;
+    let notes = super::upgrade_notes::read(cx.state, &cx.gh, add, &base).await;
+    let ask = sec::join_note_with(add, &member_refs, cx.cfg, &notes);
     follow_up(cx, &add.repo, pr.number, ticket, ask).await?;
     save_unit(cx.state, cx.team_id, ticket, &merged).await?;
+    let kept = ticket_item(cx.state, cx.team_id, ticket)
+        .await
+        .map(|i| s(&i, "notes"))
+        .unwrap_or_default();
+    save_notes(
+        cx.state,
+        cx.team_id,
+        ticket,
+        &super::upgrade_notes::merged(&kept, &notes),
+    )
+    .await;
     let now = Utc::now().to_rfc3339();
     for i in members {
         let (f, st) = &mut findings[*i];
@@ -2775,7 +2819,11 @@ async fn enqueue(
     let (owner, name) = unit.repo.split_once('/').ok_or("bad repo")?;
     let base = cx.gh.get_default_branch(owner, name).await?;
     let member_refs: Vec<&Finding> = members.iter().map(|i| &findings[*i].0).collect();
-    let body = sec::ticket_body(unit, &member_refs, cx.cfg);
+    // What each bump changes, read before the run: the coder starts from
+    // the breaking changes and their call sites, and the pull request's
+    // "What to check" is written from the same notes.
+    let notes = super::upgrade_notes::read(cx.state, &cx.gh, unit, &base).await;
+    let body = sec::ticket_body_with(unit, &member_refs, cx.cfg, &notes);
     let lead = member_refs
         .iter()
         .min_by_key(|f| f.tier)
@@ -2792,6 +2840,7 @@ async fn enqueue(
         .item("branch", attr_s(&unit.branch))
         .item("title", attr_s(&unit.title))
         .item("lead_finding", attr_s(&lead))
+        .item("notes", attr_s(&serde_json::to_string(&notes)?))
         .item("ttl", attr_n(Utc::now().timestamp() + 120 * 86_400))
         .send()
         .await?;
@@ -3398,7 +3447,149 @@ pub async fn pr_body(state: &WorkerState, msg: &TicketMessage, change: &str) -> 
         .await;
     let members = unit_findings(state, &msg.team_id, &unit).await;
     let pairs: Vec<(&Finding, &FindingState)> = members.iter().map(|(f, s)| (f, s)).collect();
-    Some(sec::pr_body(&unit, &pairs, change))
+    let notes = ticket_item(state, &msg.team_id, &msg.ticket_id)
+        .await
+        .map(|i| s(&i, "notes"))
+        .unwrap_or_default();
+    let check = match github(state, msg.installation_id) {
+        Ok(gh) => what_to_check(&gh, &unit, &notes, None).await,
+        Err(_) => common::upgrade_notes::WhatToCheck::from_notes(&notes),
+    };
+    Some(sec::pr_body_with(&unit, &pairs, change, &check))
+}
+
+/// Keeps a ticket's upgrade notes.
+async fn save_notes(
+    state: &WorkerState,
+    team_id: &str,
+    ticket: &str,
+    notes: &[common::upgrade_notes::PackageNotes],
+) {
+    let _ = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(team_id))
+        .key("sk", attr_s(&sec::ticket_sk(ticket)))
+        .update_expression("SET notes = :n")
+        .condition_expression("attribute_exists(sk)")
+        .expression_attribute_values(
+            ":n",
+            attr_s(&serde_json::to_string(notes).unwrap_or_default()),
+        )
+        .send()
+        .await;
+}
+
+/// The pull request's CI for its "What to check": which checks ran and
+/// which fail (CoderHelm's own checks left out).
+async fn ci_of(gh: &GitHubClient, repo: &str, number: u64) -> common::upgrade_notes::CiState {
+    let mut out = common::upgrade_notes::CiState::default();
+    let Some((o, n)) = repo.split_once('/') else {
+        return out;
+    };
+    let Ok(pr) = gh.get_pull_request(o, n, number).await else {
+        return out;
+    };
+    let sha = pr["head"]["sha"].as_str().unwrap_or("");
+    let Ok(v) = gh.list_ci_for_ref(o, n, sha).await else {
+        return out;
+    };
+    let runs: Vec<Value> = v["check_runs"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| {
+            let name = r["name"].as_str().unwrap_or("");
+            name != common::review_check::CHECK_NAME
+                && !super::is_own_login(r["app"]["slug"].as_str().unwrap_or(""))
+        })
+        .collect();
+    if runs.is_empty() {
+        return out;
+    }
+    for r in &runs {
+        let name = r["name"].as_str().unwrap_or("").to_string();
+        if !out.checks.contains(&name) {
+            out.checks.push(name.clone());
+        }
+        if matches!(
+            r["conclusion"].as_str(),
+            Some("failure" | "timed_out" | "cancelled" | "action_required")
+        ) && !out.failing.contains(&name)
+        {
+            out.failing.push(name);
+        }
+    }
+    out.state = if !out.failing.is_empty() {
+        "failing"
+    } else if runs
+        .iter()
+        .all(|r| r["status"].as_str() == Some("completed"))
+    {
+        "passing"
+    } else {
+        "pending"
+    }
+    .into();
+    out
+}
+
+/// What a security pull request's "What to check" is written from: the
+/// ticket's upgrade notes, the files the branch changes, and the pull
+/// request's CI when it has one.
+async fn what_to_check(
+    gh: &GitHubClient,
+    unit: &FixUnit,
+    notes: &str,
+    pr: Option<u64>,
+) -> common::upgrade_notes::WhatToCheck {
+    let mut w = common::upgrade_notes::WhatToCheck::from_notes(notes);
+    if let Some((o, n)) = unit.repo.split_once('/') {
+        if let Ok(base) = gh.get_default_branch(o, n).await {
+            if let Ok(files) = gh.compare_changed_files(o, n, &base, &unit.branch).await {
+                w.files = files;
+            }
+        }
+    }
+    if let Some(number) = pr {
+        w.ci = ci_of(gh, &unit.repo, number).await;
+    }
+    w
+}
+
+/// A security pull request whose CI just ended (passed or failed): its
+/// "What to check" and Proof say so, in place; the rest of the description
+/// (the draft status at its top) stays.
+async fn refresh_ci_sections(cx: &Ctx<'_>, repo: &str, number: u64, ticket: &str) {
+    let Some(unit) = load_unit(cx.state, cx.team_id, ticket).await else {
+        return;
+    };
+    let Some((o, n)) = repo.split_once('/') else {
+        return;
+    };
+    let Ok(pr) = cx.gh.get_pull_request(o, n, number).await else {
+        return;
+    };
+    let body = pr["body"].as_str().unwrap_or("");
+    if !body.contains(sec::MARKER) {
+        return;
+    }
+    let item = ticket_item(cx.state, cx.team_id, ticket).await;
+    let change = item.as_ref().map(|i| s(i, "change")).unwrap_or_default();
+    let notes = item.as_ref().map(|i| s(i, "notes")).unwrap_or_default();
+    let members = unit_findings(cx.state, cx.team_id, &unit).await;
+    let pairs: Vec<(&Finding, &FindingState)> = members.iter().map(|(f, st)| (f, st)).collect();
+    let check = what_to_check(&cx.gh, &unit, &notes, Some(number)).await;
+    let fresh = sec::pr_body_with(&unit, &pairs, &change, &check);
+    let next =
+        common::upgrade_notes::replace_sections(body, &fresh, &["## What to check", "## Proof"]);
+    if next != body {
+        if let Err(e) = cx.gh.update_pr_body(o, n, number, &next).await {
+            warn!(%repo, number, error = %e, "security: could not write the CI result into the description");
+        }
+    }
 }
 
 /// A security run opened its pull request: labels, the findings, the card.

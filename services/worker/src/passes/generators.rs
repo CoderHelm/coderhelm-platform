@@ -40,6 +40,9 @@ pub enum GenKind {
     Protobuf,
     /// A rule the repository's docs state.
     Documented,
+    /// A lockfile, written by the repository's own package manager (a
+    /// security fix run's: `common::upgrade_notes::lock_tools`).
+    Lockfile,
 }
 
 /// One generator, the files it reads and the files it writes.
@@ -661,8 +664,47 @@ pub fn detect(repo: &RepoFiles) -> Vec<Generator> {
     out
 }
 
+/// The lockfiles' own generators: each lockfile, its package manager's
+/// command, and the manifests it reads. A manifest change writes the
+/// lockfile again, and so does a lockfile changed by hand (the manager's
+/// output replaces it).
+pub fn lockfile_generators(tree: &[String]) -> Vec<Generator> {
+    common::upgrade_notes::lock_tools(tree)
+        .into_iter()
+        .map(|t| Generator {
+            kind: GenKind::Lockfile,
+            name: format!("{} lockfile `{}`", t.manager, t.lockfile),
+            command: t.command,
+            inputs: t.inputs,
+            outputs: vec![t.lockfile],
+        })
+        .collect()
+}
+
+/// The changed files a lockfile generator answers to: a manifest it reads
+/// (a `!dir/**` input leaves a nested lockfile's folder out), or the
+/// lockfile itself, edited by hand.
+pub fn lockfile_hits(g: &Generator, changed: &[String]) -> Vec<String> {
+    let (skip, read): (Vec<String>, Vec<String>) =
+        g.inputs.iter().cloned().partition(|i| i.starts_with('!'));
+    let skip: Vec<String> = skip
+        .iter()
+        .map(|s| s.trim_start_matches('!').to_string())
+        .collect();
+    changed
+        .iter()
+        .filter(|c| any_match(&g.outputs, c) || (any_match(&read, c) && !any_match(&skip, c)))
+        .cloned()
+        .collect()
+}
+
 /// The full command for the sandbox: install, then the generator.
 pub fn sandbox_command(tree: &[String], g: &Generator) -> String {
+    // A lockfile's command writes the lockfile itself: a frozen install
+    // before it would fail on the very change it answers.
+    if g.kind == GenKind::Lockfile {
+        return g.command.clone();
+    }
     let (install, _) = package_manager(tree);
     let needs_node = g.command.starts_with("npm ")
         || g.command.starts_with("pnpm ")
@@ -747,6 +789,17 @@ fn kind_hosts(kind: GenKind) -> &'static [&'static str] {
         GenKind::Prisma => &["binaries.prisma.sh"],
         GenKind::Protobuf => &["buf.build"],
         GenKind::GraphqlCodegen | GenKind::OpenApi | GenKind::Documented => &[],
+        GenKind::Lockfile => &[
+            "registry.npmjs.org",
+            "registry.yarnpkg.com",
+            "pypi.org",
+            "files.pythonhosted.org",
+            "proxy.golang.org",
+            "sum.golang.org",
+            "index.crates.io",
+            "static.crates.io",
+            "rubygems.org",
+        ],
     }
 }
 
@@ -1007,7 +1060,7 @@ pub fn added_types(kind: GenKind, status: &str, patch: &str) -> Vec<String> {
         GenKind::Protobuf => {
             out.extend(added_lines(patch).filter_map(|l| keyword_name(l, &["message", "enum"])))
         }
-        GenKind::OpenApi | GenKind::Documented => {}
+        GenKind::OpenApi | GenKind::Documented | GenKind::Lockfile => {}
     }
     out.dedup();
     out
@@ -1478,17 +1531,34 @@ async fn regenerate(
 ) -> Option<Pass> {
     let (owner, name) = (&w.msg.repo_owner, &w.msg.repo_name);
     let repo = load(w.github, owner, name, w.branch).await;
-    let gens = detect(&repo);
-    if gens.is_empty() {
+    let mut gens = detect(&repo);
+    // A security fix's lockfiles are written by their package manager,
+    // never by hand: they run first, so a generator's install after them
+    // reads a lockfile that matches the manifests.
+    let locks = if common::security_fixes::is_ticket(&w.msg.ticket_id) {
+        lockfile_generators(&repo.tree)
+    } else {
+        Vec::new()
+    };
+    if gens.is_empty() && locks.is_empty() {
         return None;
     }
     let mut changed =
         super::plan_coverage::changed_files(w.github, owner, name, &w.msg.base_branch, w.branch)
             .await?;
-    let hits: Vec<(Generator, Vec<String>)> = affected(&gens, &changed)
-        .into_iter()
-        .map(|(g, i)| (g.clone(), i))
+    let mut hits: Vec<(Generator, Vec<String>)> = locks
+        .iter()
+        .filter_map(|g| {
+            let h = lockfile_hits(g, &changed);
+            (!h.is_empty()).then(|| (g.clone(), h))
+        })
         .collect();
+    hits.extend(
+        affected(&gens, &changed)
+            .into_iter()
+            .map(|(g, i)| (g.clone(), i)),
+    );
+    gens.extend(locks);
     if hits.is_empty() {
         return Some(Pass::Problems(Vec::new()));
     }
@@ -1504,7 +1574,15 @@ async fn regenerate(
     };
     let scripts_cmd = super::detect_codegen_command(w.github, owner, name, w.branch).await;
     let env = super::load_codegen_env(w.state, &w.msg.team_id, owner, name).await;
-    let hosts = required_hosts(&repo, &env);
+    let mut hosts = required_hosts(&repo, &env);
+    // A lockfile's manager reads its registry.
+    if hits.iter().any(|(g, _)| g.kind == GenKind::Lockfile) {
+        for h in kind_hosts(GenKind::Lockfile) {
+            if !hosts.iter().any(|x| x == h) {
+                hosts.push(h.to_string());
+            }
+        }
+    }
     let cmds = generator_commands(&repo);
     let net = Network {
         hosts: &hosts,
@@ -1583,6 +1661,15 @@ async fn regenerate(
                 }
                 problems.push((g, inputs, format!("{why}.")));
             }
+            // A lockfile no sandbox could write: the pull request says so
+            // ("What to check") and its CI decides; never a hand edit.
+            Ran::NotRun(why) if g.kind == GenKind::Lockfile => {
+                info!(generator = %g.name, why, "Lockfile not written in the sandbox");
+                notes.push(format!(
+                    "{} couldn't be written here ({why}); CI on the pull request shows whether it matches the manifests",
+                    g.name
+                ));
+            }
             Ran::NotRun(why) => {
                 info!(generator = %g.name, why, "Generator not run in the sandbox");
                 // An earlier build of this run (the coder's run_codegen, or
@@ -1611,7 +1698,7 @@ async fn regenerate(
         .await
     {
         for g in &gens {
-            if problems.iter().any(|(p, _, _)| p == g) {
+            if g.kind == GenKind::Lockfile || problems.iter().any(|(p, _, _)| p == g) {
                 continue;
             }
             let mut outputs: Vec<(String, String)> = Vec::new();
@@ -1858,6 +1945,53 @@ mod tests {
 
     fn changed(p: &[&str]) -> Vec<String> {
         p.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// A security fix's manifest change, or a lockfile changed by hand,
+    /// is answered by the lockfile's own package manager, run on its own
+    /// (no frozen install first); a nested lockfile's folder is its own.
+    #[test]
+    fn a_security_fix_lockfile_is_written_by_its_package_manager() {
+        let tree: Vec<String> = [
+            "package.json",
+            "pnpm-lock.yaml",
+            "apps/web/package.json",
+            "lambdas/resize/package.json",
+            "lambdas/resize/package-lock.json",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let gens = lockfile_generators(&tree);
+        assert_eq!(gens.len(), 2);
+        let root = gens
+            .iter()
+            .find(|g| g.outputs == ["pnpm-lock.yaml"])
+            .unwrap();
+        assert_eq!(root.kind, GenKind::Lockfile);
+        assert_eq!(
+            lockfile_hits(root, &changed(&["apps/web/package.json", "src/a.ts"])),
+            changed(&["apps/web/package.json"])
+        );
+        assert!(lockfile_hits(root, &changed(&["lambdas/resize/package.json"])).is_empty());
+        // Edited by hand: written again by the manager.
+        assert_eq!(
+            lockfile_hits(root, &changed(&["pnpm-lock.yaml"])),
+            changed(&["pnpm-lock.yaml"])
+        );
+        let cmd = sandbox_command(&tree, root);
+        assert!(cmd.contains("pnpm install --lockfile-only --ignore-scripts"));
+        assert!(!cmd.contains("--frozen-lockfile"), "{cmd}");
+        let lambda = gens
+            .iter()
+            .find(|g| g.outputs == ["lambdas/resize/package-lock.json"])
+            .unwrap();
+        assert_eq!(
+            lockfile_hits(lambda, &changed(&["lambdas/resize/package.json"])),
+            changed(&["lambdas/resize/package.json"])
+        );
+        assert!(sandbox_command(&tree, lambda)
+            .starts_with("cd 'lambdas/resize' && npm install --package-lock-only"));
     }
 
     #[test]

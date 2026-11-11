@@ -97,6 +97,7 @@ pub mod security_fixes;
 pub mod settings_index;
 /// Setup: the settings registry, the repo analysis, runs, apply and undo.
 pub mod setup;
+pub mod upgrade_notes;
 // Which repo a log group's or alarm's code lives in, from evidence.
 /// Sealed credentials for a team's MCP servers (KMS, bound to team and server).
 pub mod envelope;
