@@ -213,6 +213,11 @@ test("manifest: URLs, permissions and events", () => {
   assert.deepEqual(m.default_events, EVENTS);
   // Security fixes: Dependabot alerts and the advisory events are asked for.
   assert.equal(m.default_permissions.vulnerability_alerts, "read");
+  for (const k of ["deployments", "repository_advisories", "code_quality", "actions", "statuses"]) {
+    assert.equal(m.default_permissions[k], "read", k);
+  }
+  assert.equal(m.default_permissions.checks, "write");
+  assert.equal(m.default_permissions.workflows, "write");
   assert.ok(m.default_events.includes("dependabot_alert"));
   assert.ok(m.default_events.includes("security_advisory"));
   assert.equal(newAppUrl(null, "s1"), "https://github.com/settings/apps/new?state=s1");

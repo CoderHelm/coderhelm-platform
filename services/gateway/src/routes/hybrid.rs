@@ -2403,7 +2403,10 @@ pub async fn github_token(
     d.external_id = ask.installation_id.to_string();
     let started = std::time::Instant::now();
     let links = github_links(&state, &install.id).await;
-    let plan = match broker::plan_token(&links, &ask) {
+    // The installation's own permissions cap the token: GitHub refuses a
+    // whole mint that asks for one it lacks.
+    let granted = installation_permissions(&state, ask.installation_id, false).await;
+    let plan = match broker::plan_token_granted(&links, &ask, granted.as_ref()) {
         Ok(p) => p,
         Err(r) => {
             d.finish(Status::Failed, "Refused", r.code());
@@ -2417,7 +2420,30 @@ pub async fn github_token(
             return Err(fail(StatusCode::FORBIDDEN, r.code(), r.message()));
         }
     };
-    match crate::auth::github_app::mint_scoped(&state, ask.installation_id, &plan).await {
+    let mut plan = plan;
+    let mut minted = crate::auth::github_app::mint_scoped(&state, ask.installation_id, &plan).await;
+    // Refused for a permission after all (changed since it was read):
+    // read the installation again, or fall back to what every
+    // installation has, and try once more.
+    if matches!(minted, Err((Some(422), _)))
+        && plan
+            .permissions
+            .keys()
+            .any(|k| broker::ONLY_WHEN_GRANTED.contains(&k.as_str()))
+    {
+        let fresh = installation_permissions(&state, ask.installation_id, true).await;
+        let again = if fresh != granted {
+            broker::plan_token_granted(&links, &ask, fresh.as_ref())
+        } else {
+            broker::plan_token(&links, &ask)
+        };
+        if let Ok(p) = again {
+            warn!(installation_id = ask.installation_id, withheld = ?p.withheld, "broker: GitHub refused the token's permissions; minting with fewer");
+            plan = p;
+            minted = crate::auth::github_app::mint_scoped(&state, ask.installation_id, &plan).await;
+        }
+    }
+    match minted {
         Ok((token, expires_at)) => {
             d.push_attempt(deliveries::Attempt {
                 at: now(),
@@ -2441,6 +2467,11 @@ pub async fn github_token(
                 "expires_at": expires_at,
                 "repositories": plan.repositories,
                 "permissions": plan.permissions,
+                // Permissions the app carries that this installation hasn't
+                // granted (its owner hasn't accepted them yet), so the install
+                // can say why a feature is limited.
+                "withheld": plan.withheld,
+                "installation_permissions_known": granted.is_some(),
                 "bot_login": format!("{slug}[bot]"),
             })))
         }
@@ -2466,6 +2497,92 @@ pub async fn github_token(
             ))
         }
     }
+}
+
+/// How long an installation's permissions are trusted without reading them
+/// again (an `installation` webhook forgets them sooner).
+const INSTALLATION_PERMISSIONS_SECS: i64 = 6 * 3600;
+
+fn installation_permissions_key(installation_id: u64) -> (String, &'static str) {
+    (format!("HYBRIDGH#{installation_id}"), "PERMISSIONS")
+}
+
+/// An installation's granted permissions: cached, read from GitHub when the
+/// cache is older than [`INSTALLATION_PERMISSIONS_SECS`] or `fresh` is set.
+/// None when GitHub can't say (the token then carries only what every
+/// installation has).
+pub async fn installation_permissions(
+    state: &AppState,
+    installation_id: u64,
+    fresh: bool,
+) -> Option<std::collections::BTreeMap<String, String>> {
+    let (pk, sk) = installation_permissions_key(installation_id);
+    let table = &state.config.settings_table_name;
+    if !fresh {
+        let cached = state
+            .dynamo
+            .get_item()
+            .table_name(table)
+            .key("pk", s(&pk))
+            .key("sk", s(sk))
+            .send()
+            .await
+            .ok()
+            .and_then(|o| o.item().cloned());
+        if let Some(i) = cached {
+            let read_at = i
+                .get("read_at")
+                .and_then(|v| v.as_s().ok())
+                .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok());
+            let young = read_at.is_some_and(|t| {
+                (chrono::Utc::now() - t.with_timezone(&chrono::Utc)).num_seconds()
+                    < INSTALLATION_PERMISSIONS_SECS
+            });
+            let perms = i
+                .get("permissions")
+                .and_then(|v| v.as_s().ok())
+                .and_then(|j| serde_json::from_str(j).ok());
+            if let (true, Some(p)) = (young, perms) {
+                return Some(p);
+            }
+        }
+    }
+    match crate::auth::github_app::installation_permissions(state, installation_id).await {
+        Ok(p) => {
+            let _ = state
+                .dynamo
+                .put_item()
+                .table_name(table)
+                .item("pk", s(&pk))
+                .item("sk", s(sk))
+                .item(
+                    "permissions",
+                    s(&serde_json::to_string(&p).unwrap_or_default()),
+                )
+                .item("read_at", s(&now()))
+                .send()
+                .await;
+            Some(p)
+        }
+        Err(e) => {
+            warn!(installation_id, error = %e, "broker: the installation's permissions could not be read");
+            None
+        }
+    }
+}
+
+/// Forgets an installation's cached permissions: an `installation` webhook
+/// (new permissions accepted, suspended, changed) means they may differ now.
+pub async fn forget_installation_permissions(state: &AppState, installation_id: u64) {
+    let (pk, sk) = installation_permissions_key(installation_id);
+    let _ = state
+        .dynamo
+        .delete_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", s(&pk))
+        .key("sk", s(sk))
+        .send()
+        .await;
 }
 
 /// The relay's part of `POST /webhooks/github` on the hosted side: when the

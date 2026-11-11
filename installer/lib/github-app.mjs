@@ -36,6 +36,26 @@ export const PERMISSIONS = {
   // Optional (REQUIRED_PERMISSIONS leaves it out): without it they use OSV
   // and GitHub's advisories only.
   vulnerability_alerts: "read",
+  // Deployments and their statuses: what shipped where, and when.
+  deployments: "read",
+  // The repository's own security advisories and private vulnerability
+  // reports (security fixes).
+  repository_advisories: "read",
+  // GitHub's code quality findings on changed files (reviews).
+  code_quality: "read",
+};
+
+/**
+ * What each permission beyond REQUIRED_PERMISSIONS limits when an app goes
+ * without it: a warning, never a failure
+ * (services/gateway/src/routes/setup_checks.rs OPTIONAL_PERMISSIONS).
+ */
+export const OPTIONAL_WHY = {
+  checks: "Reviews work without Checks: write, but pull requests don't show the \"CoderHelm review\" check that links to each review's session.",
+  vulnerability_alerts: "Security fixes work without Dependabot alerts, using OSV and GitHub's advisories only.",
+  deployments: "Without Deployments, what shipped where is worked out from workflow names instead of GitHub's deployments.",
+  repository_advisories: "Without Repository security advisories, security fixes don't see a repository's own advisories and private vulnerability reports.",
+  code_quality: "Without Code quality, reviews don't see GitHub's code quality findings on the changed files.",
 };
 
 /**
@@ -43,7 +63,11 @@ export const PERMISSIONS = {
  * permission was added to PERMISSIONS is warned about that one, not failed
  * (services/gateway/src/routes/setup_checks.rs REQUIRED_PERMISSIONS).
  */
-export const REQUIRED_PERMISSIONS = (({ vulnerability_alerts: _optional, ...rest }) => ({ ...rest, checks: "read" }))(PERMISSIONS);
+export const REQUIRED_PERMISSIONS = (() => {
+  const out = { ...PERMISSIONS, checks: "read" };
+  for (const k of Object.keys(OPTIONAL_WHY)) if (k !== "checks") delete out[k];
+  return out;
+})();
 
 /** The webhook events the gateway handles (services/gateway/src/routes/github_webhook.rs). */
 export const EVENTS = [

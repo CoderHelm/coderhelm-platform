@@ -114,6 +114,37 @@ pub async fn mint_scoped(
     ))
 }
 
+/// An installation's granted permissions (`GET /app/installations/{id}`):
+/// what a token for it may carry at most.
+pub async fn installation_permissions(
+    state: &AppState,
+    installation_id: u64,
+) -> Result<std::collections::BTreeMap<String, String>, String> {
+    let jwt = app_jwt(state).map_err(|e| e.to_string())?;
+    let resp = state
+        .http
+        .get(format!(
+            "https://api.github.com/app/installations/{installation_id}"
+        ))
+        .header("Authorization", format!("Bearer {jwt}"))
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "Coderhelm-bot")
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|e| e.without_url().to_string())?;
+    let code = resp.status().as_u16();
+    let v: serde_json::Value = resp.json().await.unwrap_or_default();
+    if !(200..300).contains(&code) {
+        return Err(format!("GitHub answered {code}"));
+    }
+    let p = common::hybrid::broker::granted_permissions(&v);
+    if p.is_empty() {
+        return Err("GitHub listed no permissions".into());
+    }
+    Ok(p)
+}
+
 static APP_SLUG: tokio::sync::OnceCell<String> = tokio::sync::OnceCell::const_new();
 
 /// The app's slug (`GET /app`), read once.
