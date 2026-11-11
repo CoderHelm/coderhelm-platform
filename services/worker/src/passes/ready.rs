@@ -1959,6 +1959,11 @@ mod tests {
             ..Default::default()
         };
         assert!(reads_ci(&f));
+        // The description's own marker is not an open security item.
+        assert!(!super::super::proof::holds_security_items(&f.body));
+        assert!(super::super::proof::holds_security_items(
+            "- Token logged in plain text <!-- coderhelm:security -->"
+        ));
         let d = decide(&f);
         let Decision::Held { reasons } = &d else {
             panic!("held expected, got {d:?}");
