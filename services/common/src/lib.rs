@@ -1,5 +1,8 @@
 //! Logic shared between the gateway and worker services.
 
+/// A repository's generated agent file: which files shape it, when a push
+/// makes it stale, and when the sweep writes it again by itself.
+pub mod agent_file;
 /// The agent log of a run: its file format, outcomes, order and redaction
 /// (worker writes it, gateway serves it).
 pub mod agent_log;

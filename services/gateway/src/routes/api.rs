@@ -4317,6 +4317,7 @@ pub async fn update_repo(
                 name: name.clone(),
                 default_branch,
             }],
+            ..Default::default()
         });
 
         if let Ok(body) = serde_json::to_string(&message) {
@@ -5191,8 +5192,21 @@ pub async fn get_repo_agents(
 ) -> Result<Json<Value>, StatusCode> {
     let repo = format!("{owner}/{name}");
     validate_repo_name(&repo)?;
-    let sk = format!("AGENTS#REPO#{repo}");
-    get_instructions_inner(&state, &claims.team_id, &sk).await
+    // The text, plus when and why Coderhelm last wrote it and whether it is
+    // out of date (`common::agent_file`).
+    let result = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(&claims.team_id))
+        .key("sk", attr_s(&common::agent_file::sk(&repo)))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to fetch the agent file: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    Ok(Json(common::agent_file::view(result.item())))
 }
 
 /// PUT /api/agents/repo/:owner/:name — update agents context for a repo.
@@ -5206,8 +5220,25 @@ pub async fn update_repo_agents(
     let repo = format!("{owner}/{name}");
     validate_repo_name(&repo)?;
     let content = body["content"].as_str().unwrap_or("");
-    let sk = format!("AGENTS#REPO#{repo}");
-    update_instructions_inner(&state, &claims.team_id, &sk, content).await
+    if content.len() > MAX_INSTRUCTIONS_BYTES {
+        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+    }
+    // Saved as an edit: the sweep never replaces it by itself, it marks it
+    // out of date instead (`common::agent_file`).
+    common::agent_file::save_edit(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        &claims.team_id,
+        &repo,
+        content,
+        &claims.sub,
+    )
+    .await
+    .map_err(|e| {
+        error!("Failed to save the agent file: {e}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok(StatusCode::OK)
 }
 
 /// POST /api/repos/:owner/:name/regenerate — re-run onboard (voice + agents) for a repo.
@@ -5226,6 +5257,21 @@ pub async fn regenerate_repo(
     }
 
     let installation_id = get_team_installation_id(&state, &claims.team_id).await?;
+    // The branch onboarding recorded for the repository; empty lets the
+    // worker ask GitHub (a repository whose default branch isn't `main`).
+    let default_branch = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.repos_table_name)
+        .key("pk", attr_s(&claims.team_id))
+        .key("sk", attr_s(&format!("REPO#{repo}")))
+        .projection_expression("default_branch")
+        .send()
+        .await
+        .ok()
+        .and_then(|o| o.item().cloned())
+        .and_then(|i| i.get("default_branch").and_then(|v| v.as_s().ok()).cloned())
+        .unwrap_or_default();
 
     let message = WorkerMessage::Onboard(OnboardMessage {
         team_id: claims.team_id.clone(),
@@ -5233,8 +5279,10 @@ pub async fn regenerate_repo(
         repos: vec![OnboardRepo {
             owner: parts[0].to_string(),
             name: parts[1].to_string(),
-            default_branch: "main".to_string(),
+            default_branch,
         }],
+        reason: common::agent_file::Reason::Manual.as_str().to_string(),
+        ..Default::default()
     });
 
     let body = serde_json::to_string(&message).map_err(|e| {

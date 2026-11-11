@@ -6,6 +6,7 @@ use crate::agent::provider::ModelProvider;
 use crate::clients::github::GitHubClient;
 use crate::models::{OnboardMessage, TokenUsage};
 use crate::WorkerState;
+use common::agent_file::Reason;
 
 /// Run onboard pass: analyze each repo and commit .coderhelm/AGENTS.md.
 pub async fn run(
@@ -13,9 +14,16 @@ pub async fn run(
     msg: OnboardMessage,
     usage: &mut TokenUsage,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let reason = Reason::parse(&msg.reason).unwrap_or(Reason::Install);
+    if reason.automatic() {
+        // The sweep's regeneration: the agent file only, under its own
+        // claim and checks (`passes::agent_file`).
+        return super::agent_file::regenerate(state, msg, reason, usage).await;
+    }
     info!(
         team_id = %msg.team_id,
         repos = msg.repos.len(),
+        reason = reason.as_str(),
         "Starting onboard"
     );
 
@@ -38,6 +46,14 @@ pub async fn run(
     let global_instructions = load_instructions(state, &msg.team_id, "INSTRUCTIONS#GLOBAL").await;
 
     for repo in &msg.repos {
+        let mut repo = repo.clone();
+        if repo.default_branch.is_empty() {
+            repo.default_branch = github
+                .get_default_branch(&repo.owner, &repo.name)
+                .await
+                .unwrap_or_else(|_| "main".to_string());
+        }
+        let repo = &repo;
         let repo_instructions = load_instructions(
             state,
             &msg.team_id,
@@ -62,6 +78,7 @@ pub async fn run(
             &global_instructions,
             &repo_instructions,
             &provider,
+            reason,
             usage,
         )
         .await
@@ -105,13 +122,28 @@ pub async fn run(
         }
     }
 
+    refresh_global(state, &msg.team_id, &provider, usage).await;
+
+    info!(team_id = %msg.team_id, "Onboard complete");
+
+    Ok(())
+}
+
+/// Writes the team's overview (`AGENTS#GLOBAL`) again from every enabled
+/// repository's agent file.
+pub(crate) async fn refresh_global(
+    state: &WorkerState,
+    team_id: &str,
+    provider: &ModelProvider,
+    usage: &mut TokenUsage,
+) {
     // Update global agents overview from all enabled repos in DynamoDB
     let enabled_repos = state
         .dynamo
         .query()
         .table_name(&state.config.repos_table_name)
         .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
-        .expression_attribute_values(":pk", AttributeValue::S(msg.team_id.clone()))
+        .expression_attribute_values(":pk", AttributeValue::S(team_id.to_string()))
         .expression_attribute_values(":prefix", AttributeValue::S("REPO#".to_string()))
         .send()
         .await
@@ -135,7 +167,7 @@ pub async fn run(
         let mut repo_summaries: Vec<String> = Vec::new();
         for repo_name in &enabled_repos {
             let agents_md =
-                load_instructions(state, &msg.team_id, &format!("AGENTS#REPO#{repo_name}")).await;
+                load_instructions(state, team_id, &format!("AGENTS#REPO#{repo_name}")).await;
             if !agents_md.is_empty() {
                 // Take first ~500 chars (overview + tech stack, not full file)
                 let summary = if agents_md.len() > 500 {
@@ -149,7 +181,7 @@ pub async fn run(
 
         // Use Anthropic to generate a proper org-level summary
         let global_content = if !repo_summaries.is_empty() {
-            match generate_global_context(state, &provider, &enabled_repos, &repo_summaries, usage)
+            match generate_global_context(state, provider, &enabled_repos, &repo_summaries, usage)
                 .await
             {
                 Ok(content) => content,
@@ -166,7 +198,7 @@ pub async fn run(
             .dynamo
             .put_item()
             .table_name(&state.config.settings_table_name)
-            .item("pk", AttributeValue::S(msg.team_id.clone()))
+            .item("pk", AttributeValue::S(team_id.to_string()))
             .item("sk", AttributeValue::S("AGENTS#GLOBAL".to_string()))
             .item("content", AttributeValue::S(global_content))
             .item(
@@ -179,10 +211,6 @@ pub async fn run(
             warn!(error = %e, "Failed to store global AGENTS.md");
         }
     }
-
-    info!(team_id = %msg.team_id, "Onboard complete");
-
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -194,27 +222,85 @@ async fn onboard_repo(
     global_instructions: &str,
     repo_instructions: &str,
     provider: &ModelProvider,
+    reason: Reason,
     usage: &mut TokenUsage,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let full_name = format!("{}/{}", repo.owner, repo.name);
     info!(repo = %full_name, "Onboarding repo");
 
-    // Get repository tree (top 2 levels)
+    // A repository turned on again keeps an agent file someone saved by
+    // hand; it is marked out of date instead. Only the regenerate button
+    // (which asks first) replaces it.
+    let edited = reason == Reason::Install
+        && super::agent_file::load_record(state, team_id, &full_name)
+            .await
+            .is_some_and(|r| r.edited);
+    if edited {
+        let why = vec!["the repository was turned on again".to_string()];
+        if let Err(e) = common::agent_file::mark_out_of_date(
+            &state.dynamo,
+            &state.config.settings_table_name,
+            team_id,
+            &full_name,
+            &why,
+        )
+        .await
+        {
+            warn!(repo = %full_name, error = %e, "Could not mark the agent file out of date");
+        }
+    } else {
+        let started = chrono::Utc::now();
+        let (agents_md, top_dirs) = generate_agents_md(
+            github,
+            repo,
+            global_instructions,
+            repo_instructions,
+            provider,
+            usage,
+        )
+        .await?;
+        store_agents_md(
+            state,
+            team_id,
+            &full_name,
+            &agents_md,
+            reason,
+            &[],
+            &top_dirs,
+            started,
+        )
+        .await?;
+    }
+
+    // Generate and store VOICE.md in DynamoDB
+    if let Err(e) = generate_voice_md(state, github, repo, team_id, provider, usage).await {
+        warn!(repo = %full_name, error = %e, "Failed to generate VOICE.md");
+    }
+
+    Ok(())
+}
+
+/// Reads the repository (its tree and the files that shape the agent file,
+/// `common::agent_file::files_to_read`) and writes its AGENTS.md. Returns
+/// the text and the tree's top-level folders.
+pub(crate) async fn generate_agents_md(
+    github: &GitHubClient,
+    repo: &crate::models::OnboardRepo,
+    global_instructions: &str,
+    repo_instructions: &str,
+    provider: &ModelProvider,
+    usage: &mut TokenUsage,
+) -> Result<(String, Vec<String>), Box<dyn std::error::Error + Send + Sync>> {
+    let full_name = format!("{}/{}", repo.owner, repo.name);
     let tree = github
         .get_tree(&repo.owner, &repo.name, &repo.default_branch)
         .await?;
-
-    // Read signal files if they exist
-    let signal_files = [
-        "README.md",
-        "package.json",
-        "Cargo.toml",
-        "pyproject.toml",
-        "go.mod",
-        ".github/CODEOWNERS",
-        "Makefile",
-        "Dockerfile",
-    ];
+    let paths: Vec<String> = tree
+        .iter()
+        .filter(|e| e.entry_type == "blob")
+        .map(|e| e.path.clone())
+        .collect();
+    let top_dirs = common::agent_file::top_dirs(&paths);
 
     let tree_str: String = tree
         .iter()
@@ -224,9 +310,11 @@ async fn onboard_repo(
     let mut context_parts: Vec<String> =
         vec![format!("Repository: {full_name}\n\nTree:\n{tree_str}")];
 
-    for path in &signal_files {
+    // The files that shape the file: the same list a push is checked
+    // against, so a change to any of them makes it stale.
+    for path in common::agent_file::files_to_read(&paths) {
         if let Ok(content) = github
-            .read_file(&repo.owner, &repo.name, path, &repo.default_branch)
+            .read_file(&repo.owner, &repo.name, &path, &repo.default_branch)
             .await
         {
             // Limit each file to ~4KB to stay within context window
@@ -252,9 +340,10 @@ async fn onboard_repo(
             GOOD: 'Rust Lambda backend (gateway + worker) that processes GitHub webhooks and runs AI agents.'\n\
          2. Tech stack and key dependencies\n\
          3. Directory structure with brief descriptions\n\
-         4. Build and test commands\n\
-         5. Code style and conventions observed\n\
-         6. Key files an AI agent should know about\n\n\
+         4. Build and test commands, including every test suite (unit, integration, end-to-end) and how CI runs them\n\
+         5. Code style and conventions observed (lint and format config)\n\
+         6. Review and contribution guidance the repo states (agent guidance files, review guidelines, the pull request template)\n\
+         7. Key files an AI agent should know about\n\n\
          Output ONLY the markdown content for AGENTS.md, no code fences.",
     );
 
@@ -279,31 +368,44 @@ async fn onboard_repo(
     )
     .await
     .map_err(|e| format!("Anthropic converse failed: {e:#}"))?;
+    Ok((agents_md, top_dirs))
+}
 
-    // Store AGENTS.md in DynamoDB (not committed to repo)
-    let agents_sk = format!("AGENTS#REPO#{full_name}");
-    state
-        .dynamo
-        .put_item()
-        .table_name(&state.config.settings_table_name)
-        .item("pk", AttributeValue::S(team_id.to_string()))
-        .item("sk", AttributeValue::S(agents_sk))
-        .item("content", AttributeValue::S(agents_md))
-        .item(
-            "updated_at",
-            AttributeValue::S(chrono::Utc::now().to_rfc3339()),
-        )
-        .send()
-        .await
-        .map_err(|e| format!("DynamoDB put AGENTS.md failed: {e:#}"))?;
-
-    info!(repo = %full_name, "Stored AGENTS.md in DynamoDB");
-
-    // Generate and store VOICE.md in DynamoDB
-    if let Err(e) = generate_voice_md(state, github, repo, team_id, provider, usage).await {
-        warn!(repo = %full_name, error = %e, "Failed to generate VOICE.md");
+/// Stores a generated AGENTS.md (in DynamoDB, not committed to the repo)
+/// with why it was written, and lists the team for the sweep.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn store_agents_md(
+    state: &WorkerState,
+    team_id: &str,
+    full_name: &str,
+    agents_md: &str,
+    reason: Reason,
+    after: &[String],
+    top_dirs: &[String],
+    started: chrono::DateTime<chrono::Utc>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let table = &state.config.settings_table_name;
+    common::agent_file::store_generated(
+        &state.dynamo,
+        table,
+        team_id,
+        full_name,
+        &common::agent_file::Generated {
+            content: agents_md,
+            reason,
+            after,
+            top_dirs,
+            started,
+        },
+    )
+    .await
+    .map_err(|e| format!("DynamoDB put AGENTS.md failed: {e}"))?;
+    if let Err(e) =
+        common::settings_index::add(&state.dynamo, table, common::agent_file::INDEX, team_id).await
+    {
+        warn!(error = %e, "Could not list the team for the agent file sweep");
     }
-
+    info!(repo = %full_name, reason = reason.as_str(), "Stored AGENTS.md in DynamoDB");
     Ok(())
 }
 
@@ -443,7 +545,7 @@ fn fallback_global_context(repo_names: &[String]) -> String {
     )
 }
 
-async fn load_instructions(state: &WorkerState, team_id: &str, sk: &str) -> String {
+pub(crate) async fn load_instructions(state: &WorkerState, team_id: &str, sk: &str) -> String {
     match state
         .dynamo
         .get_item()

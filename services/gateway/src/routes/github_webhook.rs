@@ -2889,6 +2889,7 @@ async fn handle_installation(
                         team_id,
                         installation_id,
                         repos,
+                        ..Default::default()
                     });
                     let _ = send_to_queue(state, &state.config.ticket_queue_url, &onboard).await;
                 }
@@ -3042,6 +3043,7 @@ async fn handle_installation_repos(
         team_id,
         installation_id,
         repos,
+        ..Default::default()
     });
 
     send_to_queue(state, &state.config.ticket_queue_url, &onboard).await
@@ -3921,6 +3923,25 @@ async fn handle_push(
     }
     // Knowledge sources reading this repository's docs sync now.
     super::knowledge_sources::on_push(state, team_id, &format!("{owner}/{name}")).await;
+    // The repository's agent file: a push that changed a file it is written
+    // from marks it stale; the worker's sweep writes it again once the
+    // pushes settle (`common::agent_file`).
+    match common::agent_file::on_push(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        team_id,
+        &format!("{owner}/{name}"),
+        &common::agent_file::PushPaths::from_payload(payload),
+        chrono::Utc::now(),
+    )
+    .await
+    {
+        Ok(c) if !c.is_empty() => {
+            info!(owner, name, changed = ?c.labels, "Agent file marked stale");
+        }
+        Ok(_) => {}
+        Err(e) => warn!(owner, name, error = %e, "Could not mark the agent file stale"),
+    }
     // Security fixes: a changed dependency file re-reads the dependencies.
     super::security::on_default_branch_push(
         state,

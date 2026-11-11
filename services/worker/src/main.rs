@@ -551,6 +551,18 @@ async fn handle_message(state: Arc<WorkerState>, message: models::WorkerMessage)
                 unstaled = stale.unstaled,
                 "Stale PR sweep done"
             );
+            // Agent files gone stale (pushes that changed what they are
+            // written from, or older than 30 days with new commits): each
+            // repository at most once a day, a few per team per tick.
+            let agent_files = passes::agent_file::sweep(&state).await;
+            info!(
+                teams = agent_files.teams,
+                queued = agent_files.queued,
+                out_of_date = agent_files.marked_out_of_date,
+                over_budget = agent_files.skipped_budget,
+                held = agent_files.held,
+                "Agent file sweep done"
+            );
             // Security fixes: daily sources per repository, triage, fix
             // runs and cards (off unless a team turned them on).
             let sec = passes::security_fixes::sweep(&state).await;
