@@ -433,6 +433,7 @@ async fn refresh_inventory(
         .filter(|p| !p.contains("node_modules/") && !p.contains("vendor/"))
         .collect();
     // Scopes and manifests from the lockfiles that record them.
+    let mut npm_locks: Vec<(String, HashMap<String, Scope>)> = vec![];
     for p in paths
         .iter()
         .filter(|p| p.ends_with("package-lock.json"))
@@ -444,7 +445,29 @@ async fn refresh_inventory(
         let Ok(lock) = serde_json::from_str::<Value>(&text) else {
             continue;
         };
-        apply_scopes(&mut deps, "npm", p, &sec::npm_lock_scopes(&lock));
+        // Each version to the lockfile that installs it, with its path.
+        sec::place_npm_copies(&mut deps, p, &sec::npm_lock_copies(&lock));
+        npm_locks.push((p.clone(), sec::npm_lock_scopes(&lock)));
+    }
+    // A version no lockfile names exactly: its scope (and lockfile) by name,
+    // as before.
+    for (p, scopes) in &npm_locks {
+        let mut unplaced: Vec<Dep> = deps
+            .iter()
+            .filter(|d| d.ecosystem == "npm" && d.manifest == sec::SBOM_MANIFEST)
+            .cloned()
+            .collect();
+        apply_scopes(&mut unplaced, "npm", p, scopes);
+        for u in unplaced {
+            if let Some(d) = deps.iter_mut().find(|d| {
+                d.ecosystem == "npm"
+                    && d.manifest == sec::SBOM_MANIFEST
+                    && d.name == u.name
+                    && d.version == u.version
+            }) {
+                *d = u;
+            }
+        }
     }
     for p in paths.iter().filter(|p| p.ends_with("poetry.lock")).take(5) {
         if let Ok(text) = gh.read_file(owner, name, p, &branch).await {
@@ -460,6 +483,7 @@ async fn refresh_inventory(
                     version: tag,
                     manifest: p.clone(),
                     scope: Scope::Runtime,
+                    path: vec![],
                 };
                 if !deps.contains(&d) {
                     deps.push(d);
@@ -515,7 +539,14 @@ async fn upsert(
             continue;
         }
         let idx = findings.iter().position(|(f, _)| {
-            sec::merges_into(f, &o.advisory.ids, &o.repo, &o.manifest, &o.package)
+            sec::merges_into_at(
+                f,
+                &o.advisory.ids,
+                &o.repo,
+                &o.manifest,
+                &o.package,
+                &o.version,
+            )
         });
         let existing = idx.map(|i| findings[i].clone());
         let before = existing.as_ref().map(|(f, _)| (f.status, f.tier));
@@ -599,12 +630,36 @@ fn status_line(f: &Finding, o: &Observation) -> String {
     }
 }
 
-/// Fills a Dependabot observation's installed version from the inventory.
+/// Fills a Dependabot observation's installed version from the inventory,
+/// and how the manifest pulls it in.
 fn fill_version(o: &mut Observation, deps: &[Dep]) {
     if o.version.is_empty() {
         if let Some(v) = sec::installed_version(deps, &o.ecosystem, &o.package, &o.manifest) {
             o.version = v;
         }
+    }
+    if o.path.is_empty() {
+        if let Some(d) = deps.iter().find(|d| {
+            d.ecosystem.eq_ignore_ascii_case(&o.ecosystem)
+                && d.name == o.package
+                && d.version == o.version
+                && d.manifest == o.manifest
+                && !d.path.is_empty()
+        }) {
+            o.path = d.path.clone();
+            if o.relation == sec::Relation::Unknown {
+                o.relation = relation_of(&d.path);
+            }
+        }
+    }
+}
+
+/// Direct or transitive, from a dependency's path (unknown without one).
+fn relation_of(path: &[String]) -> sec::Relation {
+    match path.len() {
+        0 => sec::Relation::Unknown,
+        1 => sec::Relation::Direct,
+        _ => sec::Relation::Transitive,
     }
 }
 
@@ -865,6 +920,8 @@ async fn osv_observations(
             version: d.version.clone(),
             advisory: adv,
             scope: d.scope,
+            relation: relation_of(&d.path),
+            path: d.path.clone(),
             ..Default::default()
         });
     }
@@ -2670,6 +2727,7 @@ fn withdrawn_observations(findings: &[(Finding, FindingState)], ghsa: &str) -> V
             manifest: f.manifest.clone(),
             ecosystem: f.ecosystem.clone(),
             package: f.package.clone(),
+            version: f.version.clone(),
             advisory: sec::AdvisoryRecord {
                 ids: vec![ghsa.to_string()],
                 withdrawn: true,
@@ -3124,6 +3182,7 @@ mod tests {
                 version: "29.0.0".into(),
                 manifest: sec::SBOM_MANIFEST.into(),
                 scope: Scope::Unknown,
+                path: vec![],
             },
             Dep {
                 ecosystem: "PyPI".into(),
@@ -3131,6 +3190,7 @@ mod tests {
                 version: "4.2".into(),
                 manifest: sec::SBOM_MANIFEST.into(),
                 scope: Scope::Unknown,
+                path: vec![],
             },
         ];
         let scopes = HashMap::from([("jest".to_string(), Scope::Dev)]);
