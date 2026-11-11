@@ -1760,6 +1760,7 @@ async fn tend(
         }
     }
     track_prs(cx, findings).await;
+    split_failed_majors(cx, findings).await;
     // Fixes a person asked for start whatever the dry run says.
     report.runs += start_requested(cx, findings).await;
     if cx.cfg.acts() {
@@ -2155,7 +2156,10 @@ async fn start_requested(cx: &Ctx<'_>, findings: &mut [(Finding, FindingState)])
             slots.give_back(&day).await;
             continue;
         }
-        match enqueue(cx, &unit, findings, &members).await {
+        let one_pr = members
+            .iter()
+            .any(|i| findings[*i].1.requested_as == sec::Combine::OnePr);
+        match deliver(cx, &unit, findings, &members, one_pr).await {
             Ok(()) => {
                 started += 1;
                 busy.insert(unit.repo.to_ascii_lowercase());
@@ -2180,8 +2184,9 @@ async fn start_asked(
     findings: &mut [(Finding, FindingState)],
     ids: &[String],
     by: &str,
+    combine: sec::Combine,
 ) -> usize {
-    let (units, _) = sec::manual_units(findings, ids, cx.cfg, Utc::now());
+    let (units, _) = sec::manual_units_as(findings, ids, cx.cfg, Utc::now(), combine);
     let mut started = 0;
     for unit in units {
         let members: Vec<usize> = unit
@@ -2199,7 +2204,15 @@ async fn start_asked(
         {
             continue;
         }
-        match enqueue(cx, &unit, findings, &members).await {
+        match deliver(
+            cx,
+            &unit,
+            findings,
+            &members,
+            combine == sec::Combine::OnePr,
+        )
+        .await
+        {
             Ok(()) => started += 1,
             Err(e) => {
                 warn!(team_id = cx.team_id, ticket = %unit.ticket, by, error = %e, "security: could not start the asked fix run");
@@ -2209,6 +2222,7 @@ async fn start_asked(
                 for i in &members {
                     let (f, st) = &mut findings[*i];
                     st.requested_by = Some(by.to_string());
+                    st.requested_as = combine;
                     f.waiting = Some(
                         "Waiting: the fix run couldn't start; it is tried again on the next check."
                             .into(),
@@ -2249,7 +2263,7 @@ async fn start_fixes(cx: &Ctx<'_>, findings: &mut [(Finding, FindingState)]) -> 
             .collect();
         // An open Dependabot or Renovate pull request for the package.
         let mut bot_pr = None;
-        if cx.cfg.adopt_bot_prs && !unit.grouped {
+        if cx.cfg.adopt_bot_prs && !unit.grouped && !unit.bundle {
             let pulls = match open_pulls.get(&unit.repo) {
                 Some(p) => p.clone(),
                 None => {
@@ -2270,7 +2284,7 @@ async fn start_fixes(cx: &Ctx<'_>, findings: &mut [(Finding, FindingState)]) -> 
         let major = unit.bumps.iter().any(|b| b.major);
         let kind = if bot_pr.is_some() {
             sec::RunKind::Adopt
-        } else if major && cx.cfg.major_bumps == sec::MajorBumps::IssueOnly {
+        } else if major && !unit.bundle && cx.cfg.major_bumps == sec::MajorBumps::IssueOnly {
             sec::RunKind::IssueOnly
         } else {
             sec::RunKind::Run
@@ -2315,7 +2329,7 @@ async fn start_fixes(cx: &Ctx<'_>, findings: &mut [(Finding, FindingState)]) -> 
                 started += 1;
             }
             (sec::RunKind::IssueOnly, _) => issue_only(cx, &unit, findings, &members).await,
-            _ => match enqueue(cx, &unit, findings, &members).await {
+            _ => match deliver(cx, &unit, findings, &members, false).await {
                 Ok(()) => {
                     started += 1;
                     busy.insert(unit.repo.to_ascii_lowercase());
@@ -2329,6 +2343,283 @@ async fn start_fixes(cx: &Ctx<'_>, findings: &mut [(Finding, FindingState)]) -> 
         }
     }
     started
+}
+
+/// Starts a unit's fixes: a follow-up run on the repository's open bundle
+/// pull request when there is one (one open security pull request per
+/// repository), otherwise a new run. `one_pr`: a person asked for one pull
+/// request, so any open CoderHelm security pull request of the repository
+/// takes the fixes.
+async fn deliver(
+    cx: &Ctx<'_>,
+    unit: &FixUnit,
+    findings: &mut [(Finding, FindingState)],
+    members: &[usize],
+    one_pr: bool,
+) -> Result<(), Error> {
+    if let Some((pr, ticket)) = sec::open_bundle_pr(findings, unit, one_pr) {
+        return join(cx, unit, &pr, &ticket, findings, members).await;
+    }
+    enqueue(cx, unit, findings, members).await
+}
+
+/// The ticket record's own fields: the stored plan and the run's words
+/// under Change.
+async fn ticket_item(state: &WorkerState, team_id: &str, ticket: &str) -> Option<Item> {
+    state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(team_id))
+        .key("sk", attr_s(&sec::ticket_sk(ticket)))
+        .send()
+        .await
+        .ok()?
+        .item
+}
+
+async fn save_unit(
+    state: &WorkerState,
+    team_id: &str,
+    ticket: &str,
+    unit: &FixUnit,
+) -> Result<(), Error> {
+    state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(team_id))
+        .key("sk", attr_s(&sec::ticket_sk(ticket)))
+        .update_expression("SET #u = :u, title = :t")
+        .condition_expression("attribute_exists(sk)")
+        .expression_attribute_names("#u", "unit")
+        .expression_attribute_values(":u", attr_s(&serde_json::to_string(unit)?))
+        .expression_attribute_values(":t", attr_s(&unit.title))
+        .send()
+        .await?;
+    Ok(())
+}
+
+/// Sends a follow-up round to the run that opened a security pull
+/// request, the way a review on it is sent: the run's fix loop pushes to
+/// the same branch. Its tokens count as the ticket's fix run.
+async fn follow_up(
+    cx: &Ctx<'_>,
+    repo: &str,
+    pr: u64,
+    ticket: &str,
+    ask: String,
+) -> Result<(), Error> {
+    if cx.state.config.feedback_queue_url.is_empty() {
+        return Err("no feedback queue".into());
+    }
+    let (owner, name) = repo.split_once('/').ok_or("bad repo")?;
+    let run_id = super::review_pr::lookup_run_by_pr(cx.state, cx.team_id, owner, name, pr)
+        .await
+        .ok_or("no run found for the open security pull request")?;
+    let msg = WorkerMessage::Feedback(common::messages::FeedbackMessage {
+        team_id: cx.team_id.to_string(),
+        installation_id: cx.gh.installation_id(),
+        run_id,
+        repo_owner: owner.to_string(),
+        repo_name: name.to_string(),
+        pr_number: pr,
+        review_id: 0,
+        review_body: ask,
+        comments: vec![],
+        security_ticket: ticket.to_string(),
+        ..Default::default()
+    });
+    cx.state
+        .sqs
+        .send_message()
+        .queue_url(&cx.state.config.feedback_queue_url)
+        .message_body(serde_json::to_string(&msg)?)
+        .send()
+        .await?;
+    Ok(())
+}
+
+/// Writes an open bundle's title, description and labels again from its
+/// plan. Best effort: the findings already point at it.
+async fn refresh_pr(
+    cx: &Ctx<'_>,
+    unit: &FixUnit,
+    ticket: &str,
+    pr: u64,
+    findings: &[(Finding, FindingState)],
+) {
+    let Some((o, n)) = unit.repo.split_once('/') else {
+        return;
+    };
+    let change = ticket_item(cx.state, cx.team_id, ticket)
+        .await
+        .map(|i| s(&i, "change"))
+        .unwrap_or_default();
+    let pairs: Vec<(&Finding, &FindingState)> = findings
+        .iter()
+        .filter(|(f, _)| unit.finding_ids.contains(&f.id))
+        .map(|(f, st)| (f, st))
+        .collect();
+    let body = sec::pr_body(unit, &pairs, &change);
+    if let Err(e) = cx.gh.update_pr_body(o, n, pr, &body).await {
+        warn!(repo = %unit.repo, pr, error = %e, "security: could not write the bundle's description");
+    }
+    if let Err(e) = cx.gh.update_pr_title(o, n, pr, &unit.title).await {
+        warn!(repo = %unit.repo, pr, error = %e, "security: could not write the bundle's title");
+    }
+    if let Err(e) = cx.gh.add_labels(o, n, pr, &unit.labels).await {
+        warn!(repo = %unit.repo, pr, error = %e, "security: could not label the bundle");
+    }
+}
+
+/// Adds a unit's fixes to the repository's open bundle pull request: a
+/// follow-up run on its ticket pushes them to its branch, and its title,
+/// description and labels count them.
+async fn join(
+    cx: &Ctx<'_>,
+    add: &FixUnit,
+    pr: &sec::PrRef,
+    ticket: &str,
+    findings: &mut [(Finding, FindingState)],
+    members: &[usize],
+) -> Result<(), Error> {
+    let open = load_unit(cx.state, cx.team_id, ticket)
+        .await
+        .ok_or("the open bundle's plan is gone")?;
+    let merged = sec::join_unit(&open, add, findings, cx.cfg);
+    let member_refs: Vec<&Finding> = members.iter().map(|i| &findings[*i].0).collect();
+    let ask = sec::join_note(add, &member_refs, cx.cfg);
+    follow_up(cx, &add.repo, pr.number, ticket, ask).await?;
+    save_unit(cx.state, cx.team_id, ticket, &merged).await?;
+    let now = Utc::now().to_rfc3339();
+    for i in members {
+        let (f, st) = &mut findings[*i];
+        f.status = Status::PrOpen;
+        f.pr = Some(sec::PrRef {
+            ci: Some("pending".into()),
+            ..pr.clone()
+        });
+        f.waiting = None;
+        st.requested_by = None;
+        st.ticket = Some(ticket.to_string());
+        st.bundled = true;
+        st.pr_opened_at.get_or_insert_with(|| now.clone());
+        f.updated_at = now.clone();
+        save_finding(cx.state, cx.team_id, f, st).await;
+        add_event(
+            cx.state,
+            cx.team_id,
+            &f.id,
+            &format!(
+                "Added to PR #{} with the repository's other security fixes",
+                pr.number
+            ),
+            Some(&pr.url),
+        )
+        .await;
+    }
+    refresh_pr(cx, &merged, ticket, pr.number, findings).await;
+    info!(team_id = cx.team_id, ticket, repo = %add.repo, pr = pr.number, findings = members.len(), "security: fixes joined the open bundle");
+    Ok(())
+}
+
+/// Whether the run's CI-fix loop gave up on its pull request (it handed
+/// it to a person).
+async fn handed_off(state: &WorkerState, team_id: &str, run_id: &str) -> bool {
+    state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(team_id))
+        .key("run_id", attr_s(run_id))
+        .projection_expression("handed_off_at")
+        .send()
+        .await
+        .ok()
+        .and_then(|o| o.item)
+        .is_some_and(|i| i.contains_key("handed_off_at"))
+}
+
+/// A bundle whose CI the fix loop couldn't get green, with major version
+/// bumps in it: the major bumps leave it (a follow-up run reverts them on
+/// its branch) and get pull requests of their own on the next tick. Once
+/// per pull request. A bundle that passes keeps its major bumps.
+async fn split_failed_majors(cx: &Ctx<'_>, findings: &mut [(Finding, FindingState)]) {
+    let mut seen = HashSet::new();
+    let failing: Vec<(String, sec::PrRef, String)> = findings
+        .iter()
+        .filter(|(f, st)| {
+            st.bundled
+                && f.status == Status::PrOpen
+                && f.pr.as_ref().is_some_and(|p| {
+                    p.state == "open" && !p.adopted && p.ci.as_deref() == Some("failing")
+                })
+        })
+        .filter_map(|(f, st)| Some((f.repo.clone(), f.pr.clone()?, st.ticket.clone()?)))
+        .filter(|(r, p, _)| seen.insert((r.to_ascii_lowercase(), p.number)))
+        .collect();
+    for (repo, pr, ticket) in failing {
+        if cx.out_of_time() {
+            return;
+        }
+        let Some(unit) = load_unit(cx.state, cx.team_id, &ticket).await else {
+            continue;
+        };
+        let gone = sec::split_out(&unit, findings);
+        if gone.is_empty() {
+            continue;
+        }
+        let Some((o, n)) = repo.split_once('/') else {
+            continue;
+        };
+        let Some(run_id) =
+            super::review_pr::lookup_run_by_pr(cx.state, cx.team_id, o, n, pr.number).await
+        else {
+            continue;
+        };
+        if !handed_off(cx.state, cx.team_id, &run_id).await {
+            continue;
+        }
+        let claim_sk = format!("SEC_SPLIT#{}#{}", repo.to_ascii_lowercase(), pr.number);
+        if !claim(cx.state, cx.team_id, &claim_sk, sec::CARD_CLAIM_SECS).await {
+            continue;
+        }
+        let majors: Vec<&sec::Bump> = unit.bumps.iter().filter(|b| b.major).collect();
+        let left = sec::without(&unit, &gone, findings, cx.cfg);
+        if let Err(e) = follow_up(cx, &repo, pr.number, &ticket, sec::split_note(&majors)).await {
+            warn!(team_id = cx.team_id, %repo, pr = pr.number, error = %e, "security: could not take the major bumps out of the bundle");
+            release(cx.state, cx.team_id, &claim_sk).await;
+            continue;
+        }
+        if let Err(e) = save_unit(cx.state, cx.team_id, &ticket, &left).await {
+            warn!(team_id = cx.team_id, %repo, error = %e, "security: could not save the bundle without its major bumps");
+        }
+        let now = Utc::now();
+        for (f, st) in findings.iter_mut().filter(|(f, _)| gone.contains(&f.id)) {
+            f.status = Status::Open;
+            f.pr = None;
+            f.waiting = None;
+            st.ticket = None;
+            st.bundled = false;
+            st.split = true;
+            f.updated_at = now.to_rfc3339();
+            save_finding(cx.state, cx.team_id, f, st).await;
+            add_event(
+                cx.state,
+                cx.team_id,
+                &f.id,
+                &format!(
+                    "Taken out of PR #{}: its major version bump failed CI there. It gets a pull request of its own.",
+                    pr.number
+                ),
+                Some(&pr.url),
+            )
+            .await;
+        }
+        refresh_pr(cx, &left, &ticket, pr.number, findings).await;
+        info!(team_id = cx.team_id, %repo, pr = pr.number, split = gone.len(), "security: major bumps split out of a failing bundle");
+    }
 }
 
 /// Notes on a unit's findings why its fix hasn't started.
@@ -2533,6 +2824,7 @@ async fn enqueue(
         f.status = Status::Fixing;
         f.waiting = None;
         st.requested_by = None;
+        st.bundled = unit.bundle;
         st.ticket = Some(unit.ticket.clone());
         f.updated_at = Utc::now().to_rfc3339();
         save_finding(cx.state, cx.team_id, f, st).await;
@@ -3015,8 +3307,14 @@ async fn event_for_team(
             }
         }
         "fix" => {
-            report.runs +=
-                start_asked(&cx, &mut findings, &msg.finding_ids, &msg.requested_by).await;
+            report.runs += start_asked(
+                &cx,
+                &mut findings,
+                &msg.finding_ids,
+                &msg.requested_by,
+                msg.combine,
+            )
+            .await;
         }
         other => {
             info!(kind = other, "security: unknown event kind");
@@ -3085,6 +3383,19 @@ pub async fn pr_body(state: &WorkerState, msg: &TicketMessage, change: &str) -> 
     if unit.ecosystem == common::infra_vuln::records::UNIT_ECOSYSTEM {
         return super::infra_findings::pr_body(state, &msg.team_id, &unit, change).await;
     }
+    // Kept, so the description can be written again when fixes join.
+    let _ = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(&msg.team_id))
+        .key("sk", attr_s(&sec::ticket_sk(&msg.ticket_id)))
+        .update_expression("SET #c = :c")
+        .condition_expression("attribute_exists(sk)")
+        .expression_attribute_names("#c", "change")
+        .expression_attribute_values(":c", attr_s(common::truncate_str(change, 20_000)))
+        .send()
+        .await;
     let members = unit_findings(state, &msg.team_id, &unit).await;
     let pairs: Vec<(&Finding, &FindingState)> = members.iter().map(|(f, s)| (f, s)).collect();
     Some(sec::pr_body(&unit, &pairs, change))

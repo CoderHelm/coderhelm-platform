@@ -224,6 +224,8 @@ fn unit_for(r: &Record) -> Option<FixUnit> {
         tier: r.finding.tier,
         finding_ids: vec![r.finding.id.clone()],
         bumps: Vec::new(),
+        bundle: false,
+        cadence: None,
         ticket: sec::ticket_id(&loc.repo, &key),
         branch: common::git_conventions::branch(
             &branch_name,
