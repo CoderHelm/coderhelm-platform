@@ -61,10 +61,7 @@ async fn fetch(state: &WorkerState, url: &str) -> Result<Vec<u8>, String> {
     let r = state
         .http
         .get(url)
-        .header(
-            "user-agent",
-            "CoderHelm security feeds",
-        )
+        .header("user-agent", "CoderHelm security feeds")
         .timeout(std::time::Duration::from_secs(40))
         .send()
         .await
