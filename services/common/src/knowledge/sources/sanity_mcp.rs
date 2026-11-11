@@ -1980,6 +1980,7 @@ mod tests {
             embedder: &WordEmbedder,
             team: "TEAM#t",
             now: &now,
+            used: None,
         };
         run(&ctx, "kb1", "s1").await
     }

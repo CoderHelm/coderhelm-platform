@@ -65,6 +65,8 @@ pub struct Ctx<'a> {
     pub team: &'a str,
     /// Unix seconds now.
     pub now: &'a (dyn Fn() -> i64 + Send + Sync),
+    /// The connection this sync opened, saved on the source when it ends.
+    pub used: Option<super::UsedConnection>,
 }
 
 fn rfc3339(secs: i64) -> String {
@@ -159,6 +161,9 @@ async fn finish(ctx: &Ctx<'_>, kb_id: &str, id: &str, ran: &Source, r: &Outcome)
     s.last_sync_at = rfc3339(now);
     s.progress = None;
     s.lease_until = 0;
+    if let Some(used) = &ctx.used {
+        s.used = Some(used.clone());
+    }
     match &r.error {
         None => {
             s.status = Status::Ready;
@@ -681,6 +686,7 @@ mod tests {
             embedder: r.embedder.as_ref(),
             team: "TEAM#t",
             now: &now,
+            used: None,
         };
         run(&ctx, "kb1", "s1").await
     }
@@ -730,6 +736,33 @@ mod tests {
             .iter()
             .any(|w| w.status == Status::Syncing
                 && w.progress.as_ref().is_some_and(|p| p.phase == "fetching")));
+    }
+
+    #[tokio::test]
+    async fn a_sync_saves_the_connection_it_used() {
+        let r = rig();
+        r.provider.set("a", "1", "Deploys run on Fridays.");
+        sync(&r).await;
+        assert!(r.store.sources.lock().unwrap()["s1"].used.is_none());
+        let clock = r.clock.clone();
+        let now = move || clock.load(Ordering::SeqCst);
+        let used = super::super::UsedConnection {
+            via: "oauth".into(),
+            owner: "team".into(),
+            by: "ada@example.com".into(),
+            used_at: "2026-11-11T10:00:00Z".into(),
+            ..Default::default()
+        };
+        let ctx = Ctx {
+            store: r.store.as_ref(),
+            connector: r.provider.as_ref(),
+            embedder: r.embedder.as_ref(),
+            team: "TEAM#t",
+            now: &now,
+            used: Some(used.clone()),
+        };
+        run(&ctx, "kb1", "s1").await;
+        assert_eq!(r.store.sources.lock().unwrap()["s1"].used, Some(used));
     }
 
     #[tokio::test]

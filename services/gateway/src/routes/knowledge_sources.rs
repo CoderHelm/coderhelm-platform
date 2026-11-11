@@ -171,12 +171,165 @@ pub fn source_json(s: &Source, now: i64) -> Value {
         "created_at": s.created_at,
         "created_by": s.created_by,
         "connection": if s.signin.is_some() { "sign_in" } else { "" },
+        "via": via_of(s),
+        "via_known": s.used.is_some() || !via_of(s).is_empty(),
+        "account": s.used.as_ref().map(|u| u.account.clone()).unwrap_or_default(),
+        "connected_used_at": s.used.as_ref().map(|u| u.used_at.clone()).unwrap_or_default(),
+        "use_saved_key": s.use_saved_key,
+        "webhook_seen_at": s.webhook_seen_at,
+        "interval_mins": s.interval_mins(),
         "signin": s.signin.as_ref().map(|si| json!({
             "name": si.who(),
             "email": si.email,
             "account": si.account,
         })),
     })
+}
+
+/// How a source reaches its provider: what its last sync used, else what
+/// its kind can only use (empty when only a sync can tell).
+pub fn via_of(s: &Source) -> &str {
+    if let Some(u) = &s.used {
+        return &u.via;
+    }
+    if s.signin.is_some() {
+        return "sign_in";
+    }
+    match s.kind {
+        Some(Kind::Web) => "public",
+        Some(Kind::Archive) => "upload",
+        Some(Kind::S3) => "aws_role",
+        Some(Kind::Github) => "github_app",
+        Some(Kind::Sanity) => "saved_key",
+        _ if s.use_saved_key => "saved_key",
+        _ => "",
+    }
+}
+
+/// The ways a kind can be switched between for one source ("Change
+/// connection"): the team's sign-in and its saved API key.
+pub fn switchable(kind: Kind) -> bool {
+    matches!(kind, Kind::Notion | Kind::Confluence)
+}
+
+/// What happens to a source when the person who connected it leaves the
+/// team, in one sentence.
+pub fn if_they_leave(via: &str, who: &str, label: &str) -> String {
+    let who = if who.trim().is_empty() {
+        "the person who connected it"
+    } else {
+        who.trim()
+    };
+    match via {
+        "oauth" => format!("It belongs to the team, so it keeps working if {who} leaves. Reconnect only if {label} stops accepting it."),
+        "sign_in" => format!("It uses {who}'s own {label} sign-in. If {who} leaves or the sign-in stops working, syncing stops (pages already here stay searchable), admins are told, and any admin can sign in again to take it over."),
+        "saved_key" => format!("It uses the API token saved for the team, so it keeps working if {who} leaves, until someone revokes that token in {label}."),
+        "github_app" => "It uses the Coderhelm GitHub App, installed for the organization, so it doesn't depend on any one person.".to_string(),
+        "aws_role" => "It uses the team's read-only role in that AWS account, so it doesn't depend on any one person.".to_string(),
+        "public" => "It reads public pages, so no one's access is involved.".to_string(),
+        "upload" => "It reads an export someone uploaded; nothing is connected, so nothing changes when they leave.".to_string(),
+        _ => "It shows here after its next sync.".to_string(),
+    }
+}
+
+/// GET /api/knowledge/:kb_id/sources/:source_id/connection — how a source
+/// connects, for the people who manage it: whose connection, when it was
+/// made, its scopes and whether it still works, and what it can switch to.
+/// Never a secret.
+pub async fn source_connection(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Path((kb_id, source_id)): Path<(String, String)>,
+) -> Reply {
+    claims.require_role(3).map_err(forbidden)?;
+    let src = load_source(&state, &claims.team_id, &kb_id, &source_id).await?;
+    let kind = src
+        .kind
+        .ok_or_else(|| fail(StatusCode::BAD_REQUEST, "This source has no kind."))?;
+    let env = env(&state, &claims.team_id, Some(kind)).await;
+    let rt = env.runtime();
+    let via = via_of(&src).to_string();
+    let used = src.used.clone().unwrap_or_default();
+    // The sign-in record a sync uses: the team's, or the member's own.
+    let token = match (via.as_str(), &src.signin) {
+        ("sign_in", Some(si)) => match Owner::parse(&si.owner) {
+            Some(o) => rt
+                .store
+                .get_token(&claims.team_id, &si.server_id, &o)
+                .await
+                .ok()
+                .flatten(),
+            None => None,
+        },
+        ("oauth", _) => rt
+            .store
+            .get_token(&claims.team_id, &oauth::connection_id(kind), &Owner::Team)
+            .await
+            .ok()
+            .flatten(),
+        _ => None,
+    };
+    let by = match (&src.signin, &token) {
+        (Some(si), _) => si.email.clone(),
+        (None, Some(t)) if !t.connected_by.is_empty() => t.connected_by.clone(),
+        _ => used.by.clone(),
+    };
+    let who = src
+        .signin
+        .as_ref()
+        .map(|si| si.who().to_string())
+        .unwrap_or_else(|| by.clone());
+    let team = connect::status(
+        &env,
+        kind,
+        app(&state, kind).is_set()
+            || super::hybrid_install::brokered(&state, kind)
+                .await
+                .is_some(),
+        &claims.email,
+    )
+    .await;
+    let (oauth_ok, _, _) = env.oauth_state(kind).await;
+    let key_ok = match kind {
+        Kind::Notion => env
+            .plugin_credentials("notion")
+            .await
+            .and_then(|c| c.get("api_key").cloned())
+            .is_some_and(|k| !k.trim().is_empty()),
+        Kind::Confluence => env.confluence_token().await.is_some(),
+        _ => false,
+    };
+    Ok(Json(json!({
+        "via": via,
+        "owner": if src.signin.is_some() { "member" } else if via.is_empty() { "" } else { "team" },
+        "by": by,
+        "account": if used.account.is_empty() { src.signin.as_ref().map(|s| s.account.clone()).unwrap_or_default() } else { used.account.clone() },
+        "connected_at": token.as_ref().map(|t| t.connected_at.clone()).filter(|t| !t.is_empty()).unwrap_or(used.connected_at.clone()),
+        "used_at": used.used_at,
+        "token": token.as_ref().map(|t| json!({
+            "status": match t.status {
+                common::mcp_remote::store::Status::Connected => "working",
+                _ => "stopped",
+            },
+            "status_reason": t.status_reason,
+            "expires_at": t.expires_at.map(ts),
+            "scopes": t.scope.split_whitespace().collect::<Vec<_>>(),
+        })),
+        "if_they_leave": if_they_leave(&via, &who, kind.label()),
+        "team": {
+            "connected": team.connected,
+            "via": team.via,
+            "connected_by": team.connected_by,
+            "reconnect_reason": team.reconnect_reason,
+            "can_sign_in": team.can_sign_in,
+            "has_saved_key": team.has_saved_key,
+        },
+        "switch": {
+            "oauth": switchable(kind) && oauth_ok && via != "oauth",
+            "saved_key": switchable(kind) && key_ok && via != "saved_key",
+            "my_sign_in": src.signin.is_some(),
+        },
+    })))
 }
 
 /// The sources of a base.
@@ -1167,6 +1320,62 @@ pub async fn update_source(
         }
         src.paused = p;
     }
+    // "Change connection": the team's sign-in or its saved API key.
+    if let Some(v) = input.via.as_deref().filter(|v| !v.is_empty()) {
+        let use_key = match v {
+            "saved_key" => true,
+            "oauth" => false,
+            _ => {
+                return Err(fail(
+                    StatusCode::BAD_REQUEST,
+                    "Switch to the team's sign-in or its saved API key.",
+                ))
+            }
+        };
+        if !switchable(kind) || src.signin.is_some() {
+            return Err(fail(
+                StatusCode::BAD_REQUEST,
+                &format!("{} sources can't switch connection.", kind.label()),
+            ));
+        }
+        let env = env(&state, &claims.team_id, Some(kind)).await;
+        let ok = if use_key {
+            match kind {
+                Kind::Notion => env
+                    .plugin_credentials("notion")
+                    .await
+                    .and_then(|c| c.get("api_key").cloned())
+                    .is_some_and(|k| !k.trim().is_empty()),
+                _ => env.confluence_token().await.is_some(),
+            }
+        } else {
+            env.oauth_state(kind).await.0
+        };
+        if !ok {
+            return Err(fail(
+                StatusCode::BAD_REQUEST,
+                &if use_key {
+                    format!(
+                        "The team has no {} API token saved. Save one first.",
+                        kind.label()
+                    )
+                } else {
+                    format!(
+                        "The team isn't signed in to {}. Sign in first.",
+                        kind.label()
+                    )
+                },
+            ));
+        }
+        if src.use_saved_key != use_key {
+            src.use_saved_key = use_key;
+            if src.status == Status::Error {
+                src.status = Status::Queued;
+                src.error = None;
+            }
+            resync = true;
+        }
+    }
     use common::knowledge::sources::store::SyncStore;
     let st = sync_store(&state);
     if resync {
@@ -1753,5 +1962,71 @@ mod tests {
         assert_eq!(r(r#"{"return_to":"//evil.example/knowledge/"}"#), "");
         assert_eq!(r(r#"{"return_to":"/knowledgeX"}"#), "");
         assert_eq!(r(""), "", "an older dashboard sends no body");
+    }
+
+    #[test]
+    fn a_source_says_how_it_connects() {
+        let mut s = Source {
+            kind: Some(Kind::Confluence),
+            ..Default::default()
+        };
+        assert_eq!(
+            via_of(&s),
+            "",
+            "only a sync can tell for an app with two ways in"
+        );
+        s.use_saved_key = true;
+        assert_eq!(via_of(&s), "saved_key");
+        s.used = Some(ks::UsedConnection {
+            via: "oauth".into(),
+            ..Default::default()
+        });
+        assert_eq!(via_of(&s), "oauth", "what the last sync used wins");
+        for (kind, via) in [
+            (Kind::Web, "public"),
+            (Kind::Archive, "upload"),
+            (Kind::S3, "aws_role"),
+            (Kind::Github, "github_app"),
+            (Kind::Sanity, "saved_key"),
+        ] {
+            let s = Source {
+                kind: Some(kind),
+                ..Default::default()
+            };
+            assert_eq!(via_of(&s), via, "{kind:?}");
+        }
+        let signin = Source {
+            kind: Some(Kind::Sanity),
+            signin: Some(ks::SignIn::default()),
+            ..Default::default()
+        };
+        assert_eq!(via_of(&signin), "sign_in");
+        let v = source_json(&s, 0);
+        assert_eq!(v["via"], "oauth");
+        assert_eq!(v["interval_mins"], 60);
+        assert!(v.get("webhook_seen_at").is_some());
+    }
+
+    #[test]
+    fn leaving_is_said_plainly_for_every_connection() {
+        let team = if_they_leave("oauth", "Ada", "Confluence");
+        assert!(team.contains("belongs to the team") && team.contains("Ada"));
+        let own = if_they_leave("sign_in", "Ada", "Sanity");
+        assert!(
+            own.contains("Ada's own Sanity sign-in") && own.contains("any admin can sign in again")
+        );
+        assert!(if_they_leave("oauth", " ", "Notion").contains("the person who connected it"));
+        for via in [
+            "saved_key",
+            "github_app",
+            "aws_role",
+            "public",
+            "upload",
+            "",
+        ] {
+            assert!(!if_they_leave(via, "Ada", "Notion").is_empty());
+        }
+        assert!(switchable(Kind::Notion) && switchable(Kind::Confluence));
+        assert!(!switchable(Kind::Sanity) && !switchable(Kind::GoogleDrive));
     }
 }

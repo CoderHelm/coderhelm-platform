@@ -980,6 +980,7 @@ mod tests {
             embedder: &WordEmbedder,
             team: "t",
             now: &|| 1_000,
+            used: None,
         };
         let first = sync::run(&ctx, "kb", "src").await;
         assert_eq!((first.fetched, first.indexed), (3, 3));
@@ -1023,6 +1024,7 @@ mod tests {
             embedder: &WordEmbedder,
             team: "t",
             now: &|| 1_000,
+            used: None,
         };
         let out = sync::run(&ctx, "kb", "src").await;
         assert!(matches!(out.error, Some(ConnectorError::Forbidden(_))));

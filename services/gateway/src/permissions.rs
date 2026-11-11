@@ -133,6 +133,8 @@ pub const CAPABILITIES: &[Capability] = &[
         handlers: &[
             "knowledge::list_bases",
             "knowledge::get_base",
+            "knowledge::poll_sources",
+            "knowledge::list_items",
             "brain::list_threads",
             "brain::get_thread",
             "brain::sources",
@@ -380,6 +382,7 @@ pub const CAPABILITIES: &[Capability] = &[
             "knowledge_sources::update_source",
             "knowledge_sources::sync_source",
             "knowledge_sources::source_signin",
+            "knowledge_sources::source_connection",
             "knowledge_sources::delete_source",
         ],
     },

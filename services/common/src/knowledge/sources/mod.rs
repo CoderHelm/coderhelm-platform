@@ -77,6 +77,36 @@ pub struct SyncMessage {
     pub team_id: String,
     pub kb_id: String,
     pub source_id: String,
+    /// What started it ([`Trigger`]), for the sync history; left out by
+    /// older senders.
+    #[serde(default)]
+    pub trigger: String,
+}
+
+/// What starts a sync, as the sync history names it.
+pub mod trigger {
+    /// The scheduled sweep.
+    pub const SCHEDULE: &str = "schedule";
+    /// The provider sent a change event.
+    pub const CHANGE: &str = "change";
+    /// Someone pressed "Check for changes".
+    pub const MANUAL: &str = "manual";
+    /// The source was just added (or a newer export uploaded).
+    pub const ADDED: &str = "added";
+    /// Its selection or settings were edited.
+    pub const EDITED: &str = "edited";
+    /// Someone signed in again or changed its connection.
+    pub const SIGN_IN: &str = "sign_in";
+    /// Someone asked to read chosen pages again.
+    pub const RETRY: &str = "retry";
+
+    /// A known trigger, or `schedule` for anything else.
+    pub fn clean(raw: &str) -> &'static str {
+        [SCHEDULE, CHANGE, MANUAL, ADDED, EDITED, SIGN_IN, RETRY]
+            .into_iter()
+            .find(|t| *t == raw)
+            .unwrap_or(SCHEDULE)
+    }
 }
 
 /// Sources one knowledge base holds.
@@ -306,6 +336,33 @@ pub fn signin_error(si: &SignIn, kind: Kind, message: String, member_gone: bool)
     }
 }
 
+/// How the last sync reached the provider, and as whom. Saved by the
+/// worker on every sync from the connection it actually opened, so the page
+/// says what was used instead of guessing from the team's settings.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsedConnection {
+    /// `oauth`, `sign_in`, `saved_key`, `github_app`, `public`, `aws_role`
+    /// or `upload` ([`connect::Via::key`]).
+    pub via: String,
+    /// Whose connection: `team`, or `user:<email>` for a member's own
+    /// sign-in.
+    #[serde(default)]
+    pub owner: String,
+    /// The member who connected it, when the provider's record says.
+    #[serde(default)]
+    pub by: String,
+    /// The account it reaches: a Confluence site, a Sanity project, a
+    /// GitHub repository, an AWS account.
+    #[serde(default)]
+    pub account: String,
+    /// When that connection was made.
+    #[serde(default)]
+    pub connected_at: String,
+    /// When a sync last used it.
+    #[serde(default)]
+    pub used_at: String,
+}
+
 /// Progress of the sync running now.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Progress {
@@ -382,6 +439,13 @@ pub struct Source {
     /// Read through a person's sign-in (not an API key).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signin: Option<SignIn>,
+    /// How the last sync that opened its connection reached the provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used: Option<UsedConnection>,
+    /// Sync with the team's saved API key even when the team also signed
+    /// in (Notion, Confluence): "Change connection".
+    #[serde(default)]
+    pub use_saved_key: bool,
 }
 
 impl Source {
