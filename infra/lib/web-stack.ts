@@ -285,14 +285,9 @@ export class WebStack extends cdk.Stack {
     this.standardLogs(cfg);
 
     // Origin access control signs the stream's calls as CloudFront; Lambda
-    // needs both of these for a function URL (FunctionUrlOrigin adds the first).
-    new lambda.CfnPermission(this, "StreamInvokeFromDistribution", {
-      action: "lambda:InvokeFunction",
-      functionName: props.streamingFunctionUrl.functionArn,
-      principal: "cloudfront.amazonaws.com",
-      sourceArn: `arn:${this.partition}:cloudfront::${this.account}:distribution/${this.distribution.distributionId}`,
-      invokedViaFunctionUrl: true,
-    });
+    // needs both lambda:InvokeFunctionUrl and lambda:InvokeFunction (with
+    // InvokedViaFunctionUrl) for a function URL. FunctionUrlOrigin adds both,
+    // scoped to this distribution, since aws-cdk-lib 2.25x.
 
     let hostname = domain ? domain.hostname : this.distribution.distributionDomainName;
     if (cfg.native) hostname = this.nativeDomain(this.distribution);

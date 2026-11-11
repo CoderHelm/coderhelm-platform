@@ -17,35 +17,35 @@ serde_json = "1"
 
 # AWS SDK
 aws-config = { version = "1", features = ["behavior-version-latest"] }
-aws-sdk-dynamodb = "1"
-aws-sdk-s3 = "1"
-aws-sdk-bedrockruntime = "1"
-aws-sdk-secretsmanager = "1"
-aws-sdk-sesv2 = "1"
-aws-sdk-lambda = "1"
-aws-sdk-kms = "1"
-aws-sdk-sts = "1"
-aws-sdk-sqs = "1"
-aws-sdk-codebuild = "1"
-aws-sdk-cloudwatchlogs = "1"
-aws-sdk-route53 = "1"
+aws-sdk-dynamodb = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-s3 = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio", "sigv4a", "http-1x"] }
+aws-sdk-bedrockruntime = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-secretsmanager = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-sesv2 = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-lambda = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-kms = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-sts = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-sqs = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-codebuild = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-cloudwatchlogs = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-route53 = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 # log_evidence: the ECS service, task definition and tasks behind a log group (read only)
-aws-sdk-ecs = "1"
+aws-sdk-ecs = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 # infra_inventory: which versions run in a team's account (describe and list
 # calls only, through its log reader role when the team switched it on)
-aws-sdk-ec2 = "1"
-aws-sdk-autoscaling = "1"
-aws-sdk-elasticloadbalancingv2 = "1"
-aws-sdk-eks = "1"
-aws-sdk-rds = "1"
-aws-sdk-elasticache = "1"
-aws-sdk-opensearch = "1"
-aws-sdk-ssm = "1"
-aws-sdk-ecr = "1"
+aws-sdk-ec2 = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-autoscaling = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-elasticloadbalancingv2 = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-eks = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-rds = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-elasticache = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-opensearch = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-ssm = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-ecr = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 # infra_inventory, when a team turns them on: Amazon Inspector findings and
 # AWS Health events (read-only)
-aws-sdk-inspector2 = "1"
-aws-sdk-health = "1"
+aws-sdk-inspector2 = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-health = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-smithy-types = "1"
 
 # HTTP client (GitHub API, Jira API)
@@ -53,7 +53,7 @@ pulldown-cmark = { version = "0.12", default-features = false, features = ["html
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 
 # Auth
-jsonwebtoken = "9"
+jsonwebtoken = { version = "10.3", features = ["aws_lc_rs"] }
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
@@ -69,7 +69,7 @@ mentedb-embedding = "=0.41.0"
 uuid = { version = "1", features = ["v4"] }
 flate2 = "1"
 # e2e: GitHub Actions artifacts are zip files
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "9.0.5", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 tar = "0.4"
 
 # Code graph extraction (tree-sitter grammars are C, compiled via cc — works

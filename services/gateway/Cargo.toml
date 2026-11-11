@@ -24,25 +24,25 @@ utoipa = { version = "5.5", features = ["preserve_order", "preserve_path_order"]
 
 # AWS SDK
 aws-config = { version = "1", features = ["behavior-version-latest"] }
-aws-sdk-dynamodb = "1"
-aws-sdk-sqs = "1"
-aws-sdk-secretsmanager = "1"
-aws-sdk-sesv2 = "1"
-aws-sdk-s3 = { version = "1", features = ["behavior-version-latest"] }
-aws-sdk-cognitoidentityprovider = "1"
-aws-sdk-sts = "1"
-aws-sdk-cloudwatchlogs = "1"
-aws-sdk-cloudwatch = "1"
-aws-sdk-lambda = "1"
+aws-sdk-dynamodb = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-sqs = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-secretsmanager = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-sesv2 = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-s3 = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio", "sigv4a", "http-1x", "behavior-version-latest"] }
+aws-sdk-cognitoidentityprovider = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-sts = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-cloudwatchlogs = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-cloudwatch = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-lambda = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 # hybrid (hosted side): CNAME records for {name}.coderhelm.com
-aws-sdk-route53 = "1"
-aws-sdk-kms = "1"
+aws-sdk-route53 = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-kms = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 # memory: embeds a memory a person adds or edits
-aws-sdk-bedrockruntime = "1"
+aws-sdk-bedrockruntime = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-smithy-types = "1"
 
 # Auth
-jsonwebtoken = "9"
+jsonwebtoken = { version = "10.3", features = ["aws_lc_rs"] }
 hmac = "0.12"
 sha2 = { version = "0.10", features = ["oid"] }
 # SNS message signature verification (alert intake)

@@ -775,7 +775,9 @@ pub fn zip_files(bytes: &[u8]) -> Vec<(String, Vec<u8>)> {
     let mut out = Vec::new();
     for i in 0..zip.len() {
         let Ok(f) = zip.by_index(i) else { continue };
-        let name = f.name().to_string();
+        let Ok(name) = f.name().map(|n| n.to_string()) else {
+            continue;
+        };
         // Reports, and the page files, screenshots and traces a failure
         // points at.
         let wanted = (is_report_name(&name)
