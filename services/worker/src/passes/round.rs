@@ -540,6 +540,60 @@ pub(crate) fn after_fault(
     }
 }
 
+/// [`after_fault`] for a round that makes one attempt per invocation (a
+/// review fix, a person's feedback, a security fix, planned work): it runs
+/// again in a fresh invocation while it may continue, and only then is
+/// left as the round that didn't finish.
+pub(crate) fn after_fault_parked(may_continue: bool) -> AfterFault {
+    after_fault(1, 1, false, if may_continue { 0 } else { MAX_REDRIVES })
+}
+
+/// Whether the round's work branch is kept for the next try. Its work is
+/// there and only the landing failed when GitHub refused the push, the
+/// compare or didn't answer; any other fault starts again from the pull
+/// request's head (a clash must: the work was written on an older head).
+pub(crate) fn keeps_work(f: Fault) -> bool {
+    matches!(
+        f,
+        Fault::PushRejected | Fault::Unreadable | Fault::GitHubBusy
+    )
+}
+
+/// What a round does about a fault it met: its class, what comes next and
+/// the line for the run page. The one decision every kind of round takes
+/// (`resume`'s CI fix loop, `run_fix_round`, the feedback pass).
+pub(crate) struct FaultPlan {
+    pub class: Fault,
+    pub next: AfterFault,
+    pub note: String,
+    /// The work branch goes, and the next try starts from the pull
+    /// request's head.
+    pub clean: bool,
+}
+
+pub(crate) fn plan_for_fault(kind: Kind, error: &str, next: AfterFault) -> FaultPlan {
+    let class = fault_of(error);
+    FaultPlan {
+        class,
+        note: fault_note(kind, class, error, &next),
+        clean: !keeps_work(class) || next == AfterFault::Supervisor,
+        next,
+    }
+}
+
+/// A clean state for a round's next try: its work branch goes, and the
+/// round starts from the pull request's head as it is now.
+pub(crate) async fn start_clean(pr: &Pr<'_>, round: &mut Round) {
+    if !round.wip_branch.is_empty() && round.wip_branch != pr.branch {
+        let _ = pr
+            .github
+            .delete_branch(pr.owner, pr.repo, &round.wip_branch)
+            .await;
+    }
+    round.wip_branch = String::new();
+    round.base_sha = branch_head(pr.github, pr.owner, pr.repo, pr.branch).await;
+}
+
 /// What a fault and its way around read like on the run page.
 pub(crate) fn fault_note(kind: Kind, f: Fault, error: &str, next: &AfterFault) -> String {
     let what = match f {

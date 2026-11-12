@@ -1239,6 +1239,38 @@ Rules:
                 }
                 super::round::Landed::Nothing => {}
                 super::round::Landed::Refused(why) => {
+                    // The same classified decision as every fix round's
+                    // (`round::plan_for_fault`): while the round may
+                    // continue it runs again in a fresh step, on its work
+                    // branch when only the landing failed, from the pull
+                    // request's head otherwise.
+                    let plan = super::round::plan_for_fault(
+                        feedback_round.kind,
+                        &why,
+                        super::round::after_fault_parked(feedback_round.may_continue()),
+                    );
+                    warn!(
+                        run_id = %msg.run_id,
+                        fault = ?plan.class,
+                        way_around = ?super::round::way_around(plan.class),
+                        next = ?plan.next,
+                        error = %why,
+                        "Feedback round met a fault"
+                    );
+                    if plan.next != super::round::AfterFault::Supervisor {
+                        let mut again = feedback_round.clone();
+                        if plan.clean {
+                            super::round::start_clean(&land_pr, &mut again).await;
+                        }
+                        super::round::record(state, &msg.team_id, &msg.run_id, &again).await;
+                        let mut next = msg.clone();
+                        next.round_attempt = feedback_round.attempt;
+                        if send_delayed_feedback(state, &next, 5).await {
+                            super::add_progress_note(state, &msg.team_id, &msg.run_id, &plan.note)
+                                .await;
+                            return Ok(());
+                        }
+                    }
                     super::round::finish_incomplete(
                         state,
                         &msg.team_id,

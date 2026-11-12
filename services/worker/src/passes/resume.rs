@@ -2863,29 +2863,27 @@ pub async fn run(
                 // and the catch-all runs the round again from a clean state
                 // (now, then once in a fresh step) before the supervisor's
                 // ending is asked. Never a dead round, never "failed" here.
-                let class = super::round::fault_of(&why);
                 let redrives = run_number(state, &msg.team_id, &msg.run_id, "round_redrives").await;
-                let next = super::round::after_fault(
-                    attempt,
-                    max_attempts,
-                    super::round::may_start(start, std::time::Instant::now()),
-                    redrives,
+                let fault_plan = super::round::plan_for_fault(
+                    ci_round.kind,
+                    &why,
+                    super::round::after_fault(
+                        attempt,
+                        max_attempts,
+                        super::round::may_start(start, std::time::Instant::now()),
+                        redrives,
+                    ),
                 );
+                let next = fault_plan.next.clone();
                 warn!(
                     run_id = msg.run_id,
-                    fault = ?class,
-                    way_around = ?super::round::way_around(class),
+                    fault = ?fault_plan.class,
+                    way_around = ?super::round::way_around(fault_plan.class),
                     next = ?next,
                     error = %why,
                     "CI fix attempt met a fault"
                 );
-                super::add_progress_note(
-                    state,
-                    &msg.team_id,
-                    &msg.run_id,
-                    &super::round::fault_note(ci_round.kind, class, &why, &next),
-                )
-                .await;
+                super::add_progress_note(state, &msg.team_id, &msg.run_id, &fault_plan.note).await;
                 tried.push(format!(
                     "attempt {attempt} didn't land: {}",
                     common::truncate_str(&why, 240)
@@ -3999,16 +3997,17 @@ async fn run_fix_round(
                     Ok(RoundEnd::Done { files: 0 })
                 }
                 super::round::Landed::Refused(why) => {
-                    super::round::finish_incomplete(
+                    round_fault(
                         state,
-                        &msg.team_id,
-                        &msg.run_id,
+                        msg,
+                        (&ctx.ticket_msg, &ctx.usage),
+                        pr,
                         &gh,
-                        &round,
-                        &format!("its changes couldn't land on the pull request: {why}"),
+                        round,
+                        &why,
+                        (created_at, start),
                     )
-                    .await;
-                    Ok(RoundEnd::Incomplete)
+                    .await
                 }
             }
         }
@@ -4030,19 +4029,69 @@ async fn run_fix_round(
                 )
                 .await;
             }
-            error!(run_id = msg.run_id, error = %e, "Fix round failed");
-            super::round::finish_incomplete(
+            warn!(run_id = msg.run_id, error = %e, "Fix round met an error; taking the way around it");
+            round_fault(
                 state,
-                &msg.team_id,
-                &msg.run_id,
+                msg,
+                (&ctx.ticket_msg, &ctx.usage),
+                pr,
                 &gh,
-                &round,
-                &run_round::errored(round.kind, &common::run_fail::error_text(err)),
+                round,
+                &common::run_fail::error_text(err),
+                (created_at, start),
             )
-            .await;
-            Ok(RoundEnd::Incomplete)
+            .await
         }
     }
+}
+
+/// A fix round met a fault (its changes couldn't land, its pass errored):
+/// the same classified decision as the CI fix round's
+/// (`round::plan_for_fault`). While the round may continue it runs again
+/// in a fresh step: on its work branch when only the landing failed, from
+/// the pull request's head otherwise. Only a round with no step left is
+/// recorded as the one that didn't finish.
+#[allow(clippy::too_many_arguments)]
+async fn round_fault(
+    state: &WorkerState,
+    msg: &ResumeMessage,
+    ctx: (&TicketMessage, &TokenUsage),
+    pr: &PrRef<'_>,
+    gh: &super::round::Pr<'_>,
+    mut round: run_round::Round,
+    why: &str,
+    (created_at, start): (Option<chrono::DateTime<chrono::Utc>>, &std::time::Instant),
+) -> Result<RoundEnd, Box<dyn std::error::Error + Send + Sync>> {
+    let plan = super::round::plan_for_fault(
+        round.kind,
+        why,
+        super::round::after_fault_parked(round.may_continue()),
+    );
+    warn!(
+        run_id = msg.run_id,
+        fault = ?plan.class,
+        way_around = ?super::round::way_around(plan.class),
+        next = ?plan.next,
+        error = %why,
+        "Fix round met a fault"
+    );
+    if plan.next == super::round::AfterFault::Supervisor {
+        super::round::finish_incomplete(
+            state,
+            &msg.team_id,
+            &msg.run_id,
+            gh,
+            &round,
+            &format!("its changes couldn't land on the pull request: {why}"),
+        )
+        .await;
+        return Ok(RoundEnd::Incomplete);
+    }
+    super::add_progress_note(state, &msg.team_id, &msg.run_id, &plan.note).await;
+    if plan.clean {
+        super::round::start_clean(gh, &mut round).await;
+    }
+    park_round(state, msg, ctx, pr, &round, true, created_at, start).await
 }
 
 /// A parked round, picked up by a fresh invocation with its whole budget:
@@ -6069,7 +6118,11 @@ async fn revert_to_green(
     excerpt: &str,
 ) -> Option<String> {
     use super::supervisor::{self as sup, Revert};
-    use crate::clients::github::FileOp;
+    // A dependency fix run takes out its newest commit of verified bumps
+    // and keeps the ones before it: only what breaks CI is deferred.
+    if let Some(note) = revert_dep_commit(state, msg, ticket_msg, github, pr, excerpt).await {
+        return Some(note);
+    }
     let reverts = run_number(state, &msg.team_id, &msg.run_id, "sup_reverts").await;
     // Earlier heads of the pull request, newest first, and whether their
     // checks passed (at most ten are read).
@@ -6185,6 +6238,108 @@ async fn revert_to_green(
             )
         }
     };
+    apply_revert(state, msg, github, pr, files, &note).await?;
+    if let Some(mut p) = plan {
+        if !deferred.is_empty() {
+            p.tasks = super::plan_coverage::with_deferred(&p.tasks, &deferred);
+            super::save_checked_tasks(state, ticket_msg, &msg.run_id, &p.tasks).await;
+        }
+    }
+    Some(note)
+}
+
+/// What fails, for a deferral's reason: the cause the fix round recorded
+/// (`ci_cause`), else the failing checks' own line.
+async fn recorded_failure(
+    state: &WorkerState,
+    team_id: &str,
+    run_id: &str,
+    excerpt: &str,
+) -> String {
+    let cause = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(team_id))
+        .key("run_id", attr_s(run_id))
+        .projection_expression("ci_cause")
+        .send()
+        .await
+        .ok()
+        .and_then(|o| o.item)
+        .and_then(|i| i.get("ci_cause").and_then(|v| v.as_s().ok()).cloned())
+        .unwrap_or_default();
+    if cause.trim().is_empty() {
+        excerpt.trim().to_string()
+    } else {
+        cause
+    }
+}
+
+/// The revert for a dependency fix run whose pull request's CI stays red:
+/// the branch goes back to the files it had before the run's newest commit
+/// of verified bumps, those bumps are deferred with what CI printed, and
+/// the commits before it stay (`DepRun::take_out_last_commit`). The
+/// findings follow the run's state, and the pull request names each bump
+/// under "Deferred".
+/// `None` when the run isn't one, or one commit or none is left.
+async fn revert_dep_commit(
+    state: &WorkerState,
+    msg: &ResumeMessage,
+    ticket_msg: &TicketMessage,
+    github: &GitHubClient,
+    pr: &PrRef<'_>,
+    excerpt: &str,
+) -> Option<String> {
+    if !common::security_fixes::is_ticket(&ticket_msg.ticket_id) {
+        return None;
+    }
+    let mut run = super::dep_fix::load(state, ticket_msg, &msg.run_id).await?;
+    let failure = recorded_failure(state, &msg.team_id, &msg.run_id, excerpt).await;
+    let out = run.take_out_last_commit(&common::dep_fix::ci_deferral_reason(&failure))?;
+    let changed = github
+        .compare_changed_files(pr.owner, pr.repo, &out.restore_to, pr.branch)
+        .await
+        .ok()?;
+    let mut files = Vec::new();
+    for path in &changed {
+        let was = github
+            .read_file_if_exists(pr.owner, pr.repo, path, &out.restore_to)
+            .await
+            .ok()?;
+        files.push((path.clone(), was));
+    }
+    let note = dep_revert_note(&out.lines, run.commits.len());
+    apply_revert(state, msg, github, pr, files, &note).await?;
+    super::dep_fix::save(state, ticket_msg, &msg.run_id, &run).await;
+    super::dep_fix::settle(state, ticket_msg, &run).await;
+    Some(note)
+}
+
+/// The pull request's "Deferred" line for a commit of bumps CI took out.
+pub(crate) fn dep_revert_note(lines: &[String], commits_left: usize) -> String {
+    format!(
+        "CI stayed red after the fix attempts: took out the newest verified set of {} bump{} and \
+         kept the {} set{} before it. {}. CI decides again.",
+        lines.len(),
+        if lines.len() == 1 { "" } else { "s" },
+        commits_left,
+        if commits_left == 1 { "" } else { "s" },
+        lines.join("; ")
+    )
+}
+
+/// Writes a revert as one commit and names it under "Deferred" on the pull
+/// request. `None` when there is nothing to write or GitHub refused it.
+async fn apply_revert(
+    state: &WorkerState,
+    msg: &ResumeMessage,
+    github: &GitHubClient,
+    pr: &PrRef<'_>,
+    files: Vec<(String, Option<String>)>,
+    note: &str,
+) -> Option<()> {
+    use crate::clients::github::FileOp;
     if files.is_empty() {
         return None;
     }
@@ -6209,12 +6364,6 @@ async fn revert_to_green(
         return None;
     }
     add_run_number(state, &msg.team_id, &msg.run_id, "sup_reverts").await;
-    if let Some(mut p) = plan {
-        if !deferred.is_empty() {
-            p.tasks = super::plan_coverage::with_deferred(&p.tasks, &deferred);
-            super::save_checked_tasks(state, ticket_msg, &msg.run_id, &p.tasks).await;
-        }
-    }
     if let Ok(p) = github.get_pull_request(pr.owner, pr.repo, pr.number).await {
         let body = p["body"].as_str().unwrap_or("");
         let line = format!("- {note}");
@@ -6227,7 +6376,7 @@ async fn revert_to_green(
             .update_pr_body(pr.owner, pr.repo, pr.number, &now)
             .await;
     }
-    Some(note)
+    Some(())
 }
 
 /// A number kept on the run record (0 when absent).

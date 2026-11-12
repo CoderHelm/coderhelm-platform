@@ -1251,3 +1251,58 @@ fn proof_a_fix_ticket_never_asks_for_documentation() {
     let body = crate::security_fixes::ticket_body(&units[0], &members, &cfg);
     assert!(body.contains("Never edit documentation"), "{body}");
 }
+
+/// The pull request's own CI stays red after the fixes: the newest commit
+/// of verified bumps comes out and the earlier ones stay, one at a time,
+/// and the pull request is never emptied.
+#[test]
+fn red_ci_takes_out_the_newest_commit_of_bumps_and_keeps_the_rest() {
+    let mut run = DepRun::new(ten_bumps(), "base", 3.0);
+    for (bumps, head) in [(vec![0, 1, 2], "h1"), (vec![3, 4], "h2"), (vec![5], "h3")] {
+        run.groups = vec![Group {
+            bumps,
+            green: true,
+            ..Default::default()
+        }];
+        run.on_commit(0, head);
+    }
+    assert_eq!(run.commits.len(), 3);
+    assert_eq!(run.applied, vec![0, 1, 2, 3, 4, 5]);
+    // A green set with nothing to write is no commit of its own.
+    run.groups = vec![Group {
+        bumps: vec![6],
+        green: true,
+        ..Default::default()
+    }];
+    run.on_commit(0, "h3");
+    assert_eq!(run.commits.len(), 3);
+
+    let why = ci_deferral_reason("npm error ETARGET No matching version found for lib-05@2.1.5");
+    let out = run.take_out_last_commit(&why).expect("three commits");
+    assert_eq!(out.restore_to, "h2");
+    assert_eq!(out.lines.len(), 1);
+    assert!(out.lines[0].starts_with("`lib-05` 2.1.0 to 2.1.5 deferred: the pull request's CI failed with it applied (npm error ETARGET"), "{}", out.lines[0]);
+    assert_eq!(run.applied, vec![0, 1, 2, 3, 4, 6]);
+    assert_eq!(run.head, "h2");
+    // It broke the checks: it doesn't come back by itself.
+    let d = run.deferred.last().unwrap();
+    assert_eq!(d.package, "lib-05");
+    assert!(!d.later);
+    assert!(run.report_md().contains("lib-05"), "{}", run.report_md());
+
+    // Still red: the one before it. Then one commit is left, and it stays.
+    let out = run.take_out_last_commit(&why).expect("two commits");
+    assert_eq!(out.restore_to, "h1");
+    assert_eq!(out.lines.len(), 2);
+    assert_eq!(run.applied, vec![0, 1, 2, 6]);
+    assert_eq!(run.take_out_last_commit(&why), None);
+    assert_eq!(run.commits.len(), 1);
+    assert_eq!(run.applied, vec![0, 1, 2, 6]);
+
+    // A saved run from before commits were kept reads with none, and
+    // nothing is taken out of it.
+    let mut old: DepRun = serde_json::from_str("{\"applied\":[0,1]}").unwrap();
+    assert!(old.commits.is_empty());
+    assert_eq!(old.take_out_last_commit(&why), None);
+    assert!(ci_deferral_reason("  ").contains("CI failed with it applied;"));
+}
