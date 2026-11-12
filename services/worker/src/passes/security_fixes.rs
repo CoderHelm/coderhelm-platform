@@ -2996,7 +2996,8 @@ async fn refresh_pr(
         Some(pr),
     )
     .await;
-    let body = sec::pr_body_with(unit, &pairs, &change, &check);
+    let links = body_links(cx.state, item.as_ref());
+    let body = sec::pr_body_linked(unit, &pairs, &change, &check, &links);
     if let Err(e) = cx.gh.update_pr_body(o, n, pr, &body).await {
         warn!(repo = %unit.repo, pr, error = %e, "security: could not write the bundle's description");
     }
@@ -4135,19 +4136,111 @@ pub async fn pr_body(state: &WorkerState, msg: &TicketMessage, change: &str) -> 
         .await;
     let members = unit_findings(state, &msg.team_id, &unit).await;
     let pairs: Vec<(&Finding, &FindingState)> = members.iter().map(|(f, s)| (f, s)).collect();
-    let notes = ticket_item(state, &msg.team_id, &msg.ticket_id)
-        .await
-        .map(|i| s(&i, "notes"))
-        .unwrap_or_default();
-    let mut check = match github(state, msg.installation_id) {
-        Ok(gh) => what_to_check(&gh, &unit, &notes, None).await,
-        Err(_) => common::upgrade_notes::WhatToCheck::from_notes(&notes),
+    let item = ticket_item(state, &msg.team_id, &msg.ticket_id).await;
+    let notes = item.as_ref().map(|i| s(i, "notes")).unwrap_or_default();
+    let gh = github(state, msg.installation_id).ok();
+    let mut check = match &gh {
+        Some(gh) => what_to_check(gh, &unit, &notes, None).await,
+        None => common::upgrade_notes::WhatToCheck::from_notes(&notes),
     };
-    check.dep_report = ticket_item(state, &msg.team_id, &msg.ticket_id)
-        .await
-        .map(|i| s(&i, "dep_report"))
+    check.dep_report = item
+        .as_ref()
+        .map(|i| s(i, "dep_report"))
         .unwrap_or_default();
-    Some(sec::pr_body_with(&unit, &pairs, change, &check))
+    let mut links = body_links(state, item.as_ref());
+    // A bundle too long to describe in full keeps its full detail on its
+    // branch, beside the plan CoderHelm commits there, when the team lets
+    // CoderHelm commit those files.
+    if sec::uses_short_body(&unit, &pairs) {
+        if let Some(gh) = &gh {
+            if let Some(url) = keep_detail(state, gh, msg, &unit, &pairs, change, &check).await {
+                links.detail = url;
+            }
+        }
+    }
+    Some(sec::pr_body_linked(&unit, &pairs, change, &check, &links))
+}
+
+/// Where a security description points for what it leaves out: each
+/// finding's page in CoderHelm, and the full detail kept on the branch (its
+/// link recorded on the ticket when it was written).
+fn body_links(state: &WorkerState, item: Option<&Item>) -> sec::BodyLinks {
+    sec::BodyLinks {
+        finding: format!(
+            "{}/security/detail?id=",
+            super::skills::app_url(&state.config.stage)
+        ),
+        detail: item.map(|i| s(i, "detail_url")).unwrap_or_default(),
+    }
+}
+
+/// The link to a file on a branch on GitHub.
+pub fn blob_url(repo: &str, branch: &str, path: &str) -> String {
+    format!("https://github.com/{repo}/blob/{branch}/{path}")
+}
+
+/// Writes the full detail of a bundle (every package's notes, every
+/// advisory) to `openspec/specs/<ticket>/security-detail.md` on its branch,
+/// where CoderHelm keeps the run's plan, and records its link on the
+/// ticket. Only when the team lets CoderHelm commit those files
+/// (`commit_openspec`); a file already as written is left alone.
+async fn keep_detail(
+    state: &WorkerState,
+    gh: &GitHubClient,
+    msg: &TicketMessage,
+    unit: &FixUnit,
+    pairs: &[(&Finding, &FindingState)],
+    change: &str,
+    check: &common::upgrade_notes::WhatToCheck,
+) -> Option<String> {
+    if unit.branch.is_empty()
+        || !super::load_workflow_setting(state, &msg.team_id, "commit_openspec").await
+    {
+        return None;
+    }
+    let (o, n) = unit.repo.split_once('/')?;
+    let path = sec::detail_path(&msg.ticket_id);
+    let doc = sec::detail_doc(unit, pairs, change, check);
+    let same = gh
+        .read_file(o, n, &path, &unit.branch)
+        .await
+        .is_ok_and(|now| now == doc);
+    if !same {
+        let conventions = super::load_git_conventions(state, &msg.team_id, &msg.ticket_id).await;
+        let message = conventions.commit_message(
+            &super::ticket_tokens(msg),
+            &format!("Add the full detail of {}", msg.ticket_id),
+        );
+        if let Err(e) = gh
+            .batch_write(
+                o,
+                n,
+                &unit.branch,
+                &message,
+                &[crate::clients::github::FileOp::Write {
+                    path: path.clone(),
+                    content: doc,
+                }],
+            )
+            .await
+        {
+            warn!(repo = %unit.repo, error = %e, "security: could not keep the full detail on the branch");
+            return None;
+        }
+    }
+    let url = blob_url(&unit.repo, &unit.branch, &path);
+    let _ = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(&msg.team_id))
+        .key("sk", attr_s(&sec::ticket_sk(&msg.ticket_id)))
+        .update_expression("SET detail_url = :u")
+        .condition_expression("attribute_exists(sk)")
+        .expression_attribute_values(":u", attr_s(&url))
+        .send()
+        .await;
+    Some(url)
 }
 
 /// Keeps a ticket's upgrade notes.
@@ -4274,7 +4367,10 @@ async fn refresh_ci_sections(cx: &Ctx<'_>, repo: &str, number: u64, ticket: &str
     let members = unit_findings(cx.state, cx.team_id, &unit).await;
     let pairs: Vec<(&Finding, &FindingState)> = members.iter().map(|(f, st)| (f, st)).collect();
     let check = what_to_check(&cx.gh, &unit, &notes, Some(number)).await;
-    let fresh = sec::pr_body_with(&unit, &pairs, &change, &check);
+    // The same links as when it opened: the rewritten sections are the
+    // short ones a bundle's description carries.
+    let links = body_links(cx.state, item.as_ref());
+    let fresh = sec::pr_body_linked(&unit, &pairs, &change, &check, &links);
     let next =
         common::upgrade_notes::replace_sections(body, &fresh, &["## What to check", "## Proof"]);
     if next != body {
@@ -4314,6 +4410,10 @@ pub async fn on_pr_opened(
     };
     let mut carded = false;
     for (f, st) in members.iter_mut() {
+        // Told already (the pull request was there before this run).
+        if f.pr.as_ref().is_some_and(|p| p.number == number) {
+            continue;
+        }
         f.status = Status::PrOpen;
         f.pr = Some(sec::PrRef {
             number,

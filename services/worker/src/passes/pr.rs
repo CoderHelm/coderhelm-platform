@@ -645,6 +645,12 @@ Return ONLY the markdown body text."#,
         {
             warn!(pr_number = number, error = %e, "Could not update the existing PR's description");
         }
+        // A security fix whose pull request an earlier attempt opened (a
+        // stopped run's draft, then Retry): its findings learn the pull
+        // request now, as they would have when it opened.
+        if common::security_fixes::is_ticket(&msg.ticket_id) {
+            super::security_fixes::on_pr_opened(state, github, msg, number, &url).await;
+        }
         (number, url, nid)
     } else if let Some(pr_data) = reopen_prior_pr(github, msg, branch).await {
         let number = pr_data
@@ -689,8 +695,11 @@ Return ONLY the markdown body text."#,
             warn!(branch, error = %e, "Squash before PR failed — proceeding with full history");
         }
 
-        // Create draft PR — CI triggers on PR creation, and we'll mark it ready after tests/review pass
-        let pr_data = github
+        // Create draft PR — CI triggers on PR creation, and we'll mark it ready after tests/review pass.
+        // The client fits the body to GitHub's limit; a refusal of the
+        // body or title anyway is tried once more with the body shortened
+        // harder, then said in GitHub's own plain words.
+        let pr_data = match github
             .create_pull_request(
                 &msg.repo_owner,
                 &msg.repo_name,
@@ -700,7 +709,38 @@ Return ONLY the markdown body text."#,
                 &msg.base_branch,
                 true,
             )
-            .await?;
+            .await
+        {
+            Ok(p) => p,
+            Err(e) if is_validation_refusal(&e.to_string()) => {
+                warn!(branch, error = %e, "GitHub refused the pull request; trying once more with a shorter description");
+                let shorter = common::pr_body_fit::fit_to(
+                    &full_body,
+                    common::pr_body_fit::BODY_TARGET / 2,
+                    None,
+                );
+                github
+                    .create_pull_request(
+                        &msg.repo_owner,
+                        &msg.repo_name,
+                        &title,
+                        &shorter,
+                        branch,
+                        &msg.base_branch,
+                        true,
+                    )
+                    .await
+                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                        let text = e.to_string();
+                        if is_validation_refusal(&text) {
+                            refusal_words("open the pull request", &text).into()
+                        } else {
+                            e
+                        }
+                    })?
+            }
+            Err(e) => return Err(e),
+        };
 
         let number = pr_data
             .get("number")
@@ -1303,6 +1343,58 @@ fn writer_system(voice_block: &str, standards_block: &str, team_instructions: &s
         "You are writing a pull request description. Be concise and technical. Return only markdown.{voice_block}{standards_block}{team}",
         team = super::team_instructions_block(team_instructions),
     )
+}
+
+/// True when GitHub refused a write as invalid (422 Validation Failed: a
+/// body or title too long, a field it doesn't take), not for its rate
+/// limit or an outage: those keep their own error so the run waits.
+pub fn is_validation_refusal(err: &str) -> bool {
+    err.contains("422") && err.contains("Validation Failed")
+}
+
+/// GitHub's refusal, in plain words: "GitHub refused to {what}: body is too
+/// long (maximum is 65536 characters)". Read from the JSON GitHub answers
+/// with (its most specific message per field); the status line when there
+/// is none.
+pub fn refusal_words(what: &str, err: &str) -> String {
+    let json = err
+        .find('{')
+        .and_then(|i| serde_json::from_str::<serde_json::Value>(&err[i..]).ok());
+    let mut said: Vec<String> = vec![];
+    if let Some(v) = &json {
+        for e in v["errors"].as_array().into_iter().flatten() {
+            let m = e["message"]
+                .as_str()
+                .map(String::from)
+                .or_else(|| {
+                    let field = e["field"].as_str()?;
+                    let code = e["code"].as_str().unwrap_or("invalid");
+                    Some(format!("{field} is {}", code.replace('_', " ")))
+                })
+                .unwrap_or_default();
+            let m = m.trim().to_string();
+            if m.is_empty() {
+                continue;
+            }
+            // "body is too long" and "body is too long (maximum is ...)":
+            // the longer one says it all.
+            if let Some(i) = said.iter().position(|s| m.starts_with(s.as_str())) {
+                said[i] = m;
+            } else if !said.iter().any(|s| s.starts_with(&m)) {
+                said.push(m);
+            }
+        }
+        if said.is_empty() {
+            if let Some(m) = v["message"].as_str() {
+                said.push(m.to_string());
+            }
+        }
+    }
+    if said.is_empty() {
+        let line = err.split(" for url").next().unwrap_or(err);
+        said.push(common::truncate_str(line.trim(), 300).to_string());
+    }
+    format!("GitHub refused to {what}: {}", said.join("; "))
 }
 
 /// The PR's title: the team's template, or `{ticket}: {title}` (cut to 72
@@ -2109,6 +2201,52 @@ mod check_results_tests {
         assert!(proof::holds_blocked(&once));
         let twice = with_checks(&once, &plan, &proof_of(&gaps, manual), "a/b");
         assert_eq!(once, twice);
+    }
+}
+
+#[cfg(test)]
+mod refusal_tests {
+    use super::{is_validation_refusal, refusal_words};
+
+    /// The error the run ended with, as the client raised it.
+    pub const TOO_LONG: &str = "HTTP status client error (422 Unprocessable Entity) for url (https://api.github.com/repos/acme/api/pulls): {\"message\":\"Validation Failed\",\"errors\":[{\"resource\":\"Issue\",\"code\":\"custom\",\"field\":\"body\",\"message\":\"body is too long\"},{\"resource\":\"Issue\",\"code\":\"custom\",\"field\":\"body\",\"message\":\"body is too long (maximum is 65536 characters)\"}],\"documentation_url\":\"https://docs.github.com/rest/pulls/pulls#create-a-pull-request\",\"status\":\"422\"}";
+
+    #[test]
+    fn githubs_refusal_reads_in_plain_words() {
+        assert!(is_validation_refusal(TOO_LONG));
+        assert_eq!(
+            refusal_words("open the pull request", TOO_LONG),
+            "GitHub refused to open the pull request: body is too long (maximum is 65536 characters)"
+        );
+        let exists = "HTTP status client error (422 Unprocessable Entity) for url (u): {\"message\":\"Validation Failed\",\"errors\":[{\"resource\":\"PullRequest\",\"code\":\"custom\",\"message\":\"A pull request already exists for acme:b.\"}]}";
+        assert_eq!(
+            refusal_words("open the pull request", exists),
+            "GitHub refused to open the pull request: A pull request already exists for acme:b."
+        );
+        let coded = "422 {\"message\":\"Validation Failed\",\"errors\":[{\"resource\":\"PullRequest\",\"field\":\"head\",\"code\":\"invalid\"}]}";
+        assert!(refusal_words("open the pull request", coded).ends_with("head is invalid"));
+        // A rate limit or an outage is not a refusal: it keeps its own error.
+        assert!(!is_validation_refusal("GitHub API error 429: rate limit"));
+        assert!(!is_validation_refusal(
+            "HTTP status server error (502 Bad Gateway)"
+        ));
+    }
+
+    /// The pull request pass tries once more with a shorter description,
+    /// then fails with GitHub's words, never the raw HTTP line.
+    #[test]
+    fn a_refused_create_is_retried_once_then_said_plainly() {
+        let src = include_str!("pr.rs");
+        let at = src.find("Create draft PR").unwrap();
+        let create = &src[at..at + 2400];
+        assert_eq!(
+            create.matches(".create_pull_request(").count(),
+            2,
+            "{create}"
+        );
+        assert!(create.contains("is_validation_refusal(&e.to_string())"));
+        assert!(create.contains("BODY_TARGET / 2"));
+        assert!(create.contains("refusal_words(\"open the pull request\""));
     }
 }
 
