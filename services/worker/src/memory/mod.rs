@@ -1,5 +1,6 @@
 pub mod embedder;
 pub mod lock;
+pub mod recall;
 pub mod s3_sync;
 
 use crate::WorkerState;
@@ -33,6 +34,9 @@ pub struct AgentMemory {
     /// Ids of the memories the last recall handed to an agent, pinned ones
     /// included, so the run can count their use.
     pub last_recalled: Vec<String>,
+    /// The memories the last recall chose, for the coding agent's own block
+    /// (see [`recall::block`]).
+    pub last_picked: Vec<Picked>,
 }
 
 /// Open a repo's memory directory with the engine settings the worker uses.
@@ -66,20 +70,24 @@ fn open_db(
 /// engine's tag index instead of loading every memory. The tag is checked
 /// again on the loaded memory in case the index lags a write.
 fn pinned_memories(db: &MenteDb) -> Vec<(String, String)> {
+    pinned_nodes(db)
+        .into_iter()
+        .map(|n| (n.id.to_string(), n.content))
+        .collect()
+}
+
+/// The pinned memories themselves (see [`pinned_memories`]).
+fn pinned_nodes(db: &MenteDb) -> Vec<MemoryNode> {
     // Oldest first, so which ten reach the agent does not change run to run.
-    let mut pinned: Vec<(u64, String, String)> = db
+    let mut pinned: Vec<MemoryNode> = db
         .memory_ids_with_tag(common::memory_meta::PINNED)
         .into_iter()
         .filter_map(|id| db.get_memory(id).ok())
         .filter(|n| n.tags.iter().any(|t| t == common::memory_meta::PINNED))
-        .map(|n| (n.created_at, n.id.to_string(), n.content))
         .collect();
-    pinned.sort();
+    pinned.sort_by_key(|n| (n.created_at, n.id.to_string()));
+    pinned.truncate(MAX_PINNED);
     pinned
-        .into_iter()
-        .take(MAX_PINNED)
-        .map(|(_, id, content)| (id, content))
-        .collect()
 }
 
 /// Tag on a lesson about where a fix belonged (see [`AgentMemory::store_lesson`]).
@@ -101,16 +109,38 @@ pub fn lesson_tags(origin: &LearningOrigin, repo_owner: &str, repo_name: &str) -
     tags
 }
 
-/// The memory context for a ticket: pinned memories, the team's lessons on
-/// where similar fixes belonged, then other relevant learnings. Returns the
-/// context and the ids it handed over.
-fn recall_with(
+/// Why a memory reached the agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PickKind {
+    /// A person pinned it: it reaches every agent on every task.
+    Pinned,
+    /// A team lesson on where a similar fix belonged.
+    Lesson,
+    /// Relevant to this task by recall.
+    Learned,
+}
+
+/// One memory chosen for a task.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Picked {
+    pub id: String,
+    pub content: String,
+    pub kind: PickKind,
+    pub memory_type: MemoryType,
+    /// The fused recall score (0 for pinned ones).
+    pub score: f32,
+}
+
+/// The memories for a task: pinned ones, then the team's lessons on where
+/// similar fixes belonged, then other relevant learnings, each once. The
+/// one selection every agent's memory block is made from.
+pub fn select(
     db: &MenteDb,
     embedding: &[f32],
     query: &str,
     k: usize,
     now_micros: u64,
-) -> (String, Vec<String>) {
+) -> Vec<Picked> {
     // Hybrid (vector + BM25 via RRF): tickets name exact code identifiers
     // (function names, crate names, file paths) that pure vector recall
     // ranks poorly — the keyword arm catches them. Same fused-score scale
@@ -138,77 +168,106 @@ fn recall_with(
     // what the team said about where this kind of fix belongs.
     let lessons = recall(MAX_LESSONS, Some(&[LESSON_TAG]));
     let results = recall(k, None);
-    let mut recalled: Vec<String> = Vec::new();
+    let mut out: Vec<Picked> = Vec::new();
+    let is_pinned = |n: &MemoryNode| n.tags.iter().any(|t| t == common::memory_meta::PINNED);
 
-    // Pinned memories reach the agent on every ticket: a person decided
+    // Pinned memories reach the agent on every task: a person decided
     // they always apply.
-    let pinned = pinned_memories(db);
-    if results.is_empty() && pinned.is_empty() && lessons.is_empty() {
+    for n in pinned_nodes(db) {
+        out.push(Picked {
+            id: n.id.to_string(),
+            content: n.content,
+            kind: PickKind::Pinned,
+            memory_type: n.memory_type,
+            score: 0.0,
+        });
+    }
+    for (kind, list) in [(PickKind::Lesson, &lessons), (PickKind::Learned, &results)] {
+        for (id, score) in list {
+            let Ok(node) = db.get_memory(*id) else {
+                continue;
+            };
+            let sid = id.to_string();
+            if is_pinned(&node) || out.iter().any(|p| p.id == sid) {
+                continue;
+            }
+            out.push(Picked {
+                id: sid,
+                content: node.content,
+                kind,
+                memory_type: node.memory_type,
+                score: *score,
+            });
+        }
+    }
+    out
+}
+
+fn type_label(t: MemoryType) -> &'static str {
+    match t {
+        MemoryType::AntiPattern => "⚠️ Anti-pattern",
+        MemoryType::Semantic => "📋 Finding",
+        MemoryType::Procedural => "🔧 Procedure",
+        MemoryType::Correction => "✏️ Correction",
+        MemoryType::Episodic => "📝 Note",
+        MemoryType::Reasoning => "💡 Reasoning",
+    }
+}
+
+/// The planner's memory context (the triage summary it plans from): the
+/// chosen memories under their headings. Returns the context and the ids it
+/// handed over.
+pub fn planner_context(picked: &[Picked]) -> (String, Vec<String>) {
+    let mut recalled: Vec<String> = Vec::new();
+    if picked.is_empty() {
         return (String::new(), recalled);
     }
-
     let mut context = String::from("## Agent Memory\n");
-    if !pinned.is_empty() {
+    let of = |k: PickKind| picked.iter().filter(move |p| p.kind == k);
+    if of(PickKind::Pinned).next().is_some() {
         context.push_str("Always follow these; your team pinned them for this repository:\n\n");
-        for (id, content) in &pinned {
-            context.push_str(&format!("- {content}\n"));
-            recalled.push(id.clone());
+        for p in of(PickKind::Pinned) {
+            context.push_str(&format!("- {}\n", p.content));
+            recalled.push(p.id.clone());
         }
         context.push('\n');
     }
-    let mut lesson_lines = Vec::new();
-    for (id, _) in &lessons {
-        let Ok(node) = db.get_memory(*id) else {
-            continue;
-        };
-        let id = id.to_string();
-        if node.tags.iter().any(|t| t == common::memory_meta::PINNED) || recalled.contains(&id) {
-            continue;
-        }
-        lesson_lines.push(format!("- {}\n", node.content));
-        recalled.push(id);
-    }
-    if !lesson_lines.is_empty() {
+    if of(PickKind::Lesson).next().is_some() {
         context.push_str(
             "Where similar fixes belonged before (your team's lessons for this repository; \
              check these first, before planning code):\n\n",
         );
-        for l in &lesson_lines {
-            context.push_str(l);
+        for p in of(PickKind::Lesson) {
+            context.push_str(&format!("- {}\n", p.content));
+            recalled.push(p.id.clone());
         }
         context.push('\n');
     }
-    if results.is_empty() {
-        return (context, recalled);
-    }
-    let mut learned = String::new();
-    for (id, score) in &results {
-        if let Ok(node) = db.get_memory(*id) {
-            let type_label = match node.memory_type {
-                MemoryType::AntiPattern => "⚠️ Anti-pattern",
-                MemoryType::Semantic => "📋 Finding",
-                MemoryType::Procedural => "🔧 Procedure",
-                MemoryType::Correction => "✏️ Correction",
-                MemoryType::Episodic => "📝 Note",
-                MemoryType::Reasoning => "💡 Reasoning",
-            };
-            let sid = id.to_string();
-            if node.tags.iter().any(|t| t == common::memory_meta::PINNED) || recalled.contains(&sid)
-            {
-                continue;
-            }
-            learned.push_str(&format!(
-                "- **{type_label}** (relevance: {score:.2}): {}\n",
-                node.content
+    if of(PickKind::Learned).next().is_some() {
+        context.push_str("Relevant learnings from past runs on this repository:\n\n");
+        for p in of(PickKind::Learned) {
+            context.push_str(&format!(
+                "- **{}** (relevance: {:.2}): {}\n",
+                type_label(p.memory_type),
+                p.score,
+                p.content
             ));
-            recalled.push(sid);
+            recalled.push(p.id.clone());
         }
     }
-    if !learned.is_empty() {
-        context.push_str("Relevant learnings from past runs on this repository:\n\n");
-        context.push_str(&learned);
-    }
     (context, recalled)
+}
+
+/// The memory context for a ticket (see [`select`] and [`planner_context`]).
+#[cfg(test)]
+fn recall_with(
+    db: &MenteDb,
+    embedding: &[f32],
+    query: &str,
+    k: usize,
+    now_micros: u64,
+) -> (String, Vec<String>) {
+    planner_context(&select(db, embedding, query, k, now_micros))
 }
 
 /// Where a learning came from: the run and ticket it was learned on.
@@ -303,6 +362,7 @@ impl AgentMemory {
                     lock_token: Some(lock_token),
                     dirty: false,
                     last_recalled: Vec::new(),
+                    last_picked: Vec::new(),
                 })
             }
             Err(e) => {
@@ -335,8 +395,10 @@ impl AgentMemory {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_micros() as u64;
-        let (context, recalled) = recall_with(&self.db, &embedding, query, k, now_micros);
+        let picked = select(&self.db, &embedding, query, k, now_micros);
+        let (context, recalled) = planner_context(&picked);
         self.last_recalled = recalled;
+        self.last_picked = picked;
         context
     }
 
@@ -401,7 +463,6 @@ impl AgentMemory {
         origin: &LearningOrigin,
     ) {
         let api_key = provider.api_key();
-        let model_id = provider.primary_model_id();
         if conversation_json.is_empty()
             || (api_key.is_empty() && !common::model_provider::is_bedrock())
         {
@@ -438,8 +499,36 @@ impl AgentMemory {
         if summary.len() < 200 {
             return; // too little content to extract from
         }
+        self.extract_and_store(
+            &summary,
+            provider,
+            origin,
+            "Analyze this AI coding agent conversation and extract ONLY genuinely useful learnings about this repository.",
+            &[],
+        )
+        .await;
+    }
 
-        let instructions = "Analyze this AI coding agent conversation and extract ONLY genuinely useful learnings about this repository. \
+    /// The extraction behind every learned memory: a model call turns
+    /// `summary` into at most five specific, reusable learnings (or none),
+    /// stored with their topic, origin and `extra_tags`. A near-verbatim
+    /// repeat of a stored one is skipped by the engine.
+    pub async fn extract_and_store(
+        &mut self,
+        summary: &str,
+        provider: &crate::agent::provider::ModelProvider,
+        origin: &LearningOrigin,
+        task: &str,
+        extra_tags: &[String],
+    ) {
+        let api_key = provider.api_key();
+        let model_id = provider.primary_model_id();
+        if summary.trim().is_empty()
+            || (api_key.is_empty() && !common::model_provider::is_bedrock())
+        {
+            return;
+        }
+        let instructions = format!("{task} \
              Output a JSON array of objects with \"type\" and \"content\" fields.\n\n\
              Types:\n\
              - \"style\": Code style preferences (naming conventions, formatting, patterns used)\n\
@@ -452,7 +541,7 @@ impl AgentMemory {
              - Each learning must be useful for future runs on this same repo\n\
              - Max 5 learnings. Quality over quantity. Return [] if nothing worth remembering.\n\
              - Content should be concise (1-2 sentences max)\n\n\
-             Answer with only the JSON array.";
+             Answer with only the JSON array.");
         let conversation = format!("Conversation:\n{summary}\n\nJSON array:");
 
         // Through the team's metered client (team-configured model; counted
@@ -463,7 +552,7 @@ impl AgentMemory {
             crate::agent::anthropic::converse_simple(
                 &provider.client(),
                 model_id,
-                instructions,
+                &instructions,
                 &conversation,
                 &mut scratch,
             ),
@@ -518,6 +607,7 @@ impl AgentMemory {
                 &origin.title,
             );
             tags.push(repo_tag.clone());
+            tags.extend(extra_tags.iter().cloned());
             self.store_learning(content, memory_type, tags).await;
             stored += 1;
         }
@@ -834,6 +924,93 @@ mod tests {
             1,
             "never listed twice"
         );
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn every_agent_is_handed_the_memories_relevant_to_its_work() {
+        use super::recall::{block, Agent};
+        let dir = std::env::temp_dir().join(format!("mentedb-agents-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = open_db(&dir, Box::new(MustNotEmbed)).unwrap();
+        let store = |text: &str, tags: Vec<String>| {
+            let mut n = MemoryNode::new(
+                AgentId::nil(),
+                MemoryType::Semantic,
+                text.into(),
+                words_vector(text),
+            );
+            n.tags = tags;
+            db.store_with_outcome(n).unwrap();
+        };
+        let run = |topic: &str| common::memory_meta::run_tags(topic, "run-0", "T-1", "older");
+        store(
+            "Retry calls to the billing gateway with the shared retry helper in billing/retry.rs, never a hand-written loop.",
+            run("code-style"),
+        );
+        store(
+            "Run the billing tests with make test-billing; plain cargo test skips the gateway fixtures.",
+            run("procedure"),
+        );
+        let mut pinned = common::memory_meta::person_tags("procedure", "a@example.com", true);
+        pinned.push("repo:acme/shop".into());
+        store(
+            "Every handler returns a typed error, never a bare string.",
+            pinned,
+        );
+        // Unrelated learnings, enough to fill a recall on their own.
+        for i in 0..12 {
+            store(
+                &format!("Marketing page note {i}: hero images are served from the media bucket."),
+                run("architecture"),
+            );
+        }
+        db.flush().unwrap();
+
+        // What each agent reads with: the PR, the comments and failing
+        // checks, the decision.
+        let cases = [
+            (
+                Agent::Reviewer,
+                "Retry the billing gateway call\nbilling/client.rs\nbilling/retry.rs",
+                "shared retry helper",
+            ),
+            (
+                Agent::Feedback,
+                "CI failed: billing tests, gateway fixtures missing under cargo test",
+                "make test-billing",
+            ),
+            (
+                Agent::Coder,
+                "Billing gateway calls time out; add a retry to the billing client",
+                "shared retry helper",
+            ),
+            (
+                Agent::StopJudge,
+                "Billing tests fail in the sandbox: gateway fixtures not found",
+                "make test-billing",
+            ),
+        ];
+        for (agent, query, expect) in cases {
+            let picked = select(&db, &words_vector(query), query, 5, now_micros());
+            let b = block(agent, &picked);
+            let all = b.lines.join("\n");
+            assert!(all.contains(expect), "{agent:?} missed {expect:?}: {all}");
+            // Ranked ahead of anything unrelated to the work.
+            let at = |t: &str| b.lines.iter().position(|l| l.contains(t));
+            if let Some(unrelated) = at("Marketing page note") {
+                assert!(at(expect).unwrap() < unrelated, "{agent:?}: {all}");
+            }
+            // The pinned memory always comes along, first.
+            assert!(b.lines[0].starts_with("Every handler returns a typed error"));
+            // Only what clears the relevance floor, inside the budget.
+            assert!(b.labels.len() <= 1 + MAX_LESSONS + 5, "{agent:?}");
+            assert!(b.text.len() <= agent.budget() + 2_000, "{agent:?}");
+            if agent != Agent::StopJudge {
+                assert!(b.text.contains(&format!("[{}]", b.labels[0].0)));
+            }
+        }
         db.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }

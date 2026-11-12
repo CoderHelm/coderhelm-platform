@@ -289,6 +289,11 @@ pub struct Picture {
     /// log (`decision_log::overturned_lines`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub overturned: Vec<String>,
+    /// What the repository's memories say that bears on this decision (how
+    /// the team works, past fixes, corrections), one line each, chosen by
+    /// relevance to it. Context for the judge, never evidence on their own.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub memories: Vec<String>,
 }
 
 /// Longest text of one field in the prompt and the stored record.
@@ -296,6 +301,8 @@ const MAX_FIELD: usize = 6_000;
 const MAX_ITEMS: usize = 40;
 /// Most overturned decisions shown to the judge.
 pub const MAX_OVERTURNED: usize = 5;
+/// Most repository memories shown to the judge.
+pub const MAX_MEMORIES: usize = 5;
 
 impl Picture {
     pub fn new(kind: Kind, step: &str, reason: &str) -> Self {
@@ -316,6 +323,7 @@ impl Picture {
         self.related.truncate(MAX_ITEMS);
         self.results.truncate(MAX_ITEMS);
         self.overturned.truncate(MAX_OVERTURNED);
+        self.memories.truncate(MAX_MEMORIES);
         for (i, e) in self.evidence.iter_mut().enumerate() {
             if e.id.trim().is_empty() {
                 e.id = format!("E{}", i + 1);
@@ -721,6 +729,17 @@ pub fn prompt(p: &Picture) -> String {
         }
         s.push('\n');
     }
+    if !p.memories.is_empty() {
+        s.push_str(
+            "## What this repository's memories say\nLearned on earlier work here or written by \
+             the team. Context, not evidence: a memory never makes a stop or a question needed \
+             on its own, and the code and results above win where they disagree.\n",
+        );
+        for m in &p.memories {
+            s.push_str(&format!("- {}\n", clip(m)));
+        }
+        s.push('\n');
+    }
     s.push_str(&format!("## Budget\n{}\n", p.budget.line()));
     s
 }
@@ -1009,6 +1028,26 @@ mod tests {
             "reason":"r","reversible":true,"ticket_title":"","ticket_body":""}))
         .unwrap();
         assert!(old.overturned.is_empty());
+    }
+
+    #[test]
+    fn repository_memories_reach_the_prompt_bounded_as_context() {
+        let mut p = picture(Kind::Block);
+        assert!(!prompt(&p).contains("memories say"));
+        p.memories = (0..8)
+            .map(|i| format!("memory number {i}: run the tests from services/"))
+            .collect();
+        let p = p.with_ids();
+        assert_eq!(p.memories.len(), MAX_MEMORIES);
+        let text = prompt(&p);
+        assert!(text.contains("## What this repository's memories say"));
+        assert!(text.contains("Context, not evidence"));
+        assert!(text.contains("- memory number 0:"));
+        assert!(!text.contains("memory number 5"));
+        let old: Picture = serde_json::from_value(json!({"kind":"block","step":"review",
+            "reason":"r","reversible":true,"ticket_title":"","ticket_body":""}))
+        .unwrap();
+        assert!(old.memories.is_empty());
     }
 
     fn proceed(a: &str) -> Value {

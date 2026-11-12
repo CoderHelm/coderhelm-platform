@@ -13,6 +13,9 @@ const TITLE: &str = "title:";
 const BY: &str = "by:";
 const SOURCE: &str = "source:";
 const EDITED_BY: &str = "edited-by:";
+/// The agent whose outcome taught a memory, when it wasn't the coding agent's
+/// own ticket (`feedback`: a fix a person asked for on a pull request).
+const LEARNED_BY: &str = "learned-by:";
 
 /// The topics a memory can be about, as tag, label for people, and the order
 /// they are shown in.
@@ -40,6 +43,10 @@ pub struct Origin {
     pub added_by: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub edited_by: String,
+    /// The agent that learned it, when not the coding agent (see
+    /// [`learned_by_tag`]).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub learned_by: String,
 }
 
 /// Everything the tags say, plus the ones that mean nothing here.
@@ -124,6 +131,8 @@ pub fn parse(tags: &[String]) -> Meta {
             m.origin.added_by = v.into();
         } else if let Some(v) = t.strip_prefix(EDITED_BY) {
             m.origin.edited_by = v.into();
+        } else if let Some(v) = t.strip_prefix(LEARNED_BY) {
+            m.origin.learned_by = v.into();
         } else if let Some(v) = t.strip_prefix(SOURCE) {
             m.origin.source = v.into();
         } else if TOPICS.iter().any(|(k, _)| k == t) {
@@ -173,6 +182,68 @@ pub fn usage_prefix(owner: &str, name: &str) -> String {
     format!("MEMUSE#{owner}/{name}#")
 }
 
+/// The tag saying which agent learned a memory (see [`Origin::learned_by`]).
+pub fn learned_by_tag(agent: &str) -> String {
+    format!("{LEARNED_BY}{agent}")
+}
+
+/// The agents that read a repository's memories, as id and name, in the
+/// order the dashboard lists them. Each one counts what it read under
+/// [`agent_use_sk`].
+pub const AGENTS: &[(&str, &str)] = &[
+    ("reviewer", "Reviewer"),
+    ("planner", "Planner"),
+    ("coder", "Coding agent"),
+    ("feedback", "Feedback agent"),
+    ("stop_judge", "Stop judge"),
+];
+
+/// Where one agent's reads of a repository's memories are counted for a
+/// day: one item per agent and day in the settings table under the team,
+/// with `reads` (times it read them) and `memories` (memories handed over).
+/// The per-memory count ([`usage_sk`]) says which memories are used; this
+/// says which agents use them.
+pub fn agent_use_sk(owner: &str, name: &str, agent: &str, day: &str) -> String {
+    format!("MEMAGENT#{owner}/{name}#{agent}#{day}")
+}
+
+pub fn agent_use_prefix(owner: &str, name: &str) -> String {
+    format!("MEMAGENT#{owner}/{name}#")
+}
+
+/// One agent's reads in a window: how often it read the memories and how
+/// many it was handed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct AgentUse {
+    pub reads: u64,
+    pub memories: u64,
+}
+
+/// Sums the per-day items (`(sort key, reads, memories)`) of the agents
+/// under `prefix` for the days from `since` (a `YYYY-MM-DD` date) on.
+pub fn agent_uses_since(
+    prefix: &str,
+    items: &[(String, u64, u64)],
+    since: &str,
+) -> std::collections::HashMap<String, AgentUse> {
+    let mut out: std::collections::HashMap<String, AgentUse> = Default::default();
+    for (sk, reads, memories) in items {
+        let Some(rest) = sk.strip_prefix(prefix) else {
+            continue;
+        };
+        let Some((agent, day)) = rest.rsplit_once('#') else {
+            continue;
+        };
+        if day < since {
+            continue;
+        }
+        let u = out.entry(agent.to_string()).or_default();
+        u.reads += reads;
+        u.memories += memories;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,6 +291,64 @@ mod tests {
             1
         );
         assert_eq!(again.iter().filter(|t| t.starts_with(EDITED_BY)).count(), 1);
+    }
+
+    #[test]
+    fn a_memory_says_which_agent_learned_it() {
+        let mut tags = run_tags("procedure", "01RUN", "", "Fix CI");
+        tags.push(learned_by_tag("feedback"));
+        let m = parse(&tags);
+        assert_eq!(m.origin.learned_by, "feedback");
+        assert_eq!(m.origin.source, "run");
+        assert!(parse(&run_tags("procedure", "", "", ""))
+            .origin
+            .learned_by
+            .is_empty());
+    }
+
+    #[test]
+    fn agent_reads_are_summed_per_agent_inside_the_window() {
+        let p = agent_use_prefix("acme", "web");
+        let items = vec![
+            (agent_use_sk("acme", "web", "reviewer", "2026-11-10"), 3, 9),
+            (agent_use_sk("acme", "web", "reviewer", "2026-11-12"), 1, 2),
+            // Before the window.
+            (
+                agent_use_sk("acme", "web", "reviewer", "2026-10-01"),
+                50,
+                50,
+            ),
+            (
+                agent_use_sk("acme", "web", "stop_judge", "2026-11-11"),
+                2,
+                4,
+            ),
+            // Another repository whose name starts the same way.
+            (
+                agent_use_sk("acme", "web-admin", "coder", "2026-11-11"),
+                7,
+                7,
+            ),
+        ];
+        let u = agent_uses_since(&p, &items, "2026-10-13");
+        assert_eq!(
+            u["reviewer"],
+            AgentUse {
+                reads: 4,
+                memories: 11
+            }
+        );
+        assert_eq!(
+            u["stop_judge"],
+            AgentUse {
+                reads: 2,
+                memories: 4
+            }
+        );
+        assert!(!u.contains_key("coder"), "{u:?}");
+        assert_eq!(u.len(), 2);
+        // Every agent the dashboard lists has a name.
+        assert!(AGENTS.iter().any(|(id, _)| *id == "stop_judge"));
     }
 
     #[test]

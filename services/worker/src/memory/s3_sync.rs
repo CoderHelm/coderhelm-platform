@@ -24,8 +24,22 @@ pub async fn download_memory(
     repo_owner: &str,
     repo_name: &str,
 ) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
-    let key = memory_key(team_id, repo_owner, repo_name);
     let local_dir = PathBuf::from(format!("/tmp/mentedb/{team_id}/{repo_owner}/{repo_name}"));
+    download_memory_to(s3, bucket, team_id, repo_owner, repo_name, local_dir).await
+}
+
+/// Download a memory snapshot into `local_dir` (emptied first). A reader that
+/// never uploads uses a directory of its own, so it can't touch the files
+/// of a run that holds the repository's memory in the same container.
+pub async fn download_memory_to(
+    s3: &S3Client,
+    bucket: &str,
+    team_id: &str,
+    repo_owner: &str,
+    repo_name: &str,
+    local_dir: PathBuf,
+) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+    let key = memory_key(team_id, repo_owner, repo_name);
 
     // Clean up any leftover from previous invocation
     if local_dir.exists() {
