@@ -701,8 +701,8 @@ pub fn ground(findings: &mut [Finding], team_rules: &str) -> Grounded {
                 if !was_held {
                     let why = format!(
                         "This blocks: {}, so the code fails on a success path. It runs once in \
-                         production with no automatic retry, so a person would have to finish \
-                         the work by hand; how rarely the code is returned doesn't lower that. \
+                         production with no automatic retry, so a failure leaves the work \
+                         half done with nothing to redo it; how rarely the code is returned doesn't lower that. \
                          Source: {}.",
                         doc.meaning,
                         f.source.as_deref().unwrap_or(doc.source).trim()

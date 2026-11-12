@@ -127,8 +127,8 @@ fn the_pipeline_pauses_at_each_place_github_can_refuse() {
         implement
             .matches("if crate::clients::github::outside_wait(&*e).is_some() {")
             .count(),
-        2,
-        "the remediation rounds don't swallow a pause"
+        3,
+        "the remediation and keep-going rounds don't swallow a pause"
     );
 
     let rp = run_passes_src();

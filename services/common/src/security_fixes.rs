@@ -2965,9 +2965,9 @@ pub fn ticket_body_with(
     if major_in_pr {
         s.push_str("   A major version is needed: follow its upgrade guide, change every call site of the APIs it changed, and fix the code it breaks so the build, type check and tests pass.\n");
     }
-    s.push_str("4. Before you finish, call run_checks (build, type check, tests). Fix what the upgrade breaks. If a check still fails, never say it passes: write which check fails and why under `### Not fixed` in your description; the pull request then stays a draft.\n");
+    s.push_str("4. Before you finish, call run_checks (build, type check, tests). Fix what the upgrade breaks. When a fix doesn't take, change the approach: read the full error, the package's upgrade guide and changelog, and the failing call site, then fix again and run the checks again. If a check still fails after that, never say it passes: write which check fails and why under `### Not fixed` in your description; the pull request then stays a draft.\n");
     s.push_str("   Never edit documentation (README, CHANGELOG, docs) for these bumps unless this ticket asks for it: the pull request's description says what changed.\n");
-    s.push_str("5. In your description, for each package write `### <package> <from> to <to>` with the breaking changes you found and how each was handled (file and line), the files you changed for it, and anything a person should look at (behaviour at runtime, configuration, environment).\n");
+    s.push_str("5. In your description, for each package write `### <package> <from> to <to>` with the breaking changes you found and how each was handled (file and line), the files you changed for it, and what you checked for behaviour at runtime, configuration and environment.\n");
     s.push_str("\n## Advisories\n");
     for f in members {
         s.push_str(&format!(

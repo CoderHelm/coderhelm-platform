@@ -1112,6 +1112,7 @@ pub mod outcome;
 pub mod outside_exec;
 pub mod outside_work;
 pub mod own_review;
+pub mod ownership;
 mod plan;
 pub mod plan_chat;
 pub(crate) mod plan_coverage;
@@ -5505,13 +5506,13 @@ async fn run_passes(
                     msg.repo_name
                 )
             });
-            let raw_clarification = elsewhere_note.as_deref().unwrap_or("I ran but produced no file changes for this issue.\n\n\
-                 If the issue already spells out the change (the exact file(s) and the values/content \
-                 to write), this is usually a transient miss on my side — **re-run it** and it \
-                 typically goes through.\n\n\
-                 If details are actually missing, add them and re-trigger — for example:\n\
+            let raw_clarification = elsewhere_note.as_deref().unwrap_or(
+                "I made no file changes for this ticket, after a second attempt with a different \
+                 approach: the ticket doesn't say what to change in a way I can act on. One answer \
+                 lets me finish it:\n\
                  - Which file(s) or component(s) should change?\n\
-                 - The expected vs. current behavior, or the exact values/content to use?");
+                 - The expected vs. current behavior, or the exact values/content to use?",
+            );
             let clarification =
                 formatter::format_with_voice(state, &voice, raw_clarification, &provider, usage)
                     .await;

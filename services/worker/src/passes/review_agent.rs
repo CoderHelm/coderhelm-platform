@@ -2660,7 +2660,7 @@ pub const BLOCKING_RULE: &str =
      ONE-SHOT PATHS: code that runs in production and that nothing retries or rolls back \
      automatically (instance startup and user data scripts, provisioning, migrations, deploy \
      and release steps, cron that runs once, writes to stored data) sets `one_shot`: true and \
-     is judged strictly: a failure there leaves a person to finish the work by hand, so even \
+     is judged strictly: a failure there leaves the work half done in production with nothing to redo it, so even \
      an unchecked concern there blocks, and a documented failure is never \"hardening\". \
      THE PR'S OWN GOAL: read the title and description for what the PR says it fixes or \
      achieves, and compare. A finding that the change doesn't achieve it (the very problem it \

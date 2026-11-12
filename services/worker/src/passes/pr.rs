@@ -179,7 +179,7 @@ the change copies, the merge order of a multi-repo change, **Not in this PR** an
 Don't write them, and don't add a warning or note banner anywhere.
 - Verification says the change works only where its real output (the real API response or page) \
 was checked and shows it. A matching filter or a passing test is not that; otherwise write \
-**Unproven** and the exact check a person should run.
+**Unproven**, the exact check that proves it, and why CoderHelm could not run it.
 - Write real values: every path, name and id in full, with its environment filled in \
 (`/app/prod/db-password`, never `/app//db-password`), never a template left as `${env}`, `<env>`, \
 `{}` or empty backticks.
@@ -2262,7 +2262,9 @@ mod refresh_tests {
         let rules = super::SHAPE_RULES;
         assert!(rules.contains("real output (the real API response or page)"));
         assert!(rules.contains("A matching filter or a passing test is not that"));
-        assert!(rules.contains("**Unproven** and the exact check a person should run"));
+        assert!(rules.contains(
+            "**Unproven**, the exact check that proves it, and why CoderHelm could not run it"
+        ));
         assert!(rules.contains("Deploy claims come only from what was read"));
         assert!(rules.contains("CI workflows and module wiring"));
         assert!(rules.contains("docs go stale"));

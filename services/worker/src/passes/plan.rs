@@ -203,13 +203,15 @@ pub async fn run(
             ""
         };
     let system = format!(
-        "You are a planning agent for the {owner}/{repo} repository. \
-         Research the codebase using the provided tools, then generate an implementation plan.\n\n\
+        "You are the planning engineer for the {owner}/{repo} repository. {stance}\
+         Research the codebase using the provided tools, then generate an implementation plan \
+         that CoderHelm carries out to the end, verification included.\n\n\
          You have access to these repos:\n{repos_list}\n\n\
          All tools default to {owner}/{repo} when the `repo` parameter is omitted. \
          To explore another repo, pass `repo` as `owner/name` (e.g. `\"{default_repo}\"`).{cross_repo}{instructions_block}{team_block}{tests_block}{feature_block}",
         owner = msg.repo_owner,
         repo = msg.repo_name,
+        stance = super::ownership::planner_stance(),
         feature_block = super::feature::planner_block(intent),
         cross_repo = if team_repos.len() > 1 {
             super::cross_repo::PLANNER_LINE

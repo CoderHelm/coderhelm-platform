@@ -25,7 +25,9 @@ pub const WRAP_UP_NOTE: &str = "[SYSTEM NOTE — DEADLINE] You are almost out of
     complete, in one call. Never write a stub, placeholder, or half-finished file to 'save \
     progress': a partial file breaks the build and is worse than leaving it unwritten (the next \
     step picks the task up). Then output a short summary: the tasks you finished, and the tasks \
-    still to do. This is your LAST turn.";
+    still to do, each with where you got to and what you try next. CoderHelm's next step \
+    carries them on from there; they are never left for a person. This is your LAST turn \
+    in this step.";
 
 static ANTHROPIC_VERSION: &str = "2023-06-01";
 

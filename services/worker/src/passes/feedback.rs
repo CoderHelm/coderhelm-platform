@@ -473,7 +473,7 @@ pub async fn run(
         && msg.review_body.trim().is_empty()
         && !super::claim_auto_fix_slot(state, &msg.team_id, &msg.run_id).await
     {
-        hand_off_to_human(state, &github, &msg).await;
+        end_auto_fix_rounds(state, &github, &msg).await;
         return Ok(());
     }
     // A person asked for this: the run guard's counts start over. A cycle only
@@ -597,9 +597,10 @@ pub async fn run(
     )
     .await;
     let system = format!(
-        "You are a feedback agent for the {owner}/{repo} repository. \
-         You respond to reviewer comments on pull requests by reading and writing files \
-         directly to the PR branch. \
+        "You are the engineer answering reviewer comments on a pull request in the \
+         {owner}/{repo} repository, by reading and writing files directly to the PR branch. \
+         {stance}Every change a comment asks for is made, checked and working when you \
+         finish; a reply says what you did and what you checked. \
          If a comment requests a code change, commit it — use edit_file for targeted edits \
          (the default, and the ONLY safe option for a few lines in a large file), and write_file \
          or batch_write only for new files or whole-file rewrites — then confirm briefly. \
@@ -615,6 +616,7 @@ pub async fn run(
          Your output is posted directly as a GitHub comment — write natural replies, no meta-commentary.{voice_block}{team_block}{tests_block}{logs_block}{memory_block}",
         logs_block = super::review_fix::logs::GUIDANCE,
         memory_block = repo_memory.text,
+        stance = super::ownership::coder_stance(),
         owner = msg.repo_owner,
         repo = msg.repo_name,
     );
@@ -3106,7 +3108,7 @@ async fn handle_wrong_repo(
     });
 
     if state.config.ticket_queue_url.is_empty() {
-        warn!("TICKET_QUEUE_URL not configured — cannot re-trigger in new repo");
+        warn!("TICKET_QUEUE_URL not configured — cannot start the run in the new repo");
         return Ok(());
     }
 
@@ -3158,7 +3160,7 @@ async fn handle_wrong_repo(
         from = %format!("{}/{}", msg.repo_owner, msg.repo_name),
         to = %target_repo,
         ticket_id = %ticket_id,
-        "Wrong-repo: closed PR and re-triggered in correct repo"
+        "Wrong-repo: closed PR and started the run in the correct repo"
     );
 
     Ok(())
@@ -3495,7 +3497,7 @@ const CANCEL_PR_CLOSED_BY_HUMAN: &str = "pr_closed_by_human";
 
 /// Whether the run has been cancelled (consistent read — cancel must win
 /// against a racing pass).
-/// Hand a PR to a human after the automated-fix budget is spent.
+/// End the automated CI fix rounds on a PR once their budget is spent.
 ///
 /// Ordering matters for crash-safety. The RELIABLE, idempotent signals run
 /// first — mark the PR ready and finalize the run (cancel-guarded, clearing the
@@ -3505,7 +3507,7 @@ const CANCEL_PR_CLOSED_BY_HUMAN: &str = "pr_closed_by_human";
 /// `handoff_notified` marker so repeated webhooks on the now-finalized run don't
 /// spam the PR. If the comment is lost to a crash, the PR is already marked
 /// ready — the worst case is a missing comment, never a stuck draft.
-async fn hand_off_to_human(state: &WorkerState, github: &GitHubClient, msg: &FeedbackMessage) {
+async fn end_auto_fix_rounds(state: &WorkerState, github: &GitHubClient, msg: &FeedbackMessage) {
     use aws_sdk_dynamodb::types::AttributeValue;
 
     // Respect a cancel (best-effort early out; the status write below is also
@@ -3578,26 +3580,26 @@ async fn hand_off_to_human(state: &WorkerState, github: &GitHubClient, msg: &Fee
         .await
         .is_ok();
     if first_notify {
-        warn!(run_id = %msg.run_id, "Auto-fix budget spent — handed PR to human");
-        super::add_progress_note(
-            state,
-            &msg.team_id,
-            &msg.run_id,
-            "Reached the automated-fix limit without getting CI green — handed off for human review.",
-        )
-        .await;
+        warn!(run_id = %msg.run_id, "Auto-fix budget spent: CI fix rounds stop on this pull request");
+        let note = auto_fix_spent_note();
+        super::add_progress_note(state, &msg.team_id, &msg.run_id, &note).await;
         let _ = github
-            .create_issue_comment(
-                &msg.repo_owner,
-                &msg.repo_name,
-                msg.pr_number,
-                "🤝 CoderHelm hit its automated-fix limit on this PR without getting CI green, so \
-                 it's handed off for human review. If this needs generated files (e.g. Sanity \
-                 types) regenerated, that step has to be run locally — the sandbox can't run \
-                 codegen that needs project configuration.",
-            )
+            .create_issue_comment(&msg.repo_owner, &msg.repo_name, msg.pr_number, &note)
             .await;
     }
+}
+
+/// What CoderHelm says when its CI fix rounds on a pull request are spent:
+/// what it did, where the pull request stands, and what starts the next
+/// round. Never a hand-off.
+fn auto_fix_spent_note() -> String {
+    format!(
+        "CoderHelm ran {} fix rounds on this pull request's CI and it is still red; the failing \
+         checks are listed on the pull request, which stays held until they pass. CoderHelm \
+         stops starting rounds on its own here so the pull request doesn't loop, and a comment \
+         naming a change starts the next round right away.",
+        super::MAX_AUTO_FIX_PUSHES
+    )
 }
 
 /// A person ended the run (cancelled or closed it): no feedback runs on it.
