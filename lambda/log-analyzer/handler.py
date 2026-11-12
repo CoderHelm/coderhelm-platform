@@ -1,7 +1,10 @@
 """
 Coderhelm Log Analyzer Lambda
 
-Triggered by EventBridge every 6 hours. For each team with an AWS connection:
+Triggered by EventBridge every 6 hours (a full analysis), and every few
+minutes in watch mode (`{"mode": "watch"}`, see `watch`): one cheap count of
+error lines per log group, and a focused analysis at once when a group
+spikes. For each team with an AWS connection, a full analysis does:
 1. AssumeRole into the customer's account
 2. Run pre-built CloudWatch Logs Insights queries, counted per log group
    and stream (@log, @logStream)
@@ -52,6 +55,9 @@ usage.SETTINGS_TABLE = SETTINGS_TABLE
 # Outbound webhook events go on this queue (empty: none are sent). The
 # worker sends them to the team's endpoints (common::webhooks).
 WEBHOOK_QUEUE_URL = os.environ.get("WEBHOOK_QUEUE_URL", "")
+# The worker's queue: a watch that stores a new finding asks the worker to
+# act on it now instead of at its hourly sweep (empty: it waits for that).
+TICKET_QUEUE_URL = os.environ.get("TICKET_QUEUE_URL", "")
 # Must equal common::webhooks::catalog::API_VERSION (a Rust test checks).
 WEBHOOK_API_VERSION = "2026-10-26"
 
@@ -177,7 +183,10 @@ def scrub_secrets(text):
 
 
 def handler(event, context):
-    """EventBridge scheduled handler — runs every 6 hours."""
+    """EventBridge scheduled handler: a full analysis every 6 hours, a watch
+    every few minutes."""
+    if isinstance(event, dict) and event.get("mode") == "watch":
+        return watch()
     logger.info("Log analyzer started")
 
     # Scan all teams with AWS connections
@@ -289,8 +298,11 @@ def lookback_window(hours=None):
     return end - int(hours or LOOKBACK_HOURS) * 3600, end
 
 
-def analyze_connection(conn):
-    """Analyze a single AWS connection — AssumeRole, query logs, generate recommendations."""
+def analyze_connection(conn, lookback_hours=None, only_groups=None, resolve=True):
+    """Analyze a single AWS connection — AssumeRole, query logs, generate recommendations.
+
+    A watch's analysis reads only the groups that spiked, over a short
+    window, and resolves nothing (it didn't read everything)."""
     team_id = conn["team_id"]
     account_id = conn["account_id"]
 
@@ -304,8 +316,8 @@ def analyze_connection(conn):
         return 0
 
     cw_logs = logs_client_for(conn)
-    log_groups = log_groups_for(conn, cw_logs)
-    start, end = lookback_window()
+    log_groups = list(only_groups) if only_groups else log_groups_for(conn, cw_logs)
+    start, end = lookback_window(lookback_hours)
 
     # Run queries and collect results. A query that fails is not "no errors":
     # nothing in the log groups it covered is auto-resolved this run (the
@@ -347,7 +359,8 @@ def analyze_connection(conn):
             logger.info(f"No errors found for {team_id}/{account_id}")
         # Every query that ran found nothing: those groups' findings are no
         # longer erroring.
-        resolve_stale_recommendations(team_id, existing, set(), skip_groups=failed_groups)
+        if resolve:
+            resolve_stale_recommendations(team_id, existing, set(), skip_groups=failed_groups)
         return 0
 
     # One entry per log group and message, each with its own counts and times.
@@ -395,7 +408,7 @@ def analyze_connection(conn):
     # which group a line was in, so then nothing is resolved.
     if check_failed:
         logger.warning(f"{team_id}/{account_id}: an attribution check failed, skipping resolution")
-    else:
+    elif resolve:
         resolve_stale_recommendations(team_id, existing, seen_ids, skip_groups=failed_groups)
 
     notify_new_recommendations(team_id, account_id, new_recs)
@@ -1434,3 +1447,164 @@ def chunk_list(lst, chunk_size):
     """Split a list into chunks."""
     for i in range(0, len(lst), chunk_size):
         yield lst[i : i + chunk_size]
+
+
+# ── Watch: new error spikes within minutes ──────────────────────
+
+# The full analysis runs every 6 hours; an error that starts just after one
+# waited up to 6 hours to be seen, then up to an hour for the automatic-fix
+# sweep. The watch counts error lines per log group every few minutes (one
+# Logs Insights query per 50 groups, over the last few minutes only) and
+# runs a focused analysis of the groups that spiked at once, then asks the
+# worker to act on what it stored.
+
+# How often the watch runs (its EventBridge schedule) and the window it reads.
+WATCH_MINUTES = int(os.environ.get("WATCH_MINUTES", "5"))
+# Lines are searchable a little after they are written: the window ends here.
+WATCH_DELAY_SECONDS = 60
+# A spike: at least this many error lines in a window, and this many times
+# the group's usual count.
+WATCH_MIN_LINES = 50
+WATCH_FACTOR = 5
+# How fast the usual count follows the windows (exponential average).
+WATCH_EWMA = 0.2
+# A focused analysis per connection at most this often and this many a day,
+# so a noisy account can't run up model calls.
+WATCH_COOLDOWN_MINUTES = 30
+WATCH_MAX_ANALYSES_PER_DAY = 24
+# A focused analysis reads this far back (the spike and a little before it).
+WATCH_LOOKBACK_HOURS = 1
+
+WATCH_COUNT_QUERY = (
+    "filter @message like /(?i)(error|exception|fatal|critical|panic|traceback|ENOTFOUND|timed out|refused|unavailable)/"
+    " | filter @message not like /(?i)(healthcheck|ping|OPTIONS)/"
+    " | stats count(*) as n by @log"
+)
+
+
+def spiking(counts, baseline, min_lines=WATCH_MIN_LINES, factor=WATCH_FACTOR):
+    """Pure: the log groups whose error lines this window are a spike: at
+    least `min_lines`, and `factor` times their usual count."""
+    out = []
+    for group, n in sorted(counts.items()):
+        usual = float(baseline.get(group, 0) or 0)
+        if n >= min_lines and n >= factor * usual:
+            out.append(group)
+    return out
+
+
+def next_baseline(counts, baseline, weight=WATCH_EWMA):
+    """Pure: every watched group's usual count after this window (a group
+    with no lines this window counts 0). A spike moves it only a little."""
+    out = {}
+    for group in set(baseline) | set(counts):
+        n = float(counts.get(group, 0))
+        old = float(baseline.get(group, n) or 0)
+        out[group] = round((1 - weight) * old + weight * n, 2)
+    # Keep the record small: groups quiet for long drop out.
+    return {g: v for g, v in out.items() if v >= 0.05}
+
+
+def watch_due(state, now, cooldown=WATCH_COOLDOWN_MINUTES, per_day=WATCH_MAX_ANALYSES_PER_DAY):
+    """Pure: whether a focused analysis may run now (cooldown and daily cap)."""
+    last = int(state.get("last_analysis", 0) or 0)
+    day = time.strftime("%Y-%m-%d", time.gmtime(now))
+    used = int(state.get("analyses", 0) or 0) if state.get("day") == day else 0
+    return now - last >= cooldown * 60 and used < per_day
+
+
+def count_errors(cw_logs, log_groups, start, end, run=None):
+    """Error lines per log group in [start, end]: {group: n}. Groups whose
+    query failed are left out."""
+    run = run or run_insights_query
+    counts = {}
+    for batch in chunk_list(log_groups, 50):
+        rows = run(cw_logs, batch, WATCH_COUNT_QUERY, start, end)
+        for row in rows or []:
+            _, group = attribution.split_log(row.get("@log"), tuple(batch))
+            if group:
+                counts[group] = counts.get(group, 0) + (attribution.as_int(row.get("n")) or 0)
+    return counts
+
+
+def watch_key(account_id):
+    return f"WATCH#{account_id}"
+
+
+def load_watch_state(team_id, account_id):
+    try:
+        item = aws_insights_table.get_item(Key={"pk": team_id, "sk": watch_key(account_id)}).get("Item") or {}
+        return json.loads(item.get("state") or "{}")
+    except Exception as e:
+        logger.warning(f"{team_id}/{account_id}: watch state unreadable ({e}); starting fresh")
+        return {}
+
+
+def save_watch_state(team_id, account_id, state):
+    try:
+        aws_insights_table.put_item(Item={
+            "pk": team_id,
+            "sk": watch_key(account_id),
+            "state": json.dumps(state, sort_keys=True),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        })
+    except Exception as e:
+        logger.warning(f"{team_id}/{account_id}: watch state not saved ({e})")
+
+
+def ask_worker_to_act(send=None):
+    """Ask the worker's automatic-fix sweep to run now (it acts only for
+    teams that turned automatic fixes on)."""
+    if not TICKET_QUEUE_URL:
+        return False
+    send = send or (lambda body: sqs_client.send_message(QueueUrl=TICKET_QUEUE_URL, MessageBody=body))
+    try:
+        send(json.dumps({"type": "log_autofix"}))
+        return True
+    except Exception as e:
+        logger.warning(f"Could not ask the worker to act on new findings: {e}")
+        return False
+
+
+def watch_connection(conn, now=None, logs=None, count=None, analyze=None, state_io=None, act=None):
+    """One watch of one connection. Returns the groups analyzed (empty when
+    nothing spiked or the analysis wasn't due)."""
+    now = int(now or time.time())
+    team_id, account_id = conn["team_id"], conn["account_id"]
+    cw_logs = logs if logs is not None else logs_client_for(conn)
+    groups = log_groups_for(conn, cw_logs)
+    end = now - WATCH_DELAY_SECONDS
+    start = end - WATCH_MINUTES * 60
+    counts = (count or count_errors)(cw_logs, groups, start, end)
+    load, save = state_io or (load_watch_state, save_watch_state)
+    state = load(team_id, account_id)
+    baseline = state.get("baseline", {})
+    spikes = spiking(counts, baseline)
+    state["baseline"] = next_baseline(counts, baseline)
+    analyzed = []
+    if spikes and watch_due(state, now):
+        day = time.strftime("%Y-%m-%d", time.gmtime(now))
+        state["analyses"] = (int(state.get("analyses", 0) or 0) if state.get("day") == day else 0) + 1
+        state["day"] = day
+        state["last_analysis"] = now
+        logger.info(f"{team_id}/{account_id}: error spike in {', '.join(spikes)}; analyzing now")
+        new = (analyze or analyze_connection)(
+            conn, lookback_hours=WATCH_LOOKBACK_HOURS, only_groups=spikes, resolve=False
+        )
+        analyzed = spikes
+        if new:
+            (act or ask_worker_to_act)()
+    save(team_id, account_id, state)
+    return analyzed
+
+
+def watch(now=None):
+    """Watch every active connection once."""
+    analyzed = 0
+    for conn in scan_aws_connections():
+        try:
+            if watch_connection(conn, now):
+                analyzed += 1
+        except Exception as e:
+            logger.error(f"Watch failed for {conn['team_id']}/{conn['account_id']}: {e}", exc_info=True)
+    return {"statusCode": 200, "analyzed": analyzed}

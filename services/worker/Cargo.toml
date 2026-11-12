@@ -40,6 +40,8 @@ aws-sdk-eks = { version = "1", default-features = false, features = ["default-ht
 aws-sdk-rds = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-sdk-elasticache = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-sdk-opensearch = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+# log_autofix: what changed on a resource behind a log error (read-only)
+aws-sdk-cloudtrail = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-sdk-ssm = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-sdk-ecr = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 # infra_inventory, when a team turns them on: Amazon Inspector findings and

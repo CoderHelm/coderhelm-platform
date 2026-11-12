@@ -355,6 +355,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-cloudtrail"
+version = "1.132.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8070c4580ff1298db2ef8210726e361893739b270012096286f4f08635cf1d46"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-cloudwatch"
 version = "1.142.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5715,6 +5740,7 @@ dependencies = [
  "aws-config",
  "aws-sdk-autoscaling",
  "aws-sdk-bedrockruntime",
+ "aws-sdk-cloudtrail",
  "aws-sdk-cloudwatchlogs",
  "aws-sdk-codebuild",
  "aws-sdk-dynamodb",

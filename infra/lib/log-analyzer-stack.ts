@@ -27,6 +27,9 @@ interface LogAnalyzerStackProps extends cdk.StackProps {
   secretsKey: kms.Key;
   /** New and resolved findings go here as webhook events (log_finding.*). */
   webhookQueue: sqs.IQueue;
+  /** The worker's queue: a watch that stores a new finding asks the
+   *  automatic-fix sweep to act now ({"type": "log_autofix"}). */
+  ticketQueue: sqs.IQueue;
 }
 
 export class LogAnalyzerStack extends cdk.Stack {
@@ -91,6 +94,8 @@ export class LogAnalyzerStack extends cdk.Stack {
         LOOKBACK_HOURS: "6",
         DASHBOARD_URL: props.appUrl,
         WEBHOOK_QUEUE_URL: props.webhookQueue.queueUrl,
+        TICKET_QUEUE_URL: props.ticketQueue.queueUrl,
+        WATCH_MINUTES: "5",
         ...modelProviderEnvironment(props.cfg),
       },
     });
@@ -104,6 +109,7 @@ export class LogAnalyzerStack extends cdk.Stack {
     // the worker's: the analyzer only opens them.
     props.secretsKey.grantDecrypt(analyzerFunction);
     props.webhookQueue.grantSendMessages(analyzerFunction);
+    props.ticketQueue.grantSendMessages(analyzerFunction);
     // Decoupled by name (like the worker) to avoid a cross-stack export.
     dynamodb.TableV2.fromTableName(this, "AnalyticsTableRef", `${prefix}-analytics`)
       .grantReadWriteData(analyzerFunction);
@@ -132,6 +138,25 @@ export class LogAnalyzerStack extends cdk.Stack {
       ruleName: `${prefix}-log-analyzer-schedule`,
       schedule: events.Schedule.rate(cdk.Duration.hours(6)),
       targets: [new targets.LambdaFunction(analyzerFunction)],
+    });
+
+    // --- Watch: every 5 minutes ---
+    // One count of error lines per log group over the last 5 minutes (a
+    // Logs Insights query per 50 groups, in the team's account), and a
+    // focused analysis at once for a group that spiked, so a new error is
+    // seen in minutes instead of at the next 6-hourly analysis. Insights
+    // bills the team's account $0.005 per GB read: the watch reads each
+    // log byte about once, so about $1 a month per 200 GB of logs a month.
+    new events.Rule(this, "AnalyzerWatch", {
+      ruleName: `${prefix}-log-analyzer-watch`,
+      description: "Count error lines per log group and analyze spikes at once",
+      schedule: events.Schedule.rate(cdk.Duration.minutes(5)),
+      targets: [
+        new targets.LambdaFunction(analyzerFunction, {
+          event: events.RuleTargetInput.fromObject({ mode: "watch" }),
+          retryAttempts: 0,
+        }),
+      ],
     });
   }
 }

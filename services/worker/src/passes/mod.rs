@@ -1102,6 +1102,7 @@ pub mod log_evidence;
 mod log_fix_checks;
 #[cfg(test)]
 mod log_fix_eval;
+pub mod log_look;
 pub mod model_check;
 #[cfg(test)]
 mod model_route_eval;

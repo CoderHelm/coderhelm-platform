@@ -168,6 +168,7 @@ export function buildApp(app: cdk.App, cfg: ResolvedConfig, opts: { accessStack?
       settingsTable: database.settingsTable,
       secretsKey: database.secretsKey,
       webhookQueue: api.webhookQueue,
+      ticketQueue: api.ticketQueue,
     });
   }
 

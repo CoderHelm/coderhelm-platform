@@ -280,6 +280,12 @@ pub enum Kind {
     LogLines,
     /// Past fixes for this log group went to it.
     PastFix,
+    /// A log group of the same service (`/ecs/x-api` and `/ecs/x-api-worker`)
+    /// is saved to it.
+    Sibling,
+    /// The log group's service name is exactly the repo's name
+    /// (`/ecs/prod-billing` and `acme/billing`).
+    ServiceName,
     /// Another log group mapped to it (context).
     RelatedMapping,
     /// The repo's role, description, README or manifests (context).
@@ -300,18 +306,24 @@ impl Kind {
         self.is_direct()
             || matches!(
                 self,
-                Kind::ImageRepo | Kind::Code | Kind::PastFix | Kind::LogLines
+                Kind::ImageRepo
+                    | Kind::Code
+                    | Kind::PastFix
+                    | Kind::LogLines
+                    | Kind::Sibling
+                    | Kind::ServiceName
             )
     }
 
     /// How directly it ties the running code to a repo: the image's own
-    /// source above a tag on a resource or stack, above everything else.
+    /// source above a tag on a resource or stack or a saved sibling of the
+    /// same service, above everything else.
     pub fn rank(self) -> u8 {
         match self {
             Kind::Saved => 4,
             Kind::ImageSource | Kind::RunRepo => 3,
-            Kind::ResourceTag | Kind::Stack => 2,
-            Kind::ImageRepo | Kind::Code | Kind::PastFix | Kind::LogLines => 1,
+            Kind::ResourceTag | Kind::Stack | Kind::Sibling => 2,
+            Kind::ImageRepo | Kind::Code | Kind::PastFix | Kind::LogLines | Kind::ServiceName => 1,
             Kind::RelatedMapping | Kind::Profile => 0,
         }
     }
@@ -328,6 +340,8 @@ impl Kind {
             Kind::RunRepo => "the fix run for this error",
             Kind::LogLines => "the error's log lines",
             Kind::PastFix => "past fixes",
+            Kind::Sibling => "a log group of the same service",
+            Kind::ServiceName => "the service's name",
             Kind::RelatedMapping => "a similar log group's repo",
             Kind::Profile => "the repo's description",
         }
@@ -671,6 +685,141 @@ pub fn record_evidence(
     *out = c.out;
 }
 
+/// Pure: two log groups of one service: the same path, one name the other's
+/// plus one more hyphenated part (`/ecs/prod-x-api` and
+/// `/ecs/prod-x-api-worker`). Names that only resemble each other are not.
+pub fn same_service(a: &str, b: &str) -> bool {
+    let split = |g: &str| match g.rsplit_once('/') {
+        Some((dir, leaf)) => (dir.to_string(), leaf.to_string()),
+        None => (String::new(), g.to_string()),
+    };
+    let ((da, la), (db, lb)) = (split(a.trim()), split(b.trim()));
+    if da != db || la.is_empty() || lb.is_empty() || la == lb {
+        return false;
+    }
+    let extends = |long: &str, short: &str| {
+        long.strip_prefix(short)
+            .and_then(|rest| rest.strip_prefix('-'))
+            .is_some_and(|part| {
+                (2..=24).contains(&part.len())
+                    && part.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            })
+    };
+    // The shorter name must still name a service, not just an environment.
+    let named = |s: &str| s.contains('-') || s.len() >= 6;
+    (extends(&la, &lb) && named(&lb)) || (extends(&lb, &la) && named(&la))
+}
+
+/// Environment words a log group's name carries around its service name.
+const ENV_WORDS: &[&str] = &[
+    "prod",
+    "production",
+    "prd",
+    "staging",
+    "stage",
+    "stg",
+    "dev",
+    "development",
+    "qa",
+    "test",
+    "uat",
+    "preprod",
+    "sandbox",
+];
+
+/// Pure: the service a log group is named for: its last path part without
+/// an environment word before or after it (`/ecs/prod-billing-api` is
+/// `billing-api`). Empty when nothing is left.
+pub fn service_name(log_group: &str) -> String {
+    let leaf = log_group.trim().rsplit('/').next().unwrap_or("").trim();
+    let mut s = leaf.to_ascii_lowercase();
+    for w in ENV_WORDS {
+        if let Some(rest) = s.strip_prefix(&format!("{w}-")) {
+            s = rest.to_string();
+            break;
+        }
+    }
+    for w in ENV_WORDS {
+        if let Some(rest) = s.strip_suffix(&format!("-{w}")) {
+            s = rest.to_string();
+            break;
+        }
+    }
+    s
+}
+
+/// Pure: what the team's other saved log groups and the log group's own
+/// name say: a saved log group of the same service ([`same_service`]) and
+/// a repo named exactly for the service ([`service_name`]).
+pub fn name_evidence(
+    target: &Target,
+    related: &[(String, String)],
+    repos: &[RepoInfo],
+    out: &mut Vec<Evidence>,
+) {
+    if target.log_group.is_empty() {
+        return;
+    }
+    let mut c = Collector {
+        repos,
+        out: std::mem::take(out),
+    };
+    for (group, repo) in related.iter().take(30) {
+        if same_service(&target.log_group, group) && repos.iter().any(|r| &r.name == repo) {
+            c.push(
+                Kind::Sibling,
+                repo,
+                format!(
+                    "{group}, a log group of the same service as {}, is saved as {repo}",
+                    target.log_group
+                ),
+            );
+        }
+    }
+    let svc = service_name(&target.log_group);
+    if svc.len() >= 3 {
+        let mut same = repos
+            .iter()
+            .filter(|r| r.short().eq_ignore_ascii_case(&svc));
+        if let (Some(r), None) = (same.next(), same.next()) {
+            c.push(
+                Kind::ServiceName,
+                &r.name,
+                format!(
+                    "The log group {} is named for the service {svc}, which is exactly the name of {}",
+                    target.log_group, r.name
+                ),
+            );
+        }
+    }
+    *out = c.out;
+}
+
+/// Pure: the evidence for one repo is decisive on its own: it rests on a
+/// strong tie (a saved sibling, a tag, a stack, an image source) that no
+/// other repo has anything as strong as, or on two independent ties of
+/// different kinds while nothing ties any other repo to the target.
+pub fn decisive(repo: &str, evidence: &[Evidence]) -> bool {
+    let mine: Vec<&Evidence> = evidence.iter().filter(|e| e.repo == repo).collect();
+    let pick = mine
+        .iter()
+        .filter(|e| e.kind.is_data())
+        .map(|e| e.kind.rank())
+        .max()
+        .unwrap_or(0);
+    let rival = evidence
+        .iter()
+        .filter(|e| !e.repo.is_empty() && e.repo != repo && e.kind.is_data())
+        .map(|e| e.kind.rank())
+        .max();
+    let kinds: BTreeSet<Kind> = mine
+        .iter()
+        .filter(|e| e.kind.is_data())
+        .map(|e| e.kind)
+        .collect();
+    (pick >= 2 && rival.is_none_or(|r| r < pick)) || (kinds.len() >= 2 && rival.is_none())
+}
+
 /// Pure: the error's own lines as evidence: that there are lines to read
 /// (the prompt carries them), where they came from when that isn't the
 /// target's log group, and the repo saved for that log group.
@@ -901,6 +1050,8 @@ code (Terraform, CDK, CloudFormation, serverless files) may live in a separate i
 repo: the fix belongs where the application code that writes these logs lives, so prefer the \
 application repo the infrastructure points at (its image, its source path) over the \
 infrastructure repo, unless the error is in the infrastructure itself.\n\
+- Strong: a log group of the same service (the same name plus one part, such as -worker) that \
+the team saved to a repo: one service's log groups live in one repo.\n\
 - Supporting: past fixes for this log group, an image repository with the repo's exact name, \
 repos saved for similar log groups, a repo's role, description, README and manifests.\n\
 - A name that merely resembles the log group is the weakest signal. Never let it outweigh any \
@@ -1091,7 +1242,10 @@ pub fn settle(
         .filter(|e| e.repo.is_empty() || repo.as_deref().is_some_and(|r| e.repo == r))
         .cloned()
         .collect();
-    let supported = cited.iter().any(|e| e.kind.is_data());
+    // A name alone (the service's name is the repo's) never makes it sure.
+    let supported = cited
+        .iter()
+        .any(|e| e.kind.is_data() && e.kind != Kind::ServiceName);
     if repo.is_some() && !supported {
         confidence = confidence.min(Confidence::Medium);
     }
@@ -1107,6 +1261,13 @@ pub fn settle(
     let conflict = ignored.iter().any(|e| e.kind.rank() >= picked_rank);
     if repo.is_some() && conflict {
         confidence = Confidence::Low;
+    }
+    // The model's own caution is not a reason to ask: when the evidence for
+    // its pick is decisive and nothing conflicts, CoderHelm goes with it.
+    if let Some(r) = repo.as_deref() {
+        if !conflict && decisive(r, evidence) {
+            confidence = Confidence::High;
+        }
     }
     // A fix run for this very error already worked in one repo (its triage
     // chose it): never offer a different one first.
@@ -1404,6 +1565,7 @@ pub async fn resolve(env: &dyn Env, input: &Input, now: DateTime<Utc>) -> Resolu
             Err(e) => tracing::warn!(query = %q, error = %e, "Repo resolution: code search failed"),
         }
     }
+    name_evidence(&input.target, &input.related, &input.repos, &mut evidence);
     record_evidence(&input.past, &input.related, &input.repos, &mut evidence);
     let mut excerpts = Vec::new();
     for r in profile_candidates(&evidence, &input.repos) {

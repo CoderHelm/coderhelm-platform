@@ -110,6 +110,16 @@ pub trait RepoHost: Send + Sync {
         -> Result<Option<String>, ReadError>;
     /// Code search across `repos` (their default branches).
     async fn search(&self, repos: &[String], query: &str) -> Result<Vec<SearchHit>, ReadError>;
+    /// The latest commits on the default branch that changed `path`, newest
+    /// first: (sha, first line of the message, RFC 3339 time). Hosts that
+    /// can't tell answer none.
+    async fn commits(
+        &self,
+        _repo: &str,
+        _path: &str,
+    ) -> Result<Vec<(String, String, String)>, ReadError> {
+        Ok(vec![])
+    }
 }
 
 // ── GitHub ──────────────────────────────────────────────────────────────────
@@ -255,6 +265,45 @@ impl RepoHost for GitHubHost<'_> {
                         .take(3)
                         .collect(),
                 })
+            })
+            .collect())
+    }
+
+    async fn commits(
+        &self,
+        repo: &str,
+        path: &str,
+    ) -> Result<Vec<(String, String, String)>, ReadError> {
+        let url = format!(
+            "{GITHUB_API}/repos/{repo}/commits?per_page=5&path={}",
+            enc(path)
+        );
+        let (status, body) = self
+            .send(self.get(&url, "application/vnd.github+json", Limit::Metadata))
+            .await?;
+        if !(200..300).contains(&status) {
+            return Err(github_status(status, path));
+        }
+        let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+        Ok(v.as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|c| {
+                Some((
+                    c["sha"].as_str()?.to_string(),
+                    c["commit"]["message"]
+                        .as_str()
+                        .unwrap_or("")
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .to_string(),
+                    c["commit"]["committer"]["date"]
+                        .as_str()
+                        .or(c["commit"]["author"]["date"].as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                ))
             })
             .collect())
     }
