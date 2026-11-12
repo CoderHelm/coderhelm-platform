@@ -250,9 +250,10 @@ export const BOUNDARY_SERVICES = [
   ...BOUNDARY_OPTION_READS.PrivateNetworks,
   // Describing EC2 and an OpenSearch domain (read-only), always: CloudFormation and Lambda describe a
   // private network's subnets, VPC and instances as they place its function, and the gateway finds a
-  // domain's VPC and subnets from its address.
+  // domain's VPC and subnets from its address (or the domain that replaced a deleted one).
   "ec2:Describe*",
   "es:DescribeDomain",
+  "es:ListDomainNames",
   "bedrock:InvokeModel",
   "bedrock:InvokeModelWithResponseStream",
   "bedrock:Get*",

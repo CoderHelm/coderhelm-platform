@@ -144,6 +144,6 @@ One list of everything you can set up, and where. Required items are steps in th
 ## Not available yet
 
 - **Single sign-on (SAML or OIDC):** sign-in is email and password (with passkeys and two-factor codes). A self-hosted install has no Google sign-in ([why](./sign-in.md#no-google-sign-in)).
-- **A private network (VPC):** the functions run without a VPC and reach GitHub, Anthropic and Bedrock over HTTPS.
+- **The install's own functions in a VPC:** they run without a VPC and reach GitHub, Anthropic and Bedrock over HTTPS. A search cluster inside a VPC is read through a [private network](./private-networks.md).
 - **GitHub Enterprise Server:** CoderHelm calls `api.github.com`.
 - **Instance sizes:** everything is serverless and pay per use; there is no size to pick. Model calls are most of the bill.

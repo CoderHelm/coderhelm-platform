@@ -43,10 +43,12 @@ pub mod net;
 pub mod newrelic;
 pub mod opensearch;
 pub mod permissions;
+pub mod private_network;
 pub mod redact;
 pub mod redshift;
 pub mod rest;
 pub mod secret;
+pub mod source_errors;
 pub mod sql;
 pub mod store;
 pub mod tools;
@@ -108,6 +110,10 @@ pub struct StepError {
     pub step: &'static str,
     pub message: String,
     pub fix: String,
+    /// What happened and where, when the network or the service said
+    /// ([`source_errors::for_source`] words it for the kind of source).
+    #[serde(skip)]
+    pub cause: Option<source_errors::Cause>,
 }
 
 impl StepError {
@@ -116,6 +122,7 @@ impl StepError {
             step,
             message: message.into(),
             fix: fix.into(),
+            cause: None,
         }
     }
 

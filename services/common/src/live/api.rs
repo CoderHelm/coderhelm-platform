@@ -135,8 +135,11 @@ async fn send(
     variables: Option<&Value>,
 ) -> Result<Response, StepError> {
     let read = check_read_only(query)?;
-    let ep = parse_endpoint(url)?;
-    let addr = resolve_public(&ep).await?;
+    // Marked failures (not found, private, …) in a GraphQL API's words.
+    let graphql =
+        |e| super::source_errors::for_source(super::source_errors::SourceType::GraphQl, e);
+    let ep = parse_endpoint(url).map_err(graphql)?;
+    let addr = resolve_public(&ep).await.map_err(graphql)?;
 
     let cant_reach = |e: reqwest::Error| {
         StepError::new(

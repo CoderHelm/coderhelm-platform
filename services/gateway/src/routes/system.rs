@@ -292,17 +292,47 @@ pub const OPTION_PARAMS: &[&str] = &[
     "HealthEvents",
 ];
 
-/// The switches a request may change: `{"options": {"InspectorFindings": "on"}}`.
+/// The install's private networks (lambda/updater, NETWORK_PARAMS): each ""
+/// (none) or `vpc-<id>:subnet-<id>[,subnet-<id>...]`.
+pub const NETWORK_PARAMS: &[&str] = &["PrivateNetwork1", "PrivateNetwork2", "PrivateNetwork3"];
+
+/// The same shape as the install stack parameter's AllowedPattern.
+pub fn network_value_ok(v: &str) -> bool {
+    if v.is_empty() {
+        return true;
+    }
+    let id = |s: &str, prefix: &str| {
+        s.strip_prefix(prefix).is_some_and(|h| {
+            (8..=17).contains(&h.len())
+                && h.chars()
+                    .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+        })
+    };
+    let Some((vpc, subnets)) = v.split_once(':') else {
+        return false;
+    };
+    let subnets: Vec<&str> = subnets.split(',').collect();
+    id(vpc, "vpc-") && (1..=6).contains(&subnets.len()) && subnets.iter().all(|s| id(s, "subnet-"))
+}
+
+/// The switches a request may change: `{"options": {"InspectorFindings": "on"}}`,
+/// or a private network: `{"options": {"PrivateNetwork2": "vpc-…:subnet-…"}}`.
 pub fn options_from(body: &Value) -> Result<serde_json::Map<String, Value>, &'static str> {
     let Some(o) = body.get("options").and_then(Value::as_object) else {
-        return Err("send options: one or more of InfrastructureVulnerabilities, InspectorFindings and HealthEvents, each on or off");
+        return Err("send options: one or more of InfrastructureVulnerabilities, InspectorFindings and HealthEvents (on or off), or PrivateNetwork1 to 3");
     };
     if o.is_empty() {
         return Err("send at least one switch");
     }
     for (k, v) in o {
+        if NETWORK_PARAMS.contains(&k.as_str()) {
+            if !v.as_str().is_some_and(network_value_ok) {
+                return Err("a private network is empty or vpc-<id>:subnet-<id>[,subnet-<id>...] (one VPC, up to 6 subnets)");
+            }
+            continue;
+        }
         if !OPTION_PARAMS.contains(&k.as_str()) {
-            return Err("only InfrastructureVulnerabilities, InspectorFindings and HealthEvents can be switched");
+            return Err("only InfrastructureVulnerabilities, InspectorFindings, HealthEvents and PrivateNetwork1 to 3 can be switched");
         }
         if !matches!(v.as_str(), Some("on") | Some("off")) {
             return Err("each switch is on or off");
@@ -726,6 +756,23 @@ mod tests {
         assert!(options_from(&json!({"options": {}})).is_err());
         assert!(options_from(&json!({"options": {"Hostname": "on"}})).is_err());
         assert!(options_from(&json!({"options": {"InspectorFindings": true}})).is_err());
+        // A private network: a VPC and its subnets, or empty to remove it.
+        let net = "vpc-0a1b2c3d4e5f60718:subnet-0a1b2c3d4e5f60719,subnet-0a1b2c3d4e5f6071a";
+        assert!(options_from(&json!({"options": {"PrivateNetwork2": net}})).is_ok());
+        assert!(options_from(&json!({"options": {"PrivateNetwork1": ""}})).is_ok());
+        for bad in [
+            "on",
+            "vpc-0a1b2c3d",
+            "vpc-0a1b2c3d4e5f60718:sg-0a1b2c3d4e5f60719",
+            "vpc-0A1B2C3D:subnet-0a1b2c3d",
+            "vpc-0a1b2c3d4e5f60718:",
+        ] {
+            assert!(
+                options_from(&json!({"options": {"PrivateNetwork3": bad}})).is_err(),
+                "{bad}"
+            );
+        }
+        assert!(options_from(&json!({"options": {"PrivateNetwork4": net}})).is_err());
         assert!(options_from(&json!({"options": {"InspectorFindings": "yes"}})).is_err());
     }
 

@@ -231,7 +231,8 @@ export function setupStatements(cfg: ResolvedConfig, scope: cdk.Stack): iam.Poli
  * PrivateNetwork1..3): invoke that network's function and read its
  * placement (subnets, security group), by name: the functions exist only
  * on a one-stack install where an admin added a network. The gateway also
- * describes an OpenSearch domain to find its VPC and subnets.
+ * describes an OpenSearch domain to find its VPC and subnets, and reads
+ * whether its security groups already let a network in.
  */
 export const REACH_PREFIX_ENV = "REACH_FUNCTION_PREFIX";
 export function reachStatements(prefix: string, scope: cdk.Stack, describeDomains: boolean): iam.PolicyStatement[] {
@@ -243,6 +244,10 @@ export function reachStatements(prefix: string, scope: cdk.Stack, describeDomain
   ];
   if (describeDomains) {
     out.push(new iam.PolicyStatement({ actions: ["es:DescribeDomain"], resources: [`arn:aws:es:${scope.region}:${scope.account}:domain/*`] }));
+    // A deleted domain's replacement, by its name (ListDomainNames takes no resource).
+    out.push(new iam.PolicyStatement({ actions: ["es:ListDomainNames"], resources: ["*"] }));
+    // Whether a domain's security groups already let a network in (these calls take no resource).
+    out.push(new iam.PolicyStatement({ actions: ["ec2:DescribeSecurityGroups", "ec2:DescribeSubnets"], resources: ["*"] }));
   }
   return out;
 }

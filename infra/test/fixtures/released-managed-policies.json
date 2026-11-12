@@ -62,5 +62,14 @@
       "Fn::Sub": "coderhelm-${Stage}-WorkerOwnAccountRead-e10f242c"
     },
     "Path": null
+  },
+  "Api/GatewayServiceRoleOverflowPolicy3E4CBDC72": {
+    "Description": {
+      "Fn::Sub": "Part of the policies for coderhelm-${Stage}-api/Gateway/ServiceRole"
+    },
+    "ManagedPolicyName": {
+      "Fn::Sub": "coderhelm-${Stage}-OverflowPolicy3-bbeb8ff8"
+    },
+    "Path": "/"
   }
 }

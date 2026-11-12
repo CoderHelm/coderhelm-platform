@@ -65,7 +65,7 @@ const sha = (v: unknown) => crypto.createHash("sha256").update(canon(v)).digest(
  */
 const ACCESS_DOCS = {
   // Private networks (access.ts BOUNDARY_OPTION_READS.PrivateNetworks, PRIVATE_NETWORK_DEPLOY_*).
-  boundary: "2da99531e7e3490c540b188b13d9dda1136c202d541d86cd7ef5d4387fece30a",
+  boundary: "2a0bcf74a7dc5704294b908c9afba48626c2fbce5fbfc2dd3cf8e2b10e888154",
   deployRole: "c55fb9759c36f7df55c4d8d25de2ebd792238d91a144fcd82ca5e765566a5117",
 };
 

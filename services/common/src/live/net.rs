@@ -2,6 +2,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
+use super::source_errors::Failure;
 use super::StepError;
 
 /// A validated address for a team's API.
@@ -12,8 +13,10 @@ pub struct Endpoint {
     pub port: u16,
 }
 
-const TYPO_FIX: &str =
-    "Check the address for a typo. It should look like https://api.yourcompany.com/graphql";
+/// Neutral: each kind of source says what its address looks like
+/// ([`super::source_errors::for_source`]); a GraphQL example here would be
+/// wrong for every other kind.
+const TYPO_FIX: &str = "Check the address for a typo.";
 
 /// Accepts only `https://host[:port]/path` with no embedded username or password.
 pub fn parse_endpoint(raw: &str) -> Result<Endpoint, StepError> {
@@ -60,15 +63,16 @@ pub fn parse_endpoint(raw: &str) -> Result<Endpoint, StepError> {
         }
     };
     if host == "localhost" || host.ends_with(".localhost") || host.ends_with(".internal") {
-        return Err(private_address());
+        return Err(private_address(&host));
     }
     let port = url.port_or_known_default().unwrap_or(443);
     Ok(Endpoint { url, host, port })
 }
 
-fn private_address() -> StepError {
-    StepError::new(
-        "reach",
+fn private_address(host: &str) -> StepError {
+    StepError::marked(
+        Failure::PrivateAddress,
+        host,
         "That address is inside a private network, so we can't reach it from here.",
         "Use the address your apps reach over the internet.",
     )
@@ -78,7 +82,7 @@ fn ensure_public(ip: IpAddr) -> Result<(), StepError> {
     if is_public_ip(ip) {
         Ok(())
     } else {
-        Err(private_address())
+        Err(private_address(&ip.to_string()))
     }
 }
 
@@ -139,26 +143,28 @@ pub async fn resolve_public(ep: &Endpoint) -> Result<SocketAddr, StepError> {
     let addrs: Vec<SocketAddr> = tokio::net::lookup_host((ep.host.as_str(), ep.port))
         .await
         .map_err(|_| {
-            StepError::new(
-                "reach",
+            StepError::marked(
+                Failure::NotFound,
+                &ep.host,
                 format!("We couldn't find {} on the internet.", ep.host),
                 TYPO_FIX,
             )
         })?
         .collect();
-    pick_public(&addrs)
+    pick_public(&ep.host, &addrs)
 }
 
-fn pick_public(addrs: &[SocketAddr]) -> Result<SocketAddr, StepError> {
+fn pick_public(host: &str, addrs: &[SocketAddr]) -> Result<SocketAddr, StepError> {
     if addrs.is_empty() {
-        return Err(StepError::new(
-            "reach",
+        return Err(StepError::marked(
+            Failure::NotFound,
+            host,
             "That address doesn't point anywhere.",
             TYPO_FIX,
         ));
     }
     if addrs.iter().any(|a| !is_public_ip(a.ip())) {
-        return Err(private_address());
+        return Err(private_address(host));
     }
     Ok(addrs[0])
 }
@@ -236,9 +242,20 @@ mod tests {
     fn one_private_answer_poisons_the_whole_name() {
         let public: SocketAddr = "8.8.8.8:443".parse().unwrap();
         let private: SocketAddr = "10.0.0.5:443".parse().unwrap();
-        assert_eq!(pick_public(&[public]).unwrap(), public);
-        assert!(pick_public(&[public, private]).is_err());
-        assert!(pick_public(&[private, public]).is_err());
-        assert!(pick_public(&[]).is_err());
+        assert_eq!(pick_public("h.example.org", &[public]).unwrap(), public);
+        assert!(pick_public("h.example.org", &[public, private]).is_err());
+        assert!(pick_public("h.example.org", &[private, public]).is_err());
+        assert!(pick_public("h.example.org", &[]).is_err());
+        // Marked, so each kind of source words it its own way.
+        let e = pick_public("h.example.org", &[private]).unwrap_err();
+        assert_eq!(e.cause.unwrap().failure, Failure::PrivateAddress);
+        assert_eq!(
+            pick_public("h.example.org", &[])
+                .unwrap_err()
+                .cause
+                .unwrap()
+                .failure,
+            Failure::NotFound
+        );
     }
 }

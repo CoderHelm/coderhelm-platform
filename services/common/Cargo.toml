@@ -55,6 +55,10 @@ aws-sdk-cloudwatch = { version = "1", default-features = false, features = ["def
 # log_repo: which repo a log group's code lives in (read-only lookups)
 aws-sdk-ecs = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-sdk-lambda = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-opensearch = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-ec2 = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+# private_network: the install's own credentials for its networks' functions and a domain's describe
+aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-cloudformation = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-sdk-ecr = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-sdk-iam = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
@@ -82,5 +86,3 @@ yaml-rust2 = "0.10"
 # model_retry: a local fake server in the tests; test-util: paused clocks
 # for the knowledge sources' backoff tests
 tokio = { version = "1", features = ["macros", "time", "net", "rt", "rt-multi-thread", "io-util", "sync", "test-util"] }
-# live: the ignored tests against a real AWS account
-aws-config = { version = "1", features = ["behavior-version-latest"] }

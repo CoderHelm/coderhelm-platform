@@ -75,7 +75,7 @@ test("the fixture is AWS's verdict on thousands of calls, for the native policie
   // Inspector's and Health's read-only calls (own-account-read.ts, OWN_OPTIONS) came after the simulator's
   // last run: three Allow patterns in CoderHelmServices for services no CloudFormation handler calls, checked
   // here; everything else is what the simulator saw. Run deploy-role-sim.py --native again to fold them in.
-  const LATER = ["inspector2:List*", "inspector2:BatchGetA*", "health:Describe*", ...BOUNDARY_OPTION_READS.PrivateNetworks, "ec2:Describe*", "es:DescribeDomain"];
+  const LATER = ["inspector2:List*", "inspector2:BatchGetA*", "health:Describe*", ...BOUNDARY_OPTION_READS.PrivateNetworks, "ec2:Describe*", "es:DescribeDomain", "es:ListDomainNames"];
   const services = t.boundary.Statement.find((s) => s.Sid === "CoderHelmServices")!;
   const simBoundary = F.policies.boundary.Statement.find((s: any) => s.Sid === "CoderHelmServices");
   const sawLater = LATER.every((a) => (simBoundary.Action as string[]).includes(a));
