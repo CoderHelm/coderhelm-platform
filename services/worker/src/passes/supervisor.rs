@@ -371,8 +371,11 @@ pub fn end_of_rounds(left: &[String], why: &str, ci_failing: &[String]) -> Endin
 // ── Red checks ──────────────────────────────────────────────────────────────
 
 /// How many reverts the supervisor makes on one pull request before the
-/// run ends with what still fails.
-pub const MAX_REVERTS: u32 = 3;
+/// run ends with what still fails. Enough to take a plan apart task by task
+/// down to the part that passes (three used to end a run failed with tasks
+/// left that could still have come out); the run's spend ceiling and its
+/// fix cycles bound it as well.
+pub const MAX_REVERTS: u32 = 8;
 
 /// What the supervisor takes out so what ships is green.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1086,7 +1089,7 @@ mod tests {
         }
         for needs in [
             "super::round::after_fault(",
-            "super::round::fault_of(",
+            "super::round::plan_for_fault(",
             "break 'attempt Some(",
         ] {
             if !ci_fix.contains(needs) {
@@ -1125,6 +1128,46 @@ mod tests {
                     "resume.rs: `{owner}` fails a run; only the supervisor's ending may"
                 ));
             }
+        }
+        // Red checks take out only what breaks them: a dependency run's
+        // newest commit of bumps before any task of the plan. Every kind
+        // of fix round takes the one fault decision. A stopped run's
+        // lockfiles are written before its pull request opens.
+        let revert = body(&resume, "\nasync fn revert_to_green(");
+        match (
+            revert.find("revert_dep_commit("),
+            revert.find("sup::revert_for("),
+        ) {
+            (Some(d), Some(t)) if d < t => {}
+            _ => bad.push("resume.rs: revert_to_green takes a dependency run apart by task".into()),
+        }
+        let fix_round = body(&resume, "\nasync fn run_fix_round(");
+        if fix_round.contains("finish_incomplete(")
+            && fix_round.matches("finish_incomplete(").count() > 1
+        {
+            bad.push(
+                "resume.rs: run_fix_round calls a fault unfinished without the decision".into(),
+            );
+        }
+        if !body(&resume, "\nasync fn round_fault(").contains("super::round::plan_for_fault(") {
+            bad.push("resume.rs: round_fault doesn't take the shared fault decision".into());
+        }
+        if !find("passes/feedback.rs").contains("super::round::plan_for_fault(") {
+            bad.push(
+                "feedback.rs: a refused landing doesn't take the shared fault decision".into(),
+            );
+        }
+        let stop = find("passes/stop_pr.rs");
+        let open = &stop[stop.find("pub async fn open_with(").unwrap_or(0)..];
+        match (
+            open.find("lockfiles_before_stop("),
+            open.find(".create_pull_request("),
+        ) {
+            (Some(l), Some(c)) if l < c => {}
+            _ => bad.push(
+                "stop_pr.rs: a stopped run's pull request opens before its lockfiles are written"
+                    .into(),
+            ),
         }
         let passes = find("passes/mod.rs");
         let from = passes.find("let mut fixed_by_code = false;").unwrap_or(0);

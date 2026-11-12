@@ -248,6 +248,62 @@ pub async fn open(
     open_with(state, msg, run_id, branch, reason, &[], true, &judged).await
 }
 
+/// Regenerates the lockfiles a stopped run's branch calls for
+/// (`generators::repair_lockfiles_with`). Returns the line for the run
+/// page, or `None` when the branch changes no manifest a lockfile reads.
+async fn lockfiles_before_stop(
+    state: &WorkerState,
+    msg: &TicketMessage,
+    github: &GitHubClient,
+    run_id: &str,
+    branch: &str,
+) -> Option<String> {
+    let provider = match crate::agent::provider::ModelProvider::load_for_team(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        &msg.team_id,
+    )
+    .await
+    {
+        Ok(p) => p.for_run(
+            run_id,
+            &format!("{}/{}", msg.repo_owner, msg.repo_name),
+            "",
+            "",
+        ),
+        Err(e) => {
+            tracing::warn!(run_id, error = %e, "Lockfiles before a stopped run's pull request: no provider scope");
+            return None;
+        }
+    };
+    let repair = super::generators::repair_lockfiles_with(
+        &super::generators::LockWork {
+            state,
+            msg,
+            github,
+            branch,
+            run_id,
+            deadline: None,
+            provider: &provider,
+        },
+        0,
+    )
+    .await;
+    stop_lock_note(&repair)
+}
+
+/// What the stop says about its lockfiles: nothing when none needed
+/// writing.
+pub(crate) fn stop_lock_note(repair: &super::generators::LockRepair) -> Option<String> {
+    if repair.written.is_empty() && repair.failed.is_empty() && repair.not_run.is_none() {
+        return None;
+    }
+    Some(format!(
+        "Before the pull request: CoderHelm {}.",
+        repair.note()
+    ))
+}
+
 /// [`open`], with what the checks left open going under Open items (on the
 /// pull request that is already there too), and the notification only when
 /// `notify` says this stop hasn't sent one.
@@ -280,6 +336,13 @@ pub async fn open_with(
         msg.installation_id,
         &state.http,
     )?;
+    // A stopped run's pull request never goes up with a manifest and its
+    // lockfile out of sync: the lockfiles the branch's changes call for
+    // are written by their package managers first, by code. What can't be
+    // written is said on the run; the stop still opens its pull request.
+    if let Some(note) = lockfiles_before_stop(state, msg, &github, run_id, branch).await {
+        super::add_progress_note(state, &msg.team_id, run_id, &note).await;
+    }
     let diff = github
         .get_diff(&msg.repo_owner, &msg.repo_name, &msg.base_branch, branch)
         .await?;

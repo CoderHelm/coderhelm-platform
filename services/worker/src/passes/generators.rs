@@ -2195,6 +2195,35 @@ pub(crate) async fn run_lock_repair(
 /// package manager in the sandbox and committed on `w.branch`. Says why
 /// when nothing could run; never an error.
 pub(crate) async fn repair_lockfiles(w: &Work<'_>, nonce: usize) -> LockRepair {
+    repair_lockfiles_with(
+        &LockWork {
+            state: w.state,
+            msg: w.msg,
+            github: w.github,
+            branch: w.branch,
+            run_id: w.run_id,
+            deadline: w.deadline,
+            provider: w.provider,
+        },
+        nonce,
+    )
+    .await
+}
+
+/// What a lockfile repair needs of a run: less than a whole [`Work`], so
+/// a path with no plan in hand (a stopped run's pull request) can call it.
+pub(crate) struct LockWork<'a> {
+    pub state: &'a crate::WorkerState,
+    pub msg: &'a crate::models::TicketMessage,
+    pub github: &'a GitHubClient,
+    pub branch: &'a str,
+    pub run_id: &'a str,
+    pub deadline: Option<std::time::Instant>,
+    pub provider: &'a crate::agent::provider::ModelProvider,
+}
+
+/// [`repair_lockfiles`], from the pieces it needs.
+pub(crate) async fn repair_lockfiles_with(w: &LockWork<'_>, nonce: usize) -> LockRepair {
     let state = w.state;
     if state.config.sandbox_bucket_name.is_empty() || state.config.sandbox_project_name.is_empty() {
         return LockRepair::not_run("no sandbox is set up");

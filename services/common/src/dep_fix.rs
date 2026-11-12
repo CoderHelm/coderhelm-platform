@@ -1049,6 +1049,45 @@ pub struct DepRun {
     pub budget_stop: bool,
     pub uses: Vec<BatchUse>,
     pub done: bool,
+    /// Each commit of verified bumps on the branch, oldest first: what the
+    /// pull request's own CI can take out again, one at a time
+    /// ([`DepRun::take_out_last_commit`]).
+    pub commits: Vec<BatchCommit>,
+}
+
+/// One commit of verified bumps.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct BatchCommit {
+    /// The head the commit was made on: its files are the branch without
+    /// this commit and everything after it.
+    pub before: String,
+    pub head: String,
+    pub bumps: Vec<usize>,
+}
+
+/// What [`DepRun::take_out_last_commit`] took out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TakenOut {
+    /// The head whose files the branch goes back to.
+    pub restore_to: String,
+    /// Each bump taken out, as its deferral line.
+    pub lines: Vec<String>,
+}
+
+/// Why a bump the sandbox verified is deferred after all: the pull
+/// request's own CI failed with it applied. `failure` is what CI printed.
+pub fn ci_deferral_reason(failure: &str) -> String {
+    let failure = failure.trim();
+    if failure.is_empty() {
+        "the pull request's CI failed with it applied; taken out so the bumps before it ship"
+            .to_string()
+    } else {
+        format!(
+            "the pull request's CI failed with it applied ({}); taken out so the bumps before it ship",
+            crate::truncate_str(failure, 300)
+        )
+    }
 }
 
 impl DepRun {
@@ -1421,6 +1460,13 @@ impl DepRun {
         if let Some(u) = self.uses.get_mut(self.batch) {
             u.applied += g.bumps.len();
         }
+        if head != self.head {
+            self.commits.push(BatchCommit {
+                before: self.head.clone(),
+                head: head.to_string(),
+                bumps: g.bumps.clone(),
+            });
+        }
         self.applied.extend(g.bumps);
         self.head = head.to_string();
         // A green probe of the rest was on the old head: probed again. A red
@@ -1531,6 +1577,42 @@ impl DepRun {
 
     /// Ends the run where it stands (no step left): what is committed
     /// ships, everything not yet verified is deferred `later`.
+    /// The pull request's CI is red after every fix: the newest commit of
+    /// verified bumps comes out, its bumps deferred with `why` (not to come
+    /// back by themselves: they broke the checks), and the commits before
+    /// it stay. `None` when one commit or none is left: the pull request is
+    /// never emptied. Called again while CI stays red, it takes out the one
+    /// before, so only what breaks CI is deferred.
+    pub fn take_out_last_commit(&mut self, why: &str) -> Option<TakenOut> {
+        if self.commits.len() < 2 {
+            return None;
+        }
+        let c = self.commits.pop()?;
+        let mut lines = Vec::new();
+        for &i in &c.bumps {
+            let Some(b) = self.plan.bumps.get(i).cloned() else {
+                continue;
+            };
+            let d = Deferral {
+                package: b.package,
+                from: b.from,
+                to: b.to,
+                manifest: b.manifest,
+                finding_ids: b.finding_ids,
+                reason: why.to_string(),
+                later: false,
+            };
+            lines.push(d.line());
+            self.deferred.push(d);
+        }
+        self.applied.retain(|i| !c.bumps.contains(i));
+        self.head = c.before.clone();
+        Some(TakenOut {
+            restore_to: c.before,
+            lines,
+        })
+    }
+
     pub fn finish_now(&mut self, why: &str) {
         self.give_up_unverified(why);
         self.done = true;
