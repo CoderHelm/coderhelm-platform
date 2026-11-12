@@ -2328,19 +2328,9 @@ pub fn labels(
         push(&format!("severity:{}", severity_word(top)));
     }
     if cfg.reachability_labels {
-        let verdicts: Vec<Verdict> = findings.iter().map(|(f, _)| f.verdict).collect();
-        let label = if verdicts.contains(&Verdict::Reachable) {
-            "reachable"
-        } else if !verdicts.is_empty()
-            && verdicts
-                .iter()
-                .all(|v| matches!(v, Verdict::NotReachable | Verdict::NotLoaded))
-        {
-            "not-reachable"
-        } else {
-            "reachability:unknown"
-        };
-        push(label);
+        push(reachability_label(worst_verdict(
+            findings.iter().map(|(f, _)| f.verdict),
+        )));
     }
     if findings.iter().any(|(f, _)| f.advisory.kev) {
         push("exploited");
@@ -2358,6 +2348,46 @@ pub fn labels(
         }
     }
     out
+}
+
+/// The labels a pull request's reachability can carry; a PR has one of them.
+pub const REACHABILITY_LABELS: [&str; 3] = ["reachable", "not-reachable", "reachability:unknown"];
+
+/// The worst of some verdicts (reachable, then pending, unknown, not
+/// reachable, not loaded): what a package bump, a bundle and its label show,
+/// so the label always agrees with the rows the review lists. None: unknown.
+pub fn worst_verdict(verdicts: impl IntoIterator<Item = Verdict>) -> Verdict {
+    verdicts
+        .into_iter()
+        .min_by_key(|v| verdict_rank(*v))
+        .unwrap_or(Verdict::Unknown)
+}
+
+/// The reachability label for a verdict: reachable, not reachable (not
+/// loaded counts), or unknown while it is not read (pending) or unclear.
+pub fn reachability_label(v: Verdict) -> &'static str {
+    match v {
+        Verdict::Reachable => "reachable",
+        Verdict::NotReachable | Verdict::NotLoaded => "not-reachable",
+        Verdict::Unknown | Verdict::Pending => "reachability:unknown",
+    }
+}
+
+/// The reachability labels an open pull request carries that its labels no
+/// longer name: GitHub only adds labels, so an earlier verdict's label is
+/// taken off when the PR is labelled again.
+pub fn stale_reachability_labels(labels: &[String]) -> Vec<&'static str> {
+    if !labels.iter().any(|l| {
+        REACHABILITY_LABELS
+            .iter()
+            .any(|r| l.eq_ignore_ascii_case(r))
+    }) {
+        return Vec::new();
+    }
+    REACHABILITY_LABELS
+        .into_iter()
+        .filter(|r| !labels.iter().any(|l| l.eq_ignore_ascii_case(r)))
+        .collect()
 }
 
 /// Whether a finding may get a pull request now: open, not held, not
@@ -5252,17 +5282,23 @@ pub fn unit_plan(u: &FixUnit, findings: &[(Finding, FindingState)], any: bool) -
                 .map(|(f, _)| *f)
                 .filter(|f| f.package.eq_ignore_ascii_case(&b.package))
                 .collect();
-            let verdict = mine
-                .iter()
-                .map(|f| f.verdict)
-                .min_by_key(|v| verdict_rank(*v))
-                .unwrap_or(Verdict::Unknown);
+            let verdict = worst_verdict(mine.iter().map(|f| f.verdict));
+            // One advisory reported for several manifests is one advisory.
+            let mut advisories: Vec<String> = Vec::new();
+            for f in &mine {
+                if !advisories
+                    .iter()
+                    .any(|a| a.eq_ignore_ascii_case(&f.advisory.primary))
+                {
+                    advisories.push(f.advisory.primary.clone());
+                }
+            }
             json!({
                 "package": b.package, "from": b.from, "to": b.to, "major": b.major,
                 "manifest": b.manifest, "verdict": verdict,
                 "tier": mine.iter().filter_map(|f| f.tier).min().map(Tier::as_str),
                 "finding_ids": mine.iter().map(|f| f.id.clone()).collect::<Vec<_>>(),
-                "advisories": mine.iter().map(|f| f.advisory.primary.clone()).collect::<Vec<_>>(),
+                "advisories": advisories,
             })
         })
         .collect();
@@ -5273,6 +5309,8 @@ pub fn unit_plan(u: &FixUnit, findings: &[(Finding, FindingState)], any: bool) -
         "branch": u.branch, "labels": u.labels, "tier": u.tier.map(Tier::as_str),
         "bundle": u.bundle, "finding_ids": u.finding_ids,
         "advisories": primaries(&members).len(),
+        // The bundle's worst verdict: the one its reachability label names.
+        "verdict": worst_verdict(members.iter().map(|(f, _)| f.verdict)),
         "majors": u.bumps.iter().filter(|b| b.major).count(),
         "bumps": bumps,
         "joins": joins,
@@ -7984,6 +8022,62 @@ mod tests {
         assert_eq!(plan["bumps"].as_array().unwrap().len(), 2);
         assert_eq!(plan["advisories"], 2);
         assert!(plan["joins"].is_null());
+    }
+
+    /// One advisory found in two manifests is listed once on its bump, and
+    /// the bundle's verdict is the worst of its rows, as its label says.
+    #[test]
+    fn the_plan_lists_each_advisory_once_and_labels_the_worst_verdict() {
+        let mut fs = vec![
+            eco_finding("a", "acme/web", "npm", "tar", Tier::P1),
+            eco_finding("b", "acme/web", "npm", "tar", Tier::P1),
+            eco_finding("c", "acme/web", "npm", "ws", Tier::P2),
+        ];
+        fs[1].0.manifest = "packages/api/package-lock.json".into();
+        fs[1].0.advisory.primary = fs[0].0.advisory.primary.clone();
+        fs[2].0.advisory.primary = "GHSA-aaaa-bbbb-cccc".into();
+        fs[0].0.verdict = Verdict::NotReachable;
+        fs[1].0.verdict = Verdict::NotReachable;
+        fs[2].0.verdict = Verdict::NotLoaded;
+        let picked = ids(&["a", "b", "c"]);
+        let now = Utc::now();
+        let cfg = SecurityConfig::default();
+        let (units, _) = manual_units_as(&fs, &picked, &cfg, now, Combine::OnePr);
+        let u = &units[0];
+        let plan = unit_plan(u, &fs, true);
+        let tar = plan["bumps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["package"] == "tar")
+            .unwrap();
+        assert_eq!(tar["advisories"].as_array().unwrap().len(), 1);
+        assert_eq!(tar["finding_ids"].as_array().unwrap().len(), 2);
+        assert_eq!(plan["verdict"], "not_reachable");
+        assert!(u.labels.iter().any(|l| l == "not-reachable"));
+        assert!(!u.labels.iter().any(|l| l == "reachability:unknown"));
+        // One package still unread: the bundle and its label say unknown.
+        fs[2].0.verdict = Verdict::Unknown;
+        let (units, _) = manual_units_as(&fs, &picked, &cfg, now, Combine::OnePr);
+        let plan = unit_plan(&units[0], &fs, true);
+        assert_eq!(plan["verdict"], "unknown");
+        assert!(units[0].labels.iter().any(|l| l == "reachability:unknown"));
+        assert_eq!(
+            reachability_label(worst_verdict([Verdict::NotLoaded, Verdict::Reachable])),
+            "reachable"
+        );
+    }
+
+    /// Labelling an open PR again takes off the earlier reachability label.
+    #[test]
+    fn a_relabelled_pr_drops_the_old_reachability_label() {
+        let now: Vec<String> = vec!["security".into(), "not-reachable".into()];
+        assert_eq!(
+            stale_reachability_labels(&now),
+            vec!["reachable", "reachability:unknown"]
+        );
+        let off: Vec<String> = vec!["security".into()];
+        assert!(stale_reachability_labels(&off).is_empty());
     }
 
     /// The bundle's description: a table of every bump.
