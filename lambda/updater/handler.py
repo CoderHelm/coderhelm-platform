@@ -1934,6 +1934,8 @@ def record_request(store, now, version, actor, skip_check=False, waiting_for="th
 
 
 def settle_request(store, req, now, status, reason="", **extra):
+    # What it waited for is over once it settles: never kept beside "started".
+    req = {k: v for k, v in req.items() if k not in ("waiting_for", "replaces")}
     req = dict(req, status=status, reason=reason, ended_at=now.isoformat(), **extra)
     store.put("UPDATE_REQUEST", req)
     return req
@@ -1998,9 +2000,14 @@ def follow_request(store, env, now, probe=None, latest=None, record=None):
     return settle_request(store, req, now, "started", id=started.get("id"))
 
 
-def request_view(req, now):
-    """The Update press for the version route: while it waits, and for a day after it ended."""
+def request_view(req, now, current=""):
+    """The Update press for the version route: while it waits, and for a day
+    after it ended. Never once the install runs that version or a newer one:
+    the press is over, whatever its record last said."""
     if not req or req.get("status") in ("done", None):
+        return None
+    version = req.get("version") or ""
+    if parse_version(current) and parse_version(version) and compare(version, current) <= 0:
         return None
     if req.get("status") != "waiting":
         try:
@@ -4434,7 +4441,7 @@ def handle(event, env, store, now, fetch=fetch_releases, probe=None, hint=None):
             # The model check for the latest release (Settings, System and Setup).
             "model_check": mc_view,
             # An admin's Update press waiting for the release check (or how it ended).
-            "update_request": request_view(store.get("UPDATE_REQUEST"), now),
+            "update_request": request_view(store.get("UPDATE_REQUEST"), now, current),
             # Which install this is, for Settings, System, Uninstall's link to the uninstall page.
             "install": install_identity(env),
             # A native install: the stack, and the change set an admin reviews.
@@ -4480,7 +4487,7 @@ def handle(event, env, store, now, fetch=fetch_releases, probe=None, hint=None):
             # Not a refusal: the press is kept, and the update starts by
             # itself once the check passes (follow_request).
             req = record_request(store, now, version, actor, bool(event.get("skip_check")), consent=bool(event.get("accept_permissions")))
-            return {"state": "checking", "version": version, "request": request_view(req, now), "model_check": mc}
+            return {"state": "checking", "version": version, "request": request_view(req, now, env.get("CODERHELM_VERSION", "")), "model_check": mc}
         if failures(mc, required=True):
             # No override: the release would call a model this install can't.
             raise ModelsBlocked(blocked_message(mc), mc)
@@ -4496,7 +4503,7 @@ def handle(event, env, store, now, fetch=fetch_releases, probe=None, hint=None):
             # Still publishing, or its template not verified yet: a wait, kept like a check.
             req = record_request(store, now, version, actor, bool(event.get("skip_check")), waiting_for=str(e),
                                  consent=bool(event.get("accept_permissions")))
-            return {"state": "checking", "version": version, "request": request_view(req, now), "model_check": mc}
+            return {"state": "checking", "version": version, "request": request_view(req, now, env.get("CODERHELM_VERSION", "")), "model_check": mc}
         req = store.get("UPDATE_REQUEST") or {}
         if req.get("status") == "waiting":
             # This press replaces the one that waited.
@@ -4567,7 +4574,7 @@ def handle(event, env, store, now, fetch=fetch_releases, probe=None, hint=None):
             version = latest["version"]
         mc = model_check(store, env, now, version, repo, probe)
         follow_request(store, env, now, probe, record=mc)
-        return {"model_check": mc, "request": request_view(store.get("UPDATE_REQUEST"), now)}
+        return {"model_check": mc, "request": request_view(store.get("UPDATE_REQUEST"), now, env.get("CODERHELM_VERSION", ""))}
 
     if action == "rollback":
         target = event.get("version")

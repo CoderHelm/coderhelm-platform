@@ -1029,6 +1029,21 @@ class PressDuringCheck(unittest.TestCase):
         self.assertTrue(s["running"])
         self.assertEqual(s["update_request"]["status"], "started")
 
+    def test_a_started_press_keeps_no_waiting_words_and_ends_once_that_version_runs(self):
+        self.press()
+        self.verify()
+        self.h({"action": "tick"}, SUNDAY_3AM + timedelta(minutes=5))
+        req = self.store.get("UPDATE_REQUEST")
+        self.assertEqual(req["status"], "started")
+        self.assertNotIn("waiting_for", req)
+        # The install now runs it (or a newer one): the press is over.
+        self.assertIsNone(u.request_view(req, SUNDAY_3AM + timedelta(minutes=30), "v1.1.0"))
+        self.assertIsNone(u.request_view(req, SUNDAY_3AM + timedelta(minutes=30), "v1.2.0"))
+        self.assertIsNotNone(u.request_view(req, SUNDAY_3AM + timedelta(minutes=30), "v1.0.0"))
+        # A beta press is over once its stable release runs.
+        beta = dict(req, version="v1.1.0-beta.20261112")
+        self.assertIsNone(u.request_view(beta, SUNDAY_3AM + timedelta(minutes=30), "v1.1.0"))
+
     def test_a_refused_model_ends_the_request_with_the_reason(self):
         self.worker.refuse = {"claude-sonnet-5-5"}
         self.press()

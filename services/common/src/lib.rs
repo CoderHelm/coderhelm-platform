@@ -154,6 +154,9 @@ pub mod jira_text;
 pub mod model_provider;
 /// Plugins: packages of skills, agents, tools, triggers and outputs a team installs.
 pub mod plugins;
+/// One shape for "something is wrong": set by a check, cleared by the same
+/// check passing, with when it recovered (every status producer uses it).
+pub mod problems;
 /// Where this deployment's dashboard and API are (links, redirects, webhooks).
 pub mod public_urls;
 /// Who asked for a run: one identity per person, for per-person analytics.

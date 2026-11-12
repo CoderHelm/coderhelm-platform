@@ -233,6 +233,28 @@ pub async fn get_activity(
             })
             .collect(),
     };
+    // A plan is a snapshot of the last sweep: it says the repository's mode
+    // as its settings are now (the one the settings page shows), so a row
+    // marked while it was on reads "nothing closes it" once it is off.
+    let team = config_of(get(&state, &claims.team_id, stale::TEAM_SK).await?.as_ref());
+    let own: HashMap<String, StaleConfig> =
+        read_prefix(&state, &claims.team_id, stale::REPO_PREFIX)
+            .await?
+            .iter()
+            .filter_map(|i| {
+                let sk = s(i, "sk");
+                Some((
+                    stale::repo_of_sk(&sk)?.to_ascii_lowercase(),
+                    config_of(Some(i))?,
+                ))
+            })
+            .collect();
+    let current = |r: &str| stale::effective(team.as_ref(), own.get(&r.to_ascii_lowercase()));
+    let plans: Vec<Value> = plans
+        .into_iter()
+        .map(|p| with_current_settings(p, &current))
+        .collect();
+    let plan = plan.map(|p| with_current_settings(p, &current));
     let log = read_log(&state, &claims.team_id, repo.as_deref(), 50).await?;
     let pfx = match &repo {
         Some(r) => stale::exempt_prefix(r),
@@ -246,6 +268,17 @@ pub async fn get_activity(
     Ok(Json(
         json!({ "plan": plan, "plans": plans, "log": log, "kept_open": kept }),
     ))
+}
+
+/// Pure: a saved plan with the repository's mode as its settings are now.
+/// The items stay: what carries the label, and what it would do once on.
+fn with_current_settings(mut plan: Value, current: &dyn Fn(&str) -> StaleConfig) -> Value {
+    let repo = plan["repo"].as_str().unwrap_or("").to_string();
+    let cfg = current(&repo);
+    plan["enabled"] = json!(cfg.enabled);
+    // Off: what it lists is what it would do, never "closing now".
+    plan["dry_run"] = json!(cfg.dry_run || !cfg.enabled);
+    plan
 }
 
 /// One repository's saved plan, its items with the repository, the days
@@ -658,6 +691,29 @@ pub(crate) async fn on_keep_open_comment(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_plan_says_the_settings_as_they_are_now() {
+        let plan = json!({"repo": "acme/web", "enabled": true, "dry_run": false,
+            "items": [{"pr": 1, "action": "wait"}]});
+        let off = StaleConfig {
+            enabled: false,
+            ..StaleConfig::default()
+        };
+        let p = with_current_settings(plan.clone(), &|_| off.clone());
+        assert_eq!(p["enabled"], false, "swept while on, it says off once off");
+        assert_eq!(p["dry_run"], true, "nothing closes while off");
+        assert_eq!(p["items"].as_array().unwrap().len(), 1);
+        let preview = StaleConfig {
+            enabled: true,
+            dry_run: true,
+            ..StaleConfig::default()
+        };
+        let p = with_current_settings(plan, &|_| preview.clone());
+        assert_eq!(p["enabled"], true);
+        assert_eq!(p["dry_run"], true);
+        assert_eq!(p["items"].as_array().unwrap().len(), 1);
+    }
+
     use super::*;
 
     fn cfg_item(sk: &str, json_text: &str) -> Item {

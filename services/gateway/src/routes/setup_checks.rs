@@ -613,6 +613,9 @@ pub fn bedrock_access_url(region: &str) -> String {
     common::model_access::bedrock_access_url(region)
 }
 
+/// The model check's words when the team has no Anthropic key yet.
+pub const NO_KEY_DETAIL: &str = "Your team hasn't added an Anthropic API key.";
+
 pub fn model(bedrock: bool, region: &str, model_id: &str, probe: &ModelProbe) -> Check {
     let label = "Claude answers a test call";
     match probe {
@@ -634,7 +637,7 @@ pub fn model(bedrock: bool, region: &str, model_id: &str, probe: &ModelProbe) ->
             "model",
             M,
             label,
-            "Your team hasn't added an Anthropic API key.",
+            NO_KEY_DETAIL,
             "Runs, reviews and chat all call Claude with the team's key.",
             Fix::text("Add a key from console.anthropic.com in Settings, AI models.")
                 .href("/settings/models")
@@ -1460,6 +1463,23 @@ pub fn update_models(status: Option<&Value>) -> Option<Check> {
     if mc["pending"].as_bool() == Some(true) || mc["stalled"].as_bool() == Some(true) {
         return None;
     }
+    // Nothing was called: every model was skipped (an Anthropic install has
+    // no key of its own to try them with). Not a pass, and nothing holds the
+    // update: say so in the updater's own words.
+    let results = mc["results"].as_array().cloned().unwrap_or_default();
+    if failing.is_empty() && !results.is_empty() && results.iter().all(|x| x["status"] == "skip") {
+        return Some(Check::not_ok(
+            Status::Skip,
+            "update_models",
+            M,
+            label,
+            mc["note"].as_str().map(str::to_string).unwrap_or_else(|| {
+                format!("{version}'s models weren't called: there was nothing to call them with. Nothing holds the update.")
+            }),
+            "",
+            Fix::default(),
+        ));
+    }
     if mc["ok"].as_bool() == Some(true) || failing.is_empty() {
         return Some(Check::pass(
             "update_models",
@@ -1564,6 +1584,10 @@ pub fn preflight(checks: &[Check], status: Option<&Value>) -> Vec<Blocker> {
             c.status == Status::Fail
                 && !matches!(c.group, "Integrations")
                 && c.key != "update_models"
+                // A team without an Anthropic key is the team's setup, not
+                // the install's: the update's health check doesn't call
+                // Claude with it, and the updater doesn't hold for it.
+                && !(c.key == "model" && c.detail == NO_KEY_DETAIL)
         })
         .map(|c| Blocker {
             technical: None,
@@ -3144,6 +3168,22 @@ mod tests {
         let ok = json!({"model_check": {"version": "v1.3.0", "ok": true, "results": []}});
         assert_eq!(update_models(Some(&ok)).unwrap().status, Status::Pass);
         assert!(update_models(Some(&json!({}))).is_none());
+        // Every model skipped (no key to call them with): not a pass, the
+        // updater's note, and no blocker.
+        let skipped = json!({"model_check": {"version": "v1.3.0", "ok": true,
+            "note": "No key to check the models with yet, so nothing holds the update.",
+            "results": [{"model": "claude-sonnet-5-5", "status": "skip", "code": "no_key"}]}});
+        let c = update_models(Some(&skipped)).unwrap();
+        assert_eq!(c.status, Status::Skip);
+        assert!(c.detail.contains("nothing holds the update"));
+        assert!(preflight(&[c], Some(&skipped))
+            .iter()
+            .all(|b| !b.key.starts_with("model")));
+        // A team without a key doesn't hold the install's update.
+        let nokey = model(false, "us-east-1", "claude-sonnet-5-5", &ModelProbe::NoKey);
+        assert!(preflight(&[nokey], Some(&skipped))
+            .iter()
+            .all(|b| b.key != "model"));
         // Before the release's signature is checked: held, not refused, and
         // the update card's state only: no install check, never a warning.
         let pending = json!({"model_check": {"version": "v1.3.0", "ok": false, "pending": true, "results": []}});

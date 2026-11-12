@@ -6264,6 +6264,11 @@ pub async fn health(
             .collect();
 
         let count = failed_runs.len();
+        // A check that warns makes the whole page "needs a look": the pill
+        // and the sentence beside it never disagree.
+        if count > 0 {
+            status = "degraded";
+        }
         checks.push(json!({
             "name": "failed_runs_24h",
             "status": if count == 0 { "ok" } else { "warning" },

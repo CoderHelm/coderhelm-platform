@@ -470,6 +470,16 @@ pub async fn test_connection(
         Ok(_) => {
             // Update status to active
             let now = chrono::Utc::now().to_rfc3339();
+            common::problems::record_on(
+                &state.dynamo,
+                &state.config.aws_insights_table_name,
+                &claims.team_id,
+                &sk,
+                common::problems::Check::AwsRole,
+                common::problems::Outcome::Pass,
+                &now,
+            )
+            .await;
             let _ = state
                 .dynamo
                 .update_item()
@@ -488,9 +498,25 @@ pub async fn test_connection(
             ))
         }
         Err(e) => {
-            warn!(role_arn, error = %e, "AssumeRole test failed");
-            // Update status to error
+            warn!(role_arn, error = %aws_sdk_sts::error::DisplayErrorContext(&e), "AssumeRole test failed");
+            // Update status to error. The page shows a plain sentence; AWS's
+            // own text stays in the log.
             let now = chrono::Utc::now().to_rfc3339();
+            let why =
+                assume_role_words(&format!("{}", aws_sdk_sts::error::DisplayErrorContext(&e)));
+            common::problems::record_on(
+                &state.dynamo,
+                &state.config.aws_insights_table_name,
+                &claims.team_id,
+                &sk,
+                common::problems::Check::AwsRole,
+                common::problems::Outcome::Fail(
+                    common::problems::Kind::AwsRoleRefused,
+                    why.clone(),
+                ),
+                &now,
+            )
+            .await;
             let _ = state
                 .dynamo
                 .update_item()
@@ -501,15 +527,31 @@ pub async fn test_connection(
                 .expression_attribute_names("#s", "status")
                 .expression_attribute_values(":s", attr_s("error"))
                 .expression_attribute_values(":t", attr_s(&now))
-                .expression_attribute_values(":e", attr_s(&format!("{e}")))
+                .expression_attribute_values(":e", attr_s(&why))
                 .send()
                 .await;
 
             Ok(Json(json!({
                 "status": "error",
-                "message": format!("Could not assume role: {e}"),
+                "message": why,
             })))
         }
+    }
+}
+
+/// Why AWS refused to let Coderhelm take on a role, in plain words.
+pub fn assume_role_words(aws_text: &str) -> String {
+    let t = aws_text.to_ascii_lowercase();
+    if t.contains("accessdenied") || t.contains("not authorized") {
+        "AWS refused to let Coderhelm take on the role. Check that the role's trust policy names Coderhelm and that its external ID matches the one shown here.".into()
+    } else if t.contains("expired") || t.contains("invalidclienttokenid") || t.contains("signature")
+    {
+        "AWS didn't accept Coderhelm's own credentials for the request. Try again in a minute."
+            .into()
+    } else if t.contains("timeout") || t.contains("dispatch") || t.contains("connect") {
+        "AWS didn't answer in time. Try again in a minute.".into()
+    } else {
+        "AWS refused to let Coderhelm take on the role. Check the role's trust policy and external ID.".into()
     }
 }
 
