@@ -149,6 +149,8 @@ pub mod run_prs;
 // review_stats: time-ordered review records for analytics
 pub mod decision_log;
 pub mod deploy_stats;
+/// Run statuses; which ones a person set; closing and reopening a run.
+pub mod handback;
 /// Work CoderHelm started on its own pull request and hasn't landed, and
 /// what a person's mention there does about it.
 pub mod held_work;
@@ -188,7 +190,6 @@ pub mod run_questions;
 /// Fix rounds on an open pull request: each with its own time budget,
 /// resumable, and never a failed run when one doesn't finish.
 pub mod run_round;
-/// Run statuses; which ones a person set; closing and reopening a run.
 pub mod run_status;
 /// What a run waiting on a person is waiting for: never nothing.
 pub mod run_wait;

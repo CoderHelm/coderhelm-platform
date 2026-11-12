@@ -267,6 +267,26 @@ pub async fn open_with(
             stop,
             super::outcome::Stop::NoProgress { .. } | super::outcome::Stop::OutOfTime(_)
         );
+    // Only a need on the human-only list waits on a person
+    // (`supervisor::hand_back_for`). Anything else ships: the work on the
+    // branch goes on to CI and the ready decision like any finished run,
+    // with what is left deferred on the checklist and named on the pull
+    // request.
+    let ending = super::supervisor::end(&super::supervisor::EndFacts {
+        blocker: super::supervisor::hand_back_for(judged, reason),
+        has_work: true,
+        ladder_spent: true,
+        ..Default::default()
+    });
+    let hand_back = match ending {
+        super::supervisor::Ending::HandBack(h) => Some(h),
+        _ => {
+            return ship(
+                state, msg, run_id, &github, branch, reason, &work, &open_text, &stop, &progress,
+            )
+            .await
+        }
+    };
     let unfinished = if mid_work {
         not_finished(
             &stop,
@@ -365,7 +385,7 @@ pub async fn open_with(
         .ended_values()
         .expression_attribute_names("#s", "status")
         .expression_attribute_values(":cp", super::attr_s("done"))
-        .needs_input(run_id, &wait)
+        .needs_input(run_id, &wait, hand_back.as_ref().expect("checked above"))
         .expression_attribute_values(":pu", super::attr_s(&url))
         .expression_attribute_values(":pn", super::attr_n(number))
         .expression_attribute_values(":b", super::attr_s(branch))
@@ -391,6 +411,194 @@ pub async fn open_with(
         super::webhooks::emit_run(state, &msg.team_id, run_id, "needs_input").await;
     }
     Ok(url)
+}
+
+/// The "Deferred" section of a run that shipped with tasks left: what
+/// the run did, what it deferred and why. It doesn't hold the pull request
+/// as a draft; CI and the ready decision do that, as for every run.
+pub fn deferred_section(stop: &super::outcome::Stop, progress: &Progress) -> String {
+    let total = progress.done.len() + progress.remaining.len();
+    let mut lines = vec![format!(
+        "CoderHelm shipped the work that is done. What it couldn't land is deferred, with why: \
+         {}.",
+        stop.words()
+    )];
+    if total > 0 {
+        lines.push(format!("- **Done ({} of {total})**", progress.done.len()));
+        for (i, r) in progress.remaining.iter().take(15).enumerate() {
+            lines.push(format!(
+                "- Deferred, task {} of {total}: {}",
+                progress.done.len() + i + 1,
+                common::truncate_str(r, 300)
+            ));
+        }
+    }
+    format!("## Deferred\n{}", lines.join("\n"))
+}
+
+/// A run stopped after its work for a reason that isn't on the human-only
+/// list: the tasks left are deferred on the run's checklist, the pull
+/// request opens (or is updated) with a "Deferred" section, and the run
+/// goes on to CI like any finished run (`awaiting_ci`), so its CI fix loop
+/// and ready decision take it from there. Never `needs_input`.
+#[allow(clippy::too_many_arguments)]
+async fn ship(
+    state: &WorkerState,
+    msg: &TicketMessage,
+    run_id: &str,
+    github: &GitHubClient,
+    branch: &str,
+    reason: &str,
+    work: &[String],
+    open_text: &str,
+    stop: &super::outcome::Stop,
+    progress: &Progress,
+) -> Result<String, BoxError> {
+    if let Some(mut plan) = super::run_plan_files(state, msg).await {
+        let defer: Vec<(String, String)> = progress
+            .remaining
+            .iter()
+            .filter_map(|r| {
+                let path = r.split('`').nth(1)?.to_string();
+                Some((path, format!("deferred: {}", stop.words())))
+            })
+            .collect();
+        if !defer.is_empty() {
+            plan.tasks = super::plan_coverage::with_deferred(&plan.tasks, &defer);
+            super::save_checked_tasks(state, msg, run_id, &plan.tasks).await;
+        }
+    }
+    let deferred = if progress.remaining.is_empty() {
+        format!("## Deferred\n{}.", stop.words())
+    } else {
+        deferred_section(stop, progress)
+    };
+    let existing = github
+        .find_open_pr_for_branch(&msg.repo_owner, &msg.repo_name, branch)
+        .await?;
+    let (number, url) = match existing {
+        Some(p) => {
+            let number = p["number"].as_u64().unwrap_or(0);
+            let body = p["body"].as_str().unwrap_or("");
+            let now = if body.contains("## Deferred") {
+                body.to_string()
+            } else {
+                format!("{}\n\n{deferred}", body.trim_end())
+            };
+            if let Err(e) = github
+                .update_pr_body(&msg.repo_owner, &msg.repo_name, number, &now)
+                .await
+            {
+                tracing::warn!(run_id, error = %e, "Could not list what is deferred on the open pull request");
+            }
+            (number, p["html_url"].as_str().unwrap_or("").to_string())
+        }
+        None => {
+            let conventions =
+                super::load_git_conventions(state, &msg.team_id, &msg.ticket_id).await;
+            let title = super::pr::pr_title(&conventions, &super::ticket_tokens(msg), msg);
+            let body = shipped_body(
+                &super::outcome::ticket_line_for(msg),
+                work,
+                open_text,
+                &deferred,
+            );
+            let p = github
+                .create_pull_request(
+                    &msg.repo_owner,
+                    &msg.repo_name,
+                    common::truncate_str(&title, 72),
+                    &body,
+                    branch,
+                    &msg.base_branch,
+                    true,
+                )
+                .await?;
+            (
+                p["number"].as_u64().unwrap_or(0),
+                p["html_url"].as_str().unwrap_or("").to_string(),
+            )
+        }
+    };
+    let usage = crate::models::TokenUsage::default();
+    super::save_checkpoint(state, &msg.team_id, run_id, "pr", branch, 0, &usage).await;
+    let now = chrono::Utc::now().to_rfc3339();
+    let res = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", super::attr_s(&msg.team_id))
+        .key("run_id", super::attr_s(run_id))
+        .update_expression(
+            "SET #s = :s, status_run_id = :sri, pr_url = :pu, pr_number = :pn, branch = :b, \
+             updated_at = :t, current_pass = :cp, deferred_reason = :dr REMOVE error_message",
+        )
+        .condition_expression(common::run_status::not_ended("#s"))
+        .ended_values()
+        .expression_attribute_names("#s", "status")
+        .expression_attribute_values(":s", super::attr_s(common::run_status::AWAITING_CI))
+        .expression_attribute_values(
+            ":sri",
+            super::attr_s(&format!("{}#{run_id}", common::run_status::AWAITING_CI)),
+        )
+        .expression_attribute_values(":pu", super::attr_s(&url))
+        .expression_attribute_values(":pn", super::attr_n(number))
+        .expression_attribute_values(":b", super::attr_s(branch))
+        .expression_attribute_values(":t", super::attr_s(&now))
+        .expression_attribute_values(":cp", super::attr_s("awaiting_ci"))
+        .expression_attribute_values(":dr", super::attr_s(common::truncate_str(reason, 500)))
+        .send()
+        .await;
+    if let Err(e) = res {
+        if !format!("{e:?}").contains("ConditionalCheckFailed") {
+            return Err(e.into());
+        }
+    }
+    super::add_progress_note(
+        state,
+        &msg.team_id,
+        run_id,
+        &format!(
+            "Shipped what is done on pull request #{number}; deferred: {}. CI and the ready \
+             decision take it from here.",
+            common::truncate_str(&stop.words(), 300)
+        ),
+    )
+    .await;
+    super::run_guard::progress(
+        state,
+        &msg.team_id,
+        run_id,
+        super::run_guard::Progress::PrOpen,
+    )
+    .await;
+    Ok(url)
+}
+
+/// The body of a pull request a run shipped with work deferred: the ticket
+/// line, Summary, Changes, Verification, what the checks left open, and the
+/// "Deferred" section.
+pub fn shipped_body(ticket: &str, files: &[String], open: &str, deferred: &str) -> String {
+    let shown: Vec<String> = files.iter().take(20).map(|f| format!("- `{f}`")).collect();
+    let more = files.len().saturating_sub(shown.len());
+    let open = if open.trim().is_empty() {
+        String::new()
+    } else {
+        format!("\n\n{}", open.trim())
+    };
+    format!(
+        "{ticket}\n\n## Summary\n\nCoderHelm did the work below on this branch and shipped it; \
+         what it deferred is listed at the end, with why.\n\n## Changes\n\n{}{}\n\n\
+         ## Verification\n\nThe repository's CI runs on this pull request; CoderHelm fixes what \
+         fails before it is marked ready.{open}\n\n{}",
+        shown.join("\n"),
+        if more > 0 {
+            format!("\n- and {more} more")
+        } else {
+            String::new()
+        },
+        deferred.trim()
+    )
 }
 
 /// What a stopped run with a pull request waits for: its review, with the
@@ -502,5 +710,32 @@ mod tests {
         let again = with_unfinished(&b, &nf);
         assert_eq!(again.matches("## Not finished").count(), 1);
         assert!(again.contains("## Summary\nx"));
+    }
+
+    /// The stalled Jira run, shipped: seven of eight tasks done, the eighth
+    /// deferred with why. The body keeps the body rules and never holds the
+    /// pull request as unfinished work for a person.
+    #[test]
+    fn a_run_stopped_mid_work_ships_with_the_rest_deferred() {
+        let stop = super::super::outcome::Stop::from_recorded(
+            "Stopped: steps 2 and 3 made no progress. The branch stayed at a8c8814 and the run \
+             was stuck at the implement work (planned tasks) while working on task 8 of 8 \
+             (`web/hooks/useScroll.ts`: adapt the offset).",
+        );
+        let progress = Progress {
+            done: (1..=7)
+                .map(|i| format!("`web/f{i}.tsx`: task {i}"))
+                .collect(),
+            remaining: vec!["`web/hooks/useScroll.ts`: adapt the offset".into()],
+        };
+        let d = deferred_section(&stop, &progress);
+        let b = shipped_body("Source ticket: WEB-12", &["web/f1.tsx".into()], "", &d);
+        assert!(
+            super::super::outcome::body_problems(&b, "WEB-12").is_empty(),
+            "{b}"
+        );
+        assert!(!super::super::proof::holds_unfinished(&b));
+        assert!(b.contains("Deferred, task 8 of 8: `web/hooks/useScroll.ts`"));
+        assert!(!b.contains("What you can do"));
     }
 }

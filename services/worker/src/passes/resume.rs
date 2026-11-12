@@ -5513,6 +5513,33 @@ async fn hand_off_red_ci(
     tried: &[String],
     needed: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // The supervisor's last rungs before a run with red checks ends: take
+    // out what broke them (back to the last green head of this pull
+    // request, else the last planned task), defer it with why, and let CI
+    // decide again. Only when nothing can come out does the run end, failed
+    // with exactly what fails (`wait_on_person`), never as a wait.
+    if let Some(note) = revert_to_green(state, msg, ticket_msg, github, pr, excerpt).await {
+        mark_events_processed(state, &msg.run_id, events).await;
+        super::add_progress_note(state, &msg.team_id, &msg.run_id, &note).await;
+        if set_run_awaiting_ci(
+            state,
+            ticket_msg,
+            &msg.run_id,
+            pr.url,
+            pr.number,
+            pr.branch,
+            usage,
+            duration,
+        )
+        .await?
+        {
+            info!(
+                run_id = msg.run_id,
+                "Reverted what broke the checks; waiting for CI on the result"
+            );
+        }
+        return Ok(());
+    }
     super::record_ci_outcome(
         state,
         &msg.team_id,
@@ -5553,6 +5580,223 @@ async fn hand_off_red_ci(
         duration,
     )
     .await
+}
+
+/// What a revert writes (each path with its content, or `None` to remove
+/// it), the tasks it defers with why, and the note to record.
+type Reverted = (Vec<(String, Option<String>)>, Vec<(String, String)>, String);
+
+/// Takes out what broke the checks, per [`super::supervisor::revert_for`]:
+/// one commit that puts every file changed since the last green head back
+/// as it was there, or the last planned task's file back as the base branch
+/// has it. The reverted work is deferred on the checklist and named on the
+/// pull request. Returns the note to record, or `None` when nothing can
+/// come out (no green head, one task or none, or the reverts are spent).
+async fn revert_to_green(
+    state: &WorkerState,
+    msg: &ResumeMessage,
+    ticket_msg: &TicketMessage,
+    github: &GitHubClient,
+    pr: &PrRef<'_>,
+    excerpt: &str,
+) -> Option<String> {
+    use super::supervisor::{self as sup, Revert};
+    use crate::clients::github::FileOp;
+    let reverts = run_number(state, &msg.team_id, &msg.run_id, "sup_reverts").await;
+    // Earlier heads of the pull request, newest first, and whether their
+    // checks passed (at most ten are read).
+    let commits = github
+        .list_pr_commits(pr.owner, pr.repo, pr.number)
+        .await
+        .unwrap_or_default();
+    let shas: Vec<String> = commits
+        .iter()
+        .filter_map(|c| c["sha"].as_str().map(str::to_string))
+        .collect();
+    let mut heads = Vec::new();
+    for sha in shas.iter().rev().skip(1).take(10) {
+        let green = match github.list_ci_for_ref(pr.owner, pr.repo, sha).await {
+            Ok(c) => matches!(ci_verdict_from_checks(&c), CiVerdict::Green),
+            Err(_) => false,
+        };
+        heads.push((sha.clone(), green));
+        if green {
+            break;
+        }
+    }
+    // The planned tasks done, in plan order.
+    let mut done: Vec<(String, String)> = Vec::new();
+    let plan = super::run_plan_files(state, ticket_msg).await;
+    if let Some(p) = &plan {
+        let tasks =
+            super::plan_coverage::tasks_for(github, pr.owner, pr.repo, pr.branch, &p.tasks).await;
+        if let Some(c) = super::plan_coverage::plan_changes(
+            github,
+            pr.owner,
+            pr.repo,
+            &ticket_msg.base_branch,
+            pr.branch,
+        )
+        .await
+        {
+            done = c
+                .coverage(&tasks)
+                .done
+                .into_iter()
+                .filter(|t| !t.generated)
+                .map(|t| (t.path, t.task))
+                .collect();
+        }
+    }
+    let what = if excerpt.trim().is_empty() {
+        "the failing checks".to_string()
+    } else {
+        format!(
+            "the failing checks ({})",
+            common::truncate_str(excerpt.trim(), 200)
+        )
+    };
+    let (files, deferred, note): Reverted = match sup::revert_for(&heads, &done, reverts) {
+        Revert::Nothing => return None,
+        Revert::ToHead(sha) => {
+            let changed = github
+                .compare_changed_files(pr.owner, pr.repo, &sha, pr.branch)
+                .await
+                .ok()?;
+            let mut files = Vec::new();
+            for path in &changed {
+                let was = github
+                    .read_file_if_exists(pr.owner, pr.repo, path, &sha)
+                    .await
+                    .ok()?;
+                files.push((path.clone(), was));
+            }
+            let deferred: Vec<(String, String)> = done
+                .iter()
+                .filter(|(p, _)| changed.contains(p))
+                .map(|(p, _)| {
+                    (
+                        p.clone(),
+                        format!(
+                            "deferred: its change broke {what}; reverted to the last green head"
+                        ),
+                    )
+                })
+                .collect();
+            let short: String = sha.chars().take(7).collect();
+            (
+                files,
+                deferred,
+                format!(
+                    "CI stayed red after the fix attempts: reverted {} file(s) to {short}, the \
+                         last head of this pull request whose checks passed, and deferred what \
+                         came after it. CI decides again.",
+                    changed.len()
+                ),
+            )
+        }
+        Revert::Task { path, task } => {
+            let was = github
+                .read_file_if_exists(pr.owner, pr.repo, &path, &ticket_msg.base_branch)
+                .await
+                .ok()?;
+            let deferred = vec![(
+                path.clone(),
+                format!(
+                    "deferred: its change broke {what} and the fixes didn't repair it; reverted"
+                ),
+            )];
+            (
+                vec![(path.clone(), was)],
+                deferred,
+                format!(
+                    "CI stayed red after the fix attempts: took out the last planned task \
+                         (`{path}`: {}) and deferred it. CI decides again.",
+                    common::truncate_str(&task, 160)
+                ),
+            )
+        }
+    };
+    if files.is_empty() {
+        return None;
+    }
+    let ops: Vec<FileOp> = files
+        .into_iter()
+        .map(|(path, was)| match was {
+            Some(content) => FileOp::Write { path, content },
+            None => FileOp::Delete { path },
+        })
+        .collect();
+    if let Err(e) = github
+        .batch_write(
+            pr.owner,
+            pr.repo,
+            pr.branch,
+            "Revert the change that broke CI; it is deferred on the pull request",
+            &ops,
+        )
+        .await
+    {
+        warn!(run_id = msg.run_id, error = %e, "Could not revert what broke the checks");
+        return None;
+    }
+    add_run_number(state, &msg.team_id, &msg.run_id, "sup_reverts").await;
+    if let Some(mut p) = plan {
+        if !deferred.is_empty() {
+            p.tasks = super::plan_coverage::with_deferred(&p.tasks, &deferred);
+            super::save_checked_tasks(state, ticket_msg, &msg.run_id, &p.tasks).await;
+        }
+    }
+    if let Ok(p) = github.get_pull_request(pr.owner, pr.repo, pr.number).await {
+        let body = p["body"].as_str().unwrap_or("");
+        let line = format!("- {note}");
+        let now = if body.contains("## Deferred") {
+            format!("{}\n{line}", body.trim_end())
+        } else {
+            format!("{}\n\n## Deferred\n{line}", body.trim_end())
+        };
+        let _ = github
+            .update_pr_body(pr.owner, pr.repo, pr.number, &now)
+            .await;
+    }
+    Some(note)
+}
+
+/// A number kept on the run record (0 when absent).
+async fn run_number(state: &WorkerState, team_id: &str, run_id: &str, field: &str) -> u32 {
+    state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(team_id))
+        .key("run_id", attr_s(run_id))
+        .projection_expression("#f")
+        .expression_attribute_names("#f", field)
+        .send()
+        .await
+        .ok()
+        .and_then(|o| o.item)
+        .and_then(|i| {
+            i.get(field)
+                .and_then(|v| v.as_n().ok())
+                .and_then(|n| n.parse().ok())
+        })
+        .unwrap_or(0)
+}
+
+/// Adds one to a number kept on the run record.
+async fn add_run_number(state: &WorkerState, team_id: &str, run_id: &str, field: &str) {
+    let _ = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(team_id))
+        .key("run_id", attr_s(run_id))
+        .update_expression("ADD #f :one")
+        .expression_attribute_names("#f", field)
+        .expression_attribute_values(":one", attr_n(1))
+        .send()
+        .await;
 }
 
 /// The run stops with its work on its pull request and something open on
@@ -5603,6 +5847,53 @@ async fn wait_on_person(
     duration: u64,
     judged: &super::stop_judge::Judged,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // The supervisor's rule: only a need on the human-only list waits on a
+    // person. Everything else the run finishes: its pull request carries
+    // what is left, deferred and named, and the run is completed; or, when
+    // its own checks are still red after every fix and revert
+    // (`hand_off_red_ci`), it failed with exactly what fails.
+    let red = red_ci_blocks_completion(state, &msg.team_id, run_id).await;
+    let ending = super::supervisor::end(&super::supervisor::EndFacts {
+        blocker: super::supervisor::hand_back_for(judged, reason),
+        ci_failing: red.iter().cloned().collect(),
+        has_work: pr_number > 0,
+        ladder_spent: true,
+        ..Default::default()
+    });
+    let super::supervisor::Ending::HandBack(hand_back) = ending else {
+        if let Some(red) = red {
+            let why = format!(
+                "{}; {red}. Every fix and revert CoderHelm tried is on pull request #{pr_number}.",
+                reason.trim().trim_end_matches('.')
+            );
+            warn!(run_id, reason = %why, "CI stays red after the supervisor's ladder: the run failed");
+            super::fail_run(state, msg, run_id, &why, usage, duration).await;
+            return Ok(());
+        }
+        super::add_progress_note(
+            state,
+            &msg.team_id,
+            run_id,
+            &format!(
+                "Finished with what is left deferred and listed on pull request #{pr_number}: {}",
+                common::truncate_str(reason, 400)
+            ),
+        )
+        .await;
+        return end_run(
+            state,
+            msg,
+            run_id,
+            common::run_status::COMPLETED,
+            None,
+            (pr_url, pr_number, branch),
+            usage,
+            duration,
+            None,
+            None,
+        )
+        .await;
+    };
     let detail = match (judged.hold_words(), judged.assumption()) {
         (Some(h), _) => format!("{reason}\nBlocked on: {h}"),
         (None, Some(a)) => format!("{reason}\nAssumed: {a}"),
@@ -5619,6 +5910,7 @@ async fn wait_on_person(
         usage,
         duration,
         Some(judged),
+        Some(&hand_back),
     )
     .await
 }
@@ -5626,7 +5918,7 @@ async fn wait_on_person(
 /// The outcome rule over the run's CI record: `Some(why)` when its last CI
 /// result on the pull request is a failure that is this change's (not one the
 /// base branch has too, not an unrelated test fixed elsewhere).
-async fn red_ci_blocks_completion(
+pub(crate) async fn red_ci_blocks_completion(
     state: &WorkerState,
     team_id: &str,
     run_id: &str,
@@ -5711,6 +6003,7 @@ async fn complete_run_with_status(
         usage,
         duration,
         None,
+        None,
     )
     .await
 }
@@ -5726,15 +6019,22 @@ async fn end_run(
     usage: &TokenUsage,
     duration: u64,
     judged: Option<&super::stop_judge::Judged>,
+    hand_back: Option<&super::supervisor::HandBack>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let now = chrono::Utc::now().to_rfc3339();
     let delta = usage.unrecorded();
-    // Waiting on a person is always for something named, and only after
-    // the stop judge decided it.
-    let wait = (status == common::run_status::NEEDS_INPUT && judged.is_some()).then(|| {
-        wait.cloned()
-            .unwrap_or_else(|| super::stop_pr::review_wait(pr_number, pr_url, ""))
-    });
+    // Waiting on a person is always for something named, only after the
+    // stop judge decided it, and only for a reason on the human-only list.
+    let wait = (status == common::run_status::NEEDS_INPUT && judged.is_some())
+        .then_some(hand_back)
+        .flatten()
+        .map(|hb| {
+            (
+                hb,
+                wait.cloned()
+                    .unwrap_or_else(|| super::stop_pr::review_wait(pr_number, pr_url, "")),
+            )
+        });
     let set_status = if wait.is_some() {
         "#s = :s, status_run_id = :sri, waiting_on = :wo"
     } else {
@@ -5756,7 +6056,7 @@ async fn end_run(
         .expression_attribute_names("#s", "status")
         .expression_attribute_names("#err", "error");
     let update = match &wait {
-        Some(w) => update.needs_input(run_id, w),
+        Some((hb, w)) => update.needs_input(run_id, w, hb),
         None => update
             .expression_attribute_values(":s", attr_s(status))
             .expression_attribute_values(":sri", attr_s(&format!("{status}#{run_id}"))),

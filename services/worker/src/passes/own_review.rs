@@ -241,10 +241,12 @@ pub fn next(
     if after.is_empty() {
         return Next::Ready;
     }
-    if rounds >= MAX_FIX_ROUNDS {
+    let progress = before.is_none_or(|b| after.len() < b) || pushed_files > 0;
+    // A round that fixed something earns another past the cap, up to twice
+    // it (`supervisor::may_extend`): the budget follows progress.
+    if !super::supervisor::may_extend(rounds, MAX_FIX_ROUNDS, progress) {
         return Next::Stop(cap_reason(after));
     }
-    let progress = before.is_none_or(|b| after.len() < b) || pushed_files > 0;
     if progress {
         return Next::Fix { stalled: 0 };
     }
@@ -271,10 +273,10 @@ pub fn stop_reason(items: &[String]) -> String {
 pub fn cap_reason(items: &[String]) -> String {
     let list: Vec<String> = items.iter().map(|i| format!("- [ ] {i}")).collect();
     format!(
-        "Handed to a person: CoderHelm took {MAX_FIX_ROUNDS} fix rounds on its own review's \
-         findings and these are still open:\n{}\nThe pull request stays a draft with them listed \
-         under \"Open review findings\". Fix them, or say on the pull request why one doesn't \
-         apply, then mark it ready.",
+        "CoderHelm took its fix rounds on its own review's findings (up to {} while they made \
+         progress) and these are still open, deferred and listed under \"Open review findings\" \
+         on the pull request:\n{}",
+        MAX_FIX_ROUNDS * 2,
         list.join("\n")
     )
 }
@@ -428,16 +430,24 @@ mod tests {
     }
 
     #[test]
-    fn two_fix_rounds_at_most_then_a_person() {
+    fn rounds_go_on_past_the_cap_while_they_fix_things_then_defer_the_rest() {
         let open = vec!["a (`x.rs:1`)".to_string(), "b (`y.rs:2`)".to_string()];
-        // Progress every round still stops at the cap: one fewer open each
-        // time, or a round that pushed changes.
         assert_eq!(next(Some(3), &open, 2, 0, 1), Next::Fix { stalled: 0 });
-        match next(Some(3), &open, 2, 0, MAX_FIX_ROUNDS) {
+        // At the cap, a round that fixed something earns another
+        // (`supervisor::may_extend`), up to twice the cap.
+        assert_eq!(
+            next(Some(3), &open, 2, 0, MAX_FIX_ROUNDS),
+            Next::Fix { stalled: 0 }
+        );
+        assert!(matches!(
+            next(Some(2), &open, 0, 0, MAX_FIX_ROUNDS),
+            Next::Stop(_)
+        ));
+        match next(Some(3), &open, 2, 0, MAX_FIX_ROUNDS * 2) {
             Next::Stop(why) => {
-                assert!(why.contains("2 fix rounds"));
                 assert!(why.contains("- [ ] a (`x.rs:1`)\n- [ ] b (`y.rs:2`)"));
-                assert!(why.contains("stays a draft"));
+                assert!(why.contains("deferred"));
+                assert!(!why.contains("Handed to a person"));
             }
             other => panic!("{other:?}"),
         }

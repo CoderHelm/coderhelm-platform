@@ -733,8 +733,14 @@ pub async fn converse_tool_loop(
     // which the agent must answer from what it already learned. Without it,
     // everything a planner read was thrown away the moment it ran out.
     let mut answer_now = false;
-    // Turns cut at the output limit before any tool call, nudged on.
-    let mut cut_nudges: u32 = 0;
+    // A turn cut at the output limit before any tool call is not an
+    // answer: one security run spent nine model calls and $11 thinking to the
+    // limit, each read as the coder's final word, and another coder did the
+    // same nine times on one README table. The turn is taken again with one
+    // step less thinking and a note to act in small steps, up to
+    // [`MAX_CUT_RETRIES`] times.
+    let mut effort = effort;
+    let mut cut_retries: u32 = 0;
 
     loop {
         turns += 1;
@@ -880,35 +886,55 @@ pub async fn converse_tool_loop(
             })
             .collect();
 
-        if continue_after_cut(
+        if let Some(cut) = cut_before_acting(
+            &blocks,
             response.stop_reason.as_deref(),
             !tool_uses.is_empty(),
-            !tools.is_empty() && !answer_now,
-            cut_nudges,
+            !tools.is_empty(),
+            answer_now,
+            cut_retries,
         ) {
-            // A turn spent its whole output thinking and made no call: the
-            // coder once did that nine times on one README table and the run
-            // ended without the change. It is told to act in small steps.
-            cut_nudges += 1;
+            cut_retries += 1;
+            effort = Some(lower_effort(effort));
             warn!(
                 max_tokens,
-                nudge = cut_nudges,
-                "A turn reached the output limit before any tool call; asking for small steps"
+                retry = cut_retries,
+                output_tokens = response.usage.output_tokens,
+                effort = effort.unwrap_or(""),
+                kept = cut == CutTurn::SaidSomething,
+                "A turn reached the output limit before any tool call: taking it again with less thinking"
             );
-            if let Some(ref mut log) = conversation_log {
-                log.push(json!({
-                    "turn": turns,
-                    "call": call,
-                    "role": "system_note",
-                    "kind": "output_limit",
-                    "content": OUTPUT_LIMIT_NOTE,
-                    "stop_reason": response.stop_reason,
-                }));
+            log_note(
+                conversation_log.as_deref_mut(),
+                call,
+                turns,
+                common::agent_log::NoteKind::OutputLimit,
+                OUTPUT_LIMIT_NOTE,
+            );
+            if cut == CutTurn::ThinkingOnly {
+                // A reply that only thought is dropped: its thinking was cut
+                // before it could be signed, and an assistant turn with no
+                // text or call can't be sent back. Dropping the last turn
+                // leaves the history before it untouched, so every earlier
+                // thinking block still round-trips. The note goes on the
+                // last user turn instead.
+                messages.pop();
+                match messages.last_mut() {
+                    Some((role, content)) if role == "user" => {
+                        content.push(json!({"type": "text", "text": OUTPUT_LIMIT_NOTE}));
+                    }
+                    _ => messages.push((
+                        "user".to_string(),
+                        vec![json!({"type": "text", "text": OUTPUT_LIMIT_NOTE})],
+                    )),
+                }
+            } else {
+                // What it said stays in history: the model sees where it was cut.
+                messages.push((
+                    "user".to_string(),
+                    vec![json!({"type": "text", "text": OUTPUT_LIMIT_NOTE})],
+                ));
             }
-            messages.push((
-                "user".to_string(),
-                vec![json!({"type": "text", "text": OUTPUT_LIMIT_NOTE})],
-            ));
             continue;
         }
 
@@ -1170,44 +1196,6 @@ fn call_index(log: &[Value]) -> usize {
 }
 
 /// Logs a message the loop put into the conversation itself.
-/// Turns cut at the output limit before any tool call that are nudged on
-/// before the loop takes the cut as the answer.
-const MAX_CUT_NUDGES: u32 = 2;
-
-const OUTPUT_LIMIT_NOTE: &str = "Your last turn reached the output limit before you made any tool call, so nothing was done. Think briefly and act now: make the change in small edit_file calls (a few lines each), one call per turn if needed. If the task is not needed, say so in one sentence.";
-
-/// Whether a turn that made no tool call goes on with a nudge: it was cut
-/// at the output limit, tools are on, and the nudges aren't used up.
-fn continue_after_cut(
-    stop_reason: Option<&str>,
-    called_tools: bool,
-    tools_on: bool,
-    nudges: u32,
-) -> bool {
-    stop_reason == Some("max_tokens") && !called_tools && tools_on && nudges < MAX_CUT_NUDGES
-}
-
-#[cfg(test)]
-mod cut_tests {
-    use super::*;
-
-    #[test]
-    fn a_turn_cut_before_any_call_is_nudged_twice_then_ends() {
-        assert!(continue_after_cut(Some("max_tokens"), false, true, 0));
-        assert!(continue_after_cut(Some("max_tokens"), false, true, 1));
-        assert!(!continue_after_cut(
-            Some("max_tokens"),
-            false,
-            true,
-            MAX_CUT_NUDGES
-        ));
-        // A call was made, tools are off, or it simply ended: no nudge.
-        assert!(!continue_after_cut(Some("max_tokens"), true, true, 0));
-        assert!(!continue_after_cut(Some("max_tokens"), false, false, 0));
-        assert!(!continue_after_cut(Some("end_turn"), false, true, 0));
-    }
-}
-
 fn log_note(
     log: Option<&mut Vec<Value>>,
     call: usize,
@@ -1452,6 +1440,63 @@ fn read_message(
     })
 }
 
+/// Turns cut at the output limit before any tool call that are taken again
+/// before the loop reads the cut as the answer.
+const MAX_CUT_RETRIES: u32 = 3;
+
+/// What the model reads after a turn cut at the output limit before any
+/// tool call.
+const OUTPUT_LIMIT_NOTE: &str = "[SYSTEM NOTE] Your last turn reached the output limit before \
+    you made any tool call, so nothing was done. Think briefly, then act now: make the next tool \
+    call, and make a change in small edit_file calls (a few lines each), one call per turn if \
+    needed. If the task is not needed, say so in one sentence; otherwise give your final answer.";
+
+/// A turn cut at the output limit before any tool call.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CutTurn {
+    /// No text and no call: its whole output went on thinking.
+    ThinkingOnly,
+    /// It wrote text and was cut before its call.
+    SaidSomething,
+}
+
+/// Whether a turn that made no tool call is taken again instead of read as
+/// the answer: it was cut at the output limit, the loop isn't on its
+/// tools-off answer turn, and the retries aren't used up. A cut that said
+/// something is taken again only when tools are on (with none, its text is
+/// the answer); one that only thought always is, as it says nothing at all.
+fn cut_before_acting(
+    blocks: &[ContentBlock],
+    stop_reason: Option<&str>,
+    called_tools: bool,
+    tools_on: bool,
+    answer_now: bool,
+    retries: u32,
+) -> Option<CutTurn> {
+    if stop_reason != Some("max_tokens") || called_tools || answer_now || retries >= MAX_CUT_RETRIES
+    {
+        return None;
+    }
+    let said = blocks.iter().any(|b| match b {
+        ContentBlock::Text { text } => !text.trim().is_empty(),
+        _ => false,
+    });
+    match (said, tools_on) {
+        (false, _) => Some(CutTurn::ThinkingOnly),
+        (true, true) => Some(CutTurn::SaidSomething),
+        (true, false) => None,
+    }
+}
+
+/// One step less thinking.
+fn lower_effort(effort: Option<&str>) -> &'static str {
+    match effort {
+        Some("max") | Some("xhigh") => "high",
+        Some("high") | None => "medium",
+        _ => "low",
+    }
+}
+
 fn extract_text(
     content: &[ContentBlock],
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
@@ -1520,6 +1565,54 @@ mod tests {
         assert_eq!(body["output_config"]["format"]["type"], "json_schema");
         // Prompt caching needs no beta on Bedrock.
         assert!(body.get("anthropic_beta").is_none());
+    }
+
+    /// A security run's coder spent nine replies thinking to the output
+    /// limit with no tool call, each read as its final answer; another coder
+    /// did the same nine times on one README table.
+    #[test]
+    fn a_turn_cut_before_any_call_is_taken_again_not_read_as_the_answer() {
+        let thought: Vec<ContentBlock> = vec![];
+        let cut = |b: &[ContentBlock], stop, called, tools_on, answer_now, n| {
+            cut_before_acting(b, stop, called, tools_on, answer_now, n)
+        };
+        let max = Some("max_tokens");
+        assert_eq!(
+            cut(&thought, max, false, true, false, 0),
+            Some(CutTurn::ThinkingOnly)
+        );
+        let blank = vec![ContentBlock::Text { text: "  ".into() }];
+        assert_eq!(
+            cut(&blank, max, false, true, false, 0),
+            Some(CutTurn::ThinkingOnly)
+        );
+        let said = vec![ContentBlock::Text {
+            text: "Now the README table:".into(),
+        }];
+        assert_eq!(
+            cut(&said, max, false, true, false, 0),
+            Some(CutTurn::SaidSomething)
+        );
+        // Taken again up to the limit, then the cut is the answer.
+        assert!(cut(&thought, max, false, true, false, MAX_CUT_RETRIES - 1).is_some());
+        assert_eq!(
+            cut(&thought, max, false, true, false, MAX_CUT_RETRIES),
+            None
+        );
+        // A call was made, it simply ended, or it is the tools-off answer turn.
+        assert_eq!(cut(&thought, max, true, true, false, 0), None);
+        assert_eq!(cut(&thought, Some("end_turn"), false, true, false, 0), None);
+        assert_eq!(cut(&thought, max, false, true, true, 0), None);
+        // With no tools, text is the answer; a reply that only thought isn't.
+        assert_eq!(cut(&said, max, false, false, false, 0), None);
+        assert_eq!(
+            cut(&thought, max, false, false, false, 0),
+            Some(CutTurn::ThinkingOnly)
+        );
+        assert_eq!(lower_effort(Some("high")), "medium");
+        assert_eq!(lower_effort(Some("medium")), "low");
+        assert_eq!(lower_effort(Some("low")), "low");
+        assert_eq!(lower_effort(Some("max")), "high");
     }
 
     use super::*;

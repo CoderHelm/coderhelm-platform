@@ -994,7 +994,11 @@ pub async fn reopen_run(
                  reopened_at = :t, reopened_by = :by \
                  REMOVE closed_at, closed_by, closed_by_name, closed_from, close_reason",
             )
-            .needs_input(&run_id, &reopened_wait(item.as_ref()))
+            .needs_input(
+                &run_id,
+                &reopened_wait(item.as_ref()),
+                &common::handback::HandBack::of(common::handback::HumanOnly::PersonAction),
+            )
     } else {
         update
             .update_expression(

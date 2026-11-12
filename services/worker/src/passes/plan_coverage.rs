@@ -69,6 +69,8 @@ const OPTIONAL_MARKS: &[&str] = &[
     "verify only",
     "read only",
     "read-only",
+    // A task the supervisor deferred with its reason (`with_deferred`).
+    "(deferred:",
 ];
 
 /// What the coder says when it judged a planned file needs no change.
@@ -511,19 +513,6 @@ pub fn narrowed_feedback(cov: &Coverage, diff_files: &[String]) -> Option<String
     ))
 }
 
-/// The planned task a run is on: the first one left, as `task K of N
-/// (`path`: what)`.
-pub fn current_task(cov: &Coverage) -> Option<String> {
-    let first = cov.required_missing().into_iter().next()?;
-    Some(format!(
-        "task {} of {} (`{}`: {})",
-        cov.done.len() + 1,
-        cov.total(),
-        first.path,
-        common::truncate_str(first.task.trim(), 160)
-    ))
-}
-
 /// Marks the tasks whose file the coder said needs no change (in `notes`)
 /// and the branch doesn't change: optional from now on, with the coder's
 /// line. Returns the paths it settled.
@@ -566,6 +555,29 @@ pub fn with_declined(tasks_md: &str, tasks: &[PlanTask]) -> String {
                         "{line} (no change needed: {})",
                         common::truncate_str(why, 300)
                     )
+                }
+                _ => line.to_string(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The plan's checklist with each deferred task's line carrying its reason
+/// (`(deferred: ...)`), so every later check reads it as settled and the
+/// pull request lists it with why. `defer` holds (path, reason) pairs; the
+/// reason starts with `deferred:`.
+pub fn with_deferred(tasks_md: &str, defer: &[(String, String)]) -> String {
+    tasks_md
+        .lines()
+        .map(|line| {
+            let Some(task) = plan_tasks(line).into_iter().next() else {
+                return line.to_string();
+            };
+            match defer.iter().find(|(p, _)| *p == task.path) {
+                Some((_, why)) if !task.optional => {
+                    let why = why.trim().trim_start_matches("deferred:").trim();
+                    format!("{line} (deferred: {})", common::truncate_str(why, 300))
                 }
                 _ => line.to_string(),
             }
@@ -1199,5 +1211,26 @@ mod tests {
             .detail
             .starts_with("Not done by this run: 1. Replace the hero on production"));
         assert!(f[0].detail.contains("no production CMS write connection"));
+    }
+
+    #[test]
+    fn a_deferred_task_is_settled_and_listed_with_why() {
+        let md = "- [ ] `src/a.rs`: fix the parser\n- [ ] `README.md`: note the new flag";
+        let out = with_deferred(
+            md,
+            &[(
+                "README.md".to_string(),
+                "deferred: this non-core task resisted 3 different approaches".to_string(),
+            )],
+        );
+        let tasks = plan_tasks(&out);
+        assert!(!tasks[0].optional);
+        assert!(tasks[1].optional, "{out}");
+        assert!(tasks[1].task.contains("resisted 3 different approaches"));
+        // Deferring twice doesn't stack the reason.
+        assert_eq!(
+            with_deferred(&out, &[("README.md".into(), "deferred: again".into())]),
+            out
+        );
     }
 }
