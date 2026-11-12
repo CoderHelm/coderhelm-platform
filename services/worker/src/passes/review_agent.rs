@@ -45,6 +45,11 @@ pub struct Finding {
     /// empty rests on nothing (see [`enforce_failed_lookups`]).
     #[serde(default)]
     pub lookups: Vec<String>,
+    /// The repository memories (`M1`, `M2`) the finding rests on, as the
+    /// prompt labelled them. A blocking one must still be shown in the code
+    /// of this change (see [`enforce_memory_grounding`]).
+    #[serde(default)]
+    pub memories: Vec<String>,
     /// For a `question`: whether the change's correctness rests on the
     /// answer (the code reads a field, shape or behaviour of another system
     /// nobody verified). A question that does requests changes with its ask;
@@ -289,6 +294,23 @@ pub struct ReviewOutput {
     /// ([`common::review_overview`]).
     #[serde(default)]
     pub overview: common::review_overview::ModelOverview,
+    /// Repository memories the code of this change contradicts: out of date,
+    /// so flagged for a person and never followed.
+    #[serde(default)]
+    pub memory_conflicts: Vec<MemoryConflict>,
+}
+
+/// A repository memory the reviewer found the code contradicts.
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
+pub struct MemoryConflict {
+    /// The memory's label in the prompt (`M2`).
+    #[serde(default)]
+    pub memory: String,
+    /// Where the code shows it (`path:line`).
+    #[serde(default)]
+    pub code: String,
+    #[serde(default)]
+    pub why: String,
 }
 
 /// A fact the PR's own evidence says is unconfirmed, and whether the change
@@ -822,6 +844,106 @@ pub fn enforce_failed_lookups(findings: &mut [Finding], lookups: &[super::proof:
         changed += 1;
     }
     changed
+}
+
+/// A blocking finding that rests on a repository memory must still be shown
+/// in the code of this change: anchored on a line of a changed file, with
+/// `basis` code, tests, CI or data (or documentation it cites). Memories are
+/// learned and can go stale, so one that only a memory supports becomes a
+/// non-blocking note saying so. Returns how many were changed.
+pub fn enforce_memory_grounding(
+    findings: &mut [Finding],
+    memory: &crate::memory::recall::Block,
+    changed_files: &[String],
+) -> usize {
+    let mut changed = 0;
+    for f in findings.iter_mut() {
+        if f.memories.is_empty() || !(f.is_blocking() || f.holds_merge()) {
+            continue;
+        }
+        let in_change = f.line > 0 && changed_files.iter().any(|c| c == f.file.trim());
+        let shown = match f.basis() {
+            Some(Basis::Code | Basis::Tests | Basis::Ci | Basis::Data) => !f.weakened,
+            Some(Basis::Documented) => f.cites_source() && !f.weakened,
+            _ => false,
+        };
+        if in_change && shown {
+            continue;
+        }
+        let cited: Vec<String> = f
+            .memories
+            .iter()
+            .map(|m| {
+                if memory.id_of(m).is_some() {
+                    m.trim().to_string()
+                } else {
+                    format!("{} (not a memory this review was given)", m.trim())
+                }
+            })
+            .collect();
+        f.severity = "medium".to_string();
+        f.weaken_to(Evidence::UnverifiedConcern);
+        f.note_only = Some("it rests on a remembered rule, not on code in this change".to_string());
+        f.body = format!(
+            "{}\n\nThis rests on what CoderHelm remembers about this repository ({}), not on code \
+             in this change it could point to, so it isn't blocking.",
+            f.body.trim_end(),
+            cited.join(", ")
+        );
+        changed += 1;
+    }
+    changed
+}
+
+/// The memory conflicts the reviewer reported, kept only for memories it
+/// was given, once each: (memory id, the memory's text, what the code shows).
+pub fn memory_conflicts(
+    reported: &[MemoryConflict],
+    memory: &crate::memory::recall::Block,
+) -> Vec<(String, String, String)> {
+    let mut out: Vec<(String, String, String)> = Vec::new();
+    for c in reported {
+        let Some(id) = memory.id_of(&c.memory) else {
+            continue;
+        };
+        if out.iter().any(|(i, _, _)| i == id) {
+            continue;
+        }
+        let text = memory
+            .labels
+            .iter()
+            .position(|(_, i)| i == id)
+            .and_then(|i| memory.lines.get(i))
+            .cloned()
+            .unwrap_or_default();
+        let shows = match (c.code.trim(), c.why.trim()) {
+            ("", w) => w.to_string(),
+            (code, "") => format!("`{code}`"),
+            (code, w) => format!("`{code}`: {w}"),
+        };
+        out.push((id.to_string(), text, shows));
+    }
+    out
+}
+
+/// The review's note on memories the code contradicts (empty when none).
+pub fn memory_conflicts_markdown(conflicts: &[(String, String, String)]) -> String {
+    if conflicts.is_empty() {
+        return String::new();
+    }
+    let mut s = String::from(
+        "\n\n#### Memories that look out of date\nThe code in this change contradicts what CoderHelm \
+         remembers about this repository, so these weren't followed. They are flagged on the \
+         Memory page for someone to edit or forget.\n",
+    );
+    for (_, text, shows) in conflicts {
+        s.push_str(&format!(
+            "- \"{}\": {}\n",
+            common::truncate_str(text, 200),
+            common::truncate_str(shows, 300)
+        ));
+    }
+    s
 }
 
 /// A fact's text for matching: lower case, letters and digits only.
@@ -3183,6 +3305,116 @@ mod evidence_tests {
         let p = to_postable(&v[..1], &changed, &HashMap::new());
         assert!(!thread_holds_merge(&p.inline[0].body));
         assert_eq!(decide_verdict(&v[..3], 0, &[], false), "APPROVE");
+    }
+
+    fn memory_block() -> crate::memory::recall::Block {
+        use crate::memory::{recall, PickKind, Picked};
+        let p = |id: &str, kind, c: &str| Picked {
+            id: id.into(),
+            content: c.into(),
+            kind,
+            memory_type: mentedb_core::memory::MemoryType::Semantic,
+            score: 0.05,
+        };
+        recall::block(
+            recall::Agent::Reviewer,
+            &[
+                p(
+                    "mem-a",
+                    PickKind::Pinned,
+                    "Every handler returns a typed error.",
+                ),
+                p(
+                    "mem-b",
+                    PickKind::Learned,
+                    "Prices come from the pricing service.",
+                ),
+            ],
+        )
+    }
+
+    fn on_memory(memories: &[&str], file: &str, line: u64, basis: Option<&str>) -> Finding {
+        Finding {
+            file: file.into(),
+            line,
+            severity: "blocking".into(),
+            category: "correctness".into(),
+            title: "Handler returns a bare string".into(),
+            body: "The team's rule is a typed error.".into(),
+            evidence: Some("verified-defect".into()),
+            basis: basis.map(str::to_string),
+            memories: memories.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_memory_never_blocks_on_its_own() {
+        let mem = memory_block();
+        let changed = vec!["src/api.rs".to_string()];
+        let mut v = vec![
+            // Rests on a memory, says nothing of the code.
+            on_memory(&["M1"], "src/api.rs", 12, None),
+            // Rests on a memory and points at a file this PR didn't change.
+            on_memory(&["M1"], "src/other.rs", 12, Some("code")),
+            // No line to point at.
+            on_memory(&["M2"], "src/api.rs", 0, Some("code")),
+            // External state is not code.
+            on_memory(&["M2"], "src/api.rs", 12, Some("external")),
+            // A label this review never gave out.
+            on_memory(&["M7"], "src/api.rs", 12, None),
+            // Shown in the code of this change: it blocks as before.
+            on_memory(&["M1"], "src/api.rs", 12, Some("code")),
+            // Not resting on a memory at all: untouched.
+            on_memory(&[], "src/api.rs", 12, None),
+        ];
+        assert_eq!(enforce_memory_grounding(&mut v, &mem, &changed), 5);
+        for f in &v[..5] {
+            assert!(!f.holds_merge() && !f.is_blocking(), "{f:?}");
+            assert_eq!(f.evidence(), Evidence::UnverifiedConcern);
+            assert!(
+                f.body.contains("rests on what CoderHelm remembers"),
+                "{}",
+                f.body
+            );
+            assert!(f.note_only.is_some());
+        }
+        assert!(v[4]
+            .body
+            .contains("M7 (not a memory this review was given)"));
+        assert!(v[5].holds_merge() && v[6].holds_merge());
+        assert_eq!(decide_verdict(&v[..5], 0, &[], false), "APPROVE");
+        assert_eq!(decide_verdict(&v, 0, &[], false), "REQUEST_CHANGES");
+    }
+
+    #[test]
+    fn a_memory_the_code_contradicts_is_flagged_not_followed() {
+        let out = parse_review(
+            "```json\n{\"verdict\":\"APPROVE\",\"findings\":[{\"file\":\"a.rs\",\"line\":1,\"memories\":[\"M1\"]}],\
+             \"memory_conflicts\":[{\"memory\":\"M2\",\"code\":\"src/pricing.rs:14\",\"why\":\"prices now come from the prices table\"},\
+             {\"memory\":\"[m2]\",\"code\":\"src/pricing.rs:20\"},\
+             {\"memory\":\"M9\",\"why\":\"not a memory it was given\"}]}\n```",
+        )
+        .unwrap();
+        assert_eq!(out.findings[0].memories, vec!["M1".to_string()]);
+        let mem = memory_block();
+        let stale = memory_conflicts(&out.memory_conflicts, &mem);
+        assert_eq!(
+            stale,
+            vec![(
+                "mem-b".to_string(),
+                "Prices come from the pricing service.".to_string(),
+                "`src/pricing.rs:14`: prices now come from the prices table".to_string()
+            )]
+        );
+        let md = memory_conflicts_markdown(&stale);
+        assert!(md.contains("#### Memories that look out of date"));
+        assert!(md.contains("weren't followed"));
+        assert!(md.contains("\"Prices come from the pricing service.\""));
+        assert!(memory_conflicts_markdown(&[]).is_empty());
+        // An older review output without the fields still reads.
+        let old = parse_review("```json\n{\"verdict\":\"APPROVE\",\"findings\":[]}\n```").unwrap();
+        assert!(old.memory_conflicts.is_empty());
     }
 
     fn fact(text: &str, blocks: bool, why: &str) -> UnconfirmedFact {

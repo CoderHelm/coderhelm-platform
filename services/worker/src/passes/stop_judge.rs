@@ -81,6 +81,9 @@ pub async fn decide(
     if picture.overturned.is_empty() {
         picture.overturned = overturned(state, team_id, &picture).await;
     }
+    if picture.memories.is_empty() {
+        picture.memories = repo_memories(state, team_id, subject, &picture).await;
+    }
     let picture = picture.with_ids();
     let judged = judge::judge(&model, picture.clone()).await;
     if let Ok(u) = model.usage.lock() {
@@ -88,6 +91,63 @@ pub async fn decide(
     }
     keep(state, team_id, subject, head_sha, &picture, &judged).await;
     judged
+}
+
+/// The repository's memories that bear on the decision, as lines for the
+/// judge's picture (context, never evidence: see `common::stop_judge`).
+/// Best effort: empty when the repository is unknown or has none.
+async fn repo_memories(
+    state: &WorkerState,
+    team_id: &str,
+    subject: &Subject,
+    picture: &Picture,
+) -> Vec<String> {
+    let (repo, run_ref) = match subject {
+        Subject::Pr { repo, number } => (repo.clone(), format!("PR #{number}")),
+        Subject::Run { run_id } => {
+            let repo = state
+                .dynamo
+                .get_item()
+                .table_name(&state.config.runs_table_name)
+                .key(
+                    "team_id",
+                    aws_sdk_dynamodb::types::AttributeValue::S(team_id.to_string()),
+                )
+                .key(
+                    "run_id",
+                    aws_sdk_dynamodb::types::AttributeValue::S(run_id.clone()),
+                )
+                .projection_expression("#r")
+                .expression_attribute_names("#r", "repo")
+                .send()
+                .await
+                .ok()
+                .and_then(|o| o.item()?.get("repo")?.as_s().ok().cloned())
+                .unwrap_or_default();
+            (repo, run_id.clone())
+        }
+    };
+    let Some((owner, name)) = repo.split_once('/') else {
+        return Vec::new();
+    };
+    let query = format!(
+        "{}\n{}\n{}",
+        picture.ticket_title,
+        picture.reason,
+        common::truncate_str(&picture.diff_summary, 1500)
+    );
+    crate::memory::recall::for_agent(
+        state,
+        crate::memory::recall::Agent::StopJudge,
+        team_id,
+        owner,
+        name,
+        &query,
+        &run_ref,
+        &picture.ticket_title,
+    )
+    .await
+    .lines
 }
 
 /// Days of the outcome log the judge remembers.

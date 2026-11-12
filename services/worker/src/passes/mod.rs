@@ -968,48 +968,42 @@ pub(crate) fn ticket_update_note(
 /// no-changes / clarification / needs_input / blocked-plan returns leaked the
 /// memory lock for its full 15-minute TTL, forcing subsequent runs on the
 /// repo to start stateless.
-/// Counts each recalled memory's use, so people can see which memories the
-/// agents actually lean on. Best effort: a failed count never fails a run.
-async fn record_memory_use(state: &WorkerState, msg: &TicketMessage, run_id: &str, ids: &[String]) {
-    let now = chrono::Utc::now().to_rfc3339();
-    for id in ids {
-        let sk = common::memory_meta::usage_sk(&msg.repo_owner, &msg.repo_name, id);
-        let res = state
-            .dynamo
-            .update_item()
-            .table_name(&state.config.settings_table_name)
-            .key(
-                "pk",
-                aws_sdk_dynamodb::types::AttributeValue::S(msg.team_id.clone()),
-            )
-            .key("sk", aws_sdk_dynamodb::types::AttributeValue::S(sk))
-            .update_expression(
-                "ADD uses :one SET last_used_at = :now, last_run_id = :run, last_title = :title",
-            )
-            .expression_attribute_values(
-                ":one",
-                aws_sdk_dynamodb::types::AttributeValue::N("1".into()),
-            )
-            .expression_attribute_values(
-                ":now",
-                aws_sdk_dynamodb::types::AttributeValue::S(now.clone()),
-            )
-            .expression_attribute_values(
-                ":run",
-                aws_sdk_dynamodb::types::AttributeValue::S(run_id.to_string()),
-            )
-            .expression_attribute_values(
-                ":title",
-                aws_sdk_dynamodb::types::AttributeValue::S(
-                    common::truncate_str(&msg.title, 120).to_string(),
-                ),
-            )
-            .send()
-            .await;
-        if let Err(e) = res {
-            warn!(run_id, error = %e, "Could not count a memory's use");
-        }
-    }
+/// Counts the planner's use of each recalled memory, and the coding agent's
+/// of the ones in its own block, so people can see which memories the
+/// agents actually lean on (`memory::recall::record`). Best effort: a failed
+/// count never fails a run.
+async fn record_memory_use(
+    state: &WorkerState,
+    msg: &TicketMessage,
+    run_id: &str,
+    mem: &crate::memory::AgentMemory,
+) -> String {
+    use crate::memory::recall::{self, Agent};
+    let (team, owner, name) = (&msg.team_id, &msg.repo_owner, &msg.repo_name);
+    recall::record(
+        state,
+        Agent::Planner,
+        team,
+        owner,
+        name,
+        run_id,
+        &msg.title,
+        &mem.last_recalled,
+    )
+    .await;
+    let coder = recall::block(Agent::Coder, &mem.last_picked);
+    recall::record(
+        state,
+        Agent::Coder,
+        team,
+        owner,
+        name,
+        run_id,
+        &msg.title,
+        &coder.ids(),
+    )
+    .await;
+    coder.text
 }
 
 async fn close_memory(state: &WorkerState, mem: Option<crate::memory::AgentMemory>) {
@@ -2265,11 +2259,12 @@ async fn run_passes(
             let ctx = mem
                 .recall_context(&format!("{} {} {}", msg.title, msg.body, msg.repo_name), 5)
                 .await;
-            record_memory_use(state, msg, run_id, &mem.last_recalled).await;
-            ctx
+            let coder = record_memory_use(state, msg, run_id, mem).await;
+            (ctx, coder)
         }
-        None => String::new(),
+        None => (String::new(), String::new()),
     };
+    let (memory_context, coder_memory) = memory_context;
     // What outcomes taught the coder in this repository: changes merged as
     // written and ones closed, rewritten or reverted, and evidence-backed
     // lessons, for the planner; the lessons and the prompt variant the
@@ -2282,7 +2277,9 @@ async fn run_passes(
         &format!("{} {}", msg.title, common::truncate_str(&msg.body, 1500)),
     )
     .await;
-    msg.coder_learning = coder_learned.implement.clone();
+    // The coding agent reads the repository's memories itself too (a
+    // dependency fix run has no planner to pass them on).
+    msg.coder_learning = format!("{}{coder_memory}", coder_learned.implement);
     let memory_context = format!("{memory_context}{}", coder_learned.context);
 
     // --- A continuation of this same run (Lambda time limit, step budget,
@@ -2858,7 +2855,8 @@ async fn run_passes(
                     let ctx = mem
                         .recall_context(&format!("{} {} {}", msg.title, msg.body, msg.repo_name), 5)
                         .await;
-                    record_memory_use(state, msg, run_id, &mem.last_recalled).await;
+                    let coder = record_memory_use(state, msg, run_id, mem).await;
+                    msg.coder_learning.push_str(&coder);
                     if !ctx.is_empty() {
                         triage_result.summary.push_str("\n\n");
                         triage_result.summary.push_str(&ctx);

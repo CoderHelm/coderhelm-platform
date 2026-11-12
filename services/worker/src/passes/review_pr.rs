@@ -2596,11 +2596,30 @@ async fn run_once(
         &format!("{title}\n{}", reward_paths.join("\n")),
     )
     .await;
+    // The repository's memories (conventions, accepted patterns, known false
+    // alarms, earlier answers), chosen by relevance to this PR. A memory
+    // never blocks on its own (`review_agent::enforce_memory_grounding`).
+    let repo_memory = crate::memory::recall::for_agent(
+        state,
+        crate::memory::recall::Agent::Reviewer,
+        &msg.team_id,
+        &msg.repo_owner,
+        &msg.repo_name,
+        &format!(
+            "{title}\n{}\n{}",
+            common::truncate_str(pr_body, 1500),
+            reward_paths.join("\n")
+        ),
+        &format!("PR #{}", msg.pr_number),
+        &format!("PR #{}: {title}", msg.pr_number),
+    )
+    .await;
     let instructions_block = format!(
-        "{}{org_block}{extra}{learning}{team_lessons}{}{}",
+        "{}{org_block}{extra}{learning}{team_lessons}{}{}{}",
         super::format_instructions_block(&repo_instructions),
         reward.context,
         reward.addendum,
+        repo_memory.text,
     );
     let critic_lessons = format!("{team_lessons}{}", reward.context);
     let changed = review_agent::changed_right_lines(&compare);
@@ -3150,6 +3169,19 @@ async fn run_once(
             on_failed_lookups, "Blocking findings resting on failed lookups made non-blocking"
         );
     }
+    // A blocking finding that rests on a remembered rule must show it in the
+    // code of this change; one that doesn't is kept as a note saying so.
+    let on_memory_only = review_agent::enforce_memory_grounding(
+        &mut findings,
+        &repo_memory,
+        &changed_files(&compare).into_iter().collect::<Vec<_>>(),
+    );
+    if on_memory_only > 0 {
+        info!(
+            pr = msg.pr_number,
+            on_memory_only, "Blocking findings resting only on a memory made non-blocking"
+        );
+    }
 
     // 3) What the repository requires: with "Require tests" on, a missing or
     // stale test blocks unless a checked exemption applies (a package without
@@ -3611,6 +3643,25 @@ async fn run_once(
     };
     full_body.push_str(&judge_note);
     full_body.push_str(&review_agent::unconfirmed_markdown(&unconfirmed));
+    // Memories the code of this change contradicts: noted on the review and
+    // flagged on the Memory page for a person; never followed.
+    let stale_memories = review_agent::memory_conflicts(&output.memory_conflicts, &repo_memory);
+    full_body.push_str(&review_agent::memory_conflicts_markdown(&stale_memories));
+    for (id, _, shows) in &stale_memories {
+        crate::memory::recall::flag_out_of_date(
+            state,
+            &msg.team_id,
+            &msg.repo_owner,
+            &msg.repo_name,
+            id,
+            shows,
+            &format!(
+                "https://github.com/{}/{}/pull/{}",
+                msg.repo_owner, msg.repo_name, msg.pr_number
+            ),
+        )
+        .await;
+    }
     if !verify_md.is_empty() {
         full_body.push_str(&format!("\n\n{verify_md}"));
     }

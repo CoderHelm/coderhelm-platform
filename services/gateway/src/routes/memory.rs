@@ -54,6 +54,10 @@ struct MemoryItem {
     uses: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     last_used: Option<LastUse>,
+    /// Set when a review found the code contradicts it: possibly out of
+    /// date, for a person to edit or forget.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    flagged: Option<Flagged>,
 }
 
 #[derive(Serialize, Clone, Default)]
@@ -61,19 +65,37 @@ struct LastUse {
     at: String,
     run_id: String,
     title: String,
+    /// The agent it was handed to last (`memory_meta::AGENTS`).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    agent: String,
+}
+
+#[derive(Serialize, Clone, Default, Debug, PartialEq)]
+struct Flagged {
+    at: String,
+    note: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    link: String,
+}
+
+/// What the usage items say about one memory.
+#[derive(Clone, Default)]
+struct Usage {
+    uses: u64,
+    last: LastUse,
+    flagged: Option<Flagged>,
 }
 
 fn item_from(
     id: String,
     node: &mentedb_core::memory::MemoryNode,
-    usage: &HashMap<String, (u64, LastUse)>,
+    usage: &HashMap<String, Usage>,
 ) -> MemoryItem {
     let meta = common::memory_meta::parse(&node.tags);
-    let (uses, last) = usage
-        .get(&id)
-        .cloned()
-        .map(|(n, l)| (n, Some(l)))
-        .unwrap_or((0, None));
+    let u = usage.get(&id).cloned();
+    let uses = u.as_ref().map(|u| u.uses).unwrap_or(0);
+    let flagged = u.as_ref().and_then(|u| u.flagged.clone());
+    let last = u.filter(|u| u.uses > 0).map(|u| u.last);
     MemoryItem {
         content: node.content.clone(),
         memory_type: memory_type_str(&node.memory_type).to_string(),
@@ -88,6 +110,7 @@ fn item_from(
         origin: meta.origin,
         uses,
         last_used: last,
+        flagged,
         id,
     }
 }
@@ -99,7 +122,7 @@ async fn load_usage(
     team_id: &str,
     owner: &str,
     name: &str,
-) -> HashMap<String, (u64, LastUse)> {
+) -> HashMap<String, Usage> {
     let prefix = common::memory_meta::usage_prefix(owner, name);
     let mut out = HashMap::new();
     let mut start: Option<HashMap<String, AttributeValue>> = None;
@@ -128,16 +151,25 @@ async fn load_usage(
                 .and_then(|v| v.as_n().ok())
                 .and_then(|n| n.parse().ok())
                 .unwrap_or(0);
+            let flagged = Some(s("conflict_at"))
+                .filter(|a| !a.is_empty())
+                .map(|at| Flagged {
+                    at,
+                    note: s("conflict_note"),
+                    link: s("conflict_link"),
+                });
             out.insert(
                 id,
-                (
+                Usage {
                     uses,
-                    LastUse {
+                    last: LastUse {
                         at: s("last_used_at"),
                         run_id: s("last_run_id"),
                         title: s("last_title"),
+                        agent: s("last_agent"),
                     },
-                ),
+                    flagged,
+                },
             );
         }
         match r.last_evaluated_key() {
@@ -966,6 +998,10 @@ struct Profile {
     name: &'static str,
     role: &'static str,
     uses_repo_memory: bool,
+    /// Memories it was handed in the last [`DAYS`] days, and how many
+    /// times it read them (`memory_meta::agent_use_sk`).
+    memory_uses: u64,
+    memory_reads: u64,
     knows: Vec<Knows>,
     learned: Vec<Lesson>,
     activity_label: String,
@@ -1005,6 +1041,10 @@ struct Facts {
     sources: Vec<String>,
     reviews: Vec<HashMap<String, AttributeValue>>,
     runs: Vec<HashMap<String, AttributeValue>>,
+    /// What each agent read in the last [`DAYS`] days.
+    agent_uses: HashMap<String, common::memory_meta::AgentUse>,
+    /// Memories the feedback agent learned from what people asked for.
+    feedback_learned: Vec<Lesson>,
 }
 
 const DAYS: i64 = 30;
@@ -1018,18 +1058,24 @@ fn rules_line(label: &str, text: &str) -> Option<Knows> {
     })
 }
 
-fn memory_line(f: &Facts) -> Knows {
+/// What the repo's memories are to one agent: how many there are and when
+/// it reads them (`when`, e.g. "on each ticket").
+fn memory_line(f: &Facts, when: &str) -> Knows {
     Knows {
         label: "Memories about this repo".into(),
         detail: if f.memories == 0 {
-            "None yet. They are learned as it finishes tickets, or a person adds them.".into()
+            "None yet. They are learned as tickets and pull requests are finished, or a person adds them.".into()
         } else {
             format!(
-                "{} in all: {} pinned (always used), {} added by people. The five most relevant come along on each ticket.",
+                "{} in all: {} pinned (always used), {} added by people. The pinned ones and the most relevant come along {when}.",
                 f.memories, f.pinned, f.from_people
             )
         },
     }
+}
+
+fn agent_use(f: &Facts, id: &str) -> common::memory_meta::AgentUse {
+    f.agent_uses.get(id).copied().unwrap_or_default()
 }
 
 fn sources_line(f: &Facts) -> Knows {
@@ -1124,6 +1170,11 @@ fn build_profiles(f: &Facts) -> Vec<Profile> {
             )
         },
     });
+    reviewer_knows.push(memory_line(f, "on each review"));
+    reviewer_knows.push(Knows {
+        label: "How it treats a memory".into(),
+        detail: "It uses them to choose where to look and to leave settled points alone. A memory never blocks a pull request on its own: a blocking comment points at the code. A memory the code contradicts is flagged here instead of followed.".into(),
+    });
     reviewer_knows.push(Knows {
         label: "The repo's own instructions".into(),
         detail: "AGENTS.md, CLAUDE.md and similar files, read at the PR's commit on every review."
@@ -1184,7 +1235,9 @@ fn build_profiles(f: &Facts) -> Vec<Profile> {
             id: "reviewer",
             name: "Reviewer",
             role: "Reviews pull requests, comments on the exact lines, and approves when nothing is left to change.",
-            uses_repo_memory: false,
+            uses_repo_memory: true,
+            memory_uses: agent_use(f, "reviewer").memories,
+            memory_reads: agent_use(f, "reviewer").reads,
             knows: reviewer_knows,
             learned: lessons,
             activity_label: format!("reviews in the last {DAYS} days ({approve} approved, {changes} asked for changes)"),
@@ -1196,7 +1249,9 @@ fn build_profiles(f: &Facts) -> Vec<Profile> {
             name: "Planner",
             role: "Reads a ticket, works out the root cause and writes the plan the coding agent follows.",
             uses_repo_memory: true,
-            knows: vec![memory_line(f), sources_line(f)],
+            memory_uses: agent_use(f, "planner").memories,
+            memory_reads: agent_use(f, "planner").reads,
+            knows: vec![memory_line(f, "on each ticket"), sources_line(f)],
             learned: f.most_used.clone(),
             activity_label: format!("tickets planned in the last {DAYS} days"),
             activity_count: planned,
@@ -1207,7 +1262,9 @@ fn build_profiles(f: &Facts) -> Vec<Profile> {
             name: "Coding agent",
             role: "Writes the change, runs the checks and opens the pull request. After each ticket it saves what it learned.",
             uses_repo_memory: true,
-            knows: vec![memory_line(f), sources_line(f)],
+            memory_uses: agent_use(f, "coder").memories,
+            memory_reads: agent_use(f, "coder").reads,
+            knows: vec![memory_line(f, "on each ticket"), sources_line(f)],
             learned: coder_learned,
             activity_label: format!("pull requests merged in the last {DAYS} days"),
             activity_count: merged,
@@ -1217,18 +1274,44 @@ fn build_profiles(f: &Facts) -> Vec<Profile> {
             id: "feedback",
             name: "Feedback agent",
             role: "Answers review comments on Coderhelm's pull requests and fixes the CI it broke.",
-            uses_repo_memory: false,
+            uses_repo_memory: true,
+            memory_uses: agent_use(f, "feedback").memories,
+            memory_reads: agent_use(f, "feedback").reads,
             knows: vec![
                 Knows {
                     label: "The pull request's conversation".into(),
                     detail: "Every comment and review thread on the PR, and the CI results.".into(),
                 },
+                memory_line(f, "on each round of fixes"),
                 sources_line(f),
             ],
-            learned: Vec::new(),
+            learned: f.feedback_learned.clone(),
             activity_label: format!("pull requests it pushed fixes to in the last {DAYS} days"),
             activity_count: fixes,
             recent: recent_fixes,
+        },
+        Profile {
+            id: "stop_judge",
+            name: "Stop judge",
+            role: "Decides whether a run goes on, asks a person, or stops, before anything costly happens.",
+            uses_repo_memory: true,
+            memory_uses: agent_use(f, "stop_judge").memories,
+            memory_reads: agent_use(f, "stop_judge").reads,
+            knows: vec![
+                Knows {
+                    label: "The run's evidence".into(),
+                    detail: "The ticket, the plan, the diff, CI results and the open threads.".into(),
+                },
+                memory_line(f, "with each decision, as context it weighs against the evidence"),
+                Knows {
+                    label: "Decisions people overturned".into(),
+                    detail: "Its recent holds and questions that people's actions showed weren't needed.".into(),
+                },
+            ],
+            learned: Vec::new(),
+            activity_label: format!("decisions that read this repo's memories in the last {DAYS} days"),
+            activity_count: agent_use(f, "stop_judge").reads as usize,
+            recent: Vec::new(),
         },
     ]
 }
@@ -1267,6 +1350,50 @@ async fn instructions(state: &AppState, team_id: &str, sk: &str) -> String {
         .ok()
         .and_then(|o| o.item().map(|i| s_of(i, "instructions")))
         .unwrap_or_default()
+}
+
+/// What each agent read of a repo's memories in the last [`DAYS`] days.
+async fn load_agent_uses(
+    state: &AppState,
+    team_id: &str,
+    owner: &str,
+    name: &str,
+) -> HashMap<String, common::memory_meta::AgentUse> {
+    let prefix = common::memory_meta::agent_use_prefix(owner, name);
+    let mut items: Vec<(String, u64, u64)> = Vec::new();
+    let mut start: Option<HashMap<String, AttributeValue>> = None;
+    let n = |i: &HashMap<String, AttributeValue>, k: &str| -> u64 {
+        i.get(k)
+            .and_then(|v| v.as_n().ok())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(0)
+    };
+    loop {
+        let Ok(r) = state
+            .dynamo
+            .query()
+            .table_name(&state.config.settings_table_name)
+            .key_condition_expression("pk = :pk AND begins_with(sk, :p)")
+            .expression_attribute_values(":pk", AttributeValue::S(team_id.into()))
+            .expression_attribute_values(":p", AttributeValue::S(prefix.clone()))
+            .set_exclusive_start_key(start.take())
+            .send()
+            .await
+        else {
+            break;
+        };
+        for i in r.items() {
+            items.push((s_of(i, "sk"), n(i, "reads"), n(i, "memories")));
+        }
+        match r.last_evaluated_key() {
+            Some(k) => start = Some(k.clone()),
+            None => break,
+        }
+    }
+    let since = (chrono::Utc::now() - chrono::Duration::days(DAYS - 1))
+        .format("%Y-%m-%d")
+        .to_string();
+    common::memory_meta::agent_uses_since(&prefix, &items, &since)
 }
 
 /// GET /api/memories/agents?repo=owner/name — what each agent knows about
@@ -1319,6 +1446,25 @@ pub async fn agent_profiles(
     f.recent_learned = by_new.iter().take(5).map(|i| lesson(i)).collect();
     let mut by_use: Vec<&MemoryItem> = items.iter().filter(|i| i.uses > 0).collect();
     by_use.sort_by_key(|i| std::cmp::Reverse(i.uses));
+    let mut by_feedback: Vec<&MemoryItem> = items
+        .iter()
+        .filter(|i| i.origin.learned_by == "feedback")
+        .collect();
+    by_feedback.sort_by_key(|i| std::cmp::Reverse(i.created_at));
+    f.feedback_learned = by_feedback
+        .iter()
+        .take(5)
+        .map(|i| {
+            let mut l = lesson(i);
+            l.source = if i.origin.title.is_empty() {
+                "Learned from a change a person asked for".into()
+            } else {
+                format!("Learned from a change asked for on \"{}\"", i.origin.title)
+            };
+            l
+        })
+        .collect();
+    f.agent_uses = load_agent_uses(&state, team, owner, name).await;
     f.most_used = by_use
         .iter()
         .take(5)
@@ -1409,18 +1555,54 @@ mod tests {
     }
 
     #[test]
-    fn the_four_profiles_say_what_each_agent_really_uses() {
-        let p = build_profiles(&facts());
+    fn every_agent_uses_the_repos_memories_and_says_how_many() {
+        let mut f = facts();
+        f.agent_uses = HashMap::from([
+            (
+                "reviewer".to_string(),
+                common::memory_meta::AgentUse {
+                    reads: 12,
+                    memories: 40,
+                },
+            ),
+            (
+                "stop_judge".to_string(),
+                common::memory_meta::AgentUse {
+                    reads: 3,
+                    memories: 6,
+                },
+            ),
+        ]);
+        let p = build_profiles(&f);
         let ids: Vec<&str> = p.iter().map(|x| x.id).collect();
-        assert_eq!(ids, vec!["reviewer", "planner", "coder", "feedback"]);
-        // Only the planner and the coding agent read the repo's memory.
+        // Every agent the worker records memory reads for is listed.
         assert_eq!(
-            p.iter()
-                .filter(|x| x.uses_repo_memory)
-                .map(|x| x.id)
-                .collect::<Vec<_>>(),
-            vec!["planner", "coder"]
+            ids,
+            common::memory_meta::AGENTS
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>()
         );
+        for (x, (_, name)) in p.iter().zip(common::memory_meta::AGENTS) {
+            assert_eq!(x.name, *name);
+            assert!(x.uses_repo_memory, "{} uses them", x.id);
+            assert!(
+                x.knows
+                    .iter()
+                    .any(|k| k.label == "Memories about this repo"),
+                "{} says what it knows of them",
+                x.id
+            );
+        }
+        assert_eq!((p[0].memory_uses, p[0].memory_reads), (40, 12));
+        assert_eq!((p[4].memory_uses, p[4].memory_reads), (6, 3));
+        assert_eq!(p[4].activity_count, 3);
+        assert_eq!((p[3].memory_uses, p[3].memory_reads), (0, 0));
+        // The reviewer says a memory never blocks on its own.
+        assert!(p[0]
+            .knows
+            .iter()
+            .any(|k| k.detail.contains("never blocks a pull request on its own")));
         let reviewer = &p[0];
         assert_eq!(reviewer.activity_count, 2);
         assert!(reviewer
@@ -1443,6 +1625,7 @@ mod tests {
         assert!(coder.knows[0].detail.contains("1 pinned"));
         let feedback = &p[3];
         assert_eq!(feedback.activity_count, 1);
+        assert!(feedback.learned.is_empty());
         assert_eq!(feedback.recent[0].outcome, "2 fixes pushed");
         assert_eq!(p[1].knows[1].detail, "Production database");
     }

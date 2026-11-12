@@ -579,6 +579,23 @@ pub async fn run(
         } else {
             ""
         };
+    // The repository's memories for this round (how to build and test, past
+    // fixes, the team's preferences), chosen by relevance to what it fixes.
+    let repo_memory = crate::memory::recall::for_agent(
+        state,
+        crate::memory::recall::Agent::Feedback,
+        &msg.team_id,
+        &msg.repo_owner,
+        &msg.repo_name,
+        &format!(
+            "{}\n{}",
+            common::truncate_str(&formatted, 3000),
+            common::truncate_str(&ci_failure_block, 1500)
+        ),
+        &msg.run_id,
+        &format!("PR #{}", msg.pr_number),
+    )
+    .await;
     let system = format!(
         "You are a feedback agent for the {owner}/{repo} repository. \
          You respond to reviewer comments on pull requests by reading and writing files \
@@ -595,8 +612,9 @@ pub async fn run(
          comment did not name stays exactly as it is. \
          Your changes land on the pull request as one commit in one push when you finish, after \
          CoderHelm checks them (scope, logs, the full test suite). \
-         Your output is posted directly as a GitHub comment — write natural replies, no meta-commentary.{voice_block}{team_block}{tests_block}{logs_block}",
+         Your output is posted directly as a GitHub comment — write natural replies, no meta-commentary.{voice_block}{team_block}{tests_block}{logs_block}{memory_block}",
         logs_block = super::review_fix::logs::GUIDANCE,
+        memory_block = repo_memory.text,
         owner = msg.repo_owner,
         repo = msg.repo_name,
     );
@@ -1253,6 +1271,30 @@ Rules:
     }
     // A held round's replies say so, first.
     let response = super::review_fix::held_replies(&response, &held);
+    // What a person asked for and CoderHelm pushed teaches the repository's
+    // memory the team's preference behind it (none for a one-off fix).
+    if fix_pushed && human_round {
+        let asks: Vec<String> = comments
+            .iter()
+            .filter(|c| !c.is_context)
+            .map(|c| c.body.clone())
+            .chain(std::iter::once(msg.review_body.clone()))
+            .collect();
+        crate::memory::recall::learn_from_feedback(
+            state,
+            &provider,
+            &msg.team_id,
+            &msg.repo_owner,
+            &msg.repo_name,
+            &crate::memory::LearningOrigin {
+                run_id: msg.run_id.clone(),
+                ticket_id: ticket.0.clone(),
+                title: ticket.1.clone(),
+            },
+            &crate::memory::recall::feedback_summary(&asks, &response),
+        )
+        .await;
+    }
     // Who must approve again, on the reply to the person who asked.
     let reapproval_note = if dismissed.is_empty() {
         String::new()
