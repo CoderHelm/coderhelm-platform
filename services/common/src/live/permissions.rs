@@ -84,6 +84,9 @@ pub struct PermissionCheck {
     /// permission limit, which only an AWS admin's access stack widens.
     #[serde(default)]
     pub optional_boundary_blocks: Vec<String>,
+    /// The role checked (its name), so a missing permission is named on the role that lacks it.
+    #[serde(default)]
+    pub role: String,
 }
 
 /// What the page shows for one account.
@@ -113,6 +116,12 @@ impl PermissionCheck {
             optional_missing: Vec::new(),
             optional_checked: false,
             optional_boundary_blocks: Vec::new(),
+            role: target
+                .role_arn
+                .rsplit('/')
+                .next()
+                .unwrap_or_default()
+                .to_string(),
         }
     }
 
@@ -200,17 +209,20 @@ impl PermissionCheck {
             });
         }
         if self.install_account && self.scp_blocks.is_empty() {
-            // Nothing for a person to launch in AWS: the install's own stack
-            // grants these with its next version update.
+            // What IAM said, on which role: nothing about why. Whether the
+            // stack grants it was not read here, so it is never claimed.
+            let role = if self.role.is_empty() {
+                "this install's read role".to_string()
+            } else {
+                self.role.clone()
+            };
             return Some(Problem {
                 code: "install_update",
                 message: format!(
-                    "{} read-only permission{} of this release {} not on this install's read role yet.",
-                    self.missing.len(),
-                    if self.missing.len() == 1 { "" } else { "s" },
-                    if self.missing.len() == 1 { "is" } else { "are" },
+                    "IAM's policy simulator says {role} isn't allowed {}.",
+                    self.missing.join(", "),
                 ),
-                fix: "They arrive with this install's next version update. Nothing is needed in AWS.".into(),
+                fix: "A version update that grants it adds it to the install's own role; nothing is needed in AWS.".into(),
             });
         }
         if !self.scp_blocks.is_empty() {
@@ -372,6 +384,7 @@ impl PermissionCheck {
             "abilities": abilities,
             "update": update,
             "install_account": self.install_account,
+            "role": self.role,
             "optional_missing": self.optional_missing,
             "problem": self.problem(pressed),
         })
@@ -434,12 +447,14 @@ fn order(v: &mut Vec<String>) {
 }
 
 /// The resource each action is simulated on: one that the template's
-/// statement for it covers.
+/// statement for it covers, and of a type the action applies to. An action
+/// without resource-level permissions (`logs:StopQuery`, `logs:DescribeLogGroups`)
+/// is simulated on `*`: on any other ARN IAM's simulator answers implicitDeny
+/// even when the role's policy allows it on `*` (iam_resource_types.json).
 pub fn simulated_resource(action: &str, role_arn: &str, region: &str, account: &str) -> String {
     match action {
         "logs:StartQuery"
         | "logs:GetQueryResults"
-        | "logs:StopQuery"
         | "logs:FilterLogEvents"
         | "logs:GetLogEvents" => {
             format!("arn:aws:logs:{region}:{account}:log-group:coderhelm-permission-check")
@@ -718,7 +733,7 @@ mod tests {
         assert_eq!(v["install_account"], true);
         let p = c.problem(true).expect("says what happens");
         assert_eq!(p.code, "install_update");
-        assert!(p.fix.contains("next version update"));
+        assert!(p.fix.contains("version update that grants it"));
         assert!(!p.fix.contains("Update in AWS"));
     }
 
@@ -995,6 +1010,57 @@ mod tests {
         c.error = "Coderhelm couldn't use the role in your AWS account (AccessDenied).".into();
         assert_eq!(c.status(), "error");
         assert_eq!(c.problem(false).unwrap().code, "role");
+    }
+
+    #[test]
+    fn an_action_without_resource_level_permissions_is_simulated_on_star() {
+        // On any other ARN the simulator answers implicitDeny for such an
+        // action whatever the policy says: logs:StopQuery read as missing on
+        // every install whose role allows it on "*".
+        let types: Value = serde_json::from_str(include_str!("iam_resource_types.json")).unwrap();
+        let types = types["actions"].as_object().unwrap();
+        let t = target();
+        for a in log_reader::simulated_actions() {
+            let kinds: Vec<&str> = types
+                .get(a)
+                .unwrap_or_else(|| panic!("{a}: add it to iam_resource_types.json"))
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|k| k.as_str().unwrap())
+                .collect();
+            let r = simulated_resource(a, &t.role_arn, "eu-west-1", "111122223333");
+            if kinds == [""] {
+                assert_eq!(r, "*", "{a} has no resource-level permissions");
+            }
+        }
+        assert_eq!(
+            simulated_resource("logs:StopQuery", &t.role_arn, "eu-west-1", "111122223333"),
+            "*"
+        );
+    }
+
+    #[test]
+    fn the_install_problem_names_the_role_and_never_claims_the_stack_grants_it() {
+        let mut c = checked();
+        c.install_account = true;
+        apply_simulation(&mut c, &[sim("logs:StopQuery", false)]);
+        assert_eq!(c.role, "CoderHelmLogReader");
+        let p = c.problem(false).unwrap();
+        assert_eq!(p.code, "install_update");
+        assert!(
+            p.message
+                .contains("CoderHelmLogReader isn't allowed logs:StopQuery"),
+            "{}",
+            p.message
+        );
+        for claim in ["drift", "grants it, yet", "changed in AWS"] {
+            assert!(!p.message.contains(claim) && !p.fix.contains(claim));
+        }
+        assert_eq!(
+            c.view(false, "https://b/launch/v1/coderhelm-log-reader.yaml")["role"],
+            "CoderHelmLogReader"
+        );
     }
 
     #[test]

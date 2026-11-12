@@ -1,0 +1,241 @@
+{
+ "about": "The IAM resource types each action CoderHelm's read role uses applies to, from AWS's Service Authorization Reference (via the public iam-dataset). [\"\"] means the action has no resource-level permissions: it is allowed only on \"*\", and IAM's policy simulator answers implicitDeny for it on any other ARN.",
+ "actions": {
+  "logs:DescribeLogGroups": [
+   ""
+  ],
+  "logs:StartQuery": [
+   "log-group"
+  ],
+  "logs:GetQueryResults": [
+   "log-group"
+  ],
+  "logs:StopQuery": [
+   ""
+  ],
+  "logs:FilterLogEvents": [
+   "log-group"
+  ],
+  "logs:GetLogEvents": [
+   "log-stream"
+  ],
+  "cloudwatch:DescribeAlarms": [
+   "alarm"
+  ],
+  "sts:GetCallerIdentity": [
+   ""
+  ],
+  "iam:SimulatePrincipalPolicy": [
+   "group",
+   "role",
+   "user"
+  ],
+  "cloudformation:DescribeStacks": [
+   "stack"
+  ],
+  "cloudwatch:GetMetricData": [
+   "dataset"
+  ],
+  "cloudwatch:ListMetrics": [
+   "dataset"
+  ],
+  "airflow:ListEnvironments": [
+   ""
+  ],
+  "airflow:GetEnvironment": [
+   "environment"
+  ],
+  "airflow:InvokeRestApi": [
+   "rbac-role"
+  ],
+  "ecs:ListClusters": [
+   ""
+  ],
+  "ecs:ListServices": [
+   ""
+  ],
+  "ecs:DescribeServices": [
+   "service"
+  ],
+  "ecs:DescribeTaskDefinition": [
+   ""
+  ],
+  "ecs:ListTasks": [
+   "container-instance"
+  ],
+  "ecs:DescribeTasks": [
+   "task"
+  ],
+  "lambda:ListTags": [
+   "capacityProvider",
+   "code signing config",
+   "eventSourceMapping",
+   "function",
+   "microvmImage",
+   "networkConnector",
+   "webFunction"
+  ],
+  "logs:ListTagsForResource": [
+   "anomaly-detector",
+   "delivery",
+   "delivery-destination",
+   "delivery-source",
+   "destination",
+   "log-group",
+   "lookup-table"
+  ],
+  "cloudformation:ListStackResources": [
+   "stack"
+  ],
+  "ecr:BatchGetImage": [
+   "repository"
+  ],
+  "ecr:ListTagsForResource": [
+   "repository"
+  ],
+  "s3:GetEncryptionConfiguration": [
+   "bucket"
+  ],
+  "s3:GetBucketPolicy": [
+   "accesspoint",
+   "bucket"
+  ],
+  "s3:GetBucketPolicyStatus": [
+   "bucket"
+  ],
+  "kms:DescribeKey": [
+   "key"
+  ],
+  "kms:GetKeyPolicy": [
+   "key"
+  ],
+  "bedrock:Retrieve": [
+   "knowledge-base"
+  ],
+  "bedrock:GetDocumentContent": [
+   ""
+  ],
+  "bedrock:ListKnowledgeBases": [
+   ""
+  ],
+  "bedrock:GetKnowledgeBase": [
+   "knowledge-base"
+  ],
+  "bedrock:ListDataSources": [
+   "knowledge-base"
+  ],
+  "bedrock:GetDataSource": [
+   "knowledge-base"
+  ],
+  "s3:ListBucket": [
+   "accesspoint",
+   "bucket"
+  ],
+  "s3:GetBucketLocation": [
+   "accesspoint",
+   "bucket"
+  ],
+  "s3:GetObject": [
+   "accesspointobject",
+   "object"
+  ],
+  "kms:Decrypt": [
+   "key"
+  ],
+  "bedrock:IngestKnowledgeBaseDocuments": [
+   "knowledge-base"
+  ],
+  "bedrock:DeleteKnowledgeBaseDocuments": [
+   "knowledge-base"
+  ],
+  "bedrock:GetKnowledgeBaseDocuments": [
+   "knowledge-base"
+  ],
+  "bedrock:ListKnowledgeBaseDocuments": [
+   "knowledge-base"
+  ],
+  "bedrock:StartIngestionJob": [
+   "knowledge-base"
+  ],
+  "bedrock:GetIngestionJob": [
+   "knowledge-base"
+  ],
+  "ec2:DescribeInstances": [
+   ""
+  ],
+  "ec2:DescribeImages": [
+   ""
+  ],
+  "autoscaling:DescribeAutoScalingGroups": [
+   ""
+  ],
+  "elasticloadbalancing:DescribeTargetGroups": [
+   ""
+  ],
+  "elasticloadbalancing:DescribeLoadBalancers": [
+   ""
+  ],
+  "eks:ListClusters": [
+   ""
+  ],
+  "eks:DescribeCluster": [
+   "cluster"
+  ],
+  "eks:ListNodegroups": [
+   "cluster"
+  ],
+  "eks:DescribeNodegroup": [
+   "nodegroup"
+  ],
+  "rds:DescribeDBClusters": [
+   "cluster"
+  ],
+  "rds:DescribeDBInstances": [
+   "db"
+  ],
+  "rds:DescribePendingMaintenanceActions": [
+   "cluster",
+   "db"
+  ],
+  "elasticache:DescribeServiceUpdates": [
+   ""
+  ],
+  "elasticache:DescribeUpdateActions": [
+   "cluster",
+   "replicationgroup"
+  ],
+  "es:ListDomainNames": [
+   ""
+  ],
+  "es:DescribeDomains": [
+   "domain"
+  ],
+  "ecr:DescribeImageScanFindings": [
+   "repository"
+  ],
+  "ssm:ListInventoryEntries": [
+   ""
+  ],
+  "ssm:GetParameters": [
+   "parameter"
+  ],
+  "inspector2:ListFindings": [
+   ""
+  ],
+  "inspector2:ListCoverage": [
+   ""
+  ],
+  "inspector2:BatchGetAccountStatus": [
+   ""
+  ],
+  "health:DescribeEvents": [
+   ""
+  ],
+  "health:DescribeAffectedEntities": [
+   "event"
+  ],
+  "health:DescribeEventDetails": [
+   "event"
+  ]
+ }
+}

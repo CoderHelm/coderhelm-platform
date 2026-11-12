@@ -27,7 +27,8 @@ import * as path from "node:path";
 import { accessNames, BOUNDARY_OPTION_READS, boundaryPolicy, PolicyDocument } from "../lib/access";
 import { ACCESS_PARAMETERS, ACCESS_SHAPE, ACCESS_WRITER_NAME, buildAccess, writerPolicy } from "../lib/native/access-stack";
 import { buildNative } from "../lib/native/build";
-import { ACCESS_FILE, deployRolePolicy, nativeNames, pinnedAccess, subInstall } from "../lib/native/parent";
+import { ACCESS_FILE, deployRolePolicy, nativeBoundaryDoc, nativeNames, pinnedAccess, subInstall } from "../lib/native/parent";
+import { plainStatements } from "../lib/own-account-read";
 import { sha256File } from "../lib/native/package";
 import { prodValues, resolveValue } from "../lib/native/resolve";
 import { decision } from "./iam-eval";
@@ -235,5 +236,48 @@ test("access.json names the reads only one switch uses, so the updater asks for 
   for (const [opt, pats] of Object.entries(BOUNDARY_OPTION_READS)) {
     assert.ok(block.includes(`"${opt}"`), opt);
     for (const p of pats) assert.ok(block.includes(`"${p}"`), `${opt}: ${p}`);
+  }
+});
+
+/**
+ * What the install's AWS card checks (services/common/src/log_reader.rs
+ * ABILITIES, every read a team doesn't choose) is what the release grants the
+ * install's own read roles, the gateway's and the worker's, under today's
+ * boundary: each action, on a resource of the type IAM applies it to
+ * (services/common/src/live/iam_resource_types.json; an action with no
+ * resource-level permissions, such as logs:StopQuery, only on "*").
+ */
+test("every read the install's permission check expects is granted to the roles that read, and the boundary allows it", () => {
+  const rs = fs.readFileSync(path.join(__dirname, "..", "..", "..", "services", "common", "src", "log_reader.rs"), "utf8");
+  const types = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "..", "..", "services", "common", "src", "live", "iam_resource_types.json"), "utf8")).actions as Record<string, string[]>;
+  const block = rs.slice(rs.indexOf("pub const ABILITIES"), rs.indexOf("pub const OPTIONAL"));
+  const expected = new Set<string>();
+  for (const ab of block.split("Ability {").slice(1)) {
+    if (/chosen: true/.test(ab)) continue;
+    for (const m of ab.matchAll(/"([a-z0-9-]+:[A-Za-z0-9]+)"/g)) expected.add(m[1]);
+  }
+  assert.ok(expected.has("logs:StopQuery") && expected.size > 20, `${expected.size} actions`);
+  const acct = F.account, region = F.region;
+  const resourceOf = (a: string) => {
+    if (types[a]?.length === 1 && types[a][0] === "") return "*";
+    if (/^logs:(StartQuery|GetQueryResults|FilterLogEvents)$/.test(a)) return `arn:aws:logs:${region}:${acct}:log-group:app`;
+    if (a === "logs:GetLogEvents") return `arn:aws:logs:${region}:${acct}:log-group:app:log-stream:s`;
+    if (a === "airflow:InvokeRestApi") return `arn:aws:airflow:${region}:${acct}:role/env/Viewer`;
+    if (a === "cloudformation:DescribeStacks") return `arn:aws:cloudformation:${region}:${acct}:stack/CoderHelmLogReaderUpdate-abc/x`;
+    return "*";
+  };
+  const boundary = resolved(nativeBoundaryDoc());
+  for (const [part, id] of [["Api", "GatewayOwnAccountRead"], ["Worker", "WorkerOwnAccountRead"]]) {
+    const doc = rel.children[part].Resources[id].Properties.PolicyDocument;
+    const identity = { Version: "2012-10-17", Statement: plainStatements(resolved(doc).Statement) } as PolicyDocument;
+    const refused: string[] = [];
+    for (const a of expected) {
+      // Its own role only (a GetAtt the resolver leaves as is): checked by synth.test.ts.
+      if (a === "iam:SimulatePrincipalPolicy") continue;
+      assert.ok(types[a], `${a}: add it to iam_resource_types.json`);
+      const v = decision([identity], boundary, { action: a, resource: resourceOf(a), context: {} });
+      if (v !== "allowed") refused.push(`${a} (${v})`);
+    }
+    assert.deepEqual(refused, [], `${part}.${id}`);
   }
 });
