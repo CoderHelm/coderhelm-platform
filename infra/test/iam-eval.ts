@@ -30,6 +30,7 @@ export function conditionHolds(cond: Statement["Condition"], ctx: Record<string,
         case "StringNotEquals": if (have !== undefined && any((h, w) => h === w)) return false; break;
         case "StringLike": if (!any((h, w) => glob(w, h))) return false; break;
         case "ArnLike": if (!any((h, w) => glob(w, h))) return false; break;
+        case "ArnEquals": if (!any((h, w) => h === w)) return false; break;
         // Negated: true when the key is missing or matches none of the values.
         case "ArnNotEquals": if (have !== undefined && any((h, w) => h === w)) return false; break;
         case "ArnNotLike": if (have !== undefined && any((h, w) => glob(w, h))) return false; break;

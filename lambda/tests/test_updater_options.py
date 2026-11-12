@@ -157,12 +157,15 @@ class Options(unittest.TestCase):
         self.assertIn("Nothing changed", row["summary"])
 
     def test_the_status_reports_each_switch_as_the_stack_has_it(self):
+        # A release before private networks: those read as not there yet.
         self.assertEqual(self.status()["native"]["options"],
-                         {"InfrastructureVulnerabilities": "on", "InspectorFindings": "off", "HealthEvents": "off"})
+                         {"InfrastructureVulnerabilities": "on", "InspectorFindings": "off", "HealthEvents": "off",
+                          "PrivateNetwork1": None, "PrivateNetwork2": None, "PrivateNetwork3": None})
         # A release before the switches: none of them yet.
         self.cfn.options = {}
         self.assertEqual(self.status()["native"]["options"],
-                         {"InfrastructureVulnerabilities": None, "InspectorFindings": None, "HealthEvents": None})
+                         {"InfrastructureVulnerabilities": None, "InspectorFindings": None, "HealthEvents": None,
+                          "PrivateNetwork1": None, "PrivateNetwork2": None, "PrivateNetwork3": None})
 
     def test_refusals_say_why_and_change_nothing(self):
         for bad, why in (({}, "at least one"), ({"Hostname": "on"}, "not a switch"), ({"InspectorFindings": "yes"}, "on or off")):
@@ -197,6 +200,76 @@ class Options(unittest.TestCase):
         self.cfn.cs = {"Status": "CREATE_PENDING", "ExecutionStatus": "UNAVAILABLE"}
         u.supersede_open(self.store, self.env, self.store.get("UPDATE_STATE"), NOW, "UPDATE#later", "v1.1.0")
         self.assertEqual(self.store.get(old)["status"], "superseded")
+
+
+NET = "vpc-0a1b2c3d4e5f60718:subnet-0a1b2c3d4e5f60719,subnet-0a1b2c3d4e5f6071a"
+NET_DEPLOYED = {
+    "Parameters": dict(DEPLOYED["Parameters"], PrivateNetwork1={}, PrivateNetwork2={}, PrivateNetwork3={}),
+    "Resources": DEPLOYED["Resources"],
+}
+# What the change set adds for a private network: exactly its four resources.
+NETWORK_CHANGES = [{"ResourceChange": {"Action": "Add", "ResourceType": t, "LogicalResourceId": lid, "Replacement": "False"}}
+                   for lid, t in (("Reach2Group", "AWS::EC2::SecurityGroup"), ("Reach2Logs", "AWS::Logs::LogGroup"),
+                                  ("Reach2Role", "AWS::IAM::Role"), ("Reach2", "AWS::Lambda::Function"))]
+
+
+class PrivateNetworks(unittest.TestCase):
+    """A private network is a parameter of the install's stack, changed the same way."""
+
+    tearDown = Options.tearDown
+    switch = Options.switch
+    poll = Options.poll
+    status = Options.status
+
+    def setUp(self):
+        Options.setUp(self)
+        self.cfn = InstallCfn({"InfrastructureVulnerabilities": "on", "InspectorFindings": "off", "HealthEvents": "off",
+                               "PrivateNetwork1": NET.replace("60718", "60799"), "PrivateNetwork2": "", "PrivateNetwork3": ""})
+        self.cfn.deployed = self.cfn.fetched = NET_DEPLOYED
+        self.cfn.changes = NETWORK_CHANGES
+        u._clients["cloudformation"] = self.cfn
+
+    def test_adding_one_changes_only_its_parameter_and_says_what_it_adds(self):
+        started = self.switch(PrivateNetwork2=" vpc-0a1b2c3d4e5f60718:subnet-0a1b2c3d4e5f60719, subnet-0a1b2c3d4e5f6071a ")
+        self.assertEqual(started["options"], {"PrivateNetwork2": {"from": "", "to": NET}})
+        kw = self.cfn.created[0]
+        self.assertTrue(kw["UsePreviousTemplate"])
+        self.assertIn("add private network 2 (vpc-0a1b2c3d4e5f60718, subnets subnet-0a1b2c3d4e5f60719, subnet-0a1b2c3d4e5f6071a)", kw["Description"])
+        params = {p["ParameterKey"]: p for p in kw["Parameters"]}
+        self.assertEqual(params["PrivateNetwork2"], {"ParameterKey": "PrivateNetwork2", "ParameterValue": NET})
+        for k in ("PrivateNetwork1", "PrivateNetwork3", "InspectorFindings"):
+            self.assertEqual(params[k], {"ParameterKey": k, "UsePreviousValue": True}, k)
+        # Reviewed and confirmed like any switch: never applied on the press alone.
+        self.assertEqual(self.poll()["native"], "review")
+        self.assertEqual(self.cfn.executed, [])
+        self.assertEqual(self.status()["native"]["pending"]["options"], {"PrivateNetwork2": {"from": "", "to": NET}})
+
+    def test_removing_one_says_so(self):
+        started = self.switch(PrivateNetwork1="")
+        self.assertEqual(started["options"]["PrivateNetwork1"]["to"], "")
+        self.assertIn("remove private network 1", self.cfn.created[0]["Description"])
+
+    def test_refuses_anything_but_a_vpc_and_its_subnets(self):
+        for bad in ("on", "vpc-0a1b2c3d", "vpc-0a1b2c3d4e5f60718:sg-0a1b2c3d4e5f60719", "vpc-0a1b2c3d4e5f60718:subnet-0a1b2c3d4e5f60719;x",
+                    "vpc-0a1b2c3d4e5f60718:" + ",".join(["subnet-0a1b2c3d4e5f60719"] * 7), 3):
+            with self.assertRaisesRegex(ValueError, "vpc-<id>:subnet-<id>"):
+                self.switch(PrivateNetwork3=bad)
+        self.assertEqual(self.cfn.created, [])
+
+    def test_a_release_without_networks_says_it_arrives_with_the_next_update(self):
+        self.cfn.options = {"InfrastructureVulnerabilities": "on", "InspectorFindings": "off", "HealthEvents": "off"}
+        with self.assertRaisesRegex(ValueError, "private network 2 switch yet"):
+            self.switch(PrivateNetwork2=NET)
+
+    def test_the_access_update_is_needed_only_once_a_network_is_set(self):
+        view = {"state": "pending", "rules": [], "adds": u.access_groups(["ec2:*SecurityGroup*", "health:Describe*"], u.OPTION_READS)}
+        self.assertEqual([g["use"] for g in view["adds"]], ["HealthEvents", "PrivateNetworks"])
+        none = u.access_decide(view, {"HealthEvents": "off", "PrivateNetwork1": "", "PrivateNetwork2": ""})
+        self.assertEqual(none["state"], "optional")
+        one = u.access_decide(view, {"HealthEvents": "off", "PrivateNetwork2": NET})
+        self.assertEqual(one["state"], "pending")
+        self.assertEqual([g["use"] for g in one["needed"]], ["PrivateNetworks"])
+        self.assertEqual(u.access_decide(view, None)["state"], "pending", "unreadable: never hidden")
 
 
 if __name__ == "__main__":

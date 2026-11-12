@@ -173,8 +173,97 @@ export function parameters(): Json {
     InfrastructureVulnerabilities: { Type: "String", Default: "on", AllowedValues: ["off", "on"], Description: "on lets CoderHelm read, read-only, which versions run in this account (EC2, Auto Scaling, load balancers, EKS, RDS, ElastiCache, OpenSearch, ECR scans) to match them against security advisories. Change it later in Settings, Integrations, AWS." },
     InspectorFindings: { Type: "String", Default: "off", AllowedValues: ["off", "on"], Description: "on lets CoderHelm read Amazon Inspector's findings in this account (read-only), when you run Inspector. Inspector is billed by AWS; CoderHelm never turns it on." },
     HealthEvents: { Type: "String", Default: "off", AllowedValues: ["off", "on"], Description: "on lets CoderHelm read this account's AWS Health events through the Health API (read-only), which needs AWS Business Support or higher." },
+    ...Object.fromEntries(PRIVATE_NETWORKS.map((p) => [p, {
+      Type: "String", Default: "", AllowedPattern: PRIVATE_NETWORK_PATTERN, ConstraintDescription: "empty, or vpc-<id>:subnet-<id>[,subnet-<id>...] (one VPC, up to 6 subnets)",
+      Description: "A private network data sources can be read through: vpc-<id>:subnet-<id>,subnet-<id> (subnets of one VPC). CoderHelm deploys a small read-only lookup function there with its own security group. Empty for none. Change it from the data source's card.",
+    }])),
   };
 }
+
+/**
+ * Private networks (docs/self-host/private-networks.md): up to three, each a
+ * VPC and some of its subnets. Each one that is set adds a read-only lookup
+ * function there (lambda/private-reach), with its own security group that
+ * sends only to tcp 443 and 9200 and takes nothing in. Changed only through
+ * the updater's parameter-only change set (set_options), never by hand.
+ */
+export const PRIVATE_NETWORKS = ["PrivateNetwork1", "PrivateNetwork2", "PrivateNetwork3"] as const;
+export const PRIVATE_NETWORK_PATTERN = "^$|^vpc-[0-9a-f]{8,17}:subnet-[0-9a-f]{8,17}(,subnet-[0-9a-f]{8,17}){0,5}$";
+/** The function of private network `n` (1 to 3): coderhelm-<name>-reach-<n>. */
+export const reachFunctionName = (n: number) => `coderhelm-\${Stage}-reach-${n}`;
+
+/** The resources of one private network, each on its condition. */
+export function privateNetworkResources(n: number, code: string): Json {
+  const param = PRIVATE_NETWORKS[n - 1];
+  const cond = `Has${param}`;
+  const name = reachFunctionName(n);
+  const parts = { "Fn::Split": [":", { Ref: param }] };
+  const tags = [{ Key: INSTALL_TAG, Value: sub("coderhelm-${Stage}") }];
+  const at = (svc: string) => `arn:\${AWS::Partition}:${svc}:\${AWS::Region}:\${AWS::AccountId}`;
+  return {
+    [`Reach${n}Group`]: {
+      Type: "AWS::EC2::SecurityGroup",
+      Condition: cond,
+      Properties: {
+        GroupDescription: sub(`CoderHelm ${name}: read-only lookups to services in this VPC (out on 443 and 9200 only, nothing in)`),
+        VpcId: { "Fn::Select": [0, parts] },
+        SecurityGroupEgress: [443, 9200].map((port) => ({ IpProtocol: "tcp", FromPort: port, ToPort: port, CidrIp: "0.0.0.0/0", Description: `HTTPS to the service (${port})` })),
+        Tags: [...tags, { Key: "Name", Value: sub(name) }],
+      },
+    },
+    [`Reach${n}Logs`]: {
+      Type: "AWS::Logs::LogGroup",
+      Condition: cond,
+      Properties: { LogGroupName: sub(`/aws/lambda/${name}`), RetentionInDays: 30, Tags: tags },
+    },
+    [`Reach${n}Role`]: {
+      Type: "AWS::IAM::Role",
+      Condition: cond,
+      Properties: {
+        RoleName: sub(name),
+        Description: "CoderHelm: a private network's read-only lookup function (its log and its network interfaces only)",
+        PermissionsBoundary: { Ref: "Boundary" },
+        AssumeRolePolicyDocument: { Version: "2012-10-17", Statement: [{ Effect: "Allow", Principal: { Service: "lambda.amazonaws.com" }, Action: "sts:AssumeRole" }] },
+        Policies: [{
+          PolicyName: "reach",
+          PolicyDocument: sub({
+            Version: "2012-10-17",
+            Statement: [
+              { Sid: "OwnLog", Effect: "Allow", Action: ["logs:CreateLogStream", "logs:PutLogEvents"], Resource: `${at("logs")}:log-group:/aws/lambda/${name}:*` },
+              // What Lambda needs to place the function in the subnets (AWSLambdaVPCAccessExecutionRole). These calls take no resource.
+              { Sid: "NetworkInterfaces", Effect: "Allow", Action: PRIVATE_NETWORK_INTERFACE_ACTIONS, Resource: "*" },
+              // The function's own code can't use them (AWS's pattern: Lambda's calls carry no source function).
+              { Sid: "NotFromItsOwnCode", Effect: "Deny", Action: PRIVATE_NETWORK_INTERFACE_ACTIONS, Resource: "*", Condition: { ArnEquals: { "lambda:SourceFunctionArn": `${at("lambda")}:function:${name}` } } },
+            ],
+          }),
+        }],
+        Tags: tags,
+      },
+    },
+    [`Reach${n}`]: {
+      Type: "AWS::Lambda::Function",
+      Condition: cond,
+      Properties: {
+        FunctionName: sub(name),
+        Description: "CoderHelm: carries data source lookups into a private network (lambda/private-reach)",
+        Runtime: "python3.12",
+        Handler: "index.handler",
+        Timeout: 30,
+        MemorySize: 256,
+        Role: { "Fn::GetAtt": [`Reach${n}Role`, "Arn"] },
+        LoggingConfig: { LogGroup: { Ref: `Reach${n}Logs` } },
+        Code: { ZipFile: code },
+        VpcConfig: { SubnetIds: { "Fn::Split": [",", { "Fn::Select": [1, parts] }] }, SecurityGroupIds: [{ Ref: `Reach${n}Group` }] },
+        Tags: tags,
+      },
+    },
+  };
+}
+
+/** Lambda's network interface calls a VPC function's role must allow. */
+export const PRIVATE_NETWORK_INTERFACE_ACTIONS = [
+  "ec2:CreateNetworkInterface", "ec2:DescribeNetworkInterfaces", "ec2:DeleteNetworkInterface", "ec2:AssignPrivateIpAddresses", "ec2:UnassignPrivateIpAddresses",
+];
 
 function conditions(): Json {
   const not = (p: string, v: string) => ({ "Fn::Not": [{ "Fn::Equals": [{ Ref: p }, v] }] });
@@ -187,6 +276,7 @@ function conditions(): Json {
     HasDomainCert: { "Fn::And": [not("Hostname", ""), not("DomainCertificateArn", "")] },
     HasStatus: not("StatusId", ""),
     HasSetupToken: not("SetupToken", ""),
+    ...Object.fromEntries(PRIVATE_NETWORKS.map((p) => [`Has${p}`, not(p, "")])),
   };
 }
 
@@ -300,6 +390,8 @@ export interface ParentInput {
   /** Child templates: name -> sha256 of the published file. */
   childSha: Record<string, string>;
   helperCode: string;
+  /** lambda/private-reach/handler.py: each private network's function. */
+  reachCode?: string;
   /** sha256 of the release's access.json (the access stack's template), when built. */
   accessSha?: string;
 }
@@ -482,6 +574,8 @@ export function buildParent(input: ParentInput): Json {
     };
   }
 
+  if (input.reachCode) PRIVATE_NETWORKS.forEach((_, i) => Object.assign(R, privateNetworkResources(i + 1, input.reachCode!)));
+
   const list = (flag: "hasTables" | "hasBuckets", out: string) => {
     const parts = children.filter((c) => c[flag]).map((c) => ({ "Fn::GetAtt": [c.name, `Outputs.${out}`] }));
     return parts.length ? { "Fn::Split": [",", { "Fn::Join": [",", parts] }] } : [];
@@ -550,6 +644,11 @@ export function buildParent(input: ParentInput): Json {
     outputs.SignUpUrl = { Description: "The first admin signs up here", Value: { "Fn::GetAtt": ["Web", "Outputs.SignUpUrl"] } };
   }
   outputs.InstallGuide = { Condition: "HasStatus", Description: "Back to the install guide", Value: { "Fn::Sub": "https://docs.coderhelm.com/self-host/install/?id=${StatusId}&region=${AWS::Region}&stage=${Stage}" } };
+  if (input.reachCode) {
+    PRIVATE_NETWORKS.forEach((p, i) => {
+      outputs[`${p}SecurityGroup`] = { Condition: `Has${p}`, Description: `The security group of private network ${i + 1}: a service it reads allows tcp 443 from it`, Value: { Ref: `Reach${i + 1}Group` } };
+    });
+  }
   if (R.Domain) outputs.Domain = { Condition: "HasHostname", Description: "Your domain's state (Settings, System has the details)", Value: { "Fn::GetAtt": ["Domain", "Message"] } };
 
   return {
@@ -570,6 +669,7 @@ export function buildParent(input: ParentInput): Json {
           { Label: { default: "Optional" }, Parameters: ["EmailTransport", "EmailFrom", "BedrockInferencePrefix"] },
           { Label: { default: "Optional: updates" }, Parameters: ["AutoUpdate", "UpdateDay", "UpdateHour", "UpdateTimezone"] },
           { Label: { default: "Optional: what CoderHelm reads in this account" }, Parameters: ["InfrastructureVulnerabilities", "InspectorFindings", "HealthEvents"] },
+          { Label: { default: "Optional: private networks data sources are read through" }, Parameters: [...PRIVATE_NETWORKS] },
           { Label: { default: "Filled in by the install guide or by CoderHelm (leave as they are)" }, Parameters: ["StatusId", "StatusKey", "SetupToken", "DomainCertificateArn", "DomainZoneId"] },
         ],
       },

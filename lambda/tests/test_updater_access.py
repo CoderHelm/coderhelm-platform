@@ -495,7 +495,7 @@ class AccessForWhatIsUsed(Base):
         v = u.access_compute(self.env)
         self.assertEqual(v["state"], "optional")
         self.assertEqual(v["summary"], [])
-        self.assertEqual([g["use"] for g in v["later"]], ["InfrastructureVulnerabilities", "InspectorFindings", "HealthEvents"])
+        self.assertEqual([g["use"] for g in v["later"]], ["InfrastructureVulnerabilities", "InspectorFindings", "HealthEvents", "PrivateNetworks"])
 
     def test_a_switch_that_is_on_asks_for_its_reads_and_only_those(self):
         self.switches(InspectorFindings="on")
@@ -504,7 +504,7 @@ class AccessForWhatIsUsed(Base):
         self.assertEqual([g["name"] for g in v["needed"]], ["Amazon Inspector findings"])
         self.assertEqual(v["needed"][0]["actions"], ["inspector2:List*", "inspector2:BatchGetA*"])
         self.assertEqual(v["summary"], ["adds read access to Amazon Inspector (inspector2:List*, inspector2:BatchGetA*)"])
-        self.assertEqual([g["use"] for g in v["later"]], ["InfrastructureVulnerabilities", "HealthEvents"])
+        self.assertEqual([g["use"] for g in v["later"]], ["InfrastructureVulnerabilities", "HealthEvents", "PrivateNetworks"])
 
     def test_an_access_json_from_before_the_reads_metadata_uses_the_updaters_own(self):
         self.body = json.dumps(self.access_json(reads_meta=False)).encode()

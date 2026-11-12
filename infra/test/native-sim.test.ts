@@ -14,7 +14,7 @@ import { test } from "node:test";
 import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { accessNames, boundaryPolicy, PolicyDocument } from "../lib/access";
+import { accessNames, BOUNDARY_OPTION_READS, boundaryPolicy, PolicyDocument, withoutPrivateNetworks } from "../lib/access";
 import { deployRolePolicy, helperPolicy, nativeNames, ROOT_TEMPLATE_SID } from "../lib/native/parent";
 import { prodValues, resolveValue } from "../lib/native/resolve";
 import { decision } from "./iam-eval";
@@ -69,16 +69,19 @@ test("the fixture is AWS's verdict on thousands of calls, for the native policie
   assert.ok(pairs().length > 3000, `${pairs().length} pairs`);
   assert.match(F.about, /--native/);
   const t = today();
-  assert.deepEqual(F.policies.deploy, t.deploy, "the auto-update role changed: run deploy-role-sim.py --native again");
+  // Private networks' statements (access.ts PRIVATE_NETWORK_DEPLOY_SIDS) came after the simulator's last run; checked in native.test.ts.
+  const sawNetworks = JSON.stringify(F.policies.deploy).includes("NetworkGroupsCreate");
+  assert.deepEqual(F.policies.deploy, sawNetworks ? t.deploy : withoutPrivateNetworks(t.deploy), "the auto-update role changed: run deploy-role-sim.py --native again");
   // Inspector's and Health's read-only calls (own-account-read.ts, OWN_OPTIONS) came after the simulator's
   // last run: three Allow patterns in CoderHelmServices for services no CloudFormation handler calls, checked
   // here; everything else is what the simulator saw. Run deploy-role-sim.py --native again to fold them in.
-  const LATER = ["inspector2:List*", "inspector2:BatchGetA*", "health:Describe*"];
+  const LATER = ["inspector2:List*", "inspector2:BatchGetA*", "health:Describe*", ...BOUNDARY_OPTION_READS.PrivateNetworks, "ec2:Describe*", "es:DescribeDomain"];
   const services = t.boundary.Statement.find((s) => s.Sid === "CoderHelmServices")!;
   const simBoundary = F.policies.boundary.Statement.find((s: any) => s.Sid === "CoderHelmServices");
   const sawLater = LATER.every((a) => (simBoundary.Action as string[]).includes(a));
   for (const a of LATER) assert.ok((services.Action as string[]).includes(a), a);
   assert.ok(pairs().every((p) => !/^(inspector2|health):/.test(p.action)), "no simulated call is Inspector's or Health's");
+  assert.ok(pairs().every((p) => !/^(ec2|es):/.test(p.action)), "no simulated call is a private network's");
   const seenBoundary = sawLater ? t.boundary : { ...t.boundary, Statement: t.boundary.Statement.map((s) => (s.Sid === "CoderHelmServices" ? { ...s, Action: (s.Action as string[]).filter((a) => !LATER.includes(a)) } : s)) };
   assert.deepEqual(F.policies.boundary, seenBoundary, "the boundary changed: run deploy-role-sim.py --native again");
   // The helper's one read of the root stack's template (stage_held) came after the simulator's last run:

@@ -225,3 +225,24 @@ export function setupStatements(cfg: ResolvedConfig, scope: cdk.Stack): iam.Poli
     }),
   ];
 }
+
+/**
+ * Reading a data source through a private network (native/parent.ts,
+ * PrivateNetwork1..3): invoke that network's function and read its
+ * placement (subnets, security group), by name: the functions exist only
+ * on a one-stack install where an admin added a network. The gateway also
+ * describes an OpenSearch domain to find its VPC and subnets.
+ */
+export const REACH_PREFIX_ENV = "REACH_FUNCTION_PREFIX";
+export function reachStatements(prefix: string, scope: cdk.Stack, describeDomains: boolean): iam.PolicyStatement[] {
+  const out = [
+    new iam.PolicyStatement({
+      actions: ["lambda:InvokeFunction", "lambda:GetFunctionConfiguration"],
+      resources: [`arn:aws:lambda:${scope.region}:${scope.account}:function:${prefix}-reach-*`],
+    }),
+  ];
+  if (describeDomains) {
+    out.push(new iam.PolicyStatement({ actions: ["es:DescribeDomain"], resources: [`arn:aws:es:${scope.region}:${scope.account}:domain/*`] }));
+  }
+  return out;
+}
