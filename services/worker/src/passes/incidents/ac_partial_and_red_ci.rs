@@ -267,13 +267,15 @@ fn the_step_after_one_that_changed_nothing_takes_a_different_approach() {
         plan_coverage::NO_CHANGE_LINE
     );
     assert!(plan_coverage::declined_by_coder(&line, "web/src/hooks/useStickyScroll.ts").is_some());
-    // The pipeline passes the stall count and uses the narrowed ask.
+    // The pipeline passes the supervisor's rung and uses the narrowed ask,
+    // with the rung's change of approach beside it.
     let src = include_str!("../mod.rs");
     let cf = fn_src(src, "async fn continuation_feedback(");
-    assert!(cf.contains("stalled: u32"));
-    assert!(cf.contains("if stalled > 0 {"));
+    assert!(cf.contains("rung: supervisor::Rung"));
+    assert!(cf.contains("if rung != supervisor::Rung::Continue {"));
     assert!(cf.contains("plan_coverage::narrowed_feedback(&cov, &files)"));
-    assert!(src.contains("stalled_steps,"));
+    assert!(cf.contains("supervisor::rung_instruction(rung"));
+    assert!(src.contains("stall_rung,"));
 }
 
 fn red() -> Ci {

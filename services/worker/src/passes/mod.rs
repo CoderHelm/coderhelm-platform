@@ -1193,6 +1193,7 @@ pub(crate) mod steps;
 pub(crate) mod stop_gate;
 pub mod stop_judge;
 pub mod stop_pr;
+pub mod supervisor;
 pub mod support_sync;
 pub mod syntax_check;
 pub(crate) mod terraform;
@@ -1410,12 +1411,36 @@ pub async fn orchestrate_ticket(
                         &msg,
                         &run_id,
                         &checkpoint,
-                        &["implement_started"],
+                        // Any pass after the work started: a step limit in a
+                        // late pass is the same "needs more turns".
+                        &["implement", "implement_started", "security"],
                         false,
                         "The coder used this step's turns with work left",
                     )
                     .await
                     .continued();
+                // An error after the work started that names nothing only a
+                // person has gets one fresh step first (`supervisor`): most
+                // are passing (a GitHub refusal, a check that errored once).
+                // A step after it that made no progress ships what is done.
+                let continued = continued
+                    || !guard_ended
+                        && paused.is_none()
+                        && supervisor::human_only_in(&err_msg).is_none()
+                        && e.downcast_ref::<stack::Refused>().is_none()
+                        && crate::agent::policy::claim_stop(&run_id).is_none()
+                        && steps::load(state, &msg.team_id, &run_id).await.stalled == 0
+                        && try_auto_continue(
+                            state,
+                            &msg,
+                            &run_id,
+                            &checkpoint,
+                            &["implement", "implement_started", "security"],
+                            false,
+                            "A step after the work stopped on an error; the next one tries again",
+                        )
+                        .await
+                        .continued();
                 // A transient model failure (5xx incl. 520-524, 429, 529, no
                 // response) that outlasted the client's own retries is not the
                 // ticket's fault: the run is sent again later (same run_id), by
@@ -3471,6 +3496,7 @@ async fn run_passes(
             &used_mcp_ids,
             &wait,
             &judged,
+            supervisor::HumanOnly::AmbiguousTicket,
         )
         .await;
 
@@ -3620,9 +3646,9 @@ async fn run_passes(
     } else {
         None
     };
-    // Steps in a row that changed nothing, after this one started: the
-    // first such step changes approach (`continuation_feedback`).
-    let mut stalled_steps = step_state.stalled;
+    // Steps in a row that changed nothing, after this one started: each
+    // one climbs the supervisor's ladder (`continuation_feedback`).
+    let mut stall_rung = supervisor::Rung::Continue;
     if msg.continuation > 0 && step_state.mark_step != step {
         let at = resume_gate
             .map(|g| g.as_str().to_string())
@@ -3645,24 +3671,52 @@ async fn run_passes(
             steps::stalled_after(step_state.mark.as_deref(), &mark, step_state.stalled)
         };
         steps::save_mark(state, &msg.team_id, run_id, &mark, stalled, step).await;
-        stalled_steps = stalled;
-        if steps::stops_for_stall(stalled)
+        // A security fix never ends by handing its unfinished work to a
+        // person, and it ships at the stall limit instead of climbing the
+        // ladder: its bumps are verified batch by batch, so a stalled coder
+        // step has nothing left a stronger approach would add. What is on
+        // the branch goes on to its checks and pull request (a draft naming
+        // the failing check when CI is red), the tasks left deferred with
+        // their reason.
+        let ship_now = steps::stops_for_stall(stalled)
             && common::security_fixes::is_ticket(&msg.ticket_id)
-            && at.starts_with("implement")
-        {
-            // A security fix never ends by handing its unfinished work to a
-            // person: what is on the branch goes on to its checks and pull
-            // request (a draft naming the failing check when CI is red), and
-            // the tasks left are named under Open items.
-            let task = current_plan_task(&github, msg, &plan_result, &branch_name).await;
+            && at.starts_with("implement");
+        // A step that changed nothing changes approach; it never stops the
+        // run (`supervisor`): one task, then fresh context and edits in
+        // place, then a re-split, then the strongest model, then the stuck
+        // task is deferred with its reason, and finally what is done ships.
+        if stalled > 0 {
+            let (rung, settled) = supervise_stall(
+                state,
+                run_id,
+                &github,
+                msg,
+                &mut plan_result,
+                &branch_name,
+                stalled,
+                ship_now,
+            )
+            .await;
+            stall_rung = rung;
+            if settled {
+                // A task deferred is a task settled: the next step starts
+                // from a clean count.
+                steps::save_mark(state, &msg.team_id, run_id, &mark, 0, step).await;
+            }
+            info!(
+                run_id,
+                step,
+                stalled,
+                rung = rung.as_str(),
+                "A step changed nothing: the supervisor changes approach"
+            );
+        }
+        if ship_now {
             add_progress_note(
                 state,
                 &msg.team_id,
                 run_id,
-                &format!(
-                    "Two steps made no progress on {}: the run goes on with what the branch holds",
-                    task.as_deref().unwrap_or("the planned tasks")
-                ),
+                "Two steps made no progress on the planned tasks: the run goes on with what the branch holds",
             )
             .await;
             close_memory(state, agent_memory.take()).await;
@@ -3678,14 +3732,6 @@ async fn run_passes(
                 usage,
             )
             .await;
-        }
-        if steps::stops_for_stall(stalled) {
-            let kept =
-                keep_wip_branch(&github, &msg.repo_owner, &msg.repo_name, &branch_name).await;
-            // The stop names the planned task the steps were stuck on.
-            let task = current_plan_task(&github, msg, &plan_result, &branch_name).await;
-            close_memory(state, agent_memory.take()).await;
-            return Err(steps::stall_reason(step, &head, &at, &kept, task.as_deref()).into());
         }
         info!(run_id, step, stalled, at = %at, "Continuing the run in this step");
     }
@@ -4926,11 +4972,17 @@ async fn run_passes(
                 msg,
                 &plan_result,
                 &branch_name,
-                stalled_steps,
+                stall_rung,
             )
             .await
         } else {
             None
+        };
+        // The strongest model for a core task that resisted the other rungs.
+        let effective_complexity = if stall_rung == supervisor::Rung::Escalate {
+            "complex".to_string()
+        } else {
+            effective_complexity.to_string()
         };
         let pass_start = std::time::Instant::now();
         let usage_before = usage.clone();
@@ -5386,6 +5438,7 @@ async fn run_passes(
                         &used_mcp_ids,
                         &wait,
                         &judged,
+                        supervisor::HumanOnly::ProductDecision,
                     )
                     .await;
                     close_memory(state, agent_memory.take()).await;
@@ -6917,7 +6970,12 @@ fn wip_holds_other_work(compare: &serde_json::Value) -> bool {
 
 /// The plan's checklist with only the done tasks checked, written where the
 /// run page and a later attempt read it.
-async fn save_checked_tasks(state: &WorkerState, msg: &TicketMessage, run_id: &str, md: &str) {
+pub(crate) async fn save_checked_tasks(
+    state: &WorkerState,
+    msg: &TicketMessage,
+    run_id: &str,
+    md: &str,
+) {
     let tasks_key = format!(
         "{}/tasks.md",
         openspec_prefix(
@@ -6941,29 +6999,78 @@ async fn save_checked_tasks(state: &WorkerState, msg: &TicketMessage, run_id: &s
     }
 }
 
-/// The planned task the run is on (the first one its branch doesn't do),
-/// as `task K of N (`path`: what)`; `None` without a checklist.
-async fn current_plan_task(
+/// The supervisor's answer to a step that changed nothing, carried out:
+/// the rung for the stuck task (core or not, with the run's spend), and for
+/// [`supervisor::Rung::Defer`] and [`supervisor::Rung::Ship`] the task (or
+/// every task left) deferred on the run's checklist with its reason, so the
+/// plan check and the pull request read them as settled. Returns the rung
+/// and whether a task was settled. `ship_now` takes the last rung at once.
+#[allow(clippy::too_many_arguments)]
+async fn supervise_stall(
+    state: &WorkerState,
+    run_id: &str,
     github: &GitHubClient,
     msg: &TicketMessage,
-    plan: &plan::PlanResult,
+    plan: &mut plan::PlanResult,
     branch: &str,
-) -> Option<String> {
+    stalled: u32,
+    ship_now: bool,
+) -> (supervisor::Rung, bool) {
     let tasks =
         plan_coverage::tasks_for(github, &msg.repo_owner, &msg.repo_name, branch, &plan.tasks)
             .await;
-    if tasks.is_empty() {
-        return None;
-    }
-    let changes = plan_coverage::plan_changes(
+    let Some(changes) = plan_coverage::plan_changes(
         github,
         &msg.repo_owner,
         &msg.repo_name,
         &msg.base_branch,
         branch,
     )
-    .await?;
-    plan_coverage::current_task(&changes.coverage(&tasks))
+    .await
+    else {
+        return (supervisor::next_rung(stalled, true), false);
+    };
+    let cov = changes.coverage(&tasks);
+    let missing = cov.required_missing();
+    let Some(first) = missing.first() else {
+        return (supervisor::Rung::Continue, false);
+    };
+    let core = supervisor::is_core(&first.path, &first.task, first.optional);
+    let spent = run_ceiling::load(state, &msg.team_id, run_id)
+        .await
+        .map(|t| t.spend_usd)
+        .unwrap_or(0.0);
+    let rung = if ship_now {
+        supervisor::Rung::Ship
+    } else {
+        supervisor::rung_for(stalled, core, spent, run_ceiling::MAX_RUN_SPEND_USD)
+    };
+    let defer: Vec<(String, String)> = match rung {
+        supervisor::Rung::Defer => vec![(
+            first.path.clone(),
+            supervisor::defer_reason(stalled, first.task.trim(), core),
+        )],
+        supervisor::Rung::Ship => missing
+            .iter()
+            .map(|t| {
+                (
+                    t.path.clone(),
+                    supervisor::defer_reason(
+                        stalled,
+                        t.task.trim(),
+                        supervisor::is_core(&t.path, &t.task, t.optional),
+                    ),
+                )
+            })
+            .collect(),
+        _ => return (rung, false),
+    };
+    plan.tasks = plan_coverage::with_deferred(&plan.tasks, &defer);
+    save_checked_tasks(state, msg, run_id, &plan.tasks).await;
+    for (path, why) in &defer {
+        add_progress_note(state, &msg.team_id, run_id, &format!("`{path}` {why}")).await;
+    }
+    (rung, true)
 }
 
 /// For a continuation: the planned tasks its branch doesn't do yet, as the
@@ -6978,7 +7085,7 @@ async fn continuation_feedback(
     msg: &TicketMessage,
     plan: &plan::PlanResult,
     branch: &str,
-    stalled: u32,
+    rung: supervisor::Rung,
 ) -> Option<String> {
     let tasks =
         plan_coverage::tasks_for(github, &msg.repo_owner, &msg.repo_name, branch, &plan.tasks)
@@ -7010,7 +7117,7 @@ async fn continuation_feedback(
     if cov.required_missing().is_empty() {
         return None;
     }
-    if stalled > 0 {
+    if rung != supervisor::Rung::Continue {
         let files = plan_coverage::changed_files(
             github,
             &msg.repo_owner,
@@ -7022,9 +7129,17 @@ async fn continuation_feedback(
         .unwrap_or_default();
         info!(
             run_id,
-            stalled, "The last step changed nothing: this one takes one task, a different approach"
+            rung = rung.as_str(),
+            "The last step changed nothing: this one takes one task, a different approach"
         );
-        return plan_coverage::narrowed_feedback(&cov, &files);
+        let narrowed = plan_coverage::narrowed_feedback(&cov, &files)?;
+        let first = cov.required_missing().into_iter().next()?;
+        let extra = supervisor::rung_instruction(rung, first.task.trim(), &first.path);
+        return Some(if extra.is_empty() || rung == supervisor::Rung::Narrow {
+            narrowed
+        } else {
+            format!("{narrowed}\n\n{extra}")
+        });
     }
     Some(plan_coverage::round_feedback(&cov))
 }
@@ -8199,7 +8314,18 @@ async fn finish_without_code(
         } else {
             wait_on_ticket(msg, &questions, &report)
         };
-        mark_run_needs_input(state, msg, run_id, usage, start, mcp_ids, &wait, judged).await;
+        mark_run_needs_input(
+            state,
+            msg,
+            run_id,
+            usage,
+            start,
+            mcp_ids,
+            &wait,
+            judged,
+            supervisor::HumanOnly::MissingAccess,
+        )
+        .await;
     }
     let status = if outside {
         fix_location::STATUS_OUTSIDE
@@ -8661,8 +8787,15 @@ async fn mark_unbuilt_needs_input(
     start: &std::time::Instant,
     wait: &WaitingOn,
     error: &str,
-    _judged: &stop_judge::Judged,
+    judged: &stop_judge::Judged,
 ) {
+    // A run that built nothing waits only for what only a person has: the
+    // judge's question or blocker, else the detail the ticket is missing.
+    let hand_back = supervisor::HandBack::of_judged(judged).unwrap_or_else(|| {
+        supervisor::HandBack::new(supervisor::HumanOnly::AmbiguousTicket, &wait.line()).unwrap_or(
+            supervisor::HandBack::of(supervisor::HumanOnly::AmbiguousTicket),
+        )
+    });
     let duration = start.elapsed().as_secs();
     let delta = usage.unrecorded();
     let now = chrono::Utc::now().to_rfc3339();
@@ -8679,7 +8812,7 @@ async fn mark_unbuilt_needs_input(
              cost_usd = if_not_exists(cost_usd, :uzero) + :c, duration_s = :d, updated_at = :t, current_pass = :cp",
         )
         .expression_attribute_names("#status", "status")
-        .needs_input(run_id, wait)
+        .needs_input(run_id, wait, &hand_back)
         .expression_attribute_values(":em", attr_s(error))
         .usage_values(&delta)
         .expression_attribute_values(":d", attr_n(duration))
@@ -8734,8 +8867,17 @@ async fn mark_run_needs_input(
     start: &std::time::Instant,
     mcp_ids: &[String],
     wait: &WaitingOn,
-    _judged: &stop_judge::Judged,
+    judged: &stop_judge::Judged,
+    asked_for: supervisor::HumanOnly,
 ) {
+    // Waiting on a person is only for what only a person has: the judge's
+    // question or blocker when it names one, else what this stop asks for
+    // (a question about the ticket, a decision, access, a pull request
+    // someone else holds).
+    let hand_back = supervisor::HandBack::of_judged(judged).unwrap_or_else(|| {
+        supervisor::HandBack::new(asked_for, &wait.line())
+            .unwrap_or(supervisor::HandBack::of(asked_for))
+    });
     let duration = start.elapsed().as_secs();
     let delta = usage.unrecorded();
     let now = chrono::Utc::now().to_rfc3339();
@@ -8753,7 +8895,7 @@ async fn mark_run_needs_input(
              status_run_id = :sri, mcp_servers = :mcp",
         )
         .expression_attribute_names("#status", "status")
-        .needs_input(run_id, wait)
+        .needs_input(run_id, wait, &hand_back)
         .usage_values(&delta)
         .expression_attribute_values(":d", attr_n(duration))
         .expression_attribute_values(":t", attr_s(&now))
@@ -8786,45 +8928,48 @@ async fn mark_run_needs_input(
     }
 }
 
-/// A run the guard stopped with nothing to open a pull request from: it still
-/// waits on a person, with the reason on the run page.
+/// A run the guard stopped with nothing to open a pull request from: there
+/// is no work to ship and nothing only a person has is missing, so the run
+/// ends `failed` with the guard's reason (`common::run_fail`), never as a
+/// wait on a person. A blocker on the human-only list waits as one.
 pub(crate) async fn mark_run_stopped_by_guard(
     state: &WorkerState,
     msg: &TicketMessage,
     run_id: &str,
     reason: &str,
-    _judged: &stop_judge::Judged,
+    judged: &stop_judge::Judged,
 ) {
-    if let Err(e) = state
-        .dynamo
-        .update_item()
-        .table_name(&state.config.runs_table_name)
-        .key("team_id", attr_s(&msg.team_id))
-        .key("run_id", attr_s(run_id))
-        .update_expression(
-            "SET #s = :s, status_run_id = :sri, waiting_on = :wo, error_message = :em, \
-             updated_at = :t, current_pass = :cp",
-        )
-        .condition_expression(common::run_status::not_ended("#s"))
-        .ended_values()
-        .expression_attribute_names("#s", "status")
-        .needs_input(
-            run_id,
-            &WaitingOn::fixed(
-                "Read why CoderHelm stopped this run, then press Retry or close it",
-                reason,
-                "",
-            ),
-        )
-        .expression_attribute_values(":em", attr_s(reason))
-        .expression_attribute_values(":t", attr_s(&chrono::Utc::now().to_rfc3339()))
-        .expression_attribute_values(":cp", attr_s("done"))
-        .send()
-        .await
-    {
-        warn!(run_id, error = %e, "Could not hand the stopped run to a person");
+    if let Some(hand_back) = supervisor::hand_back_for(judged, reason) {
+        if let Err(e) = state
+            .dynamo
+            .update_item()
+            .table_name(&state.config.runs_table_name)
+            .key("team_id", attr_s(&msg.team_id))
+            .key("run_id", attr_s(run_id))
+            .update_expression(
+                "SET #s = :s, status_run_id = :sri, waiting_on = :wo, error_message = :em, \
+                 updated_at = :t, current_pass = :cp",
+            )
+            .condition_expression(common::run_status::not_ended("#s"))
+            .ended_values()
+            .expression_attribute_names("#s", "status")
+            .needs_input(
+                run_id,
+                &WaitingOn::fixed("Give CoderHelm what it needs, then press Retry", reason, ""),
+                &hand_back,
+            )
+            .expression_attribute_values(":em", attr_s(reason))
+            .expression_attribute_values(":t", attr_s(&chrono::Utc::now().to_rfc3339()))
+            .expression_attribute_values(":cp", attr_s("done"))
+            .send()
+            .await
+        {
+            warn!(run_id, error = %e, "Could not record what the stopped run needs");
+        }
+        self::webhooks::emit_run(state, &msg.team_id, run_id, "needs_input").await;
+    } else {
+        fail_run(state, msg, run_id, reason, &TokenUsage::default(), 0).await;
     }
-    self::webhooks::emit_run(state, &msg.team_id, run_id, "needs_input").await;
     release_blocked_pr(state, msg).await;
 }
 
@@ -8874,7 +9019,18 @@ async fn stop_run_repo_not_enabled(
         message,
     )
     .await;
-    mark_run_needs_input(state, msg, run_id, usage, start, &[], &wait, &judged).await;
+    mark_run_needs_input(
+        state,
+        msg,
+        run_id,
+        usage,
+        start,
+        &[],
+        &wait,
+        &judged,
+        supervisor::HumanOnly::MissingAccess,
+    )
+    .await;
 }
 
 /// Append a timestamped progress note to the run record for live activity display.
@@ -8987,7 +9143,7 @@ async fn release_blocked_pr(state: &WorkerState, msg: &TicketMessage) {
     }
 }
 
-async fn fail_run(
+pub(crate) async fn fail_run(
     state: &WorkerState,
     msg: &TicketMessage,
     run_id: &str,
@@ -9630,7 +9786,18 @@ async fn stop_for_open_pr(
     )
     .await;
     let wait = wait_on_ticket(msg, std::slice::from_ref(&question), &note);
-    mark_run_needs_input(state, msg, run_id, usage, start, &[], &wait, &judged).await;
+    mark_run_needs_input(
+        state,
+        msg,
+        run_id,
+        usage,
+        start,
+        &[],
+        &wait,
+        &judged,
+        supervisor::HumanOnly::HeldByAnother,
+    )
+    .await;
     true
 }
 

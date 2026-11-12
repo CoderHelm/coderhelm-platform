@@ -24,6 +24,7 @@ use aws_sdk_dynamodb::operation::update_item::builders::UpdateItemFluentBuilder;
 use aws_sdk_dynamodb::types::AttributeValue;
 use serde::{Deserialize, Serialize};
 
+use crate::handback::HandBack;
 use crate::run_questions::{Asked, Question, FIELD_QUESTIONS};
 use crate::run_status::NEEDS_INPUT;
 
@@ -56,6 +57,10 @@ pub struct WaitingOn {
     /// When the wait started (RFC 3339): the reminder counts from here.
     #[serde(default)]
     pub since: String,
+    /// Why only a person can do it: a code on the human-only list
+    /// (`handback::HumanOnly::code`), set by [`NeedsInput::needs_input`].
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub handback: String,
 }
 
 fn is_zero(n: &usize) -> bool {
@@ -86,6 +91,7 @@ impl WaitingOn {
             url: url.trim().to_string(),
             questions: 0,
             since: now(),
+            handback: String::new(),
         })
     }
 
@@ -98,6 +104,7 @@ impl WaitingOn {
             url: url.trim().to_string(),
             questions: 0,
             since: now(),
+            handback: String::new(),
         }
     }
 
@@ -190,16 +197,24 @@ pub fn asks_something(item: &HashMap<String, AttributeValue>) -> bool {
     asked || WaitingOn::of_item(item).is_some()
 }
 
-/// The one way to write `needs_input`: with what the run waits for.
+/// The one way to write `needs_input`: with what the run waits for, and
+/// why only a person can do it ([`HandBack`]: a reason on the human-only
+/// list). A stall, a red check, a budget or an error has no `HandBack`, so
+/// it can't end a run this way.
 pub trait NeedsInput {
     /// Sets `:s` to `needs_input`, `:sri` to its `status_run_id` and `:wo`
-    /// to `wait`. The update expression names them:
-    /// `#s = :s, status_run_id = :sri, waiting_on = :wo`.
-    fn needs_input(self, run_id: &str, wait: &WaitingOn) -> Self;
+    /// to `wait` with the hand-back's reason. The update expression names
+    /// them: `#s = :s, status_run_id = :sri, waiting_on = :wo`.
+    fn needs_input(self, run_id: &str, wait: &WaitingOn, why: &HandBack) -> Self;
 }
 
 impl NeedsInput for UpdateItemFluentBuilder {
-    fn needs_input(self, run_id: &str, wait: &WaitingOn) -> Self {
+    fn needs_input(self, run_id: &str, wait: &WaitingOn, why: &HandBack) -> Self {
+        let mut wait = wait.clone();
+        wait.handback = why.why().code().to_string();
+        if wait.detail.trim().is_empty() {
+            wait.detail = bounded(why.need(), MAX_DETAIL_CHARS);
+        }
         self.expression_attribute_values(":s", AttributeValue::S(NEEDS_INPUT.into()))
             .expression_attribute_values(
                 ":sri",

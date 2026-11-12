@@ -794,6 +794,14 @@ async fn wait_on_open_pr(
     reason: &str,
     judged: &super::stop_judge::Judged,
 ) {
+    // The supervisor's rule: only a need on the human-only list waits on a
+    // person. A guard stop on a run that has its pull request otherwise
+    // finishes it: completed with the reason on the run page (the pull
+    // request lists what is open), or failed when its checks are red.
+    let Some(hand_back) = super::supervisor::hand_back_for(judged, reason) else {
+        finish_open_pr(state, team_id, run_id, reason).await;
+        return;
+    };
     let reason = match (judged.hold_words(), judged.assumption()) {
         (Some(h), _) => format!("{reason} Blocked on: {h}"),
         (None, Some(a)) => format!("{reason} Assumed: {a}"),
@@ -817,7 +825,7 @@ async fn wait_on_open_pr(
         .condition_expression(run_status::not_ended("#s"))
         .ended_values()
         .expression_attribute_names("#s", "status")
-        .needs_input(run_id, &wait)
+        .needs_input(run_id, &wait, &hand_back)
         .expression_attribute_values(":em", attr_s(reason))
         .expression_attribute_values(":t", attr_s(&now))
         .expression_attribute_values(":cp", attr_s("done"))
@@ -828,6 +836,73 @@ async fn wait_on_open_pr(
     }
     if claim_notification(state, team_id, run_id).await {
         super::webhooks::emit_run(state, team_id, run_id, run_status::NEEDS_INPUT).await;
+    }
+}
+
+/// A guard stop on a run with its pull request and nothing a person must
+/// supply: `failed` with the reason when the run's checks are red by its
+/// record (`common::run_fail`), else `completed` with the reason noted.
+async fn finish_open_pr(state: &WorkerState, team_id: &str, run_id: &str, reason: &str) {
+    if let Some(red) = super::resume::red_ci_blocks_completion(state, team_id, run_id).await {
+        let why = format!("{}; {red}", reason.trim().trim_end_matches('.'));
+        let failure = common::run_fail::RunFailure {
+            reason: &why,
+            pass: None,
+            only_from: None,
+            extra: Vec::new(),
+            add: Vec::new(),
+        };
+        match common::run_fail::fail_run(
+            &state.dynamo,
+            &state.config.runs_table_name,
+            team_id,
+            run_id,
+            &failure,
+        )
+        .await
+        {
+            Ok(true) => super::webhooks::emit_run(state, team_id, run_id, "failed").await,
+            Ok(false) => {}
+            Err(e) => warn!(run_id, error = %e, "Run guard: could not end the run"),
+        }
+        return;
+    }
+    add_progress_note(
+        state,
+        team_id,
+        run_id,
+        &format!("Finished on its pull request; left open there: {reason}"),
+    )
+    .await;
+    let res = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(team_id))
+        .key("run_id", attr_s(run_id))
+        .update_expression(
+            "SET #s = :s, status_run_id = :sri, deferred_reason = :dr, updated_at = :t, \
+             current_pass = :cp",
+        )
+        .condition_expression(run_status::not_ended("#s"))
+        .ended_values()
+        .expression_attribute_names("#s", "status")
+        .expression_attribute_values(":s", attr_s(run_status::COMPLETED))
+        .expression_attribute_values(
+            ":sri",
+            attr_s(&format!("{}#{run_id}", run_status::COMPLETED)),
+        )
+        .expression_attribute_values(":dr", attr_s(common::truncate_str(reason, 500)))
+        .expression_attribute_values(":t", attr_s(&chrono::Utc::now().to_rfc3339()))
+        .expression_attribute_values(":cp", attr_s("done"))
+        .send()
+        .await;
+    match res {
+        Ok(_) => {
+            super::webhooks::emit_run(state, team_id, run_id, run_status::COMPLETED).await;
+            super::ready::after_completion(state, team_id, run_id).await;
+        }
+        Err(e) => warn!(run_id, error = %e, "Run guard: could not finish the run"),
     }
 }
 

@@ -106,6 +106,7 @@ pub fn stops_for_stall(stalled: u32) -> bool {
 
 /// Why a stalled run stops, in a sentence, naming the planned task it was
 /// on when it knows (`task 8 of 8 (`path`: what)`).
+#[cfg(test)]
 pub fn stall_reason(step: u32, head: &str, at: &str, kept: &str, task: Option<&str>) -> String {
     let short: String = head.chars().take(7).collect();
     let on = match task {
@@ -121,6 +122,7 @@ pub fn stall_reason(step: u32, head: &str, at: &str, kept: &str, task: Option<&s
     )
 }
 
+#[cfg(test)]
 fn where_label(at: &str) -> &str {
     match at {
         "verify" => "the test and security audit after the implement work",

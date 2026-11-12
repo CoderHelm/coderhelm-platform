@@ -494,6 +494,7 @@ async fn write_run_stop(
                     &stop.note(),
                     "",
                 ),
+                &common::handback::HandBack::of(common::handback::HumanOnly::Approval),
             ),
         Stop::Paused { .. } => update
             .update_expression(

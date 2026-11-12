@@ -143,6 +143,8 @@ pub enum NoteKind {
     WrapUp,
     /// Every tool step is used: tools are off, answer now.
     ToolsOff,
+    /// A turn reached the output limit before any tool call: act now.
+    OutputLimit,
 }
 
 impl NoteKind {
@@ -151,6 +153,7 @@ impl NoteKind {
             NoteKind::TurnBudget => "turn_budget",
             NoteKind::WrapUp => "wrap_up",
             NoteKind::ToolsOff => "tools_off",
+            NoteKind::OutputLimit => "output_limit",
         }
     }
 }

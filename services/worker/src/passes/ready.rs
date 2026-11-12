@@ -1670,6 +1670,26 @@ async fn record_hold(state: &WorkerState, team_id: &str, run_id: &str, hold: Dra
     }
 }
 
+/// Why a finished run's held draft may wait on a person: a person put it
+/// back to draft, or a reason on the human-only list. `None` for every
+/// other hold (red checks, open findings, planned work): those are
+/// CoderHelm's, the hold stays recorded and named on the pull request, and
+/// the run's status isn't turned into a wait.
+fn draft_hand_back(
+    hold: &DraftHold,
+    judged: &super::stop_judge::Judged,
+) -> Option<super::supervisor::HandBack> {
+    use super::supervisor::{HandBack, HumanOnly};
+    let summary = hold.summary();
+    if summary.contains("put it back to draft") {
+        return Some(
+            HandBack::new(HumanOnly::PersonAction, &summary)
+                .unwrap_or(HandBack::of(HumanOnly::PersonAction)),
+        );
+    }
+    super::supervisor::hand_back_for(judged, &summary)
+}
+
 /// Sets a finished run to `needs_input` on its draft hold, naming what to
 /// do. `false` when the run's status isn't one this changes.
 async fn wait_on_person(
@@ -1678,8 +1698,11 @@ async fn wait_on_person(
     run_id: &str,
     hold: &DraftHold,
     was: &str,
-    _judged: &super::stop_judge::Judged,
+    judged: &super::stop_judge::Judged,
 ) -> bool {
+    let Some(hand_back) = draft_hand_back(hold, judged) else {
+        return false;
+    };
     let now = chrono::Utc::now().to_rfc3339();
     // `:held` is a condition value, never a status written here: the write
     // goes through `NeedsInput::needs_input`.
@@ -1698,7 +1721,7 @@ async fn wait_on_person(
             "#s IN (:done, :old_done) OR (#s = :held AND attribute_exists(draft_hold))",
         )
         .expression_attribute_names("#s", "status")
-        .needs_input(run_id, &hold.waiting_on())
+        .needs_input(run_id, &hold.waiting_on(), &hand_back)
         .expression_attribute_values(":h", hold.to_attr())
         .expression_attribute_values(":t", attr_s(&now))
         .expression_attribute_values(":done", attr_s(common::run_status::COMPLETED))

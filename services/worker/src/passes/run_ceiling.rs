@@ -204,7 +204,7 @@ impl EntryGate for DynamoGate<'_> {
     }
 }
 
-async fn load(state: &WorkerState, team_id: &str, run_id: &str) -> Option<Totals> {
+pub(crate) async fn load(state: &WorkerState, team_id: &str, run_id: &str) -> Option<Totals> {
     match state
         .dynamo
         .get_item()
