@@ -395,12 +395,18 @@ pub async fn run(
         Some(sb) if codegen_cmd.is_some() => {
             let repo =
                 super::generators::load(github, &msg.repo_owner, &msg.repo_name, branch).await;
-            Some(sb.with_generator_hosts(
-                super::generators::required_hosts(&repo, &codegen_env),
-                super::generators::generator_commands(&repo),
-            ))
+            // The registries too: run_codegen writes lockfiles with their
+            // package managers.
+            let mut hosts = super::generators::required_hosts(&repo, &codegen_env);
+            for h in super::generators::lockfile_hosts() {
+                if !hosts.contains(&h) {
+                    hosts.push(h);
+                }
+            }
+            Some(sb.with_generator_hosts(hosts, super::generators::generator_commands(&repo)))
         }
-        other => other,
+        Some(sb) => Some(sb.with_generator_hosts(super::generators::lockfile_hosts(), Vec::new())),
+        None => None,
     };
 
     // Purely bot/CI-driven fix cycles are scoped to the files the PR already
@@ -438,8 +444,10 @@ pub async fn run(
     if sandbox.is_some() && checks_cmd.is_some() {
         tools.push(run_checks_tool());
     }
-    // Offer codegen regeneration when the repo has a codegen command.
-    if sandbox.is_some() && codegen_cmd.is_some() {
+    // Offer regeneration whenever there is a sandbox: the repository's
+    // codegen when it has one, and always its lockfiles (a lockfile is
+    // written by its package manager, never by the coder).
+    if sandbox.is_some() {
         tools.push(run_codegen_tool());
     }
 
@@ -1407,7 +1415,11 @@ fn run_codegen_tool() -> ToolDefinition {
              regenerated files. Use this AFTER you add or change a schema/source that feeds \
              generated types — for example after adding a Sanity block, so its key lands in the \
              generated types union and type-checks pass. Do NOT hand-edit large generated files; \
-             run this instead. Takes no arguments. After it runs, call run_checks to confirm."
+             run this instead. It also regenerates LOCKFILES: after you change a manifest \
+             (package.json, pyproject.toml, Cargo.toml, Gemfile, go.mod), every lockfile that \
+             reads it (package-lock.json, pnpm-lock.yaml, yarn.lock, ...) is written again by \
+             its own package manager and committed. Never write a lockfile yourself: such a \
+             write is refused. Takes no arguments. After it runs, call run_checks to confirm."
                 .to_string(),
         input_schema: json!({"type": "object", "properties": {}}),
     }
@@ -1982,6 +1994,10 @@ impl<'a> WriteToolExecutor<'a> {
                          Skip this file and continue with other changes."
                     )));
                 }
+                if let Some(refusal) = lockfile_write_refusal(path) {
+                    note(LogOutcome::soft_fail(LOCKFILE_REFUSED));
+                    return Ok(json!(refusal));
+                }
                 let content = input
                     .get("content")
                     .and_then(|v| v.as_str())
@@ -2079,6 +2095,10 @@ impl<'a> WriteToolExecutor<'a> {
                     return Ok(json!(format!(
                         "Cannot modify {path}: CI/CD workflow files are protected."
                     )));
+                }
+                if let Some(refusal) = lockfile_write_refusal(path) {
+                    note(LogOutcome::soft_fail(LOCKFILE_REFUSED));
+                    return Ok(json!(refusal));
                 }
                 if self.scope_guard.should_block(path) {
                     note(LogOutcome::soft_fail(
@@ -2212,6 +2232,15 @@ impl<'a> WriteToolExecutor<'a> {
                             path: path.to_string(),
                         });
                     } else {
+                        // A lockfile in the batch refuses the whole commit:
+                        // its package manager writes it (run_codegen).
+                        if let Some(refusal) = lockfile_write_refusal(path) {
+                            note(LogOutcome::soft_fail(LOCKFILE_REFUSED));
+                            return Ok(json!(format!(
+                                "Batch write REJECTED. {refusal} Send the batch again without \
+                                 {path}."
+                            )));
+                        }
                         let content = f.get("content").and_then(|v| v.as_str()).unwrap_or("");
                         // Atomic batch: one syntactically broken file rejects
                         // the whole commit — same contract as edit_file.
@@ -2668,6 +2697,19 @@ impl<'a> WriteToolExecutor<'a> {
                 if let Some(blocked) = blocked_check_note(o.passed, &o.output) {
                     report = format!("{blocked}\n\n{report}");
                 }
+                // A frozen install that failed on a stale lockfile is not a
+                // finding about the code: the lockfiles are written again by
+                // their package managers right here, and the coder is told
+                // to run the checks again.
+                if !o.passed && !common::lockfile_sync::mismatches(&o.output).is_empty() {
+                    if let Some(locks) = self.regenerate_lockfiles().await? {
+                        report = format!(
+                            "The install failed because a lockfile doesn't match its manifest; \
+                             that is not a problem in the code. {locks} Call run_checks again \
+                             before reading the results below.\n\n{report}"
+                        );
+                    }
+                }
                 note(checks_outcome(o.passed, &codes));
                 Ok(json!(report))
             }
@@ -2730,6 +2772,121 @@ impl<'a> WriteToolExecutor<'a> {
     /// loaded into the agent's context — like restore_file). Ok(...) even on
     /// failure; the agent reads the summary and iterates.
     async fn run_codegen_impl(
+        &self,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        // Lockfiles first: a generator's install after them reads a
+        // lockfile that matches the manifests (a frozen install on a stale
+        // one fails before any generator runs).
+        let locks = self.regenerate_lockfiles().await?;
+        if self.codegen_cmd.is_none() {
+            return Ok(json!(locks.unwrap_or_else(|| {
+                "Nothing to regenerate: this branch changes no manifest a lockfile reads, and \
+                 the repository has no other generator."
+                    .to_string()
+            })));
+        }
+        let generated = self.run_generators().await?;
+        Ok(match locks {
+            Some(l) => json!(format!("{l}\n\n{}", generated.as_str().unwrap_or_default())),
+            None => generated,
+        })
+    }
+
+    /// Writes every lockfile this branch's changes call for with its own
+    /// package manager, in the sandbox, and commits them
+    /// (`generators::run_lock_repair`). `None` when there is nothing to
+    /// write or no sandbox; otherwise what it came to, for the coder.
+    async fn regenerate_lockfiles(
+        &self,
+    ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+        use std::sync::atomic::Ordering;
+        let (Some(sandbox), Some(run_id)) = (&self.sandbox, &self.run_id) else {
+            return Ok(None);
+        };
+        let Some((tools, cmd)) = super::generators::plan_lock_repair(
+            self.github,
+            &self.owner,
+            &self.repo,
+            &self.base_branch,
+            &self.branch,
+        )
+        .await
+        else {
+            return Ok(None);
+        };
+        if let Some(gate) = &self.policy {
+            match gate
+                .check_command(&cmd, "Regenerate the lockfiles with their package managers")
+                .await
+            {
+                common::agent_policy::Outcome::Run { .. } => {}
+                common::agent_policy::Outcome::Stop(stop) => {
+                    crate::agent::policy::record_stop(&stop);
+                    return Err(Box::new(common::agent_policy::AgentStopped(stop)));
+                }
+                common::agent_policy::Outcome::Refused { message, .. }
+                | common::agent_policy::Outcome::Pending { message, .. } => {
+                    return Ok(Some(format!(
+                        "Lockfiles were not regenerated: {message}. Leave them as they are; \
+                         never write one by hand."
+                    )));
+                }
+            }
+        }
+        let attempt = self.check_budget.fetch_add(1, Ordering::SeqCst);
+        if attempt >= MAX_CHECKS_PER_RUN {
+            return Ok(Some(format!(
+                "Lockfiles were not regenerated: the sandbox budget ({MAX_CHECKS_PER_RUN}) is \
+                 used for this pass. CoderHelm regenerates them after this pass; never write \
+                 one by hand."
+            )));
+        }
+        let message =
+            self.commit_message("chore: regenerate lockfiles with their package managers");
+        let repair = super::generators::run_lock_repair(
+            &super::generators::LockJob {
+                github: self.github,
+                owner: &self.owner,
+                repo: &self.repo,
+                branch: &self.branch,
+                run_id,
+                sandbox,
+                node: self.node_version.as_deref(),
+                deadline: self.deadline,
+                nonce: 800 + attempt,
+                message: &message,
+            },
+            &tools,
+            &cmd,
+        )
+        .await;
+        for p in &repair.written {
+            self.files_modified.lock().unwrap().insert(p.clone());
+            self.file_cache
+                .remove(&format!("{}:{}", self.branch, p))
+                .await;
+            self.scope_guard.allow(p);
+        }
+        note(if repair.failed.is_empty() && repair.not_run.is_none() {
+            LogOutcome::ok(format!("{} lockfile(s) regenerated", repair.written.len()))
+        } else {
+            LogOutcome::soft_fail("a lockfile could not be regenerated")
+        });
+        let advice = if repair.failed.is_empty() {
+            ""
+        } else {
+            " For a lockfile its manager couldn't write, read the error: it names the version \
+             or range the manifest asks for that can't be resolved. Fix the manifest and call \
+             run_codegen again."
+        };
+        Ok(Some(format!(
+            "Lockfiles: {}.{advice} Never write a lockfile by hand.",
+            repair.note()
+        )))
+    }
+
+    /// The repository's own generators (see [`Self::run_codegen_impl`]).
+    async fn run_generators(
         &self,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
         use std::sync::atomic::Ordering;
@@ -3067,6 +3224,17 @@ fn extract_file_paths(tasks: &str) -> Vec<String> {
         }
     }
     paths
+}
+
+/// The run log's words for a refused lockfile write.
+const LOCKFILE_REFUSED: &str = "refused: a lockfile is written by its package manager";
+
+/// A coder's write to a lockfile is refused, always: the refusal names the
+/// tool that regenerates it (`common::lockfile_sync::refusal`). `None` for
+/// any other path. Deleting a lockfile and restoring one from a branch stay
+/// allowed: neither writes content of the coder's own.
+pub(crate) fn lockfile_write_refusal(path: &str) -> Option<String> {
+    common::lockfile_sync::lock_manager(path).map(|_| common::lockfile_sync::refusal(path))
 }
 
 /// True if `content` is machine-generated output carrying a do-not-edit banner.

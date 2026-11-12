@@ -105,6 +105,8 @@ async fn pushed(
     }
     match github.get_diff(owner, repo, base_sha, branch).await {
         Ok(compare) => run_round::pushed_from_compare(&compare),
+        // No WIP branch: the round saved nothing.
+        Err(e) if crate::clients::github::is_not_found(&*e) => (Vec::new(), Vec::new()),
         Err(e) => {
             warn!(error = %e, "Could not read what the round pushed");
             (Vec::new(), Vec::new())
@@ -409,18 +411,259 @@ pub(crate) enum Landed {
     Refused(String),
 }
 
+/// What stopped a fix round from inside. The class decides the way around
+/// it ([`way_around`]); none of them ends the round or the run by itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Fault {
+    /// The round's WIP branch isn't there (never made, or already cleaned
+    /// up): the round saved nothing.
+    WipMissing,
+    /// The round's changes couldn't be read (a compare GitHub refused).
+    Unreadable,
+    /// GitHub refused the one commit (the head moved, a 409 or 422).
+    PushRejected,
+    /// The pull request changed the same files while the round worked.
+    Clash,
+    /// GitHub is refusing for a while (its limit, a 5xx, no answer).
+    GitHubBusy,
+    /// The sandbox or one of its tools failed.
+    Sandbox,
+    /// Anything else.
+    Other,
+}
+
+/// The class of an error met inside a fix round, from its text.
+pub(crate) fn fault_of(error: &str) -> Fault {
+    let e = error.to_ascii_lowercase();
+    let has = |needles: &[&str]| needles.iter().any(|n| e.contains(n));
+    if has(&["changed the same files meanwhile"]) {
+        Fault::Clash
+    } else if has(&["no wip branch"])
+        || (e.contains("404") && has(&["coderhelm-wip/", "wip branch", "/git/ref"]))
+    {
+        Fault::WipMissing
+    } else if has(&[
+        "(409",
+        "(422",
+        "not a fast forward",
+        "not a fast-forward",
+        "reference update failed",
+        "couldn't be pushed",
+        "update is not a fast",
+    ]) {
+        Fault::PushRejected
+    } else if has(&[
+        "rate limit",
+        "(500",
+        "(502",
+        "(503",
+        "(504",
+        "timed out",
+        "timeout",
+        "connection reset",
+        "error sending request",
+    ]) {
+        Fault::GitHubBusy
+    } else if has(&["sandbox", "codebuild", "snapshot"]) {
+        Fault::Sandbox
+    } else if has(&["couldn't be read", "/compare/", "(404"]) {
+        Fault::Unreadable
+    } else {
+        Fault::Other
+    }
+}
+
+/// The way around a fault, as the round takes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WayAround {
+    /// Make the WIP branch again at the pull request's head and go on: the
+    /// round saved nothing, so nothing is lost.
+    ReopenWip,
+    /// Read the round's changes from the two trees instead of a compare.
+    ReadFromTrees,
+    /// Read the pull request's head again and push the one commit again.
+    PushAgain,
+    /// Start the round's work again from the pull request's new head.
+    RestartFromHead,
+    /// Wait for GitHub and go on as the same run.
+    WaitForGitHub,
+    /// Go on without the sandbox: CI on the pull request is the check.
+    WithoutSandbox,
+    /// Run the round again from a clean WIP branch.
+    RetryClean,
+}
+
+pub(crate) fn way_around(f: Fault) -> WayAround {
+    match f {
+        Fault::WipMissing => WayAround::ReopenWip,
+        Fault::Unreadable => WayAround::ReadFromTrees,
+        Fault::PushRejected => WayAround::PushAgain,
+        Fault::Clash => WayAround::RestartFromHead,
+        Fault::GitHubBusy => WayAround::WaitForGitHub,
+        Fault::Sandbox => WayAround::WithoutSandbox,
+        Fault::Other => WayAround::RetryClean,
+    }
+}
+
+/// How many times a round whose attempts all met a fault is run again in a
+/// fresh invocation before the supervisor's ending takes over.
+pub(crate) const MAX_REDRIVES: u32 = 1;
+
+/// What a round does after an attempt met a fault it couldn't get around
+/// inside the attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AfterFault {
+    /// Another attempt in this invocation, from a clean WIP branch.
+    RetryClean,
+    /// A fresh invocation runs the round again from the start.
+    Redrive,
+    /// Every way around is spent: the supervisor's ending (take out what
+    /// broke the checks, else end with the exact cause).
+    Supervisor,
+}
+
+/// The catch-all: an attempt that met a fault is followed by a clean one
+/// while the round has attempts and time, then by one fresh invocation,
+/// and only then by the supervisor's ending. Never by a dead round.
+pub(crate) fn after_fault(
+    attempt: usize,
+    max_attempts: usize,
+    has_time: bool,
+    redrives: u32,
+) -> AfterFault {
+    if attempt < max_attempts && has_time {
+        AfterFault::RetryClean
+    } else if redrives < MAX_REDRIVES {
+        AfterFault::Redrive
+    } else {
+        AfterFault::Supervisor
+    }
+}
+
+/// What a fault and its way around read like on the run page.
+pub(crate) fn fault_note(kind: Kind, f: Fault, error: &str, next: &AfterFault) -> String {
+    let what = match f {
+        Fault::WipMissing => "its work branch wasn't there, so it had saved nothing",
+        Fault::Unreadable => "its changes couldn't be read from GitHub",
+        Fault::PushRejected => "GitHub refused its commit",
+        Fault::Clash => "the pull request changed the same files while it worked",
+        Fault::GitHubBusy => "GitHub didn't answer",
+        Fault::Sandbox => "the sandbox gave no result",
+        Fault::Other => "it met an error",
+    };
+    let then = match next {
+        AfterFault::RetryClean => "CoderHelm runs it again now from the pull request's head",
+        AfterFault::Redrive => "CoderHelm runs it again in a fresh step",
+        AfterFault::Supervisor => "its attempts are used",
+    };
+    format!(
+        "The {} didn't land: {what} ({}). {then}.",
+        kind.label(),
+        common::truncate_str(error.trim(), 200)
+    )
+}
+
+/// The files that differ between two trees (`before`, `after`: path and
+/// blob sha): the round's changes read without a compare.
+pub(crate) fn changed_from_trees(
+    before: &[(String, String)],
+    after: &[(String, String)],
+) -> Vec<Changed> {
+    let was: std::collections::HashMap<&str, &str> = before
+        .iter()
+        .map(|(p, s)| (p.as_str(), s.as_str()))
+        .collect();
+    let now: std::collections::HashMap<&str, &str> = after
+        .iter()
+        .map(|(p, s)| (p.as_str(), s.as_str()))
+        .collect();
+    let mut out: Vec<Changed> = after
+        .iter()
+        .filter(|(p, s)| was.get(p.as_str()) != Some(&s.as_str()))
+        .map(|(p, _)| Changed {
+            path: p.clone(),
+            removed: false,
+            previous: None,
+        })
+        .collect();
+    out.extend(
+        before
+            .iter()
+            .filter(|(p, _)| !now.contains_key(p.as_str()))
+            .map(|(p, _)| Changed {
+                path: p.clone(),
+                removed: true,
+                previous: None,
+            }),
+    );
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    out
+}
+
+async fn blobs(
+    github: &GitHubClient,
+    owner: &str,
+    repo: &str,
+    git_ref: &str,
+) -> Result<Vec<(String, String)>, Box<dyn std::error::Error + Send + Sync>> {
+    Ok(github
+        .get_tree(owner, repo, git_ref)
+        .await?
+        .into_iter()
+        .filter(|e| e.entry_type == "blob")
+        .map(|e| (e.path, e.sha))
+        .collect())
+}
+
+/// What a round changed on its WIP branch since `base_sha`. `Ok(None)`
+/// when the WIP branch isn't there (the round saved nothing). A compare
+/// GitHub refuses is read another way: the two trees, file by file.
+async fn round_changes(
+    pr: &Pr<'_>,
+    wip: &str,
+    base_sha: &str,
+) -> Result<Option<Vec<Changed>>, String> {
+    let (github, owner, repo) = (pr.github, pr.owner, pr.repo);
+    let first = match github.get_diff(owner, repo, base_sha, wip).await {
+        Ok(c) => return Ok(Some(changed_from_compare(&c))),
+        Err(e) => e,
+    };
+    if let Err(e) = github.get_ref(owner, repo, wip).await {
+        if crate::clients::github::is_not_found(&*e) {
+            info!(wip, "The round's WIP branch isn't there: it saved nothing");
+            return Ok(None);
+        }
+    }
+    warn!(wip, error = %first, "Compare refused; reading the round's changes from the trees");
+    match (
+        blobs(github, owner, repo, base_sha).await,
+        blobs(github, owner, repo, wip).await,
+    ) {
+        (Ok(before), Ok(after)) => Ok(Some(changed_from_trees(&before, &after))),
+        (Err(e), _) | (_, Err(e)) => Err(format!(
+            "its changes couldn't be read ({first}; reading the trees: {e})"
+        )),
+    }
+}
+
 /// Lands a finished round on the pull request: everything it changed on its
 /// WIP branch since `base_sha`, as ONE commit with `message`, in one push.
 /// Refuses (keeping the WIP branch) when the pull request changed the same
 /// files meanwhile. The WIP branch is deleted once landed.
+///
+/// A WIP branch that isn't there is a round that saved nothing
+/// ([`Landed::Nothing`]), never a refusal. A compare GitHub refuses is read
+/// from the trees, and a commit GitHub refuses is pushed once more on the
+/// pull request's head as it is then.
 pub(crate) async fn land(pr: &Pr<'_>, wip: &str, base_sha: &str, message: &str) -> Landed {
     let (github, owner, repo) = (pr.github, pr.owner, pr.repo);
     if wip.is_empty() || wip == pr.branch || base_sha.is_empty() {
         return Landed::Refused("the round has no WIP branch to land".into());
     }
-    let ours = match github.get_diff(owner, repo, base_sha, wip).await {
-        Ok(c) => changed_from_compare(&c),
-        Err(e) => return Landed::Refused(format!("its changes couldn't be read ({e})")),
+    let ours = match round_changes(pr, wip, base_sha).await {
+        Ok(Some(c)) => c,
+        Ok(None) => return Landed::Nothing,
+        Err(why) => return Landed::Refused(why),
     };
     if ours.is_empty() {
         let _ = github.delete_branch(owner, repo, wip).await;
@@ -475,10 +718,20 @@ pub(crate) async fn land(pr: &Pr<'_>, wip: &str, base_sha: &str, message: &str) 
             }
         }
     }
-    match github
+    // A refused commit is pushed once more: the write reads the pull
+    // request's head again, so a head that moved under the first try (the
+    // files don't clash, checked above) takes the second.
+    let mut pushed = github
         .batch_write(owner, repo, pr.branch, message, &ops)
-        .await
-    {
+        .await;
+    if let Err(e) = &pushed {
+        warn!(wip, error = %e, "The round's commit was refused; pushing once more on the current head");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        pushed = github
+            .batch_write(owner, repo, pr.branch, message, &ops)
+            .await;
+    }
+    match pushed {
         Ok(_) => {
             let _ = github.delete_branch(owner, repo, wip).await;
             Landed::Pushed { files: ours.len() }
@@ -526,6 +779,102 @@ mod tests {
         assert!(overlap(&c, &["README.md".to_string()]).is_empty());
         assert_eq!(overlap(&c, &["src/a.ts".to_string()]), vec!["src/a.ts"]);
         assert_eq!(overlap(&c, &["src/was.ts".to_string()]), vec!["src/was.ts"]);
+    }
+
+    #[test]
+    fn every_fault_inside_a_round_has_a_way_around_and_none_is_a_dead_round() {
+        // The run's own errors, as GitHub returned them (names invented).
+        let compare_404 = "HTTP status client error (404 Not Found) for url (https://api.github.com/repos/acme/site/compare/abc123...coderhelm-wip/coderhelm/gh-41-card-block): {\"message\":\"Not Found\"}";
+        let ref_404 = "HTTP status client error (404 Not Found) for url (https://api.github.com/repos/acme/site/git/ref/heads/coderhelm-wip/coderhelm/gh-41-card-block)";
+        for (error, fault, way) in [
+            (compare_404, Fault::WipMissing, WayAround::ReopenWip),
+            (ref_404, Fault::WipMissing, WayAround::ReopenWip),
+            (
+                "its changes couldn't be read (HTTP status client error (404 Not Found) for url (https://api.github.com/repos/acme/site/compare/abc...def))",
+                Fault::Unreadable,
+                WayAround::ReadFromTrees,
+            ),
+            (
+                "the one commit couldn't be pushed (HTTP status client error (422 Unprocessable Entity): Update is not a fast forward)",
+                Fault::PushRejected,
+                WayAround::PushAgain,
+            ),
+            (
+                "HTTP status client error (409 Conflict) for url (https://api.github.com/repos/acme/site/git/refs/heads/x)",
+                Fault::PushRejected,
+                WayAround::PushAgain,
+            ),
+            (
+                "the pull request changed the same files meanwhile (package.json)",
+                Fault::Clash,
+                WayAround::RestartFromHead,
+            ),
+            (
+                "HTTP status server error (502 Bad Gateway) for url (https://api.github.com/repos/acme/site/git/trees)",
+                Fault::GitHubBusy,
+                WayAround::WaitForGitHub,
+            ),
+            (
+                "the sandbox build didn't start: CodeBuild AccountLimitExceededException",
+                Fault::Sandbox,
+                WayAround::WithoutSandbox,
+            ),
+            ("model reply had no content", Fault::Other, WayAround::RetryClean),
+        ] {
+            assert_eq!(fault_of(error), fault, "{error}");
+            assert_eq!(way_around(fault), way, "{error}");
+        }
+        // The catch-all: a clean attempt while the round has attempts and
+        // time, then one fresh invocation, then the supervisor's ending.
+        assert_eq!(after_fault(1, 3, true, 0), AfterFault::RetryClean);
+        assert_eq!(after_fault(2, 3, true, 0), AfterFault::RetryClean);
+        assert_eq!(after_fault(3, 3, true, 0), AfterFault::Redrive);
+        assert_eq!(after_fault(1, 3, false, 0), AfterFault::Redrive);
+        assert_eq!(
+            after_fault(3, 3, true, MAX_REDRIVES),
+            AfterFault::Supervisor
+        );
+        let note = fault_note(
+            Kind::CiFix,
+            Fault::WipMissing,
+            ref_404,
+            &AfterFault::RetryClean,
+        );
+        assert!(
+            note.contains("saved nothing") && note.contains("runs it again now"),
+            "{note}"
+        );
+        assert!(!note.contains("didn't finish"), "{note}");
+    }
+
+    #[test]
+    fn a_rounds_changes_are_read_from_the_trees_when_the_compare_is_refused() {
+        let t = |v: &[(&str, &str)]| -> Vec<(String, String)> {
+            v.iter()
+                .map(|(p, s)| (p.to_string(), s.to_string()))
+                .collect()
+        };
+        let before = t(&[
+            ("package.json", "a1"),
+            ("pnpm-lock.yaml", "b1"),
+            ("old.ts", "c1"),
+        ]);
+        let after = t(&[
+            ("package.json", "a1"),
+            ("pnpm-lock.yaml", "b2"),
+            ("new.ts", "d1"),
+        ]);
+        let c = changed_from_trees(&before, &after);
+        let paths: Vec<(&str, bool)> = c.iter().map(|c| (c.path.as_str(), c.removed)).collect();
+        assert_eq!(
+            paths,
+            vec![
+                ("new.ts", false),
+                ("old.ts", true),
+                ("pnpm-lock.yaml", false)
+            ]
+        );
+        assert!(changed_from_trees(&before, &before).is_empty());
     }
 
     #[test]
