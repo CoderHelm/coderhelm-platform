@@ -14,11 +14,18 @@
 //! up" page. The name stays reserved for its install; nothing is deleted
 //! that would let someone else take it.
 //!
-//! A network failure (DNS, connection, timeout) doesn't count as a wrong
-//! answer: only an answer that is wrong does, [`PARK_AFTER`] times in a row.
-//! A name whose address hasn't answered at all for a whole day
-//! ([`UNREACHABLE_PARK_AFTER`] runs) is parked too: by then it isn't a blip,
-//! the CloudFront address is gone.
+//! A network failure (DNS, connection, timeout) and a server error from the
+//! address (5xx, 408, 429: the install restarting, crashing after an update,
+//! or overloaded) don't count as a wrong answer: only a definitive mismatch
+//! does (another app or distribution answering, a wrong proof),
+//! [`PARK_AFTER`] times in a row. A name whose address hasn't answered as
+//! anyone for a whole day ([`UNREACHABLE_PARK_AFTER`] runs) is parked too: by
+//! then it isn't a blip, the CloudFront address is gone.
+//!
+//! A parked name comes back by itself: once the install proves itself again
+//! at its recorded CloudFront address, the check writes the address record
+//! back, clears the parked note and keeps when it recovered as history
+//! ([`Decision::restore`]).
 
 use super::names::{self, NameRecord};
 
@@ -26,9 +33,9 @@ use super::names::{self, NameRecord};
 /// the gateway adds a name when it is claimed, the name check reads it.
 pub const NAME_INDEX: &str = "HYBRIDNAME";
 
-/// Wrong answers in a row before a name is parked (15 minutes apart: about
-/// 45 minutes).
-pub const PARK_AFTER: u32 = 3;
+/// Definitive wrong answers in a row before a name is parked (15 minutes
+/// apart: an hour).
+pub const PARK_AFTER: u32 = 4;
 
 /// Runs in a row with no answer at all before a name is parked (a day).
 pub const UNREACHABLE_PARK_AFTER: u32 = 96;
@@ -176,10 +183,23 @@ pub enum Proof {
     /// The install answered with its own id and a right proof.
     Proven,
     /// Something answered, and it wasn't this install's right proof (another
-    /// install, a wrong proof, an HTTP error page): counts toward parking.
+    /// install or app, a wrong proof, a 4xx page): counts toward parking.
     Wrong,
-    /// No answer (DNS, connection, timeout): never counts.
+    /// No answer as anyone (DNS, connection, timeout, or a server error such
+    /// as the install's gateway failing): never counts as wrong.
     Unreachable,
+}
+
+/// What an HTTP status alone says about a proof: `None` for a success (the
+/// body decides), [`Proof::Unreachable`] for a server error, a timeout or a
+/// rate limit (the install is there but not answering right now, which is
+/// not a different app answering), [`Proof::Wrong`] for anything else.
+pub fn proof_for_status(status: u16) -> Option<Proof> {
+    match status {
+        200..=299 => None,
+        408 | 429 | 500..=599 => Some(Proof::Unreachable),
+        _ => Some(Proof::Wrong),
+    }
 }
 
 /// Why a name is parked (stored, shown to the install's admins and in hosted
@@ -225,6 +245,8 @@ pub struct History {
     pub proven_before: bool,
     /// Runs in a row where the address didn't answer at all.
     pub unreachable: u32,
+    /// The name is parked now (on the holding page).
+    pub parked: bool,
 }
 
 /// What one run decides for one name.
@@ -233,6 +255,9 @@ pub struct Decision {
     pub history: History,
     /// Park now, and why.
     pub park: Option<ParkReason>,
+    /// A parked name whose install proved itself again at its recorded
+    /// CloudFront address: write the address back and clear the parked note.
+    pub restore: bool,
     /// A short state for the admin views: `ok`, `setting_up`, `waiting`,
     /// `failing`, `unreachable`, `parked`.
     pub state: &'static str,
@@ -241,7 +266,8 @@ pub struct Decision {
 /// Decides for one claimed name. `install_ok` is false when the name's
 /// install is missing, revoked or unverified. `origin` is the proof through
 /// the recorded CloudFront address and `via_name` through the name; both are
-/// None while the name is still on the fallback (nothing to prove yet).
+/// None while the name is still on the fallback (nothing to prove yet). A
+/// parked name is proved through its CloudFront address only (`origin`).
 pub fn decide(
     prev: History,
     install_ok: bool,
@@ -249,35 +275,67 @@ pub fn decide(
     origin: Option<Proof>,
     via_name: Option<Proof>,
 ) -> Decision {
-    let park = |reason, history| Decision {
-        history,
+    let park = |reason, history: History| Decision {
+        history: History {
+            parked: true,
+            ..history
+        },
         park: Some(reason),
+        restore: false,
         state: "parked",
+    };
+    let keep = |history, state| Decision {
+        history,
+        park: None,
+        restore: false,
+        state,
     };
     let reset = History {
         failures: 0,
         proven_before: prev.proven_before,
         unreachable: 0,
+        parked: prev.parked,
     };
     if !install_ok {
+        if prev.parked {
+            // Already on the holding page: nothing to change again.
+            return keep(reset, "parked");
+        }
         return park(ParkReason::NoInstall, reset);
     }
     if !records.clean() {
         // Written outside CoderHelm: back to what CoderHelm knows, now.
         return park(ParkReason::ForeignRecord, reset);
     }
-    let (Some(origin), Some(via_name)) = (origin, via_name) else {
-        return Decision {
-            history: reset,
-            park: None,
-            state: "setting_up",
+    if prev.parked {
+        // The install answering as itself at its own CloudFront address is
+        // the whole proof the address record needs (the same proof the
+        // install's own record write asks for): put it back.
+        return if origin == Some(Proof::Proven) {
+            Decision {
+                history: History {
+                    failures: 0,
+                    proven_before: true,
+                    unreachable: 0,
+                    parked: false,
+                },
+                park: None,
+                restore: true,
+                state: "ok",
+            }
+        } else {
+            keep(reset, "parked")
         };
+    }
+    let (Some(origin), Some(via_name)) = (origin, via_name) else {
+        return keep(reset, "setting_up");
     };
     let strike = |reason: ParkReason| {
         let history = History {
             failures: prev.failures + 1,
             proven_before: prev.proven_before,
             unreachable: 0,
+            parked: false,
         };
         if history.failures >= PARK_AFTER {
             park(
@@ -288,34 +346,26 @@ pub fn decide(
                 },
             )
         } else {
-            Decision {
-                history,
-                park: None,
-                state: "failing",
-            }
+            keep(history, "failing")
         }
     };
     match (origin, via_name) {
-        (Proof::Proven, Proof::Proven) => Decision {
-            history: History {
+        (Proof::Proven, Proof::Proven) => keep(
+            History {
                 failures: 0,
                 proven_before: true,
                 unreachable: 0,
+                parked: false,
             },
-            park: None,
-            state: "ok",
-        },
+            "ok",
+        ),
         // The address the name points at answers as someone else, or as nobody.
         (Proof::Wrong, _) => strike(ParkReason::OriginGone),
         // The install is there, the name doesn't reach it: dangerous only
         // once it worked (before that, the install hasn't moved onto the
         // name yet; the domain step shows it).
         (Proof::Proven, Proof::Wrong) if prev.proven_before => strike(ParkReason::NameGone),
-        (Proof::Proven, Proof::Wrong) => Decision {
-            history: reset,
-            park: None,
-            state: "waiting",
-        },
+        (Proof::Proven, Proof::Wrong) => keep(reset, "waiting"),
         // No answer at all: not a wrong answer, and no reset. Only a whole
         // day of it parks the name (the address is gone, not blipping).
         (Proof::Unreachable, _) | (_, Proof::Unreachable) => {
@@ -326,11 +376,7 @@ pub fn decide(
             if history.unreachable >= UNREACHABLE_PARK_AFTER {
                 park(ParkReason::OriginGone, reset)
             } else {
-                Decision {
-                    history,
-                    park: None,
-                    state: "unreachable",
-                }
+                keep(history, "unreachable")
             }
         }
     }
@@ -378,6 +424,54 @@ pub fn stored_after_park(stored: &[NameRecord]) -> Vec<NameRecord> {
         .filter(|r| r.purpose != "address")
         .cloned()
         .collect()
+}
+
+/// What restoring a parked name changes: the fallback alias records to delete
+/// and the address record to write back (to the install's own, just proved,
+/// CloudFront address). None when the CloudFront address isn't one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestorePlan {
+    pub delete: Vec<usize>,
+    pub address: NameRecord,
+}
+
+pub fn plan_restore(
+    name: &str,
+    zone: &str,
+    records: &Records,
+    listed: &[ZoneRecord],
+    cloudfront: &str,
+) -> Option<RestorePlan> {
+    let address = names::check_record(
+        name,
+        &NameRecord {
+            purpose: "address".into(),
+            name: names::hostname(name),
+            rtype: "CNAME".into(),
+            value: bare(cloudfront),
+        },
+        cloudfront,
+    )
+    .ok()?;
+    let delete = records
+        .fallback
+        .iter()
+        .copied()
+        .filter(|i| {
+            listed
+                .get(*i)
+                .is_some_and(|r| r.writable() && owner(&r.name, zone).as_deref() == Some(name))
+        })
+        .collect();
+    Some(RestorePlan { delete, address })
+}
+
+/// The stored record list once restored: the address is back beside the
+/// certificate's validation record.
+pub fn stored_after_restore(stored: &[NameRecord], address: &NameRecord) -> Vec<NameRecord> {
+    let mut out = stored_after_park(stored);
+    out.push(address.clone());
+    out
 }
 
 /// Records in the zone that sit under no claimed name and match a shape the
@@ -512,6 +606,7 @@ mod tests {
             failures: 2,
             proven_before: false,
             unreachable: 5,
+            parked: false,
         };
         let d = decide(prev, true, &r, Some(Proof::Proven), Some(Proof::Proven));
         assert_eq!(d.park, None);
@@ -521,18 +616,20 @@ mod tests {
             History {
                 failures: 0,
                 proven_before: true,
-                unreachable: 0
+                unreachable: 0,
+                parked: false,
             }
         );
     }
 
     #[test]
-    fn a_wrong_target_is_parked_after_three_wrong_answers() {
+    fn a_sustained_definitive_mismatch_is_parked_after_park_after_answers() {
         let r = sort(&live(), false, CF);
         let mut h = History {
             failures: 0,
             proven_before: true,
             unreachable: 0,
+            parked: false,
         };
         for n in 1..PARK_AFTER {
             let d = decide(h, true, &r, Some(Proof::Wrong), Some(Proof::Wrong));
@@ -552,6 +649,7 @@ mod tests {
             failures: 2,
             proven_before: true,
             unreachable: 0,
+            parked: false,
         };
         for (o, n) in [
             (Proof::Unreachable, Proof::Unreachable),
@@ -605,6 +703,7 @@ mod tests {
             failures: 0,
             proven_before: false,
             unreachable: 0,
+            parked: false,
         };
         for _ in 0..10 {
             let d = decide(h, true, &r, Some(Proof::Proven), Some(Proof::Wrong));
@@ -616,6 +715,7 @@ mod tests {
             failures: PARK_AFTER - 1,
             proven_before: true,
             unreachable: 0,
+            parked: false,
         };
         let d = decide(h, true, &r, Some(Proof::Proven), Some(Proof::Wrong));
         assert_eq!(d.park, Some(ParkReason::NameGone));
@@ -765,6 +865,139 @@ mod tests {
         let claimed = |n: &str| n == "acme";
         assert_eq!(orphans(ZONE, &claimed, FALLBACK, &listed), vec![0, 1, 2]);
         assert_eq!(unknown(ZONE, &claimed, FALLBACK, &listed), vec![5]);
+    }
+
+    #[test]
+    fn a_server_error_is_no_answer_and_a_4xx_is_a_wrong_answer() {
+        assert_eq!(proof_for_status(200), None);
+        assert_eq!(proof_for_status(204), None);
+        for st in [500, 502, 503, 504, 408, 429] {
+            assert_eq!(proof_for_status(st), Some(Proof::Unreachable), "{st}");
+        }
+        for st in [301, 400, 401, 403, 404, 410] {
+            assert_eq!(proof_for_status(st), Some(Proof::Wrong), "{st}");
+        }
+    }
+
+    #[test]
+    fn an_install_whose_gateway_fails_for_an_hour_after_an_update_is_never_parked() {
+        // A working name; then every request answers 500 for four runs (the
+        // gateway crashing at start after an update), then it answers again.
+        let r = sort(&live(), false, CF);
+        let mut h = History {
+            proven_before: true,
+            ..History::default()
+        };
+        let down = proof_for_status(500);
+        for _ in 0..(PARK_AFTER + 2) {
+            let d = decide(h, true, &r, down, down);
+            assert_eq!(d.park, None);
+            assert_eq!(d.state, "unreachable");
+            assert_eq!(d.history.failures, 0);
+            h = d.history;
+        }
+        let d = decide(h, true, &r, Some(Proof::Proven), Some(Proof::Proven));
+        assert_eq!(d.park, None);
+        assert_eq!(d.state, "ok");
+        assert_eq!(
+            d.history,
+            History {
+                proven_before: true,
+                ..History::default()
+            }
+        );
+    }
+
+    #[test]
+    fn one_good_answer_between_wrong_ones_starts_the_count_over() {
+        let r = sort(&live(), false, CF);
+        let mut h = History {
+            proven_before: true,
+            ..History::default()
+        };
+        for round in 0..3 {
+            for _ in 1..PARK_AFTER {
+                let d = decide(h, true, &r, Some(Proof::Wrong), Some(Proof::Wrong));
+                assert_eq!(d.park, None, "round {round}");
+                h = d.history;
+            }
+            h = decide(h, true, &r, Some(Proof::Proven), Some(Proof::Proven)).history;
+            assert_eq!(h.failures, 0);
+        }
+    }
+
+    #[test]
+    fn a_parked_name_whose_install_answers_again_is_restored() {
+        // Parked: the address is gone from the stored records and the name
+        // is back on the fallback alias.
+        let listed = vec![
+            ZoneRecord::new(CERT_NAME, "CNAME", Some(CERT_VALUE), None),
+            ZoneRecord::new("acme.coderhelm.com", "A", None, Some(FALLBACK)),
+            ZoneRecord::new("acme.coderhelm.com", "AAAA", None, Some(FALLBACK)),
+        ];
+        let kept = stored_after_park(&stored());
+        let r = sort_records("acme", ZONE, &kept, true, CF, FALLBACK, &listed);
+        assert!(r.clean());
+        assert_eq!(r.fallback, vec![1, 2]);
+        let parked = History {
+            parked: true,
+            ..History::default()
+        };
+        // Still not answering: stays parked, nothing is changed again.
+        for o in [None, Some(Proof::Unreachable), Some(Proof::Wrong)] {
+            let d = decide(parked, true, &r, o, None);
+            assert_eq!((d.park, d.restore, d.state), (None, false, "parked"));
+            assert!(d.history.parked);
+        }
+        // An install that is gone keeps its name parked, without parking again.
+        let d = decide(parked, false, &r, None, None);
+        assert_eq!((d.park, d.restore, d.state), (None, false, "parked"));
+        // Answers as itself at its CloudFront address: put back, note cleared.
+        let d = decide(parked, true, &r, Some(Proof::Proven), None);
+        assert!(d.restore);
+        assert_eq!(d.park, None);
+        assert_eq!(d.state, "ok");
+        assert!(!d.history.parked);
+        assert!(d.history.proven_before);
+        let p = plan_restore("acme", ZONE, &r, &listed, CF).unwrap();
+        assert_eq!(p.delete, vec![1, 2]);
+        assert_eq!(p.address.purpose, "address");
+        assert_eq!(p.address.name, "acme.coderhelm.com");
+        assert_eq!(p.address.value, CF);
+        let back = stored_after_restore(&kept, &p.address);
+        assert_eq!(back.len(), 2);
+        assert!(back.iter().any(|x| x.purpose == "certificate"));
+        // A record CoderHelm didn't write appearing meanwhile is not restored over.
+        let mut odd = listed.clone();
+        odd.push(ZoneRecord::new(
+            "acme.coderhelm.com",
+            "TXT",
+            Some("x"),
+            None,
+        ));
+        odd.push(ZoneRecord::new(
+            "_x.acme.coderhelm.com",
+            "CNAME",
+            Some("elsewhere.example.org"),
+            None,
+        ));
+        let r2 = sort_records("acme", ZONE, &kept, true, CF, FALLBACK, &odd);
+        let d = decide(parked, true, &r2, Some(Proof::Proven), None);
+        assert_eq!(d.park, Some(ParkReason::ForeignRecord));
+        assert!(!d.restore);
+    }
+
+    #[test]
+    fn a_restore_only_points_at_the_install_s_own_cloudfront() {
+        let listed = vec![ZoneRecord::new(
+            "acme.coderhelm.com",
+            "A",
+            None,
+            Some(FALLBACK),
+        )];
+        let r = sort_records("acme", ZONE, &[], true, CF, FALLBACK, &listed);
+        assert!(plan_restore("acme", ZONE, &r, &listed, "not-cloudfront.example.org").is_none());
+        assert!(plan_restore("acme", ZONE, &r, &listed, "").is_none());
     }
 
     #[test]

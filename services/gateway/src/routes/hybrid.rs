@@ -992,9 +992,18 @@ async fn stored_name(state: &AppState, name: &str) -> (Vec<names::NameRecord>, b
     (recs, pending)
 }
 
+fn opt(v: String) -> Value {
+    if v.is_empty() {
+        Value::Null
+    } else {
+        Value::String(v)
+    }
+}
+
 /// The 15-minute name check's last result for a name (worker
 /// hybrid_name_check): its state, and when parked, why and when, in plain
-/// words. Null when the name hasn't been checked yet.
+/// words; when it last recovered, as history. Null when the name hasn't
+/// been checked yet.
 pub(crate) async fn name_check_view(state: &AppState, name: &str) -> Value {
     if name.is_empty() {
         return Value::Null;
@@ -1033,6 +1042,10 @@ pub(crate) async fn name_check_view(state: &AppState, name: &str) -> Value {
         "parked_code": if parked { json!(g("parked_code")) } else { Value::Null },
         "parked_reason": if parked { json!(g("parked_reason")) } else { Value::Null },
         "parked_at": if parked { json!(g("parked_at")) } else { Value::Null },
+        // History, apart from the state: when a parked name last came back.
+        "recovered_at": opt(g("recovered_at")),
+        "recovered_code": opt(g("recovered_code")),
+        "last_parked_at": opt(g("last_parked_at")),
     })
 }
 

@@ -8,13 +8,16 @@
 //! recorded CloudFront address, and the name). Parking swaps the address back
 //! to the hosted holding page, records why on the reservation (the install
 //! reads it from /hybrid/status, and so does hosted admin) and writes an
-//! audit entry. The reservation is never deleted. Records left under no
+//! audit entry. The reservation is never deleted. A parked name whose
+//! install proves itself again at its recorded CloudFront address gets its
+//! address record back by itself, and the reservation keeps when it
+//! recovered (`recovered_at`) as history. Records left under no
 //! claimed name in a shape CoderHelm writes are removed; anything else
 //! unexpected is logged for CoderHelm's operators.
 
 use aws_sdk_dynamodb::types::AttributeValue;
 use aws_sdk_route53::types::{
-    AliasTarget, Change, ChangeAction, ChangeBatch, ResourceRecordSet, RrType,
+    AliasTarget, Change, ChangeAction, ChangeBatch, ResourceRecord, ResourceRecordSet, RrType,
 };
 use common::hybrid::name_check::{self, History, Proof, ZoneRecord};
 use common::hybrid::names::{self, NameRecord};
@@ -48,6 +51,9 @@ struct Claim {
     records: Vec<NameRecord>,
     pending: bool,
     history: History,
+    /// Why it was parked, while it is (kept as history once it recovers).
+    parked_code: String,
+    parked_at: String,
 }
 
 fn claim_from(i: &std::collections::HashMap<String, AttributeValue>) -> Option<Claim> {
@@ -79,7 +85,10 @@ fn claim_from(i: &std::collections::HashMap<String, AttributeValue>) -> Option<C
             failures: n("check_failures"),
             proven_before: b("check_proven"),
             unreachable: n("check_unreachable"),
+            parked: b("parked"),
         },
+        parked_code: g("parked_code"),
+        parked_at: g("parked_at"),
         name,
     })
 }
@@ -227,8 +236,10 @@ async fn prove(master: &str, install_id: &str, host: &str) -> Proof {
     else {
         return Proof::Unreachable;
     };
-    if !r.status().is_success() {
-        return Proof::Wrong;
+    // A server error is the install not answering right now (its gateway
+    // restarting or failing after an update), not another app answering.
+    if let Some(p) = name_check::proof_for_status(r.status().as_u16()) {
+        return p;
     }
     let v: Value = serde_json::from_slice(&relay::read_capped(r).await).unwrap_or_default();
     answer(master, install_id, &challenge, &v)
@@ -263,8 +274,17 @@ fn fallback_alias(host: &str, fallback: &str, rtype: RrType) -> Result<ResourceR
         .build()?)
 }
 
-/// Deletes listed records (exactly as listed) and adds the fallback alias,
-/// in one atomic change. Refuses anything outside `name`.
+fn address_record(r: &NameRecord) -> Result<ResourceRecordSet, Error> {
+    Ok(ResourceRecordSet::builder()
+        .name(&r.name)
+        .r#type(RrType::Cname)
+        .ttl(300)
+        .resource_records(ResourceRecord::builder().value(&r.value).build()?)
+        .build()?)
+}
+
+/// Deletes listed records (exactly as listed) and adds the fallback alias or
+/// the address record, in one atomic change. Refuses anything outside `name`.
 async fn change_zone(
     state: &WorkerState,
     zone_id: &str,
@@ -272,6 +292,7 @@ async fn change_zone(
     name: &str,
     delete: &[&ResourceRecordSet],
     add_fallback: Option<&str>,
+    add_address: Option<&NameRecord>,
 ) -> Result<(), Error> {
     let mut changes = vec![];
     for r in delete {
@@ -295,6 +316,18 @@ async fn change_zone(
                     .build()?,
             );
         }
+    }
+    if let Some(a) = add_address {
+        if name_check::owner(&a.name, zone).as_deref() != Some(name) {
+            return Err(format!("refused a change outside {name}: {}", a.name).into());
+        }
+        // Create, never overwrite: the zone holds nothing else at the name.
+        changes.push(
+            Change::builder()
+                .action(ChangeAction::Create)
+                .resource_record_set(address_record(a)?)
+                .build()?,
+        );
     }
     if changes.is_empty() {
         return Ok(());
@@ -369,7 +402,51 @@ async fn save(
         // Working again: the parked note goes.
         set.push_str(" REMOVE parked, parked_code, parked_reason, parked_at");
     }
-    match q.update_expression(format!("SET {set}")).send().await {
+    q = q.update_expression(format!("SET {set}"));
+    send_save(q).await
+}
+
+/// Writes a restored name: the address record is back, the parked note goes,
+/// and when it recovered (and from what) stays as history.
+async fn save_restored(
+    state: &WorkerState,
+    c: &Claim,
+    d: &name_check::Decision,
+    records: &[NameRecord],
+) -> Result<(), Error> {
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let q = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", s(&format!("HYBRIDNAME#{}", c.name)))
+        .key("sk", s("NAME"))
+        .condition_expression("install_id = :i")
+        .expression_attribute_values(":i", s(&c.install_id))
+        .expression_attribute_values(":f", AttributeValue::N("0".into()))
+        .expression_attribute_values(":u", AttributeValue::N("0".into()))
+        .expression_attribute_values(":pv", AttributeValue::Bool(true))
+        .expression_attribute_values(":st", s(d.state))
+        .expression_attribute_values(":at", s(&now))
+        .expression_attribute_values(":r", s(&serde_json::to_string(records)?))
+        .expression_attribute_values(":no", AttributeValue::Bool(false))
+        .expression_attribute_values(":lp", s(if c.parked_at.is_empty() { &now } else { &c.parked_at }))
+        .expression_attribute_values(
+            ":rc",
+            s(if c.parked_code.is_empty() { "parked" } else { &c.parked_code }),
+        )
+        .update_expression(
+            "SET check_failures = :f, check_unreachable = :u, check_proven = :pv, check_state = :st, checked_at = :at, \
+             records = :r, pending = :no, recovered_at = :at, recovered_code = :rc, last_parked_at = :lp \
+             REMOVE parked, parked_code, parked_reason, parked_at",
+        );
+    send_save(q).await
+}
+
+async fn send_save(
+    q: aws_sdk_dynamodb::operation::update_item::builders::UpdateItemFluentBuilder,
+) -> Result<(), Error> {
+    match q.send().await {
         Ok(_) => Ok(()),
         Err(e)
             if e.as_service_error()
@@ -414,6 +491,8 @@ async fn check_one(
         warn!(name = %c.name, record = %listed[*i].name, rtype = %listed[*i].rtype, "hybrid_name_unknown_record: under a claimed name, of a type CoderHelm can't change");
     }
     let (origin, via_name) = match (&cloudfront, records.address) {
+        // Parked: only the install's own CloudFront address can prove it's back.
+        (Some(cf), _) if c.history.parked => (Some(prove(master, &c.install_id, cf).await), None),
         (Some(cf), Some(_)) => (
             Some(prove(master, &c.install_id, cf).await),
             Some(prove(master, &c.install_id, &names::hostname(&c.name)).await),
@@ -421,6 +500,17 @@ async fn check_one(
         _ => (None, None),
     };
     let d = name_check::decide(c.history, cloudfront.is_some(), &records, origin, via_name);
+    if d.restore {
+        return restore(
+            state,
+            z,
+            c,
+            &d,
+            &records,
+            cloudfront.as_deref().unwrap_or(""),
+        )
+        .await;
+    }
     let Some(reason) = d.park else {
         save(state, c, &d, None).await?;
         return Ok(d.state);
@@ -434,6 +524,7 @@ async fn check_one(
         &c.name,
         &delete,
         plan.add_fallback.then_some(fallback),
+        None,
     )
     .await?;
     let kept = name_check::stored_after_park(&c.records);
@@ -452,6 +543,44 @@ async fn check_one(
     )
     .await;
     Ok("parked")
+}
+
+/// Puts a parked name back on its install: the fallback alias goes and the
+/// address record is written again, in one change.
+async fn restore(
+    state: &WorkerState,
+    z: &Zone,
+    c: &Claim,
+    d: &name_check::Decision,
+    records: &name_check::Records,
+    cloudfront: &str,
+) -> Result<&'static str, Error> {
+    let Some(plan) = name_check::plan_restore(&c.name, &z.name, records, &z.listed, cloudfront)
+    else {
+        return Ok("parked");
+    };
+    let delete: Vec<&ResourceRecordSet> = plan.delete.iter().map(|i| &z.raw[*i]).collect();
+    change_zone(
+        state,
+        &z.id,
+        &z.name,
+        &c.name,
+        &delete,
+        None,
+        Some(&plan.address),
+    )
+    .await?;
+    let back = name_check::stored_after_restore(&c.records, &plan.address);
+    save_restored(state, c, d, &back).await?;
+    info!(name = %c.name, install = %c.install_id, was = %c.parked_code, "hybrid_name_restored");
+    audit(
+        state,
+        &c.install_id,
+        "name_restored",
+        json!({ "name": c.name, "was": c.parked_code, "address": plan.address.value }),
+    )
+    .await;
+    Ok("restored")
 }
 
 pub async fn run(state: &WorkerState) -> Result<(), Error> {
@@ -497,7 +626,7 @@ pub async fn run(state: &WorkerState) -> Result<(), Error> {
         let Some(label) = name_check::owner(&r.name, zone) else {
             continue;
         };
-        match change_zone(state, zone_id, zone, &label, &[&raw[i]], None).await {
+        match change_zone(state, zone_id, zone, &label, &[&raw[i]], None, None).await {
             Ok(()) => {
                 warn!(record = %r.name, rtype = %r.rtype, "hybrid_name_orphan_removed");
                 audit(
@@ -578,6 +707,12 @@ mod tests {
         assert!(c.pending);
         assert_eq!(c.history.failures, 2);
         assert!(c.history.proven_before);
+        assert!(!c.history.parked);
+        i.insert("parked".into(), AttributeValue::Bool(true));
+        i.insert("parked_code".into(), s("origin_gone"));
+        let c = claim_from(&i).unwrap();
+        assert!(c.history.parked);
+        assert_eq!(c.parked_code, "origin_gone");
         // A key that isn't a valid name is skipped, never acted on.
         i.insert("pk".into(), s("HYBRIDNAME#Not A Name"));
         assert!(claim_from(&i).is_none());

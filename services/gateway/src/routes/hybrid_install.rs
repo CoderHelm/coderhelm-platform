@@ -971,6 +971,37 @@ pub fn offered_by(hosted: Option<&Value>) -> Option<Vec<String>> {
     })
 }
 
+/// One line per address, from the latest checks. CoderHelm's 15-minute name
+/// check may have parked the address (it pointed somewhere that no longer
+/// answered as this install, or a record under it wasn't CoderHelm's). When
+/// this install's own check of the address passes right now, the address
+/// reaches this install and the parked note is out of date (the name check
+/// puts the record back by itself on its next run): the line stays the
+/// passing one. Otherwise the parked reason replaces the address line, so the
+/// card never shows the same address as both live and needing a fix.
+pub fn merge_parked(list: &mut Vec<Value>, name_check: &Value) {
+    if name_check["parked"].as_bool() != Some(true) {
+        return;
+    }
+    let at = list.iter().position(|c| c["id"] == "hybrid_name");
+    if at.is_some_and(|i| list[i]["status"] == "pass") {
+        return;
+    }
+    let line = check(
+        "hybrid_name",
+        "fail",
+        name_check["parked_code"].as_str().unwrap_or("parked"),
+        name_check["parked_reason"]
+            .as_str()
+            .unwrap_or("CoderHelm put this address back on its holding page."),
+        "Open Settings, System, Domain and press Try again. If the install moved to a new CloudFront address, set the name up again there.",
+    );
+    match at {
+        Some(i) => list[i] = line,
+        None => list.push(line),
+    }
+}
+
 async fn status_value(state: &AppState, deep: bool) -> Value {
     let mut l = local(state).await;
     let creds = creds_now().await;
@@ -993,21 +1024,12 @@ async fn status_value(state: &AppState, deep: bool) -> Value {
     }
     let problem = recent_intake_problem();
     let mut list = checks(&l, creds.is_some(), hosted.as_ref(), Some(code), problem);
-    // CoderHelm's 15-minute name check parked the address (it pointed
-    // somewhere that no longer answered as this install, or a record under it
-    // wasn't CoderHelm's): say so with the reason, where the domain is set up.
     let name_check = hosted
         .as_ref()
         .map(|h| h["name_check"].clone())
         .unwrap_or(Value::Null);
-    if !l.name.is_empty() && name_check["parked"].as_bool() == Some(true) {
-        list.push(check(
-            "hybrid_name_parked",
-            "fail",
-            name_check["parked_code"].as_str().unwrap_or("parked"),
-            name_check["parked_reason"].as_str().unwrap_or("CoderHelm put this address back on its holding page."),
-            "Open Settings, System, Domain and press Try again. If the install moved to a new CloudFront address, set the name up again there.",
-        ));
+    if !l.name.is_empty() {
+        merge_parked(&mut list, &name_check);
     }
     if deep && l.github_mode == "hosted" {
         if let Some(first) = hosted
@@ -2077,6 +2099,79 @@ async fn only_team(state: &AppState) -> Option<String> {
 fn sole(mut ids: Vec<String>) -> Option<String> {
     ids.dedup();
     (ids.len() == 1).then(|| ids.remove(0))
+}
+
+#[cfg(test)]
+mod name_line_tests {
+    use super::{check, merge_parked};
+    use serde_json::json;
+
+    fn parked() -> serde_json::Value {
+        json!({
+            "state": "parked",
+            "parked": true,
+            "parked_code": "origin_gone",
+            "parked_reason": "The CloudFront address this name pointed at stopped answering as this install, so CoderHelm put the address back on its holding page.",
+        })
+    }
+
+    fn names(list: &[serde_json::Value]) -> Vec<(String, String)> {
+        list.iter()
+            .filter(|c| c["id"].as_str().unwrap_or("").starts_with("hybrid_name"))
+            .map(|c| {
+                (
+                    c["id"].as_str().unwrap().into(),
+                    c["status"].as_str().unwrap().into(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_live_address_is_never_also_shown_as_parked() {
+        let mut list = vec![check(
+            "hybrid_name",
+            "pass",
+            "ok",
+            "acme.coderhelm.com is live",
+            "",
+        )];
+        merge_parked(&mut list, &parked());
+        assert_eq!(names(&list), vec![("hybrid_name".into(), "pass".into())]);
+    }
+
+    #[test]
+    fn a_parked_address_that_does_not_answer_shows_one_line_with_the_reason() {
+        let mut list = vec![check(
+            "hybrid_name",
+            "fail",
+            "https_failed",
+            "acme.coderhelm.com isn't working yet",
+            "x",
+        )];
+        merge_parked(&mut list, &parked());
+        assert_eq!(names(&list), vec![("hybrid_name".into(), "fail".into())]);
+        assert_eq!(list[0]["code"], "origin_gone");
+        assert!(list[0]["title"].as_str().unwrap().contains("holding page"));
+    }
+
+    #[test]
+    fn nothing_changes_when_the_address_is_not_parked() {
+        for nc in [
+            serde_json::Value::Null,
+            json!({ "state": "ok", "parked": false }),
+        ] {
+            let mut list = vec![check(
+                "hybrid_name",
+                "wait",
+                "validating",
+                "Setting up",
+                "x",
+            )];
+            merge_parked(&mut list, &nc);
+            assert_eq!(names(&list), vec![("hybrid_name".into(), "wait".into())]);
+        }
+    }
 }
 
 #[cfg(test)]
