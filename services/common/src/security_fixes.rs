@@ -380,6 +380,10 @@ pub struct FindingState {
     /// Taken out of a bundle because its major version bump failed the
     /// bundle's CI: it gets a pull request of its own.
     pub split: bool,
+    /// A fix run left it out: its bump broke the repository's checks and
+    /// could not be fixed in the run. Bundles leave it out while it holds
+    /// (see `dep_fix::RunDeferral`).
+    pub deferred: Option<crate::dep_fix::RunDeferral>,
 }
 
 // ── Settings ────────────────────────────────────────────────────────────
@@ -495,7 +499,19 @@ pub struct SecurityConfig {
     /// Cards posted per day, at most; past it, one digest card says how
     /// many more are waiting.
     pub max_cards_per_day: u32,
+    /// The model budget of one dependency fix run, in cents (the coder's
+    /// call-site changes; mechanical bumps use no model). Past it the run
+    /// ships what is green and defers the rest, resumable.
+    #[serde(default = "default_fix_run_budget")]
+    pub fix_run_budget_cents: u32,
 }
+
+fn default_fix_run_budget() -> u32 {
+    crate::dep_fix::DEFAULT_RUN_BUDGET_CENTS
+}
+
+/// The most a team may set a dependency fix run's budget to, in cents.
+pub const MAX_FIX_RUN_BUDGET_CENTS: u32 = 5_000;
 
 pub const MAX_FIX_RUNS_PER_DAY: u32 = 3;
 pub const MAX_FIX_RUNS_LIMIT: u32 = 20;
@@ -550,6 +566,7 @@ impl Default for SecurityConfig {
             max_fix_runs_per_day: MAX_FIX_RUNS_PER_DAY,
             max_fix_tokens_per_day: MAX_FIX_TOKENS_PER_DAY,
             max_cards_per_day: MAX_CARDS_PER_DAY,
+            fix_run_budget_cents: crate::dep_fix::DEFAULT_RUN_BUDGET_CENTS,
         }
     }
 }
@@ -600,6 +617,11 @@ impl SecurityConfig {
         }
         if self.max_cards_per_day > MAX_CARDS_LIMIT {
             return Err(format!("max_cards_per_day is 0 to {MAX_CARDS_LIMIT}"));
+        }
+        if self.fix_run_budget_cents > MAX_FIX_RUN_BUDGET_CENTS {
+            return Err(format!(
+                "fix_run_budget_cents is 0 to {MAX_FIX_RUN_BUDGET_CENTS}"
+            ));
         }
         if self.ignore.len() > MAX_IGNORES {
             return Err(format!("at most {MAX_IGNORES} ignores"));
@@ -2427,6 +2449,10 @@ pub fn plan_units(
     let eligible: Vec<&(Finding, FindingState)> = findings
         .iter()
         .filter(|(f, st)| fixable(f, st, cfg, now))
+        // A major the rules defer (not reachable, not urgent) or a bump a run
+        // found breaking stays open and out of every pull request; a person
+        // asking for it takes it anyway (`requested_units`).
+        .filter(|(f, st)| deferred(f, st, cfg).is_none())
         .collect();
     if cfg.bundle == Bundle::PerPackage {
         let only: Vec<&Finding> = eligible.iter().map(|(f, _)| f).collect();
@@ -2442,6 +2468,30 @@ pub fn plan_units(
         &together, findings, cfg, cfg.bundle, false, now,
     ));
     units
+}
+
+/// Why a fixable finding waits outside every pull request (the rules of
+/// `dep_fix`): its fix is a major upgrade it doesn't need yet, or a run
+/// found its bump breaking. None when it goes in.
+pub fn deferred(f: &Finding, st: &FindingState, cfg: &SecurityConfig) -> Option<String> {
+    if st.requested_by.is_some() {
+        return None;
+    }
+    crate::dep_fix::defer_reason(f, st, cfg)
+}
+
+/// The fixable findings the rules hold back, with why: what the dashboard
+/// shows as each one's wait.
+pub fn deferred_waits(
+    findings: &[(Finding, FindingState)],
+    cfg: &SecurityConfig,
+    now: DateTime<Utc>,
+) -> Vec<(String, String)> {
+    findings
+        .iter()
+        .filter(|(f, st)| fixable(f, st, cfg, now))
+        .filter_map(|(f, st)| deferred(f, st, cfg).map(|r| (f.id.clone(), r)))
+        .collect()
 }
 
 /// A finding a bundle leaves to a pull request (or issue) of its own: its
@@ -2916,6 +2966,7 @@ pub fn ticket_body_with(
         s.push_str("   A major version is needed: follow its upgrade guide, change every call site of the APIs it changed, and fix the code it breaks so the build, type check and tests pass.\n");
     }
     s.push_str("4. Before you finish, call run_checks (build, type check, tests). Fix what the upgrade breaks. If a check still fails, never say it passes: write which check fails and why under `### Not fixed` in your description; the pull request then stays a draft.\n");
+    s.push_str("   Never edit documentation (README, CHANGELOG, docs) for these bumps unless this ticket asks for it: the pull request's description says what changed.\n");
     s.push_str("5. In your description, for each package write `### <package> <from> to <to>` with the breaking changes you found and how each was handled (file and line), the files you changed for it, and anything a person should look at (behaviour at runtime, configuration, environment).\n");
     s.push_str("\n## Advisories\n");
     for f in members {
@@ -5955,6 +6006,7 @@ mod tests {
                 failing: vec!["test".into()],
                 checks: vec!["build".into(), "test".into()],
             },
+            ..Default::default()
         };
         let pr = pr_body_with(
             &unit,

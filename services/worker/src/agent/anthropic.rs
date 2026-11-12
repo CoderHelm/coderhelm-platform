@@ -733,6 +733,8 @@ pub async fn converse_tool_loop(
     // which the agent must answer from what it already learned. Without it,
     // everything a planner read was thrown away the moment it ran out.
     let mut answer_now = false;
+    // Turns cut at the output limit before any tool call, nudged on.
+    let mut cut_nudges: u32 = 0;
 
     loop {
         turns += 1;
@@ -877,6 +879,38 @@ pub async fn converse_tool_loop(
                 _ => None,
             })
             .collect();
+
+        if continue_after_cut(
+            response.stop_reason.as_deref(),
+            !tool_uses.is_empty(),
+            !tools.is_empty() && !answer_now,
+            cut_nudges,
+        ) {
+            // A turn spent its whole output thinking and made no call: the
+            // coder once did that nine times on one README table and the run
+            // ended without the change. It is told to act in small steps.
+            cut_nudges += 1;
+            warn!(
+                max_tokens,
+                nudge = cut_nudges,
+                "A turn reached the output limit before any tool call; asking for small steps"
+            );
+            if let Some(ref mut log) = conversation_log {
+                log.push(json!({
+                    "turn": turns,
+                    "call": call,
+                    "role": "system_note",
+                    "kind": "output_limit",
+                    "content": OUTPUT_LIMIT_NOTE,
+                    "stop_reason": response.stop_reason,
+                }));
+            }
+            messages.push((
+                "user".to_string(),
+                vec![json!({"type": "text", "text": OUTPUT_LIMIT_NOTE})],
+            ));
+            continue;
+        }
 
         if tool_uses.is_empty() || response.stop_reason.as_deref() == Some("end_turn") {
             // An answer cut at the output limit loses whatever it was to
@@ -1136,6 +1170,44 @@ fn call_index(log: &[Value]) -> usize {
 }
 
 /// Logs a message the loop put into the conversation itself.
+/// Turns cut at the output limit before any tool call that are nudged on
+/// before the loop takes the cut as the answer.
+const MAX_CUT_NUDGES: u32 = 2;
+
+const OUTPUT_LIMIT_NOTE: &str = "Your last turn reached the output limit before you made any tool call, so nothing was done. Think briefly and act now: make the change in small edit_file calls (a few lines each), one call per turn if needed. If the task is not needed, say so in one sentence.";
+
+/// Whether a turn that made no tool call goes on with a nudge: it was cut
+/// at the output limit, tools are on, and the nudges aren't used up.
+fn continue_after_cut(
+    stop_reason: Option<&str>,
+    called_tools: bool,
+    tools_on: bool,
+    nudges: u32,
+) -> bool {
+    stop_reason == Some("max_tokens") && !called_tools && tools_on && nudges < MAX_CUT_NUDGES
+}
+
+#[cfg(test)]
+mod cut_tests {
+    use super::*;
+
+    #[test]
+    fn a_turn_cut_before_any_call_is_nudged_twice_then_ends() {
+        assert!(continue_after_cut(Some("max_tokens"), false, true, 0));
+        assert!(continue_after_cut(Some("max_tokens"), false, true, 1));
+        assert!(!continue_after_cut(
+            Some("max_tokens"),
+            false,
+            true,
+            MAX_CUT_NUDGES
+        ));
+        // A call was made, tools are off, or it simply ended: no nudge.
+        assert!(!continue_after_cut(Some("max_tokens"), true, true, 0));
+        assert!(!continue_after_cut(Some("max_tokens"), false, false, 0));
+        assert!(!continue_after_cut(Some("end_turn"), false, true, 0));
+    }
+}
+
 fn log_note(
     log: Option<&mut Vec<Value>>,
     call: usize,

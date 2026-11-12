@@ -1,0 +1,9018 @@
+{
+"web-monorepo": [
+{
+"id": "web-001",
+"package": "lib-001",
+"version": "5.29.0",
+"fixed_version": "6.27.0",
+"fixed": [
+"6.27.0",
+"7.28.0",
+"8.5.0"
+],
+"tier": "P3",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-002",
+"package": "lib-002",
+"version": "2.0.3",
+"fixed_version": "2.1.6",
+"fixed": [
+"5.0.11",
+"3.0.8",
+"2.1.6",
+"1.1.20"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "web-003",
+"package": "lib-001",
+"version": "5.29.0",
+"fixed_version": "6.24.0",
+"fixed": [
+"6.24.0",
+"7.24.0"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "runtime",
+"manifest": "tools/t2/package-lock.json"
+},
+{
+"id": "web-004",
+"package": "lib-003",
+"version": "4.5.3",
+"fixed_version": "4.5.4",
+"fixed": [
+"5.3.5",
+"4.5.4"
+],
+"tier": "P2",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-005",
+"package": "lib-004",
+"version": "9.0.5",
+"fixed_version": "11.0.1",
+"fixed": [
+"11.0.1"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "web-006",
+"package": "lib-001",
+"version": "5.29.0",
+"fixed_version": "6.27.0",
+"fixed": [
+"6.27.0",
+"7.28.0",
+"8.5.0"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-007",
+"package": "lib-003",
+"version": "4.5.3",
+"fixed_version": "5.12.0",
+"fixed": [
+"5.12.0"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "tools/t3/package-lock.json"
+},
+{
+"id": "web-008",
+"package": "lib-005",
+"version": "6.1.4",
+"fixed_version": "6.1.5",
+"fixed": [
+"6.1.5"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-009",
+"package": "lib-001",
+"version": "5.29.0",
+"fixed_version": "6.24.0",
+"fixed": [
+"6.24.0",
+"7.24.0"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-010",
+"package": "lib-006",
+"version": "10.48.0",
+"fixed_version": "10.75.2",
+"fixed": [
+"9.47.2",
+"10.75.2",
+"11.0.0-rc.1"
+],
+"tier": "P2",
+"verdict": "not_reachable",
+"relation": "unknown",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-011",
+"package": "lib-007",
+"version": "2.0.19",
+"fixed_version": "2.1.13",
+"fixed": [
+"2.1.13"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-012",
+"package": "lib-008",
+"version": "2.3.1",
+"fixed_version": "2.3.2",
+"fixed": [
+"4.0.4",
+"3.0.2",
+"2.3.2"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-013",
+"package": "lib-009",
+"version": "3.25.76",
+"fixed_version": "4.6.6",
+"fixed": [
+"4.6.6"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "direct",
+"scope": "runtime",
+"manifest": "tools/t4/package.json"
+},
+{
+"id": "web-014",
+"package": "lib-010",
+"version": "2.8.2",
+"fixed_version": "2.8.3",
+"fixed": [
+"2.8.3",
+"1.10.3"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "web-015",
+"package": "lib-011",
+"version": "1.12.2",
+"fixed_version": "1.15.2",
+"fixed": [
+"1.15.2"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-016",
+"package": "lib-001",
+"version": "5.29.0",
+"fixed_version": "6.28.0",
+"fixed": [
+"6.28.0",
+"7.29.0",
+"8.9.0"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-017",
+"package": "lib-003",
+"version": "4.5.3",
+"fixed_version": "5.3.4",
+"fixed": [
+"5.3.4"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "tools/t3/package-lock.json"
+},
+{
+"id": "web-018",
+"package": "lib-012",
+"version": "3.14.1",
+"fixed_version": "3.15.2",
+"fixed": [
+"4.3.2",
+"3.15.2"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-019",
+"package": "lib-011",
+"version": "1.12.2",
+"fixed_version": "1.20.0",
+"fixed": [
+"0.34.0",
+"1.20.0"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-020",
+"package": "lib-013",
+"version": "9.0.5",
+"fixed_version": "10.7.4",
+"fixed": [
+"10.7.4"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-021",
+"package": "lib-003",
+"version": "4.5.3",
+"fixed_version": "4.5.4",
+"fixed": [
+"5.3.8",
+"4.5.4"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-022",
+"package": "lib-014",
+"version": "3.2.6",
+"fixed_version": "3.4.0",
+"fixed": [
+"3.4.0"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-023",
+"package": "lib-015",
+"version": "1.3.1",
+"fixed_version": "1.4.1",
+"fixed": [
+"1.4.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-024",
+"package": "lib-003",
+"version": "4.5.3",
+"fixed_version": "4.5.4",
+"fixed": [
+"5.3.5",
+"4.5.4"
+],
+"tier": "P2",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "tools/t3/package-lock.json"
+},
+{
+"id": "web-025",
+"package": "lib-013",
+"version": "9.0.5",
+"fixed_version": "10.3.1",
+"fixed": [
+"10.3.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-026",
+"package": "lib-016",
+"version": "4.0.1",
+"fixed_version": "4.8.1",
+"fixed": [
+"4.8.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-027",
+"package": "lib-001",
+"version": "5.29.0",
+"fixed_version": "6.24.0",
+"fixed": [
+"6.24.0",
+"7.24.0"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "runtime",
+"manifest": "tools/t2/package-lock.json"
+},
+{
+"id": "web-028",
+"package": "lib-017",
+"version": "1.15.4",
+"fixed_version": "1.15.6",
+"fixed": [
+"2.0.1-rc.15",
+"1.15.6"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-029",
+"package": "lib-002",
+"version": "1.1.11",
+"fixed_version": "1.1.20",
+"fixed": [
+"5.0.11",
+"3.0.8",
+"2.1.6",
+"1.1.20"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-030",
+"package": "lib-018",
+"version": "5.0.5",
+"fixed_version": "5.2.0",
+"fixed": [
+"5.2.0"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-031",
+"package": "lib-019",
+"version": "3.3.11",
+"fixed_version": "3.3.16",
+"fixed": [
+"3.3.16",
+"5.1.16"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-032",
+"package": "lib-010",
+"version": "1.10.2",
+"fixed_version": "1.10.3",
+"fixed": [
+"2.8.3",
+"1.10.3"
+],
+"tier": "P3",
+"verdict": "not_loaded",
+"relation": "transitive",
+"scope": "dev",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-033",
+"package": "lib-001",
+"version": "5.29.0",
+"fixed_version": "6.24.0",
+"fixed": [
+"6.24.0",
+"7.24.0"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-034",
+"package": "lib-011",
+"version": "1.12.2",
+"fixed_version": "1.20.0",
+"fixed": [
+"1.20.0"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-035",
+"package": "lib-002",
+"version": "1.1.11",
+"fixed_version": "1.1.12",
+"fixed": [
+"2.0.2",
+"1.1.12",
+"3.0.1",
+"4.0.1"
+],
+"tier": "P3",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-036",
+"package": "lib-020",
+"version": "7.3.1",
+"fixed_version": "7.3.7",
+"fixed": [
+"8.3.3",
+"8.2.4",
+"8.1.6",
+"7.3.7",
+"6.4.4"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-037",
+"package": "lib-002",
+"version": "1.1.11",
+"fixed_version": "1.1.18",
+"fixed": [
+"1.1.18",
+"2.1.4",
+"3.0.6",
+"5.0.9"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-038",
+"package": "lib-011",
+"version": "1.12.2",
+"fixed_version": "1.15.0",
+"fixed": [
+"1.15.0",
+"0.31.0"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-039",
+"package": "lib-021",
+"version": "8.4.49",
+"fixed_version": "8.5.18",
+"fixed": [
+"8.5.18"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-040",
+"package": "lib-001",
+"version": "5.29.0",
+"fixed_version": "6.28.0",
+"fixed": [
+"6.28.0",
+"7.29.0",
+"8.9.0"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-041",
+"package": "lib-017",
+"version": "1.15.4",
+"fixed_version": "1.15.6",
+"fixed": [
+"2.0.1-rc.15",
+"1.15.6"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-042",
+"package": "lib-022",
+"version": "2.11.1",
+"fixed_version": "2.14.1",
+"fixed": [
+"2.14.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-043",
+"package": "lib-004",
+"version": "9.0.5",
+"fixed_version": "9.0.7",
+"fixed": [
+"10.2.3",
+"9.0.7",
+"8.0.6",
+"7.4.8",
+"6.2.2",
+"5.1.8",
+"4.2.5",
+"3.1.4"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "web-044",
+"package": "lib-023",
+"version": "0.33.0",
+"fixed_version": "0.40.0",
+"fixed": [
+"0.40.0"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "web-045",
+"package": "lib-004",
+"version": "3.1.2",
+"fixed_version": "3.1.3",
+"fixed": [
+"10.2.3",
+"9.0.7",
+"8.0.6",
+"7.4.8",
+"6.2.2",
+"5.1.8",
+"4.2.5",
+"3.1.3"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-046",
+"package": "lib-019",
+"version": "3.3.11",
+"fixed_version": "3.3.18",
+"fixed": [
+"3.3.18",
+"5.1.6"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-047",
+"package": "lib-014",
+"version": "3.2.6",
+"fixed_version": "3.4.6",
+"fixed": [
+"3.4.6"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-048",
+"package": "lib-011",
+"version": "1.12.2",
+"fixed_version": "1.15.1",
+"fixed": [
+"1.15.1",
+"0.31.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-049",
+"package": "lib-011",
+"version": "1.12.2",
+"fixed_version": "1.16.0",
+"fixed": [
+"1.16.0"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-050",
+"package": "lib-015",
+"version": "1.3.1",
+"fixed_version": "1.4.3",
+"fixed": [
+"1.4.3"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "web-051",
+"package": "lib-011",
+"version": "1.12.2",
+"fixed_version": "1.18.0",
+"fixed": [
+"0.33.0",
+"1.18.0"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-052",
+"package": "lib-001",
+"version": "7.30.1",
+"fixed_version": "8.12.2",
+"fixed": [
+"6.29.1",
+"7.30.1",
+"8.12.2"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "direct",
+"scope": "runtime",
+"manifest": "tools/t2/package-lock.json"
+},
+{
+"id": "web-053",
+"package": "lib-001",
+"version": "5.29.0",
+"fixed_version": "6.28.1",
+"fixed": [
+"6.28.1",
+"7.29.1",
+"8.10.2"
+],
+"tier": "P3",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-054",
+"package": "lib-024",
+"version": "1.30.1",
+"fixed_version": "2.8.0",
+"fixed": [
+"2.8.0"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-055",
+"package": "lib-020",
+"version": "7.3.1",
+"fixed_version": "7.3.2",
+"fixed": [
+"8.0.5",
+"7.3.2",
+"6.4.2"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-056",
+"package": "lib-025",
+"version": "2.1.1",
+"fixed_version": "3.2.2",
+"fixed": [
+"3.2.2"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-057",
+"package": "lib-026",
+"version": "4.0.2",
+"fixed_version": "4.0.4",
+"fixed": [
+"8.0.3",
+"5.2.2",
+"4.0.4",
+"3.5.1"
+],
+"tier": "P3",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-058",
+"package": "lib-015",
+"version": "1.3.1",
+"fixed_version": "1.4.1",
+"fixed": [
+"1.4.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-059",
+"package": "lib-023",
+"version": "0.18.1",
+"fixed_version": "0.40.0",
+"fixed": [
+"0.40.0"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-060",
+"package": "lib-011",
+"version": "1.12.2",
+"fixed_version": "1.15.1",
+"fixed": [
+"1.15.1",
+"0.31.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-061",
+"package": "lib-027",
+"version": "8.3.2",
+"fixed_version": "11.1.1",
+"fixed": [
+"12.0.1",
+"13.0.1",
+"11.1.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-062",
+"package": "lib-027",
+"version": "11.1.0",
+"fixed_version": "11.1.1",
+"fixed": [
+"11.1.1",
+"12.0.1",
+"13.0.1"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "tools/t3/package-lock.json"
+},
+{
+"id": "web-063",
+"package": "lib-011",
+"version": "1.12.2",
+"fixed_version": "1.20.0",
+"fixed": [
+"1.20.0"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-064",
+"package": "lib-015",
+"version": "1.3.1",
+"fixed_version": "1.4.0",
+"fixed": [
+"1.4.0"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-065",
+"package": "lib-013",
+"version": "9.0.5",
+"fixed_version": "10.7.1",
+"fixed": [
+"10.7.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-066",
+"package": "lib-028",
+"version": "8.20.0",
+"fixed_version": "8.21.0",
+"fixed": [
+"5.2.5",
+"6.2.4",
+"7.5.11",
+"8.21.0"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "web-067",
+"package": "lib-002",
+"version": "1.1.11",
+"fixed_version": "1.1.21",
+"fixed": [
+"5.0.12",
+"3.0.9",
+"2.1.7",
+"1.1.21"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-068",
+"package": "lib-011",
+"version": "1.12.2",
+"fixed_version": "1.15.1",
+"fixed": [
+"1.15.1",
+"0.31.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-069",
+"package": "lib-029",
+"version": "1.8.3",
+"fixed_version": "1.9.0",
+"fixed": [
+"1.9.0"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-070",
+"package": "lib-030",
+"version": "4.7.8",
+"fixed_version": "4.7.9",
+"fixed": [
+"4.7.9"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-071",
+"package": "lib-011",
+"version": "1.12.2",
+"fixed_version": "1.18.0",
+"fixed": [
+"0.33.0",
+"1.18.0"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-072",
+"package": "lib-031",
+"version": "3.5.22",
+"fixed_version": "3.5.42",
+"fixed": [
+"3.5.42",
+"3.6.0-rc.6"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-073",
+"package": "lib-030",
+"version": "4.7.8",
+"fixed_version": "4.7.9",
+"fixed": [
+"4.7.9"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-074",
+"package": "lib-013",
+"version": "9.0.5",
+"fixed_version": "10.7.1",
+"fixed": [
+"10.7.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-075",
+"package": "lib-021",
+"version": "8.4.49",
+"fixed_version": "8.5.12",
+"fixed": [
+"8.5.12"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-076",
+"package": "lib-032",
+"version": "4.28.2",
+"fixed_version": "4.28.7",
+"fixed": [
+"4.28.7"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-077",
+"package": "lib-027",
+"version": "8.3.2",
+"fixed_version": "11.1.1",
+"fixed": [
+"11.1.1",
+"12.0.1",
+"13.0.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "unknown",
+"scope": "runtime",
+"manifest": "tools/t3/package-lock.json"
+},
+{
+"id": "web-078",
+"package": "lib-030",
+"version": "4.7.8",
+"fixed_version": "4.7.10",
+"fixed": [
+"4.7.10"
+],
+"tier": "P2",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-079",
+"package": "lib-002",
+"version": "2.0.3",
+"fixed_version": "2.1.3",
+"fixed": [
+"5.0.8",
+"3.0.3",
+"2.1.3",
+"1.1.17"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "web-080",
+"package": "lib-003",
+"version": "4.5.3",
+"fixed_version": "4.5.4",
+"fixed": [
+"5.3.8",
+"4.5.4"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "tools/t3/package-lock.json"
+},
+{
+"id": "web-081",
+"package": "lib-019",
+"version": "3.3.11",
+"fixed_version": "3.3.12",
+"fixed": [
+"3.3.12",
+"5.1.11"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-082",
+"package": "lib-003",
+"version": "4.5.3",
+"fixed_version": "4.5.5",
+"fixed": [
+"4.5.5",
+"5.5.7"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "tools/t3/package-lock.json"
+},
+{
+"id": "web-083",
+"package": "lib-033",
+"version": "6.1.2",
+"fixed_version": "6.1.5",
+"fixed": [
+"7.1.6",
+"6.1.5"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-084",
+"package": "lib-014",
+"version": "3.2.6",
+"fixed_version": "3.3.2",
+"fixed": [
+"3.3.2"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-085",
+"package": "lib-028",
+"version": "7.5.10",
+"fixed_version": "7.5.11",
+"fixed": [
+"5.2.5",
+"6.2.4",
+"7.5.11",
+"8.21.0"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-086",
+"package": "lib-003",
+"version": "5.2.5",
+"fixed_version": "5.3.4",
+"fixed": [
+"5.3.4"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "tools/t3/package-lock.json"
+},
+{
+"id": "web-087",
+"package": "lib-011",
+"version": "1.12.2",
+"fixed_version": "1.15.0",
+"fixed": [
+"1.15.0",
+"0.31.0"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-088",
+"package": "lib-004",
+"version": "9.0.5",
+"fixed_version": "9.0.6",
+"fixed": [
+"10.2.1",
+"9.0.6",
+"8.0.5",
+"7.4.7",
+"6.2.1",
+"5.1.7",
+"4.2.4",
+"3.1.3"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "web-089",
+"package": "lib-034",
+"version": "14.1.0",
+"fixed_version": "14.2.0",
+"fixed": [
+"14.2.0"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-090",
+"package": "lib-035",
+"version": "1.8.1",
+"fixed_version": "1.8.2",
+"fixed": [
+"1.8.2"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-091",
+"package": "lib-019",
+"version": "5.1.5",
+"fixed_version": "5.1.6",
+"fixed": [
+"3.3.18",
+"5.1.6"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "web-092",
+"package": "lib-004",
+"version": "3.1.2",
+"fixed_version": "3.1.4",
+"fixed": [
+"10.2.3",
+"9.0.7",
+"8.0.6",
+"7.4.8",
+"6.2.2",
+"5.1.8",
+"4.2.5",
+"3.1.4"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-093",
+"package": "lib-015",
+"version": "1.3.1",
+"fixed_version": "1.4.1",
+"fixed": [
+"1.4.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-094",
+"package": "lib-036",
+"version": "0.5.16",
+"fixed_version": "0.6.1",
+"fixed": [
+"0.6.1"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-095",
+"package": "lib-002",
+"version": "1.1.11",
+"fixed_version": "1.1.17",
+"fixed": [
+"5.0.8",
+"3.0.3",
+"2.1.3",
+"1.1.17"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-096",
+"package": "lib-003",
+"version": "4.5.3",
+"fixed_version": "4.5.5",
+"fixed": [
+"5.5.6",
+"4.5.5"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-097",
+"package": "lib-020",
+"version": "7.3.1",
+"fixed_version": "7.3.7",
+"fixed": [
+"8.3.3",
+"8.2.4",
+"8.1.6",
+"7.3.7",
+"6.4.4"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-098",
+"package": "lib-037",
+"version": "0.44.1",
+"fixed_version": "0.65.0",
+"fixed": [
+"0.65.0"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-099",
+"package": "lib-015",
+"version": "1.3.1",
+"fixed_version": "1.4.0",
+"fixed": [
+"1.4.0"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-100",
+"package": "lib-038",
+"version": "3.1.8",
+"fixed_version": "3.1.9",
+"fixed": [
+"2.4.8",
+"3.1.9",
+"4.2.3"
+],
+"tier": "P3",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-101",
+"package": "lib-001",
+"version": "5.29.0",
+"fixed_version": "6.24.0",
+"fixed": [
+"6.24.0",
+"7.24.0"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-102",
+"package": "lib-039",
+"version": "6.12.6",
+"fixed_version": "6.14.0",
+"fixed": [
+"8.18.0",
+"6.14.0"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-103",
+"package": "lib-038",
+"version": "3.1.8",
+"fixed_version": "3.1.9",
+"fixed": [
+"2.4.8",
+"3.1.9",
+"4.2.3"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-104",
+"package": "lib-015",
+"version": "1.3.1",
+"fixed_version": "1.4.1",
+"fixed": [
+"1.4.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-105",
+"package": "lib-022",
+"version": "2.11.1",
+"fixed_version": "2.14.2",
+"fixed": [
+"2.14.2"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-106",
+"package": "lib-014",
+"version": "3.2.6",
+"fixed_version": "3.4.7",
+"fixed": [
+"3.4.7"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-107",
+"package": "lib-001",
+"version": "5.29.0",
+"fixed_version": "6.27.0",
+"fixed": [
+"6.27.0",
+"7.28.0",
+"8.5.0"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "runtime",
+"manifest": "tools/t2/package-lock.json"
+},
+{
+"id": "web-108",
+"package": "lib-030",
+"version": "4.7.8",
+"fixed_version": "4.7.10",
+"fixed": [
+"4.7.10"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-109",
+"package": "lib-003",
+"version": "5.2.5",
+"fixed_version": "5.5.7",
+"fixed": [
+"4.5.5",
+"5.5.7"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "tools/t3/package-lock.json"
+},
+{
+"id": "web-110",
+"package": "lib-040",
+"version": "0.45.2",
+"fixed_version": "0.67.0",
+"fixed": [
+"0.67.0"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-111",
+"package": "lib-041",
+"version": "2.19.0",
+"fixed_version": "2.19.1",
+"fixed": [
+"2.19.1"
+],
+"tier": "P3",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-112",
+"package": "lib-042",
+"version": "11.1.0",
+"fixed_version": "14.0.2",
+"fixed": [
+"14.0.2"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "web-113",
+"package": "lib-001",
+"version": "5.29.0",
+"fixed_version": "6.27.0",
+"fixed": [
+"6.27.0",
+"7.28.0",
+"8.5.0"
+],
+"tier": "P3",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "runtime",
+"manifest": "tools/t2/package-lock.json"
+},
+{
+"id": "web-114",
+"package": "lib-043",
+"version": "5.0.4",
+"fixed_version": "5.0.5",
+"fixed": [
+"5.0.5"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-115",
+"package": "lib-003",
+"version": "4.5.3",
+"fixed_version": "5.7.0",
+"fixed": [
+"5.7.0"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "tools/t3/package-lock.json"
+},
+{
+"id": "web-116",
+"package": "lib-034",
+"version": "14.1.0",
+"fixed_version": "14.3.2",
+"fixed": [
+"15.0.2",
+"14.3.2"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-117",
+"package": "lib-034",
+"version": "14.1.0",
+"fixed_version": "14.3.3",
+"fixed": [
+"14.3.3",
+"15.0.3"
+],
+"tier": "P3",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-118",
+"package": "lib-014",
+"version": "3.2.6",
+"fixed_version": "3.3.2",
+"fixed": [
+"3.3.2"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-119",
+"package": "lib-011",
+"version": "1.12.2",
+"fixed_version": "1.16.0",
+"fixed": [
+"1.16.0",
+"0.32.0"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-120",
+"package": "lib-007",
+"version": "2.0.19",
+"fixed_version": "2.1.11",
+"fixed": [
+"2.1.11"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-121",
+"package": "lib-015",
+"version": "1.3.1",
+"fixed_version": "1.3.2",
+"fixed": [
+"1.3.2"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-122",
+"package": "lib-030",
+"version": "4.7.8",
+"fixed_version": "4.7.10",
+"fixed": [
+"4.7.10"
+],
+"tier": "P2",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-123",
+"package": "lib-014",
+"version": "3.2.6",
+"fixed_version": "3.4.6",
+"fixed": [
+"3.4.6"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-124",
+"package": "lib-015",
+"version": "1.3.1",
+"fixed_version": "1.4.1",
+"fixed": [
+"1.4.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-125",
+"package": "lib-036",
+"version": "0.5.16",
+"fixed_version": "0.6.1",
+"fixed": [
+"0.6.1"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-126",
+"package": "lib-011",
+"version": "1.12.2",
+"fixed_version": "1.15.2",
+"fixed": [
+"1.15.2"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-127",
+"package": "lib-022",
+"version": "2.11.1",
+"fixed_version": "2.14.2",
+"fixed": [
+"2.14.2"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-128",
+"package": "lib-011",
+"version": "1.12.2",
+"fixed_version": "1.13.5",
+"fixed": [
+"1.13.5",
+"0.30.3"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-129",
+"package": "lib-015",
+"version": "1.3.1",
+"fixed_version": "1.4.1",
+"fixed": [
+"1.4.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-130",
+"package": "lib-012",
+"version": "3.14.1",
+"fixed_version": "3.15.1",
+"fixed": [
+"4.3.1",
+"3.15.1"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-131",
+"package": "lib-012",
+"version": "4.1.0",
+"fixed_version": "4.3.0",
+"fixed": [
+"3.15.0",
+"4.3.0"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "web-132",
+"package": "lib-003",
+"version": "4.5.3",
+"fixed_version": "4.5.4",
+"fixed": [
+"4.5.4",
+"5.3.6"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "tools/t3/package-lock.json"
+},
+{
+"id": "web-133",
+"package": "lib-003",
+"version": "4.5.3",
+"fixed_version": "4.5.5",
+"fixed": [
+"5.5.6",
+"4.5.5"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "tools/t3/package-lock.json"
+},
+{
+"id": "web-134",
+"package": "lib-001",
+"version": "5.29.0",
+"fixed_version": "6.23.0",
+"fixed": [
+"7.18.2",
+"6.23.0"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "runtime",
+"manifest": "tools/t2/package-lock.json"
+},
+{
+"id": "web-135",
+"package": "lib-015",
+"version": "1.3.1",
+"fixed_version": "1.3.2",
+"fixed": [
+"1.3.2"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-136",
+"package": "lib-003",
+"version": "5.2.5",
+"fixed_version": "5.7.0",
+"fixed": [
+"5.7.0"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "tools/t3/package-lock.json"
+},
+{
+"id": "web-137",
+"package": "lib-020",
+"version": "7.3.1",
+"fixed_version": "7.3.5",
+"fixed": [
+"8.0.16",
+"7.3.5",
+"6.4.3"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-138",
+"package": "lib-014",
+"version": "3.2.6",
+"fixed_version": "3.4.8",
+"fixed": [
+"3.4.8"
+],
+"tier": "P3",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-139",
+"package": "lib-014",
+"version": "3.2.6",
+"fixed_version": "3.4.17",
+"fixed": [
+"3.4.17"
+],
+"tier": "P3",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-140",
+"package": "lib-001",
+"version": "5.29.0",
+"fixed_version": "6.24.0",
+"fixed": [
+"6.24.0",
+"7.24.0"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "runtime",
+"manifest": "tools/t2/package-lock.json"
+},
+{
+"id": "web-141",
+"package": "lib-011",
+"version": "1.12.2",
+"fixed_version": "1.15.1",
+"fixed": [
+"1.15.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-142",
+"package": "lib-044",
+"version": "5.5.9",
+"fixed_version": "5.5.11",
+"fixed": [
+"5.5.11"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-143",
+"package": "lib-024",
+"version": "2.0.1",
+"fixed_version": "2.8.0",
+"fixed": [
+"2.8.0"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "web-144",
+"package": "lib-036",
+"version": "0.5.16",
+"fixed_version": "0.6.0",
+"fixed": [
+"0.6.0"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-145",
+"package": "lib-030",
+"version": "4.7.8",
+"fixed_version": "4.7.9",
+"fixed": [
+"4.7.9"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-146",
+"package": "lib-032",
+"version": "4.28.2",
+"fixed_version": "4.28.7",
+"fixed": [
+"4.28.7"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-147",
+"package": "lib-012",
+"version": "4.1.0",
+"fixed_version": "4.2.0",
+"fixed": [
+"4.2.0",
+"3.15.0"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "web-148",
+"package": "lib-003",
+"version": "5.2.5",
+"fixed_version": "5.3.8",
+"fixed": [
+"5.3.8",
+"4.5.4"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "tools/t3/package-lock.json"
+},
+{
+"id": "web-149",
+"package": "lib-033",
+"version": "6.1.2",
+"fixed_version": "6.1.3",
+"fixed": [
+"6.1.3",
+"7.1.3"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-150",
+"package": "lib-011",
+"version": "1.12.2",
+"fixed_version": "1.18.0",
+"fixed": [
+"1.18.0"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-151",
+"package": "lib-014",
+"version": "3.2.6",
+"fixed_version": "3.4.16",
+"fixed": [
+"3.4.16"
+],
+"tier": "P3",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-152",
+"package": "lib-012",
+"version": "3.14.1",
+"fixed_version": "3.15.0",
+"fixed": [
+"3.15.0",
+"4.3.0"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-153",
+"package": "lib-045",
+"version": "3.0.12",
+"fixed_version": "3.0.28",
+"fixed": [
+"3.0.28",
+"4.0.33",
+"5.0.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-154",
+"package": "lib-012",
+"version": "3.14.1",
+"fixed_version": "3.15.0",
+"fixed": [
+"4.2.0",
+"3.15.0"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-155",
+"package": "lib-001",
+"version": "5.29.0",
+"fixed_version": "6.29.1",
+"fixed": [
+"6.29.1",
+"7.30.1",
+"8.12.2"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "runtime",
+"manifest": "tools/t2/package-lock.json"
+},
+{
+"id": "web-156",
+"package": "lib-011",
+"version": "1.12.2",
+"fixed_version": "1.15.1",
+"fixed": [
+"1.15.1",
+"0.31.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-157",
+"package": "lib-003",
+"version": "4.5.3",
+"fixed_version": "4.5.4",
+"fixed": [
+"4.5.4",
+"5.3.6"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-158",
+"package": "lib-003",
+"version": "5.2.5",
+"fixed_version": "5.3.6",
+"fixed": [
+"4.5.4",
+"5.3.6"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "tools/t3/package-lock.json"
+},
+{
+"id": "web-159",
+"package": "lib-011",
+"version": "1.12.2",
+"fixed_version": "1.18.0",
+"fixed": [
+"1.18.0",
+"0.33.0"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-160",
+"package": "lib-003",
+"version": "5.2.5",
+"fixed_version": "5.12.0",
+"fixed": [
+"5.12.0"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "tools/t3/package-lock.json"
+},
+{
+"id": "web-161",
+"package": "lib-001",
+"version": "5.29.0",
+"fixed_version": "6.27.0",
+"fixed": [
+"6.27.0",
+"7.28.0",
+"8.5.0"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "runtime",
+"manifest": "tools/t2/package-lock.json"
+},
+{
+"id": "web-162",
+"package": "lib-046",
+"version": "0.66.0",
+"fixed_version": "0.73.0",
+"fixed": [
+"0.73.0"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "web-163",
+"package": "lib-011",
+"version": "1.12.2",
+"fixed_version": "1.15.1",
+"fixed": [
+"1.15.1",
+"0.31.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-164",
+"package": "lib-014",
+"version": "3.2.6",
+"fixed_version": "3.2.7",
+"fixed": [
+"3.2.7"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-165",
+"package": "lib-011",
+"version": "1.12.2",
+"fixed_version": "1.16.0",
+"fixed": [
+"1.16.0",
+"0.32.0"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-166",
+"package": "lib-001",
+"version": "6.28.1",
+"fixed_version": "6.29.1",
+"fixed": [
+"6.29.1",
+"7.30.1",
+"8.12.2"
+],
+"tier": "P1",
+"verdict": "reachable",
+"relation": "direct",
+"scope": "runtime",
+"manifest": "tools/t2/package-lock.json"
+},
+{
+"id": "web-167",
+"package": "lib-001",
+"version": "5.29.0",
+"fixed_version": "6.28.0",
+"fixed": [
+"6.28.0",
+"7.29.0",
+"8.9.0"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-168",
+"package": "lib-047",
+"version": "0.3.3",
+"fixed_version": "0.3.4",
+"fixed": [
+"0.3.4"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-169",
+"package": "lib-003",
+"version": "4.5.3",
+"fixed_version": "4.5.5",
+"fixed": [
+"4.5.5",
+"5.5.7"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-170",
+"package": "lib-014",
+"version": "3.2.6",
+"fixed_version": "3.4.0",
+"fixed": [
+"3.4.0"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-171",
+"package": "lib-015",
+"version": "1.3.1",
+"fixed_version": "1.4.0",
+"fixed": [
+"1.4.0"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-172",
+"package": "lib-029",
+"version": "1.8.3",
+"fixed_version": "1.8.4",
+"fixed": [
+"1.8.4"
+],
+"tier": "P2",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-173",
+"package": "lib-036",
+"version": "0.5.16",
+"fixed_version": "0.6.1",
+"fixed": [
+"0.6.1"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-174",
+"package": "lib-020",
+"version": "7.3.1",
+"fixed_version": "7.3.5",
+"fixed": [
+"8.0.16",
+"7.3.5",
+"6.4.3"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-175",
+"package": "lib-042",
+"version": "10.5.0",
+"fixed_version": "14.0.2",
+"fixed": [
+"14.0.2"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "web-176",
+"package": "lib-004",
+"version": "3.1.2",
+"fixed_version": "3.1.3",
+"fixed": [
+"10.2.1",
+"9.0.6",
+"8.0.5",
+"7.4.7",
+"6.2.1",
+"5.1.7",
+"4.2.4",
+"3.1.3"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-177",
+"package": "lib-038",
+"version": "3.1.8",
+"fixed_version": "3.1.9",
+"fixed": [
+"2.4.8",
+"3.1.9",
+"4.2.3"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-178",
+"package": "lib-014",
+"version": "3.2.6",
+"fixed_version": "3.4.7",
+"fixed": [
+"3.4.7"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-179",
+"package": "lib-001",
+"version": "5.29.0",
+"fixed_version": "6.27.0",
+"fixed": [
+"6.27.0",
+"7.28.0",
+"8.5.0"
+],
+"tier": "P3",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-180",
+"package": "lib-007",
+"version": "2.0.19",
+"fixed_version": "2.1.11",
+"fixed": [
+"2.1.11"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-181",
+"package": "lib-001",
+"version": "5.29.0",
+"fixed_version": "6.29.1",
+"fixed": [
+"6.29.1",
+"7.30.1",
+"8.12.2"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-182",
+"package": "lib-013",
+"version": "9.0.5",
+"fixed_version": "10.1.1",
+"fixed": [
+"10.1.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-183",
+"package": "lib-011",
+"version": "1.12.2",
+"fixed_version": "1.15.1",
+"fixed": [
+"1.15.1",
+"0.31.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-184",
+"package": "lib-001",
+"version": "5.29.0",
+"fixed_version": "6.27.0",
+"fixed": [
+"6.27.0",
+"7.28.0",
+"8.5.0"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-185",
+"package": "lib-014",
+"version": "3.2.6",
+"fixed_version": "3.4.9",
+"fixed": [
+"3.4.9"
+],
+"tier": "P3",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-186",
+"package": "lib-002",
+"version": "2.0.3",
+"fixed_version": "2.1.5",
+"fixed": [
+"5.0.10",
+"3.0.7",
+"2.1.5",
+"1.1.19"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "web-187",
+"package": "lib-004",
+"version": "3.1.2",
+"fixed_version": "11.0.1",
+"fixed": [
+"11.0.1"
+],
+"tier": "P3",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "dev",
+"manifest": "tools/t5/pnpm-lock.yaml"
+},
+{
+"id": "web-188",
+"package": "lib-001",
+"version": "5.29.0",
+"fixed_version": "6.29.1",
+"fixed": [
+"6.29.1",
+"7.30.1",
+"8.12.2"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-189",
+"package": "lib-014",
+"version": "3.2.6",
+"fixed_version": "3.3.2",
+"fixed": [
+"3.3.2"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-190",
+"package": "lib-015",
+"version": "1.3.1",
+"fixed_version": "1.4.1",
+"fixed": [
+"1.4.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-191",
+"package": "lib-011",
+"version": "1.12.2",
+"fixed_version": "1.16.0",
+"fixed": [
+"1.16.0",
+"0.32.0"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-192",
+"package": "lib-004",
+"version": "9.0.5",
+"fixed_version": "9.0.7",
+"fixed": [
+"10.2.3",
+"9.0.7",
+"8.0.6",
+"7.4.8",
+"6.2.2",
+"5.1.8",
+"4.2.5",
+"3.1.3"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "web-193",
+"package": "lib-018",
+"version": "5.0.5",
+"fixed_version": "5.2.2",
+"fixed": [
+"5.2.2"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-194",
+"package": "lib-030",
+"version": "4.7.8",
+"fixed_version": "4.7.9",
+"fixed": [
+"4.7.9"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-195",
+"package": "lib-018",
+"version": "5.0.5",
+"fixed_version": "5.3.0",
+"fixed": [
+"5.3.0"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-196",
+"package": "lib-048",
+"version": "5.0.0",
+"fixed_version": "5.0.2",
+"fixed": [
+"5.0.2"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-197",
+"package": "lib-049",
+"version": "4.17.21",
+"fixed_version": "4.18.0",
+"fixed": [
+"4.18.0"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-198",
+"package": "lib-011",
+"version": "1.12.2",
+"fixed_version": "1.15.1",
+"fixed": [
+"1.15.1",
+"0.31.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-199",
+"package": "lib-018",
+"version": "5.0.5",
+"fixed_version": "5.3.1",
+"fixed": [
+"5.3.1"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-200",
+"package": "lib-050",
+"version": "0.4.1",
+"fixed_version": "0.5.0",
+"fixed": [
+"0.5.0"
+],
+"tier": "P2",
+"verdict": "reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-201",
+"package": "lib-014",
+"version": "3.2.6",
+"fixed_version": "3.3.2",
+"fixed": [
+"3.3.2",
+"2.5.9"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-202",
+"package": "lib-051",
+"version": "0.60.0",
+"fixed_version": "0.67.0",
+"fixed": [
+"0.67.0"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "web-203",
+"package": "lib-030",
+"version": "4.7.8",
+"fixed_version": "4.7.9",
+"fixed": [
+"4.7.9"
+],
+"tier": "P2",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-204",
+"package": "lib-001",
+"version": "5.29.0",
+"fixed_version": "6.29.1",
+"fixed": [
+"6.29.1",
+"7.30.1",
+"8.12.2"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "runtime",
+"manifest": "tools/t2/package-lock.json"
+},
+{
+"id": "web-205",
+"package": "lib-001",
+"version": "5.29.0",
+"fixed_version": "6.29.1",
+"fixed": [
+"6.29.1",
+"7.30.1",
+"8.12.2"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-206",
+"package": "lib-027",
+"version": "9.0.1",
+"fixed_version": "11.1.1",
+"fixed": [
+"12.0.1",
+"13.0.1",
+"11.1.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "tools/t3/package-lock.json"
+},
+{
+"id": "web-207",
+"package": "lib-020",
+"version": "7.3.1",
+"fixed_version": "7.3.7",
+"fixed": [
+"8.3.3",
+"8.2.4",
+"8.1.6",
+"7.3.7",
+"6.4.4"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-208",
+"package": "lib-001",
+"version": "7.30.1",
+"fixed_version": "8.12.2",
+"fixed": [
+"6.29.1",
+"7.30.1",
+"8.12.2"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "direct",
+"scope": "runtime",
+"manifest": "tools/t2/package-lock.json"
+},
+{
+"id": "web-209",
+"package": "lib-037",
+"version": "0.58.0",
+"fixed_version": "0.65.0",
+"fixed": [
+"0.65.0"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "web-210",
+"package": "lib-034",
+"version": "14.1.0",
+"fixed_version": "14.3.3",
+"fixed": [
+"14.3.3",
+"15.0.3"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-211",
+"package": "lib-011",
+"version": "1.12.2",
+"fixed_version": "1.15.1",
+"fixed": [
+"1.15.1",
+"0.31.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-212",
+"package": "lib-001",
+"version": "5.29.0",
+"fixed_version": "6.29.1",
+"fixed": [
+"6.29.1",
+"7.30.1",
+"8.12.2"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "runtime",
+"manifest": "tools/t2/package-lock.json"
+},
+{
+"id": "web-213",
+"package": "lib-019",
+"version": "5.1.5",
+"fixed_version": "5.1.16",
+"fixed": [
+"3.3.16",
+"5.1.16"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "web-214",
+"package": "lib-003",
+"version": "4.5.3",
+"fixed_version": "5.12.0",
+"fixed": [
+"5.12.0"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-215",
+"package": "lib-014",
+"version": "3.2.6",
+"fixed_version": "3.4.0",
+"fixed": [
+"3.4.0"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-216",
+"package": "lib-028",
+"version": "7.5.10",
+"fixed_version": "8.20.1",
+"fixed": [
+"8.20.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-217",
+"package": "lib-017",
+"version": "1.15.4",
+"fixed_version": "1.15.5",
+"fixed": [
+"1.15.5"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-218",
+"package": "lib-052",
+"version": "0.0.33",
+"fixed_version": "0.2.4",
+"fixed": [
+"0.2.4"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-219",
+"package": "lib-021",
+"version": "8.4.49",
+"fixed_version": "8.5.10",
+"fixed": [
+"8.5.10"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-220",
+"package": "lib-001",
+"version": "6.28.1",
+"fixed_version": "6.29.1",
+"fixed": [
+"6.29.1",
+"7.30.1",
+"8.12.2"
+],
+"tier": "P1",
+"verdict": "reachable",
+"relation": "direct",
+"scope": "runtime",
+"manifest": "tools/t2/package-lock.json"
+},
+{
+"id": "web-221",
+"package": "lib-001",
+"version": "5.29.0",
+"fixed_version": "6.27.0",
+"fixed": [
+"6.27.0",
+"7.28.0",
+"8.5.0"
+],
+"tier": "P3",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "runtime",
+"manifest": "tools/t2/package-lock.json"
+},
+{
+"id": "web-222",
+"package": "lib-014",
+"version": "3.2.6",
+"fixed_version": "3.4.0",
+"fixed": [
+"3.4.0"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-223",
+"package": "lib-014",
+"version": "3.2.6",
+"fixed_version": "3.4.13",
+"fixed": [
+"3.4.13"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-224",
+"package": "lib-046",
+"version": "0.51.1",
+"fixed_version": "0.73.0",
+"fixed": [
+"0.73.0"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-225",
+"package": "lib-053",
+"version": "2.5.4",
+"fixed_version": "2.9.14",
+"fixed": [
+"2.9.14"
+],
+"tier": "P2",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-226",
+"package": "lib-008",
+"version": "4.0.3",
+"fixed_version": "4.0.4",
+"fixed": [
+"4.0.4",
+"3.0.2",
+"2.3.2"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "web-227",
+"package": "lib-015",
+"version": "1.3.1",
+"fixed_version": "1.4.1",
+"fixed": [
+"1.4.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-228",
+"package": "lib-015",
+"version": "1.3.1",
+"fixed_version": "1.4.1",
+"fixed": [
+"1.4.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-229",
+"package": "lib-054",
+"version": "4.0.5",
+"fixed_version": "4.0.6",
+"fixed": [
+"2.5.6",
+"3.0.5",
+"4.0.6"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-230",
+"package": "lib-055",
+"version": "2.7.6",
+"fixed_version": "2.9.14",
+"fixed": [
+"2.9.14"
+],
+"tier": "P3",
+"verdict": "not_loaded",
+"relation": "direct",
+"scope": "dev",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-231",
+"package": "lib-012",
+"version": "4.1.0",
+"fixed_version": "4.1.1",
+"fixed": [
+"4.1.1",
+"3.14.2"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "web-232",
+"package": "lib-019",
+"version": "5.1.5",
+"fixed_version": "5.1.11",
+"fixed": [
+"3.3.12",
+"5.1.11"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "web-233",
+"package": "lib-030",
+"version": "4.7.8",
+"fixed_version": "4.7.9",
+"fixed": [
+"4.7.9"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-234",
+"package": "lib-056",
+"version": "7.28.5",
+"fixed_version": "7.29.4",
+"fixed": [
+"7.29.4",
+"8.0.0-alpha.13"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-235",
+"package": "lib-011",
+"version": "1.12.2",
+"fixed_version": "1.15.2",
+"fixed": [
+"1.15.2",
+"0.31.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-236",
+"package": "lib-027",
+"version": "13.0.0",
+"fixed_version": "13.0.1",
+"fixed": [
+"11.1.1",
+"12.0.1",
+"13.0.1"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "runtime",
+"manifest": "tools/t3/package-lock.json"
+},
+{
+"id": "web-237",
+"package": "lib-030",
+"version": "4.7.8",
+"fixed_version": "4.7.9",
+"fixed": [
+"4.7.9"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-238",
+"package": "lib-057",
+"version": "2.9.3",
+"fixed_version": "2.9.4",
+"fixed": [
+"2.9.4"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-239",
+"package": "lib-058",
+"version": "1.27.0",
+"fixed_version": "1.30.0",
+"fixed": [
+"1.30.0"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-240",
+"package": "lib-042",
+"version": "13.0.6",
+"fixed_version": "14.0.2",
+"fixed": [
+"14.0.2"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "web-241",
+"package": "lib-015",
+"version": "1.3.1",
+"fixed_version": "1.4.1",
+"fixed": [
+"1.4.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-242",
+"package": "lib-036",
+"version": "0.5.16",
+"fixed_version": "0.6.1",
+"fixed": [
+"0.6.1"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-243",
+"package": "lib-022",
+"version": "2.11.1",
+"fixed_version": "2.14.2",
+"fixed": [
+"2.14.2"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-244",
+"package": "lib-015",
+"version": "1.3.1",
+"fixed_version": "1.4.1",
+"fixed": [
+"1.4.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-245",
+"package": "lib-059",
+"version": "4.44.1",
+"fixed_version": "4.59.0",
+"fixed": [
+"2.80.0",
+"3.30.0",
+"4.59.0"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-246",
+"package": "lib-013",
+"version": "9.0.5",
+"fixed_version": "10.5.1",
+"fixed": [
+"10.5.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-247",
+"package": "lib-011",
+"version": "1.12.2",
+"fixed_version": "1.18.0",
+"fixed": [
+"0.33.0",
+"1.18.0"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-248",
+"package": "lib-020",
+"version": "7.3.1",
+"fixed_version": "7.3.2",
+"fixed": [
+"8.0.5",
+"7.3.2",
+"6.4.2"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-249",
+"package": "lib-042",
+"version": "7.2.3",
+"fixed_version": "14.0.2",
+"fixed": [
+"14.0.2"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-250",
+"package": "lib-003",
+"version": "5.2.5",
+"fixed_version": "5.3.5",
+"fixed": [
+"5.3.5",
+"4.5.4"
+],
+"tier": "P2",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "tools/t3/package-lock.json"
+},
+{
+"id": "web-251",
+"package": "lib-036",
+"version": "0.5.16",
+"fixed_version": "0.6.1",
+"fixed": [
+"0.6.1"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-252",
+"package": "lib-015",
+"version": "1.3.1",
+"fixed_version": "1.4.3",
+"fixed": [
+"1.4.3"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "web-253",
+"package": "lib-001",
+"version": "5.29.0",
+"fixed_version": "6.28.1",
+"fixed": [
+"6.28.1",
+"7.29.1",
+"8.10.2"
+],
+"tier": "P3",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "runtime",
+"manifest": "tools/t2/package-lock.json"
+},
+{
+"id": "web-254",
+"package": "lib-038",
+"version": "3.1.8",
+"fixed_version": "3.1.9",
+"fixed": [
+"2.4.8",
+"3.1.9",
+"4.2.3"
+],
+"tier": "P3",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-255",
+"package": "lib-002",
+"version": "1.1.11",
+"fixed_version": "1.1.19",
+"fixed": [
+"5.0.10",
+"3.0.7",
+"2.1.5",
+"1.1.19"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-256",
+"package": "lib-060",
+"version": "0.60.0",
+"fixed_version": "0.67.0",
+"fixed": [
+"0.67.0"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "web-257",
+"package": "lib-014",
+"version": "3.2.6",
+"fixed_version": "3.4.12",
+"fixed": [
+"3.4.12"
+],
+"tier": "P3",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-258",
+"package": "lib-012",
+"version": "4.1.0",
+"fixed_version": "4.3.1",
+"fixed": [
+"4.3.1",
+"3.15.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "web-259",
+"package": "lib-051",
+"version": "0.45.1",
+"fixed_version": "0.67.0",
+"fixed": [
+"0.67.0"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-260",
+"package": "lib-040",
+"version": "0.60.0",
+"fixed_version": "0.67.0",
+"fixed": [
+"0.67.0"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "web-261",
+"package": "lib-049",
+"version": "4.17.21",
+"fixed_version": "4.17.23",
+"fixed": [
+"4.17.23"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-262",
+"package": "lib-014",
+"version": "3.2.6",
+"fixed_version": "3.4.17",
+"fixed": [
+"3.4.17"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-263",
+"package": "lib-021",
+"version": "8.4.49",
+"fixed_version": "8.5.23",
+"fixed": [
+"8.5.23"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-264",
+"package": "lib-015",
+"version": "1.3.1",
+"fixed_version": "1.4.1",
+"fixed": [
+"1.4.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-265",
+"package": "lib-011",
+"version": "1.12.2",
+"fixed_version": "1.16.0",
+"fixed": [
+"1.16.0",
+"0.32.0"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-266",
+"package": "lib-030",
+"version": "4.7.8",
+"fixed_version": "4.7.9",
+"fixed": [
+"4.7.9"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-267",
+"package": "lib-001",
+"version": "5.29.0",
+"fixed_version": "6.28.0",
+"fixed": [
+"6.28.0",
+"7.29.0",
+"8.9.0"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "runtime",
+"manifest": "tools/t2/package-lock.json"
+},
+{
+"id": "web-268",
+"package": "lib-002",
+"version": "2.0.3",
+"fixed_version": "2.1.7",
+"fixed": [
+"5.0.12",
+"3.0.9",
+"2.1.7",
+"1.1.21"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "web-269",
+"package": "lib-011",
+"version": "1.12.2",
+"fixed_version": "1.15.1",
+"fixed": [
+"1.15.1",
+"0.31.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-270",
+"package": "lib-015",
+"version": "1.3.1",
+"fixed_version": "1.4.1",
+"fixed": [
+"1.4.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-271",
+"package": "lib-001",
+"version": "5.29.0",
+"fixed_version": "6.28.0",
+"fixed": [
+"6.28.0",
+"7.29.0",
+"8.9.0"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "runtime",
+"manifest": "tools/t2/package-lock.json"
+},
+{
+"id": "web-272",
+"package": "lib-002",
+"version": "2.0.3",
+"fixed_version": "2.1.4",
+"fixed": [
+"1.1.18",
+"2.1.4",
+"3.0.6",
+"5.0.9"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "web-273",
+"package": "lib-001",
+"version": "7.30.1",
+"fixed_version": "8.12.2",
+"fixed": [
+"6.29.1",
+"7.30.1",
+"8.12.2"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "direct",
+"scope": "runtime",
+"manifest": "tools/t2/package-lock.json"
+},
+{
+"id": "web-274",
+"package": "lib-020",
+"version": "7.3.1",
+"fixed_version": "7.3.7",
+"fixed": [
+"8.3.3",
+"8.2.4",
+"8.1.6",
+"7.3.7",
+"6.4.4"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-275",
+"package": "lib-061",
+"version": "7.29.0",
+"fixed_version": "7.29.6",
+"fixed": [
+"8.0.0-rc.6",
+"7.29.6"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-276",
+"package": "lib-009",
+"version": "4.3.6",
+"fixed_version": "4.6.6",
+"fixed": [
+"4.6.6"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "web-277",
+"package": "lib-002",
+"version": "1.1.11",
+"fixed_version": "1.1.13",
+"fixed": [
+"5.0.5",
+"3.0.2",
+"2.0.3",
+"1.1.13"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-278",
+"package": "lib-062",
+"version": "0.16.6",
+"fixed_version": "0.16.8",
+"fixed": [
+"0.16.8"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-279",
+"package": "lib-012",
+"version": "4.1.0",
+"fixed_version": "4.3.2",
+"fixed": [
+"4.3.2",
+"3.15.2"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "web-280",
+"package": "lib-017",
+"version": "1.15.4",
+"fixed_version": "1.15.9",
+"fixed": [
+"2.0.1-rc.17",
+"1.15.9"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-281",
+"package": "lib-002",
+"version": "1.1.11",
+"fixed_version": "1.1.16",
+"fixed": [
+"5.0.7",
+"1.1.16",
+"2.1.2"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-282",
+"package": "lib-001",
+"version": "5.29.0",
+"fixed_version": "6.24.0",
+"fixed": [
+"6.24.0",
+"7.24.0"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-283",
+"package": "lib-011",
+"version": "1.12.2",
+"fixed_version": "1.20.0",
+"fixed": [
+"1.20.0"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-284",
+"package": "lib-001",
+"version": "6.28.1",
+"fixed_version": "6.29.1",
+"fixed": [
+"6.29.1",
+"7.30.1",
+"8.12.2"
+],
+"tier": "P1",
+"verdict": "reachable",
+"relation": "direct",
+"scope": "runtime",
+"manifest": "tools/t2/package-lock.json"
+},
+{
+"id": "web-285",
+"package": "lib-004",
+"version": "10.2.6",
+"fixed_version": "11.0.1",
+"fixed": [
+"11.0.1"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "web-286",
+"package": "lib-015",
+"version": "1.3.1",
+"fixed_version": "1.4.1",
+"fixed": [
+"1.4.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-287",
+"package": "lib-001",
+"version": "6.28.1",
+"fixed_version": "6.29.1",
+"fixed": [
+"6.29.1",
+"7.30.1",
+"8.12.2"
+],
+"tier": "P2",
+"verdict": "reachable",
+"relation": "direct",
+"scope": "runtime",
+"manifest": "tools/t2/package-lock.json"
+},
+{
+"id": "web-288",
+"package": "lib-060",
+"version": "0.46.1",
+"fixed_version": "0.67.0",
+"fixed": [
+"0.67.0"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-289",
+"package": "lib-063",
+"version": "4.17.23",
+"fixed_version": "4.18.0",
+"fixed": [
+"4.18.0"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-290",
+"package": "lib-015",
+"version": "1.3.1",
+"fixed_version": "1.4.1",
+"fixed": [
+"1.4.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-291",
+"package": "lib-015",
+"version": "1.3.1",
+"fixed_version": "1.4.3",
+"fixed": [
+"1.4.3"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "web-292",
+"package": "lib-018",
+"version": "5.0.5",
+"fixed_version": "6.2.1",
+"fixed": [
+"6.2.1"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-293",
+"package": "lib-048",
+"version": "5.0.0",
+"fixed_version": "5.0.1",
+"fixed": [
+"5.0.1"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-294",
+"package": "lib-025",
+"version": "2.1.1",
+"fixed_version": "3.2.1",
+"fixed": [
+"3.2.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-295",
+"package": "lib-015",
+"version": "1.3.1",
+"fixed_version": "1.4.3",
+"fixed": [
+"1.4.3"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "web-296",
+"package": "lib-015",
+"version": "1.3.1",
+"fixed_version": "1.3.2",
+"fixed": [
+"1.3.2"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-297",
+"package": "lib-036",
+"version": "0.5.16",
+"fixed_version": "0.6.1",
+"fixed": [
+"0.6.1"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-298",
+"package": "lib-034",
+"version": "14.1.0",
+"fixed_version": "14.1.1",
+"fixed": [
+"14.1.1"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-299",
+"package": "lib-020",
+"version": "7.3.1",
+"fixed_version": "7.3.2",
+"fixed": [
+"8.0.5",
+"7.3.2"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-300",
+"package": "lib-015",
+"version": "1.3.1",
+"fixed_version": "1.4.0",
+"fixed": [
+"1.4.0"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-301",
+"package": "lib-052",
+"version": "0.0.33",
+"fixed_version": "0.2.6",
+"fixed": [
+"0.2.6"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-302",
+"package": "lib-064",
+"version": "1.15.9",
+"fixed_version": "1.16.0",
+"fixed": [
+"1.16.0"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-303",
+"package": "lib-001",
+"version": "5.29.0",
+"fixed_version": "6.23.0",
+"fixed": [
+"7.18.2",
+"6.23.0"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-304",
+"package": "lib-034",
+"version": "14.1.0",
+"fixed_version": "14.3.1",
+"fixed": [
+"15.0.1",
+"14.3.1"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-305",
+"package": "lib-004",
+"version": "3.1.2",
+"fixed_version": "11.0.1",
+"fixed": [
+"11.0.1"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-306",
+"package": "lib-014",
+"version": "3.2.6",
+"fixed_version": "3.4.11",
+"fixed": [
+"3.4.11"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-307",
+"package": "lib-001",
+"version": "7.30.1",
+"fixed_version": "8.12.2",
+"fixed": [
+"6.29.1",
+"7.30.1",
+"8.12.2"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "direct",
+"scope": "runtime",
+"manifest": "tools/t2/package-lock.json"
+},
+{
+"id": "web-308",
+"package": "lib-001",
+"version": "5.29.0",
+"fixed_version": "6.24.0",
+"fixed": [
+"6.24.0",
+"7.24.0"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "runtime",
+"manifest": "tools/t2/package-lock.json"
+},
+{
+"id": "web-309",
+"package": "lib-012",
+"version": "3.14.1",
+"fixed_version": "3.14.2",
+"fixed": [
+"4.1.1",
+"3.14.2"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-310",
+"package": "lib-050",
+"version": "0.4.1",
+"fixed_version": "0.5.1",
+"fixed": [
+"0.5.1"
+],
+"tier": "P1",
+"verdict": "reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-311",
+"package": "lib-028",
+"version": "8.20.0",
+"fixed_version": "8.20.1",
+"fixed": [
+"8.20.1"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "web-312",
+"package": "lib-001",
+"version": "7.30.1",
+"fixed_version": "8.12.2",
+"fixed": [
+"6.29.1",
+"7.30.1",
+"8.12.2"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "direct",
+"scope": "runtime",
+"manifest": "tools/t2/package-lock.json"
+},
+{
+"id": "web-313",
+"package": "lib-020",
+"version": "7.3.1",
+"fixed_version": "7.3.7",
+"fixed": [
+"8.3.3",
+"8.2.4",
+"8.1.6",
+"7.3.7",
+"6.4.4"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-314",
+"package": "lib-008",
+"version": "4.0.3",
+"fixed_version": "4.0.4",
+"fixed": [
+"4.0.4",
+"3.0.2",
+"2.3.2"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "web-315",
+"package": "lib-008",
+"version": "2.3.1",
+"fixed_version": "2.3.2",
+"fixed": [
+"4.0.4",
+"3.0.2",
+"2.3.2"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-316",
+"package": "lib-003",
+"version": "4.5.3",
+"fixed_version": "5.7.0",
+"fixed": [
+"5.7.0"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-317",
+"package": "lib-003",
+"version": "5.2.5",
+"fixed_version": "5.5.6",
+"fixed": [
+"5.5.6",
+"4.5.5"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "tools/t3/package-lock.json"
+},
+{
+"id": "web-318",
+"package": "lib-055",
+"version": "2.7.6",
+"fixed_version": "2.9.14",
+"fixed": [
+"2.9.14"
+],
+"tier": "P3",
+"verdict": "not_loaded",
+"relation": "direct",
+"scope": "dev",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-319",
+"package": "lib-001",
+"version": "6.28.1",
+"fixed_version": "6.29.1",
+"fixed": [
+"6.29.1",
+"7.30.1",
+"8.12.2"
+],
+"tier": "P2",
+"verdict": "reachable",
+"relation": "direct",
+"scope": "runtime",
+"manifest": "tools/t2/package-lock.json"
+},
+{
+"id": "web-320",
+"package": "lib-017",
+"version": "1.15.4",
+"fixed_version": "1.15.9",
+"fixed": [
+"1.15.9"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-321",
+"package": "lib-011",
+"version": "1.12.2",
+"fixed_version": "1.15.1",
+"fixed": [
+"1.15.1",
+"0.31.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-322",
+"package": "lib-009",
+"version": "3.25.76",
+"fixed_version": "4.6.6",
+"fixed": [
+"4.6.6"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-323",
+"package": "lib-011",
+"version": "1.12.2",
+"fixed_version": "1.16.0",
+"fixed": [
+"1.16.0"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-324",
+"package": "lib-063",
+"version": "4.17.23",
+"fixed_version": "4.18.1",
+"fixed": [
+"4.18.1"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-325",
+"package": "lib-002",
+"version": "2.0.3",
+"fixed_version": "2.1.2",
+"fixed": [
+"5.0.7",
+"1.1.16",
+"2.1.2"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "web-326",
+"package": "lib-015",
+"version": "1.3.1",
+"fixed_version": "1.4.1",
+"fixed": [
+"1.4.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "web-327",
+"package": "lib-001",
+"version": "5.29.0",
+"fixed_version": "6.28.0",
+"fixed": [
+"6.28.0",
+"7.29.0",
+"8.9.0"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "runtime",
+"manifest": "tools/t2/package-lock.json"
+}
+],
+"api-service": [
+{
+"id": "api-001",
+"package": "lib-001",
+"version": "7.25.0",
+"fixed_version": "7.29.1",
+"fixed": [
+"7.29.1",
+"8.10.2"
+],
+"tier": "P3",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-002",
+"package": "lib-008",
+"version": "4.0.1",
+"fixed_version": "4.0.4",
+"fixed": [
+"4.0.4",
+"3.0.2",
+"2.3.2"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "api-003",
+"package": "lib-065",
+"version": "1.4.4-lts.1",
+"fixed_version": "2.1.1",
+"fixed": [
+"2.1.1"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-004",
+"package": "lib-032",
+"version": "4.24.4",
+"fixed_version": "4.28.7",
+"fixed": [
+"4.28.7"
+],
+"tier": "P3",
+"verdict": "not_loaded",
+"relation": "transitive",
+"scope": "dev",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-005",
+"package": "lib-066",
+"version": "6.2.1",
+"fixed_version": "7.5.21",
+"fixed": [
+"7.5.21"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-006",
+"package": "lib-067",
+"version": "6.14.0",
+"fixed_version": "6.14.2",
+"fixed": [
+"6.14.2"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-007",
+"package": "lib-003",
+"version": "4.4.1",
+"fixed_version": "4.5.5",
+"fixed": [
+"4.5.5",
+"5.5.7"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "dev",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-008",
+"package": "lib-012",
+"version": "4.1.0",
+"fixed_version": "4.3.2",
+"fixed": [
+"4.3.2",
+"3.15.2"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "api-009",
+"package": "lib-068",
+"version": "10.4.15",
+"fixed_version": "10.4.16",
+"fixed": [
+"11.0.16",
+"10.4.16"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "direct",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-010",
+"package": "lib-013",
+"version": "9.0.5",
+"fixed_version": "10.7.4",
+"fixed": [
+"10.7.4"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-011",
+"package": "lib-002",
+"version": "1.1.11",
+"fixed_version": "1.1.13",
+"fixed": [
+"5.0.5",
+"3.0.2",
+"2.0.3",
+"1.1.13"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-012",
+"package": "lib-004",
+"version": "5.1.6",
+"fixed_version": "5.1.8",
+"fixed": [
+"10.2.3",
+"9.0.7",
+"8.0.6",
+"7.4.8",
+"6.2.2",
+"5.1.8",
+"4.2.5",
+"3.1.3"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "api-013",
+"package": "lib-011",
+"version": "1.8.3",
+"fixed_version": "1.16.0",
+"fixed": [
+"1.16.0"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "direct",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-014",
+"package": "lib-001",
+"version": "7.25.0",
+"fixed_version": "7.28.0",
+"fixed": [
+"6.27.0",
+"7.28.0",
+"8.5.0"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-015",
+"package": "lib-013",
+"version": "9.0.5",
+"fixed_version": "10.3.1",
+"fixed": [
+"10.3.1"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-016",
+"package": "lib-069",
+"version": "0.1.12",
+"fixed_version": "0.1.13",
+"fixed": [
+"0.1.13"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-017",
+"package": "lib-001",
+"version": "7.25.0",
+"fixed_version": "7.30.1",
+"fixed": [
+"7.30.1",
+"8.12.2"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-018",
+"package": "lib-070",
+"version": "7.4.0",
+"fixed_version": "7.5.6",
+"fixed": [
+"7.5.6",
+"8.0.2"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-019",
+"package": "lib-008",
+"version": "2.3.1",
+"fixed_version": "2.3.2",
+"fixed": [
+"4.0.4",
+"3.0.2",
+"2.3.2"
+],
+"tier": "P3",
+"verdict": "not_loaded",
+"relation": "transitive",
+"scope": "dev",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-020",
+"package": "lib-071",
+"version": "2.0.7",
+"fixed_version": "2.0.8",
+"fixed": [
+"2.0.8",
+"3.0.4"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "direct",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-021",
+"package": "lib-067",
+"version": "6.14.0",
+"fixed_version": "6.14.1",
+"fixed": [
+"6.14.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-022",
+"package": "lib-042",
+"version": "7.2.3",
+"fixed_version": "14.0.2",
+"fixed": [
+"14.0.2"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-023",
+"package": "lib-015",
+"version": "1.4.0",
+"fixed_version": "1.4.1",
+"fixed": [
+"1.4.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-024",
+"package": "lib-011",
+"version": "1.8.3",
+"fixed_version": "1.16.0",
+"fixed": [
+"1.16.0",
+"0.32.0"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "direct",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-025",
+"package": "lib-072",
+"version": "1.20.3",
+"fixed_version": "1.20.6",
+"fixed": [
+"1.20.6",
+"2.3.0"
+],
+"tier": "P3",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-026",
+"package": "lib-011",
+"version": "1.8.3",
+"fixed_version": "1.15.0",
+"fixed": [
+"1.15.0",
+"0.31.0"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "direct",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-027",
+"package": "lib-013",
+"version": "9.0.5",
+"fixed_version": "10.5.1",
+"fixed": [
+"10.5.1"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-028",
+"package": "lib-015",
+"version": "1.4.0",
+"fixed_version": "1.4.1",
+"fixed": [
+"1.4.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-029",
+"package": "lib-004",
+"version": "3.1.2",
+"fixed_version": "3.1.3",
+"fixed": [
+"10.2.3",
+"9.0.7",
+"8.0.6",
+"7.4.8",
+"6.2.2",
+"5.1.8",
+"4.2.5",
+"3.1.3"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-030",
+"package": "lib-049",
+"version": "4.17.21",
+"fixed_version": "4.17.23",
+"fixed": [
+"4.17.23"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-031",
+"package": "lib-072",
+"version": "1.20.3",
+"fixed_version": "1.20.9",
+"fixed": [
+"2.4.0",
+"1.20.9"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-032",
+"package": "lib-004",
+"version": "3.1.2",
+"fixed_version": "3.1.4",
+"fixed": [
+"10.2.3",
+"9.0.7",
+"8.0.6",
+"7.4.8",
+"6.2.2",
+"5.1.8",
+"4.2.5",
+"3.1.4"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-033",
+"package": "lib-054",
+"version": "2.5.3",
+"fixed_version": "2.5.6",
+"fixed": [
+"2.5.6",
+"3.0.5",
+"4.0.6"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-034",
+"package": "lib-003",
+"version": "4.4.1",
+"fixed_version": "5.12.0",
+"fixed": [
+"5.12.0"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-035",
+"package": "lib-011",
+"version": "1.8.3",
+"fixed_version": "1.15.2",
+"fixed": [
+"1.15.2"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "direct",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-036",
+"package": "lib-073",
+"version": "0.7.4",
+"fixed_version": "0.7.5",
+"fixed": [
+"0.7.5"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-037",
+"package": "lib-015",
+"version": "1.4.0",
+"fixed_version": "1.4.1",
+"fixed": [
+"1.4.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-038",
+"package": "lib-074",
+"version": "6.0.2",
+"fixed_version": "7.1.3",
+"fixed": [
+"7.1.3"
+],
+"tier": "P3",
+"verdict": "not_loaded",
+"relation": "transitive",
+"scope": "dev",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-039",
+"package": "lib-075",
+"version": "1.14.3",
+"fixed_version": "1.14.4",
+"fixed": [
+"1.9.16",
+"1.10.12",
+"1.11.4",
+"1.12.7",
+"1.13.5",
+"1.14.4"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-040",
+"package": "lib-011",
+"version": "1.8.3",
+"fixed_version": "1.15.1",
+"fixed": [
+"1.15.1",
+"0.31.1"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "direct",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-041",
+"package": "lib-065",
+"version": "1.4.4-lts.1",
+"fixed_version": "2.3.0",
+"fixed": [
+"2.3.0"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-042",
+"package": "lib-012",
+"version": "3.14.1",
+"fixed_version": "3.14.2",
+"fixed": [
+"4.1.1",
+"3.14.2"
+],
+"tier": "P3",
+"verdict": "not_loaded",
+"relation": "transitive",
+"scope": "dev",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-043",
+"package": "lib-066",
+"version": "6.2.1",
+"fixed_version": "7.5.18",
+"fixed": [
+"7.5.18"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-044",
+"package": "lib-011",
+"version": "1.8.3",
+"fixed_version": "1.15.1",
+"fixed": [
+"1.15.1",
+"0.31.1"
+],
+"tier": "P3",
+"verdict": "unknown",
+"relation": "direct",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-045",
+"package": "lib-052",
+"version": "0.0.33",
+"fixed_version": "0.2.6",
+"fixed": [
+"0.2.6"
+],
+"tier": "P3",
+"verdict": "not_loaded",
+"relation": "transitive",
+"scope": "dev",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-046",
+"package": "lib-001",
+"version": "7.25.0",
+"fixed_version": "7.29.1",
+"fixed": [
+"7.29.1",
+"8.10.2"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-047",
+"package": "lib-032",
+"version": "4.24.4",
+"fixed_version": "4.28.7",
+"fixed": [
+"4.28.7"
+],
+"tier": "P3",
+"verdict": "not_loaded",
+"relation": "transitive",
+"scope": "dev",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-048",
+"package": "lib-074",
+"version": "6.0.2",
+"fixed_version": "7.0.3",
+"fixed": [
+"7.0.3"
+],
+"tier": "P3",
+"verdict": "not_loaded",
+"relation": "transitive",
+"scope": "dev",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-049",
+"package": "lib-011",
+"version": "1.8.3",
+"fixed_version": "1.18.0",
+"fixed": [
+"0.33.0",
+"1.18.0"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "direct",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-050",
+"package": "lib-066",
+"version": "6.2.1",
+"fixed_version": "7.5.16",
+"fixed": [
+"7.5.16"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-051",
+"package": "lib-001",
+"version": "7.25.0",
+"fixed_version": "7.28.0",
+"fixed": [
+"7.28.0",
+"8.5.0"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-052",
+"package": "lib-010",
+"version": "2.8.2",
+"fixed_version": "2.8.3",
+"fixed": [
+"2.8.3",
+"1.10.3"
+],
+"tier": "P3",
+"verdict": "not_loaded",
+"relation": "transitive",
+"scope": "dev",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-053",
+"package": "lib-011",
+"version": "1.8.3",
+"fixed_version": "1.16.0",
+"fixed": [
+"1.16.0"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "direct",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-054",
+"package": "lib-065",
+"version": "1.4.4-lts.1",
+"fixed_version": "2.2.0",
+"fixed": [
+"2.2.0",
+"3.0.0-alpha.2"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-055",
+"package": "lib-012",
+"version": "4.1.0",
+"fixed_version": "4.1.1",
+"fixed": [
+"4.1.1",
+"3.14.2"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "api-056",
+"package": "lib-012",
+"version": "4.1.0",
+"fixed_version": "4.2.0",
+"fixed": [
+"4.2.0",
+"3.15.0"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "api-057",
+"package": "lib-038",
+"version": "3.0.6",
+"fixed_version": "3.1.6",
+"fixed": [
+"2.4.5",
+"3.1.6",
+"4.1.3"
+],
+"tier": "P3",
+"verdict": "not_loaded",
+"relation": "transitive",
+"scope": "dev",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-058",
+"package": "lib-004",
+"version": "5.1.6",
+"fixed_version": "5.1.8",
+"fixed": [
+"10.2.3",
+"9.0.7",
+"8.0.6",
+"7.4.8",
+"6.2.2",
+"5.1.8",
+"4.2.5",
+"3.1.4"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "api-059",
+"package": "lib-011",
+"version": "1.8.3",
+"fixed_version": "1.16.0",
+"fixed": [
+"1.16.0",
+"0.32.0"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "direct",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-060",
+"package": "lib-028",
+"version": "8.18.0",
+"fixed_version": "8.20.1",
+"fixed": [
+"8.20.1"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "api-061",
+"package": "lib-009",
+"version": "3.24.2",
+"fixed_version": "4.6.6",
+"fixed": [
+"4.6.6"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "direct",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-062",
+"package": "lib-012",
+"version": "4.1.0",
+"fixed_version": "4.3.1",
+"fixed": [
+"4.3.1",
+"3.15.1"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "api-063",
+"package": "lib-067",
+"version": "6.14.0",
+"fixed_version": "6.15.2",
+"fixed": [
+"6.15.2"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-064",
+"package": "lib-008",
+"version": "4.0.1",
+"fixed_version": "4.0.4",
+"fixed": [
+"4.0.4",
+"3.0.2",
+"2.3.2"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "api-065",
+"package": "lib-004",
+"version": "3.1.2",
+"fixed_version": "11.0.1",
+"fixed": [
+"11.0.1"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-066",
+"package": "lib-075",
+"version": "1.14.3",
+"fixed_version": "1.14.4",
+"fixed": [
+"1.9.16",
+"1.10.12",
+"1.11.4",
+"1.12.7",
+"1.13.5",
+"1.14.4"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-067",
+"package": "lib-015",
+"version": "1.4.0",
+"fixed_version": "1.4.1",
+"fixed": [
+"1.4.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-068",
+"package": "lib-015",
+"version": "1.4.0",
+"fixed_version": "1.4.1",
+"fixed": [
+"1.4.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-069",
+"package": "lib-011",
+"version": "1.8.3",
+"fixed_version": "1.18.0",
+"fixed": [
+"1.18.0",
+"0.33.0"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "direct",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-070",
+"package": "lib-076",
+"version": "2.0.7",
+"fixed_version": "2.0.8",
+"fixed": [
+"2.0.8"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-071",
+"package": "lib-001",
+"version": "7.25.0",
+"fixed_version": "7.30.1",
+"fixed": [
+"6.29.1",
+"7.30.1",
+"8.12.2"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-072",
+"package": "lib-003",
+"version": "4.4.1",
+"fixed_version": "4.5.4",
+"fixed": [
+"4.5.4",
+"5.3.6"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "dev",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-073",
+"package": "lib-002",
+"version": "2.0.1",
+"fixed_version": "2.1.5",
+"fixed": [
+"5.0.10",
+"3.0.7",
+"2.1.5",
+"1.1.19"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "api-074",
+"package": "lib-015",
+"version": "1.4.0",
+"fixed_version": "1.4.1",
+"fixed": [
+"1.4.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-075",
+"package": "lib-001",
+"version": "7.25.0",
+"fixed_version": "7.28.0",
+"fixed": [
+"7.28.0",
+"8.2.0"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-076",
+"package": "lib-001",
+"version": "7.25.0",
+"fixed_version": "7.29.1",
+"fixed": [
+"7.29.1",
+"8.10.2"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-077",
+"package": "lib-028",
+"version": "7.5.10",
+"fixed_version": "8.20.1",
+"fixed": [
+"8.20.1"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-078",
+"package": "lib-077",
+"version": "2.10.0",
+"fixed_version": "2.10.5",
+"fixed": [
+"2.9.6",
+"2.10.5",
+"2.11.6",
+"2.12.3",
+"2.13.2"
+],
+"tier": "P2",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-079",
+"package": "lib-012",
+"version": "3.14.1",
+"fixed_version": "3.15.0",
+"fixed": [
+"3.15.0",
+"4.3.0"
+],
+"tier": "P3",
+"verdict": "not_loaded",
+"relation": "transitive",
+"scope": "dev",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-080",
+"package": "lib-011",
+"version": "1.8.3",
+"fixed_version": "1.18.0",
+"fixed": [
+"0.33.0",
+"1.18.0"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "direct",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-081",
+"package": "lib-066",
+"version": "6.2.1",
+"fixed_version": "7.5.10",
+"fixed": [
+"7.5.10"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-082",
+"package": "lib-078",
+"version": "1.24.1",
+"fixed_version": "2.0.1",
+"fixed": [
+"2.0.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "direct",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-083",
+"package": "lib-001",
+"version": "7.25.0",
+"fixed_version": "7.29.0",
+"fixed": [
+"6.28.0",
+"7.29.0",
+"8.9.0"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-084",
+"package": "lib-004",
+"version": "9.0.5",
+"fixed_version": "9.0.7",
+"fixed": [
+"10.2.3",
+"9.0.7",
+"8.0.6",
+"7.4.8",
+"6.2.2",
+"5.1.8",
+"4.2.5",
+"3.1.4"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "api-085",
+"package": "lib-002",
+"version": "2.0.1",
+"fixed_version": "2.1.2",
+"fixed": [
+"5.0.7",
+"1.1.16",
+"2.1.2"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "api-086",
+"package": "lib-066",
+"version": "6.2.1",
+"fixed_version": "7.5.4",
+"fixed": [
+"7.5.4"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-087",
+"package": "lib-012",
+"version": "3.14.1",
+"fixed_version": "3.15.2",
+"fixed": [
+"4.3.2",
+"3.15.2"
+],
+"tier": "P3",
+"verdict": "not_loaded",
+"relation": "transitive",
+"scope": "dev",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-088",
+"package": "lib-001",
+"version": "7.25.0",
+"fixed_version": "7.29.0",
+"fixed": [
+"6.28.0",
+"7.29.0",
+"8.9.0"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-089",
+"package": "lib-061",
+"version": "7.26.10",
+"fixed_version": "7.29.6",
+"fixed": [
+"8.0.0-rc.6",
+"7.29.6"
+],
+"tier": "P3",
+"verdict": "not_loaded",
+"relation": "transitive",
+"scope": "dev",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-090",
+"package": "lib-001",
+"version": "7.25.0",
+"fixed_version": "7.29.1",
+"fixed": [
+"7.29.1",
+"8.10.2"
+],
+"tier": "P3",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-091",
+"package": "lib-070",
+"version": "7.4.0",
+"fixed_version": "7.5.6",
+"fixed": [
+"7.5.6",
+"8.0.2"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-092",
+"package": "lib-065",
+"version": "1.4.4-lts.1",
+"fixed_version": "2.0.0",
+"fixed": [
+"2.0.0"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-093",
+"package": "lib-015",
+"version": "1.4.0",
+"fixed_version": "1.4.1",
+"fixed": [
+"1.4.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-094",
+"package": "lib-015",
+"version": "1.4.0",
+"fixed_version": "1.4.1",
+"fixed": [
+"1.4.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-095",
+"package": "lib-002",
+"version": "2.0.1",
+"fixed_version": "2.1.4",
+"fixed": [
+"1.1.18",
+"2.1.4",
+"3.0.6",
+"5.0.9"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "api-096",
+"package": "lib-011",
+"version": "1.8.3",
+"fixed_version": "1.20.0",
+"fixed": [
+"1.20.0"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "direct",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-097",
+"package": "lib-015",
+"version": "1.4.0",
+"fixed_version": "1.4.1",
+"fixed": [
+"1.4.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-098",
+"package": "lib-011",
+"version": "1.8.3",
+"fixed_version": "1.15.1",
+"fixed": [
+"1.15.1",
+"0.31.1"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "direct",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-099",
+"package": "lib-011",
+"version": "1.8.3",
+"fixed_version": "1.15.0",
+"fixed": [
+"1.15.0",
+"0.31.0"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "direct",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-100",
+"package": "lib-001",
+"version": "7.25.0",
+"fixed_version": "7.30.1",
+"fixed": [
+"7.30.1",
+"8.12.2"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-101",
+"package": "lib-079",
+"version": "1.1.0",
+"fixed_version": "1.1.1",
+"fixed": [
+"1.1.1"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-102",
+"package": "lib-027",
+"version": "9.0.1",
+"fixed_version": "11.1.1",
+"fixed": [
+"11.1.1",
+"12.0.1",
+"13.0.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "api-103",
+"package": "lib-065",
+"version": "1.4.4-lts.1",
+"fixed_version": "2.0.0",
+"fixed": [
+"2.0.0"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-104",
+"package": "lib-025",
+"version": "3.1.1",
+"fixed_version": "3.2.1",
+"fixed": [
+"3.2.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-105",
+"package": "lib-070",
+"version": "7.4.0",
+"fixed_version": "7.5.6",
+"fixed": [
+"7.5.6",
+"8.0.2"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-106",
+"package": "lib-075",
+"version": "1.14.3",
+"fixed_version": "1.14.5",
+"fixed": [
+"1.13.6",
+"1.14.5"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-107",
+"package": "lib-066",
+"version": "6.2.1",
+"fixed_version": "7.5.17",
+"fixed": [
+"7.5.17"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-108",
+"package": "lib-001",
+"version": "7.25.0",
+"fixed_version": "7.29.0",
+"fixed": [
+"7.29.0",
+"8.9.0"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-109",
+"package": "lib-080",
+"version": "4.5.0",
+"fixed_version": "4.18.0",
+"fixed": [
+"4.18.0"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-110",
+"package": "lib-015",
+"version": "1.4.0",
+"fixed_version": "1.4.3",
+"fixed": [
+"1.4.3"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "api-111",
+"package": "lib-025",
+"version": "3.1.1",
+"fixed_version": "3.2.1",
+"fixed": [
+"3.2.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-112",
+"package": "lib-078",
+"version": "1.24.1",
+"fixed_version": "2.0.1",
+"fixed": [
+"2.0.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "direct",
+"scope": "runtime",
+"manifest": "package.json"
+},
+{
+"id": "api-113",
+"package": "lib-011",
+"version": "1.8.3",
+"fixed_version": "1.15.1",
+"fixed": [
+"1.15.1",
+"0.31.1"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "direct",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-114",
+"package": "lib-054",
+"version": "2.5.3",
+"fixed_version": "2.5.4",
+"fixed": [
+"2.5.4",
+"3.0.4",
+"4.0.4"
+],
+"tier": "P2",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-115",
+"package": "lib-011",
+"version": "1.8.3",
+"fixed_version": "1.18.0",
+"fixed": [
+"0.33.0",
+"1.18.0"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "direct",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-116",
+"package": "lib-081",
+"version": "0.3.21",
+"fixed_version": "0.3.31",
+"fixed": [
+"0.3.31",
+"1.1.0"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "direct",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-117",
+"package": "lib-038",
+"version": "3.0.6",
+"fixed_version": "3.1.5",
+"fixed": [
+"2.4.4",
+"3.1.5",
+"4.1.2"
+],
+"tier": "P3",
+"verdict": "not_loaded",
+"relation": "transitive",
+"scope": "dev",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-118",
+"package": "lib-038",
+"version": "3.0.6",
+"fixed_version": "3.1.4",
+"fixed": [
+"2.4.3",
+"3.1.4",
+"4.1.1"
+],
+"tier": "P3",
+"verdict": "not_loaded",
+"relation": "transitive",
+"scope": "dev",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-119",
+"package": "lib-065",
+"version": "1.4.4-lts.1",
+"fixed_version": "2.0.1",
+"fixed": [
+"2.0.1"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-120",
+"package": "lib-002",
+"version": "1.1.11",
+"fixed_version": "1.1.18",
+"fixed": [
+"1.1.18",
+"2.1.4",
+"3.0.6",
+"5.0.9"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-121",
+"package": "lib-082",
+"version": "10.4.15",
+"fixed_version": "11.1.18",
+"fixed": [
+"11.1.18"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "direct",
+"scope": "runtime",
+"manifest": "package.json"
+},
+{
+"id": "api-122",
+"package": "lib-066",
+"version": "6.2.1",
+"fixed_version": "7.5.8",
+"fixed": [
+"7.5.8"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-123",
+"package": "lib-013",
+"version": "9.0.5",
+"fixed_version": "10.7.1",
+"fixed": [
+"10.7.1"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-124",
+"package": "lib-067",
+"version": "6.14.0",
+"fixed_version": "6.16.1",
+"fixed": [
+"6.16.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-125",
+"package": "lib-038",
+"version": "3.0.6",
+"fixed_version": "3.1.1",
+"fixed": [
+"3.1.1",
+"2.4.1"
+],
+"tier": "P3",
+"verdict": "not_loaded",
+"relation": "transitive",
+"scope": "dev",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-126",
+"package": "lib-028",
+"version": "7.5.10",
+"fixed_version": "7.5.11",
+"fixed": [
+"5.2.5",
+"6.2.4",
+"7.5.11",
+"8.21.0"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-127",
+"package": "lib-011",
+"version": "1.8.3",
+"fixed_version": "1.15.1",
+"fixed": [
+"1.15.1",
+"0.31.1"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "direct",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-128",
+"package": "lib-015",
+"version": "1.4.0",
+"fixed_version": "1.4.1",
+"fixed": [
+"1.4.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-129",
+"package": "lib-003",
+"version": "4.4.1",
+"fixed_version": "4.5.5",
+"fixed": [
+"5.5.6",
+"4.5.5"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-130",
+"package": "lib-039",
+"version": "6.12.6",
+"fixed_version": "6.14.0",
+"fixed": [
+"8.18.0",
+"6.14.0"
+],
+"tier": "P3",
+"verdict": "not_loaded",
+"relation": "transitive",
+"scope": "dev",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-131",
+"package": "lib-054",
+"version": "4.0.2",
+"fixed_version": "4.0.4",
+"fixed": [
+"2.5.4",
+"3.0.4",
+"4.0.4"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "api-132",
+"package": "lib-027",
+"version": "11.1.0",
+"fixed_version": "11.1.1",
+"fixed": [
+"11.1.1",
+"12.0.1",
+"13.0.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "api-133",
+"package": "lib-011",
+"version": "1.8.3",
+"fixed_version": "1.15.1",
+"fixed": [
+"1.15.1",
+"0.31.1"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "direct",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-134",
+"package": "lib-001",
+"version": "7.25.0",
+"fixed_version": "7.29.1",
+"fixed": [
+"6.28.1",
+"7.29.1",
+"8.10.2"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-135",
+"package": "lib-001",
+"version": "7.25.0",
+"fixed_version": "7.29.1",
+"fixed": [
+"7.29.1",
+"8.10.2"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-136",
+"package": "lib-011",
+"version": "1.8.3",
+"fixed_version": "1.15.1",
+"fixed": [
+"1.15.1",
+"0.31.1"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "direct",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-137",
+"package": "lib-011",
+"version": "1.8.3",
+"fixed_version": "1.16.0",
+"fixed": [
+"1.16.0",
+"0.32.0"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "direct",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-138",
+"package": "lib-065",
+"version": "1.4.4-lts.1",
+"fixed_version": "2.3.0",
+"fixed": [
+"2.3.0"
+],
+"tier": "P3",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-139",
+"package": "lib-003",
+"version": "5.4.1",
+"fixed_version": "5.5.7",
+"fixed": [
+"4.5.5",
+"5.5.7"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "api-140",
+"package": "lib-038",
+"version": "3.0.6",
+"fixed_version": "3.1.7",
+"fixed": [
+"2.4.6",
+"3.1.7",
+"4.1.4"
+],
+"tier": "P3",
+"verdict": "not_loaded",
+"relation": "transitive",
+"scope": "dev",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-141",
+"package": "lib-083",
+"version": "5.97.1",
+"fixed_version": "5.104.0",
+"fixed": [
+"5.104.0"
+],
+"tier": "P3",
+"verdict": "not_loaded",
+"relation": "transitive",
+"scope": "dev",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-142",
+"package": "lib-067",
+"version": "6.14.0",
+"fixed_version": "6.16.0",
+"fixed": [
+"6.16.0"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-143",
+"package": "lib-084",
+"version": "4.0.0",
+"fixed_version": "4.0.1",
+"fixed": [
+"3.2.3",
+"4.0.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "api-144",
+"package": "lib-011",
+"version": "1.8.3",
+"fixed_version": "1.18.0",
+"fixed": [
+"1.18.0"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "direct",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-145",
+"package": "lib-038",
+"version": "3.0.6",
+"fixed_version": "3.1.9",
+"fixed": [
+"2.4.8",
+"3.1.9",
+"4.2.3"
+],
+"tier": "P3",
+"verdict": "not_loaded",
+"relation": "transitive",
+"scope": "dev",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-146",
+"package": "lib-085",
+"version": "10.8.1",
+"fixed_version": "12.0.1",
+"fixed": [
+"12.0.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "api-147",
+"package": "lib-065",
+"version": "1.4.4-lts.1",
+"fixed_version": "2.0.2",
+"fixed": [
+"2.0.2"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-148",
+"package": "lib-086",
+"version": "2.1.2",
+"fixed_version": "2.1.3",
+"fixed": [
+"1.16.5",
+"2.1.3",
+"3.0.9"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-149",
+"package": "lib-070",
+"version": "7.4.0",
+"fixed_version": "7.5.5",
+"fixed": [
+"8.0.1",
+"7.5.5",
+"6.11.6"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-150",
+"package": "lib-071",
+"version": "2.0.7",
+"fixed_version": "2.0.9",
+"fixed": [
+"2.0.9",
+"3.0.5"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "direct",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-151",
+"package": "lib-085",
+"version": "9.2.1",
+"fixed_version": "12.0.1",
+"fixed": [
+"12.0.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-152",
+"package": "lib-003",
+"version": "5.4.1",
+"fixed_version": "5.5.6",
+"fixed": [
+"5.5.6",
+"4.5.5"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "api-153",
+"package": "lib-066",
+"version": "6.2.1",
+"fixed_version": "7.5.19",
+"fixed": [
+"7.5.19"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-154",
+"package": "lib-001",
+"version": "7.25.0",
+"fixed_version": "7.29.1",
+"fixed": [
+"6.28.1",
+"7.29.1",
+"8.10.2"
+],
+"tier": "P3",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-155",
+"package": "lib-009",
+"version": "4.3.6",
+"fixed_version": "4.6.6",
+"fixed": [
+"4.6.6"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "api-156",
+"package": "lib-081",
+"version": "0.3.21",
+"fixed_version": "0.3.29",
+"fixed": [
+"0.3.29"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "direct",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-157",
+"package": "lib-011",
+"version": "1.8.3",
+"fixed_version": "1.15.2",
+"fixed": [
+"1.15.2"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "direct",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-158",
+"package": "lib-011",
+"version": "1.8.3",
+"fixed_version": "1.16.0",
+"fixed": [
+"1.16.0",
+"0.32.0"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "direct",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-159",
+"package": "lib-082",
+"version": "10.4.15",
+"fixed_version": "11.1.18",
+"fixed": [
+"11.1.18"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "direct",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-160",
+"package": "lib-087",
+"version": "2.1.2",
+"fixed_version": "2.1.3",
+"fixed": [
+"3.5.3",
+"2.1.3"
+],
+"tier": "P3",
+"verdict": "not_loaded",
+"relation": "transitive",
+"scope": "dev",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-161",
+"package": "lib-001",
+"version": "7.25.0",
+"fixed_version": "7.30.1",
+"fixed": [
+"6.29.1",
+"7.30.1",
+"8.12.2"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-162",
+"package": "lib-011",
+"version": "1.8.3",
+"fixed_version": "1.20.0",
+"fixed": [
+"1.20.0"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "direct",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-163",
+"package": "lib-081",
+"version": "0.3.21",
+"fixed_version": "0.3.26",
+"fixed": [
+"0.3.26"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "direct",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-164",
+"package": "lib-001",
+"version": "7.25.0",
+"fixed_version": "7.28.0",
+"fixed": [
+"7.28.0",
+"8.5.0"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-165",
+"package": "lib-070",
+"version": "7.5.6",
+"fixed_version": "7.6.5",
+"fixed": [
+"7.6.5",
+"8.6.6"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-166",
+"package": "lib-039",
+"version": "8.12.0",
+"fixed_version": "8.18.0",
+"fixed": [
+"8.18.0",
+"6.14.0"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "api-167",
+"package": "lib-001",
+"version": "7.25.0",
+"fixed_version": "7.28.0",
+"fixed": [
+"6.27.0",
+"7.28.0",
+"8.5.0"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-168",
+"package": "lib-042",
+"version": "10.4.5",
+"fixed_version": "10.5.0",
+"fixed": [
+"11.1.0",
+"10.5.0"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "api-169",
+"package": "lib-088",
+"version": "4.0.1",
+"fixed_version": "4.4.0",
+"fixed": [
+"4.4.0"
+],
+"tier": "P3",
+"verdict": "not_loaded",
+"relation": "transitive",
+"scope": "dev",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-170",
+"package": "lib-002",
+"version": "2.0.1",
+"fixed_version": "2.1.6",
+"fixed": [
+"5.0.11",
+"3.0.8",
+"2.1.6",
+"1.1.20"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "api-171",
+"package": "lib-071",
+"version": "2.0.7",
+"fixed_version": "2.0.10",
+"fixed": [
+"3.0.6",
+"4.1.0",
+"2.0.10"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "direct",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-172",
+"package": "lib-002",
+"version": "1.1.11",
+"fixed_version": "1.1.16",
+"fixed": [
+"5.0.7",
+"1.1.16",
+"2.1.2"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-173",
+"package": "lib-038",
+"version": "3.0.6",
+"fixed_version": "3.1.8",
+"fixed": [
+"2.4.7",
+"3.1.8",
+"4.1.5"
+],
+"tier": "P3",
+"verdict": "not_loaded",
+"relation": "transitive",
+"scope": "dev",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-174",
+"package": "lib-089",
+"version": "2.0.0",
+"fixed_version": "2.0.1",
+"fixed": [
+"3.0.1",
+"2.0.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "api-175",
+"package": "lib-002",
+"version": "2.0.1",
+"fixed_version": "2.0.2",
+"fixed": [
+"2.0.2",
+"1.1.12",
+"3.0.1",
+"4.0.1"
+],
+"tier": "P3",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "api-176",
+"package": "lib-002",
+"version": "2.0.1",
+"fixed_version": "2.0.3",
+"fixed": [
+"5.0.5",
+"3.0.2",
+"2.0.3",
+"1.1.13"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "api-177",
+"package": "lib-004",
+"version": "3.1.2",
+"fixed_version": "3.1.3",
+"fixed": [
+"10.2.1",
+"9.0.6",
+"8.0.5",
+"7.4.7",
+"6.2.1",
+"5.1.7",
+"4.2.4",
+"3.1.3"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-178",
+"package": "lib-066",
+"version": "6.2.1",
+"fixed_version": "7.5.7",
+"fixed": [
+"7.5.7"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-179",
+"package": "lib-065",
+"version": "1.4.4-lts.1",
+"fixed_version": "2.1.0",
+"fixed": [
+"2.1.0"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-180",
+"package": "lib-011",
+"version": "1.8.3",
+"fixed_version": "1.15.1",
+"fixed": [
+"1.15.1"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "direct",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-181",
+"package": "lib-011",
+"version": "1.8.3",
+"fixed_version": "1.13.5",
+"fixed": [
+"1.13.5",
+"0.30.3"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "direct",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-182",
+"package": "lib-070",
+"version": "7.4.0",
+"fixed_version": "7.5.8",
+"fixed": [
+"7.5.8",
+"8.2.0"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-183",
+"package": "lib-004",
+"version": "5.1.6",
+"fixed_version": "5.1.7",
+"fixed": [
+"10.2.1",
+"9.0.6",
+"8.0.5",
+"7.4.7",
+"6.2.1",
+"5.1.7",
+"4.2.4",
+"3.1.3"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "api-184",
+"package": "lib-001",
+"version": "7.25.0",
+"fixed_version": "7.30.1",
+"fixed": [
+"6.29.1",
+"7.30.1",
+"8.12.2"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-185",
+"package": "lib-001",
+"version": "7.25.0",
+"fixed_version": "7.28.0",
+"fixed": [
+"6.27.0",
+"7.28.0",
+"8.5.0"
+],
+"tier": "P3",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-186",
+"package": "lib-015",
+"version": "1.4.0",
+"fixed_version": "1.4.3",
+"fixed": [
+"1.4.3"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "api-187",
+"package": "lib-028",
+"version": "8.18.0",
+"fixed_version": "8.21.0",
+"fixed": [
+"5.2.5",
+"6.2.4",
+"7.5.11",
+"8.21.0"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "api-188",
+"package": "lib-015",
+"version": "1.4.0",
+"fixed_version": "1.4.1",
+"fixed": [
+"1.4.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-189",
+"package": "lib-038",
+"version": "3.0.6",
+"fixed_version": "3.1.2",
+"fixed": [
+"3.1.2",
+"2.4.1"
+],
+"tier": "P3",
+"verdict": "not_loaded",
+"relation": "transitive",
+"scope": "dev",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-190",
+"package": "lib-011",
+"version": "1.8.3",
+"fixed_version": "1.12.0",
+"fixed": [
+"1.12.0",
+"0.30.2"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "direct",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-191",
+"package": "lib-070",
+"version": "7.4.0",
+"fixed_version": "7.6.3",
+"fixed": [
+"7.6.3",
+"8.6.0"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-192",
+"package": "lib-070",
+"version": "7.4.0",
+"fixed_version": "7.5.6",
+"fixed": [
+"7.5.6",
+"8.0.2"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-193",
+"package": "lib-001",
+"version": "7.25.0",
+"fixed_version": "7.30.1",
+"fixed": [
+"6.29.1",
+"7.30.1",
+"8.12.2"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-194",
+"package": "lib-090",
+"version": "1.0.0",
+"fixed_version": "1.1.7",
+"fixed": [
+"1.1.7"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-195",
+"package": "lib-011",
+"version": "1.8.3",
+"fixed_version": "1.15.1",
+"fixed": [
+"1.15.1",
+"0.31.1"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "direct",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-196",
+"package": "lib-091",
+"version": "4.11.3",
+"fixed_version": "5.5.0",
+"fixed": [
+"5.5.0"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "direct",
+"scope": "runtime",
+"manifest": "package.json"
+},
+{
+"id": "api-197",
+"package": "lib-089",
+"version": "1.1.2",
+"fixed_version": "2.0.1",
+"fixed": [
+"3.0.1",
+"2.0.1"
+],
+"tier": "P3",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-198",
+"package": "lib-054",
+"version": "4.0.2",
+"fixed_version": "4.0.6",
+"fixed": [
+"2.5.6",
+"3.0.5",
+"4.0.6"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "api-199",
+"package": "lib-011",
+"version": "1.8.3",
+"fixed_version": "1.15.1",
+"fixed": [
+"1.15.1",
+"0.31.1"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "direct",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-200",
+"package": "lib-025",
+"version": "3.1.1",
+"fixed_version": "3.2.2",
+"fixed": [
+"3.2.2"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-201",
+"package": "lib-011",
+"version": "1.8.3",
+"fixed_version": "1.20.0",
+"fixed": [
+"0.34.0",
+"1.20.0"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "direct",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-202",
+"package": "lib-002",
+"version": "1.1.11",
+"fixed_version": "1.1.17",
+"fixed": [
+"5.0.8",
+"3.0.3",
+"2.1.3",
+"1.1.17"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-203",
+"package": "lib-052",
+"version": "0.0.33",
+"fixed_version": "0.2.4",
+"fixed": [
+"0.2.4"
+],
+"tier": "P3",
+"verdict": "not_loaded",
+"relation": "transitive",
+"scope": "dev",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-204",
+"package": "lib-002",
+"version": "1.1.11",
+"fixed_version": "1.1.12",
+"fixed": [
+"2.0.2",
+"1.1.12",
+"3.0.1",
+"4.0.1"
+],
+"tier": "P3",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-205",
+"package": "lib-092",
+"version": "3.3.3",
+"fixed_version": "3.4.0",
+"fixed": [
+"3.4.0"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-206",
+"package": "lib-075",
+"version": "1.14.3",
+"fixed_version": "1.14.5",
+"fixed": [
+"1.13.6",
+"1.14.5"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-207",
+"package": "lib-003",
+"version": "4.4.1",
+"fixed_version": "4.5.4",
+"fixed": [
+"5.3.5",
+"4.5.4"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "dev",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-208",
+"package": "lib-091",
+"version": "4.11.3",
+"fixed_version": "4.13.0",
+"fixed": [
+"4.13.0",
+"5.4.0"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "direct",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-209",
+"package": "lib-024",
+"version": "2.0.1",
+"fixed_version": "2.8.0",
+"fixed": [
+"2.8.0"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-210",
+"package": "lib-001",
+"version": "7.25.0",
+"fixed_version": "7.30.1",
+"fixed": [
+"6.29.1",
+"7.30.1",
+"8.12.2"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-211",
+"package": "lib-002",
+"version": "1.1.11",
+"fixed_version": "1.1.21",
+"fixed": [
+"5.0.12",
+"3.0.9",
+"2.1.7",
+"1.1.21"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-212",
+"package": "lib-065",
+"version": "1.4.4-lts.1",
+"fixed_version": "2.3.0",
+"fixed": [
+"2.3.0"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-213",
+"package": "lib-093",
+"version": "13.12.0",
+"fixed_version": "13.15.22",
+"fixed": [
+"13.15.22"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-214",
+"package": "lib-015",
+"version": "1.4.0",
+"fixed_version": "1.4.1",
+"fixed": [
+"1.4.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-215",
+"package": "lib-070",
+"version": "7.4.0",
+"fixed_version": "7.5.6",
+"fixed": [
+"7.5.6",
+"8.0.2"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-216",
+"package": "lib-042",
+"version": "7.2.3",
+"fixed_version": "10.5.0",
+"fixed": [
+"11.1.0",
+"10.5.0"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-217",
+"package": "lib-015",
+"version": "1.4.0",
+"fixed_version": "1.4.1",
+"fixed": [
+"1.4.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-218",
+"package": "lib-064",
+"version": "1.15.9",
+"fixed_version": "1.16.0",
+"fixed": [
+"1.16.0"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-219",
+"package": "lib-086",
+"version": "2.1.2",
+"fixed_version": "2.1.4",
+"fixed": [
+"3.1.1",
+"2.1.4",
+"1.16.6"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-220",
+"package": "lib-003",
+"version": "4.4.1",
+"fixed_version": "5.7.0",
+"fixed": [
+"5.7.0"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-221",
+"package": "lib-091",
+"version": "4.11.3",
+"fixed_version": "5.5.0",
+"fixed": [
+"5.5.0"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "direct",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-222",
+"package": "lib-002",
+"version": "2.0.1",
+"fixed_version": "2.1.3",
+"fixed": [
+"5.0.8",
+"3.0.3",
+"2.1.3",
+"1.1.17"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "api-223",
+"package": "lib-038",
+"version": "3.0.6",
+"fixed_version": "3.1.9",
+"fixed": [
+"2.4.8",
+"3.1.9",
+"4.2.3"
+],
+"tier": "P3",
+"verdict": "not_loaded",
+"relation": "transitive",
+"scope": "dev",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-224",
+"package": "lib-066",
+"version": "6.2.1",
+"fixed_version": "7.5.3",
+"fixed": [
+"7.5.3"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-225",
+"package": "lib-003",
+"version": "5.4.1",
+"fixed_version": "5.12.0",
+"fixed": [
+"5.12.0"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "api-226",
+"package": "lib-011",
+"version": "1.8.3",
+"fixed_version": "1.15.1",
+"fixed": [
+"1.15.1",
+"0.31.1"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "direct",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-227",
+"package": "lib-012",
+"version": "4.1.0",
+"fixed_version": "4.3.0",
+"fixed": [
+"3.15.0",
+"4.3.0"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "api-228",
+"package": "lib-070",
+"version": "7.4.0",
+"fixed_version": "7.6.1",
+"fixed": [
+"7.6.1",
+"8.4.1"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-229",
+"package": "lib-065",
+"version": "1.4.4-lts.1",
+"fixed_version": "2.1.0",
+"fixed": [
+"2.1.0"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-230",
+"package": "lib-001",
+"version": "7.25.0",
+"fixed_version": "7.29.0",
+"fixed": [
+"6.28.0",
+"7.29.0",
+"8.9.0"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-231",
+"package": "lib-092",
+"version": "3.3.3",
+"fixed_version": "3.4.2",
+"fixed": [
+"3.4.2"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-232",
+"package": "lib-002",
+"version": "1.1.11",
+"fixed_version": "1.1.19",
+"fixed": [
+"5.0.10",
+"3.0.7",
+"2.1.5",
+"1.1.19"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-233",
+"package": "lib-012",
+"version": "3.14.1",
+"fixed_version": "3.15.1",
+"fixed": [
+"4.3.1",
+"3.15.1"
+],
+"tier": "P3",
+"verdict": "not_loaded",
+"relation": "transitive",
+"scope": "dev",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-234",
+"package": "lib-093",
+"version": "13.12.0",
+"fixed_version": "13.15.20",
+"fixed": [
+"13.15.20"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-235",
+"package": "lib-049",
+"version": "4.17.21",
+"fixed_version": "4.18.0",
+"fixed": [
+"4.18.0"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-236",
+"package": "lib-001",
+"version": "7.25.0",
+"fixed_version": "7.28.0",
+"fixed": [
+"6.27.0",
+"7.28.0",
+"8.5.0"
+],
+"tier": "P3",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-237",
+"package": "lib-001",
+"version": "7.25.0",
+"fixed_version": "7.29.1",
+"fixed": [
+"7.29.1",
+"8.10.2"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-238",
+"package": "lib-011",
+"version": "1.8.3",
+"fixed_version": "1.15.2",
+"fixed": [
+"1.15.2",
+"0.31.1"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "direct",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-239",
+"package": "lib-004",
+"version": "9.0.5",
+"fixed_version": "9.0.7",
+"fixed": [
+"10.2.3",
+"9.0.7",
+"8.0.6",
+"7.4.8",
+"6.2.2",
+"5.1.8",
+"4.2.5",
+"3.1.3"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "api-240",
+"package": "lib-038",
+"version": "3.0.6",
+"fixed_version": "3.1.6",
+"fixed": [
+"2.4.5",
+"3.1.6",
+"4.1.3"
+],
+"tier": "P3",
+"verdict": "not_loaded",
+"relation": "transitive",
+"scope": "dev",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-241",
+"package": "lib-001",
+"version": "7.25.0",
+"fixed_version": "7.30.1",
+"fixed": [
+"7.30.1",
+"8.12.2"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-242",
+"package": "lib-073",
+"version": "0.7.4",
+"fixed_version": "0.7.5",
+"fixed": [
+"0.7.5"
+],
+"tier": "P2",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-243",
+"package": "lib-004",
+"version": "9.0.5",
+"fixed_version": "11.0.1",
+"fixed": [
+"11.0.1"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "api-244",
+"package": "lib-004",
+"version": "9.0.5",
+"fixed_version": "9.0.6",
+"fixed": [
+"10.2.1",
+"9.0.6",
+"8.0.5",
+"7.4.7",
+"6.2.1",
+"5.1.7",
+"4.2.4",
+"3.1.3"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "api-245",
+"package": "lib-094",
+"version": "2.4.11",
+"fixed_version": "2.4.12",
+"fixed": [
+"2.4.12"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-246",
+"package": "lib-015",
+"version": "1.4.0",
+"fixed_version": "1.4.1",
+"fixed": [
+"1.4.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-247",
+"package": "lib-066",
+"version": "6.2.1",
+"fixed_version": "7.5.11",
+"fixed": [
+"7.5.11"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-248",
+"package": "lib-015",
+"version": "1.4.0",
+"fixed_version": "1.4.1",
+"fixed": [
+"1.4.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-249",
+"package": "lib-003",
+"version": "5.4.1",
+"fixed_version": "5.7.0",
+"fixed": [
+"5.7.0"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "api-250",
+"package": "lib-083",
+"version": "5.97.1",
+"fixed_version": "5.104.1",
+"fixed": [
+"5.104.1"
+],
+"tier": "P3",
+"verdict": "not_loaded",
+"relation": "transitive",
+"scope": "dev",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-251",
+"package": "lib-001",
+"version": "7.25.0",
+"fixed_version": "7.29.1",
+"fixed": [
+"7.29.1",
+"8.10.2"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-252",
+"package": "lib-038",
+"version": "3.0.6",
+"fixed_version": "3.1.3",
+"fixed": [
+"4.0.1",
+"3.1.3",
+"2.4.2"
+],
+"tier": "P3",
+"verdict": "not_loaded",
+"relation": "transitive",
+"scope": "dev",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-253",
+"package": "lib-066",
+"version": "6.2.1",
+"fixed_version": "7.5.18",
+"fixed": [
+"7.5.18"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-254",
+"package": "lib-015",
+"version": "1.4.0",
+"fixed_version": "1.4.3",
+"fixed": [
+"1.4.3"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "api-255",
+"package": "lib-027",
+"version": "8.3.2",
+"fixed_version": "11.1.1",
+"fixed": [
+"12.0.1",
+"13.0.1",
+"11.1.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-256",
+"package": "lib-008",
+"version": "2.3.1",
+"fixed_version": "2.3.2",
+"fixed": [
+"4.0.4",
+"3.0.2",
+"2.3.2"
+],
+"tier": "P3",
+"verdict": "not_loaded",
+"relation": "transitive",
+"scope": "dev",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-257",
+"package": "lib-009",
+"version": "3.24.2",
+"fixed_version": "4.6.6",
+"fixed": [
+"4.6.6"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "direct",
+"scope": "runtime",
+"manifest": "package.json"
+},
+{
+"id": "api-258",
+"package": "lib-026",
+"version": "4.0.2",
+"fixed_version": "4.0.4",
+"fixed": [
+"8.0.3",
+"5.2.2",
+"4.0.4",
+"3.5.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-259",
+"package": "lib-015",
+"version": "1.4.0",
+"fixed_version": "1.4.1",
+"fixed": [
+"1.4.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-260",
+"package": "lib-015",
+"version": "1.4.0",
+"fixed_version": "1.4.3",
+"fixed": [
+"1.4.3"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "api-261",
+"package": "lib-003",
+"version": "4.4.1",
+"fixed_version": "4.5.4",
+"fixed": [
+"5.3.8",
+"4.5.4"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "dev",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-262",
+"package": "lib-070",
+"version": "7.4.0",
+"fixed_version": "7.5.6",
+"fixed": [
+"7.5.6",
+"8.0.2"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-263",
+"package": "lib-002",
+"version": "1.1.11",
+"fixed_version": "1.1.20",
+"fixed": [
+"5.0.11",
+"3.0.8",
+"2.1.6",
+"1.1.20"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-264",
+"package": "lib-001",
+"version": "7.25.0",
+"fixed_version": "7.29.0",
+"fixed": [
+"7.29.0",
+"8.9.0"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-265",
+"package": "lib-013",
+"version": "9.0.5",
+"fixed_version": "10.7.1",
+"fixed": [
+"10.7.1"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-266",
+"package": "lib-080",
+"version": "4.5.0",
+"fixed_version": "4.18.0",
+"fixed": [
+"4.18.0"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-267",
+"package": "lib-074",
+"version": "6.0.2",
+"fixed_version": "7.0.5",
+"fixed": [
+"7.0.5"
+],
+"tier": "P3",
+"verdict": "not_loaded",
+"relation": "transitive",
+"scope": "dev",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-268",
+"package": "lib-070",
+"version": "7.4.0",
+"fixed_version": "7.5.6",
+"fixed": [
+"7.5.6",
+"8.0.2"
+],
+"tier": "P1",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-269",
+"package": "lib-002",
+"version": "2.0.1",
+"fixed_version": "2.1.7",
+"fixed": [
+"5.0.12",
+"3.0.9",
+"2.1.7",
+"1.1.21"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "api-270",
+"package": "lib-084",
+"version": "3.2.2",
+"fixed_version": "3.2.3",
+"fixed": [
+"3.2.3",
+"4.0.1"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-271",
+"package": "lib-013",
+"version": "9.0.5",
+"fixed_version": "10.1.1",
+"fixed": [
+"10.1.1"
+],
+"tier": "P2",
+"verdict": "unknown",
+"relation": "transitive",
+"scope": "runtime",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-272",
+"package": "lib-038",
+"version": "3.0.6",
+"fixed_version": "3.1.9",
+"fixed": [
+"2.4.8",
+"3.1.9",
+"4.2.3"
+],
+"tier": "P3",
+"verdict": "not_loaded",
+"relation": "transitive",
+"scope": "dev",
+"manifest": "pnpm-lock.yaml"
+},
+{
+"id": "api-273",
+"package": "lib-042",
+"version": "10.4.5",
+"fixed_version": "14.0.2",
+"fixed": [
+"14.0.2"
+],
+"tier": "P3",
+"verdict": "not_reachable",
+"relation": "unknown",
+"scope": "unknown",
+"manifest": "sbom"
+},
+{
+"id": "api-274",
+"package": "lib-012",
+"version": "3.14.1",
+"fixed_version": "3.15.0",
+"fixed": [
+"4.2.0",
+"3.15.0"
+],
+"tier": "P3",
+"verdict": "not_loaded",
+"relation": "transitive",
+"scope": "dev",
+"manifest": "pnpm-lock.yaml"
+}
+]
+}
