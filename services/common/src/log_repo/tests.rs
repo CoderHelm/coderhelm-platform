@@ -350,7 +350,8 @@ async fn with_no_evidence_a_name_alone_is_never_sure() {
     let r = resolve(&env, &inp, t(NOW)).await;
     assert_eq!(r.repo.as_deref(), Some("acme/render-worker"));
     assert!(r.confidence <= Confidence::Medium);
-    assert!(r.decided_by.is_empty());
+    // The name is shown as what it is, and only that.
+    assert!(r.decided_by.iter().all(|e| e.kind == Kind::ServiceName));
 
     // The model finds nothing: no repo.
     let env = Fake::new(AwsFacts::default(), |_| {
@@ -375,6 +376,120 @@ async fn a_name_pick_over_direct_evidence_is_low() {
     let r = resolve(&env, &inp, t(NOW)).await;
     assert_eq!(r.confidence, Confidence::Low);
     assert_eq!(r.candidates[1].repo, "acme/render-service");
+}
+
+#[test]
+fn log_groups_of_one_service_are_told_apart_from_lookalikes() {
+    assert!(same_service(
+        "/ecs/prod-ledger-api",
+        "/ecs/prod-ledger-api-worker"
+    ));
+    assert!(same_service(
+        "/ecs/prod-ledger-api-worker",
+        "/ecs/prod-ledger-api"
+    ));
+    // Another path, another service, or a mere resemblance: not siblings.
+    assert!(!same_service(
+        "/ecs/prod-ledger-api",
+        "/aws/lambda/prod-ledger-api-worker"
+    ));
+    assert!(!same_service(
+        "/ecs/prod-ledger-api",
+        "/ecs/prod-ledger-apis"
+    ));
+    assert!(!same_service(
+        "/ecs/prod-ledger-api",
+        "/ecs/prod-ledger-web"
+    ));
+    assert!(!same_service("/ecs/prod", "/ecs/prod-ledger"));
+    assert!(!same_service(
+        "/ecs/prod-ledger-api",
+        "/ecs/prod-ledger-api"
+    ));
+    assert_eq!(service_name("/ecs/prod-ledger-api"), "ledger-api");
+    assert_eq!(service_name("/aws/lambda/billing-staging"), "billing");
+    assert_eq!(service_name("/ecs/web"), "web");
+}
+
+#[tokio::test]
+async fn a_saved_sibling_of_the_same_service_decides_without_asking() {
+    // The model is cautious ("medium"), as it was on the real install, and
+    // a CLI repo's code names the log group: the sibling decides anyway.
+    let mut env = Fake::new(
+        AwsFacts::default(),
+        answer(
+            "acme/ledger-api",
+            "medium",
+            "The sibling worker log group is saved to ledger-api",
+        ),
+    );
+    env.hits.insert(
+        "/ecs/prod-ledger-api".into(),
+        vec![SearchHit {
+            repo: "acme/ops-cli".into(),
+            path: "src/tail.ts".into(),
+            fragments: vec!["'/ecs/prod-ledger-api'".into()],
+        }],
+    );
+    let mut inp = input(
+        "/ecs/prod-ledger-api",
+        &["acme/ledger-api", "acme/infra-live", "acme/ops-cli"],
+    );
+    inp.related = vec![(
+        "/ecs/prod-ledger-api-worker".into(),
+        "acme/ledger-api".into(),
+    )];
+    let r = resolve(&env, &inp, t(NOW)).await;
+    assert_eq!(r.repo.as_deref(), Some("acme/ledger-api"));
+    assert_eq!(r.confidence, Confidence::High);
+    assert!(r.is_sure());
+    let p = env.prompts.lock().unwrap()[0].clone();
+    assert!(p.contains("[sibling] (acme/ledger-api)"), "{p}");
+
+    // Two siblings saved to different repos: genuinely split, a person
+    // checks.
+    let env = Fake::new(
+        AwsFacts::default(),
+        answer("acme/ledger-api", "medium", "The worker sibling"),
+    );
+    inp.related
+        .push(("/ecs/prod-ledger-api-cron".into(), "acme/infra-live".into()));
+    let r = resolve(&env, &inp, t(NOW)).await;
+    assert!(!r.is_sure(), "{r:?}");
+}
+
+#[test]
+fn decisive_needs_strength_or_agreement_with_no_rival() {
+    let e = |kind: Kind, repo: &str| Evidence {
+        id: "E1".into(),
+        kind,
+        repo: repo.into(),
+        detail: String::new(),
+    };
+    // A name alone, or a name against code elsewhere: not decisive.
+    assert!(!decisive("a/x", &[e(Kind::ServiceName, "a/x")]));
+    assert!(!decisive(
+        "a/x",
+        &[
+            e(Kind::ServiceName, "a/x"),
+            e(Kind::Code, "a/x"),
+            e(Kind::Code, "a/y")
+        ]
+    ));
+    // The name and the code agree, nothing else: decisive.
+    assert!(decisive(
+        "a/x",
+        &[e(Kind::ServiceName, "a/x"), e(Kind::Code, "a/x")]
+    ));
+    // A tag beats a code mention elsewhere, not another tag.
+    assert!(decisive(
+        "a/x",
+        &[e(Kind::ResourceTag, "a/x"), e(Kind::Code, "a/y")]
+    ));
+    assert!(!decisive(
+        "a/x",
+        &[e(Kind::ResourceTag, "a/x"), e(Kind::ResourceTag, "a/y")]
+    ));
 }
 
 #[tokio::test]

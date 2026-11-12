@@ -213,6 +213,11 @@ pub struct Finding {
     pub daily_lines: Vec<Counted>,
     /// When it was last resolved before its latest reopen (empty if never).
     pub last_resolved_at: String,
+    /// The incident it is part of ([`crate::log_incident`]): findings with
+    /// one cause share one id, one card and one fix.
+    pub incident_id: String,
+    /// That incident as the page shows it (JSON), empty until worked out.
+    pub incident: String,
 }
 
 impl Finding {
@@ -274,6 +279,8 @@ impl Finding {
             quiet_days: n(item, "quiet_days"),
             daily_lines: counted(item, "daily_lines", "day"),
             last_resolved_at: s(item, "last_resolved_at"),
+            incident_id: s(item, "incident_id"),
+            incident: s(item, "incident"),
         })
     }
 
@@ -330,7 +337,7 @@ impl Finding {
 
 /// When a time string parses (RFC 3339, or the analyzer's
 /// "YYYY-MM-DD HH:MM:SS[.f]" in UTC).
-fn parse_time(v: &str) -> Option<DateTime<Utc>> {
+pub(crate) fn parse_time(v: &str) -> Option<DateTime<Utc>> {
     let v = v.trim();
     if v.is_empty() {
         return None;
@@ -676,6 +683,73 @@ pub struct GroupOverride {
     /// Its own minimum severity; `None` follows the team.
     #[serde(default)]
     pub min_severity: Option<Severity>,
+    /// Set when CoderHelm saved `repo` itself from decisive evidence
+    /// ([`with_learned`]); a person changing the repo clears it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub learned: Option<Learned>,
+}
+
+/// Why and when CoderHelm saved a log group's repo itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct Learned {
+    /// The evidence, in a sentence a person reads.
+    pub reason: String,
+    pub at: String,
+}
+
+/// Pure: the setting with `repo` saved for `log_group` as learned, when no
+/// repo is saved for it yet (a person's choice is never replaced). None when
+/// nothing changes.
+pub fn with_learned(
+    cfg: &AutoFix,
+    log_group: &str,
+    repo: &str,
+    reason: &str,
+    now: DateTime<Utc>,
+) -> Option<AutoFix> {
+    if !valid_log_group(log_group) || !valid_repo(repo) {
+        return None;
+    }
+    let learned = Some(Learned {
+        reason: crate::truncate_str(reason.trim(), 300).to_string(),
+        at: now.to_rfc3339(),
+    });
+    let mut out = cfg.clone();
+    match out.overrides.iter_mut().find(|o| o.log_group == log_group) {
+        Some(o) if !o.repo.is_empty() => return None,
+        Some(o) => {
+            o.repo = repo.to_string();
+            o.learned = learned;
+        }
+        None => {
+            if out.overrides.len() >= MAX_OVERRIDES {
+                return None;
+            }
+            out.overrides.push(GroupOverride {
+                log_group: log_group.to_string(),
+                repo: repo.to_string(),
+                learned,
+                ..Default::default()
+            });
+        }
+    }
+    Some(out)
+}
+
+/// Pure: the setting a person saved, with `learned` kept only on log groups
+/// whose repo they left as CoderHelm saved it.
+pub fn keep_learned(before: &AutoFix, mut sent: AutoFix) -> AutoFix {
+    for o in &mut sent.overrides {
+        let was = before
+            .overrides
+            .iter()
+            .find(|b| b.log_group == o.log_group && b.learned.is_some());
+        o.learned = match was {
+            Some(b) if b.repo == o.repo && !o.repo.is_empty() => b.learned.clone(),
+            _ => None,
+        };
+    }
+    sent
 }
 
 /// The team's automatic-fix setting. Off unless a person turns it on.
@@ -825,6 +899,15 @@ pub enum Skip {
     Budget(String),
     /// Nothing could be sent (no GitHub installation, a queue error).
     CouldNotStart(String),
+    /// Part of an incident another finding leads: one fix covers both. The
+    /// lead's title.
+    InIncident(String),
+    /// The incident stopped on its own; nothing to change. When it stopped.
+    Recovered(String),
+    /// What only a person can do for the incident, said once on its card.
+    ForAPerson(String),
+    /// AWS's side and still happening: tried again next sweep.
+    Watching,
 }
 
 impl Skip {
@@ -849,6 +932,11 @@ impl Skip {
             Skip::Budget(why) if why.is_empty() => "the team's token limit was reached".into(),
             Skip::Budget(why) => format!("the team's token limit was reached ({why})"),
             Skip::CouldNotStart(why) => format!("could not start ({why})"),
+            Skip::InIncident(lead) => format!("same cause as \"{lead}\"; one fix covers both"),
+            Skip::Recovered(at) if at.is_empty() => "stopped on its own; nothing to change".into(),
+            Skip::Recovered(at) => format!("stopped on its own at {at}; nothing to change"),
+            Skip::ForAPerson(why) => why.clone(),
+            Skip::Watching => "on AWS's side; watching until it recovers".into(),
         }
     }
 
@@ -859,7 +947,7 @@ impl Skip {
 
     /// `waiting` (tried again later) or `skipped` (left for a person).
     pub fn auto_status(&self) -> &'static str {
-        if matches!(self, Skip::QuietHours) {
+        if matches!(self, Skip::QuietHours | Skip::Watching) {
             "waiting"
         } else {
             "skipped"
@@ -1011,7 +1099,17 @@ pub async fn start(
         ticket_id: tid,
         repo: repo.to_string(),
         title: crate::truncate_str(&format!("Fix: {}", f.title), 200).to_string(),
-        body: ticket_body(f, &starter, samples),
+        body: {
+            // The incident's diagnosis, when one was worked out, so the run
+            // changes what the diagnosis found.
+            let note = crate::log_incident::stored_note(f);
+            let body = ticket_body(f, &starter, samples);
+            if note.is_empty() {
+                body
+            } else {
+                format!("{body}\n\n{note}")
+            }
+        },
         starter,
     };
     if let Err(e) = env.send(team_id, &st).await {
@@ -1378,6 +1476,164 @@ pub async fn record_skip(
         .expression_attribute_values(":s", attr(skip.auto_status()))
         .expression_attribute_values(":r", attr(&skip.reason()))
         .expression_attribute_values(":t", attr(&now.to_rfc3339()))
+        .send()
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// Save `repo` for `log_group` as learned ([`with_learned`]), unless a repo
+/// is saved for it by then. The setting is replaced only if nobody changed it
+/// since it was read. Ok(true) when it was saved.
+pub async fn learn_mapping(
+    dynamo: &DynamoClient,
+    settings_table: &str,
+    team_id: &str,
+    log_group: &str,
+    repo: &str,
+    reason: &str,
+    now: DateTime<Utc>,
+) -> Result<bool, String> {
+    for _ in 0..3 {
+        let got = dynamo
+            .get_item()
+            .table_name(settings_table)
+            .key("pk", attr(team_id))
+            .key("sk", attr(AUTOFIX_SK))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        let Some(item) = got.item() else {
+            return Ok(false);
+        };
+        let old = s(item, "config");
+        let cfg = AutoFix::from_item(Some(item));
+        let Some(next) = with_learned(&cfg, log_group, repo, reason, now) else {
+            return Ok(false);
+        };
+        let config = serde_json::to_string(&next).map_err(|e| e.to_string())?;
+        match dynamo
+            .update_item()
+            .table_name(settings_table)
+            .key("pk", attr(team_id))
+            .key("sk", attr(AUTOFIX_SK))
+            .update_expression("SET config = :c, learned_at = :t")
+            .condition_expression("config = :old")
+            .expression_attribute_values(":c", attr(&config))
+            .expression_attribute_values(":old", attr(&old))
+            .expression_attribute_values(":t", attr(&now.to_rfc3339()))
+            .send()
+            .await
+        {
+            Ok(_) => return Ok(true),
+            Err(e)
+                if e.as_service_error()
+                    .is_some_and(|se| se.is_conditional_check_failed_exception()) =>
+            {
+                continue
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Ok(false)
+}
+
+const REPO_ASK_PREFIX: &str = "LOG_REPO_ASK#";
+/// How long one "which repo?" question stands for a log group.
+pub const REPO_ASK_SECS: i64 = 7 * 86_400;
+
+/// Hold the one "which repo?" question for a log group: false when it was
+/// already asked within [`REPO_ASK_SECS`], so findings after the first don't
+/// ask again.
+pub async fn claim_repo_ask(
+    dynamo: &DynamoClient,
+    settings_table: &str,
+    team_id: &str,
+    account: &str,
+    log_group: &str,
+    now: DateTime<Utc>,
+) -> bool {
+    let key = format!(
+        "{REPO_ASK_PREFIX}{}",
+        &crate::sha256_hex(&[account, log_group])[..32]
+    );
+    claim_once(dynamo, settings_table, team_id, &key, REPO_ASK_SECS, now).await
+}
+
+/// Settings-table key prefix of an incident card posted.
+pub const INCIDENT_CARD_PREFIX: &str = "LOG_INCIDENT_CARD#";
+
+/// Hold one card per incident and outcome (`recovered`, `person`, …), so
+/// later sweeps and findings that join it don't post again.
+pub async fn claim_incident_card(
+    dynamo: &DynamoClient,
+    settings_table: &str,
+    team_id: &str,
+    incident_id: &str,
+    outcome: &str,
+    now: DateTime<Utc>,
+) -> bool {
+    let key = format!("{INCIDENT_CARD_PREFIX}{incident_id}#{outcome}");
+    claim_once(dynamo, settings_table, team_id, &key, 30 * 86_400, now).await
+}
+
+/// Write `key` once for `secs`: false when it is already there. A write
+/// that fails for another reason answers true (better a second card than
+/// none).
+async fn claim_once(
+    dynamo: &DynamoClient,
+    settings_table: &str,
+    team_id: &str,
+    key: &str,
+    secs: i64,
+    now: DateTime<Utc>,
+) -> bool {
+    let ttl = now.timestamp() + secs;
+    match dynamo
+        .put_item()
+        .table_name(settings_table)
+        .item("pk", attr(team_id))
+        .item("sk", attr(key))
+        .item("at", attr(&now.to_rfc3339()))
+        .item("ttl", AttributeValue::N(ttl.to_string()))
+        .condition_expression("attribute_not_exists(pk) OR #ttl < :now")
+        .expression_attribute_names("#ttl", "ttl")
+        .expression_attribute_values(":now", AttributeValue::N(now.timestamp().to_string()))
+        .send()
+        .await
+    {
+        Ok(_) => true,
+        Err(e) => {
+            if e.as_service_error()
+                .is_some_and(|se| se.is_conditional_check_failed_exception())
+            {
+                return false;
+            }
+            tracing::warn!(error = %e, key, "Could not record a one-time claim; going ahead");
+            true
+        }
+    }
+}
+
+/// Store the incident a finding belongs to (its id and the incident as the
+/// page shows it) on the finding.
+pub async fn record_incident(
+    dynamo: &DynamoClient,
+    insights_table: &str,
+    team_id: &str,
+    rec_id: &str,
+    incident_id: &str,
+    incident: &serde_json::Value,
+) -> Result<(), String> {
+    dynamo
+        .update_item()
+        .table_name(insights_table)
+        .key("pk", attr(team_id))
+        .key("sk", attr(&format!("{REC_PREFIX}{rec_id}")))
+        .update_expression("SET incident_id = :i, incident = :d")
+        .condition_expression("attribute_exists(pk)")
+        .expression_attribute_values(":i", attr(incident_id))
+        .expression_attribute_values(":d", attr(&incident.to_string()))
         .send()
         .await
         .map(|_| ())
@@ -1796,6 +2052,33 @@ pub fn fix_message(
     }
     if let Some(seen) = f.and_then(seen_words) {
         facts.push(("Seen".into(), seen));
+    }
+    // The incident the fix is for: its cause, the other findings it covers
+    // and what is left outside the change.
+    if let Some(inc) = f.and_then(crate::log_incident::stored) {
+        let d = &inc.diagnosis;
+        if d.place != crate::log_incident::Place::Code || inc.members.len() > 1 {
+            if !d.summary.trim().is_empty() {
+                facts.push((
+                    "Cause".into(),
+                    crate::truncate_str(d.summary.trim(), 400).replace('\n', " "),
+                ));
+            }
+            if inc.members.len() > 1 {
+                let titles: Vec<String> = inc
+                    .members
+                    .iter()
+                    .map(|m| crate::truncate_str(m.title.trim(), 120).replace('\n', " "))
+                    .collect();
+                facts.push((
+                    format!("{} findings, one cause", inc.members.len()),
+                    titles.join("; "),
+                ));
+            }
+            if !d.steps.is_empty() {
+                facts.push(("Also needed".into(), d.steps.join(" ")));
+            }
+        }
     }
     facts.push((
         "Pull request".into(),
@@ -3320,6 +3603,90 @@ mod tests {
         assert_eq!(console_url("us-east-1", "bad group"), None);
         assert!(valid_repo("acme/shop.web") && !valid_repo("acme/..") && !valid_repo("/shop"));
         assert_eq!(daily_sk(t(NOW)), "LOG_AUTOFIX_RUNS#2026-10-21");
+    }
+}
+
+#[cfg(test)]
+mod learned_tests {
+    use super::*;
+
+    fn t(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    #[test]
+    fn a_learned_repo_fills_an_empty_group_and_never_replaces_a_persons() {
+        let now = t("2026-11-12T05:30:00Z");
+        let cfg = AutoFix {
+            enabled: true,
+            overrides: vec![
+                GroupOverride {
+                    log_group: "/ecs/prod-ledger-api-worker".into(),
+                    repo: "acme/ledger-api".into(),
+                    ..Default::default()
+                },
+                GroupOverride {
+                    log_group: "/ecs/prod-ledger-cron".into(),
+                    auto: Some(false),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let next = with_learned(
+            &cfg,
+            "/ecs/prod-ledger-api",
+            "acme/ledger-api",
+            "The worker sibling is saved there.",
+            now,
+        )
+        .expect("saved");
+        let o = next
+            .overrides
+            .iter()
+            .find(|o| o.log_group == "/ecs/prod-ledger-api")
+            .unwrap();
+        assert_eq!(o.repo, "acme/ledger-api");
+        assert_eq!(
+            o.learned.as_ref().unwrap().reason,
+            "The worker sibling is saved there."
+        );
+        assert_eq!(
+            next.policy("/ecs/prod-ledger-api").repo.as_deref(),
+            Some("acme/ledger-api")
+        );
+        // A group with its own rules but no repo gets the repo, rules kept.
+        let next =
+            with_learned(&cfg, "/ecs/prod-ledger-cron", "acme/ledger-api", "x", now).unwrap();
+        let o = next
+            .overrides
+            .iter()
+            .find(|o| o.log_group == "/ecs/prod-ledger-cron")
+            .unwrap();
+        assert_eq!((o.repo.as_str(), o.auto), ("acme/ledger-api", Some(false)));
+        // A person's choice stands.
+        assert_eq!(
+            with_learned(&cfg, "/ecs/prod-ledger-api-worker", "acme/other", "x", now),
+            None
+        );
+        // It survives the setting's round trip.
+        let json = serde_json::to_string(&next).unwrap();
+        let back: AutoFix = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, next);
+    }
+
+    #[test]
+    fn a_person_changing_a_learned_repo_makes_it_theirs() {
+        let now = t("2026-11-12T05:30:00Z");
+        let before = with_learned(&AutoFix::default(), "/ecs/a", "acme/a", "why", now).unwrap();
+        // Sent back unchanged (the page doesn't send `learned`): kept.
+        let mut sent = before.clone();
+        sent.overrides[0].learned = None;
+        let kept = keep_learned(&before, sent.clone());
+        assert!(kept.overrides[0].learned.is_some());
+        // A different repo: a person's choice now.
+        sent.overrides[0].repo = "acme/b".into();
+        assert!(keep_learned(&before, sent).overrides[0].learned.is_none());
     }
 }
 

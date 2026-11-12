@@ -163,6 +163,16 @@ pub fn finding_json(
         "resolves_at": f.resolves_at(),
         "resolved_at": (!f.resolved_at.is_empty()).then_some(&f.resolved_at),
         "resolved_reason": (!f.resolved_reason.is_empty()).then_some(&f.resolved_reason),
+        // The incident it is part of (one cause, one card, one fix) and
+        // what CoderHelm found and did about it.
+        "incident_id": (!f.incident_id.is_empty()).then_some(&f.incident_id),
+        "incident": serde_json::from_str::<Value>(&f.incident).ok(),
+        // A repo CoderHelm saved for the log group itself, and why.
+        "repo_learned": cfg
+            .overrides
+            .iter()
+            .find(|o| o.log_group == f.source_log_group)
+            .and_then(|o| o.learned.as_ref()),
     })
 }
 
@@ -655,7 +665,10 @@ pub async fn create_fix(
             .iter_mut()
             .find(|o| o.log_group == f.source_log_group)
         {
-            Some(o) => o.repo = repo.clone(),
+            Some(o) => {
+                o.repo = repo.clone();
+                o.learned = None;
+            }
             None => cfg.overrides.push(lf::GroupOverride {
                 log_group: f.source_log_group.clone(),
                 repo: repo.clone(),
@@ -893,7 +906,8 @@ pub async fn put_autofix(
     let prior = lf::load_autofix(&state.dynamo, &state.config.settings_table_name, team)
         .await
         .map_err(|e| internal("Could not read the automatic-fix setting", e))?;
-    let cfg = next_autofix(sent, &prior, &Utc::now().to_rfc3339());
+    // A learned repo stays marked learned only while the person leaves it.
+    let cfg = lf::keep_learned(&prior, next_autofix(sent, &prior, &Utc::now().to_rfc3339()));
     cfg.validate()
         .map_err(|m| fail(StatusCode::BAD_REQUEST, "invalid", &m))?;
     for repo in cfg
