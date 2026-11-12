@@ -6,7 +6,7 @@
 //
 //   npm test   (compiles with tsc, then runs node --test)
 
-import { plainStatements } from "../lib/own-account-read";
+import { OWN_OPTIONS, plainStatements } from "../lib/own-account-read";
 import { test } from "node:test";
 import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
@@ -15,7 +15,7 @@ import * as path from "node:path";
 import * as cdk from "aws-cdk-lib";
 import { buildApp } from "../lib/app";
 import { resolveConfig, ResolvedConfig, CoderhelmConfig } from "../lib/config";
-import { AccessNames, accessNames, boundaryPolicy, BOUNDARY_SERVICES, LOG_ANALYZER_ROLE, OWN_READ_ROLES, READ_ROLE_CALLERS, RUNTIME_ROLE_TAG, RUNTIME_ROLES, deployPolicy, INSTALL_TAG, PolicyDocument, Statement, WINDOW_EXPIRES, WINDOW_USER_ID, windowPolicy, windowPolicyParts } from "../lib/access";
+import { AccessNames, accessNames, boundaryPolicy, BOUNDARY_OPTION_READS, BOUNDARY_SERVICES, LOG_ANALYZER_ROLE, OWN_READ_ROLES, READ_ROLE_CALLERS, RUNTIME_ROLE_TAG, RUNTIME_ROLES, deployPolicy, INSTALL_TAG, PolicyDocument, Statement, WINDOW_EXPIRES, WINDOW_USER_ID, windowPolicy, windowPolicyParts } from "../lib/access";
 import { allowed, glob, list, Request } from "./iam-eval";
 import { installName } from "../lib/hardening";
 import { buildSpecSha256, canonicalJson, updateBuildSpecObject, UPDATE_BUILD_VARIABLES } from "../lib/updates-stack";
@@ -214,6 +214,47 @@ test("boundary: allows every action every synthesized CoderHelm role is given", 
     }
   }
   assert.deepEqual([...missing], [], "actions the boundary would silently refuse");
+});
+
+test("boundary: the reads named for one switch serve only that switch's statements, so the updater may skip them while it is off", () => {
+  const stacks = hardened();
+  // Each statement with the switch whose condition guards it (null: always given).
+  const conds: Record<string, string> = Object.fromEntries(OWN_OPTIONS.flatMap((o) => [[o.own, o.parameter], [o.condition, o.parameter]]));
+  const tagged = (statements: unknown, use: string | null = null): { s: any; use: string | null }[] =>
+    (Array.isArray(statements) ? statements : [statements]).flatMap((s: any) => {
+      if (s && typeof s === "object" && Array.isArray(s["Fn::If"])) {
+        const [name, yes, no] = s["Fn::If"];
+        const u = conds[name] ?? use;
+        return [...tagged(yes, u), ...tagged(no, use)];
+      }
+      if (!s || (typeof s === "object" && s.Ref === "AWS::NoValue")) return [];
+      return [{ s, use }];
+    });
+  const served: Record<string, Set<string>> = {};
+  for (const t of Object.values(stacks)) {
+    for (const r of Object.values<any>(t.Resources ?? {})) {
+      const docs = r.Type === "AWS::IAM::Role" ? (r.Properties.Policies ?? []).map((p: any) => p.PolicyDocument) : r.Type === "AWS::IAM::Policy" || r.Type === "AWS::IAM::ManagedPolicy" ? [r.Properties.PolicyDocument] : [];
+      if (r.Properties?.ManagedPolicyName === n.boundaryName) continue;
+      for (const d of docs) for (const { s, use } of tagged(d.Statement)) {
+        if (s.Effect !== "Allow") continue;
+        for (const a of list(s.Action)) {
+          for (const [opt, pats] of Object.entries(BOUNDARY_OPTION_READS)) {
+            if (!(pats as readonly string[]).some((p) => glob(p, a, true))) continue;
+            // Another boundary statement (not a switch's read) that allows it too keeps it allowed with the switch's reads off.
+            const elsewhere = BOUNDARY.Statement.some((b) => b.Effect === "Allow" && list(b.Action).some((x) => !Object.values(BOUNDARY_OPTION_READS).flat().includes(x as any) && (glob(x, a, true) || glob(a, x, true))));
+            if (!elsewhere) (served[a] ??= new Set()).add(use === opt ? opt : `${use ?? "always"} (not ${opt})`);
+          }
+        }
+      }
+    }
+  }
+  const wrong = Object.entries(served).filter(([, uses]) => [...uses].some((u) => u.includes("(not "))).map(([a, uses]) => `${a}: ${[...uses].join(", ")}`);
+  assert.deepEqual(wrong, [], "an action outside the switch needs one of its reads: name it in BOUNDARY_SERVICES itself");
+  // Each switch's reads are used by its statements, and all are in the boundary.
+  for (const [opt, pats] of Object.entries(BOUNDARY_OPTION_READS)) {
+    assert.ok(Object.values(served).some((u) => u.has(opt)), `${opt}'s statements use its reads`);
+    for (const p of pats) assert.ok(BOUNDARY_SERVICES.includes(p), p);
+  }
 });
 
 // ── The deploy role ──────────────────────────────────────────────────────
