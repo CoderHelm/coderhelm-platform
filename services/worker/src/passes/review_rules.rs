@@ -2,7 +2,7 @@
 //! because of it whatever the model called them.
 //!
 //! The verdict is a function of the findings and the team's policy, never the
-//! model's free choice. Three kinds of finding block by rule ([`mandatory`]),
+//! model's free choice. Four kinds of finding block by rule ([`mandatory`]),
 //! and no later step can make them a note (a critic, the team's calibration,
 //! the late-blocker rule, a second look at the same commit, the stop judge):
 //!
@@ -20,6 +20,13 @@
 //!   system validates or depends on (a signed header, auth, payments, data
 //!   writes, a public contract, a deploy step) and no test, check or lookup
 //!   shows it holds.
+//! - **A possible break of the change's main path, unchecked**: the finding
+//!   is about code every request or run of the change goes through
+//!   (`main_path`), and neither the reviewer nor the PR's own verification
+//!   settled it (no `proof`). It blocks as "needs a check" naming the check
+//!   that settles it ([`main_path_unchecked`]); a check that shows it
+//!   harmless makes it a note, one that shows it wrong makes it a defect.
+//!   "Not verified" is never the last word on a main-path risk.
 //!
 //! The misses behind it: a new hash for the header a CDN signs uploads with,
 //! in a repository that requires tests, was approved with the missing test
@@ -40,6 +47,9 @@ pub const REQUIRED_WHY: &str = "a rule this repository requires is broken";
 pub const FAILING_CHECK_WHY: &str = "a check fails on this commit";
 /// Why a critical path without proof blocks.
 pub const CRITICAL_WHY: &str = "a critical-path change with no test or proof";
+/// Why a possible break of the change's main path, unchecked, blocks.
+pub const MAIN_PATH_WHY: &str =
+    "a possible break of the change's main path that nothing has checked";
 
 /// Hidden in a posted comment for a required rule: only a fix (or a person
 /// resolving the thread) settles it, never an answer.
@@ -473,6 +483,64 @@ pub fn critical_unproven(f: &Finding) -> bool {
             .any(|c| f.category.trim().eq_ignore_ascii_case(c))
 }
 
+/// Categories a main-path risk can't be: a preference, a request for a test
+/// (judged by the tests rule), or a by-hand test suggestion.
+const NOT_MAIN_PATH: &[&str] = &[
+    "style",
+    "nit",
+    "naming",
+    "formatting",
+    "docs",
+    "documentation",
+    "logging",
+    "log-level",
+    "convention",
+    "manual-check",
+    "tests",
+    "test",
+    "test-coverage",
+    "coverage",
+    "question",
+];
+
+/// Proof that says nothing settled a main-path risk. Unlike a critical path,
+/// a run by hand that the PR reports (the exact path, once, against the real
+/// system) settles it: that is the check such a finding asks for.
+fn nothing_settled(proof: Option<&str>) -> bool {
+    let Some(p) = proof.map(|p| p.trim().to_ascii_lowercase()) else {
+        return true;
+    };
+    p.is_empty()
+        || ["none", "no", "n/a", "na", "nothing", "-"].contains(&p.as_str())
+        || p.starts_with("no ")
+        || p.starts_with("none ")
+        || p.starts_with("nothing ")
+}
+
+/// The finding is a possible break of the change's main path and nothing
+/// settled it: no proof from the reviewer's checks or the PR's own.
+pub fn main_path_unchecked(f: &Finding) -> bool {
+    f.main_path.as_deref().is_some_and(|m| !m.trim().is_empty())
+        && nothing_settled(f.proof.as_deref())
+        && !f.file.trim().is_empty()
+        && f.evidence() != super::review_agent::Evidence::Question
+        && !NOT_MAIN_PATH
+            .iter()
+            .any(|c| f.category.trim().eq_ignore_ascii_case(c))
+}
+
+/// The check that settles an unchecked main-path risk: the one the
+/// finding names, or a run of the path it hits.
+pub fn settling_check(f: &Finding) -> String {
+    match f.check.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
+        Some(c) => c.trim_end_matches('.').to_string(),
+        None => format!(
+            "make one real call on that path ({}) and paste the result in the PR",
+            f.main_path.as_deref().unwrap_or("the changed path").trim()
+        ),
+    }
+}
+
 /// Why the finding blocks by rule, if it does. Nothing downstream can make
 /// such a finding a note; only the PR's change can (a fix, or the thread a
 /// person resolves).
@@ -492,6 +560,9 @@ pub fn mandatory(f: &Finding) -> Option<&'static str> {
     if critical_unproven(f) {
         return Some(CRITICAL_WHY);
     }
+    if main_path_unchecked(f) {
+        return Some(MAIN_PATH_WHY);
+    }
     None
 }
 
@@ -503,6 +574,10 @@ pub fn mandatory_label(f: &Finding) -> Option<String> {
         }
         REQUIRED_WHY => "Blocking (required rule)".to_string(),
         FAILING_CHECK_WHY => "Blocking (failing check)".to_string(),
+        MAIN_PATH_WHY if f.evidence() == super::review_agent::Evidence::VerifiedDefect => {
+            "Blocking (main path)".to_string()
+        }
+        MAIN_PATH_WHY => "Blocking (needs a check)".to_string(),
         _ => "Blocking (critical path, no proof)".to_string(),
     })
 }

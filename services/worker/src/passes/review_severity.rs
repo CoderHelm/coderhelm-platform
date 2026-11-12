@@ -9,11 +9,17 @@
 //!
 //! - **Should fix**: a written team rule not marked required, or a problem
 //!   outside the three blocking kinds (a missing test where tests aren't
-//!   required);
+//!   required, whatever `optional` the model gave it);
 //! - **Suggestion**: an optional improvement, hardening or a refactor;
 //! - **Nit** and **FYI** (suggestion tier): a style, naming or layout
-//!   preference; a question, a concern resting on state nobody could check,
-//!   an unconfirmed fact, or a problem without a location or evidence.
+//!   preference; a question, a concern about an edge case resting on state
+//!   nobody could check, an unconfirmed fact, or a problem without a location
+//!   or evidence.
+//!
+//! A possible break of the change's main path that nobody settled is none
+//! of these: it blocks as "needs a check" naming the check
+//! ([`super::review_rules::main_path_unchecked`]); [`ground`] reads one from
+//! a concern that says it hits every request and couldn't confirm it.
 //!
 //! [`classify`] decides from the finding's structured fields (basis,
 //! category, location, stated-goal miss); the model's own severity is only
@@ -353,6 +359,15 @@ pub fn classify(f: &Finding) -> Class {
     {
         return Class::Note(PREFERENCE);
     }
+    // A missing test where tests aren't required is a should-fix note: the
+    // model's `optional` doesn't make new untested code a suggestion.
+    if category_in(&f.category, TEST_CATEGORIES) && asks_for_a_test(f) && !says_optional(f) {
+        return if f.severity_check.as_ref().is_some_and(|c| c.blocking) {
+            located_and_shown(f, "the severity check found it a blocking problem")
+        } else {
+            Class::Note(NOT_BLOCKING_KIND)
+        };
+    }
     if (f.optional == Some(true) || says_optional(f)) && !shown_harm(f) {
         return Class::Note(OPTIONAL);
     }
@@ -637,6 +652,9 @@ pub struct Grounded {
     pub unquoted_rules: usize,
     /// Findings whose text cites the team's or repository's written rules.
     pub cited_rules: usize,
+    /// Unsettled concerns whose text says they hit every request (or call,
+    /// search, run) of the change: a main-path risk.
+    pub main_path: usize,
 }
 
 /// Fills the classifier's fields from what each finding shows. Runs after
@@ -702,9 +720,125 @@ pub fn ground(findings: &mut [Finding], team_rules: &str) -> Grounded {
             f.verify_by_code();
             g.traced += 1;
         }
+        if f.main_path.as_deref().is_none_or(|m| m.trim().is_empty()) {
+            if let Some(path) = unsettled_main_path(f) {
+                f.main_path = Some(path);
+                g.main_path += 1;
+            }
+        }
     }
     g
 }
+
+/// Categories whose concern isn't a possible break even when it is on
+/// every call: speed, upkeep, scope, what is logged or measured.
+const NOT_A_BREAK_CATEGORIES: &[&str] = &[
+    "question",
+    "perf",
+    "performance",
+    "observability",
+    "maintainability",
+    "refactor",
+    "scope",
+    "follow-up",
+    "followup",
+    "manual-check",
+];
+
+/// Words that start a clause saying the code runs on every call.
+const EVERY_WORDS: &[&str] = &["every", "each", "all"];
+
+/// What the change runs on every call of: the noun after "every".
+const MAIN_PATH_NOUNS: &[&str] = &[
+    "request",
+    "call",
+    "search",
+    "query",
+    "write",
+    "read",
+    "run",
+    "upload",
+    "download",
+    "message",
+    "event",
+    "login",
+    "sync",
+    "job",
+    "build",
+    "deploy",
+    "invocation",
+    "page",
+];
+
+/// Phrases of a finding that says it couldn't settle the point.
+const UNSETTLED_PHRASES: &[&str] = &[
+    "couldn't confirm",
+    "could not confirm",
+    "can't confirm",
+    "cannot confirm",
+    "couldn't verify",
+    "could not verify",
+    "can't verify",
+    "cannot verify",
+    "couldn't check",
+    "could not check",
+    "couldn't tell",
+    "could not tell",
+    "not verified",
+    "unverified",
+    "unclear whether",
+    "not sure whether",
+];
+
+/// The main path an unsettled concern says it hits ("every search with a
+/// body"), from its own words: it says the code runs on every request (or
+/// call, search, write, run) and that it couldn't settle whether that
+/// breaks. A concern about one edge case, or one that settled the point,
+/// has none.
+pub fn unsettled_main_path(f: &Finding) -> Option<String> {
+    if f.evidence() != Evidence::UnverifiedConcern
+        || says_optional(f)
+        || category_in(&f.category, PREFERENCE_CATEGORIES)
+        || category_in(&f.category, TEST_CATEGORIES)
+        || category_in(&f.category, NOT_A_BREAK_CATEGORIES)
+        || f.file.trim().is_empty()
+    {
+        return None;
+    }
+    let text = format!("{}. {}", f.title, f.body);
+    let lower = text.to_ascii_lowercase();
+    if !UNSETTLED_PHRASES.iter().any(|p| lower.contains(p)) {
+        return None;
+    }
+    let words: Vec<&str> = lower.split_whitespace().collect();
+    words.windows(2).enumerate().find_map(|(i, w)| {
+        let noun = w[1].trim_matches(|c: char| !c.is_ascii_alphanumeric());
+        let noun = noun
+            .strip_suffix("es")
+            .filter(|n| n.ends_with("ch"))
+            .unwrap_or(noun);
+        let noun = noun.strip_suffix('s').unwrap_or(noun);
+        if !EVERY_WORDS.contains(&w[0]) || !MAIN_PATH_NOUNS.contains(&noun) {
+            return None;
+        }
+        // The clause, up to its first punctuation.
+        let clause: Vec<&str> = words[i..]
+            .iter()
+            .take(8)
+            .scan(false, |ended, w| {
+                if *ended {
+                    return None;
+                }
+                *ended = w.ends_with([':', '.', ',', ';', ')']);
+                Some(w.trim_end_matches([':', '.', ',', ';', ')']))
+            })
+            .collect();
+        Some(clause.join(" "))
+    })
+}
+
+/// How an unsettled main-path risk's posted body names its check.
+pub const NEEDS_CHECK_LEAD: &str = "This needs a check before merge:";
 
 /// Sets each finding's severity to match its class: a finding that holds the
 /// merge reads as blocking ("high" at least), a note is "medium" at most.
@@ -719,6 +853,21 @@ pub fn finalize(findings: &mut [Finding]) {
             if !stripped.is_empty() {
                 f.body = stripped;
             }
+        }
+        // An unsettled main-path risk names the check that settles it, so
+        // "not verified" is never its last word.
+        if super::review_rules::mandatory(f) == Some(super::review_rules::MAIN_PATH_WHY)
+            && f.evidence() != Evidence::VerifiedDefect
+            && !f.body.contains(NEEDS_CHECK_LEAD)
+        {
+            f.body = format!(
+                "{}\n\n_{NEEDS_CHECK_LEAD} {}. This is on {}, and nothing in the review or the PR's \
+                 own verification exercises it yet. If the check passes, say so here and this \
+                 becomes a note; if it fails, it is a defect to fix._",
+                f.body.trim_end(),
+                super::review_rules::settling_check(f),
+                f.main_path.as_deref().unwrap_or("the change's main path").trim()
+            );
         }
         let high = matches!(
             f.severity.trim().to_ascii_lowercase().as_str(),
@@ -749,12 +898,17 @@ pub const JUDGE_SYSTEM: &str = "You check the severity of code review findings t
      written rules mark required (MUST, MUST NOT, NEVER, REQUIRED or ALWAYS in capitals), or \
      when it is on a critical path (a header, hash or signature another system validates, \
      auth, payments, data writes, a public contract, a deploy step) and nothing in the PR \
-     proves the change holds there (no test, no check). Correctness includes a PR that doesn't achieve its \
+     proves the change holds there (no test, no check). A finding also BLOCKS when it is a \
+     possible break of the change's main path (code that every request, search, write or run \
+     the change exists for goes through) that the finding couldn't settle and that neither the \
+     PR's tests nor its described verification exercise: unchecked state on the main path is a \
+     check to run before merge, not a note. Correctness includes a PR that doesn't achieve its \
      stated goal; data loss includes lost or stale writes, cursors or watermarks that skip \
      rows, duplicates and ordering that flips between runs. Likelihood and estimated impact \
      never make a shown defect non-blocking. Everything else is a note: style and naming, \
      optional improvements, a written team rule not followed with no defect shown, questions, \
-     and concerns resting on state nobody could check. Output ONLY a fenced ```json block: \
+     a missing test where the team doesn't require tests, and concerns about an edge case or \
+     rare input resting on state nobody could check. Output ONLY a fenced ```json block: \
      {\"checks\":[{\"index\":<int>,\"blocking\":<bool>,\"reason\":\"one short sentence\"}]} \
      with one entry per finding.";
 
@@ -1242,6 +1396,138 @@ mod tests {
         let note = &posted.inline[1].body;
         assert!(note.starts_with("💬 **Nit: Rename**"), "{note}");
         assert!(note.contains(super::super::review_agent::NON_BLOCKING_MARK));
+    }
+
+    /// The two notes of an approved review, as the reviewer emitted them: a
+    /// new request path through a tunnel sends every search body chunked,
+    /// "couldn't confirm" the server accepts it (the PR's live check hit a
+    /// no-body endpoint), and the new request function has no test.
+    fn tunnel_review() -> Vec<Finding> {
+        vec![
+            finding(json!({
+                "file": "src/commands/search.js", "line": 101, "severity": "low",
+                "category": "hardening", "evidence": "unverified-concern", "optional": true,
+                "title": "Tunnelled requests with a body are sent without Content-Length",
+                "body": "`request` passes `init.body` as a JSON string. On the `fetch` path, Node \
+                         sets `Content-Length` for a string body. On the new `https.request` path \
+                         no length is set, so Node sends `Transfer-Encoding: chunked` for every \
+                         search with a body: `search query`, `find-class` and the trace hop. I \
+                         couldn't confirm whether the private domain accepts chunked search \
+                         requests; the description's live check names `_cluster/health`, which \
+                         has no body. Setting the header keeps both paths sending the same thing.",
+                "suggestion": "headers: { ...headers, Host: credentials.host, \"Content-Length\": Buffer.byteLength(body) },"
+            })),
+            finding(json!({
+                "file": "src/commands/search.js", "line": 92, "severity": "low",
+                "category": "tests", "evidence": "verified-defect", "optional": true,
+                "title": "requestViaTunnel has no test",
+                "body": "The new tests cover `isPrivateEndpoint` and `proxyConfig`, but nothing \
+                         exercises `requestViaTunnel` or the `credentials.tunnelPort` branch in \
+                         `request`. That code carries the TLS servername/Host handling and the \
+                         response shape that `searchIndex` relies on. Suggested test: start a \
+                         local `https.createServer` and assert the Host header, path and JSON."
+            })),
+        ]
+    }
+
+    #[test]
+    fn an_unsettled_main_path_risk_blocks_as_needing_a_check() {
+        let changed = vec!["src/commands/search.js".to_string()];
+        for require_tests in [false, true] {
+            let mut fs = tunnel_review();
+            let g = ground(&mut fs, "");
+            assert_eq!(g.main_path, 1);
+            assert_eq!(fs[0].main_path.as_deref(), Some("every search with a body"));
+            super::super::review_rules::apply(
+                &mut fs,
+                &super::super::review_rules::Policy::new(require_tests, ""),
+                &changed,
+            );
+            finalize(&mut fs);
+            // Case 1: blocks whatever "optional" and "hardening" said, and
+            // names the check that settles it.
+            assert!(fs[0].holds_merge(), "require_tests={require_tests}");
+            assert_eq!(
+                super::super::review_rules::mandatory(&fs[0]),
+                Some(super::super::review_rules::MAIN_PATH_WHY)
+            );
+            assert_eq!(
+                super::super::review_rules::mandatory_label(&fs[0]).as_deref(),
+                Some("Blocking (needs a check)")
+            );
+            assert!(fs[0].body.contains(NEEDS_CHECK_LEAD), "{}", fs[0].body);
+            assert!(fs[0].body.contains("every search with a body"));
+            // Case 2: blocks with "Require tests" on, a should-fix note off.
+            assert_eq!(fs[1].holds_merge(), require_tests);
+            if !require_tests {
+                assert_eq!(label(&fs[1]), Some(Label::ShouldFix));
+            }
+        }
+        // The reviewer's own words for the check, when it gives them.
+        let mut named = tunnel_review();
+        named[0].main_path = Some("every search through the tunnel".into());
+        named[0].check =
+            Some("run `cli search query` once through the tunnel and paste the result".into());
+        finalize(&mut named);
+        assert!(named[0].holds_merge());
+        assert!(named[0]
+            .body
+            .contains("run `cli search query` once through the tunnel and paste the result"));
+        // A verified defect on the main path blocks as one.
+        let mut shown = tunnel_review();
+        shown[0].main_path = Some("every search with a body".into());
+        shown[0].evidence = Some("verified-defect".into());
+        shown[0].basis = Some("documented".into());
+        shown[0].source = Some("the server's docs: Content-Length is required".into());
+        assert_eq!(
+            super::super::review_rules::mandatory_label(&shown[0]).as_deref(),
+            Some("Blocking (main path)")
+        );
+    }
+
+    #[test]
+    fn a_settled_or_speculative_concern_stays_a_note() {
+        // Settled harmless by a check: a note.
+        let mut settled = tunnel_review();
+        settled[0].main_path = Some("every search with a body".into());
+        settled[0].proof = Some("a local server received the body with Content-Length set".into());
+        assert!(!settled[0].holds_merge());
+        // A run the PR reports settles it too.
+        settled[0].proof =
+            Some("checked by hand: `search query` through the tunnel returned hits".into());
+        assert!(!settled[0].holds_merge());
+        // Speculation about an edge case: no "every request", a note.
+        let mut edge = vec![finding(json!({
+            "file": "src/commands/search.js", "line": 60, "severity": "low",
+            "category": "hardening", "evidence": "unverified-concern", "basis": "external",
+            "title": "A slow bastion might time out the first connection",
+            "body": "If the bastion is slow to start, the first connection might time out. I \
+                     couldn't confirm how long it takes; a retry would be nice to have."
+        }))];
+        assert_eq!(ground(&mut edge, "").main_path, 0);
+        assert!(!edge[0].holds_merge());
+        // "Every request" with the point settled in its own words: a note.
+        let mut fine = vec![finding(json!({
+            "file": "src/commands/search.js", "line": 70, "severity": "low",
+            "category": "hardening", "evidence": "unverified-concern",
+            "title": "Every request reopens the agent",
+            "body": "Every request builds a new agent; not a bug, just slower."
+        }))];
+        assert_eq!(ground(&mut fine, "").main_path, 0);
+        assert!(!fine[0].holds_merge());
+        // Speed on every request isn't a possible break.
+        let mut slow = vec![finding(json!({
+            "file": "src/commands/search.js", "line": 75, "severity": "medium",
+            "category": "perf", "evidence": "unverified-concern",
+            "title": "A new TLS handshake for every request",
+            "body": "Every request opens a new connection; I couldn't confirm how slow that is."
+        }))];
+        assert_eq!(ground(&mut slow, "").main_path, 0);
+        assert!(!slow[0].holds_merge());
+        // A main path on a tests finding is judged by the tests rule only.
+        let mut t = tunnel_review();
+        t[1].main_path = Some("every search".into());
+        assert!(!t[1].holds_merge());
     }
 
     #[test]

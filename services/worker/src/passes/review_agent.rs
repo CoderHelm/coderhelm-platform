@@ -97,9 +97,21 @@ pub struct Finding {
     /// finding blocks ([`super::review_rules::mandatory`]).
     #[serde(default)]
     pub critical_path: Option<String>,
-    /// The test, check or lookup that proves the critical path holds.
+    /// The test, check or lookup that proves the critical path holds (or
+    /// that settled a main-path risk either way).
     #[serde(default)]
     pub proof: Option<String>,
+    /// What part of the change's main behaviour the flagged code carries,
+    /// when the finding is a possible break of it ("every search with a
+    /// body through the tunnel"). With no `proof`, the finding blocks until
+    /// it is checked ([`super::review_rules::mandatory`]).
+    #[serde(default)]
+    pub main_path: Option<String>,
+    /// For a main-path risk the reviewer couldn't settle: the one check that
+    /// would ("run `cli query` once through the tunnel and paste the
+    /// result").
+    #[serde(default)]
+    pub check: Option<String>,
     /// For a tests finding in a repository that requires tests: the
     /// exemption the reviewer claims (docs, config, generated, tests only, or
     /// a covered refactor), checked against the changed files.
@@ -537,6 +549,28 @@ pub const CRITICAL_PATH_RULE: &str = "CRITICAL PATHS: analyse critically and nev
      naming or wording. Write what you found as a fact with its consequence (\"every upload fails \
      once signing is enforced\"); never \"a suggestion only\", \"just a heads-up\" or \
      \"optional\" about something that can break production. ";
+
+/// How the reviewer handles a possible break of the change's main path. A
+/// review approved a new request path that sent every search body chunked,
+/// posting "I couldn't confirm whether the server accepts it" as a
+/// suggestion while the PR's own live check had only hit a no-body endpoint.
+pub const MAIN_PATH_RULE: &str = "MAIN PATH: when you find something that could break the \
+     change's main behaviour (every request, search, write or run the change exists for goes \
+     through the code, not one edge case), settle it before you post it. Read every caller and \
+     what the code sends or does; use the documented behaviour of the runtime, library or \
+     service involved (what an HTTP client sends when no length is set, what a server or API \
+     documents it accepts) and any live source you have. Then: (1) shown wrong: a \
+     verified-defect with the evidence; (2) shown harmless: drop it, or keep a short note with \
+     `proof` naming what showed it; (3) still unsettled: keep it as an \"unverified-concern\" \
+     with `main_path` set to what it hits and `check` set to the one check that settles it, \
+     concrete enough to run (\"run `tool query` once through the tunnel and paste the \
+     result\"). Set `proof` when the PR's own tests or the description's verification already \
+     exercise that exact path (a live check of an endpoint with no body doesn't cover requests \
+     with one); leave it empty otherwise. A main-path risk with no proof holds the merge until \
+     the check is done: never post it as \"hardening\", \"a suggestion\" or `optional`, and \
+     never leave \"not verified\" as its last word. Speculation about an edge case, a rare \
+     input or an unlikely environment is not a main path; leave `main_path` unset there. A \
+     missing test is a \"tests\" finding, never a main-path risk. ";
 
 pub const TEST_STATE_RULE: &str = "TESTS OF UI STATE: when the diff writes or changes a test \
      or page object that checks a page offers something (a way to register, buy or book), \
@@ -1537,7 +1571,8 @@ pub fn review_system_prompt(
          \"unverified-concern\" when it might be wrong but you could not establish it; \
          \"question\" when only a person can confirm it. \
          {DOCUMENTED_RULE} A concern resting on external state you couldn't check is posted as \
-         a comment and doesn't hold the merge (except on a one-shot path, see WHAT BLOCKS), so \
+         a comment and doesn't hold the merge (except on a one-shot path, see WHAT BLOCKS, and \
+         a possible break of the change's main path, see MAIN PATH), so \
          never dress such a concern as a defect, and never call a defect you proved a concern. A \"question\" sets `blocks`: true only when the \
          change's correctness rests on the answer (the code reads a field, shape or behaviour of \
          another system that nobody verified); its body then says exactly what to confirm and \
@@ -1552,6 +1587,7 @@ pub fn review_system_prompt(
 {EXISTING_PATTERN_RULE}\
          {PROOF_RULE}\
          {CRITICAL_PATH_RULE}\
+         {MAIN_PATH_RULE}\
          {COPY_RULE}\
          {TONE_RULE}\
          {PROGRESS_NOTES_RULE}\
@@ -1570,7 +1606,8 @@ pub fn review_system_prompt(
          \"one_shot\": <bool, true when the code runs once in production with no automatic retry or rollback>,\n    \
          \"defeats_goal\": <bool, true when the change doesn't achieve what its title or description says it does>, \"team_rule\": \"the written team or repository rule it breaks, quoted exactly\",\n    \
          \"optional\": <bool, true when the current code is correct and this is an optional improvement, false when the code as written is wrong>,\n    \
-         \"critical_path\": \"per CRITICAL PATHS: what depends on this code, in a few words; omit when it isn't on one\", \"proof\": \"the test, check or lookup that proves it holds there; empty when nothing does\",\n    \
+         \"critical_path\": \"per CRITICAL PATHS: what depends on this code, in a few words; omit when it isn't on one\", \"proof\": \"the test, check or lookup that proves it holds there (or that settled a main-path risk); empty when nothing does\",\n    \
+         \"main_path\": \"per MAIN PATH: the part of the change's main behaviour this possible break hits, in a few words; omit otherwise\", \"check\": \"per MAIN PATH: the one check that would settle it, when you couldn't\",\n    \
          \"exemption\": \"tests findings in a repo that requires tests only: docs | config | generated | tests | refactor, when one applies\",\n    \
          \"lookups\": [\"L1\"]  (ids of the live lookups the finding rests on, if any),\n    \
          \"blocks\": <bool, questions only: true when the change's correctness rests on the answer>,\n    \
@@ -2086,6 +2123,14 @@ pub fn to_postable(
             // merge (see `thread_holds_merge`).
             Evidence::Question if holds => "question, blocks the merge".to_string(),
             Evidence::Question => "question".to_string(),
+            // An unsettled main-path risk holds the merge until checked:
+            // its header says what it needs, never only "not verified".
+            Evidence::UnverifiedConcern
+                if super::review_rules::mandatory(f)
+                    == Some(super::review_rules::MAIN_PATH_WHY) =>
+            {
+                format!("{}, needs a check", f.category)
+            }
             Evidence::UnverifiedConcern => format!("{}, not verified", f.category),
         };
         let mut body = format!("{emoji} **{label}{}** ({kind})\n\n{}", f.title, f.body);
