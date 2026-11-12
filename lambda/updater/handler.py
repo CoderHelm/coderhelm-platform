@@ -4039,7 +4039,9 @@ def native_poll(store, env, now, cfn=None, wait=False):
             entry["access"] = access_stack_state(env, cfn)
             store.put(hid, entry)
             try:
-                access_needed(store, env, now, entry, entry["preflight"], cfn)
+                if entry["access"].get("behind"):
+                    # Only what the access stack update can give: never for a call it couldn't check.
+                    access_needed(store, env, now, entry, [c for c in entry["preflight"] if "couldn't check" not in c], cfn)
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"access card not marked: {e}")
         store.put(hid, entry)
@@ -4583,7 +4585,7 @@ def native_finish(store, env, now, hid, status, reason, phase=None):
         if denied or PREFLIGHT_MARK.lower() in str(reason or "").lower():
             # The access stack as it is now, and the card shows it as needed for this change.
             access = access_stack_state(env)
-            if denied:
+            if denied and access.get("behind"):
                 try:
                     access_needed(store, env, now, dict(entry, access=access), [denied])
                 except Exception as e:  # noqa: BLE001
