@@ -1480,7 +1480,8 @@ pub async fn run(
     if age_hours >= MAX_AWAITING_CI_HOURS {
         warn!(
             run_id = msg.run_id,
-            age_hours, "Run exceeded awaiting_ci wall-clock cap — finalizing for human review"
+            age_hours,
+            "Run exceeded awaiting_ci wall-clock cap — finishing with the pull request open"
         );
         let repo_full = run_record
             .get("repo")
@@ -1506,7 +1507,8 @@ pub async fn run(
             state,
             &msg.team_id,
             &msg.run_id,
-            "CI did not conclude within 24h — PR handed off for human review",
+            "CI didn't finish within 24 hours, so CoderHelm stopped waiting on it and finished the \
+             run with the pull request open; the ready decision holds it until its checks pass.",
         )
         .await;
         set_run_complete(state, &msg.team_id, &msg.run_id, created_at).await;
@@ -1682,7 +1684,7 @@ pub async fn run(
                 // and re-trigger so the next resume routes into the fix path.
                 info!(
                     run_id = msg.run_id,
-                    "CI failed (missed webhook) — writing event and re-triggering"
+                    "CI failed (missed webhook) — writing the event and starting the fix"
                 );
                 record_synthetic_ci_failed(state, &msg.run_id, branch_head.as_deref()).await;
                 send_delayed_resume(state, &msg, 0).await;
@@ -2026,14 +2028,14 @@ pub async fn run(
             info!(
                 run_id = msg.run_id,
                 checks = ?on_base,
-                "CI is red only on checks that fail on the base branch too — handing off"
+                "CI is red only on checks that fail on the base branch too — finishing"
             );
             super::add_progress_note(
                 state,
                 &msg.team_id,
                 &msg.run_id,
                 &format!(
-                    "CI is red only on checks that also fail on {base_branch} ({}) — not caused by this PR; handed off for human review.",
+                    "CI is red only on checks that also fail on {base_branch} ({}), so this pull request didn't cause them. CoderHelm finished the run with this change's own work done; those checks are the base branch's to fix.",
                     on_base.join(", ")
                 ),
             )
@@ -2846,7 +2848,7 @@ pub async fn run(
             repo_instructions.clone()
         } else {
             format!(
-                "{repo_instructions}\n\n## Human Review Feedback\nThe following feedback was left on the PR. Address these comments:\n\n{}",
+                "{repo_instructions}\n\n## Reviewer feedback\nThe following feedback was left on the PR. Address these comments:\n\n{}",
                 review_feedback
             )
         };
@@ -3124,13 +3126,15 @@ pub async fn run(
             if over_cycle || !claimed {
                 warn!(
                     run_id = msg.run_id,
-                    cycle, "Fix budget exhausted — handing PR to human review as-is"
+                    cycle, "Fix budget spent with CI green — finishing the run"
                 );
                 super::add_progress_note(
                     state,
                     &msg.team_id,
                     &msg.run_id,
-                    "Automated fix budget exhausted — PR handed off for human review",
+                    "The review fix rounds for this pull request are used and its CI is green: CoderHelm \
+                     finished the run with the pull request ready, and the review's remaining \
+                     notes are on it.",
                 )
                 .await;
                 super::record_ci_outcome(
@@ -6257,9 +6261,9 @@ async fn resume_multi_repo(
         set_run_complete(state, &msg.team_id, &msg.run_id, created_at).await;
     };
     if !failed.is_empty() {
-        info!(run_id = %msg.run_id, failed = ?failed, "Multi-repo run: CI failed — handing off");
+        info!(run_id = %msg.run_id, failed = ?failed, "Multi-repo run: CI failed — finishing with the failing checks named");
         finish(Some(format!(
-            "CI failed on {}. Handed off for a person: CoderHelm fixes CI within one repository, not across several in one run.",
+            "CI failed on {}. CoderHelm fixes CI one repository at a time and this run spans several, so it finished with the pull requests open; the ready decision holds each one while its checks fail.",
             failed.join(", ")
         )))
         .await;
@@ -6339,7 +6343,9 @@ async fn hand_off_after_ci_wait(state: &WorkerState, msg: &ResumeMessage) {
         state,
         &msg.team_id,
         &msg.run_id,
-        "CI didn't conclude after about a day of checks — handed off for a person",
+        "CI didn't finish after about a day of checks, so CoderHelm stopped waiting on it and \
+         finished the run with the pull requests open; the ready decision holds each one until \
+         its checks pass.",
     )
     .await;
     let created_at = rec

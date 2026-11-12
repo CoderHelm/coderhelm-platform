@@ -823,7 +823,7 @@ async fn own_pr_failures(
             )
             .await;
             let body = format!(
-                "These E2E failures may come from this change, but Coderhelm has used its automatic fix attempts on this PR, so it's over to you:\n\n{}",
+                "These E2E failures may come from this change. CoderHelm has used the automatic fix rounds this PR has, so it doesn't start another on its own; a comment naming a change starts the next one right away:\n\n{}",
                 caused.iter().map(|l| format!("- {}", l.text)).collect::<Vec<_>>().join("\n")
             );
             let _ = gh
@@ -920,7 +920,7 @@ async fn own_pr_failures(
             }
         }
     } else {
-        format!("The E2E failures are still there after a re-run, for reasons outside this change:\n\n{items}\n\nLeaving this for a person to decide.")
+        format!("The E2E failures are still there after a re-run, for reasons outside this change:\n\n{items}\n\nThey don't come from this change, so CoderHelm doesn't change this pull request's code for them; its own work is done.")
     };
     if gh
         .create_issue_comment(&msg.repo_owner, &msg.repo_name, pr, &body)
@@ -2037,7 +2037,7 @@ async fn follow_generated(
                 _ => {
                     if let Some(pr) = run.pr {
                         let _ = gh
-                            .create_issue_comment(&msg.repo_owner, &msg.repo_name, pr, &format!("Coderhelm couldn't run the new test {GENERATED_RUNS} times automatically (the E2E workflow has no repeat input, or the new test wasn't in this run). Please run it repeatedly before marking this ready."))
+                            .create_issue_comment(&msg.repo_owner, &msg.repo_name, pr, &format!("CoderHelm couldn't run the new test {GENERATED_RUNS} times: the E2E workflow has no repeat input, or the new test wasn't in this run. Its one passing run is the evidence so far; a `repeat` input on the E2E workflow lets CoderHelm run it {GENERATED_RUNS} times itself."))
                             .await;
                     }
                 }

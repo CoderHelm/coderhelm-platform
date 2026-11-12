@@ -1060,6 +1060,56 @@ pub async fn run(
         }
     }
 
+    // Gate: a closing reply that hands the work back to a person ("I couldn't
+    // finish, please complete manually") for a reason not on the human-only
+    // list is not an ending. The coder is told to change its approach and
+    // keep going, once in this pass; a reply that still changes nothing is a
+    // step without progress, which climbs the supervisor's ladder.
+    if let Some(note) = super::ownership::escalation_note(&closing) {
+        warn!(
+            run_id = run_id.unwrap_or("?"),
+            "The coder's reply handed the work back with no human-only reason: it keeps going"
+        );
+        messages.push((
+            "user".to_string(),
+            vec![serde_json::json!({"type": "text", "text": note})],
+        ));
+        let opts = llm::ConverseOptions {
+            max_turns: 20,
+            max_tokens: 16384,
+            deadline,
+            effort: None,
+        };
+        match provider::converse(
+            state,
+            provider,
+            common::agent_policy::Agent::Coder,
+            model_id,
+            &full_system,
+            &mut messages,
+            &tools,
+            &executor,
+            usage,
+            opts,
+            on_tool.as_ref().map(|o| o as &dyn llm::LoopObserver),
+            Some(&mut conv_log),
+        )
+        .await
+        {
+            Ok(reply) if !reply.trim().is_empty() => closing = reply,
+            Ok(_) => {}
+            Err(e) => {
+                if crate::clients::github::outside_wait(&*e).is_some() {
+                    return Err(e);
+                }
+                warn!(error = %e, "The keep-going pass errored — proceeding with current state");
+            }
+        }
+        if let Some(s) = &skills {
+            s.drain_usage_into(usage);
+        }
+    }
+
     let files: Vec<String> = executor
         .write_executor
         .files_modified
@@ -1183,8 +1233,10 @@ pub(crate) fn coder_system(
     tests_block: &str,
 ) -> String {
     format!(
-        "You are an implementation agent for the {owner}/{repo} repository. \
-         Implement each task from the checklist. Follow existing code patterns exactly.{repo_context}{team}{tests_block}",
+        "You are the implementation engineer for the {owner}/{repo} repository. \
+         {stance}Implement every task from the checklist and see it through: the change \
+         written, checked and working. Follow existing code patterns exactly.{repo_context}{team}{tests_block}",
+        stance = super::ownership::coder_stance(),
         team = super::team_instructions_block(team_instructions),
     )
 }
@@ -3513,6 +3565,8 @@ mod task_prompt_tests {
         assert!(with.find("## Repository Instructions") < with.find("## Your team's instructions"));
         let without = coder_system("acme", "web", "", "  \n", "");
         assert!(!without.contains("team's instructions"));
+        // Every coder owns the outcome, with the human-only list as its only stop.
+        assert!(without.contains(&super::super::ownership::coder_stance()));
     }
 }
 

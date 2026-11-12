@@ -288,7 +288,7 @@ pub fn body_holds_on(body: &str, ci_green: bool) -> Vec<Reason> {
     if super::proof::holds_unfinished(body) {
         out.push(Reason::new(
             "Planned work is not done yet (listed under Not finished)",
-            "Finish it on the branch, or remove the section if the work isn't needed.",
+            "Each item there says why it was deferred; CoderHelm finishes it on this branch when a comment asks, or the section goes if the work isn't needed.",
         ));
     }
     // A check that would once have stopped the pull request (carried-over
@@ -548,7 +548,7 @@ pub fn status_section(d: &Decision) -> String {
             let items: Vec<String> = reasons.iter().map(|r| format!("- {}", r.line())).collect();
             format!(
                 "{STATUS_START}\n**This pull request stays a draft.** CoderHelm finished its \
-                 work; a person needs to deal with:\n{}\n{STATUS_END}",
+                 work and holds it on what is below, each with what settles it:\n{}\n{STATUS_END}",
                 items.join("\n")
             )
         }
@@ -567,7 +567,8 @@ pub fn status_section(d: &Decision) -> String {
             let items: Vec<String> = reasons.iter().map(|r| format!("- {}", r.line())).collect();
             format!(
                 "{STATUS_START}\n{PROVING_MARK}\n**Marked ready so its checks run, and it isn't \
-                 proven.** Don't merge it yet; a person needs to deal with:\n{}\n{STATUS_END}",
+                 proven.** Don't merge it yet; it is held on what is below, each with what settles \
+                 it:\n{}\n{STATUS_END}",
                 items.join("\n")
             )
         }

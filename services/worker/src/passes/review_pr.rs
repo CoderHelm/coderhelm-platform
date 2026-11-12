@@ -4099,7 +4099,7 @@ async fn run_once(
         } else if prev_verdict.as_deref() == Some("APPROVE") {
             info!(
                 pr = msg.pr_number,
-                "Self-review flipped APPROVE→REQUEST_CHANGES — holding for a human, not re-fixing (hysteresis)"
+                "Self-review flipped from APPROVE to REQUEST_CHANGES — not re-fixing on a flip (hysteresis)"
             );
         } else if claim_self_review_round(
             state,
@@ -4122,22 +4122,23 @@ async fn run_once(
         )
         .await
         {
-            // Cap reached — stop the auto-fix loop and hand to a human, once.
+            // Cap reached — stop starting fix rounds on our own, and say so once.
             let _ = github
                 .create_issue_comment(
                     &msg.repo_owner,
                     &msg.repo_name,
                     msg.pr_number,
                     &format!(
-                        "🛑 I've self-fixed this PR {MAX_SELF_REVIEW_FIX_ROUNDS} times without the \
-                         review converging, so I'm stopping the automatic fix loop and handing it \
-                         to a human. My latest findings are above."
+                        "I've made {MAX_SELF_REVIEW_FIX_ROUNDS} fix rounds on my own review of this \
+                         PR and each round still finds something, so I stop starting rounds on my \
+                         own here. My latest findings are above, each with what fixing it takes; a \
+                         comment naming a change starts the next round right away."
                     ),
                 )
                 .await;
             info!(
                 pr = msg.pr_number,
-                "Self-review→fix cap reached — handed off to a human"
+                "Self-review fix cap reached — rounds stop, findings stay on the PR"
             );
         }
     }

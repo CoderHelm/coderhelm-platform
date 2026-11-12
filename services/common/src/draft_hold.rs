@@ -203,8 +203,7 @@ impl DraftHold {
             .join(" ");
         match self.kind {
             Kind::Held if self.ready => format!(
-                "Finished; {} was marked ready so its checks run, and a person needs to deal \
-                 with: {reasons}",
+                "Finished; {} was marked ready so its checks run, and is held on: {reasons}",
                 self.pr_words()
             ),
             Kind::Waiting if self.ready => format!(

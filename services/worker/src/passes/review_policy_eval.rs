@@ -754,7 +754,7 @@ mod misgraded_findings {
                      `if ($p.ExitCode -ne 0) { throw }` throws on any non-zero code, so that code \
                      stops the script before the next install step. A fresh install usually returns \
                      0, so this may never happen. If it does, the log shows FAILED for a working \
-                     install and someone has to finish it by hand. You could accept the reboot code \
+                     install and the next install steps never run. You could accept the reboot code \
                      as success too.",
                 ),
             },

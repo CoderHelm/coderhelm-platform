@@ -510,7 +510,8 @@ pub fn render(merge_sha: &str, verdict: &Verdict, follows: &[Follow]) -> String 
         Verdict::Failed(jobs) => format!(
             "🔴 **Post-merge health check FAILED**: the merge of `{sha}` has NEW failing \
              check(s) that were not failing before the merge:\n\n{}\n\nFailures that were \
-             already there before the merge were ignored. A person should decide on a rollback.",
+             already there before the merge were ignored. Rolling a deploy back needs the \
+             approval of whoever owns it: should `{sha}` be rolled back?",
             jobs.iter().map(job_line).collect::<Vec<_>>().join("\n")
         ),
         Verdict::StillRunning(jobs) => format!(
@@ -549,8 +550,8 @@ pub fn render_interim(
         format!(
             "🔴 **Post-merge health check FAILED**: the merge of `{sha}` has NEW failing \
              check(s) that were not failing before the merge:\n\n{}\n\nFailures that were \
-             already there before the merge were ignored. A person should decide on a \
-             rollback.\n\nStill to come:\n\n{waits}\n\nI'll update this comment once it is \
+             already there before the merge were ignored. Rolling a deploy back needs the \
+             approval of whoever owns it: should `{sha}` be rolled back?\n\nStill to come:\n\n{waits}\n\nI'll update this comment once it is \
              approved and finishes.",
             failed.iter().map(job_line).collect::<Vec<_>>().join("\n")
         )

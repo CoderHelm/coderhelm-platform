@@ -713,7 +713,7 @@ async fn ship(
         run_id,
         &format!(
             "Shipped what is done on pull request #{number}; deferred: {}. CI and the ready \
-             decision take it from here.",
+             decision carry it on.",
             common::truncate_str(&stop.words(), 300)
         ),
     )
