@@ -943,6 +943,10 @@ pub struct WhatToCheck {
     /// The files the pull request changes.
     pub files: Vec<String>,
     pub ci: CiState,
+    /// A dependency fix run's account (`dep_fix::DepRun::report_md`): the
+    /// bumps applied, the ones deferred with why, and the checks run in the
+    /// sandbox. Empty for a run without one.
+    pub dep_report: String,
 }
 
 impl WhatToCheck {
@@ -1008,6 +1012,10 @@ fn runtime_notes(n: &PackageNotes) -> Vec<String> {
 /// checks; a pass is said only when CI passed.
 pub fn what_to_check(bumps: &[Bump], w: &WhatToCheck) -> String {
     let mut s = String::from("## What to check\n\n");
+    if !w.dep_report.trim().is_empty() {
+        s.push_str(w.dep_report.trim());
+        s.push_str("\n\n");
+    }
     for b in bumps {
         let n = w
             .notes
@@ -1427,6 +1435,7 @@ mod tests {
                 failing: vec!["test".into()],
                 checks: vec!["build".into(), "test".into()],
             },
+            ..Default::default()
         };
         let s = what_to_check(&bumps, &w);
         assert!(s.starts_with("## What to check"));

@@ -695,7 +695,12 @@ mod continuation_tests {
         let check = rp
             .find("if remaining_secs(start) < MIN_TIME_FOR_IMPLEMENT_SECS {")
             .expect("a time check before the coder starts");
-        let first_run = rp.find("let mut result = implement::run(").unwrap();
+        // The coder's first call (a dependency run's driver comes first in
+        // the same place, and only the coder's call sites use the model).
+        let first_run = rp
+            .find("let mut result = if let Some(run) = dep_run.take() {")
+            .unwrap();
+        assert!(rp[first_run..first_run + 4000].contains("implement::run("));
         assert!(check < first_run);
         assert!(rp[check..first_run].contains("try_auto_continue("));
         let judged = rp.find("let mut verdict = run_end::judge(").unwrap();
@@ -1065,6 +1070,7 @@ pub mod code_graph;
 mod completeness;
 mod covering;
 mod cross_repo;
+pub mod dep_fix;
 pub mod deploy_stats;
 pub mod dlq_cleanup;
 pub mod e2e;
@@ -2455,6 +2461,22 @@ async fn run_passes(
         }
     }
 
+    // A security ticket whose bumps go through a JavaScript lockfile is a
+    // dependency fix run (`dep_fix`): the rules plan it (no planner, never a
+    // documentation task), the sandbox verifies every bump with the
+    // repository's own checks before anything is pushed, and the coder only
+    // changes the call sites of a major the run must fix.
+    let mut dep_run = dep_fix::start(state, msg, &github, run_id).await;
+    let mut dep_mechanical = false;
+    if let Some(run) = &dep_run {
+        info!(
+            run_id,
+            bumps = run.plan.bumps.len(),
+            deferred = run.plan.deferred.len(),
+            "Dependency fix run: planned by the rules"
+        );
+    }
+
     // --- Pass 2: Plan ---
     check_cancelled(state, &msg.team_id, run_id).await?;
     // How far planning got: saved from here on, so a step that runs out of
@@ -2597,7 +2619,26 @@ async fn run_passes(
     let context_changed = lookup.hash_changed;
     let previous_ticket_text = lookup.previous_ticket_text;
     let mut plan_was_reused = false;
-    let mut plan_result = if let Some(plan) = own_plan {
+    let mut plan_result = if let Some(run) = dep_run.as_ref() {
+        // The bump list is the plan: one task per lockfile, kept as this
+        // run's own so a continuation reads the same one. It comes first: a
+        // retry of a run planned the old way never takes up that plan.
+        let plan = dep_fix::plan_result(run, false);
+        dep_fix::save_plan_files(state, msg, run_id, &plan).await;
+        add_progress_note(
+            state,
+            &msg.team_id,
+            run_id,
+            &format!(
+                "Dependency fix: {} bump(s) in {} risk batch(es); {} deferred by the rules",
+                run.plan.bumps.len(),
+                run.plan.batches().len(),
+                run.plan.deferred.len()
+            ),
+        )
+        .await;
+        plan
+    } else if let Some(plan) = own_plan {
         plan_was_reused = true;
         plan
     } else if let Some(plan) = lookup.plan {
@@ -3591,6 +3632,12 @@ async fn run_passes(
             .get_ref(&msg.repo_owner, &msg.repo_name, &branch_name)
             .await
             .unwrap_or_default();
+        // A dependency run moves without a commit while it verifies: its
+        // probes are progress too.
+        let at = match &dep_run {
+            Some(r) => format!("{at}|{}", r.progress()),
+            None => at,
+        };
         let mark = steps::progress_mark(&head, &at);
         let stalled = if head.is_empty() {
             0
@@ -3599,6 +3646,39 @@ async fn run_passes(
         };
         steps::save_mark(state, &msg.team_id, run_id, &mark, stalled, step).await;
         stalled_steps = stalled;
+        if steps::stops_for_stall(stalled)
+            && common::security_fixes::is_ticket(&msg.ticket_id)
+            && at.starts_with("implement")
+        {
+            // A security fix never ends by handing its unfinished work to a
+            // person: what is on the branch goes on to its checks and pull
+            // request (a draft naming the failing check when CI is red), and
+            // the tasks left are named under Open items.
+            let task = current_plan_task(&github, msg, &plan_result, &branch_name).await;
+            add_progress_note(
+                state,
+                &msg.team_id,
+                run_id,
+                &format!(
+                    "Two steps made no progress on {}: the run goes on with what the branch holds",
+                    task.as_deref().unwrap_or("the planned tasks")
+                ),
+            )
+            .await;
+            close_memory(state, agent_memory.take()).await;
+            return hand_off_at(
+                state,
+                msg,
+                &github,
+                run_id,
+                &branch_name,
+                steps::Gate::Verify,
+                None,
+                "The remaining planned tasks made no progress; the run goes on with the work on the branch",
+                usage,
+            )
+            .await;
+        }
         if steps::stops_for_stall(stalled) {
             let kept =
                 keep_wip_branch(&github, &msg.repo_owner, &msg.repo_name, &branch_name).await;
@@ -4854,24 +4934,86 @@ async fn run_passes(
         };
         let pass_start = std::time::Instant::now();
         let usage_before = usage.clone();
-        let mut result = implement::run(
-            state,
-            msg,
-            &github,
-            &plan_result,
-            &branch_name,
-            &rules,
-            &repo_instructions,
-            still_to_do.as_deref(),
-            &effective_complexity,
-            &provider,
-            usage,
-            &file_cache,
-            Some(run_id),
-            implement_deadline,
-            false, // initial implement — unscoped
-        )
-        .await?;
+        let mut result = if let Some(run) = dep_run.take() {
+            let work = dep_fix::Work {
+                state,
+                msg,
+                github: &github,
+                run_id,
+                branch: &branch_name,
+                deadline: implement_deadline,
+                rules: &rules,
+                repo_instructions: &repo_instructions,
+                provider: &provider,
+                file_cache: &file_cache,
+            };
+            let run = match dep_fix::drive(&work, run, usage).await? {
+                dep_fix::Driven::Done(run) => run,
+                dep_fix::Driven::Handoff(mut run) => {
+                    let resume_from =
+                        Some(("implement_started".to_string(), branch_name.clone(), 0u8));
+                    let handoff = try_auto_continue(
+                        state,
+                        msg,
+                        run_id,
+                        &resume_from,
+                        &["implement_started"],
+                        false,
+                        "The dependency checks continue in a fresh step",
+                    )
+                    .await;
+                    if handoff.continued() {
+                        close_memory(state, agent_memory.take()).await;
+                        return Ok(());
+                    }
+                    // No next step: what is verified ships, the rest waits.
+                    run.finish_now("not verified: the run had no step left to verify it");
+                    dep_fix::save(state, msg, run_id, &run).await;
+                    run
+                }
+            };
+            dep_fix::settle(state, msg, &run).await;
+            plan_result = dep_fix::plan_result(&run, true);
+            dep_mechanical = run.code_fixes == 0;
+            add_progress_note(
+                state,
+                &msg.team_id,
+                run_id,
+                &format!(
+                    "Dependency fix: {} bump(s) applied and verified, {} deferred with their reasons",
+                    run.applied.len(),
+                    run.all_deferred().len()
+                ),
+            )
+            .await;
+            if run.applied.is_empty() {
+                // Nothing could ship safely: the run says why and ends,
+                // never a question.
+                dep_fix::complete_without_pr(state, msg, run_id, usage, start, &run).await;
+                close_memory(state, agent_memory.take()).await;
+                return Ok(());
+            }
+            dep_fix::implement_result(&github, msg, &branch_name, &run).await
+        } else {
+            implement::run(
+                state,
+                msg,
+                &github,
+                &plan_result,
+                &branch_name,
+                &rules,
+                &repo_instructions,
+                still_to_do.as_deref(),
+                &effective_complexity,
+                &provider,
+                usage,
+                &file_cache,
+                Some(run_id),
+                implement_deadline,
+                false, // initial implement — unscoped
+            )
+            .await?
+        };
         // The run's own tooling failing is never a question (stop rule 1):
         // a pass that changed nothing after a command failed for want of a
         // dependency or tool gets that package's dependencies installed with
@@ -5411,7 +5553,25 @@ async fn run_passes(
         )
         .await
     };
-    if let Some(cov) = coverage {
+    if let Some(mut cov) = coverage {
+        let dropped = plan_coverage::drop_non_core(&mut cov, &msg.body);
+        if !dropped.is_empty() {
+            add_progress_note(
+                state,
+                &msg.team_id,
+                run_id,
+                &format!(
+                    "Dropped {} planned task(s) not core to the ticket (documentation it doesn't name), named under Open items: {}",
+                    dropped.len(),
+                    dropped
+                        .iter()
+                        .map(|t| format!("`{}`", t.path))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            )
+            .await;
+        }
         run_guard::progress(
             state,
             &msg.team_id,
@@ -5596,7 +5756,22 @@ async fn run_passes(
         .await
         .unwrap_or_default();
     let already_tested = !tested_at.is_empty() && ledger.update(|l| l.tested_head == tested_at);
-    if run_verify && !already_tested && has_time_for_remediation(start) {
+    // A dependency run that changed only manifests and lockfiles, each set
+    // verified with the repository's own checks in the sandbox, has no code
+    // for the model's test writer or audit to read: both are skipped.
+    let dep_mechanical = dep_mechanical
+        || (common::security_fixes::is_ticket(&msg.ticket_id)
+            && dep_fix::mechanical(state, msg, &github, run_id, &branch_name).await);
+    if dep_mechanical && run_verify {
+        add_progress_note(
+            state,
+            &msg.team_id,
+            run_id,
+            "Dependency fix: only manifests and lockfiles changed, each set verified in the sandbox; the model's test writer and audit are skipped",
+        )
+        .await;
+    }
+    if run_verify && !already_tested && !dep_mechanical && has_time_for_remediation(start) {
         update_pass(state, &msg.team_id, run_id, "test").await?;
         let pass_start = std::time::Instant::now();
         let usage_before = usage.clone();
@@ -5681,6 +5856,8 @@ async fn run_passes(
         step_state.carry.clone().filter(|_| !run_verify)
     {
         (c.security, c.security_round)
+    } else if dep_mechanical {
+        (security::Verdict::Passed, None)
     } else {
         // --- Security Audit (before PR — ensures only security-clean code is published) ---
         check_cancelled(state, &msg.team_id, run_id).await?;

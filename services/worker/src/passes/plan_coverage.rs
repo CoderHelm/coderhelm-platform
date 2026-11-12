@@ -272,6 +272,22 @@ impl Coverage {
     }
 }
 
+/// Drops the missing tasks that are not core to the ticket: a
+/// documentation file (README, CHANGELOG, docs) the ticket doesn't name.
+/// They become optional (named under Open items) and never hold the run; a
+/// dependency run once spent five steps on a README table no one asked for
+/// and stopped asking a person. Returns the tasks it dropped.
+pub fn drop_non_core(cov: &mut Coverage, ticket_body: &str) -> Vec<PlanTask> {
+    let mut dropped = vec![];
+    for t in cov.missing.iter_mut() {
+        if !t.optional && !t.generated && !common::dep_fix::core_to_dep_fix(&t.path, ticket_body) {
+            t.optional = true;
+            dropped.push(t.clone());
+        }
+    }
+    dropped
+}
+
 /// One spelling for a path (`..` resolved), the one the diff uses.
 fn norm(p: &str) -> String {
     super::generators::normalize_path(p)

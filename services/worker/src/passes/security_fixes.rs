@@ -2765,6 +2765,13 @@ async fn start_fixes(cx: &Ctx<'_>, findings: &mut [(Finding, FindingState)]) -> 
     let slots = slots(cx);
     let mut units = sec::plan_units(findings, cx.cfg, now);
     sec::order_units(&mut units, findings);
+    // The findings the rules hold out (a major they don't need yet, a bump a
+    // run found breaking) say why on the dashboard.
+    for (id, why) in sec::deferred_waits(findings, cx.cfg, now) {
+        if let Some(i) = findings.iter().position(|(f, _)| f.id == id) {
+            hold(cx, findings, &[i], &why).await;
+        }
+    }
     let mut busy: HashSet<String> = findings
         .iter()
         .filter(|(f, _)| f.status == Status::Fixing)
@@ -4132,10 +4139,14 @@ pub async fn pr_body(state: &WorkerState, msg: &TicketMessage, change: &str) -> 
         .await
         .map(|i| s(&i, "notes"))
         .unwrap_or_default();
-    let check = match github(state, msg.installation_id) {
+    let mut check = match github(state, msg.installation_id) {
         Ok(gh) => what_to_check(&gh, &unit, &notes, None).await,
         Err(_) => common::upgrade_notes::WhatToCheck::from_notes(&notes),
     };
+    check.dep_report = ticket_item(state, &msg.team_id, &msg.ticket_id)
+        .await
+        .map(|i| s(&i, "dep_report"))
+        .unwrap_or_default();
     Some(sec::pr_body_with(&unit, &pairs, change, &check))
 }
 
@@ -4328,6 +4339,106 @@ pub async fn on_pr_opened(
             carded = post_card(state, &msg.team_id, &channels, &thing, Stage::PrOpen, f).await;
         }
     }
+}
+
+// ── Dependency fix runs (`passes::dep_fix`) ─────────────────────────────
+
+/// What a dependency fix run plans from: the ticket's unit, its findings
+/// and the team's policy.
+pub(crate) struct DepInputs {
+    pub findings: Vec<(Finding, FindingState)>,
+    pub cfg: SecurityConfig,
+}
+
+pub(crate) async fn dep_inputs(
+    state: &WorkerState,
+    team_id: &str,
+    ticket: &str,
+) -> Option<DepInputs> {
+    let unit = load_unit(state, team_id, ticket).await?;
+    if unit.ecosystem == common::infra_vuln::records::UNIT_ECOSYSTEM
+        || unit.ecosystem == common::base_images::ECOSYSTEM
+    {
+        return None;
+    }
+    let cfg = load_config(state, team_id).await.unwrap_or_default();
+    let findings = unit_findings(state, team_id, &unit).await;
+    (!findings.is_empty()).then_some(DepInputs { findings, cfg })
+}
+
+/// The upgrade notes read for the ticket before its run.
+pub(crate) async fn dep_notes(
+    state: &WorkerState,
+    team_id: &str,
+    ticket: &str,
+) -> Vec<common::upgrade_notes::PackageNotes> {
+    let notes = ticket_item(state, team_id, ticket)
+        .await
+        .map(|i| s(&i, "notes"))
+        .unwrap_or_default();
+    serde_json::from_str(&notes).unwrap_or_default()
+}
+
+/// A dependency run's end: its deferred findings go back to open with the
+/// reason as their wait and leave the unit (the ones the run itself found
+/// breaking, `held`, stay out of later bundles while the deferral holds);
+/// the unit keeps what the pull request fixes, and the run's report is kept
+/// for the description.
+pub(crate) async fn settle_dep_run(
+    state: &WorkerState,
+    team_id: &str,
+    ticket: &str,
+    fixed: &[String],
+    deferred: &[(String, String, bool)],
+    held: &[String],
+    report: &str,
+) {
+    let Some(unit) = load_unit(state, team_id, ticket).await else {
+        return;
+    };
+    let mut findings = unit_findings(state, team_id, &unit).await;
+    let now = Utc::now();
+    let gone: Vec<String> = deferred
+        .iter()
+        .map(|(id, _, _)| id.clone())
+        .filter(|id| !fixed.contains(id))
+        .collect();
+    for (f, st) in findings.iter_mut() {
+        let Some((_, why, _)) = deferred.iter().find(|(id, _, _)| id == &f.id) else {
+            continue;
+        };
+        if fixed.contains(&f.id) {
+            continue;
+        }
+        f.status = Status::Open;
+        f.waiting = Some(why.clone());
+        f.updated_at = now.to_rfc3339();
+        st.ticket = None;
+        st.bundled = false;
+        if held.contains(&f.id) {
+            st.deferred = Some(common::dep_fix::RunDeferral::new(f, why, now));
+        }
+        save_finding(state, team_id, f, st).await;
+    }
+    if !gone.is_empty() {
+        let cfg = load_config(state, team_id).await.unwrap_or_default();
+        let all: Vec<(Finding, FindingState)> = findings.clone();
+        let kept = sec::without(&unit, &gone, &all, &cfg);
+        if let Err(e) = save_unit(state, team_id, ticket, &kept).await {
+            warn!(team_id, ticket, error = %e, "security: the unit without its deferred bumps could not be saved");
+        }
+    }
+    let _ = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(team_id))
+        .key("sk", attr_s(&sec::ticket_sk(ticket)))
+        .update_expression("SET dep_report = :r")
+        .condition_expression("attribute_exists(sk)")
+        .expression_attribute_values(":r", attr_s(common::truncate_str(report, 20_000)))
+        .send()
+        .await;
 }
 
 #[cfg(test)]
