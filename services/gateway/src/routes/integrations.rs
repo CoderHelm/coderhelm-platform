@@ -24,6 +24,7 @@ use axum::{
 use common::live::aws_account::{self, AwsAccount};
 use common::live::connectors::{self, ConnKind, Connector};
 use common::live::identity;
+use common::problems::{Check, Kind, Outcome};
 use serde_json::{json, Value};
 use tracing::{error, info, warn};
 
@@ -256,12 +257,19 @@ pub fn aws_state(a: &AwsAccount) -> CardState {
         .filter(|p| p.status() == "update_needed")
     {
         let n = p.missing.len();
+        let s_ = if n == 1 { "" } else { "s" };
+        // The install's own account gets them with the next version update:
+        // nothing to do in AWS.
+        if install_account(a) {
+            return cs(
+                "connected",
+                format!("{n} read-only permission{s_} arrive with the next Coderhelm update. Nothing is needed in AWS."),
+                "manage",
+            );
+        }
         return cs(
             "connected",
-            format!(
-                "Update needed: {n} new read-only permission{}.",
-                if n == 1 { "" } else { "s" }
-            ),
+            format!("Update needed: {n} new read-only permission{s_}."),
             "manage",
         );
     }
@@ -358,6 +366,51 @@ pub(crate) async fn check_and_save(
         common::live::permissions::check(&state.sts, &target, actor, &now),
     );
     a.apply_check(&c, &now);
+    // The role check is the same check as Test connection: its pass clears
+    // what a failed test left ("The last test of the role failed").
+    let table = &state.config.aws_insights_table_name;
+    let sk = format!("{}{}", aws_account::PREFIX, a.account);
+    if c.works {
+        if a.status == "error" {
+            let cleared = state
+                .dynamo
+                .update_item()
+                .table_name(table)
+                .key("pk", AttributeValue::S(team_id.into()))
+                .key("sk", AttributeValue::S(sk.clone()))
+                .condition_expression("attribute_exists(pk)")
+                .update_expression("SET #s = :s REMOVE last_error, last_error_at")
+                .expression_attribute_names("#s", "status")
+                .expression_attribute_values(":s", AttributeValue::S("active".into()))
+                .send()
+                .await;
+            if cleared.is_ok() {
+                a.status = "active".into();
+            }
+        }
+        common::problems::record_on(
+            &state.dynamo,
+            table,
+            team_id,
+            &sk,
+            Check::AwsRole,
+            Outcome::Pass,
+            &now,
+        )
+        .await;
+    } else {
+        let why = format!("Coderhelm couldn't take on the role: {}", c.error);
+        common::problems::record_on(
+            &state.dynamo,
+            table,
+            team_id,
+            &sk,
+            Check::AwsRole,
+            Outcome::Fail(Kind::AwsRoleRefused, why),
+            &now,
+        )
+        .await;
+    }
     if let Err(e) = aws_account::save_permissions(
         &state.dynamo,
         &state.config.aws_insights_table_name,
@@ -905,7 +958,15 @@ pub async fn check_aws_permissions(
     reply["permissions"] = a
         .permissions
         .as_ref()
-        .map(|p| p.view(pressed, &common::public_urls::log_reader_template_url()))
+        // With the team's choices, like every other read of the account: the
+        // update link keeps their knowledge bases, buckets and reads.
+        .map(|p| {
+            p.view_with(
+                pressed,
+                &common::public_urls::log_reader_template_url(),
+                &a.chosen(),
+            )
+        })
         .unwrap_or(Value::Null);
     Ok(Json(reply))
 }

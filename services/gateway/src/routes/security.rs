@@ -25,6 +25,7 @@ use std::sync::Arc;
 use aws_sdk_dynamodb::types::AttributeValue;
 use axum::extract::{Path, Query, State};
 use axum::{http::StatusCode, Extension, Json};
+use common::problems::{self, Check, Kind, ProblemState};
 use common::security_fixes::{
     self as sec, Dismissed, Finding, FindingState, SecurityConfig, Status, Tier,
 };
@@ -292,19 +293,153 @@ fn advisory_feed_reason(
             shown_time(t)
         );
     }
-    match (webhook_at, polled_at) {
+    match (webhook_at, polled_at.or(poll.run_at.as_deref())) {
         (Some(_), _) => String::new(),
+        // The webhook is optional: the hourly poll alone keeps the feed current.
         (None, Some(p)) => format!(
-            "Waiting for GitHub's first webhook; checked by polling at {}.",
+            "Read by polling GitHub's advisory database about hourly; last read {}.",
             shown_time(p)
         ),
-        (None, None) => "Waiting for GitHub's first webhook; GitHub's advisory database is also polled about hourly, starting on the next check.".into(),
+        (None, None) => "Read by polling GitHub's advisory database about hourly; the first read runs on the next check.".into(),
     }
+}
+
+/// One check's problem across the repositories' dependency rows: the
+/// repositories with a problem now (worst kind first), how many were read,
+/// and the latest recovery when none has one. A row written before the
+/// problem state existed reads its old fields.
+struct RepoProblems {
+    now: Vec<(String, problems::Problem)>,
+    read: usize,
+    recovered_at: Option<String>,
+}
+
+fn repo_problems(deps: &[Item], check: Check) -> RepoProblems {
+    let mut out = RepoProblems {
+        now: vec![],
+        read: 0,
+        recovered_at: None,
+    };
+    for i in deps {
+        let mut st = problems::read_from(i, check);
+        if !i.contains_key(&check.attr()) {
+            st = legacy_state(i, check);
+        }
+        if st.current.is_none() && st.passed_at.is_none() {
+            continue;
+        }
+        out.read += 1;
+        match st.current {
+            Some(p) => out.now.push((s(i, "repo"), p)),
+            None => {
+                if let Some(r) = st.history.first() {
+                    out.recovered_at =
+                        latest(out.recovered_at.take(), Some(r.recovered_at.clone()));
+                }
+            }
+        }
+    }
+    let rank = |k: Kind| match k {
+        Kind::DependabotNoPermission => 0,
+        Kind::DependabotReadFailed | Kind::OsvReadFailed => 1,
+        _ => 2,
+    };
+    out.now
+        .sort_by_key(|(r, p)| (rank(p.kind), r.to_ascii_lowercase()));
+    out
+}
+
+/// A dependency row from before the problem state: its `dependabot` and
+/// `osv_error` fields, which each read rewrote.
+fn legacy_state(i: &Item, check: Check) -> ProblemState {
+    let mut st = ProblemState::default();
+    let at = Some(s(i, "updated_at"))
+        .filter(|v| !v.is_empty())
+        .unwrap_or_default();
+    let fail = |kind: Kind, message: String| problems::Problem {
+        kind,
+        message,
+        since: at.clone(),
+        seen_at: at.clone(),
+    };
+    match check {
+        Check::Dependabot => {
+            let reason = s(i, "dependabot_reason");
+            st.current = match s(i, "dependabot").as_str() {
+                "" => return st,
+                "on" => None,
+                "off" => Some(fail(Kind::DependabotOff, reason)),
+                "no_permission" | "not_accepted" => {
+                    Some(fail(Kind::DependabotNoPermission, reason))
+                }
+                _ => Some(fail(Kind::DependabotReadFailed, reason)),
+            };
+        }
+        Check::Osv => {
+            let e = s(i, "osv_error");
+            if !e.is_empty() {
+                st.current = Some(fail(
+                    Kind::OsvReadFailed,
+                    format!("{e}; tried again on the next check."),
+                ));
+            } else if s(i, "osv_synced_at").is_empty() {
+                return st;
+            }
+        }
+        _ => return st,
+    }
+    if st.current.is_none() {
+        st.passed_at = Some(at);
+    }
+    st
+}
+
+/// "acme/web: …" for one repository, "2 of 5 repositories (acme/web, acme/api): …" for more.
+fn repos_reason(p: &RepoProblems, total: usize) -> String {
+    let Some((first, prob)) = p.now.first() else {
+        return String::new();
+    };
+    let msg = prob.message.trim();
+    if p.now.len() == 1 {
+        return if total > 1 {
+            format!("{first}: {msg}")
+        } else {
+            msg.to_string()
+        };
+    }
+    let names: Vec<&str> = p.now.iter().take(3).map(|(r, _)| r.as_str()).collect();
+    let more = if p.now.len() > 3 { ", and more" } else { "" };
+    format!(
+        "{} of {} repositories ({}{more}): {msg}",
+        p.now.len(),
+        total.max(p.now.len()),
+        names.join(", ")
+    )
+}
+
+/// The team's own state for a team-wide check (`problem_<check>`), when kept.
+fn team_problem(team_state: &Item, check: Check) -> Option<ProblemState> {
+    team_state
+        .contains_key(&check.attr())
+        .then(|| problems::read_from(team_state, check))
+}
+
+/// The latest recovery of a team-wide check, while nothing is wrong now.
+fn recovered(st: &Option<ProblemState>) -> Option<String> {
+    st.as_ref()
+        .filter(|s| s.current.is_none())
+        .and_then(|s| s.history.first())
+        .map(|r| r.recovered_at.clone())
 }
 
 /// One row per source: what it gives, its state in plain words, when it
 /// last synced, and how many findings came from it.
-pub fn source_rows(team_state: &Item, kev: &Item, findings: &[(Finding, FindingState)]) -> Value {
+pub fn source_rows(
+    team_state: &Item,
+    kev: &Item,
+    findings: &[(Finding, FindingState)],
+    deps: &[Item],
+) -> Value {
     let opt = |i: &Item, k: &str| Some(s(i, k)).filter(|v| !v.is_empty());
     let open: Vec<&Finding> = findings
         .iter()
@@ -312,25 +447,62 @@ pub fn source_rows(team_state: &Item, kev: &Item, findings: &[(Finding, FindingS
         .filter(|f| f.status.is_open())
         .collect();
     let from = |src: &str| open.iter().filter(|f| f.advisory.source == src).count();
-    let dependabot_state = s(team_state, "dependabot");
+    // Read from every repository when there are dependency rows: the team's
+    // own fields are whichever repository was read last.
+    let dep_p = repo_problems(deps, Check::Dependabot);
+    let osv_p = repo_problems(deps, Check::Osv);
+    let total = deps.len();
+    let dependabot_state = if deps.is_empty() || dep_p.read == 0 {
+        s(team_state, "dependabot")
+    } else {
+        match dep_p.now.first().map(|(_, p)| p.kind) {
+            None => "on".into(),
+            Some(Kind::DependabotOff) => "off".into(),
+            Some(Kind::DependabotNoPermission) => "no_permission".into(),
+            Some(_) => "error".into(),
+        }
+    };
+    let team_reason = if deps.is_empty() || dep_p.read == 0 {
+        opt(team_state, "dependabot_reason")
+    } else {
+        Some(repos_reason(&dep_p, total)).filter(|r| !r.is_empty())
+    };
     let (d_state, d_reason) = match dependabot_state.as_str() {
         "" => ("never", "Read on the first check of each repository.".to_string()),
         "on" => ("ok", String::new()),
-        "off" => ("off", opt(team_state, "dependabot_reason").unwrap_or_else(|| "Dependabot alerts are turned off for a repository; turn them on in its Settings, Code security.".into())),
-        "not_accepted" | "no_permission" => ("needs_permission", opt(team_state, "dependabot_reason").unwrap_or_else(|| "The GitHub App needs Dependabot alerts: read.".into())),
-        _ => ("error", opt(team_state, "dependabot_reason").unwrap_or_else(|| "The last read of Dependabot's alerts failed; the next check records why.".into())),
+        "off" => ("off", team_reason.clone().unwrap_or_else(|| "Dependabot alerts are turned off for a repository; turn them on in its Settings, Code security.".into())),
+        "not_accepted" | "no_permission" => ("needs_permission", team_reason.clone().unwrap_or_else(|| "The GitHub App needs Dependabot alerts: read.".into())),
+        _ => ("error", team_reason.clone().unwrap_or_else(|| "The last read of Dependabot's alerts failed; the next check tries again.".into())),
     };
-    let osv_error = opt(team_state, "osv_error");
+    let osv_error = if deps.is_empty() || osv_p.read == 0 {
+        opt(team_state, "osv_error").map(|e| format!("{e}; tried again on the next check."))
+    } else {
+        Some(repos_reason(&osv_p, total)).filter(|r| !r.is_empty())
+    };
     let osv_synced = opt(team_state, "osv_synced_at");
     let adv_at = opt(team_state, "advisory_event_at");
     let adv_polled = opt(team_state, "advisory_polled_at");
+    let poll_p = team_problem(team_state, Check::AdvisoryPoll);
     let poll = AdvisoryPoll {
         run_at: opt(team_state, "advisory_poll_run_at"),
         read_up_to: opt(team_state, "advisory_poll_from"),
-        error: opt(team_state, "advisory_poll_error"),
+        // The poll's problem state when kept; its last run's field before.
+        error: match &poll_p {
+            Some(p) => p.current.as_ref().map(|_| {
+                opt(team_state, "advisory_poll_error")
+                    .unwrap_or_else(|| "GitHub didn't answer".into())
+            }),
+            None => opt(team_state, "advisory_poll_error"),
+        },
     };
-    // The poll has read something: it finished once, or keeps a checkpoint.
-    let poll_read = adv_polled.is_some() || poll.read_up_to.is_some();
+    // The poll has read something: it finished once, keeps a checkpoint, or
+    // ran (a run that read pages but lost its checkpoint save still polled).
+    let poll_read = adv_polled.is_some() || poll.read_up_to.is_some() || poll.run_at.is_some();
+    let epss_p = team_problem(team_state, Check::Epss);
+    let epss_error = epss_p
+        .as_ref()
+        .and_then(|p| p.current.as_ref())
+        .map(|p| p.message.clone());
     let poll_synced = latest(
         adv_polled.clone(),
         poll.run_at.clone().filter(|_| poll.read_up_to.is_some()),
@@ -345,6 +517,7 @@ pub fn source_rows(team_state: &Item, kev: &Item, findings: &[(Finding, FindingS
             "state": d_state,
             "access": if dependabot_state.is_empty() { "on" } else { dependabot_state.as_str() },
             "reason": d_reason,
+            "recovered_at": if d_state == "ok" { dep_p.recovered_at.clone() } else { None },
             "synced_at": opt(team_state, "dependabot_checked_at"),
             "count": open.iter().filter(|f| f.dependabot_alert.is_some() || f.advisory.source == "dependabot").count(),
         },
@@ -357,7 +530,8 @@ pub fn source_rows(team_state: &Item, kev: &Item, findings: &[(Finding, FindingS
                 (None, Some(_)) => "ok",
                 _ => "never",
             },
-            "reason": osv_error.clone().map(|e| format!("{e}; tried again on the next check.")).unwrap_or_default(),
+            "reason": osv_error.clone().unwrap_or_default(),
+            "recovered_at": if osv_error.is_none() { osv_p.recovered_at.clone() } else { None },
             "synced_at": osv_synced,
             "count": from("osv"),
         },
@@ -367,6 +541,7 @@ pub fn source_rows(team_state: &Item, kev: &Item, findings: &[(Finding, FindingS
             "gives": "New and changed GitHub advisories (the security_advisory webhook, and GitHub's advisory database read about hourly), matched against the dependency lists.",
             "state": if poll.error.is_some() { "error" } else if adv_at.is_some() || poll_read { "ok" } else { "never" },
             "reason": advisory_feed_reason(adv_at.as_deref(), adv_polled.as_deref(), &poll),
+            "recovered_at": recovered(&poll_p),
             "synced_at": latest(adv_at.clone(), poll_synced.clone()),
             "webhook_at": adv_at,
             "polled_at": adv_polled,
@@ -382,7 +557,7 @@ pub fn source_rows(team_state: &Item, kev: &Item, findings: &[(Finding, FindingS
         {
             "id": "kev",
             "name": "CISA known exploited list",
-            "gives": "Vulnerabilities attackers are using now, with CISA's due date. On the list and loaded at runtime is P0.",
+            "gives": "Vulnerabilities attackers are using now, with CISA's due date. A listed one that your running code loads goes to the top tier (P0).",
             "state": if kev_at.is_some() { "ok" } else { "never" },
             "reason": if kev_at.is_some() { String::new() } else { "Read once a day on the first check.".into() },
             "synced_at": kev_at,
@@ -393,8 +568,13 @@ pub fn source_rows(team_state: &Item, kev: &Item, findings: &[(Finding, FindingS
             "id": "epss",
             "name": "FIRST EPSS",
             "gives": "The chance each vulnerability is exploited in the next 30 days. 0.1 or more raises the tier.",
-            "state": if epss_at.is_some() { "ok" } else { "never" },
-            "reason": if epss_at.is_some() { String::new() } else { "Read once a day for open findings.".into() },
+            "state": if epss_error.is_some() { "error" } else if epss_at.is_some() { "ok" } else { "never" },
+            "reason": match (&epss_error, &epss_at) {
+                (Some(e), _) => e.clone(),
+                (None, Some(_)) => String::new(),
+                (None, None) => "Read once a day for open findings.".into(),
+            },
+            "recovered_at": recovered(&epss_p),
             "synced_at": epss_at,
             "count": open.iter().filter(|f| f.advisory.epss.is_some()).count(),
         },
@@ -457,7 +637,7 @@ pub fn repo_rows(deps: &[Item], cfg: &SecurityConfig, team_state: &Item) -> Valu
             }) {
                 rows.push(json!({
                     "repo": r, "packages": 0, "ecosystems": {}, "read_at": null, "state": "not_read",
-                    "reason": "Not read yet: its first check runs within 20 minutes of turning Security on.",
+                    "reason": "Not read yet: the next security check reads it.",
                     "unpinned": 0, "dependabot": null, "dependabot_reason": "", "osv_error": null, "next_read": "",
                 }));
             }
@@ -576,7 +756,6 @@ pub async fn overview(
         // Not read yet: "on" until a read says otherwise.
         _ => "on",
     };
-    let permission_missing = matches!(dependabot, "no_permission" | "not_accepted");
     out["enabled"] = json!(cfg.enabled);
     out["dry_run"] = json!(cfg.dry_run);
     out["bundle"] = json!(cfg.bundle);
@@ -588,7 +767,6 @@ pub async fn overview(
         "epss_synced_at": opt(&team_state, "epss_synced_at"),
         "repository_advisories": sec::repo_advisories_source(&s(&team_state, "repository_advisories")),
     });
-    out["source_rows"] = source_rows(&team_state, &kev, &findings);
     let deps = query_prefix(
         &state,
         &claims.team_id,
@@ -605,9 +783,28 @@ pub async fn overview(
             "dependabot",
             "dependabot_reason",
             "osv_error",
+            "osv_synced_at",
+            "problem_dependabot",
+            "problem_osv",
         ],
     )
     .await?;
+    let rows = source_rows(&team_state, &kev, &findings, &deps);
+    // The Dependabot state the banner and the row read: every repository's.
+    let dep_row = rows
+        .as_array()
+        .and_then(|r| r.iter().find(|r| r["id"] == "dependabot"))
+        .cloned()
+        .unwrap_or_default();
+    let dep_access = dep_row["access"].as_str().unwrap_or("on").to_string();
+    out["sources"]["dependabot"] = json!(match dep_access.as_str() {
+        "off" | "no_permission" | "not_accepted" | "error" => dep_access.as_str(),
+        _ => "on",
+    });
+    out["sources"]["dependabot_reason"] =
+        json!(dep_row["reason"].as_str().filter(|r| !r.is_empty()));
+    let permission_missing = matches!(dep_access.as_str(), "no_permission" | "not_accepted");
+    out["source_rows"] = rows;
     out["repos"] = repo_rows(&deps, &cfg, &team_state);
     out["spend"] = spend(&state, &claims.team_id, &cfg).await?;
     out["permission_missing"] = json!(permission_missing);
@@ -2129,6 +2326,7 @@ mod tests {
             &st,
             &item(&[("synced_at", "2026-11-11T02:22:00Z"), ("count", "1484")]),
             &fs,
+            &[],
         );
         let by = |id: &str| {
             rows.as_array()
@@ -2153,6 +2351,7 @@ mod tests {
             &item(&[("osv_error", "OSV answered 503")]),
             &Item::new(),
             &fs,
+            &[],
         );
         assert_eq!(err[1]["state"], "error");
         assert_eq!(
@@ -2231,7 +2430,7 @@ mod tests {
     #[test]
     fn the_advisory_feed_counts_the_poll_until_a_webhook_arrives() {
         let row = |st: &Item| {
-            source_rows(st, &Item::new(), &[])
+            source_rows(st, &Item::new(), &[], &[])
                 .as_array()
                 .unwrap()
                 .iter()
@@ -2241,16 +2440,23 @@ mod tests {
         };
         let none = row(&Item::new());
         assert_eq!(none["state"], "never");
-        assert!(none["reason"]
+        assert!(none["reason"].as_str().unwrap().starts_with(
+            "Read by polling GitHub's advisory database about hourly; the first read"
+        ));
+        // A run that read pages but kept no checkpoint still polled: never
+        // "Not synced yet" for a feed that polls every hour.
+        let ran = row(&item(&[("advisory_poll_run_at", "2026-11-11T07:00:00Z")]));
+        assert_eq!(ran["state"], "ok");
+        assert!(ran["reason"]
             .as_str()
             .unwrap()
-            .starts_with("Waiting for GitHub's first webhook"));
+            .contains("last read Nov 11, 07:00 UTC"));
         let polled = row(&item(&[("advisory_polled_at", "2026-11-11T06:00:00Z")]));
         assert_eq!(polled["state"], "ok");
         assert_eq!(polled["synced_at"], "2026-11-11T06:00:00Z");
         assert_eq!(
             polled["reason"],
-            "Waiting for GitHub's first webhook; checked by polling at Nov 11, 06:00 UTC."
+            "Read by polling GitHub's advisory database about hourly; last read Nov 11, 06:00 UTC."
         );
         // Last read is whichever ran last; a webhook clears the note.
         let both = row(&item(&[
@@ -2270,7 +2476,7 @@ mod tests {
     #[test]
     fn the_advisory_feed_shows_a_poll_catching_up_or_failing() {
         let row = |st: &Item| {
-            source_rows(st, &Item::new(), &[])
+            source_rows(st, &Item::new(), &[], &[])
                 .as_array()
                 .unwrap()
                 .iter()
@@ -2688,5 +2894,120 @@ mod tests {
             .starts_with("This request takes the first 1000 fixes (1000 findings)"));
         let small = resolve_selection(&fs[..3], &select(GroupQuery::default(), &[])).unwrap();
         assert_eq!(small.json()["note"], Value::Null);
+    }
+
+    /// The Sources rows read every repository's own state: one repository
+    /// with alerts off says so (with which one) even when the repository read
+    /// last is fine, and once each repository's check passes again the row is
+    /// "on" with when it recovered.
+    #[test]
+    fn sources_read_every_repository_and_clear_when_their_checks_pass() {
+        use common::problems::{record, Check, Kind, Outcome, ProblemState};
+        let state = |check: Check, fail: Option<Kind>| {
+            let mut st = ProblemState::default();
+            if let Some(k) = fail {
+                record(
+                    &mut st,
+                    check,
+                    Outcome::Fail(k, "Dependabot alerts are off for this repository.".into()),
+                    "2026-11-11T01:00:00Z",
+                );
+            }
+            record(&mut st, check, Outcome::Pass, "2026-11-11T02:00:00Z");
+            st
+        };
+        let row = |deps: &[Item], team: &Item, id: &str| {
+            source_rows(team, &Item::new(), &[], deps)
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["id"] == id)
+                .unwrap()
+                .clone()
+        };
+        let dep_row = |repo: &str, st: &ProblemState| {
+            let mut i = item(&[("repo", repo)]);
+            i.insert("problem_dependabot".into(), AttributeValue::S(st.to_json()));
+            i
+        };
+        // acme/api is off now; acme/web (read last, team row "on") is fine.
+        let mut off = ProblemState::default();
+        record(
+            &mut off,
+            Check::Dependabot,
+            Outcome::Fail(
+                Kind::DependabotOff,
+                "Dependabot alerts are off for this repository.".into(),
+            ),
+            "2026-11-11T03:00:00Z",
+        );
+        let on = state(Check::Dependabot, None);
+        let team = item(&[("dependabot", "on")]);
+        let r = row(
+            &[dep_row("acme/api", &off), dep_row("acme/web", &on)],
+            &team,
+            "dependabot",
+        );
+        assert_eq!(r["state"], "off");
+        assert_eq!(
+            r["reason"],
+            "acme/api: Dependabot alerts are off for this repository."
+        );
+        // It passes again: on, with when it recovered, and no old text.
+        let recovered = state(Check::Dependabot, Some(Kind::DependabotOff));
+        let r = row(
+            &[dep_row("acme/api", &recovered), dep_row("acme/web", &on)],
+            &team,
+            "dependabot",
+        );
+        assert_eq!(r["state"], "ok");
+        assert_eq!(r["reason"], "");
+        assert_eq!(r["recovered_at"], "2026-11-11T02:00:00Z");
+        // A row from before the problem state reads its old fields per repository.
+        let legacy = [
+            item(&[
+                ("repo", "acme/api"),
+                ("osv_error", "OSV answered 503"),
+                ("updated_at", "2026-11-11T01:00:00Z"),
+            ]),
+            item(&[
+                ("repo", "acme/web"),
+                ("osv_synced_at", "2026-11-11T01:00:00Z"),
+                ("updated_at", "2026-11-11T01:00:00Z"),
+            ]),
+        ];
+        let r = row(&legacy, &Item::new(), "osv");
+        assert_eq!(r["state"], "error");
+        assert_eq!(
+            r["reason"],
+            "acme/api: OSV answered 503; tried again on the next check."
+        );
+    }
+
+    /// EPSS: a failed read is an error, never a fresh sync; a later pass clears it.
+    #[test]
+    fn epss_says_a_failed_read_until_the_next_read_passes() {
+        use common::problems::{record, Check, Kind, Outcome, ProblemState};
+        let mut st = ProblemState::default();
+        record(
+            &mut st,
+            Check::Epss,
+            Outcome::Fail(
+                Kind::EpssReadFailed,
+                "FIRST's scores couldn't be read (FIRST answered 503); tried again tomorrow."
+                    .into(),
+            ),
+            "2026-11-11T00:20:00Z",
+        );
+        let mut team = item(&[("epss_synced_at", "2026-11-10T00:20:00Z")]);
+        team.insert("problem_epss".into(), AttributeValue::S(st.to_json()));
+        let epss = |t: &Item| source_rows(t, &Item::new(), &[], &[])[4].clone();
+        assert_eq!(epss(&team)["state"], "error");
+        assert!(epss(&team)["reason"].as_str().unwrap().contains("503"));
+        record(&mut st, Check::Epss, Outcome::Pass, "2026-11-12T00:20:00Z");
+        team.insert("problem_epss".into(), AttributeValue::S(st.to_json()));
+        assert_eq!(epss(&team)["state"], "ok");
+        assert_eq!(epss(&team)["reason"], "");
+        assert_eq!(epss(&team)["recovered_at"], "2026-11-12T00:20:00Z");
     }
 }

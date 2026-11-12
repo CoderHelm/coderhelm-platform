@@ -40,6 +40,8 @@ use common::security_fixes::{
 use serde_json::{json, Value};
 use tracing::{info, warn};
 
+use common::problems::{self, Check, Kind, Outcome};
+
 use crate::clients::github::GitHubClient;
 use crate::models::{SecurityEventMessage, TicketMessage, TicketSource, TokenUsage, WorkerMessage};
 use crate::passes::{attr_n, attr_s};
@@ -322,6 +324,27 @@ async fn set_team_state(state: &WorkerState, team_id: &str, fields: &[(&str, Att
     {
         warn!(team_id, error = %e, "security: could not save the source status");
     }
+}
+
+/// Records one run of a source's check on `sk` (a repository's dependency
+/// row, or the team's source status): a pass clears what that check set.
+async fn record_problem(
+    state: &WorkerState,
+    team_id: &str,
+    sk: &str,
+    check: Check,
+    outcome: Outcome,
+) {
+    problems::record_on(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        team_id,
+        sk,
+        check,
+        outcome,
+        &Utc::now().to_rfc3339(),
+    )
+    .await;
 }
 
 async fn claim(state: &WorkerState, pk: &str, sk: &str, ttl: u64) -> bool {
@@ -806,6 +829,34 @@ async fn record_dependabot(cx: &Ctx<'_>, repo: &str, access: &sec::DependabotAcc
         ],
     )
     .await;
+    // The repository's own problem state: the team's row above is whichever
+    // repository was read last, the page reads every repository's.
+    let sk = sec::deps_sk(repo);
+    let kind = match access.state.as_str() {
+        "on" => None,
+        "off" => Some(Kind::DependabotOff),
+        "no_permission" | "not_accepted" => Some(Kind::DependabotNoPermission),
+        _ => Some(Kind::DependabotReadFailed),
+    };
+    match kind {
+        None => record_problem(cx.state, cx.team_id, &sk, Check::Dependabot, Outcome::Pass).await,
+        Some(k) => {
+            let why = if access.reason.is_empty() {
+                "The last read of Dependabot's alerts failed; the next check tries again."
+                    .to_string()
+            } else {
+                access.reason.clone()
+            };
+            record_problem(
+                cx.state,
+                cx.team_id,
+                &sk,
+                Check::Dependabot,
+                Outcome::Fail(k, why),
+            )
+            .await
+        }
+    }
 }
 
 /// OSV's matches for some packages: `(index, vulnerability id)`, following
@@ -1000,24 +1051,43 @@ async fn kev(state: &WorkerState) -> BTreeMap<String, String> {
 }
 
 /// FIRST's EPSS scores for the CVEs of open findings.
-async fn epss(state: &WorkerState, cves: &[String]) -> HashMap<String, (f64, f64)> {
+/// FIRST's scores for these CVEs, and why a batch couldn't be read (the
+/// scores read before it are kept).
+async fn epss(
+    state: &WorkerState,
+    cves: &[String],
+) -> (HashMap<String, (f64, f64)>, Option<String>) {
     let mut out = HashMap::new();
+    let mut failed = None;
     for batch in sec::epss_batches(cves) {
         let url = format!("{}?cve={}", sec::EPSS_API, batch);
-        let Ok(r) = state
+        let r = match state
             .http
             .get(url)
             .timeout(std::time::Duration::from_secs(20))
             .send()
             .await
-        else {
-            continue;
+        {
+            Ok(r) if r.status().is_success() => r,
+            Ok(r) => {
+                failed = Some(format!("FIRST answered {}", r.status().as_u16()));
+                continue;
+            }
+            Err(e) => {
+                failed = Some(if e.is_timeout() {
+                    "FIRST didn't answer in time".to_string()
+                } else {
+                    "FIRST couldn't be reached".to_string()
+                });
+                continue;
+            }
         };
-        if let Ok(v) = r.json::<Value>().await {
-            out.extend(sec::epss_map(&v));
+        match r.json::<Value>().await {
+            Ok(v) => out.extend(sec::epss_map(&v)),
+            Err(_) => failed = Some("FIRST's answer couldn't be read".to_string()),
         }
     }
-    out
+    (out, failed)
 }
 
 // ── Triage ──────────────────────────────────────────────────────────────
@@ -1942,6 +2012,14 @@ async fn sync_repo(
                 &[("osv_synced_at", attr_s(&now)), ("osv_error", attr_s(""))],
             )
             .await;
+            record_problem(
+                cx.state,
+                cx.team_id,
+                &sec::deps_sk(repo),
+                Check::Osv,
+                Outcome::Pass,
+            )
+            .await;
             obs.extend(o);
         }
         Err(why) => {
@@ -1951,6 +2029,17 @@ async fn sync_repo(
                 cx.state,
                 cx.team_id,
                 &[("osv_error", attr_s(&why)), ("osv_error_at", attr_s(&now))],
+            )
+            .await;
+            record_problem(
+                cx.state,
+                cx.team_id,
+                &sec::deps_sk(repo),
+                Check::Osv,
+                Outcome::Fail(
+                    Kind::OsvReadFailed,
+                    format!("{why}; tried again on the next check."),
+                ),
             )
             .await;
         }
@@ -2050,13 +2139,41 @@ async fn tend(
             .collect();
         cves.sort();
         cves.dedup();
-        let m = epss(cx.state, &cves).await;
-        set_team_state(
-            cx.state,
-            cx.team_id,
-            &[("epss_synced_at", attr_s(&now.to_rfc3339()))],
-        )
-        .await;
+        let (m, failed) = epss(cx.state, &cves).await;
+        match failed {
+            // Synced only when every batch was read: a failed read never
+            // shows as a fresh sync.
+            None => {
+                set_team_state(
+                    cx.state,
+                    cx.team_id,
+                    &[("epss_synced_at", attr_s(&now.to_rfc3339()))],
+                )
+                .await;
+                record_problem(
+                    cx.state,
+                    cx.team_id,
+                    sec::STATE_SK,
+                    Check::Epss,
+                    Outcome::Pass,
+                )
+                .await;
+            }
+            Some(why) => {
+                warn!(team_id = cx.team_id, error = %why, "security: EPSS couldn't be read");
+                record_problem(
+                    cx.state,
+                    cx.team_id,
+                    sec::STATE_SK,
+                    Check::Epss,
+                    Outcome::Fail(
+                        Kind::EpssReadFailed,
+                        format!("FIRST's scores couldn't be read ({why}); tried again tomorrow."),
+                    ),
+                )
+                .await;
+            }
+        }
         m
     } else {
         HashMap::new()
@@ -3706,9 +3823,27 @@ async fn poll_advisories(cx: &Ctx<'_>, findings: &mut Vec<(Finding, FindingState
     };
     match &r.error {
         Some(e) => {
-            warn!(team_id = cx.team_id, error = %e, poll = %line(&r), "security: advisory poll failed")
+            warn!(team_id = cx.team_id, error = %e, poll = %line(&r), "security: advisory poll failed");
+            record_problem(
+                cx.state,
+                cx.team_id,
+                sec::STATE_SK,
+                Check::AdvisoryPoll,
+                Outcome::Fail(Kind::AdvisoryPollFailed, format!("The last read of GitHub's advisory database failed ({e}); it is tried again within the hour.")),
+            )
+            .await;
         }
-        None => info!(team_id = cx.team_id, poll = %line(&r), "security: advisory poll"),
+        None => {
+            info!(team_id = cx.team_id, poll = %line(&r), "security: advisory poll");
+            record_problem(
+                cx.state,
+                cx.team_id,
+                sec::STATE_SK,
+                Check::AdvisoryPoll,
+                Outcome::Pass,
+            )
+            .await;
+        }
     }
     r.created
 }

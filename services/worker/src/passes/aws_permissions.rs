@@ -64,7 +64,13 @@ async fn accounts_by_team(
 /// Pure: whether a team that was last told about `told` should be told now.
 pub fn should_tell(checks: &[PermissionCheck], told: Option<&str>) -> bool {
     let id = common::log_reader::permissions_id();
-    told != Some(id.as_str()) && checks.iter().any(|c| c.status() == "update_needed")
+    told != Some(id.as_str()) && checks.iter().any(needs_people)
+}
+
+/// An account a person has to update: the install's own gets its
+/// permissions with the next Coderhelm update, so it is never asked.
+fn needs_people(c: &PermissionCheck) -> bool {
+    c.status() == "update_needed" && !c.install_account
 }
 
 /// Claims this permissions id for the team: true only for the one sweep that
@@ -150,7 +156,7 @@ pub async fn run(state: &WorkerState) -> Result<Report, String> {
         }
         let needing: Vec<(String, usize)> = checks
             .iter()
-            .filter(|c| c.status() == "update_needed")
+            .filter(|c| needs_people(c))
             .map(|c| (c.account.clone(), c.missing.len()))
             .collect();
         let url = format!(
@@ -205,5 +211,9 @@ mod tests {
         assert!(should_tell(&need, Some("00000000")));
         assert!(!should_tell(&need, Some(&id)));
         assert!(!should_tell(&[check(&[])], None));
+        // The install's own account is never asked to update.
+        let mut own = need[0].clone();
+        own.install_account = true;
+        assert!(!should_tell(&[own], None));
     }
 }
