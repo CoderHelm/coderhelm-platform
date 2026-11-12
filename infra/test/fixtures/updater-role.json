@@ -1,0 +1,684 @@
+{
+  "account": "111122223333",
+  "region": "us-east-1",
+  "stack": "coderhelm-prod",
+  "deployRoleArn": "arn:aws:iam::111122223333:role/coderhelm-prod-deploy-stack",
+  "boundaryArn": "arn:aws:iam::111122223333:policy/coderhelm-prod-boundary-stack",
+  "identity": [
+    {
+      "Statement": [
+        {
+          "Action": [
+            "kms:Decrypt",
+            "kms:DescribeKey",
+            "kms:Encrypt",
+            "kms:ReEncrypt*",
+            "kms:GenerateDataKey*"
+          ],
+          "Effect": "Allow",
+          "Resource": {
+            "Ref": "Imp1a6e52e87b82"
+          }
+        },
+        {
+          "Action": [
+            "dynamodb:BatchGetItem",
+            "dynamodb:Query",
+            "dynamodb:GetItem",
+            "dynamodb:Scan",
+            "dynamodb:ConditionCheckItem",
+            "dynamodb:BatchWriteItem",
+            "dynamodb:PutItem",
+            "dynamodb:UpdateItem",
+            "dynamodb:DeleteItem",
+            "dynamodb:DescribeTable"
+          ],
+          "Effect": "Allow",
+          "Resource": {
+            "Ref": "Impc7032c9ec0d3"
+          }
+        },
+        {
+          "Action": [
+            "dynamodb:GetRecords",
+            "dynamodb:GetShardIterator"
+          ],
+          "Effect": "Allow",
+          "Resource": {
+            "Ref": "Impc7032c9ec0d3"
+          }
+        },
+        {
+          "Action": "codebuild:StartBuild",
+          "Effect": "Allow",
+          "Resource": {
+            "Fn::GetAtt": [
+              "ReleaseCheck8B2118C4",
+              "Arn"
+            ]
+          }
+        },
+        {
+          "Action": "codebuild:BatchGetBuilds",
+          "Effect": "Allow",
+          "Resource": {
+            "Fn::GetAtt": [
+              "ReleaseCheck8B2118C4",
+              "Arn"
+            ]
+          }
+        },
+        {
+          "Action": "secretsmanager:GetSecretValue",
+          "Effect": "Allow",
+          "Resource": "arn:aws:secretsmanager:us-east-1:111122223333:secret:coderhelm/prod/secrets-??????",
+          "Sid": "ReadHybridRegistrationForMail"
+        },
+        {
+          "Action": "ses:SendEmail",
+          "Condition": {
+            "StringEquals": {
+              "ses:FromAddress": "owner@example.org"
+            }
+          },
+          "Effect": "Allow",
+          "Resource": "*"
+        },
+        {
+          "Action": "lambda:InvokeFunction",
+          "Effect": "Allow",
+          "Resource": "arn:aws:lambda:us-east-1:111122223333:function:coderhelm-prod-worker",
+          "Sid": "ModelCheckThroughWorker"
+        },
+        {
+          "Action": [
+            "lambda:GetFunctionConfiguration",
+            "lambda:UpdateFunctionConfiguration"
+          ],
+          "Effect": "Allow",
+          "Resource": [
+            "arn:aws:lambda:us-east-1:111122223333:function:coderhelm-prod-gateway",
+            "arn:aws:lambda:us-east-1:111122223333:function:coderhelm-prod-streaming",
+            "arn:aws:lambda:us-east-1:111122223333:function:coderhelm-prod-worker"
+          ],
+          "Sid": "RestartSecretReaders"
+        },
+        {
+          "Action": [
+            "acm:DescribeCertificate",
+            "acm:AddTagsToCertificate"
+          ],
+          "Effect": "Allow",
+          "Resource": "arn:aws:acm:us-east-1:111122223333:certificate/*",
+          "Sid": "DomainCertificate"
+        },
+        {
+          "Action": "acm:RequestCertificate",
+          "Condition": {
+            "StringEquals": {
+              "aws:RequestedRegion": "us-east-1"
+            }
+          },
+          "Effect": "Allow",
+          "Resource": "*",
+          "Sid": "DomainCertificateRequest"
+        },
+        {
+          "Action": "ssm:GetParameter",
+          "Effect": "Allow",
+          "Resource": "arn:aws:ssm:us-east-1:111122223333:parameter/coderhelm-prod/distribution-domain",
+          "Sid": "DomainTarget"
+        },
+        {
+          "Action": [
+            "ssm:GetParameter",
+            "ssm:PutParameter",
+            "ssm:DeleteParameter"
+          ],
+          "Effect": "Allow",
+          "Resource": "arn:aws:ssm:us-east-1:111122223333:parameter/coderhelm-prod/uninstall/delete-data",
+          "Sid": "UninstallSwitch"
+        },
+        {
+          "Action": "lambda:InvokeFunction",
+          "Effect": "Allow",
+          "Resource": "arn:aws:lambda:us-east-1:111122223333:function:coderhelm-prod-install-helper",
+          "Sid": "StageReleaseFiles"
+        },
+        {
+          "Action": "s3:GetObject",
+          "Effect": "Allow",
+          "Resource": "arn:aws:s3:::coderhelm-prod-release-111122223333/releases/*",
+          "Sid": "ReadStagedTemplates"
+        },
+        {
+          "Action": "cloudformation:CreateChangeSet",
+          "Condition": {
+            "StringLike": {
+              "cloudformation:TemplateUrl": [
+                "https://coderhelm-public.s3.amazonaws.com/launch/v*.*.*/coderhelm.json",
+                "https://coderhelm-prod-release-111122223333.s3.us-east-1.amazonaws.com/releases/v*.*.*/held/coderhelm.json"
+              ]
+            },
+            "StringEqualsIfExists": {
+              "cloudformation:RoleArn": "arn:aws:iam::111122223333:role/coderhelm-prod-deploy-stack"
+            }
+          },
+          "Effect": "Allow",
+          "Resource": "arn:aws:cloudformation:us-east-1:111122223333:stack/coderhelm-prod/*",
+          "Sid": "ProposeReleaseUpdate"
+        },
+        {
+          "Action": "cloudformation:CreateChangeSet",
+          "Condition": {
+            "StringLikeIfExists": {
+              "cloudformation:TemplateUrl": [
+                "https://coderhelm-prod-release-111122223333.s3.us-east-1.amazonaws.com/releases/v*.*.*/stacks/*.json"
+              ]
+            },
+            "StringEqualsIfExists": {
+              "cloudformation:RoleArn": "arn:aws:iam::111122223333:role/coderhelm-prod-deploy-stack"
+            }
+          },
+          "Effect": "Allow",
+          "Resource": "arn:aws:cloudformation:us-east-1:111122223333:stack/coderhelm-prod-*/*",
+          "Sid": "ProposePartUpdates"
+        },
+        {
+          "Action": "cloudformation:CreateChangeSet",
+          "Condition": {
+            "StringEqualsIfExists": {
+              "cloudformation:RoleArn": "arn:aws:iam::111122223333:role/coderhelm-prod-deploy-stack"
+            }
+          },
+          "Effect": "Allow",
+          "Resource": "arn:aws:cloudformation:us-east-1:aws:transform/LanguageExtensions",
+          "Sid": "ProposeThroughTransform"
+        },
+        {
+          "Action": [
+            "cloudformation:DescribeChangeSet",
+            "cloudformation:ListChangeSets",
+            "cloudformation:ExecuteChangeSet",
+            "cloudformation:DeleteChangeSet",
+            "cloudformation:DescribeStacks",
+            "cloudformation:DescribeStackEvents",
+            "cloudformation:GetTemplate"
+          ],
+          "Effect": "Allow",
+          "Resource": [
+            "arn:aws:cloudformation:us-east-1:111122223333:stack/coderhelm-prod/*",
+            "arn:aws:cloudformation:us-east-1:111122223333:stack/coderhelm-prod-*/*"
+          ],
+          "Sid": "ReviewAndApplyReleaseUpdate"
+        },
+        {
+          "Action": "cloudformation:ContinueUpdateRollback",
+          "Effect": "Allow",
+          "Resource": "arn:aws:cloudformation:us-east-1:111122223333:stack/coderhelm-prod/*",
+          "Sid": "RecoverFailedRollback"
+        },
+        {
+          "Action": [
+            "iam:GetRole",
+            "iam:GetRolePolicy",
+            "iam:ListRolePolicies",
+            "iam:ListAttachedRolePolicies",
+            "iam:GetPolicy",
+            "iam:GetPolicyVersion"
+          ],
+          "Effect": "Allow",
+          "Resource": [
+            "arn:aws:iam::111122223333:role/coderhelm-prod-deploy-stack",
+            "arn:aws:iam::111122223333:policy/coderhelm-prod-boundary-stack",
+            "arn:aws:iam::111122223333:policy/coderhelm-prod-deploy-boundary-stack"
+          ],
+          "Sid": "ReadDeployRoleAccess"
+        },
+        {
+          "Action": "iam:PassRole",
+          "Condition": {
+            "StringEquals": {
+              "iam:PassedToService": "cloudformation.amazonaws.com"
+            }
+          },
+          "Effect": "Allow",
+          "Resource": "arn:aws:iam::111122223333:role/coderhelm-prod-deploy-stack",
+          "Sid": "AutoUpdateThroughDeployRole"
+        }
+      ],
+      "Version": "2012-10-17"
+    }
+  ],
+  "boundary": {
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Sid": "CoderHelmServices",
+        "Effect": "Allow",
+        "Action": [
+          "acm:*",
+          "apigateway:*",
+          "bedrock:InvokeModel",
+          "bedrock:InvokeModelWithResponseStream",
+          "bedrock:Get*",
+          "bedrock:List*",
+          "cloudformation:*",
+          "cloudfront:*",
+          "cloudwatch:*",
+          "codebuild:*",
+          "cognito-idp:*",
+          "dynamodb:*",
+          "events:*",
+          "kms:*",
+          "lambda:*",
+          "logs:*",
+          "s3:*",
+          "scheduler:*",
+          "secretsmanager:*",
+          "ses:*",
+          "sns:*",
+          "sqs:*",
+          "ssm:*",
+          "sts:AssumeRole",
+          "sts:GetCallerIdentity"
+        ],
+        "Resource": "*"
+      },
+      {
+        "Sid": "InstallRoleWrites",
+        "Effect": "Allow",
+        "Action": [
+          "iam:CreateRole",
+          "iam:PutRolePolicy",
+          "iam:AttachRolePolicy",
+          "iam:DetachRolePolicy",
+          "iam:DeleteRolePolicy",
+          "iam:PutRolePermissionsBoundary"
+        ],
+        "Resource": "arn:aws:iam::111122223333:role/coderhelm-prod-*",
+        "Condition": {
+          "StringEquals": {
+            "iam:PermissionsBoundary": "arn:aws:iam::111122223333:policy/coderhelm-prod-boundary-stack"
+          }
+        }
+      },
+      {
+        "Sid": "InstallRoles",
+        "Effect": "Allow",
+        "Action": [
+          "iam:Get*",
+          "iam:List*",
+          "iam:DeleteRole",
+          "iam:UpdateRole*",
+          "iam:UpdateAssumeRolePolicy",
+          "iam:TagRole",
+          "iam:UntagRole",
+          "iam:PassRole"
+        ],
+        "Resource": "arn:aws:iam::111122223333:role/coderhelm-prod-*"
+      },
+      {
+        "Sid": "InstallPolicies",
+        "Effect": "Allow",
+        "Action": [
+          "iam:CreatePolicy*",
+          "iam:DeletePolicy*",
+          "iam:Get*",
+          "iam:List*",
+          "iam:TagPolicy",
+          "iam:UntagPolicy"
+        ],
+        "Resource": "arn:aws:iam::111122223333:policy/coderhelm-prod-*"
+      },
+      {
+        "Sid": "NoDnsChanges",
+        "Effect": "Deny",
+        "Action": [
+          "route53:ChangeResourceRecordSets",
+          "route53:CreateHostedZone",
+          "route53:DeleteHostedZone"
+        ],
+        "Resource": "*"
+      },
+      {
+        "Sid": "NoIamUsersOrKeys",
+        "Effect": "Deny",
+        "Action": [
+          "iam:*User*",
+          "iam:*AccessKey*",
+          "iam:*LoginProfile*",
+          "iam:*Group*",
+          "iam:*ServiceSpecificCredential*",
+          "iam:*SSHPublicKey*",
+          "iam:Create*Provider",
+          "iam:UpdateAccountPasswordPolicy",
+          "iam:CreateAccountAlias"
+        ],
+        "Resource": "*"
+      },
+      {
+        "Sid": "NoAccountGuardrailChanges",
+        "Effect": "Deny",
+        "Action": [
+          "organizations:*",
+          "account:*",
+          "cloudtrail:*",
+          "guardduty:*"
+        ],
+        "Resource": "*"
+      },
+      {
+        "Sid": "NoIamOutsideTheInstall",
+        "Effect": "Deny",
+        "Action": "iam:*",
+        "NotResource": [
+          "arn:aws:iam::111122223333:role/coderhelm-prod-*",
+          "arn:aws:iam::111122223333:policy/coderhelm-prod-*"
+        ]
+      },
+      {
+        "Sid": "RolesOnlyWithTheBoundary",
+        "Effect": "Deny",
+        "Action": [
+          "iam:CreateRole",
+          "iam:PutRolePolicy",
+          "iam:AttachRolePolicy",
+          "iam:DetachRolePolicy",
+          "iam:DeleteRolePolicy",
+          "iam:PutRolePermissionsBoundary"
+        ],
+        "Resource": "*",
+        "Condition": {
+          "StringNotEquals": {
+            "iam:PermissionsBoundary": "arn:aws:iam::111122223333:policy/coderhelm-prod-boundary-stack"
+          }
+        }
+      },
+      {
+        "Sid": "TheBoundaryStays",
+        "Effect": "Deny",
+        "Action": [
+          "iam:DeleteRolePermissionsBoundary",
+          "iam:CreatePolicy*",
+          "iam:DeletePolicy*",
+          "iam:SetDefault*",
+          "iam:*agPolicy"
+        ],
+        "Resource": [
+          "arn:aws:iam::111122223333:policy/coderhelm-prod-*boundary-stack",
+          "arn:aws:iam::111122223333:role/*"
+        ]
+      },
+      {
+        "Sid": "OnlyTheInstallsOwn",
+        "Effect": "Deny",
+        "Action": [
+          "lambda:CreateF*",
+          "lambda:CreateAlias",
+          "lambda:Delete*",
+          "lambda:Update*",
+          "lambda:Invoke*",
+          "lambda:Put*",
+          "lambda:*Permission",
+          "lambda:Publish*",
+          "cloudformation:Create*",
+          "cloudformation:Update*",
+          "cloudformation:Delete*",
+          "cloudformation:Execute*",
+          "cloudformation:Set*",
+          "cloudformation:Continue*",
+          "s3:Put*",
+          "s3:Delete*",
+          "secretsmanager:GetSecretValue",
+          "secretsmanager:Put*",
+          "secretsmanager:Update*",
+          "secretsmanager:Delete*",
+          "ssm:Put*",
+          "ssm:Delete*"
+        ],
+        "NotResource": [
+          "arn:*:lambda:*:*:function:coderhelm-prod-*",
+          "arn:*:lambda:*:*:layer:coderhelm-prod-*",
+          "arn:*:lambda:*:*:event-source-mapping:*",
+          "arn:*:cloudformation:*:*:stack/coderhelm-prod*",
+          "arn:*:cloudformation:*:aws:transform/*",
+          "arn:*:s3:::coderhelm-prod-*",
+          "arn:*:s3:::coderhelm-setup-*",
+          "arn:*:secretsmanager:*:*:secret:coderhelm/prod/*",
+          "arn:*:ssm:*:*:parameter/coderhelm-prod/*"
+        ]
+      },
+      {
+        "Sid": "NoCommandsOnInstances",
+        "Effect": "Deny",
+        "Action": [
+          "ssm:SendCommand",
+          "ssm:Start*",
+          "ssm:*Association*"
+        ],
+        "Resource": "*"
+      },
+      {
+        "Sid": "TheDeployRoleStays",
+        "Effect": "Deny",
+        "Action": [
+          "iam:CreateRole",
+          "iam:PutRolePolicy",
+          "iam:AttachRolePolicy",
+          "iam:DetachRolePolicy",
+          "iam:DeleteRolePolicy",
+          "iam:PutRolePermissionsBoundary",
+          "iam:DeleteRole",
+          "iam:UpdateRole",
+          "iam:UpdateAssumeRolePolicy",
+          "iam:TagRole",
+          "iam:UntagRole"
+        ],
+        "Resource": "arn:aws:iam::111122223333:role/coderhelm-prod-deploy-stack"
+      },
+      {
+        "Sid": "TheAccessStackStays",
+        "Effect": "Deny",
+        "Action": [
+          "cloudformation:CreateChangeSet",
+          "cloudformation:ExecuteChangeSet",
+          "cloudformation:UpdateStack",
+          "cloudformation:DeleteStack",
+          "cloudformation:CreateStack",
+          "cloudformation:SetStackPolicy"
+        ],
+        "Resource": "arn:aws:cloudformation:us-east-1:111122223333:stack/coderhelm-prod-access/*"
+      },
+      {
+        "Sid": "NoOtherRolesHere",
+        "Effect": "Deny",
+        "Action": [
+          "sts:AssumeRole",
+          "sts:AssumeRoleWithWebIdentity",
+          "sts:AssumeRoleWithSAML",
+          "sts:TagSession",
+          "sts:SetSourceIdentity"
+        ],
+        "NotResource": [
+          "arn:aws:iam::111122223333:role/CoderHelmLogReader",
+          "arn:aws:iam::111122223333:role/CoderhelmReadOnly"
+        ],
+        "Condition": {
+          "StringEquals": {
+            "aws:ResourceAccount": "111122223333"
+          }
+        }
+      },
+      {
+        "Sid": "ReadRolesHereAssumeOnly",
+        "Effect": "Deny",
+        "Action": [
+          "sts:AssumeRoleWithWebIdentity",
+          "sts:AssumeRoleWithSAML",
+          "sts:TagSession",
+          "sts:SetSourceIdentity"
+        ],
+        "Resource": [
+          "arn:aws:iam::111122223333:role/CoderHelmLogReader",
+          "arn:aws:iam::111122223333:role/CoderhelmReadOnly"
+        ]
+      },
+      {
+        "Sid": "ReadRolesHereOnlyGatewayAndWorker",
+        "Effect": "Deny",
+        "Action": "sts:AssumeRole",
+        "Resource": [
+          "arn:aws:iam::111122223333:role/CoderHelmLogReader",
+          "arn:aws:iam::111122223333:role/CoderhelmReadOnly"
+        ],
+        "Condition": {
+          "StringNotEquals": {
+            "aws:PrincipalTag/coderhelm:role": [
+              "gateway",
+              "worker"
+            ]
+          }
+        }
+      },
+      {
+        "Sid": "RuntimeTagOnlyByDeploy",
+        "Effect": "Deny",
+        "Action": [
+          "iam:CreateRole",
+          "iam:TagRole",
+          "iam:UntagRole"
+        ],
+        "Resource": "*",
+        "Condition": {
+          "ForAnyValue:StringEqualsIgnoreCase": {
+            "aws:TagKeys": [
+              "coderhelm:role"
+            ]
+          },
+          "ArnNotEquals": {
+            "aws:PrincipalArn": "arn:aws:iam::111122223333:role/coderhelm-prod-deploy-stack"
+          }
+        }
+      }
+    ]
+  },
+  "checks": [
+    {
+      "request": {
+        "action": "cloudformation:CreateChangeSet",
+        "resource": "arn:aws:cloudformation:us-east-1:111122223333:stack/coderhelm-prod/abc",
+        "context": {
+          "cloudformation:TemplateUrl": "https://coderhelm-public.s3.amazonaws.com/launch/v1.2.3/coderhelm.json",
+          "cloudformation:RoleArn": "arn:aws:iam::111122223333:role/coderhelm-prod-deploy-stack"
+        }
+      },
+      "verdict": "allowed"
+    },
+    {
+      "request": {
+        "action": "cloudformation:CreateChangeSet",
+        "resource": "arn:aws:cloudformation:us-east-1:111122223333:stack/coderhelm-prod/abc",
+        "context": {
+          "cloudformation:TemplateUrl": "https://coderhelm-prod-release-111122223333.s3.us-east-1.amazonaws.com/releases/v1.2.3/held/coderhelm.json",
+          "cloudformation:RoleArn": "arn:aws:iam::111122223333:role/coderhelm-prod-deploy-stack"
+        }
+      },
+      "verdict": "allowed"
+    },
+    {
+      "request": {
+        "action": "cloudformation:CreateChangeSet",
+        "resource": "arn:aws:cloudformation:us-east-1:111122223333:stack/coderhelm-prod/abc",
+        "context": {
+          "cloudformation:RoleArn": "arn:aws:iam::111122223333:role/coderhelm-prod-deploy-stack"
+        }
+      },
+      "verdict": "implicitDeny"
+    },
+    {
+      "request": {
+        "action": "cloudformation:CreateChangeSet",
+        "resource": "arn:aws:cloudformation:us-east-1:111122223333:stack/coderhelm-prod/abc",
+        "context": {
+          "cloudformation:TemplateUrl": "https://example.org/launch/v1.2.3/coderhelm.json",
+          "cloudformation:RoleArn": "arn:aws:iam::111122223333:role/coderhelm-prod-deploy-stack"
+        }
+      },
+      "verdict": "implicitDeny"
+    },
+    {
+      "request": {
+        "action": "cloudformation:CreateChangeSet",
+        "resource": "arn:aws:cloudformation:us-east-1:111122223333:stack/coderhelm-prod/abc",
+        "context": {
+          "cloudformation:TemplateUrl": "https://coderhelm-public.s3.amazonaws.com/launch/v1.2.3/coderhelm.json",
+          "cloudformation:RoleArn": "arn:aws:iam::111122223333:role/other"
+        }
+      },
+      "verdict": "implicitDeny"
+    },
+    {
+      "request": {
+        "action": "cloudformation:CreateChangeSet",
+        "resource": "arn:aws:cloudformation:us-east-1:111122223333:stack/coderhelm-prod-Api-1A2B3C/def",
+        "context": {
+          "cloudformation:TemplateUrl": "https://coderhelm-prod-release-111122223333.s3.us-east-1.amazonaws.com/releases/v1.2.3/stacks/Api.json",
+          "cloudformation:RoleArn": "arn:aws:iam::111122223333:role/coderhelm-prod-deploy-stack"
+        }
+      },
+      "verdict": "allowed"
+    },
+    {
+      "request": {
+        "action": "cloudformation:CreateChangeSet",
+        "resource": "arn:aws:cloudformation:us-east-1:111122223333:stack/coderhelm-prod-Api-1A2B3C/def",
+        "context": {
+          "cloudformation:RoleArn": "arn:aws:iam::111122223333:role/coderhelm-prod-deploy-stack"
+        }
+      },
+      "verdict": "allowed"
+    },
+    {
+      "request": {
+        "action": "cloudformation:CreateChangeSet",
+        "resource": "arn:aws:cloudformation:us-east-1:111122223333:stack/coderhelm-prod-Api-1A2B3C/def",
+        "context": {
+          "cloudformation:TemplateUrl": "https://example.org/x.json"
+        }
+      },
+      "verdict": "implicitDeny"
+    },
+    {
+      "request": {
+        "action": "cloudformation:ExecuteChangeSet",
+        "resource": "arn:aws:cloudformation:us-east-1:111122223333:stack/coderhelm-prod/abc"
+      },
+      "verdict": "allowed"
+    },
+    {
+      "request": {
+        "action": "cloudformation:DeleteChangeSet",
+        "resource": "arn:aws:cloudformation:us-east-1:111122223333:stack/coderhelm-prod/abc"
+      },
+      "verdict": "allowed"
+    },
+    {
+      "request": {
+        "action": "iam:PassRole",
+        "resource": "arn:aws:iam::111122223333:role/coderhelm-prod-deploy-stack",
+        "context": {
+          "iam:PassedToService": "cloudformation.amazonaws.com"
+        }
+      },
+      "verdict": "allowed"
+    },
+    {
+      "request": {
+        "action": "s3:GetObject",
+        "resource": "arn:aws:s3:::coderhelm-prod-release-111122223333/releases/v1.2.3/stacks/Api.json"
+      },
+      "verdict": "allowed"
+    }
+  ]
+}

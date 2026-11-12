@@ -2237,11 +2237,11 @@ def native_parameters(stack, template, overrides=None):
     return out
 
 
-def native_propose(store, env, version, mode, extra=None, cfn=None, opener=None):
-    """Creates the change set. Returns {change_set_id, apply}."""
-    cfn = cfn or client("cloudformation")
-    if mode == "options":
-        return options_propose(env, version, (extra or {}).get("options") or {}, cfn)
+def verified_release(store, env, version, mode, opener=None):
+    """(url, sha256, template) of `version`'s parent template, as the release
+    check verified it. Every change set on the install's stack is made from
+    such a URL: the updater role may create one only from a release template
+    (infra/lib/updates-stack.ts, ProposeReleaseUpdate's cloudformation:TemplateUrl)."""
     url = native_template_url(env, version)
     try:
         body = fetch_template(url, opener)
@@ -2254,16 +2254,30 @@ def native_propose(store, env, version, mode, extra=None, cfn=None, opener=None)
     rec = store.get(f"MANIFEST#{version}") or {}
     want = rec.get("template_sha256")
     if not want:
-        # Every change set, a domain move included, is made only from a template the release check verified.
-        if mode == "domain":
+        # Every change set, a domain move or a switch included, is made only from a template the release check verified.
+        if mode in ("domain", "options"):
             start_verify(store, env, datetime.now(timezone.utc), version)
         raise ReleaseNotReady(f"{version}'s stack template isn't verified yet (its release check reports it); try again in a few minutes")
     got = hashlib.sha256(body).hexdigest()
     if got != want:
         raise ValueError(f"{version}'s stack template doesn't match its signed checksum, so it was not proposed")
-    current = env.get("CODERHELM_VERSION", "")
+    template = json.loads(body)
+    if template.get("Transform"):
+        # CloudFormation stores such a template already resolved, so what it
+        # fetched could never be compared with what was verified.
+        raise ValueError(f"{version}'s stack template uses a transform, which the updater can't check after CloudFormation reads it; update it in the console with a change set")
+    return url, want, template
+
+
+def native_propose(store, env, version, mode, extra=None, cfn=None, opener=None):
+    """Creates the change set. Returns {change_set_id, apply}."""
+    cfn = cfn or client("cloudformation")
+    if mode == "options":
+        return options_propose(store, env, version, (extra or {}).get("options") or {}, cfn, opener)
     if mode not in ("update", "rollback", "domain"):
         raise ValueError(f"unknown change: {mode}")
+    url, want, template = verified_release(store, env, version, mode, opener)
+    current = env.get("CODERHELM_VERSION", "")
     if parse_version(current):
         # Every kind of change set, not only an update: a domain move keeps the
         # running release, and going back only to one this install ran.
@@ -2273,11 +2287,6 @@ def native_propose(store, env, version, mode, extra=None, cfn=None, opener=None)
             raise ValueError(f"a domain change keeps the running release ({current}), not {version}")
         if mode == "rollback" and version not in ran_versions(store, store.get("UPDATE_STATE", {}), current):
             raise ValueError(f"{version} is not a version this install ran before, so it can't be rolled back to")
-    template = json.loads(body)
-    if template.get("Transform"):
-        # CloudFormation stores such a template already resolved, so what it
-        # fetched could never be compared with what was verified.
-        raise ValueError(f"{version}'s stack template uses a transform, which the updater can't check after CloudFormation reads it; update it in the console with a change set")
     stack = cfn.describe_stacks(StackName=env["NATIVE_STACK"])["Stacks"][0]
     st = stack.get("StackStatus") or ""
     if st == STUCK:
@@ -2342,8 +2351,11 @@ def native_propose(store, env, version, mode, extra=None, cfn=None, opener=None)
 # events are parameters of the install's stack (infra/lib/own-account-read.ts,
 # OWN_OPTIONS): each adds or removes its read-only statements on the
 # install's own roles. An admin switches one from the AWS card; the change
-# set keeps the running release's template exactly (UsePreviousTemplate)
-# and changes only those parameters. It goes the way a version update goes:
+# set keeps the running release's template exactly and changes only those
+# parameters. It names that template by the release's own URL, staged the
+# way a version update to the running release stages it: the updater role
+# may create a change set on the stack only from a release template
+# (ProposeReleaseUpdate), and UsePreviousTemplate has no URL, so IAM refused it. It goes the way a version update goes:
 # the same preflight of the deploy role, the same review of what it changes
 # about permissions (never applied without an admin's confirmation), the
 # same history row, and CloudFormation's own rollback when it fails.
@@ -2423,7 +2435,7 @@ def options_text(changes):
     return "; ".join(one(k, c) for k, c in sorted(changes.items()))
 
 
-def options_propose(env, version, wanted, cfn):
+def options_propose(store, env, version, wanted, cfn, opener=None):
     """The parameter-only change set on the running release."""
     current = env.get("CODERHELM_VERSION", "")
     if version != current:
@@ -2444,13 +2456,30 @@ def options_propose(env, version, wanted, cfn):
     deployed = deployed_template(cfn, env["NATIVE_STACK"])
     if not deployed:
         raise ValueError("the install's stack template couldn't be read, so nothing was proposed")
+    # The running release, exactly, by the URL a version update to it uses
+    # (the release's, or the held copy when the install keeps its own deploy
+    # role and boundaries), its parts staged for the nested change sets.
+    url, want, template = verified_release(store, env, version, "options", opener)
+    stage_release(env, version, want)
+    proposed = template
+    keep = keep_for(template, deployed)
+    if keep:
+        proposed = held_template(template, keep)
+        r = stage_held(env, version, want, keep)
+        if r.get("canonical") != canonical_sha(proposed):
+            raise ValueError(f"{version}'s template with the install's own permissions kept isn't the one the updater made, so nothing was proposed")
+        url = held_url(env, stack, version)
+    if canonical_sha(proposed) != canonical_sha(deployed):
+        # Only parameters may change: never a template other than the one running.
+        raise ValueError(f"the install's stack template isn't {version} as released, so a switch can't keep it exactly; "
+                         "update to a release first (Settings, System), then switch this")
     name = f"coderhelm-options-{uuid.uuid4().hex[:8]}"
     kwargs = {
         "StackName": env["NATIVE_STACK"],
         "ChangeSetName": name,
         "ChangeSetType": "UPDATE",
         # The running release, exactly: only parameters change.
-        "UsePreviousTemplate": True,
+        "TemplateURL": url,
         "Parameters": native_parameters(stack, deployed, {k: c["to"] for k, c in changes.items()}),
         "Capabilities": NATIVE_CAPABILITIES,
         "Description": f"CoderHelm: {options_text(changes)}"[:1024],
