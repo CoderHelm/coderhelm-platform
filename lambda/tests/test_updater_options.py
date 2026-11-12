@@ -9,6 +9,8 @@ confirmation, the history row, and CloudFormation's own rollback.
 Run: python3 -m unittest discover -s lambda/tests
 """
 
+import hashlib
+import json
 import unittest
 
 from test_updater_native import ENV, NOW, FakeCfn, FakeDynamo, FakeIam, FakeLambda, u
@@ -57,14 +59,24 @@ class Options(unittest.TestCase):
         self.sent = []
         u.notify = lambda *a, **k: self.sent.append(a[0])
         self.env = dict(ENV, DEPLOY_ROLE_ARN=ROLE)
+        # The running release's published template: what the install's stack runs.
+        self._fetch = u.fetch_template
+        self.fetched_urls = []
+        u.fetch_template = lambda url, opener=None: self.fetched_urls.append(url) or self.release_body()
+
+    def release_body(self):
+        return json.dumps(getattr(self, "release", None) or self.cfn.deployed).encode()
 
     def tearDown(self):
+        u.fetch_template = self._fetch
         u.notify = self._notify
         u._clients["iam"] = self._iam
         u._clients.pop("cloudformation", None)
         u._clients.pop("lambda", None)
 
     def switch(self, **options):
+        # The running release as its release check verified it.
+        self.store.put("MANIFEST#v1.0.0", {"verified": True, "manifest": None, "template_sha256": hashlib.sha256(self.release_body()).hexdigest()})
         return u.handle({"action": "set_options", "options": options, "actor": "owner@example.org"}, self.env, self.store, NOW)
 
     def poll(self, execution="AVAILABLE"):
@@ -80,10 +92,13 @@ class Options(unittest.TestCase):
         self.assertEqual(started["version"], "v1.0.0")
         self.assertEqual(started["options"], {"InspectorFindings": {"from": "off", "to": "on"}})
         kw = self.cfn.created[0]
-        # The running release's template, exactly: no template URL, nothing staged.
-        self.assertTrue(kw["UsePreviousTemplate"])
-        self.assertNotIn("TemplateURL", kw)
-        self.assertEqual(self.lam.calls, [])
+        # The running release's template, exactly, by the release's own URL (the updater role
+        # may create a change set only from one: UsePreviousTemplate was refused by IAM), its parts staged.
+        self.assertNotIn("UsePreviousTemplate", kw)
+        self.assertEqual(kw["TemplateURL"], "https://coderhelm-public.s3.amazonaws.com/launch/v1.0.0/coderhelm.json")
+        self.assertRegex(kw["TemplateURL"], r"^https://coderhelm-public\.s3\.amazonaws\.com/launch/v\d+\.\d+\.\d+/coderhelm\.json$")
+        self.assertEqual(self.lam.calls, [("coderhelm-prod-install-helper", {"action": "stage", "version": "v1.0.0",
+                                                                             "template_sha256": hashlib.sha256(self.release_body()).hexdigest()})])
         self.assertEqual(kw["RoleARN"], ROLE)
         self.assertTrue(kw["IncludeNestedStacks"])
         self.assertIn("turn on Amazon Inspector findings", kw["Description"])
@@ -91,6 +106,42 @@ class Options(unittest.TestCase):
         self.assertEqual(params["InspectorFindings"], {"ParameterKey": "InspectorFindings", "ParameterValue": "on"})
         for k in ("Stage", "AdminEmail", "InfrastructureVulnerabilities", "HealthEvents"):
             self.assertEqual(params[k], {"ParameterKey": k, "UsePreviousValue": True}, k)
+
+    def test_an_install_that_keeps_its_own_deploy_role_switches_on_the_held_copy(self):
+        # The release's DeployRole differs from the install's (an update kept the install's own):
+        # the template running is the held copy, so the switch names that one.
+        own = {"Type": "AWS::IAM::Role", "Properties": {"RoleName": "coderhelm-prod-deploy-stack", "Policies": ["own"]}}
+        self.cfn.deployed = {"Parameters": DEPLOYED["Parameters"], "Resources": dict(DEPLOYED["Resources"], DeployRole=own)}
+        self.release = {"Parameters": DEPLOYED["Parameters"],
+                        "Resources": dict(DEPLOYED["Resources"], DeployRole=dict(own, Properties={"RoleName": "coderhelm-prod-deploy-stack", "Policies": ["newer"]}))}
+        self.lam.answer = {"ok": True, "canonical": u.canonical_sha(self.cfn.deployed)}
+        self.switch(InspectorFindings="on")
+        kw = self.cfn.created[0]
+        self.assertNotIn("UsePreviousTemplate", kw)
+        self.assertEqual(kw["TemplateURL"], "https://coderhelm-prod-release-111122223333.s3.us-east-1.amazonaws.com/releases/v1.0.0/held/coderhelm.json")
+        self.assertEqual([c[1]["action"] for c in self.lam.calls], ["stage", "stage_held"])
+        self.assertEqual(self.lam.calls[1][1]["keep"], {"DeployRole": own})
+        self.assertEqual(self.store.get(self.store.get("UPDATE_STATE")["running_id"])["template_canonical"], u.canonical_sha(self.cfn.deployed))
+
+    def test_a_stack_not_running_its_release_template_is_never_switched(self):
+        # Anything but the deploy role and boundaries differs: the switch would change the template too.
+        self.release = {"Parameters": DEPLOYED["Parameters"], "Resources": dict(DEPLOYED["Resources"], Extra={"Type": "AWS::SQS::Queue"})}
+        with self.assertRaisesRegex(ValueError, "isn't v1.0.0 as released"):
+            self.switch(InspectorFindings="on")
+        self.assertEqual(self.cfn.created, [])
+
+    def test_an_unverified_running_release_waits_for_its_check(self):
+        self.store.put("MANIFEST#v1.0.0", {})
+        started = []
+        saved = u.start_verify
+        u.start_verify = lambda store, env, now, version: started.append(version)
+        try:
+            with self.assertRaises(u.ReleaseNotReady):
+                u.handle({"action": "set_options", "options": {"InspectorFindings": "on"}, "actor": "owner@example.org"}, self.env, self.store, NOW)
+        finally:
+            u.start_verify = saved
+        self.assertEqual(started, ["v1.0.0"])
+        self.assertEqual(self.cfn.created, [])
 
     def test_the_review_lists_the_permission_change_and_waits_for_the_confirmation(self):
         self.switch(InspectorFindings="on")
@@ -218,6 +269,7 @@ class PrivateNetworks(unittest.TestCase):
 
     tearDown = Options.tearDown
     switch = Options.switch
+    release_body = Options.release_body
     poll = Options.poll
     status = Options.status
 
@@ -233,7 +285,8 @@ class PrivateNetworks(unittest.TestCase):
         started = self.switch(PrivateNetwork2=" vpc-0a1b2c3d4e5f60718:subnet-0a1b2c3d4e5f60719, subnet-0a1b2c3d4e5f6071a ")
         self.assertEqual(started["options"], {"PrivateNetwork2": {"from": "", "to": NET}})
         kw = self.cfn.created[0]
-        self.assertTrue(kw["UsePreviousTemplate"])
+        self.assertNotIn("UsePreviousTemplate", kw)
+        self.assertEqual(kw["TemplateURL"], "https://coderhelm-public.s3.amazonaws.com/launch/v1.0.0/coderhelm.json")
         self.assertIn("add private network 2 (vpc-0a1b2c3d4e5f60718, subnets subnet-0a1b2c3d4e5f60719, subnet-0a1b2c3d4e5f6071a)", kw["Description"])
         params = {p["ParameterKey"]: p for p in kw["Parameters"]}
         self.assertEqual(params["PrivateNetwork2"], {"ParameterKey": "PrivateNetwork2", "ParameterValue": NET})

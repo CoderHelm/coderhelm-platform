@@ -18,10 +18,14 @@ export const glob = (pattern: string, value: string, ci = false) => {
 };
 
 export function conditionHolds(cond: Statement["Condition"], ctx: Record<string, string | string[] | undefined>): boolean {
-  for (const [op, kv] of Object.entries(cond ?? {})) {
+  for (const [fullOp, kv] of Object.entries(cond ?? {})) {
+    // "...IfExists": holds when the key is absent from the request, else as the operator without it.
+    const ifExists = fullOp.endsWith("IfExists") && fullOp !== "IfExists";
+    const op = ifExists ? fullOp.slice(0, -"IfExists".length) : fullOp;
     for (const [key, want] of Object.entries(kv)) {
       // Condition key names are not case-sensitive in IAM.
       const have = ctx[key] ?? Object.entries(ctx).find(([k]) => k.toLowerCase() === key.toLowerCase())?.[1];
+      if (ifExists && have === undefined) continue;
       const wants = list(want as string | string[]);
       const haves = list(have);
       const any = (f: (h: string, w: string) => boolean) => haves.some((h) => wants.some((w) => f(h, w)));
