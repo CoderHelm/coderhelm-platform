@@ -104,12 +104,17 @@ pub fn stops_for_stall(stalled: u32) -> bool {
     stalled >= MAX_STALLED_STEPS
 }
 
-/// Why a stalled run stops, in a sentence.
-pub fn stall_reason(step: u32, head: &str, at: &str, kept: &str) -> String {
+/// Why a stalled run stops, in a sentence, naming the planned task it was
+/// on when it knows (`task 8 of 8 (`path`: what)`).
+pub fn stall_reason(step: u32, head: &str, at: &str, kept: &str, task: Option<&str>) -> String {
     let short: String = head.chars().take(7).collect();
+    let on = match task {
+        Some(t) if !t.trim().is_empty() => format!(" while working on {}", t.trim()),
+        _ => String::new(),
+    };
     format!(
         "Stopped: steps {} and {} made no progress. The branch stayed at {short} and the run was \
-         stuck at {}. The work so far is kept on branch `{kept}`.",
+         stuck at {}{on}. The work so far is kept on branch `{kept}`.",
         step.saturating_sub(2).max(1),
         step.saturating_sub(1).max(1),
         where_label(at)
@@ -542,7 +547,7 @@ mod tests {
         assert!(!stops_for_stall(s1), "one stalled step keeps going");
         let s2 = stalled_after(Some(&mark), &mark, s1);
         assert!(stops_for_stall(s2));
-        let why = stall_reason(7, "abcdef1234", "generators", "coderhelm-wip/x");
+        let why = stall_reason(7, "abcdef1234", "generators", "coderhelm-wip/x", None);
         assert!(why.contains("steps 5 and 6 made no progress"), "{why}");
         assert!(why.contains("abcdef1"), "{why}");
         assert!(why.contains("generator check"), "{why}");

@@ -68,8 +68,8 @@ fn repos_reached_for(log: &[serde_json::Value], owner: &str, repo: &str) -> Vec<
 /// The agent-loop error emitted when the step budget is exhausted
 /// (anthropic.rs: "Reached the maximum number of steps (N) without finishing").
 /// This means "needs more turns", NOT a real failure — treated like the
-/// wall-clock timeout and auto-continued rather than salvaged into a
-/// half-finished PR. Substring match is the same error-classification idiom as
+/// wall-clock timeout and auto-continued rather than stopped with a
+/// half-finished draft. Substring match is the same error-classification idiom as
 /// the `cancelled by user` check. Coupled to the message in
 /// `agent::anthropic::converse_tool_loop`.
 fn is_budget_exhausted(err_msg: &str) -> bool {
@@ -1108,6 +1108,7 @@ mod model_route_eval;
 pub mod onboard;
 pub mod open_pr_choice;
 pub mod ops_tools;
+pub mod outcome;
 pub mod outside_exec;
 pub mod outside_work;
 pub mod own_review;
@@ -1387,12 +1388,12 @@ pub async fn orchestrate_ticket(
                 }
                 // Budget exhausted (hit the step limit) with committed partial
                 // work is "needs more turns", not a real failure — auto-continue
-                // (bounded) from the branch instead of salvaging a half-finished
-                // PR the user sees as an error. Identical treatment to the
-                // wall-clock timeout arm; only THIS error class continues, other
-                // failures still salvage/fail below.
+                // (bounded) from the branch instead of stopping with a
+                // half-finished draft. Identical treatment to the wall-clock
+                // timeout arm; only THIS error class continues, other failures
+                // get the held draft or fail below.
                 // Only a genuine mid-implement step-budget death continues (the
-                // salvage arm below uses the same "implement_started" signal). This
+                // held draft below uses the same "implement_started" signal). This
                 // stays correct even if a future non-implement pass propagates the
                 // same step-limit message — it won't match this checkpoint.
                 let continued = !guard_ended
@@ -1421,39 +1422,19 @@ pub async fn orchestrate_ticket(
                         common::model_retry::is_transient_model_error(err)
                             && requeue_after_model_error(state, &msg, &run_id).await
                     };
-                // Salvage before failing: an implement that burned its turn
-                // budget mid-task has already pushed real commits to the branch.
-                // Only mid-implement deaths salvage: for later-pass errors a
-                // salvage would mark the run completed and hide the real error
-                // behind a misleading "partial work" message.
+                // A run stopped after its work started (mid-implement or by a
+                // check after it) with work on its branch gets the standard
+                // held draft (`stop_pr`): its ticket line, what is done and
+                // left, and the recorded reason. One path, never a separate
+                // "partial" pull request.
                 let salvaged = if continued || guard_ended {
                     false
                 } else if let Some((ref last_pass, ref branch, _)) = checkpoint {
-                    if !branch.is_empty() && last_pass.as_str() == "implement_started" {
-                        info!(
-                            run_id,
-                            branch,
-                            "Error mid-implement — attempting to salvage partial work as draft PR"
-                        );
-                        match salvage_timeout_pr(state, &msg, &run_id, branch, &usage, duration)
-                            .await
-                        {
-                            Ok(pr_url) => {
-                                info!(run_id, pr_url, "Salvaged partial work into draft PR");
-                                true
-                            }
-                            Err(salvage_err) => {
-                                warn!(run_id, error = %salvage_err, "Failed to salvage partial work");
-                                false
-                            }
-                        }
-                    } else if !branch.is_empty()
+                    if !branch.is_empty()
                         && stop_pr::opens_pr(last_pass)
                         && e.downcast_ref::<stack::Refused>().is_none()
                         && crate::agent::policy::claim_stop(&run_id).is_none()
                     {
-                        // A check after the work stopped the run: the work
-                        // still gets its (draft) pull request, with why.
                         match stop_pr::open(state, &msg, &run_id, branch, &sanitize_error(&err_msg))
                             .await
                         {
@@ -1533,8 +1514,8 @@ pub async fn orchestrate_ticket(
             .await;
 
             // Fallback (the usage limit, no work committed, no queue, or the
-            // enqueue failed): salvage the partial work as a draft PR, else
-            // fail with why.
+            // enqueue failed): the standard held draft for the work on the
+            // branch (`stop_pr`), else fail with why.
             if let Handoff::Stopped(why) = handoff {
                 let guard_ended = run_guard::end_if_stopped(
                     state,
@@ -1552,19 +1533,21 @@ pub async fn orchestrate_ticket(
                             "implement" | "implement_started" | "security"
                         )
                     {
-                        info!(
-                            run_id,
-                            branch, "Timeout — attempting to salvage partial work as draft PR"
+                        // The standard held draft, with the recorded reason:
+                        // the step's time limit and why no fresh step took over.
+                        let reason = format!(
+                            "The step reached its time limit and the run couldn't continue in a fresh step: {why}."
                         );
-                        match salvage_timeout_pr(state, &msg, &run_id, branch, &usage, duration)
-                            .await
-                        {
+                        match stop_pr::open(state, &msg, &run_id, branch, &reason).await {
                             Ok(pr_url) => {
-                                info!(run_id, pr_url, "Salvaged partial work into draft PR");
+                                info!(
+                                    run_id,
+                                    pr_url, "Opened a draft PR for a run stopped at its time limit"
+                                );
                                 true
                             }
                             Err(e) => {
-                                warn!(run_id, error = %e, "Failed to salvage partial work");
+                                warn!(run_id, error = %e, "No draft PR for the stopped run");
                                 false
                             }
                         }
@@ -3596,6 +3579,9 @@ async fn run_passes(
     } else {
         None
     };
+    // Steps in a row that changed nothing, after this one started: the
+    // first such step changes approach (`continuation_feedback`).
+    let mut stalled_steps = step_state.stalled;
     if msg.continuation > 0 && step_state.mark_step != step {
         let at = resume_gate
             .map(|g| g.as_str().to_string())
@@ -3612,11 +3598,14 @@ async fn run_passes(
             steps::stalled_after(step_state.mark.as_deref(), &mark, step_state.stalled)
         };
         steps::save_mark(state, &msg.team_id, run_id, &mark, stalled, step).await;
+        stalled_steps = stalled;
         if steps::stops_for_stall(stalled) {
             let kept =
                 keep_wip_branch(&github, &msg.repo_owner, &msg.repo_name, &branch_name).await;
+            // The stop names the planned task the steps were stuck on.
+            let task = current_plan_task(&github, msg, &plan_result, &branch_name).await;
             close_memory(state, agent_memory.take()).await;
-            return Err(steps::stall_reason(step, &head, &at, &kept).into());
+            return Err(steps::stall_reason(step, &head, &at, &kept, task.as_deref()).into());
         }
         info!(run_id, step, stalled, at = %at, "Continuing the run in this step");
     }
@@ -4850,7 +4839,16 @@ async fn run_passes(
         }
         // A continuation picks up the planned tasks the branch doesn't do yet.
         let still_to_do = if msg.continuation > 0 {
-            continuation_feedback(state, run_id, &github, msg, &plan_result, &branch_name).await
+            continuation_feedback(
+                state,
+                run_id,
+                &github,
+                msg,
+                &plan_result,
+                &branch_name,
+                stalled_steps,
+            )
+            .await
         } else {
             None
         };
@@ -5423,11 +5421,16 @@ async fn run_passes(
         .await;
         // Only the tasks the branch did are checked off, so the run page and
         // a later attempt see the truth.
+        // A task the coder settled without a change says so on its line,
+        // so a later step reads it as optional, never asks for it again.
         save_checked_tasks(
             state,
             msg,
             run_id,
-            &plan_coverage::checked_tasks_md(&plan_result.tasks, &cov),
+            &plan_coverage::with_declined(
+                &plan_coverage::checked_tasks_md(&plan_result.tasks, &cov),
+                &cov.missing,
+            ),
         )
         .await;
         add_progress_note(
@@ -6761,8 +6764,36 @@ async fn save_checked_tasks(state: &WorkerState, msg: &TicketMessage, run_id: &s
     }
 }
 
+/// The planned task the run is on (the first one its branch doesn't do),
+/// as `task K of N (`path`: what)`; `None` without a checklist.
+async fn current_plan_task(
+    github: &GitHubClient,
+    msg: &TicketMessage,
+    plan: &plan::PlanResult,
+    branch: &str,
+) -> Option<String> {
+    let tasks =
+        plan_coverage::tasks_for(github, &msg.repo_owner, &msg.repo_name, branch, &plan.tasks)
+            .await;
+    if tasks.is_empty() {
+        return None;
+    }
+    let changes = plan_coverage::plan_changes(
+        github,
+        &msg.repo_owner,
+        &msg.repo_name,
+        &msg.base_branch,
+        branch,
+    )
+    .await?;
+    plan_coverage::current_task(&changes.coverage(&tasks))
+}
+
 /// For a continuation: the planned tasks its branch doesn't do yet, as the
 /// implement pass's instructions. `None` when all are done or it can't tell.
+/// After a step that changed nothing (`stalled` > 0) the approach changes:
+/// one task, the branch's files so far, and the two ways to finish it
+/// (`plan_coverage::narrowed_feedback`), never the same ask again.
 async fn continuation_feedback(
     state: &WorkerState,
     run_id: &str,
@@ -6770,6 +6801,7 @@ async fn continuation_feedback(
     msg: &TicketMessage,
     plan: &plan::PlanResult,
     branch: &str,
+    stalled: u32,
 ) -> Option<String> {
     let tasks =
         plan_coverage::tasks_for(github, &msg.repo_owner, &msg.repo_name, branch, &plan.tasks)
@@ -6798,7 +6830,26 @@ async fn continuation_feedback(
         run_guard::Progress::TasksDone(cov.done.len()),
     )
     .await;
-    (!cov.required_missing().is_empty()).then(|| plan_coverage::round_feedback(&cov))
+    if cov.required_missing().is_empty() {
+        return None;
+    }
+    if stalled > 0 {
+        let files = plan_coverage::changed_files(
+            github,
+            &msg.repo_owner,
+            &msg.repo_name,
+            &msg.base_branch,
+            branch,
+        )
+        .await
+        .unwrap_or_default();
+        info!(
+            run_id,
+            stalled, "The last step changed nothing: this one takes one task, a different approach"
+        );
+        return plan_coverage::narrowed_feedback(&cov, &files);
+    }
+    Some(plan_coverage::round_feedback(&cov))
 }
 
 /// Run implement → security → PR for a single repo.
@@ -11355,118 +11406,6 @@ mod trace_name_tests {
         // Readers group by the name before ':' (analytics, the run page).
         assert_eq!(trace_pass_name("plan", 2).split(':').next(), Some("plan"));
     }
-}
-
-/// Salvage partial work from a timed-out run by creating a draft PR.
-/// Returns the PR URL on success.
-async fn salvage_timeout_pr(
-    state: &WorkerState,
-    msg: &TicketMessage,
-    run_id: &str,
-    branch: &str,
-    usage: &TokenUsage,
-    duration: u64,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let github = GitHubClient::new(
-        &state.secrets.github_app_id,
-        &state.secrets.github_private_key,
-        msg.installation_id,
-        &state.http,
-    )?;
-
-    // Check if there's actually a diff on the branch
-    let diff = github
-        .get_diff(&msg.repo_owner, &msg.repo_name, &msg.base_branch, branch)
-        .await?;
-    let files_changed = diff
-        .get("files")
-        .and_then(|f| f.as_array())
-        .map(|a| a.len())
-        .unwrap_or(0);
-    if files_changed == 0 {
-        return Err("No changes on branch to salvage".into());
-    }
-
-    // Check for existing PR
-    let existing = github
-        .find_open_pr_for_branch(&msg.repo_owner, &msg.repo_name, branch)
-        .await?;
-    let (pr_number, pr_url) = if let Some(pr_data) = existing {
-        let n = pr_data.get("number").and_then(|v| v.as_u64()).unwrap_or(0);
-        let u = pr_data
-            .get("html_url")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        (n, u)
-    } else {
-        let conventions = load_git_conventions(state, &msg.team_id, &msg.ticket_id).await;
-        let title = format!(
-            "⚠️ Partial: {}",
-            pr::pr_title(&conventions, &ticket_tokens(msg), msg)
-        );
-        let body = format!(
-            "Closes #{}\n\n\
-             ⚠️ **This implementation is partial** — the agent ran out of time before finishing all tasks.\n\n\
-             Please review what's been done and either:\n\
-             - Complete the remaining work manually, or\n\
-             - Re-trigger the issue for the agent to continue\n",
-            msg.issue_number,
-        );
-        let pr_data = github
-            .create_pull_request(
-                &msg.repo_owner,
-                &msg.repo_name,
-                common::truncate_str(&title, 72),
-                &body,
-                branch,
-                &msg.base_branch,
-                true, // draft
-            )
-            .await?;
-        let n = pr_data.get("number").and_then(|v| v.as_u64()).unwrap_or(0);
-        let u = pr_data
-            .get("html_url")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        (n, u)
-    };
-
-    // Mark run as completed (not failed) — it produced a PR
-    let now = chrono::Utc::now().to_rfc3339();
-    let delta = usage.unrecorded();
-    let usage_res = state
-        .dynamo
-        .update_item()
-        .table_name(&state.config.runs_table_name)
-        .key("team_id", attr_s(&msg.team_id))
-        .key("run_id", attr_s(run_id))
-        .update_expression(
-            "SET #s = :s, status_run_id = :sri, pr_url = :pu, pr_number = :pn, \
-             branch = :b, tokens_in = if_not_exists(tokens_in, :uzero) + :ti, tokens_out = if_not_exists(tokens_out, :uzero) + :to, \
-             cache_read_tokens = if_not_exists(cache_read_tokens, :uzero) + :crt, cache_write_tokens = if_not_exists(cache_write_tokens, :uzero) + :cwt, \
-             cost_usd = if_not_exists(cost_usd, :uzero) + :c, duration_s = :d, updated_at = :t, \
-             error_message = :err",
-        )
-        .expression_attribute_names("#s", "status")
-        .expression_attribute_values(":s", attr_s("completed"))
-        .expression_attribute_values(":sri", attr_s(&format!("completed#{run_id}")))
-        .expression_attribute_values(":pu", attr_s(&pr_url))
-        .expression_attribute_values(":pn", attr_n(pr_number))
-        .expression_attribute_values(":b", attr_s(branch))
-        .usage_values(&delta)
-        .expression_attribute_values(":d", attr_n(duration))
-        .expression_attribute_values(":t", attr_s(&now))
-        .expression_attribute_values(":err", attr_s("Partial implementation — agent timed out"))
-        .send()
-        .await;
-    if usage_res.is_ok() {
-        usage.mark_recorded(&delta);
-    }
-    self::webhooks::emit_run(state, &msg.team_id, run_id, "completed").await;
-
-    Ok(pr_url)
 }
 
 /// Save a checkpoint after a pass completes so runs can resume on Lambda timeout.

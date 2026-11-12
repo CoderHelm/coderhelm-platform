@@ -426,6 +426,18 @@ pub fn decide(f: &Facts) -> Decision {
     if let Some(w) = sec_wait {
         proof_wait.get_or_insert(w);
     }
+    // Every other pull request too (`outcome`): never ready with a failing
+    // check, never ready while one runs. CoderHelm's own findings already
+    // name CI in their reason, so they aren't said twice.
+    if !f.security && f.feature.is_none() {
+        let (ci_hold, ci_wait) = repo_ci(f);
+        if let Some(r) = ci_hold {
+            reasons.push(r);
+        }
+        if let Some(w) = ci_wait {
+            proof_wait.get_or_insert(w);
+        }
+    }
     // CoderHelm's own sandbox and checklist findings weigh against the
     // repository's CI and the review: with both green they are open items
     // on a ready pull request, never a hold by themselves.
@@ -1014,7 +1026,9 @@ async fn gather(ctx: &Ctx<'_>) -> Result<Facts, Refused> {
         )
         .await;
         f.approved = matches!(&verdict, Ok(Some(v)) if v == "APPROVE");
-        if f.security && f.ci.failing() {
+        // A failure the base branch has too is not this change's: it holds
+        // nothing (`outcome::CiState::RedOnBase`), for every pull request.
+        if f.ci.failing() {
             f.red_on_base = red_on_base(ctx).await;
         }
         // Only a read that found no review: a failed read never queues one.
@@ -1134,8 +1148,16 @@ async fn fix_own_findings(ctx: &Ctx<'_>, run_id: &str, f: &mut Facts) {
 /// `proof::holds_blocked_on`). CI was once read only for the first: a pull
 /// request whose one hold was such a line read CI as "not green" without
 /// asking, and stayed a draft on every sweep although its CI had passed.
+///
+/// Every open draft's CI is read now: a failing check holds any pull
+/// request and a running one is waited for (`outcome::ci_blocker`). A pull
+/// request with no feature findings once read CI never, and a run whose CI
+/// was red end to end had its pull request marked ready.
 pub fn reads_ci(f: &Facts) -> bool {
-    f.feature.is_some() || f.security || super::proof::ci_settles_a_hold(&f.body)
+    !f.closed && f.put_back_by.is_none()
+        || f.feature.is_some()
+        || f.security
+        || super::proof::ci_settles_a_hold(&f.body)
 }
 
 /// A security fix's hold or wait on its CI: failing CI keeps the draft with
@@ -1174,6 +1196,25 @@ pub fn security_ci(f: &Facts) -> (Option<Reason>, Option<String>) {
         );
     }
     (None, None)
+}
+
+/// The repository's CI as a hold (failing, with the checks named and what
+/// to do) or a wait (running), from the one rule in `outcome`.
+pub fn repo_ci(f: &Facts) -> (Option<Reason>, Option<String>) {
+    use super::outcome::CiState;
+    match CiState::of(&f.ci, f.red_on_base) {
+        CiState::Failing(checks) => (
+            Some(Reason::new(
+                format!("CI is failing on this head: {checks}"),
+                "Fix the failing checks on this branch (CoderHelm decides again on the push), or \
+                 re-run them if the failure isn't the change's; the pull request leaves draft once \
+                 CI is green.",
+            )),
+            None,
+        ),
+        CiState::Pending(checks) => (None, Some(format!("its CI is still running: {checks}"))),
+        CiState::NoChecks | CiState::Green | CiState::RedOnBase => (None, None),
+    }
 }
 
 /// Whether a check is CoderHelm's own (its review check, or any check its
@@ -2010,13 +2051,19 @@ mod tests {
         let section = status_section(&d);
         assert!(section.contains("**This pull request stays a draft.**"));
         assert!(section.contains("`test`"));
-        // The same pull request without the marker is any other run's, and
-        // that run's hand-off still marks it ready for a person.
+        // The same pull request without the marker is any other run's: it
+        // is held on its failing check too, never marked ready red
+        // (`outcome::ci_blocker`).
         let plain = Facts {
             security: false,
             ..f.clone()
         };
-        assert!(matches!(decide(&plain), Decision::Ready { .. }));
+        let Decision::Held { reasons } = decide(&plain) else {
+            panic!("held expected");
+        };
+        assert!(reasons[0]
+            .line()
+            .contains("CI is failing on this head: `test`"));
         // Green CI: ready.
         let green = Facts {
             ci: Ci {

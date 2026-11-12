@@ -679,6 +679,47 @@ pub fn ci_outcomes(runs: &[&RunRow]) -> Value {
             "running": c("running"),
         },
         "gave_up_reasons": gave_up_reasons,
+        // Runs that ended wrong (should be zero): see [`ended_wrong`].
+        "ended_wrong": ended_wrong(runs),
+    })
+}
+
+/// Runs that ended in a state CoderHelm must never leave, counted so a
+/// regression shows the day it happens: `completed` with this change's CI
+/// still red, and `completed` after a stop mid-work (the old "partial"
+/// salvage). Both must be zero; each lists its newest runs.
+pub fn ended_wrong(runs: &[&RunRow]) -> Value {
+    let done = |r: &RunRow| matches!(r.status.as_str(), "completed" | "success");
+    let completed_red: Vec<&RunRow> = runs
+        .iter()
+        .copied()
+        .filter(|r| done(r) && r.ci_went_red() && matches!(r.ci_end_state(), CiEnd::GaveUp(_)))
+        .collect();
+    let completed_stopped: Vec<&RunRow> = runs
+        .iter()
+        .copied()
+        .filter(|r| {
+            done(r)
+                && (r.error_message.starts_with("Stopped:")
+                    || r.error_message.starts_with("Partial implementation"))
+        })
+        .collect();
+    let newest = |v: &[&RunRow]| -> Vec<String> {
+        let mut ids: Vec<(&str, &str)> = v
+            .iter()
+            .map(|r| (r.created_at.as_str(), r.run_id.as_str()))
+            .collect();
+        ids.sort_by(|a, b| b.0.cmp(a.0));
+        ids.into_iter()
+            .take(5)
+            .map(|(_, id)| id.to_string())
+            .collect()
+    };
+    json!({
+        "completed_with_red_ci": completed_red.len(),
+        "completed_red_runs": newest(&completed_red),
+        "completed_after_stop": completed_stopped.len(),
+        "completed_after_stop_runs": newest(&completed_stopped),
     })
 }
 
@@ -3444,6 +3485,10 @@ mod tests {
         ];
         let refs: Vec<&RunRow> = runs.iter().collect();
         let ci = ci_outcomes(&refs);
+        // The two that gave up were left "completed" with red CI: counted
+        // as runs that ended wrong.
+        assert_eq!(ci["ended_wrong"]["completed_with_red_ci"], 2);
+        assert_eq!(ci["ended_wrong"]["completed_after_stop"], 0);
         assert_eq!(ci["runs_with_red_ci"], 6);
         assert_eq!(ci["red_on_base_runs"], 1);
         let o = &ci["outcomes"];
@@ -3889,5 +3934,26 @@ mod tests {
         )
         .to_string();
         assert!(lo < inside && inside < hi);
+    }
+
+    /// The salvaged run: completed after a stop mid-work. A run that needs a
+    /// person instead isn't counted.
+    #[test]
+    fn a_run_completed_after_a_stop_is_counted_as_ended_wrong() {
+        let runs = [
+            RunRow {
+                error_message: "Partial implementation — agent timed out".into(),
+                ..run("1", 2, "completed")
+            },
+            RunRow {
+                error_message: "Stopped: steps 2 and 3 made no progress.".into(),
+                ..run("2", 2, "needs_input")
+            },
+        ];
+        let refs: Vec<&RunRow> = runs.iter().collect();
+        let w = ended_wrong(&refs);
+        assert_eq!(w["completed_after_stop"], 1);
+        assert_eq!(w["completed_after_stop_runs"][0], "1");
+        assert_eq!(w["completed_with_red_ci"], 0);
     }
 }

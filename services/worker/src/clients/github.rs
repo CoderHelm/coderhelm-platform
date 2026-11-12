@@ -3265,6 +3265,8 @@ impl GitHubClient {
         draft: bool,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
         let url = format!("{API_BASE}/repos/{owner}/{repo}/pulls");
+        // No body reaches GitHub naming issue #0 (`passes::outcome`).
+        let body = crate::passes::outcome::guard_body(body);
         self.post(
             &url,
             &serde_json::json!({
@@ -4329,6 +4331,7 @@ impl GitHubClient {
         body: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let url = format!("{API_BASE}/repos/{owner}/{repo}/pulls/{pr_number}");
+        let body = crate::passes::outcome::guard_body(body);
         self.patch(&url, &serde_json::json!({"body": body})).await?;
         Ok(())
     }

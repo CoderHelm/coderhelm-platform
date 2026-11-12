@@ -84,7 +84,28 @@ const NO_CHANGE_MARKS: &[&str] = &[
     "does not need any change",
     "doesn't need changing",
     "nothing to change",
+    // How coders actually say it (a run looped two steps on a file its
+    // coder twice said "needed no code change" and "stays as it is").
+    "needed no change",
+    "need no code change",
+    "needs no code change",
+    "needed no code change",
+    "no code change is needed",
+    "no code change needed",
+    "no change is needed",
+    "no changes are needed",
+    "requires no change",
+    "required no change",
+    "stays as it is",
+    "stays as is",
+    "left as it is",
+    "left unchanged",
+    "stays unchanged",
 ];
+
+/// The line a coder writes to settle a planned task without a change
+/// (`round_feedback` asks for it): `No change needed: <path>: <why>`.
+pub const NO_CHANGE_LINE: &str = "No change needed:";
 
 /// The coder's own line saying `path` needs no change, when it wrote one: the
 /// line names the file (its path or, when that is how the coder wrote it,
@@ -407,7 +428,7 @@ pub fn round_feedback(cov: &Coverage) -> String {
         "The plan is not done yet: the branch doesn't change the file of {} of its {} tasks. \
          Do these tasks now, in order, writing each task's files as soon as that task is done. \
          Read what is already on the branch first and build on it; don't redo finished tasks.\n\n\
-         Still to do:\n{}\n\nAlready done on the branch:\n{}",
+         Still to do:\n{}\n\nAlready done on the branch:\n{}\n\n{}",
         todo.len(),
         cov.total(),
         todo.join("\n"),
@@ -415,8 +436,126 @@ pub fn round_feedback(cov: &Coverage) -> String {
             "(none)".to_string()
         } else {
             done.join("\n")
-        }
+        },
+        settle_without_change()
     )
+}
+
+/// How a task is settled without a change, said the same way every time.
+fn settle_without_change() -> String {
+    format!(
+        "If, after reading a task's file, it truly needs no change (the code already does what \
+         the task asks), don't edit it: write one line `{NO_CHANGE_LINE} <path>: <why, with the \
+         code that already does it>` in your final message. That settles the task; it is listed \
+         on the pull request for a person to check."
+    )
+}
+
+/// A different approach after a step changed nothing: one task only (the
+/// first one left), what the branch already changes, and the two ways to
+/// finish it (the change, or the no-change line). `diff_files` is what the
+/// branch changes so far.
+pub fn narrowed_feedback(cov: &Coverage, diff_files: &[String]) -> Option<String> {
+    let missing = cov.required_missing();
+    let first = missing.first()?;
+    let n = cov.done.len() + 1;
+    let files = if diff_files.is_empty() {
+        "(nothing yet)".to_string()
+    } else {
+        diff_files
+            .iter()
+            .take(40)
+            .map(|f| format!("- `{f}`"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    Some(format!(
+        "The last step changed nothing on the branch while this task was open, so this step \
+         takes a different approach: one task only. Start fresh from the plan and the branch as \
+         it is now; don't re-read or redo finished work.\n\n\
+         The task (task {n} of {total}):\n{task}\n\n\
+         The branch already changes these files (the other tasks are done there):\n{files}\n\n\
+         Do exactly one of these, then stop:\n\
+         1. Make the change the task asks for in `{path}` and save the file.\n\
+         2. If the file already does what the task asks, write the line \
+         `{NO_CHANGE_LINE} {path}: <why, with the code that already does it>` in your final \
+         message. Saying it needs no change any other way leaves the task open, and the run \
+         stops after this step.{more}",
+        total = cov.total(),
+        task = task_line(first),
+        path = first.path,
+        more = if missing.len() > 1 {
+            format!(
+                "\n\n{} more task(s) are left after this one; the next step takes them.",
+                missing.len() - 1
+            )
+        } else {
+            String::new()
+        }
+    ))
+}
+
+/// The planned task a run is on: the first one left, as `task K of N
+/// (`path`: what)`.
+pub fn current_task(cov: &Coverage) -> Option<String> {
+    let first = cov.required_missing().into_iter().next()?;
+    Some(format!(
+        "task {} of {} (`{}`: {})",
+        cov.done.len() + 1,
+        cov.total(),
+        first.path,
+        common::truncate_str(first.task.trim(), 160)
+    ))
+}
+
+/// Marks the tasks whose file the coder said needs no change (in `notes`)
+/// and the branch doesn't change: optional from now on, with the coder's
+/// line. Returns the paths it settled.
+pub fn settle_declined(tasks: &mut [PlanTask], cov: &Coverage, notes: &str) -> Vec<String> {
+    let missing: Vec<String> = cov
+        .required_missing()
+        .iter()
+        .map(|t| t.path.clone())
+        .collect();
+    let mut settled = Vec::new();
+    for t in tasks.iter_mut().filter(|t| missing.contains(&t.path)) {
+        if let Some(why) = declined_by_coder(notes, &t.path) {
+            info!(path = %t.path, "The coder found a planned file needs no change");
+            t.optional = true;
+            t.task = format!("{} (the coder found it needs no change: {why})", t.task);
+            settled.push(t.path.clone());
+        }
+    }
+    settled
+}
+
+/// The plan's checklist with each settled task's line saying so, so a later
+/// step reads the task as optional (`is_optional` matches "no change
+/// needed") instead of asking for it again.
+pub fn with_declined(tasks_md: &str, tasks: &[PlanTask]) -> String {
+    tasks_md
+        .lines()
+        .map(|line| {
+            let Some(task) = plan_tasks(line).into_iter().next() else {
+                return line.to_string();
+            };
+            match tasks.iter().find(|t| t.path == task.path) {
+                Some(t) if t.optional && !task.optional => {
+                    let why = t
+                        .task
+                        .split_once("(the coder found it needs no change: ")
+                        .map(|(_, w)| w.trim_end_matches(')').trim())
+                        .unwrap_or("");
+                    format!(
+                        "{line} (no change needed: {})",
+                        common::truncate_str(why, 300)
+                    )
+                }
+                _ => line.to_string(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// The run's status when it stops with planned work not done: plain, and
@@ -647,6 +786,9 @@ pub async fn close_gaps(
         return None;
     }
     let mut rounds = 0;
+    // The implement pass may already have said a planned file needs no
+    // change: that settles the task before any round asks for it again.
+    let mut notes = evidence.notes.clone();
     loop {
         let cov = plan_changes(
             w.github,
@@ -657,11 +799,25 @@ pub async fn close_gaps(
         )
         .await?
         .coverage(&tasks);
+        let settled = settle_declined(&mut tasks, &cov, &notes);
+        notes.clear();
+        let cov = if settled.is_empty() {
+            cov
+        } else {
+            let mut c = cov;
+            for t in c.missing.iter_mut() {
+                if let Some(n) = tasks.iter().find(|n| n.path == t.path) {
+                    *t = n.clone();
+                }
+            }
+            c
+        };
         info!(
             run_id = w.run_id,
             done = cov.done.len(),
             missing = cov.missing.len(),
             on_base = cov.on_base.len(),
+            settled = settled.len(),
             rounds,
             "Plan check"
         );
@@ -723,25 +879,19 @@ pub async fn close_gaps(
         match result {
             Ok(r) => {
                 let timed_out = r.timed_out;
-                // Told to do a task, the coder wrote nothing for it and said
-                // why its file needs no change: that is its judgment, listed
-                // on the pull request for a person, never another round or
-                // step asking the same thing.
-                if r.files_modified.is_empty() {
-                    let missing: Vec<String> = cov
-                        .required_missing()
-                        .iter()
-                        .map(|t| t.path.clone())
-                        .collect();
-                    for t in tasks.iter_mut().filter(|t| missing.contains(&t.path)) {
-                        if let Some(why) = declined_by_coder(&r.evidence.notes, &t.path) {
-                            info!(run_id = w.run_id, path = %t.path, "The coder found a planned file needs no change");
-                            t.optional = true;
-                            t.task =
-                                format!("{} (the coder found it needs no change: {why})", t.task);
-                        }
-                    }
-                }
+                // Told to do a task, the coder said why its file needs no
+                // change: that is its judgment, listed on the pull request
+                // for a person, never another round or step asking the same
+                // thing (settled at the top of the loop).
+                notes = r.evidence.notes.clone();
+                super::write_conversation_log(
+                    w.state,
+                    &w.msg.team_id,
+                    w.run_id,
+                    "implement_plan_round",
+                    &r.conversation_log,
+                )
+                .await;
                 evidence.merge(r.evidence);
                 if timed_out {
                     // No time for another round here; what it wrote counts.
