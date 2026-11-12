@@ -2493,7 +2493,10 @@ def options_propose(store, env, version, wanted, cfn, opener=None):
             # The template the change set must keep: checked before it is offered (native_poll).
             "template_canonical": canonical_sha(deployed), "held": [],
             "deployed_access": {k: v for k, v in (deployed.get("Resources") or {}).items() if k in HELD},
-            "options": changes}
+            "options": changes,
+            # The access stack against the running release, read before the change:
+            # the review says so when it is behind (native_status, access_note).
+            "access": access_stack_state(env, cfn)}
 
 
 def set_options(store, env, now, event):
@@ -2595,6 +2598,11 @@ def stack_account(stack):
 def stack_partition(stack):
     parts = str(stack.get("StackId") or "").split(":")
     return parts[1] if len(parts) > 5 else "aws"
+
+
+def stack_region(stack):
+    parts = str(stack.get("StackId") or "").split(":")
+    return parts[3] if len(parts) > 5 else ""
 
 
 def held_url(env, stack, version):
@@ -2893,6 +2901,88 @@ def iam_calls(rc, account, partition, install_boundary, prefix="coderhelm"):
     return calls
 
 
+# The calls CloudFormation's own handlers make, as the deploy role, for the
+# resources a private network adds besides its role (infra/lib/access.ts,
+# deployPolicy's NetworkGroups* and PRIVATE_NETWORK_DEPLOY_READS; the
+# handlers' registry schemas). v0.8.95's first network failed on
+# ec2:DescribeSecurityGroups at Reach1Group, after the preflight had checked
+# only the IAM calls: the install's deploy role was still v0.8.90's.
+SECURITY_GROUP_CALLS = {
+    "Add": ["ec2:CreateSecurityGroup", "ec2:DescribeSecurityGroups", "ec2:AuthorizeSecurityGroupEgress",
+            "ec2:RevokeSecurityGroupEgress", "ec2:CreateTags"],
+    "Modify": ["ec2:DescribeSecurityGroups", "ec2:AuthorizeSecurityGroupEgress", "ec2:RevokeSecurityGroupEgress"],
+    "Remove": ["ec2:DescribeSecurityGroups", "ec2:DeleteSecurityGroup"],
+}
+# Lambda checks the caller may read the VPC, its subnets and the security
+# groups a function is placed in (and reads the network interfaces on delete).
+VPC_FUNCTION_CALLS = {
+    "Add": ["ec2:DescribeSecurityGroups", "ec2:DescribeSubnets", "ec2:DescribeVpcs"],
+    "Modify": ["ec2:DescribeSecurityGroups", "ec2:DescribeSubnets", "ec2:DescribeVpcs"],
+    "Remove": ["ec2:DescribeNetworkInterfaces"],
+}
+LOG_GROUP_CALLS = {
+    "Add": ["logs:CreateLogGroup", "logs:PutRetentionPolicy", "logs:TagResource"],
+    "Modify": ["logs:PutRetentionPolicy"],
+    "Remove": ["logs:DeleteLogGroup"],
+}
+INSTALL_TAG = "coderhelm:install"
+# Calls AWS authorizes against "*" (no resource ARN).
+NO_RESOURCE = ("ec2:DescribeSecurityGroups", "ec2:DescribeSubnets", "ec2:DescribeVpcs", "ec2:DescribeNetworkInterfaces")
+
+
+def resource_calls(rc, account, partition, region, prefix="coderhelm"):
+    """[(action, resource ARN, context)] the calls CloudFormation's handlers
+    make for one change of a security group, a function in a VPC or a log
+    group (a replacement is a create and a delete)."""
+    t, act = rc.get("ResourceType") or "", rc.get("Action") or ""
+    after = context(rc.get("AfterContext"))
+    after = after.get("Properties", after) if isinstance(after, dict) else {}
+    before = context(rc.get("BeforeContext"))
+    before = before.get("Properties", before) if isinstance(before, dict) else {}
+    targets = {(d.get("Target") or {}).get("Name") for d in rc.get("Details") or []} - {None}
+    replaced = act == "Modify" and rc.get("Replacement") in ("True", "Conditional")
+    acts = ["Add", "Remove"] if replaced else [act]
+    phys = rc.get("PhysicalResourceId") or ""
+    at = lambda svc: f"arn:{partition}:{svc}:{region}:{account}"  # noqa: E731
+    calls = []
+
+    def one(action, arn, ctx=None):
+        calls.append((action, "*" if action in NO_RESOURCE else arn, ctx or {}))
+    if t == "AWS::EC2::SecurityGroup":
+        group = f"{at('ec2')}:security-group/{phys if phys.startswith('sg-') else '*'}"
+        tagged = {f"aws:ResourceTag/{INSTALL_TAG}": prefix}
+        for a in acts:
+            for action in SECURITY_GROUP_CALLS.get(a, []):
+                if action == "ec2:CreateSecurityGroup":
+                    vpc = after.get("VpcId")
+                    one(action, f"{at('ec2')}:vpc/{vpc if _known(vpc) else '*'}")
+                    one(action, f"{at('ec2')}:security-group/*")
+                elif action == "ec2:CreateTags":
+                    tags = {x.get("Key"): x.get("Value") for x in _as_list(after.get("Tags")) if isinstance(x, dict)}
+                    ctx = {f"aws:RequestTag/{k}": v for k, v in tags.items() if _known(k) and isinstance(v, str)}
+                    ctx.setdefault(f"aws:RequestTag/{INSTALL_TAG}", prefix)
+                    one(action, f"{at('ec2')}:security-group/*", dict(ctx, **{"aws:TagKeys": sorted(set(tags) | {INSTALL_TAG})}))
+                elif a == "Add":
+                    one(action, f"{at('ec2')}:security-group/*")
+                else:
+                    one(action, group, tagged)
+    elif t == "AWS::Lambda::Function":
+        for a in acts:
+            props = before if a == "Remove" else after
+            if not props.get("VpcConfig") and not (a == "Modify" and "VpcConfig" in targets):
+                continue
+            for action in VPC_FUNCTION_CALLS.get(a, []):
+                one(action, "*")
+    elif t == "AWS::Logs::LogGroup":
+        name = (before if act == "Remove" else after).get("LogGroupName")
+        if not _known(name):
+            name = f"/aws/lambda/{prefix}-{rc.get('LogicalResourceId') or 'x'}"
+        for a in acts:
+            for action in LOG_GROUP_CALLS.get(a, []):
+                one(action, f"{at('logs')}:log-group:{name}")
+    return calls
+
+
 class Unchecked(Exception):
     """The preflight couldn't check the change set: it holds the update."""
 
@@ -2909,6 +2999,7 @@ def preflight(cfn, env, cs_id, stack, iam=None):
     except Exception as e:  # noqa: BLE001
         return [f"couldn't check: the deploy role's policies couldn't be read ({type(e).__name__}: {str(e)[:160]})"]
     account, partition = stack_account(stack), stack_partition(stack)
+    region = env.get("AWS_REGION") or stack_region(stack)
     prefix = env.get("RESOURCE_PREFIX") or env["NATIVE_STACK"]
     install_boundary = f"arn:{partition}:iam::{account}:policy/{prefix}-boundary-stack"
     out, seen = [], set()
@@ -2916,7 +3007,8 @@ def preflight(cfn, env, cs_id, stack, iam=None):
     def walk(cid, part, stack_name):
         for ch in change_set_pages(cfn, cid, stack_name):
             rc = ch.get("ResourceChange") or {}
-            for action, arn, ctx in iam_calls(rc, account, partition, install_boundary, prefix):
+            calls = iam_calls(rc, account, partition, install_boundary, prefix) + resource_calls(rc, account, partition, region, prefix)
+            for action, arn, ctx in calls:
                 try:
                     verdict, sid = iam_decision(access["identity"], access["boundary"], action, arn,
                                                 dict(ctx, **{"aws:PrincipalArn": access["role_arn"]}))
@@ -3272,6 +3364,77 @@ def access_view(store, env, now, force=False, **kw):
         view = dict(rec.get("view") or {"state": "unknown"}, error=str(e)[:300])
     store.put("ACCESS", {"at": now.isoformat(), "view": view})
     return view
+
+
+def access_stack_state(env, cfn=None):
+    """The access stack against the running release: {stack, version (its
+    Version output, None when there is no such stack or it has none), needs
+    (the running release), behind, link (the stack in the console, or the
+    quick-create link when there is none), template_url}. Never fails."""
+    root = env.get("NATIVE_STACK") or ""
+    running = env.get("CODERHELM_VERSION") or ""
+    region = env.get("AWS_REGION") or ""
+    url = f"https://{NATIVE_HOST}/launch/{running}/{ACCESS_FILE}"
+    out = {"stack": f"{root}-access", "version": None, "needs": running, "behind": False, "link": None, "template_url": url}
+    try:
+        st = (cfn or client("cloudformation")).describe_stacks(StackName=f"{root}-access")["Stacks"][0]
+    except Exception as e:  # noqa: BLE001
+        if "does not exist" not in str(e):
+            logger.warning(f"access stack not read: {e}")
+            return out
+        out.update(behind=bool(parse_version(running)), exists=False)
+        return out
+    have = {o.get("OutputKey"): o.get("OutputValue") for o in st.get("Outputs") or []}.get("Version") or None
+    out.update(version=have, exists=True,
+               link=f"https://{region}.console.aws.amazon.com/cloudformation/home?region={region}#/stacks/stackinfo?stackId={st.get('StackId')}")
+    if parse_version(have) and parse_version(running):
+        out["behind"] = compare(have, running) < 0
+    return out
+
+
+def access_first_line(acc):
+    """"Apply the access stack update first (it's at v0.8.90, this needs v0.8.95)" and how, or ""."""
+    if not acc or not acc.get("behind"):
+        return ""
+    if acc.get("exists") is False:
+        return (f"Create the access stack first (there is none yet, this needs {acc.get('needs')}'s): "
+                "Settings, System, Permissions has the one link, or the AWS console with the template "
+                f"{acc.get('template_url')}")
+    where = f": {acc['link']}" if acc.get("link") else ""
+    return (f"Apply the access stack update first (it's at {acc.get('version') or 'an older release'}, this needs {acc.get('needs')}): "
+            f"update {acc.get('stack')} with the template {acc.get('template_url')}{where}")
+
+
+def access_needed(store, env, now, entry, calls, cfn=None):
+    """A change the deploy role can't make until the access stack is applied:
+    kept so Settings, System, Permissions shows the access card as needed
+    for it, whatever the switches read now."""
+    acc = entry.get("access") or access_stack_state(env, cfn)
+    store.put("ACCESS_NEEDED", {"at": now.isoformat(), "needs": acc.get("needs"), "version": acc.get("version"),
+                                "for": options_text(entry.get("options") or {}) if entry.get("options") else (entry.get("version") or ""),
+                                "options": {k: c.get("to") for k, c in (entry.get("options") or {}).items()},
+                                "calls": list(calls)[:20], "link": acc.get("link"), "template_url": acc.get("template_url")})
+    access_view(store, env, now, force=True, cfn=cfn)
+
+
+def access_with_needed(view, need, options):
+    """The access card decided for the switches as they are, and as needed
+    (state pending) for a change the deploy role was refused, until the
+    access stack carries that release."""
+    if need and need.get("options"):
+        options = dict(options or {}, **need["options"])
+    out = access_decide(view, options)
+    if not need:
+        return out
+    have = ((out or {}).get("current") or {}).get("version")
+    if parse_version(have) and parse_version(need.get("needs")) and compare(have, need["needs"]) >= 0:
+        return out
+    out = dict(out or {"state": "unknown"})
+    line = (f"needed to {need.get('for') or 'apply the last change'}: the deploy role may not make "
+            + ", ".join(sorted({str(c).split(' on ')[0].split(': ')[-1] for c in need.get('calls') or []})[:8]) + " yet")
+    out.update(state="pending", needed_for=need, summary=[line] + [s for s in out.get("summary") or [] if s != line])
+    out.setdefault("template_url", need.get("template_url"))
+    return out
 
 
 # ── A stack whose rollback stopped (UPDATE_ROLLBACK_FAILED) ──────────────
@@ -3655,6 +3818,8 @@ def native_status(store, env, state):
                 "preflight": entry.get("preflight") or [],
                 "can_apply": can_apply_here(env, entry),
                 "confirm": confirm_token(hid, entry),
+                # The access stack against the running release, in plain words ("" when it isn't behind).
+                "access_note": access_note(entry),
             })
     role = bool(env.get("DEPLOY_ROLE_ARN"))
     options = install_options(env)
@@ -3668,12 +3833,26 @@ def native_status(store, env, state):
         # applied by an AWS admin through the access stack (one link).
         # Decided for the switches as they are this moment, so turning one on or
         # off shows (or hides) what it needs at once.
-        "access": access_decide((store.get("ACCESS") or {}).get("view"), options),
+        # A change the deploy role was refused (ACCESS_NEEDED) keeps it needed until the access stack has caught up.
+        "access": access_with_needed((store.get("ACCESS") or {}).get("view"), store.get("ACCESS_NEEDED") or None, options),
         # A stack whose rollback stopped, and what CoderHelm did about it.
         "recovery": state.get("recovery"),
         # What the install reads in its own account, as its stack has it (None: not readable).
         "options": options,
     }
+
+
+def access_note(entry):
+    """What the review says about the access stack when it is behind the running release."""
+    acc = entry.get("access") or {}
+    if not acc.get("behind"):
+        return ""
+    have = acc.get("version") or ("none yet" if acc.get("exists") is False else "an older release")
+    if entry.get("preflight"):
+        return f"The access stack is at {have} and this change needs {acc.get('needs')}'s permissions. {access_first_line(acc)}."
+    checked = "the deploy role may make every call this change needs (checked), so it doesn't need it" if "preflight" in entry else "this change may need it"
+    return (f"The access stack is at {have}, behind the running release ({acc.get('needs')}): {checked}. "
+            "Apply it when you can (Settings, System, Permissions).")
 
 
 def confirm_token(hid, entry):
@@ -3729,17 +3908,49 @@ def change_set_summary(cs, region, role=False):
     }
 
 
-def first_failure(cfn, stack_name, since):
-    """CloudFormation's own reason for the first resource that failed since `since`."""
+def _when(v):
+    """An event's Timestamp (boto3 gives a datetime) or an ISO string, as an aware datetime, or None."""
+    if isinstance(v, datetime):
+        return v if v.tzinfo else v.replace(tzinfo=timezone.utc)
     try:
-        events = cfn.describe_stack_events(StackName=stack_name).get("StackEvents") or []
-    except Exception as e:
-        return f"could not read the stack's events: {e}"
+        d = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+
+
+# What CloudFormation says of a resource it stopped because another one failed.
+_KNOCK_ON = ("resource creation cancelled", "resource update cancelled", "resource deletion cancelled")
+
+
+def first_failure(cfn, stack_name, since, pages=5):
+    """CloudFormation's own reason for the first resource that failed since
+    `since`: the oldest failure that isn't only "cancelled" because another
+    one failed (events are newest first, and a page holds about 100)."""
+    start = _when(since) if since else None
+    events, token = [], None
+    try:
+        for _ in range(pages):
+            kw = {"StackName": stack_name}
+            if token:
+                kw["NextToken"] = token
+            page = cfn.describe_stack_events(**kw)
+            got = page.get("StackEvents") or []
+            events += got
+            token = page.get("NextToken")
+            # Read until the events are older than the update (a datetime, never its str: "2026-11-12 19:10"
+            # sorts before "2026-11-12T19:00", which hid every failure of the same day).
+            if not token or (start and got and (_when(got[-1].get("Timestamp")) or start) < start):
+                break
+    except Exception as e:  # noqa: BLE001
+        if not events:
+            return f"could not read the stack's events: {e}"
     failed = [e for e in events if str(e.get("ResourceStatus", "")).endswith("_FAILED")
-              and (not since or str(e.get("Timestamp", "")) >= since)]
+              and (not start or (_when(e.get("Timestamp")) or start) >= start)]
     if not failed:
         return ""
-    e = failed[-1]  # events are newest first: the last one is the first failure
+    real = [e for e in failed if str(e.get("ResourceStatusReason") or "").strip().lower().rstrip(".") not in _KNOCK_ON]
+    e = (real or failed)[-1]  # newest first: the last one is the first failure
     return f"{e.get('LogicalResourceId')}: {e.get('ResourceStatusReason') or e.get('ResourceStatus')}"[:500]
 
 
@@ -3822,6 +4033,17 @@ def native_poll(store, env, now, cfn=None, wait=False):
             logger.warning(f"change set not deleted: {e}")
         if (store.get(hid, {}) or {}).get("status") != was:
             return {"native": "moved on"}
+        if entry.get("preflight"):
+            # The deploy role is behind the running release: the access stack
+            # update comes first, and Settings, System, Permissions shows it.
+            entry["access"] = access_stack_state(env, cfn)
+            store.put(hid, entry)
+            try:
+                if entry["access"].get("behind"):
+                    # Only what the access stack update can give: never for a call it couldn't check.
+                    access_needed(store, env, now, entry, [c for c in entry["preflight"] if "couldn't check" not in c], cfn)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"access card not marked: {e}")
         store.put(hid, entry)
         return native_finish(store, env, now, hid, "failed", never, PREPARE)
     if execution == "AVAILABLE" and entry.get("executed_at"):
@@ -3955,7 +4177,20 @@ def never_runs(entry):
         calls = [f"parent.{c}" for c in entry["admin_changes"]]
     if not calls:
         return ""
-    return (f"{PREFLIGHT_MARK}: " + "; ".join(calls))[:900]
+    text = f"{PREFLIGHT_MARK}: " + "; ".join(calls)
+    if len(text) > 900:
+        # Each resource once, with the actions it would be refused (the full list stays in the entry's preflight).
+        by = {}
+        for c in calls:
+            m = re.match(r"^([\w.-]+): ([\w-]+:[\w*]+) on ", c)
+            if m:
+                by.setdefault(m.group(1), [])
+                if m.group(2) not in by[m.group(1)]:
+                    by[m.group(1)].append(m.group(2))
+            else:
+                by.setdefault(c, [])
+        text = f"{PREFLIGHT_MARK}: " + "; ".join(f"{k}: {', '.join(v)}" if v else k for k, v in by.items())
+    return text[:900]
 
 
 # After UPDATE_COMPLETE the new release must answer, as `coderhelm-selfhost
@@ -4253,11 +4488,32 @@ _NEXT_RELEASE = "Update again once a newer release is out (CoderHelm checks for 
 _SAME_AGAIN = "If the next try fails the same way, wait for a newer release (CoderHelm checks every hour)."
 
 
-def _cause(raw):
+# CloudFormation acting as the stack's service role (the deploy role): its session is AWSCloudFormation.
+_AS_DEPLOY_ROLE = re.compile(r"assumed-role/[\w+=,.@-]+/AWSCloudFormation\b", re.I)
+
+
+def deploy_role_denied(raw):
+    """The action the deploy role was refused, from CloudFormation's text ("" when it wasn't)."""
+    text = raw or ""
+    m = _NOT_ALLOWED.search(text)
+    return m.group(1) if m and _AS_DEPLOY_ROLE.search(text) else ""
+
+
+def _access_fix(access):
+    line = access_first_line(access)
+    return (line + ", then try again." if line
+            else "An AWS admin applies the access stack update (Settings, System, Permissions has the link), then try again.")
+
+
+def _cause(raw, access=None, phase=None):
     """(what went wrong, the next step) for CloudFormation's text, or (None, None)."""
     text = raw or ""
     low = text.lower()
     m = _NOT_ALLOWED.search(text)
+    denied = deploy_role_denied(text) if phase in (ROLLED_BACK, STOPPED) else ""
+    if denied:
+        # The deploy role is behind what the change needs: never fixed by pressing again.
+        return (f"the deploy role isn't allowed {denied} yet", _access_fix(access))
     if m and m.group(1).lower() == "cloudformation:createchangeset" and _TRANSFORM.search(text):
         return ("CoderHelm's update role isn't allowed to use an AWS template feature this release needs", _NEXT_RELEASE)
     if m or "accessdenied" in low or "access denied" in low:
@@ -4277,6 +4533,8 @@ def _cause(raw):
     if ("does not exist" in low and "change set" in low) or "change set was deleted" in low:
         return ("the prepared change was deleted in AWS before it ran", "Press Update again.")
     if PREFLIGHT_MARK.lower() in low:
+        if access and access.get("behind"):
+            return ("it needs permissions the deploy role doesn't have yet, so it was stopped before anything ran", _access_fix(access))
         return ("it needs permissions CoderHelm's update role doesn't have, so it was stopped before anything ran",
                 "An AWS admin applies the permission change shown under Version, Permissions (one link to the AWS console), then press Update again.")
     if "can no longer run" in low or "stack changed since" in low:
@@ -4284,12 +4542,14 @@ def _cause(raw):
     return (None, None)
 
 
-def explain_failure(raw, version, from_version, phase):
-    """{summary, fix, technical, reason} for an update that didn't succeed."""
+def explain_failure(raw, version, from_version, phase, access=None):
+    """{summary, fix, technical, reason} for an update that didn't succeed.
+    `access`: the access stack against the running release (access_stack_state),
+    for a step that needs it first."""
     raw = str(raw or "").strip()
     v = version or "the new release"
     was = from_version or "the release it ran before"
-    what, fix = _cause(raw)
+    what, fix = _cause(raw, access, phase)
     part = re.match(r"([A-Za-z][A-Za-z0-9]{0,63}): ", raw)
     broken = f"the {part.group(1)} part of the install could not be updated" if part else "a part of the install could not be updated"
     if phase == UNANSWERED:
@@ -4320,7 +4580,20 @@ def native_finish(store, env, now, hid, status, reason, phase=None):
     if status != "succeeded":
         entry = store.get(hid, {}) or {}
         phase = phase or (ROLLED_BACK if status == "rolled_back" else STOPPED)
-        event.update(explain_failure(reason, entry.get("version"), entry.get("from_version"), phase))
+        access = entry.get("access")
+        denied = deploy_role_denied(reason) if phase != PREPARE else ""
+        if denied or PREFLIGHT_MARK.lower() in str(reason or "").lower():
+            # The access stack as it is now, and the card shows it as needed for this change.
+            access = access_stack_state(env)
+            if denied and access.get("behind"):
+                try:
+                    access_needed(store, env, now, dict(entry, access=access), [denied])
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(f"access card not marked: {e}")
+        event.update(explain_failure(reason, entry.get("version"), entry.get("from_version"), phase, access))
+    elif (store.get(hid, {}) or {}).get("mode") == "options":
+        # A change applied: whatever an earlier refusal needed is applied too.
+        store.put("ACCESS_NEEDED", {})
     return handle(event, env, store, now)
 
 
