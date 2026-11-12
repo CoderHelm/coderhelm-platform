@@ -90,6 +90,8 @@ pub mod instructions;
 pub mod live;
 /// Log findings and the fix runs started from them.
 pub mod log_findings;
+/// Reachability read from the code: imports, calls, lockfile parents.
+pub mod reachability;
 /// One repo's reviewer settings: the page's view and the saved item.
 pub mod review_config;
 /// Security fixes: advisories, triage, fix runs and cards (gateway and worker).

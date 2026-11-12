@@ -50,14 +50,23 @@ type Item = HashMap<String, AttributeValue>;
 
 /// Time one tick may spend on security work.
 const TICK_BUDGET_SECS: u64 = 300;
-/// Model calls triage makes per team per tick (one call reads one package
-/// at one version, with every advisory it has).
-const TRIAGE_PER_TICK: usize = 6;
-/// Groups whose code is searched per tick: those that settle without the
-/// model (or reuse an earlier verdict) cost no tokens.
-const TRIAGE_SEARCH_PER_TICK: usize = 40;
+/// Model calls triage makes per team per tick at most (one call reads one
+/// package at one version, with every advisory it has); fewer when the
+/// day's token cap is near (`reachability::model_calls_allowed`). With a
+/// tick every 20 minutes, 50 reads take five ticks under the 400k cap.
+const TRIAGE_PER_TICK: usize = 12;
+/// Groups read per tick. The code check reads the repository once per tick
+/// (one tarball) and settles most groups without the model, so every open
+/// group fits in one tick.
+const TRIAGE_SEARCH_PER_TICK: usize = 600;
 /// Characters of evidence one triage question carries.
-const TRIAGE_MAX_CHARS: usize = 12_000;
+const TRIAGE_MAX_CHARS: usize = 8_000;
+/// Days before a verdict is read again (the code changes; an unchanged
+/// read reuses the verdict without the model).
+const TRIAGE_RECHECK_DAYS: i64 = 7;
+/// What the triage key starts with: a new way of reading the code reads
+/// every finding again once.
+const TRIAGE_VERSION: &str = "code-2";
 /// OSV records read per sync (shared by every repository in the tick).
 const OSV_HYDRATE_MAX: usize = 1_500;
 /// OSV records read at once.
@@ -1015,7 +1024,7 @@ async fn epss(state: &WorkerState, cves: &[String]) -> HashMap<String, (f64, f64
 
 fn triage_key(f: &Finding) -> String {
     common::content_hash(&format!(
-        "{}|{}|{:?}",
+        "{TRIAGE_VERSION}|{}|{}|{:?}",
         f.advisory.ids.join(","),
         f.version,
         f.scope
@@ -1035,8 +1044,9 @@ async fn code_hits(
     let branch = gh.get_default_branch(owner, name).await?;
     let mut files: Vec<(String, String)> = vec![];
     for t in terms {
-        let q = format!("\"{t}\"");
-        let results = gh.search_code(owner, name, &branch, &q).await?;
+        // No quotes: the snapshot's search takes them literally, so
+        // `"axios"` never matched `from 'axios'`.
+        let results = gh.search_code(owner, name, &branch, t).await?;
         for r in results.into_iter().take(4) {
             if is_lockfile_or_manifest(&r.path) {
                 continue;
@@ -1102,6 +1112,8 @@ enum Triaged {
     Reused,
     /// Settled without the model (dev only, withdrawn, no code names it).
     Settled,
+    /// Settled by reading the code (imports, calls, the lockfile's parents).
+    Code(Verdict),
     /// One model call.
     Model,
     /// No model call left this tick, or today's limit is used.
@@ -1174,6 +1186,7 @@ async fn apply_verdict(
         f.evidence = Some(e.clone());
         f.waiting = None;
         st.triaged = Some(triage_key(f));
+        st.triaged_at = Some(Utc::now().to_rfc3339());
         sec::retier(f, st, cx.cfg);
         f.updated_at = Utc::now().to_rfc3339();
         save_finding(cx.state, cx.team_id, f, st).await;
@@ -1354,59 +1367,412 @@ async fn triage_group(
     }
 }
 
+/// Whether a finding's verdict is read on this tick: never read, read by an
+/// older way of reading the code, its advisories or version changed, or
+/// read more than [`TRIAGE_RECHECK_DAYS`] ago.
+fn triage_due(f: &Finding, st: &FindingState, now: chrono::DateTime<Utc>) -> bool {
+    if f.verdict == Verdict::Pending || st.triaged.as_deref() != Some(triage_key(f).as_str()) {
+        return true;
+    }
+    st.triaged_at
+        .as_deref()
+        .and_then(sec::parse_time)
+        .is_none_or(|t| now - t >= Duration::days(TRIAGE_RECHECK_DAYS))
+}
+
+/// The groups to read, the most urgent first: the lowest tier, then the
+/// highest score (criticals before highs), runtime before scope unknown
+/// before dev.
+fn triage_order(
+    findings: &[(Finding, FindingState)],
+    groups: &BTreeMap<String, Vec<usize>>,
+) -> Vec<String> {
+    let scope_rank = |s: sec::Scope| match s {
+        sec::Scope::Runtime => 0,
+        sec::Scope::Unknown => 1,
+        sec::Scope::Dev => 2,
+    };
+    let mut order: Vec<(Option<sec::Tier>, i64, u8, String)> = groups
+        .iter()
+        .map(|(k, idxs)| {
+            let tier = idxs.iter().filter_map(|i| findings[*i].0.tier).min();
+            let score = idxs
+                .iter()
+                .map(|i| (sec::score(&findings[*i].0, &findings[*i].1) * 10.0) as i64)
+                .max()
+                .unwrap_or(0);
+            let scope = idxs
+                .iter()
+                .map(|i| scope_rank(findings[*i].0.scope))
+                .min()
+                .unwrap_or(1);
+            (tier, -score, scope, k.clone())
+        })
+        .collect();
+    order.sort();
+    order.into_iter().map(|(_, _, _, k)| k).collect()
+}
+
+/// The lockfiles that say how a manifest's packages come in: the manifest
+/// itself when it is one; for a `package.json`, the nearest lockfile in its
+/// folder or above; for the dependency graph's list, every lockfile.
+fn lockfiles_for(manifest: &str, tree: &[String]) -> Vec<String> {
+    use common::reachability as reach;
+    let in_tree = |p: &str| tree.iter().any(|t| t == p);
+    if reach::is_lockfile(manifest) {
+        return if in_tree(manifest) {
+            vec![manifest.to_string()]
+        } else {
+            vec![]
+        };
+    }
+    if manifest == sec::SBOM_MANIFEST {
+        return tree
+            .iter()
+            .filter(|t| reach::is_lockfile(t) && !t.contains("node_modules/"))
+            .cloned()
+            .collect();
+    }
+    let mut dir = reach::Query::dir_of(manifest);
+    loop {
+        let found: Vec<String> = reach::LOCKFILES
+            .iter()
+            .map(|n| format!("{dir}{n}"))
+            .filter(|p| in_tree(p))
+            .collect();
+        if !found.is_empty() || dir.is_empty() {
+            return found;
+        }
+        let trimmed = dir.trim_end_matches('/');
+        dir = match trimmed.rsplit_once('/') {
+            Some((up, _)) => format!("{up}/"),
+            None => String::new(),
+        };
+    }
+}
+
+/// Reads the code once for a repository's groups: one snapshot (a tarball),
+/// the lockfiles, then one pass over every file. A decision per group, in
+/// order; None when the snapshot can't be had (the search path runs then).
+async fn code_decisions(
+    cx: &Ctx<'_>,
+    repo: &str,
+    groups: &[Vec<usize>],
+    findings: &[(Finding, FindingState)],
+) -> Option<Vec<common::reachability::Decision>> {
+    use common::reachability as reach;
+    let (owner, name) = repo.split_once('/')?;
+    let branch = cx.gh.get_default_branch(owner, name).await.ok()?;
+    let snap = cx.gh.code_snapshot(owner, name, &branch).await?;
+    let tree = snap.tree().await;
+    let mut locks: HashMap<String, Option<String>> = HashMap::new();
+    let mut queries = vec![];
+    for idxs in groups {
+        let lead = &findings[idxs[0]].0;
+        let mut symbols: Vec<String> = vec![];
+        let mut hints: Vec<String> = vec![];
+        for i in idxs {
+            let (f, st) = &findings[*i];
+            for s in &st.symbols {
+                if !symbols.contains(s) {
+                    symbols.push(s.clone());
+                }
+            }
+            let text = format!("{} {}", f.advisory.title, f.advisory.summary);
+            for h in reach::hints_from_text(&text, &f.package) {
+                if !hints.contains(&h) && hints.len() < 12 {
+                    hints.push(h);
+                }
+            }
+        }
+        // What brings it in, from the lockfile (npm, pnpm, Yarn).
+        let mut ancestry = reach::Ancestry::default();
+        let lockfiles = if lead.ecosystem == "npm" {
+            lockfiles_for(&lead.manifest, &tree)
+        } else {
+            vec![]
+        };
+        for lf in &lockfiles {
+            if !locks.contains_key(lf) {
+                let text = match snap.read_file(lf).await {
+                    Some(t) => Some(t),
+                    None => cx.gh.read_file(owner, name, lf, &branch).await.ok(),
+                };
+                locks.insert(lf.clone(), text);
+            }
+            let Some(Some(text)) = locks.get(lf) else {
+                continue;
+            };
+            let direct_names = if lf.ends_with("yarn.lock") {
+                let dir = reach::Query::dir_of(lf);
+                let mut names = vec![];
+                for p in tree.iter().filter(|p| {
+                    p.starts_with(&dir)
+                        && p.ends_with("package.json")
+                        && !p.contains("node_modules/")
+                }) {
+                    if let Some(t) = snap.read_file(p).await {
+                        names.extend(reach::package_json_names(&t));
+                    }
+                }
+                names
+            } else {
+                vec![]
+            };
+            if let Some(a) =
+                reach::lock_ancestry(lf, text, &lead.package, &lead.version, &direct_names)
+            {
+                ancestry.merge(a);
+            }
+        }
+        let (parents, parents_unknown) = if ancestry.found {
+            if ancestry.direct {
+                (vec![], false)
+            } else {
+                let p: Vec<String> = ancestry.parents.iter().cloned().collect();
+                let unknown = p.is_empty();
+                (p, unknown)
+            }
+        } else if let Some(p) = sec::direct_parent(&lead.path) {
+            (vec![p.to_string()], false)
+        } else {
+            let direct = lead.relation == sec::Relation::Direct || lead.path.len() == 1;
+            (vec![], !direct)
+        };
+        let dir = match lockfiles.as_slice() {
+            [one] => reach::Query::dir_of(one),
+            _ => reach::Query::dir_of(&lead.manifest),
+        };
+        queries.push(reach::Query {
+            ecosystem: lead.ecosystem.clone(),
+            package: lead.package.clone(),
+            dir,
+            parents,
+            symbols,
+            hints,
+            parents_unknown,
+        });
+    }
+    let mut scanner = reach::Scanner::new(queries);
+    snap.visit(&mut |path, text| scanner.add(path, text)).await;
+    Some(
+        scanner
+            .finish()
+            .iter()
+            .map(|(q, facts)| reach::decide(q, facts))
+            .collect(),
+    )
+}
+
+/// One group's verdict from the code check: the verdict it settled, or the
+/// model reading the lines it found (an earlier verdict for the same lines
+/// is reused).
+async fn triage_decided(
+    cx: &Ctx<'_>,
+    findings: &mut [(Finding, FindingState)],
+    idxs: &[usize],
+    decision: common::reachability::Decision,
+    calls_left: usize,
+) -> Triaged {
+    use common::reachability::Decision;
+    let Some(&lead_i) = idxs.iter().min_by_key(|i| findings[**i].0.tier) else {
+        return Triaged::Failed;
+    };
+    let lead = findings[lead_i].0.clone();
+    if lead.scope == sec::Scope::Dev || lead.status == Status::Withdrawn {
+        let st = findings[lead_i].1.clone();
+        if let Some((v, e)) = sec::settle_without_model(&lead, &st, 1, 1, &[]) {
+            apply_verdict(cx, findings, idxs, v, &e).await;
+            return Triaged::Settled;
+        }
+    }
+    let (evidence, found) = match decision {
+        Decision::Settled(v, e) => {
+            apply_verdict(cx, findings, idxs, v, &e).await;
+            return Triaged::Code(v);
+        }
+        Decision::Ask(e, found) => (e, found),
+    };
+    let gk = sec::group_key(&lead);
+    let members: Vec<&Finding> = idxs.iter().map(|i| &findings[*i].0).collect();
+    let key = sec::group_triage_key(&members, &evidence.lines);
+    let key = common::content_hash(&format!("{TRIAGE_VERSION}|{key}"));
+    if let Some((v, e)) = load_group_verdict(cx, &gk, &key).await {
+        apply_verdict(cx, findings, idxs, v, &e).await;
+        return Triaged::Reused;
+    }
+    if calls_left == 0 {
+        return Triaged::Waiting;
+    }
+    let mut st_all = findings[lead_i].1.clone();
+    for i in idxs {
+        for sym in &findings[*i].1.symbols {
+            if !st_all.symbols.contains(sym) {
+                st_all.symbols.push(sym.clone());
+            }
+        }
+    }
+    if let Some(why) = super::check_budget_exceeded(cx.state, cx.team_id).await {
+        mark_waiting(
+            cx,
+            findings,
+            idxs,
+            &format!("Not read by the agent: {why}."),
+        )
+        .await;
+        return Triaged::Waiting;
+    }
+    let Ok(provider) = crate::agent::provider::ModelProvider::load_for_team(
+        &cx.state.dynamo,
+        &cx.state.config.settings_table_name,
+        cx.team_id,
+    )
+    .await
+    else {
+        let e = Evidence {
+            summary: format!(
+                "{found} No model is set up for this team, so only the code check ran."
+            ),
+            ..evidence
+        };
+        apply_verdict(cx, findings, idxs, Verdict::Unknown, &e).await;
+        return Triaged::Settled;
+    };
+    let mut prompt = format!("What a check of every source file found: {found}\n\n");
+    prompt.push_str(&sec::triage_prompt(
+        &lead,
+        &st_all,
+        &evidence.lines,
+        TRIAGE_MAX_CHARS,
+    ));
+    if idxs.len() > 1 {
+        prompt.push_str("\n\nThe same package and version also has these advisories; one verdict covers them all:\n");
+        for i in idxs.iter().filter(|i| **i != lead_i).take(20) {
+            let f = &findings[*i].0;
+            prompt.push_str(&format!(
+                "- {}: {}\n",
+                f.advisory.primary,
+                common::truncate_str(&f.advisory.title, 160)
+            ));
+        }
+    }
+    let mut usage = TokenUsage::default();
+    let answer = crate::agent::provider::converse_simple(
+        cx.state,
+        &provider,
+        provider.primary_model_id(),
+        sec::TRIAGE_SYSTEM,
+        &prompt,
+        &mut usage,
+    )
+    .await;
+    triage_tokens(cx.state, cx.team_id, usage.total_tokens(), 1).await;
+    match answer {
+        Ok(text) => {
+            let (v, mut e) = sec::parse_triage(&text, &evidence.lines);
+            e.checked = evidence.checked.clone();
+            if v == Verdict::Unknown {
+                e.summary = format!("{found} {}", e.summary);
+            }
+            save_group_verdict(cx, &gk, &key, v, &e).await;
+            apply_verdict(cx, findings, idxs, v, &e).await;
+            Triaged::Model
+        }
+        Err(err) => {
+            warn!(team_id = cx.team_id, group = %gk, error = %err, "security: triage call failed");
+            Triaged::Failed
+        }
+    }
+}
+
 /// Triage for the tick: the groups whose verdict is missing or stale, the
-/// most urgent first. Returns how many groups got a verdict.
+/// most urgent first. The code is read once per repository and settles
+/// what it can; the model reads the rest, as many as the day's token cap
+/// leaves room for. Returns how many groups got a verdict.
 async fn triage_tick(cx: &Ctx<'_>, findings: &mut [(Finding, FindingState)]) -> usize {
+    let now = Utc::now();
     let mut groups: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     for (i, (f, st)) in findings.iter().enumerate() {
         // Base images are not searched in code (common::base_images).
         if f.status.is_open()
             && f.ecosystem != common::base_images::ECOSYSTEM
             && cx.cfg.repos.includes(&f.repo)
-            && (f.verdict == Verdict::Pending
-                || st.triaged.as_deref() != Some(triage_key(f).as_str()))
+            && triage_due(f, st, now)
         {
             groups.entry(sec::group_key(f)).or_default().push(i);
         }
     }
-    let mut order: Vec<(Option<sec::Tier>, String)> = groups
-        .iter()
-        .map(|(k, idxs)| {
-            (
-                idxs.iter().filter_map(|i| findings[*i].0.tier).min(),
-                k.clone(),
-            )
-        })
+    if groups.is_empty() {
+        return 0;
+    }
+    let order: Vec<String> = triage_order(findings, &groups)
+        .into_iter()
+        .take(TRIAGE_SEARCH_PER_TICK)
         .collect();
-    order.sort();
-    let (mut calls_left, mut done) = (TRIAGE_PER_TICK, 0);
+    // The model calls the day's cap leaves room for (an unreadable counter
+    // reads as the cap reached).
+    let today = triage_tokens(cx.state, cx.team_id, 0, 0).await;
+    let mut calls_left = common::reachability::model_calls_allowed(
+        today,
+        cx.cfg.triage_tokens_per_day,
+        common::reachability::estimate_call_tokens(TRIAGE_MAX_CHARS),
+        TRIAGE_PER_TICK,
+    );
+    // By repository, in the order of each one's most urgent group.
+    let mut repos: Vec<(String, Vec<String>)> = vec![];
+    for k in order {
+        let repo = findings[groups[&k][0]].0.repo.to_ascii_lowercase();
+        match repos.iter_mut().find(|(r, _)| *r == repo) {
+            Some((_, ks)) => ks.push(k),
+            None => repos.push((repo, vec![k])),
+        }
+    }
+    let mut done = 0;
     let mut tally: BTreeMap<&'static str, usize> = BTreeMap::new();
-    for (_, k) in order.into_iter().take(TRIAGE_SEARCH_PER_TICK) {
+    for (_, keys) in repos {
         if cx.out_of_time() {
             break;
         }
-        let idxs = groups.get(&k).cloned().unwrap_or_default();
-        let r = triage_group(cx, findings, &idxs, calls_left).await;
-        *tally
-            .entry(match r {
-                Triaged::Reused => "reused",
-                Triaged::Settled => "settled",
-                Triaged::Model => "model",
-                Triaged::Waiting => "waiting",
-                Triaged::Failed => "failed",
-            })
-            .or_default() += 1;
-        match r {
-            Triaged::Model => {
-                calls_left = calls_left.saturating_sub(1);
-                done += 1;
+        let idx_lists: Vec<Vec<usize>> = keys.iter().map(|k| groups[k].clone()).collect();
+        let repo = findings[idx_lists[0][0]].0.repo.clone();
+        let decisions = code_decisions(cx, &repo, &idx_lists, findings).await;
+        if decisions.is_none() {
+            warn!(team_id = cx.team_id, repo = %repo, "security: the repository's files couldn't be read; triage searches the code instead");
+        }
+        let mut decisions = decisions.map(|d| d.into_iter());
+        for idxs in idx_lists {
+            if cx.out_of_time() {
+                break;
             }
-            Triaged::Reused | Triaged::Settled => done += 1,
-            Triaged::Waiting | Triaged::Failed => {}
+            let r = match decisions.as_mut().and_then(|d| d.next()) {
+                Some(d) => triage_decided(cx, findings, &idxs, d, calls_left).await,
+                None => triage_group(cx, findings, &idxs, calls_left).await,
+            };
+            *tally
+                .entry(match r {
+                    Triaged::Reused => "reused",
+                    Triaged::Settled => "settled",
+                    Triaged::Code(Verdict::Reachable) => "code_reachable",
+                    Triaged::Code(Verdict::NotReachable) => "code_not_reachable",
+                    Triaged::Code(Verdict::NotLoaded) => "code_not_loaded",
+                    Triaged::Code(_) => "code_unknown",
+                    Triaged::Model => "model",
+                    Triaged::Waiting => "waiting",
+                    Triaged::Failed => "failed",
+                })
+                .or_default() += 1;
+            match r {
+                Triaged::Model => {
+                    calls_left = calls_left.saturating_sub(1);
+                    done += 1;
+                }
+                Triaged::Reused | Triaged::Settled | Triaged::Code(_) => done += 1,
+                Triaged::Waiting | Triaged::Failed => {}
+            }
         }
     }
     if !tally.is_empty() {
-        info!(team_id = cx.team_id, ?tally, "security: triage");
+        info!(team_id = cx.team_id, ?tally, calls_left, "security: triage");
     }
     done
 }
@@ -1695,8 +2061,16 @@ async fn tend(
     } else {
         HashMap::new()
     };
-    // Triage by group: one search and at most one model call per package
-    // version, the most urgent first.
+    // The tier a finding's first card posted at, for cards posted before
+    // it was kept: the tier it had then (read before triage moves it).
+    for (f, st) in findings.iter_mut() {
+        if st.carded_tier.is_none() && st.cards.iter().any(|c| c == "new") && f.tier.is_some() {
+            st.carded_tier = f.tier;
+            save_finding(cx.state, cx.team_id, f, st).await;
+        }
+    }
+    // Triage by group: the code read once per repository, at most one model
+    // call per package version, the most urgent first.
     report.triaged += triage_tick(cx, findings).await;
     for (f, st) in findings.iter_mut() {
         let before = (f.clone(), st.clone());
@@ -2067,6 +2441,9 @@ async fn cards(cx: &Ctx<'_>, findings: &mut [(Finding, FindingState)]) -> usize 
         if post_card(cx.state, cx.team_id, &channels, &f.id, stage, f).await {
             cards_today(cx.state, cx.team_id, 1).await;
             st.cards.push(stage.key().to_string());
+            if stage == Stage::New {
+                st.carded_tier = f.tier;
+            }
             posted += 1;
             add_event(
                 cx.state,
@@ -2128,6 +2505,7 @@ fn stage_words(stage: Stage) -> &'static str {
         Stage::Half => "half the deadline gone",
         Stage::Deadline => "deadline reached",
         Stage::Withdrawn => "withdrawn",
+        Stage::RaisedP0 => "now P0",
     }
 }
 
@@ -3866,6 +4244,117 @@ mod tests {
         );
         assert_eq!(deps[1].scope, Scope::Runtime);
         assert!(is_lockfile_or_manifest("go.sum") && !is_lockfile_or_manifest("src/a.ts"));
+    }
+
+    fn open_finding(id: &str, tier: sec::Tier, cvss: f64, scope: Scope) -> (Finding, FindingState) {
+        (
+            Finding {
+                id: id.into(),
+                repo: "acme/web".into(),
+                ecosystem: "npm".into(),
+                package: id.into(),
+                version: "1.0.0".into(),
+                advisory: sec::Advisory {
+                    ids: vec![format!("GHSA-{id}")],
+                    cvss: Some(cvss),
+                    ..Default::default()
+                },
+                scope,
+                tier: Some(tier),
+                verdict: Verdict::Unknown,
+                ..Default::default()
+            },
+            FindingState::default(),
+        )
+    }
+
+    /// Verdicts settled by the old way of reading (every "unknown" from the
+    /// quoted search) are read again once, and every verdict weekly.
+    #[test]
+    fn old_and_week_old_verdicts_are_read_again() {
+        let now = Utc::now();
+        let (f, mut st) = open_finding("a", sec::Tier::P1, 9.8, Scope::Runtime);
+        // What the old code stored: a key without the version, no time.
+        st.triaged = Some(common::content_hash(&format!(
+            "{}|{}|{:?}",
+            f.advisory.ids.join(","),
+            f.version,
+            f.scope
+        )));
+        assert!(triage_due(&f, &st, now), "read by the old way: read again");
+        st.triaged = Some(triage_key(&f));
+        st.triaged_at = Some((now - Duration::days(1)).to_rfc3339());
+        assert!(!triage_due(&f, &st, now));
+        st.triaged_at = Some((now - Duration::days(8)).to_rfc3339());
+        assert!(triage_due(&f, &st, now), "a week old: read again");
+    }
+
+    /// Criticals before highs, runtime before dev; and one tick reads every
+    /// group an install has (140 there), with the model calls the day's cap
+    /// allows: 50 model reads finish in five ticks, under 400k tokens.
+    #[test]
+    fn a_tick_reads_every_group_most_urgent_first() {
+        let findings = vec![
+            open_finding("high", sec::Tier::P1, 7.5, Scope::Runtime),
+            open_finding("dev", sec::Tier::P1, 9.8, Scope::Dev),
+            open_finding("crit", sec::Tier::P1, 9.8, Scope::Runtime),
+            open_finding("low", sec::Tier::P3, 3.0, Scope::Runtime),
+        ];
+        let mut groups: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        for (i, (f, _)) in findings.iter().enumerate() {
+            groups.entry(sec::group_key(f)).or_default().push(i);
+        }
+        let order: Vec<String> = triage_order(&findings, &groups)
+            .iter()
+            .map(|k| k.split('|').nth(2).unwrap_or("").to_string())
+            .collect();
+        assert_eq!(order, ["crit", "dev", "high", "low"]);
+        let per_tick = std::hint::black_box(TRIAGE_SEARCH_PER_TICK);
+        assert!(per_tick >= 140, "every group in one tick");
+        let estimate = common::reachability::estimate_call_tokens(TRIAGE_MAX_CHARS);
+        let (mut left, mut spent, mut ticks) = (50usize, 0u64, 0);
+        while left > 0 {
+            ticks += 1;
+            let n = common::reachability::model_calls_allowed(
+                spent,
+                sec::TRIAGE_TOKENS_PER_DAY,
+                estimate,
+                TRIAGE_PER_TICK,
+            )
+            .min(left);
+            assert!(n > 0, "stalled under the cap after {spent} tokens");
+            left -= n;
+            spent += n as u64 * estimate;
+        }
+        assert!(spent <= sec::TRIAGE_TOKENS_PER_DAY);
+        assert!(ticks <= 5, "{ticks} ticks");
+    }
+
+    #[test]
+    fn the_lockfile_for_a_manifest_is_found() {
+        let tree: Vec<String> = [
+            "pnpm-lock.yaml",
+            "lambdas/resizer/package-lock.json",
+            "lambdas/resizer/package.json",
+            "packages/ui/package.json",
+            "node_modules/x/yarn.lock",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(lockfiles_for("pnpm-lock.yaml", &tree), ["pnpm-lock.yaml"]);
+        assert_eq!(
+            lockfiles_for("lambdas/resizer/package.json", &tree),
+            ["lambdas/resizer/package-lock.json"]
+        );
+        assert_eq!(
+            lockfiles_for("packages/ui/package.json", &tree),
+            ["pnpm-lock.yaml"]
+        );
+        assert_eq!(
+            lockfiles_for(sec::SBOM_MANIFEST, &tree),
+            ["pnpm-lock.yaml", "lambdas/resizer/package-lock.json"]
+        );
     }
 }
 
