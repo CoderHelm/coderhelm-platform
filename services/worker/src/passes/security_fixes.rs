@@ -2879,8 +2879,19 @@ async fn refresh_pr(
     if let Err(e) = cx.gh.update_pr_title(o, n, pr, &unit.title).await {
         warn!(repo = %unit.repo, pr, error = %e, "security: could not write the bundle's title");
     }
+    relabel(cx, o, n, pr, unit).await;
+}
+
+/// Labels an open pull request with the unit's labels, first taking off a
+/// reachability label an earlier verdict left (GitHub only adds labels), so
+/// the PR never says `reachability:unknown` beside `not-reachable`.
+async fn relabel(cx: &Ctx<'_>, o: &str, n: &str, pr: u64, unit: &FixUnit) {
+    for gone in sec::stale_reachability_labels(&unit.labels) {
+        // A label the PR does not carry is a 404: nothing to take off.
+        let _ = cx.gh.remove_label(o, n, pr, gone).await;
+    }
     if let Err(e) = cx.gh.add_labels(o, n, pr, &unit.labels).await {
-        warn!(repo = %unit.repo, pr, error = %e, "security: could not label the bundle");
+        warn!(repo = %unit.repo, pr, error = %e, "security: could not label the pull request");
     }
 }
 
@@ -3089,9 +3100,7 @@ async fn adopt(
     let Some((o, n)) = unit.repo.split_once('/') else {
         return;
     };
-    if let Err(e) = cx.gh.add_labels(o, n, number, &unit.labels).await {
-        warn!(repo = %unit.repo, number, error = %e, "security: could not label the adopted pull request");
-    }
+    relabel(cx, o, n, number, unit).await;
     if claim(
         cx.state,
         cx.team_id,
