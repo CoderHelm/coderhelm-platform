@@ -1469,11 +1469,22 @@ pub async fn orchestrate_ticket(
                         match stop_pr::open(state, &msg, &run_id, branch, &sanitize_error(&err_msg))
                             .await
                         {
-                            Ok(pr_url) => {
-                                info!(
-                                    run_id,
-                                    pr_url, "Opened a draft PR for a run stopped after its work"
-                                );
+                            // Named only when GitHub gave it a number: a
+                            // refused pull request waits on a person with
+                            // GitHub's reason, and is never logged as opened.
+                            Ok(stopped) => {
+                                match &stopped {
+                                    stop_pr::Stopped::Opened { number, url } => info!(
+                                        run_id,
+                                        pr_number = number,
+                                        pr_url = %url,
+                                        "{} (stopped after its work)",
+                                        stop_pr::stop_line(&stopped)
+                                    ),
+                                    stop_pr::Stopped::Refused { .. } => {
+                                        warn!(run_id, "{}", stop_pr::stop_line(&stopped))
+                                    }
+                                }
                                 true
                             }
                             Err(e) => {
@@ -1570,11 +1581,19 @@ pub async fn orchestrate_ticket(
                             "The step reached its time limit and the run couldn't continue in a fresh step: {why}."
                         );
                         match stop_pr::open(state, &msg, &run_id, branch, &reason).await {
-                            Ok(pr_url) => {
-                                info!(
-                                    run_id,
-                                    pr_url, "Opened a draft PR for a run stopped at its time limit"
-                                );
+                            Ok(stopped) => {
+                                match &stopped {
+                                    stop_pr::Stopped::Opened { number, url } => info!(
+                                        run_id,
+                                        pr_number = number,
+                                        pr_url = %url,
+                                        "{} (stopped at its time limit)",
+                                        stop_pr::stop_line(&stopped)
+                                    ),
+                                    stop_pr::Stopped::Refused { .. } => {
+                                        warn!(run_id, "{}", stop_pr::stop_line(&stopped))
+                                    }
+                                }
                                 true
                             }
                             Err(e) => {
@@ -2216,6 +2235,16 @@ async fn run_passes(
 
     // --- Checkpoint Resume: skip expensive passes if we've already completed them ---
     let checkpoint = load_checkpoint(state, &msg.team_id, run_id).await;
+    // A person's Retry of a run that finished its work (implemented, its
+    // branch kept, stopped after: the pull request GitHub refused, a check)
+    // goes on from that work: the earlier run's checkpoint becomes this
+    // run's, so the retry opens the pull request from the branch without
+    // implementing again. Only with the earlier plan, which the retry takes
+    // up below.
+    let checkpoint = match checkpoint {
+        Some(c) => Some(c),
+        None => inherited_checkpoint(state, msg, run_id, &github, usage).await,
+    };
     let can_skip_implement = checkpoint.as_ref().is_some_and(|(last_pass, branch, _)| {
         !branch.is_empty()
             && matches!(
@@ -11812,6 +11841,55 @@ pub(crate) async fn save_checkpoint(
 }
 
 /// Load an existing checkpoint for a run (if any).
+/// The checkpoint a Retry takes up from the run it retries: one that says
+/// the work was implemented (`implement` or a pass after it), on a branch.
+/// A run stopped before its work finished implements again, as before.
+pub(crate) fn retry_checkpoint(prev: Option<(String, String, u8)>) -> Option<(String, String, u8)> {
+    prev.filter(|(last, branch, _)| {
+        !branch.is_empty()
+            && matches!(
+                last.as_str(),
+                "implement" | "security" | "pr" | "test" | "review"
+            )
+    })
+}
+
+/// A Retry (`resume_from`) of a run whose work was done: that run's
+/// checkpoint, saved as this run's (so a continuation of this run keeps
+/// it), when the earlier plan and the branch are still there.
+async fn inherited_checkpoint(
+    state: &WorkerState,
+    msg: &TicketMessage,
+    run_id: &str,
+    github: &GitHubClient,
+    usage: &TokenUsage,
+) -> Option<(String, String, u8)> {
+    let prev = msg
+        .resume_from
+        .as_deref()
+        .filter(|r| !msg.same_run() && !r.is_empty() && *r != run_id)?;
+    let (last, branch, cycle) = retry_checkpoint(load_checkpoint(state, &msg.team_id, prev).await)?;
+    // The plan the work was made against, and the branch holding it.
+    load_run_plan(state, msg, prev).await?;
+    github
+        .get_ref(&msg.repo_owner, &msg.repo_name, &branch)
+        .await
+        .ok()
+        .filter(|head| !head.is_empty())?;
+    save_checkpoint(state, &msg.team_id, run_id, &last, &branch, cycle, usage).await;
+    info!(run_id, retried = %prev, last_pass = %last, branch = %branch, "Retry: going on from the earlier run's finished work");
+    add_progress_note(
+        state,
+        &msg.team_id,
+        run_id,
+        &format!(
+            "Retry: the work on `{branch}` is done; going on from it to the checks and the pull request"
+        ),
+    )
+    .await;
+    Some((last, branch, cycle))
+}
+
 async fn load_checkpoint(
     state: &WorkerState,
     team_id: &str,
@@ -13130,5 +13208,53 @@ mod retry_resume_tests {
             serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
         assert_eq!(back.resume_from.as_deref(), Some("01RUN"));
         assert!(!back.retry_of_run);
+    }
+
+    /// The run that did all 24 tasks and stopped when GitHub refused its
+    /// pull request: Retry goes on from its checkpoint (the work, the
+    /// branch) to the checks and the pull request, never implementing
+    /// again. A run stopped before its work finished implements again.
+    #[test]
+    fn a_retry_of_finished_work_opens_the_pull_request_from_the_branch() {
+        use super::retry_checkpoint;
+        let branch = "coderhelm/security-updates-2026-11-12-abc123".to_string();
+        // The run record's error: Retry takes up that run (not a plan error).
+        let error = "HTTP status client error (422 Unprocessable Entity) for url \
+                     (https://api.github.com/repos/acme/api/pulls): body is too long";
+        assert!(common::run_status::retry_resumes("done", error));
+        for last in ["implement", "security", "pr", "test", "review"] {
+            assert_eq!(
+                retry_checkpoint(Some((last.into(), branch.clone(), 0))),
+                Some((last.into(), branch.clone(), 0)),
+                "{last}"
+            );
+        }
+        for last in ["implement_started", "plan", "triage", ""] {
+            assert_eq!(
+                retry_checkpoint(Some((last.into(), branch.clone(), 0))),
+                None,
+                "{last}"
+            );
+        }
+        assert_eq!(
+            retry_checkpoint(Some(("implement".into(), String::new(), 0))),
+            None
+        );
+        assert_eq!(retry_checkpoint(None), None);
+        // The run uses it before deciding whether to implement, and the
+        // pull request pass finds the branch's open pull request (the
+        // stopped run's draft) and writes its description in place.
+        let src = include_str!("mod.rs");
+        let run = &src[src.find("async fn run_passes(").unwrap()..];
+        let inherit = run
+            .find("None => inherited_checkpoint(state, msg, run_id, &github, usage).await")
+            .expect("Retry takes up the checkpoint");
+        let skip = run.find("let can_skip_implement = checkpoint").unwrap();
+        assert!(inherit < skip);
+        let pr = include_str!("pr.rs");
+        assert!(pr.contains(".find_open_pr_for_branch(&msg.repo_owner, &msg.repo_name, branch)"));
+        assert!(pr.contains(
+            "super::security_fixes::on_pr_opened(state, github, msg, number, &url).await;\n        }\n        (number, url, nid)"
+        ));
     }
 }

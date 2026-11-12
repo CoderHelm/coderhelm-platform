@@ -181,6 +181,49 @@ async fn progress(
     }
 }
 
+/// What [`open`] did for a stopped run with work on its branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Stopped {
+    /// The draft pull request is open (or was already), and the run waits
+    /// for its review.
+    Opened { number: u64, url: String },
+    /// GitHub refused the pull request, twice: the run waits on a person
+    /// with GitHub's reason in plain words, and nothing claims a pull
+    /// request it doesn't have.
+    Refused { why: String },
+}
+
+/// The pull request GitHub answered a create with: its number and link, or
+/// why there is none in plain words. A create GitHub refused, or an answer
+/// without a number, is never taken for an open pull request.
+pub fn created(answer: Result<serde_json::Value, BoxError>) -> Result<(u64, String), String> {
+    match answer {
+        Ok(p) => match (p["number"].as_u64(), p["html_url"].as_str()) {
+            (Some(n), Some(u)) if n > 0 && !u.trim().is_empty() => Ok((n, u.to_string())),
+            _ => Err(
+                "GitHub answered the request to open the pull request without a pull \
+                      request number"
+                    .to_string(),
+            ),
+        },
+        Err(e) => Err(super::pr::refusal_words(
+            "open the pull request",
+            &e.to_string(),
+        )),
+    }
+}
+
+/// The log line for a stopped run's pull request: it names a pull request
+/// only when there is one.
+pub fn stop_line(s: &Stopped) -> String {
+    match s {
+        Stopped::Opened { number, .. } => {
+            format!("Opened draft pull request #{number} for the stopped run")
+        }
+        Stopped::Refused { why } => format!("No pull request for the stopped run: {why}"),
+    }
+}
+
 /// Opens (or finds) the draft pull request for a stopped run's branch and
 /// records it on the run. Errors when the branch holds no work.
 pub async fn open(
@@ -189,7 +232,7 @@ pub async fn open(
     run_id: &str,
     branch: &str,
     reason: &str,
-) -> Result<String, BoxError> {
+) -> Result<Stopped, BoxError> {
     // Handing the work to a person is the stop judge's call: it either
     // names what blocks, or the draft carries its assumption as an open item.
     let mut usage = crate::models::TokenUsage::default();
@@ -218,7 +261,7 @@ pub async fn open_with(
     items: &[super::proof::Finding],
     notify: bool,
     judged: &super::stop_judge::Judged,
-) -> Result<String, BoxError> {
+) -> Result<Stopped, BoxError> {
     let mut with_assumption = items.to_vec();
     if let Some(a) = judged.assumption() {
         with_assumption.push(super::proof::Finding {
@@ -317,7 +360,10 @@ pub async fn open_with(
         .await?;
     let (number, url) = match existing {
         Some(p) => {
-            let number = p["number"].as_u64().unwrap_or(0);
+            let number = p["number"]
+                .as_u64()
+                .filter(|n| *n > 0)
+                .ok_or("GitHub listed the branch's pull request without its number")?;
             // The pull request already open says what is not finished too.
             if !unfinished.is_empty() {
                 let now = with_unfinished(p["body"].as_str().unwrap_or(""), &unfinished);
@@ -345,21 +391,56 @@ pub async fn open_with(
             let conventions =
                 super::load_git_conventions(state, &msg.team_id, &msg.ticket_id).await;
             let title = super::pr::pr_title(&conventions, &super::ticket_tokens(msg), msg);
-            let p = github
-                .create_pull_request(
-                    &msg.repo_owner,
-                    &msg.repo_name,
-                    common::truncate_str(&title, 72),
+            let title = common::truncate_str(&title, 72);
+            // Refused once: once more with the body shortened harder, then
+            // the run waits with GitHub's reason, never claiming a pull
+            // request it doesn't have.
+            let mut answer = created(
+                github
+                    .create_pull_request(
+                        &msg.repo_owner,
+                        &msg.repo_name,
+                        title,
+                        &draft_body,
+                        branch,
+                        &msg.base_branch,
+                        true,
+                    )
+                    .await,
+            );
+            if let Err(first) = &answer {
+                tracing::warn!(run_id, error = %first, "GitHub refused the stopped run's pull request; trying once more");
+                let shorter = common::pr_body_fit::fit_to(
                     &draft_body,
-                    branch,
-                    &msg.base_branch,
-                    true,
-                )
-                .await?;
-            (
-                p["number"].as_u64().unwrap_or(0),
-                p["html_url"].as_str().unwrap_or("").to_string(),
-            )
+                    common::pr_body_fit::BODY_TARGET / 2,
+                    None,
+                );
+                answer = created(
+                    github
+                        .create_pull_request(
+                            &msg.repo_owner,
+                            &msg.repo_name,
+                            title,
+                            &shorter,
+                            branch,
+                            &msg.base_branch,
+                            true,
+                        )
+                        .await,
+                );
+            }
+            match answer {
+                Ok(p) => p,
+                Err(why) => {
+                    let hand_back = hand_back.as_ref().expect("checked above");
+                    record_refused(state, msg, run_id, branch, reason, &why, judged, hand_back)
+                        .await;
+                    if notify {
+                        super::webhooks::emit_run(state, &msg.team_id, run_id, "needs_input").await;
+                    }
+                    return Ok(Stopped::Refused { why });
+                }
+            }
         }
     };
     let now = chrono::Utc::now().to_rfc3339();
@@ -410,7 +491,76 @@ pub async fn open_with(
     if notify {
         super::webhooks::emit_run(state, &msg.team_id, run_id, "needs_input").await;
     }
-    Ok(url)
+    Ok(Stopped::Opened { number, url })
+}
+
+/// What a stopped run waits for when GitHub refused its pull request: a
+/// person, with GitHub's words and what Retry does.
+pub fn refused_wait(why: &str) -> WaitingOn {
+    WaitingOn::action(
+        "Open the pull request",
+        &format!(
+            "The work is done and on the branch, but {why}. Press Retry: CoderHelm opens the \
+             pull request from the branch without doing the work again."
+        ),
+        "",
+    )
+    .unwrap_or_default()
+}
+
+/// Records a stopped run whose pull request GitHub refused: it waits on a
+/// person (never failed, never "Review pull request #0"), with the branch
+/// kept and GitHub's reason as its error. Only a run the supervisor already
+/// hands back gets here (`hand_back`, a reason on the human-only list); a
+/// run it ships opens its pull request in [`ship`].
+#[allow(clippy::too_many_arguments)]
+async fn record_refused(
+    state: &WorkerState,
+    msg: &TicketMessage,
+    run_id: &str,
+    branch: &str,
+    reason: &str,
+    why: &str,
+    judged: &super::stop_judge::Judged,
+    hand_back: &common::handback::HandBack,
+) {
+    // The stop judge's hold, when it named one, goes with GitHub's words.
+    let why = match judged.hold_words() {
+        Some(h) => format!("{why}. Blocked on: {h}"),
+        None => why.to_string(),
+    };
+    let why = why.as_str();
+    let wait = refused_wait(why);
+    let res = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", super::attr_s(&msg.team_id))
+        .key("run_id", super::attr_s(run_id))
+        .update_expression(
+            "SET #s = :s, status_run_id = :sri, waiting_on = :wo, branch = :b, \
+             error_message = :em, updated_at = :t, current_pass = :cp",
+        )
+        .condition_expression(common::run_status::not_ended("#s"))
+        .ended_values()
+        .expression_attribute_names("#s", "status")
+        .expression_attribute_values(":cp", super::attr_s("done"))
+        .needs_input(run_id, &wait, hand_back)
+        .expression_attribute_values(":b", super::attr_s(branch))
+        .expression_attribute_values(":em", super::attr_s(&format!("{reason} {why}.")))
+        .expression_attribute_values(":t", super::attr_s(&chrono::Utc::now().to_rfc3339()))
+        .send()
+        .await;
+    if let Err(e) = res {
+        tracing::warn!(run_id, error = %e, "Could not record the refused pull request on the run");
+    }
+    super::add_progress_note(
+        state,
+        &msg.team_id,
+        run_id,
+        &format!("Stopped after the work; no pull request: {why}"),
+    )
+    .await;
 }
 
 /// The "Deferred" section of a run that shipped with tasks left: what
@@ -453,7 +603,7 @@ async fn ship(
     open_text: &str,
     stop: &super::outcome::Stop,
     progress: &Progress,
-) -> Result<String, BoxError> {
+) -> Result<Stopped, BoxError> {
     if let Some(mut plan) = super::run_plan_files(state, msg).await {
         let defer: Vec<(String, String)> = progress
             .remaining
@@ -478,7 +628,10 @@ async fn ship(
         .await?;
     let (number, url) = match existing {
         Some(p) => {
-            let number = p["number"].as_u64().unwrap_or(0);
+            let number = p["number"]
+                .as_u64()
+                .filter(|n| *n > 0)
+                .ok_or("GitHub listed the branch's pull request without its number")?;
             let body = p["body"].as_str().unwrap_or("");
             let now = if body.contains("## Deferred") {
                 body.to_string()
@@ -503,21 +656,21 @@ async fn ship(
                 open_text,
                 &deferred,
             );
-            let p = github
-                .create_pull_request(
-                    &msg.repo_owner,
-                    &msg.repo_name,
-                    common::truncate_str(&title, 72),
-                    &body,
-                    branch,
-                    &msg.base_branch,
-                    true,
-                )
-                .await?;
-            (
-                p["number"].as_u64().unwrap_or(0),
-                p["html_url"].as_str().unwrap_or("").to_string(),
-            )
+            // Named only when GitHub gave it a number; a refusal is the
+            // error, in GitHub's words.
+            created(
+                github
+                    .create_pull_request(
+                        &msg.repo_owner,
+                        &msg.repo_name,
+                        common::truncate_str(&title, 72),
+                        &body,
+                        branch,
+                        &msg.base_branch,
+                        true,
+                    )
+                    .await,
+            )?
         }
     };
     let usage = crate::models::TokenUsage::default();
@@ -572,7 +725,7 @@ async fn ship(
         super::run_guard::Progress::PrOpen,
     )
     .await;
-    Ok(url)
+    Ok(Stopped::Opened { number, url })
 }
 
 /// The body of a pull request a run shipped with work deferred: the ticket
@@ -693,6 +846,79 @@ mod tests {
         for never in ["#0", "Partial", "ran out of time"] {
             assert!(!b.contains(never), "{never}");
         }
+    }
+
+    const TOO_LONG: &str = "HTTP status client error (422 Unprocessable Entity) for url (https://api.github.com/repos/acme/api/pulls): {\"message\":\"Validation Failed\",\"errors\":[{\"resource\":\"Issue\",\"code\":\"custom\",\"field\":\"body\",\"message\":\"body is too long\"},{\"resource\":\"Issue\",\"code\":\"custom\",\"field\":\"body\",\"message\":\"body is too long (maximum is 65536 characters)\"}],\"status\":\"422\"}";
+
+    /// A create GitHub refused, or answered without a number, is never an
+    /// open pull request: the stop names none and waits with GitHub's words.
+    #[test]
+    fn a_refused_create_never_claims_a_pull_request() {
+        let refused = created(Err(TOO_LONG.into())).unwrap_err();
+        assert_eq!(
+            refused,
+            "GitHub refused to open the pull request: body is too long (maximum is 65536 characters)"
+        );
+        for answer in [
+            serde_json::json!({}),
+            serde_json::json!({"number": 0, "html_url": "https://github.com/acme/api/pull/0"}),
+            serde_json::json!({"number": 12}),
+        ] {
+            assert!(created(Ok(answer.clone())).is_err(), "{answer}");
+        }
+        assert_eq!(
+            created(Ok(
+                serde_json::json!({"number": 602, "html_url": "https://github.com/acme/api/pull/602"})
+            )),
+            Ok((602, "https://github.com/acme/api/pull/602".to_string()))
+        );
+        let line = stop_line(&Stopped::Refused {
+            why: refused.clone(),
+        });
+        assert!(!line.contains("Opened") && !line.contains('#'), "{line}");
+        assert!(line.contains("body is too long (maximum is 65536 characters)"));
+        let line = stop_line(&Stopped::Opened {
+            number: 602,
+            url: "u".into(),
+        });
+        assert_eq!(line, "Opened draft pull request #602 for the stopped run");
+        // The run waits on a person, with GitHub's words and what Retry does.
+        let w = refused_wait(&refused);
+        assert_eq!(w.action, "Open the pull request");
+        assert!(w
+            .detail
+            .contains("body is too long (maximum is 65536 characters)"));
+        assert!(w.detail.contains("Press Retry"));
+        assert!(!w.detail.contains("HTTP status"));
+    }
+
+    /// The stop path: a refused create is tried once more, shorter, and
+    /// then recorded as a wait; the log names a pull request only from
+    /// `Stopped::Opened`, never from a create that failed.
+    #[test]
+    fn the_stop_path_logs_only_a_pull_request_it_has() {
+        let src = include_str!("stop_pr.rs");
+        let open_with = &src[src.find("pub async fn open_with(").unwrap()
+            ..src
+                .find("/// What a stopped run waits for when GitHub refused")
+                .unwrap()];
+        assert_eq!(open_with.matches(".create_pull_request(").count(), 2);
+        assert!(open_with.contains("record_refused("));
+        assert!(open_with.contains("Ok(Stopped::Refused { why })"));
+        assert!(
+            !open_with.contains("as_u64().unwrap_or(0)"),
+            "no pull request #0"
+        );
+        let run = include_str!("mod.rs");
+        assert!(
+            !run.contains("pr_url, \"Opened a draft PR"),
+            "the old line logged a link it didn't check"
+        );
+        assert_eq!(
+            run.matches("stop_pr::Stopped::Opened { number, url } => info!(")
+                .count(),
+            2
+        );
     }
 
     #[test]

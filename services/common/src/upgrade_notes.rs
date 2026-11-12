@@ -1017,10 +1017,70 @@ pub fn what_to_check(bumps: &[Bump], w: &WhatToCheck) -> String {
         s.push_str("\n\n");
     }
     for b in bumps {
-        let n = w
-            .notes
-            .iter()
-            .find(|n| n.package.eq_ignore_ascii_case(&b.package));
+        s.push_str(&package_check(b, w, usize::MAX));
+    }
+    s.push_str(&check_footer(w));
+    s
+}
+
+/// The notes read for a bump's package, if any.
+pub fn notes_for<'a>(w: &'a WhatToCheck, package: &str) -> Option<&'a PackageNotes> {
+    w.notes
+        .iter()
+        .find(|n| n.package.eq_ignore_ascii_case(package))
+}
+
+/// A major version a person has to look at: its notes list breaking
+/// changes, the code uses what changed, or its notes weren't read.
+pub fn needs_eyes(b: &Bump, w: &WhatToCheck) -> bool {
+    b.major
+        && notes_for(w, &b.package)
+            .is_none_or(|n| !n.read() || !n.breaking.is_empty() || !n.call_sites.is_empty())
+}
+
+/// A bundle's section when it is too long to list every package: the
+/// packages in `shown` with their notes (each list at most `cap` long),
+/// `intro` above them and `rest` (what the others are, already written)
+/// below, then the files and the tests as usual. A dependency fix run's
+/// account comes first, whole, as in [`what_to_check`].
+pub fn what_to_check_short(
+    shown: &[&Bump],
+    w: &WhatToCheck,
+    cap: usize,
+    intro: &str,
+    rest: &str,
+) -> String {
+    let mut s = String::from("## What to check\n\n");
+    if !w.dep_report.trim().is_empty() {
+        s.push_str(w.dep_report.trim());
+        s.push_str("\n\n");
+    }
+    if !intro.trim().is_empty() {
+        s.push_str(intro.trim());
+        s.push_str("\n\n");
+    }
+    for b in shown {
+        s.push_str(&package_check(b, w, cap));
+    }
+    if !rest.trim().is_empty() {
+        s.push_str(rest.trim_end());
+        s.push_str("\n\n");
+    }
+    s.push_str(&check_footer(w));
+    s
+}
+
+/// One package's part of the section: its notes, what changed, where the
+/// code uses it, its lockfile. Each list at most `cap` long.
+fn package_check(b: &Bump, w: &WhatToCheck, cap: usize) -> String {
+    let mut s = String::new();
+    let more = |s: &mut String, n: usize| {
+        if n > cap {
+            s.push_str(&format!("  - and {} more\n", n - cap));
+        }
+    };
+    {
+        let n = notes_for(w, &b.package);
         s.push_str(&format!(
             "### `{}` {} to {}{}\n\n",
             b.package,
@@ -1039,13 +1099,14 @@ pub fn what_to_check(bumps: &[Bump], w: &WhatToCheck) -> String {
                     s.push_str("- Breaking changes found: none in the notes.\n");
                 } else {
                     s.push_str(&format!("- Breaking changes found: {}\n", n.breaking.len()));
-                    for line in &n.breaking {
+                    for line in n.breaking.iter().take(cap) {
                         s.push_str(&format!("  - {line}\n"));
                     }
+                    more(&mut s, n.breaking.len());
                 }
                 if !n.call_sites.is_empty() {
                     s.push_str("- Where the code uses what changed:\n");
-                    for c in &n.call_sites {
+                    for c in n.call_sites.iter().take(cap) {
                         let touched = w.files.iter().any(|f| f == &c.file);
                         s.push_str(&format!(
                             "  - `{}:{}` (`{}`): {}\n",
@@ -1059,6 +1120,7 @@ pub fn what_to_check(bumps: &[Bump], w: &WhatToCheck) -> String {
                             }
                         ));
                     }
+                    more(&mut s, n.call_sites.len());
                 } else if !n.apis.is_empty() {
                     s.push_str(&format!(
                         "- No use of {} was found in the code.\n",
@@ -1094,6 +1156,12 @@ pub fn what_to_check(bumps: &[Bump], w: &WhatToCheck) -> String {
         }
         s.push('\n');
     }
+    s
+}
+
+/// The section's end: the files the pull request touches, and the tests.
+fn check_footer(w: &WhatToCheck) -> String {
+    let mut s = String::new();
     if !w.files.is_empty() {
         s.push_str(&format!("**Files touched** ({}):\n", w.files.len()));
         for f in w.files.iter().take(40) {

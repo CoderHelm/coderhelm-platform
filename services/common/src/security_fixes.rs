@@ -3081,6 +3081,576 @@ pub fn pr_body_with(
     change: &str,
     check: &crate::upgrade_notes::WhatToCheck,
 ) -> String {
+    pr_body_linked(unit, members, change, check, &BodyLinks::default())
+}
+
+/// Where a security pull request's description points for what it leaves
+/// out.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BodyLinks {
+    /// The dashboard's finding page without its id
+    /// (`https://app.example.com/security/detail?id=`): each finding's
+    /// advisory, affected path, reachability and evidence, in full.
+    pub finding: String,
+    /// Every package's notes and every advisory in one document, when the
+    /// run kept one (`openspec/specs/<ticket>/security-detail.md` on the
+    /// pull request's branch).
+    pub detail: String,
+}
+
+/// A bundle of more than this many packages gets the short description:
+/// the packages to look at first in full, the rest summed up by tier.
+pub const SHORT_BODY_FROM: usize = 10;
+
+/// True when a unit's description is the short one.
+pub fn uses_short_body(unit: &FixUnit, members: &[(&Finding, &FindingState)]) -> bool {
+    unit.bumps.len() > SHORT_BODY_FROM || members.len() > 4 * SHORT_BODY_FROM
+}
+
+/// The relative path, on the pull request's branch, of a ticket's full
+/// detail document.
+pub fn detail_path(ticket: &str) -> String {
+    format!(
+        "openspec/specs/{}/security-detail.md",
+        ticket.to_lowercase()
+    )
+}
+
+/// [`pr_body_with`], pointing at `links` for what it leaves out. A bundle
+/// over [`SHORT_BODY_FROM`] packages gets the short description; whatever
+/// it is, it fits GitHub's limit for a description.
+pub fn pr_body_linked(
+    unit: &FixUnit,
+    members: &[(&Finding, &FindingState)],
+    change: &str,
+    check: &crate::upgrade_notes::WhatToCheck,
+    links: &BodyLinks,
+) -> String {
+    let body = if uses_short_body(unit, members) {
+        short_body(unit, members, change, check, links)
+    } else {
+        full_body(unit, members, change, check)
+    };
+    let more = if !links.detail.is_empty() {
+        links.detail.as_str()
+    } else {
+        ""
+    };
+    crate::pr_body_fit::fit_with_link(&body, more)
+}
+
+/// Every package's notes and every advisory, as one document: what a short
+/// description leaves out. Kept on the pull request's branch.
+pub fn detail_doc(
+    unit: &FixUnit,
+    members: &[(&Finding, &FindingState)],
+    change: &str,
+    check: &crate::upgrade_notes::WhatToCheck,
+) -> String {
+    let full = full_body(unit, members, change, check);
+    // The description's marker stays in the description only.
+    let full = full.replace(MARKER, "");
+    format!(
+        "# Security updates: full detail\n\nThe pull request for branch `{}` lists the packages \
+         to look at first; this file lists every package and advisory. Written by CoderHelm when \
+         the pull request opened; the pull request's own description has its CI state.\n\n{}\n",
+        unit.branch,
+        full.trim()
+    )
+}
+
+/// Each package's tier: its findings' most urgent.
+fn package_tiers(unit: &FixUnit, members: &[(&Finding, &FindingState)]) -> Vec<Option<Tier>> {
+    unit.bumps
+        .iter()
+        .map(|b| {
+            members
+                .iter()
+                .filter(|(f, _)| f.package.eq_ignore_ascii_case(&b.package))
+                .filter_map(|(f, _)| f.tier)
+                .min()
+        })
+        .collect()
+}
+
+/// The bumps in the order a person should look at them: P0 and P1 first,
+/// then majors that need a look (breaking changes, call sites, notes not
+/// read), then majors, then the rest by tier; the package name breaks ties.
+pub fn bumps_by_priority(
+    unit: &FixUnit,
+    members: &[(&Finding, &FindingState)],
+    check: &crate::upgrade_notes::WhatToCheck,
+) -> Vec<usize> {
+    let tiers = package_tiers(unit, members);
+    let mut order: Vec<usize> = (0..unit.bumps.len()).collect();
+    order.sort_by_key(|&i| {
+        let b = &unit.bumps[i];
+        let urgent = matches!(tiers[i], Some(Tier::P0 | Tier::P1));
+        let eyes = crate::upgrade_notes::needs_eyes(b, check);
+        let sites =
+            crate::upgrade_notes::notes_for(check, &b.package).map_or(0, |n| n.call_sites.len());
+        (
+            !urgent,
+            !eyes,
+            !b.major,
+            tiers[i].unwrap_or(Tier::P3),
+            std::cmp::Reverse(sites),
+            b.package.to_ascii_lowercase(),
+        )
+    });
+    order
+}
+
+/// True when a bump belongs in the short description in full.
+fn shown_in_full(b: &Bump, tier: Option<Tier>, check: &crate::upgrade_notes::WhatToCheck) -> bool {
+    matches!(tier, Some(Tier::P0 | Tier::P1)) || crate::upgrade_notes::needs_eyes(b, check)
+}
+
+/// At most this many packages in full in a short description.
+const SHORT_SHOWN: usize = 10;
+/// Each list under a package in a short description, at most.
+const SHORT_CAP: usize = 5;
+
+fn package_cell(b: &Bump, members: &[(&Finding, &FindingState)], links: &BodyLinks) -> String {
+    let id = members
+        .iter()
+        .find(|(f, _)| f.package.eq_ignore_ascii_case(&b.package))
+        .map(|(f, _)| f.id.as_str())
+        .unwrap_or("");
+    let name = format!("`{}`", b.package.replace('|', "\\|"));
+    if links.finding.is_empty() || id.is_empty() {
+        name
+    } else {
+        format!("[{name}]({}{id})", links.finding)
+    }
+}
+
+/// The short description: the bump table (every package, most urgent
+/// first, each linked to its finding page), the advisories and evidence
+/// that matter most, "What to check" for the packages to look at first,
+/// the rest by tier with counts, Proof and Closes as usual.
+fn short_body(
+    unit: &FixUnit,
+    members: &[(&Finding, &FindingState)],
+    change: &str,
+    check: &crate::upgrade_notes::WhatToCheck,
+    links: &BodyLinks,
+) -> String {
+    let mut s = String::new();
+    let tiers = package_tiers(unit, members);
+    let order = bumps_by_priority(unit, members, check);
+    let top = members
+        .iter()
+        .filter_map(|(f, _)| f.tier)
+        .min()
+        .unwrap_or(Tier::P3);
+    let due = members
+        .iter()
+        .filter_map(|(f, _)| parse_time(&f.due_at))
+        .min()
+        .map(|d| format!(", due {}", d.format("%b %-d")))
+        .unwrap_or_default();
+    let advisories = primaries(members).len();
+    let majors = unit.bumps.iter().filter(|b| b.major).count();
+    let where_all = if !links.detail.is_empty() {
+        format!(
+            "Every package and advisory, in full: [security-detail.md]({}).",
+            links.detail
+        )
+    } else if !links.finding.is_empty() {
+        "Each package links to its finding page in CoderHelm: its advisories, reachability and \
+         evidence in full."
+            .to_string()
+    } else {
+        String::new()
+    };
+    s.push_str(&format!(
+        "## Summary\n\nFixes {advisories} advisor{} in {} packages ({majors} major version{}). \
+         {}{due}.\n\n{where_all}\n\n",
+        if advisories == 1 { "y" } else { "ies" },
+        unit.bumps.len(),
+        if majors == 1 { "" } else { "s" },
+        top.as_str(),
+    ));
+    // The table: every bump, most urgent first, ids capped per row.
+    let cell = |s: &str| s.replace('|', "\\|").replace('\n', " ");
+    s.push_str("| Package | Version | Advisories | Reachability | Due |\n| --- | --- | --- | --- | --- |\n");
+    for &i in &order {
+        let b = &unit.bumps[i];
+        let mine: Vec<&Finding> = members
+            .iter()
+            .map(|(f, _)| *f)
+            .filter(|f| f.package.eq_ignore_ascii_case(&b.package))
+            .collect();
+        let mut ids: Vec<&str> = mine.iter().map(|f| f.advisory.primary.as_str()).collect();
+        ids.sort();
+        ids.dedup();
+        let shown_ids = if ids.len() > 3 {
+            format!("{} and {} more", ids[..3].join(", "), ids.len() - 3)
+        } else {
+            ids.join(", ")
+        };
+        let verdict = mine
+            .iter()
+            .map(|f| f.verdict)
+            .min_by_key(|v| verdict_rank(*v))
+            .map(verdict_words)
+            .unwrap_or("Unknown");
+        let due = mine
+            .iter()
+            .filter_map(|f| parse_time(&f.due_at))
+            .min()
+            .map(|d| d.format("%b %-d").to_string())
+            .unwrap_or_default();
+        s.push_str(&format!(
+            "| {} | {} to {}{} | {} | {} | {}{} |\n",
+            package_cell(b, members, links),
+            cell(&b.from),
+            cell(&b.to),
+            if b.major { " (major)" } else { "" },
+            cell(&shown_ids),
+            verdict,
+            tiers[i]
+                .map(|t| format!("{} ", t.as_str()))
+                .unwrap_or_default(),
+            due
+        ));
+    }
+    s.push('\n');
+
+    // The advisories that matter most: P0 and P1, exploited, malware.
+    let mut ranked: Vec<&(&Finding, &FindingState)> = members.iter().collect();
+    ranked.sort_by_key(|(f, _)| {
+        (
+            !(f.advisory.kev || f.advisory.malware),
+            f.tier.unwrap_or(Tier::P3),
+            verdict_rank(f.verdict),
+            f.advisory.primary.clone(),
+        )
+    });
+    s.push_str("## Advisory\n\n");
+    let urgent: Vec<&&(&Finding, &FindingState)> = ranked
+        .iter()
+        .filter(|(f, _)| {
+            matches!(f.tier, Some(Tier::P0 | Tier::P1)) || f.advisory.kev || f.advisory.malware
+        })
+        .take(20)
+        .collect();
+    for (f, st) in urgent.iter().map(|p| (p.0, p.1)) {
+        s.push_str(&format!("- {}\n", advisory_facts(f, st)));
+        if let Some(u) = f.advisory.urls.first() {
+            s.push_str(&format!("  - {u}\n"));
+        }
+    }
+    let left = members.len() - urgent.len();
+    if left > 0 {
+        let mut by_tier: Vec<String> = vec![];
+        for t in Tier::ALL {
+            let n = ranked.iter().filter(|(f, _)| f.tier == Some(t)).count()
+                - urgent.iter().filter(|(f, _)| f.tier == Some(t)).count();
+            if n > 0 {
+                by_tier.push(format!("{n} {}", t.as_str()));
+            }
+        }
+        s.push_str(&format!(
+            "- {}{left} more ({}): their ids are in the table above{}.\n",
+            if urgent.is_empty() { "" } else { "and " },
+            if by_tier.is_empty() {
+                "tier not set".to_string()
+            } else {
+                by_tier.join(", ")
+            },
+            if links.finding.is_empty() {
+                ""
+            } else {
+                ", each package linked to its finding page"
+            }
+        ));
+    }
+
+    // Reachability: what is reachable, with its evidence, then the counts.
+    s.push_str("\n## Reachability\n\n");
+    let reachable: Vec<&(&Finding, &FindingState)> = ranked
+        .iter()
+        .copied()
+        .filter(|(f, _)| f.verdict == Verdict::Reachable)
+        .collect();
+    for (f, _) in reachable.iter().take(10) {
+        let summary = f
+            .evidence
+            .as_ref()
+            .map(|e| e.summary.trim().to_string())
+            .unwrap_or_default();
+        s.push_str(&format!(
+            "- {} in `{}`: **Reachable**. {}\n",
+            f.advisory.primary,
+            f.package,
+            crate::truncate_str(&summary, 400)
+        ));
+        if let Some(e) = &f.evidence {
+            for l in e.lines.iter().take(2) {
+                s.push_str(&format!(
+                    "  - `{}:{}` {}\n",
+                    l.file,
+                    l.line,
+                    crate::truncate_str(l.text.trim(), 160)
+                ));
+            }
+        }
+    }
+    if reachable.len() > 10 {
+        s.push_str(&format!("- and {} more reachable\n", reachable.len() - 10));
+    }
+    let count = |v: &[Verdict]| {
+        members
+            .iter()
+            .filter(|(f, _)| v.contains(&f.verdict))
+            .count()
+    };
+    let others = [
+        (count(&[Verdict::NotReachable]), "present, not reachable"),
+        (count(&[Verdict::NotLoaded]), "not loaded at runtime"),
+        (count(&[Verdict::Unknown, Verdict::Pending]), "unknown"),
+    ];
+    let said: Vec<String> = others
+        .iter()
+        .filter(|(n, _)| *n > 0)
+        .map(|(n, w)| format!("{n} {w}"))
+        .collect();
+    if !said.is_empty() {
+        s.push_str(&format!(
+            "- {}: {}.\n",
+            if reachable.is_empty() {
+                "All advisories"
+            } else {
+                "The others"
+            },
+            said.join(", ")
+        ));
+    }
+
+    s.push_str("\n## Change\n\nThe bumps are in the table above.\n");
+    let change = change.trim();
+    if !change.is_empty() {
+        s.push('\n');
+        s.push_str(crate::truncate_str(change, 6_000));
+        if change.len() > 6_000 {
+            s.push_str("\n\n(The run's account is longer; shortened here.)");
+        }
+        s.push('\n');
+    }
+    s.push('\n');
+
+    // What to check: the packages to look at first, then the rest by tier.
+    let first: Vec<usize> = order
+        .iter()
+        .copied()
+        .filter(|&i| shown_in_full(&unit.bumps[i], tiers[i], check))
+        .collect();
+    let shown: Vec<&Bump> = first
+        .iter()
+        .take(SHORT_SHOWN)
+        .map(|&i| &unit.bumps[i])
+        .collect();
+    let intro =
+        format!(
+        "The packages to look at first: P0 and P1 fixes, and major versions whose release notes \
+         list breaking changes, whose changed APIs this code uses, or whose notes weren't found. \
+         {} of {} {} below{}{}",
+        shown.len(),
+        unit.bumps.len(),
+        if shown.len() == 1 { "is" } else { "are" },
+        if first.len() > shown.len() {
+            format!(" ({} more need a look, listed after them)", first.len() - shown.len())
+        } else {
+            String::new()
+        },
+        if where_all.is_empty() {
+            ".".to_string()
+        } else {
+            format!(". {where_all}")
+        }
+    );
+    let mut rest = String::new();
+    let later: Vec<usize> = order
+        .iter()
+        .copied()
+        .filter(|i| !shown.iter().any(|b| std::ptr::eq(*b, &unit.bumps[*i])))
+        .collect();
+    if !later.is_empty() {
+        rest.push_str(&format!(
+            "<details><summary>The other {} packages, by tier</summary>\n\n",
+            later.len()
+        ));
+        let mut groups: Vec<(String, Vec<usize>)> = vec![];
+        let needs: Vec<usize> = later
+            .iter()
+            .copied()
+            .filter(|i| first.contains(i))
+            .collect();
+        if !needs.is_empty() {
+            groups.push(("Also need a look".into(), needs.clone()));
+        }
+        for t in Tier::ALL {
+            let g: Vec<usize> = later
+                .iter()
+                .copied()
+                .filter(|i| !needs.contains(i) && tiers[*i] == Some(t))
+                .collect();
+            if !g.is_empty() {
+                groups.push((t.as_str().to_string(), g));
+            }
+        }
+        let unset: Vec<usize> = later
+            .iter()
+            .copied()
+            .filter(|i| !needs.contains(i) && tiers[*i].is_none())
+            .collect();
+        if !unset.is_empty() {
+            groups.push(("Tier not set".into(), unset));
+        }
+        for (name, g) in groups {
+            let majors = g.iter().filter(|&&i| unit.bumps[i].major).count();
+            let names: Vec<String> = g
+                .iter()
+                .take(25)
+                .map(|&i| {
+                    let b = &unit.bumps[i];
+                    format!(
+                        "`{}` {} to {}{}",
+                        b.package,
+                        b.from,
+                        b.to,
+                        if b.major { " (major)" } else { "" }
+                    )
+                })
+                .collect();
+            rest.push_str(&format!(
+                "- **{name}**: {} package{}{}: {}{}\n",
+                g.len(),
+                if g.len() == 1 { "" } else { "s" },
+                if majors > 0 {
+                    format!(", {majors} major")
+                } else {
+                    String::new()
+                },
+                names.join(", "),
+                if g.len() > 25 {
+                    format!(", and {} more", g.len() - 25)
+                } else {
+                    String::new()
+                }
+            ));
+        }
+        rest.push_str("\n</details>\n");
+    }
+    s.push_str(&crate::upgrade_notes::what_to_check_short(
+        &shown, check, SHORT_CAP, &intro, &rest,
+    ));
+    s.push_str(&proof_and_closes(members, check, 25));
+    s
+}
+
+fn verdict_words(v: Verdict) -> &'static str {
+    match v {
+        Verdict::Reachable => "Reachable",
+        Verdict::NotReachable => "Present, not reachable",
+        Verdict::NotLoaded => "Not loaded at runtime",
+        Verdict::Unknown | Verdict::Pending => "Unknown",
+    }
+}
+
+/// One advisory's facts on one line: its ids, score, exploited, malware,
+/// weaknesses and when it was published.
+fn advisory_facts(f: &Finding, st: &FindingState) -> String {
+    let a = &f.advisory;
+    let mut facts = vec![a.ids.join(", ")];
+    let sc = score(f, st);
+    match a.cvss {
+        Some(c) => facts.push(format!("CVSS {}", fmt_num(c))),
+        None if sc > 0.0 => facts.push(format!("severity {}", severity_word(sc))),
+        None => {}
+    }
+    if let Some(e) = a.epss {
+        facts.push(format!("EPSS {}", fmt_num(e)));
+    }
+    if a.kev {
+        facts.push(match &a.kev_due {
+            Some(d) => format!(
+                "on CISA's exploited list (due {})",
+                d.get(..10).unwrap_or(d)
+            ),
+            None => "on CISA's exploited list".to_string(),
+        });
+    }
+    if a.malware {
+        facts.push("malicious package".into());
+    }
+    if !a.cwe.is_empty() {
+        facts.push(a.cwe.join(", "));
+    }
+    if let Some(p) = &a.published_at {
+        facts.push(format!("published {}", p.get(..10).unwrap_or(p)));
+    }
+    facts.join(" · ")
+}
+
+/// Proof (where CI stands, never a pass it didn't have), Closes (at most
+/// `cap` alerts listed), the data's credit and the description's marker.
+fn proof_and_closes(
+    members: &[(&Finding, &FindingState)],
+    check: &crate::upgrade_notes::WhatToCheck,
+    cap: usize,
+) -> String {
+    let mut s = String::new();
+    let ci = match check.ci.state.as_str() {
+        "passing" => "CI passes on this pull request.".to_string(),
+        "failing" => format!(
+            "CI fails on this pull request ({}), so it stays a draft until that is fixed.",
+            if check.ci.failing.is_empty() {
+                "see its checks".to_string()
+            } else {
+                check
+                    .ci
+                    .failing
+                    .iter()
+                    .map(|c| format!("`{c}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        ),
+        _ => "CI runs on this pull request; it stays a draft until CI passes.".to_string(),
+    };
+    s.push_str(&format!("\n## Proof\n\n{ci} After it merges, the dependency list is read again and the advisory clears from Security.\n"));
+    s.push_str("\n## Closes\n\n");
+    let alerts: Vec<&AlertRef> = members
+        .iter()
+        .filter_map(|(f, _)| f.dependabot_alert.as_ref())
+        .collect();
+    for a in alerts.iter().take(cap) {
+        s.push_str(&format!("- Dependabot alert [#{}]({})\n", a.number, a.url));
+    }
+    if alerts.len() > cap {
+        s.push_str(&format!(
+            "- and {} more Dependabot alerts\n",
+            alerts.len() - cap
+        ));
+    }
+    if alerts.is_empty() {
+        s.push_str("- No Dependabot alert is open for these.\n");
+    }
+    s.push_str(&format!("\n{ATTRIBUTION}\n\n{MARKER}\n"));
+    s
+}
+
+/// The description in full: every advisory, every affected path, every
+/// piece of evidence and every package's notes.
+fn full_body(
+    unit: &FixUnit,
+    members: &[(&Finding, &FindingState)],
+    change: &str,
+    check: &crate::upgrade_notes::WhatToCheck,
+) -> String {
     let mut s = String::new();
     let top = members
         .iter()
@@ -8163,5 +8733,298 @@ mod tests {
         );
         assert_eq!(p["pr_count"], 1);
         assert_eq!(p["would_open"].as_array().unwrap().len(), 2);
+    }
+
+    /// The bundle that failed at its very end: 55 packages, 37 of them
+    /// majors, 229 advisories, every package's notes read. The full
+    /// description was several times GitHub's limit; the short one fits,
+    /// lists the P0 and P1 packages and the majors that need a look first,
+    /// sums up the rest by tier and links the full list.
+    fn big_bundle() -> (
+        FixUnit,
+        Vec<(Finding, FindingState)>,
+        crate::upgrade_notes::WhatToCheck,
+    ) {
+        use crate::upgrade_notes::{CallSite, PackageNotes, WhatToCheck};
+        let mut unit = FixUnit {
+            repo: "acme/api".into(),
+            ecosystem: "npm".into(),
+            bundle: true,
+            ticket: "SEC-ABC123".into(),
+            branch: "coderhelm/security-updates-2026-11-12-abc123".into(),
+            ..Default::default()
+        };
+        let mut fs: Vec<(Finding, FindingState)> = vec![];
+        let mut notes: Vec<PackageNotes> = vec![];
+        let mut n = 0;
+        for p in 0..55 {
+            let pkg = format!("@scope/package-number-{p:02}");
+            let major = p < 37;
+            unit.bumps.push(Bump {
+                package: pkg.clone(),
+                from: "1.4.2".into(),
+                to: if major {
+                    "2.0.1".into()
+                } else {
+                    "1.4.9".into()
+                },
+                major,
+                manifest: "package.json".into(),
+            });
+            let tier = match p {
+                0..=1 => Tier::P0,
+                2..=5 => Tier::P1,
+                _ if p % 2 == 0 => Tier::P2,
+                _ => Tier::P3,
+            };
+            let count = if p < 9 { 5 } else { 4 };
+            for _ in 0..count {
+                if n == 229 {
+                    break;
+                }
+                let id = format!("{n:04}-wxyz-abcd");
+                let (mut f, st) = adv_finding(
+                    &id,
+                    &pkg,
+                    "1.4.2",
+                    Some("2.0.1"),
+                    tier,
+                    "2026-12-10T00:00:00Z",
+                );
+                f.repo = unit.repo.clone();
+                f.advisory.title = "Prototype pollution in the request parser allows a crafted body to change defaults".into();
+                f.advisory.ids.push(format!("CVE-2026-{n:05}"));
+                f.advisory.cvss = Some(8.1);
+                f.advisory.cwe = vec!["CWE-1321".into()];
+                f.advisory.urls = (0..3)
+                    .map(|k| format!("https://github.com/advisories/GHSA-{id}-{k}"))
+                    .collect();
+                f.path = vec![
+                    "@nestjs/core".into(),
+                    "@nestjs/platform-express".into(),
+                    pkg.clone(),
+                ];
+                f.verdict = if n % 3 == 0 {
+                    Verdict::Reachable
+                } else {
+                    Verdict::Unknown
+                };
+                f.evidence = Some(Evidence {
+                    summary: "The server loads the package at start and passes request bodies to its parser on every call.".into(),
+                    lines: (0..8).map(|l| EvidenceLine { file: format!("src/modules/area-{p}/handler-{l}.ts"), line: 10 + l, text: "const parsed = parser.parse(request.body, { strict: false })".into() }).collect(),
+                    checked: "Followed the import from main.ts through the module graph.".into(),
+                    confidence: "medium".into(),
+                });
+                f.dependabot_alert = Some(AlertRef {
+                    number: 100 + n as u64,
+                    url: format!(
+                        "https://github.com/acme/api/security/dependabot/{}",
+                        100 + n
+                    ),
+                });
+                fs.push((f, st));
+                n += 1;
+            }
+            notes.push(PackageNotes {
+                package: pkg.clone(),
+                source: "the GitHub releases of acme/package".into(),
+                versions: vec!["2.0.0".into(), "2.0.1".into()],
+                breaking: if major { (0..9).map(|k| format!("Breaking change {k}: the option `legacyMode` is removed and the default timeout changes from 30s to 5s.")).collect() } else { vec![] },
+                apis: vec!["parse".into()],
+                call_sites: if major { (0..14).map(|k| CallSite { api: "parse".into(), file: format!("src/modules/area-{p}/use-{k}.ts"), line: 40 + k, text: String::new() }).collect() } else { vec![] },
+                lockfile: "pnpm-lock.yaml".into(),
+                lock_command: "pnpm install --lockfile-only".into(),
+                ..Default::default()
+            });
+        }
+        assert_eq!(n, 229);
+        let check = WhatToCheck {
+            notes,
+            files: (0..60)
+                .map(|i| format!("src/modules/area-{i}/module.ts"))
+                .collect(),
+            ..Default::default()
+        };
+        (unit, fs, check)
+    }
+
+    #[test]
+    fn a_55_package_bundle_fits_and_lists_what_to_look_at_first() {
+        let (unit, fs, check) = big_bundle();
+        let pairs: Vec<(&Finding, &FindingState)> = fs.iter().map(|(f, s)| (f, s)).collect();
+        let change =
+            "Raised the direct ranges and added overrides for transitive copies. ".repeat(40);
+        // The description before: every advisory, path, piece of evidence
+        // and package note, over GitHub's limit.
+        let before = full_body(&unit, &pairs, &change, &check);
+        assert!(
+            before.chars().count() > crate::pr_body_fit::GITHUB_BODY_MAX,
+            "{}",
+            before.len()
+        );
+        let links = BodyLinks {
+            finding: "https://app.example.com/security/detail?id=".into(),
+            detail: "https://github.com/acme/api/blob/coderhelm/security-updates-2026-11-12-abc123/openspec/specs/sec-abc123/security-detail.md".into(),
+        };
+        let body = pr_body_linked(&unit, &pairs, &change, &check, &links);
+        assert!(
+            crate::pr_body_fit::fits(&body),
+            "{} chars",
+            body.chars().count()
+        );
+        assert!(
+            body.len() <= crate::pr_body_fit::BODY_TARGET,
+            "{}",
+            body.len()
+        );
+        // No shortening pass was needed: the short description fits as written.
+        assert!(!body.contains(crate::pr_body_fit::SHORTENED), "{body}");
+        for h in [
+            "## Summary",
+            "## Advisory",
+            "## Reachability",
+            "## Change",
+            "## What to check",
+            "## Proof",
+            "## Closes",
+        ] {
+            assert!(
+                body.contains(&format!("\n{h}")) || body.starts_with(h),
+                "{h}"
+            );
+        }
+        assert!(body.contains(MARKER));
+        assert!(
+            body.contains("Fixes 229 advisories in 55 packages (37 major versions)."),
+            "{body}"
+        );
+        // Every package is in the table, each linked to its finding page.
+        for b in &unit.bumps {
+            assert!(
+                body.contains(&format!(
+                    "[`{}`](https://app.example.com/security/detail?id=",
+                    b.package
+                )),
+                "{}",
+                b.package
+            );
+        }
+        assert!(body.contains(&links.detail));
+        // What to check: the P0 and P1 packages first, then majors.
+        let wtc = &body[body.find("## What to check").unwrap()..body.find("## Proof").unwrap()];
+        let order: Vec<usize> = wtc
+            .lines()
+            .filter_map(|l| l.strip_prefix("### `@scope/package-number-"))
+            .map(|l| l[..2].parse().unwrap())
+            .collect();
+        assert_eq!(&order[..6], &[0, 1, 2, 3, 4, 5], "{order:?}");
+        assert!(
+            order.iter().all(|p| *p < 37),
+            "only P0, P1 and majors in full: {order:?}"
+        );
+        assert!(
+            wtc.contains("<details><summary>The other 45 packages, by tier</summary>"),
+            "{wtc}"
+        );
+        assert!(
+            wtc.contains("- **Also need a look**: 27 packages, 27 major"),
+            "{wtc}"
+        );
+        assert!(wtc.contains("- **P2**: 9 packages"), "{wtc}");
+        assert!(wtc.contains("- **P3**: 9 packages"), "{wtc}");
+        assert!(
+            wtc.contains("  - and 4 more\n"),
+            "lists capped under each package"
+        );
+        // Advisories: the P0 and P1 ones, then the rest counted.
+        assert!(
+            body.contains(
+                "- and 209 more (10 P1, 102 P2, 97 P3): their ids are in the table above"
+            ),
+            "{body}"
+        );
+        assert!(body.contains("- and 204 more Dependabot alerts"));
+        // The full detail document keeps every package and advisory.
+        let doc = detail_doc(&unit, &pairs, &change, &check);
+        for b in &unit.bumps {
+            assert!(doc.contains(&format!("### `{}`", b.package)));
+        }
+        assert!(!doc.contains(MARKER));
+    }
+
+    /// A dependency fix run's account (#634: the bumps applied, the ones
+    /// deferred with why, the sandbox's checks, the cost) is in the short
+    /// description's "What to check" whole, and in the full detail.
+    #[test]
+    fn the_short_bundle_body_keeps_the_dependency_fix_runs_account() {
+        let (unit, fs, mut check) = big_bundle();
+        let pairs: Vec<(&Finding, &FindingState)> = fs.iter().map(|(f, s)| (f, s)).collect();
+        let mut report = String::from("### Dependency fix run\n\n**Applied (40):**\n");
+        for i in 0..40 {
+            report.push_str(&format!(
+                "- `@scope/package-number-{i:02}` 1.0.0 to 1.0.1 (package.json; same version line)\n"
+            ));
+        }
+        report.push_str("\n**Deferred (15), the findings stay open:**\n");
+        for i in 40..55 {
+            report.push_str(&format!(
+                "- `@scope/package-number-{i:02}` 1.0.0 to 2.0.0: a major version for a finding that is not reachable\n"
+            ));
+        }
+        report.push_str("\n**Checks run in the sandbox:**\n- test: passes with these bumps\n\n**Cost:** 3 sandbox probe(s); model $0.31\n");
+        check.dep_report = report.clone();
+        let links = BodyLinks {
+            finding: "https://app.example.com/security/detail?id=".into(),
+            detail: String::new(),
+        };
+        let change =
+            "Raised the direct ranges and added overrides for transitive copies. ".repeat(40);
+        assert!(uses_short_body(&unit, &pairs));
+        let body = pr_body_linked(&unit, &pairs, &change, &check, &links);
+        assert!(crate::pr_body_fit::fits(&body));
+        assert!(body.contains(MARKER));
+        let wtc = &body[body.find("## What to check").unwrap()..body.find("## Proof").unwrap()];
+        assert!(
+            wtc.starts_with(&format!("## What to check\n\n{}", report.trim())),
+            "{wtc}"
+        );
+        // Over the limit anyway, the account is what stays.
+        let fitted = crate::pr_body_fit::fit_to(&body, 20_000, None);
+        assert!(fitted.contains(report.trim()), "{fitted}");
+        assert!(fitted.contains(MARKER));
+        let doc = detail_doc(&unit, &pairs, &change, &check);
+        assert!(doc.contains(report.trim()));
+    }
+
+    /// CI ending rewrites "What to check" and Proof in place on the short
+    /// description, which then still fits.
+    #[test]
+    fn the_short_bundle_body_takes_the_ci_rewrite_in_place() {
+        let (unit, fs, mut check) = big_bundle();
+        let pairs: Vec<(&Finding, &FindingState)> = fs.iter().map(|(f, s)| (f, s)).collect();
+        let links = BodyLinks::default();
+        let body = format!(
+            "<!-- coderhelm:draft-status -->\n> Draft until CI passes.\n\n{}",
+            pr_body_linked(&unit, &pairs, "Bumped.", &check, &links)
+        );
+        check.ci = crate::upgrade_notes::CiState {
+            state: "failing".into(),
+            failing: vec!["test".into()],
+            checks: vec!["build".into(), "test".into()],
+        };
+        let fresh = pr_body_linked(&unit, &pairs, "Bumped.", &check, &links);
+        let next = crate::upgrade_notes::replace_sections(
+            &body,
+            &fresh,
+            &["## What to check", "## Proof"],
+        );
+        assert!(
+            next.contains("CI fails on this pull request: `test`"),
+            "{next}"
+        );
+        assert!(next.contains("## Proof\n\nCI fails on this pull request (`test`)"));
+        assert!(next.starts_with("<!-- coderhelm:draft-status -->"));
+        assert!(crate::pr_body_fit::fits(&next));
+        assert_eq!(next.matches("## What to check").count(), 1);
     }
 }

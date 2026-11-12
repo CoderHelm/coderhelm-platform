@@ -90,6 +90,42 @@ async fn ok_or_body(
     }
 }
 
+/// A write's JSON as GitHub takes it: a `body` (and each inline comment's
+/// `body`) within GitHub's 65,536-character limit, fitted by
+/// `common::pr_body_fit` (required sections and CoderHelm's markers kept,
+/// long lists shortened), and a `title` within its 256. Every POST, PATCH
+/// and review PUT this client sends goes through here, so no caller can
+/// send a body GitHub refuses for its size.
+pub fn bounded_payload(v: &serde_json::Value) -> serde_json::Value {
+    use common::pr_body_fit as fit;
+    let mut out = v.clone();
+    let Some(o) = out.as_object_mut() else {
+        return out;
+    };
+    if let Some(b) = o.get("body").and_then(|b| b.as_str()) {
+        if !fit::fits(b) || b.len() > fit::BODY_TARGET {
+            let fitted = fit::fit(b);
+            o.insert("body".into(), serde_json::Value::String(fitted));
+        }
+    }
+    if let Some(t) = o.get("title").and_then(|t| t.as_str()) {
+        if t.chars().count() > fit::GITHUB_TITLE_MAX {
+            let fitted = fit::fit_title(t);
+            o.insert("title".into(), serde_json::Value::String(fitted));
+        }
+    }
+    if let Some(cs) = o.get_mut("comments").and_then(|c| c.as_array_mut()) {
+        for c in cs {
+            if let Some(b) = c.get("body").and_then(|b| b.as_str()) {
+                if b.len() > fit::BODY_TARGET {
+                    c["body"] = serde_json::Value::String(fit::fit(b));
+                }
+            }
+        }
+    }
+    out
+}
+
 /// GitHub refused a request for its rate limit (primary or secondary). The
 /// message is the usual status line, so string checks still match; the wait
 /// is how long GitHub asked for.
@@ -873,7 +909,7 @@ impl GitHubClient {
         body: &serde_json::Value,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
         let headers = self.auth_headers().await?;
-        let mut req = self.http.post(url).json(body);
+        let mut req = self.http.post(url).json(&bounded_payload(body));
         for (k, v) in headers {
             req = req.header(k, v);
         }
@@ -887,7 +923,7 @@ impl GitHubClient {
         body: &serde_json::Value,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
         let headers = self.auth_headers().await?;
-        let mut req = self.http.patch(url).json(body);
+        let mut req = self.http.patch(url).json(&bounded_payload(body));
         for (k, v) in headers {
             req = req.header(k, v);
         }
@@ -3566,7 +3602,7 @@ impl GitHubClient {
         let mut req = self
             .http
             .put(&url)
-            .json(&serde_json::json!({ "body": body }));
+            .json(&bounded_payload(&serde_json::json!({ "body": body })));
         for (k, v) in headers {
             req = req.header(k, v);
         }
@@ -4397,7 +4433,7 @@ impl GitHubClient {
         body: &serde_json::Value,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let headers = self.auth_headers().await?;
-        let mut req = self.http.post(url).json(body);
+        let mut req = self.http.post(url).json(&bounded_payload(body));
         for (k, v) in headers {
             req = req.header(k, v);
         }
@@ -5468,5 +5504,171 @@ mod reopen_tests {
         ));
         assert!(!closed_by_a_bot(&json!({"closed_by": null})));
         assert!(!closed_by_a_bot(&json!({})));
+    }
+}
+
+#[cfg(test)]
+mod body_limit_tests {
+    use super::*;
+    use common::pr_body_fit::{fits, GITHUB_BODY_MAX, GITHUB_TITLE_MAX};
+    use serde_json::json;
+
+    fn huge_body() -> String {
+        let mut s = String::from(
+            "Source ticket: SEC-1\n\n## Summary\n\nFixes 229 advisories.\n\n## Advisory\n\n",
+        );
+        for i in 0..3000 {
+            s.push_str(&format!(
+                "- GHSA-{i:04}-aaaa-bbbb · CVSS 7.5 · CWE-400 · published 2026-01-01\n"
+            ));
+        }
+        s.push_str("\n## Verification\n\n- [ ] CI passes\n\n<!-- coderhelm:security -->\n");
+        s
+    }
+
+    /// A client whose token is already cached: no app key needed.
+    fn client() -> GitHubClient {
+        let c = GitHubClient::new("1", "test-key", 0, &reqwest::Client::new()).unwrap();
+        *c.token_cache.lock().unwrap() = Some(CachedToken {
+            token: "t".into(),
+            expires_at: GitHubClient::now_epoch() + 3600,
+            permissions: Default::default(),
+        });
+        c
+    }
+
+    /// A server that keeps each request's body and answers `{"number": 7}`.
+    async fn capture() -> (String, std::sync::Arc<Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let kept = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut raw = Vec::new();
+                let mut buf = vec![0u8; 1 << 16];
+                // Headers, then the body to its Content-Length.
+                loop {
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    raw.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&raw).to_string();
+                    if let Some(h) = text.find("\r\n\r\n") {
+                        let len = text[..h]
+                            .lines()
+                            .find_map(|l| {
+                                let l = l.to_ascii_lowercase();
+                                l.strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                            })
+                            .unwrap_or(0);
+                        if raw.len() >= h + 4 + len {
+                            kept.lock()
+                                .unwrap()
+                                .push(String::from_utf8_lossy(&raw[h + 4..]).to_string());
+                            break;
+                        }
+                    }
+                }
+                let body = "{\"number\":7}";
+                let head = format!("HTTP/1.1 201 Created\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len());
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(body.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    /// What reaches GitHub for a pull request, a description update, an
+    /// issue and a comment is never over GitHub's limit, whatever the
+    /// caller wrote; required sections and markers stay.
+    #[tokio::test]
+    async fn no_write_sends_a_body_over_githubs_limit() {
+        let body = huge_body();
+        assert!(body.chars().count() > 2 * GITHUB_BODY_MAX);
+        let (base, seen) = capture().await;
+        let c = client();
+        let pr = json!({"title": "t".repeat(400), "body": body, "head": "b", "base": "main", "draft": true});
+        let made = c
+            .post(&format!("{base}/repos/o/r/pulls"), &pr)
+            .await
+            .unwrap();
+        assert_eq!(made["number"], 7);
+        c.patch(&format!("{base}/repos/o/r/pulls/7"), &json!({"body": body}))
+            .await
+            .unwrap();
+        c.post(
+            &format!("{base}/repos/o/r/issues/7/comments"),
+            &json!({"body": body}),
+        )
+        .await
+        .unwrap();
+        c.post_empty(
+            &format!("{base}/repos/o/r/issues"),
+            &json!({"title": "x", "body": body}),
+        )
+        .await
+        .unwrap();
+        let sent = seen.lock().unwrap().clone();
+        assert_eq!(sent.len(), 4);
+        for raw in sent {
+            let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            let b = v["body"].as_str().unwrap();
+            assert!(fits(b), "{} chars sent", b.chars().count());
+            assert!(b.starts_with("Source ticket: SEC-1"));
+            assert!(b.contains("## Summary\n\nFixes 229 advisories."));
+            assert!(b.contains("## Verification\n\n- [ ] CI passes"));
+            assert!(b.contains("<!-- coderhelm:security -->"));
+            if let Some(t) = v["title"].as_str() {
+                assert!(t.chars().count() <= GITHUB_TITLE_MAX);
+            }
+        }
+    }
+
+    #[test]
+    fn a_body_within_the_limit_is_sent_unchanged() {
+        let p = json!({"title": "fix: x", "body": "Closes #4\n\n## Summary\nx"});
+        assert_eq!(bounded_payload(&p), p);
+        let p = json!({"sha": "abc", "force": false});
+        assert_eq!(bounded_payload(&p), p);
+    }
+
+    /// Every method that writes a body sends it through `post`, `patch` or
+    /// `post_empty`, which bound it: none builds its own request around it.
+    #[test]
+    fn every_body_write_goes_through_the_bound() {
+        let src = include_str!("github.rs");
+        for f in [
+            "pub async fn create_pull_request(",
+            "pub async fn update_pr_body(",
+            "pub async fn create_issue(",
+            "pub async fn create_issue_comment(",
+            "pub async fn edit_issue_comment(",
+            "pub async fn create_pr_review(",
+            "pub async fn create_pr_review_inline(",
+        ] {
+            let at = src.find(f).unwrap_or_else(|| panic!("{f} is gone"));
+            let rest = &src[at..];
+            let end = rest[1..]
+                .find("\n    pub async fn ")
+                .map_or(rest.len(), |i| i + 1);
+            let body = &rest[..end];
+            assert!(
+                body.contains("self.post(") || body.contains("self.patch("),
+                "{f} sends its body some other way"
+            );
+        }
+        for send in ["async fn post(", "async fn patch(", "async fn post_empty("] {
+            let at = src.find(send).unwrap();
+            let rest = &src[at..at + 600];
+            assert!(rest.contains("bounded_payload(body)"), "{send}");
+        }
     }
 }

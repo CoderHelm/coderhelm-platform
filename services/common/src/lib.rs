@@ -143,6 +143,8 @@ mod model_call_sites;
 pub mod own_pr;
 /// Paginated DynamoDB lookups (follow LastEvaluatedKey to a match).
 pub mod paged;
+/// Every body CoderHelm sends GitHub fits GitHub's limit.
+pub mod pr_body_fit;
 /// What happened to a PR Coderhelm opened, read from GitHub.
 pub mod pr_outcome;
 pub mod run_prs;
