@@ -20,6 +20,7 @@ mod aa_promised_round;
 mod ab_label_prefix;
 mod ac_partial_and_red_ci;
 mod ad_hand_back_reply;
+mod ae_budget_rounds;
 mod b_open_pr_retry;
 mod c_codegen_egress;
 mod d_echoed_markers;

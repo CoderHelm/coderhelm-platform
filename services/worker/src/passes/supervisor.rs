@@ -46,6 +46,12 @@
 //! - **Budget follows progress** ([`may_extend`]): a loop at its round cap
 //!   that is still fixing things gets more rounds, up to twice the cap; a
 //!   run near its spend ceiling ships what is done ([`near_spend_cap`]).
+//!   The loops of fix rounds after the work (the CI-only rounds on a
+//!   finished run's pull request, the self-review and own-review rounds)
+//!   take each round by [`next_round`]: on while rounds make progress, a new
+//!   rung of the ladder when one makes none, and at the end what is left
+//!   deferred with the reason or the run failed with the cause
+//!   ([`end_of_rounds`]), never a wait on a person's comment.
 //!
 //! The tests at the bottom replay every historical stuck run's shape
 //! ([`replay`], `supervisor_replays.rs`) and read the worker's sources so a
@@ -213,6 +219,153 @@ pub fn defer_reason(rung_count: u32, task: &str, core: bool) -> String {
          work ships without it and the pull request lists it",
         common::truncate_str(task, 160)
     )
+}
+
+// ── Round budgets ───────────────────────────────────────────────────────────
+
+/// The hard ceiling on a loop's rounds: twice its cap.
+pub fn ceiling(cap: u32) -> u32 {
+    cap.saturating_mul(2)
+}
+
+/// What a loop of fix rounds (the CI-only rounds on a finished run's pull
+/// request, the rounds on CoderHelm's own review findings) decides its next
+/// round from.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct RoundFacts {
+    /// Rounds the loop already took.
+    pub rounds: u32,
+    /// The loop's cap: rounds past it only while they make progress, up to
+    /// [`ceiling`].
+    pub cap: u32,
+    /// The last round made progress (checks that were red turned green,
+    /// findings closed, the branch moved with changes for them).
+    pub progressed: bool,
+    /// Rounds in a row without progress before the last one.
+    pub stalled: u32,
+    /// What is left is core to the work (a readme line is not).
+    pub core: bool,
+    pub spent_usd: f64,
+    pub cap_usd: f64,
+}
+
+/// The next step of a loop of fix rounds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RoundStep {
+    /// Take another round with this rung's approach; `stalled` is recorded
+    /// for the next decision.
+    Round { rung: Rung, stalled: u32 },
+    /// The rounds are over: what is left is deferred with `why`, and the run
+    /// finishes ([`end_of_rounds`]). Never a wait on a person.
+    End { why: String },
+}
+
+/// The supervisor's rule for a loop of fix rounds: keep going while the
+/// rounds make progress, up to twice the cap and below the spend ceiling; a
+/// round without progress climbs the ladder ([`next_rung`]: narrow, fresh
+/// context, re-split, the strongest model); the ladder's end, the ceiling,
+/// or a round past the cap that made no progress ends the rounds.
+pub fn next_round(f: &RoundFacts) -> RoundStep {
+    let stalled = if f.progressed {
+        0
+    } else {
+        f.stalled.saturating_add(1)
+    };
+    if near_spend_cap(f.spent_usd, f.cap_usd) {
+        return RoundStep::End {
+            why: "the run is near its spend ceiling".into(),
+        };
+    }
+    if f.rounds >= ceiling(f.cap) {
+        return RoundStep::End {
+            why: format!(
+                "{} rounds, the most this loop takes (twice its {} while rounds make progress)",
+                f.rounds, f.cap
+            ),
+        };
+    }
+    if !may_extend(f.rounds, f.cap, f.progressed) {
+        return RoundStep::End {
+            why: format!(
+                "{} rounds, and the last one past the first {} made no progress",
+                f.rounds, f.cap
+            ),
+        };
+    }
+    match next_rung(stalled, f.core) {
+        Rung::Defer | Rung::Ship => RoundStep::End {
+            why: format!(
+                "{stalled} rounds in a row made no progress, each with a different approach \
+                 (one item only, a fresh context with small edits, a re-split{})",
+                if f.core { ", the strongest model" } else { "" }
+            ),
+        },
+        rung => RoundStep::Round { rung, stalled },
+    }
+}
+
+/// Whether a CI fix round made progress: a check that was red before it is
+/// no longer red. The first round (nothing recorded before it) counts as
+/// progress. A new check failing while every earlier one still fails is
+/// not.
+pub fn ci_progress(before: &[String], after: &[String]) -> bool {
+    before.is_empty() || before.iter().any(|c| !after.contains(c))
+}
+
+/// Whether a round on review findings made progress: fewer open than at the
+/// review before it (`None` at the first), or the round pushed changes.
+pub fn findings_progress(before: Option<usize>, after: usize, pushed_files: usize) -> bool {
+    before.is_none_or(|b| after < b) || pushed_files > 0
+}
+
+/// What a round on a rung is told, for `what` the round fixes. Empty for
+/// [`Rung::Continue`], [`Rung::Defer`] and [`Rung::Ship`].
+pub fn round_instruction(rung: Rung, what: &str) -> String {
+    let what = common::truncate_str(what.trim(), 600);
+    match rung {
+        Rung::Continue | Rung::Defer | Rung::Ship => String::new(),
+        Rung::Narrow => format!(
+            "\n\n## This round's approach\nThe last round made no progress on: {what}. Take one \
+             item only, the first one, and finish it in this round."
+        ),
+        Rung::SwitchTools => format!(
+            "\n\n## This round's approach\nTwo rounds in a row made no progress on: {what}. Start \
+             fresh from the pull request's diff; don't redo work that is done. Read the files in \
+             the parts you need and edit them in place with small edits, never rewrite a whole \
+             file. If an edit is refused, read the exact current text around it and edit again."
+        ),
+        Rung::Resplit => format!(
+            "\n\n## This round's approach\nThree rounds made no progress on: {what}. Split the \
+             first item into two or three smaller changes, write the list as the first lines of \
+             your final message, and make only the first change now."
+        ),
+        Rung::Escalate => format!(
+            "\n\n## This round's approach\n{ESCALATED} Four rounds made no progress on: {what}. \
+             Read the code around it and the tests that cover it, find why the earlier rounds \
+             didn't land (a refused edit, a wrong file, a failing build), and make the change."
+        ),
+    }
+}
+
+/// The words that mark a round taken on [`Rung::Escalate`]: a fix round
+/// that carries them runs on the strongest model.
+pub const ESCALATED: &str = "This round runs on the strongest model.";
+
+/// How a loop of fix rounds ends, by the one ending rule ([`end`]): `left`
+/// (failing checks, findings) deferred with `why`, finished with them
+/// listed on the pull request, or failed with the cause while checks of
+/// ours are red (`ci_failing`). Never a wait on a person.
+pub fn end_of_rounds(left: &[String], why: &str, ci_failing: &[String]) -> Ending {
+    end(&EndFacts {
+        deferred: left
+            .iter()
+            .map(|l| format!("{l} (deferred: {why})"))
+            .collect(),
+        ci_failing: ci_failing.to_vec(),
+        has_work: true,
+        ladder_spent: true,
+        ..Default::default()
+    })
 }
 
 // ── Red checks ──────────────────────────────────────────────────────────────
@@ -501,6 +654,76 @@ mod tests {
         assert!(may_extend(3, 3, true));
         assert!(!may_extend(3, 3, false));
         assert!(!may_extend(6, 3, true));
+    }
+
+    #[test]
+    fn rounds_follow_progress_climb_the_ladder_and_end_without_a_wait() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert!(ci_progress(&[], &s(&["lint"])));
+        assert!(ci_progress(&s(&["lint", "test"]), &s(&["test", "e2e"])));
+        assert!(!ci_progress(&s(&["test"]), &s(&["test", "e2e"])));
+        assert!(findings_progress(Some(3), 2, 0));
+        assert!(findings_progress(Some(2), 2, 1));
+        assert!(!findings_progress(Some(2), 2, 0));
+        let f = RoundFacts {
+            rounds: 9,
+            cap: 8,
+            progressed: true,
+            core: true,
+            cap_usd: 200.0,
+            ..Default::default()
+        };
+        assert_eq!(
+            next_round(&f),
+            RoundStep::Round {
+                rung: Rung::Continue,
+                stalled: 0
+            }
+        );
+        assert!(matches!(
+            next_round(&RoundFacts { rounds: 16, ..f }),
+            RoundStep::End { .. }
+        ));
+        assert!(matches!(
+            next_round(&RoundFacts {
+                progressed: false,
+                ..f
+            }),
+            RoundStep::End { .. }
+        ));
+        assert_eq!(
+            next_round(&RoundFacts {
+                rounds: 2,
+                progressed: false,
+                stalled: 1,
+                ..f
+            }),
+            RoundStep::Round {
+                rung: Rung::SwitchTools,
+                stalled: 2
+            }
+        );
+        // A non-core item (a readme line) is deferred after three.
+        assert!(matches!(
+            next_round(&RoundFacts {
+                rounds: 3,
+                progressed: false,
+                stalled: 2,
+                core: false,
+                ..f
+            }),
+            RoundStep::End { .. }
+        ));
+        // The ending: deferred and finished when green, failed when red;
+        // never a wait.
+        let left = s(&["a finding"]);
+        match end_of_rounds(&left, "why", &[]) {
+            Ending::Finished { deferred } => {
+                assert_eq!(deferred, s(&["a finding (deferred: why)"]))
+            }
+            e => panic!("{e:?}"),
+        }
+        assert_eq!(end_of_rounds(&left, "why", &s(&["build"])), Ending::Failed);
     }
 
     #[test]

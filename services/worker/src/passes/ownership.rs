@@ -77,6 +77,17 @@ pub const HAND_OFF_PHRASES: &[&str] = &[
     "best effort attempt",
     "if you can't, say so and stop",
     "if you cannot, say so and stop",
+    // A loop of fix rounds that stops on its own budget and waits for a
+    // person's comment to go on (the CI-only feedback rounds, the
+    // self-review rounds, the E2E rounds did): the supervisor's rule ends
+    // them instead, deferred with the reason or failed with the cause.
+    "comment to continue",
+    "comment naming a change",
+    "naming a change starts",
+    "starts the next round right away",
+    "starts the next one right away",
+    "stop starting rounds",
+    "stops starting rounds",
 ];
 
 /// How a model's reply gives the work up, besides [`HAND_OFF_PHRASES`].

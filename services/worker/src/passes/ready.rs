@@ -1120,7 +1120,9 @@ pub fn wants_own_round(f: &Facts) -> bool {
 
 /// CoderHelm's own open review findings hold the draft: a review-fix round
 /// is queued for them while the run has rounds left (once per head), and
-/// the decision waits for it. Otherwise they are a person's to deal with.
+/// the decision waits for it. When the run's rounds are over by the
+/// supervisor's rule, they are deferred on the pull request with the reason
+/// and hold nothing.
 async fn fix_own_findings(ctx: &Ctx<'_>, run_id: &str, f: &mut Facts) {
     if !wants_own_round(f) {
         return;
@@ -1138,7 +1140,33 @@ async fn fix_own_findings(ctx: &Ctx<'_>, run_id: &str, f: &mut Facts) {
     {
         super::resume::OwnRound::Fixing => f.own_fixing = true,
         super::resume::OwnRound::Person(why) => {
-            info!(pr = ctx.pr, run_id, why = %why, "No fix round for the own review's findings: a person has them");
+            info!(pr = ctx.pr, run_id, why = %why, "No fix round for the own review's findings now");
+        }
+        super::resume::OwnRound::Defer(why) => {
+            // The run's rounds on them are over (the supervisor's rule): they
+            // are deferred on the pull request with the reason and hold
+            // nothing, so the draft waits only on what else holds it.
+            let body = super::own_review::defer_findings(&f.body, &items, &why);
+            match ctx
+                .github
+                .update_pr_body(ctx.owner, ctx.repo, ctx.pr, &body)
+                .await
+            {
+                Ok(_) => {
+                    info!(pr = ctx.pr, run_id, why = %why, "The run's rounds on its own review's findings are over: deferred");
+                    super::add_progress_note(
+                        ctx.state,
+                        ctx.team_id,
+                        run_id,
+                        &super::own_review::finish_reason(&items, &why),
+                    )
+                    .await;
+                    f.body = body;
+                }
+                Err(e) => {
+                    warn!(pr = ctx.pr, run_id, error = %e, "Could not defer the own review's findings on the pull request")
+                }
+            }
         }
     }
 }

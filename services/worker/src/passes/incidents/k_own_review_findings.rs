@@ -10,10 +10,11 @@
 //! optional improvement to correct code) before the PR is marked ready or
 //! the merge armed. The review lists them at the top of the description and
 //! requests changes; the run takes them in review-fix rounds; the next
-//! review resolves the threads the new commit settled. It goes on while the
-//! rounds make progress, for at most two fix rounds; two rounds without
-//! progress, or the cap, stop it with the PR still a draft, the findings
-//! listed, and the run `needs_input`. A
+//! review resolves the threads the new commit settled. It goes on by the
+//! supervisor's rule: while the rounds make progress, past the cap of two up
+//! to twice it; a round without progress changes approach; when the rounds
+//! end, the findings still open are deferred with the reason on the pull
+//! request and the run finishes, never waiting on a person. A
 //! verdict is never APPROVE while a finding holds the merge.
 
 use super::fixture::*;
@@ -135,7 +136,8 @@ fn the_review_posts_never_approve_with_a_blocker_and_arms_nothing_on_open_findin
 }
 
 #[test]
-fn the_run_fixes_them_in_rounds_and_stops_after_two_without_progress() {
+fn the_run_fixes_them_in_rounds_and_defers_what_the_rounds_cant_close() {
+    use crate::passes::supervisor::Rung;
     let resume = include_str!("../resume.rs");
     // A review with open own findings fails the run's review: a fix round
     // follows, never ready_or_prove.
@@ -145,27 +147,36 @@ fn the_run_fixes_them_in_rounds_and_stops_after_two_without_progress() {
     let mut end = Ending::default();
     // Round 1 fixed one of three: progress, another round.
     assert_eq!(
-        own_review::next(Some(3), &open, 0, 0, 0),
-        Next::Fix { stalled: 0 }
+        own_review::next(Some(3), &open, 0, 0, 0, 0.0),
+        Next::Fix {
+            stalled: 0,
+            rung: Rung::Continue
+        }
     );
-    // Two rounds in a row with the same two open: stop.
+    // The same two open: the next round changes approach.
     assert_eq!(
-        own_review::next(Some(2), &open, 0, 0, 1),
-        Next::Fix { stalled: 1 }
+        own_review::next(Some(2), &open, 0, 0, 1, 0.0),
+        Next::Fix {
+            stalled: 1,
+            rung: Rung::Narrow
+        }
     );
-    match own_review::next(Some(2), &open, 0, 1, 1) {
-        Next::Stop(reason) => {
-            end.status = common::run_status::NEEDS_INPUT.into();
-            end.draft = true;
-            end.said(reason);
+    // At the cap and still no progress: the findings are deferred on the
+    // pull request and the run finishes.
+    match own_review::next(Some(2), &open, 0, 1, own_review::MAX_FIX_ROUNDS, 0.0) {
+        Next::Finish { why } => {
+            end.status = common::run_status::COMPLETED.into();
+            let body = own_review::defer_findings(&own_review::section(&open), &open, &why);
+            end.draft = own_review::hold(&body).is_some();
+            end.said(own_review::finish_reason(&open, &why));
         }
         other => panic!("{other:?}"),
     }
-    assert_eq!(end.status, "needs_input");
-    assert!(end.draft);
-    assert!(end.says("- A (`a.py:1`)"));
-    assert!(end.says("stays a draft"));
+    assert_eq!(end.status, "completed");
+    assert!(!end.draft);
+    assert!(end.says("- [ ] A (`a.py:1`)"));
+    assert!(end.says("deferred"));
     // Nothing open: ready.
-    assert_eq!(own_review::next(Some(2), &[], 1, 1, 2), Next::Ready);
+    assert_eq!(own_review::next(Some(2), &[], 1, 1, 2, 0.0), Next::Ready);
     end.never_says(OLD);
 }
