@@ -192,6 +192,34 @@ const POLICY_MANAGE = [
 ];
 
 /**
+ * The boundary's reads that only one switch of the AWS card uses, by the
+ * install stack's parameter (own-account-read.ts, OWN_OPTIONS). A release's
+ * access.json carries them (Metadata.CoderHelm.reads), so the updater offers
+ * an admin the access stack for them only when that switch is on
+ * (lambda/updater, access_decide); infra/test/access.test.ts checks no
+ * other role's action needs them.
+ */
+export const BOUNDARY_OPTION_READS = {
+  // Which versions run and what AWS has pending: describe and list calls only.
+  InfrastructureVulnerabilities: [
+    "autoscaling:Describe*",
+    // DescribeImages and DescribeInstances (one pattern: IAM's 6,144 characters).
+    "ec2:DescribeI*",
+    "ecr:Describe*",
+    "eks:Describe*",
+    "eks:List*",
+    "elasticache:Describe*",
+    "elasticloadbalancing:Describe*",
+    "es:Describe*",
+    "es:List*",
+    "rds:Describe*",
+  ],
+  // ListFindings, ListCoverage and BatchGetAccountStatus (short: IAM's 6,144 characters).
+  InspectorFindings: ["inspector2:List*", "inspector2:BatchGetA*"],
+  HealthEvents: ["health:Describe*"],
+} as const;
+
+/**
  * The services the boundary allows: what the install's functions, builds
  * and its deploy use (infra/test/access.test.ts checks every action in
  * every synthesized policy is in here).
@@ -208,27 +236,13 @@ export const BOUNDARY_SERVICES = [
   "ecr:BatchGetImage",
   "ecr:List*",
   "apigateway:*",
-  // Infrastructure vulnerabilities in the install's own account
-  // (own-account-read.ts): which versions run and what AWS has pending,
-  // describe and list calls only. Like bedrock:Retrieve, they reach an
+  // Infrastructure vulnerabilities, Amazon Inspector findings and AWS Health
+  // events in the install's own account: the reads only a switch of the AWS
+  // card uses (BOUNDARY_OPTION_READS). Like bedrock:Retrieve, they reach an
   // install only through the access stack an AWS admin applies.
-  "autoscaling:Describe*",
-  // DescribeImages and DescribeInstances (one pattern: IAM's 6,144 characters).
-  "ec2:DescribeI*",
-  "ecr:Describe*",
-  "eks:Describe*",
-  "eks:List*",
-  "elasticache:Describe*",
-  "elasticloadbalancing:Describe*",
-  "es:Describe*",
-  "es:List*",
-  "rds:Describe*",
-  // Amazon Inspector's findings and AWS Health events in the install's own
-  // account, when an admin switches them on (own-account-read.ts, OWN_OPTIONS).
-  // ListFindings, ListCoverage and BatchGetAccountStatus (short: IAM's 6,144 characters).
-  "inspector2:List*",
-  "inspector2:BatchGetA*",
-  "health:Describe*",
+  ...BOUNDARY_OPTION_READS.InfrastructureVulnerabilities,
+  ...BOUNDARY_OPTION_READS.InspectorFindings,
+  ...BOUNDARY_OPTION_READS.HealthEvents,
   "bedrock:InvokeModel",
   "bedrock:InvokeModelWithResponseStream",
   "bedrock:Get*",

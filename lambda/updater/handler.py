@@ -2699,8 +2699,15 @@ def iam_decision(identity, boundary, action, resource, ctx=None):
 
 
 def managed_policy_doc(iam, arn):
+    return managed_policy(iam, arn)[0]
+
+
+def managed_policy(iam, arn):
+    """(the default version's document, when that version was written or None)."""
     v = iam.get_policy(PolicyArn=arn)["Policy"]["DefaultVersionId"]
-    return policy_doc(iam.get_policy_version(PolicyArn=arn, VersionId=v)["PolicyVersion"]["Document"])
+    pv = iam.get_policy_version(PolicyArn=arn, VersionId=v)["PolicyVersion"]
+    at = pv.get("CreateDate")
+    return policy_doc(pv["Document"]), (at.isoformat() if hasattr(at, "isoformat") else (str(at) if at else None))
 
 
 def deploy_role_access(env, iam=None):
@@ -2932,7 +2939,10 @@ def cfn_resolve(v, values, conditions=None):
 
 SERVICE_NAMES = {"airflow": "Airflow", "ecs": "ECS", "ecr": "ECR", "iam": "IAM", "sts": "STS", "logs": "CloudWatch Logs",
                  "bedrock": "Bedrock", "lambda": "Lambda", "s3": "S3", "dynamodb": "DynamoDB", "cloudwatch": "CloudWatch",
-                 "ssm": "Systems Manager", "sqs": "SQS", "sns": "SNS", "ses": "SES", "kms": "KMS", "events": "EventBridge"}
+                 "ssm": "Systems Manager", "sqs": "SQS", "sns": "SNS", "ses": "SES", "kms": "KMS", "events": "EventBridge",
+                 "ec2": "EC2", "eks": "EKS", "rds": "RDS", "elasticache": "ElastiCache", "autoscaling": "Auto Scaling",
+                 "elasticloadbalancing": "Elastic Load Balancing", "es": "OpenSearch", "inspector2": "Amazon Inspector",
+                 "health": "AWS Health"}
 READ_VERBS = ("Get", "List", "Describe", "BatchGet", "Simulate", "InvokeRestApi")
 # What a statement means, for the few that change who may do what.
 STATEMENT_WORDS = {
@@ -2946,20 +2956,29 @@ def _names(services):
     return names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
 
 
-def describe_policy_change(have, want):
-    """What changes from `have` to `want`, in a few plain lines."""
+def policy_additions(have, want):
+    """The actions `want` allows that `have` doesn't (statement by statement), in order."""
+    hs = {s.get("Sid"): s for s in _as_list(policy_doc(have).get("Statement"))}
+    added = []
+    for s in _as_list(policy_doc(want).get("Statement")):
+        if s.get("Effect") == "Allow" and "Action" in s:
+            old = set(_as_list((hs.get(s.get("Sid")) or {}).get("Action")))
+            added += [a for a in _as_list(s["Action"]) if a not in old and a not in added]
+    return added
+
+
+def adds_line(actions):
+    """"adds read access to ECR and ECS (ecr:List*, ecs:Describe*)" and the like."""
+    svcs = [a.split(":")[0] for a in actions]
+    read = all(any(a.split(":", 1)[1].startswith(v) for v in READ_VERBS) for a in actions if ":" in a)
+    return f"adds {'read ' if read else ''}access to {_names(svcs)} ({', '.join(actions)})"
+
+
+def policy_rule_changes(have, want):
+    """What changes from `have` to `want` besides allowed actions added: rules added, replaced or rewritten."""
     hs = {s.get("Sid"): s for s in _as_list(policy_doc(have).get("Statement"))}
     ws = {s.get("Sid"): s for s in _as_list(policy_doc(want).get("Statement"))}
     lines = []
-    added = []
-    for sid, s in ws.items():
-        if s.get("Effect") == "Allow" and "Action" in s:
-            old = set(_as_list((hs.get(sid) or {}).get("Action")))
-            added += [a for a in _as_list(s["Action"]) if a not in old]
-    if added:
-        svcs = [a.split(":")[0] for a in added]
-        read = all(any(a.split(":", 1)[1].startswith(v) for v in READ_VERBS) for a in added if ":" in a)
-        lines.append(f"adds {'read ' if read else ''}access to {_names(svcs)} ({', '.join(added)})")
     for sid in ws.keys() - hs.keys():
         if ws[sid].get("Effect") == "Deny" or sid in STATEMENT_WORDS:
             lines.append(STATEMENT_WORDS.get(sid) or f"adds the rule {sid}")
@@ -2972,10 +2991,78 @@ def describe_policy_change(have, want):
             a.pop("Action", None), b.pop("Action", None)
         if canonical_policy({"Statement": [a]}) != canonical_policy({"Statement": [b]}):
             lines.append(STATEMENT_WORDS.get(sid) or f"rewrites the rule {sid}")
+    return lines
+
+
+def describe_policy_change(have, want):
+    """What changes from `have` to `want`, in a few plain lines."""
+    added = policy_additions(have, want)
+    lines = ([adds_line(added)] if added else []) + policy_rule_changes(have, want)
     return lines or ["rewrites the policy (the same rules)"]
 
 
+# The boundary's reads only one switch of the AWS card uses (infra/lib/access.ts,
+# BOUNDARY_OPTION_READS). A release's access.json carries them as
+# Metadata.CoderHelm.reads; this is for one from before it did.
+OPTION_READS = {
+    "InfrastructureVulnerabilities": ["autoscaling:Describe*", "ec2:DescribeI*", "ecr:Describe*", "eks:Describe*", "eks:List*",
+                                      "elasticache:Describe*", "elasticloadbalancing:Describe*", "es:Describe*", "es:List*", "rds:Describe*"],
+    "InspectorFindings": ["inspector2:List*", "inspector2:BatchGetA*"],
+    "HealthEvents": ["health:Describe*"],
+}
+# A switch a release doesn't have yet reads as its default (own-account-read.ts, OWN_OPTIONS):
+# the infrastructure reads were always on before they were a switch.
+OPTION_DEFAULTS = {"InfrastructureVulnerabilities": "on", "InspectorFindings": "off", "HealthEvents": "off"}
+
+
+def option_reads(access):
+    """{switch: [boundary action]} from the access.json, or OPTION_READS."""
+    reads = ((access.get("Metadata") or {}).get("CoderHelm") or {}).get("reads")
+    if isinstance(reads, dict) and all(k in OPTION_PARAMS and isinstance(v, list) for k, v in reads.items()):
+        return reads
+    return OPTION_READS
+
+
+def read_use(action, reads):
+    """The switch a boundary action serves alone (None: something the install always uses)."""
+    return next((opt for opt, pats in reads.items() if action in pats), None)
+
+
+def access_groups(added, reads):
+    """The added actions grouped by what uses them, in plain words."""
+    groups = []
+    for opt in [None] + list(OPTION_PARAMS):
+        acts = [a for a in added if read_use(a, reads) == opt]
+        if not acts:
+            continue
+        svcs = [a.split(":")[0] for a in acts]
+        groups.append({"use": opt, "name": OPTION_NAMES.get(opt) if opt else None, "services": _names(svcs),
+                       "actions": acts, "line": adds_line(acts)})
+    return groups
+
+
+def access_decide(view, options):
+    """`view` decided for the install's switches as they are now: "pending"
+    when what it adds matters to the install (something it always uses, a
+    rule, or a read whose switch is on), "optional" when it adds only reads
+    for switches that are off. Its summary lists only what matters."""
+    if not isinstance(view, dict) or view.get("state") not in ("pending", "optional") or "adds" not in view:
+        return view
+    opts = {k: ((options or {}).get(k) or OPTION_DEFAULTS[k]) for k in OPTION_PARAMS}
+    if options is None:
+        opts = {k: "on" for k in OPTION_PARAMS}  # unreadable: never hides what may matter
+    needed = [g for g in view["adds"] if g["use"] is None or opts.get(g["use"]) == "on"]
+    later = [g for g in view["adds"] if g not in needed]
+    rules = view.get("rules") or []
+    out = dict(view, needed=needed, later=later, options=opts)
+    out["state"] = "pending" if needed or rules else "optional"
+    out["summary"] = [g["line"] for g in needed] + rules
+    out["later_summary"] = [g["line"] for g in later]
+    return out
+
+
 def access_link(region, stack_name, template_url, params):
+    """The quick-create link: only for an install that has no access stack yet."""
     from urllib.parse import quote, urlencode
     q = {"stackName": f"{stack_name}-access", "templateURL": template_url}
     q.update({f"param_{k}": v for k, v in params.items()})
@@ -2985,23 +3072,32 @@ def access_link(region, stack_name, template_url, params):
 
 def access_stack_origin(cfn, st):
     """Who made the stack named <install>-access: a release's access.json (its
-    template says kind "access"; deleting it changes nothing, so it may be
-    deleted to make room for the newer one), or something else of that name,
-    like the boundary stack of an install hardened from the CLI, which must
-    never be deleted. Unreadable counts as something else."""
+    template says kind "access": an update with a newer access.json applies a
+    newer release's permissions), or something else of that name, like the
+    boundary stack of an install hardened from the CLI, which is never touched.
+    Unreadable counts as something else."""
     try:
         meta = (deployed_template(cfn, st.get("StackId") or st.get("StackName")).get("Metadata") or {}).get("CoderHelm") or {}
     except Exception as e:  # noqa: BLE001
         logger.warning(f"access stack template not read: {e}")
         meta = {}
     if meta.get("kind") == "access":
-        return {"kind": "access", "version": meta.get("version") or None}
+        out = {o.get("OutputKey"): o.get("OutputValue") for o in st.get("Outputs") or []}
+        # The Version output is the release whose permissions the stack applied
+        # (its template's metadata changes before an update has finished).
+        return {"kind": "access", "version": out.get("Version") or meta.get("version") or None}
     return {"kind": "other", "version": None}
 
 
+def _iso(t):
+    return t.isoformat() if hasattr(t, "isoformat") else (str(t) if t else None)
+
+
 def access_compute(env, cfn=None, iam=None, opener=None):
-    """The install's access against what its release's access.json gives: the
-    pending permission change, if any, and the one link that applies it."""
+    """The install's access against what its release's access.json gives: what
+    it would add, grouped by what uses it, what the install already has (and
+    since when), and how an AWS admin applies it: an update of the existing
+    access stack with the newer access.json, or one link that creates it."""
     cfn = cfn or client("cloudformation")
     root = env["NATIVE_STACK"]
     stack = cfn.describe_stacks(StackName=root)["Stacks"][0]
@@ -3023,13 +3119,19 @@ def access_compute(env, cfn=None, iam=None, opener=None):
     props = ((access.get("Resources") or {}).get("Access") or {}).get("Properties") or {}
     values = cfn_values(stack, env)
     conds = access.get("Conditions") or {}
+    reads = option_reads(access)
     iam = iam or client("iam")
-    changes = []
+    changes, added, rules, written = [], [], [], None
     for key in ("Boundary", "DeployBoundary"):
         want = cfn_resolve(props[key]["Document"], values, conds)
-        have = managed_policy_doc(iam, cfn_resolve(props[key]["Arn"], values, conds))
+        have, at = managed_policy(iam, cfn_resolve(props[key]["Arn"], values, conds))
+        if key == "Boundary":
+            written = at
         if not same_policy(have, want):
             changes.append({"resource": key, "lines": describe_policy_change(have, want)})
+            added += [a for a in policy_additions(have, want) if a not in added]
+            rules += [ln for ln in policy_rule_changes(have, want) if ln not in rules]
+    groups = access_groups(added, reads)
     role = props.get("DeployRole") or {}
     if role:
         name = cfn_resolve(role["RoleName"], values, conds)
@@ -3037,30 +3139,46 @@ def access_compute(env, cfn=None, iam=None, opener=None):
         have = policy_doc(iam.get_role_policy(RoleName=name, PolicyName=role.get("PolicyName") or "deploy")["PolicyDocument"])
         if not same_policy(have, want):
             changes.append({"resource": "DeployRole", "lines": describe_policy_change(have, want)})
+            # The deploy role's own actions: what every update uses, never a switch's.
+            more = [a for a in policy_additions(have, want) if not any(a in g["actions"] for g in groups)]
+            if more:
+                groups.insert(0, {"use": None, "name": None, "services": _names([a.split(":")[0] for a in more]),
+                                  "actions": more, "line": "lets updates " + adds_line(more)})
+            rules += [ln for ln in policy_rule_changes(have, want) if ln not in rules]
+    if changes and not groups and not rules:
+        rules = ["rewrites the policy (the same rules)"]
     params = {p: values.get(p, "") for p in (access.get("Parameters") or {})}
+    region = env.get("AWS_REGION") or ""
     try:
         st = cfn.describe_stacks(StackName=f"{root}-access")["Stacks"][0]
-        existing = {"status": st.get("StackStatus"), "link": f"https://{env.get('AWS_REGION')}.console.aws.amazon.com/cloudformation/home?region={env.get('AWS_REGION')}#/stacks/stackinfo?stackId={st.get('StackId')}"}
+        existing = {"status": st.get("StackStatus"),
+                    "link": f"https://{region}.console.aws.amazon.com/cloudformation/home?region={region}#/stacks/stackinfo?stackId={st.get('StackId')}",
+                    "at": _iso(st.get("LastUpdatedTime") or st.get("CreationTime"))}
         existing.update(access_stack_origin(cfn, st))
     except Exception as e:  # noqa: BLE001
         if "does not exist" not in str(e):
             raise
         existing = None
-    lines = []
-    for c in changes:
-        for ln in c["lines"]:
-            if ln not in lines:
-                lines.append(ln)
-    return {
+    ours = bool(existing) and existing.get("kind") == "access"
+    view = {
         "state": "pending" if changes else "applied",
         "version": version,
-        "summary": lines,
         "resources": [c["resource"] for c in changes],
-        "link": access_link(env.get("AWS_REGION") or "", root, url, params) if changes else None,
+        # What it adds, by what uses it (use: the AWS card's switch, None: always used).
+        "adds": groups,
+        "rules": rules,
+        # What the install has now: the release whose access stack applied it and
+        # when, or (no stack) when its permission limit was last written.
+        "current": ({"version": existing.get("version"), "at": existing.get("at"), "from": "stack"} if ours
+                    else {"version": None, "at": written, "from": "policy"}),
+        # How an admin applies it: an update of the stack a release made, or a create when there is none.
+        "apply": ("update" if ours else "create" if not existing else "blocked") if changes else None,
+        "link": access_link(region, root, url, params) if changes and not existing else None,
         "template_url": url,
         "stack": f"{root}-access",
         "existing": existing,
     }
+    return access_decide(view, stack_options(stack))
 
 
 def access_view(store, env, now, force=False, **kw):
@@ -3466,6 +3584,7 @@ def native_status(store, env, state):
                 "confirm": confirm_token(hid, entry),
             })
     role = bool(env.get("DEPLOY_ROLE_ARN"))
+    options = install_options(env)
     return {
         "stack": env.get("NATIVE_STACK"),
         # The install has the deploy role: an admin's Update applies (older name: auto_apply).
@@ -3474,11 +3593,13 @@ def native_status(store, env, state):
         "pending": pending,
         # A newer boundary or deploy role policy than the install has: optional,
         # applied by an AWS admin through the access stack (one link).
-        "access": (store.get("ACCESS") or {}).get("view"),
+        # Decided for the switches as they are this moment, so turning one on or
+        # off shows (or hides) what it needs at once.
+        "access": access_decide((store.get("ACCESS") or {}).get("view"), options),
         # A stack whose rollback stopped, and what CoderHelm did about it.
         "recovery": state.get("recovery"),
         # What the install reads in its own account, as its stack has it (None: not readable).
-        "options": install_options(env),
+        "options": options,
     }
 
 

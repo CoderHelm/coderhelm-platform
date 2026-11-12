@@ -130,9 +130,27 @@ There is only ever one update waiting. A newer prepared update replaces an older
 
 ## Permissions
 
-Some releases can do more once your install's permission limit (its boundary) or its deploy role allows a little more, for example reading Airflow, ECS and ECR in your own account. No update can change those: the deploy role that runs updates may never change itself or a boundary. So the update installs without them, the features that need them say so where you use them, and **Settings, then System, then Version** shows a separate, optional item: **Permissions**, with what it adds in plain words (for example "adds read access to Airflow, ECR and ECS").
+Some releases can do more once your install's permission limit (its boundary) or its deploy role allows a little more, for example reading Amazon Inspector findings in your own account. No update can change those: the deploy role that runs updates may never change itself or a boundary. So the update installs without them, and the features that need them say so where you use them.
 
-**Open in the AWS console** opens one link: a stack named `coderhelm-<name>-access`, from that release's signed `access.json`, with your install's values filled in. Someone with administrator rights in the AWS account checks the box and chooses **Create stack**. It runs with that person's own permissions (the stack has no service role), writes a new version of `coderhelm-<name>-boundary-stack` and `coderhelm-<name>-deploy-boundary-stack` and the deploy role's policy, only where they differ, and finishes in about a minute. The item then reads **Applied**. Deleting that stack later changes nothing. If that stack is left from an earlier change, the item asks you to delete it first and links to it; **Open in the AWS console** shows once it's gone (CloudFormation can't create a second stack of that name). It asks only when the stack is one a release's `access.json` made. A stack of that name that something else made, like the boundary stack of an install hardened from the CLI, is never called safe to delete. No CoderHelm role can create, change or delete a stack of that name.
+CoderHelm compares what your boundary and deploy role allow now with what the release's signed `access.json` gives, and keeps only the new parts. It asks for them only when they matter to something your install uses:
+
+- reads that only one switch of the AWS card uses (infrastructure vulnerabilities, Amazon Inspector findings, AWS Health events) count only while that switch is on. Turning a switch on shows what it needs at once; turning it off hides it again;
+- anything else new counts always.
+
+When nothing new matters, **Settings, then System, then Version** shows no card, only one quiet line, **Permissions: nothing needed**, that opens to what the release would add for switches that are off. When something does, it shows **More AWS access for what you use**: what you already allowed (for example "You allowed access for v0.8.59 on Nov 9"), then only the new permissions, in plain words, with the switch that needs each.
+
+**If the stack `coderhelm-<name>-access` already exists** (a release's `access.json` made it), you update it; you never delete it. Someone with administrator rights in the AWS account:
+
+1. clicks **Open coderhelm-<name>-access** (the stack in the CloudFormation console);
+2. chooses **Update stack**, then **Make a direct update**, then **Replace existing template**;
+3. under **Amazon S3 URL**, pastes the release's template URL (the card has a **Copy** button), then **Next**;
+4. keeps every parameter as it is (**Use existing value**), chooses **Next** twice, ticks the box that says it creates IAM resources, and chooses **Submit**.
+
+The CloudFormation console has no link that opens an update with a new template already filled in, so these are the steps. Every release keeps the stack's resources, names and parameters the same, so the update changes them in place, and the stack's custom resource carries the release's version, so every update runs its writer again. It runs with that person's own permissions (the stack has no service role), writes a new version of `coderhelm-<name>-boundary-stack` and `coderhelm-<name>-deploy-boundary-stack` and the deploy role's policy, only where they differ, and finishes in about a minute. The stack's **Version** output then names the newer release, and the card goes away by itself.
+
+**If there is no such stack yet** (or it was deleted; deleting it changes nothing), **Open in the AWS console** creates it from one link with your install's values filled in: tick the box and choose **Create stack**.
+
+A stack of that name that something else made, like the boundary stack of an install hardened from the CLI, is never updated or deleted from here; the card says to ask CoderHelm support. No CoderHelm role can create, change or delete a stack of that name.
 
 Updates never wait for this item, and it never waits for an update.
 

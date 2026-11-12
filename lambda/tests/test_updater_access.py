@@ -446,6 +446,163 @@ class AccessItem(Base):
         self.assertEqual(len(self.urls), 2, "an admin's finished access stack shows within a minute")
 
 
+class AccessForWhatIsUsed(Base):
+    """A newer release's access, offered only for what the install uses, as an
+    update of the access stack an admin already made (never a delete)."""
+
+    READS = u.OPTION_READS
+
+    def setUp(self):
+        super().setUp()
+        self.body = json.dumps(self.access_json()).encode()
+        self.cfn.deployed = {"Resources": {"ReleaseAssets": {"Properties": {"Files": [
+            {"Key": "access.json", "Dest": "releases/v1.0.0/access.json", "Sha256": hashlib.sha256(self.body).hexdigest()}]}}}}
+        self.urls = []
+        u.fetch_template = lambda url, opener=None: self.urls.append(url) or self.body
+
+    def access_json(self, reads_meta=True):
+        t = AccessItem.access_json(self)
+        for k in ("Boundary", "DeployBoundary"):
+            d = copy.deepcopy(PINNED["Boundary"]["Properties"]["PolicyDocument"])
+            for s in d["Statement"]:
+                if s["Sid"] == "CoderHelmServices":
+                    s["Action"] = s["Action"] + [a for v in u.OPTION_READS.values() for a in v]
+            t["Resources"]["Access"]["Properties"][k]["Document"] = d
+        if reads_meta:
+            t["Metadata"] = {"CoderHelm": {"version": "v1.0.0", "kind": "access", "reads": self.READS}}
+        return t
+
+    def switches(self, **on):
+        params = {**PARAMS, "InfrastructureVulnerabilities": "off", "InspectorFindings": "off", "HealthEvents": "off", **on}
+        root = self.cfn.describe_stacks
+
+        def describe(StackName):
+            r = root(StackName)
+            if not StackName.endswith("-access"):
+                r["Stacks"][0]["Parameters"] = [{"ParameterKey": k, "ParameterValue": v} for k, v in params.items()]
+            return r
+        self.cfn.describe_stacks = describe
+
+    def made_on_nov_9(self, version="v0.9.0", status="CREATE_COMPLETE"):
+        from datetime import datetime, timezone
+        self.cfn.access_stack = {"StackId": "arn:aws:cloudformation:us-east-1:1:stack/coderhelm-prod-access/x", "StackName": "coderhelm-prod-access",
+                                 "StackStatus": status, "CreationTime": datetime(2026, 11, 9, 18, 45, tzinfo=timezone.utc),
+                                 "Outputs": [{"OutputKey": "Version", "OutputValue": version}, {"OutputKey": "Written", "OutputValue": "Boundary"}]}
+        self.cfn.access_template = {"Metadata": {"CoderHelm": {"version": version, "kind": "access"}}, "Resources": {}}
+
+    def test_reads_only_for_switches_that_are_off_are_not_asked_for(self):
+        self.switches()
+        v = u.access_compute(self.env)
+        self.assertEqual(v["state"], "optional")
+        self.assertEqual(v["summary"], [])
+        self.assertEqual([g["use"] for g in v["later"]], ["InfrastructureVulnerabilities", "InspectorFindings", "HealthEvents"])
+
+    def test_a_switch_that_is_on_asks_for_its_reads_and_only_those(self):
+        self.switches(InspectorFindings="on")
+        v = u.access_compute(self.env)
+        self.assertEqual(v["state"], "pending")
+        self.assertEqual([g["name"] for g in v["needed"]], ["Amazon Inspector findings"])
+        self.assertEqual(v["needed"][0]["actions"], ["inspector2:List*", "inspector2:BatchGetA*"])
+        self.assertEqual(v["summary"], ["adds read access to Amazon Inspector (inspector2:List*, inspector2:BatchGetA*)"])
+        self.assertEqual([g["use"] for g in v["later"]], ["InfrastructureVulnerabilities", "HealthEvents"])
+
+    def test_an_access_json_from_before_the_reads_metadata_uses_the_updaters_own(self):
+        self.body = json.dumps(self.access_json(reads_meta=False)).encode()
+        self.cfn.deployed["Resources"]["ReleaseAssets"]["Properties"]["Files"][0]["Sha256"] = hashlib.sha256(self.body).hexdigest()
+        self.switches(InfrastructureVulnerabilities="on")
+        v = u.access_compute(self.env)
+        self.assertEqual((v["state"], [g["use"] for g in v["needed"]]), ("pending", ["InfrastructureVulnerabilities"]))
+        self.assertIn("EC2", v["needed"][0]["services"])
+
+    def test_a_release_without_switches_reads_them_as_their_defaults(self):
+        # PARAMS has none of the three: infrastructure reads were always on before they were a switch.
+        v = u.access_compute(self.env)
+        self.assertEqual([g["use"] for g in v["needed"]], ["InfrastructureVulnerabilities"])
+
+    def test_something_the_install_always_uses_is_always_asked_for(self):
+        self.READS = {"HealthEvents": ["health:Describe*"]}
+        self.body = json.dumps(self.access_json()).encode()
+        self.cfn.deployed["Resources"]["ReleaseAssets"]["Properties"]["Files"][0]["Sha256"] = hashlib.sha256(self.body).hexdigest()
+        self.switches()
+        v = u.access_compute(self.env)
+        self.assertEqual(v["state"], "pending")
+        self.assertEqual([g["use"] for g in v["needed"]], [None])
+        self.assertNotIn("health:Describe*", v["needed"][0]["actions"])
+
+    def test_turning_a_switch_on_shows_what_it_needs_at_once(self):
+        self.switches()
+        st = u.handle({"action": "status"}, self.env, self.store, base.NOW, fetch=lambda repo: [])
+        self.assertEqual(st["native"]["access"]["state"], "optional")
+        self.switches(HealthEvents="on")
+        st = u.handle({"action": "status"}, self.env, self.store, base.NOW, fetch=lambda repo: [])
+        self.assertEqual(len(self.urls), 1, "the cached read, decided again for the switches as they are now")
+        self.assertEqual(st["native"]["access"]["state"], "pending")
+        self.assertEqual([g["name"] for g in st["native"]["access"]["needed"]], ["AWS Health events"])
+
+    def test_an_existing_access_stack_is_updated_never_deleted(self):
+        self.switches(InspectorFindings="on")
+        self.made_on_nov_9()
+        v = u.access_compute(self.env)
+        self.assertEqual(v["apply"], "update")
+        self.assertIsNone(v["link"], "no quick-create while the stack exists")
+        self.assertEqual(v["template_url"], "https://coderhelm-public.s3.amazonaws.com/launch/v1.0.0/access.json")
+        self.assertEqual(v["current"], {"version": "v0.9.0", "at": "2026-11-09T18:45:00+00:00", "from": "stack"})
+        self.assertIn("#/stacks/stackinfo?stackId=", v["existing"]["link"])
+
+    def test_without_a_stack_it_says_when_the_limit_was_last_written_and_links_a_create(self):
+        self.switches(InspectorFindings="on")
+        v = u.access_compute(self.env)
+        self.assertEqual((v["apply"], v["current"]["from"]), ("create", "policy"))
+        self.assertIn("#/stacks/quickcreate?", v["link"])
+
+    def test_a_stack_of_that_name_a_release_didnt_make_is_blocked_not_updated(self):
+        self.switches(InspectorFindings="on")
+        self.made_on_nov_9()
+        self.cfn.access_template = {"Description": "something else", "Resources": {}}
+        v = u.access_compute(self.env)
+        self.assertEqual((v["apply"], v["link"]), ("blocked", None))
+
+    def test_the_admins_update_runs_the_writer_and_the_card_clears(self):
+        """The update CloudFormation sends the writer when an admin updates the
+        stack with the newer access.json: it writes, and the next read is applied."""
+        self.switches(InspectorFindings="on")
+        self.made_on_nov_9()
+        self.assertEqual(u.access_compute(self.env)["state"], "pending")
+        new = resolved(self.access_json()["Resources"]["Access"]["Properties"])
+        old = dict(new, Version="v0.9.0")
+        event = {"RequestType": "Update", "ResourceProperties": dict(new, ServiceToken="x"), "OldResourceProperties": old,
+                 "PhysicalResourceId": "access", "StackId": "s", "RequestId": "r", "LogicalResourceId": "Access",
+                 "ResponseURL": "https://cloudformation-custom-resource-response-useast1.s3.amazonaws.com/x"}
+        sent = []
+        saved = (writer.respond, writer._iam)
+
+        class Iam(base.FakeIam):
+            def list_policy_versions(s, PolicyArn):
+                return {"Versions": [{"VersionId": "v1", "IsDefaultVersion": True}]}
+
+            def create_policy_version(s, PolicyArn, PolicyDocument, SetAsDefault):
+                s.policies[PolicyArn] = json.loads(PolicyDocument)
+
+            def put_role_policy(s, RoleName, PolicyName, PolicyDocument):
+                s.role_policies[(RoleName, PolicyName)] = json.loads(PolicyDocument)
+        iam = Iam(deploy=OLD_DEPLOY, boundary=OLD_BOUNDARY, policies=dict(self.iam.policies))
+        writer.respond = lambda ev, status, reason="", data=None: sent.append((status, reason, data, ev.get("PhysicalResourceId")))
+        writer._iam = iam
+        try:
+            writer.handler(event)
+        finally:
+            writer.respond, writer._iam = saved
+        self.assertEqual(sent[0][0], "SUCCESS")
+        self.assertEqual(sent[0][2], {"Written": "DeployBoundary,Boundary"})
+        self.assertEqual(sent[0][3], "access", "the same physical id: updated in place, never replaced")
+        # The stack's Version output now names the newer release, and the read is applied.
+        self.made_on_nov_9(version="v1.0.0", status="UPDATE_COMPLETE")
+        u._clients["iam"] = iam
+        v = u.access_compute(self.env)
+        self.assertEqual(v["state"], "applied")
+        self.assertEqual(v["existing"]["version"], "v1.0.0")
+
+
 class StuckBase(Base):
     def setUp(self):
         super().setUp()

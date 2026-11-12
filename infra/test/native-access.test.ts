@@ -24,8 +24,8 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { accessNames, boundaryPolicy, PolicyDocument } from "../lib/access";
-import { ACCESS_PARAMETERS, ACCESS_WRITER_NAME, buildAccess, writerPolicy } from "../lib/native/access-stack";
+import { accessNames, BOUNDARY_OPTION_READS, boundaryPolicy, PolicyDocument } from "../lib/access";
+import { ACCESS_PARAMETERS, ACCESS_SHAPE, ACCESS_WRITER_NAME, buildAccess, writerPolicy } from "../lib/native/access-stack";
 import { buildNative } from "../lib/native/build";
 import { ACCESS_FILE, deployRolePolicy, nativeNames, pinnedAccess, subInstall } from "../lib/native/parent";
 import { sha256File } from "../lib/native/package";
@@ -188,5 +188,52 @@ test("the install's optional reads are parent parameters fed to the parts that r
     for (const k of ["InfrastructureVulnerabilities", "InspectorFindings", "HealthEvents"]) {
       assert.deepEqual(R[part].Properties.Parameters[k], { Ref: k }, `${part}.${k}`);
     }
+  }
+});
+
+// ── A newer release's access: an update of the stack, never a delete ─────
+
+/** The resources an earlier release's access.json made (v0.8.59's, as published). */
+const EARLIER = {
+  WriterRole: { Type: "AWS::IAM::Role", RoleName: { "Fn::Sub": "CoderHelmAccess-${Stage}" } },
+  Writer: { Type: "AWS::Lambda::Function", FunctionName: { "Fn::Sub": "CoderHelmAccess-${Stage}" } },
+  Access: { Type: "Custom::Access" },
+};
+
+test("an admin's update of the access stack with a newer access.json changes every resource in place and runs the writer again", () => {
+  const older = buildAccess("v9.8.6", "def write_policy(): pass\n");
+  const newer = buildAccess("v9.8.7", "def write_policy(): pass  # newer\n");
+  // The same logical ids, types and fixed names as every earlier release: nothing is replaced.
+  assert.deepEqual(Object.keys(newer.Resources).sort(), Object.keys(EARLIER).sort());
+  for (const [id, want] of Object.entries(EARLIER)) {
+    const r = newer.Resources[id];
+    assert.equal(r.Type, want.Type, id);
+    assert.equal(r.Type, ACCESS_SHAPE[id as keyof typeof ACCESS_SHAPE].Type, id);
+    if ("RoleName" in want) assert.deepEqual(r.Properties.RoleName, want.RoleName);
+    if ("FunctionName" in want) assert.deepEqual(r.Properties.FunctionName, want.FunctionName);
+    assert.equal(r.Condition, undefined, `${id} has no condition (one would delete it on update)`);
+  }
+  // The same parameters, so "Use existing values" is all an update asks.
+  assert.deepEqual(Object.keys(newer.Parameters).sort(), Object.keys(older.Parameters).sort());
+  // The custom resource's properties change with every release (its Version), so
+  // CloudFormation sends the writer an Update, which writes what differs (lambda/tests, AccessForWhatIsUsed).
+  assert.notDeepEqual(newer.Resources.Access.Properties, older.Resources.Access.Properties);
+  assert.equal(newer.Resources.Access.Properties.Version, "v9.8.7");
+  assert.equal(older.Resources.Access.Properties.Version, "v9.8.6");
+  // The writer answers an Update the way it answers a Create.
+  const code = fs.readFileSync(path.join(__dirname, "..", "..", "..", "lambda", "native-access", "handler.py"), "utf8");
+  assert.match(code, /if event.get\("RequestType"\) in \("Create", "Update"\):/);
+  assert.match(code, /"PhysicalResourceId": event.get\("PhysicalResourceId"\) or "access"/, "an Update keeps its physical id: never a replacement");
+});
+
+test("access.json names the reads only one switch uses, so the updater asks for them only while that switch is on", () => {
+  assert.deepEqual(ACCESS.Metadata.CoderHelm.reads, JSON.parse(JSON.stringify(BOUNDARY_OPTION_READS)));
+  assert.equal(ACCESS.Metadata.CoderHelm.kind, "access");
+  // The updater's own copy for an access.json from before the metadata is the same.
+  const updater = fs.readFileSync(path.join(__dirname, "..", "..", "..", "lambda", "updater", "handler.py"), "utf8");
+  const block = updater.slice(updater.indexOf("OPTION_READS = {"), updater.indexOf("}", updater.indexOf("OPTION_READS = {")) + 1);
+  for (const [opt, pats] of Object.entries(BOUNDARY_OPTION_READS)) {
+    assert.ok(block.includes(`"${opt}"`), opt);
+    for (const p of pats) assert.ok(block.includes(`"${p}"`), `${opt}: ${p}`);
   }
 });

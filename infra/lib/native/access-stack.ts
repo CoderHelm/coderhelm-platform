@@ -15,6 +15,14 @@
  *   permissions: the stack has no service role. No CoderHelm role may
  *   create, change or delete a stack of that name (TheAccessStackStays).
  *
+ * A newer release's permissions reach an install that already has the stack
+ * by an update of it with the newer access.json (Settings, System: Open the
+ * stack, Update, Replace existing template, the URL): never a delete and a
+ * new one. Every release keeps the stack's logical ids, types and fixed
+ * names (ACCESS_SHAPE), so an update changes each resource in place, and the
+ * custom resource's Version is the release, so every update with a newer
+ * template runs the writer again.
+ *
  * Its custom resource (lambda/native-access/handler.py) writes each document
  * that differs: a new default version of each boundary, the deploy role's
  * inline policy. Its function and role are named outside the install's
@@ -22,6 +30,7 @@
  * (NoIamOutsideTheInstall, OnlyTheInstallsOwn).
  */
 import * as fs from "fs";
+import { BOUNDARY_OPTION_READS } from "../access";
 import { repoPath } from "../paths";
 import { Json } from "./package";
 import { DEPLOY_BOUNDARY_ARN, deployRolePolicy, nativeBoundaryDoc, nativeNames, parameters, sub, subInstall } from "./parent";
@@ -33,6 +42,18 @@ export const ACCESS_WRITER_NAME = "CoderHelmAccess-${Stage}";
 
 /** The launch parameters the documents use; the updater's Launch link fills them from the parent stack. */
 export const ACCESS_PARAMETERS = ["Stage", "AdminEmail", "EmailFrom", "StatusId"];
+
+/**
+ * What stays the same in every release's access.json, so an admin's update of
+ * the stack with a newer one changes each resource in place (a new logical id,
+ * a new type or a new fixed name would replace it, and a replaced writer role
+ * or function is a delete and create AWS may refuse while the old one exists).
+ */
+export const ACCESS_SHAPE = {
+  WriterRole: { Type: "AWS::IAM::Role", RoleName: ACCESS_WRITER_NAME },
+  Writer: { Type: "AWS::Lambda::Function", FunctionName: ACCESS_WRITER_NAME },
+  Access: { Type: "Custom::Access" },
+} as const;
 
 export function writerPolicy(): Json {
   const n = nativeNames();
@@ -68,7 +89,9 @@ export function buildAccess(version: string, writerCode?: string): Json {
       "(an install's updates can't change them). It writes a new version of coderhelm-<name>-boundary-stack and " +
       "coderhelm-<name>-deploy-boundary-stack and the deploy role's policy, only where they differ. Deleting this stack changes nothing. " +
       "docs.coderhelm.com/self-host/security",
-    Metadata: { CoderHelm: { version, kind: "access" } },
+    // reads: the boundary's reads only one switch of the AWS card uses (access.ts),
+    // so the updater asks an admin for them only when that switch is on.
+    Metadata: { CoderHelm: { version, kind: "access", reads: BOUNDARY_OPTION_READS } },
     Parameters: Object.fromEntries(ACCESS_PARAMETERS.map((p) => [p, all[p]])),
     Conditions: { HasEmailFrom: { "Fn::Not": [{ "Fn::Equals": [{ Ref: "EmailFrom" }, ""] }] } },
     Resources: {
@@ -97,6 +120,8 @@ export function buildAccess(version: string, writerCode?: string): Json {
         Type: "Custom::Access",
         Properties: {
           ServiceToken: { "Fn::GetAtt": ["Writer", "Arn"] },
+          // The release: an update of the stack with a newer access.json always
+          // changes it, so CloudFormation sends the writer an Update every time.
           Version: version,
           Boundary: { Arn: sub(n.boundaryArn), Document: boundary },
           DeployBoundary: { Arn: sub(DEPLOY_BOUNDARY_ARN), Document: boundary },
