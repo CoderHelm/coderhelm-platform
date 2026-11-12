@@ -1102,13 +1102,17 @@ pub async fn get_rec_notify(
 ) -> Result<Json<Value>, StatusCode> {
     claims.require_role(3)?;
     let item = rec_notify_item(&state, &claims.team_id).await?;
-    let mode = item
+    let saved = item
         .get("notify_mode")
         .and_then(|v| v.as_s().ok())
         .cloned()
-        .unwrap_or_else(|| "off".to_string());
+        .unwrap_or_default();
+    // Never saved: the team's alert channel, the same default the senders
+    // apply (`common::log_findings::effective_mode`).
+    let mode = common::log_findings::effective_mode(&saved).to_string();
     Ok(Json(json!({
         "notify_mode": mode,
+        "saved": !saved.trim().is_empty(),
         "webhooks": common::notify::store::view(&item),
     })))
 }

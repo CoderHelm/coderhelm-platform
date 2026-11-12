@@ -761,7 +761,76 @@ pub async fn get_autofix(
         Utc::now(),
     )
     .await;
-    Ok(Json(json!({ "autofix": cfg, "runs_today": today })))
+    // Where its fix PRs post, in words: the dashboard says it next to the
+    // switch. Never a webhook URL.
+    let posts_to = lf::load_posts_to(&state.dynamo, &state.config.settings_table_name, team).await;
+    Ok(Json(
+        json!({ "autofix": cfg, "runs_today": today, "posts_to": posts_to }),
+    ))
+}
+
+/// A fix PR from a log finding merged or closed: the follow-up card where its
+/// first card posted ([`lf::announce_fix_closed`]). Called from the GitHub
+/// webhook with the PR's run; does nothing for any other run. Best effort.
+#[allow(clippy::too_many_arguments)]
+pub async fn on_fix_pr_closed(
+    state: &AppState,
+    team_id: &str,
+    run: &HashMap<String, AttributeValue>,
+    owner: &str,
+    name: &str,
+    pr_number: u64,
+    pr_url: &str,
+    merged: bool,
+) {
+    let ticket_id = run
+        .get("ticket_id")
+        .and_then(|v| v.as_s().ok())
+        .map(String::as_str)
+        .unwrap_or("");
+    if !lf::is_log_ticket(ticket_id) {
+        return;
+    }
+    let table = &state.config.settings_table_name;
+    let Some(ticket) = lf::load_ticket(&state.dynamo, table, team_id, ticket_id).await else {
+        return;
+    };
+    let cipher = super::alerts::cipher(state);
+    let channels = lf::channels(&state.dynamo, &cipher, table, team_id).await;
+    let cards = lf::DynamoFixCards {
+        dynamo: &state.dynamo,
+        table,
+    };
+    let base = common::public_urls::app_url(&state.config.stage);
+    let started = std::time::Instant::now();
+    if let Some(sent) = lf::announce_fix_closed(
+        &cards,
+        &common::notify::Http(&state.http),
+        &channels,
+        team_id,
+        &ticket,
+        &format!("{owner}/{name}"),
+        pr_number,
+        pr_url,
+        merged,
+        &lf::finding_url(base, &ticket.rec_id),
+    )
+    .await
+    {
+        info!(
+            team_id,
+            pr_number, merged, "Posted the log fix PR's follow-up"
+        );
+        common::deliveries::record_chat(
+            &state.dynamo,
+            table,
+            team_id,
+            "log_fix_pr_closed",
+            &sent,
+            started.elapsed().as_millis() as u64,
+        )
+        .await;
+    }
 }
 
 async fn save_autofix(state: &AppState, team: &str, cfg: &AutoFix, by: &str) -> Result<(), Reply> {

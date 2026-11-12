@@ -136,6 +136,10 @@ pub enum Binding {
     CodeGraph,
     /// The team's daily alert token budget.
     AlertBudget,
+    /// Automatic fix PRs for log findings: the switch of the team's
+    /// `LOG_AUTOFIX` setting (`crate::log_findings::AutoFix`); a write keeps
+    /// the rest of it (severity, daily limit, log groups).
+    LogAutofix,
 }
 
 /// One managed setting.
@@ -736,6 +740,20 @@ pub static REGISTRY: &[Entry] = &[
         "alerts",
         B::AlertBudget,
     )),
+    entry(
+        "logs.autofix.enabled",
+        F::Alerts,
+        "Automatic fix PRs for log findings",
+        "CoderHelm opens a fix PR for new critical log findings, up to 3 a day, and posts it to the alerts channel.",
+        Team,
+        (crate::log_findings::AUTOFIX_SK, "enabled"),
+        V07,
+        Acts,
+        R::Detector,
+        BOOL,
+        "alerts",
+        B::LogAutofix,
+    ),
     // ── Code graph ──
     policy(
         primary(entry(
@@ -851,6 +869,7 @@ pub fn row(e: &Entry, repo: &str) -> String {
         B::GitConvention(_) => crate::git_conventions::SETTINGS_SK.to_string(),
         B::CodeGraph => crate::code_graph::config_sk(repo),
         B::AlertBudget => crate::alert_budget::SK.to_string(),
+        B::LogAutofix => crate::log_findings::AUTOFIX_SK.to_string(),
     }
 }
 
@@ -966,6 +985,14 @@ fn graph_value(item: Option<&Item>) -> Current {
     }
 }
 
+fn log_autofix_value(item: Option<&Item>) -> Current {
+    Current {
+        value: Value::Bool(crate::log_findings::AutoFix::from_item(item).enabled),
+        stored: item.is_some(),
+        row: item.is_some(),
+    }
+}
+
 fn budget_value(item: Option<&Item>) -> Current {
     let saved = crate::alert_budget::saved(item);
     Current {
@@ -986,6 +1013,7 @@ pub fn default_value(e: &Entry) -> Value {
         B::GitConvention(f) => git_value(None, f).value,
         B::CodeGraph => graph_value(None).value,
         B::AlertBudget => budget_value(None).value,
+        B::LogAutofix => log_autofix_value(None).value,
     }
 }
 
@@ -1038,6 +1066,9 @@ pub async fn read(store: &dyn Store, e: &Entry, repo: &str) -> Result<Current, S
                 .as_ref(),
         ),
         B::AlertBudget => budget_value(store.get(crate::alert_budget::SK).await?.as_ref()),
+        B::LogAutofix => {
+            log_autofix_value(store.get(crate::log_findings::AUTOFIX_SK).await?.as_ref())
+        }
     })
 }
 
@@ -1294,6 +1325,29 @@ pub async fn write(
             store.put(item).await.map_err(store_err)?;
             Ok(vec![])
         }
+        B::LogAutofix => {
+            use crate::log_findings as lf;
+            let on = value.as_bool().unwrap_or(false);
+            let mut cfg = lf::AutoFix::from_item(
+                store.get(lf::AUTOFIX_SK).await.map_err(store_err)?.as_ref(),
+            );
+            // As the Logs page saves it: `enabled_at` moves only when it is
+            // turned on, so the backlog never gets fix PRs.
+            cfg.enabled_at = match (on, cfg.enabled) {
+                (true, false) => ctx.now.clone(),
+                (true, true) => cfg.enabled_at,
+                (false, _) => String::new(),
+            };
+            cfg.enabled = on;
+            cfg.validate().map_err(WriteError::Invalid)?;
+            let json = serde_json::to_string(&cfg).map_err(|e| store_err(e.to_string()))?;
+            store
+                .put(config_item(&team, lf::AUTOFIX_SK, &json, ctx.by, &ctx.now))
+                .await
+                .map_err(store_err)?;
+            store.index(lf::AUTOFIX_INDEX).await.map_err(store_err)?;
+            Ok(vec![])
+        }
     }
 }
 
@@ -1365,6 +1419,7 @@ pub fn page_name(e: &Entry) -> &'static str {
         B::GitConvention(_) => "Workflow",
         B::CodeGraph => "Code graph",
         B::AlertBudget => "Alerts",
+        B::LogAutofix => "Logs",
     }
 }
 

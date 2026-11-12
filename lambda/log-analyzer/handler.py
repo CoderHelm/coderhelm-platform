@@ -1212,8 +1212,18 @@ def open_channels(team_id, item):
     return out
 
 
+def effective_mode(saved):
+    """The findings' notify mode: a setting never saved follows the team's
+    alert channel ("team"); a saved "off" or "custom" stands. Matches
+    common::log_findings::effective_mode."""
+    saved = (saved or "").strip()
+    return saved or "team"
+
+
 def pick_channels(mode, own, team, team_enabled):
-    """The channels new recommendations post to. Off unless the team turned it on."""
+    """The channels new recommendations post to: the team's alert channel
+    unless the team chose its own channels or off."""
+    mode = effective_mode(mode)
     if mode == "custom":
         return own
     if mode == "team" and team_enabled:
@@ -1383,7 +1393,7 @@ def notify_new_recommendations(team_id, account_id, recs):
         return
     try:
         own = settings_table.get_item(Key={"pk": team_id, "sk": REC_NOTIFY_SK}).get("Item") or {}
-        mode = own.get("notify_mode", "off")
+        mode = effective_mode(own.get("notify_mode"))
         if mode == "off":
             return
         team = settings_table.get_item(Key={"pk": team_id, "sk": TEAM_CHANNEL_SK}).get("Item") or {}

@@ -723,16 +723,14 @@ Return ONLY the markdown body text."#,
             .to_string();
         info!(pr_number = number, pr_url = %url, "PR created");
         if let Some(t) = &log_ticket {
-            super::log_autofix::notify_pr(
-                state,
-                &msg.team_id,
-                t,
-                &format!("{}/{}", msg.repo_owner, msg.repo_name),
+            let pr = common::log_findings::FixPr {
+                repo: format!("{}/{}", msg.repo_owner, msg.repo_name),
                 number,
-                &title,
-                &url,
-            )
-            .await;
+                title: title.clone(),
+                url: url.clone(),
+                change: common::log_findings::change_line(clean_body),
+            };
+            super::log_autofix::notify_pr(state, &msg.team_id, t, &pr).await;
         } else if common::security_fixes::is_ticket(&msg.ticket_id) {
             super::security_fixes::on_pr_opened(state, github, msg, number, &url).await;
         } else if matches!(msg.source, TicketSource::Alert) {

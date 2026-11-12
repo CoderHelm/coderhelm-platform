@@ -116,6 +116,10 @@ pub struct RepoFacts {
     /// The open pull requests whose timelines weren't read.
     #[serde(default)]
     pub open_not_read: usize,
+    /// Log groups the Logs page saved this repo for (their code lives here).
+    /// Not sent to the AI read.
+    #[serde(default, skip_serializing)]
+    pub log_groups: Vec<String>,
 }
 
 impl RepoFacts {

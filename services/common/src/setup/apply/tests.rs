@@ -1037,3 +1037,42 @@ async fn stale_cleanup_applied_by_setup_is_the_row_the_sweep_and_page_read() {
     assert!(!s.changed_ids.contains(&"stale_prs.enabled".to_string()));
     assert!(!s.changed_ids.contains(&"stale_prs.dry_run".to_string()));
 }
+
+#[tokio::test]
+async fn turning_on_log_fix_prs_keeps_the_rest_of_the_setting() {
+    use crate::log_findings::{self as lf, AutoFix, Severity};
+    let all = all_repos();
+    let store = MemoryStore::new(T);
+    let e = registry::get("logs.autofix.enabled").unwrap();
+    assert_eq!(e.scope, registry::Scope::Team);
+    assert_eq!(registry::default_value(e), json!(false));
+    // A team that chose warnings and 5 a day keeps both.
+    let saved = AutoFix {
+        min_severity: Severity::Warning,
+        daily_cap: 5,
+        ..AutoFix::default()
+    };
+    store
+        .put(crate::setup::store::config_item(
+            T,
+            lf::AUTOFIX_SK,
+            &serde_json::to_string(&saved).unwrap(),
+            "x",
+            "y",
+        ))
+        .await
+        .unwrap();
+    registry::write(&store, e, &ctx(REPO, &all), &json!(true))
+        .await
+        .unwrap();
+    let now = AutoFix::from_item(store.get(lf::AUTOFIX_SK).await.unwrap().as_ref());
+    assert!(now.enabled);
+    assert_eq!((now.min_severity, now.daily_cap), (Severity::Warning, 5));
+    assert_eq!(now.enabled_at, "2026-11-11T00:00:00Z");
+    assert!(store.indexes().contains(&lf::AUTOFIX_INDEX.to_string()));
+    registry::write(&store, e, &ctx(REPO, &all), &json!(false))
+        .await
+        .unwrap();
+    let off = AutoFix::from_item(store.get(lf::AUTOFIX_SK).await.unwrap().as_ref());
+    assert!(!off.enabled && off.enabled_at.is_empty());
+}

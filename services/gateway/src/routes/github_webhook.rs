@@ -1969,6 +1969,18 @@ async fn handle_pull_request(
         record_secondary_pr_outcome(state, team_id, item, owner, name, pr_number, merged).await;
     }
     if let Some(item) = found.as_ref() {
+        // A fix PR from a log finding: its follow-up card.
+        super::log_findings::on_fix_pr_closed(
+            state,
+            team_id,
+            item,
+            owner,
+            name,
+            pr_number,
+            payload["pull_request"]["html_url"].as_str().unwrap_or(""),
+            merged,
+        )
+        .await;
         let run_id = item
             .get("run_id")
             .and_then(|v| v.as_s().ok())

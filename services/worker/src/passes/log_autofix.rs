@@ -420,16 +420,15 @@ pub async fn run(state: &WorkerState) -> Result<Report, String> {
     Ok(report)
 }
 
-/// The follow-up when a fix run from a log finding opens its pull request:
-/// posted where the team's findings post (Teams, Slack). Best effort.
+/// The card when a fix run from a log finding opens its pull request
+/// (started automatically or by a person): posted where the findings post,
+/// which is the team's alert channel unless the team chose otherwise. Posts
+/// once per finding ([`lf::announce_fix_pr`]). Best effort.
 pub async fn notify_pr(
     state: &WorkerState,
     team_id: &str,
     ticket: &lf::TicketRecord,
-    repo: &str,
-    number: u64,
-    title: &str,
-    url: &str,
+    pr: &lf::FixPr,
 ) {
     let cipher = common::mcp_credentials::Kms {
         client: &state.kms,
@@ -443,25 +442,52 @@ pub async fn notify_pr(
     )
     .await;
     if channels.is_empty() {
+        info!(
+            team_id,
+            pr = pr.number,
+            "No channel for log findings; the fix PR card isn't posted"
+        );
         return;
     }
+    let finding = lf::load_finding(
+        &state.dynamo,
+        &state.config.aws_insights_table_name,
+        team_id,
+        &ticket.rec_id,
+    )
+    .await
+    .ok()
+    .flatten();
     let base = super::skills::app_url(&state.config.stage);
-    let finding_url = if ticket.rec_id.is_empty() {
-        format!("{base}/logs")
-    } else {
-        format!("{base}/logs?finding={}", ticket.rec_id)
+    let finding_url = lf::finding_url(base, &ticket.rec_id);
+    let cards = lf::DynamoFixCards {
+        dynamo: &state.dynamo,
+        table: &state.config.settings_table_name,
     };
-    let msg = lf::fix_message(ticket, repo, number, title, url, &finding_url);
-    common::notify::deliver_recorded(
+    let started = std::time::Instant::now();
+    if let Some(sent) = lf::announce_fix_pr(
+        &cards,
         &common::notify::Http(&state.http),
         &channels,
-        &msg,
-        "log_fix_pr",
-        &state.dynamo,
-        &state.config.settings_table_name,
         team_id,
+        ticket,
+        finding.as_ref(),
+        pr,
+        &finding_url,
+        Utc::now(),
     )
-    .await;
+    .await
+    {
+        common::deliveries::record_chat(
+            &state.dynamo,
+            &state.config.settings_table_name,
+            team_id,
+            "log_fix_pr",
+            &sent,
+            started.elapsed().as_millis() as u64,
+        )
+        .await;
+    }
 }
 
 #[cfg(test)]
