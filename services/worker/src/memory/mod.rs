@@ -69,6 +69,7 @@ fn open_db(
 /// Pinned memories (id, content), at most [`MAX_PINNED`], found through the
 /// engine's tag index instead of loading every memory. The tag is checked
 /// again on the loaded memory in case the index lags a write.
+#[cfg(test)]
 fn pinned_memories(db: &MenteDb) -> Vec<(String, String)> {
     pinned_nodes(db)
         .into_iter()
