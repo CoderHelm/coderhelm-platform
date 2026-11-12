@@ -249,41 +249,7 @@ pub async fn run(
             }
             if !branch.is_empty() && may_update {
                 // The run's ticket, so the merge commit carries its real key.
-                let ticket_msg = crate::models::TicketMessage {
-                    github_wait: Default::default(),
-                    team_id: msg.team_id.clone(),
-                    installation_id: msg.installation_id,
-                    source: if ticket.2 > 0 {
-                        TicketSource::Github
-                    } else {
-                        TicketSource::Jira
-                    },
-                    ticket_id: ticket.0.clone(),
-                    title: ticket.1.clone(),
-                    body: String::new(),
-                    repo_owner: msg.repo_owner.clone(),
-                    repo_name: msg.repo_name.clone(),
-                    issue_number: ticket.2,
-                    sender: String::new(),
-                    requester: None,
-                    base_branch,
-                    image_attachments: vec![],
-                    continuation: 0,
-                    continuation_run_id: None,
-                    first_attempt_ms: 0,
-                    resume_from: None,
-                    retry_of_run: false,
-                    model_retries: 0,
-                    ticket_type: None,
-                    ticket_update_note: None,
-                    ticket_history_note: None,
-                    plan_cache_key: None,
-                    team_instructions: String::new(),
-                    coder_learning: String::new(),
-                    person_direction: None,
-                    answers: Vec::new(),
-                    new_run_id: None,
-                };
+                let ticket_msg = run_ticket_message(&msg, &ticket, base_branch);
                 if let Some(ask) = &update_ask {
                     let (line, pushed) = super::branch_update::run(
                         state,
@@ -378,29 +344,38 @@ pub async fn run(
     if resume_owns_ci && msg.review_id == 0 {
         info!(run_id = %msg.run_id, status = %run_status, "Run is awaiting CI / running — resume owns CI, not attaching CI failures");
     }
-    let mut ci_failure_block = if msg.review_id == 0 && !resume_owns_ci {
+    // The failing checks (names, and the log the fix reads).
+    let (failing_checks, ci_logs) = if msg.review_id == 0 && !resume_owns_ci {
         let branch = get_pr_branch(state, &msg).await.unwrap_or_default();
-        match fetch_ci_failures(&github, &msg, &branch).await {
-            Some(logs) => format!(
-                "\n## CI Failures\nThe following CI checks are failing. Fix these issues as well:\n\n```\n{}\n```\n",
-                if logs.len() > 12000 { format!("... (truncated)\n{}", common::tail_str(&logs, 12000)) } else { logs }
-            ),
-            None => String::new(),
-        }
+        fetch_ci_failures(&github, &msg, &branch)
+            .await
+            .unwrap_or_default()
     } else {
+        Default::default()
+    };
+    let mut ci_failure_block = if ci_logs.is_empty() {
         String::new()
+    } else {
+        format!(
+            "\n## CI Failures\nThe following CI checks are failing. Fix these issues as well:\n\n```\n{}\n```\n",
+            if ci_logs.len() > 12000 { format!("... (truncated)\n{}", common::tail_str(&ci_logs, 12000)) } else { ci_logs.clone() }
+        )
     };
 
     // CI fixing riding along with a human comment is still an automated fix:
-    // it draws from the same per-run auto-fix budget as CI-only cycles (claimed
-    // below). Out of budget → answer the human, leave CI to a person.
+    // it draws from the same per-run rounds as CI-only cycles (claimed below),
+    // by the supervisor's rule. When the rounds are over, the person's
+    // comment is still answered, without the CI fix.
     let ci_only_cycle = comments.is_empty() && msg.review_body.trim().is_empty();
-    if !ci_failure_block.is_empty()
-        && !ci_only_cycle
-        && !super::claim_auto_fix_slot(state, &msg.team_id, &msg.run_id).await
-    {
-        info!(run_id = %msg.run_id, "Auto-fix budget spent — answering feedback without the CI fix");
-        ci_failure_block.clear();
+    let mut ci_rung = super::supervisor::Rung::Continue;
+    if !ci_failure_block.is_empty() && !ci_only_cycle {
+        match super::claim_auto_fix_round(state, &msg.team_id, &msg.run_id, &failing_checks).await {
+            super::AutoFix::Round(rung) => ci_rung = rung,
+            other => {
+                info!(run_id = %msg.run_id, ?other, "No CI fix round — answering feedback without the CI fix");
+                ci_failure_block.clear();
+            }
+        }
     }
 
     let has_ci_failures = !ci_failure_block.is_empty();
@@ -464,18 +439,43 @@ pub async fn run(
 
     // CI-ONLY churn (no unanswered human comment or review to answer — the
     // all-empty case already returned above, so reaching here with both empty
-    // means CI failures are the sole driver) is the automated-fix path. Draw it
-    // from the durable budget so a PR that structurally can't go green (e.g.
-    // codegen that can't run in the sandbox) can't churn forever. Human feedback
-    // is ALWAYS honored, never budget-gated. The claim is atomic, so concurrent
-    // feedback webhooks for one run can't overshoot the cap.
-    if comments.is_empty()
-        && msg.review_body.trim().is_empty()
-        && !super::claim_auto_fix_slot(state, &msg.team_id, &msg.run_id).await
-    {
-        end_auto_fix_rounds(state, &github, &msg).await;
-        return Ok(());
+    // means CI failures are the sole driver) is the automated-fix path, under
+    // the supervisor's rule (`claim_auto_fix_round`): rounds go on while
+    // checks that were red turn green, up to twice the cap and below the
+    // spend ceiling; a round without progress changes approach; when the
+    // rounds are over the run ends with what fails and why
+    // (`end_auto_fix_rounds`), never waiting on a comment. Human feedback is
+    // ALWAYS honored, never budget-gated. The claim is a compare-and-set, so
+    // concurrent feedback webhooks for one run can't take the same round.
+    if comments.is_empty() && msg.review_body.trim().is_empty() {
+        match super::claim_auto_fix_round(state, &msg.team_id, &msg.run_id, &failing_checks).await {
+            super::AutoFix::Round(rung) => ci_rung = rung,
+            super::AutoFix::End(why) => {
+                end_auto_fix_rounds(
+                    state,
+                    &github,
+                    &msg,
+                    &ticket,
+                    &failing_checks,
+                    &ci_logs,
+                    &why,
+                    &usage,
+                    start.elapsed().as_secs(),
+                )
+                .await;
+                return Ok(());
+            }
+            super::AutoFix::Busy => {
+                info!(run_id = %msg.run_id, "Another invocation holds this CI round — nothing to do here");
+                return Ok(());
+            }
+        }
     }
+    // A round without progress changes approach (`supervisor::next_rung`).
+    ci_failure_block.push_str(&super::supervisor::round_instruction(
+        ci_rung,
+        &format!("the failing checks ({})", failing_checks.join(", ")),
+    ));
     // A person asked for this: the run guard's counts start over. A cycle only
     // CI asked for is a pass like any other, and the guard can stop it.
     if comments.is_empty() && msg.review_body.trim().is_empty() {
@@ -943,7 +943,12 @@ Rules:
         vec![serde_json::json!({"type": "text", "text": prompt})],
     )];
 
-    let model_id = provider.primary_model_id();
+    // A round on the ladder's escalate rung takes the strongest model.
+    let model_id = if ci_rung == super::supervisor::Rung::Escalate {
+        provider.implement_model_id("complex")
+    } else {
+        provider.primary_model_id()
+    };
     let mut response = provider::converse(
         state,
         &provider,
@@ -3430,12 +3435,13 @@ pub(crate) fn failed_check_lines(failed: &[&serde_json::Value]) -> String {
     out
 }
 
-/// Check CI status for a PR branch. Returns Some(logs) if there are failures, None if CI is green or absent.
+/// Check CI status for a PR branch. Returns the failing checks' names and
+/// their logs if there are failures, None if CI is green or absent.
 async fn fetch_ci_failures(
     github: &GitHubClient,
     msg: &FeedbackMessage,
     branch: &str,
-) -> Option<String> {
+) -> Option<(Vec<String>, String)> {
     if branch.is_empty() {
         return None;
     }
@@ -3457,6 +3463,12 @@ async fn fetch_ci_failures(
     if failed.is_empty() {
         return None;
     }
+    let names: Vec<String> = failed
+        .iter()
+        .map(|r| r["name"].as_str().unwrap_or("check").to_string())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
 
     // Try to get workflow run logs for the first failed check
     let workflow_run_id = failed
@@ -3469,7 +3481,7 @@ async fn fetch_ci_failures(
             .get_workflow_run_logs(&msg.repo_owner, &msg.repo_name, workflow_run_id)
             .await
         {
-            return Some(logs);
+            return Some((names, logs));
         }
     }
 
@@ -3479,13 +3491,14 @@ async fn fetch_ci_failures(
         .await
     {
         if !annotations.is_empty() {
-            return Some(annotations);
+            return Some((names, annotations));
         }
     }
 
     // Last resort: the failed checks' names, and for a commit status (CI
     // outside GitHub Actions) what it said and where its log is.
-    Some(failed_check_lines(&failed))
+    let lines = failed_check_lines(&failed);
+    Some((names, lines))
 }
 
 /// Make sure the run's PR is open before feedback work starts, reattaching or
@@ -3497,109 +3510,130 @@ const CANCEL_PR_CLOSED_BY_HUMAN: &str = "pr_closed_by_human";
 
 /// Whether the run has been cancelled (consistent read — cancel must win
 /// against a racing pass).
-/// End the automated CI fix rounds on a PR once their budget is spent.
+/// End the CI-only fix rounds on a PR once the supervisor's rule ends them
+/// (`claim_auto_fix_round` gave `AutoFix::End`): the same ending as the
+/// run's own CI loop (`resume::end_red_ci_rounds`). What broke the checks
+/// comes out first (back to the last green head, else the last planned
+/// task, deferred and named on the pull request) and CI decides again;
+/// when nothing can come out, the run ends failed with what fails and why.
+/// Never "a comment starts the next round": nothing waits on a person.
 ///
-/// Ordering matters for crash-safety. The RELIABLE, idempotent signals run
-/// first — mark the PR ready and finalize the run (cancel-guarded, clearing the
-/// stale partial/error marker) — so that even if this invocation dies mid-way,
-/// the human still sees a ready PR and a redelivery just repeats these no-ops.
-/// The explanatory note + PR comment run LAST, gated by an atomic
-/// `handoff_notified` marker so repeated webhooks on the now-finalized run don't
-/// spam the PR. If the comment is lost to a crash, the PR is already marked
-/// ready — the worst case is a missing comment, never a stuck draft.
-async fn end_auto_fix_rounds(state: &WorkerState, github: &GitHubClient, msg: &FeedbackMessage) {
+/// Once per head: a later webhook on the same red head finds the marker
+/// and does nothing, so the pull request and the ticket hear it once.
+#[allow(clippy::too_many_arguments)]
+async fn end_auto_fix_rounds(
+    state: &WorkerState,
+    github: &GitHubClient,
+    msg: &FeedbackMessage,
+    ticket: &(String, String, u64),
+    failing: &[String],
+    logs: &str,
+    why: &str,
+    usage: &TokenUsage,
+    duration: u64,
+) {
     use aws_sdk_dynamodb::types::AttributeValue;
 
-    // Respect a cancel (best-effort early out; the status write below is also
-    // cancel-guarded for the race window).
+    // Respect a cancel (best-effort early out; the endings below are
+    // cancel-guarded too).
     if run_is_cancelled(state, &msg.team_id, &msg.run_id).await {
         return;
     }
-
-    // (1) Reliable signal: un-draft the PR. Idempotent (no-ops if already ready).
-    crate::passes::resume::mark_pr_ready(
-        state,
-        &msg.team_id,
-        github,
-        &msg.repo_owner,
-        &msg.repo_name,
-        msg.pr_number,
-    )
-    .await;
-
-    // (2) Finalize the run — completed, stale error cleared, never clobbering a
-    // cancel. Safe to repeat on redelivery.
-    let now = chrono::Utc::now().to_rfc3339();
-    let wrote = state
+    let branch = get_pr_branch(state, msg).await.unwrap_or_default();
+    let head = super::round::branch_head(github, &msg.repo_owner, &msg.repo_name, &branch).await;
+    let first = state
         .dynamo
         .update_item()
         .table_name(&state.config.runs_table_name)
         .key("team_id", AttributeValue::S(msg.team_id.clone()))
         .key("run_id", AttributeValue::S(msg.run_id.clone()))
-        .update_expression(
-            "SET #s = :s, status_run_id = :sri, updated_at = :t REMOVE error_message, #err",
-        )
-        .condition_expression(common::run_status::not_ended("#s"))
-        .expression_attribute_names("#s", "status")
-        .expression_attribute_names("#err", "error")
-        .expression_attribute_values(":s", AttributeValue::S("completed".to_string()))
-        .expression_attribute_values(
-            ":sri",
-            AttributeValue::S(format!("completed#{}", msg.run_id)),
-        )
-        .expression_attribute_values(":t", AttributeValue::S(now))
-        .ended_values()
+        .update_expression("SET auto_fix_end_head = :h")
+        .condition_expression("attribute_not_exists(auto_fix_end_head) OR auto_fix_end_head <> :h")
+        .expression_attribute_values(":h", AttributeValue::S(head.clone()))
         .send()
         .await
         .is_ok();
-    if wrote {
-        super::webhooks::emit_run(state, &msg.team_id, &msg.run_id, "completed").await;
+    if !first {
+        info!(run_id = %msg.run_id, head = %head, "CI fix rounds already ended on this head");
+        return;
     }
-    // When it was handed off (the first time only), for the weekly summary.
-    super::record_ci_outcome(
+    warn!(run_id = %msg.run_id, why, "CI fix rounds end: what broke the checks comes out, or the run fails with what fails");
+    let base_branch = resolve_pr_base(github, msg).await;
+    let ticket_msg = run_ticket_message(msg, ticket, base_branch);
+    let url = format!(
+        "https://github.com/{}/{}/pull/{}",
+        msg.repo_owner, msg.repo_name, msg.pr_number
+    );
+    let excerpt = super::resume::failure_excerpt(logs);
+    if let Err(e) = super::resume::end_red_ci_rounds(
         state,
-        &msg.team_id,
+        &ticket_msg,
         &msg.run_id,
-        super::CiOutcome::HandedOff(super::GaveUp::NoChange),
+        github,
+        (&branch, msg.pr_number, &url),
+        usage,
+        duration,
+        failing,
+        &excerpt,
+        &auto_fix_rounds_tried(why),
     )
-    .await;
-
-    // (3) Explain ONCE. The marker write wins for exactly one invocation; a
-    // redelivered/concurrent event sees the marker and skips (no PR spam). Done
-    // last so a crash here can't suppress the reliable signals above.
-    let first_notify = state
-        .dynamo
-        .update_item()
-        .table_name(&state.config.runs_table_name)
-        .key("team_id", AttributeValue::S(msg.team_id.clone()))
-        .key("run_id", AttributeValue::S(msg.run_id.clone()))
-        .update_expression("SET handoff_notified = :true")
-        .condition_expression("attribute_not_exists(handoff_notified)")
-        .expression_attribute_values(":true", AttributeValue::Bool(true))
-        .send()
-        .await
-        .is_ok();
-    if first_notify {
-        warn!(run_id = %msg.run_id, "Auto-fix budget spent: CI fix rounds stop on this pull request");
-        let note = auto_fix_spent_note();
-        super::add_progress_note(state, &msg.team_id, &msg.run_id, &note).await;
-        let _ = github
-            .create_issue_comment(&msg.repo_owner, &msg.repo_name, msg.pr_number, &note)
-            .await;
+    .await
+    {
+        warn!(run_id = %msg.run_id, error = %e, "Could not end the CI fix rounds");
     }
 }
 
-/// What CoderHelm says when its CI fix rounds on a pull request are spent:
-/// what it did, where the pull request stands, and what starts the next
-/// round. Never a hand-off.
-fn auto_fix_spent_note() -> String {
-    format!(
-        "CoderHelm ran {} fix rounds on this pull request's CI and it is still red; the failing \
-         checks are listed on the pull request, which stays held until they pass. CoderHelm \
-         stops starting rounds on its own here so the pull request doesn't loop, and a comment \
-         naming a change starts the next round right away.",
-        super::MAX_AUTO_FIX_PUSHES
-    )
+/// What the CI-only fix rounds tried, as the failing-checks section and the
+/// run's failure name it: how many rounds, and why they ended.
+pub(crate) fn auto_fix_rounds_tried(why: &str) -> Vec<String> {
+    vec![format!(
+        "CoderHelm's CI fix rounds on this pull request, each with a different approach once one \
+         made no progress; they ended after {why}"
+    )]
+}
+
+/// The run's ticket as a message, for the passes that work on the pull
+/// request (the conflict merge, the end of the CI fix rounds).
+fn run_ticket_message(
+    msg: &FeedbackMessage,
+    ticket: &(String, String, u64),
+    base_branch: String,
+) -> crate::models::TicketMessage {
+    crate::models::TicketMessage {
+        github_wait: Default::default(),
+        team_id: msg.team_id.clone(),
+        installation_id: msg.installation_id,
+        source: if ticket.2 > 0 {
+            TicketSource::Github
+        } else {
+            TicketSource::Jira
+        },
+        ticket_id: ticket.0.clone(),
+        title: ticket.1.clone(),
+        body: String::new(),
+        repo_owner: msg.repo_owner.clone(),
+        repo_name: msg.repo_name.clone(),
+        issue_number: ticket.2,
+        sender: String::new(),
+        requester: None,
+        base_branch,
+        image_attachments: vec![],
+        continuation: 0,
+        continuation_run_id: None,
+        first_attempt_ms: 0,
+        resume_from: None,
+        retry_of_run: false,
+        model_retries: 0,
+        ticket_type: None,
+        ticket_update_note: None,
+        ticket_history_note: None,
+        plan_cache_key: None,
+        team_instructions: String::new(),
+        coder_learning: String::new(),
+        person_direction: None,
+        answers: Vec::new(),
+        new_run_id: None,
+    }
 }
 
 /// A person ended the run (cancelled or closed it): no feedback runs on it.

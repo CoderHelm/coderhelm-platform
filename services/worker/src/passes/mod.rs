@@ -405,9 +405,10 @@ async fn try_auto_continue(
     }
 }
 
-/// Hard, signature-INDEPENDENT ceiling on how many times the automated post-PR
-/// loops (CI-fix, review-fix, feedback) may push a fix to a PR before it is
-/// handed to a human. This is the backstop for thrash that (a) mutating-error
+/// The cap on how many times the automated post-PR loops (CI-fix,
+/// review-fix, feedback) push a fix to a PR. Past it, rounds go on only
+/// while they make progress, up to twice it (`claim_auto_fix_round`,
+/// `supervisor::next_round`); then the run ends with what fails and why. This is the backstop for thrash that (a) mutating-error
 /// stall detection can't catch (each cycle emits different errors, so the
 /// signature never repeats) and (b) a dropped resume ("run already running")
 /// lets bypass the per-cycle counter while the uncapped feedback loop keeps
@@ -423,13 +424,24 @@ pub(crate) const MAX_AUTO_FIX_PUSHES: u32 = 8;
 /// increment are ONE conditional write, so concurrent invocations (feedback is
 /// unserialized: several webhooks for one run can run at once) can never
 /// overshoot the cap. Returns true if a slot was claimed (proceed with the fix),
-/// false if the budget is spent (hand off to a human). Fails CLOSED: a
+/// false if the budget is spent (no round). Fails CLOSED: a
 /// non-ConditionalCheckFailed error also returns false, because the feedback
 /// path has NO other cap (no per-cycle counter, no wall-clock) and failing open
 /// there would resurrect the exact unbounded churn this prevents. A transient
-/// DynamoDB blip therefore causes an early, RECOVERABLE hand-off — strictly
-/// safer than thrash.
+/// DynamoDB blip therefore skips a round — strictly safer than thrash.
 pub(crate) async fn claim_auto_fix_slot(state: &WorkerState, team_id: &str, run_id: &str) -> bool {
+    claim_auto_fix_slot_upto(state, team_id, run_id, MAX_AUTO_FIX_PUSHES).await
+}
+
+/// [`claim_auto_fix_slot`] up to `max` pushes: a caller that already
+/// decided, by the supervisor's rule, that rounds past the cap make progress
+/// claims up to [`supervisor::ceiling`].
+pub(crate) async fn claim_auto_fix_slot_upto(
+    state: &WorkerState,
+    team_id: &str,
+    run_id: &str,
+    max: u32,
+) -> bool {
     match state
         .dynamo
         .update_item()
@@ -439,18 +451,143 @@ pub(crate) async fn claim_auto_fix_slot(state: &WorkerState, team_id: &str, run_
         .update_expression("ADD auto_fix_pushes :one")
         .condition_expression("attribute_not_exists(auto_fix_pushes) OR auto_fix_pushes < :max")
         .expression_attribute_values(":one", attr_n(1))
-        .expression_attribute_values(":max", attr_n(u64::from(MAX_AUTO_FIX_PUSHES)))
+        .expression_attribute_values(":max", attr_n(u64::from(max)))
         .send()
         .await
     {
         Ok(_) => true,
         Err(e) => {
             if !format!("{e:?}").contains("ConditionalCheckFailed") {
-                warn!(run_id, error = %e, "auto-fix slot claim errored — failing closed (hand off)");
+                warn!(run_id, error = %e, "auto-fix slot claim errored — failing closed (no round)");
             }
             false
         }
     }
+}
+
+/// What the supervisor's rule gives a CI fix round outside the run's own CI
+/// loop (the CI-only rounds on a finished run's pull request, an E2E
+/// failure sent back to the run).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AutoFix {
+    /// Take the round, with this rung's approach.
+    Round(supervisor::Rung),
+    /// The rounds are over (`supervisor::RoundStep::End`): the run ends with
+    /// what fails and why.
+    End(String),
+    /// Another invocation is taking a round now, or the record couldn't be
+    /// read: no round from this one, and nothing ends.
+    Busy,
+}
+
+/// The supervisor's rule for the next CI fix round after the run's own CI
+/// loop: `rounds` pushes taken, `before` the checks failing at the last
+/// round, `failing` those failing now, `stalled` rounds in a row without
+/// progress, `spent` the run's spend.
+pub(crate) fn auto_fix_step(
+    rounds: u32,
+    before: &[String],
+    failing: &[String],
+    stalled: u32,
+    spent: f64,
+) -> supervisor::RoundStep {
+    supervisor::next_round(&supervisor::RoundFacts {
+        rounds,
+        cap: MAX_AUTO_FIX_PUSHES,
+        progressed: supervisor::ci_progress(before, failing),
+        stalled,
+        core: true,
+        spent_usd: spent,
+        cap_usd: run_ceiling::MAX_RUN_SPEND_USD,
+    })
+}
+
+/// Claims a CI fix round by the supervisor's rule (`supervisor::next_round`
+/// over the run's automatic pushes, `MAX_AUTO_FIX_PUSHES` as the cap):
+/// rounds go on while checks that were red turn green (`failing` is what
+/// fails now, compared with what failed at the last round), up to twice the
+/// cap and below the run's spend ceiling, and a round without progress
+/// climbs the ladder. The read and the write are one compare-and-set on the
+/// push count, so concurrent invocations can't both take the same round.
+pub(crate) async fn claim_auto_fix_round(
+    state: &WorkerState,
+    team_id: &str,
+    run_id: &str,
+    failing: &[String],
+) -> AutoFix {
+    let spent = run_ceiling::load(state, team_id, run_id)
+        .await
+        .map(|t| t.spend_usd)
+        .unwrap_or(0.0);
+    for _ in 0..2 {
+        let item = match state
+            .dynamo
+            .get_item()
+            .table_name(&state.config.runs_table_name)
+            .key("team_id", attr_s(team_id))
+            .key("run_id", attr_s(run_id))
+            .projection_expression("auto_fix_pushes, auto_fix_failing, auto_fix_stalled")
+            .consistent_read(true)
+            .send()
+            .await
+        {
+            Ok(o) => o.item.unwrap_or_default(),
+            Err(e) => {
+                warn!(run_id, error = %e, "Could not read the run's fix rounds — no round now");
+                return AutoFix::Busy;
+            }
+        };
+        let n = |k: &str| {
+            item.get(k)
+                .and_then(|v| v.as_n().ok())
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(0)
+        };
+        let rounds = n("auto_fix_pushes");
+        let before: Vec<String> = item
+            .get("auto_fix_failing")
+            .and_then(|v| v.as_s().ok())
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default();
+        let step = auto_fix_step(rounds, &before, failing, n("auto_fix_stalled"), spent);
+        let (rung, stalled) = match step {
+            supervisor::RoundStep::End { why } => return AutoFix::End(why),
+            supervisor::RoundStep::Round { rung, stalled } => (rung, stalled),
+        };
+        let seen = if rounds == 0 {
+            "(attribute_not_exists(auto_fix_pushes) OR auto_fix_pushes = :seen)"
+        } else {
+            "auto_fix_pushes = :seen"
+        };
+        let wrote = state
+            .dynamo
+            .update_item()
+            .table_name(&state.config.runs_table_name)
+            .key("team_id", attr_s(team_id))
+            .key("run_id", attr_s(run_id))
+            .update_expression(
+                "SET auto_fix_failing = :f, auto_fix_stalled = :s ADD auto_fix_pushes :one",
+            )
+            .condition_expression(seen)
+            .expression_attribute_values(
+                ":f",
+                attr_s(&serde_json::to_string(failing).unwrap_or_default()),
+            )
+            .expression_attribute_values(":s", attr_n(u64::from(stalled)))
+            .expression_attribute_values(":one", attr_n(1))
+            .expression_attribute_values(":seen", attr_n(u64::from(rounds)))
+            .send()
+            .await;
+        match wrote {
+            Ok(_) => return AutoFix::Round(rung),
+            Err(e) if format!("{e:?}").contains("ConditionalCheckFailed") => continue,
+            Err(e) => {
+                warn!(run_id, error = %e, "Could not claim a fix round — no round now");
+                return AutoFix::Busy;
+            }
+        }
+    }
+    AutoFix::Busy
 }
 
 /// TTL for the per-run WRITER slot, in seconds. Slightly past the 960s

@@ -16,20 +16,23 @@
 //! - The run takes them in a review-fix round (`run_fix_round`), pushes,
 //!   and the next review of the new head resolves the threads the commit
 //!   settled and rewrites the section, or removes it when nothing is left.
-//! - It goes on while the rounds make progress (fewer open findings, or a
-//!   round that pushed changes), for at most [`MAX_FIX_ROUNDS`] rounds. Two
-//!   rounds in a row without progress, or the cap, stop it ([`next`]): the
-//!   findings stay listed, the PR stays a draft, and the run waits on a
-//!   person (`needs_input`). Uncapped, two runs spent $29 in 17 rounds
-//!   where the count of open findings went down by one and back up.
+//! - It goes on by the supervisor's rule ([`next`],
+//!   `supervisor::next_round`): while the rounds make progress (fewer open
+//!   findings, or a round that pushed changes) up to twice
+//!   [`MAX_FIX_ROUNDS`] and below the run's spend ceiling. A round without
+//!   progress changes approach (one finding only, a fresh context with
+//!   small edits, a re-split, the strongest model). When the rounds end, the
+//!   findings still open are deferred with the reason ([`defer_findings`]):
+//!   they move from "Open review findings" to "Deferred" on the pull
+//!   request, the run finishes, and the draft is held only while required
+//!   checks are red. Uncapped, two runs once spent $29 in 17 rounds where
+//!   the count of open findings went down by one and back up; the ceiling
+//!   and the progress rule keep that bound, and nothing waits on a person.
 //! - A finished run's PR held on its findings never waits on a round
 //!   nothing queued. The ready decision queues one review-fix round for
 //!   them, once per head, while the run has rounds left ([`round_left`]),
-//!   and waits for it; with none left, or once a round ran on the head and
-//!   the findings are still there, the hold names what a person does
-//!   ([`person_todo`]) and promises no CoderHelm work. A PR once stayed a
-//!   draft for days on "CoderHelm fixes them in its review rounds" after its
-//!   run had spent its fix budget.
+//!   and waits for it; when the run's rounds are over ([`rounds_over`]) the
+//!   findings are deferred the same way instead of held for a person.
 //! - Each round is told what the rounds before it found and looked up
 //!   ([`round_note`], [`fix_feedback`]), so it doesn't repeat the same
 //!   database and live-data lookups from scratch.
@@ -37,7 +40,6 @@
 //! People's PRs are unchanged: the findings are posted for the author.
 
 use super::review_agent::{Evidence, Finding};
-use super::steps;
 
 pub const START: &str = "<!-- coderhelm:open-findings -->";
 pub const END: &str = "<!-- /coderhelm:open-findings -->";
@@ -159,10 +161,10 @@ pub fn fixing_why(n: usize) -> String {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RoundBudget {
     pub status: String,
-    /// The run guard stopped the run: a person has it.
+    /// The run guard stopped the run.
     pub guard_open: bool,
-    /// The run itself stopped its rounds and handed the findings to a
-    /// person (`own_review_handed`).
+    /// The run's own rounds on its findings ended and deferred what was
+    /// left (`own_review_handed`).
     pub handed: bool,
     /// Fix rounds taken on the own review's findings.
     pub rounds: u32,
@@ -172,11 +174,43 @@ pub struct RoundBudget {
     pub cycles: usize,
     /// The head a round was last queued for (`own_fix_head`).
     pub queued_head: String,
+    /// Findings open at the run's last review (`own_review_open`).
+    pub open_before: Option<usize>,
+    /// Findings open now, when the caller knows them: fewer than
+    /// `open_before` is progress, which earns rounds past the caps.
+    pub open_now: Option<usize>,
+}
+
+/// Whether the run's rounds on its findings are over, by the supervisor's
+/// rule: `Some(why)` when they are (the run ended them, or the caps are
+/// reached without progress, or the ceilings are), and what is open is then
+/// deferred with that reason.
+pub fn rounds_over(b: &RoundBudget, max_pushes: u32, max_cycles: usize) -> Option<String> {
+    use super::supervisor::{ceiling, may_extend};
+    if b.handed {
+        return Some("the run's fix rounds on its own review's findings ended".into());
+    }
+    let progressed = matches!((b.open_before, b.open_now), (Some(was), Some(now)) if now < was);
+    if !may_extend(b.rounds, MAX_FIX_ROUNDS, progressed) {
+        return Some(format!(
+            "the run took its fix rounds on its own review's findings ({} while they made \
+             progress, up to {})",
+            b.rounds,
+            ceiling(MAX_FIX_ROUNDS)
+        ));
+    }
+    let cycles = u32::try_from(b.cycles).unwrap_or(u32::MAX);
+    let max_cycles = u32::try_from(max_cycles).unwrap_or(u32::MAX);
+    if !may_extend(b.pushes, max_pushes, progressed) || !may_extend(cycles, max_cycles, progressed)
+    {
+        return Some("the run's automatic fix budget is spent".into());
+    }
+    None
 }
 
 /// Whether a fix round may be queued now for the findings on `head`:
 /// `Err` names why not, for the log. The round counts against the same
-/// budgets the run's own rounds draw on.
+/// budgets the run's own rounds draw on ([`rounds_over`]).
 pub fn round_left(
     b: &RoundBudget,
     head: &str,
@@ -193,16 +227,8 @@ pub fn round_left(
     if b.guard_open {
         return Err("the run guard stopped the run".into());
     }
-    if b.handed {
-        return Err("the run stopped its rounds and handed the findings to a person".into());
-    }
-    if b.rounds >= MAX_FIX_ROUNDS {
-        return Err(format!(
-            "the run took its {MAX_FIX_ROUNDS} fix rounds on its own review's findings"
-        ));
-    }
-    if b.pushes >= max_pushes || b.cycles >= max_cycles {
-        return Err("the run's automatic fix budget is spent".into());
+    if let Some(why) = rounds_over(b, max_pushes, max_cycles) {
+        return Err(why);
     }
     if b.queued_head == head {
         return Err("a fix round already ran on this head".into());
@@ -210,8 +236,9 @@ pub fn round_left(
     Ok(())
 }
 
-/// Fix rounds a run takes on its own review's findings before it hands the
-/// PR to a person with the findings still listed.
+/// The cap on fix rounds a run takes on its own review's findings. Past it,
+/// rounds go on only while they make progress, up to twice it
+/// (`supervisor::next_round`); then what is open is deferred.
 pub const MAX_FIX_ROUNDS: u32 = 2;
 
 /// What follows a review of CoderHelm's own PR.
@@ -219,66 +246,95 @@ pub const MAX_FIX_ROUNDS: u32 = 2;
 pub enum Next {
     /// Nothing is open: the PR may be marked ready and the merge armed.
     Ready,
-    /// Another fix round, with this many rounds without progress before it.
-    Fix { stalled: u32 },
-    /// Two rounds in a row made no progress, or [`MAX_FIX_ROUNDS`] rounds
-    /// ran: the run stops, the findings stay listed and the PR stays a
-    /// draft.
-    Stop(String),
+    /// Another fix round, with this many rounds without progress before it
+    /// and the ladder's approach for it.
+    Fix {
+        stalled: u32,
+        rung: super::supervisor::Rung,
+    },
+    /// The rounds are over: what is open is deferred with this reason
+    /// ([`finish_reason`], [`defer_findings`]) and the run finishes.
+    Finish { why: String },
 }
 
-/// What follows. `before`: the findings open at the previous review of
-/// this run (`None` at the first); `after`: those open now;
-/// `pushed_files`: what the last fix round changed; `stalled`: rounds
-/// without progress so far; `rounds`: fix rounds this run already took.
+/// Whether what is left is core work: a finding in a readme or the docs is
+/// not, and is deferred first when rounds stall.
+fn core_left(items: &[String]) -> bool {
+    items.iter().any(|i| {
+        let path = i
+            .rsplit_once("(`")
+            .map(|(_, p)| p.trim_end_matches(')').trim_end_matches('`'))
+            .unwrap_or("");
+        let path = path.split(':').next().unwrap_or(path);
+        super::supervisor::is_core(path, i, false)
+    })
+}
+
+/// What follows, by the supervisor's rule (`supervisor::next_round`).
+/// `before`: the findings open at the previous review of this run (`None`
+/// at the first); `after`: those open now; `pushed_files`: what the last fix
+/// round changed; `stalled`: rounds without progress so far; `rounds`: fix
+/// rounds this run already took; `spent_usd`: the run's spend.
 pub fn next(
     before: Option<usize>,
     after: &[String],
     pushed_files: usize,
     stalled: u32,
     rounds: u32,
+    spent_usd: f64,
 ) -> Next {
+    use super::supervisor::{findings_progress, next_round, RoundFacts, RoundStep};
     if after.is_empty() {
         return Next::Ready;
     }
-    let progress = before.is_none_or(|b| after.len() < b) || pushed_files > 0;
-    // A round that fixed something earns another past the cap, up to twice
-    // it (`supervisor::may_extend`): the budget follows progress.
-    if !super::supervisor::may_extend(rounds, MAX_FIX_ROUNDS, progress) {
-        return Next::Stop(cap_reason(after));
+    match next_round(&RoundFacts {
+        rounds,
+        cap: MAX_FIX_ROUNDS,
+        progressed: findings_progress(before, after.len(), pushed_files),
+        stalled,
+        core: core_left(after),
+        spent_usd,
+        cap_usd: super::run_ceiling::MAX_RUN_SPEND_USD,
+    }) {
+        RoundStep::Round { rung, stalled } => Next::Fix { stalled, rung },
+        RoundStep::End { why } => Next::Finish { why },
     }
-    if progress {
-        return Next::Fix { stalled: 0 };
-    }
-    let stalled = stalled.saturating_add(1);
-    if steps::stops_for_stall(stalled) {
-        return Next::Stop(stop_reason(after));
-    }
-    Next::Fix { stalled }
 }
 
-/// Why the fix rounds stopped, with the findings still open.
-pub fn stop_reason(items: &[String]) -> String {
-    let list: Vec<String> = items.iter().map(|i| format!("- {i}")).collect();
-    format!(
-        "Stopped: {} fix rounds in a row didn't fix any of CoderHelm's own review findings. \
-         Still open:\n{}\nThe pull request stays a draft with these listed under \"Open review \
-         findings\".",
-        steps::MAX_STALLED_STEPS,
-        list.join("\n")
-    )
-}
-
-/// Why the fix rounds stopped at the cap, with the findings still open.
-pub fn cap_reason(items: &[String]) -> String {
+/// What the run says when its rounds on its own findings end: what is
+/// deferred and why, and that the run finishes.
+pub fn finish_reason(items: &[String], why: &str) -> String {
     let list: Vec<String> = items.iter().map(|i| format!("- [ ] {i}")).collect();
     format!(
-        "CoderHelm took its fix rounds on its own review's findings (up to {} while they made \
-         progress) and these are still open, deferred and listed under \"Open review findings\" \
-         on the pull request:\n{}",
-        MAX_FIX_ROUNDS * 2,
+        "CoderHelm's fix rounds on its own review's findings ended ({why}). These are deferred, \
+         listed under \"Deferred\" on the pull request with that reason, and the run finishes:\n{}",
         list.join("\n")
     )
+}
+
+/// The description with the open findings deferred: the "Open review
+/// findings" section (which holds the draft) removed, and each finding
+/// listed under "Deferred" with `why`. Unchanged when nothing is listed.
+pub fn defer_findings(body: &str, items: &[String], why: &str) -> String {
+    if items.is_empty() {
+        return body.to_string();
+    }
+    let mut rest = body.to_string();
+    if let (Some(a), Some(b)) = (rest.find(START), rest.find(END)) {
+        if b > a {
+            rest.replace_range(a..b + END.len(), "");
+        }
+    }
+    let rest = rest.trim().replace("\n\n\n", "\n\n");
+    let lines: Vec<String> = items
+        .iter()
+        .map(|i| format!("- {i}: deferred from CoderHelm's own review ({why})"))
+        .collect();
+    if rest.contains("## Deferred") {
+        format!("{}\n{}", rest.trim_end(), lines.join("\n"))
+    } else {
+        format!("{}\n\n## Deferred\n{}", rest.trim_end(), lines.join("\n"))
+    }
 }
 
 /// What a fix round is told: every open finding, fixed now, and what the
@@ -413,17 +469,29 @@ mod tests {
     }
 
     #[test]
-    fn rounds_go_on_while_they_make_progress_and_stop_after_two_without() {
-        let two = vec!["a".to_string(), "b".to_string()];
-        assert_eq!(next(Some(2), &[], 0, 1, 1), Next::Ready);
-        assert_eq!(next(None, &two, 0, 0, 0), Next::Fix { stalled: 0 });
-        assert_eq!(next(Some(3), &two, 0, 1, 1), Next::Fix { stalled: 0 });
-        assert_eq!(next(Some(2), &two, 4, 1, 1), Next::Fix { stalled: 0 });
-        assert_eq!(next(Some(2), &two, 0, 0, 1), Next::Fix { stalled: 1 });
-        match next(Some(2), &two, 0, 1, 1) {
-            Next::Stop(why) => {
-                assert!(why.contains("- a\n- b"));
-                assert!(why.contains("stays a draft"));
+    fn rounds_go_on_while_they_make_progress_and_change_approach_without() {
+        use super::super::supervisor::Rung;
+        let two = vec![
+            "a (`src/a.rs:1`)".to_string(),
+            "b (`src/b.rs:2`)".to_string(),
+        ];
+        let fix = |stalled, rung| Next::Fix { stalled, rung };
+        assert_eq!(next(Some(2), &[], 0, 1, 1, 0.0), Next::Ready);
+        assert_eq!(next(None, &two, 0, 0, 0, 0.0), fix(0, Rung::Continue));
+        assert_eq!(next(Some(3), &two, 0, 1, 1, 0.0), fix(0, Rung::Continue));
+        assert_eq!(next(Some(2), &two, 4, 1, 1, 0.0), fix(0, Rung::Continue));
+        // Under the cap a round without progress changes approach, never
+        // stops: one finding only, then a fresh context with small edits.
+        assert_eq!(next(Some(2), &two, 0, 0, 1, 0.0), fix(1, Rung::Narrow));
+        assert_eq!(next(Some(2), &two, 0, 1, 1, 0.0), fix(2, Rung::SwitchTools));
+        // At the cap without progress the rounds end: deferred, never a wait.
+        match next(Some(2), &two, 0, 1, MAX_FIX_ROUNDS, 0.0) {
+            Next::Finish { why } => {
+                let said = finish_reason(&two, &why);
+                assert!(said.contains("- [ ] a (`src/a.rs:1`)\n- [ ] b (`src/b.rs:2`)"));
+                assert!(said.contains("deferred"));
+                assert!(said.contains("the run finishes"));
+                assert!(!said.contains("stays a draft"));
             }
             other => panic!("{other:?}"),
         }
@@ -431,28 +499,96 @@ mod tests {
 
     #[test]
     fn rounds_go_on_past_the_cap_while_they_fix_things_then_defer_the_rest() {
+        use super::super::supervisor::Rung;
         let open = vec!["a (`x.rs:1`)".to_string(), "b (`y.rs:2`)".to_string()];
-        assert_eq!(next(Some(3), &open, 2, 0, 1), Next::Fix { stalled: 0 });
+        let go = Next::Fix {
+            stalled: 0,
+            rung: Rung::Continue,
+        };
+        assert_eq!(next(Some(3), &open, 2, 0, 1, 0.0), go);
         // At the cap, a round that fixed something earns another
         // (`supervisor::may_extend`), up to twice the cap.
-        assert_eq!(
-            next(Some(3), &open, 2, 0, MAX_FIX_ROUNDS),
-            Next::Fix { stalled: 0 }
-        );
+        assert_eq!(next(Some(3), &open, 2, 0, MAX_FIX_ROUNDS, 0.0), go);
+        assert_eq!(next(Some(3), &open, 0, 0, MAX_FIX_ROUNDS * 2 - 1, 0.0), go);
         assert!(matches!(
-            next(Some(2), &open, 0, 0, MAX_FIX_ROUNDS),
-            Next::Stop(_)
+            next(Some(2), &open, 0, 0, MAX_FIX_ROUNDS, 0.0),
+            Next::Finish { .. }
         ));
-        match next(Some(3), &open, 2, 0, MAX_FIX_ROUNDS * 2) {
-            Next::Stop(why) => {
-                assert!(why.contains("- [ ] a (`x.rs:1`)\n- [ ] b (`y.rs:2`)"));
-                assert!(why.contains("deferred"));
-                assert!(!why.contains("Handed to a person"));
-            }
+        match next(Some(3), &open, 2, 0, MAX_FIX_ROUNDS * 2, 0.0) {
+            Next::Finish { why } => assert!(why.contains("twice"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        // Near the spend ceiling the rounds end too, progress or not.
+        match next(Some(3), &open, 2, 0, 0, 190.0) {
+            Next::Finish { why } => assert!(why.contains("spend ceiling"), "{why}"),
             other => panic!("{other:?}"),
         }
         // Nothing open is ready whatever the count.
-        assert_eq!(next(Some(1), &[], 0, 0, 9), Next::Ready);
+        assert_eq!(next(Some(1), &[], 0, 0, 9, 0.0), Next::Ready);
+    }
+
+    #[test]
+    fn deferred_findings_leave_the_hold_and_are_listed_with_why() {
+        let items = vec!["A (`a.rs:1`)".to_string(), "B (`README.md`)".to_string()];
+        let body = format!("Closes #4\n\n{}\n\n## Summary\nx", section(&items));
+        assert!(hold(&body).is_some());
+        let now = defer_findings(&body, &items, "the rounds stopped closing findings");
+        assert!(hold(&now).is_none(), "{now}");
+        assert!(listed(&now).is_empty());
+        assert!(now.contains("## Summary\nx"));
+        assert!(now.contains(
+            "## Deferred\n- A (`a.rs:1`): deferred from CoderHelm's own review (the rounds \
+             stopped closing findings)"
+        ));
+        // An existing "Deferred" section gets the lines added.
+        let again = defer_findings("x\n\n## Deferred\n- t: why", &items[..1], "w");
+        assert_eq!(again.matches("## Deferred").count(), 1);
+        assert!(again.ends_with("- A (`a.rs:1`): deferred from CoderHelm's own review (w)"));
+        assert_eq!(defer_findings("x", &[], "w"), "x");
+    }
+
+    #[test]
+    fn a_finished_runs_rounds_are_over_by_the_same_rule() {
+        let base = RoundBudget {
+            status: "completed".into(),
+            ..Default::default()
+        };
+        assert_eq!(rounds_over(&base, 8, 10), None);
+        let at_cap = RoundBudget {
+            rounds: MAX_FIX_ROUNDS,
+            open_before: Some(3),
+            ..base.clone()
+        };
+        // At the cap without progress known: over.
+        assert!(rounds_over(&at_cap, 8, 10).is_some());
+        // At the cap with fewer open than at the last review: one more.
+        let closing = RoundBudget {
+            open_now: Some(2),
+            ..at_cap.clone()
+        };
+        assert_eq!(rounds_over(&closing, 8, 10), None);
+        assert_eq!(round_left(&closing, "h", 8, 10), Ok(()));
+        // The ceiling holds whatever the progress.
+        let ceiling = RoundBudget {
+            rounds: MAX_FIX_ROUNDS * 2,
+            ..closing.clone()
+        };
+        assert!(rounds_over(&ceiling, 8, 10).is_some());
+        // Pushes past their cap only while progressing, up to twice it.
+        let pushes = RoundBudget {
+            pushes: 9,
+            ..closing.clone()
+        };
+        assert_eq!(rounds_over(&pushes, 8, 10), None);
+        assert!(rounds_over(
+            &RoundBudget {
+                pushes: 16,
+                ..closing
+            },
+            8,
+            10
+        )
+        .is_some());
     }
 
     #[test]

@@ -3039,24 +3039,32 @@ pub async fn run(
             )
             .await?;
         } else {
-            // Own review findings: another round while the rounds make
-            // progress; two rounds in a row without it stop the run with the
-            // PR still a draft and the findings listed at its top.
+            // Own review findings, by the supervisor's rule: another round
+            // while the rounds make progress (up to twice the cap), a round
+            // without progress changes approach, and when the rounds end
+            // what is open is deferred and the run finishes.
             if !own_open.is_empty() {
                 let progress = own_review_progress(&run_record);
+                let spent = super::run_ceiling::load(state, &msg.team_id, &msg.run_id)
+                    .await
+                    .map(|t| t.spend_usd)
+                    .unwrap_or(0.0);
                 match super::own_review::next(
                     progress.open_before,
                     &own_open,
                     0,
                     progress.stalled,
                     progress.rounds,
+                    spent,
                 ) {
-                    super::own_review::Next::Stop(reason) => {
-                        stop_on_own_findings(
+                    super::own_review::Next::Finish { why } => {
+                        finish_on_own_findings(
                             state,
                             &ticket_msg,
+                            &github,
                             &msg.run_id,
-                            &reason,
+                            &own_open,
+                            &why,
                             &pr_url,
                             pr_number,
                             &branch,
@@ -3067,41 +3075,7 @@ pub async fn run(
                         mark_events_processed(state, &msg.run_id, &events).await;
                         return Ok(());
                     }
-                    super::own_review::Next::Fix { .. }
-                        if progress.rounds > 0
-                            && super::stop_judge::cycle_licence(
-                                state,
-                                &ticket_msg,
-                                &msg.run_id,
-                                "own_review",
-                                progress.rounds,
-                                super::own_review::MAX_FIX_ROUNDS,
-                                &super::stop_judge::evidence_lines(
-                                    "CoderHelm's own review",
-                                    &own_open,
-                                ),
-                            )
-                            .await
-                            .is_none() =>
-                    {
-                        // The stop judge found no named blocker worth another
-                        // round: the draft goes to a person with what is open.
-                        stop_on_own_findings(
-                            state,
-                            &ticket_msg,
-                            &msg.run_id,
-                            &super::own_review::cap_reason(&own_open),
-                            &pr_url,
-                            pr_number,
-                            &branch,
-                            &usage,
-                            wall_clock_secs(created_at, &start),
-                        )
-                        .await?;
-                        mark_events_processed(state, &msg.run_id, &events).await;
-                        return Ok(());
-                    }
-                    super::own_review::Next::Fix { stalled } => {
+                    super::own_review::Next::Fix { stalled, rung } => {
                         record_own_review_progress(
                             state,
                             &msg.team_id,
@@ -3111,6 +3085,15 @@ pub async fn run(
                             progress.rounds.saturating_add(1),
                         )
                         .await;
+                        review_result
+                            .summary
+                            .push_str(&super::supervisor::round_instruction(
+                                rung,
+                                &format!(
+                                    "CoderHelm's own review findings ({})",
+                                    own_open.join("; ")
+                                ),
+                            ));
                     }
                     super::own_review::Next::Ready => {}
                 }
@@ -3145,13 +3128,15 @@ pub async fn run(
                 )
                 .await;
                 if !own_open.is_empty() {
-                    // Never hand over a PR with its own review's findings
-                    // open as if it were ready: it stays a draft, listed.
-                    stop_on_own_findings(
+                    // The fix budget ended the rounds: what is open is
+                    // deferred with that reason and the run finishes.
+                    finish_on_own_findings(
                         state,
                         &ticket_msg,
+                        &github,
                         &msg.run_id,
-                        &super::own_review::stop_reason(&own_open),
+                        &own_open,
+                        "the run's automatic fix budget is spent",
                         &pr_url,
                         pr_number,
                         &branch,
@@ -3615,7 +3600,12 @@ async fn run_fix_round(
         &ctx.rules,
         &ctx.repo_instructions,
         Some(&feedback),
-        "medium",
+        // A round on the ladder's escalate rung takes the strongest model.
+        if round.feedback.contains(super::supervisor::ESCALATED) {
+            "complex"
+        } else {
+            "medium"
+        },
         &ctx.provider,
         &mut ctx.usage,
         &FileCache::default(),
@@ -5202,8 +5192,12 @@ async fn record_own_round_note(
 pub(crate) enum OwnRound {
     /// A review-fix round for them is queued or running on this head.
     Fixing,
-    /// No round will run: a person deals with them. Why, for the log.
+    /// No round runs now (the run isn't finished, a round already ran on
+    /// this head, the record couldn't be read). Why, for the log.
     Person(String),
+    /// The run's rounds on them are over (`own_review::rounds_over`): they
+    /// are deferred with this reason and hold nothing.
+    Defer(String),
 }
 
 /// The record fields that say what a finished run has left for a round on
@@ -5232,6 +5226,11 @@ pub(crate) fn own_round_budget(
         pushes: n("auto_fix_pushes"),
         cycles,
         queued_head: s(OWN_FIX_HEAD),
+        open_before: item
+            .get("own_review_open")
+            .and_then(|v| v.as_n().ok())
+            .and_then(|v| v.parse::<usize>().ok()),
+        open_now: None,
     }
 }
 
@@ -5306,10 +5305,25 @@ pub(crate) async fn queue_own_review_round(
         return OwnRound::Fixing;
     }
     let cycles = load_cycle_from_checkpoint(state, team_id, run_id).await;
-    let budget = own_round_budget(&item, cycles);
+    let mut budget = own_round_budget(&item, cycles);
+    budget.open_now = Some(items.len());
     if let Err(why) =
         super::own_review::round_left(&budget, head, super::MAX_AUTO_FIX_PUSHES, MAX_CI_FIX_CYCLES)
     {
+        // The rounds are over by the supervisor's rule: the findings are
+        // deferred, never held for a person.
+        let finished = common::run_status::COMPLETED == status
+            || common::run_status::SUCCESS == status
+            || common::run_status::NEEDS_INPUT == status;
+        if finished && !budget.guard_open {
+            if let Some(over) = super::own_review::rounds_over(
+                &budget,
+                super::MAX_AUTO_FIX_PUSHES,
+                MAX_CI_FIX_CYCLES,
+            ) {
+                return OwnRound::Defer(over);
+            }
+        }
         return OwnRound::Person(why);
     }
     let Some((ticket, branch)) = super::recheck::message_of(&item) else {
@@ -5348,8 +5362,18 @@ pub(crate) async fn queue_own_review_round(
         .expression_attribute_values(":h", attr_s(head))
         .expression_attribute_values(":zero", attr_n(0))
         .expression_attribute_values(":one", attr_n(1))
-        .expression_attribute_values(":maxr", attr_n(super::own_review::MAX_FIX_ROUNDS))
-        .expression_attribute_values(":maxp", attr_n(super::MAX_AUTO_FIX_PUSHES))
+        // `round_left` decided by the supervisor's rule; the claim keeps the
+        // ceilings (twice each cap) so two deciders can't overshoot them.
+        .expression_attribute_values(
+            ":maxr",
+            attr_n(super::supervisor::ceiling(
+                super::own_review::MAX_FIX_ROUNDS,
+            )),
+        )
+        .expression_attribute_values(
+            ":maxp",
+            attr_n(super::supervisor::ceiling(super::MAX_AUTO_FIX_PUSHES)),
+        )
         .expression_attribute_values(":t", attr_s(&now))
         .send()
         .await;
@@ -5383,7 +5407,14 @@ pub(crate) async fn queue_own_review_round(
         warn!(run_id, why = %why, "The fix round for the own review's findings couldn't be queued");
         OwnRound::Person(why)
     };
-    if !super::claim_auto_fix_slot(state, team_id, run_id).await {
+    if !super::claim_auto_fix_slot_upto(
+        state,
+        team_id,
+        run_id,
+        super::supervisor::ceiling(super::MAX_AUTO_FIX_PUSHES),
+    )
+    .await
+    {
         return give_back("the run's automatic fix budget is spent".into()).await;
     }
     let base_sha =
@@ -5428,10 +5459,10 @@ pub(crate) async fn queue_own_review_round(
         team_id,
         run_id,
         &format!(
-            "{}: a review fix round takes them (round {} of {}).",
+            "{}: a review fix round takes them (round {}; up to {} while rounds make progress).",
             super::own_review::fixing_why(items.len()),
             budget.rounds + 1,
-            super::own_review::MAX_FIX_ROUNDS
+            super::supervisor::ceiling(super::own_review::MAX_FIX_ROUNDS)
         ),
     )
     .await;
@@ -5444,15 +5475,23 @@ pub(crate) async fn queue_own_review_round(
     OwnRound::Fixing
 }
 
-/// The run stops with its own review's findings still open: it says which
-/// and why, waits on a person (`needs_input`, never `completed`), and the PR
-/// stays a draft with them listed at its top.
+/// The run's rounds on its own review's findings ended (by the
+/// supervisor's rule, `own_review::next`, or the fix budget): what is open
+/// is deferred with the reason, moved from "Open review findings" (which
+/// holds the draft) to "Deferred" on the pull request
+/// (`own_review::defer_findings`). The ready decision then holds the draft
+/// only while required checks are red, and the run finishes through the
+/// supervisor's ending (`wait_on_person`: completed with what is deferred,
+/// or failed with what fails while its checks are red). It waits on a
+/// person only for a need on the human-only list.
 #[allow(clippy::too_many_arguments)]
-async fn stop_on_own_findings(
+async fn finish_on_own_findings(
     state: &WorkerState,
     msg: &TicketMessage,
+    github: &GitHubClient,
     run_id: &str,
-    reason: &str,
+    open: &[String],
+    why: &str,
     pr_url: &str,
     pr_number: u64,
     branch: &str,
@@ -5461,10 +5500,12 @@ async fn stop_on_own_findings(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     warn!(
         run_id,
-        pr_number, "Own review findings still open — the PR stays a draft"
+        pr_number,
+        open = open.len(),
+        "Own review rounds ended — the findings left are deferred and the run finishes"
     );
     // The run's rounds on them are over: the ready decision never queues
-    // another one, and its hold names what a person does.
+    // another one.
     if let Err(e) = state
         .dynamo
         .update_item()
@@ -5477,11 +5518,43 @@ async fn stop_on_own_findings(
         .send()
         .await
     {
-        warn!(run_id, error = %e, "Could not record that the own review's rounds stopped");
+        warn!(run_id, error = %e, "Could not record that the own review's rounds ended");
     }
-    super::add_progress_note(state, &msg.team_id, run_id, reason).await;
+    let reason = super::own_review::finish_reason(open, why);
+    match github
+        .get_pull_request(&msg.repo_owner, &msg.repo_name, pr_number)
+        .await
+    {
+        Ok(p) => {
+            let body = p["body"].as_str().unwrap_or("");
+            let now = super::own_review::defer_findings(body, open, why);
+            if now != body {
+                if let Err(e) = github
+                    .update_pr_body(&msg.repo_owner, &msg.repo_name, pr_number, &now)
+                    .await
+                {
+                    warn!(run_id, error = %e, "Could not list the deferred findings on the pull request");
+                }
+            }
+        }
+        Err(e) => {
+            warn!(run_id, error = %e, "Could not read the pull request to defer the findings")
+        }
+    }
+    super::add_progress_note(state, &msg.team_id, run_id, &reason).await;
+    // The one ready decision: with the findings deferred, only red
+    // required checks hold the draft.
+    mark_pr_ready(
+        state,
+        &msg.team_id,
+        github,
+        &msg.repo_owner,
+        &msg.repo_name,
+        pr_number,
+    )
+    .await;
     wait_for_review(
-        state, msg, run_id, reason, pr_url, pr_number, branch, usage, duration,
+        state, msg, run_id, &reason, pr_url, pr_number, branch, usage, duration,
     )
     .await
 }
@@ -5584,6 +5657,100 @@ async fn hand_off_red_ci(
         duration,
     )
     .await
+}
+
+/// The CI fix rounds outside the run's own CI loop (the CI-only rounds on a
+/// finished run's pull request) ended by the supervisor's rule with checks
+/// still red: the supervisor's ending, as [`hand_off_red_ci`] has it. What
+/// broke the checks comes out first ([`revert_to_green`]), deferred and
+/// named on the pull request, and the run waits for CI on the result like
+/// any finished run. When nothing can come out the run ends failed, with
+/// the failing checks, the error and what was tried on the pull request
+/// and as the run's cause (`supervisor::end_of_rounds`); the pull request
+/// stays a draft while the checks are red. Never a wait on a person.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn end_red_ci_rounds(
+    state: &WorkerState,
+    ticket_msg: &TicketMessage,
+    run_id: &str,
+    github: &GitHubClient,
+    (branch, number, url): (&str, u64, &str),
+    usage: &TokenUsage,
+    duration: u64,
+    checks: &[String],
+    excerpt: &str,
+    tried: &[String],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let msg = ResumeMessage {
+        team_id: ticket_msg.team_id.clone(),
+        run_id: run_id.to_string(),
+        installation_id: ticket_msg.installation_id,
+        ..Default::default()
+    };
+    let pr = PrRef {
+        owner: &ticket_msg.repo_owner,
+        repo: &ticket_msg.repo_name,
+        branch,
+        number,
+        url,
+    };
+    if let Some(note) = revert_to_green(state, &msg, ticket_msg, github, &pr, excerpt).await {
+        super::add_progress_note(state, &msg.team_id, run_id, &note).await;
+        set_run_awaiting_ci(
+            state, ticket_msg, run_id, url, number, branch, usage, duration,
+        )
+        .await?;
+        return Ok(());
+    }
+    super::record_ci_outcome(
+        state,
+        &msg.team_id,
+        run_id,
+        super::CiOutcome::HandedOff(super::GaveUp::NoProgress),
+    )
+    .await;
+    let failing = if checks.is_empty() {
+        vec!["the repository's CI".to_string()]
+    } else {
+        checks.to_vec()
+    };
+    let ending = super::supervisor::end_of_rounds(&[], &tried.join("; "), &failing);
+    let section = ci_failing_section(
+        checks,
+        excerpt,
+        tried,
+        "Nothing on this branch can come out to make these checks pass, so the run ended \
+         failed with this cause; the pull request stays a draft while they fail.",
+    );
+    match github.get_pull_request(pr.owner, pr.repo, number).await {
+        Ok(p) => {
+            let body = with_ci_failing(p["body"].as_str().unwrap_or(""), &section);
+            if let Err(e) = github
+                .update_pr_body(pr.owner, pr.repo, number, &body)
+                .await
+            {
+                warn!(run_id, error = %e, "Could not write what fails on the pull request");
+            }
+        }
+        Err(e) => warn!(run_id, error = %e, "Could not read the pull request to say what fails"),
+    }
+    // The one ready decision: a failing check holds the draft, named.
+    mark_pr_ready(state, &msg.team_id, github, pr.owner, pr.repo, number).await;
+    let reason = format!(
+        "{}. {}",
+        ci_failing_reason(checks, excerpt, tried.len()),
+        tried.join("; ")
+    );
+    if ending != super::supervisor::Ending::Failed {
+        error!(
+            run_id,
+            ?ending,
+            "Red checks after the rounds must end the run failed"
+        );
+    }
+    warn!(run_id, reason = %reason, "CI stays red after the fix rounds and nothing can come out: the run failed");
+    super::fail_run(state, ticket_msg, run_id, &reason, usage, duration).await;
+    Ok(())
 }
 
 /// What a revert writes (each path with its content, or `None` to remove

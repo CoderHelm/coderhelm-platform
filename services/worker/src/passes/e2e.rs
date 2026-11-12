@@ -758,6 +758,21 @@ pub(crate) async fn run_for_branch(
     Some((get("run_id"), get("status")))
 }
 
+/// What the pull request is told when CoderHelm's fix rounds on its E2E
+/// failures end: what still fails, and why the rounds ended. No hand-off.
+fn e2e_rounds_ended_note(caused: &[&Line], why: &str) -> String {
+    format!(
+        "These E2E failures may come from this change, and CoderHelm's fix rounds on them ended \
+         ({why}). Each round tried a different approach once one made no progress. Still \
+         failing:\n\n{}",
+        caused
+            .iter()
+            .map(|l| format!("- {}", l.text))
+            .collect::<Vec<_>>()
+            .join("\n")
+    )
+}
+
 /// What happens when E2E fails on a PR Coderhelm opened: fix what the change
 /// broke; otherwise confirm with one re-run and say why, once.
 async fn own_pr_failures(
@@ -814,23 +829,36 @@ async fn own_pr_failures(
             info!(pr, run_id, "E2E failure left to the run's own CI-fix loop");
             return;
         }
-        if !super::claim_auto_fix_slot(state, &msg.team_id, &run_id).await {
-            super::record_ci_outcome(
-                state,
-                &msg.team_id,
-                &run_id,
-                super::CiOutcome::HandedOff(super::GaveUp::Budget),
-            )
-            .await;
-            let body = format!(
-                "These E2E failures may come from this change. CoderHelm has used the automatic fix rounds this PR has, so it doesn't start another on its own; a comment naming a change starts the next one right away:\n\n{}",
-                caused.iter().map(|l| format!("- {}", l.text)).collect::<Vec<_>>().join("\n")
-            );
-            let _ = gh
-                .create_issue_comment(&msg.repo_owner, &msg.repo_name, pr, &body)
+        // The same rounds as every CI fix after the run, by the supervisor's
+        // rule: on while failures turn green, a new approach when a round
+        // makes no progress, and when they end the pull request says what
+        // fails and why, never "a comment starts the next one".
+        let failing: Vec<String> = caused.iter().map(|l| l.title.clone()).collect();
+        let rung = match super::claim_auto_fix_round(state, &msg.team_id, &run_id, &failing).await {
+            super::AutoFix::Round(rung) => rung,
+            super::AutoFix::Busy => {
+                info!(
+                    pr,
+                    run_id, "E2E fix round not claimed now (busy or unreadable)"
+                );
+                return;
+            }
+            super::AutoFix::End(why) => {
+                super::record_ci_outcome(
+                    state,
+                    &msg.team_id,
+                    &run_id,
+                    super::CiOutcome::HandedOff(super::GaveUp::NoProgress),
+                )
                 .await;
-            return;
-        }
+                let body = e2e_rounds_ended_note(&caused, &why);
+                super::add_progress_note(state, &msg.team_id, &run_id, &body).await;
+                let _ = gh
+                    .create_issue_comment(&msg.repo_owner, &msg.repo_name, pr, &body)
+                    .await;
+                return;
+            }
+        };
         let body = format!(
             "E2E tests failed on this PR's commit `{sha}` and nothing outside this change explains them (they aren't known to be flaky and they pass on `{main}`). Fix the application code this PR changed so these tests pass. Do not change, skip or loosen the tests themselves unless the test is plainly wrong about the intended behaviour, and say so if it is.\n\n{items}\n\nRun: {url}",
             sha = msg.head_sha.get(..7).unwrap_or(&msg.head_sha),
@@ -845,7 +873,7 @@ async fn own_pr_failures(
                 .collect::<Vec<_>>()
                 .join("\n"),
             url = run.url,
-        );
+        ) + &super::supervisor::round_instruction(rung, "these E2E failures");
         let fb = FeedbackMessage {
             github_wait: Default::default(),
             team_id: msg.team_id.clone(),

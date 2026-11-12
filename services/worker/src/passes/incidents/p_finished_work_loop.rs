@@ -317,7 +317,7 @@ fn every_pass_continuation_and_round_goes_through_the_guard() {
     let cont = fn_of(
         src,
         "\nasync fn try_auto_continue(",
-        "\n/// Hard, signature-INDEPENDENT",
+        "\npub(crate) const MAX_AUTO_FIX_PUSHES",
     );
     assert!(
         cont.find("run_guard::on_continuation(").unwrap() < cont.find(".send_message()").unwrap()

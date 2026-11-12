@@ -171,7 +171,7 @@ fn every_round_budget_bounds_it() {
                 handed: true,
                 ..base.clone()
             },
-            "handed the findings to a person",
+            "fix rounds on its own review's findings ended",
         ),
         (
             RoundBudget {
@@ -247,10 +247,10 @@ fn the_pipeline_queues_the_round_and_routes_finished_runs_to_it() {
     assert!(fn_src(ready_src, "async fn fix_own_findings(").contains("queue_own_review_round("));
 
     let resume_src = include_str!("../resume.rs");
-    // The run's own stop marks its rounds as over, so none is queued after.
-    assert!(fn_src(resume_src, "async fn stop_on_own_findings(").contains("OWN_REVIEW_HANDED"));
+    // The run's own end of its rounds marks them over, so none is queued after.
+    assert!(fn_src(resume_src, "async fn finish_on_own_findings(").contains("OWN_REVIEW_HANDED"));
     let queue = fn_src(resume_src, "pub(crate) async fn queue_own_review_round(");
-    assert!(queue.contains("claim_auto_fix_slot("));
+    assert!(queue.contains("claim_auto_fix_slot_upto("));
     assert!(queue.contains("Kind::ReviewFix"));
 
     let review_src = include_str!("../review_pr.rs");

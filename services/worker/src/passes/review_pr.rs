@@ -4101,45 +4101,42 @@ async fn run_once(
                 pr = msg.pr_number,
                 "Self-review flipped from APPROVE to REQUEST_CHANGES — not re-fixing on a flip (hysteresis)"
             );
-        } else if claim_self_review_round(
-            state,
-            &msg.team_id,
-            &msg.repo_owner,
-            &msg.repo_name,
-            msg.pr_number,
-        )
-        .await
-        {
-            // Under the cap — apply the fixes. A new commit re-triggers the review.
-            feed_review_back_to_run(state, &msg, &record_body).await;
-        } else if claim_once(
-            state,
-            &msg.team_id,
-            &format!(
-                "SELFREVIEWHANDOFF#{}/{}#{:0>6}",
-                msg.repo_owner, msg.repo_name, msg.pr_number
-            ),
-        )
-        .await
-        {
-            // Cap reached — stop starting fix rounds on our own, and say so once.
-            let _ = github
-                .create_issue_comment(
-                    &msg.repo_owner,
-                    &msg.repo_name,
-                    msg.pr_number,
-                    &format!(
-                        "I've made {MAX_SELF_REVIEW_FIX_ROUNDS} fix rounds on my own review of this \
-                         PR and each round still finds something, so I stop starting rounds on my \
-                         own here. My latest findings are above, each with what fixing it takes; a \
-                         comment naming a change starts the next round right away."
-                    ),
-                )
-                .await;
-            info!(
-                pr = msg.pr_number,
-                "Self-review fix cap reached — rounds stop, findings stay on the PR"
-            );
+        } else {
+            // The convergence rule is the supervisor's: rounds go on while
+            // they close findings, up to twice the cap and below the run's
+            // spend ceiling; a round without progress changes approach; when
+            // the rounds end, what is open is deferred on the pull request
+            // with the reason and the ready decision takes it.
+            match claim_self_review_round(
+                state,
+                &msg.team_id,
+                &msg.repo_owner,
+                &msg.repo_name,
+                msg.pr_number,
+                &own_open,
+            )
+            .await
+            {
+                SelfRound::Fix(rung) => {
+                    let body = format!(
+                        "{record_body}{}",
+                        super::supervisor::round_instruction(
+                            rung,
+                            &format!("CoderHelm's own review findings ({})", own_open.join("; ")),
+                        )
+                    );
+                    feed_review_back_to_run(state, &msg, &body).await;
+                }
+                SelfRound::End(why) => {
+                    end_self_review_rounds(state, &github, &msg, &own_open, &why).await;
+                }
+                SelfRound::Busy => {
+                    info!(
+                        pr = msg.pr_number,
+                        "Self-review round not claimed now (busy or unreadable)"
+                    );
+                }
+            }
         }
     }
 
@@ -4372,42 +4369,218 @@ pub async fn review_for_run(
     }
 }
 
-/// How many self-review → self-fix rounds CoderHelm runs on its OWN PR before it
-/// gives up and hands to a human. Bounds the review↔fix loop so a flip-flopping
-/// verdict can't churn commits/reviews forever (one PR hit 67 commits / 44 reviews
-/// oscillating APPROVE↔REQUEST_CHANGES). The same cap as the run's own fix
-/// rounds (`own_review::MAX_FIX_ROUNDS`).
+/// The cap on self-review → self-fix rounds CoderHelm runs on its OWN PR. Past
+/// it, rounds go on only while they close findings, up to twice it
+/// (`supervisor::next_round`); then what is open is deferred. Bounds the
+/// review↔fix loop so a flip-flopping verdict can't churn commits/reviews
+/// forever (one PR hit 67 commits / 44 reviews oscillating
+/// APPROVE↔REQUEST_CHANGES). The same cap as the run's own fix rounds
+/// (`own_review::MAX_FIX_ROUNDS`).
 const MAX_SELF_REVIEW_FIX_ROUNDS: u32 = super::own_review::MAX_FIX_ROUNDS;
 
-/// Claim one self-review→fix round for this PR (atomic conditional increment).
-/// True while under MAX_SELF_REVIEW_FIX_ROUNDS (proceed with the fix); false once
-/// the cap is reached — or on ANY error (fail CLOSED, like claim_auto_fix_slot:
-/// never keep looping when the bound can't be confirmed). Self-expires via TTL so
-/// a genuinely fresh re-run of the ticket later starts over.
+/// What the supervisor's rule gives a self-review fix round.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SelfRound {
+    /// Take the round, with this rung's approach.
+    Fix(super::supervisor::Rung),
+    /// The rounds are over: what is open is deferred with this reason.
+    End(String),
+    /// Another review is taking a round now, or the record couldn't be
+    /// read: no round from this one, and nothing ends.
+    Busy,
+}
+
+/// The supervisor's rule for the next self-review fix round: `rounds`
+/// taken, the findings open at the last one (`open_before`) and now
+/// (`open_now`), `stalled` rounds in a row without progress, `spent` the
+/// run's spend.
+pub(crate) fn self_review_step(
+    rounds: u32,
+    open_before: Option<usize>,
+    open_now: usize,
+    stalled: u32,
+    spent: f64,
+) -> super::supervisor::RoundStep {
+    super::supervisor::next_round(&super::supervisor::RoundFacts {
+        rounds,
+        cap: MAX_SELF_REVIEW_FIX_ROUNDS,
+        progressed: super::supervisor::findings_progress(open_before, open_now, 0),
+        stalled,
+        core: true,
+        spent_usd: spent,
+        cap_usd: super::run_ceiling::MAX_RUN_SPEND_USD,
+    })
+}
+
+/// Claims one self-review → fix round for this PR by the supervisor's rule
+/// (`supervisor::next_round`): the record keeps the rounds taken, the
+/// findings open at the last one and the rounds in a row without progress,
+/// and the claim is a compare-and-set on the round count. `open` is what the
+/// review found open now. Self-expires via TTL so a genuinely fresh re-run of
+/// the ticket later starts over.
 async fn claim_self_review_round(
     state: &WorkerState,
     team_id: &str,
     owner: &str,
     repo: &str,
     pr: u64,
-) -> bool {
+    open: &[String],
+) -> SelfRound {
     let sk = format!("SELFREVIEWROUNDS#{owner}/{repo}#{pr:0>6}");
     let ttl = chrono::Utc::now().timestamp() as u64 + 3 * 86_400;
-    state
-        .dynamo
-        .update_item()
-        .table_name(&state.config.settings_table_name)
-        .key("pk", attr_s(team_id))
-        .key("sk", attr_s(&sk))
-        .update_expression("SET #ttl = :ttl ADD rounds :one")
-        .condition_expression("attribute_not_exists(rounds) OR rounds < :max")
-        .expression_attribute_names("#ttl", "ttl")
-        .expression_attribute_values(":one", attr_n(1))
-        .expression_attribute_values(":max", attr_n(u64::from(MAX_SELF_REVIEW_FIX_ROUNDS)))
-        .expression_attribute_values(":ttl", attr_n(ttl))
-        .send()
-        .await
-        .is_ok()
+    let spent = match lookup_run_by_pr(state, team_id, owner, repo, pr).await {
+        Some(run_id) => super::run_ceiling::load(state, team_id, &run_id)
+            .await
+            .map(|t| t.spend_usd)
+            .unwrap_or(0.0),
+        None => 0.0,
+    };
+    for _ in 0..2 {
+        let item = match state
+            .dynamo
+            .get_item()
+            .table_name(&state.config.settings_table_name)
+            .key("pk", attr_s(team_id))
+            .key("sk", attr_s(&sk))
+            .consistent_read(true)
+            .send()
+            .await
+        {
+            Ok(o) => o.item.unwrap_or_default(),
+            Err(e) => {
+                warn!(pr, error = %e, "Could not read the self-review rounds — no round now");
+                return SelfRound::Busy;
+            }
+        };
+        let n = |k: &str| {
+            item.get(k)
+                .and_then(|v| v.as_n().ok())
+                .and_then(|v| v.parse::<u32>().ok())
+        };
+        let rounds = n("rounds").unwrap_or(0);
+        let step = self_review_step(
+            rounds,
+            n("open").map(|v| v as usize),
+            open.len(),
+            n("stalled").unwrap_or(0),
+            spent,
+        );
+        let (rung, stalled) = match step {
+            super::supervisor::RoundStep::End { why } => return SelfRound::End(why),
+            super::supervisor::RoundStep::Round { rung, stalled } => (rung, stalled),
+        };
+        let seen = if rounds == 0 {
+            "attribute_not_exists(rounds) OR rounds = :seen"
+        } else {
+            "rounds = :seen"
+        };
+        let wrote = state
+            .dynamo
+            .update_item()
+            .table_name(&state.config.settings_table_name)
+            .key("pk", attr_s(team_id))
+            .key("sk", attr_s(&sk))
+            .update_expression("SET #ttl = :ttl, #open = :o, stalled = :s ADD rounds :one")
+            .condition_expression(seen)
+            .expression_attribute_names("#ttl", "ttl")
+            .expression_attribute_names("#open", "open")
+            .expression_attribute_values(":one", attr_n(1))
+            .expression_attribute_values(":seen", attr_n(rounds))
+            .expression_attribute_values(":o", attr_n(open.len()))
+            .expression_attribute_values(":s", attr_n(stalled))
+            .expression_attribute_values(":ttl", attr_n(ttl))
+            .send()
+            .await;
+        match wrote {
+            Ok(_) => return SelfRound::Fix(rung),
+            Err(e) if format!("{e:?}").contains("ConditionalCheckFailed") => continue,
+            Err(e) => {
+                warn!(pr, error = %e, "Could not claim a self-review round — no round now");
+                return SelfRound::Busy;
+            }
+        }
+    }
+    SelfRound::Busy
+}
+
+/// The self-review rounds on CoderHelm's own PR ended by the supervisor's
+/// rule: what is open is deferred on the pull request with the reason
+/// (`own_review::defer_findings`, so it no longer holds the draft), the
+/// pull request says so once, and the ready decision takes it (the draft
+/// stays only while required checks are red). Never "a comment starts the
+/// next round".
+async fn end_self_review_rounds(
+    state: &WorkerState,
+    github: &GitHubClient,
+    msg: &ReviewMessage,
+    open: &[String],
+    why: &str,
+) {
+    if !open.is_empty() {
+        match github
+            .get_pull_request(&msg.repo_owner, &msg.repo_name, msg.pr_number)
+            .await
+        {
+            Ok(p) => {
+                let body = p["body"].as_str().unwrap_or("");
+                let now = super::own_review::defer_findings(body, open, why);
+                if now != body {
+                    if let Err(e) = github
+                        .update_pr_body(&msg.repo_owner, &msg.repo_name, msg.pr_number, &now)
+                        .await
+                    {
+                        warn!(pr = msg.pr_number, error = %e, "Could not list the deferred findings on the pull request");
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(pr = msg.pr_number, error = %e, "Could not read the pull request to defer the findings")
+            }
+        }
+    }
+    if claim_once(
+        state,
+        &msg.team_id,
+        &format!(
+            "SELFREVIEWHANDOFF#{}/{}#{:0>6}",
+            msg.repo_owner, msg.repo_name, msg.pr_number
+        ),
+    )
+    .await
+    {
+        let _ = github
+            .create_issue_comment(
+                &msg.repo_owner,
+                &msg.repo_name,
+                msg.pr_number,
+                &self_review_end_note(open, why),
+            )
+            .await;
+    }
+    info!(
+        pr = msg.pr_number,
+        why, "Self-review rounds ended — open findings deferred"
+    );
+    super::ready::request(state, msg).await;
+}
+
+/// What the pull request is told when the self-review rounds end: what was
+/// deferred and why, and what happens next. No hand-off.
+pub(crate) fn self_review_end_note(open: &[String], why: &str) -> String {
+    if open.is_empty() {
+        return format!(
+            "CoderHelm finished its fix rounds on its own review of this pull request ({why}). \
+             The ready decision takes it from here: the draft is held only while required checks \
+             fail."
+        );
+    }
+    let list: Vec<String> = open.iter().map(|i| format!("- {i}")).collect();
+    format!(
+        "CoderHelm finished its fix rounds on its own review of this pull request ({why}). These \
+         findings are deferred, listed under \"Deferred\" in the description with that reason:\n{}\n\n\
+         The ready decision takes it from here: the draft is held only while required checks fail.",
+        list.join("\n")
+    )
 }
 
 /// Perform a one-time action for a key (e.g. post the handoff notice once).
