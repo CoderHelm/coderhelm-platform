@@ -23,7 +23,7 @@ import { ResolvedConfig } from "./config";
 import { repoPath } from "./paths";
 import { grantOwnAccountRead } from "./own-account-read";
 import { Hybrid } from "./hybrid";
-import { serviceEnvironment, modelPolicyStatements, publicUrlReadStatement, recordNameIn, setupEnvironment, setupStatements, updaterInvokeStatement, weeklySummaryScheduled } from "./service-env";
+import { serviceEnvironment, modelPolicyStatements, publicUrlReadStatement, recordNameIn, setupEnvironment, setupStatements, updaterInvokeStatement, weeklySummaryScheduled, reachStatements, REACH_PREFIX_ENV } from "./service-env";
 import { MailRelay, relaySendStatement } from "./mail-relay";
 
 interface ApiStackProps extends cdk.StackProps {
@@ -828,6 +828,8 @@ export class ApiStack extends cdk.Stack {
     // worker, named rather than referenced: the worker stack depends on this
     // one.
     this.gatewayFunction.addEnvironment("WORKER_FUNCTION_NAME", `${prefix}-worker`);
+    this.gatewayFunction.addEnvironment(REACH_PREFIX_ENV, `${prefix}-reach-`);
+    for (const st of reachStatements(prefix, this, true)) this.gatewayFunction.addToRolePolicy(st);
     this.gatewayFunction.addToRolePolicy(
       new iam.PolicyStatement({
         actions: ["lambda:InvokeFunction"],

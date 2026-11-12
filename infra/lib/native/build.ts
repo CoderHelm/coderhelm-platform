@@ -96,11 +96,12 @@ export function buildNative(version: string, outDir: string, opts: { dashboardDi
     problems.push(...checkLimits(c.name, c.template));
   }
   const helperCode = fs.readFileSync(repoPath("lambda/native-helper/handler.py"), "utf8");
+  const reachCode = fs.readFileSync(repoPath("lambda/private-reach/handler.py"), "utf8");
   const access = buildAccess(version);
   fs.writeFileSync(path.join(outDir, ACCESS_FILE), JSON.stringify(access, null, 1));
   problems.push(...checkLimits(ACCESS_FILE, access));
   const accessSha = sha256File(path.join(outDir, ACCESS_FILE));
-  const parent = buildParent({ version, children, assets, childSha, helperCode, accessSha });
+  const parent = buildParent({ version, children, assets, childSha, helperCode, reachCode, accessSha });
   fs.writeFileSync(path.join(outDir, "coderhelm.json"), JSON.stringify(parent, null, 1));
   problems.push(...checkLimits("coderhelm.json", parent));
   const files = ["coderhelm.json", ACCESS_FILE, ...children.map((c) => childKey(version, c.name).key), ...assets.map((a) => a.key)];

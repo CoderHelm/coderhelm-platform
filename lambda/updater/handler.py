@@ -2348,16 +2348,38 @@ def native_propose(store, env, version, mode, extra=None, cfn=None, opener=None)
 # about permissions (never applied without an admin's confirmation), the
 # same history row, and CloudFormation's own rollback when it fails.
 
-OPTION_PARAMS = ("InfrastructureVulnerabilities", "InspectorFindings", "HealthEvents")
+# Private networks (infra/lib/native/parent.ts, PrivateNetwork1..3) go the
+# same way: each is "" (none) or "vpc-<id>:subnet-<id>[,subnet-<id>...]", and
+# setting one adds a read-only lookup function in those subnets.
+SWITCH_PARAMS = ("InfrastructureVulnerabilities", "InspectorFindings", "HealthEvents")
+NETWORK_PARAMS = ("PrivateNetwork1", "PrivateNetwork2", "PrivateNetwork3")
+OPTION_PARAMS = SWITCH_PARAMS + NETWORK_PARAMS
 OPTION_VALUES = ("on", "off")
+# The same pattern as the stack parameter's AllowedPattern.
+NETWORK_RE = re.compile(r"^$|^vpc-[0-9a-f]{8,17}:subnet-[0-9a-f]{8,17}(,subnet-[0-9a-f]{8,17}){0,5}$")
 OPTION_NAMES = {"InfrastructureVulnerabilities": "infrastructure vulnerabilities",
-                "InspectorFindings": "Amazon Inspector findings", "HealthEvents": "AWS Health events"}
+                "InspectorFindings": "Amazon Inspector findings", "HealthEvents": "AWS Health events",
+                "PrivateNetwork1": "private network 1", "PrivateNetwork2": "private network 2", "PrivateNetwork3": "private network 3",
+                "PrivateNetworks": "private networks"}
+
+
+def option_valid(k, v):
+    return isinstance(v, str) and (NETWORK_RE.match(v) is not None if k in NETWORK_PARAMS else v in OPTION_VALUES)
+
+
+def option_on(opts, use):
+    """Whether what a switch (or every private network, "PrivateNetworks") reads is in use."""
+    if use == "PrivateNetworks":
+        return any((opts or {}).get(k) for k in NETWORK_PARAMS)
+    if use in NETWORK_PARAMS:
+        return bool((opts or {}).get(use))
+    return (opts or {}).get(use) == "on"
 
 
 def stack_options(stack):
-    """{parameter: "on" | "off" | None}: None when the stack's release has no such parameter yet."""
+    """{parameter: value | None}: None when the stack's release has no such parameter yet."""
     have = {p.get("ParameterKey"): p.get("ParameterValue") for p in stack.get("Parameters") or []}
-    return {k: (have[k] if have.get(k) in OPTION_VALUES else None) if k in have else None for k in OPTION_PARAMS}
+    return {k: (have[k] if option_valid(k, have.get(k)) else None) if k in have else None for k in OPTION_PARAMS}
 
 
 def install_options(env, cfn=None):
@@ -2380,15 +2402,25 @@ def clean_options(raw):
     for k, v in raw.items():
         if k not in OPTION_PARAMS:
             raise ValueError(f"{k} is not a switch this install has (one of {', '.join(OPTION_PARAMS)})")
-        if v not in OPTION_VALUES:
-            raise ValueError(f"{k} must be on or off")
+        if k in NETWORK_PARAMS and isinstance(v, str):
+            v = ",".join(x.strip() for x in v.strip().split(","))
+        if not option_valid(k, v):
+            raise ValueError(f"{k} must be empty or vpc-<id>:subnet-<id>[,subnet-<id>...] (one VPC, up to 6 subnets)"
+                             if k in NETWORK_PARAMS else f"{k} must be on or off")
         out[k] = v
     return out
 
 
 def options_text(changes):
     """"turn on Amazon Inspector findings" and the like, for history and notices."""
-    return "; ".join(f"turn {c['to']} {OPTION_NAMES.get(k, k)}" for k, c in sorted(changes.items()))
+    def one(k, c):
+        if k not in NETWORK_PARAMS:
+            return f"turn {c['to']} {OPTION_NAMES.get(k, k)}"
+        if not c["to"]:
+            return f"remove {OPTION_NAMES[k]}"
+        vpc, subnets = c["to"].split(":", 1)
+        return f"{'move' if c['from'] else 'add'} {OPTION_NAMES[k]} ({vpc}, subnets {subnets.replace(',', ', ')})"
+    return "; ".join(one(k, c) for k, c in sorted(changes.items()))
 
 
 def options_propose(env, version, wanted, cfn):
@@ -3016,16 +3048,20 @@ OPTION_READS = {
                                       "elasticache:Describe*", "elasticloadbalancing:Describe*", "es:Describe*", "es:List*", "rds:Describe*"],
     "InspectorFindings": ["inspector2:List*", "inspector2:BatchGetA*"],
     "HealthEvents": ["health:Describe*"],
+    "PrivateNetworks": ["ec2:*NetworkInterface*", "ec2:*PrivateIp*", "ec2:*SecurityGroup*", "ec2:CreateTags"],
 }
 # A switch a release doesn't have yet reads as its default (own-account-read.ts, OWN_OPTIONS):
 # the infrastructure reads were always on before they were a switch.
-OPTION_DEFAULTS = {"InfrastructureVulnerabilities": "on", "InspectorFindings": "off", "HealthEvents": "off"}
+OPTION_DEFAULTS = {"InfrastructureVulnerabilities": "on", "InspectorFindings": "off", "HealthEvents": "off",
+                   "PrivateNetwork1": "", "PrivateNetwork2": "", "PrivateNetwork3": ""}
+# The boundary's reads keyed by what uses them: each switch, and every private network together.
+READ_USES = SWITCH_PARAMS + ("PrivateNetworks",)
 
 
 def option_reads(access):
     """{switch: [boundary action]} from the access.json, or OPTION_READS."""
     reads = ((access.get("Metadata") or {}).get("CoderHelm") or {}).get("reads")
-    if isinstance(reads, dict) and all(k in OPTION_PARAMS and isinstance(v, list) for k, v in reads.items()):
+    if isinstance(reads, dict) and all(k in READ_USES and isinstance(v, list) for k, v in reads.items()):
         return reads
     return OPTION_READS
 
@@ -3038,7 +3074,7 @@ def read_use(action, reads):
 def access_groups(added, reads):
     """The added actions grouped by what uses them, in plain words."""
     groups = []
-    for opt in [None] + list(OPTION_PARAMS):
+    for opt in [None] + list(READ_USES):
         acts = [a for a in added if read_use(a, reads) == opt]
         if not acts:
             continue
@@ -3057,8 +3093,9 @@ def access_decide(view, options):
         return view
     opts = {k: ((options or {}).get(k) or OPTION_DEFAULTS[k]) for k in OPTION_PARAMS}
     if options is None:
-        opts = {k: "on" for k in OPTION_PARAMS}  # unreadable: never hides what may matter
-    needed = [g for g in view["adds"] if g["use"] is None or opts.get(g["use"]) == "on"]
+        # Unreadable: never hides what may matter.
+        opts = {k: ("on" if k in SWITCH_PARAMS else "unknown") for k in OPTION_PARAMS}
+    needed = [g for g in view["adds"] if g["use"] is None or option_on(opts, g["use"])]
     later = [g for g in view["adds"] if g not in needed]
     rules = view.get("rules") or []
     out = dict(view, needed=needed, later=later, options=opts)

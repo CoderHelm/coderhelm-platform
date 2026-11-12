@@ -17,6 +17,7 @@ use serde_json::{json, Map, Value};
 use super::connectors::Connector;
 use super::http::{Method, Request, Transport};
 use super::redact::{hidden_terms, redact_all};
+use super::source_errors::{for_source, Failure, SourceType};
 use super::StepError;
 
 /// Documents one search returns.
@@ -45,7 +46,7 @@ fn refused(message: impl Into<String>, fix: &str) -> StepError {
 
 /// Accepts `https://host` or `https://host:port`, no path, no credentials.
 pub fn check_endpoint(raw: &str) -> Result<String, StepError> {
-    let fix = "Paste the cluster's address, like https://search.example.com or https://search.example.com:9200";
+    let fix = "Paste the cluster's address: https://search-<domain>-<id>.<region>.es.amazonaws.com or https://vpc-<domain>-<id>.<region>.es.amazonaws.com for an AWS domain, or your own cluster's, like https://search.yourcompany.com:9200";
     let url = reqwest::Url::parse(raw.trim())
         .map_err(|_| StepError::new("reach", "That isn't a web address.", fix))?;
     let host = url.host_str().unwrap_or("").to_ascii_lowercase();
@@ -231,6 +232,12 @@ impl OpenSearch<'_> {
         body: Option<Value>,
     ) -> Result<Value, StepError> {
         let base = check_endpoint(&self.conn.site)?;
+        let host = base
+            .trim_start_matches("https://")
+            .split(':')
+            .next()
+            .unwrap_or("")
+            .to_string();
         let reply = self
             .http
             .send(Request {
@@ -242,7 +249,10 @@ impl OpenSearch<'_> {
                 ],
                 body,
             })
-            .await?;
+            .await
+            .map_err(|e| for_source(SourceType::OpenSearch, e))?;
+        let worded =
+            |f: Failure| for_source(SourceType::OpenSearch, StepError::marked(f, &host, "", ""));
         match reply.status {
             200..=299 => reply.json().ok_or_else(|| {
                 StepError::new(
@@ -251,21 +261,9 @@ impl OpenSearch<'_> {
                     "Check the address points at the cluster itself.",
                 )
             }),
-            401 => Err(StepError::new(
-                "sign_in",
-                "The cluster didn't accept the user and password.",
-                "Enter them again in Settings → Integrations.",
-            )),
-            403 => Err(StepError::new(
-                "read",
-                "That user can't read this.",
-                "Give the user read access to the index, or read one it can see.",
-            )),
-            404 => Err(StepError::new(
-                "read",
-                "No such index (or the user can't see it).",
-                "List the indexes with `search_read` action \"indexes\".",
-            )),
+            401 | 403 | 404 | 429 => {
+                Err(worded(Failure::from_status(reply.status).expect("listed")))
+            }
             400 => {
                 let why = reply
                     .json()
@@ -285,6 +283,7 @@ impl OpenSearch<'_> {
                     "Fix the query and try again.",
                 ))
             }
+            s if s >= 500 => Err(worded(Failure::ServerError)),
             s => Err(StepError::new(
                 "read",
                 format!("The cluster answered {s}."),

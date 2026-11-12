@@ -64,8 +64,9 @@ const sha = (v: unknown) => crypto.createHash("sha256").update(canon(v)).digest(
  * release notes; the dashboard then offers it as one optional item.
  */
 const ACCESS_DOCS = {
-  boundary: "46394a7a0b5a06f96c0c42a5ca3b99e8f29539754420681b0baf60e5c71c75ea",
-  deployRole: "d11f40637e639812ba5408d153351341bc593cb604726f6cb4193861c2dd7b1f",
+  // Private networks (access.ts BOUNDARY_OPTION_READS.PrivateNetworks, PRIVATE_NETWORK_DEPLOY_*).
+  boundary: "2a0bcf74a7dc5704294b908c9afba48626c2fbce5fbfc2dd3cf8e2b10e888154",
+  deployRole: "c55fb9759c36f7df55c4d8d25de2ebd792238d91a144fcd82ca5e765566a5117",
 };
 
 test("the parent carries the deploy role and both boundaries exactly as installs have them, so no update ever changes them", () => {

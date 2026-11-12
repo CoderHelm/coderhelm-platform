@@ -1404,6 +1404,14 @@ fn build_app(state: Arc<AppState>) -> Router {
         )
         .route("/data-sources/:id/test", post(routes::data_sources::test))
         .route(
+            "/data-sources/private-networks",
+            get(routes::data_sources::private_networks),
+        )
+        .route(
+            "/data-sources/:id/private-network",
+            get(routes::data_sources::private_network_plan),
+        )
+        .route(
             "/data-sources/:id/samples",
             get(routes::data_sources::samples),
         )

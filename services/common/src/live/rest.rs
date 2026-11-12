@@ -12,6 +12,7 @@ use serde_json::Value;
 use super::connectors::{clip, Connector};
 use super::http::{Method, Request, Transport};
 use super::redact::{hidden_terms, redact_all, redact_text, DEFAULT_HIDDEN};
+use super::source_errors::{for_source, Failure, SourceType};
 use super::StepError;
 
 /// Characters of a response an agent reads.
@@ -25,7 +26,7 @@ fn refused(message: impl Into<String>, fix: &str) -> StepError {
 
 /// Accepts `https://host` (an optional port), no path, query or credentials.
 pub fn check_base(raw: &str) -> Result<String, StepError> {
-    let fix = "Paste the API's base address, like https://api.example.com";
+    let fix = "Paste the API's base address, like https://api.yourcompany.com (the paths agents may read are listed separately)";
     let url = reqwest::Url::parse(raw.trim())
         .map_err(|_| StepError::new("reach", "That isn't a web address.", fix))?;
     let host = url.host_str().unwrap_or("").to_ascii_lowercase();
@@ -196,29 +197,21 @@ impl Rest<'_> {
                 ],
                 body: None,
             })
-            .await?;
+            .await
+            .map_err(|e| for_source(SourceType::Rest, e))?;
         match reply.status {
             200..=299 => {}
-            401 => {
-                return Err(StepError::new(
-                    "sign_in",
-                    "The API didn't accept the key.",
-                    "Enter the key again in Settings → Integrations.",
-                ))
-            }
-            403 => {
-                return Err(StepError::new(
-                    "read",
-                    "The key can't read that.",
-                    "Read something the key has access to.",
-                ))
-            }
-            404 => {
-                return Err(StepError::new(
-                    "read",
-                    "The API has nothing at that path.",
-                    "Paths can't be guessed. Find where the team's code calls this API (search the repos for its address or a path segment) and copy that exact path, with every parent id in it, before trying again.",
-                ))
+            s if Failure::from_status(s).is_some() => {
+                let host = base
+                    .trim_start_matches("https://")
+                    .split(':')
+                    .next()
+                    .unwrap_or("");
+                let f = Failure::from_status(s).expect("checked");
+                return Err(for_source(
+                    SourceType::Rest,
+                    StepError::marked(f, host, "", ""),
+                ));
             }
             s => {
                 return Err(StepError::new(

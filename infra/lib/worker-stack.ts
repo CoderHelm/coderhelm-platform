@@ -20,7 +20,7 @@ import { grantOwnAccountRead } from "./own-account-read";
 import * as path from "path";
 import { relaySendStatement } from "./mail-relay";
 import { logAccessTo } from "./storage-stack";
-import { serviceEnvironment, modelPolicyStatements, publicUrlReadStatement, weeklySummaryScheduled } from "./service-env";
+import { serviceEnvironment, modelPolicyStatements, publicUrlReadStatement, reachStatements, REACH_PREFIX_ENV, weeklySummaryScheduled } from "./service-env";
 
 interface WorkerStackProps extends cdk.StackProps {
   stage: string;
@@ -149,6 +149,9 @@ export class WorkerStack extends cdk.Stack {
     for (const st of [...modelPolicyStatements(cfg, this), publicUrlReadStatement(cfg, this), relaySendStatement(cfg, this.account)]) {
       if (st) this.workerFunction.addToRolePolicy(st);
     }
+    // Agents read a data source behind a private network through its function (native/parent.ts).
+    this.workerFunction.addEnvironment(REACH_PREFIX_ENV, `${prefix}-reach-`);
+    for (const st of reachStatements(prefix, this, false)) this.workerFunction.addToRolePolicy(st);
 
     // Hosted side of hybrid: the 15-minute name check reads the zone, and
     // parks a name (its address back to the holding page) with the same

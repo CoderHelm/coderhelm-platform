@@ -633,6 +633,8 @@ pub const CAPABILITIES: &[Capability] = &[
             "data_sources::create_rest",
             "data_sources::create_search",
             "data_sources::update",
+            "data_sources::private_networks",
+            "data_sources::private_network_plan",
             "data_sources::remove",
             "data_sources::replace_key",
             "data_sources::test",

@@ -13,9 +13,10 @@ use axum::{
 use common::live::api::{self, ApiSource, Check, ConnectReport};
 use common::live::aws::{self as live_aws, AwsTarget};
 use common::live::graphql::check_read_only;
-use common::live::http::Https;
+use common::live::http::{Https, Transport};
 use common::live::net::parse_endpoint;
 use common::live::opensearch::{check_endpoint, check_index, OpenSearch};
+use common::live::private_network::{self, Reach};
 use common::live::redact::{hidden_terms, is_hidden};
 use common::live::rest::{check_base, check_header, check_path, Rest, MAX_PATHS};
 use common::live::store::{self, Activity, Kind, Source};
@@ -412,6 +413,7 @@ pub async fn create(
         user: String::new(),
         indexes: Vec::new(),
         instructions: String::new(),
+        network: String::new(),
     };
     apply_report(&mut source, &report);
     save_schema(&state, &claims.team_id, &source.id, &report).await;
@@ -466,6 +468,16 @@ fn apply_reader_fields(source: &mut Source, body: &Value) -> Result<(), (StatusC
                 }
                 source.user = u.to_string();
             }
+            if let Some(n) = body["network"].as_str() {
+                let n = n.trim();
+                if !private_network::valid(n) {
+                    return Err(fail(
+                        StatusCode::BAD_REQUEST,
+                        "A private network is 1, 2 or 3 (or empty for the internet).",
+                    ));
+                }
+                source.network = n.to_string();
+            }
             if let Some(indexes) = string_list(&body["indexes"], 50) {
                 source.indexes = indexes
                     .iter()
@@ -479,59 +491,112 @@ fn apply_reader_fields(source: &mut Source, body: &Value) -> Result<(), (StatusC
     Ok(())
 }
 
+fn check_of(id: &'static str, label: &'static str, res: Result<String, StepError>) -> Check {
+    match res {
+        Ok(detail) => Check {
+            id,
+            label,
+            ok: true,
+            detail,
+            fix: None,
+        },
+        Err(e) => Check {
+            id,
+            label,
+            ok: false,
+            detail: e.message,
+            fix: Some(e.fix),
+        },
+    }
+}
+
 /// Whether a REST API or cluster answers with `key`: one GET of the first
-/// allowed path, or signing in and listing the indexes the user may read.
+/// allowed path, or signing in and reading the indexes the user may read.
+/// A cluster behind a private network is checked hop by hop from inside it
+/// first (the address, the name, TCP, TLS), then signing in, then an index
+/// read, and the first that fails is named.
 async fn reader_checks(source: &Source, key: &str) -> (bool, Vec<Check>) {
     let conn = source.reader();
-    let res: Result<String, StepError> = match source.kind {
+    let mut checks = Vec::new();
+    let reach = if source.network.is_empty() {
+        None
+    } else {
+        match Reach::new(&source.network).await {
+            Ok(r) => Some(r),
+            Err(e) => {
+                return (
+                    false,
+                    vec![check_of(
+                        "network",
+                        "Run the private network's function",
+                        Err(e),
+                    )],
+                )
+            }
+        }
+    };
+    if let Some(r) = &reach {
+        let hops = r.hops(&source.url).await;
+        let ok = !hops.is_empty() && hops.iter().all(|c| c.ok);
+        checks.extend(hops);
+        if !ok {
+            return (false, checks);
+        }
+    }
+    let http: &dyn Transport = match &reach {
+        Some(r) => r,
+        None => &Https,
+    };
+    match source.kind {
         Kind::Rest => {
             let first = source.paths.first().cloned().unwrap_or_default();
-            Rest {
+            let res = Rest {
                 conn: &conn,
                 key,
-                http: &Https,
+                http,
             }
             .get(&first, None)
             .await
-            .map(|a| format!("{} answered", a.asked))
+            .map(|a| format!("{} answered", a.asked));
+            checks.push(check_of("read", "Read with the key", res));
         }
         _ => {
             let os = OpenSearch {
                 conn: &conn,
                 password: key,
-                http: &Https,
+                http,
             };
-            match os.whoami().await {
-                Err(e) => Err(e),
-                Ok(who) => match os.indexes().await {
+            let signed_in = os.whoami().await;
+            let ok = signed_in.is_ok();
+            let mut first = check_of("sign_in", "Sign in to the cluster", signed_in);
+            if !ok && reach.is_none() {
+                // An AWS domain that was deleted, replaced or moved into a VPC: say where it is now.
+                if let Some(hint) = cluster_hint(&source.url).await {
+                    first.fix = Some(format!("{} {hint}", first.fix.unwrap_or_default()));
+                }
+            }
+            checks.push(first);
+            if ok {
+                let read = match os.indexes().await {
                     Err(e) => Err(e),
                     Ok(a) if a.text == "No shared indexes." => Err(StepError::new(
                         "read",
                         "Signed in, but the user sees none of the indexes you listed.",
                         "Check the index names, or leave the list empty to allow every index the user sees.",
                     )),
-                    Ok(_) => Ok(who),
-                },
+                    Ok(a) => Ok(format!("{} readable", common::live::count(a.text.lines().count(), "index"))),
+                };
+                checks.push(check_of("read", "Read the indexes", read));
             }
         }
-    };
-    let check = match res {
-        Ok(detail) => Check {
-            id: "read",
-            label: "Read with the key",
-            ok: true,
-            detail,
-            fix: None,
-        },
-        Err(e) => Check {
-            id: "read",
-            label: "Read with the key",
-            ok: false,
-            detail: e.message,
-            fix: Some(e.fix),
-        },
-    };
-    (check.ok, vec![check])
+    }
+    (checks.iter().all(|c| c.ok), checks)
+}
+
+/// What the install's own AWS account says about a cluster address that failed.
+async fn cluster_hint(url: &str) -> Option<String> {
+    let host = reqwest::Url::parse(url).ok()?.host_str()?.to_string();
+    private_network::domain_hint(&host).await
 }
 
 /// POST /api/data-sources/rest  { name, url, header_name, paths, key, hidden_fields?, instructions? }
@@ -620,6 +685,7 @@ async fn create_reader(
         user: String::new(),
         indexes: Vec::new(),
         instructions: String::new(),
+        network: String::new(),
     };
     apply_reader_fields(&mut source, &body)?;
     apply_guide(&mut source, &body)?;
@@ -764,6 +830,7 @@ pub async fn update(
             source.header_name.clone(),
             source.user.clone(),
             source.indexes.clone(),
+            source.network.clone(),
         );
         apply_reader_fields(&mut source, &body)?;
         let after = (
@@ -772,6 +839,7 @@ pub async fn update(
             source.header_name.clone(),
             source.user.clone(),
             source.indexes.clone(),
+            source.network.clone(),
         );
         // Where it reads changed: check it reads there before saving.
         if before != after {
@@ -1250,10 +1318,19 @@ pub async fn try_lookup(
         Kind::Search => {
             let key = open_key(&state, &claims.team_id, &source).await?;
             let conn = source.reader();
+            let http = match private_network::transport(&source.network).await {
+                Ok(t) => t,
+                Err(e) => {
+                    return Err(fail(
+                        StatusCode::BAD_REQUEST,
+                        &format!("{} {}", e.message, e.fix),
+                    ))
+                }
+            };
             let os = OpenSearch {
                 conn: &conn,
                 password: &key,
-                http: &Https,
+                http: &*http,
             };
             let index = body["index"].as_str().unwrap_or("");
             let started = std::time::Instant::now();
@@ -1672,6 +1749,7 @@ fn new_aws_source(kind: Kind, name: String, t: AwsTarget, email: &str) -> Source
         user: String::new(),
         indexes: Vec::new(),
         instructions: String::new(),
+        network: String::new(),
     }
 }
 
@@ -2034,6 +2112,106 @@ async fn create_warehouse(
     Ok(Json(
         json!({ "source": source.public_json(), "checks": checks }),
     ))
+}
+
+// ── Private networks (docs/self-host/private-networks.md) ──────────────────
+
+/// GET /api/data-sources/private-networks: the install's networks as Lambda
+/// has them (each one's VPC, subnets, security group and state).
+pub async fn private_networks(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+) -> Reply {
+    admin(&claims)?;
+    let available = private_network::function_name("1").is_some();
+    let networks = if available {
+        private_network::placements(&state.lambda).await
+    } else {
+        Vec::new()
+    };
+    Ok(Json(
+        json!({ "available": available, "networks": networks }),
+    ))
+}
+
+/// GET /api/data-sources/:id/private-network: for a search source, where its
+/// AWS domain lives (DescribeDomain with the install's own role), which
+/// network to read it through (one already in its VPC, or the next free
+/// one, with the install stack value to add it), and whether the domain's
+/// security groups already let that network in (else the one rule to add,
+/// as a console link and a command).
+pub async fn private_network_plan(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Path(id): Path<String>,
+) -> Reply {
+    admin(&claims)?;
+    let source = load(&state, &claims.team_id, &id).await?;
+    if source.kind != Kind::Search {
+        return Err(fail(
+            StatusCode::BAD_REQUEST,
+            "Only a search cluster is read through a private network today.",
+        ));
+    }
+    let available = private_network::function_name("1").is_some();
+    if !available {
+        return Ok(Json(json!({
+            "available": false,
+            "why": "This Coderhelm runs outside your AWS account, so it can't reach inside your VPC. Give the cluster a read-only https address on the internet, or run Coderhelm self-hosted in the cluster's AWS account and add a private network there.",
+        })));
+    }
+    let host = reqwest::Url::parse(&source.url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+        .unwrap_or_default();
+    let networks = private_network::placements(&state.lambda).await;
+    // The domain behind the address, or the one that replaced it when the address's domain is gone.
+    let (domain, replaced, domain_error) = match private_network::find_domain(&host).await {
+        Ok(Some((d, replaced))) => (Some(d), replaced, None),
+        Ok(None) => (None, false, None),
+        Err(e) => (None, false, Some(e)),
+    };
+    let suggestion = domain
+        .as_ref()
+        .filter(|d| d.vpc_only)
+        .map(|d| private_network::suggest(d, &networks));
+    // The network the source uses, or the one suggested that exists: is it let in?
+    let chosen = if source.network.is_empty() {
+        suggestion
+            .as_ref()
+            .filter(|s| s.exists)
+            .and_then(|s| s.network.clone())
+    } else {
+        Some(source.network.clone())
+    };
+    let mut access = Value::Null;
+    if let (Some(d), Some(n)) = (domain.as_ref(), chosen.as_deref()) {
+        if let Some(p) = networks.iter().find(|p| p.network == n) {
+            let allowed =
+                private_network::already_allowed(&d.region, &d.security_group_ids, p).await;
+            let rules: Vec<_> = d
+                .security_group_ids
+                .iter()
+                .filter_map(|g| {
+                    p.security_group_ids
+                        .first()
+                        .map(|src| private_network::rule(&d.region, g, src))
+                })
+                .collect();
+            access = json!({ "network": n, "allowed": allowed, "rules": rules });
+        }
+    }
+    Ok(Json(json!({
+        "available": true,
+        "network": source.network,
+        "networks": networks,
+        "domain": domain,
+        // True when the address's own domain is gone and `domain` has a similar name (its likely replacement).
+        "replaced": replaced,
+        "domain_error": domain_error,
+        "suggestion": suggestion,
+        "access": access,
+    })))
 }
 
 #[cfg(test)]

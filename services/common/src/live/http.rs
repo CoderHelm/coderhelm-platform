@@ -10,6 +10,7 @@ use std::time::Duration;
 use serde_json::Value;
 
 use super::net::{parse_endpoint, resolve_public};
+use super::source_errors::Failure;
 use super::StepError;
 
 const TIMEOUT: Duration = Duration::from_secs(30);
@@ -79,8 +80,9 @@ impl Transport for Https {
         let ep = parse_endpoint(&req.url)?;
         let addr = resolve_public(&ep).await?;
         let cant_reach = |e: reqwest::Error| {
-            StepError::new(
-                "reach",
+            StepError::marked(
+                failure_of(&e),
+                &ep.host,
                 format!("We couldn't reach {} ({}).", ep.host, short(&e)),
                 "Check the address and try again.",
             )
@@ -125,6 +127,31 @@ impl Transport for Https {
             status,
             body: String::from_utf8_lossy(&buf).into_owned(),
         })
+    }
+}
+
+/// What a transport error was: a timeout, a failed secure connection, or a refused one.
+fn failure_of(e: &reqwest::Error) -> Failure {
+    let mut chain = String::new();
+    let mut src: Option<&dyn std::error::Error> = Some(e);
+    while let Some(x) = src {
+        chain.push_str(&x.to_string().to_ascii_lowercase());
+        chain.push(' ');
+        src = x.source();
+    }
+    failure_of_text(e.is_timeout(), &chain)
+}
+
+fn failure_of_text(timeout: bool, chain: &str) -> Failure {
+    if timeout || chain.contains("timed out") {
+        Failure::Timeout
+    } else if ["certificate", "tls", "ssl", "handshake"]
+        .iter()
+        .any(|w| chain.contains(w))
+    {
+        Failure::Tls
+    } else {
+        Failure::Refused
     }
 }
 
@@ -264,6 +291,26 @@ mod tests {
             D14
         )
         .is_err());
+    }
+
+    #[test]
+    fn transport_failures_are_told_apart() {
+        assert_eq!(failure_of_text(true, ""), Failure::Timeout);
+        assert_eq!(
+            failure_of_text(false, "error trying to connect: operation timed out"),
+            Failure::Timeout
+        );
+        assert_eq!(
+            failure_of_text(
+                false,
+                "error trying to connect: invalid peer certificate: notvalidforname"
+            ),
+            Failure::Tls
+        );
+        assert_eq!(
+            failure_of_text(false, "error trying to connect: connection refused"),
+            Failure::Refused
+        );
     }
 
     #[test]

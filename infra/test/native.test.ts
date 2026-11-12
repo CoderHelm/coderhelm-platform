@@ -13,6 +13,8 @@
 //   npm test
 
 import { test } from "node:test";
+import { accessNames, boundaryPolicy, withoutPrivateNetworks } from "../lib/access";
+import { prodValues, resolveValue } from "../lib/native/resolve";
 import * as assert from "node:assert/strict";
 import * as cdk from "aws-cdk-lib";
 import * as fs from "node:fs";
@@ -243,8 +245,9 @@ test("no update build, no deploy window; every install has the deploy role, Auto
   const onAuto = Object.entries<any>(R).filter(([, r]) => r.Condition === "AutoUpdateOn").map(([k]) => k);
   assert.deepEqual(onAuto, []);
   assert.ok(JSON.stringify(installValue("UpdateDefaultsJson")).includes("AutoUpdateOn"));
-  // Its policy is the scoped deploy policy, unchanged: the deploy policy, the parent stack, the release files.
-  assert.deepEqual(R.DeployRole.Properties.Policies, [{ PolicyName: "deploy", PolicyDocument: subInstall(deployRolePolicy(nativeNames())) }]);
+  // Its policy is the scoped deploy policy as pinned: the deploy policy, the parent stack, the release files.
+  // Today's adds only the private networks' statements, which reach installs through the access stack.
+  assert.deepEqual(R.DeployRole.Properties.Policies, [{ PolicyName: "deploy", PolicyDocument: subInstall(withoutPrivateNetworks(deployRolePolicy(nativeNames()))) }]);
   assert.deepEqual(deployRolePolicy(nativeNames()).Statement.slice(-5).map((x: any) => x.Sid), ["ParentStack", "ReleaseFiles", "InstallSecret", "SecretPassword", "ProgressBucket"]);
   // Its Description is what installs that had it carry: a change would hold their next update.
   assert.equal(R.DeployRole.Properties.Description, "CoderHelm: applies a reviewed release's stack update when auto-update is on (docs/self-host/security.md)");
@@ -621,7 +624,9 @@ test("every template's transforms are ones the auto-update role may create chang
 
 test("every resource type in the release is one the simulator checked the auto-update role against", () => {
   // A new type means new calls: run infra/scripts/deploy-role-sim.py --native.
-  const checked = new Set<string>(SIM.types);
+  // A private network's security group came after the simulator's last run: checked by hand in
+  // "a private network's security group is one the deploy role may make" below.
+  const checked = new Set<string>([...SIM.types, "AWS::EC2::SecurityGroup"]);
   const missing = new Set<string>();
   for (const [name, t] of all()) {
     for (const r of Object.values<any>(t.Resources)) if (r.Type.startsWith("AWS::") && !checked.has(r.Type)) missing.add(`${name}: ${r.Type}`);
@@ -671,4 +676,77 @@ test("no released managed policy is replaced on update: Description, ManagedPoli
     [],
     `A new managed policy: add it to ${fixture} as shown, so its Description, ManagedPolicyName and Path are pinned from its first release.`,
   );
+});
+
+// ── Private networks (native/parent.ts, docs/self-host/private-networks.md) ──
+
+test("a private network is three install parameters, off by default, and each one set adds exactly its function, role, log and security group", () => {
+  for (const p of ["PrivateNetwork1", "PrivateNetwork2", "PrivateNetwork3"]) {
+    assert.equal(P.Parameters[p].Default, "");
+    const re = new RegExp(P.Parameters[p].AllowedPattern);
+    assert.ok(re.test("") && re.test("vpc-0a1b2c3d4e5f60718:subnet-0a1b2c3d4e5f60719,subnet-0a1b2c3d4e5f6071a"), p);
+    for (const bad of ["vpc-0a1b2c3d", "subnet-0a1b2c3d", "vpc-0a1b2c3d:sg-0a1b2c3d", "vpc-0a1b2c3d:subnet-0a1b2c3d;rm", "vpc-0A1B2C3D:subnet-0a1b2c3d"]) assert.ok(!re.test(bad), bad);
+    assert.deepEqual(P.Conditions[`Has${p}`], { "Fn::Not": [{ "Fn::Equals": [{ Ref: p }, ""] }] });
+  }
+  for (const n of [1, 2, 3]) {
+    const mine = Object.entries<any>(R).filter(([, r]) => r.Condition === `HasPrivateNetwork${n}`).map(([k, r]) => `${k} ${r.Type}`).sort();
+    assert.deepEqual(mine, [`Reach${n} AWS::Lambda::Function`, `Reach${n}Group AWS::EC2::SecurityGroup`, `Reach${n}Logs AWS::Logs::LogGroup`, `Reach${n}Role AWS::IAM::Role`]);
+    const fn = R[`Reach${n}`].Properties;
+    assert.deepEqual(fn.FunctionName, { "Fn::Sub": `coderhelm-\${Stage}-reach-${n}` });
+    assert.deepEqual(fn.VpcConfig.SecurityGroupIds, [{ Ref: `Reach${n}Group` }]);
+    assert.match(fn.Code.ZipFile, /def handler\(event/, "the function's code is in the signed template");
+    const sg = R[`Reach${n}Group`].Properties;
+    // Out on 443 and 9200 only; nothing in.
+    assert.deepEqual(sg.SecurityGroupEgress.map((e: any) => [e.IpProtocol, e.FromPort, e.ToPort]), [["tcp", 443, 443], ["tcp", 9200, 9200]]);
+    assert.equal(sg.SecurityGroupIngress, undefined);
+    const role = R[`Reach${n}Role`].Properties;
+    assert.deepEqual(role.PermissionsBoundary, { Ref: "Boundary" });
+    const doc = JSON.stringify(role.Policies);
+    assert.ok(!/lambda:Invoke|s3:|dynamodb:|secretsmanager:|sts:/.test(doc), "only its log and its network interfaces");
+    assert.match(doc, /NotFromItsOwnCode/);
+    assert.equal(P.Outputs[`PrivateNetwork${n}SecurityGroup`].Condition, `HasPrivateNetwork${n}`);
+  }
+  // Nothing else hangs on them.
+  const other = Object.entries<any>(R).filter(([k, r]) => /PrivateNetwork/.test(r.Condition ?? "") && !k.startsWith("Reach"));
+  assert.deepEqual(other, []);
+});
+
+test("a private network's security group and function are ones the deploy role may make, under today's boundary (checked by hand until the simulator runs again)", () => {
+  const values: Record<string, string> = { ...prodValues(SIM.account, SIM.region), EmailFrom: "owner@example.org" };
+  values.EmailIdentity = values.EmailFromResolved;
+  const wrap = (v: any): any => (typeof v === "string" ? (v.includes("${") ? { "Fn::Sub": v } : v) : Array.isArray(v) ? v.map(wrap) : v && typeof v === "object" ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, wrap(x)])) : v);
+  const deploy = resolveValue(wrap(deployRolePolicy(nativeNames())), { values, conditions: { HasEmailFrom: true } }) as any;
+  const names = { ...accessNames({ account: SIM.account, region: SIM.region, prefix: "coderhelm-prod", suffix: `-${SIM.account}`, secretName: "coderhelm/prod/secrets", id: "stack" }), emailIdentity: values.EmailIdentity };
+  const boundary = boundaryPolicy(names, [`arn:aws:iam::${SIM.account}:policy/coderhelm-prod-deploy-boundary-stack`]);
+  const ec2 = `arn:aws:ec2:${SIM.region}:${SIM.account}`;
+  const sg = `${ec2}:security-group/sg-0a1b2c3d4e5f60718`;
+  const tagged = { "aws:ResourceTag/coderhelm:install": "coderhelm-prod" };
+  // CloudFormation's AWS::EC2::SecurityGroup handlers (registry schema) and Lambda's VpcConfig checks.
+  const yes: [string, string, Record<string, string>?][] = [
+    ["ec2:CreateSecurityGroup", `${ec2}:vpc/vpc-0a1b2c3d4e5f60718`], ["ec2:CreateSecurityGroup", sg],
+    ["ec2:CreateTags", sg, { "aws:RequestTag/coderhelm:install": "coderhelm-prod" }],
+    ["ec2:RevokeSecurityGroupEgress", sg], ["ec2:AuthorizeSecurityGroupEgress", sg],
+    ["ec2:DescribeSecurityGroups", "*"], ["ec2:DescribeSubnets", "*"], ["ec2:DescribeVpcs", "*"], ["ec2:DescribeNetworkInterfaces", "*"], ["ec2:DescribeInstances", "*"],
+    ["ec2:DeleteSecurityGroup", sg, tagged],
+    ["lambda:CreateFunction", `arn:aws:lambda:${SIM.region}:${SIM.account}:function:coderhelm-prod-reach-1`],
+    ["iam:CreateRole", `arn:aws:iam::${SIM.account}:role/coderhelm-prod-reach-1`, { "iam:PermissionsBoundary": names.boundaryArn }],
+  ];
+  for (const [action, resource, context] of yes) assert.equal(decision([deploy], boundary, { action, resource, context: context ?? {} }), "allowed", `${action} on ${resource}`);
+  // Never someone else's group, never an inbound rule, never another stack's tag.
+  const no: [string, string, Record<string, string>?][] = [
+    ["ec2:DeleteSecurityGroup", sg, { "aws:ResourceTag/coderhelm:install": "other" }],
+    ["ec2:DeleteSecurityGroup", sg],
+    ["ec2:AuthorizeSecurityGroupIngress", sg],
+    ["ec2:CreateTags", sg, { "aws:RequestTag/coderhelm:install": "other" }],
+    ["ec2:CreateTags", `${ec2}:instance/i-0a1b2c3d4e5f60718`, { "aws:RequestTag/coderhelm:install": "coderhelm-prod" }],
+    ["ec2:CreateNetworkInterface", `${ec2}:subnet/subnet-0a1b2c3d4e5f60718`],
+  ];
+  for (const [action, resource, context] of no) assert.notEqual(decision([deploy], boundary, { action, resource, context: context ?? {} }), "allowed", `${action} on ${resource}`);
+  // The function's own role: its network interfaces, under the boundary; never from the function's own code.
+  const fnRole = resolveValue(R.Reach1Role.Properties.Policies[0].PolicyDocument, { values }) as any;
+  const fnArn = `arn:aws:lambda:${SIM.region}:${SIM.account}:function:coderhelm-prod-reach-1`;
+  for (const a of ["ec2:CreateNetworkInterface", "ec2:DeleteNetworkInterface", "ec2:DescribeNetworkInterfaces", "ec2:AssignPrivateIpAddresses", "ec2:UnassignPrivateIpAddresses"]) {
+    assert.equal(decision([fnRole], boundary, { action: a, resource: "*", context: {} }), "allowed", a);
+    assert.equal(decision([fnRole], boundary, { action: a, resource: "*", context: { "lambda:SourceFunctionArn": fnArn } }), "explicitDeny", `${a} from its own code`);
+  }
 });

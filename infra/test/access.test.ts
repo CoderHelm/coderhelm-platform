@@ -15,7 +15,7 @@ import * as path from "node:path";
 import * as cdk from "aws-cdk-lib";
 import { buildApp } from "../lib/app";
 import { resolveConfig, ResolvedConfig, CoderhelmConfig } from "../lib/config";
-import { AccessNames, accessNames, boundaryPolicy, BOUNDARY_OPTION_READS, BOUNDARY_SERVICES, LOG_ANALYZER_ROLE, OWN_READ_ROLES, READ_ROLE_CALLERS, RUNTIME_ROLE_TAG, RUNTIME_ROLES, deployPolicy, INSTALL_TAG, PolicyDocument, Statement, WINDOW_EXPIRES, WINDOW_USER_ID, windowPolicy, windowPolicyParts } from "../lib/access";
+import { AccessNames, accessNames, boundaryPolicy, BOUNDARY_OPTION_READS, BOUNDARY_SERVICES, LOG_ANALYZER_ROLE, OWN_READ_ROLES, READ_ROLE_CALLERS, RUNTIME_ROLE_TAG, RUNTIME_ROLES, deployPolicy, INSTALL_TAG, PolicyDocument, PRIVATE_NETWORK_DEPLOY_READS, PRIVATE_NETWORK_DEPLOY_SIDS, Statement, WINDOW_EXPIRES, WINDOW_USER_ID, windowPolicy, windowPolicyParts } from "../lib/access";
 import { allowed, glob, list, Request } from "./iam-eval";
 import { installName } from "../lib/hardening";
 import { buildSpecSha256, canonicalJson, updateBuildSpecObject, UPDATE_BUILD_VARIABLES } from "../lib/updates-stack";
@@ -158,8 +158,9 @@ test("boundary: in its own account, only the gateway, worker and log analyzer ma
 test("boundary: fits IAM's managed policy limit (6,144 characters without whitespace) with room to spare", () => {
   const size = JSON.stringify(BOUNDARY).length;
   // Measured with the longest names an install can have (a 20-character stage).
-  // About 140 characters to spare since Inspector's and Health's reads (own-account-read.ts, OWN_OPTIONS).
-  assert.ok(size < 6000, `boundary is ${size} characters`);
+  // About 140 characters to spare since Inspector's and Health's reads (own-account-read.ts, OWN_OPTIONS),
+  // about 60 since the private networks' (BOUNDARY_OPTION_READS.PrivateNetworks). Under 6,144 is IAM's own refusal.
+  assert.ok(size < 6100, `boundary is ${size} characters`);
 });
 
 test("boundary: only the deploy role may set or remove the gateway and worker tag", () => {
@@ -235,9 +236,11 @@ test("boundary: the reads named for one switch serve only that switch's statemen
     for (const r of Object.values<any>(t.Resources ?? {})) {
       const docs = r.Type === "AWS::IAM::Role" ? (r.Properties.Policies ?? []).map((p: any) => p.PolicyDocument) : r.Type === "AWS::IAM::Policy" || r.Type === "AWS::IAM::ManagedPolicy" ? [r.Properties.PolicyDocument] : [];
       if (r.Properties?.ManagedPolicyName === n.boundaryName) continue;
-      for (const d of docs) for (const { s, use } of tagged(d.Statement)) {
+      for (const d of docs) for (const { s, use: stUse } of tagged(d.Statement)) {
         if (s.Effect !== "Allow") continue;
         for (const a of list(s.Action)) {
+          // The deploy role's private network statements serve only private networks (access.ts PRIVATE_NETWORK_DEPLOY_*).
+          const use = PRIVATE_NETWORK_DEPLOY_SIDS.includes(s.Sid) || PRIVATE_NETWORK_DEPLOY_READS.includes(a) ? "PrivateNetworks" : stUse;
           for (const [opt, pats] of Object.entries(BOUNDARY_OPTION_READS)) {
             if (!(pats as readonly string[]).some((p) => glob(p, a, true))) continue;
             // Another boundary statement (not a switch's read) that allows it too keeps it allowed with the switch's reads off.

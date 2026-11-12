@@ -19,6 +19,7 @@ order: 11
 | CloudFront | HTTP API, streaming function URL, dashboard bucket | HTTPS; the bucket is private and only CloudFront can read it; the streaming function URL takes only calls CloudFront signs (origin access control) |
 | GitHub, Jira | `/webhooks/*` | Signed payloads, checked before use |
 | Functions | GitHub, Anthropic, Bedrock, the services teams connect | HTTPS from Lambda (no VPC) |
+| A private network's function | A search cluster inside a VPC | HTTPS from inside that VPC, only to private addresses on 443 or 9200 ([Private networks](./private-networks.md)) |
 
 ## Identity and sessions
 

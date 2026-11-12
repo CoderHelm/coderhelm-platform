@@ -217,6 +217,10 @@ export const BOUNDARY_OPTION_READS = {
   // ListFindings, ListCoverage and BatchGetAccountStatus (short: IAM's 6,144 characters).
   InspectorFindings: ["inspector2:List*", "inspector2:BatchGetA*"],
   HealthEvents: ["health:Describe*"],
+  // A private network's lookup function (native/parent.ts, PrivateNetwork1..3): its security group
+  // (made and removed by the deploy role) and the network interfaces Lambda places for it.
+  // Short patterns (IAM's 6,144 characters); the roles themselves name each call (no inbound rule anywhere).
+  PrivateNetworks: ["ec2:*NetworkInterface*", "ec2:*PrivateIp*", "ec2:*SecurityGroup*", "ec2:CreateTags"],
 } as const;
 
 /**
@@ -243,6 +247,13 @@ export const BOUNDARY_SERVICES = [
   ...BOUNDARY_OPTION_READS.InfrastructureVulnerabilities,
   ...BOUNDARY_OPTION_READS.InspectorFindings,
   ...BOUNDARY_OPTION_READS.HealthEvents,
+  ...BOUNDARY_OPTION_READS.PrivateNetworks,
+  // Describing EC2 and an OpenSearch domain (read-only), always: CloudFormation and Lambda describe a
+  // private network's subnets, VPC and instances as they place its function, and the gateway finds a
+  // domain's VPC and subnets from its address (or the domain that replaced a deleted one).
+  "ec2:Describe*",
+  "es:DescribeDomain",
+  "es:ListDomainNames",
   "bedrock:InvokeModel",
   "bedrock:InvokeModelWithResponseStream",
   "bedrock:Get*",
@@ -435,6 +446,26 @@ export function boundaryPolicy(n: AccessNames, otherBoundaries: string[] = []): 
   ]);
 }
 
+/**
+ * What the deploy role gained for private networks (native/parent.ts): its
+ * statements on the networks' security groups, and the reads Lambda and
+ * CloudFormation's security group handler make while they place the function
+ * (the handler's registry schema: DescribeSecurityGroups, and on delete
+ * DescribeInstances). Named so the tests can tell them from what the
+ * simulator last saw (test/native-sim.test.ts).
+ */
+export const PRIVATE_NETWORK_DEPLOY_SIDS = ["NetworkGroupsCreate", "NetworkGroupsTag", "NetworkGroupsDelete"];
+export const PRIVATE_NETWORK_DEPLOY_READS = ["ec2:DescribeSecurityGroups", "ec2:DescribeSubnets", "ec2:DescribeVpcs", "ec2:DescribeNetworkInterfaces", "ec2:DescribeInstances"];
+
+/** `doc` without what private networks added to it (the deploy policy as released before them). */
+export function withoutPrivateNetworks(doc: PolicyDocument): PolicyDocument {
+  return {
+    ...doc,
+    Statement: doc.Statement.filter((s) => !PRIVATE_NETWORK_DEPLOY_SIDS.includes(s.Sid ?? "")).map((s) =>
+      s.Sid === "Reads" && Array.isArray(s.Action) ? { ...s, Action: s.Action.filter((a) => !PRIVATE_NETWORK_DEPLOY_READS.includes(a)) } : s),
+  };
+}
+
 /** CloudFormation's role for the install's stacks (the deploy role's own policy). */
 export function deployPolicy(n: AccessNames): PolicyDocument {
   const a = arns(n);
@@ -536,6 +567,11 @@ export function deployPolicy(n: AccessNames): PolicyDocument {
     },
     { Sid: "CertificatesRequest", Effect: "Allow", Action: ["acm:RequestCertificate", "acm:AddTagsToCertificate"], Resource: "*", Condition: { StringEquals: { [`aws:RequestTag/${INSTALL_TAG}`]: p } } },
     { Sid: "Certificates", Effect: "Allow", Action: "acm:*", Resource: `arn:${n.partition}:acm:*:${n.account}:certificate/*`, Condition: tagged },
+    // A private network's security group (native/parent.ts): made in the VPC an admin chose, its
+    // outbound rules set, tagged for the install; deleted only while it carries the tag.
+    { Sid: "NetworkGroupsCreate", Effect: "Allow", Action: ["ec2:CreateSecurityGroup", "ec2:AuthorizeSecurityGroupEgress", "ec2:RevokeSecurityGroupEgress"], Resource: [`${a.at("ec2")}:vpc/*`, `${a.at("ec2")}:security-group/*`] },
+    { Sid: "NetworkGroupsTag", Effect: "Allow", Action: "ec2:CreateTags", Resource: `${a.at("ec2")}:security-group/*`, Condition: { StringEquals: { [`aws:RequestTag/${INSTALL_TAG}`]: p } } },
+    { Sid: "NetworkGroupsDelete", Effect: "Allow", Action: "ec2:DeleteSecurityGroup", Resource: `${a.at("ec2")}:security-group/*`, Condition: tagged },
     // The deploy role carries the boundary too, whose guardrails deny the rest.
     { Sid: "NoIamUsersOrKeys", Effect: "Deny", Action: ["iam:CreateUser", "iam:CreateAccessKey", "iam:CreateLoginProfile"], Resource: "*" },
     { Sid: "NoKeyDestruction", Effect: "Deny", Action: ["kms:ScheduleKeyDeletion", "kms:DisableKey", "kms:DeleteImportedKeyMaterial"], Resource: "*" },
@@ -549,6 +585,7 @@ export function deployPolicy(n: AccessNames): PolicyDocument {
         "kms:List*", "lambda:Get*", "lambda:List*", "logs:Describe*", "logs:List*",
         "ses:Get*", "ses:List*", "ses:DescribeConfigurationSet", "sqs:List*", "sns:List*", "ssm:Describe*", "acm:Describe*", "acm:List*", "codebuild:List*",
         "scheduler:List*", "sts:GetCallerIdentity",
+        ...PRIVATE_NETWORK_DEPLOY_READS,
       ],
       Resource: "*",
     },

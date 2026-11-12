@@ -1109,10 +1109,12 @@ impl LiveSources {
             }
             Kind::Search => {
                 let conn = l.source.reader();
+                // Over the internet, or through the source's private network.
+                let http = common::live::private_network::transport(&l.source.network).await?;
                 let os = OpenSearch {
                     conn: &conn,
                     password: &l.key,
-                    http: &Https,
+                    http: &*http,
                 };
                 let index = input["index"].as_str().unwrap_or("");
                 let started = std::time::Instant::now();
@@ -1710,6 +1712,7 @@ mod tests {
             user: String::new(),
             indexes: Vec::new(),
             instructions: String::new(),
+            network: String::new(),
         }
     }
 

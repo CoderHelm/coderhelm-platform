@@ -94,6 +94,9 @@ pub struct Source {
     /// What agents should know when using it (what the system is, what its
     /// fields mean, where else its data lives). Given to them with it.
     pub instructions: String,
+    /// Search: "" read over the internet, or the private network ("1" to
+    /// "3") whose function reads it from inside a VPC ([`super::private_network`]).
+    pub network: String,
 }
 
 /// Characters of a source's guide for agents.
@@ -174,6 +177,7 @@ impl Source {
             ("user".to_string(), av_s(&self.user)),
             ("indexes".to_string(), av_list(&self.indexes)),
             ("instructions".to_string(), av_s(&self.instructions)),
+            ("network".to_string(), av_s(&self.network)),
         ]);
         if let Some(k) = self.kinds {
             item.insert("kinds".to_string(), AttributeValue::N(k.to_string()));
@@ -219,6 +223,9 @@ impl Source {
             user: s(item, "user"),
             indexes: list(item, "indexes"),
             instructions: s(item, "instructions"),
+            network: Some(s(item, "network"))
+                .filter(|n| super::private_network::valid(n))
+                .unwrap_or_default(),
         })
     }
 
@@ -294,6 +301,7 @@ impl Source {
             user: c.email.clone(),
             indexes: c.indexes.clone(),
             instructions: c.instructions.clone(),
+            network: String::new(),
         })
     }
 
@@ -335,6 +343,7 @@ impl Source {
             "user": self.user,
             "indexes": self.indexes,
             "instructions": self.instructions,
+            "network": self.network,
         })
     }
 
@@ -880,6 +889,7 @@ mod tests {
             user: String::new(),
             indexes: Vec::new(),
             instructions: String::new(),
+            network: String::new(),
         }
     }
 
