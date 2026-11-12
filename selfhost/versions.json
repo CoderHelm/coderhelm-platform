@@ -1,4 +1,4 @@
 {
   "about": "The dashboard commit each platform release ships: a full 40-character commit SHA of CoderHelm/coderhelm, never a branch or tag (scripts/check-dashboard-ref.mjs fails CI and the release otherwise). The release workflow builds exactly this commit (dashboard/) into dashboard.tar.gz. Move it with scripts/bump-dashboard.sh in a reviewed PR, in the same PR as any API change the dashboard needs.",
-  "dashboardRef": "cbd24ab27dab318ba4c81b2a624272268bb9799b"
+  "dashboardRef": "69ce0e66f0efc5334f4f7aafcf1f8c77b54a777b"
 }
