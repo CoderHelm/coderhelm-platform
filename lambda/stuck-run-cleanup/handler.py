@@ -29,8 +29,12 @@ action such as reviewing its pull request). The sweep reads every
 - one that names nothing (written before that rule, or by hand) is reported
   (`run_waiting_unasked` in the log, counted by the monitoring stack) and
   given a named wait: the review of its pull request when it has one, else
-  a Retry with the reason it stopped. The worker then sends the usual
-  `run.needs_input` notification for it;
+  a Retry with the reason it stopped. The reason is the run's
+  `error_message`, else its `outside_change_report`, else its own last
+  progress note (runs that stopped on an open pull request or an unsure fix
+  location wrote it only there). The worker then sends the usual
+  `run.needs_input` notification for it. A wait named earlier without a
+  reason gets the reason filled in, with no new notification;
 - one still waiting WAIT_REMIND_AFTER_HOURS after its wait started gets one
   reminder through the same notification.
 """
@@ -142,11 +146,73 @@ def asks_something(run):
     return isinstance(wait, dict) and bool(str(wait.get("action") or "").strip())
 
 
+# What the sweep writes when a run names no reason anywhere, and the notes
+# it adds itself: neither is a run's own reason for stopping.
+NOTHING_SAID = "It stopped waiting on a person without saying what for."
+SWEEP_NOTES = ("This run was waiting with nothing asked", "Reminder: still waiting")
+OUTSIDE_CHANGE_FIELD = "outside_change_report"
+NOTES_FIELD = "progress_notes"
+REASON_CHARS = 400
+
+
+def _one_line(text):
+    return " ".join(str(text or "").split())
+
+
+def _cut(text):
+    text = _one_line(text)
+    return text if len(text) <= REASON_CHARS else text[: REASON_CHARS - 1].rstrip() + "…"
+
+
+def outside_change_reason(report):
+    """The headline and finding of a run's outside-change report (markdown:
+    a bold headline, then "**What I found:** ..."), as one line."""
+    lines = [ln.strip() for ln in str(report or "").splitlines() if ln.strip()]
+    if not lines:
+        return ""
+    head = lines[0].strip("*# ").rstrip(".")
+    found = next(
+        (ln.split(":**", 1)[1].strip() for ln in lines[1:] if ln.lower().startswith("**what i found:**")),
+        "",
+    )
+    return _cut(f"{head}: {found}" if found else f"{head}.")
+
+
+# Progress notes that record a step done, never a reason to stop.
+STEP_NOTES = ("Triaged as", "Plan generated", "Plan reviewed by", "Planning again")
+
+
+def last_stop_note(notes):
+    """The run's own last progress note (the sweep's notes skipped): the run
+    stopped right after it, so it says why. A routine step note says only
+    where it stopped. Notes are dicts with a `message`, oldest first (worker
+    run_lists::append_note)."""
+    for n in reversed(notes if isinstance(notes, list) else []):
+        msg = _one_line(n.get("message") if isinstance(n, dict) else n)
+        if not msg or msg.startswith(SWEEP_NOTES):
+            continue
+        if msg.startswith(STEP_NOTES):
+            return _cut(f"It stopped right after its last step ({msg.rstrip('.')}) without saying why.")
+        return _cut(msg)
+    return ""
+
+
+def stop_reason(run):
+    """Why a waiting run stopped, from the newest place the worker records
+    it: its error_message, its outside-change report, else its last own
+    progress note. Empty when none says."""
+    return (
+        _cut(run.get("error_message"))
+        or outside_change_reason(run.get(OUTSIDE_CHANGE_FIELD))
+        or last_stop_note(run.get(NOTES_FIELD))
+    )
+
+
 def named_wait(run, now_iso):
     """The wait for a needs_input run that named none: its pull request's
     review when it has one (it did its work), else a Retry with its reason.
     The words mirror WaitingOn::review_pr and mark_run_stopped_by_guard."""
-    reason = " ".join(str(run.get("error_message") or "").split())
+    reason = stop_reason(run)
     if has_pull_request(run):
         try:
             number = int(run.get("pr_number") or 0)
@@ -171,9 +237,16 @@ def named_wait(run, now_iso):
         }
     return {
         "action": "Read why CoderHelm stopped this run, then press Retry or close it",
-        "detail": reason or "It stopped waiting on a person without saying what for.",
+        "detail": reason or NOTHING_SAID,
         "since": now_iso,
     }
+
+
+def said_nothing(run):
+    """A wait this sweep named earlier without a reason, for a run whose
+    record now gives one: the wait's detail is filled in (no new notice)."""
+    wait = _json(run.get(WAITING_ON_FIELD))
+    return isinstance(wait, dict) and wait.get("detail") == NOTHING_SAID and bool(stop_reason(run))
 
 
 def wait_since(run):
@@ -243,8 +316,9 @@ def take_default(runs_table, run, now):
 
 def settle_waiting(runs_table, run, now):
     """A needs_input run: take a passed question deadline's default, name
-    its wait when it names none, or remind once. Returns "defaulted",
-    "named", "reminded" or ""."""
+    its wait when it names none, say why on a wait named without a reason,
+    or remind once. Returns "defaulted", "named", "explained", "reminded"
+    or ""."""
     run_id = run["run_id"]
     key = {"team_id": run["team_id"], "run_id": run_id}
     now_iso = now.isoformat()
@@ -269,6 +343,18 @@ def settle_waiting(runs_table, run, now):
             )
             _send_waiting(run, "named")
             return "named"
+        if said_nothing(run):
+            wait = _json(run.get(WAITING_ON_FIELD))
+            wait["detail"] = named_wait(run, now_iso)["detail"]
+            runs_table.update_item(
+                Key=key,
+                UpdateExpression="SET #w = :w",
+                ExpressionAttributeNames={"#s": "status", "#w": WAITING_ON_FIELD},
+                ExpressionAttributeValues={":w": json.dumps(wait), ":ni": NEEDS_INPUT},
+                ConditionExpression="#s = :ni",
+            )
+            logger.info(f"Run {run_id}: its wait now says why it stopped")
+            return "explained"
         if reminder_due(run, now):
             since = wait_since(run)
             runs_table.update_item(
@@ -574,7 +660,7 @@ def handler(event, context):
     #    before, so awaiting_ci runs sat forever.
     stuck_runs = []
     over_count = 0
-    waiting = {"named": 0, "reminded": 0, "defaulted": 0}
+    waiting = {"named": 0, "explained": 0, "reminded": 0, "defaulted": 0}
     scan_kwargs = {
         "FilterExpression": "#s = :running OR #s = :awaiting OR #s = :ni",
         "ExpressionAttributeNames": {"#s": "status"},
@@ -586,13 +672,15 @@ def handler(event, context):
         "ProjectionExpression": (
             "team_id, run_id, created_at, updated_at, title, current_pass, pass_history, #s, "
             "step_queued_at, ceil_passes, ceil_continuations, ceil_worked_secs, ceil_spend_usd, "
-            "#round, pr_number, pr_url, error_message, #q, #w, #r"
+            "#round, pr_number, pr_url, error_message, #q, #w, #r, #oc, #notes"
         ),
     }
     scan_kwargs["ExpressionAttributeNames"]["#round"] = ROUND_FIELD
     scan_kwargs["ExpressionAttributeNames"]["#q"] = QUESTIONS_FIELD
     scan_kwargs["ExpressionAttributeNames"]["#w"] = WAITING_ON_FIELD
     scan_kwargs["ExpressionAttributeNames"]["#r"] = REMINDED_FIELD
+    scan_kwargs["ExpressionAttributeNames"]["#oc"] = OUTSIDE_CHANGE_FIELD
+    scan_kwargs["ExpressionAttributeNames"]["#notes"] = NOTES_FIELD
 
     while True:
         resp = runs_table.scan(**scan_kwargs)
@@ -633,6 +721,7 @@ def handler(event, context):
             "stuck_count": 0,
             "over_ceiling": over_count,
             "waiting_named": waiting["named"],
+            "waiting_explained": waiting["explained"],
             "waiting_reminded": waiting["reminded"],
             "waiting_defaulted": waiting["defaulted"],
         }
@@ -725,6 +814,7 @@ def handler(event, context):
         "unstuck_count": failed_count,
         "over_ceiling": over_count,
         "waiting_named": waiting["named"],
+        "waiting_explained": waiting["explained"],
         "waiting_reminded": waiting["reminded"],
         "waiting_defaulted": waiting["defaulted"],
     }

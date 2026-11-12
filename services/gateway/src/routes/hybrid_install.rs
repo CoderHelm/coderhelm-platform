@@ -548,8 +548,8 @@ pub async fn sync_name_records(state: &AppState, view: Option<&Value>) {
             d.finish(
                 Status::Failed,
                 "CoderHelm didn't take the records",
-                if e.code == "broker_unreachable" {
-                    "broker_unreachable"
+                if e.is_outage() {
+                    e.code.as_str()
                 } else {
                     "broker_refused"
                 },
@@ -1014,6 +1014,9 @@ async fn status_value(state: &AppState, deep: bool) -> Value {
             .as_ref()
             .and_then(|h| h["github"]["links"][0]["installation_id"].as_u64())
         {
+            // A person checking now gets the broker's answer now, not the
+            // wait a background sweep is in.
+            client::forget_token_backoff(first);
             list.push(match client::github_token(&state.http, first).await {
                 Ok(_) => check(
                     "hybrid_broker",

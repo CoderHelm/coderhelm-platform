@@ -311,6 +311,67 @@ class WaitingOnAPerson(unittest.TestCase):
         self.assertIn("Retry", wait["action"])
         self.assertEqual(wait["detail"], "stopped")
 
+    # Runs that stopped before waits were recorded wrote why only in their
+    # progress notes (an open pull request already existed) or in their
+    # outside-change report (unsure where the fix belongs).
+    NOTES = [
+        {"message": "Plan generated", "timestamp": "2026-10-26T14:25:12+00:00"},
+        {
+            "message": "An open pull request for ABC-1 already exists in o/r: #9. I didn't open another.",
+            "timestamp": "2026-10-26T14:27:59+00:00",
+        },
+        {
+            "message": "This run was waiting with nothing asked; it now waits for: Read why",
+            "timestamp": "2026-11-06T16:41:19+00:00",
+        },
+        {"message": "Reminder: still waiting after 24 hours for: Read why", "timestamp": "2026-11-07T16:51:18+00:00"},
+    ]
+    REPORT = (
+        "**Not sure yet where the fix belongs**\n\n"
+        "**What I found:** The question's style sets no font.\n\n"
+        "**What I checked**\n- [code] read styles.ts"
+    )
+
+    def test_the_reason_is_read_from_the_last_stop_note(self):
+        wait = sweep.named_wait({"progress_notes": self.NOTES}, "now")
+        self.assertEqual(
+            wait["detail"], "An open pull request for ABC-1 already exists in o/r: #9. I didn't open another."
+        )
+        # The outside-change report comes before the notes; error_message first of all.
+        run = {"progress_notes": self.NOTES, "outside_change_report": self.REPORT}
+        self.assertEqual(
+            sweep.named_wait(run, "now")["detail"],
+            "Not sure yet where the fix belongs: The question's style sets no font.",
+        )
+        self.assertEqual(sweep.named_wait(dict(run, error_message="stopped"), "now")["detail"], "stopped")
+        # A routine step note says where it stopped, never that it is a reason.
+        steps = [{"message": "Triaged as simple complexity"}, {"message": "Plan generated"}] + self.NOTES[2:]
+        self.assertEqual(
+            sweep.named_wait({"progress_notes": steps}, "now")["detail"],
+            "It stopped right after its last step (Plan generated) without saying why.",
+        )
+        # Only the sweep's own notes: nothing said.
+        self.assertEqual(sweep.named_wait({"progress_notes": self.NOTES[2:]}, "now")["detail"], sweep.NOTHING_SAID)
+        self.assertEqual(sweep.named_wait({}, "now")["detail"], sweep.NOTHING_SAID)
+        long = sweep.named_wait({"progress_notes": [{"message": "x " * 400}]}, "now")["detail"]
+        self.assertLessEqual(len(long), sweep.REASON_CHARS)
+
+    def test_a_wait_named_without_a_reason_gets_it_once_without_a_notice(self):
+        wait = sweep.json.dumps(
+            {"action": "Read why CoderHelm stopped this run", "detail": sweep.NOTHING_SAID, "since": "2026-11-11T15:00:00+00:00"}
+        )
+        run = {"team_id": "T", "run_id": "R", "status": "needs_input", "waiting_on": wait, "progress_notes": self.NOTES}
+        out, updates, sent = self._sweep([run])
+        self.assertEqual(out["waiting_explained"], 1)
+        written = sweep.json.loads(updates[0]["ExpressionAttributeValues"][":w"])
+        self.assertIn("already exists", written["detail"])
+        self.assertEqual(written["since"], "2026-11-11T15:00:00+00:00")
+        self.assertEqual(sent, [])
+        # Once filled in (or with nothing to say), it is left alone.
+        explained = dict(run, waiting_on=sweep.json.dumps(written))
+        self.assertFalse(sweep.said_nothing(explained))
+        self.assertFalse(sweep.said_nothing(dict(run, progress_notes=[])))
+
     def test_one_reminder_after_the_wait(self):
         wait = sweep.json.dumps({"action": "Review pull request #7", "since": "2026-11-04T16:00:00+00:00"})
         run = {"team_id": "T", "run_id": "R", "status": "needs_input", "waiting_on": wait}

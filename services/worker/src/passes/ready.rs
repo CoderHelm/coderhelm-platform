@@ -687,6 +687,16 @@ impl Refused {
             Some((_, w)) => w,
             None => backoff_secs(attempt),
         };
+        // No GitHub token from CoderHelm's broker (a hybrid install): its
+        // own reason, never "GitHub refused", and no sooner than the broker
+        // is asked again.
+        if let Some(b) = hosted_error(e) {
+            let wait = common::hybrid::client::retry_after_secs(b, 1).max(wait_secs as i64);
+            return Refused {
+                what: format!("{what} (no GitHub token from CoderHelm: {})", b.code),
+                wait_secs: wait as u64,
+            };
+        }
         let reason = match crate::clients::github::outside_wait(e) {
             Some((common::github_wait::Cause::RateLimit, _)) => "GitHub's rate limit",
             Some((common::github_wait::Cause::Outage, _)) => "GitHub not answering",
@@ -697,6 +707,27 @@ impl Refused {
             wait_secs,
         }
     }
+}
+
+/// The broker's error inside `e`, when the GitHub token couldn't be had.
+fn hosted_error<'a>(
+    e: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a common::hybrid::client::CallError> {
+    let mut cur = Some(e);
+    while let Some(err) = cur {
+        if let Some(c) = err.downcast_ref::<common::hybrid::client::CallError>() {
+            return Some(c);
+        }
+        cur = err.source();
+    }
+    None
+}
+
+/// A refused mark-ready is logged as a warning on its first try only: the
+/// tries after it (every few minutes while the PR stays a draft or GitHub
+/// stays unreachable) repeat the same thing, so they are info.
+pub fn refusal_is_news(attempt: u32) -> bool {
+    attempt <= 1
 }
 
 /// The wait before try `attempt + 1` when GitHub named no reset: one minute,
@@ -1334,7 +1365,11 @@ async fn retry_or_give_up(ctx: &Ctx<'_>, run_id: &str, pr_url: &str, r: Refused)
         };
         let delay = r.wait_secs.clamp(1, MAX_DELAY_SECS);
         if send(ctx.state, &msg, delay).await {
-            warn!(pr = ctx.pr, attempt, wait_secs = r.wait_secs, what = %r.what, "Mark-ready refused by GitHub — trying again later");
+            if refusal_is_news(attempt) {
+                warn!(pr = ctx.pr, attempt, wait_secs = r.wait_secs, what = %r.what, "Mark-ready refused by GitHub — trying again later");
+            } else {
+                info!(pr = ctx.pr, attempt, wait_secs = r.wait_secs, what = %r.what, "Mark-ready still refused — trying again later");
+            }
             if let Some(h) = DraftHold::new(
                 Kind::Waiting,
                 vec![Reason::new(
@@ -2244,6 +2279,26 @@ mod tests {
         assert!(!ci.green && ci.why.contains("no CI checks"));
         let pending = json!({"name": "e2e", "status": "in_progress", "conclusion": null});
         assert!(ci_standing(&[pending], &[]).why.contains("still running"));
+    }
+
+    #[test]
+    fn a_refusal_from_coderhelms_broker_says_so_and_waits_for_it() {
+        let e = common::hybrid::client::answer_error(502, &serde_json::Value::Null);
+        let boxed: Box<dyn std::error::Error + Send + Sync> = Box::new(e);
+        let r = Refused::of("the pull request couldn't be read", &*boxed, 0);
+        assert!(
+            r.what.contains("no GitHub token from CoderHelm"),
+            "{}",
+            r.what
+        );
+        assert!(!r.what.contains("GitHub refused"), "{}", r.what);
+        assert!(r.wait_secs >= 30);
+        // GitHub's own refusal still reads as GitHub's.
+        let gh: Box<dyn std::error::Error + Send + Sync> = "422 Unprocessable".into();
+        assert!(Refused::of("x", &*gh, 0).what.contains("GitHub refused"));
+        // Only the first try of a series is a warning.
+        assert!(refusal_is_news(1));
+        assert!(!refusal_is_news(2) && !refusal_is_news(7));
     }
 
     #[test]
