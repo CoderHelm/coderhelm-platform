@@ -6,6 +6,7 @@
 //
 //   npm test
 
+import { plainStatements } from "../lib/own-account-read";
 import { test } from "node:test";
 import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
@@ -46,7 +47,7 @@ function statements(t: Template): any[] {
   const out: any[] = [];
   for (const type of ["AWS::IAM::Policy", "AWS::IAM::ManagedPolicy"]) {
     for (const r of Object.values(t.findResources(type))) {
-      out.push(...((r as any).Properties.PolicyDocument.Statement as any[]));
+      out.push(...(plainStatements((r as any).Properties.PolicyDocument.Statement) as any[]));
     }
   }
   return out;

@@ -79,6 +79,11 @@ pub struct PermissionCheck {
     /// The optional abilities were checked (the simulator answered).
     #[serde(default)]
     pub optional_checked: bool,
+    /// Optional actions the role lacks because a permissions boundary blocks
+    /// them (whatever its own policy says): on a self-hosted install, its
+    /// permission limit, which only an AWS admin's access stack widens.
+    #[serde(default)]
+    pub optional_boundary_blocks: Vec<String>,
 }
 
 /// What the page shows for one account.
@@ -107,6 +112,7 @@ impl PermissionCheck {
             install_role: false,
             optional_missing: Vec::new(),
             optional_checked: false,
+            optional_boundary_blocks: Vec::new(),
         }
     }
 
@@ -180,6 +186,19 @@ impl PermissionCheck {
         if self.missing.is_empty() {
             return None;
         }
+        if self.install_account && self.scp_blocks.is_empty() && !self.boundary_blocks.is_empty() {
+            // The install's own permission limit: no version update widens it,
+            // only the access stack an AWS admin applies (Settings, System).
+            return Some(Problem {
+                code: "install_boundary",
+                message: format!(
+                    "This install's permission limit doesn't allow {} of these read-only permission{} yet.",
+                    self.boundary_blocks.len(),
+                    if self.boundary_blocks.len() == 1 { "" } else { "s" },
+                ),
+                fix: "An AWS admin applies the install's access update once (Settings, System, Version, Permissions: one link to the AWS console). No version update can change the limit.".into(),
+            });
+        }
         if self.install_account && self.scp_blocks.is_empty() {
             // Nothing for a person to launch in AWS: the install's own stack
             // grants these with its next version update.
@@ -191,7 +210,7 @@ impl PermissionCheck {
                     if self.missing.len() == 1 { "" } else { "s" },
                     if self.missing.len() == 1 { "is" } else { "are" },
                 ),
-                fix: "They arrive with this install's next version update (Settings, Version and updates). Nothing is needed in AWS.".into(),
+                fix: "They arrive with this install's next version update. Nothing is needed in AWS.".into(),
             });
         }
         if !self.scp_blocks.is_empty() {
@@ -294,6 +313,27 @@ impl PermissionCheck {
                             || (optional && self.optional_missing.iter().any(|m| m == x))
                     })
                     .collect();
+                let blocked: Vec<&str> = gone
+                    .iter()
+                    .copied()
+                    .filter(|x| {
+                        self.boundary_blocks.iter().any(|m| m == x)
+                            || self.optional_boundary_blocks.iter().any(|m| m == x)
+                    })
+                    .collect();
+                // Another account's role: an optional read is turned on with the
+                // role's one-click update stack, that read included.
+                let turn_on_url = (optional && !gone.is_empty() && !self.install_account)
+                    .then(|| log_reader::update_template_url(template_url))
+                    .flatten()
+                    .map(|t| {
+                        let with = match a.key {
+                            "infra" => chosen.with_infrastructure(true),
+                            "inspector" => chosen.with_optin(true, chosen.health),
+                            _ => chosen.with_optin(chosen.inspector, true),
+                        };
+                        log_reader::update_url(&t, &self.region, &with)
+                    });
                 json!({
                     "key": a.key,
                     "name": a.name,
@@ -301,6 +341,8 @@ impl PermissionCheck {
                     "actions": a.actions,
                     "missing": gone,
                     "optional": optional,
+                    "boundary_blocked": blocked,
+                    "turn_on_url": turn_on_url,
                 })
             })
             .collect();
@@ -348,6 +390,9 @@ pub fn apply_simulation(c: &mut PermissionCheck, results: &[Simulated]) {
         if !r.allowed && log_reader::is_optional(&r.action) {
             if !c.optional_missing.contains(&r.action) {
                 c.optional_missing.push(r.action.clone());
+                if r.boundary_allows == Some(false) {
+                    c.optional_boundary_blocks.push(r.action.clone());
+                }
             }
             continue;
         }
@@ -675,6 +720,73 @@ mod tests {
         assert_eq!(p.code, "install_update");
         assert!(p.fix.contains("next version update"));
         assert!(!p.fix.contains("Update in AWS"));
+    }
+
+    #[test]
+    fn the_install_account_names_its_permission_limit_when_that_is_what_blocks() {
+        let mut c = checked();
+        c.install_account = true;
+        apply_simulation(
+            &mut c,
+            &[Simulated {
+                boundary_allows: Some(false),
+                ..sim("logs:StopQuery", false)
+            }],
+        );
+        let p = c.problem(false).expect("says why");
+        assert_eq!(p.code, "install_boundary");
+        assert!(p.fix.contains("AWS admin"));
+        assert!(!p.fix.contains("next version update"));
+    }
+
+    #[test]
+    fn optional_reads_say_whether_the_limit_blocks_them_and_how_another_account_turns_them_on() {
+        let inspector = log_reader::ability("inspector").unwrap();
+        let mut c = checked();
+        let results: Vec<Simulated> = inspector
+            .actions
+            .iter()
+            .map(|a| Simulated {
+                boundary_allows: Some(false),
+                ..sim(a, false)
+            })
+            .collect();
+        apply_simulation(&mut c, &results);
+        assert_eq!(c.status(), "up_to_date");
+        assert_eq!(c.optional_boundary_blocks.len(), inspector.actions.len());
+        let tpl = "https://b.s3.amazonaws.com/launch/v1.2.3/coderhelm-log-reader.yaml";
+        let v = c.view(false, tpl);
+        let row = |v: &Value, k: &str| {
+            v["abilities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|a| a["key"] == k)
+                .unwrap()
+                .clone()
+        };
+        let r = row(&v, "inspector");
+        assert_eq!(
+            r["boundary_blocked"].as_array().unwrap().len(),
+            inspector.actions.len()
+        );
+        let url = r["turn_on_url"]
+            .as_str()
+            .expect("another account: the update stack link");
+        assert!(url.contains("param_InspectorFindings=on"));
+        assert!(!url.contains("param_HealthEvents=on"));
+        // A read the role already has, or a required one, has no such link.
+        assert!(row(&v, "logs")["turn_on_url"].is_null());
+        // The install's own account switches it on its own stack instead.
+        c.install_account = true;
+        assert!(row(&c.view(false, tpl), "inspector")["turn_on_url"].is_null());
+        // A check saved before the field still reads.
+        let mut old = serde_json::to_value(checked()).unwrap();
+        old.as_object_mut()
+            .unwrap()
+            .remove("optional_boundary_blocks");
+        let back: PermissionCheck = serde_json::from_value(old).unwrap();
+        assert!(back.optional_boundary_blocks.is_empty());
     }
 
     #[test]

@@ -183,6 +183,9 @@ fn build_app(state: Arc<AppState>) -> Router {
         .route("/system/update", post(routes::system::update_now))
         // Apply the prepared update waiting for an admin (a native install).
         .route("/system/update/apply", post(routes::system::apply_update))
+        // What the install reads in its own account (Inspector, Health,
+        // infrastructure): a parameter-only change set, reviewed like an update.
+        .route("/system/options", post(routes::system::set_options))
         .route("/system/rollback", post(routes::system::rollback))
         .route("/system/test-email", post(routes::system::test_email))
         // The model check before an update, run again now ("Check again").

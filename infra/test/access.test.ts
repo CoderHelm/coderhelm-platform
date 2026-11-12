@@ -6,6 +6,7 @@
 //
 //   npm test   (compiles with tsc, then runs node --test)
 
+import { plainStatements } from "../lib/own-account-read";
 import { test } from "node:test";
 import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
@@ -157,7 +158,8 @@ test("boundary: in its own account, only the gateway, worker and log analyzer ma
 test("boundary: fits IAM's managed policy limit (6,144 characters without whitespace) with room to spare", () => {
   const size = JSON.stringify(BOUNDARY).length;
   // Measured with the longest names an install can have (a 20-character stage).
-  assert.ok(size < 5900, `boundary is ${size} characters`);
+  // About 140 characters to spare since Inspector's and Health's reads (own-account-read.ts, OWN_OPTIONS).
+  assert.ok(size < 6000, `boundary is ${size} characters`);
 });
 
 test("boundary: only the deploy role may set or remove the gateway and worker tag", () => {
@@ -205,7 +207,7 @@ test("boundary: allows every action every synthesized CoderHelm role is given", 
     for (const r of Object.values<any>(t.Resources ?? {})) {
       const docs = r.Type === "AWS::IAM::Role" ? (r.Properties.Policies ?? []).map((p: any) => p.PolicyDocument) : r.Type === "AWS::IAM::Policy" || r.Type === "AWS::IAM::ManagedPolicy" ? [r.Properties.PolicyDocument] : [];
       if (r.Properties?.ManagedPolicyName === n.boundaryName) continue;
-      for (const d of docs) for (const s of d.Statement) {
+      for (const d of docs) for (const s of plainStatements(d.Statement)) {
         if (s.Effect !== "Allow") continue;
         for (const a of list(s.Action)) if (!BOUNDARY.Statement.some((b) => b.Effect === "Allow" && list(b.Action).some((x) => glob(x, a, true) || glob(a, x, true)))) missing.add(a);
       }
@@ -399,7 +401,7 @@ test("hardened: every role carries the boundary; no AdministratorAccess, no *:*,
           for (const m of r.Properties.ManagedPolicyArns ?? []) assert.match(JSON.stringify(m), /AWSLambdaBasicExecutionRole/, `${name}/${id}: ${JSON.stringify(m)}`);
         }
         const docs = r.Type === "AWS::IAM::Role" ? (r.Properties.Policies ?? []).map((p: any) => p.PolicyDocument) : ["AWS::IAM::Policy", "AWS::IAM::ManagedPolicy"].includes(r.Type) ? [r.Properties.PolicyDocument] : [];
-        for (const d of docs) for (const s of d.Statement) {
+        for (const d of docs) for (const s of plainStatements(d.Statement)) {
           if (s.Effect !== "Allow") continue;
           const actions = list(s.Action);
           assert.ok(!actions.some((a) => a === "*" || a === "*:*" || a === "iam:*"), `${name}/${id}: ${JSON.stringify(actions)}`);
@@ -545,7 +547,7 @@ test("boundary: a hardened install's worker may make a data key for a sign-in's 
   const t = hardened();
   const statements = Object.values<any>(t["coderhelm-prod-worker"].Resources)
     .filter((r) => r.Type === "AWS::IAM::Policy" || r.Type === "AWS::IAM::ManagedPolicy")
-    .flatMap((p) => p.Properties.PolicyDocument.Statement as any[]);
+    .flatMap((p) => plainStatements(p.Properties.PolicyDocument.Statement) as any[]);
   const seal = statements.find((s) => JSON.stringify(s.Condition ?? {}).includes("mcp-oauth-token"));
   assert.ok(seal, "the worker seals sign-in tokens");
   assert.deepEqual([...list(seal.Action)].sort(), ["kms:Encrypt", "kms:GenerateDataKey"]);

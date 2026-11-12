@@ -6,6 +6,7 @@
 //
 //   npm test   (compiles with tsc, then runs node --test)
 
+import { plainStatements } from "../lib/own-account-read";
 import { test } from "node:test";
 import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
@@ -54,7 +55,7 @@ function policies(t: Template): any[] {
   return [
     ...Object.values(t.findResources("AWS::IAM::Policy")),
     ...Object.values(t.findResources("AWS::IAM::ManagedPolicy")),
-  ].flatMap((p: any) => p.Properties.PolicyDocument.Statement);
+  ].flatMap((p: any) => plainStatements(p.Properties.PolicyDocument.Statement));
 }
 const s = (v: unknown) => JSON.stringify(v);
 

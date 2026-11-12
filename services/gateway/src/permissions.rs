@@ -811,6 +811,7 @@ pub const CAPABILITIES: &[Capability] = &[
             "system::set_uninstall_mode",
             "system::update_now",
             "system::apply_update",
+            "system::set_options",
             "system::check_update",
             "system::check_releases",
             "system::rollback",

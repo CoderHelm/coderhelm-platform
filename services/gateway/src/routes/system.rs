@@ -284,6 +284,68 @@ pub async fn apply_update(
     answer(body)
 }
 
+/// The install's switches for what it reads in its own account
+/// (lambda/updater, OPTION_PARAMS), each `on` or `off`.
+pub const OPTION_PARAMS: &[&str] = &[
+    "InfrastructureVulnerabilities",
+    "InspectorFindings",
+    "HealthEvents",
+];
+
+/// The switches a request may change: `{"options": {"InspectorFindings": "on"}}`.
+pub fn options_from(body: &Value) -> Result<serde_json::Map<String, Value>, &'static str> {
+    let Some(o) = body.get("options").and_then(Value::as_object) else {
+        return Err("send options: one or more of InfrastructureVulnerabilities, InspectorFindings and HealthEvents, each on or off");
+    };
+    if o.is_empty() {
+        return Err("send at least one switch");
+    }
+    for (k, v) in o {
+        if !OPTION_PARAMS.contains(&k.as_str()) {
+            return Err("only InfrastructureVulnerabilities, InspectorFindings and HealthEvents can be switched");
+        }
+        if !matches!(v.as_str(), Some("on") | Some("off")) {
+            return Err("each switch is on or off");
+        }
+    }
+    Ok(o.clone())
+}
+
+/// Who may switch what the install reads in its own account: a team admin
+/// (role 3) who is also an install admin, never a support view.
+pub(crate) fn may_set_options(claims: &Claims, install_admin: bool) -> Result<(), StatusCode> {
+    claims.require_role(3)?;
+    if !install_admin {
+        warn!(email = %claims.email, "Install options refused: not an install admin");
+        return Err(StatusCode::FORBIDDEN);
+    }
+    Ok(())
+}
+
+/// POST /api/system/options: switch infrastructure vulnerabilities, Amazon
+/// Inspector findings or AWS Health events for the install's own account.
+/// The updater prepares a change set that changes only those stack
+/// parameters on the running release; its permission changes wait for an
+/// admin's confirmation (POST /api/system/update/apply), like an update's.
+pub async fn set_options(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<Value>,
+) -> Reply {
+    claims.require_role(3).map_err(status_only)?;
+    may_set_options(&claims, is_platform_admin(&claims)).map_err(status_only)?;
+    let options =
+        options_from(&body).map_err(|m| (StatusCode::BAD_REQUEST, Json(json!({ "error": m }))))?;
+    warn!(email = %claims.email, options = %serde_json::Value::Object(options.clone()), "Install options change requested");
+    let body = call(
+        &state,
+        json!({ "action": "set_options", "options": options, "actor": claims.email }),
+    )
+    .await
+    .map_err(status_only)?;
+    answer(body)
+}
+
 /// Who may make the updater read GitHub's release list now: a team admin
 /// (role 3) who is also an install admin.
 pub(crate) fn may_check_releases(claims: &Claims, install_admin: bool) -> Result<(), StatusCode> {
@@ -629,6 +691,42 @@ mod tests {
         assert_eq!(p["action"], "status");
         assert_eq!(p["refresh"], true);
         assert_eq!(p["actor"], "admin@acme.example");
+    }
+
+    #[test]
+    fn only_install_admins_who_are_team_admins_may_switch_the_installs_reads() {
+        assert_eq!(may_set_options(&claims("admin"), true), Ok(()));
+        assert_eq!(may_set_options(&claims("owner"), true), Ok(()));
+        assert_eq!(
+            may_set_options(&claims("admin"), false),
+            Err(StatusCode::FORBIDDEN)
+        );
+        assert_eq!(
+            may_set_options(&claims("member"), true),
+            Err(StatusCode::FORBIDDEN)
+        );
+        assert_eq!(
+            may_set_options(&claims("viewer"), true),
+            Err(StatusCode::FORBIDDEN)
+        );
+        // The route belongs to the system capability, like Update.
+        assert_eq!(
+            crate::permissions::handler_capability("system::set_options").map(|c| c.key),
+            Some("system")
+        );
+    }
+
+    #[test]
+    fn a_switch_names_only_the_three_reads_each_on_or_off() {
+        let o =
+            options_from(&json!({"options": {"InspectorFindings": "on", "HealthEvents": "off"}}))
+                .unwrap();
+        assert_eq!(o.len(), 2);
+        assert!(options_from(&json!({})).is_err());
+        assert!(options_from(&json!({"options": {}})).is_err());
+        assert!(options_from(&json!({"options": {"Hostname": "on"}})).is_err());
+        assert!(options_from(&json!({"options": {"InspectorFindings": true}})).is_err());
+        assert!(options_from(&json!({"options": {"InspectorFindings": "yes"}})).is_err());
     }
 
     #[test]
