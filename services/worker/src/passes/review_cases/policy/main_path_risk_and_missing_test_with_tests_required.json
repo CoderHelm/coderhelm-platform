@@ -1,0 +1,72 @@
+{
+  "description": "The same review in a repository with Require tests on: the unchecked main-path risk blocks as needing a check, and the missing test for the new request function blocks by the tests rule. The speculative edge-case timeout stays a note.",
+  "steps": [
+    {
+      "require_tests": true
+    },
+    {
+      "push": {
+        "head": "d4e5f6a",
+        "changed": {
+          "src/commands/search.js": [
+            60,
+            92,
+            101
+          ]
+        }
+      }
+    },
+    {
+      "review": {
+        "trigger": "synchronize",
+        "dedup_key": "head#d4e5f6a",
+        "model": {
+          "verdict": "APPROVE",
+          "summary": "x",
+          "findings": [
+            {
+              "file": "src/commands/search.js",
+              "line": 101,
+              "severity": "low",
+              "category": "hardening",
+              "evidence": "unverified-concern",
+              "optional": true,
+              "title": "Tunnelled requests with a body are sent without Content-Length",
+              "body": "`request` passes `init.body` as a JSON string. On the `fetch` path, Node sets `Content-Length` for a string body. On the new `https.request` path no length is set, so Node sends `Transfer-Encoding: chunked` for every search with a body: `search query`, `find-class` and the trace hop. I couldn't confirm whether the private domain accepts chunked search requests; the description's live check names `_cluster/health`, which has no body. Setting the header keeps both paths sending the same thing."
+            },
+            {
+              "file": "src/commands/search.js",
+              "line": 92,
+              "severity": "low",
+              "category": "tests",
+              "evidence": "verified-defect",
+              "optional": true,
+              "title": "requestViaTunnel has no test",
+              "body": "The new tests cover `isPrivateEndpoint` and `proxyConfig`, but nothing exercises `requestViaTunnel` or the `credentials.tunnelPort` branch in `request`. That code carries the TLS servername/Host handling and the response shape that `searchIndex` relies on. Suggested test: start a local `https.createServer` and assert the Host header, path and JSON."
+            },
+            {
+              "file": "src/commands/search.js",
+              "line": 60,
+              "severity": "low",
+              "category": "hardening",
+              "evidence": "unverified-concern",
+              "basis": "external",
+              "title": "A slow bastion might time out the first connection",
+              "body": "If the bastion is slow to start, the first connection might time out. I couldn't confirm how long it takes; a retry would be nice to have."
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "expect": {
+    "formal": [
+      [
+        "d4e5f6a",
+        "REQUEST_CHANGES"
+      ]
+    ],
+    "body_contains": [],
+    "last_notes": 1
+  }
+}

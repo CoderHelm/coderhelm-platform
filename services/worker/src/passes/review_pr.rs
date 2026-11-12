@@ -3129,6 +3129,7 @@ async fn run_once(
             documented = grounded.documented,
             traced = grounded.traced,
             unquoted_rules = grounded.unquoted_rules,
+            main_path = grounded.main_path,
             "Findings grounded for the severity classifier"
         );
     }
@@ -5157,6 +5158,7 @@ fn findings_record(findings: &[review_agent::Finding]) -> String {
                 "category": f.category,
                 "required": f.required.as_deref().unwrap_or(""),
                 "critical_path": f.critical_path.as_deref().unwrap_or(""),
+                "main_path": f.main_path.as_deref().unwrap_or(""),
                 "class_reason": super::review_severity::classify(f).reason(),
                 "severity_checked": check.is_some(),
                 "severity_check_reason": check.map(|c| c.reason.as_str()).unwrap_or(""),
