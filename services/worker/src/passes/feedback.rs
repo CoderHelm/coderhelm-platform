@@ -362,6 +362,48 @@ pub async fn run(
         )
     };
 
+    // A lockfile out of sync with its manifest is repaired by code, before
+    // any model round and outside the fix rounds' budget: each package
+    // manager writes its own lockfile in the sandbox, one commit on the pull
+    // request, and CI decides again. With the lockfiles written the model
+    // has no CI failure left to read here.
+    if let Some(cause) = common::lockfile_sync::cause(&common::lockfile_sync::mismatches(&ci_logs))
+    {
+        let pr_branch = get_pr_branch(state, &msg).await.unwrap_or_default();
+        if !pr_branch.is_empty() {
+            let base = resolve_pr_base(&github, &msg).await;
+            let ticket_msg = run_ticket_message(&msg, &ticket, base);
+            let repair = super::resume::lock_repair_on_pr(
+                state,
+                &ticket_msg,
+                &github,
+                &pr_branch,
+                (&[], "", &provider),
+                &msg.run_id,
+                None,
+                msg.round_attempt as usize,
+            )
+            .await;
+            super::add_progress_note(
+                state,
+                &msg.team_id,
+                &msg.run_id,
+                &super::resume::lock_repair_note(&cause, &repair),
+            )
+            .await;
+            if repair.written.is_empty() {
+                ci_failure_block.push_str(&format!(
+                    "\nLockfiles: CI says {cause}. CoderHelm ran each package manager's own \
+                     lockfile command in the sandbox: {}. Never write a lockfile by hand; \
+                     change the manifest so its package manager can resolve it.\n",
+                    repair.note()
+                ));
+            } else {
+                ci_failure_block.clear();
+            }
+        }
+    }
+
     // CI fixing riding along with a human comment is still an automated fix:
     // it draws from the same per-run rounds as CI-only cycles (claimed below),
     // by the supervisor's rule. When the rounds are over, the person's
@@ -2566,6 +2608,14 @@ impl<'a> ToolExecutor for FeedbackToolExecutor<'a> {
                         "Cannot modify {path}: CI/CD workflow files are protected."
                     )));
                 }
+                if let Some(refusal) = lockfile_write_refusal(path) {
+                    crate::agent::tool_outcome::note(
+                        crate::agent::tool_outcome::ToolOutcome::soft_fail(
+                            "refused: a lockfile is written by its package manager",
+                        ),
+                    );
+                    return Ok(json!(refusal));
+                }
                 if self.scope_guard.should_block(path) {
                     crate::agent::tool_outcome::note(
                         crate::agent::tool_outcome::ToolOutcome::soft_fail(
@@ -2669,6 +2719,14 @@ impl<'a> ToolExecutor for FeedbackToolExecutor<'a> {
                     return Ok(json!(format!(
                         "Cannot modify {path}: CI/CD workflow files are protected."
                     )));
+                }
+                if let Some(refusal) = lockfile_write_refusal(path) {
+                    crate::agent::tool_outcome::note(
+                        crate::agent::tool_outcome::ToolOutcome::soft_fail(
+                            "refused: a lockfile is written by its package manager",
+                        ),
+                    );
+                    return Ok(json!(refusal));
                 }
                 if self.scope_guard.should_block(path) {
                     crate::agent::tool_outcome::note(
@@ -2789,6 +2847,17 @@ impl<'a> ToolExecutor for FeedbackToolExecutor<'a> {
                             path: path.to_string(),
                         });
                     } else {
+                        if let Some(refusal) = lockfile_write_refusal(path) {
+                            crate::agent::tool_outcome::note(
+                                crate::agent::tool_outcome::ToolOutcome::soft_fail(
+                                    "nothing committed: a lockfile is written by its package manager",
+                                ),
+                            );
+                            return Ok(json!(format!(
+                                "Batch write REJECTED. {refusal} Send the batch again without \
+                                 {path}."
+                            )));
+                        }
                         let content = f.get("content").and_then(|v| v.as_str()).unwrap_or("");
                         if let Err(problem) =
                             super::syntax_check::validate_change(path, None, content)
@@ -4120,6 +4189,14 @@ pub(crate) fn top_level_reply(
         common::truncate_str(&text, 60_000).to_string()
     };
     Some(format!("@{author} {text}{consulted}"))
+}
+
+/// A feedback round's write to a lockfile is refused, like the coder's
+/// (`implement::lockfile_write_refusal`); this round has no regenerate
+/// tool, so the refusal says CoderHelm regenerates it by code.
+pub(crate) fn lockfile_write_refusal(path: &str) -> Option<String> {
+    common::lockfile_sync::lock_manager(path)
+        .map(|_| common::lockfile_sync::refusal_without_tool(path))
 }
 
 #[cfg(test)]

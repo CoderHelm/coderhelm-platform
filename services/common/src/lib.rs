@@ -158,6 +158,9 @@ pub mod handback;
 /// what a person's mention there does about it.
 pub mod held_work;
 pub mod jira_text;
+/// A lockfile out of sync with its manifest: read from a log, repaired by
+/// code with the package manager's own command, never written by a model.
+pub mod lockfile_sync;
 /// Anthropic API or Amazon Bedrock, and Bedrock's model ids.
 pub mod model_provider;
 /// Plugins: packages of skills, agents, tools, triggers and outputs a team installs.

@@ -1532,14 +1532,14 @@ async fn regenerate(
     let (owner, name) = (&w.msg.repo_owner, &w.msg.repo_name);
     let repo = load(w.github, owner, name, w.branch).await;
     let mut gens = detect(&repo);
-    // A security fix's lockfiles are written by their package manager,
-    // never by hand: they run first, so a generator's install after them
-    // reads a lockfile that matches the manifests.
-    let locks = if common::security_fixes::is_ticket(&w.msg.ticket_id) {
-        lockfile_generators(&repo.tree)
-    } else {
-        Vec::new()
-    };
+    // A lockfile is written by its package manager, never by hand, for
+    // any ticket: a branch that changes a manifest (or a lockfile) gets the
+    // lockfile written again. They run first, so a generator's install
+    // after them reads a lockfile that matches the manifests. (This used to
+    // be a security fix's alone; every other ticket that touched a manifest
+    // shipped a stale lockfile and failed its frozen install in CI.)
+    let security = common::security_fixes::is_ticket(&w.msg.ticket_id);
+    let locks = lockfile_generators(&repo.tree);
     if gens.is_empty() && locks.is_empty() {
         return None;
     }
@@ -1636,6 +1636,18 @@ async fn regenerate(
                     ));
                     changed.extend(paths);
                 }
+            }
+            // Outside a security fix, a lockfile its manager couldn't write
+            // here (a private registry the sandbox has no token for) never
+            // holds the pull request: it is named, and CI decides. When CI
+            // then reports it out of sync, the repair runs again with what
+            // CI printed (`repair_lockfiles`).
+            Ran::Failed(why, _) if g.kind == GenKind::Lockfile && !security => {
+                info!(generator = %g.name, why, "Lockfile not written in the sandbox");
+                notes.push(format!(
+                    "{} couldn't be written here ({why}); CI on the pull request shows whether it matches the manifests",
+                    g.name
+                ));
             }
             Ran::Failed(why, output) => {
                 // Public values the generator reads that the repository's
@@ -1925,6 +1937,339 @@ pub async fn gate(
             block_reason(g, inputs, why)
         ))),
     }
+}
+
+// ── Lockfiles out of sync: repaired by code ─────────────────────────────────
+
+/// What a lockfile repair came to (see `common::lockfile_sync`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LockRepair {
+    /// Lockfiles their manager wrote, committed on the branch.
+    pub written: Vec<String>,
+    /// Lockfiles their manager ran on and left as they were.
+    pub clean: Vec<String>,
+    /// Lockfiles their manager couldn't write, each with why.
+    pub failed: Vec<(String, String)>,
+    /// Why nothing ran (no sandbox, no time, a refused command), when
+    /// nothing did.
+    pub not_run: Option<String>,
+}
+
+impl LockRepair {
+    fn not_run(why: impl Into<String>) -> Self {
+        LockRepair {
+            not_run: Some(why.into()),
+            ..Default::default()
+        }
+    }
+
+    /// One line for the run page and for what a fix round already tried.
+    pub fn note(&self) -> String {
+        if let Some(why) = &self.not_run {
+            return format!("the lockfiles couldn't be regenerated here ({why})");
+        }
+        let mut parts = Vec::new();
+        if !self.written.is_empty() {
+            parts.push(format!(
+                "regenerated {} with {} own package manager and committed {}",
+                list(&self.written, 6),
+                if self.written.len() == 1 {
+                    "its"
+                } else {
+                    "their"
+                },
+                if self.written.len() == 1 {
+                    "it"
+                } else {
+                    "them"
+                },
+            ));
+        }
+        if !self.clean.is_empty() {
+            parts.push(format!(
+                "{} already matched {}",
+                list(&self.clean, 6),
+                if self.clean.len() == 1 {
+                    "its manifest"
+                } else {
+                    "their manifests"
+                },
+            ));
+        }
+        for (lock, why) in &self.failed {
+            parts.push(format!("`{lock}` couldn't be written ({why})"));
+        }
+        if parts.is_empty() {
+            "no lockfile reads a file this branch changes".to_string()
+        } else {
+            parts.join("; ")
+        }
+    }
+}
+
+/// The lockfiles to write again for a branch whose changed files are
+/// `changed`: every lockfile the branch touches, and every lockfile whose
+/// manifests it touches (a nested package's own, not its parent's).
+pub fn lockfiles_to_repair(
+    tree: &[String],
+    changed: &[String],
+) -> Vec<common::upgrade_notes::LockTool> {
+    common::upgrade_notes::lock_tools(tree)
+        .into_iter()
+        .filter(|t| {
+            let g = Generator {
+                kind: GenKind::Lockfile,
+                name: String::new(),
+                command: String::new(),
+                inputs: t.inputs.clone(),
+                outputs: vec![t.lockfile.clone()],
+            };
+            !lockfile_hits(&g, changed).is_empty()
+        })
+        .collect()
+}
+
+/// A repair build's outcome as what to commit and what to say: a lockfile
+/// whose manager exited 0 is written (when it changed) or clean; any other
+/// is named with the end of its output. Only lockfiles are committed.
+pub fn read_lock_repair(
+    tools: &[common::upgrade_notes::LockTool],
+    o: &CodegenOutcome,
+) -> (Vec<(String, String)>, LockRepair) {
+    use common::lockfile_sync as ls;
+    if !o.ran {
+        return (
+            Vec::new(),
+            LockRepair::not_run(common::truncate_str(o.output.trim(), 300)),
+        );
+    }
+    let marks = ls::repair_marks(&o.output);
+    if marks.is_empty() {
+        // The build ended before any manager reported: no verdict on any
+        // lockfile, and nothing to commit.
+        let said = common::tail_str(o.output.trim(), 300);
+        return (
+            Vec::new(),
+            LockRepair::not_run(if said.is_empty() {
+                "the sandbox build gave no result".to_string()
+            } else {
+                format!("the sandbox build gave no result: {said}")
+            }),
+        );
+    }
+    let mut rep = LockRepair::default();
+    let mut files = Vec::new();
+    for (i, t) in tools.iter().enumerate() {
+        match marks.iter().find(|(m, _)| *m == i).map(|(_, c)| *c) {
+            Some(0) => match o.changed.iter().find(|(p, _)| *p == t.lockfile) {
+                Some(f) => {
+                    files.push(f.clone());
+                    rep.written.push(t.lockfile.clone());
+                }
+                None => rep.clean.push(t.lockfile.clone()),
+            },
+            Some(code) => {
+                let tail = ls::failure_tail(&o.output, i);
+                rep.failed.push((
+                    t.lockfile.clone(),
+                    if tail.is_empty() {
+                        format!("{} exited {code}", t.manager)
+                    } else {
+                        format!("{} exited {code}: {tail}", t.manager)
+                    },
+                ));
+            }
+            None => rep.failed.push((
+                t.lockfile.clone(),
+                format!("{} gave no result in the sandbox", t.manager),
+            )),
+        }
+    }
+    (files, rep)
+}
+
+/// Where a lockfile repair runs and commits.
+pub(crate) struct LockJob<'a> {
+    pub github: &'a GitHubClient,
+    pub owner: &'a str,
+    pub repo: &'a str,
+    pub branch: &'a str,
+    pub run_id: &'a str,
+    pub sandbox: &'a crate::clients::sandbox::SandboxClient<'a>,
+    pub node: Option<&'a str>,
+    pub deadline: Option<std::time::Instant>,
+    /// The build's number in this run (its S3 key).
+    pub nonce: usize,
+    pub message: &'a str,
+}
+
+/// The lockfiles the branch's changes call for and the one command that
+/// writes them. `None` when the branch changes no manifest and no lockfile
+/// (or its files can't be read).
+pub(crate) async fn plan_lock_repair(
+    github: &GitHubClient,
+    owner: &str,
+    repo: &str,
+    base: &str,
+    branch: &str,
+) -> Option<(Vec<common::upgrade_notes::LockTool>, String)> {
+    let tree: Vec<String> = github
+        .get_tree(owner, repo, branch)
+        .await
+        .ok()?
+        .into_iter()
+        .filter(|e| e.entry_type == "blob")
+        .map(|e| e.path)
+        .collect();
+    let changed = super::plan_coverage::changed_files(github, owner, repo, base, branch).await?;
+    let tools = lockfiles_to_repair(&tree, &changed);
+    if tools.is_empty() {
+        return None;
+    }
+    let cmd = common::lockfile_sync::repair_command(&tools);
+    Some((tools, cmd))
+}
+
+/// Runs the repair build and commits the lockfiles it wrote, as one commit.
+pub(crate) async fn run_lock_repair(
+    job: &LockJob<'_>,
+    tools: &[common::upgrade_notes::LockTool],
+    cmd: &str,
+) -> LockRepair {
+    if !job.sandbox.has_time(job.deadline) {
+        return LockRepair::not_run("this step has too little time left for a sandbox build");
+    }
+    let head = match job.github.get_ref(job.owner, job.repo, job.branch).await {
+        Ok(h) => h,
+        Err(e) => return LockRepair::not_run(format!("the branch head couldn't be read: {e}")),
+    };
+    let source = match job
+        .sandbox
+        .ensure_source(job.run_id, &head, || {
+            job.github.download_tarball(job.owner, job.repo, &head)
+        })
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => return LockRepair::not_run(format!("the branch couldn't be snapshotted: {e}")),
+    };
+    let o = match job
+        .sandbox
+        .run_codegen(
+            job.run_id,
+            job.nonce,
+            &source,
+            cmd,
+            job.node,
+            &[],
+            job.deadline,
+        )
+        .await
+    {
+        Ok(o) => o,
+        Err(e) => return LockRepair::not_run(format!("the sandbox build didn't start: {e}")),
+    };
+    let (files, mut rep) = read_lock_repair(tools, &o);
+    if files.is_empty() {
+        return rep;
+    }
+    let ops: Vec<FileOp> = files
+        .into_iter()
+        .map(|(path, content)| FileOp::Write { path, content })
+        .collect();
+    if let Err(e) = job
+        .github
+        .batch_write(job.owner, job.repo, job.branch, job.message, &ops)
+        .await
+    {
+        // Written in the sandbox, not on the branch: say so per lockfile.
+        let why = format!("its commit was refused: {e}");
+        rep.failed
+            .extend(rep.written.drain(..).map(|l| (l, why.clone())));
+    }
+    rep
+}
+
+/// The deterministic repair for "lockfile out of sync", for any ticket:
+/// every lockfile the branch's changes call for is written by its own
+/// package manager in the sandbox and committed on `w.branch`. Says why
+/// when nothing could run; never an error.
+pub(crate) async fn repair_lockfiles(w: &Work<'_>, nonce: usize) -> LockRepair {
+    let state = w.state;
+    if state.config.sandbox_bucket_name.is_empty() || state.config.sandbox_project_name.is_empty() {
+        return LockRepair::not_run("no sandbox is set up");
+    }
+    let (owner, name) = (&w.msg.repo_owner, &w.msg.repo_name);
+    let Some((tools, cmd)) =
+        plan_lock_repair(w.github, owner, name, &w.msg.base_branch, w.branch).await
+    else {
+        return LockRepair::default();
+    };
+    let gate = crate::agent::policy::gate(
+        state,
+        w.provider.scope.ctx(common::agent_policy::Agent::Coder),
+        w.deadline,
+    );
+    match gate
+        .check_command(&cmd, "Regenerate the lockfiles with their package managers")
+        .await
+    {
+        common::agent_policy::Outcome::Run { .. } => {}
+        _ => return LockRepair::not_run("the team's agent permissions hold this command"),
+    }
+    let hosts: Vec<String> = kind_hosts(GenKind::Lockfile)
+        .iter()
+        .map(|h| h.to_string())
+        .collect();
+    let sandbox = crate::clients::sandbox::SandboxClient::new(
+        &state.codebuild,
+        &state.s3,
+        &state.logs,
+        &state.config.sandbox_bucket_name,
+        &state.config.sandbox_project_name,
+    )
+    .with_egress(crate::agent::policy::sandbox_egress(state, &w.msg.team_id).await)
+    .with_generator_hosts(hosts, vec![cmd.clone()]);
+    let node = super::detect_node_version(w.github, owner, name, w.branch).await;
+    let conventions = super::load_git_conventions(state, &w.msg.team_id, &w.msg.ticket_id).await;
+    let message = conventions.commit_message(
+        &super::ticket_tokens(w.msg),
+        "Regenerate the lockfiles with their package managers",
+    );
+    let rep = run_lock_repair(
+        &LockJob {
+            github: w.github,
+            owner,
+            repo: name,
+            branch: w.branch,
+            run_id: w.run_id,
+            sandbox: &sandbox,
+            node: node.as_deref(),
+            deadline: w.deadline,
+            nonce: 700 + nonce,
+            message: &message,
+        },
+        &tools,
+        &cmd,
+    )
+    .await;
+    info!(
+        run_id = w.run_id,
+        written = rep.written.len(),
+        clean = rep.clean.len(),
+        failed = rep.failed.len(),
+        not_run = rep.not_run.as_deref().unwrap_or(""),
+        "Lockfile repair"
+    );
+    rep
+}
+
+/// The registries a lockfile's package manager reads.
+pub(crate) fn lockfile_hosts() -> Vec<String> {
+    kind_hosts(GenKind::Lockfile)
+        .iter()
+        .map(|h| h.to_string())
+        .collect()
 }
 
 #[cfg(test)]

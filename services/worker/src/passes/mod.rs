@@ -2913,7 +2913,7 @@ async fn run_passes(
         plan_result.fix = fix_location::fallback(
             triage_result.intent,
             &plan_result.tasks,
-            "the plan carried no fix_location decision; decided from its tasks",
+            no_decision_reason(dep_run.is_some()),
         );
     }
 
@@ -4095,7 +4095,31 @@ async fn run_passes(
                 "Re-run detection: PR status"
             );
 
-            if (has_ci_failure || has_review_feedback) && !context_changed {
+            // A dependency fix run never patches an earlier attempt's pull
+            // request with a model: it rebuilds the change from the plan the
+            // rules just made (`dep_fix::drive`: the branch goes back to the
+            // base's files, each bump is applied and its lockfile written by
+            // the package manager in the sandbox, only verified sets are
+            // committed). A person's review comments still get their round.
+            let dep_rebuilds = rebuilds_by_plan(dep_run.is_some(), has_review_feedback);
+            if dep_rebuilds && has_ci_failure && !context_changed {
+                info!(
+                    run_id,
+                    pr_number,
+                    "Re-run detected: the open PR's checks fail; the dependency run rebuilds it from its plan"
+                );
+                add_progress_note(
+                    state,
+                    &msg.team_id,
+                    run_id,
+                    &format!(
+                        "Pull request #{pr_number} has failing checks. This run rebuilds its change on the same branch from the base branch: each bump applied and each lockfile written by its package manager in the sandbox, only verified sets committed."
+                    ),
+                )
+                .await;
+            }
+
+            if (has_ci_failure || has_review_feedback) && !context_changed && !dep_rebuilds {
                 // Build combined feedback from CI failures and review comments
                 let mut feedback_parts: Vec<String> = Vec::new();
 
@@ -4244,6 +4268,41 @@ async fn run_passes(
 
                 // A fix round on an open PR: checkpoints go to its own WIP
                 // branch, and the PR gets one commit (one push) at the end.
+                // A lockfile out of sync with its manifest is repaired by
+                // code before any model round, for any ticket: the package
+                // managers write the lockfiles in the sandbox, one commit.
+                // With nothing else asked (no review comments), that is the
+                // whole fix and CI decides.
+                let mut fixed_by_code = false;
+                if let Some(cause) =
+                    common::lockfile_sync::cause(&common::lockfile_sync::mismatches(&feedback))
+                {
+                    let repair = generators::repair_lockfiles(
+                        &plan_coverage::Work {
+                            state,
+                            msg,
+                            github: &github,
+                            plan: &plan_result,
+                            branch: &branch_name,
+                            rules: &[],
+                            repo_instructions: "",
+                            provider: &provider,
+                            file_cache: &file_cache,
+                            run_id,
+                            deadline: implement_deadline,
+                        },
+                        0,
+                    )
+                    .await;
+                    add_progress_note(
+                        state,
+                        &msg.team_id,
+                        run_id,
+                        &resume::lock_repair_note(&cause, &repair),
+                    )
+                    .await;
+                    fixed_by_code = !repair.written.is_empty() && !has_review_feedback;
+                }
                 let fix_base =
                     round::branch_head(&github, &msg.repo_owner, &msg.repo_name, &branch_name)
                         .await;
@@ -4251,35 +4310,40 @@ async fn run_passes(
                     round::open_wip(&github, &msg.repo_owner, &msg.repo_name, &branch_name, "")
                         .await?;
 
-                match implement::run(
-                    state,
-                    msg,
-                    &github,
-                    &plan_result,
-                    &fix_wip,
-                    &[],
-                    "",
-                    Some(&feedback),
-                    "medium",
-                    &provider,
-                    usage,
-                    &file_cache,
-                    Some(run_id),
-                    implement_deadline,
-                    // Scoped only when purely CI-driven; human review comments
-                    // in the feedback mean the human's ask wins (unscoped).
-                    !has_review_feedback,
-                )
-                .await
-                .and_then(|r| {
-                    // Partial work never reaches the PR: it stays on the WIP
-                    // branch, and the run starts over below.
-                    if r.timed_out {
-                        Err(format!("ran out of time; its work is kept on `{fix_wip}`").into())
-                    } else {
-                        Ok(r)
-                    }
-                }) {
+                let ran = if fixed_by_code {
+                    Ok(None)
+                } else {
+                    implement::run(
+                        state,
+                        msg,
+                        &github,
+                        &plan_result,
+                        &fix_wip,
+                        &[],
+                        "",
+                        Some(&feedback),
+                        "medium",
+                        &provider,
+                        usage,
+                        &file_cache,
+                        Some(run_id),
+                        implement_deadline,
+                        // Scoped only when purely CI-driven; human review comments
+                        // in the feedback mean the human's ask wins (unscoped).
+                        !has_review_feedback,
+                    )
+                    .await
+                    .and_then(|r| {
+                        // Partial work never reaches the PR: it stays on the WIP
+                        // branch, and the run starts over below.
+                        if r.timed_out {
+                            Err(format!("ran out of time; its work is kept on `{fix_wip}`").into())
+                        } else {
+                            Ok(Some(r))
+                        }
+                    })
+                };
+                match ran {
                     Ok(result) => {
                         let landed = round::land(
                             &round::Pr {
@@ -4321,17 +4385,20 @@ async fn run_passes(
                             None,
                         )
                         .await;
-                        write_conversation_log(
-                            state,
-                            &msg.team_id,
-                            run_id,
-                            "ci_fix",
-                            &result.conversation_log,
-                        )
-                        .await;
+                        if let Some(result) = &result {
+                            write_conversation_log(
+                                state,
+                                &msg.team_id,
+                                run_id,
+                                "ci_fix",
+                                &result.conversation_log,
+                            )
+                            .await;
+                        }
                         info!(
                             run_id,
-                            files = result.files_modified.len(),
+                            files = result.as_ref().map_or(0, |r| r.files_modified.len()),
+                            by_code = fixed_by_code,
                             "Fix implemented on re-run"
                         );
 
@@ -7096,6 +7163,26 @@ async fn resumed_optional(
         return Vec::new();
     };
     plan_coverage::optional_findings(&changes.coverage(&tasks))
+}
+
+/// What a plan without a `fix_location` decision is recorded as. A plan
+/// the rules wrote (a dependency fix run: no planner ran) is no planner
+/// failure; any other plan without one is, and says so.
+pub(crate) fn no_decision_reason(planned_by_rules: bool) -> &'static str {
+    if planned_by_rules {
+        ""
+    } else {
+        "the plan carried no fix_location decision; decided from its tasks"
+    }
+}
+
+/// Whether a re-run that finds its open pull request red rebuilds the
+/// change from its plan instead of patching the pull request with a model:
+/// a dependency fix run does (its bumps and lockfiles are written by code
+/// and verified in the sandbox), unless a person's review comments wait on
+/// the pull request, which get their fix round first.
+pub(crate) fn rebuilds_by_plan(dep_run: bool, has_review_feedback: bool) -> bool {
+    dep_run && !has_review_feedback
 }
 
 /// Keeps a branch's commits on `coderhelm-wip/<branch>` when a run stops before its

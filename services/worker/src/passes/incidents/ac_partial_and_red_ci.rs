@@ -413,7 +413,7 @@ fn a_ci_fix_that_changes_nothing_tries_again_then_holds_and_needs_attention() {
     let no_change = &no_change[..no_change.find("super::GaveUp::NoChange").unwrap()];
     assert!(no_change.contains("if attempt < max_attempts\n"));
     assert!(no_change.contains("next_attempt_feedback("));
-    assert!(no_change.contains("continue;"));
+    assert!(no_change.contains("continue 'fix;"));
     assert!(no_change.contains("return hand_off_red_ci("));
     assert!(!no_change.contains("complete_run_with_status("));
     assert!(!no_change.contains("mark_pr_ready("));

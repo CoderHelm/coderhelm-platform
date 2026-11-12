@@ -1057,6 +1057,107 @@ mod tests {
                 ));
             }
         }
+        // The CI fix round and a re-run on an open pull request (the
+        // continued-PR path): nothing inside them ends the run. A fault is
+        // a classified decision with a way around it, red checks go back
+        // to the fix round before any ending, and the only failed endings
+        // for red checks come after the revert to green.
+        let from = resume
+            .find("let mut ci_round = run_round::Round::start(")
+            .unwrap_or(0);
+        let to = resume[from..]
+            .find("// A fix that left the tree unchanged")
+            .map_or(from, |i| from + i);
+        let ci_fix = &resume[from..to];
+        if ci_fix.is_empty() {
+            bad.push("resume.rs: the CI fix round can't be found".into());
+        }
+        for ends in [
+            "finish_incomplete(",
+            "complete_run_with_status(",
+            "fail_run(",
+            "end_run(",
+        ] {
+            if ci_fix.contains(ends) {
+                bad.push(format!(
+                    "resume.rs: the CI fix round ends the run itself (`{ends}`)"
+                ));
+            }
+        }
+        for needs in [
+            "super::round::after_fault(",
+            "super::round::fault_of(",
+            "break 'attempt Some(",
+        ] {
+            if !ci_fix.contains(needs) {
+                bad.push(format!(
+                    "resume.rs: the CI fix round no longer classifies a fault (`{needs}`)"
+                ));
+            }
+        }
+        let complete = body(&resume, "\nasync fn complete_run_with_status(");
+        match (
+            complete.find("redrive_red_ci("),
+            complete.find("wait_for_review("),
+        ) {
+            (Some(r), Some(w)) if r < w => {}
+            _ => bad.push(
+                "resume.rs: complete_run_with_status ends a red run before its CI fix round is asked"
+                    .into(),
+            ),
+        }
+        for (i, _) in resume.match_indices("fail_run(") {
+            let before = &resume[..i];
+            let owner = ["\nasync fn ", "\npub(crate) async fn "]
+                .iter()
+                .filter_map(|h| before.rfind(h).map(|at| (at, *h)))
+                .max()
+                .map(|(at, h)| {
+                    before[at + h.len()..]
+                        .split('(')
+                        .next()
+                        .unwrap_or("")
+                        .to_string()
+                })
+                .unwrap_or_default();
+            if !["wait_on_person", "end_red_ci_rounds"].contains(&owner.as_str()) {
+                bad.push(format!(
+                    "resume.rs: `{owner}` fails a run; only the supervisor's ending may"
+                ));
+            }
+        }
+        let passes = find("passes/mod.rs");
+        let from = passes.find("let mut fixed_by_code = false;").unwrap_or(0);
+        let to = passes[from..]
+            .find("falling through to fresh start")
+            .map_or(from, |i| from + i);
+        let rerun = &passes[from..to];
+        if rerun.is_empty() {
+            bad.push("mod.rs: the re-run's fix on an open pull request can't be found".into());
+        }
+        for ends in ["fail_run(", "mark_run_needs_input(", ".needs_input("] {
+            if rerun.contains(ends) {
+                bad.push(format!(
+                    "mod.rs: a re-run's fix on an open pull request ends the run (`{ends}`)"
+                ));
+            }
+        }
+        match (
+            rerun.find("generators::repair_lockfiles("),
+            rerun.find("implement::run("),
+        ) {
+            (Some(r), Some(m)) if r < m => {}
+            _ => {
+                bad.push("mod.rs: a re-run's fix asks the model before the repairs by code".into())
+            }
+        }
+        if !passes.contains(
+            "if (has_ci_failure || has_review_feedback) && !context_changed && !dep_rebuilds {",
+        ) {
+            bad.push(
+                "mod.rs: a dependency run's re-run patches its pull request with a model".into(),
+            );
+        }
         assert!(
             bad.is_empty(),
             "endings around the supervisor:\n{}",

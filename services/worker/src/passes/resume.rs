@@ -905,6 +905,106 @@ async fn ci_evidence(
 /// The next attempt's instructions after one that changed nothing: the same
 /// failure, what was tried, a different approach (reproduce first), and the
 /// evidence read again.
+/// How hard a CI fix attempt thinks: the last attempt of a round that
+/// hasn't changed the code yet runs on the strongest model, never the same
+/// loop a third time.
+pub(crate) fn ci_fix_effort(attempt: usize, max: usize) -> &'static str {
+    if attempt > 1 && attempt >= max {
+        "complex"
+    } else {
+        "medium"
+    }
+}
+
+/// The run page's line for a lockfile repair: the cause CI printed, and
+/// what regenerating came to.
+pub(crate) fn lock_repair_note(cause: &str, repair: &super::generators::LockRepair) -> String {
+    let then = if repair.written.is_empty() {
+        "The fix round goes on from there"
+    } else {
+        "No model round was needed; CI decides again"
+    };
+    format!(
+        "CI is failing because {cause}. CoderHelm {}. {then}.",
+        repair.note()
+    )
+}
+
+/// The one failing-CI ending text: what was open, and what the record says
+/// fails, said once (the same sentence used to be joined to itself).
+pub(crate) fn red_ending_text(reason: &str, red: &str, pr_number: u64) -> String {
+    let reason = reason.trim().trim_end_matches('.');
+    let red = red.trim().trim_end_matches('.');
+    let what = if reason.is_empty() || reason == red || reason.contains(red) {
+        if reason.is_empty() { red } else { reason }.to_string()
+    } else if red.contains(reason) {
+        red.to_string()
+    } else {
+        format!("{reason}; {red}")
+    };
+    format!("{what}. Every fix and revert CoderHelm tried is on pull request #{pr_number}.")
+}
+
+/// Regenerates the lockfiles the pull request's changes call for, on the
+/// pull request's branch, as one commit (`generators::repair_lockfiles`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn lock_repair_on_pr(
+    state: &WorkerState,
+    ticket_msg: &TicketMessage,
+    github: &GitHubClient,
+    branch: &str,
+    (rules, repo_instructions, provider): (&[String], &str, &crate::agent::provider::ModelProvider),
+    run_id: &str,
+    deadline: Option<std::time::Instant>,
+    nonce: usize,
+) -> super::generators::LockRepair {
+    let plan = plan::PlanResult {
+        proposal: String::new(),
+        tasks: String::new(),
+        spec: String::new(),
+        design: String::new(),
+        repo_tasks: vec![],
+        fix: None,
+    };
+    let file_cache = FileCache::default();
+    super::generators::repair_lockfiles(
+        &super::plan_coverage::Work {
+            state,
+            msg: ticket_msg,
+            github,
+            plan: &plan,
+            branch,
+            rules,
+            repo_instructions,
+            provider,
+            file_cache: &file_cache,
+            run_id,
+            deadline,
+        },
+        nonce,
+    )
+    .await
+}
+
+/// What fails in CI, kept on the run record (`ci_cause`) so every later
+/// message names it instead of "the pull request's checks".
+async fn record_ci_cause(state: &WorkerState, team_id: &str, run_id: &str, cause: &str) {
+    let cause = common::truncate_str(cause.trim(), 600);
+    if cause.is_empty() {
+        return;
+    }
+    let _ = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(team_id))
+        .key("run_id", attr_s(run_id))
+        .update_expression("SET ci_cause = :c")
+        .expression_attribute_values(":c", attr_s(cause))
+        .send()
+        .await;
+}
+
 pub(crate) fn next_attempt_feedback(
     base: &str,
     attempt: usize,
@@ -2186,6 +2286,85 @@ pub async fn run(
 
         // Load checkpoint for review cycle count
         let cycle = load_cycle_from_checkpoint(state, &msg.team_id, &msg.run_id).await;
+
+        // What fails, on the run record: every later message names it.
+        let lock_cause = common::lockfile_sync::cause(&common::lockfile_sync::mismatches(&logs));
+        record_ci_cause(
+            state,
+            &msg.team_id,
+            &msg.run_id,
+            &lock_cause.clone().unwrap_or_else(|| failure_excerpt(&logs)),
+        )
+        .await;
+        // A lockfile out of sync with its manifest is repaired by code:
+        // each package manager writes its own lockfile in the sandbox and
+        // the result is one commit on the pull request. No model round, and
+        // before the fix budget and the stall check: it is not a guess that
+        // can repeat (a second repair of the same files writes nothing).
+        let mut lock_tried = false;
+        let mut lock_context = String::new();
+        if let Some(cause) = &lock_cause {
+            lock_tried = true;
+            let repair = lock_repair_on_pr(
+                state,
+                &ticket_msg,
+                &github,
+                &branch,
+                (&rules, &repo_instructions, &provider),
+                &msg.run_id,
+                Some(super::round::deadline(start)),
+                cycle,
+            )
+            .await;
+            super::add_progress_note(
+                state,
+                &msg.team_id,
+                &msg.run_id,
+                &lock_repair_note(cause, &repair),
+            )
+            .await;
+            if !repair.written.is_empty() {
+                super::record_ci_outcome(
+                    state,
+                    &msg.team_id,
+                    &msg.run_id,
+                    super::CiOutcome::FixCommitted,
+                )
+                .await;
+                save_checkpoint(
+                    state,
+                    &msg.team_id,
+                    &msg.run_id,
+                    "pr",
+                    &branch,
+                    (cycle + 1) as u8,
+                    &usage,
+                )
+                .await;
+                mark_events_processed(state, &msg.run_id, &events).await;
+                if set_run_awaiting_ci(
+                    state,
+                    &ticket_msg,
+                    &msg.run_id,
+                    &pr_url,
+                    pr_number,
+                    &branch,
+                    &usage,
+                    wall_clock_secs(created_at, &start),
+                )
+                .await?
+                {
+                    send_delayed_resume(state, &msg, 120).await;
+                }
+                return Ok(());
+            }
+            lock_context = format!(
+                "\n\nLockfiles: CI says {cause}. CoderHelm ran each package manager's own \
+                 lockfile command in the sandbox: {}. Never write a lockfile by hand; change \
+                 the manifest so its package manager can resolve it, then call run_codegen.",
+                repair.note()
+            );
+        }
         let over_cycle = cycle >= MAX_CI_FIX_CYCLES;
         // Atomically claim a shared auto-fix slot (skipped when the cycle cap has
         // already tripped, so we don't consume a slot on the way out).
@@ -2314,7 +2493,7 @@ pub async fn run(
              - Before you finish, call run_checks to verify your fix builds and type-checks against real output. Do not finish on a red result if run_checks is available.\n\
              - You may create new test files or edit existing ones if needed.\n\n\
              Failure summary:\n{failure_logs}\n\n\
-             Full logs:\n{logs}{review_context}{base_note}"
+             Full logs:\n{logs}{review_context}{base_note}{lock_context}"
         );
 
         // The CI fix is a round of its own (common::run_round): its own
@@ -2356,8 +2535,11 @@ pub async fn run(
         }
         // The fix writes its checkpoints to its own WIP branch; the pull
         // request gets one commit when it's done.
-        ci_round.wip_branch =
-            super::round::open_wip(&github, &repo_owner, &repo_name, &branch, "").await?;
+        // (Each attempt below makes sure the branch is there before it
+        // writes; one that can't be made here is that attempt's fault.)
+        ci_round.wip_branch = super::round::open_wip(&github, &repo_owner, &repo_name, &branch, "")
+            .await
+            .unwrap_or_default();
         super::round::record(state, &msg.team_id, &msg.run_id, &ci_round).await;
 
         // The tree before the fix: compared with the tree after it to tell a
@@ -2379,184 +2561,185 @@ pub async fn run(
             .unwrap_or(&feedback)
             .to_string();
         let mut feedback = feedback;
-        loop {
-            match implement::run(
-                state,
-                &ticket_msg,
+        'fix: loop {
+            // Every attempt starts with its WIP branch there: an attempt
+            // that changed nothing had it cleaned up when it landed, and the
+            // next one used to write to a branch that no longer existed
+            // (every write a 404, then "its changes couldn't be read").
+            let ran = match super::round::open_wip(
                 &github,
-                &plan_result,
+                &repo_owner,
+                &repo_name,
+                &branch,
                 &ci_round.wip_branch,
-                &rules,
-                &repo_instructions,
-                Some(&feedback),
-                "medium",
-                &provider,
-                &mut usage,
-                &file_cache,
-                Some(&msg.run_id),
-                Some(super::round::deadline(start)),
-                // Scope to the PR only when this cycle is purely CI-driven; if
-                // human review comments ride along, the human's ask wins.
-                review_feedback.is_empty(),
             )
             .await
             {
-                Ok(result) if result.timed_out => {
-                    // Out of its budget with work left: what it wrote is
-                    // committed; the rest continues in a fresh step, or the run
-                    // says the round didn't finish.
-                    write_pass_trace(
-                        state,
-                        &msg.team_id,
-                        &msg.run_id,
-                        &format!("ci_fix:{}", cycle + 1),
-                        pass_start,
-                        &usage_before,
-                        &usage,
-                        None,
-                    )
-                    .await;
-                    mark_events_processed(state, &msg.run_id, &events).await;
-                    if ci_round.may_continue() {
-                        park_round(
-                            state,
-                            &msg,
-                            (&ticket_msg, &usage),
-                            &pr_ref,
-                            &ci_round,
-                            true,
-                            created_at,
-                            &start,
-                        )
-                        .await?;
-                        return Ok(());
-                    }
-                    super::round::finish_incomplete(
-                        state,
-                        &msg.team_id,
-                        &msg.run_id,
-                        &super::round::Pr {
-                            github: &github,
-                            owner: &repo_owner,
-                            repo: &repo_name,
-                            branch: &branch,
-                        },
-                        &ci_round,
-                        &run_round::out_of_time(ci_round.kind, ci_round.attempt),
-                    )
-                    .await;
-                    complete_run_with_status(
+                Ok(wip) => {
+                    ci_round.wip_branch = wip;
+                    implement::run(
                         state,
                         &ticket_msg,
-                        &msg.run_id,
-                        "completed",
-                        &pr_url,
-                        pr_number,
-                        &branch,
-                        &usage,
-                        wall_clock_secs(created_at, &start),
-                    )
-                    .await?;
-                    return Ok(());
-                }
-                Ok(mut result) => {
-                    // One commit, one push: the fix lands on the pull request.
-                    let message =
-                        super::round::round_message(state, &msg.team_id, &ticket_msg, &ci_round)
-                            .await;
-                    let gh = super::round::Pr {
-                        github: &github,
-                        owner: &repo_owner,
-                        repo: &repo_name,
-                        branch: &branch,
-                    };
-                    match super::round::land(
-                        &gh,
+                        &github,
+                        &plan_result,
                         &ci_round.wip_branch,
-                        &ci_round.base_sha,
-                        &message,
+                        &rules,
+                        &repo_instructions,
+                        Some(&feedback),
+                        ci_fix_effort(attempt, max_attempts),
+                        &provider,
+                        &mut usage,
+                        &file_cache,
+                        Some(&msg.run_id),
+                        Some(super::round::deadline(start)),
+                        // Scope to the PR only when this cycle is purely CI-driven; if
+                        // human review comments ride along, the human's ask wins.
+                        review_feedback.is_empty(),
                     )
                     .await
-                    {
-                        super::round::Landed::Pushed { .. } => {}
-                        super::round::Landed::Nothing => result.files_modified.clear(),
-                        super::round::Landed::Refused(why) => {
-                            mark_events_processed(state, &msg.run_id, &events).await;
-                            super::round::finish_incomplete(
+                }
+                Err(e) => Err(e),
+            };
+            // A fault inside the attempt (its changes couldn't land, the
+            // pass errored) leaves here with its text: the round takes the
+            // way around it below, never "the round didn't finish".
+            let fault: Option<String> = 'attempt: {
+                match ran {
+                    Ok(result) if result.timed_out => {
+                        // Out of its budget with work left: what it wrote is
+                        // committed; the rest continues in a fresh step, or the run
+                        // says the round didn't finish.
+                        write_pass_trace(
+                            state,
+                            &msg.team_id,
+                            &msg.run_id,
+                            &format!("ci_fix:{}", cycle + 1),
+                            pass_start,
+                            &usage_before,
+                            &usage,
+                            None,
+                        )
+                        .await;
+                        mark_events_processed(state, &msg.run_id, &events).await;
+                        if ci_round.may_continue() {
+                            park_round(
                                 state,
-                                &msg.team_id,
-                                &msg.run_id,
-                                &gh,
+                                &msg,
+                                (&ticket_msg, &usage),
+                                &pr_ref,
                                 &ci_round,
-                                &format!("its changes couldn't land on the pull request: {why}"),
-                            )
-                            .await;
-                            complete_run_with_status(
-                                state,
-                                &ticket_msg,
-                                &msg.run_id,
-                                "completed",
-                                &pr_url,
-                                pr_number,
-                                &branch,
-                                &usage,
-                                wall_clock_secs(created_at, &start),
+                                true,
+                                created_at,
+                                &start,
                             )
                             .await?;
                             return Ok(());
                         }
-                    }
-                    // What the fix read and tried, on the run page like every pass.
-                    super::write_conversation_log(
-                        state,
-                        &msg.team_id,
-                        &msg.run_id,
-                        &format!("ci_fix_{}_{attempt}", cycle + 1),
-                        &result.conversation_log,
-                    )
-                    .await;
-                    if !result.files_modified.is_empty() {
+                        // Its invocations are used with the checks still red:
+                        // the supervisor's ending (what broke the checks comes
+                        // out, else the run ends with exactly what fails).
                         super::round::clear(state, &msg.team_id, &msg.run_id).await;
-                    }
-                    info!(
-                        run_id = msg.run_id,
-                        files = result.files_modified.len(),
-                        attempt,
-                        "CI fix implemented"
-                    );
-                    write_pass_trace(
+                        tried.push(run_round::out_of_time(ci_round.kind, ci_round.attempt));
+                        return hand_off_red_ci(
                         state,
-                        &msg.team_id,
-                        &msg.run_id,
-                        &format!("ci_fix:{}", cycle + 1),
-                        pass_start,
-                        &usage_before,
+                        &msg,
+                        &ticket_msg,
+                        &github,
+                        &PrRef {
+                            owner: &repo_owner,
+                            repo: &repo_name,
+                            branch: &branch,
+                            number: pr_number,
+                            url: &pr_url,
+                        },
                         &usage,
-                        None,
+                        wall_clock_secs(created_at, &start),
+                        &events,
+                        super::GaveUp::Budget,
+                        &failure_excerpt(&logs),
+                        &tried,
+                        "The failing check needs a change CoderHelm's fix rounds didn't reach in their time: fix it on this branch, or press Retry to give the run a new budget.",
                     )
                     .await;
-
-                    if result.files_modified.is_empty() {
-                        let said = result
-                            .evidence
-                            .notes
-                            .lines()
-                            .map(str::trim)
-                            .find(|l| !l.is_empty())
-                            .unwrap_or("no explanation");
-                        tried.push(format!(
-                            "attempt {attempt} changed nothing ({})",
-                            common::truncate_str(said, 240)
-                        ));
-                        if attempt < max_attempts
-                            && super::round::may_start(start, std::time::Instant::now())
+                    }
+                    Ok(mut result) => {
+                        // One commit, one push: the fix lands on the pull request.
+                        let message = super::round::round_message(
+                            state,
+                            &msg.team_id,
+                            &ticket_msg,
+                            &ci_round,
+                        )
+                        .await;
+                        let gh = super::round::Pr {
+                            github: &github,
+                            owner: &repo_owner,
+                            repo: &repo_name,
+                            branch: &branch,
+                        };
+                        match super::round::land(
+                            &gh,
+                            &ci_round.wip_branch,
+                            &ci_round.base_sha,
+                            &message,
+                        )
+                        .await
                         {
-                            attempt += 1;
-                            warn!(
+                            super::round::Landed::Pushed { .. } => {}
+                            super::round::Landed::Nothing => result.files_modified.clear(),
+                            super::round::Landed::Refused(why) => break 'attempt Some(why),
+                        }
+                        // What the fix read and tried, on the run page like every pass.
+                        super::write_conversation_log(
+                            state,
+                            &msg.team_id,
+                            &msg.run_id,
+                            &format!("ci_fix_{}_{attempt}", cycle + 1),
+                            &result.conversation_log,
+                        )
+                        .await;
+                        if !result.files_modified.is_empty() {
+                            super::round::clear(state, &msg.team_id, &msg.run_id).await;
+                        }
+                        info!(
+                            run_id = msg.run_id,
+                            files = result.files_modified.len(),
+                            attempt,
+                            "CI fix implemented"
+                        );
+                        write_pass_trace(
+                            state,
+                            &msg.team_id,
+                            &msg.run_id,
+                            &format!("ci_fix:{}", cycle + 1),
+                            pass_start,
+                            &usage_before,
+                            &usage,
+                            None,
+                        )
+                        .await;
+
+                        if result.files_modified.is_empty() {
+                            let said = result
+                                .evidence
+                                .notes
+                                .lines()
+                                .map(str::trim)
+                                .find(|l| !l.is_empty())
+                                .unwrap_or("no explanation");
+                            tried.push(format!(
+                                "attempt {attempt} changed nothing ({})",
+                                common::truncate_str(said, 240)
+                            ));
+                            if attempt < max_attempts
+                                && super::round::may_start(start, std::time::Instant::now())
+                            {
+                                attempt += 1;
+                                warn!(
                             run_id = msg.run_id,
                             attempt, max_attempts, "CI fix changed nothing — the next attempt takes a different approach"
                         );
-                            super::add_progress_note(
+                                super::add_progress_note(
                             state,
                             &msg.team_id,
                             &msg.run_id,
@@ -2566,33 +2749,74 @@ pub async fn run(
                             ),
                         )
                         .await;
-                            let fresh = ci_evidence(
-                                &github,
-                                &repo_owner,
-                                &repo_name,
-                                &branch,
-                                pr_number,
-                                &job_logs,
-                            )
-                            .await;
-                            feedback = next_attempt_feedback(
-                                &base_feedback,
-                                attempt,
-                                max_attempts,
-                                &tried,
-                                &fresh,
-                            );
-                            continue;
-                        }
-                        warn!(
+                                // The approach changes by code first: the
+                                // deterministic repairs not yet run, before
+                                // the model is asked again.
+                                if !lock_tried {
+                                    lock_tried = true;
+                                    let repair = lock_repair_on_pr(
+                                        state,
+                                        &ticket_msg,
+                                        &github,
+                                        &branch,
+                                        (&rules, &repo_instructions, &provider),
+                                        &msg.run_id,
+                                        Some(super::round::deadline(start)),
+                                        cycle + attempt,
+                                    )
+                                    .await;
+                                    if !repair.written.is_empty() {
+                                        super::add_progress_note(
+                                            state,
+                                            &msg.team_id,
+                                            &msg.run_id,
+                                            &format!(
+                                                "CoderHelm {}. CI decides again.",
+                                                repair.note()
+                                            ),
+                                        )
+                                        .await;
+                                        super::round::clear(state, &msg.team_id, &msg.run_id).await;
+                                        super::webhooks::emit_ci_fix_completed(
+                                            state,
+                                            &ci_fix,
+                                            "pushed",
+                                            repair.written.len(),
+                                        )
+                                        .await;
+                                        break 'fix;
+                                    }
+                                    if !repair.failed.is_empty() {
+                                        tried.push(repair.note());
+                                    }
+                                }
+                                let fresh = ci_evidence(
+                                    &github,
+                                    &repo_owner,
+                                    &repo_name,
+                                    &branch,
+                                    pr_number,
+                                    &job_logs,
+                                )
+                                .await;
+                                feedback = next_attempt_feedback(
+                                    &base_feedback,
+                                    attempt,
+                                    max_attempts,
+                                    &tried,
+                                    &fresh,
+                                );
+                                continue 'fix;
+                            }
+                            warn!(
                         run_id = msg.run_id,
                         attempts = attempt,
                         "CI fix produced no changes — the PR stays a draft with what fails, the run needs attention"
                     );
-                        super::round::clear(state, &msg.team_id, &msg.run_id).await;
-                        super::webhooks::emit_ci_fix_completed(state, &ci_fix, "no_changes", 0)
-                            .await;
-                        return hand_off_red_ci(
+                            super::round::clear(state, &msg.team_id, &msg.run_id).await;
+                            super::webhooks::emit_ci_fix_completed(state, &ci_fix, "no_changes", 0)
+                                .await;
+                            return hand_off_red_ci(
                         state,
                         &msg,
                         &ticket_msg,
@@ -2613,65 +2837,138 @@ pub async fn run(
                         "A person reads the failing check's report (its test name and error are above) and fixes it on this branch, or re-runs it if the failure isn't this change's.",
                     )
                     .await;
+                        }
+                        super::webhooks::emit_ci_fix_completed(
+                            state,
+                            &ci_fix,
+                            "pushed",
+                            result.files_modified.len(),
+                        )
+                        .await;
                     }
-                    super::webhooks::emit_ci_fix_completed(
-                        state,
-                        &ci_fix,
-                        "pushed",
-                        result.files_modified.len(),
-                    )
-                    .await;
+                    Err(e) => {
+                        if wait_for_github(state, &msg, &*e).await
+                            || requeue_after_model_error(state, &msg, &*e).await
+                        {
+                            return Ok(());
+                        }
+                        warn!(run_id = msg.run_id, error = %e, "CI fix attempt errored; taking the way around it");
+                        break 'attempt Some(common::run_fail::error_text(&*e));
+                    }
                 }
-                Err(e) => {
-                    if wait_for_github(state, &msg, &*e).await
-                        || requeue_after_model_error(state, &msg, &*e).await
-                    {
+                None
+            };
+            if let Some(why) = fault {
+                // The classified decision: every fault has a way around it,
+                // and the catch-all runs the round again from a clean state
+                // (now, then once in a fresh step) before the supervisor's
+                // ending is asked. Never a dead round, never "failed" here.
+                let class = super::round::fault_of(&why);
+                let redrives = run_number(state, &msg.team_id, &msg.run_id, "round_redrives").await;
+                let next = super::round::after_fault(
+                    attempt,
+                    max_attempts,
+                    super::round::may_start(start, std::time::Instant::now()),
+                    redrives,
+                );
+                warn!(
+                    run_id = msg.run_id,
+                    fault = ?class,
+                    way_around = ?super::round::way_around(class),
+                    next = ?next,
+                    error = %why,
+                    "CI fix attempt met a fault"
+                );
+                super::add_progress_note(
+                    state,
+                    &msg.team_id,
+                    &msg.run_id,
+                    &super::round::fault_note(ci_round.kind, class, &why, &next),
+                )
+                .await;
+                tried.push(format!(
+                    "attempt {attempt} didn't land: {}",
+                    common::truncate_str(&why, 240)
+                ));
+                // A clean state for whatever runs next: the WIP branch goes,
+                // and the round starts from the pull request's head as it is.
+                if !ci_round.wip_branch.is_empty() && ci_round.wip_branch != branch {
+                    let _ = github
+                        .delete_branch(&repo_owner, &repo_name, &ci_round.wip_branch)
+                        .await;
+                }
+                match next {
+                    super::round::AfterFault::RetryClean => {
+                        attempt += 1;
+                        ci_round.base_sha =
+                            super::round::branch_head(&github, &repo_owner, &repo_name, &branch)
+                                .await;
+                        let fresh = ci_evidence(
+                            &github,
+                            &repo_owner,
+                            &repo_name,
+                            &branch,
+                            pr_number,
+                            &job_logs,
+                        )
+                        .await;
+                        feedback = next_attempt_feedback(
+                            &base_feedback,
+                            attempt,
+                            max_attempts,
+                            &tried,
+                            &fresh,
+                        );
+                        continue;
+                    }
+                    super::round::AfterFault::Redrive => {
+                        add_run_number(state, &msg.team_id, &msg.run_id, "round_redrives").await;
+                        super::round::clear(state, &msg.team_id, &msg.run_id).await;
+                        super::webhooks::emit_ci_fix_completed(state, &ci_fix, "failed", 0).await;
+                        mark_events_processed(state, &msg.run_id, &events).await;
+                        record_synthetic_ci_failed(state, &msg.run_id, branch_head.as_deref())
+                            .await;
+                        if set_run_awaiting_ci(
+                            state,
+                            &ticket_msg,
+                            &msg.run_id,
+                            &pr_url,
+                            pr_number,
+                            &branch,
+                            &usage,
+                            wall_clock_secs(created_at, &start),
+                        )
+                        .await?
+                        {
+                            send_delayed_resume(state, &msg, 30).await;
+                        }
                         return Ok(());
                     }
-                    error!(run_id = msg.run_id, error = %e, "CI fix implementation failed — the PR stays a draft, the round is named as not finished");
-                    super::webhooks::emit_ci_fix_completed(state, &ci_fix, "failed", 0).await;
-                    // Not "failed", and not handed over as if done: the run says
-                    // the round didn't finish and what it pushed; Resume runs it
-                    // again.
-                    super::round::finish_incomplete(
-                        state,
-                        &msg.team_id,
-                        &msg.run_id,
-                        &super::round::Pr {
-                            github: &github,
-                            owner: &repo_owner,
-                            repo: &repo_name,
-                            branch: &branch,
-                        },
-                        &ci_round,
-                        &run_round::errored(ci_round.kind, &common::run_fail::error_text(&*e)),
-                    )
-                    .await;
-                    tried.push(format!(
-                        "attempt {attempt} errored: {}",
-                        common::truncate_str(&common::run_fail::error_text(&*e), 240)
-                    ));
-                    return hand_off_red_ci(
-                        state,
-                        &msg,
-                        &ticket_msg,
-                        &github,
-                        &PrRef {
-                            owner: &repo_owner,
-                            repo: &repo_name,
-                            branch: &branch,
-                            number: pr_number,
-                            url: &pr_url,
-                        },
-                        &usage,
-                        wall_clock_secs(created_at, &start),
-                        &events,
-                        super::GaveUp::FixError,
-                        &failure_excerpt(&logs),
-                        &tried,
-                        "Retry the run from its page, or fix the failing check on this branch.",
-                    )
-                    .await;
+                    super::round::AfterFault::Supervisor => {
+                        super::round::clear(state, &msg.team_id, &msg.run_id).await;
+                        super::webhooks::emit_ci_fix_completed(state, &ci_fix, "failed", 0).await;
+                        return hand_off_red_ci(
+                            state,
+                            &msg,
+                            &ticket_msg,
+                            &github,
+                            &PrRef {
+                                owner: &repo_owner,
+                                repo: &repo_name,
+                                branch: &branch,
+                                number: pr_number,
+                                url: &pr_url,
+                            },
+                            &usage,
+                            wall_clock_secs(created_at, &start),
+                            &events,
+                            super::GaveUp::FixError,
+                            &failure_excerpt(&logs),
+                            &tried,
+                            "Retry the run from its page, or fix the failing check on this branch.",
+                        )
+                        .await;
+                    }
                 }
             }
             break;
@@ -6033,10 +6330,7 @@ async fn wait_on_person(
     });
     let super::supervisor::Ending::HandBack(hand_back) = ending else {
         if let Some(red) = red {
-            let why = format!(
-                "{}; {red}. Every fix and revert CoderHelm tried is on pull request #{pr_number}.",
-                reason.trim().trim_end_matches('.')
-            );
+            let why = red_ending_text(reason, &red, pr_number);
             warn!(run_id, reason = %why, "CI stays red after the supervisor's ladder: the run failed");
             super::fail_run(state, msg, run_id, &why, usage, duration).await;
             return Ok(());
@@ -6100,7 +6394,7 @@ pub(crate) async fn red_ci_blocks_completion(
         .table_name(&state.config.runs_table_name)
         .key("team_id", attr_s(team_id))
         .key("run_id", attr_s(run_id))
-        .projection_expression("ci_last, ci_end")
+        .projection_expression("ci_last, ci_end, ci_cause")
         .consistent_read(true)
         .send()
         .await
@@ -6114,7 +6408,7 @@ pub(crate) async fn red_ci_blocks_completion(
     };
     let facts = super::outcome::Facts {
         tasks_remaining: vec![],
-        ci: ci_state_of_record(&read("ci_last"), &read("ci_end")),
+        ci: ci_state_with_cause(&read("ci_last"), &read("ci_end"), &read("ci_cause")),
         review: super::outcome::Review::Missing,
         stop: None,
     };
@@ -6137,6 +6431,80 @@ pub(crate) fn ci_state_of_record(ci_last: &str, ci_end: &str) -> super::outcome:
     }
 }
 
+/// [`ci_state_of_record`], with what fails named from the record's
+/// `ci_cause` when the fix round kept one.
+pub(crate) fn ci_state_with_cause(
+    ci_last: &str,
+    ci_end: &str,
+    ci_cause: &str,
+) -> super::outcome::CiState {
+    use super::outcome::CiState;
+    match ci_state_of_record(ci_last, ci_end) {
+        CiState::Failing(_) if !ci_cause.trim().is_empty() => {
+            CiState::Failing(ci_cause.trim().to_string())
+        }
+        other => other,
+    }
+}
+
+/// A run about to be completed with its pull request's checks red goes back
+/// to fixing them, once: a failing-CI event is recorded and the run waits
+/// for CI like any other, so the CI fix round (its repairs by code, its
+/// attempts, its reverts) takes it. Returns false when that was already
+/// done for this run or its fix cycles are used; the supervisor's ending
+/// then applies.
+#[allow(clippy::too_many_arguments)]
+async fn redrive_red_ci(
+    state: &WorkerState,
+    msg: &TicketMessage,
+    run_id: &str,
+    pr_url: &str,
+    pr_number: u64,
+    branch: &str,
+    usage: &TokenUsage,
+    duration: u64,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let redrives = run_number(state, &msg.team_id, run_id, "red_redrives").await;
+    let cycle = load_cycle_from_checkpoint(state, &msg.team_id, run_id).await;
+    if !may_redrive_red_ci(redrives, cycle) {
+        return Ok(false);
+    }
+    add_run_number(state, &msg.team_id, run_id, "red_redrives").await;
+    record_synthetic_ci_failed(state, run_id, None).await;
+    if !set_run_awaiting_ci(
+        state, msg, run_id, pr_url, pr_number, branch, usage, duration,
+    )
+    .await?
+    {
+        return Ok(true);
+    }
+    super::add_progress_note(
+        state,
+        &msg.team_id,
+        run_id,
+        "The pull request's checks are red, so the run isn't done: CoderHelm goes back to fixing them.",
+    )
+    .await;
+    send_delayed_resume(
+        state,
+        &ResumeMessage {
+            team_id: msg.team_id.clone(),
+            run_id: run_id.to_string(),
+            installation_id: msg.installation_id,
+            ..Default::default()
+        },
+        30,
+    )
+    .await;
+    Ok(true)
+}
+
+/// Whether a run with red checks goes back to its CI fix round instead of
+/// ending: once per run, while fix cycles are left.
+pub(crate) fn may_redrive_red_ci(redrives: u32, cycle: usize) -> bool {
+    redrives < super::round::MAX_REDRIVES && cycle < MAX_CI_FIX_CYCLES
+}
+
 /// Ends the run as `status`. A wait on a person goes through
 /// [`wait_for_review`], which names what it waits for.
 #[allow(clippy::too_many_arguments)]
@@ -6157,7 +6525,16 @@ async fn complete_run_with_status(
     // with why, on every path that would have said "completed".
     if status == common::run_status::COMPLETED && pr_number > 0 {
         if let Some(reason) = red_ci_blocks_completion(state, &msg.team_id, run_id).await {
-            warn!(run_id, reason = %reason, "A run whose CI is red is never completed: it waits on a person");
+            // Red checks are work left, not an ending: the CI fix round
+            // takes them first.
+            if redrive_red_ci(
+                state, msg, run_id, pr_url, pr_number, branch, usage, duration,
+            )
+            .await?
+            {
+                return Ok(());
+            }
+            warn!(run_id, reason = %reason, "A run whose CI is red is never completed: the supervisor's ending applies");
             return wait_for_review(
                 state, msg, run_id, &reason, pr_url, pr_number, branch, usage, duration,
             )
