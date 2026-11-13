@@ -6316,6 +6316,73 @@ async fn revert_dep_commit(
     Some(note)
 }
 
+/// The same revert for a check CoderHelm ran itself in its sandbox before
+/// the run finished (`settle`): the newest verified set of bumps comes out
+/// with `why`, the sets before it stay, and the pull request names each
+/// bump under "Deferred". `None` when the run isn't a dependency fix, or
+/// one set or none is left.
+pub(crate) async fn take_out_dep_set(
+    state: &WorkerState,
+    ticket_msg: &TicketMessage,
+    run_id: &str,
+    github: &GitHubClient,
+    branch: &str,
+    pr_number: u64,
+    why: &str,
+) -> Option<String> {
+    if !common::security_fixes::is_ticket(&ticket_msg.ticket_id) {
+        return None;
+    }
+    let mut run = super::dep_fix::load(state, ticket_msg, run_id).await?;
+    let out = run.take_out_last_commit(why)?;
+    let (owner, repo) = (&ticket_msg.repo_owner, &ticket_msg.repo_name);
+    let changed = github
+        .compare_changed_files(owner, repo, &out.restore_to, branch)
+        .await
+        .ok()?;
+    let mut files = Vec::new();
+    for path in &changed {
+        let was = github
+            .read_file_if_exists(owner, repo, path, &out.restore_to)
+            .await
+            .ok()?;
+        files.push((path.clone(), was));
+    }
+    let note = settle_revert_note(&out.lines, run.commits.len());
+    let msg = ResumeMessage {
+        team_id: ticket_msg.team_id.clone(),
+        run_id: run_id.to_string(),
+        installation_id: ticket_msg.installation_id,
+        ..Default::default()
+    };
+    let pr = PrRef {
+        owner,
+        repo,
+        branch,
+        number: pr_number,
+        url: "",
+    };
+    apply_revert(state, &msg, github, &pr, files, &note).await?;
+    super::dep_fix::save(state, ticket_msg, run_id, &run).await;
+    super::dep_fix::settle(state, ticket_msg, &run).await;
+    Some(note)
+}
+
+/// The pull request's "Deferred" line for a set of bumps a sandbox check
+/// took out.
+pub(crate) fn settle_revert_note(lines: &[String], commits_left: usize) -> String {
+    format!(
+        "The repository's checks failed in CoderHelm's sandbox with the newest verified set \
+         applied: took out that set of {} bump{} and kept the {} set{} before it. {}. The checks \
+         run again on what is left.",
+        lines.len(),
+        if lines.len() == 1 { "" } else { "s" },
+        commits_left,
+        if commits_left == 1 { "" } else { "s" },
+        lines.join("; ")
+    )
+}
+
 /// The pull request's "Deferred" line for a commit of bumps CI took out.
 pub(crate) fn dep_revert_note(lines: &[String], commits_left: usize) -> String {
     format!(
@@ -6648,6 +6715,109 @@ async fn redrive_red_ci(
     Ok(true)
 }
 
+/// A run about to be completed whose pull request lists Open items written
+/// on an earlier head goes back to its checks in a fresh step
+/// (`settle::redrive_due`): the items are derived again from the head as it
+/// is, what CoderHelm can run is run, and the run finishes from there.
+/// Once per head and at most `settle::MAX_REDRIVES` times a run. False when
+/// there is nothing stale, or the step couldn't be queued (the run then
+/// finishes as it stands).
+async fn redrive_stale_items(
+    state: &WorkerState,
+    msg: &TicketMessage,
+    run_id: &str,
+    pr_number: u64,
+    branch: &str,
+) -> bool {
+    let Ok(github) = GitHubClient::new(
+        &state.secrets.github_app_id,
+        &state.secrets.github_private_key,
+        msg.installation_id,
+        &state.http,
+    ) else {
+        return false;
+    };
+    let Ok(pr) = github
+        .get_pull_request(&msg.repo_owner, &msg.repo_name, pr_number)
+        .await
+    else {
+        return false;
+    };
+    let body = pr["body"].as_str().unwrap_or("");
+    let head = pr["head"]["sha"].as_str().unwrap_or("");
+    let redrives = run_number(state, &msg.team_id, run_id, "items_redrives").await;
+    let last = run_text(state, &msg.team_id, run_id, "items_redrive_head").await;
+    if !super::settle::redrive_due(body, head, redrives, &last) {
+        return false;
+    }
+    add_run_number(state, &msg.team_id, run_id, "items_redrives").await;
+    let _ = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(&msg.team_id))
+        .key("run_id", attr_s(run_id))
+        .update_expression("SET items_redrive_head = :h")
+        .expression_attribute_values(":h", attr_s(head))
+        .send()
+        .await;
+    // The step after the run's last one, from its record (the message in
+    // hand may be a resume's, which carries no step number).
+    let item = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(&msg.team_id))
+        .key("run_id", attr_s(run_id))
+        .consistent_read(true)
+        .send()
+        .await
+        .ok()
+        .and_then(|o| o.item)
+        .unwrap_or_default();
+    let Some((ticket, _)) = super::recheck::message_of(&item) else {
+        return false;
+    };
+    let why = "The pull request's open items were written before its last changes";
+    match super::recheck_at_checks(
+        state,
+        &ticket,
+        run_id,
+        branch,
+        super::recheck::carry_of(body).as_ref(),
+        why,
+    )
+    .await
+    {
+        super::Handoff::Continued => {
+            info!(run_id, pr_number, %head, "Open items are of an earlier head: deriving them again before the run finishes");
+            true
+        }
+        super::Handoff::Stopped(reason) => {
+            warn!(run_id, pr_number, reason = %reason, "Could not derive the open items again: the run finishes as it stands");
+            false
+        }
+    }
+}
+
+/// A text kept on the run record (empty when absent).
+async fn run_text(state: &WorkerState, team_id: &str, run_id: &str, field: &str) -> String {
+    state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(team_id))
+        .key("run_id", attr_s(run_id))
+        .projection_expression("#f")
+        .expression_attribute_names("#f", field)
+        .send()
+        .await
+        .ok()
+        .and_then(|o| o.item)
+        .and_then(|i| i.get(field).and_then(|v| v.as_s().ok()).cloned())
+        .unwrap_or_default()
+}
+
 /// Whether a run with red checks goes back to its CI fix round instead of
 /// ending: once per run, while fix cycles are left.
 pub(crate) fn may_redrive_red_ci(redrives: u32, cycle: usize) -> bool {
@@ -6669,6 +6839,15 @@ async fn complete_run_with_status(
     duration: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     debug_assert_ne!(status, "needs_input", "use wait_for_review");
+    // Open items written on an earlier head are not this run's last word: a
+    // later round may have settled one. The run goes back to its checks on
+    // the head first, and finishes from there.
+    if status == common::run_status::COMPLETED
+        && pr_number > 0
+        && redrive_stale_items(state, msg, run_id, pr_number, branch).await
+    {
+        return Ok(());
+    }
     // The one outcome rule (`outcome::decide`): a run whose pull request's CI
     // is red, by its own record, is never completed. It waits on a person,
     // with why, on every path that would have said "completed".
