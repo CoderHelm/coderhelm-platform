@@ -1335,6 +1335,151 @@ pub fn feature_totals(
     out
 }
 
+/// One slice of a period's usage (the whole period, one feature or one
+/// model): the four token parts, the calls and what they cost.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct UsageSlice {
+    /// New input: neither read from nor written to the cache.
+    pub tokens_in: u64,
+    pub tokens_out: u64,
+    pub cache_read: u64,
+    /// Both cache lifetimes together.
+    pub cache_write: u64,
+    pub calls: u64,
+    /// Each call at its own model's price when it was made.
+    pub cost_usd: f64,
+}
+
+impl UsageSlice {
+    /// All four parts.
+    pub fn total(&self) -> u64 {
+        self.tokens_in + self.tokens_out + self.cache_read + self.cache_write
+    }
+
+    pub fn add(&mut self, other: &UsageSlice) {
+        self.tokens_in += other.tokens_in;
+        self.tokens_out += other.tokens_out;
+        self.cache_read += other.cache_read;
+        self.cache_write += other.cache_write;
+        self.calls += other.calls;
+        self.cost_usd += other.cost_usd;
+    }
+
+    /// Cache reads as a share of all input (cache read + cache write + new
+    /// input); `None` with no input.
+    pub fn cache_hit_share(&self) -> Option<f64> {
+        let input = self.cache_read + self.cache_write + self.tokens_in;
+        (input > 0).then(|| self.cache_read as f64 / input as f64)
+    }
+}
+
+fn f_of(item: &HashMap<String, AttributeValue>, k: &str) -> f64 {
+    item.get(k)
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse::<f64>().ok())
+        .map(|f| f.max(0.0))
+        .unwrap_or(0.0)
+}
+
+/// A period item's own totals: every call the team was billed for.
+pub fn total_slice(item: &HashMap<String, AttributeValue>) -> UsageSlice {
+    UsageSlice {
+        tokens_in: n_of(item, "total_tokens_in"),
+        tokens_out: n_of(item, "total_tokens_out"),
+        cache_read: n_of(item, "cache_read_tokens"),
+        cache_write: n_of(item, "cache_write_tokens"),
+        calls: n_of(item, "model_calls"),
+        cost_usd: f_of(item, "total_cost_usd"),
+    }
+}
+
+/// The breakdown counters on a period item, by key: `prefix` is `feature`
+/// (keys are [`feature`] names) or `model` (keys are normalized model ids).
+/// These are the counters [`add_expression`] writes with every call, so a
+/// period has them from the day per-call counting started for the team.
+pub fn slices(
+    item: &HashMap<String, AttributeValue>,
+    prefix: &str,
+) -> std::collections::BTreeMap<String, UsageSlice> {
+    let mut by: std::collections::BTreeMap<String, UsageSlice> = Default::default();
+    let lead = format!("{prefix}#");
+    for (k, v) in item {
+        let Some((key, field)) = k.strip_prefix(&lead).and_then(|r| r.rsplit_once('#')) else {
+            continue;
+        };
+        let f = v
+            .as_n()
+            .ok()
+            .and_then(|n| n.parse::<f64>().ok())
+            .unwrap_or(0.0)
+            .max(0.0);
+        let e = by.entry(key.to_string()).or_default();
+        match field {
+            "tokens_in" => e.tokens_in += f as u64,
+            "tokens_out" => e.tokens_out += f as u64,
+            "cache_read" => e.cache_read += f as u64,
+            // `cache_write_5m` and `cache_write_1h` are parts of this one.
+            "cache_write" => e.cache_write += f as u64,
+            "calls" => e.calls += f as u64,
+            "cost_usd" => e.cost_usd += f,
+            _ => {}
+        }
+    }
+    by.retain(|_, s| s.total() > 0 || s.calls > 0);
+    by
+}
+
+/// Whether the price table has this model. A model it doesn't have is
+/// costed at the most expensive known rate, so its cost is an upper bound.
+pub fn price_known(model_id: &str) -> bool {
+    prices().contains_key(&normalize_model(model_id))
+}
+
+/// The kinds of work a team's usage is shown under. Each [`feature`] is in
+/// exactly one; a feature added later is `other` until it is placed here.
+pub mod work_kind {
+    use super::feature as f;
+
+    /// Runs on tickets, and the tasks of an approved plan.
+    pub const TICKET_RUNS: &str = "ticket_runs";
+    /// Security fixes: triage of advisories and the runs that fix them
+    /// (their follow-up work included).
+    pub const SECURITY: &str = "security";
+    /// Work on a pull request after it opened: review comments, CI fixes
+    /// and conflicts. The meter doesn't tell these apart.
+    pub const FOLLOW_UPS: &str = "follow_ups";
+    /// Reviews of pull requests.
+    pub const REVIEWS: &str = "reviews";
+    /// Plan chat, the company brain and questions asked of team agents.
+    pub const CHAT: &str = "chat";
+    /// The log analyzer, and alert triage and alert runs.
+    pub const LOGS: &str = "logs";
+    pub const OTHER: &str = "other";
+
+    /// Display order.
+    pub const ALL: [&str; 7] = [
+        TICKET_RUNS,
+        SECURITY,
+        FOLLOW_UPS,
+        REVIEWS,
+        CHAT,
+        LOGS,
+        OTHER,
+    ];
+
+    pub fn of_feature(feature: &str) -> &'static str {
+        match feature {
+            f::RUN | f::PLAN => TICKET_RUNS,
+            f::SECURITY | f::SECURITY_FIX => SECURITY,
+            f::FEEDBACK => FOLLOW_UPS,
+            f::REVIEW => REVIEWS,
+            f::CHAT | f::BRAIN | f::AGENT_ASK => CHAT,
+            f::LOG_ANALYSIS | f::ALERT => LOGS,
+            _ => OTHER,
+        }
+    }
+}
+
 /// Whether the token limit counts cache tokens for a team: the team's
 /// `counts_cache` on `SETTINGS#TOKEN_LIMIT` wins; otherwise the
 /// `TOKEN_LIMIT_COUNTS_CACHE` env default (off unless "true").
@@ -1694,6 +1839,151 @@ mod tests {
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].0, "review");
         assert_eq!(f[0].1.total(), 10);
+    }
+
+    /// The item two calls leave behind, as the table would hold it.
+    fn item_of(calls: &[(&str, &str, CallUsage)]) -> HashMap<String, AttributeValue> {
+        let mut item: HashMap<String, f64> = HashMap::new();
+        for (feature, model, call) in calls {
+            let (_, names, values) = add_expression(feature, model, call);
+            for (ph, attr) in &names {
+                let v: f64 = values[&ph.replace("#a", ":v")]
+                    .as_n()
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                *item.entry(attr.clone()).or_default() += v;
+            }
+        }
+        item.into_iter()
+            .map(|(k, v)| (k, AttributeValue::N(v.to_string())))
+            .collect()
+    }
+
+    #[test]
+    fn slices_read_each_feature_and_model_with_its_parts_calls_and_cost() {
+        let review = CallUsage {
+            uncached_input: 100,
+            cache_read: 9_000,
+            cache_write_5m: 600,
+            cache_write_1h: 300,
+            output: 50,
+        };
+        let run = CallUsage {
+            uncached_input: 1_000,
+            cache_read: 0,
+            cache_write_5m: 0,
+            cache_write_1h: 0,
+            output: 500,
+        };
+        let item = item_of(&[
+            ("review", "claude-sonnet-5-5", review),
+            ("review", "us.anthropic.claude-sonnet-5-5-v1:0", review),
+            ("run", "claude-opus-5-5", run),
+        ]);
+        let by_feature = slices(&item, "feature");
+        assert_eq!(by_feature.len(), 2);
+        let r = by_feature["review"];
+        assert_eq!(
+            (
+                r.tokens_in,
+                r.cache_read,
+                r.cache_write,
+                r.tokens_out,
+                r.calls
+            ),
+            (200, 18_000, 1_800, 100, 2),
+            "the two cache lifetimes are one write, counted once"
+        );
+        assert!((r.cost_usd - 2.0 * review.cost_usd("claude-sonnet-5-5")).abs() < 1e-9);
+        assert_eq!(r.total(), 20_100);
+
+        let by_model = slices(&item, "model");
+        assert_eq!(
+            by_model.keys().collect::<Vec<_>>(),
+            ["claude-opus-5-5", "claude-sonnet-5-5"],
+            "a Bedrock id and the plain id are one model"
+        );
+        assert_eq!(by_model["claude-opus-5-5"].total(), 1_500);
+        assert_eq!(by_model["claude-opus-5-5"].cache_hit_share(), Some(0.0));
+        let share = by_model["claude-sonnet-5-5"].cache_hit_share().unwrap();
+        assert!((share - 18_000.0 / 20_000.0).abs() < 1e-9);
+
+        // The slices add up to the item's own totals.
+        let total = total_slice(&item);
+        let mut sum = UsageSlice::default();
+        for s in by_feature.values() {
+            sum.add(s);
+        }
+        assert_eq!(sum.total(), total.total());
+        assert_eq!(sum.calls, total.calls);
+        assert_eq!(total.calls, 3);
+        assert!((sum.cost_usd - total.cost_usd).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_slice_with_no_input_has_no_cache_share_and_other_counters_are_left_out() {
+        assert_eq!(UsageSlice::default().cache_hit_share(), None);
+        let mut item = item_of(&[(
+            "chat",
+            "claude-haiku-5-5",
+            CallUsage {
+                uncached_input: 5,
+                output: 5,
+                ..Default::default()
+            },
+        )]);
+        // CoderHelm's own embeddings and a plugin's copy are not the team's
+        // features or models.
+        item.insert(
+            "coderhelm#feature#embedding#tokens_in".into(),
+            AttributeValue::N("999".into()),
+        );
+        item.insert(
+            "plugin#p1#tokens_in".into(),
+            AttributeValue::N("999".into()),
+        );
+        item.insert("feature#broken".into(), AttributeValue::N("1".into()));
+        assert_eq!(
+            slices(&item, "feature").keys().collect::<Vec<_>>(),
+            ["chat"]
+        );
+        assert_eq!(
+            slices(&item, "model").keys().collect::<Vec<_>>(),
+            ["claude-haiku-5-5"]
+        );
+    }
+
+    #[test]
+    fn every_feature_is_shown_under_one_kind_of_work() {
+        use work_kind as k;
+        for (f, kind) in [
+            (feature::RUN, k::TICKET_RUNS),
+            (feature::PLAN, k::TICKET_RUNS),
+            (feature::SECURITY_FIX, k::SECURITY),
+            (feature::SECURITY, k::SECURITY),
+            (feature::FEEDBACK, k::FOLLOW_UPS),
+            (feature::REVIEW, k::REVIEWS),
+            (feature::CHAT, k::CHAT),
+            (feature::BRAIN, k::CHAT),
+            (feature::AGENT_ASK, k::CHAT),
+            (feature::LOG_ANALYSIS, k::LOGS),
+            (feature::ALERT, k::LOGS),
+            (feature::ONBOARD, k::OTHER),
+            (feature::MEMORY, k::OTHER),
+            (feature::OTHER, k::OTHER),
+            ("a_feature_added_later", k::OTHER),
+        ] {
+            assert_eq!(k::of_feature(f), kind, "{f}");
+            assert!(k::ALL.contains(&kind));
+        }
+    }
+
+    #[test]
+    fn a_model_missing_from_the_price_table_is_known_to_be_missing() {
+        assert!(price_known("claude-opus-5-5"));
+        assert!(price_known("us.anthropic.claude-opus-5-5-v1:0"));
+        assert!(!price_known("claude-not-released-9"));
     }
 
     /// Exactly once: no service adds tokens or cost to the analytics counters
