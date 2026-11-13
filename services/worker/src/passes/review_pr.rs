@@ -5149,6 +5149,40 @@ async fn last_review(state: &WorkerState, msg: &ReviewMessage) -> Option<LastRev
     })
 }
 
+/// CoderHelm's latest verdict on a pull request and the commit it is on
+/// (`APPROVE` or `REQUEST_CHANGES`), for whoever decides what the pull
+/// request needs next (`pr_watch`). None before any review.
+pub(crate) async fn own_verdict(
+    state: &WorkerState,
+    team_id: &str,
+    owner: &str,
+    repo: &str,
+    pr_number: u64,
+) -> Option<(String, String)> {
+    let msg = ReviewMessage {
+        team_id: team_id.to_string(),
+        repo_owner: owner.to_string(),
+        repo_name: repo.to_string(),
+        pr_number,
+        ..Default::default()
+    };
+    last_review(state, &msg)
+        .await
+        .map(|r| (r.verdict, r.head_sha))
+}
+
+/// Whether CoderHelm's reviewer is on for the repository.
+pub(crate) async fn reviewer_enabled(
+    state: &WorkerState,
+    team_id: &str,
+    owner: &str,
+    repo: &str,
+) -> bool {
+    enabled_trigger_label(state, team_id, owner, repo)
+        .await
+        .is_some()
+}
+
 /// Pure: was the head commit authored by CoderHelm? Reads the compare
 /// response's commit list (oldest first).
 fn head_commit_by_bot(compare: &serde_json::Value, head_sha: &str) -> bool {

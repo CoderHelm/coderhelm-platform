@@ -539,6 +539,17 @@ async fn handle_message(state: Arc<WorkerState>, message: models::WorkerMessage)
                 prs = ?drafts.settled,
                 "Draft sweep done"
             );
+            // Finished runs' pull requests: a conflict with a moved base,
+            // checks that went red later, a reviewer verdict missing on the
+            // head, a merge whose deploy nobody watches. Each is picked
+            // back up by the mechanism it already has.
+            let watch = passes::pr_watch::sweep(&state).await;
+            info!(
+                candidates = watch.candidates,
+                looked_at = watch.looked_at,
+                acted = ?watch.acted,
+                "Pull request watch sweep done"
+            );
             // Deploy counts that stopped between passes carry on without
             // waiting for someone to open Analytics.
             let resumed = passes::deploy_stats::sweep(&state).await;

@@ -118,6 +118,9 @@ pub mod memory_meta;
 /// The auto-merge gate's per-PR record: keys and states (the worker runs the
 /// gate, the gateway re-arms it on GitHub events).
 pub mod merge_gate;
+/// Where a finished run's pull request stands on its way to merge, in the
+/// one reason that is true.
+pub mod merge_standing;
 /// Every message on the worker queues: one enum the gateway and worker share.
 pub mod messages;
 /// Retrying model API calls on transient failures, classified by status.
@@ -152,6 +155,9 @@ pub mod run_prs;
 // review_stats: time-ordered review records for analytics
 pub mod decision_log;
 pub mod deploy_stats;
+/// Flaky or broken: whose failure a red check is, and the repository's
+/// record of checks that failed and then passed on one commit.
+pub mod flaky_checks;
 /// Run statuses; which ones a person set; closing and reopening a run.
 pub mod handback;
 /// Work CoderHelm started on its own pull request and hasn't landed, and

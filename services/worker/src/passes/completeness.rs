@@ -136,10 +136,17 @@ pub enum Section {
     /// the very top (see `ready::status_section`): a finished run never
     /// leaves its pull request a draft without saying why here.
     DraftStatus,
+    /// What a reviewer reads first: where to look, how to roll back, and
+    /// each verification claim with the recorded check result it rests on
+    /// (see `reviewer_guide`). Written from records, never by the writer.
+    ReviewerGuide,
+    /// Red checks judged not caused by the change, with the evidence and
+    /// what was done about them (see `common::flaky_checks`).
+    CiNotes,
 }
 
 impl Section {
-    const ALL: [Section; 10] = [
+    const ALL: [Section; 12] = [
         Section::Links,
         Section::Mirrors,
         Section::MergeOrder,
@@ -150,6 +157,8 @@ impl Section {
         Section::OpenFindings,
         Section::Objections,
         Section::DraftStatus,
+        Section::ReviewerGuide,
+        Section::CiNotes,
     ];
 
     /// Its start and end markers.
@@ -174,6 +183,8 @@ impl Section {
             Section::OpenFindings => (super::own_review::START, super::own_review::END),
             Section::Objections => (OBJECTIONS_START, OBJECTIONS_END),
             Section::DraftStatus => (super::ready::STATUS_START, super::ready::STATUS_END),
+            Section::ReviewerGuide => (super::reviewer_guide::START, super::reviewer_guide::END),
+            Section::CiNotes => (common::flaky_checks::START, common::flaky_checks::END),
         }
     }
 }
@@ -211,6 +222,8 @@ pub struct Owned {
     pub open_findings: String,
     pub objections: String,
     pub draft_status: String,
+    pub reviewer_guide: String,
+    pub ci_notes: String,
 }
 
 impl Owned {
@@ -226,6 +239,8 @@ impl Owned {
             Section::OpenFindings => &mut self.open_findings,
             Section::Objections => &mut self.objections,
             Section::DraftStatus => &mut self.draft_status,
+            Section::ReviewerGuide => &mut self.reviewer_guide,
+            Section::CiNotes => &mut self.ci_notes,
         }
     }
 
@@ -342,11 +357,13 @@ pub fn assemble(rest: &str, owned: &Owned) -> String {
     let (main, footer) = split_footer(rest);
     let main = main.trim();
     let middle: Vec<&str> = [
+        &owned.reviewer_guide,
         &owned.links,
         &owned.mirrors,
         &owned.merge_order,
         &owned.not_in_pr,
         &owned.review_fixes,
+        &owned.ci_notes,
     ]
     .into_iter()
     .map(|s| s.trim())
@@ -1202,6 +1219,8 @@ mod tests {
             objections: String::new(),
             draft_status: String::new(),
             links: String::new(),
+            reviewer_guide: String::new(),
+            ci_notes: String::new(),
             mirrors: mirrors_section(&[Mirror {
                 path: "envs/prod/users.tf".into(),
                 name: "billing_reader".into(),

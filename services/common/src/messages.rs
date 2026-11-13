@@ -848,6 +848,12 @@ pub struct HealthCheckMessage {
     /// merge), so an approval wait never runs into it.
     #[serde(default)]
     pub approval_seen_at: Option<i64>,
+    /// The watch of a merge nobody asked a report for (CoderHelm's own pull
+    /// request merged by anyone, see `worker::passes::pr_watch`): it speaks
+    /// only when the deploy fails. A team's own health check setting is
+    /// never quiet.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub quiet: bool,
 }
 
 /// A deploy run of the merge commit that was superseded, and the later run on

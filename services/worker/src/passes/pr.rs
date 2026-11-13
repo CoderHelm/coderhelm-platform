@@ -1634,6 +1634,9 @@ pub async fn apply_checks(
             warn!(pr_number = number, error = %e, "Could not add the checks' results to the PR");
         }
     }
+    // What the reviewer reads first, from the diff and the head's recorded
+    // check results as they stand now.
+    super::reviewer_guide::refresh(github, &msg.repo_owner, &msg.repo_name, number).await;
 }
 
 /// Heading over what only a person can check, when the checks found some.
@@ -1665,6 +1668,8 @@ fn with_checks(body: &str, plan: &PlanResult, proof: &Proof<'_>, repo: &str) -> 
     new.open_findings = owned.open_findings;
     new.objections = owned.objections;
     new.merge_order = owned.merge_order;
+    new.reviewer_guide = owned.reviewer_guide;
+    new.ci_notes = owned.ci_notes;
     if new.mirrors.is_empty() {
         new.mirrors = owned.mirrors;
     }
@@ -1689,6 +1694,10 @@ fn owned_sections(plan: &PlanResult, proof: &Proof<'_>, repo: &str) -> super::co
         open_findings: String::new(),
         objections: String::new(),
         draft_status: String::new(),
+        // Built from the diff and the head's checks (`reviewer_guide`), and
+        // from a red check's judgement (`flaky`): never from the plan.
+        reviewer_guide: String::new(),
+        ci_notes: String::new(),
         // A small failing-test fix carries no open items or questions.
         open_items: if small_test_fix {
             String::new()
@@ -1911,6 +1920,20 @@ Return ONLY the markdown body text, then a line `{CHANGES_MARK}` and one bullet 
         super::completeness::assemble(&rest, &kept)
     };
     let body = super::release_plan::put_section(&body, &release_section);
+    // The reviewer's section follows this diff and this head's recorded
+    // check results, like everything else in the description.
+    let body = super::reviewer_guide::put(
+        &body,
+        super::reviewer_guide::build(
+            github,
+            owner,
+            repo,
+            &risk_files,
+            &risk_floor,
+            pr["head"]["sha"].as_str().unwrap_or(""),
+        )
+        .await,
+    );
     // A reviewer's standing request for changes is stated at the top. An
     // unreadable review list keeps whatever the description said before.
     let body = match super::review_actions::fetch_approvals(
