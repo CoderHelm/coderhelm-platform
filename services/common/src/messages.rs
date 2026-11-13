@@ -600,7 +600,11 @@ pub struct SecurityEventMessage {
     pub team_id: String,
     #[serde(default)]
     pub installation_id: u64,
-    /// `dependabot_alert`, `security_advisory`, `push`, `scan` or `fix`.
+    /// `dependabot_alert`, `security_advisory`, `push`, `scan`, `fix`, or
+    /// one of the release kinds (`common::security_release`): `pr` (a
+    /// pull request closed or reopened), `run` (a fix run a person
+    /// cancelled or closed) and `retry` (a person's Retry of a fix run
+    /// whose pull request is gone).
     pub kind: String,
     /// `owner/name`; empty for a scan of every repository.
     #[serde(default)]
@@ -622,6 +626,12 @@ pub struct SecurityEventMessage {
     /// `fix`: how the picked findings combine into pull requests.
     #[serde(default)]
     pub combine: crate::security_fixes::Combine,
+    /// `pr`: the pull request's number (in `repo`).
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub pr_number: u64,
+    /// `run` and `retry`: the fix run's ticket (`SEC-...`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub ticket: String,
 }
 
 /// One repository's stale pull request preview (`common::stale_prs`).

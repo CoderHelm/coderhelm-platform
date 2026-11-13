@@ -30,6 +30,7 @@ mod al_learning_loop;
 mod am_description_from_the_head;
 mod an_six_database_findings;
 mod ao_stopped_log_finding;
+mod ap_closed_pr_keeps_findings;
 mod ar_description_stamped_to_the_head;
 mod b_open_pr_retry;
 mod ba_verdict_on_old_commit;

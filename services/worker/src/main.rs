@@ -607,6 +607,7 @@ async fn handle_message_inner(state: Arc<WorkerState>, message: models::WorkerMe
             let sec = passes::security_fixes::sweep(&state).await;
             info!(
                 teams = sec.teams,
+                released = sec.released,
                 repos = sec.repos_synced,
                 new_findings = sec.new_findings,
                 triaged = sec.triaged,

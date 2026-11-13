@@ -1801,6 +1801,13 @@ async fn handle_pull_request(
 ) -> Result<StatusCode, StatusCode> {
     let action = payload["action"].as_str().unwrap_or("");
 
+    // A security fix's pull request closed or reopened (CoderHelm's, or a
+    // bot's it adopted): its findings follow at once, before any return
+    // below. The worker's sweep catches a delivery that never arrives.
+    if action == "closed" || action == "reopened" {
+        super::security::on_pull_request(state, payload, installation_id, team_id).await;
+    }
+
     // Reviewer agent triggers (opt-in, off by default per repo):
     //  - human PRs: the review label added, or a new commit on a labeled PR.
     //  - CoderHelm's own PRs: auto-reviewed on open/reopen/push with no label

@@ -2313,6 +2313,43 @@ pub async fn retry_run(
         return Err(StatusCode::BAD_REQUEST);
     }
 
+    // A security fix run whose pull request is gone (a person closed it,
+    // or the run ended without one): the retry is a new request for the
+    // unit's findings as they stand now, so the new run plans from today's
+    // findings and opens a new pull request. It never reopens the closed
+    // one, and never runs the old plan.
+    let ticket_id = item
+        .get("ticket_id")
+        .and_then(|v| v.as_s().ok())
+        .map(|s| s.as_str())
+        .unwrap_or("");
+    if let Some(event) =
+        super::security::retry_event(&state, &claims.team_id, ticket_id, &claims.email).await
+    {
+        super::security::queue_retry(&state, event)
+            .await
+            .map_err(|_| {
+                error!(run_id, "Failed to enqueue the security retry");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+        mark_retried(&state, &claims.team_id, &run_id).await;
+        info!(
+            run_id,
+            ticket_id, "Security fix run retried as a new request for its findings"
+        );
+        common::decision_log::on_run_acted(
+            &state.dynamo,
+            &state.config.settings_table_name,
+            &claims.team_id,
+            &run_id,
+            common::decision_log::Outcome::Retried,
+        )
+        .await;
+        return Ok(Json(RunActionResult {
+            status: "retrying".into(),
+        }));
+    }
+
     let mut ticket = retry_message(&state, &claims, item).await?;
     // The new run takes up this run's plan and the commits on its branch,
     // unless the plan was what failed (Start over always starts over).
@@ -2347,21 +2384,7 @@ pub async fn retry_run(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    // Mark the old run as retried so it can't be retried again
-    let now = chrono::Utc::now().to_rfc3339();
-    let _ = state
-        .dynamo
-        .update_item()
-        .table_name(&state.config.runs_table_name)
-        .key("team_id", attr_s(&claims.team_id))
-        .key("run_id", attr_s(&run_id))
-        .update_expression("SET #status = :s, status_run_id = :sri, updated_at = :t")
-        .expression_attribute_names("#status", "status")
-        .expression_attribute_values(":s", attr_s("retried"))
-        .expression_attribute_values(":sri", attr_s(&format!("retried#{run_id}")))
-        .expression_attribute_values(":t", attr_s(&now))
-        .send()
-        .await;
+    mark_retried(&state, &claims.team_id, &run_id).await;
 
     info!(run_id, "Run retried — dispatched to SQS");
     // A retry as it was says the stop wasn't needed (the outcome log).
@@ -2377,6 +2400,24 @@ pub async fn retry_run(
     Ok(Json(RunActionResult {
         status: "retrying".into(),
     }))
+}
+
+/// Marks a run as retried, so it can't be retried again.
+async fn mark_retried(state: &AppState, team_id: &str, run_id: &str) {
+    let now = chrono::Utc::now().to_rfc3339();
+    let _ = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(team_id))
+        .key("run_id", attr_s(run_id))
+        .update_expression("SET #status = :s, status_run_id = :sri, updated_at = :t")
+        .expression_attribute_names("#status", "status")
+        .expression_attribute_values(":s", attr_s("retried"))
+        .expression_attribute_values(":sri", attr_s(&format!("retried#{run_id}")))
+        .expression_attribute_values(":t", attr_s(&now))
+        .send()
+        .await;
 }
 
 /// The message that starts a run's ticket again, from the run's record:
@@ -3061,6 +3102,23 @@ pub async fn cancel_run(
         })?;
 
     info!(run_id, "Run cancelled by user");
+    // A security fix run: the findings it claimed are released now (the
+    // run opened no pull request, or the pull request's own state decides).
+    let ticket = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(&claims.team_id))
+        .key("run_id", attr_s(&run_id))
+        .projection_expression("ticket_id")
+        .send()
+        .await
+        .ok()
+        .and_then(|o| o.item)
+        .and_then(|i| i.get("ticket_id").and_then(|v| v.as_s().ok()).cloned());
+    if let Some(ticket) = ticket {
+        super::security::on_run_ended(&state, &claims.team_id, &ticket).await;
+    }
     common::decision_log::on_run_acted(
         &state.dynamo,
         &state.config.settings_table_name,

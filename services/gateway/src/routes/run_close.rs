@@ -568,6 +568,10 @@ impl Ctx<'_> {
         if let Some(ticket) = &steps.ticket_lock {
             super::api::delete_ticket_lock(self.state, self.team_id, ticket).await;
         }
+        // A security fix run: the findings it claimed are released now.
+        if let Some(ticket) = &steps.ticket_lock {
+            super::security::on_run_ended(self.state, self.team_id, ticket).await;
+        }
         let actor = Actor {
             by: self
                 .closer
