@@ -197,13 +197,36 @@ async fn record(
     note: Note,
     done_reason: Option<&str>,
 ) {
-    let sk = ticket_state::sk(&msg.ticket_id);
+    record_notes(
+        state,
+        &msg.team_id,
+        &msg.ticket_id,
+        vec![note],
+        done_reason.map(|r| (r, msg.context_hash.as_str())),
+    )
+    .await;
+}
+
+/// Adds comments to the ticket's record, so the next plan on the ticket
+/// reads them. `done`: also marks the ticket done, with the reason and the
+/// ticket's content hash now.
+pub(crate) async fn record_notes(
+    state: &WorkerState,
+    team_id: &str,
+    ticket_id: &str,
+    new: Vec<Note>,
+    done: Option<(&str, &str)>,
+) {
+    if new.is_empty() && done.is_none() {
+        return;
+    }
+    let sk = ticket_state::sk(ticket_id);
     let table = &state.config.settings_table_name;
     let mut notes = state
         .dynamo
         .get_item()
         .table_name(table)
-        .key("pk", attr_s(&msg.team_id))
+        .key("pk", attr_s(team_id))
         .key("sk", attr_s(&sk))
         .send()
         .await
@@ -216,7 +239,7 @@ async fn record(
         })
         .map(|j| ticket_state::parse_notes(&j))
         .unwrap_or_default();
-    notes.push(note);
+    notes.extend(new);
     if notes.len() > ticket_state::MAX_NOTES {
         let drop = notes.len() - ticket_state::MAX_NOTES;
         notes.drain(..drop);
@@ -226,7 +249,7 @@ async fn record(
         .dynamo
         .update_item()
         .table_name(table)
-        .key("pk", attr_s(&msg.team_id))
+        .key("pk", attr_s(team_id))
         .key("sk", attr_s(&sk))
         .expression_attribute_names("#n", ticket_state::FIELD_NOTES)
         .expression_attribute_values(
@@ -234,19 +257,19 @@ async fn record(
             attr_s(&serde_json::to_string(&notes).unwrap_or_default()),
         )
         .expression_attribute_values(":t", attr_s(&now));
-    up = match done_reason {
-        Some(reason) => up
+    up = match done {
+        Some((reason, context_hash)) => up
             .update_expression("SET #n = :n, updated_at = :t, #s = :s, #r = :r, #h = :h")
             .expression_attribute_names("#s", ticket_state::FIELD_STATE)
             .expression_attribute_names("#r", ticket_state::FIELD_DONE_REASON)
             .expression_attribute_names("#h", ticket_state::FIELD_DONE_HASH)
             .expression_attribute_values(":s", attr_s(ticket_state::STATE_DONE))
             .expression_attribute_values(":r", attr_s(reason))
-            .expression_attribute_values(":h", attr_s(&msg.context_hash)),
+            .expression_attribute_values(":h", attr_s(context_hash)),
         None => up.update_expression("SET #n = :n, updated_at = :t"),
     };
     if let Err(e) = up.send().await {
-        warn!(ticket_id = %msg.ticket_id, error = %aws_sdk_dynamodb::error::DisplayErrorContext(&e), "Could not record the ticket comment");
+        warn!(ticket_id, error = %aws_sdk_dynamodb::error::DisplayErrorContext(&e), "Could not record the ticket comment");
     }
 }
 
@@ -308,6 +331,14 @@ pub async fn run(
     state: &WorkerState,
     msg: JiraCommentMessage,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Comments kept while a run worked on the ticket (see
+    // `ticket_comments`) are read first: a request to stop ends the run
+    // now, and what a run that has ended never read is acted on here.
+    super::ticket_comments::on_comment(state, &msg).await;
+    if msg.action.is_none() {
+        // The comment itself is one of those: nothing else to start.
+        return Ok(());
+    }
     let provider = ModelProvider::load_for_team(
         &state.dynamo,
         &state.config.settings_table_name,

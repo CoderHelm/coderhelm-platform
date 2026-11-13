@@ -715,6 +715,10 @@ async fn process_jira_payload(
         return Ok(StatusCode::OK);
     }
 
+    // What people already wrote on the ticket (the app sends its comments
+    // with the event) is kept, so the run reads it before it plans.
+    super::ticket_comments::keep_jira_existing(state, team_id, ticket_key, payload).await;
+
     let message = WorkerMessage::Ticket(TicketMessage {
         team_id: team_id.to_string(),
         installation_id,
@@ -941,11 +945,26 @@ async fn handle_jira_comment(
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
-    // Ignore comments by the bot itself
-    if comment_author.to_ascii_lowercase().contains("coderhelm") {
+    // CoderHelm's own comments (its acknowledgement included) and other
+    // apps' are never read: one of them must never start anything.
+    let author_kind = payload
+        .pointer("/comment/author/accountType")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if !common::ticket_comments::is_person(
+        common::ticket_comments::Source::Jira,
+        comment_author,
+        author_kind,
+        comment_body,
+    ) {
         info!(ticket_key, "Skipping own comment");
         return Ok(StatusCode::OK);
     }
+    let comment_id = match payload.pointer("/comment/id") {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Number(n)) => n.to_string(),
+        _ => String::new(),
+    };
 
     info!(team_id, ticket_key, comment_author, "Jira comment received");
     let requester = payload
@@ -995,7 +1014,27 @@ async fn handle_jira_comment(
     }
 
     let Some(run_item) = run_item_found.as_ref() else {
-        info!(ticket_key, "No runs found for Jira comment — ignoring");
+        // No run yet: the comment is kept, and the run that starts on the
+        // ticket reads it before it plans.
+        info!(
+            ticket_key,
+            "No runs found for Jira comment — kept for the run that starts on the ticket"
+        );
+        super::ticket_comments::keep(
+            state,
+            &super::ticket_comments::Incoming {
+                team_id,
+                installation_id,
+                source: common::ticket_comments::Source::Jira,
+                ticket_id: ticket_key,
+                comment_id: &comment_id,
+                author: comment_author,
+                author_kind,
+                text: comment_body,
+                ..Default::default()
+            },
+        )
+        .await;
         return Ok(StatusCode::OK);
     };
 
@@ -1042,19 +1081,45 @@ async fn handle_jira_comment(
         .map(|s| s.as_str())
         .unwrap_or("");
 
-    // A run in flight owns the ticket; the comment waits for it.
-    if matches!(run_status, "running" | "queued" | "awaiting_ci") {
+    // A run is working on the ticket: the comment is kept for it,
+    // acknowledged on the ticket, and read at the run's next step (an
+    // answer to its questions, an instruction, or a request to stop). It
+    // used to be dropped here.
+    if common::ticket_comments::run_working(run_status) {
+        let received = super::ticket_comments::receive(
+            state,
+            &super::ticket_comments::Incoming {
+                team_id,
+                installation_id,
+                source: common::ticket_comments::Source::Jira,
+                ticket_id: ticket_key,
+                comment_id: &comment_id,
+                author: comment_author,
+                author_kind,
+                text: comment_body,
+                title,
+                run_id,
+                run_status,
+                pr_number,
+                repo_owner,
+                repo_name,
+            },
+        )
+        .await?;
         info!(
             ticket_key,
-            run_status, "Ignoring Jira comment — run already in progress"
+            run_status, run_id, "Jira comment kept for the run in progress"
         );
         log_jira_event(
             state,
             team_id,
-            "comment_skipped",
+            "comment_kept",
             ticket_key,
             title,
-            "skipped",
+            match received {
+                super::ticket_comments::Received::Kept(..) => "queued",
+                _ => "duplicate",
+            },
             None,
         )
         .await;
