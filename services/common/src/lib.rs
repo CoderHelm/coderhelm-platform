@@ -201,6 +201,10 @@ pub mod run_round;
 pub mod run_status;
 /// What a run waiting on a person is waiting for: never nothing.
 pub mod run_wait;
+/// Proof that a repository builds and starts after its dependencies change:
+/// what to run (found in its CI and manifests), the sandbox script, and what
+/// the bumps are blamed for.
+pub mod runtime_proof;
 pub mod scorecard;
 #[cfg(test)]
 mod selfhost_links;

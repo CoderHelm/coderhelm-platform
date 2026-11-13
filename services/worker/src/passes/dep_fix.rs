@@ -3,6 +3,10 @@
 //! the repository's own package manager and runs its checks; a red set is
 //! halved until the breaking bump is found; only green sets are committed.
 //! The coder is used only for the call sites of a major the run must fix.
+//! Once the batches are settled the repository's real build and its start
+//! command run in a sandbox build of their own, on the base branch and on
+//! the branch (`common::runtime_proof`): what the bumps break there takes
+//! out the newest commit of bumps, deferred with the cause.
 //!
 //! The run's state is kept on S3 after every probe, so a step that runs out
 //! of time hands off and the next one resumes where it stopped (and its
@@ -12,6 +16,7 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use common::dep_fix::{self as df, Action, CodeFixed, DepRun, ProbeResult};
+use common::runtime_proof as rp;
 use tracing::{info, warn};
 
 use crate::clients::github::{FileOp, GitHubClient};
@@ -371,6 +376,85 @@ impl Probe<'_> {
     }
 }
 
+/// The least time left in a step for a runtime proof build to start in it:
+/// an install, the application's build and its start. With less, the proof
+/// starts in a fresh step, where it has the sandbox's whole wait
+/// (`clients::sandbox::MAX_WAIT`, bounded by the step's own time).
+const PROOF_WINDOW: std::time::Duration = std::time::Duration::from_secs(9 * 60);
+
+/// Whether a runtime proof build should wait for a fresh step: this step
+/// has less than [`PROOF_WINDOW`] left, and the run has not already moved
+/// to a fresh step for this build.
+pub fn proof_waits(left: Option<std::time::Duration>, waited: bool) -> bool {
+    !waited && left.is_some_and(|l| l < PROOF_WINDOW)
+}
+
+impl Probe<'_> {
+    /// One runtime proof build on `sha`: the install, each build command,
+    /// then the start command and its pages.
+    async fn prove(&self, sha: &str, plan: &rp::ProofPlan, nonce: usize) -> rp::ProofResult {
+        let (owner, name) = (&self.msg.repo_owner, &self.msg.repo_name);
+        let source = match self
+            .sandbox
+            .ensure_source(self.run_id, sha, || {
+                self.github.download_tarball(owner, name, sha)
+            })
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                return rp::ProofResult::no_result(&format!(
+                    "the branch could not be snapshotted: {e}"
+                ))
+            }
+        };
+        let out = self
+            .sandbox
+            .run_codegen(
+                self.run_id,
+                900 + nonce,
+                &source,
+                &rp::script(plan),
+                self.node.as_deref(),
+                &[],
+                self.deadline,
+            )
+            .await;
+        match out {
+            Ok(o) if o.ran => rp::parse(&o.output, plan),
+            Ok(o) => rp::ProofResult::no_result(&o.output),
+            Err(e) => rp::ProofResult::no_result(&e.to_string()),
+        }
+    }
+}
+
+/// What the runtime proof of a run runs: the build and start commands of
+/// the project most of its applied bumps are in, read from the repository's
+/// workflows and that project's manifest.
+async fn proof_plan(w: &Work<'_>, run: &DepRun) -> rp::ProofPlan {
+    let (o, n, base) = (&w.msg.repo_owner, &w.msg.repo_name, &w.msg.base_branch);
+    let mut by: HashMap<&str, usize> = HashMap::new();
+    for b in run.applied_bumps() {
+        *by.entry(b.manifest.as_str()).or_default() += 1;
+    }
+    let mut locks: Vec<(&str, usize)> = by.into_iter().collect();
+    locks.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    let Some((lockfile, _)) = locks.first().copied() else {
+        return rp::ProofPlan::default();
+    };
+    let workflows = checks::read_workflows(w.github, o, n, base).await;
+    let ci = checks::build_commands(&workflows, base);
+    let mut files = vec![];
+    for path in rp::files_to_read(lockfile) {
+        if let Ok(Some(text)) = w.github.read_file_if_exists(o, n, &path, base).await {
+            files.push((path, text));
+        }
+    }
+    let mut plan = rp::discover(lockfile, &ci, &files);
+    plan.not_covered = locks.iter().skip(1).map(|(l, _)| l.to_string()).collect();
+    plan
+}
+
 /// Everything the driver borrows from the run.
 pub struct Work<'a> {
     pub state: &'a WorkerState,
@@ -633,6 +717,81 @@ pub async fn drive(
                 let usd = (usage.cost_usd - before.cost_usd).max(0.0);
                 run.on_code_fix(bump, r, tokens, usd);
             }
+            Action::ProofPlan => {
+                let plan = proof_plan(w, &run).await;
+                // The proof's commands are the repository's own: the team's
+                // agent permissions hold them like any other.
+                let permitted = plan.is_empty()
+                    || matches!(
+                        gate.check_command(
+                            &rp::script(&plan),
+                            "Build and start the application in the sandbox"
+                        )
+                        .await,
+                        common::agent_policy::Outcome::Run { .. }
+                    );
+                run.on_proof_plan(plan);
+                if !permitted {
+                    run.skip_proof(
+                        "the team's agent permissions do not let the sandbox run the repository's build and start commands",
+                    );
+                }
+            }
+            Action::Proof { base } => {
+                let left = w
+                    .deadline
+                    .map(|d| d.saturating_duration_since(Instant::now()));
+                if proof_waits(left, run.proof.waited) {
+                    // Its own step, with a full time window.
+                    run.on_proof_wait();
+                    save(state, msg, w.run_id, &run).await;
+                    return Ok(Driven::Handoff(Box::new(run)));
+                }
+                let sha = if base {
+                    match run.base_sha() {
+                        Some(s) => s.to_string(),
+                        None => w
+                            .github
+                            .get_ref(owner, name, &msg.base_branch)
+                            .await
+                            .unwrap_or_default(),
+                    }
+                } else {
+                    run.head.clone()
+                };
+                let plan = run.proof.plan.clone().unwrap_or_default();
+                let r = probe.prove(&sha, &plan, run.proof.runs as usize).await;
+                let note = proof_note(base, &plan, &r);
+                run.on_proof(base, r);
+                super::add_progress_note(state, &msg.team_id, w.run_id, &note).await;
+            }
+            Action::ProofTakeOut { why } => {
+                // The state moves only once the branch is written.
+                let mut next = run.clone();
+                let written = match next.take_out_last_commit(&why) {
+                    Some(out) => restore_to(w, &out).await.map(|head| (out, head)),
+                    None => None,
+                };
+                match written {
+                    Some((out, head)) => {
+                        next.on_proof_taken_out(&out, &head);
+                        run = next;
+                        super::add_progress_note(
+                            state,
+                            &msg.team_id,
+                            w.run_id,
+                            &format!(
+                                "Dependency fix: the application's build or start fails with the newest verified set and passes on the base branch; took out {} bump(s) and kept the {} set(s) before it. {}",
+                                out.lines.len(),
+                                run.commits.len(),
+                                common::truncate_str(&out.lines.join("; "), 600)
+                            ),
+                        )
+                        .await;
+                    }
+                    None => run.on_proof_take_out_failed(),
+                }
+            }
             Action::Done => {
                 save(state, msg, w.run_id, &run).await;
                 return Ok(Driven::Done(Box::new(run)));
@@ -640,6 +799,78 @@ pub async fn drive(
         }
         save(state, msg, w.run_id, &run).await;
     }
+}
+
+/// The run page's line for one runtime proof build.
+fn proof_note(base: bool, plan: &rp::ProofPlan, r: &rp::ProofResult) -> String {
+    let on = if base {
+        "on the base branch"
+    } else {
+        "with the bumps"
+    };
+    if !r.ran {
+        return format!(
+            "Dependency fix: the runtime proof {on} gave no result ({})",
+            common::truncate_str(r.tail.lines().next().unwrap_or(""), 200)
+        );
+    }
+    let build = match (plan.builds.is_empty(), r.built()) {
+        (true, _) => "no build command found".to_string(),
+        (false, true) => "the build passes".to_string(),
+        (false, false) => "the build fails".to_string(),
+    };
+    let start = match (&plan.start, r.start.as_str()) {
+        (None, _) => "no start command declared".to_string(),
+        (Some(_), "up") => format!(
+            "the application started and answered {} of {} requested paths with success",
+            r.pages.iter().filter(|(_, c)| rp::page_ok(*c)).count(),
+            r.pages.len()
+        ),
+        (Some(_), "skipped") => "the start did not run".to_string(),
+        (Some(_), _) => "the application did not start".to_string(),
+    };
+    format!("Dependency fix: runtime proof {on}: {build}; {start}")
+}
+
+/// Puts the branch back to the files of `out.restore_to` as one commit (the
+/// commit a runtime proof takes out) and returns the branch's new head.
+/// `None` when nothing was written.
+async fn restore_to(w: &Work<'_>, out: &df::TakenOut) -> Option<String> {
+    let (owner, name) = (&w.msg.repo_owner, &w.msg.repo_name);
+    let changed = w
+        .github
+        .compare_changed_files(owner, name, &out.restore_to, w.branch)
+        .await
+        .ok()?;
+    let mut ops = vec![];
+    for path in changed {
+        match w
+            .github
+            .read_file_if_exists(owner, name, &path, &out.restore_to)
+            .await
+            .ok()?
+        {
+            Some(content) => ops.push(FileOp::Write { path, content }),
+            None => ops.push(FileOp::Delete { path }),
+        }
+    }
+    if ops.is_empty() {
+        return None;
+    }
+    let conventions = super::load_git_conventions(w.state, &w.msg.team_id, &w.msg.ticket_id).await;
+    let message = conventions.commit_message(
+        &super::ticket_tokens(w.msg),
+        &format!(
+            "fix(deps): take out {} security update{} the build or start fails with",
+            out.lines.len(),
+            if out.lines.len() == 1 { "" } else { "s" }
+        ),
+    );
+    w.github
+        .batch_write(owner, name, w.branch, &message, &ops)
+        .await
+        .ok()?;
+    w.github.get_ref(owner, name, w.branch).await.ok()
 }
 
 /// A dependency run starts from the base branch: an earlier attempt's
@@ -938,6 +1169,19 @@ pub async fn settle(state: &WorkerState, msg: &TicketMessage, run: &DepRun) {
         .filter(|d| !d.later)
         .flat_map(|d| d.finding_ids.clone())
         .collect();
+    // What stays open in the repository after this pull request, by reason.
+    let repo = format!("{}/{}", msg.repo_owner, msg.repo_name);
+    let all = super::security_fixes::load_findings(state, &msg.team_id).await;
+    let of_repo: Vec<&common::security_fixes::Finding> = all
+        .iter()
+        .map(|(f, _)| f)
+        .filter(|f| f.repo.eq_ignore_ascii_case(&repo))
+        .collect();
+    let report = format!(
+        "{}\n{}",
+        run.report_md().trim_end(),
+        df::remaining_md(&df::remaining(run, &of_repo))
+    );
     super::security_fixes::settle_dep_run(
         state,
         &msg.team_id,
@@ -945,7 +1189,7 @@ pub async fn settle(state: &WorkerState, msg: &TicketMessage, run: &DepRun) {
         &run.fixed_ids(),
         &deferred,
         &held,
-        &run.report_md(),
+        &report,
     )
     .await;
 }
@@ -985,6 +1229,61 @@ pub async fn implement_result(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_proof_build_starts_only_with_a_full_window_or_in_a_fresh_step() {
+        let mins = |m: u64| Some(std::time::Duration::from_secs(m * 60));
+        // Little time left in this step: the build waits for a fresh one.
+        assert!(proof_waits(mins(4), false));
+        assert!(proof_waits(mins(8), false));
+        // A fresh step has the window.
+        assert!(!proof_waits(mins(10), false));
+        // It never waits twice for the same build: a step that starts with
+        // less than the window runs it with what it has.
+        assert!(!proof_waits(mins(8), true));
+        assert!(!proof_waits(None, false));
+        // The window fits inside a step and inside the sandbox's own wait.
+        assert!(PROOF_WINDOW.as_secs() < super::super::LAMBDA_TIMEOUT_SECS - 150);
+    }
+
+    #[test]
+    fn the_run_page_says_what_a_proof_build_came_to() {
+        let plan = rp::discover(
+            "pnpm-lock.yaml",
+            &[rp::CiBuild {
+                cmd: "pnpm build".into(),
+                workflow: "ci.yml".into(),
+                job: "build".into(),
+                on_pull_request: true,
+                ..Default::default()
+            }],
+            &[(
+                "package.json".to_string(),
+                r#"{"scripts":{"start":"next start"}}"#.to_string(),
+            )],
+        );
+        let green = rp::parse(
+            "CODERHELM_PROOF_STEP build 1 0\nCODERHELM_PROOF_PAGE / 200\nCODERHELM_PROOF_PAGE /healthz 404\nCODERHELM_PROOF install=0 start=up port=38411\n",
+            &plan,
+        );
+        assert_eq!(
+            proof_note(false, &plan, &green),
+            "Dependency fix: runtime proof with the bumps: the build passes; the application started and answered 1 of 2 requested paths with success"
+        );
+        let red = rp::parse(
+            "CODERHELM_PROOF_STEP build 1 1\nCODERHELM_PROOF install=0 start=skipped port=0\n",
+            &plan,
+        );
+        assert_eq!(
+            proof_note(true, &plan, &red),
+            "Dependency fix: runtime proof on the base branch: the build fails; the start did not run"
+        );
+        let none = rp::ProofResult::no_result("the sandbox build timed out (CodeBuild TIMED_OUT)");
+        assert_eq!(
+            proof_note(false, &plan, &none),
+            "Dependency fix: the runtime proof with the bumps gave no result (the sandbox build timed out (CodeBuild TIMED_OUT))"
+        );
+    }
 
     fn task(path: &str, what: &str) -> super::super::plan_coverage::PlanTask {
         super::super::plan_coverage::PlanTask {

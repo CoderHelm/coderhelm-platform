@@ -3038,7 +3038,16 @@ async fn join(
     let member_refs: Vec<&Finding> = members.iter().map(|i| &findings[*i].0).collect();
     let (o, n) = add.repo.split_once('/').ok_or("bad repo")?;
     let base = cx.gh.get_default_branch(o, n).await?;
-    let notes = super::upgrade_notes::read(cx.state, &cx.gh, add, &base).await;
+    let deps = load_deps(cx.state, cx.team_id, &add.repo)
+        .await
+        .map(|d| d.0)
+        .unwrap_or_default();
+    let member_pairs: Vec<(&Finding, &FindingState)> = members
+        .iter()
+        .map(|i| (&findings[*i].0, &findings[*i].1))
+        .collect();
+    let notes =
+        super::upgrade_notes::read(cx.state, &cx.gh, add, &base, &member_pairs, &deps).await;
     let ask = sec::join_note_with(add, &member_refs, cx.cfg, &notes);
     follow_up(cx, &add.repo, pr.number, ticket, ask).await?;
     save_unit(cx.state, cx.team_id, ticket, &merged).await?;
@@ -3337,7 +3346,16 @@ async fn enqueue(
     // What each bump changes, read before the run: the coder starts from
     // the breaking changes and their call sites, and the pull request's
     // "What to check" is written from the same notes.
-    let notes = super::upgrade_notes::read(cx.state, &cx.gh, unit, &base).await;
+    let deps = load_deps(cx.state, cx.team_id, &unit.repo)
+        .await
+        .map(|d| d.0)
+        .unwrap_or_default();
+    let member_pairs: Vec<(&Finding, &FindingState)> = members
+        .iter()
+        .map(|i| (&findings[*i].0, &findings[*i].1))
+        .collect();
+    let notes =
+        super::upgrade_notes::read(cx.state, &cx.gh, unit, &base, &member_pairs, &deps).await;
     let body = sec::ticket_body_with(unit, &member_refs, cx.cfg, &notes);
     let lead = member_refs
         .iter()

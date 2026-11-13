@@ -1,5 +1,5 @@
 use super::*;
-use crate::security_fixes::{same_line, Relation, Scope, SecurityConfig, Status};
+use crate::security_fixes::{same_line, Relation, Scope, SecurityConfig};
 
 fn finding(
     id: &str,
@@ -560,6 +560,14 @@ struct FakeSandbox {
     coder_fixes: Vec<String>,
     probes: u32,
     commits: u32,
+    /// What the runtime proof runs (`None`: the repository names no build
+    /// and no start command).
+    proof_plan: Option<rp::ProofPlan>,
+    /// Packages the application's build fails with.
+    build_breaks: Vec<String>,
+    /// The build fails on the base branch too.
+    base_build_fails: bool,
+    proof_runs: u32,
 }
 
 const CHECKS: [&str; 4] = ["install", "lint", "typecheck", "tests"];
@@ -626,6 +634,23 @@ impl FakeSandbox {
                     };
                     run.on_code_fix(bump, r, 40_000, 0.6);
                 }
+                Action::ProofPlan => run.on_proof_plan(self.proof_plan.clone().unwrap_or_default()),
+                Action::Proof { base } => {
+                    self.proof_runs += 1;
+                    let broken = self.base_build_fails
+                        || (!base
+                            && run
+                                .applied_bumps()
+                                .iter()
+                                .any(|b| self.build_breaks.contains(&b.package)));
+                    let plan = run.proof.plan.clone().unwrap();
+                    run.on_proof(base, proof_result(&plan, broken));
+                }
+                Action::ProofTakeOut { why } => {
+                    let out = run.take_out_last_commit(&why).expect("a set to take out");
+                    self.commits += 1;
+                    run.on_proof_taken_out(&out, &format!("sha{}", self.commits));
+                }
                 Action::Done => return,
             }
         }
@@ -643,7 +668,41 @@ fn sandbox(breaks: &[(&str, &str)]) -> FakeSandbox {
         coder_fixes: vec![],
         probes: 0,
         commits: 0,
+        proof_plan: None,
+        build_breaks: vec![],
+        base_build_fails: false,
+        proof_runs: 0,
     }
+}
+
+/// A repository whose CI builds with `pnpm build` and that declares a start
+/// script.
+fn web_proof_plan() -> rp::ProofPlan {
+    rp::discover(
+        "pnpm-lock.yaml",
+        &[rp::CiBuild {
+            cmd: "pnpm build".into(),
+            dir: None,
+            workflow: "ci.yml".into(),
+            job: "build".into(),
+            on_pull_request: true,
+        }],
+        &[(
+            "package.json".to_string(),
+            r#"{"scripts":{"build":"next build","start":"next start"}}"#.to_string(),
+        )],
+    )
+}
+
+/// What the proof script prints: a failed build, or a build, a start and
+/// its pages.
+fn proof_result(plan: &rp::ProofPlan, build_fails: bool) -> rp::ProofResult {
+    let out = if build_fails {
+        "Module not found: Can't resolve 'lib/legacy'\nCODERHELM_PROOF_STEP build 1 1\nCODERHELM_PROOF install=0 start=skipped port=0\n"
+    } else {
+        "CODERHELM_PROOF_STEP build 1 0\nCODERHELM_PROOF_PAGE / 200\nCODERHELM_PROOF_PAGE /healthz 404\nCODERHELM_PROOF_PAGE /health 404\nCODERHELM_PROOF_PAGE /api/health 200\nCODERHELM_PROOF install=0 start=up port=38411\n"
+    };
+    rp::parse(out, plan)
 }
 
 fn ten_bumps() -> DepPlan {
@@ -945,8 +1004,12 @@ fn a_version_that_cannot_be_installed_is_deferred_without_the_coder() {
                 .into(),
         },
     )]);
+    // The batches are settled: the runtime proof, here with nothing to run.
+    assert_eq!(run.next_action(), Action::ProofPlan);
+    run.on_proof_plan(rp::ProofPlan::default());
     assert_eq!(run.next_action(), Action::Done);
     assert_eq!(run.code_fixes, 0);
+    assert_eq!(run.deferred[0].cause, Cause::Parent);
     assert!(run.deferred[0].reason.contains("could not be installed"));
     assert!(run.deferred[0]
         .reason
@@ -1305,4 +1368,502 @@ fn red_ci_takes_out_the_newest_commit_of_bumps_and_keeps_the_rest() {
     assert!(old.commits.is_empty());
     assert_eq!(old.take_out_last_commit(&why), None);
     assert!(ci_deferral_reason("  ").contains("CI failed with it applied;"));
+}
+
+// ── Version choice: the patched release inside the major ────────────────
+
+fn advised(
+    id: &str,
+    advisory: &str,
+    pkg: &str,
+    version: &str,
+    fixed: &[&str],
+) -> (Finding, FindingState) {
+    let (mut f, st) = finding(id, pkg, version, fixed, Tier::P2, Verdict::Unknown);
+    f.advisory.primary = advisory.into();
+    (f, st)
+}
+
+#[test]
+fn a_patched_release_inside_the_major_is_chosen_over_a_newer_major() {
+    // The advisory lists a patched release on the installed line and on the
+    // next major: the plan stays on the line, with the lowest one.
+    let fs = vec![
+        advised(
+            "a",
+            "GHSA-aaaa",
+            "glob-walk",
+            "7.2.0",
+            &["8.1.1", "7.5.9", "7.5.4"],
+        ),
+        advised("b", "GHSA-bbbb", "yaml-lite", "2.3.0", &["4.0.1", "2.8.3"]),
+    ];
+    let p = plan(&pairs(&fs), &cfg());
+    assert!(p.deferred.is_empty());
+    let walk = bump(&p, "glob-walk");
+    assert_eq!((walk.to.as_str(), walk.major), ("7.5.4", false));
+    assert_eq!(walk.major_reason, "");
+    let yaml = bump(&p, "yaml-lite");
+    assert_eq!((yaml.to.as_str(), yaml.major), ("2.8.3", false));
+    // The override the sandbox writes is scoped to the line and stays on it.
+    let all: Vec<&PlanBump> = p.bumps.iter().collect();
+    let spec = &specs(&all)[0];
+    assert_eq!(
+        spec.bumps,
+        vec![
+            ApplyBump {
+                name: "glob-walk".into(),
+                line: "7".into(),
+                to: "7.5.4".into()
+            },
+            ApplyBump {
+                name: "yaml-lite".into(),
+                line: "2".into(),
+                to: "2.8.3".into()
+            },
+        ]
+    );
+    for b in &spec.bumps {
+        assert_eq!(version_line(&b.to), b.line, "{} leaves its line", b.name);
+    }
+    for (f, st) in &fs {
+        assert!(!crosses_major(f, st, &cfg()), "{}", f.package);
+    }
+}
+
+#[test]
+fn a_major_is_crossed_only_with_the_advisory_that_has_no_patch_on_the_line() {
+    let fs = vec![advised(
+        "a",
+        "GHSA-cccc",
+        "tmpl-engine",
+        "2.3.0",
+        &["4.0.1", "3.9.0"],
+    )];
+    let p = plan(&pairs(&fs), &cfg());
+    let b = bump(&p, "tmpl-engine");
+    // The lowest patched release above the line, never the newest.
+    assert_eq!((b.to.as_str(), b.major), ("3.9.0", true));
+    assert_eq!(
+        b.major_reason,
+        "GHSA-cccc lists no patched release on the 2 line (patched releases it lists: 3.9.0, 4.0.1)"
+    );
+    assert!(crosses_major(&fs[0].0, &fs[0].1, &cfg()));
+    // The pull request says it on the bump's line.
+    let mut run = DepRun::new(p, "base", 3.0);
+    sandbox(&[]).drive(&mut run);
+    let report = run.report_md();
+    assert!(
+        report.contains("- `tmpl-engine` 2.3.0 to 3.9.0 (pnpm-lock.yaml; major version: GHSA-cccc lists no patched release on the 2 line"),
+        "{report}"
+    );
+}
+
+#[test]
+fn one_advisory_without_a_patch_on_the_line_is_named_as_why_the_line_moves() {
+    // Two advisories on the same copy: one patched on the line, one only on
+    // the next major. The line has to move; the reason names the one.
+    let fs = vec![
+        advised("a", "GHSA-dddd", "glob-walk", "7.2.0", &["7.5.4", "8.1.1"]),
+        advised("b", "GHSA-eeee", "glob-walk", "7.2.0", &["8.2.0"]),
+    ];
+    let p = plan(&pairs(&fs), &cfg());
+    assert_eq!(p.bumps.len(), 1);
+    let b = &p.bumps[0];
+    assert_eq!((b.to.as_str(), b.major), ("8.2.0", true));
+    assert!(b
+        .major_reason
+        .starts_with("GHSA-eeee lists no patched release on the 7 line"));
+    assert!(!b.major_reason.contains("GHSA-dddd"));
+}
+
+#[test]
+fn every_major_in_a_plan_records_why_and_no_same_line_bump_does() {
+    let mut fs = vec![];
+    for i in 0..12 {
+        let fixed: &[&str] = if i % 3 == 0 {
+            &["5.0.0"]
+        } else {
+            &["4.2.9", "5.0.0"]
+        };
+        fs.push(advised(
+            &format!("f{i}"),
+            &format!("GHSA-{i:04}"),
+            &format!("lib-{i:02}"),
+            "4.1.0",
+            fixed,
+        ));
+    }
+    let p = plan(&pairs(&fs), &cfg());
+    assert_eq!(p.bumps.iter().filter(|b| b.major).count(), 4);
+    for b in &p.bumps {
+        assert_eq!(b.major, !b.major_reason.is_empty(), "{}", b.package);
+        assert_eq!(b.major, version_line(&b.to) != b.line, "{}", b.package);
+    }
+}
+
+// ── Runtime proof: the build and the start ──────────────────────────────
+
+/// Eight same-line bumps and two majors, each major its own commit.
+fn mixed_plan() -> DepPlan {
+    let mut fs: Vec<_> = (0..8)
+        .map(|i| {
+            advised(
+                &format!("f{i}"),
+                &format!("GHSA-s{i:03}"),
+                &format!("lib-{i:02}"),
+                "2.1.0",
+                &["2.1.5"],
+            )
+        })
+        .collect();
+    fs.push(advised(
+        "m1",
+        "GHSA-m001",
+        "render-core",
+        "3.4.0",
+        &["4.0.2"],
+    ));
+    fs.push(advised("m2", "GHSA-m002", "route-kit", "1.9.0", &["2.0.0"]));
+    plan(&pairs(&fs), &cfg())
+}
+
+#[test]
+fn a_run_proves_the_build_and_the_start_after_its_batches() {
+    let mut run = DepRun::new(mixed_plan(), "base", 3.0);
+    let mut sb = sandbox(&[]);
+    sb.proof_plan = Some(web_proof_plan());
+    sb.drive(&mut run);
+    assert_eq!(run.applied.len(), 10);
+    // One build on the base branch, one on the branch.
+    assert_eq!((sb.proof_runs, run.proof.runs), (2, 2));
+    assert!(run.proof.done && run.proof.unresolved.is_empty() && run.proof.taken_out.is_empty());
+    let report = run.report_md();
+    assert!(report.contains("**Runtime proof (the repository's build and start, run in the sandbox with the bumps):**"), "{report}");
+    assert!(report.contains("- Build `pnpm build` (from the CI workflow `ci.yml`, job `build`): passes with these bumps."), "{report}");
+    assert!(report.contains("the application started in the sandbox and answered on port 38411. `GET /` 200, `GET /api/health` 200."), "{report}");
+    assert!(
+        report.contains("and 2 runtime proof build(s); model $0.00"),
+        "{report}"
+    );
+}
+
+#[test]
+fn a_build_the_newest_bumps_break_takes_them_out_and_defers_them_with_the_cause() {
+    let mut run = DepRun::new(mixed_plan(), "base", 3.0);
+    // The checks pass with it; only the application's build shows it.
+    let mut sb = sandbox(&[]);
+    sb.proof_plan = Some(web_proof_plan());
+    sb.build_breaks = vec!["route-kit".into()];
+    sb.drive(&mut run);
+    let applied: Vec<&str> = run
+        .applied_bumps()
+        .iter()
+        .map(|b| b.package.as_str())
+        .collect();
+    assert!(!applied.contains(&"route-kit"), "{applied:?}");
+    assert!(applied.contains(&"render-core"), "{applied:?}");
+    assert_eq!(applied.len(), 9);
+    // Base, the branch (red), the branch again without the newest set.
+    assert_eq!(sb.proof_runs, 3);
+    let d = run
+        .deferred
+        .iter()
+        .find(|d| d.package == "route-kit")
+        .expect("deferred");
+    assert_eq!(d.cause, Cause::Broke);
+    assert!(
+        !d.later,
+        "a bump that breaks the build is held out of later bundles"
+    );
+    assert_eq!(
+        d.reason,
+        "with it applied the build `pnpm build` fails (exit 1), which passes on the base branch; taken out so the bumps before it ship"
+    );
+    assert_eq!(run.fixed_ids().len(), 9);
+    assert!(run.deferred_ids().iter().any(|(id, _)| id == "m2"));
+    let report = run.report_md();
+    assert!(report.contains("- Taken out by this proof: `route-kit` 1.9.0 to 2.0.0 deferred: with it applied the build `pnpm build` fails"), "{report}");
+    assert!(report.contains("Build `pnpm build` (from the CI workflow `ci.yml`, job `build`): passes with these bumps."), "{report}");
+    assert!(run.proof.unresolved.is_empty());
+}
+
+#[test]
+fn a_build_that_fails_on_the_base_branch_too_is_never_blamed_on_a_bump() {
+    let mut run = DepRun::new(mixed_plan(), "base", 3.0);
+    let mut sb = sandbox(&[]);
+    sb.proof_plan = Some(web_proof_plan());
+    sb.base_build_fails = true;
+    sb.drive(&mut run);
+    assert_eq!(run.applied.len(), 10, "nothing is taken out");
+    assert_eq!(sb.proof_runs, 2);
+    let report = run.report_md();
+    assert!(report.contains("fails on the base branch too"), "{report}");
+    assert!(
+        report.contains("proves nothing about the bumps"),
+        "{report}"
+    );
+    assert!(
+        !report.contains("passes with these bumps.\n- Start"),
+        "{report}"
+    );
+}
+
+#[test]
+fn the_last_commit_is_never_taken_out_and_what_fails_is_said() {
+    let fs = vec![advised("a", "GHSA-one1", "lib-00", "2.1.0", &["2.1.5"])];
+    let mut run = DepRun::new(plan(&pairs(&fs), &cfg()), "base", 3.0);
+    let mut sb = sandbox(&[]);
+    sb.proof_plan = Some(web_proof_plan());
+    sb.build_breaks = vec!["lib-00".into()];
+    sb.drive(&mut run);
+    assert_eq!(run.applied.len(), 1, "the pull request is never emptied");
+    assert_eq!(
+        run.proof.unresolved,
+        vec!["the build `pnpm build` fails (exit 1)"]
+    );
+    let report = run.report_md();
+    assert!(report.contains("Still failing with the bumps in this pull request: the build `pnpm build` fails (exit 1)."), "{report}");
+    assert!(
+        report.contains("fails with these bumps (exit 1); it passes on the base branch"),
+        "{report}"
+    );
+    assert!(
+        !report.contains("job `build`): passes with these bumps"),
+        "{report}"
+    );
+}
+
+#[test]
+fn a_proof_that_did_not_run_is_said_never_claimed() {
+    // Nothing to run.
+    let mut run = DepRun::new(ten_bumps(), "base", 3.0);
+    sandbox(&[]).drive(&mut run);
+    assert!(run.proof.done && run.proof.runs == 0);
+    let report = run.report_md();
+    assert!(report.contains("- Not run: "), "{report}");
+    assert!(
+        report.contains("Nothing here claims the application builds or starts"),
+        "{report}"
+    );
+    // No result from the sandbox, twice: no verdict, nothing taken out.
+    let mut run = DepRun::new(mixed_plan(), "base", 3.0);
+    let mut sb = sandbox(&[]);
+    sb.proof_plan = Some(web_proof_plan());
+    loop {
+        match run.next_action() {
+            Action::Proof { base: true } => {
+                run.on_proof(true, proof_result(&web_proof_plan(), false))
+            }
+            Action::Proof { base: false } => run.on_proof(
+                false,
+                rp::ProofResult::no_result("the sandbox build timed out (CodeBuild TIMED_OUT)"),
+            ),
+            Action::Done => break,
+            Action::ProofTakeOut { .. } => panic!("no result is never a verdict"),
+            _ => {
+                // The batches, as the worker drives them.
+                let mut one = run.clone();
+                step(&mut sb, &mut one);
+                run = one;
+            }
+        }
+    }
+    assert_eq!(run.applied.len(), 10);
+    assert_eq!(run.proof.runs, 3, "the base, then the branch twice");
+    let report = run.report_md();
+    assert!(
+        report.contains("no result (the sandbox build timed out (CodeBuild TIMED_OUT))"),
+        "{report}"
+    );
+    assert!(
+        report.contains("Not proven here; CI on this pull request is the check."),
+        "{report}"
+    );
+    assert!(
+        !report.contains("job `build`): passes with these bumps"),
+        "{report}"
+    );
+}
+
+/// One action of a run, by the fake sandbox.
+fn step(sb: &mut FakeSandbox, run: &mut DepRun) {
+    match run.next_action() {
+        Action::Base => run.on_base(&sb.result(&[])),
+        Action::Probe(groups) => {
+            let results: Vec<(usize, ProbeResult)> = groups
+                .iter()
+                .map(|&g| {
+                    let mut on: Vec<&PlanBump> = run.applied_bumps();
+                    on.extend(run.groups[g].bumps.iter().map(|&i| &run.plan.bumps[i]));
+                    (g, sb.result(&on))
+                })
+                .collect();
+            run.on_probes(&results);
+        }
+        Action::Commit(g) => {
+            sb.commits += 1;
+            let head = format!("sha{}", sb.commits);
+            run.on_commit(g, &head);
+        }
+        Action::ProofPlan => run.on_proof_plan(sb.proof_plan.clone().unwrap_or_default()),
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+#[test]
+fn a_proof_waits_for_a_fresh_step_once_and_the_run_reads_as_moving() {
+    let mut run = DepRun::new(ten_bumps(), "base", 3.0);
+    let mut sb = sandbox(&[]);
+    sb.proof_plan = Some(web_proof_plan());
+    while run.next_action() != (Action::Proof { base: true }) {
+        step(&mut sb, &mut run);
+    }
+    let before = run.progress();
+    run.on_proof_wait();
+    assert_ne!(
+        run.progress(),
+        before,
+        "a wait for a fresh step is progress"
+    );
+    assert!(run.proof.waited);
+    // The state survives the hand-off as plain data.
+    let json = serde_json::to_string(&run).unwrap();
+    let mut back: DepRun = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, run);
+    assert_eq!(back.next_action(), Action::Proof { base: true });
+    back.on_proof(true, proof_result(&web_proof_plan(), false));
+    assert!(
+        !back.proof.waited,
+        "the next build may wait for its own step"
+    );
+    // A state saved before this change resumes with the proof still to do.
+    let old: DepRun = serde_json::from_str(r#"{"plan":{"bumps":[],"deferred":[]}}"#).unwrap();
+    assert_eq!(old.proof, RuntimeProof::default());
+}
+
+// ── What stays open ─────────────────────────────────────────────────────
+
+#[test]
+fn the_report_counts_what_stays_open_by_reason() {
+    let mut fs = vec![
+        advised("a", "GHSA-fix1", "lib-00", "2.1.0", &["2.1.5"]),
+        advised("b", "GHSA-fix2", "lib-01", "2.1.0", &["2.1.5"]),
+        advised("m", "GHSA-brk1", "route-kit", "1.9.0", &["2.0.0"]),
+    ];
+    // Only a major fixes it and it isn't reachable: the rules leave it out.
+    let mut skipped = advised("n", "GHSA-maj1", "old-parser", "4.11.3", &["5.5.0"]);
+    skipped.0.verdict = Verdict::NotReachable;
+    fs.push(skipped);
+    let mut run = DepRun::new(plan(&pairs(&fs), &cfg()), "base", 3.0);
+    let mut sb = sandbox(&[]);
+    sb.proof_plan = Some(web_proof_plan());
+    sb.build_breaks = vec!["route-kit".into()];
+    sb.drive(&mut run);
+    assert_eq!(run.fixed_ids(), vec!["a", "b"]);
+
+    // The repository's other findings: no patched release, one a parent
+    // holds, one another pull request fixes, one not due, one handled.
+    let mut no_patch = advised("p", "GHSA-nop1", "legacy-crypto", "1.2.0", &[]).0;
+    no_patch.fixed_version = None;
+    let mut no_patch2 = advised("p2", "GHSA-nop2", "legacy-crypto", "1.2.0", &[]).0;
+    no_patch2.fixed_version = None;
+    no_patch2.status = Status::NoFix;
+    let mut elsewhere = advised("o", "GHSA-oth1", "img-tool", "3.0.0", &["3.0.1"]).0;
+    elsewhere.status = Status::PrOpen;
+    let waiting = advised("w", "GHSA-wai1", "date-lib", "1.0.0", &["1.0.1"]).0;
+    let mut done = advised("d", "GHSA-don1", "gone", "1.0.0", &["1.0.1"]).0;
+    done.status = Status::Fixed;
+    let mut all: Vec<Finding> = fs.iter().map(|(f, _)| f.clone()).collect();
+    all.extend([no_patch, no_patch2, elsewhere, waiting, done]);
+    // A bump the package manager could not install.
+    run.deferred.push(Deferral {
+        package: "held-lib".into(),
+        from: "2.0.0".into(),
+        to: "2.0.4".into(),
+        finding_ids: vec!["h".into()],
+        reason: "its version could not be installed".into(),
+        cause: Cause::Parent,
+        ..Default::default()
+    });
+    all.push(advised("h", "GHSA-par1", "held-lib", "2.0.0", &["2.0.4"]).0);
+    let refs: Vec<&Finding> = all.iter().collect();
+    let groups = remaining(&run, &refs);
+    assert_eq!(
+        groups,
+        vec![
+            OpenGroup {
+                why: Open::NoPatch,
+                advisories: 2,
+                packages: vec!["legacy-crypto".into()]
+            },
+            OpenGroup {
+                why: Open::Parent,
+                advisories: 1,
+                packages: vec!["held-lib".into()]
+            },
+            OpenGroup {
+                why: Open::Broke,
+                advisories: 1,
+                packages: vec!["route-kit".into()]
+            },
+            OpenGroup {
+                why: Open::MajorNotNeeded,
+                advisories: 1,
+                packages: vec!["old-parser".into()]
+            },
+            OpenGroup {
+                why: Open::OtherPr,
+                advisories: 1,
+                packages: vec!["img-tool".into()]
+            },
+            OpenGroup {
+                why: Open::NotInRun,
+                advisories: 1,
+                packages: vec!["date-lib".into()]
+            },
+        ]
+    );
+    assert_eq!(
+        remaining_md(&groups),
+        "**Advisories that stay open after this pull request: 7** (counted from the advisories CoderHelm tracks for this repository)\n\
+         - 2: no patched release exists yet (`legacy-crypto`)\n\
+         - 1: blocked by a parent package (it pins the version, or the fixed version could not be installed) (`held-lib`)\n\
+         - 1: deferred because the build or the checks failed with the bump (`route-kit`)\n\
+         - 1: only a major upgrade fixes it, and the advisory is not reachable or urgent (`old-parser`)\n\
+         - 1: fixed by another open pull request (`img-tool`)\n\
+         - 1: not part of this run (not due yet, still being triaged, or in another run) (`date-lib`)\n"
+    );
+    // Nothing left is said too.
+    let fixed: Vec<&Finding> = all
+        .iter()
+        .filter(|f| run.fixed_ids().contains(&f.id))
+        .collect();
+    assert_eq!(
+        remaining_md(&remaining(&run, &fixed)),
+        "**Advisories that stay open after this pull request: 0** (counted from the advisories CoderHelm tracks for this repository)\n\
+         - None: every open advisory CoderHelm tracks for this repository is fixed here.\n"
+    );
+}
+
+#[test]
+fn a_take_out_that_could_not_be_written_leaves_the_bumps_and_says_what_fails() {
+    let mut run = DepRun::new(mixed_plan(), "base", 3.0);
+    let mut sb = sandbox(&[]);
+    sb.proof_plan = Some(web_proof_plan());
+    loop {
+        match run.next_action() {
+            Action::Proof { base } => run.on_proof(base, proof_result(&web_proof_plan(), !base)),
+            // GitHub refused the commit: the state never moved.
+            Action::ProofTakeOut { .. } => run.on_proof_take_out_failed(),
+            Action::Done => break,
+            _ => step(&mut sb, &mut run),
+        }
+    }
+    assert_eq!(run.applied.len(), 10);
+    assert!(run.deferred.is_empty());
+    assert_eq!(
+        run.proof.unresolved,
+        vec!["the build `pnpm build` fails (exit 1)"]
+    );
 }
