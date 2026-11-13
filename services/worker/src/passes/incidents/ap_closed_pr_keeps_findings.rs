@@ -316,7 +316,7 @@ fn every_path_that_ends_a_claim_tells_the_findings() {
 
     // GitHub failing is never "open": the release reads it as unknown.
     let rel_src = include_str!("../security_release.rs");
-    let pr_now = fn_src(rel_src, "impl ReleaseIo for Live<'_, '_> {");
+    let pr_now = fn_src(rel_src, "    pub async fn pr_now(");
     assert!(pr_now.contains("return PrNow::Unknown"));
     assert!(pr_now.contains("is_not_found"));
 }
