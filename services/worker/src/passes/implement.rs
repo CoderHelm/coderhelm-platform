@@ -195,7 +195,8 @@ pub async fn run(
 
     let feedback_section = match review_feedback {
         Some(fb) => format!(
-            "\n\n## Review Feedback (from previous cycle)\nThe reviewer found issues with the previous implementation. Fix ALL of the following:\n{fb}"
+            "\n\n## Review Feedback (from previous cycle)\nThe reviewer found issues with the previous implementation. Fix ALL of the following:\n{fb}\n\n## The pull request's description\n{}",
+            common::description_handoff::ROUND_NOTE
         ),
         None => String::new(),
     };

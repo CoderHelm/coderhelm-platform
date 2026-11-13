@@ -376,6 +376,10 @@ Resources:
                     - "es:ListDomainNames"
                     - "es:DescribeDomains"
                     - "ecr:DescribeImageScanFindings"
+                    # Which stack made a resource (its name and the resource's
+                    # logical id), where CloudFormation does not tag the resource:
+                    # never a template, parameters or outputs.
+                    - "cloudformation:DescribeStackResources"
                     - "ssm:ListInventoryEntries"
                   Resource: "*"
                 # AWS's public "latest AMI" parameters only.

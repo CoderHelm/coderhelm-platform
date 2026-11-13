@@ -364,7 +364,8 @@ pub async fn refresh(github: &GitHubClient, owner: &str, repo: &str, pr_number: 
     let floor = super::pr_risk::floor(&files, &HashMap::new());
     let out = put(body, build(github, owner, repo, &files, &floor, head).await);
     if out != body {
-        if let Err(e) = github.update_pr_body(owner, repo, pr_number, &out).await {
+        if let Err(e) = crate::passes::description::save(github, owner, repo, pr_number, &out).await
+        {
             warn!(pr_number, error = %e, "Reviewer guide: could not save the description");
         }
     }

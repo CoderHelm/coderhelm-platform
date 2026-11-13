@@ -476,7 +476,10 @@ async fn perform(
                     // request, never left as an unexplained verdict.
                     let now = super::own_review::defer_findings(&body, &items, &why);
                     if now != body {
-                        if let Err(e) = github.update_pr_body(&c.owner, &c.repo, c.pr, &now).await {
+                        if let Err(e) =
+                            crate::passes::description::save(github, &c.owner, &c.repo, c.pr, &now)
+                                .await
+                        {
                             warn!(run_id = %c.run_id, error = %e, "PR watch: could not list the deferred findings");
                         }
                     }

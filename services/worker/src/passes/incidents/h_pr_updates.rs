@@ -42,7 +42,7 @@ fn the_description_drops_an_older_rounds_failure_when_a_newer_round_lands() {
     let resume = include_str!("../resume.rs");
     let round = fn_src(resume, "\nasync fn run_fix_round(");
     let pushed = round.find("Landed::Pushed { files }").unwrap();
-    assert!(round[pushed..].contains("pr::refresh_description("));
+    assert!(round[pushed..].contains("description::head_moved("));
 }
 
 #[test]

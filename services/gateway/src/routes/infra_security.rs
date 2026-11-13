@@ -541,6 +541,79 @@ mod tests {
         assert_eq!(rv["resources"][0]["findings"][0], "pr");
     }
 
+    /// What the page reads for a database update: why it is a pull
+    /// request or a runbook, where the code is and how sure, the whole
+    /// runbook, and a refusal.
+    #[test]
+    fn a_finding_carries_its_decision_location_and_runbook_to_the_page() {
+        use common::infra_vuln::inventory::{Confidence, Location};
+        use common::infra_vuln::matching::{Fix, FixKind, InfraFinding};
+        use common::infra_vuln::runbook::{Runbook, Step};
+        let now = chrono::Utc::now();
+        let f = InfraFinding {
+            id: "db".into(),
+            account: "111122223333".into(),
+            environment: "production".into(),
+            tier: Some(sec::Tier::P2),
+            fix: Fix {
+                kind: Some(FixKind::Runbook),
+                decision: "This cannot be expressed in code.".into(),
+                meaning: Some(common::infra_vuln::actions::Meaning::OsUpdate),
+                advisory_note: "AWS publishes no CVE list for this action.".into(),
+                order: vec!["2 of 2 pending on this database.".into()],
+                location: Some(Location {
+                    repo: "acme/infra".into(),
+                    file: "db/main.tf".into(),
+                    how: "terraform_generated_name".into(),
+                    tool: "terraform".into(),
+                    confidence: Confidence::Low,
+                    evidence: vec!["2 other places fit about as well".into()],
+                    candidates: vec!["acme/infra:db/main.tf aws_db_instance.b".into()],
+                    ..Default::default()
+                }),
+                runbook: Some(Runbook {
+                    scope: vec!["AWS account 111122223333, Region us-east-1.".into()],
+                    steps: vec![Step {
+                        text: "Schedule it.".into(),
+                        cli: "aws rds apply-pending-maintenance-action".into(),
+                    }],
+                    apply_by: "2026-12-01".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut recs = records::reconcile(&[], vec![f], now);
+        recs[0].refused = vec!["db/main.tf: `aws_db_instance.a` changes `identifier`".into()];
+        let v = findings_view(&recs, vec![], &sec::SecurityConfig::default(), &[], now);
+        let x = &v["findings"][0];
+        assert_eq!(x["environment"], "production");
+        assert_eq!(x["fix"]["decision"], "This cannot be expressed in code.");
+        assert_eq!(x["fix"]["meaning"], "os_update");
+        assert_eq!(x["fix"]["location"]["confidence"], "low");
+        assert_eq!(x["fix"]["location"]["how"], "terraform_generated_name");
+        assert_eq!(
+            x["fix"]["location"]["candidates"][0],
+            "acme/infra:db/main.tf aws_db_instance.b"
+        );
+        assert_eq!(
+            x["fix"]["runbook"]["steps"][0]["cli"],
+            "aws rds apply-pending-maintenance-action"
+        );
+        assert_eq!(x["fix"]["runbook"]["apply_by"], "2026-12-01");
+        assert_eq!(x["fix"]["order"][0], "2 of 2 pending on this database.");
+        assert_eq!(x["drafted"], false);
+        assert!(x["refused"][0]
+            .as_str()
+            .unwrap()
+            .contains("changes `identifier`"));
+        assert!(
+            x["fix"].get("notes").is_none(),
+            "nothing is sent that is not there"
+        );
+    }
+
     #[test]
     fn the_switches_say_what_they_cost_and_the_template_only_receives() {
         let v = config_view(&records::InfraConfig::default());

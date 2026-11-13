@@ -430,7 +430,11 @@ impl Probe<'_> {
 
 /// What the runtime proof of a run runs: the build and start commands of
 /// the project most of its applied bumps are in, read from the repository's
-/// workflows and that project's manifest.
+/// workflows and that project's manifest, then the build of every other
+/// project the bumps can break: each workspace project whose dependencies
+/// bring in a changed package line (read from the lockfile), and the
+/// project of every other lockfile the run bumped. A project with no build
+/// to run is named as not built, with why.
 async fn proof_plan(w: &Work<'_>, run: &DepRun) -> rp::ProofPlan {
     let (o, n, base) = (&w.msg.repo_owner, &w.msg.repo_name, &w.msg.base_branch);
     let mut by: HashMap<&str, usize> = HashMap::new();
@@ -444,15 +448,141 @@ async fn proof_plan(w: &Work<'_>, run: &DepRun) -> rp::ProofPlan {
     };
     let workflows = checks::read_workflows(w.github, o, n, base).await;
     let ci = checks::build_commands(&workflows, base);
+    let mut plan = rp::discover(lockfile, &ci, &proof_files(w, lockfile).await);
+    if plan.install.is_empty() {
+        // Not a lockfile CoderHelm builds from: nothing more to add.
+        plan.not_covered = locks.iter().skip(1).map(|(l, _)| l.to_string()).collect();
+        return plan;
+    }
+    // The workspace projects that take a changed package line.
+    let asked: Vec<(String, String)> = run
+        .applied_bumps()
+        .iter()
+        .filter(|b| b.manifest == lockfile)
+        .map(|b| (b.package.clone(), b.from.clone()))
+        .collect();
+    match affected_projects(w, lockfile, &asked).await {
+        Ok(projects) => rp::add_projects(&mut plan, lockfile, &projects),
+        Err(why) => plan.projects_unknown = why,
+    }
+    // The projects of the other lockfiles with bumps.
+    for (other, bumps) in locks.iter().skip(1) {
+        let found = rp::discover(other, &ci, &proof_files(w, other).await);
+        rp::add_lockfile(&mut plan, other, *bumps, &found);
+    }
+    plan
+}
+
+/// The files [`rp::discover`] reads for a lockfile that exist on the base
+/// branch.
+async fn proof_files(w: &Work<'_>, lockfile: &str) -> Vec<(String, String)> {
+    let (o, n, base) = (&w.msg.repo_owner, &w.msg.repo_name, &w.msg.base_branch);
     let mut files = vec![];
     for path in rp::files_to_read(lockfile) {
         if let Ok(Some(text)) = w.github.read_file_if_exists(o, n, &path, base).await {
             files.push((path, text));
         }
     }
-    let mut plan = rp::discover(lockfile, &ci, &files);
-    plan.not_covered = locks.iter().skip(1).map(|(l, _)| l.to_string()).collect();
-    plan
+    files
+}
+
+/// Workspace manifests one proof reads at most.
+const MAX_WORKSPACE_MANIFESTS: usize = 60;
+
+/// The workspace projects of `lockfile` whose dependencies bring in one of
+/// the changed package lines (`asked`: package and the version it had),
+/// each with its scripts manifest. `Err` says why they could not be worked
+/// out; a lockfile with one project gives none.
+async fn affected_projects(
+    w: &Work<'_>,
+    lockfile: &str,
+    asked: &[(String, String)],
+) -> Result<Vec<rp::AffectedProject>, String> {
+    let (o, n, base) = (&w.msg.repo_owner, &w.msg.repo_name, &w.msg.base_branch);
+    if !common::reachability::is_lockfile(lockfile) {
+        // Not a JavaScript workspace lockfile: one project per lockfile.
+        return Ok(vec![]);
+    }
+    let root = lockfile.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+    let at = |dir: &str| -> String {
+        match (root.is_empty(), dir.is_empty()) {
+            (_, true) => root.to_string(),
+            (true, false) => dir.to_string(),
+            (false, false) => format!("{root}/{dir}"),
+        }
+    };
+    let manifest_path = |dir: &str| -> String {
+        let d = at(dir);
+        if d.is_empty() {
+            "package.json".to_string()
+        } else {
+            format!("{d}/package.json")
+        }
+    };
+    let text = match w.github.read_file_if_exists(o, n, lockfile, base).await {
+        Ok(Some(t)) => t,
+        _ => return Err(format!("`{lockfile}` could not be read on the base branch")),
+    };
+    // `yarn.lock` does not list its projects: the root manifest's
+    // workspaces and each project's manifest do.
+    let mut manifests: Vec<(String, String)> = vec![];
+    if lockfile.ends_with("yarn.lock") {
+        let Ok(Some(root_manifest)) = w
+            .github
+            .read_file_if_exists(o, n, &manifest_path(""), base)
+            .await
+        else {
+            return Err(format!(
+                "`{}` could not be read to list the workspace",
+                manifest_path("")
+            ));
+        };
+        let tree: Vec<String> = match w.github.get_tree(o, n, base).await {
+            Ok(t) => t.into_iter().map(|e| e.path).collect(),
+            Err(_) => return Err("the repository's files could not be listed".to_string()),
+        };
+        let dirs = rp::workspace_dirs(&root_manifest, &tree, root);
+        if dirs.len() > MAX_WORKSPACE_MANIFESTS {
+            return Err(format!(
+                "the workspace has {} projects, more than one proof reads",
+                dirs.len()
+            ));
+        }
+        manifests.push((String::new(), root_manifest));
+        for d in dirs {
+            if let Ok(Some(t)) = w
+                .github
+                .read_file_if_exists(o, n, &manifest_path(&d), base)
+                .await
+            {
+                manifests.push((d, t));
+            }
+        }
+    }
+    let Some(projects) = common::reachability::lock_projects(lockfile, &text, &manifests, asked)
+    else {
+        return Err(format!(
+            "`{lockfile}` could not be read as a workspace's lockfile"
+        ));
+    };
+    let mut out = vec![];
+    for p in projects.into_iter().filter(|p| !p.uses.is_empty()) {
+        let manifest = match manifests.iter().find(|(d, _)| *d == p.dir) {
+            Some((_, t)) => Some(t.clone()),
+            None => w
+                .github
+                .read_file_if_exists(o, n, &manifest_path(&p.dir), base)
+                .await
+                .ok()
+                .flatten(),
+        };
+        out.push(rp::AffectedProject {
+            dir: at(&p.dir),
+            uses: p.uses,
+            manifest,
+        });
+    }
+    Ok(out)
 }
 
 /// Everything the driver borrows from the run.

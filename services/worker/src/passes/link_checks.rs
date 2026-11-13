@@ -1425,9 +1425,8 @@ pub async fn refresh_pr(
                 super::completeness::Section::Links,
                 String::new(),
             );
-            if let Err(e) = github
-                .update_pr_body(owner, repo, pr_number, &without)
-                .await
+            if let Err(e) =
+                crate::passes::description::save(github, owner, repo, pr_number, &without).await
             {
                 warn!(pr_number, error = %e, "Could not drop the link checks from the description");
             }
@@ -1453,9 +1452,8 @@ pub async fn refresh_pr(
         report.section(),
     );
     if updated != body {
-        if let Err(e) = github
-            .update_pr_body(owner, repo, pr_number, &updated)
-            .await
+        if let Err(e) =
+            crate::passes::description::save(github, owner, repo, pr_number, &updated).await
         {
             warn!(pr_number, error = %e, "Could not save the link checks to the description");
             return None;

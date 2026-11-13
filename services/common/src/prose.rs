@@ -52,6 +52,24 @@ pub fn sentence_ends(text: &str) -> Vec<usize> {
     ends
 }
 
+/// The sentences of `text`, each with its byte range: every stretch up to a
+/// sentence end ([`sentence_ends`]), and what is left after the last one.
+/// Leading whitespace belongs to the sentence it precedes.
+pub fn sentence_spans(text: &str) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    for end in sentence_ends(text) {
+        if !text[start..end].trim().is_empty() {
+            out.push((start, end));
+        }
+        start = end;
+    }
+    if !text[start..].trim().is_empty() {
+        out.push((start, text.len()));
+    }
+    out
+}
+
 /// At most `max_sentences` whole sentences and about `max_bytes`. A first
 /// sentence longer than `max_bytes` is kept whole: the cap never splits it.
 /// Text with no sentence end is returned as it is.
