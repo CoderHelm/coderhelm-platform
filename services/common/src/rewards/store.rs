@@ -1127,6 +1127,221 @@ impl Store {
             }
         }
     }
+
+    /// Keeps what one outcome taught: the lesson distilled from it (`d`,
+    /// None when it taught no rule) is written, or counted on the kept
+    /// lesson that says the same, once per pull request; the kept lessons
+    /// the outcome contradicts lose weight, each once per pull request. The
+    /// evidence lines go on the lesson (a contradiction as a line of its
+    /// own), and a new lesson is logged as a change an admin can turn off.
+    pub async fn learn_outcome(
+        &self,
+        team_id: &str,
+        repo: &str,
+        d: Option<&super::lessons::Distilled>,
+        contradicts: &[String],
+        ev: &OutcomeEvidence,
+    ) -> Result<OutcomeLearned, String> {
+        use super::lessons::{self, OutcomeAction};
+        let kept = self.lessons(team_id, Some(repo)).await?;
+        let now_t = chrono::Utc::now();
+        let now = now_t.to_rfc3339();
+        let pr_key = lessons::pr_key(repo, ev.pr);
+        let plan = lessons::plan_outcome(&kept, d, contradicts, &pr_key, now_t);
+        let mut out = OutcomeLearned::default();
+        let change_evidence = |why: &str| {
+            vec![serde_json::json!({
+                "kind": ev.source, "at": now, "pr": ev.pr, "run_id": ev.run_id, "detail": why,
+            })]
+        };
+        for id in &plan.contradict {
+            let Some(l) = kept.iter().find(|l| &l.id == id) else {
+                continue;
+            };
+            let line = lessons::contradiction_line(&pr_key, &ev.lines);
+            let evidence = lessons::bounded(
+                &l.evidence,
+                std::slice::from_ref(&line),
+                lessons::MAX_EVIDENCE,
+            );
+            self.dynamo
+                .update_item()
+                .table_name(&self.table)
+                .key("pk", s(team_id))
+                .key("sk", s(&lesson_sk(repo, id)))
+                .condition_expression("attribute_exists(sk)")
+                .update_expression("ADD #c :one SET #ev = :ev, #ca = :t")
+                .expression_attribute_names("#c", "contradicted")
+                .expression_attribute_names("#ev", "evidence")
+                .expression_attribute_names("#ca", "last_contradicted_at")
+                .expression_attribute_values(":one", n(1))
+                .expression_attribute_values(
+                    ":ev",
+                    AttributeValue::L(evidence.iter().map(|x| s(x)).collect()),
+                )
+                .expression_attribute_values(":t", s(&now))
+                .send()
+                .await
+                .map_err(|e| DisplayErrorContext(e).to_string())?;
+            out.contradicted.push(id.clone());
+        }
+        match (&plan.action, d) {
+            (OutcomeAction::Reinforce { id, counts }, _) => {
+                if let Some(l) = kept.iter().find(|l| &l.id == id).filter(|_| *counts) {
+                    let list = |v: Vec<String>| AttributeValue::L(v.iter().map(|x| s(x)).collect());
+                    self.dynamo
+                        .update_item()
+                        .table_name(&self.table)
+                        .key("pk", s(team_id))
+                        .key("sk", s(&lesson_sk(repo, id)))
+                        .condition_expression("attribute_exists(sk)")
+                        .update_expression("ADD #seen :one SET #ls = :t, #prs = :prs, #ev = :ev")
+                        .expression_attribute_names("#seen", "seen")
+                        .expression_attribute_names("#ls", "last_seen_at")
+                        .expression_attribute_names("#prs", "prs")
+                        .expression_attribute_names("#ev", "evidence")
+                        .expression_attribute_values(":one", n(1))
+                        .expression_attribute_values(":t", s(&now))
+                        .expression_attribute_values(
+                            ":prs",
+                            list(lessons::bounded(
+                                &l.prs,
+                                std::slice::from_ref(&pr_key),
+                                lessons::MAX_PRS,
+                            )),
+                        )
+                        .expression_attribute_values(
+                            ":ev",
+                            list(lessons::bounded(
+                                &l.evidence,
+                                &lessons::reinforcing_lines(&ev.lines),
+                                lessons::MAX_EVIDENCE,
+                            )),
+                        )
+                        .send()
+                        .await
+                        .map_err(|e| DisplayErrorContext(e).to_string())?;
+                }
+                out.lesson = Some(id.clone());
+            }
+            (OutcomeAction::Write, Some(d)) => {
+                if let Some(drop) = &plan.drop {
+                    let _ = self
+                        .dynamo
+                        .delete_item()
+                        .table_name(&self.table)
+                        .key("pk", s(team_id))
+                        .key("sk", s(&lesson_sk(repo, drop)))
+                        .send()
+                        .await;
+                }
+                let id = ulid::Ulid::new().to_string();
+                let lesson =
+                    lessons::new_outcome_lesson(repo, &id, d, &ev.source, ev.pr, &ev.lines, &now);
+                self.dynamo
+                    .put_item()
+                    .table_name(&self.table)
+                    .set_item(Some(outcome_lesson_item(team_id, &lesson)))
+                    .send()
+                    .await
+                    .map_err(|e| DisplayErrorContext(e).to_string())?;
+                let change = Change {
+                    id: ulid::Ulid::new().to_string(),
+                    repo: repo.to_string(),
+                    kind: changes::KIND_LESSON.into(),
+                    key: id.clone(),
+                    from: String::new(),
+                    to: crate::truncate_str(d.rule.trim(), 300).to_string(),
+                    reason: format!(
+                        "New coder lesson from PR #{} ({})",
+                        ev.pr,
+                        match ev.source.as_str() {
+                            lessons::SOURCE_EDITED => "people edited it before merging",
+                            lessons::SOURCE_CLOSED => "closed without merging",
+                            lessons::SOURCE_REVERTED => "reverted after merging",
+                            _ => "its outcome",
+                        }
+                    ),
+                    evidence: change_evidence(ev.lines.first().map(String::as_str).unwrap_or("")),
+                    at: now.clone(),
+                    ..Default::default()
+                };
+                self.apply_change(team_id, &change).await?;
+                out.lesson = Some(id);
+                out.written = true;
+            }
+            _ => {}
+        }
+        Ok(out)
+    }
+
+    /// Marks what became of lessons proposed for the guide file: merged
+    /// into it (`kept`), or taken out or declined by people (`declined`,
+    /// which also counts against the lesson once).
+    pub async fn settle_guide_lessons(
+        &self,
+        team_id: &str,
+        repo: &str,
+        kept: &[String],
+        declined: &[String],
+        pr: u64,
+    ) -> Result<(), String> {
+        let now = chrono::Utc::now().to_rfc3339();
+        for id in kept {
+            self.dynamo
+                .update_item()
+                .table_name(&self.table)
+                .key("pk", s(team_id))
+                .key("sk", s(&lesson_sk(repo, id)))
+                .condition_expression("attribute_exists(sk)")
+                .update_expression("SET #g = :y, #gp = :pr, #ga = :t")
+                .expression_attribute_names("#g", "in_guide")
+                .expression_attribute_names("#gp", "guide_pr")
+                .expression_attribute_names("#ga", "guide_at")
+                .expression_attribute_values(":y", AttributeValue::Bool(true))
+                .expression_attribute_values(":pr", n(pr))
+                .expression_attribute_values(":t", s(&now))
+                .send()
+                .await
+                .map_err(|e| DisplayErrorContext(e).to_string())?;
+        }
+        for id in declined {
+            let line = format!("Declined for the guide file in PR #{pr}");
+            self.dynamo
+                .update_item()
+                .table_name(&self.table)
+                .key("pk", s(team_id))
+                .key("sk", s(&lesson_sk(repo, id)))
+                .condition_expression("attribute_exists(sk) AND attribute_not_exists(#gd)")
+                .update_expression(
+                    "ADD #c :one SET #gd = :y, #gp = :pr, #ga = :t, \
+                     #ev = list_append(if_not_exists(#ev, :empty), :line)",
+                )
+                .expression_attribute_names("#gd", "guide_declined")
+                .expression_attribute_names("#gp", "guide_pr")
+                .expression_attribute_names("#ga", "guide_at")
+                .expression_attribute_names("#c", "contradicted")
+                .expression_attribute_names("#ev", "evidence")
+                .expression_attribute_values(":one", n(1))
+                .expression_attribute_values(":y", AttributeValue::Bool(true))
+                .expression_attribute_values(":pr", n(pr))
+                .expression_attribute_values(":t", s(&now))
+                .expression_attribute_values(":empty", AttributeValue::L(vec![]))
+                .expression_attribute_values(":line", AttributeValue::L(vec![s(&line)]))
+                .send()
+                .await
+                .map(|_| ())
+                .or_else(|e| {
+                    let msg = DisplayErrorContext(&e).to_string();
+                    if msg.contains("ConditionalCheckFailed") {
+                        Ok(()) // already settled, or the lesson is gone
+                    } else {
+                        Err(msg)
+                    }
+                })?;
+        }
+        Ok(())
+    }
 }
 
 /// Counts on a category record.
@@ -1254,12 +1469,76 @@ pub fn lesson_of(i: &Item) -> Lesson {
             .and_then(|v| v.as_l().ok())
             .map(|l| l.iter().filter_map(|v| v.as_s().ok().cloned()).collect())
             .unwrap_or_default(),
-        reverted: i
-            .get("reverted")
-            .and_then(|v| v.as_bool().ok())
-            .copied()
-            .unwrap_or(false),
+        reverted: gb(i, "reverted"),
+        check: gs(i, "check"),
+        applies_to: gs(i, "applies_to"),
+        source: gs(i, "source"),
+        prs: gl(i, "prs"),
+        contradicted: gu(i, "contradicted"),
+        in_guide: gb(i, "in_guide"),
+        guide_declined: gb(i, "guide_declined"),
     }
+}
+
+fn gb(i: &Item, k: &str) -> bool {
+    i.get(k)
+        .and_then(|v| v.as_bool().ok())
+        .copied()
+        .unwrap_or(false)
+}
+
+fn gl(i: &Item, k: &str) -> Vec<String> {
+    i.get(k)
+        .and_then(|v| v.as_l().ok())
+        .map(|l| l.iter().filter_map(|v| v.as_s().ok().cloned()).collect())
+        .unwrap_or_default()
+}
+
+/// One outcome a lesson is distilled from: the pull request, what happened
+/// to it, and the evidence lines kept with the lesson (what people changed
+/// or said, in their words).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OutcomeEvidence {
+    pub pr: u64,
+    /// `edited`, `closed` or `reverted` (`lessons::SOURCE_*`).
+    pub source: String,
+    pub run_id: String,
+    pub lines: Vec<String>,
+}
+
+/// What [`Store::learn_outcome`] did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OutcomeLearned {
+    /// The lesson written or reinforced.
+    pub lesson: Option<String>,
+    pub written: bool,
+    /// Kept lessons the outcome counted against.
+    pub contradicted: Vec<String>,
+}
+
+/// Pure: the item of a lesson distilled from an outcome
+/// (`lessons::new_outcome_lesson`); [`lesson_of`] reads it back.
+pub fn outcome_lesson_item(team_id: &str, l: &Lesson) -> Item {
+    let list = |v: &[String]| AttributeValue::L(v.iter().map(|x| s(x)).collect());
+    Item::from([
+        ("pk".to_string(), s(team_id)),
+        ("sk".to_string(), s(&lesson_sk(&l.repo, &l.id))),
+        ("record_type".to_string(), s("reward_lesson")),
+        ("id".to_string(), s(&l.id)),
+        ("repo".to_string(), s(&l.repo)),
+        ("agent".to_string(), s(&l.agent)),
+        ("text".to_string(), s(&l.text)),
+        ("check".to_string(), s(&l.check)),
+        ("applies_to".to_string(), s(&l.applies_to)),
+        ("source".to_string(), s(&l.source)),
+        ("seen".to_string(), n(l.seen)),
+        ("contradicted".to_string(), n(l.contradicted)),
+        ("prs".to_string(), list(&l.prs)),
+        ("created_at".to_string(), s(&l.created_at)),
+        ("last_seen_at".to_string(), s(&l.last_seen_at)),
+        ("evidence".to_string(), list(&l.evidence)),
+        ("reverted".to_string(), AttributeValue::Bool(l.reverted)),
+    ])
 }
 
 #[cfg(test)]
@@ -1271,6 +1550,37 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.clone()))
             .collect()
+    }
+
+    #[test]
+    fn an_outcome_lesson_reads_back_as_it_was_written() {
+        let d = super::super::lessons::Distilled {
+            rule: " Fetch through `useApi` in `apps/web`. ".into(),
+            check: "No `fetch(` in the diff.".into(),
+            applies_to: "apps/web".into(),
+            ..Default::default()
+        };
+        let l = super::super::lessons::new_outcome_lesson(
+            "acme/web",
+            "L1",
+            &d,
+            "edited",
+            12,
+            &["PR #12: people edited it before merging".to_string()],
+            "2026-10-02T00:00:00Z",
+        );
+        let written = outcome_lesson_item("TEAM#a", &l);
+        assert_eq!(written["sk"], s("REWARDLESSON#acme/web#L1"));
+        assert_eq!(written["pk"], s("TEAM#a"));
+        let back = lesson_of(&written);
+        assert_eq!(back, l);
+        assert_eq!(back.text, "Fetch through `useApi` in `apps/web`.");
+        assert_eq!(back.prs, vec!["acme/web#12"]);
+        // A lesson written before these fields existed reads with none.
+        let old = item(&[("id", s("A")), ("text", s("x")), ("seen", n(3))]);
+        let l = lesson_of(&old);
+        assert_eq!((l.seen, l.contradicted, l.in_guide), (3, 0, false));
+        assert!(l.check.is_empty() && l.prs.is_empty());
     }
 
     #[test]

@@ -188,6 +188,9 @@ pub struct RewardEvent {
     /// People's own words about it: their commit subjects, the reason a PR
     /// was closed.
     pub notes: Vec<String>,
+    /// Short excerpts of what people changed (their commits' own patches),
+    /// so a lesson can be distilled from the code and not only its name.
+    pub diff: Vec<String>,
 }
 
 impl RewardEvent {
@@ -331,7 +334,11 @@ impl RewardEvent {
                 AttributeValue::Ss(self.skills.clone()),
             );
         }
-        for (k, v) in [("files", &self.files), ("notes", &self.notes)] {
+        for (k, v) in [
+            ("files", &self.files),
+            ("notes", &self.notes),
+            ("diff", &self.diff),
+        ] {
             if !v.is_empty() {
                 i.insert(
                     k.to_string(),
@@ -374,6 +381,7 @@ impl RewardEvent {
             dedup: get_s(item, "dedup"),
             files: get_l(item, "files"),
             notes: get_l(item, "notes"),
+            diff: get_l(item, "diff"),
         })
     }
 }
@@ -427,6 +435,7 @@ mod tests {
         e.variant = "standard".into();
         e.files = vec!["src/a.ts".into()];
         e.notes = vec!["Use the shared client".into()];
+        e.diff = vec!["src/a.ts\n-fetch(url)\n+client.get(url)".into()];
         let item = e.to_item();
         assert_eq!(item["pk"], AttributeValue::S("TEAM#a".into()));
         let back = RewardEvent::from_item(&item).unwrap();
