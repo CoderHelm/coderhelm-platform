@@ -804,6 +804,7 @@ mod continuation_tests {
             "The link and redirect check needs more time",
             "The failing-test rules need more time",
             "The new-feature rules need more time",
+            "Running the changed tests with and without the change needs a step of its own",
         ] {
             assert!(rp.contains(why), "no hand-off for: {why}");
         }
@@ -1215,6 +1216,8 @@ pub mod fix_location;
 pub mod formatter;
 pub(crate) mod generators;
 pub mod github_history;
+pub mod habits;
+pub mod habits_check;
 pub mod health_check;
 pub mod hidden_suggest;
 /// Hosted side of hybrid: forward a held event to a self-hosted install again.
@@ -6599,6 +6602,7 @@ async fn run_passes(
                 links: "",
                 test_fix: None,
                 feature: None,
+                habits: None,
                 keep_commits: stacked_on
                     .as_ref()
                     .is_some_and(|d| !d.unresolved.is_empty()),
@@ -6821,6 +6825,38 @@ async fn run_passes(
     if let Some(f) = &feature_pr {
         gaps.extend(feature::open_findings(f));
     }
+    // Each new or changed test run with and without the change, and the
+    // changed files held to the plan (see habits_check). Its sandbox runs
+    // take a step of their own when this one is short.
+    let habits_pr = match habits_check::gate(&work, &mut evidence, usage, has_time, || {
+        remaining_secs(start)
+    })
+    .await
+    {
+        Ok(h) => h,
+        Err(habits_check::GateStop::NeedsTime) => {
+            close_memory(state, agent_memory.take()).await;
+            return hand_off_at(
+                state,
+                msg,
+                &github,
+                run_id,
+                &branch_name,
+                steps::Gate::Checks,
+                Some(&carry),
+                "Running the changed tests with and without the change needs a step of its own",
+                usage,
+            )
+            .await;
+        }
+        Err(habits_check::GateStop::Why(why)) => {
+            gaps.push(proof::check_item("The tests and scope check", &why));
+            None
+        }
+    };
+    if let Some(h) = &habits_pr {
+        gaps.extend(habits_check::open_findings(h, &plan_result));
+    }
     // What the stop judge assumed instead of asking: an Open item a person
     // corrects if it's wrong.
     gaps.extend(stop_judge::assumptions(state, &msg.team_id, run_id).await);
@@ -6842,6 +6878,7 @@ async fn run_passes(
             links: &links,
             test_fix: test_pr.as_ref(),
             feature: feature_pr.as_ref(),
+            habits: habits_pr.as_ref(),
             keep_commits: false,
         },
     )
@@ -7939,6 +7976,7 @@ async fn run_repo_pipeline(
                 test_fix: None,
                 // Multi-repo runs: the new-feature rules check single-repo runs.
                 feature: None,
+                habits: None,
                 keep_commits: false,
             },
             provider,
@@ -8039,6 +8077,28 @@ async fn run_repo_pipeline(
             None
         }
     };
+    // This path has no step of its own to give: with too little time the
+    // tests are recorded as not run, with why.
+    ledger.update(|l| l.habits_waited = true);
+    let habits_pr = match habits_check::gate(
+        &work,
+        &mut evidence,
+        usage,
+        || has_time_for_remediation(start),
+        || remaining_secs(start),
+    )
+    .await
+    {
+        Ok(h) => h,
+        Err(habits_check::GateStop::NeedsTime) => None,
+        Err(habits_check::GateStop::Why(why)) => {
+            gaps.push(proof::check_item("The tests and scope check", &why));
+            None
+        }
+    };
+    if let Some(h) = &habits_pr {
+        gaps.extend(habits_check::open_findings(h, &repo_plan));
+    }
     gaps.extend(stop_judge::assumptions(state, &msg.team_id, run_id).await);
     pr::apply_checks(
         state,
@@ -8058,6 +8118,7 @@ async fn run_repo_pipeline(
             links: &links,
             test_fix: test_pr.as_ref(),
             feature: None,
+            habits: habits_pr.as_ref(),
             keep_commits: false,
         },
     )

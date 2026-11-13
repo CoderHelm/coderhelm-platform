@@ -13,7 +13,7 @@ use crate::WorkerState;
 /// any change to how plans are made or what a plan must carry, so a plan
 /// written by an older planner is never reused.
 pub const PLANNER_VERSION: &str =
-    "2026-11-06.intent-history-env-near-match-stop-rules-data-rules-cross-repo-asking-reproduce-decision-reask-series";
+    "2026-11-13.intent-history-env-near-match-stop-rules-data-rules-cross-repo-asking-reproduce-decision-reask-series-habits";
 
 /// The openspec file holding the plan's end-to-end checklist, readable.
 pub const END_TO_END_FILE: &str = "end_to_end.md";
@@ -829,6 +829,21 @@ Then the ```fix_location.json block described above."#,
     back.extend(feature_gaps.iter().cloned());
     // A decision that stops without a fix names the one step a person takes.
     back.extend(super::fix_location::next_step_gaps(draft.fix.as_ref()));
+    // What a careful engineer settles before code (see habits): the worker
+    // reads the planned files' history and what depends on them itself, and
+    // the draft must answer what it found.
+    let habit_reader = super::habits::Reader {
+        state,
+        github,
+        graph: graphs.ready(),
+        search: &executor.read_only,
+        owner: &msg.repo_owner,
+        repo: &msg.repo_name,
+        team_repos: &team_repos,
+    };
+    let habit_facts = habit_reader.facts(&draft).await;
+    let habit_gaps = super::habits::plan_gaps(&draft, &habit_facts);
+    back.extend(habit_gaps.iter().cloned());
     // The outside steps: decided in order (the change, CoderHelm, a person
     // with a reason), looked up before claimed, ordered, valued, confirmable.
     let note_gaps = super::outside_work::plan_gaps(&draft, &abilities);
@@ -1214,6 +1229,43 @@ Then the ```fix_location.json block described above."#,
             }
         }
     }
+    // The habits, read again on the plan as it now stands (a revision names
+    // new files and new names to search for).
+    {
+        let names = |p: &PlanResult| p.fix.as_ref().map(|d| d.habits.surfaces.clone());
+        let facts = if draft.tasks == files.tasks && names(&draft) == names(&files) {
+            habit_facts
+        } else {
+            habit_reader.facts(&files).await
+        };
+        let left = super::habits::plan_gaps(&files, &facts);
+        if !left.is_empty() {
+            warn!(ticket_id = %msg.ticket_id, gaps = left.len(), "Plan habits still open after one send-back");
+            super::add_progress_note(
+                state,
+                &msg.team_id,
+                run_id,
+                &format!(
+                    "Plan check (reproduction, history, dependents, early questions): {} left open",
+                    left.len()
+                ),
+            )
+            .await;
+        }
+        if let Some(d) = files.fix.as_mut() {
+            super::habits::keep_open(d, &facts, &left);
+        }
+        // The reproducing test is written before the fix.
+        let test = files
+            .fix
+            .as_ref()
+            .map(|d| d.habits.repro.test.clone())
+            .unwrap_or_default();
+        if let Some(tasks) = super::habits::put_repro_first(&files.tasks, &test) {
+            files.tasks = tasks;
+            files.repo_tasks = parse_repo_tasks(&files.tasks);
+        }
+    }
     // What the plan's own check still finds after the send-back stays on
     // the decision: the ticket, the PR and the reviewer see it.
     if !plan_findings.is_empty() {
@@ -1381,6 +1433,9 @@ Then the ```fix_location.json block described above."#,
     // The questions only a person can answer are part of the plan people read.
     if let Some(d) = files.fix.as_ref() {
         files.proposal = with_questions(&files.proposal, d);
+        // What the coder holds to: the test first, the defaults being
+        // built, the dependents to update, the plan's own files.
+        files.design = super::habits::with_design_section(&files.design, d, &files.tasks);
     }
 
     // Write openspec to S3
@@ -1749,7 +1804,12 @@ fn parse_openspec_files(response: &str, intent: super::triage::TicketIntent) -> 
         tasks: contents.remove(0),
         spec: contents.remove(0),
         repo_tasks,
-        fix: super::fix_location::parse_for(response, intent),
+        // A doubt asked early is one of the decision's questions from the
+        // start, so every check of them reads it (see habits).
+        fix: super::fix_location::parse_for(response, intent).map(|mut d| {
+            super::habits::fold_questions(&mut d);
+            d
+        }),
     }
 }
 

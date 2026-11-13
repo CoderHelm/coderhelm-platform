@@ -49,6 +49,10 @@ pub struct Proof<'a> {
     /// content, the verification checklist and open product questions (see
     /// `feature`).
     pub feature: Option<&'a super::feature::PrFacts>,
+    /// The tests run with and without the change, the touched files'
+    /// history, who the change affects and what changed outside the plan
+    /// (see `habits_check`); `None` when that check didn't run.
+    pub habits: Option<&'a super::habits_check::PrFacts>,
     /// The branch's commits stay as they are (no squash): a stacked change
     /// was rebuilt with a labelled follow-up commit people should see (see
     /// `stack`).
@@ -1650,6 +1654,10 @@ fn with_checks(body: &str, plan: &PlanResult, proof: &Proof<'_>, repo: &str) -> 
         Some(f) => super::feature::shape_body(rest, f),
         None => rest,
     };
+    let rest = match proof.habits {
+        Some(h) => super::habits_check::shape_body(rest, &super::habits_check::section(plan, h)),
+        None => rest,
+    };
     let rest = if !proof.manual.trim().is_empty() && !rest.contains(MANUAL_HEADING) {
         format!(
             "{}\n\n{MANUAL_HEADING}\n{}",
@@ -2179,6 +2187,7 @@ mod check_results_tests {
             links: "",
             test_fix: None,
             feature: None,
+            habits: None,
             keep_commits: false,
         }
     }
@@ -2400,6 +2409,7 @@ mod refresh_tests {
             links: "",
             test_fix: None,
             feature: None,
+            habits: None,
             keep_commits: false,
         };
         let owned = super::owned_sections(&plan, &proof, "acme/infra");

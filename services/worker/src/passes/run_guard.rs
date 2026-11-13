@@ -1021,6 +1021,16 @@ pub struct Ledger {
     pub links: CheckRecord,
     #[serde(default)]
     pub test_fix: CheckRecord,
+    /// The tests and scope check (`habits_check`).
+    #[serde(default)]
+    pub habits: CheckRecord,
+    /// What the tests and scope check last came to.
+    #[serde(default)]
+    pub habits_outcome: Option<Result<Option<super::habits_check::PrFacts>, String>>,
+    /// That check has asked once for a step of its own for its sandbox
+    /// runs: it never asks twice.
+    #[serde(default)]
+    pub habits_waited: bool,
     /// What the proof check last found (`None`: the judge couldn't answer).
     #[serde(default)]
     pub proof_findings: Option<Vec<Finding>>,
@@ -1068,6 +1078,7 @@ impl Ledger {
             &mut self.rules,
             &mut self.links,
             &mut self.test_fix,
+            &mut self.habits,
         ];
         if records.iter().any(|r| r.fixing) {
             for r in records {
@@ -1130,6 +1141,9 @@ impl Ledger {
                 "they didn't finish",
             )),
         }
+        if let Some(Err(why)) = &self.habits_outcome {
+            open.push(proof::check_item("The tests and scope check", why));
+        }
         open
     }
 
@@ -1150,6 +1164,8 @@ impl Ledger {
         smaller.links.head = String::new();
         smaller.test_outcome = None;
         smaller.test_fix.head = String::new();
+        smaller.habits_outcome = None;
+        smaller.habits.head = String::new();
         serde_json::to_string(&smaller).unwrap_or_default()
     }
 }
