@@ -2015,6 +2015,7 @@ async fn run_passes(
     // (context for the plan) and since its last step. Read here, before
     // the run spends more work, and again at each boundary below.
     ticket_comments::keep_existing_github(state, msg, &github).await;
+    ticket_comments::note_unread_earlier(state, msg, run_id).await;
     read_ticket_comments(state, msg, run_id, usage).await?;
     // Every pull request for the ticket in the team's repositories (this
     // repo first; CoderHelm's or anyone's), read in full with how it ended:

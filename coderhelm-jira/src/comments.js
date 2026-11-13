@@ -12,16 +12,22 @@
 const MAX_COMMENTS = 20;
 
 /**
+ * The most characters of comment bodies sent with one ticket event. The
+ * event also carries the ticket's images, and the whole request has to stay
+ * well inside what the gateway accepts. When the newest comments are longer
+ * than this in all, the oldest of them are left out.
+ */
+const MAX_TOTAL_CHARS = 200000;
+
+/**
  * @param {object} fields The ticket's fields, as the issue REST API returns them.
  * @returns {{id: string, author: {displayName: string, accountType: string}, body: string}[]}
  */
 function existingComments(fields) {
   const all = (fields && fields.comment && fields.comment.comments) || [];
   if (!Array.isArray(all)) return [];
-  return all
-    .filter((c) => c && c.id && c.body)
-    .slice(-MAX_COMMENTS)
-    .map((c) => ({
+  const newest = all.filter((c) => c && c.id && c.body).slice(-MAX_COMMENTS);
+  const sent = newest.map((c) => ({
       id: String(c.id),
       author: {
         displayName: (c.author && c.author.displayName) || "",
@@ -30,6 +36,15 @@ function existingComments(fields) {
       // A comment body is a document (JSON); the gateway reads its words.
       body: typeof c.body === "string" ? c.body : JSON.stringify(c.body),
     }));
+  // Keep the newest comments that fit; a body is never cut in the middle
+  // (it is a JSON document, and half of one cannot be read).
+  let total = 0;
+  let from = sent.length;
+  while (from > 0 && total + sent[from - 1].body.length <= MAX_TOTAL_CHARS) {
+    total += sent[from - 1].body.length;
+    from -= 1;
+  }
+  return sent.slice(from);
 }
 
-module.exports = { existingComments, MAX_COMMENTS };
+module.exports = { existingComments, MAX_COMMENTS, MAX_TOTAL_CHARS };

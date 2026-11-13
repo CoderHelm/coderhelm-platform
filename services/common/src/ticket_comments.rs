@@ -37,11 +37,19 @@ use std::collections::BTreeMap;
 
 /// The settings-table sort key prefix of a ticket's comments.
 pub const SK_PREFIX: &str = "TICKETCOMMENT#";
-/// Days a comment's record is kept.
-pub const KEEP_DAYS: i64 = 90;
-/// Days a comment written while no run worked on the ticket is kept: it is
-/// only context for a run that starts soon after.
-pub const KEEP_DAYS_NO_RUN: i64 = 30;
+/// Days a comment written while a run worked is kept. Nothing reads a
+/// comment after it is acted on; the record is kept only so that the same
+/// comment delivered again is not taken twice, and so that one nobody read
+/// (its worker stopped, or its round could not be sent) is still there for
+/// what comes next. A run and its wait for CI end within 26 hours, and the
+/// rounds on its open pull request follow within days: two weeks covers
+/// them with room to spare.
+pub const KEEP_DAYS: i64 = 14;
+/// Days a comment written before a run is kept. It is stored only for a
+/// ticket CoderHelm is already set to work (see the gateway), so the run
+/// that reads it starts within minutes; a week covers a run held back by a
+/// usage limit or a ticket lock.
+pub const KEEP_DAYS_NO_RUN: i64 = 7;
 
 /// How long a comment's record is kept, in days.
 pub fn keep_days(c: &Comment) -> i64 {
@@ -64,6 +72,35 @@ pub const FIELD_STOPPED_TO_ASK: &str = crate::run_questions::FIELD_QUESTIONS;
 /// The question an instruction (not an answer to a question) is kept under
 /// when it is folded into the plan.
 pub const COMMENT_QUESTION: &str = "A person's comment on the ticket";
+/// Ticket-record field (`ticket_state::sk`): whether the event that last
+/// started a run on the ticket carried the ticket's existing comments
+/// ([`EVENT_COMMENTS_SENT`] or [`EVENT_COMMENTS_NOT_SENT`]). A Jira app
+/// older than the version that sends them leaves a run without what
+/// people wrote before it started, and the run says so.
+pub const FIELD_EVENT_COMMENTS: &str = "event_comments";
+pub const EVENT_COMMENTS_SENT: &str = "sent";
+pub const EVENT_COMMENTS_NOT_SENT: &str = "not_sent";
+
+/// Whether a pre-run comment is stored at all. Only for a ticket
+/// CoderHelm has something to do with: one it already ran on, or one
+/// that carries the team's trigger label or is assigned to CoderHelm
+/// when the comment is written. Comments on every other ticket are never
+/// stored: when a run starts there, the event that starts it brings the
+/// ticket's comments (Jira), or the run reads them from the issue
+/// (GitHub).
+pub fn stores_before_run(has_run: bool, has_trigger_label: bool, assigned: bool) -> bool {
+    has_run || has_trigger_label || assigned
+}
+
+/// What a run on a Jira ticket says when the event that started it
+/// carried no comments: it did not read what people wrote before it
+/// started. `None` when the comments were sent, or nothing is known.
+pub fn unread_earlier_note(marker: Option<&str>) -> Option<&'static str> {
+    (marker == Some(EVENT_COMMENTS_NOT_SENT)).then_some(
+        "Comments written on the ticket before this run started were not read: the event          that started the run carried none (this site's Jira app is a version that does not          send them), and CoderHelm has no other access to them. The run works from the          ticket's title and description; comments written from now on are read. Updating          the Jira app on the site sends earlier comments with the next ticket.",
+    )
+}
+
 /// How CoderHelm's acknowledgement on a ticket starts. A comment that
 /// starts this way is its own, whoever the tracker says wrote it.
 pub const ACK_OPENING: &str = "Got it.";
@@ -1387,6 +1424,34 @@ mod tests {
             direction(&[answer, instruction]),
             "Pat Doe: Production only.\nPat Doe: Use the existing helper."
         );
+    }
+
+    #[test]
+    fn a_comment_on_a_ticket_coderhelm_has_nothing_to_do_with_is_never_stored() {
+        // No run on record, no trigger label, not assigned to CoderHelm.
+        assert!(!stores_before_run(false, false, false));
+        assert!(stores_before_run(true, false, false));
+        assert!(stores_before_run(false, true, false));
+        assert!(stores_before_run(false, false, true));
+    }
+
+    #[test]
+    fn records_are_kept_two_weeks_and_a_week_before_a_run() {
+        let during = comment("1", "x");
+        let mut before = comment("2", "x");
+        before.run_id.clear();
+        assert_eq!(keep_days(&during), 14);
+        assert_eq!(keep_days(&before), 7);
+    }
+
+    #[test]
+    fn a_run_says_when_earlier_comments_were_not_read() {
+        let note = unread_earlier_note(Some(EVENT_COMMENTS_NOT_SENT)).unwrap();
+        assert!(note.contains("before this run started were not read"));
+        assert_eq!(unread_earlier_note(Some(EVENT_COMMENTS_SENT)), None);
+        // Nothing known about the event (a retry from the dashboard on a
+        // ticket no event marked): nothing is claimed.
+        assert_eq!(unread_earlier_note(None), None);
     }
 
     #[test]

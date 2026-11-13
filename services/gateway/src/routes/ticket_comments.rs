@@ -15,8 +15,12 @@
 //! 4. the worker is told at once, so a comment that says to stop is read
 //!    now, not at the run's next step.
 //!
-//! A comment on a ticket no run is working on is kept too ([`keep`]), with
-//! no acknowledgement: the run that starts on the ticket reads it first.
+//! A comment on a ticket no run is working on is kept ([`keep`], with no
+//! acknowledgement) only when CoderHelm has something to do with the
+//! ticket: it carries the team's trigger label or is assigned to
+//! CoderHelm. Comments on every other ticket are never stored. When a run
+//! starts on such a ticket, the event that starts it brings the ticket's
+//! comments ([`keep_jira_existing`]), and a GitHub run reads the issue's.
 
 use crate::models::{JiraCommentMessage, WorkerMessage};
 use crate::AppState;
@@ -190,24 +194,78 @@ pub async fn keep(state: &AppState, inc: &Incoming<'_>) {
 }
 
 /// The comments a Jira event carries with the ticket (`comments`: id,
-/// author, body), kept as context for the run the event starts.
+/// author, body), kept as context for the run the event starts: this is
+/// how a run reads what people wrote on a ticket whose comments were
+/// never stored. The ticket's record says whether the event carried them,
+/// so a run started by an older Jira app says they were not read.
 pub async fn keep_jira_existing(state: &AppState, team_id: &str, ticket_id: &str, payload: &Value) {
-    for c in existing_jira_comments(payload) {
-        keep(
-            state,
-            &Incoming {
-                team_id,
-                source: Source::Jira,
-                ticket_id,
-                comment_id: &c.id,
-                author: &c.author,
-                author_kind: &c.kind,
-                text: &c.text,
-                ..Default::default()
-            },
+    let kept = keep_existing_in(&store(state), team_id, ticket_id, payload).await;
+    let sent = event_carries_comments(payload);
+    info!(
+        ticket_id,
+        sent, kept, "The ticket's existing comments, from the event that starts the run"
+    );
+    if let Err(e) = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", AttributeValue::S(team_id.to_string()))
+        .key("sk", AttributeValue::S(common::ticket_state::sk(ticket_id)))
+        .update_expression("SET #f = :v, updated_at = :t")
+        .expression_attribute_names("#f", tc::FIELD_EVENT_COMMENTS)
+        .expression_attribute_values(
+            ":v",
+            AttributeValue::S(
+                if sent {
+                    tc::EVENT_COMMENTS_SENT
+                } else {
+                    tc::EVENT_COMMENTS_NOT_SENT
+                }
+                .to_string(),
+            ),
         )
-        .await;
+        .expression_attribute_values(":t", AttributeValue::S(chrono::Utc::now().to_rfc3339()))
+        .send()
+        .await
+    {
+        warn!(ticket_id, error = %e, "Could not note whether the event carried the ticket's comments");
     }
+}
+
+/// Whether a Jira event carries the ticket's comments at all (an empty
+/// list is a ticket without comments; a missing one is an app version
+/// that does not send them).
+pub fn event_carries_comments(payload: &Value) -> bool {
+    payload["comments"].is_array()
+}
+
+/// Keeps the people's comments an event carries, as context (no run was
+/// working). Returns how many were newly kept.
+pub async fn keep_existing_in(
+    store: &dyn Store,
+    team_id: &str,
+    ticket_id: &str,
+    payload: &Value,
+) -> usize {
+    let mut kept = 0;
+    for c in existing_jira_comments(payload) {
+        let inc = Incoming {
+            team_id,
+            source: Source::Jira,
+            ticket_id,
+            comment_id: &c.id,
+            author: &c.author,
+            author_kind: &c.kind,
+            text: &c.text,
+            ..Default::default()
+        };
+        match take(store, &inc).await {
+            Ok(Received::Kept(..)) => kept += 1,
+            Ok(_) => {}
+            Err(e) => warn!(ticket_id, error = %e, "Could not keep a ticket comment"),
+        }
+    }
+    kept
 }
 
 /// One comment a Jira event carries with its ticket.
@@ -609,6 +667,67 @@ mod tests {
         let got = existing_jira_comments(&json!({ "comments": many }));
         assert_eq!(got.len(), MAX_EXISTING);
         assert_eq!(got.last().unwrap().id, "49");
+    }
+
+    #[tokio::test]
+    async fn a_ticket_whose_comments_were_never_stored_gets_them_from_the_event_that_starts_the_run(
+    ) {
+        // People wrote on a ticket CoderHelm had nothing to do with: none
+        // of it was stored. The ticket is then assigned to CoderHelm, and
+        // the event that starts the run carries the comments.
+        let store = Memory::default();
+        assert!(store.all("TEAM#1", "ABC-1").is_empty());
+        let event = json!({"comments": [
+            {"id": "1", "author": {"displayName": "Pat Doe", "accountType": "atlassian"},
+             "body": "Production only."},
+            {"id": "2", "author": {"displayName": "Sam Roe", "accountType": "atlassian"},
+             "body": "Use the existing export helper."},
+            {"id": "3", "author": {"displayName": "CoderHelm", "accountType": "app"},
+             "body": "An earlier note of its own"}
+        ]});
+        assert!(event_carries_comments(&event));
+        assert_eq!(keep_existing_in(&store, "TEAM#1", "ABC-1", &event).await, 2);
+        // Kept as context for the run: open, never a stop, no run named.
+        let open = tc::open(store.all("TEAM#1", "ABC-1"));
+        assert_eq!(open.len(), 2);
+        assert!(open.iter().all(|c| !c.during_run()));
+        // The run reads them at its first boundary, while it plans.
+        let s = tc::settle_open(&store, "TEAM#1", "01RUN", &open, tc::Stage::Planning, None).await;
+        assert_eq!(s.with(tc::Action::Fold).len(), 2);
+        // The same comments with a later event are not taken again.
+        assert_eq!(keep_existing_in(&store, "TEAM#1", "ABC-1", &event).await, 0);
+        assert!(tc::open(store.all("TEAM#1", "ABC-1")).is_empty());
+    }
+
+    #[test]
+    fn an_event_from_an_older_jira_app_is_told_apart_from_a_ticket_without_comments() {
+        // The app sends the list, empty for a ticket nobody commented on.
+        assert!(event_carries_comments(
+            &json!({"issue": {}, "comments": []})
+        ));
+        // An older app (or a plain Jira webhook) sends no list at all.
+        assert!(!event_carries_comments(&json!({"issue": {}})));
+        assert!(!event_carries_comments(&json!({"comments": null})));
+    }
+
+    #[test]
+    fn a_comment_before_a_run_is_stored_only_for_a_ticket_coderhelm_works() {
+        let jira = include_str!("jira_webhook.rs");
+        let branch = &jira[jira
+            .find("let Some(run_item) = run_item_found.as_ref() else {")
+            .unwrap()..];
+        let branch = &branch[..branch.find("let run_status = run_item").unwrap()];
+        // The store is reached only through the trigger check.
+        let gate = branch
+            .find("stores_before_run(false, has_label, is_assigned)")
+            .unwrap();
+        assert!(gate < branch.find("super::ticket_comments::keep(").unwrap());
+        // The same trigger rule that starts a run.
+        assert!(
+            jira.matches("ticket_triggers(issue, &trigger_label)")
+                .count()
+                >= 2
+        );
     }
 
     #[test]

@@ -1,6 +1,6 @@
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
-const { existingComments, MAX_COMMENTS } = require("../src/comments");
+const { existingComments, MAX_COMMENTS, MAX_TOTAL_CHARS } = require("../src/comments");
 
 const doc = (text) => ({ type: "doc", version: 1, content: [{ type: "paragraph", content: [{ type: "text", text }] }] });
 
@@ -37,4 +37,19 @@ test("only the newest comments are sent", () => {
   assert.equal(got.length, MAX_COMMENTS);
   assert.equal(got[got.length - 1].id, "49");
   assert.deepEqual(got[0].author, { displayName: "", accountType: "" });
+});
+
+test("very long comments never make the event too large: the oldest are left out whole", () => {
+  const big = "x".repeat(MAX_TOTAL_CHARS / 2 + 10);
+  const comments = [
+    { id: "1", author: {}, body: big },
+    { id: "2", author: {}, body: big },
+    { id: "3", author: {}, body: "short" },
+  ];
+  const got = existingComments({ comment: { comments } });
+  assert.deepEqual(got.map((c) => c.id), ["2", "3"]);
+  assert.equal(got[0].body.length, big.length);
+  // One comment longer than the whole allowance is left out, not cut.
+  const huge = [{ id: "9", author: {}, body: "y".repeat(MAX_TOTAL_CHARS + 1) }];
+  assert.deepEqual(existingComments({ comment: { comments: huge } }), []);
 });

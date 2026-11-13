@@ -758,6 +758,36 @@ pub async fn keep_existing_github(state: &WorkerState, msg: &TicketMessage, gith
     }
 }
 
+/// A fresh run on a Jira ticket says on its page when the event that
+/// started it carried no comments (an older Jira app, which CoderHelm
+/// cannot ask for them): what people wrote before the run was not read.
+pub async fn note_unread_earlier(state: &WorkerState, msg: &TicketMessage, run_id: &str) {
+    if !matches!(msg.source, TicketSource::Jira) || msg.same_run() || msg.ticket_id.is_empty() {
+        return;
+    }
+    let marker = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(&msg.team_id))
+        .key("sk", attr_s(&common::ticket_state::sk(&msg.ticket_id)))
+        .projection_expression("#f")
+        .expression_attribute_names("#f", tc::FIELD_EVENT_COMMENTS)
+        .send()
+        .await
+        .ok()
+        .and_then(|o| o.item)
+        .and_then(|i| {
+            i.get(tc::FIELD_EVENT_COMMENTS)
+                .and_then(|v| v.as_s().ok())
+                .cloned()
+        });
+    if let Some(note) = tc::unread_earlier_note(marker.as_deref()) {
+        info!(run_id, ticket_id = %msg.ticket_id, "The event that started the run carried no ticket comments");
+        super::add_progress_note(state, &msg.team_id, run_id, note).await;
+    }
+}
+
 /// Most comments read from an issue when a run starts on it (the newest).
 pub const MAX_EXISTING: usize = 20;
 
@@ -1037,6 +1067,9 @@ mod tests {
             "the run start and the plan, implement, test and pull request boundaries"
         );
         assert!(run.contains("ticket_comments::keep_existing_github("));
+        // A run started by an older Jira app says earlier comments were
+        // not read.
+        assert!(run.contains("ticket_comments::note_unread_earlier(state, msg, run_id)"));
         let orch = &src[src.find("\npub async fn orchestrate_ticket(").unwrap()..start];
         assert!(orch.contains("ticket_comments::after_step("));
         // The run's questions are kept for reading the answers.
