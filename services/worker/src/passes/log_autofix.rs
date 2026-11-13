@@ -449,21 +449,92 @@ pub fn starter_of<'a>(
         .find_map(|m| screened.iter().find(|(f, r)| &f.rec_id == m && r.is_ok()))
 }
 
-async fn sweep_team(state: &WorkerState, team_id: &str, cfg: &AutoFix, report: &mut Report) {
-    let mut findings = match lf::list_findings(
-        &state.dynamo,
-        &state.config.aws_insights_table_name,
-        team_id,
-        500,
-    )
-    .await
-    {
-        Ok(f) => f,
-        Err(e) => {
-            warn!(team_id, error = %e, "Could not read the team's log findings");
-            return;
+/// Most stopped findings whose repo is read for a change in one sweep.
+const MAX_CHANGE_LOOKUPS: usize = 10;
+
+/// For each open burst the analyzer's checks say stopped, look for a
+/// change in the repo saved for its log group that landed as it stopped: a
+/// production deploy on record, or a commit on the default branch. Kept on
+/// the finding ([`lf::pick_change`]), it lets the analyzer resolve the burst
+/// after a day instead of three, with that evidence in the reason. For every
+/// team with a saved repo, whether or not automatic fixes are on. Best
+/// effort: nothing found or unreadable leaves the default period.
+async fn note_changes(state: &WorkerState, team_id: &str, cfg: &AutoFix, findings: &[Finding]) {
+    let wanted: Vec<(&Finding, String)> = findings
+        .iter()
+        .filter_map(|f| lf::change_wanted(f, cfg).map(|repo| (f, repo)))
+        .take(MAX_CHANGE_LOOKUPS)
+        .collect();
+    if wanted.is_empty() {
+        return;
+    }
+    let code = Code::load(state, team_id).await;
+    let http = common::mcp_remote::http::GuardedHttps;
+    let host = code.token.as_ref().map(|t| common::repo_read::GitHubHost {
+        http: &http,
+        auth: format!("Bearer {t}"),
+    });
+    for (f, repo) in wanted {
+        if !code.repos.contains(&repo) {
+            continue;
         }
-    };
+        let activity = f.activity();
+        let Some(since) = lf::change_window_start(&f.last_seen_at) else {
+            continue;
+        };
+        let until = &activity.checked_at;
+        let mut candidates = match lf::deploys_between(
+            &state.dynamo,
+            &state.config.settings_table_name,
+            team_id,
+            &since,
+            until,
+        )
+        .await
+        {
+            Ok(records) => lf::deploy_changes(&repo, &records),
+            Err(e) => {
+                warn!(team_id, rec_id = %f.rec_id, error = %e, "Could not read the team's deploy records for a stopped finding");
+                Vec::new()
+            }
+        };
+        if let Some(host) = &host {
+            match common::repo_read::RepoHost::commits_between(host, &repo, &since, until).await {
+                Ok(commits) => candidates.extend(lf::merge_changes(&repo, &commits)),
+                Err(e) => {
+                    warn!(team_id, rec_id = %f.rec_id, repo = %repo, error = %e, "Could not read the repo's commits for a stopped finding")
+                }
+            }
+        }
+        let Some(change) = lf::pick_change(&candidates, &f.last_seen_at, &activity) else {
+            continue;
+        };
+        match lf::record_change(
+            &state.dynamo,
+            &state.config.aws_insights_table_name,
+            team_id,
+            &f.rec_id,
+            &change,
+        )
+        .await
+        {
+            Ok(()) => {
+                info!(team_id, rec_id = %f.rec_id, repo = %repo, kind = %change.kind, at = %change.at, "A change in the repo explains why the errors stopped")
+            }
+            Err(e) => {
+                warn!(team_id, rec_id = %f.rec_id, error = %e, "Could not keep the change on the finding")
+            }
+        }
+    }
+}
+
+async fn sweep_team(
+    state: &WorkerState,
+    team_id: &str,
+    cfg: &AutoFix,
+    mut findings: Vec<Finding>,
+    report: &mut Report,
+) {
     order(&mut findings);
     let now = Utc::now();
     // The findings the team's setting covers and nobody decided yet.
@@ -471,7 +542,8 @@ async fn sweep_team(state: &WorkerState, team_id: &str, cfg: &AutoFix, report: &
         .iter()
         .filter_map(|f| match lf::screen(cfg, f, now) {
             Err(Skip::Disabled | Skip::NotEligible | Skip::NotNew) => None,
-            Err(Skip::QuietHours) if f.auto_status == "waiting" => None,
+            // Said already; looked at again every sweep, nothing to redo.
+            Err(Skip::QuietHours | Skip::Stopped(_)) if f.auto_status == "waiting" => None,
             r => Some((f.clone(), r)),
         })
         .collect();
@@ -509,7 +581,8 @@ async fn record(
     now: DateTime<Utc>,
     report: &mut Report,
 ) {
-    if !skip.recorded() || (skip == &Skip::Watching && f.auto_status == "waiting") {
+    let again = matches!(skip, Skip::Watching | Skip::RepoPending) && f.auto_status == "waiting";
+    if !skip.recorded() || again {
         return;
     }
     report.skipped += 1;
@@ -610,7 +683,24 @@ async fn act(
                         Err(skip) => starter_skip = Some(skip),
                     }
                 }
+                // The evidence couldn't be weighed (the model wasn't
+                // reachable): that is CoderHelm's to retry, not a question
+                // for a person. The next sweep weighs it again.
+                Err((r, _)) if r.unweighed => starter_skip = Some(Skip::RepoPending),
                 Err((r, guess)) => {
+                    // The question stays on the finding, so its row offers
+                    // the choice in one click.
+                    if let Err(e) = lf::record_repo_ask(
+                        &state.dynamo,
+                        &state.config.aws_insights_table_name,
+                        team_id,
+                        &starter.rec_id,
+                        &common::log_repo::ask_json(&r),
+                    )
+                    .await
+                    {
+                        warn!(team_id, rec_id = %starter.rec_id, error = %e, "Could not keep the repo question on the finding");
+                    }
                     // Genuinely split: ask once for the log group, never per
                     // finding.
                     if lf::claim_repo_ask(
@@ -774,13 +864,36 @@ async fn start_fix(
 }
 
 pub async fn run(state: &WorkerState) -> Result<Report, String> {
-    let teams = lf::teams_with_autofix(&state.dynamo, &state.config.settings_table_name).await?;
+    // Every team with a setting: it holds the repo saved for each log group,
+    // which stopped findings are checked against whether or not automatic
+    // fixes are on.
+    let teams = lf::teams_with_setting(&state.dynamo, &state.config.settings_table_name).await?;
     let mut report = Report {
-        teams: teams.len(),
+        teams: teams.iter().filter(|(_, cfg)| cfg.enabled).count(),
         ..Default::default()
     };
     for (team_id, cfg) in &teams {
-        sweep_team(state, team_id, cfg, &mut report).await;
+        if !cfg.enabled && cfg.overrides.iter().all(|o| o.repo.is_empty()) {
+            continue;
+        }
+        let findings = match lf::list_findings(
+            &state.dynamo,
+            &state.config.aws_insights_table_name,
+            team_id,
+            500,
+        )
+        .await
+        {
+            Ok(f) => f,
+            Err(e) => {
+                warn!(team_id, error = %e, "Could not read the team's log findings");
+                continue;
+            }
+        };
+        note_changes(state, team_id, cfg, &findings).await;
+        if cfg.enabled {
+            sweep_team(state, team_id, cfg, findings, &mut report).await;
+        }
     }
     Ok(report)
 }

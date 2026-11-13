@@ -120,6 +120,17 @@ pub trait RepoHost: Send + Sync {
     ) -> Result<Vec<(String, String, String)>, ReadError> {
         Ok(vec![])
     }
+    /// The commits that landed on the default branch between `since` and
+    /// `until` (RFC 3339), newest first, in the same shape as
+    /// [`RepoHost::commits`]. Hosts that can't tell answer none.
+    async fn commits_between(
+        &self,
+        _repo: &str,
+        _since: &str,
+        _until: &str,
+    ) -> Result<Vec<(String, String, String)>, ReadError> {
+        Ok(vec![])
+    }
 }
 
 // ── GitHub ──────────────────────────────────────────────────────────────────
@@ -284,29 +295,54 @@ impl RepoHost for GitHubHost<'_> {
         if !(200..300).contains(&status) {
             return Err(github_status(status, path));
         }
-        let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-        Ok(v.as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|c| {
-                Some((
-                    c["sha"].as_str()?.to_string(),
-                    c["commit"]["message"]
-                        .as_str()
-                        .unwrap_or("")
-                        .lines()
-                        .next()
-                        .unwrap_or("")
-                        .to_string(),
-                    c["commit"]["committer"]["date"]
-                        .as_str()
-                        .or(c["commit"]["author"]["date"].as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                ))
-            })
-            .collect())
+        Ok(commit_rows(&body))
     }
+
+    async fn commits_between(
+        &self,
+        repo: &str,
+        since: &str,
+        until: &str,
+    ) -> Result<Vec<(String, String, String)>, ReadError> {
+        let url = format!(
+            "{GITHUB_API}/repos/{repo}/commits?per_page=30&since={}&until={}",
+            enc(since),
+            enc(until)
+        );
+        let (status, body) = self
+            .send(self.get(&url, "application/vnd.github+json", Limit::Metadata))
+            .await?;
+        if !(200..300).contains(&status) {
+            return Err(github_status(status, repo));
+        }
+        Ok(commit_rows(&body))
+    }
+}
+
+/// Pure: GitHub's list of commits as (sha, first line of the message, time).
+pub fn commit_rows(body: &[u8]) -> Vec<(String, String, String)> {
+    let v: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+    v.as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|c| {
+            Some((
+                c["sha"].as_str()?.to_string(),
+                c["commit"]["message"]
+                    .as_str()
+                    .unwrap_or("")
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .to_string(),
+                c["commit"]["committer"]["date"]
+                    .as_str()
+                    .or(c["commit"]["author"]["date"].as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            ))
+        })
+        .collect()
 }
 
 // ── In memory ───────────────────────────────────────────────────────────────

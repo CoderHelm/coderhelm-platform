@@ -278,6 +278,8 @@ pub enum Kind {
     RunRepo,
     /// The error's own log lines: where they came from and what they say.
     LogLines,
+    /// Files the error's own lines name (stack frames) exist in the repo.
+    StackFile,
     /// Past fixes for this log group went to it.
     PastFix,
     /// A log group of the same service (`/ecs/x-api` and `/ecs/x-api-worker`)
@@ -310,6 +312,7 @@ impl Kind {
                     | Kind::Code
                     | Kind::PastFix
                     | Kind::LogLines
+                    | Kind::StackFile
                     | Kind::Sibling
                     | Kind::ServiceName
             )
@@ -323,7 +326,12 @@ impl Kind {
             Kind::Saved => 4,
             Kind::ImageSource | Kind::RunRepo => 3,
             Kind::ResourceTag | Kind::Stack | Kind::Sibling => 2,
-            Kind::ImageRepo | Kind::Code | Kind::PastFix | Kind::LogLines | Kind::ServiceName => 1,
+            Kind::ImageRepo
+            | Kind::Code
+            | Kind::PastFix
+            | Kind::LogLines
+            | Kind::StackFile
+            | Kind::ServiceName => 1,
             Kind::RelatedMapping | Kind::Profile => 0,
         }
     }
@@ -339,6 +347,7 @@ impl Kind {
             Kind::Code => "code that names the resource",
             Kind::RunRepo => "the fix run for this error",
             Kind::LogLines => "the error's log lines",
+            Kind::StackFile => "files the error's lines name",
             Kind::PastFix => "past fixes",
             Kind::Sibling => "a log group of the same service",
             Kind::ServiceName => "the service's name",
@@ -873,6 +882,150 @@ pub fn sample_evidence(
     *out = c.out;
 }
 
+/// File extensions of source code a stack frame names.
+const CODE_EXTS: &[&str] = &[
+    "py", "js", "ts", "tsx", "jsx", "mjs", "cjs", "rb", "go", "rs", "java", "kt", "php", "cs",
+    "ex", "exs", "scala", "swift",
+];
+/// Path parts of code that isn't the team's own (dependencies, runtimes).
+const NOT_OWN_CODE: &[&str] = &[
+    "node_modules/",
+    "site-packages/",
+    "dist-packages/",
+    "vendor/",
+    ".venv/",
+    "/gems/",
+    "usr/lib/",
+    "usr/local/lib/",
+    "go/pkg/mod/",
+];
+/// Most file paths taken from the error's lines.
+const MAX_STACK_PATHS: usize = 12;
+/// Most repos whose file lists are read to look for those paths. Every one
+/// of the team's repos is read or none is: files found in one repo are only
+/// evidence when no other repo could hold them too.
+pub const MAX_FILE_CHECKS: usize = 24;
+/// File lists read at once.
+const FILE_CHECKS_AT_ONCE: usize = 6;
+
+/// Pure: the source files the error's own lines name (stack frames, a
+/// suspected location): tokens with a directory and a code file extension,
+/// without the line number, a `file://` scheme or a leading slash, and never
+/// a dependency's or the runtime's file. No pattern matching on names: only
+/// whole paths, compared exactly later ([`paths_found`]).
+pub fn stack_paths(target: &Target) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let texts = target
+        .samples
+        .iter()
+        .map(|l| l.message.as_str())
+        .chain(std::iter::once(target.about.as_str()));
+    for text in texts {
+        let tokens = text.split(|c: char| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    '(' | ')'
+                        | '"'
+                        | '\''
+                        | ','
+                        | ';'
+                        | '['
+                        | ']'
+                        | '{'
+                        | '}'
+                        | '<'
+                        | '>'
+                        | '='
+                        | '`'
+                )
+        });
+        for token in tokens {
+            let token = token.strip_prefix("file://").unwrap_or(token);
+            // Without ":line:column".
+            let path = token.split(':').next().unwrap_or("").trim_end_matches('.');
+            if !path.contains('/') || NOT_OWN_CODE.iter().any(|v| path.contains(v)) {
+                continue;
+            }
+            let ext = path.rsplit('.').next().unwrap_or("");
+            if !CODE_EXTS.contains(&ext) {
+                continue;
+            }
+            let parts: Vec<&str> = path
+                .split('/')
+                .filter(|p| !p.is_empty() && *p != ".")
+                .collect();
+            if parts.len() < 2 || parts.contains(&"..") {
+                continue;
+            }
+            let clean = parts.join("/");
+            if clean.len() <= 300 && !out.contains(&clean) {
+                out.push(clean);
+            }
+            if out.len() >= MAX_STACK_PATHS {
+                return out;
+            }
+        }
+    }
+    out
+}
+
+/// Pure: which of `paths` (from [`stack_paths`]) are files of a repo whose
+/// file list is `files`, with how many trailing path parts agree: a path in
+/// a container (`app/src/jobs/sync.py`) is the repo's `src/jobs/sync.py`.
+/// Two parts at least (a directory and the file); a bare file name is in
+/// every repo.
+pub fn paths_found(paths: &[String], files: &[String]) -> Vec<(String, usize)> {
+    let mut out = Vec::new();
+    for p in paths {
+        let want: Vec<&str> = p.split('/').collect();
+        let depth = files
+            .iter()
+            .map(|f| {
+                f.rsplit('/')
+                    .zip(want.iter().rev())
+                    .take_while(|(a, b)| a == *b)
+                    .count()
+            })
+            .max()
+            .unwrap_or(0);
+        if depth >= 2 {
+            out.push((p.clone(), depth));
+        }
+    }
+    out
+}
+
+/// Pure: files the error's lines name that are in `repo`, as evidence. One
+/// two-part path (`src/index.js`) is in too many repos to count: it takes
+/// two files, or one whose path agrees three parts deep.
+pub fn stack_evidence(
+    repo: &str,
+    found: &[(String, usize)],
+    named: usize,
+    repos: &[RepoInfo],
+    out: &mut Vec<Evidence>,
+) {
+    if found.len() < 2 && !found.iter().any(|(_, depth)| *depth >= 3) {
+        return;
+    }
+    let mut c = Collector {
+        repos,
+        out: std::mem::take(out),
+    };
+    let shown: Vec<&str> = found.iter().take(3).map(|(p, _)| p.as_str()).collect();
+    c.push(
+        Kind::StackFile,
+        repo,
+        format!(
+            "{} of the {named} source files the error's lines name are in {repo}: {}",
+            found.len(),
+            shown.join(", ")
+        ),
+    );
+    *out = c.out;
+}
+
 /// Pure: the repos' roles and descriptions, and any README or manifest
 /// excerpts read, as evidence.
 pub fn profile_evidence(
@@ -995,6 +1148,10 @@ pub struct Resolution {
     /// against it (and may disagree).
     #[serde(default)]
     pub saved: Option<String>,
+    /// The evidence was gathered but couldn't be weighed (the model wasn't
+    /// reachable): nothing to ask a person yet, it is weighed again later.
+    #[serde(default)]
+    pub unweighed: bool,
 }
 
 impl Resolution {
@@ -1052,7 +1209,8 @@ application repo the infrastructure points at (its image, its source path) over 
 infrastructure repo, unless the error is in the infrastructure itself.\n\
 - Strong: a log group of the same service (the same name plus one part, such as -worker) that \
 the team saved to a repo: one service's log groups live in one repo.\n\
-- Supporting: past fixes for this log group, an image repository with the repo's exact name, \
+- Supporting: source files named in the error's own stack frames that exist in a repo \
+(stack_file), past fixes for this log group, an image repository with the repo's exact name, \
 repos saved for similar log groups, a repo's role, description, README and manifests.\n\
 - A name that merely resembles the log group is the weakest signal. Never let it outweigh any \
 evidence above; if it is all there is, say so and use low confidence.\n\
@@ -1359,6 +1517,7 @@ pub fn settle(
         resolved_at: now.to_rfc3339(),
         cached: false,
         saved: None,
+        unweighed: false,
     }
 }
 
@@ -1399,6 +1558,7 @@ pub fn unjudged(evidence: &[Evidence], permissions: Vec<String>, now: DateTime<U
         candidates,
         permissions,
         resolved_at: now.to_rfc3339(),
+        unweighed: true,
         ..Default::default()
     }
 }
@@ -1447,6 +1607,11 @@ pub trait Env: Send + Sync {
     async fn search(&self, repos: &[String], query: &str) -> Result<Vec<SearchHit>, String>;
     /// A repo's README and manifests, briefly.
     async fn profile(&self, repo: &RepoInfo) -> Option<String>;
+    /// Every file path in the repo at its default branch; None when it
+    /// can't be read.
+    async fn files(&self, _repo: &RepoInfo) -> Option<Vec<String>> {
+        None
+    }
     /// One metered model call: the reply's text.
     async fn judge(&self, system: &str, user: &str) -> Result<String, String>;
     async fn load(&self, key: &str) -> Option<Cached>;
@@ -1499,6 +1664,7 @@ pub async fn resolve(env: &dyn Env, input: &Input, now: DateTime<Utc>) -> Resolu
             resolved_at: now.to_rfc3339(),
             cached: false,
             saved: Some(saved.to_string()),
+            unweighed: false,
         };
     }
     if input.repos.is_empty() {
@@ -1567,6 +1733,30 @@ pub async fn resolve(env: &dyn Env, input: &Input, now: DateTime<Utc>) -> Resolu
     }
     name_evidence(&input.target, &input.related, &input.repos, &mut evidence);
     record_evidence(&input.past, &input.related, &input.repos, &mut evidence);
+    // The files the error's own lines name, looked for in every one of the
+    // team's repos: something CoderHelm can check itself before it asks
+    // anyone. All or nothing: when a repo can't be read (or the team has
+    // more repos than are read), a file found in one repo could be in
+    // another too, so nothing is claimed.
+    let named = stack_paths(&input.target);
+    if !named.is_empty() && input.repos.len() <= MAX_FILE_CHECKS {
+        let mut found_in = Vec::new();
+        let mut all_read = true;
+        for chunk in input.repos.chunks(FILE_CHECKS_AT_ONCE) {
+            let lists = futures::future::join_all(chunk.iter().map(|r| env.files(r))).await;
+            for (r, files) in chunk.iter().zip(lists) {
+                match files {
+                    Some(files) => found_in.push((r.name.clone(), paths_found(&named, &files))),
+                    None => all_read = false,
+                }
+            }
+        }
+        if all_read {
+            for (repo, found) in &found_in {
+                stack_evidence(repo, found, named.len(), &input.repos, &mut evidence);
+            }
+        }
+    }
     let mut excerpts = Vec::new();
     for r in profile_candidates(&evidence, &input.repos) {
         if let Some(t) = env.profile(&r).await {
@@ -1657,6 +1847,18 @@ pub fn to_json(r: &Resolution) -> Value {
         "resolved_at": r.resolved_at,
         "cached": r.cached,
         "saved": r.saved,
+    })
+}
+
+/// Pure: the "which repo?" question as it is kept on the finding and shown
+/// on its row: the best guess, the repos worth choosing between (best
+/// first) and why CoderHelm couldn't settle it itself.
+pub fn ask_json(r: &Resolution) -> Value {
+    json!({
+        "guess": r.repo,
+        "reason": r.reason,
+        "candidates": r.candidates,
+        "asked_at": r.resolved_at,
     })
 }
 

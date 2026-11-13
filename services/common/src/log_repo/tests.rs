@@ -26,6 +26,11 @@ pub(super) struct Fake {
     pub facts: AwsFacts,
     pub hits: HashMap<String, Vec<SearchHit>>,
     pub profiles: HashMap<String, String>,
+    /// Each repo's file paths at its default branch (a repo not listed has
+    /// no files).
+    pub files: HashMap<String, Vec<String>>,
+    /// Repos whose files can't be read.
+    pub unreadable: Vec<String>,
     pub answer: Answer,
     pub changed: bool,
     pub cache: Mutex<HashMap<String, Cached>>,
@@ -42,6 +47,8 @@ impl Fake {
             facts,
             hits: HashMap::new(),
             profiles: HashMap::new(),
+            files: HashMap::new(),
+            unreadable: Vec::new(),
             answer: Box::new(answer),
             changed: false,
             cache: Mutex::new(HashMap::new()),
@@ -82,6 +89,13 @@ impl Env for Fake {
     }
     async fn profile(&self, repo: &RepoInfo) -> Option<String> {
         self.profiles.get(&repo.name).cloned()
+    }
+    async fn files(&self, repo: &RepoInfo) -> Option<Vec<String>> {
+        self.calls.lock().unwrap().push("files");
+        if self.unreadable.contains(&repo.name) {
+            return None;
+        }
+        Some(self.files.get(&repo.name).cloned().unwrap_or_default())
     }
     async fn judge(&self, _system: &str, user: &str) -> Result<String, String> {
         self.calls.lock().unwrap().push("judge");
@@ -895,4 +909,335 @@ fn the_lookups_never_read_function_configuration_or_stack_parameters() {
         assert!(!live.contains(call), "{call}");
     }
     assert!(live.contains(".list_tags()") && live.contains(".list_stack_resources()"));
+}
+
+// ─── Files the error's own lines name ───────────────────────────────────────
+
+const API_GROUP: &str = "/ecs/prod-ledger-api";
+
+/// A Node stack from a container: its own files under /app, a dependency
+/// and the runtime.
+fn stack_lines(group: &str) -> Vec<LogLine> {
+    [
+        "Search failed: Error: getaddrinfo ENOTFOUND search.ledger.internal",
+        "    at SearchClient.query (/app/src/search/client.js:88:13)",
+        "    at async listOrders (file:///app/src/routes/orders.js:41:20)",
+        "    at Layer.handle (/app/node_modules/express/lib/router/layer.js:95:5)",
+        "    at process.processTicksAndRejections (node:internal/process/task_queues:95:5)",
+    ]
+    .iter()
+    .map(|m| LogLine {
+        log_group: group.into(),
+        message: m.to_string(),
+    })
+    .collect()
+}
+
+fn paths(v: &[&str]) -> Vec<String> {
+    v.iter().map(|s| s.to_string()).collect()
+}
+
+#[test]
+fn only_the_teams_own_source_files_are_taken_from_the_lines() {
+    let mut target = Target {
+        log_group: API_GROUP.into(),
+        samples: stack_lines(API_GROUP),
+        about: "Orders search down\nSuspected location: src/search/client.js:88".into(),
+        ..Default::default()
+    };
+    assert_eq!(
+        stack_paths(&target),
+        [
+            "app/src/search/client.js",
+            "app/src/routes/orders.js",
+            "src/search/client.js"
+        ]
+    );
+    // A Python traceback, a Go frame and a bare file name.
+    target.samples = vec![
+        LogLine {
+            log_group: API_GROUP.into(),
+            message: r#"  File "/var/task/jobs/sync_orders.py", line 12, in run"#.into(),
+        },
+        LogLine {
+            log_group: API_GROUP.into(),
+            message: "  File \"/usr/local/lib/python3.12/site-packages/requests/api.py\", line 59"
+                .into(),
+        },
+        LogLine {
+            log_group: API_GROUP.into(),
+            message: "\t/go/src/ledger/internal/store/orders.go:210 +0x1d4".into(),
+        },
+        LogLine {
+            log_group: API_GROUP.into(),
+            message:
+                "at com.acme.ledger.Orders.list(Orders.java:41) handler.py ../../etc/passwd.py"
+                    .into(),
+        },
+    ];
+    target.about.clear();
+    assert_eq!(
+        stack_paths(&target),
+        [
+            "var/task/jobs/sync_orders.py",
+            "go/src/ledger/internal/store/orders.go"
+        ]
+    );
+    // No lines, no paths.
+    assert!(stack_paths(&Target::default()).is_empty());
+}
+
+#[test]
+fn a_path_is_in_a_repo_when_its_directory_and_file_agree() {
+    let files = paths(&[
+        "README.md",
+        "src/search/client.js",
+        "src/routes/orders.js",
+        "services/api/src/index.js",
+    ]);
+    let named = paths(&[
+        "app/src/search/client.js",
+        "app/src/routes/orders.js",
+        "app/src/routes/missing.js",
+        "app/index.js",
+        "srv/src/index.js",
+    ]);
+    assert_eq!(
+        paths_found(&named, &files),
+        [
+            ("app/src/search/client.js".to_string(), 3),
+            ("app/src/routes/orders.js".to_string(), 3),
+            // Only the directory and the file agree.
+            ("srv/src/index.js".to_string(), 2),
+        ]
+    );
+    // One two-part path is in too many repos to be evidence; two files, or
+    // one three parts deep, are.
+    let rs = repos(&["acme/ledger-api"]);
+    let mut out = Vec::new();
+    stack_evidence(
+        "acme/ledger-api",
+        &[("srv/src/index.js".into(), 2)],
+        5,
+        &rs,
+        &mut out,
+    );
+    assert!(out.is_empty());
+    stack_evidence(
+        "acme/ledger-api",
+        &[("app/src/search/client.js".into(), 3)],
+        5,
+        &rs,
+        &mut out,
+    );
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].kind, Kind::StackFile);
+    assert_eq!(
+        out[0].detail,
+        "1 of the 5 source files the error's lines name are in acme/ledger-api: app/src/search/client.js"
+    );
+    let mut out = Vec::new();
+    stack_evidence(
+        "acme/ledger-api",
+        &[("a/src/index.js".into(), 2), ("a/src/app.js".into(), 2)],
+        2,
+        &rs,
+        &mut out,
+    );
+    assert_eq!(out.len(), 1);
+    // It ties the code to the repo through data, at the weight of a code hit.
+    assert!(Kind::StackFile.is_data() && !Kind::StackFile.is_direct());
+    assert_eq!(Kind::StackFile.rank(), Kind::Code.rank());
+}
+
+fn api_input(names: &[&str]) -> Input {
+    let mut inp = input(API_GROUP, names);
+    inp.target.samples = stack_lines(API_GROUP);
+    inp
+}
+
+#[tokio::test]
+async fn the_services_name_and_the_files_its_stack_names_settle_the_repo_without_asking() {
+    // The model is cautious (the name is all it cites): before, this asked
+    // a person to check the repo. The files the error's own stack names are
+    // in that repo and nothing ties any other repo to the log group, so
+    // CoderHelm settles it itself.
+    let mut env = Fake::new(
+        AwsFacts::default(),
+        answer(
+            "acme/ledger-api",
+            "medium",
+            "Its name matches the log group",
+        ),
+    );
+    env.files.insert(
+        "acme/ledger-api".into(),
+        paths(&[
+            "src/search/client.js",
+            "src/routes/orders.js",
+            "package.json",
+        ]),
+    );
+    let inp = api_input(&[
+        "acme/ledger-api",
+        "acme/ledger-web",
+        "acme/infra",
+        "acme/docs",
+        "acme/tools",
+    ]);
+    let r = resolve(&env, &inp, t(NOW)).await;
+    assert_eq!(r.repo.as_deref(), Some("acme/ledger-api"));
+    assert!(r.is_sure(), "{r:?}");
+    assert!(!r.unweighed);
+    // The model saw the checked evidence, numbered like the rest.
+    let p = env.prompts.lock().unwrap()[0].clone();
+    assert!(p.contains("[stack_file] (acme/ledger-api) 2 of the 2 source files the error's lines name are in acme/ledger-api"), "{p}");
+    // Every repo of the team was read: the files are in this one only.
+    assert_eq!(env.count("files"), 5);
+
+    // Without those files in the repo, the name alone still never decides.
+    let mut env = Fake::new(
+        AwsFacts::default(),
+        answer("acme/ledger-api", "high", "Its name matches the log group"),
+    );
+    env.files
+        .insert("acme/ledger-api".into(), paths(&["lib/main.rb", "Gemfile"]));
+    let r = resolve(&env, &inp, t(NOW)).await;
+    assert!(!r.is_sure(), "{r:?}");
+    assert!(r.confidence <= Confidence::Medium);
+}
+
+#[tokio::test]
+async fn files_found_in_two_repos_or_too_generic_leave_the_question_open() {
+    // Both candidates hold the files (a fork, a copy): a genuine tie, so a
+    // person chooses, with both offered.
+    let both = paths(&["src/search/client.js", "src/routes/orders.js"]);
+    let mut env = Fake::new(
+        AwsFacts::default(),
+        answer("acme/ledger-api", "medium", "The stack's files are here"),
+    );
+    env.files.insert("acme/ledger-api".into(), both.clone());
+    env.files.insert("acme/ledger-api-v2".into(), both);
+    let inp = api_input(&["acme/ledger-api", "acme/ledger-api-v2"]);
+    let r = resolve(&env, &inp, t(NOW)).await;
+    assert!(!r.is_sure(), "{r:?}");
+    let offered: Vec<&str> = r.candidates.iter().map(|c| c.repo.as_str()).collect();
+    assert!(
+        offered.contains(&"acme/ledger-api") && offered.contains(&"acme/ledger-api-v2"),
+        "{offered:?}"
+    );
+    let ask = ask_json(&r);
+    assert_eq!(ask["guess"], "acme/ledger-api");
+    assert_eq!(ask["candidates"].as_array().unwrap().len(), offered.len());
+
+    // The files are in a different repo than the one the name suggests: the
+    // evidence disagrees, so nothing starts on its own.
+    let mut env = Fake::new(
+        AwsFacts::default(),
+        answer("acme/ledger-api", "high", "Its name matches the log group"),
+    );
+    env.files
+        .insert("acme/ledger-api".into(), paths(&["lib/main.rb"]));
+    env.files.insert(
+        "acme/orders-service".into(),
+        paths(&["src/search/client.js", "src/routes/orders.js"]),
+    );
+    let inp = api_input(&["acme/ledger-api", "acme/orders-service"]);
+    let r = resolve(&env, &inp, t(NOW)).await;
+    assert!(!r.is_sure(), "{r:?}");
+
+    // One generic path (a directory and a file) is not evidence: the name
+    // plus `src/index.js` never starts a fix.
+    let mut env = Fake::new(
+        AwsFacts::default(),
+        answer("acme/ledger-api", "high", "Its name matches the log group"),
+    );
+    env.files
+        .insert("acme/ledger-api".into(), paths(&["src/index.js"]));
+    let mut inp = input(
+        API_GROUP,
+        &[
+            "acme/ledger-api",
+            "acme/ledger-web",
+            "acme/infra",
+            "acme/docs",
+            "acme/tools",
+        ],
+    );
+    inp.target.samples = vec![LogLine {
+        log_group: API_GROUP.into(),
+        message: "    at main (/srv/src/index.js:3:1)".into(),
+    }];
+    let r = resolve(&env, &inp, t(NOW)).await;
+    assert!(!r.is_sure(), "{r:?}");
+    assert!(!env.prompts.lock().unwrap()[0].contains("[stack_file]"));
+}
+
+#[tokio::test]
+async fn evidence_the_model_could_not_weigh_is_weighed_again_not_put_to_a_person() {
+    let mut env = Fake::new(AwsFacts::default(), |_| Err("overloaded".into()));
+    env.files.insert(
+        "acme/ledger-api".into(),
+        paths(&["src/search/client.js", "src/routes/orders.js"]),
+    );
+    let inp = api_input(&[
+        "acme/ledger-api",
+        "acme/ledger-web",
+        "acme/infra",
+        "acme/docs",
+        "acme/tools",
+    ]);
+    let r = resolve(&env, &inp, t(NOW)).await;
+    // Nothing is chosen for sure and nothing is cached, as before; and it
+    // is marked so the sweep tries again instead of asking.
+    assert!(!r.is_sure());
+    assert!(r.unweighed);
+    assert!(env.cache.lock().unwrap().is_empty());
+    // A verdict, sure or not, is weighed.
+    let env = Fake::new(
+        AwsFacts::default(),
+        answer("acme/ledger-api", "low", "Only the name fits"),
+    );
+    let r = resolve(&env, &inp, t(NOW)).await;
+    assert!(!r.unweighed && !r.is_sure());
+}
+
+#[tokio::test]
+async fn files_are_evidence_only_when_every_repo_was_read() {
+    let names = ["acme/ledger-api", "acme/ledger-web", "acme/infra"];
+    let files = paths(&["src/search/client.js", "src/routes/orders.js"]);
+    // One repo can't be read: the files could be there too, so the name
+    // stays a name and nothing starts on its own.
+    let mut env = Fake::new(
+        AwsFacts::default(),
+        answer(
+            "acme/ledger-api",
+            "medium",
+            "Its name matches the log group",
+        ),
+    );
+    env.files.insert("acme/ledger-api".into(), files.clone());
+    env.unreadable.push("acme/infra".into());
+    let r = resolve(&env, &api_input(&names), t(NOW)).await;
+    assert!(!r.is_sure(), "{r:?}");
+    assert!(!env.prompts.lock().unwrap()[0].contains("[stack_file]"));
+
+    // More repos than are read in full: none is read.
+    let many: Vec<String> = (0..=MAX_FILE_CHECKS)
+        .map(|i| format!("acme/service-{i}"))
+        .chain(["acme/ledger-api".to_string()])
+        .collect();
+    let many: Vec<&str> = many.iter().map(String::as_str).collect();
+    let mut env = Fake::new(
+        AwsFacts::default(),
+        answer(
+            "acme/ledger-api",
+            "medium",
+            "Its name matches the log group",
+        ),
+    );
+    env.files.insert("acme/ledger-api".into(), files);
+    let r = resolve(&env, &api_input(&many), t(NOW)).await;
+    assert!(!r.is_sure(), "{r:?}");
+    assert_eq!(env.count("files"), 0);
 }

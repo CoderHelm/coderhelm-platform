@@ -26,6 +26,27 @@ The quiet period (quiet_days_for):
   the reopen, so it isn't resolved while it is likely to return.
 - Never less than MIN_QUIET_DAYS (24 hours), never more than MAX_QUIET_DAYS.
 
+Whether it is still happening (activity_for), from the checks the analyzer
+keeps on the finding (one per analysis of its log group: new matching lines,
+the lines the group logged in the window checked, the window's length):
+- happening: the latest analysis saw a new line, or only one has gone by
+  without one (one run that saw nothing is not evidence);
+- stopped: STOPPED_AFTER_CHECKS analyses in a row saw no matching line while
+  the service kept logging (at least 1/VOLUME_FACTOR of its volume while the
+  error was happening);
+- unknown: no matching line, but the service itself went quiet or its volume
+  could not be read, so nobody can tell.
+
+Evidence resolves a burst sooner (quiet_period): a burst that stopped, with a
+production deploy of the log group's repo or a change merged in it around the
+time it stopped (`change`, recorded by the worker), resolves after
+EVIDENCE_QUIET_DAYS without a line instead of DEFAULT_QUIET_DAYS. An error that keeps coming back keeps its
+longer period whatever changed.
+
+services/common/src/log_findings.rs has the same rules; both run
+services/common/tests/fixtures/quiet_days_cases.json and
+finding_activity_cases.json.
+
 Pure functions only; the handler does the reads and writes.
 """
 
@@ -39,6 +60,26 @@ import fingerprint
 DEFAULT_QUIET_DAYS = 3
 MIN_QUIET_DAYS = 1
 MAX_QUIET_DAYS = 14
+# How often the full analysis runs (its EventBridge schedule).
+ANALYSIS_EVERY_HOURS = 6
+# Analyses in a row without a matching line, at the service's usual volume,
+# before a finding is stopped: one that saw nothing is never evidence (a run
+# can miss it), so the smallest number that is.
+STOPPED_AFTER_CHECKS = 2
+# The service "kept logging" when a check's volume is at least this fraction
+# of its volume while the error was happening: the factor the watch uses to
+# call a change in volume a spike (handler.WATCH_FACTOR), the other way round.
+VOLUME_FACTOR = 5
+# Checks kept on a finding: the analyses in the default quiet period.
+ACTIVITY_KEEP = DEFAULT_QUIET_DAYS * 24 // ANALYSIS_EVERY_HOURS
+# A burst that stopped after a change in its repo resolves after this long
+# without a line: the shortest quiet period there is, which is also the
+# analyzer's lookback (every line it can read was read without a match).
+EVIDENCE_QUIET_DAYS = MIN_QUIET_DAYS
+# A change this long before the last matching line can still be what stopped
+# it (merged, then deployed while the last lines were written): one analysis
+# interval, the finest the analyzer tells time.
+CHANGE_BEFORE_HOURS = ANALYSIS_EVERY_HOURS
 # A resolved finding seen again within this long is reopened.
 REOPEN_DAYS = 30
 # Stored findings expire this long after their last sighting (DynamoDB TTL),
@@ -148,9 +189,10 @@ def find_match(sighting, existing, now=None):
     return None
 
 
-def quiet_days_for(item):
-    """How long `item` must go without a matching line before it is
-    resolved (see the module notes)."""
+def return_gaps(item):
+    """The silences (in days) a finding has come back from: gaps between
+    days with lines, and the time from a resolve to the reopen. Empty for a
+    burst that stopped."""
     days = sorted(
         str(h["day"])
         for h in item.get("daily_lines") or []
@@ -167,14 +209,131 @@ def quiet_days_for(item):
     resolved, back = _ts(item.get("last_resolved_at")), _ts(item.get("reopened_at"))
     if resolved and back and back > resolved:
         gaps.append(max(1, round((back - resolved).total_seconds() / 86400)))
+    return gaps
+
+
+def quiet_days_for(item):
+    """How long `item` must go without a matching line before it is
+    resolved, from its history alone (see the module notes)."""
+    gaps = return_gaps(item)
     quiet = 2 * max(gaps) if gaps else DEFAULT_QUIET_DAYS
     return max(MIN_QUIET_DAYS, min(MAX_QUIET_DAYS, quiet))
 
 
+def checks_of(item):
+    """The finding's checks, oldest first: (at, new matching lines, lines the
+    group logged per minute or None when that wasn't read). Entries that are
+    not checks are skipped."""
+    out = []
+    for c in item.get("activity") or []:
+        if not isinstance(c, dict):
+            continue
+        at = _ts(c.get("at"))
+        if at is None:
+            continue
+        minutes = attribution.as_int(c.get("minutes"))
+        rate = None
+        if c.get("scanned") is not None and minutes > 0:
+            rate = attribution.as_int(c.get("scanned")) / minutes
+        out.append((at, attribution.as_int(c.get("lines")), rate))
+    return out
+
+
+def activity_for(item):
+    """Whether the finding is still happening (see the module notes):
+    {state, quiet_checks, normal_checks, checked_at}. `quiet_checks` is the
+    analyses in a row, up to the latest, with no new matching line;
+    `normal_checks` those of them at the service's usual volume."""
+    checks = checks_of(item)
+    quiet = []
+    for c in reversed(checks):
+        if c[1] > 0:
+            break
+        quiet.append(c)
+    # The service's usual volume: the middle rate of the checks with lines.
+    busy = sorted(c[2] for c in checks if c[1] > 0 and c[2])
+    usual = busy[(len(busy) - 1) // 2] if busy else None
+    normal = sum(
+        1 for c in quiet
+        if c[2] is not None and (c[2] * VOLUME_FACTOR >= usual if usual else c[2] > 0)
+    )
+    if quiet and normal >= STOPPED_AFTER_CHECKS:
+        state = "stopped"
+    elif len(quiet) >= STOPPED_AFTER_CHECKS:
+        state = "unknown"
+    else:
+        state = "happening"
+    return {
+        "state": state,
+        "quiet_checks": len(quiet),
+        "normal_checks": normal,
+        "checked_at": checks[-1][0] if checks else None,
+    }
+
+
+def change_explains(item, activity=None):
+    """Whether the change recorded on the finding (`change`: kind, repo, at,
+    title) can be what stopped it: it landed no more than CHANGE_BEFORE_HOURS
+    before the last matching line and no later than the latest check."""
+    change = item.get("change")
+    if not isinstance(change, dict):
+        return False
+    at, last = _ts(change.get("at")), _ts(item.get("last_seen_at"))
+    checked = (activity or activity_for(item))["checked_at"]
+    if not (at and last and checked):
+        return False
+    return last - timedelta(hours=CHANGE_BEFORE_HOURS) <= at <= checked
+
+
+def quiet_period(item):
+    """(days, basis): how long `item` must go without a matching line before
+    it is resolved, and why: "returns" (it keeps coming back), "change" (a
+    burst that stopped after a change in its repo) or "default"."""
+    if return_gaps(item):
+        return quiet_days_for(item), "returns"
+    activity = activity_for(item)
+    if activity["state"] == "stopped" and change_explains(item, activity):
+        return EVIDENCE_QUIET_DAYS, "change"
+    return quiet_days_for(item), "default"
+
+
+def _days(n):
+    return f"{n} day{'s' if n != 1 else ''}"
+
+
+def resolved_reason(item, days, basis):
+    """Why the analyzer resolved a finding, with the evidence when it
+    resolved sooner than the default."""
+    reason = f"Resolved: no new lines for {_days(days)}"
+    if basis != "change":
+        return reason
+    change, activity = item.get("change") or {}, activity_for(item)
+    what = "a deploy of" if change.get("kind") == "deploy" else "a change merged in"
+    title = str(change.get("title") or "").strip()[:120]
+    at = _ts(change.get("at"))
+    return (
+        f"{reason}. It stopped after {what} {change.get('repo') or 'its repo'}"
+        + (f" ({title})" if title else "")
+        + (f" on {at.strftime('%Y-%m-%d %H:%M')} UTC" if at else "")
+        + f", and {activity['quiet_checks']} analyses in a row since found no matching line"
+        " while the service kept logging"
+    )
+
+
+def add_check(activity, at, lines, scanned=None, minutes=None, keep=ACTIVITY_KEEP):
+    """The finding's checks with one more (see checks_of); at most `keep`."""
+    check = {"at": at, "lines": max(int(lines), 0)}
+    if scanned is not None and minutes and int(minutes) > 0:
+        check["scanned"] = max(int(scanned), 0)
+        check["minutes"] = int(minutes)
+    kept = [c for c in activity or [] if isinstance(c, dict)]
+    return (kept + [check])[-keep:]
+
+
 def stale(existing, seen_ids, now=None, quiet_days=None):
     """Open findings to resolve: pending (New, Acknowledged or being fixed),
-    not seen this run, and quiet for their quiet period (`quiet_days` when
-    given). A finding with no time at all is left open."""
+    not seen this run, and quiet for their quiet period (quiet_period, or
+    `quiet_days` when given). A finding with no time at all is left open."""
     now = now or datetime.now(timezone.utc)
     out = []
     for item in existing:
@@ -183,7 +342,7 @@ def stale(existing, seen_ids, now=None, quiet_days=None):
         if item.get("merged_into"):
             continue
         last = last_sighting(item)
-        days = quiet_days if quiet_days is not None else quiet_days_for(item)
+        days = quiet_days if quiet_days is not None else quiet_period(item)[0]
         if last is not None and now - last >= timedelta(days=days):
             out.append(item)
     return out

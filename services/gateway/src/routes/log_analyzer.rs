@@ -1246,6 +1246,13 @@ fn rec_from_item(item: &std::collections::HashMap<String, AttributeValue>) -> Op
         "error_hash": item.get("error_hash").and_then(|v| v.as_s().ok()),
         "error_count": item.get("error_count").and_then(|v| v.as_n().ok()).and_then(|n| n.parse::<u64>().ok()),
         "plan_id": item.get("plan_id").and_then(|v| v.as_s().ok()),
+        // Open, but its error stopped while the service kept logging
+        // (common::log_findings): not a live problem.
+        "stopped": item
+            .get("pk")
+            .and_then(|v| v.as_s().ok())
+            .and_then(|team| common::log_findings::Finding::from_item(team, item))
+            .is_some_and(|f| f.stopped()),
         "created_at": item.get("created_at").and_then(|v| v.as_s().ok()),
         "updated_at": item.get("updated_at").and_then(|v| v.as_s().ok()),
     }))

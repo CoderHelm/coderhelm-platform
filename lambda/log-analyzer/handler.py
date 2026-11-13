@@ -360,6 +360,7 @@ def analyze_connection(conn, lookback_hours=None, only_groups=None, resolve=True
         # Every query that ran found nothing: those groups' findings are no
         # longer erroring.
         if resolve:
+            check_quiet(team_id, existing, set(), cw_logs, (start, end), failed_groups)
             resolve_stale_recommendations(team_id, existing, set(), skip_groups=failed_groups)
         return 0
 
@@ -409,6 +410,7 @@ def analyze_connection(conn, lookback_hours=None, only_groups=None, resolve=True
     if check_failed:
         logger.warning(f"{team_id}/{account_id}: an attribution check failed, skipping resolution")
     elif resolve:
+        check_quiet(team_id, existing, seen_ids, cw_logs, (start, end), failed_groups)
         resolve_stale_recommendations(team_id, existing, seen_ids, skip_groups=failed_groups)
 
     notify_new_recommendations(team_id, account_id, new_recs)
@@ -763,7 +765,8 @@ def list_recent_findings(team_id, account_id, now=None):
 def resolve_stale_recommendations(team_id, existing, seen_ids, now=None, skip_groups=()):
     """Mark open findings resolved when this run read their log group in full,
     didn't see them, and they have been quiet for their quiet period
-    (lifecycle.quiet_days_for). One missed run never resolves a finding, and a
+    (lifecycle.quiet_period: shorter for a burst that stopped after a change in
+    its repo, with that evidence in the reason). One missed run never resolves a finding, and a
     group whose query failed (`skip_groups`) resolves nothing. Open findings
     also carry their quiet period (`quiet_days`) so the page can say when one
     resolves."""
@@ -774,8 +777,8 @@ def resolve_stale_recommendations(team_id, existing, seen_ids, now=None, skip_gr
     stale = [i for i in lifecycle.stale(existing, seen_ids, now_dt) if i.get("source_log_group") not in skip]
     stale_ids = {i.get("rec_id") for i in stale}
     for item in stale:
-        days = lifecycle.quiet_days_for(item)
-        reason = f"Resolved: no new lines for {days} day{'s' if days != 1 else ''}"
+        days, basis = lifecycle.quiet_period(item)
+        reason = lifecycle.resolved_reason(item, days, basis)
         try:
             aws_insights_table.update_item(
                 Key={"pk": team_id, "sk": item["sk"]},
@@ -808,7 +811,7 @@ def resolve_stale_recommendations(team_id, existing, seen_ids, now=None, skip_gr
             continue
         if item.get("status", "pending") != "pending" or item.get("merged_into"):
             continue
-        days = lifecycle.quiet_days_for(item)
+        days = lifecycle.quiet_period(item)[0]
         if attribution.as_int(item.get("quiet_days")) == days:
             continue
         try:
@@ -918,22 +921,103 @@ def suspected_location(rec):
     return "" if loc.lower() in ("", "null", "none", "unknown") else loc[:300]
 
 
-def lines_since(cw_logs, group, literal, prev, window):
-    """Matching lines after a stored finding's last_seen_at, for seen_count.
-    None when that time is before this run's window (every line in it is
-    new). 0 when the check can't run: an unanswered question never adds."""
+def since_check(cw_logs, group, literal, prev, window):
+    """The check of a stored finding's group after its last_seen_at
+    (attribution.check_group: count, scanned, minutes). None when that time
+    is before this run's window (every line in it is new), False when the
+    check can't run."""
     start, end = window
     prev_last = attribution.parse_ts(prev.get("last_seen_at"))
     if prev_last is None or prev_last.timestamp() < start:
         return None
     if cw_logs is None:
-        return 0
+        return False
     # Insights takes whole seconds; lines in the same second as the stored
     # last one are not counted again (a rare undercount, never a double count).
-    checked = attribution.check_group(
-        cw_logs, group, literal, int(prev_last.timestamp()) + 1, end, scrub_secrets
-    )
+    since = int(prev_last.timestamp()) + 1
+    if since >= end:
+        return False
+    return attribution.check_group(cw_logs, group, literal, since, end, scrub_secrets) or False
+
+
+def lines_since(cw_logs, group, literal, prev, window):
+    """Matching lines after a stored finding's last_seen_at, for seen_count.
+    None when that time is before this run's window (every line in it is
+    new). 0 when the check can't run: an unanswered question never adds."""
+    checked = since_check(cw_logs, group, literal, prev, window)
+    if checked is None:
+        return None
     return checked["count"] if checked else 0
+
+
+# Most open findings without a sighting checked in one run (one Insights
+# query each, on one log group): the latest to go quiet first, which are the
+# ones the page still shows as open.
+MAX_QUIET_CHECKS = 25
+# The checks stop once they have taken this long in one run, and one that
+# doesn't answer within QUIET_CHECK_WAIT_SECS records nothing: the function
+# has 10 minutes for every account, and a check not made this run is made
+# the next.
+QUIET_CHECK_BUDGET_SECS = 60
+QUIET_CHECK_WAIT_SECS = 10
+
+
+def check_quiet(team_id, existing, seen_ids, cw_logs, window, skip_groups=(), now=None):
+    """One check per open finding this run didn't sight: its own literal
+    counted on its own log group since its last line (within this run's
+    window), with the lines the group logged in that time. The model not
+    mentioning an error is not a count of zero; this is. The check is kept on
+    the finding (`activity`), which is what says it stopped
+    (lifecycle.activity_for). A check that can't run records nothing. Returns
+    how many were recorded."""
+    now_dt = now or datetime.now(timezone.utc)
+    start, end = window
+    skip = set(skip_groups or ())
+    quiet = [
+        i for i in existing
+        if i.get("status", "pending") == "pending" and not i.get("merged_into")
+        and i.get("rec_id") not in seen_ids and i.get("source_log_group")
+        and i.get("source_log_group") not in skip
+        and attribution.pattern_literal(i.get("error_pattern"))
+        and lifecycle.last_sighting(i)
+    ]
+    quiet.sort(key=lambda i: lifecycle.last_sighting(i), reverse=True)
+    recorded = 0
+    stop_at = time.monotonic() + QUIET_CHECK_BUDGET_SECS
+
+    def run(cw, groups, query, s, e):
+        return attribution.run_query(cw, groups, query, s, e, wait_secs=QUIET_CHECK_WAIT_SECS)
+
+    for item in quiet[:MAX_QUIET_CHECKS]:
+        if time.monotonic() >= stop_at:
+            logger.info(f"{team_id}: quiet checks stopped at their time limit after {recorded}")
+            break
+        since = max(int(start), int(lifecycle.last_sighting(item).timestamp()) + 1)
+        if since >= end:
+            continue
+        checked = attribution.check_group(
+            cw_logs, item["source_log_group"], attribution.pattern_literal(item.get("error_pattern")),
+            since, end, scrub_secrets, run,
+        )
+        if checked is None:
+            continue
+        activity = lifecycle.add_check(
+            item.get("activity"), now_dt.isoformat(), checked["count"], checked.get("scanned"), checked.get("minutes")
+        )
+        try:
+            aws_insights_table.update_item(
+                Key={"pk": team_id, "sk": item["sk"]},
+                UpdateExpression="SET #act = :a",
+                ConditionExpression="#s = :pending",
+                ExpressionAttributeNames={"#s": "status", "#act": "activity"},
+                ExpressionAttributeValues={":a": activity, ":pending": "pending"},
+            )
+            item["activity"] = activity
+            recorded += 1
+        except ClientError as e:
+            if e.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
+                logger.warning(f"Failed to record a check on {item['sk']}: {e}")
+    return recorded
 
 
 def store_finding(team_id, account_id, cand, existing, cw_logs=None, window=None, now=None):
@@ -969,9 +1053,22 @@ def store_finding(team_id, account_id, cand, existing, cw_logs=None, window=None
 
     match = lifecycle.find_match(sighting, existing, now_dt)
     if match:
-        new_lines = lines_since(cw_logs, group, literal, match, window)
+        since = since_check(cw_logs, group, literal, match, window)
+        new_lines = None if since is None else (since["count"] if since else 0)
         seen, first, last = attribution.merge_seen(match, stats, new_lines)
         added = stats["count"] if new_lines is None else new_lines
+        # This run's check: the lines after the stored last one (or the whole
+        # window when that is older), with the group's volume in that time. A
+        # check that couldn't run records nothing.
+        activity = match.get("activity") or []
+        if since is None:
+            activity = lifecycle.add_check(
+                activity, now, stats["count"], stats.get("scanned"), stats.get("minutes")
+            )
+        elif since:
+            activity = lifecycle.add_check(
+                activity, now, since["count"], since.get("scanned"), since.get("minutes")
+            )
         hashes = fingerprint.merge_hashes(
             sorted(fingerprint.item_hashes(match)) if not match.get("signature_hashes")
             else match.get("signature_hashes"),
@@ -1001,14 +1098,16 @@ def store_finding(team_id, account_id, cand, existing, cw_logs=None, window=None
             ":fp": sighting["fingerprint"],
             ":sig": sighting["signature"][:300],
             ":quiet": quiet,
+            ":act": activity,
         }
         sets = (
             "last_seen_at = :l, first_seen_at = :f, updated_at = :t, error_count = :c, "
             "seen_count = :seen, count_basis = :basis, samples = :samples, log_account_id = :acct, "
             "signature_hashes = :sigs, log_streams = :streams, also_in = :others, daily_lines = :hist, "
-            "fingerprint = if_not_exists(fingerprint, :fp), #sig = if_not_exists(#sig, :sig), quiet_days = :quiet"
+            "fingerprint = if_not_exists(fingerprint, :fp), #sig = if_not_exists(#sig, :sig), quiet_days = :quiet, "
+            "#act = :act"
         )
-        names = {"#sig": "signature"}
+        names = {"#sig": "signature", "#act": "activity"}
         reopened = match.get("status") == "resolved"
         removes = ""
         if reopened:
@@ -1049,7 +1148,7 @@ def store_finding(team_id, account_id, cand, existing, cw_logs=None, window=None
         match.update({
             "last_seen_at": values[":l"], "first_seen_at": values[":f"],
             "seen_count": seen, "count_basis": "events", "signature_hashes": hashes,
-            "daily_lines": history, "quiet_days": quiet,
+            "daily_lines": history, "quiet_days": quiet, "activity": activity,
         })
         if reopened:
             match.update({"status": "pending", "reopened_at": now})
@@ -1082,6 +1181,7 @@ def store_finding(team_id, account_id, cand, existing, cw_logs=None, window=None
         "also_in": others,
         "daily_lines": lifecycle.add_history([], today, stats["count"]),
         "quiet_days": lifecycle.DEFAULT_QUIET_DAYS,
+        "activity": lifecycle.add_check([], now, stats["count"], stats.get("scanned"), stats.get("minutes")),
         "created_at": now,
         "updated_at": now,
         "first_seen_at": attribution.iso(first) or now,
@@ -1104,7 +1204,7 @@ def store_finding(team_id, account_id, cand, existing, cw_logs=None, window=None
             "error_pattern": item["error_pattern"], "created_at": now,
             "source_log_group": group, "count_basis": "events", "seen_count": stats["count"],
             "first_seen_at": item["first_seen_at"], "last_seen_at": item["last_seen_at"],
-            "daily_lines": item["daily_lines"],
+            "daily_lines": item["daily_lines"], "activity": item["activity"],
         })
         return rec_id, True
     except Exception as e:
