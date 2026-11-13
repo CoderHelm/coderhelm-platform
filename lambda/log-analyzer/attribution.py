@@ -101,8 +101,26 @@ def rows_of(results):
     return [{f.get("field"): f.get("value") for f in row} for row in results or []]
 
 
+class Rows(list):
+    """A query's rows, with how many log events it scanned (every line in
+    the log groups and window, whatever the filter kept), or None when
+    Insights didn't say."""
+
+    scanned = None
+
+
+def scanned_of(result):
+    """`recordsScanned` of a get_query_results answer, or None."""
+    value = (result.get("statistics") or {}).get("recordsScanned")
+    try:
+        return max(int(float(value)), 0)
+    except (TypeError, ValueError):
+        return None
+
+
 def run_query(cw_logs, log_groups, query, start, end, wait_secs=30, sleep=None):
-    """Run one Insights query; rows as dicts, or None when it failed."""
+    """Run one Insights query; rows as dicts (a Rows, with the lines it
+    scanned), or None when it failed."""
     try:
         q = cw_logs.start_query(
             logGroupNames=list(log_groups),
@@ -119,7 +137,9 @@ def run_query(cw_logs, log_groups, query, start, end, wait_secs=30, sleep=None):
         r = cw_logs.get_query_results(queryId=query_id)
         status = r.get("status")
         if status == "Complete":
-            return rows_of(r.get("results", []))
+            rows = Rows(rows_of(r.get("results", [])))
+            rows.scanned = scanned_of(r)
+            return rows
         if status in ("Failed", "Cancelled", "Timeout"):
             logger.warning(f"Query {query_id} ended with status: {status}")
             return None
@@ -323,14 +343,20 @@ def attribute(cw_logs, groups, literal, start, end, scrub=lambda s: s, run=run_q
 
 def check_group(cw_logs, group, literal, start, end, scrub=lambda s: s, run=run_query):
     """The check before saving: the literal's stats on this one log group.
-    Zero lines = an empty dict's count of 0; None when the query failed."""
-    stats = attribute(cw_logs, [group], literal, start, end, scrub, run)
-    if stats is None:
+    Zero lines = an empty dict's count of 0; None when the query failed.
+    `scanned` is every line the group logged in the window (None when
+    Insights didn't say) and `minutes` the window's length: the service's
+    volume, for telling "the error stopped" from "the service went quiet"."""
+    rows = run(cw_logs, [group], stats_query(literal), start, end)
+    if rows is None:
         return None
-    return stats.get(group) or {
+    stats = group_stats(rows, [group], scrub).get(group) or {
         "account": "", "log_group": group, "count": 0,
         "first": None, "last": None, "streams": {}, "samples": [],
     }
+    stats["scanned"] = getattr(rows, "scanned", None)
+    stats["minutes"] = max(int(end - start) // 60, 0)
+    return stats
 
 
 def credited_groups(stats, cw_logs, literal, start, end, scrub=lambda s: s, run=run_query):

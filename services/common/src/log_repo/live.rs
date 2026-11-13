@@ -666,6 +666,13 @@ impl Env for Live<'_> {
         (!text.is_empty()).then_some(text)
     }
 
+    async fn files(&self, repo: &RepoInfo) -> Option<Vec<String>> {
+        let host = self.host?;
+        let commit = host.head(&repo.name, &repo.branch).await.ok()?;
+        let tree = host.tree(&repo.name, &commit).await.ok()?;
+        Some(tree.files.into_iter().map(|f| f.path).collect())
+    }
+
     async fn judge(&self, system: &str, user: &str) -> Result<String, String> {
         self.judge.judge(system, user).await
     }

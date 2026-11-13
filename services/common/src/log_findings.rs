@@ -148,6 +148,21 @@ pub const MAX_QUIET_DAYS: u64 = 14;
 /// How often the analyzer runs (its EventBridge schedule), so a finding past
 /// its quiet period resolves within this long once analysis works.
 pub const ANALYSIS_EVERY_HOURS: u64 = 6;
+/// Analyses in a row without a matching line, at the service's usual
+/// volume, before a finding is stopped (lifecycle.py STOPPED_AFTER_CHECKS):
+/// one that saw nothing is never evidence, so the smallest number that is.
+pub const STOPPED_AFTER_CHECKS: u64 = 2;
+/// The service "kept logging" when a check's volume is at least this
+/// fraction of its volume while the error was happening (lifecycle.py
+/// VOLUME_FACTOR, the analyzer's own factor for an unusual volume).
+pub const VOLUME_FACTOR: f64 = 5.0;
+/// A burst that stopped after a change in its repo resolves after this long
+/// without a line: the shortest quiet period there is (lifecycle.py
+/// EVIDENCE_QUIET_DAYS).
+pub const EVIDENCE_QUIET_DAYS: u64 = MIN_QUIET_DAYS;
+/// A change this long before the last matching line can still be what
+/// stopped it (lifecycle.py CHANGE_BEFORE_HOURS): one analysis interval.
+pub const CHANGE_BEFORE_HOURS: u64 = ANALYSIS_EVERY_HOURS;
 
 /// One finding as stored.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -218,6 +233,99 @@ pub struct Finding {
     pub incident_id: String,
     /// That incident as the page shows it (JSON), empty until worked out.
     pub incident: String,
+    /// The analyzer's checks of this finding, oldest first: one per analysis
+    /// of its log group ([`Check`]). What says whether it is still happening
+    /// ([`Finding::activity`]).
+    pub activity: Vec<Check>,
+    /// A change in the log group's repo around the time the errors stopped,
+    /// recorded by the worker ([`change_wanted`], [`pick_change`]).
+    pub change: Option<Change>,
+    /// The "which repo?" question an automatic fix is waiting on (JSON:
+    /// guess, candidates, reason), so the page offers the choice in one
+    /// click. Empty when nothing was asked.
+    pub repo_ask: String,
+}
+
+/// One analysis of a finding's log group.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Check {
+    pub at: String,
+    /// New matching lines since the finding's last one.
+    pub lines: u64,
+    /// Every line the log group wrote in the window checked; None when
+    /// CloudWatch didn't say.
+    #[serde(default)]
+    pub scanned: Option<u64>,
+    /// That window's length.
+    #[serde(default)]
+    pub minutes: u64,
+}
+
+impl Check {
+    /// Lines the log group wrote per minute in the window, when known.
+    fn rate(&self) -> Option<f64> {
+        match self.scanned {
+            Some(n) if self.minutes > 0 => Some(n as f64 / self.minutes as f64),
+            _ => None,
+        }
+    }
+}
+
+/// A change in a repo that can explain why errors stopped.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Change {
+    /// `merge` (a commit on the default branch) or `deploy`.
+    pub kind: String,
+    pub repo: String,
+    pub at: String,
+    /// The first line of the commit message.
+    pub title: String,
+    pub url: String,
+}
+
+/// Whether a finding's error is still happening.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivityState {
+    /// The latest analysis saw a new line, or only one has gone by without.
+    #[default]
+    Happening,
+    /// [`STOPPED_AFTER_CHECKS`] analyses in a row saw no matching line while
+    /// the service kept logging.
+    Stopped,
+    /// No matching line, but the service itself went quiet or its volume
+    /// couldn't be read: nobody can tell.
+    Unknown,
+}
+
+/// What the checks say ([`activity_for`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct Activity {
+    pub state: ActivityState,
+    /// Analyses in a row, up to the latest, with no new matching line.
+    pub quiet_checks: u64,
+    /// Those of them at the service's usual volume.
+    pub normal_checks: u64,
+    /// When the latest check ran (empty when there is none).
+    pub checked_at: String,
+    /// What the latest check read: every line the log group wrote in its
+    /// window, and the window's length.
+    pub scanned: Option<u64>,
+    pub minutes: Option<u64>,
+}
+
+/// Why a finding's quiet period is what it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuietBasis {
+    /// A burst that stopped: [`DEFAULT_QUIET_DAYS`].
+    Default,
+    /// It keeps coming back: twice its longest silence.
+    Returns,
+    /// A burst that stopped after a change in its repo:
+    /// [`EVIDENCE_QUIET_DAYS`].
+    Change,
 }
 
 impl Finding {
@@ -281,6 +389,9 @@ impl Finding {
             last_resolved_at: s(item, "last_resolved_at"),
             incident_id: s(item, "incident_id"),
             incident: s(item, "incident"),
+            activity: checks(item),
+            change: change(item),
+            repo_ask: s(item, "repo_ask"),
         })
     }
 
@@ -304,7 +415,29 @@ impl Finding {
     /// the analyzer's resolve sweep does (lifecycle.quiet_days_for), so the
     /// date the page shows is the date the sweep uses.
     pub fn quiet_days(&self) -> u64 {
-        quiet_days_for(&self.daily_lines, &self.last_resolved_at, &self.reopened_at)
+        quiet_period(self).0
+    }
+
+    /// Whether the error is still happening, from the analyzer's checks.
+    pub fn activity(&self) -> Activity {
+        activity_for(&self.activity)
+    }
+
+    /// Open, and the checks say its error stopped while the service kept
+    /// logging: shown as stopped, counted as stopped, never fixed
+    /// automatically.
+    pub fn stopped(&self) -> bool {
+        self.status == "pending"
+            && self.merged_into.is_empty()
+            && self.activity().state == ActivityState::Stopped
+    }
+
+    /// The change that explains why it stopped, when one does
+    /// ([`change_explains`]).
+    pub fn explaining_change(&self) -> Option<&Change> {
+        self.change
+            .as_ref()
+            .filter(|c| change_explains(c, &self.last_seen_at, &self.activity()))
     }
 
     /// When an open finding resolves on its own if no new line comes
@@ -362,6 +495,18 @@ pub(crate) fn parse_time(v: &str) -> Option<DateTime<Utc>> {
 ///   reopen);
 /// - never less than [`MIN_QUIET_DAYS`] nor more than [`MAX_QUIET_DAYS`].
 pub fn quiet_days_for(daily_lines: &[Counted], last_resolved_at: &str, reopened_at: &str) -> u64 {
+    let quiet = return_gaps(daily_lines, last_resolved_at, reopened_at)
+        .iter()
+        .max()
+        .map(|g| g * 2)
+        .unwrap_or(DEFAULT_QUIET_DAYS);
+    quiet.clamp(MIN_QUIET_DAYS, MAX_QUIET_DAYS)
+}
+
+/// Pure: the silences (in days) a finding has come back from: gaps between
+/// days with lines, and the time from a resolve to the reopen. Empty for a
+/// burst that stopped (lifecycle.py `return_gaps`).
+pub fn return_gaps(daily_lines: &[Counted], last_resolved_at: &str, reopened_at: &str) -> Vec<u64> {
     let mut days: Vec<chrono::NaiveDate> = daily_lines
         .iter()
         .filter(|d| d.lines > 0)
@@ -380,12 +525,261 @@ pub fn quiet_days_for(daily_lines: &[Counted], last_resolved_at: &str, reopened_
             gaps.push((d as u64).max(1));
         }
     }
-    let quiet = gaps
+    gaps
+}
+
+/// The analyzer's checks on a stored finding (`activity`), oldest first.
+/// Entries without a time are skipped, as lifecycle.py `checks_of` does.
+fn checks(item: &Item) -> Vec<Check> {
+    let Some(list) = item.get("activity").and_then(|v| v.as_l().ok()) else {
+        return Vec::new();
+    };
+    let num = |m: &Item, k: &str| -> Option<u64> {
+        m.get(k)
+            .and_then(|v| v.as_n().ok())
+            .and_then(|v| v.parse::<f64>().ok())
+            .map(|v| v.max(0.0) as u64)
+    };
+    list.iter()
+        .filter_map(|v| v.as_m().ok())
+        .filter_map(|m| {
+            let at = s(m, "at");
+            parse_time(&at)?;
+            Some(Check {
+                at,
+                lines: num(m, "lines").unwrap_or(0),
+                scanned: num(m, "scanned"),
+                minutes: num(m, "minutes").unwrap_or(0),
+            })
+        })
+        .collect()
+}
+
+/// The change recorded on a stored finding (`change`), if any.
+fn change(item: &Item) -> Option<Change> {
+    let m = item.get("change")?.as_m().ok()?;
+    Some(Change {
+        kind: s(m, "kind"),
+        repo: s(m, "repo"),
+        at: s(m, "at"),
+        title: s(m, "title"),
+        url: s(m, "url"),
+    })
+}
+
+/// Pure: whether a finding is still happening, from its checks. The same
+/// rule as lambda/log-analyzer/lifecycle.py `activity_for` (both are checked
+/// against services/common/tests/fixtures/finding_activity_cases.json):
+/// - happening: the latest check has a new line, or only one has gone by
+///   without one;
+/// - stopped: [`STOPPED_AFTER_CHECKS`] checks in a row have no matching line
+///   while the service wrote at least 1/[`VOLUME_FACTOR`] of its usual volume
+///   (the middle rate of the checks with lines; with none, any line at all);
+/// - unknown: no matching line, but the service went quiet or its volume
+///   wasn't read.
+pub fn activity_for(checks: &[Check]) -> Activity {
+    let quiet: Vec<&Check> = checks.iter().rev().take_while(|c| c.lines == 0).collect();
+    let mut busy: Vec<f64> = checks
         .iter()
-        .max()
-        .map(|g| g * 2)
-        .unwrap_or(DEFAULT_QUIET_DAYS);
-    quiet.clamp(MIN_QUIET_DAYS, MAX_QUIET_DAYS)
+        .filter(|c| c.lines > 0)
+        .filter_map(Check::rate)
+        .filter(|r| *r > 0.0)
+        .collect();
+    busy.sort_by(|a, b| a.total_cmp(b));
+    let usual = (!busy.is_empty()).then(|| busy[(busy.len() - 1) / 2]);
+    let normal = quiet
+        .iter()
+        .filter(|c| match (c.rate(), usual) {
+            (Some(r), Some(u)) => r * VOLUME_FACTOR >= u,
+            (Some(r), None) => r > 0.0,
+            _ => false,
+        })
+        .count() as u64;
+    let quiet_checks = quiet.len() as u64;
+    let state = if quiet_checks > 0 && normal >= STOPPED_AFTER_CHECKS {
+        ActivityState::Stopped
+    } else if quiet_checks >= STOPPED_AFTER_CHECKS {
+        ActivityState::Unknown
+    } else {
+        ActivityState::Happening
+    };
+    let latest = checks.last();
+    Activity {
+        state,
+        quiet_checks,
+        normal_checks: normal,
+        checked_at: latest.map(|c| c.at.clone()).unwrap_or_default(),
+        scanned: latest.and_then(|c| c.scanned.filter(|_| c.minutes > 0)),
+        minutes: latest
+            .filter(|c| c.scanned.is_some() && c.minutes > 0)
+            .map(|c| c.minutes),
+    }
+}
+
+/// Pure: whether `change` can be what stopped a finding: it landed no more
+/// than [`CHANGE_BEFORE_HOURS`] before the last matching line and no later
+/// than the latest check (lifecycle.py `change_explains`).
+pub fn change_explains(change: &Change, last_seen_at: &str, activity: &Activity) -> bool {
+    let (Some(at), Some(last), Some(checked)) = (
+        parse_time(&change.at),
+        parse_time(last_seen_at),
+        parse_time(&activity.checked_at),
+    ) else {
+        return false;
+    };
+    last - chrono::Duration::hours(CHANGE_BEFORE_HOURS as i64) <= at && at <= checked
+}
+
+/// Pure: how long a finding must go without a matching line before it is
+/// resolved, and why (lifecycle.py `quiet_period`, the same fixture):
+/// - it keeps coming back: its longer period ([`quiet_days_for`]), whatever
+///   changed;
+/// - a burst that stopped (the checks say so) after a change in its repo:
+///   [`EVIDENCE_QUIET_DAYS`];
+/// - otherwise the default.
+pub fn quiet_period(f: &Finding) -> (u64, QuietBasis) {
+    let days = quiet_days_for(&f.daily_lines, &f.last_resolved_at, &f.reopened_at);
+    if !return_gaps(&f.daily_lines, &f.last_resolved_at, &f.reopened_at).is_empty() {
+        return (days, QuietBasis::Returns);
+    }
+    let activity = activity_for(&f.activity);
+    let explained = f
+        .change
+        .as_ref()
+        .is_some_and(|c| change_explains(c, &f.last_seen_at, &activity));
+    if activity.state == ActivityState::Stopped && explained {
+        return (EVIDENCE_QUIET_DAYS, QuietBasis::Change);
+    }
+    (days, QuietBasis::Default)
+}
+
+/// Pure: the repo whose changes can explain why `f` stopped, when that is
+/// worth looking up: an open burst the checks say stopped, with a repo saved
+/// for its log group (or the one its fix ran in), and no change that
+/// explains it recorded yet.
+pub fn change_wanted(f: &Finding, cfg: &AutoFix) -> Option<String> {
+    if !f.stopped()
+        || !return_gaps(&f.daily_lines, &f.last_resolved_at, &f.reopened_at).is_empty()
+        || f.explaining_change().is_some()
+    {
+        return None;
+    }
+    Some(f.fix_repo.clone())
+        .filter(|r| !r.is_empty())
+        .or_else(|| cfg.policy(&f.source_log_group).repo)
+        .filter(|r| valid_repo(r))
+}
+
+/// Pure: the earliest time a change could have landed and still explain
+/// why a finding whose last line was at `last_seen_at` stopped (RFC 3339).
+pub fn change_window_start(last_seen_at: &str) -> Option<String> {
+    let last = parse_time(last_seen_at)?;
+    Some(
+        (last - chrono::Duration::hours(CHANGE_BEFORE_HOURS as i64))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+    )
+}
+
+/// Pure: the commits that landed on `repo`'s default branch (sha, first
+/// line of the message, RFC 3339 time) as changes.
+pub fn merge_changes(repo: &str, commits: &[(String, String, String)]) -> Vec<Change> {
+    commits
+        .iter()
+        .filter(|c| !c.0.is_empty())
+        .map(|c| Change {
+            kind: "merge".into(),
+            repo: repo.to_string(),
+            at: c.2.clone(),
+            title: crate::truncate_str(c.1.trim(), 160).to_string(),
+            url: format!("https://github.com/{repo}/commit/{}", c.0),
+        })
+        .collect()
+}
+
+/// Pure: the production deploys of `repo` that succeeded, from the team's
+/// deploy records ([`crate::deploy_stats`]), as changes.
+pub fn deploy_changes(repo: &str, records: &[Item]) -> Vec<Change> {
+    records
+        .iter()
+        .filter(|i| s(i, "repo").eq_ignore_ascii_case(repo))
+        .filter(|i| s(i, "environment") == "production" && s(i, "outcome") == "succeeded")
+        .map(|i| Change {
+            kind: "deploy".into(),
+            repo: repo.to_string(),
+            at: s(i, "created_at"),
+            title: crate::truncate_str(s(i, "workflow").trim(), 160).to_string(),
+            url: match n(i, "run_id") {
+                Some(id) if id > 0 => format!("https://github.com/{repo}/actions/runs/{id}"),
+                _ => String::new(),
+            },
+        })
+        .collect()
+}
+
+/// Pure: the change that can explain why a finding stopped, from the
+/// merges and deploys of its repo ([`merge_changes`], [`deploy_changes`]):
+/// only one that landed in time ([`change_explains`]); a production deploy
+/// before a merge; then the latest at or before the last matching line,
+/// else the first after it. None when nothing landed in that time.
+pub fn pick_change(
+    candidates: &[Change],
+    last_seen_at: &str,
+    activity: &Activity,
+) -> Option<Change> {
+    let last = parse_time(last_seen_at)?;
+    let mut fits: Vec<(DateTime<Utc>, &Change)> = candidates
+        .iter()
+        .filter_map(|c| Some((parse_time(&c.at)?, c)))
+        .filter(|(_, c)| change_explains(c, last_seen_at, activity))
+        .collect();
+    if fits.iter().any(|(_, c)| c.kind == "deploy") {
+        fits.retain(|(_, c)| c.kind == "deploy");
+    }
+    fits.sort_by_key(|(t, _)| *t);
+    let before = fits.iter().rev().find(|(t, _)| *t <= last);
+    before.or(fits.first()).map(|(_, c)| (*c).clone())
+}
+
+/// The team's deploy records ([`crate::deploy_stats`]) that started between
+/// `since` and `until` (RFC 3339), for every repo.
+pub async fn deploys_between(
+    dynamo: &DynamoClient,
+    settings_table: &str,
+    team_id: &str,
+    since: &str,
+    until: &str,
+) -> Result<Vec<Item>, String> {
+    let prefix = crate::deploy_stats::PREFIX;
+    let out = dynamo
+        .query()
+        .table_name(settings_table)
+        .key_condition_expression("pk = :pk AND sk BETWEEN :lo AND :hi")
+        .expression_attribute_values(":pk", attr(team_id))
+        .expression_attribute_values(":lo", attr(&format!("{prefix}{since}")))
+        .expression_attribute_values(":hi", attr(&format!("{prefix}{until}~")))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(out.items().to_vec())
+}
+
+/// Pure: what the checks say about an open finding, in a sentence for a
+/// ticket or a card; None while it is happening.
+pub fn activity_words(f: &Finding) -> Option<String> {
+    let a = f.activity();
+    let since = card_time(&f.last_seen_at)
+        .map(|t| format!(" since {t}"))
+        .unwrap_or_default();
+    match a.state {
+        ActivityState::Happening => None,
+        ActivityState::Stopped => Some(format!(
+            "no matching line{since}: {} analyses in a row found none while the service kept logging",
+            a.quiet_checks
+        )),
+        ActivityState::Unknown => Some(format!(
+            "no matching line{since}, but the service itself went quiet, so it can't be told whether the error stopped"
+        )),
+    }
 }
 
 /// How the log analyzer is doing for one AWS account, from its connection
@@ -619,7 +1013,8 @@ pub fn fix_state(
 }
 
 /// Pure: the status the Logs page shows: `new`, `acknowledged`, `fixing`,
-/// `fixed` or `ignored`.
+/// `stopped` (open, but the analyzer's checks say its error stopped), `fixed`
+/// or `ignored`.
 pub fn display_status(f: &Finding, fix: FixState) -> &'static str {
     if fix.is_open() {
         return "fixing";
@@ -630,13 +1025,31 @@ pub fn display_status(f: &Finding, fix: FixState) -> &'static str {
     if f.status == "dismissed" {
         return "ignored";
     }
+    // Open, but its error stopped: never New, whoever acknowledged it.
+    if f.stopped() {
+        return "stopped";
+    }
     if f.status == "approved" || !f.acknowledged_at.is_empty() {
         return "acknowledged";
     }
     "new"
 }
 
-pub const STATUSES: &[&str] = &["new", "acknowledged", "fixing", "fixed", "ignored"];
+pub const STATUSES: &[&str] = &[
+    "new",
+    "acknowledged",
+    "fixing",
+    "stopped",
+    "fixed",
+    "ignored",
+];
+
+/// Pure: the finding is a live problem a card or a count may call open: New
+/// or Acknowledged on the page. A stopped, fixing, fixed or ignored finding
+/// is not.
+pub fn is_open_problem(f: &Finding, fix: FixState) -> bool {
+    matches!(display_status(f, fix), "new" | "acknowledged")
+}
 
 // ─── The automatic-fix setting ──────────────────────────────────────────────
 
@@ -891,6 +1304,9 @@ pub enum Skip {
     /// The repo was worked out but not with high confidence: a person
     /// checks it. Carries the best guess (empty when none).
     RepoUnsure(String),
+    /// The evidence for the repo couldn't be weighed just now (the model
+    /// wasn't reachable): weighed again next sweep, nobody is asked.
+    RepoPending,
     /// Tried again after the quiet hours.
     QuietHours,
     AlreadyFixing,
@@ -908,6 +1324,10 @@ pub enum Skip {
     ForAPerson(String),
     /// AWS's side and still happening: tried again next sweep.
     Watching,
+    /// The analyzer's checks say the error stopped while the service kept
+    /// logging: nothing to fix now. Tried again if it comes back. What the
+    /// checks found ([`activity_words`]).
+    Stopped(String),
 }
 
 impl Skip {
@@ -924,7 +1344,11 @@ impl Skip {
                 "couldn't tell which repo this log group's code is in; choose one".into()
             }
             Skip::RepoUnsure(guess) => {
-                format!("not sure the repo is {guess}; check it and start the fix")
+                format!("the evidence is split on the repo (best guess {guess}); choose one")
+            }
+            Skip::RepoPending => {
+                "working out which repo this log group's code is in; trying again within the hour"
+                    .into()
             }
             Skip::QuietHours => "waiting for quiet hours to end".into(),
             Skip::AlreadyFixing => "already fixing".into(),
@@ -937,6 +1361,12 @@ impl Skip {
             Skip::Recovered(at) => format!("stopped on its own at {at}; nothing to change"),
             Skip::ForAPerson(why) => why.clone(),
             Skip::Watching => "on AWS's side; watching until it recovers".into(),
+            Skip::Stopped(what) if what.is_empty() => {
+                "the error stopped; a fix starts if it comes back".into()
+            }
+            Skip::Stopped(what) => {
+                format!("the error stopped ({what}); a fix starts if it comes back")
+            }
         }
     }
 
@@ -947,7 +1377,10 @@ impl Skip {
 
     /// `waiting` (tried again later) or `skipped` (left for a person).
     pub fn auto_status(&self) -> &'static str {
-        if matches!(self, Skip::QuietHours | Skip::Watching) {
+        if matches!(
+            self,
+            Skip::QuietHours | Skip::Watching | Skip::Stopped(_) | Skip::RepoPending
+        ) {
             "waiting"
         } else {
             "skipped"
@@ -984,6 +1417,12 @@ pub fn screen(cfg: &AutoFix, f: &Finding, now: DateTime<Utc>) -> Result<Option<S
     }
     if f.severity < p.min_severity {
         return Err(Skip::BelowSeverity);
+    }
+    // Its error stopped while the service kept logging: no run starts for a
+    // problem that isn't happening. It is looked at again every sweep, so a
+    // fix starts if it comes back.
+    if f.stopped() {
+        return Err(Skip::Stopped(activity_words(f).unwrap_or_default()));
     }
     if cfg.quiet_hours.is_some_and(|q| q.contains(now.hour())) {
         return Err(Skip::QuietHours);
@@ -1149,6 +1588,9 @@ pub fn ticket_body(f: &Finding, starter: &Starter, samples: &[String]) -> String
     }
     if !f.last_seen_at.is_empty() {
         data.push(format!("Last seen: {}", f.last_seen_at));
+    }
+    if let Some(words) = activity_words(f) {
+        data.push(format!("Still happening: {words}"));
     }
     data.push(String::new());
     data.push(format!("Summary: {}", f.summary));
@@ -1640,6 +2082,64 @@ pub async fn record_incident(
         .map_err(|e| e.to_string())
 }
 
+/// Keep the change that explains why a finding stopped ([`pick_change`]) on
+/// the finding, for the analyzer's resolve sweep and the page.
+pub async fn record_change(
+    dynamo: &DynamoClient,
+    insights_table: &str,
+    team_id: &str,
+    rec_id: &str,
+    change: &Change,
+) -> Result<(), String> {
+    let map: Item = [
+        ("kind", &change.kind),
+        ("repo", &change.repo),
+        ("at", &change.at),
+        ("title", &change.title),
+        ("url", &change.url),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), attr(v)))
+    .collect();
+    dynamo
+        .update_item()
+        .table_name(insights_table)
+        .key("pk", attr(team_id))
+        .key("sk", attr(&format!("{REC_PREFIX}{rec_id}")))
+        .update_expression("SET #c = :c")
+        .condition_expression("attribute_exists(pk)")
+        .expression_attribute_names("#c", "change")
+        .expression_attribute_values(":c", AttributeValue::M(map))
+        .send()
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// Keep the "which repo?" question an automatic fix waits on (the guess,
+/// the candidates and why) on the finding, so the page offers the choice in
+/// one click.
+pub async fn record_repo_ask(
+    dynamo: &DynamoClient,
+    insights_table: &str,
+    team_id: &str,
+    rec_id: &str,
+    ask: &serde_json::Value,
+) -> Result<(), String> {
+    dynamo
+        .update_item()
+        .table_name(insights_table)
+        .key("pk", attr(team_id))
+        .key("sk", attr(&format!("{REC_PREFIX}{rec_id}")))
+        .update_expression("SET repo_ask = :a")
+        .condition_expression("attribute_exists(pk)")
+        .expression_attribute_values(":a", attr(&ask.to_string()))
+        .send()
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
 /// The fix ticket's record, for the worker.
 pub async fn load_ticket(
     dynamo: &DynamoClient,
@@ -1691,9 +2191,22 @@ pub fn autofix_index() -> crate::settings_index::Spec<'static> {
     }
 }
 
-/// Teams whose automatic fixes are on: each indexed team's setting, read by
-/// key. This ran hourly as a scan of the whole settings table before.
+/// Teams whose automatic fixes are on ([`teams_with_setting`]).
 pub async fn teams_with_autofix(
+    dynamo: &DynamoClient,
+    settings_table: &str,
+) -> Result<Vec<(String, AutoFix)>, String> {
+    Ok(teams_with_setting(dynamo, settings_table)
+        .await?
+        .into_iter()
+        .filter(|(_, cfg)| cfg.enabled)
+        .collect())
+}
+
+/// Every team with an automatic-fix setting, on or off (the setting also
+/// holds the repo saved for each log group): each indexed team's setting,
+/// read by key. This ran hourly as a scan of the whole settings table before.
+pub async fn teams_with_setting(
     dynamo: &DynamoClient,
     settings_table: &str,
 ) -> Result<Vec<(String, AutoFix)>, String> {
@@ -1712,12 +2225,7 @@ pub async fn teams_with_autofix(
             None => {
                 crate::settings_index::remove(dynamo, settings_table, AUTOFIX_INDEX, &team).await
             }
-            Some(i) => {
-                let cfg = AutoFix::from_item(Some(i));
-                if cfg.enabled {
-                    out.push((team, cfg));
-                }
-            }
+            Some(i) => out.push((team, AutoFix::from_item(Some(i)))),
         }
     }
     Ok(out)
@@ -4142,5 +4650,441 @@ mod fix_card_tests {
             matches!(&m.blocks[1], Block::Text(t) if t.text.contains("The finding stays open") && t.text.contains("posted earlier"))
         );
         assert_eq!(m.buttons.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod activity_tests {
+    use super::*;
+    use serde_json::Value;
+
+    const TEAM: &str = "TEAM#t";
+
+    /// JSON as the analyzer's boto3 writes it to DynamoDB.
+    fn av(v: &Value) -> AttributeValue {
+        match v {
+            Value::String(s) => AttributeValue::S(s.clone()),
+            Value::Number(n) => AttributeValue::N(n.to_string()),
+            Value::Bool(b) => AttributeValue::Bool(*b),
+            Value::Array(a) => AttributeValue::L(a.iter().map(av).collect()),
+            Value::Object(o) => {
+                AttributeValue::M(o.iter().map(|(k, v)| (k.clone(), av(v))).collect())
+            }
+            Value::Null => AttributeValue::Null(true),
+        }
+    }
+
+    fn finding(fields: &Value) -> Finding {
+        let mut item: Item = fields
+            .as_object()
+            .unwrap()
+            .iter()
+            .filter(|(_, v)| !v.is_null() && v.as_str() != Some(""))
+            .map(|(k, v)| (k.clone(), av(v)))
+            .collect();
+        item.insert("pk".into(), attr(TEAM));
+        item.insert("sk".into(), attr("REC#r1"));
+        item.entry("status".into()).or_insert(attr("pending"));
+        Finding::from_item(TEAM, &item).unwrap()
+    }
+
+    fn at(t: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(t).unwrap().with_timezone(&Utc)
+    }
+
+    fn word(v: impl Serialize) -> String {
+        serde_json::to_value(v)
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn both_sides_agree_on_every_shared_case() {
+        // lambda/tests/test_log_dedup.py runs the same cases through
+        // lifecycle.activity_for and quiet_period: the analyzer's sweep and
+        // the page never disagree on whether a finding stopped or when it
+        // resolves.
+        let raw = include_str!("../tests/fixtures/finding_activity_cases.json");
+        let doc: Value = serde_json::from_str(raw).unwrap();
+        let cases = doc["cases"].as_array().unwrap();
+        assert!(cases.len() > 15);
+        let (mut states, mut bases) = (Vec::new(), Vec::new());
+        for c in cases {
+            let name = c["name"].as_str().unwrap();
+            let f = finding(c);
+            let a = f.activity();
+            assert_eq!(word(a.state), c["state"].as_str().unwrap(), "{name}");
+            assert_eq!(
+                a.quiet_checks,
+                c["quiet_checks"].as_u64().unwrap(),
+                "{name}"
+            );
+            assert_eq!(
+                a.normal_checks,
+                c["normal_checks"].as_u64().unwrap(),
+                "{name}"
+            );
+            let (days, basis) = quiet_period(&f);
+            assert_eq!(days, c["quiet_days"].as_u64().unwrap(), "{name}");
+            assert_eq!(word(basis), c["basis"].as_str().unwrap(), "{name}");
+            assert_eq!(f.quiet_days(), days, "{name}");
+            states.push(word(a.state));
+            bases.push(word(basis));
+        }
+        for s in ["happening", "stopped", "unknown"] {
+            assert!(states.iter().any(|x| x == s), "no case is {s}");
+        }
+        for b in ["default", "change", "returns"] {
+            assert!(bases.iter().any(|x| x == b), "no case resolves by {b}");
+        }
+    }
+
+    #[test]
+    fn the_thresholds_are_the_existing_rules() {
+        // Sooner on evidence is the existing floor, never under it.
+        assert_eq!(EVIDENCE_QUIET_DAYS, MIN_QUIET_DAYS);
+        assert_eq!((EVIDENCE_QUIET_DAYS, DEFAULT_QUIET_DAYS), (1, 3));
+        assert_eq!(CHANGE_BEFORE_HOURS, ANALYSIS_EVERY_HOURS);
+        // One analysis that saw nothing is never evidence: two is the
+        // smallest number that is.
+        assert_eq!(STOPPED_AFTER_CHECKS, 2);
+    }
+
+    fn check(at: &str, lines: u64, scanned: u64, minutes: u64) -> Check {
+        Check {
+            at: at.into(),
+            lines,
+            scanned: Some(scanned),
+            minutes,
+        }
+    }
+
+    /// The burst that stopped: 735 lines in one window, then four analyses
+    /// with none while the service wrote 70 lines a minute.
+    fn stopped() -> Finding {
+        Finding {
+            rec_id: "r1".into(),
+            status: "pending".into(),
+            severity: Severity::Critical,
+            title: "Search endpoint not found".into(),
+            source_log_group: "/ecs/prod-ledger-api".into(),
+            created_at: "2026-11-02T12:00:00Z".into(),
+            first_seen_at: "2026-11-02T11:40:00Z".into(),
+            last_seen_at: "2026-11-02T17:30:00Z".into(),
+            daily_lines: vec![Counted {
+                name: "2026-11-02".into(),
+                lines: 735,
+            }],
+            activity: vec![
+                check("2026-11-02T12:00:00Z", 735, 100_800, 1440),
+                check("2026-11-02T18:00:00Z", 0, 2_100, 30),
+                check("2026-11-03T00:00:00Z", 0, 27_300, 390),
+                check("2026-11-03T06:00:00Z", 0, 52_500, 750),
+                check("2026-11-03T12:00:00Z", 0, 77_700, 1110),
+            ],
+            ..Default::default()
+        }
+    }
+
+    fn merge(at: &str) -> Change {
+        Change {
+            kind: "merge".into(),
+            repo: "acme/ledger-api".into(),
+            at: at.into(),
+            title: "Point search at the new endpoint".into(),
+            url: "https://github.com/acme/ledger-api/commit/0a1b2c3".into(),
+        }
+    }
+
+    #[test]
+    fn a_stopped_finding_is_never_shown_or_counted_as_a_live_problem() {
+        let f = stopped();
+        assert!(f.stopped());
+        assert_eq!(display_status(&f, FixState::None), "stopped");
+        assert!(!is_open_problem(&f, FixState::None));
+        // Acknowledging doesn't make it live again.
+        let mut ack = f.clone();
+        ack.acknowledged_at = "2026-11-02T13:00:00Z".into();
+        assert_eq!(display_status(&ack, FixState::None), "stopped");
+        // A run or pull request that is open is still shown as fixing, a
+        // merged fix as fixed, an ignored one as ignored.
+        assert_eq!(display_status(&f, FixState::Running), "fixing");
+        assert_eq!(display_status(&f, FixState::Merged), "fixed");
+        let mut ignored = f.clone();
+        ignored.status = "dismissed".into();
+        assert_eq!(display_status(&ignored, FixState::None), "ignored");
+        assert!(!ignored.stopped());
+        // Still happening, or nobody can tell: it stays New and open.
+        let mut live = f.clone();
+        live.activity.truncate(2);
+        assert_eq!(display_status(&live, FixState::None), "new");
+        assert!(is_open_problem(&live, FixState::None));
+        let mut silent = f.clone();
+        for c in silent.activity.iter_mut().skip(1) {
+            c.scanned = Some(0);
+        }
+        assert_eq!(silent.activity().state, ActivityState::Unknown);
+        assert_eq!(display_status(&silent, FixState::None), "new");
+        assert!(is_open_problem(&silent, FixState::None));
+        // It came back: live again.
+        let mut back = f.clone();
+        back.activity
+            .push(check("2026-11-03T18:00:00Z", 3, 25_200, 360));
+        assert_eq!(display_status(&back, FixState::None), "new");
+        assert!(STATUSES.contains(&"stopped"));
+    }
+
+    #[test]
+    fn no_automatic_fix_starts_for_a_stopped_finding_until_it_comes_back() {
+        let cfg = AutoFix {
+            enabled: true,
+            enabled_at: "2026-11-01T00:00:00Z".into(),
+            ..Default::default()
+        };
+        let now = at("2026-11-03T13:00:00Z");
+        let f = stopped();
+        let skip = screen(&cfg, &f, now).unwrap_err();
+        assert!(matches!(skip, Skip::Stopped(_)));
+        assert_eq!(
+            skip.reason(),
+            "the error stopped (no matching line since Nov 2, 17:30 UTC: 4 analyses in a row found none while the service kept logging); a fix starts if it comes back"
+        );
+        // Kept on the finding, and looked at again every sweep.
+        assert!(skip.recorded());
+        assert_eq!(skip.auto_status(), "waiting");
+        let mut waiting = f.clone();
+        waiting.auto_status = "waiting".into();
+        assert!(matches!(screen(&cfg, &waiting, now), Err(Skip::Stopped(_))));
+        // Back again: the sweep may start its fix.
+        waiting
+            .activity
+            .push(check("2026-11-03T18:00:00Z", 9, 25_200, 360));
+        assert_eq!(screen(&cfg, &waiting, now), Ok(None));
+        // The team's own rules are still said first.
+        let mut low = f.clone();
+        low.severity = Severity::Info;
+        assert_eq!(screen(&cfg, &low, now), Err(Skip::BelowSeverity));
+        // A person's run on a stopped finding says what the checks found.
+        let body = ticket_body(&f, &Starter::Person("a@b.c".into()), &[]);
+        assert!(body.contains("Still happening: no matching line since Nov 2, 17:30 UTC"));
+        assert!(!ticket_body(&back_again(), &Starter::Auto, &[]).contains("Still happening"));
+    }
+
+    fn back_again() -> Finding {
+        let mut f = stopped();
+        f.activity
+            .push(check("2026-11-03T18:00:00Z", 9, 25_200, 360));
+        f
+    }
+
+    #[test]
+    fn evidence_resolves_a_burst_after_a_day_and_the_page_shows_that_date() {
+        let mut f = stopped();
+        // Nothing changed in its repo: three days after its last line.
+        assert_eq!(quiet_period(&f), (3, QuietBasis::Default));
+        assert_eq!(f.resolves_at().as_deref(), Some("2026-11-05T17:30:00Z"));
+        // A change merged an hour before the last line: one day.
+        f.change = Some(merge("2026-11-02T16:30:00Z"));
+        assert_eq!(quiet_period(&f), (1, QuietBasis::Change));
+        assert_eq!(f.resolves_at().as_deref(), Some("2026-11-03T17:30:00Z"));
+        assert_eq!(
+            f.explaining_change().map(|c| c.repo.as_str()),
+            Some("acme/ledger-api")
+        );
+        assert_eq!(
+            resolve_state(&f, None, at("2026-11-03T13:00:00Z")),
+            Some(ResolveState::Scheduled {
+                at: "2026-11-03T17:30:00Z".into()
+            })
+        );
+        assert!(matches!(
+            resolve_state(&f, None, at("2026-11-03T18:10:00Z")),
+            Some(ResolveState::Due { .. })
+        ));
+        // The same change on an error that keeps coming back changes nothing.
+        f.last_resolved_at = "2026-10-29T12:00:00Z".into();
+        f.reopened_at = "2026-11-02T12:00:00Z".into();
+        assert_eq!(quiet_period(&f), (8, QuietBasis::Returns));
+        // Nor while the error is still happening.
+        let mut live = back_again();
+        live.change = Some(merge("2026-11-02T16:30:00Z"));
+        assert_eq!(quiet_period(&live), (3, QuietBasis::Default));
+    }
+
+    #[test]
+    fn the_change_is_the_one_that_landed_as_the_errors_stopped() {
+        let f = stopped();
+        let a = f.activity();
+        let c = |sha: &str, msg: &str, at: &str| (sha.to_string(), msg.to_string(), at.to_string());
+        let commits = vec![
+            c("f00", "Later cleanup", "2026-11-03T09:00:00Z"),
+            c(
+                "0a1",
+                "Point search at the new endpoint\n\nbody",
+                "2026-11-02T16:30:00Z",
+            ),
+            c("b22", "Bump a dependency", "2026-11-02T13:00:00Z"),
+            c("old", "Last week's work", "2026-10-28T10:00:00Z"),
+            c("new", "After the latest check", "2026-11-03T12:30:00Z"),
+        ];
+        let merges = merge_changes("acme/ledger-api", &commits);
+        let got = pick_change(&merges, &f.last_seen_at, &a).unwrap();
+        assert_eq!(got.kind, "merge");
+        assert_eq!(got.title, "Point search at the new endpoint\n\nbody");
+        assert_eq!(got.url, "https://github.com/acme/ledger-api/commit/0a1");
+        assert!(change_explains(&got, &f.last_seen_at, &a));
+        // Only later ones: the first after the last line.
+        let got = pick_change(&merges[..1], &f.last_seen_at, &a).unwrap();
+        assert_eq!(got.url, "https://github.com/acme/ledger-api/commit/f00");
+        // Nothing landed around then: no evidence, the default period stands.
+        assert_eq!(pick_change(&merges[3..], &f.last_seen_at, &a), None);
+        assert_eq!(pick_change(&[], &f.last_seen_at, &a), None);
+
+        // A production deploy on record says more than a merge: it is what
+        // reached the service.
+        let record = |repo: &str, at: &str, env: &str, outcome: &str, run: &str| -> Item {
+            [
+                ("repo", attr(repo)),
+                ("created_at", attr(at)),
+                ("environment", attr(env)),
+                ("outcome", attr(outcome)),
+                ("workflow", attr("Deploy production")),
+                ("run_id", AttributeValue::N(run.into())),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect()
+        };
+        let records = vec![
+            record(
+                "acme/Ledger-API",
+                "2026-11-02T17:05:00Z",
+                "production",
+                "succeeded",
+                "77",
+            ),
+            record(
+                "acme/ledger-api",
+                "2026-11-02T16:40:00Z",
+                "staging",
+                "succeeded",
+                "76",
+            ),
+            record(
+                "acme/ledger-api",
+                "2026-11-02T16:50:00Z",
+                "production",
+                "failed",
+                "75",
+            ),
+            record(
+                "acme/ledger-web",
+                "2026-11-02T17:10:00Z",
+                "production",
+                "succeeded",
+                "74",
+            ),
+        ];
+        let deploys = deploy_changes("acme/ledger-api", &records);
+        assert_eq!(
+            deploys,
+            vec![Change {
+                kind: "deploy".into(),
+                repo: "acme/ledger-api".into(),
+                at: "2026-11-02T17:05:00Z".into(),
+                title: "Deploy production".into(),
+                url: "https://github.com/acme/ledger-api/actions/runs/77".into(),
+            }]
+        );
+        let all: Vec<Change> = merges.iter().chain(&deploys).cloned().collect();
+        assert_eq!(
+            pick_change(&all, &f.last_seen_at, &a),
+            Some(deploys[0].clone())
+        );
+        // A deploy outside the time doesn't hide the merge that fits.
+        let mut late = deploys.clone();
+        late[0].at = "2026-11-04T00:00:00Z".into();
+        let all: Vec<Change> = merges.iter().chain(&late).cloned().collect();
+        assert_eq!(
+            pick_change(&all, &f.last_seen_at, &a).unwrap().kind,
+            "merge"
+        );
+    }
+
+    #[test]
+    fn a_change_is_looked_up_only_for_a_stopped_burst_with_a_known_repo() {
+        let mut cfg = AutoFix::default();
+        let f = stopped();
+        // No repo saved for the log group: nothing to look in.
+        assert_eq!(change_wanted(&f, &cfg), None);
+        cfg.overrides.push(GroupOverride {
+            log_group: f.source_log_group.clone(),
+            repo: "acme/ledger-api".into(),
+            ..Default::default()
+        });
+        // Looked up whether or not automatic fixes are on.
+        assert_eq!(change_wanted(&f, &cfg).as_deref(), Some("acme/ledger-api"));
+        // The repo its fix ran in wins over the saved one.
+        let mut fixed_in = f.clone();
+        fixed_in.fix_repo = "acme/ledger-web".into();
+        assert_eq!(
+            change_wanted(&fixed_in, &cfg).as_deref(),
+            Some("acme/ledger-web")
+        );
+        // Already explained, still happening, coming back, or not open.
+        let mut explained = f.clone();
+        explained.change = Some(merge("2026-11-02T16:30:00Z"));
+        assert_eq!(change_wanted(&explained, &cfg), None);
+        assert_eq!(change_wanted(&back_again(), &cfg), None);
+        let mut returner = f.clone();
+        returner.last_resolved_at = "2026-10-29T12:00:00Z".into();
+        returner.reopened_at = "2026-11-02T12:00:00Z".into();
+        assert_eq!(change_wanted(&returner, &cfg), None);
+        let mut resolved = f.clone();
+        resolved.status = "resolved".into();
+        assert_eq!(change_wanted(&resolved, &cfg), None);
+        // A stale change that no longer explains it is looked up again.
+        let mut stale = f.clone();
+        stale.change = Some(merge("2026-10-20T16:30:00Z"));
+        assert_eq!(
+            change_wanted(&stale, &cfg).as_deref(),
+            Some("acme/ledger-api")
+        );
+    }
+
+    #[test]
+    fn the_stored_checks_change_and_question_are_read() {
+        let f = finding(&serde_json::json!({
+            "last_seen_at": "2026-11-02T17:30:00+00:00",
+            "activity": [
+                {"at": "2026-11-02T12:00:00+00:00", "lines": 735, "scanned": 100800, "minutes": 1440},
+                {"at": "2026-11-02T18:00:00+00:00", "lines": 0},
+                {"lines": 0},
+                "junk",
+            ],
+            "change": {"kind": "merge", "repo": "acme/ledger-api", "at": "2026-11-02T16:30:00Z", "title": "t", "url": "u"},
+            "repo_ask": "{\"guess\":\"acme/ledger-api\"}",
+        }));
+        assert_eq!(f.activity.len(), 2);
+        assert_eq!(
+            f.activity[0],
+            check("2026-11-02T12:00:00+00:00", 735, 100_800, 1440)
+        );
+        assert_eq!((f.activity[1].scanned, f.activity[1].minutes), (None, 0));
+        assert_eq!(
+            f.change,
+            Some(merge("2026-11-02T16:30:00Z")).map(|mut c| {
+                c.title = "t".into();
+                c.url = "u".into();
+                c
+            })
+        );
+        assert_eq!(f.repo_ask, "{\"guess\":\"acme/ledger-api\"}");
+        // The latest check's volume is only shown when it was read.
+        let a = f.activity();
+        assert_eq!((a.scanned, a.minutes), (None, None));
+        assert_eq!(a.checked_at, "2026-11-02T18:00:00+00:00");
     }
 }

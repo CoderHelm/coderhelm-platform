@@ -1,8 +1,10 @@
 //! The Logs page: the log analyzer's findings in one list, with their fix runs.
 //!
 //! - `GET  /api/log-findings` — every finding with its status (new,
-//!   acknowledged, fixing, fixed, ignored), its fix run and pull request,
-//!   counts per status and whether AWS is connected.
+//!   acknowledged, fixing, stopped, fixed, ignored), whether its error is
+//!   still happening (`activity`), its fix run and pull request, counts per
+//!   status and whether AWS is connected. A finding whose error stopped while
+//!   the service kept logging is `stopped`, never `new`.
 //! - `GET  /api/log-findings/:id/samples` — a few recent lines of the error,
 //!   read live with the team's log reader role and scrubbed; never stored.
 //! - `POST /api/log-findings/:id/fix` — start a fix run (a person's "Create
@@ -127,8 +129,44 @@ pub fn finding_json(
             "started_at": f.fix_started_at,
         })
     });
-    let auto = (!f.auto_status.is_empty())
-        .then(|| json!({ "status": f.auto_status, "reason": f.auto_reason }));
+    // What the analyzer's checks say about an open finding: still
+    // happening, stopped, or can't tell, with the change that explains a stop.
+    let open = f.status == "pending" && f.merged_into.is_empty();
+    let stopped = status == "stopped";
+    let activity = (open && !f.activity.is_empty()).then(|| {
+        let a = f.activity();
+        json!({
+            "state": a.state,
+            "quiet_checks": a.quiet_checks,
+            "normal_checks": a.normal_checks,
+            "checked_at": a.checked_at,
+            "scanned": a.scanned,
+            "minutes": a.minutes,
+            "change": f.explaining_change(),
+        })
+    });
+    // A reason recorded while the error was live ("choose a repo") is stale
+    // once it stopped: the row says it stopped and that a fix starts if it
+    // comes back.
+    let auto = if stopped && matches!(f.auto_status.as_str(), "skipped" | "waiting") {
+        Some(json!({
+            "status": "waiting",
+            "reason": Skip::Stopped(lf::activity_words(f).unwrap_or_default()).reason(),
+        }))
+    } else {
+        (!f.auto_status.is_empty())
+            .then(|| json!({ "status": f.auto_status, "reason": f.auto_reason }))
+    };
+    // The "which repo?" question an automatic fix waits on, while it is
+    // still a question: the finding is live, nothing started and no repo was
+    // saved for its log group since.
+    let repo_ask = (matches!(status, "new" | "acknowledged")
+        && f.auto_status == "skipped"
+        && f.fix_ticket_id.is_empty()
+        && mapped.is_none())
+    .then(|| serde_json::from_str::<Value>(&f.repo_ask).ok())
+    .flatten()
+    .filter(|v| v["candidates"].as_array().is_some_and(|c| !c.is_empty()));
     json!({
         "rec_id": f.rec_id,
         "title": f.title,
@@ -151,6 +189,8 @@ pub fn finding_json(
         "console_url": region.and_then(|r| lf::console_url(r, &f.source_log_group)),
         "fix": fix_json,
         "auto": auto,
+        "activity": activity,
+        "repo_ask": repo_ask,
         // Where the lines are: this group's streams and the other groups the
         // same error was counted in, never a list of the account's groups.
         "log_streams": f.log_streams.iter().map(|c| json!({ "log_stream": c.name, "lines": c.lines })).collect::<Vec<_>>(),
@@ -160,6 +200,9 @@ pub fn finding_json(
         // Open: when it resolves on its own unless seen again. Resolved: when
         // and why the analyzer resolved it.
         "quiet_days": f.quiet_days(),
+        // Why that long: `default`, `returns` (it keeps coming back) or
+        // `change` (it stopped after a change in its repo, so sooner).
+        "quiet_basis": lf::quiet_period(f).1,
         "resolves_at": f.resolves_at(),
         "resolved_at": (!f.resolved_at.is_empty()).then_some(&f.resolved_at),
         "resolved_reason": (!f.resolved_reason.is_empty()).then_some(&f.resolved_reason),
@@ -1049,6 +1092,177 @@ mod tests {
         f.count_basis.clear();
         let row = finding_json(&f, lf::FixState::None, None, &AutoFix::default(), None);
         assert!(row["seen_count"].is_null());
+    }
+
+    fn check(at: &str, lines: u64, scanned: u64, minutes: u64) -> lf::Check {
+        lf::Check {
+            at: at.into(),
+            lines,
+            scanned: Some(scanned),
+            minutes,
+        }
+    }
+
+    /// A critical burst that stopped: three analyses in a row found no
+    /// matching line while the service kept logging. While it was live the
+    /// automatic fix asked which repo.
+    fn stopped() -> Finding {
+        let mut f = finding();
+        f.severity = lf::Severity::Critical;
+        f.last_seen_at = "2026-11-02T17:30:00Z".into();
+        f.activity = vec![
+            check("2026-11-02T12:00:00Z", 735, 100_800, 1440),
+            check("2026-11-02T18:00:00Z", 0, 2_100, 30),
+            check("2026-11-03T00:00:00Z", 0, 27_300, 390),
+            check("2026-11-03T06:00:00Z", 0, 52_500, 750),
+        ];
+        f.auto_status = "skipped".into();
+        f.auto_reason =
+            "the evidence is split on the repo (best guess acme/shop); choose one".into();
+        f.repo_ask = json!({
+            "guess": "acme/shop",
+            "reason": "Two repos name this service.",
+            "candidates": [
+                { "repo": "acme/shop", "reason": "From the service's name" },
+                { "repo": "acme/shop-infra", "reason": "From code that names the resource" },
+            ],
+        })
+        .to_string();
+        f
+    }
+
+    #[test]
+    fn a_stopped_finding_reads_as_stopped_with_its_evidence() {
+        let f = stopped();
+        let row = finding_json(&f, lf::FixState::None, None, &AutoFix::default(), None);
+        // Never New, and the severity is still there for the page to mute.
+        assert_eq!(row["status"], "stopped");
+        assert_eq!(row["severity"], "critical");
+        assert_eq!(
+            row["activity"],
+            json!({
+                "state": "stopped",
+                "quiet_checks": 3,
+                "normal_checks": 3,
+                "checked_at": "2026-11-03T06:00:00Z",
+                "scanned": 52_500,
+                "minutes": 750,
+                "change": null,
+            })
+        );
+        // When it closes unless seen again: the default, three days on.
+        assert_eq!(row["quiet_basis"], "default");
+        assert_eq!(row["resolves_at"], "2026-11-05T17:30:00Z");
+        // The question asked while it was live is not put to anyone now.
+        assert!(row["repo_ask"].is_null());
+        assert_eq!(row["auto"]["status"], "waiting");
+        let reason = row["auto"]["reason"].as_str().unwrap();
+        assert!(reason.starts_with("the error stopped (no matching line since Nov 2, 17:30 UTC"));
+        assert!(!reason.contains("choose"));
+        // With a change in its repo as it stopped: a day, and the change shown.
+        let mut explained = f.clone();
+        explained.change = Some(lf::Change {
+            kind: "merge".into(),
+            repo: "acme/shop".into(),
+            at: "2026-11-02T16:30:00Z".into(),
+            title: "Point search at the new endpoint".into(),
+            url: "https://github.com/acme/shop/commit/0a1b2c3".into(),
+        });
+        let row = finding_json(
+            &explained,
+            lf::FixState::None,
+            None,
+            &AutoFix::default(),
+            None,
+        );
+        assert_eq!(row["quiet_basis"], "change");
+        assert_eq!(row["quiet_days"], 1);
+        assert_eq!(row["resolves_at"], "2026-11-03T17:30:00Z");
+        assert_eq!(row["activity"]["change"]["repo"], "acme/shop");
+        assert_eq!(
+            row["activity"]["change"]["title"],
+            "Point search at the new endpoint"
+        );
+        // A stopped finding is its own count, never one of the new ones.
+        assert!(lf::STATUSES.contains(&"stopped"));
+        assert!(matches(
+            &row,
+            &ListQuery {
+                status: Some("stopped".into()),
+                ..Default::default()
+            }
+        ));
+        assert!(!matches(
+            &row,
+            &ListQuery {
+                status: Some("new,acknowledged".into()),
+                ..Default::default()
+            }
+        ));
+    }
+
+    #[test]
+    fn a_live_finding_keeps_its_state_and_offers_the_repo_choice() {
+        // Still happening: one analysis without a line is not evidence.
+        let mut live = stopped();
+        live.activity.truncate(2);
+        let row = finding_json(&live, lf::FixState::None, None, &AutoFix::default(), None);
+        assert_eq!(row["status"], "new");
+        assert_eq!(row["activity"]["state"], "happening");
+        assert_eq!(row["auto"]["status"], "skipped");
+        // The question is offered with its candidates, best first.
+        assert_eq!(row["repo_ask"]["guess"], "acme/shop");
+        assert_eq!(row["repo_ask"]["candidates"][1]["repo"], "acme/shop-infra");
+        // Answered (a repo saved for the log group, or a fix started): gone.
+        let cfg = AutoFix {
+            overrides: vec![lf::GroupOverride {
+                log_group: live.source_log_group.clone(),
+                repo: "acme/shop".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let row = finding_json(&live, lf::FixState::None, None, &cfg, None);
+        assert!(row["repo_ask"].is_null());
+        let mut started = live.clone();
+        started.fix_ticket_id = "LOG-ABCDEF12".into();
+        let row = finding_json(
+            &started,
+            lf::FixState::Running,
+            None,
+            &AutoFix::default(),
+            None,
+        );
+        assert!(row["repo_ask"].is_null());
+        // The service itself went quiet: nobody can tell, so it stays New.
+        let mut silent = stopped();
+        for c in silent.activity.iter_mut().skip(1) {
+            c.scanned = Some(0);
+        }
+        let row = finding_json(&silent, lf::FixState::None, None, &AutoFix::default(), None);
+        assert_eq!(row["status"], "new");
+        assert_eq!(row["activity"]["state"], "unknown");
+        // A finding stored before checks were kept says nothing about it.
+        let row = finding_json(
+            &finding(),
+            lf::FixState::None,
+            None,
+            &AutoFix::default(),
+            None,
+        );
+        assert!(row["activity"].is_null());
+        // A resolved one has no activity to show either.
+        let mut resolved = stopped();
+        resolved.status = "resolved".into();
+        let row = finding_json(
+            &resolved,
+            lf::FixState::None,
+            None,
+            &AutoFix::default(),
+            None,
+        );
+        assert_eq!(row["status"], "fixed");
+        assert!(row["activity"].is_null());
     }
 
     #[test]

@@ -100,7 +100,13 @@ class FakeInsights:
             else:
                 row.append({"field": "sample", "value": a["sample"]})
             rows.append(row)
-        self.results[qid] = {"status": "Complete", "results": rows}
+        # Insights reports every line it read in the groups and window,
+        # whatever the filter kept.
+        scanned = sum(e[4] for e in self.events if e[0] in groups and startTime <= e[2] <= endTime)
+        self.results[qid] = {
+            "status": "Complete", "results": rows,
+            "statistics": {"recordsMatched": float(sum(a["n"] for a in agg.values())), "recordsScanned": float(scanned)},
+        }
         return {"queryId": qid}
 
     def get_query_results(self, queryId):

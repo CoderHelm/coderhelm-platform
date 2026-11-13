@@ -14,7 +14,9 @@ from test_log_attribution import ACCOUNT, NOW, FakeInsights, Patch, Table
 
 import merge_duplicates as M
 
-QUIET_CASES = __import__("pathlib").Path(__file__).resolve().parents[2] / "services/common/tests/fixtures/quiet_days_cases.json"
+FIXTURES = __import__("pathlib").Path(__file__).resolve().parents[2] / "services/common/tests/fixtures"
+QUIET_CASES = FIXTURES / "quiet_days_cases.json"
+ACTIVITY_CASES = FIXTURES / "finding_activity_cases.json"
 
 A, F, L = h.attribution, h.fingerprint, h.lifecycle
 
@@ -353,6 +355,223 @@ class Lifecycle(unittest.TestCase):
         for d in range(40):
             long = L.add_history(long, f"2026-09-{d:02d}", 1)
         self.assertEqual(len(long), L.HISTORY_DAYS)
+
+
+DNS = "getaddrinfo ENOTFOUND search.ledger.internal"
+
+
+def dns_line(i):
+    return f"2026-11-02T05:{i % 60:02d}:11.123Z\treq-{i}\tERROR\tSearch failed: Error: {DNS}"
+
+
+class Activity(unittest.TestCase):
+    """Whether a finding is still happening, and resolving sooner on evidence."""
+
+    def finding(self, last_ago_hours, **kw):
+        last = datetime.fromtimestamp(NOW - int(last_ago_hours * 3600), tz=timezone.utc).isoformat()
+        return {"rec_id": "d1", "sk": "REC#d1", "status": "pending", "severity": "critical",
+                "source_log_group": API, "source_account_id": ACCOUNT, "error_pattern": DNS,
+                "last_seen_at": last, "first_seen_at": last,
+                "daily_lines": [{"day": "2026-11-02", "lines": 735}], **kw}
+
+    def traffic(self, hours=24, per_hour=4200):
+        """The service's ordinary lines, every hour of the window."""
+        return [(API, "api/api/c3", NOW - h * 3600 - 60, "GET /health 200", per_hour) for h in range(hours)]
+
+    def check(self, item, events, seen=(), skip=(), window_hours=24):
+        cw, t = FakeInsights(events), Table()
+        with Patch(aws_insights_table=t):
+            n = h.check_quiet("TEAM#t", [item], set(seen), cw, (NOW - window_hours * 3600, NOW), skip)
+        return n, t, cw
+
+    def test_both_sides_agree_on_every_shared_case(self):
+        # services/common/src/log_findings.rs runs the same cases: the page,
+        # the cards and the automatic sweep read what this sweep decides.
+        cases = json.load(open(ACTIVITY_CASES))["cases"]
+        self.assertGreater(len(cases), 15)
+        for c in cases:
+            item = {k: c[k] for k in ("last_seen_at", "daily_lines", "last_resolved_at", "reopened_at", "activity", "change") if c[k]}
+            a = L.activity_for(item)
+            self.assertEqual(
+                (a["state"], a["quiet_checks"], a["normal_checks"]),
+                (c["state"], c["quiet_checks"], c["normal_checks"]), c["name"],
+            )
+            self.assertEqual(L.quiet_period(item), (c["quiet_days"], c["basis"]), c["name"])
+        # Every state and every basis is exercised.
+        self.assertEqual({c["state"] for c in cases}, {"happening", "stopped", "unknown"})
+        self.assertEqual({c["basis"] for c in cases}, {"default", "change", "returns"})
+
+    def test_the_thresholds_come_from_the_existing_rules(self):
+        self.assertEqual(L.VOLUME_FACTOR, h.WATCH_FACTOR)
+        self.assertEqual(L.EVIDENCE_QUIET_DAYS, L.MIN_QUIET_DAYS)
+        self.assertEqual(L.EVIDENCE_QUIET_DAYS * 24, h.LOOKBACK_HOURS)
+        self.assertEqual(L.ACTIVITY_KEEP, L.DEFAULT_QUIET_DAYS * 24 // L.ANALYSIS_EVERY_HOURS)
+        self.assertEqual(L.CHANGE_BEFORE_HOURS, L.ANALYSIS_EVERY_HOURS)
+        self.assertGreater(L.STOPPED_AFTER_CHECKS, 1)
+
+    def test_a_query_says_how_many_lines_it_read(self):
+        cw = FakeInsights(self.traffic(hours=2) + [(API, "api/api/c3", NOW - 600, dns_line(1), 7)])
+        got = A.check_group(cw, API, DNS, NOW - 3 * 3600, NOW)
+        self.assertEqual((got["count"], got["scanned"], got["minutes"]), (7, 8407, 180))
+        # No matching line is still an answer, with the volume beside it.
+        got = A.check_group(cw, API, "no such text here", NOW - 3 * 3600, NOW)
+        self.assertEqual((got["count"], got["scanned"]), (0, 8407))
+        # Older fakes and a reply without statistics: the volume is unknown, never zero.
+        self.assertIsNone(A.check_group(None, API, DNS, 0, 60, run=lambda *_a: [])["scanned"])
+        self.assertIsNone(A.scanned_of({"status": "Complete"}))
+
+    def test_an_unsighted_finding_is_counted_not_assumed_quiet(self):
+        # The model said nothing about it this run. Its own literal is counted
+        # on its own group since its last line: zero, while the service logged.
+        item = self.finding(last_ago_hours=9)
+        n, t, cw = self.check(item, self.traffic())
+        self.assertEqual(n, 1)
+        (u,) = t.updates
+        self.assertEqual((u["Key"]["sk"], u["UpdateExpression"]), ("REC#d1", "SET #act = :a"))
+        self.assertEqual(u["ExpressionAttributeNames"], {"#s": "status", "#act": "activity"})
+        self.assertEqual(u["ExpressionAttributeValues"][":pending"], "pending")
+        (c,) = u["ExpressionAttributeValues"][":a"]
+        self.assertEqual((c["lines"], c["scanned"]), (0, 9 * 4200))
+        self.assertIn(c["minutes"], (539, 540))
+        # One query, on that group alone, starting after the last line.
+        ((groups, query, start, end),) = cw.queries
+        self.assertEqual((groups, end), ((API,), NOW))
+        self.assertIn(f'like "{DNS}"', query)
+        self.assertEqual(start, NOW - 9 * 3600 + 1)
+        # The analyzer's own copy carries it for the resolve sweep.
+        self.assertEqual(item["activity"], [c])
+
+    def test_lines_the_model_missed_keep_it_happening(self):
+        item = self.finding(last_ago_hours=9)
+        _, t, _ = self.check(item, self.traffic() + [(API, "api/api/c3", NOW - 1800, dns_line(2), 3)])
+        self.assertEqual(t.updates[0]["ExpressionAttributeValues"][":a"][0]["lines"], 3)
+        self.assertEqual(L.activity_for(item)["state"], "happening")
+
+    def test_what_cannot_be_checked_records_nothing(self):
+        # Seen this run, its group's query failed, ignored, resolved, merged,
+        # no usable literal: none is checked.
+        for item, kw in [
+            (self.finding(9), {"seen": {"d1"}}),
+            (self.finding(9), {"skip": {API}}),
+            (self.finding(9, status="dismissed"), {}),
+            (self.finding(9, status="resolved"), {}),
+            (self.finding(9, merged_into="x"), {}),
+            (self.finding(9, error_pattern="ERR"), {}),
+        ]:
+            n, t, cw = self.check(item, self.traffic(), **kw)
+            self.assertEqual((n, t.updates, cw.queries), (0, [], []), (item, kw))
+        # A query that fails is not zero lines.
+        item = self.finding(9)
+        cw, t = FakeInsights(self.traffic(), fail_on=("ENOTFOUND",)), Table()
+        with Patch(aws_insights_table=t):
+            self.assertEqual(h.check_quiet("TEAM#t", [item], set(), cw, (NOW - 86400, NOW)), 0)
+        self.assertEqual((t.updates, item.get("activity")), ([], None))
+
+    def test_checks_are_capped_newest_first_and_history_is_bounded(self):
+        items = [dict(self.finding(1 + i), rec_id=f"r{i}", sk=f"REC#r{i}") for i in range(h.MAX_QUIET_CHECKS + 5)]
+        cw, t = FakeInsights(self.traffic()), Table()
+        with Patch(aws_insights_table=t):
+            n = h.check_quiet("TEAM#t", list(reversed(items)), set(), cw, (NOW - 86400, NOW))
+        self.assertEqual(n, h.MAX_QUIET_CHECKS)
+        self.assertEqual(t.updates[0]["Key"]["sk"], "REC#r0")
+        # And by time: past the limit no further check is made this run.
+        cw, t = FakeInsights(self.traffic()), Table()
+        with Patch(aws_insights_table=t, QUIET_CHECK_BUDGET_SECS=0):
+            self.assertEqual(h.check_quiet("TEAM#t", items, set(), cw, (NOW - 86400, NOW)), 0)
+        self.assertEqual((t.updates, cw.queries), ([], []))
+        # The limit and the one check that may be under way at it fit the
+        # function's ten minutes with room for the analysis itself.
+        self.assertLess(h.QUIET_CHECK_BUDGET_SECS + h.QUIET_CHECK_WAIT_SECS, 5 * 60)
+        kept = []
+        for i in range(L.ACTIVITY_KEEP + 4):
+            kept = L.add_check(kept, f"2026-11-0{1 + i // 10}T0{i % 10}:00:00+00:00", 0, 10, 360)
+        self.assertEqual(len(kept), L.ACTIVITY_KEEP)
+
+    def test_a_sighting_records_its_check(self):
+        events = self.traffic() + [(API, "api/api/c3", NOW - 7200 + i, dns_line(i), 5) for i in range(3)]
+        words = {"title": "Search endpoint not found", "cite": "ENOTFOUND", "pattern": DNS}
+        _, t, _ = run(events, words, [])
+        (first,) = t.puts[0]["activity"]
+        self.assertEqual((first["lines"], first["scanned"], first["minutes"]), (15, 24 * 4200 + 15, 1440))
+        # Seen again in the next run with nothing new: a check with no lines.
+        item = stored(t.puts[0])
+        _, t2, _ = run(events, words, [item])
+        (u,) = [u for u in t2.updates if ":act" in u["ExpressionAttributeValues"]]
+        self.assertIn("#act = :act", u["UpdateExpression"])
+        self.assertEqual(u["ExpressionAttributeNames"]["#act"], "activity")
+        checks = u["ExpressionAttributeValues"][":act"]
+        self.assertEqual([c["lines"] for c in checks], [15, 0])
+        self.assertGreater(checks[1]["scanned"], 0)
+
+    def stopped(self, last_ago_hours, **kw):
+        """The burst, then every 6-hourly analysis since found nothing while
+        the service logged as usual."""
+        item = self.finding(last_ago_hours, **kw)
+        at = lambda hours: datetime.fromtimestamp(NOW - int(hours * 3600), tz=timezone.utc).isoformat()
+        checks = [{"at": at(last_ago_hours + 1), "lines": 735, "scanned": 100800, "minutes": 1440}]
+        hours = last_ago_hours - 5
+        while hours > 0:
+            checks.append({"at": at(hours), "lines": 0, "scanned": 25200, "minutes": 360})
+            hours -= 6
+        item["activity"] = checks[-L.ACTIVITY_KEEP:]
+        return item
+
+    def change(self, hours_ago):
+        return {"kind": "merge", "repo": "acme/ledger-api", "title": "Point search at the new endpoint",
+                "at": datetime.fromtimestamp(NOW - int(hours_ago * 3600), tz=timezone.utc).isoformat()}
+
+    def resolve(self, item):
+        t = Table()
+        with Patch(aws_insights_table=t, emit_event=lambda *_a, **_k: None):
+            h.resolve_stale_recommendations("TEAM#t", [item], set())
+        return [u["ExpressionAttributeValues"] for u in t.updates if ":s" in u["ExpressionAttributeValues"]]
+
+    def test_a_burst_that_stopped_after_a_change_resolves_after_a_day_with_the_evidence(self):
+        # 35 hours without a line; a change merged an hour before the last one.
+        item = self.stopped(35, change=self.change(36))
+        self.assertEqual(L.activity_for(item)["state"], "stopped")
+        (vals,) = self.resolve(item)
+        self.assertEqual((vals[":s"], vals[":q"]), ("resolved", 1))
+        self.assertTrue(vals[":r"].startswith("Resolved: no new lines for 1 day. It stopped after a change merged in acme/ledger-api (Point search at the new endpoint) on "), vals[":r"])
+        self.assertIn("analyses in a row since found no matching line while the service kept logging", vals[":r"])
+        # A production deploy on record reads as one.
+        deployed = self.stopped(35, change=dict(self.change(36), kind="deploy", title="Deploy production"))
+        (vals,) = self.resolve(deployed)
+        self.assertIn("It stopped after a deploy of acme/ledger-api (Deploy production) on ", vals[":r"])
+
+    def test_without_the_evidence_it_waits_the_default_period(self):
+        # Stopped, but nothing changed in its repo: three days, as before.
+        self.assertEqual(self.resolve(self.stopped(35)), [])
+        # A change, but only 20 hours quiet: the floor is a day.
+        self.assertEqual(self.resolve(self.stopped(20, change=self.change(21))), [])
+        # A change, but the service itself went quiet: nobody can tell.
+        silent = self.stopped(35, change=self.change(36))
+        for c in silent["activity"][1:]:
+            c["scanned"] = 0
+        self.assertEqual(L.activity_for(silent)["state"], "unknown")
+        self.assertEqual(self.resolve(silent), [])
+        # Past the default period it resolves with the plain reason.
+        (vals,) = self.resolve(self.stopped(73))
+        self.assertEqual(vals[":r"], "Resolved: no new lines for 3 days")
+
+    def test_an_error_that_keeps_coming_back_keeps_its_longer_period(self):
+        item = self.stopped(35, change=self.change(36),
+                            last_resolved_at=iso_ago(days=6), reopened_at=iso_ago(days=2))
+        self.assertEqual(L.quiet_period(item), (8, "returns"))
+        self.assertEqual(self.resolve(item), [])
+
+    def test_seen_again_after_an_early_resolve_reopens_and_is_happening(self):
+        events = self.traffic() + [(API, "api/api/c3", NOW - 600, dns_line(1), 4)]
+        item = self.stopped(35, change=self.change(36), status="resolved", resolved_at=iso_ago(hours=5),
+                            fingerprint="", signature_hashes=[])
+        words = {"title": "Search endpoint not found", "cite": "ENOTFOUND", "pattern": DNS}
+        reported, t, _ = run(events, words, [item])
+        self.assertEqual((reported, len(t.puts)), (1, 0))
+        (u,) = [u for u in t.updates if "#s = :open" in u["UpdateExpression"]]
+        self.assertEqual(u["ExpressionAttributeValues"][":act"][-1]["lines"], 4)
+        self.assertEqual(L.activity_for(item)["state"], "happening")
+        # Back from a silence: the longer period, whatever changed before.
+        self.assertEqual(L.quiet_period(item)[1], "returns")
 
 
 class MultiGroupAttribution(unittest.TestCase):
