@@ -1315,6 +1315,7 @@ pub mod security_fixes;
 #[cfg(test)]
 mod selfhost_links;
 mod series;
+pub(crate) mod settle;
 pub mod setup;
 pub mod skill_compat;
 pub mod skill_suggest;
@@ -6591,6 +6592,7 @@ async fn run_passes(
             &pr::Proof {
                 evidence: &opening_evidence.for_pr(),
                 gaps: &proof::gaps_section(&known_open),
+                settled: "",
                 unfinished: "",
                 manual: "",
                 ci: &opening_evidence.ci_commands,
@@ -6824,6 +6826,40 @@ async fn run_passes(
     // What the stop judge assumed instead of asking: an Open item a person
     // corrects if it's wrong.
     gaps.extend(stop_judge::assumptions(state, &msg.team_id, run_id).await);
+    // --- Settle: what CoderHelm can run itself is run, never listed ---
+    // A check an item waits on, the package manager's audit after a change
+    // to the dependencies, a check the coder's step had no time for: each
+    // runs in the sandbox with a full window, in a fresh step when this one
+    // has too little left. Only what a result didn't settle is written.
+    let (gaps, settled) = match settle::run(
+        &work,
+        &gaps,
+        triage_result.intent,
+        pr_result.pr_number,
+        &mut evidence,
+        usage,
+        has_time,
+    )
+    .await
+    {
+        settle::Ran::Settled(s, rec) => (s.open.clone(), settle::settled_section(&s, &rec)),
+        settle::Ran::Again(why) => {
+            match settle_in_fresh_step(state, msg, run_id, &branch_name, &carry, &why, usage).await
+            {
+                Handoff::Continued => {
+                    close_memory(state, agent_memory.take()).await;
+                    return Ok(());
+                }
+                Handoff::Stopped(reason) => {
+                    warn!(run_id, reason = %reason, "Settle: the run couldn't go on in a fresh step; what is open is written as it stands");
+                    let (s, rec) =
+                        settle::finish(&work, &gaps, triage_result.intent, &mut evidence).await;
+                    (s.open.clone(), settle::settled_section(&s, &rec))
+                }
+            }
+        }
+    };
+    let items_head = work.head().await;
     pr::apply_checks(
         state,
         msg,
@@ -6833,7 +6869,8 @@ async fn run_passes(
         pr_result.pr_number,
         &pr::Proof {
             evidence: &evidence.for_pr(),
-            gaps: &proof::gaps_section(&gaps),
+            gaps: &settle::stamp(&proof::gaps_section(&gaps), &items_head),
+            settled: &settled,
             unfinished: &unfinished,
             manual: &proof::manual_steps(&gaps),
             ci: &evidence.ci_commands,
@@ -7074,6 +7111,33 @@ async fn hand_off_at(
             .into())
         }
     }
+}
+
+/// The settle stage goes on in a fresh step at the checks: the checkpoint
+/// names the gate, and the step's mark starts over (a step that waited for
+/// a sandbox window is not one that made no progress). Never an error: a
+/// run that can't continue writes its open items as they stand.
+async fn settle_in_fresh_step(
+    state: &WorkerState,
+    msg: &TicketMessage,
+    run_id: &str,
+    branch: &str,
+    carry: &steps::Carry,
+    why: &str,
+    usage: &TokenUsage,
+) -> Handoff {
+    save_checkpoint(state, &msg.team_id, run_id, "implement", branch, 0, usage).await;
+    steps::save_gate(
+        state,
+        &msg.team_id,
+        run_id,
+        steps::Gate::Checks,
+        Some(carry),
+    )
+    .await;
+    steps::save_mark(state, &msg.team_id, run_id, "", 0, 0).await;
+    let from = Some(("implement".to_string(), branch.to_string(), 0u8));
+    try_auto_continue(state, msg, run_id, &from, &["implement"], false, why).await
 }
 
 /// A finished run's checks, again, in a fresh step of the run that resumes
@@ -7930,6 +7994,7 @@ async fn run_repo_pipeline(
             &pr::Proof {
                 evidence: &opening_evidence.for_pr(),
                 gaps: &proof::gaps_section(&known_open),
+                settled: "",
                 unfinished: "",
                 manual: "",
                 ci: &opening_evidence.ci_commands,
@@ -8040,6 +8105,29 @@ async fn run_repo_pipeline(
         }
     };
     gaps.extend(stop_judge::assumptions(state, &msg.team_id, run_id).await);
+    // Settle, as the single-repository path does. A run across repositories
+    // has no step that resumes one repository at its checks, so what needs
+    // a fresh step is written as it stands.
+    let triage_intent = repo_plan.fix.as_ref().map(|d| d.intent).unwrap_or_default();
+    let (s, rec) = match settle::run(
+        &work,
+        &gaps,
+        triage_intent,
+        pr_result.pr_number,
+        &mut evidence,
+        usage,
+        || has_time_for_remediation(start),
+    )
+    .await
+    {
+        settle::Ran::Settled(s, rec) => (*s, rec),
+        settle::Ran::Again(_) => {
+            let (s, rec) = settle::finish(&work, &gaps, triage_intent, &mut evidence).await;
+            (*s, rec)
+        }
+    };
+    let (gaps, settled) = (s.open.clone(), settle::settled_section(&s, &rec));
+    let items_head = work.head().await;
     pr::apply_checks(
         state,
         msg,
@@ -8049,7 +8137,8 @@ async fn run_repo_pipeline(
         pr_result.pr_number,
         &pr::Proof {
             evidence: &evidence.for_pr(),
-            gaps: &proof::gaps_section(&gaps),
+            gaps: &settle::stamp(&proof::gaps_section(&gaps), &items_head),
+            settled: &settled,
             unfinished: &unfinished,
             manual: &proof::manual_steps(&gaps),
             ci: &evidence.ci_commands,

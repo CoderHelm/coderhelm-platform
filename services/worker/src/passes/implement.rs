@@ -750,6 +750,7 @@ pub async fn run(
             node_version,
             terraform_version,
             check_budget: std::sync::atomic::AtomicUsize::new(0),
+            locks_written_at: std::sync::Mutex::new(None),
             gen_edit_rejects: std::sync::Mutex::new(std::collections::HashMap::new()),
             deadline,
             policy: Some(crate::agent::policy::gate(
@@ -1186,6 +1187,8 @@ pub async fn run(
             // Read from the diff when the change is judged.
             environments: Vec::new(),
             data_change: false,
+            // Run by the settle stage, after the coder.
+            audits: Vec::new(),
         },
     })
 }
@@ -1402,6 +1405,14 @@ fn run_checks_tool() -> ToolDefinition {
     }
 }
 
+/// Whether the lockfiles already match the branch at `head`: they were
+/// regenerated for exactly this head in this pass. A regeneration is a
+/// sandbox build of minutes, and two of them in one step once left no time
+/// for the checks.
+pub(crate) fn lockfiles_current(written_at: Option<&str>, head: &str) -> bool {
+    !head.is_empty() && written_at == Some(head)
+}
+
 /// Regenerates the repo's generated files (Sanity types, GraphQL types, etc.) by
 /// running its codegen in the sandbox and committing the changed files back —
 /// the capability that lets the agent finish tickets whose fix depends on
@@ -1419,7 +1430,9 @@ fn run_codegen_tool() -> ToolDefinition {
              (package.json, pyproject.toml, Cargo.toml, Gemfile, go.mod), every lockfile that \
              reads it (package-lock.json, pnpm-lock.yaml, yarn.lock, ...) is written again by \
              its own package manager and committed. Never write a lockfile yourself: such a \
-             write is refused. Takes no arguments. After it runs, call run_checks to confirm."
+             write is refused. Each call is a sandbox build of several minutes: make EVERY manifest \
+             change the task needs first, then call this ONCE. Takes no arguments. After it runs, \
+             call run_checks to confirm."
                 .to_string(),
         input_schema: json!({"type": "object", "properties": {}}),
     }
@@ -1738,6 +1751,9 @@ struct WriteToolExecutor<'a> {
     run_id: Option<String>,
     /// Bounds sandbox runs per pass; also the S3 key nonce per attempt.
     check_budget: std::sync::atomic::AtomicUsize,
+    /// The branch head the lockfiles were last regenerated for in this pass
+    /// (see [`lockfiles_current`]).
+    locks_written_at: std::sync::Mutex<Option<String>>,
     /// Per-path count of generated-file edit rejections. After MAX_GEN_REJECTS
     /// on the same path the guard opens (escape hatch) so a banner-carrying file
     /// that run_codegen cannot regenerate — or a false-positive banner match —
@@ -2618,8 +2634,14 @@ impl<'a> WriteToolExecutor<'a> {
         }
         if !sandbox.has_time(self.deadline) {
             note(LogOutcome::soft_fail("not run: not enough time left"));
+            // The check is owed, not dropped: the settle stage runs it in a
+            // step with a full window before the run finishes (`settle`).
+            self.sandbox_record.lock().unwrap().refused_for_time = true;
             return Ok(json!(
-                "Not enough time remains to run a sandbox build safely; finalize your changes now."
+                "This step has too little time left for a sandbox build. Finish your changes \
+                 now; CoderHelm runs the repository's checks on the branch in a fresh step \
+                 before the run finishes, and fixes what they find. Do not write that a check \
+                 passed: none has run on these changes."
             ));
         }
 
@@ -2833,6 +2855,20 @@ impl<'a> WriteToolExecutor<'a> {
                 }
             }
         }
+        // One regeneration per state of the branch: a lockfile written for
+        // this head is not written again until a manifest changes.
+        let head = self
+            .github
+            .get_ref(&self.owner, &self.repo, &self.branch)
+            .await
+            .unwrap_or_default();
+        if lockfiles_current(self.locks_written_at.lock().unwrap().as_deref(), &head) {
+            return Ok(Some(
+                "Lockfiles: already regenerated for the manifests as they are now; nothing \
+                 changed since. Call run_checks."
+                    .to_string(),
+            ));
+        }
         let attempt = self.check_budget.fetch_add(1, Ordering::SeqCst);
         if attempt >= MAX_CHECKS_PER_RUN {
             return Ok(Some(format!(
@@ -2860,6 +2896,19 @@ impl<'a> WriteToolExecutor<'a> {
             &cmd,
         )
         .await;
+        if repair.not_run.is_none() && repair.failed.is_empty() {
+            // The head the lockfiles now match: the commit that wrote them,
+            // or the one they already matched.
+            let now = if repair.written.is_empty() {
+                head.clone()
+            } else {
+                self.github
+                    .get_ref(&self.owner, &self.repo, &self.branch)
+                    .await
+                    .unwrap_or_default()
+            };
+            *self.locks_written_at.lock().unwrap() = Some(now).filter(|h| !h.is_empty());
+        }
         for p in &repair.written {
             self.files_modified.lock().unwrap().insert(p.clone());
             self.file_cache

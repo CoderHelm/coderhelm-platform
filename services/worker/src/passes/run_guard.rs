@@ -1052,6 +1052,10 @@ pub struct Ledger {
     /// kept.
     #[serde(default)]
     pub checks_version: String,
+    /// What the settle stage ran for the run's open items, and what it came
+    /// to (`settle::Record`).
+    #[serde(default)]
+    pub settle: super::settle::Record,
 }
 
 /// A record larger than this drops its longest text: DynamoDB's item limit is

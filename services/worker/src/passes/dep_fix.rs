@@ -472,7 +472,7 @@ pub struct Work<'a> {
 /// The steps a probe runs: the repository's install and type-check/build,
 /// its CI's lint and format commands, and its unit tests (all of them: a
 /// dependency touches every caller).
-async fn probe_steps(github: &GitHubClient, msg: &TicketMessage) -> Vec<Step> {
+pub(crate) async fn probe_steps(github: &GitHubClient, msg: &TicketMessage) -> Vec<Step> {
     let (o, n, base) = (&msg.repo_owner, &msg.repo_name, &msg.base_branch);
     let ci = checks::detect_ci(github, o, n, base).await;
     let mut steps = vec![];
