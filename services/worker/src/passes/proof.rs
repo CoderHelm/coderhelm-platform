@@ -151,6 +151,10 @@ pub struct RunEvidence {
     /// The diff changes stored data (see `feature::data_rules::touches_data`),
     /// read from it when the change is judged.
     pub data_change: bool,
+    /// What the package manager's audit came to on this head, one line per
+    /// lockfile, as the settle stage recorded it (`settle::Record`). Empty
+    /// when none ran.
+    pub audits: Vec<String>,
 }
 
 /// What the sandbox came to on the run's last check: the kinds of check it
@@ -161,6 +165,10 @@ pub struct SandboxRecord {
     pub passed: Vec<CheckKind>,
     /// Why the last attempt gave no result (the build's status and phases).
     pub failure: Option<String>,
+    /// The coder asked for a check and none started, because its step had
+    /// too little time left for a sandbox build. The check is owed: the
+    /// settle stage runs it in a step with a full window (`settle`).
+    pub refused_for_time: bool,
 }
 
 impl SandboxRecord {
@@ -249,6 +257,9 @@ impl RunEvidence {
             self.environments = later.environments;
         }
         self.data_change |= later.data_change;
+        if !later.audits.is_empty() {
+            self.audits = later.audits;
+        }
         let notes = later.notes.trim();
         if !notes.is_empty() {
             if self.notes.trim().is_empty() {
@@ -302,16 +313,20 @@ impl RunEvidence {
         let sources: Vec<&str> = self.sources.iter().map(String::as_str).collect();
         let lookups: Vec<&str> = self.lookups.iter().map(|l| l.line.as_str()).collect();
         let checks: Vec<&str> = self.checks.iter().map(String::as_str).collect();
+        let audits: Vec<String> = self.audits.iter().map(|a| format!("- {a}")).collect();
+        let audits: Vec<&str> = audits.iter().map(String::as_str).collect();
         format!(
             "## Data sources this team connected for this repository\n{}\n\
              ## Lookups the run made, and what came back\n{}\n\
              ## Checks run in the sandbox before the PR opened (recorded by CoderHelm, not the coder)\n{}\n\
+             ## Dependency audit run in the sandbox on this head (recorded by CoderHelm, not the coder)\n{}\n\
              ## Checks the repository's CI runs on this pull request\n{}\n\n\
              ## Environments the diff changes (read from its file paths)\n{}\n\n\
              ## The coder's evidence notes (they become the PR description's evidence)\n{}\n",
             list(&sources, "(none connected)"),
             list(&lookups, "(no lookups were made)"),
             list(&checks, "(no sandbox checks ran)"),
+            list(&audits, "(no audit ran)"),
             self.ci_for_judge(),
             match self.environments.as_slice() {
                 [] => "(none)".to_string(),
@@ -374,6 +389,11 @@ pub struct Finding {
     /// [`classify`]; never read from the judge.
     #[serde(skip)]
     pub ci_cmd: String,
+    /// Why the item is still open after the settle stage, set only by it
+    /// (`settle::apply`): the reason only a person can settle it, or what
+    /// CoderHelm ran and what came back. Never read from the judge.
+    #[serde(skip)]
+    pub needs: String,
 }
 
 /// What settles a finding.
@@ -467,7 +487,11 @@ impl Finding {
             (Settler::Ci, _) => " Settles when this PR's CI passes.".to_string(),
             _ => String::new(),
         };
-        format!("- **{}:** {what}{settle}", self.label())
+        let needs = match self.needs.trim() {
+            "" => String::new(),
+            n => format!(" {}.", n.trim_end_matches('.')),
+        };
+        format!("- **{}:** {what}{settle}{needs}", self.label())
     }
 }
 
@@ -659,7 +683,10 @@ pub const JUDGE_SYSTEM: &str = "You check a code change before its pull request 
      at DEBUG.\n\
      4. assumption: a miss when the change rests on an assumption (what another system sends, \
      what values a field takes, uniqueness, ordering) that nothing in the lookups or the code \
-     proves.\n\
+     proves. That the repository's own code still builds, type-checks or passes its tests (after \
+     a version bump, an override, a refactor), or that a document's claim about those checks is \
+     true, is never this point: a sandbox check listed as PASS proves it, and when none ran it \
+     is ci_pending (point 11) with the check's kind.\n\
      5. structured_field: a miss when the change reads another system's data by parsing a name, \
      title or description (a regex, a pattern, a substring) while the payload has a structured \
      field or flag (a boolean, a type, a quantity, an id) that says the same thing, or when it \
@@ -691,7 +718,10 @@ pub const JUDGE_SYSTEM: &str = "You check a code change before its pull request 
      command it runs, with an id like C1), its result settles it, so it is not a proof gap. Set \
      `check` to the kind, `command` to the command the check needs (e.g. `terraform fmt -check`), \
      and `ci` to the id of the CI command that runs it, or empty when CI runs none. A check the \
-     sandbox list shows as PASS is not a finding.\n\
+     sandbox list shows as PASS is not a finding. The package manager's audit of the \
+     dependencies is the `security` kind: advisory counts the dependency audit section gives \
+     are proven, and counts nobody ran an audit for are ci_pending with `check` \"security\", \
+     never an external_fact.\n\
      12. manual_check: something only a person can verify (in a real browser, on a device, a \
      manual click-through). Never a gap; it becomes a numbered step in the PR's Verification \
      section. Never a command the CI list shows: running that is CI's job, so it is ci_pending \
@@ -2956,6 +2986,7 @@ mod tests {
             ran: vec![CheckKind::Typecheck, CheckKind::Tests],
             passed: vec![CheckKind::Typecheck, CheckKind::Tests],
             failure: None,
+            refused_for_time: false,
         };
         let kinds: Vec<String> = recorded_gaps(&passed)
             .into_iter()

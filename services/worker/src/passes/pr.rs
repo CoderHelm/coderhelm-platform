@@ -34,6 +34,9 @@ pub struct Proof<'a> {
     /// the description (`proof::unfinished_section`); empty when none.
     pub unfinished: &'a str,
     pub manual: &'a str,
+    /// What the settle stage ran in the sandbox, with each result
+    /// (`settle::settled_section`); empty when it ran nothing.
+    pub settled: &'a str,
     pub ci: &'a [CiCommand],
     pub mirrors: &'a [super::completeness::Mirror],
     /// For a run started from a log finding: what its evidence step found.
@@ -1686,6 +1689,7 @@ fn owned_sections(plan: &PlanResult, proof: &Proof<'_>, repo: &str) -> super::co
             },
         ),
         review_fixes: String::new(),
+        settled: proof.settled.to_string(),
         open_findings: String::new(),
         objections: String::new(),
         draft_status: String::new(),
@@ -2171,6 +2175,7 @@ mod check_results_tests {
         Proof {
             evidence: "",
             gaps,
+            settled: "",
             unfinished: "",
             manual,
             ci: &[],
@@ -2392,6 +2397,7 @@ mod refresh_tests {
         let proof = super::Proof {
             evidence: "",
             gaps: &gaps,
+            settled: "",
             unfinished: "",
             manual: "",
             ci: &[],

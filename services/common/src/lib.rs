@@ -41,6 +41,7 @@ pub mod deliveries;
 pub mod deliveries_rollup;
 /// Dependency fix runs: the risk-aware plan, sandbox verification and
 /// bisect, resumable state.
+pub mod dep_audit;
 pub mod dep_fix;
 /// The shared dead-letter queue: whose each failed message is, whether the
 /// worker can read it, and when the cleanup archives it.

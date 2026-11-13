@@ -118,6 +118,9 @@ pub enum Section {
     /// What each review fix round checked before its push (see
     /// `review_fix`).
     ReviewFixes,
+    /// What CoderHelm ran in its sandbox to settle its own open items, with
+    /// each result (see `settle`).
+    Settled,
     /// What is still open, at the bottom (#238's "Not yet verified").
     OpenItems,
     /// Planned work the check before the PR still found not done after its
@@ -139,12 +142,13 @@ pub enum Section {
 }
 
 impl Section {
-    const ALL: [Section; 10] = [
+    const ALL: [Section; 11] = [
         Section::Links,
         Section::Mirrors,
         Section::MergeOrder,
         Section::NotInPr,
         Section::ReviewFixes,
+        Section::Settled,
         Section::OpenItems,
         Section::Unfinished,
         Section::OpenFindings,
@@ -169,6 +173,7 @@ impl Section {
                 super::review_fix::evidence::START,
                 super::review_fix::evidence::END,
             ),
+            Section::Settled => (super::settle::SETTLED_START, super::settle::SETTLED_END),
             Section::OpenItems => (super::proof::UNVERIFIED_START, super::proof::UNVERIFIED_END),
             Section::Unfinished => (super::proof::UNFINISHED_START, super::proof::UNFINISHED_END),
             Section::OpenFindings => (super::own_review::START, super::own_review::END),
@@ -206,6 +211,7 @@ pub struct Owned {
     pub merge_order: String,
     pub not_in_pr: String,
     pub review_fixes: String,
+    pub settled: String,
     pub open_items: String,
     pub unfinished: String,
     pub open_findings: String,
@@ -221,6 +227,7 @@ impl Owned {
             Section::MergeOrder => &mut self.merge_order,
             Section::NotInPr => &mut self.not_in_pr,
             Section::ReviewFixes => &mut self.review_fixes,
+            Section::Settled => &mut self.settled,
             Section::OpenItems => &mut self.open_items,
             Section::Unfinished => &mut self.unfinished,
             Section::OpenFindings => &mut self.open_findings,
@@ -347,6 +354,7 @@ pub fn assemble(rest: &str, owned: &Owned) -> String {
         &owned.merge_order,
         &owned.not_in_pr,
         &owned.review_fixes,
+        &owned.settled,
     ]
     .into_iter()
     .map(|s| s.trim())
@@ -1197,6 +1205,7 @@ mod tests {
     fn the_description_is_put_together_in_its_order() {
         let writer = "Closes #9\n\n**Summary** The report needs a reader.\n\n**Changes**\n* **Users** add `analytics_reader`\n\n**Risk** **Low**: one new user.\n\n**Verification**\n1. Run the plan.";
         let owned = Owned {
+            settled: String::new(),
             unfinished: String::new(),
             open_findings: String::new(),
             objections: String::new(),

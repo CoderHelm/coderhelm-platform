@@ -24,6 +24,7 @@ mod ae_budget_rounds;
 mod af_lockfiles_out_of_sync;
 mod ag_red_ci_ships_what_passes;
 mod ah_dep_run_choice_and_proof;
+mod ai_open_items_settled;
 mod al_learning_loop;
 mod b_open_pr_retry;
 mod c_codegen_egress;
