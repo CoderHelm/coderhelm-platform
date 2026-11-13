@@ -22,7 +22,7 @@ use chrono::NaiveDate;
 use common::usage::{work_kind, UsageSlice};
 use serde_json::{json, Value};
 
-use super::{day, ratio, round2, window_days, MeteredDay, RunRow, Window};
+use super::{day, ratio, window_days, MeteredDay, RunRow, Window};
 
 /// The first whole day (UTC) from which a run record holds everything the
 /// run used. Until the release of the day before, a resume, a CI fix or a
@@ -73,10 +73,6 @@ impl Since {
     }
 }
 
-fn round4(v: f64) -> f64 {
-    (v * 10_000.0).round() / 10_000.0
-}
-
 fn run_slice(r: &RunRow) -> UsageSlice {
     UsageSlice {
         tokens_in: r.tokens_in.max(0.0) as u64,
@@ -100,7 +96,8 @@ fn run_kind(r: &RunRow) -> &'static str {
     }
 }
 
-/// The four parts, their sum and the cost, as the page reads them.
+/// The four parts and their sum, as the page reads them. Tokens only: the
+/// Analytics page shows no money.
 fn parts(s: &UsageSlice) -> Value {
     json!({
         "tokens": s.total(),
@@ -108,7 +105,6 @@ fn parts(s: &UsageSlice) -> Value {
         "tokens_out": s.tokens_out,
         "cache_read_tokens": s.cache_read,
         "cache_write_tokens": s.cache_write,
-        "cost_usd": round4(s.cost_usd),
     })
 }
 
@@ -234,7 +230,6 @@ impl PerMergedPr {
         let per = |s: &UsageSlice, prs: usize| {
             json!({
                 "tokens_per_pr": ratio(s.total() as f64, prs as f64).map(f64::round),
-                "cost_per_pr": ratio(s.cost_usd, prs as f64).map(round2),
             })
         };
         let by_kind: Vec<Value> = work_kind::ALL
@@ -320,9 +315,9 @@ pub fn token_use(
     });
     let before_of = |s: UsageSlice| {
         if comparable {
-            json!({"previous_tokens": s.total(), "previous_cost_usd": round4(s.cost_usd)})
+            json!({"previous_tokens": s.total()})
         } else {
-            json!({"previous_tokens": null, "previous_cost_usd": null})
+            json!({"previous_tokens": null})
         }
     };
 
@@ -368,7 +363,6 @@ pub fn token_use(
                     "model": model,
                     "calls": s.calls,
                     "cache_hit_share": s.cache_hit_share(),
-                    "price_known": common::usage::price_known(model),
                 }),
             )
         })
@@ -612,7 +606,6 @@ mod tests {
         assert_eq!(per["tokens"], 4000);
         assert_eq!(per["cache_read_tokens"], 3800);
         assert_eq!(per["tokens_per_pr"], 2000.0);
-        assert_eq!(per["cost_per_pr"], 1.0);
         // The old number, for the same rows: every run's tokens over 2 PRs.
         assert_eq!(v["runs"]["tokens"], 11_520);
         let by: HashMap<&str, (u64, u64)> = v["runs"]["by_outcome"]
@@ -843,7 +836,12 @@ mod tests {
         assert_eq!(tickets["cache_write_tokens"], 700);
         assert_eq!(tickets["tokens_in"], 100);
         assert_eq!(tickets["tokens_out"], 200);
-        assert_eq!(tickets["cost_usd"], 6.5);
+        // Tokens only: no money anywhere in the answer.
+        let text = v.to_string();
+        assert!(
+            !text.contains("cost") && !text.contains("usd") && !text.contains("price"),
+            "{text}"
+        );
         assert_eq!(tickets["calls"], 11);
         // The kinds add up to the total, part by part.
         for part in [
@@ -867,9 +865,7 @@ mod tests {
         let models = v["by_model"].as_array().unwrap();
         assert_eq!(models[0]["model"], "claude-opus-5-5");
         assert_eq!(models[0]["cache_hit_share"], 8000.0 / 9250.0);
-        assert_eq!(models[0]["price_known"], true);
         assert_eq!(models[2]["model"], "claude-not-released-9");
-        assert_eq!(models[2]["price_known"], false);
         assert_eq!(models[2]["cache_hit_share"], 1.0);
 
         let daily = v["daily"].as_array().unwrap();
@@ -952,7 +948,6 @@ mod tests {
         assert_eq!(prs[0]["pr_number"], 7);
         assert_eq!(prs[0]["runs"], 3);
         assert_eq!(prs[0]["tokens"], 18_000);
-        assert_eq!(prs[0]["cost_usd"], 6.0);
         assert_eq!(
             prs[0]["run_id"], "same2",
             "the latest run of the pull request"

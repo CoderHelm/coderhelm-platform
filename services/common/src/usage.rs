@@ -1429,12 +1429,6 @@ pub fn slices(
     by
 }
 
-/// Whether the price table has this model. A model it doesn't have is
-/// costed at the most expensive known rate, so its cost is an upper bound.
-pub fn price_known(model_id: &str) -> bool {
-    prices().contains_key(&normalize_model(model_id))
-}
-
 /// The kinds of work a team's usage is shown under. Each [`feature`] is in
 /// exactly one; a feature added later is `other` until it is placed here.
 pub mod work_kind {
@@ -1977,13 +1971,6 @@ mod tests {
             assert_eq!(k::of_feature(f), kind, "{f}");
             assert!(k::ALL.contains(&kind));
         }
-    }
-
-    #[test]
-    fn a_model_missing_from_the_price_table_is_known_to_be_missing() {
-        assert!(price_known("claude-opus-5-5"));
-        assert!(price_known("us.anthropic.claude-opus-5-5-v1:0"));
-        assert!(!price_known("claude-not-released-9"));
     }
 
     /// Exactly once: no service adds tokens or cost to the analytics counters
