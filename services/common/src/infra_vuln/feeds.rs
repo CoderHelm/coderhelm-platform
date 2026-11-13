@@ -1056,7 +1056,19 @@ pub fn parse_bulletin(page: &str, url: &str) -> Result<Bulletin, ParseError> {
             });
         }
     }
-    let cves = cves_in(&text_of(&body));
+    // The CVEs the bulletin is about: those its title and summary name,
+    // above the per-service status. A CVE named only inside one service's
+    // words belongs to that service's row (`actions::tie` reads it there)
+    // and is not put on every finding the bulletin touches. A page with
+    // no CVE above the status falls back to every CVE on it.
+    let head = ["Mitigation Status", "Affected"]
+        .iter()
+        .find_map(|m| body.split_once(m).map(|(h, _)| h))
+        .unwrap_or(&body);
+    let mut cves = cves_in(&format!("{title} {}", text_of(head)));
+    if cves.is_empty() {
+        cves = cves_in(&text_of(&body));
+    }
     Ok(Bulletin {
         id,
         title,
@@ -1441,6 +1453,29 @@ mod tests {
             .services
             .iter()
             .any(|s| s.heading.to_ascii_lowercase().contains("workaround")));
+    }
+
+    #[test]
+    fn a_cve_named_only_in_one_services_words_is_not_the_bulletins() {
+        let b = parse_bulletin(BULLETIN, "u").unwrap();
+        assert_eq!(b.cves, vec!["CVE-2026-98432"]);
+        // The same page with another CVE named only under ElastiCache.
+        let page = BULLETIN.replacen(
+            "ElastiCache clusters named either",
+            "ElastiCache clusters (it also addresses CVE-2026-11112) named either",
+            1,
+        );
+        assert_ne!(
+            page, BULLETIN,
+            "the fixture still has the ElastiCache sentence"
+        );
+        let b = parse_bulletin(&page, "u").unwrap();
+        assert_eq!(b.cves, vec!["CVE-2026-98432"], "not put on every service");
+        assert!(b
+            .status("elasticache")
+            .unwrap()
+            .reason
+            .contains("CVE-2026-11112"));
     }
 
     #[test]

@@ -564,7 +564,9 @@ pub async fn run(state: &WorkerState, msg: ReleaseStepsMessage) -> Result<(), Bo
         let body = p["body"].as_str().unwrap_or("");
         let updated = release_plan::put_section(body, &release_plan::section(&after));
         if updated != body {
-            if let Err(e) = github.update_pr_body(owner, repo, pr, &updated).await {
+            if let Err(e) =
+                crate::passes::description::save(&github, owner, repo, pr, &updated).await
+            {
                 warn!(pr, error = %e, "release: could not update the PR's release section");
             }
         }

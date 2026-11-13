@@ -15,18 +15,40 @@
 //!   the optional "Infrastructure vulnerabilities" permissions of its
 //!   CoderHelmLogReader role (`RES#` records in the AWS insights table).
 //!
+//! - [`locate`], [`terraform`] and [`hcl`]: where each resource is defined
+//!   in the team's code, in whatever tool and layout, with how it was
+//!   found and how sure that is.
+//!
+//! - [`actions`]: what a pending action means on its ARN, which advisories
+//!   apply to it, and one ordered set of rows per resource.
+//!
 //! - [`matching`] and [`records`]: one finding per fix (a PR, a runbook
 //!   step in AWS, or AWS-managed), closed only when a new read of the
-//!   account shows the fix running.
+//!   account shows the fix running. A fix is a pull request when the
+//!   update has a code equivalent and the code was found for sure; else a
+//!   runbook that says why.
 //!
-//! Nothing here calls a model: every match is a version comparison.
+//! - [`guidance`]: what AWS and each tool say about applying an update,
+//!   as dated, sourced data. [`runbook`] writes the runbook and the pull
+//!   request's notes from it; [`guard`] refuses a change that would
+//!   replace or destroy a data resource.
+//!
+//! Nothing here calls a model: every match is a comparison.
 
+pub mod actions;
 pub mod feeds;
+pub mod guard;
+pub mod guidance;
+pub mod hcl;
 pub mod inventory;
+pub mod locate;
 pub mod matching;
 pub mod raw;
 pub mod records;
+pub mod runbook;
+pub mod stacks;
 pub mod store;
+pub mod terraform;
 
 /// Global records live under the same partition as the CISA list.
 pub const GLOBAL_PK: &str = crate::security_fixes::GLOBAL_PK;

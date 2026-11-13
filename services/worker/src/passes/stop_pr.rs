@@ -430,9 +430,14 @@ pub async fn open_with(
             // The pull request already open says what is not finished too.
             if !unfinished.is_empty() {
                 let now = with_unfinished(p["body"].as_str().unwrap_or(""), &unfinished);
-                if let Err(e) = github
-                    .update_pr_body(&msg.repo_owner, &msg.repo_name, number, &now)
-                    .await
+                if let Err(e) = crate::passes::description::save(
+                    &github,
+                    &msg.repo_owner,
+                    &msg.repo_name,
+                    number,
+                    &now,
+                )
+                .await
                 {
                     tracing::warn!(run_id, error = %e, "Could not say what is not finished on the open pull request");
                 }
@@ -701,9 +706,14 @@ async fn ship(
             } else {
                 format!("{}\n\n{deferred}", body.trim_end())
             };
-            if let Err(e) = github
-                .update_pr_body(&msg.repo_owner, &msg.repo_name, number, &now)
-                .await
+            if let Err(e) = crate::passes::description::save(
+                github,
+                &msg.repo_owner,
+                &msg.repo_name,
+                number,
+                &now,
+            )
+            .await
             {
                 tracing::warn!(run_id, error = %e, "Could not list what is deferred on the open pull request");
             }

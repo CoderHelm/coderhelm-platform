@@ -29,6 +29,16 @@
 //! - [`report`] writes what ran and what it came to. A part that did not run
 //!   says so with the reason; nothing is claimed that did not run.
 //!
+//! - Every project the bumps can break is built, not only the one with the
+//!   most bumps. In a workspace, [`add_projects`] adds the build of each
+//!   project whose dependencies bring in a changed package line (read from
+//!   the lockfile, `reachability::lock_projects`), whether or not any CI job
+//!   builds it; [`add_lockfile`] adds the project of every other lockfile
+//!   the run bumped. A project that is not built, or whose build fails on
+//!   the base branch too, is named as not proven with the reason
+//!   ([`unproven_projects`]); a project build that passes on the base
+//!   branch and fails with the bumps is blamed like any other.
+//!
 //! Everything here is pure; the sandbox run is the worker's
 //! (`worker::passes::dep_fix`).
 
@@ -49,8 +59,11 @@ pub const PORT: u16 = 38411;
 pub const COMMON_PORTS: &[u16] = &[3000, 8080, 8000, 5000, 4173, 5173, 4321, 4200];
 /// How long the start command gets to answer, in two-second polls.
 pub const START_POLLS: u32 = 45;
-/// Build commands one proof runs.
+/// Build commands one proof runs for the main project.
 pub const MAX_BUILDS: usize = 3;
+/// Builds of other affected projects one proof runs beside them: the whole
+/// proof is one sandbox run inside one step's time.
+pub const MAX_PROJECT_BUILDS: usize = 5;
 /// The paths requested once the application answers: its root page and the
 /// health endpoints servers commonly have.
 pub const PATHS: &[&str] = &["/", "/healthz", "/health", "/api/health"];
@@ -152,6 +165,9 @@ pub struct ProofCmd {
     pub dir: String,
     /// Where the command was found, in words (`` `ci.yml`, job `build` ``).
     pub source: String,
+    /// The build of another affected project: it is judged on its own and
+    /// never keeps the main project's start from running.
+    pub extra: bool,
 }
 
 /// What a proof runs, found once per run.
@@ -170,6 +186,246 @@ pub struct ProofPlan {
     /// Other lockfiles the run bumped packages in, whose projects this
     /// proof does not build.
     pub not_covered: Vec<String>,
+    /// The other projects the bumps can break: each workspace project that
+    /// takes a changed package line, and the project of each other lockfile
+    /// with bumps. Each is built, or named as not proven with why.
+    pub projects: Vec<ProjectProof>,
+    /// Why the workspace projects that take the changed packages could not
+    /// be worked out; empty when they were (or the project is no workspace).
+    pub projects_unknown: String,
+}
+
+/// One project the bumps can break, beside the main one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ProjectProof {
+    /// Its folder from the repository root.
+    pub dir: String,
+    /// Why it is affected, in words (`takes glob-walk@2.3.1`).
+    pub because: String,
+    /// Its builds, as indices into the plan's `builds`.
+    pub builds: Vec<usize>,
+    /// Why it is not built here; empty when it is.
+    pub not_built: String,
+}
+
+/// A workspace project whose dependencies bring in a changed package line.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AffectedProject {
+    /// Its folder from the repository root.
+    pub dir: String,
+    /// The changed packages it installs, as `name@version`.
+    pub uses: Vec<String>,
+    /// Its scripts manifest (`package.json`), when it has one.
+    pub manifest: Option<String>,
+}
+
+fn because(uses: &[String]) -> String {
+    let shown: Vec<String> = uses.iter().take(4).map(|u| format!("`{u}`")).collect();
+    format!(
+        "takes {}{}",
+        shown.join(", "),
+        if uses.len() > shown.len() {
+            format!(" and {} more changed packages", uses.len() - shown.len())
+        } else {
+            String::new()
+        }
+    )
+}
+
+fn project_builds(plan: &ProofPlan) -> usize {
+    plan.projects.iter().map(|p| p.builds.len()).sum()
+}
+
+/// Adds to `plan` (the proof of `lockfile`'s project) every workspace
+/// project the bumps can break: a project a build of the plan already runs
+/// in is covered by it; one whose manifest declares a `build` script gets
+/// that build, whether or not CI builds it; one that declares none is named
+/// as not built. The lockfile's own folder is the plan's main project.
+pub fn add_projects(plan: &mut ProofPlan, lockfile: &str, projects: &[AffectedProject]) {
+    let Some(m) = manager_of(lockfile) else {
+        return;
+    };
+    for p in projects {
+        if p.dir == plan.dir || plan.projects.iter().any(|x| x.dir == p.dir) {
+            continue;
+        }
+        let mut proof = ProjectProof {
+            dir: p.dir.clone(),
+            because: because(&p.uses),
+            ..Default::default()
+        };
+        let covered: Vec<usize> = plan
+            .builds
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.dir == p.dir)
+            .map(|(i, _)| i)
+            .collect();
+        let scripted = p
+            .manifest
+            .as_deref()
+            .and_then(|t| script_of(t, "build"))
+            .is_some();
+        if !covered.is_empty() {
+            proof.builds = covered;
+        } else if !is_plain_path(&p.dir) {
+            proof.not_built = "its folder can't be named in a sandbox command".into();
+        } else if let (true, Some(run), Some(name)) = (scripted, m.run_script, m.scripts_in) {
+            if project_builds(plan) >= MAX_PROJECT_BUILDS {
+                proof.not_built = format!(
+                    "one proof builds at most {MAX_PROJECT_BUILDS} projects beside the main one"
+                );
+            } else {
+                plan.builds.push(ProofCmd {
+                    cmd: format!("{run} build"),
+                    dir: p.dir.clone(),
+                    source: format!("the `build` script of `{}`", under(&p.dir, name)),
+                    extra: true,
+                });
+                proof.builds = vec![plan.builds.len() - 1];
+            }
+        } else {
+            proof.not_built = match m.scripts_in {
+                Some(name) => format!("`{}` declares no `build` script", under(&p.dir, name)),
+                None => format!("{} has no build per project", m.name),
+            };
+        }
+        plan.projects.push(proof);
+    }
+}
+
+/// Adds to `plan` the project of another lockfile the run bumped packages
+/// in, as `other` (its own [`discover`]) found it: each of its builds runs
+/// after that project's own install. A project with no build is named as
+/// not built, with why.
+pub fn add_lockfile(plan: &mut ProofPlan, lockfile: &str, bumps: usize, other: &ProofPlan) {
+    let mut proof = ProjectProof {
+        dir: other.dir.clone(),
+        because: format!("has its own lockfile `{lockfile}` with {bumps} of the bumps"),
+        ..Default::default()
+    };
+    if other.builds.is_empty() {
+        proof.not_built = other.no_build.clone();
+    } else if project_builds(plan) + other.builds.len() > MAX_PROJECT_BUILDS {
+        proof.not_built =
+            format!("one proof builds at most {MAX_PROJECT_BUILDS} projects beside the main one");
+    } else {
+        for b in &other.builds {
+            // The project's own install first, in the lockfile's folder.
+            let install = if b.dir == other.dir {
+                other.install.clone()
+            } else {
+                format!("( cd \"$CH_ROOT\" && {}{} )", cd(&other.dir), other.install)
+            };
+            plan.builds.push(ProofCmd {
+                cmd: format!("{install} && {}", b.cmd),
+                dir: b.dir.clone(),
+                source: format!("{}, after the install of `{lockfile}`", b.source),
+                extra: true,
+            });
+            proof.builds.push(plan.builds.len() - 1);
+        }
+    }
+    plan.projects.push(proof);
+}
+
+/// The workspace folders a root `package.json` names (`workspaces`, as a
+/// list or under `packages`), among the folders of `tree` that hold a
+/// `package.json`. `root`: the folder of the root manifest. Folders are
+/// returned from `root`. `*` matches one folder name, `**` any depth.
+pub fn workspace_dirs(root_manifest: &str, tree: &[String], root: &str) -> Vec<String> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(root_manifest) else {
+        return vec![];
+    };
+    let ws = &v["workspaces"];
+    let globs: Vec<&str> = ws
+        .as_array()
+        .or_else(|| ws["packages"].as_array())
+        .map(|a| a.iter().filter_map(|g| g.as_str()).collect())
+        .unwrap_or_default();
+    fn matches(glob: &[&str], dir: &[&str]) -> bool {
+        match (glob.first(), dir.first()) {
+            (None, None) => true,
+            (Some(&"**"), _) => {
+                matches(&glob[1..], dir) || (!dir.is_empty() && matches(glob, &dir[1..]))
+            }
+            (Some(g), Some(d)) => {
+                let one = match g.split_once('*') {
+                    Some((pre, post)) => {
+                        d.len() >= pre.len() + post.len() && d.starts_with(pre) && d.ends_with(post)
+                    }
+                    None => g == d,
+                };
+                one && matches(&glob[1..], &dir[1..])
+            }
+            _ => false,
+        }
+    }
+    let prefix = if root.is_empty() {
+        String::new()
+    } else {
+        format!("{root}/")
+    };
+    let mut out: Vec<String> = tree
+        .iter()
+        .filter_map(|p| p.strip_prefix(prefix.as_str()))
+        .filter_map(|p| p.strip_suffix("/package.json"))
+        .filter(|d| !d.split('/').any(|s| s == "node_modules"))
+        .filter(|d| {
+            let segs: Vec<&str> = d.split('/').collect();
+            globs.iter().any(|g| {
+                let g = g.trim_start_matches("./").trim_end_matches('/');
+                !g.starts_with('!') && matches(&g.split('/').collect::<Vec<_>>(), &segs)
+            })
+        })
+        .map(String::from)
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The projects the proof does not prove, each with why: one that is not
+/// built, one whose build gave no result, and one whose build fails on the
+/// base branch too (the sandbox has no secrets or services, so that says
+/// nothing about the bumps). A project whose build passes with the bumps,
+/// or fails only with them, is not here: the first is proven, the second
+/// is blamed ([`blamed`]).
+pub fn unproven_projects(
+    plan: &ProofPlan,
+    base: Option<&ProofResult>,
+    head: Option<&ProofResult>,
+) -> Vec<(String, String)> {
+    let code = |r: Option<&ProofResult>, i: usize| -> Option<i32> {
+        r.filter(|r| r.ran)
+            .and_then(|r| r.builds.get(i).copied().flatten())
+    };
+    let mut out = vec![];
+    for p in &plan.projects {
+        if !p.not_built.is_empty() {
+            out.push((p.dir.clone(), p.not_built.clone()));
+            continue;
+        }
+        let why = p.builds.iter().find_map(|&i| {
+            let cmd = plan.builds.get(i).map(|b| b.cmd.as_str()).unwrap_or("");
+            match (code(base, i), code(head, i)) {
+                (_, Some(0)) => None,
+                (Some(0), Some(_)) => None,
+                (Some(b), Some(_)) => Some(format!(
+                    "its build `{cmd}` fails on the base branch too in the sandbox (exit {b}),                      which has no secrets or services, so the result says nothing about the bumps"
+                )),
+                (None, Some(c)) => Some(format!(
+                    "its build `{cmd}` fails (exit {c}) and did not run on the base branch, so                      the bumps can't be told from what was already failing"
+                )),
+                (_, None) => Some(format!("its build `{cmd}` gave no result in the sandbox")),
+            }
+        });
+        if let Some(why) = why {
+            out.push((p.dir.clone(), why));
+        }
+    }
+    out
 }
 
 impl ProofPlan {
@@ -285,6 +541,7 @@ pub fn discover(lockfile: &str, ci: &[CiBuild], files: &[(String, String)]) -> P
             } else {
                 format!("the CI workflow `{}`, job `{}`", c.workflow, c.job)
             },
+            extra: false,
         });
         if plan.builds.len() >= MAX_BUILDS {
             break;
@@ -297,6 +554,7 @@ pub fn discover(lockfile: &str, ci: &[CiBuild], files: &[(String, String)]) -> P
                 cmd: format!("{run} build"),
                 dir: dir.clone(),
                 source: format!("the `build` script of `{}`", under(&dir, name)),
+                extra: false,
             }),
             _ => None,
         };
@@ -304,6 +562,7 @@ pub fn discover(lockfile: &str, ci: &[CiBuild], files: &[(String, String)]) -> P
             cmd: b.to_string(),
             dir: dir.clone(),
             source: format!("{}'s own build", m.name),
+            extra: false,
         });
         match scripted.or(own) {
             Some(b) => plan.builds.push(b),
@@ -328,11 +587,13 @@ pub fn discover(lockfile: &str, ci: &[CiBuild], files: &[(String, String)]) -> P
             cmd,
             dir: dir.clone(),
             source: format!("the `web` entry of `{}`", under(&dir, "Procfile")),
+            extra: false,
         }),
         (None, Some(run), Some(name), Some(text)) => script_of(text, "start").map(|_| ProofCmd {
             cmd: format!("{run} start"),
             dir: dir.clone(),
             source: format!("the `start` script of `{}`", under(&dir, name)),
+            extra: false,
         }),
         _ => None,
     };
@@ -364,6 +625,9 @@ fn cd(dir: &str) -> String {
 /// exits 0; the verdict is read from its marker lines.
 pub fn script(plan: &ProofPlan) -> String {
     let mut s = String::new();
+    if plan.builds.iter().any(|b| b.cmd.contains("$CH_ROOT")) {
+        s.push_str("export CH_ROOT=\"$(pwd)\"\n");
+    }
     s.push_str(&format!(
         "( {}{} ) > /tmp/coderhelm-proof-install.log 2>&1; ch_install=$?\n",
         cd(&plan.dir),
@@ -375,10 +639,11 @@ pub fn script(plan: &ProofPlan) -> String {
         let n = i + 1;
         s.push_str(&format!(
             "if [ $ch_install -eq 0 ]; then ( {}{} ) > /tmp/coderhelm-proof-build-{n}.log 2>&1; ch_b{n}=$?; \
-             if [ $ch_b{n} -ne 0 ]; then ch_built=1; echo \"--- build {n} failed (exit $ch_b{n}), last output ---\"; tail -c 1200 /tmp/coderhelm-proof-build-{n}.log; echo; fi; \
+             if [ $ch_b{n} -ne 0 ]; then {gate}echo \"--- build {n} failed (exit $ch_b{n}), last output ---\"; tail -c 1200 /tmp/coderhelm-proof-build-{n}.log; echo; fi; \
              echo \"{STEP_MARK} build {n} $ch_b{n}\"; fi\n",
             cd(&b.dir),
-            b.cmd
+            b.cmd,
+            gate = if b.extra { "" } else { "ch_built=1; " },
         ));
     }
     s.push_str("ch_start=skipped; ch_port=0\n");
@@ -623,6 +888,38 @@ pub fn report(plan: &ProofPlan, base: Option<&ProofResult>, head: Option<&ProofR
                 .join(", ")
         ));
     }
+    if !plan.projects_unknown.is_empty() {
+        s.push_str(&format!(
+            "- Which workspace projects take the changed packages is not known ({}), so only the builds below were run; a project they don't cover is not proven here.\n",
+            plan.projects_unknown
+        ));
+    }
+    for p in &plan.projects {
+        if p.not_built.is_empty() {
+            s.push_str(&format!(
+                "- Project `{}` {}: built here ({}).\n",
+                p.dir,
+                p.because,
+                p.builds
+                    .iter()
+                    .filter_map(|&i| plan.builds.get(i))
+                    .map(|b| format!("`{}`", b.cmd))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
+    for (dir, why) in unproven_projects(plan, base, head) {
+        let because = plan
+            .projects
+            .iter()
+            .find(|p| p.dir == dir)
+            .map(|p| p.because.as_str())
+            .unwrap_or("");
+        s.push_str(&format!(
+            "- Project `{dir}` {because}: **not proven here**: {why}. CI on this pull request, or a build by hand, is the check.\n"
+        ));
+    }
     let head = match head {
         Some(h) if h.ran => h,
         other => {
@@ -749,6 +1046,239 @@ mod tests {
             "package.json".to_string(),
             format!("{{\"name\":\"shop\",\"scripts\":{scripts}}}"),
         )]
+    }
+
+    // ── Every project the bumps can break ──────────────────────────────
+
+    fn affected(dir: &str, uses: &[&str], scripts: Option<&str>) -> AffectedProject {
+        AffectedProject {
+            dir: dir.into(),
+            uses: uses.iter().map(|u| u.to_string()).collect(),
+            manifest: scripts.map(|s| format!("{{\"scripts\":{s}}}")),
+        }
+    }
+
+    /// The site is what CI builds; the studio has a build script and no CI
+    /// job; the shared package declares no build.
+    fn workspace_plan() -> ProofPlan {
+        let mut plan = discover(
+            "pnpm-lock.yaml",
+            &[ci("pnpm --filter web build", Some("apps/web"), true)],
+            &pkg(r#"{"dev":"turbo dev"}"#),
+        );
+        add_projects(
+            &mut plan,
+            "pnpm-lock.yaml",
+            &[
+                affected(
+                    "apps/web",
+                    &["path-match@3.1.2"],
+                    Some(r#"{"build":"next build"}"#),
+                ),
+                affected(
+                    "apps/studio",
+                    &["glob-walk@2.3.1"],
+                    Some(r#"{"build":"studio build"}"#),
+                ),
+                affected(
+                    "packages/ui",
+                    &["path-match@3.1.2"],
+                    Some(r#"{"lint":"eslint ."}"#),
+                ),
+            ],
+        );
+        plan
+    }
+
+    #[test]
+    fn a_project_no_ci_job_builds_is_built_when_its_manifest_declares_a_build() {
+        let plan = workspace_plan();
+        let cmds: Vec<(&str, &str)> = plan
+            .builds
+            .iter()
+            .map(|b| (b.cmd.as_str(), b.dir.as_str()))
+            .collect();
+        assert_eq!(
+            cmds,
+            vec![
+                ("pnpm --filter web build", "apps/web"),
+                ("pnpm run build", "apps/studio"),
+            ]
+        );
+        assert_eq!(
+            plan.builds[1].source,
+            "the `build` script of `apps/studio/package.json`"
+        );
+        // The site is covered by the build CI runs in its folder.
+        assert_eq!(plan.projects[0].builds, vec![0]);
+        assert_eq!(plan.projects[1].builds, vec![1]);
+        assert_eq!(
+            plan.projects[2].not_built,
+            "`packages/ui/package.json` declares no `build` script"
+        );
+        let sh = script(&plan);
+        assert!(sh.contains("( cd 'apps/studio' && pnpm run build )"));
+        // The studio's build failing never keeps the site's start from
+        // running: only the main project's builds gate it.
+        let studio = sh.lines().find(|l| l.contains("apps/studio")).unwrap();
+        assert!(!studio.contains("ch_built=1"), "{studio}");
+        let web = sh.lines().find(|l| l.contains("--filter web")).unwrap();
+        assert!(web.contains("ch_built=1"), "{web}");
+    }
+
+    #[test]
+    fn a_project_build_only_the_bumps_break_is_blamed_and_feeds_the_take_out() {
+        let plan = workspace_plan();
+        let base = ProofResult {
+            ran: true,
+            builds: vec![Some(0), Some(0)],
+            start: "skipped".into(),
+            ..Default::default()
+        };
+        let head = ProofResult {
+            builds: vec![Some(0), Some(1)],
+            ..base.clone()
+        };
+        assert_eq!(
+            blamed(&plan, &base, &head),
+            vec!["the build `pnpm run build` fails (exit 1)".to_string()]
+        );
+        // Blamed, so not listed as unproven: only the project with no build is.
+        let open = unproven_projects(&plan, Some(&base), Some(&head));
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].0, "packages/ui");
+    }
+
+    #[test]
+    fn a_project_that_cannot_be_built_in_the_sandbox_is_named_as_not_proven() {
+        let plan = workspace_plan();
+        // The studio's build needs a token the sandbox does not have: it
+        // fails on the base branch too.
+        let base = ProofResult {
+            ran: true,
+            builds: vec![Some(0), Some(1)],
+            start: "skipped".into(),
+            ..Default::default()
+        };
+        let head = base.clone();
+        assert!(
+            blamed(&plan, &base, &head).is_empty(),
+            "never blamed on a bump"
+        );
+        let open = unproven_projects(&plan, Some(&base), Some(&head));
+        assert_eq!(open.len(), 2);
+        assert_eq!(open[0].0, "apps/studio");
+        assert!(
+            open[0].1.contains("fails on the base branch too"),
+            "{}",
+            open[0].1
+        );
+        let r = report(&plan, Some(&base), Some(&head));
+        assert!(
+            r.contains("- Project `apps/studio` takes `glob-walk@2.3.1`: **not proven here**: its build `pnpm run build` fails on the base branch too"),
+            "{r}"
+        );
+        assert!(
+            r.contains("- Project `packages/ui` takes `path-match@3.1.2`: **not proven here**: `packages/ui/package.json` declares no `build` script"),
+            "{r}"
+        );
+        assert!(r.contains("- Project `apps/web` takes `path-match@3.1.2`: built here (`pnpm --filter web build`)."), "{r}");
+        // No result at all: every built project is unproven, and said so.
+        let none = unproven_projects(&plan, Some(&base), None);
+        assert!(none
+            .iter()
+            .any(|(d, w)| d == "apps/web" && w.contains("gave no result")));
+    }
+
+    #[test]
+    fn the_project_of_another_lockfile_is_built_after_its_own_install() {
+        let mut plan = discover("package-lock.json", &[], &pkg(r#"{"build":"vite build"}"#));
+        let studio = discover(
+            "studio/package-lock.json",
+            &[],
+            &[(
+                "studio/package.json".to_string(),
+                r#"{"scripts":{"build":"studio build"}}"#.to_string(),
+            )],
+        );
+        add_lockfile(&mut plan, "studio/package-lock.json", 3, &studio);
+        let tools = discover("tools/package-lock.json", &[], &[]);
+        add_lockfile(&mut plan, "tools/package-lock.json", 1, &tools);
+        assert_eq!(plan.builds.len(), 2);
+        assert_eq!(plan.builds[1].dir, "studio");
+        assert!(
+            plan.builds[1]
+                .cmd
+                .ends_with("npm ci --no-audit --no-fund && npm run build"),
+            "{}",
+            plan.builds[1].cmd
+        );
+        assert_eq!(
+            plan.projects[0].because,
+            "has its own lockfile `studio/package-lock.json` with 3 of the bumps"
+        );
+        assert!(
+            plan.projects[1]
+                .not_built
+                .contains("`tools/package.json` has no `build` script"),
+            "{}",
+            plan.projects[1].not_built
+        );
+        assert!(plan.not_covered.is_empty());
+        // The cap is said, never silently dropped.
+        let mut many = discover("pnpm-lock.yaml", &[], &pkg(r#"{"build":"x"}"#));
+        let all: Vec<AffectedProject> = (0..MAX_PROJECT_BUILDS + 2)
+            .map(|i| {
+                affected(
+                    &format!("apps/a{i}"),
+                    &["glob-walk@2.3.1"],
+                    Some(r#"{"build":"x"}"#),
+                )
+            })
+            .collect();
+        add_projects(&mut many, "pnpm-lock.yaml", &all);
+        assert_eq!(many.builds.len(), 1 + MAX_PROJECT_BUILDS);
+        assert_eq!(
+            many.projects
+                .iter()
+                .filter(|p| p.not_built.contains("at most"))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn workspace_folders_are_read_from_the_root_manifest() {
+        let tree: Vec<String> = [
+            "package.json",
+            "apps/web/package.json",
+            "apps/studio/package.json",
+            "apps/web/node_modules/x/package.json",
+            "packages/ui/package.json",
+            "packages/deep/inner/package.json",
+            "tools/release/package.json",
+        ]
+        .iter()
+        .map(|p| p.to_string())
+        .collect();
+        assert_eq!(
+            workspace_dirs(r#"{"workspaces":["apps/*","packages/**"]}"#, &tree, ""),
+            vec![
+                "apps/studio",
+                "apps/web",
+                "packages/deep/inner",
+                "packages/ui"
+            ]
+        );
+        assert_eq!(
+            workspace_dirs(
+                r#"{"workspaces":{"packages":["tools/release"]}}"#,
+                &tree,
+                ""
+            ),
+            vec!["tools/release"]
+        );
+        assert!(workspace_dirs(r#"{"name":"x"}"#, &tree, "").is_empty());
     }
 
     #[test]

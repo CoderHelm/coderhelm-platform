@@ -1391,9 +1391,8 @@ pub async fn record_round(
         section,
     );
     if updated != body {
-        if let Err(e) = github
-            .update_pr_body(owner, repo, pr_number, &updated)
-            .await
+        if let Err(e) =
+            crate::passes::description::save(github, owner, repo, pr_number, &updated).await
         {
             warn!(pr_number, error = %e, "review fix: could not record the round in the description");
         }

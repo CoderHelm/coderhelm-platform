@@ -3795,6 +3795,23 @@ impl GitHubClient {
         Ok(resp)
     }
 
+    /// Put a pull request back to draft (GraphQL only, like marking ready).
+    /// The pull request stays open and its branch is untouched.
+    pub async fn convert_pr_to_draft(
+        &self,
+        node_id: &str,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        let query = serde_json::json!({
+            "query": "mutation($id: ID!) { convertPullRequestToDraft(input: { pullRequestId: $id }) { pullRequest { isDraft } } }",
+            "variables": { "id": node_id }
+        });
+        let resp = self.post("https://api.github.com/graphql", &query).await?;
+        if let Some(errors) = resp.get("errors") {
+            return Err(format!("GraphQL errors: {}", errors).into());
+        }
+        Ok(resp)
+    }
+
     /// Conversation comments on an issue or PR, oldest first.
     pub async fn list_issue_comments(
         &self,

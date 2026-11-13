@@ -9,17 +9,23 @@
 //! summary of the read (`RES_READ#<account>#<region>`) with any call AWS
 //! refused, naming the permission.
 //!
-//! Where each resource is defined comes from its tags (a repository tag,
-//! its CloudFormation stack) or a search of the team's infrastructure
-//! repositories for its AMI, group or name. Lambda functions come from the
-//! team's Terraform only: the role never reads function settings, which
-//! hold environment variables.
+//! Where each resource is defined (`common::infra_vuln::locate`): its
+//! CloudFormation stack and logical id (its tags, or CloudFormation asked
+//! by physical id where tags are missing), matched to a template or a CDK
+//! construct; Terraform and OpenTofu matched by resource type and
+//! attributes through module calls and variable files; and its name
+//! written in an infrastructure file as a last resort. Every enabled
+//! repository is read, and files are recognised as infrastructure code by
+//! their content. Lambda functions come from the team's Terraform only:
+//! the role never reads function settings, which hold environment
+//! variables.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use aws_sdk_dynamodb::types::AttributeValue;
 use chrono::{Duration, Utc};
 use common::infra_vuln::inventory::{self as inv, Resource};
+use common::infra_vuln::locate;
 use common::infra_vuln::raw::{
     RawAccount, RawAsg, RawCacheUpdate, RawDatabase, RawDomain, RawEksCluster, RawImage,
     RawInstance, RawLoadBalancer, RawNodegroup, RawPending, RawService,
@@ -33,9 +39,16 @@ use crate::WorkerState;
 
 /// Pages read per list call (each up to 100 to 1,000 items).
 const MAX_PAGES: usize = 10;
-/// Repositories and files searched to place resources.
-const MAX_REPOS: usize = 8;
-const MAX_FILES: usize = 40;
+/// Repositories searched to place resources (every enabled one, up to
+/// this many), the names searched for in each, and what is read: files per
+/// repository, files and bytes per read, and the largest file.
+const MAX_REPOS: usize = 30;
+const MAX_TERMS: usize = 60;
+const MAX_FILES_PER_REPO: usize = 400;
+const MAX_FILES: usize = 1_200;
+const MAX_BYTES: usize = 12 * 1024 * 1024;
+const MAX_FILE_BYTES: usize = 400 * 1024;
+const MAX_MENTIONS: usize = 2_000;
 /// Prefix of a read's summary row.
 pub const READ_PREFIX: &str = "RES_READ#";
 
@@ -463,142 +476,305 @@ async fn read_ecs(s: &Session, raw: &mut RawAccount) {
     }
 }
 
+fn fact(facts: &mut BTreeMap<String, String>, key: &str, value: Option<String>) {
+    if let Some(v) = value.filter(|v| !v.is_empty()) {
+        facts.insert(key.to_string(), v);
+    }
+}
+
+/// Clusters, instances and pending maintenance, every page (each call
+/// returns at most 100 records and a marker for the next).
 async fn read_rds(s: &Session, raw: &mut RawAccount) {
     let rds = client!(aws_sdk_rds, s);
-    match rds.describe_db_clusters().max_records(100).send().await {
-        Ok(o) => raw.db_clusters.extend(o.db_clusters().iter().map(|c| {
-            RawDatabase {
-                id: c.db_cluster_identifier().unwrap_or("").into(),
-                arn: c.db_cluster_arn().unwrap_or("").into(),
-                engine: c.engine().unwrap_or("").into(),
-                engine_version: c.engine_version().unwrap_or("").into(),
-                public: c.publicly_accessible().unwrap_or(false),
-                cluster: String::new(),
-                tags: tags_of(
-                    c.tag_list()
-                        .iter()
-                        .map(|t| (t.key().unwrap_or(""), t.value().unwrap_or(""))),
-                ),
-            }
-        })),
-        Err(e) => note!(raw, "DescribeDBClusters", e),
-    }
-    match rds.describe_db_instances().max_records(100).send().await {
-        Ok(o) => raw.db_instances.extend(o.db_instances().iter().map(|d| {
-            RawDatabase {
-                id: d.db_instance_identifier().unwrap_or("").into(),
-                arn: d.db_instance_arn().unwrap_or("").into(),
-                engine: d.engine().unwrap_or("").into(),
-                engine_version: d.engine_version().unwrap_or("").into(),
-                public: d.publicly_accessible().unwrap_or(false),
-                cluster: d.db_cluster_identifier().unwrap_or("").into(),
-                tags: tags_of(
-                    d.tag_list()
-                        .iter()
-                        .map(|t| (t.key().unwrap_or(""), t.value().unwrap_or(""))),
-                ),
-            }
-        })),
-        Err(e) => note!(raw, "DescribeDBInstances", e),
-    }
-    match rds
-        .describe_pending_maintenance_actions()
-        .max_records(100)
-        .send()
-        .await
-    {
-        Ok(o) => {
-            for r in o.pending_maintenance_actions() {
-                for a in r.pending_maintenance_action_details() {
-                    let d = |t: Option<&aws_smithy_types::DateTime>| {
-                        t.and_then(|x| x.fmt(aws_smithy_types::date_time::Format::DateTime).ok())
-                            .unwrap_or_default()
-                    };
-                    raw.pending.push(RawPending {
-                        resource_arn: r.resource_identifier().unwrap_or("").into(),
-                        action: a.action().unwrap_or("").into(),
-                        description: a.description().unwrap_or("").into(),
-                        auto_applied_after: d(a.auto_applied_after_date()),
-                        forced_apply: d(a.forced_apply_date()),
-                        current_apply: d(a.current_apply_date()),
+    let mut writers: BTreeSet<String> = BTreeSet::new();
+    let mut marker: Option<String> = None;
+    for _ in 0..MAX_PAGES {
+        match rds
+            .describe_db_clusters()
+            .max_records(100)
+            .set_marker(marker.take())
+            .send()
+            .await
+        {
+            Ok(o) => {
+                for c in o.db_clusters() {
+                    for m in c.db_cluster_members() {
+                        if m.is_cluster_writer() == Some(true) {
+                            writers.insert(m.db_instance_identifier().unwrap_or("").to_string());
+                        }
+                    }
+                    let mut facts = BTreeMap::new();
+                    fact(
+                        &mut facts,
+                        "subnet_group",
+                        c.db_subnet_group().map(String::from),
+                    );
+                    fact(
+                        &mut facts,
+                        "parameter_group",
+                        c.db_cluster_parameter_group().map(String::from),
+                    );
+                    fact(&mut facts, "multi_az", c.multi_az().map(|b| b.to_string()));
+                    fact(
+                        &mut facts,
+                        "auto_minor",
+                        c.auto_minor_version_upgrade().map(|b| b.to_string()),
+                    );
+                    fact(
+                        &mut facts,
+                        "maintenance_window",
+                        c.preferred_maintenance_window().map(String::from),
+                    );
+                    fact(
+                        &mut facts,
+                        "backup_retention",
+                        c.backup_retention_period().map(|n| n.to_string()),
+                    );
+                    raw.db_clusters.push(RawDatabase {
+                        id: c.db_cluster_identifier().unwrap_or("").into(),
+                        arn: c.db_cluster_arn().unwrap_or("").into(),
+                        engine: c.engine().unwrap_or("").into(),
+                        engine_version: c.engine_version().unwrap_or("").into(),
+                        public: c.publicly_accessible().unwrap_or(false),
+                        cluster: String::new(),
+                        tags: tags_of(
+                            c.tag_list()
+                                .iter()
+                                .map(|t| (t.key().unwrap_or(""), t.value().unwrap_or(""))),
+                        ),
+                        writer: false,
+                        facts,
                     });
                 }
+                marker = o.marker().map(String::from);
+            }
+            Err(e) => {
+                note!(raw, "DescribeDBClusters", e);
+                break;
             }
         }
-        Err(e) => note!(raw, "DescribePendingMaintenanceActions", e),
+        if marker.is_none() {
+            break;
+        }
+    }
+    let mut marker: Option<String> = None;
+    for _ in 0..MAX_PAGES {
+        match rds
+            .describe_db_instances()
+            .max_records(100)
+            .set_marker(marker.take())
+            .send()
+            .await
+        {
+            Ok(o) => {
+                for d in o.db_instances() {
+                    let id = d.db_instance_identifier().unwrap_or("").to_string();
+                    let mut facts = BTreeMap::new();
+                    fact(
+                        &mut facts,
+                        "subnet_group",
+                        d.db_subnet_group()
+                            .and_then(|g| g.db_subnet_group_name())
+                            .map(String::from),
+                    );
+                    fact(
+                        &mut facts,
+                        "parameter_group",
+                        d.db_parameter_groups()
+                            .first()
+                            .and_then(|g| g.db_parameter_group_name())
+                            .map(String::from),
+                    );
+                    fact(
+                        &mut facts,
+                        "instance_class",
+                        d.db_instance_class().map(String::from),
+                    );
+                    fact(&mut facts, "multi_az", d.multi_az().map(|b| b.to_string()));
+                    fact(
+                        &mut facts,
+                        "auto_minor",
+                        d.auto_minor_version_upgrade().map(|b| b.to_string()),
+                    );
+                    fact(
+                        &mut facts,
+                        "maintenance_window",
+                        d.preferred_maintenance_window().map(String::from),
+                    );
+                    fact(
+                        &mut facts,
+                        "backup_retention",
+                        d.backup_retention_period().map(|n| n.to_string()),
+                    );
+                    let replicas = d.read_replica_db_instance_identifiers().len();
+                    if replicas > 0 {
+                        facts.insert("replicas".into(), replicas.to_string());
+                    }
+                    fact(
+                        &mut facts,
+                        "replica_of",
+                        d.read_replica_source_db_instance_identifier()
+                            .map(String::from),
+                    );
+                    raw.db_instances.push(RawDatabase {
+                        writer: writers.contains(&id),
+                        id,
+                        arn: d.db_instance_arn().unwrap_or("").into(),
+                        engine: d.engine().unwrap_or("").into(),
+                        engine_version: d.engine_version().unwrap_or("").into(),
+                        public: d.publicly_accessible().unwrap_or(false),
+                        cluster: d.db_cluster_identifier().unwrap_or("").into(),
+                        tags: tags_of(
+                            d.tag_list()
+                                .iter()
+                                .map(|t| (t.key().unwrap_or(""), t.value().unwrap_or(""))),
+                        ),
+                        facts,
+                    });
+                }
+                marker = o.marker().map(String::from);
+            }
+            Err(e) => {
+                note!(raw, "DescribeDBInstances", e);
+                break;
+            }
+        }
+        if marker.is_none() {
+            break;
+        }
+    }
+    let mut marker: Option<String> = None;
+    for _ in 0..MAX_PAGES {
+        match rds
+            .describe_pending_maintenance_actions()
+            .max_records(100)
+            .set_marker(marker.take())
+            .send()
+            .await
+        {
+            Ok(o) => {
+                for r in o.pending_maintenance_actions() {
+                    for a in r.pending_maintenance_action_details() {
+                        let d = |t: Option<&aws_smithy_types::DateTime>| {
+                            t.and_then(|x| {
+                                x.fmt(aws_smithy_types::date_time::Format::DateTime).ok()
+                            })
+                            .unwrap_or_default()
+                        };
+                        raw.pending.push(RawPending {
+                            resource_arn: r.resource_identifier().unwrap_or("").into(),
+                            action: a.action().unwrap_or("").into(),
+                            description: a.description().unwrap_or("").into(),
+                            auto_applied_after: d(a.auto_applied_after_date()),
+                            forced_apply: d(a.forced_apply_date()),
+                            current_apply: d(a.current_apply_date()),
+                        });
+                    }
+                }
+                marker = o.marker().map(String::from);
+            }
+            Err(e) => {
+                note!(raw, "DescribePendingMaintenanceActions", e);
+                break;
+            }
+        }
+        if marker.is_none() {
+            break;
+        }
     }
 }
 
 async fn read_elasticache(s: &Session, raw: &mut RawAccount) {
     let ec = client!(aws_sdk_elasticache, s);
     let mut severity: BTreeMap<String, (String, String, String)> = BTreeMap::new();
-    match ec
-        .describe_service_updates()
-        .service_update_status(aws_sdk_elasticache::types::ServiceUpdateStatus::Available)
-        .max_records(100)
-        .send()
-        .await
-    {
-        Ok(o) => {
-            for u in o.service_updates() {
-                severity.insert(
-                    u.service_update_name().unwrap_or("").into(),
-                    (
-                        u.service_update_severity()
-                            .map(|x| x.as_str().to_string())
-                            .unwrap_or_default(),
-                        u.service_update_type()
-                            .map(|x| x.as_str().to_string())
-                            .unwrap_or_default(),
-                        u.service_update_recommended_apply_by_date()
-                            .and_then(|x| x.fmt(aws_smithy_types::date_time::Format::DateTime).ok())
-                            .unwrap_or_default(),
-                    ),
-                );
+    let mut marker: Option<String> = None;
+    for _ in 0..MAX_PAGES {
+        match ec
+            .describe_service_updates()
+            .service_update_status(aws_sdk_elasticache::types::ServiceUpdateStatus::Available)
+            .max_records(100)
+            .set_marker(marker.take())
+            .send()
+            .await
+        {
+            Ok(o) => {
+                for u in o.service_updates() {
+                    severity.insert(
+                        u.service_update_name().unwrap_or("").into(),
+                        (
+                            u.service_update_severity()
+                                .map(|x| x.as_str().to_string())
+                                .unwrap_or_default(),
+                            u.service_update_type()
+                                .map(|x| x.as_str().to_string())
+                                .unwrap_or_default(),
+                            u.service_update_recommended_apply_by_date()
+                                .and_then(|x| {
+                                    x.fmt(aws_smithy_types::date_time::Format::DateTime).ok()
+                                })
+                                .unwrap_or_default(),
+                        ),
+                    );
+                }
+                marker = o.marker().map(String::from);
+            }
+            Err(e) => {
+                note!(raw, "DescribeServiceUpdates", e);
+                return;
             }
         }
-        Err(e) => {
-            note!(raw, "DescribeServiceUpdates", e);
-            return;
+        if marker.is_none() {
+            break;
         }
     }
     if severity.is_empty() {
         return;
     }
-    match ec
-        .describe_update_actions()
-        .service_update_status(aws_sdk_elasticache::types::ServiceUpdateStatus::Available)
-        .max_records(100)
-        .send()
-        .await
-    {
-        Ok(o) => {
-            for a in o.update_actions() {
-                let name = a.service_update_name().unwrap_or("").to_string();
-                let (sev, ty, by) = severity.get(&name).cloned().unwrap_or_default();
-                raw.cache_updates.push(RawCacheUpdate {
-                    group_id: a
-                        .replication_group_id()
-                        .or(a.cache_cluster_id())
-                        .unwrap_or("")
-                        .into(),
-                    status: a
-                        .update_action_status()
-                        .map(|x| x.as_str().to_string())
-                        .unwrap_or_default(),
-                    severity: sev,
-                    update_type: ty,
-                    apply_by: a
-                        .service_update_recommended_apply_by_date()
-                        .and_then(|x| x.fmt(aws_smithy_types::date_time::Format::DateTime).ok())
-                        .unwrap_or(by),
-                    engine: a.engine().unwrap_or("").into(),
-                    engine_version: String::new(),
-                    service_update: name,
-                });
+    let mut marker: Option<String> = None;
+    for _ in 0..MAX_PAGES {
+        match ec
+            .describe_update_actions()
+            .service_update_status(aws_sdk_elasticache::types::ServiceUpdateStatus::Available)
+            .max_records(100)
+            .set_marker(marker.take())
+            .send()
+            .await
+        {
+            Ok(o) => {
+                for a in o.update_actions() {
+                    let name = a.service_update_name().unwrap_or("").to_string();
+                    let (sev, ty, by) = severity.get(&name).cloned().unwrap_or_default();
+                    raw.cache_updates.push(RawCacheUpdate {
+                        group_id: a
+                            .replication_group_id()
+                            .or(a.cache_cluster_id())
+                            .unwrap_or("")
+                            .into(),
+                        status: a
+                            .update_action_status()
+                            .map(|x| x.as_str().to_string())
+                            .unwrap_or_default(),
+                        severity: sev,
+                        update_type: ty,
+                        apply_by: a
+                            .service_update_recommended_apply_by_date()
+                            .and_then(|x| x.fmt(aws_smithy_types::date_time::Format::DateTime).ok())
+                            .unwrap_or(by),
+                        engine: a.engine().unwrap_or("").into(),
+                        engine_version: String::new(),
+                        service_update: name,
+                    });
+                }
+                marker = o.marker().map(String::from);
+            }
+            Err(e) => {
+                note!(raw, "DescribeUpdateActions", e);
+                break;
             }
         }
-        Err(e) => note!(raw, "DescribeUpdateActions", e),
+        if marker.is_none() {
+            break;
+        }
     }
 }
 
@@ -1069,17 +1245,99 @@ pub async fn infra_config(
         .unwrap_or_default()
 }
 
-/// Places each resource in the team's code, and adds the Lambda functions
-/// its Terraform defines.
+/// CloudFormation is asked about at most this many resources per read.
+const MAX_STACK_LOOKUPS: usize = 80;
+
+/// Asks CloudFormation which stack made each resource that carries no
+/// stack tags (tags are not propagated to every resource type), and adds
+/// the answer as the tags a stack would have set. A role that may not ask
+/// is noted once, with the permission, and the read goes on without it.
+async fn lookup_stacks(s: &Session, raw: &mut RawAccount, resources: &mut [Resource]) {
+    use common::infra_vuln::stacks::{self, Owner};
+    let mut order: Vec<usize> = (0..resources.len())
+        .filter(|i| locate::stack_ref(&resources[*i]).is_none())
+        .filter(|i| stacks::physical_id(&resources[*i]).is_some())
+        .collect();
+    // What has an update pending first: those are the rows a fix needs.
+    order.sort_by_key(|i| resources[*i].pending.is_empty());
+    let mut failed = 0;
+    for i in order.into_iter().take(MAX_STACK_LOOKUPS) {
+        let Some(id) = stacks::physical_id(&resources[i]) else {
+            continue;
+        };
+        match stacks::owner_of(s, &id).await {
+            Owner::Stack { stack, logical_id } => {
+                let t = &mut resources[i].tags;
+                t.insert("aws:cloudformation:stack-name".into(), stack);
+                t.insert("aws:cloudformation:logical-id".into(), logical_id);
+                t.insert(locate::LOOKUP_TAG.into(), "true".into());
+            }
+            Owner::None => {}
+            Owner::Denied(why) => {
+                raw.errors.push(("DescribeStackResources".into(), why));
+                return;
+            }
+            Owner::Failed(why) => {
+                failed += 1;
+                if failed >= 3 {
+                    raw.errors.push(("DescribeStackResources".into(), why));
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// What placing read, kept on the read's summary so nothing is skipped
+/// silently.
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Placing {
+    pub repos: usize,
+    pub repos_not_searched: usize,
+    pub files_read: usize,
+    pub files_not_read: usize,
+    pub located: usize,
+    pub sure: usize,
+}
+
+/// The order a repository's candidate files are read in, within the cap:
+/// files a resource's name was found in, then Terraform and its variable
+/// files (a module's caller and an environment's values may name nothing
+/// the search looks for), then files found by a tool's marker, then other
+/// files whose name says infrastructure.
+pub fn read_order(
+    named: &BTreeSet<String>,
+    marked: &BTreeSet<String>,
+    tree: &[String],
+) -> Vec<String> {
+    let tf = |p: &str| p.ends_with(".tf") || p.ends_with(".tofu") || p.ends_with(".tfvars");
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |p: &String| {
+        if locate::maybe_iac_path(p) && !out.contains(p) {
+            out.push(p.clone());
+        }
+    };
+    named.iter().for_each(&mut push);
+    tree.iter().filter(|p| tf(p)).for_each(&mut push);
+    marked.iter().for_each(&mut push);
+    tree.iter()
+        .filter(|p| locate::iac_by_name(p))
+        .for_each(&mut push);
+    out
+}
+
+/// Places each resource in the team's code, across every connected
+/// repository, and adds the Lambda functions its Terraform defines.
 async fn place(
     state: &WorkerState,
     team_id: &str,
     account: &str,
     region: &str,
     resources: &mut Vec<Resource>,
-) {
+) -> Placing {
+    let mut report = Placing::default();
     let Some(iid) = super::review_reminder::team_installation_id(state, team_id).await else {
-        return;
+        return report;
     };
     let Ok(gh) = crate::clients::github::GitHubClient::new(
         &state.secrets.github_app_id,
@@ -1087,61 +1345,102 @@ async fn place(
         iid,
         &state.http,
     ) else {
-        return;
+        return report;
     };
-    let repos: Vec<String> = super::infra_repo::team_repos(state, team_id)
-        .await
+    // Every enabled repository; those that speak of infrastructure first,
+    // so they are inside the cap when a team has very many.
+    let mut all = super::infra_repo::team_repos(state, team_id).await;
+    all.retain(|r| r.enabled);
+    all.sort_by_key(|r| !super::infra_repo::speaks_of_infrastructure(r));
+    report.repos_not_searched = all.len().saturating_sub(MAX_REPOS);
+    let repos: Vec<String> = all
         .into_iter()
-        .filter(|r| r.enabled)
-        .map(|r| r.full_name)
         .take(MAX_REPOS)
+        .map(|r| r.full_name)
         .collect();
-    let mut files: Vec<(String, String, String)> = Vec::new();
-    let mut fetched: BTreeSet<(String, String)> = BTreeSet::new();
-    let mut wanted: Vec<(String, String)> = Vec::new();
-    let mut terms: Vec<String> = resources.iter().flat_map(inv::search_terms).collect();
-    terms.push("aws_lambda_function".into());
-    terms.sort();
-    terms.dedup();
+    report.repos = repos.len();
+    let terms = locate::ranked_terms(resources, MAX_TERMS);
+    let mut files: Vec<locate::SourceFile> = Vec::new();
+    let mut mentions: Vec<locate::Mention> = Vec::new();
+    let mut bytes = 0usize;
     for repo in &repos {
         let Some((owner, name)) = repo.split_once('/') else {
             continue;
         };
-        for term in terms.iter().take(30) {
+        let mut named: BTreeSet<String> = BTreeSet::new();
+        let mut marked: BTreeSet<String> = BTreeSet::new();
+        for term in &terms {
             if let Ok(hits) = gh.search_code(owner, name, "HEAD", term).await {
-                for h in hits
-                    .into_iter()
-                    .filter(|h| super::infra_repo::is_iac_path(&h.path))
-                {
-                    wanted.push((repo.clone(), h.path));
+                for h in hits {
+                    if mentions.len() < MAX_MENTIONS {
+                        mentions.push(locate::Mention {
+                            repo: repo.clone(),
+                            path: h.path.clone(),
+                            term: term.clone(),
+                        });
+                    }
+                    named.insert(h.path);
                 }
             }
         }
-    }
-    for (repo, path) in wanted {
-        if files.len() >= MAX_FILES || !fetched.insert((repo.clone(), path.clone())) {
-            continue;
+        for marker in locate::MARKERS {
+            if let Ok(hits) = gh.search_code(owner, name, "HEAD", marker).await {
+                marked.extend(hits.into_iter().map(|h| h.path));
+            }
         }
-        let Some((owner, name)) = repo.split_once('/') else {
-            continue;
-        };
-        if let Ok(c) = gh.get_file_content(owner, name, &path).await {
-            files.push((repo, path, c));
+        let tree: Vec<String> = gh
+            .get_tree(owner, name, "HEAD")
+            .await
+            .map(|t| {
+                t.into_iter()
+                    .filter(|e| e.entry_type == "blob")
+                    .map(|e| e.path)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let order = read_order(&named, &marked, &tree);
+        let mut read = 0;
+        for path in &order {
+            if read >= MAX_FILES_PER_REPO || files.len() >= MAX_FILES || bytes >= MAX_BYTES {
+                report.files_not_read += 1;
+                continue;
+            }
+            let Ok(content) = gh.get_file_content(owner, name, path).await else {
+                continue;
+            };
+            if content.len() > MAX_FILE_BYTES || locate::tool_of(path, &content).is_none() {
+                continue;
+            }
+            bytes += content.len();
+            read += 1;
+            files.push(locate::SourceFile {
+                repo: repo.clone(),
+                path: path.clone(),
+                content,
+            });
         }
     }
+    report.files_read = files.len();
+    // Parsed once for every resource.
+    let code = locate::Code::new(&files, &mentions);
     for r in resources.iter_mut() {
         if r.defined_in.is_none() {
-            r.defined_in = inv::locate(r, &repos, &files);
+            r.defined_in = locate::locate_in(r, &repos, &code);
+        }
+        if let Some(l) = &r.defined_in {
+            report.located += 1;
+            report.sure += l.sure() as usize;
         }
     }
     let now = Utc::now().to_rfc3339();
-    for (repo, path, content) in &files {
-        if path.ends_with(".tf") {
+    for f in &files {
+        if f.path.ends_with(".tf") {
             resources.extend(inv::lambdas_from_terraform(
-                repo, path, content, account, region, &now,
+                &f.repo, &f.path, &f.content, account, region, &now,
             ));
         }
     }
+    report
 }
 
 async fn save(
@@ -1149,6 +1448,7 @@ async fn save(
     team_id: &str,
     raw: &RawAccount,
     resources: &[Resource],
+    placing: &Placing,
 ) -> usize {
     let ttl = (Utc::now() + Duration::days(inv::KEEP_DAYS)).timestamp();
     let mut n = 0;
@@ -1179,6 +1479,7 @@ async fn save(
         "resources": n,
         "errors": raw.errors.iter().map(|(c, w)| serde_json::json!({ "call": c, "why": w, "permission": common::infra_vuln::raw::CALLS.iter().find(|(x, _)| x == c).map(|(_, p)| *p) })).collect::<Vec<_>>(),
         "latest_al2023": raw.latest_al2023,
+        "placing": placing,
     });
     let _ = state
         .dynamo
@@ -1242,10 +1543,11 @@ pub async fn read_account(
         .await
         .map_err(|e| e.message)?;
     let cfg = infra_config(state, team_id).await;
-    let raw = read_with(&session, &a.account, &cfg).await;
+    let mut raw = read_with(&session, &a.account, &cfg).await;
     let mut resources = raw.resources();
-    place(state, team_id, &a.account, &a.region, &mut resources).await;
-    Ok(save(state, team_id, &raw, &resources).await)
+    lookup_stacks(&session, &mut raw, &mut resources).await;
+    let placing = place(state, team_id, &a.account, &a.region, &mut resources).await;
+    Ok(save(state, team_id, &raw, &resources, &placing).await)
 }
 
 /// The daily read, on the review-reminder tick: each account once a day.
@@ -1283,4 +1585,67 @@ pub async fn sweep(state: &WorkerState) -> InventoryReport {
         "Infrastructure inventory read"
     );
     report
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn set(paths: &[&str]) -> BTreeSet<String> {
+        paths.iter().map(|p| p.to_string()).collect()
+    }
+
+    /// A module's caller and an environment's variable file may name
+    /// nothing the search looks for: every Terraform file is read, after
+    /// the files a name was found in and before files found by a marker.
+    #[test]
+    fn files_are_read_in_an_order_that_keeps_what_placing_needs() {
+        let tree: Vec<String> = [
+            "README.md",
+            "src/app/page.tsx",
+            "src/database.ts",
+            "modules/aurora/main.tf",
+            "envs/prod/main.tf",
+            "envs/prod.tfvars",
+            "deploy/api.yaml",
+            "serverless.yml",
+            "node_modules/aws-cdk-lib/index.js",
+            "package.json",
+        ]
+        .iter()
+        .map(|p| p.to_string())
+        .collect();
+        let named = set(&["deploy/api.yaml", "README.md", "scripts/deploy.sh"]);
+        let marked = set(&["src/database.ts", "node_modules/aws-cdk-lib/index.js"]);
+        let order = read_order(&named, &marked, &tree);
+        assert_eq!(
+            order,
+            vec![
+                "deploy/api.yaml",
+                "modules/aurora/main.tf",
+                "envs/prod/main.tf",
+                "envs/prod.tfvars",
+                "src/database.ts",
+                "serverless.yml",
+            ]
+        );
+        // Nothing vendored, no application page, no manifest, and a file
+        // is listed once.
+        assert!(order.iter().all(|p| !p.contains("node_modules")));
+    }
+
+    #[test]
+    fn the_caps_are_wide_enough_for_every_connected_repository() {
+        // The old caps were 8 repositories, 30 names and 40 files.
+        const { assert!(MAX_REPOS >= 30 && MAX_TERMS >= 60 && MAX_FILES >= 1_000) };
+        const { assert!(MAX_FILES_PER_REPO < MAX_FILES) };
+        let p = Placing {
+            repos: 3,
+            files_read: 12,
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&p).unwrap();
+        assert_eq!(v["repos"], 3);
+        assert_eq!(v["files_not_read"], 0);
+    }
 }

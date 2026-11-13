@@ -433,7 +433,7 @@ fn the_build_and_the_start_prove_the_bumps_and_what_breaks_them_is_taken_out() {
     assert!(out < written && written < moved);
     let plan_src = fn_src(dep, "async fn proof_plan(");
     assert!(plan_src.contains("checks::build_commands(&workflows, base)"));
-    assert!(plan_src.contains("rp::discover(lockfile, &ci, &files)"));
+    assert!(plan_src.contains("rp::discover(lockfile, &ci, &proof_files(w, lockfile).await)"));
     assert!(worker_dep_fix::proof_waits(
         Some(std::time::Duration::from_secs(240)),
         false
