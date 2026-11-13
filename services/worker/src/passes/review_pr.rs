@@ -3536,9 +3536,14 @@ async fn run_once(
             section,
         );
         if updated != pr_body {
-            if let Err(e) = github
-                .update_pr_body(&msg.repo_owner, &msg.repo_name, msg.pr_number, &updated)
-                .await
+            if let Err(e) = crate::passes::description::save(
+                &github,
+                &msg.repo_owner,
+                &msg.repo_name,
+                msg.pr_number,
+                &updated,
+            )
+            .await
             {
                 warn!(pr = msg.pr_number, error = %e, "Could not update the own PR's open review findings");
             } else {
@@ -4525,9 +4530,14 @@ async fn end_self_review_rounds(
                 let body = p["body"].as_str().unwrap_or("");
                 let now = super::own_review::defer_findings(body, open, why);
                 if now != body {
-                    if let Err(e) = github
-                        .update_pr_body(&msg.repo_owner, &msg.repo_name, msg.pr_number, &now)
-                        .await
+                    if let Err(e) = crate::passes::description::save(
+                        github,
+                        &msg.repo_owner,
+                        &msg.repo_name,
+                        msg.pr_number,
+                        &now,
+                    )
+                    .await
                     {
                         warn!(pr = msg.pr_number, error = %e, "Could not list the deferred findings on the pull request");
                     }

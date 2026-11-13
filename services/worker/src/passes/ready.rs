@@ -1147,9 +1147,7 @@ async fn fix_own_findings(ctx: &Ctx<'_>, run_id: &str, f: &mut Facts) {
             // are deferred on the pull request with the reason and hold
             // nothing, so the draft waits only on what else holds it.
             let body = super::own_review::defer_findings(&f.body, &items, &why);
-            match ctx
-                .github
-                .update_pr_body(ctx.owner, ctx.repo, ctx.pr, &body)
+            match crate::passes::description::save(ctx.github, ctx.owner, ctx.repo, ctx.pr, &body)
                 .await
             {
                 Ok(_) => {
@@ -1407,10 +1405,8 @@ async fn write_body(ctx: &Ctx<'_>, body: &str, d: &Decision) {
     let Some(new) = body_for(body, d) else {
         return;
     };
-    if let Err(e) = ctx
-        .github
-        .update_pr_body(ctx.owner, ctx.repo, ctx.pr, &new)
-        .await
+    if let Err(e) =
+        crate::passes::description::save(ctx.github, ctx.owner, ctx.repo, ctx.pr, &new).await
     {
         warn!(pr = ctx.pr, error = %e, "Could not write the draft status to the description");
     }
@@ -1472,9 +1468,7 @@ async fn retry_or_give_up(ctx: &Ctx<'_>, run_id: &str, pr_url: &str, r: Refused)
             failed_section(&what),
         );
         if new != body {
-            let _ = ctx
-                .github
-                .update_pr_body(ctx.owner, ctx.repo, ctx.pr, &new)
+            let _ = crate::passes::description::save(ctx.github, ctx.owner, ctx.repo, ctx.pr, &new)
                 .await;
         }
     }

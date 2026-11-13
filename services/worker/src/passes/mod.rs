@@ -1203,6 +1203,7 @@ mod covering;
 mod cross_repo;
 pub mod dep_fix;
 pub mod deploy_stats;
+pub mod description;
 pub mod dlq_cleanup;
 pub mod e2e;
 pub mod e2e_attribution;
@@ -1210,6 +1211,7 @@ pub mod e2e_setup;
 pub mod email_events;
 pub mod feature;
 pub mod feedback;
+pub mod file_claims;
 mod finish_planned;
 pub mod fix_location;
 pub mod formatter;
@@ -6756,6 +6758,18 @@ async fn run_passes(
         "The proof check needs more time than this step has left"
     );
     let mut gaps = proof::prove(&work, &mut evidence, usage, has_time).await;
+    // A sentence the run wrote into a file that says a check passes stays
+    // only on a recorded passing result.
+    let unproven_claims = file_claims::settle(state, msg, &github, work.branch, &evidence).await;
+    if !unproven_claims.is_empty() {
+        add_progress_note(
+            state,
+            &msg.team_id,
+            run_id,
+            &file_claims::note(&unproven_claims),
+        )
+        .await;
+    }
     // Planned work the check found not done is never an Open item: it goes at
     // the top of the pull request, which stays a draft until it's done.
     if !proof::planned_work(&gaps).is_empty() {
@@ -8076,6 +8090,16 @@ async fn run_repo_pipeline(
         has_time_for_remediation(start)
     })
     .await;
+    let unproven_claims = file_claims::settle(state, msg, github, work.branch, &evidence).await;
+    if !unproven_claims.is_empty() {
+        add_progress_note(
+            state,
+            &msg.team_id,
+            run_id,
+            &file_claims::note(&unproven_claims),
+        )
+        .await;
+    }
     // Planned work still not done after the fix rounds: this repository's
     // pull request stays a draft with it listed at the top.
     let unfinished = proof::unfinished_section(&gaps);

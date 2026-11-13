@@ -642,9 +642,14 @@ Return ONLY the markdown body text."#,
         info!(pr_number = number, pr_url = %url, "Using existing PR");
         // A re-run changed the code: the description is rewritten from this
         // diff, never left describing the earlier version.
-        if let Err(e) = github
-            .update_pr_body(&msg.repo_owner, &msg.repo_name, number, &full_body)
-            .await
+        if let Err(e) = crate::passes::description::save(
+            github,
+            &msg.repo_owner,
+            &msg.repo_name,
+            number,
+            &full_body,
+        )
+        .await
         {
             warn!(pr_number = number, error = %e, "Could not update the existing PR's description");
         }
@@ -1592,7 +1597,7 @@ pub async fn put_open_items(
     }
     let out = super::completeness::assemble(&rest, &owned);
     if out != body {
-        if let Err(e) = github.update_pr_body(owner, repo, number, &out).await {
+        if let Err(e) = crate::passes::description::save(github, owner, repo, number, &out).await {
             warn!(pr_number = number, error = %e, "Could not list the open items on the PR");
         }
     }
@@ -1630,9 +1635,9 @@ pub async fn apply_checks(
     };
     let out = with_checks(&body, plan, proof, &repo);
     if out != body {
-        if let Err(e) = github
-            .update_pr_body(&msg.repo_owner, &msg.repo_name, number, &out)
-            .await
+        if let Err(e) =
+            crate::passes::description::save(github, &msg.repo_owner, &msg.repo_name, number, &out)
+                .await
         {
             warn!(pr_number = number, error = %e, "Could not add the checks' results to the PR");
         }
@@ -1939,7 +1944,7 @@ Return ONLY the markdown body text, then a line `{CHANGES_MARK}` and one bullet 
     if body == current {
         return None;
     }
-    if let Err(e) = github.update_pr_body(owner, repo, pr_number, &body).await {
+    if let Err(e) = crate::passes::description::save(github, owner, repo, pr_number, &body).await {
         warn!(pr_number, error = %e, "Could not save the rewritten PR description");
         return None;
     }
@@ -2020,7 +2025,7 @@ async fn fill_placeholders_once(
     if fixed == body.trim() {
         return;
     }
-    match github.update_pr_body(owner, repo, pr_number, &fixed).await {
+    match crate::passes::description::save(github, owner, repo, pr_number, &fixed).await {
         Ok(()) => {
             let left = super::completeness::placeholder_holes(&fixed);
             if left.is_empty() {
@@ -2063,7 +2068,7 @@ pub async fn link_siblings(github: &GitHubClient, prs: &[(String, String, u64)])
         if new == body {
             continue;
         }
-        match github.update_pr_body(owner, name, *number, &new).await {
+        match crate::passes::description::save(github, owner, name, *number, &new).await {
             Ok(()) => info!(
                 pr_number = number,
                 "Named the run's sibling PRs and merge order"
@@ -2094,7 +2099,7 @@ pub async fn settle_unverified_by_ci(
     let Some(body) = super::proof::settle_by_ci(pr["body"].as_str().unwrap_or("")) else {
         return;
     };
-    match github.update_pr_body(owner, repo, pr_number, &body).await {
+    match crate::passes::description::save(github, owner, repo, pr_number, &body).await {
         Ok(()) => info!(
             pr_number,
             "CI passed: removed the checks it settled from the PR's Open items"

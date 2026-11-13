@@ -1063,7 +1063,7 @@ pub async fn note_pr(github: &GitHubClient, owner: &str, repo: &str, pr: u64, de
     let body = p["body"].as_str().unwrap_or("");
     let updated = put_section(body, &dep.section());
     if updated != body {
-        if let Err(e) = github.update_pr_body(owner, repo, pr, &updated).await {
+        if let Err(e) = crate::passes::description::save(github, owner, repo, pr, &updated).await {
             tracing::warn!(pr, error = %e, "Could not state the stacked pull request's dependency");
         }
     }

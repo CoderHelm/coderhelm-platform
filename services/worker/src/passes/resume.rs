@@ -3953,7 +3953,17 @@ async fn run_fix_round(
                 Ok(RoundEnd::Incomplete)
             }
         }
-        Ok(r) => {
+        Ok(mut r) => {
+            // The description is CoderHelm's to rebuild: an account that
+            // says it can't be edited, or leaves an edit of it to a person,
+            // loses that sentence and the rebuild runs below, whether or not
+            // the round pushed code.
+            let (account, handed_off) =
+                super::description::round_account(r.evidence.latest_notes());
+            if handed_off {
+                warn!(run_id = %msg.run_id, "A fix round handed the description to a person; rebuilding it from the branch");
+                r.evidence.notes = account;
+            }
             // What this round was asked and looked up reaches the next one.
             if round.kind == run_round::Kind::ReviewFix {
                 record_own_round_note(
@@ -3976,15 +3986,31 @@ async fn run_fix_round(
                     // from the whole diff now, never left on the earlier
                     // version.
                     if files > 0 {
-                        let _ = super::pr::refresh_description(
+                        // A sentence the round wrote into a file that says
+                        // a check passes stands only on a recorded result.
+                        super::file_claims::settle(
                             state,
+                            &ctx.ticket_msg,
                             &ctx.github,
-                            (&msg.team_id, ctx.ticket_msg.installation_id),
-                            pr.owner,
-                            pr.repo,
-                            pr.number,
-                            &ctx.ticket_msg.team_instructions,
-                            &[],
+                            pr.branch,
+                            &r.evidence,
+                        )
+                        .await;
+                    }
+                    if files > 0 || handed_off {
+                        let _ = super::description::head_moved(
+                            &super::description::Moved {
+                                state,
+                                github: &ctx.github,
+                                team_id: &msg.team_id,
+                                installation_id: ctx.ticket_msg.installation_id,
+                                owner: pr.owner,
+                                repo: pr.repo,
+                                number: pr.number,
+                                ticket_id: &ctx.ticket_msg.ticket_id,
+                                team_instructions: &ctx.ticket_msg.team_instructions,
+                                requests: &[],
+                            },
                             &ctx.provider,
                             &mut ctx.usage,
                         )
@@ -3994,6 +4020,25 @@ async fn run_fix_round(
                 }
                 super::round::Landed::Nothing => {
                     super::round::clear(state, &msg.team_id, &msg.run_id).await;
+                    if handed_off {
+                        let _ = super::description::head_moved(
+                            &super::description::Moved {
+                                state,
+                                github: &ctx.github,
+                                team_id: &msg.team_id,
+                                installation_id: ctx.ticket_msg.installation_id,
+                                owner: pr.owner,
+                                repo: pr.repo,
+                                number: pr.number,
+                                ticket_id: &ctx.ticket_msg.ticket_id,
+                                team_instructions: &ctx.ticket_msg.team_instructions,
+                                requests: &[],
+                            },
+                            &ctx.provider,
+                            &mut ctx.usage,
+                        )
+                        .await;
+                    }
                     Ok(RoundEnd::Done { files: 0 })
                 }
                 super::round::Landed::Refused(why) => {
@@ -4583,10 +4628,14 @@ async fn after_planned_round(
                 section.clone(),
             );
             if updated != body {
-                if let Err(e) = ctx
-                    .github
-                    .update_pr_body(pr.owner, pr.repo, pr.number, &updated)
-                    .await
+                if let Err(e) = crate::passes::description::save(
+                    &ctx.github,
+                    pr.owner,
+                    pr.repo,
+                    pr.number,
+                    &updated,
+                )
+                .await
                 {
                     warn!(run_id = msg.run_id, error = %e, "Could not update the PR's Not finished section");
                 }
@@ -4771,10 +4820,9 @@ async fn recheck_security(
         }
     };
     if let Some(updated) = super::proof::with_security_items(&body, &items) {
-        if let Err(e) = ctx
-            .github
-            .update_pr_body(pr.owner, pr.repo, pr.number, &updated)
-            .await
+        if let Err(e) =
+            crate::passes::description::save(&ctx.github, pr.owner, pr.repo, pr.number, &updated)
+                .await
         {
             warn!(run_id = msg.run_id, error = %e, "Could not update the PR's security items");
         }
@@ -5875,9 +5923,14 @@ async fn finish_on_own_findings(
             let body = p["body"].as_str().unwrap_or("");
             let now = super::own_review::defer_findings(body, open, why);
             if now != body {
-                if let Err(e) = github
-                    .update_pr_body(&msg.repo_owner, &msg.repo_name, pr_number, &now)
-                    .await
+                if let Err(e) = crate::passes::description::save(
+                    github,
+                    &msg.repo_owner,
+                    &msg.repo_name,
+                    pr_number,
+                    &now,
+                )
+                .await
                 {
                     warn!(run_id, error = %e, "Could not list the deferred findings on the pull request");
                 }
@@ -5976,9 +6029,8 @@ async fn hand_off_red_ci(
     match github.get_pull_request(pr.owner, pr.repo, pr.number).await {
         Ok(p) => {
             let body = with_ci_failing(p["body"].as_str().unwrap_or(""), &section);
-            if let Err(e) = github
-                .update_pr_body(pr.owner, pr.repo, pr.number, &body)
-                .await
+            if let Err(e) =
+                crate::passes::description::save(github, pr.owner, pr.repo, pr.number, &body).await
             {
                 warn!(run_id = msg.run_id, error = %e, "Could not write what fails on the pull request");
             }
@@ -6071,9 +6123,8 @@ pub(crate) async fn end_red_ci_rounds(
     match github.get_pull_request(pr.owner, pr.repo, number).await {
         Ok(p) => {
             let body = with_ci_failing(p["body"].as_str().unwrap_or(""), &section);
-            if let Err(e) = github
-                .update_pr_body(pr.owner, pr.repo, number, &body)
-                .await
+            if let Err(e) =
+                crate::passes::description::save(github, pr.owner, pr.repo, number, &body).await
             {
                 warn!(run_id, error = %e, "Could not write what fails on the pull request");
             }
@@ -6313,6 +6364,18 @@ async fn revert_dep_commit(
     apply_revert(state, msg, github, pr, files, &note).await?;
     super::dep_fix::save(state, ticket_msg, &msg.run_id, &run).await;
     super::dep_fix::settle(state, ticket_msg, &run).await;
+    // The head lost a set of bumps: the table and the headline say what it
+    // resolves now.
+    super::description::dependency_sections(
+        state,
+        github,
+        &msg.team_id,
+        pr.owner,
+        pr.repo,
+        pr.number,
+        &ticket_msg.ticket_id,
+    )
+    .await;
     Some(note)
 }
 
@@ -6439,9 +6502,7 @@ async fn apply_revert(
         } else {
             format!("{}\n\n## Deferred\n{line}", body.trim_end())
         };
-        let _ = github
-            .update_pr_body(pr.owner, pr.repo, pr.number, &now)
-            .await;
+        let _ = crate::passes::description::save(github, pr.owner, pr.repo, pr.number, &now).await;
     }
     Some(())
 }

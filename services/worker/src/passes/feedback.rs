@@ -770,10 +770,15 @@ Rules:
         && github
             .has_write_access(&msg.repo_owner, &msg.repo_name, msg.trigger_author.trim())
             .await;
-    if !msg.trigger_author.trim().is_empty() {
-        tools.push(update_description_tool());
-    }
+    // The tool is there in every round: a round with no person behind it
+    // (CoderHelm's own review, a security follow-up) was told to call a tool
+    // it did not have, and answered that it could not edit the description.
+    // There the call asks for the rebuild from the branch.
+    let person_asked = !msg.trigger_author.trim().is_empty();
+    tools.push(update_description_tool());
     let mut full_system = system.clone();
+    full_system.push_str("\n\n");
+    full_system.push_str(common::description_handoff::ROUND_NOTE);
     // Live systems the team connected for this repo, if any: read-only lookups
     // so the fix rests on the system's real shape.
     let live = super::live_sources::LiveSources::load(
@@ -968,7 +973,7 @@ Rules:
         branch: &feedback_round.wip_branch,
         base_branch: &base,
         files_modified: std::sync::Mutex::new(false),
-        description: DescriptionRequests::new(may_edit_description),
+        description: DescriptionRequests::for_round(may_edit_description, person_asked),
         scope_guard,
         history: Some(&history),
         graphs: Some(&graphs),
@@ -1399,24 +1404,42 @@ Rules:
     // with no code change. What changed goes on the reply.
     // The round's changes landed above, as one commit in one push.
     let asked = executor.description.taken();
-    let description_note = if fix_pushed || !asked.is_empty() {
-        let changed = super::pr::refresh_description(
-            state,
-            &github,
-            (&msg.team_id, msg.installation_id),
-            &msg.repo_owner,
-            &msg.repo_name,
-            msg.pr_number,
-            &team_instructions,
-            &asked,
-            &provider,
-            &mut usage,
-        )
-        .await;
-        description_reply(&asked, changed.as_deref())
-    } else {
-        String::new()
-    };
+    // A reply that says the description can't be edited, or leaves an edit
+    // of it to a person, loses that sentence; the rebuild then runs whether
+    // or not code was pushed.
+    let (response, handed_off) = super::description::round_account(&response);
+    if handed_off {
+        warn!(run_id = %msg.run_id, "A feedback round handed the description to a person; rebuilding it from the branch");
+    }
+    let description_note =
+        if fix_pushed || !asked.is_empty() || handed_off || executor.description.wants_rebuild() {
+            let changed = super::description::head_moved(
+                &super::description::Moved {
+                    state,
+                    github: &github,
+                    team_id: &msg.team_id,
+                    installation_id: msg.installation_id,
+                    owner: &msg.repo_owner,
+                    repo: &msg.repo_name,
+                    number: msg.pr_number,
+                    // A security follow-up names its ticket; any other round's
+                    // ticket is the run's.
+                    ticket_id: if msg.security_ticket.is_empty() {
+                        &ticket.0
+                    } else {
+                        &msg.security_ticket
+                    },
+                    team_instructions: &team_instructions,
+                    requests: &asked,
+                },
+                &provider,
+                &mut usage,
+            )
+            .await;
+            description_reply(&asked, changed.as_deref())
+        } else {
+            String::new()
+        };
 
     // Redirects and links the PR changes are checked again after a push
     // (or when the evidence is a day old) and the description's table
@@ -2379,7 +2402,11 @@ fn update_description_tool() -> ToolDefinition {
                       item). Pass the change in the person's words, with every value they gave. \
                       CoderHelm rewrites the description once you finish (after any code you \
                       commit), keeps its shape, and adds what changed to your reply. Only people \
-                      with write access to the repository can have it changed."
+                      with write access to the repository can have it changed to order. When a \
+                      review finding (not a person) says the description is wrong or out of \
+                      date, call this too with what is wrong: CoderHelm then rebuilds the \
+                      description from the branch as it stands. You can always call it; never \
+                      answer that you cannot edit the description."
             .to_string(),
         input_schema: json!({
             "type": "object",
@@ -2395,15 +2422,33 @@ fn update_description_tool() -> ToolDefinition {
 /// whether the person who asked may have it changed.
 struct DescriptionRequests {
     allowed: bool,
+    /// A person triggered the round (false: CoderHelm's own review or a
+    /// follow-up it sent itself).
+    person: bool,
     asked: std::sync::Mutex<Vec<String>>,
+    /// The round asked for the description to be rebuilt from the branch.
+    rebuild: std::sync::atomic::AtomicBool,
 }
 
 impl DescriptionRequests {
+    #[cfg(test)]
     fn new(allowed: bool) -> Self {
+        Self::for_round(allowed, true)
+    }
+
+    fn for_round(allowed: bool, person: bool) -> Self {
         Self {
             allowed,
+            person,
             asked: std::sync::Mutex::new(Vec::new()),
+            rebuild: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// The round asked for a rebuild from the branch (no person's words to
+    /// apply).
+    fn wants_rebuild(&self) -> bool {
+        self.rebuild.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Records one request and says what happens with it.
@@ -2411,6 +2456,18 @@ impl DescriptionRequests {
         let change = change.split_whitespace().collect::<Vec<_>>().join(" ");
         if change.is_empty() {
             return "Say what to change in the description.".to_string();
+        }
+        if !self.person {
+            // Nobody's wording to apply: the description is rebuilt from
+            // the branch, which is what makes it right.
+            self.rebuild
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            return "Recorded. CoderHelm rebuilds the description from the branch as it stands \
+                    when you finish (the versions the lockfile resolves, the counts, the changes, \
+                    the verification and the open items), so the statement you named is replaced \
+                    by what the branch shows. Fix the code if the code is what is wrong; never \
+                    write that you cannot edit the description."
+                .to_string();
         }
         if !self.allowed {
             return "Not changed: only people with write access to this repository can have the \
@@ -4280,6 +4337,33 @@ mod description_request_tests {
         assert_eq!(tool.name, "update_pr_description");
         assert!(tool.description.contains("write access"));
         assert_eq!(tool.input_schema["required"][0], "change");
+    }
+
+    /// A round with no person behind it (CoderHelm's own review) was told
+    /// to call a tool it did not have and said it could not edit the
+    /// description. It has the tool now, and the call asks for the rebuild.
+    #[test]
+    fn a_round_nobody_asked_can_still_have_the_description_rebuilt() {
+        let d = DescriptionRequests::for_round(false, false);
+        assert!(!d.wants_rebuild());
+        let out = d
+            .ask("the table lists glob-walk as 2.3.1 to 4.0.4 (major); the manifest keeps it on 2");
+        assert!(
+            out.starts_with("Recorded. CoderHelm rebuilds the description from the branch"),
+            "{out}"
+        );
+        assert!(d.wants_rebuild());
+        assert!(d.taken().is_empty(), "no person's wording is applied");
+        assert!(common::description_handoff::handoffs(&out).is_empty());
+        let tool = update_description_tool();
+        assert!(tool
+            .description
+            .contains("never answer that you cannot edit the description"));
+        // The round's instructions and the tool are in every round.
+        let src = include_str!("feedback.rs");
+        let run = &src[..src.find("\nfn update_description_tool()").unwrap()];
+        assert!(run.contains("tools.push(update_description_tool());\n    let mut full_system"));
+        assert!(run.contains("common::description_handoff::ROUND_NOTE"));
     }
 }
 

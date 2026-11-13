@@ -532,9 +532,7 @@ impl Cover for GhCover<'_> {
     }
 
     async fn raw_set_body(&self, number: u64, body: &str) -> Result<(), Error> {
-        self.github
-            .update_pr_body(self.owner, self.repo, number, body)
-            .await
+        crate::passes::description::save(self.github, self.owner, self.repo, number, body).await
     }
 }
 
@@ -1235,7 +1233,7 @@ mod tests {
         assert_eq!(body.matches(".raw_fast_forward(").count(), 1);
         assert_eq!(body.matches(".raw_set_body(").count(), 1);
         assert_eq!(body.matches(".fast_forward(self.owner").count(), 1);
-        assert_eq!(body.matches(".update_pr_body(").count(), 1);
+        assert_eq!(body.matches("description::save(").count(), 1);
         let guarded = |name: &str| {
             let at = body.find(&format!("pub async fn {name}<")).unwrap();
             let f = &body[at..];

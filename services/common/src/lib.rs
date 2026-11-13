@@ -43,11 +43,14 @@ pub mod deliveries_rollup;
 /// bisect, resumable state.
 pub mod dep_audit;
 pub mod dep_fix;
+pub mod dep_head;
+pub mod description_handoff;
 /// The shared dead-letter queue: whose each failed message is, whether the
 /// worker can read it, and when the cleanup archives it.
 pub mod dlq;
 /// One DNS TXT lookup through the system resolver (the email check's DMARC).
 pub mod dns_txt;
+pub mod file_claims;
 /// Hybrid self-hosting: CoderHelm addresses, the event relay, the token
 /// broker and the signatures between an install and the hosted side.
 pub mod hybrid;

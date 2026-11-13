@@ -3041,11 +3041,21 @@ fn fmt_num(n: f64) -> String {
 /// A bundle's table: every package bump with its advisories, reachability
 /// and due date.
 pub fn bump_table(unit: &FixUnit, members: &[(&Finding, &FindingState)]) -> String {
+    bump_table_at(unit, members, None)
+}
+
+/// [`bump_table`] with each Version cell as the head resolves it, when the
+/// head was read ([`crate::dep_head`]).
+pub fn bump_table_at(
+    unit: &FixUnit,
+    members: &[(&Finding, &FindingState)],
+    head: Option<&crate::dep_head::HeadFacts>,
+) -> String {
     let cell = |s: &str| s.replace('|', "\\|").replace('\n', " ");
     let mut s = String::from(
         "| Package | Version | Advisories | Reachability | Due |\n| --- | --- | --- | --- | --- |\n",
     );
-    for b in &unit.bumps {
+    for (i, b) in unit.bumps.iter().enumerate() {
         let mine: Vec<&Finding> = members
             .iter()
             .map(|(f, _)| *f)
@@ -3073,11 +3083,9 @@ pub fn bump_table(unit: &FixUnit, members: &[(&Finding, &FindingState)]) -> Stri
             .unwrap_or_default();
         let tier = mine.iter().filter_map(|f| f.tier).min();
         s.push_str(&format!(
-            "| `{}` | {} to {}{} | {} | {} | {}{} |\n",
+            "| `{}` | {} | {} | {} | {}{} |\n",
             cell(&b.package),
-            cell(&b.from),
-            cell(&b.to),
-            if b.major { " (major)" } else { "" },
+            cell(&version_cell(b, i, head)),
             cell(&ids.join(", ")),
             verdict,
             tier.map(|t| format!("{} ", t.as_str())).unwrap_or_default(),
@@ -3152,10 +3160,66 @@ pub fn pr_body_linked(
     check: &crate::upgrade_notes::WhatToCheck,
     links: &BodyLinks,
 ) -> String {
-    let body = if uses_short_body(unit, members) {
-        short_body(unit, members, change, check, links)
+    body_linked(unit, members, change, check, links, None)
+}
+
+/// [`pr_body_linked`] for a pull request that exists or is about to: its
+/// table and its first sentences say what the lockfile on the head
+/// resolves (`head`, from [`crate::dep_head::resolve`]), never what the run
+/// planned. A line that could not be read is shown as a plan and said to be
+/// one.
+pub fn pr_body_at_head(
+    unit: &FixUnit,
+    members: &[(&Finding, &FindingState)],
+    change: &str,
+    check: &crate::upgrade_notes::WhatToCheck,
+    links: &BodyLinks,
+    head: &crate::dep_head::HeadFacts,
+) -> String {
+    body_linked(unit, members, change, check, links, Some(head))
+}
+
+/// The table's Version cell of bump `i`: what the head resolves when it was
+/// read, the plan's versions otherwise.
+fn version_cell(b: &Bump, i: usize, head: Option<&crate::dep_head::HeadFacts>) -> String {
+    match head {
+        Some(h) => h.version_cell(i),
+        None => format!(
+            "{} to {}{}",
+            b.from,
+            b.to,
+            if b.major { " (major)" } else { "" }
+        ),
+    }
+}
+
+fn body_linked(
+    unit: &FixUnit,
+    members: &[(&Finding, &FindingState)],
+    change: &str,
+    check: &crate::upgrade_notes::WhatToCheck,
+    links: &BodyLinks,
+    head: Option<&crate::dep_head::HeadFacts>,
+) -> String {
+    // Which body is chosen by the plan's size, so it never flips between
+    // two heads; everything shown comes from the head when it was read.
+    let short = uses_short_body(unit, members);
+    let plan = unit;
+    let at_head = head.map(|h| h.unit_at_head(unit));
+    let unit = at_head.as_ref().unwrap_or(unit);
+    let headline = head.map(|h| h.headline(plan, members));
+    let body = if short {
+        short_body(
+            unit,
+            members,
+            change,
+            check,
+            links,
+            head,
+            headline.as_deref(),
+        )
     } else {
-        full_body(unit, members, change, check)
+        full_body(unit, members, change, check, head, headline.as_deref())
     };
     let more = if !links.detail.is_empty() {
         links.detail.as_str()
@@ -3173,7 +3237,7 @@ pub fn detail_doc(
     change: &str,
     check: &crate::upgrade_notes::WhatToCheck,
 ) -> String {
-    let full = full_body(unit, members, change, check);
+    let full = full_body(unit, members, change, check, None, None);
     // The description's marker stays in the description only.
     let full = full.replace(MARKER, "");
     format!(
@@ -3255,12 +3319,15 @@ fn package_cell(b: &Bump, members: &[(&Finding, &FindingState)], links: &BodyLin
 /// first, each linked to its finding page), the advisories and evidence
 /// that matter most, "What to check" for the packages to look at first,
 /// the rest by tier with counts, Proof and Closes as usual.
+#[allow(clippy::too_many_arguments)]
 fn short_body(
     unit: &FixUnit,
     members: &[(&Finding, &FindingState)],
     change: &str,
     check: &crate::upgrade_notes::WhatToCheck,
     links: &BodyLinks,
+    head: Option<&crate::dep_head::HeadFacts>,
+    headline: Option<&str>,
 ) -> String {
     let mut s = String::new();
     let tiers = package_tiers(unit, members);
@@ -3290,14 +3357,20 @@ fn short_body(
     } else {
         String::new()
     };
-    s.push_str(&format!(
-        "## Summary\n\nFixes {advisories} advisor{} in {} packages ({majors} major version{}). \
-         {}{due}.\n\n{where_all}\n\n",
-        if advisories == 1 { "y" } else { "ies" },
-        unit.bumps.len(),
-        if majors == 1 { "" } else { "s" },
-        top.as_str(),
-    ));
+    match headline {
+        Some(h) => s.push_str(&format!(
+            "## Summary\n\n{h} {}{due}.\n\n{where_all}\n\n",
+            top.as_str()
+        )),
+        None => s.push_str(&format!(
+            "## Summary\n\nFixes {advisories} advisor{} in {} packages ({majors} major version{}). \
+             {}{due}.\n\n{where_all}\n\n",
+            if advisories == 1 { "y" } else { "ies" },
+            unit.bumps.len(),
+            if majors == 1 { "" } else { "s" },
+            top.as_str(),
+        )),
+    }
     // The table: every bump, most urgent first, ids capped per row.
     let cell = |s: &str| s.replace('|', "\\|").replace('\n', " ");
     s.push_str("| Package | Version | Advisories | Reachability | Due |\n| --- | --- | --- | --- | --- |\n");
@@ -3329,11 +3402,9 @@ fn short_body(
             .map(|d| d.format("%b %-d").to_string())
             .unwrap_or_default();
         s.push_str(&format!(
-            "| {} | {} to {}{} | {} | {} | {}{} |\n",
+            "| {} | {} | {} | {} | {}{} |\n",
             package_cell(b, members, links),
-            cell(&b.from),
-            cell(&b.to),
-            if b.major { " (major)" } else { "" },
+            cell(&version_cell(b, i, head)),
             cell(&shown_ids),
             verdict,
             tiers[i]
@@ -3542,13 +3613,7 @@ fn short_body(
                 .take(25)
                 .map(|&i| {
                     let b = &unit.bumps[i];
-                    format!(
-                        "`{}` {} to {}{}",
-                        b.package,
-                        b.from,
-                        b.to,
-                        if b.major { " (major)" } else { "" }
-                    )
+                    format!("`{}` {}", b.package, version_cell(b, i, head))
                 })
                 .collect();
             rest.push_str(&format!(
@@ -3676,6 +3741,8 @@ fn full_body(
     members: &[(&Finding, &FindingState)],
     change: &str,
     check: &crate::upgrade_notes::WhatToCheck,
+    head: Option<&crate::dep_head::HeadFacts>,
+    headline: Option<&str>,
 ) -> String {
     let mut s = String::new();
     let top = members
@@ -3709,18 +3776,34 @@ fn full_body(
     );
     if unit.bundle {
         let advisories = primaries(members).len();
-        s.push_str(&format!(
-            "## Summary\n\nFixes {advisories} advisor{} in {} package{}. {when}.\n\n",
-            if advisories == 1 { "y" } else { "ies" },
-            unit.bumps.len(),
-            if unit.bumps.len() == 1 { "" } else { "s" },
-        ));
-        s.push_str(&bump_table(unit, members));
+        match headline {
+            Some(h) => s.push_str(&format!("## Summary\n\n{h} {when}.\n\n")),
+            None => s.push_str(&format!(
+                "## Summary\n\nFixes {advisories} advisor{} in {} package{}. {when}.\n\n",
+                if advisories == 1 { "y" } else { "ies" },
+                unit.bumps.len(),
+                if unit.bumps.len() == 1 { "" } else { "s" },
+            )),
+        }
+        s.push_str(&bump_table_at(unit, members, head));
     } else {
-        s.push_str(&format!(
-            "## Summary\n\nFixes {}. {when}.\n\n",
-            what.join("; ")
-        ));
+        match headline {
+            // One fix: what it is for, then what the head resolves.
+            Some(h) => s.push_str(&format!(
+                "## Summary\n\nFor {}. {h} {when}.\n\n",
+                what.join("; ")
+            )),
+            None => s.push_str(&format!(
+                "## Summary\n\nFixes {}. {when}.\n\n",
+                what.join("; ")
+            )),
+        }
+        if let Some(h) = head {
+            for (i, b) in unit.bumps.iter().enumerate() {
+                s.push_str(&format!("- `{}` {}\n", b.package, h.version_cell(i)));
+            }
+            s.push('\n');
+        }
     }
     s.push_str("## Advisory\n\n");
     for (f, st) in members {
@@ -9010,6 +9093,80 @@ mod tests {
         (unit, fs, check)
     }
 
+    /// The plan called 37 of the bundle's 55 packages major versions. A
+    /// review round kept each on its line; the description says what the
+    /// head's lockfile resolves, and where the head can't be read it says
+    /// so and marks the plan as a plan.
+    #[test]
+    fn a_bundles_table_and_headline_come_from_the_head_never_the_plan() {
+        use crate::dep_head::{resolve, unknown, LockAt};
+        let (unit, fs, check) = big_bundle();
+        let pairs: Vec<(&Finding, &FindingState)> = fs.iter().map(|(f, s)| (f, s)).collect();
+        let links = BodyLinks::default();
+        let planned = pr_body_linked(&unit, &pairs, "Bumped.", &check, &links);
+        assert!(planned.contains("(37 major versions)"), "the plan's count");
+        let copies = |v: &str| -> Option<Vec<(String, String)>> {
+            Some(
+                unit.bumps
+                    .iter()
+                    .map(|b| (b.package.clone(), v.to_string()))
+                    .collect(),
+            )
+        };
+        let lock = LockAt {
+            path: "pnpm-lock.yaml".into(),
+            base: copies("1.4.2"),
+            head: copies("1.4.9"),
+            why: String::new(),
+        };
+        let head = resolve(&unit, "0123abc4567", &[lock]);
+        let body = pr_body_at_head(&unit, &pairs, "Bumped.", &check, &links, &head);
+        let summary = &body[..body.find("## Advisory").unwrap()];
+        assert!(
+            summary.contains("in 55 package version lines (0 cross a major version), read from the lockfile on the head `0123abc`"),
+            "{summary}"
+        );
+        assert!(
+            !body.contains("(major)"),
+            "no line crosses a major on the head"
+        );
+        assert!(
+            !summary.contains("2.0.1"),
+            "the plan's target is not what the head installs"
+        );
+        assert!(summary.contains("| 1.4.2 to 1.4.9 |"), "{summary}");
+        // Advisories are counted against their patched versions.
+        let fixed = fs
+            .iter()
+            .filter(|(f, _)| head.fixed(&unit, f) == crate::dep_head::Fixed::Yes)
+            .count();
+        assert!(
+            fixed < fs.len(),
+            "a finding patched only in 2.0.1 is not fixed at 1.4.9"
+        );
+        assert!(summary.contains("Not fixed on the head:"), "{summary}");
+        // Same head, same text.
+        assert_eq!(
+            body,
+            pr_body_at_head(&unit, &pairs, "Bumped.", &check, &links, &head)
+        );
+        // The head could not be read: nothing is counted, the plan is
+        // shown as a plan.
+        let blind = unknown(&unit, "`pnpm-lock.yaml` could not be read on the head");
+        let body = pr_body_at_head(&unit, &pairs, "Bumped.", &check, &links, &blind);
+        let summary = &body[..body.find("## Advisory").unwrap()];
+        assert!(
+            summary.contains("What the head installs is not known"),
+            "{summary}"
+        );
+        assert!(!summary.contains("Fixes "), "{summary}");
+        assert!(
+            summary.contains("1.4.2 to 2.0.1 planned; not read from the head"),
+            "{summary}"
+        );
+        assert!(body.chars().count() <= crate::pr_body_fit::GITHUB_BODY_MAX);
+    }
+
     #[test]
     fn a_55_package_bundle_fits_and_lists_what_to_look_at_first() {
         let (unit, fs, check) = big_bundle();
@@ -9018,7 +9175,7 @@ mod tests {
             "Raised the direct ranges and added overrides for transitive copies. ".repeat(40);
         // The description before: every advisory, path, piece of evidence
         // and package note, over GitHub's limit.
-        let before = full_body(&unit, &pairs, &change, &check);
+        let before = full_body(&unit, &pairs, &change, &check, None, None);
         assert!(
             before.chars().count() > crate::pr_body_fit::GITHUB_BODY_MAX,
             "{}",
