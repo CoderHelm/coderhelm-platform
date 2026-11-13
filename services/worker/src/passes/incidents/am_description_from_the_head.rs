@@ -189,7 +189,7 @@ fn a_rebuild_replaces_the_stale_sections_in_place() {
     );
     // The pipeline rebuilds those sections from the head, in one place.
     let src = include_str!("../security_fixes.rs");
-    let rebuild = fn_src(src, "pub(crate) async fn rebuild_at_head(");
+    let rebuild = fn_src(src, "pub(crate) async fn at_head(");
     assert!(rebuild.contains("head_facts("));
     assert!(rebuild.contains("sec::pr_body_at_head("));
     assert!(rebuild.contains("rebuilt_body(body, &fresh)"));
@@ -197,7 +197,8 @@ fn a_rebuild_replaces_the_stale_sections_in_place() {
     for heading in ["\"## Summary\"", "\"## What to check\"", "\"## Proof\""] {
         assert!(pure.contains(heading), "{heading}");
     }
-    assert!(rebuild.contains("description::save("));
+    let reconcile = include_str!("../description.rs");
+    assert!(reconcile.contains("security_fixes::at_head("));
 }
 
 /// Every section CoderHelm owns elsewhere survives a rebuild word for

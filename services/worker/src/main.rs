@@ -314,7 +314,22 @@ async fn installation_is_teams_own(
     }
 }
 
+/// Handles one message, then rebuilds the description of every pull
+/// request whose branch CoderHelm moved while handling it: the one place a
+/// push is followed up, whichever code made it.
 async fn handle_message(state: Arc<WorkerState>, message: models::WorkerMessage) {
+    let team = serde_json::to_value(&message).ok().and_then(|raw| {
+        let (_, teams) = team_installation::claims(&raw);
+        team_installation::single_team(&teams)
+            .ok()
+            .flatten()
+            .map(str::to_string)
+    });
+    handle_message_inner(Arc::clone(&state), message).await;
+    passes::description::reconcile_moved(&state, team.as_deref()).await;
+}
+
+async fn handle_message_inner(state: Arc<WorkerState>, message: models::WorkerMessage) {
     match message {
         models::WorkerMessage::Ticket(msg) => {
             info!(team_id = %msg.team_id, ticket_id = %msg.ticket_id, "Starting ticket run");

@@ -241,12 +241,11 @@ pub fn label(f: &Finding) -> Option<Label> {
     }
 }
 
-/// Strictly optional: a preference the reviewer inferred or an optional
-/// improvement where the code is correct. On CoderHelm's own pull requests
-/// everything else is fixed before the PR is marked ready
-/// ([`super::own_review`]).
-pub fn optional(f: &Finding) -> bool {
-    matches!(classify(f), Class::Note(r) if r == PREFERENCE || r == OPTIONAL)
+/// Pure style: a preference the reviewer inferred (wording, naming,
+/// layout). The one kind of finding CoderHelm leaves on its own pull
+/// request; an optional improvement to working code is still acted on.
+pub fn pure_style(f: &Finding) -> bool {
+    matches!(classify(f), Class::Note(r) if r == PREFERENCE)
 }
 
 /// Categories that name a data-loss problem.

@@ -114,8 +114,8 @@ pub async fn head_moved(
     )
     .await;
     // After the rewrite, so what the lockfile resolves is the last word on
-    // every version and count.
-    dependency_sections(
+    // every version and count, and the description names the head it is of.
+    rebuild(
         m.state,
         m.github,
         m.team_id,
@@ -129,8 +129,8 @@ pub async fn head_moved(
 }
 
 /// A dependency pull request's table, headline, "What to check" and Proof,
-/// rebuilt from what the lockfile on its head resolves. Costs no model
-/// call. Nothing for any other pull request.
+/// rebuilt from what the lockfile on its head resolves, and the stamp of
+/// the head they are of. Costs no model call.
 pub async fn dependency_sections(
     state: &WorkerState,
     github: &GitHubClient,
@@ -140,18 +140,260 @@ pub async fn dependency_sections(
     number: u64,
     ticket_id: &str,
 ) {
-    if !common::security_fixes::is_ticket(ticket_id) {
-        return;
+    rebuild(state, github, team_id, owner, repo, number, ticket_id).await;
+}
+
+// ── The head a description was built for ───────────────────────────────
+
+/// A hidden line naming the head commit the description's computed
+/// sections were built for. A description with no stamp, or another
+/// head's, is rebuilt before anything rests on it.
+pub const STAMP_START: &str = "<!-- coderhelm:built-for ";
+const STAMP_END: &str = " -->";
+
+/// The head the description says it was built for.
+pub fn stamp_of(body: &str) -> Option<&str> {
+    let at = body.rfind(STAMP_START)? + STAMP_START.len();
+    let rest = &body[at..];
+    Some(rest[..rest.find(STAMP_END)?].trim()).filter(|h| !h.is_empty())
+}
+
+/// `body` stamped as built for `head` (one stamp, on its own last line).
+pub fn with_stamp(body: &str, head: &str) -> String {
+    let kept: Vec<&str> = body
+        .lines()
+        .filter(|l| !l.trim_start().starts_with(STAMP_START))
+        .collect();
+    let body = kept.join("\n");
+    if head.is_empty() {
+        return body.trim_end().to_string();
     }
-    super::security_fixes::rebuild_at_head(
-        state,
-        github,
-        team_id,
-        &format!("{owner}/{repo}"),
-        number,
-        ticket_id,
+    format!("{}\n\n{STAMP_START}{head}{STAMP_END}", body.trim_end())
+}
+
+/// Whether the description was built for `head`.
+pub fn is_current(body: &str, head: &str) -> bool {
+    !head.is_empty() && stamp_of(body) == Some(head)
+}
+
+/// How a reconcile ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reconciled {
+    /// The description was already built for the head (or the pull request
+    /// is closed).
+    Current,
+    /// It was rebuilt and stamped for the head.
+    Rebuilt,
+    /// It could not be read or written: it may still be of another head.
+    Failed(String),
+}
+
+/// Rebuilds the description when its stamp is not the pull request's head.
+/// Every place that rests on the description calls this first: each step
+/// that pushed (`reconcile_moved`), the checks and settle step, a review of
+/// CoderHelm's own pull request, the pull request watch, and the end of the
+/// run, which never completes while the two differ.
+pub async fn reconcile(
+    state: &WorkerState,
+    github: &GitHubClient,
+    team_id: &str,
+    owner: &str,
+    repo: &str,
+    number: u64,
+    ticket_id: &str,
+) -> Reconciled {
+    build(
+        state, github, team_id, owner, repo, number, ticket_id, false,
     )
-    .await;
+    .await
+}
+
+/// [`reconcile`] whatever the stamp says: something the description shows
+/// changed on the same head (its CI ended, the model rewrote its prose).
+pub async fn rebuild(
+    state: &WorkerState,
+    github: &GitHubClient,
+    team_id: &str,
+    owner: &str,
+    repo: &str,
+    number: u64,
+    ticket_id: &str,
+) -> Reconciled {
+    build(state, github, team_id, owner, repo, number, ticket_id, true).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn build(
+    state: &WorkerState,
+    github: &GitHubClient,
+    team_id: &str,
+    owner: &str,
+    repo: &str,
+    number: u64,
+    ticket_id: &str,
+    force: bool,
+) -> Reconciled {
+    if number == 0 {
+        return Reconciled::Current;
+    }
+    let pr = match github.get_pull_request(owner, repo, number).await {
+        Ok(p) => p,
+        Err(e) => return Reconciled::Failed(format!("the pull request could not be read: {e}")),
+    };
+    if pr["state"].as_str().is_some_and(|s| s != "open") {
+        return Reconciled::Current;
+    }
+    let body = pr["body"].as_str().unwrap_or("");
+    let head = pr["head"]["sha"].as_str().unwrap_or("");
+    if head.is_empty() {
+        return Reconciled::Failed("the pull request names no head".into());
+    }
+    if !force && is_current(body, head) {
+        return Reconciled::Current;
+    }
+    // Everything computed from the branch, for this head: a dependency
+    // pull request's table, counts, "What to check" and Proof.
+    let computed = if common::security_fixes::is_ticket(ticket_id) {
+        super::security_fixes::at_head(
+            state,
+            github,
+            team_id,
+            &format!("{owner}/{repo}"),
+            number,
+            ticket_id,
+            &pr,
+        )
+        .await
+    } else {
+        None
+    };
+    let next = with_stamp(computed.as_deref().unwrap_or(body), head);
+    if next == body {
+        return Reconciled::Current;
+    }
+    match save(github, owner, repo, number, &next).await {
+        Ok(()) => {
+            tracing::info!(pr_number = number, %head, was = stamp_of(body).unwrap_or("none"), "Description rebuilt for the head");
+            Reconciled::Rebuilt
+        }
+        Err(e) => Reconciled::Failed(format!("the description could not be saved: {e}")),
+    }
+}
+
+/// [`reconcile`] for a run's pull request, its ticket read from the run.
+pub async fn reconcile_run(
+    state: &WorkerState,
+    github: &GitHubClient,
+    team_id: &str,
+    run_id: &str,
+    owner: &str,
+    repo: &str,
+    number: u64,
+) -> Reconciled {
+    let ticket = run_ticket(state, team_id, run_id).await;
+    reconcile(state, github, team_id, owner, repo, number, &ticket).await
+}
+
+async fn run_ticket(state: &WorkerState, team_id: &str, run_id: &str) -> String {
+    use aws_sdk_dynamodb::types::AttributeValue as A;
+    state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", A::S(team_id.to_string()))
+        .key("run_id", A::S(run_id.to_string()))
+        .projection_expression("ticket_id")
+        .send()
+        .await
+        .ok()
+        .and_then(|o| o.item)
+        .and_then(|i| i.get("ticket_id").and_then(|v| v.as_s().ok()).cloned())
+        .unwrap_or_default()
+}
+
+/// Every branch CoderHelm moved while handling a message gets its pull
+/// request's description rebuilt for the new head. Called once, where
+/// every message ends (`main::handle_message`); the branches come from the
+/// one place every request leaves the GitHub client, so no code path that
+/// pushes has to remember anything.
+pub async fn reconcile_moved(state: &WorkerState, team_id: Option<&str>) {
+    let moved = crate::clients::github::take_moved_branches();
+    let Some(team_id) = team_id else {
+        return;
+    };
+    for m in moved {
+        let Ok(github) = GitHubClient::new(
+            &state.secrets.github_app_id,
+            &state.secrets.github_private_key,
+            m.installation_id,
+            &state.http,
+        ) else {
+            continue;
+        };
+        let Ok(Some(pr)) = github
+            .find_open_pr_for_branch(&m.owner, &m.repo, &m.branch)
+            .await
+        else {
+            continue;
+        };
+        let Some(number) = pr["number"].as_u64() else {
+            continue;
+        };
+        // Only a run's own pull request: its run names its ticket.
+        let Some(run_id) =
+            super::review_pr::lookup_run_by_pr(state, team_id, &m.owner, &m.repo, number).await
+        else {
+            continue;
+        };
+        if let Reconciled::Failed(why) =
+            reconcile_run(state, &github, team_id, &run_id, &m.owner, &m.repo, number).await
+        {
+            warn!(pr_number = number, why, "The description could not be rebuilt after a push; the next step that reads it rebuilds it");
+        }
+    }
+}
+
+/// How an [`edit`] ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Edited {
+    Saved(String),
+    Unchanged,
+    /// The pull request's head is no longer the one the edit is about.
+    HeadMoved,
+    Failed(String),
+}
+
+/// Changes one part of a description on the description as GitHub has it
+/// now, never on a copy read earlier: a review that ran for minutes once
+/// wrote back the copy it had read at its start, with its own section
+/// added, and undid every write made in between. `of_head`: the head the
+/// change is about; when the pull request has moved past it, nothing is
+/// written (a review of a superseded head says nothing about this one).
+pub async fn edit(
+    github: &GitHubClient,
+    owner: &str,
+    repo: &str,
+    number: u64,
+    of_head: Option<&str>,
+    change: impl FnOnce(&str) -> String,
+) -> Edited {
+    let pr = match github.get_pull_request(owner, repo, number).await {
+        Ok(p) => p,
+        Err(e) => return Edited::Failed(e.to_string()),
+    };
+    let body = pr["body"].as_str().unwrap_or("");
+    let head = pr["head"]["sha"].as_str().unwrap_or("");
+    if of_head.is_some_and(|h| !h.is_empty() && !head.is_empty() && h != head) {
+        return Edited::HeadMoved;
+    }
+    let next = change(body);
+    if next == body {
+        return Edited::Unchanged;
+    }
+    match save(github, owner, repo, number, &next).await {
+        Ok(()) => Edited::Saved(next),
+        Err(e) => Edited::Failed(e.to_string()),
+    }
 }
 
 /// A round's account, checked: `(the account without any sentence that
@@ -283,6 +525,87 @@ mod tests {
         let sec = code(include_str!("security_fixes.rs"));
         assert_eq!(sec.matches("sec::pr_body_linked(").count(), 0);
         assert!(sec.matches("sec::pr_body_at_head(").count() >= 3);
+    }
+
+    #[test]
+    fn a_description_names_the_head_it_was_built_for() {
+        let body = "## Summary\n\nKept glob-walk on the 2 line.\n";
+        assert_eq!(stamp_of(body), None);
+        assert!(!is_current(body, "aaa111"));
+        let stamped = with_stamp(body, "aaa111");
+        assert_eq!(stamp_of(&stamped), Some("aaa111"));
+        assert!(is_current(&stamped, "aaa111"));
+        assert!(!is_current(&stamped, "bbb222"), "another head: rebuilt");
+        // One stamp, replaced in place, wherever a writer left the old one.
+        let moved = format!("{stamped}\n\n## Open items\n- One thing.\n");
+        let again = with_stamp(&moved, "bbb222");
+        assert_eq!(again.matches(STAMP_START).count(), 1);
+        assert_eq!(stamp_of(&again), Some("bbb222"));
+        assert!(again.contains("- One thing."));
+        assert_eq!(
+            with_stamp(&again, "bbb222"),
+            again,
+            "stamping is idempotent"
+        );
+    }
+
+    /// Every place that rests on the description reconciles it first, and
+    /// a run never completes while stamp and head differ.
+    #[test]
+    fn everything_that_rests_on_the_description_reconciles_it_first() {
+        let main = include_str!("../main.rs");
+        let handle = &main[main.find("\nasync fn handle_message(").unwrap()..];
+        let handle = &handle[..handle.find("\nasync fn handle_message_inner(").unwrap()];
+        assert!(handle.contains("description::reconcile_moved("));
+        let pr = include_str!("pr.rs");
+        let checks = &pr[pr.find("pub async fn apply_checks(").unwrap()..];
+        let checks = &checks[..checks.find("\n}\n").unwrap()];
+        assert!(
+            checks.contains("description::reconcile("),
+            "the checks and settle step"
+        );
+        let run = &pr[pr.find("\npub async fn run(").unwrap()..];
+        let run = &run[..run.find("\nasync fn notify_alert_pr(").unwrap()];
+        assert!(
+            run.contains("description::reconcile("),
+            "the first description"
+        );
+        let review = include_str!("review_pr.rs");
+        assert!(
+            review.contains("description::reconcile_run("),
+            "before a review of its own pull request"
+        );
+        assert!(
+            review.contains("description::edit("),
+            "a review writes on the description as it is now"
+        );
+        let watch = include_str!("pr_watch.rs");
+        assert!(
+            watch.contains("description::reconcile_run("),
+            "the pull request watch"
+        );
+        let resume = include_str!("resume.rs");
+        let done = &resume[resume.find("\nasync fn complete_run_with_status(").unwrap()..];
+        let gate = done
+            .find("description::reconcile(")
+            .expect("the end of the run");
+        let redrive = done.find("redrive_stale_items(").unwrap();
+        assert!(gate < redrive, "before anything else at completion");
+        assert!(
+            done[gate..redrive].contains("return Err("),
+            "a run never completes on another head's description"
+        );
+        // The dependency sections are computed in one function, called only
+        // from here.
+        for (path, text) in sources() {
+            if path == "passes/description.rs" || path.starts_with("passes/incidents/") {
+                continue;
+            }
+            assert!(
+                !code(&text).contains("security_fixes::at_head("),
+                "{path} builds the dependency sections past description::reconcile"
+            );
+        }
     }
 
     #[test]

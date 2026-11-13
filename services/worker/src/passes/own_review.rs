@@ -5,9 +5,9 @@
 //! with the merge armed: a person was handed a PR with three known open
 //! issues.
 //!
-//! On CoderHelm's own PRs every finding that isn't strictly optional (a
-//! preference the reviewer inferred, or an optional improvement where the
-//! code is correct, see [`super::review_severity::optional`]) is work the
+//! On CoderHelm's own PRs every finding that isn't pure style (a
+//! preference the reviewer inferred: wording, naming, layout, see
+//! [`super::review_severity::pure_style`]) is work the
 //! run does itself:
 //!
 //! - The review lists them at the top of the description under "Open review
@@ -45,7 +45,7 @@ pub const START: &str = "<!-- coderhelm:open-findings -->";
 pub const END: &str = "<!-- /coderhelm:open-findings -->";
 
 /// The findings CoderHelm must fix on its own PR, one line each: every
-/// finding but the strictly optional ones, questions the change doesn't
+/// finding but pure style, questions the change doesn't
 /// rest on, and notes a policy made (a follow-up the PR tracks, a problem
 /// it didn't cause). `held_late` are blockers held as notes because they
 /// came late: they are still defects to fix.
@@ -63,13 +63,56 @@ pub fn required(findings: &[Finding], held_late: &[Finding]) -> Vec<String> {
         .iter()
         .filter(|f| {
             f.holds_merge()
+                || about_description(f)
                 || (f.note_only.is_none()
                     && f.evidence() != Evidence::Question
-                    && !super::review_severity::optional(f))
+                    && !super::review_severity::pure_style(f))
         })
         .chain(held_late.iter())
         .map(line)
         .collect()
+}
+
+/// A finding that says the pull request's description does not match the
+/// code: it names the description and says it is behind. Never optional
+/// and never a person's to fix, whatever its severity: the description is
+/// CoderHelm's to rebuild from the head (`description::rebuild`), which is
+/// what settles it.
+pub fn about_description(f: &Finding) -> bool {
+    let text = format!("{} {}", f.title, f.body).to_lowercase();
+    let names = [
+        "pr description",
+        "pull request description",
+        "pull request's description",
+        "pr body",
+        "the description",
+    ]
+    .iter()
+    .any(|n| text.contains(n));
+    let behind = [
+        "still says",
+        "still lists",
+        "still shows",
+        "still counts",
+        "still claims",
+        "still describes",
+        "stale",
+        "out of date",
+        "outdated",
+        "does not match",
+        "doesn't match",
+        "no longer",
+        "mismatch",
+        "inaccurate",
+        "contradicts",
+        "not updated",
+        "wasn't updated",
+        "was not updated",
+        "disagrees with",
+    ]
+    .iter()
+    .any(|b| text.contains(b));
+    names && behind
 }
 
 /// One line for an earlier review thread still open: its title (the first
@@ -425,7 +468,7 @@ mod tests {
     }
 
     #[test]
-    fn everything_but_the_strictly_optional_is_fixed() {
+    fn everything_but_pure_style_is_fixed() {
         let mut tracked = finding(json!({"title": "Tracked", "category": "bug"}));
         super::super::review_policy::demote(&mut tracked, "tracked");
         let fs = vec![
@@ -447,10 +490,53 @@ mod tests {
             required(&fs, &late),
             vec![
                 "Watermark skips rows (`src/a.rs:3`)".to_string(),
+                // An optional improvement to working code is not style: it
+                // is acted on before the run finishes.
+                "Could cache this (`src/a.rs:3`)".to_string(),
                 "Network might be slow (`src/a.rs:9`)".to_string(),
                 "Late bug (`b.rs`)".to_string(),
-            ]
+            ],
+            "a rename is pure style and stays a note"
         );
+    }
+
+    /// The description being behind the code is never a note left for a
+    /// person, whatever severity or category the reviewer gave it.
+    #[test]
+    fn a_finding_that_the_description_is_behind_is_never_optional() {
+        let stale = finding(json!({
+            "title": "PR description still says the package was not moved",
+            "body": "The lockfile resolves path-match to 2.0.3, but the description's table still lists it as not moved on the head.",
+            "category": "wording", "severity": "low", "optional": true
+        }));
+        assert!(about_description(&stale));
+        assert_eq!(
+            required(std::slice::from_ref(&stale), &[]),
+            vec!["PR description still says the package was not moved (`src/a.rs:3`)".to_string()]
+        );
+        for (title, body) in [
+            ("Rename x", "The name does not match the convention."),
+            (
+                "Typo in the description",
+                "The description has a typo in the second paragraph.",
+            ),
+            (
+                "Stale comment",
+                "The comment above the function is out of date.",
+            ),
+            (
+                "Meta description missing",
+                "The page's meta description tag is no longer set.",
+            ),
+        ] {
+            let f = finding(json!({"title": title, "body": body, "category": "wording"}));
+            assert!(!about_description(&f), "{title}");
+        }
+        let typo = finding(
+            json!({"title": "Typo in the description", "body": "The description has a typo.", "category": "naming"}),
+        );
+        assert!(!about_description(&typo));
+        assert!(required(&[typo], &[]).is_empty());
     }
 
     #[test]
