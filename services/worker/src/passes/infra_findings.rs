@@ -251,6 +251,50 @@ pub(crate) fn unit_for(r: &Record) -> Option<FixUnit> {
     })
 }
 
+/// How long after a tripped guard the one fix round starts: the run that
+/// opened the pull request ends first.
+const FIX_ROUND_DELAY_SECS: i32 = 300;
+
+/// Puts one ticket for a fix unit on the ticket queue.
+async fn send_ticket(
+    state: &WorkerState,
+    team_id: &str,
+    installation_id: u64,
+    unit: &FixUnit,
+    body: String,
+    base: String,
+    delay_secs: i32,
+) -> Result<(), String> {
+    let (owner, name) = unit.repo.split_once('/').ok_or("bad repo")?;
+    let msg = WorkerMessage::Ticket(TicketMessage {
+        team_id: team_id.to_string(),
+        installation_id,
+        source: TicketSource::Alert,
+        ticket_id: unit.ticket.clone(),
+        title: unit.title.clone(),
+        body,
+        repo_owner: owner.to_string(),
+        repo_name: name.to_string(),
+        issue_number: 0,
+        sender: "security".into(),
+        requester: Some(common::requester::Requester::coderhelm(
+            common::requester::SECURITY,
+        )),
+        base_branch: base,
+        ..Default::default()
+    });
+    state
+        .sqs
+        .send_message()
+        .queue_url(&state.config.ticket_queue_url)
+        .message_body(serde_json::to_string(&msg).map_err(|e| e.to_string())?)
+        .delay_seconds(delay_secs.clamp(0, 900))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Queues one infrastructure fix run.
 async fn enqueue(
     state: &WorkerState,
@@ -292,31 +336,16 @@ async fn enqueue(
         .send()
         .await
         .map_err(|e| e.to_string())?;
-    let msg = WorkerMessage::Ticket(TicketMessage {
-        team_id: team_id.to_string(),
+    send_ticket(
+        state,
+        team_id,
         installation_id,
-        source: TicketSource::Alert,
-        ticket_id: unit.ticket.clone(),
-        title: unit.title.clone(),
-        body: records::ticket_body(r),
-        repo_owner: owner.to_string(),
-        repo_name: name.to_string(),
-        issue_number: 0,
-        sender: "security".into(),
-        requester: Some(common::requester::Requester::coderhelm(
-            common::requester::SECURITY,
-        )),
-        base_branch: base,
-        ..Default::default()
-    });
-    state
-        .sqs
-        .send_message()
-        .queue_url(&state.config.ticket_queue_url)
-        .message_body(serde_json::to_string(&msg).map_err(|e| e.to_string())?)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
+        &unit,
+        records::ticket_body(r),
+        base,
+        0,
+    )
+    .await?;
     r.status = Status::Fixing;
     r.ticket = unit.ticket.clone();
     r.updated_at = Utc::now().to_rfc3339();
@@ -374,8 +403,10 @@ async fn start_fixes(
             }
             continue;
         }
-        // The guard refused the last change: no new run by itself.
-        if !r.refused.is_empty() && !asked {
+        // The guard refused this finding's change and the finding still
+        // asks for the same: no new run by itself, until its code or its
+        // target changes. A person's own request goes ahead.
+        if r.guard_blocks() && !asked {
             continue;
         }
         // Production waits for its non-production copy. A person's own
@@ -409,6 +440,9 @@ async fn start_fixes(
         match sec::admit_run(&slots(state, team_id), cfg, &day, busy).await {
             Admit::Start => {
                 let r = &mut records[i];
+                // A refusal about a change it no longer asks for, or one
+                // a person overrides, is forgotten: a full cycle again.
+                r.start_over();
                 match enqueue(state, team_id, installation_id, r).await {
                     Ok(()) => started += 1,
                     Err(e) => {
@@ -611,6 +645,14 @@ pub fn guard_refusals(files: &[(String, String, String)]) -> Vec<String> {
     common::infra_vuln::guard::refusals(&changes)
 }
 
+/// What the guard needs to act on a pull request.
+struct Guarded {
+    gh: crate::clients::github::GitHubClient,
+    installation_id: u64,
+    base: String,
+    reasons: Vec<String>,
+}
+
 /// Reads each infrastructure file the pull request changed, before and
 /// after, and asks the replacement guard. `None` when the files could not
 /// be read (the guard then has no say; the description still carries what
@@ -620,12 +662,12 @@ async fn guard_pr(
     team_id: &str,
     unit: &FixUnit,
     number: u64,
-) -> Option<(crate::clients::github::GitHubClient, Vec<String>)> {
-    let iid = super::review_reminder::team_installation_id(state, team_id).await?;
+) -> Option<Guarded> {
+    let installation_id = super::review_reminder::team_installation_id(state, team_id).await?;
     let gh = crate::clients::github::GitHubClient::new(
         &state.secrets.github_app_id,
         &state.secrets.github_private_key,
-        iid,
+        installation_id,
         &state.http,
     )
     .ok()?;
@@ -649,14 +691,97 @@ async fn guard_pr(
             .unwrap_or_default();
         files.push((path, before, after));
     }
-    let refusals = guard_refusals(&files);
-    Some((gh, refusals))
+    let reasons = guard_refusals(&files);
+    Some(Guarded {
+        gh,
+        installation_id,
+        base,
+        reasons,
+    })
 }
 
-/// A fix run for an infrastructure finding opened its PR. The replacement
-/// guard reads the change first: a change that would replace or destroy a
-/// resource that holds data is refused, its pull request is closed with
-/// the reason, and the finding goes back to its runbook.
+/// What a record shows after each outcome of the guard, and the line for
+/// the finding's timeline. Pure.
+pub(crate) fn after_guard(
+    r: &mut Record,
+    reasons: &[String],
+    number: u64,
+    url: &str,
+    now: &str,
+) -> (records::GuardStep, String) {
+    let step = r.guard_step(reasons);
+    let pr = |state: &str| {
+        Some(records::PrRef {
+            number,
+            url: url.to_string(),
+            state: state.into(),
+        })
+    };
+    let event = match step {
+        records::GuardStep::Passed => {
+            r.status = Status::PrOpen;
+            r.pr = pr("open");
+            format!("PR #{number} opened")
+        }
+        records::GuardStep::FixRound => {
+            // Still CoderHelm's to finish: the fix round is on its way.
+            r.status = Status::Fixing;
+            r.pr = pr("open");
+            format!(
+                "PR #{number}: the change would replace or destroy a resource that holds data ({}). One fix round corrects it and the change is read again",
+                reasons.join("; ")
+            )
+        }
+        records::GuardStep::Draft => {
+            r.status = Status::Open;
+            r.pr = pr("draft");
+            format!(
+                "PR #{number} is now a draft: after a fix round the change would still replace or destroy a resource that holds data ({}). The finding shows its runbook. {}",
+                reasons.join("; "),
+                records::GUARD_STOPPED
+            )
+        }
+    };
+    r.updated_at = now.to_string();
+    (step, event)
+}
+
+/// The pull request becomes a draft with the reason at the top of its
+/// description. It is never closed and its branch is never deleted.
+async fn draft_with_reason(g: &Guarded, unit: &FixUnit, number: u64, reasons: &[String]) {
+    let Some((owner, name)) = unit.repo.split_once('/') else {
+        return;
+    };
+    let pr = match g.gh.get_pull_request(owner, name, number).await {
+        Ok(pr) => pr,
+        Err(e) => {
+            warn!(number, error = %e, "infra findings: the pull request could not be read to make it a draft");
+            return;
+        }
+    };
+    if !pr["draft"].as_bool().unwrap_or(false) {
+        if let Some(node) = pr["node_id"].as_str() {
+            if let Err(e) = g.gh.convert_pr_to_draft(node).await {
+                warn!(number, error = %e, "infra findings: the pull request could not be made a draft");
+            }
+        }
+    }
+    // The reason is in the description whether or not the conversion
+    // worked: it alone keeps the pull request from being marked ready.
+    let body = common::infra_vuln::guard::put_hold(pr["body"].as_str().unwrap_or(""), reasons);
+    if let Err(e) = g.gh.update_pr_body(owner, name, number, &body).await {
+        warn!(number, error = %e, "infra findings: the reason could not be written on the pull request");
+    }
+}
+
+/// A fix run for an infrastructure finding opened or updated its PR. The
+/// replacement guard reads the change first. A change that would replace
+/// or destroy a resource that holds data gets one fix round that is told
+/// each offending line; if the change still trips the guard after it, the
+/// pull request becomes a draft with the reason at its top, the finding
+/// falls back to its runbook, and no further attempt starts by itself
+/// until the finding's code or target changes. The pull request is never
+/// closed and its branch is never deleted.
 pub async fn on_pr_opened(
     state: &WorkerState,
     team_id: &str,
@@ -664,57 +789,41 @@ pub async fn on_pr_opened(
     number: u64,
     url: &str,
 ) {
-    let refused = match guard_pr(state, team_id, unit, number).await {
-        Some((gh, reasons)) if !reasons.is_empty() => {
-            if let Some((owner, name)) = unit.repo.split_once('/') {
-                let explain = common::infra_vuln::guard::explain(&reasons);
-                if let Err(e) = gh.update_pr_body(owner, name, number, &explain).await {
-                    warn!(team_id, number, error = %e, "infra findings: the refusal could not be written on the pull request");
-                }
-                if let Err(e) = gh.close_pull_request(owner, name, number).await {
-                    warn!(team_id, number, error = %e, "infra findings: the refused pull request could not be closed");
-                }
-            }
-            reasons
-        }
-        _ => Vec::new(),
-    };
+    let guarded = guard_pr(state, team_id, unit, number).await;
+    let reasons: Vec<String> = guarded
+        .as_ref()
+        .map(|g| g.reasons.clone())
+        .unwrap_or_default();
+    let mut drafted = false;
     for id in &unit.finding_ids {
         let mut recs = load_records(state, team_id).await;
-        if let Some(r) = recs.iter_mut().find(|r| &r.finding.id == id) {
-            if refused.is_empty() {
-                r.status = Status::PrOpen;
-                r.pr = Some(records::PrRef {
-                    number,
-                    url: url.to_string(),
-                    state: "open".into(),
-                });
-            } else {
-                r.status = Status::Open;
-                r.pr = Some(records::PrRef {
-                    number,
-                    url: url.to_string(),
-                    state: "closed".into(),
-                });
-                r.refused = refused.clone();
+        let Some(r) = recs.iter_mut().find(|r| &r.finding.id == id) else {
+            continue;
+        };
+        let (step, event) = after_guard(r, &reasons, number, url, &Utc::now().to_rfc3339());
+        save(state, team_id, r).await;
+        super::security_fixes::add_event(state, team_id, id, &event, Some(url)).await;
+        match (step, &guarded) {
+            (records::GuardStep::FixRound, Some(g)) => {
+                if let Err(e) = send_ticket(
+                    state,
+                    team_id,
+                    g.installation_id,
+                    unit,
+                    records::fix_round_body(r),
+                    g.base.clone(),
+                    FIX_ROUND_DELAY_SECS,
+                )
+                .await
+                {
+                    warn!(team_id, number, error = %e, "infra findings: the fix round could not be queued");
+                }
             }
-            r.updated_at = Utc::now().to_rfc3339();
-            save(state, team_id, r).await;
-            super::security_fixes::add_event(
-                state,
-                team_id,
-                id,
-                &if refused.is_empty() {
-                    format!("PR #{number} opened")
-                } else {
-                    format!(
-                        "PR #{number} refused and closed: the change would replace or destroy a resource that holds data ({})",
-                        refused.join("; ")
-                    )
-                },
-                Some(url),
-            )
-            .await;
+            (records::GuardStep::Draft, Some(g)) if !drafted => {
+                draft_with_reason(g, unit, number, &reasons).await;
+                drafted = true;
+            }
+            _ => {}
         }
     }
 }
@@ -786,6 +895,115 @@ mod tests {
         let mut runbook = r.clone();
         runbook.finding.fix.kind = Some(FixKind::Runbook);
         assert!(unit_for(&runbook).is_none());
+    }
+
+    fn pr_record() -> Record {
+        Record::new(
+            InfraFinding {
+                id: "abc".into(),
+                name: "orders".into(),
+                fix: Fix {
+                    kind: Some(FixKind::Pr),
+                    to: "16.6".into(),
+                    location: Some(Location {
+                        repo: "acme/infra".into(),
+                        file: "db/main.tf".into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            "t",
+        )
+    }
+
+    const WHY: &str = "db/main.tf, line 2: `aws_db_instance.orders` changes `identifier`, which replaces the resource";
+
+    #[test]
+    fn a_tripped_guard_gets_one_fix_round_and_the_pull_request_stays_open() {
+        let mut r = pr_record();
+        let (step, event) = after_guard(&mut r, &[WHY.to_string()], 7, "u", "now");
+        assert_eq!(step, records::GuardStep::FixRound);
+        // Still CoderHelm's work, the pull request open, never closed.
+        assert_eq!(r.status, Status::Fixing);
+        assert_eq!(r.pr.as_ref().unwrap().state, "open");
+        assert!(event.contains("One fix round corrects it"), "{event}");
+        assert!(!event.contains("closed"));
+        // What the round is told.
+        let body = records::fix_round_body(&r);
+        assert!(
+            body.contains(WHY) && body.contains("Undo exactly those lines"),
+            "{body}"
+        );
+        // The round's change passes: a normal open pull request again.
+        let (step, event) = after_guard(&mut r, &[], 7, "u", "now");
+        assert_eq!(step, records::GuardStep::Passed);
+        assert_eq!(r.status, Status::PrOpen);
+        assert!(r.refused.is_empty());
+        assert_eq!(event, "PR #7 opened");
+    }
+
+    #[test]
+    fn a_second_trip_makes_the_pull_request_a_draft_and_stops_automatic_attempts() {
+        let mut r = pr_record();
+        after_guard(&mut r, &[WHY.to_string()], 7, "u", "now");
+        let (step, event) = after_guard(&mut r, &[WHY.to_string()], 7, "u", "now");
+        assert_eq!(step, records::GuardStep::Draft);
+        assert_eq!(r.pr.as_ref().unwrap().state, "draft");
+        assert!(
+            event.contains("is now a draft") && event.contains("runbook"),
+            "{event}"
+        );
+        assert!(!event.contains("closed"));
+        // Open again as a finding, shown as a runbook, and not picked up
+        // by itself while it asks for the same change.
+        assert_eq!(r.status, Status::Open);
+        assert_eq!(r.view()["fix"]["kind"], "runbook");
+        assert!(unit_for(&r).is_some(), "still a code fix underneath");
+        assert!(r.guard_blocks());
+        // Its target changes: an attempt may start again, from the top.
+        r.finding.fix.to = "16.8".into();
+        assert!(!r.guard_blocks());
+        r.start_over();
+        let (step, _) = after_guard(&mut r, &[WHY.to_string()], 8, "u", "now");
+        assert_eq!(step, records::GuardStep::FixRound);
+    }
+
+    /// The description's section is what keeps the draft a draft: the one
+    /// decision that marks pull requests ready reads it as a hold, and a
+    /// draft is never merged (`await_merge`).
+    #[test]
+    fn the_draft_reason_holds_the_pull_request_and_nothing_closes_it_or_deletes_its_branch() {
+        use common::infra_vuln::guard;
+        let body = guard::put_hold("<!-- m -->\n\n## Summary\n", &[WHY.to_string()]);
+        let holds = crate::passes::ready::body_holds(&body);
+        assert_eq!(holds.len(), 1, "{holds:?}");
+        assert!(crate::passes::ready::body_holds("## Summary\n").is_empty());
+        let decided = crate::passes::ready::decide(&crate::passes::ready::Facts {
+            draft: true,
+            body,
+            ..Default::default()
+        });
+        assert!(
+            matches!(decided, crate::passes::ready::Decision::Held { .. }),
+            "{decided:?}"
+        );
+        // This file never closes a pull request, deletes a branch or
+        // marks one ready.
+        let src = include_str!("infra_findings.rs");
+        let code = src.split("#[cfg(test)]").next().unwrap();
+        for never in [
+            "close_pull_request",
+            "delete_branch",
+            "delete_ref",
+            "mark_pr_ready",
+            "merge_pull_request",
+        ] {
+            assert!(!code.contains(never), "infra_findings calls {never}");
+        }
+        // And it writes a description in exactly one place.
+        assert_eq!(code.matches(".update_pr_body(").count(), 1);
     }
 
     #[test]

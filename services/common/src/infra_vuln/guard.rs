@@ -18,6 +18,12 @@
 //! - A safeguard taken away in the same change (deletion protection,
 //!   `prevent_destroy`, a retaining deletion policy).
 //!
+//! When the guard trips, the pull request is never closed and its branch
+//! is never deleted: one fix round is told each offending line
+//! ([`fix_round`]); if the change still trips, the pull request becomes a
+//! draft with the reason at the top of its description ([`put_hold`]) and
+//! the finding falls back to its runbook (`records::guard_step`).
+//!
 //! What the guidance documents as in place (an engine version raised, a
 //! node group release, a runtime) passes. The guard is a floor, not a
 //! plan: the pull request still says what the plan must show.
@@ -171,11 +177,20 @@ fn terraform(c: &Change, out: &mut Vec<String>) {
         let Some(a) = resources(&after).into_iter().find(|a| a.labels == b.labels) else {
             if !moved.contains(&address) {
                 out.push(format!(
-                    "{}: `{address}` is removed or renamed with no `moved` block. Terraform would destroy the resource it manages.",
-                    c.path
+                    "{}: `{address}` (line {} before the change) is removed or renamed with no `moved` block. Terraform would destroy the resource it manages.",
+                    c.path, b.line
                 ));
             }
             continue;
+        };
+        // The file and the line of the changed attribute as it now stands
+        // (the block's line when the attribute is gone).
+        let at = |n: &str| {
+            format!(
+                "{}, line {}",
+                c.path,
+                a.attr(n).map(|x| x.line).unwrap_or(a.line)
+            )
         };
         let changed =
             |n: &str| b.attr(n).map(|x| x.expr.trim()) != a.attr(n).map(|x| x.expr.trim());
@@ -183,7 +198,7 @@ fn terraform(c: &Change, out: &mut Vec<String>) {
             if changed(n) {
                 out.push(format!(
                     "{}: `{address}` changes `{n}`, which replaces the resource (a new one is created and this one is destroyed).",
-                    c.path
+                    at(n)
                 ));
             }
         }
@@ -191,7 +206,7 @@ fn terraform(c: &Change, out: &mut Vec<String>) {
             if changed(n) {
                 out.push(format!(
                     "{}: `{address}` changes `{n}`: the addresses of the resources it creates change, and Terraform destroys the ones that no longer have one.",
-                    c.path
+                    at(n)
                 ));
             }
         }
@@ -203,7 +218,7 @@ fn terraform(c: &Change, out: &mut Vec<String>) {
                 if version_lt(&new, &old) {
                     out.push(format!(
                         "{}: `{address}` lowers `{n}` from {old} to {new}. No downgrade is done in place: the service refuses it, and for an ElastiCache replication group the provider destroys and re-creates the group.",
-                        c.path
+                        at(n)
                     ));
                 }
             }
@@ -212,20 +227,20 @@ fn terraform(c: &Change, out: &mut Vec<String>) {
         {
             out.push(format!(
                 "{}: `{address}` changes `engine_version` on a cluster instance. An Aurora upgrade is made on the `aws_rds_cluster`; on the instance it does not upgrade anything.",
-                c.path
+                at("engine_version")
             ));
         }
         let truthy = |x: Option<&hcl::Attr>| x.is_some_and(|x| x.expr.trim() == "true");
         if truthy(b.attr("deletion_protection")) && !truthy(a.attr("deletion_protection")) {
             out.push(format!(
                 "{}: `{address}` turns `deletion_protection` off.",
-                c.path
+                at("deletion_protection")
             ));
         }
         if !truthy(b.attr("skip_final_snapshot")) && truthy(a.attr("skip_final_snapshot")) {
             out.push(format!(
                 "{}: `{address}` turns `skip_final_snapshot` on.",
-                c.path
+                at("skip_final_snapshot")
             ));
         }
         let guarded = |x: &Block| {
@@ -235,7 +250,7 @@ fn terraform(c: &Change, out: &mut Vec<String>) {
         if guarded(b) && !guarded(a) {
             out.push(format!(
                 "{}: `{address}` removes `prevent_destroy`.",
-                c.path
+                at("lifecycle")
             ));
         }
     }
@@ -453,16 +468,66 @@ pub fn refusals(changes: &[Change]) -> Vec<String> {
     out
 }
 
-/// The refusal as a card or a closed pull request says it.
-pub fn explain(reasons: &[String]) -> String {
+/// What the one fix round after a tripped guard is told: each line that
+/// would replace, remove or downgrade the resource, and what to produce
+/// instead. Goes under the ticket's own text.
+pub fn fix_round(reasons: &[String]) -> String {
     let mut out = String::from(
-        "CoderHelm refused this change: it would replace or destroy a resource that holds data, or take away what protects it.\n\n",
+        "\n\nThe change on this branch was read before anything else happened to it, and it would replace or destroy a resource that holds data, or take away what protects it:\n\n",
     );
     for r in reasons {
         out.push_str(&format!("- {r}\n"));
     }
-    out.push_str("\nNothing was merged or applied. The update is still open; apply it with the runbook on the finding, or change the code by hand with a plan reviewed first.");
+    out.push_str("\nUndo exactly those lines on this branch, so each attribute, block, logical id and construct id named above is as it is on the base branch, and make the in-place change this ticket asks for: only the one value it names, raised and never lowered. Change nothing else. The change is read again when this round ends.\n");
     out
+}
+
+/// Around the section at the top of a description that says why the pull
+/// request is a draft. While the section is there the pull request is
+/// never marked ready (`worker::passes::ready`), so it is never merged.
+pub const HOLD_START: &str = "<!-- coderhelm:infra-guard -->";
+pub const HOLD_END: &str = "<!-- /coderhelm:infra-guard -->";
+
+/// The section: the reason and the offending lines.
+pub fn hold_section(reasons: &[String]) -> String {
+    let mut out = format!(
+        "{HOLD_START}\n## This pull request is a draft: do not merge it as it is\n\nCoderHelm read its own change twice and both times it would replace or destroy a resource that holds data, or take away what protects it:\n\n"
+    );
+    for r in reasons {
+        out.push_str(&format!("- {r}\n"));
+    }
+    out.push_str("\nNothing was merged or applied, and CoderHelm makes no further attempt until the code that defines the resource or the update's target changes. The finding in CoderHelm carries the runbook to apply the update in AWS. The branch is kept: a person can correct the lines above on it, then remove this section and mark the pull request ready.\n");
+    out.push_str(HOLD_END);
+    out.push('\n');
+    out
+}
+
+/// A description with the section at its top (after a first-line marker
+/// comment, which stays first), replacing an earlier one.
+pub fn put_hold(body: &str, reasons: &[String]) -> String {
+    let without = match (body.find(HOLD_START), body.find(HOLD_END)) {
+        (Some(a), Some(b)) if b > a => format!(
+            "{}{}",
+            &body[..a],
+            body[b + HOLD_END.len()..].trim_start_matches('\n')
+        ),
+        _ => body.to_string(),
+    };
+    let section = hold_section(reasons);
+    match without.split_once('\n') {
+        Some((first, rest)) if first.trim_start().starts_with("<!--") => {
+            format!("{first}\n\n{section}\n{}", rest.trim_start_matches('\n'))
+        }
+        _ => format!("{section}\n{without}"),
+    }
+}
+
+/// Why a description holds its pull request as a draft, when it carries
+/// the section.
+pub fn hold(body: &str) -> Option<String> {
+    (body.contains(HOLD_START) && body.contains(HOLD_END)).then(|| {
+        "CoderHelm's own change would replace or destroy a resource that holds data (the lines are at the top of the description)".to_string()
+    })
 }
 
 #[cfg(test)]
@@ -537,7 +602,7 @@ resource "aws_db_instance" "orders" {
         assert!(r[0].contains("removes `prevent_destroy`"), "{r:?}");
         let r = tf(DB, "");
         assert!(r[0].contains("Terraform would destroy"), "{r:?}");
-        assert!(explain(&r).contains("Nothing was merged or applied"));
+        assert!(fix_round(&r).contains("make the in-place change this ticket asks for"));
         // A variable file that lowers a version.
         let r = refusals(&[Change {
             path: "envs/prod.tfvars",
@@ -684,6 +749,56 @@ Resources:
             after: &safe
         }])
         .is_empty());
+    }
+
+    #[test]
+    fn a_reason_names_the_file_and_the_line() {
+        let r = tf(DB, &DB.replace("orders-prod", "orders-production"));
+        assert!(r[0].starts_with("db/main.tf, line 3: "), "{r:?}");
+        let r = tf(DB, &DB.replace("16.4", "15.8"));
+        assert!(r[0].starts_with("db/main.tf, line 5: "), "{r:?}");
+        let r = tf(DB, "");
+        assert!(r[0].contains("(line 2 before the change)"), "{r:?}");
+    }
+
+    #[test]
+    fn the_fix_round_is_told_each_line_and_what_to_produce_instead() {
+        let r = tf(DB, &DB.replace("orders-prod", "orders-production"));
+        let t = fix_round(&r);
+        assert!(
+            t.contains("- db/main.tf, line 3: `aws_db_instance.orders` changes `identifier`"),
+            "{t}"
+        );
+        assert!(t.contains("Undo exactly those lines"));
+        assert!(t.contains("raised and never lowered"));
+        assert!(t.contains("read again when this round ends"));
+    }
+
+    #[test]
+    fn the_draft_section_sits_at_the_top_once_and_holds_the_pull_request() {
+        let reasons =
+            vec!["db/main.tf, line 3: `aws_db_instance.orders` changes `identifier`".to_string()];
+        let body = "<!-- marker -->\n\n## Summary\n\nRaised the version.\n";
+        assert_eq!(hold(body), None);
+        let held = put_hold(body, &reasons);
+        assert!(
+            held.starts_with("<!-- marker -->\n\n<!-- coderhelm:infra-guard -->"),
+            "{held}"
+        );
+        assert!(held.contains("## This pull request is a draft"));
+        assert!(held.contains("db/main.tf, line 3"));
+        assert!(held.contains("The branch is kept"));
+        assert!(
+            held.ends_with("## Summary\n\nRaised the version.\n"),
+            "{held}"
+        );
+        assert!(hold(&held).is_some());
+        // Put again with new reasons: one section, the new lines.
+        let again = put_hold(&held, &["x.tf, line 9: other".to_string()]);
+        assert_eq!(again.matches(HOLD_START).count(), 1);
+        assert!(again.contains("x.tf, line 9") && !again.contains("db/main.tf, line 3"));
+        // A description with no marker line: the section is first.
+        assert!(put_hold("## Summary\n", &reasons).starts_with(HOLD_START));
     }
 
     #[test]

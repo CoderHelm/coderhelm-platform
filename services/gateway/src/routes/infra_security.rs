@@ -603,6 +603,7 @@ mod tests {
         );
         assert_eq!(x["fix"]["runbook"]["apply_by"], "2026-12-01");
         assert_eq!(x["fix"]["order"][0], "2 of 2 pending on this database.");
+        assert_eq!(x["drafted"], false);
         assert!(x["refused"][0]
             .as_str()
             .unwrap()

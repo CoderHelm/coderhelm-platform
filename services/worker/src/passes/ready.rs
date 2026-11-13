@@ -305,6 +305,14 @@ pub fn body_holds_on(body: &str, ci_green: bool) -> Vec<Reason> {
     if let Some(r) = own_review_reason(body) {
         out.push(r);
     }
+    // An infrastructure fix the replacement guard gave up on: it would
+    // replace or destroy a resource that holds data.
+    if let Some(why) = common::infra_vuln::guard::hold(body) {
+        out.push(Reason::new(
+            why,
+            "Correct the lines named at the top of the description on this branch, then remove that section and mark the pull request ready; or apply the update with the runbook on the finding.",
+        ));
+    }
     // A stacked change asks a person to look first.
     if let Some(why) = super::stack::hold(body) {
         out.push(Reason::new(

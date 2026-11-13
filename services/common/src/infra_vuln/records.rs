@@ -92,10 +92,21 @@ pub struct Record {
     #[serde(default)]
     pub fixed_at: Option<String>,
     /// Why the replacement guard refused the change a fix run made
-    /// ([`super::guard`]). While it is set no new fix run starts by
-    /// itself: the finding is applied by its runbook or by hand.
+    /// ([`super::guard`]): each offending line.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub refused: Vec<String>,
+    /// How many times in a row the guard tripped on this finding's
+    /// change: 1 while the one fix round runs, 2 once it gave up.
+    #[serde(default)]
+    pub guard_attempts: u8,
+    /// The guard tripped twice: the pull request is a draft and the
+    /// finding is applied by its runbook.
+    #[serde(default)]
+    pub drafted: bool,
+    /// What the refused change was for ([`guard_sig`]): no new fix run
+    /// starts by itself while the finding still asks for the same.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub guard_sig: String,
     /// A line for the timeline when something changed (not stored).
     #[serde(skip)]
     pub event: Option<String>,
@@ -122,6 +133,9 @@ impl Record {
             updated_at: now.into(),
             fixed_at: None,
             refused: Vec::new(),
+            guard_attempts: 0,
+            drafted: false,
+            guard_sig: String::new(),
         }
     }
 
@@ -139,11 +153,24 @@ impl Record {
             o.insert("first_seen_at".into(), json!(self.first_seen_at));
             o.insert("updated_at".into(), json!(self.updated_at));
             o.insert("fixed_at".into(), json!(self.fixed_at));
-            if !self.refused.is_empty() {
-                o.insert("refused".into(), json!(self.refused));
-            }
             // The fix's kind as the contract names it.
             o["fix"]["kind"] = json!(self.finding.fix.kind);
+            if !self.refused.is_empty() {
+                o.insert("refused".into(), json!(self.refused));
+                o.insert("drafted".into(), json!(self.drafted));
+                if self.drafted {
+                    // The guard gave up on the code change: the person
+                    // still has a correct way to apply the update.
+                    o["fix"]["kind"] = json!(FixKind::Runbook);
+                    o["fix"]["decision"] = json!(format!(
+                        "A runbook: CoderHelm's own code change for this update would have replaced or destroyed a resource that holds data, twice, so its pull request is a draft and the update is applied in AWS. {}",
+                        GUARD_STOPPED
+                    ));
+                    o.insert("note".into(), json!(GUARD_DRAFT_NOTE));
+                } else {
+                    o.insert("note".into(), json!(GUARD_ROUND_NOTE));
+                }
+            }
             if self.status == Status::PrOpen
                 && self.pr.as_ref().is_some_and(|p| p.state == "merged")
             {
@@ -152,6 +179,87 @@ impl Record {
         }
         v
     }
+}
+
+/// What the page says while the one fix round after a tripped guard runs.
+pub const GUARD_ROUND_NOTE: &str = "CoderHelm read its own change and it would have replaced or destroyed a resource that holds data. One fix round is correcting the lines below; the change is read again when it ends.";
+/// What the page says once the guard tripped twice.
+pub const GUARD_DRAFT_NOTE: &str = "The pull request is kept as a draft with the reason at the top of its description, and is never merged as it is. Nothing was applied.";
+/// When CoderHelm tries the code change again.
+pub const GUARD_STOPPED: &str = "CoderHelm makes no further attempt until the code that defines the resource or the update's target changes.";
+
+/// What a finding's code change is for: the target and the line it
+/// edits. A guard refusal holds for as long as this stays the same.
+pub fn guard_sig(f: &InfraFinding) -> String {
+    let l = f.fix.location.as_ref();
+    let e = l.and_then(|l| l.edit.as_ref());
+    format!(
+        "{}|{}|{}|{}|{}|{}",
+        f.fix.to,
+        l.map(|l| l.repo.as_str()).unwrap_or(""),
+        l.map(|l| l.address.as_str()).unwrap_or(""),
+        e.map(|e| e.file.as_str()).unwrap_or(""),
+        e.map(|e| e.attribute.as_str()).unwrap_or(""),
+        e.map(|e| e.value.as_str()).unwrap_or(""),
+    )
+}
+
+/// What happens after the guard read a fix run's pull request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuardStep {
+    /// Nothing to object to: the pull request stands.
+    Passed,
+    /// First trip: one fix round, told each offending line.
+    FixRound,
+    /// Second trip: the pull request becomes a draft, the finding falls
+    /// back to its runbook, and no further attempt starts by itself.
+    Draft,
+}
+
+impl Record {
+    fn clear_guard(&mut self) {
+        self.refused.clear();
+        self.guard_attempts = 0;
+        self.drafted = false;
+        self.guard_sig.clear();
+    }
+
+    /// Records what the guard found on this finding's pull request and
+    /// says what happens next. Pure: the caller does it.
+    pub fn guard_step(&mut self, reasons: &[String]) -> GuardStep {
+        if reasons.is_empty() {
+            self.clear_guard();
+            return GuardStep::Passed;
+        }
+        self.refused = reasons.to_vec();
+        self.guard_sig = guard_sig(&self.finding);
+        self.guard_attempts = self.guard_attempts.saturating_add(1);
+        if self.guard_attempts == 1 {
+            GuardStep::FixRound
+        } else {
+            self.drafted = true;
+            GuardStep::Draft
+        }
+    }
+
+    /// The guard refused this finding's change and the finding still asks
+    /// for the same change: no fix run starts by itself.
+    pub fn guard_blocks(&self) -> bool {
+        !self.refused.is_empty() && self.guard_sig == guard_sig(&self.finding)
+    }
+
+    /// Before a new fix run for this finding: an old refusal about a
+    /// change the finding no longer asks for (its code or its target
+    /// changed), or one a person now overrides, is forgotten.
+    pub fn start_over(&mut self) {
+        self.clear_guard();
+    }
+}
+
+/// The ticket of the one fix round after a tripped guard: the finding's
+/// own ticket, then each offending line and what to produce instead.
+pub fn fix_round_body(r: &Record) -> String {
+    format!("{}{}", ticket_body(r), super::guard::fix_round(&r.refused))
 }
 
 /// A new read's findings against the stored ones: the records that
@@ -176,7 +284,7 @@ pub fn reconcile(stored: &[Record], fresh: Vec<InfraFinding>, now: DateTime<Utc>
                     r2.fixed_at = None;
                     r2.pr = None;
                     r2.ticket.clear();
-                    r2.refused.clear();
+                    r2.clear_guard();
                     r2.event = Some("Found again in the latest read".into());
                 }
                 if r2 != *r {
@@ -485,6 +593,11 @@ pub fn pr_body(r: &Record, change: &str) -> String {
     } else if f.fix.notes.is_some() {
         out.push_str("\n## After merge\n\nCoderHelm never applies this. It closes the finding when it reads the account again and sees the new version running.\n");
     }
+    // The guard gave up on this change: every rebuild of the description
+    // keeps the reason at its top, which keeps the pull request a draft.
+    if r.drafted && !r.refused.is_empty() {
+        return super::guard::put_hold(&out, &r.refused);
+    }
     out
 }
 
@@ -761,15 +874,137 @@ mod tests {
         assert_eq!(held(&prod, &all, "2027-01-10"), None);
     }
 
+    const LINE: &str =
+        "modules/aurora/main.tf, line 5: `aws_rds_cluster.this` changes `cluster_identifier`, which replaces the resource";
+
     #[test]
-    fn a_refused_change_is_kept_on_the_record_and_shown() {
+    fn a_first_trip_is_one_fix_round_told_the_offending_line() {
         let mut r = Record::new(upgrade("a", "ledger-prod-aurora", "production", ""), "t");
         assert!(r.view().get("refused").is_none());
-        r.refused = vec!["db/main.tf: `aws_db_instance.orders` changes `identifier`".into()];
-        assert_eq!(r.view()["refused"][0], r.refused[0]);
+        assert_eq!(r.guard_step(&[LINE.to_string()]), GuardStep::FixRound);
+        assert_eq!((r.guard_attempts, r.drafted), (1, false));
+        let t = fix_round_body(&r);
+        // The ticket's own words, then the line and the in-place change.
+        assert!(
+            t.contains("The value to change: `engine_version` in `envs/prod/main.tf`, line 4"),
+            "{t}"
+        );
+        assert!(t.contains(&format!("- {LINE}")), "{t}");
+        assert!(
+            t.contains("make the in-place change this ticket asks for"),
+            "{t}"
+        );
+        // Still a pull request on the page, with what is happening.
+        let v = r.view();
+        assert_eq!(v["fix"]["kind"], "pr");
+        assert_eq!(v["drafted"], false);
+        assert_eq!(v["note"], GUARD_ROUND_NOTE);
+        // The description is not marked while the round runs.
+        assert!(crate::infra_vuln::guard::hold(&pr_body(&r, "Raised it.")).is_none());
+    }
+
+    #[test]
+    fn a_fix_round_that_passes_the_guard_clears_the_refusal() {
+        let mut r = Record::new(upgrade("a", "ledger-prod-aurora", "production", ""), "t");
+        r.guard_step(&[LINE.to_string()]);
+        assert_eq!(r.guard_step(&[]), GuardStep::Passed);
+        assert!(r.refused.is_empty() && !r.drafted && r.guard_attempts == 0);
+        assert!(!r.guard_blocks());
+        assert!(r.view().get("refused").is_none());
+    }
+
+    #[test]
+    fn a_second_trip_drafts_the_pull_request_and_falls_back_to_the_runbook() {
+        let mut r = Record::new(upgrade("a", "ledger-prod-aurora", "production", ""), "t");
+        r.finding.fix.runbook = Some(crate::infra_vuln::runbook::Runbook {
+            steps: vec![crate::infra_vuln::runbook::Step {
+                text: "Upgrade the cluster in its next maintenance window.".into(),
+                cli: "aws rds modify-db-cluster --db-cluster-identifier ledger-prod-aurora --engine-version 16.6".into(),
+            }],
+            ..Default::default()
+        });
+        r.guard_step(&[LINE.to_string()]);
+        assert_eq!(r.guard_step(&[LINE.to_string()]), GuardStep::Draft);
+        assert!(r.drafted && r.guard_attempts == 2);
+        // On the finding: the reason, a runbook, and why.
+        let v = r.view();
+        assert_eq!(v["refused"][0], LINE);
+        assert_eq!(v["drafted"], true);
+        assert_eq!(v["fix"]["kind"], "runbook");
+        assert!(v["fix"]["decision"]
+            .as_str()
+            .unwrap()
+            .contains("its pull request is a draft"));
+        assert!(v["fix"]["decision"]
+            .as_str()
+            .unwrap()
+            .contains("no further attempt until the code"));
+        assert!(v["fix"]["runbook"]["steps"][0]["cli"]
+            .as_str()
+            .unwrap()
+            .contains("modify-db-cluster"));
+        assert_eq!(v["note"], GUARD_DRAFT_NOTE);
+        // The stored finding is unchanged: it is still a code fix, should
+        // its code or target change.
+        assert_eq!(r.finding.fix.kind, Some(FixKind::Pr));
+    }
+
+    #[test]
+    fn a_draft_stays_a_draft_through_later_description_rebuilds() {
+        use crate::infra_vuln::guard;
+        let mut r = Record::new(upgrade("a", "ledger-prod-aurora", "production", ""), "t");
+        r.guard_step(&[LINE.to_string()]);
+        r.guard_step(&[LINE.to_string()]);
+        for change in ["Raised it.", "Raised it again, after a later run.", ""] {
+            let b = pr_body(&r, change);
+            assert!(b.starts_with(crate::security_fixes::MARKER), "{b}");
+            assert_eq!(b.matches(guard::HOLD_START).count(), 1);
+            assert!(
+                guard::hold(&b).is_some(),
+                "a rebuilt description lost the hold"
+            );
+            let top = &b[..b.find("## Summary").unwrap()];
+            assert!(
+                top.contains("This pull request is a draft") && top.contains(LINE),
+                "{top}"
+            );
+        }
+        // Once the guard passes a later change, the section goes.
+        r.guard_step(&[]);
+        assert!(guard::hold(&pr_body(&r, "Raised it.")).is_none());
+    }
+
+    #[test]
+    fn no_further_attempt_until_the_code_or_the_target_changes() {
+        let mut r = Record::new(upgrade("a", "ledger-prod-aurora", "production", ""), "t");
+        assert!(!r.guard_blocks());
+        r.guard_step(&[LINE.to_string()]);
+        r.guard_step(&[LINE.to_string()]);
+        assert!(r.guard_blocks());
+        // A new read with the same finding: still blocked.
+        let same = reconcile(&[r.clone()], vec![r.finding.clone()], now());
+        assert!(same.is_empty(), "{same:?}");
+        // The target changes.
+        let mut target = r.clone();
+        target.finding.fix.to = "16.8".into();
+        assert!(!target.guard_blocks());
+        // The code changes (the line that sets the value moved or changed).
+        let mut code = r.clone();
+        if let Some(e) = code
+            .finding
+            .fix
+            .location
+            .as_mut()
+            .and_then(|l| l.edit.as_mut())
+        {
+            e.value = "16.5".into();
+        }
+        assert!(!code.guard_blocks());
+        code.start_over();
+        assert!(code.refused.is_empty() && !code.drafted && code.guard_attempts == 0);
         // Found again after being fixed: the refusal belongs to the past.
         r.status = Status::Fixed;
         let again = reconcile(&[r.clone()], vec![r.finding.clone()], now());
-        assert!(again[0].refused.is_empty());
+        assert!(again[0].refused.is_empty() && !again[0].drafted);
     }
 }

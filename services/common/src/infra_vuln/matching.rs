@@ -934,8 +934,10 @@ fn update(r: &Resource, p: &Pending, feeds: &Feeds, out: &mut Vec<InfraFinding>)
         }
     };
 
-    let rb = (kind == FixKind::Runbook).then(|| runbook::build(r, &p, feeds.today));
-    let (cli, console) = match &rb {
+    // Built for a pull request too: if the replacement guard gives up on
+    // the code change, the finding falls back to it.
+    let rb = Some(runbook::build(r, &p, feeds.today));
+    let (cli, console) = match rb.as_ref().filter(|_| kind == FixKind::Runbook) {
         Some(rb) => (
             rb.steps
                 .iter()
@@ -1857,7 +1859,14 @@ mod tests {
             "{}",
             x.fix.decision
         );
-        assert!(x.fix.runbook.is_none());
+        // The runbook is kept behind the pull request, for a fallback; the
+        // card's own commands stay empty while it is a pull request.
+        assert!(x
+            .fix
+            .runbook
+            .as_ref()
+            .is_some_and(|rb| !rb.steps.is_empty()));
+        assert!(x.fix.cli.is_empty());
         let n = x.fix.notes.as_ref().unwrap();
         assert!(n.takes_effect[0].contains("`apply_immediately` defaults to `false`"));
         assert!(n.interruption[0].contains("Engine upgrades require downtime"));
