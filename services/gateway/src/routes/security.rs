@@ -18,6 +18,11 @@
 //! - The `dependabot_alert` and `security_advisory` webhooks, and a push to
 //!   a default branch that touches a dependency file, queue a
 //!   `security_event` for the worker when the team turned this on.
+//! - A security pull request closing or reopening, a person cancelling or
+//!   closing a fix run, and a person's Retry of a fix run whose pull
+//!   request is gone queue the release kinds (`common::security_release`):
+//!   the findings follow what happened at once, and the worker's sweep
+//!   catches what a webhook missed.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -1932,6 +1937,150 @@ pub fn advisory_event(
     })
 }
 
+/// Pure: the event a `pull_request` webhook queues, if any: a pull request
+/// that closed (merged or not) or was reopened and that security fixes may
+/// have a finding in. Those are CoderHelm's own security pull requests (by
+/// branch or by the marker in the description) and the Dependabot and
+/// Renovate ones it adopts. The worker reads the pull request itself and
+/// finds none when no finding names it.
+pub fn pr_event(
+    payload: &Value,
+    installation_id: u64,
+    team_id: &str,
+) -> Option<SecurityEventMessage> {
+    let action = payload["action"].as_str().unwrap_or("");
+    if !matches!(action, "closed" | "reopened") {
+        return None;
+    }
+    let pr = &payload["pull_request"];
+    let number = pr["number"].as_u64().filter(|n| *n > 0)?;
+    let repo = payload["repository"]["full_name"]
+        .as_str()
+        .filter(|r| sec::valid_repo(r))?;
+    let head = pr["head"]["ref"].as_str().unwrap_or("");
+    let ours = head.starts_with("coderhelm/security-")
+        || head.starts_with("dependabot/")
+        || head.starts_with("renovate/")
+        || pr["body"].as_str().is_some_and(|b| b.contains(sec::MARKER));
+    ours.then(|| SecurityEventMessage {
+        team_id: team_id.to_string(),
+        installation_id,
+        kind: "pr".into(),
+        repo: repo.to_string(),
+        action: action.to_string(),
+        pr_number: number,
+        ..Default::default()
+    })
+}
+
+/// The `pull_request` webhook, closed or reopened: the findings in that
+/// pull request follow it now. For every team with security findings,
+/// turned on or not (a release is the truth about a finding, not an
+/// action). Best effort: the worker's sweep finds what is missed here.
+pub(crate) async fn on_pull_request(
+    state: &AppState,
+    payload: &Value,
+    installation_id: u64,
+    team_id: &str,
+) {
+    let Some(msg) = pr_event(payload, installation_id, team_id) else {
+        return;
+    };
+    if !matches!(load_config(state, team_id).await, Ok(Some(_))) {
+        return;
+    }
+    info!(team_id, repo = %msg.repo, pr = msg.pr_number, action = %msg.action, "Security pull request change queued for its findings");
+    if queue(state, msg).await.is_err() {
+        warn!(
+            team_id,
+            "Could not queue a security pull request's change; the sweep picks it up"
+        );
+    }
+}
+
+/// A person cancelled or closed a run: when it is a security fix run, the
+/// findings it claimed are released now. Best effort, as above.
+pub(crate) async fn on_run_ended(state: &AppState, team_id: &str, ticket: &str) {
+    if !sec::is_ticket(ticket) {
+        return;
+    }
+    let msg = SecurityEventMessage {
+        team_id: team_id.to_string(),
+        kind: "run".into(),
+        ticket: ticket.to_string(),
+        ..Default::default()
+    };
+    if queue(state, msg).await.is_err() {
+        warn!(
+            team_id,
+            ticket, "Could not queue a fix run's end; the sweep picks it up"
+        );
+    }
+}
+
+/// A person's Retry of a security fix run. When the run's pull request is
+/// gone (closed unmerged, or the run ended without one) and its findings
+/// still need the fix, the retry is a new request for those findings as
+/// they stand now, so the new run plans from today's findings and opens a
+/// new pull request; the event to queue is returned. `None`: not a
+/// dependency fix run, or the unit still has an open pull request or a
+/// run, and the retry takes up the earlier run as any other does.
+pub(crate) async fn retry_event(
+    state: &AppState,
+    team_id: &str,
+    ticket: &str,
+    by: &str,
+) -> Option<SecurityEventMessage> {
+    if !sec::is_ticket(ticket) {
+        return None;
+    }
+    let item = get_item(state, team_id, &sec::ticket_sk(ticket))
+        .await
+        .ok()??;
+    let unit: sec::FixUnit = serde_json::from_str(&s(&item, "unit")).ok()?;
+    let findings = load_findings(state, team_id).await.ok()?;
+    retry_of(&unit, &findings, team_id, ticket, by)
+}
+
+/// Pure: [`retry_event`]'s decision.
+pub fn retry_of(
+    unit: &sec::FixUnit,
+    findings: &[(Finding, FindingState)],
+    team_id: &str,
+    ticket: &str,
+    by: &str,
+) -> Option<SecurityEventMessage> {
+    // Infrastructure fixes and base images have their own runs.
+    if unit.ecosystem == common::infra_vuln::records::UNIT_ECOSYSTEM
+        || unit.ecosystem == common::base_images::ECOSYSTEM
+    {
+        return None;
+    }
+    let members: Vec<(Finding, FindingState)> = findings
+        .iter()
+        .filter(|(f, _)| unit.finding_ids.contains(&f.id))
+        .cloned()
+        .collect();
+    let ids = common::security_release::retry_ids(&members)?;
+    Some(SecurityEventMessage {
+        team_id: team_id.to_string(),
+        kind: "retry".into(),
+        repo: unit.repo.clone(),
+        ticket: ticket.to_string(),
+        requested_by: by.to_string(),
+        finding_ids: ids,
+        ..Default::default()
+    })
+}
+
+/// Queues a release event built by [`retry_event`].
+pub(crate) async fn queue_retry(
+    state: &AppState,
+    msg: SecurityEventMessage,
+) -> Result<StatusCode, StatusCode> {
+    queue(state, msg).await
+}
+
 /// Pure: whether a push changed a dependency file.
 pub fn push_touches_dependencies(payload: &Value) -> bool {
     payload["commits"]
@@ -2131,6 +2280,173 @@ mod tests {
         assert_eq!(dismissed_reason(&fi), "tolerable_risk");
         fi.verdict = sec::Verdict::NotLoaded;
         assert_eq!(dismissed_reason(&fi), "not_used");
+    }
+
+    #[test]
+    fn a_security_pull_request_closing_or_reopening_tells_its_findings() {
+        let p = |action: &str, head: &str, body: &str| {
+            json!({
+                "action": action,
+                "repository": {"full_name": "acme/web"},
+                "pull_request": {"number": 412, "merged": false, "head": {"ref": head}, "body": body},
+            })
+        };
+        let ours = "coderhelm/security-updates-2026-11-12-0a1b2c";
+        let m = pr_event(&p("closed", ours, ""), 7, "TEAM#a").unwrap();
+        assert_eq!(
+            (
+                m.kind.as_str(),
+                m.repo.as_str(),
+                m.pr_number,
+                m.action.as_str(),
+                m.installation_id
+            ),
+            ("pr", "acme/web", 412, "closed", 7)
+        );
+        assert!(pr_event(&p("reopened", ours, ""), 7, "TEAM#a").is_some());
+        // A bot's pull request CoderHelm may have adopted, and one named by
+        // its description whatever its branch.
+        assert!(pr_event(
+            &p("closed", "dependabot/npm_and_yarn/ws-8.17.1", ""),
+            7,
+            "T"
+        )
+        .is_some());
+        assert!(pr_event(&p("closed", "renovate/ws-8.x", ""), 7, "T").is_some());
+        let marked = format!("Fixes two advisories.\n\n{}", sec::MARKER);
+        assert!(pr_event(&p("closed", "feature/x", &marked), 7, "T").is_some());
+        // Anyone else's pull request, and anything but a close or a reopen.
+        assert!(pr_event(&p("closed", "feature/x", "A feature"), 7, "T").is_none());
+        for action in ["opened", "synchronize", "edited", "labeled"] {
+            assert!(pr_event(&p(action, ours, ""), 7, "T").is_none(), "{action}");
+        }
+        // The message the worker reads keeps the pull request and the kind.
+        let wire = serde_json::to_value(&m).unwrap();
+        assert_eq!(
+            (wire["kind"].as_str(), wire["pr_number"].as_u64()),
+            (Some("pr"), Some(412))
+        );
+        let back: SecurityEventMessage = serde_json::from_value(wire).unwrap();
+        assert_eq!(back.pr_number, 412);
+    }
+
+    #[test]
+    fn retry_after_a_closed_pull_request_asks_for_the_findings_as_they_are_now() {
+        let mk = |id: &str, status: Status, pr_state: Option<&str>| {
+            let mut x = f(id, Tier::P1, status, "2026-11-20", "acme/web");
+            x.fixed_version = Some("2.0.0".into());
+            x.pr = pr_state.map(|st| sec::PrRef {
+                number: 412,
+                url: "https://github.com/acme/web/pull/412".into(),
+                state: st.into(),
+                ..Default::default()
+            });
+            (x, FindingState::default())
+        };
+        let unit = sec::FixUnit {
+            repo: "acme/web".into(),
+            ecosystem: "npm".into(),
+            bundle: true,
+            finding_ids: vec!["a".into(), "b".into(), "c".into()],
+            ..Default::default()
+        };
+        // Closed unmerged and released: a new request, for what still
+        // needs the fix (one was fixed since).
+        let released = vec![
+            mk("a", Status::Open, Some("closed")),
+            mk("b", Status::Open, Some("closed")),
+            mk("c", Status::Fixed, Some("closed")),
+            mk("other", Status::Open, None),
+        ];
+        let m = retry_of(
+            &unit,
+            &released,
+            "TEAM#a",
+            "SEC-0A1B2C3D4E5F",
+            "dev@example.com",
+        )
+        .unwrap();
+        assert_eq!(
+            (m.kind.as_str(), m.ticket.as_str(), m.requested_by.as_str()),
+            ("retry", "SEC-0A1B2C3D4E5F", "dev@example.com")
+        );
+        assert_eq!(m.finding_ids, vec!["a".to_string(), "b".to_string()]);
+        // Its pull request still open, or a run working: the earlier run
+        // is taken up as before.
+        let open = vec![
+            mk("a", Status::PrOpen, Some("open")),
+            mk("b", Status::PrOpen, Some("open")),
+        ];
+        assert!(retry_of(&unit, &open, "T", "SEC-0A1B2C3D4E5F", "d").is_none());
+        let working = vec![mk("a", Status::Fixing, None)];
+        assert!(retry_of(&unit, &working, "T", "SEC-0A1B2C3D4E5F", "d").is_none());
+        // Nothing left to fix, and an infrastructure fix: not this path.
+        let done = vec![mk("a", Status::Fixed, Some("merged"))];
+        assert!(retry_of(&unit, &done, "T", "SEC-0A1B2C3D4E5F", "d").is_none());
+        let infra = sec::FixUnit {
+            ecosystem: common::infra_vuln::records::UNIT_ECOSYSTEM.into(),
+            ..unit.clone()
+        };
+        assert!(retry_of(&infra, &released, "T", "SEC-0A1B2C3D4E5F", "d").is_none());
+    }
+
+    #[test]
+    fn a_group_says_who_closed_its_pull_request_and_which_run_works_on_it() {
+        let mk = |id: &str, status: Status| {
+            let mut x = f(id, Tier::P1, status, "2026-11-20", "acme/web");
+            x.package = "ws".into();
+            x.version = "8.0.0".into();
+            x.fixed_version = Some("8.17.1".into());
+            x
+        };
+        // Closed by a person: selectable again, with the record on the row.
+        let mut closed = mk("a", Status::Open);
+        closed.pr = Some(sec::PrRef {
+            number: 412,
+            url: "https://github.com/acme/web/pull/412".into(),
+            state: "closed".into(),
+            closed_at: Some("2026-11-13T09:30:00Z".into()),
+            closed_by: Some("octo".into()),
+            closed_by_person: true,
+            ..Default::default()
+        });
+        let groups = sec::groups(&[(closed, FindingState::default())]);
+        assert!(group_fixable(&groups[0]));
+        let row = serde_json::to_value(&groups[0]).unwrap();
+        assert_eq!(row["pr"]["state"], "closed");
+        assert_eq!(row["pr"]["closed_by"], "octo");
+        assert_eq!(row["pr"]["closed_at"], "2026-11-13T09:30:00Z");
+        assert_eq!(row["pr"]["closed_by_person"], true);
+        assert_eq!(row["ticket"], Value::Null);
+        // A run working on it: not selectable, and the row names the run.
+        let st = FindingState {
+            ticket: Some("SEC-0A1B2C3D4E5F".into()),
+            ..Default::default()
+        };
+        let groups = sec::groups(&[(mk("a", Status::Fixing), st.clone())]);
+        assert!(!group_fixable(&groups[0]));
+        assert_eq!(
+            serde_json::to_value(&groups[0]).unwrap()["ticket"],
+            "SEC-0A1B2C3D4E5F"
+        );
+        // An open pull request wins over an older closed one in the group.
+        let mut old = mk("old", Status::Open);
+        old.pr = Some(sec::PrRef {
+            number: 300,
+            state: "closed".into(),
+            ..Default::default()
+        });
+        let mut now_open = mk("new", Status::PrOpen);
+        now_open.pr = Some(sec::PrRef {
+            number: 412,
+            state: "open".into(),
+            ..Default::default()
+        });
+        let groups = sec::groups(&[(old, FindingState::default()), (now_open, st)]);
+        assert_eq!(groups[0].pr.as_ref().map(|p| p.number), Some(412));
+        // An open pull request's record carries no closed fields.
+        let row = serde_json::to_value(&groups[0]).unwrap();
+        assert!(row["pr"].get("closed_by").is_none() && row["pr"].get("closed_at").is_none());
     }
 
     #[test]

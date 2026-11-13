@@ -104,6 +104,7 @@ pub mod reachability;
 pub mod review_config;
 /// Security fixes: advisories, triage, fix runs and cards (gateway and worker).
 pub mod security_fixes;
+pub mod security_release;
 pub mod settings_index;
 /// Setup: the settings registry, the repo analysis, runs, apply and undo.
 pub mod setup;

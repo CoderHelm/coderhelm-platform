@@ -24,6 +24,11 @@
 //!   repository and ecosystem, through the normal run pipeline (`SEC-`
 //!   tickets). An open Dependabot or Renovate pull request for the package is
 //!   adopted instead. Nothing opens or posts in a dry run.
+//! - **Release**: a finding's `fixing` and `pr_open` follow GitHub and the
+//!   run's record (`release`): a pull request closed unmerged or a run that
+//!   ended without one gives its findings back, on the webhook, on the
+//!   person's cancel, and on every sweep before anything else, on a clock
+//!   of its own.
 //! - **Cards**: P0 and P1 post to the team's alert channel once, then on the
 //!   pull request opening, CI passing and the merge, and at half the
 //!   deadline and the deadline. Every card is claimed once.
@@ -47,11 +52,18 @@ use crate::models::{SecurityEventMessage, TicketMessage, TicketSource, TokenUsag
 use crate::passes::{attr_n, attr_s};
 use crate::WorkerState;
 
+/// Releasing a finding from a pull request or a run that is over.
+#[path = "security_release.rs"]
+pub(crate) mod release;
+
 type Error = Box<dyn std::error::Error + Send + Sync>;
 type Item = HashMap<String, AttributeValue>;
 
 /// Time one tick may spend on security work.
 const TICK_BUDGET_SECS: u64 = 300;
+/// Time past that budget the sweep may still spend releasing findings for
+/// the teams the budget never reached (`release`).
+const RELEASE_BUDGET_SECS: u64 = 240;
 /// Model calls triage makes per team per tick at most (one call reads one
 /// package at one version, with every advisory it has); fewer when the
 /// day's token cap is near (`reachability::model_calls_allowed`). With a
@@ -1923,6 +1935,8 @@ async fn post_card(
 /// What one team's tick did.
 #[derive(Debug, Default)]
 pub struct TeamReport {
+    /// Findings brought in line with their pull request or run (`release`).
+    pub released: usize,
     pub repos_synced: usize,
     pub new_findings: usize,
     pub triaged: usize,
@@ -2273,7 +2287,10 @@ fn verdict_word(v: Verdict) -> &'static str {
     }
 }
 
-/// Pull requests: merged, closed, CI; runs that ended without one.
+/// Open pull requests: their CI, its cards and its lines in the
+/// description. A pull request that merged or closed, and a run that ended
+/// without one, are `release`'s (it runs first, on its own clock); one that
+/// merges or closes between the two is settled here by the same rules.
 async fn track_prs(cx: &Ctx<'_>, findings: &mut [(Finding, FindingState)]) {
     let now = Utc::now();
     let mut seen: HashMap<(String, u64), (String, Option<String>)> = HashMap::new();
@@ -2283,51 +2300,11 @@ async fn track_prs(cx: &Ctx<'_>, findings: &mut [(Finding, FindingState)]) {
     } else {
         None
     };
+    let io = release::Live::new(cx, release::TEAM_BUDGET_SECS);
+    let mut facts: HashMap<(String, u64), common::security_release::PrNow> = HashMap::new();
     for (f, st) in findings.iter_mut() {
         if cx.out_of_time() {
             return;
-        }
-        if f.status == Status::Fixing {
-            // A run that ended without a pull request lets the finding open again.
-            let stale =
-                sec::parse_time(&f.updated_at).is_some_and(|t| now - t > Duration::hours(12));
-            if let (true, Some(ticket)) = (stale, st.ticket.clone()) {
-                let branch = ticket_branch(cx.state, cx.team_id, &ticket).await;
-                let open = match (branch, f.repo.split_once('/')) {
-                    (Some(b), Some((o, n))) => {
-                        cx.gh.find_open_pr_for_branch(o, n, &b).await.ok().flatten()
-                    }
-                    _ => None,
-                };
-                match open {
-                    Some(pr) => {
-                        f.status = Status::PrOpen;
-                        f.pr = Some(sec::PrRef {
-                            number: pr["number"].as_u64().unwrap_or(0),
-                            url: pr["html_url"].as_str().unwrap_or("").to_string(),
-                            ci: Some("pending".into()),
-                            state: "open".into(),
-                            adopted: false,
-                        });
-                    }
-                    None => {
-                        f.status = Status::Open;
-                        st.ticket = None;
-                        st.hold_until = Some((now + Duration::days(1)).to_rfc3339());
-                        add_event(
-                            cx.state,
-                            cx.team_id,
-                            &f.id,
-                            "The fix run ended without a pull request; it is tried again tomorrow",
-                            None,
-                        )
-                        .await;
-                    }
-                }
-                f.updated_at = now.to_rfc3339();
-                save_finding(cx.state, cx.team_id, f, st).await;
-            }
-            continue;
         }
         let Some(pr) =
             f.pr.clone()
@@ -2348,34 +2325,28 @@ async fn track_prs(cx: &Ctx<'_>, findings: &mut [(Finding, FindingState)]) {
         let mut p = pr.clone();
         p.ci = ci.clone().or(p.ci);
         match state_now.as_str() {
-            "merged" => {
-                p.state = "merged".into();
-                f.status = Status::Fixed;
-                st.merged_at = Some(now.to_rfc3339());
-                add_event(
-                    cx.state,
-                    cx.team_id,
-                    &f.id,
-                    &format!("PR #{} merged", p.number),
-                    Some(&p.url),
-                )
-                .await;
-            }
-            "closed" => {
-                p.state = "closed".into();
-                f.status = Status::Open;
-                st.hold_until = Some((now + Duration::days(7)).to_rfc3339());
-                add_event(
-                    cx.state,
-                    cx.team_id,
-                    &f.id,
-                    &format!(
-                        "PR #{} was closed without merging; not opened again for 7 days",
-                        p.number
-                    ),
-                    Some(&p.url),
-                )
-                .await;
+            "merged" | "closed" => {
+                use release::ReleaseIo;
+                let fact = match facts.get(&key) {
+                    Some(v) => v.clone(),
+                    None => {
+                        let v = io.pr_now(&f.repo, pr.number, true).await;
+                        facts.insert(key.clone(), v.clone());
+                        v
+                    }
+                };
+                if let Some(change) = common::security_release::settle_pr(f, st, &fact, now) {
+                    save_finding(cx.state, cx.team_id, f, st).await;
+                    add_event(
+                        cx.state,
+                        cx.team_id,
+                        &f.id,
+                        &change.text,
+                        change.link.as_deref(),
+                    )
+                    .await;
+                }
+                p = f.pr.clone().unwrap_or(p);
             }
             _ => {
                 if p.ci != pr.ci && p.ci.as_deref() == Some("passing") {
@@ -2411,10 +2382,12 @@ async fn track_prs(cx: &Ctx<'_>, findings: &mut [(Finding, FindingState)]) {
                 }
             }
         }
-        f.pr = Some(p.clone());
-        if *f != before {
-            f.updated_at = now.to_rfc3339();
-            save_finding(cx.state, cx.team_id, f, st).await;
+        if p.state == "open" {
+            f.pr = Some(p.clone());
+            if *f != before {
+                f.updated_at = now.to_rfc3339();
+                save_finding(cx.state, cx.team_id, f, st).await;
+            }
         }
         // One card per pull request and stage, when its findings post.
         if let Some(ch) = &channels {
@@ -2695,6 +2668,84 @@ async fn start_requested(cx: &Ctx<'_>, findings: &mut [(Finding, FindingState)])
         }
     }
     started
+}
+
+/// The `retry` event: the fix unit behind `ticket` is asked for again by
+/// `by`, from its findings as they are now. First they are brought in line
+/// with GitHub (the closed pull request releases them), then the ones a new
+/// pull request can still fix carry the person's request, combined as the
+/// unit was: `start_requested` starts it with room under the day's limits,
+/// dry run or not, and the hold a closed pull request left does not apply
+/// to a person's request. Returns how many findings were asked for.
+async fn retry_asked(
+    cx: &Ctx<'_>,
+    findings: &mut [(Finding, FindingState)],
+    ticket: &str,
+    by: &str,
+) -> usize {
+    let Some(unit) = load_unit(cx.state, cx.team_id, ticket).await else {
+        warn!(
+            team_id = cx.team_id,
+            ticket, "security: retry of a fix run whose plan is gone"
+        );
+        return 0;
+    };
+    let scope = release::Scope::Ids(unit.finding_ids.clone());
+    release::run(cx, findings, &scope, release::TEAM_BUDGET_SECS).await;
+    let asked = mark_retry(findings, &unit, by, Utc::now());
+    for id in &asked {
+        if let Some((f, st)) = findings.iter().find(|(f, _)| &f.id == id) {
+            save_finding(cx.state, cx.team_id, f, st).await;
+            add_event(
+                cx.state,
+                cx.team_id,
+                &f.id,
+                &format!("A new fix pull request was asked for by {by} (Retry on the fix run)"),
+                None,
+            )
+            .await;
+        }
+    }
+    info!(
+        team_id = cx.team_id,
+        ticket,
+        by,
+        findings = asked.len(),
+        "security: fix run retried as a new request"
+    );
+    asked.len()
+}
+
+/// Pure: marks the unit's findings a retry asks for again (see
+/// `security_release::retry_ids`) with who asked and how they combine, one
+/// pull request for a bundle and one per package otherwise. Returns their
+/// ids; empty when the unit still has an open pull request or a run.
+pub(crate) fn mark_retry(
+    findings: &mut [(Finding, FindingState)],
+    unit: &FixUnit,
+    by: &str,
+    now: chrono::DateTime<Utc>,
+) -> Vec<String> {
+    let members: Vec<(Finding, FindingState)> = findings
+        .iter()
+        .filter(|(f, _)| unit.finding_ids.contains(&f.id))
+        .cloned()
+        .collect();
+    let Some(ids) = common::security_release::retry_ids(&members) else {
+        return vec![];
+    };
+    let combine = if unit.bundle {
+        sec::Combine::OnePr
+    } else {
+        sec::Combine::PerPackage
+    };
+    for (f, st) in findings.iter_mut().filter(|(f, _)| ids.contains(&f.id)) {
+        st.requested_by = Some(by.to_string());
+        st.requested_as = combine;
+        f.waiting = None;
+        f.updated_at = now.to_rfc3339();
+    }
+    ids
 }
 
 /// The `fix` event: the gateway took the run slots for these findings when a
@@ -3281,6 +3332,7 @@ async fn adopt(
             ci: Some("pending".into()),
             state: "open".into(),
             adopted: true,
+            ..Default::default()
         });
         f.waiting = None;
         st.pr_opened_at
@@ -3411,6 +3463,7 @@ async fn enqueue(
         st.requested_by = None;
         st.bundled = unit.bundle;
         st.ticket = Some(unit.ticket.clone());
+        st.claimed_at = Some(Utc::now().to_rfc3339());
         f.updated_at = Utc::now().to_rfc3339();
         save_finding(cx.state, cx.team_id, f, st).await;
         add_event(
@@ -3524,12 +3577,16 @@ async fn dependabot_sync(
         .created
 }
 
+/// One team's tick. `kev_map`: the CISA list when the sweep still has time
+/// for the team's sources, triage and fix runs; `None` when its time is
+/// spent on the teams before, and only the release runs (it has a clock of
+/// its own, so no team's stale findings wait on another team's work).
 async fn team_tick(
     state: &WorkerState,
     team_id: &str,
     installation_id: u64,
     cfg: &SecurityConfig,
-    kev_map: &BTreeMap<String, String>,
+    kev_map: Option<&BTreeMap<String, String>>,
     started: Instant,
 ) -> Result<TeamReport, Error> {
     let cx = Ctx {
@@ -3542,6 +3599,19 @@ async fn team_tick(
     };
     let mut report = TeamReport::default();
     let mut findings = load_findings(state, team_id).await;
+    // First, and whatever else the tick has time for: every finding in a
+    // pull request or a run is checked against GitHub and the run's record.
+    report.released = release::run(
+        &cx,
+        &mut findings,
+        &release::Scope::All,
+        release::TEAM_BUDGET_SECS,
+    )
+    .await
+    .changed();
+    let Some(kev_map) = kev_map else {
+        return Ok(report);
+    };
     let day = Utc::now().format("%Y%m%d").to_string();
     // Dependabot access is read again every sweep until it works, so a
     // permission accepted on GitHub shows within one sweep.
@@ -3586,6 +3656,8 @@ async fn team_tick(
 #[derive(Debug, Default)]
 pub struct SweepReport {
     pub teams: usize,
+    /// Findings brought in line with their pull request or run.
+    pub released: usize,
     pub repos_synced: usize,
     pub new_findings: usize,
     pub triaged: usize,
@@ -3900,25 +3972,39 @@ async fn sweep_inner(state: &WorkerState) -> SweepReport {
     let started = Instant::now();
     let mut kev_map: Option<BTreeMap<String, String>> = None;
     for team in teams {
-        if started.elapsed().as_secs() >= TICK_BUDGET_SECS {
+        // The sources, triage and fix runs share the sweep's budget. The
+        // release does not: a team reached after the budget is spent still
+        // has its findings checked against GitHub, until the sweep's hard
+        // stop.
+        let spent = started.elapsed().as_secs();
+        if spent >= TICK_BUDGET_SECS + RELEASE_BUDGET_SECS {
             break;
         }
+        let heavy = spent < TICK_BUDGET_SECS;
         let Some(cfg) = load_config(state, &team).await else {
             continue;
         };
+        // A team that turned security fixes off still sees its findings:
+        // they are released once a day, and nothing else runs.
         if !cfg.enabled {
-            continue;
+            let day = Utc::now().format("%Y%m%d").to_string();
+            if !claim(state, &team, &format!("SECRELEASE#{day}"), 2 * 86_400).await {
+                continue;
+            }
         }
         let Some(iid) = super::review_reminder::team_installation_id(state, &team).await else {
             continue;
         };
-        if kev_map.is_none() {
+        if heavy && cfg.enabled && kev_map.is_none() {
             kev_map = Some(kev(state).await);
         }
-        let kev_ref = kev_map.as_ref().expect("set above");
-        report.teams += 1;
+        let kev_ref = kev_map.as_ref().filter(|_| heavy && cfg.enabled);
+        if cfg.enabled {
+            report.teams += 1;
+        }
         match team_tick(state, &team, iid, &cfg, kev_ref, started).await {
             Ok(r) => {
+                report.released += r.released;
                 report.repos_synced += r.repos_synced;
                 report.new_findings += r.new_findings;
                 report.triaged += r.triaged;
@@ -3939,6 +4025,7 @@ pub async fn on_event(state: &WorkerState, msg: &SecurityEventMessage) {
 }
 
 async fn on_event_inner(state: &WorkerState, msg: &SecurityEventMessage) {
+    let release = matches!(msg.kind.as_str(), "pr" | "run" | "retry");
     let teams: Vec<String> = if msg.team_id.is_empty() {
         common::settings_index::members(
             &state.dynamo,
@@ -3950,9 +4037,20 @@ async fn on_event_inner(state: &WorkerState, msg: &SecurityEventMessage) {
     } else {
         vec![msg.team_id.clone()]
     };
-    let kev_map = kev(state).await;
+    // A release reads GitHub and the run records only; the rest tends the
+    // findings afterwards and needs the CISA list.
+    let kev_map = if matches!(msg.kind.as_str(), "pr" | "run") {
+        BTreeMap::new()
+    } else {
+        kev(state).await
+    };
     for team in teams {
-        let Some(cfg) = load_config(state, &team).await.filter(|c| c.enabled) else {
+        // A release is the truth about a finding, not an action: it runs
+        // for a team that turned security fixes off too.
+        let Some(cfg) = load_config(state, &team)
+            .await
+            .filter(|c| c.enabled || release)
+        else {
             continue;
         };
         let iid = if msg.installation_id > 0 && !msg.team_id.is_empty() {
@@ -4064,6 +4162,28 @@ async fn event_for_team(
                 )
                 .await;
             }
+        }
+        // A security pull request closed or reopened (the gateway's
+        // webhook), or a person cancelled or closed a fix run: the findings
+        // follow, now.
+        "pr" | "run" => {
+            let scope = if msg.kind == "pr" {
+                release::Scope::Pr {
+                    repo: msg.repo.clone(),
+                    number: msg.pr_number,
+                }
+            } else {
+                release::Scope::Ticket(msg.ticket.clone())
+            };
+            let r = release::run(&cx, &mut findings, &scope, release::TEAM_BUDGET_SECS).await;
+            info!(team_id, kind = %msg.kind, repo = %msg.repo, pr = msg.pr_number, ticket = %msg.ticket, changed = r.changed(), "security: release event handled");
+            return Ok(());
+        }
+        // A person pressed Retry on a fix run whose pull request is gone:
+        // its findings, as they stand now, are asked for again, and the
+        // request starts below like any other a person made.
+        "retry" => {
+            retry_asked(&cx, &mut findings, &msg.ticket, &msg.requested_by).await;
         }
         "fix" => {
             report.runs += start_asked(
@@ -4580,16 +4700,26 @@ pub async fn on_pr_opened(
     let mut carded = false;
     for (f, st) in members.iter_mut() {
         // Told already (the pull request was there before this run).
-        if f.pr.as_ref().is_some_and(|p| p.number == number) {
+        if f.pr
+            .as_ref()
+            .is_some_and(|p| p.number == number && p.state == "open")
+        {
+            continue;
+        }
+        // Fixed, dismissed or withdrawn while the run worked: it stays so.
+        if f.status.is_handled() {
             continue;
         }
         f.status = Status::PrOpen;
+        f.waiting = None;
+        st.hold_until = None;
         f.pr = Some(sec::PrRef {
             number,
             url: url.to_string(),
             ci: Some("pending".into()),
             state: "open".into(),
             adopted: false,
+            ..Default::default()
         });
         st.pr_opened_at
             .get_or_insert_with(|| Utc::now().to_rfc3339());
