@@ -68,6 +68,7 @@ pub mod run_close;
 pub mod run_search;
 pub mod run_start;
 pub mod run_trigger;
+pub mod scorecard;
 pub mod search;
 pub mod security;
 pub mod setup;

@@ -88,6 +88,9 @@ fn pull_requests_are_opened_and_marked_ready_in_one_place_each() {
         vec![
             // The setup pull request (CI and end-to-end setup), not a run's.
             "passes/e2e_setup.rs".to_string(),
+            // The guide pull request (lessons proposed for the repository's
+            // guide file), not a run's.
+            "passes/guide_pr.rs".to_string(),
             // A run's pull request.
             "passes/pr.rs".to_string(),
             // A run stopped with work on its branch: the held draft.

@@ -152,6 +152,8 @@ pub mod run_prs;
 // review_stats: time-ordered review records for analytics
 pub mod decision_log;
 pub mod deploy_stats;
+/// Lessons the reviewer learns from people's pushback on its findings.
+pub mod guide;
 /// Run statuses; which ones a person set; closing and reopening a run.
 pub mod handback;
 /// Work CoderHelm started on its own pull request and hasn't landed, and
@@ -176,7 +178,6 @@ pub mod requester;
 pub mod review_activity;
 /// The PR's "CoderHelm review" check run, from scheduled to finished.
 pub mod review_check;
-/// Lessons the reviewer learns from people's pushback on its findings.
 pub mod review_lessons;
 /// Where the reviewer is with each PR right now (queued, reviewing, retrying,
 /// done), and the one status a PR shows on the dashboard.
@@ -185,6 +186,7 @@ pub mod review_live;
 pub mod review_overview;
 pub mod review_session;
 pub mod review_stats;
+pub mod reviewer_prefs;
 /// Learning from outcomes: reward events, scores, calibration, variants,
 /// examples and evidence-backed lessons, per team.
 pub mod rewards;
@@ -199,6 +201,7 @@ pub mod run_round;
 pub mod run_status;
 /// What a run waiting on a person is waiting for: never nothing.
 pub mod run_wait;
+pub mod scorecard;
 #[cfg(test)]
 mod selfhost_links;
 pub mod skill_apply;

@@ -1215,6 +1215,7 @@ pub mod fix_location;
 pub mod formatter;
 pub(crate) mod generators;
 pub mod github_history;
+pub mod guide_pr;
 pub mod health_check;
 pub mod hidden_suggest;
 /// Hosted side of hybrid: forward a held event to a self-hosted install again.
@@ -1247,6 +1248,7 @@ pub mod onboard;
 pub mod open_pr_choice;
 pub mod ops_tools;
 pub mod outcome;
+pub mod outcome_learning;
 pub mod outside_exec;
 pub mod outside_work;
 pub mod own_review;
@@ -11186,6 +11188,9 @@ const INSTRUCTION_FILES: &[&str] = &[
     "copilot-instructions.md",
     ".cursorrules",
     ".github/instructions.md",
+    // The contribution guide last: the agent files above win the byte cap.
+    "CONTRIBUTING.md",
+    ".github/CONTRIBUTING.md",
 ];
 
 /// Load repo-level instruction files from the repo's default branch (HEAD).

@@ -651,6 +651,21 @@ fn build_app(state: Arc<AppState>) -> Router {
         .route("/learning/revert", post(routes::learning::revert_change))
         .route("/learning/restore", post(routes::learning::restore_change))
         .route("/learning/weights", put(routes::learning::put_weights))
+        // What became of CoderHelm's pull requests, the coder's lessons
+        // with their evidence, and what each reviewer asks for
+        .route("/learning/scorecard", get(routes::learning::get_scorecard))
+        .route(
+            "/learning/lessons",
+            get(routes::learning::get_outcome_lessons),
+        )
+        .route(
+            "/learning/reviewers",
+            get(routes::learning::get_reviewer_asks),
+        )
+        .route(
+            "/learning/reviewers/forget",
+            post(routes::learning::forget_reviewer),
+        )
         .route("/releases", get(routes::reviewer::list_releases))
         .route("/releases/send", post(routes::reviewer::send_release))
         .route("/releases/pending", get(routes::reviewer::pending_releases))

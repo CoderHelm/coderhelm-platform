@@ -2587,7 +2587,7 @@ async fn run_once(
     // What outcomes taught: this repo's calibration, the prompt variant the
     // bandit picked, good and avoid examples, and evidence-backed lessons.
     let reward_paths: Vec<String> = changed_files(&compare).into_iter().collect();
-    let reward = super::rewards::review_learning(
+    let mut reward = super::rewards::review_learning(
         state,
         &msg.team_id,
         &format!("{}/{}", msg.repo_owner, msg.repo_name),
@@ -2596,6 +2596,20 @@ async fn run_once(
         &format!("{title}\n{}", reward_paths.join("\n")),
     )
     .await;
+    // CoderHelm's review of its own pull request also holds the change to
+    // what the likely reviewers of these files repeatedly ask for.
+    if self_authored {
+        reward.context.push_str(
+            &super::rewards::reviewer_asks(
+                state,
+                &msg.team_id,
+                &format!("{}/{}", msg.repo_owner, msg.repo_name),
+                msg.installation_id,
+                &reward_paths,
+            )
+            .await,
+        );
+    }
     // The repository's memories (conventions, accepted patterns, known false
     // alarms, earlier answers), chosen by relevance to this PR. A memory
     // never blocks on its own (`review_agent::enforce_memory_grounding`).
