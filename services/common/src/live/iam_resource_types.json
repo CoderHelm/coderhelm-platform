@@ -87,6 +87,9 @@
   "cloudformation:ListStackResources": [
    "stack"
   ],
+  "cloudformation:DescribeStackResources": [
+   "stack"
+  ],
   "ecr:BatchGetImage": [
    "repository"
   ],

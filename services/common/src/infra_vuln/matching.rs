@@ -23,8 +23,10 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use super::actions::{self, Meaning, Tie};
 use super::feeds::{Advisory, Bulletin, Distro, LatestImage, Runtime, Who};
-use super::inventory::{Exposure, Kind, Location, Os, Resource};
+use super::inventory::{Exposure, Kind, Location, Os, Pending, Resource};
+use super::runbook::{self, PrNotes, Runbook};
 use crate::security_fixes::Tier;
 
 /// What kind of fix a finding has.
@@ -71,6 +73,33 @@ pub struct Fix {
     /// Why nothing is needed (aws), in the bulletin's words.
     #[serde(default)]
     pub reason: String,
+    /// Why this is a pull request, or why it is a runbook, in words.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub decision: String,
+    /// What a pending action means on the ARN it is on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meaning: Option<Meaning>,
+    /// The whole runbook, when a person applies the update in AWS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runbook: Option<Runbook>,
+    /// What a pull request must say and check, for the tool that defines
+    /// the resource.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<PrNotes>,
+    /// What to do in the code once the update is applied in AWS.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub code_note: String,
+    /// Its place among related work: the other actions on the same
+    /// resource, and non-production before production.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub order: Vec<String>,
+    /// The findings that go first (their ids).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub after: Vec<String>,
+    /// What is said about advisories: why none is named, or that one is
+    /// only related.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub advisory_note: String,
 }
 
 /// One infrastructure finding: one fix for one group of resources.
@@ -100,6 +129,9 @@ pub struct InfraFinding {
     /// replace CoderHelm's own matching for the resource.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inspector: Option<InspectorFacts>,
+    /// `production`, `staging`, ...; empty when not known.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub environment: String,
 }
 
 /// Amazon Inspector's facts on a finding.
@@ -242,6 +274,22 @@ impl Hits {
             self.severity("important");
         }
     }
+    /// A bulletin with only the CVEs that tie to the action (none for a
+    /// bulletin that is only related).
+    fn bulletin_with(&mut self, b: &Bulletin, cves: &[String], kev: &BTreeMap<String, String>) {
+        if !self.sources.iter().any(|s| s.id == b.id) {
+            self.sources.push(Source {
+                id: b.id.clone(),
+                kind: "bulletin".into(),
+                url: b.url.clone(),
+                severity: b.severity.clone(),
+            });
+        }
+        self.add_cves(cves, kev);
+        if b.severity == "important" && !cves.is_empty() {
+            self.severity("important");
+        }
+    }
     fn advisory(&mut self, a: &Advisory, kev: &BTreeMap<String, String>) {
         if !self.sources.iter().any(|s| s.id == a.id) {
             self.sources.push(Source {
@@ -291,13 +339,65 @@ fn finding(r: &Resource, key: &str, title: String, hits: Hits, fix: Fix) -> Infr
         exposure: r.exposure.clone(),
         fix,
         inspector: None,
+        environment: r
+            .defined_in
+            .as_ref()
+            .map(|l| l.environment.clone())
+            .filter(|e| !e.is_empty())
+            .unwrap_or_else(|| super::locate::environment_of_resource(r)),
     }
 }
 
+/// The place to open a pull request against: found, with a file, and not
+/// a guess.
 fn iac(r: &Resource) -> Option<Location> {
-    r.defined_in
-        .clone()
-        .filter(|l| !l.repo.is_empty() && !l.file.is_empty())
+    r.defined_in.clone().filter(Location::sure)
+}
+
+/// Why there is no pull request for a change that has a code equivalent.
+fn not_in_code(r: &Resource) -> String {
+    match &r.defined_in {
+        None => "This change has a code equivalent, but CoderHelm did not find this resource in any connected repository, so it is a runbook. If it is defined in code somewhere else, change it there too, or the next apply may undo this.".to_string(),
+        Some(l) => format!(
+            "This change has a code equivalent, but CoderHelm is not sure where this resource is defined, so it opens no pull request. {} {}",
+            super::locate::describe(l),
+            l.evidence.join(". ")
+        )
+        .trim()
+        .to_string(),
+    }
+}
+
+/// A code fix for a resource: a pull request where the code was found for
+/// sure, with the guidance's notes for its tool; a runbook otherwise.
+fn code_fix(r: &Resource, feeds: &Feeds, mut fix: Fix) -> Fix {
+    let service = runbook::service_of(r.kind, &r.versions.engine);
+    let action = runbook::action_of(r.kind);
+    match iac(r) {
+        Some(l) => {
+            let v = runbook::vars(r, None, &fix.from, &fix.to, feeds.today);
+            fix.notes = Some(runbook::pr_notes(
+                service,
+                action,
+                &l.tool,
+                BTreeMap::new(),
+                &v,
+                feeds.today,
+            ));
+            fix.decision = format!(
+                "A pull request: this change has a code equivalent and the code that defines the resource was found. {}",
+                super::locate::describe(&l)
+            );
+            fix.kind = Some(FixKind::Pr);
+            fix.location = Some(l);
+        }
+        None => {
+            fix.kind = Some(FixKind::Runbook);
+            fix.decision = not_in_code(r);
+            fix.location = r.defined_in.clone();
+        }
+    }
+    fix
 }
 
 /// An AMI-based group (Auto Scaling group, instance, ECS container hosts).
@@ -404,9 +504,9 @@ fn match_ami(r: &Resource, feeds: &Feeds, out: &mut Vec<InfraFinding>) {
         } else {
             format!("AWS's latest AL2023 AMI in {} is {latest}", r.region)
         },
-        apply_by: String::new(),
-        reason: String::new(),
+        ..Default::default()
     };
+    let fix = code_fix(r, feeds, fix);
     out.push(finding(
         r,
         &format!("ami:{to}"),
@@ -481,9 +581,9 @@ fn match_nodegroup(r: &Resource, feeds: &Feeds, out: &mut Vec<InfraFinding>) {
             r.name, r.region
         )],
         console: format!("EKS > Clusters > {cluster} > Compute > {} > Update now", r.name),
-        apply_by: String::new(),
-        reason: String::new(),
+        ..Default::default()
     };
+    let fix = code_fix(r, feeds, fix);
     out.push(finding(
         r,
         &format!("nodegroup:{to}"),
@@ -610,6 +710,7 @@ fn match_lambda(r: &Resource, feeds: &Feeds, out: &mut Vec<InfraFinding>) {
                 apply_by: runtime.block_update.clone(),
                 ..Default::default()
             };
+            let fix = code_fix(r, feeds, fix);
             out.push(finding(
                 r,
                 &format!("runtime:{rt}"),
@@ -635,75 +736,316 @@ fn match_lambda(r: &Resource, feeds: &Feeds, out: &mut Vec<InfraFinding>) {
     }
 }
 
-fn runbook(
-    r: &Resource,
-    pending: &super::inventory::Pending,
-    cli: String,
-    console: String,
-    service: &str,
-    feeds: &Feeds,
-    out: &mut Vec<InfraFinding>,
-) {
+/// What a stored pending row means: its own reading, or, for a row saved
+/// before meanings were kept, what its kind says.
+fn meaning(r: &Resource, p: &Pending) -> Meaning {
+    if p.meaning != Meaning::Unknown {
+        return p.meaning;
+    }
+    match (r.kind, p.kind.as_str()) {
+        (_, "health") => Meaning::Health,
+        (Kind::ElasticacheGroup, "service-update") => Meaning::ServiceUpdate,
+        (Kind::OpensearchDomain, "service-software") => Meaning::ServiceSoftware,
+        (Kind::RdsInstance, k) => actions::meaning_of(k, "instance", &r.versions.engine),
+        (Kind::RdsCluster, k) => match p.arns.first() {
+            Some(a) => actions::meaning_of(k, actions::scope_of(a), &r.versions.engine),
+            // Which ARN it was on was not kept: only names that mean one
+            // thing on both are read.
+            None => match k {
+                "db-upgrade" | "os-upgrade" => actions::meaning_of(k, "cluster", ""),
+                _ => Meaning::Unknown,
+            },
+        },
+        _ => Meaning::Unknown,
+    }
+}
+
+/// The severity an update's own words give, when no advisory does.
+fn own_severity(m: Meaning, description: &str) -> &'static str {
+    let d = description.to_ascii_lowercase();
+    for s in ["critical", "important", "medium", "low"] {
+        if d.split(|c: char| !c.is_ascii_alphabetic()).any(|w| w == s) {
+            return s;
+        }
+    }
+    if m == Meaning::OsUpdate || d.contains("security") {
+        "important"
+    } else {
+        "medium"
+    }
+}
+
+/// Whether the code's value for a version already allows `target`: the
+/// same version, a later one, or a prefix of it (`16` for `16.6`).
+fn code_covers(code: &str, target: &str) -> bool {
+    !code.is_empty()
+        && !target.is_empty()
+        && (code == target || target.starts_with(&format!("{code}.")) || !version_lt(code, target))
+}
+
+/// One pending update of a database, cache or search domain: a pull
+/// request when the update has a code equivalent and the code was found
+/// for sure, a runbook otherwise, and in both cases why.
+fn update(r: &Resource, p: &Pending, feeds: &Feeds, out: &mut Vec<InfraFinding>) {
+    let m = meaning(r, p);
+    let service = runbook::service_of(r.kind, &r.versions.engine);
+    let action = m.guidance_action();
+    let from = r.versions.engine_version.clone();
+    let mut p = p.clone();
+    p.meaning = m;
+    if p.arns.is_empty() {
+        p.arns = vec![r.id.clone()];
+    }
+
+    // Advisories: only what ties to this action.
     let mut hits = Hits::new();
     hits.sources.push(Source {
-        id: format!("{}:{}", pending.kind, pending.name),
+        id: format!("{}:{}", p.kind, p.name),
         kind: "maintenance".into(),
         url: String::new(),
         severity: String::new(),
     });
-    // A bulletin that says the customer applies it in AWS names the CVEs.
-    for (b, row) in bulletin_rows(feeds, service) {
-        if row.who == Who::CustomerInAws {
-            hits.bulletin(b, feeds.kev);
+    let bulletin_service = match r.kind {
+        Kind::RdsCluster | Kind::RdsInstance => "rds",
+        Kind::ElasticacheGroup => "elasticache",
+        Kind::OpensearchDomain => "opensearch",
+        _ => "",
+    };
+    let target = actions::Target {
+        meaning: m,
+        engine: &r.versions.engine,
+        running: &from,
+        target: &p.target,
+        name: &p.name,
+        today: feeds.today,
+    };
+    let mut advisory_note = String::new();
+    for (b, row) in bulletin_rows(feeds, bulletin_service) {
+        match actions::tie(b, row, &target) {
+            Ok(Tie::Exact { cves, .. }) => hits.bulletin_with(b, &cves, feeds.kev),
+            Ok(Tie::Related { why }) => {
+                hits.bulletin_with(b, &[], feeds.kev);
+                advisory_note = why;
+            }
+            Err(_) => {}
         }
     }
-    if hits.severity.is_empty() {
-        hits.severity(
-            if pending.kind == "system-update"
-                || pending
-                    .description
-                    .to_ascii_lowercase()
-                    .contains("security")
-            {
-                "important"
-            } else {
-                "medium"
-            },
-        );
+    let q = super::guidance::Query {
+        service,
+        action,
+        tool: "",
+        facts: BTreeMap::new(),
+    };
+    let first = |section: &str| {
+        super::guidance::section(&q, section)
+            .first()
+            .map(|e| e.text.clone())
+            .unwrap_or_default()
+    };
+    if hits.cves.is_empty() && advisory_note.is_empty() {
+        advisory_note = first("cve");
     }
-    let fix = Fix {
-        kind: Some(FixKind::Runbook),
-        summary: format!(
-            "Apply {} {} in AWS",
-            pending.kind.replace('-', " "),
-            if pending.name == pending.kind {
+    if hits.severity.is_empty() {
+        hits.severity(own_severity(m, &p.description));
+    }
+
+    // Pull request or runbook.
+    let located = r.defined_in.clone();
+    let sure = located.clone().filter(Location::sure);
+    let where_it_is = |l: &Location| {
+        format!(
+            "`{}`{} in {}",
+            l.file,
+            if l.address.is_empty() {
                 String::new()
             } else {
-                pending.name.clone()
-            }
+                format!(" (`{}`)", l.address)
+            },
+            l.repo
         )
-        .replace("  ", " ")
-        .trim()
-        .to_string(),
-        location: None,
-        from: r.versions.engine_version.clone(),
-        to: String::new(),
-        cli: vec![cli],
+    };
+    let mut kind = FixKind::Runbook;
+    let mut notes = None;
+    let mut code_note = String::new();
+    let decision = if m == Meaning::Unknown {
+        format!(
+            "A runbook: AWS documents the `{}` action on a cluster only for Aurora PostgreSQL (an engine patch) and on an instance as an operating system update. On this {} ({}) AWS does not say what it does, so CoderHelm does not either: read AWS's description of the action before applying it.",
+            p.kind,
+            r.kind.label(),
+            r.versions.engine
+        )
+    } else if !m.in_code() {
+        let mut d = first("in_code");
+        if d.is_empty() {
+            d = "This is applied in AWS; nothing in infrastructure code does it.".into();
+        }
+        if let Some(l) = &sure {
+            d.push_str(&format!(
+                " The resource is defined in {}; nothing there changes for this update.",
+                where_it_is(l)
+            ));
+        }
+        d
+    } else if p.target.is_empty() {
+        "This update has a code equivalent, but AWS's description of the action does not name the version it moves to, so CoderHelm cannot write the change. Read the valid targets with the first check below.".to_string()
+    } else {
+        match (&sure, sure.as_ref().and_then(|l| l.edit.as_ref())) {
+            (Some(_), Some(e)) if e.value.is_empty() => {
+                code_note = format!(
+                    "The code that defines this resource sets no `{}` ({}), so no version there holds this back and there is nothing to change.",
+                    e.attribute, e.file
+                );
+                "A runbook: the code that defines this resource does not pin a version, so the upgrade is not a code change. Apply it in AWS, or let AWS apply it in the maintenance window.".to_string()
+            }
+            (Some(_), Some(e)) if code_covers(&e.value, &p.target) => {
+                code_note = format!(
+                    "The code already allows {}: {} sets `{}` to `{}` (line {}). No code change is needed.",
+                    p.target, e.file, e.attribute, e.value, e.line
+                );
+                format!(
+                    "A runbook: the code that defines this resource already allows version {} ({} is `{}`), so there is nothing to change there. The upgrade has not run yet: it is waiting for the maintenance window or for the change to be applied.",
+                    p.target, e.attribute, e.value
+                )
+            }
+            (Some(l), Some(_)) => {
+                kind = FixKind::Pr;
+                let mut facts = BTreeMap::new();
+                if let Some(major) = actions::is_major(&r.versions.engine, &from, &p.target) {
+                    facts.insert("major".to_string(), major.to_string());
+                }
+                let v = runbook::vars(r, Some(&p), &from, &p.target, feeds.today);
+                notes = Some(runbook::pr_notes(
+                    service,
+                    action,
+                    &l.tool,
+                    facts,
+                    &v,
+                    feeds.today,
+                ));
+                format!(
+                    "A pull request: an engine version change has a code equivalent, and the code that defines this resource was found. {}",
+                    super::locate::describe(l)
+                )
+            }
+            _ => {
+                code_note = "If this resource is defined in code, raise its pinned version there to the new version once this is applied. A version pinned behind the live one makes the next apply a downgrade attempt, which the service refuses.".into();
+                not_in_code(r)
+            }
+        }
+    };
+
+    let rb = (kind == FixKind::Runbook).then(|| runbook::build(r, &p, feeds.today));
+    let (cli, console) = match &rb {
+        Some(rb) => (
+            rb.steps
+                .iter()
+                .filter(|s| !s.cli.is_empty())
+                .map(|s| s.cli.clone())
+                .take(p.arns.len().max(1))
+                .collect(),
+            rb.console.first().cloned().unwrap_or_default(),
+        ),
+        None => (Vec::new(), String::new()),
+    };
+    let what = if m == Meaning::Unknown {
+        format!("AWS action `{}`", p.kind)
+    } else if p.target.is_empty() {
+        m.label().to_string()
+    } else {
+        format!("{} to {}", m.label(), p.target)
+    };
+    let summary = match (kind, &sure) {
+        (FixKind::Pr, Some(l)) => {
+            let e = l.edit.as_ref();
+            format!(
+                "Raise `{}` to {} in {}",
+                e.map(|e| e.attribute.as_str())
+                    .unwrap_or("the engine version"),
+                p.target,
+                e.map(|e| e.file.as_str()).unwrap_or(l.file.as_str())
+            )
+        }
+        _ => format!("Apply the {what} in AWS (`{}`)", p.kind),
+    };
+    let mut order = Vec::new();
+    if !p.order_why.is_empty() {
+        order.push(p.order_why.clone());
+    }
+    for x in &p.merged {
+        order.push(format!("{}.", super::locate::sentence(x)));
+    }
+    let fix = Fix {
+        kind: Some(kind),
+        summary,
+        location: if kind == FixKind::Pr { sure } else { located },
+        from,
+        to: p.target.clone(),
+        cli,
         console,
-        apply_by: pending.apply_by.clone(),
-        reason: pending.description.clone(),
+        apply_by: p.apply_by.clone(),
+        reason: p.description.clone(),
+        decision,
+        meaning: Some(m),
+        runbook: rb,
+        notes,
+        code_note,
+        order,
+        after: Vec::new(),
+        advisory_note,
     };
     out.push(finding(
         r,
-        &format!("{}:{}", pending.kind, pending.name),
+        &format!("{}:{}", p.kind, p.name),
+        format!("{} {}: {what} pending", r.kind.label(), r.name),
+        hits,
+        fix,
+    ));
+}
+
+/// An AWS Health event on a resource: a card that says where to read it.
+fn health(r: &Resource, p: &Pending, out: &mut Vec<InfraFinding>) {
+    let mut hits = Hits::new();
+    hits.sources.push(Source {
+        id: format!("{}:{}", p.kind, p.name),
+        kind: "maintenance".into(),
+        url: String::new(),
+        severity: String::new(),
+    });
+    hits.severity(own_severity(Meaning::Health, &p.description));
+    let fix = Fix {
+        kind: Some(FixKind::Runbook),
+        summary: format!("Act on the AWS Health event {}", p.name),
+        from: r.versions.engine_version.clone(),
+        cli: vec![format!(
+            "aws health describe-events --filter eventTypeCodes={} --region us-east-1",
+            p.name
+        )],
+        console: format!(
+            "AWS Health Dashboard > Your account health > {}",
+            if p.auto_applied_after.is_empty() {
+                "Open and recent issues"
+            } else {
+                "Scheduled changes"
+            }
+        ),
+        apply_by: p.apply_by.clone(),
+        reason: p.description.clone(),
+        decision: "A runbook: an AWS Health event says what to do in its own words; read the event for the steps.".into(),
+        meaning: Some(Meaning::Health),
+        advisory_note: "AWS Health events carry an action type and dates, not a CVE list.".into(),
+        ..Default::default()
+    };
+    out.push(finding(
+        r,
+        &format!("{}:{}", p.kind, p.name),
         format!(
             "{} {}: {}",
             r.kind.label(),
             r.name,
-            if pending.description.is_empty() {
-                pending.name.clone()
+            if p.description.is_empty() {
+                p.name.clone()
             } else {
-                pending.description.clone()
+                p.description.clone()
             }
         ),
         hits,
@@ -713,52 +1055,92 @@ fn runbook(
 
 fn match_managed(r: &Resource, feeds: &Feeds, out: &mut Vec<InfraFinding>) {
     for p in &r.pending {
-        match r.kind {
-            Kind::RdsCluster | Kind::RdsInstance
-                if matches!(p.kind.as_str(), "system-update" | "db-upgrade") =>
+        match meaning(r, p) {
+            Meaning::Health => health(r, p, out),
+            Meaning::OsUpdate
+            | Meaning::EnginePatch
+            | Meaning::EngineUpgrade
+            | Meaning::ServiceUpdate
+            | Meaning::ServiceSoftware => update(r, p, feeds, out),
+            // An update action AWS does not document for this ARN (a
+            // cluster-level `system-update` on an engine other than Aurora
+            // PostgreSQL): shown, named as AWS names it, with no meaning
+            // made up for it.
+            Meaning::Unknown
+                if matches!(r.kind, Kind::RdsCluster | Kind::RdsInstance)
+                    && matches!(
+                        p.kind.as_str(),
+                        "system-update" | "os-upgrade" | "db-upgrade"
+                    ) =>
             {
-                let cli = format!(
-                    "aws rds apply-pending-maintenance-action --resource-identifier {} --apply-action {} --opt-in-type next-maintenance --region {}",
-                    r.id, p.kind, r.region
-                );
-                let console = format!(
-                    "RDS > Databases > {} > Maintenance & backups > Pending maintenance > Apply",
-                    r.name
-                );
-                runbook(r, p, cli, console, "rds", feeds, out);
+                update(r, p, feeds, out)
             }
-            Kind::ElasticacheGroup if p.kind == "service-update" => {
-                let cli = format!(
-                    "aws elasticache batch-apply-update-action --service-update-name {} --replication-group-ids {} --region {}",
-                    p.name, r.name, r.region
-                );
-                let console = format!("ElastiCache > Service updates > {} > Apply now", p.name);
-                runbook(r, p, cli, console, "elasticache", feeds, out);
-            }
-            _ if p.kind == "health" => {
-                let cli = format!(
-                    "aws health describe-events --filter eventTypeCodes={} --region us-east-1",
-                    p.name
-                );
-                let console = format!(
-                    "AWS Health Dashboard > Your account health > {}",
-                    if p.auto_applied_after.is_empty() {
-                        "Open and recent issues"
-                    } else {
-                        "Scheduled changes"
-                    }
-                );
-                runbook(r, p, cli, console, "", feeds, out);
-            }
-            Kind::OpensearchDomain if p.kind == "service-software" => {
-                let cli = format!("aws opensearch start-service-software-update --domain-name {} --schedule-at OFF_PEAK_WINDOW --region {}", r.name, r.region);
-                let console = format!(
-                    "OpenSearch Service > Domains > {} > Actions > Update",
-                    r.name
-                );
-                runbook(r, p, cli, console, "opensearch", feeds, out);
-            }
+            // Hardware maintenance, certificate rotation and the
+            // serverless platform version are not security updates
+            // CoderHelm describes: they are not made into findings.
             _ => {}
+        }
+    }
+}
+
+/// The same resource in more than one environment: the non-production
+/// one goes first, and both rows say so.
+fn order_environments(found: &mut [InfraFinding], siblings: &[(usize, String)]) {
+    let rule = super::guidance::section(
+        &super::guidance::Query {
+            service: "any",
+            action: "any",
+            tool: "",
+            facts: BTreeMap::new(),
+        },
+        "order",
+    )
+    .first()
+    .map(|e| e.text.clone())
+    .unwrap_or_default();
+    let mut groups: BTreeMap<(String, Option<Meaning>, String), Vec<usize>> = BTreeMap::new();
+    for (i, key) in siblings {
+        let f = &found[*i];
+        if f.fix.kind == Some(FixKind::Aws) {
+            continue;
+        }
+        groups
+            .entry((key.clone(), f.fix.meaning, f.fix.to.clone()))
+            .or_default()
+            .push(*i);
+    }
+    for members in groups.values() {
+        let prod: Vec<usize> = members
+            .iter()
+            .copied()
+            .filter(|i| found[*i].environment == "production")
+            .collect();
+        let first: Vec<usize> = members
+            .iter()
+            .copied()
+            .filter(|i| !found[*i].environment.is_empty() && found[*i].environment != "production")
+            .collect();
+        if prod.is_empty() || first.is_empty() {
+            continue;
+        }
+        let names = |ids: &[usize]| {
+            ids.iter()
+                .map(|i| format!("`{}` ({})", found[*i].name, found[*i].environment))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let (before, after_names) = (names(&first), names(&prod));
+        let ids: Vec<String> = first.iter().map(|i| found[*i].id.clone()).collect();
+        for i in &prod {
+            found[*i].fix.after = ids.clone();
+            found[*i].fix.order.push(format!(
+                "This is production. The same update is open on {before}: do that first, check it, then this one. {rule}"
+            ));
+        }
+        for i in &first {
+            found[*i].fix.order.push(format!(
+                "This is the non-production copy of {after_names}: do this one first. {rule}"
+            ));
         }
     }
 }
@@ -820,7 +1202,9 @@ fn with_inspector(r: &Resource, own: Vec<InfraFinding>, feeds: &Feeds) -> Vec<In
             },
         };
     }
-    let mut base = own.into_iter().find(|f| f.fix.kind == Some(FixKind::Pr));
+    let mut base = own
+        .into_iter()
+        .find(|f| f.fix.kind != Some(FixKind::Aws) && !f.fix.to.is_empty());
     let mut f = match base.take() {
         Some(mut f) => {
             for s in hit_sources.sources.drain(..) {
@@ -891,7 +1275,27 @@ fn with_inspector(r: &Resource, own: Vec<InfraFinding>, feeds: &Feeds) -> Vec<In
 /// Every finding for a team's resources, one per fix, sorted by tier.
 pub fn findings(resources: &[Resource], feeds: &Feeds) -> Vec<InfraFinding> {
     let mut out = Vec::new();
+    let mut siblings: Vec<(usize, String)> = Vec::new();
     for r in resources {
+        let start = out.len();
+        match_one(r, feeds, &mut out);
+        let key = super::locate::sibling_key(r);
+        siblings.extend((start..out.len()).map(|i| (i, key.clone())));
+    }
+    order_environments(&mut out, &siblings);
+    out.sort_by(|a, b| {
+        (a.tier.is_none(), a.tier, a.fix.kind, a.title.as_str()).cmp(&(
+            b.tier.is_none(),
+            b.tier,
+            b.fix.kind,
+            b.title.as_str(),
+        ))
+    });
+    out
+}
+
+fn match_one(r: &Resource, feeds: &Feeds, out: &mut Vec<InfraFinding>) {
+    {
         if !r.inspector.is_empty()
             && matches!(
                 r.kind,
@@ -910,30 +1314,21 @@ pub fn findings(resources: &[Resource], feeds: &Feeds) -> Vec<InfraFinding> {
                 _ => {}
             }
             out.extend(with_inspector(r, own, feeds));
-            match_managed(r, feeds, &mut out);
-            continue;
+            match_managed(r, feeds, out);
+            return;
         }
         match r.kind {
-            Kind::AutoScalingGroup | Kind::Ec2Instance => match_ami(r, feeds, &mut out),
-            Kind::EksNodegroup => match_nodegroup(r, feeds, &mut out),
-            Kind::EcsFargateService => match_fargate(r, feeds, &mut out),
-            Kind::LambdaFunction => match_lambda(r, feeds, &mut out),
+            Kind::AutoScalingGroup | Kind::Ec2Instance => match_ami(r, feeds, out),
+            Kind::EksNodegroup => match_nodegroup(r, feeds, out),
+            Kind::EcsFargateService => match_fargate(r, feeds, out),
+            Kind::LambdaFunction => match_lambda(r, feeds, out),
             Kind::RdsCluster
             | Kind::RdsInstance
             | Kind::ElasticacheGroup
-            | Kind::OpensearchDomain => match_managed(r, feeds, &mut out),
+            | Kind::OpensearchDomain => match_managed(r, feeds, out),
             Kind::EksCluster | Kind::ContainerImage => {}
         }
     }
-    out.sort_by(|a, b| {
-        (a.tier.is_none(), a.tier, a.fix.kind, a.title.as_str()).cmp(&(
-            b.tier.is_none(),
-            b.tier,
-            b.fix.kind,
-            b.title.as_str(),
-        ))
-    });
-    out
 }
 
 /// Whether a finding is still open after a new read of the account: its
@@ -1075,13 +1470,44 @@ mod tests {
         // The Aurora runbook card: exact CLI, console path, AWS's date.
         let db = runbooks[0];
         assert_eq!(db.kind, Some(Kind::RdsCluster));
-        assert!(db.fix.cli[0].starts_with("aws rds apply-pending-maintenance-action --resource-identifier arn:aws:rds:us-east-1:111122223333:cluster:orders --apply-action system-update"));
-        assert!(db.fix.console.contains("Pending maintenance"));
+        // The action is pending on the instance ARN, where `system-update`
+        // is an operating system update: the command names that ARN.
+        assert!(db.fix.cli[0].starts_with("aws rds apply-pending-maintenance-action --resource-identifier arn:aws:rds:us-east-1:111122223333:db:orders-1 --apply-action system-update"), "{:?}", db.fix.cli);
+        assert!(
+            db.fix.console.contains("Patch at next window"),
+            "{}",
+            db.fix.console
+        );
         assert_eq!(db.fix.apply_by, "2026-12-01");
+        assert_eq!(db.fix.meaning, Some(Meaning::OsUpdate));
+        assert!(db.title.contains("operating system update"), "{}", db.title);
+        // AWS publishes no CVE list for an OS update: the bulletin that
+        // tells RDS customers to patch the database OS is shown as
+        // related, and its CVE is not put on the action.
+        assert!(db.cves.is_empty(), "{:?}", db.cves);
         assert!(
             db.sources.iter().any(|s| s.id == "2026-160-AWS"),
-            "the bulletin says RDS customers apply it"
+            "the bulletin says RDS customers patch the database OS"
         );
+        assert!(
+            db.fix.advisory_note.contains("no CVE list"),
+            "{}",
+            db.fix.advisory_note
+        );
+        // The cluster is in the team's Terraform, and it is still a
+        // runbook, because an OS update cannot be expressed in code.
+        assert!(
+            db.fix.decision.contains("cannot be expressed in code"),
+            "{}",
+            db.fix.decision
+        );
+        assert!(
+            db.fix.decision.contains("aws_rds_cluster.orders"),
+            "{}",
+            db.fix.decision
+        );
+        let rb = db.fix.runbook.as_ref().expect("a full runbook");
+        assert!(!rb.prechecks.is_empty() && !rb.backup.is_empty() && !rb.rollback.is_empty());
 
         // AWS-managed rows, never counted as open.
         let fargate = aws
@@ -1181,8 +1607,15 @@ mod tests {
             .unwrap();
         assert_eq!(
             ng.fix.kind,
-            Some(FixKind::Pr),
-            "CoderHelm's node group fix is kept"
+            Some(FixKind::Runbook),
+            "CoderHelm's node group fix is kept; not found in code, it is a runbook"
+        );
+        assert!(ng.fix.to.ends_with("20261031"), "{}", ng.fix.to);
+        assert!(ng.fix.cli[0].starts_with("aws eks update-nodegroup-version"));
+        assert!(
+            ng.fix.decision.contains("did not find this resource"),
+            "{}",
+            ng.fix.decision
         );
         assert!(ng.sources.iter().any(|s| s.kind == "inspector"));
         let facts = ng.inspector.as_ref().unwrap();
@@ -1268,6 +1701,15 @@ mod tests {
                 package_type: "Zip".into(),
                 ..Default::default()
             },
+            defined_in: Some(Location {
+                repo: "acme/infra".into(),
+                file: "lambda.tf".into(),
+                address: "aws_lambda_function.thumbs".into(),
+                how: "terraform_name".into(),
+                tool: "terraform".into(),
+                confidence: inventory::Confidence::High,
+                ..Default::default()
+            }),
             ..Default::default()
         };
         let kev = BTreeMap::new();
@@ -1293,6 +1735,448 @@ mod tests {
                 .find(|r| r.id == f[0].fix.to)
                 .unwrap()
                 .deprecated
+        );
+        let notes = f[0].fix.notes.as_ref().expect("the guidance for Terraform");
+        assert!(notes.attribute[0].contains("`runtime` on the `aws_lambda_function`"));
+        assert!(notes.rollback[0].contains("block-update date"));
+    }
+
+    fn feeds_with<'a>(
+        bulletins: &'a [Bulletin],
+        kev: &'a BTreeMap<String, String>,
+        latest: &'a BTreeMap<String, String>,
+    ) -> Feeds<'a> {
+        Feeds {
+            advisories: &[],
+            bulletins,
+            runtimes: &[],
+            latest: &[],
+            kev,
+            latest_al2023: latest,
+            today: "2026-11-13",
+        }
+    }
+
+    fn database(name: &str, engine: &str, version: &str, lines: &[(&str, &str, &str)]) -> Resource {
+        let cluster = engine.starts_with("aurora");
+        let arn = format!(
+            "arn:aws:rds:us-east-1:111122223333:{}:{name}",
+            if cluster { "cluster" } else { "db" }
+        );
+        let lines: Vec<actions::Line> = lines
+            .iter()
+            .map(|(action, description, by)| actions::Line {
+                arn: arn.clone(),
+                action: action.to_string(),
+                description: description.to_string(),
+                apply_by: by.to_string(),
+                ..Default::default()
+            })
+            .collect();
+        Resource {
+            id: arn.clone(),
+            kind: if cluster {
+                Kind::RdsCluster
+            } else {
+                Kind::RdsInstance
+            },
+            name: name.into(),
+            account: "111122223333".into(),
+            region: "us-east-1".into(),
+            group: arn,
+            versions: inventory::Versions {
+                engine: engine.into(),
+                engine_version: version.into(),
+                ..Default::default()
+            },
+            pending: actions::reconcile(engine, version, &lines),
+            count: 1,
+            ..Default::default()
+        }
+    }
+
+    fn in_terraform(
+        file: &str,
+        address: &str,
+        value: &str,
+        confidence: inventory::Confidence,
+    ) -> Location {
+        Location {
+            repo: "acme/infra".into(),
+            file: file.into(),
+            address: address.into(),
+            line: 3,
+            how: "terraform_name".into(),
+            tool: "terraform".into(),
+            confidence,
+            edit: Some(inventory::Edit {
+                file: file.into(),
+                line: 5,
+                attribute: "engine_version".into(),
+                value: value.into(),
+                via: "resource".into(),
+                shared: String::new(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn one(r: Resource, bulletins: &[Bulletin]) -> Vec<InfraFinding> {
+        let (kev, latest) = (BTreeMap::new(), BTreeMap::new());
+        findings(&[r], &feeds_with(bulletins, &kev, &latest))
+    }
+
+    #[test]
+    fn an_engine_upgrade_is_a_pull_request_when_the_code_is_found_for_sure() {
+        let mut r = database(
+            "billing-prod",
+            "mysql",
+            "8.0.36",
+            &[("db-upgrade", "Upgrade to 8.0.40", "2026-12-10")],
+        );
+        r.defined_in = Some(in_terraform(
+            "db/main.tf",
+            "aws_db_instance.billing",
+            "8.0.36",
+            inventory::Confidence::High,
+        ));
+        let f = one(r.clone(), &[]);
+        assert_eq!(f.len(), 1);
+        let x = &f[0];
+        assert_eq!(x.fix.kind, Some(FixKind::Pr));
+        assert_eq!(
+            (x.fix.from.as_str(), x.fix.to.as_str()),
+            ("8.0.36", "8.0.40")
+        );
+        assert_eq!(
+            x.fix.summary,
+            "Raise `engine_version` to 8.0.40 in db/main.tf"
+        );
+        assert!(
+            x.fix.decision.starts_with("A pull request"),
+            "{}",
+            x.fix.decision
+        );
+        assert!(x.fix.runbook.is_none());
+        let n = x.fix.notes.as_ref().unwrap();
+        assert!(n.takes_effect[0].contains("`apply_immediately` defaults to `false`"));
+        assert!(n.interruption[0].contains("Engine upgrades require downtime"));
+        assert!(n.rollback[0].contains("one-way"));
+        assert!(n.never_change.contains(&"identifier".to_string()));
+        assert!(n
+            .traps
+            .iter()
+            .any(|t| t.contains("Never set a value below the live version")));
+        assert!(
+            x.cves.is_empty(),
+            "the action names no CVE and no bulletin ties one to it"
+        );
+        assert_eq!(x.fix.apply_by, "2026-12-10");
+
+        // The same update, the code found but not for sure: a runbook
+        // that says what was found and why it is unsure.
+        let mut unsure = r.clone();
+        let mut l = in_terraform(
+            "db/main.tf",
+            "aws_db_instance.billing",
+            "8.0.36",
+            inventory::Confidence::Low,
+        );
+        l.evidence = vec!["2 other places fit about as well".into()];
+        unsure.defined_in = Some(l);
+        let x = &one(unsure, &[])[0];
+        assert_eq!(x.fix.kind, Some(FixKind::Runbook));
+        assert!(
+            x.fix
+                .decision
+                .contains("is not sure where this resource is defined"),
+            "{}",
+            x.fix.decision
+        );
+        assert!(
+            x.fix.decision.contains("2 other places fit"),
+            "{}",
+            x.fix.decision
+        );
+        assert!(x.fix.location.is_some(), "what was found is still shown");
+        assert!(x.fix.runbook.as_ref().unwrap().steps[0].cli.contains(
+            "modify-db-instance --db-instance-identifier billing-prod --engine-version 8.0.40"
+        ));
+        assert!(x.fix.code_note.contains("raise its pinned version"));
+
+        // Not in any repository: a runbook.
+        let mut nowhere = r.clone();
+        nowhere.defined_in = None;
+        let x = &one(nowhere, &[])[0];
+        assert_eq!(x.fix.kind, Some(FixKind::Runbook));
+        assert!(x
+            .fix
+            .decision
+            .contains("did not find this resource in any connected repository"));
+
+        // The code already allows the target (a prefix): nothing to change.
+        let mut prefix = r.clone();
+        prefix.defined_in = Some(in_terraform(
+            "db/main.tf",
+            "aws_db_instance.billing",
+            "8.0",
+            inventory::Confidence::High,
+        ));
+        let x = &one(prefix, &[])[0];
+        assert_eq!(x.fix.kind, Some(FixKind::Runbook));
+        assert!(
+            x.fix.decision.contains("already allows version 8.0.40"),
+            "{}",
+            x.fix.decision
+        );
+
+        // The code pins no version at all: nothing to change there.
+        let mut unpinned = r.clone();
+        let mut l = in_terraform(
+            "db/main.tf",
+            "aws_db_instance.billing",
+            "",
+            inventory::Confidence::High,
+        );
+        if let Some(e) = l.edit.as_mut() {
+            e.via = "add".into();
+        }
+        unpinned.defined_in = Some(l);
+        let x = &one(unpinned, &[])[0];
+        assert_eq!(x.fix.kind, Some(FixKind::Runbook));
+        assert!(
+            x.fix.decision.contains("does not pin a version"),
+            "{}",
+            x.fix.decision
+        );
+
+        // AWS's description names no version: no change can be written.
+        let mut vague = database(
+            "billing-prod",
+            "mysql",
+            "8.0.36",
+            &[("db-upgrade", "A new engine version is available", "")],
+        );
+        vague.defined_in = r.defined_in.clone();
+        let x = &one(vague, &[])[0];
+        assert_eq!(x.fix.kind, Some(FixKind::Runbook));
+        assert!(x.fix.decision.contains("does not name the version"));
+    }
+
+    #[test]
+    fn what_cannot_be_expressed_in_code_stays_a_runbook_even_when_the_resource_is_in_code() {
+        for (engine, version, action, description, meaning) in [
+            (
+                "postgres",
+                "16.4",
+                "system-update",
+                "New Operating System update is available",
+                Meaning::OsUpdate,
+            ),
+            (
+                "aurora-postgresql",
+                "16.4",
+                "system-update",
+                "Upgrade to Aurora PostgreSQL 16.4.3",
+                Meaning::EnginePatch,
+            ),
+            (
+                "aurora-postgresql",
+                "16.4",
+                "os-upgrade",
+                "New Operating System patch is available",
+                Meaning::OsUpdate,
+            ),
+        ] {
+            let mut r = database("orders", engine, version, &[(action, description, "")]);
+            r.defined_in = Some(in_terraform(
+                "main.tf",
+                "aws_rds_cluster.orders",
+                version,
+                inventory::Confidence::High,
+            ));
+            let f = one(r, &[]);
+            assert_eq!(f.len(), 1, "{action} on {engine}");
+            let x = &f[0];
+            assert_eq!(x.fix.meaning, Some(meaning));
+            assert_eq!(x.fix.kind, Some(FixKind::Runbook), "{action} on {engine}");
+            assert!(
+                x.fix.decision.contains("cannot be expressed in code"),
+                "{}",
+                x.fix.decision
+            );
+            assert!(
+                x.fix
+                    .decision
+                    .contains("nothing there changes for this update"),
+                "{}",
+                x.fix.decision
+            );
+            assert!(x.fix.notes.is_none());
+            assert!(x.cves.is_empty());
+        }
+        // Hardware maintenance is not made into a finding. An update
+        // action AWS does not document for this ARN is shown under AWS's
+        // own name, with no meaning made up for it.
+        let r = database(
+            "orders",
+            "aurora-mysql",
+            "8.0.mysql_aurora.3.08.2",
+            &[
+                ("hardware-maintenance", "", ""),
+                ("system-update", "something", "2026-12-01"),
+            ],
+        );
+        let f = one(r, &[]);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].fix.meaning, Some(Meaning::Unknown));
+        assert!(
+            f[0].title.contains("AWS action `system-update` pending"),
+            "{}",
+            f[0].title
+        );
+        assert!(
+            f[0].fix.decision.contains("AWS does not say what it does"),
+            "{}",
+            f[0].fix.decision
+        );
+        assert!(
+            f[0].fix.cli[0].contains("--apply-action system-update --opt-in-type next-maintenance"),
+            "{:?}",
+            f[0].fix.cli
+        );
+        assert!(f[0].cves.is_empty());
+    }
+
+    #[test]
+    fn an_advisory_is_attached_only_where_it_applies() {
+        let b = Bulletin {
+            id: "2026-170-AWS".into(),
+            severity: "important".into(),
+            published: "2026-11-01".into(),
+            url: "u".into(),
+            cves: vec!["CVE-2026-11111".into()],
+            services: vec![feeds::ServiceStatus {
+                service: "rds".into(),
+                who: Who::CustomerInAws,
+                reason: "Customers should upgrade to Aurora PostgreSQL 16.4.3 or RDS for MySQL version 8.0.40.".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let bs = std::slice::from_ref(&b);
+        // The OS update on any database: never the CVE.
+        let os = one(
+            database(
+                "a",
+                "postgres",
+                "16.4",
+                &[(
+                    "system-update",
+                    "New Operating System update is available",
+                    "",
+                )],
+            ),
+            bs,
+        );
+        assert!(os[0].cves.is_empty() && !os[0].sources.iter().any(|s| s.id == b.id));
+        // The Aurora PostgreSQL patch to the fixed version: the CVE.
+        let patch = one(
+            database(
+                "b",
+                "aurora-postgresql",
+                "16.4",
+                &[("system-update", "Upgrade to Aurora PostgreSQL 16.4.3", "")],
+            ),
+            bs,
+        );
+        assert_eq!(patch[0].cves, vec!["CVE-2026-11111"]);
+        assert_eq!(patch[0].severity, "important");
+        // A MySQL upgrade that stops short of the fix: not the CVE.
+        let short = one(
+            database(
+                "c",
+                "mysql",
+                "8.0.36",
+                &[("db-upgrade", "Upgrade to 8.0.39", "")],
+            ),
+            bs,
+        );
+        assert!(short[0].cves.is_empty());
+        // A MySQL upgrade that reaches it: the CVE.
+        let reach = one(
+            database(
+                "d",
+                "mysql",
+                "8.0.36",
+                &[("db-upgrade", "Upgrade to 8.0.40", "")],
+            ),
+            bs,
+        );
+        assert_eq!(reach[0].cves, vec!["CVE-2026-11111"]);
+        // MariaDB is not named by the bulletin.
+        let other = one(
+            database(
+                "e",
+                "mariadb",
+                "10.11.6",
+                &[("db-upgrade", "Upgrade to 10.11.9", "")],
+            ),
+            bs,
+        );
+        assert!(other[0].cves.is_empty());
+        assert!(
+            other[0].fix.advisory_note.contains("no CVE list"),
+            "{}",
+            other[0].fix.advisory_note
+        );
+    }
+
+    #[test]
+    fn the_non_production_copy_goes_first_and_both_rows_say_so() {
+        let up = [("db-upgrade", "Upgrade to 16.6", "2027-01-15")];
+        let mut prod = database("orders-prod", "postgres", "16.4", &up);
+        prod.defined_in = Some(in_terraform(
+            "envs/prod/main.tf",
+            "aws_db_instance.orders",
+            "16.4",
+            inventory::Confidence::High,
+        ));
+        let mut staging = database("orders-staging", "postgres", "16.4", &up);
+        staging.defined_in = Some(in_terraform(
+            "envs/staging/main.tf",
+            "aws_db_instance.orders",
+            "16.4",
+            inventory::Confidence::High,
+        ));
+        let other = database("billing-prod", "postgres", "16.4", &up);
+        let (kev, latest) = (BTreeMap::new(), BTreeMap::new());
+        let f = findings(&[prod, staging, other], &feeds_with(&[], &kev, &latest));
+        let by = |n: &str| f.iter().find(|x| x.name == n).unwrap();
+        let (p, s, o) = (by("orders-prod"), by("orders-staging"), by("billing-prod"));
+        assert_eq!(
+            (p.environment.as_str(), s.environment.as_str()),
+            ("production", "staging")
+        );
+        assert_eq!(p.fix.after, vec![s.id.clone()]);
+        assert!(
+            p.fix
+                .order
+                .iter()
+                .any(|x| x.contains("`orders-staging` (staging): do that first")),
+            "{:?}",
+            p.fix.order
+        );
+        assert!(s.fix.after.is_empty());
+        assert!(
+            s.fix.order.iter().any(|x| x.contains("do this one first")),
+            "{:?}",
+            s.fix.order
+        );
+        assert!(s.fix.order.iter().any(|x| x.contains("Well-Architected")));
+        assert!(
+            o.fix.after.is_empty() && o.fix.order.is_empty(),
+            "no copy of it elsewhere"
         );
     }
 }

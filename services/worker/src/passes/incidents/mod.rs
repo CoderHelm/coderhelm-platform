@@ -27,6 +27,7 @@ mod ah_dep_run_choice_and_proof;
 mod ai_open_items_settled;
 mod aj_coder_habits;
 mod al_learning_loop;
+mod an_six_database_findings;
 mod b_open_pr_retry;
 mod ba_verdict_on_old_commit;
 mod bb_flaky_not_broken;

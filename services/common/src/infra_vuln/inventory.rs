@@ -252,9 +252,10 @@ pub struct Exposure {
 /// Something AWS has waiting for the resource (applied in AWS, not in code).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Pending {
-    /// `system-update`, `db-upgrade`, `service-update`, `service-software`.
+    /// AWS's own name for the action: `system-update`, `os-upgrade`,
+    /// `db-upgrade`, `service-update`, `service-software`, `health`.
     pub kind: String,
-    /// The update's name (`elasticache-20261106-intel`) or description.
+    /// The update's name (`elasticache-20261106-intel`), or the action's.
     pub name: String,
     #[serde(default)]
     pub description: String,
@@ -266,6 +267,30 @@ pub struct Pending {
     pub auto_applied_after: String,
     #[serde(default)]
     pub status: String,
+    /// What the action does on the ARN it is pending on
+    /// ([`super::actions::meaning_of`]).
+    #[serde(default)]
+    pub meaning: super::actions::Meaning,
+    /// `cluster` or `instance` for a database action.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub scope: String,
+    /// Every ARN the action is applied to, in the order to apply it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub arns: Vec<String>,
+    /// The version it moves to, when AWS's description names it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub target: String,
+    /// What else AWS listed that this row stands for.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub merged: Vec<String>,
+    /// Its place among the actions pending on the same resource (1-based,
+    /// 0 when it is the only one), and why it is there.
+    #[serde(default)]
+    pub step: u8,
+    #[serde(default)]
+    pub steps: u8,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub order_why: String,
 }
 
 /// One Amazon Inspector finding on a resource (when the team runs it).
@@ -287,19 +312,87 @@ pub struct InspectorHit {
     pub remediation: String,
 }
 
-/// Where a resource is defined in the team's code.
+/// How sure a location is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum Confidence {
+    /// More than one place could define it, or only weak signs point here.
+    /// Never enough for a pull request.
+    Low,
+    /// One place fits, without the identifier itself being written there.
+    #[default]
+    Medium,
+    /// AWS's own stack records name it, or the code writes its identifier.
+    High,
+}
+
+/// The line a version change edits.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Edit {
+    pub file: String,
+    #[serde(default)]
+    pub line: u32,
+    /// `engine_version`, `EngineVersion`, `release_version`, `runtime`.
+    pub attribute: String,
+    /// What is written there now, empty when the attribute is not set.
+    #[serde(default)]
+    pub value: String,
+    /// Where the value lives: `resource`, `module_input`, `tfvars`,
+    /// `variable_default`, `local`, `template`, `parameter`, `construct`,
+    /// or `add` when nothing sets it yet.
+    pub via: String,
+    /// What else reads the same value, when the edit is not private to
+    /// this resource.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub shared: String,
+}
+
+/// Where a resource is defined in the team's code, how that was found and
+/// how sure it is.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Location {
     pub repo: String,
     #[serde(default)]
     pub file: String,
-    /// `aws_launch_template.web`, `module.eks.aws_eks_node_group.main`.
+    /// `aws_launch_template.web`, `module.eks.aws_eks_node_group.main`, a
+    /// CloudFormation logical id, a CDK construct id.
     #[serde(default)]
     pub address: String,
     #[serde(default)]
     pub line: u32,
-    /// How it was found: `tag`, `cloudformation`, `search`.
+    /// How it was found: `cloudformation_tag`, `cloudformation_lookup`,
+    /// `cdk_logical_id`, `terraform_name`, `terraform_generated_name`,
+    /// `terraform_attributes`, `terraform_module`, `repo_tag`, `search`.
     pub how: String,
+    /// `terraform`, `opentofu`, `cloudformation`, `sam`, `cdk`,
+    /// `serverless`, `pulumi`; empty when not known.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tool: String,
+    #[serde(default)]
+    pub confidence: Confidence,
+    /// What matched, in words, and what makes it unsure.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<String>,
+    /// The line a version change edits, when it was found.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edit: Option<Edit>,
+    /// `production`, `staging`, `development`, ...; empty when not known.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub environment: String,
+    /// The CloudFormation stack, when one made the resource.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub stack: String,
+    /// The other places that could define it, when unsure
+    /// (`repo:file address`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidates: Vec<String>,
+}
+
+impl Location {
+    /// Enough to open a pull request against: a file, and not a guess.
+    pub fn sure(&self) -> bool {
+        !self.repo.is_empty() && !self.file.is_empty() && self.confidence != Confidence::Low
+    }
 }
 
 /// One running resource.
@@ -323,6 +416,12 @@ pub struct Resource {
     pub pending: Vec<Pending>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub defined_in: Option<Location>,
+    /// Settings read from AWS that tell one resource from another in code
+    /// and say how an update lands (`subnet_group`, `parameter_group`,
+    /// `instance_class`, `multi_az`, `auto_minor`, `maintenance_window`,
+    /// `backup_retention`, `replicas`, `writer`, `global`). Never secrets.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub facts: BTreeMap<String, String>,
     /// `aws` (read from the account) or `iac` (from the team's code).
     pub source: String,
     pub seen_at: String,
@@ -418,29 +517,10 @@ pub fn stack_of(tags: &BTreeMap<String, String>) -> Option<&str> {
         .map(String::as_str)
 }
 
-/// The names to search the team's infrastructure code for: the AMI id,
-/// the group, the resource's own name, its CloudFormation logical id.
+/// The names to search the team's infrastructure code for, strongest
+/// first ([`super::locate::search_terms`]).
 pub fn search_terms(r: &Resource) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    let mut push = |s: &str| {
-        let s = s.trim();
-        if s.len() >= 4 && !out.iter().any(|x| x == s) {
-            out.push(s.to_string());
-        }
-    };
-    if !r.versions.ami_id.is_empty() {
-        push(&r.versions.ami_id);
-    }
-    // A group that is an ARN ends in an id nobody writes in code.
-    if !r.group.starts_with("arn:") {
-        push(&r.group);
-    }
-    push(&r.name);
-    if let Some(l) = r.tags.get("aws:cloudformation:logical-id") {
-        push(l);
-    }
-    out.truncate(4);
-    out
+    super::locate::search_terms(r)
 }
 
 /// The Terraform block around `line` (1-based) in a `.tf` file: its
@@ -466,55 +546,23 @@ pub fn line_of(content: &str, term: &str) -> Option<usize> {
         .map(|i| i + 1)
 }
 
-/// Picks where a resource is defined from what was found: a repository a
-/// tag names wins; else the first infrastructure file a search found for
-/// the earliest term (`files` are `(repo, path, content)`).
+/// Where a resource is defined, from the files read (`(repo, path,
+/// content)`): see [`super::locate::locate`], which also takes the places
+/// a name is mentioned outside infrastructure files.
 pub fn locate(
     r: &Resource,
     team_repos: &[String],
     files: &[(String, String, String)],
 ) -> Option<Location> {
-    let tagged = repo_from_tags(&r.tags, team_repos);
-    for term in search_terms(r) {
-        for (repo, path, content) in files {
-            if tagged.as_ref().is_some_and(|t| t != repo) {
-                continue;
-            }
-            let Some(line) = line_of(content, &term) else {
-                continue;
-            };
-            let (address, line) = if path.ends_with(".tf") {
-                terraform_address(content, line).unwrap_or((String::new(), line as u32))
-            } else {
-                (String::new(), line as u32)
-            };
-            return Some(Location {
-                repo: repo.clone(),
-                file: path.clone(),
-                address,
-                line,
-                how: if tagged.is_some() {
-                    "tag".into()
-                } else {
-                    "search".into()
-                },
-            });
-        }
-    }
-    if let Some(repo) = tagged {
-        return Some(Location {
-            repo,
-            how: "tag".into(),
-            ..Default::default()
-        });
-    }
-    stack_of(&r.tags).map(|s| Location {
-        repo: String::new(),
-        file: String::new(),
-        address: format!("stack {s}"),
-        line: 0,
-        how: "cloudformation".into(),
-    })
+    let files: Vec<super::locate::SourceFile> = files
+        .iter()
+        .map(|(repo, path, content)| super::locate::SourceFile {
+            repo: repo.clone(),
+            path: path.clone(),
+            content: content.clone(),
+        })
+        .collect();
+    super::locate::locate(r, team_repos, &files, &[])
 }
 
 /// Lambda functions as the team's Terraform defines them (`aws_lambda_function`
@@ -577,7 +625,22 @@ pub fn lambdas_from_terraform(
                 file: path.into(),
                 address: format!("aws_lambda_function.{name}"),
                 line,
-                how: "search".into(),
+                how: "terraform_name".into(),
+                tool: "terraform".into(),
+                confidence: Confidence::High,
+                evidence: vec![
+                    "read from this block: the function is listed from the code itself".into(),
+                ],
+                edit: runtime.captures(body).and_then(|c| c.get(1)).map(|m| Edit {
+                    file: path.into(),
+                    line: content[..*start + m.start()].lines().count() as u32,
+                    attribute: "runtime".into(),
+                    value: m.as_str().into(),
+                    via: "resource".into(),
+                    shared: String::new(),
+                }),
+                environment: super::locate::environment_of(&[path]),
+                ..Default::default()
             }),
             source: "iac".into(),
             seen_at: now.into(),
@@ -757,14 +820,18 @@ resource "aws_lambda_function" "render" {
         let l = locate(&r, &["acme/infra".into()], &files).unwrap();
         assert_eq!(l.address, "aws_launch_template.web");
         assert_eq!(l.file, "envs/prod/web.tf");
-        assert_eq!(l.how, "search");
+        assert_eq!(l.how, "terraform_attributes");
+        assert_eq!(l.confidence, Confidence::High, "{:?}", l.evidence);
+        assert_eq!(l.edit.as_ref().unwrap().attribute, "image_id");
         // Nothing found and no tags: unknown.
         assert!(locate(&r, &[], &[]).is_none());
         // A CloudFormation stack tag says at least which stack.
         let mut s = r.clone();
         s.tags
             .insert("aws:cloudformation:stack-name".into(), "web-prod".into());
-        assert_eq!(locate(&s, &[], &[]).unwrap().how, "cloudformation");
+        let stack = locate(&s, &[], &[]).unwrap();
+        assert_eq!(stack.how, "cloudformation_tag");
+        assert!(!stack.sure(), "a stack name alone is never a pull request");
     }
 
     #[test]

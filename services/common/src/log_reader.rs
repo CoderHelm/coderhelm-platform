@@ -175,7 +175,7 @@ pub const ABILITIES: &[Ability] = &[
     Ability {
         key: "infra",
         name: "Infrastructure vulnerabilities",
-        why: "Reads which versions run in the account so they can be matched against security advisories: EC2 instances and their AMIs, Auto Scaling groups and the load balancers in front of them, EKS clusters and node groups, RDS and Aurora pending maintenance, ElastiCache service updates, OpenSearch software updates, ECR scan results, kernels from SSM inventory, and AWS's public latest-AMI parameters. Only when the stack's InfrastructureVulnerabilities parameter is on. Never Lambda function settings, launch template user data or environment variables, and nothing is changed.",
+        why: "Reads which versions run in the account so they can be matched against security advisories: EC2 instances and their AMIs, Auto Scaling groups and the load balancers in front of them, EKS clusters and node groups, RDS and Aurora pending maintenance, ElastiCache service updates, OpenSearch software updates, ECR scan results, kernels from SSM inventory, AWS's public latest-AMI parameters, and which CloudFormation stack made a resource (the stack's name and the resource's logical id, so the fix goes to the code that defines it). Only when the stack's InfrastructureVulnerabilities parameter is on. Never Lambda function settings, launch template user data or environment variables, and nothing is changed.",
         actions: &[
             "ec2:DescribeInstances",
             "ec2:DescribeImages",
@@ -194,6 +194,7 @@ pub const ABILITIES: &[Ability] = &[
             "es:ListDomainNames",
             "es:DescribeDomains",
             "ecr:DescribeImageScanFindings",
+            "cloudformation:DescribeStackResources",
             "ssm:ListInventoryEntries",
             "ssm:GetParameters",
         ],
@@ -815,8 +816,8 @@ mod tests {
         assert!(checked.contains(&"logs:StartQuery"));
         // Knowledge bases (6), imports (4), copying into Bedrock (6 more:
         // its Get calls are the knowledge bases' too) and infrastructure
-        // reads (19), Inspector (3) and Health (3).
-        assert_eq!(checked.len() + 41, all_actions().len());
+        // reads (20), Inspector (3) and Health (3).
+        assert_eq!(checked.len() + 42, all_actions().len());
         assert!(!checked.contains(&"bedrock:IngestKnowledgeBaseDocuments"));
         // Copying into Bedrock rides along as its own parameter and stack.
         let sync = ["arn:aws:bedrock:us-east-1:111122223333:knowledge-base/SYNC123456".to_string()];

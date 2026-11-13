@@ -203,8 +203,13 @@ fn cadence_due(c: Cadence, daily: bool) -> bool {
     }
 }
 
-fn unit_for(r: &Record) -> Option<FixUnit> {
-    let loc = r.finding.fix.location.as_ref()?;
+pub(crate) fn unit_for(r: &Record) -> Option<FixUnit> {
+    // A pull request only where the fix is one and the code was found for
+    // sure: a low-confidence location never becomes a pull request.
+    if r.finding.fix.kind != Some(FixKind::Pr) {
+        return None;
+    }
+    let loc = r.finding.fix.location.as_ref().filter(|l| l.sure())?;
     let key = format!("infra:{}", r.finding.id);
     let to = r.finding.fix.to.clone();
     let branch_name = format!(
@@ -359,14 +364,27 @@ async fn start_fixes(
         if only.is_some() && !asked {
             continue;
         }
-        if r.status != Status::Open
-            || r.finding.fix.kind != Some(FixKind::Pr)
-            || r.finding.fix.location.is_none()
-        {
+        if r.status != Status::Open || unit_for(r).is_none() {
             if asked {
-                why = Some("This finding has no PR to open (a runbook step, AWS-managed, or no file found).".into());
+                why = Some(if r.finding.fix.decision.is_empty() {
+                    "This finding has no PR to open (a runbook step, AWS-managed, or no file found).".into()
+                } else {
+                    format!("This finding has no PR to open. {}", r.finding.fix.decision)
+                });
             }
             continue;
+        }
+        // The guard refused the last change: no new run by itself.
+        if !r.refused.is_empty() && !asked {
+            continue;
+        }
+        // Production waits for its non-production copy. A person's own
+        // request for this finding goes ahead.
+        if !asked {
+            let today = Utc::now().format("%Y-%m-%d").to_string();
+            if records::held(r, records, &today).is_some() {
+                continue;
+            }
         }
         if !asked
             && (!cfg.acts() || !cadence_due(cfg.open_prs.get(r.tier().unwrap_or(Tier::P3)), daily))
@@ -579,7 +597,66 @@ pub async fn on_event(state: &WorkerState, msg: &SecurityEventMessage) {
     }
 }
 
-/// A fix run for an infrastructure finding opened its PR.
+/// What the replacement guard says of a pull request's files
+/// (`(path, before, after)`): the reasons to refuse it, empty when none.
+pub fn guard_refusals(files: &[(String, String, String)]) -> Vec<String> {
+    let changes: Vec<common::infra_vuln::guard::Change> = files
+        .iter()
+        .map(|(path, before, after)| common::infra_vuln::guard::Change {
+            path,
+            before,
+            after,
+        })
+        .collect();
+    common::infra_vuln::guard::refusals(&changes)
+}
+
+/// Reads each infrastructure file the pull request changed, before and
+/// after, and asks the replacement guard. `None` when the files could not
+/// be read (the guard then has no say; the description still carries what
+/// the plan must show).
+async fn guard_pr(
+    state: &WorkerState,
+    team_id: &str,
+    unit: &FixUnit,
+    number: u64,
+) -> Option<(crate::clients::github::GitHubClient, Vec<String>)> {
+    let iid = super::review_reminder::team_installation_id(state, team_id).await?;
+    let gh = crate::clients::github::GitHubClient::new(
+        &state.secrets.github_app_id,
+        &state.secrets.github_private_key,
+        iid,
+        &state.http,
+    )
+    .ok()?;
+    let (owner, name) = unit.repo.split_once('/')?;
+    let base = gh.get_default_branch(owner, name).await.ok()?;
+    let changed = gh.list_pull_files(owner, name, number).await.ok()?;
+    let mut files = Vec::new();
+    for (path, _) in changed {
+        if !common::infra_vuln::locate::maybe_iac_path(&path) {
+            continue;
+        }
+        let before = gh
+            .read_file_if_exists(owner, name, &path, &base)
+            .await
+            .ok()?
+            .unwrap_or_default();
+        let after = gh
+            .read_file_if_exists(owner, name, &path, &unit.branch)
+            .await
+            .ok()?
+            .unwrap_or_default();
+        files.push((path, before, after));
+    }
+    let refusals = guard_refusals(&files);
+    Some((gh, refusals))
+}
+
+/// A fix run for an infrastructure finding opened its PR. The replacement
+/// guard reads the change first: a change that would replace or destroy a
+/// resource that holds data is refused, its pull request is closed with
+/// the reason, and the finding goes back to its runbook.
 pub async fn on_pr_opened(
     state: &WorkerState,
     team_id: &str,
@@ -587,22 +664,54 @@ pub async fn on_pr_opened(
     number: u64,
     url: &str,
 ) {
+    let refused = match guard_pr(state, team_id, unit, number).await {
+        Some((gh, reasons)) if !reasons.is_empty() => {
+            if let Some((owner, name)) = unit.repo.split_once('/') {
+                let explain = common::infra_vuln::guard::explain(&reasons);
+                if let Err(e) = gh.update_pr_body(owner, name, number, &explain).await {
+                    warn!(team_id, number, error = %e, "infra findings: the refusal could not be written on the pull request");
+                }
+                if let Err(e) = gh.close_pull_request(owner, name, number).await {
+                    warn!(team_id, number, error = %e, "infra findings: the refused pull request could not be closed");
+                }
+            }
+            reasons
+        }
+        _ => Vec::new(),
+    };
     for id in &unit.finding_ids {
         let mut recs = load_records(state, team_id).await;
         if let Some(r) = recs.iter_mut().find(|r| &r.finding.id == id) {
-            r.status = Status::PrOpen;
-            r.pr = Some(records::PrRef {
-                number,
-                url: url.to_string(),
-                state: "open".into(),
-            });
+            if refused.is_empty() {
+                r.status = Status::PrOpen;
+                r.pr = Some(records::PrRef {
+                    number,
+                    url: url.to_string(),
+                    state: "open".into(),
+                });
+            } else {
+                r.status = Status::Open;
+                r.pr = Some(records::PrRef {
+                    number,
+                    url: url.to_string(),
+                    state: "closed".into(),
+                });
+                r.refused = refused.clone();
+            }
             r.updated_at = Utc::now().to_rfc3339();
             save(state, team_id, r).await;
             super::security_fixes::add_event(
                 state,
                 team_id,
                 id,
-                &format!("PR #{number} opened"),
+                &if refused.is_empty() {
+                    format!("PR #{number} opened")
+                } else {
+                    format!(
+                        "PR #{number} refused and closed: the change would replace or destroy a resource that holds data ({})",
+                        refused.join("; ")
+                    )
+                },
                 Some(url),
             )
             .await;
@@ -664,6 +773,38 @@ mod tests {
         let mut none = r.clone();
         none.finding.fix.location = None;
         assert!(unit_for(&none).is_none(), "no file, no PR");
+        // A location that is a guess is never a pull request.
+        let mut unsure = r.clone();
+        if let Some(l) = unsure.finding.fix.location.as_mut() {
+            l.confidence = common::infra_vuln::inventory::Confidence::Low;
+        }
+        assert!(
+            unit_for(&unsure).is_none(),
+            "a low-confidence match opens no PR"
+        );
+        // Nor is a runbook that happens to know where the code is.
+        let mut runbook = r.clone();
+        runbook.finding.fix.kind = Some(FixKind::Runbook);
+        assert!(unit_for(&runbook).is_none());
+    }
+
+    #[test]
+    fn the_guard_reads_a_pull_requests_files_before_and_after() {
+        let before = "resource \"aws_db_instance\" \"orders\" {\n  identifier     = \"orders-prod\"\n  engine_version = \"16.4\"\n}\n";
+        let ok = vec![(
+            "db/main.tf".to_string(),
+            before.to_string(),
+            before.replace("16.4", "16.6"),
+        )];
+        assert!(guard_refusals(&ok).is_empty());
+        let bad = vec![(
+            "db/main.tf".to_string(),
+            before.to_string(),
+            before.replace("orders-prod", "orders"),
+        )];
+        let why = guard_refusals(&bad);
+        assert_eq!(why.len(), 1);
+        assert!(why[0].contains("replaces the resource"), "{why:?}");
     }
 
     #[test]

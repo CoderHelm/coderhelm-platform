@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use super::actions::{self, Line, Meaning};
 use super::inventory::{self as inv, AmiInfo, Exposure, Kind, Pending, Resource, Versions};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -110,6 +111,13 @@ pub struct RawDatabase {
     /// An instance of this cluster (its own record is the cluster's).
     pub cluster: String,
     pub tags: Vec<(String, String)>,
+    /// An instance that is its cluster's writer.
+    pub writer: bool,
+    /// Settings that tell it apart in code and say how an update lands
+    /// (`subnet_group`, `parameter_group`, `instance_class`, `multi_az`,
+    /// `auto_minor`, `maintenance_window`, `backup_retention`, `replicas`,
+    /// `global`). Never credentials.
+    pub facts: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -275,13 +283,14 @@ impl RawAccount {
         out
     }
 
-    fn pending_for(&self, arn: &str) -> Vec<Pending> {
+    /// What AWS lists as pending on one ARN.
+    fn lines_for(&self, arn: &str, writer: bool) -> Vec<Line> {
         self.pending
             .iter()
             .filter(|p| p.resource_arn == arn)
-            .map(|p| Pending {
-                kind: p.action.clone(),
-                name: p.action.clone(),
+            .map(|p| Line {
+                arn: arn.to_string(),
+                action: p.action.clone(),
                 description: p.description.clone(),
                 apply_by: [&p.forced_apply, &p.auto_applied_after, &p.current_apply]
                     .into_iter()
@@ -289,7 +298,7 @@ impl RawAccount {
                     .map(|d| d.chars().take(10).collect())
                     .unwrap_or_default(),
                 auto_applied_after: p.auto_applied_after.chars().take(10).collect(),
-                status: "pending".into(),
+                writer,
             })
             .collect()
     }
@@ -528,15 +537,26 @@ impl RawAccount {
                     "not publicly accessible".into()
                 },
             };
-            let mut pending = self.pending_for(&d.arn);
+            // Everything pending on the cluster and on its instances, as
+            // one row per meaning (the same action name means different
+            // things on the two kinds of ARN).
+            let mut lines = self.lines_for(&d.arn, false);
             for m in &members {
-                for p in self.pending_for(&m.arn) {
-                    if !pending.iter().any(|x| x.kind == p.kind) {
-                        pending.push(p);
-                    }
-                }
+                lines.extend(self.lines_for(&m.arn, m.writer));
             }
-            r.pending = pending;
+            r.pending = actions::reconcile(&d.engine, &d.engine_version, &lines);
+            r.facts = d.facts.clone();
+            r.facts.insert(
+                "members".into(),
+                members
+                    .iter()
+                    .map(|m| m.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+            if let Some(w) = members.iter().find(|m| m.writer) {
+                r.facts.insert("writer".into(), w.id.clone());
+            }
             out.push(r);
         }
         for d in self.db_instances.iter().filter(|i| i.cluster.is_empty()) {
@@ -551,7 +571,9 @@ impl RawAccount {
                     "not publicly accessible".into()
                 },
             };
-            r.pending = self.pending_for(&d.arn);
+            r.pending =
+                actions::reconcile(&d.engine, &d.engine_version, &self.lines_for(&d.arn, false));
+            r.facts = d.facts.clone();
             out.push(r);
         }
 
@@ -580,6 +602,9 @@ impl RawAccount {
                     apply_by: u.apply_by.chars().take(10).collect(),
                     auto_applied_after: String::new(),
                     status: u.status.clone(),
+                    meaning: Meaning::ServiceUpdate,
+                    arns: vec![g.to_string()],
+                    ..Default::default()
                 })
                 .collect();
             out.push(r);
@@ -611,6 +636,9 @@ impl RawAccount {
                     apply_by: d.automated_update_date.chars().take(10).collect(),
                     auto_applied_after: d.automated_update_date.chars().take(10).collect(),
                     status: "available".into(),
+                    meaning: Meaning::ServiceSoftware,
+                    arns: vec![d.arn.clone()],
+                    ..Default::default()
                 });
             }
             out.push(r);
@@ -662,6 +690,8 @@ impl RawAccount {
                             String::new()
                         },
                         status: e.status.clone(),
+                        meaning: Meaning::Health,
+                        ..Default::default()
                     });
                 }
             }
@@ -702,6 +732,10 @@ pub const CALLS: &[(&str, &str)] = &[
         "elasticache:DescribeServiceUpdates",
     ),
     ("DescribeUpdateActions", "elasticache:DescribeUpdateActions"),
+    (
+        "DescribeStackResources",
+        "cloudformation:DescribeStackResources",
+    ),
     ("ListDomainNames", "es:ListDomainNames"),
     ("DescribeDomains", "es:DescribeDomains"),
     ("DescribeImageScanFindings", "ecr:DescribeImageScanFindings"),
