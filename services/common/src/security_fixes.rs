@@ -286,6 +286,16 @@ pub struct PrRef {
     /// `open`, `merged` or `closed`.
     pub state: String,
     pub adopted: bool,
+    /// Closed without merging: when (`security_release::settle_pr`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub closed_at: Option<String>,
+    /// ...and who closed it: a GitHub login, or the name of the person who
+    /// closed its run in CoderHelm. None when GitHub does not say.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub closed_by: Option<String>,
+    /// A person closed it (false: CoderHelm did, for a reason of its own).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub closed_by_person: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -355,6 +365,9 @@ pub struct FindingState {
     pub withdrawn: Vec<String>,
     /// The fix run working on it.
     pub ticket: Option<String>,
+    /// When that run was started for it: a run of the ticket that began
+    /// after this is the one it waits on (`security_release::settle_run`).
+    pub claimed_at: Option<String>,
     /// What the last triage read (so it isn't read twice).
     pub triaged: Option<String>,
     /// When the last triage ran: verdicts are read again weekly (the code
@@ -362,7 +375,9 @@ pub struct FindingState {
     pub triaged_at: Option<String>,
     /// The tier its first card posted at: a later rise to P0 posts again.
     pub carded_tier: Option<Tier>,
-    /// A person closed its pull request unmerged: not opened again until.
+    /// Its pull request closed unmerged, or its fix run ended without one:
+    /// automatic fixes don't start again until then. A person asking for a
+    /// fix never waits on it.
     pub hold_until: Option<String>,
     pub merged_at: Option<String>,
     /// Stages whose card posted (`new`, `half`, `deadline`, ...).
@@ -2163,7 +2178,9 @@ pub fn requested_units(
                 st.requested_by.is_some()
                     && st.requested_as == combine
                     && f.status == Status::Open
-                    && f.pr.is_none()
+                    // A pull request that closed unmerged is history, not a
+                    // claim: the person asked for a new one.
+                    && f.pr.as_ref().is_none_or(|p| p.state != "open")
             })
             .map(|(f, _)| f.id.clone())
             .collect();
@@ -5041,7 +5058,12 @@ pub struct Group {
     pub malware: bool,
     pub epss: Option<f64>,
     pub manifests: Vec<String>,
+    /// The open pull request a member is in; otherwise the last one (merged,
+    /// or closed unmerged with who closed it and when).
     pub pr: Option<PrRef>,
+    /// The fix run working on a member (`fixing`) or behind its open pull
+    /// request, so the dashboard can link to it.
+    pub ticket: Option<String>,
     pub finding_ids: Vec<String>,
     pub advisories: Vec<GroupAdvisory>,
 }
@@ -5099,12 +5121,18 @@ fn verdict_rank(v: Verdict) -> u8 {
 /// package). Open members decide an open group's tier and due date.
 pub fn groups(findings: &[(Finding, FindingState)]) -> Vec<Group> {
     let mut by: BTreeMap<String, Vec<&Finding>> = BTreeMap::new();
-    for (f, _) in findings {
-        by.entry(group_key(f)).or_default().push(f);
+    let mut tickets: BTreeMap<String, String> = BTreeMap::new();
+    for (f, st) in findings {
+        let key = group_key(f);
+        if let (Status::Fixing | Status::PrOpen, Some(t)) = (f.status, &st.ticket) {
+            tickets.entry(key.clone()).or_insert_with(|| t.clone());
+        }
+        by.entry(key).or_default().push(f);
     }
     let mut out: Vec<Group> = by
         .into_iter()
         .map(|(key, members)| {
+            let ticket = tickets.get(&key).cloned();
             let status = members
                 .iter()
                 .map(|f| f.status)
@@ -5174,7 +5202,13 @@ pub fn groups(findings: &[(Finding, FindingState)]) -> Vec<Group> {
                     .filter_map(|f| f.advisory.epss)
                     .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)),
                 manifests,
-                pr: members.iter().find_map(|f| f.pr.clone()),
+                pr: members
+                    .iter()
+                    .filter_map(|f| f.pr.as_ref())
+                    .find(|p| p.state == "open")
+                    .or_else(|| members.iter().find_map(|f| f.pr.as_ref()))
+                    .cloned(),
+                ticket,
                 finding_ids: members.iter().map(|f| f.id.clone()).collect(),
                 advisories,
             }
@@ -7860,6 +7894,7 @@ mod tests {
             ci: None,
             state: "merged".into(),
             adopted: false,
+            ..Default::default()
         });
         a.1.pr_opened_at = Some("2026-11-10T12:00:00Z".into());
         a.1.merged_at = Some("2026-11-11T10:00:00Z".into());
@@ -7994,6 +8029,7 @@ mod tests {
             ci: Some("passing".into()),
             state: "open".into(),
             adopted: false,
+            ..Default::default()
         });
         v[5].0.status = Status::PrOpen;
         v[6].0.status = Status::Dismissed;
@@ -8538,6 +8574,7 @@ mod tests {
                 ci: Some("pending".into()),
                 state: "open".into(),
                 adopted: false,
+                ..Default::default()
             });
             st.bundled = true;
             st.ticket = Some("SEC-OPEN".into());
