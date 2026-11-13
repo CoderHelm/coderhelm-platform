@@ -281,6 +281,14 @@ mod tests {
                 < push.find("Only the branch the graph tracks").unwrap()
         );
         assert!(fn_src(hook, "async fn record_revert(").contains("revert_reason("));
+        // No review job is queued for a guide pull request: its check comes
+        // before the label is read and long before the job is sent.
+        let trigger = fn_src(hook, "async fn handle_review_trigger(");
+        let guide = trigger
+            .find("is_guide_branch(")
+            .expect("guide pull requests are skipped");
+        assert!(guide < trigger.find("let carries_label").unwrap());
+        assert!(guide < trigger.find("send_review_job(").unwrap());
         let noted = fn_src(hook, "async fn note_reverted(");
         assert!(
             noted.contains("scorecard::on_revert_pr(") && noted.contains("queue_revert_lesson(")

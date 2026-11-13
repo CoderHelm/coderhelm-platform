@@ -1625,6 +1625,35 @@ async fn run_once(
     *reviewed_head = head_sha.clone();
     live_job.follow_head(state, &github, &msg, &head_sha).await;
 
+    // The repository's guide pull request holds lessons CoderHelm proposed
+    // for the guide file. The team reviews those; CoderHelm does not review
+    // its own lessons, so nothing is written into the description as an
+    // open finding, the pull request is not held, and no fix round is
+    // asked for, whatever started this review.
+    if super::is_own_login(pr_author)
+        && common::guide::is_guide_branch(pr["head"]["ref"].as_str().unwrap_or(""))
+    {
+        info!(pr = msg.pr_number, head = %head_sha, "A guide pull request — left to the team to review");
+        common::claim::release(
+            &state.dynamo,
+            &state.config.settings_table_name,
+            &msg.team_id,
+            &super::review_policy::head_claim_sk(
+                &msg.repo_owner,
+                &msg.repo_name,
+                msg.pr_number,
+                &head_sha,
+            ),
+        )
+        .await;
+        live_job.settle(NotReviewed::GuidePullRequest);
+        return Ok(Outcome::Skipped {
+            reason: "This pull request holds CoderHelm's own lessons for the guide file; it is \
+                     for the team to review."
+                .into(),
+        });
+    }
+
     // CoderHelm's own push while its run is still fixing the PR: the run
     // asks for the verdict itself when CI is green, and hands the PR over
     // for review if it ends without one. A person's push is reviewed.

@@ -666,6 +666,11 @@ fn build_app(state: Arc<AppState>) -> Router {
             "/learning/reviewers/forget",
             post(routes::learning::forget_reviewer),
         )
+        // Whether CoderHelm may open guide pull requests, per team and repo
+        .route(
+            "/settings/guide-prs",
+            get(routes::learning::get_guide_setting).put(routes::learning::put_guide_setting),
+        )
         .route("/releases", get(routes::reviewer::list_releases))
         .route("/releases/send", post(routes::reviewer::send_release))
         .route("/releases/pending", get(routes::reviewer::pending_releases))

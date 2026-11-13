@@ -619,6 +619,60 @@ pub async fn forget_reviewer(
     Ok(Json(json!({"forgotten": forgotten})))
 }
 
+/// GET /api/settings/guide-prs — whether CoderHelm may open pull requests
+/// that add its lessons to a repository's guide file: for the team, and for
+/// each repository set apart. On unless turned off.
+pub async fn get_guide_setting(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<Value>, StatusCode> {
+    let switch = common::guide::load_switch(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        &claims.team_id,
+    )
+    .await
+    .map_err(internal)?;
+    let mut v = switch.view();
+    v["can_manage"] = json!(claims.holder().holds("learning"));
+    Ok(Json(v))
+}
+
+/// PUT /api/settings/guide-prs — `{"enabled": bool, "repos": {"owner/name":
+/// bool}}` (admins). Off stops new guide pull requests only: lessons still
+/// reach the agents' prompts, and one already open is settled when it
+/// closes.
+pub async fn put_guide_setting(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if let Err(s) = claims.require_role(3) {
+        return Err((s, Json(json!({ "error": "Only admins can change this." }))));
+    }
+    let switch = common::guide::Switch::parse(&body)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))))?;
+    common::guide::save_switch(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        &claims.team_id,
+        &switch,
+        &claims.display_name(),
+    )
+    .await
+    .map_err(|e| {
+        error!(error = %e, "Could not save the guide pull request setting");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "Could not save. Try again." })),
+        )
+    })?;
+    info!(team_id = %claims.team_id, enabled = switch.enabled, overrides = switch.repos.len(), "Guide pull request setting saved");
+    let mut v = switch.view();
+    v["can_manage"] = json!(true);
+    Ok(Json(v))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -71,6 +71,9 @@ pub(crate) enum NotReviewed<'a> {
     Superseded { newer: &'a str },
     /// CoderHelm's own push while its run is still fixing the PR.
     OwnPushDuringRun,
+    /// The repository's guide pull request (lessons CoderHelm proposed):
+    /// the team reviews it, CoderHelm does not review its own lessons.
+    GuidePullRequest,
     /// A description edit this commit was already reviewed with.
     DescriptionSeen { head: &'a str },
     /// The commit already has CoderHelm's verdict.
@@ -104,6 +107,10 @@ pub(crate) fn not_reviewed(why: NotReviewed<'_>) -> (&'static str, String) {
         NotReviewed::OwnPushDuringRun => (
             "neutral",
             "CoderHelm's own push during its run: reviewed when the run finishes".into(),
+        ),
+        NotReviewed::GuidePullRequest => (
+            "neutral",
+            "CoderHelm's own lessons for the guide file: for the team to review".into(),
         ),
         NotReviewed::DescriptionSeen { head } => (
             "neutral",
@@ -580,6 +587,7 @@ mod tests {
         for why in [
             NotReviewed::Superseded { newer: NEWER },
             NotReviewed::OwnPushDuringRun,
+            NotReviewed::GuidePullRequest,
             NotReviewed::AlreadyReviewed {
                 head: HEAD,
                 verdict: "APPROVE",

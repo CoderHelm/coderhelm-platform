@@ -40,11 +40,16 @@ pub trait GuideRepo: Send + Sync {
     /// Opens the pull request; its number.
     async fn open_pr(&self, title: &str, body: &str, head: &str, base: &str)
         -> Result<u64, String>;
+    /// Puts the lessons label on the pull request.
+    async fn label(&self, pr: u64, label: &str) -> Result<(), String>;
 }
 
 /// The team's records, as the proposal needs them.
 #[async_trait::async_trait]
 pub trait GuideStore: Send + Sync {
+    /// Whether the team has guide pull requests on for this repository.
+    /// An error counts as off.
+    async fn enabled(&self) -> Result<bool, String>;
     async fn lessons(&self) -> Result<Vec<Lesson>, String>;
     async fn record(&self) -> Result<Option<Record>, String>;
     /// Writes `next` only when the stored record is still `prev`.
@@ -55,6 +60,9 @@ pub trait GuideStore: Send + Sync {
 /// What a call to [`propose`] did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Proposal {
+    /// The team turned guide pull requests off (for this repository or for
+    /// all), or the switch could not be read: nothing is written.
+    Off,
     /// No lesson has reached the confidence for the guide (or the guide
     /// already says them all).
     NothingReady,
@@ -92,6 +100,12 @@ pub async fn propose(
     // The cheap check first: most outcomes leave nothing ready.
     if guide::pick(&kept, "", now).is_empty() {
         return Ok(Proposal::NothingReady);
+    }
+    // The team's switch, before anything is claimed, read or created. A
+    // switch that cannot be read is off: nothing goes to a repository on a
+    // guess.
+    if !store.enabled().await.unwrap_or(false) {
+        return Ok(Proposal::Off);
     }
     let prev = store.record().await?;
     if let Err(hold) = guide::may_propose(prev.as_ref(), now) {
@@ -147,6 +161,13 @@ pub async fn propose(
         .await
     }
     .await;
+    // The label says where it comes from in every list of pull requests.
+    // Without it the title and the description still do.
+    if let Ok(pr) = &opened {
+        if let Err(e) = repo.label(*pr, guide::LABEL).await {
+            warn!(repo = repo_name, pr, error = %e, "Could not label the guide pull request");
+        }
+    }
     let next = match &opened {
         Ok(pr) => Record {
             state: guide::STATE_OPEN.into(),
@@ -309,6 +330,18 @@ impl GuideRepo for GitHubRepo<'_> {
             .filter(|n| *n > 0)
             .ok_or_else(|| "GitHub returned no pull request number".to_string())
     }
+
+    async fn label(&self, pr: u64, label: &str) -> Result<(), String> {
+        self.github
+            .ensure_label(self.owner, self.name, label)
+            .await
+            .map_err(|e| e.to_string())?;
+        self.github
+            .add_labels(self.owner, self.name, pr, &[label.to_string()])
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
 }
 
 pub struct DynamoStore<'a> {
@@ -319,6 +352,16 @@ pub struct DynamoStore<'a> {
 
 #[async_trait::async_trait]
 impl GuideStore for DynamoStore<'_> {
+    async fn enabled(&self) -> Result<bool, String> {
+        guide::load_switch(
+            &self.state.dynamo,
+            &self.state.config.settings_table_name,
+            self.team_id,
+        )
+        .await
+        .map(|s| s.allows(self.repo))
+    }
+
     async fn lessons(&self) -> Result<Vec<Lesson>, String> {
         Store::new(&self.state.dynamo, &self.state.config.settings_table_name)
             .lessons(self.team_id, Some(self.repo))
@@ -434,6 +477,8 @@ pub mod fakes {
         pub writes: Mutex<Vec<(String, String)>>,
         pub prs: Mutex<Vec<OpenedPr>>,
         pub fail_pr: bool,
+        /// (pull request, label) of each label put on.
+        pub labels: Mutex<Vec<(u64, String)>>,
     }
 
     impl FakeRepo {
@@ -524,19 +569,46 @@ pub mod fakes {
             prs.push((n, title.into(), body.into(), head.into(), base.into()));
             Ok(n)
         }
+
+        async fn label(&self, pr: u64, label: &str) -> Result<(), String> {
+            self.labels.lock().unwrap().push((pr, label.to_string()));
+            Ok(())
+        }
     }
 
     /// The team's records in memory, with the same compare-and-swap.
-    #[derive(Default)]
     pub struct FakeStore {
         pub lessons: Mutex<Vec<Lesson>>,
         pub record: Mutex<Option<Record>>,
         /// The next swap loses to another worker.
         pub lose_next_swap: Mutex<bool>,
+        /// The team's switch; None stands for one that cannot be read.
+        pub switch: Mutex<Option<guide::Switch>>,
+        pub repo: String,
+    }
+
+    impl Default for FakeStore {
+        /// Guide pull requests on, as for a team that saved no setting.
+        fn default() -> Self {
+            FakeStore {
+                lessons: Default::default(),
+                record: Default::default(),
+                lose_next_swap: Default::default(),
+                switch: Mutex::new(Some(guide::Switch::default())),
+                repo: "acme/web".into(),
+            }
+        }
     }
 
     #[async_trait::async_trait]
     impl GuideStore for FakeStore {
+        async fn enabled(&self) -> Result<bool, String> {
+            match &*self.switch.lock().unwrap() {
+                Some(s) => Ok(s.allows(&self.repo)),
+                None => Err("the settings table did not answer".into()),
+            }
+        }
+
         async fn lessons(&self) -> Result<Vec<Lesson>, String> {
             Ok(self.lessons.lock().unwrap().clone())
         }
@@ -657,7 +729,7 @@ mod tests {
         let prs = repo.prs.lock().unwrap().clone();
         assert_eq!(prs.len(), 1);
         let (_, title, body, head, base) = &prs[0];
-        assert_eq!(title, "Guide: one lesson from earlier pull requests");
+        assert_eq!(title, "CoderHelm lessons: one for the guide file");
         assert_eq!(
             (head.as_str(), base.as_str()),
             ("coderhelm/guide-lessons-20261020-0930", "trunk")
@@ -665,6 +737,124 @@ mod tests {
         assert!(body.contains("From #12, #15.") && body.contains("Use the shared client"));
         let rec = st.record.lock().unwrap().clone().unwrap();
         assert_eq!((rec.state.as_str(), rec.pr), (guide::STATE_OPEN, 40));
+        // It says where it comes from: in the title, the first words of the
+        // description, and a label.
+        assert!(title.starts_with("CoderHelm lessons:"));
+        assert!(body.starts_with("**This pull request comes from CoderHelm's lessons"));
+        assert_eq!(
+            repo.labels.lock().unwrap().clone(),
+            vec![(40, "coderhelm-lessons".to_string())]
+        );
+    }
+
+    fn switch(enabled: bool, repos: &[(&str, bool)]) -> Option<guide::Switch> {
+        Some(guide::Switch {
+            enabled,
+            repos: repos.iter().map(|(r, on)| (r.to_string(), *on)).collect(),
+        })
+    }
+
+    /// Nothing reached the repository: no branch, no commit, no pull
+    /// request, no label, and no claim on its record.
+    fn untouched(repo: &FakeRepo, st: &FakeStore) {
+        assert!(repo.writes.lock().unwrap().is_empty());
+        assert!(repo.prs.lock().unwrap().is_empty());
+        assert!(repo.labels.lock().unwrap().is_empty());
+        assert_eq!(
+            repo.branches.lock().unwrap().len(),
+            1,
+            "only the default branch"
+        );
+        assert!(st.record.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn turned_off_for_the_team_nothing_is_written_and_the_lesson_still_reaches_the_prompt() {
+        let repo = FakeRepo::new("main", &[("AGENTS.md", "# Guide\n")]);
+        let st = store(vec![hook()]);
+        *st.switch.lock().unwrap() = switch(false, &[]);
+        for day in [20, 21, 28] {
+            assert_eq!(
+                propose(&repo, &st, REPO, at(day)).await.unwrap(),
+                Proposal::Off
+            );
+        }
+        untouched(&repo, &st);
+        // The lesson is as it was, and is still given to the next run.
+        let kept = st.lessons.lock().unwrap().clone();
+        assert!(!kept[0].in_guide && !kept[0].guide_declined && kept[0].contradicted == 0);
+        let recalled = common::rewards::lessons::recall(&kept, "coder", at(20));
+        assert_eq!(recalled.len(), 1);
+        assert!(common::rewards::lessons::prompt_block(&recalled).contains("`useApi`"));
+        // Turned back on: the same lesson is proposed.
+        *st.switch.lock().unwrap() = switch(true, &[]);
+        assert!(matches!(
+            propose(&repo, &st, REPO, at(29)).await.unwrap(),
+            Proposal::Opened { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_repository_can_be_set_apart_from_the_team() {
+        // On for the team, off for this repository.
+        let repo = FakeRepo::new("main", &[]);
+        let st = store(vec![hook()]);
+        *st.switch.lock().unwrap() = switch(true, &[(REPO, false)]);
+        assert_eq!(
+            propose(&repo, &st, REPO, at(20)).await.unwrap(),
+            Proposal::Off
+        );
+        untouched(&repo, &st);
+        // Another repository's override does not turn this one off.
+        *st.switch.lock().unwrap() = switch(true, &[("acme/api", false)]);
+        assert!(matches!(
+            propose(&repo, &st, REPO, at(20)).await.unwrap(),
+            Proposal::Opened { .. }
+        ));
+        // Off for the team, on for this repository.
+        let repo = FakeRepo::new("main", &[]);
+        let st = store(vec![hook()]);
+        *st.switch.lock().unwrap() = switch(false, &[(REPO, true)]);
+        assert!(matches!(
+            propose(&repo, &st, REPO, at(20)).await.unwrap(),
+            Proposal::Opened { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_switch_that_cannot_be_read_counts_as_off() {
+        let repo = FakeRepo::new("main", &[]);
+        let st = store(vec![hook()]);
+        *st.switch.lock().unwrap() = None;
+        assert_eq!(
+            propose(&repo, &st, REPO, at(20)).await.unwrap(),
+            Proposal::Off
+        );
+        untouched(&repo, &st);
+    }
+
+    #[tokio::test]
+    async fn a_guide_pull_request_open_when_the_switch_goes_off_is_still_settled() {
+        let repo = FakeRepo::new("main", &[("AGENTS.md", "# Guide\n")]);
+        let st = store(vec![hook()]);
+        let Proposal::Opened { pr, .. } = propose(&repo, &st, REPO, at(20)).await.unwrap() else {
+            panic!("opened");
+        };
+        *st.switch.lock().unwrap() = switch(false, &[]);
+        // The team closes it: its lesson is declined as usual, and no new
+        // one is proposed while the switch is off.
+        let done = on_closed(&repo, &st, pr, false, at(21)).await.unwrap();
+        assert!(matches!(done, Closed::Settled { merged: false, .. }));
+        st.lessons.lock().unwrap().push(lesson(
+            "L2",
+            "Name migration files `NNNN_what.sql` in `db/migrations`.",
+            &["acme/web#3", "acme/web#5"],
+        ));
+        assert_eq!(
+            propose(&repo, &st, REPO, at(30)).await.unwrap(),
+            Proposal::Off
+        );
+        assert_eq!(repo.prs.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

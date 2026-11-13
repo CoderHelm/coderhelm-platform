@@ -4212,6 +4212,22 @@ async fn handle_review_trigger(
         return Ok(StatusCode::OK);
     }
 
+    // The repository's guide pull request (lessons CoderHelm proposed for
+    // the guide file) is for the team to review: CoderHelm queues no review
+    // of its own lessons, labelled or not.
+    if pr["user"]["login"]
+        .as_str()
+        .unwrap_or("")
+        .contains("coderhelm")
+        && common::guide::is_guide_branch(pr["head"]["ref"].as_str().unwrap_or(""))
+    {
+        info!(
+            owner,
+            name, pr_number, "Reviewer skipped — a guide pull request is the team's to review"
+        );
+        return Ok(StatusCode::OK);
+    }
+
     // Review is gated on the repo's trigger label for EVERY PR, including
     // CoderHelm's own (bot-authored) PRs — nothing is reviewed until the label is
     // present. `labeled`: the just-added label must BE the trigger label.

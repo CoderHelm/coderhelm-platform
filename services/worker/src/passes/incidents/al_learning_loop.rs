@@ -598,7 +598,10 @@ async fn a_confident_lesson_goes_to_the_guide_file_as_one_pull_request() {
             "# Working on the site\n\nRun `pnpm test` before a commit.\n",
         )],
     );
-    let store = FakeStore::default();
+    let store = FakeStore {
+        repo: full(),
+        ..Default::default()
+    };
 
     // After one pull request nothing is proposed.
     learn(&mut kept, &mut prefs, &edited_outcome(101), REPLY, 1).await;
@@ -610,9 +613,29 @@ async fn a_confident_lesson_goes_to_the_guide_file_as_one_pull_request() {
         Proposal::NothingReady
     );
 
-    // After the second, one pull request, on a branch of its own.
+    // After the second the lesson is ready. With guide pull requests turned
+    // off for this repository nothing is written to it, and the lesson
+    // still reaches the next run's prompt.
     learn(&mut kept, &mut prefs, &edited_outcome(117), REPLY, 2).await;
     *store.lessons.lock().unwrap() = kept.clone();
+    *store.switch.lock().unwrap() = Some(guide::Switch {
+        enabled: true,
+        repos: [(full(), false)].into(),
+    });
+    assert_eq!(
+        guide_pr::propose(&repo, &store, &full(), day(21))
+            .await
+            .unwrap(),
+        Proposal::Off
+    );
+    assert!(repo.writes.lock().unwrap().is_empty() && repo.prs.lock().unwrap().is_empty());
+    assert_eq!(repo.branches.lock().unwrap().len(), 1);
+    assert!(
+        lessons::prompt_block(&lessons::recall(&kept, "coder", day(21))).contains("`imageUrl`")
+    );
+    // Turned on (as it is unless a team turns it off): one pull request, on
+    // a branch of its own.
+    *store.switch.lock().unwrap() = Some(guide::Switch::default());
     let Proposal::Opened {
         pr,
         lessons: proposed,
@@ -632,7 +655,7 @@ async fn a_confident_lesson_goes_to_the_guide_file_as_one_pull_request() {
         "# Working on the site\n\nRun `pnpm test` before a commit.\n"
     );
     let (_, title, body, head, base) = repo.prs.lock().unwrap()[0].clone();
-    assert_eq!(title, "Guide: one lesson from earlier pull requests");
+    assert_eq!(title, "CoderHelm lessons: one for the guide file");
     assert_eq!(
         (head.as_str(), base),
         (writes[0].0.as_str(), BASE.to_string())
@@ -641,6 +664,12 @@ async fn a_confident_lesson_goes_to_the_guide_file_as_one_pull_request() {
     assert!(
         body.contains("Use the shared image builder"),
         "the evidence is in the description"
+    );
+    assert!(body
+        .starts_with("**This pull request comes from CoderHelm's lessons, not from a ticket.**"));
+    assert_eq!(
+        repo.labels.lock().unwrap().clone(),
+        vec![(pr, guide::LABEL.to_string())]
     );
 
     // While it is open, later outcomes open no second one.
@@ -682,4 +711,18 @@ async fn a_confident_lesson_goes_to_the_guide_file_as_one_pull_request() {
     let rewards = include_str!("../rewards.rs");
     assert!(fn_src(rewards, "pub async fn score_outcome(").contains("TRIGGER_GUIDE_CLOSED"));
     assert!(fn_src(rewards, "async fn learn_from_outcome(").contains("guide_pr::maybe_propose("));
+    // The switch is read before anything is claimed or created, and
+    // CoderHelm's reviewer leaves a guide pull request to the team: it is
+    // never reviewed as CoderHelm's own code work, so no findings are
+    // written into its description and no fix round is asked for.
+    let propose = fn_src(include_str!("../guide_pr.rs"), "pub async fn propose(");
+    let read = propose.find("store.enabled()").expect("the switch is read");
+    assert!(read < propose.find("store.swap(").unwrap());
+    assert!(read < propose.find("repo.create_branch(").unwrap());
+    assert!(read < propose.find("repo.default_branch()").unwrap());
+    let review = include_str!("../review_pr.rs");
+    let skip = review
+        .find("NotReviewed::GuidePullRequest")
+        .expect("guide pull requests are skipped");
+    assert!(skip < review.find("let self_authored = ").unwrap());
 }

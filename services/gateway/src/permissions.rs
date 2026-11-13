@@ -121,6 +121,7 @@ pub const CAPABILITIES: &[Capability] = &[
             "learning::get_scorecard",
             "learning::get_outcome_lessons",
             "learning::get_reviewer_asks",
+            "learning::get_guide_setting",
             "tests::summary",
             "tests::list_tests",
             "api::get_usage",
@@ -560,6 +561,7 @@ pub const CAPABILITIES: &[Capability] = &[
             "learning::restore_change",
             "learning::put_weights",
             "learning::forget_reviewer",
+            "learning::put_guide_setting",
         ],
     },
     Capability {

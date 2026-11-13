@@ -15,6 +15,12 @@
 //! the team closed without merging ([`may_propose`]). The record is claimed
 //! before anything is written to GitHub, so two workers never open two.
 //!
+//! A team can turn guide pull requests off, for every repository or for one
+//! ([`Switch`], `SETTINGS#GUIDE_PRS`; on unless turned off). Off, nothing is
+//! written to the repository: no branch, no commit, no pull request. Lessons
+//! still reach the prompt as before. The switch is read before anything is
+//! claimed or created, and a switch that cannot be read counts as off.
+//!
 //! When the pull request closes ([`settle`]): lessons still in the merged
 //! file are marked as in the guide (the run reads them there from then on
 //! and they leave the prompt); lessons people took out before merging, and
@@ -41,6 +47,12 @@ pub const SECTION_END: &str = "<!-- /coderhelm:lessons -->";
 /// The head branch of every guide pull request starts with this.
 pub const BRANCH_PREFIX: &str = "coderhelm/guide-lessons-";
 pub const RECORD_PREFIX: &str = "GUIDEPR#";
+/// The team's switch for guide pull requests.
+pub const SETTINGS_SK: &str = "SETTINGS#GUIDE_PRS";
+/// The label every guide pull request carries.
+pub const LABEL: &str = "coderhelm-lessons";
+/// Most per-repository overrides one team keeps.
+pub const MAX_REPO_OVERRIDES: usize = 500;
 
 /// Most lessons proposed in one pull request: small enough to review.
 pub const MAX_LESSONS_PER_PR: usize = 6;
@@ -228,23 +240,171 @@ pub fn with_lessons(content: &str, add: &[Lesson]) -> Option<String> {
     (out.len() <= MAX_GUIDE_BYTES).then_some(out)
 }
 
+/// The title says where the pull request comes from before anything else.
 pub fn pr_title(n: usize) -> String {
     if n == 1 {
-        "Guide: one lesson from earlier pull requests".to_string()
+        "CoderHelm lessons: one for the guide file".to_string()
     } else {
-        format!("Guide: {n} lessons from earlier pull requests")
+        format!("CoderHelm lessons: {n} for the guide file")
     }
+}
+
+/// Whether guide pull requests are on: for the team, and per repository
+/// where the team set one apart. On unless turned off.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Switch {
+    pub enabled: bool,
+    /// `owner/name` to on or off, for repositories set apart from the team.
+    pub repos: std::collections::BTreeMap<String, bool>,
+}
+
+impl Default for Switch {
+    fn default() -> Self {
+        Switch {
+            enabled: true,
+            repos: Default::default(),
+        }
+    }
+}
+
+impl Switch {
+    /// Whether a guide pull request may be opened in `repo`: the
+    /// repository's own setting when it has one, else the team's.
+    pub fn allows(&self, repo: &str) -> bool {
+        self.repos.get(repo).copied().unwrap_or(self.enabled)
+    }
+
+    /// From the body of a save: `{"enabled": bool, "repos": {"owner/name":
+    /// bool}}`. An error says what to change.
+    pub fn parse(body: &serde_json::Value) -> Result<Switch, String> {
+        let enabled = body["enabled"]
+            .as_bool()
+            .ok_or("`enabled` must be true or false.")?;
+        let mut repos = std::collections::BTreeMap::new();
+        match &body["repos"] {
+            serde_json::Value::Null => {}
+            serde_json::Value::Object(m) => {
+                if m.len() > MAX_REPO_OVERRIDES {
+                    return Err(format!(
+                        "At most {MAX_REPO_OVERRIDES} repositories can be set apart."
+                    ));
+                }
+                for (repo, on) in m {
+                    let valid = crate::review_lessons::valid_scope(repo)
+                        && repo != crate::review_lessons::TEAM_SCOPE;
+                    match (valid, on.as_bool()) {
+                        (true, Some(on)) => {
+                            repos.insert(repo.clone(), on);
+                        }
+                        (false, _) => return Err(format!("`{repo}` is not `owner/name`.")),
+                        (_, None) => return Err(format!("`{repo}` must be set to true or false.")),
+                    }
+                }
+            }
+            _ => return Err("`repos` must map `owner/name` to true or false.".into()),
+        }
+        Ok(Switch { enabled, repos })
+    }
+
+    pub fn view(&self) -> serde_json::Value {
+        serde_json::json!({ "enabled": self.enabled, "repos": self.repos })
+    }
+
+    pub fn to_item(&self, team: &str, now: &str, by: &str) -> Item {
+        Item::from([
+            ("pk".to_string(), s(team)),
+            ("sk".to_string(), s(SETTINGS_SK)),
+            ("record_type".to_string(), s("guide_pr_switch")),
+            ("enabled".to_string(), AttributeValue::Bool(self.enabled)),
+            (
+                "repos".to_string(),
+                AttributeValue::M(
+                    self.repos
+                        .iter()
+                        .map(|(r, on)| (r.clone(), AttributeValue::Bool(*on)))
+                        .collect(),
+                ),
+            ),
+            ("updated_at".to_string(), s(now)),
+            ("updated_by".to_string(), s(by)),
+        ])
+    }
+
+    /// From the stored item; no item, or one without a field, is the
+    /// default (on).
+    pub fn from_item(i: Option<&Item>) -> Switch {
+        let Some(i) = i else {
+            return Switch::default();
+        };
+        Switch {
+            enabled: i
+                .get("enabled")
+                .and_then(|v| v.as_bool().ok())
+                .copied()
+                .unwrap_or(true),
+            repos: i
+                .get("repos")
+                .and_then(|v| v.as_m().ok())
+                .map(|m| {
+                    m.iter()
+                        .filter_map(|(r, on)| Some((r.clone(), *on.as_bool().ok()?)))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        }
+    }
+}
+
+/// The team's switch. An error is the caller's to treat as off.
+pub async fn load_switch(
+    dynamo: &aws_sdk_dynamodb::Client,
+    table: &str,
+    team: &str,
+) -> Result<Switch, String> {
+    dynamo
+        .get_item()
+        .table_name(table)
+        .key("pk", s(team))
+        .key("sk", s(SETTINGS_SK))
+        .consistent_read(true)
+        .send()
+        .await
+        .map(|r| Switch::from_item(r.item.as_ref()))
+        .map_err(|e| aws_sdk_dynamodb::error::DisplayErrorContext(e).to_string())
+}
+
+pub async fn save_switch(
+    dynamo: &aws_sdk_dynamodb::Client,
+    table: &str,
+    team: &str,
+    switch: &Switch,
+    by: &str,
+) -> Result<(), String> {
+    dynamo
+        .put_item()
+        .table_name(table)
+        .set_item(Some(switch.to_item(
+            team,
+            &chrono::Utc::now().to_rfc3339(),
+            by,
+        )))
+        .send()
+        .await
+        .map(|_| ())
+        .map_err(|e| aws_sdk_dynamodb::error::DisplayErrorContext(e).to_string())
 }
 
 /// The pull request's description: each lesson with the pull requests and
 /// the evidence behind it.
 pub fn pr_body(path: &str, repo: &str, add: &[Lesson]) -> String {
     let mut out = format!(
-        "This adds what I learned from earlier pull requests in this repository to `{path}`, \
-         which I read at the start of every run. Each lesson is below with what it came from. \
-         Edit the wording, remove a line you disagree with, or close this without merging: I \
-         follow the file as merged, drop what you take out, and do not propose a declined lesson \
-         again.\n"
+        "**This pull request comes from CoderHelm's lessons, not from a ticket.** It changes \
+         only `{path}`, the guide file I read at the start of every run, and adds what I learned \
+         from earlier pull requests in this repository. Each lesson is below with what it came \
+         from. Edit the wording, remove a line you disagree with, or close this without merging: \
+         I follow the file as merged, drop what you take out, and do not propose a declined \
+         lesson again. An admin can turn these pull requests off, for this repository or for \
+         every one, on the Learning page in CoderHelm.\n"
     );
     for l in add {
         out.push_str(&format!(
@@ -607,8 +767,10 @@ mod tests {
         assert!(body.contains("From #12, #15."));
         assert!(body.contains("Use the shared client"));
         assert!(body.contains("close this without merging"));
-        assert_eq!(pr_title(1), "Guide: one lesson from earlier pull requests");
-        assert_eq!(pr_title(3), "Guide: 3 lessons from earlier pull requests");
+        assert!(body.starts_with("**This pull request comes from CoderHelm's lessons"));
+        assert!(body.contains("An admin can turn these pull requests off"));
+        assert_eq!(pr_title(1), "CoderHelm lessons: one for the guide file");
+        assert_eq!(pr_title(3), "CoderHelm lessons: 3 for the guide file");
         assert!(is_guide_branch(&branch(now())));
         assert_eq!(branch(now()), "coderhelm/guide-lessons-20261020-0930");
         assert!(!is_guide_branch("coderhelm/abc-1"));
@@ -641,6 +803,58 @@ mod tests {
         // Merged, but the section was removed from the file altogether.
         let s = settle(&proposed, Some("# Guide\n"));
         assert_eq!(s.declined, vec!["L1", "L2"]);
+    }
+
+    #[test]
+    fn guide_pull_requests_are_on_unless_turned_off_and_a_repository_can_differ() {
+        // Nothing saved: on everywhere.
+        let none = Switch::from_item(None);
+        assert_eq!(none, Switch::default());
+        assert!(none.allows("acme/web"));
+        // Off for the team, on for one repository.
+        let off = Switch::parse(&serde_json::json!({
+            "enabled": false,
+            "repos": {"acme/web": true}
+        }))
+        .unwrap();
+        assert!(!off.allows("acme/api"));
+        assert!(off.allows("acme/web"));
+        // On for the team, off for one repository.
+        let on = Switch::parse(&serde_json::json!({
+            "enabled": true,
+            "repos": {"acme/api": false}
+        }))
+        .unwrap();
+        assert!(on.allows("acme/web"));
+        assert!(!on.allows("acme/api"));
+        // It round trips through its item, under the team's key.
+        let item = off.to_item("TEAM#a", "2026-10-20T00:00:00Z", "an admin");
+        assert_eq!(item["sk"], s(SETTINGS_SK));
+        assert_eq!(item["pk"], s("TEAM#a"));
+        assert_eq!(Switch::from_item(Some(&item)), off);
+        assert_eq!(off.view()["repos"]["acme/web"], true);
+        // An item from before a field existed reads as on.
+        assert!(Switch::from_item(Some(&Item::new())).allows("acme/web"));
+        // A save names what is wrong.
+        let bad = |v: serde_json::Value| Switch::parse(&v).unwrap_err();
+        assert!(bad(serde_json::json!({})).contains("`enabled`"));
+        assert!(
+            bad(serde_json::json!({"enabled": true, "repos": {"acme": true}}))
+                .contains("not `owner/name`")
+        );
+        assert!(
+            bad(serde_json::json!({"enabled": true, "repos": {"*": true}}))
+                .contains("not `owner/name`")
+        );
+        assert!(
+            bad(serde_json::json!({"enabled": true, "repos": {"acme/web": "no"}}))
+                .contains("true or false")
+        );
+        assert!(bad(serde_json::json!({"enabled": true, "repos": []})).contains("`repos`"));
+        assert!(Switch::parse(&serde_json::json!({"enabled": true}))
+            .unwrap()
+            .repos
+            .is_empty());
     }
 
     #[test]
