@@ -377,6 +377,12 @@ pub struct FixDecision {
     /// planner again for the block, or fell back from the plan itself).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub planner_failure: String,
+    /// What a careful engineer settles before writing code: how a bug is
+    /// reproduced first, what the touched files' history shows, who the
+    /// change affects, and what is asked early with a default (see
+    /// `habits`).
+    #[serde(default)]
+    pub habits: super::habits::Habits,
 }
 
 /// One step of the whole job, and who does it.
@@ -963,7 +969,10 @@ pub fn planner_guidance(intent: TicketIntent) -> String {
         TicketIntent::Feature | TicketIntent::Chore => NEW_WORK_GUIDANCE.to_string(),
         TicketIntent::Question => format!("{QUESTION_GUIDANCE}\n\n{MISSING_DATA_GUIDANCE}"),
     };
-    format!("{framing}\n\n{EVERY_PLAN_GUIDANCE}\n\n{CHECKLIST_GUIDANCE}")
+    format!(
+        "{framing}\n\n{EVERY_PLAN_GUIDANCE}\n\n{CHECKLIST_GUIDANCE}\n\n{}",
+        super::habits::planner_guidance(intent.is_bug())
+    )
 }
 
 /// For a ticket about data that is missing or wrong (a record that should

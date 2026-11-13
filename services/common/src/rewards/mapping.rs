@@ -38,11 +38,62 @@ pub struct PeopleEdits {
     pub files: Vec<String>,
     /// Their commit subjects, oldest first.
     pub subjects: Vec<String>,
+    /// Excerpts of their commits' own patches ([`diff_excerpts`]): what
+    /// they changed in CoderHelm's code, not only where.
+    pub diff: Vec<String>,
 }
 
 /// Most paths and commit subjects kept on one event.
 pub const MAX_EDIT_FILES: usize = 6;
 pub const MAX_EDIT_NOTES: usize = 4;
+/// Most patch excerpts kept on one event, and the longest one.
+pub const MAX_DIFF_EXCERPTS: usize = 4;
+pub const MAX_DIFF_CHARS: usize = 700;
+
+/// Generated and vendored files: what people changed there teaches nothing
+/// about how to write the code.
+fn is_generated(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    name.ends_with(".lock")
+        || name.ends_with("-lock.json")
+        || name.ends_with("-lock.yaml")
+        || name.ends_with(".min.js")
+        || name.ends_with(".snap")
+        || name.ends_with(".map")
+        || path.contains("/vendor/")
+        || path.contains("/node_modules/")
+        || path.contains("/dist/")
+}
+
+/// Short excerpts of people's patches, one per file, the files they changed
+/// most first: the path, then the changed lines (context lines are left out
+/// so the excerpt is what they removed and added).
+pub fn diff_excerpts(patches: &[(String, String)]) -> Vec<String> {
+    let mut by_size: Vec<(usize, &str, String)> = patches
+        .iter()
+        .filter(|(path, patch)| !is_generated(path) && !patch.trim().is_empty())
+        .map(|(path, patch)| {
+            let changed: Vec<&str> = patch
+                .lines()
+                .filter(|l| {
+                    (l.starts_with('+') || l.starts_with('-'))
+                        && !l.starts_with("+++")
+                        && !l.starts_with("---")
+                })
+                .collect();
+            (changed.len(), path.as_str(), changed.join("\n"))
+        })
+        .filter(|(n, _, _)| *n > 0)
+        .collect();
+    by_size.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(b.1)));
+    by_size
+        .into_iter()
+        .take(MAX_DIFF_EXCERPTS)
+        .map(|(_, path, changed)| {
+            crate::truncate_str(&format!("{path}\n{changed}"), MAX_DIFF_CHARS).to_string()
+        })
+        .collect()
+}
 
 impl PeopleEdits {
     /// The share of the PR's diff they changed, 0..1.
@@ -154,6 +205,7 @@ pub fn pr_closed_events(
                             .take(MAX_EDIT_NOTES)
                             .map(|t| crate::truncate_str(t.trim(), 160).to_string())
                             .collect();
+                        e.diff = ed.diff.iter().take(MAX_DIFF_EXCERPTS).cloned().collect();
                         out.push(e);
                     }
                 }
@@ -491,6 +543,14 @@ mod tests {
             lines: 40,
             files: vec!["src/api/a.ts".into()],
             subjects: vec!["Use the shared client".into(), " ".into()],
+            diff: diff_excerpts(&[
+                (
+                    "src/api/a.ts".into(),
+                    "@@ -1,4 +1,4 @@\n import x\n-const r = await fetch(url)\n+const r = await client.get(url)\n done".into(),
+                ),
+                ("package-lock.json".into(), "@@\n-a\n+b".into()),
+                ("src/empty.ts".into(), String::new()),
+            ]),
         };
         let mut pr = merged();
         pr["additions"] = json!(80);
@@ -509,6 +569,15 @@ mod tests {
         // What people changed and said travels on the event.
         assert_eq!(v[0].files, vec!["src/api/a.ts".to_string()]);
         assert_eq!(v[0].notes, vec!["Use the shared client".to_string()]);
+        // And so does what they changed in the code: their lines only, never
+        // a lockfile's.
+        assert_eq!(
+            v[0].diff,
+            vec![
+                "src/api/a.ts\n-const r = await fetch(url)\n+const r = await client.get(url)"
+                    .to_string()
+            ]
+        );
         assert_eq!(v[2].value, 2.0);
         // Unmeasured edits are not guessed.
         let v = pr_closed_events(&ctx(), &merged(), Some(3), None, CiSummary::default());
