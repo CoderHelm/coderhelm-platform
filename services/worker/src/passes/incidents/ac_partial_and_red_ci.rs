@@ -86,8 +86,15 @@ fn pull_requests_are_opened_and_marked_ready_in_one_place_each() {
     assert_eq!(
         opens,
         vec![
+            // The revert of a merged change whose deploy failed, not a
+            // run's: opened ready with its evidence, never a draft or a
+            // partial (`deploy_revert`).
+            "passes/deploy_revert.rs".to_string(),
             // The setup pull request (CI and end-to-end setup), not a run's.
             "passes/e2e_setup.rs".to_string(),
+            // The guide pull request (lessons proposed for the repository's
+            // guide file), not a run's.
+            "passes/guide_pr.rs".to_string(),
             // A run's pull request.
             "passes/pr.rs".to_string(),
             // A run stopped with work on its branch: the held draft.

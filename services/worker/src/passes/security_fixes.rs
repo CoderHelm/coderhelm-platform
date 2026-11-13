@@ -4522,16 +4522,31 @@ pub(crate) async fn rebuild_at_head(
     )
     .await;
     let fresh = sec::pr_body_at_head(&unit, &pairs, &change, &check, &links, &head);
-    let next = common::upgrade_notes::replace_sections(
-        body,
-        &fresh,
-        &["## Summary", "## What to check", "## Proof"],
-    );
+    let next = rebuilt_body(body, &fresh);
     if next != body {
         if let Err(e) = crate::passes::description::save(gh, o, n, number, &next).await {
             warn!(%repo, number, error = %e, "security: could not rebuild the description from the head");
         }
     }
+}
+
+/// `body` with the sections computed from the head taken from `fresh`.
+/// Every section CoderHelm owns elsewhere (the draft status, review fixes,
+/// the settled items, CI notes, the reviewer guide, open items and the
+/// rest of `completeness::Section`) is lifted out first and put back as it
+/// was, so a rebuild can never overwrite one that sits under a rebuilt
+/// heading. A body the rebuild does not change is returned as it is.
+pub(crate) fn rebuilt_body(body: &str, fresh: &str) -> String {
+    let (owned, rest) = super::completeness::take_owned(body);
+    let next = common::upgrade_notes::replace_sections(
+        &rest,
+        fresh,
+        &["## Summary", "## What to check", "## Proof"],
+    );
+    if next == rest {
+        return body.to_string();
+    }
+    super::completeness::assemble(&next, &owned)
 }
 
 /// A security run opened its pull request: labels, the findings, the card.

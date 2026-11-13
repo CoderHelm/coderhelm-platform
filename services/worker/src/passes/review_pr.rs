@@ -1625,6 +1625,35 @@ async fn run_once(
     *reviewed_head = head_sha.clone();
     live_job.follow_head(state, &github, &msg, &head_sha).await;
 
+    // The repository's guide pull request holds lessons CoderHelm proposed
+    // for the guide file. The team reviews those; CoderHelm does not review
+    // its own lessons, so nothing is written into the description as an
+    // open finding, the pull request is not held, and no fix round is
+    // asked for, whatever started this review.
+    if super::is_own_login(pr_author)
+        && common::guide::is_guide_branch(pr["head"]["ref"].as_str().unwrap_or(""))
+    {
+        info!(pr = msg.pr_number, head = %head_sha, "A guide pull request — left to the team to review");
+        common::claim::release(
+            &state.dynamo,
+            &state.config.settings_table_name,
+            &msg.team_id,
+            &super::review_policy::head_claim_sk(
+                &msg.repo_owner,
+                &msg.repo_name,
+                msg.pr_number,
+                &head_sha,
+            ),
+        )
+        .await;
+        live_job.settle(NotReviewed::GuidePullRequest);
+        return Ok(Outcome::Skipped {
+            reason: "This pull request holds CoderHelm's own lessons for the guide file; it is \
+                     for the team to review."
+                .into(),
+        });
+    }
+
     // CoderHelm's own push while its run is still fixing the PR: the run
     // asks for the verdict itself when CI is green, and hands the PR over
     // for review if it ends without one. A person's push is reviewed.
@@ -2587,7 +2616,7 @@ async fn run_once(
     // What outcomes taught: this repo's calibration, the prompt variant the
     // bandit picked, good and avoid examples, and evidence-backed lessons.
     let reward_paths: Vec<String> = changed_files(&compare).into_iter().collect();
-    let reward = super::rewards::review_learning(
+    let mut reward = super::rewards::review_learning(
         state,
         &msg.team_id,
         &format!("{}/{}", msg.repo_owner, msg.repo_name),
@@ -2596,6 +2625,20 @@ async fn run_once(
         &format!("{title}\n{}", reward_paths.join("\n")),
     )
     .await;
+    // CoderHelm's review of its own pull request also holds the change to
+    // what the likely reviewers of these files repeatedly ask for.
+    if self_authored {
+        reward.context.push_str(
+            &super::rewards::reviewer_asks(
+                state,
+                &msg.team_id,
+                &format!("{}/{}", msg.repo_owner, msg.repo_name),
+                msg.installation_id,
+                &reward_paths,
+            )
+            .await,
+        );
+    }
     // The repository's memories (conventions, accepted patterns, known false
     // alarms, earlier answers), chosen by relevance to this PR. A memory
     // never blocks on its own (`review_agent::enforce_memory_grounding`).
@@ -5157,6 +5200,40 @@ async fn last_review(state: &WorkerState, msg: &ReviewMessage) -> Option<LastRev
             created_at: get(i, "created_at"),
         })
     })
+}
+
+/// CoderHelm's latest verdict on a pull request and the commit it is on
+/// (`APPROVE` or `REQUEST_CHANGES`), for whoever decides what the pull
+/// request needs next (`pr_watch`). None before any review.
+pub(crate) async fn own_verdict(
+    state: &WorkerState,
+    team_id: &str,
+    owner: &str,
+    repo: &str,
+    pr_number: u64,
+) -> Option<(String, String)> {
+    let msg = ReviewMessage {
+        team_id: team_id.to_string(),
+        repo_owner: owner.to_string(),
+        repo_name: repo.to_string(),
+        pr_number,
+        ..Default::default()
+    };
+    last_review(state, &msg)
+        .await
+        .map(|r| (r.verdict, r.head_sha))
+}
+
+/// Whether CoderHelm's reviewer is on for the repository.
+pub(crate) async fn reviewer_enabled(
+    state: &WorkerState,
+    team_id: &str,
+    owner: &str,
+    repo: &str,
+) -> bool {
+    enabled_trigger_label(state, team_id, owner, repo)
+        .await
+        .is_some()
 }
 
 /// Pure: was the head commit authored by CoderHelm? Reads the compare

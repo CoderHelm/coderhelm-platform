@@ -991,6 +991,48 @@ fn draft_hold_of(item: &run_search::Item) -> Option<RunDraftHold> {
     })
 }
 
+/// Where a run's pull request stands on its way to merge.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct RunMergeStanding {
+    /// Stable code: `merged`, `closed`, `reviewing`, `fixing_review`,
+    /// `review_changes_requested`, `checks_running`, `checks_failing`,
+    /// `conflict`, `draft`, `auto_merge_off`, `needs_person_approval`,
+    /// `repo_requires_person_review` or `merging`.
+    #[schema(example = "auto_merge_off")]
+    pub code: String,
+    /// What is true now, one sentence.
+    #[schema(
+        example = "Auto-merge is off for this repo, so CoderHelm leaves the merge to your team."
+    )]
+    pub text: String,
+    /// What happens next, one sentence.
+    #[schema(
+        example = "Merge it, or turn auto-merge on and CoderHelm merges approved pull requests itself."
+    )]
+    pub next: String,
+    /// A person has to act for the merge to happen.
+    #[schema(example = true)]
+    pub needs_person: bool,
+    /// Where the rule is set, when a setting decides it: a dashboard path
+    /// or a GitHub URL. Null otherwise.
+    #[schema(example = "/reviewer/config")]
+    pub link: Option<String>,
+}
+
+fn merge_standing_of(item: &run_search::Item) -> Option<RunMergeStanding> {
+    let s = item
+        .get(common::merge_standing::FIELD)
+        .and_then(|v| v.as_s().ok())
+        .and_then(|s| common::merge_standing::Standing::from_json(s))?;
+    Some(RunMergeStanding {
+        code: s.code,
+        text: s.text,
+        next: s.next,
+        needs_person: s.needs_person,
+        link: Some(s.link).filter(|l| !l.is_empty()),
+    })
+}
+
 fn waiting_on_of(item: &run_search::Item) -> Option<RunWaitingOn> {
     let w = common::run_wait::WaitingOn::of_item(item)?;
     Some(RunWaitingOn {
@@ -1249,6 +1291,13 @@ pub struct Run {
     /// is ready or closed.
     #[schema(example = json!(null))]
     pub draft_hold: Option<RunDraftHold>,
+    /// Where the run's pull request stands on its way to merge, in the one
+    /// reason that is true now (`common::merge_standing`): what holds it,
+    /// what happens next, whether a person has to act and, when a setting
+    /// decides it, where that setting is. Null until the worker has looked
+    /// at the pull request.
+    #[schema(example = json!(null))]
+    pub merge_standing: Option<RunMergeStanding>,
     /// The CI checks on the head of the run's open pull request, read from
     /// GitHub (reused for up to a minute). Null when the run has no open
     /// pull request or GitHub can't be read.
@@ -1848,6 +1897,7 @@ fn run_of(
             None
         },
         draft_hold: draft_hold_of(item),
+        merge_standing: merge_standing_of(item),
         checks: None,
         pr_review: None,
         pr_review_comments: None,

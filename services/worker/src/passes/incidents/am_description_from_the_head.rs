@@ -1,4 +1,4 @@
-//! aj. A dependency security run's pull request had the right code after a
+//! am. A dependency security run's pull request had the right code after a
 //! review round and the wrong description:
 //!
 //! - its table still showed the plan: five packages as major version jumps
@@ -192,8 +192,104 @@ fn a_rebuild_replaces_the_stale_sections_in_place() {
     let rebuild = fn_src(src, "pub(crate) async fn rebuild_at_head(");
     assert!(rebuild.contains("head_facts("));
     assert!(rebuild.contains("sec::pr_body_at_head("));
-    assert!(rebuild.contains("\"## Summary\", \"## What to check\", \"## Proof\""));
+    assert!(rebuild.contains("rebuilt_body(body, &fresh)"));
+    let pure = fn_src(src, "pub(crate) fn rebuilt_body(");
+    for heading in ["\"## Summary\"", "\"## What to check\"", "\"## Proof\""] {
+        assert!(pure.contains(heading), "{heading}");
+    }
     assert!(rebuild.contains("description::save("));
+}
+
+/// Every section CoderHelm owns elsewhere survives a rebuild word for
+/// word, wherever it sits: the draft status, review fixes, the settled
+/// items, CI notes, the reviewer guide, open items, and what the run did
+/// before and after the code.
+#[test]
+fn a_rebuild_keeps_every_other_owned_section() {
+    use crate::passes::completeness::{self, Section};
+    use crate::passes::{habits_check, security_fixes};
+    let (unit, fs) = (unit(), findings());
+    let pairs: Vec<(&Finding, &FindingState)> = fs.iter().map(|(f, s)| (f, s)).collect();
+    let check = common::upgrade_notes::WhatToCheck::default();
+    let links = sec::BodyLinks::default();
+    let mut open = sec::pr_body_linked(&unit, &pairs, "Bumped.", &check, &links);
+    let sections = [
+        (Section::DraftStatus, "Draft: waiting on CI for this head."),
+        (
+            Section::ReviewFixes,
+            "Round 1: scoped the overrides to their lines.",
+        ),
+        (
+            Section::Settled,
+            "Settled here: the audit ran on this head.",
+        ),
+        (
+            Section::CiNotes,
+            "The end-to-end job failed once and passed on a rerun: flaky.",
+        ),
+        (
+            Section::ReviewerGuide,
+            "Start with package.json, then the lockfile.",
+        ),
+        (
+            Section::OpenFindings,
+            "One finding of CoderHelm's own review is open.",
+        ),
+        (
+            Section::Objections,
+            "A reviewer's request for changes stands.",
+        ),
+    ];
+    let mut blocks: Vec<String> = vec![];
+    for (section, words) in sections {
+        let (start, end) = section.markers();
+        let block = format!("{start}\n{words}\n{end}");
+        open = completeness::with_section(&open, section, block.clone());
+        blocks.push(block);
+    }
+    let habits = format!(
+        "{}\n### Before and after the code\n- Reproduced the advisory's path first.\n{}",
+        habits_check::START,
+        habits_check::END
+    );
+    open = habits_check::shape_body(open, &habits);
+    blocks.push(habits);
+    for b in &blocks {
+        assert!(open.contains(b.as_str()), "the fixture lost {b}");
+    }
+    let head = dep_head::resolve(
+        &unit,
+        "5e1f00d7a9",
+        &[lock_at(
+            &lockfile("2.3.1", "3.1.2"),
+            &lockfile("2.3.2", "3.1.5"),
+        )],
+    );
+    let fresh = sec::pr_body_at_head(&unit, &pairs, "Bumped.", &check, &links, &head);
+    let rebuilt = security_fixes::rebuilt_body(&open, &fresh);
+    assert!(
+        rebuilt.contains("| `glob-walk` | 2.3.1 to 2.3.2 |"),
+        "{rebuilt}"
+    );
+    assert!(!rebuilt.contains("(major)"), "{rebuilt}");
+    for b in &blocks {
+        assert_eq!(
+            rebuilt.matches(b.as_str()).count(),
+            1,
+            "lost or doubled: {b}\n{rebuilt}"
+        );
+    }
+    assert!(rebuilt.contains(sec::MARKER));
+    // The same head again writes nothing new.
+    assert_eq!(security_fixes::rebuilt_body(&rebuilt, &fresh), rebuilt);
+    // The model's rewrite keeps them too: the owned sections never reach
+    // it, and what the run did before and after the code is put back.
+    let pr = include_str!("../pr.rs");
+    let refresh = &pr[pr.find("pub async fn refresh_description(").unwrap()..];
+    let refresh = &refresh[..refresh.find("\nasync fn fill_placeholders_once(").unwrap()];
+    assert!(refresh.contains("completeness::take_owned(&current)"));
+    assert!(refresh.contains("habits_check::current_section(&rest)"));
+    assert!(refresh.contains("habits_check::shape_body(written, &habits_section)"));
 }
 
 /// "I can't edit the PR description from here" never reaches a person: the

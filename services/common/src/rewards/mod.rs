@@ -49,4 +49,16 @@ pub struct RewardOutcomeMessage {
     /// A PR CoderHelm reviewed but didn't write: no coder outcome.
     #[serde(default)]
     pub review_only: bool,
+    /// What happened, when it is not the pull request closing: empty for a
+    /// close, [`TRIGGER_REVERTED`] when a merged CoderHelm change was
+    /// reverted (`pr_number` is the reverted one), [`TRIGGER_GUIDE_CLOSED`]
+    /// when the repository's guide pull request closed.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub trigger: String,
+    /// People's words that came with it: why they reverted.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub note: String,
 }
+
+pub const TRIGGER_REVERTED: &str = "reverted";
+pub const TRIGGER_GUIDE_CLOSED: &str = "guide_closed";

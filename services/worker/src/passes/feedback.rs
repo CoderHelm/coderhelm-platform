@@ -1404,6 +1404,39 @@ Rules:
     // with no code change. What changed goes on the reply.
     // The round's changes landed above, as one commit in one push.
     let asked = executor.description.taken();
+    // A sentence the round wrote into a file that says a check passes
+    // stands only on a recorded result: here, the round's own run of the
+    // full test suite. Before the description is rebuilt from the branch.
+    if fix_pushed {
+        let recorded = super::proof::RunEvidence {
+            sandbox: super::proof::SandboxRecord {
+                passed: if suite_passed(&evidence_lines) {
+                    vec![super::checks::CheckKind::Tests]
+                } else {
+                    vec![]
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let removed = super::file_claims::settle(
+            state,
+            &run_ticket_message(&msg, &ticket, base.clone()),
+            &github,
+            &branch,
+            &recorded,
+        )
+        .await;
+        if !removed.is_empty() {
+            super::add_progress_note(
+                state,
+                &msg.team_id,
+                &msg.run_id,
+                &super::file_claims::note(&removed),
+            )
+            .await;
+        }
+    }
     // A reply that says the description can't be edited, or leaves an edit
     // of it to a person, loses that sentence; the rebuild then runs whether
     // or not code was pushed.
@@ -2391,6 +2424,16 @@ fn feedback_tools() -> Vec<ToolDefinition> {
             }),
         },
     ]
+}
+
+/// Whether the round's evidence records a passing run of the full test
+/// suite (the line `review_fix::suite` writes), and no failing one after.
+fn suite_passed(evidence: &[String]) -> bool {
+    evidence
+        .iter()
+        .rev()
+        .find(|l| l.starts_with("Full test suite "))
+        .is_some_and(|l| l.starts_with("Full test suite passed"))
 }
 
 /// The tool a person's comment reaches the PR description through.
@@ -4337,6 +4380,30 @@ mod description_request_tests {
         assert_eq!(tool.name, "update_pr_description");
         assert!(tool.description.contains("write access"));
         assert_eq!(tool.input_schema["required"][0], "change");
+    }
+
+    /// A feedback round's file claims are held to its own suite result.
+    #[test]
+    fn a_feedback_rounds_claims_are_checked_against_its_suite_result() {
+        use super::suite_passed;
+        let passed = vec![
+            "Scope: took out 1 file".to_string(),
+            "Full test suite passed: `pnpm test` (13 passed)".to_string(),
+        ];
+        assert!(suite_passed(&passed));
+        let failed_after = vec![
+            "Full test suite passed: `pnpm test` (13 passed)".to_string(),
+            "Full test suite FAILED (exit 1): `pnpm test` (12 passed, 1 failed)".to_string(),
+        ];
+        assert!(!suite_passed(&failed_after));
+        assert!(!suite_passed(&[]));
+        let src = include_str!("feedback.rs");
+        let claims = src.find("super::file_claims::settle(").unwrap();
+        let rebuild = src.find("super::description::head_moved(").unwrap();
+        assert!(
+            claims < rebuild,
+            "claims are settled before the description is rebuilt"
+        );
     }
 
     /// A round with no person behind it (CoderHelm's own review) was told

@@ -3838,6 +3838,17 @@
               "null"
             ]
           },
+          "merge_standing": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RunMergeStanding",
+                "description": "Where the run's pull request stands on its way to merge, in the one\nreason that is true now (`common::merge_standing`): what holds it,\nwhat happens next, whether a person has to act and, when a setting\ndecides it, where that setting is. Null until the worker has looked\nat the pull request."
+              }
+            ]
+          },
           "outside_change_report": {
             "description": "The report written when (part of) the fix is a change outside the code.",
             "examples": [
@@ -4638,6 +4649,56 @@
         "required": [
           "what",
           "todo"
+        ],
+        "type": "object"
+      },
+      "RunMergeStanding": {
+        "description": "Where a run's pull request stands on its way to merge.",
+        "properties": {
+          "code": {
+            "description": "Stable code: `merged`, `closed`, `reviewing`, `fixing_review`,\n`review_changes_requested`, `checks_running`, `checks_failing`,\n`conflict`, `draft`, `auto_merge_off`, `needs_person_approval`,\n`repo_requires_person_review` or `merging`.",
+            "examples": [
+              "auto_merge_off"
+            ],
+            "type": "string"
+          },
+          "link": {
+            "description": "Where the rule is set, when a setting decides it: a dashboard path\nor a GitHub URL. Null otherwise.",
+            "examples": [
+              "/reviewer/config"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "needs_person": {
+            "description": "A person has to act for the merge to happen.",
+            "examples": [
+              true
+            ],
+            "type": "boolean"
+          },
+          "next": {
+            "description": "What happens next, one sentence.",
+            "examples": [
+              "Merge it, or turn auto-merge on and CoderHelm merges approved pull requests itself."
+            ],
+            "type": "string"
+          },
+          "text": {
+            "description": "What is true now, one sentence.",
+            "examples": [
+              "Auto-merge is off for this repo, so CoderHelm leaves the merge to your team."
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "text",
+          "next",
+          "needs_person"
         ],
         "type": "object"
       },

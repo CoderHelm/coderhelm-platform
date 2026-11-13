@@ -804,6 +804,7 @@ mod continuation_tests {
             "The link and redirect check needs more time",
             "The failing-test rules need more time",
             "The new-feature rules need more time",
+            "Running the changed tests with and without the change needs a step of its own",
         ] {
             assert!(rp.contains(why), "no hand-off for: {why}");
         }
@@ -1202,6 +1203,7 @@ mod completeness;
 mod covering;
 mod cross_repo;
 pub mod dep_fix;
+pub(crate) mod deploy_revert;
 pub mod deploy_stats;
 pub mod description;
 pub mod dlq_cleanup;
@@ -1214,9 +1216,13 @@ pub mod feedback;
 pub mod file_claims;
 mod finish_planned;
 pub mod fix_location;
+pub(crate) mod flaky;
 pub mod formatter;
 pub(crate) mod generators;
 pub mod github_history;
+pub mod guide_pr;
+pub mod habits;
+pub mod habits_check;
 pub mod health_check;
 pub mod hidden_suggest;
 /// Hosted side of hybrid: forward a held event to a self-hosted install again.
@@ -1249,6 +1255,7 @@ pub mod onboard;
 pub mod open_pr_choice;
 pub mod ops_tools;
 pub mod outcome;
+pub mod outcome_learning;
 pub mod outside_exec;
 pub mod outside_work;
 pub mod own_review;
@@ -1264,6 +1271,7 @@ mod pr;
 mod pr_holder;
 pub mod pr_outcomes;
 mod pr_risk;
+pub mod pr_watch;
 mod proof;
 pub mod quarantine;
 /// Whether a finished run's pull request leaves draft, decided in one place.
@@ -1305,6 +1313,7 @@ pub mod review_severity;
 pub mod review_sweep;
 pub mod review_thread_reply;
 pub mod review_verdict;
+mod reviewer_guide;
 pub mod rewards;
 pub(crate) mod round;
 pub mod run_ceiling;
@@ -6603,6 +6612,7 @@ async fn run_passes(
                 links: "",
                 test_fix: None,
                 feature: None,
+                habits: None,
                 keep_commits: stacked_on
                     .as_ref()
                     .is_some_and(|d| !d.unresolved.is_empty()),
@@ -6837,6 +6847,38 @@ async fn run_passes(
     if let Some(f) = &feature_pr {
         gaps.extend(feature::open_findings(f));
     }
+    // Each new or changed test run with and without the change, and the
+    // changed files held to the plan (see habits_check). Its sandbox runs
+    // take a step of their own when this one is short.
+    let habits_pr = match habits_check::gate(&work, &mut evidence, usage, has_time, || {
+        remaining_secs(start)
+    })
+    .await
+    {
+        Ok(h) => h,
+        Err(habits_check::GateStop::NeedsTime) => {
+            close_memory(state, agent_memory.take()).await;
+            return hand_off_at(
+                state,
+                msg,
+                &github,
+                run_id,
+                &branch_name,
+                steps::Gate::Checks,
+                Some(&carry),
+                "Running the changed tests with and without the change needs a step of its own",
+                usage,
+            )
+            .await;
+        }
+        Err(habits_check::GateStop::Why(why)) => {
+            gaps.push(proof::check_item("The tests and scope check", &why));
+            None
+        }
+    };
+    if let Some(h) = &habits_pr {
+        gaps.extend(habits_check::open_findings(h, &plan_result));
+    }
     // What the stop judge assumed instead of asking: an Open item a person
     // corrects if it's wrong.
     gaps.extend(stop_judge::assumptions(state, &msg.team_id, run_id).await);
@@ -6893,6 +6935,7 @@ async fn run_passes(
             links: &links,
             test_fix: test_pr.as_ref(),
             feature: feature_pr.as_ref(),
+            habits: habits_pr.as_ref(),
             keep_commits: false,
         },
     )
@@ -8018,6 +8061,7 @@ async fn run_repo_pipeline(
                 test_fix: None,
                 // Multi-repo runs: the new-feature rules check single-repo runs.
                 feature: None,
+                habits: None,
                 keep_commits: false,
             },
             provider,
@@ -8128,6 +8172,28 @@ async fn run_repo_pipeline(
             None
         }
     };
+    // This path has no step of its own to give: with too little time the
+    // tests are recorded as not run, with why.
+    ledger.update(|l| l.habits_waited = true);
+    let habits_pr = match habits_check::gate(
+        &work,
+        &mut evidence,
+        usage,
+        || has_time_for_remediation(start),
+        || remaining_secs(start),
+    )
+    .await
+    {
+        Ok(h) => h,
+        Err(habits_check::GateStop::NeedsTime) => None,
+        Err(habits_check::GateStop::Why(why)) => {
+            gaps.push(proof::check_item("The tests and scope check", &why));
+            None
+        }
+    };
+    if let Some(h) = &habits_pr {
+        gaps.extend(habits_check::open_findings(h, &repo_plan));
+    }
     gaps.extend(stop_judge::assumptions(state, &msg.team_id, run_id).await);
     // Settle, as the single-repository path does. A run across repositories
     // has no step that resumes one repository at its checks, so what needs
@@ -8171,6 +8237,7 @@ async fn run_repo_pipeline(
             links: &links,
             test_fix: test_pr.as_ref(),
             feature: None,
+            habits: habits_pr.as_ref(),
             keep_commits: false,
         },
     )
@@ -11299,6 +11366,9 @@ const INSTRUCTION_FILES: &[&str] = &[
     "copilot-instructions.md",
     ".cursorrules",
     ".github/instructions.md",
+    // The contribution guide last: the agent files above win the byte cap.
+    "CONTRIBUTING.md",
+    ".github/CONTRIBUTING.md",
 ];
 
 /// Load repo-level instruction files from the repo's default branch (HEAD).
