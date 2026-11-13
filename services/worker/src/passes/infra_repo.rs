@@ -37,6 +37,15 @@ pub struct CodeHit {
     pub repo: String,
     pub path: String,
     pub term: String,
+    /// The file was read and is infrastructure code by its content.
+    #[serde(default)]
+    pub iac: bool,
+}
+
+impl CodeHit {
+    fn is_iac(&self) -> bool {
+        self.iac || is_iac_path(&self.path)
+    }
 }
 
 /// What the search found.
@@ -58,15 +67,20 @@ pub enum Found {
 const MAX_REPOS: usize = 8;
 const MAX_TERMS: usize = 4;
 
-/// Pure: whether a file is infrastructure code: Terraform, CloudFormation
-/// or a CDK stack.
+/// Files of one repository read to see whether they are infrastructure
+/// code that their name does not give away.
+const MAX_CONTENT_CHECKS: usize = 20;
+
+/// Pure: whether a file's name says it is infrastructure code: Terraform
+/// and OpenTofu, CloudFormation and SAM templates, a Serverless Framework
+/// service, a CDK or Pulumi program in a folder or file named for it. A
+/// file at a neutral path is recognised by its content instead
+/// ([`is_iac`]).
 pub fn is_iac_path(path: &str) -> bool {
     let p = path.to_ascii_lowercase();
     let file = p.rsplit('/').next().unwrap_or(&p);
-    p.ends_with(".tf")
+    common::infra_vuln::locate::iac_by_name(path)
         || p.ends_with(".tf.json")
-        || p.ends_with(".tfvars")
-        || p.ends_with(".hcl")
         || ((p.ends_with(".yaml") || p.ends_with(".yml") || p.ends_with(".json"))
             && (p.contains("cloudformation") || p.contains("cfn") || file.contains("template")))
         || ((p.ends_with(".ts")
@@ -74,6 +88,13 @@ pub fn is_iac_path(path: &str) -> bool {
             || p.ends_with(".go")
             || p.ends_with(".java"))
             && (file.contains("stack") || p.contains("/cdk/") || p.starts_with("cdk/")))
+}
+
+/// Pure: whether a file is infrastructure code, by what is in it: a CDK
+/// construct file next to application code, a CloudFormation or SAM
+/// template at any path, a `serverless.yml`, a Pulumi program.
+pub fn is_iac(path: &str, content: &str) -> bool {
+    common::infra_vuln::locate::tool_of(path, content).is_some()
 }
 
 /// Pure: the names to search for, from the evidence: the task family, the
@@ -98,6 +119,11 @@ pub fn search_terms(ev: &LogEvidence) -> Vec<String> {
     }
     out.truncate(MAX_TERMS);
     out
+}
+
+/// Pure: the repository's role or description speaks of infrastructure.
+pub fn speaks_of_infrastructure(r: &RepoInfo) -> bool {
+    infra_word(r)
 }
 
 fn infra_word(r: &RepoInfo) -> bool {
@@ -139,7 +165,7 @@ pub fn pick(primary: &str, repos: &[RepoInfo], hits: &[CodeHit], terms: &[String
     for (i, repo) in order.iter().enumerate() {
         let mut named: Vec<&str> = hits
             .iter()
-            .filter(|h| &h.repo == repo && is_iac_path(&h.path))
+            .filter(|h| &h.repo == repo && h.is_iac())
             .map(|h| h.term.as_str())
             .collect();
         named.sort();
@@ -163,14 +189,14 @@ pub fn pick(primary: &str, repos: &[RepoInfo], hits: &[CodeHit], terms: &[String
         Some((_, _, _, repo)) => {
             let mut files: Vec<String> = hits
                 .iter()
-                .filter(|h| h.repo == repo && is_iac_path(&h.path))
+                .filter(|h| h.repo == repo && h.is_iac())
                 .map(|h| h.path.clone())
                 .collect();
             files.sort();
             files.dedup();
             let mut found_terms: Vec<String> = hits
                 .iter()
-                .filter(|h| h.repo == repo && is_iac_path(&h.path))
+                .filter(|h| h.repo == repo && h.is_iac())
                 .map(|h| h.term.clone())
                 .collect();
             found_terms.sort();
@@ -342,13 +368,37 @@ pub async fn locate(
         let Some((owner, name)) = repo.split_once('/') else {
             continue;
         };
+        // A file whose name does not say so may still be infrastructure
+        // code (CDK next to the application, a template at a neutral
+        // path): read it once to find out.
+        let mut by_content: std::collections::BTreeMap<String, bool> =
+            std::collections::BTreeMap::new();
         for term in terms {
             if let Ok(found) = github.search_code(owner, name, "HEAD", term).await {
-                hits.extend(found.into_iter().map(|r| CodeHit {
-                    repo: repo.clone(),
-                    path: r.path,
-                    term: term.clone(),
-                }));
+                for r in found {
+                    let mut iac = false;
+                    if !is_iac_path(&r.path) && common::infra_vuln::locate::maybe_iac_path(&r.path)
+                    {
+                        iac = match by_content.get(&r.path) {
+                            Some(known) => *known,
+                            None if by_content.len() < MAX_CONTENT_CHECKS => {
+                                let is = github
+                                    .get_file_content(owner, name, &r.path)
+                                    .await
+                                    .is_ok_and(|c| is_iac(&r.path, &c));
+                                by_content.insert(r.path.clone(), is);
+                                is
+                            }
+                            None => false,
+                        };
+                    }
+                    hits.push(CodeHit {
+                        repo: repo.clone(),
+                        path: r.path,
+                        term: term.clone(),
+                        iac,
+                    });
+                }
             }
         }
     }
@@ -484,6 +534,7 @@ mod tests {
             repo: repo.into(),
             path: path.into(),
             term: term.into(),
+            iac: false,
         }
     }
 
@@ -494,6 +545,42 @@ mod tests {
         assert!(is_iac_path("lib/web-stack.ts"));
         assert!(!is_iac_path("src/app/page.tsx"));
         assert!(!is_iac_path("docker-compose.yml"));
+        // By name: Serverless Framework, SAM, Pulumi, OpenTofu.
+        assert!(is_iac_path("services/api/serverless.yml"));
+        assert!(is_iac_path("samconfig.toml"));
+        assert!(is_iac_path("Pulumi.prod.yaml"));
+        assert!(is_iac_path("main.tofu"));
+        assert!(is_iac_path("infra/app.py"));
+    }
+
+    #[test]
+    fn a_file_at_a_neutral_path_is_recognised_by_its_content() {
+        // CDK next to application code, in a file not named a stack.
+        assert!(!is_iac_path("src/database.ts"));
+        assert!(is_iac(
+            "src/database.ts",
+            "import * as rds from 'aws-cdk-lib/aws-rds';"
+        ));
+        // CloudFormation at a neutral path.
+        assert!(!is_iac_path("deploy/api.yaml"));
+        assert!(is_iac(
+            "deploy/api.yaml",
+            "AWSTemplateFormatVersion: '2010-09-09'\nResources:\n  Db:\n    Type: AWS::RDS::DBInstance\n"
+        ));
+        assert!(is_iac("index.ts", "import * as aws from '@pulumi/aws';"));
+        assert!(!is_iac(
+            "docker-compose.yml",
+            "services:\n  web:\n    image: nginx\n"
+        ));
+        assert!(!is_iac(
+            "src/app/page.tsx",
+            "export default function Page() {}"
+        ));
+        // A hit read and found to be infrastructure code counts.
+        let mut h = hit("acme/app", "src/database.ts", "orders");
+        assert!(!h.is_iac());
+        h.iac = true;
+        assert!(h.is_iac());
     }
 
     #[test]

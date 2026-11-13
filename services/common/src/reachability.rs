@@ -1303,6 +1303,192 @@ struct Graph {
     edges: Vec<Vec<usize>>,
     /// (direct dependency name, its node)
     roots: Vec<(String, usize)>,
+    /// The workspace projects the lockfile installs for: each one's folder
+    /// from the lockfile's folder (`""` for the root) and the nodes it
+    /// depends on directly.
+    projects: Vec<(String, Vec<usize>)>,
+    /// (project, a workspace project it depends on), by index in `projects`.
+    project_links: Vec<(usize, usize)>,
+}
+
+/// `rel` from the folder `base`, with `.` and `..` resolved (`apps/web` and
+/// `../studio` is `apps/studio`).
+fn join_rel(base: &str, rel: &str) -> String {
+    let mut parts: Vec<&str> = base.split('/').filter(|p| !p.is_empty()).collect();
+    for seg in rel.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            s => parts.push(s),
+        }
+    }
+    parts.join("/")
+}
+
+/// One workspace project of a lockfile, and which of the packages asked
+/// about its dependencies bring in.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LockProject {
+    /// Its folder, from the lockfile's folder (`""`: the lockfile's own).
+    pub dir: String,
+    /// The packages asked about that it installs, directly or through a
+    /// dependency or another workspace project, as `name@version`.
+    pub uses: Vec<String>,
+}
+
+fn graph_of(path: &str, text: &str, manifests: &[(String, String)]) -> Option<Graph> {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    match name {
+        "pnpm-lock.yaml" => pnpm_graph(text),
+        "package-lock.json" | "npm-shrinkwrap.json" => npm_graph(text),
+        "yarn.lock" => yarn_projects(text, manifests),
+        _ => None,
+    }
+}
+
+/// Every installed copy a lockfile resolves, as (name, version). `None` for
+/// a lockfile this can't read: the caller then says the versions are not
+/// known, never a guess.
+pub fn lock_copies(path: &str, text: &str) -> Option<Vec<(String, String)>> {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let mut out: Vec<(String, String)> = match name {
+        "pnpm-lock.yaml" | "package-lock.json" | "npm-shrinkwrap.json" | "yarn.lock" => {
+            graph_of(path, text, &[])?.nodes
+        }
+        "Cargo.lock" | "poetry.lock" | "uv.lock" => toml_copies(text),
+        "Gemfile.lock" => gem_copies(text),
+        _ => return None,
+    };
+    out.retain(|(n, v)| !n.is_empty() && !v.is_empty());
+    out.sort();
+    out.dedup();
+    (!out.is_empty()).then_some(out)
+}
+
+/// The `[[package]]` tables of a TOML lockfile (`Cargo.lock`, `poetry.lock`,
+/// `uv.lock`): each one's `name` and `version`.
+fn toml_copies(text: &str) -> Vec<(String, String)> {
+    let mut out = vec![];
+    let mut cur: Option<(String, String)> = None;
+    let value = |l: &str, key: &str| -> Option<String> {
+        let rest = l.strip_prefix(key)?.trim_start().strip_prefix('=')?;
+        Some(rest.trim().trim_matches('"').to_string())
+    };
+    for line in text.lines() {
+        let t = line.trim();
+        if t.starts_with('[') {
+            if let Some(c) = cur.take() {
+                out.push(c);
+            }
+            if t == "[[package]]" {
+                cur = Some((String::new(), String::new()));
+            }
+            continue;
+        }
+        if let Some(c) = cur.as_mut() {
+            if let Some(v) = value(t, "name") {
+                c.0 = v;
+            } else if let Some(v) = value(t, "version") {
+                c.1 = v;
+            }
+        }
+    }
+    out.extend(cur);
+    out
+}
+
+/// The gems a `Gemfile.lock` resolves: the `name (version)` lines of its
+/// `specs:` lists (a dependency's own requirements sit deeper and carry a
+/// range, never a single version).
+fn gem_copies(text: &str) -> Vec<(String, String)> {
+    let mut out = vec![];
+    for line in text.lines() {
+        let Some(rest) = line.strip_prefix("    ") else {
+            continue;
+        };
+        if rest.starts_with(' ') {
+            continue;
+        }
+        let Some((name, ver)) = rest.split_once(" (") else {
+            continue;
+        };
+        let ver = ver.trim_end_matches(')');
+        if ver.chars().next().is_some_and(|c| c.is_ascii_digit()) && !ver.contains(' ') {
+            out.push((name.to_string(), ver.to_string()));
+        }
+    }
+    out
+}
+
+/// The workspace projects of a lockfile, each with the packages of `asked`
+/// (name and a version on the line asked about) that its dependencies bring
+/// in: the projects a change to those packages can break. `manifests`: each
+/// workspace project's folder (from the lockfile's folder) and its
+/// `package.json`; only `yarn.lock`, which does not list its projects,
+/// needs them. `None` for a lockfile this can't read.
+pub fn lock_projects(
+    path: &str,
+    text: &str,
+    manifests: &[(String, String)],
+    asked: &[(String, String)],
+) -> Option<Vec<LockProject>> {
+    let g = graph_of(path, text, manifests)?;
+    if g.projects.is_empty() {
+        return None;
+    }
+    let mut out = vec![];
+    for (pi, (dir, _)) in g.projects.iter().enumerate() {
+        // This project and every workspace project it depends on.
+        let mut mine = vec![pi];
+        let mut i = 0;
+        while i < mine.len() {
+            for (from, to) in &g.project_links {
+                if *from == mine[i] && !mine.contains(to) {
+                    mine.push(*to);
+                }
+            }
+            i += 1;
+        }
+        let mut seen: HashSet<usize> = HashSet::new();
+        let mut queue: VecDeque<usize> = VecDeque::new();
+        for p in &mine {
+            for n in &g.projects[*p].1 {
+                if seen.insert(*n) {
+                    queue.push_back(*n);
+                }
+            }
+        }
+        while let Some(n) = queue.pop_front() {
+            for to in &g.edges[n] {
+                if seen.insert(*to) {
+                    queue.push_back(*to);
+                }
+            }
+        }
+        let mut uses: Vec<String> = seen
+            .iter()
+            .map(|n| &g.nodes[*n])
+            .filter(|(name, ver)| {
+                asked.iter().any(|(an, av)| {
+                    an == name
+                        && !ver.is_empty()
+                        && crate::security_fixes::version_line(av)
+                            == crate::security_fixes::version_line(ver)
+                })
+            })
+            .map(|(name, ver)| format!("{name}@{ver}"))
+            .collect();
+        uses.sort();
+        uses.dedup();
+        out.push(LockProject {
+            dir: dir.clone(),
+            uses,
+        });
+    }
+    out.sort_by(|a, b| a.dir.cmp(&b.dir));
+    Some(out)
 }
 
 impl Graph {
@@ -1454,13 +1640,18 @@ fn pnpm_graph(text: &str) -> Option<Graph> {
         }
     }
     // The direct dependencies: each importer's, or the top level's.
-    let mut importers: Vec<&serde_yaml::Value> = vec![];
+    let mut importers: Vec<(String, &serde_yaml::Value)> = vec![];
     if let Some(m) = doc.get("importers") {
-        importers.extend(yaml_map(m).into_iter().map(|(_, v)| v));
+        importers.extend(yaml_map(m));
     } else {
-        importers.push(&doc);
+        importers.push((".".to_string(), &doc));
     }
-    for imp in importers {
+    // (project, the folder of the workspace project it links to)
+    let mut links: Vec<(usize, String)> = vec![];
+    for (key, imp) in importers {
+        let dir = join_rel("", &key);
+        let pi = g.projects.len();
+        g.projects.push((dir.clone(), vec![]));
         for field in ["dependencies", "devDependencies", "optionalDependencies"] {
             let Some(m) = imp.get(field) else { continue };
             for (dn, dv) in yaml_map(m) {
@@ -1469,12 +1660,22 @@ fn pnpm_graph(text: &str) -> Option<Graph> {
                     other => yaml_str(other),
                 };
                 let Some(value) = value else { continue };
+                if let Some(to) = value.strip_prefix("link:") {
+                    links.push((pi, join_rel(&dir, to)));
+                    continue;
+                }
                 if let Some(t) = pnpm_target(&dn, &value, v5) {
                     if let Some(n) = node(&mut g, &t) {
                         g.roots.push((dn.clone(), n));
+                        g.projects[pi].1.push(n);
                     }
                 }
             }
+        }
+    }
+    for (from, dir) in links {
+        if let Some(to) = g.projects.iter().position(|(d, _)| *d == dir) {
+            g.project_links.push((from, to));
         }
     }
     Some(g)
@@ -1521,18 +1722,92 @@ fn npm_graph(text: &str) -> Option<Graph> {
             }
         }
     }
+    // The workspace projects: every location outside `node_modules`. A
+    // dependency that resolves to a link is another workspace project.
+    let project_locs: Vec<&str> = packages
+        .keys()
+        .map(String::as_str)
+        .filter(|l| !l.contains("node_modules/"))
+        .collect();
+    let mut loc_of: Vec<&str> = vec![""; g.nodes.len()];
+    for (loc, i) in &index {
+        loc_of[*i] = loc;
+    }
+    for loc in &project_locs {
+        let pi = g.projects.len();
+        g.projects.push((loc.to_string(), vec![]));
+        for to in g.edges[index[*loc]].clone() {
+            match packages.get(loc_of[to]) {
+                Some(p) if p["link"].as_bool() == Some(true) => {
+                    let dir = p["resolved"].as_str().unwrap_or("").trim_matches('/');
+                    if let Some(at) = project_locs.iter().position(|l| *l == dir) {
+                        g.project_links.push((pi, at));
+                    }
+                }
+                _ => g.projects[pi].1.push(to),
+            }
+        }
+    }
     Some(g)
 }
 
+fn yarn_spec(name: &str, range: &str) -> String {
+    let r = range.trim().trim_matches('"');
+    let r = r.strip_prefix("npm:").unwrap_or(r);
+    format!("{name}@{r}")
+}
+
 fn yarn_graph(text: &str, direct_names: &[String]) -> Option<Graph> {
+    let (mut g, _) = yarn_parse(text)?;
+    // The project's own dependencies: every copy of a name it lists.
+    for d in direct_names {
+        for (i, (n, _)) in g.nodes.iter().enumerate() {
+            if n == d {
+                g.roots.push((d.clone(), i));
+            }
+        }
+    }
+    Some(g)
+}
+
+/// A `yarn.lock` with its workspace projects, which the lockfile itself
+/// does not list: each project's `package.json` names what it depends on,
+/// and the lockfile says which copy each range resolves to.
+fn yarn_projects(text: &str, manifests: &[(String, String)]) -> Option<Graph> {
+    let (mut g, spec_to) = yarn_parse(text)?;
+    let parsed: Vec<(String, Value)> = manifests
+        .iter()
+        .filter_map(|(dir, t)| Some((join_rel("", dir), serde_json::from_str::<Value>(t).ok()?)))
+        .collect();
+    for (dir, _) in &parsed {
+        g.projects.push((dir.clone(), vec![]));
+    }
+    for (pi, (_, m)) in parsed.iter().enumerate() {
+        for field in ["dependencies", "devDependencies", "optionalDependencies"] {
+            for (dep, range) in m[field].as_object().into_iter().flatten() {
+                let range = range.as_str().unwrap_or("");
+                if let Some(n) = spec_to.get(&yarn_spec(dep, range)) {
+                    g.roots.push((dep.clone(), *n));
+                    g.projects[pi].1.push(*n);
+                } else if let Some(to) = parsed
+                    .iter()
+                    .position(|(_, o)| o["name"].as_str() == Some(dep.as_str()))
+                {
+                    g.project_links.push((pi, to));
+                }
+            }
+        }
+    }
+    Some(g)
+}
+
+/// The copies and edges of a `yarn.lock` (classic and berry), and which
+/// copy each `name@range` resolves to.
+fn yarn_parse(text: &str) -> Option<(Graph, HashMap<String, usize>)> {
     let mut g = Graph::default();
     let mut spec_to: HashMap<String, usize> = HashMap::new();
     let mut pending: Vec<(usize, String, String)> = vec![];
-    let norm = |name: &str, range: &str| {
-        let r = range.trim().trim_matches('"');
-        let r = r.strip_prefix("npm:").unwrap_or(r);
-        format!("{name}@{r}")
-    };
+    let norm = yarn_spec;
     let split_spec = |spec: &str| -> Option<(String, String)> {
         let s = spec.trim().trim_matches('"');
         let at = s[1..].find('@')? + 1;
@@ -1595,18 +1870,10 @@ fn yarn_graph(text: &str, direct_names: &[String]) -> Option<Graph> {
             g.edges[from].push(*to);
         }
     }
-    // The project's own dependencies: every copy of a name it lists.
-    for d in direct_names {
-        for (i, (n, _)) in g.nodes.iter().enumerate() {
-            if n == d {
-                g.roots.push((d.clone(), i));
-            }
-        }
-    }
     if g.nodes.is_empty() {
         return None;
     }
-    Some(g)
+    Some((g, spec_to))
 }
 
 /// The names a `package.json` lists as dependencies.
@@ -1966,6 +2233,144 @@ snapshots:
         let yarn = "# yarn lockfile v1\n\n\"a@^1.0.0\":\n  version \"1.0.0\"\n  dependencies:\n    x \"^1.2.0\"\n\nx@^1.2.0:\n  version \"1.2.3\"\n";
         let a = lock_ancestry("yarn.lock", yarn, "x", "1.2.3", &["a".into()]).unwrap();
         assert_eq!(a.parents.iter().cloned().collect::<Vec<_>>(), ["a"]);
+    }
+
+    // ── The workspace projects a changed package can break ─────────────
+
+    fn asked() -> Vec<(String, String)> {
+        vec![
+            ("glob-walk".to_string(), "2.3.1".to_string()),
+            ("path-match".to_string(), "3.1.2".to_string()),
+        ]
+    }
+
+    fn uses(projects: &[LockProject]) -> Vec<(&str, Vec<&str>)> {
+        projects
+            .iter()
+            .map(|p| (p.dir.as_str(), p.uses.iter().map(String::as_str).collect()))
+            .collect()
+    }
+
+    /// A site, a studio no CI job builds, a shared package the site links,
+    /// and a docs project that takes neither changed package.
+    #[test]
+    fn pnpm_workspace_projects_that_consume_a_changed_line_are_found() {
+        let lock = "lockfileVersion: '9.0'\nimporters:\n  .:\n    devDependencies:\n      turbo:\n        specifier: ^2.0.0\n        version: 2.0.1\n  apps/web:\n    dependencies:\n      '@acme/ui':\n        specifier: workspace:*\n        version: link:../../packages/ui\n      next-ish:\n        specifier: ^14.0.0\n        version: 14.1.0\n  apps/studio:\n    dependencies:\n      studio-kit:\n        specifier: ^3.0.0\n        version: 3.2.0\n  apps/docs:\n    dependencies:\n      glob-walk:\n        specifier: ^4.0.0\n        version: 4.0.1\n  packages/ui:\n    dependencies:\n      path-match:\n        specifier: ^3.1.0\n        version: 3.1.2\npackages:\n  glob-walk@2.3.1: {}\n  glob-walk@4.0.1: {}\n  path-match@3.1.2: {}\n  next-ish@14.1.0: {}\n  studio-kit@3.2.0: {}\n  studio-cli@1.0.0: {}\n  turbo@2.0.1: {}\nsnapshots:\n  glob-walk@2.3.1: {}\n  glob-walk@4.0.1: {}\n  path-match@3.1.2: {}\n  next-ish@14.1.0: {}\n  studio-kit@3.2.0:\n    dependencies:\n      studio-cli: 1.0.0\n  studio-cli@1.0.0:\n    dependencies:\n      glob-walk: 2.3.1\n  turbo@2.0.1: {}\n";
+        let projects = lock_projects("pnpm-lock.yaml", lock, &[], &asked()).unwrap();
+        assert_eq!(
+            uses(&projects),
+            vec![
+                ("", vec![]),
+                // Two levels down, through the studio's tooling.
+                ("apps/docs", vec![]),
+                ("apps/studio", vec!["glob-walk@2.3.1"]),
+                // Through the workspace package it links.
+                ("apps/web", vec!["path-match@3.1.2"]),
+                ("packages/ui", vec!["path-match@3.1.2"]),
+            ],
+            "the docs project has glob-walk on the 4 line only, which did not change"
+        );
+        let copies = lock_copies("pnpm-lock.yaml", lock).unwrap();
+        assert!(copies.contains(&("glob-walk".into(), "2.3.1".into())));
+        assert!(copies.contains(&("glob-walk".into(), "4.0.1".into())));
+    }
+
+    #[test]
+    fn npm_workspace_projects_that_consume_a_changed_line_are_found() {
+        let lock = r#"{"lockfileVersion":3,"packages":{
+            "":{"name":"site","workspaces":["apps/*","packages/*"],"devDependencies":{"turbo":"^2.0.0"}},
+            "apps/web":{"name":"web","dependencies":{"@acme/ui":"*","next-ish":"^14.0.0"}},
+            "apps/studio":{"name":"studio","dependencies":{"studio-kit":"^3.0.0"}},
+            "packages/ui":{"name":"@acme/ui","dependencies":{"path-match":"^3.1.0"}},
+            "node_modules/@acme/ui":{"resolved":"packages/ui","link":true},
+            "node_modules/web":{"resolved":"apps/web","link":true},
+            "node_modules/studio":{"resolved":"apps/studio","link":true},
+            "node_modules/turbo":{"version":"2.0.1","dev":true},
+            "node_modules/next-ish":{"version":"14.1.0"},
+            "node_modules/path-match":{"version":"3.1.2"},
+            "node_modules/studio-kit":{"version":"3.2.0","dependencies":{"glob-walk":"^2.3.0"}},
+            "node_modules/glob-walk":{"version":"4.0.1"},
+            "node_modules/studio-kit/node_modules/glob-walk":{"version":"2.3.1"}}}"#;
+        let projects = lock_projects("package-lock.json", lock, &[], &asked()).unwrap();
+        assert_eq!(
+            uses(&projects),
+            vec![
+                ("", vec![]),
+                ("apps/studio", vec!["glob-walk@2.3.1"]),
+                ("apps/web", vec!["path-match@3.1.2"]),
+                ("packages/ui", vec!["path-match@3.1.2"]),
+            ]
+        );
+        let copies = lock_copies("package-lock.json", lock).unwrap();
+        assert!(copies.contains(&("glob-walk".into(), "2.3.1".into())));
+        assert!(!copies.iter().any(|(n, _)| n == "web"), "a link is no copy");
+    }
+
+    #[test]
+    fn yarn_workspace_projects_are_read_from_their_manifests() {
+        let manifests = vec![
+            (
+                "".to_string(),
+                r#"{"name":"site","private":true,"workspaces":["apps/*","packages/*"]}"#
+                    .to_string(),
+            ),
+            (
+                "apps/web".to_string(),
+                r#"{"name":"web","dependencies":{"@acme/ui":"*","next-ish":"^14.0.0"}}"#
+                    .to_string(),
+            ),
+            (
+                "apps/studio".to_string(),
+                r#"{"name":"studio","devDependencies":{"studio-kit":"^3.0.0"}}"#.to_string(),
+            ),
+            (
+                "packages/ui".to_string(),
+                r#"{"name":"@acme/ui","dependencies":{"path-match":"^3.1.0"}}"#.to_string(),
+            ),
+        ];
+        let classic = "# yarn lockfile v1\n\nglob-walk@^2.3.0:\n  version \"2.3.1\"\n\nglob-walk@^4.0.0:\n  version \"4.0.1\"\n\nnext-ish@^14.0.0:\n  version \"14.1.0\"\n\npath-match@^3.1.0:\n  version \"3.1.2\"\n\nstudio-kit@^3.0.0:\n  version \"3.2.0\"\n  dependencies:\n    glob-walk \"^2.3.0\"\n";
+        let berry = "__metadata:\n  version: 8\n\n\"glob-walk@npm:^2.3.0\":\n  version: 2.3.1\n  resolution: \"glob-walk@npm:2.3.1\"\n\n\"next-ish@npm:^14.0.0\":\n  version: 14.1.0\n  resolution: \"next-ish@npm:14.1.0\"\n\n\"path-match@npm:^3.1.0\":\n  version: 3.1.2\n  resolution: \"path-match@npm:3.1.2\"\n\n\"studio-kit@npm:^3.0.0\":\n  version: 3.2.0\n  resolution: \"studio-kit@npm:3.2.0\"\n  dependencies:\n    glob-walk: \"npm:^2.3.0\"\n";
+        for lock in [classic, berry] {
+            let projects = lock_projects("yarn.lock", lock, &manifests, &asked()).unwrap();
+            assert_eq!(
+                uses(&projects),
+                vec![
+                    ("", vec![]),
+                    ("apps/studio", vec!["glob-walk@2.3.1"]),
+                    ("apps/web", vec!["path-match@3.1.2"]),
+                    ("packages/ui", vec!["path-match@3.1.2"]),
+                ],
+                "{lock}"
+            );
+        }
+        // Without its projects' manifests a yarn.lock names no project.
+        assert_eq!(lock_projects("yarn.lock", classic, &[], &asked()), None);
+        assert_eq!(lock_projects("Cargo.lock", "", &[], &asked()), None);
+    }
+
+    #[test]
+    fn the_copies_of_other_lockfiles_are_read_or_said_unreadable() {
+        let cargo = "version = 3\n\n[[package]]\nname = \"serde\"\nversion = \"1.0.200\"\nsource = \"registry\"\n\n[[package]]\nname = \"time\"\nversion = \"0.3.36\"\n";
+        assert_eq!(
+            lock_copies("Cargo.lock", cargo).unwrap(),
+            vec![
+                ("serde".to_string(), "1.0.200".to_string()),
+                ("time".to_string(), "0.3.36".to_string())
+            ]
+        );
+        let gems = "GEM\n  remote: https://rubygems.org/\n  specs:\n    rack (2.2.8)\n    sinatra (3.1.0)\n      rack (~> 2.2, >= 2.2.4)\n\nDEPENDENCIES\n  sinatra\n";
+        assert_eq!(
+            lock_copies("Gemfile.lock", gems).unwrap(),
+            vec![
+                ("rack".to_string(), "2.2.8".to_string()),
+                ("sinatra".to_string(), "3.1.0".to_string())
+            ]
+        );
+        assert_eq!(
+            lock_copies("go.sum", "example.com/x v1.0.0 h1:abc=\n"),
+            None
+        );
+        assert_eq!(lock_copies("pnpm-lock.yaml", "not: [a lockfile"), None);
     }
 
     // ── Tiers move with what is learned ───────────────────────────────

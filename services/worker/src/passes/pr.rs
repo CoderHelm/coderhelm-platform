@@ -646,9 +646,14 @@ Return ONLY the markdown body text."#,
         info!(pr_number = number, pr_url = %url, "Using existing PR");
         // A re-run changed the code: the description is rewritten from this
         // diff, never left describing the earlier version.
-        if let Err(e) = github
-            .update_pr_body(&msg.repo_owner, &msg.repo_name, number, &full_body)
-            .await
+        if let Err(e) = crate::passes::description::save(
+            github,
+            &msg.repo_owner,
+            &msg.repo_name,
+            number,
+            &full_body,
+        )
+        .await
         {
             warn!(pr_number = number, error = %e, "Could not update the existing PR's description");
         }
@@ -1596,7 +1601,7 @@ pub async fn put_open_items(
     }
     let out = super::completeness::assemble(&rest, &owned);
     if out != body {
-        if let Err(e) = github.update_pr_body(owner, repo, number, &out).await {
+        if let Err(e) = crate::passes::description::save(github, owner, repo, number, &out).await {
             warn!(pr_number = number, error = %e, "Could not list the open items on the PR");
         }
     }
@@ -1634,9 +1639,9 @@ pub async fn apply_checks(
     };
     let out = with_checks(&body, plan, proof, &repo);
     if out != body {
-        if let Err(e) = github
-            .update_pr_body(&msg.repo_owner, &msg.repo_name, number, &out)
-            .await
+        if let Err(e) =
+            crate::passes::description::save(github, &msg.repo_owner, &msg.repo_name, number, &out)
+                .await
         {
             warn!(pr_number = number, error = %e, "Could not add the checks' results to the PR");
         }
@@ -1807,6 +1812,9 @@ pub async fn refresh_description(
     // writer's text and put back as they are.
     let release_section = super::release_plan::current_section(&rest);
     let rest = super::release_plan::put_section(&rest, "");
+    // What the run did before and after the code is a record of checks
+    // that ran: the writer may move it, never reword or drop it.
+    let habits_section = super::habits_check::current_section(&rest);
     let shaped = super::completeness::assemble(&rest, &owned);
     let old = if requests.is_empty() {
         rest.trim().to_string()
@@ -1917,6 +1925,11 @@ Return ONLY the markdown body text, then a line `{CHANGES_MARK}` and one bullet 
     let written = split_changes(&written).0;
     // The Risk it states is at least what the diff now makes it.
     let written = super::pr_risk::enforce(&written, &risk_floor);
+    let written = if habits_section.is_empty() {
+        written
+    } else {
+        super::habits_check::shape_body(written, &habits_section)
+    };
     if !keeps_ticket_line(&old, &written) {
         warn!(
             pr_number,
@@ -1970,7 +1983,7 @@ Return ONLY the markdown body text, then a line `{CHANGES_MARK}` and one bullet 
     if body == current {
         return None;
     }
-    if let Err(e) = github.update_pr_body(owner, repo, pr_number, &body).await {
+    if let Err(e) = crate::passes::description::save(github, owner, repo, pr_number, &body).await {
         warn!(pr_number, error = %e, "Could not save the rewritten PR description");
         return None;
     }
@@ -2051,7 +2064,7 @@ async fn fill_placeholders_once(
     if fixed == body.trim() {
         return;
     }
-    match github.update_pr_body(owner, repo, pr_number, &fixed).await {
+    match crate::passes::description::save(github, owner, repo, pr_number, &fixed).await {
         Ok(()) => {
             let left = super::completeness::placeholder_holes(&fixed);
             if left.is_empty() {
@@ -2094,7 +2107,7 @@ pub async fn link_siblings(github: &GitHubClient, prs: &[(String, String, u64)])
         if new == body {
             continue;
         }
-        match github.update_pr_body(owner, name, *number, &new).await {
+        match crate::passes::description::save(github, owner, name, *number, &new).await {
             Ok(()) => info!(
                 pr_number = number,
                 "Named the run's sibling PRs and merge order"
@@ -2125,7 +2138,7 @@ pub async fn settle_unverified_by_ci(
     let Some(body) = super::proof::settle_by_ci(pr["body"].as_str().unwrap_or("")) else {
         return;
     };
-    match github.update_pr_body(owner, repo, pr_number, &body).await {
+    match crate::passes::description::save(github, owner, repo, pr_number, &body).await {
         Ok(()) => info!(
             pr_number,
             "CI passed: removed the checks it settled from the PR's Open items"

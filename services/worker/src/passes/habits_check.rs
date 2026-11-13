@@ -663,6 +663,14 @@ pub fn section(plan: &PlanResult, f: &PrFacts) -> String {
     )
 }
 
+/// The section as `body` has it, markers included; empty when it has none.
+pub fn current_section(body: &str) -> String {
+    match (body.find(START), body.find(END)) {
+        (Some(s), Some(e)) if e > s => body[s..e + END.len()].to_string(),
+        _ => String::new(),
+    }
+}
+
 /// The description with the section in place: replaced where it stands,
 /// added at the end the first time, taken out when there is none.
 pub fn shape_body(body: String, section: &str) -> String {

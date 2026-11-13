@@ -249,7 +249,7 @@ pub(crate) async fn note_on_pr(
     let out =
         super::completeness::with_section(&body, super::completeness::Section::CiNotes, section);
     if out != body {
-        if let Err(e) = github.update_pr_body(owner, repo, pr, &out).await {
+        if let Err(e) = crate::passes::description::save(github, owner, repo, pr, &out).await {
             warn!(pr, error = %e, "Flaky checks: could not note the judgement on the pull request");
         }
     }

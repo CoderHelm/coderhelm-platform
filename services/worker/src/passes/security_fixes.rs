@@ -2997,8 +2997,11 @@ async fn refresh_pr(
     )
     .await;
     let links = body_links(cx.state, item.as_ref());
-    let body = sec::pr_body_linked(unit, &pairs, &change, &check, &links);
-    if let Err(e) = cx.gh.update_pr_body(o, n, pr, &body).await {
+    // What the branch resolves now, with the fixes that joined or left.
+    let base = cx.gh.get_default_branch(o, n).await.unwrap_or_default();
+    let head = head_facts(&cx.gh, unit, &base, &unit.branch).await;
+    let body = sec::pr_body_at_head(unit, &pairs, &change, &check, &links, &head);
+    if let Err(e) = crate::passes::description::save(&cx.gh, o, n, pr, &body).await {
         warn!(repo = %unit.repo, pr, error = %e, "security: could not write the bundle's description");
     }
     if let Err(e) = cx.gh.update_pr_title(o, n, pr, &unit.title).await {
@@ -4176,7 +4179,104 @@ pub async fn pr_body(state: &WorkerState, msg: &TicketMessage, change: &str) -> 
             }
         }
     }
-    Some(sec::pr_body_linked(&unit, &pairs, change, &check, &links))
+    // The table and the headline say what the branch's lockfile resolves,
+    // never what the run planned.
+    let head = match &gh {
+        Some(gh) => head_facts(gh, &unit, &msg.base_branch, &unit.branch).await,
+        None => common::dep_head::unknown(&unit, "GitHub could not be reached to read the branch"),
+    };
+    Some(sec::pr_body_at_head(
+        &unit, &pairs, change, &check, &links, &head,
+    ))
+}
+
+/// The lockfiles whose resolved copies CoderHelm reads.
+fn is_read_lockfile(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    !path.contains("node_modules/")
+        && (common::reachability::is_lockfile(path)
+            || matches!(
+                name,
+                "Cargo.lock" | "poetry.lock" | "uv.lock" | "Gemfile.lock"
+            ))
+}
+
+/// What the head of a unit's branch resolves for each of its bumps: the
+/// lockfiles its bumps go through, read on the base branch and on the head
+/// and compared (`common::dep_head`). Whatever can't be read is said as not
+/// known, with why.
+pub(crate) async fn head_facts(
+    gh: &GitHubClient,
+    unit: &FixUnit,
+    base: &str,
+    head: &str,
+) -> common::dep_head::HeadFacts {
+    use common::dep_head::{self, LockAt};
+    let Some((o, n)) = unit.repo.split_once('/') else {
+        return dep_head::unknown(unit, "the repository is not known");
+    };
+    if head.is_empty() {
+        return dep_head::unknown(unit, "the pull request's branch is not known");
+    }
+    let tree = match gh.get_tree(o, n, head).await {
+        Ok(t) => t,
+        Err(e) => {
+            warn!(repo = %unit.repo, error = %e, "security: could not list the head's files");
+            return dep_head::unknown(unit, "the files on the head could not be listed");
+        }
+    };
+    let lockfiles: Vec<String> = tree
+        .into_iter()
+        .map(|t| t.path)
+        .filter(|p| is_read_lockfile(p))
+        .collect();
+    let mut wanted: Vec<String> = vec![];
+    for b in &unit.bumps {
+        let lock =
+            common::dep_fix::lockfile_for(&b.manifest, &lockfiles).or_else(|| {
+                match lockfiles.as_slice() {
+                    [one] => Some(one.clone()),
+                    _ => None,
+                }
+            });
+        if let Some(l) = lock {
+            if !wanted.contains(&l) {
+                wanted.push(l);
+            }
+        }
+    }
+    let mut locks = vec![];
+    for path in wanted {
+        let mut at = LockAt {
+            path: path.clone(),
+            ..Default::default()
+        };
+        for (side, git_ref) in [("the base branch", base), ("the head", head)] {
+            let copies = match gh.read_file_if_exists(o, n, &path, git_ref).await {
+                // Not there: nothing is installed through it on that side.
+                Ok(None) => Some(vec![]),
+                Ok(Some(text)) => {
+                    let c = common::reachability::lock_copies(&path, &text);
+                    if c.is_none() {
+                        at.why = format!("`{path}` on {side} could not be read as a lockfile");
+                    }
+                    c
+                }
+                Err(e) => {
+                    at.why = format!("`{path}` could not be read on {side} ({e})");
+                    None
+                }
+            };
+            if side == "the head" {
+                at.head = copies;
+            } else {
+                at.base = copies;
+            }
+        }
+        locks.push(at);
+    }
+    let sha = gh.get_ref(o, n, head).await.unwrap_or_default();
+    dep_head::resolve(unit, &sha, &locks)
 }
 
 /// Where a security description points for what it leaves out: each
@@ -4363,39 +4463,90 @@ async fn what_to_check(
 }
 
 /// A security pull request whose CI just ended (passed or failed): its
-/// "What to check" and Proof say so, in place; the rest of the description
-/// (the draft status at its top) stays.
+/// description is rebuilt from its head.
 async fn refresh_ci_sections(cx: &Ctx<'_>, repo: &str, number: u64, ticket: &str) {
-    let Some(unit) = load_unit(cx.state, cx.team_id, ticket).await else {
+    rebuild_at_head(cx.state, &cx.gh, cx.team_id, repo, number, ticket).await;
+}
+
+/// The sections of a security pull request's description CoderHelm
+/// computes, written again from the head: the first sentences and the
+/// table (what the lockfile on the head resolves, compared with the base
+/// branch), "What to check" and Proof (where CI stands on this head). The
+/// rest of the description (the draft status at its top, the run's words)
+/// stays. Running it twice on one head writes nothing the second time.
+pub(crate) async fn rebuild_at_head(
+    state: &WorkerState,
+    gh: &GitHubClient,
+    team_id: &str,
+    repo: &str,
+    number: u64,
+    ticket: &str,
+) {
+    let Some(unit) = load_unit(state, team_id, ticket).await else {
         return;
     };
+    if unit.ecosystem == common::infra_vuln::records::UNIT_ECOSYSTEM {
+        return;
+    }
     let Some((o, n)) = repo.split_once('/') else {
         return;
     };
-    let Ok(pr) = cx.gh.get_pull_request(o, n, number).await else {
+    let Ok(pr) = gh.get_pull_request(o, n, number).await else {
         return;
     };
     let body = pr["body"].as_str().unwrap_or("");
     if !body.contains(sec::MARKER) {
         return;
     }
-    let item = ticket_item(cx.state, cx.team_id, ticket).await;
+    let item = ticket_item(state, team_id, ticket).await;
     let change = item.as_ref().map(|i| s(i, "change")).unwrap_or_default();
     let notes = item.as_ref().map(|i| s(i, "notes")).unwrap_or_default();
-    let members = unit_findings(cx.state, cx.team_id, &unit).await;
+    let members = unit_findings(state, team_id, &unit).await;
     let pairs: Vec<(&Finding, &FindingState)> = members.iter().map(|(f, st)| (f, st)).collect();
-    let check = what_to_check(&cx.gh, &unit, &notes, Some(number)).await;
+    let mut check = what_to_check(gh, &unit, &notes, Some(number)).await;
+    check.dep_report = item
+        .as_ref()
+        .map(|i| s(i, "dep_report"))
+        .unwrap_or_default();
     // The same links as when it opened: the rewritten sections are the
     // short ones a bundle's description carries.
-    let links = body_links(cx.state, item.as_ref());
-    let fresh = sec::pr_body_linked(&unit, &pairs, &change, &check, &links);
-    let next =
-        common::upgrade_notes::replace_sections(body, &fresh, &["## What to check", "## Proof"]);
+    let links = body_links(state, item.as_ref());
+    let head = head_facts(
+        gh,
+        &unit,
+        pr["base"]["ref"].as_str().unwrap_or(""),
+        pr["head"]["sha"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&unit.branch),
+    )
+    .await;
+    let fresh = sec::pr_body_at_head(&unit, &pairs, &change, &check, &links, &head);
+    let next = rebuilt_body(body, &fresh);
     if next != body {
-        if let Err(e) = cx.gh.update_pr_body(o, n, number, &next).await {
-            warn!(%repo, number, error = %e, "security: could not write the CI result into the description");
+        if let Err(e) = crate::passes::description::save(gh, o, n, number, &next).await {
+            warn!(%repo, number, error = %e, "security: could not rebuild the description from the head");
         }
     }
+}
+
+/// `body` with the sections computed from the head taken from `fresh`.
+/// Every section CoderHelm owns elsewhere (the draft status, review fixes,
+/// the settled items, CI notes, the reviewer guide, open items and the
+/// rest of `completeness::Section`) is lifted out first and put back as it
+/// was, so a rebuild can never overwrite one that sits under a rebuilt
+/// heading. A body the rebuild does not change is returned as it is.
+pub(crate) fn rebuilt_body(body: &str, fresh: &str) -> String {
+    let (owned, rest) = super::completeness::take_owned(body);
+    let next = common::upgrade_notes::replace_sections(
+        &rest,
+        fresh,
+        &["## Summary", "## What to check", "## Proof"],
+    );
+    if next == rest {
+        return body.to_string();
+    }
+    super::completeness::assemble(&next, &owned)
 }
 
 /// A security run opened its pull request: labels, the findings, the card.

@@ -862,7 +862,7 @@ pub async fn refresh_pr(github: &GitHubClient, owner: &str, repo: &str, pr: u64,
     );
     let updated = outside_work::with_not_done_top(&super::completeness::assemble(&rest, &owned), c);
     if updated != body {
-        if let Err(e) = github.update_pr_body(owner, repo, pr, &updated).await {
+        if let Err(e) = crate::passes::description::save(github, owner, repo, pr, &updated).await {
             warn!(pr, error = %e, "Could not update the PR's outside steps");
         }
     }
