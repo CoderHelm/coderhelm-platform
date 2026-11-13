@@ -1858,6 +1858,11 @@ async fn handle_pull_request(
         return send_review_job(state, message, head, 0).await;
     }
 
+    // The scorecard: one of CoderHelm's pull requests opened or reopened.
+    if action == "opened" || action == "reopened" {
+        super::scorecard::on_pull_request(state, team_id, payload, action, None).await;
+    }
+
     if action == "labeled"
         || action == "synchronize"
         || action == "opened"
@@ -1928,7 +1933,7 @@ async fn handle_pull_request(
     // A merged revert of one of CoderHelm's pull requests (any author) is a
     // strong signal against that change.
     if merged {
-        record_revert(state, payload, team_id).await;
+        record_revert(state, payload, team_id, installation_id).await;
     }
 
     // Only track our PRs
@@ -1952,6 +1957,36 @@ async fn handle_pull_request(
     if pr_number == 0 {
         return Ok(StatusCode::OK);
     }
+
+    // The repository's guide pull request (lessons CoderHelm proposed for
+    // the guide file): the worker settles its lessons. It is not code work,
+    // so it is neither scored nor counted on the scorecard.
+    if common::guide::is_guide_branch(
+        payload["pull_request"]["head"]["ref"]
+            .as_str()
+            .unwrap_or(""),
+    ) {
+        super::scorecard::queue_guide_closed(
+            state,
+            team_id,
+            installation_id,
+            owner,
+            name,
+            pr_number,
+        )
+        .await;
+        return Ok(StatusCode::OK);
+    }
+
+    // Commits people pushed on top of CoderHelm's: none means it merged as
+    // CoderHelm wrote it. Counted once here, for the scorecard and the run.
+    let merged_human_commits = if merged {
+        count_human_commits(state, installation_id, owner, name, pr_number).await
+    } else {
+        None
+    };
+    super::scorecard::on_pull_request(state, team_id, payload, "closed", merged_human_commits)
+        .await;
 
     // The run that opened this PR: its own PR, or one of a multi-repo run's.
     let found = lookup_run_item_by_pr(state, team_id, owner, name, pr_number).await;
@@ -2064,10 +2099,7 @@ async fn handle_pull_request(
         } else if !run_id.is_empty() {
             let now = chrono::Utc::now().to_rfc3339();
             let pr = &payload["pull_request"];
-            // Commits people pushed on top of Coderhelm's: none means it
-            // merged as Coderhelm wrote it.
-            let human_commits =
-                count_human_commits(state, installation_id, owner, name, pr_number).await;
+            let human_commits = merged_human_commits;
             let run_status = item
                 .get("status")
                 .and_then(|v| v.as_s().ok())
@@ -2222,7 +2254,7 @@ async fn queue_reward_outcome(
         repo_owner: owner.to_string(),
         repo_name: name.to_string(),
         pr_number,
-        review_only: false,
+        ..Default::default()
     });
     if let Err(e) = send_to_queue(state, &state.config.ticket_queue_url, &msg).await {
         warn!(team_id, run_id, pr_number, status = ?e, "Could not queue the PR's reward outcome");
@@ -2251,6 +2283,7 @@ async fn queue_review_outcome(
         repo_name: name.to_string(),
         pr_number,
         review_only: true,
+        ..Default::default()
     });
     match send_to_queue(state, &state.config.ticket_queue_url, &msg).await {
         Ok(_) => info!(
@@ -2386,7 +2419,7 @@ pub(crate) async fn record_rereview(
 
 /// When a merged pull request is GitHub's revert of one of CoderHelm's,
 /// records that change as reverted.
-async fn record_revert(state: &AppState, payload: &Value, team_id: &str) {
+async fn record_revert(state: &AppState, payload: &Value, team_id: &str, installation_id: u64) {
     let pr = &payload["pull_request"];
     let repo = &payload["repository"];
     let owner = repo["owner"]["login"].as_str().unwrap_or("");
@@ -2428,7 +2461,7 @@ async fn record_revert(state: &AppState, payload: &Value, team_id: &str) {
         pr["number"].as_u64().unwrap_or(0)
     ))
     .with_source("webhook:pull_request");
-    ev.run_id = run_id;
+    ev.run_id = run_id.clone();
     // The area and the coder arm the reverted run's own outcome was scored
     // under: the revert counts for the area's lesson and against that arm.
     ev.area = run_s("reward_area");
@@ -2436,14 +2469,106 @@ async fn record_revert(state: &AppState, payload: &Value, team_id: &str) {
         ev.variant = run_s("prompt_variant");
     }
     ev.prompt_version = common::rewards::bandit::CODER_PROMPT_VERSION.to_string();
+    // Why, in the words of whoever reverted it (the revert's description
+    // without the lines GitHub writes itself); else the revert's title.
+    let reason = common::scorecard::revert_reason(pr["body"].as_str().unwrap_or(""));
     let title = pr["title"].as_str().unwrap_or("").trim().to_string();
-    if !title.is_empty() {
+    if !reason.is_empty() {
+        ev.notes = vec![reason.clone()];
+    } else if !title.is_empty() {
         ev.notes = vec![common::truncate_str(&title, 200).to_string()];
     }
-    if let Err(e) = reward_store(state).record(&ev).await {
-        warn!(error = %e, "Could not record the revert");
-    } else {
-        info!(team_id, repo = %full, pr = target, "A CoderHelm change was reverted");
+    let reverted = super::scorecard::Reverted {
+        owner: owner.to_string(),
+        name: name.to_string(),
+        pr: target,
+        at,
+        by: format!("#{}", pr["number"].as_u64().unwrap_or(0)),
+        reason,
+    };
+    note_reverted(state, team_id, installation_id, &run_id, &ev, &reverted).await;
+}
+
+/// Records one of CoderHelm's merged changes as reverted: the reward event
+/// (once per reverted pull request), the scorecard, and the lesson.
+async fn note_reverted(
+    state: &AppState,
+    team_id: &str,
+    installation_id: u64,
+    run_id: &str,
+    ev: &common::rewards::RewardEvent,
+    reverted: &super::scorecard::Reverted,
+) {
+    super::scorecard::on_revert_pr(state, team_id, reverted).await;
+    match reward_store(state).record(ev).await {
+        Err(e) => warn!(error = %e, "Could not record the revert"),
+        // A redelivery, or the revert pull request and its merge commit
+        // both naming it: learned from once.
+        Ok(false) => {}
+        Ok(true) => {
+            info!(
+                team_id,
+                repo = %format!("{}/{}", reverted.owner, reverted.name),
+                pr = reverted.pr,
+                by = %reverted.by,
+                "A CoderHelm change was reverted"
+            );
+            super::scorecard::queue_revert_lesson(
+                state,
+                team_id,
+                installation_id,
+                run_id,
+                reverted,
+            )
+            .await;
+        }
+    }
+}
+
+/// A push with commits that revert the merge commit of CoderHelm's pull
+/// requests (`git revert`, pushed or merged without GitHub's revert
+/// button): each is recorded as reverted, with the reason in the message.
+async fn record_revert_commits(
+    state: &AppState,
+    team_id: &str,
+    installation_id: u64,
+    reverted: &[super::scorecard::Reverted],
+) {
+    for r in reverted {
+        let Some(run) = lookup_run_item_by_pr(state, team_id, &r.owner, &r.name, r.pr).await else {
+            continue;
+        };
+        let Some(run_id) = common::paged::run_id_of(&run) else {
+            continue;
+        };
+        let run_s = |k: &str| {
+            run.get(k)
+                .and_then(|v| v.as_s().ok())
+                .cloned()
+                .unwrap_or_default()
+        };
+        let full = format!("{}/{}", r.owner, r.name);
+        let mut ev = common::rewards::RewardEvent::new(
+            team_id,
+            common::rewards::RewardKind::PrReverted,
+            common::rewards::event::AGENT_CODER,
+            &r.at,
+            // The same signal as GitHub's revert pull request for it.
+            &format!("reverted#{full}#{}", r.pr),
+        )
+        .with_repo(&full, r.pr)
+        .with_detail(&format!("PR #{} was reverted by {}", r.pr, r.by))
+        .with_source("webhook:push");
+        ev.run_id = run_id.clone();
+        ev.area = run_s("reward_area");
+        if bandit_arm_ok(&run_s("prompt_variant")) {
+            ev.variant = run_s("prompt_variant");
+        }
+        ev.prompt_version = common::rewards::bandit::CODER_PROMPT_VERSION.to_string();
+        if !r.reason.is_empty() {
+            ev.notes = vec![r.reason.clone()];
+        }
+        note_reverted(state, team_id, installation_id, &run_id, &ev, r).await;
     }
 }
 
@@ -2543,6 +2668,10 @@ async fn handle_pr_review(
     if reviewer.contains("coderhelm") {
         return Ok(StatusCode::OK);
     }
+
+    // The scorecard: a person's review of one of CoderHelm's pull requests
+    // (a request for changes is a review round, an approval ends them).
+    super::scorecard::on_review(state, team_id, payload).await;
 
     // A person's request for changes (or a comment) can withdraw the person
     // key: wake a gate already armed on this head so it re-reads the reviews.
@@ -3935,6 +4064,10 @@ async fn handle_push(
         )
         .await;
     }
+    // The scorecard: a person's commits on the branch of one of CoderHelm's
+    // open pull requests, and commits that revert one of its merged ones.
+    let reverted = super::scorecard::on_push(state, team_id, payload).await;
+    record_revert_commits(state, team_id, installation_id, &reverted).await;
     // Only the branch the graph tracks.
     if git_ref != format!("refs/heads/{default_branch}") {
         return Ok(StatusCode::OK);
@@ -4076,6 +4209,22 @@ async fn handle_review_trigger(
 
     let cfg = load_review_config(state, team_id, owner, name).await?;
     if !cfg.enabled || cfg.killed {
+        return Ok(StatusCode::OK);
+    }
+
+    // The repository's guide pull request (lessons CoderHelm proposed for
+    // the guide file) is for the team to review: CoderHelm queues no review
+    // of its own lessons, labelled or not.
+    if pr["user"]["login"]
+        .as_str()
+        .unwrap_or("")
+        .contains("coderhelm")
+        && common::guide::is_guide_branch(pr["head"]["ref"].as_str().unwrap_or(""))
+    {
+        info!(
+            owner,
+            name, pr_number, "Reviewer skipped — a guide pull request is the team's to review"
+        );
         return Ok(StatusCode::OK);
     }
 

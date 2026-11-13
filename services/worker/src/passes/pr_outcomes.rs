@@ -430,7 +430,7 @@ fn missed_outcome(p: &Pending, owner: &str, repo: &str, number: u64) -> RewardOu
         repo_owner: owner.to_string(),
         repo_name: repo.to_string(),
         pr_number: number,
-        review_only: false,
+        ..Default::default()
     }
 }
 

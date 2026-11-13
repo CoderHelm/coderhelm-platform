@@ -93,6 +93,8 @@ pub use common::rewards::lessons::is_coder_setback;
 
 /// Most of people's commits read for what they changed.
 const MAX_EDIT_COMMITS: usize = 20;
+/// Most of them whose patches are read for the lesson.
+const MAX_PATCH_COMMITS: usize = 5;
 
 /// What people changed on top of CoderHelm's work: their own non-merge
 /// commits, each measured by its own stats. `None` when GitHub couldn't say
@@ -111,7 +113,8 @@ async fn people_edits(
     let mut read = 0usize;
     let mut touched: BTreeMap<String, usize> = BTreeMap::new();
     let mut subjects = Vec::new();
-    for c in mine.iter().take(MAX_EDIT_COMMITS) {
+    let mut patches: Vec<(String, String)> = Vec::new();
+    for (i, c) in mine.iter().take(MAX_EDIT_COMMITS).enumerate() {
         let Some(sha) = c["sha"].as_str() else {
             continue;
         };
@@ -120,6 +123,16 @@ async fn people_edits(
             lines += n;
             for f in files {
                 *touched.entry(f).or_default() += 1;
+            }
+        }
+        // What they changed, for the lesson: their first few commits' own
+        // patches (a later one overrides an earlier one on the same file).
+        if i < MAX_PATCH_COMMITS {
+            if let Ok(files) = github.commit_changes(owner, name, sha).await {
+                for f in files {
+                    patches.retain(|(p, _)| p != &f.path);
+                    patches.push((f.path, f.patch));
+                }
             }
         }
         let subject = common::pr_outcome::commit_subject(c);
@@ -137,6 +150,7 @@ async fn people_edits(
         lines,
         files: files.into_iter().map(|(f, _)| f).collect(),
         subjects,
+        diff: mapping::diff_excerpts(&patches),
     })
 }
 
@@ -237,6 +251,21 @@ pub async fn score_outcome(state: &WorkerState, msg: RewardOutcomeMessage) -> Re
         &state.http,
     )
     .map_err(|e| e.to_string())?;
+    match msg.trigger.as_str() {
+        common::rewards::TRIGGER_REVERTED => return learn_from_revert(state, &github, &msg).await,
+        common::rewards::TRIGGER_GUIDE_CLOSED => {
+            return super::guide_pr::closed(
+                state,
+                &github,
+                &msg.team_id,
+                &msg.repo_owner,
+                &msg.repo_name,
+                msg.pr_number,
+            )
+            .await
+        }
+        _ => {}
+    }
     let pr = github
         .get_pull_request(&msg.repo_owner, &msg.repo_name, msg.pr_number)
         .await
@@ -246,6 +275,9 @@ pub async fn score_outcome(state: &WorkerState, msg: RewardOutcomeMessage) -> Re
     let coder = !msg.review_only && !msg.run_id.is_empty();
     let mut events = Vec::new();
     let mut area = String::new();
+    let mut paths_touched: Vec<String> = Vec::new();
+    let mut people: Option<mapping::PeopleEdits> = None;
+    let mut run_close_reason = String::new();
     if coder {
         let run = load_run(state, &msg.team_id, &msg.run_id)
             .await
@@ -276,6 +308,25 @@ pub async fn score_outcome(state: &WorkerState, msg: RewardOutcomeMessage) -> Re
             vec![]
         };
         area = main_area(&paths);
+        // The scorecard counts the close here too: the webhook counted it
+        // already (then this changes nothing), or it was missed and this
+        // is the reconcile sweep's message.
+        if !closed_at.is_empty()
+            && (common::scorecard::counts(&pr, github.bot_login().await.as_deref())
+                || common::scorecard::counts(&pr, None))
+        {
+            if let Some(e) = common::scorecard::pr_event("closed", &pr, human) {
+                let sc = common::scorecard::Dynamo::new(
+                    &state.dynamo,
+                    &state.config.settings_table_name,
+                );
+                if let Err(err) =
+                    common::scorecard::record(&sc, &msg.team_id, &repo, msg.pr_number, &e).await
+                {
+                    warn!(error = %err, "Could not count the pull request on the scorecard");
+                }
+            }
+        }
         let ctx = RunContext {
             team_id: msg.team_id.clone(),
             run_id: msg.run_id.clone(),
@@ -298,6 +349,9 @@ pub async fn score_outcome(state: &WorkerState, msg: RewardOutcomeMessage) -> Re
             edits.as_ref(),
             ci_of(&run),
         ));
+        run_close_reason = ctx.close_reason.clone();
+        paths_touched = paths;
+        people = edits;
     }
 
     // What became of each of CoderHelm's review comments, notes (Nit,
@@ -382,6 +436,152 @@ pub async fn score_outcome(state: &WorkerState, msg: RewardOutcomeMessage) -> Re
     if events.iter().any(is_coder_setback) {
         learn_from_setbacks(state, &msg.team_id, &repo, &area).await;
     }
+
+    // What people did with this pull request, in their own words and code:
+    // one lesson at most, and what its reviewers asked for.
+    let source = if !merged {
+        lessons::SOURCE_CLOSED
+    } else if people.as_ref().is_some_and(|p| p.commits > 0) {
+        lessons::SOURCE_EDITED
+    } else {
+        ""
+    };
+    let mut words: Vec<String> = Vec::new();
+    if merged {
+        if let Some(p) = &people {
+            words.extend(p.subjects.iter().take(mapping::MAX_EDIT_NOTES).cloned());
+        }
+    } else {
+        if !run_close_reason.trim().is_empty() {
+            words.push(run_close_reason.trim().to_string());
+        }
+        if let Ok(comments) = github
+            .list_issue_comments(&msg.repo_owner, &msg.repo_name, msg.pr_number)
+            .await
+        {
+            words.extend(super::outcome_learning::closing_comment(
+                &comments, &closed_at,
+            ));
+        }
+    }
+    let reviews = github
+        .list_pr_reviews(&msg.repo_owner, &msg.repo_name, msg.pr_number)
+        .await
+        .ok()
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default();
+    let review_comments = github
+        .get_review_comments(&msg.repo_owner, &msg.repo_name, msg.pr_number)
+        .await
+        .unwrap_or_default();
+    let outcome = super::outcome_learning::Outcome {
+        repo: repo.clone(),
+        pr: msg.pr_number,
+        run_id: msg.run_id.clone(),
+        source: source.to_string(),
+        title: pr["title"].as_str().unwrap_or("").to_string(),
+        summary: pr["body"].as_str().unwrap_or("").to_string(),
+        files: people
+            .as_ref()
+            .map(|p| {
+                p.files
+                    .iter()
+                    .take(mapping::MAX_EDIT_FILES)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default(),
+        words,
+        diff: people.map(|p| p.diff).unwrap_or_default(),
+        reviews: super::outcome_learning::reviews_from(&reviews, &review_comments),
+    };
+    let areas: std::collections::BTreeSet<String> = paths_touched
+        .iter()
+        .map(|p| rev::file_area(p))
+        .filter(|a| !a.is_empty())
+        .collect();
+    learn_from_outcome(state, &github, &msg, &outcome, &areas).await;
+    Ok(())
+}
+
+/// Distils one outcome with the team's model (`outcome_learning`), then
+/// proposes the repository's guide pull request when a lesson reached the
+/// confidence for it. Best effort.
+async fn learn_from_outcome(
+    state: &WorkerState,
+    github: &GitHubClient,
+    msg: &RewardOutcomeMessage,
+    outcome: &super::outcome_learning::Outcome,
+    areas: &std::collections::BTreeSet<String>,
+) {
+    if !outcome.teaches() && outcome.reviews.is_empty() {
+        return;
+    }
+    let provider = match crate::agent::provider::ModelProvider::load_for_team(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        &msg.team_id,
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(error = %e, "No model to learn from the outcome with");
+            return;
+        }
+    };
+    let mut usage = crate::models::TokenUsage::default();
+    let kept = {
+        let mut model = super::review_lessons::TeamModel {
+            state,
+            provider: &provider,
+            usage: &mut usage,
+        };
+        super::outcome_learning::learn(state, &mut model, &msg.team_id, outcome, areas).await
+    };
+    if kept.lesson.is_some() {
+        super::guide_pr::maybe_propose(
+            state,
+            github,
+            &msg.team_id,
+            &msg.repo_owner,
+            &msg.repo_name,
+        )
+        .await;
+    }
+}
+
+/// A merged CoderHelm change was reverted (the gateway recorded the event):
+/// the area's lesson is written again with it, and the reason people gave
+/// is distilled into a lesson of its own.
+async fn learn_from_revert(
+    state: &WorkerState,
+    github: &GitHubClient,
+    msg: &RewardOutcomeMessage,
+) -> Result<(), String> {
+    let repo = format!("{}/{}", msg.repo_owner, msg.repo_name);
+    let run = load_run(state, &msg.team_id, &msg.run_id)
+        .await
+        .unwrap_or_default();
+    learn_from_setbacks(state, &msg.team_id, &repo, &gs(&run, "reward_area")).await;
+    let pr = github
+        .get_pull_request(&msg.repo_owner, &msg.repo_name, msg.pr_number)
+        .await
+        .map_err(|e| e.to_string())?;
+    let outcome = super::outcome_learning::Outcome {
+        repo,
+        pr: msg.pr_number,
+        run_id: msg.run_id.clone(),
+        source: lessons::SOURCE_REVERTED.to_string(),
+        title: pr["title"].as_str().unwrap_or("").to_string(),
+        summary: pr["body"].as_str().unwrap_or("").to_string(),
+        words: Some(msg.note.trim().to_string())
+            .filter(|n| !n.is_empty())
+            .into_iter()
+            .collect(),
+        ..Default::default()
+    };
+    learn_from_outcome(state, github, msg, &outcome, &Default::default()).await;
     Ok(())
 }
 
@@ -795,7 +995,12 @@ pub async fn coder_learning(
     let examples = examples_block(state, team_id, repo, exemplars::KIND_FIX, &[], query, &by).await;
     let kept = st.lessons(team_id, Some(repo)).await.unwrap_or_default();
     let recalled = lessons::recall(&kept, rev::AGENT_CODER, chrono::Utc::now());
-    let lesson_block = lessons::prompt_block(&recalled);
+    // What the likely reviewers of this repository's changes ask for (the
+    // files are not chosen yet, so: its code owners and whoever reviewed
+    // here recently).
+    let reviewer_block =
+        reviewer_asks(state, team_id, repo, gu(&run, "installation_id"), &[]).await;
+    let lesson_block = format!("{}{reviewer_block}", lessons::prompt_block(&recalled));
     info!(
         team_id,
         repo,
@@ -803,12 +1008,46 @@ pub async fn coder_learning(
         arm = %arm,
         lessons = recalled.len(),
         examples = !examples.is_empty(),
+        reviewer_asks = !reviewer_block.is_empty(),
         "Coder learning loaded"
     );
     CoderLearning {
         implement: implement_block(addendum, &lesson_block),
         context: format!("{examples}{lesson_block}"),
     }
+}
+
+/// What the likely reviewers of a change to `paths` in `repo` repeatedly
+/// ask for, as a prompt block (`common::reviewer_prefs`); empty when
+/// nothing is kept for them. With no paths (the build has not chosen files)
+/// the likely reviewers are the repository's catch-all code owners and its
+/// recent reviewers. Reads CODEOWNERS only when the team has asks kept.
+pub async fn reviewer_asks(
+    state: &WorkerState,
+    team_id: &str,
+    repo: &str,
+    installation_id: u64,
+    paths: &[String],
+) -> String {
+    let store =
+        common::reviewer_prefs::Store::new(&state.dynamo, &state.config.settings_table_name);
+    if !matches!(store.prefs(team_id, None).await, Ok(p) if !p.is_empty()) {
+        return String::new();
+    }
+    let codeowners = match (repo.split_once('/'), installation_id) {
+        (Some((owner, name)), id) if id > 0 => match GitHubClient::new(
+            &state.secrets.github_app_id,
+            &state.secrets.github_private_key,
+            id,
+            &state.http,
+        ) {
+            Ok(github) => super::outcome_learning::read_codeowners(&github, owner, name).await,
+            Err(_) => None,
+        },
+        _ => None,
+    };
+    super::outcome_learning::reviewer_block(state, team_id, repo, codeowners.as_deref(), paths)
+        .await
 }
 
 /// Notes the coder arm on the run, only when none is noted yet. True when

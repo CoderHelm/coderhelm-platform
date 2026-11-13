@@ -422,9 +422,394 @@ pub async fn put_weights(
     Ok(Json(json!({"weights": w.effective()})))
 }
 
+// ── The scorecard, outcome lessons and reviewer asks ──────────────────
+
+#[derive(Deserialize)]
+pub struct ScorecardQuery {
+    months: Option<u32>,
+    repo: Option<String>,
+}
+
+/// The window in months; 0 is all time.
+pub fn months_of(raw: Option<u32>) -> u32 {
+    raw.unwrap_or(3).min(24)
+}
+
+/// GET /api/learning/scorecard — what became of the pull requests
+/// CoderHelm opened, per team and per repository, from the counters the
+/// webhooks keep (`common::scorecard`). `months=0` is all time.
+pub async fn get_scorecard(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Query(q): Query<ScorecardQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    use common::scorecard::{self, Store as _};
+    let repo = repo_filter(q.repo.as_deref())?;
+    let months = months_of(q.months);
+    let store = scorecard::Dynamo::new(&state.dynamo, &state.config.settings_table_name);
+    let items = store
+        .counters(&claims.team_id, scorecard::AGG_PREFIX)
+        .await
+        .map_err(internal)?;
+    Ok(Json(scorecard::view(
+        &items,
+        months,
+        &repo,
+        chrono::Utc::now(),
+    )))
+}
+
+/// Pure: the coder's lessons as the Learning page lists them, heaviest
+/// first: the rule, how to check it, the evidence behind it, and where it
+/// stands (recalled into runs, in the guide file, declined, turned off).
+pub fn lessons_view(
+    lessons: &[common::rewards::lessons::Lesson],
+    guides: &[common::guide::Record],
+    repo: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Value {
+    use common::rewards::lessons as l;
+    let mut rows: Vec<(f64, Value)> = lessons
+        .iter()
+        .filter(|x| x.agent == common::rewards::event::AGENT_CODER)
+        .filter(|x| repo.is_empty() || x.repo == repo)
+        .map(|x| {
+            let weight = l::weight_of(x, now);
+            let status = if x.reverted {
+                "off"
+            } else if x.in_guide {
+                "in_guide"
+            } else if weight < l::MIN_WEIGHT {
+                if x.contradicted > 0 {
+                    "contradicted"
+                } else {
+                    "faded"
+                }
+            } else {
+                "recalled"
+            };
+            (
+                weight,
+                json!({
+                    "id": x.id,
+                    "repo": x.repo,
+                    "text": x.text,
+                    "check": x.check,
+                    "applies_to": x.applies_to,
+                    "source": x.source,
+                    "seen": x.seen,
+                    "contradicted": x.contradicted,
+                    "prs": x.prs,
+                    "evidence": x.evidence,
+                    "created_at": x.created_at,
+                    "last_seen_at": x.last_seen_at,
+                    "status": status,
+                    "guide_declined": x.guide_declined,
+                    "guide_ready": l::guide_ready(x, now),
+                }),
+            )
+        })
+        .collect();
+    rows.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    let guides: Vec<Value> = guides
+        .iter()
+        .filter(|g| repo.is_empty() || g.repo == repo)
+        .filter(|g| g.pr > 0)
+        .map(|g| {
+            json!({
+                "repo": g.repo,
+                "pr": g.pr,
+                "url": format!("https://github.com/{}/pull/{}", g.repo, g.pr),
+                "state": g.state,
+                "path": g.path,
+                "lessons": g.lesson_ids.len(),
+                "at": g.at,
+            })
+        })
+        .collect();
+    json!({
+        "lessons": rows.into_iter().map(|(_, v)| v).collect::<Vec<_>>(),
+        "guide_prs": guides,
+        "guide_min_seen": l::GUIDE_MIN_SEEN,
+    })
+}
+
+/// GET /api/learning/lessons — the coder's lessons with their evidence,
+/// and each repository's guide pull request.
+pub async fn get_outcome_lessons(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Query(q): Query<LearningQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    let repo = repo_filter(q.repo.as_deref())?;
+    let st = store(&state);
+    let team = claims.team_id.as_str();
+    let lessons = st
+        .lessons(team, (!repo.is_empty()).then_some(repo.as_str()))
+        .await
+        .map_err(internal)?;
+    let guides: Vec<common::guide::Record> = st
+        .query_prefix(team, common::guide::RECORD_PREFIX, None)
+        .await
+        .map_err(internal)?
+        .iter()
+        .filter_map(common::guide::Record::from_item)
+        .collect();
+    Ok(Json(lessons_view(
+        &lessons,
+        &guides,
+        &repo,
+        chrono::Utc::now(),
+    )))
+}
+
+/// GET /api/learning/reviewers — what each reviewer repeatedly asks for on
+/// CoderHelm's pull requests (`common::reviewer_prefs`): the ask, its
+/// category and the pull requests it was seen on. Nothing else is kept.
+pub async fn get_reviewer_asks(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<Value>, StatusCode> {
+    let prefs =
+        common::reviewer_prefs::Store::new(&state.dynamo, &state.config.settings_table_name)
+            .prefs(&claims.team_id, None)
+            .await
+            .map_err(internal)?;
+    let mut v = common::reviewer_prefs::view(&prefs, chrono::Utc::now());
+    v["can_manage"] = json!(claims.holder().holds("learning"));
+    Ok(Json(v))
+}
+
+#[derive(Deserialize)]
+pub struct ForgetBody {
+    login: String,
+    /// One ask; without it, everything kept about the reviewer.
+    id: Option<String>,
+}
+
+/// What a forget request names: a plain login, and optionally one ask's id.
+pub fn check_forget(login: &str, id: Option<&str>) -> Result<String, StatusCode> {
+    let login = common::reviewer_prefs::login_key(login).ok_or(StatusCode::BAD_REQUEST)?;
+    match id {
+        Some(i) if !valid_change_id(i) => Err(StatusCode::BAD_REQUEST),
+        _ => Ok(login),
+    }
+}
+
+/// POST /api/learning/reviewers/forget — forget one ask, or everything
+/// kept about a reviewer.
+pub async fn forget_reviewer(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<ForgetBody>,
+) -> Result<Json<Value>, StatusCode> {
+    claims.require_role(3)?;
+    let login = check_forget(&body.login, body.id.as_deref())?;
+    let st = common::reviewer_prefs::Store::new(&state.dynamo, &state.config.settings_table_name);
+    let forgotten = match body.id.as_deref() {
+        Some(id) => {
+            st.forget_ask(&claims.team_id, &login, id)
+                .await
+                .map_err(internal)?;
+            1
+        }
+        None => st.forget(&claims.team_id, &login).await.map_err(internal)?,
+    };
+    info!(team_id = %claims.team_id, forgotten, "Reviewer asks forgotten");
+    Ok(Json(json!({"forgotten": forgotten})))
+}
+
+/// GET /api/settings/guide-prs — whether CoderHelm may open pull requests
+/// that add its lessons to a repository's guide file: for the team, and for
+/// each repository set apart. On unless turned off.
+pub async fn get_guide_setting(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<Value>, StatusCode> {
+    let switch = common::guide::load_switch(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        &claims.team_id,
+    )
+    .await
+    .map_err(internal)?;
+    let mut v = switch.view();
+    v["can_manage"] = json!(claims.holder().holds("learning"));
+    Ok(Json(v))
+}
+
+/// PUT /api/settings/guide-prs — `{"enabled": bool, "repos": {"owner/name":
+/// bool}}` (admins). Off stops new guide pull requests only: lessons still
+/// reach the agents' prompts, and one already open is settled when it
+/// closes.
+pub async fn put_guide_setting(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if let Err(s) = claims.require_role(3) {
+        return Err((s, Json(json!({ "error": "Only admins can change this." }))));
+    }
+    let switch = common::guide::Switch::parse(&body)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))))?;
+    common::guide::save_switch(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        &claims.team_id,
+        &switch,
+        &claims.display_name(),
+    )
+    .await
+    .map_err(|e| {
+        error!(error = %e, "Could not save the guide pull request setting");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "Could not save. Try again." })),
+        )
+    })?;
+    info!(team_id = %claims.team_id, enabled = switch.enabled, overrides = switch.repos.len(), "Guide pull request setting saved");
+    let mut v = switch.view();
+    v["can_manage"] = json!(true);
+    Ok(Json(v))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_scorecard_window_is_bounded_and_zero_is_all_time() {
+        assert_eq!(months_of(None), 3);
+        assert_eq!(months_of(Some(0)), 0);
+        assert_eq!(months_of(Some(999)), 24);
+    }
+
+    #[test]
+    fn a_forget_request_names_a_plain_login_and_a_real_id() {
+        assert_eq!(check_forget("Pat-Lee", None), Ok("pat-lee".into()));
+        assert_eq!(
+            check_forget("pat", Some("01JBALERT3K8P2N6Q9R1S4T7V0")),
+            Ok("pat".into())
+        );
+        assert_eq!(
+            check_forget("acme/team", None),
+            Err(StatusCode::BAD_REQUEST)
+        );
+        assert_eq!(check_forget("pat#x", None), Err(StatusCode::BAD_REQUEST));
+        assert_eq!(
+            check_forget("pat", Some("../x")),
+            Err(StatusCode::BAD_REQUEST)
+        );
+    }
+
+    #[test]
+    fn lessons_are_listed_with_their_evidence_and_where_they_stand() {
+        use chrono::TimeZone;
+        use common::rewards::lessons::Lesson;
+        let now = chrono::Utc.with_ymd_and_hms(2026, 10, 20, 0, 0, 0).unwrap();
+        let base = Lesson {
+            repo: "acme/web".into(),
+            agent: "coder".into(),
+            check: "No `fetch(` in the diff.".into(),
+            seen: 2,
+            prs: vec!["acme/web#12".into(), "acme/web#15".into()],
+            last_seen_at: "2026-10-19T00:00:00Z".into(),
+            evidence: vec!["PR #12 in people's words: \"Use the shared client\"".into()],
+            ..Default::default()
+        };
+        let lessons = vec![
+            Lesson {
+                id: "ready".into(),
+                text: "Use `useApi`.".into(),
+                ..base.clone()
+            },
+            Lesson {
+                id: "guide".into(),
+                in_guide: true,
+                seen: 5,
+                ..base.clone()
+            },
+            Lesson {
+                id: "against".into(),
+                contradicted: 2,
+                ..base.clone()
+            },
+            Lesson {
+                id: "off".into(),
+                reverted: true,
+                seen: 9,
+                ..base.clone()
+            },
+            Lesson {
+                id: "faded".into(),
+                last_seen_at: "2025-10-01T00:00:00Z".into(),
+                ..base.clone()
+            },
+            Lesson {
+                id: "reviewers".into(),
+                agent: "reviewer".into(),
+                ..base.clone()
+            },
+            Lesson {
+                id: "other".into(),
+                repo: "acme/api".into(),
+                ..base.clone()
+            },
+        ];
+        let guides = vec![common::guide::Record {
+            repo: "acme/web".into(),
+            state: "open".into(),
+            pr: 40,
+            path: "AGENTS.md".into(),
+            lesson_ids: vec!["ready".into()],
+            ..Default::default()
+        }];
+        let v = lessons_view(&lessons, &guides, "acme/web", now);
+        let status: std::collections::BTreeMap<String, String> = v["lessons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| {
+                (
+                    l["id"].as_str().unwrap().into(),
+                    l["status"].as_str().unwrap().into(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            status.len(),
+            5,
+            "the reviewer's and the other repository's are not listed"
+        );
+        assert_eq!(status["ready"], "recalled");
+        assert_eq!(status["guide"], "in_guide");
+        assert_eq!(status["against"], "contradicted");
+        assert_eq!(status["off"], "off");
+        assert_eq!(status["faded"], "faded");
+        let ready = v["lessons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|l| l["id"] == "ready")
+            .unwrap();
+        assert_eq!(ready["guide_ready"], true);
+        assert_eq!(
+            ready["evidence"][0],
+            "PR #12 in people's words: \"Use the shared client\""
+        );
+        assert_eq!(
+            v["guide_prs"][0]["url"],
+            "https://github.com/acme/web/pull/40"
+        );
+        // All repositories.
+        assert_eq!(
+            lessons_view(&lessons, &guides, "", now)["lessons"]
+                .as_array()
+                .unwrap()
+                .len(),
+            6
+        );
+    }
 
     #[test]
     fn repo_filters_are_owner_and_name_only() {

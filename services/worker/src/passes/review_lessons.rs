@@ -451,7 +451,7 @@ struct Judgments {
 /// The JSON in a model's reply: a ```json fence, any fence, or the outermost
 /// braces (models drop or rename the fence; a reply that didn't read used to
 /// teach nothing).
-fn json_block(text: &str) -> &str {
+pub(crate) fn json_block(text: &str) -> &str {
     if let Some(s) = text.rfind("```json") {
         let after = &text[s + 7..];
         return after[..after.find("```").unwrap_or(after.len())].trim();

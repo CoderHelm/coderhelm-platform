@@ -837,8 +837,10 @@ pub async fn run(state: &WorkerState, msg: HealthCheckMessage) -> Result<(), Box
             delay,
         } => {
             msg.green_since = None;
-            let body = render_interim(&msg.merge_sha, finished, &failed, &waiting, &follows);
-            upsert_comment(&github, &msg, &body).await;
+            if speaks(msg.quiet, None) {
+                let body = render_interim(&msg.merge_sha, finished, &failed, &waiting, &follows);
+                upsert_comment(&github, &msg, &body).await;
+            }
             info!(
                 pr = msg.pr_number,
                 sha = %msg.merge_sha,
@@ -876,12 +878,96 @@ pub async fn run(state: &WorkerState, msg: HealthCheckMessage) -> Result<(), Box
                     "Health check: SAFETY CEILING reached with the deploy still running"
                 );
             }
-            let body = render(&msg.merge_sha, &verdict, &follows);
+            if !speaks(msg.quiet, Some(&verdict)) {
+                info!(pr = msg.pr_number, sha = %msg.merge_sha, ?verdict, "Health check: quiet watch, nothing failed, nothing to report");
+                return Ok(());
+            }
+            let mut body = render(&msg.merge_sha, &verdict, &follows);
+            // A failed deploy of CoderHelm's own change: the revert is
+            // opened, ready for the team's approval, with these failures as
+            // its evidence. Never merged here.
+            if let Verdict::Failed(jobs) = &verdict {
+                if let Some(line) = propose_revert(state, &github, &msg, jobs).await {
+                    body = with_revert_line(&body, &line);
+                }
+            }
             upsert_comment(&github, &msg, &body).await;
             info!(pr = msg.pr_number, sha = %msg.merge_sha, ?verdict, "Health check reported");
         }
     }
     Ok(())
+}
+
+/// Whether a look's result is said on the pull request. A quiet watch (a
+/// merge nobody asked a report for) speaks only for a failed deploy.
+pub fn speaks(quiet: bool, verdict: Option<&Verdict>) -> bool {
+    !quiet || matches!(verdict, Some(Verdict::Failed(_)))
+}
+
+/// The failed verdict's comment with what CoderHelm did about it: the
+/// question it used to end on is answered by the revert's own line.
+pub fn with_revert_line(body: &str, line: &str) -> String {
+    const ASK: &str = " Rolling a deploy back needs the approval";
+    const ASK_END: &str = "be rolled back?";
+    if let (Some(a), Some(b)) = (body.find(ASK), body.find(ASK_END)) {
+        if b > a {
+            return format!("{} {line}{}", &body[..a], &body[b + ASK_END.len()..]);
+        }
+    }
+    match body.rfind("\n\n<!--") {
+        Some(i) => format!("{}\n\n{line}{}", &body[..i], &body[i..]),
+        None => format!("{body}\n\n{line}"),
+    }
+}
+
+/// The deploy of a merge failed on checks that passed before it. When the
+/// merged pull request is CoderHelm's own, the revert pull request is
+/// opened (or found) and its line returned; `None` for anyone else's.
+async fn propose_revert(
+    state: &WorkerState,
+    github: &GitHubClient,
+    msg: &HealthCheckMessage,
+    failed: &[Job],
+) -> Option<String> {
+    let run_id = super::review_pr::lookup_run_by_pr(
+        state,
+        &msg.team_id,
+        &msg.repo_owner,
+        &msg.repo_name,
+        msg.pr_number,
+    )
+    .await?;
+    let evidence: Vec<String> = failed.iter().map(job_line).collect();
+    let outcome = super::deploy_revert::propose(
+        github,
+        &super::deploy_revert::Request {
+            owner: &msg.repo_owner,
+            repo: &msg.repo_name,
+            pr_number: msg.pr_number,
+            merge_sha: &msg.merge_sha,
+            base_branch: &msg.base_branch,
+            cause: super::deploy_revert::Cause::DeployFailed,
+            evidence: &evidence,
+        },
+    )
+    .await;
+    let line = super::deploy_revert::report_line(&outcome);
+    super::add_progress_note(
+        state,
+        &msg.team_id,
+        &run_id,
+        &format!(
+            "The deploy of the merge `{}` failed on checks that passed before it ({}). {line}",
+            short(&msg.merge_sha),
+            failed
+                .iter()
+                .map(|j| j.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    )
+    .await;
+    Some(line)
 }
 
 /// One comment per merge: edit the one already posted for this merge, or
@@ -931,6 +1017,15 @@ pub async fn schedule(
     merge_sha: &str,
     baseline_failed: Vec<String>,
 ) -> bool {
+    // The one watch of this merge: `schedule_own` finds it and starts none.
+    let _ = common::claim::claim(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        team_id,
+        &watch_claim_sk(owner, repo, merge_sha),
+        WATCH_CLAIM_SECS,
+    )
+    .await;
     let msg = HealthCheckMessage {
         team_id: team_id.to_string(),
         installation_id,
@@ -945,8 +1040,73 @@ pub async fn schedule(
         merged_at: Some(chrono::Utc::now().timestamp()),
         followed: Vec::new(),
         approval_seen_at: None,
+        quiet: false,
     };
     send_tick(state, &msg, backoff(0)).await
+}
+
+/// How long one claim on a merge's deploy watch holds: longer than any
+/// deploy is watched.
+const WATCH_CLAIM_SECS: u64 = 24 * 3600;
+
+/// Watches the deploy of CoderHelm's own pull request merged by anyone
+/// (`pr_watch`): quiet unless it fails. The checks failing before the
+/// merge are read from the commit the merge sits on. One watch per merge
+/// commit: a merge whose watch the team's own setting already started is
+/// left to it. True when a watch runs for the merge (this one or that).
+pub async fn schedule_own(
+    state: &WorkerState,
+    github: &GitHubClient,
+    team_id: &str,
+    installation_id: u64,
+    (owner, repo, pr_number): (&str, &str, u64),
+    base_branch: &str,
+    merge_sha: &str,
+) -> bool {
+    if merge_sha.is_empty() || base_branch.is_empty() {
+        return false;
+    }
+    let sk = watch_claim_sk(owner, repo, merge_sha);
+    let table = &state.config.settings_table_name;
+    if common::claim::claim(&state.dynamo, table, team_id, &sk, WATCH_CLAIM_SECS).await
+        == common::claim::Claim::Held
+    {
+        return true;
+    }
+    let baseline = match github.commit_tree_parents(owner, repo, merge_sha).await {
+        Ok((_, parents)) => match parents.first() {
+            Some(parent) => failing_checks(github, owner, repo, parent).await,
+            None => Vec::new(),
+        },
+        Err(_) => Vec::new(),
+    };
+    let msg = HealthCheckMessage {
+        team_id: team_id.to_string(),
+        installation_id,
+        repo_owner: owner.to_string(),
+        repo_name: repo.to_string(),
+        pr_number,
+        base_branch: base_branch.to_string(),
+        merge_sha: merge_sha.to_string(),
+        baseline_failed: baseline,
+        attempts: 0,
+        green_since: None,
+        merged_at: Some(chrono::Utc::now().timestamp()),
+        followed: Vec::new(),
+        approval_seen_at: None,
+        quiet: true,
+    };
+    if send_tick(state, &msg, backoff(0)).await {
+        true
+    } else {
+        common::claim::release(&state.dynamo, table, team_id, &sk).await;
+        false
+    }
+}
+
+/// The claim one deploy watch of a merge commit holds.
+pub fn watch_claim_sk(owner: &str, repo: &str, merge_sha: &str) -> String {
+    format!("DEPLOYWATCH#{owner}/{repo}#{merge_sha}")
 }
 
 /// Send the next tick as a new message. The handler always completes the

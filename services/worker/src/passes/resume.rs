@@ -13,6 +13,7 @@ use crate::passes::{
     attr_n, attr_s, implement, plan, review, save_checkpoint, write_pass_trace, FileCache,
 };
 use crate::WorkerState;
+use common::flaky_checks::Rerun;
 use common::run_round;
 
 const MAX_CI_FIX_CYCLES: usize = 10;
@@ -1798,6 +1799,7 @@ pub async fn run(
                 );
                 // A green CI counts however Coderhelm learned of it: without
                 // this, a fixed run that missed its webhook read "ended red".
+                record_flaky_pass(state, &msg, &run_record, branch_head.as_deref()).await;
                 super::record_ci_outcome(
                     state,
                     &msg.team_id,
@@ -1970,8 +1972,10 @@ pub async fn run(
                                 branch_head.as_deref(),
                                 &events,
                                 None,
+                                false,
                             )
                             .await
+                                == Some(Rerun::Started)
                         {
                             return Ok(());
                         }
@@ -2264,10 +2268,35 @@ pub async fn run(
             &job_logs,
         )
         .await;
-        // A failure on the runner or a service outside the code is re-run
-        // once before any code changes for it.
-        if let Some(line) = looks_infra(&logs) {
-            if try_rerun_once(
+        // Flaky or broken: before any code changes for the failure, it is
+        // judged against the files this pull request changed and the
+        // repository's record of checks that fail and pass on one commit
+        // (`flaky`). A failure on the runner or a service, or of a check
+        // with such a record that names no changed file, is re-run once and
+        // the pull request says so. When GitHub won't let CoderHelm re-run
+        // it, the pull request says that too, and no code changes for a
+        // check with a flaky record.
+        let infra = looks_infra(&logs);
+        let failing_wf = failing_workflows(&events);
+        let (judgement, touch) = super::flaky::judge(
+            state,
+            &github,
+            &super::flaky::Failure {
+                team_id: &msg.team_id,
+                owner: &repo_owner,
+                repo: &repo_name,
+                pr: pr_number,
+                failing: &failing_wf,
+                on_base: &on_base,
+                logs: &logs,
+                infra: infra.as_deref(),
+            },
+        )
+        .await;
+        let known_flaky = infra.is_none() && judgement.none_ours();
+        let mut logs = logs;
+        if infra.is_some() || known_flaky {
+            let rerun = try_rerun_once(
                 state,
                 &msg,
                 &github,
@@ -2276,11 +2305,116 @@ pub async fn run(
                 &repo_name,
                 branch_head.as_deref(),
                 &events,
-                Some(line),
+                infra.clone(),
+                known_flaky,
             )
-            .await
-            {
-                return Ok(());
+            .await;
+            match after_rerun_try(rerun.as_ref(), known_flaky) {
+                NotOursNext::Wait | NotOursNext::Finish => {
+                    let rerun = rerun.unwrap_or(Rerun::NotActions);
+                    super::flaky::note_on_pr(
+                        &github,
+                        &repo_owner,
+                        &repo_name,
+                        pr_number,
+                        common::flaky_checks::section(&judgement, &base_branch, &rerun, &touch),
+                    )
+                    .await;
+                    if rerun == Rerun::Started {
+                        if let Some(line) = &infra {
+                            super::flaky::observe(
+                                state,
+                                &msg.team_id,
+                                &format!("{repo_owner}/{repo_name}"),
+                                &failing_wf,
+                                &common::flaky_checks::Observation {
+                                    kind: common::flaky_checks::Kind::Infra,
+                                    at: chrono::Utc::now().to_rfc3339(),
+                                    pr: pr_number,
+                                    sha: branch_head.clone().unwrap_or_default(),
+                                    line: line.clone(),
+                                },
+                            )
+                            .await;
+                        }
+                        // The re-run's result wakes the run: it waits for CI
+                        // again, not as "running" until a sweep resets it.
+                        set_run_awaiting_ci(
+                            state,
+                            &ticket_msg,
+                            &msg.run_id,
+                            &pr_url,
+                            pr_number,
+                            &branch,
+                            &usage,
+                            wall_clock_secs(created_at, &start),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                    // No re-run could start and the check is not this
+                    // change's: the run finishes with its own work done, as
+                    // it does for a check that is red on the base branch.
+                    info!(
+                        run_id = msg.run_id,
+                        checks = ?failing_wf,
+                        ?rerun,
+                        "CI is red only on checks with a flaky record that name no changed file; no re-run could start — finishing without changing code"
+                    );
+                    super::add_progress_note(
+                        state,
+                        &msg.team_id,
+                        &msg.run_id,
+                        &super::flaky::progress_note(&judgement, &rerun),
+                    )
+                    .await;
+                    super::record_ci_outcome(
+                        state,
+                        &msg.team_id,
+                        &msg.run_id,
+                        super::CiOutcome::HandedOff(super::GaveUp::UnrelatedTest),
+                    )
+                    .await;
+                    super::pr_watch::mark_ci_head(
+                        state,
+                        &msg.team_id,
+                        &msg.run_id,
+                        branch_head.as_deref().unwrap_or_default(),
+                    )
+                    .await;
+                    mark_events_processed(state, &msg.run_id, &events).await;
+                    mark_pr_ready(
+                        state,
+                        &msg.team_id,
+                        &github,
+                        &repo_owner,
+                        &repo_name,
+                        pr_number,
+                    )
+                    .await;
+                    complete_run_with_status(
+                        state,
+                        &ticket_msg,
+                        &msg.run_id,
+                        "completed",
+                        &pr_url,
+                        pr_number,
+                        &branch,
+                        &usage,
+                        wall_clock_secs(created_at, &start),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                NotOursNext::Fix => {
+                    // It failed again after its re-run, or the failure is an
+                    // infrastructure one no re-run could start for: the fix
+                    // round reads it, with what the record says.
+                    let note = common::flaky_checks::fixer_note(&judgement);
+                    if !note.is_empty() {
+                        logs = format!("{note}\n\n{logs}");
+                    }
+                }
             }
         }
 
@@ -3161,6 +3295,7 @@ pub async fn run(
             )
             .await;
         }
+        record_flaky_pass(state, &msg, &run_record, branch_head.as_deref()).await;
         super::record_ci_outcome(
             state,
             &msg.team_id,
@@ -4882,6 +5017,48 @@ fn passed_outcome(run_record: &RunRecord, head: Option<&str>) -> super::CiOutcom
     }
 }
 
+/// A green CI on a head that failed and was re-run with nothing changed:
+/// the workflows re-run on it go on the repository's record of flaky checks
+/// (`flaky`), the evidence a later pull request's failure is judged with.
+async fn record_flaky_pass(
+    state: &WorkerState,
+    msg: &ResumeMessage,
+    run_record: &RunRecord,
+    head: Option<&str>,
+) {
+    if !matches!(
+        passed_outcome(run_record, head),
+        super::CiOutcome::PassedAfterRerun
+    ) {
+        return;
+    }
+    let text = |k: &str| {
+        run_record
+            .get(k)
+            .and_then(|v| v.as_s().ok())
+            .cloned()
+            .unwrap_or_default()
+    };
+    let pr = run_record
+        .get("pr_number")
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse::<u64>().ok())
+        .unwrap_or(0);
+    let repo = text("repo");
+    if repo.is_empty() || pr == 0 {
+        return;
+    }
+    super::flaky::passed_after_rerun(
+        state,
+        &msg.team_id,
+        &repo,
+        pr,
+        head.unwrap_or_default(),
+        run_record,
+    )
+    .await;
+}
+
 /// Workflows that passed at least once on this run's PR, any commit.
 async fn ci_passed_workflows(
     state: &WorkerState,
@@ -4925,10 +5102,53 @@ async fn ci_passed_workflows(
     }
 }
 
+/// What a re-run that had a reason to start came to: started, or why not
+/// (`Rerun::NoPermission` when the installation may not write Actions,
+/// `Rerun::NotActions` when no failing check is a GitHub Actions run).
+pub(crate) fn rerun_result(started: bool, refused: bool) -> Rerun {
+    if started {
+        Rerun::Started
+    } else if refused {
+        Rerun::NoPermission
+    } else {
+        Rerun::NotActions
+    }
+}
+
+/// What the run does with a failure judged not the pull request's, after
+/// the try at re-running it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NotOursNext {
+    /// A re-run started: wait for its result.
+    Wait,
+    /// No re-run could start and the check has a flaky record: finish
+    /// without changing code, the pull request says why.
+    Finish,
+    /// A fix round reads the failure: this head was re-run already and
+    /// failed again, or an infrastructure failure can't be started again.
+    Fix,
+}
+
+/// `rerun` is [`try_rerun_once`]'s answer (None: this head was re-run
+/// already), `known_flaky` whether every failing check has a flaky record
+/// and the failure names no changed file. A second failure in a row on one
+/// head is evidence too, so it is read by a fix round, never waved through.
+pub(crate) fn after_rerun_try(rerun: Option<&Rerun>, known_flaky: bool) -> NotOursNext {
+    match rerun {
+        Some(Rerun::Started) => NotOursNext::Wait,
+        Some(_) if known_flaky => NotOursNext::Finish,
+        _ => NotOursNext::Fix,
+    }
+}
+
 /// Re-runs this head's failed workflows once instead of spending a fix
-/// attempt, when the failure looks flaky (see `should_rerun`). True when a
-/// re-run started: the run stays in awaiting_ci and the re-run's result
-/// wakes it again.
+/// attempt, when the failure looks flaky (see `should_rerun`) or the
+/// repository's record says the check is (`known_flaky`, see
+/// `common::flaky_checks`). None when there was no reason to re-run (or
+/// this head was re-run already). `Some(Rerun::Started)` when a re-run
+/// started: the re-run's result wakes the run again. Otherwise why none
+/// could start, so the caller says so instead of changing code that is not
+/// wrong.
 #[allow(clippy::too_many_arguments)]
 async fn try_rerun_once(
     state: &WorkerState,
@@ -4940,7 +5160,8 @@ async fn try_rerun_once(
     head: Option<&str>,
     events: &[RunEvent],
     infra: Option<String>,
-) -> bool {
+    known_flaky: bool,
+) -> Option<Rerun> {
     let failed: Vec<&RunEvent> = events
         .iter()
         .filter(|e| e.event_type == "ci_failed")
@@ -4961,11 +5182,12 @@ async fn try_rerun_once(
         &rerun_heads(run_record),
         &workflows,
         &passed_before,
-        infra.is_some(),
+        infra.is_some() || known_flaky,
     ) {
-        return false;
+        return None;
     }
     let mut started = false;
+    let mut refused = false;
     for e in &failed {
         let Some(wf_run) = e.payload["workflow_run_id"].as_u64() else {
             continue;
@@ -4973,14 +5195,18 @@ async fn try_rerun_once(
         match gh.rerun_failed_jobs(owner, name, wf_run).await {
             Ok(()) => started = true,
             Err(err) => {
+                refused |= common::flaky_checks::rerun_refused_for_permission(&err.to_string());
                 warn!(run_id = msg.run_id, workflow_run_id = wf_run, error = %err, "Could not re-run failed jobs")
             }
         }
     }
     if !started {
-        return false;
+        return Some(rerun_result(false, refused));
     }
-    info!(run_id = msg.run_id, workflows = ?workflows, infra = ?infra, "CI failed on a check that passed earlier on this PR, or on infrastructure — re-running once before a fix");
+    info!(run_id = msg.run_id, workflows = ?workflows, infra = ?infra, known_flaky, "CI failed on a check that passed earlier on this PR, on infrastructure, or on a check with a flaky record — re-running once before a fix");
+    // A green on this head later is this repository's evidence that these
+    // workflows fail and pass on one commit (`flaky::passed_after_rerun`).
+    super::flaky::remember_rerun(state, &msg.team_id, &msg.run_id, &workflows).await;
     super::record_ci_outcome(
         state,
         &msg.team_id,
@@ -4997,6 +5223,10 @@ async fn try_rerun_once(
                 "CI failed on {} for a reason outside the code ({line}) — re-running the failed jobs once before changing code.",
                 workflows.join(", ")
             ),
+            None if known_flaky => format!(
+                "CI failed on {}, which has failed and then passed on one commit of other pull requests, and the failure names no file this change touches — re-running the failed jobs once before changing code.",
+                workflows.join(", ")
+            ),
             None => format!(
                 "CI failed on {} after passing earlier on this PR — re-running the failed jobs once before changing code.",
                 workflows.join(", ")
@@ -5009,7 +5239,7 @@ async fn try_rerun_once(
     let consumed: Vec<RunEvent> = failed.into_iter().cloned().collect();
     mark_events_processed(state, &msg.run_id, &consumed).await;
     send_delayed_resume(state, msg, 120).await;
-    true
+    Some(Rerun::Started)
 }
 
 /// After a run was handed off red, a green CI on its current head is
@@ -6987,6 +7217,9 @@ async fn end_run(
             )
             .await;
         }
+        // Where the pull request stands on its way to merge, written for
+        // the run page now and not at the next sweep.
+        super::pr_watch::after_completion(state, &msg.team_id, run_id).await;
     }
     Ok(())
 }
@@ -7341,6 +7574,14 @@ async fn set_run_complete(
         run_id,
         duration, status, "Run marked complete (no CI / CI passed)"
     );
+    // This ending skips the review step every other ending goes through:
+    // a run that pushed a fix and then found CI green (or no CI) finished
+    // with its reviewer's verdict still on the commit before the fix. The
+    // pull request is looked at now: a verdict missing on the head asks for
+    // the review, and changes requested on it get their fix round.
+    if status == common::run_status::COMPLETED {
+        super::pr_watch::after_completion(state, team_id, run_id).await;
+    }
 }
 
 /// How a run whose CI passed ends: completed, or (with requirements left
