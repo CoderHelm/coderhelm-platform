@@ -1084,7 +1084,7 @@ pub async fn run(
                     w.file_cache,
                     Some(w.run_id),
                     w.deadline,
-                    true,
+                    super::write_guard::RoundFor::Settle,
                 )
                 .await;
                 match fixed {
