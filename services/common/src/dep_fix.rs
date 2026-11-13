@@ -34,6 +34,20 @@
 //! 3. The state is plain data ([`DepRun`] serializes): a step that runs out
 //!    of time, or a run that reaches its budget, resumes where it stopped.
 //!
+//! 4. A run of 64 packages later showed three more gaps. It finished with
+//!    its checks passed though the application's build never ran and the
+//!    application was never started, with four overrides crossing a major
+//!    version. Its pull request did not say why a bump left its version line,
+//!    and it did not say how many advisories stayed open or why. So: a bump
+//!    that leaves its version line records which advisory has no patched
+//!    release on the line ([`PlanBump::major_reason`]); once the batches are
+//!    settled the repository's real build and its start command run in the
+//!    sandbox in a step of their own, on the base branch and on the branch
+//!    ([`RuntimeProof`], `crate::runtime_proof`), and what the bumps break
+//!    there takes out the newest commit of bumps and defers them with the
+//!    cause; and the report ends with the advisories that stay open, by
+//!    reason ([`remaining`]).
+//!
 //! Nothing here asks a person. A bump that cannot ship is deferred with the
 //! reason, and the run ends with a pull request of what is green.
 //!
@@ -43,9 +57,10 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::runtime_proof as rp;
 use crate::security_fixes::{
     compare_versions, is_major_bump, version_line, Finding, FindingState, MajorBumps,
-    SecurityConfig, Tier, Verdict,
+    SecurityConfig, Status, Tier, Verdict,
 };
 
 // ── Limits ──────────────────────────────────────────────────────────────
@@ -64,6 +79,9 @@ pub const MAX_CODE_FIXES: u32 = 2;
 pub const MAX_BROKEN_PROBES: u32 = 2;
 /// The default model budget of one dependency fix run, in cents.
 pub const DEFAULT_RUN_BUDGET_CENTS: u32 = 300;
+/// Sandbox builds one run's runtime proof may start (the base branch's, the
+/// branch's, and one more for each commit of bumps the proof takes out).
+pub const MAX_PROOF_RUNS: u32 = 6;
 
 // ── The plan ────────────────────────────────────────────────────────────
 
@@ -114,6 +132,10 @@ pub struct PlanBump {
     pub finding_ids: Vec<String>,
     /// Why it is in the run, in a few words.
     pub why: String,
+    /// Why it leaves its version line, for a major: the advisory whose data
+    /// lists no patched release on the line, with the releases it does list.
+    /// Empty for a bump that stays on its line; never empty for a major.
+    pub major_reason: String,
 }
 
 impl PlanBump {
@@ -130,6 +152,29 @@ impl PlanBump {
     }
 }
 
+/// The kind of reason a bump is left out: what the pull request groups the
+/// advisories that stay open by.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum Cause {
+    /// It broke the repository's checks, its build or its start, in the
+    /// sandbox or in the pull request's CI.
+    Broke,
+    /// Another package holds it: a parent pins the version, or the package
+    /// manager could not install the fixed version.
+    Parent,
+    /// A major upgrade the rules leave out (not reachable, not urgent).
+    MajorNotNeeded,
+    /// A cap, the budget or time: the next run takes it.
+    Later,
+    /// It could not be placed or verified (no sandbox result, the lockfile
+    /// can't be told).
+    #[default]
+    Unverified,
+}
+
 /// A bump the run leaves out, with why. Its findings stay open.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -144,6 +189,8 @@ pub struct Deferral {
     /// It can come back by itself in a later run (a cap, the budget, time):
     /// not a decision about the bump.
     pub later: bool,
+    /// The kind of reason, for the pull request's count of what stays open.
+    pub cause: Cause,
 }
 
 impl Deferral {
@@ -257,6 +304,35 @@ pub fn lowest_fix(f: &Finding, st: &FindingState) -> Option<String> {
     fixed_versions(f, st)
         .into_iter()
         .find(|x| compare_versions(x, &f.version) == std::cmp::Ordering::Greater)
+}
+
+/// Why a finding's fix leaves its version line: its advisory data lists no
+/// patched release on the line. Names the advisory and what it does list.
+pub fn major_reason(f: &Finding, st: &FindingState) -> String {
+    let listed = fixed_versions(f, st);
+    let advisory = if f.advisory.primary.is_empty() {
+        "its advisory".to_string()
+    } else {
+        f.advisory.primary.clone()
+    };
+    format!(
+        "{advisory} lists no patched release on the {} line (patched releases it lists: {})",
+        version_line(&f.version),
+        if listed.is_empty() {
+            "none".to_string()
+        } else {
+            listed.join(", ")
+        }
+    )
+}
+
+/// Whether the rules fix a finding by leaving its version line (a major
+/// upgrade that goes in): such a fix gets a pull request of its own.
+pub fn crosses_major(f: &Finding, st: &FindingState, cfg: &SecurityConfig) -> bool {
+    matches!(
+        choose(f, st, cfg),
+        Some(Choice::Include { ref to, risk }) if risk.is_major() || is_major_bump(&f.version, to)
+    )
 }
 
 /// What the plan does with one finding.
@@ -433,6 +509,7 @@ pub fn plan_in(
                 to: f.fixed_version.clone().unwrap_or_default(),
                 manifest: f.manifest.clone(),
                 reason: "the lockfile it is installed through can't be told from the repository, so the sandbox can't apply and verify it".into(),
+                cause: Cause::Unverified,
                 ..Default::default()
             });
         d.finding_ids.push(f.id.clone());
@@ -453,9 +530,11 @@ pub fn plan(members: &[(&Finding, &FindingState)], cfg: &SecurityConfig) -> DepP
         to: String,
         risk: Option<Risk>,
         ids: Vec<String>,
-        deferred: Vec<(String, String, String)>, // (id, to, reason)
+        deferred: Vec<(String, String, String, Cause)>, // (id, to, reason, cause)
         urgent: usize,
         n: usize,
+        /// The member that takes the group off its version line, in words.
+        major_why: String,
     }
     let mut groups: BTreeMap<(String, String, String), Group> = BTreeMap::new();
     for (f, st) in members {
@@ -479,6 +558,11 @@ pub fn plan(members: &[(&Finding, &FindingState)], cfg: &SecurityConfig) -> DepP
         }
         g.n += 1;
         let held = st.deferred.as_ref().filter(|d| d.holds(f));
+        let cause = if held.is_some() {
+            Cause::Broke
+        } else {
+            Cause::MajorNotNeeded
+        };
         let choice = match held {
             Some(d) => Some(Choice::Defer {
                 to: f.fixed_version.clone().unwrap_or_default(),
@@ -491,6 +575,11 @@ pub fn plan(members: &[(&Finding, &FindingState)], cfg: &SecurityConfig) -> DepP
                 if urgent(f) {
                     g.urgent += 1;
                 }
+                // The first member with no patched release on the line is
+                // the reason the whole line moves.
+                if is_major_bump(&f.version, &to) && g.major_why.is_empty() {
+                    g.major_why = major_reason(f, st);
+                }
                 if g.to.is_empty() || compare_versions(&to, &g.to) == std::cmp::Ordering::Greater {
                     g.to = to;
                 }
@@ -500,7 +589,9 @@ pub fn plan(members: &[(&Finding, &FindingState)], cfg: &SecurityConfig) -> DepP
                 });
                 g.ids.push(f.id.clone());
             }
-            Some(Choice::Defer { to, reason }) => g.deferred.push((f.id.clone(), to, reason)),
+            Some(Choice::Defer { to, reason }) => {
+                g.deferred.push((f.id.clone(), to, reason, cause))
+            }
             // Its own issue (`stands_alone`), never in the bundle.
             Some(Choice::IssueOnly) | None => {}
         }
@@ -524,11 +615,13 @@ pub fn plan(members: &[(&Finding, &FindingState)], cfg: &SecurityConfig) -> DepP
                 Some((
                     "a yarn lockfile pins one version of a package; another version line of it is fixed in this run, and this one needs its parent upgraded".to_string(),
                     false,
+                    Cause::Parent,
                 ))
             } else if major && majors >= MAX_MAJORS_PER_RUN && !matches!(risk, Risk::UrgentMajor) {
                 Some((
                     format!("one run takes at most {MAX_MAJORS_PER_RUN} major upgrades; the next run takes it"),
                     true,
+                    Cause::Later,
                 ))
             } else if out.bumps.len() >= MAX_BUMPS_PER_RUN
                 && !matches!(risk, Risk::Urgent | Risk::UrgentMajor)
@@ -538,12 +631,13 @@ pub fn plan(members: &[(&Finding, &FindingState)], cfg: &SecurityConfig) -> DepP
                         "one run takes at most {MAX_BUMPS_PER_RUN} bumps; the next run takes it"
                     ),
                     true,
+                    Cause::Later,
                 ))
             } else {
                 None
             };
             match reason {
-                Some((reason, later)) => out.deferred.push(Deferral {
+                Some((reason, later, cause)) => out.deferred.push(Deferral {
                     package: g.package.clone(),
                     from: g.from.clone(),
                     to: g.to.clone(),
@@ -551,6 +645,7 @@ pub fn plan(members: &[(&Finding, &FindingState)], cfg: &SecurityConfig) -> DepP
                     finding_ids: g.ids.clone(),
                     reason,
                     later,
+                    cause,
                 }),
                 None => {
                     if major {
@@ -586,6 +681,16 @@ pub fn plan(members: &[(&Finding, &FindingState)], cfg: &SecurityConfig) -> DepP
                         }),
                         finding_ids: g.ids.clone(),
                         why,
+                        // A bump never leaves its line without the advisory
+                        // that has no patched release on it.
+                        major_reason: match (major, g.major_why.is_empty()) {
+                            (false, _) => String::new(),
+                            (true, false) => g.major_why.clone(),
+                            (true, true) => format!(
+                                "no patched release on the {} line in the advisory data",
+                                g.line
+                            ),
+                        },
                     });
                 }
             }
@@ -593,7 +698,7 @@ pub fn plan(members: &[(&Finding, &FindingState)], cfg: &SecurityConfig) -> DepP
         if !g.deferred.is_empty() {
             // One line per package and line: the highest version it needs.
             let mut to = String::new();
-            for (_, t, _) in &g.deferred {
+            for (_, t, _, _) in &g.deferred {
                 if to.is_empty() || compare_versions(t, &to) == std::cmp::Ordering::Greater {
                     to = t.clone();
                 }
@@ -604,9 +709,10 @@ pub fn plan(members: &[(&Finding, &FindingState)], cfg: &SecurityConfig) -> DepP
                 from: g.from.clone(),
                 to,
                 manifest: g.manifest.clone(),
-                finding_ids: g.deferred.iter().map(|(id, _, _)| id.clone()).collect(),
+                finding_ids: g.deferred.iter().map(|(id, _, _, _)| id.clone()).collect(),
                 reason,
                 later: false,
+                cause: g.deferred[0].3,
             });
         }
     }
@@ -1003,8 +1109,58 @@ pub enum Action {
         failing: Vec<String>,
         error: String,
     },
+    /// Find what the runtime proof runs: the repository's build and start
+    /// commands (`runtime_proof::discover`).
+    ProofPlan,
+    /// Run the runtime proof in a sandbox build of its own: on the base
+    /// branch (`base`), or on the branch with the committed bumps.
+    Proof { base: bool },
+    /// The build or the start fails with the bumps and passes without them:
+    /// take out the newest commit of verified bumps
+    /// ([`DepRun::take_out_last_commit`]) with this reason, then prove the
+    /// branch again.
+    ProofTakeOut { why: String },
     /// Nothing left: open the pull request with what is committed.
     Done,
+}
+
+/// The runtime proof of one run: the repository's real build and its start
+/// command, run on the base branch and on the branch with the bumps.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct RuntimeProof {
+    /// What runs, found once.
+    pub plan: Option<rp::ProofPlan>,
+    pub base: Option<rp::ProofResult>,
+    /// The branch's result, read on the head `proved`.
+    pub head: Option<rp::ProofResult>,
+    pub proved: String,
+    /// Sandbox builds started for it.
+    pub runs: u32,
+    /// Builds in a row that gave no result.
+    pub broken: u32,
+    /// The run already moved to a fresh step so the next proof build gets a
+    /// full time window; it never waits twice for the same build.
+    pub waited: bool,
+    /// The sets of bumps the proof took out, oldest first: each as where
+    /// its deferrals start in the run's `deferred` and how many they are.
+    pub taken_out: Vec<(usize, usize)>,
+    /// What still fails with the bumps and passes without them, when nothing
+    /// more could be taken out.
+    pub unresolved: Vec<String>,
+    /// Why no proof ran; empty when one did.
+    pub skipped: String,
+    pub done: bool,
+}
+
+/// Why a bump the checks passed is deferred after all: the repository's
+/// build or start fails with it. `blamed`: what fails, from
+/// [`rp::blamed`].
+pub fn proof_deferral_reason(blamed: &[String]) -> String {
+    format!(
+        "with it applied {}, which passes on the base branch; taken out so the bumps before it ship",
+        crate::truncate_str(&blamed.join("; "), 300)
+    )
 }
 
 /// How the code-fix attempt ended.
@@ -1053,6 +1209,8 @@ pub struct DepRun {
     /// pull request's own CI can take out again, one at a time
     /// ([`DepRun::take_out_last_commit`]).
     pub commits: Vec<BatchCommit>,
+    /// The build and the start, proven after the batches settle.
+    pub proof: RuntimeProof,
 }
 
 /// One commit of verified bumps.
@@ -1129,11 +1287,13 @@ impl DepRun {
     /// read, a commit, a batch done): steps compare it to tell a stall.
     pub fn progress(&self) -> String {
         format!(
-            "dep:{}:{}:{}:{}",
+            "dep:{}:{}:{}:{}:{}:{}",
             self.batch,
             self.applied.len(),
             self.probes,
-            self.dropped.len() + self.deferred.len()
+            self.dropped.len() + self.deferred.len(),
+            self.proof.runs + u32::from(self.proof.waited) + u32::from(self.proof.plan.is_some()),
+            self.proof.taken_out.len()
         )
     }
 
@@ -1167,18 +1327,27 @@ impl DepRun {
                             error: d.error.clone(),
                         };
                     }
-                    let why = if self.over_budget() {
+                    let (why, cause) = if self.over_budget() {
                         self.budget_stop = true;
-                        "the run's budget was reached before its call sites were changed"
+                        (
+                            "the run's budget was reached before its call sites were changed",
+                            Cause::Later,
+                        )
                     } else {
-                        "it breaks the checks and the run's attempts at its call sites are used up"
+                        (
+                            "it breaks the checks and the run's attempts at its call sites are used up",
+                            Cause::Broke,
+                        )
                     };
                     self.code_queue.remove(0);
-                    self.drop_bump(d, why, self.over_budget());
+                    self.drop_bump(d, why, self.over_budget(), cause);
                     self.end_batch_if_settled();
                     continue;
                 }
                 if self.batch >= self.batches.len() {
+                    if let Some(a) = self.proof_action() {
+                        return a;
+                    }
                     self.done = true;
                     return Action::Done;
                 }
@@ -1246,18 +1415,20 @@ impl DepRun {
         let only_lock = checks.iter().all(|c| c == LOCKFILE_CHECK);
         if b.major && b.risk() == Risk::UrgentMajor && !only_lock {
             self.code_queue.push(d);
+        } else if only_lock {
+            self.drop_bump(
+                d,
+                "its version could not be installed (the lockfile could not be written with it)",
+                false,
+                Cause::Parent,
+            );
         } else {
-            let why = if only_lock {
-                "its version could not be installed (the lockfile could not be written with it)"
-                    .to_string()
-            } else {
-                format!("it breaks {} in the sandbox", checks.join(", "))
-            };
-            self.drop_bump(d, &why, false);
+            let why = format!("it breaks {} in the sandbox", checks.join(", "));
+            self.drop_bump(d, &why, false, Cause::Broke);
         }
     }
 
-    fn drop_bump(&mut self, d: Dropped, why: &str, later: bool) {
+    fn drop_bump(&mut self, d: Dropped, why: &str, later: bool, cause: Cause) {
         let b = self.plan.bumps[d.bump].clone();
         let mut reason = why.to_string();
         if !d.error.trim().is_empty() {
@@ -1274,6 +1445,7 @@ impl DepRun {
             finding_ids: b.finding_ids,
             reason,
             later,
+            cause,
         });
         if let Some(u) = self.use_mut() {
             u.dropped += 1;
@@ -1302,10 +1474,11 @@ impl DepRun {
                 },
                 why,
                 true,
+                Cause::Later,
             );
         }
         for d in std::mem::take(&mut self.code_queue) {
-            self.drop_bump(d, why, true);
+            self.drop_bump(d, why, true, Cause::Later);
         }
         self.batch = self.batches.len();
     }
@@ -1346,6 +1519,7 @@ impl DepRun {
                     },
                     "a major upgrade, and the sandbox could not run the repository's checks on the base branch to verify it",
                     true,
+                    Cause::Unverified,
                 );
             }
             self.batches = if keep.is_empty() {
@@ -1385,6 +1559,7 @@ impl DepRun {
                             finding_ids: self.plan.bumps[i].finding_ids.clone(),
                             reason: "not verified: the sandbox gave no result twice".into(),
                             later: true,
+                            cause: Cause::Unverified,
                         });
                     }
                 }
@@ -1493,6 +1668,7 @@ impl DepRun {
                 },
                 &format!("its verified change could not be committed ({why})"),
                 true,
+                Cause::Later,
             );
         }
         self.end_batch_if_settled();
@@ -1532,6 +1708,7 @@ impl DepRun {
                         checks.join(", ")
                     ),
                     false,
+                    Cause::Broke,
                 );
             }
         }
@@ -1601,6 +1778,7 @@ impl DepRun {
                 finding_ids: b.finding_ids,
                 reason: why.to_string(),
                 later: false,
+                cause: Cause::Broke,
             };
             lines.push(d.line());
             self.deferred.push(d);
@@ -1613,9 +1791,202 @@ impl DepRun {
         })
     }
 
+    /// The runtime proof's next action, once every batch is settled; `None`
+    /// when the proof is over (or has nothing to prove).
+    fn proof_action(&mut self) -> Option<Action> {
+        if self.proof.done {
+            return None;
+        }
+        let skip = |p: &mut RuntimeProof, why: String| -> Option<Action> {
+            p.skipped = why;
+            p.done = true;
+            None
+        };
+        if self.applied.is_empty() {
+            self.proof.done = true;
+            return None;
+        }
+        if self.unverified {
+            return skip(
+                &mut self.proof,
+                "the sandbox could not run the repository's commands on the base branch".into(),
+            );
+        }
+        let Some(plan) = self.proof.plan.clone() else {
+            return Some(Action::ProofPlan);
+        };
+        if plan.is_empty() {
+            return skip(
+                &mut self.proof,
+                format!("{}; {}", plan.no_build, plan.no_start),
+            );
+        }
+        let Some(base) = self.proof.base.clone() else {
+            return Some(Action::Proof { base: true });
+        };
+        if !base.ran {
+            return skip(
+                &mut self.proof,
+                format!(
+                    "the sandbox gave no result for the base branch ({})",
+                    crate::truncate_str(first_error_line(&base.tail), 160)
+                ),
+            );
+        }
+        let head = match &self.proof.head {
+            Some(h) if self.proof.proved == self.head => h.clone(),
+            _ => return Some(Action::Proof { base: false }),
+        };
+        let blamed = rp::blamed(&plan, &base, &head);
+        if blamed.is_empty() {
+            // The set whose removal made it pass is the cause. The sets
+            // taken out before it were only newer: removing them changed
+            // nothing, so they wait for the next run instead of being held
+            // as breaking.
+            let cleared = self.proof.taken_out.len().saturating_sub(1);
+            self.release_taken_out(cleared);
+            self.proof.done = true;
+            return None;
+        }
+        if self.commits.len() >= 2 && self.proof.runs < MAX_PROOF_RUNS {
+            return Some(Action::ProofTakeOut {
+                why: proof_deferral_reason(&blamed),
+            });
+        }
+        // One commit left (the pull request is never emptied) or the proof's
+        // builds are used up: what still fails is said, and the pull
+        // request's own CI decides. No set taken out was shown to be the
+        // cause.
+        self.release_taken_out(self.proof.taken_out.len());
+        self.proof.unresolved = blamed;
+        self.proof.done = true;
+        None
+    }
+
+    /// The first `n` sets the proof took out were not shown to break
+    /// anything (the build still failed without them): their bumps come
+    /// back in the next run instead of being held out as breaking.
+    fn release_taken_out(&mut self, n: usize) {
+        for &(start, len) in self.proof.taken_out.iter().take(n) {
+            for d in self.deferred.iter_mut().skip(start).take(len) {
+                d.later = true;
+                d.cause = Cause::Later;
+                d.reason = "taken out while the application's build or start failed with a newer set; removing it did not make it pass, so the next run verifies it again".into();
+            }
+        }
+    }
+
+    /// What the runtime proof runs was found.
+    pub fn on_proof_plan(&mut self, plan: rp::ProofPlan) {
+        self.proof.plan = Some(plan);
+    }
+
+    /// The proof was not permitted or could not be set up: said, never a
+    /// claim.
+    pub fn skip_proof(&mut self, why: &str) {
+        self.proof.skipped = why.to_string();
+        self.proof.done = true;
+    }
+
+    /// The result of `Action::Proof`. A build that gave no result is run
+    /// once more before it stands as "no result".
+    pub fn on_proof(&mut self, base: bool, r: rp::ProofResult) {
+        self.proof.runs += 1;
+        self.proof.waited = false;
+        if !r.ran {
+            self.proof.broken += 1;
+            if self.proof.broken < MAX_BROKEN_PROBES && self.proof.runs < MAX_PROOF_RUNS {
+                return;
+            }
+        }
+        self.proof.broken = 0;
+        if base {
+            self.proof.base = Some(r);
+        } else {
+            self.proof.head = Some(r);
+            self.proof.proved = self.head.clone();
+        }
+    }
+
+    /// The run moved to a fresh step so the next proof build has a full time
+    /// window.
+    pub fn on_proof_wait(&mut self) {
+        self.proof.waited = true;
+    }
+
+    /// `Action::ProofTakeOut` was written to the branch, now at `head`: the
+    /// bumps it took out are deferred, and the branch is proven again.
+    pub fn on_proof_taken_out(&mut self, out: &TakenOut, head: &str) {
+        let n = out.lines.len();
+        self.proof
+            .taken_out
+            .push((self.deferred.len().saturating_sub(n), n));
+        self.head = head.to_string();
+        self.proof.head = None;
+    }
+
+    /// `Action::ProofTakeOut` could not be written: what fails is said, and
+    /// the pull request's own CI decides.
+    pub fn on_proof_take_out_failed(&mut self) {
+        let p = &self.proof;
+        let blamed = match (&p.plan, &p.base, &p.head) {
+            (Some(plan), Some(base), Some(head)) => rp::blamed(plan, base, head),
+            _ => vec![],
+        };
+        self.release_taken_out(self.proof.taken_out.len());
+        self.proof.unresolved = blamed;
+        self.proof.done = true;
+    }
+
+    /// The report's account of the runtime proof.
+    fn proof_md(&self) -> String {
+        let p = &self.proof;
+        let mut s = String::from(
+            "\n**Runtime proof (the repository's build and start, run in the sandbox with the bumps):**\n",
+        );
+        if !p.skipped.is_empty() {
+            s.push_str(&format!(
+                "- Not run: {}. Nothing here claims the application builds or starts; CI on this pull request is the check.\n",
+                p.skipped
+            ));
+            return s;
+        }
+        let Some(plan) = &p.plan else {
+            s.push_str("- Not run in this run. Nothing here claims the application builds or starts; CI on this pull request is the check.\n");
+            return s;
+        };
+        s.push_str(&rp::report(plan, p.base.as_ref(), p.head.as_ref()));
+        if p.head.is_some() && p.proved != self.head {
+            s.push_str("- This proof is of the branch before the pull request's CI took out its newest set of bumps; what is left was not built again here.\n");
+        }
+        for &(start, len) in &p.taken_out {
+            for d in self.deferred.iter().skip(start).take(len) {
+                s.push_str(&format!("- Taken out by this proof: {}\n", d.line()));
+            }
+        }
+        if !p.unresolved.is_empty() {
+            s.push_str(&format!(
+                "- Still failing with the bumps in this pull request: {}. It passes on the base branch, and no further set of bumps could be taken out here, so the pull request's CI decides.\n",
+                p.unresolved.join("; ")
+            ));
+        }
+        s
+    }
+
     pub fn finish_now(&mut self, why: &str) {
         self.give_up_unverified(why);
+        if !self.proof.done {
+            // The proof never ran to its end: said as not run, with why.
+            self.proof.skipped = "the run had no step left for it".into();
+            self.proof.done = true;
+        }
         self.done = true;
+    }
+
+    /// The commit the run started from: the base branch's head when it was
+    /// planned. `None` when no commit of bumps recorded it.
+    pub fn base_sha(&self) -> Option<&str> {
+        self.commits.first().map(|c| c.before.as_str())
     }
 
     /// Every deferral: the plan's and the run's.
@@ -1663,10 +2034,10 @@ impl DepRun {
                 b.from,
                 b.to,
                 b.manifest,
-                if b.major {
-                    "major version"
-                } else {
-                    "same version line"
+                match (b.major, b.major_reason.is_empty()) {
+                    (true, false) => format!("major version: {}", b.major_reason),
+                    (true, true) => "major version".to_string(),
+                    (false, _) => "same version line".to_string(),
                 }
             ));
         }
@@ -1703,9 +2074,18 @@ impl DepRun {
                 ));
             }
         }
+        if !self.applied.is_empty() {
+            s.push_str(&self.proof_md());
+        }
         s.push_str(&format!(
-            "\n**Cost:** {} sandbox probe(s); model ${:.2}",
-            self.probes, self.spent_usd
+            "\n**Cost:** {} sandbox probe(s){}; model ${:.2}",
+            self.probes,
+            if self.proof.runs > 0 {
+                format!(" and {} runtime proof build(s)", self.proof.runs)
+            } else {
+                String::new()
+            },
+            self.spent_usd
         ));
         let used: Vec<&BatchUse> = self
             .uses
@@ -1725,6 +2105,151 @@ impl DepRun {
         }
         s
     }
+}
+
+// ── What stays open after the run ───────────────────────────────────────
+
+/// Why an advisory stays open after the run's pull request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Open {
+    /// The advisory data lists no patched release at all.
+    NoPatch,
+    /// A parent package holds the version, or the fixed version could not
+    /// be installed.
+    Parent,
+    /// The bump broke the checks, the build or the start and was deferred.
+    Broke,
+    /// Only a major upgrade fixes it and the rules leave it out.
+    MajorNotNeeded,
+    /// A cap, the budget or time: the next run takes it.
+    Later,
+    /// It could not be placed or verified.
+    Unverified,
+    /// Another open pull request fixes it.
+    OtherPr,
+    /// It was not part of this run.
+    NotInRun,
+}
+
+impl Open {
+    pub fn label(self) -> &'static str {
+        match self {
+            Open::NoPatch => "no patched release exists yet",
+            Open::Parent => {
+                "blocked by a parent package (it pins the version, or the fixed version could not be installed)"
+            }
+            Open::Broke => "deferred because the build or the checks failed with the bump",
+            Open::MajorNotNeeded => {
+                "only a major upgrade fixes it, and the advisory is not reachable or urgent"
+            }
+            Open::Later => "left for the next run (a cap, the budget or time)",
+            Open::Unverified => "could not be placed or verified in the sandbox",
+            Open::OtherPr => "fixed by another open pull request",
+            Open::NotInRun => "not part of this run (not due yet, still being triaged, or in another run)",
+        }
+    }
+
+    fn of(c: Cause) -> Open {
+        match c {
+            Cause::Broke => Open::Broke,
+            Cause::Parent => Open::Parent,
+            Cause::MajorNotNeeded => Open::MajorNotNeeded,
+            Cause::Later => Open::Later,
+            Cause::Unverified => Open::Unverified,
+        }
+    }
+}
+
+/// The advisories of one reason that stay open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenGroup {
+    pub why: Open,
+    /// Advisories counted once per package (an advisory on two version
+    /// lines of a package is one).
+    pub advisories: usize,
+    pub packages: Vec<String>,
+}
+
+/// What stays open in the repository after the run: every finding of the
+/// repository still open that the run's pull request does not fix, grouped
+/// by why. `findings`: the repository's findings (any status; handled ones
+/// are left out here).
+pub fn remaining(run: &DepRun, findings: &[&Finding]) -> Vec<OpenGroup> {
+    let fixed = run.fixed_ids();
+    let deferred: BTreeMap<String, Cause> = run
+        .all_deferred()
+        .iter()
+        .flat_map(|d| d.finding_ids.iter().map(|id| (id.clone(), d.cause)))
+        .collect();
+    let mut by: BTreeMap<Open, Vec<(String, String)>> = BTreeMap::new();
+    for f in findings {
+        if !f.status.is_open() || fixed.contains(&f.id) {
+            continue;
+        }
+        let why = if let Some(c) = deferred.get(&f.id) {
+            Open::of(*c)
+        } else if f.fixed_version.is_none() || f.status == Status::NoFix {
+            Open::NoPatch
+        } else if f.status == Status::PrOpen {
+            Open::OtherPr
+        } else {
+            Open::NotInRun
+        };
+        let key = (f.advisory.primary.clone(), f.package.clone());
+        let v = by.entry(why).or_default();
+        if !v.contains(&key) {
+            v.push(key);
+        }
+    }
+    by.into_iter()
+        .map(|(why, pairs)| {
+            let mut packages: Vec<String> = pairs.iter().map(|(_, p)| p.clone()).collect();
+            packages.sort();
+            packages.dedup();
+            OpenGroup {
+                why,
+                advisories: pairs.len(),
+                packages,
+            }
+        })
+        .collect()
+}
+
+/// The report's last part: how many advisories stay open after the pull
+/// request, and why, by group. Counted from CoderHelm's own findings for
+/// the repository (its advisory sources), which is said.
+pub fn remaining_md(groups: &[OpenGroup]) -> String {
+    let total: usize = groups.iter().map(|g| g.advisories).sum();
+    let mut s = format!(
+        "**Advisories that stay open after this pull request: {total}** (counted from the advisories CoderHelm tracks for this repository)\n"
+    );
+    if total == 0 {
+        s.push_str(
+            "- None: every open advisory CoderHelm tracks for this repository is fixed here.\n",
+        );
+        return s;
+    }
+    for g in groups {
+        let shown: Vec<String> = g
+            .packages
+            .iter()
+            .take(8)
+            .map(|p| format!("`{p}`"))
+            .collect();
+        let more = g.packages.len().saturating_sub(8);
+        s.push_str(&format!(
+            "- {}: {} ({}{})\n",
+            g.advisories,
+            g.why.label(),
+            shown.join(", "),
+            if more > 0 {
+                format!(", and {more} more")
+            } else {
+                String::new()
+            }
+        ));
+    }
+    s
 }
 
 fn first_error_line(tail: &str) -> &str {

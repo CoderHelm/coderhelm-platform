@@ -22,13 +22,22 @@
 //!   ([`what_to_check`]), per package for a bundle. CI that fails is stated
 //!   as failing, never as a pass.
 //!
+//! - A bump that crosses a major version says why it has to (the advisory
+//!   with no patched release on the installed line), and its notes are read
+//!   before any other package's. When the package is only pulled in by
+//!   another one, the notes name that parent and say whether it declares
+//!   support for the new major ([`ParentSupport`]): the range the installed
+//!   parent declares for the package, and the range its newest release
+//!   declares. An override that puts a parent on a major it does not
+//!   declare is said in those words.
+//!
 //! Everything here is pure; the reads are the worker's
 //! (`worker::passes::upgrade_notes`).
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::security_fixes::{compare_versions, Bump};
+use crate::security_fixes::{compare_versions, same_line, Bump};
 
 /// Characters of release notes kept per package.
 pub const EXCERPT_CHARS: usize = 2_500;
@@ -42,6 +51,30 @@ pub const MAX_CALL_SITES: usize = 25;
 pub const SECTION_CHARS: usize = 14_000;
 /// Packages whose notes are read for one fix run.
 pub const MAX_PACKAGES: usize = 8;
+/// Parents read per package that is only pulled in by others.
+pub const MAX_PARENTS: usize = 3;
+
+/// Whether a package that pulls in a bumped one declares support for the
+/// bump's version.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ParentSupport {
+    pub parent: String,
+    /// The parent's installed version (empty when the dependency list
+    /// doesn't say, or holds several).
+    pub version: String,
+    /// The range the installed parent declares for the package.
+    pub declares: String,
+    /// Whether the bump's version is inside that range (`None`: not read,
+    /// or a range CoderHelm can't evaluate).
+    pub admits: Option<bool>,
+    /// The parent's newest release and what it declares.
+    pub latest: String,
+    pub latest_declares: String,
+    pub latest_admits: Option<bool>,
+    /// Why nothing could be read; empty when something was.
+    pub missing: String,
+}
 
 /// Where the repository uses an API a breaking change names.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -86,6 +119,14 @@ pub struct PackageNotes {
     /// The lockfile and the command that writes it, when known.
     pub lockfile: String,
     pub lock_command: String,
+    /// Why the bump leaves its version line, for a major (the advisory with
+    /// no patched release on the line).
+    pub major_reason: String,
+    /// The bumped package is in this repository's own manifest.
+    pub direct: bool,
+    /// The packages that pull it in, when it is only a transitive
+    /// dependency, with whether each declares support for the new version.
+    pub parents: Vec<ParentSupport>,
 }
 
 impl PackageNotes {
@@ -225,6 +266,327 @@ pub fn source_repo(ecosystem: &str, package: &str, meta: &Value) -> Option<Sourc
             .find_map(|k| meta[*k].as_str().and_then(plain)),
         _ => None,
     }
+}
+
+// ── A transitive package's parents ──────────────────────────────────────
+
+/// A registry's record of one version of a package, with what it depends
+/// on. `version`: `None` for the newest release. One row per ecosystem;
+/// `None` where the registry has no such record (the parent's support is
+/// then said to be unread, never guessed).
+pub fn deps_url(ecosystem: &str, package: &str, version: Option<&str>) -> Option<String> {
+    let enc = |s: &str| urlencoding::encode(s).to_string();
+    match (ecosystem, version) {
+        ("npm", v) => Some(format!(
+            "https://registry.npmjs.org/{}/{}",
+            package.replace('/', "%2F"),
+            enc(v.unwrap_or("latest"))
+        )),
+        ("PyPI", Some(v)) => Some(format!(
+            "https://pypi.org/pypi/{}/{}/json",
+            enc(package),
+            enc(v)
+        )),
+        ("PyPI", None) => Some(format!("https://pypi.org/pypi/{}/json", enc(package))),
+        ("crates.io", Some(v)) => Some(format!(
+            "https://crates.io/api/v1/crates/{}/{}/dependencies",
+            enc(package),
+            enc(v)
+        )),
+        ("RubyGems", Some(v)) => Some(format!(
+            "https://rubygems.org/api/v2/rubygems/{}/versions/{}.json",
+            enc(package),
+            enc(v)
+        )),
+        ("RubyGems", None) => Some(format!(
+            "https://rubygems.org/api/v1/gems/{}.json",
+            enc(package)
+        )),
+        _ => None,
+    }
+}
+
+/// The version a [`deps_url`] record is of.
+pub fn record_version(ecosystem: &str, meta: &Value) -> Option<String> {
+    match ecosystem {
+        "npm" | "RubyGems" => meta["version"].as_str().map(String::from),
+        "PyPI" => meta["info"]["version"].as_str().map(String::from),
+        _ => None,
+    }
+}
+
+/// The range a [`deps_url`] record declares for `child`, as the registry
+/// writes it. `None` when the record doesn't depend on it.
+pub fn declared_range(ecosystem: &str, meta: &Value, child: &str) -> Option<String> {
+    match ecosystem {
+        "npm" => ["dependencies", "peerDependencies", "optionalDependencies"]
+            .iter()
+            .find_map(|k| meta[*k][child].as_str().map(String::from)),
+        "PyPI" => {
+            let want = norm_name(child);
+            meta["info"]["requires_dist"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                // An extra's requirement is not what an install pulls in.
+                .filter(|r| !r.contains("extra =="))
+                .find_map(|r| {
+                    let r = r.split(';').next().unwrap_or(r).trim();
+                    let end = r
+                        .find(|c: char| {
+                            !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+                        })
+                        .unwrap_or(r.len());
+                    (norm_name(&r[..end]) == want).then(|| {
+                        let spec = r[end..]
+                            .trim()
+                            .trim_start_matches('(')
+                            .trim_end_matches(')')
+                            .trim();
+                        if spec.is_empty() || spec.starts_with('[') {
+                            "*".to_string()
+                        } else {
+                            spec.to_string()
+                        }
+                    })
+                })
+        }
+        "crates.io" => meta["dependencies"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|d| {
+                d["crate_id"].as_str() == Some(child)
+                    && d["kind"].as_str().is_none_or(|k| k == "normal")
+            })
+            .and_then(|d| d["req"].as_str().map(String::from)),
+        "RubyGems" => meta["dependencies"]["runtime"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|d| d["name"].as_str() == Some(child))
+            .and_then(|d| d["requirements"].as_str().map(String::from)),
+        _ => None,
+    }
+}
+
+/// The leading numbers of a version or partial version (`1.2.x` is `[1, 2]`).
+fn nums(v: &str) -> Vec<u64> {
+    v.trim()
+        .trim_start_matches(['v', '='])
+        .split(['.', '-', '+'])
+        .map_while(|p| p.parse::<u64>().ok())
+        .collect()
+}
+
+fn starts_with_nums(v: &str, prefix: &[u64]) -> bool {
+    let n = nums(v);
+    n.len() >= prefix.len() && n[..prefix.len()] == *prefix
+}
+
+/// `^base`: at or above it, below the next breaking version.
+fn caret(base: &str, v: &str) -> bool {
+    use std::cmp::Ordering::Less;
+    let b = nums(base);
+    let keep = match b.as_slice() {
+        [] => return true,
+        [0, 0, ..] => 3,
+        [0, ..] => 2,
+        _ => 1,
+    };
+    compare_versions(v, base) != Less && starts_with_nums(v, &b[..keep.min(b.len())])
+}
+
+/// `~base`: at or above it, on the same minor (or major, for `~1`).
+fn tilde(base: &str, v: &str) -> bool {
+    use std::cmp::Ordering::Less;
+    let b = nums(base);
+    b.is_empty() || (compare_versions(v, base) != Less && starts_with_nums(v, &b[..b.len().min(2)]))
+}
+
+/// `~> base` and `~= base`: at or above it, with all but its last part kept.
+fn pessimistic(base: &str, v: &str) -> bool {
+    use std::cmp::Ordering::Less;
+    let b = nums(base);
+    compare_versions(v, base) != Less && (b.len() < 2 || starts_with_nums(v, &b[..b.len() - 1]))
+}
+
+/// One comparator of a range (`>=1.2`, `^7`, `~>2.1`, `1.x`).
+fn comparator_admits(ecosystem: &str, c: &str, v: &str) -> Option<bool> {
+    use std::cmp::Ordering::*;
+    let c = c.trim();
+    if c.is_empty() || c == "*" || c.eq_ignore_ascii_case("x") {
+        return Some(true);
+    }
+    let versioned = |base: &str| base.chars().next().is_some_and(|x| x.is_ascii_digit());
+    for (op, f) in [
+        ("~>", pessimistic as fn(&str, &str) -> bool),
+        ("~=", pessimistic),
+        ("^", caret),
+        ("~", tilde),
+    ] {
+        if let Some(base) = c.strip_prefix(op) {
+            let base = base.trim();
+            return versioned(base).then(|| f(base, v));
+        }
+    }
+    for op in [">=", "<=", "==", "!=", ">", "<", "="] {
+        if let Some(base) = c.strip_prefix(op) {
+            let base = base.trim();
+            if !versioned(base) {
+                return None;
+            }
+            // `==1.4.*`, `<=2` and `>2`: a partial version stands for
+            // every version that starts with it.
+            let prefix = nums(base);
+            let partial = prefix.len() < 3;
+            let within = starts_with_nums(v, &prefix);
+            let wild = base.contains('*') || base.to_ascii_lowercase().contains('x');
+            let o = compare_versions(v, base);
+            return Some(match op {
+                ">=" => o != Less,
+                "<=" => o != Greater || (partial && within),
+                ">" => o == Greater && !(partial && within),
+                "<" => o == Less,
+                "!=" if wild => !within,
+                "!=" => o != Equal,
+                _ if wild => within,
+                _ => o == Equal,
+            });
+        }
+    }
+    if !versioned(c) {
+        // A tag, a URL, a workspace or git reference: not a range.
+        return None;
+    }
+    let partial = nums(c).len() < 3 || c.contains('*') || c.to_ascii_lowercase().contains(".x");
+    Some(match ecosystem {
+        // Cargo reads a bare version as a caret range.
+        "crates.io" => caret(c, v),
+        _ if partial => starts_with_nums(v, &nums(c)),
+        _ => compare_versions(v, c) == Equal,
+    })
+}
+
+/// Whether `version` is inside a declared dependency range, in the range
+/// syntax of the ecosystem (npm's `^7 || ^8`, Cargo's `1.2, <1.9`, PyPI's
+/// `>=1,<3`, RubyGems' `~> 2.1`). `None` when the range isn't one CoderHelm
+/// can evaluate (a tag, a URL, a git reference).
+pub fn range_admits(ecosystem: &str, range: &str, version: &str) -> Option<bool> {
+    let mut any = Some(false);
+    for alt in range.split("||") {
+        // Operators written apart from their version (`>= 1.2`).
+        let mut alt = alt.trim().to_string();
+        for op in [">=", "<=", "~>", "~=", "==", "!=", ">", "<", "^", "~", "="] {
+            alt = alt.replace(&format!("{op} "), op);
+        }
+        let parts: Vec<&str> = if ecosystem == "npm" {
+            alt.split_whitespace().collect()
+        } else {
+            alt.split(',').map(str::trim).collect()
+        };
+        // npm's `1.2.3 - 2.3.4`.
+        let set = if let [lo, "-", hi] = parts.as_slice() {
+            match (
+                comparator_admits(ecosystem, &format!(">={lo}"), version),
+                comparator_admits(ecosystem, &format!("<={hi}"), version),
+            ) {
+                (Some(a), Some(b)) => Some(a && b),
+                _ => None,
+            }
+        } else {
+            let mut all = Some(true);
+            for c in &parts {
+                match (all, comparator_admits(ecosystem, c, version)) {
+                    (_, None) => {
+                        all = None;
+                        break;
+                    }
+                    (Some(a), Some(b)) => all = Some(a && b),
+                    (None, _) => {}
+                }
+            }
+            all
+        };
+        match set {
+            Some(true) => return Some(true),
+            Some(false) => {}
+            None => any = None,
+        }
+    }
+    any
+}
+
+/// The line of one parent, for the ticket and the pull request.
+pub fn parent_line(p: &ParentSupport, package: &str, to: &str) -> String {
+    if p.declares.is_empty() && p.latest_declares.is_empty() {
+        return format!(
+            "Pulled in by `{}`: whether it supports {to} could not be read ({}).",
+            p.parent,
+            if p.missing.is_empty() {
+                "its registry record names no range for the package"
+            } else {
+                p.missing.as_str()
+            }
+        );
+    }
+    let mut s = format!("Pulled in by `{}`", p.parent);
+    if !p.version.is_empty() {
+        s.push_str(&format!(" {}", p.version));
+    }
+    if p.declares.is_empty() {
+        s.push_str(", whose installed version's declared range could not be read.");
+    } else {
+        s.push_str(&format!(
+            ", which declares `{package}: {}`: {to} is {}.",
+            p.declares,
+            match p.admits {
+                Some(true) => "inside the range it declares",
+                Some(false) =>
+                    "outside the range it declares, so the override puts it on a version it does not declare support for",
+                None => "not comparable with that range by CoderHelm",
+            }
+        ));
+    }
+    if !p.latest.is_empty() && p.latest != p.version && !p.latest_declares.is_empty() {
+        s.push_str(&format!(
+            " Its newest release {} declares `{}`, which {}.",
+            p.latest,
+            p.latest_declares,
+            match p.latest_admits {
+                Some(true) => format!(
+                    "admits {to}: upgrading `{}` is the way its maintainers support",
+                    p.parent
+                ),
+                Some(false) => format!("does not admit {to} either"),
+                None => "CoderHelm can't compare".to_string(),
+            }
+        ));
+    }
+    s
+}
+
+/// What a major bump's notes say about why it is one and who uses the
+/// package: this repository's own code, or the parents that pull it in.
+pub fn usage_lines(n: &PackageNotes) -> Vec<String> {
+    let mut out = vec![];
+    if !n.major {
+        return out;
+    }
+    if !n.major_reason.is_empty() {
+        out.push(format!("Why a major version: {}.", n.major_reason));
+    }
+    if n.direct {
+        out.push(
+            "A direct dependency: this repository's own code calls it (its call sites are listed here)."
+                .to_string(),
+        );
+    }
+    for p in &n.parents {
+        out.push(parent_line(p, &n.package, &n.to));
+    }
+    out
 }
 
 // ── Versions in tags and headings ───────────────────────────────────────
@@ -854,6 +1216,9 @@ pub fn ticket_section(notes: &[PackageNotes]) -> String {
             n.to,
             if n.major { " (major version)" } else { "" }
         );
+        for l in usage_lines(n) {
+            p.push_str(&format!("{l}\n"));
+        }
         if n.read() {
             p.push_str(&format!(
                 "Read from {} ({}){}.\n",
@@ -1030,12 +1395,26 @@ pub fn notes_for<'a>(w: &'a WhatToCheck, package: &str) -> Option<&'a PackageNot
         .find(|n| n.package.eq_ignore_ascii_case(package))
 }
 
+/// The notes read for a bump: its package's on its own version line (a
+/// package bumped on two lines has notes for each), else its package's.
+pub fn notes_for_bump<'a>(w: &'a WhatToCheck, b: &Bump) -> Option<&'a PackageNotes> {
+    w.notes
+        .iter()
+        .find(|n| n.package.eq_ignore_ascii_case(&b.package) && same_line(&n.from, &b.from))
+        .or_else(|| notes_for(w, &b.package))
+}
+
 /// A major version a person has to look at: its notes list breaking
-/// changes, the code uses what changed, or its notes weren't read.
+/// changes, the code uses what changed, its notes weren't read, or a
+/// parent does not declare support for it.
 pub fn needs_eyes(b: &Bump, w: &WhatToCheck) -> bool {
     b.major
-        && notes_for(w, &b.package)
-            .is_none_or(|n| !n.read() || !n.breaking.is_empty() || !n.call_sites.is_empty())
+        && notes_for_bump(w, b).is_none_or(|n| {
+            !n.read()
+                || !n.breaking.is_empty()
+                || !n.call_sites.is_empty()
+                || n.parents.iter().any(|p| p.admits != Some(true))
+        })
 }
 
 /// A bundle's section when it is too long to list every package: the
@@ -1080,7 +1459,7 @@ fn package_check(b: &Bump, w: &WhatToCheck, cap: usize) -> String {
         }
     };
     {
-        let n = notes_for(w, &b.package);
+        let n = notes_for_bump(w, b);
         s.push_str(&format!(
             "### `{}` {} to {}{}\n\n",
             b.package,
@@ -1088,6 +1467,9 @@ fn package_check(b: &Bump, w: &WhatToCheck, cap: usize) -> String {
             b.to,
             if b.major { " (major version)" } else { "" }
         ));
+        for l in n.map(usage_lines).unwrap_or_default() {
+            s.push_str(&format!("- {l}\n"));
+        }
         match n {
             Some(n) if n.read() => {
                 s.push_str(&format!(
@@ -1536,6 +1918,239 @@ mod tests {
         assert_eq!(
             out,
             "<!-- status -->\nheld\n\n## Summary\nx\n\n## What to check\nnew\n\n## Proof\nnew proof\n"
+        );
+    }
+}
+
+#[cfg(test)]
+mod parent_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn a_declared_range_admits_a_version_in_each_ecosystems_syntax() {
+        let cases: &[(&str, &str, &str, Option<bool>)] = &[
+            // npm
+            ("npm", "^7.0.0", "7.5.4", Some(true)),
+            ("npm", "^7.0.0", "8.1.1", Some(false)),
+            ("npm", "^7.0.0 || ^8.0.0", "8.1.1", Some(true)),
+            ("npm", ">=7.2.0 <9", "8.1.1", Some(true)),
+            ("npm", ">= 7.2.0 < 8", "8.1.1", Some(false)),
+            ("npm", "~7.2.0", "7.5.4", Some(false)),
+            ("npm", "~7.2", "7.2.9", Some(true)),
+            ("npm", "7.x", "7.5.4", Some(true)),
+            ("npm", "7", "8.0.0", Some(false)),
+            ("npm", "*", "8.1.1", Some(true)),
+            ("npm", "", "8.1.1", Some(true)),
+            ("npm", "7.0.0 - 8.5.0", "8.1.1", Some(true)),
+            ("npm", "^0.12.1", "0.13.0", Some(false)),
+            ("npm", "^0.12.1", "0.12.9", Some(true)),
+            ("npm", "^0.0.3", "0.0.4", Some(false)),
+            ("npm", "7.5.4", "7.5.4", Some(true)),
+            ("npm", "workspace:*", "8.1.1", None),
+            ("npm", "github:acme/glob-walk", "8.1.1", None),
+            ("npm", "latest", "8.1.1", None),
+            // Cargo: a bare version is a caret range.
+            ("crates.io", "1.2", "1.9.0", Some(true)),
+            ("crates.io", "1.2", "2.0.0", Some(false)),
+            ("crates.io", ">=1.2, <1.9", "1.9.0", Some(false)),
+            ("crates.io", "0.4.1", "0.5.0", Some(false)),
+            // PyPI
+            ("PyPI", ">=1.0,<3", "2.4.0", Some(true)),
+            ("PyPI", ">=1.0,<3", "3.0.0", Some(false)),
+            ("PyPI", "~=2.1", "2.9.0", Some(true)),
+            ("PyPI", "~=2.1.0", "2.2.0", Some(false)),
+            ("PyPI", "==2.1.*", "2.1.7", Some(true)),
+            ("PyPI", "!=2.1.7,>=2", "2.1.7", Some(false)),
+            // RubyGems
+            ("RubyGems", "~> 2.1", "2.9.0", Some(true)),
+            ("RubyGems", "~> 2.1", "3.0.0", Some(false)),
+            ("RubyGems", ">= 1.0, < 3", "2.9.0", Some(true)),
+        ];
+        for (eco, range, version, want) in cases {
+            assert_eq!(
+                range_admits(eco, range, version),
+                *want,
+                "{eco}: `{range}` and {version}"
+            );
+        }
+    }
+
+    #[test]
+    fn each_registrys_record_names_the_range_it_declares() {
+        let npm = json!({"version": "3.2.1", "dependencies": {"glob-walk": "^7.0.0"},
+            "peerDependencies": {"react": ">=17"}});
+        assert_eq!(
+            declared_range("npm", &npm, "glob-walk").as_deref(),
+            Some("^7.0.0")
+        );
+        assert_eq!(
+            declared_range("npm", &npm, "react").as_deref(),
+            Some(">=17")
+        );
+        assert_eq!(declared_range("npm", &npm, "left-out"), None);
+        assert_eq!(record_version("npm", &npm).as_deref(), Some("3.2.1"));
+        let pypi = json!({"info": {"version": "2.0.0", "requires_dist": [
+            "Yaml_Lite (>=1.0,<3)", "tomlkit>=0.11; python_version < '3.11'",
+            "yaml-lite>=9 ; extra == 'fast'", "plainpkg"]}});
+        assert_eq!(
+            declared_range("PyPI", &pypi, "yaml-lite").as_deref(),
+            Some(">=1.0,<3")
+        );
+        assert_eq!(
+            declared_range("PyPI", &pypi, "tomlkit").as_deref(),
+            Some(">=0.11")
+        );
+        assert_eq!(
+            declared_range("PyPI", &pypi, "plainpkg").as_deref(),
+            Some("*")
+        );
+        assert_eq!(record_version("PyPI", &pypi).as_deref(), Some("2.0.0"));
+        let crates = json!({"dependencies": [
+            {"crate_id": "xml-read", "req": "^0.31", "kind": "dev"},
+            {"crate_id": "xml-read", "req": "^0.36", "kind": "normal"}]});
+        assert_eq!(
+            declared_range("crates.io", &crates, "xml-read").as_deref(),
+            Some("^0.36")
+        );
+        let gems = json!({"version": "5.1.0", "dependencies": {"runtime": [
+            {"name": "rack-lite", "requirements": "~> 2.1"}]}});
+        assert_eq!(
+            declared_range("RubyGems", &gems, "rack-lite").as_deref(),
+            Some("~> 2.1")
+        );
+        // Every ecosystem with a record has its URL; the others say none.
+        assert_eq!(
+            deps_url("npm", "@acme/parent-lib", Some("3.2.1")).as_deref(),
+            Some("https://registry.npmjs.org/@acme%2Fparent-lib/3.2.1")
+        );
+        assert_eq!(
+            deps_url("npm", "parent-lib", None).as_deref(),
+            Some("https://registry.npmjs.org/parent-lib/latest")
+        );
+        assert!(deps_url("PyPI", "parent", Some("1.0"))
+            .unwrap()
+            .ends_with("/parent/1.0/json"));
+        assert!(deps_url("crates.io", "parent", Some("1.0"))
+            .unwrap()
+            .ends_with("/parent/1.0/dependencies"));
+        assert_eq!(deps_url("crates.io", "parent", None), None);
+        assert_eq!(deps_url("Go", "example.invalid/parent", Some("1.0")), None);
+    }
+
+    fn major_notes() -> PackageNotes {
+        PackageNotes {
+            package: "glob-walk".into(),
+            ecosystem: "npm".into(),
+            from: "7.2.0".into(),
+            to: "8.1.1".into(),
+            major: true,
+            major_reason: "GHSA-eeee lists no patched release on the 7 line (patched releases it lists: 8.1.1)".into(),
+            parents: vec![ParentSupport {
+                parent: "build-kit".into(),
+                version: "3.2.1".into(),
+                declares: "^7.0.0".into(),
+                admits: Some(false),
+                latest: "4.0.0".into(),
+                latest_declares: "^8.0.0".into(),
+                latest_admits: Some(true),
+                missing: String::new(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_transitive_major_names_its_parent_and_what_the_parent_declares() {
+        let n = major_notes();
+        assert_eq!(
+            usage_lines(&n),
+            vec![
+                "Why a major version: GHSA-eeee lists no patched release on the 7 line (patched releases it lists: 8.1.1).",
+                "Pulled in by `build-kit` 3.2.1, which declares `glob-walk: ^7.0.0`: 8.1.1 is outside the range it declares, so the override puts it on a version it does not declare support for. Its newest release 4.0.0 declares `^8.0.0`, which admits 8.1.1: upgrading `build-kit` is the way its maintainers support.",
+            ]
+        );
+        // In the pull request, under the package, and it needs a look.
+        let b = Bump {
+            package: "glob-walk".into(),
+            from: "7.2.0".into(),
+            to: "8.1.1".into(),
+            major: true,
+            manifest: "pnpm-lock.yaml".into(),
+        };
+        let w = WhatToCheck {
+            notes: vec![n.clone()],
+            ..Default::default()
+        };
+        let text = what_to_check(std::slice::from_ref(&b), &w);
+        assert!(
+            text.contains(
+                "- Why a major version: GHSA-eeee lists no patched release on the 7 line"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("- Pulled in by `build-kit` 3.2.1, which declares `glob-walk: ^7.0.0`: 8.1.1 is outside the range it declares"), "{text}");
+        assert!(needs_eyes(&b, &w));
+        // And in the ticket the coder reads.
+        let ticket = ticket_section(std::slice::from_ref(&n));
+        assert!(
+            ticket.contains("Pulled in by `build-kit` 3.2.1"),
+            "{ticket}"
+        );
+        // A parent that declares the new major reads as inside its range.
+        let mut ok = n.clone();
+        ok.parents[0].declares = "^7.0.0 || ^8.0.0".into();
+        ok.parents[0].admits = Some(true);
+        ok.parents[0].latest.clear();
+        assert_eq!(
+            usage_lines(&ok)[1],
+            "Pulled in by `build-kit` 3.2.1, which declares `glob-walk: ^7.0.0 || ^8.0.0`: 8.1.1 is inside the range it declares."
+        );
+        // Nothing read is said so, never guessed.
+        let mut unread = n;
+        unread.parents = vec![ParentSupport {
+            parent: "build-kit".into(),
+            missing: "the registry answered 404".into(),
+            ..Default::default()
+        }];
+        assert_eq!(
+            usage_lines(&unread)[1],
+            "Pulled in by `build-kit`: whether it supports 8.1.1 could not be read (the registry answered 404)."
+        );
+    }
+
+    #[test]
+    fn a_package_bumped_on_two_lines_has_notes_for_each() {
+        let mut seven = major_notes();
+        seven.to = "7.5.4".into();
+        seven.major = false;
+        seven.parents.clear();
+        seven.breaking = vec!["on the 7 line".into()];
+        let mut eight = seven.clone();
+        eight.from = "8.0.3".into();
+        eight.to = "8.1.1".into();
+        eight.breaking = vec!["on the 8 line".into()];
+        let w = WhatToCheck {
+            notes: vec![seven, eight],
+            ..Default::default()
+        };
+        let b = |from: &str| Bump {
+            package: "glob-walk".into(),
+            from: from.into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            notes_for_bump(&w, &b("8.0.3")).unwrap().breaking,
+            vec!["on the 8 line"]
+        );
+        assert_eq!(
+            notes_for_bump(&w, &b("7.1.0")).unwrap().breaking,
+            vec!["on the 7 line"]
+        );
+        // A line with no notes of its own falls back to the package's.
+        assert_eq!(
+            notes_for_bump(&w, &b("6.0.0")).unwrap().breaking,
+            vec!["on the 7 line"]
         );
     }
 }

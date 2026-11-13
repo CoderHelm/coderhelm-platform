@@ -590,7 +590,7 @@ fn is_build_cmd(line: &str) -> bool {
     (["pnpm", "npm", "yarn", "turbo", "bun"].contains(&first)
         && tokens
             .iter()
-            .any(|t| *t == "build" || t.ends_with(":build")))
+            .any(|t| *t == "build" || t.ends_with(":build") || t.starts_with("build:")))
         || low.starts_with("cargo build")
         || low.starts_with("go build")
 }
@@ -798,6 +798,12 @@ fn runs_on_pull_request(on: &Value, base: &str) -> bool {
 /// doesn't trigger it. A workflow YAML can't read is scanned line by line,
 /// as long as it names `pull_request`.
 fn workflow_commands(wf: &Workflow, base: &str) -> Vec<CiCommand> {
+    commands_of(wf, Some(base))
+}
+
+/// [`workflow_commands`] for a pull request into `base`; with `None`, the
+/// check commands of the workflow whatever triggers it.
+fn commands_of(wf: &Workflow, base: Option<&str>) -> Vec<CiCommand> {
     let file = wf.path.rsplit('/').next().unwrap_or(&wf.path).to_string();
     let mut found: Vec<(String, Option<String>, String)> = Vec::new();
     match serde_yaml::from_str::<Value>(&wf.text) {
@@ -805,7 +811,7 @@ fn workflow_commands(wf: &Workflow, base: &str) -> Vec<CiCommand> {
             let Some(on) = get(&doc, "on") else {
                 return Vec::new();
             };
-            if !runs_on_pull_request(on, base) {
+            if base.is_some_and(|b| !runs_on_pull_request(on, b)) {
                 return Vec::new();
             }
             let Some(jobs) = get(&doc, "jobs").and_then(Value::as_mapping) else {
@@ -835,7 +841,7 @@ fn workflow_commands(wf: &Workflow, base: &str) -> Vec<CiCommand> {
                 }
             }
         }
-        Err(_) if wf.text.contains("pull_request") => {
+        Err(_) if base.is_none() || wf.text.contains("pull_request") => {
             for raw in wf.text.lines() {
                 let line = raw.trim().trim_start_matches("- ").trim();
                 let Some(run) = line.strip_prefix("run:") else {
@@ -888,6 +894,33 @@ pub fn pr_commands(workflows: &[Workflow], base: &str) -> Vec<CiCommand> {
     }
     for (i, c) in out.iter_mut().enumerate() {
         c.id = format!("C{}", i + 1);
+    }
+    out
+}
+
+/// The build commands the repository's workflows run, for the runtime
+/// proof of a dependency run (`common::runtime_proof`): the ones a pull
+/// request into `base` triggers, marked as such, then the ones any other
+/// workflow runs (a deploy workflow's build is still the repository's real
+/// build). Each as the workflow writes it, with the directory it runs in.
+pub fn build_commands(workflows: &[Workflow], base: &str) -> Vec<common::runtime_proof::CiBuild> {
+    let mut out: Vec<common::runtime_proof::CiBuild> = Vec::new();
+    for on_pull_request in [true, false] {
+        for wf in workflows {
+            let cmds = commands_of(wf, on_pull_request.then_some(base));
+            for c in cmds.into_iter().filter(|c| c.kind == CheckKind::Build) {
+                if out.iter().any(|o| o.cmd == c.cmd && o.dir == c.dir) {
+                    continue;
+                }
+                out.push(common::runtime_proof::CiBuild {
+                    cmd: c.cmd,
+                    dir: c.dir,
+                    workflow: c.workflow,
+                    job: c.job,
+                    on_pull_request,
+                });
+            }
+        }
     }
     out
 }
@@ -1364,5 +1397,45 @@ jobs:
         ] {
             assert_eq!(CheckKind::parse(k.name()), Some(k));
         }
+    }
+
+    #[test]
+    fn the_build_commands_are_the_ones_the_workflows_run() {
+        let ci = wf(
+            ".github/workflows/ci.yml",
+            "on:\n  pull_request:\njobs:\n  build:\n    steps:\n      - run: pnpm install --frozen-lockfile\n      - run: pnpm lint\n      - run: pnpm --filter web build\n        working-directory: apps/web\n",
+        );
+        let deploy = wf(
+            ".github/workflows/deploy.yml",
+            "on:\n  push:\n    branches: [main]\njobs:\n  ship:\n    steps:\n      - run: pnpm --filter web build\n        working-directory: apps/web\n      - run: pnpm build:prod\n      - run: ./scripts/deploy.sh\n",
+        );
+        let found = build_commands(&[deploy, ci], "main");
+        let seen: Vec<(&str, Option<&str>, &str, bool)> = found
+            .iter()
+            .map(|b| {
+                (
+                    b.cmd.as_str(),
+                    b.dir.as_deref(),
+                    b.workflow.as_str(),
+                    b.on_pull_request,
+                )
+            })
+            .collect();
+        // What a pull request triggers first; a command both workflows run
+        // is kept once; lint, install and a deploy script are not builds.
+        assert_eq!(
+            seen,
+            vec![
+                ("pnpm --filter web build", Some("apps/web"), "ci.yml", true),
+                ("pnpm build:prod", None, "deploy.yml", false),
+            ]
+        );
+        assert_eq!(found[0].job, "build");
+        // A repository whose workflows build nothing names none.
+        let lint_only = wf(
+            ".github/workflows/lint.yml",
+            "on: pull_request\njobs:\n  lint:\n    steps:\n      - run: pnpm lint\n",
+        );
+        assert!(build_commands(&[lint_only], "main").is_empty());
     }
 }

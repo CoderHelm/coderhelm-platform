@@ -2495,10 +2495,18 @@ pub fn deferred_waits(
 }
 
 /// A finding a bundle leaves to a pull request (or issue) of its own: its
-/// major bump was split out after it failed the bundle's CI, or the policy
-/// opens only an issue for a major bump.
+/// fix crosses a major version, its major bump was split out after it
+/// failed the bundle's CI, or the policy opens only an issue for a major
+/// bump.
+///
+/// A bundle once carried 64 bumps, four of them across a major version:
+/// the one risky bump held every safe one. A fix that leaves its version
+/// line now gets its own pull request from the start (one per package),
+/// verified and proven on its own, and the bundle is the bumps that stay on
+/// their lines.
 pub fn stands_alone(f: &Finding, st: &FindingState, cfg: &SecurityConfig) -> bool {
     st.split
+        || crate::dep_fix::crosses_major(f, st, cfg)
         || (cfg.major_bumps == MajorBumps::IssueOnly
             && f.fixed_version
                 .as_deref()
@@ -2577,19 +2585,31 @@ fn per_package_units(
         .collect()
 }
 
-/// Adds a finding's bump to a unit's: one per package, to the highest
-/// version any of its advisories needs.
+/// Whether a finding is one a bump fixes: the bump's package, on the
+/// bump's version line.
+pub fn in_bump(b: &Bump, f: &Finding) -> bool {
+    b.package.eq_ignore_ascii_case(&f.package) && same_line(&b.from, &f.version)
+}
+
+/// Adds a finding's bump to a unit's: one per package and version line, to
+/// the highest version any of the line's advisories needs.
+///
+/// One bump per package (whatever the line) once took the highest target
+/// of all of a package's copies: a copy on the 7 line with a patched 7.x
+/// release was listed as "7.x to 8.y, a major version" because another copy
+/// sat on the 8 line, and the run forced the 7 line onto 8 through an
+/// override. Each line is its own bump, to its own line's fix.
 fn add_bump(bumps: &mut Vec<Bump>, f: &Finding) {
     let to = f.fixed_version.clone().unwrap_or_default();
-    match bumps
-        .iter_mut()
-        .find(|b| b.package.eq_ignore_ascii_case(&f.package))
-    {
+    match bumps.iter_mut().find(|b| in_bump(b, f)) {
         Some(b) => {
+            if compare_versions(&f.version, &b.from) == std::cmp::Ordering::Less {
+                b.from = f.version.clone();
+            }
             if compare_versions(&to, &b.to) == std::cmp::Ordering::Greater {
                 b.to = to.clone();
-                b.major = is_major_bump(&b.from, &to);
             }
+            b.major = is_major_bump(&b.from, &b.to);
         }
         None => bumps.push(Bump {
             package: f.package.clone(),
@@ -2809,16 +2829,11 @@ pub fn join_unit(
 /// member would leave (the pull request is then only the major bumps, and
 /// stays as it is for a person).
 pub fn split_out(unit: &FixUnit, findings: &[(Finding, FindingState)]) -> Vec<String> {
-    let majors: Vec<&str> = unit
-        .bumps
-        .iter()
-        .filter(|b| b.major)
-        .map(|b| b.package.as_str())
-        .collect();
+    let majors: Vec<&Bump> = unit.bumps.iter().filter(|b| b.major).collect();
     let out: Vec<String> = findings
         .iter()
         .filter(|(f, _)| unit.finding_ids.contains(&f.id))
-        .filter(|(f, _)| majors.iter().any(|p| p.eq_ignore_ascii_case(&f.package)))
+        .filter(|(f, _)| majors.iter().any(|b| in_bump(b, f)))
         .map(|(f, _)| f.id.clone())
         .collect();
     let stays = unit.finding_ids.iter().any(|id| !out.contains(id));
@@ -2840,11 +2855,8 @@ pub fn without(
     u.finding_ids.retain(|id| !gone.contains(id));
     let by_id = by_id(findings);
     let members = members_of(&u, &by_id);
-    u.bumps.retain(|b| {
-        members
-            .iter()
-            .any(|(f, _)| f.package.eq_ignore_ascii_case(&b.package))
-    });
+    u.bumps
+        .retain(|b| members.iter().any(|(f, _)| in_bump(b, f)));
     u.tier = members.iter().filter_map(|(f, _)| f.tier).min();
     finish_bundle(&mut u, &members, cfg);
     u
@@ -2938,9 +2950,27 @@ pub fn ticket_body_with(
         s.push_str("Every bump below goes in this one pull request.\n\n");
     }
     s.push_str("## Bumps\n");
+    s.push_str("One line per package and version line. A package installed on two version lines is fixed on each line with that line's own patched release.\n");
     for b in &unit.bumps {
+        let line = version_line(&b.from);
+        let how = if b.major {
+            let advisory = members
+                .iter()
+                .find(|f| in_bump(b, f) && f.fixed_version.as_deref() == Some(b.to.as_str()))
+                .or_else(|| members.iter().find(|f| in_bump(b, f)))
+                .map(|f| f.advisory.primary.as_str())
+                .filter(|a| !a.is_empty())
+                .unwrap_or("its advisory");
+            format!(
+                " — a major version, because {advisory} lists no patched release on the {line} line: fix the breaking changes in this same change"
+            )
+        } else {
+            format!(
+                " — stays on the {line} line: never move it to another major version, in a range or in an override"
+            )
+        };
         s.push_str(&format!(
-            "- `{}` {} to {} ({}){}\n",
+            "- `{}` {} to {} ({}){how}\n",
             b.package,
             b.from,
             b.to,
@@ -2949,17 +2979,13 @@ pub fn ticket_body_with(
             } else {
                 &b.manifest
             },
-            if b.major {
-                " — a major version: fix the breaking changes in this same change"
-            } else {
-                ""
-            }
         ));
     }
     s.push_str(&crate::upgrade_notes::ticket_section(notes));
     let major_in_pr = cfg.major_bumps == MajorBumps::FixInPr && unit.bumps.iter().any(|b| b.major);
     s.push_str("\n## How\n");
     s.push_str("1. Change the manifest only. A direct dependency: raise its version range to the fixed version. A transitive one: add the ecosystem's override (npm `overrides`, pnpm `pnpm.overrides`, Yarn `resolutions`, Poetry or uv constraints, Maven `dependencyManagement`, Gradle `constraints`) with a comment saying it can be removed once the parent ships the fixed version.\n");
+    s.push_str("   Use exactly the version each line under Bumps names. Where the manager scopes an override to a version line (`pkg@7`), scope it, and point it inside that same major: an override for the 7 line never points at 8 unless its line under Bumps says a major version is needed.\n");
     s.push_str("2. Never write or edit a lockfile yourself. CoderHelm runs the repository's own package manager in its sandbox right after your change (the command is named under Upgrade notes) and commits the lockfile it writes; a lockfile you edited is replaced by that output.\n");
     s.push_str("3. Read the upgrade notes above. For every breaking change they name, find each use in this repository with search_code (the listed places are where a search found them before the run, not necessarily all of them) and update every call site in this same change. Keep the behaviour the same.\n");
     if major_in_pr {
@@ -3023,7 +3049,7 @@ pub fn bump_table(unit: &FixUnit, members: &[(&Finding, &FindingState)]) -> Stri
         let mine: Vec<&Finding> = members
             .iter()
             .map(|(f, _)| *f)
-            .filter(|f| f.package.eq_ignore_ascii_case(&b.package))
+            .filter(|f| in_bump(b, f))
             .collect();
         let mut ids: Vec<&str> = mine.iter().map(|f| f.advisory.primary.as_str()).collect();
         ids.sort();
@@ -3166,7 +3192,7 @@ fn package_tiers(unit: &FixUnit, members: &[(&Finding, &FindingState)]) -> Vec<O
         .map(|b| {
             members
                 .iter()
-                .filter(|(f, _)| f.package.eq_ignore_ascii_case(&b.package))
+                .filter(|(f, _)| in_bump(b, f))
                 .filter_map(|(f, _)| f.tier)
                 .min()
         })
@@ -3188,7 +3214,7 @@ pub fn bumps_by_priority(
         let urgent = matches!(tiers[i], Some(Tier::P0 | Tier::P1));
         let eyes = crate::upgrade_notes::needs_eyes(b, check);
         let sites =
-            crate::upgrade_notes::notes_for(check, &b.package).map_or(0, |n| n.call_sites.len());
+            crate::upgrade_notes::notes_for_bump(check, b).map_or(0, |n| n.call_sites.len());
         (
             !urgent,
             !eyes,
@@ -3214,7 +3240,7 @@ const SHORT_CAP: usize = 5;
 fn package_cell(b: &Bump, members: &[(&Finding, &FindingState)], links: &BodyLinks) -> String {
     let id = members
         .iter()
-        .find(|(f, _)| f.package.eq_ignore_ascii_case(&b.package))
+        .find(|(f, _)| in_bump(b, f))
         .map(|(f, _)| f.id.as_str())
         .unwrap_or("");
     let name = format!("`{}`", b.package.replace('|', "\\|"));
@@ -3280,7 +3306,7 @@ fn short_body(
         let mine: Vec<&Finding> = members
             .iter()
             .map(|(f, _)| *f)
-            .filter(|f| f.package.eq_ignore_ascii_case(&b.package))
+            .filter(|f| in_bump(b, f))
             .collect();
         let mut ids: Vec<&str> = mine.iter().map(|f| f.advisory.primary.as_str()).collect();
         ids.sort();
@@ -4647,6 +4673,13 @@ pub fn advisory_from_osv(v: &Value, ecosystem: &str, package: &str) -> Option<Ad
         }
         any = true;
         for r in a["ranges"].as_array().into_iter().flatten() {
+            // A `GIT` range's events are commit hashes, never a release: a
+            // hash read as a version made a bump's target unreadable, and
+            // hid the release that patches the installed version line.
+            let ty = r["type"].as_str().unwrap_or("");
+            if ty != "SEMVER" && ty != "ECOSYSTEM" {
+                continue;
+            }
             for ev in r["events"].as_array().into_iter().flatten() {
                 if let Some(f) = ev["fixed"].as_str() {
                     ranges_fixed.push(f.to_string());
@@ -5901,7 +5934,7 @@ pub fn unit_plan(u: &FixUnit, findings: &[(Finding, FindingState)], any: bool) -
             let mine: Vec<&Finding> = members
                 .iter()
                 .map(|(f, _)| *f)
-                .filter(|f| f.package.eq_ignore_ascii_case(&b.package))
+                .filter(|f| in_bump(b, f))
                 .collect();
             let verdict = worst_verdict(mine.iter().map(|f| f.verdict));
             // One advisory reported for several manifests is one advisory.
@@ -8493,8 +8526,10 @@ mod tests {
         assert_eq!(open_bundle_pr(&per_pkg, web, true).unwrap().0.number, 812);
     }
 
-    /// A major bump stays in the bundle; it leaves only when the bundle's
-    /// CI can't be made to pass, and then gets its own PR.
+    /// A major bump gets its own PR from the start: the bundle is the bumps
+    /// that stay on their version lines. A person who asks for one PR gets
+    /// the major in it, and it leaves only when that PR's CI can't be made
+    /// to pass.
     #[test]
     fn a_failing_major_bump_is_split_out() {
         let mut fs = vec![
@@ -8502,10 +8537,20 @@ mod tests {
             eco_finding("b", "acme/web", "npm", "ws", Tier::P2),
         ];
         fs[1].0.fixed_version = Some("2.0.0".into());
+        fs[1].1.fixed = vec!["2.0.0".into()];
         let cfg = SecurityConfig::default();
         let now = t("2026-11-11T10:00:00Z");
         let units = plan_units(&fs, &cfg, now);
-        assert_eq!(units.len(), 1, "the major bump is in the bundle");
+        assert_eq!(units.len(), 2, "the major bump holds the safe one");
+        let bundle = units.iter().find(|u| u.bundle).unwrap();
+        assert_eq!(bundle.finding_ids, ids(&["a"]));
+        assert!(!bundle.bumps.iter().any(|b| b.major));
+        let major = units.iter().find(|u| !u.bundle).unwrap();
+        assert_eq!(major.finding_ids, ids(&["b"]));
+        assert_eq!(major.key, "ws@2.0.0");
+        // Asked for as one PR: every bump is in it.
+        let (units, _) = manual_units_as(&fs, &ids(&["a", "b"]), &cfg, now, Combine::OnePr);
+        assert_eq!(units.len(), 1, "a person asked for one PR");
         let u = &units[0];
         assert!(u.bumps.iter().any(|b| b.major));
         assert!(u.labels.contains(&"breaking".to_string()));
@@ -8535,6 +8580,113 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(plan_units(&fs, &issues, now).len(), 2);
+    }
+
+    /// A package installed on two version lines is one bump per line, each
+    /// to its own line's patched release. One bump per package once took
+    /// the highest target of both, so the 7 line was sent to 8.
+    #[test]
+    fn a_package_on_two_version_lines_gets_one_bump_per_line() {
+        let due = "2026-12-10T00:00:00Z";
+        let mut fs = vec![
+            adv_finding("a", "glob-walk", "7.2.0", Some("7.5.4"), Tier::P2, due),
+            adv_finding("b", "glob-walk", "8.0.3", Some("8.1.1"), Tier::P2, due),
+            adv_finding("c", "glob-walk", "7.1.0", Some("7.5.4"), Tier::P2, due),
+        ];
+        for (f, st) in fs.iter_mut() {
+            f.manifest = "pnpm-lock.yaml".into();
+            st.fixed = vec!["7.5.4".into(), "8.1.1".into()];
+        }
+        let cfg = SecurityConfig::default();
+        let units = plan_units(&fs, &cfg, t("2026-11-11T10:00:00Z"));
+        assert_eq!(units.len(), 1);
+        let u = &units[0];
+        let bump = |package: &str, from: &str, to: &str| Bump {
+            package: package.into(),
+            from: from.into(),
+            to: to.into(),
+            major: false,
+            manifest: "pnpm-lock.yaml".into(),
+        };
+        assert_eq!(
+            u.bumps,
+            vec![
+                bump("glob-walk", "7.1.0", "7.5.4"),
+                bump("glob-walk", "8.0.3", "8.1.1")
+            ]
+        );
+        let members: Vec<&Finding> = fs.iter().map(|(f, _)| f).collect();
+        let body = ticket_body(u, &members, &cfg);
+        assert!(body.contains("- `glob-walk` 7.1.0 to 7.5.4 (pnpm-lock.yaml) — stays on the 7 line: never move it to another major version, in a range or in an override"), "{body}");
+        assert!(
+            body.contains("- `glob-walk` 8.0.3 to 8.1.1 (pnpm-lock.yaml) — stays on the 8 line"),
+            "{body}"
+        );
+        assert!(
+            !body.contains("to 8.1.1 (pnpm-lock.yaml) — a major version"),
+            "{body}"
+        );
+        assert!(body.contains("an override for the 7 line never points at 8 unless its line under Bumps says a major version is needed"), "{body}");
+        // The table counts each line's own advisories.
+        let pairs: Vec<(&Finding, &FindingState)> = fs.iter().map(|(f, s)| (f, s)).collect();
+        let table = bump_table(u, &pairs);
+        assert!(
+            table.contains("| `glob-walk` | 7.1.0 to 7.5.4 | GHSA-a, GHSA-c |"),
+            "{table}"
+        );
+        assert!(
+            table.contains("| `glob-walk` | 8.0.3 to 8.1.1 | GHSA-b |"),
+            "{table}"
+        );
+        // A line that leaves the unit takes only its own bump with it.
+        let left = without(u, &ids(&["b"]), &fs, &cfg);
+        assert_eq!(left.bumps, vec![bump("glob-walk", "7.1.0", "7.5.4")]);
+    }
+
+    /// A major bump's ticket line names the advisory that has no patched
+    /// release on the installed line.
+    #[test]
+    fn a_major_bumps_ticket_line_says_which_advisory_forces_it() {
+        let mut fs = vec![adv_finding(
+            "m",
+            "tmpl-engine",
+            "2.3.0",
+            Some("4.0.1"),
+            Tier::P2,
+            "2026-12-10T00:00:00Z",
+        )];
+        fs[0].1.fixed = vec!["4.0.1".into()];
+        let cfg = SecurityConfig::default();
+        let units = plan_units(&fs, &cfg, t("2026-11-11T10:00:00Z"));
+        assert_eq!(units.len(), 1);
+        assert!(
+            !units[0].bundle,
+            "a major bump is a pull request of its own"
+        );
+        let body = ticket_body(&units[0], &[&fs[0].0], &cfg);
+        assert!(body.contains("- `tmpl-engine` 2.3.0 to 4.0.1 (manifest unknown) — a major version, because GHSA-m lists no patched release on the 2 line: fix the breaking changes in this same change") || body.contains("— a major version, because GHSA-m lists no patched release on the 2 line"), "{body}");
+    }
+
+    /// A commit hash in an OSV `GIT` range is not a release: only version
+    /// ranges name the patched releases.
+    #[test]
+    fn osv_git_ranges_never_name_a_patched_release() {
+        let v = json!({
+            "id": "GHSA-g1t0-0000-0001",
+            "affected": [{"package": {"ecosystem": "npm", "name": "glob-walk"},
+                "ranges": [
+                    {"type": "GIT", "repo": "https://example.invalid/glob-walk",
+                     "events": [{"introduced": "0"}, {"fixed": "8f3a9c1d2e4b5a6978c0d1e2f3a4b5c6d7e8f901"}]},
+                    {"type": "SEMVER", "events": [{"introduced": "7.0.0"}, {"fixed": "7.5.4"}]},
+                    {"type": "SEMVER", "events": [{"introduced": "8.0.0"}, {"fixed": "8.1.1"}]}
+                ]}]
+        });
+        let r = advisory_from_osv(&v, "npm", "glob-walk").unwrap();
+        assert_eq!(r.fixed, vec!["7.5.4", "8.1.1"]);
+        assert_eq!(
+            pick_fixed("7.2.0", std::slice::from_ref(&r.fixed)).as_deref(),
+            Some("7.5.4")
+        );
     }
 
     /// A bundle is one fix run against the day's limit, whatever its size.
@@ -8710,7 +8862,16 @@ mod tests {
             eco_finding("b", "acme/web", "npm", "ws", Tier::P1),
         ];
         fs[1].0.fixed_version = Some("2.0.0".into());
-        let u = &plan_units(&fs, &SecurityConfig::default(), t("2026-11-11T10:00:00Z"))[0];
+        fs[1].1.fixed = vec!["2.0.0".into()];
+        // One pull request asked for: the major is in the bundle's table.
+        let (units, _) = manual_units_as(
+            &fs,
+            &ids(&["a", "b"]),
+            &SecurityConfig::default(),
+            t("2026-11-11T10:00:00Z"),
+            Combine::OnePr,
+        );
+        let u = &units[0];
         let pairs: Vec<(&Finding, &FindingState)> = fs.iter().map(|(f, s)| (f, s)).collect();
         let body = pr_body(u, &pairs, "");
         assert!(
@@ -8731,7 +8892,8 @@ mod tests {
             },
             t("2026-11-11T10:00:00Z"),
         );
-        assert_eq!(p["pr_count"], 1);
+        // By the policy the major gets its own pull request.
+        assert_eq!(p["pr_count"], 2);
         assert_eq!(p["would_open"].as_array().unwrap().len(), 2);
     }
 
