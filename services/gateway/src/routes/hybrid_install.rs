@@ -539,12 +539,20 @@ pub async fn sync_name_records(state: &AppState, view: Option<&Value>) {
             info!(name = %l.name, "hybrid: name records sent to CoderHelm");
         }
         Err(e) => {
+            // Made after the call, which wasn't timed: the attempt goes in
+            // first so the record stays untimed.
             let mut d = Delivery::new(
                 Direction::Outbound,
                 "hybrid",
                 "name.records",
                 &names::hostname(&l.name),
             );
+            d.push_attempt(deliveries::Attempt {
+                at: d.created_at.clone(),
+                code: e.status,
+                duration_ms: 0,
+                error: e.message.clone(),
+            });
             d.finish(
                 Status::Failed,
                 "CoderHelm didn't take the records",
@@ -554,12 +562,6 @@ pub async fn sync_name_records(state: &AppState, view: Option<&Value>) {
                     "broker_refused"
                 },
             );
-            d.attempts.push(deliveries::Attempt {
-                at: d.created_at.clone(),
-                code: e.status,
-                duration_ms: 0,
-                error: e.message.clone(),
-            });
             super::deliveries::save(state, super::deliveries::UNROUTED, &d).await;
             warn!(error = %e, "hybrid: name records not taken");
         }
@@ -1830,6 +1832,8 @@ pub async fn intake(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, (StatusCode, Json<Value>)> {
+    // A refused forward is timed from its arrival.
+    let received = deliveries::Clock::start();
     let Some(c) = creds_now().await else {
         return Err(fail(
             StatusCode::NOT_FOUND,
@@ -1873,6 +1877,7 @@ pub async fn intake(
                 &format!("{source}.{event}"),
                 "",
             )
+            .since(received)
             .with_headers(
                 headers
                     .iter()

@@ -637,14 +637,16 @@ pub async fn list_invite(s: &Sender<'_>, by: &str, to: &str) -> Result<(), SendE
 }
 
 /// The Deliveries record for one send: domain only, never the address, and
-/// never a parameter.
+/// never a parameter. `send_ms` is how long [`send`] took (time it with a
+/// [`crate::deliveries::Clock`] started just before the call).
 pub fn delivery(
     kind: &str,
     to: &str,
     result: &Result<Route, SendError>,
+    send_ms: Option<u64>,
 ) -> crate::deliveries::Delivery {
     let r = result.as_ref().map(|_| ()).map_err(|e| e.code.clone());
-    let mut d = crate::deliveries::email(kind, to, &r);
+    let mut d = crate::deliveries::email(kind, to, &r, send_ms);
     if let Err(e) = result {
         // `email` guessed from the text; the code is known here.
         d.reason = e.code.clone();
@@ -761,11 +763,14 @@ mod tests {
             &mail.kind,
             &mail.to,
             &Err(err("recipient_not_listed", "no")),
+            Some(310),
         );
         assert_eq!(d.target, "example.com");
+        assert_eq!(d.duration_ms, 310, "a failed send is timed too");
         assert_eq!(d.reason, "recipient_not_listed");
-        let d = delivery(&mail.kind, &mail.to, &Ok(Route::Relay));
+        let d = delivery(&mail.kind, &mail.to, &Ok(Route::Relay), Some(420));
         assert_eq!(d.outcome, "Sent through CoderHelm");
+        assert_eq!(d.duration_ms, 420);
         assert!(!serde_json::to_string(&d).unwrap().contains("dev@"));
     }
 }
@@ -1039,6 +1044,7 @@ mod adversarial {
             "plugin_approval",
             "approver@acme.test",
             &Ok(super::Route::Relay),
+            Some(1),
         );
         let all = serde_json::to_string(&d).unwrap();
         assert!(!all.contains("TOKEN") && !all.contains("approver@"));

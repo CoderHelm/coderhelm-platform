@@ -360,12 +360,14 @@ async fn tell_admins(state: &WorkerState, team: &str, src: &Source) {
                 headers: vec![],
             },
         };
+        let sending = common::deliveries::Clock::start();
         let sent = common::mail::send(&crate::clients::email::sender(state), &mail).await;
+        let send_ms = sending.ms();
         common::deliveries::record(
             &state.dynamo,
             &state.config.settings_table_name,
             team,
-            &common::mail::delivery("knowledge_signin", &to, &sent),
+            &common::mail::delivery("knowledge_signin", &to, &sent, send_ms),
         )
         .await;
         if let Err(err) = sent {

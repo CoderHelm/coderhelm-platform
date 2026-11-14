@@ -832,12 +832,14 @@ pub async fn notify_review(state: &WorkerState, team: &str, artifact: &str) {
                 headers: vec![],
             },
         };
+        let sending = common::deliveries::Clock::start();
         let sent = common::mail::send(&crate::clients::email::sender(state), &mail).await;
+        let send_ms = sending.ms();
         common::deliveries::record(
             &state.dynamo,
             &state.config.settings_table_name,
             team,
-            &common::mail::delivery("plugin_approval", to, &sent),
+            &common::mail::delivery("plugin_approval", to, &sent, send_ms),
         )
         .await;
         if let Err(e) = sent {

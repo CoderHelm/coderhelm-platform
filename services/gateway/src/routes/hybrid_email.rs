@@ -318,14 +318,21 @@ async fn record(state: &AppState, install: &str, d: &Delivery) {
 }
 
 /// The delivery record for one relayed email: template id, redacted
-/// address, status. Never a parameter.
-pub fn relay_delivery(template: &str, to: &str, outcome: Result<(), &str>) -> Delivery {
+/// address, status. Never a parameter. Timed from `received`, when the
+/// install's request arrived, to sent or refused.
+pub fn relay_delivery(
+    template: &str,
+    to: &str,
+    outcome: Result<(), &str>,
+    received: deliveries::Clock,
+) -> Delivery {
     let mut d = Delivery::new(
         Direction::Outbound,
         "email_relay",
         &format!("email.{template}"),
         &relay::redact(to),
-    );
+    )
+    .since(received);
     match outcome {
         Ok(()) => d.finish(Status::Handled, "Sent", ""),
         Err(code) => d.finish(Status::Failed, "Not sent", code),
@@ -341,10 +348,11 @@ pub async fn send(
     headers: HeaderMap,
     body: Bytes,
 ) -> Reply {
+    let received = deliveries::Clock::start();
     let (install, from) = verified(&state, &headers, &method, &uri, &body).await?;
     let req: relay::SendRequest =
         serde_json::from_slice(&body).map_err(|_| refuse(relay::Refusal::BadRequest))?;
-    let fail_with = |code: &str| relay_delivery(&req.template, &req.to, Err(code));
+    let fail_with = |code: &str| relay_delivery(&req.template, &req.to, Err(code), received);
     let domain = custom_domain(&state, &install.id).await?;
     let hosts = relay::link_hosts(&own_hosts(&install), domain.as_ref(), epoch());
     let (template, values) = match templates::check(&req.template, &req.params, &hosts, true) {
@@ -492,6 +500,7 @@ pub async fn send(
         template.id,
         &req.to,
         sent.as_ref().map(|_| ()).map_err(|_| "email_failed"),
+        received,
     );
     record(&state, &install.id, &d).await;
     match sent {
@@ -1250,13 +1259,24 @@ mod tests {
 
     #[test]
     fn a_relay_delivery_keeps_no_address_and_no_parameter() {
-        let d = relay_delivery("plugin_approval", "Dev@Example.com", Ok(()));
+        let d = relay_delivery(
+            "plugin_approval",
+            "Dev@Example.com",
+            Ok(()),
+            deliveries::Clock::start(),
+        );
         let all = serde_json::to_string(&d).unwrap();
         assert_eq!(d.target, "d***@example.com");
         assert!(!all.contains("Dev@"));
         assert!(d.payload_preview.is_empty());
-        let f = relay_delivery("welcome", "x@y.com", Err("recipient_not_listed"));
+        let f = relay_delivery(
+            "welcome",
+            "x@y.com",
+            Err("recipient_not_listed"),
+            deliveries::Clock::start(),
+        );
         assert_eq!(f.reason, "recipient_not_listed");
+        assert!(f.duration_ms >= 1, "timed from the request");
     }
 
     #[test]

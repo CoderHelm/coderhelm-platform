@@ -51,15 +51,22 @@ pub async fn save(state: &AppState, pk: &str, d: &Delivery) {
 }
 
 /// Records one send through `common::mail` (SES or CoderHelm's relay), with
-/// its reason code when it failed.
+/// its reason code when it failed and how long the send took (`send_ms`,
+/// from a clock started just before the send).
 pub async fn record_mail(
     state: &AppState,
     pk: &str,
     kind: &str,
     to: &str,
     result: &Result<common::mail::Route, common::mail::SendError>,
+    send_ms: Option<u64>,
 ) {
-    save(state, pk, &common::mail::delivery(kind, to, result)).await;
+    save(
+        state,
+        pk,
+        &common::mail::delivery(kind, to, result, send_ms),
+    )
+    .await;
 }
 
 pub fn alert_to_delivery(
@@ -75,13 +82,20 @@ pub fn alert_to_delivery(
     if id.is_empty() {
         return None;
     }
+    // Mapped from the alert log: its time is the one the log kept.
     let mut d = Delivery::new(
         Direction::Inbound,
         "alerts",
         &format!("alert.{}", g("kind")),
         g("topic_arn").rsplit(':').next().unwrap_or(""),
-    );
+    )
+    .untimed();
     d.id = format!("alert:{id}");
+    d.duration_ms = item
+        .get("duration_ms")
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0);
     d.created_at = g("received_at");
     d.repo = g("repo");
     d.outcome = g("title");
@@ -103,13 +117,20 @@ pub fn jira_to_delivery(v: &Value) -> Option<Delivery> {
     if id.is_empty() {
         return None;
     }
+    // Mapped from the Jira event log: its time is the one the log kept.
     let mut d = Delivery::new(
         Direction::Inbound,
         "jira",
         &s("event_type"),
         &s("ticket_key"),
-    );
+    )
+    .untimed();
     d.id = format!("jira:{id}");
+    // A number in the log's JSON, or text when read from a table item.
+    d.duration_ms = v["duration_ms"]
+        .as_u64()
+        .or_else(|| v["duration_ms"].as_str().and_then(|n| n.parse().ok()))
+        .unwrap_or(0);
     d.created_at = s("created_at");
     d.repo = s("repo");
     d.outcome = s("title");
@@ -490,6 +511,69 @@ mod tests {
         i.insert("outcome".into(), AttributeValue::S("run_started".into()));
         assert_eq!(alert_to_delivery(&i).unwrap().status, Status::Handled);
         assert!(alert_to_delivery(&HashMap::new()).is_none());
+        // The time the alert log kept; none on older records.
+        assert_eq!(alert_to_delivery(&i).unwrap().duration_ms, 0);
+        i.insert("duration_ms".into(), AttributeValue::N("37".into()));
+        assert_eq!(alert_to_delivery(&i).unwrap().duration_ms, 37);
+    }
+
+    /// Every place outside tests that makes a delivery record, and how it
+    /// gets its time. A delivery times itself when it finishes (from
+    /// `Delivery::new`, or from `since` when the work began earlier), unless
+    /// an attempt or its caller set the time. A record made after the work
+    /// with neither is wrong (it would read 1 ms), so a new place fails here
+    /// until someone checks how it is timed and adds it.
+    #[test]
+    fn every_place_that_makes_a_delivery_is_timed() {
+        const KNOWN: &[(&str, usize, &str)] = &[
+            ("common/src/deliveries.rs", 2, "email(): the send's time, given by its caller; from_chat(): an attempt with the post's time"),
+            ("common/src/webhooks/deliver.rs", 1, "new_record(): each send is an attempt with its time"),
+            ("gateway/src/routes/github_webhook.rs", 1, "made at receipt; process() sets the handling time"),
+            ("gateway/src/routes/hybrid.rs", 4, "broker and relay records: attempts with their times, refusals from receipt, the token handout since the request"),
+            ("gateway/src/routes/hybrid_install.rs", 2, "a refused forward since its arrival; name records: an untimed attempt"),
+            ("gateway/src/routes/hybrid_email.rs", 1, "relay_delivery(): since the request"),
+            ("gateway/src/routes/hybrid_jira.rs", 1, "relay forward: attempts with their times"),
+            ("gateway/src/routes/deliveries.rs", 2, "alert and Jira log rows: untimed, carrying the time their log kept"),
+            ("worker/src/passes/email_events.rs", 1, "a bounce since the event's arrival"),
+        ];
+        let services = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let mut found = std::collections::BTreeMap::new();
+        let mut dirs: Vec<std::path::PathBuf> = ["common/src", "gateway/src", "worker/src"]
+            .iter()
+            .map(|d| services.join(d))
+            .collect();
+        while let Some(dir) = dirs.pop() {
+            for e in std::fs::read_dir(&dir).unwrap().flatten() {
+                let path = e.path();
+                if path.is_dir() {
+                    dirs.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|x| x != "rs") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).unwrap();
+                let code = text
+                    .find("#[cfg(test)]\nmod tests")
+                    .map_or(text.as_str(), |i| &text[..i]);
+                let n = code.matches("Delivery::new(").count();
+                if n > 0 {
+                    let rel = path
+                        .strip_prefix(&services)
+                        .unwrap()
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    found.insert(rel, n);
+                }
+            }
+        }
+        let known: std::collections::BTreeMap<String, usize> =
+            KNOWN.iter().map(|(f, n, _)| (f.to_string(), *n)).collect();
+        assert_eq!(
+            found, known,
+            "a delivery record was added or moved: check it is timed (finish() from its \
+             start, since() when the work began earlier, or an attempt), then update KNOWN"
+        );
     }
 
     #[test]
@@ -502,6 +586,16 @@ mod tests {
         let d = jira_to_delivery(&json!({"event_id": "e2", "status": "duplicate"})).unwrap();
         assert_eq!(d.status, Status::Ignored);
         assert!(jira_to_delivery(&json!({})).is_none());
+        // The time the Jira log kept (a number, or text from an item); none
+        // on older records, and never a time made up by mapping.
+        assert_eq!(d.duration_ms, 0);
+        let timed = json!({"event_id": "e3", "status": "queued", "duration_ms": 52});
+        assert_eq!(jira_to_delivery(&timed).unwrap().duration_ms, 52);
+        let text = json!({"event_id": "e3", "status": "queued", "duration_ms": "52"});
+        assert_eq!(jira_to_delivery(&text).unwrap().duration_ms, 52);
+        let mut m = jira_to_delivery(&json!({"event_id": "e4"})).unwrap();
+        m.finish(Status::Handled, "", "");
+        assert_eq!(m.duration_ms, 0);
     }
 
     #[test]

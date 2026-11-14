@@ -2084,12 +2084,14 @@ async fn send(
             headers,
         },
     };
+    let sending = common::deliveries::Clock::start();
     let sent = common::mail::send(&crate::clients::email::sender(state), &mail).await;
+    let send_ms = sending.ms();
     common::deliveries::record(
         &state.dynamo,
         &state.config.settings_table_name,
         team_id,
-        &common::mail::delivery("weekly_summary", to, &sent),
+        &common::mail::delivery("weekly_summary", to, &sent, send_ms),
     )
     .await;
     sent.map(|_| ()).map_err(|e| e.into())

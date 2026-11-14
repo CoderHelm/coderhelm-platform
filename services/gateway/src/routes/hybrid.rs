@@ -3374,6 +3374,9 @@ fn form(body: &[u8]) -> HashMap<String, String> {
 /// a grant handle; `refresh_token` with the handle answers a fresh access
 /// token. The provider's own refresh token never leaves this side.
 pub async fn oauth_token(State(state): State<Arc<AppState>>, body: Bytes) -> Reply {
+    // The broker record below is made once the token is in hand; it is timed
+    // from the request.
+    let received = deliveries::Clock::start();
     let master = master(&state).ok_or_else(not_here)?.to_string();
     let f = form(&body);
     let g = |k: &str| f.get(k).cloned().unwrap_or_default();
@@ -3504,7 +3507,8 @@ pub async fn oauth_token(State(state): State<Arc<AppState>>, body: Bytes) -> Rep
         "broker",
         &format!("{kind}.token"),
         &install.id,
-    );
+    )
+    .since(received);
     d.finish(Status::Handled, "Token handed out", "");
     deliveries::record(
         &state.dynamo,

@@ -99,6 +99,37 @@ pub enum Redeliver {
     Webhook,
 }
 
+/// When a delivery's handling began. Kept in memory only, never stored: a
+/// record read back from the table has none, so finishing it again never
+/// times it from the read.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Clock(Option<std::time::Instant>);
+
+impl Clock {
+    pub fn start() -> Self {
+        Self(Some(std::time::Instant::now()))
+    }
+
+    /// No start known: nothing is measured from it.
+    pub fn none() -> Self {
+        Self(None)
+    }
+
+    /// Milliseconds since it started, at least 1 (a measured time is never
+    /// 0, which means "not timed"); None when it never started.
+    pub fn ms(&self) -> Option<u64> {
+        self.0.map(|t| (t.elapsed().as_millis() as u64).max(1))
+    }
+}
+
+/// A clock is not part of what a record says: two records that say the
+/// same are equal whenever their clocks started.
+impl PartialEq for Clock {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
 /// One delivery.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Delivery {
@@ -130,6 +161,9 @@ pub struct Delivery {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub endpoint_id: String,
     pub created_at: String,
+    /// How long it took, in milliseconds; 0 means it wasn't timed (the
+    /// rollups leave it out of the latency). [`Delivery::finish`] sets it
+    /// from [`Delivery::clock`] when no attempt or caller has.
     pub duration_ms: u64,
     #[serde(default)]
     pub attempts: Vec<Attempt>,
@@ -143,6 +177,10 @@ pub struct Delivery {
     pub payload_bytes: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub redeliver: Option<Redeliver>,
+    /// When handling began: [`Delivery::new`] starts it, [`Delivery::since`]
+    /// moves it back to when the work really started. Never stored.
+    #[serde(skip)]
+    pub clock: Clock,
 }
 
 impl Delivery {
@@ -168,7 +206,22 @@ impl Delivery {
             payload_preview: String::new(),
             payload_bytes: 0,
             redeliver: None,
+            clock: Clock::start(),
         }
+    }
+
+    /// Times the delivery from `clock` (when the request or event arrived)
+    /// rather than from when the record was made.
+    pub fn since(mut self, clock: Clock) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// A record whose time can't be known (mapped from another log, or made
+    /// after the work with no start kept): it stays untimed.
+    pub fn untimed(mut self) -> Self {
+        self.clock = Clock::none();
+        self
     }
 
     /// Keeps the headers, with secrets removed.
@@ -187,10 +240,20 @@ impl Delivery {
         self
     }
 
+    /// Sets where the delivery ended up. A finished delivery (handled,
+    /// ignored or failed) measures itself: with no attempt and no time set by
+    /// its caller, its time is from its clock's start to now. An attempt's
+    /// time, or one a caller set, is kept.
     pub fn finish(&mut self, status: Status, outcome: &str, reason: &str) {
         self.status = status;
         self.outcome = outcome.into();
         self.reason = reason.into();
+        let finished = matches!(status, Status::Handled | Status::Ignored | Status::Failed);
+        if finished && self.duration_ms == 0 && self.attempts.is_empty() {
+            if let Some(ms) = self.clock.ms() {
+                self.duration_ms = ms;
+            }
+        }
     }
 
     /// Adds an attempt (newest last), keeping at most [`MAX_ATTEMPTS_KEPT`].
@@ -431,12 +494,20 @@ pub fn reason_for_http(source: &str, code: Option<u16>) -> &'static str {
     }
 }
 
-/// The record for one email send: the recipient's domain only, never the address.
-pub fn email(kind: &str, to: &str, result: &Result<(), String>) -> Delivery {
+/// The record for one email send: the recipient's domain only, never the
+/// address. `send_ms` is how long the send itself took ([`Clock::ms`] of a
+/// clock started just before it), on success and failure alike; None leaves
+/// the record untimed.
+pub fn email(kind: &str, to: &str, result: &Result<(), String>, send_ms: Option<u64>) -> Delivery {
     let domain = to.rsplit('@').next().unwrap_or("").to_ascii_lowercase();
-    let mut d = Delivery::new(Direction::Outbound, "email", kind, &domain);
+    // Built after the send: its time is the send's, never the build's.
+    let mut d = Delivery::new(Direction::Outbound, "email", kind, &domain).untimed();
+    let send_ms = send_ms.unwrap_or(0);
     match result {
-        Ok(()) => d.finish(Status::Handled, "Sent", ""),
+        Ok(()) => {
+            d.duration_ms = send_ms;
+            d.finish(Status::Handled, "Sent", "");
+        }
         Err(e) => {
             let r = e.to_ascii_lowercase();
             let reason = if r.contains("not verified") || r.contains("sandbox") {
@@ -450,7 +521,7 @@ pub fn email(kind: &str, to: &str, result: &Result<(), String>) -> Delivery {
             d.push_attempt(Attempt {
                 at,
                 code: None,
-                duration_ms: 0,
+                duration_ms: send_ms,
                 error: reason_text(reason).into(),
             });
             d.finish(Status::Failed, "Not sent", reason);
@@ -951,7 +1022,7 @@ mod tests {
 
     #[test]
     fn emails_keep_the_domain_only() {
-        let ok = email("invite", "Someone@Example.com", &Ok(()));
+        let ok = email("invite", "Someone@Example.com", &Ok(()), Some(5));
         assert_eq!(
             (ok.target.as_str(), ok.status),
             ("example.com", Status::Handled)
@@ -960,17 +1031,92 @@ mod tests {
             "invite",
             "a@example.com",
             &Err("MessageRejected: Email address is not verified".into()),
+            Some(5),
         );
         assert_eq!(sandbox.reason, "email_sandbox");
         assert!(!format!("{sandbox:?}").contains("a@example.com"));
         assert_eq!(
-            email("x", "a@b.c", &Err("AccessDeniedException".into())).reason,
+            email("x", "a@b.c", &Err("AccessDeniedException".into()), Some(5)).reason,
             "email_denied"
         );
         assert_eq!(
-            email("x", "a@b.c", &Err("boom".into())).reason,
+            email("x", "a@b.c", &Err("boom".into()), Some(5)).reason,
             "email_failed"
         );
+    }
+
+    #[test]
+    fn emails_are_timed_by_their_send_on_success_and_failure() {
+        let ok = email("invite", "a@example.com", &Ok(()), Some(840));
+        assert_eq!(ok.duration_ms, 840);
+        let failed = email("invite", "a@example.com", &Err("boom".into()), Some(1200));
+        assert_eq!(failed.status, Status::Failed);
+        assert_eq!(failed.duration_ms, 1200);
+        assert_eq!(failed.attempts[0].duration_ms, 1200);
+        // Unknown stays untimed, never a made-up 0 or 1 from the build.
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        assert_eq!(email("x", "a@b.c", &Ok(()), None).duration_ms, 0);
+        assert_eq!(
+            email("x", "a@b.c", &Err("boom".into()), None).duration_ms,
+            0
+        );
+    }
+
+    #[test]
+    fn a_finished_delivery_measures_itself() {
+        let received = Clock::start();
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        let mut d =
+            Delivery::new(Direction::Inbound, "jira", "issue_updated", "TEAM#1").since(received);
+        d.finish(Status::Handled, "Handled", "");
+        assert!(d.duration_ms >= 15, "receipt to handled: {}", d.duration_ms);
+
+        // Even an instant one is timed, never 0 ("not timed").
+        let mut quick = Delivery::new(Direction::Inbound, "alerts", "x", "y");
+        quick.finish(Status::Ignored, "", "");
+        assert!(quick.duration_ms >= 1);
+
+        // Still in flight: not timed yet.
+        let mut pending = Delivery::new(Direction::Outbound, "relay", "push", "ins_x");
+        pending.finish(Status::Pending, "Retrying", "");
+        assert_eq!(pending.duration_ms, 0);
+    }
+
+    #[test]
+    fn finish_keeps_an_attempts_time_or_a_callers() {
+        let mut d = Delivery::new(Direction::Outbound, "relay", "push", "ins_x");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        d.push_attempt(Attempt {
+            at: "t".into(),
+            code: Some(200),
+            duration_ms: 2,
+            error: String::new(),
+        });
+        d.finish(Status::Handled, "Forwarded", "");
+        assert_eq!(d.duration_ms, 2);
+
+        // An attempt that never went out (blocked, 0) stays untimed.
+        let mut blocked = Delivery::new(Direction::Outbound, "webhook", "run.failed", "h");
+        blocked.push_attempt(Attempt::default());
+        blocked.finish(Status::Failed, "Not sent", "webhook_blocked");
+        assert_eq!(blocked.duration_ms, 0);
+
+        let mut set = Delivery::new(Direction::Inbound, "github", "push", "TEAM#1");
+        set.duration_ms = 14;
+        set.finish(Status::Handled, "Handled", "");
+        assert_eq!(set.duration_ms, 14);
+    }
+
+    #[test]
+    fn a_record_read_back_or_mapped_is_never_timed_from_then() {
+        let mut d = Delivery::new(Direction::Outbound, "webhook", "run.failed", "h");
+        d.status = Status::Pending;
+        let mut back = from_item(&to_item("TEAM#1", &d, 1_800_000_000)).unwrap();
+        back.finish(Status::Failed, "Endpoint is off", "webhook_disabled");
+        assert_eq!(back.duration_ms, 0);
+        let mut mapped = Delivery::new(Direction::Inbound, "jira", "x", "y").untimed();
+        mapped.finish(Status::Handled, "", "");
+        assert_eq!(mapped.duration_ms, 0);
     }
 
     #[test]

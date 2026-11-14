@@ -767,6 +767,9 @@ async fn handle_notification(
     msg: &SnsMessage,
     route: &Route,
 ) -> Result<StatusCode, StatusCode> {
+    // The delivery's time: from here (the message verified and routed to a
+    // team, as GitHub's are timed once checked) to its record.
+    let started = common::deliveries::Clock::start();
     let alert = normalize(msg.subject.as_deref(), &msg.message);
     let tid = ticket_id(&alert.fingerprint);
     let rule = pick_rule(&route.rules, &alert);
@@ -872,7 +875,17 @@ async fn handle_notification(
         fires: t.episode.fires,
         suppressed: outcome == Outcome::Suppressed,
     });
-    record_event(state, msg, route, repo, &alert, outcome, tag.as_ref()).await;
+    record_event(
+        state,
+        started,
+        msg,
+        route,
+        repo,
+        &alert,
+        outcome,
+        tag.as_ref(),
+    )
+    .await;
     if alert.actionable
         && alert.recovers.is_none()
         && !repo.is_empty()
@@ -1575,9 +1588,12 @@ async fn start_run(
 }
 
 /// Store the alert and what was done with it, under its own id, so it has a
-/// link. Best effort: a failed write never blocks or retries the alert itself.
+/// link, with how long handling it took since `started`. Best effort: a
+/// failed write never blocks or retries the alert itself.
+#[allow(clippy::too_many_arguments)]
 async fn record_event(
     state: &AppState,
+    started: common::deliveries::Clock,
     msg: &SnsMessage,
     route: &Route,
     repo: &str,
@@ -1628,6 +1644,11 @@ async fn record_event(
             .item("suppressed", AttributeValue::Bool(e.suppressed)),
         None => put,
     };
+    let duration_ms = started.ms();
+    let put = match duration_ms {
+        Some(ms) => put.item("duration_ms", AttributeValue::N(ms.to_string())),
+        None => put,
+    };
     let written = put
         .item("ttl", AttributeValue::N(ttl.to_string()))
         .item(
@@ -1655,6 +1676,9 @@ async fn record_event(
                 ("outcome", outcome.as_str()),
             ] {
                 item.insert(k.to_string(), attr_s(v));
+            }
+            if let Some(ms) = duration_ms {
+                item.insert("duration_ms".into(), AttributeValue::N(ms.to_string()));
             }
             if let Some(new) = super::deliveries::alert_to_delivery(&item) {
                 let store = common::deliveries_rollup::Dynamo {

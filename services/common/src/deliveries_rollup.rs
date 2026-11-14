@@ -945,6 +945,26 @@ mod tests {
     }
 
     #[test]
+    fn untimed_records_count_but_stay_out_of_the_latency() {
+        // Older records (and ones whose time can't be known) carry 0: they
+        // count as deliveries, never as a 0 ms time.
+        let mut d = at("2026-10-26T15:10:00Z", "jira", Status::Handled).untimed();
+        d.direction = Direction::Inbound;
+        let c = contribution(&d);
+        assert_eq!(c["s#jira#in#handled"], 1);
+        assert!(!c.keys().any(|k| k.contains("#lat#")), "{c:?}");
+        // The same record timed lands in its bucket.
+        d.duration_ms = 40;
+        assert_eq!(contribution(&d)["s#jira#in#lat#ok#50"], 1);
+        // A finished one times itself, so it is never left out.
+        let mut f = Delivery::new(Direction::Inbound, "alerts", "alert.x", "t");
+        f.finish(Status::Handled, "Handled", "");
+        assert!(contribution(&f)
+            .keys()
+            .any(|k| k.starts_with("s#alerts#in#lat#ok#")));
+    }
+
+    #[test]
     fn a_record_counts_once_it_is_finished() {
         let mut d = at("2026-10-26T15:10:00Z", "webhook", Status::Pending);
         d.endpoint_id = "ep_1".into();

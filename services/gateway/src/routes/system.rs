@@ -463,6 +463,7 @@ pub async fn test_email(
             headers: vec![],
         },
     };
+    let sending = common::deliveries::Clock::start();
     let result = mail::send(&super::email_settings::sender(&state), &m).await;
     super::deliveries::record_mail(
         &state,
@@ -470,6 +471,7 @@ pub async fn test_email(
         "test_email",
         &claims.email,
         &result,
+        sending.ms(),
     )
     .await;
     match result {
