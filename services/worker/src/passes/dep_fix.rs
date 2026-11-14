@@ -1134,7 +1134,7 @@ async fn code_fix(
         w.file_cache,
         Some(w.run_id),
         w.deadline,
-        false,
+        super::write_guard::RoundFor::Build,
     )
     .await;
     let head = w
@@ -1357,6 +1357,8 @@ pub async fn implement_result(
         timed_out: false,
         conversation_log: vec![],
         writes: Default::default(),
+        outside_plan: Vec::new(),
+        refused: Vec::new(),
         evidence: super::proof::RunEvidence {
             notes: run.report_md(),
             checks: run

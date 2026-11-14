@@ -23,6 +23,8 @@ use tracing::{error, info, warn};
 use crate::models::Claims;
 use crate::AppState;
 
+pub mod token_use;
+
 type Item = HashMap<String, AttributeValue>;
 
 /// Most pages read from one table for one request; a guard, not a limit
@@ -1931,6 +1933,11 @@ pub struct MeteredDay {
     pub tokens: f64,
     /// Cost by what the calls were for (`review`, `run`, `feedback`, ...).
     pub features: BTreeMap<String, f64>,
+    /// The day's four token parts, calls and cost.
+    pub total: common::usage::UsageSlice,
+    /// The same for each feature, and for each model.
+    pub by_feature: BTreeMap<String, common::usage::UsageSlice>,
+    pub by_model: BTreeMap<String, common::usage::UsageSlice>,
 }
 
 impl MeteredDay {
@@ -1950,6 +1957,9 @@ impl MeteredDay {
             cost_usd: n(i, "total_cost_usd"),
             tokens: n(i, "total_tokens"),
             features,
+            total: common::usage::total_slice(i),
+            by_feature: common::usage::slices(i, "feature"),
+            by_model: common::usage::slices(i, "model"),
         })
     }
 }
@@ -1989,6 +1999,33 @@ async fn load_metered(state: &AppState, team: &str, w: Window) -> Vec<MeteredDay
         }
     }
     out
+}
+
+/// The first day the team's per-call meter has anything (`YYYY-MM-DD`):
+/// one item read, the oldest `DAY#`. `None` when it has nothing or the read
+/// failed (a comparison is then not shown, never guessed).
+async fn first_metered_day(state: &AppState, team: &str) -> Option<String> {
+    if state.config.analytics_table_name.is_empty() {
+        return None;
+    }
+    let resp = state
+        .dynamo
+        .query()
+        .table_name(&state.config.analytics_table_name)
+        .key_condition_expression("team_id = :t AND period BETWEEN :lo AND :hi")
+        .expression_attribute_values(":t", av(team))
+        .expression_attribute_values(":lo", av("DAY#"))
+        .expression_attribute_values(":hi", av("DAY#~"))
+        .projection_expression("period")
+        .scan_index_forward(true)
+        .limit(1)
+        .send()
+        .await
+        .map_err(|e| warn!(error = %e, "Analytics: first metered day"))
+        .ok()?;
+    resp.items()
+        .first()
+        .and_then(|i| s(i, "period").strip_prefix("DAY#").map(str::to_string))
 }
 
 /// The UTC days a window covers, as the daily series keys them.
@@ -2508,7 +2545,7 @@ pub async fn get_analytics(
         );
         DeployBackfill::from_items(marker.as_ref(), progress.as_ref())
     };
-    let (runs, reviews, lookups, traces, known, deploys, backfilled, metered) = tokio::join!(
+    let (runs, reviews, lookups, traces, known, deploys, backfilled, metered, counted_since) = tokio::join!(
         load_runs(&state, &team, whole),
         load_settings_range(&state, &team, &stat_lo, &stat_hi),
         load_settings_range(&state, &team, &log_lo, &log_hi),
@@ -2517,6 +2554,7 @@ pub async fn get_analytics(
         load_settings_range(&state, &team, &dep_lo, &dep_hi),
         backfill_marker,
         load_metered(&state, &team, whole),
+        first_metered_day(&state, &team),
     );
     if backfilled.since.is_none() && claims.support_view.is_none() {
         ask_for_deploy_backfill(&state, &team).await;
@@ -2556,6 +2594,14 @@ pub async fn get_analytics(
         repo,
     );
     apply_metered(&mut out, &metered, window, prev, repo);
+    out["token_use"] = token_use::token_use(
+        window,
+        prev,
+        &runs,
+        &metered,
+        repo,
+        &token_use::Since { counted_since },
+    );
     add_deploys(
         &mut out["comparison"],
         window,
@@ -2588,6 +2634,7 @@ mod metered_tests {
             cost_usd: cost,
             tokens: cost * 1000.0,
             features: features.iter().map(|(f, c)| (f.to_string(), *c)).collect(),
+            ..Default::default()
         }
     }
 
@@ -2681,10 +2728,34 @@ mod metered_tests {
             "feature#review#tokens_out".into(),
             AttributeValue::N("9".into()),
         );
-        assert_eq!(
-            MeteredDay::from_item(&i),
-            Some(day("2026-10-29", 168.48, &[("review", 35.65)]))
+        i.insert(
+            "model#claude-opus-5-5#cache_read".into(),
+            AttributeValue::N("7".into()),
         );
+        i.insert("cache_read_tokens".into(), AttributeValue::N("7".into()));
+        let m = MeteredDay::from_item(&i).unwrap();
+        let mut want = day("2026-10-29", 168.48, &[("review", 35.65)]);
+        want.total = common::usage::UsageSlice {
+            cache_read: 7,
+            cost_usd: 168.48,
+            ..Default::default()
+        };
+        want.by_feature.insert(
+            "review".into(),
+            common::usage::UsageSlice {
+                tokens_out: 9,
+                cost_usd: 35.65,
+                ..Default::default()
+            },
+        );
+        want.by_model.insert(
+            "claude-opus-5-5".into(),
+            common::usage::UsageSlice {
+                cache_read: 7,
+                ..Default::default()
+            },
+        );
+        assert_eq!(m, want);
         i.insert("period".into(), av("2026-10"));
         assert_eq!(MeteredDay::from_item(&i), None);
     }

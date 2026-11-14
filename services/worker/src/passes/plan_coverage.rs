@@ -889,8 +889,8 @@ pub async fn close_gaps(
             Some(w.run_id),
             w.deadline,
             // Planned files the PR doesn't change yet are exactly what this
-            // round must write.
-            false,
+            // round must write: the plan's task files are its files.
+            super::write_guard::RoundFor::PlannedWork,
         )
         .await;
         super::write_pass_trace(

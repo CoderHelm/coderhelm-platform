@@ -734,10 +734,11 @@ Rules:
     // Try to extract branch from repo metadata. For now, use a convention.
     let branch = get_pr_branch(state, &msg).await?;
 
-    // Ticket-scope guard: CI-ONLY cycles (no unanswered human comment/review —
-    // same signal as the budget gate) may only write files the PR already
-    // changed; a lint/type warning in an untouched file pre-exists on base and
-    // is out of scope. HUMAN-directed feedback runs unscoped — a reviewer
+    // The round's files (`write_guard`): a CI-ONLY cycle (no unanswered human
+    // comment/review — same signal as the budget gate) may edit the files the
+    // PR changes, the plan's, and the ones the failing checks' output names;
+    // a lint/type warning in any other file pre-exists on base and is not
+    // this round's. HUMAN-directed feedback has no boundary — a reviewer
     // asking for an out-of-diff change is authorization, not overreach.
     // The PR's base branch — used both for scope detection and as restore_file's
     // default target so out-of-scope reverts hit the real base, not `main`.
@@ -753,7 +754,23 @@ Rules:
         .await;
     let scope_guard = if ci_only {
         match &pr_files {
-            Ok(files) => super::write_guard::ScopeGuard::scoped(files.clone()),
+            Ok(files) => {
+                let plan = super::plan_files_of(
+                    state,
+                    &msg.team_id,
+                    &ticket.0,
+                    &msg.repo_owner,
+                    &msg.repo_name,
+                )
+                .await;
+                super::write_guard::ScopeGuard::for_round(
+                    super::write_guard::RoundFor::CiFix,
+                    files,
+                    plan.as_ref(),
+                    &format!("{}/{}", msg.repo_owner, msg.repo_name),
+                    &ci_failure_block,
+                )
+            }
             Err(e) => {
                 warn!(run_id = %msg.run_id, error = %e, "Could not list PR files — feedback cycle runs unscoped");
                 super::write_guard::ScopeGuard::unscoped()
@@ -764,6 +781,18 @@ Rules:
     };
 
     let mut tools = feedback_tools();
+    // A bounded round's write tools take the reason for an edit outside
+    // its files.
+    if scope_guard.bounded() {
+        for t in tools.iter_mut() {
+            if matches!(
+                t.name.as_str(),
+                "write_file" | "edit_file" | "batch_write" | "restore_file"
+            ) {
+                super::write_guard::offer_reason(&t.name, &mut t.input_schema);
+            }
+        }
+    }
     // Who may have the description changed: a person with write access or
     // higher, the same check as the comment commands.
     let may_edit_description = !msg.trigger_author.trim().is_empty()
@@ -1473,6 +1502,18 @@ Rules:
         } else {
             String::new()
         };
+    // The files outside the plan's a CI-only round edited, with why, are on
+    // the pull request.
+    if fix_pushed {
+        super::habits_check::record_outside(
+            &github,
+            &msg.repo_owner,
+            &msg.repo_name,
+            msg.pr_number,
+            &executor.scope_guard.outside(),
+        )
+        .await;
+    }
 
     // Redirects and links the PR changes are checked again after a push
     // (or when the evidence is a day old) and the description's table
@@ -2571,8 +2612,8 @@ struct FeedbackToolExecutor<'a> {
     /// reverts target the real base (not a hardcoded `main`).
     base_branch: &'a str,
     files_modified: std::sync::Mutex<bool>,
-    /// Ticket-scope guard: CI-only cycles may only write files the PR already
-    /// changed (bounded escape). Human-directed feedback is unscoped.
+    /// Which existing files the round may edit (`write_guard`): a CI-only
+    /// cycle is bounded, human-directed feedback is not.
     scope_guard: super::write_guard::ScopeGuard,
     /// Repository history (commits, blame, pull requests, releases, deploys).
     history: Option<&'a super::github_history::GithubHistory>,
@@ -2597,6 +2638,26 @@ struct FeedbackToolExecutor<'a> {
 }
 
 impl FeedbackToolExecutor<'_> {
+    /// The guard's refusal of a write to `path`, when it has one. Only an
+    /// existing file is ever refused: a path outside the round's files that
+    /// isn't on the branch is a new file, and becomes the round's own.
+    async fn scope_refusal(&self, path: &str, why: Option<&str>) -> Option<String> {
+        let refusal = self.scope_guard.check(path, why).err()?;
+        if self
+            .github
+            .read_file(self.owner, self.repo, path, self.branch)
+            .await
+            .is_ok()
+        {
+            crate::agent::tool_outcome::note(crate::agent::tool_outcome::ToolOutcome::soft_fail(
+                "refused: outside the round's files",
+            ));
+            return Some(refusal);
+        }
+        self.scope_guard.allow(path);
+        None
+    }
+
     /// The commit message for the agent's own `message`, in the team's
     /// commit template when it set one.
     fn commit_message(&self, message: &str) -> String {
@@ -2748,13 +2809,11 @@ impl<'a> ToolExecutor for FeedbackToolExecutor<'a> {
                     );
                     return Ok(json!(refusal));
                 }
-                if self.scope_guard.should_block(path) {
-                    crate::agent::tool_outcome::note(
-                        crate::agent::tool_outcome::ToolOutcome::soft_fail(
-                            "rejected: outside the ticket's files",
-                        ),
-                    );
-                    return Ok(json!(super::write_guard::ScopeGuard::reject_msg(path)));
+                if let Some(refusal) = self
+                    .scope_refusal(path, super::write_guard::reason_input(input))
+                    .await
+                {
+                    return Ok(json!(refusal));
                 }
                 let edits = &super::implement::tool_edits(input)?;
                 let message = input
@@ -2860,13 +2919,11 @@ impl<'a> ToolExecutor for FeedbackToolExecutor<'a> {
                     );
                     return Ok(json!(refusal));
                 }
-                if self.scope_guard.should_block(path) {
-                    crate::agent::tool_outcome::note(
-                        crate::agent::tool_outcome::ToolOutcome::soft_fail(
-                            "rejected: outside the ticket's files",
-                        ),
-                    );
-                    return Ok(json!(super::write_guard::ScopeGuard::reject_msg(path)));
+                if let Some(refusal) = self
+                    .scope_refusal(path, super::write_guard::reason_input(input))
+                    .await
+                {
+                    return Ok(json!(refusal));
                 }
                 let content = input
                     .get("content")
@@ -2962,15 +3019,14 @@ impl<'a> ToolExecutor for FeedbackToolExecutor<'a> {
                              Nothing was committed."
                         )));
                     }
-                    if self.scope_guard.should_block(path) {
-                        crate::agent::tool_outcome::note(
-                            crate::agent::tool_outcome::ToolOutcome::soft_fail(
-                                "nothing committed: a file was rejected",
-                            ),
-                        );
+                    if let Some(refusal) = self
+                        .scope_refusal(path, super::write_guard::reason_input(f))
+                        .await
+                    {
                         return Ok(json!(format!(
-                            "Batch write REJECTED — {}. Nothing was committed.",
-                            super::write_guard::ScopeGuard::reject_msg(path)
+                            "Batch write REJECTED: nothing was committed. {refusal} In a batch, \
+                             `{}` goes on that file's entry.",
+                            super::write_guard::REASON_INPUT
                         )));
                     }
                     let action = f.get("action").and_then(|v| v.as_str()).unwrap_or("write");
@@ -3054,8 +3110,11 @@ impl<'a> ToolExecutor for FeedbackToolExecutor<'a> {
                         "Cannot modify {path}: CI/CD workflow files are protected."
                     )));
                 }
-                if self.scope_guard.should_block(path) {
-                    return Ok(json!(super::write_guard::ScopeGuard::reject_msg(path)));
+                if let Some(refusal) = self
+                    .scope_refusal(path, super::write_guard::reason_input(input))
+                    .await
+                {
+                    return Ok(json!(refusal));
                 }
                 // Default to the PR's base branch: restoring an out-of-scope file
                 // to base is how you remove the change. Guessing "main" was the bug
