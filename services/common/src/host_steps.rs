@@ -449,9 +449,10 @@ pub fn section(readers: &[Reader], caps: &[Capability]) -> String {
     let applies: Vec<&str> = readers.iter().map(|r| r.line()).collect();
     format!(
         "\n\n## Instructions written for a person's machine\n{}\n\n{PURPOSE}\n\nWhat Coderhelm can do \
-         instead of a person's machine:\n{}\n",
+         instead of a person's machine:\n{}\n\n{}",
         applies.join("\n"),
-        lines.join("\n")
+        lines.join("\n"),
+        crate::person_gate::prompt_section()
     )
 }
 

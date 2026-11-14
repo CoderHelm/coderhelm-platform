@@ -462,7 +462,7 @@ pub fn rubric(body: &str, facts: &Facts) -> Vec<Flaw> {
 mod tests {
     use super::*;
 
-    const LEAD: &str = "<!-- coderhelm:lead -->\nRetries the export poller three times before it gives up.\n\n**Check:** 2 recorded checks passed on `abc1234`.\n**Needed from you:** Nothing.\n**Review:** decide whether this is right to merge. Feedback wanted: nothing specific is flagged.\n<!-- /coderhelm:lead -->";
+    const LEAD: &str = "<!-- coderhelm:lead -->\nRetries the export poller three times before it gives up.\n\n**Check:** 2 recorded checks passed on `abc1234`.\n**Needed from you:** Nothing.\n**Review:** decide whether this is right to merge. CoderHelm's conclusion: every recorded check passed on `abc1234`.\n<!-- /coderhelm:lead -->";
 
     fn body() -> String {
         format!(

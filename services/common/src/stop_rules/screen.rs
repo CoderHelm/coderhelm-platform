@@ -321,6 +321,26 @@ pub const WHY_ANSWERABLE: &str =
     "the run's own tools, data sources or code can answer it: look it up instead of asking";
 pub const WHY_FIELD_UNREAD: &str = "it rests on what a field means, but the run never read where that field is written: open the code or query that writes it and cite it (`written_at:`), then ask only if it is still unclear";
 pub const WHY_CONFLICT: &str = "the run's own findings about the same record disagree (different ids or values): resolve which one is right before asking";
+pub const WHY_DECIDE: &str = "a careful engineer decides this without asking: it is reversible or nothing outside the pull request depends on it, so take the option the codebase's patterns, the safest reversible choice and the ticket's intent point to, do the work that way, and note the decision in one line with the alternative and why (`person_gate`)";
+pub const WHY_SAME: &str = "it asks the same thing as another question in other words: ask it once";
+
+/// Whether the gate finds the question one only a person can settle.
+pub fn gate_says_person(q: &Question) -> bool {
+    matches!(
+        crate::person_gate::decide(&question_ask(q), &crate::person_gate::Context::default()),
+        crate::person_gate::Outcome::Human(_)
+    )
+}
+
+/// A question as an item for the gate: its suggestions are the options,
+/// the first the default.
+pub fn question_ask(q: &Question) -> crate::person_gate::Ask {
+    let mut a = crate::person_gate::Ask::new(crate::person_gate::Kind::Question, &q.question);
+    a.why_not = q.why.clone();
+    a.options = q.suggestions.clone();
+    a
+}
+
 pub const WHY_NO_EVIDENCE: &str = "the ticket states the root cause, the fix plan and the acceptance criteria, and this question cites no code (`path:line`) or data lookup that contradicts them";
 
 /// The rule for one question. `diagnosed`: the ticket's diagnosis is
@@ -345,7 +365,14 @@ pub fn admit(
         return Admission::Drop(why.to_string());
     }
     if !diagnosed {
-        return Admission::Ask;
+        // Only what a person alone can settle is asked (`person_gate`); a
+        // choice CoderHelm can make is made and noted. A question with no
+        // listed reason never reaches a person.
+        return if q.decision.is_empty() && !gate_says_person(q) {
+            Admission::Drop(WHY_DECIDE.to_string())
+        } else {
+            Admission::Ask
+        };
     }
     let cited = q
         .evidence
@@ -464,6 +491,13 @@ pub fn screen(
     for (i, q) in questions.iter().enumerate() {
         let read = reads.get(i).cloned().unwrap_or_default();
         match admit(q, &read, diagnosed, form, checks_out) {
+            Admission::Ask
+                if out.ask.iter().any(|k| {
+                    crate::person_gate::same_decision(&question_ask(k), &question_ask(q))
+                }) =>
+            {
+                out.dropped.push((q.clone(), WHY_SAME.to_string()));
+            }
             Admission::Ask => {
                 let mut q = q.clone();
                 for e in read.evidence {
@@ -731,9 +765,11 @@ mod tests {
         let back = send_back(&s, Some(&d));
         assert!(back.contains("Follow the ticket's own plan"));
         assert!(back.contains("Select the card by the name the test gives it."));
-        // Without a diagnosis, a plain question is asked.
+        // Without a diagnosis, a reversible engineering choice is decided,
+        // never asked (`person_gate`).
         let s = screen(&questions[..1], &reads[..1], false, Form::Stop, &real);
-        assert_eq!(s.ask.len(), 1);
+        assert!(s.ask.is_empty());
+        assert_eq!(s.dropped[0].1, WHY_DECIDE);
     }
 
     #[test]
@@ -767,7 +803,15 @@ mod tests {
         let s = ask(no_change.clone(), plain.clone());
         assert_eq!(s.dropped[0].1, WHY_NO_CHANGE);
         no_change.changes = "all: drop the filter; some: keep it".into();
-        assert_eq!(ask(no_change.clone(), plain.clone()).ask.len(), 1);
+        // Past the asking rules, a reversible choice is decided and noted.
+        assert_eq!(
+            ask(no_change.clone(), plain.clone()).dropped[0].1,
+            WHY_DECIDE
+        );
+        // A choice that reaches customers and nothing settles is asked.
+        let mut refund = no_change.clone();
+        refund.question = "Should cancelled bookings be refunded to customers?".into();
+        assert_eq!(ask(refund, plain.clone()).ask.len(), 1);
         // A notice CoderHelm records itself is not held to them.
         let mut notice = bare("q1", "Open my own pull request?", &[]);
         notice.decision = "open_pr:acme/web#12".into();
@@ -797,7 +841,11 @@ mod tests {
 
     #[test]
     fn a_plain_line_in_the_decision_is_held_only_to_what_it_can_say() {
-        let line = bare("q1", "Use the existing schema?", &[]);
+        let line = bare(
+            "q1",
+            "Should cancelled bookings be refunded to customers?",
+            &[],
+        );
         let plain = read("q1", StopKind::NeedsPerson, false, &[]);
         let s = screen(
             std::slice::from_ref(&line),
@@ -829,7 +877,7 @@ mod tests {
         };
         let mut q = q(
             "q1",
-            "Is published_at the date the item goes live?",
+            "Is published_at the date the price change goes live for customers?",
             &["src/items/list.ts:40"],
         );
         let real = |c: &Citation| match c {
