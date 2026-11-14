@@ -281,7 +281,7 @@ pub fn prompt_section(candidates: &[RepoLabel], current: &[String], rules: &Labe
     if !rules.requires.is_empty() {
         s.push_str("Added automatically with a label (you don't need to pick these):\n");
         for (pat, comps) in &rules.requires {
-            s.push_str(&format!("- {pat} → {}\n", comps.join(", ")));
+            s.push_str(&format!("- {pat} to {}\n", comps.join(", ")));
         }
     }
     if !rules.guide.is_empty() {

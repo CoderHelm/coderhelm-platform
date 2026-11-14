@@ -987,14 +987,25 @@ async fn upsert_comment(github: &GitHubClient, msg: &HealthCheckMessage, body: &
         // Already says this (an approval wait seen again): nothing to edit.
         Some((_, true)) => return,
         Some((Some(id), false)) => {
-            github
-                .edit_issue_comment(&msg.repo_owner, &msg.repo_name, id, body)
-                .await
+            crate::passes::conversation::edit_own(
+                github,
+                &msg.repo_owner,
+                &msg.repo_name,
+                id,
+                &format!("health:{}", msg.merge_sha),
+                body,
+            )
+            .await
         }
         Some((None, false)) | None => {
-            github
-                .create_issue_comment(&msg.repo_owner, &msg.repo_name, msg.pr_number, body)
-                .await
+            crate::passes::conversation::github(
+                github,
+                &msg.repo_owner,
+                &msg.repo_name,
+                msg.pr_number,
+                common::conversation::Say::status(&format!("health:{}", msg.merge_sha), body),
+            )
+            .await
         }
     };
     if let Err(e) = res {

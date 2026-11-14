@@ -394,6 +394,13 @@ async fn read(
     if let Some(reply) = &fx.reply {
         say_on_ticket(state, t, &facts, &open, reply).await;
     }
+    // An answer to a question CoderHelm asked marks that question answered
+    // in the comment that asked it.
+    for (_, c) in settled.done.iter().filter(|(a, c)| {
+        matches!(a, Action::Fold | Action::Round | Action::Defer) && !c.question.trim().is_empty()
+    }) {
+        mark_answered(state, t, &facts, c).await;
+    }
     Read {
         folded: fx.folded,
         stopped: fx.stop_by.is_some(),
@@ -564,15 +571,16 @@ async fn say_on_ticket(
     let source = open.first().map(|c| c.source).unwrap_or_default();
     match source {
         Source::Jira => {
-            if let Err(e) = super::post_jira_comment(
+            if let Err(e) = crate::passes::conversation::jira(
                 state,
                 t.team_id,
                 t.ticket_id,
-                reply,
+                common::conversation::Say::reply_all("ticket-comments", reply),
                 "info",
                 "Comments read",
             )
             .await
+            .map(|_| ())
             {
                 warn!(ticket_id = t.ticket_id, error = %e, "Could not say on the ticket what was done with its comments");
             }
@@ -596,13 +604,67 @@ async fn say_on_ticket(
                     return;
                 }
             };
-            if let Err(e) = github
-                .create_issue_comment(owner, name, facts.issue_number, reply)
-                .await
+            if let Err(e) = crate::passes::conversation::github(
+                &github,
+                owner,
+                name,
+                facts.issue_number,
+                common::conversation::Say::reply_all("ticket-comments", reply),
+            )
+            .await
             {
                 warn!(ticket_id = t.ticket_id, error = %e, "Could not say on the issue what was done with its comments");
             }
         }
+    }
+}
+
+/// Marks `c`'s question answered in CoderHelm's comment that asked it.
+/// Best effort.
+async fn mark_answered(state: &WorkerState, t: &Ticket<'_>, facts: &RunFacts, c: &Comment) {
+    let res = match c.source {
+        Source::Jira => {
+            crate::passes::conversation::mark_answered_jira(
+                state,
+                t.team_id,
+                t.ticket_id,
+                &c.question,
+                &c.author,
+                &c.text,
+            )
+            .await
+        }
+        Source::Github => {
+            let Some((owner, name)) = facts.repo.split_once('/') else {
+                return;
+            };
+            if facts.issue_number == 0 {
+                return;
+            }
+            match GitHubClient::new(
+                &state.secrets.github_app_id,
+                &state.secrets.github_private_key,
+                t.installation_id,
+                &state.http,
+            ) {
+                Ok(gh) => {
+                    crate::passes::conversation::mark_answered_github(
+                        &gh,
+                        owner,
+                        name,
+                        facts.issue_number,
+                        &c.question,
+                        &c.author,
+                        &c.text,
+                    )
+                    .await
+                }
+                Err(e) => Err(e.to_string().into()),
+            }
+        }
+    };
+    if let Err(e) = res {
+        warn!(ticket_id = t.ticket_id, error = %e, "Could not mark the question answered on the ticket");
     }
 }
 

@@ -1276,21 +1276,21 @@ fn check_inner(q: Requirement, inv: &Inventory) -> Requirement {
             // Connected (with a token or through the Jira app) but this step
             // writes: the write switch and page list are what's missing.
             (true, _, _) if writes => format!(
-                "Turn on {} writes and list the page in Settings → Integrations, or leave this step to a person.",
+                "Turn on {} writes and list the page in Settings under Integrations, or leave this step to a person.",
                 kind.label()
             ),
             (true, _, _) => format!(
-                "{} is connected; check its settings in Settings → Integrations.",
+                "{} is connected; check its settings in Settings under Integrations.",
                 kind.label()
             ),
             (false, _, true) => format!(
-                "Turn on {} for your AWS account in Settings → Integrations.",
+                "Turn on {} for your AWS account in Settings under Integrations.",
                 kind.label()
             ),
             (false, _, false) if kind == crate::live::connectors::ConnKind::Confluence => {
-                "Connect Confluence in Settings → Integrations, or install the Coderhelm app in Jira (it reads Confluence on the same site).".into()
+                "Connect Confluence in Settings under Integrations, or install the Coderhelm app in Jira (it reads Confluence on the same site).".into()
             }
-            (false, _, false) => format!("Connect {} in Settings → Integrations.", kind.label()),
+            (false, _, false) => format!("Connect {} in Settings under Integrations.", kind.label()),
         };
         return q;
     }

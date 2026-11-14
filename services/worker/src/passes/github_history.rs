@@ -415,7 +415,7 @@ fn pr_line(p: &Value) -> String {
         .map(|l| l.iter().filter_map(|x| x["name"].as_str()).collect())
         .unwrap_or_default();
     format!(
-        "#{} {} — {} → {}, by {}, {}{}{}",
+        "#{} {} — {} to {}, by {}, {}{}{}",
         p["number"],
         p["title"].as_str().unwrap_or(""),
         p["head"]["ref"].as_str().unwrap_or(""),
@@ -566,7 +566,7 @@ pub fn fmt_tags(list: &[Value]) -> String {
         .map(|t| {
             let sha = t["commit"]["sha"].as_str().unwrap_or("");
             format!(
-                "{} → {}",
+                "{} to {}",
                 t["name"].as_str().unwrap_or(""),
                 sha.get(..7).unwrap_or(sha)
             )

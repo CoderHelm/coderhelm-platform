@@ -1102,6 +1102,10 @@ async fn handle_jira_comment(
                 comment_id: &comment_id,
                 author: comment_author,
                 author_kind,
+                author_id: payload
+                    .pointer("/comment/author/accountId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(""),
                 text: comment_body,
                 ..Default::default()
             },
@@ -1168,6 +1172,10 @@ async fn handle_jira_comment(
                 comment_id: &comment_id,
                 author: comment_author,
                 author_kind,
+                author_id: payload
+                    .pointer("/comment/author/accountId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(""),
                 text: comment_body,
                 title,
                 run_id,

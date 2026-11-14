@@ -1261,6 +1261,7 @@ mod checks;
 pub mod code_graph;
 mod completeness;
 pub mod conventions;
+pub mod conversation;
 mod covering;
 mod cross_repo;
 pub mod dep_fix;
@@ -2049,14 +2050,14 @@ async fn run_passes(
     // Post "working on it" comment only for GitHub-sourced tickets.
     let mut progress_comment_id: Option<u64> = None;
     if matches!(msg.source, TicketSource::Github) && msg.issue_number > 0 {
-        let resp = github
-            .create_issue_comment(
-                &msg.repo_owner,
-                &msg.repo_name,
-                msg.issue_number,
-                &format_progress("triage", run_id),
-            )
-            .await?;
+        let resp = crate::passes::conversation::github(
+            &github,
+            &msg.repo_owner,
+            &msg.repo_name,
+            msg.issue_number,
+            common::conversation::Say::status("run", format_progress("triage", run_id)),
+        )
+        .await?;
         progress_comment_id = resp["id"].as_u64();
     }
 
@@ -2712,6 +2713,17 @@ async fn run_passes(
     // lacks on its branch and carries it there (see `covering`) ---
     let mut continue_in: Option<(covering::Remembered, stack::Dependency)> = None;
     if !resumed_plan && plan_resume.is_none() {
+        // A retry on a ticket an earlier run ended as covered keeps that
+        // decision while its pull request is open and nobody wrote since:
+        // decided here, before anything is built, never by building a
+        // duplicate and finding out when the pull request is about to open.
+        if let Some(rec) = covered_retry(state, msg, &github, &history).await {
+            let mut rec = rec;
+            rec.note = common::stop_rules::covering::retried_note(&rec);
+            covering::finish(state, msg, run_id, &github, &rec, usage, start).await;
+            close_memory(state, agent_memory.take()).await;
+            return Ok(());
+        }
         let (tests, specs, failure) = existing_work_inputs(test_ev.as_ref());
         if let Some(covered) = stop_gate::existing_work(
             state,
@@ -3532,7 +3544,7 @@ async fn run_passes(
         info!(run_id, reason, "Plan determined no changes needed");
 
         let raw_github = format!(
-            "✅ **No changes needed**\n\n{reason}\n\nThe codebase already satisfies what this issue asks for."
+            "No changes needed: {reason}\n\nThe code already does what this issue asks for."
         );
         let github_comment =
             formatter::format_with_voice(state, &voice, &raw_github, &provider, usage).await;
@@ -3551,23 +3563,28 @@ async fn run_passes(
             jira_comment = format!("{jira_comment}\n\n{note}");
         }
 
+        // The run's model reads the thread first: people who wrote since
+        // CoderHelm last spoke are answered in reply to their comment.
+        let judge = conversation::ModelJudge::new(&provider, usage);
         if matches!(msg.source, TicketSource::Github) && msg.issue_number > 0 {
-            let _ = github
-                .create_issue_comment(
-                    &msg.repo_owner,
-                    &msg.repo_name,
-                    msg.issue_number,
-                    &github_comment,
-                )
-                .await;
+            let _ = conversation::github_judged(
+                &github,
+                &msg.repo_owner,
+                &msg.repo_name,
+                msg.issue_number,
+                common::conversation::Say::status("run", &github_comment),
+                Some(&judge),
+            )
+            .await;
         } else if matches!(msg.source, TicketSource::Jira) && !msg.ticket_id.is_empty() {
-            let _ = post_jira_comment(
+            let _ = conversation::jira_judged(
                 state,
                 &msg.team_id,
                 &msg.ticket_id,
-                &jira_comment,
+                common::conversation::Say::status("run", &jira_comment),
                 "no_changes",
                 "No changes needed",
+                Some(&judge),
             )
             .await;
         }
@@ -4837,7 +4854,7 @@ async fn run_passes(
             info!(
                 run_id,
                 files = plan_warnings.mentioned_file_count,
-                "Plan touches multiple files — upgrading complexity simple → medium"
+                "Plan touches multiple files — upgrading complexity simple to medium"
             );
             add_progress_note(
                 state,
@@ -8807,27 +8824,28 @@ async fn finish_without_code(
     let jira_body = fix_location::jira_text(&report);
     if outside {
         if matches!(msg.source, TicketSource::Github) && msg.issue_number > 0 {
-            if let Err(e) = github
-                .create_issue_comment(
-                    &msg.repo_owner,
-                    &msg.repo_name,
-                    msg.issue_number,
-                    &github_body,
-                )
-                .await
+            if let Err(e) = crate::passes::conversation::github(
+                github,
+                &msg.repo_owner,
+                &msg.repo_name,
+                msg.issue_number,
+                common::conversation::Say::status("run", &github_body),
+            )
+            .await
             {
                 warn!(run_id, error = %e, "Could not post the outside-the-code report on the issue");
             }
         } else if matches!(msg.source, TicketSource::Jira) && !msg.ticket_id.is_empty() {
-            if let Err(e) = post_jira_comment(
+            if let Err(e) = crate::passes::conversation::jira(
                 state,
                 &msg.team_id,
                 &msg.ticket_id,
-                &jira_body,
+                common::conversation::Say::status("run", &jira_body),
                 jira_type,
                 jira_title,
             )
             .await
+            .map(|_| ())
             {
                 warn!(run_id, error = %e, "Could not post the outside-the-code report on the ticket");
             }
@@ -8960,9 +8978,10 @@ async fn report_also_outside(
         run_id,
         github,
         NOTICE_ALSO_OUTSIDE,
-        &format!("**{title}**\n\n{report}"),
+        &report,
         &fix_location::jira_text(&report),
         title,
+        &[],
     )
     .await;
     let _ = state
@@ -9148,6 +9167,7 @@ async fn post_ticket_notice(
     github_body: &str,
     jira_body: &str,
     jira_title: &str,
+    asks: &[String],
 ) -> Option<String> {
     use common::ticket_state::{notice_action, notice_hash, Notice, NoticeAction};
     let github_ticket = matches!(msg.source, TicketSource::Github) && msg.issue_number > 0;
@@ -9167,14 +9187,16 @@ async fn post_ticket_notice(
             return (!earlier.url.is_empty()).then(|| earlier.url.clone());
         }
         (NoticeAction::Edit(earlier), true) => {
-            match github
-                .edit_issue_comment(
-                    &msg.repo_owner,
-                    &msg.repo_name,
-                    earlier.comment_id,
-                    github_body,
-                )
-                .await
+            match conversation::edit_own_asking(
+                github,
+                &msg.repo_owner,
+                &msg.repo_name,
+                earlier.comment_id,
+                key,
+                github_body,
+                asks,
+            )
+            .await
             {
                 Ok(_) => {
                     info!(run_id, key, "Edited the earlier notice on the issue");
@@ -9186,14 +9208,14 @@ async fn post_ticket_notice(
                 }
             }
         }
-        (_, true) => match github
-            .create_issue_comment(
-                &msg.repo_owner,
-                &msg.repo_name,
-                msg.issue_number,
-                github_body,
-            )
-            .await
+        (_, true) => match crate::passes::conversation::github(
+            github,
+            &msg.repo_owner,
+            &msg.repo_name,
+            msg.issue_number,
+            common::conversation::Say::status(key, github_body).asks(asks.to_vec()),
+        )
+        .await
         {
             Ok(c) => (
                 c["html_url"].as_str().unwrap_or("").to_string(),
@@ -9204,15 +9226,16 @@ async fn post_ticket_notice(
                 return None;
             }
         },
-        (_, false) => match post_jira_comment_link(
+        (_, false) => match crate::passes::conversation::jira(
             state,
             &msg.team_id,
             &msg.ticket_id,
-            jira_body,
+            common::conversation::Say::status(key, jira_body).asks(asks.to_vec()),
             "clarification",
             jira_title,
         )
         .await
+        .map(|(_, link)| link)
         {
             Ok(link) => (link.unwrap_or_default(), 0),
             Err(e) => {
@@ -9272,19 +9295,14 @@ async fn report_questions(
     if fresh.is_empty() {
         return;
     }
-    let shown = fix_location::FixDecision {
-        questions: fresh.iter().map(|q| q.to_string()).collect(),
-        ..Default::default()
-    };
-    let questions = fix_location::questions_markdown(&shown);
-    let Some((_, list)) = questions.split_once('\n') else {
+    // Asked as sentences to the person, the same question worded twice
+    // asked once, plain text (no warning panel, no heading).
+    let fresh_text: Vec<String> = fresh.iter().map(|q| q.to_string()).collect();
+    let report = common::conversation::ask_text(&fresh_text, true);
+    if report.is_empty() {
         return;
-    };
-    let title = "Questions only a person can answer";
-    let report = format!(
-        "{}\n\nI'm building the rest of the plan meanwhile; reply here with the answers.",
-        list.trim()
-    );
+    }
+    let title = "Questions for the ticket";
     add_progress_note(state, &msg.team_id, run_id, title).await;
     let key = fresh
         .iter()
@@ -9297,9 +9315,10 @@ async fn report_questions(
         run_id,
         github,
         &key,
-        &format!("**{title}**\n\n{report}"),
+        &report,
         &fix_location::jira_text(&report),
         title,
+        &fresh_text,
     )
     .await;
     // Each question is kept as asked, so no later run asks it again.
@@ -9536,15 +9555,16 @@ async fn stop_run_repo_not_enabled(
     );
     add_progress_note(state, &msg.team_id, run_id, message).await;
     if matches!(msg.source, TicketSource::Jira) && !msg.ticket_id.is_empty() {
-        if let Err(e) = post_jira_comment(
+        if let Err(e) = crate::passes::conversation::jira(
             state,
             &msg.team_id,
             &msg.ticket_id,
-            message,
+            common::conversation::Say::status("run", message),
             "clarification",
             "Repo not turned on",
         )
         .await
+        .map(|_| ())
         {
             warn!(run_id, error = %e, "Could not post the repo-not-turned-on Jira comment");
         }
@@ -9669,11 +9689,11 @@ fn budget_reason(hit: &common::token_limits::LimitUse) -> String {
     use common::token_limits::LimitKind;
     match hit.kind {
         LimitKind::Legacy { .. } => format!(
-            "Monthly token limit exceeded ({} / {} tokens). Increase your limit in Settings → Token Limit.",
+            "Monthly token limit exceeded ({} / {} tokens). Increase your limit in Settings under Token Limit.",
             hit.used, hit.max
         ),
         kind => format!(
-            "Monthly {label} limit exceeded ({} / {} {label}). Raise or clear that limit in Settings → Token Limit.",
+            "Monthly {label} limit exceeded ({} / {} {label}). Raise or clear that limit in Settings under Token Limit.",
             hit.used,
             hit.max,
             label = kind.label(),
@@ -9765,7 +9785,18 @@ async fn notify_ticket_failed(
     run_id: &str,
     error_msg: &str,
 ) {
-    // Comment on the GitHub issue so the user knows the run failed
+    // One live comment per ticket for the run: the failure rewrites the
+    // run's earlier comment (saying what it said before), says what
+    // happened in plain words, and gives the one next step for its cause.
+    use common::conversation::{cause_of, failure_comment, Say};
+    let run_url = format!(
+        "{}/runs/detail?id={run_id}",
+        common::public_urls::app_url(&state.config.stage)
+    );
+    let say = |markdown: bool| {
+        Say::status("run", failure_comment(error_msg, &run_url, markdown))
+            .meaning(format!("failed {:?} {error_msg}", cause_of(error_msg)))
+    };
     if matches!(msg.source, TicketSource::Github) && msg.issue_number > 0 {
         if let Ok(gh) = GitHubClient::new(
             &state.secrets.github_app_id,
@@ -9773,37 +9804,24 @@ async fn notify_ticket_failed(
             msg.installation_id,
             &state.http,
         ) {
-            let comment = format!(
-                "⚠️ **Coderhelm couldn't complete this issue**\n\n\
-                 {}\n\n\
-                 If you can, add more detail to the issue description — for example which files to change, \
-                 expected behavior, or relevant code snippets — and I'll try again.\n\n\
-                 [View run →]({}/runs/detail?id={})",
-                common::truncate_str(error_msg, 300),
-                common::public_urls::app_url(&state.config.stage),
-                run_id,
-            );
-            if let Err(e) = gh
-                .create_issue_comment(&msg.repo_owner, &msg.repo_name, msg.issue_number, &comment)
-                .await
+            if let Err(e) = conversation::github(
+                &gh,
+                &msg.repo_owner,
+                &msg.repo_name,
+                msg.issue_number,
+                say(true),
+            )
+            .await
             {
                 error!("Failed to comment on issue about run failure: {e}");
             }
         }
     } else if matches!(msg.source, TicketSource::Jira) && !msg.ticket_id.is_empty() {
-        let comment = format!(
-            "{}\n\n\
-             Add more detail — which files to change, expected behavior, or relevant code snippets — and comment to retry.\n\n\
-             View run → {}/runs/detail?id={}",
-            common::truncate_str(error_msg, 300),
-            common::public_urls::app_url(&state.config.stage),
-            run_id,
-        );
-        if let Err(e) = post_jira_comment(
+        if let Err(e) = conversation::jira(
             state,
             &msg.team_id,
             &msg.ticket_id,
-            &comment,
+            say(false),
             "error",
             "Run failed",
         )
@@ -10114,9 +10132,14 @@ async fn supersede_moved_prs(
             p.repo,
             p.branch
         );
-        if let Err(e) = github
-            .create_issue_comment(owner, name, p.number, &note)
-            .await
+        if let Err(e) = crate::passes::conversation::github(
+            github,
+            owner,
+            name,
+            p.number,
+            common::conversation::Say::note("superseded", &note),
+        )
+        .await
         {
             warn!(repo = %p.repo, pr = p.number, error = %e, "Could not note the superseded PR; leaving it open");
             continue;
@@ -10211,6 +10234,50 @@ fn own_pr_numbers(history: &ticket_history::TicketHistory, owner: &str, name: &s
         .filter(|r| r.pr_number > 0 && (r.repo.is_empty() || r.repo.eq_ignore_ascii_case(&repo)))
         .map(|r| r.pr_number)
         .collect()
+}
+
+/// The covered decision a retry keeps (see
+/// `common::stop_rules::covering::on_retry`): the latest earlier run on the
+/// ticket ended as covered, its pull request is still open, and no person
+/// wrote on the ticket since (no direction with the retry, no unread ticket
+/// comment).
+async fn covered_retry(
+    state: &WorkerState,
+    msg: &TicketMessage,
+    github: &GitHubClient,
+    history: &ticket_history::TicketHistory,
+) -> Option<common::stop_rules::covering::Record> {
+    use common::stop_rules::covering::{on_retry, Retry};
+    let last = history.runs.iter().rev().find(|r| {
+        matches!(
+            r.status.as_str(),
+            common::run_status::COVERED_BY_PR | "failed" | "completed" | "needs_input"
+        )
+    })?;
+    let earlier = last.covered_by.as_ref()?;
+    let (owner, repo) = earlier.repo.split_once('/')?;
+    let still_open = github
+        .get_pull_request(owner, repo, earlier.number)
+        .await
+        .ok()
+        .is_some_and(|v| v["state"].as_str() == Some("open"));
+    let unread = {
+        use common::ticket_comments::Store;
+        let store = common::ticket_comments::Dynamo {
+            client: &state.dynamo,
+            table: &state.config.settings_table_name,
+        };
+        store
+            .of_ticket(&msg.team_id, &msg.ticket_id)
+            .await
+            .map(|c| !common::ticket_comments::open(c).is_empty())
+            .unwrap_or(false)
+    };
+    let person_spoke = msg.person_direction.is_some() || unread;
+    match on_retry(Some(earlier), still_open, person_spoke) {
+        Retry::Same(r) => Some(*r),
+        Retry::Decide => None,
+    }
 }
 
 /// Pull requests a person already decided about on the ticket (work on it,
@@ -10350,99 +10417,6 @@ async fn stop_for_open_pr(
     true
 }
 
-async fn post_jira_comment(
-    state: &WorkerState,
-    team_id: &str,
-    issue_key: &str,
-    comment: &str,
-    comment_type: &str,
-    title: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    post_jira_comment_link(state, team_id, issue_key, comment, comment_type, title)
-        .await
-        .map(|_| ())
-}
-
-/// Posts a comment on a Jira ticket through the team's Jira app and returns
-/// the comment's address, when the app said its id and the site is known.
-async fn post_jira_comment_link(
-    state: &WorkerState,
-    team_id: &str,
-    issue_key: &str,
-    comment: &str,
-    comment_type: &str,
-    title: &str,
-) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
-    let config = state
-        .dynamo
-        .get_item()
-        .table_name(&state.config.jira_config_table_name)
-        .key(
-            "pk",
-            aws_sdk_dynamodb::types::AttributeValue::S(team_id.to_string()),
-        )
-        .key(
-            "sk",
-            aws_sdk_dynamodb::types::AttributeValue::S("JIRA#config".to_string()),
-        )
-        .send()
-        .await?
-        .item;
-    let field = |k: &str| {
-        config
-            .as_ref()
-            .and_then(|item| item.get(k))
-            .and_then(|v| v.as_s().ok())
-            .filter(|s| !s.is_empty())
-            .cloned()
-    };
-    let url = field("add_comment_url").ok_or("No Jira add_comment_url configured")?;
-    let site = field("site_url");
-
-    let payload = serde_json::json!({
-        "issueKey": issue_key,
-        "comment": comment,
-        "commentType": comment_type,
-        "title": title,
-    });
-
-    let resp = state
-        .http
-        .post(&url)
-        .header("Content-Type", "application/json")
-        .body(payload.to_string())
-        .send()
-        .await?;
-
-    if !resp.status().is_success() {
-        let status = resp.status().as_u16();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(format!("Jira comment failed ({status}): {body}").into());
-    }
-    let id = resp
-        .json::<serde_json::Value>()
-        .await
-        .ok()
-        .and_then(|v| match &v["id"] {
-            serde_json::Value::String(s) => Some(s.clone()),
-            serde_json::Value::Number(n) => Some(n.to_string()),
-            _ => None,
-        });
-    Ok(jira_comment_link(site.as_deref(), issue_key, id.as_deref()))
-}
-
-/// The address of a comment on a Jira ticket.
-fn jira_comment_link(site: Option<&str>, issue_key: &str, id: Option<&str>) -> Option<String> {
-    let site = site?.trim().trim_end_matches('/');
-    if site.is_empty() || issue_key.is_empty() {
-        return None;
-    }
-    Some(match id.filter(|i| !i.is_empty()) {
-        Some(id) => format!("{site}/browse/{issue_key}?focusedCommentId={id}"),
-        None => format!("{site}/browse/{issue_key}"),
-    })
-}
-
 /// Posts a run's questions on the ticket it came from (`github_body` on a
 /// GitHub issue, `jira_body` under `jira_title` on a Jira ticket) and keeps
 /// them on the run with the comment's address, so the run page lists them
@@ -10530,14 +10504,14 @@ async fn ask_on_ticket_keyed(
     let mut comment_url = None;
     let mut posted = false;
     if matches!(msg.source, TicketSource::Github) && msg.issue_number > 0 {
-        match github
-            .create_issue_comment(
-                &msg.repo_owner,
-                &msg.repo_name,
-                msg.issue_number,
-                github_body,
-            )
-            .await
+        match crate::passes::conversation::github(
+            github,
+            &msg.repo_owner,
+            &msg.repo_name,
+            msg.issue_number,
+            common::conversation::Say::status("questions", github_body),
+        )
+        .await
         {
             Ok(c) => {
                 posted = true;
@@ -10549,15 +10523,16 @@ async fn ask_on_ticket_keyed(
             Err(e) => warn!(run_id, error = %e, "Could not post the run's questions on the issue"),
         }
     } else if matches!(msg.source, TicketSource::Jira) && !msg.ticket_id.is_empty() {
-        match post_jira_comment_link(
+        match crate::passes::conversation::jira(
             state,
             &msg.team_id,
             &msg.ticket_id,
-            jira_body,
+            common::conversation::Say::status("questions", jira_body),
             "clarification",
             jira_title,
         )
         .await
+        .map(|(_, link)| link)
         {
             Ok(link) => {
                 posted = true;
@@ -10767,7 +10742,7 @@ pub(crate) async fn load_rules(state: &WorkerState, msg: &TicketMessage) -> Vec<
             .to_string(),
         "Use the right editing tool. edit_file needs old_text to match EXACTLY; a sloppy match silently drops lines (e.g. an array element). For JSON, template literals, or heavy special characters, or when an edit_file call fails more than once on a file, switch to write_file and rewrite the whole file with complete content. Very large generated files (e.g. sanity.types.ts) are not indexed by search_code — read them directly with read_file instead of concluding a type is missing."
             .to_string(),
-        "In jsdom / Testing-Library component tests, never select elements with querySelector/querySelectorAll using Tailwind arbitrary-value classes (e.g. `.text-[32px]`, `.w-[50%]`, `.top-[-1px]`) — the square brackets are invalid CSS selector syntax and throw `SyntaxError: '…' is not a valid selector` in jsdom. Query by role, accessible name, text, label, or test id (getByRole/getByText/getByLabelText/getByTestId), or escape the class with CSS.escape. When FIXING such a failing test, change the QUERY approach — do NOT merely swap the tag name (e.g. h3 → h2) while keeping the bracketed class."
+        "In jsdom / Testing-Library component tests, never select elements with querySelector/querySelectorAll using Tailwind arbitrary-value classes (e.g. `.text-[32px]`, `.w-[50%]`, `.top-[-1px]`) — the square brackets are invalid CSS selector syntax and throw `SyntaxError: '…' is not a valid selector` in jsdom. Query by role, accessible name, text, label, or test id (getByRole/getByText/getByLabelText/getByTestId), or escape the class with CSS.escape. When FIXING such a failing test, change the QUERY approach — do NOT merely swap the tag name (e.g. h3 to h2) while keeping the bracketed class."
             .to_string(),
     ];
 
@@ -12459,7 +12434,7 @@ fn format_progress(current_phase: &str, run_id: &str) -> String {
 
     let app = common::public_urls::app_url_from_env();
     format!(
-        "🔄 **Coderhelm is working on this**\n\n| Phase | Status |\n|-------|--------|\n{rows}\n[View run →]({app}/runs/detail?id={run_id})"
+        "🔄 **Coderhelm is working on this**\n\n| Step | Status |\n|-------|--------|\n{rows}\n[View the run]({app}/runs/detail?id={run_id})"
     )
 }
 
@@ -12474,7 +12449,9 @@ async fn update_progress_comment(
 ) {
     if let Some(cid) = comment_id {
         let body = format_progress(phase, run_id);
-        if let Err(e) = github.edit_issue_comment(owner, repo, cid, &body).await {
+        if let Err(e) =
+            crate::passes::conversation::edit_own(github, owner, repo, cid, "run", &body).await
+        {
             tracing::warn!(error = %e, "Failed to update progress comment");
         }
     }
@@ -13516,7 +13493,7 @@ mod ticket_notice_tests {
 
 #[cfg(test)]
 mod asking_tests {
-    use super::{clarification_questions, jira_comment_link, unknown_fix_questions};
+    use super::{clarification_questions, unknown_fix_questions};
     use crate::passes::fix_location::{FixDecision, FixLocation, TicketIntent};
     use common::run_questions::Answer;
 
@@ -13614,7 +13591,7 @@ mod asking_tests {
     #[test]
     fn a_jira_comment_link_needs_the_site() {
         assert_eq!(
-            jira_comment_link(
+            super::conversation::jira_link(
                 Some("https://example.atlassian.net/"),
                 "ABC-7",
                 Some("10001")
@@ -13622,7 +13599,10 @@ mod asking_tests {
             .as_deref(),
             Some("https://example.atlassian.net/browse/ABC-7?focusedCommentId=10001")
         );
-        assert_eq!(jira_comment_link(None, "ABC-7", Some("1")), None);
+        assert_eq!(
+            super::conversation::jira_link(None, "ABC-7", Some("1")),
+            None
+        );
     }
 }
 

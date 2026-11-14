@@ -41,6 +41,8 @@ pub struct PriorRun {
     pub answers: Vec<common::run_questions::Answer>,
     /// Every pull request the run opened, each with its repository.
     pub pr_list: Vec<common::run_prs::RunPr>,
+    /// The open pull request the run ended as covered by, if it did.
+    pub covered_by: Option<common::stop_rules::covering::Record>,
 }
 
 impl PriorRun {
@@ -613,6 +615,7 @@ fn prior_run(item: &Item) -> PriorRun {
         answers: serde_json::from_str(&s(item, common::run_questions::FIELD_ANSWERS))
             .unwrap_or_default(),
         pr_list: common::run_prs::from_item(item),
+        covered_by: serde_json::from_str(&s(item, "covered_by")).ok(),
     }
 }
 

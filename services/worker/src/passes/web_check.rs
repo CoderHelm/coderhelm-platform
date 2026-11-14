@@ -577,8 +577,8 @@ impl Checked {
     pub fn line(&self) -> String {
         let chain: Vec<String> = self.hops.iter().map(|h| h.status.to_string()).collect();
         format!(
-            "{} → {}{}",
-            chain.join(" → "),
+            "{} to {}{}",
+            chain.join(" to "),
             self.final_url,
             self.stopped
                 .as_ref()

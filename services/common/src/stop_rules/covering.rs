@@ -352,6 +352,40 @@ pub fn not_carried_note(number: u64, why: &str, branch: &str) -> String {
     )
 }
 
+/// What a run does when an earlier run on the ticket already ended as
+/// covered by an open pull request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Retry {
+    /// Nothing changed since: the earlier decision stands. The run ends
+    /// the same way before building anything, and its ticket comment is
+    /// the earlier one, edited ("Retried at ...; same result").
+    Same(Box<Record>),
+    /// Decide afresh: no earlier decision, its pull request is no longer
+    /// open, or a person wrote since (asking for more, or for a separate
+    /// change).
+    Decide,
+}
+
+/// The decision before building, for a retry. A model asked the same
+/// question twice can answer differently; the second answer once built a
+/// duplicate of the covering pull request on its branch, which failed when
+/// the pull request was about to open. A retry with nothing new is the same
+/// question, so it gets the same answer.
+pub fn on_retry(earlier: Option<&Record>, still_open: bool, person_spoke: bool) -> Retry {
+    match earlier {
+        Some(r) if still_open && !person_spoke && r.number > 0 => Retry::Same(Box::new(r.clone())),
+        _ => Retry::Decide,
+    }
+}
+
+/// The run page's note when a retry keeps the earlier covered decision.
+pub fn retried_note(record: &Record) -> String {
+    format!(
+        "Retried: #{} still covers this ticket and nobody asked for more on the ticket since, so          nothing was built. To change it, say on the ticket what #{} should add or what separate          change is needed, then run it again.",
+        record.number, record.number
+    )
+}
+
 /// The note on the ticket. `markdown` for GitHub, plain for Jira.
 pub fn ticket_note(record: &Record, markdown: bool) -> String {
     let link = match (markdown, record.url.is_empty()) {
@@ -395,6 +429,24 @@ pub fn ticket_note(record: &Record, markdown: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_retry_with_nothing_new_keeps_the_covered_decision() {
+        let r = Record {
+            repo: "acme/web".into(),
+            number: 41,
+            outcome: Outcome::Complete.as_str().into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            on_retry(Some(&r), true, false),
+            Retry::Same(Box::new(r.clone()))
+        );
+        assert_eq!(on_retry(Some(&r), false, false), Retry::Decide);
+        assert_eq!(on_retry(Some(&r), true, true), Retry::Decide);
+        assert_eq!(on_retry(None, true, false), Retry::Decide);
+        assert!(retried_note(&r).contains("#41 still covers"));
+    }
     use crate::stop_rules::existing_work::{OpenPr, Signals};
 
     fn covered() -> Covered {
