@@ -152,10 +152,27 @@ mod model_call_sites;
 pub mod own_pr;
 /// Paginated DynamoDB lookups (follow LastEvaluatedKey to a match).
 pub mod paged;
+/// Placeholder tokens: never learned, never written into a commit or title.
+pub mod placeholders;
 /// Every body CoderHelm sends GitHub fits GitHub's limit.
 pub mod pr_body_fit;
+/// A description checked against the recorded facts, sentence by sentence.
+pub mod pr_claims;
+/// What is recorded about a pull request at one head, and the lead rendered
+/// from it.
+pub mod pr_conventions;
+/// A dependency pull request's facts, from what the pipeline records.
+pub mod pr_dependency;
+pub mod pr_facts;
+/// Where each part of a description goes, and how a reader would judge it.
+pub mod pr_layout;
 /// What happened to a PR Coderhelm opened, read from GitHub.
 pub mod pr_outcome;
+/// The last read of a description before it is saved, verified.
+pub mod pr_reader;
+/// The work around a pull request that is not in its diff, each step with
+/// one owner and one state.
+pub mod pr_steps;
 pub mod run_prs;
 // review_stats: time-ordered review records for analytics
 pub mod decision_log;

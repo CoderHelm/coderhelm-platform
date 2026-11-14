@@ -797,16 +797,17 @@ pub async fn drive(
                     .into_iter()
                     .map(|(path, content)| FileOp::Write { path, content })
                     .collect();
-                let conventions =
-                    super::load_git_conventions(state, &msg.team_id, &msg.ticket_id).await;
-                let message = conventions.commit_message(
-                    &super::ticket_tokens(msg),
+                let message = super::conventions::commit_for(
+                    state,
+                    w.github,
+                    msg,
                     &format!(
                         "fix(deps): {} security update{} verified in the sandbox",
                         set.len(),
                         if set.len() == 1 { "" } else { "s" }
                     ),
-                );
+                )
+                .await;
                 match w
                     .github
                     .batch_write(owner, name, w.branch, &message, &ops)
@@ -987,15 +988,17 @@ async fn restore_to(w: &Work<'_>, out: &df::TakenOut) -> Option<String> {
     if ops.is_empty() {
         return None;
     }
-    let conventions = super::load_git_conventions(w.state, &w.msg.team_id, &w.msg.ticket_id).await;
-    let message = conventions.commit_message(
-        &super::ticket_tokens(w.msg),
+    let message = super::conventions::commit_for(
+        w.state,
+        w.github,
+        w.msg,
         &format!(
             "fix(deps): take out {} security update{} the build or start fails with",
             out.lines.len(),
             if out.lines.len() == 1 { "" } else { "s" }
         ),
-    );
+    )
+    .await;
     w.github
         .batch_write(owner, name, w.branch, &message, &ops)
         .await
@@ -1081,7 +1084,13 @@ async fn code_fix(
             content: content.clone(),
         })
         .collect();
-    let message = format!("fix(deps): {} {} to {}", b.package, b.from, b.to);
+    let message = super::conventions::commit_for(
+        w.state,
+        w.github,
+        w.msg,
+        &format!("fix(deps): {} {} to {}", b.package, b.from, b.to),
+    )
+    .await;
     if let Err(e) = w
         .github
         .batch_write(owner, name, w.branch, &message, &ops)
@@ -1168,10 +1177,16 @@ async fn code_fix(
             }
         }
         if !ops.is_empty() {
-            let message = format!(
-                "Revert {} {} to {}: its call sites could not be made to pass",
-                b.package, b.from, b.to
-            );
+            let message = super::conventions::commit_for(
+                w.state,
+                w.github,
+                w.msg,
+                &format!(
+                    "Revert {} {} to {}: its call sites could not be made to pass",
+                    b.package, b.from, b.to
+                ),
+            )
+            .await;
             if let Err(e) = w
                 .github
                 .batch_write(owner, name, w.branch, &message, &ops)

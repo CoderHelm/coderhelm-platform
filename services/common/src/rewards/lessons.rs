@@ -471,6 +471,9 @@ pub enum NotCheckable {
     Vague,
     /// It is about a person, not about the code.
     AboutAPerson,
+    /// It holds a placeholder (a sample ticket key such as `KEY-1`, `XXXX`,
+    /// `<summary>`, `TODO`): an example somebody wrote, not a rule.
+    Placeholder,
 }
 
 const VAGUE: &[&str] = &[
@@ -515,6 +518,10 @@ pub fn checkable(d: &Distilled) -> Result<(), NotCheckable> {
     }
     if rule.contains('@') || check.contains('@') {
         return Err(NotCheckable::AboutAPerson);
+    }
+    // An example read as a rule taught commits a `KEY-1:` prefix once.
+    if crate::placeholders::has(rule, &[]) || crate::placeholders::has(check, &[]) {
+        return Err(NotCheckable::Placeholder);
     }
     if !names_code(rule) && !names_code(check) && d.applies_to.trim().is_empty() {
         return Err(NotCheckable::NamesNothing);

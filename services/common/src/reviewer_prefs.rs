@@ -190,6 +190,10 @@ pub fn clean(a: &Ask) -> Option<Ask> {
     if text.len() < MIN_ASK_CHARS || PERSONAL.iter().any(|p| low.contains(&format!(" {p} "))) {
         return None;
     }
+    // An example is not an ask: no placeholder is kept as one.
+    if crate::placeholders::has(&text, &[]) {
+        return None;
+    }
     // The reviewer's own name is not part of what they ask for.
     if low.contains(&spaced(&reviewer)) {
         return None;

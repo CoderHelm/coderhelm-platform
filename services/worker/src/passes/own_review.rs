@@ -79,7 +79,13 @@ pub fn required(findings: &[Finding], held_late: &[Finding]) -> Vec<String> {
 /// CoderHelm's to rebuild from the head (`description::rebuild`), which is
 /// what settles it.
 pub fn about_description(f: &Finding) -> bool {
-    let text = format!("{} {}", f.title, f.body).to_lowercase();
+    says_description_is_behind(&format!("{} {}", f.title, f.body))
+}
+
+/// [`about_description`] for a finding's words alone (a review thread's
+/// first comment).
+pub fn says_description_is_behind(text: &str) -> bool {
+    let text = text.to_lowercase();
     let names = [
         "pr description",
         "pull request description",

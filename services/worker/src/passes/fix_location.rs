@@ -1474,11 +1474,17 @@ pub fn also_outside_section(d: Option<&FixDecision>) -> String {
         return String::new();
     };
     let mut out = String::from("\n\n## Also needed outside the code\n\n");
-    if !d.cause.trim().is_empty() {
-        out.push_str(&format!("{}\n\n", d.cause.trim()));
+    // A note with its steps says what each step's state is and who does
+    // it: it neither restates the ticket nor says nobody does the work.
+    if c.steps.is_empty() {
+        if !d.cause.trim().is_empty() {
+            out.push_str(&format!("{}\n\n", d.cause.trim()));
+        }
+        push_change(&mut out, c);
+        out.push_str("\nThis pull request does not make that change; it has to be made there.\n");
+    } else {
+        push_change(&mut out, c);
     }
-    push_change(&mut out, c);
-    out.push_str("\nThis pull request does not make that change; it has to be made there.\n");
     out
 }
 
@@ -1576,12 +1582,9 @@ pub fn not_in_pr_steps(d: Option<&FixDecision>, repo: &str) -> Vec<(String, Stri
             .as_ref()
             .filter(|c| c.is_usable() && !c.steps.is_empty())
         {
-            let mut lines = super::outside_work::context_lines(c)
-                .into_iter()
-                .map(|l| (l, "found by CoderHelm".to_string()))
-                .collect::<Vec<_>>();
-            lines.extend(super::outside_work::pr_lines(c));
-            for l in lines {
+            // Only work that is still to come: what CoderHelm found, looked
+            // up or already did is evidence, never an item with an owner.
+            for l in super::outside_work::pr_lines(c) {
                 if !out.iter().any(|(s, _)| s == &l.0) {
                     out.push(l);
                 }
@@ -2446,13 +2449,22 @@ mod intent_tests {
             ..Default::default()
         };
         let ticket = also_outside_section(Some(&d));
+        // The person's step first, with its one owner; what CoderHelm did
+        // as done, once, with no raw link or lookup beside it.
+        assert!(ticket.contains("**Needed from you:**\n1. Replace the hero block's content on production (values: title = Classes). CoderHelm cannot: CoderHelm never writes production content. (a content editor)"), "{ticket}");
+        assert!(
+            ticket.contains("- Done: Deploy the studio to staging (started `Deploy studio`)."),
+            "{ticket}"
+        );
+        assert!(
+            !ticket.contains("https://") && !ticket.contains("Looked up"),
+            "{ticket}"
+        );
+        assert!(!ticket.contains("(owner:"), "{ticket}");
+        // Nothing is left for CoderHelm to do later, so the PR's
+        // "Not in this PR" lists none of it: found facts are not items.
         let pr = not_in_pr_steps(Some(&d), "o/r");
-        assert!(pr.len() >= 4, "{pr:?}");
-        for (line, _) in &pr {
-            assert!(ticket.contains(line.as_str()), "{line}\n---\n{ticket}");
-        }
-        assert!(ticket.contains("1. Deploy the studio to staging Done by CoderHelm: started `Deploy studio`: https://example.test/run/1."));
-        assert!(ticket.contains("(owner: a content editor)"));
+        assert!(pr.is_empty(), "{pr:?}");
         assert!(!ticket.contains("Not checked"));
     }
 }

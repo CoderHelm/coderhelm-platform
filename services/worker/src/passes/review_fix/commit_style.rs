@@ -29,11 +29,11 @@ pub struct Style {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeyPrefix {
-    /// `KEY-1: subject`
+    /// The key, a colon, the subject.
     Colon,
-    /// `KEY-1 subject`
+    /// The key, a space, the subject.
     Space,
-    /// `[KEY-1] subject`
+    /// The key in square brackets, the subject.
     Bracket,
 }
 
@@ -134,16 +134,11 @@ fn is_trailer(line: &str) -> bool {
         || l.starts_with("change-id:")
 }
 
-/// The subject without any key or type the agent already put in front.
+/// The subject without any key or type the agent already put in front, in
+/// whatever order and however many (`fix(deps): KEY-1: bump x` once left
+/// its sample key as the subject's start), and never a stand-in key.
 fn bare(subject: &str) -> String {
-    let mut s = subject.trim().to_string();
-    if let Some(c) = key_re().captures(&s) {
-        s = s[c.get(0).unwrap().end()..].trim_start().to_string();
-    }
-    if let Some(c) = conventional_re().captures(&s) {
-        s = s[c.get(0).unwrap().end()..].trim_start().to_string();
-    }
-    s
+    common::pr_conventions::bare(subject).2
 }
 
 /// The one commit message of a round, in the repository's style, from the
@@ -202,9 +197,14 @@ pub fn describe(style: &Style) -> String {
     }
     let mut parts = Vec::new();
     match style.key_prefix {
-        Some(KeyPrefix::Colon) => parts.push("ticket key prefix `KEY-1: `"),
-        Some(KeyPrefix::Space) => parts.push("ticket key prefix `KEY-1 `"),
-        Some(KeyPrefix::Bracket) => parts.push("ticket key prefix `[KEY-1] `"),
+        // In words, never as a sample key: this line is written into the
+        // pull request's description, which the learning steps read back,
+        // and a sample key written here was once learned as a commit prefix.
+        Some(KeyPrefix::Colon) => parts.push("the run's ticket key and a colon before the subject"),
+        Some(KeyPrefix::Space) => parts.push("the run's ticket key before the subject"),
+        Some(KeyPrefix::Bracket) => {
+            parts.push("the run's ticket key in square brackets before the subject")
+        }
         None => parts.push("no ticket key prefix"),
     }
     if style.conventional {
@@ -318,12 +318,39 @@ mod tests {
     }
 
     #[test]
+    fn a_sample_key_behind_a_type_never_becomes_the_subject() {
+        let style = learn(&s(&["Add a", "Add b", "Add c", "Add d", "Add e"]));
+        assert_eq!(
+            compose(
+                &style,
+                None,
+                &s(&["fix(deps): KEY-1: bump glob-walk to 2.1.4"])
+            ),
+            "bump glob-walk to 2.1.4"
+        );
+        let keyed = learn(&s(&["K-1: a", "K-2: b", "K-3: c", "K-4: d", "K-5: e"]));
+        assert_eq!(
+            compose(&keyed, None, &s(&["KEY-1: fix(deps): bump glob-walk"])),
+            "bump glob-walk"
+        );
+    }
+
+    #[test]
     fn the_description_says_what_was_learned() {
         let style = learn(&s(&["K-1: a", "K-2: b", "K-3: c", "K-4: d", "K-5: e"]));
         assert_eq!(
             describe(&style),
-            "ticket key prefix `KEY-1: `, single line, no co-author lines (learned from the last 5 commits)"
+            "the run's ticket key and a colon before the subject, single line, no co-author lines (learned from the last 5 commits)"
         );
+        // No sample key, in any form.
+        for prefix in [KeyPrefix::Colon, KeyPrefix::Space, KeyPrefix::Bracket] {
+            let text = describe(&Style {
+                key_prefix: Some(prefix),
+                samples: 9,
+                ..Default::default()
+            });
+            assert!(common::placeholders::found(&text, &[]).is_empty(), "{text}");
+        }
         assert!(describe(&Style::default()).starts_with("too few"));
     }
 }
