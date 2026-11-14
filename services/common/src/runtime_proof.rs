@@ -52,6 +52,10 @@ pub const MARK: &str = "CODERHELM_PROOF";
 pub const STEP_MARK: &str = "CODERHELM_PROOF_STEP";
 /// One requested path's status: `CODERHELM_PROOF_PAGE <path> <status>`.
 pub const PAGE_MARK: &str = "CODERHELM_PROOF_PAGE";
+/// Each before-and-after request's answer.
+pub const PROBE_MARK: &str = "CODERHELM_PROOF_PROBE";
+/// Bytes of an answer's body kept to show what changed.
+pub const PROBE_EXCERPT: usize = 120;
 /// The port the start command is given as `PORT`.
 pub const PORT: u16 = 38411;
 /// Ports asked when the application ignores `PORT` and the sandbox image
@@ -193,6 +197,56 @@ pub struct ProofPlan {
     /// Why the workspace projects that take the changed packages could not
     /// be worked out; empty when they were (or the project is no workspace).
     pub projects_unknown: String,
+    /// The requests sent to the started application, on the base branch
+    /// and on the head alike, so what a major changes in its answers shows
+    /// (`upgrade_quality::behaviour`).
+    pub probes: Vec<ProbeRequest>,
+}
+
+/// One request of a before-and-after probe.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ProbeRequest {
+    pub method: String,
+    pub path: String,
+    /// Empty for a request with no body.
+    pub content_type: String,
+    pub body: String,
+    /// Zero bytes sent after `body` and before `tail`, in KiB (an upload
+    /// over a size limit).
+    pub pad_kb: u32,
+    pub tail: String,
+    /// What the request exercises, in words.
+    pub what: String,
+}
+
+impl ProbeRequest {
+    /// It can be sent by the proof's shell command as it is.
+    pub fn sendable(&self) -> bool {
+        let ok = |s: &str, extra: &[char]| {
+            s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || extra.contains(&c))
+        };
+        !self.method.is_empty()
+            && self.method.chars().all(|c| c.is_ascii_uppercase())
+            && self.path.starts_with('/')
+            && ok(&self.path, &['/', '_', '-', '.', '~'])
+            && ok(&self.content_type, &['/', ';', '=', '+', '.', '-', ' '])
+    }
+}
+
+/// One answer to a [`ProbeRequest`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ProbeAnswer {
+    pub status: u16,
+    pub content_type: String,
+    /// The start of the body's SHA-256.
+    pub sha: String,
+    /// The start of the body.
+    pub excerpt: String,
+    /// The same request sent twice to this build was answered the same.
+    pub stable: bool,
 }
 
 /// One project the bumps can break, beside the main one.
@@ -678,11 +732,65 @@ pub fn script(plan: &ProofPlan) -> String {
         s.push_str(&format!(
             "      echo \"{PAGE_MARK} $ch_path ${{ch_code:-000}}\"\n    done\n"
         ));
+        for (i, q) in plan.probes.iter().enumerate().filter(|(_, q)| q.sendable()) {
+            s.push_str(&probe_lines(i + 1, q));
+        }
         s.push_str("  else\n    echo \"--- start did not answer ($ch_start), last output ---\"; tail -c 1200 /tmp/coderhelm-proof-start.log; echo\n  fi\n");
         s.push_str("  ch_killtree $ch_pid\nfi\n");
     }
     s.push_str(&format!(
         "echo \"{MARK} install=$ch_install start=$ch_start port=$ch_port\"\ntrue"
+    ));
+    s
+}
+
+/// The shell lines that send request `n` twice and print each answer as
+/// `CODERHELM_PROOF_PROBE <n> <try> <status> <content type> <sha> <excerpt>`
+/// (the excerpt base64, on the first try only). The body travels encoded,
+/// so nothing in it meets the shell.
+fn probe_lines(n: usize, q: &ProbeRequest) -> String {
+    let file = format!("/tmp/coderhelm-probe-{n}.in");
+    let mut s = String::new();
+    let has_body = !q.body.is_empty() || q.pad_kb > 0 || !q.tail.is_empty();
+    if has_body {
+        s.push_str(&format!(
+            "    echo '{}' | base64 -d > {file}\n",
+            crate::dep_fix::b64(q.body.as_bytes())
+        ));
+        if q.pad_kb > 0 {
+            s.push_str(&format!(
+                "    head -c {} /dev/zero >> {file}\n",
+                u64::from(q.pad_kb) * 1024
+            ));
+        }
+        if !q.tail.is_empty() {
+            s.push_str(&format!(
+                "    echo '{}' | base64 -d >> {file}\n",
+                crate::dep_fix::b64(q.tail.as_bytes())
+            ));
+        }
+    }
+    let header = if q.content_type.is_empty() {
+        String::new()
+    } else {
+        format!(" -H 'Content-Type: {}'", q.content_type)
+    };
+    let data = if has_body {
+        format!(" --data-binary @{file}")
+    } else {
+        String::new()
+    };
+    s.push_str("    for ch_t in 1 2; do\n");
+    s.push_str(&format!(
+        "      ch_o=$(curl -s -m 30 --noproxy '*' -X {}{header}{data} -o /tmp/coderhelm-probe.out -w '%{{http_code}} %{{content_type}}' \"http://127.0.0.1:$ch_port{}\" 2>/dev/null)\n",
+        q.method, q.path
+    ));
+    s.push_str("      ch_ct=$(printf %s \"${ch_o#* }\" | tr -d ' ' | cut -c1-48); ch_sha=$( (sha256sum /tmp/coderhelm-probe.out 2>/dev/null || shasum -a 256 /tmp/coderhelm-probe.out 2>/dev/null) | cut -c1-16)\n");
+    s.push_str(&format!(
+        "      ch_ex=; if [ $ch_t = 1 ]; then ch_ex=$(head -c {PROBE_EXCERPT} /tmp/coderhelm-probe.out 2>/dev/null | base64 | tr -d '\\n'); fi\n"
+    ));
+    s.push_str(&format!(
+        "      echo \"{PROBE_MARK} {n} $ch_t ${{ch_o%% *}} ${{ch_ct:--}} ${{ch_sha:--}} $ch_ex\"\n    done\n"
     ));
     s
 }
@@ -704,6 +812,9 @@ pub struct ProofResult {
     pub port: u16,
     /// Each requested path and the status it answered (0: no answer).
     pub pages: Vec<(String, u16)>,
+    /// The answer to each of the plan's probes, in its order (`None`: no
+    /// answer, or the request was not sent).
+    pub probes: Vec<Option<ProbeAnswer>>,
     /// The output's tail, for a reason.
     pub tail: String,
 }
@@ -733,6 +844,9 @@ pub fn page_ok(status: u16) -> bool {
 
 /// A proof's result from its output; `ran` is false without the last line.
 pub fn parse(output: &str, plan: &ProofPlan) -> ProofResult {
+    // Each probe's two answers: (status, content type, sha, excerpt).
+    type Try = Option<(u16, String, String, String)>;
+    let mut tries: Vec<[Try; 2]> = vec![[None, None]; plan.probes.len()];
     let mut r = ProofResult {
         builds: vec![None; plan.builds.len()],
         start: "skipped".into(),
@@ -764,6 +878,29 @@ pub fn parse(output: &str, plan: &ProofPlan) -> ProofResult {
                 r.pages.retain(|(p, _)| p != path);
                 r.pages.push((path.to_string(), code));
             }
+            Some(PROBE_MARK) => {
+                let (Some(n), Some(t), Some(status)) = (
+                    parts.next().and_then(|n| n.parse::<usize>().ok()),
+                    parts.next().and_then(|n| n.parse::<usize>().ok()),
+                    parts.next().and_then(|c| c.parse::<u16>().ok()),
+                ) else {
+                    continue;
+                };
+                if !(1..=tries.len()).contains(&n) || !(1..=2).contains(&t) {
+                    continue;
+                }
+                let ct = parts.next().unwrap_or("-").to_string();
+                let sha = parts.next().unwrap_or("-").to_string();
+                let excerpt = parts
+                    .next()
+                    .and_then(|b| {
+                        use base64::Engine;
+                        base64::engine::general_purpose::STANDARD.decode(b).ok()
+                    })
+                    .map(|b| String::from_utf8_lossy(&b).to_string())
+                    .unwrap_or_default();
+                tries[n - 1][t - 1] = Some((status, ct, sha, excerpt));
+            }
             Some(MARK) => {
                 let mut install = None;
                 for p in parts {
@@ -783,6 +920,22 @@ pub fn parse(output: &str, plan: &ProofPlan) -> ProofResult {
             _ => {}
         }
     }
+    r.probes = tries
+        .into_iter()
+        .map(|[first, second]| {
+            let (status, content_type, sha, excerpt) = first.filter(|(s, ..)| *s != 0)?;
+            let stable = second
+                .as_ref()
+                .is_some_and(|(s, c, h, _)| *s == status && *c == content_type && *h == sha);
+            Some(ProbeAnswer {
+                status,
+                content_type,
+                sha,
+                excerpt,
+                stable,
+            })
+        })
+        .collect();
     r
 }
 

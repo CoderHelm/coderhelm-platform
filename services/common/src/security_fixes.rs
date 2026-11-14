@@ -3222,6 +3222,22 @@ fn body_linked(
     // two heads; everything shown comes from the head when it was read.
     let short = uses_short_body(unit, members);
     let plan = unit;
+    // The upgrade evidence is of one commit: it is shown against the head
+    // this body is written for, and the run's own words may call the
+    // contract or the behaviour unchanged only when a probe recorded on
+    // that head shows it.
+    let head_sha = head.map(|h| h.sha.clone()).unwrap_or_default();
+    let shown = check
+        .upgrade_facts
+        .as_ref()
+        .is_some_and(|f| f.of_head(&head_sha) && f.unchanged_shown());
+    let guarded = crate::upgrade_quality::behaviour::guard(change, shown);
+    let change = guarded.as_str();
+    let with_head = crate::upgrade_notes::WhatToCheck {
+        head_sha,
+        ..check.clone()
+    };
+    let check = &with_head;
     let at_head = head.map(|h| h.unit_at_head(unit));
     let unit = at_head.as_ref().unwrap_or(unit);
     let headline = head.map(|h| h.headline(plan, members));
