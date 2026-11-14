@@ -64,6 +64,7 @@ pub mod repo_setup;
 pub mod review_lessons;
 pub mod reviewer;
 pub mod roles;
+pub mod run_activity;
 pub mod run_answer;
 pub mod run_checks;
 pub mod run_close;
