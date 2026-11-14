@@ -323,7 +323,10 @@ pub fn findings_view(
     })
 }
 
-async fn load_records(state: &AppState, team_id: &str) -> Result<Vec<Record>, StatusCode> {
+pub(crate) async fn load_records(
+    state: &AppState,
+    team_id: &str,
+) -> Result<Vec<Record>, StatusCode> {
     Ok(rows_in(
         state,
         &state.config.settings_table_name,
@@ -439,6 +442,39 @@ pub async fn fix(
     Ok(Json(json!({ "status": "queued", "reason": null })))
 }
 
+/// Pure: what a person's Retry of an infrastructure fix run does. When
+/// the run's pull request is gone (closed unmerged, or the run ended
+/// without one) and the finding still has a pull request to open, the
+/// retry is a new request for the finding as it stands now: the event the
+/// "Open fix PR" button queues, so the worker checks the record against
+/// GitHub, plans from today's finding and opens a new pull request, never
+/// the closed one. `None` (the earlier run is taken up as before) while
+/// the record has an open pull request, a draft the replacement guard
+/// holds, or a run working.
+pub fn retry_of(
+    unit: &common::security_fixes::FixUnit,
+    found: &[Record],
+    team_id: &str,
+    by: &str,
+) -> Option<SecurityEventMessage> {
+    use common::infra_vuln::matching::FixKind;
+    let id = unit.finding_ids.first()?;
+    let r = found.iter().find(|r| &r.finding.id == id)?;
+    let gone =
+        r.pr.as_ref()
+            .is_none_or(|p| p.state == "closed" && !r.drafted);
+    let can = r.finding.fix.kind == Some(FixKind::Pr)
+        && r.finding.fix.location.is_some()
+        && r.status == records::Status::Open;
+    (gone && can).then(|| SecurityEventMessage {
+        team_id: team_id.to_string(),
+        kind: "infrastructure_fix".into(),
+        repo: id.clone(),
+        requested_by: by.to_string(),
+        ..Default::default()
+    })
+}
+
 /// GET /api/security/infrastructure/resources
 pub async fn resources(
     State(state): State<Arc<AppState>>,
@@ -468,6 +504,70 @@ pub async fn resources(
 mod tests {
     use super::*;
     use common::infra_vuln::inventory::Kind;
+
+    #[test]
+    fn retry_after_a_closed_pull_request_asks_for_the_finding_again() {
+        use common::infra_vuln::inventory::Location;
+        use common::infra_vuln::matching::{Fix, FixKind, InfraFinding};
+        let rec = |status: records::Status, pr_state: Option<&str>| {
+            let mut r = Record::new(
+                InfraFinding {
+                    id: "abc".into(),
+                    fix: Fix {
+                        kind: Some(FixKind::Pr),
+                        location: Some(Location {
+                            repo: "acme/infra".into(),
+                            file: "db/main.tf".into(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                "t",
+            );
+            r.status = status;
+            r.pr = pr_state.map(|st| records::PrRef {
+                number: 7,
+                url: "u".into(),
+                state: st.into(),
+                ..Default::default()
+            });
+            r
+        };
+        let unit = common::security_fixes::FixUnit {
+            repo: "acme/infra".into(),
+            ecosystem: records::UNIT_ECOSYSTEM.into(),
+            finding_ids: vec!["abc".into()],
+            ..Default::default()
+        };
+        let ask = |r: Record| retry_of(&unit, &[r], "TEAM#a", "dev@example.com");
+        // Closed unmerged and released, or a run that ended with none.
+        for r in [
+            rec(records::Status::Open, Some("closed")),
+            rec(records::Status::Open, None),
+        ] {
+            let m = ask(r).unwrap();
+            assert_eq!(
+                (m.kind.as_str(), m.repo.as_str(), m.requested_by.as_str()),
+                ("infrastructure_fix", "abc", "dev@example.com")
+            );
+        }
+        // Still open, merged and waiting for AWS, a run working, a draft
+        // the guard holds: the earlier run is taken up as before.
+        assert!(ask(rec(records::Status::PrOpen, Some("open"))).is_none());
+        assert!(ask(rec(records::Status::PrOpen, Some("merged"))).is_none());
+        assert!(ask(rec(records::Status::Fixing, None)).is_none());
+        assert!(ask(rec(records::Status::Open, Some("draft"))).is_none());
+        let mut held = rec(records::Status::Open, Some("closed"));
+        held.drafted = true;
+        assert!(ask(held).is_none());
+        // A runbook has no pull request to ask for.
+        let mut runbook = rec(records::Status::Open, None);
+        runbook.finding.fix.kind = Some(FixKind::Runbook);
+        assert!(ask(runbook).is_none());
+        assert!(retry_of(&unit, &[], "TEAM#a", "dev@example.com").is_none());
+    }
 
     #[test]
     fn the_view_lists_resources_and_names_what_an_account_lacks() {

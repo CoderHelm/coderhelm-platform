@@ -1279,6 +1279,7 @@ mod pr_risk;
 pub mod pr_watch;
 mod proof;
 pub mod quarantine;
+pub mod quarantine_work;
 /// Whether a finished run's pull request leaves draft, decided in one place.
 pub mod ready;
 pub mod recheck;
@@ -9964,9 +9965,12 @@ pub async fn load_git_conventions(
         .unwrap_or_default()
 }
 
-/// CoderHelm's own E2E tickets (a fix for a failing test, a generated test).
+/// CoderHelm's own E2E tickets (a fix for a failing test, a generated test,
+/// the removal of a quarantined one).
 fn is_internal_ticket(ticket_id: &str) -> bool {
-    ticket_id.starts_with(e2e::FIX_TICKET_PREFIX) || ticket_id.starts_with(e2e::GEN_TICKET_PREFIX)
+    ticket_id.starts_with(e2e::FIX_TICKET_PREFIX)
+        || ticket_id.starts_with(e2e::GEN_TICKET_PREFIX)
+        || ticket_id.starts_with(e2e::REMOVE_TICKET_PREFIX)
 }
 
 /// The template tokens for this run's ticket. `{ticket}` is written the way
@@ -13383,6 +13387,7 @@ mod git_conventions_tests {
     fn e2e_tickets_keep_the_default_shapes_the_e2e_loop_reads_back() {
         assert!(is_internal_ticket("E2E-FIX-abc"));
         assert!(is_internal_ticket("E2E-GEN-abc"));
+        assert!(is_internal_ticket("E2E-RM-abc"));
         assert!(!is_internal_ticket("ABC-12"));
     }
 

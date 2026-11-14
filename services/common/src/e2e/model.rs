@@ -276,6 +276,102 @@ pub const CAUSES: &[&str] = &[
 pub struct Cause {
     pub label: String,
     pub evidence: String,
+    /// What outside the test it depends on (a service, shared data, the
+    /// preview it runs against), when the cause is outside the test.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depends_on: Option<String>,
+    /// How the test can be made independent of that, or why it can't.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub independent: Option<String>,
+    /// When it was worked out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<String>,
+    /// Set once later runs contradict it: what the history shows now.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub out_of_date: Option<String>,
+}
+
+/// A pull request as Coderhelm last read it from GitHub.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrSeen {
+    pub url: String,
+    /// `open` | `draft` | `merged` | `closed`
+    pub state: String,
+    /// `passing` | `failing` | `running`, while it is open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checks: Option<String>,
+    #[serde(default)]
+    pub seen_at: String,
+    /// Who merged or closed it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by: Option<String>,
+}
+
+/// A pull request that deletes a quarantined test.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Removal {
+    /// `running` | `opened` | `merged` | `declined` | `failed`
+    pub status: String,
+    /// Who asked: a person's email, or `coderhelm` when its rule was met.
+    pub by: String,
+    pub at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr: Option<PrSeen>,
+    /// Why removal is reasonable, one fact per line.
+    #[serde(default)]
+    pub evidence: Vec<String>,
+    /// Why it ended without a pull request, or who declined it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Who approved the pull request that merged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub approved_by: Vec<String>,
+}
+
+/// Why a test left quarantine by itself.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Release {
+    pub at: String,
+    pub reason: String,
+    pub passes: u32,
+    pub sources: u32,
+    pub hours: u32,
+}
+
+/// What Coderhelm is doing about a quarantined test, beyond its health.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Care {
+    /// The run writing the current fix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fix_run_id: Option<String>,
+    /// Who asked for the current fix: a person's email, or `auto`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fix_by: Option<String>,
+    /// When a person asked for it (the worker starts it moments later).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fix_requested_at: Option<String>,
+    /// The fix pull request as last read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fix_pr: Option<PrSeen>,
+    /// Why the last fix attempt ended without a fix, and when.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fix_failure: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fix_failed_at: Option<String>,
+    /// Fix attempts that ended without a fix since it was quarantined.
+    #[serde(default)]
+    pub fix_failures: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removal: Option<Removal>,
+    /// The last time it left quarantine by itself, and why.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release: Option<Release>,
+    /// Each time it was quarantined again within the window after leaving
+    /// by itself.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bounces: Vec<String>,
 }
 
 /// A change of state, with why. Kept as the test's audit log.
@@ -337,6 +433,9 @@ pub struct TestRecord {
     /// The workflow file the test last ran in, for dispatching repeat runs.
     #[serde(default)]
     pub workflow_path: Option<String>,
+    /// Fix and removal work, and how it last left quarantine.
+    #[serde(default)]
+    pub care: Care,
     pub last_seen: String,
     #[serde(default)]
     pub history: Vec<HistoryEntry>,
@@ -424,6 +523,11 @@ pub struct Settings {
     /// tests run against (see [`super::report_source`]).
     #[serde(default)]
     pub report_sources: Vec<super::report_source::ReportSource>,
+    /// Fix and removal runs Coderhelm starts by itself, per repository per
+    /// week. Each is a full coding run, so this bounds what they cost;
+    /// a person's request is never counted.
+    #[serde(default = "default_auto_fixes_per_week")]
+    pub auto_fixes_per_week: u32,
 }
 
 fn default_tickets() -> String {
@@ -439,6 +543,16 @@ fn default_ticket_after_days() -> u32 {
     DEFAULT_TICKET_AFTER_DAYS
 }
 
+/// Automatic fix runs per repository per week, unless the team picks
+/// another number.
+pub const DEFAULT_AUTO_FIXES_PER_WEEK: u32 = 2;
+/// The range a team can pick for `auto_fixes_per_week`.
+pub const AUTO_FIXES_PER_WEEK_RANGE: std::ops::RangeInclusive<u32> = 1..=10;
+
+fn default_auto_fixes_per_week() -> u32 {
+    DEFAULT_AUTO_FIXES_PER_WEEK
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Settings {
@@ -450,6 +564,7 @@ impl Default for Settings {
             repos: Vec::new(),
             ticket_after_days: DEFAULT_TICKET_AFTER_DAYS,
             report_sources: Vec::new(),
+            auto_fixes_per_week: DEFAULT_AUTO_FIXES_PER_WEEK,
         }
     }
 }
@@ -483,6 +598,13 @@ impl Settings {
                 TICKET_AFTER_DAYS_RANGE.end()
             ));
         }
+        if !AUTO_FIXES_PER_WEEK_RANGE.contains(&self.auto_fixes_per_week) {
+            return Err(format!(
+                "Pick between {} and {} automatic fixes per repository per week. To stop them, turn fix pull requests off.",
+                AUTO_FIXES_PER_WEEK_RANGE.start(),
+                AUTO_FIXES_PER_WEEK_RANGE.end()
+            ));
+        }
         Ok(())
     }
 
@@ -494,6 +616,10 @@ impl Settings {
         self.ticket_after_days = self.ticket_after_days.clamp(
             *TICKET_AFTER_DAYS_RANGE.start(),
             *TICKET_AFTER_DAYS_RANGE.end(),
+        );
+        self.auto_fixes_per_week = self.auto_fixes_per_week.clamp(
+            *AUTO_FIXES_PER_WEEK_RANGE.start(),
+            *AUTO_FIXES_PER_WEEK_RANGE.end(),
         );
         self.repos.retain(|r| {
             let r = r.trim();
@@ -606,6 +732,7 @@ mod tests {
             fix_branch: None,
             fix_phase_at: None,
             workflow_path: None,
+            care: Default::default(),
             last_seen: String::new(),
             history: vec![],
             events: vec![],
@@ -665,6 +792,37 @@ mod tests {
         };
         assert!(s.validate().is_ok());
         assert_eq!(s.sanitized().ticket_after_days, 7);
+    }
+
+    #[test]
+    fn the_weekly_cap_defaults_to_two_and_stays_in_range() {
+        let old: Settings = serde_json::from_str(r#"{"enabled":true,"fix_prs":true}"#).unwrap();
+        assert_eq!(old.auto_fixes_per_week, 2);
+        assert!(old.validate().is_ok());
+        for bad in [0, 11] {
+            let s = Settings {
+                auto_fixes_per_week: bad,
+                ..Default::default()
+            };
+            assert!(s.validate().unwrap_err().contains("per week"), "{bad}");
+        }
+        let s = Settings {
+            auto_fixes_per_week: 40,
+            ..Default::default()
+        }
+        .sanitized();
+        assert_eq!(s.auto_fixes_per_week, 10);
+    }
+
+    #[test]
+    fn records_saved_before_care_existed_still_read() {
+        let old = r#"{"id":"x","repo":"acme/web","framework":"playwright","file":"a","title":"t",
+            "health":"flaky","quarantined":true,"last_seen":"",
+            "cause":{"label":"environment","evidence":"e"}}"#;
+        let r: TestRecord = serde_json::from_str(old).unwrap();
+        assert_eq!(r.care, Care::default());
+        let c = r.cause.unwrap();
+        assert!(c.out_of_date.is_none() && c.depends_on.is_none() && c.at.is_none());
     }
 
     #[test]

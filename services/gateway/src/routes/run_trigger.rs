@@ -23,6 +23,8 @@ use crate::AppState;
 const E2E_FIX: &str = "E2E-FIX-";
 /// Ticket id of a new test CoderHelm writes (`E2E-GEN-<suggestion id>`).
 const E2E_GEN: &str = "E2E-GEN-";
+/// Ticket id of a quarantined test CoderHelm removes (`E2E-RM-<test id>`).
+const E2E_RM: &str = common::e2e::quarantine::REMOVE_TICKET_PREFIX;
 /// Ticket id of an alert (`ALERT-<hash>`).
 const ALERT: &str = "ALERT-";
 /// Ticket id of a security fix (`SEC-<hash>`, `common::security_fixes`).
@@ -153,7 +155,7 @@ pub fn kind(item: &Item) -> TriggerKind {
             TriggerKind::Coderhelm
         };
     }
-    if ticket.starts_with(E2E_FIX) || ticket.starts_with(E2E_GEN) {
+    if ticket.starts_with(E2E_FIX) || ticket.starts_with(E2E_GEN) || ticket.starts_with(E2E_RM) {
         return TriggerKind::Coderhelm;
     }
     if ticket.starts_with(SEC) {
@@ -402,6 +404,12 @@ pub fn trigger(item: &Item, lookups: &Lookups) -> RunTrigger {
             Some(format!("/tests/test?id={}", q(&ticket[E2E_FIX.len()..]))),
             None,
         ),
+        _ if ticket.starts_with(E2E_RM) => t(
+            "Started by Coderhelm · test removal",
+            None,
+            Some(format!("/tests/test?id={}", q(&ticket[E2E_RM.len()..]))),
+            None,
+        ),
         _ if ticket.starts_with(E2E_GEN) => t(
             "Started by Coderhelm · new test",
             None,
@@ -580,6 +588,25 @@ mod tests {
         let tr = trigger(&item, &Lookups::default());
         assert_eq!(tr.kind, TriggerKind::Github);
         assert_eq!(tr.r#ref.as_deref(), Some("#318"));
+    }
+
+    #[test]
+    fn a_test_removal_links_to_its_test() {
+        let item = run(&[
+            ("ticket_source", "alert"),
+            ("ticket_id", "E2E-RM-a7f51433483adf820849"),
+            ("sender", "e2e"),
+            ("requester_key", "coderhelm:e2e"),
+            ("title", "Remove quarantined test: checkout works"),
+        ]);
+        let tr = trigger(&item, &Lookups::default());
+        assert_eq!(tr.kind, TriggerKind::Coderhelm);
+        assert_eq!(tr.label, "Started by Coderhelm · test removal");
+        assert_eq!(tr.r#ref, None);
+        assert_eq!(
+            tr.ref_url.as_deref(),
+            Some("/tests/test?id=a7f51433483adf820849")
+        );
     }
 
     #[test]

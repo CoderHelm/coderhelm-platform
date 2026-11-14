@@ -17,6 +17,8 @@
 //! | `T#{team}` | `COVERAGE#{repo}` | areas, their tests and untested routes |
 //! | `T#{team}` | `CI#{repo}` | results and quarantine calls seen per workflow |
 //! | `T#{team}` | `SETUP#{repo}` | the setup pull request and the last workflow check |
+//! | `TEAM#{team}#AUTOFIX` | `{repo}#{ISO week}` | fix and removal runs Coderhelm started by itself that week (`n`, expires) |
+//! | `INDEX#e2e-teams` | `{team}` | the teams with saved settings, for the periodic sweep (`settings_index`) |
 //!
 //! Every item keeps its payload as JSON in `data`.
 
@@ -51,6 +53,32 @@ fn data<T: DeserializeOwned>(item: &Item) -> Option<T> {
     item.get("data")
         .and_then(|v| v.as_s().ok())
         .and_then(|d| serde_json::from_str(d).ok())
+}
+
+/// The index of teams with saved E2E settings, kept in this table.
+pub const TEAMS_INDEX: &str = "e2e-teams";
+
+fn teams_index() -> crate::settings_index::Spec<'static> {
+    fn member_of(item: &crate::settings_index::Item) -> Option<String> {
+        if item.get("sk")?.as_s().ok()? != "SETTINGS" {
+            return None;
+        }
+        team_of_pk(item.get("pk")?.as_s().ok()?)
+    }
+    crate::settings_index::Spec {
+        name: TEAMS_INDEX,
+        filter: "sk = :sk",
+        values: vec![(":sk", s("SETTINGS"))],
+        member_of,
+    }
+}
+
+/// The team a settings item's partition key names (`T#{team}`), and nothing
+/// for any other partition (`T#{team}#TESTS`, the index itself).
+fn team_of_pk(pk: &str) -> Option<String> {
+    let team = pk.strip_prefix("T#")?;
+    (!team.is_empty() && !team.contains("#TEST") && !team.contains("#RUN"))
+        .then(|| team.to_string())
 }
 
 fn team_pk(team: &str) -> String {
@@ -232,7 +260,84 @@ impl<'a> Store<'a> {
     }
 
     pub async fn put_settings(&self, team: &str, settings: &Settings) -> Result<(), String> {
-        self.put(&team_pk(team), "SETTINGS", settings, vec![]).await
+        self.put(&team_pk(team), "SETTINGS", settings, vec![])
+            .await?;
+        // The sweep finds the team without scanning; a failed add is made up
+        // by the index's daily rebuild.
+        if let Err(e) = crate::settings_index::add(self.dynamo, self.table, TEAMS_INDEX, team).await
+        {
+            tracing::warn!(error = %e, "Could not index the team's E2E settings");
+        }
+        Ok(())
+    }
+
+    /// Every team that saved E2E settings (the periodic sweep's list).
+    pub async fn teams(&self) -> Result<Vec<String>, String> {
+        crate::settings_index::members(self.dynamo, self.table, &teams_index()).await
+    }
+
+    // ── the weekly spend guard ──────────────────────────────────────────
+
+    /// Runs Coderhelm started by itself for `repo` in the week of `now`.
+    pub async fn auto_fixes_used(
+        &self,
+        team: &str,
+        repo: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u32, String> {
+        let week = super::quarantine::week_key(now);
+        Ok(self
+            .get(&format!("TEAM#{team}#AUTOFIX"), &format!("{repo}#{week}"))
+            .await?
+            .and_then(|i| i.get("n").and_then(|v| v.as_n().ok()).cloned())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(0))
+    }
+
+    /// Takes one of the repo's automatic runs for the week; false once the
+    /// week's are used (or the count can't be written: never over the cap).
+    pub async fn claim_auto_fix(
+        &self,
+        team: &str,
+        repo: &str,
+        now: chrono::DateTime<chrono::Utc>,
+        cap: u32,
+    ) -> bool {
+        let week = super::quarantine::week_key(now);
+        self.dynamo
+            .update_item()
+            .table_name(self.table)
+            .key("pk", s(&format!("TEAM#{team}#AUTOFIX")))
+            .key("sk", s(&format!("{repo}#{week}")))
+            .update_expression("ADD n :one SET #ttl = :ttl")
+            .condition_expression("attribute_not_exists(n) OR n < :cap")
+            .expression_attribute_names("#ttl", "ttl")
+            .expression_attribute_values(":one", AttributeValue::N("1".into()))
+            .expression_attribute_values(":cap", AttributeValue::N(cap.to_string()))
+            .expression_attribute_values(
+                ":ttl",
+                AttributeValue::N((now.timestamp() + 14 * 86400).to_string()),
+            )
+            .send()
+            .await
+            .is_ok()
+    }
+
+    /// The repo's automatic runs this week against the team's cap.
+    pub async fn budget(
+        &self,
+        team: &str,
+        repo: &str,
+        settings: &Settings,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<super::quarantine::Budget, String> {
+        Ok(super::quarantine::Budget {
+            repo: repo.to_string(),
+            on: settings.fix_prs,
+            cap: settings.auto_fixes_per_week,
+            used: self.auto_fixes_used(team, repo, now).await?,
+            resumes_at: super::quarantine::week_resets(now).to_rfc3339(),
+        })
     }
 
     /// Removes the team's saved settings (they read as the defaults again).
@@ -755,6 +860,24 @@ mod tests {
             "e2e/TEAM_1/acme/web/raw/9-1/.._x_y.json"
         );
         assert_eq!(day_minus("2026-03-01", 1), "2026-02-28");
+    }
+
+    #[test]
+    fn the_teams_index_names_settings_items_only() {
+        assert_eq!(team_of_pk("T#TEAM#42"), Some("TEAM#42".into()));
+        assert_eq!(team_of_pk("T#TEAM#42#TESTS"), None);
+        assert_eq!(team_of_pk("T#TEAM#42#TEST#abc"), None);
+        assert_eq!(team_of_pk("T#TEAM#42#RUNS#acme/web"), None);
+        assert_eq!(team_of_pk("INDEX#e2e-teams"), None);
+        let spec = teams_index();
+        let item = |pk: &str, sk: &str| {
+            HashMap::from([("pk".to_string(), s(pk)), ("sk".to_string(), s(sk))])
+        };
+        assert_eq!(
+            (spec.member_of)(&item("T#TEAM#42", "SETTINGS")),
+            Some("TEAM#42".into())
+        );
+        assert_eq!((spec.member_of)(&item("T#TEAM#42", "REPO#acme/web")), None);
     }
 
     fn claim(sk: &str, data: Option<Value>) -> Item {

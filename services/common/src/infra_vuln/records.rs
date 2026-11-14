@@ -5,6 +5,13 @@
 //!   only a new read of the account closes one, never a merged PR.
 //! - A merged PR without the new version running stays open and says so.
 //! - AWS-managed rows are kept as `aws_managed` and never count as open.
+//! - A finding is `fixing` only while its run works and `pr_open` only
+//!   while its pull request is open or merged: a pull request closed
+//!   unmerged, or a run that ended without one, gives it back
+//!   ([`crate::security_release::Claim`], the same rules, words and holds
+//!   as dependency findings). A pull request the replacement guard made a
+//!   draft is neither: it stays as it is, and its finding stays on its
+//!   runbook until its code or its target changes.
 
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
@@ -73,8 +80,17 @@ impl Status {
 pub struct PrRef {
     pub number: u64,
     pub url: String,
-    /// `open`, `merged` or `closed`.
+    /// `open`, `draft` (the replacement guard held it), `merged` or
+    /// `closed`.
     pub state: String,
+    /// Closed without merging: when, who (a GitHub login, or the person
+    /// who closed its run in CoderHelm), and whether that was a person.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed_by: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub closed_by_person: bool,
 }
 
 /// One stored finding.
@@ -107,6 +123,18 @@ pub struct Record {
     /// starts by itself while the finding still asks for the same.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub guard_sig: String,
+    /// Its pull request closed unmerged, or its fix run ended without one:
+    /// no fix run starts by itself until then. A person asking never
+    /// waits on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold_until: Option<String>,
+    /// When its run was started for it: a run of the ticket that began
+    /// after this is the one it waits on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claimed_at: Option<String>,
+    /// What the page says after a person ended its fix run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_note: Option<String>,
     /// A line for the timeline when something changed (not stored).
     #[serde(skip)]
     pub event: Option<String>,
@@ -136,6 +164,9 @@ impl Record {
             guard_attempts: 0,
             drafted: false,
             guard_sig: String::new(),
+            hold_until: None,
+            claimed_at: None,
+            release_note: None,
         }
     }
 
@@ -158,7 +189,11 @@ impl Record {
             if !self.refused.is_empty() {
                 o.insert("refused".into(), json!(self.refused));
                 o.insert("drafted".into(), json!(self.drafted));
-                if self.drafted {
+                let closed = self.pr.as_ref().is_some_and(|p| p.state == "closed");
+                if closed && !self.drafted {
+                    // The round never finished: its pull request was closed.
+                    o.insert("note".into(), json!(GUARD_CLOSED_NOTE));
+                } else if self.drafted {
                     // The guard gave up on the code change: the person
                     // still has a correct way to apply the update.
                     o["fix"]["kind"] = json!(FixKind::Runbook);
@@ -170,6 +205,11 @@ impl Record {
                 } else {
                     o.insert("note".into(), json!(GUARD_ROUND_NOTE));
                 }
+            }
+            if let (Some(note), Status::Open, true) =
+                (&self.release_note, self.status, self.refused.is_empty())
+            {
+                o.insert("note".into(), json!(note));
             }
             if self.status == Status::PrOpen
                 && self.pr.as_ref().is_some_and(|p| p.state == "merged")
@@ -185,6 +225,9 @@ impl Record {
 pub const GUARD_ROUND_NOTE: &str = "CoderHelm read its own change and it would have replaced or destroyed a resource that holds data. One fix round is correcting the lines below; the change is read again when it ends.";
 /// What the page says once the guard tripped twice.
 pub const GUARD_DRAFT_NOTE: &str = "The pull request is kept as a draft with the reason at the top of its description, and is never merged as it is. Nothing was applied.";
+/// What the page says when the pull request was closed while the guard's
+/// refusal stood.
+pub const GUARD_CLOSED_NOTE: &str = "The pull request was closed. CoderHelm had read its own change and it would have replaced or destroyed a resource that holds data, so no new attempt starts by itself until the code that defines the resource or the update's target changes.";
 /// When CoderHelm tries the code change again.
 pub const GUARD_STOPPED: &str = "CoderHelm makes no further attempt until the code that defines the resource or the update's target changes.";
 
@@ -253,6 +296,248 @@ impl Record {
     /// changed), or one a person now overrides, is forgotten.
     pub fn start_over(&mut self) {
         self.clear_guard();
+    }
+}
+
+// ── The claim: fixing and pr_open follow GitHub and the run ─────────────
+
+use crate::security_release::{self as rel, Change, Claim, OpenPr, PrNow, RunNow, Standing};
+
+impl Record {
+    /// Whether the hold a closed pull request or an ended run left is on:
+    /// no fix run starts by itself.
+    pub fn on_hold(&self, now: DateTime<Utc>) -> bool {
+        self.hold_until
+            .as_deref()
+            .and_then(crate::security_fixes::parse_time)
+            .is_some_and(|t| t > now)
+    }
+
+    /// The run claims the finding from `at`: a run of its ticket that
+    /// began after this is the one it waits on.
+    pub fn claim(&mut self, ticket: &str, at: DateTime<Utc>) {
+        self.status = Status::Fixing;
+        self.ticket = ticket.to_string();
+        self.claimed_at = Some(at.to_rfc3339());
+        self.hold_until = None;
+        self.release_note = None;
+    }
+
+    fn released(&mut self, hold_days: i64, now: DateTime<Utc>) {
+        self.status = Status::Open;
+        self.ticket.clear();
+        self.claimed_at = None;
+        self.hold_until = Some((now + Duration::days(hold_days)).to_rfc3339());
+        self.updated_at = now.to_rfc3339();
+    }
+
+    fn pr_is(&self, state: &str) -> bool {
+        self.pr.as_ref().is_some_and(|p| p.state == state)
+    }
+}
+
+impl Claim for Record {
+    fn id(&self) -> &str {
+        &self.finding.id
+    }
+    fn repo(&self) -> &str {
+        self.finding
+            .fix
+            .location
+            .as_ref()
+            .map(|l| l.repo.as_str())
+            .unwrap_or("")
+    }
+    fn pr(&self) -> Option<(u64, &str)> {
+        self.pr.as_ref().map(|p| (p.number, p.state.as_str()))
+    }
+    fn ticket(&self) -> Option<&str> {
+        (!self.ticket.is_empty()).then_some(self.ticket.as_str())
+    }
+    fn standing(&self) -> Standing {
+        match self.status {
+            Status::Open => Standing::Open,
+            Status::Fixing => Standing::Fixing,
+            Status::PrOpen => Standing::InPr,
+            Status::Fixed => Standing::Fixed,
+            Status::AwsManaged | Status::Dismissed => Standing::Other,
+        }
+    }
+    /// An open pull request and a draft the guard held are read every
+    /// sweep (either can be closed or merged on GitHub); a closed one while
+    /// its hold is on (a person may reopen it); a merged one never again.
+    fn watches_pr(&self, now: DateTime<Utc>) -> bool {
+        match self.pr.as_ref().map(|p| p.state.as_str()) {
+            Some("open" | "draft") => true,
+            Some("closed") => {
+                self.status == Status::Open && self.on_hold(now) && self.refused.is_empty()
+            }
+            _ => false,
+        }
+    }
+    fn claimed_at(&self) -> Option<DateTime<Utc>> {
+        let parse = crate::security_fixes::parse_time;
+        self.claimed_at
+            .as_deref()
+            .and_then(parse)
+            .or_else(|| parse(&self.updated_at))
+    }
+    /// The one fix round after a tripped guard works on the open pull
+    /// request: if that run ends without settling it, the run decides.
+    fn run_decides_with_pr(&self) -> bool {
+        self.status == Status::Fixing && self.pr_is("open")
+    }
+    /// A pull request is recorded only after the replacement guard read it.
+    fn opens_through_store(&self) -> bool {
+        true
+    }
+
+    /// - Merged: recorded as merged. The finding stays open until a read of
+    ///   the account sees the new version; a merge alone never closes one.
+    /// - Closed unmerged: the finding is open again with who closed it and
+    ///   when; no fix run starts by itself for
+    ///   [`rel::HOLD_DAYS_CLOSED`] days, and a guard refusal that stood
+    ///   keeps standing. A person asking never waits.
+    /// - A draft the guard held is not closed: left as it is while GitHub
+    ///   has it open. Closed on GitHub, the record says so and the finding
+    ///   keeps its runbook.
+    /// - Reopened: the finding is in the pull request again, unless the
+    ///   guard had refused its change or the finding moved on.
+    fn settle_pr(&mut self, pr_now: &PrNow, now: DateTime<Utc>) -> Option<Change> {
+        let pr = self.pr.clone()?;
+        let gone = PrNow::Closed(rel::Closer::default());
+        let pr_now = match pr_now {
+            PrNow::Gone => &gone,
+            other => other,
+        };
+        match (pr.state.as_str(), pr_now) {
+            ("open" | "draft", PrNow::Merged) => {
+                self.pr = Some(PrRef {
+                    state: "merged".into(),
+                    ..pr.clone()
+                });
+                if self.status == Status::Fixing {
+                    self.status = Status::PrOpen;
+                }
+                self.updated_at = now.to_rfc3339();
+                rel::change(
+                    format!(
+                        "PR #{} merged: the finding closes when CoderHelm reads the account again and sees the new version running",
+                        pr.number
+                    ),
+                    &pr.url,
+                )
+            }
+            ("open" | "draft", PrNow::Closed(closer)) => {
+                let (at, by, person) = rel::closed_record(closer, now);
+                self.pr = Some(PrRef {
+                    state: "closed".into(),
+                    closed_at: Some(at),
+                    closed_by: by,
+                    closed_by_person: person,
+                    ..pr.clone()
+                });
+                let words = rel::closed_words(pr.number, closer);
+                let then = if pr.state == "draft" {
+                    "; the finding keeps its runbook"
+                } else if !matches!(self.status, Status::PrOpen | Status::Fixing) {
+                    ""
+                } else {
+                    self.released(rel::HOLD_DAYS_CLOSED, now);
+                    if self.guard_blocks() {
+                        "; CoderHelm's own check had refused the change, so no new attempt starts by itself until the code or the target changes. Ask for a fix to try again"
+                    } else {
+                        "; automatic fixes wait 7 days. Ask for a fix to open a new pull request now"
+                    }
+                };
+                self.updated_at = now.to_rfc3339();
+                rel::change(format!("{words}{then}"), &pr.url)
+            }
+            ("closed", PrNow::Open) => {
+                let moved_on = self.status != Status::Open
+                    || !self.ticket.is_empty()
+                    || !self.refused.is_empty()
+                    || self.drafted;
+                if moved_on {
+                    return None;
+                }
+                self.pr = Some(PrRef {
+                    state: "open".into(),
+                    closed_at: None,
+                    closed_by: None,
+                    closed_by_person: false,
+                    ..pr.clone()
+                });
+                self.status = Status::PrOpen;
+                self.hold_until = None;
+                self.release_note = None;
+                self.updated_at = now.to_rfc3339();
+                rel::change(
+                    format!("PR #{} was reopened: the fix is in it again", pr.number),
+                    &pr.url,
+                )
+            }
+            _ => None,
+        }
+    }
+
+    /// - The run is queued or working: left alone.
+    /// - The run ended with no pull request: the finding is open again,
+    ///   held as a dependency finding is ([`rel::run_end`]).
+    /// - The fix round after a tripped guard ended and the refused change
+    ///   still stands on its open pull request: the guard's second step.
+    ///   The finding falls back to its runbook, its pull request is
+    ///   recorded as a draft (the caller makes it one on GitHub), and no
+    ///   further attempt starts by itself.
+    /// - A pull request found on the branch that the record does not have
+    ///   is never recorded here: it goes through the store's opening path,
+    ///   where the guard reads it first.
+    fn settle_run(
+        &mut self,
+        run: &RunNow,
+        open_pr: Option<&OpenPr>,
+        now: DateTime<Utc>,
+    ) -> Option<Change> {
+        if self.status != Status::Fixing {
+            return None;
+        }
+        let known = self.pr.clone().filter(|p| p.state == "open");
+        if open_pr.is_some_and(|o| known.as_ref().is_none_or(|p| p.number != o.number)) {
+            return None;
+        }
+        let end = rel::run_end(run, Claim::claimed_at(self), now)?;
+        let Some(pr) = known else {
+            self.released(end.hold_days, now);
+            self.release_note = end.waiting;
+            return rel::change(end.text, "");
+        };
+        if self.refused.is_empty() {
+            // Nothing was refused: the pull request stands.
+            self.status = Status::PrOpen;
+            self.ticket.clear();
+            self.claimed_at = None;
+            self.updated_at = now.to_rfc3339();
+            return rel::change(format!("PR #{} is open", pr.number), &pr.url);
+        }
+        self.guard_attempts = self.guard_attempts.max(2);
+        self.drafted = true;
+        self.status = Status::Open;
+        self.ticket.clear();
+        self.claimed_at = None;
+        self.pr = Some(PrRef {
+            state: "draft".into(),
+            ..pr.clone()
+        });
+        self.updated_at = now.to_rfc3339();
+        rel::change(
+            format!(
+                "PR #{} is now a draft: the fix round ended without correcting the change, which would still replace or destroy a resource that holds data ({}). The finding shows its runbook. {}",
+                pr.number,
+                self.refused.join("; "),
+                GUARD_STOPPED
+            ),
+            &pr.url,
+        )
     }
 }
 
@@ -692,6 +977,7 @@ mod tests {
             number: 7,
             url: "u".into(),
             state: "merged".into(),
+            ..Default::default()
         });
         let again = reconcile(
             &stored,
@@ -713,6 +999,261 @@ mod tests {
         assert!(back
             .iter()
             .any(|r| r.finding.id == "a" && r.status == Status::Open));
+    }
+
+    // ── The claim (`security_release::Claim`) ──
+
+    use crate::security_release::{Claim, Closer, OpenPr, PrNow, RunNow, Standing};
+
+    const WHY: &str = "db/main.tf: `identifier` changes, which replaces the database";
+
+    /// A finding with a pull request to open, in a run or a pull request.
+    fn claimed(status: Status, pr_state: Option<&str>) -> Record {
+        let mut x = f("a", FixKind::Pr);
+        x.fix.to = "16.6".into();
+        x.fix.location = Some(crate::infra_vuln::inventory::Location {
+            repo: "acme/infra".into(),
+            file: "db/main.tf".into(),
+            ..Default::default()
+        });
+        let mut r = Record::new(x, "2026-11-09T12:00:00Z");
+        r.status = status;
+        r.ticket = "SEC-0A1B2C3D4E5F".into();
+        r.claimed_at = Some("2026-11-10T11:00:00Z".into());
+        r.pr = pr_state.map(|st| PrRef {
+            number: 7,
+            url: "https://github.com/acme/infra/pull/7".into(),
+            state: st.into(),
+            ..Default::default()
+        });
+        r
+    }
+
+    fn by(login: &str) -> PrNow {
+        PrNow::Closed(Closer {
+            by: login.into(),
+            person: true,
+            at: Some("2026-11-10T11:30:00Z".into()),
+        })
+    }
+
+    fn cancelled() -> RunNow {
+        RunNow::Ended {
+            status: "cancelled".into(),
+            by: Some("dev@example.com".into()),
+        }
+    }
+
+    #[test]
+    fn a_pull_request_a_person_closed_gives_the_finding_back_with_who_and_when() {
+        let mut r = claimed(Status::PrOpen, Some("open"));
+        let c = r.settle_pr(&by("octo"), now()).unwrap();
+        assert_eq!((r.status, r.standing()), (Status::Open, Standing::Open));
+        let pr = r.pr.clone().unwrap();
+        assert_eq!(
+            (
+                pr.number,
+                pr.state.as_str(),
+                pr.closed_by.as_deref(),
+                pr.closed_by_person
+            ),
+            (7, "closed", Some("octo"), true)
+        );
+        assert_eq!(pr.closed_at.as_deref(), Some("2026-11-10T11:30:00Z"));
+        assert!(r.ticket.is_empty() && r.claimed_at.is_none());
+        // No run starts by itself for a week; the page gets the record.
+        assert!(r.on_hold(now()) && r.on_hold(now() + Duration::days(6)));
+        assert!(!r.on_hold(now() + Duration::days(8)));
+        assert!(c.text.contains("PR #7 was closed without merging by octo"));
+        assert!(c
+            .text
+            .contains("Ask for a fix to open a new pull request now"));
+        let v = r.view();
+        assert_eq!(v["status"], "open");
+        assert_eq!(v["pr"]["state"], "closed");
+        assert_eq!(v["pr"]["closed_by"], "octo");
+        assert_eq!(v["pr"]["closed_by_person"], true);
+        // The same fact again: nothing.
+        let after = r.clone();
+        assert!(r.settle_pr(&by("octo"), now()).is_none());
+        assert_eq!(r, after);
+        // Gone from GitHub releases too; GitHub not answering never does.
+        let mut gone = claimed(Status::PrOpen, Some("open"));
+        assert!(gone.settle_pr(&PrNow::Unknown, now()).is_none());
+        let c = gone.settle_pr(&PrNow::Gone, now()).unwrap();
+        assert_eq!(gone.status, Status::Open);
+        assert!(c.text.starts_with("PR #7 is no longer on GitHub"));
+    }
+
+    #[test]
+    fn a_merge_is_recorded_and_never_closes_the_finding() {
+        let mut r = claimed(Status::PrOpen, Some("open"));
+        let c = r.settle_pr(&PrNow::Merged, now()).unwrap();
+        // Only a read of the account closes it.
+        assert_eq!(r.status, Status::PrOpen);
+        assert_eq!(r.pr.as_ref().unwrap().state, "merged");
+        assert!(c.text.contains("reads the account again"));
+        assert!(r.view()["note"]
+            .as_str()
+            .unwrap()
+            .contains("waiting for the new version"));
+        assert!(!r.watches_pr(now()));
+        assert!(r.settle_pr(&PrNow::Merged, now()).is_none());
+        assert!(r.settle_pr(&by("octo"), now()).is_none());
+    }
+
+    #[test]
+    fn a_draft_the_guard_held_is_not_closed_and_keeps_its_runbook() {
+        let mut r = claimed(Status::Open, Some("draft"));
+        r.ticket.clear();
+        r.guard_step(&[WHY.to_string()]);
+        r.guard_step(&[WHY.to_string()]);
+        assert!(r.drafted && r.guard_blocks());
+        let before = r.clone();
+        // GitHub has a draft as open: the record is left exactly as it is.
+        assert!(r.watches_pr(now()));
+        assert!(r.settle_pr(&PrNow::Open, now()).is_none());
+        assert_eq!(r, before);
+        // A person closes the draft: recorded, and the finding still falls
+        // back to its runbook with no attempt by itself.
+        let c = r.settle_pr(&by("octo"), now()).unwrap();
+        assert_eq!(r.pr.as_ref().unwrap().state, "closed");
+        assert_eq!(r.status, Status::Open);
+        assert!(r.drafted && r.guard_blocks() && r.hold_until.is_none());
+        assert!(
+            c.text.ends_with("the finding keeps its runbook"),
+            "{}",
+            c.text
+        );
+        assert_eq!(r.view()["fix"]["kind"], "runbook");
+        // Reopening it does not put the refused change back as the fix.
+        assert!(!r.watches_pr(now()));
+        assert!(r.settle_pr(&PrNow::Open, now()).is_none());
+        // Its code or target changed: the refusal no longer stands.
+        r.finding.fix.to = "16.7".into();
+        assert!(!r.guard_blocks());
+    }
+
+    #[test]
+    fn a_reopened_pull_request_takes_the_finding_back_unless_it_moved_on() {
+        let mut r = claimed(Status::PrOpen, Some("open"));
+        r.settle_pr(&by("octo"), now()).unwrap();
+        assert!(r.watches_pr(now()));
+        let c = r.settle_pr(&PrNow::Open, now()).unwrap();
+        assert_eq!(r.status, Status::PrOpen);
+        let pr = r.pr.clone().unwrap();
+        assert_eq!(
+            (pr.state.as_str(), pr.closed_by, pr.closed_at),
+            ("open", None, None)
+        );
+        assert!(r.hold_until.is_none() && c.text.contains("reopened"));
+        // A new run took the finding in between: it is not pulled back.
+        let mut r = claimed(Status::PrOpen, Some("open"));
+        r.settle_pr(&by("octo"), now()).unwrap();
+        r.claim("SEC-0A1B2C3D4E5F", now());
+        assert!(r.hold_until.is_none(), "a claim ends the hold");
+        assert!(r.settle_pr(&PrNow::Open, now()).is_none());
+        assert_eq!(r.status, Status::Fixing);
+    }
+
+    #[test]
+    fn a_run_that_ended_without_a_pull_request_releases_the_finding() {
+        let mut r = claimed(Status::Fixing, None);
+        assert!(r.settle_run(&RunNow::Working, None, now()).is_none());
+        assert!(r.settle_run(&RunNow::Unknown, None, now()).is_none());
+        // Claimed an hour ago with no run on record: still in the queue.
+        assert!(r.settle_run(&RunNow::Missing, None, now()).is_none());
+        let c = r.settle_run(&cancelled(), None, now()).unwrap();
+        assert_eq!(r.status, Status::Open);
+        assert!(r.ticket.is_empty());
+        assert!(r.on_hold(now() + Duration::days(6)));
+        assert!(c.text.contains("cancelled by dev@example.com"));
+        assert_eq!(
+            r.view()["note"],
+            "The fix run was cancelled by dev@example.com. Ask for a fix to start a new one."
+        );
+        assert!(r.settle_run(&cancelled(), None, now()).is_none());
+        // A run that failed: tried again tomorrow.
+        let mut r = claimed(Status::Fixing, None);
+        let failed = RunNow::Ended {
+            status: "failed".into(),
+            by: None,
+        };
+        r.settle_run(&failed, None, now()).unwrap();
+        assert!(r.on_hold(now() + Duration::hours(23)));
+        assert!(!r.on_hold(now() + Duration::hours(25)));
+        assert_eq!(r.view().get("note"), None);
+    }
+
+    #[test]
+    fn a_pull_request_the_record_never_learned_goes_through_the_guard_not_this_rule() {
+        let mut r = claimed(Status::Fixing, None);
+        assert!(r.opens_through_store());
+        let found = OpenPr {
+            number: 9,
+            url: "https://github.com/acme/infra/pull/9".into(),
+        };
+        let before = r.clone();
+        assert!(r.settle_run(&cancelled(), Some(&found), now()).is_none());
+        assert_eq!(r, before, "nothing is recorded before the guard reads it");
+    }
+
+    #[test]
+    fn a_fix_round_that_ends_without_settling_is_the_guards_second_step() {
+        // The guard tripped once: the round works on the open pull request.
+        let mut r = claimed(Status::Fixing, Some("open"));
+        assert_eq!(r.guard_step(&[WHY.to_string()]), GuardStep::FixRound);
+        assert!(r.run_decides_with_pr());
+        let same = OpenPr {
+            number: 7,
+            url: "https://github.com/acme/infra/pull/7".into(),
+        };
+        assert!(r.settle_run(&RunNow::Working, Some(&same), now()).is_none());
+        // The round was cancelled: the refused change still stands.
+        let c = r.settle_run(&cancelled(), Some(&same), now()).unwrap();
+        assert_eq!(r.status, Status::Open);
+        assert_eq!(r.pr.as_ref().unwrap().state, "draft");
+        assert!(r.drafted && r.guard_blocks() && r.ticket.is_empty());
+        assert!(c.text.contains("PR #7 is now a draft") && c.text.contains(WHY));
+        assert!(c.text.contains(GUARD_STOPPED));
+        assert_eq!(r.view()["fix"]["kind"], "runbook");
+        assert_eq!(r.view()["note"], GUARD_DRAFT_NOTE);
+        assert!(r.settle_run(&cancelled(), Some(&same), now()).is_none());
+    }
+
+    #[test]
+    fn a_pull_request_closed_during_the_fix_round_keeps_the_refusal_standing() {
+        let mut r = claimed(Status::Fixing, Some("open"));
+        r.guard_step(&[WHY.to_string()]);
+        let c = r.settle_pr(&by("octo"), now()).unwrap();
+        assert_eq!(r.status, Status::Open);
+        assert!(r.guard_blocks() && !r.drafted);
+        assert!(c.text.contains("had refused the change"), "{}", c.text);
+        assert_eq!(r.view()["note"], GUARD_CLOSED_NOTE);
+        // Not watched for a reopen: the refused change is never the fix.
+        assert!(!r.watches_pr(now()));
+    }
+
+    #[test]
+    fn records_stored_before_these_fields_read_as_before() {
+        // A record as it was stored before: none of the new fields.
+        let mut old = claimed(Status::PrOpen, Some("open"));
+        old.claimed_at = None;
+        old.event = None;
+        let stored = serde_json::to_value(&old).unwrap();
+        for k in ["hold_until", "claimed_at", "release_note"] {
+            assert!(stored.get(k).is_none(), "{k}");
+        }
+        for k in ["closed_at", "closed_by", "closed_by_person"] {
+            assert!(stored["pr"].get(k).is_none(), "{k}");
+        }
+        let back: Record = serde_json::from_value(stored).unwrap();
+        assert_eq!(back, old);
+        // Its claim time falls back to its last write.
+        assert_eq!(
+            Claim::claimed_at(&back),
+            crate::security_fixes::parse_time("2026-11-09T12:00:00Z")
+        );
     }
 
     #[test]

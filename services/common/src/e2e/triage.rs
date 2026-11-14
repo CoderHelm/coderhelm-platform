@@ -305,6 +305,7 @@ mod tests {
             fix_branch: None,
             fix_phase_at: None,
             workflow_path: None,
+            care: Default::default(),
             last_seen: String::new(),
             history: history
                 .into_iter()

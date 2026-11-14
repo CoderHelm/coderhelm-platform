@@ -10,6 +10,7 @@
 //! | Bad run | More than 20% of a job's tests fail together (at least 3), or the job died. Those failures count against the run, not the tests |
 //! | Back to healthy | No flip for 7 days or 100 runs |
 //! | Fixed | 30 days with no flake after a fix merged |
+//! | Out of quarantine | By itself once it has proven healthy (see [`super::quarantine`]); what it did before that no longer counts against it |
 //!
 //! Broken outranks flaky, and a broken test is never quarantined: it is a real
 //! regression, not noise.
@@ -244,12 +245,16 @@ pub fn decide(r: &TestRecord, now: DateTime<Utc>, default_branch: &str) -> Optio
             )
         });
     }
-    let recent_flips = flips(&r.history, now - Duration::days(FLIP_WINDOW_DAYS));
-    let (runs, fails) = main_rate(
-        &r.history,
-        default_branch,
-        now - Duration::days(RATE_WINDOW_DAYS),
-    );
+    // A test that left quarantine by proving itself is judged from then on:
+    // the flips that put it there would otherwise quarantine it again on its
+    // next run.
+    let proven = r.care.release.as_ref().and_then(|rel| at(&rel.at));
+    let since = |days: i64| {
+        let window = now - Duration::days(days);
+        proven.map_or(window, |p| p.max(window))
+    };
+    let recent_flips = flips(&r.history, since(FLIP_WINDOW_DAYS));
+    let (runs, fails) = main_rate(&r.history, default_branch, since(RATE_WINDOW_DAYS));
     let rate_flaky = runs >= RATE_MIN_RUNS
         && fails > 0
         && prob_rate_above(fails, runs, RATE_THRESHOLD) >= RATE_CONFIDENCE;
@@ -321,6 +326,10 @@ pub struct Applied {
     pub events: Vec<StateEvent>,
     pub became_flaky: bool,
     pub became_broken: bool,
+    /// It left quarantine by itself on this run, with the evidence.
+    pub released: Option<super::model::Release>,
+    /// Its recorded cause was marked out of date on this run.
+    pub cause_went_stale: bool,
 }
 
 /// Adds a run to a test's history and updates its health and quarantine.
@@ -377,9 +386,7 @@ pub fn apply_run(
         });
     }
     if out.became_flaky && auto_quarantine && !r.quarantined && !r.never_quarantine {
-        r.quarantined = true;
-        r.quarantined_since = Some(now_s.clone());
-        r.quarantined_by = Some("auto".into());
+        super::quarantine::enter(r, now, "auto");
         out.events.push(StateEvent {
             at: now_s,
             from: "flaky".into(),
@@ -388,6 +395,12 @@ pub fn apply_run(
             actor: "coderhelm".into(),
         });
     }
+    // The record against its own history: a merged fix that failed again, a
+    // cause the runs disprove, a quarantine it has earned its way out of.
+    let settled = super::quarantine::settle(r, now);
+    out.events.extend(settled.events);
+    out.released = settled.released;
+    out.cause_went_stale = settled.cause_went_stale;
     r.events.extend(out.events.iter().cloned());
     if r.events.len() > 100 {
         let drop = r.events.len() - 100;
@@ -437,6 +450,7 @@ mod tests {
             fix_branch: None,
             fix_phase_at: None,
             workflow_path: None,
+            care: Default::default(),
             last_seen: String::new(),
             history: vec![],
             events: vec![],
@@ -670,6 +684,57 @@ mod tests {
             false,
         );
         assert!(!off.quarantined);
+    }
+
+    #[test]
+    fn a_test_released_by_its_passes_is_not_quarantined_again_by_its_old_flips() {
+        let mut r = record();
+        run(&mut r, entry(1, "s1", "main", Outcome::Flaky, 0), 0, true);
+        run(&mut r, entry(2, "s2", "main", Outcome::Flaky, 0), 0, true);
+        assert!(r.quarantined);
+        // Twenty passes on two branches over the next day.
+        let mut last = Applied::default();
+        for i in 0..20u32 {
+            let mut e = entry(
+                10 + i,
+                &format!("p{i}"),
+                if i % 2 == 0 { "main" } else { "feature" },
+                Outcome::Passed,
+                1,
+            );
+            e.at = (day(1) + Duration::minutes(10 * i as i64)).to_rfc3339();
+            last = apply_run(
+                &mut r,
+                e,
+                day(1) + Duration::minutes(10 * i as i64 + 5),
+                "main",
+                true,
+            );
+        }
+        assert!(last.released.is_some(), "the twentieth pass releases it");
+        assert!(!r.quarantined);
+        assert_eq!(r.health, State::Healthy);
+        assert!(r.events.iter().any(|e| e.from == "quarantined"
+            && e.to == "healthy"
+            && e.reason
+                .starts_with("Left quarantine by itself: 20 passes in a row")));
+        // The next pass, still inside the 14 days of the two flips: it stays
+        // out, and stays healthy.
+        let a = run(
+            &mut r,
+            entry(40, "p40", "main", Outcome::Passed, 2),
+            2,
+            true,
+        );
+        assert!(!a.became_flaky);
+        assert!(!r.quarantined);
+        // It flakes twice again: quarantined again by the same rule, and
+        // that is counted as a bounce.
+        run(&mut r, entry(41, "n1", "main", Outcome::Flaky, 3), 3, true);
+        let a = run(&mut r, entry(42, "n2", "main", Outcome::Flaky, 3), 3, true);
+        assert!(a.became_flaky);
+        assert!(r.quarantined);
+        assert_eq!(r.care.bounces.len(), 1);
     }
 
     #[test]
