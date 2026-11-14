@@ -126,7 +126,11 @@ async fn handle_event(
     common::model_stream::set_deadline_epoch_ms(Some(
         context.deadline as i64 - MODEL_DEADLINE_MARGIN_MS,
     ));
-    let out = if let Some(req) = payload.get("plan_chat") {
+    let out = if payload.get("health").is_some() {
+        // The updater's probe after it installs a release (and before a
+        // person's Roll back): the real entry path, nothing outside the install.
+        Box::pin(health(Arc::clone(&state), context)).await
+    } else if let Some(req) = payload.get("plan_chat") {
         let req: passes::plan_chat::Request = serde_json::from_value(req.clone())?;
         // The brain chat uses the same tools; its calls count as the brain's.
         let feature = if req.feature == "brain" {
@@ -173,6 +177,23 @@ async fn handle_event(
     // background: finish those writes before the Lambda is frozen.
     common::model_stream::settle_dropped_calls().await;
     out
+}
+
+/// `{"health": {}}`: answers `{"ok": true, "version": ...}` once the event has
+/// gone the way a queued job goes (this event's future, the state built at
+/// start, the provider and URL reads above) and one empty batch has gone
+/// through `handle_sqs`. No model, GitHub or queue is called. A release that
+/// crashes on every event (v0.8.108's stack overflow) crashes on this one too,
+/// and the updater rolls it back (lambda/updater, post-update watch).
+async fn health(
+    state: Arc<WorkerState>,
+    context: lambda_runtime::Context,
+) -> Result<serde_json::Value, Error> {
+    handle_sqs(state, LambdaEvent::new(SqsEvent::default(), context)).await?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "version": std::env::var("CODERHELM_VERSION").ok(),
+    }))
 }
 
 /// How long before the Lambda deadline in-flight model calls are cancelled.
@@ -1005,6 +1026,7 @@ mod future_sizes {
         for (name, size) in [
             ("handle_event", size_of_future(&handle_event)),
             ("handle_sqs", size_of_future(&handle_sqs)),
+            ("health", size_of_future(&health)),
             ("handle_message", size_of_future(&handle_message)),
         ] {
             assert!(

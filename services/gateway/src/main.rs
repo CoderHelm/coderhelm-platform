@@ -426,6 +426,10 @@ fn build_app(state: Arc<AppState>) -> Router {
         .route("/runs/start", post(routes::run_start::start_run))
         .route("/runs/:run_id", get(routes::api::get_run))
         .route("/runs/:run_id/traces", get(routes::api::get_run_traces))
+        .route(
+            "/runs/:run_id/activity",
+            get(routes::run_activity::activity),
+        )
         .route("/runs/:run_id/agent-log", get(routes::api::get_agent_log))
         .route("/runs/:run_id/openspec", get(routes::api::get_run_openspec))
         .route(

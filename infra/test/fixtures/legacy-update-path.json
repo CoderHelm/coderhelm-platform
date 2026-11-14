@@ -633,6 +633,12 @@
             "Sid": "ModelCheckThroughWorker"
           },
           {
+            "Action": "cloudwatch:GetMetricData",
+            "Effect": "Allow",
+            "Resource": "*",
+            "Sid": "WatchNewRelease"
+          },
+          {
             "Action": [
               "lambda:GetFunctionConfiguration",
               "lambda:UpdateFunctionConfiguration"
