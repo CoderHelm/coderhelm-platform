@@ -2326,11 +2326,10 @@ async fn track_prs(cx: &Ctx<'_>, findings: &mut [(Finding, FindingState)]) {
         p.ci = ci.clone().or(p.ci);
         match state_now.as_str() {
             "merged" | "closed" => {
-                use release::ReleaseIo;
                 let fact = match facts.get(&key) {
                     Some(v) => v.clone(),
                     None => {
-                        let v = io.pr_now(&f.repo, pr.number, true).await;
+                        let v = io.reads().pr_now(&f.repo, pr.number, true).await;
                         facts.insert(key.clone(), v.clone());
                         v
                     }
@@ -3610,6 +3609,11 @@ async fn team_tick(
     )
     .await
     .changed();
+    // ...and so are its infrastructure records, by the same reconciliation.
+    report.released += super::infra_findings::release(state, team_id, &cx.gh, &release::Scope::All)
+        .await
+        .1
+        .changed();
     let Some(kev_map) = kev_map else {
         return Ok(report);
     };
@@ -4177,7 +4181,11 @@ async fn event_for_team(
                 release::Scope::Ticket(msg.ticket.clone())
             };
             let r = release::run(&cx, &mut findings, &scope, release::TEAM_BUDGET_SECS).await;
-            info!(team_id, kind = %msg.kind, repo = %msg.repo, pr = msg.pr_number, ticket = %msg.ticket, changed = r.changed(), "security: release event handled");
+            // The same event for the team's infrastructure records.
+            let infra = super::infra_findings::release(state, team_id, &cx.gh, &scope)
+                .await
+                .1;
+            info!(team_id, kind = %msg.kind, repo = %msg.repo, pr = msg.pr_number, ticket = %msg.ticket, changed = r.changed(), infrastructure = infra.changed(), "security: release event handled");
             return Ok(());
         }
         // A person pressed Retry on a fix run whose pull request is gone:
