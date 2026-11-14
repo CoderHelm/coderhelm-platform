@@ -74,12 +74,16 @@ pub const FIELD_STOPPED_TO_ASK: &str = crate::run_questions::FIELD_QUESTIONS;
 pub const COMMENT_QUESTION: &str = "A person's comment on the ticket";
 /// Ticket-record field (`ticket_state::sk`): whether the event that last
 /// started a run on the ticket carried the ticket's existing comments
-/// ([`EVENT_COMMENTS_SENT`] or [`EVENT_COMMENTS_NOT_SENT`]). A Jira app
-/// older than the version that sends them leaves a run without what
-/// people wrote before it started, and the run says so.
+/// ([`EVENT_COMMENTS_SENT`], [`EVENT_COMMENTS_NOT_SENT`] or
+/// [`EVENT_COMMENTS_NOT_SENT_WEBHOOK`]). An event without them leaves a
+/// run without what people wrote before it started, and the run says so.
 pub const FIELD_EVENT_COMMENTS: &str = "event_comments";
 pub const EVENT_COMMENTS_SENT: &str = "sent";
+/// The Jira app sent the event without the ticket's comments (a version
+/// older than the one that sends them).
 pub const EVENT_COMMENTS_NOT_SENT: &str = "not_sent";
+/// The event came from a plain Jira webhook, which never carries them.
+pub const EVENT_COMMENTS_NOT_SENT_WEBHOOK: &str = "not_sent_webhook";
 
 /// Whether a pre-run comment is stored at all. Only for a ticket
 /// CoderHelm has something to do with: one it already ran on, or one
@@ -94,11 +98,31 @@ pub fn stores_before_run(has_run: bool, has_trigger_label: bool, assigned: bool)
 
 /// What a run on a Jira ticket says when the event that started it
 /// carried no comments: it did not read what people wrote before it
-/// started. `None` when the comments were sent, or nothing is known.
+/// started, and why, which differs by how the event arrived. `None` when
+/// the comments were sent, or nothing is known.
+///
+/// CoderHelm cannot read them another way on either path: the Jira app's
+/// web triggers return no comments, and a plain Jira webhook gives
+/// CoderHelm an address and a signing secret, never access to the site.
 pub fn unread_earlier_note(marker: Option<&str>) -> Option<&'static str> {
-    (marker == Some(EVENT_COMMENTS_NOT_SENT)).then_some(
-        "Comments written on the ticket before this run started were not read: the event          that started the run carried none (this site's Jira app is a version that does not          send them), and CoderHelm has no other access to them. The run works from the          ticket's title and description; comments written from now on are read. Updating          the Jira app on the site sends earlier comments with the next ticket.",
-    )
+    match marker {
+        Some(EVENT_COMMENTS_NOT_SENT) => Some(
+            "Comments written on the ticket before this run started were not read: the \
+             event that started the run did not include them (this site's Jira app is a \
+             version that does not send them), and CoderHelm has no other access to them. \
+             The run works from the ticket's title and description; comments written from \
+             now on are read. Updating the Jira app on the site sends earlier comments with \
+             the next ticket.",
+        ),
+        Some(EVENT_COMMENTS_NOT_SENT_WEBHOOK) => Some(
+            "Comments written on the ticket before this run started were not read: the \
+             event that started the run did not include the ticket's comments (it came \
+             from a Jira webhook, which sends none with a ticket), and a webhook gives \
+             CoderHelm no access to the Jira site to read them. The run works from the \
+             ticket's title and description; comments written from now on are read.",
+        ),
+        _ => None,
+    }
 }
 
 /// How CoderHelm's acknowledgement on a ticket starts. A comment that
@@ -1445,13 +1469,30 @@ mod tests {
     }
 
     #[test]
-    fn a_run_says_when_earlier_comments_were_not_read() {
+    fn a_run_started_by_an_older_jira_app_says_earlier_comments_were_not_read() {
         let note = unread_earlier_note(Some(EVENT_COMMENTS_NOT_SENT)).unwrap();
         assert!(note.contains("before this run started were not read"));
+        assert!(note.contains("this site's Jira app is a version that does not send them"));
+        assert!(note.contains("Updating the Jira app"));
+    }
+
+    #[test]
+    fn a_run_started_by_a_plain_jira_webhook_says_so_without_blaming_an_app() {
+        let note = unread_earlier_note(Some(EVENT_COMMENTS_NOT_SENT_WEBHOOK)).unwrap();
+        assert!(note.contains("before this run started were not read"));
+        assert!(note.contains("did not include the ticket's comments"));
+        assert!(note.contains("came from a Jira webhook"));
+        // No app is involved on this path, so none is named or blamed.
+        assert!(!note.to_lowercase().contains("app"));
+        assert!(!note.contains("version"));
+    }
+
+    #[test]
+    fn nothing_is_said_when_the_comments_came_or_nothing_is_known() {
         assert_eq!(unread_earlier_note(Some(EVENT_COMMENTS_SENT)), None);
-        // Nothing known about the event (a retry from the dashboard on a
-        // ticket no event marked): nothing is claimed.
+        // A retry from the dashboard on a ticket no event marked.
         assert_eq!(unread_earlier_note(None), None);
+        assert_eq!(unread_earlier_note(Some("")), None);
     }
 
     #[test]

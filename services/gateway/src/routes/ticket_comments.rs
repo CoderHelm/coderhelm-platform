@@ -200,10 +200,10 @@ pub async fn keep(state: &AppState, inc: &Incoming<'_>) {
 /// so a run started by an older Jira app says they were not read.
 pub async fn keep_jira_existing(state: &AppState, team_id: &str, ticket_id: &str, payload: &Value) {
     let kept = keep_existing_in(&store(state), team_id, ticket_id, payload).await;
-    let sent = event_carries_comments(payload);
+    let marker = event_comments_marker(payload);
     info!(
         ticket_id,
-        sent, kept, "The ticket's existing comments, from the event that starts the run"
+        marker, kept, "The ticket's existing comments, from the event that starts the run"
     );
     if let Err(e) = state
         .dynamo
@@ -213,17 +213,7 @@ pub async fn keep_jira_existing(state: &AppState, team_id: &str, ticket_id: &str
         .key("sk", AttributeValue::S(common::ticket_state::sk(ticket_id)))
         .update_expression("SET #f = :v, updated_at = :t")
         .expression_attribute_names("#f", tc::FIELD_EVENT_COMMENTS)
-        .expression_attribute_values(
-            ":v",
-            AttributeValue::S(
-                if sent {
-                    tc::EVENT_COMMENTS_SENT
-                } else {
-                    tc::EVENT_COMMENTS_NOT_SENT
-                }
-                .to_string(),
-            ),
-        )
+        .expression_attribute_values(":v", AttributeValue::S(marker.to_string()))
         .expression_attribute_values(":t", AttributeValue::S(chrono::Utc::now().to_rfc3339()))
         .send()
         .await
@@ -237,6 +227,28 @@ pub async fn keep_jira_existing(state: &AppState, team_id: &str, ticket_id: &str
 /// that does not send them).
 pub fn event_carries_comments(payload: &Value) -> bool {
     payload["comments"].is_array()
+}
+
+/// Whether a Jira event came from CoderHelm's Jira app (which names the
+/// team, or on older installs the installation, and its secret) and not
+/// from a plain Jira webhook the team pointed at CoderHelm.
+pub fn from_jira_app(payload: &Value) -> bool {
+    ["team_id", "installation_id", "forge_secret"]
+        .iter()
+        .any(|k| payload["coderhelm"].get(k).is_some_and(|v| !v.is_null()))
+}
+
+/// What the ticket's record keeps about the event that starts a run: its
+/// comments came with it, or they did not, and by which way it arrived
+/// (the run's note differs: only an app has a version to update).
+pub fn event_comments_marker(payload: &Value) -> &'static str {
+    if event_carries_comments(payload) {
+        tc::EVENT_COMMENTS_SENT
+    } else if from_jira_app(payload) {
+        tc::EVENT_COMMENTS_NOT_SENT
+    } else {
+        tc::EVENT_COMMENTS_NOT_SENT_WEBHOOK
+    }
 }
 
 /// Keeps the people's comments an event carries, as context (no run was
@@ -708,6 +720,58 @@ mod tests {
         // An older app (or a plain Jira webhook) sends no list at all.
         assert!(!event_carries_comments(&json!({"issue": {}})));
         assert!(!event_carries_comments(&json!({"comments": null})));
+    }
+
+    #[test]
+    fn an_older_jira_app_and_a_plain_webhook_get_their_own_note() {
+        // The Jira app, a version that sends no comments: by team, by the
+        // installation older installs name, and as the relay forwards it
+        // (its secret taken out).
+        for app in [
+            json!({"issue": {}, "coderhelm": {"team_id": "T1", "forge_secret": "s"}}),
+            json!({"issue": {}, "coderhelm": {"installation_id": 7}}),
+            json!({"issue": {}, "coderhelm": {"team_id": "T1"}}),
+        ] {
+            assert!(from_jira_app(&app));
+            let marker = event_comments_marker(&app);
+            assert_eq!(marker, tc::EVENT_COMMENTS_NOT_SENT);
+            let note = tc::unread_earlier_note(Some(marker)).unwrap();
+            assert!(note.contains("Updating the Jira app"));
+        }
+        // A plain Jira webhook, with or without a repository named.
+        for hook in [
+            json!({"webhookEvent": "jira:issue_updated", "issue": {}}),
+            json!({"issue": {}, "coderhelm": {"repo_owner": "acme", "repo_name": "web"}}),
+            json!({"issue": {}, "coderhelm": {"team_id": null}}),
+        ] {
+            assert!(!from_jira_app(&hook));
+            let marker = event_comments_marker(&hook);
+            assert_eq!(marker, tc::EVENT_COMMENTS_NOT_SENT_WEBHOOK);
+            let note = tc::unread_earlier_note(Some(marker)).unwrap();
+            assert!(note.contains("came from a Jira webhook"));
+            assert!(!note.to_lowercase().contains("app"));
+        }
+        // The current app: the comments came, and the run notes nothing.
+        let sent = json!({"issue": {}, "comments": [], "coderhelm": {"team_id": "T1"}});
+        assert_eq!(event_comments_marker(&sent), tc::EVENT_COMMENTS_SENT);
+        assert_eq!(
+            tc::unread_earlier_note(Some(event_comments_marker(&sent))),
+            None
+        );
+        // The webhook path holds an address and a signing secret, nothing
+        // that reads a Jira site: there is nothing to fetch with.
+        let jira = include_str!("jira_webhook.rs");
+        let handle = &jira[jira.find("pub async fn handle(").unwrap()
+            ..jira.find("pub async fn process_relayed(").unwrap()];
+        assert!(handle.contains("\"webhook_secret\""));
+        for access in [
+            "api_token",
+            "access_token",
+            "refresh_token",
+            "Authorization",
+        ] {
+            assert!(!handle.contains(access), "{access}");
+        }
     }
 
     #[test]

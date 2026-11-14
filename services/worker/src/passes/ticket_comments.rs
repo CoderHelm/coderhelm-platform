@@ -759,8 +759,9 @@ pub async fn keep_existing_github(state: &WorkerState, msg: &TicketMessage, gith
 }
 
 /// A fresh run on a Jira ticket says on its page when the event that
-/// started it carried no comments (an older Jira app, which CoderHelm
-/// cannot ask for them): what people wrote before the run was not read.
+/// started it carried no comments (an older Jira app, or a plain Jira
+/// webhook; CoderHelm cannot read them another way on either): what
+/// people wrote before the run was not read, and why for that path.
 pub async fn note_unread_earlier(state: &WorkerState, msg: &TicketMessage, run_id: &str) {
     if !matches!(msg.source, TicketSource::Jira) || msg.same_run() || msg.ticket_id.is_empty() {
         return;
