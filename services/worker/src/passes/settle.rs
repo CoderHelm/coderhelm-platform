@@ -74,6 +74,10 @@ pub enum Action {
     Check(CheckKind),
     /// The package manager's audit of the lockfiles the change touches.
     Audit,
+    /// The repository's checks, which install from the lockfile: an item
+    /// that says a lockfile is out of sync with its manifest is settled by
+    /// them on the head as it is, never carried from an earlier head.
+    LockSync,
 }
 
 /// What settles an open item.
@@ -159,6 +163,23 @@ fn check_words(text: &str) -> Vec<CheckKind> {
 
 /// Whether a sentence asks for the package manager's audit result: it names
 /// an audit or advisories, and a count or a severity of them.
+pub fn names_lock_sync(text: &str) -> bool {
+    let t = text.to_lowercase();
+    (t.contains("lockfile") || t.contains("lock file"))
+        && [
+            "out of sync",
+            "out-of-sync",
+            "not in sync",
+            "not regenerated",
+            "needs regenerating",
+            "needs to be regenerated",
+            "frozen install",
+            "frozen-lockfile",
+        ]
+        .iter()
+        .any(|m| t.contains(m))
+}
+
 pub fn names_audit(text: &str) -> bool {
     let t = text.to_lowercase();
     if t.contains("audit log") || t.contains("audit trail") {
@@ -186,6 +207,11 @@ fn text_of(f: &Finding) -> String {
 pub fn classify(f: &Finding, facts: &Facts) -> Class {
     let point = f.point.trim();
     let text = text_of(f);
+    // Whatever wrote it, on whatever head: a lockfile out of sync is a
+    // fact about the branch, and CoderHelm checks it on this head.
+    if names_lock_sync(&text) {
+        return Class::Run(vec![Action::LockSync]);
+    }
     match point {
         "ci_pending" => return Class::Ci,
         "manual_check" => return Class::Human(HumanOnly::PersonAction),
@@ -512,6 +538,7 @@ pub fn plan(items: &[Finding], facts: &Facts) -> Plan {
             for a in actions {
                 match a {
                     Action::Audit => p.audit = true,
+                    Action::LockSync => p.checks = true,
                     Action::Check(k) => {
                         p.checks = true;
                         if !p.kinds.contains(&k) {
@@ -611,6 +638,32 @@ fn result_of(actions: &[Action], rec: &Record) -> Result<String, String> {
             Action::Audit => {
                 return Err(
                     "CoderHelm had no step with a full sandbox window left to run the audit".into(),
+                )
+            }
+            Action::LockSync if rec.checked && !rec.passed.is_empty() => {
+                proof.push(format!(
+                    "the repository's checks installed from the lockfile and passed on this head ({})",
+                    rec.passed.join(", ")
+                ));
+            }
+            Action::LockSync if rec.checked => {
+                return Err(
+                    "CoderHelm ran the repository's checks on this head and none passed, so \
+                     nothing shows the lockfile in sync"
+                        .into(),
+                )
+            }
+            Action::LockSync if !rec.no_result.is_empty() => {
+                return Err(format!(
+                    "CoderHelm's sandbox gave no result: {}",
+                    rec.no_result
+                ))
+            }
+            Action::LockSync => {
+                return Err(
+                    "CoderHelm had no step with a full sandbox window left to install from the \
+                     lockfile"
+                        .into(),
                 )
             }
             Action::Check(k) if rec.passed(*k) => {
@@ -1255,7 +1308,7 @@ pub async fn run(
                     w.file_cache,
                     Some(w.run_id),
                     w.deadline,
-                    true,
+                    super::write_guard::RoundFor::Settle,
                 )
                 .await;
                 match fixed {
@@ -1734,6 +1787,60 @@ mod tests {
         let mut lint = Record::default();
         lint.record_checks(&[step(CheckKind::Lint, "pnpm lint")], &[Some(1)], "x");
         assert_eq!(next(&plan, &lint, &room()), Next::Done);
+    }
+
+    /// "The lockfile is out of sync" stayed listed after the lockfile was
+    /// regenerated: it was CoderHelm's own item, so nothing checked it
+    /// again. It is checked on the head, whoever wrote it.
+    #[test]
+    fn a_lockfile_out_of_sync_item_is_settled_on_the_head_never_carried() {
+        let items = vec![
+            f(
+                "check_blocked",
+                "The lockfile is out of sync with the manifests this pull request changes (pnpm: specifiers in the lockfile don't match).",
+                "",
+            ),
+            f("external_fact", "The vendor's rate limit is not confirmed.", ""),
+        ];
+        assert_eq!(
+            classify(&items[0], &chore()),
+            Class::Run(vec![Action::LockSync])
+        );
+        assert!(plan(&items, &chore()).checks, "the checks run for it");
+        // The checks installed and passed on this head: the item closes.
+        let mut rec = Record::default();
+        rec.for_head("h2");
+        rec.checked = true;
+        rec.ran = vec!["build".into(), "tests".into()];
+        rec.passed = vec!["build".into(), "tests".into()];
+        let settled = apply(items.clone(), &chore(), &rec);
+        assert_eq!(settled.closed.len(), 1);
+        assert!(settled.closed[0]
+            .1
+            .contains("installed from the lockfile and passed on this head"));
+        assert!(settled
+            .open
+            .iter()
+            .all(|o| !o.detail.contains("out of sync")));
+        // Nothing ran on this head: it stays, saying why, never as a fact
+        // of the earlier head.
+        let mut none = Record::default();
+        none.for_head("h2");
+        let settled = apply(items, &chore(), &none);
+        let open = settled
+            .open
+            .iter()
+            .find(|o| o.detail.contains("out of sync"))
+            .unwrap();
+        assert!(
+            open.needs.contains("no step with a full sandbox window"),
+            "{}",
+            open.needs
+        );
+        assert!(!names_lock_sync("The lockfile was regenerated by pnpm."));
+        assert!(!names_lock_sync(
+            "The cache is out of sync with the database."
+        ));
     }
 
     #[test]

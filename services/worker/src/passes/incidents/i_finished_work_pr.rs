@@ -92,7 +92,7 @@ fn planned_round(
     let section = proof::unfinished_section(&proof::parse_findings(&reply).unwrap());
     let after = finish_planned::listed(&section);
     gh.pr_mut(21).body = completeness::with_section(&body, Section::Unfinished, section);
-    let next = finish_planned::next(&before, Some(&after), pushed.len(), round);
+    let next = finish_planned::next(&before, Some(&after), pushed.len(), &[], round);
     end.status = finish_planned::run_status(&next, pushed.len()).into();
     match next {
         Next::Ready => {
@@ -102,7 +102,13 @@ fn planned_round(
             }
             None
         }
-        Next::Again { stalled } => Some(finish_planned::next_round(round, &after, stalled, now())),
+        Next::Again { stalled } => Some(finish_planned::next_round(
+            round,
+            &after,
+            stalled,
+            &[],
+            now(),
+        )),
         Next::Stop(why) => {
             end.said(why);
             None
@@ -199,7 +205,7 @@ fn a_round_whose_check_cannot_answer_claims_nothing_done() {
     let round = open_the_pull_request(&mut gh, &mut end).unwrap();
     let before = finish_planned::listed(&gh.pr(21).body);
     assert_eq!(
-        finish_planned::next(&before, None, 0, &round),
+        finish_planned::next(&before, None, 0, &[], &round),
         Next::Again { stalled: 1 }
     );
 }

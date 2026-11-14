@@ -2726,9 +2726,10 @@ pub async fn run(
                         &file_cache,
                         Some(&msg.run_id),
                         Some(super::round::deadline(start)),
-                        // Scope to the PR only when this cycle is purely CI-driven; if
-                        // human review comments ride along, the human's ask wins.
-                        review_feedback.is_empty(),
+                        // Bounded only when this cycle is purely CI-driven; if human
+                        // review comments ride along, the human's ask wins.
+                        super::write_guard::RoundFor::CiFix
+                            .unless_person(!review_feedback.is_empty()),
                     )
                     .await
                 }
@@ -3635,8 +3636,17 @@ pub async fn run(
                 number: pr_number,
                 url: &pr_url,
             };
-            let end =
-                run_fix_round(state, &msg, &mut ctx, &pr, fix_round, created_at, &start).await?;
+            let end = run_fix_round(
+                state,
+                &msg,
+                &mut ctx,
+                &pr,
+                fix_round,
+                &mut Vec::new(),
+                created_at,
+                &start,
+            )
+            .await?;
             mark_events_processed(state, &msg.run_id, &events).await;
             match end {
                 RoundEnd::Parked => return Ok(()),
@@ -3972,6 +3982,9 @@ async fn run_fix_round(
     ctx: &mut FixContext,
     pr: &PrRef<'_>,
     round: run_round::Round,
+    // The edits the round was refused and never made (`write_guard`): what
+    // decides the next round reads them (`supervisor::progressed`).
+    refused: &mut Vec<super::write_guard::Refusal>,
     created_at: Option<chrono::DateTime<chrono::Utc>>,
     start: &std::time::Instant,
 ) -> Result<RoundEnd, Box<dyn std::error::Error + Send + Sync>> {
@@ -4041,7 +4054,7 @@ async fn run_fix_round(
         &FileCache::default(),
         Some(&msg.run_id),
         Some(super::round::deadline(*start)),
-        round.scoped,
+        super::write_guard::RoundFor::of_round(round.kind, round.scoped),
     )
     .await;
     write_pass_trace(
@@ -4099,6 +4112,8 @@ async fn run_fix_round(
                 warn!(run_id = %msg.run_id, "A fix round handed the description to a person; rebuilding it from the branch");
                 r.evidence.notes = account;
             }
+            *refused = std::mem::take(&mut r.refused);
+            let outside_plan = std::mem::take(&mut r.outside_plan);
             // What this round was asked and looked up reaches the next one.
             if round.kind == run_round::Kind::ReviewFix {
                 record_own_round_note(
@@ -4151,6 +4166,18 @@ async fn run_fix_round(
                         )
                         .await;
                     }
+                    // The files outside the plan's the round edited, with
+                    // why, are on the pull request.
+                    if files > 0 {
+                        super::habits_check::record_outside(
+                            &ctx.github,
+                            pr.owner,
+                            pr.repo,
+                            pr.number,
+                            &outside_plan,
+                        )
+                        .await;
+                    }
                     Ok(RoundEnd::Done { files })
                 }
                 super::round::Landed::Nothing => {
@@ -4185,6 +4212,7 @@ async fn run_fix_round(
                         &gh,
                         round,
                         &why,
+                        crate::clients::github::outside_for(msg.installation_id),
                         (created_at, start),
                     )
                     .await
@@ -4210,6 +4238,11 @@ async fn run_fix_round(
                 .await;
             }
             warn!(run_id = msg.run_id, error = %e, "Fix round met an error; taking the way around it");
+            // GitHub refusing for a while (its hourly limit, a 5xx, no
+            // answer) is known from the error itself, else from what this
+            // process saw of the installation's limit.
+            let known = crate::clients::github::outside_wait(err)
+                .or_else(|| crate::clients::github::outside_for(msg.installation_id));
             round_fault(
                 state,
                 msg,
@@ -4218,6 +4251,7 @@ async fn run_fix_round(
                 &gh,
                 round,
                 &common::run_fail::error_text(err),
+                known,
                 (created_at, start),
             )
             .await
@@ -4240,8 +4274,28 @@ async fn round_fault(
     gh: &super::round::Pr<'_>,
     mut round: run_round::Round,
     why: &str,
+    // What is known of GitHub refusing right now: the cause and the
+    // seconds left (`round::github_wait_of`).
+    github_known: Option<(common::github_wait::Cause, u64)>,
     (created_at, start): (Option<chrono::DateTime<chrono::Utc>>, &std::time::Instant),
 ) -> Result<RoundEnd, Box<dyn std::error::Error + Send + Sync>> {
+    // GitHub's limit is a wait, never a fault: the round goes on as itself
+    // (its work branch, its attempt) once the limit resets.
+    if let Some((cause, wait)) = super::round::github_wait_of(why, github_known) {
+        if wait_round_for_github(
+            state,
+            msg,
+            ctx,
+            pr,
+            &round,
+            (cause, wait),
+            (created_at, start),
+        )
+        .await?
+        {
+            return Ok(RoundEnd::Parked);
+        }
+    }
     let plan = super::round::plan_for_fault(
         round.kind,
         why,
@@ -4272,6 +4326,46 @@ async fn round_fault(
         super::round::start_clean(gh, &mut round).await;
     }
     park_round(state, msg, ctx, pr, &round, true, created_at, start).await
+}
+
+/// A fix round GitHub refused for a while waits for GitHub as the same
+/// round. It is parked as it stands (the attempt it was on, its work branch
+/// with everything it saved) and the resume that runs it is sent for
+/// GitHub's reset, in hops (`common::github_wait`): no attempt is spent, no
+/// work is thrown away, and nothing is asked of GitHub meanwhile. False
+/// when the run has taken every wait it may or the wait couldn't be sent:
+/// the fault's usual way follows then.
+async fn wait_round_for_github(
+    state: &WorkerState,
+    msg: &ResumeMessage,
+    ctx: (&TicketMessage, &TokenUsage),
+    pr: &PrRef<'_>,
+    round: &run_round::Round,
+    (cause, wait): (common::github_wait::Cause, u64),
+    (created_at, start): (Option<chrono::DateTime<chrono::Utc>>, &std::time::Instant),
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    if !super::round::may_wait_for_github(msg.github_wait.waits)
+        || state.config.ci_fix_queue_url.is_empty()
+    {
+        return Ok(false);
+    }
+    super::round::record(state, &msg.team_id, &msg.run_id, &round.parked(false)).await;
+    let still_active = set_run_awaiting_ci(
+        state,
+        ctx.0,
+        &msg.run_id,
+        pr.url,
+        pr.number,
+        pr.branch,
+        ctx.1,
+        wall_clock_secs(created_at, start),
+    )
+    .await?;
+    if !still_active {
+        // Cancelled or ended meanwhile: nothing to send on.
+        return Ok(true);
+    }
+    Ok(send_github_wait(state, msg, cause, wait).await)
 }
 
 /// A parked round, picked up by a fresh invocation with its whole budget:
@@ -4375,17 +4469,30 @@ async fn run_pending_round(
     let kind = round.kind;
     let number = round.number;
     let planned = (kind == run_round::Kind::PlannedWork).then(|| round.clone());
+    let mut refused = Vec::new();
     let end = if kind == run_round::Kind::Conflict {
         run_conflict_round(state, msg, &mut ctx, &pr, &round).await
     } else {
-        run_fix_round(state, msg, &mut ctx, &pr, round, created_at, start).await?
+        run_fix_round(
+            state,
+            msg,
+            &mut ctx,
+            &pr,
+            round,
+            &mut refused,
+            created_at,
+            start,
+        )
+        .await?
     };
     // Planned work: the check judges the branch again and decides the next
     // round, the ready pull request, or the stop (`finish_planned`).
     if let Some(planned) = planned {
         if end != RoundEnd::Parked {
-            after_planned_round(state, msg, &mut ctx, &pr, &planned, end, created_at, start)
-                .await?;
+            after_planned_round(
+                state, msg, &mut ctx, &pr, &planned, end, &refused, created_at, start,
+            )
+            .await?;
         }
         return Ok(());
     }
@@ -4729,6 +4836,7 @@ async fn after_planned_round(
     pr: &PrRef<'_>,
     round: &run_round::Round,
     end: RoundEnd,
+    refused: &[super::write_guard::Refusal],
     created_at: Option<chrono::DateTime<chrono::Utc>>,
     start: &std::time::Instant,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -4778,7 +4886,7 @@ async fn after_planned_round(
         }
     }
     let duration = wall_clock_secs(created_at, start);
-    let next = finish_planned::next(&before, after.as_deref(), files, round);
+    let next = finish_planned::next(&before, after.as_deref(), files, refused, round);
     let status = finish_planned::run_status(&next, files);
     match next {
         Next::Ready => {
@@ -4845,7 +4953,8 @@ async fn after_planned_round(
         }
         Next::Again { stalled } => {
             let items = after.unwrap_or(before);
-            let next = finish_planned::next_round(round, &items, stalled, chrono::Utc::now());
+            let next =
+                finish_planned::next_round(round, &items, stalled, refused, chrono::Utc::now());
             super::round::record(state, &msg.team_id, &msg.run_id, &next).await;
             super::add_progress_note(
                 state,
@@ -7130,6 +7239,34 @@ async fn complete_run_with_status(
     duration: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     debug_assert_ne!(status, "needs_input", "use wait_for_review");
+    // A run never completes on a description built for another head: it is
+    // rebuilt for the head first, and when that cannot be done this step
+    // ends in an error and is tried again.
+    if status == common::run_status::COMPLETED && pr_number > 0 {
+        if let Ok(github) = GitHubClient::new(
+            &state.secrets.github_app_id,
+            &state.secrets.github_private_key,
+            msg.installation_id,
+            &state.http,
+        ) {
+            if let super::description::Reconciled::Failed(why) = super::description::reconcile(
+                state,
+                &github,
+                &msg.team_id,
+                &msg.repo_owner,
+                &msg.repo_name,
+                pr_number,
+                &msg.ticket_id,
+            )
+            .await
+            {
+                return Err(format!(
+                    "the pull request's description is not of its head and could not be rebuilt: {why}"
+                )
+                .into());
+            }
+        }
+    }
     // Open items written on an earlier head are not this run's last word: a
     // later round may have settled one. The run goes back to its checks on
     // the head first, and finishes from there.
@@ -7297,7 +7434,19 @@ async fn wait_for_github(
     let Some((cause, wait)) = crate::clients::github::outside_wait(e) else {
         return false;
     };
-    if msg.github_wait.waits >= common::github_wait::MAX_WAITS {
+    send_github_wait(state, msg, cause, wait).await
+}
+
+/// Sends this resume on for GitHub's reset in `wait` seconds, in hops, and
+/// says so on the run page. False when every wait is taken or the message
+/// couldn't be sent.
+async fn send_github_wait(
+    state: &WorkerState,
+    msg: &ResumeMessage,
+    cause: common::github_wait::Cause,
+    wait: u64,
+) -> bool {
+    if !super::round::may_wait_for_github(msg.github_wait.waits) {
         return false;
     }
     let now = chrono::Utc::now().timestamp().max(0) as u64;
