@@ -281,7 +281,7 @@ pub fn open_pr(prs: &[common::run_prs::RunPr], run_repo: &str) -> Option<(String
 }
 
 /// The opening words of an old error review: not a verdict on the code.
-const LEGACY_FAILED_PREFIX: &str = "Automated review could not complete";
+pub(crate) const LEGACY_FAILED_PREFIX: &str = "Automated review could not complete";
 
 /// Pure: the latest verdict among a PR's review records, newest first.
 /// Answers to questions and old error reviews are skipped.

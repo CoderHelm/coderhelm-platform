@@ -104,6 +104,7 @@ pub const CAPABILITIES: &[Capability] = &[
             "search::search",
             "api::get_run",
             "api::get_run_traces",
+            "run_activity::activity",
             "api::get_agent_log",
             "api::list_repos",
             "api::get_stats",
