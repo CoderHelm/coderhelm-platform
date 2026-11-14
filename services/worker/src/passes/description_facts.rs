@@ -151,7 +151,7 @@ pub fn check_of(body: &str) -> String {
         let mut ticks = l.split('`');
         ticks.next();
         while let Some(inside) = ticks.next() {
-            if pr_steps::is_command(inside) {
+            if pr_steps::is_check_command(inside) {
                 return format!("`{}`", inside.trim());
             }
             ticks.next();
@@ -173,12 +173,63 @@ fn questions_of(body: &str) -> Vec<OpenItem> {
         .take_while(|l| !l.is_empty() && !l.starts_with("<!--") && !l.starts_with('#'))
         .filter_map(|l| {
             let digits = l.chars().take_while(|c| c.is_ascii_digit()).count();
-            (digits > 0 && l[digits..].starts_with(". ")).then(|| OpenItem {
-                text: format!("Answer: {}", one_line(&l[digits + 2..])),
-                closer: Closer::Person,
-            })
+            (digits > 0 && l[digits..].starts_with(". ")).then(|| one_line(&l[digits + 2..]))
+        })
+        .filter_map(|q| {
+            // A question reaches a person only when the gate finds it theirs
+            // (as a yes/no on CoderHelm's recommendation); the rest are
+            // decided and noted ([`question_notes`]).
+            match common::person_gate::line_outcome(common::person_gate::Kind::Question, &q) {
+                common::person_gate::Outcome::Human(h) => Some(OpenItem {
+                    text: h.line(),
+                    closer: Closer::Person,
+                }),
+                _ => None,
+            }
         })
         .collect()
+}
+
+/// The sign-offs the settle stage folded into the merge decision
+/// (`settle::SIGNOFF_START`).
+pub fn signoffs(body: &str) -> Vec<String> {
+    let (start, end) = (super::settle::SIGNOFF_START, super::settle::SIGNOFF_END);
+    let mut out = Vec::new();
+    let mut rest = body;
+    while let Some(a) = rest.find(start) {
+        let after = &rest[a + start.len()..];
+        let Some(b) = after.find(end) else {
+            break;
+        };
+        let note = one_line(&after[..b]);
+        if !note.is_empty() && !out.contains(&note) {
+            out.push(note);
+        }
+        rest = &after[b..];
+    }
+    out
+}
+
+/// The decisions and settled notes for the questions a description put to
+/// a person that the gate found CoderHelm's to decide: one line each, for
+/// the collapsed evidence.
+pub fn question_notes(body: &str) -> Vec<String> {
+    let Some(at) = body.find("## Questions only a person can answer") else {
+        return Vec::new();
+    };
+    let asks: Vec<common::person_gate::Ask> = body[at..]
+        .lines()
+        .skip(1)
+        .map(str::trim)
+        .take_while(|l| !l.is_empty() && !l.starts_with("<!--") && !l.starts_with('#'))
+        .filter_map(|l| {
+            let digits = l.chars().take_while(|c| c.is_ascii_digit()).count();
+            (digits > 0 && l[digits..].starts_with(". ")).then(|| {
+                common::person_gate::Ask::new(common::person_gate::Kind::Question, &l[digits + 2..])
+            })
+        })
+        .collect();
+    common::person_gate::gate(asks, &common::person_gate::Context::default()).evidence_lines()
 }
 
 /// The open items a description lists, each with who closes it, and the
@@ -213,12 +264,12 @@ fn listed_open(body: &str) -> Vec<OpenItem> {
                 }
                 one_line(&t)
             };
-            let lower = text.to_lowercase();
-            let person = [
-                "by hand", "a person", "someone", "manually", "approve", "decide", "ask ", "grant",
-            ]
-            .iter()
-            .any(|w| lower.contains(w));
+            // Who closes it is the gate's call, never a word list: an item
+            // reaches a person only for a listed reason.
+            let person = matches!(
+                common::person_gate::line_outcome(common::person_gate::Kind::OpenItem, &text),
+                common::person_gate::Outcome::Human(_)
+            );
             OpenItem {
                 text,
                 closer: if ci {
@@ -314,7 +365,13 @@ pub fn facts(i: &Inputs<'_>) -> Facts {
         dependency: i.dependency.clone(),
         run_url: i.run_url.to_string(),
         notes: i.notes.clone(),
-        evidence: i.evidence.clone(),
+        evidence: i
+            .evidence
+            .iter()
+            .cloned()
+            .chain(question_notes(i.body))
+            .collect(),
+        review_notes: signoffs(i.body),
         ..Default::default()
     };
     // A frozen install a check recorded on this head.
@@ -336,6 +393,9 @@ pub fn facts(i: &Inputs<'_>) -> Facts {
     if let Some(c) = i.outside {
         f.steps = super::outside_work::steps_now(c, true);
         f.steps.extend(super::outside_work::person_checks(c));
+        // A look at a page belongs to the reviewer's merge decision.
+        f.review_notes
+            .extend(f.steps.iter().filter_map(|s| s.for_review()));
         f.checked = super::outside_work::checked_now(c);
         // A test the note wants run is CI's to run, and CoderHelm's to read.
         // "none, because ... . The unit test x must pass": only what is to
@@ -596,11 +656,27 @@ mod tests {
     }
 
     #[test]
-    fn a_question_for_a_person_is_something_needed_from_them() {
+    fn only_a_question_a_person_alone_can_settle_is_needed_from_them() {
         let body = "## Summary\n\nAdds the card block.\n\n<!-- coderhelm:not-in-pr -->\n## Questions only a person can answer\n1. Should the card link open in a new tab?\n<!-- /coderhelm:not-in-pr -->\n";
-        let open = open_of(body);
+        // A reversible choice is decided and noted, never asked.
+        assert!(open_of(body).is_empty());
+        assert_eq!(question_notes(body).len(), 1);
+        assert!(
+            question_notes(body)[0].starts_with("Chose "),
+            "{:?}",
+            question_notes(body)
+        );
+        // One that reaches customers and nothing settles is a yes/no.
+        let refund = body.replace(
+            "Should the card link open in a new tab?",
+            "Should cancelled bookings be refunded to customers?",
+        );
+        let open = open_of(&refund);
         assert_eq!(open.len(), 1);
         assert_eq!(open[0].closer, Closer::Person);
+        assert!(open[0]
+            .text
+            .starts_with("Yes or no: Should cancelled bookings be refunded"));
         let s = shape(
             body,
             "GH-41: Card block",
@@ -611,8 +687,7 @@ mod tests {
             None,
         );
         assert!(
-            common::pr_layout::visible(&s.body)
-                .contains("**Needed from you:**\n1. Answer: Should the card link open in a new tab? (a person)"),
+            common::pr_layout::visible(&s.body).contains("**Needed from you:** Nothing."),
             "{}",
             s.body
         );

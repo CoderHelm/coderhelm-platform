@@ -387,9 +387,13 @@ pub(crate) async fn on_comment(
     let api = format!("https://api.github.com/repos/{owner}/{name}");
     let reply = |text: String| {
         let token = token.clone();
-        let url = format!("{api}/issues/{pr_number}/comments");
         async move {
-            gh_post(state, &token, &url, &serde_json::json!({ "body": text })).await;
+            let say = common::conversation::Say::reply_all("merge-control", text);
+            if let Err(e) =
+                super::conversation::github(state, &token, owner, name, pr_number, say).await
+            {
+                warn!(owner, name, pr_number, error = %e, "merge control: reply failed");
+            }
         }
     };
     let allowed = match gh_get(

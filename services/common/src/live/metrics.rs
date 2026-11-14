@@ -363,7 +363,7 @@ where
         return StepError::new(
             "sign_in",
             "The CoderHelm role in your AWS account can't read metrics yet.",
-            "Update the role from Settings → AWS (one click adds read access to metrics).",
+            "Update the role from Settings under AWS (one click adds read access to metrics).",
         );
     }
     StepError::new(

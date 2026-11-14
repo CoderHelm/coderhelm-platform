@@ -488,10 +488,15 @@ impl Env for Live<'_> {
     }
 
     async fn comment(&self, pr: u64, body: &str) -> Result<(), Error> {
-        self.github
-            .create_issue_comment(self.owner, self.name, pr, body)
-            .await
-            .map(|_| ())
+        crate::passes::conversation::github(
+            &self.github,
+            self.owner,
+            self.name,
+            pr,
+            common::conversation::Say::note("stale", body),
+        )
+        .await
+        .map(|_| ())
     }
 
     async fn close(&self, pr: u64) -> Result<(), Error> {

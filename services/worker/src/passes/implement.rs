@@ -3630,7 +3630,7 @@ pub(crate) fn validate_edit_safety(original: &str, edited: &str, path: &str) -> 
     let edit_lines = edited.lines().count();
     if orig_lines > 20 && edit_lines < orig_lines * 60 / 100 {
         return Some(format!(
-            "edit would delete {:.0}% of the file ({orig_lines} → {edit_lines} lines) — \
+            "edit would delete {:.0}% of the file ({orig_lines} to {edit_lines} lines) — \
              use smaller, targeted edits instead",
             (1.0 - edit_lines as f64 / orig_lines as f64) * 100.0
         ));

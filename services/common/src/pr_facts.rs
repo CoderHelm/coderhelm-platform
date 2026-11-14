@@ -16,7 +16,8 @@
 //!   known, the risk and the way back, what is open and who can close it,
 //!   and for a dependency update [`DependencyFacts`].
 //! - [`lead`] renders what a reviewer reads first from them, in a fixed
-//!   order: one standalone line, what is to be decided, the feedback wanted,
+//!   order: one standalone line, what is to be decided with CoderHelm's own
+//!   conclusion,
 //!   and the anomalies, each with its evidence.
 //! - `pr_claims` checks every sentence somebody wrote against them, and
 //!   `pr_layout` puts the routine detail after them, collapsed.
@@ -349,6 +350,11 @@ pub struct Facts {
     /// the part a reader sees first.
     #[serde(default)]
     pub evidence: Vec<String>,
+    /// Sign-offs that belong to the reviewer's merge decision (a page to
+    /// look at) and decisions that matter for it, from `person_gate`:
+    /// carried in the one review line, never listed as chores.
+    #[serde(default)]
+    pub review_notes: Vec<String>,
 }
 
 impl Facts {
@@ -575,8 +581,9 @@ fn listed(ids: &[String], max: usize) -> String {
 /// full list is.
 pub const MAX_ANOMALIES: usize = 8;
 
-/// What the reviewer is asked to decide, and the feedback wanted: the one
-/// place a second pair of eyes helps most.
+/// What the reviewer is asked to decide, with CoderHelm's own conclusion
+/// and the evidence it rests on. The reviewer is asked for the merge
+/// decision only, never for CoderHelm's analysis (`person_gate`).
 fn review_line(f: &Facts) -> String {
     let decide = match (&f.dependency, &f.why) {
         (Some(d), _) => format!(
@@ -588,38 +595,107 @@ fn review_line(f: &Facts) -> String {
         }
         _ => "whether this is right to merge".to_string(),
     };
-    let feedback = if let Some(d) = f
-        .dependency
-        .as_ref()
-        .filter(|d| !d.major_lines().is_empty())
-    {
-        if d.major_lines().len() == 1 {
-            "does the evidence beside the major version jump cover how this code uses the package"
-                .to_string()
-        } else {
-            "does the evidence beside each major version jump cover how this code uses those packages".to_string()
+    let mut s = format!(
+        "decide {decide}. CoderHelm's conclusion: {}.",
+        conclusion(f)
+    );
+    if !f.review_notes.is_empty() {
+        s.push_str(&format!(
+            " Your merge decision also signs off: {}.",
+            f.review_notes
+                .iter()
+                .map(|n| one_line(n).trim_end_matches('.').to_string())
+                .collect::<Vec<_>>()
+                .join("; ")
+        ));
+    }
+    s
+}
+
+/// What CoderHelm concludes from the facts, with what each part rests on.
+pub fn conclusion(f: &Facts) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(d) = &f.dependency {
+        let majors = d.major_lines();
+        if !majors.is_empty() {
+            let bare: Vec<String> = majors
+                .iter()
+                .filter(|l| d.evidence_for(l).is_none())
+                .map(|l| format!("`{}` {} to {}", l.package, l.from, l.to))
+                .collect();
+            let covered = majors.len() - bare.len();
+            if bare.is_empty() {
+                parts.push(format!(
+                    "{} safe for this code, each by the usages, checks and probes recorded beside it",
+                    if majors.len() == 1 {
+                        "the major version jump is".to_string()
+                    } else {
+                        format!("all {} major version jumps are", majors.len())
+                    }
+                ));
+            } else {
+                parts.push(format!(
+                    "{covered} of {} major version jumps are shown safe for this code; {} {} no recorded evidence, so {} the risk in this merge",
+                    majors.len(),
+                    listed(&bare, 4),
+                    if bare.len() == 1 { "has" } else { "have" },
+                    if bare.len() == 1 { "it is" } else { "they are" },
+                ));
+            }
         }
-    } else if f
-        .dependency
-        .as_ref()
-        .is_some_and(|d| !d.advisories.remaining.is_empty())
-    {
-        "can the advisories left wait for a release that fixes them".to_string()
-    } else if let Some(b) = f.behaviour.first() {
-        format!(
-            "is the behaviour change ({}) the one wanted",
-            one_line(&b.what)
-        )
-    } else {
-        match f.risk.as_ref().and_then(|r| r.look_first.as_ref()) {
+        if !d.advisories.remaining.is_empty() {
+            parts.push(format!(
+                "{} left open, listed below with why",
+                plural(
+                    d.advisories.remaining.len(),
+                    "advisory is",
+                    "advisories are"
+                )
+            ));
+        }
+        if !d.advisories.introduced.is_empty() {
+            parts.push(format!(
+                "the new versions bring {}",
+                plural(d.advisories.introduced.len(), "advisory", "advisories")
+            ));
+        }
+    }
+    if let Some(b) = f.behaviour.first() {
+        parts.push(format!(
+            "the behaviour changes as recorded ({}; {})",
+            one_line(&b.what).trim_end_matches('.'),
+            one_line(&b.evidence).trim_end_matches('.')
+        ));
+    }
+    let failing = f
+        .checks
+        .iter()
+        .filter(|c| c.outcome == Outcome::Failed)
+        .count();
+    if failing > 0 {
+        parts.push(format!(
+            "{} on `{}`, so it is not ready",
+            plural(failing, "check fails", "checks fail"),
+            f.short_head()
+        ));
+    } else if f.all_checks_passed() {
+        parts.push(format!(
+            "every recorded check passed on `{}`",
+            f.short_head()
+        ));
+    } else if f.checks.is_empty() {
+        parts.push(format!("no check has reported on `{}` yet", f.short_head()));
+    }
+    if parts.is_empty() {
+        return match f.risk.as_ref().and_then(|r| r.look_first.as_ref()) {
             Some((path, why)) => format!(
-                "read `{path}` with care ({})",
+                "nothing is out of the ordinary; the change that matters most is in `{path}` ({})",
                 one_line(why).trim_end_matches('.')
             ),
-            None => "nothing specific is flagged".to_string(),
-        }
-    };
-    format!("decide {decide}. Feedback wanted: {feedback}.")
+            None => "nothing is out of the ordinary".to_string(),
+        };
+    }
+    parts.join("; ")
 }
 
 /// How to check the change, and what the records say of it.
@@ -656,7 +732,14 @@ fn check_line(f: &Facts) -> String {
 /// only a person can close. Empty when nothing is needed.
 pub fn needed_lines(f: &Facts) -> Vec<String> {
     let mut out = crate::pr_steps::needed(&f.steps);
-    for o in f.open.iter().filter(|o| o.closer == Closer::Person) {
+    // Every item through the gate: only what a person alone can do.
+    for o in f.open.iter().filter(|o| {
+        o.closer == Closer::Person
+            && matches!(
+                crate::person_gate::line_outcome(crate::person_gate::Kind::OpenItem, &o.text),
+                crate::person_gate::Outcome::Human(_)
+            )
+    }) {
         out.push(format!(
             "{} (a person)",
             crate::pr_steps::plain(&o.text).trim_end_matches('.')
@@ -811,7 +894,7 @@ mod tests {
              **Check:** `cargo test -p export`; 2 recorded checks passed on `abc1234`.\n\
              **Risk:** **Low**: one module.\n\
              **Needed from you:** Nothing.\n\
-             **Review:** decide whether this does what OPS-41 asks. Feedback wanted: read `src/export/poller.rs` with care (the retry loop decides when a poll is abandoned).\n\
+             **Review:** decide whether this does what OPS-41 asks. CoderHelm's conclusion: every recorded check passed on `abc1234`.\n\
              <!-- /coderhelm:lead -->"
         );
         assert!(out.lines().count() <= visible_budget(&f));
@@ -907,7 +990,11 @@ mod tests {
             out.contains("`tiny-yaml` 1.2.0 to 2.0.0 crosses a major version. No safety evidence is recorded"),
             "{out}"
         );
-        assert!(out.contains("each major version jump"), "{out}");
+        assert!(
+            out.contains("CoderHelm's conclusion: 1 of 2 major version jumps are shown safe for this code; `tiny-yaml` 1.2.0 to 2.0.0 has no recorded evidence, so it is the risk in this merge"),
+            "{out}"
+        );
+        assert!(!out.contains("Feedback wanted"), "{out}");
         assert!(
             out.contains("whether to merge 2 dependency updates"),
             "{out}"

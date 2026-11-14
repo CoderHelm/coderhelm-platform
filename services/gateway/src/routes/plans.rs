@@ -3696,7 +3696,7 @@ pub async fn plan_chat_stream(
             let _ = tx
                 .send(sse_event(
                     "error",
-                    json!({ "message": "Anthropic API key not configured. Please set up your API key in Settings → Model Provider." }),
+                    json!({ "message": "Anthropic API key not configured. Please set up your API key in Settings under Model Provider." }),
                 ))
                 .await;
         }

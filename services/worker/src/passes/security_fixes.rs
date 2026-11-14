@@ -3347,7 +3347,14 @@ async fn adopt(
             }
         }
         body.push_str(&format!("\n{}\n\n{}", sec::ATTRIBUTION, sec::MARKER));
-        let _ = cx.gh.create_issue_comment(o, n, number, &body).await;
+        let _ = crate::passes::conversation::github(
+            &cx.gh,
+            o,
+            n,
+            number,
+            common::conversation::Say::note("security", &body),
+        )
+        .await;
     }
     for i in members {
         let (f, st) = &mut findings[*i];
@@ -3524,7 +3531,14 @@ async fn close_withdrawn(cx: &Ctx<'_>, findings: &mut [(Finding, FindingState)])
             continue;
         }
         let note = format!("The advisory this pull request fixes was withdrawn, so CoderHelm closed it. The branch is kept.\n\n{}", sec::MARKER);
-        let _ = cx.gh.create_issue_comment(o, n, number, &note).await;
+        let _ = crate::passes::conversation::github(
+            &cx.gh,
+            o,
+            n,
+            number,
+            common::conversation::Say::note("security", &note),
+        )
+        .await;
         if let Err(e) = cx.gh.close_pull_request(o, n, number).await {
             warn!(repo, number, error = %e, "security: could not close the withdrawn advisory's pull request");
         }

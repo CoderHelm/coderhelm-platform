@@ -397,7 +397,7 @@ pub async fn assess(
         let cr: Vec<String> = cross_repo_top
             .iter()
             .take(3)
-            .map(|(p, n)| format!("{p} → {n} repo(s)"))
+            .map(|(p, n)| format!("{p} to {n} repo(s)"))
             .collect();
         blast_detail = format!("{blast_detail} · cross-repo consumers: {}", cr.join(", "));
     }

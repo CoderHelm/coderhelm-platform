@@ -3,7 +3,13 @@
 //!
 //! Sources a question may use (see [`SOURCE_KINDS`]): knowledge bases,
 //! connections (the MCP servers on the Connections page), repositories and
-//! the code graph, memories, data sources, and team skills. By default a
+//! the code graph, memories, data sources, team skills, and the team's own
+//! work: tickets, pull requests, runs, findings and the other records
+//! Coderhelm keeps (`chat_work`), read only and only what the asker could
+//! see in the dashboard. A question about the team's work ("what's the
+//! latest on", a ticket key, a PR number, a CVE id, "what's running") is
+//! pointed at that source first (`chat_hints`), and an answer that says it
+//! found nothing without looking there is sent back once (`chat_agent`). By default a
 //! question may use every source the asker can see; the asker can narrow it
 //! by mentioning a repository or a knowledge base. Knowledge is retrieved
 //! first, in code, before the model's first step; the model then reads code
@@ -113,6 +119,11 @@ pub const SOURCE_KINDS: &[SourceKind] = &[
         about: "Your team's written skills and helpers",
     },
     SourceKind {
+        key: super::chat_work::SOURCE_KEY,
+        label: super::chat_work::SOURCE_LABEL,
+        about: super::chat_work::SOURCE_ABOUT,
+    },
+    SourceKind {
         key: common::plugins::brain::SOURCE_KEY,
         label: common::plugins::brain::SOURCE_LABEL,
         about: common::plugins::brain::SOURCE_ABOUT,
@@ -135,6 +146,9 @@ pub struct Picks {
     pub data_sources: bool,
     #[serde(default)]
     pub skills: bool,
+    /// Tickets, pull requests, runs, findings and the records Coderhelm keeps.
+    #[serde(default)]
+    pub work: bool,
     /// Installed plugins (ids) the question may ask; only active ones are used.
     #[serde(default)]
     pub plugins: Vec<String>,
@@ -190,6 +204,9 @@ pub fn resolve_picks(
             knowledge: m_kbs,
             code: !m_repos.is_empty(),
             memories: !m_repos.is_empty(),
+            // Where the team's work stands is never narrowed away: it's
+            // where a status question's answer lives.
+            work: true,
             repo: m_repos.first().cloned(),
             repos: m_repos,
             ..Default::default()
@@ -208,6 +225,7 @@ pub fn resolve_picks(
         memories: !repos.is_empty(),
         data_sources: true,
         skills: true,
+        work: true,
         // Every active plugin, looked up when the question is asked.
         plugins: Vec::new(),
         repo: None,
@@ -225,6 +243,7 @@ impl Picks {
             "memories" => self.memories,
             "data_sources" => self.data_sources,
             "skills" => self.skills,
+            super::chat_work::SOURCE_KEY => self.work,
             common::plugins::brain::SOURCE_KEY => !self.plugins.is_empty(),
             _ => false,
         }
@@ -238,6 +257,7 @@ pub fn kind_of_tool(name: &str) -> &'static str {
         MEMORY_TOOL => "memories",
         "read_skill" | "read_skill_file" | "ask_team_agent" => "skills",
         common::plugins::brain::ASK_TOOL => common::plugins::brain::SOURCE_KEY,
+        n if super::chat_work::is_work_tool(n) => super::chat_work::SOURCE_KEY,
         n if n.starts_with("github__") || n.starts_with("graph_") => "code",
         n if n.contains("__") => "connections",
         _ => "data_sources",
@@ -783,7 +803,12 @@ pub fn starter_questions(
         .map(|r| Starter {
             question: format!("What's the latest on “{}”?", clip(&r.title, 70)),
             why: format!("From recent work in {}", short_repo(&r.repo)),
-            sources: code(&r.repo),
+            // Where it stands is in the ticket, its pull requests and runs;
+            // the code is context.
+            sources: Picks {
+                work: true,
+                ..code(&r.repo)
+            },
             mentions: Vec::new(),
         })
         .collect();
@@ -1137,6 +1162,8 @@ How to work:
 - "What does file Y do?": read it (in ranges when it is long) and the files it leans on when that matters.
 - Never hand work back. Don't ask the person to open, read, paste or attach a file, to say which repository or who owns it, or to look something up: your tools do that. When a tool fails, try another way (another path, a search, the file listing). Say something isn't there only after you looked, and say where you looked.
 - Ask the person only for what no tool can reach, such as a decision or a preference.
+- The team's own work lives in the work tools (work_tickets, work_pull_requests, work_runs, work_findings, work_records), not in the code or the docs. "What's the latest on X", "where are we on", "status of", a ticket key, a pull request number, a run, "what's running", a CVE id or a package, a quoted title: look it up there first (the ticket, then its pull requests and Coderhelm's runs on it), then read code or docs only for context. Give a dated status: say when each record last changed. Never say there's nothing on it before you searched the tickets, pull requests and runs.
+- Don't guess a field, column, type or property name. Before you query a data source, a CMS or a database, read its schema (its describe, schema or mapping tool) and query with the names it lists.
 
 Citations:
 - Ground every claim. After each sentence that uses a source, cite it with its id in square brackets, like [S2] or [S1, S4]. Cite only ids you were given in <source> blocks. Never invent an id.
@@ -1257,6 +1284,9 @@ struct Run {
     /// What the knowledge searches found (`(base, item, title)`), for the
     /// bases' usage.
     found: std::sync::Mutex<Vec<(String, String, String)>>,
+    /// The team's work (tickets, pull requests, runs, findings) as this
+    /// asker may read it; `None` when the question doesn't read it.
+    work: Option<super::chat_work::Ctx>,
 }
 
 impl Run {
@@ -1313,7 +1343,9 @@ pub fn run_context_line(item: &HashMap<String, AttributeValue>) -> String {
     if !pr.is_empty() {
         line.push_str(&format!(", pull request {pr}"));
     }
-    let err = s("error");
+    let err = Some(s("error_message"))
+        .filter(|e| !e.is_empty())
+        .unwrap_or_else(|| s("error"));
     if !err.is_empty() {
         line.push_str(&format!(". It stopped with: {}", clip(&err, 400)));
     }
@@ -1400,6 +1432,13 @@ fn tool_defs(run: &Run) -> Vec<Value> {
     if !run.plugin_ids.is_empty() {
         tools.push(common::plugins::brain::ask_tool(&run.plugin_ids));
     }
+    if let Some(w) = run.work.as_ref().filter(|_| run.picks.work) {
+        tools.extend(super::chat_work::defs(
+            &w.readable,
+            &w.repos,
+            w.github_token.is_some(),
+        ));
+    }
     tools.extend(
         run.worker
             .tools
@@ -1427,6 +1466,7 @@ fn tool_label(name: &str, input: &Value) -> String {
         ),
         MEMORY_TOOL => format!("Searched past work in {}", short_repo(&s("repo"))),
         common::plugins::brain::ASK_TOOL => format!("Asked the {} plugin", s("plugin")),
+        n if super::chat_work::is_work_tool(n) => super::chat_work::label(n, input),
         n if n.starts_with("graph_") => chat_code::graph_label(n, input),
         n if n.contains("__") => {
             let (server, tool) = n.split_once("__").unwrap_or((n, ""));
@@ -1555,6 +1595,16 @@ async fn run_tool(
         );
     }
     let state = &run.state;
+    if super::chat_work::is_work_tool(name) {
+        return match &run.work {
+            Some(w) => Box::pin(super::chat_work::call(w, reg, name, input)).await,
+            None => (
+                "That source isn't part of this question.".into(),
+                "Not allowed".into(),
+                true,
+            ),
+        };
+    }
     match name {
         KNOWLEDGE_TOOL => {
             let q = input["query"].as_str().unwrap_or("");
@@ -1749,6 +1799,31 @@ struct BrainTools<'a> {
     gate: common::agent_policy::Gate,
     defs: Vec<Value>,
     used: Used,
+    /// Tools called so far, for the schema-first check.
+    called: Vec<String>,
+}
+
+/// A query tool and the tool that reads its source's schema: a query before
+/// the schema is read is answered with "read the schema first", once.
+const SCHEMA_FIRST: &[(&str, &str)] = &[
+    ("live_lookup", "live_describe"),
+    ("db_query", "live_describe"),
+    ("opensearch_search", "opensearch_mapping"),
+];
+
+/// The note for a query sent before its schema was read; `None` to run it.
+pub fn schema_first(name: &str, called: &[String], offered: &[Value]) -> Option<String> {
+    let (_, schema) = SCHEMA_FIRST.iter().find(|(q, _)| *q == name)?;
+    let has = offered.iter().any(|t| t["name"] == *schema);
+    let read = called.iter().any(|c| c == schema);
+    // Once: a second try runs (the model may know the names from before).
+    let tried = called.iter().any(|c| c == name);
+    (has && !read && !tried).then(|| {
+        format!(
+            "Not run: read the source's schema first with {schema}, then query with the field, \
+             column and type names it lists. Don't guess names."
+        )
+    })
 }
 
 #[async_trait::async_trait]
@@ -1766,6 +1841,17 @@ impl Toolbox for BrainTools<'_> {
     ) -> Called {
         let label = tool_label(name, input);
         let kind = kind_of_tool(name).to_string();
+        if let Some(note) = schema_first(name, &self.called, &self.defs) {
+            self.called.push(name.to_string());
+            return Called::Done {
+                text: note,
+                label,
+                summary: "Schema first".into(),
+                is_error: true,
+                kind,
+            };
+        }
+        self.called.push(name.to_string());
         let verdict = if name == super::chat_policy::SIGN_IN_TOOL {
             let (text, event) = super::chat_policy::sign_in(
                 &self.run.state,
@@ -2128,7 +2214,7 @@ pub async fn brain_stream(
             }
         },
         async {
-            if picks.code && !code_repos.is_empty() {
+            if (picks.code && !code_repos.is_empty()) || (picks.work && !all_repos.is_empty()) {
                 github_token(&state, &claims.team_id).await
             } else {
                 None
@@ -2152,6 +2238,26 @@ pub async fn brain_stream(
     } else {
         active_plugins(&state, &claims.team_id, &picks.plugins).await
     };
+    let work = if picks.work {
+        let (jira, installation_id) = tokio::join!(
+            super::chat_work_tickets::load(&state, &claims.team_id),
+            super::graph::installation_id(&state, &claims.team_id),
+        );
+        Some(super::chat_work::Ctx {
+            state: state.clone(),
+            claims: claims.clone(),
+            readable: super::chat_work::readable(&holder),
+            holder: holder.clone(),
+            repos: repo_names.clone(),
+            github_token: github.clone(),
+            installation_id,
+            jira,
+        })
+    } else {
+        None
+    };
+    // Code reads only when the question reads code.
+    let github = github.filter(|_| picks.code && !code_repos.is_empty());
     let run = Run {
         state: state.clone(),
         team_id: claims.team_id.clone(),
@@ -2173,6 +2279,7 @@ pub async fn brain_stream(
         is_admin: claims.holder().holds("integrations"),
         run_note: run_note(&state, &claims.team_id, &mentioned_runs(&body.mentions)).await,
         found: std::sync::Mutex::new(Vec::new()),
+        work,
     };
 
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(256);
@@ -2440,6 +2547,9 @@ async fn answer(
     .await;
 
     let mut tools = tool_defs(run);
+    // What the question names puts the tool that holds the answer first.
+    let hints = super::chat_hints::read(question);
+    super::chat_work::put_first(&mut tools, &hints);
     // Agent permissions: a connection the asker can't use yet is offered as
     // a sign-in card, and every call is asked of the gate first.
     if let Some(t) = super::chat_policy::sign_in_tool(&run.missing) {
@@ -2463,6 +2573,18 @@ async fn answer(
     }
 
     let mut notes = mention_note(&run.code_repos, question);
+    let offered: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+    notes.push_str(&super::chat_work::hint_note(&hints, &offered));
+    // A status question's answer is in the tickets, pull requests and runs:
+    // an answer that found nothing without looking there goes back once.
+    let must_look = hints.about_work().then(|| chat_agent::MustLook {
+        tools: super::chat_work::STATUS_TOOLS
+            .iter()
+            .filter(|t| offered.contains(t))
+            .map(|t| t.to_string())
+            .collect(),
+        what: "the team's tickets, pull requests and Coderhelm's runs".into(),
+    });
     notes.push_str(&run.run_note);
     if !problems.is_empty() {
         notes.push_str(&format!(
@@ -2490,6 +2612,7 @@ async fn answer(
         gate,
         defs: tools,
         used: Used::default(),
+        called: Vec::new(),
     };
     let model = chat_agent::ApiModel {
         http: reqwest::Client::new(),
@@ -2504,6 +2627,7 @@ async fn answer(
         messages,
         question,
         limits: chat_agent::LIMITS,
+        must_look,
     };
     let out = chat_agent::run(&model, &mut toolbox, sink, &mut reg, ask)
         .await
@@ -2913,6 +3037,66 @@ mod tests {
         assert!(system_prompt(&repos, false).contains("can't read these repositories"));
         assert!(mention_note(&repos, "How is api put together?").contains("acme/api"));
         assert_eq!(mention_note(&repos, "How do refunds work?"), "");
+    }
+
+    #[test]
+    fn the_teams_work_is_its_own_source_and_read_by_default() {
+        for t in super::super::chat_work::TOOLS {
+            assert_eq!(kind_of_tool(t), super::super::chat_work::SOURCE_KEY);
+        }
+        let p = resolve_picks(None, &[], &[], &["acme/web".into()]);
+        assert!(p.work && p.allows("work"));
+        // Mentioning a repository narrows the code, never where work stands.
+        let m = resolve_picks(
+            None,
+            &[Mention {
+                kind: "repo".into(),
+                id: "acme/web".into(),
+            }],
+            &[],
+            &["acme/web".into()],
+        );
+        assert!(m.work && m.code);
+        // An older client's picks without it leave it off.
+        let old: Picks = serde_json::from_value(json!({"code": true})).unwrap();
+        assert!(!old.work);
+        // "What's the latest on <a run's title>" reads the work, not only code.
+        let runs = vec![run("Embed the portal", "acme/web")];
+        let q = starter_questions(&[], &["acme/web".into()], &runs);
+        let latest = q
+            .iter()
+            .find(|s| s.question.starts_with("What's the latest"))
+            .unwrap();
+        assert!(latest.sources.work && latest.sources.code);
+    }
+
+    #[test]
+    fn a_query_waits_for_its_schema_once() {
+        let offered = vec![
+            json!({"name": "live_describe"}),
+            json!({"name": "live_lookup"}),
+        ];
+        let note = schema_first("live_lookup", &[], &offered).unwrap();
+        assert!(note.contains("live_describe") && note.contains("Don't guess"));
+        assert!(schema_first("live_lookup", &["live_describe".into()], &offered).is_none());
+        // Once: the second try runs.
+        assert!(schema_first("live_lookup", &["live_lookup".into()], &offered).is_none());
+        // No schema tool offered: nothing to read first.
+        assert!(schema_first("db_query", &[], &[json!({"name": "db_query"})]).is_none());
+        assert!(schema_first("github__read_file", &[], &offered).is_none());
+    }
+
+    #[test]
+    fn a_run_mention_says_why_it_stopped_from_the_runs_own_field() {
+        let item = HashMap::from([
+            ("run_id".to_string(), AttributeValue::S("r1".into())),
+            ("status".to_string(), AttributeValue::S("failed".into())),
+            (
+                "error_message".to_string(),
+                AttributeValue::S("The build broke".into()),
+            ),
+        ]);
+        assert!(run_context_line(&item).contains("It stopped with: The build broke"));
     }
 
     #[test]

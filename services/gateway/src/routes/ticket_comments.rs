@@ -42,6 +42,9 @@ pub struct Incoming<'a> {
     pub author: &'a str,
     /// The tracker's account type for the author (`Bot`, `app`, ...).
     pub author_kind: &'a str,
+    /// The tracker's id of the author (Jira's account id), for a mention
+    /// in a reply to the comment.
+    pub author_id: &'a str,
     pub text: &'a str,
     pub title: &'a str,
     /// The ticket's latest run and its status; empty when it has none.
@@ -75,6 +78,7 @@ pub async fn take(store: &dyn Store, inc: &Incoming<'_>) -> Result<Received, Str
         source: inc.source,
         comment_id: tc::comment_id(inc.comment_id, inc.author, inc.text),
         author: inc.author.trim().to_string(),
+        author_id: inc.author_id.trim().to_string(),
         text: common::truncate_str(inc.text.trim(), tc::MAX_TEXT_CHARS).to_string(),
         at: chrono::Utc::now().to_rfc3339(),
         run_id: if working {
@@ -390,6 +394,7 @@ pub async fn on_github_issue_comment(
             comment_id: &id,
             author,
             author_kind: kind,
+            author_id: "",
             text,
             title: payload["issue"]["title"].as_str().unwrap_or(""),
             run_id: &run.run_id,
@@ -491,20 +496,22 @@ async fn reply(state: &AppState, inc: &Incoming<'_>) {
         );
         return;
     };
-    let payload = json!({
-        "issueKey": inc.ticket_id,
-        "comment": tc::ack_reply(),
-        "commentType": "info",
-        "title": "Comment received",
-    });
-    match state.http.post(url).json(&payload).send().await {
-        Ok(r) if r.status().is_success() => {}
-        Ok(r) => warn!(
-            ticket_id = inc.ticket_id,
-            status = r.status().as_u16(),
-            "Jira refused the acknowledgement"
-        ),
-        Err(e) => warn!(ticket_id = inc.ticket_id, error = %e, "Jira acknowledgement failed"),
+    // Through the conversation layer: the comment that just arrived is
+    // acknowledged by name and quote, and a second one before CoderHelm
+    // spoke again is named in the same reply.
+    let say = common::conversation::Say::status("comment-received", tc::ack_reply());
+    if let Err(e) = super::conversation::jira_at(
+        state,
+        inc.team_id,
+        url,
+        inc.ticket_id,
+        say,
+        "info",
+        "Comment received",
+    )
+    .await
+    {
+        warn!(ticket_id = inc.ticket_id, error = %e, "Jira acknowledgement failed");
     }
 }
 

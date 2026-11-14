@@ -852,9 +852,14 @@ async fn own_pr_failures(
                 .await;
                 let body = e2e_rounds_ended_note(&caused, &why);
                 super::add_progress_note(state, &msg.team_id, &run_id, &body).await;
-                let _ = gh
-                    .create_issue_comment(&msg.repo_owner, &msg.repo_name, pr, &body)
-                    .await;
+                let _ = crate::passes::conversation::github(
+                    gh,
+                    &msg.repo_owner,
+                    &msg.repo_name,
+                    pr,
+                    common::conversation::Say::note("e2e", &body),
+                )
+                .await;
                 return;
             }
         };
@@ -949,10 +954,15 @@ async fn own_pr_failures(
     } else {
         format!("The E2E failures are still there after a re-run, for reasons outside this change:\n\n{items}\n\nThey don't come from this change, so CoderHelm doesn't change this pull request's code for them; its own work is done.")
     };
-    if gh
-        .create_issue_comment(&msg.repo_owner, &msg.repo_name, pr, &body)
-        .await
-        .is_ok()
+    if crate::passes::conversation::github(
+        gh,
+        &msg.repo_owner,
+        &msg.repo_name,
+        pr,
+        common::conversation::Say::note("e2e", &body),
+    )
+    .await
+    .is_ok()
     {
         t[&flag] = json!(true);
         let _ = st
@@ -1156,17 +1166,28 @@ async fn note_rescued(st: &Store<'_>, gh: &GitHubClient, msg: &TestIngest, run: 
     let repo = format!("{}/{}", msg.repo_owner, msg.repo_name);
     let body = rescued_note(&run.workflow, &run.sha, &run.quarantined_tests);
     if let Ok(Some(id)) = st.pr_note(&msg.team_id, &repo, pr).await {
-        if gh
-            .edit_issue_comment(&msg.repo_owner, &msg.repo_name, id, &body)
-            .await
-            .is_ok()
+        if crate::passes::conversation::edit_own(
+            gh,
+            &msg.repo_owner,
+            &msg.repo_name,
+            id,
+            "e2e-rescued",
+            &body,
+        )
+        .await
+        .is_ok()
         {
             return;
         }
     }
-    match gh
-        .create_issue_comment(&msg.repo_owner, &msg.repo_name, pr, &body)
-        .await
+    match crate::passes::conversation::github(
+        gh,
+        &msg.repo_owner,
+        &msg.repo_name,
+        pr,
+        common::conversation::Say::status("e2e-rescued", &body),
+    )
+    .await
     {
         Ok(c) => {
             if let Some(id) = c["id"].as_u64() {
@@ -1352,8 +1373,7 @@ async fn begin_fix_proof(gh: &GitHubClient, f: &FixPr<'_>, r: &mut TestRecord, n
             let e = quarantine::fix_failed(r, chrono::Utc::now(), &format!("Fix refused: {why}."));
             r.events.push(e);
             if let Some(pr) = f.pr {
-                let _ = gh
-                    .create_issue_comment(f.owner, f.repo, pr, &format!("This fix can't be used as is: {why}. A fix has to make the test pass without loosening it, so this PR stays a draft."))
+                let _ = crate::passes::conversation::github(gh, f.owner, f.repo, pr, common::conversation::Say::note("e2e", format!("This fix can't be used as is: {why}. A fix has to make the test pass without loosening it, so this PR stays a draft.")))
                     .await;
             }
             return;
@@ -1551,8 +1571,7 @@ async fn follow_fix(
                     format!("Fix held for {total} of {total} repeat runs."),
                 ));
                 if let Some(pr) = pr {
-                    let _ = gh
-                        .create_issue_comment(&msg.repo_owner, &msg.repo_name, pr, &format!("The fix held: `{}` passed {total} of {total} repeat runs. Ready for review.", r.title))
+                    let _ = crate::passes::conversation::github(gh, &msg.repo_owner, &msg.repo_name, pr, common::conversation::Say::note("e2e", format!("The fix held: `{}` passed {total} of {total} repeat runs. Ready for review.", r.title)))
                         .await;
                     super::resume::mark_e2e_pr_ready(
                         state,
@@ -1572,8 +1591,7 @@ async fn follow_fix(
                 );
                 r.events.push(e);
                 if let Some(pr) = pr {
-                    let _ = gh
-                        .create_issue_comment(&msg.repo_owner, &msg.repo_name, pr, &format!("The fix didn't hold: `{}` still failed {failures} of {total} repeat runs, so this PR stays a draft.", r.title))
+                    let _ = crate::passes::conversation::github(gh, &msg.repo_owner, &msg.repo_name, pr, common::conversation::Say::note("e2e", format!("The fix didn't hold: `{}` still failed {failures} of {total} repeat runs, so this PR stays a draft.", r.title)))
                         .await;
                 }
             }
@@ -1624,17 +1642,11 @@ async fn no_burn_in_note(
         "Fix opened without repeat runs: the E2E workflow can't be started with repeats.".into(),
     ));
     if let Some(pr) = pr {
-        let _ = gh
-            .create_issue_comment(
-                owner,
-                repo,
-                pr,
-                &format!(
+        let _ = crate::passes::conversation::github(gh, owner, repo, pr, common::conversation::Say::note("e2e", format!(
                     "Coderhelm couldn't prove this fix with repeat runs, because the E2E workflow has no `workflow_dispatch` input for repeats, so it's ready for review without them. Run `{}` about 20 times (e.g. `npx playwright test --grep \"{}\" --repeat-each=20`) before merging. Adding a `repeat_each` input to the workflow lets Coderhelm do this itself.",
                     r.title,
                     grep_for(std::slice::from_ref(&r.title))
-                ),
-            )
+                )))
             .await;
     }
 }
@@ -2155,8 +2167,7 @@ async fn follow_generated(
                 }
                 _ => {
                     if let Some(pr) = run.pr {
-                        let _ = gh
-                            .create_issue_comment(&msg.repo_owner, &msg.repo_name, pr, &format!("CoderHelm couldn't run the new test {GENERATED_RUNS} times: the E2E workflow has no repeat input, or the new test wasn't in this run. Its one passing run is the evidence so far; a `repeat` input on the E2E workflow lets CoderHelm run it {GENERATED_RUNS} times itself."))
+                        let _ = crate::passes::conversation::github(gh, &msg.repo_owner, &msg.repo_name, pr, common::conversation::Say::note("e2e", format!("CoderHelm couldn't run the new test {GENERATED_RUNS} times: the E2E workflow has no repeat input, or the new test wasn't in this run. Its one passing run is the evidence so far; a `repeat` input on the E2E workflow lets CoderHelm run it {GENERATED_RUNS} times itself.")))
                             .await;
                     }
                 }
@@ -2187,7 +2198,7 @@ async fn follow_generated(
             if failures > 0 {
                 rec.phase = Some("failed".into());
                 if let Some(pr) = pr {
-                    let _ = gh.create_issue_comment(&msg.repo_owner, &msg.repo_name, pr, &format!("The new test isn't reliable yet: it failed {failures} time(s) in {GENERATED_RUNS} repeat runs, so this PR stays a draft.")).await;
+                    let _ = crate::passes::conversation::github(gh, &msg.repo_owner, &msg.repo_name, pr, common::conversation::Say::note("e2e", format!("The new test isn't reliable yet: it failed {failures} time(s) in {GENERATED_RUNS} repeat runs, so this PR stays a draft."))).await;
                 }
             } else if let Some(fix_pr) = rec
                 .evidence
@@ -2229,7 +2240,7 @@ async fn follow_generated(
             } else {
                 rec.phase = Some("proven".into());
                 if let Some(pr) = pr {
-                    let _ = gh.create_issue_comment(&msg.repo_owner, &msg.repo_name, pr, &format!("The new test passed {GENERATED_RUNS} of {GENERATED_RUNS} repeat runs. Ready for review.")).await;
+                    let _ = crate::passes::conversation::github(gh, &msg.repo_owner, &msg.repo_name, pr, common::conversation::Say::note("e2e", format!("The new test passed {GENERATED_RUNS} of {GENERATED_RUNS} repeat runs. Ready for review."))).await;
                     super::resume::mark_e2e_pr_ready(
                         state,
                         gh,
@@ -2257,7 +2268,7 @@ async fn follow_generated(
             if failed_on_base {
                 rec.phase = Some("proven".into());
                 if let Some(pr) = pr {
-                    let _ = gh.create_issue_comment(&msg.repo_owner, &msg.repo_name, pr, &format!("The new test passed {GENERATED_RUNS} of {GENERATED_RUNS} repeat runs, and it fails on the code from before the bug fix, so it would have caught the bug. Ready for review.")).await;
+                    let _ = crate::passes::conversation::github(gh, &msg.repo_owner, &msg.repo_name, pr, common::conversation::Say::note("e2e", format!("The new test passed {GENERATED_RUNS} of {GENERATED_RUNS} repeat runs, and it fails on the code from before the bug fix, so it would have caught the bug. Ready for review."))).await;
                     super::resume::mark_e2e_pr_ready(
                         state,
                         gh,
@@ -2271,7 +2282,7 @@ async fn follow_generated(
             } else {
                 rec.phase = Some("failed".into());
                 if let Some(pr) = pr {
-                    let _ = gh.create_issue_comment(&msg.repo_owner, &msg.repo_name, pr, "The new test is reliable, but it also passes on the code from before the bug fix, so it wouldn't have caught the bug. It stays a draft: the test should check the behaviour the fix changed.").await;
+                    let _ = crate::passes::conversation::github(gh, &msg.repo_owner, &msg.repo_name, pr, common::conversation::Say::note("e2e", "The new test is reliable, but it also passes on the code from before the bug fix, so it wouldn't have caught the bug. It stays a draft: the test should check the behaviour the fix changed.")).await;
                 }
             }
         }

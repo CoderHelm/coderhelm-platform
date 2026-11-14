@@ -976,7 +976,7 @@ async fn handle_review_comment(
                 comment_id,
                 root,
                 mentioned = ask.is_some(),
-                "Reviewer: thread reply → review job"
+                "Reviewer: thread reply: review job"
             );
             ReviewMessage {
                 team_id: team_id.to_string(),
@@ -1008,7 +1008,7 @@ async fn handle_review_comment(
                 name,
                 pr_number,
                 is_rereview = ask.rereview,
-                "Reviewer: thread reply → review job"
+                "Reviewer: thread reply: review job"
             );
             if ask.rereview {
                 record_rereview(
@@ -1222,7 +1222,7 @@ async fn handle_quote_reply(
     let body = payload["comment"]["body"].as_str().unwrap_or("");
     info!(
         owner,
-        name, pr_number, comment_id, "Reviewer: quote reply → review job"
+        name, pr_number, comment_id, "Reviewer: quote reply: review job"
     );
     let message = ReviewMessage {
         team_id: team_id.to_string(),
@@ -1498,7 +1498,7 @@ async fn handle_issue_comment(
             )
             .await;
 
-            info!(pr_number, commenter, "PR comment → feedback queue");
+            info!(pr_number, commenter, "PR comment: feedback queue");
             let message = WorkerMessage::Feedback(FeedbackMessage {
                 team_id: team_id.to_string(),
                 installation_id,
@@ -1550,7 +1550,7 @@ async fn handle_issue_comment(
                 let question = ask.question;
                 info!(
                     owner,
-                    name, pr_number, is_rereview, "Reviewer: reply → review job"
+                    name, pr_number, is_rereview, "Reviewer: reply: review job"
                 );
                 // Idempotency key = this comment's id. A webhook GitHub delivers
                 // more than once (at-least-once) carries the SAME comment id, so
@@ -1761,7 +1761,7 @@ async fn resume_outstanding(
         commenter,
         held = work.held,
         wip_branch = %work.wip_branch,
-        "Mention on CoderHelm's PR → resuming its outstanding round"
+        "Mention on CoderHelm's PR: resuming its outstanding round"
     );
     let message = WorkerMessage::Feedback(FeedbackMessage {
         team_id: team_id.to_string(),
@@ -1854,7 +1854,7 @@ async fn handle_pull_request(
         }
         info!(
             owner,
-            name, pr_number, "Reviewer: native re-request review → review job"
+            name, pr_number, "Reviewer: native re-request review: review job"
         );
         // Every press is its own ask and gets its own verdict; only a
         // redelivery of the same event is the same job.
@@ -2792,7 +2792,7 @@ async fn handle_pr_review(
                     name,
                     pr_number,
                     is_rereview = ask.rereview,
-                    "Reviewer: review body → review job"
+                    "Reviewer: review body: review job"
                 );
                 if ask.rereview {
                     record_rereview(
@@ -3974,7 +3974,7 @@ async fn handle_tag_push(
     }
     info!(
         owner,
-        name, tag, sender, "Release notes: tag pushed outside CoderHelm → release notes job"
+        name, tag, sender, "Release notes: tag pushed outside CoderHelm: release notes job"
     );
     let message = WorkerMessage::ReleaseNotes(ReleaseNotesMessage {
         team_id: team_id.to_string(),
@@ -4196,7 +4196,7 @@ async fn handle_push(
         owner,
         name,
         full = changed_files.is_none(),
-        "Push on default branch → code-graph index"
+        "Push on default branch: code-graph index"
     );
     let message = WorkerMessage::GraphIndex(GraphIndexMessage {
         team_id: team_id.to_string(),
@@ -4910,7 +4910,7 @@ fn attr_n(val: impl std::fmt::Display) -> aws_sdk_dynamodb::types::AttributeValu
 pub fn limit_reason(hit: &common::token_limits::LimitUse) -> String {
     use common::token_limits::{short_tokens, LimitKind};
     let settings = format!(
-        "[Settings → Token Limit]({}/settings/budget)",
+        "[Token limit settings]({}/settings/budget)",
         common::public_urls::app_url_from_env()
     );
     match hit.kind {
@@ -5012,20 +5012,11 @@ pub(crate) async fn post_limit_comment(
         }
     };
 
-    let url = format!("https://api.github.com/repos/{owner}/{repo}/issues/{issue_number}/comments");
-    let body = serde_json::json!({
-        "body": format!("⚠️ **Coderhelm — run skipped**\n\n{reason}")
-    });
-
-    if let Err(e) = state
-        .http
-        .post(&url)
-        .header("Authorization", format!("Bearer {token}"))
-        .header("Accept", "application/vnd.github+json")
-        .header("User-Agent", "Coderhelm-bot")
-        .json(&body)
-        .send()
-        .await
+    let say = common::conversation::Say::status(
+        "run",
+        format!("**CoderHelm skipped this run.** {reason}"),
+    );
+    if let Err(e) = super::conversation::github(state, &token, owner, repo, issue_number, say).await
     {
         warn!("Failed to post limit comment: {e}");
     }

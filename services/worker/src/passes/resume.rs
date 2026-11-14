@@ -4745,10 +4745,14 @@ async fn run_conflict_round(
                  the review of the new commit.",
                 common::truncate_str(&why, 300)
             );
-            if let Err(e) = ctx
-                .github
-                .create_issue_comment(pr.owner, pr.repo, pr.number, &comment)
-                .await
+            if let Err(e) = crate::passes::conversation::github(
+                &ctx.github,
+                pr.owner,
+                pr.repo,
+                pr.number,
+                common::conversation::Say::status("conflict", &comment),
+            )
+            .await
             {
                 warn!(run_id = msg.run_id, error = %e, "Could not hand the conflict off on the PR");
             }

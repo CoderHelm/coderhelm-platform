@@ -389,6 +389,11 @@ pub struct Finding {
     /// [`classify`]; never read from the judge.
     #[serde(skip)]
     pub ci_cmd: String,
+    /// What the decision is about (`fix location`), when its writer named
+    /// it: the key that makes rewordings of one decision one item
+    /// (`common::person_gate::key`). Set by code, never by the judge.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub topic: String,
     /// Why the item is still open after the settle stage, set only by it
     /// (`settle::apply`): the reason only a person can settle it, or what
     /// CoderHelm ran and what came back. Never read from the judge.
@@ -435,7 +440,7 @@ impl Finding {
         match self.point.trim() {
             "ci_pending" => "Waiting on CI",
             "check_blocked" => "Check not passed",
-            JUDGE_ASSUMPTION => "Assumed instead of asking",
+            JUDGE_ASSUMPTION => "Your yes or no",
             "rule_failing" => "New-feature rule failing",
             "manual_check" => "Check by hand",
             "unrun_check" => "Check not run",
@@ -483,7 +488,10 @@ impl Finding {
                     self.ci_cmd
                 )
             }
-            (_, s) if !s.is_empty() => format!(" Settle: {s}"),
+            // Only an item a person settles says how; CoderHelm's own items
+            // say what settles them, never as a chore for the reader.
+            (_, s) if !s.is_empty() && self.needs.contains("CoderHelm can't:") => String::new(),
+            (_, s) if !s.is_empty() => format!(" What settles it: {s}"),
             (Settler::Ci, _) => " Settles when this PR's CI passes.".to_string(),
             _ => String::new(),
         };
@@ -502,17 +510,44 @@ fn capped(text: &str, max: usize) -> String {
     if flat.chars().count() <= max {
         return flat;
     }
-    let cut: String = flat.chars().take(max).collect();
-    let at_word = match cut.rfind(' ') {
-        Some(i) if i > 0 => &cut[..i],
-        _ => cut.as_str(),
-    };
-    format!("{}…", at_word.trim_end_matches([',', ';', ':']))
+    // Whole sentences while they fit, and always the first: a sentence is
+    // never cut off with an ellipsis (`person_gate::keeps_the_rules`).
+    let mut out = String::new();
+    for s in sentences(&flat) {
+        if !out.is_empty() && out.chars().count() + 1 + s.chars().count() > max {
+            break;
+        }
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(&s);
+    }
+    out
 }
 
-/// The first sentence of `text`, whitespace collapsed, cut to `max`
-/// characters at a word boundary (with an ellipsis) when longer.
-fn sentence(text: &str, max: usize) -> String {
+/// `text`'s sentences, in order.
+fn sentences(flat: &str) -> Vec<String> {
+    let chars: Vec<char> = flat.chars().collect();
+    let mut out = Vec::new();
+    let mut start = 0;
+    for i in 0..chars.len() {
+        if matches!(chars[i], '.' | '!' | '?')
+            && chars.get(i + 1) == Some(&' ')
+            && chars.get(i + 2).is_some_and(|c| c.is_uppercase())
+        {
+            out.push(chars[start..=i].iter().collect::<String>());
+            start = i + 2;
+        }
+    }
+    if start < chars.len() {
+        out.push(chars[start..].iter().collect());
+    }
+    out
+}
+
+/// The first sentence of `text`, whitespace collapsed, whole: the layout
+/// gives a long one its room, it is never cut off with an ellipsis.
+fn sentence(text: &str, _max: usize) -> String {
     let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
     // A sentence ends at `.`, `!` or `?` followed by a space and a capital
     // letter, so `e.g. this` and `v1.2` stay whole.
@@ -527,16 +562,7 @@ fn sentence(text: &str, max: usize) -> String {
             break;
         }
     }
-    let first: String = chars[..end].iter().collect();
-    if first.chars().count() <= max {
-        return first;
-    }
-    let cut: String = first.chars().take(max).collect();
-    let at_word = match cut.rfind(' ') {
-        Some(i) if i > 0 => &cut[..i],
-        _ => cut.as_str(),
-    };
-    format!("{}…", at_word.trim_end_matches([',', ';', ':']))
+    chars[..end].iter().collect()
 }
 
 /// How a finding was tied to the CI command that settles it.
@@ -2135,7 +2161,7 @@ mod tests {
         assert!(!top.contains("[!WARNING]"));
         assert!(top
             .contains("\n- **Unconfirmed external field or behaviour:** No lookup against vendor"));
-        assert!(top.contains("Settle: Read one real record from vendor"));
+        assert!(top.contains("What settles it: Read one real record from vendor"));
         assert!(!top.contains(CI_MARK));
         assert_eq!(settle_by_ci(&format!("{top}Body")), None);
         assert_eq!(unconfirmed_facts(&top).len(), 1);
@@ -2546,13 +2572,13 @@ mod tests {
         let line = f.line();
         assert_eq!(
             line,
-            "- **Impact not measured:** Affected bookings were not counted. Settle: Count them \
-             in the warehouse, e.g. by season."
+            "- **Impact not measured:** Affected bookings were not counted. What settles it: \
+             Count them in the warehouse, e.g. by season."
         );
-        // A run-on sentence is cut at a word boundary.
+        // A run-on sentence is kept whole: never cut off with an ellipsis.
         let long = sentence(&"word ".repeat(100), 30);
-        assert_eq!(long, "word word word word word word…");
-        assert!(long.chars().count() <= 31);
+        assert_eq!(long, "word ".repeat(100).trim());
+        assert!(!long.contains('…'));
         // A pending item says what settles it even when the judge didn't.
         let p = check_finding("ci_pending", "lint");
         assert!(p.line().ends_with("Settles when this PR's CI passes."));

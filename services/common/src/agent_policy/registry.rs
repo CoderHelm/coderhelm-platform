@@ -227,6 +227,12 @@ pub const BUILTIN: &[(&str, Risk)] = &[
     ("ask_team_agent", Risk::Read),
     // Knowledge bases (the brain's search tool, and a plugin's).
     ("search_knowledge", Risk::Read),
+    // Chat's lookups of the team's work (gateway/src/routes/chat_work.rs).
+    ("work_tickets", Risk::Read),
+    ("work_pull_requests", Risk::Read),
+    ("work_runs", Risk::Read),
+    ("work_findings", Risk::Read),
+    ("work_records", Risk::Read),
     // A chat asking the person to connect an account (shows a sign-in card).
     ("request_sign_in", Risk::Read),
     // Plugin runs: the plugin's own skills, and drafts kept in CoderHelm

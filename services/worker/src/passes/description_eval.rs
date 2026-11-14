@@ -351,10 +351,14 @@ pub fn feature_case() -> Case {
             "`none, because",
             // The ticket restated.
             "New work: the ticket asks",
+            // A look given to a person as a chore of its own.
+            "2. Look at Studio",
+            "how a page looks is a judgement only a person can make",
         ],
         in_sight: vec![
             "**Needed from you:**\n1. After merging: Deploy the staging Studio: run `cd apps/studio && npm run deploy:staging`. CoderHelm could not: CoderHelm's GitHub App is not allowed to start workflows in this repository. To let it: grant the app \"Actions: write\" (GitHub, Settings, Installed GitHub Apps, CoderHelm, Permissions). (a repository admin)",
-            "2. Look at Studio: the page document, the title field. CoderHelm cannot: how a page looks is a judgement only a person can make. (the reviewer)",
+            // A look belongs to the merge decision, never a separate chore.
+            "Your merge decision also signs off: Look at Studio: the page document, the title field.",
             "**Check:** `npm test --workspace apps/studio`; 2 recorded checks passed on `9f8e7d6`.",
         ],
         collapsed: vec![
@@ -437,9 +441,127 @@ pub fn ticket_case() -> Case {
     }
 }
 
+// ── Case 4: a security update that handed its own work to a person ──────
+
+/// What the settle stage now writes for the security update's items
+/// (incident `bf_owns_the_work`): the registry lookup run, the nine
+/// wordings of one ticket-settled decision one note, nothing for a person.
+pub fn owned_body() -> String {
+    use super::proof::{self, Finding};
+    use super::settle;
+    let mut items: Vec<Finding> = (0..9)
+        .map(|i| Finding {
+            point: proof::JUDGE_ASSUMPTION.into(),
+            topic: "fix location".into(),
+            detail: format!(
+                "The ticket is an explicit, self-contained security-update request (wording {i}), so CoderHelm opens a new pull request applying the planned lockfile bumps."
+            ),
+            ..Default::default()
+        })
+        .collect();
+    items.push(Finding {
+        point: "external_fact".into(),
+        detail: "The new version of left-pad is not confirmed against the registry.".into(),
+        settle: "Run npm view left-pad@4.18.0 maintainers dist.integrity and compare the result to the lockfile hash.".into(),
+        ..Default::default()
+    });
+    let rec = settle::Record {
+        head: "77aa88bb99cc".into(),
+        registry_checked: true,
+        registry: vec![
+            "`left-pad@4.18.0`: lockfile integrity matches the registry; maintainers alice".into(),
+        ],
+        ..Default::default()
+    };
+    let facts = settle::Facts {
+        intent: super::triage::TicketIntent::Chore,
+        planned_by_rules: true,
+        dep_change: true,
+        checks_owed: false,
+    };
+    let s = settle::apply(items, &facts, &rec);
+    format!(
+        "## Summary\n\nSecurity updates for web.\n\n{}\n\n{}",
+        proof::gaps_section(&s.open),
+        settle::settled_section(&s, &rec)
+    )
+}
+
+pub fn owned_case() -> Case {
+    let body = owned_body();
+    let files = vec![(
+        "package-lock.json".to_string(),
+        "modified".to_string(),
+        String::new(),
+    )];
+    let floor = super::pr_risk::floor(&files, &HashMap::new());
+    let checks = vec![passed("build"), passed("unit tests")];
+    let facts = description_facts::facts(&Inputs {
+        head: "77aa88bb99cc",
+        body: &body,
+        files: &files,
+        floor: &floor,
+        checks: Some(&checks),
+        why: None,
+        dependency: Some(DependencyFacts {
+            lines: vec![DepLine {
+                package: "left-pad".into(),
+                from: "3.0.0".into(),
+                to: "4.18.0".into(),
+                moved: true,
+                major: true,
+                remaining: vec![],
+            }],
+            majors: vec![common::pr_facts::MajorEvidence {
+                package: "left-pad".into(),
+                from: "3.0.0".into(),
+                to: "4.18.0".into(),
+                evidence: vec![
+                    "1 call site uses `pad`, unchanged in 4.x; 41 tests passed on the new version"
+                        .into(),
+                ],
+            }],
+            ..Default::default()
+        }),
+        outside: None,
+        run_url: "https://app.example.com/runs/detail?id=run-sec",
+        notes: vec![],
+        evidence: vec![],
+    });
+    Case {
+        name: "a security update that handed its own work to a person",
+        before: body,
+        title: "fix(deps): security updates for web (1 package)",
+        facts,
+        reply: None,
+        flagged: vec![
+            "Assumed instead of asking",
+            "delete this line",
+            "Only a person can settle this",
+            "Run npm view",
+            "Feedback wanted",
+            "…",
+            "and 3 more, under Open items",
+        ],
+        in_sight: vec![
+            "**Needed from you:** Nothing.",
+            "CoderHelm's conclusion: the major version jump is safe for this code",
+        ],
+        collapsed: vec![
+            "lockfile integrity matches the registry",
+            "(settled by the ticket)",
+        ],
+    }
+}
+
 /// Every case of the eval.
 pub fn cases() -> Vec<Case> {
-    vec![dependency_case(), feature_case(), ticket_case()]
+    vec![
+        dependency_case(),
+        feature_case(),
+        ticket_case(),
+        owned_case(),
+    ]
 }
 
 /// What one case's result fails on, in words; empty when it passes.

@@ -65,7 +65,7 @@ pub fn release_notes_failed(owner: &str, repo: &str, tag: &str, error: &str) -> 
             Block::Text(Text::new(title).bold().color(Tone::Attention)),
             Block::Text(Text::new(crate::truncate_str(error, 500))),
             Block::Text(
-                Text::new("Send them again from CoderHelm → Releases once fixed.").subtle(),
+                Text::new("Send them again from CoderHelm under Releases once fixed.").subtle(),
             ),
         ],
         buttons: vec![],

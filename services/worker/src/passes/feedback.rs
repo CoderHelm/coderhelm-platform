@@ -558,14 +558,17 @@ pub async fn run(
         let line = w.pickup_line();
         if constraints.may_comment() && !msg.trigger_author.trim().is_empty() {
             super::add_progress_note(state, &msg.team_id, &msg.run_id, &line).await;
-            if let Err(e) = github
-                .create_issue_comment(
-                    &msg.repo_owner,
-                    &msg.repo_name,
-                    msg.pr_number,
-                    &addressed(&msg.trigger_author, &line),
-                )
-                .await
+            if let Err(e) = crate::passes::conversation::github(
+                &github,
+                &msg.repo_owner,
+                &msg.repo_name,
+                msg.pr_number,
+                common::conversation::Say::reply_all(
+                    "feedback",
+                    addressed(&msg.trigger_author, &line),
+                ),
+            )
+            .await
             {
                 warn!(run_id = %msg.run_id, error = %e, "Could not say the held work is being picked up");
             }
@@ -1592,14 +1595,17 @@ Rules:
         }
         Some(line) => {
             // Inline threads carry the rest: the update gets its own reply.
-            github
-                .create_issue_comment(
-                    &msg.repo_owner,
-                    &msg.repo_name,
-                    msg.pr_number,
-                    &addressed(&msg.trigger_author, line),
-                )
-                .await?;
+            crate::passes::conversation::github(
+                &github,
+                &msg.repo_owner,
+                &msg.repo_name,
+                msg.pr_number,
+                common::conversation::Say::reply_all(
+                    "feedback",
+                    addressed(&msg.trigger_author, line),
+                ),
+            )
+            .await?;
             response
         }
         None => response,
@@ -1631,9 +1637,14 @@ Rules:
         // A person's top-level comment (or review body) addressed to CoderHelm
         // has no inline thread to answer in: reply on the PR, to them, so
         // nobody is left unanswered.
-        github
-            .create_issue_comment(&msg.repo_owner, &msg.repo_name, msg.pr_number, &reply)
-            .await?;
+        crate::passes::conversation::github(
+            &github,
+            &msg.repo_owner,
+            &msg.repo_name,
+            msg.pr_number,
+            common::conversation::Say::reply_all("feedback", &reply),
+        )
+        .await?;
         info!(run_id = %msg.run_id, author = %msg.trigger_author, "Replied to a top-level PR comment");
     } else if actionable_comments.is_empty() {
         // CI-only fix — the commit diff speaks for itself, no comment needed
@@ -1650,15 +1661,15 @@ Rules:
             if i == last {
                 reply.push_str(&consulted);
             }
-            github
-                .reply_to_review_comment(
-                    &msg.repo_owner,
-                    &msg.repo_name,
-                    msg.pr_number,
-                    comment.comment_id.unwrap(),
-                    &reply,
-                )
-                .await?;
+            crate::passes::conversation::review_reply(
+                &github,
+                &msg.repo_owner,
+                &msg.repo_name,
+                msg.pr_number,
+                comment.comment_id.unwrap(),
+                &reply,
+            )
+            .await?;
         }
     } else {
         // Fallback — reply to the first review thread
@@ -1673,15 +1684,15 @@ Rules:
         };
         let reply = format!("{reply}{consulted}");
         if let Some(comment_id) = actionable_comments.first().and_then(|c| c.comment_id) {
-            github
-                .reply_to_review_comment(
-                    &msg.repo_owner,
-                    &msg.repo_name,
-                    msg.pr_number,
-                    comment_id,
-                    &reply,
-                )
-                .await?;
+            crate::passes::conversation::review_reply(
+                &github,
+                &msg.repo_owner,
+                &msg.repo_name,
+                msg.pr_number,
+                comment_id,
+                &reply,
+            )
+            .await?;
         }
     }
 
@@ -3263,9 +3274,14 @@ async fn handle_wrong_repo(
     let comment = format!(
         "🔀 Moving this work to `{target_repo}` as requested. This PR will be closed and a new one will be opened in the correct repository."
     );
-    let _ = github
-        .create_issue_comment(&msg.repo_owner, &msg.repo_name, msg.pr_number, &comment)
-        .await;
+    let _ = crate::passes::conversation::github(
+        github,
+        &msg.repo_owner,
+        &msg.repo_name,
+        msg.pr_number,
+        common::conversation::Say::reply_all("feedback", &comment),
+    )
+    .await;
 
     // Close the PR
     if let Err(e) = github
@@ -3479,14 +3495,17 @@ pub(crate) async fn close_own_pr_outside(
         return false;
     }
     if pr["state"].as_str() == Some("open") {
-        let _ = github
-            .create_issue_comment(
-                pr_ref.owner,
-                pr_ref.repo,
-                pr_ref.pr_number,
-                &super::lessons::closing_note(where_, cause),
-            )
-            .await;
+        let _ = crate::passes::conversation::github(
+            github,
+            pr_ref.owner,
+            pr_ref.repo,
+            pr_ref.pr_number,
+            common::conversation::Say::reply_all(
+                "feedback",
+                super::lessons::closing_note(where_, cause),
+            ),
+        )
+        .await;
         match github
             .close_pull_request(pr_ref.owner, pr_ref.repo, pr_ref.pr_number)
             .await
@@ -3563,28 +3582,35 @@ pub(crate) async fn close_own_pr_outside(
             .unwrap_or(0);
         match field("ticket_source").as_str() {
             "jira" if !ticket.is_empty() => {
-                if let Err(e) = super::post_jira_comment(
+                if let Err(e) = crate::passes::conversation::jira(
                     state,
                     pr_ref.team_id,
                     &ticket,
-                    &fix_location::jira_text(&format!("{body}{closed_line}")),
+                    common::conversation::Say::reply_all(
+                        "feedback",
+                        fix_location::jira_text(&format!("{body}{closed_line}")),
+                    ),
                     "clarification",
                     "Needs a change outside the code",
                 )
                 .await
+                .map(|_| ())
                 {
                     warn!(run_id = %pr_ref.run_id, error = %e, "Could not post the outside-the-code report on the ticket");
                 }
             }
             "github" if issue_number > 0 => {
-                let _ = github
-                    .create_issue_comment(
-                        pr_ref.owner,
-                        pr_ref.repo,
-                        issue_number,
-                        &format!("**Needs a change outside the code**\n\n{body}{closed_line}"),
-                    )
-                    .await;
+                let _ = crate::passes::conversation::github(
+                    github,
+                    pr_ref.owner,
+                    pr_ref.repo,
+                    issue_number,
+                    common::conversation::Say::reply_all(
+                        "feedback",
+                        format!("**Needs a change outside the code**\n\n{body}{closed_line}"),
+                    ),
+                )
+                .await;
             }
             _ => {}
         }
@@ -4306,19 +4332,28 @@ async fn finish_branch_update(
             .await
         }
         Some(id) => {
-            github
-                .reply_to_review_comment(&msg.repo_owner, &msg.repo_name, msg.pr_number, id, line)
-                .await?;
+            crate::passes::conversation::review_reply(
+                github,
+                &msg.repo_owner,
+                &msg.repo_name,
+                msg.pr_number,
+                id,
+                line,
+            )
+            .await?;
         }
         None => {
-            github
-                .create_issue_comment(
-                    &msg.repo_owner,
-                    &msg.repo_name,
-                    msg.pr_number,
-                    &addressed(&msg.trigger_author, line),
-                )
-                .await?;
+            crate::passes::conversation::github(
+                github,
+                &msg.repo_owner,
+                &msg.repo_name,
+                msg.pr_number,
+                common::conversation::Say::reply_all(
+                    "feedback",
+                    addressed(&msg.trigger_author, line),
+                ),
+            )
+            .await?;
         }
     }
     info!(run_id = %msg.run_id, pushed, "Answered a request to update the branch");

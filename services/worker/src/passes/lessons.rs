@@ -284,9 +284,14 @@ pub async fn check_comment(
     if j.also_wants_code_change {
         // Feedback goes on to change the code; say what was learned first.
         let reply = ack_reply(&j);
-        let _ = github
-            .create_issue_comment(&msg.repo_owner, &msg.repo_name, msg.pr_number, &reply)
-            .await;
+        let _ = crate::passes::conversation::github(
+            github,
+            &msg.repo_owner,
+            &msg.repo_name,
+            msg.pr_number,
+            common::conversation::Say::reply_all("lesson", &reply),
+        )
+        .await;
         return None;
     }
     // Feedback stops: the caller closes the PR with one note that says it.
@@ -578,14 +583,14 @@ async fn ask_close_reason(state: &WorkerState, github: &GitHubClient, msg: &Less
             .await;
     }
     info!(run_id = %msg.run_id, pr = msg.pr_number, "PR closed without a reason: asking once");
-    if let Err(e) = github
-        .create_issue_comment(
-            &msg.repo_owner,
-            &msg.repo_name,
-            msg.pr_number,
-            &close_reason_question(),
-        )
-        .await
+    if let Err(e) = crate::passes::conversation::github(
+        github,
+        &msg.repo_owner,
+        &msg.repo_name,
+        msg.pr_number,
+        common::conversation::Say::status("closed-reason", close_reason_question()),
+    )
+    .await
     {
         warn!(run_id = %msg.run_id, error = %e, "Could not ask why the PR was closed");
     }
