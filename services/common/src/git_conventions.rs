@@ -236,6 +236,23 @@ fn stand_in_number(number: &str) -> bool {
     number.chars().all(|c| c == '0') || counting || number.chars().all(|c| c == '9')
 }
 
+/// Whether a key-shaped token (`KEY-1`, `ABC-XXXX`, `OPS-0000`) is an
+/// example rather than a ticket: a stand-in project or a stand-in number.
+pub fn is_stand_in_key(key: &str) -> bool {
+    let Some((project, number)) = key.split_once('-') else {
+        return false;
+    };
+    stand_in_number(number)
+        || STAND_IN_PROJECTS
+            .iter()
+            .any(|p| project.eq_ignore_ascii_case(p))
+}
+
+/// Whether a word in braces or angle brackets stands for the ticket.
+pub fn is_stand_in_word(word: &str) -> bool {
+    STAND_IN_WORDS.iter().any(|w| word.eq_ignore_ascii_case(w))
+}
+
 /// The key (or stand-in) a commit subject starts with, if any. `run_key` is
 /// the run's real key: an exact match is never a stand-in.
 fn lead(subject: &str, run_key: Option<&str>) -> Option<Lead> {

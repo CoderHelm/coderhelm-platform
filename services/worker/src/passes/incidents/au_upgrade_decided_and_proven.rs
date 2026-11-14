@@ -920,5 +920,92 @@ fn the_description_carries_all_five_for_the_head_it_is_of() {
     }
     // The record round-trips through the ticket.
     let json = serde_json::to_string(&facts).unwrap();
-    assert_eq!(UpgradeFacts::from_json(&json), Some(facts));
+    assert_eq!(UpgradeFacts::from_json(&json), Some(facts.clone()));
+    // The description is shaped from the facts of the head (`av`): the
+    // section the run recorded survives the check of every written
+    // sentence and the folds, whole.
+    let unit = FixUnit {
+        repo: format!("{OWNER}/{REPO}"),
+        ecosystem: "npm".into(),
+        bumps: vec![Bump {
+            package: "shape-check".into(),
+            from: "3.2.0".into(),
+            to: "4.0.1".into(),
+            major: true,
+            manifest: LOCK.into(),
+        }],
+        ..Default::default()
+    };
+    let fs = [(
+        finding(
+            "GHSA-dddd-dddd-dddd",
+            "shape-check",
+            "3.2.0",
+            "4.0.1",
+            Scope::Runtime,
+        ),
+        FindingState::default(),
+    )];
+    let pairs: Vec<(&Finding, &FindingState)> = fs.iter().map(|(f, s)| (f, s)).collect();
+    let at_head = dep_head::resolve(
+        &unit,
+        HEAD,
+        &[LockAt {
+            path: LOCK.into(),
+            base: Some(copies(BASE)),
+            head: Some(copies(WHOLE_HEAD)),
+            why: String::new(),
+        }],
+    );
+    let check = WhatToCheck {
+        upgrade_facts: Some(facts),
+        ..Default::default()
+    };
+    let body = sec::pr_body_at_head(
+        &unit,
+        &pairs,
+        "Raised the validation library.",
+        &check,
+        &sec::BodyLinks::default(),
+        &at_head,
+    );
+    let files = vec![(LOCK.to_string(), "modified".to_string(), String::new())];
+    let floor = crate::passes::pr_risk::floor(&files, &Default::default());
+    let shaped = crate::passes::description_facts::shape(
+        &body,
+        "fix(deps): security update for shape-check",
+        crate::passes::description_facts::facts(&crate::passes::description_facts::Inputs {
+            head: HEAD,
+            body: &body,
+            files: &files,
+            floor: &floor,
+            checks: None,
+            why: None,
+            dependency: Some(common::pr_dependency::facts(
+                &unit, &pairs, &at_head, &check,
+            )),
+            outside: None,
+            run_url: "",
+            notes: vec![],
+            evidence: vec![],
+        }),
+        None,
+    );
+    let described = common::pr_layout::unfold(&shaped.body);
+    for part in [
+        "**Advisories on commit `5e1f00d`",
+        "2 remaining (1 in production, 1 development only), 0 introduced.",
+        "**Families released together**",
+        "The head installs every member at one version.",
+        "**Verified in the sandbox on commit `5e1f00d`**",
+        "- frozen install, deployment version: `npx -y pnpm@9.1.0 install --frozen-lockfile --ignore-scripts`: passes.",
+    ] {
+        assert!(
+            described.contains(part),
+            "{part} is missing from the shaped description:\n{described}"
+        );
+    }
+    // A rebuild reads the run's record through the same path.
+    let description = include_str!("../description.rs");
+    assert!(fn_src(description, "\nasync fn build(").contains("super::security_fixes::at_head("));
 }

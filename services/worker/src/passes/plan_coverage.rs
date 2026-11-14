@@ -1179,7 +1179,7 @@ mod tests {
             .starts_with("Not covered: 1. Publish on production"));
         assert!(f[1]
             .detail
-            .contains("Why a person: production content needs an editor's approval"));
+            .contains("CoderHelm cannot: production content needs an editor's approval"));
         assert!(outside_note(Some(&d)).contains("1 handed out with no reason"));
         assert!(outside_findings(None).is_empty());
     }

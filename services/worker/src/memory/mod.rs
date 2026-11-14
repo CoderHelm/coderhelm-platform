@@ -591,6 +591,12 @@ impl AgentMemory {
                 Some(c) if !c.is_empty() => c,
                 _ => continue,
             };
+            // An example is not a learning: a sample ticket key or a
+            // template mark is never kept as how this repository works.
+            if common::placeholders::has(content, &[]) {
+                warn!(content, "A learning held a placeholder; it was not kept");
+                continue;
+            }
 
             let (memory_type, tag) = match ltype {
                 "style" => (MemoryType::Semantic, "code-style"),

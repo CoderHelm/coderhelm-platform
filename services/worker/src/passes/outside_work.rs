@@ -31,6 +31,7 @@
 //! "Not in this PR" section are both rendered from the same steps
 //! ([`note_markdown`], [`pr_lines`]).
 
+use common::pr_steps::{self, Checked, State, Step, When};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -304,11 +305,35 @@ fn workflow_label(text: &str) -> Option<String> {
     None
 }
 
+/// The command a workflow runs that deploys the studio or schema: a `run`
+/// line that deploys, never the words "deploy" and "studio" somewhere in
+/// the file. A test workflow that only mentions both once started for a
+/// step that said "deploy the staging Studio".
+fn deploy_command(text: &str) -> Option<String> {
+    let about_cms = {
+        let l = text.to_lowercase();
+        l.contains("studio") || l.contains("sanity") || l.contains("schema")
+    };
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.starts_with('#'))
+        .map(|l| l.trim_start_matches("- ").trim())
+        .filter_map(|l| l.strip_prefix("run:").map(str::trim))
+        .find(|l| {
+            let c = l.to_lowercase();
+            if c.contains("sanity deploy") || c.contains("sanity schema deploy") {
+                return true;
+            }
+            let runner = ["npm ", "pnpm ", "yarn ", "npx ", "make ", "sanity "]
+                .iter()
+                .any(|r| c.starts_with(r) || c.contains(&format!("&& {r}")));
+            runner && c.contains("deploy") && about_cms
+        })
+        .map(str::to_string)
+}
+
 fn deploys_studio(text: &str) -> bool {
-    let l = text.to_lowercase();
-    l.contains("sanity deploy")
-        || l.contains("sanity schema deploy")
-        || (l.contains("deploy") && l.contains("studio"))
+    deploy_command(text).is_some()
 }
 
 fn runs_e2e(text: &str) -> bool {
@@ -343,13 +368,7 @@ pub fn routes(tree: &[String], files: &[(String, String)]) -> (Vec<Route>, Vec<R
             && (path.ends_with(".yml") || path.ends_with(".yaml"));
         if workflow {
             if deploys_studio(text) {
-                let cmd = text
-                    .lines()
-                    .map(str::trim)
-                    .map(|l| l.trim_start_matches("- ").trim_start_matches("run:").trim())
-                    .find(|l| l.contains("deploy") && !l.starts_with('#') && !l.starts_with("name"))
-                    .unwrap_or("")
-                    .to_string();
+                let cmd = deploy_command(text).unwrap_or_default();
                 deploys.push(route_for(path, text, &cmd));
             }
             if runs_e2e(text) {
@@ -1255,18 +1274,104 @@ fn quote_result(s: &str) -> String {
 
 // ── Rendering: one source for the ticket note and the PR ────────────────────
 
-/// One step as both the ticket note and the PR list it, with its owner.
-pub fn step_line(n: usize, s: &NoteStep) -> (String, String) {
-    let mut t = format!("{n}. {}", one_line(&s.step));
-    if !s.how.trim().is_empty() {
-        t.push_str(&format!(
-            " How: {}.",
-            one_line(&s.how).trim_end_matches('.')
-        ));
-    }
+/// One step in the one state it is in now (`common::pr_steps`). `n` is its
+/// number among the steps; `pr_open`: the pull request exists, so nothing
+/// waits for it to open. `None` for a step the pull request itself does.
+pub fn step_now(c: &OutsideChange, i: usize, pr_open: bool) -> Option<Step> {
+    let s = c.steps.get(i)?;
+    let text = s.text();
+    let when = if text.contains("after merg") || text.contains("once merged") {
+        When::AfterMerge
+    } else if text.contains("before merg") {
+        When::BeforeMerge
+    } else {
+        When::Any
+    };
+    let (owner, state) = match s.doer() {
+        Doer::ThisPr => return None,
+        Doer::Person => (
+            match one_line(&s.owner) {
+                o if o.is_empty() => "a person on the team".to_string(),
+                o => o,
+            },
+            State::Person {
+                why: one_line(&s.why_person),
+                unblock: one_line(&s.grant),
+            },
+        ),
+        Doer::CoderHelm => {
+            let run_state = s.run.as_ref().map(|r| r.state.as_str()).unwrap_or("");
+            if s.done {
+                (
+                    "CoderHelm".to_string(),
+                    State::Done {
+                        evidence: pr_steps::strip_machinery(&s.result),
+                    },
+                )
+            } else if run_state == "waiting_approval" {
+                (
+                    "a team admin".to_string(),
+                    State::Approval {
+                        who: "a team admin".to_string(),
+                        place: "on the Agent permissions page".to_string(),
+                    },
+                )
+            } else if run_state == "running" {
+                (
+                    "CoderHelm".to_string(),
+                    State::Waiting {
+                        on: "when the workflow it started ends".to_string(),
+                    },
+                )
+            } else if !s.result.trim().is_empty() {
+                let why = s.result.trim().trim_start_matches("not done:").trim();
+                // What the executor wrote: the reason, then the access to grant.
+                let (cause, unblock) = match why.split_once("; grant:") {
+                    Some((cause, grant)) => {
+                        (pr_steps::strip_machinery(cause), pr_steps::plain(grant))
+                    }
+                    None => pr_steps::plain_error(why),
+                };
+                let owner = if unblock.contains("GitHub") || unblock.contains("Settings") {
+                    "a repository admin"
+                } else {
+                    "a person on the team"
+                };
+                (owner.to_string(), State::Failed { cause, unblock })
+            } else {
+                // Not started: what it waits for, as things stand now.
+                let blocked_by = c.steps[..i].iter().position(|b| {
+                    b.doer() != Doer::ThisPr
+                        && !b.done
+                        && matches!(
+                            b.step_kind(),
+                            StepKind::Deploy | StepKind::Content | StepKind::Migration
+                        )
+                });
+                let mut on = match (pr_open, blocked_by) {
+                    (false, _) => "when the pull request opens".to_string(),
+                    (true, Some(b)) => format!("once step {} is done", b + 1),
+                    (true, None) => "on its next step".to_string(),
+                };
+                // A production step is asked for first: who approves, where.
+                if s.target() == Target::Production
+                    && matches!(
+                        s.step_kind(),
+                        StepKind::Deploy | StepKind::Content | StepKind::Migration
+                    )
+                {
+                    on.push_str(" and a team admin has approved it on the Agent permissions page");
+                }
+                ("CoderHelm".to_string(), State::Waiting { on })
+            }
+        }
+    };
+    // What the step needs to be done right is part of what it is.
+    let mut what = one_line(&s.step);
+    let mut extra: Vec<String> = Vec::new();
     if !s.values.is_empty() {
-        t.push_str(&format!(
-            " Values: {}.",
+        extra.push(format!(
+            "values: {}",
             s.values
                 .iter()
                 .map(|v| one_line(v))
@@ -1275,8 +1380,8 @@ pub fn step_line(n: usize, s: &NoteStep) -> (String, String) {
         ));
     }
     if !s.remove.is_empty() {
-        t.push_str(&format!(
-            " Remove: {}.",
+        extra.push(format!(
+            "remove: {}",
             s.remove
                 .iter()
                 .map(|v| format!("`{}`", one_line(v)))
@@ -1285,51 +1390,146 @@ pub fn step_line(n: usize, s: &NoteStep) -> (String, String) {
         ));
     }
     if !s.minimum.trim().is_empty() {
-        t.push_str(&format!(
-            " At least: {}.",
+        extra.push(format!(
+            "at least: {}",
             one_line(&s.minimum).trim_end_matches('.')
         ));
     }
-    match s.doer() {
-        Doer::CoderHelm if !s.result.trim().is_empty() => {
-            let state = if s.done {
-                "Done by CoderHelm"
-            } else if under_way(s) {
-                "Under way"
-            } else {
-                "CoderHelm could not do it"
-            };
-            t.push_str(&format!(
-                " {state}: {}.",
-                one_line(&s.result).trim_end_matches('.')
-            ));
-        }
-        Doer::CoderHelm => t.push_str(" CoderHelm does this after the pull request opens."),
-        Doer::Person => {
-            if !s.why_person.trim().is_empty() {
-                t.push_str(&format!(
-                    " Why a person: {}.",
-                    one_line(&s.why_person).trim_end_matches('.')
-                ));
-            }
-            if !s.grant.trim().is_empty() {
-                t.push_str(&format!(
-                    " So CoderHelm can do it next time: {}.",
-                    one_line(&s.grant).trim_end_matches('.')
-                ));
-            }
-        }
-        Doer::ThisPr => {}
+    if !extra.is_empty() {
+        what = format!("{} ({})", what.trim_end_matches('.'), extra.join("; "));
     }
-    let owner = match s.doer() {
-        Doer::ThisPr => "this pull request".to_string(),
-        Doer::CoderHelm => "CoderHelm".to_string(),
-        Doer::Person => match one_line(&s.owner) {
-            o if o.is_empty() => "not named yet".to_string(),
-            o => o,
-        },
+    // "After merging: ... after merge" says it twice.
+    if when == When::AfterMerge {
+        for tail in [
+            " after merge",
+            " after merging",
+            " once merged",
+            " after the merge",
+        ] {
+            if what.to_lowercase().ends_with(tail) {
+                what.truncate(what.len() - tail.len());
+            }
+        }
+    }
+    Some(Step {
+        what,
+        how: one_line(&s.how),
+        when,
+        owner,
+        state,
+    })
+}
+
+/// Every step outside the pull request, each in its one state. A check
+/// CoderHelm made (a verify step it ran) is a result, not a step: see
+/// [`checked_now`].
+pub fn steps_now(c: &OutsideChange, pr_open: bool) -> Vec<Step> {
+    // The confirm query CoderHelm already ran answers a step that only
+    // asks for it to be run.
+    let confirmed = c
+        .confirm
+        .as_ref()
+        .is_some_and(|f| !f.result.trim().is_empty() && !f.result.starts_with("the query failed"));
+    (0..c.steps.len())
+        .filter(|i| {
+            let s = &c.steps[*i];
+            !(s.step_kind() == StepKind::Verify
+                && s.doer() == Doer::CoderHelm
+                && (s.done || confirmed))
+        })
+        .filter_map(|i| step_now(c, i, pr_open))
+        .collect()
+}
+
+/// The checks CoderHelm made itself, each with its result: a verify step
+/// it ran, and the confirm query.
+pub fn checked_now(c: &OutsideChange) -> Vec<Checked> {
+    let mut out: Vec<Checked> = c
+        .steps
+        .iter()
+        .filter(|s| s.done && s.doer() == Doer::CoderHelm && s.step_kind() == StepKind::Verify)
+        .map(|s| Checked {
+            what: one_line(&s.step),
+            result: "the query returned what was expected".to_string(),
+            when: String::new(),
+        })
+        .collect();
+    if let Some(f) = c.confirm.as_ref().filter(|f| !f.result.trim().is_empty()) {
+        let failed = f.result.starts_with("the query failed");
+        out.push(Checked {
+            what: if f.expect.trim().is_empty() {
+                "the content the change needs".to_string()
+            } else {
+                format!("the content query returns {}", one_line(&f.expect))
+            },
+            result: if failed {
+                let (cause, _) = pr_steps::plain_error(&f.result);
+                format!("could not be read ({cause})")
+            } else {
+                "it does".to_string()
+            },
+            when: String::new(),
+        });
+    }
+    out
+}
+
+/// What is left to confirm that CoderHelm cannot: a page only a person can
+/// judge. A query it can run and a test CI runs are never given to a person.
+pub fn person_checks(c: &OutsideChange) -> Vec<Step> {
+    let Some(f) = c.confirm.as_ref() else {
+        return Vec::new();
     };
-    (t, owner)
+    if f.page.trim().is_empty() || says_no_look(&f.page) {
+        return Vec::new();
+    }
+    vec![Step {
+        what: format!("Look at {}", one_line(&f.page).trim_end_matches('.')),
+        how: String::new(),
+        when: When::Any,
+        owner: "the reviewer".to_string(),
+        state: State::Person {
+            why: "how a page looks is a judgement only a person can make".to_string(),
+            unblock: String::new(),
+        },
+    }]
+}
+
+/// The raw evidence behind the note: the names, the lookup with its result,
+/// what was already there, the confirm query. For the collapsed part only.
+pub fn raw_evidence(c: &OutsideChange) -> Vec<String> {
+    let mut out = context_lines(c);
+    if let Some(f) = c.confirm.as_ref().filter(|f| !f.query.trim().is_empty()) {
+        let mut t = format!("Confirm query `{}`", one_line(&f.query));
+        if !f.result.trim().is_empty() {
+            t.push_str(&format!(" returned {}", quote_result(&f.result)));
+        }
+        out.push(t);
+    }
+    for s in c.steps.iter().filter(|s| !s.result.trim().is_empty()) {
+        out.push(format!(
+            "\"{}\": {}",
+            one_line(&s.step),
+            quote_result(&s.result)
+        ));
+    }
+    out
+}
+
+/// One step as a line with its owner, for a progress note and the plan
+/// check: generated from its state (see [`step_now`]).
+pub fn step_line(n: usize, s: &NoteStep) -> (String, String) {
+    let only = OutsideChange {
+        steps: vec![s.clone()],
+        ..Default::default()
+    };
+    match step_now(&only, 0, true) {
+        Some(step) => (format!("{n}. {}", step.line()), step.owner),
+        None => (
+            format!("{n}. {}", one_line(&s.step)),
+            "this pull request".to_string(),
+        ),
+    }
 }
 
 /// The lines before the steps: the names, the lookup and what is there.
@@ -1399,82 +1599,47 @@ pub fn context_lines(c: &OutsideChange) -> Vec<String> {
     out
 }
 
-/// The confirm line.
-pub fn confirm_line(c: &OutsideChange) -> Option<String> {
-    let f = c.confirm.as_ref()?;
-    if f.query.trim().is_empty() && f.page.trim().is_empty() && f.e2e.trim().is_empty() {
-        return None;
-    }
-    let mut t = String::from("How to confirm:");
-    if !f.query.trim().is_empty() {
-        t.push_str(&format!(" query `{}`", one_line(&f.query)));
-        if !f.expect.trim().is_empty() {
-            t.push_str(&format!(
-                ", expect {}",
-                one_line(&f.expect).trim_end_matches('.')
-            ));
-        }
-        t.push(';');
-    }
-    if !f.page.trim().is_empty() {
-        t.push_str(&format!(
-            " look at {};",
-            one_line(&f.page).trim_end_matches('.')
-        ));
-    }
-    if !f.e2e.trim().is_empty() {
-        t.push_str(&format!(
-            " `{}` must run and pass, not skip;",
-            one_line(&f.e2e)
-        ));
-    }
-    let mut t = t.trim_end_matches(';').to_string();
-    t.push('.');
-    if !f.result.trim().is_empty() {
-        t.push_str(&format!(
-            " CoderHelm ran the query: {}",
-            quote_result(&f.result)
-        ));
-    }
-    Some(t)
-}
-
-/// The steps outside this pull request, in order, each with its owner: what
-/// the PR's "Not in this PR" lists, from the same steps as the ticket note.
+/// The work outside this pull request that is still to come and needs
+/// nobody now (a step CoderHelm does at a named point), each with its one
+/// owner: what the PR's "Not in this PR" lists. What a person has to do is
+/// in the lead; what is done, checked or found is evidence.
 pub fn pr_lines(c: &OutsideChange) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = c
-        .steps
-        .iter()
-        .enumerate()
-        .filter(|(_, s)| s.doer() != Doer::ThisPr)
-        .map(|(i, s)| step_line(i + 1, s))
-        .collect();
-    if let Some(l) = confirm_line(c) {
-        out.push((l, "the owner of the last step".to_string()));
-    }
-    out
+    steps_now(c, true)
+        .into_iter()
+        .filter(|s| matches!(s.state, State::Waiting { .. }))
+        .map(|s| (s.line(), s.owner))
+        .collect()
 }
 
-/// The ticket note's body: the names and lookup, then every step in order
-/// with its owner, then how to confirm.
+/// The ticket note's body: what a person has to do first (or that nothing
+/// is needed), then what CoderHelm did, checked and will do. The raw
+/// evidence stays on the pull request and the run page.
 pub fn note_markdown(c: &OutsideChange) -> String {
-    // What is not done comes first, with the access to grant.
-    let mut out = match not_done_block(c) {
-        b if b.is_empty() => String::new(),
-        b => format!("{b}\n"),
-    };
-    for l in context_lines(c) {
-        out.push_str(&format!("- {l}\n"));
-    }
-    if !c.steps.is_empty() {
-        out.push_str("\n**Steps, in order**\n");
-        for (i, s) in c.steps.iter().enumerate() {
-            let (t, owner) = step_line(i + 1, s);
-            out.push_str(&format!("{t} (owner: {owner})\n"));
+    let mut steps = steps_now(c, c.placed.is_some());
+    steps.extend(person_checks(c));
+    let needed = pr_steps::needed(&steps);
+    let mut out = String::new();
+    if needed.is_empty() {
+        out.push_str(&format!(
+            "**Needed from you:** {}\n",
+            pr_steps::NOTHING_NEEDED
+        ));
+    } else {
+        out.push_str("**Needed from you:**\n");
+        for (i, l) in needed.iter().enumerate() {
+            out.push_str(&format!("{}. {l}\n", i + 1));
         }
     }
-    if let Some(l) = confirm_line(c) {
-        out.push_str(&format!("\n{l}\n"));
+    let rest = pr_steps::others(&steps);
+    let checked = checked_now(c);
+    if !rest.is_empty() || !checked.is_empty() {
+        out.push_str("\n**What CoderHelm does and checked**\n");
+        for l in rest {
+            out.push_str(&format!("- {l}\n"));
+        }
+        for k in checked {
+            out.push_str(&format!("- {}\n", k.line()));
+        }
     }
     out
 }
@@ -1563,45 +1728,32 @@ pub fn not_done_lines(c: &OutsideChange) -> Vec<String> {
 
 const NOT_DONE_START: &str = "<!-- coderhelm:not-done:start -->";
 const NOT_DONE_END: &str = "<!-- coderhelm:not-done:end -->";
-/// The heading of the block at the top of the PR and the ticket note.
-pub const NOT_DONE_HEADING: &str =
-    "Not done: this ticket still needs access CoderHelm doesn't have";
 
-/// The block at the top of the PR and the ticket note naming each
-/// requirement not done, why, and the access to grant. Empty when none.
+/// What a person has to do for the steps not done, numbered, each with
+/// why CoderHelm did not and what lets it. Empty when nothing is needed.
+#[cfg(test)]
 pub fn not_done_block(c: &OutsideChange) -> String {
-    let lines = not_done_lines(c);
-    if lines.is_empty() {
+    let needed = pr_steps::needed(&steps_now(c, c.placed.is_some()));
+    if needed.is_empty() {
         return String::new();
     }
-    let mut out = format!("**{NOT_DONE_HEADING}**\n\n");
-    for l in lines {
-        out.push_str(&format!(
-            "- {}\n",
-            l.trim_start_matches(|ch: char| ch.is_ascii_digit() || ch == '.')
-                .trim()
-        ));
+    let mut out = String::from("**Needed from you:**\n");
+    for (i, l) in needed.iter().enumerate() {
+        out.push_str(&format!("{}. {l}\n", i + 1));
     }
     out
 }
 
-/// The PR body with the not-done block at its top (replaced when there,
-/// removed when nothing is left).
-pub fn with_not_done_top(body: &str, c: &OutsideChange) -> String {
-    let rest = match (body.find(NOT_DONE_START), body.find(NOT_DONE_END)) {
+/// The PR body without the not-done block an earlier shape of the
+/// description put at its top: what a person has to do is in the lead now
+/// (`description`), rendered from the same steps.
+pub fn with_not_done_top(body: &str, _c: &OutsideChange) -> String {
+    match (body.find(NOT_DONE_START), body.find(NOT_DONE_END)) {
         (Some(a), Some(b)) if b > a => format!("{}{}", &body[..a], &body[b + NOT_DONE_END.len()..])
             .trim_start()
             .to_string(),
         _ => body.to_string(),
-    };
-    let block = not_done_block(c);
-    if block.is_empty() {
-        return rest;
     }
-    format!(
-        "{NOT_DONE_START}\n{}\n{NOT_DONE_END}\n\n{rest}",
-        block.trim_end()
-    )
 }
 
 /// Whether a CoderHelm step is still under way (an approval card or a
@@ -1774,11 +1926,22 @@ pub fn action_for(s: &NoteStep, a: &Abilities, c: &OutsideChange) -> Action {
                 Target::Staging => true,
             };
             pick(&a.deploys, &fit).unwrap_or_else(|| {
+                // Said plainly, with the commands a person runs instead.
+                let scripts: Vec<String> = a
+                    .deploys
+                    .iter()
+                    .filter(|r| r.trigger == Trigger::Script && fit(r))
+                    .map(|r| format!("`{}`", r.command))
+                    .collect();
                 Action::Cannot(format!(
-                    "the repository has no {}deploy workflow CoderHelm can start (one with \
-                     workflow_dispatch, or one that runs on a pull request label); add \
-                     `workflow_dispatch:` to the deploy workflow's triggers",
-                    if target == Target::Production { "production " } else { "" }
+                    "the repository has no {}deploy workflow CoderHelm can start{}; grant: add a \
+                     deploy workflow with a manual start (`workflow_dispatch:` in its triggers)",
+                    if target == Target::Production { "production " } else { "" },
+                    if scripts.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" (it deploys with {})", scripts.join(" or "))
+                    }
                 ))
             })
         }
@@ -2005,15 +2168,24 @@ mod tests {
         let g = gaps(&c, &a, PlanFacts::default());
         assert!(g.is_empty(), "{g:?}");
         let note = note_markdown(&c);
-        assert!(note.contains("Already there: `page-events` (key `k1`), \"Events\"; fields the new schema doesn't know: `image`; new required fields it lacks: `tabs`; left by #41"), "{note}");
-        assert!(note.contains("1. Replace the carousel block's content on production Values: title = Classes. Why a person: only an editor picks the classes shown."));
-        assert!(note.contains(
-            "How to confirm: query `count(*[_type == \"carousel\"])`, expect exactly 1."
-        ));
-        // The PR lists the same steps.
-        let pr = pr_lines(&c);
-        assert!(note.contains(&pr[0].0));
-        assert_eq!(pr[0].1, "a content editor");
+        // The person's step comes first, with what it needs and why.
+        assert!(
+            note.starts_with("**Needed from you:**\n1. Replace the carousel block's content on production (values: title = Classes). CoderHelm cannot: only an editor picks the classes shown. (a content editor)\n"),
+            "{note}"
+        );
+        // What was found and how it is confirmed are evidence, not items.
+        assert!(
+            !note.contains("Already there") && !note.contains("How to confirm"),
+            "{note}"
+        );
+        let raw = raw_evidence(&c).join("\n");
+        assert!(raw.contains("Already there: `page-events` (key `k1`), \"Events\"; fields the new schema doesn't know: `image`; new required fields it lacks: `tabs`; left by #41"), "{raw}");
+        assert!(
+            raw.contains("Confirm query `count(*[_type == \"carousel\"])`"),
+            "{raw}"
+        );
+        // Nothing waits on CoderHelm here, so the PR lists no step of its own.
+        assert!(pr_lines(&c).is_empty());
         // A failed attempt may say so, quoting the error.
         let failed = OutsideChange {
             existing: "could not look up: the lookup failed".into(),
@@ -2056,7 +2228,10 @@ mod tests {
         assert_eq!(h.by_person.len(), 1);
         assert_eq!(h.not_done.len(), 1);
         assert!(
-            h.not_done[0].contains("CoderHelm could not do it: not done: the end-to-end workflow")
+            h.not_done[0].contains("CoderHelm could not: the end-to-end workflow")
+                && !h.not_done[0].contains("not done"),
+            "{}",
+            h.not_done[0]
         );
     }
 
@@ -2280,26 +2455,22 @@ mod tests {
             ..Default::default()
         };
         let block = not_done_block(&c);
-        assert!(block.contains(NOT_DONE_HEADING));
-        assert!(block.contains("Why a person: no production CMS write connection exists"));
-        assert!(block.contains("So CoderHelm can do it next time: add a production write token"));
-        assert!(block.contains("workflow_dispatch"));
-        assert!(
-            !block.contains("Deploy the studio"),
-            "a step under way is not 'not done'"
+        assert_eq!(
+            block,
+            "**Needed from you:**\n\
+             1. Replace the hero on production. CoderHelm cannot: no production CMS write connection exists. To let it: add a production write token. (a content editor)\n\
+             2. Re-run the e2e tests. CoderHelm could not: the end-to-end workflow has no workflow_dispatch trigger. (a person on the team)\n\
+             3. Approve \"Deploy the studio\": a team admin approves it on the Agent permissions page, and CoderHelm then does it. (a team admin)\n"
         );
+        // One state each: nothing says both "CoderHelm" and "needs access".
+        assert!(!block.contains("owner: CoderHelm"), "{block}");
         // The ticket note starts with it.
-        assert!(note_markdown(&c).starts_with(&format!("**{NOT_DONE_HEADING}**")));
-        // The PR body gets it at the top, once, and loses it when all is done.
-        let body = with_not_done_top("## Summary\nx", &c);
-        assert!(body.starts_with(NOT_DONE_START));
-        assert!(body.ends_with("## Summary\nx"));
-        assert_eq!(with_not_done_top(&body, &c), body);
-        let done = OutsideChange {
-            steps: Vec::new(),
-            ..c.clone()
-        };
-        assert_eq!(with_not_done_top(&body, &done), "## Summary\nx");
+        assert!(note_markdown(&c).starts_with("**Needed from you:**\n1. Replace the hero"));
+        // The block an earlier shape put at the top of the PR is taken out:
+        // the lead says it now.
+        let old = format!("{NOT_DONE_START}\n**Not done**\n- x\n{NOT_DONE_END}\n\n## Summary\nx");
+        assert_eq!(with_not_done_top(&old, &c), "## Summary\nx");
+        assert_eq!(with_not_done_top("## Summary\nx", &c), "## Summary\nx");
         assert!(unfinished(&c), "the waiting step keeps the run going");
     }
 

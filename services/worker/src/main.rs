@@ -662,6 +662,9 @@ async fn handle_message_inner(state: Arc<WorkerState>, message: models::WorkerMe
             {
                 error!("Merged PR backfill failed: {e:?}");
             }
+            // Lessons kept from before placeholders were refused when
+            // learned: removed once per install.
+            passes::lesson_cleanup::run_once(&state).await;
             if let Err(e) = as_sweep(who::SWEEP_SKILLS, passes::skills::sweep(&state)).await {
                 error!("Skill repository sweep failed: {e:?}");
             }
