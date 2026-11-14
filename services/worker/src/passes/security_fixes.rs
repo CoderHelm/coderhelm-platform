@@ -3057,6 +3057,7 @@ async fn refresh_pr(
     if let Err(e) = cx.gh.update_pr_title(o, n, pr, &unit.title).await {
         warn!(repo = %unit.repo, pr, error = %e, "security: could not write the bundle's title");
     }
+    crate::passes::description::reconcile(cx.state, &cx.gh, cx.team_id, o, n, pr, ticket).await;
     relabel(cx, o, n, pr, unit).await;
 }
 
@@ -4593,38 +4594,35 @@ async fn what_to_check(
 /// A security pull request whose CI just ended (passed or failed): its
 /// description is rebuilt from its head.
 async fn refresh_ci_sections(cx: &Ctx<'_>, repo: &str, number: u64, ticket: &str) {
-    rebuild_at_head(cx.state, &cx.gh, cx.team_id, repo, number, ticket).await;
+    let Some((o, n)) = repo.split_once('/') else {
+        return;
+    };
+    crate::passes::description::rebuild(cx.state, &cx.gh, cx.team_id, o, n, number, ticket).await;
 }
 
-/// The sections of a security pull request's description CoderHelm
-/// computes, written again from the head: the first sentences and the
-/// table (what the lockfile on the head resolves, compared with the base
-/// branch), "What to check" and Proof (where CI stands on this head). The
-/// rest of the description (the draft status at its top, the run's words)
-/// stays. Running it twice on one head writes nothing the second time.
-pub(crate) async fn rebuild_at_head(
+/// A security pull request's description with the sections CoderHelm
+/// computes written again from the head `pr` is on: the first sentences
+/// and the table (what the lockfile on the head resolves, compared with
+/// the base branch), "What to check" and Proof (where CI stands on this
+/// head). The rest (the draft status at its top, the run's words) stays.
+/// `None` for a pull request that is not a dependency fix's. Saved by
+/// `description::reconcile`, the only caller.
+pub(crate) async fn at_head(
     state: &WorkerState,
     gh: &GitHubClient,
     team_id: &str,
     repo: &str,
     number: u64,
     ticket: &str,
-) {
-    let Some(unit) = load_unit(state, team_id, ticket).await else {
-        return;
-    };
+    pr: &Value,
+) -> Option<String> {
+    let unit = load_unit(state, team_id, ticket).await?;
     if unit.ecosystem == common::infra_vuln::records::UNIT_ECOSYSTEM {
-        return;
+        return None;
     }
-    let Some((o, n)) = repo.split_once('/') else {
-        return;
-    };
-    let Ok(pr) = gh.get_pull_request(o, n, number).await else {
-        return;
-    };
     let body = pr["body"].as_str().unwrap_or("");
     if !body.contains(sec::MARKER) {
-        return;
+        return None;
     }
     let item = ticket_item(state, team_id, ticket).await;
     let change = item.as_ref().map(|i| s(i, "change")).unwrap_or_default();
@@ -4650,12 +4648,8 @@ pub(crate) async fn rebuild_at_head(
     )
     .await;
     let fresh = sec::pr_body_at_head(&unit, &pairs, &change, &check, &links, &head);
-    let next = rebuilt_body(body, &fresh);
-    if next != body {
-        if let Err(e) = crate::passes::description::save(gh, o, n, number, &next).await {
-            warn!(%repo, number, error = %e, "security: could not rebuild the description from the head");
-        }
-    }
+    let _ = repo;
+    Some(rebuilt_body(body, &fresh))
 }
 
 /// `body` with the sections computed from the head taken from `fresh`.

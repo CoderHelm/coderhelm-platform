@@ -1301,7 +1301,7 @@ async fn check_and_fix(
             // until the time limit cut the whole step off.
             w.deadline,
             // Registrations and test maps live outside the diff.
-            false,
+            super::write_guard::RoundFor::FeatureRules,
         )
         .await;
         w.ledger.update(|l| l.rules.end_fix());

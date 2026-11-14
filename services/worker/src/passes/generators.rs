@@ -1914,7 +1914,7 @@ pub async fn gate(
         Some(w.run_id),
         w.deadline,
         // Generated files may not be in the PR yet.
-        false,
+        super::write_guard::RoundFor::Build,
     )
     .await
     {

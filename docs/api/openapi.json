@@ -5825,6 +5825,13 @@
             "minimum": 0,
             "type": "integer"
           },
+          "models": {
+            "description": "Usage per model, most tokens first.",
+            "items": {
+              "$ref": "#/components/schemas/UsageModel"
+            },
+            "type": "array"
+          },
           "month": {
             "description": "The month, `YYYY-MM` (UTC).",
             "examples": [
@@ -5892,6 +5899,7 @@
           "counted_tokens",
           "limit_counts_cache",
           "features",
+          "models",
           "total_runs",
           "max_tokens"
         ],
@@ -5996,6 +6004,91 @@
           "kind",
           "max",
           "used"
+        ],
+        "type": "object"
+      },
+      "UsageModel": {
+        "description": "One model's share of the month's tokens.",
+        "properties": {
+          "cache_hit_rate": {
+            "description": "Cache reads divided by all input, from 0 to 1.",
+            "examples": [
+              0.78
+            ],
+            "format": "double",
+            "type": "number"
+          },
+          "cache_read_tokens": {
+            "description": "Tokens read from the prompt cache.",
+            "examples": [
+              11020300
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "cache_write_tokens": {
+            "description": "Tokens written to the prompt cache.",
+            "examples": [
+              700000
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "calls": {
+            "description": "Model calls counted.",
+            "examples": [
+              412
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "model": {
+            "description": "The model, without a provider prefix or date, such as `claude-opus-5-5`.",
+            "examples": [
+              "claude-opus-5-5"
+            ],
+            "type": "string"
+          },
+          "tokens_in": {
+            "description": "New input tokens (not from the cache).",
+            "examples": [
+              2400100
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "tokens_out": {
+            "description": "Output tokens.",
+            "examples": [
+              1000000
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total_tokens": {
+            "description": "All four parts together.",
+            "examples": [
+              15120400
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "model",
+          "total_tokens",
+          "tokens_in",
+          "cache_read_tokens",
+          "cache_write_tokens",
+          "tokens_out",
+          "calls",
+          "cache_hit_rate"
         ],
         "type": "object"
       },

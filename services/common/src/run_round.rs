@@ -174,8 +174,9 @@ pub struct Round {
     pub base_sha: String,
     /// What the round was asked to do, kept so a parked round can run.
     pub feedback: String,
-    /// Whether the round may only change the files the pull request already
-    /// changes (a bot-driven fix).
+    /// Whether CoderHelm started the round by itself (a bot-driven fix): the
+    /// files it may edit are then bounded by what the round is for (the
+    /// worker's `write_guard`). False when a person's ask rides along.
     pub scoped: bool,
     /// The branch the round writes its checkpoints to (empty until it
     /// starts working).

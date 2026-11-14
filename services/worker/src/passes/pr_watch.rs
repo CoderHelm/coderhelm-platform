@@ -424,6 +424,11 @@ async fn perform(
     seen: &Seen,
     act: &Act,
 ) -> bool {
+    // Whatever the watch does next rests on a description of this head.
+    super::description::reconcile_run(
+        state, github, &c.team_id, &c.run_id, &c.owner, &c.repo, c.pr,
+    )
+    .await;
     match act {
         Act::Nothing => true,
         Act::ResolveConflict => {
