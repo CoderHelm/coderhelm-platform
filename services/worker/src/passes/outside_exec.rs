@@ -417,6 +417,31 @@ async fn write(
     }
 }
 
+/// What a step that needs a workflow started says where the app may not
+/// start one: the cause, then the access that lifts it (after `; grant:`,
+/// as every step's reason is written).
+pub const NO_ACTIONS_WRITE: &str = "CoderHelm's GitHub App is not allowed to start workflows in this repository; grant: give the app \"Actions: write\" (GitHub, Settings, Installed GitHub Apps, CoderHelm, Permissions), or run the command yourself";
+
+/// The attribute on a run that names a GitHub permission one of its steps
+/// needed and the app lacks: one item for an admin, whatever number of
+/// steps met it.
+pub const PERMISSION_NEEDED: &str = "permission_needed";
+
+async fn note_permission_needed(cx: &Ctx<'_>) {
+    let _ = cx
+        .state
+        .dynamo
+        .update_item()
+        .table_name(&cx.state.config.runs_table_name)
+        .key("team_id", super::attr_s(cx.team_id))
+        .key("run_id", super::attr_s(cx.run_id))
+        .update_expression("SET #p = :p")
+        .expression_attribute_names("#p", PERMISSION_NEEDED)
+        .expression_attribute_values(":p", super::attr_s("actions:write"))
+        .send()
+        .await;
+}
+
 /// Starts the route (dispatch, or its label), finds the run it started and
 /// waits for it.
 async fn start(
@@ -427,6 +452,18 @@ async fn start(
     until: Instant,
     p: &mut Progress,
 ) {
+    // Whether the app may start a workflow is known from its token: a
+    // start that would be refused is not tried, for this step or the next.
+    let installation = cx.github.installation_id();
+    if label.is_none()
+        && common::github_grants::write_grant(installation, "actions")
+            == common::github_grants::Grant::Missing
+    {
+        s.run = None;
+        s.result = format!("not done: {NO_ACTIONS_WRITE}");
+        note_permission_needed(cx).await;
+        return;
+    }
     let since = chrono::Utc::now() - chrono::Duration::seconds(5);
     let file = r.file.rsplit('/').next().unwrap_or(&r.file).to_string();
     let started = match label {
@@ -451,7 +488,16 @@ async fn start(
         Ok(w) => w,
         Err(e) => {
             s.run = None;
-            s.result = format!("not done: starting {} failed: {e}", r.line());
+            let text = e.to_string();
+            let lower = text.to_lowercase();
+            if lower.contains("resource not accessible by integration") || lower.contains("403") {
+                // Remembered: the steps after this one say so without trying.
+                common::github_grants::refused_write(installation, "actions");
+                s.result = format!("not done: {NO_ACTIONS_WRITE}");
+                note_permission_needed(cx).await;
+            } else {
+                s.result = format!("not done: starting {} failed: {text}", r.line());
+            }
             return;
         }
     };

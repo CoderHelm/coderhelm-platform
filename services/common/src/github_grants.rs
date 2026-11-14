@@ -51,7 +51,12 @@ pub fn record(installation: u64, permissions: &Value) {
         .collect();
     with(|all| {
         let k = all.entry(installation).or_default();
-        k.refused.retain(|p| !map.contains_key(p));
+        k.refused.retain(|p| match p.split_once(":write") {
+            Some((name, _)) => !map
+                .get(name)
+                .is_some_and(|l| matches!(l.as_str(), "write" | "admin")),
+            None => !map.contains_key(p),
+        });
         k.token = Some(map);
     });
 }
@@ -71,6 +76,32 @@ pub fn grant(installation: u64, permission: &str) -> Grant {
             None => Grant::Unknown,
         }
     })
+}
+
+/// Whether `installation` may write with `permission` (start a workflow
+/// needs `actions: write`; reading its runs only `read`).
+pub fn write_grant(installation: u64, permission: &str) -> Grant {
+    with(|all| {
+        let Some(k) = all.get(&installation) else {
+            return Grant::Unknown;
+        };
+        if k.refused.contains(&format!("{permission}:write")) {
+            return Grant::Missing;
+        }
+        match &k.token {
+            Some(t) => match t.get(permission).map(String::as_str) {
+                Some("write" | "admin") => Grant::Granted,
+                _ => Grant::Missing,
+            },
+            None => Grant::Unknown,
+        }
+    })
+}
+
+/// Remembers that GitHub refused a write with `permission`. True the first
+/// time, so the caller says it once.
+pub fn refused_write(installation: u64, permission: &str) -> bool {
+    refused(installation, &format!("{permission}:write"))
 }
 
 /// True when the installation is known to lack the permission: the read is
@@ -131,6 +162,23 @@ pub fn limit_note(permission: &str, instead: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_write_is_known_before_it_is_tried() {
+        let i = 990_001;
+        assert_eq!(write_grant(i, "actions"), Grant::Unknown);
+        record(i, &json!({"actions": "read", "contents": "write"}));
+        assert_eq!(grant(i, "actions"), Grant::Granted);
+        assert_eq!(write_grant(i, "actions"), Grant::Missing);
+        assert_eq!(write_grant(i, "contents"), Grant::Granted);
+        // A refusal is remembered once, and a newer token clears it.
+        let j = 990_002;
+        assert!(refused_write(j, "actions"));
+        assert!(!refused_write(j, "actions"));
+        assert_eq!(write_grant(j, "actions"), Grant::Missing);
+        record(j, &json!({"actions": "write"}));
+        assert_eq!(write_grant(j, "actions"), Grant::Granted);
+    }
 
     #[test]
     fn unknown_until_a_token_or_a_refusal_says() {

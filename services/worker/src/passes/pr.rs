@@ -618,10 +618,42 @@ Return ONLY the markdown body text."#,
         full_body
     };
 
+    // A change the diff does not contain never opens a pull request.
+    let full_body = crate::passes::description::checked_for_diff(&full_body, &diff);
+
     // The PR title and squash commit follow the team's templates.
     let conventions = super::load_git_conventions(state, &msg.team_id, &msg.ticket_id).await;
     let tokens = super::ticket_tokens(msg);
     let title = pr_title(&conventions, &tokens, msg);
+    // The repository's own form for titles and commits, read from its
+    // configuration and what people merged. A run with a ticket keeps
+    // `{ticket}: {title}` unless the repository states or enforces another
+    // form; a run without one (a security update) follows the repository,
+    // with a real key or none.
+    let is_security = common::security_fixes::is_ticket(&msg.ticket_id);
+    let form = super::conventions::for_run(
+        state,
+        github,
+        &msg.team_id,
+        &msg.repo_owner,
+        &msg.repo_name,
+        &msg.base_branch,
+        &msg.ticket_id,
+        if is_security { None } else { tokens.key() },
+        &msg.title,
+        &conventions,
+    )
+    .await;
+    let follows = |c: &common::pr_conventions::Convention, team_set: bool| {
+        !team_set && (is_security || !super::conventions::keeps_ticket_form(c))
+    };
+    let (title, form_note) = if follows(&form.title, conventions.pr_title.is_some()) {
+        let w = form.title(&title);
+        (common::pr_body_fit::fit_title(&w.text), w.note)
+    } else {
+        (title, None)
+    };
+    super::conventions::record(state, &msg.team_id, run_id, &form, form_note.as_deref()).await;
 
     // Check if a PR already exists for this branch (e.g. from a re-run or retry)
     let existing_pr = github
@@ -689,6 +721,12 @@ Return ONLY the markdown body text."#,
         // the noisier history. Skipped for existing/reopened PRs above to avoid
         // rewriting a PR a human may already be reviewing.
         let squash_msg = squash_message(&conventions, &tokens, msg);
+        // The same form as the title: GitHub squashes to one or the other.
+        let squash_msg = if follows(&form.commit, conventions.commit.is_some()) {
+            form.commit(&squash_msg)
+        } else {
+            squash_msg
+        };
         if proof.keep_commits {
             info!(
                 branch,
@@ -854,8 +892,10 @@ Return ONLY the markdown body text."#,
         usage,
     )
     .await;
-    // The description names the head it was built for from the start.
-    crate::passes::description::reconcile(
+    // The description names the head it was built for from the start, in
+    // its final shape: the lead from the facts, read once as its reviewer
+    // will, and everything else collapsed.
+    crate::passes::description::reconcile_read(
         state,
         github,
         &msg.team_id,
@@ -863,6 +903,7 @@ Return ONLY the markdown body text."#,
         &msg.repo_name,
         pr_number,
         &msg.ticket_id,
+        crate::passes::description::Reader { provider, usage },
     )
     .await;
 
@@ -1820,13 +1861,18 @@ pub async fn refresh_description(
     pr_number: u64,
     team_instructions: &str,
     requests: &[String],
+    facts: Option<&common::pr_facts::Facts>,
     provider: &ModelProvider,
     usage: &mut TokenUsage,
 ) -> Option<Vec<String>> {
     let pr = github.get_pull_request(owner, repo, pr_number).await.ok()?;
     let base = pr["base"]["ref"].as_str()?.to_string();
     let head = pr["head"]["ref"].as_str()?.to_string();
-    let current = pr["body"].as_str().unwrap_or("").trim().to_string();
+    // The writer rewrites what was written, never what CoderHelm renders
+    // around it (the lead, the folds, the steps and evidence).
+    let current = crate::passes::description::flat(pr["body"].as_str().unwrap_or(""))
+        .trim()
+        .to_string();
     // CoderHelm's own sections (Open items above all) are its record, kept
     // word for word (only CI's result changes Open items, see
     // `settle_unverified_by_ci`): the writer rewrites the rest. A person's
@@ -2007,7 +2053,11 @@ Return ONLY the markdown body text, then a line `{CHANGES_MARK}` and one bullet 
     if body == current {
         return None;
     }
-    if let Err(e) = crate::passes::description::save(github, owner, repo, pr_number, &body).await {
+    // What the writer wrote is held against the facts of the head before it
+    // is saved: a statement they do not bear out never reaches the page.
+    if let Err(e) =
+        crate::passes::description::save_checked(github, owner, repo, pr_number, &body, facts).await
+    {
         warn!(pr_number, error = %e, "Could not save the rewritten PR description");
         return None;
     }
@@ -2043,7 +2093,7 @@ async fn fill_placeholders_once(
     let Ok(pr) = github.get_pull_request(owner, repo, pr_number).await else {
         return;
     };
-    let body = pr["body"].as_str().unwrap_or("").to_string();
+    let body = crate::passes::description::flat(pr["body"].as_str().unwrap_or(""));
     let holes = super::completeness::placeholder_holes(&body);
     if holes.is_empty() {
         return;

@@ -3058,7 +3058,29 @@ async fn refresh_pr(
     if let Err(e) = crate::passes::description::save(&cx.gh, o, n, pr, &body).await {
         warn!(repo = %unit.repo, pr, error = %e, "security: could not write the bundle's description");
     }
-    if let Err(e) = cx.gh.update_pr_title(o, n, pr, &unit.title).await {
+    // In the repository's own form, like the title the pull request opened
+    // with (`conventions`).
+    let team = crate::passes::load_git_conventions(cx.state, cx.team_id, ticket).await;
+    let title = if team.pr_title.is_some() {
+        unit.title.clone()
+    } else {
+        crate::passes::conventions::for_run(
+            cx.state,
+            &cx.gh,
+            cx.team_id,
+            o,
+            n,
+            &base,
+            ticket,
+            None,
+            &unit.title,
+            &team,
+        )
+        .await
+        .title(&unit.title)
+        .text
+    };
+    if let Err(e) = cx.gh.update_pr_title(o, n, pr, &title).await {
         warn!(repo = %unit.repo, pr, error = %e, "security: could not write the bundle's title");
     }
     crate::passes::description::reconcile(cx.state, &cx.gh, cx.team_id, o, n, pr, ticket).await;
@@ -4622,12 +4644,15 @@ pub(crate) async fn at_head(
     number: u64,
     ticket: &str,
     pr: &Value,
-) -> Option<String> {
+) -> Option<(String, common::pr_facts::DependencyFacts)> {
     let unit = load_unit(state, team_id, ticket).await?;
     if unit.ecosystem == common::infra_vuln::records::UNIT_ECOSYSTEM {
         return None;
     }
-    let body = pr["body"].as_str().unwrap_or("");
+    // The written text and the computed sections, without the lead and the
+    // folds the description wears around them.
+    let flat = crate::passes::description::flat(pr["body"].as_str().unwrap_or(""));
+    let body = flat.as_str();
     if !body.contains(sec::MARKER) {
         return None;
     }
@@ -4659,7 +4684,10 @@ pub(crate) async fn at_head(
     .await;
     let fresh = sec::pr_body_at_head(&unit, &pairs, &change, &check, &links, &head);
     let _ = repo;
-    Some(rebuilt_body(body, &fresh))
+    // The same lockfile read, as facts: what the lead and the fact check of
+    // the description are written from.
+    let facts = common::pr_dependency::facts(&unit, &pairs, &head, &check);
+    Some((rebuilt_body(body, &fresh), facts))
 }
 
 /// `body` with the sections computed from the head taken from `fresh`.
