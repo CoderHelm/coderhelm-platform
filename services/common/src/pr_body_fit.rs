@@ -13,7 +13,9 @@
 //! failing, Not yet verified, Verification, Open items, Proof, Risk), a
 //! dependency fix run's account (its `### Dependency fix run` block under
 //! What to check: the bumps applied, the ones deferred with why, the
-//! sandbox's checks and the cost), every `## ` heading (so a section rewritten in place later is still found), and
+//! sandbox's checks and the cost) and its `### Upgrade evidence` block (what
+//! the run recorded for the head: the advisory count, the families, the
+//! verification set, each major and its behaviour probe), every `## ` heading (so a section rewritten in place later is still found), and
 //! every line holding an HTML comment (the markers CoderHelm parses later).
 //! Shrunk, largest section first and a step at a time: nested detail under
 //! a list item, then long lists (capped, with "and N more"), then a whole
@@ -34,7 +36,7 @@ pub const BODY_TARGET: usize = 64_000;
 pub const GITHUB_TITLE_MAX: usize = 256;
 
 /// The sections kept as written, by the start of their heading.
-const KEPT: [&str; 11] = [
+const KEPT: [&str; 12] = [
     "summary",
     "not finished",
     "ci failing",
@@ -46,6 +48,7 @@ const KEPT: [&str; 11] = [
     "why it stopped",
     "what you can do",
     "dependency fix run",
+    "upgrade evidence",
 ];
 
 /// The notice a shortened body ends with.

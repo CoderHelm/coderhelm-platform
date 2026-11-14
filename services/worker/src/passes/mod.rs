@@ -148,7 +148,7 @@ async fn send_ticket_after(state: &WorkerState, msg: &TicketMessage, delay: u64)
 /// refusing this installation right now and the error came from a read or
 /// write that failed under it. A stop by a person, the policy or the run
 /// guard is never a wait.
-fn github_pause_of(
+pub(crate) fn github_pause_of(
     e: &(dyn std::error::Error + Send + Sync + 'static),
     installation_id: u64,
 ) -> Option<crate::clients::github::GitHubPaused> {
@@ -169,9 +169,46 @@ fn github_pause_of(
     outside_for(installation_id).map(|(cause, secs)| GitHubPaused::after(cause, secs))
 }
 
+/// Says on the run page that the run waits for GitHub (`text`, from
+/// `common::github_wait::waiting_text`): the `github_wait` line and a note.
+pub(crate) async fn note_github_wait(state: &WorkerState, team_id: &str, run_id: &str, text: &str) {
+    let _ = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(team_id))
+        .key("run_id", attr_s(run_id))
+        .update_expression("SET github_wait = :w")
+        .condition_expression(format!(
+            "attribute_exists(run_id) AND {}",
+            common::run_status::not_ended("#s")
+        ))
+        .expression_attribute_names("#s", "status")
+        .ended_values()
+        .expression_attribute_values(":w", attr_s(text))
+        .send()
+        .await;
+    add_progress_note(state, team_id, run_id, text).await;
+}
+
+/// The wait is over: the run page stops saying it waits for GitHub.
+pub(crate) async fn clear_github_wait(state: &WorkerState, team_id: &str, run_id: &str) {
+    let _ = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(team_id))
+        .key("run_id", attr_s(run_id))
+        .update_expression("REMOVE github_wait")
+        .condition_expression("attribute_exists(github_wait)")
+        .send()
+        .await;
+}
+
 /// The message that carries a run's wait for GitHub, and its first SQS
 /// delay: the same run (its run_id and step), one more wait, the pass it was
-/// in. None once the run has waited `MAX_WAITS` times.
+/// in. None once the run has taken every wait it may
+/// (`common::github_wait::may_wait`).
 pub(crate) fn github_wait_message(
     msg: &TicketMessage,
     run_id: &str,
@@ -179,9 +216,18 @@ pub(crate) fn github_wait_message(
     pass: &str,
     now: u64,
 ) -> Option<(TicketMessage, u64)> {
-    if msg.github_wait.waits >= common::github_wait::MAX_WAITS {
+    if !common::github_wait::may_wait(paused.cause, msg.github_wait.waits) {
         return None;
     }
+    // GitHub's reset, and never sooner than the pace of a limit that keeps
+    // answering "in a minute".
+    let until = paused
+        .until
+        .max(now + common::github_wait::paced(paused.cause, 1, msg.github_wait.waits));
+    let paused = &crate::clients::github::GitHubPaused {
+        cause: paused.cause,
+        until,
+    };
     let mut next = msg.clone();
     next.continuation_run_id = Some(run_id.to_string());
     next.github_wait = Box::new(common::github_wait::GitHubWait {
@@ -776,7 +822,21 @@ mod continuation_tests {
         // A reset already past still goes on after a moment, never at once.
         let (_, hop) = github_wait_message(&msg, "R", &paused, "implement", 10_500).unwrap();
         assert!(hop > 0);
+        // An outage is waited out MAX_WAITS times; the rate limit far
+        // longer, and never sooner than its pace.
         msg.github_wait.waits = MAX_WAITS;
+        let outage = GitHubPaused {
+            cause: Cause::Outage,
+            until: 10_000,
+        };
+        assert!(github_wait_message(&msg, "R", &outage, "implement", 9_000).is_none());
+        let (next, _) = github_wait_message(&msg, "R", &paused, "implement", 9_990).unwrap();
+        assert_eq!(
+            next.github_wait.until,
+            9_990 + 900,
+            "paced, not ten seconds"
+        );
+        msg.github_wait.waits = common::github_wait::MAX_LIMIT_WAITS;
         assert!(github_wait_message(&msg, "R", &paused, "implement", 9_000).is_none());
         assert_ne!(GitHubWaited::Queued, GitHubWaited::No);
     }
@@ -1358,6 +1418,7 @@ pub mod ticket_history;
 pub mod tool_proposals;
 mod triage;
 pub mod upgrade_notes;
+pub mod upgrade_quality;
 pub mod usage_reconcile;
 pub mod web_check;
 pub mod webhooks;

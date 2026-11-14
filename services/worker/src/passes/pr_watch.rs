@@ -42,8 +42,16 @@ pub const WATCH_DAYS: i64 = 14;
 /// go first, so every one is reached.
 pub const SWEEP_MAX_LOOKS: usize = 40;
 
+/// GitHub requests one look may make when the pull request changed since
+/// the last one (the pull request, its base, its checks and statuses, the
+/// base's when a check fails, its approvals): a look isn't started with
+/// less than this left of the sweep's budget. A look at a pull request
+/// that didn't change costs none (see [`Probe`]).
+pub const LOOK_REQUESTS: u64 = 8;
+
 /// What a look read of the pull request.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Seen {
     pub open: bool,
     pub merged: bool,
@@ -64,6 +72,44 @@ pub struct Seen {
     pub own_verdict: Option<(String, String)>,
 }
 
+/// What the last look read from GitHub, kept on the run (`watch_probe`):
+/// the validator of each read and what they came to. The next look asks
+/// GitHub only whether any of those reads changed (conditional requests,
+/// which cost nothing of the hourly budget while unchanged) and, when none
+/// did, decides from this. A pull request nobody touched is looked at
+/// every 15 minutes for free.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct Probe {
+    /// URL and `ETag` of each read.
+    pub validators: Vec<(String, String)>,
+    pub seen: Seen,
+    /// A person's approval on the head, when the look read approvals.
+    pub human_approved: bool,
+}
+
+impl Probe {
+    pub const FIELD: &'static str = "watch_probe";
+    /// The most reads a probe keeps: a look that made more (a long list of
+    /// reviews) is read in full every time.
+    pub const MAX_VALIDATORS: usize = 12;
+
+    pub fn parse(json: &str) -> Option<Probe> {
+        serde_json::from_str::<Probe>(json)
+            .ok()
+            .filter(|p| !p.validators.is_empty())
+    }
+
+    /// The probe to keep after a full look, or "" when it can't stand in
+    /// for one (a read without a validator, or too many).
+    pub fn to_json(&self) -> String {
+        if self.validators.is_empty() || self.validators.len() > Self::MAX_VALIDATORS {
+            return String::new();
+        }
+        serde_json::to_string(self).unwrap_or_default()
+    }
+}
+
 /// What was already done, each against the commit it was done for.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Marks {
@@ -78,6 +124,9 @@ pub struct Marks {
     pub findings_head: String,
     /// The merge commit whose deploy is watched.
     pub deploy_sha: String,
+    /// The unfinished round (by when it stopped) that was run again after
+    /// GitHub's limit ended it.
+    pub limit_at: String,
 }
 
 impl Marks {
@@ -86,6 +135,7 @@ impl Marks {
     pub const REVIEW: &'static str = "watch_review_head";
     pub const FINDINGS: &'static str = "watch_findings_head";
     pub const DEPLOY: &'static str = "watch_deploy_sha";
+    pub const LIMIT: &'static str = "watch_limit_at";
 
     pub fn of_item(item: &HashMap<String, AttributeValue>) -> Marks {
         let s = |k: &str| {
@@ -100,6 +150,7 @@ impl Marks {
             review_head: s(Self::REVIEW),
             findings_head: s(Self::FINDINGS),
             deploy_sha: s(Self::DEPLOY),
+            limit_at: s(Self::LIMIT),
         }
     }
 }
@@ -121,6 +172,9 @@ pub enum Act {
     FixFindings,
     /// Watch the merge commit's deploy (`health_check`).
     WatchDeploy,
+    /// Run again the round GitHub's rate limit ended (the round's record,
+    /// by when it stopped): `resume::resume_limit_ended`.
+    ResumeRound(String),
 }
 
 impl Act {
@@ -133,6 +187,7 @@ impl Act {
             Act::ReviewHead => Some((Marks::REVIEW, seen.head.clone())),
             Act::FixFindings => Some((Marks::FINDINGS, seen.head.clone())),
             Act::WatchDeploy => Some((Marks::DEPLOY, seen.merge_sha.clone())),
+            Act::ResumeRound(at) => Some((Marks::LIMIT, at.clone())),
         }
     }
 }
@@ -197,6 +252,27 @@ pub fn decide(status: &str, seen: &Seen, marks: &Marks) -> Act {
     }
 }
 
+/// The round to run again before anything else is decided: one GitHub's
+/// rate limit ended (`limit_ended`: when that round stopped, "" when the
+/// run's last round wasn't ended by a limit), on a pull request still open,
+/// once per such round. A limit is never how a round ends: before a limit
+/// was waited out everywhere, a round that met one was left "didn't
+/// finish" and its review's findings were deferred to a person. The sweep
+/// runs only while GitHub's budget has room for it (`SweepGate`), so the
+/// round starts again once the budget allows, with nobody pressing Resume.
+pub fn resume_after_limit(
+    status: &str,
+    seen: &Seen,
+    marks: &Marks,
+    limit_ended: &str,
+) -> Option<Act> {
+    let open = seen.open && !seen.merged;
+    (watched(status) && status != "merged" && open && !limit_ended.is_empty())
+        .then(|| limit_ended.to_string())
+        .filter(|at| marks.limit_at != *at)
+        .map(Act::ResumeRound)
+}
+
 /// One finished run and its pull request.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Candidate {
@@ -213,6 +289,11 @@ pub struct Candidate {
     pub looked_at: String,
     /// The standing last written, to write only a change.
     pub standing: String,
+    /// The last look's [`Probe`], as stored ("" when none).
+    pub probe: String,
+    /// When the run's last round stopped, if GitHub's rate limit is why
+    /// (`round::ended_by_limit`); "" otherwise.
+    pub limit_ended: String,
 }
 
 pub fn candidate_of(item: &HashMap<String, AttributeValue>) -> Option<Candidate> {
@@ -249,6 +330,11 @@ pub fn candidate_of(item: &HashMap<String, AttributeValue>) -> Option<Candidate>
         marks: Marks::of_item(item),
         looked_at: s("watch_looked_at"),
         standing: s(merge_standing::FIELD),
+        probe: s(Probe::FIELD),
+        limit_ended: common::run_round::Incomplete::from_item(item)
+            .filter(|inc| !inc.held && super::round::ended_by_limit(&inc.reason))
+            .map(|inc| inc.at)
+            .unwrap_or_default(),
     };
     (pr > 0 && c.installation_id > 0 && !c.team_id.is_empty() && !c.run_id.is_empty()).then_some(c)
 }
@@ -503,6 +589,9 @@ async fn perform(
                 }
             }
         }
+        Act::ResumeRound(_) => {
+            super::resume::resume_limit_ended(state, &c.team_id, &c.run_id, c.installation_id).await
+        }
         Act::WatchDeploy => {
             super::health_check::schedule_own(
                 state,
@@ -526,10 +615,14 @@ async fn standing(
     c: &Candidate,
     seen: &Seen,
     working: bool,
-) -> Standing {
+    // The approval the last look read, when nothing changed since.
+    known_approval: Option<bool>,
+) -> (Standing, bool) {
     let cfg =
         super::review_actions::OnApproveConfig::load(state, &c.team_id, &c.owner, &c.repo).await;
-    let human_approved = if seen.open && cfg.auto_merge && cfg.require_human_approval {
+    let human_approved = if let Some(known) = known_approval {
+        known
+    } else if seen.open && cfg.auto_merge && cfg.require_human_approval {
         super::review_actions::fetch_approvals(github, &c.owner, &c.repo, c.pr, &seen.head)
             .await
             .map(|a| a.human_key_at_head())
@@ -537,7 +630,7 @@ async fn standing(
     } else {
         false
     };
-    merge_standing::decide(
+    let standing = merge_standing::decide(
         &format!("{}/{}", c.owner, c.repo),
         &merge_standing::Facts {
             merged: seen.merged,
@@ -555,11 +648,19 @@ async fn standing(
             human_approved,
             blocked_by_rules: seen.blocked && seen.failing.is_empty() && !seen.checks_running,
         },
-    )
+    );
+    (standing, human_approved)
 }
 
-async fn record_look(state: &WorkerState, c: &Candidate, standing: &Standing) {
-    let json = standing.to_json();
+/// Stamps the look, with the standing and the probe when they changed.
+/// `None` for either leaves what is there.
+async fn record_look(
+    state: &WorkerState,
+    c: &Candidate,
+    standing: Option<&Standing>,
+    probe: Option<&str>,
+) {
+    let mut sets = vec!["watch_looked_at = :t".to_string()];
     let mut req = state
         .dynamo
         .update_item()
@@ -568,13 +669,19 @@ async fn record_look(state: &WorkerState, c: &Candidate, standing: &Standing) {
         .key("run_id", attr_s(&c.run_id))
         .condition_expression("attribute_exists(run_id)")
         .expression_attribute_values(":t", attr_s(&chrono::Utc::now().to_rfc3339()));
-    req = if json == c.standing {
-        req.update_expression("SET watch_looked_at = :t")
-    } else {
-        req.update_expression("SET watch_looked_at = :t, #ms = :ms")
+    if let Some(json) = standing.map(Standing::to_json).filter(|j| *j != c.standing) {
+        sets.push("#ms = :ms".to_string());
+        req = req
             .expression_attribute_names("#ms", merge_standing::FIELD)
-            .expression_attribute_values(":ms", attr_s(&json))
-    };
+            .expression_attribute_values(":ms", attr_s(&json));
+    }
+    if let Some(p) = probe.filter(|p| *p != c.probe) {
+        sets.push("#wp = :wp".to_string());
+        req = req
+            .expression_attribute_names("#wp", Probe::FIELD)
+            .expression_attribute_values(":wp", attr_s(p));
+    }
+    req = req.update_expression(format!("SET {}", sets.join(", ")));
     if let Err(e) = req.send().await {
         warn!(run_id = %c.run_id, error = %aws_sdk_dynamodb::error::DisplayErrorContext(&e), "PR watch: could not record the look");
     }
@@ -583,10 +690,40 @@ async fn record_look(state: &WorkerState, c: &Candidate, standing: &Standing) {
 /// Looks at one finished run's pull request and does the one thing it
 /// needs. Returns what it did.
 pub async fn look(state: &WorkerState, github: &GitHubClient, c: &Candidate) -> Act {
-    let Some(seen) = read(state, github, c).await else {
-        return Act::Nothing;
+    // Nothing the last look read has changed: its reads stand, at no cost
+    // to GitHub's budget. What CoderHelm's own records say is read again.
+    let kept = match Probe::parse(&c.probe) {
+        Some(p) if github.unchanged(&p.validators).await => Some(p),
+        _ => None,
     };
-    let mut act = decide(&c.status, &seen, &c.marks);
+    let (seen, mut validators) = match &kept {
+        Some(p) => {
+            let mut seen = p.seen.clone();
+            seen.reviewer_on =
+                super::review_pr::reviewer_enabled(state, &c.team_id, &c.owner, &c.repo).await;
+            seen.own_verdict =
+                super::review_pr::own_verdict(state, &c.team_id, &c.owner, &c.repo, c.pr).await;
+            (seen, p.validators.clone())
+        }
+        None => {
+            github.record_validators();
+            let seen = read(state, github, c).await;
+            let validators = github.take_validators();
+            let Some(seen) = seen else {
+                // GitHub refusing for a while says nothing of the pull
+                // request, and the sweep's order is left as it is. Any
+                // other failure moves on: the look is stamped, so the same
+                // pull requests aren't the only ones a sweep reaches.
+                if github.outside().is_none() {
+                    record_look(state, c, None, None).await;
+                }
+                return Act::Nothing;
+            };
+            (seen, validators)
+        }
+    };
+    let mut act = resume_after_limit(&c.status, &seen, &c.marks, &c.limit_ended)
+        .unwrap_or_else(|| decide(&c.status, &seen, &c.marks));
     if let Some((field, value)) = act.claim(&seen) {
         if !claim(state, c, field, &value).await {
             act = Act::Nothing;
@@ -601,10 +738,36 @@ pub async fn look(state: &WorkerState, github: &GitHubClient, c: &Candidate) -> 
     // earlier look) is CoderHelm working, not a person's turn.
     let working = matches!(
         act,
-        Act::ReviewHead | Act::FixFindings | Act::ResolveConflict
+        Act::ReviewHead | Act::FixFindings | Act::ResolveConflict | Act::ResumeRound(_)
     ) || common::run_status::IN_FLIGHT.contains(&c.status.as_str());
-    let s = standing(state, github, c, &seen, working).await;
-    record_look(state, c, &s).await;
+    if kept.is_none() {
+        github.record_validators();
+    }
+    let (s, human_approved) = standing(
+        state,
+        github,
+        c,
+        &seen,
+        working,
+        kept.as_ref().map(|p| p.human_approved),
+    )
+    .await;
+    let probe = match kept {
+        // Unchanged: the probe stands as it is.
+        Some(_) => None,
+        None => {
+            validators.extend(github.take_validators());
+            Some(
+                Probe {
+                    validators,
+                    seen,
+                    human_approved,
+                }
+                .to_json(),
+            )
+        }
+    };
+    record_look(state, c, Some(&s), probe.as_deref()).await;
     act
 }
 
@@ -650,6 +813,8 @@ pub async fn after_completion(state: &WorkerState, team_id: &str, run_id: &str) 
 pub struct SweepReport {
     pub candidates: usize,
     pub looked_at: usize,
+    /// Installations skipped this cycle for GitHub's budget.
+    pub skipped_installations: usize,
     /// `owner/repo#pr: act` for each pull request picked back up.
     pub acted: Vec<String>,
 }
@@ -696,7 +861,19 @@ pub async fn sweep(state: &WorkerState) -> SweepReport {
     all.retain(|c| c.status != "merged" || c.marks.deploy_sha.is_empty());
     report.candidates = all.len();
     let mut clients: HashMap<u64, GitHubClient> = HashMap::new();
-    for c in order(all, SWEEP_MAX_LOOKS) {
+    // Asked before each look: the sweep never spends the runs' share of
+    // GitHub's budget nor more than its own hour's, and an installation it
+    // skips is said once. The others' pull requests are still reached.
+    let mut budget = crate::clients::github_budget::SweepGate::new(
+        common::github_budget::caller::SWEEP_PR_WATCH,
+    );
+    for c in order(all, usize::MAX) {
+        if report.looked_at >= SWEEP_MAX_LOOKS {
+            break;
+        }
+        if !budget.allows(state, c.installation_id, LOOK_REQUESTS).await {
+            continue;
+        }
         if let std::collections::hash_map::Entry::Vacant(v) = clients.entry(c.installation_id) {
             match client(state, c.installation_id) {
                 Some(g) => {
@@ -713,6 +890,7 @@ pub async fn sweep(state: &WorkerState) -> SweepReport {
                 .push(format!("{}/{}#{}: {act:?}", c.owner, c.repo, c.pr));
         }
     }
+    report.skipped_installations = budget.skipped();
     report
 }
 

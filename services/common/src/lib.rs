@@ -87,6 +87,7 @@ pub mod e2e;
 pub mod git_conventions;
 /// What an installation's token may read: permissions a feature uses when
 /// granted and does without otherwise.
+pub mod github_budget;
 pub mod github_grants;
 pub mod github_wait;
 /// Infrastructure vulnerabilities: public AWS feeds, a team's AWS inventory,
@@ -109,6 +110,7 @@ pub mod settings_index;
 /// Setup: the settings registry, the repo analysis, runs, apply and undo.
 pub mod setup;
 pub mod upgrade_notes;
+pub mod upgrade_quality;
 // Which repo a log group's or alarm's code lives in, from evidence.
 /// Sealed credentials for a team's MCP servers (KMS, bound to team and server).
 pub mod envelope;

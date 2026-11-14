@@ -560,7 +560,7 @@ pub fn key_help(id: &str) -> Option<String> {
         }
     };
     Some(format!(
-        "Create one in {place}, then paste it under Use a key instead."
+        "Create one in {place}, then paste it under Other ways to connect, Use a key."
     ))
 }
 
@@ -579,6 +579,9 @@ pub struct OwnApp {
     pub refresh: &'static str,
     /// Exactly what the package (and the connection check) calls.
     pub scopes: &'static [&'static str],
+    /// What those scopes let Coderhelm do, in plain words, for the card
+    /// (the scope names themselves go behind its "Details").
+    pub reads: &'static str,
     /// The environment variable the package reads the token from.
     #[serde(skip)]
     pub env_var: &'static str,
@@ -615,6 +618,7 @@ pub fn own_app(id: &str) -> Option<OwnApp> {
             token: "https://api.figma.com/v1/oauth/token",
             refresh: "https://api.figma.com/v1/oauth/refresh",
             scopes: &["current_user:read", "file_content:read"],
+            reads: "Coderhelm reads your Figma files and the name of the account that signs in. It can't change anything in Figma.",
             env_var: "FIGMA_OAUTH_TOKEN",
             check: "https://api.figma.com/v1/me",
             console: "https://www.figma.com/developers/apps",

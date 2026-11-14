@@ -89,6 +89,11 @@ use crate::WorkerState;
 pub const STATUS_START: &str = "<!-- coderhelm:draft-status -->";
 pub const STATUS_END: &str = "<!-- /coderhelm:draft-status -->";
 
+/// GitHub requests one sweep decision may make (the pull request, its
+/// timeline, CI, the description, the mark-ready): a decision isn't started
+/// with less than this left of the sweep's budget.
+pub const SWEEP_DECISION_REQUESTS: u64 = 15;
+
 /// A held pull request is decided again this long after the last decision
 /// (the sweep): a person may have dealt with it without a push.
 pub const RECHECK_HELD_SECS: i64 = 3600;
@@ -1978,12 +1983,25 @@ pub async fn sweep(state: &WorkerState) -> SweepReport {
         }
     }
     let mut clients: HashMap<u64, GitHubClient> = HashMap::new();
+    // Asked before each pull request: a peek is one read, a decision up to
+    // `SWEEP_DECISION_REQUESTS`. The sweep never spends the runs' share of
+    // GitHub's budget and says a skip once per installation.
+    let mut budget =
+        crate::clients::github_budget::SweepGate::new(common::github_budget::caller::SWEEP_DRAFTS);
     for c in candidates {
         if report.decided >= SWEEP_MAX_DECISIONS {
             break;
         }
         let step = sweep_step(&c, now);
         if step == SweepStep::Skip || c.installation_id == 0 || c.team_id.is_empty() {
+            continue;
+        }
+        let need = if step == SweepStep::Peek {
+            1
+        } else {
+            SWEEP_DECISION_REQUESTS
+        };
+        if !budget.allows(state, c.installation_id, need).await {
             continue;
         }
         report.looked_at += 1;
@@ -2014,6 +2032,12 @@ pub async fn sweep(state: &WorkerState) -> SweepReport {
                 }
                 Ok(_) => {}
                 Err(_) => continue,
+            }
+            if !budget
+                .allows(state, c.installation_id, SWEEP_DECISION_REQUESTS)
+                .await
+            {
+                continue;
             }
         }
         let mut ctx = Ctx::new(state, gh, &c.team_id, &c.owner, &c.repo, c.pr);

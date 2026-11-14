@@ -21,13 +21,16 @@ use axum::{
     http::StatusCode,
     Extension, Json,
 };
+use common::knowledge::sources::Kind as SourceKind;
 use common::live::aws_account::{self, AwsAccount};
 use common::live::connectors::{self, ConnKind, Connector};
 use common::live::identity;
+use common::mcp_remote::store::{Owner, ServerRecord, Sharing, Status, TokenRecord};
 use common::problems::{Check, Kind, Outcome};
 use serde_json::{json, Value};
 use tracing::{error, info, warn};
 
+use super::integration_status::{product_state, Action, Need, Path as Way, ProductState, Use};
 use crate::models::Claims;
 use crate::AppState;
 
@@ -69,7 +72,7 @@ pub fn section_of(id: &str) -> &'static str {
         "github" | "jira" | "atlassian" => "code",
         "aws" | "opensearch" | "rest" => "cloud",
         "newrelic" | "sentry" => "monitoring",
-        "confluence" | "notion" | "figma" | "sanity" => "docs",
+        "confluence" | "notion" | "figma" | "sanity" | "google_drive" => "docs",
         "teams" | "slack" => "chat",
         // Remote MCP servers an admin added by address (`mcp:<id>`).
         "mcp" => "mcp",
@@ -210,7 +213,7 @@ pub fn remote_state(
 pub fn connector_state(c: Option<&Connector>) -> CardState {
     match c {
         None => cs("not_connected", "", "connect"),
-        Some(c) if c.key_sealed.is_empty() && !c.via_jira_app() => {
+        Some(c) if c.key_sealed.is_empty() && !c.via_jira_app() && !c.via_sign_in() => {
             cs("needs_credentials", "No key is saved.", "add_credentials")
         }
         Some(c) if c.status != "ready" => cs(
@@ -226,12 +229,19 @@ pub fn connector_state(c: Option<&Connector>) -> CardState {
             "connected",
             if c.via_jira_app() {
                 "Connected through the Jira app but paused: agents don't use it."
+            } else if c.via_sign_in() {
+                "Reads with the team's Atlassian sign-in but paused: agents don't use it."
             } else {
                 "Connected but paused: agents don't use it."
             },
             "manage",
         ),
         Some(c) if c.via_jira_app() => cs("connected", "Connected through the Jira app.", "manage"),
+        Some(c) if c.via_sign_in() => cs(
+            "connected",
+            "Agents read pages with the team's Atlassian sign-in.",
+            "manage",
+        ),
         Some(_) => cs("connected", "", "manage"),
     }
 }
@@ -349,7 +359,321 @@ fn card(
         "last_check": last_check,
         "manage_href": manage,
         "detail": detail,
+        // What it is used for, how it is connected and by whom: filled in
+        // for a product reached in more than one way ([`product_card`]).
+        "uses": [],
+        "how": "",
+        "connected_by": "",
+        "connected_at": "",
     })
+}
+
+/// A card whose state comes from every way the team reaches the product
+/// (`integration_status`).
+fn product_card(
+    id: &str,
+    name: &str,
+    does: &str,
+    p: &ProductState,
+    last_check: &str,
+    manage: &str,
+    detail: Value,
+) -> Value {
+    let mut v = card(id, name, does, p.card.clone(), last_check, manage, detail);
+    if let Some(fields) = p.fields().as_object() {
+        for (k, val) in fields {
+            v[k.as_str()] = val.clone();
+        }
+    }
+    v
+}
+
+/// The sign-in a team (or, for Sanity, this person) made so Knowledge can
+/// sync a product: its record and its connection, when someone signed in.
+#[derive(Debug, Clone)]
+pub struct KnowledgeSignIn {
+    pub kind: SourceKind,
+    pub server: ServerRecord,
+    pub token: TokenRecord,
+    /// How many of the team's Knowledge sources are of this kind.
+    pub sources: usize,
+}
+
+impl KnowledgeSignIn {
+    fn personal(&self) -> bool {
+        self.server.sharing == Sharing::Personal
+    }
+
+    fn works(&self) -> bool {
+        self.token.status == Status::Connected
+    }
+
+    /// Whose sign-in it is, in a card's words.
+    pub fn how(&self) -> String {
+        match (self.kind, self.personal()) {
+            (_, true) => format!("your {} sign-in", self.kind.label()),
+            (SourceKind::Confluence, _) => "the team's Atlassian sign-in".into(),
+            (SourceKind::GoogleDrive, _) => "the team's Google sign-in".into(),
+            (k, _) => format!("the team's {} sign-in", k.label()),
+        }
+    }
+
+    /// The sign-in's own state. A sign-in that stopped working is renewed
+    /// by signing in again, whatever stopped it.
+    pub fn state(&self) -> CardState {
+        let why = self.token.status_reason.clone();
+        match self.token.status {
+            Status::Connected => cs("connected", "", "manage"),
+            Status::Failed => cs("error", why, "reconnect"),
+            Status::NotConnected => cs("not_connected", why, "connect"),
+            Status::NeedsReconnect => cs(
+                "needs_reconnect",
+                if why.is_empty() {
+                    "The sign-in has to be renewed.".to_string()
+                } else {
+                    why
+                },
+                "reconnect",
+            ),
+        }
+    }
+
+    /// The way Knowledge reaches the product.
+    pub fn way(&self) -> Way {
+        Way::new(&self.how(), self.state(), &[Use::Knowledge])
+            .by(&self.token.connected_by, &self.token.connected_at)
+    }
+
+    fn json(&self) -> Value {
+        let st = self.state();
+        json!({
+            "kind": self.kind.key(),
+            "label": self.kind.label(),
+            "server_id": self.server.id,
+            "personal": self.personal(),
+            "status": st.status,
+            "reason": st.reason,
+            "connected_by": self.token.connected_by,
+            "connected_at": self.token.connected_at,
+            "sources": self.sources,
+        })
+    }
+}
+
+/// The Knowledge source kind a card's product is also synced as.
+pub fn knowledge_kind(card_id: &str) -> Option<SourceKind> {
+    match card_id {
+        "confluence" => Some(SourceKind::Confluence),
+        "notion" => Some(SourceKind::Notion),
+        "sanity" => Some(SourceKind::Sanity),
+        "google_drive" => Some(SourceKind::GoogleDrive),
+        _ => None,
+    }
+}
+
+const KNOWLEDGE_HREF: &str = "/knowledge/";
+
+/// Confluence's card, from the connection agents read with (an API token,
+/// the Jira app, or the team's Atlassian sign-in switched on for runs) and
+/// the sign-in made for Knowledge.
+pub fn confluence_product(
+    conn: Option<&Connector>,
+    knowledge: Option<&KnowledgeSignIn>,
+    sources: usize,
+) -> ProductState {
+    let mut ways = Vec::new();
+    if let Some(k) = knowledge {
+        // The same sign-in reads pages during runs once an admin turns
+        // that on: its scopes cover it, so nobody signs in twice.
+        ways.push(k.way().extend(
+            Use::Runs,
+            "The same sign-in can read pages during runs and reviews. Turn it on: no second sign-in.",
+            Some(Action::new("use_in_runs", "Use in runs too")),
+        ));
+    }
+    if let Some(c) = conn {
+        let mut st = connector_state(Some(c));
+        let how = if c.via_jira_app() {
+            "the Jira app"
+        } else if c.via_sign_in() {
+            "the team's Atlassian sign-in"
+        } else {
+            "an API token"
+        };
+        // Reading with the sign-in stops when the sign-in does.
+        if c.via_sign_in() && st.status == "connected" && !knowledge.is_some_and(|k| k.works()) {
+            st = match knowledge {
+                Some(k) => k.state(),
+                None => cs(
+                    "needs_reconnect",
+                    "The team isn't signed in to Confluence any more.",
+                    "reconnect",
+                ),
+            };
+        }
+        let token = !c.via_jira_app() && !c.via_sign_in();
+        // A saved token also syncs Knowledge's sources when nobody signed in.
+        let serves: &[Use] = if token && knowledge.is_none() && sources > 0 {
+            &[Use::Runs, Use::Knowledge]
+        } else {
+            &[Use::Runs]
+        };
+        let mut way = Way::new(how, st, serves).by(&c.updated_by, &c.updated_at);
+        if token {
+            way = way.extend(
+                Use::Knowledge,
+                "Knowledge can sync with the same token: add a source there.",
+                Some(Action::link("Add a source in Knowledge", KNOWLEDGE_HREF)),
+            );
+        }
+        ways.push(way);
+    }
+    let needs = [Need {
+        for_use: Use::Knowledge,
+        detail: "Syncing pages into Knowledge needs an Atlassian sign-in or an API token: the Jira app only reads pages during runs.".into(),
+        action: Some(Action::link("Connect in Knowledge", KNOWLEDGE_HREF)),
+    }];
+    product_state(&[Use::Runs, Use::Knowledge], &ways, &needs)
+}
+
+/// The ways a team reaches a catalog product, as found in its records.
+#[derive(Debug, Default)]
+pub struct CatalogWays<'a> {
+    /// The app sign-in's card JSON (`mcp_servers::own_app_json`).
+    pub own_app: Option<&'a Value>,
+    /// The vendor's remote server and this person's (or the team's)
+    /// connection to it.
+    pub remote: Option<(&'a ServerRecord, Option<&'a TokenRecord>)>,
+    /// The key for the vendor's package, when the switch was ever set.
+    pub key: Option<CardState>,
+    pub key_at: &'a str,
+    pub knowledge: Option<&'a KnowledgeSignIn>,
+    pub sources: usize,
+}
+
+/// A catalog product's card (Notion, Sanity, Figma, Sentry and the rest):
+/// one status from its app sign-in, the vendor's remote server, its key and
+/// its Knowledge sign-in.
+pub fn catalog_product(id: &str, name: &str, w: &CatalogWays) -> ProductState {
+    let kind = knowledge_kind(id);
+    let mut ways = Vec::new();
+    if let Some(k) = w.knowledge {
+        ways.push(k.way());
+    }
+    if let Some(o) = w.own_app {
+        let how = if o["source"] == "coderhelm" {
+            format!("Coderhelm's {name} app")
+        } else {
+            format!("your own {name} app")
+        };
+        let st = own_app_state(o, &cs("not_connected", "", "connect"));
+        ways.push(Way::new(&how, st, &[Use::Runs]).by(
+            o["connected_by"].as_str().unwrap_or(""),
+            o["connected_at"].as_str().unwrap_or(""),
+        ));
+    }
+    if let Some((r, token)) = w.remote {
+        let mut way = Way::new(
+            &format!("{name}'s own server"),
+            remote_state(r, token),
+            &[Use::Runs],
+        );
+        if let Some(t) = token {
+            way = way.by(&t.connected_by, &t.connected_at);
+        }
+        // A member's sign-in on Sanity's server is the one Knowledge syncs with.
+        if kind == Some(SourceKind::Sanity) {
+            way = way.extend(
+                Use::Knowledge,
+                "Knowledge can sync with this sign-in: add a source there.",
+                Some(Action::link("Add a source in Knowledge", KNOWLEDGE_HREF)),
+            );
+        }
+        ways.push(way);
+    }
+    if let Some(st) = &w.key {
+        // Notion's and Sanity's saved keys also sync Knowledge's sources.
+        let syncs = matches!(kind, Some(SourceKind::Notion | SourceKind::Sanity));
+        let serves: &[Use] = if syncs && w.knowledge.is_none() && w.sources > 0 {
+            &[Use::Runs, Use::Knowledge]
+        } else {
+            &[Use::Runs]
+        };
+        let mut way = Way::new("a key", st.clone(), serves).by("", w.key_at);
+        if syncs {
+            way = way.extend(
+                Use::Knowledge,
+                "Knowledge can sync with the same key: add a source there.",
+                Some(Action::link("Add a source in Knowledge", KNOWLEDGE_HREF)),
+            );
+        }
+        ways.push(way);
+    }
+    let needs: Vec<Need> = match kind {
+        Some(SourceKind::Notion) => vec![
+            Need {
+                for_use: Use::Runs,
+                detail: "Using Notion in runs needs Notion's own sign-in for agents, or a key: Notion grants that separately from Knowledge.".into(),
+                action: Some(Action::new("connect", "Connect for runs")),
+            },
+            Need {
+                for_use: Use::Knowledge,
+                detail: "Syncing Notion into Knowledge needs the Notion sign-in Knowledge uses, or a key: Notion grants that separately.".into(),
+                action: Some(Action::link("Connect in Knowledge", KNOWLEDGE_HREF)),
+            },
+        ],
+        Some(SourceKind::Sanity) => vec![Need {
+            for_use: Use::Runs,
+            detail: "Using Sanity in runs needs Sanity connected here, so an admin can pick its tools.".into(),
+            action: Some(Action::new("connect", "Connect for runs")),
+        }],
+        _ => Vec::new(),
+    };
+    let uses: &[Use] = if kind.is_some() {
+        &[Use::Runs, Use::Knowledge]
+    } else {
+        &[Use::Runs]
+    };
+    product_state(uses, &ways, &needs)
+}
+
+/// The sign-ins the team made for Knowledge, by kind.
+async fn knowledge_sign_ins(
+    rt: &common::mcp_remote::runtime::Runtime,
+    email: &str,
+    sources: &[common::knowledge::sources::Source],
+) -> Vec<KnowledgeSignIn> {
+    let mut out = Vec::new();
+    for kind in [
+        SourceKind::Confluence,
+        SourceKind::Notion,
+        SourceKind::Sanity,
+        SourceKind::GoogleDrive,
+    ] {
+        let id = common::knowledge::sources::oauth::connection_id(kind);
+        let Ok(Some(server)) = rt.store.get_server(&rt.team, &id).await else {
+            continue;
+        };
+        let owner = match server.sharing {
+            Sharing::Personal => Owner::user(email),
+            Sharing::Shared => Owner::Team,
+        };
+        // A record nobody finished signing in to is no connection.
+        let Ok(Some(token)) = rt.store.get_token(&rt.team, &id, &owner).await else {
+            continue;
+        };
+        out.push(KnowledgeSignIn {
+            kind,
+            server,
+            token,
+            sources: sources_of(sources, kind),
+        });
+    }
+    out
+}
+
+fn sources_of(sources: &[common::knowledge::sources::Source], kind: SourceKind) -> usize {
+    sources.iter().filter(|s| s.kind == Some(kind)).count()
 }
 
 /// Checks the account's role (read-only) and saves what it can do.
@@ -514,7 +838,7 @@ pub async fn list(
         aws_account::list(&state.dynamo, &state.config.aws_insights_table_name, &team)
             .await
             .map_err(|e| internal("list aws accounts", e))?;
-    with_knowledge_bases(&state, &team, &mut accounts).await;
+    let sources = with_knowledge_bases(&state, &team, &mut accounts).await;
     // A support view only reads: no migration, no checks into the team's
     // AWS accounts (they would run as the support admin).
     let support_view = claims.support_view.is_some();
@@ -582,6 +906,18 @@ pub async fn list(
             .unwrap_or(common::mcp_remote::store::Owner::Team);
         if let Ok(Some(t)) = rt.store.get_token(&team, &r.id, &owner).await {
             my_tokens.insert(r.id.clone(), t);
+        }
+    }
+    // The sign-ins made for Knowledge (kept apart from MCP servers): a
+    // product signed in to there is connected here too.
+    let knowledge = knowledge_sign_ins(&rt, &claims.email, &sources).await;
+    let knowledge_of = |kind: SourceKind| knowledge.iter().find(|k| k.kind == kind);
+    // Sign-ins nobody finished are removed once they expire, whether or
+    // not the table expires records on its own.
+    if !support_view {
+        let swept = rt.sweep_pending().await;
+        if swept > 0 {
+            info!(team_id = %team, swept, "Expired sign-ins in progress removed");
         }
     }
 
@@ -689,6 +1025,24 @@ pub async fn list(
                 }
                 None => (kind.as_str().to_string(), kind.label().to_string()),
             };
+            if kind == ConnKind::Confluence {
+                // One status from every way the team reaches Confluence:
+                // the connection agents read with and the Knowledge sign-in.
+                let k = knowledge_of(SourceKind::Confluence);
+                let p = confluence_product(c, k, sources_of(&sources, SourceKind::Confluence));
+                let mut detail = detail;
+                detail["knowledge"] = json!(k.map(KnowledgeSignIn::json));
+                items.push(product_card(
+                    &id,
+                    &name,
+                    does,
+                    &p,
+                    c.map(|c| c.updated_at.as_str()).unwrap_or(""),
+                    "",
+                    detail,
+                ));
+                continue;
+            }
             items.push(card(
                 &id,
                 &name,
@@ -755,27 +1109,34 @@ pub async fn list(
             !tested_at.is_empty() && tested_at >= creds_at,
         );
         let custom_prompt = rec.map(|r| s(r, "custom_prompt")).unwrap_or_default();
-        // Connected through the vendor's remote server: that connection's
-        // state is the card's (the key form stays as a fallback).
+        // The vendor's own remote server, when the team set it up.
         let remote = remotes.iter().find(|r| r.id == id && r.catalog_id == id);
-        // A sign-in started but never finished doesn't hide a key that works.
-        let st = match remote {
-            Some(r) => {
-                let rs = remote_state(r, my_tokens.get(&r.id));
-                if rs.status == "not_connected" && enabled == Some(true) {
-                    st
-                } else {
-                    rs
-                }
-            }
-            None => st,
+        // A record for a vendor's server the catalog no longer offers
+        // (Figma's takes only apps Figma approved) that was never
+        // connected: kept, said on the card as unused, and not a second
+        // sign-in beside the one that works.
+        let offered = !p["remote_url"].as_str().unwrap_or("").is_empty();
+        let (remote, unused) = match remote {
+            Some(r) if !offered && remote_state(r, my_tokens.get(&r.id)).status != "connected" => (
+                None,
+                vec![json!({
+                    "id": r.id,
+                    "name": r.name,
+                    "kind": "remote",
+                    "note": format!(
+                        "A sign-in through {}'s own server was started and never finished. Coderhelm doesn't use it.",
+                        r.name
+                    ),
+                })],
+            ),
+            r => (r, Vec::new()),
         };
         let tested_at = match remote {
             Some(r) => r.tools_listed_at.clone(),
             None => tested_at,
         };
-        // Signed in with the team's own app: that sign-in is what agents
-        // use (the key stays as a fallback), so its state is the card's.
+        // The sign-in with an app (CoderHelm's or the team's own): what
+        // agents use first when it is there.
         let own = match common::mcp_remote::own_app::load(&rt, &id).await {
             Ok(o) => o,
             Err(e) => {
@@ -787,10 +1148,23 @@ pub async fn list(
             Some(o) => Some(super::mcp_servers::own_app_json(&state, &rt, o).await),
             None => None,
         };
-        let st = match own_json.as_ref().map(|o| own_app_state(o, &st)) {
-            Some(s) => s,
-            None => st,
-        };
+        // One status from every way the team reaches it: the app sign-in
+        // agents use first, the vendor's server, the key, and the sign-in
+        // made for Knowledge.
+        let kind = knowledge_kind(&id);
+        let k = kind.and_then(&knowledge_of);
+        let product = catalog_product(
+            &id,
+            p["name"].as_str().unwrap_or(&id),
+            &CatalogWays {
+                own_app: own_json.as_ref(),
+                remote: remote.map(|r| (r, my_tokens.get(&r.id))),
+                key: enabled.is_some().then_some(st),
+                key_at: &creds_at,
+                knowledge: k,
+                sources: kind.map_or(0, |kind| sources_of(&sources, kind)),
+            },
+        );
         // Where the team's own app sends people back, for its setup steps.
         let own_redirect = common::mcp_catalog::own_app(&id)
             .map(|_| super::mcp_servers::redirect_uri(&state.config.stage));
@@ -808,15 +1182,32 @@ pub async fn list(
             "custom_prompt": if can_edit { custom_prompt } else { String::new() },
             "last_test_ok": rec.and_then(|r| ob(r, "last_test_ok")),
             "last_test_message": rec.map(|r| s(r, "last_test_message")).unwrap_or_default(),
+            "knowledge": k.map(KnowledgeSignIn::json),
+            "unused": unused,
         });
-        items.push(card(
+        items.push(product_card(
             &id,
             p["name"].as_str().unwrap_or(&id),
             p["description"].as_str().unwrap_or(""),
-            st,
+            &product,
             &tested_at,
             "",
             detail,
+        ));
+    }
+
+    // Google Drive is only ever synced into Knowledge: it has a card here
+    // once the team signed in, so the sign-in is seen where sign-ins are.
+    if let Some(k) = knowledge_of(SourceKind::GoogleDrive) {
+        let p = product_state(&[Use::Knowledge], &[k.way()], &[]);
+        items.push(product_card(
+            "google_drive",
+            "Google Drive",
+            "Syncs the folders, Docs, Sheets, Slides and PDFs you pick into Knowledge. It only reads.",
+            &p,
+            "",
+            KNOWLEDGE_HREF,
+            json!({ "knowledge": k.json() }),
         ));
     }
 
@@ -879,13 +1270,18 @@ async fn load_account(
 
 /// Each account's connected knowledge bases and import buckets, so its
 /// update link keeps the role able to search and read them.
-async fn with_knowledge_bases(state: &AppState, team_id: &str, accounts: &mut [AwsAccount]) {
+async fn with_knowledge_bases(
+    state: &AppState,
+    team_id: &str,
+    accounts: &mut [AwsAccount],
+) -> Vec<common::knowledge::sources::Source> {
     let bases = team_bases(state, team_id).await;
     let sources = team_sources(state, team_id).await;
     for a in accounts {
         a.knowledge_bases = common::knowledge::remote::arns_in(&bases, &a.account);
         a.import_buckets = common::knowledge::sources::s3::buckets_in(&sources, &a.account);
     }
+    sources
 }
 
 /// Every knowledge source of the team (the buckets it imports from).
@@ -1281,6 +1677,517 @@ mod tests {
         assert!(e.contains("typed-name"), "only discovered environments");
         assert!(AbilityChange::parse(&json!({ "metrics": "yes" })).is_err());
         assert!(AbilityChange::parse(&json!({ "airflow_environments": "prod" })).is_err());
+    }
+
+    // ── One status per product, from every record the team has ──────────
+
+    fn token(status: Status, reason: &str) -> TokenRecord {
+        TokenRecord {
+            owner: Owner::Team,
+            sealed: String::new(),
+            expires_at: None,
+            scope: String::new(),
+            version: 1,
+            status,
+            status_reason: reason.into(),
+            step_up: vec![],
+            connected_by: "ada@example.com".into(),
+            connected_at: "2026-11-11T10:00:00Z".into(),
+        }
+    }
+
+    /// The sign-in Knowledge made for `kind` (`MCPSERVER#ks-<kind>` and its
+    /// `MCPTOKEN`).
+    fn signed_in(kind: SourceKind, status: Status) -> KnowledgeSignIn {
+        let id = common::knowledge::sources::oauth::connection_id(kind);
+        let mut server = ServerRecord::new(
+            &id,
+            &format!("{} (knowledge)", kind.label()),
+            "https://auth.example.com",
+        );
+        server.catalog_id = common::knowledge::sources::oauth::catalog_id(kind);
+        server.auth = common::mcp_remote::store::AuthKind::OAuth;
+        if kind == SourceKind::Sanity {
+            server.sharing = Sharing::Personal;
+        }
+        let reason = if status == Status::Connected {
+            ""
+        } else {
+            "The provider ended the sign-in."
+        };
+        KnowledgeSignIn {
+            kind,
+            server,
+            token: token(status, reason),
+            sources: 0,
+        }
+    }
+
+    fn confluence_token() -> Connector {
+        Connector {
+            enabled: true,
+            status: "ready".into(),
+            key_sealed: "sealed".into(),
+            site: "https://example.atlassian.net".into(),
+            email: "bot@example.com".into(),
+            updated_by: "grace@example.com".into(),
+            updated_at: "2026-11-01T09:00:00Z".into(),
+            ..Connector::new(ConnKind::Confluence)
+        }
+    }
+
+    fn jira_app_confluence() -> Connector {
+        common::live::jira_app::JiraApp {
+            site: "https://example.atlassian.net".into(),
+            confluence_url: "https://example.invalid/x1/confluence".into(),
+            secret: "s".into(),
+        }
+        .default_confluence()
+    }
+
+    fn use_state(p: &ProductState, u: Use) -> &str {
+        p.uses.iter().find(|s| s.of == u).unwrap().state
+    }
+
+    /// The report: a connected-app record for Confluence as a knowledge
+    /// source and its team sign-in, no saved connector, and a Jira app that
+    /// can't reach Confluence. The card read "Not connected".
+    #[test]
+    fn confluence_signed_in_for_knowledge_only_is_connected() {
+        let k = signed_in(SourceKind::Confluence, Status::Connected);
+        let p = confluence_product(None, Some(&k), 0);
+        assert_eq!((p.card.status, p.card.action), ("connected", "manage"));
+        assert_eq!(
+            p.card.reason,
+            "Connected for Knowledge. The same sign-in can read pages during runs and reviews. Turn it on: no second sign-in."
+        );
+        assert_eq!(use_state(&p, Use::Knowledge), "on");
+        assert_eq!(use_state(&p, Use::Runs), "ready");
+        assert_eq!(p.how, "the team's Atlassian sign-in");
+        assert_eq!(p.connected_by, "ada@example.com");
+        assert_eq!(p.connected_at, "2026-11-11T10:00:00Z");
+    }
+
+    #[test]
+    fn confluence_in_every_combination_of_its_records() {
+        let k_ok = signed_in(SourceKind::Confluence, Status::Connected);
+        let k_renew = signed_in(SourceKind::Confluence, Status::NeedsReconnect);
+        let token = confluence_token();
+        let app = jira_app_confluence();
+        let signed = Connector {
+            enabled: true,
+            status: "ready".into(),
+            via: common::live::connectors::VIA_SIGN_IN.into(),
+            site: "https://example.atlassian.net".into(),
+            ..Connector::new(ConnKind::Confluence)
+        };
+
+        // Nothing at all.
+        let p = confluence_product(None, None, 0);
+        assert_eq!((p.card.status, p.card.action), ("not_connected", "connect"));
+
+        // An API token only: runs work, Knowledge can use the same token.
+        let p = confluence_product(Some(&token), None, 0);
+        assert_eq!(p.card.status, "connected");
+        assert_eq!(
+            p.card.reason,
+            "Connected for runs and reviews. Knowledge can sync with the same token: add a source there."
+        );
+        assert_eq!(use_state(&p, Use::Knowledge), "ready");
+        assert_eq!(p.connected_by, "grace@example.com");
+        // Once a source syncs with that token, both uses are on.
+        let p = confluence_product(Some(&token), None, 2);
+        assert_eq!(p.card.reason, "Used in runs and reviews, and in Knowledge.");
+
+        // The Jira app only: Knowledge needs a different grant, said exactly.
+        let p = confluence_product(Some(&app), None, 0);
+        assert_eq!(p.card.status, "connected");
+        assert!(
+            p.card.reason.starts_with("Connected for runs and reviews."),
+            "{}",
+            p.card.reason
+        );
+        assert!(
+            p.card.reason.contains(
+                "Syncing pages into Knowledge needs an Atlassian sign-in or an API token"
+            ),
+            "{}",
+            p.card.reason
+        );
+        assert_eq!(use_state(&p, Use::Knowledge), "needs");
+
+        // Token and Knowledge sign-in, the Jira app and Knowledge sign-in.
+        for c in [&token, &app] {
+            let p = confluence_product(Some(c), Some(&k_ok), 1);
+            assert_eq!(p.card.status, "connected");
+            assert!(
+                p.card
+                    .reason
+                    .starts_with("Used in runs and reviews, and in Knowledge."),
+                "{}",
+                p.card.reason
+            );
+        }
+
+        // Runs switched on with the Knowledge sign-in: one sign-in, both uses.
+        let p = confluence_product(Some(&signed), Some(&k_ok), 1);
+        assert_eq!(p.card.status, "connected");
+        assert_eq!(
+            p.card.reason,
+            "Used in runs and reviews, and in Knowledge. Agents read pages with the team's Atlassian sign-in."
+        );
+        // That sign-in ends: both uses need it renewed, with one action.
+        let p = confluence_product(Some(&signed), Some(&k_renew), 1);
+        assert_eq!(
+            (p.card.status, p.card.action),
+            ("needs_reconnect", "reconnect")
+        );
+        assert_eq!(p.card.reason, "The provider ended the sign-in.");
+        // ... or was removed from under the connection.
+        let p = confluence_product(Some(&signed), None, 0);
+        assert_eq!(p.card.status, "needs_reconnect");
+        assert!(p.card.reason.contains("isn't signed in to Confluence"));
+
+        // The Knowledge sign-in needs renewing while a token still works:
+        // attention, never "not connected".
+        let p = confluence_product(Some(&token), Some(&k_renew), 1);
+        assert_eq!(
+            (p.card.status, p.card.action),
+            ("needs_reconnect", "reconnect")
+        );
+        assert_eq!(
+            p.card.reason,
+            "Runs and reviews still work. Knowledge: The provider ended the sign-in."
+        );
+
+        // Only a Knowledge sign-in that needs renewing.
+        let p = confluence_product(None, Some(&k_renew), 0);
+        assert_eq!(p.card.status, "needs_reconnect");
+        assert_eq!(use_state(&p, Use::Runs), "off");
+
+        // A token Confluence refuses beside a working Knowledge sign-in.
+        let bad = Connector {
+            status: "error".into(),
+            status_message: "Confluence didn't accept the email and token.".into(),
+            ..confluence_token()
+        };
+        let p = confluence_product(Some(&bad), Some(&k_ok), 1);
+        assert_eq!((p.card.status, p.card.action), ("error", "check_again"));
+        assert!(
+            p.card.reason.starts_with("Knowledge still works."),
+            "{}",
+            p.card.reason
+        );
+    }
+
+    fn remote(id: &str, name: &str, status: Status) -> ServerRecord {
+        let mut r = ServerRecord::new(id, name, &format!("https://mcp.{id}.example/mcp"));
+        r.catalog_id = id.into();
+        r.auth = common::mcp_remote::store::AuthKind::OAuth;
+        r.status = status;
+        r.allowed = ["search".to_string()].into();
+        r.approved = r.allowed.clone();
+        r
+    }
+
+    fn key_on() -> CardState {
+        plugin_state(Some(true), true, Some(true), "", true)
+    }
+
+    #[test]
+    fn notion_in_every_combination_of_its_records() {
+        let k = signed_in(SourceKind::Notion, Status::Connected);
+        let r = remote("notion", "Notion", Status::Connected);
+        let r_off = remote("notion", "Notion", Status::NotConnected);
+        let ways = |own: Option<(&ServerRecord, Option<&TokenRecord>)>,
+                    key: Option<CardState>,
+                    knowledge: Option<&KnowledgeSignIn>,
+                    sources: usize| {
+            let w = CatalogWays {
+                remote: own,
+                key,
+                knowledge,
+                sources,
+                ..Default::default()
+            };
+            catalog_product("notion", "Notion", &w)
+        };
+
+        assert_eq!(ways(None, None, None, 0).card.status, "not_connected");
+
+        // Signed in for Knowledge only: connected, and runs really do need
+        // another grant (Notion's sign-in for agents is a different one).
+        let p = ways(None, None, Some(&k), 1);
+        assert_eq!(p.card.status, "connected");
+        assert_eq!(
+            p.card.reason,
+            "Connected for Knowledge. Using Notion in runs needs Notion's own sign-in for agents, or a key: Notion grants that separately from Knowledge."
+        );
+        assert_eq!(use_state(&p, Use::Runs), "needs");
+        assert_eq!(p.how, "the team's Notion sign-in");
+        // A sign-in for agents that was started and never finished changes nothing.
+        let p2 = ways(Some((&r_off, None)), None, Some(&k), 1);
+        assert_eq!(p2.card, p.card);
+
+        // Notion's own server only: runs work, Knowledge needs its own grant.
+        let p = ways(Some((&r, None)), None, None, 0);
+        assert_eq!(p.card.status, "connected");
+        assert!(p.card.reason.starts_with("Connected for runs and reviews."));
+        assert!(p
+            .card
+            .reason
+            .contains("Syncing Notion into Knowledge needs"));
+        assert_eq!(use_state(&p, Use::Knowledge), "needs");
+
+        // A key only: it serves runs and Knowledge can use it too.
+        let p = ways(None, Some(key_on()), None, 0);
+        assert_eq!(use_state(&p, Use::Knowledge), "ready");
+        assert!(p
+            .card
+            .reason
+            .contains("Knowledge can sync with the same key"));
+        let p = ways(None, Some(key_on()), None, 3);
+        assert_eq!(p.card.reason, "Used in runs and reviews, and in Knowledge.");
+
+        // Everything: one card, both uses on.
+        let p = ways(Some((&r, None)), Some(key_on()), Some(&k), 1);
+        assert_eq!(p.card.status, "connected");
+        assert_eq!(p.card.reason, "Used in runs and reviews, and in Knowledge.");
+        assert_eq!(p.how, "Notion's own server");
+
+        // A sign-in started and never finished doesn't hide a key that works.
+        let p = ways(Some((&r_off, None)), Some(key_on()), None, 0);
+        assert_eq!(p.card.status, "connected");
+        assert_eq!(p.how, "a key");
+    }
+
+    #[test]
+    fn sanity_in_every_combination_of_its_records() {
+        let mine = signed_in(SourceKind::Sanity, Status::Connected);
+        let mut r = remote("sanity", "Sanity", Status::Connected);
+        r.sharing = Sharing::Personal;
+        let my_token = TokenRecord {
+            owner: Owner::user("ada@example.com"),
+            ..token(Status::Connected, "")
+        };
+        let product = |w: CatalogWays| catalog_product("sanity", "Sanity", &w);
+
+        // A member's sign-in for Knowledge only.
+        let p = product(CatalogWays {
+            knowledge: Some(&mine),
+            ..Default::default()
+        });
+        assert_eq!(p.card.status, "connected");
+        assert_eq!(p.how, "your Sanity sign-in");
+        assert!(p.card.reason.starts_with("Connected for Knowledge."));
+        assert!(p
+            .card
+            .reason
+            .contains("Using Sanity in runs needs Sanity connected here"));
+
+        // The connected app only, signed in to by this person: runs work
+        // and the same sign-in syncs Knowledge.
+        let p = product(CatalogWays {
+            remote: Some((&r, Some(&my_token))),
+            ..Default::default()
+        });
+        assert_eq!(p.card.status, "connected");
+        assert_eq!(use_state(&p, Use::Knowledge), "ready");
+        assert!(p
+            .card
+            .reason
+            .contains("Knowledge can sync with this sign-in"));
+
+        // The connected app that this person hasn't signed in to yet, and
+        // their Knowledge sign-in: connected, never "not connected".
+        let p = product(CatalogWays {
+            remote: Some((&r, None)),
+            knowledge: Some(&mine),
+            ..Default::default()
+        });
+        assert_eq!(p.card.status, "connected");
+        assert_eq!(use_state(&p, Use::Knowledge), "on");
+
+        // A key and a Knowledge sign-in that needs renewing.
+        let renew = signed_in(SourceKind::Sanity, Status::NeedsReconnect);
+        let p = product(CatalogWays {
+            key: Some(key_on()),
+            knowledge: Some(&renew),
+            ..Default::default()
+        });
+        assert_eq!(p.card.status, "needs_reconnect");
+        assert!(p.card.reason.starts_with("Runs and reviews still work."));
+    }
+
+    /// Figma: a sign-in through Coderhelm's app (`MCPSERVER#app-figma`), an
+    /// older record for Figma's own server (`MCPSERVER#figma`) and the old
+    /// switch (`PLUGIN#figma`). One card.
+    #[test]
+    fn figma_with_several_records_is_one_card() {
+        let ours = |status: &str| {
+            json!({ "status": status, "status_reason": "", "source": "coderhelm",
+                    "connected_by": "ada@example.com", "connected_at": "2026-11-12T08:00:00Z" })
+        };
+        let product = |w: CatalogWays| catalog_product("figma", "Figma", &w);
+        let stale = remote("figma", "Figma", Status::NotConnected);
+        let old_switch = plugin_state(Some(false), false, None, "", false);
+
+        // Signed in with Coderhelm's app; the other records change nothing.
+        let app = ours("connected");
+        let p = product(CatalogWays {
+            own_app: Some(&app),
+            remote: Some((&stale, None)),
+            key: Some(old_switch.clone()),
+            ..Default::default()
+        });
+        assert_eq!(
+            p.card,
+            cs("connected", "Signed in with Coderhelm's app.", "manage")
+        );
+        assert_eq!(p.how, "Coderhelm's Figma app");
+        assert_eq!(p.connected_by, "ada@example.com");
+        assert_eq!(p.uses.len(), 1, "Figma has one use");
+
+        // A sign-in with the app started and never finished, beside the
+        // other unfinished records: not connected, one Connect.
+        let pending = ours("not_connected");
+        let p = product(CatalogWays {
+            own_app: Some(&pending),
+            remote: Some((&stale, None)),
+            key: Some(old_switch),
+            ..Default::default()
+        });
+        assert_eq!(p.card, cs("not_connected", "", "connect"));
+
+        // The app sign-in has to be renewed: that is what agents use, so it
+        // shows even with a key saved.
+        let renew = ours("needs_reconnect");
+        let p = product(CatalogWays {
+            own_app: Some(&renew),
+            key: Some(key_on()),
+            ..Default::default()
+        });
+        assert_eq!(
+            (p.card.status, p.card.action),
+            ("needs_reconnect", "reconnect")
+        );
+
+        // The team's own app, saved but not signed in to, and a key that works.
+        let own = json!({ "status": "not_connected", "status_reason": "", "source": "own" });
+        let p = product(CatalogWays {
+            own_app: Some(&own),
+            key: Some(key_on()),
+            ..Default::default()
+        });
+        assert_eq!(p.card.status, "connected");
+        assert_eq!(p.how, "a key");
+        let p = product(CatalogWays {
+            own_app: Some(&own),
+            ..Default::default()
+        });
+        assert_eq!(
+            p.card.reason,
+            "Your own app is saved. Connect it to sign in."
+        );
+    }
+
+    /// Sentry: the vendor's server and a key.
+    #[test]
+    fn sentry_with_a_sign_in_and_a_key() {
+        let product = |w: CatalogWays| catalog_product("sentry", "Sentry", &w);
+        let r = remote("sentry", "Sentry", Status::Connected);
+        let failed = remote("sentry", "Sentry", Status::Failed);
+        let p = product(CatalogWays {
+            remote: Some((&r, None)),
+            key: Some(plugin_state(Some(true), false, None, "", false)),
+            ..Default::default()
+        });
+        assert_eq!(p.card, cs("connected", "", "manage"));
+        assert_eq!(p.uses.len(), 1);
+        // The sign-in agents would use stopped working: it shows.
+        let p = product(CatalogWays {
+            remote: Some((&failed, None)),
+            key: Some(key_on()),
+            ..Default::default()
+        });
+        assert_eq!((p.card.status, p.card.action), ("error", "check_again"));
+        // Switched on with no credentials and no sign-in.
+        let p = product(CatalogWays {
+            key: Some(plugin_state(Some(true), false, None, "", false)),
+            ..Default::default()
+        });
+        assert_eq!(
+            (p.card.status, p.card.action),
+            ("needs_credentials", "add_credentials")
+        );
+        // No tools allowed yet is still said on the card.
+        let mut bare = remote("sentry", "Sentry", Status::Connected);
+        bare.allowed.clear();
+        let p = product(CatalogWays {
+            remote: Some((&bare, None)),
+            ..Default::default()
+        });
+        assert_eq!(
+            p.card.reason,
+            "No tools are allowed yet, so agents don't get it."
+        );
+    }
+
+    #[test]
+    fn google_drive_signed_in_for_knowledge_has_a_card() {
+        let k = signed_in(SourceKind::GoogleDrive, Status::Connected);
+        let p = product_state(&[Use::Knowledge], &[k.way()], &[]);
+        let v = product_card(
+            "google_drive",
+            "Google Drive",
+            "",
+            &p,
+            "",
+            KNOWLEDGE_HREF,
+            json!({}),
+        );
+        assert_eq!(v["status"], "connected");
+        assert_eq!(v["section"], "docs");
+        assert_eq!(v["how"], "the team's Google sign-in");
+        assert_eq!(v["connected_by"], "ada@example.com");
+        assert_eq!(v["uses"][0]["id"], "knowledge");
+        assert_eq!(v["uses"][0]["state"], "on");
+        let renew = signed_in(SourceKind::GoogleDrive, Status::NeedsReconnect);
+        let p = product_state(&[Use::Knowledge], &[renew.way()], &[]);
+        assert_eq!(
+            (p.card.status, p.card.action),
+            ("needs_reconnect", "reconnect")
+        );
+        // Every card carries the same fields, filled in or not.
+        let plain = card(
+            "github",
+            "GitHub",
+            "",
+            cs("connected", "", "manage"),
+            "",
+            "",
+            json!({}),
+        );
+        assert_eq!(plain["uses"], json!([]));
+        assert_eq!(plain["connected_by"], "");
+    }
+
+    #[test]
+    fn a_knowledge_sign_in_says_whose_it_is() {
+        let json = signed_in(SourceKind::Confluence, Status::Connected).json();
+        assert_eq!(json["server_id"], "ks-confluence");
+        assert_eq!(json["kind"], "confluence");
+        assert_eq!(json["status"], "connected");
+        assert_eq!(json["personal"], false);
+        assert_eq!(
+            signed_in(SourceKind::Sanity, Status::Connected).json()["personal"],
+            true
+        );
+        for id in ["confluence", "notion", "sanity", "google_drive"] {
+            assert!(knowledge_kind(id).is_some(), "{id}");
+        }
+        assert!(knowledge_kind("figma").is_none());
+        assert!(knowledge_kind("sentry").is_none());
     }
 
     #[test]

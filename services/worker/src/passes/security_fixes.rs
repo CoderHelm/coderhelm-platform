@@ -1955,8 +1955,12 @@ struct Ctx<'a> {
 }
 
 impl Ctx<'_> {
+    /// The tick's time is used, or the sweep may not spend GitHub's budget
+    /// now (the runs' share, its own hour's cap, a spent limit): every loop
+    /// here asks before its next item, so a sweep stops instead of failing
+    /// item by item.
     fn out_of_time(&self) -> bool {
-        self.started.elapsed().as_secs() >= TICK_BUDGET_SECS
+        self.started.elapsed().as_secs() >= TICK_BUDGET_SECS || self.gh.held()
     }
 }
 
@@ -4319,6 +4323,9 @@ pub async fn pr_body(state: &WorkerState, msg: &TicketMessage, change: &str) -> 
         .as_ref()
         .map(|i| s(i, "dep_report"))
         .unwrap_or_default();
+    check.upgrade_facts = item
+        .as_ref()
+        .and_then(|i| common::upgrade_quality::UpgradeFacts::from_json(&s(i, "dep_facts")));
     let mut links = body_links(state, item.as_ref());
     // A bundle too long to describe in full keeps its full detail on its
     // branch, beside the plan CoderHelm commits there, when the team lets
@@ -4659,6 +4666,9 @@ pub(crate) async fn at_head(
         .as_ref()
         .map(|i| s(i, "dep_report"))
         .unwrap_or_default();
+    check.upgrade_facts = item
+        .as_ref()
+        .and_then(|i| common::upgrade_quality::UpgradeFacts::from_json(&s(i, "dep_facts")));
     // The same links as when it opened: the rewritten sections are the
     // short ones a bundle's description carries.
     let links = body_links(state, item.as_ref());
@@ -4793,6 +4803,17 @@ pub(crate) async fn dep_inputs(
     let cfg = load_config(state, team_id).await.unwrap_or_default();
     let findings = unit_findings(state, team_id, &unit).await;
     (!findings.is_empty()).then_some(DepInputs { findings, cfg })
+}
+
+/// The upgrade evidence a dependency run recorded for its head commit
+/// (`passes::upgrade_quality::record`), when it recorded one.
+pub(crate) async fn dep_facts(
+    state: &WorkerState,
+    team_id: &str,
+    ticket: &str,
+) -> Option<common::upgrade_quality::UpgradeFacts> {
+    let item = ticket_item(state, team_id, ticket).await?;
+    common::upgrade_quality::UpgradeFacts::from_json(&s(&item, "dep_facts"))
 }
 
 /// The upgrade notes read for the ticket before its run.

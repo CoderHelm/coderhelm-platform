@@ -589,10 +589,24 @@ pub(crate) fn github_wait_of(
     }
 }
 
-/// Whether a round that met GitHub's limit may wait for it again: each run
-/// waits at most `common::github_wait::MAX_WAITS` times.
-pub(crate) fn may_wait_for_github(waits: u32) -> bool {
-    waits < common::github_wait::MAX_WAITS
+/// Whether a round GitHub refused may wait for it again
+/// (`common::github_wait::may_wait`): an outage a few times, its rate limit
+/// for as long as two days of hourly limits.
+pub(crate) fn may_wait_for_github(cause: common::github_wait::Cause, waits: u32) -> bool {
+    common::github_wait::may_wait(cause, waits)
+}
+
+/// Whether a round's "didn't finish" reason is GitHub's rate limit: the
+/// round was ended by the limit, not by its work, so it is run again once
+/// the budget allows (`pr_watch`). The reason is the error's first line cut
+/// short, so the status and the API path it names are read too: a 403 on a
+/// read CoderHelm makes with its own token all run long is the limit.
+pub(crate) fn ended_by_limit(reason: &str) -> bool {
+    let r = reason.to_ascii_lowercase();
+    r.contains("rate limit")
+        || r.contains("hourly limit")
+        || r.contains("(429")
+        || (r.contains("(403 forbidden)") && r.contains("api.github.com"))
 }
 
 /// Whether the round's work branch is kept for the next try. Its work is
@@ -903,10 +917,28 @@ mod tests {
             None
         );
         assert_eq!(github_wait_of("operation timed out", None), None);
-        // Bounded: a run waits at most MAX_WAITS times.
-        assert!(may_wait_for_github(0));
-        assert!(may_wait_for_github(common::github_wait::MAX_WAITS - 1));
-        assert!(!may_wait_for_github(common::github_wait::MAX_WAITS));
+        // Bounded: an outage is waited out MAX_WAITS times, the limit far
+        // longer (a limit never ends a round inside a day).
+        use common::github_wait::{MAX_LIMIT_WAITS, MAX_WAITS};
+        assert!(may_wait_for_github(Cause::Outage, MAX_WAITS - 1));
+        assert!(!may_wait_for_github(Cause::Outage, MAX_WAITS));
+        assert!(may_wait_for_github(Cause::RateLimit, MAX_WAITS));
+        assert!(!may_wait_for_github(Cause::RateLimit, MAX_LIMIT_WAITS));
+        // A round the limit ended, as its record words it.
+        assert!(ended_by_limit(&common::run_round::errored(
+            Kind::ReviewFix,
+            raw
+        )));
+        assert!(ended_by_limit(
+            "the review fix round hit an error (HTTP status client error (403 Forbidden) for url \
+             (https://api.github.com/repos/acme/site/git/ref/heads/coderhelm/gh-41))"
+        ));
+        assert!(!ended_by_limit(
+            "the review fix round ran out of its time budget 3 times in a row"
+        ));
+        assert!(!ended_by_limit(
+            "the review fix round hit an error (the model returned no text)"
+        ));
     }
 
     #[test]

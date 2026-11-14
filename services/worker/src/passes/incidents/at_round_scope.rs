@@ -353,7 +353,7 @@ fn a_round_that_hits_githubs_limit_waits_and_goes_on_as_itself() {
     let (cause, wait) =
         round::github_wait_of(&paused, Some((Cause::RateLimit, RESET - HIT))).expect("a wait");
     assert_eq!((cause, wait), (Cause::RateLimit, 2_400));
-    assert!(round::may_wait_for_github(0));
+    assert!(round::may_wait_for_github(cause, 0));
     end.said(gw::waiting_text(cause, gw::until(HIT, wait)));
 
     // The round is parked as it stands: the same attempt, its work branch.
@@ -403,9 +403,7 @@ fn a_round_that_hits_githubs_limit_waits_and_goes_on_as_itself() {
     let round_fn = fn_src(resume, "async fn run_fix_round(");
     assert!(round_fn.contains("crate::clients::github::outside_wait(err)"));
 
-    assert!(
-        end.says("Waiting for GitHub's hourly limit to reset at 21:05 UTC; continues by itself")
-    );
+    assert!(end.says("Waiting for GitHub's hourly limit; continues by itself at 21:05 UTC"));
     end.never_says(OLD_FAULT);
     assert_eq!(end.status, "awaiting_ci");
 }

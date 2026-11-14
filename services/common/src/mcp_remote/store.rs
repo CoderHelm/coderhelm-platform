@@ -798,6 +798,11 @@ pub trait Store: Send + Sync {
     async fn put_pending(&self, team: &str, p: &PendingAuth) -> Result<(), String>;
     /// Reads and deletes a pending sign-in in one step: a `state` works once.
     async fn take_pending(&self, team: &str, key: &str) -> Result<Option<PendingAuth>, String>;
+    /// Every sign-in in progress for the team (a handful at most: each
+    /// lives ten minutes), so a new one can end the ones it replaces and
+    /// expired ones are removed without waiting for the table to do it.
+    async fn list_pending(&self, team: &str) -> Result<Vec<PendingAuth>, String>;
+    async fn delete_pending(&self, team: &str, key: &str) -> Result<(), String>;
     async fn put_log(&self, team: &str, e: &LogEntry, now: i64) -> Result<(), String>;
     async fn list_logs(&self, team: &str, id: &str, limit: i32) -> Result<Vec<LogEntry>, String>;
 }
@@ -1071,6 +1076,19 @@ impl Store for DynamoStore {
         }
     }
 
+    async fn list_pending(&self, team: &str) -> Result<Vec<PendingAuth>, String> {
+        Ok(self
+            .query_prefix(team, PENDING_PREFIX, None, false)
+            .await?
+            .iter()
+            .filter_map(PendingAuth::from_item)
+            .collect())
+    }
+
+    async fn delete_pending(&self, team: &str, key: &str) -> Result<(), String> {
+        self.delete(team, &format!("{PENDING_PREFIX}{key}")).await
+    }
+
     async fn put_log(&self, team: &str, e: &LogEntry, now: i64) -> Result<(), String> {
         self.dynamo
             .put_item()
@@ -1286,6 +1304,20 @@ pub mod fake {
                 .remove(&(team.to_string(), format!("{PENDING_PREFIX}{key}")))
                 .as_ref()
                 .and_then(PendingAuth::from_item))
+        }
+        async fn list_pending(&self, team: &str) -> Result<Vec<PendingAuth>, String> {
+            Ok(self
+                .prefix(team, PENDING_PREFIX)
+                .iter()
+                .filter_map(PendingAuth::from_item)
+                .collect())
+        }
+        async fn delete_pending(&self, team: &str, key: &str) -> Result<(), String> {
+            self.items
+                .lock()
+                .unwrap()
+                .remove(&(team.to_string(), format!("{PENDING_PREFIX}{key}")));
+            Ok(())
         }
         async fn put_log(&self, team: &str, e: &LogEntry, now: i64) -> Result<(), String> {
             self.put(team, e.to_item(team, now));

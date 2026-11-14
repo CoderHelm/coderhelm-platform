@@ -1394,6 +1394,10 @@ pub async fn run(
             return Ok(());
         }
     }
+    if msg.github_wait.waits > 0 {
+        // The wait is over: the run page stops saying so.
+        super::clear_github_wait(state, &msg.team_id, &msg.run_id).await;
+    }
 
     // Load run record
     info!(run_id = %msg.run_id, table = %state.config.runs_table_name, "Loading run record");
@@ -1536,6 +1540,23 @@ pub async fn run(
             return Ok(());
         }
     };
+
+    // GitHub's hourly limit is spent for this installation (this worker or
+    // another met it): no read here would be answered, and a read that
+    // fails is how a round was once ended. The resume waits for the reset
+    // before it asks for anything; the run is untouched.
+    if let Some(until) = crate::clients::github_budget::limited_until(msg.installation_id, now) {
+        if send_github_wait(
+            state,
+            &msg,
+            common::github_wait::Cause::RateLimit,
+            until.saturating_sub(now).max(1),
+        )
+        .await
+        {
+            return Ok(());
+        }
+    }
 
     // Parse created_at for wall-clock duration (spans multiple Lambda invocations)
     let created_at = run_record
@@ -4344,7 +4365,7 @@ async fn wait_round_for_github(
     (cause, wait): (common::github_wait::Cause, u64),
     (created_at, start): (Option<chrono::DateTime<chrono::Utc>>, &std::time::Instant),
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    if !super::round::may_wait_for_github(msg.github_wait.waits)
+    if !super::round::may_wait_for_github(cause, msg.github_wait.waits)
         || state.config.ci_fix_queue_url.is_empty()
     {
         return Ok(false);
@@ -7446,10 +7467,11 @@ async fn send_github_wait(
     cause: common::github_wait::Cause,
     wait: u64,
 ) -> bool {
-    if !super::round::may_wait_for_github(msg.github_wait.waits) {
+    if !super::round::may_wait_for_github(cause, msg.github_wait.waits) {
         return false;
     }
     let now = chrono::Utc::now().timestamp().max(0) as u64;
+    let wait = common::github_wait::paced(cause, wait, msg.github_wait.waits);
     let until = common::github_wait::until(now, wait);
     let mut next = msg.clone();
     next.github_wait = common::github_wait::GitHubWait {
@@ -7465,8 +7487,186 @@ async fn send_github_wait(
     }
     let text = common::github_wait::waiting_text(cause, until);
     warn!(run_id = %msg.run_id, until, "github_wait: the fix round waits for GitHub");
-    super::add_progress_note(state, &msg.team_id, &msg.run_id, &text).await;
+    super::note_github_wait(state, &msg.team_id, &msg.run_id, &text).await;
     true
+}
+
+/// A resume that ended on GitHub refusing for a while (its hourly limit, a
+/// 5xx, no answer) waits for GitHub as the same run: the resume is sent for
+/// the reset, the run goes back to waiting on it, and a round that was
+/// being worked is parked as it stands (its attempt, its work branch).
+/// Nothing is marked failed or unfinished, no finding is deferred, and no
+/// attempt is spent. False when the error isn't GitHub's, or every wait is
+/// taken (`common::github_wait::may_wait`): the caller's usual way follows.
+pub(crate) async fn wait_out_github(
+    state: &WorkerState,
+    msg: &ResumeMessage,
+    e: &(dyn std::error::Error + Send + Sync + 'static),
+) -> bool {
+    let Some(paused) = super::github_pause_of(e, msg.installation_id) else {
+        return false;
+    };
+    let now = chrono::Utc::now().timestamp().max(0) as u64;
+    let wait = paused.until.saturating_sub(now).max(1);
+    if !send_github_wait(state, msg, paused.cause, wait).await {
+        return false;
+    }
+    release_for_wait(state, &msg.team_id, &msg.run_id).await;
+    true
+}
+
+/// Runs again the round GitHub's rate limit ended on a finished run (its
+/// record says "didn't finish" for the limit): the round is parked with
+/// what it was asked, its work branch and where it started, the run goes
+/// back to waiting on it, and a resume is sent, as pressing Resume does
+/// (the gateway's `resume_round`), with nobody pressing it. A round with
+/// nothing kept to run is read again from CI and the review on the head.
+/// False when the run isn't in that state any more or nothing was sent.
+pub(crate) async fn resume_limit_ended(
+    state: &WorkerState,
+    team_id: &str,
+    run_id: &str,
+    installation_id: u64,
+) -> bool {
+    if state.config.ci_fix_queue_url.is_empty() {
+        return false;
+    }
+    let item = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.runs_table_name)
+        .consistent_read(true)
+        .key("team_id", attr_s(team_id))
+        .key("run_id", attr_s(run_id))
+        .send()
+        .await
+        .ok()
+        .and_then(|o| o.item)
+        .unwrap_or_default();
+    let status = item
+        .get("status")
+        .and_then(|v| v.as_s().ok())
+        .cloned()
+        .unwrap_or_default();
+    let pr_number = item
+        .get("pr_number")
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse::<u64>().ok())
+        .unwrap_or(0);
+    let Some(inc) = run_round::Incomplete::from_item(&item) else {
+        return false;
+    };
+    // A person's comments are read again by the feedback round, which
+    // waits out a limit by itself; a held round waits on its checks.
+    if !run_round::may_resume(&status, pr_number, true)
+        || inc.held
+        || inc.kind == Some(run_round::Kind::Feedback)
+        || !super::round::ended_by_limit(&inc.reason)
+    {
+        return false;
+    }
+    let now = chrono::Utc::now();
+    let parked = Some(&inc)
+        .filter(|i| !i.feedback.trim().is_empty())
+        .and_then(|i| i.resume_round(now));
+    let mut update = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(team_id))
+        .key("run_id", attr_s(run_id))
+        .condition_expression("#s = :from")
+        .expression_attribute_names("#s", "status")
+        .expression_attribute_names("#inc", run_round::INCOMPLETE_FIELD)
+        .expression_attribute_names("#round", run_round::FIELD)
+        .expression_attribute_values(":from", attr_s(&status))
+        .expression_attribute_values(":s", attr_s(common::run_status::AWAITING_CI))
+        .expression_attribute_values(":sri", attr_s(&format!("awaiting_ci#{run_id}")))
+        .expression_attribute_values(":t", attr_s(&now.to_rfc3339()));
+    update = match &parked {
+        Some(round) => update
+            .update_expression(
+                "SET #s = :s, status_run_id = :sri, current_pass = :s, updated_at = :t, \
+                 #round = :r REMOVE #inc",
+            )
+            .expression_attribute_values(":r", round.to_attr()),
+        None => update.update_expression(
+            "SET #s = :s, status_run_id = :sri, current_pass = :s, updated_at = :t \
+             REMOVE #inc, #round",
+        ),
+    };
+    if update.send().await.is_err() {
+        return false;
+    }
+    let msg = ResumeMessage {
+        team_id: team_id.to_string(),
+        run_id: run_id.to_string(),
+        installation_id,
+        ..Default::default()
+    };
+    let sent = send_resume_message(state, &msg, 0).await;
+    info!(
+        run_id,
+        sent, "A round GitHub's limit ended is run again, now that the budget allows"
+    );
+    if sent {
+        super::add_progress_note(
+            state,
+            team_id,
+            run_id,
+            "GitHub's hourly limit ended the last fix round; the limit has reset, so CoderHelm \
+             is running that round again from the work it kept.",
+        )
+        .await;
+    }
+    sent
+}
+
+/// The run a resume claimed goes back to `awaiting_ci` for the resume that
+/// follows the wait, and its round, if one was being worked, is parked
+/// without a new attempt.
+async fn release_for_wait(state: &WorkerState, team_id: &str, run_id: &str) {
+    let item = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.runs_table_name)
+        .consistent_read(true)
+        .key("team_id", attr_s(team_id))
+        .key("run_id", attr_s(run_id))
+        .send()
+        .await
+        .ok()
+        .and_then(|o| o.item)
+        .unwrap_or_default();
+    if let Some(round) =
+        run_round::Round::from_item(&item).filter(|r| r.state == run_round::State::Running)
+    {
+        super::round::record(state, team_id, run_id, &round.parked(false)).await;
+    }
+    let res = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(team_id))
+        .key("run_id", attr_s(run_id))
+        .update_expression(
+            "SET #s = :aw, status_run_id = :sri, current_pass = :aw, updated_at = :t \
+             REMOVE error_message, #err",
+        )
+        .condition_expression("#s = :running")
+        .expression_attribute_names("#s", "status")
+        .expression_attribute_names("#err", "error")
+        .expression_attribute_values(":aw", attr_s(common::run_status::AWAITING_CI))
+        .expression_attribute_values(":sri", attr_s(&format!("awaiting_ci#{run_id}")))
+        .expression_attribute_values(":running", attr_s(common::run_status::RUNNING))
+        .expression_attribute_values(":t", attr_s(&chrono::Utc::now().to_rfc3339()))
+        .send()
+        .await;
+    if let Err(e) = res {
+        if !common::run_fail::is_condition_failed(&e) {
+            warn!(run_id, error = %e, "Could not put the run back to waiting for GitHub");
+        }
+    }
 }
 
 /// Sends this resume message, as it is, to the CI fix queue after `delay`
@@ -7671,7 +7871,32 @@ async fn hand_off_after_ci_wait(state: &WorkerState, msg: &ResumeMessage) {
     set_run_complete(state, &msg.team_id, &msg.run_id, created_at).await;
 }
 
+/// The delay of a resume that checks again later, given GitHub's budget:
+/// while less than the runs' share is left of the hour, a check that would
+/// come back within minutes (a CI poll every two) waits ten, so a run
+/// waiting on CI doesn't spend the budget polling. CI's own events still
+/// wake the run at once; an immediate resume (0) is never delayed.
+pub(crate) fn poll_delay(
+    asked: i32,
+    budget: Option<common::github_budget::Budget>,
+    now: u64,
+) -> i32 {
+    /// The poll interval while the budget is low.
+    const LOW_BUDGET_POLL_SECS: i32 = 600;
+    let low = budget.is_some_and(|b| !b.is_past(now) && b.background_left() == 0);
+    if low && asked >= 60 {
+        asked.max(LOW_BUDGET_POLL_SECS)
+    } else {
+        asked
+    }
+}
+
 async fn send_delayed_resume(state: &WorkerState, msg: &ResumeMessage, delay_seconds: i32) {
+    let delay_seconds = poll_delay(
+        delay_seconds,
+        crate::clients::github::budget_of(msg.installation_id),
+        chrono::Utc::now().timestamp().max(0) as u64,
+    );
     if state.config.ci_fix_queue_url.is_empty() {
         warn!("CI_FIX_QUEUE_URL not configured — cannot send delayed resume");
         return;

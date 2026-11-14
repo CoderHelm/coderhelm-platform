@@ -1312,6 +1312,14 @@ pub struct WhatToCheck {
     /// bumps applied, the ones deferred with why, and the checks run in the
     /// sandbox. Empty for a run without one.
     pub dep_report: String,
+    /// What the dependency run recorded for its head commit
+    /// (`upgrade_quality::UpgradeFacts`): the reconciled advisory count,
+    /// the families, the verification set's results, why each major is
+    /// safe and what its behaviour probe showed.
+    pub upgrade_facts: Option<crate::upgrade_quality::UpgradeFacts>,
+    /// The head the description is written for: facts recorded on another
+    /// commit are shown as that commit's.
+    pub head_sha: String,
 }
 
 impl WhatToCheck {
@@ -1381,6 +1389,10 @@ pub fn what_to_check(bumps: &[Bump], w: &WhatToCheck) -> String {
         s.push_str(w.dep_report.trim());
         s.push_str("\n\n");
     }
+    if let Some(facts) = &w.upgrade_facts {
+        s.push_str(facts.section(&w.head_sha).trim());
+        s.push_str("\n\n");
+    }
     for b in bumps {
         s.push_str(&package_check(b, w, usize::MAX));
     }
@@ -1432,6 +1444,10 @@ pub fn what_to_check_short(
     let mut s = String::from("## What to check\n\n");
     if !w.dep_report.trim().is_empty() {
         s.push_str(w.dep_report.trim());
+        s.push_str("\n\n");
+    }
+    if let Some(facts) = &w.upgrade_facts {
+        s.push_str(facts.section(&w.head_sha).trim());
         s.push_str("\n\n");
     }
     if !intro.trim().is_empty() {

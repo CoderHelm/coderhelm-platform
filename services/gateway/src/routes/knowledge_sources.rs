@@ -454,11 +454,17 @@ pub async fn connectors(
 }
 
 /// The `return_to` a sign-in start may send (`{"return_to": "/knowledge/..."}`):
-/// a Knowledge page only, else nothing (the callback goes to Knowledge).
+/// a Knowledge page, or the Integrations page (a sign-in renewed from the
+/// product's card there), else nothing (the callback goes to Knowledge).
 pub fn return_to_of(body: &[u8]) -> String {
     let v: Value = serde_json::from_slice(body).unwrap_or_default();
     let p = common::mcp_remote::oauth::clean_return_path(v["return_to"].as_str().unwrap_or(""));
-    if p == "/knowledge" || p.starts_with("/knowledge/") || p.starts_with("/knowledge?") {
+    let under = |root: &str| {
+        p == root
+            || p.strip_prefix(root)
+                .is_some_and(|rest| rest.starts_with(['/', '?', '#']))
+    };
+    if under("/knowledge") || under("/settings/integrations") {
         p
     } else {
         String::new()
@@ -520,7 +526,11 @@ pub async fn connect(
             oauth::StartError::Refused(e) => fail(StatusCode::BAD_REQUEST, &e),
         })?;
     info!(team = %claims.team_id, kind = kind.key(), "Knowledge sign-in started");
-    Ok(Json(json!({ "authorize_url": url })))
+    Ok(Json(json!({
+        "authorize_url": url,
+        "server_id": oauth::connection_id(kind),
+        "expires_in": super::mcp_servers::SIGN_IN_SECS,
+    })))
 }
 
 /// Starts `claims`' own sign-in to `kind` through its remote MCP server, on
@@ -2352,6 +2362,12 @@ mod tests {
         assert_eq!(r(r#"{"return_to":"/settings/"}"#), "");
         assert_eq!(r(r#"{"return_to":"//evil.example/knowledge/"}"#), "");
         assert_eq!(r(r#"{"return_to":"/knowledgeX"}"#), "");
+        // A sign-in renewed from the product's card goes back to that card.
+        assert_eq!(
+            r(r#"{"return_to":"/settings/integrations/#integration-confluence"}"#),
+            "/settings/integrations/#integration-confluence"
+        );
+        assert_eq!(r(r#"{"return_to":"/settings/integrationsX"}"#), "");
         assert_eq!(r(""), "", "an older dashboard sends no body");
     }
 

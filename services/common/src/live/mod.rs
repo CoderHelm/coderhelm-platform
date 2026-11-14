@@ -24,6 +24,7 @@
 
 pub mod airflow;
 pub mod api;
+pub mod atlassian;
 pub mod aws;
 pub mod aws_account;
 pub mod aws_settings;

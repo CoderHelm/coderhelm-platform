@@ -1,4 +1,5 @@
-//! Confluence Cloud through its REST API, with an Atlassian API token or
+//! Confluence Cloud through its REST API, with an Atlassian API token, with
+//! the Atlassian sign-in the team made for Knowledge (reading only), or
 //! through the Coderhelm app the team installed in its Jira ([`Access`]).
 //!
 //! Reads are GETs to the team's own `*.atlassian.net` site (or the same calls
@@ -200,6 +201,12 @@ pub enum Access<'a> {
     /// shared secret it checks. The app makes the same calls with its own
     /// Confluence access (see `coderhelm-jira/src/confluence.js`).
     JiraApp { url: &'a str, secret: &'a str },
+    /// The team's Atlassian sign-in (the one Knowledge syncs with), through
+    /// `api.atlassian.com/ex/confluence/<cloud id>` (`base`) with its
+    /// `Bearer` header. Its scopes read pages, spaces and search and
+    /// nothing else, so it never writes
+    /// (`knowledge::sources::oauth::provider`).
+    SignIn { base: &'a str, bearer: &'a str },
 }
 
 /// A Confluence connection for one call.
@@ -239,9 +246,33 @@ enum Op<'b> {
 impl Confluence<'_> {
     fn request(&self, op: &Op) -> Result<Request, StepError> {
         match self.access {
-            Access::Token(token) => {
-                let site = check_site(&self.conn.site)?;
+            Access::Token(_) | Access::SignIn { .. } => {
+                let (root, auth) = match self.access {
+                    Access::Token(token) => (
+                        check_site(&self.conn.site)?,
+                        format!(
+                            "Basic {}",
+                            STANDARD.encode(format!("{}:{token}", self.conn.email))
+                        ),
+                    ),
+                    Access::SignIn { base, bearer } => {
+                        if matches!(op, Op::Append { .. }) {
+                            return Err(refused(
+                                "The Atlassian sign-in only reads Confluence.",
+                                "To add text to pages, connect Confluence with an API token or the Jira app.",
+                            ));
+                        }
+                        (base.trim_end_matches('/').to_string(), bearer.to_string())
+                    }
+                    Access::JiraApp { .. } => unreachable!("matched above"),
+                };
+                let signed_in = matches!(self.access, Access::SignIn { .. });
                 let (method, path, body) = match op {
+                    // The sign-in has no scope for "who am I": one space
+                    // listed shows it reads.
+                    Op::WhoAmI if signed_in => {
+                        (Method::Get, "/wiki/api/v2/spaces?limit=1".to_string(), None)
+                    }
                     Op::WhoAmI => (Method::Get, "/wiki/rest/api/user/current".to_string(), None),
                     Op::Page(id) => (
                         Method::Get,
@@ -283,15 +314,9 @@ impl Confluence<'_> {
                 };
                 Ok(Request {
                     method,
-                    url: format!("{site}{path}"),
+                    url: format!("{root}{path}"),
                     headers: vec![
-                        (
-                            "Authorization".to_string(),
-                            format!(
-                                "Basic {}",
-                                STANDARD.encode(format!("{}:{token}", self.conn.email))
-                            ),
-                        ),
+                        ("Authorization".to_string(), auth),
                         ("Accept".to_string(), "application/json".to_string()),
                     ],
                     body,
@@ -328,6 +353,7 @@ impl Confluence<'_> {
 
     async fn call(&self, op: Op<'_>) -> Result<Value, StepError> {
         let app = matches!(self.access, Access::JiraApp { .. });
+        let signed_in = matches!(self.access, Access::SignIn { .. });
         let reply = self.http.send(self.request(&op)?).await?;
         match reply.status {
             200..=299 => reply.json().ok_or_else(|| {
@@ -341,6 +367,16 @@ impl Confluence<'_> {
                 "sign_in",
                 "The Coderhelm app in Jira didn't accept Coderhelm's secret.",
                 "Open Coderhelm Settings in Jira and save them again.",
+            )),
+            401 if signed_in => Err(StepError::new(
+                "sign_in",
+                "Confluence didn't accept the team's Atlassian sign-in.",
+                "Sign in to Confluence again in Settings, Integrations, Confluence.",
+            )),
+            403 if signed_in => Err(StepError::new(
+                "read",
+                "The Atlassian account that signed in can't see this in Confluence.",
+                "Give that account access to the space, or use a page it can see.",
             )),
             401 => Err(StepError::new(
                 "sign_in",
@@ -498,6 +534,12 @@ impl Confluence<'_> {
     /// writes on and listed this page. Returns the new version number.
     pub async fn append(&self, id: &str, text: &str) -> Result<Answer, StepError> {
         let id = check_page_id(id)?;
+        if matches!(self.access, Access::SignIn { .. }) {
+            return Err(refused(
+                "The Atlassian sign-in only reads Confluence.",
+                "To add text to pages, connect Confluence with an API token or the Jira app. Put the text in your reply for a person to add.",
+            ));
+        }
         if !self.conn.may_write_page(id) {
             return Err(refused(
                 format!("Coderhelm may not write to page {id}."),
@@ -530,9 +572,13 @@ impl Confluence<'_> {
         })
     }
 
-    /// Checks the email and token: who they sign in as.
+    /// Checks the email and token: who they sign in as. With the team's
+    /// Atlassian sign-in, that it reads the site.
     pub async fn whoami(&self) -> Result<String, StepError> {
         let v = self.call(Op::WhoAmI).await?;
+        if matches!(self.access, Access::SignIn { .. }) {
+            return Ok("the team's Atlassian sign-in".to_string());
+        }
         Ok(v["displayName"]
             .as_str()
             .or(v["publicName"].as_str())
@@ -848,6 +894,53 @@ mod tests {
         let c = app_conn();
         let e = app(&c, &http).whoami().await.unwrap_err();
         assert!(e.fix.contains("Coderhelm Settings in Jira"), "{}", e.fix);
+    }
+
+    #[tokio::test]
+    async fn with_the_atlassian_sign_in_reads_go_to_its_site_and_nothing_is_written() {
+        let c = Connector {
+            via: crate::live::connectors::VIA_SIGN_IN.into(),
+            email: String::new(),
+            ..conn()
+        };
+        let http = Fake::answering(vec![
+            (200, r#"{"results":[{"id":"7"}]}"#),
+            (200, PAGE),
+            (401, "{}"),
+        ]);
+        let cf = Confluence {
+            conn: &c,
+            access: Access::SignIn {
+                base: "https://api.atlassian.com/ex/confluence/cloud-1/",
+                bearer: "Bearer at-1",
+            },
+            http: &http,
+        };
+        assert_eq!(cf.whoami().await.unwrap(), "the team's Atlassian sign-in");
+        cf.page("42").await.unwrap();
+        // An append is refused before anything is sent: the sign-in only reads.
+        let e = cf.append("42", "note").await.unwrap_err();
+        assert!(e.is_refusal(), "{e:?}");
+        assert!(e.fix.contains("API token or the Jira app"), "{e:?}");
+        // A sign-in Confluence refuses says where to sign in again.
+        let e = cf.page("42").await.unwrap_err();
+        assert!(e.message.contains("Atlassian sign-in"), "{e:?}");
+        let sent = http.sent();
+        assert_eq!(sent.len(), 3, "the append sent nothing");
+        assert_eq!(
+            sent[0].url,
+            "https://api.atlassian.com/ex/confluence/cloud-1/wiki/api/v2/spaces?limit=1"
+        );
+        assert!(sent[1]
+            .url
+            .starts_with("https://api.atlassian.com/ex/confluence/cloud-1/wiki/api/v2/pages/42"));
+        for r in &sent {
+            assert_eq!(r.method, Method::Get);
+            assert!(r
+                .headers
+                .iter()
+                .any(|(k, v)| k == "Authorization" && v == "Bearer at-1"));
+        }
     }
 
     #[tokio::test]

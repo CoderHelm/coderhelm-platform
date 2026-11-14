@@ -103,9 +103,7 @@ fn a_rate_limited_round_waits_for_the_reset_and_goes_on_as_itself() {
         "only once"
     );
 
-    assert!(
-        end.says("Waiting for GitHub's hourly limit to reset at 21:05 UTC; continues by itself")
-    );
+    assert!(end.says("Waiting for GitHub's hourly limit; continues by itself at 21:05 UTC"));
     end.never_says(OLD);
     end.never_says("the coder wrote no file");
     end.never_says("Orchestration failed");
