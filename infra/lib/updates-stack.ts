@@ -467,10 +467,21 @@ export class UpdatesStack extends cdk.Stack {
     // The model check: the worker makes the test calls with its own role (or
     // a team's key). The updater itself never calls a model, and nothing in
     // the install may subscribe in AWS Marketplace or accept model terms.
+    // The health probe after an update goes the same way ({"health": {}}).
     this.updaterFunction.addToRolePolicy(new iam.PolicyStatement({
       sid: "ModelCheckThroughWorker",
       actions: ["lambda:InvokeFunction"],
       resources: [`arn:aws:lambda:${this.region}:${this.account}:function:${prefix}-worker`],
+    }));
+
+    // After an update the updater watches the new release (lambda/updater,
+    // watch_step): it probes the worker through ModelCheckThroughWorker above,
+    // and reads the worker's and the gateway's Errors and Invocations against
+    // the hour before. GetMetricData is read-only and takes no resource.
+    this.updaterFunction.addToRolePolicy(new iam.PolicyStatement({
+      sid: "WatchNewRelease",
+      actions: ["cloudwatch:GetMetricData"],
+      resources: ["*"],
     }));
 
     // refresh_secrets: stamp SECRETS_REVISION on the functions that read
@@ -532,7 +543,8 @@ export class UpdatesStack extends cdk.Stack {
       ruleName: `${prefix}-domain-check`,
       description: "Every 5 minutes: a domain waiting for its certificate? Attach it once issued",
       schedule: events.Schedule.rate(cdk.Duration.minutes(5)),
-      targets: [new targets.LambdaFunction(this.updaterFunction, { event: events.RuleTargetInput.fromObject({ action: "domain_status" }) })],
+      // `scheduled`: an install with an update build also watches a release it just installed here (lambda/updater, watch_step).
+      targets: [new targets.LambdaFunction(this.updaterFunction, { event: events.RuleTargetInput.fromObject({ action: "domain_status", scheduled: true }) })],
     });
 
     new events.Rule(this, "UpdateCheck", {
