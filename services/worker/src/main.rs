@@ -344,7 +344,11 @@ async fn handle_message_inner(state: Arc<WorkerState>, message: models::WorkerMe
             let team_id = msg.team_id.clone();
             let run_id = msg.run_id.clone();
             let retry_msg = msg.clone();
-            if let Err(e) = passes::feedback::run(&state, msg).await {
+            let round = passes::feedback::run(&state, msg).await;
+            // What people wrote on the ticket while the round worked is
+            // read now, never left for the next event.
+            passes::ticket_comments::after_round(&state, &team_id, &run_id).await;
+            if let Err(e) = round {
                 // The run guard fired: it waits on a person, one way.
                 if passes::run_guard::settle_open_pr(&state, &team_id, &run_id).await {
                     return;
@@ -506,7 +510,9 @@ async fn handle_message_inner(state: Arc<WorkerState>, message: models::WorkerMe
         models::WorkerMessage::Resume(msg) => {
             info!(team_id = %msg.team_id, run_id = %msg.run_id, "Resuming run from webhook event");
             let (team_id, run_id) = (msg.team_id.clone(), msg.run_id.clone());
-            if let Err(e) = passes::resume::run(&state, msg).await {
+            let resumed = passes::resume::run(&state, msg).await;
+            passes::ticket_comments::after_round(&state, &team_id, &run_id).await;
+            if let Err(e) = resumed {
                 error!("Resume failed: {e:?}");
                 // The run guard fired: it waits on a person, one way.
                 if passes::run_guard::settle_open_pr(&state, &team_id, &run_id).await {

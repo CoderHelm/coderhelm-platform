@@ -3,6 +3,7 @@ const { fetch } = api;
 const { storage } = api;
 const { route } = api;
 const { GATEWAY_URL } = require("./gateway");
+const { existingComments } = require("./comments");
 
 /** The parts of a Jira user CoderHelm keeps: account id, name, email. */
 function jiraUser(u) {
@@ -134,7 +135,9 @@ exports.handler = async (event, context) => {
       comment: {
         id: comment.id,
         body: commentBody,
-        author: { ...jiraUser(author), displayName: authorName },
+        // accountType tells a person ("atlassian") from an app ("app"): the
+        // gateway never reads an app's comment as a person's.
+        author: { ...jiraUser(author), displayName: authorName, accountType: author.accountType },
       },
       image_attachments: imageAttachments,
       coderhelm: {
@@ -159,7 +162,7 @@ exports.handler = async (event, context) => {
   let fields = {};
   if (issue.id) {
     try {
-      const res = await api.asApp().requestJira(route`/rest/api/3/issue/${issue.id}?fields=summary,description,labels,assignee,reporter,creator,project,attachment,issuetype`);
+      const res = await api.asApp().requestJira(route`/rest/api/3/issue/${issue.id}?fields=summary,description,labels,assignee,reporter,creator,project,attachment,issuetype,comment`);
       if (res.ok) {
         const full = await res.json();
         fields = full.fields || {};
@@ -206,6 +209,9 @@ exports.handler = async (event, context) => {
       },
     },
     image_attachments: imageAttachments,
+    // What people already wrote on the ticket: the run that starts reads it
+    // before it plans (the gateway keeps each comment once, by its id).
+    comments: existingComments(fields),
     user: requester(event.atlassianId, fields),
     coderhelm: {
       repo_owner: repoOwner || undefined,

@@ -247,6 +247,8 @@ pub mod stop_judge;
 pub mod stop_rules;
 /// A team's run and PR-reviewed counts, each added exactly once.
 pub mod team_counts;
+/// What people write on a ticket while a run works on it: kept, acknowledged, acted on.
+pub mod ticket_comments;
 /// A ticket's comments as CoderHelm read them, and whether its work is done.
 pub mod ticket_state;
 /// A team's monthly token limits: new tokens, cache read, cache write.
