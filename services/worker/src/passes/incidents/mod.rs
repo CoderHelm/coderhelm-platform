@@ -34,6 +34,7 @@ mod ap_closed_pr_keeps_findings;
 mod aq_comment_during_run;
 mod ar_description_stamped_to_the_head;
 mod at_round_scope;
+mod aw_quarantine_dead_end;
 mod b_open_pr_retry;
 mod ba_verdict_on_old_commit;
 mod bb_flaky_not_broken;

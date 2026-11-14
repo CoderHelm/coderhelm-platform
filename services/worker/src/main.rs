@@ -632,6 +632,19 @@ async fn handle_message_inner(state: Arc<WorkerState>, message: models::WorkerMe
             passes::infra_inventory::sweep(&state).await;
             // ...and matched against the feeds, once a day per team.
             passes::infra_findings::sweep(&state).await;
+            // Quarantined tests: each team's at most once an hour. Tests
+            // that proved healthy leave, fixes and removals are followed on
+            // GitHub, and the longest quarantined get the week's fixes.
+            let q = passes::quarantine_work::sweep(&state).await;
+            info!(
+                teams = q.teams,
+                looked_at = q.looked_at,
+                released = q.released,
+                changed = q.changed,
+                fixes_started = q.fixes_started,
+                removals_proposed = q.removals_proposed,
+                "Quarantine sweep done"
+            );
         }
         models::WorkerMessage::SecurityEvent(msg) => {
             info!(team_id = %msg.team_id, kind = %msg.kind, repo = %msg.repo, "Security event");
