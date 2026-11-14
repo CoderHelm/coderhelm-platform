@@ -333,6 +333,15 @@ class EveryCallTheUpdaterMakes(unittest.TestCase):
         self.run_through(self._switch(PrivateNetwork1=NETWORK, PrivateNetwork2=NETWORK.replace("60718", "60799")))
         self.assert_every_call_allowed(rf"^https://{RELEASE_BUCKET}\.s3\.{REGION}\.amazonaws\.com/releases/v1\.0\.0/held/coderhelm\.json$")
 
+    def test_the_watch_after_an_update_may_probe_the_worker_and_read_its_errors(self):
+        # lambda/updater, watch_step: the probe and the metrics, and nothing past them.
+        worker = f"arn:aws:lambda:{REGION}:{ACCOUNT}:function:{STACK}-worker"
+        for action, resource, want in (("lambda:InvokeFunction", worker, "allowed"),
+                                       ("cloudwatch:GetMetricData", "*", "allowed"),
+                                       ("cloudwatch:PutMetricAlarm", "*", "implicitDeny"),
+                                       ("lambda:InvokeFunction", f"arn:aws:lambda:{REGION}:{ACCOUNT}:function:{STACK}-gateway", "implicitDeny")):
+            self.assertEqual(decision({"action": action, "resource": resource, "context": {}}), want, (action, resource))
+
     def test_a_change_set_without_a_template_url_is_refused(self):
         # What v0.8.94 sent for a switch: the guard above would have caught it.
         self.cfn.create_change_set(StackName=STACK, ChangeSetName="x", UsePreviousTemplate=True, RoleARN=DEPLOY_ROLE, IncludeNestedStacks=True)

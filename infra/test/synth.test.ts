@@ -706,6 +706,8 @@ test("domain: the updater may request the certificate, never touches DNS, and ch
   const t = synth(selfHost({ integrations: { googleSignIn: false } }));
   const u = t["coderhelm-prod-updates"];
   u.hasResourceProperties("AWS::Events::Rule", { Name: "coderhelm-prod-domain-check", ScheduleExpression: "rate(5 minutes)" });
+  // `scheduled`: the post-update watch runs from it (an install with an update build has no update poll).
+  assert.ok(JSON.stringify(u.findResources("AWS::Events::Rule")).includes('\\"action\\":\\"domain_status\\",\\"scheduled\\":true'));
   const updater = envOf(u, "coderhelm-prod-updater");
   assert.equal(updater.DISTRIBUTION_DOMAIN_PARAMETER, "/coderhelm-prod/distribution-domain");
   const policies = JSON.stringify(u.findResources("AWS::IAM::Policy"));
@@ -796,6 +798,9 @@ test("a self-host that starts on Anthropic keys may still call Bedrock, and noth
   const up = JSON.stringify(u.findResources("AWS::IAM::Policy"));
   assert.ok(up.includes("ModelCheckThroughWorker"));
   assert.ok(!up.includes("bedrock:"), "the updater itself never calls a model");
+  // After an update it watches the new release: the worker's probe (above) and the error metrics, read-only.
+  const watch = Object.values<any>(u.findResources("AWS::IAM::Policy")).flatMap((p) => p.Properties.PolicyDocument.Statement).find((s: any) => s.Sid === "WatchNewRelease");
+  assert.deepEqual({ Action: watch.Action, Resource: watch.Resource }, { Action: "cloudwatch:GetMetricData", Resource: "*" });
 });
 
 test("the hosted deployment on Anthropic keys gets no Bedrock model access", () => {
