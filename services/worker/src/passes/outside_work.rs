@@ -824,6 +824,46 @@ impl NoteStep {
         self.step_kind() == StepKind::E2e
     }
 
+    /// The pull request labels the step adds, from its values
+    /// (`labels += a, b`, `labels = a`, `label: a`).
+    pub fn labels_named(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for v in &self.values {
+            let lower = v.to_lowercase();
+            let Some(at) = lower.find("label") else {
+                continue;
+            };
+            let rest = &v[at..];
+            let Some(cut) = ["+=", "=", ":"]
+                .iter()
+                .filter_map(|sep| rest.find(sep).map(|i| i + sep.len()))
+                .min()
+            else {
+                continue;
+            };
+            for part in rest[cut..].split(',').flat_map(|p| p.split(" and ")) {
+                let name = part
+                    .trim()
+                    .trim_matches(|c| c == '`' || c == '"' || c == '\'')
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("");
+                if !name.is_empty() && !out.iter().any(|o| o == name) {
+                    out.push(name.to_string());
+                }
+            }
+        }
+        out
+    }
+
+    /// A step whose whole action is adding labels to the pull request:
+    /// CoderHelm adds them itself, through GitHub's issues API, which needs
+    /// no Actions permission. Never a person's step.
+    pub fn adds_labels_only(&self) -> bool {
+        let step = self.step.trim().to_lowercase();
+        step.starts_with("add") && step.contains("label") && !self.labels_named().is_empty()
+    }
+
     fn is_verify(&self) -> bool {
         self.step_kind() == StepKind::Verify
     }
@@ -1077,6 +1117,13 @@ pub fn gaps(c: &OutsideChange, a: &Abilities, plan: PlanFacts) -> Vec<String> {
             out.push(format!(
                 "Step {n} (`{}`) names no owner.",
                 one_line(&s.step)
+            ));
+        }
+        if s.doer() == Doer::Person && s.adds_labels_only() {
+            out.push(format!(
+                "Step {n} adds pull request labels ({}): CoderHelm adds labels itself through \
+                 GitHub's issues API, which needs no Actions permission: make it `by: coderhelm`.",
+                s.labels_named().join(", ")
             ));
         }
         if s.doer() == Doer::Person {
@@ -1906,6 +1953,24 @@ fn is_staging_route(r: &Route) -> bool {
 /// The action for a CoderHelm step.
 pub fn action_for(s: &NoteStep, a: &Abilities, c: &OutsideChange) -> Action {
     let target = s.target();
+    // Labels on the pull request: added through the issues API, whatever
+    // workflow they start. A route that runs on one of them is waited for.
+    let labels = s.labels_named();
+    if !labels.is_empty() {
+        let route = a
+            .e2e
+            .iter()
+            .chain(a.deploys.iter())
+            .find(|r| matches!(&r.trigger, Trigger::Label(l) if labels.contains(l)))
+            .cloned()
+            .unwrap_or(Route {
+                name: "pull request labels".to_string(),
+                file: String::new(),
+                command: String::new(),
+                trigger: Trigger::Label(labels.join(",")),
+            });
+        return Action::Label(labels.join(","), route);
+    }
     let pick = |routes: &[Route], fit: &dyn Fn(&Route) -> bool| -> Option<Action> {
         let ok = |r: &&Route| r.startable() && fit(r);
         let r = routes

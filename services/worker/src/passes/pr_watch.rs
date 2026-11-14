@@ -502,44 +502,67 @@ async fn send_ci_fix(state: &WorkerState, c: &Candidate) -> bool {
         .is_ok()
 }
 
-/// Does `act`. False when it could not be started (its claim is given back).
+/// What came of an act: work CoderHelm started (a review, a round), an act
+/// that settled the pull request with nothing left running (the findings
+/// deferred with their reasons), or nothing started (its claim is given
+/// back). Only `Started` is CoderHelm working on the pull request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Performed {
+    Started,
+    Settled,
+    NotStarted,
+}
+
+impl From<bool> for Performed {
+    fn from(started: bool) -> Self {
+        if started {
+            Performed::Started
+        } else {
+            Performed::NotStarted
+        }
+    }
+}
+
+/// Whether the pull request's standing says CoderHelm is working on it:
+/// only for work an act started now, or while the run itself is in flight.
+/// An act that settled the pull request (its findings deferred) and a
+/// finished run are never "working".
+pub fn is_working(act: &Act, performed: Performed, status: &str) -> bool {
+    let started = performed == Performed::Started
+        && matches!(
+            act,
+            Act::ReviewHead | Act::FixFindings | Act::ResolveConflict | Act::ResumeRound(_)
+        );
+    started || common::run_status::IN_FLIGHT.contains(&status)
+}
+
+/// Does `act`, and says what came of it ([`Performed`]).
 async fn perform(
     state: &WorkerState,
     github: &GitHubClient,
     c: &Candidate,
     seen: &Seen,
     act: &Act,
-) -> bool {
+) -> Performed {
     // Whatever the watch does next rests on a description of this head.
     super::description::reconcile_run(
         state, github, &c.team_id, &c.run_id, &c.owner, &c.repo, c.pr,
     )
     .await;
     match act {
-        Act::Nothing => true,
-        Act::ResolveConflict => {
-            super::resume::start_conflict_round(
-                state,
-                &c.team_id,
-                c.installation_id,
-                &c.owner,
-                &c.repo,
-                c.pr,
-            )
-            .await
-        }
-        Act::FixCi(_) => send_ci_fix(state, c).await,
-        Act::ReviewHead => !matches!(
-            super::review_pr::review_for_ready(
-                state,
-                &c.team_id,
-                c.installation_id,
-                (&c.owner, &c.repo, c.pr),
-                &seen.head,
-            )
-            .await,
-            super::review_pr::ReadyReviewAsk::Failed
-        ),
+        Act::Nothing => Performed::Settled,
+        Act::ResolveConflict => super::resume::start_conflict_round(
+            state,
+            &c.team_id,
+            c.installation_id,
+            &c.owner,
+            &c.repo,
+            c.pr,
+        )
+        .await
+        .into(),
+        Act::FixCi(_) => send_ci_fix(state, c).await.into(),
+        Act::ReviewHead => review_head(state, c, &seen.head).await,
         Act::FixFindings => {
             let body = github
                 .get_pull_request(&c.owner, &c.repo, c.pr)
@@ -547,25 +570,27 @@ async fn perform(
                 .ok()
                 .and_then(|p| p["body"].as_str().map(str::to_string))
                 .unwrap_or_default();
-            let mut items = super::own_review::listed(&body);
+            let items = super::own_review::listed(&body);
             if items.is_empty() {
-                items.push(format!(
-                    "CoderHelm's review requested changes on `{}`; its review comments on the \
-                     pull request say what",
-                    seen.head.get(..7).unwrap_or(&seen.head)
-                ));
+                // The verdict asks for changes and the description lists
+                // none: they disagree, and a placeholder is never deferred
+                // as if it were a finding. The head is reviewed again, with
+                // what the run settled read (`own_review_ledger`).
+                return review_head(state, c, &seen.head).await;
             }
             match super::resume::queue_own_review_round(
                 state, github, &c.team_id, &c.run_id, &seen.head, &items,
             )
             .await
             {
-                super::resume::OwnRound::Fixing => true,
-                super::resume::OwnRound::Defer(why) => {
-                    // The run's rounds are over by the supervisor's rule:
-                    // what is open is deferred with the reason, on the pull
-                    // request, never left as an unexplained verdict.
-                    let now = super::own_review::defer_findings(&body, &items, &why);
+                super::resume::OwnRound::Fixing => Performed::Started,
+                super::resume::OwnRound::Defer(lines) => {
+                    // Every finding left is settled with its own reason (a
+                    // person-gate reason, or the ticket's words): listed on
+                    // the pull request, and the head reviewed again so its
+                    // verdict says what is actually left.
+                    let why = "each with the reason it is not fixed in the code";
+                    let now = super::own_review::defer_findings(&body, &lines, why);
                     if now != body {
                         if let Err(e) =
                             crate::passes::description::save(github, &c.owner, &c.repo, c.pr, &now)
@@ -578,33 +603,54 @@ async fn perform(
                         state,
                         &c.team_id,
                         &c.run_id,
-                        &super::own_review::finish_reason(&items, &why),
+                        &super::own_review::finish_reason(&lines, why),
                     )
                     .await;
-                    true
+                    match review_head(state, c, &seen.head).await {
+                        Performed::Started => Performed::Started,
+                        // Settled with reasons: nothing runs on it.
+                        _ => Performed::Settled,
+                    }
                 }
                 super::resume::OwnRound::Person(why) => {
                     info!(run_id = %c.run_id, why = %why, "PR watch: no fix round for the review's findings now");
-                    false
+                    Performed::NotStarted
                 }
             }
         }
         Act::ResumeRound(_) => {
-            super::resume::resume_limit_ended(state, &c.team_id, &c.run_id, c.installation_id).await
+            super::resume::resume_limit_ended(state, &c.team_id, &c.run_id, c.installation_id)
+                .await
+                .into()
         }
-        Act::WatchDeploy => {
-            super::health_check::schedule_own(
-                state,
-                github,
-                &c.team_id,
-                c.installation_id,
-                (&c.owner, &c.repo, c.pr),
-                &c.base_branch,
-                &seen.merge_sha,
-            )
-            .await
-        }
+        Act::WatchDeploy => super::health_check::schedule_own(
+            state,
+            github,
+            &c.team_id,
+            c.installation_id,
+            (&c.owner, &c.repo, c.pr),
+            &c.base_branch,
+            &seen.merge_sha,
+        )
+        .await
+        .into(),
     }
+}
+
+/// Asks for CoderHelm's review of the head.
+async fn review_head(state: &WorkerState, c: &Candidate, head: &str) -> Performed {
+    (!matches!(
+        super::review_pr::review_for_ready(
+            state,
+            &c.team_id,
+            c.installation_id,
+            (&c.owner, &c.repo, c.pr),
+            head,
+        )
+        .await,
+        super::review_pr::ReadyReviewAsk::Failed
+    ))
+    .into()
 }
 
 /// The standing shown for the pull request, from what the look read and
@@ -724,22 +770,24 @@ pub async fn look(state: &WorkerState, github: &GitHubClient, c: &Candidate) -> 
     };
     let mut act = resume_after_limit(&c.status, &seen, &c.marks, &c.limit_ended)
         .unwrap_or_else(|| decide(&c.status, &seen, &c.marks));
+    let mut performed = Performed::NotStarted;
     if let Some((field, value)) = act.claim(&seen) {
         if !claim(state, c, field, &value).await {
             act = Act::Nothing;
-        } else if !perform(state, github, c, &seen, &act).await {
-            release(state, c, field, &value).await;
-            act = Act::Nothing;
         } else {
-            info!(run_id = %c.run_id, pr = c.pr, ?act, "PR watch: picked the pull request back up");
+            performed = perform(state, github, c, &seen, &act).await;
+            if performed == Performed::NotStarted {
+                release(state, c, field, &value).await;
+                act = Act::Nothing;
+            } else {
+                info!(run_id = %c.run_id, pr = c.pr, ?act, ?performed, "PR watch: picked the pull request back up");
+            }
         }
     }
-    // A review asked for or a round started on this head (now or at an
-    // earlier look) is CoderHelm working, not a person's turn.
-    let working = matches!(
-        act,
-        Act::ReviewHead | Act::FixFindings | Act::ResolveConflict | Act::ResumeRound(_)
-    ) || common::run_status::IN_FLIGHT.contains(&c.status.as_str());
+    // Only work an act started now, or a run still in flight, is CoderHelm
+    // working: a finished run whose findings were settled is never shown as
+    // "a fix round is taking them".
+    let working = is_working(&act, performed, &c.status);
     if kept.is_none() {
         github.record_validators();
     }

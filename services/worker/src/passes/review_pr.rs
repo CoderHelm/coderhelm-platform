@@ -2843,7 +2843,14 @@ async fn run_once(
     // judged against it.
     let plan_context = plan_evidence_for_pr(state, &msg).await;
     let quality_context = code_quality_context(&github, &msg, &compare).await;
-    let extra_context = format!("{graph_context}{ci_context}{quality_context}{plan_context}");
+    // CoderHelm's own pull request is held to its ticket, the comments on
+    // it and its plan: a finding never asks for what they rule out.
+    let ticket_context = match &own_run {
+        Some(run_id) => Box::pin(ticket_context_for_pr(state, &msg.team_id, run_id)).await,
+        None => String::new(),
+    };
+    let extra_context =
+        format!("{graph_context}{ci_context}{quality_context}{plan_context}{ticket_context}");
 
     // CoderHelm's own threads from earlier reviews, with the replies under them.
     // Still-open ones: the re-review reports each as fixed or answered (→ resolved
@@ -3520,12 +3527,31 @@ async fn run_once(
             }
         }
     }
+    // On CoderHelm's own pull request, a finding its fix loop settled with a
+    // reason (the ticket rules it out, or only a person can do it) is a note
+    // naming that reason, never a request for changes on the head.
+    let settled_by_run = match (&own_run, self_authored) {
+        (Some(run_id), true) => {
+            let ledger =
+                Box::pin(super::own_review_ledger::load(state, &msg.team_id, run_id)).await;
+            settle_own_findings(&ledger, &mut findings, &mut own_open)
+        }
+        _ => Vec::new(),
+    };
     // The one verdict the rest of this review may use: what holds the merge,
     // by name. Nothing named holding means approve, whatever came before.
     let open_holding: Vec<(String, u64, String)> = prior_threads
         .iter()
         .filter(|t| !fixed_threads.iter().any(|f| f.id == t.id))
         .filter(|t| review_agent::thread_holds_merge(&t.body))
+        .filter(|t| {
+            !settled_by_run.iter().any(|s| {
+                super::own_review_ledger::same_finding(
+                    s,
+                    &super::own_review::thread_line(&t.path, t.line, &t.body),
+                )
+            })
+        })
         .map(|t| (t.path.clone(), t.line, t.body.clone()))
         .collect();
     let mut final_verdict =
@@ -5059,6 +5085,83 @@ async fn plan_evidence_for_pr(state: &WorkerState, msg: &ReviewMessage) -> Strin
         .and_then(|j| serde_json::from_str::<super::fix_location::FixDecision>(j).ok())
         .map(|d| super::fix_location::reviewer_context(&d))
         .unwrap_or_default()
+}
+
+/// The findings of a review of CoderHelm's own pull request that its fix
+/// loop settled with a reason (`own_review_ledger`): each becomes a note
+/// that names the reason, and leaves `own_open`. Returns their lines.
+pub(crate) fn settle_own_findings(
+    ledger: &super::own_review_ledger::Ledger,
+    findings: &mut [review_agent::Finding],
+    own_open: &mut Vec<String>,
+) -> Vec<String> {
+    use super::own_review_ledger::Settled;
+    let why = |s: &Settled| match s {
+        Settled::ByTicket { quote } => {
+            format!("Not a change to make: the ticket says \"{quote}\".")
+        }
+        Settled::Deferred { reason, what } => format!(
+            "A follow-up only a person can do ({reason}){}.",
+            if what.is_empty() {
+                String::new()
+            } else {
+                format!(": {what}")
+            }
+        ),
+        Settled::Fixed => String::new(),
+    };
+    let mut settled = Vec::new();
+    for f in findings.iter_mut() {
+        let line = super::own_review::thread_line(&f.file, f.line, &f.title);
+        if let Some(s) = ledger.settled_item(&line) {
+            super::review_policy::demote(f, &why(s));
+            settled.push(line);
+        }
+    }
+    own_open.retain(|o| {
+        let keep = ledger.settled_item(o).is_none();
+        if !keep && !settled.contains(o) {
+            settled.push(o.clone());
+        }
+        keep
+    });
+    settled
+}
+
+/// For CoderHelm's own pull request: the ticket, the comments people wrote
+/// on it and the plan, with the rule that a finding never asks for what
+/// they rule out.
+async fn ticket_context_for_pr(state: &WorkerState, team_id: &str, run_id: &str) -> String {
+    let Some(item) = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(team_id))
+        .key("run_id", attr_s(run_id))
+        .send()
+        .await
+        .ok()
+        .and_then(|o| o.item)
+    else {
+        return String::new();
+    };
+    let text = super::own_review_ledger::ticket_text(state, team_id, &item).await;
+    own_ticket_section(&text)
+}
+
+/// The reviewer's section for the ticket of CoderHelm's own pull request.
+pub(crate) fn own_ticket_section(text: &str) -> String {
+    if text.trim().is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n## The ticket this pull request does, the comments on it and the plan\n{}\n\nNever \
+         raise a finding that asks for something these rule out: where the code follows the \
+         ticket, a comment on it or the plan, that is the work asked for, not a defect. Where \
+         they disagree with each other, the newest comment wins. When you think the ticket is \
+         wrong, say so in a note naming the words; it never holds the merge.\n",
+        common::truncate_str(text.trim(), 12_000)
+    )
 }
 
 /// The ticket of a run, from its record (empty when it has none).
