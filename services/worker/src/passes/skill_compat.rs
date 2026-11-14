@@ -189,6 +189,7 @@ const PASSES: &[(&str, &[&str])] = &[
     ("get_diff", &["coder"]),
     ("run_checks", &["coder"]),
     ("run_codegen", &["coder"]),
+    ("bash", &["coder"]),
     ("graph_definition", &["planner", "coder", "reviewer"]),
     ("graph_callers", &["planner", "coder", "reviewer"]),
     ("graph_impact", &["planner", "coder", "reviewer"]),

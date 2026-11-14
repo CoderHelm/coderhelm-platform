@@ -363,11 +363,23 @@ impl Gate {
             Decision::Deny => {
                 self.record(&call, &verdict, audit::action::TOOL_REFUSED, "refused", "")
                     .await;
-                let message = format!(
-                    "Not allowed: {} Don't try this again. Carry on without it, and say what you \
-                     couldn't do.",
-                    verdict.reason
-                );
+                // A tool the agent doesn't have, under a name with an
+                // equivalent: the reason names the tool to use, and "carry
+                // on without it" would tell the model to give the work up.
+                let message = if matches!(verdict.decided_by, DecidedBy::Unknown)
+                    && crate::tool_aliases::alternative(&call.tool).is_some()
+                {
+                    format!(
+                        "Not allowed: {} Don't call {} again.",
+                        verdict.reason, call.tool
+                    )
+                } else {
+                    format!(
+                        "Not allowed: {} Don't try this again. Carry on without it, and say what \
+                         you couldn't do.",
+                        verdict.reason
+                    )
+                };
                 Outcome::Refused { verdict, message }
             }
             Decision::Ask => self.ask(&policy, call, args, why, verdict, &now).await,
