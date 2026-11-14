@@ -66,12 +66,16 @@ pub mod webhooks;
 /// Agent permissions: one policy engine (allow, ask, deny) every agent loop
 /// asks before every call, approval cards, sign-in prompts and the pause.
 pub mod agent_policy;
+// What a shell command an agent sent means here, and the tool names
+// models are trained on with their CoderHelm equivalents.
 /// Alert notifications: which channels an alert posts to, and its messages.
 pub mod alert_episodes;
 pub mod alert_notify;
+pub mod coder_shell;
 /// Chat notifications (Teams and Slack): one message model, a renderer per
 /// channel, sealed webhook URLs.
 pub mod notify;
+pub mod tool_aliases;
 
 /// The team's daily alert token budget (alerts route and Setup).
 pub mod alert_budget;

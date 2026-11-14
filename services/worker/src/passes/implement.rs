@@ -18,6 +18,11 @@ use crate::WorkerState;
 /// Cap on sandbox check runs per implement pass — bounds cost/time and forces
 /// the agent to converge within a handful of real verifications.
 const MAX_CHECKS_PER_RUN: usize = 6;
+/// Commands the coder may run with `bash` in one pass: each is a sandbox
+/// build of minutes.
+const MAX_COMMANDS_PER_PASS: usize = 8;
+/// How long one `bash` command may run in the sandbox before it is stopped.
+const COMMAND_SECS: u64 = 480;
 
 /// The steps run_checks runs, each on its own: the derived type-check/build
 /// command (with the install), the repo's own CI format and lint commands and
@@ -481,6 +486,9 @@ pub async fn run(
     if sandbox.is_some() {
         tools.push(run_codegen_tool());
     }
+    // The shell the model expects: its reads always work, its commands
+    // when there is a sandbox.
+    tools.push(bash_tool(sandbox.is_some()));
 
     // Only load MCP plugins if the issue body contains URLs or external references
     let has_external_refs = msg.body.contains("http://")
@@ -800,6 +808,9 @@ pub async fn run(
             node_version,
             terraform_version,
             check_budget: std::sync::atomic::AtomicUsize::new(0),
+            command_budget: std::sync::atomic::AtomicUsize::new(0),
+            unchecked: std::sync::atomic::AtomicBool::new(false),
+            time_told: std::sync::atomic::AtomicBool::new(false),
             locks_written_at: std::sync::Mutex::new(None),
             gen_edit_rejects: std::sync::Mutex::new(std::collections::HashMap::new()),
             deadline,
@@ -1216,12 +1227,22 @@ pub async fn run(
         .lock()
         .unwrap()
         .clone();
-    let sandbox = executor
+    let mut sandbox = executor
         .write_executor
         .sandbox_record
         .lock()
         .unwrap()
         .clone();
+    // Changes no check ran on are owed their checks: the settle stage runs
+    // them in a step with a full window before the run finishes. A round
+    // is never done on edits nothing checked.
+    sandbox.refused_for_time |= checks_owed(
+        executor.write_executor.sandbox.is_some() && executor.write_executor.checks_cmd.is_some(),
+        executor
+            .write_executor
+            .unchecked
+            .load(std::sync::atomic::Ordering::SeqCst),
+    );
     let ci_gates = super::checks::kinds_from(&ci);
     let writes = std::mem::take(&mut *executor.write_executor.writes.lock().unwrap());
     // The edits outside the plan's files the round made, with why: the
@@ -1470,6 +1491,66 @@ fn run_checks_tool() -> ToolDefinition {
     }
 }
 
+/// The script the sandbox runs for one `bash` command: in its folder,
+/// stopped after [`COMMAND_SECS`].
+pub(crate) fn command_script(command: &str, dir: Option<&str>) -> String {
+    let inner = match dir {
+        Some(d) => format!("cd {} && {command}", common::coder_shell::quote(d)),
+        None => command.to_string(),
+    };
+    format!(
+        "timeout {COMMAND_SECS} bash -c {}",
+        common::coder_shell::quote(&inner)
+    )
+}
+
+/// Whether a pass's checks are owed when it ends: the repository has
+/// checks the sandbox runs, and the branch changed after the last ones ran.
+pub(crate) fn checks_owed(has_checks: bool, unchecked: bool) -> bool {
+    has_checks && unchecked
+}
+
+/// The note that asks for the checks while a build still fits.
+pub(crate) fn check_now_text(left: std::time::Duration, build: std::time::Duration) -> String {
+    format!(
+        "TIME: about {} min are left in this step and one sandbox check takes about {} min. \
+         Call run_checks now, before more edits, so this round's changes are checked; fix what \
+         it reports in small edits. Edits after the last check are checked in the next step \
+         before the run finishes.",
+        left.as_secs().div_ceil(60),
+        build.as_secs().div_ceil(60)
+    )
+}
+
+/// What the coder reads back from one command.
+pub(crate) fn command_report(
+    command: &str,
+    code: i32,
+    secs: u64,
+    dropped: Option<&str>,
+    output: &str,
+) -> String {
+    let mut out = format!("`{command}` exited {code} after {secs}s");
+    if code == 124 {
+        out.push_str(&format!(
+            " (stopped: it ran past {} minutes)",
+            COMMAND_SECS / 60
+        ));
+    }
+    out.push('.');
+    if let Some(d) = dropped {
+        out.push_str(&format!(
+            " `{d}` was left off: the output below is already the end of what it printed."
+        ));
+    }
+    out.push_str("\n--- output (the last part) ---\n");
+    out.push_str(output.trim_end());
+    out.push_str(
+        "\n---\nAnything the command wrote is not kept: change files with edit_file or write_file.",
+    );
+    out
+}
+
 /// Whether the lockfiles already match the branch at `head`: they were
 /// regenerated for exactly this head in this pass. A regeneration is a
 /// sandbox build of minutes, and two of them in one step once left no time
@@ -1503,6 +1584,50 @@ fn run_codegen_tool() -> ToolDefinition {
     }
 }
 
+/// The coder's shell. Models are trained with one and call `bash` whatever
+/// they are given; refused as an unknown tool, that call cost a step and
+/// the model worked around a tool it had under other names. Reads (`cat`,
+/// `grep`, `ls`, `git diff`) run as the file tools at once; build, test,
+/// lint and package commands run in the sandbox on the branch as it is
+/// committed; what never runs here (writes, git, network, secrets) is
+/// refused with the tool to use instead (`common::coder_shell`).
+pub(crate) fn bash_tool(sandbox: bool) -> ToolDefinition {
+    let commands = if sandbox {
+        format!(
+            "Other commands (the repository's tests, type check, linters, build, package \
+             scripts: `npm test -- src/a.test.ts`, `npx tsc --noEmit`, `cargo test -p core`, \
+             `pytest tests/test_a.py`) run in the sandbox on the branch as committed, after its \
+             install, and return the exit code, how long it took and the end of the output. \
+             Each is a build of a few minutes, stopped after {} minutes, at most {} per step: \
+             prefer run_checks for the full checks. One plain command per call (a leading \
+             `cd dir &&` is fine; a pipe into head or tail is dropped).",
+            COMMAND_SECS / 60,
+            MAX_COMMANDS_PER_PASS
+        )
+    } else {
+        "Other commands don't run in this run (it has no sandbox).".to_string()
+    };
+    ToolDefinition {
+        name: "bash".to_string(),
+        description: format!(
+            "Run a shell command line against the repository. Reads run at once as the file \
+             tools: `cat`/`head`/`sed -n` read files, `grep`/`rg` search the code, `ls` lists a \
+             folder, `find` lists every file, `git diff`/`git status` show the change. {commands} \
+             Commands never change files (nothing they write is kept: use edit_file and \
+             write_file), never run git commands that change the branch (CoderHelm commits and \
+             pushes), and never reach the network beyond the sandbox's allowlist or any \
+             credentials."
+        ),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "description": "The command line to run, e.g. `grep -rn useFlag src` or `npm test -- src/flags.test.ts`"}
+            },
+            "required": ["command"]
+        }),
+    }
+}
+
 /// The names of the coding agent's own tools.
 #[cfg(test)]
 pub(crate) fn tool_names() -> Vec<String> {
@@ -1515,6 +1640,7 @@ pub(crate) fn coder_tools() -> Vec<ToolDefinition> {
     let mut v = all_tools();
     v.push(run_checks_tool());
     v.push(run_codegen_tool());
+    v.push(bash_tool(true));
     v
 }
 
@@ -1586,21 +1712,23 @@ fn all_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "edit_file".to_string(),
-            description: "Make targeted edits to an existing file using search/replace. Sends only the changed parts — use this instead of write_file for modifications. Each edit replaces one occurrence of old_text with new_text. old_text must match the file EXACTLY (whitespace, quotes, commas) — a sloppy match can drop a line. For files with JSON, template literals, or heavy special characters, or when an edit call keeps failing, prefer write_file to rewrite the whole file instead.".to_string(),
+            description: "Make targeted edits to an existing file using search/replace. Sends only the changed parts — use this instead of write_file for modifications. `edits` is an array of {old_text, new_text} objects; each replaces one occurrence of old_text with new_text. old_text must match the file EXACTLY (whitespace, quotes, commas) — a sloppy match can drop a line. For files with JSON, template literals, or heavy special characters, or when an edit call keeps failing, prefer write_file to rewrite the whole file instead.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "File path relative to repo root"},
                     "edits": {
                         "type": "array",
-                        "description": "Array of search/replace edits to apply in order",
+                        "description": "A JSON array (not a string holding one) of search/replace edits, applied in order: [{\"old_text\": \"...\", \"new_text\": \"...\"}]",
+                        "minItems": 1,
                         "items": {
                             "type": "object",
                             "properties": {
                                 "old_text": {"type": "string", "description": "Exact text to find (must match uniquely)"},
                                 "new_text": {"type": "string", "description": "Replacement text"}
                             },
-                            "required": ["old_text", "new_text"]
+                            "required": ["old_text", "new_text"],
+                            "additionalProperties": false
                         }
                     },
                     "message": {"type": "string", "description": "Commit message"}
@@ -1816,6 +1944,13 @@ struct WriteToolExecutor<'a> {
     run_id: Option<String>,
     /// Bounds sandbox runs per pass; also the S3 key nonce per attempt.
     check_budget: std::sync::atomic::AtomicUsize,
+    /// `bash` commands run in the sandbox in this pass.
+    command_budget: std::sync::atomic::AtomicUsize,
+    /// The branch changed since the last checks that ran: the checks are
+    /// owed (run by the settle stage when this pass ends without them).
+    unchecked: std::sync::atomic::AtomicBool,
+    /// The coder was told once to run the checks while a build still fits.
+    time_told: std::sync::atomic::AtomicBool,
     /// The branch head the lockfiles were last regenerated for in this pass
     /// (see [`lockfiles_current`]).
     locks_written_at: std::sync::Mutex<Option<String>>,
@@ -1849,7 +1984,19 @@ impl<'a> ToolExecutor for WriteToolExecutor<'a> {
         name: &str,
         input: &serde_json::Value,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        if name == "bash" {
+            return Box::pin(self.bash(input)).await;
+        }
         let out = self.execute_tool(name, input).await;
+        let out = match out {
+            Ok(serde_json::Value::String(text)) if is_write_tool(name) => {
+                Ok(json!(match self.check_now_note() {
+                    Some(n) => format!("{text}\n\n{n}"),
+                    None => text,
+                }))
+            }
+            other => other,
+        };
         if let Err(e) = &out {
             if is_write_tool(name) {
                 let mut w = self.writes.lock().unwrap();
@@ -2129,7 +2276,9 @@ impl<'a> WriteToolExecutor<'a> {
                         .scope_guard
                         .check(path, super::write_guard::reason_input(input))
                     {
-                        note(LogOutcome::soft_fail("refused: outside the round's files"));
+                        note(LogOutcome::soft_fail(super::write_guard::refused_summary(
+                            path,
+                        )));
                         return Ok(json!(refusal));
                     }
                     if let Some(problem) = validate_edit_safety(old, content, path) {
@@ -2161,7 +2310,7 @@ impl<'a> WriteToolExecutor<'a> {
                         sha.as_deref(),
                     )
                     .await?;
-                self.files_modified.lock().unwrap().insert(path.to_string());
+                self.mark_written(path.to_string());
                 // A file the round created is the round's from here on.
                 if existing.is_none() {
                     self.scope_guard.allow(path);
@@ -2194,8 +2343,10 @@ impl<'a> WriteToolExecutor<'a> {
                 let message = input
                     .get("message")
                     .and_then(|v| v.as_str())
-                    .ok_or("Missing message")?;
-                let message: &str = &self.commit_message(message);
+                    .map(str::to_string)
+                    // A missing message never costs the edit a step.
+                    .unwrap_or_else(|| format!("Edit {path}"));
+                let message: &str = &self.commit_message(&message);
 
                 // Fetch current file content
                 let cache_key = format!("{}:{}", self.branch, path);
@@ -2213,7 +2364,9 @@ impl<'a> WriteToolExecutor<'a> {
                     .scope_guard
                     .check(path, super::write_guard::reason_input(input))
                 {
-                    note(LogOutcome::soft_fail("refused: outside the round's files"));
+                    note(LogOutcome::soft_fail(super::write_guard::refused_summary(
+                        path,
+                    )));
                     return Ok(json!(refusal));
                 }
                 // Apply edits atomically via the shared search/replace applier —
@@ -2288,7 +2441,7 @@ impl<'a> WriteToolExecutor<'a> {
                         sha.as_deref(),
                     )
                     .await?;
-                self.files_modified.lock().unwrap().insert(path.to_string());
+                self.mark_written(path.to_string());
                 let (add, del) = common::agent_log::line_delta(&original_content, &content);
                 self.file_cache.insert(cache_key, content).await;
                 self.task_tracker.mark_files_done(&[path]).await;
@@ -2380,9 +2533,10 @@ impl<'a> WriteToolExecutor<'a> {
                                 .scope_guard
                                 .check(path, super::write_guard::reason_input(f))
                             {
-                                note(LogOutcome::soft_fail(
-                                    "nothing committed: outside the round's files",
-                                ));
+                                note(LogOutcome::soft_fail(format!(
+                                    "nothing committed: {}",
+                                    super::write_guard::refused_summary(path)
+                                )));
                                 return Ok(json!(format!(
                                     "Batch write REJECTED: nothing was committed. {refusal} In \
                                      a batch, `{}` goes on that file's entry.",
@@ -2429,7 +2583,7 @@ impl<'a> WriteToolExecutor<'a> {
                     let path = match op {
                         FileOp::Write { path, .. } | FileOp::Delete { path } => path,
                     };
-                    self.files_modified.lock().unwrap().insert(path.clone());
+                    self.mark_written(path.clone());
                     self.file_cache
                         .remove(&format!("{}:{}", self.branch, path))
                         .await;
@@ -2523,7 +2677,9 @@ impl<'a> WriteToolExecutor<'a> {
                     .scope_guard
                     .check(path, super::write_guard::reason_input(input))
                 {
-                    note(LogOutcome::soft_fail("refused: outside the round's files"));
+                    note(LogOutcome::soft_fail(super::write_guard::refused_summary(
+                        path,
+                    )));
                     return Ok(json!(refusal));
                 }
                 // Default to the PR's base branch — restoring an out-of-scope file
@@ -2582,7 +2738,7 @@ impl<'a> WriteToolExecutor<'a> {
                         sha.as_deref(),
                     )
                     .await?;
-                self.files_modified.lock().unwrap().insert(path.to_string());
+                self.mark_written(path.to_string());
                 self.file_cache
                     .insert(format!("{}:{}", self.branch, path), content.clone())
                     .await;
@@ -2601,6 +2757,30 @@ impl<'a> WriteToolExecutor<'a> {
 }
 
 impl<'a> WriteToolExecutor<'a> {
+    /// A file this pass committed: part of the change, and not checked yet.
+    fn mark_written(&self, path: String) -> bool {
+        self.unchecked
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.files_modified.lock().unwrap().insert(path)
+    }
+
+    /// Once, when the branch has unchecked changes and the time left in
+    /// this step fits one more sandbox build but not two: tell the coder to
+    /// run the checks now. A round that kept editing to the end used to
+    /// find no time left for its checks (15 files changed, checks "not run:
+    /// not enough time left").
+    fn check_now_note(&self) -> Option<String> {
+        use std::sync::atomic::Ordering;
+        let sandbox = self.sandbox.as_ref()?;
+        self.checks_cmd.as_ref()?;
+        if !self.unchecked.load(Ordering::SeqCst) || self.time_told.load(Ordering::SeqCst) {
+            return None;
+        }
+        let (left, build) = sandbox.check_window(self.deadline)?;
+        self.time_told.store(true, Ordering::SeqCst);
+        Some(check_now_text(left, build))
+    }
+
     /// Should a hand-edit to `path` (whose current content is `existing`) be
     /// rejected and steered to run_codegen? True only when the repo HAS a codegen
     /// command, the file looks generated, AND this path hasn't already been
@@ -2687,6 +2867,201 @@ impl<'a> WriteToolExecutor<'a> {
         Ok((kept, skipped))
     }
 
+    /// The coder's `bash` call: a read runs as its file tool (asked of the
+    /// gate as that tool), a command runs in the sandbox, anything else is
+    /// refused with what to use instead.
+    async fn bash(
+        &self,
+        input: &serde_json::Value,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        use common::coder_shell::Shell;
+        let line = ["command", "cmd"]
+            .iter()
+            .find_map(|k| input.get(*k).and_then(|v| v.as_str()))
+            .unwrap_or("")
+            .trim();
+        let (tool, args) = match common::coder_shell::classify(line) {
+            Shell::Read {
+                path,
+                lines: Some((a, b)),
+            } => (
+                "read_file_lines",
+                json!({"path": path, "start_line": a, "end_line": b}),
+            ),
+            Shell::Read { path, lines: None } => ("read_file", json!({ "path": path })),
+            Shell::List { path } => ("list_directory", json!({ "path": path })),
+            Shell::Search { query } => ("search_code", json!({ "query": query })),
+            Shell::Tree => ("read_tree", json!({})),
+            Shell::Diff => ("get_diff", json!({})),
+            Shell::Refuse(why) => {
+                note(LogOutcome::refused("not run: not a command for here"));
+                return Ok(json!(why));
+            }
+            Shell::Empty => {
+                note(LogOutcome::soft_fail("not run: no command"));
+                return Ok(json!(
+                    "No command was sent: put the command line in `command`."
+                ));
+            }
+            Shell::Run {
+                command,
+                dir,
+                dropped,
+            } => {
+                return self
+                    .run_command(&command, dir.as_deref(), dropped.as_deref())
+                    .await
+            }
+        };
+        if let Some(gate) = &self.policy {
+            match gate
+                .check(common::agent_policy::Request {
+                    tool,
+                    args: &args,
+                    why: "",
+                })
+                .await
+            {
+                common::agent_policy::Outcome::Run { .. } => {}
+                common::agent_policy::Outcome::Stop(stop) => {
+                    crate::agent::policy::record_stop(&stop);
+                    return Err(Box::new(common::agent_policy::AgentStopped(stop)));
+                }
+                common::agent_policy::Outcome::Refused { message, .. }
+                | common::agent_policy::Outcome::Pending { message, .. } => {
+                    note(LogOutcome::refused("the agent policy did not allow it"));
+                    return Ok(json!(message));
+                }
+            }
+        }
+        let out = self.execute_tool(tool, &args).await?;
+        let text = match out {
+            serde_json::Value::String(t) => t,
+            other => other.to_string(),
+        };
+        Ok(json!(format!("(`{line}` ran as {tool})\n{text}")))
+    }
+
+    /// One command in the sandbox, on the branch as committed: its exit
+    /// code, how long it took and the end of its output. Never an Err for
+    /// a command that failed: its exit code is its result.
+    async fn run_command(
+        &self,
+        command: &str,
+        dir: Option<&str>,
+        dropped: Option<&str>,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        use std::sync::atomic::Ordering;
+        let (Some(sandbox), Some(run_id)) = (&self.sandbox, &self.run_id) else {
+            note(LogOutcome::soft_fail("not run: no sandbox for this run"));
+            return Ok(json!(
+                "Commands can't run in this run: it has no sandbox. Read files with read_file, \
+                 find code with search_code, and rely on the repository's CI on the pull request."
+            ));
+        };
+        if let Some(d) = dir {
+            if d.split('/').any(|seg| seg == "..")
+                || !d
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "-_./@".contains(c))
+            {
+                note(LogOutcome::refused(
+                    "not run: a folder outside the repository",
+                ));
+                return Ok(json!(format!(
+                    "`cd {d}` isn't a folder of the repository. Name a folder under its root."
+                )));
+            }
+        }
+        let n = self.command_budget.fetch_add(1, Ordering::SeqCst);
+        if n >= MAX_COMMANDS_PER_PASS {
+            note(LogOutcome::soft_fail(
+                "not run: the step's commands are used",
+            ));
+            return Ok(json!(format!(
+                "This step has run its {MAX_COMMANDS_PER_PASS} commands. Use run_checks for the \
+                 repository's checks, and finish with the output you have."
+            )));
+        }
+        if let Some((times, reason)) = crate::clients::sandbox::NoResults::given_up(run_id) {
+            note(LogOutcome::soft_fail("not run: the sandbox gave no result"));
+            return Ok(json!(format!(
+                "The sandbox gave no result {times} times in this run ({reason}), so no more \
+                 builds are started. Finish without it; CI still runs on the pull request."
+            )));
+        }
+        if !sandbox.has_time(self.deadline) {
+            note(LogOutcome::soft_fail("not run: not enough time left"));
+            return Ok(json!(
+                "This step has too little time left for a sandbox build. Finish your changes; \
+                 CoderHelm runs the repository's checks before the run finishes."
+            ));
+        }
+        if let Some(gate) = &self.policy {
+            match gate
+                .check_command(command, "Run a command the coder asked for")
+                .await
+            {
+                common::agent_policy::Outcome::Run { .. } => {}
+                common::agent_policy::Outcome::Stop(stop) => {
+                    crate::agent::policy::record_stop(&stop);
+                    return Err(Box::new(common::agent_policy::AgentStopped(stop)));
+                }
+                common::agent_policy::Outcome::Refused { message, .. }
+                | common::agent_policy::Outcome::Pending { message, .. } => {
+                    note(LogOutcome::refused("the agent policy did not allow it"));
+                    return Ok(json!(message));
+                }
+            }
+        }
+        let source = match self.sandbox_source(sandbox, run_id).await {
+            Ok(k) => k,
+            Err(e) => {
+                note(LogOutcome::soft_fail(
+                    "not run: could not snapshot the branch",
+                ));
+                return Ok(json!(format!(
+                    "Could not snapshot the branch for the command: {e}."
+                )));
+            }
+        };
+        let script = command_script(command, dir);
+        let started = std::time::Instant::now();
+        let ran = sandbox
+            .run_checks(
+                &source,
+                &script,
+                self.node_version.as_deref(),
+                self.terraform_version.as_deref(),
+                self.deadline,
+            )
+            .await;
+        let secs = started.elapsed().as_secs();
+        match ran {
+            Ok(o) if o.ran => {
+                crate::clients::sandbox::NoResults::clear(run_id);
+                let code = o.exit_code.unwrap_or(-1);
+                note(LogOutcome::ok(format!("exit {code}, {secs}s")));
+                Ok(json!(command_report(
+                    command, code, secs, dropped, &o.output
+                )))
+            }
+            Ok(o) => {
+                if o.broken {
+                    crate::clients::sandbox::NoResults::record(run_id, &o.reason);
+                }
+                note(LogOutcome::soft_fail("the sandbox gave no result"));
+                Ok(json!(format!("The command gave no result: {}", o.output)))
+            }
+            Err(e) => {
+                note(LogOutcome::soft_fail("sandbox error"));
+                Ok(json!(format!(
+                    "Sandbox error: {e}. The command didn't run."
+                )))
+            }
+        }
+    }
+
     /// Run the repo's real checks in the sandbox and return the actual output
     /// for the agent to iterate on. Returns Ok(...) even on a failing build — a
     /// red result is normal feedback, not a tool error.
@@ -2728,7 +3103,9 @@ impl<'a> WriteToolExecutor<'a> {
             )));
         }
         if !sandbox.has_time(self.deadline) {
-            note(LogOutcome::soft_fail("not run: not enough time left"));
+            note(LogOutcome::soft_fail(
+                "not run: not enough time left in this step; the checks run in the next step",
+            ));
             // The check is owed, not dropped: the settle stage runs it in a
             // step with a full window before the run finishes (`settle`).
             self.sandbox_record.lock().unwrap().refused_for_time = true;
@@ -2788,6 +3165,8 @@ impl<'a> WriteToolExecutor<'a> {
         {
             Ok(o) if o.ran => {
                 crate::clients::sandbox::NoResults::clear(run_id);
+                self.unchecked
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
                 let codes = super::checks::step_results(&o.output, steps.len());
                 let lines: Vec<String> = steps
                     .iter()
@@ -3005,7 +3384,7 @@ impl<'a> WriteToolExecutor<'a> {
             *self.locks_written_at.lock().unwrap() = Some(now).filter(|h| !h.is_empty());
         }
         for p in &repair.written {
-            self.files_modified.lock().unwrap().insert(p.clone());
+            self.mark_written(p.clone());
             self.file_cache
                 .remove(&format!("{}:{}", self.branch, p))
                 .await;
@@ -3162,7 +3541,7 @@ impl<'a> WriteToolExecutor<'a> {
                 {
                     Ok(_) => {
                         for p in &paths {
-                            self.files_modified.lock().unwrap().insert(p.clone());
+                            self.mark_written(p.clone());
                             self.file_cache
                                 .remove(&format!("{}:{}", self.branch, p))
                                 .await;
@@ -3454,29 +3833,163 @@ fn generated_file_reject(path: &str) -> String {
     )
 }
 
-/// The `edits` of an `edit_file` call. The model sometimes sends the array
-/// as a JSON string; that string is read as the array it holds. A string
-/// that isn't one, or no `edits` at all, gets an answer that says what was
-/// wrong with the call ("Missing edits array" read as if nothing was sent,
-/// and the model wrote the same call again).
+/// The `edits` of an `edit_file` call, each as `{old_text, new_text}`.
+///
+/// Models send the same edits in several shapes, and refusing any of them
+/// cost a step and often a second one (an incident run failed twice in a
+/// row with "`edits` was a string that isn't a JSON array" before a third
+/// call went through). Read as the edits they hold:
+/// - an array of edits;
+/// - a string holding that array, including one with raw line breaks or
+///   tabs inside its strings (strict JSON rejects those, and code a model
+///   pastes into a string is full of them), text after the array, or the
+///   array encoded twice;
+/// - one edit object instead of an array, or `old_text`/`new_text` on the
+///   call itself with no `edits`;
+/// - the keys `old_string`/`new_string` (Claude Code) and
+///   `old_str`/`new_str` (Anthropic's editor) for `old_text`/`new_text`.
+///
+/// Anything else gets an answer that says exactly what was wrong ("Missing
+/// edits array" read as if nothing was sent, and the model wrote the same
+/// call again).
 pub(crate) fn tool_edits(input: &serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
-    let shape = "Send `edits` as an array of {\"old_text\": ..., \"new_text\": ...} objects, \
-                 not as a string. For a large change, use write_file instead.";
-    match input.get("edits") {
-        Some(serde_json::Value::Array(a)) => Ok(a.clone()),
-        Some(serde_json::Value::String(s)) => match serde_json::from_str::<serde_json::Value>(s) {
-            Ok(serde_json::Value::Array(a)) => Ok(a),
-            _ => Err(format!(
-                "edit_file not applied: `edits` was a string that isn't a JSON array. {shape}"
-            )),
-        },
-        Some(_) => Err(format!(
-            "edit_file not applied: `edits` isn't an array. {shape}"
-        )),
-        None => Err(format!(
-            "edit_file not applied: the call has no `edits`. {shape}"
-        )),
+    use serde_json::Value;
+    let shape = "Send `edits` as a JSON array of {\"old_text\": ..., \"new_text\": ...} \
+                 objects (an array, not a string holding one). For a large change, use \
+                 write_file instead.";
+    let fail = |what: String| Err(format!("edit_file not applied: {what}. {shape}"));
+    let raw = match input.get("edits") {
+        Some(v) => v.clone(),
+        None if edit_pair(input).is_some() => Value::Array(vec![input.clone()]),
+        None => return fail("the call has no `edits`".into()),
+    };
+    let list = match unwrap_edits(raw) {
+        Ok(l) => l,
+        Err(why) => return fail(why),
+    };
+    if list.is_empty() {
+        return fail("`edits` was an empty array".into());
     }
+    let mut out = Vec::with_capacity(list.len());
+    for (i, e) in list.iter().enumerate() {
+        match edit_pair(e) {
+            Some((old, new)) => out.push(serde_json::json!({"old_text": old, "new_text": new})),
+            None => {
+                let sent = match e {
+                    Value::Object(m) if m.is_empty() => "an empty object".to_string(),
+                    Value::Object(m) => format!(
+                        "an object with {}",
+                        m.keys()
+                            .map(|k| format!("`{k}`"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                    Value::String(_) => "a string".to_string(),
+                    other => format!("a {}", json_kind(other)),
+                };
+                return fail(format!(
+                    "edit {} of {} is {sent}, not old_text and new_text",
+                    i + 1,
+                    list.len()
+                ));
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn json_kind(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "true or false",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+/// `edits` as a list: an array as it is, one edit object as a list of one,
+/// a string read as the JSON it holds (see [`lenient_json`]).
+fn unwrap_edits(v: serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+    use serde_json::Value;
+    let mut v = v;
+    // A string may hold the array, or (encoded twice) a string holding it.
+    for _ in 0..2 {
+        let Value::String(text) = &v else { break };
+        let t = text.trim();
+        if t.is_empty() {
+            return Err("`edits` was an empty string".into());
+        }
+        v = lenient_json(t).map_err(|e| format!("`edits` was a string that isn't JSON ({e})"))?;
+    }
+    match v {
+        Value::Array(a) => Ok(a),
+        Value::Object(ref m) if m.contains_key("edits") => unwrap_edits(m["edits"].clone()),
+        Value::Object(_) if edit_pair(&v).is_some() => Ok(vec![v]),
+        Value::String(_) => Err("`edits` was a string that holds only another string".into()),
+        other => Err(format!("`edits` was a {}, not an array", json_kind(&other))),
+    }
+}
+
+/// The JSON value at the start of `text`, read leniently: raw line breaks,
+/// carriage returns and tabs inside strings are taken as their escapes, a
+/// code fence around it is dropped, and anything after the value is
+/// ignored. The error says where the text stopped being JSON.
+fn lenient_json(text: &str) -> Result<serde_json::Value, String> {
+    let t = text.trim();
+    let t = t
+        .strip_prefix("```json")
+        .or_else(|| t.strip_prefix("```"))
+        .map(|r| r.trim_end().trim_end_matches("```").trim())
+        .unwrap_or(t);
+    let first = |s: &str| -> Result<serde_json::Value, serde_json::Error> {
+        let mut it = serde_json::Deserializer::from_str(s).into_iter::<serde_json::Value>();
+        match it.next() {
+            Some(r) => r,
+            None => serde_json::from_str(s),
+        }
+    };
+    match first(t) {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            // Escape control characters inside strings, then try again.
+            let mut fixed = String::with_capacity(t.len() + 16);
+            let (mut in_str, mut esc) = (false, false);
+            for c in t.chars() {
+                if in_str {
+                    if esc {
+                        esc = false;
+                    } else if c == '\\' {
+                        esc = true;
+                    } else if c == '"' {
+                        in_str = false;
+                    } else if c == '\n' {
+                        fixed.push_str("\\n");
+                        continue;
+                    } else if c == '\r' {
+                        fixed.push_str("\\r");
+                        continue;
+                    } else if c == '\t' {
+                        fixed.push_str("\\t");
+                        continue;
+                    }
+                } else if c == '"' {
+                    in_str = true;
+                }
+                fixed.push(c);
+            }
+            first(&fixed).map_err(|_| format!("line {}, column {}: {}", e.line(), e.column(), e))
+        }
+    }
+}
+
+/// One edit's search and replace text, under any of the names models use.
+fn edit_pair(e: &serde_json::Value) -> Option<(String, String)> {
+    let get = |keys: &[&str]| keys.iter().find_map(|k| e.get(*k).and_then(|v| v.as_str()));
+    let old = get(&["old_text", "old_string", "old_str", "oldText", "search"])?;
+    let new = get(&["new_text", "new_string", "new_str", "newText", "replace"])?;
+    Some((old.to_string(), new.to_string()))
 }
 
 #[cfg(test)]
@@ -3503,11 +4016,53 @@ mod tool_edits_tests {
     fn a_broken_edits_string_says_what_to_send() {
         let garbled = json!({"edits": "[{\"old_text\">/** a */\", \"new_text\": \"b\"}]"});
         let e = tool_edits(&garbled).unwrap_err();
-        assert!(e.contains("string that isn't a JSON array"), "{e}");
+        assert!(
+            e.contains("a string that isn't JSON (line 1, column"),
+            "{e}"
+        );
         assert!(e.contains("array of"), "{e}");
         let none = tool_edits(&json!({"path": "a"})).unwrap_err();
         assert!(none.contains("no `edits`"), "{none}");
-        assert!(tool_edits(&json!({"edits": 3})).is_err());
+        assert!(tool_edits(&json!({"edits": 3}))
+            .unwrap_err()
+            .contains("a number, not an array"));
+        assert!(tool_edits(&json!({"edits": []}))
+            .unwrap_err()
+            .contains("empty array"));
+        let wrong_keys = tool_edits(&json!({"edits": [{"from": "a", "to": "b"}]})).unwrap_err();
+        assert!(
+            wrong_keys.contains("edit 1 of 1 is an object with `from`, `to`"),
+            "{wrong_keys}"
+        );
+    }
+
+    /// The shapes models send the same edits in all apply.
+    #[test]
+    fn every_shape_of_the_same_edit_applies() {
+        let file = "const a = 1;\nconst b = 2;\n";
+        let want = "const a = 1;\nconst b = 3;\n";
+        let shapes = [
+            // A string holding the array with a raw line break inside a
+            // string: strict JSON refuses it (the incident's two failures).
+            json!({"edits": "[{\"old_text\": \"const a = 1;\nconst b = 2;\", \"new_text\": \"const a = 1;\nconst b = 3;\"}]"}),
+            // Text after the array, and a code fence around it.
+            json!({"edits": "[{\"old_text\": \"b = 2\", \"new_text\": \"b = 3\"}]\nThat is the edit."}),
+            json!({"edits": "```json\n[{\"old_text\": \"b = 2\", \"new_text\": \"b = 3\"}]\n```"}),
+            // Encoded twice.
+            json!({"edits": serde_json::to_string(&serde_json::to_string(&json!([{"old_text": "b = 2", "new_text": "b = 3"}])).unwrap()).unwrap()}),
+            // One object instead of an array, as a value and as a string.
+            json!({"edits": {"old_text": "b = 2", "new_text": "b = 3"}}),
+            json!({"edits": "{\"old_str\": \"b = 2\", \"new_str\": \"b = 3\"}"}),
+            // Other tools' key names.
+            json!({"edits": [{"old_string": "b = 2", "new_string": "b = 3"}]}),
+            json!({"edits": [{"old_str": "b = 2", "new_str": "b = 3"}]}),
+            // The pair on the call itself.
+            json!({"path": "a.ts", "old_string": "b = 2", "new_string": "b = 3"}),
+        ];
+        for input in shapes {
+            let edits = tool_edits(&input).unwrap_or_else(|e| panic!("{input}: {e}"));
+            assert_eq!(apply_text_edits(file, &edits).unwrap(), want, "{input}");
+        }
     }
 }
 

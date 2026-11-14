@@ -21,6 +21,20 @@
 use super::model::*;
 use super::sandbox;
 
+/// Why a tool nothing knows doesn't run, with the tool to use instead when
+/// its name is one models are trained on (`bash`, `Edit`, `grep`). A
+/// refusal that only said "unknown" left the model to guess, and it spent
+/// steps working around a tool it already had under another name.
+pub fn unknown_reason(tool: &str) -> String {
+    match crate::tool_aliases::alternative(tool) {
+        Some(instead) => format!("{tool} isn't one of this agent's tools. {instead}"),
+        None => format!(
+            "{tool} isn't one of this agent's tools, so it doesn't run. Use only the tools \
+             you were given."
+        ),
+    }
+}
+
 /// `pattern` with `*` matching any run of characters, ignoring case.
 pub fn glob_match(pattern: &str, name: &str) -> bool {
     let pattern = pattern.trim().to_ascii_lowercase();
@@ -292,12 +306,7 @@ pub fn explain(policy: &TeamPolicy, call: &Call, risk: impl Into<Known>, now: &s
                 decision: Decision::Deny,
                 risk: None,
                 decided_by: DecidedBy::Unknown,
-                reason: refused.unwrap_or_else(|| {
-                    format!(
-                        "Nothing says what {} does, so it doesn't run. Unknown tools are always denied.",
-                        call.tool
-                    )
-                }),
+                reason: refused.unwrap_or_else(|| unknown_reason(&call.tool)),
                 capped: false,
             },
             considered,

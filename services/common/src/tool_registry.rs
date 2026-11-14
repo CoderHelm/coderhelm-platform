@@ -120,6 +120,9 @@ pub const BUILTIN: &[(&str, Risk)] = &[
     // A team skill's own script in the sandbox (read-only GitHub token at
     // most), and the run's outputs kept in CoderHelm.
     ("run_skill_script", Risk::Write),
+    // The coder's shell: reads become file tools, commands run in the
+    // sandbox (each asked of the gate as a command).
+    ("bash", Risk::Write),
     ("save_output", Risk::Write),
     ("read_output", Risk::Read),
     // Outside steps CoderHelm runs after the PR opens (worker outside_exec).

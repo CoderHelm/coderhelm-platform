@@ -535,7 +535,8 @@ fn coder_prompts(t: &Ticket) -> (String, String) {
 fn coder_tools() -> Vec<ToolDefinition> {
     super::implement::coder_tools()
         .into_iter()
-        .filter(|t| t.name != "run_codegen")
+        // The eval's repository is in memory: no sandbox, no codegen.
+        .filter(|t| t.name != "run_codegen" && t.name != "bash")
         .collect()
 }
 
