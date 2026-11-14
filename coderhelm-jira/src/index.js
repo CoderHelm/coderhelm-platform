@@ -1,4 +1,5 @@
 const api = require("@forge/api");
+const { buildCommentAdf } = require("./comment-adf");
 const { fetch } = api;
 const { storage } = api;
 const { route } = api;
@@ -313,19 +314,27 @@ exports.createTicketHandler = async (request) => {
 exports.addCommentHandler = async (request) => {
   try {
     const body = JSON.parse(request.body || "{}");
-    const { issueKey, comment, commentType, title } = body;
+    const { issueKey, comment, commentType, title, commentId, replyTo } = body;
 
     if (!issueKey || !comment) {
       return { statusCode: 400, body: JSON.stringify({ error: "issueKey and comment required" }) };
     }
 
-    const adfBody = buildCommentAdf(comment, commentType, title);
+    const adfBody = buildCommentAdf(comment, commentType, title, replyTo);
 
-    const res = await api.asApp().requestJira(route`/rest/api/3/issue/${issueKey}/comment`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ body: adfBody }),
-    });
+    // CoderHelm keeps one live comment per subject: it edits its own
+    // comment in place instead of adding another.
+    const res = commentId
+      ? await api.asApp().requestJira(route`/rest/api/3/issue/${issueKey}/comment/${commentId}`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ body: adfBody }),
+        })
+      : await api.asApp().requestJira(route`/rest/api/3/issue/${issueKey}/comment`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ body: adfBody }),
+        });
 
     if (!res.ok) {
       const err = await res.text();
@@ -335,9 +344,9 @@ exports.addCommentHandler = async (request) => {
 
     const created = await res.json();
     return {
-      statusCode: 201,
+      statusCode: commentId ? 200 : 201,
       headers: { "Content-Type": ["application/json"] },
-      body: JSON.stringify({ id: created.id }),
+      body: JSON.stringify({ id: created.id, edited: Boolean(commentId) }),
     };
   } catch (e) {
     console.error("addComment error:", e);
@@ -389,53 +398,7 @@ async function fetchImageAttachments(fields) {
  * Build ADF (Atlassian Document Format) for a comment.
  * Uses native Jira panel nodes for professional styling.
  */
-function buildCommentAdf(comment, commentType, title) {
-  // Map comment type to Jira ADF panel type
-  const panelTypeMap = {
-    clarification: "warning",  // yellow
-    no_changes: "info",        // blue
-    error: "error",            // red
-    success: "success",        // green
-  };
 
-  const panelType = panelTypeMap[commentType];
-
-  // Split comment into paragraphs
-  const paragraphs = comment.split("\n\n").filter(Boolean).map((para) => ({
-    type: "paragraph",
-    content: [{ type: "text", text: para.replace(/\n/g, " ") }],
-  }));
-
-  // If we have a known panel type, wrap in a panel with bold title
-  if (panelType && title) {
-    return {
-      type: "doc",
-      version: 1,
-      content: [
-        {
-          type: "panel",
-          attrs: { panelType },
-          content: [
-            {
-              type: "paragraph",
-              content: [{ type: "text", text: title, marks: [{ type: "strong" }] }],
-            },
-            ...paragraphs,
-          ],
-        },
-      ],
-    };
-  }
-
-  // Fallback: plain paragraphs
-  return {
-    type: "doc",
-    version: 1,
-    content: paragraphs.length > 0 ? paragraphs : [{ type: "paragraph", content: [{ type: "text", text: comment }] }],
-  };
-}
-
-// ── Web trigger: get Jira site URL ───────────────────────────────────────────
 exports.getSiteUrlHandler = async () => {
   try {
     const res = await api.asApp().requestJira(route`/rest/api/3/serverInfo`);

@@ -1252,20 +1252,25 @@ async fn send_reply(
     let body = format!("{answer}{consulted}{RATING_FOOTER}");
     match msg.reply_to_comment_id {
         Some(comment_id) => {
-            github
-                .reply_to_review_comment(
-                    &msg.repo_owner,
-                    &msg.repo_name,
-                    msg.pr_number,
-                    comment_id,
-                    &body,
-                )
-                .await?;
+            crate::passes::conversation::review_reply(
+                github,
+                &msg.repo_owner,
+                &msg.repo_name,
+                msg.pr_number,
+                comment_id,
+                &body,
+            )
+            .await?;
         }
         None => {
-            github
-                .create_issue_comment(&msg.repo_owner, &msg.repo_name, msg.pr_number, &body)
-                .await?;
+            crate::passes::conversation::github(
+                github,
+                &msg.repo_owner,
+                &msg.repo_name,
+                msg.pr_number,
+                common::conversation::Say::reply_all("review", &body),
+            )
+            .await?;
         }
     }
     let record_sk = store_review_record(
@@ -1455,14 +1460,25 @@ async fn review_failed_for_service(
     };
     let note = gave_up_note(msg, head);
     let posted = match (msg.question.is_some(), msg.reply_to_comment_id) {
-        (true, Some(cid)) => github
-            .reply_to_review_comment(&msg.repo_owner, &msg.repo_name, msg.pr_number, cid, &note)
-            .await
-            .map(|_| ()),
-        _ => github
-            .create_issue_comment(&msg.repo_owner, &msg.repo_name, msg.pr_number, &note)
-            .await
-            .map(|_| ()),
+        (true, Some(cid)) => crate::passes::conversation::review_reply(
+            &github,
+            &msg.repo_owner,
+            &msg.repo_name,
+            msg.pr_number,
+            cid,
+            &note,
+        )
+        .await
+        .map(|_| ()),
+        _ => crate::passes::conversation::github(
+            &github,
+            &msg.repo_owner,
+            &msg.repo_name,
+            msg.pr_number,
+            common::conversation::Say::reply_all("review", &note),
+        )
+        .await
+        .map(|_| ()),
     };
     if let Err(e) = posted {
         warn!(pr = msg.pr_number, error = %e, "Could not tell the PR the review failed");
@@ -4677,14 +4693,14 @@ async fn end_self_review_rounds(
     )
     .await
     {
-        let _ = github
-            .create_issue_comment(
-                &msg.repo_owner,
-                &msg.repo_name,
-                msg.pr_number,
-                &self_review_end_note(open, why),
-            )
-            .await;
+        let _ = crate::passes::conversation::github(
+            github,
+            &msg.repo_owner,
+            &msg.repo_name,
+            msg.pr_number,
+            common::conversation::Say::reply_all("review", self_review_end_note(open, why)),
+        )
+        .await;
     }
     info!(
         pr = msg.pr_number,
@@ -4853,7 +4869,7 @@ async fn forward_ask_to_fix_loop(state: &WorkerState, msg: &ReviewMessage, ask: 
         .await
     {
         Ok(_) => {
-            info!(pr = msg.pr_number, run_id = %run_id, "Fix request on CoderHelm's PR → fix loop");
+            info!(pr = msg.pr_number, run_id = %run_id, "Fix request on CoderHelm's PR: fix loop");
             true
         }
         Err(e) => {
@@ -4909,7 +4925,7 @@ async fn feed_review_back_to_run(state: &WorkerState, msg: &ReviewMessage, revie
         Ok(_) => info!(
             pr = msg.pr_number,
             run_id = %run_id,
-            "Reviewer requested changes on own PR → fed back to run"
+            "Reviewer requested changes on own PR: fed back to run"
         ),
         Err(e) => {
             warn!(pr = msg.pr_number, error = %e, "Failed to enqueue self-review feedback")

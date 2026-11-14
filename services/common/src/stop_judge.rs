@@ -948,7 +948,9 @@ pub async fn judge<M: JudgeModel>(model: &M, picture: Picture) -> Judged {
     let schema = schema();
     let first_prompt = prompt(&picture);
     let mut replies = Vec::new();
-    let first = model.answer(SYSTEM, &first_prompt, &schema).await;
+    // The standard every hand-off is held to (`person_gate`).
+    let system = format!("{SYSTEM}\n\n{}", crate::person_gate::prompt_section());
+    let first = model.answer(&system, &first_prompt, &schema).await;
     let problem = match first {
         Ok(v) => {
             let checked = validate(&picture, &v);
@@ -964,7 +966,7 @@ pub async fn judge<M: JudgeModel>(model: &M, picture: Picture) -> Judged {
         "{first_prompt}\n## Your earlier answer broke a rule\n{problem}\n\nAnswer again with \
          one JSON object matching this schema exactly:\n{schema}"
     );
-    match model.answer(SYSTEM, &again, &schema).await {
+    match model.answer(&system, &again, &schema).await {
         Ok(v) => {
             let checked = validate(&picture, &v);
             replies.push(v);

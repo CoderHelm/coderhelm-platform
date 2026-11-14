@@ -3297,6 +3297,22 @@ impl GitHubClient {
         self.patch(&url, &serde_json::json!({"body": body})).await
     }
 
+    /// A reaction (`eyes`, `+1`, ...) on a comment: an issue or pull
+    /// request conversation comment, or a review (line) comment.
+    pub async fn add_reaction(
+        &self,
+        owner: &str,
+        repo: &str,
+        comment_id: u64,
+        line: bool,
+        content: &str,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        let kind = if line { "pulls" } else { "issues" };
+        let url = format!("{API_BASE}/repos/{owner}/{repo}/{kind}/comments/{comment_id}/reactions");
+        self.post(&url, &serde_json::json!({ "content": content }))
+            .await
+    }
+
     /// Add one or more labels to an issue/PR. Additive (GitHub keeps existing
     /// labels) and creates any label that doesn't exist yet. Used to hand a PR
     /// off to the repo's own label-triggered CI (e.g. a deploy workflow).

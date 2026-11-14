@@ -330,14 +330,17 @@ async fn close_ticket(gh: &GitHubClient, owner: &str, name: &str, r: &mut TestRe
     let Some(n) = own_issue(&url, owner, name) else {
         return;
     };
-    if let Err(e) = gh
-        .create_issue_comment(
-            owner,
-            name,
-            n,
-            &format!("Closing: `{}` is no longer quarantined. {why}", r.title),
-        )
-        .await
+    if let Err(e) = crate::passes::conversation::github(
+        gh,
+        owner,
+        name,
+        n,
+        common::conversation::Say::note(
+            "quarantine",
+            format!("Closing: `{}` is no longer quarantined. {why}", r.title),
+        ),
+    )
+    .await
     {
         warn!(test = %r.id, error = %e, "Could not note why a test's ticket is closed");
     }

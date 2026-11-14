@@ -2459,9 +2459,11 @@ mod tests {
             block,
             "**Needed from you:**\n\
              1. Replace the hero on production. CoderHelm cannot: no production CMS write connection exists. To let it: add a production write token. (a content editor)\n\
-             2. Re-run the e2e tests. CoderHelm could not: the end-to-end workflow has no workflow_dispatch trigger. (a person on the team)\n\
-             3. Approve \"Deploy the studio\": a team admin approves it on the Agent permissions page, and CoderHelm then does it. (a team admin)\n"
+             2. Approve \"Deploy the studio\": a team admin approves it on the Agent permissions page, and CoderHelm then does it. (a team admin)\n"
         );
+        // A failure with no listed reason is CoderHelm's to retry, never a
+        // person's chore (`person_gate`).
+        assert!(!block.contains("Re-run the e2e tests"), "{block}");
         // One state each: nothing says both "CoderHelm" and "needs access".
         assert!(!block.contains("owner: CoderHelm"), "{block}");
         // The ticket note starts with it.

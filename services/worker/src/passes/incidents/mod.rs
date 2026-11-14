@@ -44,6 +44,8 @@ mod ba_verdict_on_old_commit;
 mod bb_flaky_not_broken;
 mod bc_stays_through_merge_and_deploy;
 mod bd_skill_runs_on_coderhelm;
+mod be_one_voice_on_retry;
+mod bf_owns_the_work;
 mod c_codegen_egress;
 mod d_echoed_markers;
 mod e_large_generated_output;

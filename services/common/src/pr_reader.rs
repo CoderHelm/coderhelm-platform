@@ -150,7 +150,7 @@ fn check_ok(check: &str, written: &str) -> Option<String> {
         return None;
     }
     // Chosen from the description, never made up.
-    (crate::pr_steps::is_command(&c) && written.contains(&c)).then(|| format!("`{c}`"))
+    (crate::pr_steps::is_check_command(&c) && written.contains(&c)).then(|| format!("`{c}`"))
 }
 
 /// What of a model's `reply` may be used, verified against `facts` and the
@@ -204,7 +204,7 @@ impl Slots {
             .and_then(|l| {
                 let l = l.trim();
                 let cmd = l.strip_prefix('`')?.split('`').next()?;
-                crate::pr_steps::is_command(cmd).then(|| format!("`{cmd}`"))
+                crate::pr_steps::is_check_command(cmd).then(|| format!("`{cmd}`"))
             })
             .unwrap_or_default();
         let known = format!("{body} {first}");
