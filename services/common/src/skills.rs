@@ -1509,7 +1509,11 @@ pub fn agent_system_prompt(brief: &str, asker: &str, tools: &[String]) -> (Optio
     let system = format!(
         "You are one of this team's own agents, asked a question by Coderhelm's {asker}. Answer \
          from your brief below and the question and context you're given. {has} Keep the answer \
-         focused, under about 600 words.\n\n## Your brief\n{}",
+         focused, under about 600 words.{}\n\n## Your brief\n{}",
+        crate::host_steps::section(
+            &[crate::host_steps::Reader::TeamAgents],
+            &crate::host_steps::for_agents(&crate::host_steps::standard(false)),
+        ),
         crate::truncate_str(&body, AGENT_BRIEF_CHARS)
     );
     (hint, system)

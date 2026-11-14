@@ -903,7 +903,7 @@ async fn discover_suite(round: &Round<'_>, staged: &Staged) -> Result<suite::Sui
     let answer = crate::agent::anthropic::converse_json(
         &round.provider.client(),
         round.provider.primary_model_id(),
-        suite::SYSTEM,
+        &suite::system(),
         &suite::prompt(&files),
         &suite::schema(),
         true,

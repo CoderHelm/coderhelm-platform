@@ -594,6 +594,7 @@ pub async fn run(
     }
     // Repository history through the GitHub App: no setup.
     let team_repos = super::plan::fetch_team_repos(state, &msg.team_id).await;
+    let script_repos = team_repos.clone();
     let history = super::github_history::GithubHistory::new(
         &msg.team_id,
         &format!("{}/{}", msg.repo_owner, msg.repo_name),
@@ -715,6 +716,24 @@ pub async fn run(
         s.record_applied(state).await;
     }
 
+    // A team skill's own work: its script in the sandbox, its files kept as
+    // the run's outputs (only a run has outputs).
+    if run_id.is_some() {
+        let ready = sandbox.is_some() && super::skill_run::sandbox_ready(&state.config);
+        tools.extend(super::skill_run::tools(ready));
+        full_system.push_str(&super::skill_run::prompt_section(ready));
+    }
+    // Instructions written for a person's machine (the repository's guidance,
+    // the team's skills, the ticket): one rule for every step.
+    full_system.push_str(&common::host_steps::section(
+        &[
+            common::host_steps::Reader::RepoGuidance,
+            common::host_steps::Reader::TeamItems,
+            common::host_steps::Reader::TicketText,
+        ],
+        &super::skill_run::standard_caps(),
+    ));
+
     // When the execution sandbox is available, tell the agent to actually use
     // it — otherwise simple/quick changes finish without ever verifying (the
     // regression canary shipped a file with zero run_checks calls). Cheap
@@ -801,6 +820,9 @@ pub async fn run(
         knowledge: knowledge.as_ref(),
         web: Some(&web),
         state,
+        team_id: &msg.team_id,
+        script_repos,
+        script_runs: std::sync::atomic::AtomicUsize::new(0),
     };
 
     // Attach the ticket's design mockups as images — the implementer must SEE
@@ -3238,6 +3260,12 @@ struct CombinedWriteToolExecutor<'a> {
     /// Knowledge bases attached to the coder.
     knowledge: Option<&'a super::knowledge::KnowledgeTools>,
     state: &'a WorkerState,
+    team_id: &'a str,
+    /// The team's repositories, which a skill's script may be given a
+    /// read-only token for.
+    script_repos: Vec<String>,
+    /// Skill scripts this pass ran.
+    script_runs: std::sync::atomic::AtomicUsize,
 }
 
 #[async_trait::async_trait]
@@ -3297,6 +3325,29 @@ impl<'a> ToolExecutor for CombinedWriteToolExecutor<'a> {
                 )
                 .await
             {
+                return Ok(serde_json::json!(out));
+            }
+        }
+        if let Some(run_id) = self
+            .write_executor
+            .run_id
+            .as_deref()
+            .filter(|_| super::skill_run::is_tool(name))
+        {
+            let run = super::skill_run::SkillRun {
+                outputs: super::skill_run::Outputs {
+                    state: self.state,
+                    team_id: self.team_id,
+                    run_id,
+                },
+                github: self.write_executor.github,
+                sandbox: self.write_executor.sandbox.as_ref(),
+                skills: self.skills,
+                team_repos: self.script_repos.clone(),
+                deadline: self.write_executor.deadline,
+                runs: &self.script_runs,
+            };
+            if let Some(out) = run.handle(name, input).await {
                 return Ok(serde_json::json!(out));
             }
         }

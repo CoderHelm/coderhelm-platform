@@ -63,6 +63,18 @@ the tests with the language's own runner (`python -m pytest`, `npm test`, `go te
 empty when none. When nothing in the files says how the tests run and there are no tests, set \
 found to false and say why.";
 
+/// [`SYSTEM`] with the shared rule for instructions written for a person's
+/// machine: a test command is real work, a login or an editor setup isn't.
+pub fn system() -> String {
+    format!(
+        "{SYSTEM}{}",
+        common::host_steps::section(
+            &[common::host_steps::Reader::SetupDocs],
+            &super::super::skill_run::standard_caps(),
+        )
+    )
+}
+
 pub fn schema() -> Value {
     json!({
         "type": "object",

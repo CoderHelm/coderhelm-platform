@@ -72,6 +72,20 @@ const EXTRA_TOOLS: &[(&str, &str)] = &[
         "Read one of the team's skills, commands or agents",
     ),
     ("read_skill_file", "Read a file kept next to a team skill"),
+    (
+        common::host_steps::RUN_SCRIPT,
+        "Run a script kept with a team skill in the code sandbox, with a read-only GitHub \
+         token when it reads GitHub; its output folder comes back as outputs (coding)",
+    ),
+    (
+        common::host_steps::SAVE_OUTPUT,
+        "Keep a file (a report, a table) with the run's outputs, linked on its page, instead of \
+         a local folder (coding)",
+    ),
+    (
+        common::host_steps::READ_OUTPUT,
+        "Read back a file kept with the run's outputs, such as one a script wrote (coding)",
+    ),
     ("ask_team_agent", "Ask one of the team's agents a question"),
     (
         super::web_check::TOOL,
@@ -135,6 +149,16 @@ const TRANSLATIONS: &[(&str, &[&str], &str)] = &[
         "Counts lines per language with count_lines, from the repository snapshot, no shell",
     ),
     (
+        "python script.py, python3 script.py, bash script.sh, node script.js, running a script kept with the skill",
+        &[common::host_steps::RUN_SCRIPT],
+        "Runs the script in the code sandbox with run_skill_script; a script that reads GitHub gets a read-only token for the repositories it names",
+    ),
+    (
+        "gh api graphql, GitHub GraphQL reads",
+        &[super::github_history::TOOL],
+        "Reads through the team's GitHub installation; a script that makes these calls itself runs with run_skill_script and a read-only token",
+    ),
+    (
         "curl -I, curl -sL -o /dev/null -w '%{http_code}', wget --spider, opening a link to see that it loads",
         &[super::web_check::TOOL],
         "Checks the page with check_url: status of each redirect, final URL and title, on the team's own sites only",
@@ -171,6 +195,9 @@ const PASSES: &[(&str, &[&str])] = &[
     ("search_org", &["reviewer"]),
     ("check_package", &["reviewer"]),
     (super::line_count::TOOL, &["reviewer"]),
+    (common::host_steps::RUN_SCRIPT, &["coder"]),
+    (common::host_steps::SAVE_OUTPUT, &["coder"]),
+    (common::host_steps::READ_OUTPUT, &["coder"]),
 ];
 
 fn passes_of(name: &str) -> Vec<String> {
@@ -204,6 +231,16 @@ pub fn builtin_tools() -> Vec<Tool> {
         }
     }
     out
+}
+
+/// Coderhelm's tools on an install with or without the code sandbox: a
+/// script runs only where there is one.
+pub fn builtin_for(sandbox: bool) -> Vec<Tool> {
+    let mut v = builtin_tools();
+    if !sandbox {
+        v.retain(|t| t.name != common::host_steps::RUN_SCRIPT);
+    }
+    v
 }
 
 /// The inventory an item is checked against: a team agent's own read-only
@@ -240,8 +277,9 @@ const GITHUB: &[&str] = &[
 ];
 
 const NEVER: &[&str] = &[
-    "Run arbitrary shell commands: there is no terminal (run_checks and run_codegen run only the \
-     repository's own configured commands; the reads listed under translations are done another way)",
+    "Open an interactive terminal: there is none (run_checks and run_codegen run the repository's \
+     own configured commands, run_skill_script runs a script kept with a skill or in the \
+     repository in the code sandbox; the reads listed under translations are done another way)",
     "Run git commands: it works through GitHub",
     "Read a person's computer or home folder (paths like ~/...)",
     "Write to outside systems (wikis, tickets, incidents, chat, dashboards) unless a ready MCP \
@@ -327,6 +365,7 @@ pub async fn check_item(
         .chars()
         .count();
     let schema = skill_compat::output_schema();
+    let system = skill_compat::system();
     // An unusable answer is asked again once, told what was wrong; if that
     // one is unusable too, a partial check is kept. Both calls count.
     let mut usage = TokenUsage::default();
@@ -339,7 +378,7 @@ pub async fn check_item(
             format!("{user}{}", skill_compat::retry_note(&unusable))
         };
         let (raw, spent) = checker
-            .check(skill_compat::SYSTEM, &shared, &ask, &schema, attempt)
+            .check(&system, &shared, &ask, &schema, attempt)
             .await;
         usage.merge(&spent);
         result = match raw {
@@ -597,7 +636,8 @@ async fn check_one(
 /// Everything the team's items can rely on in Coderhelm right now.
 pub async fn inventory(state: &WorkerState, team_id: &str) -> Inventory {
     let table = &state.config.settings_table_name;
-    let builtin = builtin_tools();
+    let sandbox = super::skill_run::sandbox_ready(&state.config);
+    let builtin = builtin_for(sandbox);
     let translations = translations(&builtin);
 
     let mcp_table = if state.config.mcp_configs_table_name.is_empty() {
@@ -676,6 +716,12 @@ pub async fn inventory(state: &WorkerState, team_id: &str) -> Inventory {
         Err(e) => warn!(error = %e, "Skill check: couldn't list the team's tools"),
     }
 
+    let capabilities = common::host_steps::catalogue(&setup(
+        sandbox,
+        &sources,
+        &servers,
+        super::knowledge::KnowledgeTools::any_attached(state, team_id).await,
+    ));
     Inventory {
         builtin,
         github: GITHUB.iter().map(|s| s.to_string()).collect(),
@@ -688,8 +734,33 @@ pub async fn inventory(state: &WorkerState, team_id: &str) -> Inventory {
         never: NEVER.iter().map(|s| s.to_string()).collect(),
         runtime: skill_compat::RUNTIME_READERS.into(),
         elsewhere: Vec::new(),
+        capabilities,
     }
     .sorted()
+}
+
+/// What the capability catalogue needs to know about the team: the sandbox,
+/// its data sources and ready apps by name with their tools, and whether a
+/// knowledge base is attached.
+pub fn setup(
+    sandbox: bool,
+    sources: &[Source],
+    servers: &[Server],
+    knowledge: bool,
+) -> common::host_steps::Setup {
+    common::host_steps::Setup {
+        sandbox,
+        data_sources: sources
+            .iter()
+            .map(|s| (s.name.clone(), s.tools.clone()))
+            .collect(),
+        apps: servers
+            .iter()
+            .filter(|s| s.ready)
+            .map(|s| (s.name.clone(), s.tools.clone()))
+            .collect(),
+        knowledge,
+    }
 }
 
 /// How a data source shows in the inventory, with the tools that read it.
@@ -917,11 +988,14 @@ mod tests {
         });
         let m = meta("skills/triage/SKILL.md", "h1", "", "");
         let (a, translated) = check_item(&Fake(answer), &inv(), &m, "body").await.unwrap();
-        assert_eq!(a.status, "needs_tools");
+        // The local doctor command only set up a laptop: not needed here,
+        // never a gap.
+        assert_eq!(a.status, "translated");
         assert_eq!(
             a.summary,
-            "0 of 2 steps run as written · 1 translated · 1 needs Shell access"
+            "2 of 2 steps run · 1 with Coderhelm's tools · 1 not needed here"
         );
+        assert!(a.needs.is_empty());
         assert_eq!(a.model, "fake-light");
         assert_eq!((a.input_tokens, a.output_tokens), (1000, 500));
         assert!((a.cost_usd - 0.01).abs() < 1e-9);
@@ -1070,7 +1144,7 @@ mod tests {
                   "requirements": [req("git diff", "translated", &["get_diff"])] },
                 { "title": "Check the version", "does": "Look up react", "dropped": false,
                   "requirements": [req("npm view", "translated", &["check_package"])] },
-                { "title": "Rebuild", "does": "Clean and build locally", "dropped": true,
+                { "title": "Rebuild", "does": "Clean and build locally", "dropped": false,
                   "requirements": [req("rm -rf build && make", "missing", &[])] }
             ],
             "translated": "1. Read src/app.ts with `read_file` (uses the GitHub API instead of git clone).\n\
@@ -1280,7 +1354,7 @@ mod tests {
         let (effort, constrained) = TRIES[0];
         crate::agent::anthropic::json_request_body(
             "claude-sonnet-5-5",
-            skill_compat::SYSTEM,
+            &skill_compat::system(),
             &skill_compat::inventory_message(inv),
             &skill_compat::item_message(m.kind.as_str(), &m.name, body, &m.files),
             &skill_compat::output_schema(),

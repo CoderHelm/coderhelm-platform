@@ -22,6 +22,22 @@ pub const MAX_PROMPT_CHARS: usize = 48_000;
 pub const MAX_OUTPUT_TOKENS: i32 = 4_000;
 const MAX_EVIDENCE: usize = 6;
 
+/// [`SYSTEM`] with the shared rule for the README, AGENTS.md and CLAUDE.md
+/// setup notes the coder's instructions are drafted from: the build and test
+/// commands are kept, a person's laptop setup is not.
+pub fn system(caps: &[crate::host_steps::Capability]) -> String {
+    format!(
+        "{SYSTEM}{}",
+        crate::host_steps::section(
+            &[
+                crate::host_steps::Reader::SetupDocs,
+                crate::host_steps::Reader::RepoGuidance,
+            ],
+            caps,
+        )
+    )
+}
+
 pub const SYSTEM: &str = "You recommend settings for CoderHelm, an AI teammate that reviews pull requests and writes code, for one GitHub repository. \
 You get facts read from the repository, its last merged pull requests, and the current settings. \
 For each field, give a value and the evidence it is based on: short sentences that point at a file in the repository (path, and line when you know it) or a pull request (its URL). \

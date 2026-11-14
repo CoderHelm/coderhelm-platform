@@ -2066,7 +2066,14 @@ async fn run_once(
             "reviewer",
             msg.pr_number,
         );
-        let system = format!("{system}{}", super::github_history::prompt_line());
+        let system = format!(
+            "{system}{}{}",
+            super::github_history::prompt_line(),
+            common::host_steps::section(
+                &super::review_agent::REVIEW_READERS,
+                &super::skill_run::standard_caps(),
+            )
+        );
         let ops = super::ops_tools::OpsTools::load(
             state,
             &msg.team_id,

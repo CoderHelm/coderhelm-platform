@@ -428,6 +428,14 @@ fn build_app(state: Arc<AppState>) -> Router {
         .route("/runs/:run_id/traces", get(routes::api::get_run_traces))
         .route("/runs/:run_id/agent-log", get(routes::api::get_agent_log))
         .route("/runs/:run_id/openspec", get(routes::api::get_run_openspec))
+        .route(
+            "/runs/:run_id/outputs",
+            get(routes::run_outputs::list_outputs),
+        )
+        .route(
+            "/runs/:run_id/outputs/file",
+            get(routes::run_outputs::get_output),
+        )
         .route("/runs/:run_id/retry", post(routes::api::retry_run))
         .route("/runs/:run_id/answer", post(routes::run_answer::answer_run))
         .route("/runs/:run_id/reset", post(routes::api::reset_and_rerun))

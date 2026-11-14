@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 /// Bumped when the analysis format changes, so every item is checked again.
-pub const FORMAT: u32 = 8;
+pub const FORMAT: u32 = 9;
 /// The first format whose checks say which review steps an item is for.
 pub const REVIEWS_FORMAT: u32 = 8;
 /// Longest translated text kept.
@@ -136,6 +136,12 @@ pub struct Inventory {
     /// translation.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub elsewhere: Vec<String>,
+    /// What Coderhelm can do in place of a person's machine
+    /// ([`crate::host_steps::catalogue`]), each with its limits and the
+    /// action that adds it. Part of the fingerprint: a capability added or
+    /// switched on checks every item again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<crate::host_steps::Capability>,
 }
 
 impl Inventory {
@@ -153,6 +159,7 @@ impl Inventory {
         self.team_tools.sort_by(|a, b| a.name.cmp(&b.name));
         self.elsewhere.sort();
         self.elsewhere.dedup();
+        self.capabilities.sort_by(|a, b| a.id.cmp(&b.id));
         self
     }
 
@@ -213,6 +220,9 @@ impl Inventory {
             never: AGENT_NEVER.iter().map(|s| s.to_string()).collect(),
             runtime: RUNTIME_AGENT.into(),
             elsewhere: Vec::new(),
+            // A team agent reads and answers: it never runs a script, keeps
+            // an output or uses a connected app.
+            capabilities: crate::host_steps::for_agents(&self.capabilities),
         };
         let mine = inv.tool_names();
         inv.elsewhere = all.into_iter().filter(|t| !mine.contains(t)).collect();
@@ -351,11 +361,14 @@ pub struct Step {
     /// What the step does, in a sentence.
     pub does: String,
     pub requirements: Vec<Requirement>,
-    /// Left out of the translated version: it only makes sense on a
-    /// person's own machine.
+    /// Not needed on Coderhelm: it only exists because the item assumed a
+    /// person's own machine (a login check, an output folder, an install).
+    /// Left out of the translated version silently, never a gap, never
+    /// counted against the item ([`crate::host_steps::PURPOSE`]).
     pub dropped: bool,
-    /// Worked out from its requirements: the worst of them, or "available"
-    /// when it needs nothing (thinking, writing a summary).
+    /// Worked out from its requirements: the worst of them, "available"
+    /// when it needs nothing (thinking, writing a summary), or
+    /// [`crate::host_steps::NOT_NEEDED`] when dropped.
     #[serde(default)]
     pub status: String,
 }
@@ -394,6 +407,10 @@ pub struct Counts {
     pub translated: usize,
     pub missing: usize,
     pub blocked: usize,
+    /// Steps not needed on Coderhelm: they run as far as the item is
+    /// concerned (there is nothing to do), and never count against it.
+    #[serde(default)]
+    pub not_needed: usize,
 }
 
 /// The check of one item, as kept on it.
@@ -496,14 +513,26 @@ pub fn output_schema() -> Value {
     })
 }
 
-/// The instructions for the check.
-pub const SYSTEM: &str = "You check a team's written skill, command or agent brief against what \
+/// The instructions for the check: the shared rule every reader of text
+/// written for a person's machine applies ([`crate::host_steps::PURPOSE`]),
+/// then how this check records it.
+pub fn system() -> String {
+    format!(
+        "{SYSTEM_INTRO}\n\n{}\n\n{SYSTEM_RULES}",
+        crate::host_steps::PURPOSE
+    )
+}
+
+const SYSTEM_INTRO: &str = "You check a team's written skill, command or agent brief against what \
 the team really has in Coderhelm, a hosted coding agent. The item was written for another tool \
 (often Claude Code on a person's laptop). Coderhelm runs it as guidance for its own agents: they \
 read and change the repository through a pull request and may use only the tools in the \
-inventory you are given.
+inventory you are given. The inventory's `capabilities` say what Coderhelm can do in place of a \
+person's machine, each with its limits and its tools; one that isn't available names the one \
+action (`enable`) that adds it.";
 
-The inventory's `runtime` says what runs the item. `readers` (or none): a skill or command, \
+const SYSTEM_RULES: &str =
+    "The inventory's `runtime` says what runs the item. `readers` (or none): a skill or command, \
 read as guidance by Coderhelm's planner, coder and reviewer, with the tools listed (a tool's \
 `passes` says which of them has it when not all). `agent`: a team agent. Coderhelm's planner, \
 coder or reviewer asks it one question; it answers with ONLY the read-only tools its own file \
@@ -537,16 +566,23 @@ plugins, `server` is the id of the MCP server it means from the inventory's serv
 connectable list, or empty when none fits. When it is one of the inventory's `connections` (New \
 Relic, Confluence, CloudWatch metrics, Airflow on MWAA: these are Coderhelm integrations, not MCP \
 servers), set `connect` to data_sources and `connection` to its id; otherwise `connection` is \
-empty. Only genuinely impossible things stay missing: running \
-arbitrary shell commands, a person's local files, systems not connected.
+empty. Only what no capability does stays missing: reading a file on a person's own computer, a \
+system that isn't connected, a program that needs a person at the keyboard. When a capability \
+that would do it isn't available, `fix` is its `enable` action. A script kept next to the item \
+(its files are listed with it) or in the repository runs with `run_skill_script` when the \
+inventory has it: translated, never missing, also when it reads GitHub (it gets a read-only \
+token). Files the item writes to a local folder are kept with `save_output`, and reading those \
+files back is `read_output`: translated.
 - blocked: the step writes to an outside system (a wiki page, a ticket, an incident, a message) \
 and no connected tool can write there. Set `write` to outside. Writing files in the repository \
 is `write: repo` and is fine.
 
-Coderhelm never runs a shell, never reads a person's machine or home folder, and only reads \
-outside systems unless a connected MCP server's tool writes. Steps that are only thinking or \
-writing a reply need nothing: give them no requirements. Mark `dropped` true for a step that only \
-makes sense on a person's own machine.
+Coderhelm has no interactive terminal and never reads a person's machine or home folder; it runs \
+code only in the sandbox (`run_skill_script`, the repository's checks) and only reads outside \
+systems unless a connected MCP server's tool writes. Steps that are only thinking or writing a \
+reply need nothing: give them no requirements. Mark `dropped` true for a step that is not needed \
+on Coderhelm (rule 1 above) and still list what it relies on; its status doesn't matter then. A \
+step that fetches data, computes, writes or reports is never dropped.
 
 Borderline cases, decided the same way every time:
 - Talking to the person always runs as written: asking the user a question or for a choice, \
@@ -558,8 +594,8 @@ written, e.g. `git log --oneline` or `~/notes/todo.md`), not a category like 'sh
 files'.
 - A command listed in the inventory's `translations` is translated, whatever the item calls it. \
 Shell access or local files is missing only when the step can't be done any other way with the \
-inventory, its translations included: a build, an install, a script, a write outside the \
-repository, a file on someone's own computer.
+inventory, its translations and capabilities included: reading a file on someone's own \
+computer, a program that needs a person at the keyboard.
 - A Coderhelm tool named outright is available, with that tool in `uses`.
 - When unsure between two statuses for the same request, pick the one the inventory supports \
 directly; don't change your mind between checks of the same text.
@@ -571,8 +607,13 @@ that does it, by its exact name and source (for a translated command, say so bri
 \"uses the GitHub API instead of git clone\"). Where something is missing, keep the step and mark \
 it inline as `GAP: <step> — <what it tried to do> — not connected in Coderhelm (<fix>)`, so a \
 run reports it instead of skipping it. Where a write is blocked, have the agent put what it \
-would have written in its own reply for a person to apply. Leave out steps that only make sense \
-on a person's machine (local paths, installing tools). Drop the front matter. Write plain words.
+would have written in its own reply for a person to apply. Leave out the steps that are not \
+needed on Coderhelm without a word about them. For a kept script, say exactly how to call \
+`run_skill_script`: the item, the script, its arguments (write `{out}` where the item names its \
+output folder) and the repositories it reads, for its token. Read what it wrote back with \
+`read_output`, keep any file the item writes with `save_output`, and give the person the links \
+to the outputs where the item tells them where things are. Drop the front matter. Write plain \
+words.
 
 Last, `reviews`: the review steps the item is meant for, judged from its name and description \
 (its front matter) and what its text says it checks. \"plan\" when it reviews a plan, spec, \
@@ -652,6 +693,7 @@ pub fn finish(
     let mut notes: Vec<String> = Vec::new();
     let mut steps: Vec<Step> = Vec::new();
     let (mut titled, mut empty) = (0usize, 0usize);
+    let mut kept_work: Vec<String> = Vec::new();
     for s in r.steps.into_iter().take(MAX_STEPS) {
         let reqs: Vec<Requirement> = s
             .requirements
@@ -671,17 +713,47 @@ pub fn finish(
             title = made_title(&does, &reqs);
             titled += 1;
         }
-        let status = step_status(&reqs);
+        let dropped = s.dropped && !does_real_work(&reqs);
+        if s.dropped && !dropped {
+            kept_work.push(title.clone());
+        }
+        let status = step_status_of(dropped, &reqs);
         steps.push(Step {
             title,
             does,
             requirements: reqs,
-            dropped: s.dropped,
+            dropped,
             status,
         });
     }
     if steps.is_empty() {
         return Err("The answer listed no usable step.".into());
+    }
+    if !kept_work.is_empty() {
+        notes.push(format!(
+            "{} left out as not needed, but {} on data or {} outside, so {} kept: {}.",
+            if kept_work.len() == 1 {
+                "A step was"
+            } else {
+                "Some steps were"
+            },
+            if kept_work.len() == 1 {
+                "it relies"
+            } else {
+                "they rely"
+            },
+            if kept_work.len() == 1 {
+                "writes"
+            } else {
+                "write"
+            },
+            if kept_work.len() == 1 {
+                "it is"
+            } else {
+                "they are"
+            },
+            kept_work.join(", ")
+        ));
     }
     if titled > 0 {
         notes.push(format!(
@@ -729,6 +801,10 @@ fn tally(steps: Vec<Step>, notes: Vec<String>) -> Analysis {
         translated: steps.iter().filter(|s| s.status == "translated").count(),
         missing: steps.iter().filter(|s| s.status == "missing").count(),
         blocked: steps.iter().filter(|s| s.status == "blocked").count(),
+        not_needed: steps
+            .iter()
+            .filter(|s| s.status == crate::host_steps::NOT_NEEDED)
+            .count(),
     };
     let needs = needs(&steps);
     let status = if counts.missing + counts.blocked > 0 {
@@ -755,6 +831,28 @@ fn tally(steps: Vec<Step>, notes: Vec<String>) -> Analysis {
         ms: 0,
         reviews: Vec::new(),
     }
+}
+
+/// A step's status: not needed when dropped, else from its requirements.
+fn step_status_of(dropped: bool, reqs: &[Requirement]) -> String {
+    if dropped {
+        crate::host_steps::NOT_NEEDED.to_string()
+    } else {
+        step_status(reqs)
+    }
+}
+
+/// Whether a step does real work, held to its own requirements: the shared
+/// guard ([`crate::host_steps::real_work`]).
+fn does_real_work(reqs: &[Requirement]) -> bool {
+    let needs: Vec<crate::host_steps::Need<'_>> = reqs
+        .iter()
+        .map(|q| crate::host_steps::Need {
+            kind: &q.kind,
+            write: &q.write,
+        })
+        .collect();
+    crate::host_steps::real_work(&needs)
 }
 
 /// A step's status: the worst of its requirements, or "available" when it
@@ -839,6 +937,10 @@ const LOCAL_NEEDS: &str = "Local files";
 const LOCAL_FIX: &str = "Coderhelm reads the repository, never a file on someone's own computer.";
 /// What Coderhelm does instead of reading a person's local file.
 const LOCAL_INSTEAD: &str = "Reads the repository and the team's connected sources instead";
+/// What Coderhelm does instead of writing to a folder on a person's
+/// computer.
+const LOCAL_SAVE_INSTEAD: &str =
+    "Kept with the work's outputs (save_output) and linked on the run's page, not a folder on someone's computer";
 /// What Coderhelm does instead of running a command on a person's machine.
 const TERMINAL_INSTEAD: &str =
     "Works through GitHub and runs only the repository's own checks; there is no terminal";
@@ -896,7 +998,8 @@ const LOCAL_EQUIVALENTS: &[LocalEquivalent] = &[
             "exitplanmode",
         ],
         status: "available",
-        instead: "Runs without it: Coderhelm puts the result in its reply or the pull request",
+        instead: "Runs without it: Coderhelm puts the result in its reply or the pull request, \
+                  and keeps files with the work's outputs",
     },
 ];
 
@@ -936,6 +1039,17 @@ fn settle(q: &mut Requirement, inv: &Inventory) -> bool {
         q.uses.clear();
         q.write = "none".into();
         q.instead = e.instead.into();
+        return true;
+    }
+    if local_path(&q.asks) && q.write != "none" && inv.has_tool(crate::host_steps::SAVE_OUTPUT) {
+        // Writing to a folder on someone's computer: the work's outputs
+        // keep the file instead.
+        q.status = "translated".into();
+        q.uses = vec![crate::host_steps::SAVE_OUTPUT.to_string()];
+        q.write = "none".into();
+        q.needs.clear();
+        q.fix.clear();
+        q.instead = LOCAL_SAVE_INSTEAD.into();
         return true;
     }
     if local_path(&q.asks) {
@@ -1409,7 +1523,7 @@ pub fn violations(a: &Analysis, translated: &str, inv: &Inventory) -> Vec<String
 /// What the item needs, most steps held up first.
 fn needs(steps: &[Step]) -> Vec<Need> {
     let mut by: BTreeMap<String, Need> = BTreeMap::new();
-    for s in steps {
+    for s in steps.iter().filter(|s| !s.dropped) {
         let mut seen: HashSet<String> = HashSet::new();
         for q in s
             .requirements
@@ -1444,8 +1558,34 @@ fn needs(steps: &[Step]) -> Vec<Need> {
     v
 }
 
-/// "7 of 10 steps run as written · 2 translated · 1 needs New Relic".
+/// "7 of 7 steps run · 3 with Coderhelm's tools · 2 not needed here" when
+/// every step runs; otherwise "4 of 10 steps run as written · 2 translated ·
+/// 1 needs New Relic". A step not needed on Coderhelm counts as running.
 pub fn summary(c: &Counts, needs: &[Need]) -> String {
+    if c.missing + c.blocked == 0 && c.steps > 0 {
+        let mut parts = vec![format!(
+            "{} of {} {}{}",
+            c.steps,
+            c.steps,
+            if c.steps == 1 {
+                "step runs"
+            } else {
+                "steps run"
+            },
+            if c.translated + c.not_needed == 0 {
+                " as written"
+            } else {
+                ""
+            }
+        )];
+        if c.translated > 0 {
+            parts.push(format!("{} with Coderhelm's tools", c.translated));
+        }
+        if c.not_needed > 0 {
+            parts.push(format!("{} not needed here", c.not_needed));
+        }
+        return parts.join(" · ");
+    }
     let mut parts = vec![format!(
         "{} of {} {} as written",
         c.as_written,
@@ -1525,6 +1665,14 @@ fn step_basis(step: &Step) -> &'static str {
         "inventory"
     } else {
         "model"
+    }
+}
+
+/// A step status in the words the changes list uses.
+pub fn status_label(status: &str) -> &str {
+    match status {
+        crate::host_steps::NOT_NEEDED => "not needed",
+        s => s,
     }
 }
 
@@ -1611,8 +1759,10 @@ pub fn stabilize(
                 let n = &a.steps[j];
                 if n.status != p.status {
                     notes.push(format!(
-                        "Step \"{}\" changed from {} to {}: the team's tools changed since the last check.",
-                        n.title, p.status, n.status
+                        "Step \"{}\" changed from {} to {}: Coderhelm's or the team's tools changed since the last check.",
+                        n.title,
+                        status_label(&p.status),
+                        status_label(&n.status)
                     ));
                 }
             }
@@ -1634,8 +1784,8 @@ pub fn stabilize(
             notes.push(format!(
                 "Step \"{}\" changed from {} to {}: {}.",
                 p.title,
-                stored.status,
-                p.status,
+                status_label(&stored.status),
+                status_label(&p.status),
                 settled_reason(&p)
             ));
             changed = true;
@@ -1650,8 +1800,8 @@ pub fn stabilize(
                 notes.push(format!(
                     "Step \"{}\" changed from {} to {}: {}.",
                     p.title,
-                    p.status,
-                    n.status,
+                    status_label(&p.status),
+                    status_label(&n.status),
                     settled_reason(n)
                 ));
                 changed = true;
@@ -1685,7 +1835,7 @@ fn resettle(steps: &[Step], inv: &Inventory) -> Vec<Step> {
                 .collect();
             let requirements = merge_same(requirements);
             Step {
-                status: step_status(&requirements),
+                status: step_status_of(s.dropped, &requirements),
                 requirements,
                 ..s.clone()
             }
@@ -2081,7 +2231,8 @@ mod tests {
                 as_written: 2,
                 translated: 1,
                 missing: 2,
-                blocked: 1
+                blocked: 1,
+                not_needed: 0
             }
         );
         assert_eq!(
@@ -2214,7 +2365,7 @@ mod tests {
         let m = user_message(&inv(), "skill", "a", "Run `grep -r TODO .` first.", &[]);
         assert!(m.contains("<item>\nRun `grep -r TODO .` first.\n</item>"));
         assert!(m.contains("\"commands\": \"grep -r\""));
-        assert!(SYSTEM.contains("translations"));
+        assert!(system().contains("translations"));
     }
 
     #[test]
@@ -2363,9 +2514,9 @@ mod tests {
 
     #[test]
     fn the_rubric_is_in_the_instructions() {
-        assert!(SYSTEM.contains("Talking to the person always runs as written"));
-        assert!(SYSTEM.contains("suggesting a commit message"));
-        assert!(SYSTEM.contains("can't be done any other way"));
+        assert!(system().contains("Talking to the person always runs as written"));
+        assert!(system().contains("suggesting a commit message"));
+        assert!(system().contains("can't be done any other way"));
         assert_eq!(
             output_schema()["properties"]["steps"]["items"]["properties"]["requirements"]["items"]
                 ["properties"]["kind"]["enum"][4],
@@ -2588,7 +2739,7 @@ mod tests {
             output_schema()["properties"]["reviews"]["items"]["enum"],
             json!(["plan", "code", "prose"])
         );
-        assert!(SYSTEM.contains("`reviews`"));
+        assert!(system().contains("`reviews`"));
     }
 
     #[test]
@@ -2716,5 +2867,250 @@ mod tests {
         let wiki = by("Wiki");
         assert!(!wiki.local && wiki.instead.is_empty());
         assert_eq!(wiki.action, "connect");
+    }
+
+    // ── Steps written for a person's machine ───────────────────────────
+
+    /// The readers' inventory with the sandbox, the outputs and the
+    /// capability catalogue, as an install with a sandbox has it.
+    fn with_sandbox() -> Inventory {
+        let mut inv = readers();
+        for name in [
+            crate::host_steps::RUN_SCRIPT,
+            crate::host_steps::SAVE_OUTPUT,
+            crate::host_steps::READ_OUTPUT,
+        ] {
+            inv.builtin.push(Tool {
+                name: name.into(),
+                what: name.into(),
+                writes_repo: false,
+                passes: vec![],
+            });
+        }
+        inv.capabilities = crate::host_steps::standard(true);
+        inv.sorted()
+    }
+
+    fn rq(asks: &str, kind: &str, status: &str, uses: &[&str], write: &str) -> Value {
+        json!({ "asks": asks, "kind": kind, "status": status, "uses": uses, "write": write,
+                "needs": if status == "missing" { "Shell access" } else { "" },
+                "fix": if status == "missing" { "Coderhelm cannot run shell commands" } else { "" },
+                "connect": if status == "missing" { "github" } else { "none" },
+                "server": "", "connection": "" })
+    }
+
+    fn host_step(title: &str, dropped: bool, reqs: Vec<Value>) -> Value {
+        json!({ "title": title, "does": title, "dropped": dropped, "requirements": reqs })
+    }
+
+    /// A report skill like the one in the incident: arguments, an output
+    /// folder, a login check, the bundled script, reading its tables, the
+    /// narrative, and where everything is.
+    fn report_answer() -> Value {
+        json!({
+            "steps": [
+                host_step("Parse the arguments", false, vec![]),
+                host_step("Choose an output directory", true,
+                     vec![rq("./reports/<date>", "path", "missing", &[], "repo")]),
+                host_step("Check GitHub access", true,
+                     vec![rq("gh auth status", "command", "missing", &[], "none")]),
+                host_step("Run the bundled script", false, vec![
+                    rq("python3 report_rate.py", "command", "translated", &["run_skill_script"], "none"),
+                    rq("Pull request history through GitHub GraphQL", "data", "translated", &["run_skill_script"], "none"),
+                ]),
+                host_step("Read the tables", false,
+                     vec![rq("tables.md and summary.json", "path", "translated", &["read_output"], "none")]),
+                host_step("Write the narrative report", false,
+                     vec![rq("report.md in the output directory", "path", "translated", &["save_output"], "repo")]),
+                host_step("Tell the user where everything is", false,
+                     vec![rq("Tell the user", "person", "available", &[], "none")]),
+            ],
+            "translated": "1. Read the arguments.\n2. Run `run_skill_script` with skill:report-rate, report_rate.py, `--out {out}`.\n3. Read tables.md with `read_output`.\n4. Keep report.md with `save_output`.\n5. Give the links.",
+            "reviews": []
+        })
+    }
+
+    #[test]
+    fn every_step_of_a_report_skill_runs_on_coderhelm() {
+        let inv = with_sandbox();
+        let (a, translated) = finish(&report_answer(), &inv, 10).unwrap();
+        let st: Vec<&str> = a.steps.iter().map(|s| s.status.as_str()).collect();
+        assert_eq!(
+            st,
+            [
+                "available",
+                "not_needed",
+                "not_needed",
+                "translated",
+                "translated",
+                "translated",
+                "available"
+            ]
+        );
+        assert_eq!(a.status, "translated");
+        assert!(a.needs.is_empty(), "{:?}", a.needs);
+        assert_eq!(
+            a.summary,
+            "7 of 7 steps run · 3 with Coderhelm's tools · 2 not needed here"
+        );
+        assert_eq!(a.counts.not_needed, 2);
+        assert_eq!(a.steps[3].requirements[0].uses, ["run_skill_script"]);
+        assert_eq!(a.steps[4].requirements[0].uses, ["read_output"]);
+        assert_eq!(a.steps[5].requirements[0].uses, ["save_output"]);
+        assert!(violations(&a, &translated, &inv).is_empty());
+    }
+
+    #[test]
+    fn laptop_chores_are_left_out_and_real_data_work_is_kept() {
+        let inv = with_sandbox();
+        let answer = json!({
+            "steps": [
+                host_step("Check the login", true, vec![rq("gh auth status", "command", "missing", &[], "none")]),
+                host_step("Ask where to save the report", true, vec![rq("Ask the user for an output folder", "person", "available", &[], "none")]),
+                host_step("Install the tools", true, vec![rq("pip install requests", "command", "missing", &[], "none")]),
+                host_step("Go to the skill's folder", true, vec![rq("cd skills/report-rate", "command", "missing", &[], "none")]),
+                host_step("Fetch every pull request", true, vec![rq("Pull requests through GitHub GraphQL", "data", "missing", &[], "none")]),
+            ],
+            "translated": "Fetch every pull request and keep the tables.",
+            "reviews": []
+        });
+        let (a, _) = finish(&answer, &inv, 10).unwrap();
+        for s in &a.steps[..4] {
+            assert!(s.dropped, "{}", s.title);
+            assert_eq!(s.status, crate::host_steps::NOT_NEEDED, "{}", s.title);
+        }
+        // A step that relies on data is real work, whatever the answer said.
+        assert!(!a.steps[4].dropped);
+        assert_eq!(a.steps[4].status, "missing");
+        assert!(
+            a.notes
+                .iter()
+                .any(|n| n.contains("Fetch every pull request")),
+            "{:?}",
+            a.notes
+        );
+        // The chores never show as gaps, and never count against the item.
+        assert_eq!(a.needs.len(), 1);
+        assert_eq!(a.counts.not_needed, 4);
+        assert!(
+            a.summary.starts_with("0 of 5 steps run as written"),
+            "{}",
+            a.summary
+        );
+    }
+
+    #[test]
+    fn a_write_to_a_folder_on_someones_computer_is_kept_as_an_output() {
+        let inv = with_sandbox();
+        let answer = json!({
+            "steps": [
+                host_step("Save the tables", false, vec![rq("~/reports/merge.csv", "path", "missing", &[], "repo")]),
+                host_step("Read the notes", false, vec![rq("~/notes/todo.md", "path", "missing", &[], "none")]),
+            ],
+            "translated": "Save the tables. Read the notes.",
+            "reviews": []
+        });
+        let (a, _) = finish(&answer, &inv, 10).unwrap();
+        let save = &a.steps[0].requirements[0];
+        assert_eq!(save.status, "translated");
+        assert_eq!(save.uses, [crate::host_steps::SAVE_OUTPUT]);
+        assert!(save.instead.contains("outputs"));
+        // Reading a person's own file stays missing: nothing has it.
+        assert_eq!(a.steps[1].status, "missing");
+        // Without the outputs tool (a team agent), the write is missing too.
+        let agent = inv.for_agent(&["read_file".to_string()]);
+        let (b, _) = finish(&answer, &agent, 10).unwrap();
+        assert_ne!(b.steps[0].status, "translated");
+    }
+
+    #[test]
+    fn a_better_translation_says_which_steps_changed() {
+        // The last check ran before the sandbox and outputs were in the
+        // catalogue: the script and its files were missing.
+        let old = readers();
+        let old_answer = json!({
+            "steps": [
+                host_step("Check GitHub access", false, vec![rq("gh auth status", "command", "missing", &[], "none")]),
+                host_step("Run the bundled script", false, vec![rq("python3 report_rate.py", "command", "missing", &[], "none")]),
+            ],
+            "translated": "GAP: the script.",
+            "reviews": []
+        });
+        let (last, last_t) = finish(&old_answer, &old, 10).unwrap();
+        assert_eq!(last.counts.missing, 2);
+        let inv = with_sandbox();
+        assert_ne!(
+            old.fingerprint(),
+            inv.fingerprint(),
+            "the catalogue is in the fingerprint"
+        );
+        assert!(!same_tools(&inv, &old.fingerprint(), FORMAT));
+        let new_answer = json!({
+            "steps": [
+                host_step("Check GitHub access", true, vec![rq("gh auth status", "command", "missing", &[], "none")]),
+                host_step("Run the bundled script", false, vec![rq("python3 report_rate.py", "command", "translated", &["run_skill_script"], "none")]),
+            ],
+            "translated": "Run `run_skill_script`.",
+            "reviews": []
+        });
+        let (new, new_t) = finish(&new_answer, &inv, 10).unwrap();
+        let (a, t) = stabilize(
+            new,
+            new_t,
+            &Last {
+                analysis: &last,
+                translated: &last_t,
+                tools_changed: true,
+            },
+            &inv,
+        );
+        assert_eq!(t, "Run `run_skill_script`.");
+        assert!(
+            a.notes.iter().any(
+                |n| n.contains("\"Run the bundled script\" changed from missing to translated")
+            ),
+            "{:?}",
+            a.notes
+        );
+        assert!(
+            a.notes
+                .iter()
+                .any(|n| n.contains("\"Check GitHub access\" changed from missing to not needed")),
+            "{:?}",
+            a.notes
+        );
+        assert_eq!(
+            a.summary,
+            "2 of 2 steps run · 1 with Coderhelm's tools · 1 not needed here"
+        );
+        // Checking the same text against the same tools again changes nothing.
+        let (again, _) = finish(&new_answer, &inv, 10).unwrap();
+        let (b, _) = stabilize(
+            again,
+            String::new(),
+            &Last {
+                analysis: &a,
+                translated: &t,
+                tools_changed: false,
+            },
+            &inv,
+        );
+        assert_eq!(b.steps, a.steps);
+    }
+
+    #[test]
+    fn the_check_reads_the_shared_rule_and_the_catalogue() {
+        let sys = system();
+        assert!(sys.contains(crate::host_steps::PURPOSE));
+        assert!(sys.contains("run_skill_script") && sys.contains("save_output"));
+        assert!(!sys.contains(
+            "Only genuinely impossible things stay missing: running arbitrary shell commands"
+        ));
+        let msg = inventory_message(&with_sandbox());
+        assert!(msg.contains("\"capabilities\"") && msg.contains("Code sandbox"));
+        // A team agent's inventory keeps only the capabilities it reads with.
+        let agent = with_sandbox().for_agent(&[]);
+        let ids: Vec<&str> = agent.capabilities.iter().map(|c| c.id.as_str()).collect();
+        assert!(!ids.contains(&"sandbox") && !ids.contains(&"outputs") && ids.contains(&"github"));
     }
 }

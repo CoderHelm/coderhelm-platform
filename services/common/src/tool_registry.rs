@@ -117,6 +117,11 @@ pub const BUILTIN: &[(&str, Risk)] = &[
     ("restore_file", Risk::Write),
     ("run_codegen", Risk::Write),
     ("run_checks", Risk::Write),
+    // A team skill's own script in the sandbox (read-only GitHub token at
+    // most), and the run's outputs kept in CoderHelm.
+    ("run_skill_script", Risk::Write),
+    ("save_output", Risk::Write),
+    ("read_output", Risk::Read),
     // Outside steps CoderHelm runs after the PR opens (worker outside_exec).
     ("start_workflow", Risk::Write),
     ("write_content", Risk::Write),

@@ -239,6 +239,12 @@ pub async fn handle(state: &WorkerState, req: Request) -> Value {
                     super::code_graph::Role::Planner,
                 ));
             }
+            // The skills, the repository's guidance and the plan the chat
+            // reads were written for a person's machine: the planner's rule.
+            prompt.push_str(&common::host_steps::section(
+                &super::plan::PLANNER_READERS,
+                &super::skill_run::standard_caps(),
+            ));
             info!(team_id = %req.team_id, tools = tools.len(), "Plan chat tools ready");
             json!({
                 "tools": tools.iter().map(|t| json!({

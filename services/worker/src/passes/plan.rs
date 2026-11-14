@@ -18,6 +18,16 @@ pub const PLANNER_VERSION: &str =
 /// The openspec file holding the plan's end-to-end checklist, readable.
 pub const END_TO_END_FILE: &str = "end_to_end.md";
 
+/// What the planner reads that was written for a person's machine, and
+/// what it writes for after the pull request.
+pub const PLANNER_READERS: [common::host_steps::Reader; 5] = [
+    common::host_steps::Reader::Plan,
+    common::host_steps::Reader::OutsideSteps,
+    common::host_steps::Reader::RepoGuidance,
+    common::host_steps::Reader::TeamItems,
+    common::host_steps::Reader::TicketText,
+];
+
 /// The cached plan's file holding its key.
 pub const PLAN_KEY_FILE: &str = "plan_key.txt";
 
@@ -607,6 +617,12 @@ Then the ```fix_location.json block described above."#,
         tools.push(t);
     }
     full_system.push_str(&abilities.prompt_section());
+    // Instructions written for a person's machine, and the steps the plan
+    // writes for after the pull request: one rule for every step.
+    full_system.push_str(&common::host_steps::section(
+        &PLANNER_READERS,
+        &super::skill_run::standard_caps(),
+    ));
     // How it releases: each environment's deploy trigger, the migration
     // workflow, each environment's dataset, expand and contract.
     full_system.push_str(&abilities.release.prompt_section());

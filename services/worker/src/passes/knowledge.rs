@@ -330,6 +330,15 @@ async fn member(state: &WorkerState, team: &str, email: &str) -> Option<kb::Pers
 pub const TOOL: &str = "search_knowledge";
 
 impl KnowledgeTools {
+    /// Whether the team has any knowledge base (for the capability
+    /// catalogue; a run still searches only the bases attached to it).
+    pub async fn any_attached(state: &WorkerState, team_id: &str) -> bool {
+        common::knowledge::search::Store::bases(&store(state), team_id)
+            .await
+            .map(|b| !b.is_empty())
+            .unwrap_or(false)
+    }
+
     /// The bases attached to `agent` (a key of `knowledge::AGENTS`) that a
     /// run started by `requester` (their email, when the run names one) may
     /// search, or None when there are none.
