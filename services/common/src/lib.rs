@@ -87,6 +87,7 @@ pub mod e2e;
 pub mod git_conventions;
 /// What an installation's token may read: permissions a feature uses when
 /// granted and does without otherwise.
+pub mod github_budget;
 pub mod github_grants;
 pub mod github_wait;
 /// Infrastructure vulnerabilities: public AWS feeds, a team's AWS inventory,

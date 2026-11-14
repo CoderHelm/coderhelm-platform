@@ -133,7 +133,10 @@ async fn handle_event(
         } else {
             common::usage::feature::CHAT
         };
-        let call = passes::plan_chat::handle(&state, req);
+        let call = clients::github_budget::scoped(
+            common::github_budget::caller::CHAT,
+            passes::plan_chat::handle(&state, req),
+        );
         Ok(common::usage::with_feature(feature, call).await)
     } else if let Some(req) = payload.get("model_check") {
         // The updater's check before it applies a release: one test call
@@ -159,10 +162,12 @@ async fn handle_event(
         Ok(passes::bedrock_sync::sync(&state, &req.team_id).await)
     } else {
         let sqs: SqsEvent = serde_json::from_value(payload)?;
-        handle_sqs(state, LambdaEvent::new(sqs, context))
+        handle_sqs(Arc::clone(&state), LambdaEvent::new(sqs, context))
             .await
             .map(|_| serde_json::Value::Null)
     };
+    // What this event spent of each installation's GitHub budget, by caller.
+    clients::github_budget::flush(&state).await;
     // A call dropped mid-reply (an outer timeout) records itself in the
     // background: finish those writes before the Lambda is frozen.
     common::model_stream::settle_dropped_calls().await;
@@ -325,11 +330,72 @@ async fn handle_message(state: Arc<WorkerState>, message: models::WorkerMessage)
             .flatten()
             .map(str::to_string)
     });
-    handle_message_inner(Arc::clone(&state), message).await;
-    passes::description::reconcile_moved(&state, team.as_deref()).await;
+    use clients::github_budget;
+    // What the other workers spent of the installation's GitHub budget this
+    // hour, and a limit one of them met, are known before the first request.
+    if let Ok(raw) = serde_json::to_value(&message) {
+        for id in team_installation::claims(&raw).0 {
+            github_budget::refresh(&state, id).await;
+        }
+    }
+    let label = github_caller(&message);
+    github_budget::scoped(label, handle_message_inner(Arc::clone(&state), message)).await;
+    github_budget::scoped(
+        common::github_budget::caller::DESCRIPTION,
+        passes::description::reconcile_moved(&state, team.as_deref()),
+    )
+    .await;
+    github_budget::flush(&state).await;
+}
+
+/// Who a message's GitHub requests are counted under, and with it whether
+/// they come before or after other work (`common::github_budget`): a run's
+/// steps, its rounds and reviews first, anything on a timer last. A sweep
+/// message's parts each carry their own label (below).
+fn github_caller(message: &models::WorkerMessage) -> &'static str {
+    use common::github_budget::caller as who;
+    use models::WorkerMessage as M;
+    match message {
+        M::Ticket(_) | M::PlanExecute(_) | M::PlanTaskContinue(_) | M::JiraComment(_) => who::RUN,
+        M::Feedback(_) | M::Resume(_) => who::FIX_ROUND,
+        M::Review(_) => who::REVIEW,
+        M::MarkReady(_) => who::READY,
+        M::AwaitMerge(_)
+        | M::ReleaseSteps(_)
+        | M::HealthCheck(_)
+        | M::Restack(_)
+        | M::TagSweep(_)
+        | M::ReleaseNotes(_) => who::MERGE,
+        M::TestIngest(_) | M::TestAction(_) => who::TESTS,
+        M::SecurityEvent(_) => who::SECURITY_EVENT,
+        M::Onboard(_)
+        | M::SetupAnalyze(_)
+        | M::StalePrsPreview(_)
+        | M::PluginRun(_)
+        | M::PluginPublish(_)
+        | M::PluginSync(_)
+        | M::PluginTrigger(_)
+        | M::PluginResults(_)
+        | M::SkillSync(_)
+        | M::SkillAsk(_)
+        | M::ToolProposals(_)
+        | M::HiddenSuggest(_) => who::SETUP,
+        M::ReviewSweep => who::SWEEP_REVIEW,
+        M::ReviewReminder => who::SWEEP_REVIEW_REMINDER,
+        M::PluginSweep => who::SWEEP_PLUGINS,
+        M::KnowledgeSyncSweep | M::KnowledgeSync(_) | M::BedrockSync(_) => who::SWEEP_KNOWLEDGE,
+        M::LogAutofix => who::SWEEP_LOG_AUTOFIX,
+        M::GraphIndex(_) => who::SWEEP_GRAPH,
+        M::Lesson(_) | M::RewardOutcome(_) | M::ReviewLesson(_) => who::SWEEP_LEARNING,
+        M::WeeklySummary | M::WeeklySummaryTest(_) => who::SWEEP_WEEKLY,
+        M::DeployStatsBackfill(_) | M::DeployRun(_) => who::SWEEP_DEPLOYS,
+        _ => who::OTHER,
+    }
 }
 
 async fn handle_message_inner(state: Arc<WorkerState>, message: models::WorkerMessage) {
+    use clients::github_budget::scoped as as_sweep;
+    use common::github_budget::caller as who;
     match message {
         models::WorkerMessage::Ticket(msg) => {
             info!(team_id = %msg.team_id, ticket_id = %msg.ticket_id, "Starting ticket run");
@@ -353,7 +419,7 @@ async fn handle_message_inner(state: Arc<WorkerState>, message: models::WorkerMe
                 // requeue policy; only a real failure marks the run failed.
                 let err: &(dyn std::error::Error + 'static) = &*e;
                 // GitHub refusing for a while: wait for its reset.
-                if passes::feedback::wait_for_github(&state, &retry_msg, err).await {
+                if passes::feedback::wait_for_github(&state, &retry_msg, &*e).await {
                     return;
                 }
                 if common::model_retry::is_transient_model_error(err)
@@ -506,7 +572,14 @@ async fn handle_message_inner(state: Arc<WorkerState>, message: models::WorkerMe
         models::WorkerMessage::Resume(msg) => {
             info!(team_id = %msg.team_id, run_id = %msg.run_id, "Resuming run from webhook event");
             let (team_id, run_id) = (msg.team_id.clone(), msg.run_id.clone());
+            let waiting = msg.clone();
             if let Err(e) = passes::resume::run(&state, msg).await {
+                // GitHub refusing for a while (its hourly limit, a 5xx, no
+                // answer) is never how a resume ends: the run waits for the
+                // reset as it stands and goes on by itself.
+                if passes::resume::wait_out_github(&state, &waiting, &*e).await {
+                    return;
+                }
                 error!("Resume failed: {e:?}");
                 // The run guard fired: it waits on a person, one way.
                 if passes::run_guard::settle_open_pr(&state, &team_id, &run_id).await {
@@ -547,7 +620,7 @@ async fn handle_message_inner(state: Arc<WorkerState>, message: models::WorkerMe
             }
             // Finished runs whose pull request is still a draft with no
             // recorded reason: decided again, so none stays silently held.
-            let drafts = passes::ready::sweep(&state).await;
+            let drafts = as_sweep(who::SWEEP_DRAFTS, passes::ready::sweep(&state)).await;
             info!(
                 looked_at = drafts.looked_at,
                 decided = drafts.decided,
@@ -558,7 +631,7 @@ async fn handle_message_inner(state: Arc<WorkerState>, message: models::WorkerMe
             // checks that went red later, a reviewer verdict missing on the
             // head, a merge whose deploy nobody watches. Each is picked
             // back up by the mechanism it already has.
-            let watch = passes::pr_watch::sweep(&state).await;
+            let watch = as_sweep(who::SWEEP_PR_WATCH, passes::pr_watch::sweep(&state)).await;
             info!(
                 candidates = watch.candidates,
                 looked_at = watch.looked_at,
@@ -567,7 +640,7 @@ async fn handle_message_inner(state: Arc<WorkerState>, message: models::WorkerMe
             );
             // Deploy counts that stopped between passes carry on without
             // waiting for someone to open Analytics.
-            let resumed = passes::deploy_stats::sweep(&state).await;
+            let resumed = as_sweep(who::SWEEP_DEPLOYS, passes::deploy_stats::sweep(&state)).await;
             info!(resumed, "Deploys backfill sweep done");
         }
         models::WorkerMessage::ReviewReminder => {
@@ -575,14 +648,19 @@ async fn handle_message_inner(state: Arc<WorkerState>, message: models::WorkerMe
             if let Err(e) = passes::review_reminder::run(&state).await {
                 error!("Review reminder sweep failed: {e:?}");
             }
-            if let Err(e) = passes::pr_outcomes::backfill(&state).await {
+            if let Err(e) = as_sweep(
+                who::SWEEP_PR_OUTCOMES,
+                passes::pr_outcomes::backfill(&state),
+            )
+            .await
+            {
                 error!("Merged PR backfill failed: {e:?}");
             }
-            if let Err(e) = passes::skills::sweep(&state).await {
+            if let Err(e) = as_sweep(who::SWEEP_SKILLS, passes::skills::sweep(&state)).await {
                 error!("Skill repository sweep failed: {e:?}");
             }
             // Stale pull requests: each repository at most once an hour.
-            let stale = passes::stale_prs::sweep(&state).await;
+            let stale = as_sweep(who::SWEEP_STALE_PRS, passes::stale_prs::sweep(&state)).await;
             info!(
                 repos = stale.repos,
                 marked = stale.marked,
@@ -593,7 +671,8 @@ async fn handle_message_inner(state: Arc<WorkerState>, message: models::WorkerMe
             // Agent files gone stale (pushes that changed what they are
             // written from, or older than 30 days with new commits): each
             // repository at most once a day, a few per team per tick.
-            let agent_files = passes::agent_file::sweep(&state).await;
+            let agent_files =
+                as_sweep(who::SWEEP_AGENT_FILES, passes::agent_file::sweep(&state)).await;
             info!(
                 teams = agent_files.teams,
                 queued = agent_files.queued,
@@ -604,7 +683,7 @@ async fn handle_message_inner(state: Arc<WorkerState>, message: models::WorkerMe
             );
             // Security fixes: daily sources per repository, triage, fix
             // runs and cards (off unless a team turned them on).
-            let sec = passes::security_fixes::sweep(&state).await;
+            let sec = as_sweep(who::SWEEP_SECURITY, passes::security_fixes::sweep(&state)).await;
             info!(
                 teams = sec.teams,
                 released = sec.released,

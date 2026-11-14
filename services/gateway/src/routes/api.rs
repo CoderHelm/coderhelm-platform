@@ -1198,9 +1198,7 @@ pub struct Run {
     /// While the run waits for GitHub (its hourly limit, or a moment GitHub
     /// failed to answer): when it goes on, in plain words. The run continues
     /// by itself; nothing is needed from anyone.
-    #[schema(
-        example = "Waiting for GitHub's hourly limit to reset at 21:05 UTC; continues by itself"
-    )]
+    #[schema(example = "Waiting for GitHub's hourly limit; continues by itself at 21:05 UTC")]
     pub github_wait: Option<String>,
     /// The approval card that timed out, when one did.
     #[schema(example = json!(null))]

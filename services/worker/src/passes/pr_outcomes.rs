@@ -41,12 +41,18 @@ pub async fn backfill(state: &WorkerState) -> Result<(), Box<dyn std::error::Err
         return reconcile_finished(state, &mut clients).await;
     }
     let (mut filled, mut unknown) = (0, 0);
+    let mut budget = crate::clients::github_budget::SweepGate::new(
+        common::github_budget::caller::SWEEP_PR_OUTCOMES,
+    );
     for p in pending {
         let Some((owner, repo, number)) = parse_pr_url(&p.pr_url) else {
             mark_unknown(state, &p, "no PR link").await;
             unknown += 1;
             continue;
         };
+        if !budget.allows(state, p.installation_id, 2).await {
+            continue;
+        }
         let gh = match clients.entry(p.installation_id) {
             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
             std::collections::hash_map::Entry::Vacant(e) => e.insert(GitHubClient::new(
@@ -58,6 +64,9 @@ pub async fn backfill(state: &WorkerState) -> Result<(), Box<dyn std::error::Err
         };
         let pr = match gh.get_pull_request(&owner, &repo, number).await {
             Ok(v) => v,
+            // GitHub's limit (or the sweep's own budget) says nothing
+            // about the pull request: it is read at a later sweep.
+            Err(e) if crate::clients::github::outside_wait(&*e).is_some() => continue,
             Err(e) => {
                 warn!(run_id = %p.run_id, error = %e, "Backfill: GitHub didn't return the PR");
                 mark_unknown(state, &p, "GitHub didn't return the PR").await;
@@ -167,12 +176,18 @@ async fn reconcile_finished(
         return Ok(());
     }
     let (mut recorded, mut still_open, mut unknown) = (0, 0, 0);
+    let mut budget = crate::clients::github_budget::SweepGate::new(
+        common::github_budget::caller::SWEEP_PR_OUTCOMES,
+    );
     for p in pending {
         let Some((owner, repo, number)) = parse_pr_url(&p.pr_url) else {
             mark_unknown(state, &p, "no PR link").await;
             unknown += 1;
             continue;
         };
+        if !budget.allows(state, p.installation_id, 2).await {
+            continue;
+        }
         let gh = match clients.entry(p.installation_id) {
             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
             std::collections::hash_map::Entry::Vacant(e) => e.insert(GitHubClient::new(
@@ -184,6 +199,7 @@ async fn reconcile_finished(
         };
         let pr = match gh.get_pull_request(&owner, &repo, number).await {
             Ok(v) => v,
+            Err(e) if crate::clients::github::outside_wait(&*e).is_some() => continue,
             Err(e) => {
                 warn!(run_id = %p.run_id, error = %e, "Reconcile: GitHub didn't return the PR");
                 mark_unknown(state, &p, "GitHub didn't return the PR").await;

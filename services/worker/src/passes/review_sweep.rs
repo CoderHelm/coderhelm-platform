@@ -300,6 +300,10 @@ pub async fn run(
     };
     let mut installs: HashMap<String, Option<u64>> = HashMap::new();
     let mut held = super::review_reminder::BrokerHeld::default();
+    // Asked before each repository: a sweep never spends the runs' share
+    // of GitHub's budget, and says so once per installation.
+    let mut budget =
+        crate::clients::github_budget::SweepGate::new(common::github_budget::caller::SWEEP_REVIEW);
     let now = chrono::Utc::now();
     for r in repos {
         let iid = match installs.get(&r.team_id) {
@@ -313,7 +317,7 @@ pub async fn run(
         let Some(iid) = iid else {
             continue;
         };
-        if held.skip(iid) {
+        if held.skip(iid) || !budget.allows(state, iid, 1).await {
             continue;
         }
         if let Err(e) = sweep_repo(state, &r, iid, now, &mut report).await {

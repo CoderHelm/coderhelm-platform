@@ -33,6 +33,7 @@ mod ao_stopped_log_finding;
 mod ap_closed_pr_keeps_findings;
 mod ar_description_stamped_to_the_head;
 mod at_round_scope;
+mod ax_github_budget;
 mod b_open_pr_retry;
 mod ba_verdict_on_old_commit;
 mod bb_flaky_not_broken;

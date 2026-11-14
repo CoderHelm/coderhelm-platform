@@ -1955,8 +1955,12 @@ struct Ctx<'a> {
 }
 
 impl Ctx<'_> {
+    /// The tick's time is used, or the sweep may not spend GitHub's budget
+    /// now (the runs' share, its own hour's cap, a spent limit): every loop
+    /// here asks before its next item, so a sweep stops instead of failing
+    /// item by item.
     fn out_of_time(&self) -> bool {
-        self.started.elapsed().as_secs() >= TICK_BUDGET_SECS
+        self.started.elapsed().as_secs() >= TICK_BUDGET_SECS || self.gh.held()
     }
 }
 

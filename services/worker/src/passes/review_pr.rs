@@ -6807,7 +6807,7 @@ mod failure_tests {
             ));
         assert_eq!(
             title,
-            "Review paused: Waiting for GitHub's hourly limit to reset at 21:05 UTC; continues by itself"
+            "Review paused: Waiting for GitHub's hourly limit; continues by itself at 21:05 UTC"
         );
         assert!(summary.contains("nothing failed"));
     }

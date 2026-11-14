@@ -178,14 +178,7 @@ fn rate_limit_wait(
     Some(after.or(until_reset).unwrap_or(60).max(1))
 }
 
-/// GitHub's hourly REST budget for one installation, as its last response
-/// said: requests left, of how many, and when it refills (epoch seconds).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Budget {
-    pub remaining: u64,
-    pub limit: u64,
-    pub reset: u64,
-}
+pub use common::github_budget::Budget;
 
 /// The last budget each installation's responses reported, in this process.
 /// A branch CoderHelm moved in this process and has not yet reconciled.
@@ -281,6 +274,7 @@ pub fn observe_budget(installation_id: u64, headers: &reqwest::header::HeaderMap
         h("x-ratelimit-reset"),
     ) {
         record_budget(installation_id, b);
+        super::github_budget::budget_seen(installation_id, GitHubClient::now_epoch());
     }
 }
 
@@ -296,7 +290,7 @@ pub fn budget_of(installation_id: u64) -> Option<Budget> {
 
 /// Background work spends only while at least half the hourly budget is
 /// left, so live work (reviews, runs) always has the rest.
-pub const BACKGROUND_SHARE_PCT: u64 = 50;
+pub const BACKGROUND_SHARE_PCT: u64 = common::github_budget::RUN_RESERVE_PCT;
 
 /// How long background work waits before spending again: None while the
 /// budget has headroom (or none was seen yet), else the seconds until the
@@ -435,7 +429,9 @@ fn limited_until_from(
     Some(after.map(|a| now + a).or(until_reset).unwrap_or(now + 60))
 }
 
-fn note_limited(installation_id: u64, headers: &reqwest::header::HeaderMap, status: u16) {
+/// Notes a response that says GitHub can't be used for a while. True when
+/// it was the rate limit.
+fn note_limited(installation_id: u64, headers: &reqwest::header::HeaderMap, status: u16) -> bool {
     let h = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
     let now = GitHubClient::now_epoch();
     if let Some(until) = limited_until_from(
@@ -446,6 +442,16 @@ fn note_limited(installation_id: u64, headers: &reqwest::header::HeaderMap, stat
         now,
     ) {
         mark_limited(installation_id, until);
+        // The hourly REST budget itself is gone (not a search or secondary
+        // limit, which pass in a minute): nothing more is sent until then.
+        if core_spent(
+            status,
+            h("x-ratelimit-resource"),
+            h("x-ratelimit-remaining"),
+        ) {
+            super::github_budget::limit_spent(installation_id, until, now);
+        }
+        return true;
     } else if (500..=599).contains(&status) {
         mark_outside(
             installation_id,
@@ -453,6 +459,26 @@ fn note_limited(installation_id: u64, headers: &reqwest::header::HeaderMap, stat
             now + OUTAGE_WAIT_SECS,
         );
     }
+    false
+}
+
+/// Whether a refused response says the hourly REST budget is used up: no
+/// requests left on the `core` resource (or on one GitHub didn't name).
+fn core_spent(status: u16, resource: Option<&str>, remaining: Option<&str>) -> bool {
+    matches!(status, 403 | 429)
+        && remaining.map(str::trim) == Some("0")
+        && resource.is_none_or(|r| r.trim() == "core")
+}
+
+/// The error of a request that wasn't sent (`common::github_budget`), in
+/// the words of the rate limit it would have met, so every caller that
+/// knows GitHub's limit reads it as one.
+fn not_sent_message(url: &str, why: common::github_budget::Hold) -> String {
+    format!(
+        "HTTP status client error (403 Forbidden) for url ({url}): not sent, {}; API rate limit, \
+         the work waits for the reset",
+        why.as_str()
+    )
 }
 
 /// Records that the installation is rate limited until `until` (epoch
@@ -693,6 +719,9 @@ pub struct GitHubClient {
     /// Repo snapshots keyed by "owner/repo@ref". `None` marks a failed fetch
     /// so we don't re-download a too-large tarball on every search.
     snapshots: tokio::sync::RwLock<HashMap<String, Option<CachedSnapshot>>>,
+    /// While a caller records ([`Self::record_validators`]): the URL and
+    /// `ETag` of each read it made, to ask later whether any changed.
+    validators: Mutex<Option<Vec<(String, String)>>>,
 }
 
 #[derive(Serialize)]
@@ -743,7 +772,75 @@ impl GitHubClient {
             http: http.clone(),
             token_cache: Mutex::new(None),
             snapshots: tokio::sync::RwLock::new(HashMap::new()),
+            validators: Mutex::new(None),
         })
+    }
+
+    /// Starts recording the validator (`ETag`) of every read made from now
+    /// until [`Self::take_validators`].
+    pub fn record_validators(&self) {
+        if let Ok(mut v) = self.validators.lock() {
+            *v = Some(Vec::new());
+        }
+    }
+
+    /// The reads recorded since [`Self::record_validators`], each with the
+    /// validator GitHub gave it, and stops recording.
+    pub fn take_validators(&self) -> Vec<(String, String)> {
+        self.validators
+            .lock()
+            .ok()
+            .and_then(|mut v| v.take())
+            .unwrap_or_default()
+    }
+
+    fn note_validator(&self, resp: &reqwest::Response) {
+        if !resp.status().is_success() {
+            return;
+        }
+        let Some(etag) = resp
+            .headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|v| v.to_str().ok())
+        else {
+            return;
+        };
+        if let Ok(mut v) = self.validators.lock() {
+            if let Some(list) = v.as_mut() {
+                list.push((resp.url().to_string(), etag.to_string()));
+            }
+        }
+    }
+
+    /// Whether every one of these reads would answer what it answered when
+    /// its validator was recorded: each is asked again as a conditional
+    /// request (`If-None-Match`), which GitHub answers 304 and doesn't
+    /// count against the hourly budget while nothing changed. False at the
+    /// first read that changed or couldn't be asked, and for an empty list.
+    pub async fn unchanged(&self, validators: &[(String, String)]) -> bool {
+        if validators.is_empty() {
+            return false;
+        }
+        for (url, etag) in validators {
+            if !(is_github_url(url) || cfg!(test)) || etag.is_empty() {
+                return false;
+            }
+            let Ok(headers) = self.auth_headers().await else {
+                return false;
+            };
+            let mut req = self
+                .http
+                .get(url)
+                .header(reqwest::header::IF_NONE_MATCH, etag);
+            for (k, v) in headers {
+                req = req.header(k, v);
+            }
+            match self.send_tracked(req).await {
+                Ok(resp) if resp.status() == reqwest::StatusCode::NOT_MODIFIED => {}
+                _ => return false,
+            }
+        }
+        true
     }
 
     fn now_epoch() -> u64 {
@@ -914,20 +1011,35 @@ impl GitHubClient {
         ])
     }
 
-    /// Sends a request made with the installation's token, recording the
-    /// budget its response reports.
+    /// Sends a request made with the installation's token: the one place
+    /// every request leaves. It is counted under who made it, the budget
+    /// its response reports is recorded, and it isn't sent at all when the
+    /// hour's budget is spent or (for background work) is the runs'
+    /// (`common::github_budget`): the caller gets the rate limit it would
+    /// have met, with the wait.
     async fn send_tracked(
         &self,
         req: reqwest::RequestBuilder,
-    ) -> Result<reqwest::Response, reqwest::Error> {
+    ) -> Result<reqwest::Response, Box<dyn std::error::Error + Send + Sync>> {
         // Every request goes out here, so this is the one place a write that
         // moves a branch is seen: whoever made it, the branch is noted, and
         // the description of its pull request is rebuilt for the new head
         // (`passes::description::reconcile_moved`).
-        let moving = req.try_clone().and_then(|r| r.build().ok()).and_then(|r| {
+        let built = req.try_clone().and_then(|r| r.build().ok());
+        let moving = built.as_ref().and_then(|r| {
             let body = r.body().and_then(|b| b.as_bytes()).unwrap_or_default();
             branch_moved_by(r.method().as_str(), r.url().path(), body)
         });
+        let now = Self::now_epoch();
+        if let common::github_budget::Spend::Hold { why, wait_secs } =
+            super::github_budget::admit(self.installation_id, now)
+        {
+            let url = built.as_ref().map(|r| r.url().as_str()).unwrap_or("");
+            return Err(Box::new(RateLimited {
+                wait_secs: wait_secs.max(1),
+                message: not_sent_message(url, why),
+            }));
+        }
         let resp = match req.send().await {
             Ok(r) => r,
             Err(e) => {
@@ -939,11 +1051,12 @@ impl GitHubClient {
                         Self::now_epoch() + OUTAGE_WAIT_SECS,
                     );
                 }
-                return Err(e);
+                return Err(Box::new(e));
             }
         };
         observe_budget(self.installation_id, resp.headers());
-        note_limited(self.installation_id, resp.headers(), resp.status().as_u16());
+        let limited = note_limited(self.installation_id, resp.headers(), resp.status().as_u16());
+        super::github_budget::responded(self.installation_id, resp.status().as_u16(), limited, now);
         if let (Some((owner, repo, branch)), true) = (moving, resp.status().is_success()) {
             note_branch_moved(self.installation_id, &owner, &repo, &branch);
         }
@@ -954,6 +1067,21 @@ impl GitHubClient {
     /// when the run waits (see [`outside_for`]).
     pub fn outside(&self) -> Option<GitHubPaused> {
         outside_for(self.installation_id).map(|(cause, secs)| GitHubPaused::after(cause, secs))
+    }
+
+    /// Whether the current task may not spend this installation's budget
+    /// now (`github_budget::held`): a sweep's loop asks before each item.
+    pub fn held(&self) -> bool {
+        super::github_budget::held(self.installation_id)
+    }
+
+    /// [`Self::held`] for a caller named outright.
+    #[cfg(test)]
+    pub fn held_as(&self, caller: &str) -> bool {
+        matches!(
+            super::github_budget::standing(self.installation_id, caller, Self::now_epoch()),
+            common::github_budget::Spend::Hold { .. }
+        )
     }
 
     /// How long background reads should wait for the installation's budget
@@ -972,6 +1100,7 @@ impl GitHubClient {
             req = req.header(k, v);
         }
         let resp = ok_or_body(self.send_tracked(req).await?).await?;
+        self.note_validator(&resp);
         Ok(resp.json().await?)
     }
 
@@ -1027,6 +1156,7 @@ impl GitHubClient {
             req = req.header(k, v);
         }
         let resp = self.send_tracked(req).await?;
+        self.note_validator(&resp);
         let status = resp.status().as_u16();
         let link = resp
             .headers()
@@ -5350,7 +5480,7 @@ mod status_error_tests {
         assert!((600..=606).contains(&left), "{left}");
         assert!(paused
             .to_string()
-            .starts_with("Waiting for GitHub's hourly limit to reset at "));
+            .starts_with("Waiting for GitHub's hourly limit; continues by itself at "));
     }
 
     #[test]
@@ -5889,5 +6019,217 @@ mod body_limit_tests {
             let rest = &src[at..at + 600];
             assert!(rest.contains("bounded_payload(body)"), "{send}");
         }
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+    use crate::clients::github_budget as ledger;
+    use common::github_budget::caller as who;
+
+    fn client(installation_id: u64) -> GitHubClient {
+        let c =
+            GitHubClient::new("1", "test-key", installation_id, &reqwest::Client::new()).unwrap();
+        *c.token_cache.lock().unwrap() = Some(CachedToken {
+            token: "t".into(),
+            expires_at: GitHubClient::now_epoch() + 3600,
+            permissions: Default::default(),
+        });
+        c
+    }
+
+    /// A GitHub that answers a read with a validator and its budget, the
+    /// same read asked conditionally with 304, and `/spent` with the hourly
+    /// limit used up. Returns its address and how many requests reached it.
+    async fn github(remaining: u64) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counted = hits.clone();
+        let reset = GitHubClient::now_epoch() + 731;
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = vec![0u8; 1 << 14];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let text = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
+                counted.fetch_add(1, Ordering::SeqCst);
+                let budget = |left: u64| {
+                    format!(
+                        "x-ratelimit-resource: core\r\nx-ratelimit-limit: 5000\r\n\
+                         x-ratelimit-remaining: {left}\r\nx-ratelimit-reset: {reset}\r\n"
+                    )
+                };
+                let out = if text.starts_with("get /spent") {
+                    let body = "{\"message\":\"API rate limit exceeded for installation.\"}";
+                    format!(
+                        "HTTP/1.1 403 Forbidden\r\n{}content-type: application/json\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        budget(0),
+                        body.len()
+                    )
+                } else if text.contains("if-none-match: \"v1\"") {
+                    format!(
+                        "HTTP/1.1 304 Not Modified\r\n{}connection: close\r\n\r\n",
+                        budget(remaining)
+                    )
+                } else {
+                    let body = "{\"state\":\"open\"}";
+                    format!(
+                        "HTTP/1.1 200 OK\r\netag: \"v1\"\r\n{}content-type: application/json\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        budget(remaining),
+                        body.len()
+                    )
+                };
+                let _ = sock.write_all(out.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        (format!("http://{addr}"), hits)
+    }
+
+    fn counts(installation_id: u64) -> HashMap<&'static str, ledger::Counts> {
+        ledger::drain_of(installation_id)
+            .into_iter()
+            .flat_map(|u| u.counts)
+            .collect()
+    }
+
+    /// A read asked again with its validator comes back 304: nothing
+    /// changed, and it isn't counted against the budget.
+    #[tokio::test]
+    async fn an_unchanged_read_is_asked_conditionally_and_costs_nothing() {
+        use std::sync::atomic::Ordering;
+        let id = 920_001;
+        let (base, hits) = github(4_000).await;
+        let c = client(id);
+        let url = format!("{base}/repos/o/r/pulls/7");
+        ledger::scoped(who::SWEEP_PR_WATCH, async {
+            c.record_validators();
+            let pr = c.get(&url).await.unwrap();
+            assert_eq!(pr["state"], "open");
+            let validators = c.take_validators();
+            assert_eq!(validators, vec![(url.clone(), "\"v1\"".to_string())]);
+            // Not recording any more.
+            c.get(&url).await.unwrap();
+            assert!(c.take_validators().is_empty());
+
+            assert!(c.unchanged(&validators).await);
+            // A validator GitHub doesn't know is a changed read.
+            let moved = vec![(url.clone(), "\"v0\"".to_string())];
+            assert!(!c.unchanged(&moved).await);
+            // Nothing to ask is not "unchanged".
+            assert!(!c.unchanged(&[]).await);
+        })
+        .await;
+        assert_eq!(hits.load(Ordering::SeqCst), 4);
+        let spent = counts(id);
+        assert_eq!(
+            spent[who::SWEEP_PR_WATCH],
+            ledger::Counts {
+                sent: 3,
+                not_modified: 1,
+                ..Default::default()
+            }
+        );
+        // The budget the responses reported is the one every caller reads.
+        assert_eq!(budget_of(id).unwrap().remaining, 4_000);
+    }
+
+    /// Below the runs' share, a sweep's request never leaves; a run's does.
+    #[tokio::test]
+    async fn a_sweep_request_is_not_sent_into_the_share_kept_for_runs() {
+        use std::sync::atomic::Ordering;
+        let id = 920_002;
+        let (base, hits) = github(2_000).await;
+        let c = client(id);
+        let url = format!("{base}/repos/o/r/pulls/7");
+        // The first response tells the budget: 2,000 of 5,000 left.
+        ledger::scoped(who::RUN, async { c.get(&url).await.unwrap() }).await;
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let e = ledger::scoped(who::SWEEP_SECURITY, async { c.get(&url).await })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "the sweep's read never left"
+        );
+        // It reads as the limit, with the wait until the reset.
+        let wait = rate_limited(&*e).expect("a rate limit");
+        assert!((700..=731).contains(&wait), "{wait}");
+        assert_eq!(
+            outside_wait(&*e).map(|(c, _)| c),
+            Some(common::github_wait::Cause::RateLimit)
+        );
+        assert!(c.held_as(who::SWEEP_SECURITY));
+        // Work a person waits on still goes.
+        for caller in [who::RUN, who::FIX_ROUND, who::REVIEW] {
+            ledger::scoped(caller, async { c.get(&url).await.unwrap() }).await;
+            assert!(!c.held_as(caller));
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 4);
+        let spent = counts(id);
+        assert_eq!(spent[who::SWEEP_SECURITY].held, 1);
+        assert_eq!(spent[who::SWEEP_SECURITY].sent, 0);
+        assert_eq!(spent[who::RUN].sent, 2);
+    }
+
+    /// Once GitHub says the hour's budget is gone, no caller sends another
+    /// request until the reset: each gets the limit, with the wait, at once.
+    #[tokio::test]
+    async fn after_the_limit_is_met_nothing_is_sent_until_the_reset() {
+        use std::sync::atomic::Ordering;
+        let id = 920_003;
+        let (base, hits) = github(0).await;
+        let c = client(id);
+        let first = ledger::scoped(who::FIX_ROUND, async {
+            c.get(&format!("{base}/spent")).await
+        })
+        .await
+        .unwrap_err();
+        let wait = rate_limited(&*first).expect("the limit");
+        assert!((700..=732).contains(&wait), "{wait}");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        for caller in [who::FIX_ROUND, who::RUN, who::SWEEP_PR_WATCH] {
+            let e = ledger::scoped(caller, async {
+                c.get(&format!("{base}/repos/o/r/git/ref/heads/b")).await
+            })
+            .await
+            .unwrap_err();
+            let again = rate_limited(&*e).expect("the limit, not a failure");
+            assert!((690..=732).contains(&again), "{again}");
+            assert!(e.to_string().contains("rate limit"));
+        }
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "one refusal, not one per call"
+        );
+        assert!(ledger::limited_until(id, GitHubClient::now_epoch()).is_some());
+        let spent = counts(id);
+        assert_eq!(spent[who::FIX_ROUND].limited, 1);
+        assert_eq!(spent[who::FIX_ROUND].held, 1);
+        assert_eq!(spent[who::RUN].held, 1);
+    }
+
+    /// A search or secondary limit passes in a minute: it never stops the
+    /// installation's other requests for the hour.
+    #[test]
+    fn only_the_hourly_rest_budget_stops_every_request() {
+        assert!(core_spent(403, Some("core"), Some("0")));
+        assert!(core_spent(403, None, Some("0")));
+        assert!(core_spent(429, Some("core"), Some("0")));
+        assert!(!core_spent(403, Some("search"), Some("0")));
+        assert!(!core_spent(403, Some("graphql"), Some("0")));
+        assert!(!core_spent(403, Some("core"), Some("12")));
+        assert!(!core_spent(403, Some("core"), None));
+        assert!(!core_spent(404, Some("core"), Some("0")));
     }
 }
