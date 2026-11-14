@@ -1977,7 +1977,7 @@ pub async fn re_review(
         owner,
         name,
         pr = body.pr,
-        "Reviewer: dashboard re-review → review job"
+        "Reviewer: dashboard re-review: review job"
     );
     Ok(Json(json!({ "status": "queued" })))
 }

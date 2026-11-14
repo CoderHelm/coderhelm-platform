@@ -409,7 +409,7 @@ fn one_comment_per_merge_and_no_timer_verdict_in_the_source() {
     let src = include_str!("../health_check.rs");
     let upsert = fn_src(src, "\nasync fn upsert_comment(");
     assert!(upsert.contains("marker(&msg.merge_sha)"));
-    assert!(upsert.contains("edit_issue_comment("));
+    assert!(upsert.contains("edit_own("));
     let run = fn_src(src, "\npub async fn run(");
     assert!(run.contains("upsert_comment("));
     assert!(!run.contains("create_issue_comment("));

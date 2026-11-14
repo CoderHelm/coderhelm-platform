@@ -157,7 +157,7 @@ async fn log_reader(
         fail(
             StatusCode::BAD_REQUEST,
             if conns.is_empty() {
-                "Connect your AWS account in Settings → Integrations first."
+                "Connect your AWS account in Settings under Integrations first."
             } else {
                 "Pick which AWS account to use."
             },
@@ -359,7 +359,7 @@ async fn try_connection(
                 Err(StepError::new(
                     "sign_in",
                     "The CoderHelm role can't read CloudWatch metrics yet.",
-                    "Add the read permissions with the one-click stack in Settings → Integrations, then check again.",
+                    "Add the read permissions with the one-click stack in Settings under Integrations, then check again.",
                 ))
             }
         }
@@ -372,7 +372,7 @@ async fn try_connection(
                 return Err(StepError::new(
                     "sign_in",
                     "The CoderHelm role can't read Airflow yet.",
-                    "Add the read permissions with the one-click stack in Settings → Integrations, then check again.",
+                    "Add the read permissions with the one-click stack in Settings under Integrations, then check again.",
                 ));
             };
             for e in &c.environments {
@@ -527,7 +527,7 @@ pub async fn save(
         // found by checking its role.
         return Err(fail(
             StatusCode::GONE,
-            "CloudWatch metrics and Airflow come with your AWS account now. Turn them on in Settings → Integrations.",
+            "CloudWatch metrics and Airflow come with your AWS account now. Turn them on in Settings under Integrations.",
         ));
     }
     let table = &state.config.settings_table_name;

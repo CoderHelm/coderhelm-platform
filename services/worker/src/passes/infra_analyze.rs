@@ -101,11 +101,11 @@ STEP 2 — CHOOSE GROUP STRATEGY:
 
 STEP 3 — SELECT MAX 8 SERVICES:
   Merging rules (critical for clean diagrams):
-  • Multiple DynamoDB tables → one "DynamoDB" node
-  • Multiple S3 buckets → one "S3" node (unless they serve DIFFERENT tiers, e.g. static vs data)
-  • Multiple Lambda functions → merge by ROLE: "API Lambda" + "Worker Lambda" max
-  • API Gateway + WAF → just "API Gateway" (WAF is implied)
-  • Route 53 + CloudFront → just "CloudFront" (Route 53 is DNS plumbing)
+  • Multiple DynamoDB tables become one "DynamoDB" node
+  • Multiple S3 buckets become one "S3" node (unless they serve DIFFERENT tiers, e.g. static vs data)
+  • Multiple Lambda functions: merge by ROLE: "API Lambda" + "Worker Lambda" max
+  • API Gateway + WAF: just "API Gateway" (WAF is implied)
+  • Route 53 + CloudFront: just "CloudFront" (Route 53 is DNS plumbing)
   • SecretsManager, KMS, IAM, CloudWatch → omit (cross-cutting, not architectural)
   • SNS + SQS in the same path → show the one the code WRITES to; the other is plumbing
   Place at most 3 services per group. If a group needs 4+, merge harder.

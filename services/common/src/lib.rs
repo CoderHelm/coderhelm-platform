@@ -177,6 +177,13 @@ pub mod pr_reader;
 pub mod pr_steps;
 pub mod run_prs;
 // review_stats: time-ordered review records for analytics
+/// What people write on a ticket while a run works on it: kept, acknowledged, acted on.
+/// One engineer's voice per ticket and per pull request: every comment
+/// CoderHelm writes reads the thread first, then stays quiet, edits its own
+/// comment, answers people or posts.
+pub mod conversation;
+/// Where `conversation` reads and writes (the Jira app with its ledger, GitHub).
+pub mod conversation_io;
 pub mod decision_log;
 pub mod deploy_stats;
 /// Flaky or broken: whose failure a red check is, and the repository's
@@ -254,7 +261,6 @@ pub mod stop_judge;
 pub mod stop_rules;
 /// A team's run and PR-reviewed counts, each added exactly once.
 pub mod team_counts;
-/// What people write on a ticket while a run works on it: kept, acknowledged, acted on.
 pub mod ticket_comments;
 /// A ticket's comments as CoderHelm read them, and whether its work is done.
 pub mod ticket_state;

@@ -531,7 +531,7 @@ impl Seen {
         match &self.result {
             Err(m) => format!("not checked: {m}"),
             Ok(c) => match (c.hops.first(), c.hops.get(1)) {
-                (Some(h), Some(next)) => format!("{} → `{}`", h.status, next.url),
+                (Some(h), Some(next)) => format!("{} to `{}`", h.status, next.url),
                 (Some(h), None) => match &c.stopped {
                     Some(why) => format!("{} ({why})", h.status),
                     None => h.status.to_string(),
@@ -546,7 +546,7 @@ impl Seen {
             Err(m) => format!("not checked: {m}"),
             Ok(c) => {
                 let chain: Vec<String> = c.hops.iter().map(|h| h.status.to_string()).collect();
-                let mut s = chain.join(" → ");
+                let mut s = chain.join(" to ");
                 if c.hops.len() > 1 {
                     s.push_str(&format!(" (`{}`)", c.final_url));
                 }
@@ -1809,7 +1809,7 @@ mod tests {
         let sec = r.section();
         assert!(sec.starts_with(START) && sec.ends_with(END));
         assert!(sec.contains(
-            "`https://go.example.com/old-plan`: 301 → `https://www.example.com/change-plan-form`"
+            "`https://go.example.com/old-plan`: 301 to `https://www.example.com/change-plan-form`"
         ));
         assert!(sec.contains("`/plan-change`: 200 · \"Plan Change \\| Example\""));
         assert!(sec.contains("was `/change-plan-form`: 404"));

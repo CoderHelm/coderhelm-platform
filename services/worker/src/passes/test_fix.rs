@@ -2828,18 +2828,21 @@ pub async fn ready_gate(
             } else {
                 String::new()
             };
-            let _ = github
-                .create_issue_comment(
-                    owner,
-                    repo,
-                    pr_number,
+            let _ = crate::passes::conversation::github(
+                github,
+                owner,
+                repo,
+                pr_number,
+                common::conversation::Say::note(
+                    "test-fix",
                     &if draft {
                         format!("This test fix stays a draft: {why}.{how}")
                     } else {
                         format!("This test fix is still being proven: {why}.{how}")
                     },
-                )
-                .await;
+                ),
+            )
+            .await;
         }
         g.polls += 1;
         if g.polls <= MAX_POLLS {
@@ -2957,9 +2960,14 @@ pub async fn after_feedback(
             .collect::<Vec<_>>()
             .join("\n")
     );
-    let _ = github
-        .create_issue_comment(owner, repo, pr_number, &body)
-        .await;
+    let _ = crate::passes::conversation::github(
+        github,
+        owner,
+        repo,
+        pr_number,
+        common::conversation::Say::note("test-fix", &body),
+    )
+    .await;
 }
 
 // ── agents' tools ────────────────────────────────────────────────────────

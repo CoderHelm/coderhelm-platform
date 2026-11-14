@@ -322,6 +322,7 @@ pub async fn after_pr(
         &format!("**{title}**\n\n{body}"),
         &super::fix_location::jira_text(&body),
         title,
+        &[],
     )
     .await;
     arm(

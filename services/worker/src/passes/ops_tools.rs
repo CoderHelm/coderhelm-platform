@@ -196,7 +196,7 @@ impl AwsAbilities {
                 [] => Err(StepError::new(
                     "read_only",
                     "CloudWatch metrics aren't on for any AWS account.",
-                    "Ask an admin to turn them on in Settings → Integrations.",
+                    "Ask an admin to turn them on in Settings under Integrations.",
                 )),
                 _ => Err(StepError::new(
                     "read_only",
@@ -1050,7 +1050,7 @@ impl OpsTools {
                             "{} isn't an Airflow environment agents may read.",
                             get.environment
                         ),
-                        "Ask an admin to pick it in Settings → Integrations.",
+                        "Ask an admin to pick it in Settings under Integrations.",
                     )
                 })?
                 .target;
@@ -1086,7 +1086,7 @@ impl OpsTools {
             StepError::new(
                 "read_only",
                 "That connection isn't on.",
-                "Ask an admin to turn it on in Settings → Integrations.",
+                "Ask an admin to turn it on in Settings under Integrations.",
             )
         })?;
         let s = |k: &str| input[k].as_str().map(str::trim).filter(|v| !v.is_empty());
@@ -1211,7 +1211,7 @@ impl OpsTools {
             ConnKind::Metrics | ConnKind::Airflow => Err(StepError::new(
                 "read_only",
                 "That connection isn't on.",
-                "Ask an admin to turn it on in Settings → Integrations.",
+                "Ask an admin to turn it on in Settings under Integrations.",
             )),
         }
     }

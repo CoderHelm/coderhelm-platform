@@ -1317,29 +1317,30 @@ pub async fn tell_requester(
     super::add_progress_note(state, team_id, run_id, text).await;
     match ticket.source.as_str() {
         "jira" if !ticket.id.is_empty() => {
-            if let Err(e) = super::post_jira_comment(
+            if let Err(e) = crate::passes::conversation::jira(
                 state,
                 team_id,
                 &ticket.id,
-                &super::fix_location::jira_text(text),
+                common::conversation::Say::note("review-fix", super::fix_location::jira_text(text)),
                 "info",
                 title,
             )
             .await
+            .map(|_| ())
             {
                 warn!(run_id, error = %e, "review fix: could not tell the requester on the ticket");
             }
         }
         "github" if ticket.issue_number > 0 => {
             if let Some((o, r)) = ticket.repo.split_once('/') {
-                let _ = github
-                    .create_issue_comment(
-                        o,
-                        r,
-                        ticket.issue_number,
-                        &format!("**{title}**\n\n{text}"),
-                    )
-                    .await;
+                let _ = crate::passes::conversation::github(
+                    github,
+                    o,
+                    r,
+                    ticket.issue_number,
+                    common::conversation::Say::note("review-fix", format!("**{title}**\n\n{text}")),
+                )
+                .await;
             }
         }
         _ => {}

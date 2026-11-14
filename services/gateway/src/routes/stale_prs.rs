@@ -656,13 +656,13 @@ pub(crate) async fn on_keep_open_comment(
             commenter,
             "keep open: refused (not the author, no write access)"
         );
-        super::merge_control::gh_post(
-            state,
-            &token,
-            &format!("{api}/issues/{number}/comments"),
-            &json!({ "body": format!("@{commenter} Only the author of this pull request or someone with write access can keep it open. Nothing changed.") }),
-        )
-        .await;
+        let say = common::conversation::Say::reply_all(
+            "keep-open",
+            format!("@{commenter} Only the author of this pull request or someone with write access can keep it open. Nothing changed."),
+        );
+        if let Err(e) = super::conversation::github(state, &token, owner, name, number, say).await {
+            warn!(owner, name, pr = number, error = %e, "keep open: reply failed");
+        }
         return Ok(StatusCode::OK);
     }
     let repo = format!("{owner}/{name}");

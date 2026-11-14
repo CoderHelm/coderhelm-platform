@@ -863,7 +863,7 @@ async fn run_locked(
     {
         let (url, secret) = forge_trigger(state, &msg.team_id, "publish_release_url")
             .await
-            .ok_or("Confluence publishing isn't connected — update the CoderHelm app in Jira and reconnect it in Settings → Integrations")?;
+            .ok_or("Confluence publishing isn't connected — update the CoderHelm app in Jira and reconnect it in Settings under Integrations")?;
         let resp = state
             .http
             .post(&url)

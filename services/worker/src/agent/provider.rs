@@ -58,7 +58,7 @@ impl ModelProvider {
             Some(item) => item,
             // On Bedrock a team needs no settings: the defaults apply.
             None if bedrock => &empty,
-            None => return Err("No model provider configured. Please set up your Anthropic API key in Settings → Model Provider.".into()),
+            None => return Err("No model provider configured. Please set up your Anthropic API key in Settings under Model Provider.".into()),
         };
 
         let api_key = item
@@ -68,7 +68,7 @@ impl ModelProvider {
             .unwrap_or_default();
 
         if api_key.is_empty() && !bedrock {
-            return Err("Anthropic API key is not configured. Please add your API key in Settings → Model Provider.".into());
+            return Err("Anthropic API key is not configured. Please add your API key in Settings under Model Provider.".into());
         }
 
         // A retired saved id runs as its replacement (Anthropic refuses it).
