@@ -3808,7 +3808,7 @@
           "github_wait": {
             "description": "While the run waits for GitHub (its hourly limit, or a moment GitHub\nfailed to answer): when it goes on, in plain words. The run continues\nby itself; nothing is needed from anyone.",
             "examples": [
-              "Waiting for GitHub's hourly limit to reset at 21:05 UTC; continues by itself"
+              "Waiting for GitHub's hourly limit; continues by itself at 21:05 UTC"
             ],
             "type": [
               "string",

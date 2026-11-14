@@ -136,6 +136,11 @@ async fn read_repo(
         &state.http,
     )
     .map_err(|e| format!("GitHub sign in failed: {e}"))?;
+    // The sweep's turn waits while GitHub's budget is the runs': the
+    // repository is read at a later tick, and nothing is recorded as failed.
+    if !force && gh.held() {
+        return Ok(None);
+    }
     let branch = gh
         .get_default_branch(owner, name)
         .await

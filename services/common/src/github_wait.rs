@@ -17,8 +17,12 @@
 //! - The run page says [`waiting_text`] while it waits.
 //! - The wait isn't work: it adds no step, no worked time and no pass to the
 //!   run's progress guard or its ceiling.
-//! - [`MAX_WAITS`] bounds it: a GitHub that refuses through that many waits
-//!   ends the run with [`gave_up_reason`], which says it was GitHub.
+//! - [`MAX_WAITS`] bounds the waits for an outage: a GitHub that fails
+//!   through that many ends the run with [`gave_up_reason`], which says it
+//!   was GitHub. Its rate limit is never why a run ends inside a day: a run
+//!   waits for it up to [`MAX_LIMIT_WAITS`] times, each wait at least
+//!   [`paced`] (a minute, doubling to one SQS delay), so a limit that
+//!   answers "try in a minute" over and over can't use the waits up.
 
 use serde::{Deserialize, Serialize};
 
@@ -28,6 +32,30 @@ pub const MAX_HOP_SECS: u64 = 900;
 /// Waits one run takes for GitHub before it stops (about eight hours of
 /// hourly limits): far above a real limit, which resets within the hour.
 pub const MAX_WAITS: u32 = 8;
+
+/// Waits one run takes for GitHub's rate limit: two days of hourly limits,
+/// and at least half a day of a secondary limit that keeps answering "in a
+/// minute" (see [`paced`]).
+pub const MAX_LIMIT_WAITS: u32 = 48;
+
+/// Whether a run that waited `waits` times may wait once more for `cause`.
+pub fn may_wait(cause: Cause, waits: u32) -> bool {
+    match cause {
+        Cause::RateLimit => waits < MAX_LIMIT_WAITS,
+        Cause::Outage => waits < MAX_WAITS,
+    }
+}
+
+/// The wait a run takes for GitHub's rate limit after `waits` earlier ones:
+/// what GitHub asked for, and never less than a minute doubled per earlier
+/// wait (60, 120, 240, 480, then one SQS delay). An outage waits what it
+/// was given.
+pub fn paced(cause: Cause, wait_secs: u64, waits: u32) -> u64 {
+    match cause {
+        Cause::RateLimit => wait_secs.max((60u64 << waits.min(4)).min(MAX_HOP_SECS)),
+        Cause::Outage => wait_secs,
+    }
+}
 
 /// Seconds added after GitHub's reset time, so the run starts after it.
 pub const RESET_SLACK_SECS: u64 = 5;
@@ -96,7 +124,7 @@ pub fn clock(epoch: u64) -> String {
 pub fn waiting_text(cause: Cause, until: u64) -> String {
     match cause {
         Cause::RateLimit => format!(
-            "Waiting for GitHub's hourly limit to reset at {}; continues by itself",
+            "Waiting for GitHub's hourly limit; continues by itself at {}",
             clock(until)
         ),
         Cause::Outage => format!(
@@ -170,9 +198,14 @@ mod tests {
         assert_eq!(clock(reset), "21:05 UTC");
         assert_eq!(
             waiting_text(Cause::RateLimit, reset),
-            "Waiting for GitHub's hourly limit to reset at 21:05 UTC; continues by itself"
+            "Waiting for GitHub's hourly limit; continues by itself at 21:05 UTC"
         );
         assert!(waiting_text(Cause::Outage, reset).contains("continues by itself"));
+        // Nothing in it asks a person for anything.
+        for cause in [Cause::RateLimit, Cause::Outage] {
+            let t = waiting_text(cause, reset).to_lowercase();
+            assert!(!t.contains("resume") && !t.contains("retry"), "{t}");
+        }
     }
 
     #[test]
@@ -193,6 +226,28 @@ mod tests {
         assert!(r.contains("GitHub's rate limit"));
         assert!(!r.contains("CoderHelm's miss"));
         assert!(!r.to_lowercase().contains("coder wrote no file"));
+    }
+
+    #[test]
+    fn a_rate_limit_is_waited_far_longer_than_an_outage_and_never_in_a_tight_loop() {
+        assert!(may_wait(Cause::Outage, MAX_WAITS - 1));
+        assert!(!may_wait(Cause::Outage, MAX_WAITS));
+        assert!(may_wait(Cause::RateLimit, MAX_WAITS));
+        assert!(may_wait(Cause::RateLimit, MAX_LIMIT_WAITS - 1));
+        assert!(!may_wait(Cause::RateLimit, MAX_LIMIT_WAITS));
+        // GitHub's own wait stands when it is longer.
+        assert_eq!(paced(Cause::RateLimit, 731, 0), 731);
+        assert_eq!(paced(Cause::RateLimit, 2_400, 7), 2_400);
+        // "In a minute", again and again, is paced out.
+        let waits: Vec<u64> = (0..6).map(|n| paced(Cause::RateLimit, 60, n)).collect();
+        assert_eq!(waits, vec![60, 120, 240, 480, 900, 900]);
+        // Every wait a run may take for the limit, at its shortest: over
+        // eleven hours, never a loop of minutes.
+        let least: u64 = (0..MAX_LIMIT_WAITS)
+            .map(|n| paced(Cause::RateLimit, 1, n))
+            .sum();
+        assert!(least > 11 * 3600, "{least}");
+        assert_eq!(paced(Cause::Outage, 60, 5), 60);
     }
 
     #[test]

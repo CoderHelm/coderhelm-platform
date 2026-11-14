@@ -73,6 +73,11 @@ pub async fn run(state: &WorkerState) -> Result<(), Box<dyn std::error::Error + 
 
     let mut install_cache: HashMap<String, u64> = HashMap::new();
     let mut held = BrokerHeld::default();
+    // Asked before each repository: a sweep never spends the runs' share
+    // of GitHub's budget, and says so once per installation.
+    let mut budget = crate::clients::github_budget::SweepGate::new(
+        common::github_budget::caller::SWEEP_REVIEW_REMINDER,
+    );
     for cfg in configs {
         let iid = match install_cache.get(&cfg.team_id) {
             Some(v) => *v,
@@ -87,7 +92,7 @@ pub async fn run(state: &WorkerState) -> Result<(), Box<dyn std::error::Error + 
                 }
             },
         };
-        if held.skip(iid) {
+        if held.skip(iid) || !budget.allows(state, iid, 1).await {
             continue;
         }
         if let Err(e) = sweep_repo(state, &cfg, iid).await {

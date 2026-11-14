@@ -489,7 +489,9 @@ impl ReleaseIo<(Finding, FindingState)> for Live<'_, '_> {
     }
 
     fn out_of_time(&self) -> bool {
-        self.started.elapsed().as_secs() >= self.budget_secs
+        // Out of time, or of the sweep's share of GitHub's budget: what is
+        // left is read at a later sweep (`Report::left`).
+        self.started.elapsed().as_secs() >= self.budget_secs || self.cx.gh.held()
     }
 }
 

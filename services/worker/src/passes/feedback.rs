@@ -1897,15 +1897,23 @@ Rules:
 pub(crate) async fn wait_for_github(
     state: &WorkerState,
     msg: &FeedbackMessage,
-    e: &(dyn std::error::Error + 'static),
+    e: &(dyn std::error::Error + Send + Sync + 'static),
 ) -> bool {
-    let Some((cause, wait)) = crate::clients::github::outside_wait(e) else {
+    // The error is GitHub's, or GitHub is refusing this installation right
+    // now and the round failed under it (`github_pause_of`).
+    let Some(paused) = super::github_pause_of(e, msg.installation_id) else {
         return false;
     };
-    if msg.github_wait.waits >= common::github_wait::MAX_WAITS {
+    let cause = paused.cause;
+    if !common::github_wait::may_wait(cause, msg.github_wait.waits) {
         return false;
     }
     let now = chrono::Utc::now().timestamp().max(0) as u64;
+    let wait = common::github_wait::paced(
+        cause,
+        paused.until.saturating_sub(now).max(1),
+        msg.github_wait.waits,
+    );
     let until = common::github_wait::until(now, wait);
     let mut next = msg.clone();
     next.github_wait = common::github_wait::GitHubWait {
@@ -1921,7 +1929,7 @@ pub(crate) async fn wait_for_github(
     }
     let text = common::github_wait::waiting_text(cause, until);
     warn!(run_id = %msg.run_id, until, "github_wait: the feedback round waits for GitHub");
-    super::add_progress_note(state, &msg.team_id, &msg.run_id, &text).await;
+    super::note_github_wait(state, &msg.team_id, &msg.run_id, &text).await;
     true
 }
 
