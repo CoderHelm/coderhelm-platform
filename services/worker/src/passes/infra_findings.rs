@@ -10,6 +10,10 @@
 //!   token limits (`SECRUNS#<day>`), one run per repository at a time,
 //!   the policy's cadence per tier, nothing in a dry run. The run's ticket
 //!   names the file and the Terraform address.
+//! - A record is `fixing` only while its run works and `pr_open` only
+//!   while its pull request is open or merged (`release`): the same
+//!   reconciliation, events, bounds and holds as dependency findings
+//!   (`security_fixes::release`), on this store's records.
 //! - Runbook steps and AWS-managed rows are shown, never run.
 //! - New P0 and P1 findings post one card each, inside the day's card
 //!   limit shared with dependency findings (`SECCARDS#<day>`).
@@ -346,8 +350,7 @@ async fn enqueue(
         0,
     )
     .await?;
-    r.status = Status::Fixing;
-    r.ticket = unit.ticket.clone();
+    r.claim(&unit.ticket, Utc::now());
     r.updated_at = Utc::now().to_rfc3339();
     save(state, team_id, r).await;
     super::security_fixes::add_event(
@@ -401,6 +404,12 @@ async fn start_fixes(
                     format!("This finding has no PR to open. {}", r.finding.fix.decision)
                 });
             }
+            continue;
+        }
+        // Its pull request closed unmerged, or its run ended without one:
+        // no new run by itself while the hold is on. A person's own
+        // request goes ahead.
+        if r.on_hold(Utc::now()) && !asked {
             continue;
         }
         // The guard refused this finding's change and the finding still
@@ -613,6 +622,18 @@ pub async fn on_event(state: &WorkerState, msg: &SecurityEventMessage) {
             super::review_reminder::team_installation_id(state, team).await
         };
         if let Some(iid) = iid {
+            // What the record says is checked against GitHub and its run
+            // first: a person asking after closing the pull request (or
+            // pressing Retry on its run) is never told "already open".
+            if let Ok(gh) = crate::clients::github::GitHubClient::new(
+                &state.secrets.github_app_id,
+                &state.secrets.github_private_key,
+                iid,
+                &state.http,
+            ) {
+                let scope = Scope::Ids(vec![msg.repo.clone()]);
+                recs = release(state, team, &gh, &scope).await.0;
+            }
             let (n, why) =
                 start_fixes(state, team, iid, &cfg, &mut recs, false, Some(&msg.repo)).await;
             if n == 0 {
@@ -629,6 +650,111 @@ pub async fn on_event(state: &WorkerState, msg: &SecurityEventMessage) {
             }
         }
     }
+}
+
+// ── Release: fixing and pr_open follow GitHub and the run ───────────────
+
+use super::security_fixes::release::{self as rel, ReleaseIo, Scope};
+use common::security_release::{OpenPr, PrNow, RunNow};
+
+/// This store's edges for the shared reconciliation
+/// (`security_fixes::release::reconcile`): the same reads of GitHub and the
+/// run records as dependency findings, and the records' own storage.
+struct Release<'a> {
+    reads: rel::Reads<'a>,
+    started: std::time::Instant,
+}
+
+#[async_trait::async_trait]
+impl ReleaseIo<Record> for Release<'_> {
+    async fn pr_now(&self, repo: &str, number: u64, closer: bool) -> PrNow {
+        self.reads.pr_now(repo, number, closer).await
+    }
+    async fn open_pr(&self, repo: &str, ticket: &str) -> Result<Option<OpenPr>, ()> {
+        self.reads.open_pr(repo, ticket).await
+    }
+    async fn run_now(&self, ticket: &str, since: Option<chrono::DateTime<Utc>>) -> RunNow {
+        self.reads.run_now(ticket, since).await
+    }
+    async fn save(&self, r: &Record) {
+        save(self.reads.state, self.reads.team_id, r).await;
+        // The guard's second step, reached because the fix round ended
+        // without settling the pull request: it becomes a draft on GitHub
+        // too, with the reason at its top. Never closed, branch kept.
+        if let Some((repo, number)) = newly_drafted(r) {
+            draft_with_reason(self.reads.gh, &repo, number, &r.refused).await;
+        }
+    }
+    async fn event(&self, finding_id: &str, text: &str, link: Option<&str>) {
+        super::security_fixes::add_event(
+            self.reads.state,
+            self.reads.team_id,
+            finding_id,
+            text,
+            link,
+        )
+        .await;
+    }
+    /// A pull request the run opened that the record never learned: the
+    /// replacement guard reads it before anything is recorded.
+    async fn opened(&self, r: &mut Record, pr: &OpenPr) -> bool {
+        let Some(unit) = unit_for(r) else {
+            return false;
+        };
+        let (state, team_id) = (self.reads.state, self.reads.team_id);
+        on_pr_opened(state, team_id, &unit, pr.number, &pr.url).await;
+        match load_records(state, team_id)
+            .await
+            .into_iter()
+            .find(|x| x.finding.id == r.finding.id)
+        {
+            Some(now) => {
+                *r = now;
+                true
+            }
+            None => false,
+        }
+    }
+    fn out_of_time(&self) -> bool {
+        self.started.elapsed().as_secs() >= rel::TEAM_BUDGET_SECS
+    }
+}
+
+/// The pull request to make a draft on GitHub when the record was just
+/// settled as the guard's second step (`Claim::settle_run`): a drafted
+/// record whose pull request is recorded as a draft. Pure.
+pub(crate) fn newly_drafted(r: &Record) -> Option<(String, u64)> {
+    let pr = r.pr.as_ref().filter(|p| p.state == "draft")?;
+    let repo = r.finding.fix.location.as_ref()?.repo.clone();
+    (r.drafted && !r.refused.is_empty()).then_some((repo, pr.number))
+}
+
+/// Brings the team's infrastructure records in `scope` in line with GitHub
+/// and the run records: the sweep (`Scope::All`), a pull request that
+/// closed or reopened, a run a person ended, a person's request. Returns
+/// the records as they stand and what was done.
+pub(crate) async fn release(
+    state: &WorkerState,
+    team_id: &str,
+    gh: &crate::clients::github::GitHubClient,
+    scope: &Scope,
+) -> (Vec<Record>, rel::Report) {
+    let mut recs = load_records(state, team_id).await;
+    // Most teams have no infrastructure finding in a run or a pull
+    // request: nothing to read then.
+    if !recs
+        .iter()
+        .any(|r| r.pr.is_some() || r.status == Status::Fixing)
+    {
+        return (recs, rel::Report::default());
+    }
+    let io = Release {
+        reads: rel::Reads { state, team_id, gh },
+        started: std::time::Instant::now(),
+    };
+    let report = rel::reconcile(&io, &mut recs, scope, Utc::now()).await;
+    rel::said(team_id, "infrastructure", scope, &report);
+    (recs, report)
 }
 
 /// What the replacement guard says of a pull request's files
@@ -715,8 +841,13 @@ pub(crate) fn after_guard(
             number,
             url: url.to_string(),
             state: state.into(),
+            ..Default::default()
         })
     };
+    // A pull request stands (or is held): nothing waits on a hold now.
+    r.hold_until = None;
+    r.release_note = None;
+    r.claimed_at = None;
     let event = match step {
         records::GuardStep::Passed => {
             r.status = Status::PrOpen;
@@ -724,9 +855,16 @@ pub(crate) fn after_guard(
             format!("PR #{number} opened")
         }
         records::GuardStep::FixRound => {
-            // Still CoderHelm's to finish: the fix round is on its way.
+            // Still CoderHelm's to finish: the fix round is on its way. Its
+            // run starts after the delay: only a run that began from then
+            // on is the round (the one that opened the pull request is not).
             r.status = Status::Fixing;
             r.pr = pr("open");
+            r.claimed_at = sec::parse_time(now).map(|t| {
+                (t + chrono::Duration::seconds(FIX_ROUND_DELAY_SECS as i64)
+                    + chrono::Duration::minutes(common::security_release::RUN_CLOCK_TOLERANCE_MINS))
+                .to_rfc3339()
+            });
             format!(
                 "PR #{number}: the change would replace or destroy a resource that holds data ({}). One fix round corrects it and the change is read again",
                 reasons.join("; ")
@@ -748,11 +886,16 @@ pub(crate) fn after_guard(
 
 /// The pull request becomes a draft with the reason at the top of its
 /// description. It is never closed and its branch is never deleted.
-async fn draft_with_reason(g: &Guarded, unit: &FixUnit, number: u64, reasons: &[String]) {
-    let Some((owner, name)) = unit.repo.split_once('/') else {
+async fn draft_with_reason(
+    gh: &crate::clients::github::GitHubClient,
+    repo: &str,
+    number: u64,
+    reasons: &[String],
+) {
+    let Some((owner, name)) = repo.split_once('/') else {
         return;
     };
-    let pr = match g.gh.get_pull_request(owner, name, number).await {
+    let pr = match gh.get_pull_request(owner, name, number).await {
         Ok(pr) => pr,
         Err(e) => {
             warn!(number, error = %e, "infra findings: the pull request could not be read to make it a draft");
@@ -761,7 +904,7 @@ async fn draft_with_reason(g: &Guarded, unit: &FixUnit, number: u64, reasons: &[
     };
     if !pr["draft"].as_bool().unwrap_or(false) {
         if let Some(node) = pr["node_id"].as_str() {
-            if let Err(e) = g.gh.convert_pr_to_draft(node).await {
+            if let Err(e) = gh.convert_pr_to_draft(node).await {
                 warn!(number, error = %e, "infra findings: the pull request could not be made a draft");
             }
         }
@@ -769,7 +912,7 @@ async fn draft_with_reason(g: &Guarded, unit: &FixUnit, number: u64, reasons: &[
     // The reason is in the description whether or not the conversion
     // worked: it alone keeps the pull request from being marked ready.
     let body = common::infra_vuln::guard::put_hold(pr["body"].as_str().unwrap_or(""), reasons);
-    if let Err(e) = crate::passes::description::save(&g.gh, owner, name, number, &body).await {
+    if let Err(e) = crate::passes::description::save(gh, owner, name, number, &body).await {
         warn!(number, error = %e, "infra findings: the reason could not be written on the pull request");
     }
 }
@@ -820,7 +963,7 @@ pub async fn on_pr_opened(
                 }
             }
             (records::GuardStep::Draft, Some(g)) if !drafted => {
-                draft_with_reason(g, unit, number, &reasons).await;
+                draft_with_reason(&g.gh, &unit.repo, number, &reasons).await;
                 drafted = true;
             }
             _ => {}
@@ -1005,6 +1148,189 @@ mod tests {
         // And it writes a description in exactly one place.
         assert_eq!(code.matches("description::save(").count(), 1);
         assert!(!code.contains(&[".update_pr", "_body("].concat()));
+    }
+
+    // ── Release: the shared reconciliation on this store's records ──
+
+    use crate::passes::security_fixes::release::{fake::*, reconcile};
+    use common::security_release::{Claim, RunNow};
+
+    const TICKET: &str = "SEC-0A1B2C3D4E5F";
+
+    fn day() -> chrono::DateTime<Utc> {
+        at("2026-11-13T10:00:00Z")
+    }
+
+    /// A record whose fix run opened pull request 7 and the guard passed it.
+    fn in_pr_record(id: &str, number: u64) -> Record {
+        let mut r = pr_record();
+        r.finding.id = id.into();
+        r.ticket = TICKET.into();
+        after_guard(
+            &mut r,
+            &[],
+            number,
+            "https://github.com/acme/infra/pull/7",
+            "2026-11-12T09:00:00Z",
+        );
+        r.updated_at = "2026-11-12T09:00:00Z".into();
+        r
+    }
+
+    #[tokio::test]
+    async fn the_sweep_releases_a_record_whose_pull_request_a_person_closed() {
+        let mut recs = vec![in_pr_record("a", 7), in_pr_record("b", 8)];
+        let github = Fake::default();
+        github.pr("acme/infra", 7, closed_by("octo"));
+        github.pr("acme/infra", 8, common::security_release::PrNow::Open);
+        let r = reconcile(&github, &mut recs, &Scope::All, day()).await;
+        assert_eq!((r.prs_read, r.released), (2, 1));
+        assert_eq!(recs[0].status, Status::Open);
+        assert_eq!(
+            recs[0].pr.as_ref().unwrap().closed_by.as_deref(),
+            Some("octo")
+        );
+        assert_eq!(recs[1].status, Status::PrOpen);
+        assert!(recs[0].on_hold(day()));
+        assert!(github.event_texts()[0].contains("closed without merging by octo"));
+        // Again: read once more while the hold is on, nothing written.
+        let saves = github.saves();
+        let again = reconcile(&github, &mut recs, &Scope::All, day()).await;
+        assert_eq!((again.changed(), github.saves()), (0, saves));
+        // The webhook's event ends in the same place as the sweep.
+        let mut by_event = vec![in_pr_record("a", 7), in_pr_record("b", 8)];
+        let scope = Scope::Pr {
+            repo: "acme/infra".into(),
+            number: 7,
+        };
+        let r = reconcile(&github, &mut by_event, &scope, day()).await;
+        assert_eq!((r.prs_read, r.released), (1, 1));
+        assert_eq!(by_event, recs);
+    }
+
+    #[tokio::test]
+    async fn github_down_releases_nothing_and_a_merge_never_closes_the_finding() {
+        let mut recs = vec![in_pr_record("a", 7)];
+        let before = recs.clone();
+        let github = Fake::default();
+        let r = reconcile(&github, &mut recs, &Scope::All, day()).await;
+        assert_eq!((r.changed(), github.saves()), (0, 0));
+        assert_eq!(recs, before);
+        github.pr("acme/infra", 7, common::security_release::PrNow::Merged);
+        let r = reconcile(&github, &mut recs, &Scope::All, day()).await;
+        // Recorded, not "fixed": only a read of the account closes it, and
+        // no merged card is this store's to post.
+        assert_eq!((r.fixed, r.released, github.saves()), (0, 0, 1));
+        assert_eq!(recs[0].status, Status::PrOpen);
+        assert_eq!(recs[0].pr.as_ref().unwrap().state, "merged");
+        assert!(github.merged_cards.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_run_releases_its_record_and_a_working_one_is_left() {
+        let mut a = pr_record();
+        a.claim(TICKET, at("2026-11-13T09:00:00Z"));
+        let mut b = pr_record();
+        b.finding.id = "other".into();
+        b.claim("SEC-BBBBBBBBBBBB", at("2026-11-13T09:00:00Z"));
+        let mut recs = vec![a, b];
+        let runs = Fake::default();
+        runs.run(
+            TICKET,
+            RunNow::Ended {
+                status: "cancelled".into(),
+                by: Some("dev@example.com".into()),
+            },
+        );
+        runs.run("SEC-BBBBBBBBBBBB", RunNow::Working);
+        let r = reconcile(&runs, &mut recs, &Scope::Ticket(TICKET.into()), day()).await;
+        assert_eq!((r.runs_read, r.released), (1, 1));
+        assert_eq!(recs[0].status, Status::Open);
+        assert!(recs[0].on_hold(day()) && recs[0].ticket.is_empty());
+        let r = reconcile(&runs, &mut recs, &Scope::All, day()).await;
+        assert_eq!((r.runs_read, r.changed()), (1, 0));
+        assert_eq!(recs[1].status, Status::Fixing);
+    }
+
+    #[tokio::test]
+    async fn a_pull_request_the_record_never_learned_is_read_by_the_guard_first() {
+        let mut a = pr_record();
+        a.claim(TICKET, at("2026-11-13T09:00:00Z"));
+        let mut recs = vec![a];
+        let github = Fake::default();
+        github.branch_prs.lock().unwrap().insert(
+            TICKET.into(),
+            OpenPr {
+                number: 9,
+                url: "https://github.com/acme/infra/pull/9".into(),
+            },
+        );
+        let before = recs.clone();
+        reconcile(&github, &mut recs, &Scope::All, day()).await;
+        // Handed to the store's opening path (the guard); nothing recorded
+        // by the shared rule, and the run was not even asked.
+        assert_eq!(
+            *github.opened_through_store.lock().unwrap(),
+            vec![("abc".to_string(), 9)]
+        );
+        assert_eq!(recs, before);
+        assert_eq!(github.saves(), 0);
+        assert!(github.run_reads.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_fix_round_that_ended_makes_the_pull_request_a_draft_and_a_draft_is_never_closed() {
+        // The guard tripped once: the round is to start in five minutes,
+        // and only a run that begins from then on is the round.
+        let mut r = pr_record();
+        r.ticket = TICKET.into();
+        let (step, _) = after_guard(&mut r, &[WHY.to_string()], 7, "u", "2026-11-13T09:00:00Z");
+        assert_eq!(step, records::GuardStep::FixRound);
+        assert_eq!(Claim::claimed_at(&r), Some(at("2026-11-13T09:15:00Z")));
+        assert_eq!(newly_drafted(&r), None);
+        let mut recs = vec![r];
+        let github = Fake::default();
+        github.branch_prs.lock().unwrap().insert(
+            TICKET.into(),
+            OpenPr {
+                number: 7,
+                url: "u".into(),
+            },
+        );
+        github.pr("acme/infra", 7, common::security_release::PrNow::Open);
+        // The round works: nothing changes.
+        github.run(TICKET, RunNow::Working);
+        let rep = reconcile(&github, &mut recs, &Scope::All, day()).await;
+        assert_eq!((rep.changed(), github.saves()), (0, 0));
+        assert_eq!(github.run_reads.lock().unwrap().len(), 1, "the run decides");
+        // The round was cancelled: the refused change still stands, so the
+        // pull request is to be made a draft and the finding falls back.
+        github.run(
+            TICKET,
+            RunNow::Ended {
+                status: "cancelled".into(),
+                by: None,
+            },
+        );
+        reconcile(&github, &mut recs, &Scope::Ticket(TICKET.into()), day()).await;
+        let r = &recs[0];
+        assert_eq!(
+            (r.status, r.pr.as_ref().unwrap().state.as_str()),
+            (Status::Open, "draft")
+        );
+        assert!(r.drafted && r.guard_blocks());
+        assert_eq!(newly_drafted(r), Some(("acme/infra".to_string(), 7)));
+        assert!(github
+            .event_texts()
+            .last()
+            .unwrap()
+            .contains("PR #7 is now a draft"));
+        // From then on the draft is read every sweep and left as it is:
+        // open on GitHub is not closed, and never "reopened" either.
+        let saves = github.saves();
+        let rep = reconcile(&github, &mut recs, &Scope::All, day()).await;
+        assert_eq!((rep.prs_read, rep.changed(), github.saves()), (1, 0, saves));
+        assert_eq!(recs[0].pr.as_ref().unwrap().state, "draft");
     }
 
     #[test]

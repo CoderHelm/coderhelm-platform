@@ -2038,6 +2038,13 @@ pub(crate) async fn retry_event(
         .await
         .ok()??;
     let unit: sec::FixUnit = serde_json::from_str(&s(&item, "unit")).ok()?;
+    // An infrastructure fix run: the same decision on its own records.
+    if unit.ecosystem == common::infra_vuln::records::UNIT_ECOSYSTEM {
+        let records = super::infra_security::load_records(state, team_id)
+            .await
+            .ok()?;
+        return super::infra_security::retry_of(&unit, &records, team_id, by);
+    }
     let findings = load_findings(state, team_id).await.ok()?;
     retry_of(&unit, &findings, team_id, ticket, by)
 }
@@ -2050,7 +2057,8 @@ pub fn retry_of(
     ticket: &str,
     by: &str,
 ) -> Option<SecurityEventMessage> {
-    // Infrastructure fixes and base images have their own runs.
+    // Infrastructure fixes decide on their own records
+    // (`infra_security::retry_of`); base images have their own runs.
     if unit.ecosystem == common::infra_vuln::records::UNIT_ECOSYSTEM
         || unit.ecosystem == common::base_images::ECOSYSTEM
     {

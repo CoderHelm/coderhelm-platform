@@ -102,6 +102,8 @@ pub mod caller {
     pub const SWEEP_LEARNING: &str = "sweep:learning";
     /// The weekly summary.
     pub const SWEEP_WEEKLY: &str = "sweep:weekly";
+    /// Quarantined tests: releases, followed fixes and removals.
+    pub const SWEEP_QUARANTINE: &str = "sweep:quarantine";
 
     /// Every background caller with its hourly cap of counted requests per
     /// installation (see [`super::hourly_cap`]).
@@ -119,9 +121,10 @@ pub mod caller {
         (SWEEP_PLUGINS, 60),
         (SWEEP_KNOWLEDGE, 200),
         (SWEEP_LOG_AUTOFIX, 60),
-        (SWEEP_GRAPH, 300),
+        (SWEEP_GRAPH, 250),
         (SWEEP_LEARNING, 100),
         (SWEEP_WEEKLY, 100),
+        (SWEEP_QUARANTINE, 90),
     ];
 }
 

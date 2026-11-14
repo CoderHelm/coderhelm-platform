@@ -1220,6 +1220,14 @@ pub async fn for_run(
     usage: &mut TokenUsage,
     run_id: &str,
 ) -> Option<Evidence> {
+    // A pull request that removes a quarantined test is not a fix: the fix
+    // rules would refuse the deletion as asking less of a test.
+    if msg
+        .ticket_id
+        .starts_with(common::e2e::quarantine::REMOVE_TICKET_PREFIX)
+    {
+        return None;
+    }
     if let Some(ev) = load(state, &msg.team_id, run_id).await {
         return Some(ev);
     }

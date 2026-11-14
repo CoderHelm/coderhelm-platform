@@ -123,6 +123,18 @@ pub fn summary(r: &TestRecord, now: DateTime<Utc>) -> Value {
         "ticket_url": r.ticket_url,
         "fix_pr_url": r.fix_pr_url,
         "fix_status": r.fix_status,
+        // Where a quarantined test stands and what happens next; `null`
+        // for a test that is not quarantined.
+        "quarantine": super::quarantine::standing(r, &s, now),
+        // Whether Coderhelm may start a fix by itself: `eligible`, or why
+        // not.
+        "auto_fix": super::quarantine::auto_hold(r, &s, now)
+            .map(|h| h.code())
+            .unwrap_or("eligible"),
+        "unstable": super::quarantine::unstable(r, now),
+        "release": r.care.release,
+        "removal": r.care.removal,
+        "removed": super::quarantine::is_removed(r),
     })
 }
 
@@ -193,6 +205,7 @@ mod tests {
             fix_branch: None,
             fix_phase_at: None,
             workflow_path: None,
+            care: Default::default(),
             last_seen: String::new(),
             history: vec![
                 e(40, Outcome::Failed, Some(1), vec![]),
