@@ -308,6 +308,75 @@ pub async fn process_relayed(
     process_jira_payload(state, team_id, installation_id, payload).await
 }
 
+/// The labels on a Jira issue (plain strings, or objects with a `name`).
+fn labels_of(issue: &Value) -> Vec<String> {
+    issue
+        .get("fields")
+        .and_then(|f| f.get("labels"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| {
+                    v.as_str().map(|s| s.to_string()).or_else(|| {
+                        v.get("name")
+                            .and_then(|n| n.as_str())
+                            .map(|s| s.to_string())
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Who a Jira issue is assigned to, as the site shows them.
+fn assignee_of(issue: &Value) -> &str {
+    issue
+        .get("fields")
+        .and_then(|f| f.get("assignee"))
+        .and_then(|a| {
+            a.get("displayName")
+                .and_then(|v| v.as_str())
+                .or_else(|| a.get("name").and_then(|v| v.as_str()))
+        })
+        .unwrap_or("")
+}
+
+/// Whether a Jira issue is CoderHelm's to work: (it carries the team's
+/// trigger label, or one that starts with `<label>:`; it is assigned to
+/// CoderHelm). Either one starts a run, and either one is what lets a
+/// comment written before the run be kept for it.
+pub(crate) fn ticket_triggers(issue: &Value, trigger_label: &str) -> (bool, bool) {
+    let label = trigger_label.to_ascii_lowercase();
+    let has_label = labels_of(issue).iter().any(|l| {
+        l.eq_ignore_ascii_case(&label) || l.to_ascii_lowercase().starts_with(&format!("{label}:"))
+    });
+    let is_assigned = assignee_of(issue)
+        .to_ascii_lowercase()
+        .contains("coderhelm");
+    (has_label, is_assigned)
+}
+
+/// The team's trigger label (`coderhelm` unless it set another).
+async fn team_trigger_label(state: &AppState, team_id: &str) -> String {
+    state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.jira_config_table_name)
+        .key("pk", attr_s(team_id))
+        .key("sk", attr_s("JIRA#config"))
+        .send()
+        .await
+        .ok()
+        .and_then(|r| r.item)
+        .and_then(|item| {
+            item.get("trigger_label")
+                .and_then(|v| v.as_s().ok())
+                .cloned()
+        })
+        .filter(|l| !l.is_empty())
+        .unwrap_or_else(|| "coderhelm".to_string())
+}
+
 /// Shared payload processing for both token-based and Forge webhook paths.
 async fn process_jira_payload(
     state: &AppState,
@@ -377,43 +446,10 @@ async fn process_jira_payload(
         .map(|s| s.to_string())
         .unwrap_or_else(|| "coderhelm".to_string());
 
-    // Jira labels can be plain strings or objects with a "name" field
-    let raw_labels = issue
-        .get("fields")
-        .and_then(|f| f.get("labels"))
-        .and_then(|v| v.as_array());
-
-    let issue_labels: Vec<String> = raw_labels
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| {
-                    v.as_str().map(|s| s.to_string()).or_else(|| {
-                        v.get("name")
-                            .and_then(|n| n.as_str())
-                            .map(|s| s.to_string())
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let has_label = issue_labels.iter().any(|l| {
-        l.eq_ignore_ascii_case(&trigger_label)
-            || l.to_ascii_lowercase()
-                .starts_with(&format!("{}:", trigger_label.to_ascii_lowercase()))
-    });
-
-    // Check assignee — trigger if assigned to "coderhelm" (case-insensitive)
-    let assignee_name = issue
-        .get("fields")
-        .and_then(|f| f.get("assignee"))
-        .and_then(|a| {
-            a.get("displayName")
-                .and_then(|v| v.as_str())
-                .or_else(|| a.get("name").and_then(|v| v.as_str()))
-        })
-        .unwrap_or("");
-    let is_assigned = assignee_name.to_ascii_lowercase().contains("coderhelm");
+    // The trigger: the team's label on the ticket, or the ticket assigned
+    // to CoderHelm.
+    let (issue_labels, assignee_name) = (labels_of(issue), assignee_of(issue));
+    let (has_label, is_assigned) = ticket_triggers(issue, &trigger_label);
 
     info!(
         labels = ?issue_labels,
@@ -715,6 +751,10 @@ async fn process_jira_payload(
         return Ok(StatusCode::OK);
     }
 
+    // What people already wrote on the ticket (the app sends its comments
+    // with the event) is kept, so the run reads it before it plans.
+    super::ticket_comments::keep_jira_existing(state, team_id, ticket_key, payload).await;
+
     let message = WorkerMessage::Ticket(TicketMessage {
         team_id: team_id.to_string(),
         installation_id,
@@ -941,11 +981,26 @@ async fn handle_jira_comment(
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
-    // Ignore comments by the bot itself
-    if comment_author.to_ascii_lowercase().contains("coderhelm") {
+    // CoderHelm's own comments (its acknowledgement included) and other
+    // apps' are never read: one of them must never start anything.
+    let author_kind = payload
+        .pointer("/comment/author/accountType")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if !common::ticket_comments::is_person(
+        common::ticket_comments::Source::Jira,
+        comment_author,
+        author_kind,
+        comment_body,
+    ) {
         info!(ticket_key, "Skipping own comment");
         return Ok(StatusCode::OK);
     }
+    let comment_id = match payload.pointer("/comment/id") {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Number(n)) => n.to_string(),
+        _ => String::new(),
+    };
 
     info!(team_id, ticket_key, comment_author, "Jira comment received");
     let requester = payload
@@ -995,7 +1050,41 @@ async fn handle_jira_comment(
     }
 
     let Some(run_item) = run_item_found.as_ref() else {
-        info!(ticket_key, "No runs found for Jira comment — ignoring");
+        // No run yet. The comment is stored only when the ticket is
+        // CoderHelm's to work (its trigger label, or assigned to it): the
+        // run that starts reads it before it plans. A comment on any other
+        // ticket is not stored; if a run starts there later, the event
+        // that starts it brings the ticket's comments.
+        let trigger_label = team_trigger_label(state, team_id).await;
+        let (has_label, is_assigned) = ticket_triggers(issue, &trigger_label);
+        if !common::ticket_comments::stores_before_run(false, has_label, is_assigned) {
+            info!(
+                ticket_key,
+                "No runs found for Jira comment and the ticket isn't CoderHelm's — not stored"
+            );
+            return Ok(StatusCode::OK);
+        }
+        info!(
+            ticket_key,
+            has_label,
+            is_assigned,
+            "No runs found for Jira comment — kept for the run that starts on the ticket"
+        );
+        super::ticket_comments::keep(
+            state,
+            &super::ticket_comments::Incoming {
+                team_id,
+                installation_id,
+                source: common::ticket_comments::Source::Jira,
+                ticket_id: ticket_key,
+                comment_id: &comment_id,
+                author: comment_author,
+                author_kind,
+                text: comment_body,
+                ..Default::default()
+            },
+        )
+        .await;
         return Ok(StatusCode::OK);
     };
 
@@ -1042,19 +1131,45 @@ async fn handle_jira_comment(
         .map(|s| s.as_str())
         .unwrap_or("");
 
-    // A run in flight owns the ticket; the comment waits for it.
-    if matches!(run_status, "running" | "queued" | "awaiting_ci") {
+    // A run is working on the ticket: the comment is kept for it,
+    // acknowledged on the ticket, and read at the run's next step (an
+    // answer to its questions, an instruction, or a request to stop). It
+    // used to be dropped here.
+    if common::ticket_comments::run_working(run_status) {
+        let received = super::ticket_comments::receive(
+            state,
+            &super::ticket_comments::Incoming {
+                team_id,
+                installation_id,
+                source: common::ticket_comments::Source::Jira,
+                ticket_id: ticket_key,
+                comment_id: &comment_id,
+                author: comment_author,
+                author_kind,
+                text: comment_body,
+                title,
+                run_id,
+                run_status,
+                pr_number,
+                repo_owner,
+                repo_name,
+            },
+        )
+        .await?;
         info!(
             ticket_key,
-            run_status, "Ignoring Jira comment — run already in progress"
+            run_status, run_id, "Jira comment kept for the run in progress"
         );
         log_jira_event(
             state,
             team_id,
-            "comment_skipped",
+            "comment_kept",
             ticket_key,
             title,
-            "skipped",
+            match received {
+                super::ticket_comments::Received::Kept(..) => "queued",
+                _ => "duplicate",
+            },
             None,
         )
         .await;
@@ -1434,6 +1549,40 @@ fn base64_decode(input: &str) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_ticket_is_coderhelms_by_its_label_or_its_assignee() {
+        let issue = |labels: Value, assignee: Value| json!({"fields": {"labels": labels, "assignee": assignee}});
+        // Neither: a ticket CoderHelm has nothing to do with.
+        assert_eq!(
+            ticket_triggers(
+                &issue(json!(["backend"]), json!({"displayName": "Pat Doe"})),
+                "coderhelm"
+            ),
+            (false, false)
+        );
+        assert_eq!(ticket_triggers(&json!({}), "coderhelm"), (false, false));
+        // The label, as a string or an object, in any case, or with a repository.
+        assert!(ticket_triggers(&issue(json!(["CoderHelm"]), Value::Null), "coderhelm").0);
+        assert!(
+            ticket_triggers(
+                &issue(json!([{"name": "coderhelm:acme/web"}]), Value::Null),
+                "coderhelm"
+            )
+            .0
+        );
+        // A team's own label.
+        assert!(ticket_triggers(&issue(json!(["ai-fix"]), Value::Null), "AI-Fix").0);
+        assert!(!ticket_triggers(&issue(json!(["coderhelm"]), Value::Null), "ai-fix").0);
+        // Assigned to CoderHelm.
+        assert_eq!(
+            ticket_triggers(
+                &issue(json!([]), json!({"displayName": "Coderhelm for Jira"})),
+                "coderhelm"
+            ),
+            (false, true)
+        );
+    }
 
     #[test]
     fn forge_secret_must_match_exactly() {

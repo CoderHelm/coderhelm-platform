@@ -31,6 +31,7 @@ mod am_description_from_the_head;
 mod an_six_database_findings;
 mod ao_stopped_log_finding;
 mod ap_closed_pr_keeps_findings;
+mod aq_comment_during_run;
 mod ar_description_stamped_to_the_head;
 mod at_round_scope;
 mod ax_github_budget;
