@@ -2117,8 +2117,6 @@ async fn check_and_fix(
         )
         .await;
         let _ = super::update_pass(w.state, &w.msg.team_id, w.run_id, "implement").await;
-        // A bug moved into the app needs files the branch doesn't touch yet.
-        let scoped = bug_problems.is_empty();
         let fixed = super::implement::run(
             w.state,
             w.msg,
@@ -2136,7 +2134,13 @@ async fn check_and_fix(
             // A round stops at the step's deadline: left open-ended, it ran
             // until the time limit cut the whole step off.
             w.deadline,
-            scoped,
+            // A bug moved into the app needs files the branch doesn't touch yet,
+            // and where it lives is what the round finds out.
+            if bug_problems.is_empty() {
+                super::write_guard::RoundFor::TestFix
+            } else {
+                super::write_guard::RoundFor::AppBug
+            },
         )
         .await;
         w.ledger.update(|l| l.test_fix.end_fix());

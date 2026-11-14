@@ -188,6 +188,67 @@ pub struct Budget {
 }
 
 /// The last budget each installation's responses reported, in this process.
+/// A branch CoderHelm moved in this process and has not yet reconciled.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MovedBranch {
+    pub installation_id: u64,
+    pub owner: String,
+    pub repo: String,
+    pub branch: String,
+}
+
+static MOVED: std::sync::LazyLock<Mutex<Vec<MovedBranch>>> =
+    std::sync::LazyLock::new(|| Mutex::new(Vec::new()));
+
+fn note_branch_moved(installation_id: u64, owner: &str, repo: &str, branch: &str) {
+    let m = MovedBranch {
+        installation_id,
+        owner: owner.to_string(),
+        repo: repo.to_string(),
+        branch: branch.to_string(),
+    };
+    if let Ok(mut moved) = MOVED.lock() {
+        if !moved.contains(&m) {
+            moved.push(m);
+        }
+    }
+}
+
+/// The branches moved since the last call, each once.
+pub fn take_moved_branches() -> Vec<MovedBranch> {
+    MOVED
+        .lock()
+        .map(|mut m| std::mem::take(&mut *m))
+        .unwrap_or_default()
+}
+
+/// The branch a request moves when it succeeds, as (owner, repo, branch):
+/// a ref update or creation, a file written or deleted through the
+/// contents API, or a merge into a branch. `None` for every other request.
+pub fn branch_moved_by(method: &str, path: &str, body: &[u8]) -> Option<(String, String, String)> {
+    if !matches!(method, "POST" | "PATCH" | "PUT" | "DELETE") {
+        return None;
+    }
+    let rest = path.strip_prefix("/repos/")?;
+    let mut parts = rest.splitn(3, '/');
+    let (owner, repo, tail) = (parts.next()?, parts.next()?, parts.next()?);
+    let json = || serde_json::from_slice::<serde_json::Value>(body).ok();
+    let field = |k: &str| json().and_then(|v| v[k].as_str().map(String::from));
+    let branch = if let Some(b) = tail.strip_prefix("git/refs/heads/") {
+        // A deleted branch has no head to describe.
+        (method == "PATCH").then(|| b.to_string())?
+    } else if tail == "git/refs" && method == "POST" {
+        field("ref")?.strip_prefix("refs/heads/")?.to_string()
+    } else if tail.starts_with("contents/") && matches!(method, "PUT" | "DELETE") {
+        field("branch")?
+    } else if tail == "merges" && method == "POST" {
+        field("base")?
+    } else {
+        return None;
+    };
+    (!branch.is_empty()).then(|| (owner.to_string(), repo.to_string(), branch))
+}
+
 static BUDGETS: std::sync::LazyLock<Mutex<HashMap<u64, Budget>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -859,6 +920,14 @@ impl GitHubClient {
         &self,
         req: reqwest::RequestBuilder,
     ) -> Result<reqwest::Response, reqwest::Error> {
+        // Every request goes out here, so this is the one place a write that
+        // moves a branch is seen: whoever made it, the branch is noted, and
+        // the description of its pull request is rebuilt for the new head
+        // (`passes::description::reconcile_moved`).
+        let moving = req.try_clone().and_then(|r| r.build().ok()).and_then(|r| {
+            let body = r.body().and_then(|b| b.as_bytes()).unwrap_or_default();
+            branch_moved_by(r.method().as_str(), r.url().path(), body)
+        });
         let resp = match req.send().await {
             Ok(r) => r,
             Err(e) => {
@@ -875,6 +944,9 @@ impl GitHubClient {
         };
         observe_budget(self.installation_id, resp.headers());
         note_limited(self.installation_id, resp.headers(), resp.status().as_u16());
+        if let (Some((owner, repo, branch)), true) = (moving, resp.status().is_success()) {
+            note_branch_moved(self.installation_id, &owner, &repo, &branch);
+        }
         Ok(resp)
     }
 
@@ -5671,6 +5743,136 @@ mod body_limit_tests {
         assert_eq!(bounded_payload(&p), p);
         let p = json!({"sha": "abc", "force": false});
         assert_eq!(bounded_payload(&p), p);
+    }
+
+    /// Every request leaves through `send_tracked`, which notes a branch a
+    /// successful write moved: a new method that pushes cannot pass it by.
+    #[test]
+    fn every_push_is_seen_in_one_place() {
+        let src = include_str!("github.rs");
+        let code = &src[..src.find("#[cfg(test)]\nmod ").unwrap_or(src.len())];
+        // Three sends in all: `send_tracked`, and two reads that mint the
+        // installation's token and name the app. A fourth is a request that
+        // could move a branch unseen.
+        assert_eq!(code.matches(".send()").count(), 3);
+        for raw in [
+            "self.http.put(",
+            "self.http.delete(",
+            "self.http.post(",
+            "self.http.patch(",
+        ] {
+            for (i, _) in code.match_indices(raw) {
+                // To the end of the method that builds it.
+                let rest = &code[i..];
+                let after = &rest[..rest.find("\n    }\n").unwrap_or(rest.len())];
+                assert!(
+                    after.contains("self.send_tracked(req)"),
+                    "a write is built and not sent through send_tracked: {}",
+                    after.lines().next().unwrap_or("")
+                );
+            }
+        }
+        let tracked = &code[code.find("async fn send_tracked(").unwrap()..];
+        let tracked = &tracked[..tracked.find("\n    }\n").unwrap()];
+        assert!(tracked.contains("branch_moved_by("));
+        assert!(tracked.contains("note_branch_moved("));
+        // No pass talks to the refs, contents or merges endpoints itself.
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for e in std::fs::read_dir(dir).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    out.push(p);
+                }
+            }
+        }
+        let mut files = vec![];
+        walk(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/passes"),
+            &mut files,
+        );
+        for f in files {
+            if f.to_string_lossy().contains("/incidents/") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&f).unwrap();
+            // The code, without the file's own tests (which quote GitHub's
+            // error messages, URLs and all).
+            let text = &text[..text.find("#[cfg(test)]").unwrap_or(text.len())];
+            for l in text.lines().filter(|l| !l.trim_start().starts_with("//")) {
+                assert!(
+                    !(l.contains("api.github.com")
+                        && (l.contains("git/refs") || l.contains("/merges"))),
+                    "{} moves a branch past the client: {l}",
+                    f.display()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_request_that_moves_a_branch_names_it() {
+        let moved = |m: &str, p: &str, b: &str| branch_moved_by(m, p, b.as_bytes());
+        let on = |b: &str| Some(("acme".to_string(), "site".to_string(), b.to_string()));
+        assert_eq!(
+            moved(
+                "PATCH",
+                "/repos/acme/site/git/refs/heads/coderhelm/sec-1",
+                r#"{"sha":"a"}"#
+            ),
+            on("coderhelm/sec-1")
+        );
+        assert_eq!(
+            moved(
+                "POST",
+                "/repos/acme/site/git/refs",
+                r#"{"ref":"refs/heads/wip/x","sha":"a"}"#
+            ),
+            on("wip/x")
+        );
+        assert_eq!(
+            moved(
+                "PUT",
+                "/repos/acme/site/contents/package.json",
+                r#"{"branch":"fix","content":""}"#
+            ),
+            on("fix")
+        );
+        assert_eq!(
+            moved(
+                "POST",
+                "/repos/acme/site/merges",
+                r#"{"base":"fix","head":"main"}"#
+            ),
+            on("fix")
+        );
+        // Reads, a deleted branch, a tag, a pull request's body, a commit
+        // object: none moves a branch.
+        for (m, p, b) in [
+            ("GET", "/repos/acme/site/git/refs/heads/fix", ""),
+            ("DELETE", "/repos/acme/site/git/refs/heads/fix", ""),
+            (
+                "POST",
+                "/repos/acme/site/git/refs",
+                r#"{"ref":"refs/tags/v1","sha":"a"}"#,
+            ),
+            ("PATCH", "/repos/acme/site/pulls/7", r#"{"body":"x"}"#),
+            ("POST", "/repos/acme/site/git/commits", r#"{"message":"x"}"#),
+            ("POST", "/app/installations/1/access_tokens", ""),
+        ] {
+            assert_eq!(moved(m, p, b), None, "{m} {p}");
+        }
+        note_branch_moved(7, "acme", "site", "fix");
+        note_branch_moved(7, "acme", "site", "fix");
+        let taken = take_moved_branches();
+        assert_eq!(
+            taken
+                .iter()
+                .filter(|m| m.branch == "fix" && m.installation_id == 7)
+                .count(),
+            1
+        );
     }
 
     /// Every method that writes a body sends it through `post`, `patch` or

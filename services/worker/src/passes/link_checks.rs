@@ -1368,7 +1368,7 @@ async fn check_and_fix(
             w.file_cache,
             Some(w.run_id),
             w.deadline,
-            true, // bot-driven link fix — scoped to the PR
+            super::write_guard::RoundFor::LinkFix,
         )
         .await;
         w.ledger.update(|l| l.links.end_fix());

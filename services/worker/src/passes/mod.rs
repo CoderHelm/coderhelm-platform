@@ -3951,6 +3951,8 @@ async fn run_passes(
             timed_out: false,
             conversation_log: vec![],
             writes: Default::default(),
+            outside_plan: Vec::new(),
+            refused: Vec::new(),
             // The first attempt's lookups weren't kept; the proof check's
             // fix round can make them again.
             evidence: proof::RunEvidence {
@@ -4341,9 +4343,9 @@ async fn run_passes(
                         &file_cache,
                         Some(run_id),
                         implement_deadline,
-                        // Scoped only when purely CI-driven; human review comments
-                        // in the feedback mean the human's ask wins (unscoped).
-                        !has_review_feedback,
+                        // Bot-driven fix cycle. Human review comments riding along
+                        // in the feedback mean the human's ask wins (no boundary).
+                        write_guard::RoundFor::CiFix.unless_person(has_review_feedback),
                     )
                     .await
                     .and_then(|r| {
@@ -5308,7 +5310,7 @@ async fn run_passes(
                 &file_cache,
                 Some(run_id),
                 implement_deadline,
-                false, // initial implement — unscoped
+                write_guard::RoundFor::Build,
             )
             .await?
         };
@@ -5376,7 +5378,7 @@ async fn run_passes(
                             &file_cache,
                             Some(run_id),
                             implement_deadline,
-                            false,
+                            write_guard::RoundFor::Build,
                         )
                         .await?;
                     }
@@ -5586,7 +5588,7 @@ async fn run_passes(
                     &file_cache,
                     Some(run_id),
                     implement_deadline,
-                    false,
+                    write_guard::RoundFor::Build,
                 )
                 .await?;
                 if again.files_modified.is_empty() {
@@ -6138,7 +6140,7 @@ async fn run_passes(
                 // Stops at the step deadline, never relying on the
                 // invocation being cut off.
                 implement_deadline,
-                true, // bot-driven test-fix — scoped to the PR
+                write_guard::RoundFor::TestFix,
             )
             .await
             {
@@ -6267,7 +6269,7 @@ async fn run_passes(
                     // Stops at the step deadline, never relying on the
                     // invocation being cut off.
                     implement_deadline,
-                    true, // bot-driven security fix — scoped to the PR
+                    write_guard::RoundFor::SecurityFix,
                 )
                 .await?;
                 write_conversation_log(
@@ -7594,7 +7596,7 @@ async fn run_repo_pipeline(
         file_cache,
         Some(run_id),
         implement_deadline,
-        false, // initial implement — unscoped
+        write_guard::RoundFor::Build,
     )
     .await?;
     write_pass_trace(
@@ -7793,7 +7795,7 @@ async fn run_repo_pipeline(
                 &fix_cache,
                 Some(run_id),
                 None,
-                true, // bot-driven test-fix — scoped to the PR
+                write_guard::RoundFor::TestFix,
             )
             .await
             {
@@ -7884,7 +7886,7 @@ async fn run_repo_pipeline(
                 file_cache,
                 Some(run_id),
                 None,
-                true, // bot-driven security fix — scoped to the PR
+                write_guard::RoundFor::SecurityFix,
             )
             .await?;
             write_conversation_log(
@@ -12845,12 +12847,30 @@ pub(crate) async fn run_plan_files(
     state: &WorkerState,
     msg: &TicketMessage,
 ) -> Option<plan::PlanResult> {
-    let prefix = openspec_prefix(
+    plan_files_of(
+        state,
         &msg.team_id,
         &msg.ticket_id,
         &msg.repo_owner,
         &msg.repo_name,
-    );
+    )
+    .await
+}
+
+/// The plan files cached for a ticket and repository, by their names: for a
+/// round that has the run's record and no ticket message. `None` when the
+/// ticket is unknown or no plan with tasks is cached.
+pub(crate) async fn plan_files_of(
+    state: &WorkerState,
+    team_id: &str,
+    ticket_id: &str,
+    owner: &str,
+    repo: &str,
+) -> Option<plan::PlanResult> {
+    if ticket_id.trim().is_empty() {
+        return None;
+    }
+    let prefix = openspec_prefix(team_id, ticket_id, owner, repo);
     load_cached_plan_files(state, &prefix)
         .await
         .filter(|p| !p.tasks.trim().is_empty())

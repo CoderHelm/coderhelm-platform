@@ -134,6 +134,11 @@ pub struct ImplementResult {
     /// The writes GitHub refused or rejected: a pass that wrote no file
     /// because GitHub refused it did write (see `run_end`).
     pub writes: super::run_end::Writes,
+    /// Existing files outside the plan's files the round edited, with why
+    /// (`write_guard`): recorded on the pull request.
+    pub outside_plan: Vec<(String, String)>,
+    /// Edits the round was refused and never made.
+    pub refused: Vec<super::write_guard::Refusal>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -152,12 +157,13 @@ pub async fn run(
     file_cache: &FileCache,
     run_id: Option<&str>,
     deadline: Option<std::time::Instant>,
-    // Restrict edits to the PR's already-changed files. Callers pass true ONLY
-    // for purely bot/CI-driven fix cycles; any cycle carrying HUMAN feedback
-    // must pass false — a human asking for an out-of-diff change is
-    // authorization, not overreach. Never inferred from review_feedback (that
-    // parameter also carries human review comments).
-    scope_to_pr: bool,
+    // What the round is for: it decides which existing files the round may
+    // edit (`write_guard`). The build and a person's ask have no file
+    // boundary; a round CoderHelm started for a gap, a finding or a failing
+    // check may edit the pull request's files, the plan's, and the ones its
+    // instructions (`review_feedback`) name. Never inferred from
+    // review_feedback alone: that parameter also carries a person's comments.
+    round_for: super::write_guard::RoundFor,
 ) -> Result<ImplementResult, Box<dyn std::error::Error + Send + Sync>> {
     // Every code-writing round goes through here, so a run the guard stopped
     // writes nothing more, whoever asked.
@@ -410,18 +416,34 @@ pub async fn run(
         None => None,
     };
 
-    // Purely bot/CI-driven fix cycles are scoped to the files the PR already
-    // changed: a lint/type warning in an untouched file pre-exists on the base
-    // branch and is out of ticket scope — fixing it is the unrelated-file churn
-    // this guard kills. Initial implement and human-directed cycles run
-    // unscoped. Listing failure → unscoped (fail open; never brick a fix cycle
-    // on an API hiccup).
-    let scope_guard = if scope_to_pr {
+    // A round CoderHelm started for a gap, a finding or a failing check may
+    // edit the files the pull request changes, the plan's task files and
+    // dependents, and the files its instructions name (`write_guard`): a
+    // lint warning in a file none of those name was there before the change,
+    // and fixing it is the unrelated churn the guard stops. The build and a
+    // person's ask have no boundary. Listing failure: no boundary (fail
+    // open; never brick a fix round on an API hiccup).
+    let scope_guard = if round_for.bounded() {
         match github
             .compare_changed_files(&msg.repo_owner, &msg.repo_name, &msg.base_branch, branch)
             .await
         {
-            Ok(files) => super::write_guard::ScopeGuard::scoped(files),
+            Ok(files) => {
+                // A round on the pull request carries no plan of its own:
+                // the run's cached plan says which files are its tasks'.
+                let cached = if plan.tasks.trim().is_empty() {
+                    super::run_plan_files(state, msg).await
+                } else {
+                    None
+                };
+                super::write_guard::ScopeGuard::for_round(
+                    round_for,
+                    &files,
+                    Some(cached.as_ref().unwrap_or(plan)),
+                    &format!("{}/{}", msg.repo_owner, msg.repo_name),
+                    review_feedback.unwrap_or_default(),
+                )
+            }
             Err(e) => {
                 warn!(error = %e, "Could not list PR files — fix cycle runs unscoped");
                 super::write_guard::ScopeGuard::unscoped()
@@ -440,6 +462,14 @@ pub async fn run(
     } else {
         all_tools()
     };
+
+    // A bounded round's write tools take the reason for an edit outside
+    // its files.
+    if scope_guard.bounded() {
+        for t in tools.iter_mut().filter(|t| is_write_tool(&t.name)) {
+            super::write_guard::offer_reason(&t.name, &mut t.input_schema);
+        }
+    }
 
     // Offer the sandbox verifier only when it can actually run for this repo.
     if sandbox.is_some() && checks_cmd.is_some() {
@@ -1172,15 +1202,27 @@ pub async fn run(
         .clone();
     let ci_gates = super::checks::kinds_from(&ci);
     let writes = std::mem::take(&mut *executor.write_executor.writes.lock().unwrap());
+    // The edits outside the plan's files the round made, with why: the
+    // habits check reads them from the notes, and the pull request lists
+    // them. The edits it was refused and never made are the round's to
+    // report (`supervisor::progressed`).
+    let outside_plan = executor.write_executor.scope_guard.outside();
+    let refused = executor.write_executor.scope_guard.refused();
+    let notes = match super::write_guard::ScopeGuard::evidence_lines(&outside_plan) {
+        lines if lines.is_empty() => closing.trim().to_string(),
+        lines => format!("{}\n{lines}", closing.trim()),
+    };
     Ok(ImplementResult {
         files_modified: files,
         timed_out,
         conversation_log: conv_log,
         writes,
+        outside_plan,
+        refused,
         evidence: super::proof::RunEvidence {
             sources,
             lookups,
-            notes: closing.trim().to_string(),
+            notes,
             checks,
             sandbox,
             ci_gates,
@@ -1741,8 +1783,8 @@ struct WriteToolExecutor<'a> {
     /// Public per-repo codegen env (e.g. Sanity projectId/dataset) passed to the
     /// sandbox codegen build. Never a secret — see `load_codegen_env`.
     codegen_env: Vec<(String, String)>,
-    /// Ticket-scope guard: in FIX cycles, writes are restricted to files the PR
-    /// already changed (bounded escape). Unscoped on initial implement.
+    /// Which existing files the round may edit, by what it is for
+    /// (`write_guard`). No boundary on the build and a person's ask.
     scope_guard: super::write_guard::ScopeGuard,
     /// Node major version to switch the sandbox to (None -> buildspec default).
     node_version: Option<String>,
@@ -2005,6 +2047,8 @@ impl<'a> WriteToolExecutor<'a> {
                     .and_then(|v| v.as_str())
                     .ok_or("Missing path")?;
                 if is_protected_path(path) {
+                    self.scope_guard
+                        .refuse(path, super::write_guard::PROTECTED_WHY);
                     note(LogOutcome::soft_fail("not written: a protected CI/CD file"));
                     return Ok(json!(format!(
                         "Cannot modify {path}: CI/CD workflow files are protected. \
@@ -2057,13 +2101,14 @@ impl<'a> WriteToolExecutor<'a> {
                         note(LogOutcome::soft_fail("rejected: a generated file"));
                         return Ok(json!(generated_file_reject(path)));
                     }
-                    // Ticket-scope guard: EDITS of existing out-of-PR files only —
-                    // creating a genuinely-needed new file is never blocked.
-                    if self.scope_guard.should_block(path) {
-                        note(LogOutcome::soft_fail(
-                            "rejected: outside the ticket's files",
-                        ));
-                        return Ok(json!(super::write_guard::ScopeGuard::reject_msg(path)));
+                    // The round's files: EDITS of existing files only —
+                    // creating a needed new file is never refused.
+                    if let Err(refusal) = self
+                        .scope_guard
+                        .check(path, super::write_guard::reason_input(input))
+                    {
+                        note(LogOutcome::soft_fail("refused: outside the round's files"));
+                        return Ok(json!(refusal));
                     }
                     if let Some(problem) = validate_edit_safety(old, content, path) {
                         note(LogOutcome::soft_fail("rejected: it would gut the file"));
@@ -2095,6 +2140,10 @@ impl<'a> WriteToolExecutor<'a> {
                     )
                     .await?;
                 self.files_modified.lock().unwrap().insert(path.to_string());
+                // A file the round created is the round's from here on.
+                if existing.is_none() {
+                    self.scope_guard.allow(path);
+                }
                 self.file_cache
                     .remove(&format!("{}:{}", self.branch, path))
                     .await;
@@ -2108,6 +2157,8 @@ impl<'a> WriteToolExecutor<'a> {
                     .and_then(|v| v.as_str())
                     .ok_or("Missing path")?;
                 if is_protected_path(path) {
+                    self.scope_guard
+                        .refuse(path, super::write_guard::PROTECTED_WHY);
                     note(LogOutcome::soft_fail("not edited: a protected CI/CD file"));
                     return Ok(json!(format!(
                         "Cannot modify {path}: CI/CD workflow files are protected."
@@ -2116,12 +2167,6 @@ impl<'a> WriteToolExecutor<'a> {
                 if let Some(refusal) = lockfile_write_refusal(path) {
                     note(LogOutcome::soft_fail(LOCKFILE_REFUSED));
                     return Ok(json!(refusal));
-                }
-                if self.scope_guard.should_block(path) {
-                    note(LogOutcome::soft_fail(
-                        "rejected: outside the ticket's files",
-                    ));
-                    return Ok(json!(super::write_guard::ScopeGuard::reject_msg(path)));
                 }
                 let edits = &tool_edits(input)?;
                 let message = input
@@ -2139,6 +2184,16 @@ impl<'a> WriteToolExecutor<'a> {
                         .read_file(&self.owner, &self.repo, path, &self.branch)
                         .await?
                 };
+                // The round's files. Asked once the file was read: a path
+                // that isn't there fails as "not found", never as a refusal
+                // a reason would then turn into that same failure.
+                if let Err(refusal) = self
+                    .scope_guard
+                    .check(path, super::write_guard::reason_input(input))
+                {
+                    note(LogOutcome::soft_fail("refused: outside the round's files"));
+                    return Ok(json!(refusal));
+                }
                 // Apply edits atomically via the shared search/replace applier —
                 // ALL must match uniquely or NOTHING is written (committing the
                 // subset that happened to match left half-done changes on the
@@ -2234,12 +2289,16 @@ impl<'a> WriteToolExecutor<'a> {
                     .ok_or("Missing files")?;
                 let mut ops = Vec::new();
                 let mut skipped = Vec::new();
+                // The files this batch creates: the round's own once committed.
+                let mut created: Vec<String> = Vec::new();
                 for f in files_arr {
                     let path = f
                         .get("path")
                         .and_then(|v| v.as_str())
                         .ok_or("Missing file path")?;
                     if is_protected_path(path) {
+                        self.scope_guard
+                            .refuse(path, super::write_guard::PROTECTED_WHY);
                         skipped.push(path.to_string());
                         continue;
                     }
@@ -2281,6 +2340,9 @@ impl<'a> WriteToolExecutor<'a> {
                                 .await
                                 .ok(),
                         };
+                        if bw_existing.is_none() {
+                            created.push(path.to_string());
+                        }
                         if let Some(old) = &bw_existing {
                             if self.should_block_generated(path, old) {
                                 note(LogOutcome::soft_fail("nothing committed: a generated file"));
@@ -2290,15 +2352,19 @@ impl<'a> WriteToolExecutor<'a> {
                                      it; never hand-edit it. Nothing was committed."
                                 )));
                             }
-                            // Ticket-scope guard: EDITS of existing out-of-PR files
-                            // only — new-file creation is never blocked.
-                            if self.scope_guard.should_block(path) {
+                            // The round's files: EDITS of existing files
+                            // only — new-file creation is never refused.
+                            if let Err(refusal) = self
+                                .scope_guard
+                                .check(path, super::write_guard::reason_input(f))
+                            {
                                 note(LogOutcome::soft_fail(
-                                    "nothing committed: outside the ticket's files",
+                                    "nothing committed: outside the round's files",
                                 ));
                                 return Ok(json!(format!(
-                                    "Batch write REJECTED — {}. Nothing was committed.",
-                                    super::write_guard::ScopeGuard::reject_msg(path)
+                                    "Batch write REJECTED: nothing was committed. {refusal} In \
+                                     a batch, `{}` goes on that file's entry.",
+                                    super::write_guard::REASON_INPUT
                                 )));
                             }
                             if let Some(problem) = validate_edit_safety(old, content, path) {
@@ -2334,6 +2400,9 @@ impl<'a> WriteToolExecutor<'a> {
                 // Bookkeeping only after the commit actually landed — doing it
                 // inside the build loop recorded files as modified even when a
                 // later file rejected the whole batch.
+                for p in &created {
+                    self.scope_guard.allow(p);
+                }
                 for op in &ops {
                     let path = match op {
                         FileOp::Write { path, .. } | FileOp::Delete { path } => path,
@@ -2417,6 +2486,8 @@ impl<'a> WriteToolExecutor<'a> {
                     .and_then(|v| v.as_str())
                     .ok_or("Missing path")?;
                 if is_protected_path(path) {
+                    self.scope_guard
+                        .refuse(path, super::write_guard::PROTECTED_WHY);
                     note(LogOutcome::soft_fail(
                         "not restored: a protected CI/CD file",
                     ));
@@ -2424,13 +2495,14 @@ impl<'a> WriteToolExecutor<'a> {
                         "Cannot modify {path}: CI/CD workflow files are protected."
                     )));
                 }
-                // An out-of-scope file is identical to base in this PR — a
-                // "restore" of it is either a no-op commit or out-of-scope churn.
-                if self.scope_guard.should_block(path) {
-                    note(LogOutcome::soft_fail(
-                        "rejected: outside the ticket's files",
-                    ));
-                    return Ok(json!(super::write_guard::ScopeGuard::reject_msg(path)));
+                // A file outside the round's files is identical to base in
+                // this PR — a "restore" of it is a no-op commit or churn.
+                if let Err(refusal) = self
+                    .scope_guard
+                    .check(path, super::write_guard::reason_input(input))
+                {
+                    note(LogOutcome::soft_fail("refused: outside the round's files"));
+                    return Ok(json!(refusal));
                 }
                 // Default to the PR's base branch — restoring an out-of-scope file
                 // to base is exactly how you remove the out-of-scope change.

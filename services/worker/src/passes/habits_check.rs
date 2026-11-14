@@ -695,6 +695,85 @@ pub fn shape_body(body: String, section: &str) -> String {
     }
 }
 
+const OUTSIDE_HEADING: &str = "**Changed outside the plan's files**";
+
+/// The description with these files added to the section's "Changed
+/// outside the plan's files" list, each with why: the record of the edits a
+/// round on the pull request made outside the plan (`write_guard`). A file
+/// already listed takes the new reason. `body` unchanged when there is
+/// nothing to add.
+pub fn with_outside(body: &str, entries: &[(String, String)]) -> String {
+    if entries.is_empty() {
+        return body.to_string();
+    }
+    let current = current_section(body);
+    let mut inner: Vec<String> = if current.is_empty() {
+        vec![
+            START.to_string(),
+            "### Before and after the code".to_string(),
+        ]
+    } else {
+        current
+            .trim_end_matches(END)
+            .trim_end()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    };
+    let heading = match inner.iter().position(|l| l.trim() == OUTSIDE_HEADING) {
+        Some(i) => i,
+        None => {
+            if inner.len() > 2 {
+                inner.push(String::new());
+            }
+            inner.push(OUTSIDE_HEADING.to_string());
+            inner.len() - 1
+        }
+    };
+    for (path, why) in entries {
+        let line = format!("- `{path}`: {why}");
+        let start = format!("- `{path}`:");
+        match inner
+            .iter()
+            .skip(heading)
+            .position(|l| l.starts_with(&start))
+        {
+            Some(i) => inner[heading + i] = line,
+            None => inner.push(line),
+        }
+    }
+    inner.push(END.to_string());
+    shape_body(body.to_string(), &inner.join("\n"))
+}
+
+/// Writes the files a round edited outside the plan's, with why, into the
+/// pull request's description ([`with_outside`]). A description that can't
+/// be read or saved is left as it is: the reasons are in the run's notes.
+pub async fn record_outside(
+    github: &crate::clients::github::GitHubClient,
+    owner: &str,
+    repo: &str,
+    number: u64,
+    entries: &[(String, String)],
+) {
+    if entries.is_empty() {
+        return;
+    }
+    let body = match github.get_pull_request(owner, repo, number).await {
+        Ok(p) => p["body"].as_str().unwrap_or("").to_string(),
+        Err(e) => {
+            warn!(error = %e, "Could not read the PR to record the files changed outside the plan");
+            return;
+        }
+    };
+    let updated = with_outside(&body, entries);
+    if updated != body {
+        if let Err(e) = super::description::save(github, owner, repo, number, &updated).await {
+            warn!(error = %e, "Could not record the files changed outside the plan on the PR");
+        }
+    }
+}
+
 // ── The sandbox ────────────────────────────────────────────────────────────
 
 /// Runs the test files in the sandbox on the branch and on a temporary
@@ -993,7 +1072,9 @@ async fn check_and_fix(
             w.file_cache,
             Some(w.run_id),
             w.deadline,
-            true,
+            // The plan's files and the dependents it updates are this round's:
+            // "update it" names a file the branch doesn't touch.
+            super::write_guard::RoundFor::Habits,
         )
         .await;
         w.ledger.update(|l| l.habits.end_fix());
@@ -1368,6 +1449,57 @@ mod tests {
         let done = PrFacts::default();
         assert!(section(&p, &done)
             .contains("- `src/invoice/pdf.ts` (uses cartTotal): updated in this pull request"));
+    }
+
+    /// The edits a round on the pull request made outside the plan's files
+    /// are listed on the pull request with why, and the description around
+    /// the section is left as it is.
+    #[test]
+    fn a_rounds_edits_outside_the_plan_are_listed_on_the_pull_request() {
+        let entry = |p: &str, w: &str| (p.to_string(), w.to_string());
+        // No section yet: one is added with the list.
+        let body = "## Summary\nAdds the gift route.\n";
+        let first = with_outside(
+            body,
+            &[entry(
+                "src/lib/metadata.ts",
+                "the gift route's metadata is built here",
+            )],
+        );
+        assert!(first.starts_with("## Summary\nAdds the gift route."));
+        assert!(first.contains(START) && first.contains(END));
+        assert!(first.contains(
+            "**Changed outside the plan's files**\n- `src/lib/metadata.ts`: the gift route's metadata is built here"
+        ));
+        // A section with a list: a new file is added, a listed one takes
+        // the new reason, nothing is listed twice.
+        let second = with_outside(
+            &first,
+            &[
+                entry("src/nav/links.ts", "named by the review findings"),
+                entry("src/lib/metadata.ts", "the title helper moved here"),
+            ],
+        );
+        assert_eq!(
+            second
+                .matches("**Changed outside the plan's files**")
+                .count(),
+            1
+        );
+        assert_eq!(second.matches("`src/lib/metadata.ts`").count(), 1);
+        assert!(second.contains("- `src/lib/metadata.ts`: the title helper moved here"));
+        assert!(second.contains("- `src/nav/links.ts`: named by the review findings"));
+        assert_eq!(second.matches(START).count(), 1);
+        // A section that says other things keeps them.
+        let with_tests = format!(
+            "## Summary\nx\n\n{START}\n### Before and after the code\n**The tests fail without the change**\n- `a.test.ts`: fails without, passes with\n{END}\n"
+        );
+        let third = with_outside(&with_tests, &[entry("src/a.ts", "the test imports it")]);
+        assert!(third.contains("- `a.test.ts`: fails without, passes with"));
+        assert!(third
+            .contains("**Changed outside the plan's files**\n- `src/a.ts`: the test imports it"));
+        // Nothing to add: unchanged.
+        assert_eq!(with_outside(body, &[]), body);
     }
 
     #[test]
