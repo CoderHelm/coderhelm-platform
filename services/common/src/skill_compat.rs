@@ -120,7 +120,7 @@ pub struct Inventory {
     #[serde(default)]
     pub translations: Vec<Translation>,
     /// Monitoring, docs and pipeline connections the team can set up in
-    /// Settings → Integrations but hasn't, by `id: what it reads` (metrics
+    /// Settings under Integrations but hasn't, by `id: what it reads` (metrics
     /// and Airflow are abilities of a connected AWS account).
     #[serde(default)]
     pub connections: Vec<String>,
@@ -2093,7 +2093,7 @@ mod tests {
         assert_eq!(q.link, "/settings/integrations#integration-aws");
         assert_eq!(
             q.fix,
-            "Turn on CloudWatch metrics for your AWS account in Settings → Integrations."
+            "Turn on CloudWatch metrics for your AWS account in Settings under Integrations."
         );
         let q = check(conn_req("missing", "airflow", "none"), &inv());
         assert_eq!(q.link, "/settings/integrations#integration-aws");
@@ -2124,7 +2124,7 @@ mod tests {
         assert_eq!(q.connection, "confluence");
         assert_eq!(q.action, "connect");
         assert!(
-            q.fix.starts_with("Connect Confluence in Settings → Integrations, or install the Coderhelm app in Jira"),
+            q.fix.starts_with("Connect Confluence in Settings under Integrations, or install the Coderhelm app in Jira"),
             "{}",
             q.fix
         );

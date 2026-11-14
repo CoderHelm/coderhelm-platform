@@ -938,11 +938,15 @@ mod tests {
         let note = common::run_questions::answers_note(&fx.folded);
         assert!(note.contains("Answer from Pat Doe: Production only."));
         assert!(note.contains("Also rename the flag."));
-        // No round, no restart, no stop, nothing more said on the ticket.
+        // No round, no restart, no stop; the answer is acknowledged in a
+        // reply to it.
         assert_eq!(fx.round, None);
         assert_eq!(fx.restart, None);
         assert_eq!(fx.stop_by, None);
-        assert_eq!(fx.reply, None);
+        assert!(fx
+            .reply
+            .as_deref()
+            .is_some_and(|r| r.contains("in the plan I'm making now")));
         // Kept on the ticket for later runs; the chatter isn't.
         assert_eq!(fx.ticket_notes.len(), 2);
         // The run page says what was done with each of the three.

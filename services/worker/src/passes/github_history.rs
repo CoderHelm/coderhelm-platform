@@ -1032,7 +1032,7 @@ mod tests {
             json!({"number":6,"title":"Other","head":{"ref":"x"},"base":{"ref":"main"},"user":{"login":"bo"},"merged_at":null,"labels":[],"state":"closed","updated_at":"2026-10-03T00:00:00Z"}),
         ];
         let t = fmt_pulls(&prs, true, Some("deploy"), Some("2026-10-01T00:00:00Z"), 30);
-        assert!(t.contains("#5 Deploy — develop → main, by amy, merged 2026-10-02T10:00Z, labels: Deploy, merge commit 1234567"), "{t}");
+        assert!(t.contains("#5 Deploy — develop to main, by amy, merged 2026-10-02T10:00Z, labels: Deploy, merge commit 1234567"), "{t}");
         assert!(!t.contains("#6"));
         let blame = json!({"repository":{"object":{"blame":{"ranges":[{"startingLine":1,"endingLine":5,"commit":{"oid":"aaaaaaa1","committedDate":"2026-09-01T00:00:00Z","messageHeadline":"Add","author":{"name":"Amy","user":{"login":"amy"}}}},{"startingLine":6,"endingLine":9,"commit":{"oid":"bbbbbbb2","committedDate":"2026-09-02T00:00:00Z","messageHeadline":"Tweak","author":{"name":"Bo","user":null}}}]}}}});
         let b = fmt_blame(&blame, 4, 7);

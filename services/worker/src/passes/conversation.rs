@@ -528,7 +528,6 @@ mod tests {
             ".reply_to_review_comment(",
             "post_jira_comment(",
             "post_jira_comment_link(",
-            "\"add_comment_url\")",
             "/comments\", ",
             "}/comments\")",
             "/comments\"),",

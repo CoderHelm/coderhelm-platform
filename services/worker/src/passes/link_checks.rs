@@ -1809,7 +1809,7 @@ mod tests {
         let sec = r.section();
         assert!(sec.starts_with(START) && sec.ends_with(END));
         assert!(sec.contains(
-            "`https://go.example.com/old-plan`: 301 → `https://www.example.com/change-plan-form`"
+            "`https://go.example.com/old-plan`: 301 to `https://www.example.com/change-plan-form`"
         ));
         assert!(sec.contains("`/plan-change`: 200 · \"Plan Change \\| Example\""));
         assert!(sec.contains("was `/change-plan-form`: 404"));
