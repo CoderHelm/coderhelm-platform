@@ -3316,6 +3316,22 @@ impl GitHubClient {
         .await
     }
 
+    /// Close an issue as completed (a ticket CoderHelm filed that is no
+    /// longer needed).
+    pub async fn close_issue(
+        &self,
+        owner: &str,
+        repo: &str,
+        issue_number: u64,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!("{API_BASE}/repos/{owner}/{repo}/issues/{issue_number}");
+        self.patch(
+            &url,
+            &serde_json::json!({"state": "closed", "state_reason": "completed"}),
+        )
+        .await
+    }
+
     /// Close a pull request.
     pub async fn close_pull_request(
         &self,
