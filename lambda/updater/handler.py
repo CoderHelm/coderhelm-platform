@@ -25,6 +25,9 @@ Actions (the `action` field of the event):
             answers with that update.
 - rollback  starts the build for the version before the last update, or an
             admin's pick, which must be a version this install ran before.
+            Away from a release failing its health check it is one call:
+            no review (data replaced or removed only with
+            `accept_data_changes`), applied once its change set is made.
 - apply_update  a native install: an admin applies the prepared update that
             waits for them (review), from Settings, System. When it would
             replace or remove data or change permissions, only with
@@ -39,7 +42,12 @@ Actions (the `action` field of the event):
 - domain_status  the domain's state, its certificate and the DNS records to
             add, and moves it along: once the certificate is issued it starts
             the build that puts the domain on CloudFront (mode "domain").
-            Also every 5 minutes (EventBridge).
+            Also every 5 minutes (EventBridge, `scheduled`), which on an
+            install with an update build also runs the post-update watch.
+- native_poll  every 5 minutes: follows a proposed or running stack update,
+            then watches a release it just installed (watch_step): the
+            worker's health probe and its error rate, and an automatic
+            rollback when either fails.
 - domain_remove  back to the AWS (CloudFront) address.
 - open_window  a hardened install's update build asks for its deploy window
             (infra/lib/access.ts). Only for the build this updater started,
@@ -4066,6 +4074,11 @@ def native_poll(store, env, now, cfn=None, wait=False):
                 c = entry["consent"]
                 entry["confirmed"] = {"by": c.get("by"), "at": c.get("at"), "data_changes": [],
                                       "permission_changes": entry["permission_changes"], "on": "update"}
+            elif entry.get("recovery") and (entry.get("permission_changes") or entry.get("data_changes")):
+                # A rollback away from a failing release: what it changed, and who started it.
+                c = entry["recovery"]
+                entry["confirmed"] = {"by": c.get("by"), "at": c.get("at"), "data_changes": entry.get("data_changes") or [],
+                                      "permission_changes": entry.get("permission_changes") or [], "on": "recovery"}
             store.put(hid, entry)
             return {"native": "executing"}
         if entry.get("status") != "review":
@@ -4254,6 +4267,395 @@ def stack_version(stack):
     return None
 
 
+# ── After an update: is the new release healthy? ─────────────────────────
+#
+# GET /api/me (answers_after) only proves the gateway answers. A release
+# whose worker crashes on every event (v0.8.108: a stack overflow before the
+# first line ran) passes that, and every job then fails until someone rolls
+# back. So for WATCH_WINDOW after every update the scheduled poll (native:
+# native_poll; an install with an update build: domain_status, both every 5
+# minutes) watches the new worker:
+#
+# - the probe: `{"health": {}}` through the worker's real entry path
+#   (services/worker/src/main.rs, health). PROBE_ATTEMPTS failures in a row,
+#   PROBE_PAUSE apart, fail it; one answer passes it. A call that couldn't be
+#   made (throttled, refused) says nothing about the release and never counts.
+# - the errors: CloudWatch's Errors against Invocations for the worker and
+#   the gateway since the update, against the hour before. A function trips
+#   it at ERROR_RATE or more of at least MIN_INVOCATIONS calls, and at least
+#   ERROR_RISE above its own rate the hour before (an install that already
+#   failed often isn't rolled back for that).
+#
+# Either one rolls the install back by itself to the release it came from
+# (always one it ran), with no review: permission changes of the rollback
+# are applied as for an admin's press, and only replacing or removing data
+# still waits for a person (that one isn't CoderHelm's to decide). Admins are
+# told what was seen, which release and that it went back; when the rollback
+# can't start or fails they are told loudly, and nothing is tried again.
+#
+# No earlier point exists: the worker has no Lambda versions or aliases, and
+# a stack update replaces its code in place, so the first invocation of the
+# new code already takes traffic. The probe runs right after UPDATE_COMPLETE.
+
+WATCH = "WATCH"
+WATCH_WINDOW = timedelta(minutes=10)
+WATCH_START_LIMIT = timedelta(minutes=30)  # an update finished longer ago than this is not watched
+PROBE_ATTEMPTS = 4
+PROBE_PAUSE = 30          # seconds between two probes
+PROBE_TIMEOUT = 30        # seconds the worker has to answer one
+MIN_INVOCATIONS = 5
+ERROR_RATE = 0.5
+ERROR_RISE = 0.25
+RECOVERY_WAIT = 90        # seconds the automatic rollback waits here for its change set before the poll takes over
+RECOVERY_CALL_WAIT = 20   # the same for a person's Roll back (the page's own polling applies it after)
+RECOVERY_PAUSE = 5
+RECOVERY_VERIFY_LIMIT = timedelta(minutes=45)  # waiting longer for the release check of the target fails the rollback
+AUTO_ROLLBACK_ACTOR = "auto-rollback"
+HEALTH_PROBE = None       # tests replace it; None is probe_worker
+METRICS = None            # tests replace it; None is error_rates
+_deadline = None          # this invocation's end (handler sets it; none in tests)
+
+
+def time_left():
+    return None if _deadline is None else _deadline - _clock()
+
+
+def probe_client():
+    """A Lambda client that gives up on the worker after PROBE_TIMEOUT, and never retries a call."""
+    if "lambda-probe" not in _clients:
+        import boto3
+        from botocore.config import Config
+        _clients["lambda-probe"] = boto3.client("lambda", config=Config(
+            read_timeout=PROBE_TIMEOUT, connect_timeout=5, retries={"max_attempts": 1, "mode": "standard"}))
+    return _clients["lambda-probe"]
+
+
+def probe_worker(env, lam=None):
+    """("ok" | "fail" | "unknown", detail): the worker's answer to `{"health": {}}`."""
+    fn = env.get("WORKER_FUNCTION_NAME")
+    if not fn:
+        return "unknown", "this install names no worker function"
+    try:
+        r = (lam or probe_client()).invoke(FunctionName=fn, InvocationType="RequestResponse", Payload=b'{"health":{}}')
+    except Exception as e:  # noqa: BLE001
+        if "timeout" in type(e).__name__.lower() or "timed out" in str(e).lower():
+            return "fail", f"the worker didn't answer within {PROBE_TIMEOUT} seconds"
+        # Throttled, refused, unreachable: nothing about the release.
+        return "unknown", f"couldn't ask the worker ({type(e).__name__}: {str(e)[:200]})"
+    body = r["Payload"].read() if r.get("Payload") is not None else b""
+    text = (body or b"")[:400].decode("utf-8", "replace")
+    if r.get("FunctionError"):
+        if "missing field" in text and "Records" in text:
+            # A worker from before the probe reads the event as a queue batch.
+            return "unknown", "this worker doesn't answer the health probe"
+        return "fail", f"the worker failed: {text}"
+    try:
+        answer = json.loads(body or b"{}")
+    except ValueError:
+        return "fail", f"the worker answered something that isn't JSON: {text}"
+    if isinstance(answer, dict) and answer.get("ok") is True:
+        return "ok", str(answer.get("version") or "")
+    return "fail", f"the worker answered {text}"
+
+
+def watched_functions(env):
+    """The functions whose errors the watch reads: the worker and the gateway."""
+    out = []
+    if env.get("WORKER_FUNCTION_NAME"):
+        out.append(env["WORKER_FUNCTION_NAME"])
+    if env.get("RESOURCE_PREFIX"):
+        out.append(f"{env['RESOURCE_PREFIX']}-gateway")
+    return out
+
+
+def error_rates(env, since, now, cw=None):
+    """{function: {"before": [errors, invocations], "after": [...]}}: the hour
+    before `since` and from its minute on, in one GetMetricData read per page."""
+    fns = watched_functions(env)
+    if not fns:
+        return {}
+    cw = cw or client("cloudwatch")
+    queries = [{"Id": f"{m.lower()}{i}", "ReturnData": True, "MetricStat": {
+        "Metric": {"Namespace": "AWS/Lambda", "MetricName": m, "Dimensions": [{"Name": "FunctionName", "Value": fn}]},
+        "Period": 60, "Stat": "Sum"}} for i, fn in enumerate(fns) for m in ("Errors", "Invocations")]
+    cut = since.replace(second=0, microsecond=0)
+    out = {fn: {"before": [0, 0], "after": [0, 0]} for fn in fns}
+    token = None
+    for _ in range(10):
+        kw = {"MetricDataQueries": queries, "StartTime": cut - timedelta(hours=1), "EndTime": now + timedelta(minutes=1),
+              "ScanBy": "TimestampAscending"}
+        if token:
+            kw["NextToken"] = token
+        page = cw.get_metric_data(**kw)
+        for res in page.get("MetricDataResults") or []:
+            m = re.fullmatch(r"(errors|invocations)(\d+)", res.get("Id") or "")
+            if not m or int(m.group(2)) >= len(fns):
+                continue
+            side = out[fns[int(m.group(2))]]
+            col = 0 if m.group(1) == "errors" else 1
+            for ts, val in zip(res.get("Timestamps") or [], res.get("Values") or []):
+                at = _when(ts)
+                side["after" if at and at >= cut else "before"][col] += val
+        token = page.get("NextToken")
+        if not token:
+            break
+    return out
+
+
+def errors_tripped(rates):
+    """What crossed the line, in words ("" when nothing did)."""
+    for fn, r in rates.items():
+        e, n = r["after"]
+        be, bn = r["before"]
+        if n < MIN_INVOCATIONS:
+            continue
+        rate, base = e / n, (be / bn if bn else 0.0)
+        if rate >= ERROR_RATE and rate - base >= ERROR_RISE:
+            return (f"{fn} failed {int(e)} of {int(n)} invocations since the update ({rate:.0%}), "
+                    f"against {base:.0%} in the hour before")
+    return ""
+
+
+def latest_update(store):
+    """(id, entry) of the newest update or rollback that started, or (None, {})."""
+    for h in store.history(10):
+        if h.get("mode") in ("update", "rollback"):
+            return h.get("id"), {k: v for k, v in h.items() if k != "id"}
+    return None, {}
+
+
+def watch_view(store, env, now):
+    """The watch of the release running now, started when its update just
+    finished (whichever updater finished it), or None."""
+    w = store.get(WATCH) or None
+    current = env.get("CODERHELM_VERSION", "")
+    hid, entry = latest_update(store)
+    fresh = (hid and entry.get("mode") == "update" and entry.get("status") == "succeeded" and entry.get("version") == current
+             and parse_version(entry.get("from_version") or "") and entry.get("from_version") != current)
+    if fresh and (not w or w.get("id") != hid):
+        try:
+            since = datetime.fromisoformat(entry.get("finished_at") or "")
+        except ValueError:
+            since = None
+        if since is None or now - since > WATCH_START_LIMIT:
+            return w
+        w = {"id": hid, "version": current, "from_version": entry["from_version"], "since": since.isoformat(),
+             "status": "watching", "probe": {"result": None, "tries": 0, "fails": 0, "unknown": 0, "detail": ""}}
+        store.put(WATCH, w)
+    return w
+
+
+def run_probe(env, w, now, health=None):
+    """Probes until it passes, fails PROBE_ATTEMPTS times in a row, or this
+    invocation runs short (the next poll goes on). Updates w["probe"]."""
+    p = w["probe"]
+    health = health or HEALTH_PROBE or probe_worker
+    while p.get("result") is None:
+        result, detail = health(env)
+        p["tries"] = int(p.get("tries") or 0) + 1
+        p["detail"], p["at"] = fit(detail, 500), now.isoformat()
+        if result == "ok":
+            p["result"] = "ok"
+            break
+        if result == "fail":
+            p["fails"] = int(p.get("fails") or 0) + 1
+            if p["fails"] >= PROBE_ATTEMPTS:
+                p["result"] = "fail"
+                break
+        else:
+            p["unknown"] = int(p.get("unknown") or 0) + 1
+            if p["tries"] >= 2 * PROBE_ATTEMPTS:
+                p["result"] = "unknown"
+                break
+        left = time_left()
+        if left is not None and left < PROBE_PAUSE + PROBE_TIMEOUT + 15:
+            break
+        _sleep(PROBE_PAUSE)
+    return p
+
+
+def watch_step(store, env, now, health=None, metrics=None, cfn=None):
+    """One step of the watch after an update (the scheduled poll's), or None
+    when nothing is watched. Never fails the poll."""
+    try:
+        w = watch_view(store, env, now)
+        if not w or w.get("status") not in ("watching", "rolling_back"):
+            return w
+        if w.get("version") != env.get("CODERHELM_VERSION", ""):
+            # Another release runs now (a person moved on): nothing left to watch.
+            if w.get("status") == "watching":
+                w.update(status="ended", reason=f"{env.get('CODERHELM_VERSION') or 'another release'} runs now")
+                store.put(WATCH, w)
+            return w
+        if w["status"] == "rolling_back":
+            return follow_recovery(store, env, now, w, cfn)
+        since = datetime.fromisoformat(w["since"])
+        p = run_probe(env, w, now, health)
+        tripped = ""
+        try:
+            rates = (metrics or METRICS or error_rates)(env, since, now)
+            w["errors"] = {fn: {"before": [int(x) for x in r["before"]], "after": [int(x) for x in r["after"]]} for fn, r in rates.items()}
+            tripped = errors_tripped(rates)
+        except Exception as e:  # noqa: BLE001  the probe still decides
+            w["errors_note"] = fit(f"couldn't read the error metrics: {type(e).__name__}: {e}", 300)
+        why = ""
+        if p.get("result") == "fail":
+            why = f"the new worker failed its health check {p['fails']} times in a row ({p.get('detail')})"
+        elif tripped:
+            why = f"errors rose after the update: {tripped}"
+        if why:
+            store.put(WATCH, w)
+            return start_recovery(store, env, now, w, why, cfn)
+        if now - since >= WATCH_WINDOW and p.get("result") is not None:
+            w.update(status="healthy", ended_at=now.isoformat())
+        store.put(WATCH, w)
+        return w
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"post-update watch step failed: {e}")
+        return None
+
+
+def mark_unhealthy(store, now, w, why):
+    """The update's own row says what was seen, and auto-update never takes
+    that release again by itself (an admin can still press Update)."""
+    entry = store.get(w["id"], {}) or {}
+    if entry:
+        summary = f"{w['version']} was installed, then {why}. CoderHelm rolled it back to {w['from_version']} by itself."
+        entry.update({"status": "rolled_back", "health_failed": why, "health_failed_at": now.isoformat(),
+                      "summary": fit(summary, 1000), "fix": "Nothing to do now. Update again once a newer release is out.",
+                      "technical": fit(why, 1000), "reason": fit(summary, 500)})
+        store.put(w["id"], entry)
+    state = store.get("UPDATE_STATE", {})
+    state["failed_versions"] = sorted(set(state.get("failed_versions") or []) | {w["version"]})
+    store.put("UPDATE_STATE", state)
+
+
+def start_recovery(store, env, now, w, why, cfn=None):
+    """Rolls the install back to the release it came from, by itself."""
+    if not w.get("why"):
+        w.update(status="rolling_back", why=fit(why, 800), failed_at=now.isoformat())
+        store.put(WATCH, w)
+        mark_unhealthy(store, now, w, w["why"])
+    try:
+        started = begin(store, env, now, w["from_version"], AUTO_ROLLBACK_ACTOR, "rollback",
+                        recovery={"auto": True, "from": w["version"], "why": w["why"]})
+    except ReleaseNotReady as e:
+        # The target's release check hasn't reported (an install launched on
+        # that release never ran one): started now, and the next poll tries again.
+        try:
+            start_verify(store, env, now, w["from_version"])
+        except Exception as ex:  # noqa: BLE001
+            logger.warning(f"release check not started: {ex}")
+        try:
+            waited = now - datetime.fromisoformat(w["failed_at"]) > RECOVERY_VERIFY_LIMIT
+        except (KeyError, ValueError):
+            waited = False
+        if waited:
+            return recovery_failed(store, env, now, w, f"the rollback to {w['from_version']} couldn't start: {e}")
+        w["waiting"] = fit(str(e), 300)
+        store.put(WATCH, w)
+        return w
+    except Exception as e:  # noqa: BLE001
+        return recovery_failed(store, env, now, w, f"the rollback to {w['from_version']} couldn't start: {not_started_reason(e)}")
+    w.pop("waiting", None)
+    w["rollback_id"] = started["id"]
+    store.put(WATCH, w)
+    if is_native(env):
+        settle_recovery(store, env, now, started["id"], cfn)
+    return follow_recovery(store, env, now, w, cfn)
+
+
+def settle_recovery(store, env, now, hid, cfn=None, budget=None):
+    """Polls a recovery rollback's change set until it runs (or `budget`
+    seconds pass): no review, so it applies as soon as CloudFormation has
+    made it, here or on any later poll (the scheduled one, the status route's)."""
+    budget = RECOVERY_WAIT if budget is None else budget
+    start = _clock()
+    while True:
+        r = native_poll(store, env, now, cfn)
+        entry = store.get(hid, {}) or {}
+        if entry.get("executed_at") or entry.get("status") not in ("preparing", "running") or r.get("native") not in ("preparing",):
+            return r
+        left = time_left()
+        if _clock() - start >= budget or (left is not None and left < RECOVERY_PAUSE + 20):
+            return r
+        _sleep(RECOVERY_PAUSE)
+
+
+def recovery_notice(store, env, now, w, entry):
+    """Admins hear once that the release was rolled back, with what was seen."""
+    notify_once(store, f"auto_rollback:{w['version']}:{w['id']}", now,
+                f"{w['version']} was unhealthy, rolled back to {w['from_version']}",
+                f"After installing {w['version']}, {w['why']}. CoderHelm is rolling the install back to {w['from_version']} by itself.\n"
+                f"{app_url(env)}/settings/system/",
+                env, what="rolled_back", version=w["version"],
+                facts={"current": w["from_version"], "checked_at": checked_at(now),
+                       "reason": f"After it was installed, {w['why']}.",
+                       "action": (f"Nothing to do: CoderHelm is putting {w['from_version']} back by itself, and auto-update "
+                                  f"won't take {w['version']} again. Settings, System, Update history shows when it is back.")})
+    w["notified_at"] = now.isoformat()
+
+
+def recovery_failed(store, env, now, w, problem):
+    """The rollback didn't happen: admins are told loudly, and it stops here."""
+    w.update(status="rollback_failed", problem=fit(problem, 800), ended_at=now.isoformat())
+    store.put(WATCH, w)
+    notify_once(store, f"auto_rollback_failed:{w['version']}:{w['id']}", now,
+                f"URGENT: {w['version']} is unhealthy and the automatic rollback failed",
+                f"After installing {w['version']}, {w.get('why')}. CoderHelm tried to roll back to {w['from_version']} and couldn't: {problem}.\n"
+                f"The install still runs {w['version']}. Roll back from Settings, System, or from a terminal: {CLI} rollback\n"
+                f"{app_url(env)}/settings/system/",
+                env, what="failed", version=w["version"],
+                facts={"current": w["version"], "checked_at": checked_at(now),
+                       "reason": f"After it was installed, {w.get('why')}. The automatic rollback to {w['from_version']} failed: {problem}.",
+                       "action": (f"The install still runs {w['version']}, which is unhealthy. Open Settings, System and press Roll back "
+                                  f"(it goes back to {w['from_version']} with no review), or open the stack in the AWS console.")})
+    logger.error(f"automatic rollback from {w['version']} failed: {problem}")
+    return w
+
+
+def follow_recovery(store, env, now, w, cfn=None):
+    """Where the automatic rollback is: running (admins told), waiting on a
+    person for data, ended (watch over), or failed (loud, and it stops)."""
+    hid = w.get("rollback_id")
+    if not hid:
+        return start_recovery(store, env, now, w, w.get("why") or "", cfn)
+    entry = store.get(hid, {}) or {}
+    status = entry.get("status")
+    if status in ("failed", "rolled_back", "not_started", "superseded"):
+        # It ran and AWS put the failing release back, or it never ran.
+        return recovery_failed(store, env, now, w, entry.get("summary") or entry.get("reason") or f"it ended {status}")
+    if entry.get("executed_at") or (status == "running" and entry.get("build_id")) or status == "succeeded":
+        if not w.get("notified_at"):
+            recovery_notice(store, env, now, w, entry)
+        if status == "succeeded":
+            w.update(status="rolled_back", ended_at=now.isoformat())
+        store.put(WATCH, w)
+        return w
+    if status == "review" and not w.get("held_notified"):
+        # Only data held it: a person decides that one, and is told so loudly.
+        notify_once(store, f"auto_rollback_held:{w['version']}:{w['id']}", now,
+                    f"URGENT: {w['version']} is unhealthy; its rollback needs your OK",
+                    f"After installing {w['version']}, {w['why']}. The rollback to {w['from_version']} is prepared, but "
+                    f"{entry.get('reason') or 'it waits for an admin'}.\nOpen Settings, System and press Apply:\n{app_url(env)}/settings/system/#version",
+                    env, what="review", version=w["from_version"],
+                    facts={"current": w["version"], "checked_at": checked_at(now), "reason": entry.get("reason"),
+                           "action": "Open Settings, System, check what it changes and press Apply."})
+        w["held_notified"] = now.isoformat()
+    store.put(WATCH, w)
+    return w
+
+
+def failing_now(store, env, now, health=None):
+    """Why the running release is failing its health check ("" when it isn't):
+    the watch found it, or the worker fails a probe right now."""
+    w = store.get(WATCH) or {}
+    if w.get("version") == env.get("CODERHELM_VERSION") and w.get("why") and w.get("status") in ("rolling_back", "rollback_failed"):
+        return w["why"]
+    result, detail = (health or HEALTH_PROBE or probe_worker)(env)
+    return f"the worker fails its health check ({detail})" if result == "fail" else ""
+
+
 def native_hold(store, env, entry):
     """Why this prepared update waits for an admin ("" when it may run now)."""
     if not entry.get("apply"):
@@ -4263,10 +4665,13 @@ def native_hold(store, env, entry):
         return ("it changes the deploy role or a permissions boundary (" + "; ".join(entry["admin_changes"])[:300]
                 + "), which CoderHelm can't apply for you: an AWS admin executes it in the AWS console")
     who = "auto-update held" if entry.get("scheduled") else "waiting for you to confirm"
+    recovery = entry.get("recovery") or {}
+    if entry.get("data_changes") and recovery.get("data"):
+        return ""
     if entry.get("data_changes"):
         # Never without a person: data would be replaced or removed.
         return f"{who}: it would replace or remove " + "; ".join(entry["data_changes"])[:400]
-    if entry.get("permission_changes") and not consented(entry):
+    if entry.get("permission_changes") and not consented(entry) and not recovery:
         # Never without a person: it changes who may do what.
         return f"{who}: it changes permissions (" + "; ".join(entry["permission_changes"])[:400] + ")"
     if entry.get("scheduled") and not auto_on(store, env):
@@ -4618,7 +5023,7 @@ def not_started_details(e, version, from_version):
     return {k: d[k][:1000] for k in ("summary", "fix", "technical")}
 
 
-def begin(store, env, now, version, actor, mode, extra=None, note=None, scheduled=False, consent=False):
+def begin(store, env, now, version, actor, mode, extra=None, note=None, scheduled=False, consent=False, recovery=None):
     """Starts the update and records it in history.
 
     History holds updates that started: the row is written once the change
@@ -4649,6 +5054,9 @@ def begin(store, env, now, version, actor, mode, extra=None, note=None, schedule
         # roles may do, inside the install's permissions boundary": that press
         # is their OK for permission changes (see native_hold). Never for data.
         entry["consent"] = {"permissions": True, "by": actor, "at": now.isoformat()}
+    if recovery and mode == "rollback":
+        # Away from a release failing its health check: no review (native_hold).
+        entry["recovery"] = dict(recovery, by=actor, at=now.isoformat())
 
     def refused(e):
         entry.update({"status": "not_started", "reason": not_started_reason(e), "finished_at": now.isoformat()})
@@ -4723,9 +5131,10 @@ def install_identity(env):
     return {"stage": m.group(1), "region": region} if m and region else None
 
 
-def handle(event, env, store, now, fetch=fetch_releases, probe=None, hint=None):
+def handle(event, env, store, now, fetch=fetch_releases, probe=None, hint=None, health=None):
     """`hint(channel, etag=...)` reads the channel's hint, latest.json or
-    beta.json (fetch_latest in the Lambda; none in tests unless given)."""
+    beta.json (fetch_latest in the Lambda; none in tests unless given).
+    `health(env)` probes the worker (probe_worker in the Lambda)."""
     probe = probe or invoke_worker
     action = (event or {}).get("action", "tick")
     current = env.get("CODERHELM_VERSION", "")
@@ -4787,6 +5196,8 @@ def handle(event, env, store, now, fetch=fetch_releases, probe=None, hint=None):
             "native": native_status(store, env, state) if is_native(env) else None,
             # What happens to the data when the stack is deleted (Settings, System, Uninstall).
             "uninstall": uninstall_status(store, env),
+            # The watch of the release after its update: probe, errors, and a rollback it made.
+            "health_watch": store.get(WATCH) or None,
         }
 
     if action == "uninstall_mode":
@@ -4917,6 +5328,10 @@ def handle(event, env, store, now, fetch=fetch_releases, probe=None, hint=None):
 
     if action == "rollback":
         target = event.get("version")
+        w = store.get(WATCH) or {}
+        if not target and w.get("version") == current and parse_version(w.get("from_version") or ""):
+            # The release the watched update came from.
+            target = w["from_version"]
         if not target:
             # A finished update whose release doesn't answer goes back to where it came from too.
             done = [h for h in store.history(50) if (h.get("status") == "succeeded" or h.get("unanswered")) and h.get("from_version")]
@@ -4930,7 +5345,21 @@ def handle(event, env, store, now, fetch=fetch_releases, probe=None, hint=None):
         ran = ran_versions(store, state, current) - {current}
         if target not in ran:
             raise ValueError(f"{target} is not a version this install ran before, so it can't be rolled back to")
-        return begin(store, env, now, target, event.get("actor") or DIRECT_ACTOR, "rollback")
+        actor = event.get("actor") or DIRECT_ACTOR
+        # Away from a release failing its health check, recovery is this one
+        # call: no review, and it applies once its change set is made. Data
+        # replaced or removed still needs `accept_data_changes`.
+        why = failing_now(store, env, now, health)
+        recovery = {"auto": False, "why": why, "from": current, "data": bool(event.get("accept_data_changes"))} if why else None
+        started = begin(store, env, now, target, actor, "rollback", recovery=recovery)
+        if recovery and is_native(env):
+            settle_recovery(store, env, now, started["id"], budget=RECOVERY_CALL_WAIT)
+            entry = store.get(started["id"], {}) or {}
+            started = dict(entry, id=started["id"])
+            if entry.get("status") == "review":
+                st = store.get("UPDATE_STATE", {})
+                started["pending"] = (native_status(store, env, st) or {}).get("pending")
+        return started
 
     if action == "apply_update":
         return native_apply(store, env, now, event)
@@ -4997,12 +5426,21 @@ def handle(event, env, store, now, fetch=fetch_releases, probe=None, hint=None):
         return {"refreshed": refresh_functions(client("lambda"), names, revision)}
 
     if action == "domain_status":
-        return domain_status(store, env, now)
+        out = domain_status(store, env, now)
+        if not is_native(env) and event.get("scheduled"):
+            # An install with an update build has no update poll: its watch goes on here, every 5 minutes.
+            w = watch_step(store, env, now, health)
+            if w:
+                out = dict(out, health_watch=w)
+        return out
 
     if action == "native_poll":
         if not is_native(env):
             raise ValueError("native_poll: not a native install")
-        return native_poll(store, env, now, wait=True)
+        out = native_poll(store, env, now, wait=True)
+        # The release just installed: probed and watched, rolled back when it fails.
+        w = watch_step(store, env, now, health)
+        return dict(out, health_watch=w) if w else out
 
     if action == "domain_set":
         return domain_set(store, env, now, event.get("hostname"), event.get("actor") or DIRECT_ACTOR)
@@ -5057,6 +5495,12 @@ def handler(event, context):
     env = dict(os.environ)
     store = Store(client("dynamodb"), env["SETTINGS_TABLE_NAME"])
     now = datetime.now(timezone.utc)
+    global _deadline
+    try:
+        # Long waits (the probe's pauses) stop with time to spare; the next poll goes on.
+        _deadline = _clock() + context.get_remaining_time_in_millis() / 1000 - 10
+    except Exception:  # noqa: BLE001
+        _deadline = None
     try:
         return {"ok": True, **handle(event, env, store, now, hint=fetch_latest)}
     except ModelsBlocked as e:
