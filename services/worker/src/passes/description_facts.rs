@@ -34,7 +34,7 @@ use super::pr_risk::{Floor, Level};
 use super::reviewer_guide::{Check, State};
 
 /// Why an open item nobody is asked to close counts as not verified.
-const OPEN_ITEM: &str = "it is listed under Open items";
+const OPEN_ITEM: &str = "nothing has checked it yet";
 
 /// GitHub lists at most this many files of a comparison.
 pub const COMPARE_FILE_LIMIT: usize = 300;
@@ -58,6 +58,19 @@ pub struct Inputs<'a> {
     /// Raw evidence beyond the outside steps' (what the title's form was
     /// read from).
     pub evidence: Vec<String>,
+    /// The repository's address, for links to files at the head.
+    pub repo_url: &'a str,
+}
+
+/// Lines added and removed in a patch.
+fn changed_lines(patch: &str) -> usize {
+    patch
+        .lines()
+        .filter(|l| {
+            (l.starts_with('+') && !l.starts_with("+++"))
+                || (l.starts_with('-') && !l.starts_with("---"))
+        })
+        .count()
 }
 
 fn one_line(s: &str) -> String {
@@ -282,10 +295,11 @@ pub fn facts(i: &Inputs<'_>) -> Facts {
         files: i
             .files
             .iter()
-            .map(|(path, status, _)| FileChange {
+            .map(|(path, status, patch)| FileChange {
                 path: path.clone(),
                 status: status.clone(),
                 previous: String::new(),
+                changed: changed_lines(patch),
             })
             .collect(),
         files_complete: i.files.len() < COMPARE_FILE_LIMIT,
@@ -315,6 +329,7 @@ pub fn facts(i: &Inputs<'_>) -> Facts {
         run_url: i.run_url.to_string(),
         notes: i.notes.clone(),
         evidence: i.evidence.clone(),
+        repo_url: i.repo_url.trim_end_matches('/').to_string(),
         ..Default::default()
     };
     // A frozen install a check recorded on this head.
@@ -388,23 +403,12 @@ pub struct Shaped {
     pub corrections: Vec<Correction>,
 }
 
-fn without_block(body: &str, start: &str, end: &str) -> String {
-    let Some(a) = body.find(start) else {
-        return body.to_string();
-    };
-    let Some(b) = body[a..].find(end) else {
-        return body.to_string();
-    };
-    format!("{}{}", &body[..a], body[a + b + end.len()..].trim_start())
-}
-
 /// The written text of `body` for the reader pass: no lead, no folds, none
 /// of CoderHelm's own blocks.
 pub fn written(body: &str) -> String {
-    let flat = common::pr_layout::unfold(body);
-    let flat = without_block(&flat, LEAD_START, LEAD_END);
+    let flat = common::pr_layout::strip_generated(body);
     let (_, rest) = super::completeness::take_owned(&flat);
-    without_block(&rest, EVIDENCE_START, EVIDENCE_END)
+    rest
 }
 
 /// `body` (as it stands, in any earlier shape) in its final shape for
@@ -412,9 +416,9 @@ pub fn written(body: &str) -> String {
 /// Shaping twice gives the same text.
 pub fn shape(body: &str, title: &str, mut facts: Facts, reply: Option<&str>) -> Shaped {
     let prior = Slots::from_body(body, &facts);
-    let flat = common::pr_layout::unfold(body);
-    let flat = without_block(&flat, LEAD_START, LEAD_END);
-    let flat = without_block(&flat, EVIDENCE_START, EVIDENCE_END);
+    // What a person ticked stays ticked.
+    let ticked = common::pr_body::ticked_ids(body);
+    let flat = common::pr_layout::strip_generated(body);
     // 1. Every written sentence against the facts.
     let (checked, corrections) = pr_claims::enforce(&flat, &facts);
     // What is open is what the checked text still lists: an item the facts
@@ -444,7 +448,7 @@ pub fn shape(body: &str, title: &str, mut facts: Facts, reply: Option<&str>) -> 
             r.why = first.to_string();
         }
     }
-    // 2. The lead's two slots: a verified reply, what the description
+    // 2. The summary and the check: a verified reply, what the description
     //    already carried, then the records.
     let text = written(&checked);
     let slots = reply
@@ -461,6 +465,11 @@ pub fn shape(body: &str, title: &str, mut facts: Facts, reply: Option<&str>) -> 
     };
     let from_title = {
         let t = common::pr_conventions::bare(title).2;
+        let mut c = t.chars();
+        let t = match c.next() {
+            Some(f) => f.to_uppercase().chain(c).collect::<String>(),
+            None => t,
+        };
         if t.is_empty() || t.ends_with('.') {
             t
         } else {
@@ -468,42 +477,77 @@ pub fn shape(body: &str, title: &str, mut facts: Facts, reply: Option<&str>) -> 
         }
     };
     let own = summary_of(&checked);
+    // A summary the facts arrive with (written for this head) comes after a
+    // verified reply and before what the description carried.
+    let given = std::mem::take(&mut facts.summary);
+    let earlier = first(&given, &prior.summary, String::new());
     facts.summary = first(
         &slots.summary,
-        &prior.summary,
+        &earlier,
         if own.is_empty() { from_title } else { own },
     );
     facts.how_to_check = first(&slots.check, &prior.check, check_of(&checked));
     let checked = pr_reader::without_sections(&checked, &slots.drop);
-    // 3. The lead and the collapsed steps and evidence, from the facts.
-    let evidence = pr_steps::evidence_block(&facts.steps, &facts.checked, &facts.evidence);
-    let mut out = common::pr_facts::lead(&facts);
-    out.push_str("\n\n");
-    if evidence.is_empty() {
-        out.push_str(checked.trim());
-    } else {
-        // Above the footer lines, so they stay last.
-        let lines: Vec<&str> = checked.trim_end().lines().collect();
-        let mut cut = lines.len();
-        while cut > 0 {
-            let t = lines[cut - 1].trim();
-            let footer = t.is_empty()
-                || t.starts_with("<sub>")
-                || (t.starts_with("<!--") && t.ends_with("-->") && !t.starts_with("<!-- /"));
-            if !footer {
-                break;
-            }
-            cut -= 1;
+    // 3. The visible part, the generated blocks below it and the steps and
+    //    evidence, from the facts; the written text goes in the first fold.
+    let r = common::pr_body::render(&common::pr_facts::body_of(&facts, &ticked));
+    // The head is named once, in the Verification lead-in.
+    let short = format!("on `{}`", facts.short_head());
+    let own_checks: Vec<Checked> = facts
+        .checked
+        .iter()
+        .map(|c| Checked {
+            when: if c.when.trim() == short {
+                String::new()
+            } else {
+                c.when.clone()
+            },
+            ..c.clone()
+        })
+        .collect();
+    let evidence = pr_steps::evidence_block(&facts.steps, &own_checks, &facts.evidence);
+    let mut out = format!("{LEAD_START}\n{}\n\n{LEAD_END}\n\n", r.visible);
+    out.push_str(checked.trim());
+    for (start, inner, end) in [
+        (
+            common::pr_body::NOTES_TOP_START,
+            r.notes_top.as_str(),
+            common::pr_body::NOTES_TOP_END,
+        ),
+        (
+            common::pr_body::CHECKS_START,
+            r.evidence.as_str(),
+            common::pr_body::CHECKS_END,
+        ),
+        (EVIDENCE_START, "", EVIDENCE_END),
+        (
+            common::pr_body::BUILT_START,
+            r.built.as_str(),
+            common::pr_body::BUILT_END,
+        ),
+        (
+            common::pr_body::FOOTER_START,
+            r.footer.as_str(),
+            common::pr_body::FOOTER_END,
+        ),
+    ] {
+        let b = if start == EVIDENCE_START {
+            evidence.clone()
+        } else {
+            common::pr_body::block(start, inner, end)
+        };
+        if !b.is_empty() {
+            out.push_str("\n\n");
+            out.push_str(&b);
         }
-        out.push_str(lines[..cut].join("\n").trim());
-        out.push_str("\n\n");
-        out.push_str(&evidence);
-        out.push_str("\n\n");
-        out.push_str(lines[cut..].join("\n").trim());
     }
-    // 4. What is in sight, what is collapsed, and GitHub's limit.
+    // 4. What is in sight, what is collapsed, and the size limit.
     let laid = common::pr_layout::layout(out.trim());
-    let body = common::pr_body_fit::fit_with_link(&laid, &facts.run_url);
+    let body = common::pr_body_fit::fit_to(
+        &laid,
+        common::pr_body::BODY_MAX,
+        Some(facts.run_url.as_str()).filter(|u| !u.trim().is_empty()),
+    );
     Shaped {
         body,
         facts,
@@ -547,6 +591,7 @@ mod tests {
             run_url: "https://app.example.com/runs/detail?id=run-1",
             notes: vec![],
             evidence: vec![],
+            repo_url: "https://github.com/acme/site",
         }
     }
 
@@ -570,24 +615,32 @@ mod tests {
         let seen = common::pr_layout::visible(&s.body);
         assert!(
             seen.starts_with(
-                "The export poller retries a timed-out poll three times before it gives up."
+                "The export poller retries a timed-out poll three times before it gives up (OPS-41)."
             ),
             "{seen}"
         );
+        assert!(seen.contains("| unit tests (CI) | Passed |"), "{seen}");
         assert!(
             seen.contains(
-                "**Check:** `cargo test -p export`; 1 recorded check passed on `abc1234`."
+                "| The export against the live bucket | Not run: nothing has checked it yet |"
             ),
             "{seen}"
         );
-        assert!(seen.contains("**Risk:** **Low**"), "{seen}");
-        assert!(seen.contains("**Needed from you:** Nothing."), "{seen}");
-        assert!(
-            seen.contains("not verified: The export against the live bucket was not run"),
-            "{seen}"
-        );
-        assert!(seen.contains("Source ticket: OPS-41"), "{seen}");
-        assert!(!seen.contains("the retry loop"), "{seen}");
+        assert!(seen.contains("**Risk:** Low. "), "{seen}");
+        // Nothing is needed: the section is not there.
+        assert!(!seen.contains("Needed from you"), "{seen}");
+        // The ticket line, the walkthrough and the command are below.
+        for below in [
+            "Source ticket: OPS-41",
+            "the retry loop",
+            "How to check: `cargo test -p export`.",
+        ] {
+            assert!(
+                s.body.contains(below) && !seen.contains(below),
+                "{below}: {}",
+                s.body
+            );
+        }
         assert_eq!(common::pr_layout::rubric(&s.body, &s.facts), vec![]);
         // Shaping what was shaped changes nothing.
         let again = shape(&s.body, "OPS-41: Export poller gives up", f, None);
@@ -611,8 +664,9 @@ mod tests {
             None,
         );
         assert!(
-            common::pr_layout::visible(&s.body)
-                .contains("**Needed from you:**\n1. Answer: Should the card link open in a new tab? (a person)"),
+            common::pr_layout::visible(&s.body).contains(
+                "### Needed from you\n- [ ] <!-- ch:should-the-card-link-open-in-a-new-tab --> **Ticket owner**, before merge: Decide: Should the card link open in a new tab? Why a person: a product decision the ticket leaves open."
+            ),
             "{}",
             s.body
         );
@@ -626,8 +680,9 @@ mod tests {
         let reply = r#"{"summary": "Retries a timed-out export poll three times. All tests pass.", "check": "cargo test -p export", "drop": []}"#;
         let s = shape(BODY, "t", f.clone(), Some(reply));
         assert!(
-            s.body
-                .contains("\nRetries a timed-out export poll three times.\n"),
+            s.body.contains(
+                "\nRetries a timed-out export poll three times (OPS-41).<!-- ch:summary-end -->\n"
+            ),
             "{}",
             s.body
         );
@@ -640,7 +695,7 @@ mod tests {
             Some(r#"{"summary": "x", "check": "make ship"}"#),
         );
         assert!(
-            s.body.contains("**Check:** `cargo test -p export`;"),
+            s.body.contains("How to check: `cargo test -p export`."),
             "{}",
             s.body
         );

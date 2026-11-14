@@ -157,6 +157,7 @@ pub mod paged;
 /// Placeholder tokens: never learned, never written into a commit or title.
 pub mod placeholders;
 /// Every body CoderHelm sends GitHub fits GitHub's limit.
+pub mod pr_body;
 pub mod pr_body_fit;
 /// A description checked against the recorded facts, sentence by sentence.
 pub mod pr_claims;

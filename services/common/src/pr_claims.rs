@@ -1064,6 +1064,7 @@ mod tests {
             path: path.into(),
             status: "modified".into(),
             previous: String::new(),
+            changed: 0,
         }
     }
 
@@ -1098,6 +1099,7 @@ mod tests {
                     moved: true,
                     major: false,
                     remaining: vec![],
+                    fixed: vec![],
                 },
                 DepLine {
                     package: "tiny-yaml".into(),
@@ -1106,6 +1108,7 @@ mod tests {
                     moved: false,
                     major: false,
                     remaining: vec!["GHSA-aaaa-bbbb-cccc".into()],
+                    fixed: vec![],
                 },
             ],
             advisories: Advisories {

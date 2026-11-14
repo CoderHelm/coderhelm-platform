@@ -21,7 +21,10 @@ pub fn facts(
     head: &HeadFacts,
     check: &WhatToCheck,
 ) -> DependencyFacts {
-    let mut out = DependencyFacts::default();
+    let mut out = DependencyFacts {
+        ecosystem: unit.ecosystem.clone(),
+        ..Default::default()
+    };
     for (i, b) in unit.bumps.iter().enumerate() {
         let Some(line) = head.lines.get(i) else {
             continue;
@@ -37,6 +40,13 @@ pub fn facts(
             .collect();
         remaining.sort();
         remaining.dedup();
+        let mut fixed: Vec<String> = mine()
+            .filter(|(f, _)| head.fixed(unit, f) == Fixed::Yes)
+            .map(|(f, _)| f.advisory.primary.clone())
+            .filter(|id| !id.is_empty())
+            .collect();
+        fixed.sort();
+        fixed.dedup();
         let (from, to, moved, major) = match &line.resolved {
             Resolved::Moved { from, to, major } => (from.clone(), to.clone(), true, *major),
             Resolved::NotMoved { at } => (at.clone(), at.clone(), false, false),
@@ -82,6 +92,7 @@ pub fn facts(
             moved,
             major,
             remaining,
+            fixed,
         });
     }
     let mut advisories = Advisories::default();
