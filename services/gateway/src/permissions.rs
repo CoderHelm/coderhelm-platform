@@ -251,6 +251,7 @@ pub const CAPABILITIES: &[Capability] = &[
         handlers: &[
             "mcp_servers::connect",
             "mcp_servers::oauth_callback",
+            "mcp_servers::cancel_sign_in",
             "mcp_servers::disconnect",
             "agent_policy::decline_sign_in",
         ],

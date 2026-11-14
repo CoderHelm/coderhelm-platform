@@ -715,9 +715,15 @@ pub async fn connect_coderhelm_app(
     info!(team = %rt.team, server = %s.id, brokered = brokered.is_some(), "CoderHelm app sign-in started");
     Ok(Json(json!({
         "authorize_url": url,
+        "server_id": s.id,
+        "expires_in": SIGN_IN_SECS,
         "own_app": own_app_json(&state, &rt, &s).await,
     })))
 }
+
+/// How long a started sign-in can still be finished, for the page that
+/// waits on it: after this it says the sign-in timed out.
+pub const SIGN_IN_SECS: i64 = common::mcp_remote::store::PENDING_TTL_SECS;
 
 /// PUT /api/mcp-servers/:id/key { header_name?, header_value } — replace a
 /// static key (checked against the server before it is saved).
@@ -817,7 +823,31 @@ pub async fn connect(
             fail(StatusCode::BAD_REQUEST, &with_key_help(&e, &s.id))
         })?;
     info!(team = %rt.team, server = %s.id, owner = %owner.key(), "MCP sign-in started");
-    Ok(Json(json!({ "authorize_url": url })))
+    Ok(Json(json!({
+        "authorize_url": url,
+        "server_id": s.id,
+        "expires_in": SIGN_IN_SECS,
+    })))
+}
+
+/// DELETE /api/mcp-servers/:id/sign-in — cancel the sign-ins this person
+/// started for a connection and didn't finish (an MCP server, a catalog
+/// app `app-<id>`, a knowledge source `ks-<id>`). Their `state` stops
+/// working at once, so an answer that arrives later is refused. Nothing
+/// that is connected changes.
+pub async fn cancel_sign_in(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Path(id): Path<String>,
+) -> Reply {
+    claims.require_role(1).map_err(member_only)?;
+    if id.is_empty() || id.len() > 200 {
+        return Err(fail(StatusCode::NOT_FOUND, "That server isn't set up."));
+    }
+    let rt = runtime(&state, &claims.team_id);
+    let cancelled = rt.end_pending(&id, None, Some(&claims.sub)).await;
+    info!(team = %rt.team, server = %id, cancelled, "Sign-in cancelled");
+    Ok(Json(json!({ "cancelled": cancelled })))
 }
 
 /// POST /api/mcp-servers/oauth/callback { state, code?, error?, error_description?, iss? }

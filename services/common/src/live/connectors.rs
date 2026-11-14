@@ -21,6 +21,10 @@ const PREFIX: &str = "CONNECTOR#";
 /// A Confluence connection reached through the team's installed Coderhelm
 /// Jira app instead of an API token.
 pub const VIA_JIRA_APP: &str = "jira_app";
+/// A Confluence connection reached with the Atlassian sign-in the team made
+/// for Knowledge (`knowledge::sources::oauth`): no key of its own, reading
+/// only.
+pub const VIA_SIGN_IN: &str = "sign_in";
 /// Pages a Confluence write list may hold.
 pub const MAX_WRITE_PAGES: usize = 20;
 /// Lookups one agent pass may make across every connection here.
@@ -346,6 +350,11 @@ impl Connector {
     /// Reached through the team's Coderhelm Jira app, not a key of its own.
     pub fn via_jira_app(&self) -> bool {
         self.via == VIA_JIRA_APP
+    }
+
+    /// Reached with the team's Atlassian sign-in, not a key of its own.
+    pub fn via_sign_in(&self) -> bool {
+        self.via == VIA_SIGN_IN
     }
 
     /// Whether work on `repo` (`owner/name`) may use it.
