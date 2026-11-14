@@ -7239,6 +7239,34 @@ async fn complete_run_with_status(
     duration: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     debug_assert_ne!(status, "needs_input", "use wait_for_review");
+    // A run never completes on a description built for another head: it is
+    // rebuilt for the head first, and when that cannot be done this step
+    // ends in an error and is tried again.
+    if status == common::run_status::COMPLETED && pr_number > 0 {
+        if let Ok(github) = GitHubClient::new(
+            &state.secrets.github_app_id,
+            &state.secrets.github_private_key,
+            msg.installation_id,
+            &state.http,
+        ) {
+            if let super::description::Reconciled::Failed(why) = super::description::reconcile(
+                state,
+                &github,
+                &msg.team_id,
+                &msg.repo_owner,
+                &msg.repo_name,
+                pr_number,
+                &msg.ticket_id,
+            )
+            .await
+            {
+                return Err(format!(
+                    "the pull request's description is not of its head and could not be rebuilt: {why}"
+                )
+                .into());
+            }
+        }
+    }
     // Open items written on an earlier head are not this run's last word: a
     // later round may have settled one. The run goes back to its checks on
     // the head first, and finishes from there.

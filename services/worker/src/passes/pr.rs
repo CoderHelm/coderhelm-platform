@@ -854,6 +854,17 @@ Return ONLY the markdown body text."#,
         usage,
     )
     .await;
+    // The description names the head it was built for from the start.
+    crate::passes::description::reconcile(
+        state,
+        github,
+        &msg.team_id,
+        &msg.repo_owner,
+        &msg.repo_name,
+        pr_number,
+        &msg.ticket_id,
+    )
+    .await;
 
     Ok(PrResult {
         pr_number,
@@ -1649,6 +1660,19 @@ pub async fn apply_checks(
     // What the reviewer reads first, from the diff and the head's recorded
     // check results as they stand now.
     super::reviewer_guide::refresh(github, &msg.repo_owner, &msg.repo_name, number).await;
+    // This step may have pushed (a settle check's take-out, a regenerated
+    // lockfile) since the description was built: everything computed from
+    // the branch is of this head before the step ends.
+    crate::passes::description::reconcile(
+        state,
+        github,
+        &msg.team_id,
+        &msg.repo_owner,
+        &msg.repo_name,
+        number,
+        &msg.ticket_id,
+    )
+    .await;
 }
 
 /// Heading over what only a person can check, when the checks found some.

@@ -626,4 +626,134 @@ mod tests {
             Resolved::Unknown { .. }
         ));
     }
+
+    // ── Suffixed versions, exact-version overrides, a later head ────────
+
+    #[test]
+    fn a_version_with_a_suffix_is_read_on_its_line() {
+        let unit = FixUnit {
+            bumps: vec![bump("xml-kit", "1.4.4-lts.1", "2.0.3")],
+            ..Default::default()
+        };
+        let f = finding("GHSA-s", "xml-kit", "1.4.4-lts.1", Some("2.0.3"));
+        // An override keyed on the exact version moved every copy to 2.0.3.
+        let moved = LockAt {
+            path: "pnpm-lock.yaml".into(),
+            base: copies(&[("xml-kit", "1.4.4-lts.1")]),
+            head: copies(&[("xml-kit", "2.0.3")]),
+            why: String::new(),
+        };
+        let facts = resolve(&unit, "h2", &[moved]);
+        assert_eq!(facts.version_cell(0), "1.4.4-lts.1 to 2.0.3 (major)");
+        assert_eq!(facts.fixed(&unit, &f), Fixed::Yes);
+        // A patched build on the same line, also suffixed.
+        let unit_lts = FixUnit {
+            bumps: vec![bump("xml-kit", "1.4.4-lts.1", "1.4.4-lts.2")],
+            ..Default::default()
+        };
+        let f_lts = finding("GHSA-s", "xml-kit", "1.4.4-lts.1", Some("1.4.4-lts.2"));
+        let same_line = LockAt {
+            path: "pnpm-lock.yaml".into(),
+            base: copies(&[("xml-kit", "1.4.4-lts.1")]),
+            head: copies(&[("xml-kit", "1.4.4-lts.2")]),
+            why: String::new(),
+        };
+        let facts = resolve(&unit_lts, "h2", &[same_line]);
+        assert_eq!(facts.version_cell(0), "1.4.4-lts.1 to 1.4.4-lts.2");
+        assert_eq!(facts.fixed(&unit_lts, &f_lts), Fixed::Yes);
+        // The suffixed build is not mistaken for the plain release.
+        let not_yet = LockAt {
+            path: "pnpm-lock.yaml".into(),
+            base: copies(&[("xml-kit", "1.4.4-lts.1")]),
+            head: copies(&[("xml-kit", "1.4.4-lts.1")]),
+            why: String::new(),
+        };
+        let facts = resolve(&unit_lts, "h1", &[not_yet]);
+        assert_eq!(facts.version_cell(0), "1.4.4-lts.1, not moved on the head");
+        assert_eq!(facts.fixed(&unit_lts, &f_lts), Fixed::No);
+    }
+
+    /// The lockfiles as the package managers write them, with an override
+    /// keyed on the exact suffixed version.
+    #[test]
+    fn an_exact_version_override_is_read_from_real_lockfile_text() {
+        use crate::reachability::lock_copies;
+        let pnpm = |v: &str| {
+            format!(
+                "lockfileVersion: '9.0'\noverrides:\n  xml-kit@1.4.4-lts.1: 2.0.3\nimporters:\n  .:\n    dependencies:\n      feed-reader:\n        specifier: ^3.0.0\n        version: 3.1.0\npackages:\n  feed-reader@3.1.0: {{}}\n  xml-kit@{v}: {{}}\nsnapshots:\n  feed-reader@3.1.0:\n    dependencies:\n      xml-kit: {v}\n  xml-kit@{v}: {{}}\n"
+            )
+        };
+        let npm = |v: &str| {
+            format!(
+                r#"{{"lockfileVersion":3,"packages":{{"":{{"dependencies":{{"feed-reader":"^3.0.0"}},"overrides":{{"xml-kit@1.4.4-lts.1":"2.0.3"}}}},"node_modules/feed-reader":{{"version":"3.1.0","dependencies":{{"xml-kit":"1.4.4-lts.1"}}}},"node_modules/xml-kit":{{"version":"{v}"}}}}}}"#
+            )
+        };
+        let yarn = |v: &str| {
+            format!(
+                "# yarn lockfile v1\n\nfeed-reader@^3.0.0:\n  version \"3.1.0\"\n  dependencies:\n    xml-kit \"1.4.4-lts.1\"\n\nxml-kit@1.4.4-lts.1:\n  version \"{v}\"\n"
+            )
+        };
+        for (path, lock) in [
+            ("pnpm-lock.yaml", &pnpm as &dyn Fn(&str) -> String),
+            ("package-lock.json", &npm),
+            ("yarn.lock", &yarn),
+        ] {
+            let mut b = bump("xml-kit", "1.4.4-lts.1", "2.0.3");
+            b.manifest = path.into();
+            let unit = FixUnit {
+                bumps: vec![b],
+                ..Default::default()
+            };
+            let at = LockAt {
+                path: path.into(),
+                base: lock_copies(path, &lock("1.4.4-lts.1")),
+                head: lock_copies(path, &lock("2.0.3")),
+                why: String::new(),
+            };
+            assert!(
+                at.base
+                    .as_ref()
+                    .unwrap()
+                    .contains(&("xml-kit".into(), "1.4.4-lts.1".into())),
+                "{path}: {:?}",
+                at.base
+            );
+            let facts = resolve(&unit, "h2", &[at]);
+            assert_eq!(
+                facts.version_cell(0),
+                "1.4.4-lts.1 to 2.0.3 (major)",
+                "{path}"
+            );
+        }
+    }
+
+    /// The manifest got its override on one head; the lockfile was written
+    /// on a later one. The first head's answer is right for that head and
+    /// wrong for the next, so it is never carried over.
+    #[test]
+    fn a_package_an_override_moves_on_a_later_head_is_read_again() {
+        let unit = FixUnit {
+            bumps: vec![bump("xml-kit", "1.4.4-lts.1", "2.0.3")],
+            ..Default::default()
+        };
+        let f = finding("GHSA-s", "xml-kit", "1.4.4-lts.1", Some("2.0.3"));
+        let st = FindingState::default();
+        let at = |head: &str| LockAt {
+            path: "pnpm-lock.yaml".into(),
+            base: copies(&[("xml-kit", "1.4.4-lts.1")]),
+            head: copies(&[("xml-kit", head)]),
+            why: String::new(),
+        };
+        let first = resolve(&unit, "h1", &[at("1.4.4-lts.1")]);
+        assert_eq!(first.version_cell(0), "1.4.4-lts.1, not moved on the head");
+        assert!(first
+            .headline(&unit, &[(&f, &st)])
+            .contains("Not fixed on the head: GHSA-s"));
+        let second = resolve(&unit, "h2", &[at("2.0.3")]);
+        assert_eq!(second.version_cell(0), "1.4.4-lts.1 to 2.0.3 (major)");
+        let h = second.headline(&unit, &[(&f, &st)]);
+        assert!(h.starts_with("Fixes 1 of 1 advisory"), "{h}");
+        assert!(!h.contains("Not fixed"), "{h}");
+        assert_ne!(first, second);
+    }
 }

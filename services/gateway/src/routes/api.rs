@@ -5612,6 +5612,35 @@ pub struct UsageFeature {
     pub tokens_out: u64,
 }
 
+/// One model's share of the month's tokens.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct UsageModel {
+    /// The model, without a provider prefix or date, such as `claude-opus-5-5`.
+    #[schema(example = "claude-opus-5-5")]
+    pub model: String,
+    /// All four parts together.
+    #[schema(example = 15120400)]
+    pub total_tokens: u64,
+    /// New input tokens (not from the cache).
+    #[schema(example = 2400100)]
+    pub tokens_in: u64,
+    /// Tokens read from the prompt cache.
+    #[schema(example = 11020300)]
+    pub cache_read_tokens: u64,
+    /// Tokens written to the prompt cache.
+    #[schema(example = 700000)]
+    pub cache_write_tokens: u64,
+    /// Output tokens.
+    #[schema(example = 1000000)]
+    pub tokens_out: u64,
+    /// Model calls counted.
+    #[schema(example = 412)]
+    pub calls: u64,
+    /// Cache reads divided by all input, from 0 to 1.
+    #[schema(example = 0.78)]
+    pub cache_hit_rate: f64,
+}
+
 /// One limit the team set, and what it counts this month.
 #[derive(serde::Serialize, utoipa::ToSchema)]
 pub struct UsageLimit {
@@ -5667,6 +5696,8 @@ pub struct Usage {
     pub limit_counts_cache: bool,
     /// Usage per feature.
     pub features: Vec<UsageFeature>,
+    /// Usage per model, most tokens first.
+    pub models: Vec<UsageModel>,
     /// Runs started this month.
     #[schema(example = 37)]
     pub total_runs: u64,
@@ -5694,6 +5725,26 @@ pub fn usage_body(
             tokens_out: ft.tokens_out,
         })
         .collect();
+    let mut models: Vec<UsageModel> = analytics
+        .map(|i| common::usage::slices(i, "model"))
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(model, m)| UsageModel {
+            model,
+            total_tokens: m.total(),
+            tokens_in: m.tokens_in,
+            cache_read_tokens: m.cache_read,
+            cache_write_tokens: m.cache_write,
+            tokens_out: m.tokens_out,
+            calls: m.calls,
+            cache_hit_rate: m.cache_hit_share().unwrap_or(0.0),
+        })
+        .collect();
+    models.sort_by(|a, b| {
+        b.total_tokens
+            .cmp(&a.total_tokens)
+            .then(a.model.cmp(&b.model))
+    });
     let uses = limits.uses(&t);
     let limit_rows: Vec<UsageLimit> = uses
         .iter()
@@ -5724,6 +5775,7 @@ pub fn usage_body(
         counted_tokens: counted,
         limit_counts_cache: counts_cache,
         features,
+        models,
         total_runs: analytics
             .and_then(|i| i.get("total_runs"))
             .and_then(|v| v.as_n().ok())
@@ -6851,6 +6903,12 @@ mod tests {
         assert_eq!(off["features"][0]["total_tokens"], 71_320_000u64);
         let rate = off["cache_hit_rate"].as_f64().unwrap();
         assert!((rate - 61_400_000.0 / 70_320_000.0).abs() < 1e-9);
+        assert_eq!(off["models"][0]["model"], "claude-opus-5-5");
+        assert_eq!(off["models"][0]["total_tokens"], 71_320_000u64);
+        assert_eq!(off["models"][0]["cache_read_tokens"], 61_400_000u64);
+        assert_eq!(off["models"][0]["cache_write_tokens"], 8_800_000u64);
+        assert_eq!(off["models"][0]["calls"], 1);
+        assert_eq!(off["models"][0]["cache_hit_rate"], off["cache_hit_rate"]);
 
         let on = usage_json("2026-10", Some(&analytics), &legacy(Some("true")));
         assert_eq!(on["counted_tokens"], on["total_tokens"]);

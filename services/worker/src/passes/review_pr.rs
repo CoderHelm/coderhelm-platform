@@ -1586,6 +1586,43 @@ async fn run_once(
     let pr = github
         .get_pull_request(&msg.repo_owner, &msg.repo_name, msg.pr_number)
         .await?;
+    // CoderHelm's own pull request is reviewed against a description built
+    // for the head under review, never an earlier one.
+    let own_run = if pr["user"]["login"]
+        .as_str()
+        .is_some_and(|l| l.contains("coderhelm"))
+    {
+        lookup_run_by_pr(
+            state,
+            &msg.team_id,
+            &msg.repo_owner,
+            &msg.repo_name,
+            msg.pr_number,
+        )
+        .await
+    } else {
+        None
+    };
+    let pr = match &own_run {
+        Some(run_id)
+            if super::description::reconcile_run(
+                state,
+                &github,
+                &msg.team_id,
+                run_id,
+                &msg.repo_owner,
+                &msg.repo_name,
+                msg.pr_number,
+            )
+            .await
+                == super::description::Reconciled::Rebuilt =>
+        {
+            github
+                .get_pull_request(&msg.repo_owner, &msg.repo_name, msg.pr_number)
+                .await?
+        }
+        _ => pr,
+    };
 
     // Coalesce rapid commits: if a newer commit has landed since this verdict
     // review was enqueued, skip it — the newer commit's own review covers the
@@ -3418,6 +3455,29 @@ async fn run_once(
     // every finding that isn't strictly optional is its own to fix before
     // the PR is marked ready or the merge armed: the review requests changes
     // and lists them at the top of the description (`own_review`).
+    // A finding that the description is behind the code is CoderHelm's to
+    // settle by rebuilding the description, never a note left for a person:
+    // the rebuild runs now, and a finding it settled is not raised.
+    if self_authored && findings.iter().any(super::own_review::about_description) {
+        let ticket = match &own_run {
+            Some(run_id) => run_ticket_id(state, &msg.team_id, run_id).await,
+            None => String::new(),
+        };
+        let rebuilt = super::description::rebuild(
+            state,
+            &github,
+            &msg.team_id,
+            &msg.repo_owner,
+            &msg.repo_name,
+            msg.pr_number,
+            &ticket,
+        )
+        .await;
+        info!(pr = msg.pr_number, head = %head_sha, ?rebuilt, "The review found the description behind the code: rebuilt from the head");
+        if rebuilt == super::description::Reconciled::Rebuilt {
+            findings.retain(|f| f.holds_merge() || !super::own_review::about_description(f));
+        }
+    }
     let mut own_open = if self_authored {
         super::own_review::required(&findings, &held_late)
     } else {
@@ -3573,24 +3633,33 @@ async fn run_once(
     let mut description_after = pr_body.to_string();
     if self_authored {
         let section = super::own_review::section(&own_open);
-        let updated = super::completeness::with_section(
-            pr_body,
-            super::completeness::Section::OpenFindings,
-            section,
-        );
-        if updated != pr_body {
-            if let Err(e) = crate::passes::description::save(
-                &github,
-                &msg.repo_owner,
-                &msg.repo_name,
-                msg.pr_number,
-                &updated,
-            )
-            .await
-            {
+        // On the description as it is now, and only while this review's
+        // head is still the pull request's: a copy read when the review
+        // started would undo every write made since, and a review of a
+        // head that has been replaced says nothing about the new one.
+        match crate::passes::description::edit(
+            &github,
+            &msg.repo_owner,
+            &msg.repo_name,
+            msg.pr_number,
+            Some(&head_sha),
+            |now| {
+                super::completeness::with_section(
+                    now,
+                    super::completeness::Section::OpenFindings,
+                    section,
+                )
+            },
+        )
+        .await
+        {
+            crate::passes::description::Edited::Saved(updated) => description_after = updated,
+            crate::passes::description::Edited::Unchanged => {}
+            crate::passes::description::Edited::HeadMoved => {
+                info!(pr = msg.pr_number, head = %head_sha, "The head moved during this review: its findings are not written into the description of the new head");
+            }
+            crate::passes::description::Edited::Failed(e) => {
                 warn!(pr = msg.pr_number, error = %e, "Could not update the own PR's open review findings");
-            } else {
-                description_after = updated;
             }
         }
         if !own_open.is_empty() {
@@ -4966,6 +5035,23 @@ async fn plan_evidence_for_pr(state: &WorkerState, msg: &ReviewMessage) -> Strin
         .and_then(|v| v.as_s().ok())
         .and_then(|j| serde_json::from_str::<super::fix_location::FixDecision>(j).ok())
         .map(|d| super::fix_location::reviewer_context(&d))
+        .unwrap_or_default()
+}
+
+/// The ticket of a run, from its record (empty when it has none).
+async fn run_ticket_id(state: &WorkerState, team_id: &str, run_id: &str) -> String {
+    state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(team_id))
+        .key("run_id", attr_s(run_id))
+        .projection_expression("ticket_id")
+        .send()
+        .await
+        .ok()
+        .and_then(|o| o.item)
+        .and_then(|i| i.get("ticket_id").and_then(|v| v.as_s().ok()).cloned())
         .unwrap_or_default()
 }
 
