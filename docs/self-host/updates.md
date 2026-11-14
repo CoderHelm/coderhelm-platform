@@ -232,6 +232,17 @@ The history entry says what happened and what to do next:
 
 A try that didn't succeed never holds up the next release: automatic updates skip only that one version, and **Update** works for a newer release (or the same one again) as soon as it is out.
 
+### After an update: the new release is watched, and rolled back if it fails
+
+An update that finishes can still be broken in a way the address check misses: a worker that crashes on every job while the site answers. So for 10 minutes after every update, CoderHelm watches the new release:
+
+- **The worker's health check.** The updater asks the worker for `{"health": {}}`, which goes through the same start-up and entry path as every job but calls no model, GitHub or queue. It fails after 4 failed answers in a row, 30 seconds apart (about 2 minutes); one answer passes it. A call AWS refused or throttled says nothing about the release and never counts.
+- **Errors.** CloudWatch's `Errors` against `Invocations` for the worker and the gateway since the update, against the hour before. It trips when at least 5 calls ran since the update, at least half of them failed, and the failure rate is at least 25 points above the hour before (an install that already failed often isn't rolled back for that).
+
+If either one fails, CoderHelm rolls the install back by itself to the release it came from, with no review: a change to what CoderHelm's own roles may do is applied as for your **Update** press. Only a rollback that would replace or remove data waits for you (admins get an urgent email). Admins get an email naming the release, what was seen, and that it went back. The update's history entry reads **Rolled back**, and automatic updates skip that release. If the rollback can't start or AWS can't finish it, admins get an urgent email, the install stays on the new release, and CoderHelm doesn't try again: press **Roll back**.
+
+On an install made with Launch Stack the watch runs from the 5-minute update poll; on an install from before native releases, from the 5-minute domain check. A stack update replaces the worker's code in place, so there is no earlier point at which the new code can be asked before it takes jobs: the first check runs as soon as the stack update completes.
+
 ### The update couldn't start: the update role isn't allowed to use an AWS template feature
 
 Up to v0.8.31, three part templates used an AWS template feature (the `AWS::LanguageExtensions` transform) that the install's deploy role isn't allowed to use. Since every update from the page goes through that role, an **Update** to one of those releases failed before anything changed, for example: "The update couldn't start: CoderHelm's update role isn't allowed to use an AWS template feature this release needs. Nothing changed: your install stayed on v0.8.29." The releases after v0.8.31 use no transform, and CoderHelm's tests fail a release whenever a template uses one the deploy role can't. Press **Update** again once a newer release is out: it applies from the page as usual, with no step in the AWS console. Your data and the **KeepDataOnDelete** choice are unchanged.
@@ -254,6 +265,8 @@ Rolling back from a hardened install to a release from before hardening needs an
 ## Roll back
 
 **Settings, then System, then Roll back** (or `coderhelm-selfhost rollback`) deploys the release before the last successful update. To pick a version: `coderhelm-selfhost rollback --to v0.7.0`. Only a release this install ran before can be picked: an older release it never ran is refused, even though it is signed.
+
+Away from a release that fails its health check (the watch found it, or the worker fails the check when you press **Roll back**), it is one press: no review and no confirmation of permission changes; it applies as soon as AWS has prepared it. If it would replace or remove data, the page lists that and asks once (`accept_data_changes` from the API).
 
 Data written by a newer release stays. Releases only add fields to stored items, so an older release keeps reading them. CloudFormation also rolls a stack back by itself if a deploy fails partway.
 

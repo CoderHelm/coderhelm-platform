@@ -55,6 +55,9 @@ def answers(*statuses):
 
 # No test reaches the network: an install's API answers 401 (up, not signed in) unless a test says otherwise.
 u.API_OPENER = answers(401)
+# Nor AWS: after an update the watch's worker probe says nothing and CloudWatch shows no calls, unless a test says otherwise.
+u.HEALTH_PROBE = lambda env: ("unknown", "not asked in tests")
+u.METRICS = lambda env, since, now: {}
 
 NOW = datetime(2026, 10, 31, 12, 0, tzinfo=timezone.utc)
 TEMPLATE = json.dumps({"Parameters": {"Stage": {}, "AdminEmail": {}, "KeepDataOnDelete": {}, "Hostname": {}, "DomainCertificateArn": {}, "DomainZoneId": {}}}).encode()
