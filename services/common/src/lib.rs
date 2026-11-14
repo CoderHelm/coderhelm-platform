@@ -207,6 +207,7 @@ pub mod lockfile_sync;
 pub mod model_provider;
 /// Files a run keeps as its outputs (reports, tables, snapshots).
 pub mod outputs;
+pub mod person_gate;
 /// Plugins: packages of skills, agents, tools, triggers and outputs a team installs.
 pub mod plugins;
 /// One shape for "something is wrong": set by a check, cleared by the same
@@ -214,6 +215,7 @@ pub mod plugins;
 pub mod problems;
 /// Where this deployment's dashboard and API are (links, redirects, webhooks).
 pub mod public_urls;
+pub mod registry_check;
 /// Who asked for a run: one identity per person, for per-person analytics.
 pub mod requester;
 /// What the reviewer did while it read a pull request, for the session page.

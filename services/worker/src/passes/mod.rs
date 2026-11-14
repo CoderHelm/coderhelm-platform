@@ -1327,6 +1327,7 @@ pub mod outside_exec;
 pub mod outside_work;
 pub mod own_review;
 pub mod ownership;
+pub(crate) mod person_gate;
 mod plan;
 pub mod plan_chat;
 pub(crate) mod plan_coverage;
@@ -7007,8 +7008,9 @@ async fn run_passes(
     if let Some(h) = &habits_pr {
         gaps.extend(habits_check::open_findings(h, &plan_result));
     }
-    // What the stop judge assumed instead of asking: an Open item a person
-    // corrects if it's wrong.
+    // What the stop judge proceeded on: through the settle stage's person
+    // gate, a note with what settled or decided it, a person's item only
+    // for a listed reason (`common::person_gate`).
     gaps.extend(stop_judge::assumptions(state, &msg.team_id, run_id).await);
     // --- Settle: what CoderHelm can run itself is run, never listed ---
     // A check an item waits on, the package manager's audit after a change

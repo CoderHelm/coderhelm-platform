@@ -352,7 +352,8 @@ fn a_check_refused_for_lack_of_time_is_owed_and_run_in_a_fresh_step() {
         Plan {
             checks: true,
             kinds: vec![],
-            audit: false
+            audit: false,
+            registry: false,
         }
     );
     let rec = Record::default();
@@ -410,10 +411,13 @@ fn what_stays_on_the_pull_request_names_why() {
     let settled = settle::apply(items, &facts, &Record::default());
     assert_eq!(settled.open.len(), 3);
     let section = proof::gaps_section(&settled.open);
+    // Each names why CoderHelm can't, through the person gate
+    // (`bf_owns_the_work`): access only a person grants, a yes/no on
+    // CoderHelm's recommendation for a key rotation, a credential.
     for why in [
-        "Only a person can settle this: access CoderHelm doesn't have.",
-        "Only a person can settle this: a product decision.",
-        "Only a person can settle this: a credential only a person can provide.",
+        "CoderHelm can't: it needs a permission only a person can grant",
+        "CoderHelm recommends going ahead as built and has done the work that way",
+        "CoderHelm can't: a credential only a person can provide",
     ] {
         assert!(section.contains(why), "{why}\n{section}");
     }

@@ -51,6 +51,7 @@ use tracing::{info, warn};
 
 use common::dep_audit;
 use common::handback::{human_only_in, HumanOnly};
+use common::person_gate;
 use common::upgrade_quality::verify as vq;
 
 use super::checks::{CheckKind, Step};
@@ -78,6 +79,9 @@ pub enum Action {
     /// that says a lockfile is out of sync with its manifest is settled by
     /// them on the head as it is, never carried from an earlier head.
     LockSync,
+    /// The package registry's records of the versions the lockfiles pin:
+    /// integrity hashes and maintainers (`common::registry_check`).
+    Registry,
 }
 
 /// What settles an open item.
@@ -89,11 +93,49 @@ pub enum Class {
     Ci,
     /// It does not apply to this run: never raised.
     NotApplicable(&'static str),
-    /// Only a person has what it needs.
+    /// Only a person has what it needs (a plan or preview's credentials).
     Human(HumanOnly),
+    /// The gate (`common::person_gate`) found only a person can do it.
+    Person(Box<person_gate::HumanItem>),
+    /// Settled by the ticket, the repository or the team, or decided by
+    /// CoderHelm where nothing settled it: one line in the evidence.
+    Noted(String),
+    /// A sign-off that belongs to the reviewer's merge decision.
+    Review(String),
     /// CoderHelm's own work left: a fix round's gap, a check the change did
     /// not pass, a security item, a deferral with its reason.
     Own,
+}
+
+/// A finding as an item for the gate.
+pub fn ask_of(f: &Finding) -> person_gate::Ask {
+    let kind = if f.point.trim() == proof::JUDGE_ASSUMPTION {
+        person_gate::Kind::Assumption
+    } else {
+        person_gate::Kind::OpenItem
+    };
+    person_gate::Ask {
+        kind,
+        topic: f.topic.clone(),
+        text: f.detail.split_whitespace().collect::<Vec<_>>().join(" "),
+        how: f.settle.clone(),
+        owner: String::new(),
+        why_not: String::new(),
+        options: Vec::new(),
+    }
+}
+
+/// What the gate makes of an item that would otherwise go to a person.
+fn gate_class(f: &Finding, facts: &Facts) -> Class {
+    use person_gate::{Outcome, Work};
+    match person_gate::decide(&ask_of(f), &person_gate::Context::default()) {
+        Outcome::Do(Work::Registry(_)) if facts.dep_change => Class::Run(vec![Action::Registry]),
+        Outcome::Do(_) => Class::Own,
+        Outcome::Settled { note, .. } => Class::Noted(note),
+        Outcome::Decided(d) => Class::Noted(d.line()),
+        Outcome::Review(r) => Class::Review(r),
+        Outcome::Human(h) => Class::Person(Box::new(h)),
+    }
 }
 
 /// What a run is, for classifying its items.
@@ -214,7 +256,9 @@ pub fn classify(f: &Finding, facts: &Facts) -> Class {
     }
     match point {
         "ci_pending" => return Class::Ci,
-        "manual_check" => return Class::Human(HumanOnly::PersonAction),
+        // A check by hand: a look belongs to the review; anything else the
+        // gate decides.
+        "manual_check" => return gate_class(f, facts),
         "check_blocked" | "rule_failing" | "security" | "security_unchecked" | "optional_task"
         | "planned_work" => return Class::Own,
         // A step outside the pull request the plan names without an owner
@@ -227,13 +271,23 @@ pub fn classify(f: &Finding, facts: &Facts) -> Class {
                      pull request",
                 )
             } else {
-                Class::Human(HumanOnly::ProductDecision)
+                gate_class(f, facts)
             };
         }
-        p if p == proof::JUDGE_ASSUMPTION => {
-            return Class::Human(human_only_in(&text).unwrap_or(HumanOnly::ProductDecision));
-        }
+        p if p == proof::JUDGE_ASSUMPTION => return gate_class(f, facts),
         _ => {}
+    }
+    // A registry lookup (maintainers, integrity, `npm view`) is CoderHelm's
+    // to run, never a reader's.
+    if matches!(
+        person_gate::decide(&ask_of(f), &person_gate::Context::default()),
+        person_gate::Outcome::Do(person_gate::Work::Registry(_))
+    ) {
+        return if facts.dep_change {
+            Class::Run(vec![Action::Registry])
+        } else {
+            Class::Own
+        };
     }
     let kind = CheckKind::parse(&f.check);
     if kind == Some(CheckKind::Security) || names_audit(&text) {
@@ -251,8 +305,15 @@ pub fn classify(f: &Finding, facts: &Facts) -> Class {
             None => Class::Own,
         };
     }
-    if let Some(why) = human_only_in(&text) {
-        return Class::Human(why);
+    // Words that name something only a person has go to the gate, which
+    // lets through only a listed reason.
+    if human_only_in(&text).is_some()
+        || matches!(
+            person_gate::decide(&ask_of(f), &person_gate::Context::default()),
+            person_gate::Outcome::Human(_)
+        )
+    {
+        return gate_class(f, facts);
     }
     // A gap whose own words say the repository's checks settle it.
     if matches!(point, "assumption" | "external_fact" | "team_rule") {
@@ -367,6 +428,14 @@ pub struct Record {
     /// The kinds that fail on this head and on the base branch too: not
     /// caused by the change, so never fixed or taken out for.
     pub base_fails: Vec<String>,
+    /// Each package line's registry check (`registry_check::Looked::line`).
+    pub registry: Vec<String>,
+    /// The lines whose lockfile hash differs from the registry's.
+    pub registry_findings: Vec<String>,
+    /// The registry check ran on this head.
+    pub registry_checked: bool,
+    /// Why the registry check gave no result, when it gave none.
+    pub registry_failed: String,
 }
 
 impl Record {
@@ -520,6 +589,8 @@ pub struct Plan {
     /// The kinds the items ask for.
     pub kinds: Vec<CheckKind>,
     pub audit: bool,
+    /// The registry's records of the moved package lines.
+    pub registry: bool,
 }
 
 /// What to run for `items`: the checks when an item names one or the coder
@@ -531,6 +602,7 @@ pub fn plan(items: &[Finding], facts: &Facts) -> Plan {
     let mut p = Plan {
         checks: facts.checks_owed || facts.dep_change,
         audit: facts.dep_change,
+        registry: facts.dep_change,
         ..Default::default()
     };
     for f in items {
@@ -538,6 +610,7 @@ pub fn plan(items: &[Finding], facts: &Facts) -> Plan {
             for a in actions {
                 match a {
                     Action::Audit => p.audit = true,
+                    Action::Registry => p.registry = true,
                     Action::LockSync => p.checks = true,
                     Action::Check(k) => {
                         p.checks = true;
@@ -623,6 +696,14 @@ pub struct Settled {
     pub closed: Vec<(Finding, String)>,
     /// Items that do not apply to this run, each with why.
     pub dropped: Vec<(Finding, &'static str)>,
+    /// What the ticket, the repository or the team settled, and what
+    /// CoderHelm decided where nothing did: one line each, for the
+    /// collapsed evidence, never an Open item.
+    pub noted: Vec<String>,
+    /// Sign-offs that belong to the reviewer's merge decision.
+    pub review: Vec<String>,
+    /// How many items went each way through the gate.
+    pub counts: person_gate::Counts,
 }
 
 /// The result that closes an item CoderHelm ran, when every action it
@@ -639,6 +720,28 @@ fn result_of(actions: &[Action], rec: &Record) -> Result<String, String> {
                 return Err(
                     "CoderHelm had no step with a full sandbox window left to run the audit".into(),
                 )
+            }
+            Action::Registry if rec.registry_checked && rec.registry_findings.is_empty() => {
+                proof.push(format!(
+                    "CoderHelm read the registry's record of each moved package line: {}",
+                    rec.registry.len()
+                ));
+                proof.push("every lockfile integrity hash matches the registry's".to_string());
+            }
+            Action::Registry if rec.registry_checked => {
+                return Err(format!(
+                    "CoderHelm read the registry: {}",
+                    rec.registry_findings.join("; ")
+                ))
+            }
+            Action::Registry if !rec.registry_failed.is_empty() => {
+                return Err(format!(
+                    "CoderHelm could not read the registry: {}",
+                    rec.registry_failed
+                ))
+            }
+            Action::Registry => {
+                return Err("CoderHelm had no step left to read the package registry".into())
             }
             Action::LockSync if rec.checked && !rec.passed.is_empty() => {
                 proof.push(format!(
@@ -718,7 +821,19 @@ fn result_of(actions: &[Action], rec: &Record) -> Result<String, String> {
 /// missing fact is named once, and what stays says why.
 pub fn apply(items: Vec<Finding>, facts: &Facts, rec: &Record) -> Settled {
     let mut out = Settled::default();
-    let classed: Vec<(Finding, Class)> = items
+    // The same decision written on several attempts or rounds, in other
+    // words, is one item in its latest wording (`person_gate::gate`).
+    let mut latest: Vec<Finding> = Vec::new();
+    for f in items {
+        match latest
+            .iter()
+            .position(|k| person_gate::same_decision(&ask_of(k), &ask_of(&f)) && k.point == f.point)
+        {
+            Some(i) => latest[i] = f,
+            None => latest.push(f),
+        }
+    }
+    let classed: Vec<(Finding, Class)> = latest
         .into_iter()
         .map(|f| {
             let c = classify(&f, facts);
@@ -728,16 +843,54 @@ pub fn apply(items: Vec<Finding>, facts: &Facts, rec: &Record) -> Settled {
     for (mut f, class) in dedup(classed) {
         match class {
             Class::NotApplicable(why) => out.dropped.push((f, why)),
-            Class::Run(actions) => match result_of(&actions, rec) {
-                Ok(proof) => out.closed.push((f, proof)),
-                Err(why) => {
-                    f.needs = why;
-                    out.open.push(f);
+            Class::Run(actions) => {
+                out.counts.done += 1;
+                match result_of(&actions, rec) {
+                    Ok(proof) => out.closed.push((f, proof)),
+                    // A registry check that found a mismatch: the finding
+                    // below says it, once.
+                    Err(_) if actions == [Action::Registry] && rec.registry_checked => {}
+                    Err(why) => {
+                        // CoderHelm ran it: what came back, never the
+                        // command for a reader to run.
+                        f.settle = String::new();
+                        f.needs = why;
+                        out.open.push(f);
+                    }
                 }
-            },
+            }
             Class::Human(why) => {
-                f.needs = format!("Only a person can settle this: {}", why.label());
+                // Through the gate, with the reason it was written for.
+                let mut ask = ask_of(&f);
+                ask.why_not = why.label().to_string();
+                match person_gate::for_reason(why, &ask) {
+                    Some(h) => {
+                        out.counts.human += 1;
+                        f.needs = person_needs(&h);
+                        out.open.push(f);
+                    }
+                    None => {
+                        out.counts.done += 1;
+                        out.open.push(f);
+                    }
+                }
+            }
+            Class::Person(h) => {
+                out.counts.human += 1;
+                f.detail = format!("{}.", h.action().trim_end_matches('.'));
+                f.settle = String::new();
+                f.needs = person_needs(&h);
                 out.open.push(f);
+            }
+            Class::Noted(line) => {
+                out.counts.settled += 1;
+                if !out.noted.contains(&line) {
+                    out.noted.push(line);
+                }
+            }
+            Class::Review(r) => {
+                out.counts.review += 1;
+                out.review.push(r);
             }
             // A check a passing sandbox run already answers needs no CI.
             Class::Ci
@@ -754,10 +907,92 @@ pub fn apply(items: Vec<Finding>, facts: &Facts, rec: &Record) -> Settled {
                 let proof = result_of(&[action], rec).unwrap_or_default();
                 out.closed.push((f, proof));
             }
-            Class::Ci | Class::Own => out.open.push(f),
+            Class::Ci => out.open.push(f),
+            Class::Own => {
+                out.counts.done += 1;
+                out.open.push(f);
+            }
+        }
+    }
+    // A mismatched hash is a finding CoderHelm acts on, never a chore.
+    for m in &rec.registry_findings {
+        let f = Finding {
+            point: "security".to_string(),
+            detail: format!("Supply chain: {m}."),
+            needs: "The lockfile does not pin what the registry serves for this version, so CoderHelm holds the pull request on it as a security item".to_string(),
+            ..Default::default()
+        };
+        if !out.open.iter().any(|o| o.detail == f.detail) {
+            out.open.push(f);
         }
     }
     out
+}
+
+/// The judge's assumptions on a run that stops before the settle stage,
+/// through the same gate: the items to list (a person's only for a listed
+/// reason) and the notes for the collapsed evidence. Other items pass as
+/// they are.
+pub fn gate_assumptions(items: &[Finding]) -> (Vec<Finding>, Vec<String>) {
+    let mut out: Vec<Finding> = Vec::new();
+    let mut noted: Vec<String> = Vec::new();
+    for f in items {
+        if f.point.trim() != proof::JUDGE_ASSUMPTION {
+            out.push(f.clone());
+            continue;
+        }
+        if out
+            .iter()
+            .any(|k| k.point == f.point && person_gate::same_decision(&ask_of(k), &ask_of(f)))
+        {
+            continue;
+        }
+        match gate_class(f, &Facts::default()) {
+            Class::Person(h) => {
+                let mut f = f.clone();
+                f.detail = format!("{}.", h.action().trim_end_matches('.'));
+                f.settle = String::new();
+                f.needs = person_needs(&h);
+                out.push(f);
+            }
+            Class::Noted(n) | Class::Review(n) => {
+                if !noted.contains(&n) {
+                    noted.push(n);
+                }
+            }
+            _ => noted.push(format!(
+                "CoderHelm proceeded on: {}",
+                f.detail.trim().trim_end_matches('.')
+            )),
+        }
+    }
+    (out, noted)
+}
+
+/// What an item only a person can do says after it: the options and the
+/// recommendation, why CoderHelm can't, and who can.
+fn person_needs(h: &person_gate::HumanItem) -> String {
+    let mut t = String::new();
+    if !h.options().is_empty() {
+        t.push_str(&format!("Options: {}. ", h.options().join("; or ")));
+    }
+    if !h.recommendation().is_empty() {
+        t.push_str(&format!(
+            "CoderHelm recommends {}{}. ",
+            h.recommendation().trim_end_matches('.'),
+            if h.yes_no() {
+                " and has done the work that way"
+            } else {
+                ""
+            }
+        ));
+    }
+    t.push_str(&format!(
+        "CoderHelm can't: {} ({})",
+        h.why_not().trim_end_matches('.'),
+        h.who()
+    ));
+    t
 }
 
 /// What the stage settled, for the pull request: each result quoted once.
@@ -768,8 +1003,35 @@ pub fn settled_section(settled: &Settled, rec: &Record) -> String {
         lines.extend(rec.checks.iter().cloned());
     }
     lines.extend(rec.audits.iter().map(|a| format!("- {a}")));
-    if lines.is_empty() {
+    lines.extend(rec.registry.iter().map(|a| format!("- {a}")));
+    if lines.is_empty() && settled.noted.is_empty() && settled.review.is_empty() {
         return String::new();
+    }
+    let decided = if settled.noted.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\nSettled or decided without asking:\n{}",
+            settled
+                .noted
+                .iter()
+                .map(|n| format!("- {n}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    };
+    // Sign-offs that belong to the merge decision, for the lead's review
+    // line (`description_facts::signoffs`): hidden here, said there.
+    let decided = format!(
+        "{decided}{}",
+        settled
+            .review
+            .iter()
+            .map(|r| format!("\n{SIGNOFF_START}{}{SIGNOFF_END}", r.replace("-->", "")))
+            .collect::<String>()
+    );
+    if lines.is_empty() {
+        return format!("{SETTLED_START}\n## Checked by CoderHelm{decided}\n{SETTLED_END}");
     }
     let closed = settled.closed.len();
     let commit: String = rec.head.chars().take(7).collect();
@@ -783,11 +1045,14 @@ pub fn settled_section(settled: &Settled, rec: &Record) -> String {
         )
     };
     format!(
-        "{SETTLED_START}\n## Checked by CoderHelm\n{lead}\n{}\n{SETTLED_END}",
+        "{SETTLED_START}\n## Checked by CoderHelm\n{lead}\n{}{decided}\n{SETTLED_END}",
         lines.join("\n")
     )
 }
 
+/// A sign-off for the review line, kept hidden in the settled section.
+pub const SIGNOFF_START: &str = "<!-- coderhelm:signoff ";
+pub const SIGNOFF_END: &str = " -->";
 pub const SETTLED_START: &str = "<!-- coderhelm:settled -->";
 pub const SETTLED_END: &str = "<!-- /coderhelm:settled -->";
 
@@ -1161,6 +1426,67 @@ async fn build(
     }
 }
 
+/// Reads the package registry's record of every package line the change
+/// moves (`common::registry_check`): the lockfile's integrity hash against
+/// the registry's, and who published the new version. CoderHelm has the
+/// network; nobody is asked to run the lookup.
+async fn registry(w: &proof::Work<'_>, audits: &[dep_audit::Audit], head: &str, rec: &mut Record) {
+    use common::registry_check as rc;
+    let (owner, name) = (&w.msg.repo_owner, &w.msg.repo_name);
+    let locks: Vec<&str> = audits
+        .iter()
+        .map(|a| a.lockfile.as_str())
+        .filter(|l| rc::supported(l))
+        .collect();
+    if locks.is_empty() {
+        rec.registry_failed = if audits.is_empty() {
+            "the change touches no lockfile".into()
+        } else {
+            "CoderHelm reads the npm registry; this change's lockfiles are for other package managers, whose audit ran instead".into()
+        };
+        return;
+    }
+    let mut moved = Vec::new();
+    for lock in locks {
+        let read = |r: String| async move { w.github.read_file_live(owner, name, lock, &r).await };
+        let head_text = match read(head.to_string()).await {
+            Ok(t) => t,
+            Err(e) => {
+                rec.registry_failed = format!("`{lock}` could not be read on the head ({e})");
+                return;
+            }
+        };
+        let base_text = read(w.msg.base_branch.clone()).await.unwrap_or_default();
+        moved.extend(rc::moved(
+            &rc::pins(lock, &base_text),
+            &rc::pins(lock, &head_text),
+        ));
+    }
+    moved.sort_by(|a, b| (&a.0.name, &a.0.version).cmp(&(&b.0.name, &b.0.version)));
+    moved.dedup_by(|a, b| a.0.name == b.0.name && a.0.version == b.0.version);
+    let looked = rc::check(&w.state.http, rc::NPM_REGISTRY, &moved).await;
+    rec.registry = looked.iter().map(rc::Looked::line).collect();
+    if moved.len() > rc::MAX_LOOKUPS {
+        rec.registry.push(format!(
+            "{} more moved lines were not looked up (CoderHelm reads at most {} a run)",
+            moved.len() - rc::MAX_LOOKUPS,
+            rc::MAX_LOOKUPS
+        ));
+    }
+    rec.registry_findings = looked
+        .iter()
+        .filter(|l| l.is_finding())
+        .map(rc::Looked::line)
+        .collect();
+    rec.registry_checked = true;
+    info!(
+        run_id = w.run_id,
+        looked = looked.len(),
+        findings = rec.registry_findings.len(),
+        "Settle: the package registry"
+    );
+}
+
 /// The settle stage: classifies `items`, runs what CoderHelm can run, acts
 /// on what comes back, and returns what goes on the pull request, or says
 /// the run goes on in a fresh step. `evidence` gains what ran.
@@ -1197,6 +1523,12 @@ pub async fn run(
                 }
             }
         }
+    }
+    // The registry is read over the network, with no sandbox: always, and
+    // first, so the checks after it see what it found.
+    if plan.registry && !rec.registry_checked && rec.registry_failed.is_empty() {
+        Box::pin(registry(w, &audits, &head, &mut rec)).await;
+        save(&rec);
     }
     loop {
         let dep_sets = match common::security_fixes::is_ticket(&w.msg.ticket_id) {
@@ -1336,7 +1668,7 @@ pub async fn run(
         }
     }
     Ran::Settled(
-        Box::new(write_down(w, items, &facts, &rec, evidence).await),
+        Box::new(Box::pin(write_down(w, items, &facts, &rec, evidence, usage)).await),
         rec,
     )
 }
@@ -1355,7 +1687,8 @@ pub async fn finish(
         l.settle.for_head(&head);
         l.settle.clone()
     });
-    let settled = write_down(w, items, &facts, &rec, evidence).await;
+    let mut usage = TokenUsage::default();
+    let settled = Box::pin(write_down(w, items, &facts, &rec, evidence, &mut usage)).await;
     (Box::new(settled), rec)
 }
 
@@ -1365,16 +1698,33 @@ async fn write_down(
     facts: &Facts,
     rec: &Record,
     evidence: &mut RunEvidence,
+    usage: &mut TokenUsage,
 ) -> Settled {
     rec.write_evidence(evidence);
-    let settled = apply(items.to_vec(), facts, rec);
+    let mut settled = apply(items.to_vec(), facts, rec);
+    // The model's check on what the gate left for a person: it can only
+    // take an item off that list or merge two.
+    {
+        let Settled {
+            open,
+            noted,
+            counts,
+            ..
+        } = &mut settled;
+        super::person_gate::refine(w.provider, w.msg, open, noted, counts, usage).await;
+    }
     info!(
         run_id = w.run_id,
         open = settled.open.len(),
         closed = settled.closed.len(),
         dropped = settled.dropped.len(),
+        done = settled.counts.done,
+        settled = settled.counts.settled,
+        review = settled.counts.review,
+        human = settled.counts.human,
         "Settle: the open items"
     );
+    super::person_gate::record_counts(w.state, &w.msg.team_id, w.run_id, &settled.counts).await;
     if !settled.closed.is_empty() || !settled.dropped.is_empty() {
         super::add_progress_note(
             w.state,
@@ -1455,10 +1805,10 @@ mod tests {
             "The billing table's column is unconfirmed: no connection reaches the warehouse.",
             "",
         );
-        assert_eq!(
-            classify(&access, &facts),
-            Class::Human(HumanOnly::MissingAccess)
-        );
+        match classify(&access, &facts) {
+            Class::Person(h) => assert_eq!(h.reason(), person_gate::Reason::Grant),
+            c => panic!("{c:?}"),
+        }
         // CI's are CI's.
         assert_eq!(classify(&f("ci_pending", "Lint.", ""), &facts), Class::Ci);
     }
@@ -1497,21 +1847,20 @@ mod tests {
             classify(&none, &by_rules),
             Class::NotApplicable(_)
         ));
-        // A feature's missing checklist is the team's to answer.
+        // A feature's missing checklist is CoderHelm's to write.
         let feature = Facts {
             intent: TicketIntent::Feature,
             ..Default::default()
         };
-        assert_eq!(
-            classify(&none, &feature),
-            Class::Human(HumanOnly::ProductDecision)
-        );
-        // A step the plan itself names without an owner stays, even for upkeep.
+        assert_eq!(classify(&none, &feature), Class::Own);
+        // A step the plan names without an owner stays, even for upkeep:
+        // rotating a key changes the security posture, so it is a yes/no
+        // on CoderHelm's recommendation.
         let unowned = f("end_to_end", "No owner is named for: rotate the key", "");
-        assert_eq!(
-            classify(&unowned, &chore()),
-            Class::Human(HumanOnly::ProductDecision)
-        );
+        match classify(&unowned, &chore()) {
+            Class::Person(h) => assert!(h.yes_no()),
+            c => panic!("{c:?}"),
+        }
     }
 
     #[test]
@@ -1663,14 +2012,21 @@ mod tests {
             &Record::default(),
         );
         assert_eq!(out.open.len(), 2);
-        assert_eq!(
-            out.open[0].needs,
-            "Only a person can settle this: a product decision"
+        assert!(
+            out.open[0]
+                .needs
+                .contains("CoderHelm recommends going ahead as built"),
+            "{}",
+            out.open[0].needs
         );
         // CoderHelm's own work left is not dressed up as a person's.
         assert!(out.open[1].needs.is_empty());
         let section = proof::gaps_section(&out.open);
-        assert!(section.contains("Only a person can settle this: a product decision"));
+        assert!(section.contains("CoderHelm can't:"), "{section}");
+        assert!(
+            common::person_gate::keeps_the_rules(&section).is_ok(),
+            "{section}"
+        );
     }
 
     fn room() -> Room {
@@ -1688,6 +2044,7 @@ mod tests {
             checks: true,
             kinds: vec![CheckKind::Build],
             audit: true,
+            registry: false,
         };
         let mut rec = Record::default();
         assert_eq!(next(&plan, &rec, &room()), Next::Build);
@@ -1735,6 +2092,7 @@ mod tests {
             checks: true,
             kinds: vec![CheckKind::Build],
             audit: false,
+            registry: false,
         };
         let mut rec = Record::default();
         rec.record_checks(
