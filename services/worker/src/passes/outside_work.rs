@@ -1731,6 +1731,7 @@ const NOT_DONE_END: &str = "<!-- coderhelm:not-done:end -->";
 
 /// What a person has to do for the steps not done, numbered, each with
 /// why CoderHelm did not and what lets it. Empty when nothing is needed.
+#[cfg(test)]
 pub fn not_done_block(c: &OutsideChange) -> String {
     let needed = pr_steps::needed(&steps_now(c, c.placed.is_some()));
     if needed.is_empty() {

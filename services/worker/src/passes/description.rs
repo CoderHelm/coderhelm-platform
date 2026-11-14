@@ -711,6 +711,13 @@ async fn build(
                 reply.as_deref(),
             );
             note_corrections(number, &shaped.corrections);
+            tracing::info!(
+                pr_number = number,
+                corrected = shaped.corrections.len(),
+                out_of_the_ordinary = common::pr_facts::anomalies(&shaped.facts).len(),
+                needed_from_a_person = common::pr_facts::needed_lines(&shaped.facts).len(),
+                "Description shaped from the facts of the head"
+            );
             shaped.body
         }
         // The head moved while it was read, or it could not be read: the
