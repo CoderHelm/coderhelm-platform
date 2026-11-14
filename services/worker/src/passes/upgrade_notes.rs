@@ -27,7 +27,7 @@ const BUDGET: Duration = Duration::from_secs(60);
 /// One registry read.
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
 
-async fn registry(state: &WorkerState, url: &str) -> Result<Value, String> {
+pub(crate) async fn registry(state: &WorkerState, url: &str) -> Result<Value, String> {
     let r = state
         .http
         .get(url)

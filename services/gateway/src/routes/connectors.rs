@@ -17,9 +17,12 @@ use axum::{
     http::StatusCode,
     Extension, Json,
 };
+use common::live::atlassian::{self, SignedIn};
 use common::live::aws::AwsTarget;
 use common::live::confluence::{check_site, Access, Confluence};
-use common::live::connectors::{self, check_page_ids, ConnKind, Connector, VIA_JIRA_APP};
+use common::live::connectors::{
+    self, check_page_ids, ConnKind, Connector, VIA_JIRA_APP, VIA_SIGN_IN,
+};
 use common::live::http::Https;
 use common::live::jira_app::{self, JiraApp};
 use common::live::newrelic::NewRelic;
@@ -217,12 +220,41 @@ async fn jira_app_of(state: &AppState, team_id: &str) -> Option<JiraApp> {
     jira_app::load(&state.dynamo, &state.config.jira_config_table_name, team_id).await
 }
 
-/// How to reach `c`'s Confluence: through the Jira app, or with `key`.
+/// The team's Atlassian sign-in, opened, when `c` reads Confluence with it.
+async fn signed_in_of(
+    state: &AppState,
+    team_id: &str,
+    c: &Connector,
+) -> Option<Result<SignedIn, StepError>> {
+    if !c.via_sign_in() {
+        return None;
+    }
+    let rt = super::mcp_servers::runtime(state, team_id);
+    Some(atlassian::confluence(&rt, &c.site).await)
+}
+
+/// How to reach `c`'s Confluence: with the team's Atlassian sign-in,
+/// through the Jira app, or with `key`.
 fn confluence_access<'a>(
     c: &Connector,
     key: &'a str,
     app: Option<&'a JiraApp>,
+    signed: Option<&'a Result<SignedIn, StepError>>,
 ) -> Result<Access<'a>, StepError> {
+    if c.via_sign_in() {
+        return match signed {
+            Some(Ok(s)) => Ok(Access::SignIn {
+                base: &s.base,
+                bearer: &s.bearer,
+            }),
+            Some(Err(e)) => Err(e.clone()),
+            None => Err(StepError::new(
+                "sign_in",
+                "The team isn't signed in to Confluence.",
+                "Sign in to Confluence in Settings, Integrations, Confluence.",
+            )),
+        };
+    }
     if !c.via_jira_app() {
         return Ok(Access::Token(key));
     }
@@ -246,6 +278,7 @@ async fn try_connection(
     c: &Connector,
     key: &str,
     app: Option<&JiraApp>,
+    signed: Option<&Result<SignedIn, StepError>>,
 ) -> Result<String, StepError> {
     match c.kind() {
         ConnKind::NewRelic => {
@@ -270,12 +303,14 @@ async fn try_connection(
         ConnKind::Confluence => {
             let who = Confluence {
                 conn: c,
-                access: confluence_access(c, key, app)?,
+                access: confluence_access(c, key, app, signed)?,
                 http: &Https,
             }
             .whoami()
             .await?;
-            if c.via_jira_app() {
+            if c.via_sign_in() {
+                Ok("Reads Confluence with the team's Atlassian sign-in".to_string())
+            } else if c.via_jira_app() {
                 Ok(format!("Connected through the Jira app (as {who})"))
             } else {
                 Ok(format!("Signed in as {who}"))
@@ -365,7 +400,19 @@ fn via_jira_app(asked: Option<&str>, saved: &Connector, key_sent: bool, app: boo
         Some(v) => v == VIA_JIRA_APP,
         None if key_sent => false,
         None if saved.via_jira_app() => true,
+        None if saved.via_sign_in() => false,
         None => app && saved.key_sealed.is_empty() && saved.site.is_empty(),
+    }
+}
+
+/// Whether a Confluence save reads with the team's Atlassian sign-in (the
+/// one made for Knowledge): when the page says so (`via`), or, when it
+/// doesn't, when the saved connection already does and no key is sent.
+/// Never on its own: an admin switches it on.
+fn via_sign_in(asked: Option<&str>, saved: &Connector, key_sent: bool) -> bool {
+    match asked {
+        Some(v) => v == VIA_SIGN_IN,
+        None => saved.via_sign_in() && !key_sent,
     }
 }
 
@@ -499,12 +546,30 @@ pub async fn save(
         None
     };
     let key_sent = text("key").is_some_and(|k| !k.is_empty());
+    let via_signin =
+        kind == ConnKind::Confluence && via_sign_in(body["via"].as_str(), &c, key_sent);
     let via_app = kind == ConnKind::Confluence
+        && !via_signin
         && via_jira_app(body["via"].as_str(), &c, key_sent, app.is_some());
 
     // Key: replaced only when one is sent.
     let mut key = String::new();
-    if via_app {
+    let mut signed: Option<Result<SignedIn, StepError>> = None;
+    if via_signin {
+        // The site stays the one already read with this sign-in; a first
+        // switch takes the site the sign-in reaches.
+        let want = if c.via_sign_in() {
+            c.site.clone()
+        } else {
+            String::new()
+        };
+        c.via = VIA_SIGN_IN.into();
+        c.key_sealed.clear();
+        c.key_hint.clear();
+        c.email.clear();
+        c.site = want;
+        signed = signed_in_of(&state, &claims.team_id, &c).await;
+    } else if via_app {
         c.via = VIA_JIRA_APP.into();
         c.key_sealed.clear();
         c.key_hint.clear();
@@ -573,6 +638,20 @@ pub async fn save(
                 return Err(fail(
                     StatusCode::BAD_REQUEST,
                     "Paste a New Relic user key (it starts with NRAK-).",
+                ));
+            }
+        }
+        ConnKind::Confluence if via_signin => {
+            match &signed {
+                Some(Ok(s)) => c.site = s.site.clone(),
+                Some(Err(e)) => return Err(step(e.clone())),
+                None => {}
+            }
+            confluence_settings(&body, &mut c)?;
+            if c.write_enabled {
+                return Err(fail(
+                    StatusCode::BAD_REQUEST,
+                    "The Atlassian sign-in only reads Confluence. To add text to pages, connect Confluence with an API token or the Jira app.",
                 ));
             }
         }
@@ -717,7 +796,7 @@ pub async fn save(
         }
     }
     let started = std::time::Instant::now();
-    let tested = try_connection(&state, &claims, &c, &key, app.as_ref()).await;
+    let tested = try_connection(&state, &claims, &c, &key, app.as_ref(), signed.as_ref()).await;
     record(
         &state,
         &claims,
@@ -776,8 +855,9 @@ pub async fn test(
             .await
             .map_err(|e| internal("open connector key", e))?
     };
+    let signed = signed_in_of(&state, &claims.team_id, &c).await;
     let started = std::time::Instant::now();
-    let tested = try_connection(&state, &claims, &c, &key, app.as_ref()).await;
+    let tested = try_connection(&state, &claims, &c, &key, app.as_ref(), signed.as_ref()).await;
     record(
         &state,
         &claims,
@@ -893,6 +973,18 @@ mod tests {
         assert!(!via_jira_app(None, &token_saved, false, true));
         assert!(via_jira_app(None, &empty, false, true));
         assert!(!via_jira_app(None, &empty, false, false));
+        // Reading with the team's Atlassian sign-in is switched on by an
+        // admin, never taken over by the Jira app, and a token replaces it.
+        let signed = Connector {
+            via: VIA_SIGN_IN.into(),
+            ..Connector::new(ConnKind::Confluence)
+        };
+        assert!(via_sign_in(Some(VIA_SIGN_IN), &empty, false));
+        assert!(!via_sign_in(None, &empty, false));
+        assert!(via_sign_in(None, &signed, false));
+        assert!(!via_sign_in(None, &signed, true));
+        assert!(!via_sign_in(Some(""), &signed, false));
+        assert!(!via_jira_app(None, &signed, false, true));
     }
 
     #[test]

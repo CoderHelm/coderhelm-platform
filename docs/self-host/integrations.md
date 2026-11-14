@@ -87,7 +87,7 @@ Two ways. A team picks one in **Settings, Integrations, Jira**.
 
 ## Monitoring and data sources
 
-New Relic, Confluence, OpenSearch, REST APIs, SQL databases, CloudWatch metrics and Airflow connect from **Settings, Integrations** or **Data sources** with keys or the AWS role. None needs an app of its own or a URL of CoderHelm's.
+New Relic, Confluence, OpenSearch, REST APIs, SQL databases, CloudWatch metrics and Airflow connect from **Settings, Integrations** or **Data sources** with keys or the AWS role. None needs an app of its own or a URL of CoderHelm's. A team signed in to Confluence for Knowledge needs no token for runs: its Confluence card on Settings, Integrations reads Connected, and Use in runs too lets agents read pages with the same sign-in (reading only).
 
 - **New Relic**\
   A user API key, and the US or EU region.
@@ -103,7 +103,7 @@ New Relic, Confluence, OpenSearch, REST APIs, SQL databases, CloudWatch metrics 
 - **Figma**\
   Figma's MCP server signs in only apps Figma approved, so CoderHelm runs Figma's tools against Figma's API with a sign-in (or a personal access token). Three ways, in Settings, Integrations, Figma:
   - **Sign in with Figma** (CoderHelm's app): on a hybrid install that uses Coderhelm's apps (the default, in Settings, System, Hybrid, Other apps), sign in. Nothing to create. CoderHelm keeps the sign-in (encrypted) and hands your install access tokens that expire within ten minutes; agents call Figma from your install.
-  - **Use my own Figma app**: create the app at https://www.figma.com/developers/apps under your Figma team or organization, add the redirect URI above, give it the `current_user:read` and `file_content:read` scopes, and publish it as a private app (no review from Figma; people in that team or organization can sign in). Paste its client id and secret there, then select Connect.
+  - **Use your own Figma app** (under Other ways to connect): create the app at https://www.figma.com/developers/apps under your Figma team or organization, add the redirect URI above, give it the `current_user:read` and `file_content:read` scopes, and publish it as a private app (no review from Figma; people in that team or organization can sign in). Paste its client id and secret there, then select Save and sign in with Figma.
   - **For every team on the install**: put a Figma app's `figma_client_id` and `figma_client_secret` in the install's secret. The card's Sign in with Figma then uses it, with no hybrid.
 - **With hybrid**\
   MCP sign-ins go to your install directly, except Figma when the install uses Coderhelm's apps and has no Figma app of its own (above).

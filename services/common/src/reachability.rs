@@ -108,7 +108,7 @@ pub fn is_test_path(path: &str) -> bool {
 /// Build and lint configuration (`vite.config.ts`, `.eslintrc.js`,
 /// `babel.config.js`): what it imports runs at build time. Counted as a
 /// mention, so the model reads it, never as a runtime import.
-fn is_tooling_config(path: &str) -> bool {
+pub fn is_tooling_config(path: &str) -> bool {
     let name = path.rsplit('/').next().unwrap_or(path).to_ascii_lowercase();
     let stem = name.split('.').next().unwrap_or("");
     name.starts_with('.')

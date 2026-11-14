@@ -62,6 +62,7 @@ use crate::security_fixes::{
     compare_versions, is_major_bump, version_line, Finding, FindingState, MajorBumps,
     SecurityConfig, Status, Tier, Verdict,
 };
+use crate::upgrade_quality::{family, verify as vq};
 
 // ── Limits ──────────────────────────────────────────────────────────────
 
@@ -82,6 +83,10 @@ pub const DEFAULT_RUN_BUDGET_CENTS: u32 = 300;
 /// Sandbox builds one run's runtime proof may start (the base branch's, the
 /// branch's, and one more for each commit of bumps the proof takes out).
 pub const MAX_PROOF_RUNS: u32 = 6;
+/// Sandbox builds one run's verification set may start (the branch's, the
+/// base branch's where the branch fails something, and again after a set
+/// of bumps is taken out).
+pub const MAX_VERIFY_RUNS: u32 = 5;
 
 // ── The plan ────────────────────────────────────────────────────────────
 
@@ -136,6 +141,31 @@ pub struct PlanBump {
     /// lists no patched release on the line, with the releases it does list.
     /// Empty for a bump that stays on its line; never empty for a major.
     pub major_reason: String,
+    /// The packages released with it that move in the same step
+    /// (`upgrade_quality::family`): applied, probed, committed and deferred
+    /// with it, never apart.
+    pub companions: Vec<Companion>,
+    /// Its family's key (the source repository), when it has one.
+    pub family: String,
+    /// What the family does in this run, in words: who moves with it, or
+    /// why it goes alone.
+    pub family_note: String,
+    /// The parent raised instead of writing an override for this package:
+    /// its release declares the fixed range
+    /// (`upgrade_quality::safety::parent_route`). The probe checks that
+    /// raising it moved the package; when it did not, this is cleared and
+    /// the override is written.
+    pub via_parent: Option<Companion>,
+}
+
+/// A package that moves with a bump because the two are released together.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct Companion {
+    pub package: String,
+    pub from: String,
+    pub to: String,
+    pub line: String,
 }
 
 impl PlanBump {
@@ -691,6 +721,7 @@ pub fn plan(members: &[(&Finding, &FindingState)], cfg: &SecurityConfig) -> DepP
                                 g.line
                             ),
                         },
+                        ..Default::default()
                     });
                 }
             }
@@ -808,11 +839,28 @@ pub fn specs(bumps: &[&PlanBump]) -> Vec<ApplySpec> {
             root: dir_of(&b.manifest),
             bumps: vec![],
         });
-        spec.bumps.push(ApplyBump {
-            name: b.package.clone(),
-            line: b.line.clone(),
-            to: b.to.clone(),
-        });
+        match &b.via_parent {
+            // The parent's release brings the fixed version in: raise it,
+            // and write no override for the package.
+            Some(p) => spec.bumps.push(ApplyBump {
+                name: p.package.clone(),
+                line: p.line.clone(),
+                to: p.to.clone(),
+            }),
+            None => spec.bumps.push(ApplyBump {
+                name: b.package.clone(),
+                line: b.line.clone(),
+                to: b.to.clone(),
+            }),
+        }
+        // Its family moves in the same step.
+        for c in &b.companions {
+            spec.bumps.push(ApplyBump {
+                name: c.package.clone(),
+                line: c.line.clone(),
+                to: c.to.clone(),
+            });
+        }
     }
     by.into_values().collect()
 }
@@ -998,6 +1046,41 @@ pub fn apply_skipped(output: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// What the lockfiles a probe wrote say against the run's families and the
+/// parents it raised: each family the lockfile installs at more than one
+/// version, as a sentence, and each package whose parent was raised
+/// instead of an override and that the lockfile still installs below its
+/// fixed version (the parent's release did not move it).
+pub fn lockfile_violations(
+    families: &[family::Family],
+    bumps: &[&PlanBump],
+    files: &[(String, String)],
+) -> (Vec<String>, Vec<String>) {
+    let mut split: Vec<String> = vec![];
+    let mut unmoved: Vec<String> = vec![];
+    for (path, text) in files {
+        let Some(copies) = crate::reachability::lock_copies(path, text) else {
+            continue;
+        };
+        split.extend(
+            family::splits(families, path, &copies)
+                .iter()
+                .map(family::Split::line),
+        );
+        for b in bumps.iter().filter(|b| b.via_parent.is_some()) {
+            let behind = copies.iter().any(|(n, v)| {
+                n.eq_ignore_ascii_case(&b.package)
+                    && version_line(v) == b.line
+                    && compare_versions(v, &b.to) == std::cmp::Ordering::Less
+            });
+            if b.manifest == *path && behind && !unmoved.contains(&b.package) {
+                unmoved.push(b.package.clone());
+            }
+        }
+    }
+    (split, unmoved)
+}
+
 /// The files a probe may hand back to commit: manifests and lockfiles,
 /// never what a build or test wrote.
 pub fn commit_path(path: &str) -> bool {
@@ -1051,6 +1134,10 @@ impl ProbeResult {
 pub const LOCKFILE_CHECK: &str = "lockfile";
 /// The install step's name.
 pub const INSTALL_CHECK: &str = "install";
+/// The check name for "the lockfile the bumps wrote installs a family
+/// released together at more than one version, or leaves a declared peer
+/// range unmet" (`upgrade_quality::family`).
+pub const FAMILY_CHECK: &str = "family";
 
 /// One set of bumps being verified together.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1120,8 +1207,64 @@ pub enum Action {
     /// ([`DepRun::take_out_last_commit`]) with this reason, then prove the
     /// branch again.
     ProofTakeOut { why: String },
+    /// Find what the verification set runs: the project's own install,
+    /// type check, build, lint, tests and production audit
+    /// (`upgrade_quality::verify::discover`).
+    VerifyPlan,
+    /// Run the verification set in a sandbox build of its own: on the
+    /// branch with the committed bumps, or on the base branch (`base`) when
+    /// the branch fails something, so a failure the base has too is never
+    /// blamed.
+    Verify { base: bool },
+    /// A check of the set fails with the bumps and passes without them:
+    /// take out the newest commit of verified bumps with this reason, then
+    /// verify the branch again.
+    VerifyTakeOut { why: String },
     /// Nothing left: open the pull request with what is committed.
     Done,
+}
+
+/// The verification set of one run (`upgrade_quality::verify`): what a
+/// dependency change is verified with whatever CI runs, on the branch with
+/// the bumps, and on the base branch where the branch fails something.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct Verification {
+    /// What runs, found once.
+    pub plan: Option<vq::Plan>,
+    /// The branch's results; they are of the commit they name.
+    pub head: Option<vq::Verified>,
+    pub base: Option<vq::Verified>,
+    /// Sandbox builds started for it.
+    pub runs: u32,
+    /// Builds in a row that gave no result.
+    pub broken: u32,
+    /// The run already moved to a fresh step for the next build.
+    pub waited: bool,
+    /// The sets of bumps it took out, as where their deferrals start in
+    /// the run's `deferred` and how many they are.
+    pub taken_out: Vec<(usize, usize)>,
+    /// What still fails with the bumps and passes without them, when no
+    /// further set could be taken out.
+    pub unresolved: Vec<String>,
+    /// Why the set did not run; empty when it did.
+    pub skipped: String,
+    pub done: bool,
+    /// What the package manager's audit listed on the branch (the
+    /// production audit and the audit of every dependency), read in the
+    /// same build as the branch's results.
+    pub audit: Option<crate::dep_audit::Listings>,
+}
+
+/// Why a bump the probes passed is deferred after all: a check of the
+/// verification set fails with it. `failing`: what fails.
+pub fn verify_deferral_reason(failing: &[String]) -> String {
+    format!(
+        "with it applied {} fail{}, which pass{} on the base branch; taken out so the bumps before it ship",
+        crate::truncate_str(&failing.join(", "), 300),
+        if failing.len() == 1 { "s" } else { "" },
+        if failing.len() == 1 { "es" } else { "" }
+    )
 }
 
 /// The runtime proof of one run: the repository's real build and its start
@@ -1211,6 +1354,21 @@ pub struct DepRun {
     pub commits: Vec<BatchCommit>,
     /// The build and the start, proven after the batches settle.
     pub proof: RuntimeProof,
+    /// The families of the plan's packages: released together, moved
+    /// together, and checked on every lockfile a probe writes.
+    pub families: Vec<family::Family>,
+    /// The peer ranges the plan's new releases declare.
+    pub peers: Vec<family::PeerRange>,
+    /// The verification set, run after the runtime proof.
+    pub verify: Verification,
+    /// The majors whose behaviour the runtime proof probes, each with its
+    /// requests (indices into the proof plan's `probes`), and the majors
+    /// it does not probe, each with why (`upgrade_quality::behaviour`).
+    pub probed: Vec<(String, Vec<usize>)>,
+    pub not_probed: Vec<(String, String)>,
+    /// The commit the run's upgrade evidence was last recorded on
+    /// (`upgrade_quality::UpgradeFacts`).
+    pub facts_sha: String,
 }
 
 /// One commit of verified bumps.
@@ -1292,8 +1450,13 @@ impl DepRun {
             self.applied.len(),
             self.probes,
             self.dropped.len() + self.deferred.len(),
-            self.proof.runs + u32::from(self.proof.waited) + u32::from(self.proof.plan.is_some()),
-            self.proof.taken_out.len()
+            self.proof.runs
+                + u32::from(self.proof.waited)
+                + u32::from(self.proof.plan.is_some())
+                + self.verify.runs
+                + u32::from(self.verify.waited)
+                + u32::from(self.verify.plan.is_some()),
+            self.proof.taken_out.len() + self.verify.taken_out.len()
         )
     }
 
@@ -1346,6 +1509,9 @@ impl DepRun {
                 }
                 if self.batch >= self.batches.len() {
                     if let Some(a) = self.proof_action() {
+                        return a;
+                    }
+                    if let Some(a) = self.verify_action() {
                         return a;
                     }
                     self.done = true;
@@ -1413,7 +1579,16 @@ impl DepRun {
             error,
         };
         let only_lock = checks.iter().all(|c| c == LOCKFILE_CHECK);
-        if b.major && b.risk() == Risk::UrgentMajor && !only_lock {
+        if checks.iter().any(|c| c == FAMILY_CHECK) {
+            // Not a call site the coder can change: the versions the
+            // lockfile resolves do not go together.
+            self.drop_bump(
+                d,
+                "the lockfile written with it installs packages released together at different versions",
+                false,
+                Cause::Parent,
+            );
+        } else if b.major && b.risk() == Risk::UrgentMajor && !only_lock {
             self.code_queue.push(d);
         } else if only_lock {
             self.drop_bump(
@@ -1573,7 +1748,7 @@ impl DepRun {
                 // Only the apply and the lockfile can fail without a base.
                 r.failing()
                     .into_iter()
-                    .filter(|c| c == LOCKFILE_CHECK)
+                    .filter(|c| c == LOCKFILE_CHECK || c == FAMILY_CHECK)
                     .collect()
             } else {
                 r.failing()
@@ -1938,6 +2113,171 @@ impl DepRun {
         self.proof.done = true;
     }
 
+    /// The verification set's next action, once the runtime proof is over;
+    /// `None` when the set is over (or has nothing to verify).
+    fn verify_action(&mut self) -> Option<Action> {
+        if self.verify.done {
+            return None;
+        }
+        let skip = |v: &mut Verification, why: String| -> Option<Action> {
+            v.skipped = why;
+            v.done = true;
+            None
+        };
+        if self.applied.is_empty() {
+            self.verify.done = true;
+            return None;
+        }
+        if self.unverified {
+            return skip(
+                &mut self.verify,
+                "the sandbox could not run the repository's commands on the base branch".into(),
+            );
+        }
+        let Some(plan) = self.verify.plan.clone() else {
+            return Some(Action::VerifyPlan);
+        };
+        if plan.is_empty() {
+            return skip(&mut self.verify, plan.none);
+        }
+        let spent = self.verify.runs >= MAX_VERIFY_RUNS;
+        let head = match &self.verify.head {
+            Some(h) if h.sha == self.head => h.clone(),
+            _ if spent => {
+                return skip(
+                    &mut self.verify,
+                    "the run's sandbox builds for it were used up before the branch's last commit was verified".into(),
+                )
+            }
+            _ => return Some(Action::Verify { base: false }),
+        };
+        if !head.ran || !vq::needs_base(&head) {
+            // No result (said as none), or nothing a change can be blamed
+            // for: over.
+            self.verify.done = true;
+            return None;
+        }
+        let base = match &self.verify.base {
+            Some(b) => b.clone(),
+            None if spent => {
+                self.verify.done = true;
+                return None;
+            }
+            None => return Some(Action::Verify { base: true }),
+        };
+        let blamed: Vec<String> = vq::blamed(&head, base.ran.then_some(&base))
+            .iter()
+            .map(|o| format!("the {} (`{}`)", o.kind.name(), o.shown))
+            .collect();
+        if blamed.is_empty() {
+            self.verify.done = true;
+            return None;
+        }
+        if self.commits.len() >= 2 && !spent {
+            return Some(Action::VerifyTakeOut {
+                why: verify_deferral_reason(&blamed),
+            });
+        }
+        // One commit left (the pull request is never emptied) or the
+        // builds are used up: what fails is said, and CI decides.
+        self.verify.unresolved = blamed;
+        self.verify.done = true;
+        None
+    }
+
+    /// What the verification set runs was found.
+    pub fn on_verify_plan(&mut self, plan: vq::Plan) {
+        self.verify.plan = Some(plan);
+    }
+
+    /// The set was not permitted or could not be set up: said, never a
+    /// claim.
+    pub fn skip_verify(&mut self, why: &str) {
+        self.verify.skipped = why.to_string();
+        self.verify.done = true;
+    }
+
+    /// The result of `Action::Verify`. A build that gave no result is run
+    /// once more before it stands as "no result".
+    pub fn on_verify(&mut self, base: bool, v: vq::Verified) {
+        self.verify.runs += 1;
+        self.verify.waited = false;
+        if !v.ran {
+            self.verify.broken += 1;
+            if self.verify.broken < MAX_BROKEN_PROBES && self.verify.runs < MAX_VERIFY_RUNS {
+                return;
+            }
+        }
+        self.verify.broken = 0;
+        if base {
+            self.verify.base = Some(v);
+        } else {
+            self.verify.head = Some(v);
+        }
+    }
+
+    /// The run moved to a fresh step so the next verification build has a
+    /// full time window.
+    pub fn on_verify_wait(&mut self) {
+        self.verify.waited = true;
+    }
+
+    /// `Action::VerifyTakeOut` was written to the branch, now at `head`:
+    /// the bumps it took out are deferred, and the branch is verified
+    /// again. The runtime proof stays of the commit it proved, and says so.
+    pub fn on_verify_taken_out(&mut self, out: &TakenOut, head: &str) {
+        let n = out.lines.len();
+        self.verify
+            .taken_out
+            .push((self.deferred.len().saturating_sub(n), n));
+        self.head = head.to_string();
+        self.verify.head = None;
+    }
+
+    /// `Action::VerifyTakeOut` could not be written: what fails is said,
+    /// and the pull request's own CI decides.
+    pub fn on_verify_take_out_failed(&mut self) {
+        let v = &self.verify;
+        self.verify.unresolved = match (&v.head, &v.base) {
+            (Some(head), Some(base)) => vq::blamed(head, base.ran.then_some(base))
+                .iter()
+                .map(|o| format!("the {} (`{}`)", o.kind.name(), o.shown))
+                .collect(),
+            _ => vec![],
+        };
+        self.verify.done = true;
+    }
+
+    /// The report's account of what the verification set took out or
+    /// could not settle. Its results are in the upgrade evidence.
+    fn verify_md(&self) -> String {
+        let v = &self.verify;
+        let mut s = String::new();
+        if !v.skipped.is_empty() {
+            s.push_str(&format!(
+                "\n**Verification set (the project's own install, type check, build, lint, tests and production audit):**\n- Not run: {}. Nothing here claims those checks pass; CI on this pull request is the check.\n",
+                v.skipped
+            ));
+            return s;
+        }
+        if v.taken_out.is_empty() && v.unresolved.is_empty() {
+            return s;
+        }
+        s.push_str("\n**Verification set:**\n");
+        for &(start, len) in &v.taken_out {
+            for d in self.deferred.iter().skip(start).take(len) {
+                s.push_str(&format!("- Taken out by it: {}\n", d.line()));
+            }
+        }
+        if !v.unresolved.is_empty() {
+            s.push_str(&format!(
+                "- Still failing with the bumps in this pull request: {}. It passes on the base branch, and no further set of bumps could be taken out here, so the pull request's CI decides.\n",
+                v.unresolved.join("; ")
+            ));
+        }
+        s
+    }
+
     /// The report's account of the runtime proof.
     fn proof_md(&self) -> String {
         let p = &self.proof;
@@ -1979,6 +2319,10 @@ impl DepRun {
             // The proof never ran to its end: said as not run, with why.
             self.proof.skipped = "the run had no step left for it".into();
             self.proof.done = true;
+        }
+        if !self.verify.done {
+            self.verify.skipped = "the run had no step left for it".into();
+            self.verify.done = true;
         }
         self.done = true;
     }
@@ -2040,6 +2384,15 @@ impl DepRun {
                     (false, _) => "same version line".to_string(),
                 }
             ));
+            if !b.family_note.is_empty() {
+                s.push_str(&format!("  - Its family: {}\n", b.family_note));
+            }
+            if let Some(p) = &b.via_parent {
+                s.push_str(&format!(
+                    "  - Fixed by raising its parent `{}` {} to {}, whose release declares the fixed range: no override.\n",
+                    p.package, p.from, p.to
+                ));
+            }
         }
         if applied.len() > 80 {
             s.push_str(&format!("- and {} more\n", applied.len() - 80));
@@ -2076,6 +2429,7 @@ impl DepRun {
         }
         if !self.applied.is_empty() {
             s.push_str(&self.proof_md());
+            s.push_str(&self.verify_md());
         }
         s.push_str(&format!(
             "\n**Cost:** {} sandbox probe(s){}; model ${:.2}",

@@ -915,6 +915,11 @@ impl Runtime {
                 }
             }
         }
+        // A new sign-in ends the ones it replaces: an earlier attempt by this
+        // person for this connection can't finish any more, so its record
+        // doesn't wait out its ten minutes (or longer, where the table
+        // doesn't expire records on its own).
+        self.end_pending(&s.id, Some(owner), Some(user_sub)).await;
         let pkce = oauth::Pkce::new();
         let state = oauth::new_state_for(flow);
         self.store
@@ -945,6 +950,39 @@ impl Runtime {
             &o.resource,
         )?;
         oauth::with_extra_params(&url, &o.extra_authorize)
+    }
+
+    /// Ends the team's sign-ins in progress for `server_id` (for one owner
+    /// and one person when given, else all of them), and every one of the
+    /// team's that has expired. Returns how many were removed. Never fails:
+    /// a record that stays is refused by [`Self::finish`] once it expires.
+    pub async fn end_pending(
+        &self,
+        server_id: &str,
+        owner: Option<&Owner>,
+        user_sub: Option<&str>,
+    ) -> usize {
+        let now = self.now();
+        let Ok(all) = self.store.list_pending(&self.team).await else {
+            return 0;
+        };
+        let mut ended = 0;
+        for p in all {
+            let replaced = p.server_id == server_id
+                && owner.is_none_or(|o| *o == p.owner)
+                && user_sub.is_none_or(|u| u == p.user_sub);
+            if (replaced || now > p.expires_at)
+                && self.store.delete_pending(&self.team, &p.key).await.is_ok()
+            {
+                ended += 1;
+            }
+        }
+        ended
+    }
+
+    /// Removes the team's expired sign-ins in progress (see [`Self::end_pending`]).
+    pub async fn sweep_pending(&self) -> usize {
+        self.end_pending("", None, None).await
     }
 
     /// Finishes a sign-in from the callback. The `state` is consumed first
@@ -1250,6 +1288,7 @@ impl Runtime {
         for t in self.store.list_tokens(&self.team, &s.id).await? {
             self.disconnect(s, &t.owner).await?;
         }
+        self.end_pending(&s.id, None, None).await;
         self.store.delete_server(&self.team, &s.id).await
     }
 }
@@ -1760,6 +1799,66 @@ mod tests {
         assert_eq!(q["scope"], "read write");
     }
 
+    /// A sign-in in progress never outlives its use: starting again ends
+    /// the earlier attempt, cancelling ends it, and expired ones are swept
+    /// (the table's own expiry isn't relied on).
+    #[tokio::test]
+    async fn a_new_sign_in_ends_the_one_it_replaces_and_expired_ones_are_swept() {
+        let r = rig("TEAM#a");
+        let mut s = server();
+        r.store.put_server("TEAM#a", &s).await.unwrap();
+        let state_of = |url: String| -> String {
+            reqwest::Url::parse(&url)
+                .unwrap()
+                .query_pairs()
+                .find(|(k, _)| k == "state")
+                .map(|(_, v)| v.into_owned())
+                .unwrap()
+        };
+        let cb = "https://app.example.com/cb/";
+        let first = state_of(
+            r.rt.start_sign_in(&mut s, &Owner::Team, "USER#1", "a@x.com", cb, None)
+                .await
+                .unwrap(),
+        );
+        // Another admin's attempt for the same server is theirs to finish.
+        r.rt.start_sign_in(&mut s, &Owner::Team, "USER#2", "b@x.com", cb, None)
+            .await
+            .unwrap();
+        assert_eq!(r.store.list_pending("TEAM#a").await.unwrap().len(), 2);
+        // The same person starts again: their first attempt is gone.
+        r.rt.start_sign_in(&mut s, &Owner::Team, "USER#1", "a@x.com", cb, None)
+            .await
+            .unwrap();
+        let left = r.store.list_pending("TEAM#a").await.unwrap();
+        assert_eq!(left.len(), 2);
+        assert!(left.iter().all(|p| p.key != oauth::state_key(&first)));
+        assert!(r
+            .rt
+            .finish_sign_in(&first, Some("code"), None, None, "USER#1", "a@x.com")
+            .await
+            .unwrap_err()
+            .contains("already used or has expired"));
+        // Cancelling ends only that person's attempt.
+        assert_eq!(
+            r.rt.end_pending("docs", Some(&Owner::Team), Some("USER#1"))
+                .await,
+            1
+        );
+        assert_eq!(r.store.list_pending("TEAM#a").await.unwrap().len(), 1);
+        // Nothing expired yet, so a sweep leaves the other one alone.
+        assert_eq!(r.rt.sweep_pending().await, 0);
+        r.now.fetch_add(PENDING_TTL_SECS + 1, Ordering::SeqCst);
+        assert_eq!(r.rt.sweep_pending().await, 1);
+        assert!(r.store.list_pending("TEAM#a").await.unwrap().is_empty());
+        // Removing a server takes its sign-ins in progress with it.
+        r.rt.start_sign_in(&mut s, &Owner::Team, "USER#1", "a@x.com", cb, None)
+            .await
+            .unwrap();
+        r.rt.remove(&s).await.unwrap();
+        assert!(r.store.list_pending("TEAM#a").await.unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn sign_in_end_to_end_binds_state_iss_and_person() {
         let r = rig("TEAM#a");
@@ -1835,23 +1934,6 @@ mod tests {
             .unwrap_err()
             .contains("already used"));
 
-        // A fresh one, finished by its starter with the right issuer.
-        let url =
-            r.rt.start_sign_in(
-                &mut s,
-                &Owner::Team,
-                "USER#1",
-                "a@x.com",
-                "https://app.example.com/cb/",
-                None,
-            )
-            .await
-            .unwrap();
-        let q: HashMap<String, String> = reqwest::Url::parse(&url)
-            .unwrap()
-            .query_pairs()
-            .into_owned()
-            .collect();
         r.http.on(Method::Post, TOKEN, fjson(200, json!({"access_token": "at-1", "token_type": "Bearer", "expires_in": 3600, "refresh_token": "rt-1"})));
         // Wrong issuer: refused before any token request.
         let url2 =
@@ -1883,6 +1965,25 @@ mod tests {
             .await
             .is_err());
         assert!(r.http.sent_to(TOKEN).is_empty());
+        // A fresh one, finished by its starter with the right issuer.
+        // (Started after the refused one: a person's new sign-in ends
+        // their earlier attempt for the same connection.)
+        let url =
+            r.rt.start_sign_in(
+                &mut s,
+                &Owner::Team,
+                "USER#1",
+                "a@x.com",
+                "https://app.example.com/cb/",
+                None,
+            )
+            .await
+            .unwrap();
+        let q: HashMap<String, String> = reqwest::Url::parse(&url)
+            .unwrap()
+            .query_pairs()
+            .into_owned()
+            .collect();
         let (back, owner) =
             r.rt.finish_sign_in(
                 &q["state"],
