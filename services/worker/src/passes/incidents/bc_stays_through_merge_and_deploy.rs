@@ -86,7 +86,11 @@ fn a_moved_base_and_late_red_checks_are_picked_up_without_a_retry() {
     let perform = fn_src(include_str!("../pr_watch.rs"), "\nasync fn perform(");
     assert!(perform.contains("super::resume::start_conflict_round("));
     assert!(perform.contains("send_ci_fix(state, c)"));
-    assert!(perform.contains("super::review_pr::review_for_ready("));
+    assert!(perform.contains("review_head(state, c, &seen.head)"));
+    assert!(
+        fn_src(include_str!("../pr_watch.rs"), "\nasync fn review_head(")
+            .contains("super::review_pr::review_for_ready(")
+    );
     assert!(perform.contains("super::resume::queue_own_review_round("));
     assert!(perform.contains("super::health_check::schedule_own("));
     // Checks red on the base too are not sent to the fix loop.

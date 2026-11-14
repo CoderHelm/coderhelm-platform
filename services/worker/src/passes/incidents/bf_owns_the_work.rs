@@ -197,6 +197,7 @@ fn the_review_line_states_coderhelms_conclusion_and_asks_only_to_merge() {
                 moved: true,
                 major: true,
                 remaining: vec![],
+                fixed: vec![],
             }],
             majors: vec![MajorEvidence {
                 package: "tiny-yaml".into(),
@@ -209,9 +210,11 @@ fn the_review_line_states_coderhelms_conclusion_and_asks_only_to_merge() {
         ..Default::default()
     };
     let lead = pr_facts::lead(&f);
-    assert!(lead.contains("**Review:** decide whether to merge 1 dependency update. CoderHelm's conclusion: the major version jump is safe for this code"), "{lead}");
+    // Review focus asks for the merge decision and states the conclusion.
+    assert!(lead.contains("- Approach: decide whether to merge 1 dependency update. CoderHelm's conclusion: the major version jump is safe for this code"), "{lead}");
     assert!(!lead.contains("Feedback wanted"), "{lead}");
-    assert!(lead.contains("**Needed from you:** Nothing."), "{lead}");
+    // Nothing is needed from a person: the section is not there.
+    assert!(!lead.contains("Needed from you"), "{lead}");
 }
 
 #[test]
@@ -274,10 +277,13 @@ fn the_second_pull_requests_three_items() {
         ..Default::default()
     };
     let lead = pr_facts::lead(&f);
+    // The look is part of the review: shown under Review focus, never a
+    // chore under "Needed from you".
     assert!(
-        lead.contains("Your merge decision also signs off: Look at Studio"),
+        lead.contains("- See it: Studio: the landing document, hero Sub Title field."),
         "{lead}"
     );
+    assert!(!lead.contains("judgement only a person"), "{lead}");
     assert_eq!(pr_facts::needed_lines(&f).len(), 1, "{lead}");
     assert_eq!(lead.matches("npm run deploy:staging").count(), 1, "{lead}");
     // A checklist step owned by CoderHelm is CoderHelm's work.

@@ -1155,21 +1155,28 @@ async fn fix_own_findings(ctx: &Ctx<'_>, run_id: &str, f: &mut Facts) {
         super::resume::OwnRound::Person(why) => {
             info!(pr = ctx.pr, run_id, why = %why, "No fix round for the own review's findings now");
         }
-        super::resume::OwnRound::Defer(why) => {
-            // The run's rounds on them are over (the supervisor's rule): they
-            // are deferred on the pull request with the reason and hold
-            // nothing, so the draft waits only on what else holds it.
-            let body = super::own_review::defer_findings(&f.body, &items, &why);
+        super::resume::OwnRound::Defer(lines) => {
+            // Every finding left is settled with its own reason (a
+            // person-gate reason, or the ticket's words): listed on the pull
+            // request and holding nothing, so the draft waits only on what
+            // else holds it.
+            let why = "each with the reason it is not fixed in the code";
+            let body = super::own_review::defer_findings(&f.body, &lines, why);
             match crate::passes::description::save(ctx.github, ctx.owner, ctx.repo, ctx.pr, &body)
                 .await
             {
                 Ok(_) => {
-                    info!(pr = ctx.pr, run_id, why = %why, "The run's rounds on its own review's findings are over: deferred");
+                    info!(
+                        pr = ctx.pr,
+                        run_id,
+                        deferred = lines.len(),
+                        "Own review findings settled with their reasons"
+                    );
                     super::add_progress_note(
                         ctx.state,
                         ctx.team_id,
                         run_id,
-                        &super::own_review::finish_reason(&items, &why),
+                        &super::own_review::finish_reason(&lines, why),
                     )
                     .await;
                     f.body = body;

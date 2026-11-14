@@ -1027,6 +1027,62 @@ pub async fn converse_tool_loop(
                 }));
                 continue;
             }
+            // A name models are trained on (`bash`, `Edit`, `str_replace_based_edit_tool`)
+            // runs as the offered tool that does the same job, or is answered
+            // with what to use instead (`common::tool_aliases`).
+            let called_as = tool_name;
+            let (tool_name, tool_input) = match common::tool_aliases::resolve(
+                called_as,
+                tool_input,
+                &|n: &str| tools.iter().any(|t| t.name == n),
+            ) {
+                Some(common::tool_aliases::Resolution::Run { tool, input }) => {
+                    info!(called_as = %called_as, tool = %tool, "Running a well known tool name as its equivalent");
+                    (
+                        std::borrow::Cow::Owned(tool),
+                        std::borrow::Cow::Owned(input),
+                    )
+                }
+                Some(common::tool_aliases::Resolution::Answer(text)) => {
+                    let outcome = common::agent_log::ToolOutcome::refused(format!(
+                        "not run: no {called_as} here, told what to use instead"
+                    ));
+                    if let Some(o) = observer {
+                        o.on_tool_ended(&super::llm::ToolEnded {
+                            name: called_as,
+                            input: tool_input,
+                            tool_use_id: tool_id,
+                            started_at: &started_at,
+                            duration_ms: 0,
+                            is_error: true,
+                            outcome: &outcome,
+                        });
+                    }
+                    logged.push(logged_result(
+                        tool_id,
+                        called_as,
+                        &text,
+                        true,
+                        &started_at,
+                        0,
+                        &outcome,
+                    ));
+                    tool_results.push(json!({
+                        "type": "tool_result",
+                        "tool_use_id": tool_id,
+                        "content": text,
+                        "is_error": true
+                    }));
+                    continue;
+                }
+                None => (
+                    std::borrow::Cow::Borrowed(called_as.as_str()),
+                    std::borrow::Cow::Borrowed(tool_input),
+                ),
+            };
+            let aliased = tool_name.as_ref() != called_as.as_str();
+            let tool_name: &str = tool_name.as_ref();
+            let tool_input: &Value = tool_input.as_ref();
             let tool_start = std::time::Instant::now();
             info!(tool = %tool_name, "Executing tool");
 
@@ -1124,7 +1180,7 @@ pub async fn converse_tool_loop(
                     outcome: &outcome,
                 });
             }
-            logged.push(logged_result(
+            let mut entry = logged_result(
                 tool_id,
                 tool_name,
                 &content,
@@ -1132,7 +1188,14 @@ pub async fn converse_tool_loop(
                 &started_at,
                 duration_ms,
                 &outcome,
-            ));
+            );
+            if aliased {
+                // The call as it ran: the log shows the tool that did the
+                // work, with the input it took, and the name the model used.
+                entry["called_as"] = json!(called_as);
+                entry["input"] = tool_input.clone();
+            }
+            logged.push(entry);
             tool_results.push(if is_error {
                 json!({
                     "type": "tool_result",
@@ -2153,6 +2216,76 @@ mod accounting_tests {
         assert_eq!(seen[0].0, "tu0");
         assert_eq!(seen[0].1, r["started_at"].as_str().unwrap());
         assert!(seen[0].2.contains("soft_fail"));
+    }
+
+    /// A turn that calls `name` with `input` (raw JSON).
+    fn named_turn(id: &str, name: &str, input: &str) -> String {
+        sse(&[
+            start(5, 0, 0, 0),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":id,"name":name,"input":{}}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":input}}),
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":40}}),
+            json!({"type":"message_stop"}),
+        ])
+    }
+
+    /// A call to another agent's tool name runs as the offered tool that
+    /// does the same job, logged as that tool with the name the model used;
+    /// a shell command that never runs here is answered with what to use,
+    /// and the executor never sees it.
+    #[tokio::test]
+    async fn a_well_known_tool_name_runs_as_its_equivalent() {
+        #[derive(Default)]
+        struct Seen(Mutex<Vec<(String, Value)>>);
+        #[async_trait::async_trait]
+        impl super::super::llm::ToolExecutor for Seen {
+            async fn execute(
+                &self,
+                name: &str,
+                input: &Value,
+            ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((name.to_string(), input.clone()));
+                Ok(json!("fn main() {}"))
+            }
+        }
+        let seen = Seen::default();
+        let mut log = Vec::new();
+        logged_loop(
+            vec![
+                named_turn("tu1", "Read", r#"{"file_path": "./src/a.rs"}"#),
+                named_turn("tu2", "bash", r#"{"command": "git push origin HEAD"}"#),
+                answer_turn(0, 0),
+            ],
+            10,
+            &seen,
+            &mut log,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            *seen.0.lock().unwrap(),
+            vec![("read_file".to_string(), json!({"path": "src/a.rs"}))]
+        );
+        let results: Vec<&Value> = log
+            .iter()
+            .filter(|e| e["role"] == "tool_results")
+            .flat_map(|e| e["content"].as_array().unwrap())
+            .collect();
+        assert_eq!(results[0]["tool"], "read_file");
+        assert_eq!(results[0]["called_as"], "Read");
+        assert_eq!(results[0]["input"], json!({"path": "src/a.rs"}));
+        assert_eq!(results[1]["tool"], "bash");
+        assert_eq!(results[1]["is_error"], true);
+        assert_eq!(results[1]["outcome"]["status"], "refused");
+        assert!(results[1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("CoderHelm pushes"));
     }
 
     /// A tool that says nothing is `ok`; a failed call is `error` with plain

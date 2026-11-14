@@ -811,6 +811,7 @@ Rules:
     let mut full_system = system.clone();
     full_system.push_str("\n\n");
     full_system.push_str(common::description_handoff::ROUND_NOTE);
+    full_system.push_str(common::tool_aliases::NO_SHELL_NOTE);
     // Live systems the team connected for this repo, if any: read-only lookups
     // so the fix rests on the system's real shape.
     let live = super::live_sources::LiveSources::load(
@@ -2419,14 +2420,16 @@ fn feedback_tools() -> Vec<ToolDefinition> {
                     "path": {"type": "string", "description": "File path relative to repo root"},
                     "edits": {
                         "type": "array",
-                        "description": "Array of search/replace edits to apply in order",
+                        "description": "A JSON array (not a string holding one) of search/replace edits, applied in order: [{\"old_text\": \"...\", \"new_text\": \"...\"}]",
+                        "minItems": 1,
                         "items": {
                             "type": "object",
                             "properties": {
                                 "old_text": {"type": "string", "description": "Exact text to find (must match uniquely)"},
                                 "new_text": {"type": "string", "description": "Replacement text"}
                             },
-                            "required": ["old_text", "new_text"]
+                            "required": ["old_text", "new_text"],
+                            "additionalProperties": false
                         }
                     },
                     "message": {"type": "string", "description": "Commit message"}
@@ -2669,7 +2672,7 @@ impl FeedbackToolExecutor<'_> {
             .is_ok()
         {
             crate::agent::tool_outcome::note(crate::agent::tool_outcome::ToolOutcome::soft_fail(
-                "refused: outside the round's files",
+                super::write_guard::refused_summary(path),
             ));
             return Some(refusal);
         }
@@ -2838,8 +2841,10 @@ impl<'a> ToolExecutor for FeedbackToolExecutor<'a> {
                 let message = input
                     .get("message")
                     .and_then(|v| v.as_str())
-                    .ok_or("Missing message")?;
-                let message: &str = &self.commit_message(message);
+                    .map(str::to_string)
+                    // A missing message never costs the edit a step.
+                    .unwrap_or_else(|| format!("Edit {path}"));
+                let message: &str = &self.commit_message(&message);
                 let original = self
                     .github
                     .read_file(self.owner, self.repo, path, self.branch)

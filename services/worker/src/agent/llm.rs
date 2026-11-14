@@ -103,22 +103,37 @@ impl LoopObserver for ToolCallFn {
     }
 }
 
-/// A tool call's input in one short line: its path, pattern or command when
-/// it has one, else the input itself cut to 200 bytes.
+/// A tool call's input in one short line the run page reads back
+/// (`parseInputSummary`): `key: value` for the fields that name what the
+/// call acts on (its path, with the lines of a range; its query, pattern or
+/// command), else the input itself as JSON cut to 200 bytes. A bare path
+/// read back as no fields at all, and the live log drew "Edited" and "Read"
+/// with no file, and an empty name in a list of files.
 pub fn input_summary(input: &Value) -> String {
-    if let Some(path) = input.get("path").and_then(|v| v.as_str()) {
-        path.to_string()
-    } else if let Some(pattern) = input.get("pattern").and_then(|v| v.as_str()) {
-        format!("pattern: {pattern}")
-    } else if let Some(command) = input.get("command").and_then(|v| v.as_str()) {
-        command.chars().take(200).collect()
-    } else {
-        let s = input.to_string();
-        if s.len() > 200 {
-            format!("{}…", common::truncate_str(&s, 200))
-        } else {
-            s
+    let field = |k: &str| input.get(k).and_then(|v| v.as_str()).map(str::trim);
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(path) = field("path").filter(|p| !p.is_empty()) {
+        parts.push(format!("path: {path}"));
+        for k in ["start_line", "end_line"] {
+            if let Some(n) = input.get(k).and_then(|v| v.as_u64()) {
+                parts.push(format!("{k}: {n}"));
+            }
         }
+    }
+    for k in ["query", "pattern", "command", "url", "host"] {
+        if let Some(v) = field(k).filter(|v| !v.is_empty()) {
+            parts.push(format!("{k}: {}", v.chars().take(200).collect::<String>()));
+            break;
+        }
+    }
+    if !parts.is_empty() {
+        return parts.join(", ");
+    }
+    let s = input.to_string();
+    if s.len() > 200 {
+        format!("{}…", common::truncate_str(&s, 200))
+    } else {
+        s
     }
 }
 
@@ -136,4 +151,32 @@ pub trait ToolExecutor: Send + Sync {
         name: &str,
         input: &Value,
     ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>>;
+}
+
+#[cfg(test)]
+mod input_summary_tests {
+    use super::input_summary;
+    use serde_json::json;
+
+    /// Every summary names what the call acted on, as `key: value`.
+    #[test]
+    fn the_summary_names_the_file_or_query() {
+        assert_eq!(
+            input_summary(&json!({"path": "src/a.ts", "edits": "[...]", "message": "m"})),
+            "path: src/a.ts"
+        );
+        assert_eq!(
+            input_summary(&json!({"path": "src/a.ts", "start_line": 3, "end_line": 9})),
+            "path: src/a.ts, start_line: 3, end_line: 9"
+        );
+        assert_eq!(
+            input_summary(&json!({"query": "scrollWidth <= window.innerWidth"})),
+            "query: scrollWidth <= window.innerWidth"
+        );
+        assert_eq!(
+            input_summary(&json!({"command": "npm test"})),
+            "command: npm test"
+        );
+        assert_eq!(input_summary(&json!({})), "{}");
+    }
 }

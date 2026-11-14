@@ -192,15 +192,24 @@ impl Slots {
             return Slots::default();
         };
         let lead = &body[a + LEAD_START.len()..a + b];
+        let key = lead
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("<!-- coderhelm:body v1 ticket="))
+            .and_then(|r| r.split_whitespace().next())
+            .filter(|k| *k != "none")
+            .unwrap_or("");
+        // The summary CoderHelm wrote, without the ticket link and the
+        // sentence about work outside the diff.
         let first = lead
             .lines()
-            .map(str::trim)
-            .find(|l| !l.is_empty())
-            .filter(|l| !l.starts_with("**"))
-            .unwrap_or("");
-        let check = lead
+            .find(|l| l.contains(crate::pr_body::SUMMARY_END))
+            .map(|l| crate::pr_body::summary_core(l, key))
+            .unwrap_or_default();
+        let first = first.as_str();
+        // The check a person can run, kept in the full evidence.
+        let check = body
             .lines()
-            .find_map(|l| l.trim().strip_prefix("**Check:**"))
+            .find_map(|l| l.trim().strip_prefix("How to check:"))
             .and_then(|l| {
                 let l = l.trim();
                 let cmd = l.strip_prefix('`')?.split('`').next()?;
@@ -301,6 +310,7 @@ mod tests {
                 path: "src/export/poller.rs".into(),
                 status: "modified".into(),
                 previous: String::new(),
+                changed: 0,
             }],
             files_complete: true,
             checks: vec![CheckFact {
@@ -359,7 +369,7 @@ mod tests {
     #[test]
     fn a_rebuild_without_a_model_keeps_the_slots_it_can_still_verify() {
         let body = format!(
-            "{LEAD_START}\nRetries a timed-out export poll 3 times before giving up.\n\n**Check:** `cargo test -p export`; 0 of 1 recorded checks passed on `abc1234`.\n**Needed from you:** Nothing.\n{LEAD_END}\n\n{WRITTEN}"
+            "{LEAD_START}\n<!-- coderhelm:body v1 ticket=OPS-41 head=abc1234 -->\nRetries a timed-out export poll 3 times before giving up (OPS-41).<!-- ch:summary-end -->\n\n### Review focus\n\n- Approach: does this do what OPS-41 asks?\n{LEAD_END}\n\n{WRITTEN}\n\nHow to check: `cargo test -p export`."
         );
         let s = Slots::from_body(&body, &facts());
         assert_eq!(

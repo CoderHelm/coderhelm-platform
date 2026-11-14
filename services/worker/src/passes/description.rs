@@ -108,22 +108,7 @@ fn note_corrections(number: u64, corrections: &[common::pr_claims::Correction]) 
 /// (the lead, the folds, the steps and evidence): what a model is given to
 /// rewrite, so it can neither reword a rendered part nor lose a fold.
 pub fn flat(body: &str) -> String {
-    let flat = common::pr_layout::unfold(body);
-    let mut out = flat;
-    for (start, end) in [
-        (common::pr_facts::LEAD_START, common::pr_facts::LEAD_END),
-        (
-            common::pr_steps::EVIDENCE_START,
-            common::pr_steps::EVIDENCE_END,
-        ),
-    ] {
-        if let (Some(a), Some(b)) = (out.find(start), out.find(end)) {
-            if b > a {
-                out = format!("{}{}", &out[..a], out[b + end.len()..].trim_start());
-            }
-        }
-    }
-    out
+    common::pr_layout::strip_generated(body)
 }
 
 /// A description about to be written for the first time, held against the
@@ -139,6 +124,7 @@ pub fn checked_for_diff(body: &str, diff: &serde_json::Value) -> String {
                 path: path.clone(),
                 status: status.clone(),
                 previous: String::new(),
+                changed: 0,
             })
             .collect(),
         files_complete: files.len() < super::description_facts::COMPARE_FILE_LIMIT,
@@ -299,6 +285,10 @@ pub fn checked_digest(body: &str) -> String {
     common::pr_claims::checked_digest(&without_stamp(body))
 }
 
+/// How much of the head the stamp keeps: enough to tell heads apart, never
+/// a full sha in the description.
+const STAMP_SHA: usize = 12;
+
 /// `body` stamped as built for `head` (one stamp, on its own last line),
 /// with the digest of the text that was checked.
 pub fn with_stamp(body: &str, head: &str) -> String {
@@ -307,10 +297,16 @@ pub fn with_stamp(body: &str, head: &str) -> String {
         return body.trim_end().to_string();
     }
     let digest = checked_digest(&body);
+    let head = head.get(..STAMP_SHA).unwrap_or(head);
     format!(
         "{}\n\n{STAMP_START}{head} {digest}{STAMP_END}",
         body.trim_end()
     )
+}
+
+/// Whether a stamp's head is `head` (a stamp keeps the start of the sha).
+fn same_head(stamped: &str, head: &str) -> bool {
+    stamped == head || (stamped.len() >= 7 && head.starts_with(stamped))
 }
 
 /// Whether the description was built for `head` and the text the fact check
@@ -319,7 +315,9 @@ pub fn with_stamp(body: &str, head: &str) -> String {
 pub fn is_current(body: &str, head: &str) -> bool {
     match stamp_parts(body) {
         Some((h, digest)) => {
-            !head.is_empty() && h == head && digest.is_none_or(|d| d == checked_digest(body))
+            !head.is_empty()
+                && same_head(h, head)
+                && digest.is_none_or(|d| d == checked_digest(body))
         }
         None => false,
     }
@@ -423,6 +421,8 @@ struct RunBits {
     convention_note: String,
     /// What the title's form was read from.
     convention_evidence: String,
+    /// The ticket's page in its tracker, when it is known.
+    ticket_url: String,
 }
 
 impl Gathered {
@@ -453,7 +453,7 @@ impl Gathered {
         .then(|| common::pr_facts::Why {
             reference,
             title: self.run.title.clone(),
-            url: String::new(),
+            url: self.run.ticket_url.clone(),
         });
         super::description_facts::facts(&super::description_facts::Inputs {
             head: self.head(),
@@ -478,6 +478,7 @@ impl Gathered {
                 .map(|e| format!("The title and commits follow {e}."))
                 .into_iter()
                 .collect(),
+            repo_url: self.pr["base"]["repo"]["html_url"].as_str().unwrap_or(""),
         })
     }
 }
@@ -517,6 +518,11 @@ async fn run_bits(
             .cloned()
             .unwrap_or_default()
     };
+    let ticket_url = if get("ticket_source") == "jira" {
+        super::conventions::ticket_url(state, team_id, &get("ticket_id")).await
+    } else {
+        String::new()
+    };
     (
         RunBits {
             ticket_id: get("ticket_id"),
@@ -530,6 +536,7 @@ async fn run_bits(
             decision: super::outside_exec::decision_of(&item),
             convention_note: get(CONVENTION_NOTE),
             convention_evidence: get(CONVENTION_EVIDENCE),
+            ticket_url,
         },
         run_id,
     )

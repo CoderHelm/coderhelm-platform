@@ -19,7 +19,7 @@
 
 use super::fixture::*;
 use crate::passes::completeness::{self, Section};
-use crate::passes::own_review::{self, Next};
+use crate::passes::own_review;
 use crate::passes::resume::draft_hold;
 use crate::passes::review_agent::{self, Finding};
 use crate::passes::review_pr::RunReview;
@@ -136,47 +136,59 @@ fn the_review_posts_never_approve_with_a_blocker_and_arms_nothing_on_open_findin
 }
 
 #[test]
-fn the_run_fixes_them_in_rounds_and_defers_what_the_rounds_cant_close() {
+fn the_run_fixes_them_in_rounds_and_never_defers_by_a_count_of_rounds() {
+    use crate::passes::own_review_ledger::{Approach, Ledger, Plan};
     use crate::passes::supervisor::Rung;
     let resume = include_str!("../resume.rs");
     // A review with open own findings fails the run's review: a fix round
     // follows, never ready_or_prove.
     assert!(resume.contains("own_review::fix_feedback(\n"));
     assert!(resume.contains("&rr.open_findings,"));
-    let open = vec!["A (`a.py:1`)".to_string(), "B (`b.py:2`)".to_string()];
+    let three = vec![
+        "A (`a.py:1`)".to_string(),
+        "B (`b.py:2`)".to_string(),
+        "C (`c.py:3`)".to_string(),
+    ];
+    let open = three[..2].to_vec();
     let mut end = Ending::default();
-    // Round 1 fixed one of three: progress, another round.
-    assert_eq!(
-        own_review::next(Some(3), &open, 0, 0, 0, 0.0),
-        Next::Fix {
-            stalled: 0,
-            rung: Rung::Continue
+    let mut l = Ledger::default();
+    l.observe(&three, "");
+    // Round 1 fixed one of three.
+    l.start_round(&three);
+    l.end_round(vec![], "");
+    l.observe(&open, "");
+    // The same two open after an honest round: each climbs its own ladder,
+    // one finding at a time, past the old cap of two.
+    for item in &open {
+        for rung in [
+            Rung::Narrow,
+            Rung::SwitchTools,
+            Rung::Resplit,
+            Rung::Escalate,
+        ] {
+            match l.decide(&open, 0.0, 200.0) {
+                Plan::Round {
+                    focus, approach, ..
+                } => {
+                    assert_eq!(approach, Approach::Ladder(rung));
+                    assert_eq!(&focus, &vec![item.clone()]);
+                    l.start_round(&focus);
+                    l.end_round(vec![], "");
+                }
+                other => panic!("{other:?}"),
+            }
+            l.observe(&open, "");
         }
-    );
-    // The same two open: the next round changes approach.
-    assert_eq!(
-        own_review::next(Some(2), &open, 0, 0, 1, 0.0),
-        Next::Fix {
-            stalled: 1,
-            rung: Rung::Narrow
-        }
-    );
-    // At the cap and still no progress: the findings are deferred on the
-    // pull request and the run finishes.
-    match own_review::next(Some(2), &open, 0, 1, own_review::MAX_FIX_ROUNDS, 0.0) {
-        Next::Finish { why } => {
-            end.status = common::run_status::COMPLETED.into();
-            let body = own_review::defer_findings(&own_review::section(&open), &open, &why);
-            end.draft = own_review::hold(&body).is_some();
-            end.said(own_review::finish_reason(&open, &why));
-        }
+    }
+    // Every approach taken and no reason only a person can give: never
+    // deferred, never "completed".
+    match l.decide(&open, 0.0, 200.0) {
+        Plan::Unfixed { why } => end.said(why),
         other => panic!("{other:?}"),
     }
-    assert_eq!(end.status, "completed");
-    assert!(!end.draft);
-    assert!(end.says("- [ ] A (`a.py:1`)"));
-    assert!(end.says("deferred"));
+    assert!(end.says("every approach"));
+    assert!(!end.says("deferred"));
     // Nothing open: ready.
-    assert_eq!(own_review::next(Some(2), &[], 1, 1, 2, 0.0), Next::Ready);
+    assert_eq!(l.decide(&[], 0.0, 200.0), Plan::Ready);
     end.never_says(OLD);
 }

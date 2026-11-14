@@ -261,6 +261,47 @@ impl Scope {
         s
     }
 
+    /// Every file the scope names (not its directories).
+    fn files(&self) -> impl Iterator<Item = &String> {
+        self.pr
+            .iter()
+            .chain(&self.plan)
+            .chain(&self.dependents)
+            .chain(&self.named)
+    }
+
+    /// Why a file outside the round's own files still goes with them: the
+    /// test of one of them (or the code a test of them covers), or the
+    /// module file that registers one (`index.ts`, `mod.rs`,
+    /// `__init__.py`) beside it. A round that changes code changes its
+    /// tests and its exports with it; refusing those cost a fix round two
+    /// edits it needed.
+    pub fn companion(&self, path: &str) -> Option<String> {
+        let p = normalize(path);
+        let (dir, name) = split(p);
+        if MODULE_FILES.contains(&name) {
+            if let Some(f) = self.files().find(|f| split(f).0 == dir && f.as_str() != p) {
+                return Some(format!(
+                    "the module file beside {f}, which this round changes"
+                ));
+            }
+        }
+        let (subject, is_test) = test_subject(p)?;
+        for f in self.files() {
+            let Some((other, other_test)) = test_subject(f) else {
+                continue;
+            };
+            if other == subject && is_test != other_test && same_package(p, f) {
+                return Some(if is_test {
+                    format!("the test of {f}, which this round changes")
+                } else {
+                    format!("the code {f} tests, which this round changes")
+                });
+            }
+        }
+        None
+    }
+
     /// Why `path` is one of the round's files; `None` when it is not.
     pub fn source(&self, path: &str) -> Option<Source> {
         let p = normalize(path);
@@ -277,6 +318,81 @@ impl Scope {
             None
         }
     }
+}
+
+/// Files that register a folder's modules.
+const MODULE_FILES: &[&str] = &[
+    "index.ts",
+    "index.tsx",
+    "index.js",
+    "index.mjs",
+    "mod.rs",
+    "lib.rs",
+    "__init__.py",
+];
+
+/// A path's folder and file name.
+fn split(p: &str) -> (&str, &str) {
+    p.rsplit_once('/').unwrap_or(("", p))
+}
+
+/// What a file is about, with its test markers taken off, and whether it is
+/// a test: `src/a.test.ts`, `src/__tests__/a.ts` and `tests/test_a.py` are
+/// tests of `a`; `src/a.ts` is `a`. `None` for a name with no stem.
+fn test_subject(p: &str) -> Option<(String, bool)> {
+    let (dir, name) = split(p);
+    let stem = name.split('.').next().filter(|s| !s.is_empty())?;
+    let middle: Vec<&str> = name.split('.').skip(1).collect();
+    let mut test = middle.iter().any(|m| *m == "test" || *m == "spec")
+        || dir
+            .split('/')
+            .any(|d| d == "__tests__" || d == "tests" || d == "test" || d == "spec");
+    let mut subject = stem;
+    for (pre, suf) in [("test_", ""), ("", "_test"), ("", "_spec")] {
+        if !pre.is_empty() {
+            if let Some(s) = subject.strip_prefix(pre) {
+                subject = s;
+                test = true;
+            }
+        } else if let Some(s) = subject.strip_suffix(suf) {
+            subject = s;
+            test = true;
+        }
+    }
+    (!subject.is_empty() && !MODULE_FILES.contains(&name))
+        .then(|| (subject.to_ascii_lowercase(), test))
+}
+
+/// Whether two paths are in the same package: the same app or package of
+/// a monorepo (`apps/web`, `packages/ui`, `services/api`), the same first
+/// folder otherwise, with `src/`, `lib/` and the test folders at the root
+/// counted as one package.
+fn same_package(a: &str, b: &str) -> bool {
+    fn package(p: &str) -> String {
+        let segs: Vec<&str> = p.split('/').collect();
+        if segs.len() < 2 {
+            return String::new();
+        }
+        match segs[0] {
+            "src" | "lib" | "tests" | "test" | "spec" | "__tests__" => String::new(),
+            "apps" | "packages" | "services" | "libs" | "crates" | "modules" | "projects"
+                if segs.len() > 2 =>
+            {
+                format!("{}/{}", segs[0], segs[1])
+            }
+            top => top.to_string(),
+        }
+    }
+    package(a) == package(b)
+}
+
+/// The outcome summary of an edit the guard refused: which file, and how
+/// it is edited after all. The run page shows it as the step's reason.
+pub fn refused_summary(path: &str) -> String {
+    format!(
+        "refused: {} is outside the round's files (edited once a reason is given)",
+        normalize(path)
+    )
 }
 
 /// Whether a token reads as a file path: no spaces, a file name with an
@@ -571,6 +687,11 @@ impl ScopeGuard {
                 self.record_outside(norm, &format!("named by {}", round.what()));
                 Ok(())
             }
+            None if scope.companion(norm).is_some() => {
+                let why = scope.companion(norm).unwrap_or_default();
+                self.record_outside(norm, &why);
+                Ok(())
+            }
             None => match stated_reason(why, norm) {
                 Some(why) => {
                     self.record_outside(norm, why);
@@ -825,6 +946,46 @@ mod scope_guard_tests {
                 "apps/web/src/lib/price.ts".to_string(),
                 "named by the review findings".to_string()
             )]
+        );
+    }
+
+    /// A round that changes code may change its tests and the module file
+    /// that exports it, recorded with why; an unrelated file stays refused.
+    #[test]
+    fn a_files_tests_and_module_file_go_with_it() {
+        let g = ScopeGuard::for_round(
+            RoundFor::OwnReview,
+            &s(&[
+                "apps/web/src/lib/flags.ts",
+                "services/api/tests/test_orders.py",
+            ]),
+            None,
+            "o/r",
+            "",
+        );
+        for p in [
+            "apps/web/src/lib/flags.test.ts",
+            "apps/web/src/lib/__tests__/flags.ts",
+            "apps/web/src/lib/index.ts",
+            "services/api/orders.py",
+        ] {
+            assert_eq!(g.check(p, None), Ok(()), "{p}");
+        }
+        let outside = g.outside();
+        assert!(outside
+            .iter()
+            .any(|(p, why)| p == "apps/web/src/lib/flags.test.ts"
+                && why.contains("the test of apps/web/src/lib/flags.ts")));
+        assert!(outside
+            .iter()
+            .any(|(p, why)| p == "apps/web/src/lib/index.ts" && why.contains("module file")));
+        // Another package's file of the same name is not a companion.
+        assert!(g.check("apps/admin/src/lib/flags.test.ts", None).is_err());
+        assert!(g.check("apps/web/src/lib/schedule.ts", None).is_err());
+        let refused = refused_summary("./apps/web/src/lib/schedule.ts");
+        assert!(
+            refused.contains("apps/web/src/lib/schedule.ts is outside"),
+            "{refused}"
         );
     }
 

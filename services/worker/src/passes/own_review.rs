@@ -16,18 +16,15 @@
 //! - The run takes them in a review-fix round (`run_fix_round`), pushes,
 //!   and the next review of the new head resolves the threads the commit
 //!   settled and rewrites the section, or removes it when nothing is left.
-//! - It goes on by the supervisor's rule ([`next`],
-//!   `supervisor::next_round`): while the rounds make progress (fewer open
-//!   findings, or a round that pushed changes) up to twice
-//!   [`MAX_FIX_ROUNDS`] and below the run's spend ceiling. A round without
-//!   progress changes approach (one finding only, a fresh context with
-//!   small edits, a re-split, the strongest model). When the rounds end, the
-//!   findings still open are deferred with the reason ([`defer_findings`]):
-//!   they move from "Open review findings" to "Deferred" on the pull
-//!   request, the run finishes, and the draft is held only while required
-//!   checks are red. Uncapped, two runs once spent $29 in 17 rounds where
-//!   the count of open findings went down by one and back up; the ceiling
-//!   and the progress rule keep that bound, and nothing waits on a person.
+//! - It goes on finding by finding (`own_review_ledger`): a round a tool
+//!   or a guard blocked is not a stall and the next one removes the block;
+//!   a stalled finding climbs its own ladder (one finding only, a fresh
+//!   context with small edits, a re-split, the strongest model). A finding
+//!   the ticket, its comments or the plan rule out is settled by their
+//!   words; only a person-gate reason defers one, listed under "Deferred"
+//!   with that reason ([`defer_findings`]). Never a count of rounds: two
+//!   rounds at a cap once deferred a one-line config omission the tools had
+//!   blocked. The run's spend ceiling still bounds every loop.
 //! - A finished run's PR held on its findings never waits on a round
 //!   nothing queued. The ready decision queues one review-fix round for
 //!   them, once per head, while the run has rounds left ([`round_left`]),
@@ -290,66 +287,6 @@ pub fn round_left(
 /// (`supervisor::next_round`); then what is open is deferred.
 pub const MAX_FIX_ROUNDS: u32 = 2;
 
-/// What follows a review of CoderHelm's own PR.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Next {
-    /// Nothing is open: the PR may be marked ready and the merge armed.
-    Ready,
-    /// Another fix round, with this many rounds without progress before it
-    /// and the ladder's approach for it.
-    Fix {
-        stalled: u32,
-        rung: super::supervisor::Rung,
-    },
-    /// The rounds are over: what is open is deferred with this reason
-    /// ([`finish_reason`], [`defer_findings`]) and the run finishes.
-    Finish { why: String },
-}
-
-/// Whether what is left is core work: a finding in a readme or the docs is
-/// not, and is deferred first when rounds stall.
-fn core_left(items: &[String]) -> bool {
-    items.iter().any(|i| {
-        let path = i
-            .rsplit_once("(`")
-            .map(|(_, p)| p.trim_end_matches(')').trim_end_matches('`'))
-            .unwrap_or("");
-        let path = path.split(':').next().unwrap_or(path);
-        super::supervisor::is_core(path, i, false)
-    })
-}
-
-/// What follows, by the supervisor's rule (`supervisor::next_round`).
-/// `before`: the findings open at the previous review of this run (`None`
-/// at the first); `after`: those open now; `pushed_files`: what the last fix
-/// round changed; `stalled`: rounds without progress so far; `rounds`: fix
-/// rounds this run already took; `spent_usd`: the run's spend.
-pub fn next(
-    before: Option<usize>,
-    after: &[String],
-    pushed_files: usize,
-    stalled: u32,
-    rounds: u32,
-    spent_usd: f64,
-) -> Next {
-    use super::supervisor::{findings_progress, next_round, RoundFacts, RoundStep};
-    if after.is_empty() {
-        return Next::Ready;
-    }
-    match next_round(&RoundFacts {
-        rounds,
-        cap: MAX_FIX_ROUNDS,
-        progressed: findings_progress(before, after.len(), pushed_files),
-        stalled,
-        core: core_left(after),
-        spent_usd,
-        cap_usd: super::run_ceiling::MAX_RUN_SPEND_USD,
-    }) {
-        RoundStep::Round { rung, stalled } => Next::Fix { stalled, rung },
-        RoundStep::End { why } => Next::Finish { why },
-    }
-}
-
 /// What the run says when its rounds on its own findings end: what is
 /// deferred and why, and that the run finishes.
 pub fn finish_reason(items: &[String], why: &str) -> String {
@@ -558,65 +495,6 @@ mod tests {
         assert!(!s.contains("It fixes them"));
         assert!(section(&[]).is_empty());
         assert!(hold("## Summary\nx").is_none());
-    }
-
-    #[test]
-    fn rounds_go_on_while_they_make_progress_and_change_approach_without() {
-        use super::super::supervisor::Rung;
-        let two = vec![
-            "a (`src/a.rs:1`)".to_string(),
-            "b (`src/b.rs:2`)".to_string(),
-        ];
-        let fix = |stalled, rung| Next::Fix { stalled, rung };
-        assert_eq!(next(Some(2), &[], 0, 1, 1, 0.0), Next::Ready);
-        assert_eq!(next(None, &two, 0, 0, 0, 0.0), fix(0, Rung::Continue));
-        assert_eq!(next(Some(3), &two, 0, 1, 1, 0.0), fix(0, Rung::Continue));
-        assert_eq!(next(Some(2), &two, 4, 1, 1, 0.0), fix(0, Rung::Continue));
-        // Under the cap a round without progress changes approach, never
-        // stops: one finding only, then a fresh context with small edits.
-        assert_eq!(next(Some(2), &two, 0, 0, 1, 0.0), fix(1, Rung::Narrow));
-        assert_eq!(next(Some(2), &two, 0, 1, 1, 0.0), fix(2, Rung::SwitchTools));
-        // At the cap without progress the rounds end: deferred, never a wait.
-        match next(Some(2), &two, 0, 1, MAX_FIX_ROUNDS, 0.0) {
-            Next::Finish { why } => {
-                let said = finish_reason(&two, &why);
-                assert!(said.contains("- [ ] a (`src/a.rs:1`)\n- [ ] b (`src/b.rs:2`)"));
-                assert!(said.contains("deferred"));
-                assert!(said.contains("the run finishes"));
-                assert!(!said.contains("stays a draft"));
-            }
-            other => panic!("{other:?}"),
-        }
-    }
-
-    #[test]
-    fn rounds_go_on_past_the_cap_while_they_fix_things_then_defer_the_rest() {
-        use super::super::supervisor::Rung;
-        let open = vec!["a (`x.rs:1`)".to_string(), "b (`y.rs:2`)".to_string()];
-        let go = Next::Fix {
-            stalled: 0,
-            rung: Rung::Continue,
-        };
-        assert_eq!(next(Some(3), &open, 2, 0, 1, 0.0), go);
-        // At the cap, a round that fixed something earns another
-        // (`supervisor::may_extend`), up to twice the cap.
-        assert_eq!(next(Some(3), &open, 2, 0, MAX_FIX_ROUNDS, 0.0), go);
-        assert_eq!(next(Some(3), &open, 0, 0, MAX_FIX_ROUNDS * 2 - 1, 0.0), go);
-        assert!(matches!(
-            next(Some(2), &open, 0, 0, MAX_FIX_ROUNDS, 0.0),
-            Next::Finish { .. }
-        ));
-        match next(Some(3), &open, 2, 0, MAX_FIX_ROUNDS * 2, 0.0) {
-            Next::Finish { why } => assert!(why.contains("twice"), "{why}"),
-            other => panic!("{other:?}"),
-        }
-        // Near the spend ceiling the rounds end too, progress or not.
-        match next(Some(3), &open, 2, 0, 0, 190.0) {
-            Next::Finish { why } => assert!(why.contains("spend ceiling"), "{why}"),
-            other => panic!("{other:?}"),
-        }
-        // Nothing open is ready whatever the count.
-        assert_eq!(next(Some(1), &[], 0, 0, 9, 0.0), Next::Ready);
     }
 
     #[test]

@@ -17,8 +17,7 @@
 //!   and for a dependency update [`DependencyFacts`].
 //! - [`lead`] renders what a reviewer reads first from them, in a fixed
 //!   order: one standalone line, what is to be decided with CoderHelm's own
-//!   conclusion,
-//!   and the anomalies, each with its evidence.
+//!   conclusion, and the anomalies, each with its evidence.
 //! - `pr_claims` checks every sentence somebody wrote against them, and
 //!   `pr_layout` puts the routine detail after them, collapsed.
 //!
@@ -42,6 +41,9 @@ pub struct FileChange {
     /// The path it had before a rename.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub previous: String,
+    /// Lines added and removed.
+    #[serde(default)]
+    pub changed: usize,
 }
 
 /// How a recorded check ended on the head.
@@ -211,6 +213,9 @@ pub struct DepLine {
     /// Advisories on this line the head still has.
     #[serde(default)]
     pub remaining: Vec<String>,
+    /// Advisories on this line the head fixes.
+    #[serde(default)]
+    pub fixed: Vec<String>,
 }
 
 /// Packages that are released together and move together.
@@ -282,6 +287,9 @@ pub struct DependencyFacts {
     /// Lines whose resolution on the head could not be read, and why.
     #[serde(default)]
     pub unread: Vec<Unverified>,
+    /// The package manager's ecosystem (`npm`), when one names them all.
+    #[serde(default)]
+    pub ecosystem: String,
 }
 
 impl DependencyFacts {
@@ -350,11 +358,25 @@ pub struct Facts {
     /// the part a reader sees first.
     #[serde(default)]
     pub evidence: Vec<String>,
+    /// The repository's address (`https://github.com/org/repo`), for links
+    /// to files at the head.
+    #[serde(default)]
+    pub repo_url: String,
     /// Sign-offs that belong to the reviewer's merge decision (a page to
     /// look at) and decisions that matter for it, from `person_gate`:
-    /// carried in the one review line, never listed as chores.
+    /// carried in Review focus, never listed as chores.
     #[serde(default)]
     pub review_notes: Vec<String>,
+    /// Where a UI change can be seen.
+    #[serde(default)]
+    pub preview_url: String,
+    /// A UI change's screenshots, or why there are none.
+    #[serde(default)]
+    pub screens: Option<crate::pr_body::Screens>,
+    /// The feedback wanted, when something more specific than the records
+    /// says it.
+    #[serde(default)]
+    pub review_question: String,
 }
 
 impl Facts {
@@ -558,15 +580,6 @@ pub fn anomalies(f: &Facts) -> Vec<Anomaly> {
     out
 }
 
-/// `s` with its first letter upper case: the evidence is its own sentence.
-fn sentence_start(s: &str) -> String {
-    let mut c = s.chars();
-    match c.next() {
-        Some(f) => f.to_uppercase().chain(c).collect(),
-        None => String::new(),
-    }
-}
-
 fn listed(ids: &[String], max: usize) -> String {
     let shown: Vec<&str> = ids.iter().take(max).map(String::as_str).collect();
     let more = ids.len().saturating_sub(max);
@@ -581,38 +594,30 @@ fn listed(ids: &[String], max: usize) -> String {
 /// full list is.
 pub const MAX_ANOMALIES: usize = 8;
 
-/// What the reviewer is asked to decide, with CoderHelm's own conclusion
-/// and the evidence it rests on. The reviewer is asked for the merge
-/// decision only, never for CoderHelm's analysis (`person_gate`).
-fn review_line(f: &Facts) -> String {
-    let decide = match (&f.dependency, &f.why) {
+/// What the reviewer is asked to decide: the merge decision only, as a
+/// question that names the kind of feedback. Never CoderHelm's analysis
+/// (`person_gate`): [`conclusion`] states that, with its evidence.
+fn review_question(f: &Facts) -> String {
+    if !f.review_question.trim().is_empty() {
+        return one_line(&f.review_question);
+    }
+    match (&f.dependency, &f.why) {
         (Some(d), _) => format!(
-            "whether to merge {}",
+            "Approach: decide whether to merge {}.",
             plural(d.moved(), "dependency update", "dependency updates")
         ),
         (None, Some(w)) if !w.reference.is_empty() => {
-            format!("whether this does what {} asks", w.reference)
+            format!(
+                "Approach: decide whether this does what {} asks.",
+                w.reference
+            )
         }
-        _ => "whether this is right to merge".to_string(),
-    };
-    let mut s = format!(
-        "decide {decide}. CoderHelm's conclusion: {}.",
-        conclusion(f)
-    );
-    if !f.review_notes.is_empty() {
-        s.push_str(&format!(
-            " Your merge decision also signs off: {}.",
-            f.review_notes
-                .iter()
-                .map(|n| one_line(n).trim_end_matches('.').to_string())
-                .collect::<Vec<_>>()
-                .join("; ")
-        ));
+        _ => "Correctness: decide whether this is right to merge.".to_string(),
     }
-    s
 }
 
 /// What CoderHelm concludes from the facts, with what each part rests on.
+/// The head is named once, in Verification, so it is "this head" here.
 pub fn conclusion(f: &Facts) -> String {
     let mut parts: Vec<String> = Vec::new();
     if let Some(d) = &f.dependency {
@@ -674,165 +679,785 @@ pub fn conclusion(f: &Facts) -> String {
         .count();
     if failing > 0 {
         parts.push(format!(
-            "{} on `{}`, so it is not ready",
-            plural(failing, "check fails", "checks fail"),
-            f.short_head()
+            "{} on this head, so it is not ready",
+            plural(failing, "check fails", "checks fail")
         ));
     } else if f.all_checks_passed() {
-        parts.push(format!(
-            "every recorded check passed on `{}`",
-            f.short_head()
-        ));
+        parts.push("all checks on this head passed".to_string());
     } else if f.checks.is_empty() {
-        parts.push(format!("no check has reported on `{}` yet", f.short_head()));
+        parts.push("no check has reported on this head yet".to_string());
     }
     if parts.is_empty() {
-        return match f.risk.as_ref().and_then(|r| r.look_first.as_ref()) {
-            Some((path, why)) => format!(
-                "nothing is out of the ordinary; the change that matters most is in `{path}` ({})",
-                one_line(why).trim_end_matches('.')
-            ),
-            None => "nothing is out of the ordinary".to_string(),
-        };
+        return "nothing is out of the ordinary".to_string();
     }
     parts.join("; ")
 }
 
-/// How to check the change, and what the records say of it.
-fn check_line(f: &Facts) -> String {
-    let passed = f
-        .checks
+/// Lockfiles, snapshots and other files a tool writes.
+pub fn is_generated(path: &str) -> bool {
+    let p = path.to_ascii_lowercase();
+    let name = p.rsplit('/').next().unwrap_or(&p);
+    [
+        "package-lock.json",
+        "yarn.lock",
+        "pnpm-lock.yaml",
+        "cargo.lock",
+        "poetry.lock",
+        "uv.lock",
+        "gemfile.lock",
+        "composer.lock",
+        "go.sum",
+        "bun.lockb",
+    ]
+    .contains(&name)
+        || name.ends_with(".snap")
+        || p.contains("/__snapshots__/")
+        || p.contains("/generated/")
+        || name.ends_with(".min.js")
+}
+
+fn is_test_path(path: &str) -> bool {
+    let p = path.to_ascii_lowercase();
+    p.contains("/test/")
+        || p.contains("/tests/")
+        || p.contains("__tests__")
+        || p.contains(".test.")
+        || p.contains(".spec.")
+        || p.contains("_test.")
+}
+
+/// A file whose change shows in a UI: components, styles, templates, an
+/// editor's schema.
+pub fn is_ui(path: &str) -> bool {
+    let p = path.to_ascii_lowercase();
+    if is_test_path(&p) || is_generated(&p) {
+        return false;
+    }
+    let ext = p.rsplit('.').next().unwrap_or("");
+    [
+        "tsx", "jsx", "vue", "svelte", "css", "scss", "sass", "less", "html", "hbs", "erb",
+        "liquid", "astro",
+    ]
+    .contains(&ext)
+        || [
+            "/components/",
+            "/styles/",
+            "/templates/",
+            "schematypes/",
+            "/schemas/",
+        ]
         .iter()
-        .filter(|c| c.outcome == Outcome::Passed)
-        .count();
-    let record = if f.checks.is_empty() {
-        format!("no check has reported on `{}` yet", f.short_head())
-    } else if f.all_checks_passed() {
-        format!(
-            "{} passed on `{}`",
-            plural(passed, "recorded check", "recorded checks"),
-            f.short_head()
-        )
+        .any(|d| format!("/{p}").contains(d))
+}
+
+/// The family a check's name belongs to, in words, for a grouped row.
+fn family_label(name: &str) -> &'static str {
+    match Family::of(name).first() {
+        Some(Family::Tests) => "Tests",
+        Some(Family::Lint) => "Lint",
+        Some(Family::Types) => "Type check",
+        Some(Family::Build) => "Build",
+        Some(Family::Install) => "Install",
+        None => "Other checks",
+    }
+}
+
+fn check_name(name: &str) -> String {
+    one_line(&name.replace('`', "'"))
+}
+
+/// The Verification rows: CI on the head, then CoderHelm's own checks and
+/// probes, then what nothing verified. A skipped check is not a row: its
+/// workflow's conditions left this pull request out, and it is listed in
+/// the full evidence only.
+pub fn rows(f: &Facts) -> Vec<crate::pr_body::Row> {
+    use crate::pr_body::{Outcome as O, Row};
+    let mut ci: Vec<Row> = Vec::new();
+    for c in &f.checks {
+        let check = format!("{} (CI)", check_name(&c.name));
+        let log = if c.url.starts_with("https://") {
+            format!("[log]({})", c.url)
+        } else {
+            String::new()
+        };
+        match c.outcome {
+            Outcome::Passed => ci.push(Row {
+                check,
+                outcome: O::Passed,
+                detail: String::new(),
+            }),
+            Outcome::Failed => ci.push(Row {
+                check,
+                outcome: O::Failed,
+                detail: log,
+            }),
+            Outcome::Running => ci.push(Row {
+                check,
+                outcome: O::NotRun,
+                detail: "still running when this was written".into(),
+            }),
+            Outcome::DidNotRun => {}
+        }
+    }
+    let mut own: Vec<Row> = Vec::new();
+    for c in &f.checked {
+        let what = one_line(&c.what);
+        let mut name = crate::pr_body::fit_words(what.trim_end_matches('.'), 14)
+            .trim_end_matches('.')
+            .to_string();
+        // A cut inside parentheses ends before them.
+        if name.matches('(').count() > name.matches(')').count() {
+            if let Some(i) = name.rfind('(') {
+                name = name[..i].trim_end().to_string();
+            }
+        }
+        own.push(Row {
+            check: format!("{name} (CoderHelm)"),
+            outcome: O::Passed,
+            detail: one_line(&c.result),
+        });
+    }
+    if let Some(d) = &f.dependency {
+        for p in &d.probes {
+            own.push(Row {
+                check: format!("{} (CoderHelm)", one_line(&p.what)),
+                outcome: if p.same() { O::Passed } else { O::Failed },
+                detail: if p.same() {
+                    format!("same before and after: `{}`", one_line(&p.after))
+                } else {
+                    format!(
+                        "before `{}`, after `{}`",
+                        one_line(&p.before),
+                        one_line(&p.after)
+                    )
+                },
+            });
+        }
+        if let Some((false, by)) = &d.frozen_install {
+            if !f.checks.iter().any(|c| by.contains(&c.name)) {
+                own.push(Row {
+                    check: "Install from the lockfile".into(),
+                    outcome: O::Failed,
+                    detail: one_line(by),
+                });
+            }
+        }
+        for u in &d.unread {
+            own.push(Row {
+                check: format!("{} on the head", one_line(&u.what)),
+                outcome: O::NotRun,
+                detail: format!("could not be read: {}", one_line(&u.why)),
+            });
+        }
+    }
+    for u in &f.unverified {
+        let mut what = one_line(&u.what).trim_end_matches('.').to_string();
+        for tail in [
+            " was not run",
+            " has not run yet",
+            " has not run",
+            " not run",
+        ] {
+            if what.ends_with(tail) {
+                what.truncate(what.len() - tail.len());
+            }
+        }
+        own.push(Row {
+            check: crate::pr_body::fit_words(&what, 12)
+                .trim_end_matches('.')
+                .to_string(),
+            outcome: O::NotRun,
+            detail: one_line(&u.why),
+        });
+    }
+    if f.checks.iter().all(|c| c.outcome == Outcome::DidNotRun) {
+        ci.insert(
+            0,
+            Row {
+                check: "CI".into(),
+                outcome: O::NotRun,
+                detail: if f.checks_read {
+                    "no check has reported on this head yet".into()
+                } else {
+                    "the head's checks could not be read".into()
+                },
+            },
+        );
+    }
+    // Too many to list: passed CI checks grouped by what they check.
+    if ci.len() + own.len() > crate::pr_body::MAX_ROWS {
+        let mut grouped: Vec<Row> = ci
+            .iter()
+            .filter(|r| r.outcome != O::Passed)
+            .cloned()
+            .collect();
+        let mut groups: Vec<(&'static str, Vec<&str>)> = Vec::new();
+        for c in f.checks.iter().filter(|c| c.outcome == Outcome::Passed) {
+            let l = family_label(&c.name);
+            match groups.iter_mut().find(|(g, _)| *g == l) {
+                Some(g) => g.1.push(&c.name),
+                None => groups.push((l, vec![&c.name])),
+            }
+        }
+        for (l, names) in groups {
+            grouped.push(match names.as_slice() {
+                [one] => Row {
+                    check: format!("{} (CI)", check_name(one)),
+                    outcome: O::Passed,
+                    detail: String::new(),
+                },
+                _ => Row {
+                    check: format!("{l} (CI): {} jobs", names.len()),
+                    outcome: O::Passed,
+                    detail: "all passed".into(),
+                },
+            });
+        }
+        ci = grouped;
+    }
+    ci.extend(own);
+    ci
+}
+
+fn semver(v: &str) -> Vec<u64> {
+    v.trim_start_matches(['v', '^', '~', '='])
+        .split(['.', '-', '+'])
+        .take(3)
+        .map(|p| p.parse().unwrap_or(0))
+        .collect()
+}
+
+/// `major`, `minor`, `patch` or what else the move is.
+pub fn bump_type(l: &DepLine) -> &'static str {
+    if !l.moved {
+        return "not moved";
+    }
+    if l.to.is_empty() || l.to.contains(' ') {
+        return "removed";
+    }
+    if l.major {
+        return "major";
+    }
+    let (a, b) = (semver(&l.from), semver(&l.to));
+    if a.first() != b.first() {
+        "major"
+    } else if a.get(1) != b.get(1) {
+        "minor"
     } else {
-        format!(
-            "{passed} of {} recorded checks passed on `{}`",
-            f.checks.len(),
-            f.short_head()
-        )
+        "patch"
+    }
+}
+
+/// A dependency update's summary, from what the lockfile on the head
+/// resolves.
+fn dependency_summary(d: &DependencyFacts) -> String {
+    let moved: Vec<&DepLine> = d.lines.iter().filter(|l| l.moved).collect();
+    let eco = if d.ecosystem.trim().is_empty() {
+        String::new()
+    } else {
+        format!("{} ", d.ecosystem.trim())
     };
-    let how = one_line(&f.how_to_check);
-    if how.is_empty() {
-        format!("{record}.")
-    } else {
-        format!("{}; {record}.", how.trim_end_matches('.'))
-    }
-}
-
-/// What a person has to do: the steps that need one, then the open items
-/// only a person can close. Empty when nothing is needed.
-pub fn needed_lines(f: &Facts) -> Vec<String> {
-    let mut out = crate::pr_steps::needed(&f.steps);
-    // Every item through the gate: only what a person alone can do.
-    for o in f.open.iter().filter(|o| {
-        o.closer == Closer::Person
-            && matches!(
-                crate::person_gate::line_outcome(crate::person_gate::Kind::OpenItem, &o.text),
-                crate::person_gate::Outcome::Human(_)
-            )
-    }) {
-        out.push(format!(
-            "{} (a person)",
-            crate::pr_steps::plain(&o.text).trim_end_matches('.')
-        ));
-    }
-    out
-}
-
-/// How many lines the part a reader sees first may take: about ten for an
-/// ordinary change, a line more for each thing that is out of the ordinary
-/// or needs a person.
-pub fn visible_budget(f: &Facts) -> usize {
-    10 + anomalies(f).len().min(MAX_ANOMALIES + 1)
-        + needed_lines(f).len().min(crate::pr_steps::MAX_NEEDED + 1)
-}
-
-/// What a reader sees first, rendered from the facts in this order and from
-/// nothing else: one standalone line saying the change, how to check it,
-/// the risk, what the reader has to do (or that nothing is needed), what is
-/// asked of the reviewer, and the anomalies with their evidence.
-pub fn lead(f: &Facts) -> String {
-    let all = anomalies(f);
-    let mut s = String::new();
-    s.push_str(LEAD_START);
-    s.push('\n');
-    let summary = one_line(&f.summary);
-    if !summary.is_empty() {
-        s.push_str(&summary);
-        s.push_str("\n\n");
-    }
-    s.push_str(&format!("**Check:** {}\n", check_line(f)));
-    if let Some(r) = f.risk.as_ref().filter(|r| !r.level.trim().is_empty()) {
-        let why = one_line(&r.why);
-        s.push_str(&format!(
-            "**Risk:** **{}**{}\n",
-            r.level.trim(),
-            if why.is_empty() {
-                ".".to_string()
-            } else {
-                format!(": {}.", why.trim_end_matches('.'))
-            }
-        ));
-    }
-    let needed = needed_lines(f);
-    if needed.is_empty() {
-        s.push_str(&format!(
-            "**Needed from you:** {}\n",
-            crate::pr_steps::NOTHING_NEEDED
-        ));
-    } else {
-        s.push_str("**Needed from you:**\n");
-        for (i, l) in needed.iter().take(crate::pr_steps::MAX_NEEDED).enumerate() {
-            s.push_str(&format!("{}. {l}\n", i + 1));
+    let mut kinds: Vec<String> = Vec::new();
+    for k in ["major", "minor", "patch"] {
+        let n = moved.iter().filter(|l| bump_type(l) == k).count();
+        if n > 0 {
+            kinds.push(format!("{n} {k}"));
         }
-        if needed.len() > crate::pr_steps::MAX_NEEDED {
+    }
+    let mut s = format!(
+        "Updates {}{}",
+        plural(
+            moved.len(),
+            &format!("{eco}package"),
+            &format!("{eco}packages")
+        ),
+        if kinds.is_empty() {
+            ".".to_string()
+        } else {
+            format!(": {}.", kinds.join(", "))
+        }
+    );
+    let fixed = d.advisories.fixed.len();
+    let left = d.advisories.remaining.len();
+    if fixed > 0 || left > 0 {
+        let by: Vec<String> = d
+            .advisories
+            .remaining_by_severity
+            .iter()
+            .filter(|(_, n)| **n > 0)
+            .map(|(s, n)| format!("{n} {s}"))
+            .collect();
+        s.push_str(&format!(
+            " Fixes {}",
+            plural(fixed, "security advisory", "security advisories")
+        ));
+        if left > 0 {
             s.push_str(&format!(
-                "{}. and {} more, under Open items below.\n",
-                crate::pr_steps::MAX_NEEDED + 1,
-                needed.len() - crate::pr_steps::MAX_NEEDED
+                "; {left} {} open{}",
+                if left == 1 { "stays" } else { "stay" },
+                if by.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", by.join(", "))
+                }
             ));
         }
+        s.push('.');
     }
-    s.push_str(&format!("**Review:** {}\n", review_line(f)));
-    if !all.is_empty() {
-        s.push_str("**Look at first:**\n");
-        for a in all.iter().take(MAX_ANOMALIES) {
-            s.push_str(&format!(
-                "- {}. {}.\n",
-                a.what,
-                sentence_start(a.evidence.trim_end_matches('.'))
-            ));
-        }
-        if all.len() > MAX_ANOMALIES {
-            let more = all.len() - MAX_ANOMALIES;
-            if f.run_url.is_empty() {
-                s.push_str(&format!("- and {more} more, in the sections below.\n"));
-            } else {
-                s.push_str(&format!(
-                    "- and {more} more: [the full list is on the run page]({}).\n",
-                    f.run_url
-                ));
-            }
-        }
+    let still = d.lines.iter().filter(|l| !l.moved).count();
+    if still > 0 {
+        s.push_str(&format!(
+            " {} the plan named did not move on the head.",
+            plural(still, "line", "lines")
+        ));
     }
-    for n in &f.notes {
-        s.push_str(&format!("\n{}\n", one_line(n)));
-    }
-    s.push_str(LEAD_END);
     s
 }
 
-/// The lead's first line as [`lead`] writes it (what `pr_layout` takes out
-/// of a section that says it again).
+/// The visible table of a dependency update: majors, security fixes and
+/// lines that need a look, ten at most.
+fn dependency_rows(d: &DependencyFacts) -> Vec<crate::pr_body::DepRow> {
+    let mut rows: Vec<(u8, crate::pr_body::DepRow)> = Vec::new();
+    for l in &d.lines {
+        let mut why: Vec<String> = Vec::new();
+        let mut rank = 9u8;
+        if l.moved && l.major {
+            rank = 0;
+            why.push(match d.evidence_for(l) {
+                Some(m) => {
+                    let e = m
+                        .evidence
+                        .iter()
+                        .map(|e| one_line(e))
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    let mut c = e.chars();
+                    let e: String = match c.next() {
+                        Some(f) => f.to_uppercase().chain(c).collect(),
+                        None => e,
+                    };
+                    format!("Major. {e}")
+                }
+                None => "Major; no safety evidence is recorded: read its upgrade notes".into(),
+            });
+        }
+        if !l.remaining.is_empty() {
+            rank = rank.min(1);
+            why.push(format!("Security: {} still open", l.remaining.join(", ")));
+        }
+        if !l.fixed.is_empty() {
+            rank = rank.min(2);
+            why.push(format!("Security: {}", l.fixed.join(", ")));
+        }
+        if !l.moved {
+            rank = rank.min(3);
+            why.push("Not moved on the head".into());
+        }
+        if rank == 9 {
+            continue;
+        }
+        let change = if l.moved {
+            format!(
+                "{} to {}",
+                l.from,
+                if l.to.is_empty() { "?" } else { &l.to }
+            )
+        } else {
+            l.from.clone()
+        };
+        rows.push((
+            rank,
+            crate::pr_body::DepRow {
+                package: l.package.clone(),
+                change,
+                why: why.join(". "),
+            },
+        ));
+    }
+    rows.sort_by_key(|(r, _)| *r);
+    rows.into_iter()
+        .take(crate::pr_body::MAX_DEP_ROWS)
+        .map(|(_, r)| r)
+        .collect()
+}
+
+/// Every update, for the first fold.
+fn all_updates(d: &DependencyFacts) -> String {
+    let mut s = String::from("| Package | From | To | Type |\n|---|---|---|---|\n");
+    for l in &d.lines {
+        s.push_str(&format!(
+            "| `{}` | {} | {} | {} |\n",
+            crate::pr_body::cell(&l.package),
+            crate::pr_body::cell(&l.from),
+            crate::pr_body::cell(if l.moved { &l.to } else { &l.from }),
+            bump_type(l)
+        ));
+    }
+    s.trim_end().to_string()
+}
+
+fn sentence_part(s: &str) -> String {
+    one_line(s)
+        .trim_end_matches(['.', ';', ','])
+        .trim()
+        .to_string()
+}
+
+/// The step that asks the reviewer to look at the change: a sign-off the
+/// gate folds into the merge decision, shown under Review focus.
+fn is_look(s: &crate::pr_steps::Step) -> bool {
+    s.for_review().is_some()
+}
+
+/// What a person has to do, as "Needed from you" lists it. The gate
+/// (`person_gate`) decides every item: a step a person was to do, a
+/// question put to a person and an open item only a person can close reach
+/// the list only as the gate's own item, for a listed reason. Looking at
+/// the change is review work: it is in Review focus, never here.
+pub fn needed_items(f: &Facts) -> Vec<crate::pr_body::Needed> {
+    use crate::person_gate::{self as gate, Outcome as G};
+    use crate::pr_body::{Merge, Needed};
+    let mut out: Vec<Needed> = Vec::new();
+    for s in f.steps.iter().filter(|s| s.needs_person()) {
+        if let G::Human(item) = gate::decide(&s.ask(), &gate::Context::default()) {
+            out.push(Needed {
+                id: crate::pr_body::slug(&crate::pr_steps::plain(&s.what)),
+                merge: if s.when == crate::pr_steps::When::AfterMerge {
+                    Merge::After
+                } else {
+                    Merge::Before
+                },
+                item,
+            });
+        }
+    }
+    for o in f.open.iter().filter(|o| o.closer == Closer::Person) {
+        let plain = crate::pr_steps::plain(&o.text);
+        // A question keeps its kind, so a hard-to-reverse choice is a
+        // yes/no on CoderHelm's recommendation.
+        let outcome = match plain.trim_start().strip_prefix("Answer:") {
+            Some(q) => crate::person_gate::line_outcome(gate::Kind::Question, q.trim()),
+            None => crate::person_gate::line_outcome(gate::Kind::OpenItem, &plain),
+        };
+        if let G::Human(item) = outcome {
+            out.push(Needed {
+                id: crate::pr_body::slug(plain.trim_start_matches("Answer:").trim()),
+                merge: Merge::Before,
+                item,
+            });
+        }
+    }
+    let mut seen: Vec<String> = Vec::new();
+    out.retain(|n| {
+        let k = n.key();
+        let fresh = !seen.contains(&k);
+        seen.push(k);
+        fresh
+    });
+    out
+}
+
+/// [`conclusion`], and the sign-offs the merge decision also carries: a
+/// look at the change is shown as "See it", so only the others are named.
+fn conclusion_with_signoffs(f: &Facts) -> String {
+    let shown: Vec<String> = f.steps.iter().filter_map(|s| s.for_review()).collect();
+    let notes: Vec<String> = f
+        .review_notes
+        .iter()
+        .map(|n| one_line(n).trim_end_matches('.').to_string())
+        .filter(|n| !n.is_empty() && !shown.iter().any(|s| one_line(s).trim_end_matches('.') == n))
+        .collect();
+    let c = conclusion(f);
+    if notes.is_empty() {
+        c
+    } else {
+        format!(
+            "{c}. Your merge decision also signs off: {}",
+            notes.join("; ")
+        )
+    }
+}
+
+/// The body every description shows, from the facts of its head. `ticked`:
+/// the item ids a person ticked in the body this one replaces.
+pub fn body_of(f: &Facts, ticked: &[String]) -> crate::pr_body::Body {
+    use crate::pr_body::{Body, Focus, Level, ReadFirst, Screens, Ticket};
+    let head = f.short_head().to_string();
+    let ticket = f.why.as_ref().filter(|w| !w.reference.is_empty()).map(|w| {
+        let url = if !w.url.is_empty() {
+            w.url.clone()
+        } else if let (Some(n), true) = (
+            w.reference.strip_prefix('#'),
+            f.repo_url.starts_with("https://"),
+        ) {
+            format!("{}/issues/{n}", f.repo_url)
+        } else {
+            String::new()
+        };
+        Ticket {
+            key: w.reference.clone(),
+            url,
+        }
+    });
+    let summary = match &f.dependency {
+        Some(d) => dependency_summary(d),
+        None => one_line(&f.summary),
+    };
+    let done: Vec<String> = f
+        .steps
+        .iter()
+        .filter(|s| {
+            matches!(s.state, crate::pr_steps::State::Done { .. })
+                && s.owner.eq_ignore_ascii_case("coderhelm")
+        })
+        .take(2)
+        .map(|s| sentence_part(&crate::pr_steps::plain(&s.what)))
+        .collect();
+    let outside = if done.is_empty() {
+        String::new()
+    } else {
+        let mut first = done.join("; ");
+        if let Some(c) = first.get(..1) {
+            first = format!("{}{}", c.to_lowercase(), &first[1..]);
+        }
+        format!("Done outside the diff: {first}.")
+    };
+    // Where to see a UI change.
+    let look = f
+        .steps
+        .iter()
+        .find(|s| is_look(s))
+        .map(|s| {
+            sentence_part(
+                s.what
+                    .trim_start()
+                    .trim_start_matches("Look at")
+                    .trim_start(),
+            )
+        })
+        .unwrap_or_default();
+    let see_it = match (f.preview_url.starts_with("https://"), look.is_empty()) {
+        (true, true) => format!("[the preview]({})", f.preview_url),
+        (true, false) => format!("[the preview]({}), {look}", f.preview_url),
+        (false, false) => look,
+        (false, true) => String::new(),
+    };
+    let generated: Vec<&FileChange> = f.files.iter().filter(|x| is_generated(&x.path)).collect();
+    let read_first = f
+        .risk
+        .as_ref()
+        .and_then(|r| r.look_first.as_ref())
+        .map(|(path, why)| {
+            let url = if f.repo_url.starts_with("https://") && !head.is_empty() {
+                format!("{}/blob/{head}/{path}", f.repo_url.trim_end_matches('/'))
+            } else {
+                String::new()
+            };
+            let others = f
+                .files
+                .iter()
+                .filter(|x| x.path != *path && !is_generated(&x.path))
+                .count();
+            let mut skim: Vec<String> = Vec::new();
+            if others > 0 {
+                skim.push(format!(
+                    "then the other {}",
+                    plural(others, "file", "files")
+                ));
+            }
+            if let Some(g) = generated.first() {
+                skim.push(format!(
+                    "skip `{}`{}, which {} generated",
+                    g.path,
+                    if generated.len() > 1 {
+                        format!(" and {} more", generated.len() - 1)
+                    } else {
+                        String::new()
+                    },
+                    if generated.len() > 1 { "are" } else { "is" }
+                ));
+            }
+            ReadFirst {
+                path: path.clone(),
+                url,
+                // Its own parentheses would nest inside the bullet's.
+                why: one_line(why).replace(" (", ", ").replace(')', ""),
+                skim: skim.join("; "),
+            }
+        });
+    let lines: usize = f
+        .files
+        .iter()
+        .filter(|x| !is_generated(&x.path))
+        .map(|x| x.changed)
+        .sum();
+    let large = if lines > crate::pr_body::LARGE_CHANGE {
+        let mut order: Vec<&FileChange> = f
+            .files
+            .iter()
+            .filter(|x| !is_generated(&x.path) && x.changed > 0)
+            .collect();
+        order.sort_by_key(|x| (is_test_path(&x.path), std::cmp::Reverse(x.changed)));
+        format!(
+            "Large change: {lines} lines; suggested order: {}",
+            order
+                .iter()
+                .take(3)
+                .map(|x| format!("`{}`", x.path.rsplit('/').next().unwrap_or(&x.path)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    } else {
+        String::new()
+    };
+    let (level, mut risk, rollback) = match &f.risk {
+        Some(r) => (Level::of(&r.level), one_line(&r.why), one_line(&r.rollback)),
+        None => (
+            Level::Medium,
+            "the diff could not be read, so nothing was judged against it".to_string(),
+            String::new(),
+        ),
+    };
+    if risk.chars().count() < 10 && !f.files.is_empty() {
+        risk = format!(
+            "{} in the diff, none on a path the risk check marks as shared or sensitive",
+            plural(f.files.len(), "file", "files")
+        );
+    }
+    if let Some(d) = &f.dependency {
+        let mut extra: Vec<String> = Vec::new();
+        if !d.advisories.introduced.is_empty() {
+            extra.push(format!(
+                "the new versions bring {}",
+                d.advisories.introduced.join(", ")
+            ));
+        }
+        for fam in d.families.iter().filter(|x| !x.together) {
+            extra.push(format!("the {} packages are not on one line", fam.name));
+        }
+        if !extra.is_empty() {
+            risk = if risk.is_empty() {
+                extra.join("; ")
+            } else {
+                format!("{}; {}", risk.trim_end_matches('.'), extra.join("; "))
+            };
+        }
+    }
+    let screens = match &f.screens {
+        Some(s) => Some(s.clone()),
+        None if f.files.iter().any(|x| is_ui(&x.path)) => Some(Screens::Missing(
+            "CoderHelm had no runnable preview to capture for this run".into(),
+        )),
+        None => None,
+    };
+    // The full list of checks, and how to check by hand.
+    let mut evidence: Vec<String> = Vec::new();
+    let how = one_line(&f.how_to_check);
+    if !how.is_empty() {
+        evidence.push(format!("How to check: {how}."));
+    }
+    if !f.checks.is_empty() {
+        let mut s = String::from("Every check on this head:\n");
+        for c in &f.checks {
+            s.push_str(&format!(
+                "- {}: {}\n",
+                linked(c),
+                match c.outcome {
+                    Outcome::Passed => "passed",
+                    Outcome::Failed => "failed",
+                    Outcome::Running => "still running",
+                    Outcome::DidNotRun => "skipped (its conditions left this PR out)",
+                }
+            ));
+        }
+        evidence.push(s.trim_end().to_string());
+    }
+    let items = needed_items(f);
+    let mut built: Vec<String> = Vec::new();
+    // A look at the change is under Review focus, not here.
+    for l in f
+        .steps
+        .iter()
+        .filter(|s| !s.needs_person() && !is_look(s))
+        .map(crate::pr_steps::Step::line)
+        .filter(|l| !l.starts_with("Done:"))
+    {
+        built.push(format!("- {l}"));
+    }
+    if items.len() > crate::pr_body::MAX_ITEMS {
+        built.push(format!(
+            "- Also needed from a person: {}",
+            items[crate::pr_body::MAX_ITEMS..]
+                .iter()
+                .map(|n| sentence_part(n.item.action()))
+                .collect::<Vec<_>>()
+                .join("; ")
+        ));
+    }
+    let mut built = built.join("\n");
+    for n in &f.notes {
+        built.push_str(&format!("\n\n{}", one_line(n)));
+    }
+    let (notes_label, notes_top) = match &f.dependency {
+        Some(d) if !d.lines.is_empty() => {
+            (format!("All {} updates", d.lines.len()), all_updates(d))
+        }
+        _ => (String::new(), String::new()),
+    };
+    Body {
+        ticket,
+        head,
+        results_of: String::new(),
+        alert: String::new(),
+        summary,
+        outside,
+        needed: items,
+        ticked: ticked.to_vec(),
+        focus: Focus {
+            question: review_question(f),
+            conclusion: conclusion_with_signoffs(f),
+            read_first,
+            see_it,
+            large,
+        },
+        dep_rows: f
+            .dependency
+            .as_ref()
+            .map(dependency_rows)
+            .unwrap_or_default(),
+        level,
+        risk,
+        rollback,
+        rows: rows(f),
+        screens,
+        notes_label,
+        notes_top,
+        evidence: evidence.join("\n\n"),
+        built: built.trim().to_string(),
+        run_url: f.run_url.clone(),
+    }
+}
+
+/// What a person has to do, as lines (for logs and counts). Empty when
+/// nothing is needed.
+pub fn needed_lines(f: &Facts) -> Vec<String> {
+    needed_items(f).iter().map(|n| n.item.line()).collect()
+}
+
+/// The visible part of a description: what a reader sees first, rendered
+/// from the facts and from nothing else, between the lead's markers.
+pub fn lead(f: &Facts) -> String {
+    lead_ticked(f, &[])
+}
+
+/// [`lead`], keeping the ticks a person made.
+pub fn lead_ticked(f: &Facts, ticked: &[String]) -> String {
+    let r = crate::pr_body::render(&body_of(f, ticked));
+    format!("{LEAD_START}\n{}\n\n{LEAD_END}", r.visible)
+}
+
+/// The summary as [`lead`] writes it (what `pr_layout` takes out of a
+/// section that says it again).
 pub fn lead_line(f: &Facts) -> String {
     one_line(&f.summary)
 }
@@ -862,6 +1487,7 @@ mod tests {
                 path: "src/export/poller.rs".into(),
                 status: "modified".into(),
                 previous: String::new(),
+                changed: 0,
             }],
             files_complete: true,
             checks: vec![
@@ -883,21 +1509,33 @@ mod tests {
     }
 
     #[test]
-    fn the_lead_says_the_change_the_check_the_risk_and_what_is_needed() {
+    fn the_lead_says_the_change_the_focus_the_risk_and_the_checks() {
         let mut f = ticket_facts();
         f.how_to_check = "`cargo test -p export`".into();
+        f.repo_url = "https://github.com/acme/site".into();
         let out = lead(&f);
         assert_eq!(
             out,
             "<!-- coderhelm:lead -->\n\
-             Retries the export poller three times before it gives up.\n\n\
-             **Check:** `cargo test -p export`; 2 recorded checks passed on `abc1234`.\n\
-             **Risk:** **Low**: one module.\n\
-             **Needed from you:** Nothing.\n\
-             **Review:** decide whether this does what OPS-41 asks. CoderHelm's conclusion: every recorded check passed on `abc1234`.\n\
+             <!-- coderhelm:body v1 ticket=OPS-41 head=abc1234 -->\n\
+             Retries the export poller three times before it gives up (OPS-41).<!-- ch:summary-end -->\n\n\
+             ### Review focus\n\n\
+             - Approach: decide whether this does what OPS-41 asks. CoderHelm's conclusion: all checks on this head passed.\n\
+             - Read first: [`src/export/poller.rs`](https://github.com/acme/site/blob/abc1234/src/export/poller.rs) (the retry loop decides when a poll is abandoned).\n\n\
+             **Risk:** Low. One module.\n\n\
+             **Rollback:** Revert this pull request.\n\n\
+             ### Verification\n\n\
+             On abc1234 (head of this PR):\n\n\
+             | Check | Result |\n\
+             |---|---|\n\
+             | unit tests (CI) | Passed |\n\
+             | lint (CI) | Passed |\n\n\
              <!-- /coderhelm:lead -->"
         );
-        assert!(out.lines().count() <= visible_budget(&f));
+        assert_eq!(
+            crate::pr_body::defects(&out, "abc1234"),
+            vec!["no footer".to_string()]
+        );
     }
 
     #[test]
@@ -906,16 +1544,13 @@ mod tests {
         f.checks = vec![];
         let out = lead(&f);
         assert!(
-            out.contains("**Check:** no check has reported on `abc1234` yet."),
-            "{out}"
-        );
-        assert!(
-            out.contains("- no check has reported on `abc1234`"),
+            out.contains("| CI | Not run: no check has reported on this head yet |"),
             "{out}"
         );
         f.checks = vec![
-            check("unit tests", Outcome::Failed),
             check("lint", Outcome::Passed),
+            check("unit tests", Outcome::Failed),
+            check("Deploy to Production", Outcome::DidNotRun),
         ];
         f.open = vec![OpenItem {
             text: "Set the staging secret.".into(),
@@ -926,25 +1561,25 @@ mod tests {
             why: "the sandbox has no credentials for it".into(),
         }];
         let out = lead(&f);
-        assert!(out.contains("1 of 2 recorded checks passed"), "{out}");
-        assert!(out.contains("failed on `abc1234`"), "{out}");
-        assert!(out.contains("https://ci.example.com/unit-tests"), "{out}");
+        // Failed first, with its log; a skipped job is not a row.
+        let failed = out
+            .find("| unit tests (CI) | Failed: [log](https://ci.example.com/unit-tests) |")
+            .unwrap();
         assert!(
-            out.contains("**Needed from you:**\n1. Set the staging secret (a person)\n"),
+            failed < out.find("| lint (CI) | Passed |").unwrap(),
             "{out}"
         );
+        assert!(!out.contains("Deploy to Production"), "{out}");
         assert!(
-            out.contains(
-                "not verified: the export against the live bucket. The sandbox has no credentials"
-            ),
+            out.contains("| the export against the live bucket | Not run: the sandbox has no credentials for it |"),
             "{out}"
         );
-        // What a person must do is in the first five lines.
-        let first: Vec<&str> = out.lines().filter(|l| !l.is_empty()).take(6).collect();
+        // What a person must do comes right after the Summary.
         assert!(
-            first.iter().any(|l| l.starts_with("**Needed from you:**")),
-            "{first:?}"
+            out.contains("<!-- ch:summary-end -->\n\n### Needed from you\n\n- [ ] <!-- ch:set-the-staging-secret --> **Person who holds the credential**, before merge: Set the staging secret. Why a person: it needs a credential only a person can provide."),
+            "{out}"
         );
+        assert!(!out.contains("(a person)"), "{out}");
     }
 
     #[test]
@@ -958,7 +1593,7 @@ mod tests {
                     to: "3.0.1".into(),
                     moved: true,
                     major: true,
-                    remaining: vec![],
+                    ..Default::default()
                 },
                 DepLine {
                     package: "tiny-yaml".into(),
@@ -966,7 +1601,7 @@ mod tests {
                     to: "2.0.0".into(),
                     moved: true,
                     major: true,
-                    remaining: vec![],
+                    ..Default::default()
                 },
             ],
             majors: vec![MajorEvidence {
@@ -981,13 +1616,17 @@ mod tests {
         });
         let out = lead(&f);
         assert!(
-            out.contains(
-                "`glob-walk` 2.1.0 to 3.0.1 crosses a major version. 3.0 drops the sync API"
-            ),
+            out.contains("| `glob-walk` | 2.1.0 to 3.0.1 | Major. 3.0 drops the sync API"),
             "{out}"
         );
         assert!(
-            out.contains("`tiny-yaml` 1.2.0 to 2.0.0 crosses a major version. No safety evidence is recorded"),
+            out.contains("| `tiny-yaml` | 1.2.0 to 2.0.0 | Major; no safety evidence is recorded: read its upgrade notes |"),
+            "{out}"
+        );
+        // The reviewer decides the merge; CoderHelm states its own
+        // conclusion on the evidence, never asks for that analysis.
+        assert!(
+            out.contains("Approach: decide whether to merge 2 dependency updates."),
             "{out}"
         );
         assert!(
@@ -996,28 +1635,38 @@ mod tests {
         );
         assert!(!out.contains("Feedback wanted"), "{out}");
         assert!(
-            out.contains("whether to merge 2 dependency updates"),
+            out.contains("Updates 2 packages: 2 major (OPS-41)."),
             "{out}"
         );
     }
 
     #[test]
-    fn a_long_list_of_anomalies_points_at_the_run_page() {
+    fn many_checks_are_grouped_into_eight_rows() {
         let mut f = ticket_facts();
-        f.run_url = "https://app.example.com/runs/detail?id=run-1".into();
-        f.unverified = (0..20)
+        f.checks = (0..12)
+            .map(|i| check(&format!("unit tests ({i}/12)"), Outcome::Passed))
+            .chain([
+                check("lint", Outcome::Passed),
+                check("build", Outcome::Failed),
+            ])
+            .collect();
+        f.unverified = (0..3)
             .map(|i| Unverified {
                 what: format!("thing {i}"),
                 why: "not run".into(),
             })
             .collect();
         let out = lead(&f);
-        assert_eq!(out.matches("\n- ").count(), MAX_ANOMALIES + 1);
         assert!(
-            out.contains("and 12 more: [the full list is on the run page](https://app.example.com/runs/detail?id=run-1)"),
+            out.contains("| Tests (CI): 12 jobs | Passed; all passed |"),
             "{out}"
         );
-        assert!(out.lines().count() <= visible_budget(&f), "{out}");
+        assert!(out.contains("| build (CI) | Failed:"), "{out}");
+        let rows = out
+            .lines()
+            .filter(|l| l.starts_with("| ") && !l.starts_with("| Check"))
+            .count();
+        assert!(rows <= crate::pr_body::MAX_ROWS, "{out}");
     }
 
     #[test]

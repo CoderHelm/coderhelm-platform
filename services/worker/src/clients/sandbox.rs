@@ -80,6 +80,11 @@ fn current_build_estimate() -> Duration {
     build_estimate_from(&samples)
 }
 
+/// Whether `left` fits one build of `build` (with the buffer) but not two.
+pub(crate) fn in_check_window(left: Duration, build: Duration) -> bool {
+    enough_runway(left, build) && left < DEADLINE_BUFFER + build * 2
+}
+
 /// Is `remaining` enough to start a build expected to take `estimate`, while
 /// still leaving the post-build buffer?
 fn enough_runway(remaining: Duration, estimate: Duration) -> bool {
@@ -573,6 +578,15 @@ impl<'a> SandboxClient<'a> {
     /// Is the sandbox configured (both bucket and project set)?
     pub fn is_enabled(&self) -> bool {
         !self.bucket.is_empty() && !self.project.is_empty()
+    }
+
+    /// The time left before `deadline` and the expected build time, when
+    /// one more build fits but two don't: the moment to run the checks
+    /// before the step runs out. `None` without a deadline, or outside it.
+    pub fn check_window(&self, deadline: Option<Instant>) -> Option<(Duration, Duration)> {
+        let left = deadline?.saturating_duration_since(Instant::now());
+        let build = current_build_estimate();
+        in_check_window(left, build).then_some((left, build))
     }
 
     /// True if there is enough runway before `deadline` to run a build to
