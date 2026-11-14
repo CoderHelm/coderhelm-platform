@@ -409,20 +409,33 @@ pub async fn assumptions(
     assumption_items(&records)
 }
 
-/// Open items from decision records: one per proceed, newest wording kept.
+/// Items from decision records, for the settle stage's gate
+/// (`common::person_gate`): one per decision, in its newest wording. A
+/// proceed the judge made on its reading is a decision CoderHelm made: the
+/// gate keeps it as a note, settled by what the judge cited or decided,
+/// and lets it reach a person only for a listed reason. Never an
+/// instruction to edit or delete CoderHelm's own text.
 pub fn assumption_items(records: &[Record]) -> Vec<super::proof::Finding> {
     let mut out: Vec<super::proof::Finding> = Vec::new();
     for r in records.iter().filter(|r| r.verdict == "proceed") {
-        if r.detail.trim().is_empty() || out.iter().any(|f| f.detail.contains(r.detail.trim())) {
+        let detail = r.detail.split_whitespace().collect::<Vec<_>>().join(" ");
+        if detail.is_empty() {
             continue;
         }
-        out.push(super::proof::Finding {
+        let f = super::proof::Finding {
             point: super::proof::JUDGE_ASSUMPTION.to_string(),
-            detail: format!("{}: {}", r.step.replace('_', " "), r.detail.trim()),
-            settle: "Correct it in a comment on this pull request if it's wrong; otherwise                      delete this line."
-                .to_string(),
+            topic: r.step.replace('_', " "),
+            detail,
             ..Default::default()
-        });
+        };
+        let ask = super::settle::ask_of(&f);
+        match out
+            .iter()
+            .position(|k| common::person_gate::same_decision(&super::settle::ask_of(k), &ask))
+        {
+            Some(i) => out[i] = f,
+            None => out.push(f),
+        }
     }
     out
 }

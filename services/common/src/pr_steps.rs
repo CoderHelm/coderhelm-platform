@@ -124,6 +124,19 @@ fn sentence_part(s: &str) -> String {
     one_line(s).trim_end_matches(['.', ';', ',']).to_string()
 }
 
+/// Whether `how` is a command that checks the change (a test, a build, a
+/// lint): a command that deploys, releases, publishes or migrates is a
+/// step, never the check a reader is pointed at.
+pub fn is_check_command(how: &str) -> bool {
+    let h = how.to_lowercase();
+    is_command(how)
+        && ![
+            "deploy", "release", "publish", "migrate", "rollout", "promote",
+        ]
+        .iter()
+        .any(|w| h.contains(w))
+}
+
 /// Whether `how` is a command a person can paste.
 pub fn is_command(how: &str) -> bool {
     let h = how.trim().trim_matches('`');
@@ -248,12 +261,53 @@ pub fn strip_machinery(raw: &str) -> String {
 }
 
 impl Step {
-    /// Whether a person has something to do for it now.
-    pub fn needs_person(&self) -> bool {
+    /// The step as an item for the gate (`person_gate`).
+    pub fn ask(&self) -> crate::person_gate::Ask {
+        let (why_not, how) = match &self.state {
+            State::Failed { cause, unblock } => (format!("{cause}. {unblock}"), self.how.clone()),
+            State::Person { why, unblock } => (format!("{why}. {unblock}"), self.how.clone()),
+            State::Approval { who, place } => (
+                format!(
+                    "{who} approves it {place}: the team's agent permission policy needs approval"
+                ),
+                self.how.clone(),
+            ),
+            _ => (String::new(), self.how.clone()),
+        };
+        crate::person_gate::Ask {
+            kind: crate::person_gate::Kind::Step,
+            topic: String::new(),
+            text: one_line(&self.what),
+            how,
+            owner: self.owner.clone(),
+            why_not: one_line(&why_not),
+            options: Vec::new(),
+        }
+    }
+
+    /// What the gate makes of the step, when it is one a person was to do.
+    fn gated(&self) -> Option<crate::person_gate::Outcome> {
         matches!(
             self.state,
             State::Person { .. } | State::Failed { .. } | State::Approval { .. }
         )
+        .then(|| crate::person_gate::decide(&self.ask(), &crate::person_gate::Context::default()))
+    }
+
+    /// Whether a person has something to do for it now: only what the gate
+    /// finds a person alone can do. A failure CoderHelm can retry, a look
+    /// that belongs to the review and its own work are never a person's.
+    pub fn needs_person(&self) -> bool {
+        matches!(self.gated(), Some(crate::person_gate::Outcome::Human(_)))
+    }
+
+    /// The sign-off the step asks for, when it belongs to the reviewer's
+    /// merge decision rather than a separate chore.
+    pub fn for_review(&self) -> Option<String> {
+        match self.gated() {
+            Some(crate::person_gate::Outcome::Review(r)) => Some(r),
+            _ => None,
+        }
     }
 
     fn how_words(&self) -> String {
