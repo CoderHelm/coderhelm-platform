@@ -1284,7 +1284,8 @@ pub fn questions_markdown(d: &FixDecision) -> String {
     if qs.is_empty() {
         return String::new();
     }
-    let mut out = String::from("**Questions only a person can answer**\n");
+    let qs = common::conversation::merge_questions(&qs);
+    let mut out = String::from("I need your call on these:\n");
     for (i, q) in qs.iter().enumerate() {
         out.push_str(&format!("{}. {q}\n", i + 1));
     }

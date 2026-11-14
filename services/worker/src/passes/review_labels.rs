@@ -281,7 +281,7 @@ pub fn prompt_section(candidates: &[RepoLabel], current: &[String], rules: &Labe
     if !rules.requires.is_empty() {
         s.push_str("Added automatically with a label (you don't need to pick these):\n");
         for (pat, comps) in &rules.requires {
-            s.push_str(&format!("- {pat} → {}\n", comps.join(", ")));
+            s.push_str(&format!("- {pat} to {}\n", comps.join(", ")));
         }
     }
     if !rules.guide.is_empty() {
@@ -695,7 +695,7 @@ mod tests {
         assert!(s.contains("- E2E:join — Online join; payments need staging"));
         assert!(!s.contains("DEPLOY_PRODUCTION"));
         assert!(s.contains("Already on the PR: ch-review"));
-        assert!(s.contains("E2E:join → CI:DEPLOY_STAGING"));
+        assert!(s.contains("E2E:join to CI:DEPLOY_STAGING"));
         assert!(s.contains("Payment tests need staging."));
         // the team's rules outrank the repo's docs and label descriptions
         assert!(s.contains("The team's label rules for this repo: "));

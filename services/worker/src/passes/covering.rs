@@ -757,28 +757,29 @@ pub async fn finish(
     super::add_progress_note(state, &msg.team_id, run_id, &rec.note).await;
     match msg.source {
         TicketSource::Github if msg.issue_number > 0 => {
-            if let Err(e) = github
-                .create_issue_comment(
-                    &msg.repo_owner,
-                    &msg.repo_name,
-                    msg.issue_number,
-                    &cov::ticket_note(rec, true),
-                )
-                .await
+            if let Err(e) = crate::passes::conversation::github(
+                github,
+                &msg.repo_owner,
+                &msg.repo_name,
+                msg.issue_number,
+                common::conversation::Say::status("run", cov::ticket_note(rec, true)),
+            )
+            .await
             {
                 warn!(run_id, error = %e, "Could not note the covering PR on the issue");
             }
         }
         TicketSource::Jira if !msg.ticket_id.is_empty() => {
-            if let Err(e) = super::post_jira_comment(
+            if let Err(e) = crate::passes::conversation::jira(
                 state,
                 &msg.team_id,
                 &msg.ticket_id,
-                &cov::ticket_note(rec, false),
+                common::conversation::Say::status("run", cov::ticket_note(rec, false)),
                 "covered",
                 "Already being fixed",
             )
             .await
+            .map(|_| ())
             {
                 warn!(run_id, error = %e, "Could not note the covering PR on the ticket");
             }

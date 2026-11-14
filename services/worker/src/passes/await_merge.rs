@@ -801,7 +801,9 @@ async fn publish_status(
     }
     let mut comment_id = None;
     if let Some(id) = record.status_comment_id {
-        match github.edit_issue_comment(owner, repo, id, body).await {
+        match crate::passes::conversation::edit_own(github, owner, repo, id, "merge-status", body)
+            .await
+        {
             Ok(_) => comment_id = Some(id),
             Err(e) => {
                 warn!(pr = msg.pr_number, error = %e, "await-merge: status comment edit failed — posting a new one")
@@ -822,9 +824,14 @@ async fn publish_status(
         if !claim.won_or_failed_open() {
             return;
         }
-        match github
-            .create_issue_comment(owner, repo, msg.pr_number, body)
-            .await
+        match crate::passes::conversation::github(
+            github,
+            owner,
+            repo,
+            msg.pr_number,
+            common::conversation::Say::status("merge-status", body),
+        )
+        .await
         {
             Ok(v) => comment_id = v["id"].as_u64(),
             Err(e) => {

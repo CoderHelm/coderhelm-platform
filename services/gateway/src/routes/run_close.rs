@@ -630,20 +630,19 @@ impl Ctx<'_> {
         }
         if let (Some(ticket), Some(url)) = (&steps.jira_ticket, &self.jira_comment_url) {
             let note = run_status::ticket_note(&self.closer.public, self.reason.as_deref());
-            let payload = json!({
-                "issueKey": ticket,
-                "comment": note,
-                "commentType": "status",
-                "title": "Closed",
-            });
-            match self.state.http.post(url).json(&payload).send().await {
-                Ok(r) if r.status().is_success() => {}
-                Ok(r) => warn!(
-                    run_id,
-                    status = r.status().as_u16(),
-                    "close: Jira note refused"
-                ),
-                Err(e) => warn!(run_id, error = %e, "close: Jira note failed"),
+            let say = common::conversation::Say::status("run", note);
+            if let Err(e) = super::conversation::jira_at(
+                self.state,
+                self.team_id,
+                url,
+                ticket,
+                say,
+                "status",
+                "Closed",
+            )
+            .await
+            {
+                warn!(run_id, error = %e, "close: Jira note failed");
             }
         }
         out
@@ -658,12 +657,9 @@ async fn close_pr_on_github(state: &AppState, token: &str, pr: &PrRef, comment: 
             .header("Accept", "application/vnd.github+json")
             .header("User-Agent", "Coderhelm-bot")
     };
-    if let Err(e) = gh(state
-        .http
-        .post(format!("{api}/issues/{}/comments", pr.number)))
-    .json(&json!({ "body": comment }))
-    .send()
-    .await
+    let say = common::conversation::Say::status("closed", comment);
+    if let Err(e) =
+        super::conversation::github(state, token, &pr.owner, &pr.repo, pr.number, say).await
     {
         warn!(pr = pr.number, error = %e, "close: PR comment failed");
     }
