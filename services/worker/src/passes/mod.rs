@@ -1351,6 +1351,7 @@ pub mod ticket_history;
 pub mod tool_proposals;
 mod triage;
 pub mod upgrade_notes;
+pub mod upgrade_quality;
 pub mod usage_reconcile;
 pub mod web_check;
 pub mod webhooks;

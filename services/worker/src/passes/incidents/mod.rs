@@ -31,6 +31,7 @@ mod am_description_from_the_head;
 mod an_six_database_findings;
 mod ao_stopped_log_finding;
 mod ap_closed_pr_keeps_findings;
+mod au_upgrade_decided_and_proven;
 mod b_open_pr_retry;
 mod ba_verdict_on_old_commit;
 mod bb_flaky_not_broken;

@@ -6,7 +6,12 @@
 //! Once the batches are settled the repository's real build and its start
 //! command run in a sandbox build of their own, on the base branch and on
 //! the branch (`common::runtime_proof`): what the bumps break there takes
-//! out the newest commit of bumps, deferred with the cause.
+//! out the newest commit of bumps, deferred with the cause. Then the set a
+//! dependency change is verified with whatever CI runs
+//! (`common::upgrade_quality::verify`: the project's own frozen install,
+//! type check, build, lint, tests and production audit) runs on the branch,
+//! and on the base branch where the branch fails something. What the run
+//! found is recorded for its head commit (`passes::upgrade_quality`).
 //!
 //! The run's state is kept on S3 after every probe, so a step that runs out
 //! of time hands off and the next one resumes where it stopped (and its
@@ -17,6 +22,7 @@ use std::time::Instant;
 
 use common::dep_fix::{self as df, Action, CodeFixed, DepRun, ProbeResult};
 use common::runtime_proof as rp;
+use common::upgrade_quality::{family as fam, verify as vq};
 use tracing::{info, warn};
 
 use crate::clients::github::{FileOp, GitHubClient};
@@ -99,7 +105,7 @@ pub async fn start(
         &common::security_fixes::Finding,
         &common::security_fixes::FindingState,
     )> = inputs.findings.iter().map(|(f, s)| (f, s)).collect();
-    let plan = df::plan_in(&pairs, &inputs.cfg, &locks);
+    let mut plan = df::plan_in(&pairs, &inputs.cfg, &locks);
     if !plan
         .bumps
         .iter()
@@ -116,7 +122,14 @@ pub async fn start(
         .await
         .ok()?;
     let budget = inputs.cfg.fix_run_budget_cents as f64 / 100.0;
-    let run = DepRun::new(plan, &head, budget);
+    // A major a parent's release brings in is fixed by raising the parent,
+    // never by an override; packages released together move together.
+    let notes = super::security_fixes::dep_notes(state, &msg.team_id, &msg.ticket_id).await;
+    common::upgrade_quality::safety::route_through_parents(&mut plan, &notes, &inputs.findings);
+    let (families, peers) = super::upgrade_quality::families(state, github, msg, &mut plan).await;
+    let mut run = DepRun::new(plan, &head, budget);
+    run.families = families;
+    run.peers = peers;
     save(state, msg, run_id, &run).await;
     Some(run)
 }
@@ -271,12 +284,19 @@ struct Probe<'a> {
     node: Option<String>,
     deadline: Option<Instant>,
     attempt: std::sync::atomic::AtomicUsize,
+    /// The run's families: every lockfile a probe writes is checked
+    /// against them.
+    families: Vec<fam::Family>,
 }
 
 /// One probe's result and the manifests and lockfiles it wrote.
+#[derive(Default)]
 struct Probed {
     result: ProbeResult,
     files: Vec<(String, String)>,
+    /// Packages whose parent was raised instead of an override, and that
+    /// the lockfile the probe wrote still installs below the fixed version.
+    parent_unmoved: Vec<String>,
 }
 
 impl Probe<'_> {
@@ -296,7 +316,7 @@ impl Probe<'_> {
                         tail: format!("the branch could not be snapshotted: {e}"),
                         ..Default::default()
                     },
-                    files: vec![],
+                    ..Default::default()
                 }
             }
         };
@@ -330,7 +350,7 @@ impl Probe<'_> {
                         tail: e.to_string(),
                         ..Default::default()
                     },
-                    files: vec![],
+                    ..Default::default()
                 }
             }
         };
@@ -349,7 +369,7 @@ impl Probe<'_> {
                         tail: common::tail_str(&o.output, 2000).to_string(),
                         ..Default::default()
                     },
-                    files: vec![],
+                    ..Default::default()
                 };
             }
             self.steps
@@ -360,18 +380,126 @@ impl Probe<'_> {
         } else {
             vec![]
         };
+        let files: Vec<(String, String)> = o
+            .changed
+            .into_iter()
+            .filter(|(p, _)| df::commit_path(p))
+            .collect();
+        let mut result = ProbeResult {
+            ran,
+            applied,
+            checks,
+            tail: common::tail_str(&o.output, 3000).to_string(),
+        };
+        // The lockfile the bumps wrote, against the run's families and the
+        // parents it raised: a family at two versions fails the set like
+        // any check.
+        let (split, parent_unmoved) = if applied {
+            df::lockfile_violations(&self.families, bumps, &files)
+        } else {
+            (vec![], vec![])
+        };
+        if !split.is_empty() {
+            result.checks.push((df::FAMILY_CHECK.to_string(), false));
+            result.tail = format!("{}\n{}", split.join("; "), result.tail);
+        }
         Probed {
-            result: ProbeResult {
-                ran,
-                applied,
-                checks,
-                tail: common::tail_str(&o.output, 3000).to_string(),
-            },
-            files: o
-                .changed
-                .into_iter()
-                .filter(|(p, _)| df::commit_path(p))
-                .collect(),
+            result,
+            files,
+            parent_unmoved,
+        }
+    }
+}
+
+/// The longest one verification build is given, and what a step keeps
+/// back from it for the build's start and the step's own end.
+const VERIFY_WINDOW: std::time::Duration = std::time::Duration::from_secs(11 * 60);
+const VERIFY_MARGIN: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// The seconds a verification build started now has for its checks.
+pub fn verify_window(left: Option<std::time::Duration>) -> u32 {
+    let w = match left {
+        Some(l) => l.saturating_sub(VERIFY_MARGIN).min(VERIFY_WINDOW),
+        None => VERIFY_WINDOW,
+    };
+    w.as_secs() as u32
+}
+
+/// Whether a verification build should wait for a fresh step: started now
+/// it would leave out a check a full window runs, and the run has not
+/// already moved to a fresh step for this build.
+pub fn verify_waits(plan: &vq::Plan, left: Option<std::time::Duration>, waited: bool) -> bool {
+    let now = vq::fit(plan, verify_window(left)).0.len();
+    let full = vq::fit(plan, verify_window(None)).0.len();
+    !waited && now < full
+}
+
+impl Probe<'_> {
+    /// One build of the verification set on `sha`: the checks that fit the
+    /// time this step has, each recorded against the commit; the ones that
+    /// do not fit are recorded as not run, with why. On the branch the
+    /// audit's listing is read from the same build.
+    async fn verify(
+        &self,
+        sha: &str,
+        plan: &vq::Plan,
+        nonce: usize,
+    ) -> (vq::Verified, Option<common::dep_audit::Listings>) {
+        let (owner, name) = (&self.msg.repo_owner, &self.msg.repo_name);
+        let left = self
+            .deadline
+            .map(|d| d.saturating_duration_since(Instant::now()));
+        let (run, not) = vq::fit(plan, verify_window(left));
+        if run.is_empty() {
+            return (
+                vq::read(plan, sha, &[], &not, "").with_reason(
+                    "this step had no time left for a sandbox build of the verification set",
+                ),
+                None,
+            );
+        }
+        let source = match self
+            .sandbox
+            .ensure_source(self.run_id, sha, || {
+                self.github.download_tarball(owner, name, sha)
+            })
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                return (
+                    vq::no_result(
+                        plan,
+                        sha,
+                        &format!("the branch could not be snapshotted: {e}"),
+                    ),
+                    None,
+                )
+            }
+        };
+        let reducer = common::dep_audit::listing(&plan.manager, &plan.dir).unwrap_or_default();
+        let out = self
+            .sandbox
+            .run_codegen(
+                self.run_id,
+                1300 + nonce,
+                &source,
+                &vq::script(plan, &run, &reducer),
+                self.node.as_deref(),
+                &[],
+                self.deadline,
+            )
+            .await;
+        match out {
+            Ok(o) if o.ran => {
+                let audited = run.iter().any(|&i| plan.checks[i].kind == vq::Kind::Audit);
+                (
+                    vq::read(plan, sha, &run, &not, &o.output),
+                    audited.then(|| common::dep_audit::listings(&plan.manager, &o.output)),
+                )
+            }
+            Ok(o) => (vq::no_result(plan, sha, &o.output), None),
+            Err(e) => (vq::no_result(plan, sha, &e.to_string()), None),
         }
     }
 }
@@ -678,6 +806,7 @@ pub async fn drive(
         node: super::detect_node_version(w.github, owner, name, &msg.base_branch).await,
         deadline: w.deadline,
         attempt: std::sync::atomic::AtomicUsize::new(run.probes as usize),
+        families: run.families.clone(),
     };
     // The team's agent permissions hold the sandbox commands like any other.
     let gate = crate::agent::policy::gate(
@@ -759,9 +888,32 @@ pub async fn drive(
                 .await;
                 let mut results = vec![];
                 let mut keyed: HashMap<Vec<usize>, Vec<(String, String)>> = HashMap::new();
+                // A parent raised instead of an override that did not move
+                // its package: the override is written after all, and the
+                // set is probed again with it.
+                let mut unmoved: Vec<String> = vec![];
                 for ((g, ids), o) in groups.iter().zip(probed).zip(outs) {
+                    if !o.parent_unmoved.is_empty() {
+                        unmoved.extend(o.parent_unmoved);
+                        continue;
+                    }
                     keyed.insert(ids, o.files);
                     results.push((*g, o.result));
+                }
+                for b in run.plan.bumps.iter_mut() {
+                    if b.via_parent.is_some() && unmoved.contains(&b.package) {
+                        let parent = b.via_parent.take().map(|p| p.package).unwrap_or_default();
+                        super::add_progress_note(
+                            state,
+                            &msg.team_id,
+                            w.run_id,
+                            &format!(
+                                "Dependency fix: raising `{parent}` did not move `{}` off its vulnerable version, so it is fixed by an override scoped to its version line",
+                                b.package
+                            ),
+                        )
+                        .await;
+                    }
                 }
                 run.on_probes(&results);
                 info!(
@@ -848,7 +1000,17 @@ pub async fn drive(
                 run.on_code_fix(bump, r, tokens, usd);
             }
             Action::ProofPlan => {
-                let plan = proof_plan(w, &run).await;
+                let mut plan = proof_plan(w, &run).await;
+                // The requests that go through the call sites of the
+                // applied majors, sent to the base branch's build and to
+                // the branch's alike.
+                if plan.start.is_some() {
+                    let planned =
+                        super::upgrade_quality::behaviour_plan(state, w.github, msg, &run).await;
+                    plan.probes = planned.requests;
+                    run.probed = planned.of;
+                    run.not_probed = planned.not_probed;
+                }
                 // The proof's commands are the repository's own: the team's
                 // agent permissions hold them like any other.
                 let permitted = plan.is_empty()
@@ -922,13 +1084,141 @@ pub async fn drive(
                     None => run.on_proof_take_out_failed(),
                 }
             }
+            Action::VerifyPlan => {
+                let plan = super::upgrade_quality::verify_plan(w.github, msg, &run, &tree).await;
+                // The set's commands are the project's own: the team's
+                // agent permissions hold them like any other.
+                let all: Vec<usize> = (0..plan.checks.len()).collect();
+                let permitted = plan.is_empty()
+                    || matches!(
+                        gate.check_command(
+                            &vq::script(&plan, &all, ""),
+                            "Verify the dependency change with the project's own checks"
+                        )
+                        .await,
+                        common::agent_policy::Outcome::Run { .. }
+                    );
+                run.on_verify_plan(plan);
+                if !permitted {
+                    run.skip_verify(
+                        "the team's agent permissions do not let the sandbox run the project's install and checks",
+                    );
+                }
+            }
+            Action::Verify { base } => {
+                let plan = run.verify.plan.clone().unwrap_or_default();
+                let left = w
+                    .deadline
+                    .map(|d| d.saturating_duration_since(Instant::now()));
+                if verify_waits(&plan, left, run.verify.waited) {
+                    // Its own step, with a full time window.
+                    run.on_verify_wait();
+                    save(state, msg, w.run_id, &run).await;
+                    return Ok(Driven::Handoff(Box::new(run)));
+                }
+                let sha = if base {
+                    match run.base_sha() {
+                        Some(s) => s.to_string(),
+                        None => w
+                            .github
+                            .get_ref(owner, name, &msg.base_branch)
+                            .await
+                            .unwrap_or_default(),
+                    }
+                } else {
+                    run.head.clone()
+                };
+                let (v, listed) = probe.verify(&sha, &plan, run.verify.runs as usize).await;
+                let note = verify_note(base, &v);
+                if !base && v.ran {
+                    run.verify.audit = listed;
+                }
+                run.on_verify(base, v);
+                super::add_progress_note(state, &msg.team_id, w.run_id, &note).await;
+            }
+            Action::VerifyTakeOut { why } => {
+                // The state moves only once the branch is written.
+                let mut next = run.clone();
+                let written = match next.take_out_last_commit(&why) {
+                    Some(out) => restore_to(w, &out).await.map(|head| (out, head)),
+                    None => None,
+                };
+                match written {
+                    Some((out, head)) => {
+                        next.on_verify_taken_out(&out, &head);
+                        run = next;
+                        super::add_progress_note(
+                            state,
+                            &msg.team_id,
+                            w.run_id,
+                            &format!(
+                                "Dependency fix: a check of the verification set fails with the newest verified set and passes on the base branch; took out {} bump(s) and kept the {} set(s) before it. {}",
+                                out.lines.len(),
+                                run.commits.len(),
+                                common::truncate_str(&out.lines.join("; "), 600)
+                            ),
+                        )
+                        .await;
+                    }
+                    None => run.on_verify_take_out_failed(),
+                }
+            }
             Action::Done => {
+                // What the run found, recorded for the commit it ends on.
+                if !run.applied.is_empty() && run.facts_sha != run.head {
+                    let at = super::upgrade_quality::At {
+                        state,
+                        gh: w.github,
+                        msg,
+                        branch: w.branch,
+                    };
+                    let facts = super::upgrade_quality::record(&at, &run).await;
+                    run.facts_sha = facts.sha;
+                }
                 save(state, msg, w.run_id, &run).await;
                 return Ok(Driven::Done(Box::new(run)));
             }
         }
         save(state, msg, w.run_id, &run).await;
     }
+}
+
+/// The run page's line for one build of the verification set.
+fn verify_note(base: bool, v: &vq::Verified) -> String {
+    let on = if base {
+        "on the base branch"
+    } else {
+        "with the bumps"
+    };
+    if !v.ran {
+        return format!(
+            "Dependency fix: the verification set {on} gave no result ({})",
+            common::truncate_str(v.tail.lines().next().unwrap_or(""), 200)
+        );
+    }
+    let words: Vec<String> = v
+        .outcomes
+        .iter()
+        .map(|o| {
+            format!(
+                "{} {}",
+                o.kind.name(),
+                match &o.status {
+                    vq::Status::Failed { .. } if o.kind == vq::Kind::Audit => {
+                        "lists advisories".to_string()
+                    }
+                    vq::Status::Passed => "passes".to_string(),
+                    vq::Status::Failed { exit } => format!("fails (exit {exit})"),
+                    vq::Status::TimedOut { .. } => "hit its time limit".to_string(),
+                    vq::Status::NotRun => "did not run".to_string(),
+                }
+            )
+        })
+        .collect();
+    format!(
+        "Dependency fix: verification set {on}: {}",
+        words.join("; ")
+    )
 }
 
 /// The run page's line for one runtime proof build.
@@ -1307,11 +1597,23 @@ pub async fn settle(state: &WorkerState, msg: &TicketMessage, run: &DepRun) {
         .map(|(f, _)| f)
         .filter(|f| f.repo.eq_ignore_ascii_case(&repo))
         .collect();
-    let report = format!(
-        "{}\n{}",
-        run.report_md().trim_end(),
-        df::remaining_md(&df::remaining(run, &of_repo))
-    );
+    // One count of what stays open: when the run recorded the advisories
+    // of this head against the package manager's audit
+    // (`upgrade_quality::advisories`), that count is the one the pull
+    // request shows. Without it, CoderHelm's own findings are counted, and
+    // said to be its own.
+    let reconciled = super::security_fixes::dep_facts(state, &msg.team_id, &msg.ticket_id)
+        .await
+        .is_some_and(|f| f.of_head(&run.head) && f.advisories.is_some());
+    let report = if reconciled {
+        run.report_md().trim_end().to_string()
+    } else {
+        format!(
+            "{}\n{}",
+            run.report_md().trim_end(),
+            df::remaining_md(&df::remaining(run, &of_repo))
+        )
+    };
     super::security_fixes::settle_dep_run(
         state,
         &msg.team_id,
@@ -1374,6 +1676,52 @@ mod tests {
         assert!(!proof_waits(None, false));
         // The window fits inside a step and inside the sandbox's own wait.
         assert!(PROOF_WINDOW.as_secs() < super::super::LAMBDA_TIMEOUT_SECS - 150);
+    }
+
+    #[test]
+    fn a_verification_build_runs_what_fits_or_waits_once_for_a_fresh_step() {
+        let mins = |m: u64| Some(std::time::Duration::from_secs(m * 60));
+        let tree: Vec<String> = ["package.json", "pnpm-lock.yaml", "tsconfig.json"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let plan = vq::discover(
+            "pnpm-lock.yaml",
+            &tree,
+            &[(
+                "package.json".to_string(),
+                r#"{"scripts":{"build":"tsc -p .","test":"vitest run","lint":"eslint ."}}"#
+                    .to_string(),
+            )],
+            Some(("pnpm audit --prod --json", "pnpm audit --prod --json")),
+        );
+        // A step never gives a build more than its own window.
+        assert_eq!(verify_window(None), 11 * 60);
+        assert_eq!(verify_window(mins(30)), 11 * 60);
+        assert_eq!(verify_window(mins(5)), 5 * 60 - 90);
+        // A full window runs the whole set.
+        assert_eq!(
+            vq::fit(&plan, verify_window(None)).0.len(),
+            plan.checks.len()
+        );
+        assert!(!verify_waits(&plan, mins(30), false));
+        // Little time left: the build waits for a fresh step, once.
+        assert!(verify_waits(&plan, mins(5), false));
+        assert!(!verify_waits(&plan, mins(5), true));
+        // Then it runs what fits, in priority order, and names the rest.
+        let (run, left) = vq::fit(&plan, verify_window(mins(5)));
+        let kept: Vec<vq::Kind> = run.iter().map(|&i| plan.checks[i].kind).collect();
+        assert_eq!(kept, vec![vq::Kind::Install]);
+        assert_eq!(left.len(), plan.checks.len() - 1);
+        let v = vq::read(&plan, "abc1234", &run, &left, "CODERHELM_VERIFY 0 0\n");
+        assert_eq!(
+            verify_note(false, &v),
+            "Dependency fix: verification set with the bumps: frozen install passes; type check did not run; build did not run; lint did not run; unit tests did not run; production audit did not run"
+        );
+        // The window fits inside a step.
+        assert!(
+            VERIFY_WINDOW.as_secs() + VERIFY_MARGIN.as_secs() < super::super::LAMBDA_TIMEOUT_SECS
+        );
     }
 
     #[test]

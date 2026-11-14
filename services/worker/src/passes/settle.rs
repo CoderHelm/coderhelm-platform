@@ -29,6 +29,14 @@
 //!   and the counts left are quoted on the pull request.
 //! - A check the coder's step was refused for lack of time is owed: it runs
 //!   here whether or not anything listed it.
+//! - A change to the dependencies is verified with the set a senior
+//!   engineer would run, found in the project and not in its CI
+//!   (`common::upgrade_quality::verify`): a typed project is type-checked
+//!   though no workflow does it. A dependency run records that set against
+//!   its head, and this stage cites the record instead of building again
+//!   ([`Record::adopt_verified`]); any other change to the dependencies
+//!   gets the set's checks added to the repository's own ([`with_min_set`]).
+//!   So "check not run" never stays open for a check of the set: it runs.
 //! - An item that does not apply to the run is never raised, and items that
 //!   name the same missing fact are one item ([`dedup`]).
 //! - Open items are derived again whenever the head moves. Each line names
@@ -43,6 +51,7 @@ use tracing::{info, warn};
 
 use common::dep_audit;
 use common::handback::{human_only_in, HumanOnly};
+use common::upgrade_quality::verify as vq;
 
 use super::checks::{CheckKind, Step};
 use super::proof::{self, Finding, RunEvidence, SandboxRecord};
@@ -329,6 +338,9 @@ pub struct Record {
     pub reverts: u32,
     /// Fresh steps taken for a sandbox window.
     pub steps: u32,
+    /// The kinds that fail on this head and on the base branch too: not
+    /// caused by the change, so never fixed or taken out for.
+    pub base_fails: Vec<String>,
 }
 
 impl Record {
@@ -361,7 +373,62 @@ impl Record {
         [CheckKind::Build, CheckKind::Typecheck, CheckKind::Tests]
             .into_iter()
             .filter(|k| self.ran(*k) && !self.passed(*k))
+            .filter(|k| !self.base_fails.iter().any(|b| b == k.name()))
             .collect()
+    }
+
+    /// The verification set a dependency run recorded on this head stands
+    /// as this stage's check run: its results are cited with the commands
+    /// that ran, and the same build is never run twice. A record of
+    /// another commit, or one with no result, is not taken. `base`: the
+    /// set's results on the base branch, when the run needed them.
+    pub fn adopt_verified(&mut self, v: &vq::Verified, base: Option<&vq::Verified>) {
+        if self.checked || !v.ran || v.sha != self.head {
+            return;
+        }
+        let kind_of = |k: vq::Kind| match k {
+            vq::Kind::Typecheck => Some(CheckKind::Typecheck),
+            vq::Kind::Build => Some(CheckKind::Build),
+            vq::Kind::Lint => Some(CheckKind::Lint),
+            vq::Kind::Tests => Some(CheckKind::Tests),
+            _ => None,
+        };
+        let commit: String = v.sha.chars().take(7).collect();
+        // The audit has its own lines here, with its counts.
+        for o in v.outcomes.iter().filter(|o| o.kind != vq::Kind::Audit) {
+            let name = kind_of(o.kind).map_or(o.kind.name(), CheckKind::name);
+            let on_base = base.and_then(|b| b.outcome(o.kind));
+            let verdict = match &o.status {
+                vq::Status::Passed => "PASS".to_string(),
+                vq::Status::Failed { exit } if on_base.is_some_and(|b| b.ran() && !b.passed()) => {
+                    format!(
+                        "FAIL (exit {exit}) on the base branch too, so not caused by this change"
+                    )
+                }
+                vq::Status::Failed { exit } => format!("FAIL (exit {exit})"),
+                vq::Status::TimedOut { after } => {
+                    format!("no result (stopped at its time limit of {after} seconds)")
+                }
+                vq::Status::NotRun => format!("not run ({})", o.why),
+            };
+            self.checks.push(format!(
+                "- {name}: {verdict}, `{}` (the dependency run's verification set, on commit `{commit}`)",
+                common::truncate_str(&o.shown, 300)
+            ));
+            let Some(k) = kind_of(o.kind) else {
+                continue;
+            };
+            if o.ran() && !matches!(o.status, vq::Status::TimedOut { .. }) {
+                self.ran.push(k.name().to_string());
+                if o.passed() {
+                    self.passed.push(k.name().to_string());
+                } else if on_base.is_some_and(|b| b.ran() && !b.passed()) {
+                    self.base_fails.push(k.name().to_string());
+                }
+            }
+        }
+        self.checked = true;
+        self.no_result.clear();
     }
 
     /// A check run's steps and exit codes, recorded.
@@ -433,8 +500,10 @@ pub struct Plan {
 /// was refused one, the audit when an item names it or the change touches
 /// the dependencies.
 pub fn plan(items: &[Finding], facts: &Facts) -> Plan {
+    // A change to the dependencies is always verified: the set a senior
+    // engineer would run, whether or not an item asked for it.
     let mut p = Plan {
-        checks: facts.checks_owed,
+        checks: facts.checks_owed || facts.dep_change,
         audit: facts.dep_change,
         ..Default::default()
     };
@@ -552,6 +621,13 @@ fn result_of(actions: &[Action], rec: &Record) -> Result<String, String> {
                     .cloned()
                     .unwrap_or_else(|| format!("- {}: PASS", k.name()));
                 proof.push(line.trim_start_matches("- ").to_string());
+            }
+            Action::Check(k) if rec.ran(*k) && rec.base_fails.iter().any(|b| b == k.name()) => {
+                return Err(format!(
+                    "CoderHelm ran {} in its sandbox: it fails on this commit and on the base \
+                     branch too, so this change did not cause it",
+                    k.name()
+                ))
             }
             Action::Check(k) if rec.ran(*k) => {
                 return Err(format!(
@@ -723,6 +799,9 @@ pub fn redrive_due(body: &str, head: &str, redrives: u32, last_head: &str) -> bo
 // ── Running ─────────────────────────────────────────────────────────────
 
 /// How the stage ended in this step.
+// One value per step, moved once: the record stays inline so the callers
+// that take it apart are unchanged.
+#[allow(clippy::large_enum_variant)]
 pub enum Ran {
     /// Settled: what goes on the pull request.
     Settled(Box<Settled>, Record),
@@ -822,6 +901,82 @@ async fn permitted(w: &proof::Work<'_>, steps: Vec<Step>) -> Vec<Step> {
     kept
 }
 
+/// The repository's check steps with the verification set's added: each
+/// type check, build, lint and test command `found` names for a kind the
+/// steps do not already run. With no step at all, the set's own install
+/// comes first. A typed project is then type-checked whatever its CI runs.
+pub fn with_min_set(mut steps: Vec<Step>, found: &[vq::Plan]) -> Vec<Step> {
+    for plan in found {
+        let cd = if plan.dir.is_empty() {
+            String::new()
+        } else {
+            format!("cd '{}' && ", plan.dir)
+        };
+        if steps.is_empty() {
+            if let Some(install) = plan.checks.iter().find(|c| c.kind == vq::Kind::Install) {
+                steps.push(Step {
+                    kinds: vec![],
+                    cmd: format!("{cd}{}", install.cmd),
+                    scope: None,
+                });
+            }
+        }
+        for c in &plan.checks {
+            let kind = match c.kind {
+                vq::Kind::Typecheck => CheckKind::Typecheck,
+                vq::Kind::Build => CheckKind::Build,
+                vq::Kind::Lint => CheckKind::Lint,
+                vq::Kind::Tests => CheckKind::Tests,
+                _ => continue,
+            };
+            if steps.iter().any(|s| s.kinds.contains(&kind)) {
+                continue;
+            }
+            steps.push(Step {
+                kinds: vec![kind],
+                cmd: format!("{cd}{}", c.cmd),
+                scope: Some(format!(
+                    "found in the project of `{}`, not in CI: {}",
+                    plan.lockfile, c.found
+                )),
+            });
+        }
+    }
+    steps
+}
+
+/// Projects whose verification set one settle build adds.
+const MAX_MIN_SET_PROJECTS: usize = 2;
+
+/// The verification set of each project whose lockfile the change touches,
+/// found in the project's own files on the branch.
+async fn min_set(w: &proof::Work<'_>, audits: &[dep_audit::Audit]) -> Vec<vq::Plan> {
+    let (owner, name) = (&w.msg.repo_owner, &w.msg.repo_name);
+    let tree: Vec<String> = match w.github.get_tree(owner, name, w.branch).await {
+        Ok(t) => t
+            .into_iter()
+            .filter(|e| e.entry_type == "blob")
+            .map(|e| e.path)
+            .collect(),
+        Err(_) => return vec![],
+    };
+    let mut out = vec![];
+    for a in audits.iter().take(MAX_MIN_SET_PROJECTS) {
+        let mut files = vec![];
+        for path in vq::files_to_read(&a.lockfile, &tree) {
+            if let Ok(Some(text)) = w
+                .github
+                .read_file_if_exists(owner, name, &path, w.branch)
+                .await
+            {
+                files.push((path, text));
+            }
+        }
+        out.push(vq::discover(&a.lockfile, &tree, &files, None));
+    }
+    out
+}
+
 /// Runs what the plan still lacks on `head`, in the sandbox, and records
 /// it. Every path records something, so the stage never asks for the same
 /// build twice.
@@ -837,7 +992,11 @@ async fn build(
     let node = super::detect_node_version(w.github, owner, name, w.branch).await;
     if plan.checks && !rec.checked && rec.no_result.is_empty() {
         let sb = sandbox(w).with_egress(egress.clone());
-        let steps = permitted(w, super::dep_fix::probe_steps(w.github, w.msg).await).await;
+        let mut steps = super::dep_fix::probe_steps(w.github, w.msg).await;
+        if !audits.is_empty() {
+            steps = with_min_set(steps, &min_set(w, audits).await);
+        }
+        let steps = permitted(w, steps).await;
         if steps.is_empty() {
             rec.no_result =
                 "the repository has no check command CoderHelm may run in its sandbox".into();
@@ -974,6 +1133,18 @@ pub async fn run(
     let save = |rec: &Record| {
         w.ledger.update(|l| l.settle = rec.clone());
     };
+    // The verification set a dependency run recorded on this head is this
+    // stage's check run: cited, never built again.
+    if !rec.checked && common::security_fixes::is_ticket(&w.msg.ticket_id) {
+        if let Some(run) = super::dep_fix::load(w.state, w.msg, w.run_id).await {
+            if let Some(v) = &run.verify.head {
+                rec.adopt_verified(v, run.verify.base.as_ref());
+                if rec.checked {
+                    save(&rec);
+                }
+            }
+        }
+    }
     loop {
         let dep_sets = match common::security_fixes::is_ticket(&w.msg.ticket_id) {
             true => super::dep_fix::load(w.state, w.msg, w.run_id)
@@ -1626,5 +1797,128 @@ mod tests {
         audit.check = "security".into();
         let out = apply(vec![audit], &chore(), &bad);
         assert!(out.open[0].needs.contains("gave no report"));
+    }
+
+    fn typed_set() -> vq::Plan {
+        let tree: Vec<String> = ["package.json", "pnpm-lock.yaml", "tsconfig.json"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        vq::discover(
+            "pnpm-lock.yaml",
+            &tree,
+            &[(
+                "package.json".to_string(),
+                r#"{"scripts":{"build":"tsc -p .","test":"vitest run"}}"#.to_string(),
+            )],
+            None,
+        )
+    }
+
+    #[test]
+    fn a_dependency_change_is_always_checked_and_a_recorded_set_is_cited_not_rebuilt() {
+        // No item asks: the set runs all the same.
+        let p = plan(&[], &chore());
+        assert!(p.checks && p.audit);
+        let set = typed_set();
+        let all: Vec<usize> = (0..set.checks.len()).collect();
+        // Install, type check, build pass; the tests fail here and on the
+        // base branch.
+        let out = "CODERHELM_VERIFY 0 0\nCODERHELM_VERIFY 1 0\nCODERHELM_VERIFY 2 0\nCODERHELM_VERIFY 3 1\n";
+        let head = vq::read(&set, "abc1234def", &all, &[], out);
+        let base = vq::read(&set, "base", &all, &[], out);
+        let mut rec = Record {
+            head: "abc1234def".into(),
+            audited: true,
+            ..Default::default()
+        };
+        rec.adopt_verified(&head, Some(&base));
+        assert!(rec.checked);
+        assert_eq!(rec.passed, vec!["typecheck", "build"]);
+        assert_eq!(rec.base_fails, vec!["tests"]);
+        // A failure the base branch has too starts no fix round and takes
+        // out no set.
+        let room = Room {
+            build: true,
+            round: true,
+            sandbox: true,
+            dep_sets: 3,
+        };
+        assert_eq!(next(&p, &rec, &room), Next::Done);
+        let mut unrun = f("unrun_check", "The type check never ran.", "");
+        unrun.check = "typecheck".into();
+        let mut tests_item = f("unrun_check", "Tests never ran.", "");
+        tests_item.check = "tests".into();
+        let settled = apply(vec![unrun, tests_item], &chore(), &rec);
+        assert_eq!(settled.closed.len(), 1);
+        assert!(settled.closed[0].1.contains(
+            "typecheck: PASS, `npx --no-install tsc --noEmit` (the dependency run's verification set, on commit `abc1234`)"
+        ));
+        // What stays says what ran and what came back.
+        assert_eq!(settled.open.len(), 1);
+        assert!(settled.open[0].needs.contains(
+            "it fails on this commit and on the base branch too, so this change did not cause it"
+        ));
+        // The same failure without the base branch failing is the change's.
+        let green_base = vq::read(
+            &set,
+            "base",
+            &all,
+            &[],
+            "CODERHELM_VERIFY 0 0\nCODERHELM_VERIFY 1 0\nCODERHELM_VERIFY 2 0\nCODERHELM_VERIFY 3 0\n",
+        );
+        let mut rec = Record {
+            head: "abc1234def".into(),
+            audited: true,
+            ..Default::default()
+        };
+        rec.adopt_verified(&head, Some(&green_base));
+        assert_eq!(next(&p, &rec, &room), Next::TakeOutSet);
+        // A record with no result, or of another commit, is never taken.
+        let mut rec = Record {
+            head: "abc1234def".into(),
+            ..Default::default()
+        };
+        rec.adopt_verified(&vq::no_result(&set, "abc1234def", "timed out"), None);
+        assert!(!rec.checked);
+    }
+
+    #[test]
+    fn the_sets_checks_join_the_repositorys_own_for_the_kinds_it_lacks() {
+        let set = typed_set();
+        // The repository's steps run its tests; the set adds the type check
+        // and the build, and leaves the tests to the repository's command.
+        let own = vec![
+            Step {
+                kinds: vec![],
+                cmd: "pnpm install --frozen-lockfile".into(),
+                scope: None,
+            },
+            Step {
+                kinds: vec![CheckKind::Tests],
+                cmd: "pnpm test -- --ci".into(),
+                scope: None,
+            },
+        ];
+        let steps = with_min_set(own, std::slice::from_ref(&set));
+        let cmds: Vec<&str> = steps.iter().map(|s| s.cmd.as_str()).collect();
+        assert_eq!(
+            cmds,
+            vec![
+                "pnpm install --frozen-lockfile",
+                "pnpm test -- --ci",
+                "npx --no-install tsc --noEmit",
+                "pnpm run build"
+            ]
+        );
+        assert_eq!(
+            steps[2].scope.as_deref(),
+            Some("found in the project of `pnpm-lock.yaml`, not in CI: `tsconfig.json` is there and no script runs it")
+        );
+        // With no step of its own, the set's install comes first.
+        let steps = with_min_set(vec![], &[set]);
+        assert!(steps[0].kinds.is_empty());
+        assert!(steps[0].cmd.ends_with("pnpm install --frozen-lockfile"));
+        assert_eq!(steps.len(), 4);
     }
 }

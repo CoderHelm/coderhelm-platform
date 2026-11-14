@@ -285,6 +285,11 @@ fn drive(run: &mut DepRun, plan: &rp::ProofPlan, breaks: &[&str]) -> u32 {
                 commits += 1;
                 run.on_proof_taken_out(&out, &format!("sha{commits}"));
             }
+            // This case replays the runtime proof: nothing to verify with.
+            Action::VerifyPlan => run.on_verify_plan(Default::default()),
+            Action::Verify { .. } | Action::VerifyTakeOut { .. } => {
+                panic!("no verification set in this case")
+            }
             Action::Done => return builds,
         }
     }

@@ -1,5 +1,6 @@
 use super::*;
 use crate::security_fixes::{same_line, Relation, Scope, SecurityConfig};
+use crate::upgrade_quality::verify as vq;
 
 fn finding(
     id: &str,
@@ -568,6 +569,13 @@ struct FakeSandbox {
     /// The build fails on the base branch too.
     base_build_fails: bool,
     proof_runs: u32,
+    /// What the verification set runs (`None`: nothing to verify with).
+    verify_plan: Option<vq::Plan>,
+    /// Packages a check of the set fails with, by the check's kind.
+    verify_breaks: Vec<(String, vq::Kind)>,
+    /// Kinds that fail on the base branch too.
+    verify_base_fails: Vec<vq::Kind>,
+    verify_runs: u32,
 }
 
 const CHECKS: [&str; 4] = ["install", "lint", "typecheck", "tests"];
@@ -651,6 +659,40 @@ impl FakeSandbox {
                     self.commits += 1;
                     run.on_proof_taken_out(&out, &format!("sha{}", self.commits));
                 }
+                Action::VerifyPlan => {
+                    run.on_verify_plan(self.verify_plan.clone().unwrap_or_default())
+                }
+                Action::Verify { base } => {
+                    self.verify_runs += 1;
+                    let plan = run.verify.plan.clone().unwrap();
+                    let all: Vec<usize> = (0..plan.checks.len()).collect();
+                    let out: String = plan
+                        .checks
+                        .iter()
+                        .enumerate()
+                        .map(|(i, c)| {
+                            let broken = self.verify_base_fails.contains(&c.kind)
+                                || (!base
+                                    && run.applied_bumps().iter().any(|b| {
+                                        self.verify_breaks
+                                            .iter()
+                                            .any(|(p, k)| *p == b.package && *k == c.kind)
+                                    }));
+                            format!("{} {i} {}\n", vq::MARK, u8::from(broken))
+                        })
+                        .collect();
+                    let sha = if base {
+                        "base".to_string()
+                    } else {
+                        run.head.clone()
+                    };
+                    run.on_verify(base, vq::read(&plan, &sha, &all, &[], &out));
+                }
+                Action::VerifyTakeOut { why } => {
+                    let out = run.take_out_last_commit(&why).expect("a set to take out");
+                    self.commits += 1;
+                    run.on_verify_taken_out(&out, &format!("sha{}", self.commits));
+                }
                 Action::Done => return,
             }
         }
@@ -672,6 +714,10 @@ fn sandbox(breaks: &[(&str, &str)]) -> FakeSandbox {
         build_breaks: vec![],
         base_build_fails: false,
         proof_runs: 0,
+        verify_plan: None,
+        verify_breaks: vec![],
+        verify_base_fails: vec![],
+        verify_runs: 0,
     }
 }
 
@@ -1007,6 +1053,9 @@ fn a_version_that_cannot_be_installed_is_deferred_without_the_coder() {
     // The batches are settled: the runtime proof, here with nothing to run.
     assert_eq!(run.next_action(), Action::ProofPlan);
     run.on_proof_plan(rp::ProofPlan::default());
+    // Then the verification set, here with nothing to verify with.
+    assert_eq!(run.next_action(), Action::VerifyPlan);
+    run.on_verify_plan(vq::Plan::default());
     assert_eq!(run.next_action(), Action::Done);
     assert_eq!(run.code_fixes, 0);
     assert_eq!(run.deferred[0].cause, Cause::Parent);
@@ -1707,6 +1756,7 @@ fn step(sb: &mut FakeSandbox, run: &mut DepRun) {
             run.on_commit(g, &head);
         }
         Action::ProofPlan => run.on_proof_plan(sb.proof_plan.clone().unwrap_or_default()),
+        Action::VerifyPlan => run.on_verify_plan(sb.verify_plan.clone().unwrap_or_default()),
         other => panic!("unexpected {other:?}"),
     }
 }
@@ -1866,4 +1916,181 @@ fn a_take_out_that_could_not_be_written_leaves_the_bumps_and_says_what_fails() {
         run.proof.unresolved,
         vec!["the build `pnpm build` fails (exit 1)"]
     );
+}
+
+/// The verification set of a typed project with a build, tests and a
+/// production audit, as `upgrade_quality::verify` finds it.
+fn typed_verify_plan() -> vq::Plan {
+    let tree: Vec<String> = ["package.json", "pnpm-lock.yaml", "tsconfig.json"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    vq::discover(
+        "pnpm-lock.yaml",
+        &tree,
+        &[(
+            "package.json".to_string(),
+            r#"{"scripts":{"build":"tsc -p .","test":"vitest run"}}"#.to_string(),
+        )],
+        Some(("pnpm audit --prod --json", "pnpm audit --prod --json")),
+    )
+}
+
+#[test]
+fn the_verification_set_runs_once_on_a_green_branch() {
+    let mut run = DepRun::new(mixed_plan(), "base", 3.0);
+    let mut sb = sandbox(&[]);
+    sb.verify_plan = Some(typed_verify_plan());
+    sb.drive(&mut run);
+    // One build, on the branch: nothing failed, so the base is not run.
+    assert_eq!((sb.verify_runs, run.verify.runs), (1, 1));
+    assert!(run.verify.done && run.verify.base.is_none());
+    let head = run.verify.head.as_ref().unwrap();
+    // The record is of the branch's last commit, and every check of the
+    // set has a result on it: none is left as not run.
+    assert_eq!(head.sha, run.head);
+    assert!(head.not_run().is_empty());
+    assert!(head.outcome(vq::Kind::Typecheck).unwrap().passed());
+    assert!(run.verify.taken_out.is_empty() && run.verify.unresolved.is_empty());
+}
+
+#[test]
+fn a_check_of_the_set_that_fails_on_the_base_too_is_never_blamed() {
+    let mut run = DepRun::new(mixed_plan(), "base", 3.0);
+    let mut sb = sandbox(&[]);
+    sb.verify_plan = Some(typed_verify_plan());
+    sb.verify_base_fails = vec![vq::Kind::Tests];
+    sb.drive(&mut run);
+    // The branch, then the base branch because the branch failed a check.
+    assert_eq!(run.verify.runs, 2);
+    assert_eq!(run.applied.len(), 10);
+    assert!(run.verify.taken_out.is_empty() && run.verify.unresolved.is_empty());
+    let text = vq::section(run.verify.head.as_ref().unwrap(), run.verify.base.as_ref());
+    assert!(
+        text.contains("it fails on the base branch too, so not caused by this change"),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_type_check_the_bumps_break_takes_out_the_set_that_breaks_it() {
+    // The probes and CI's mirrored checks pass: the repository's CI has no
+    // type check. The set finds it in the project and runs it.
+    let mut run = DepRun::new(mixed_plan(), "base", 3.0);
+    let mut sb = sandbox(&[]);
+    sb.verify_plan = Some(typed_verify_plan());
+    sb.verify_breaks = vec![("route-kit".into(), vq::Kind::Typecheck)];
+    sb.drive(&mut run);
+    assert!(!run.verify.taken_out.is_empty());
+    let applied: Vec<&str> = run
+        .applied_bumps()
+        .iter()
+        .map(|b| b.package.as_str())
+        .collect();
+    assert!(!applied.contains(&"route-kit"), "{applied:?}");
+    let d = run
+        .deferred
+        .iter()
+        .find(|d| d.package == "route-kit")
+        .expect("route-kit deferred");
+    assert!(
+        d.reason
+            .contains("the type check (`npx --no-install tsc --noEmit`) fails, which passes on the base branch"),
+        "{}",
+        d.reason
+    );
+    // What is left was verified again, on the commit it is on, and passes.
+    let head = run.verify.head.as_ref().unwrap();
+    assert_eq!(head.sha, run.head);
+    assert!(head.outcome(vq::Kind::Typecheck).unwrap().passed());
+    assert!(run.verify.unresolved.is_empty());
+    assert!(run.report_md().contains("- Taken out by it: `route-kit`"));
+    // The run reads as moving through each build of the set.
+    assert!(run.progress().starts_with("dep:"));
+}
+
+#[test]
+fn a_set_with_no_result_claims_nothing_and_a_single_commit_is_never_emptied() {
+    // The sandbox gives no result, twice: recorded as none.
+    let mut run = DepRun::new(ten_bumps(), "base", 3.0);
+    let mut sb = sandbox(&[]);
+    let plan = typed_verify_plan();
+    loop {
+        match run.next_action() {
+            Action::VerifyPlan => run.on_verify_plan(plan.clone()),
+            Action::Verify { base } => {
+                assert!(!base);
+                run.on_verify(
+                    false,
+                    vq::no_result(&plan, &run.head.clone(), "the sandbox build timed out"),
+                );
+            }
+            Action::Done => break,
+            _ => step(&mut sb, &mut run),
+        }
+    }
+    assert_eq!(run.verify.runs, MAX_BROKEN_PROBES);
+    let head = run.verify.head.as_ref().unwrap();
+    assert!(!head.ran);
+    assert!(vq::section(head, None).contains("Nothing here claims a check passed"));
+    // One commit of bumps and a blamed check: nothing is taken out (the
+    // pull request is never emptied); what fails is said.
+    let mut run = DepRun::new(ten_bumps(), "base", 3.0);
+    let mut sb = sandbox(&[]);
+    sb.verify_plan = Some(typed_verify_plan());
+    sb.verify_breaks = vec![("lib-03".into(), vq::Kind::Build)];
+    sb.drive(&mut run);
+    assert_eq!(run.commits.len(), 1);
+    assert_eq!(run.applied.len(), 10);
+    assert_eq!(
+        run.verify.unresolved,
+        vec!["the build (`pnpm run build`)".to_string()]
+    );
+    assert!(run.report_md().contains(
+        "Still failing with the bumps in this pull request: the build (`pnpm run build`)"
+    ));
+    // A run with no step left says the set did not run.
+    let mut run = DepRun::new(ten_bumps(), "base", 3.0);
+    run.on_base(&FakeSandbox::result(&sandbox(&[]), &[]));
+    run.finish_now("the run had no step left");
+    assert_eq!(run.verify.skipped, "the run had no step left for it");
+}
+
+#[test]
+fn a_split_family_fails_the_probe_and_is_deferred_with_the_reason() {
+    let fs = vec![finding(
+        "f1",
+        "@lattice/common",
+        "10.4.15",
+        &["10.4.22"],
+        Tier::P2,
+        Verdict::Unknown,
+    )];
+    let mut run = DepRun::new(plan(&pairs(&fs), &cfg()), "base", 3.0);
+    run.on_base(&FakeSandbox::result(&sandbox(&[]), &[]));
+    let Action::Probe(g) = run.next_action() else {
+        panic!()
+    };
+    // Every check of the repository passes; the lockfile the bump wrote
+    // has its family at two versions.
+    let mut r = FakeSandbox::result(&sandbox(&[]), &[]);
+    r.checks.push((FAMILY_CHECK.to_string(), false));
+    r.tail = "the family `lattice-js/lattice` is split on the head: `@lattice/common` at 10.4.22, `@lattice/core` at 10.4.15".into();
+    run.on_probes(&[(g[0], r)]);
+    while run.next_action() != Action::Done {
+        if let Some(v) = run.verify.plan.is_none().then(vq::Plan::default) {
+            run.on_verify_plan(v);
+        }
+    }
+    assert!(run.applied.is_empty());
+    assert_eq!(run.deferred.len(), 1);
+    assert_eq!(run.deferred[0].cause, Cause::Parent);
+    assert!(
+        run.deferred[0]
+            .reason
+            .starts_with("the lockfile written with it installs packages released together at different versions"),
+        "{}",
+        run.deferred[0].reason
+    );
+    assert!(run.deferred[0].reason.contains("is split on the head"));
 }

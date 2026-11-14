@@ -468,6 +468,181 @@ pub fn read(audits: &[Audit], output: &str) -> Vec<Audited> {
         .collect()
 }
 
+// ── The production-scoped audit and the advisories it lists ─────────────
+
+/// The audit of production dependencies only, for the managers whose own
+/// documentation names the flag: what people read, and what runs. `None`
+/// for a manager CoderHelm has no production-scoped audit for (its audit
+/// of every dependency is [`audits`]).
+pub fn production(manager: &str) -> Option<(&'static str, String)> {
+    use crate::e2e::test_package::{ensure_manager, Manager};
+    match manager {
+        "npm" => Some((
+            "npm audit --omit=dev --json",
+            "npm audit --omit=dev --json".to_string(),
+        )),
+        "pnpm" => Some((
+            "pnpm audit --prod --json",
+            format!("{}pnpm audit --prod --json", ensure_manager(Manager::Pnpm)),
+        )),
+        _ => None,
+    }
+}
+
+/// One advisory an audit lists.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct Listed {
+    /// The advisory's id as the audit names it (a GHSA id), upper case.
+    pub id: String,
+    pub severity: String,
+    pub package: String,
+}
+
+/// What one audit listed.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct Listing {
+    /// What ran, as people read it.
+    pub shown: String,
+    /// Distinct advisory and package pairs the report holds.
+    pub total: usize,
+    /// The first [`MAX_LISTED`] of them.
+    pub listed: Vec<Listed>,
+}
+
+impl Listing {
+    /// The report held more than is listed here.
+    pub fn cut(&self) -> bool {
+        self.total > self.listed.len()
+    }
+}
+
+/// The production audit's listing and the listing of every dependency.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct Listings {
+    pub production: Option<Listing>,
+    pub all: Option<Listing>,
+    /// Why a listing is missing; empty when both were read.
+    pub why: String,
+}
+
+/// Advisories one listing carries at most: the sandbox keeps only the end
+/// of a build's output.
+pub const MAX_LISTED: usize = 30;
+const LIST_ADV: &str = "CODERHELM_AUDIT_ADV";
+const LIST_END: &str = "CODERHELM_AUDIT_LIST";
+
+/// Reduces an audit's JSON report (npm 7 and later, pnpm, yarn, bun) to
+/// one line per advisory and package: any object that names a GHSA id (a
+/// `github_advisory_id`, or an advisory URL) is an advisory, its package
+/// the name beside it. It then prints how many it found and whether the
+/// file was a report at all.
+const LIST_JS: &str = r#"
+const fs=require('fs');const [file,scope,max]=process.argv.slice(2);
+let text='';try{text=fs.readFileSync(file,'utf8')}catch(e){}
+let docs=[];
+try{docs=[JSON.parse(text.slice(text.indexOf('{')))]}catch(e){
+  for(const l of text.split('\n')){try{const d=JSON.parse(l);if(d&&typeof d==='object')docs.push(d)}catch(e){}}}
+const report=docs.some(d=>d.auditReportVersion||d.vulnerabilities||d.advisories||d.metadata||d.type==='auditSummary'||d.type==='auditAdvisory'||d.children);
+const seen=new Map();
+function ghsa(o){const g=String(o.github_advisory_id||o.ghsa||'');if(/^GHSA-/i.test(g))return g;
+  for(const k of['url','URL']){const m=String(o[k]==null?'':o[k]).match(/GHSA(-[0-9a-z]{4}){3}/i);if(m)return m[0]}return ''}
+function walk(o,key){
+  if(Array.isArray(o)){for(const x of o)walk(x,key);return}
+  if(!o||typeof o!=='object')return;
+  const g=ghsa(o);
+  if(g){const pkg=String(o.module_name||o.name||o.dependency||o.package||key||'-').replace(/\s/g,'');
+    const sev=String(o.severity||o.Severity||'-').toLowerCase().replace(/\s/g,'');
+    const k=g.toUpperCase()+' '+pkg;if(!seen.has(k))seen.set(k,sev)}
+  const own=(typeof o.value==='string'&&o.children)?o.value:null;
+  for(const [k,v] of Object.entries(o))walk(v,own||k)}
+for(const d of docs)walk(d,'');
+let n=0;for(const [k,sev] of seen){if(n++>=Number(max))break;const [g,pkg]=k.split(' ');console.log(['CODERHELM_AUDIT_ADV',scope,g,sev,pkg].join(' '))}
+console.log(['CODERHELM_AUDIT_LIST',scope,seen.size,report?1:0].join(' '));
+"#;
+
+/// The shell lines that list what a manager's audits found, for the
+/// managers with a [`production`] audit: `{out}` is the file the
+/// production audit's report was written to; the audit of every
+/// dependency is run here, in `dir`, and listed beside it. `None` for a
+/// manager with no production audit.
+pub fn listing(manager: &str, dir: &str) -> Option<String> {
+    production(manager)?;
+    let all = tool(manager, false)?;
+    let cd = if dir.is_empty() {
+        String::new()
+    } else {
+        format!("cd '{dir}' && ")
+    };
+    Some(format!(
+        "echo '{}' | base64 -d > /tmp/coderhelm-audit-list.js; \
+         node /tmp/coderhelm-audit-list.js {{out}} production {MAX_LISTED}; \
+         ( {cd}{} ) > /tmp/coderhelm-audit-all.out 2>/dev/null; \
+         node /tmp/coderhelm-audit-list.js /tmp/coderhelm-audit-all.out all {MAX_LISTED}",
+        crate::dep_fix::b64(LIST_JS.as_bytes()),
+        all.run
+    ))
+}
+
+/// The listings in a build's output. A scope whose end line is missing, or
+/// whose file was no audit report, has no listing, and `why` says so.
+pub fn listings(manager: &str, output: &str) -> Listings {
+    let mut out = Listings::default();
+    let shown_all = tool(manager, false).map(|t| t.shown).unwrap_or("the audit");
+    let shown_prod = production(manager)
+        .map(|(s, _)| s)
+        .unwrap_or("the production audit");
+    let mut missing: Vec<String> = vec![];
+    for (scope, shown) in [("production", shown_prod), ("all", shown_all)] {
+        let mut listed: Vec<Listed> = vec![];
+        let mut end: Option<(usize, bool)> = None;
+        for line in output.lines() {
+            let mut p = line.split_whitespace();
+            match (p.next(), p.next()) {
+                (Some(LIST_ADV), Some(s)) if s == scope => {
+                    if let (Some(id), Some(sev), Some(pkg)) = (p.next(), p.next(), p.next()) {
+                        listed.push(Listed {
+                            id: id.to_ascii_uppercase(),
+                            severity: sev.to_string(),
+                            package: pkg.to_string(),
+                        });
+                    }
+                }
+                (Some(LIST_END), Some(s)) if s == scope => {
+                    if let (Some(n), Some(ok)) = (p.next().and_then(|n| n.parse().ok()), p.next()) {
+                        end = Some((n, ok == "1"));
+                    }
+                }
+                _ => {}
+            }
+        }
+        let listing = match end {
+            Some((total, true)) => Some(Listing {
+                shown: shown.to_string(),
+                total,
+                listed,
+            }),
+            Some((_, false)) => {
+                missing.push(format!("`{shown}` gave no report"));
+                None
+            }
+            None => {
+                missing.push(format!("`{shown}` did not report before the build ended"));
+                None
+            }
+        };
+        if scope == "production" {
+            out.production = listing;
+        } else {
+            out.all = listing;
+        }
+    }
+    out.why = missing.join("; ");
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -707,5 +882,38 @@ mod tests {
             "{text}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_production_audit_is_listed_beside_the_audit_of_everything() {
+        // Only the managers whose documentation names the flag.
+        assert_eq!(production("pnpm").unwrap().0, "pnpm audit --prod --json");
+        assert_eq!(production("npm").unwrap().0, "npm audit --omit=dev --json");
+        assert!(production("cargo").is_none());
+        assert!(listing("cargo", "").is_none());
+        let cmd = listing("pnpm", "apps/api").unwrap();
+        assert!(cmd.contains("{out} production 30"));
+        assert!(cmd.contains("cd 'apps/api' && "));
+        assert!(cmd.contains("pnpm audit --json"));
+        let out = "CODERHELM_AUDIT_LIST production 0 1\n\
+                   CODERHELM_AUDIT_ADV all GHSA-AAAA-BBBB-CCCC high dev-tool\n\
+                   CODERHELM_AUDIT_ADV all GHSA-DDDD-EEEE-FFFF moderate @scope/lint-kit\n\
+                   CODERHELM_AUDIT_LIST all 2 1\n";
+        let l = listings("pnpm", out);
+        assert!(l.why.is_empty());
+        let prod = l.production.unwrap();
+        assert_eq!((prod.total, prod.listed.len()), (0, 0));
+        assert_eq!(prod.shown, "pnpm audit --prod --json");
+        let all = l.all.unwrap();
+        assert_eq!(all.listed[1].package, "@scope/lint-kit");
+        assert!(!all.cut());
+        // A file that was no report, and a build cut short, give no
+        // listing: never an empty one.
+        let l = listings("npm", "CODERHELM_AUDIT_LIST production 0 0\n");
+        assert!(l.production.is_none() && l.all.is_none());
+        assert_eq!(
+            l.why,
+            "`npm audit --omit=dev --json` gave no report; `npm audit --json` did not report before the build ended"
+        );
     }
 }
