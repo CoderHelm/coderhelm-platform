@@ -86,6 +86,7 @@ pub mod system_models;
 pub mod telemetry;
 pub mod tests;
 pub mod tests_setup;
+pub mod ticket_comments;
 pub mod tools;
 pub mod trigger_gate;
 pub mod users;

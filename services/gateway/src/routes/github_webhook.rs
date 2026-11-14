@@ -1349,6 +1349,13 @@ async fn handle_issue_comment(
         || lower.trim_start().starts_with("/coderhelm")
         || lower.contains("@coderhelm");
     if !on_bot_pr && !addressed {
+        // A person writing on an issue a run is working on is talking to
+        // that run, mention or not (an answer to its questions).
+        if super::ticket_comments::on_github_issue_comment(state, payload, installation_id, team_id)
+            .await
+        {
+            return Ok(StatusCode::OK);
+        }
         // A person quoting CoderHelm's review in the PR conversation (GitHub's
         // "Quote reply") is answering it, mention or not.
         if action == "created"
@@ -1641,7 +1648,16 @@ async fn handle_issue_comment(
             .await,
         super::trigger_gate::TicketGate::SkipInFlight
     ) {
-        info!(ticket_id = %ticket_id_str, "Skipping slash command — run already in flight");
+        // No second run: the run in flight gets the comment (kept,
+        // acknowledged, read at its next step).
+        let kept = super::ticket_comments::on_github_issue_comment(
+            state,
+            payload,
+            installation_id,
+            team_id,
+        )
+        .await;
+        info!(ticket_id = %ticket_id_str, kept, "Run already in flight — the comment goes to it, no second run");
         return Ok(StatusCode::OK);
     }
 

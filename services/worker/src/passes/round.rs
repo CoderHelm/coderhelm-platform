@@ -454,6 +454,11 @@ pub(crate) fn fault_of(error: &str) -> Fault {
         Fault::PushRejected
     } else if has(&[
         "rate limit",
+        // The pause as the run words it (`common::github_wait::waiting_text`):
+        // read as anything else, the round threw its work away and spent an
+        // attempt on GitHub's limit.
+        "hourly limit",
+        "waiting for github",
         "(500",
         "(502",
         "(503",
@@ -546,6 +551,48 @@ pub(crate) fn after_fault(
 /// left as the round that didn't finish.
 pub(crate) fn after_fault_parked(may_continue: bool) -> AfterFault {
     after_fault(1, 1, false, if may_continue { 0 } else { MAX_REDRIVES })
+}
+
+/// The wait a round takes when GitHub refuses for a while, from the fault's
+/// text and what this process knows of the installation's limit (`known`:
+/// the cause and the seconds left). `None` for any other fault, and for a
+/// GitHub fault with no limit or outage to wait out (a lone timeout): those
+/// take the fault's usual way.
+///
+/// A round that waits is the same round afterwards: its work branch and
+/// its attempt are kept (`resume::wait_round_for_github`). It used to be
+/// read as "an error": the work branch was deleted, an attempt was spent,
+/// and the next try started five seconds later, inside the same limit.
+pub(crate) fn github_wait_of(
+    error: &str,
+    known: Option<(common::github_wait::Cause, u64)>,
+) -> Option<(common::github_wait::Cause, u64)> {
+    use common::github_wait::Cause;
+    if fault_of(error) != Fault::GitHubBusy {
+        return None;
+    }
+    if known.is_some() {
+        return known;
+    }
+    let e = error.to_ascii_lowercase();
+    let wait = crate::clients::github::OUTAGE_WAIT_SECS;
+    if e.contains("rate limit") || e.contains("hourly limit") || e.contains("(429") {
+        Some((Cause::RateLimit, wait))
+    } else if e.contains("waiting for github")
+        || ["(500", "(502", "(503", "(504"]
+            .iter()
+            .any(|c| e.contains(c))
+    {
+        Some((Cause::Outage, wait))
+    } else {
+        None
+    }
+}
+
+/// Whether a round that met GitHub's limit may wait for it again: each run
+/// waits at most `common::github_wait::MAX_WAITS` times.
+pub(crate) fn may_wait_for_github(waits: u32) -> bool {
+    waits < common::github_wait::MAX_WAITS
 }
 
 /// Whether the round's work branch is kept for the next try. Its work is
@@ -816,6 +863,51 @@ pub(crate) async fn round_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// GitHub's hourly limit, as every place words it, is GitHub being
+    /// busy: the round's work is kept, and the round waits for the reset
+    /// instead of spending an attempt.
+    #[test]
+    fn githubs_limit_is_a_wait_that_keeps_the_rounds_work() {
+        use common::github_wait::{waiting_text, Cause};
+        let paused = waiting_text(Cause::RateLimit, 1_793_999_100);
+        let raw = "HTTP status client error (403 Forbidden) for url \
+                   (https://api.github.com/repos/acme/site/git/ref/heads/coderhelm/gh-41): API \
+                   rate limit exceeded for installation ID 41.";
+        for text in [paused.as_str(), raw] {
+            assert_eq!(fault_of(text), Fault::GitHubBusy, "{text}");
+            assert!(keeps_work(fault_of(text)));
+            let plan = plan_for_fault(Kind::PlannedWork, text, after_fault_parked(true));
+            assert!(!plan.clean, "the work branch is kept: {text}");
+            assert!(!plan.note.contains("it met an error"), "{}", plan.note);
+        }
+        // The reset this process knows is the wait; without one, a minute.
+        assert_eq!(
+            github_wait_of(&paused, Some((Cause::RateLimit, 2_400))),
+            Some((Cause::RateLimit, 2_400))
+        );
+        assert_eq!(
+            github_wait_of(raw, None),
+            Some((Cause::RateLimit, crate::clients::github::OUTAGE_WAIT_SECS))
+        );
+        assert_eq!(
+            github_wait_of(&waiting_text(Cause::Outage, 1_793_999_100), None),
+            Some((Cause::Outage, crate::clients::github::OUTAGE_WAIT_SECS))
+        );
+        // Any other fault is no wait, whatever is known of GitHub; a lone
+        // timeout has nothing to wait out.
+        let known = Some((Cause::RateLimit, 2_400));
+        assert_eq!(github_wait_of("the model returned no text", known), None);
+        assert_eq!(
+            github_wait_of("(409 Conflict) reference update failed", known),
+            None
+        );
+        assert_eq!(github_wait_of("operation timed out", None), None);
+        // Bounded: a run waits at most MAX_WAITS times.
+        assert!(may_wait_for_github(0));
+        assert!(may_wait_for_github(common::github_wait::MAX_WAITS - 1));
+        assert!(!may_wait_for_github(common::github_wait::MAX_WAITS));
+    }
 
     #[test]
     fn a_rounds_changes_are_read_from_its_wip_compare() {

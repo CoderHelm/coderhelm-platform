@@ -318,6 +318,18 @@ pub fn findings_progress(before: Option<usize>, after: usize, pushed_files: usiz
     before.is_none_or(|b| after < b) || pushed_files > 0
 }
 
+/// Whether a round moved its work on: it closed something (a task
+/// finished, a finding settled), or it pushed changes with no edit it asked
+/// for left refused. A round that ends with a refused edit standing and
+/// nothing closed made no progress, whatever else it pushed: the change it
+/// was started for is the one it couldn't make, so the next round changes
+/// approach (it is told what was refused and how to make that edit) and a
+/// second one stops, instead of the same round repeating while the branch
+/// moves.
+pub fn progressed(closed: bool, pushed_files: usize, refused: usize) -> bool {
+    closed || (pushed_files > 0 && refused == 0)
+}
+
 /// What a round on a rung is told, for `what` the round fixes. Empty for
 /// [`Rung::Continue`], [`Rung::Defer`] and [`Rung::Ship`].
 pub fn round_instruction(rung: Rung, what: &str) -> String {
@@ -366,6 +378,23 @@ pub fn end_of_rounds(left: &[String], why: &str, ci_failing: &[String]) -> Endin
         ladder_spent: true,
         ..Default::default()
     })
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::progressed;
+
+    #[test]
+    fn a_refused_edit_with_nothing_closed_is_no_progress() {
+        // Something closed is progress, whatever was refused.
+        assert!(progressed(true, 0, 0));
+        assert!(progressed(true, 0, 2));
+        // Pushed changes count only when no edit the round asked for was
+        // left refused.
+        assert!(progressed(false, 3, 0));
+        assert!(!progressed(false, 3, 1));
+        assert!(!progressed(false, 0, 0));
+    }
 }
 
 // ── Red checks ──────────────────────────────────────────────────────────────

@@ -15,11 +15,16 @@
 //! - The check judges the branch again. The "Not finished" section is
 //!   rewritten to what is still not done, or removed when nothing is.
 //! - Nothing left: the pull request is marked ready ([`Next::Ready`]).
-//! - Progress (a task finished, or the round pushed changes): another round
+//! - Progress (a task finished, or the round pushed changes with no edit
+//!   left refused, `supervisor::progressed`): another round
 //!   ([`Next::Again`]). The runaway ceiling is the same as a run's steps.
+//! - A round that ends with an edit refused and no task finished made no
+//!   progress, whatever else it pushed: the next round is told which edits
+//!   were refused and how to make them ([`next_round`]).
 //! - Two rounds in a row with no progress stop the work ([`Next::Stop`]):
-//!   the run says which tasks are still not done and why, its status is
-//!   `needs_input` (never `completed`), and the pull request stays a draft.
+//!   the run says once which tasks are still not done and why (the refused
+//!   files by name), its status is `needs_input` (never `completed`), and
+//!   the pull request stays a draft.
 //!
 //! The progress rule is the one ticket runs use between steps
 //! (`steps::stalled_after`, `steps::MAX_STALLED_STEPS`).
@@ -28,6 +33,7 @@ use common::run_round::{Kind, Round};
 
 use super::proof::{UNFINISHED_END, UNFINISHED_START};
 use super::steps;
+use super::write_guard::Refusal;
 
 /// The planned tasks a description still lists under "Not finished": one
 /// per item line, without the bullet. Empty when the section isn't there.
@@ -67,7 +73,9 @@ pub fn first_round(section: &str, now: chrono::DateTime<chrono::Utc>) -> Option<
     if items.is_empty() {
         return None;
     }
-    // Not scoped: planned work may need files the branch doesn't change yet.
+    // Recorded as not scoped (no pull-request-files boundary): a planned-work
+    // round is bounded by the plan, whose task files the branch may not
+    // change yet (`write_guard::RoundFor::of_round`).
     Some(
         Round::start(
             Kind::PlannedWork,
@@ -81,18 +89,24 @@ pub fn first_round(section: &str, now: chrono::DateTime<chrono::Utc>) -> Option<
     )
 }
 
-/// The round after `prev`, for the tasks still listed.
+/// The round after `prev`, for the tasks still listed. It is told the
+/// edits `prev` was refused, and how to make them.
 pub fn next_round(
     prev: &Round,
     items: &[String],
     stalled: u32,
+    refused: &[Refusal],
     now: chrono::DateTime<chrono::Utc>,
 ) -> Round {
     let mut r = Round::start(
         Kind::PlannedWork,
         prev.number.saturating_add(1),
         "",
-        &round_feedback(items),
+        &format!(
+            "{}{}",
+            round_feedback(items),
+            super::write_guard::refused_note(refused)
+        ),
         false,
         now,
     )
@@ -115,18 +129,21 @@ pub enum Next {
 /// What follows a round. `before`: the tasks listed when it started;
 /// `after`: the tasks the check lists now (`None` when the check couldn't
 /// answer: nothing is claimed done then); `pushed_files`: the files the
-/// round's commit changed.
+/// round's commit changed; `refused`: the edits the round was refused and
+/// never made.
 pub fn next(
     before: &[String],
     after: Option<&[String]>,
     pushed_files: usize,
+    refused: &[Refusal],
     round: &Round,
 ) -> Next {
     let after = after.unwrap_or(before);
     if after.is_empty() {
         return Next::Ready;
     }
-    let progress = after.len() < before.len() || pushed_files > 0;
+    let progress =
+        super::supervisor::progressed(after.len() < before.len(), pushed_files, refused.len());
     if progress {
         // The same runaway ceiling as a ticket run's steps: never reached by
         // real work, but no loop runs forever.
@@ -144,11 +161,23 @@ pub fn next(
     let stalled = round.stalled.saturating_add(1);
     if steps::stops_for_stall(stalled) {
         let last = round.number.max(2);
+        let what = if refused.is_empty() {
+            "nothing was pushed".to_string()
+        } else {
+            format!(
+                "the edits the work needs were refused ({})",
+                refused
+                    .iter()
+                    .map(|r| format!("`{}`: {}", r.path, r.why))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        };
         return Next::Stop(stop_reason(
             after,
             &format!(
                 "planned-work rounds {} and {last} made no progress: no task was finished and \
-                 nothing was pushed",
+                 {what}",
                 last - 1
             ),
         ));
@@ -236,13 +265,22 @@ mod tests {
         )
         .unwrap();
         // A task finished: progress.
-        assert_eq!(next(&three, Some(&two), 0, &r), Next::Again { stalled: 0 });
+        assert_eq!(
+            next(&three, Some(&two), 0, &[], &r),
+            Next::Again { stalled: 0 }
+        );
         // Pushed changes, nothing finished yet: progress (the head moved).
-        assert_eq!(next(&two, Some(&two), 3, &r), Next::Again { stalled: 0 });
+        assert_eq!(
+            next(&two, Some(&two), 3, &[], &r),
+            Next::Again { stalled: 0 }
+        );
         // No change at all: one stalled round, then the second stops.
-        assert_eq!(next(&two, Some(&two), 0, &r), Next::Again { stalled: 1 });
-        r = next_round(&r, &two, 1, now());
-        match next(&two, Some(&two), 0, &r) {
+        assert_eq!(
+            next(&two, Some(&two), 0, &[], &r),
+            Next::Again { stalled: 1 }
+        );
+        r = next_round(&r, &two, 1, &[], now());
+        match next(&two, Some(&two), 0, &[], &r) {
             Next::Stop(why) => {
                 assert!(why.contains("rounds 1 and 2 made no progress"), "{why}");
                 assert!(why.contains("- a\n- b"), "{why}");
@@ -251,11 +289,63 @@ mod tests {
         }
         // A check that couldn't answer claims nothing done.
         assert_eq!(
-            next(&two, None, 0, &r).clone(),
-            next(&two, Some(&two), 0, &r)
+            next(&two, None, 0, &[], &r).clone(),
+            next(&two, Some(&two), 0, &[], &r)
         );
         // Nothing left: ready.
-        assert_eq!(next(&two, Some(&[]), 0, &r), Next::Ready);
+        assert_eq!(next(&two, Some(&[]), 0, &[], &r), Next::Ready);
+    }
+
+    /// A round that ends with an edit refused and no task finished made no
+    /// progress, whatever else it pushed: the next round is told what was
+    /// refused, and a second such round stops with the files by name.
+    #[test]
+    fn a_round_with_a_refused_edit_and_nothing_finished_stalls_then_stops_once() {
+        let items = vec!["`src/lib/metadata.ts` has no metadata for the gift route.".to_string()];
+        let refused = vec![Refusal {
+            path: "src/lib/metadata.ts".into(),
+            why: "outside the files of the planned tasks still not done".into(),
+        }];
+        let r = first_round(&unfinished_section(&[planned(&items[0])]), now()).unwrap();
+        // It pushed other files: still no progress, because the edit the
+        // task needs is the one it couldn't make.
+        assert_eq!(
+            next(&items, Some(&items), 4, &refused, &r),
+            Next::Again { stalled: 1 }
+        );
+        // The same push with nothing refused is progress.
+        assert_eq!(
+            next(&items, Some(&items), 4, &[], &r),
+            Next::Again { stalled: 0 }
+        );
+        // A task finished is progress whatever was refused.
+        assert_eq!(
+            next(
+                &["a".to_string(), "b".to_string()],
+                Some(&items),
+                1,
+                &refused,
+                &r
+            ),
+            Next::Again { stalled: 0 }
+        );
+        // The next round is told, once, what was refused and how to make it.
+        let second = next_round(&r, &items, 1, &refused, now());
+        assert!(second.feedback.contains("Edits the last round was refused"));
+        assert!(second.feedback.contains("`src/lib/metadata.ts`"));
+        assert!(second.feedback.contains("outside_plan"));
+        // Refused again: the work stops and says which file, once.
+        match next(&items, Some(&items), 2, &refused, &second) {
+            Next::Stop(why) => {
+                assert!(why.contains("rounds 1 and 2 made no progress"), "{why}");
+                assert!(
+                    why.contains("`src/lib/metadata.ts`: outside the files"),
+                    "{why}"
+                );
+                assert_eq!(why.matches("src/lib/metadata.ts").count(), 2, "{why}");
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
@@ -264,11 +354,14 @@ mod tests {
         let mut r = first_round(&unfinished_section(&[planned("a"), planned("b")]), now()).unwrap();
         for _ in 1..steps::MAX_RUN_STEPS {
             assert_eq!(
-                next(&items, Some(&items), 1, &r),
+                next(&items, Some(&items), 1, &[], &r),
                 Next::Again { stalled: 0 }
             );
-            r = next_round(&r, &items, 0, now());
+            r = next_round(&r, &items, 0, &[], now());
         }
-        assert!(matches!(next(&items, Some(&items), 1, &r), Next::Stop(_)));
+        assert!(matches!(
+            next(&items, Some(&items), 1, &[], &r),
+            Next::Stop(_)
+        ));
     }
 }

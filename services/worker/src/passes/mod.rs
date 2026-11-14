@@ -1347,6 +1347,7 @@ mod test;
 pub mod test_bug;
 pub mod test_fix;
 pub mod ticket_base;
+pub mod ticket_comments;
 pub mod ticket_history;
 pub mod tool_proposals;
 mod triage;
@@ -1799,6 +1800,33 @@ pub async fn orchestrate_ticket(
         release_ticket_lock(state, &msg.team_id, &msg.ticket_id).await;
     }
 
+    // The step is over. What people wrote on the ticket meanwhile is never
+    // left behind: with the pull request open it becomes a round on it, a
+    // run that ended waiting or failed starts the ticket again with it, a
+    // run a person stopped keeps it for the next run, and a run that goes
+    // on in a fresh step reads it there.
+    ticket_comments::after_step(state, &msg, &run_id).await;
+
+    Ok(())
+}
+
+/// A step boundary: the run reads what people wrote on its ticket (all of
+/// it together) before it spends more work. Answers and instructions go
+/// into the plan while it is being made; once the plan is final they are
+/// kept for a round on the pull request; a person saying to stop ends the
+/// run here, the way a cancel from the dashboard does.
+async fn read_ticket_comments(
+    state: &WorkerState,
+    msg: &mut TicketMessage,
+    run_id: &str,
+    usage: &mut TokenUsage,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let read = ticket_comments::at_boundary(state, msg, run_id, usage).await;
+    common::run_questions::merge(&mut msg.answers, &read.folded);
+    if read.stopped {
+        // The text `orchestrate_ticket` reads as a person's cancel.
+        return Err("Run cancelled by user".into());
+    }
     Ok(())
 }
 
@@ -1983,6 +2011,12 @@ async fn run_passes(
         .map(common::ticket_state::decision_answer)
         .collect();
     common::run_questions::merge(&mut msg.answers, &decided);
+    // What people wrote on the ticket itself: before this run started
+    // (context for the plan) and since its last step. Read here, before
+    // the run spends more work, and again at each boundary below.
+    ticket_comments::keep_existing_github(state, msg, &github).await;
+    ticket_comments::note_unread_earlier(state, msg, run_id).await;
+    read_ticket_comments(state, msg, run_id, usage).await?;
     // Every pull request for the ticket in the team's repositories (this
     // repo first; CoderHelm's or anyone's), read in full with how it ended:
     // an earlier attempt often holds the design, and its close event says
@@ -2681,6 +2715,7 @@ async fn run_passes(
 
     // --- Pass 2: Plan ---
     check_cancelled(state, &msg.team_id, run_id).await?;
+    read_ticket_comments(state, msg, run_id, usage).await?;
     // How far planning got: saved from here on, so a step that runs out of
     // time while planning continues in a fresh step (see `steps::Gate::Plan`)
     // instead of failing with nothing committed. A continuation past
@@ -3950,6 +3985,8 @@ async fn run_passes(
             timed_out: false,
             conversation_log: vec![],
             writes: Default::default(),
+            outside_plan: Vec::new(),
+            refused: Vec::new(),
             // The first attempt's lookups weren't kept; the proof check's
             // fix round can make them again.
             evidence: proof::RunEvidence {
@@ -3964,6 +4001,9 @@ async fn run_passes(
     } else {
         check_cancelled(state, &msg.team_id, run_id).await?;
         update_pass(state, &msg.team_id, run_id, "implement").await?;
+        // The plan is final from here: a comment read now is applied as a
+        // round on the pull request when this step ends.
+        read_ticket_comments(state, msg, run_id, usage).await?;
 
         // --- Re-run detection: check if branch already has an open PR ---
         // If an open PR exists, we always try to fix it rather than starting fresh.
@@ -4340,9 +4380,9 @@ async fn run_passes(
                         &file_cache,
                         Some(run_id),
                         implement_deadline,
-                        // Scoped only when purely CI-driven; human review comments
-                        // in the feedback mean the human's ask wins (unscoped).
-                        !has_review_feedback,
+                        // Bot-driven fix cycle. Human review comments riding along
+                        // in the feedback mean the human's ask wins (no boundary).
+                        write_guard::RoundFor::CiFix.unless_person(has_review_feedback),
                     )
                     .await
                     .and_then(|r| {
@@ -5307,7 +5347,7 @@ async fn run_passes(
                 &file_cache,
                 Some(run_id),
                 implement_deadline,
-                false, // initial implement — unscoped
+                write_guard::RoundFor::Build,
             )
             .await?
         };
@@ -5375,7 +5415,7 @@ async fn run_passes(
                             &file_cache,
                             Some(run_id),
                             implement_deadline,
-                            false,
+                            write_guard::RoundFor::Build,
                         )
                         .await?;
                     }
@@ -5585,7 +5625,7 @@ async fn run_passes(
                     &file_cache,
                     Some(run_id),
                     implement_deadline,
-                    false,
+                    write_guard::RoundFor::Build,
                 )
                 .await?;
                 if again.files_modified.is_empty() {
@@ -6049,6 +6089,7 @@ async fn run_passes(
 
     // --- Adversarial Test (multi-repo path) ---
     check_cancelled(state, &msg.team_id, run_id).await?;
+    read_ticket_comments(state, msg, run_id, usage).await?;
     let tested_at = github
         .get_ref(&msg.repo_owner, &msg.repo_name, &branch_name)
         .await
@@ -6137,7 +6178,7 @@ async fn run_passes(
                 // Stops at the step deadline, never relying on the
                 // invocation being cut off.
                 implement_deadline,
-                true, // bot-driven test-fix — scoped to the PR
+                write_guard::RoundFor::TestFix,
             )
             .await
             {
@@ -6266,7 +6307,7 @@ async fn run_passes(
                     // Stops at the step deadline, never relying on the
                     // invocation being cut off.
                     implement_deadline,
-                    true, // bot-driven security fix — scoped to the PR
+                    write_guard::RoundFor::SecurityFix,
                 )
                 .await?;
                 write_conversation_log(
@@ -6542,6 +6583,7 @@ async fn run_passes(
         }
 
         check_cancelled(state, &msg.team_id, run_id).await?;
+        read_ticket_comments(state, msg, run_id, usage).await?;
         if remaining_secs(start) < MIN_TIME_FOR_PR_SECS {
             close_memory(state, agent_memory.take()).await;
             return hand_off_at(
@@ -7593,7 +7635,7 @@ async fn run_repo_pipeline(
         file_cache,
         Some(run_id),
         implement_deadline,
-        false, // initial implement — unscoped
+        write_guard::RoundFor::Build,
     )
     .await?;
     write_pass_trace(
@@ -7792,7 +7834,7 @@ async fn run_repo_pipeline(
                 &fix_cache,
                 Some(run_id),
                 None,
-                true, // bot-driven test-fix — scoped to the PR
+                write_guard::RoundFor::TestFix,
             )
             .await
             {
@@ -7883,7 +7925,7 @@ async fn run_repo_pipeline(
                 file_cache,
                 Some(run_id),
                 None,
-                true, // bot-driven security fix — scoped to the PR
+                write_guard::RoundFor::SecurityFix,
             )
             .await?;
             write_conversation_log(
@@ -9137,6 +9179,8 @@ async fn report_questions(
     github: &GitHubClient,
     decision: &fix_location::FixDecision,
 ) {
+    // Kept on the run, so a comment that answers one is read as its answer.
+    ticket_comments::keep_asked(state, &msg.team_id, run_id, &decision.questions).await;
     let rec = open_pr_choice::load_record(state, &msg.team_id, &msg.ticket_id).await;
     let fresh = new_questions(&decision.questions, &rec.notices);
     let earlier = decision
@@ -9151,7 +9195,7 @@ async fn report_questions(
             &msg.team_id,
             run_id,
             &format!(
-                "{earlier} question(s) already asked on the ticket — not asked again; the run goes on without the answers"
+                "{earlier} question(s) already asked on the ticket — not asked again; the run builds its defaults and applies an answer when one is written on the ticket"
             ),
         )
         .await;
@@ -12841,12 +12885,30 @@ pub(crate) async fn run_plan_files(
     state: &WorkerState,
     msg: &TicketMessage,
 ) -> Option<plan::PlanResult> {
-    let prefix = openspec_prefix(
+    plan_files_of(
+        state,
         &msg.team_id,
         &msg.ticket_id,
         &msg.repo_owner,
         &msg.repo_name,
-    );
+    )
+    .await
+}
+
+/// The plan files cached for a ticket and repository, by their names: for a
+/// round that has the run's record and no ticket message. `None` when the
+/// ticket is unknown or no plan with tasks is cached.
+pub(crate) async fn plan_files_of(
+    state: &WorkerState,
+    team_id: &str,
+    ticket_id: &str,
+    owner: &str,
+    repo: &str,
+) -> Option<plan::PlanResult> {
+    if ticket_id.trim().is_empty() {
+        return None;
+    }
+    let prefix = openspec_prefix(team_id, ticket_id, owner, repo);
     load_cached_plan_files(state, &prefix)
         .await
         .filter(|p| !p.tasks.trim().is_empty())
