@@ -17,6 +17,16 @@
 //! cancelled or closed, and the scheduled sweep, which finds what the first
 //! two missed and what was stale before they existed. Applying a fact twice
 //! changes nothing the second time.
+//!
+//! Two stores keep such claims: dependency findings (`SECFINDING#`, here)
+//! and infrastructure findings (`INFRAFINDING#`, `infra_vuln::records`).
+//! Both are a [`Claim`]: the worker's reconciliation, the events and the
+//! bounds are written once against it, and the words and holds
+//! ([`closed_words`], [`run_end`]) are shared, so the two cannot drift.
+//! What differs stays with each store: a merged pull request fixes a
+//! dependency finding, while an infrastructure finding is fixed only when
+//! AWS is read again; and an infrastructure pull request the replacement
+//! guard made a draft is neither open nor closed.
 
 use chrono::{DateTime, Duration, Utc};
 
@@ -93,7 +103,7 @@ pub struct Change {
     pub link: Option<String>,
 }
 
-fn change(text: String, link: &str) -> Option<Change> {
+pub(crate) fn change(text: String, link: &str) -> Option<Change> {
     Some(Change {
         text,
         link: (!link.is_empty()).then(|| link.to_string()),
@@ -116,6 +126,81 @@ pub fn watches_pr(f: &Finding, st: &FindingState, now: DateTime<Utc>) -> bool {
         Some(p) if p.state == "open" => true,
         Some(p) => p.state == "closed" && f.status == Status::Open && held(st, now),
         None => false,
+    }
+}
+
+/// "PR #12 was closed without merging by octo", or "PR #12 is no longer on
+/// GitHub" for one that is gone ([`PrNow::Gone`], a closer nobody named).
+pub fn closed_words(number: u64, closer: &Closer) -> String {
+    if !closer.person && closer.by.is_empty() && closer.at.is_none() {
+        return format!("PR #{number} is no longer on GitHub");
+    }
+    let who = match (closer.person, closer.by.is_empty()) {
+        (true, false) => format!(" by {}", closer.by),
+        (false, _) => " by CoderHelm".to_string(),
+        (true, true) => String::new(),
+    };
+    format!("PR #{number} was closed without merging{who}")
+}
+
+/// The record a closed pull request leaves: when, who, and whether that
+/// was a person. The same three fields on both stores' pull requests.
+pub fn closed_record(closer: &Closer, now: DateTime<Utc>) -> (String, Option<String>, bool) {
+    (
+        closer.at.clone().unwrap_or_else(|| now.to_rfc3339()),
+        (!closer.by.is_empty()).then(|| closer.by.clone()),
+        closer.person,
+    )
+}
+
+/// What a run that is over with no pull request means for the finding it
+/// claimed: how long automatic fixes wait, the timeline's line, and what
+/// the page says while it waits (when a person ended the run).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunEnd {
+    pub hold_days: i64,
+    pub text: String,
+    pub waiting: Option<String>,
+}
+
+/// Whether a `fixing` claim is released, from what became of its run.
+/// `claimed`: when the run was started for it. `None`: the run is queued
+/// or working, could not be read, or may still be in the queue.
+pub fn run_end(run: &RunNow, claimed: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Option<RunEnd> {
+    let by_itself = || RunEnd {
+        hold_days: HOLD_DAYS_RUN_ENDED,
+        text: "The fix run ended without a pull request; it is tried again tomorrow".to_string(),
+        waiting: None,
+    };
+    match run {
+        RunNow::Working | RunNow::Unknown => None,
+        RunNow::Ended { status, by } => {
+            if !crate::run_status::ended_by_person(status) {
+                return Some(by_itself());
+            }
+            let who = by
+                .as_deref()
+                .filter(|b| !b.is_empty())
+                .map(|b| format!(" by {b}"))
+                .unwrap_or_default();
+            let word = if status == crate::run_status::CLOSED {
+                "closed"
+            } else {
+                "cancelled"
+            };
+            Some(RunEnd {
+                hold_days: HOLD_DAYS_CLOSED,
+                text: format!(
+                    "The fix run was {word}{who} before it opened a pull request; automatic fixes wait {HOLD_DAYS_CLOSED} days. Ask for a fix to start one now"
+                ),
+                waiting: Some(format!(
+                    "The fix run was {word}{who}. Ask for a fix to start a new one."
+                )),
+            })
+        }
+        RunNow::Missing => claimed
+            .is_none_or(|t| now - t > Duration::hours(NO_RUN_GRACE_HOURS))
+            .then(by_itself),
     }
 }
 
@@ -146,7 +231,6 @@ pub fn settle_pr(
         PrNow::Gone => &gone,
         other => other,
     };
-    let is_gone = |c: &Closer| !c.person && c.by.is_empty() && c.at.is_none();
     match pr_now {
         PrNow::Unknown | PrNow::Gone => None,
         PrNow::Merged => {
@@ -172,11 +256,12 @@ pub fn settle_pr(
             if pr.state != "open" {
                 return None;
             }
+            let (at, by, person) = closed_record(closer, now);
             f.pr = Some(PrRef {
                 state: "closed".into(),
-                closed_at: Some(closer.at.clone().unwrap_or_else(|| now_s.clone())),
-                closed_by: (!closer.by.is_empty()).then(|| closer.by.clone()),
-                closed_by_person: closer.person,
+                closed_at: Some(at),
+                closed_by: by,
+                closed_by_person: person,
                 ..pr.clone()
             });
             let was_in_it = f.status == Status::PrOpen;
@@ -189,11 +274,6 @@ pub fn settle_pr(
                 st.hold_until = Some((now + Duration::days(HOLD_DAYS_CLOSED)).to_rfc3339());
             }
             f.updated_at = now_s;
-            let who = match (closer.person, closer.by.is_empty()) {
-                (true, false) => format!(" by {}", closer.by),
-                (false, _) => " by CoderHelm".to_string(),
-                (true, true) => String::new(),
-            };
             let then = if was_in_it {
                 format!(
                     "; automatic fixes wait {HOLD_DAYS_CLOSED} days. Ask for a fix to open a new pull request now"
@@ -201,12 +281,10 @@ pub fn settle_pr(
             } else {
                 String::new()
             };
-            let what = if is_gone(closer) {
-                format!("PR #{} is no longer on GitHub", pr.number)
-            } else {
-                format!("PR #{} was closed without merging{who}", pr.number)
-            };
-            change(format!("{what}{then}"), &pr.url)
+            change(
+                format!("{}{then}", closed_words(pr.number, closer)),
+                &pr.url,
+            )
         }
         PrNow::Open => {
             if pr.state != "closed" {
@@ -237,6 +315,9 @@ pub fn settle_pr(
     }
 }
 
+/// Minutes a run may have begun before its claim was written and still be
+/// the claim's run: the two are written on different clocks.
+pub const RUN_CLOCK_TOLERANCE_MINS: i64 = 10;
 /// Days a run waiting on a person's answer keeps its findings.
 pub const WAITING_RUN_DAYS: i64 = 7;
 /// Hours a run recorded as queued or working keeps its findings after its
@@ -318,51 +399,11 @@ pub fn settle_run(
         f.updated_at = now_s;
         return change(format!("PR #{} opened", pr.number), &pr.url);
     }
-    let (days, text, waiting) = match run {
-        RunNow::Working | RunNow::Unknown => return None,
-        RunNow::Ended { status, by } => {
-            if crate::run_status::ended_by_person(status) {
-                let who = by
-                    .as_deref()
-                    .filter(|b| !b.is_empty())
-                    .map(|b| format!(" by {b}"))
-                    .unwrap_or_default();
-                let word = if status == crate::run_status::CLOSED {
-                    "closed"
-                } else {
-                    "cancelled"
-                };
-                (
-                    HOLD_DAYS_CLOSED,
-                    format!(
-                        "The fix run was {word}{who} before it opened a pull request; automatic fixes wait {HOLD_DAYS_CLOSED} days. Ask for a fix to start one now"
-                    ),
-                    Some(format!(
-                        "The fix run was {word}{who}. Ask for a fix to start a new one."
-                    )),
-                )
-            } else {
-                (
-                    HOLD_DAYS_RUN_ENDED,
-                    "The fix run ended without a pull request; it is tried again tomorrow"
-                        .to_string(),
-                    None,
-                )
-            }
-        }
-        RunNow::Missing => {
-            let waited =
-                claimed_at(f, st).is_none_or(|t| now - t > Duration::hours(NO_RUN_GRACE_HOURS));
-            if !waited {
-                return None;
-            }
-            (
-                HOLD_DAYS_RUN_ENDED,
-                "The fix run ended without a pull request; it is tried again tomorrow".to_string(),
-                None,
-            )
-        }
-    };
+    let RunEnd {
+        hold_days: days,
+        text,
+        waiting,
+    } = run_end(run, claimed_at(f, st), now)?;
     f.status = Status::Open;
     f.waiting = waiting;
     st.ticket = None;
@@ -371,6 +412,108 @@ pub fn settle_run(
     st.hold_until = Some((now + Duration::days(days)).to_rfc3339());
     f.updated_at = now_s;
     change(text, "")
+}
+
+// ── One reconciliation for both stores ──────────────────────────────────
+
+/// Where a claim stands, for counting what a reconciliation did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Standing {
+    Open,
+    Fixing,
+    InPr,
+    Fixed,
+    Other,
+}
+
+/// The open pull request found on a run's branch.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct OpenPr {
+    pub number: u64,
+    pub url: String,
+}
+
+/// A stored finding that a fix run or a pull request can claim. The
+/// worker's reconciliation reads GitHub and the run records and applies
+/// them through this, whichever store the finding lives in.
+pub trait Claim {
+    fn id(&self) -> &str;
+    /// `owner/name` of the repository its pull request is in.
+    fn repo(&self) -> &str;
+    /// Its pull request as recorded: the number and the state.
+    fn pr(&self) -> Option<(u64, &str)>;
+    /// The fix run's ticket, while a run or its pull request has it.
+    fn ticket(&self) -> Option<&str>;
+    fn standing(&self) -> Standing;
+    /// Whether the sweep reads its pull request (see [`watches_pr`]).
+    fn watches_pr(&self, now: DateTime<Utc>) -> bool;
+    /// When its run claimed it.
+    fn claimed_at(&self) -> Option<DateTime<Utc>>;
+    /// Whether what became of its run matters although its pull request is
+    /// open (a round still working on that pull request). Otherwise an
+    /// open pull request is the whole answer and the run is not read.
+    fn run_decides_with_pr(&self) -> bool {
+        false
+    }
+    /// Whether an open pull request found on its run's branch must go
+    /// through the store's own opening path (it has checks to make there)
+    /// instead of being recorded as open here.
+    fn opens_through_store(&self) -> bool {
+        false
+    }
+    fn settle_pr(&mut self, pr_now: &PrNow, now: DateTime<Utc>) -> Option<Change>;
+    fn settle_run(
+        &mut self,
+        run: &RunNow,
+        open_pr: Option<&OpenPr>,
+        now: DateTime<Utc>,
+    ) -> Option<Change>;
+}
+
+impl Claim for (Finding, FindingState) {
+    fn id(&self) -> &str {
+        &self.0.id
+    }
+    fn repo(&self) -> &str {
+        &self.0.repo
+    }
+    fn pr(&self) -> Option<(u64, &str)> {
+        self.0.pr.as_ref().map(|p| (p.number, p.state.as_str()))
+    }
+    fn ticket(&self) -> Option<&str> {
+        self.1.ticket.as_deref()
+    }
+    fn standing(&self) -> Standing {
+        match self.0.status {
+            Status::Open | Status::NoFix => Standing::Open,
+            Status::Fixing => Standing::Fixing,
+            Status::PrOpen => Standing::InPr,
+            Status::Fixed => Standing::Fixed,
+            Status::Dismissed | Status::Withdrawn => Standing::Other,
+        }
+    }
+    fn watches_pr(&self, now: DateTime<Utc>) -> bool {
+        watches_pr(&self.0, &self.1, now)
+    }
+    fn claimed_at(&self) -> Option<DateTime<Utc>> {
+        claimed_at(&self.0, &self.1)
+    }
+    fn settle_pr(&mut self, pr_now: &PrNow, now: DateTime<Utc>) -> Option<Change> {
+        settle_pr(&mut self.0, &mut self.1, pr_now, now)
+    }
+    fn settle_run(
+        &mut self,
+        run: &RunNow,
+        open_pr: Option<&OpenPr>,
+        now: DateTime<Utc>,
+    ) -> Option<Change> {
+        let pr = open_pr.map(|p| PrRef {
+            number: p.number,
+            url: p.url.clone(),
+            ..Default::default()
+        });
+        settle_run(&mut self.0, &mut self.1, run, pr.as_ref(), now)
+    }
 }
 
 /// The `limit` items of `all` this sweep reads, in turn: every sweep starts

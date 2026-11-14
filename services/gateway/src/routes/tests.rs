@@ -19,7 +19,8 @@ use axum::{
 };
 use common::e2e::detect::can_quarantine;
 use common::e2e::messages::{TestAction, TestIngest};
-use common::e2e::model::{Run, Settings, State as TestState, StateEvent};
+use common::e2e::model::{Removal, Run, Settings, StateEvent};
+use common::e2e::quarantine;
 use common::e2e::stats::impact;
 use common::e2e::store::Store;
 use serde::Deserialize;
@@ -258,10 +259,12 @@ pub async fn summary(
         .cloned()
         .collect();
 
-    let tests = st
+    let mut tests = st
         .summaries(team, only)
         .await
         .map_err(|e| internal("e2e summaries", e))?;
+    // A test removed by a merged pull request is no longer one of the team's.
+    tests.retain(|t| t["removed"].as_bool() != Some(true));
     let mut counts: HashMap<&str, u32> = ["healthy", "flaky", "broken", "quarantined", "fixed"]
         .into_iter()
         .map(|k| (k, 0))
@@ -450,6 +453,28 @@ pub async fn list_tests(
         .summaries(&claims.team_id, q(&params, "repo"))
         .await
         .map_err(|e| internal("e2e list tests", e))?;
+    // A test removed by a merged pull request is gone from every list; its
+    // record (who approved the removal) stays on its own page.
+    tests.retain(|t| t["removed"].as_bool() != Some(true));
+    let now = chrono::Utc::now();
+    let wants_quarantine = q(&params, "state") == Some("quarantined");
+    if wants_quarantine {
+        // What a quarantined row says depends on today's date (a cool-off
+        // that ended, a test that stopped running), so each is read from
+        // its record, not from the summary saved with its last run.
+        for t in tests
+            .iter_mut()
+            .filter(|t| t["state"].as_str() == Some("quarantined"))
+            .take(MAX_FRESH_ROWS)
+        {
+            let Some(id) = t["id"].as_str() else { continue };
+            if let Ok(Some(r)) = st.record(&claims.team_id, id).await {
+                *t = common::e2e::stats::summary(&r, now);
+            }
+        }
+    }
+    let budgets = budgets_for(&st, &claims.team_id, &tests, now).await;
+    quarantine::overlay(&mut tests, &budgets);
     if let Some(s) = q(&params, "state") {
         tests.retain(|t| {
             t["state"].as_str() == Some(s)
@@ -496,7 +521,70 @@ pub async fn list_tests(
         .unwrap_or(0);
     let page: Vec<Value> = tests.iter().skip(start).take(limit).cloned().collect();
     let next = (start + limit < tests.len()).then(|| (start + limit).to_string());
-    Ok(Json(json!({ "tests": page, "next": next })))
+    let mut auto: Vec<&quarantine::Budget> = budgets.values().collect();
+    auto.sort_by(|a, b| a.repo.cmp(&b.repo));
+    Ok(Json(json!({
+        "tests": page,
+        "next": next,
+        // The weekly number of automatic fixes per repository with
+        // quarantined tests, and why there is one.
+        "auto_fixes": auto,
+        "auto_fixes_reason": quarantine::CAP_REASON,
+    })))
+}
+
+/// Quarantined rows read from their records in one list call.
+const MAX_FRESH_ROWS: usize = 100;
+
+/// This week's automatic fixes for each repository that has a quarantined
+/// test among `rows`.
+async fn budgets_for(
+    st: &Store<'_>,
+    team: &str,
+    rows: &[Value],
+    now: chrono::DateTime<chrono::Utc>,
+) -> HashMap<String, quarantine::Budget> {
+    let mut repos: Vec<&str> = rows
+        .iter()
+        .filter(|t| !t["quarantine"].is_null())
+        .filter_map(|t| t["repo"].as_str())
+        .collect();
+    repos.sort_unstable();
+    repos.dedup();
+    let mut out = HashMap::new();
+    if repos.is_empty() {
+        return out;
+    }
+    let settings = st.settings(team).await.unwrap_or_default();
+    for repo in repos {
+        match st.budget(team, repo, &settings, now).await {
+            Ok(b) => {
+                out.insert(repo.to_string(), b);
+            }
+            Err(e) => warn!(error = %e, "Could not read the week's automatic fixes"),
+        }
+    }
+    out
+}
+
+/// One test's summary as its own page shows it: fresh from the record, with
+/// its place among the repository's quarantined tests and the week's count.
+async fn fresh_summary(
+    st: &Store<'_>,
+    team: &str,
+    r: &common::e2e::model::TestRecord,
+) -> (Value, Option<quarantine::Budget>) {
+    let now = chrono::Utc::now();
+    let own = common::e2e::stats::summary(r, now);
+    if own["quarantine"].is_null() {
+        return (own, None);
+    }
+    let mut rows = st.summaries(team, Some(&r.repo)).await.unwrap_or_default();
+    rows.retain(|t| t["id"].as_str() != Some(r.id.as_str()));
+    rows.push(own);
+    let mut budgets = budgets_for(st, team, &rows, now).await;
+    quarantine::overlay(&mut rows, &budgets);
+    (rows.pop().unwrap_or(Value::Null), budgets.remove(&r.repo))
 }
 
 pub async fn get_test(
@@ -520,10 +608,13 @@ pub async fn get_test(
     history.truncate(50);
     let mut events = r.events.clone();
     events.reverse();
+    let (test, budget) = fresh_summary(&st, &claims.team_id, &r).await;
     Ok(Json(json!({
-        "test": common::e2e::stats::summary(&r, chrono::Utc::now()),
+        "test": test,
         "history": history,
         "events": events,
+        "auto_fixes": budget,
+        "auto_fixes_reason": quarantine::CAP_REASON,
     })))
 }
 
@@ -565,9 +656,7 @@ pub async fn quarantine(
     if body.on {
         can_quarantine(&r).map_err(|why| fail(StatusCode::BAD_REQUEST, why))?;
         if !r.quarantined {
-            r.quarantined = true;
-            r.quarantined_since = Some(chrono::Utc::now().to_rfc3339());
-            r.quarantined_by = Some(claims.email.clone());
+            quarantine::enter(&mut r, chrono::Utc::now(), &claims.email);
             let from = r.health.as_str().to_string();
             r.events.push(event(
                 &from,
@@ -648,22 +737,26 @@ pub async fn fix(
         .await
         .map_err(|e| internal("e2e get test", e))?
         .ok_or_else(|| fail(StatusCode::NOT_FOUND, "That test isn't here."))?;
-    if r.health != TestState::Flaky {
-        return Err(fail(
-            StatusCode::BAD_REQUEST,
-            "Only flaky tests get a fix PR. A broken test is a real regression: fix the code it tests.",
-        ));
+    // A quarantined test can be fixed whatever its health says now, and a
+    // fix that did not hold can be asked for again.
+    let now = chrono::Utc::now();
+    if let Some(why) = quarantine::fix_blocked(&r, now) {
+        return Err(fail(StatusCode::BAD_REQUEST, &why));
     }
-    if matches!(
-        r.fix_status.as_deref(),
-        Some("reproducing" | "fixing" | "burn_in")
-    ) {
-        return Err(fail(
-            StatusCode::BAD_REQUEST,
-            "A fix for this test is already in progress.",
-        ));
-    }
+    // Marked as asked for, with no start time: the worker starts it. (A
+    // start time here made the worker drop the request as a duplicate.)
     r.fix_status = Some("reproducing".into());
+    r.fix_phase_at = None;
+    r.care.fix_requested_at = Some(now.to_rfc3339());
+    r.care.fix_by = Some(claims.email.clone());
+    r.care.fix_run_id = None;
+    let state_now = r.state().as_str().to_string();
+    r.events.push(event(
+        &state_now,
+        &state_now,
+        "A fix was asked for.".into(),
+        &claims.email,
+    ));
     st.put_record(&claims.team_id, &r)
         .await
         .map_err(|e| internal("e2e save test", e))?;
@@ -673,7 +766,7 @@ pub async fn fix(
             team_id: claims.team_id.clone(),
             repo: r.repo.clone(),
             action: "fix".into(),
-            target_id: id,
+            target_id: id.clone(),
             actor: claims.email.clone(),
             setup: None,
         }),
@@ -681,7 +774,62 @@ pub async fn fix(
     )
     .await
     .map_err(|e| internal("e2e queue fix", e))?;
-    Ok(Json(json!({ "queued": true })))
+    info!(team = %claims.team_id, test = %id, "Test fix asked for");
+    let (test, _) = fresh_summary(&st, &claims.team_id, &r).await;
+    Ok(Json(json!({ "queued": true, "test": test })))
+}
+
+/// POST /api/tests/:id/remove: opens a pull request that deletes a
+/// quarantined test and what only it used. The team approves and merges it;
+/// Coderhelm never does.
+pub async fn remove(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Path(id): Path<String>,
+) -> Reply {
+    admin(&claims)?;
+    let st = store(&state)?;
+    let mut r = st
+        .record(&claims.team_id, &id)
+        .await
+        .map_err(|e| internal("e2e get test", e))?
+        .ok_or_else(|| fail(StatusCode::NOT_FOUND, "That test isn't here."))?;
+    let now = chrono::Utc::now();
+    if let Some(why) = quarantine::removal_blocked(&r, now) {
+        return Err(fail(StatusCode::BAD_REQUEST, &why));
+    }
+    r.care.removal = Some(Removal {
+        status: "running".into(),
+        by: claims.email.clone(),
+        at: now.to_rfc3339(),
+        ..Default::default()
+    });
+    r.events.push(event(
+        "quarantined",
+        "quarantined",
+        "A pull request that removes it was asked for.".into(),
+        &claims.email,
+    ));
+    st.put_record(&claims.team_id, &r)
+        .await
+        .map_err(|e| internal("e2e save test", e))?;
+    queue(
+        &state,
+        WorkerMessage::TestAction(TestAction {
+            team_id: claims.team_id.clone(),
+            repo: r.repo.clone(),
+            action: "remove".into(),
+            target_id: id.clone(),
+            actor: claims.email.clone(),
+            setup: None,
+        }),
+        0,
+    )
+    .await
+    .map_err(|e| internal("e2e queue remove", e))?;
+    info!(team = %claims.team_id, test = %id, "Test removal asked for");
+    let (test, _) = fresh_summary(&st, &claims.team_id, &r).await;
+    Ok(Json(json!({ "queued": true, "test": test })))
 }
 
 // ── Failure groups, coverage, recommendations ─────────────────────────────

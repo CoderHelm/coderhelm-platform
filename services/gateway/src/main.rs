@@ -1470,6 +1470,7 @@ fn build_app(state: Arc<AppState>) -> Router {
         .route("/tests/:id/quarantine", post(routes::tests::quarantine))
         .route("/tests/:id/pin", post(routes::tests::pin))
         .route("/tests/:id/fix", post(routes::tests::fix))
+        .route("/tests/:id/remove", post(routes::tests::remove))
         // Memory browser
         .route(
             "/memories",

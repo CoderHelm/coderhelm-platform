@@ -7,6 +7,8 @@
 //! - [`detect`] decides healthy, flaky, broken or fixed; pure and tested.
 //! - [`coverage`] maps code to the areas tests cover.
 //! - [`store`] keeps runs, tests, failure groups and recommendations.
+//! - [`quarantine`] decides how a test leaves quarantine: by proving itself,
+//!   by a fix, or by a pull request that removes it.
 //!
 //! Fixing a failing or flaky test from a ticket or pull request:
 //!
@@ -43,6 +45,7 @@ pub mod messages;
 pub mod model;
 pub mod owners;
 pub mod parse;
+pub mod quarantine;
 pub mod report_source;
 pub mod signature;
 pub mod stats;

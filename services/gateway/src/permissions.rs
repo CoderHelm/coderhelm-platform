@@ -680,7 +680,7 @@ pub const CAPABILITIES: &[Capability] = &[
     },
     Capability {
         key: "tests",
-        label: "Change test settings; quarantine, pin and fix tests; open setup pull requests",
+        label: "Change test settings; quarantine, pin, fix and remove tests; open setup pull requests",
 
         short_label: "Manage tests",
         min_role: "admin",
@@ -691,6 +691,7 @@ pub const CAPABILITIES: &[Capability] = &[
             "tests::quarantine",
             "tests::pin",
             "tests::fix",
+            "tests::remove",
             "tests::accept_recommendation",
             "tests::dismiss_recommendation",
         ],
