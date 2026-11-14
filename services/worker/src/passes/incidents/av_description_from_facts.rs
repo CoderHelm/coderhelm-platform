@@ -89,7 +89,7 @@ fn the_description_check_catches_every_statement_the_head_refutes() {
         end.never_says(old);
     }
     assert!(end.says(
-        "`tiny-yaml` 1.2.0 to 2.0.0 crosses a major version. no safety evidence is recorded"
+        "`tiny-yaml` 1.2.0 to 2.0.0 crosses a major version. No safety evidence is recorded"
     ));
     assert!(pr_claims::check(&out.body, &out.facts).is_empty());
 }

@@ -955,6 +955,57 @@ mod tests {
         );
     }
 
+    /// Every write is laid out and every rebuild is a view of the facts of
+    /// its head: the one save lays the body out, the model's text is held
+    /// against the facts before it is saved, and a rebuild shapes the body
+    /// from the facts (fact check, reader pass, lead, folds) and settles
+    /// CoderHelm's own thread about the description. No other module runs
+    /// the fact check or the layout on a description by itself.
+    #[test]
+    fn every_write_is_laid_out_and_every_rebuild_is_shaped_from_the_facts() {
+        let me = code(include_str!("description.rs"));
+        let body_of = |start: &str, end: &str| {
+            let s = &me[me.find(start).unwrap_or_else(|| panic!("{start}"))..];
+            s[..s.find(end).unwrap_or_else(|| panic!("{end}"))].to_string()
+        };
+        let save = body_of("\npub async fn save(", "\npub async fn save_checked(");
+        assert!(save.contains("clean(body)"));
+        assert!(save.contains("pr_layout::layout("));
+        let checked = body_of("\npub async fn save_checked(", "\nfn note_corrections(");
+        assert!(checked.contains("pr_claims::enforce("));
+        assert!(checked.contains("save(github"));
+        let build = body_of("\nasync fn build(", "\npub async fn reconcile_run(");
+        for step in [
+            "facts_of(",
+            "ask_reader(",
+            "description_facts::shape(",
+            "with_stamp(",
+            "save(github",
+            "resolve_own_description_threads(",
+        ] {
+            assert!(build.contains(step), "a rebuild runs {step}");
+        }
+        // The shaping runs in one place: the eval and the incident cases
+        // (tests) run the same function.
+        for (path, text) in sources() {
+            let code = code(&text);
+            if path.starts_with("passes/incidents/")
+                || [
+                    "passes/description.rs",
+                    "passes/description_facts.rs",
+                    "passes/description_eval.rs",
+                ]
+                .contains(&path.as_str())
+            {
+                continue;
+            }
+            assert!(
+                !code.contains("description_facts::shape("),
+                "{path} shapes a description outside the rebuild"
+            );
+        }
+    }
+
     /// Every path that moves a pull request's head rebuilds its
     /// description, through this module.
     #[test]

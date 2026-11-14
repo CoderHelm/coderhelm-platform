@@ -552,6 +552,15 @@ pub fn anomalies(f: &Facts) -> Vec<Anomaly> {
     out
 }
 
+/// `s` with its first letter upper case: the evidence is its own sentence.
+fn sentence_start(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        Some(f) => f.to_uppercase().chain(c).collect(),
+        None => String::new(),
+    }
+}
+
 fn listed(ids: &[String], max: usize) -> String {
     let shown: Vec<&str> = ids.iter().take(max).map(String::as_str).collect();
     let more = ids.len().saturating_sub(max);
@@ -717,7 +726,7 @@ pub fn lead(f: &Facts) -> String {
             s.push_str(&format!(
                 "- {}. {}.\n",
                 a.what,
-                a.evidence.trim_end_matches('.')
+                sentence_start(a.evidence.trim_end_matches('.'))
             ));
         }
         if all.len() > MAX_ANOMALIES {
@@ -843,7 +852,7 @@ mod tests {
         );
         assert!(
             out.contains(
-                "not verified: the export against the live bucket. the sandbox has no credentials"
+                "not verified: the export against the live bucket. The sandbox has no credentials"
             ),
             "{out}"
         );
@@ -895,7 +904,7 @@ mod tests {
             "{out}"
         );
         assert!(
-            out.contains("`tiny-yaml` 1.2.0 to 2.0.0 crosses a major version. no safety evidence is recorded"),
+            out.contains("`tiny-yaml` 1.2.0 to 2.0.0 crosses a major version. No safety evidence is recorded"),
             "{out}"
         );
         assert!(out.contains("each major version jump"), "{out}");

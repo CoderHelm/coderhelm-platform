@@ -177,7 +177,7 @@ pub fn dependency_case() -> Case {
         in_sight: vec![
             "**Needed from you:** Nothing.",
             // Why each major jump is safe, or that nothing says so.
-            "`tiny-yaml` 1.2.0 to 2.0.0 crosses a major version. no safety evidence is recorded",
+            "`tiny-yaml` 1.2.0 to 2.0.0 crosses a major version. No safety evidence is recorded",
             "2 advisories are not fixed by this pull request (2 high)",
             "Fixes 2 advisories in 3 package version lines. 2 high advisories remain.",
             "3 recorded checks passed on `5e4d3c2`",
