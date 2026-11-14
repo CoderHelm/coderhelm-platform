@@ -56,6 +56,12 @@ impl ForRun {
         pc::subject(&self.title, &self.key, was)
     }
 
+    /// [`Self::title`] for a change to `paths`: a Conventional Commits
+    /// title takes the scope people used that fits them.
+    pub fn title_for(&self, was: &str, paths: &[String]) -> Written {
+        pc::subject_for(&self.title, &self.key, was, paths)
+    }
+
     /// `was` (a commit message) with its subject in the repository's form
     /// and its body kept.
     pub fn commit(&self, was: &str) -> String {
@@ -98,7 +104,16 @@ async fn read(
     team: &GitConventions,
 ) -> (Convention, Convention) {
     let mut commitlint: Option<(String, String)> = None;
+    let mut release_tooling: Option<String> = None;
     if let Ok(root) = github.list_directory(owner, repo, "", base).await {
+        release_tooling = root
+            .iter()
+            .find(|e| {
+                e.name == "release-please-config.json"
+                    || e.name.starts_with(".releaserc")
+                    || e.name.starts_with("release.config.")
+            })
+            .map(|e| e.path.clone());
         if let Some(f) = root.iter().find(|e| {
             e.name.starts_with(".commitlintrc") || e.name.starts_with("commitlint.config")
         }) {
@@ -173,6 +188,7 @@ async fn read(
         guide,
         commitlint: commitlint.as_ref().map(|(p, t)| (p.as_str(), t.as_str())),
         title_checks: checks.clone(),
+        release_tooling: release_tooling.as_deref(),
         merged: &merged,
         commits: &commits,
     };
@@ -265,6 +281,19 @@ async fn jira_config(state: &WorkerState, team_id: &str) -> HashMap<String, Stri
                 .filter_map(|(k, v)| v.as_s().ok().map(|s| (k, s.clone())))
                 .collect()
         })
+        .unwrap_or_default()
+}
+
+/// The page of `key` in the connected tracker, when its address is known.
+pub async fn ticket_url(state: &WorkerState, team_id: &str, key: &str) -> String {
+    if !common::git_conventions::is_ticket_key(key) {
+        return String::new();
+    }
+    jira_config(state, team_id)
+        .await
+        .get("site_url")
+        .filter(|s| s.starts_with("https://"))
+        .map(|s| format!("{}/browse/{key}", s.trim_end_matches('/')))
         .unwrap_or_default()
 }
 
@@ -511,6 +540,7 @@ mod tests {
             form: Form::TicketKey(Sep::Colon),
             source: Source::MergedPullRequests,
             evidence: "24 of the last 30 merged pull requests written by people".into(),
+            ..Default::default()
         }
     }
 
@@ -524,10 +554,7 @@ mod tests {
             ),
         };
         let w = run.title("fix(deps): security updates for web (14 packages, 31 advisories)");
-        assert_eq!(
-            w.text,
-            "Security updates for web (14 packages, 31 advisories)"
-        );
+        assert_eq!(w.text, "Update 14 packages to fix 31 security advisories");
         assert!(w.note.unwrap().contains("is off in the team's settings"));
         assert_eq!(
             run.commit("fix(deps): glob-walk 2.1.0 to 2.1.4\n\nbody stays"),
@@ -541,6 +568,25 @@ mod tests {
         assert_eq!(
             run.title("fix(deps): security updates for web").text,
             "OPS-431: Security updates for web"
+        );
+        // A Conventional Commits title takes the scope that fits the change.
+        let conventional = ForRun {
+            title: Convention {
+                form: Form::Conventional,
+                source: Source::MergedPullRequests,
+                scopes: vec!["api".into(), "studio".into()],
+                ..Default::default()
+            },
+            ..run.clone()
+        };
+        assert_eq!(
+            conventional
+                .title_for(
+                    "OPS-431: Warns when the Hero subtitle is too long.",
+                    &["apps/studio/schema.ts".to_string()]
+                )
+                .text,
+            "chore(studio): warn when the Hero subtitle is too long"
         );
         assert_eq!(
             run.commit("KEY-1: fix(deps): glob-walk 2.1.0 to 2.1.4"),
@@ -556,6 +602,7 @@ mod tests {
             form: Form::Conventional,
             source: Source::BaseCommits,
             evidence: "x".into(),
+            ..Default::default()
         };
         assert!(keeps_ticket_form(&inferred));
         let enforced = Convention {
