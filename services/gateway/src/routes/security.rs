@@ -95,7 +95,7 @@ pub(crate) async fn load_config(
         .and_then(|i| SecurityConfig::from_json(&s(&i, "config"))))
 }
 
-async fn load_findings(
+pub(crate) async fn load_findings(
     state: &AppState,
     team_id: &str,
 ) -> Result<Vec<(Finding, FindingState)>, StatusCode> {

@@ -1582,7 +1582,7 @@ async fn start_run(
         repo = %rule.repo,
         rule = %rule.id,
         title = %alert.title,
-        "Alert → run enqueued"
+        "Alert: run enqueued"
     );
     Ok(Outcome::RunStarted)
 }

@@ -26,7 +26,7 @@
 //!   the ticket ([`Settled::ByTicket`]) when the round quotes the words and
 //!   they are found there: it is dropped, never deferred;
 //! - a finding is deferred only with a reason from the person gate
-//!   ([`PERSON_REASONS`]: a credential, a permission only a person grants,
+//!   (`common::person_gate`: a credential, a permission only a person grants,
 //!   an irreversible choice nothing settles, work someone else holds, an
 //!   approval the team requires, an action outside every system CoderHelm
 //!   reaches), claimed by two honest rounds or by the round that exhausted
@@ -55,31 +55,13 @@ pub const MAX_ROUNDS: u32 = 24;
 /// because its own review still asks for changes on the head.
 pub const MAX_CONTINUES: u32 = 2;
 
-/// The person gate's reasons (`person_gate::Reason`), by code, with the
-/// words a person reads. The only reasons a finding is deferred for.
-pub const PERSON_REASONS: &[(&str, &str)] = &[
-    (
-        "credential",
-        "it needs a credential only a person can provide",
-    ),
-    ("grant", "it needs a permission only a person can grant"),
-    (
-        "irreversible_choice",
-        "the choice is hard to reverse and nothing in the ticket, repository or settings shows a preference",
-    ),
-    ("held_by_another", "someone else is working on it"),
-    ("approval", "the team's policy needs a person's approval"),
-    (
-        "outside_reach",
-        "it is outside every system CoderHelm reaches",
-    ),
-];
-
+/// The person gate's reason for `code` (`common::person_gate::Reason`):
+/// the only reasons a finding is deferred for, in the words a person reads.
 fn person_label(code: &str) -> Option<&'static str> {
-    PERSON_REASONS
+    common::person_gate::REASONS
         .iter()
-        .find(|(c, _)| *c == code.trim())
-        .map(|(_, l)| *l)
+        .find(|r| r.code() == code.trim())
+        .map(|r| r.label())
 }
 
 /// What blocked a round, read from the round itself: not the model failing.
@@ -317,7 +299,10 @@ pub const NEEDS_A_PERSON: &str = "NEEDS A PERSON:";
 /// a finding the ticket rules out is never coded around, and only a person
 /// gate reason makes a finding a person's.
 pub fn round_rules(ticket: &str) -> String {
-    let codes: Vec<&str> = PERSON_REASONS.iter().map(|(c, _)| *c).collect();
+    let codes: Vec<&str> = common::person_gate::REASONS
+        .iter()
+        .map(|r| r.code())
+        .collect();
     let ticket = ticket.trim();
     let ticket = if ticket.is_empty() {
         String::new()
@@ -1091,8 +1076,8 @@ mod tests {
     fn the_round_is_told_the_ticket_and_the_only_reasons() {
         let r = round_rules("### Ticket: x\nKeep the footer.");
         assert!(r.contains("Keep the footer."));
-        for (code, _) in PERSON_REASONS {
-            assert!(r.contains(code));
+        for reason in common::person_gate::REASONS {
+            assert!(r.contains(reason.code()));
         }
         assert!(r.contains(TICKET_CONFLICT) && r.contains(NEEDS_A_PERSON));
     }

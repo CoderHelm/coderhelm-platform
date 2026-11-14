@@ -384,7 +384,7 @@ where
         return StepError::new(
             "sign_in",
             "The CoderHelm role in your AWS account can't read Airflow yet.",
-            "Update the role from Settings → AWS (one click adds read access to Airflow).",
+            "Update the role from Settings under AWS (one click adds read access to Airflow).",
         );
     }
     StepError::new(

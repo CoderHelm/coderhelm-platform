@@ -329,7 +329,7 @@ pub async fn on_webhook(
             name = %t.name,
             pr = t.pr_number,
             trigger = t.trigger,
-            "Pushback on a review → judgment queued"
+            "Pushback on a review: judgment queued"
         ),
         Err(e) => warn!(status = ?e, "Could not queue the review lesson judgment"),
     }

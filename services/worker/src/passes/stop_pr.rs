@@ -320,16 +320,17 @@ pub async fn open_with(
 ) -> Result<Stopped, BoxError> {
     let mut with_assumption = items.to_vec();
     if let Some(a) = judged.assumption() {
+        // Through the settle stage's gate like every other item: a note
+        // when it is settled or decided, a person's only for a listed reason.
         with_assumption.push(super::proof::Finding {
             point: super::proof::JUDGE_ASSUMPTION.to_string(),
-            detail: format!("handoff: {}", a.trim()),
-            settle: "Correct it in a comment on this pull request if it's wrong; otherwise \
-                     delete this line."
-                .to_string(),
+            topic: "handoff".to_string(),
+            detail: a.trim().to_string(),
             ..Default::default()
         });
     }
-    let items = &with_assumption[..];
+    let (gated, decided) = super::settle::gate_assumptions(&with_assumption);
+    let items = &gated[..];
     let github = GitHubClient::new(
         &state.secrets.github_app_id,
         &state.secrets.github_private_key,
@@ -356,9 +357,22 @@ pub async fn open_with(
     if work.is_empty() {
         return Err("no work on the branch".into());
     }
+    let decided_text = if decided.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<details><summary>Settled or decided without asking</summary>\n\n{}\n\n</details>",
+            decided
+                .iter()
+                .map(|d| format!("- {d}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    };
     let open_text = [
         super::proof::unfinished_section(items),
         super::proof::gaps_section(items),
+        decided_text,
     ]
     .into_iter()
     .filter(|s| !s.is_empty())

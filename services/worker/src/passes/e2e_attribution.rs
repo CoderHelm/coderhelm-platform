@@ -594,9 +594,14 @@ pub async fn handle_own_pr(
         .unwrap_or_default();
     for a in found.iter().filter(|a| a.blocks()) {
         if start_fix(state, msg, pr, &run_id, a).await {
-            let _ = gh
-                .create_issue_comment(&msg.repo_owner, &msg.repo_name, pr, &a.reply())
-                .await;
+            let _ = crate::passes::conversation::github(
+                gh,
+                &msg.repo_owner,
+                &msg.repo_name,
+                pr,
+                common::conversation::Say::note("e2e-attribution", a.reply()),
+            )
+            .await;
             if let Some(l) = a.blocked_line() {
                 note_blocked(state, &msg.team_id, &run_id, &l).await;
             }
@@ -682,9 +687,14 @@ pub async fn link_fix(
         t.fix_pr = Some(fix_pr);
         save(state, team_id, &full, &seed.sha, &rec).await;
     }
-    let _ = gh
-        .create_issue_comment(&seed.owner, &seed.repo, seed.pr, &a.reply())
-        .await;
+    let _ = crate::passes::conversation::github(
+        gh,
+        &seed.owner,
+        &seed.repo,
+        seed.pr,
+        common::conversation::Say::note("e2e-attribution", a.reply()),
+    )
+    .await;
     if let Some(l) = a.blocked_line() {
         note_blocked(state, team_id, &seed.run_id, &l).await;
     }

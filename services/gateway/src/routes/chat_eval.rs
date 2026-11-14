@@ -20,6 +20,16 @@
 //! ```text
 //! CHAT_EVAL_API_KEY=... cargo test -p gateway live_chat_eval -- --ignored --nocapture
 //! ```
+//!
+//! The work cases ([`WORK_CASES`]) ask about the team's own work: "what's
+//! the latest on <a ticket's title>", "what's running now", "is <CVE> fixed
+//! in <repo>", "why did the run for <key> stop", "which infra findings are
+//! open", and a ticket of another team the asker can't see. They run the
+//! real loop and the real lookups ([`WorkBox`]: the runs, tickets, pull
+//! requests and findings code of `chat_work_*`) over an in-memory store that
+//! holds two teams, and pass only when the answer looked where the answer
+//! lives, cites those records, states their facts and dates, and says
+//! nothing of the other team. `live_work_eval` runs them against the model.
 
 use super::brain::system_prompt;
 use super::chat_agent::testing::{CodeBox, Recorder};
@@ -347,6 +357,415 @@ pub async fn ask(
             messages: opening(repos, case.question),
             question: case.question,
             limits: LIMITS,
+            must_look: None,
+        },
+    )
+    .await
+    .unwrap_or_else(|_| panic!("{}: the model couldn't be reached", case.name));
+    (out, sink)
+}
+
+// ── The team's work ────────────────────────────────────────────────────────
+
+use super::chat_agent::{Called, Sink, Toolbox};
+use super::chat_work::{self as work, Found};
+use super::chat_work_runs as runs;
+use aws_sdk_dynamodb::types::AttributeValue;
+use serde_json::Value;
+
+/// The asker's team, and another one whose records must never show.
+pub const TEAM: &str = "TEAM#northwind";
+pub const OTHER_TEAM: &str = "TEAM#elsewhere";
+/// The ticket the report's question is about, by its title.
+pub const TITLE: &str = "Embed the booking portal on the signup pages";
+
+fn run_item(
+    team: &str,
+    id: &str,
+    status: &str,
+    ticket: &str,
+    title: &str,
+    extra: &[(&str, &str)],
+) -> (String, runs::Item) {
+    let mut i: runs::Item = std::collections::HashMap::from([
+        ("run_id".to_string(), AttributeValue::S(id.into())),
+        ("status".to_string(), AttributeValue::S(status.into())),
+        (
+            "ticket_source".to_string(),
+            AttributeValue::S("jira".into()),
+        ),
+        ("ticket_id".to_string(), AttributeValue::S(ticket.into())),
+        ("title".to_string(), AttributeValue::S(title.into())),
+        ("repo".to_string(), AttributeValue::S(WEB.into())),
+    ]);
+    for (k, v) in extra {
+        i.insert(k.to_string(), AttributeValue::S(v.to_string()));
+    }
+    (team.to_string(), i)
+}
+
+/// Two teams' runs, tickets, pull requests and findings.
+pub struct WorkStore {
+    pub runs: Vec<(String, runs::Item)>,
+    pub issues: Vec<(String, Value)>,
+    pub prs: Vec<(String, Value)>,
+    pub security: Vec<(String, Value)>,
+    pub infra: Vec<(String, Value)>,
+}
+
+pub fn work_store() -> WorkStore {
+    WorkStore {
+        runs: vec![
+            run_item(TEAM, "01JC0000000000000000000005", "running", "HAR-31", "Add a waitlist to full slips",
+                &[("current_pass", "implement"), ("created_at", "2026-11-14T09:00:00Z"), ("updated_at", "2026-11-14T09:20:00Z")]),
+            run_item(TEAM, "01JC0000000000000000000004", "awaiting_ci", "HAR-27", "Embed the booking portal on the signup pages",
+                &[("current_pass", "ci_fix"), ("created_at", "2026-11-11T15:00:00Z"), ("updated_at", "2026-11-12T10:05:00Z"),
+                  ("pr_url", "https://github.com/northwind/harbor-web/pull/88")]),
+            run_item(TEAM, "01JC0000000000000000000003", "failed", "HAR-12", "Refund the deposit on early cancellations",
+                &[("created_at", "2026-11-09T08:00:00Z"), ("updated_at", "2026-11-09T08:40:00Z"),
+                  ("error_message", "The tests failed twice: refundService.test.ts expects 48 hours and the change used 24")]),
+            run_item(OTHER_TEAM, "01JC0000000000000000000002", "running", "OTH-9", "Move the secret billing export",
+                &[("created_at", "2026-11-14T08:00:00Z")]),
+        ],
+        issues: vec![
+            (TEAM.into(), json!({"key": "HAR-27", "summary": TITLE, "status": "In Review", "type": "Story",
+                "assignee": "Dana Ruiz", "priority": "High", "updated": "2026-11-12T10:00:00.000+0000",
+                "comments": [{"author": "Dana Ruiz", "created": "2026-11-12T09:58:00.000+0000", "text": "PR is up, waiting on CI."}],
+                "links": [{"title": "PR #88", "url": "https://github.com/northwind/harbor-web/pull/88"}]})),
+            (TEAM.into(), json!({"key": "HAR-12", "summary": "Refund the deposit on early cancellations", "status": "In Progress",
+                "assignee": "", "updated": "2026-11-09T08:41:00.000+0000"})),
+            (OTHER_TEAM.into(), json!({"key": "OTH-9", "summary": "Move the secret billing export", "status": "To Do",
+                "updated": "2026-11-14T08:00:00.000+0000"})),
+        ],
+        prs: vec![
+            (TEAM.into(), json!({"number": 88, "title": "HAR-27: Embed the booking portal on the signup pages", "state": "open",
+                "draft": false, "user": {"login": "coderhelm"}, "head": {"ref": "coderhelm/har-27", "sha": "abc"},
+                "created_at": "2026-11-11T16:00:00Z", "updated_at": "2026-11-12T10:04:00Z",
+                "html_url": "https://github.com/northwind/harbor-web/pull/88"})),
+        ],
+        security: vec![
+            (TEAM.into(), json!({"id": "sf1", "repo": WEB, "package": "next", "version": "15.0.0", "fixed_version": "15.0.4",
+                "advisory": {"ids": ["CVE-2026-1234", "GHSA-ab12-cd34-ef56"], "primary": "CVE-2026-1234", "title": "Cache poisoning"},
+                "status": "fixed", "updated_at": "2026-11-08T12:00:00Z",
+                "pr": {"number": 80, "url": "https://github.com/northwind/harbor-web/pull/80", "state": "merged"}})),
+            (TEAM.into(), json!({"id": "sf2", "repo": API, "package": "express", "version": "4.19.2",
+                "advisory": {"ids": ["CVE-2026-5678"], "primary": "CVE-2026-5678", "title": "Open redirect"},
+                "status": "open", "updated_at": "2026-11-10T12:00:00Z"})),
+        ],
+        infra: vec![
+            (TEAM.into(), json!({"id": "if1", "title": "Load balancer allows TLS 1.0", "severity": "high", "status": "open", "updated_at": "2026-11-13T00:00:00Z"})),
+            (TEAM.into(), json!({"id": "if2", "title": "Database snapshot is public", "severity": "critical", "status": "pr_open", "updated_at": "2026-11-12T00:00:00Z"})),
+            (TEAM.into(), json!({"id": "if3", "title": "Old container image", "severity": "low", "status": "fixed", "updated_at": "2026-11-01T00:00:00Z"})),
+            (OTHER_TEAM.into(), json!({"id": "if9", "title": "Secret bucket open", "severity": "critical", "status": "open", "updated_at": "2026-11-14T00:00:00Z"})),
+        ],
+    }
+}
+
+/// Chat's work tools over the store, as one team's asker with what they may
+/// read: the same matching, records and citations as production.
+pub struct WorkBox<'a> {
+    pub store: &'a WorkStore,
+    pub team: String,
+    pub readable: Vec<&'static str>,
+    pub defs: Vec<Value>,
+}
+
+impl<'a> WorkBox<'a> {
+    pub fn new(store: &'a WorkStore, team: &str, readable: Vec<&'static str>) -> Self {
+        let defs = work::defs(&readable, &[API.to_string(), WEB.to_string()], true);
+        WorkBox {
+            store,
+            team: team.into(),
+            readable,
+            defs,
+        }
+    }
+
+    fn mine<T: Clone>(&self, rows: &[(String, T)]) -> Vec<T> {
+        rows.iter()
+            .filter(|(t, _)| *t == self.team)
+            .map(|(_, r)| r.clone())
+            .collect()
+    }
+
+    fn find(&self, name: &str, input: &Value) -> Result<(Vec<Found>, &'static str), String> {
+        let kind_ok = |k: &str| work::may(&self.readable, k);
+        let runs_of = |ask: &runs::RunAsk| -> Vec<Found> {
+            let mut items = self.mine(&self.store.runs);
+            items.sort_by(|a, b| {
+                let id = |i: &runs::Item| {
+                    i.get("run_id")
+                        .and_then(|v| v.as_s().ok())
+                        .cloned()
+                        .unwrap_or_default()
+                };
+                id(b).cmp(&id(a))
+            });
+            runs::best(&items, ask, runs::MAX_RESULTS)
+                .into_iter()
+                .map(runs::record)
+                .collect()
+        };
+        match name {
+            work::RUNS if kind_ok("runs") => Ok((
+                runs_of(&runs::RunAsk::from_input(input, chrono::Utc::now())),
+                "runs",
+            )),
+            work::TICKETS if kind_ok("tickets") => {
+                use super::chat_work_tickets as t;
+                let key = input["key"].as_str().map(|k| k.to_ascii_uppercase());
+                let words = work::words_of(input["query"].as_str().unwrap_or(""));
+                let mut ask = runs::RunAsk::default();
+                match &key {
+                    Some(k) => ask.ticket = Some(k.to_lowercase()),
+                    None => ask.words = words.clone(),
+                }
+                let found_runs = runs_of(&ask);
+                let keys = t::keys_of(&found_runs);
+                let issues: Vec<Value> = self
+                    .mine(&self.store.issues)
+                    .into_iter()
+                    .filter(|i| {
+                        let k = i["key"].as_str().unwrap_or("");
+                        let title = i["summary"].as_str().unwrap_or("").to_lowercase();
+                        key.as_deref() == Some(k)
+                            || keys.iter().any(|x| x == k)
+                            || (!words.is_empty()
+                                && words.iter().filter(|w| title.contains(w.as_str())).count() * 2
+                                    >= words.len())
+                    })
+                    .collect();
+                let site = "https://northwind.atlassian.net";
+                Ok((
+                    issues
+                        .iter()
+                        .map(|i| t::from_jira(i, site, &found_runs))
+                        .collect(),
+                    "tickets",
+                ))
+            }
+            work::PULL_REQUESTS if kind_ok("pull_requests") => {
+                let ticket = input["ticket"].as_str().unwrap_or("").to_lowercase();
+                let words = work::words_of(input["query"].as_str().unwrap_or(""));
+                let number = input["number"].as_u64();
+                let prs = self.mine(&self.store.prs).into_iter().filter(|p| {
+                    let title = p["title"].as_str().unwrap_or("").to_lowercase();
+                    number.is_some_and(|n| p["number"].as_u64() == Some(n))
+                        || (!ticket.is_empty() && title.contains(&ticket))
+                        || (!words.is_empty()
+                            && words.iter().filter(|w| title.contains(w.as_str())).count() * 2
+                                >= words.len())
+                });
+                let checks = json!({"check_runs": [{"name": "build", "status": "completed", "conclusion": "success"},
+                    {"name": "e2e", "status": "in_progress"}]});
+                let reviews =
+                    json!([{"user": {"login": "coderhelm-reviewer"}, "state": "APPROVED"}]);
+                Ok((
+                    prs.map(|p| {
+                        super::chat_work_prs::record(WEB, &p, Some(&checks), Some(&reviews))
+                    })
+                    .collect(),
+                    "pull requests",
+                ))
+            }
+            work::FINDINGS => {
+                let k = input["kind"].as_str().unwrap_or("");
+                if !kind_ok(k) {
+                    return Err(
+                        "Your role can't see these in the dashboard, so Chat doesn't read them."
+                            .into(),
+                    );
+                }
+                let ask = super::chat_work_records::RecordAsk::from_input(input, "open");
+                let rows = match k {
+                    "security" => self.mine(&self.store.security),
+                    "infra" => self.mine(&self.store.infra),
+                    _ => Vec::new(),
+                };
+                Ok((super::chat_work_records::pick(k, &rows, &ask), "findings"))
+            }
+            _ => {
+                Err("Your role can't see these in the dashboard, so Chat doesn't read them.".into())
+            }
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Toolbox for WorkBox<'_> {
+    fn defs(&self) -> &[Value] {
+        &self.defs
+    }
+    async fn call(
+        &mut self,
+        reg: &mut Registry,
+        _sink: &dyn Sink,
+        name: &str,
+        input: &Value,
+    ) -> Called {
+        let (text, summary, is_error) = match self.find(name, input) {
+            Ok((found, noun)) => work::register(reg, found, noun, ""),
+            Err(e) => (e, "Not allowed".into(), true),
+        };
+        Called::Done {
+            text,
+            label: work::label(name, input),
+            summary,
+            is_error,
+            kind: "work".into(),
+        }
+    }
+}
+
+/// One question about the team's work and what a good answer does.
+pub struct WorkCase {
+    pub name: &'static str,
+    pub question: &'static str,
+    /// Every one of these tools is called.
+    pub uses_all: &'static [&'static str],
+    /// The answer cites a source of each of these kinds.
+    pub cites: &'static [&'static str],
+    /// Facts the answer states (any one spelling of each).
+    pub facts: &'static [&'static [&'static str]],
+    /// Words that must never appear (another team's records).
+    pub never: &'static [&'static str],
+}
+
+pub const WORK_CASES: &[WorkCase] = &[
+    WorkCase {
+        name: "the latest on a ticket by its title",
+        question:
+            "What's the latest on \u{201c}Embed the booking portal on the signup pages\u{201d}?",
+        uses_all: &[work::TICKETS, work::PULL_REQUESTS, work::RUNS],
+        cites: &["ticket", "pull_request", "run"],
+        facts: &[
+            &["HAR-27"],
+            &["in review"],
+            &["#88", "pull request 88", "pr 88"],
+            &["2026-11-12", "nov 12", "november 12"],
+            &["checks", "ci"],
+        ],
+        never: &["OTH-9", "billing export"],
+    },
+    WorkCase {
+        name: "what is running now",
+        question: "What's running now?",
+        uses_all: &[work::RUNS],
+        cites: &["run"],
+        facts: &[&["waitlist"], &["HAR-31"]],
+        never: &["OTH-9", "billing export"],
+    },
+    WorkCase {
+        name: "is a CVE fixed in a repository",
+        question: "Is CVE-2026-1234 fixed in harbor-web?",
+        uses_all: &[work::FINDINGS],
+        cites: &["finding"],
+        facts: &[&["fixed"], &["15.0.4", "#80", "pull/80"]],
+        never: &[],
+    },
+    WorkCase {
+        name: "why a run stopped",
+        question: "Why did the run for HAR-12 stop?",
+        uses_all: &[work::RUNS],
+        cites: &["run"],
+        facts: &[&["tests failed"], &["48"]],
+        never: &[],
+    },
+    WorkCase {
+        name: "which infra findings are open",
+        question: "Which infra findings are open?",
+        uses_all: &[work::FINDINGS],
+        cites: &["finding"],
+        facts: &[&["TLS 1.0"], &["snapshot"]],
+        never: &["Old container image", "Secret bucket"],
+    },
+    WorkCase {
+        name: "a ticket the asker can't see",
+        question: "What's the latest on OTH-9?",
+        uses_all: &[work::TICKETS],
+        cites: &[],
+        facts: &[],
+        never: &["billing export", "To Do"],
+    },
+];
+
+/// Why an answer failed its work case (empty when it passed).
+pub fn grade_work(case: &WorkCase, out: &Answered) -> Vec<String> {
+    let mut why = Vec::new();
+    for t in case.uses_all {
+        if !out.calls.iter().any(|c| c == t) {
+            why.push(format!("didn't call {t} (called {:?})", out.calls));
+        }
+    }
+    for k in case.cites {
+        if !out.fin.citations.iter().any(|c| c.kind == *k) {
+            why.push(format!("cites no {k}"));
+        }
+    }
+    if !case.cites.is_empty() && !out.fin.grounded {
+        why.push("the answer cites nothing".into());
+    }
+    let text = out.fin.text.to_lowercase();
+    for fact in case.facts {
+        if !fact.iter().any(|f| text.contains(&f.to_lowercase())) {
+            why.push(format!("doesn't say {}", fact.join(" / ")));
+        }
+    }
+    let everything = format!(
+        "{} {}",
+        out.fin.text,
+        out.fin
+            .citations
+            .iter()
+            .map(|c| format!("{} {}", c.title, c.passage))
+            .collect::<Vec<_>>()
+            .join(" ")
+    )
+    .to_lowercase();
+    for w in case.never {
+        if everything.contains(&w.to_lowercase()) {
+            why.push(format!("says {w}, another team's"));
+        }
+    }
+    why
+}
+
+/// Runs one work case through the real answer loop, as Chat builds it
+/// (hint note, tools put first, the must-look check).
+pub async fn ask_work(
+    model: &dyn chat_agent::Model,
+    store: &WorkStore,
+    readable: Vec<&'static str>,
+    case: &WorkCase,
+) -> (Answered, Recorder) {
+    let mut tb = WorkBox::new(store, TEAM, readable);
+    let hints = super::chat_hints::read(case.question);
+    work::put_first(&mut tb.defs, &hints);
+    let offered: Vec<&str> = tb.defs.iter().filter_map(|t| t["name"].as_str()).collect();
+    let notes = work::hint_note(&hints, &offered);
+    let must_look = hints.about_work().then(|| chat_agent::MustLook {
+        tools: work::STATUS_TOOLS
+            .iter()
+            .filter(|t| offered.contains(t))
+            .map(|t| t.to_string())
+            .collect(),
+        what: "the team's tickets, pull requests and Coderhelm's runs".into(),
+    });
+    let sink = Recorder::default();
+    let mut reg = Registry::default();
+    let (_, repos) = fixture();
+    let out = chat_agent::run(
+        model,
+        &mut tb,
+        &sink,
+        &mut reg,
+        Ask {
+            system: system_prompt(&repos, true),
+            messages: vec![json!({"role": "user", "content": [{"type": "text", "text":
+                format!("<sources>\n(no knowledge passages matched this question)</sources>\n{notes}\nQuestion: {}", case.question)}]})],
+            question: case.question,
+            limits: LIMITS,
+            must_look,
         },
     )
     .await
@@ -358,6 +777,7 @@ pub async fn ask(
 mod tests {
     use super::*;
     use crate::routes::chat_agent::testing::{calls, id_for, last_result, say, Scripted, Step};
+    use crate::routes::chat_agent::Toolbox;
 
     /// The way a good answer goes, played by a scripted model: the loop,
     /// tools, sources and graders are real.
@@ -493,6 +913,261 @@ mod tests {
         let p = system_prompt(&repos, true);
         assert!(p.contains("northwind/harbor-api (main), the backend repository"));
         assert!(p.contains("Never hand work back"));
+    }
+
+    /// The source ids of `kind` in every tool result sent so far.
+    fn ids_of(body: &serde_json::Value, kind: &str) -> Vec<String> {
+        let all = body["messages"].to_string().replace("\\\"", "\"");
+        let needle = format!("kind=\"{kind}\"");
+        let mut out: Vec<String> = Vec::new();
+        for part in all.split("<source id=\"").skip(1) {
+            let id = part.split('"').next().unwrap_or("").to_string();
+            if part.contains(&needle) && part.find(&needle) < part.find('>') && !out.contains(&id) {
+                out.push(id);
+            }
+        }
+        out
+    }
+
+    fn all_kinds() -> Vec<&'static str> {
+        work::KINDS.iter().map(|k| k.key).collect()
+    }
+
+    /// A good answer's way through each work case, played by a scripted
+    /// model over the real lookups.
+    fn work_script(case: &WorkCase) -> Vec<Step> {
+        match case.name {
+            "the latest on a ticket by its title" => vec![
+                Box::new(|_| calls("a", work::TICKETS, json!({"query": TITLE}))),
+                Box::new(|_| calls("b", work::PULL_REQUESTS, json!({"ticket": "HAR-27"}))),
+                Box::new(|_| calls("c", work::RUNS, json!({"ticket": "HAR-27"}))),
+                Box::new(|b| {
+                    let (t, p, r) = (
+                        &ids_of(b, "ticket")[0],
+                        &ids_of(b, "pull_request")[0],
+                        &ids_of(b, "run")[0],
+                    );
+                    say(&format!(
+                        "HAR-27 is In Review, assigned to Dana Ruiz, last changed 2026-11-12 [{t}]. Its pull request #88 is open: \
+                         the build passed and the e2e checks are still running, with an approval [{p}]. Coderhelm's run on it is \
+                         waiting on the pull request's CI checks, last updated 2026-11-12 [{r}]."
+                    ))
+                }),
+            ],
+            "what is running now" => vec![
+                Box::new(|_| calls("a", work::RUNS, json!({"status": "active"}))),
+                Box::new(|b| {
+                    let r = ids_of(b, "run");
+                    say(&format!(
+                        "Two runs are active: HAR-31 \"Add a waitlist to full slips\" is working now, in the implement step [{}]; \
+                         HAR-27 is waiting on its pull request's checks [{}].",
+                        r[0], r[1]
+                    ))
+                }),
+            ],
+            "is a CVE fixed in a repository" => vec![
+                Box::new(|_| {
+                    calls(
+                        "a",
+                        work::FINDINGS,
+                        json!({"kind": "security", "query": "CVE-2026-1234", "repo": "harbor-web", "state": "any"}),
+                    )
+                }),
+                Box::new(|b| {
+                    let f = &ids_of(b, "finding")[0];
+                    say(&format!("Yes. CVE-2026-1234 in next is fixed in harbor-web: it moved to 15.0.4 in pull request #80, merged [{f}]."))
+                }),
+            ],
+            "why a run stopped" => vec![
+                Box::new(|_| calls("a", work::RUNS, json!({"ticket": "HAR-12"}))),
+                Box::new(|b| {
+                    let r = &ids_of(b, "run")[0];
+                    say(&format!(
+                        "It failed on 2026-11-09: the tests failed twice, because refundService.test.ts expects 48 hours and the \
+                         change used 24 [{r}]."
+                    ))
+                }),
+            ],
+            "which infra findings are open" => vec![
+                Box::new(|_| calls("a", work::FINDINGS, json!({"kind": "infra"}))),
+                Box::new(|b| {
+                    let f = ids_of(b, "finding");
+                    say(&format!(
+                        "Two are open: the load balancer allows TLS 1.0 (high) [{}], and a database snapshot is public \
+                         (critical), with a fix pull request open [{}].",
+                        f[0], f[1]
+                    ))
+                }),
+            ],
+            _ => vec![
+                Box::new(|_| calls("a", work::TICKETS, json!({"key": "OTH-9"}))),
+                Box::new(|_| calls("b", work::RUNS, json!({"ticket": "OTH-9"}))),
+                Box::new(|_| {
+                    say("I looked for OTH-9 in the team's tickets and Coderhelm's runs and found no ticket by that key that you can see.")
+                }),
+            ],
+        }
+    }
+
+    #[tokio::test]
+    async fn offline_every_work_case_passes_with_a_good_trajectory() {
+        let store = work_store();
+        for case in WORK_CASES {
+            let model = Scripted::new(work_script(case), vec![r#"{"hands_back": false}"#]);
+            let (out, _) = ask_work(&model, &store, all_kinds(), case).await;
+            let why = grade_work(case, &out);
+            assert!(why.is_empty(), "{}: {why:?}\n{}", case.name, out.fin.text);
+            // Every record cited links somewhere: its page or the original.
+            for c in &out.fin.citations {
+                assert!(
+                    c.href.is_some() || c.url.is_some(),
+                    "{}: {} has no link",
+                    case.name,
+                    c.title
+                );
+            }
+        }
+    }
+
+    /// The report: Chat searched the code and docs, said it found nothing,
+    /// and never looked at the ticket, its pull requests or the runs.
+    #[tokio::test]
+    async fn offline_the_reported_answer_fails_before_and_is_sent_back_after() {
+        let store = work_store();
+        let case = &WORK_CASES[0];
+        let reported = "I couldn't find anything on that in the team's docs, code or website content, so I can't give you a status.";
+        // Before: no must-look check (the loop as it was) keeps that answer.
+        let model = Scripted::new(
+            vec![Box::new(move |_| say(reported))],
+            vec![r#"{"hands_back": false}"#],
+        );
+        let mut tb = WorkBox::new(&store, TEAM, all_kinds());
+        let mut reg = Registry::default();
+        let before = chat_agent::run(
+            &model,
+            &mut tb,
+            &Recorder::default(),
+            &mut reg,
+            Ask {
+                system: "test".into(),
+                messages: vec![
+                    json!({"role": "user", "content": [{"type": "text", "text": case.question}]}),
+                ],
+                question: case.question,
+                limits: LIMITS,
+                must_look: None,
+            },
+        )
+        .await
+        .unwrap();
+        let why = grade_work(case, &before);
+        assert!(
+            why.iter().any(|w| w.contains("didn't call work_tickets")),
+            "{why:?}"
+        );
+        assert!(!before.rechecked);
+        // After: the same first answer is sent back in code (the model's
+        // check isn't even asked), and the answer looks where it lives.
+        let mut steps: Vec<Step> = vec![Box::new(move |_| say(reported))];
+        steps.extend(work_script(case));
+        let model = Scripted::new(steps, vec![r#"{"hands_back": false}"#]);
+        let (after, sink) = ask_work(&model, &store, all_kinds(), case).await;
+        assert!(after.rechecked);
+        assert!(
+            grade_work(case, &after).is_empty(),
+            "{:?}\n{}",
+            grade_work(case, &after),
+            after.fin.text
+        );
+        let bodies = model.bodies.lock().unwrap();
+        let nudged = bodies[1]["messages"].to_string();
+        assert!(
+            nudged.contains("didn't look where the answer would")
+                && nudged.contains("work_tickets"),
+            "{nudged}"
+        );
+        // The first turn already pointed at the ticket.
+        let first = bodies[0]["messages"].to_string();
+        assert!(first.contains("work_tickets with query"), "{first}");
+        assert_eq!(bodies[0]["tools"][0]["name"], work::TICKETS);
+        assert!(sink.kinds().contains(&"step".to_string()));
+    }
+
+    #[tokio::test]
+    async fn offline_another_teams_records_never_show_and_a_role_reads_only_what_it_sees() {
+        let store = work_store();
+        // Another team's running run and open infra finding stay out.
+        let model = Scripted::new(
+            vec![
+                Box::new(|_| calls("a", work::RUNS, json!({"status": "active"}))),
+                Box::new(|_| say("ok")),
+            ],
+            vec![],
+        );
+        let (_, sink) = ask_work(&model, &store, all_kinds(), &WORK_CASES[1]).await;
+        let seen = format!("{:?}", sink.0.lock().unwrap());
+        assert!(seen.contains("HAR-31") && !seen.contains("OTH-9"), "{seen}");
+        // A role that can't see infrastructure findings isn't offered them,
+        // and a call anyway reads nothing.
+        let mut tb = WorkBox::new(&store, TEAM, vec!["runs", "tickets"]);
+        assert!(!tb.defs.iter().any(|t| t["name"] == work::FINDINGS));
+        let mut reg = Registry::default();
+        let r = tb
+            .call(
+                &mut reg,
+                &Recorder::default(),
+                work::FINDINGS,
+                &json!({"kind": "infra"}),
+            )
+            .await;
+        match r {
+            Called::Done { is_error, text, .. } => {
+                assert!(is_error && text.contains("can't see"), "{text}")
+            }
+            Called::Stop(_) => panic!("stopped"),
+        }
+        assert!(reg.is_empty());
+    }
+
+    /// The work cases against the real model. Ignored unless asked for.
+    #[tokio::test]
+    #[ignore = "calls the real model: set CHAT_EVAL_API_KEY and run with --ignored"]
+    async fn live_work_eval() {
+        let key = std::env::var("CHAT_EVAL_API_KEY").expect("set CHAT_EVAL_API_KEY");
+        let model_id =
+            std::env::var("CHAT_EVAL_MODEL").unwrap_or_else(|_| "claude-sonnet-5-5".into());
+        let (meter, _) = common::usage::UsageMeter::memory("TEAM#eval");
+        let model = chat_agent::ApiModel {
+            http: reqwest::Client::new(),
+            api_key: key,
+            meter,
+            check_model_id: model_id.clone(),
+            model_id,
+            kind_of: crate::routes::brain::kind_of_tool,
+        };
+        let store = work_store();
+        let mut failed = Vec::new();
+        for case in WORK_CASES {
+            let (out, _) = ask_work(&model, &store, all_kinds(), case).await;
+            let why = grade_work(case, &out);
+            println!(
+                "\n=== {} ===\nQ: {}\ncalls: {:?}\nrechecked: {}\nA: {}\nverdict: {}",
+                case.name,
+                case.question,
+                out.calls,
+                out.rechecked,
+                out.fin.text,
+                if why.is_empty() {
+                    "PASS".to_string()
+                } else {
+                    format!("FAIL {why:?}")
+                }
+            );
+            if !why.is_empty() {
+                failed.push((case.name, why));
+            }
+        }
+        assert!(failed.is_empty(), "{failed:?}");
     }
 
     /// The same cases against the real model. Ignored unless asked for.

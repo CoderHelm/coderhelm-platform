@@ -493,29 +493,23 @@ async fn post_reply(
                 .and_then(|o| o.item)?;
             let url = Some(s(&config, "add_comment_url")).filter(|u| !u.is_empty())?;
             let site = s(&config, "site_url");
-            let payload = json!({
-                "issueKey": ticket,
-                "comment": run_questions::reply(author, answers, asked_at, false),
-                "commentType": "answer",
-                "title": "Answered in CoderHelm",
-            });
-            match state.http.post(&url).json(&payload).send().await {
-                Ok(r) if r.status().is_success() => {
-                    let id = r.json::<Value>().await.ok().and_then(|v| match &v["id"] {
-                        Value::String(s) => Some(s.clone()),
-                        Value::Number(n) => Some(n.to_string()),
-                        _ => None,
-                    });
-                    Some(jira_link(&site, &ticket, id.as_deref()))
-                }
-                Ok(r) => {
-                    warn!(
-                        run_id,
-                        status = r.status().as_u16(),
-                        "answer: Jira refused the reply"
-                    );
-                    None
-                }
+            let team = s(item, "team_id");
+            let say = common::conversation::Say::note(
+                "answer",
+                run_questions::reply(author, answers, asked_at, false),
+            );
+            match super::conversation::jira_at(
+                state,
+                &team,
+                &url,
+                &ticket,
+                say,
+                "answer",
+                "Answered in CoderHelm",
+            )
+            .await
+            {
+                Ok(spoke) => Some(jira_link(&site, &ticket, spoke.id())),
                 Err(e) => {
                     warn!(run_id, error = %e, "answer: Jira reply failed");
                     None
@@ -542,32 +536,12 @@ async fn post_reply(
                 .await
                 .map_err(|e| warn!(run_id, error = %e, "answer: no GitHub token for the reply"))
                 .ok()?;
-            let res = state
-                .http
-                .post(format!(
-                    "https://api.github.com/repos/{owner}/{name}/issues/{issue}/comments"
-                ))
-                .header("Authorization", format!("Bearer {token}"))
-                .header("Accept", "application/vnd.github+json")
-                .header("User-Agent", "Coderhelm-bot")
-                .json(&json!({ "body": run_questions::reply(author, answers, asked_at, true) }))
-                .send()
-                .await;
-            match res {
-                Ok(r) if r.status().is_success() => Some(
-                    r.json::<Value>()
-                        .await
-                        .ok()
-                        .and_then(|v| v["html_url"].as_str().map(str::to_string)),
-                ),
-                Ok(r) => {
-                    warn!(
-                        run_id,
-                        status = r.status().as_u16(),
-                        "answer: GitHub refused the reply"
-                    );
-                    None
-                }
+            let say = common::conversation::Say::note(
+                "answer",
+                run_questions::reply(author, answers, asked_at, true),
+            );
+            match super::conversation::github(state, &token, owner, name, issue, say).await {
+                Ok(spoke) => Some(super::conversation::github_url(owner, name, issue, &spoke)),
                 Err(e) => {
                     warn!(run_id, error = %e, "answer: GitHub reply failed");
                     None

@@ -381,7 +381,7 @@ impl Confluence<'_> {
             401 => Err(StepError::new(
                 "sign_in",
                 "Confluence didn't accept the email and token.",
-                "Paste a new API token in Settings → Integrations → Confluence.",
+                "Paste a new API token in Settings under Integrations, Confluence.",
             )),
             403 if app => Err(StepError::new(
                 "read",
@@ -543,7 +543,7 @@ impl Confluence<'_> {
         if !self.conn.may_write_page(id) {
             return Err(refused(
                 format!("Coderhelm may not write to page {id}."),
-                "An admin can allow it in Settings → Integrations → Confluence (writes on, and the page on the list). Put the text in your reply for a person to add.",
+                "An admin can allow it in Settings under Integrations, Confluence (writes on, and the page on the list). Put the text in your reply for a person to add.",
             ));
         }
         let text = text.trim();

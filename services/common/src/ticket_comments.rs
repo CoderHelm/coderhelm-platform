@@ -227,6 +227,10 @@ pub struct Comment {
     /// The comment's id in its tracker.
     pub comment_id: String,
     pub author: String,
+    /// The tracker's id of the author (Jira's account id): a reply to the
+    /// comment mentions them by it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub author_id: String,
     pub text: String,
     /// When CoderHelm received it (RFC 3339).
     pub at: String,
@@ -690,7 +694,10 @@ pub fn received_note(c: &Comment, ack: Ack) -> String {
 pub fn ticket_reply(done: &[(Action, Comment)], pr: Option<&str>) -> Option<String> {
     let said: Vec<String> = done
         .iter()
-        .filter(|(a, _)| matches!(a, Action::Stop | Action::Round | Action::Restart))
+        .filter(|(a, c)| {
+            matches!(a, Action::Stop | Action::Round | Action::Restart)
+                || (*a == Action::Fold && !c.question.trim().is_empty())
+        })
         .map(|(a, c)| {
             let pr = pr.filter(|p| !p.is_empty()).unwrap_or("the pull request");
             match (a, c.class, c.question.trim().is_empty()) {
@@ -706,6 +713,12 @@ pub fn ticket_reply(done: &[(Action, Comment)], pr: Option<&str>) -> Option<Stri
                      {pr}, and I say there what changed.",
                     who(c),
                     one_line(&c.question, 200)
+                ),
+                (Action::Fold, _, _) => format!(
+                    "{}'s answer to \"{}\": using it (\"{}\") in the plan I'm making now.",
+                    who(c),
+                    one_line(&c.question, 200),
+                    one_line(&c.text, 160)
                 ),
                 (Action::Round, _, _) => format!(
                     "{}'s comment (\"{}\"): I'm applying it on {pr} now, and I say there what \
@@ -1428,7 +1441,9 @@ mod tests {
         assert!(said.contains("https://example.test/pr/12"));
         // Left alone, folded or waiting: no reply.
         assert_eq!(ticket_reply(&[(Action::Leave, chat.clone())], pr), None);
-        assert_eq!(ticket_reply(&[(Action::Fold, answer.clone())], pr), None);
+        assert!(ticket_reply(&[(Action::Fold, answer.clone())], pr)
+            .unwrap()
+            .contains("in the plan I'm making now"));
         assert_eq!(ticket_reply(&[(Action::Defer, answer.clone())], pr), None);
         // The run page says what arrived and what was done with it.
         assert!(received_note(&answer, Ack::Reply).contains(

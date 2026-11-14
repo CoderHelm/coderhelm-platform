@@ -2,6 +2,13 @@
 //! again (bounded) until it answers; then check the answer doesn't hand the
 //! person work its tools could have done, and finalize the citations.
 //!
+//! Two checks run in code before the model's check: an answer that says it
+//! found nothing, to a question about the team's work (a ticket, a pull
+//! request, a run, "what's the latest"), when it never looked in the
+//! tickets, pull requests or runs ([`MustLook`]); and an answer that says it
+//! guessed a field name instead of reading the schema. Either is sent back
+//! once, like a hand-back.
+//!
 //! The loop knows three things only through traits, so the same code runs
 //! in production and in the Chat evals: the [`Model`] (the metered model
 //! calls in `model_call`), the [`Toolbox`] (Chat's tools behind the agent
@@ -95,6 +102,57 @@ pub struct Ask<'a> {
     pub messages: Vec<Value>,
     pub question: &'a str,
     pub limits: Limits,
+    /// Where this question's answer would be, when the question says so.
+    pub must_look: Option<MustLook>,
+}
+
+/// The tools a question's answer lives in (a status question: the tickets,
+/// pull requests and runs). An answer that says it found nothing without
+/// calling any of them is sent back once.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MustLook {
+    pub tools: Vec<String>,
+    /// Where to look, in a few words ("the ticket, its pull requests and runs").
+    pub what: String,
+}
+
+/// The note sent back when an answer found nothing without looking where
+/// the answer would be.
+pub fn look_there(what: &str, tools: &[String]) -> String {
+    format!(
+        "<check>Your answer says nothing was found, but you didn't look where the answer would \
+         be: {what}. Look there now with {}, then answer with citations. If those don't have it \
+         either, say which places you searched.</check>",
+        tools.join(", ")
+    )
+}
+
+/// The note sent back when an answer guessed a field or type name.
+pub const READ_THE_SCHEMA: &str = "<check>Your answer says it guessed a field, column or type \
+name. Don't guess: read the source's schema first (its describe, schema or mapping tool), then \
+query with the names it lists, and answer with citations.</check>";
+
+/// The checks made in code: `Some(note)` when the answer must look again.
+pub fn checked_in_code(
+    answer: &str,
+    must_look: Option<&MustLook>,
+    calls: &[String],
+    defs: &[Value],
+) -> Option<String> {
+    use super::chat_hints::{says_it_guessed, says_nothing_found};
+    if let Some(m) = must_look {
+        let offered: Vec<String> = m
+            .tools
+            .iter()
+            .filter(|t| defs.iter().any(|d| d["name"] == t.as_str()))
+            .cloned()
+            .collect();
+        let looked = calls.iter().any(|c| m.tools.contains(c));
+        if !offered.is_empty() && !looked && says_nothing_found(answer) {
+            return Some(look_there(&m.what, &offered));
+        }
+    }
+    says_it_guessed(answer).then(|| READ_THE_SCHEMA.to_string())
 }
 
 /// What the loop gives back.
@@ -189,6 +247,7 @@ pub async fn run(
         mut messages,
         question,
         limits,
+        must_look,
     } = ask;
     let mut used: Vec<Value> = Vec::new();
     let mut calls: Vec<String> = Vec::new();
@@ -240,14 +299,21 @@ pub async fn run(
         if t.stop != "tool_use" || tool_uses.is_empty() || must_answer {
             // An answer. Check it doesn't hand back work the tools can do.
             if has_tools && retries < limits.retries && !must_answer && !text.trim().is_empty() {
-                let verdict = model
-                    .ask(check_body(model.check_id(), question, &text, tools.defs()))
-                    .await
-                    .and_then(|r| read_check(&r));
-                if let Some(what) = verdict {
+                // In code first; the model's check only when that passes.
+                let note = match checked_in_code(&text, must_look.as_ref(), &calls, tools.defs()) {
+                    Some(note) => Some(note),
+                    None => model
+                        .ask(check_body(model.check_id(), question, &text, tools.defs()))
+                        .await
+                        .and_then(|r| read_check(&r))
+                        .map(|what| nudge(&what)),
+                };
+                if let Some(note) = note {
                     retries += 1;
-                    info!(what = %what, "Chat: answer handed work back; looking again");
-                    messages.push(json!({ "role": "user", "content": [{"type": "text", "text": nudge(&what)}] }));
+                    info!(note = %common::truncate_str(&note, 120), "Chat: the answer looks again");
+                    messages.push(
+                        json!({ "role": "user", "content": [{"type": "text", "text": note}] }),
+                    );
                     sink.send("text_reset", json!({})).await;
                     sink.send(
                         "step",
@@ -619,6 +685,7 @@ mod tests {
             messages: vec![json!({"role": "user", "content": [{"type": "text", "text": q}]})],
             question: q,
             limits: LIMITS,
+            must_look: None,
         }
     }
 

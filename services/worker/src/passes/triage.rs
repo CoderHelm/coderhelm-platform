@@ -727,7 +727,7 @@ pub async fn select_repo(
     let roles_section = {
         let mut lines: Vec<String> = repos
             .iter()
-            .filter_map(|r| roles.get(r).map(|role| format!("- {r} → {role}")))
+            .filter_map(|r| roles.get(r).map(|role| format!("- {r} to {role}")))
             .collect();
         lines.sort();
         if lines.is_empty() {
