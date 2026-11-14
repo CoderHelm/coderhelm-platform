@@ -189,12 +189,17 @@ pub mod handback;
 /// Work CoderHelm started on its own pull request and hasn't landed, and
 /// what a person's mention there does about it.
 pub mod held_work;
+/// Instructions written for a person's machine, read on Coderhelm: one rule
+/// and one capability catalogue for every reader.
+pub mod host_steps;
 pub mod jira_text;
 /// A lockfile out of sync with its manifest: read from a log, repaired by
 /// code with the package manager's own command, never written by a model.
 pub mod lockfile_sync;
 /// Anthropic API or Amazon Bedrock, and Bedrock's model ids.
 pub mod model_provider;
+/// Files a run keeps as its outputs (reports, tables, snapshots).
+pub mod outputs;
 /// Plugins: packages of skills, agents, tools, triggers and outputs a team installs.
 pub mod plugins;
 /// One shape for "something is wrong": set by a check, cleared by the same

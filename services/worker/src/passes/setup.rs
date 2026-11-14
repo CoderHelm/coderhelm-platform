@@ -252,7 +252,7 @@ async fn ai_read(
     let answer = crate::agent::anthropic::converse_json(
         &provider.client(),
         &state.config.light_model_id,
-        ai::SYSTEM,
+        &ai::system(&super::skill_run::standard_caps()),
         &prompt,
         &ai::output_schema(),
         true,

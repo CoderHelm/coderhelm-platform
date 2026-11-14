@@ -92,9 +92,12 @@ fn enough_runway(remaining: Duration, estimate: Duration) -> bool {
 const PRESIGNED_URL_TTL: Duration = Duration::from_secs(20 * 60);
 
 /// Build env vars the worker sets; a repo's codegen env can't override them.
-const RESERVED_ENV: [&str; 11] = [
+const RESERVED_ENV: [&str; 13] = [
     "SANDBOX_GET_URL",
     "SANDBOX_PUT_URL",
+    // A script run's command and the one-time URL of its GitHub token.
+    "SCRIPT_CMD",
+    "SANDBOX_SECRET_URL",
     "CHECKS_CMD",
     "CODEGEN_CMD",
     "NODE_VERSION",
@@ -348,6 +351,102 @@ pub fn read_changed_tar(
 /// A codegen build's changed-files archive, read with the worker's caps.
 pub fn read_archive(bytes: &[u8]) -> Result<Captured, Box<dyn std::error::Error + Send + Sync>> {
     read_changed_tar(bytes, MAX_CODEGEN_FILES, MAX_CODEGEN_FILE_BYTES)
+}
+
+const MARKER_SCRIPT_START: &str = "===CODERHELM_SCRIPT_START===";
+const MARKER_SCRIPT_END: &str = "CODERHELM_SCRIPT_END exit=";
+const MARKER_SCRIPT_UPLOADED: &str = "===CODERHELM_SCRIPT_UPLOADED===";
+/// A script run keeps at most this many output files, each this large.
+pub const MAX_SCRIPT_FILES: usize = common::outputs::MAX_FILES;
+pub const MAX_SCRIPT_FILE_BYTES: u64 = common::outputs::MAX_BYTES as u64;
+
+/// What a script run in the sandbox came to.
+#[derive(Debug, Default)]
+pub struct ScriptOutcome {
+    /// The script ran (its end marker was printed).
+    pub ran: bool,
+    pub exit_code: Option<i32>,
+    /// The tail of what it printed, or why it didn't run. The caller
+    /// redacts any secret it was given before showing it.
+    pub output: String,
+    /// The files it wrote to `$CODERHELM_OUT`, relative to that folder.
+    pub files: Vec<(String, String)>,
+    /// Files it wrote that couldn't be brought back, each with why.
+    pub dropped: Vec<String>,
+}
+
+/// One script run: the files it runs from, the command, and the secret it
+/// may read once.
+pub struct ScriptRun<'r> {
+    /// Unique per run of a script: the S3 folder of its objects.
+    pub key: &'r str,
+    /// A tar.gz whose single top folder holds the script and its files.
+    pub source: Vec<u8>,
+    pub cmd: &'r str,
+    /// A read-only GitHub token, handed to the build through a one-time
+    /// object (never in the build's environment or log); deleted when the
+    /// build ends.
+    pub secret: Option<&'r str>,
+    /// Hosts the script needs beyond the team's allowlist (GitHub's API for
+    /// a script given a token).
+    pub hosts: Vec<String>,
+}
+
+/// The S3 keys of one script run: its source, its secret and its output.
+pub fn script_keys(key: &str) -> (String, String, String) {
+    let safe: String = key
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    (
+        format!("skill-run/{safe}/src.tgz"),
+        format!("skill-run/{safe}/secret"),
+        format!("skill-run/{safe}/out.tgz"),
+    )
+}
+
+/// What a finished script build came to, from its log and its outputs.
+pub fn script_outcome(log: &str, captured: Captured) -> ScriptOutcome {
+    let code = parse_marker_exit(log, MARKER_SCRIPT_END);
+    let window = {
+        let mut at = 0;
+        let mut start = None;
+        for line in log.split_inclusive('\n') {
+            if line.trim() == MARKER_SCRIPT_START {
+                start = Some(at + line.len());
+            }
+            at += line.len();
+        }
+        start.map(|s| &log[s..]).unwrap_or(log)
+    };
+    let window: String = window
+        .lines()
+        .filter(|l| {
+            let t = l.trim();
+            !t.contains(MARKER_SCRIPT_END) && t != MARKER_SCRIPT_UPLOADED
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    ScriptOutcome {
+        ran: code.is_some(),
+        exit_code: code,
+        output: if code.is_some() {
+            common::tail_str(&window, MAX_OUTPUT_CHARS).to_string()
+        } else {
+            format!(
+                "The sandbox build gave no result for the script.\n{}",
+                common::tail_str(log, MAX_OUTPUT_CHARS)
+            )
+        },
+        files: captured.files,
+        dropped: captured.dropped,
+    }
 }
 
 /// Thin driver over CodeBuild + S3 + CloudWatch Logs. Holds only borrows from
@@ -620,6 +719,169 @@ impl<'a> SandboxClient<'a> {
             .send()
             .await;
         outcome
+    }
+
+    /// Runs a script in the sandbox and brings back what it wrote to
+    /// `$CODERHELM_OUT`. Every object it used (its source, its secret, its
+    /// output) is deleted when the build ends, whatever happened.
+    pub async fn run_script(
+        &self,
+        run: ScriptRun<'_>,
+        deadline: Option<Instant>,
+    ) -> Result<ScriptOutcome, Box<dyn std::error::Error + Send + Sync>> {
+        if !self.is_enabled() {
+            return Ok(ScriptOutcome {
+                output: "The code sandbox isn't set up for this install.".into(),
+                ..Default::default()
+            });
+        }
+        if !self.has_time(deadline) {
+            return Ok(ScriptOutcome {
+                output: "Not enough time left in this pass to run a sandbox build.".into(),
+                ..Default::default()
+            });
+        }
+        let (src_key, secret_key, out_key) = script_keys(run.key);
+        let r = self
+            .script_build(&run, &src_key, &secret_key, &out_key, deadline)
+            .await;
+        for k in [&secret_key, &src_key, &out_key] {
+            let _ = self
+                .s3
+                .delete_object()
+                .bucket(self.bucket)
+                .key(k)
+                .send()
+                .await;
+        }
+        r
+    }
+
+    async fn script_build(
+        &self,
+        run: &ScriptRun<'_>,
+        src_key: &str,
+        secret_key: &str,
+        out_key: &str,
+        deadline: Option<Instant>,
+    ) -> Result<ScriptOutcome, Box<dyn std::error::Error + Send + Sync>> {
+        self.s3
+            .put_object()
+            .bucket(self.bucket)
+            .key(src_key)
+            .body(aws_sdk_s3::primitives::ByteStream::from(run.source.clone()))
+            .content_type("application/gzip")
+            .send()
+            .await
+            .map_err(|e| format!("sandbox: script upload failed: {e}"))?;
+        let mut env = vec![
+            env_var("SANDBOX_GET_URL", &self.presigned_get(src_key).await?)?,
+            env_var("SANDBOX_PUT_URL", &self.presigned_put(out_key).await?)?,
+            env_var("SCRIPT_CMD", run.cmd)?,
+        ];
+        if let Some(secret) = run.secret {
+            self.s3
+                .put_object()
+                .bucket(self.bucket)
+                .key(secret_key)
+                .body(aws_sdk_s3::primitives::ByteStream::from(
+                    secret.as_bytes().to_vec(),
+                ))
+                .content_type("text/plain")
+                .send()
+                .await
+                .map_err(|e| format!("sandbox: secret upload failed: {e}"))?;
+            env.push(env_var(
+                "SANDBOX_SECRET_URL",
+                &self.presigned_get(secret_key).await?,
+            )?);
+        }
+        if let Some(allow) = build_allowlist(self.egress.as_deref(), &run.hosts, true) {
+            use base64::Engine;
+            env.push(env_var("EGRESS_ALLOW", &allow)?);
+            env.push(env_var(
+                "EGRESS_PROXY_B64",
+                &base64::engine::general_purpose::STANDARD.encode(EGRESS_PROXY),
+            )?);
+        }
+        let started = self
+            .codebuild
+            .start_build()
+            .project_name(self.project)
+            .set_environment_variables_override(Some(env))
+            .send()
+            .await
+            .map_err(|e| format!("codebuild start_build (script) failed: {e}"))?;
+        let build_id = started
+            .build_value()
+            .and_then(|b| b.id())
+            .ok_or("codebuild returned no build id")?
+            .to_string();
+        info!(build_id = %build_id, "sandbox: script build started");
+        let poll_until = {
+            let by_max = Instant::now() + MAX_WAIT;
+            match deadline {
+                Some(dl) => (dl - DEADLINE_BUFFER).min(by_max),
+                None => by_max,
+            }
+        };
+        loop {
+            let builds = self
+                .codebuild
+                .batch_get_builds()
+                .ids(&build_id)
+                .send()
+                .await
+                .map_err(|e| format!("codebuild batch_get_builds failed: {e}"))?;
+            let build = builds.builds().first().ok_or("no build record")?;
+            let status = build.build_status();
+            if !matches!(status, Some(StatusType::InProgress)) {
+                let (group, stream) = build
+                    .logs()
+                    .and_then(|l| Some((l.group_name()?.to_string(), l.stream_name()?.to_string())))
+                    .unzip_or_default();
+                let captured = self.download_script_out(out_key).await;
+                let mut log = String::new();
+                for attempt in 0..4 {
+                    if !group.is_empty() {
+                        log = self.fetch_log(&group, &stream).await.unwrap_or_default();
+                    }
+                    if parse_marker_exit(&log, MARKER_SCRIPT_END).is_some() || attempt == 3 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                }
+                return Ok(script_outcome(&log, captured));
+            }
+            if Instant::now() >= poll_until {
+                warn!(build_id = %build_id, "sandbox: script deadline reached, stopping");
+                let _ = self.codebuild.stop_build().id(&build_id).send().await;
+                return Ok(ScriptOutcome {
+                    output: "The script was stopped: this pass's time ran out.".into(),
+                    ..Default::default()
+                });
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+
+    /// The files a script wrote, read with the outputs' caps (none when it
+    /// wrote nothing).
+    async fn download_script_out(&self, out_key: &str) -> Captured {
+        let Ok(obj) = self
+            .s3
+            .get_object()
+            .bucket(self.bucket)
+            .key(out_key)
+            .send()
+            .await
+        else {
+            return Captured::default();
+        };
+        let Ok(bytes) = obj.body.collect().await.map(|b| b.into_bytes()) else {
+            return Captured::default();
+        };
+        read_changed_tar(&bytes, MAX_SCRIPT_FILES, MAX_SCRIPT_FILE_BYTES).unwrap_or_default()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1551,5 +1813,21 @@ mod tests {
         assert!(sb.has_time(None));
         assert!(!sb.has_time(Some(Instant::now() + Duration::from_secs(81))));
         assert!(sb.has_time(Some(Instant::now() + Duration::from_secs(600))));
+    }
+
+    #[test]
+    fn a_script_run_reads_its_exit_and_output_and_says_when_it_gave_none() {
+        let log = "Running command echo \"===CODERHELM_SCRIPT_END exit=$CODE===\"\n===CODERHELM_SCRIPT_START===\nfetched 9\n===CODERHELM_SCRIPT_END exit=2===\n";
+        let o = script_outcome(log, Captured::default());
+        assert!(o.ran);
+        assert_eq!(o.exit_code, Some(2));
+        assert_eq!(o.output, "fetched 9");
+        let none = script_outcome("provisioning failed", Captured::default());
+        assert!(!none.ran && none.output.contains("no result"));
+        let (src, secret, out) = script_keys("run/1 x");
+        assert_eq!(src, "skill-run/run-1-x/src.tgz");
+        assert_eq!(secret, "skill-run/run-1-x/secret");
+        assert_eq!(out, "skill-run/run-1-x/out.tgz");
+        assert!(is_reserved_env("SANDBOX_SECRET_URL") && is_reserved_env("SCRIPT_CMD"));
     }
 }

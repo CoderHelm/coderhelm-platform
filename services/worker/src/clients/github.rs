@@ -710,6 +710,20 @@ pub fn actions_unreadable() -> String {
 }
 
 /// GitHub REST API client using installation token auth.
+/// The body that asks GitHub for a script's token: only these
+/// repositories, only reads.
+pub fn script_token_request(repos: &[String]) -> serde_json::Value {
+    serde_json::json!({
+        "repositories": repos,
+        "permissions": {
+            "contents": "read",
+            "metadata": "read",
+            "pull_requests": "read",
+            "issues": "read"
+        }
+    })
+}
+
 pub struct GitHubClient {
     app_id: String,
     private_key: String,
@@ -868,6 +882,56 @@ impl GitHubClient {
         &self,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         self.get_installation_token().await
+    }
+
+    /// A token for a script run in the sandbox: read-only (contents, pull
+    /// requests, issues, metadata), limited to `repos` (names in this
+    /// installation's account), never cached and never shared with the
+    /// worker's own calls. GitHub ends it after an hour at most; the caller
+    /// revokes it as soon as the script ends ([`Self::revoke_token`]). A
+    /// hybrid install whose broker issues tokens can't scope one this way.
+    pub async fn read_only_token(
+        &self,
+        repos: &[String],
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        if common::hybrid::client::github_via_broker(&self.private_key) {
+            return Err("this install's GitHub tokens come from its broker, which can't issue a read-only token for a script".into());
+        }
+        if repos.is_empty() {
+            return Err("name the repositories the script reads".into());
+        }
+        let jwt = self.generate_jwt()?;
+        let mut req = self
+            .http
+            .post(format!(
+                "{API_BASE}/app/installations/{}/access_tokens",
+                self.installation_id
+            ))
+            .header("Authorization", format!("Bearer {jwt}"))
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .json(&script_token_request(repos));
+        if let Some(mode) = common::stateless_s2s_token_mode() {
+            req = req.header(common::STATELESS_S2S_TOKEN_HEADER, mode);
+        }
+        let resp: TokenResponse = req.send().await?.error_for_status()?.json().await?;
+        Ok(resp.token)
+    }
+
+    /// Ends a token now (`DELETE /installation/token`, authenticated with
+    /// the token itself). Best effort: GitHub ends it within the hour anyway.
+    pub async fn revoke_token(&self, token: &str) {
+        let r = self
+            .http
+            .delete(format!("{API_BASE}/installation/token"))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .send()
+            .await;
+        if let Err(e) = r {
+            tracing::warn!(error = %e, "Could not revoke a script's GitHub token; it ends within the hour");
+        }
     }
 
     async fn get_installation_token(
@@ -5881,10 +5945,11 @@ mod body_limit_tests {
     fn every_push_is_seen_in_one_place() {
         let src = include_str!("github.rs");
         let code = &src[..src.find("#[cfg(test)]\nmod ").unwrap_or(src.len())];
-        // Three sends in all: `send_tracked`, and two reads that mint the
-        // installation's token and name the app. A fourth is a request that
-        // could move a branch unseen.
-        assert_eq!(code.matches(".send()").count(), 3);
+        // Five sends in all: `send_tracked`, two reads that mint the
+        // installation's token and name the app, and a script's read-only
+        // token minted and revoked (neither touches a branch). Another is a
+        // request that could move a branch unseen.
+        assert_eq!(code.matches(".send()").count(), 5);
         for raw in [
             "self.http.put(",
             "self.http.delete(",

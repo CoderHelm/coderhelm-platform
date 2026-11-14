@@ -1289,6 +1289,7 @@ pub mod habits;
 pub mod habits_check;
 pub mod health_check;
 pub mod hidden_suggest;
+mod host_steps_readers;
 /// Hosted side of hybrid: forward a held event to a self-hosted install again.
 pub mod hybrid_name_check;
 pub(crate) mod implement;
@@ -1395,6 +1396,7 @@ mod series;
 pub(crate) mod settle;
 pub mod setup;
 pub mod skill_compat;
+pub mod skill_run;
 pub mod skill_suggest;
 pub mod skills;
 pub mod skipped_checks;

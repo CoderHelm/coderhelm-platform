@@ -238,6 +238,14 @@ impl Basis {
 
 /// Hidden in a posted comment that doesn't hold the merge, so a later review
 /// knows the open thread is a question, not a requested change.
+/// What the reviewer reads that was written for a person's machine: the
+/// repository's guidance and the team's skills, reviewed against.
+pub const REVIEW_READERS: [common::host_steps::Reader; 3] = [
+    common::host_steps::Reader::Review,
+    common::host_steps::Reader::RepoGuidance,
+    common::host_steps::Reader::TeamItems,
+];
+
 pub const NON_BLOCKING_MARK: &str = "<!-- coderhelm:evidence=non-blocking -->";
 
 /// Whether an earlier CoderHelm comment, still open, holds the merge. A
@@ -1820,7 +1828,8 @@ pub async fn generate_review(
     let skills_context = skills.map(|s| s.prompt_section()).unwrap_or_default()
         + &web.map(|w| w.prompt_section()).unwrap_or_default()
         + &mcp.map(|m| m.prompt_section()).unwrap_or_default()
-        + &knowledge.map(|k| k.prompt_section()).unwrap_or_default();
+        + &knowledge.map(|k| k.prompt_section()).unwrap_or_default()
+        + &common::host_steps::section(&REVIEW_READERS, &super::skill_run::standard_caps());
     let prompt = review_user_prompt(
         title,
         pr_body,
