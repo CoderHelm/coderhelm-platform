@@ -3,6 +3,7 @@ use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
 };
+use common::deliveries::Clock;
 use hmac::{Hmac, Mac};
 use serde_json::Value;
 use sha2::Sha256;
@@ -191,6 +192,9 @@ pub async fn handle(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, StatusCode> {
+    // A refusal is timed from here; a handled event from when its handling
+    // starts (process_jira_payload), as GitHub's are.
+    let received = Clock::start();
     // Look up team by webhook token from jira-tokens table
     let token_item = state
         .dynamo
@@ -251,6 +255,7 @@ pub async fn handle(
             warn!(team_id, "Jira webhook: invalid HMAC signature");
             log_jira_event(
                 &state,
+                received,
                 &team_id,
                 "signature_rejected",
                 "",
@@ -384,6 +389,9 @@ async fn process_jira_payload(
     installation_id: u64,
     payload: &Value,
 ) -> Result<StatusCode, StatusCode> {
+    // The delivery's time: from here (the event checked and understood, on
+    // every path in: Jira, Forge, CoderHelm's relay) to its log line.
+    let started = Clock::start();
     let event_type = payload
         .get("webhookEvent")
         .and_then(|v| v.as_str())
@@ -393,7 +401,7 @@ async fn process_jira_payload(
 
     // ── Handle comment events ────────────────────────────────────────────────
     if event_type.contains("comment") {
-        return handle_jira_comment(state, team_id, installation_id, payload, issue).await;
+        return handle_jira_comment(state, started, team_id, installation_id, payload, issue).await;
     }
 
     // Repo mapping — now optional. When absent, triage will auto-pick the repo.
@@ -464,7 +472,10 @@ async fn process_jira_payload(
     if !has_label && !is_assigned {
         let tk = issue.get("key").and_then(|v| v.as_str()).unwrap_or("?");
         info!(ticket_key = %tk, label = %trigger_label, "Skipping — no trigger label or assignee match");
-        log_jira_event(state, team_id, event_type, tk, "", "filtered", None).await;
+        log_jira_event(
+            state, started, team_id, event_type, tk, "", "filtered", None,
+        )
+        .await;
         return Ok(StatusCode::OK);
     }
 
@@ -504,7 +515,10 @@ async fn process_jira_payload(
             if !enabled {
                 info!(project_key, "Skipping — Jira project not enabled");
                 let tk = issue.get("key").and_then(|v| v.as_str()).unwrap_or("?");
-                log_jira_event(state, team_id, event_type, tk, "", "filtered", None).await;
+                log_jira_event(
+                    state, started, team_id, event_type, tk, "", "filtered", None,
+                )
+                .await;
                 return Ok(StatusCode::OK);
             }
         }
@@ -636,6 +650,7 @@ async fn process_jira_payload(
             let repo_display = format!("{}/{}", pr.repo_owner, pr.repo_name);
             log_jira_event(
                 state,
+                started,
                 team_id,
                 event_type,
                 ticket_key,
@@ -653,6 +668,7 @@ async fn process_jira_payload(
         super::trigger_gate::TicketGate::SkipInFlight => {
             log_jira_event(
                 state,
+                started,
                 team_id,
                 event_type,
                 ticket_key,
@@ -666,6 +682,7 @@ async fn process_jira_payload(
         super::trigger_gate::TicketGate::SkipUnchanged => {
             log_jira_event(
                 state,
+                started,
                 team_id,
                 event_type,
                 ticket_key,
@@ -684,6 +701,7 @@ async fn process_jira_payload(
         info!(team_id, "Jira webhook skipped — token limit reached");
         log_jira_event(
             state,
+            started,
             team_id,
             event_type,
             ticket_key,
@@ -722,6 +740,7 @@ async fn process_jira_payload(
         );
         log_jira_event(
             state,
+            started,
             team_id,
             event_type,
             ticket_key,
@@ -740,6 +759,7 @@ async fn process_jira_payload(
     if !acquire_ticket_lock(state, team_id, ticket_key).await {
         log_jira_event(
             state,
+            started,
             team_id,
             event_type,
             ticket_key,
@@ -782,6 +802,7 @@ async fn process_jira_payload(
     };
     log_jira_event(
         state,
+        started,
         team_id,
         event_type,
         ticket_key,
@@ -954,6 +975,7 @@ pub(crate) fn forge_secret_matches(stored: &str, given: &str) -> bool {
 /// Handle a Jira comment event — retry failed runs or send feedback for completed runs with PRs.
 async fn handle_jira_comment(
     state: &AppState,
+    started: Clock,
     team_id: &str,
     installation_id: u64,
     payload: &Value,
@@ -1162,6 +1184,7 @@ async fn handle_jira_comment(
         );
         log_jira_event(
             state,
+            started,
             team_id,
             "comment_kept",
             ticket_key,
@@ -1277,6 +1300,7 @@ async fn handle_jira_comment(
     let repo_display = format!("{repo_owner}/{repo_name}");
     log_jira_event(
         state,
+        started,
         team_id,
         "comment_read",
         ticket_key,
@@ -1360,9 +1384,12 @@ async fn remember_jira_users(state: &AppState, team_id: &str, payload: &Value) {
     }
 }
 
-/// Log a Jira webhook event to the jira-events table.
+/// Log a Jira webhook event to the jira-events table, with how long it took
+/// since `clock` started (the Deliveries page's time for it).
+#[allow(clippy::too_many_arguments)]
 async fn log_jira_event(
     state: &AppState,
+    clock: Clock,
     team_id: &str,
     event_type: &str,
     ticket_key: &str,
@@ -1396,6 +1423,13 @@ async fn log_jira_event(
     if let Some(r) = repo {
         put = put.item("repo", attr_s(r));
     }
+    let duration_ms = clock.ms();
+    if let Some(ms) = duration_ms {
+        put = put.item(
+            "duration_ms",
+            aws_sdk_dynamodb::types::AttributeValue::N(ms.to_string()),
+        );
+    }
     // Counted by the Deliveries overview as it is written.
     put = put.item(
         common::deliveries_rollup::ROLLED,
@@ -1413,6 +1447,7 @@ async fn log_jira_event(
         "status": status,
         "created_at": now,
         "repo": repo.unwrap_or(""),
+        "duration_ms": duration_ms,
     });
     if let Some(d) = super::deliveries::jira_to_delivery(&logged) {
         let store = common::deliveries_rollup::Dynamo {
@@ -1471,6 +1506,10 @@ pub async fn list_jira_events(
                 "status": s("status"),
                 "repo": s("repo"),
                 "created_at": s("created_at"),
+                "duration_ms": item
+                    .get("duration_ms")
+                    .and_then(|v| v.as_n().ok())
+                    .and_then(|n| n.parse::<u64>().ok()),
             })
         })
         .collect();

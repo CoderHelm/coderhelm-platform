@@ -220,12 +220,14 @@ pub async fn send_notification(
                 data: template_data.clone(),
             },
         };
+        let sending = common::deliveries::Clock::start();
         let result = common::mail::send(&sender(state), &mail).await;
+        let send_ms = sending.ms();
         common::deliveries::record(
             &state.dynamo,
             &state.config.settings_table_name,
             team_id,
-            &common::mail::delivery(template_suffix, &email, &result),
+            &common::mail::delivery(template_suffix, &email, &result, send_ms),
         )
         .await;
         match result {

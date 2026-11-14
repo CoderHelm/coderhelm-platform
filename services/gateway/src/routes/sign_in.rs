@@ -2141,9 +2141,17 @@ pub async fn notify_lockout(state: &AppState, who: &str, secs: i64) {
                 headers: vec![],
             },
         };
+        let sending = common::deliveries::Clock::start();
         let result = common::mail::send(&super::email_settings::sender(state), &m).await;
-        super::deliveries::record_mail(state, &org.team_id, "two_factor_lockout", &to, &result)
-            .await;
+        super::deliveries::record_mail(
+            state,
+            &org.team_id,
+            "two_factor_lockout",
+            &to,
+            &result,
+            sending.ms(),
+        )
+        .await;
         if let Err(e) = result {
             warn!(code = %e.code, error = %e.message, "Lockout email not sent");
         }
@@ -3079,8 +3087,9 @@ async fn send_mail(
             headers: vec![],
         },
     };
+    let sending = common::deliveries::Clock::start();
     let result = common::mail::send(&super::email_settings::sender(state), &m).await;
-    super::deliveries::record_mail(state, team_id, template, to, &result).await;
+    super::deliveries::record_mail(state, team_id, template, to, &result, sending.ms()).await;
     match result {
         Ok(_) => true,
         Err(e) => {

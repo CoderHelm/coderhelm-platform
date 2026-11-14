@@ -81,6 +81,8 @@ pub fn stats_pk(c: &stats::Counted, hosted: bool) -> Option<String> {
 }
 
 pub async fn handle(state: &WorkerState, raw: &Value) {
+    // A bounce's record is timed from the event's arrival to its suppression.
+    let received = deliveries::Clock::start();
     // Every send, delivery, bounce, complaint and rejection is counted by
     // kind, for the install's Deliveries page.
     if let Some(c) = stats::read_event(raw) {
@@ -121,7 +123,8 @@ pub async fn handle(state: &WorkerState, raw: &Value) {
             "email_relay",
             &format!("email.{}", field(ev.kind)),
             &relay::redact(r),
-        );
+        )
+        .since(received);
         d.finish(
             Status::Failed,
             "Address suppressed",

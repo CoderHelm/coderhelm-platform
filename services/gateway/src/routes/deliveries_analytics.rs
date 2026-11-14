@@ -1188,6 +1188,8 @@ pub fn jira_item_to_delivery(item: &Item) -> Option<Delivery> {
     for (k, a) in item {
         if let Ok(s) = a.as_s() {
             v.insert(k.clone(), Value::String(s.clone()));
+        } else if let Ok(n) = a.as_n() {
+            v.insert(k.clone(), Value::String(n.clone()));
         }
     }
     super::deliveries::jira_to_delivery(&Value::Object(v))
@@ -2123,11 +2125,13 @@ mod tests {
             ("status".to_string(), s("token_limit")),
             ("created_at".to_string(), s("2026-10-26T10:00:00Z")),
             ("expires_at".to_string(), AttributeValue::N("1".into())),
+            ("duration_ms".to_string(), AttributeValue::N("41".into())),
         ]);
         let d = jira_item_to_delivery(&item).unwrap();
         assert_eq!(
             (d.source.as_str(), d.status, d.reason.as_str()),
             ("jira", Status::Failed, "jira_limit")
         );
+        assert_eq!(d.duration_ms, 41, "the backfill counts the logged time");
     }
 }

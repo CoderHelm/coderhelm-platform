@@ -1819,8 +1819,9 @@ async fn send_invite_email(
     // Through CoderHelm, the invite is listed first, vouched for by the
     // admin sending it (the gateway only lets admins invite).
     let listed = mail::list_invite(&sender, inviter, to).await;
-    let result = match listed {
-        Err(e) => Err(e),
+    // Nothing was sent when the listing failed: that record stays untimed.
+    let (result, send_ms) = match listed {
+        Err(e) => (Err(e), None),
         Ok(()) => {
             let inviter_name = inviter.split('@').next().unwrap_or("A teammate");
             let m = mail::Mail {
@@ -1841,10 +1842,12 @@ async fn send_invite_email(
                     data: template_data,
                 },
             };
-            mail::send(&sender, &m).await
+            let sending = common::deliveries::Clock::start();
+            let r = mail::send(&sender, &m).await;
+            (r, sending.ms())
         }
     };
-    super::deliveries::record_mail(state, team, "invite", to, &result).await;
+    super::deliveries::record_mail(state, team, "invite", to, &result, send_ms).await;
     result.map(|_| ()).map_err(|e| {
         error!("Failed to send invite email: {e}");
         StatusCode::INTERNAL_SERVER_ERROR
