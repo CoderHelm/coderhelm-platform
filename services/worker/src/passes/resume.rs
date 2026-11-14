@@ -3495,27 +3495,51 @@ pub async fn run(
             // while the rounds make progress (up to twice the cap), a round
             // without progress changes approach, and when the rounds end
             // what is open is deferred and the run finishes.
+            // Each finding is tracked on its own (`own_review_ledger`): a
+            // round a tool or a guard blocked is not a stall, a stalled
+            // finding climbs its own ladder, a finding the ticket rules out
+            // is settled by it, and only a person-gate reason defers one.
+            let mut own_scope = OwnScope::default();
             if !own_open.is_empty() {
-                let progress = own_review_progress(&run_record);
-                let spent = super::run_ceiling::load(state, &msg.team_id, &msg.run_id)
-                    .await
-                    .map(|t| t.spend_usd)
-                    .unwrap_or(0.0);
-                match super::own_review::next(
-                    progress.open_before,
+                let decided = Box::pin(own_review_decide(
+                    state,
+                    &msg.team_id,
+                    &msg.run_id,
+                    &run_record,
                     &own_open,
-                    0,
-                    progress.stalled,
-                    progress.rounds,
-                    spent,
-                ) {
-                    super::own_review::Next::Finish { why } => {
+                ))
+                .await;
+                match decided.plan {
+                    super::own_review_ledger::Plan::Ready => {}
+                    super::own_review_ledger::Plan::Settle {
+                        deferred,
+                        by_ticket,
+                    } => {
+                        let lines = super::own_review_ledger::settled_lines(&deferred, &by_ticket);
                         finish_on_own_findings(
                             state,
                             &ticket_msg,
                             &github,
                             &msg.run_id,
-                            &own_open,
+                            &lines,
+                            "each with the reason it is not fixed in the code",
+                            &pr_url,
+                            pr_number,
+                            &branch,
+                            &usage,
+                            wall_clock_secs(created_at, &start),
+                        )
+                        .await?;
+                        mark_events_processed(state, &msg.run_id, &events).await;
+                        return Ok(());
+                    }
+                    super::own_review_ledger::Plan::Unfixed { why } => {
+                        // Never "completed" with its own review asking for
+                        // changes: the run ends with what is open, named.
+                        wait_for_review(
+                            state,
+                            &ticket_msg,
+                            &msg.run_id,
                             &why,
                             &pr_url,
                             pr_number,
@@ -3527,27 +3551,32 @@ pub async fn run(
                         mark_events_processed(state, &msg.run_id, &events).await;
                         return Ok(());
                     }
-                    super::own_review::Next::Fix { stalled, rung } => {
+                    super::own_review_ledger::Plan::Round {
+                        focus,
+                        approach,
+                        unscoped,
+                        fresh,
+                    } => {
+                        let progress = own_review_progress(&run_record);
                         record_own_review_progress(
                             state,
                             &msg.team_id,
                             &msg.run_id,
                             own_open.len(),
-                            stalled,
+                            progress.stalled,
                             progress.rounds.saturating_add(1),
                         )
                         .await;
-                        review_result
-                            .summary
-                            .push_str(&super::supervisor::round_instruction(
-                                rung,
-                                &format!(
-                                    "CoderHelm's own review findings ({})",
-                                    own_open.join("; ")
-                                ),
-                            ));
+                        let mut summary = super::own_review::fix_feedback(
+                            &focus,
+                            &review_result.summary,
+                            &progress.notes,
+                        );
+                        summary.push_str(&super::own_review_ledger::instruction(&approach, &focus));
+                        summary.push_str(&super::own_review_ledger::round_rules(&decided.ticket));
+                        review_result.summary = summary;
+                        own_scope = OwnScope { unscoped, fresh };
                     }
-                    super::own_review::Next::Ready => {}
                 }
             }
             // Review found issues — implement fix and go back to awaiting_ci.
@@ -3555,9 +3584,14 @@ pub async fn run(
             // to run uncapped AND reset the shared counter to zero, so an
             // oscillating review could loop until the 24h wall clock.
             let cycle = load_cycle_from_checkpoint(state, &msg.team_id, &msg.run_id).await;
-            let over_cycle = cycle >= MAX_CI_FIX_CYCLES;
-            let claimed =
-                !over_cycle && super::claim_auto_fix_slot(state, &msg.team_id, &msg.run_id).await;
+            // Rounds on the own review's findings are bounded finding by
+            // finding (`own_review_ledger`), never by the shared CI budget:
+            // that budget once ended them with a defect left for a person.
+            let own_round = !own_open.is_empty();
+            let over_cycle = cycle >= MAX_CI_FIX_CYCLES && !own_round;
+            let claimed = !over_cycle
+                && (own_round
+                    || super::claim_auto_fix_slot(state, &msg.team_id, &msg.run_id).await);
             if over_cycle || !claimed {
                 warn!(
                     run_id = msg.run_id,
@@ -3579,26 +3613,6 @@ pub async fn run(
                     super::CiOutcome::HandedOff(super::GaveUp::Budget),
                 )
                 .await;
-                if !own_open.is_empty() {
-                    // The fix budget ended the rounds: what is open is
-                    // deferred with that reason and the run finishes.
-                    finish_on_own_findings(
-                        state,
-                        &ticket_msg,
-                        &github,
-                        &msg.run_id,
-                        &own_open,
-                        "the run's automatic fix budget is spent",
-                        &pr_url,
-                        pr_number,
-                        &branch,
-                        &usage,
-                        wall_clock_secs(created_at, &start),
-                    )
-                    .await?;
-                    mark_events_processed(state, &msg.run_id, &events).await;
-                    return Ok(());
-                }
                 mark_pr_ready(
                     state,
                     &msg.team_id,
@@ -3638,8 +3652,9 @@ pub async fn run(
                 &base_sha,
                 &review_result.summary,
                 // Bot self-review fix — scoped, unless human comments were
-                // folded into the review context.
-                review_feedback.is_empty(),
+                // folded into the review context, or the last round on the
+                // finding had an edit it needed refused.
+                review_feedback.is_empty() && !own_scope.unscoped,
                 chrono::Utc::now(),
             );
             let mut ctx = FixContext {
@@ -3657,17 +3672,33 @@ pub async fn run(
                 number: pr_number,
                 url: &pr_url,
             };
-            let end = run_fix_round(
-                state,
-                &msg,
-                &mut ctx,
-                &pr,
-                fix_round,
-                &mut Vec::new(),
-                created_at,
-                &start,
-            )
-            .await?;
+            // A round whose last attempt ran out of time starts in a fresh
+            // invocation with its full budget, never after a review.
+            let end = if own_scope.fresh {
+                park_round(
+                    state,
+                    &msg,
+                    (&ctx.ticket_msg, &ctx.usage),
+                    &pr,
+                    &fix_round,
+                    false,
+                    created_at,
+                    &start,
+                )
+                .await?
+            } else {
+                run_fix_round(
+                    state,
+                    &msg,
+                    &mut ctx,
+                    &pr,
+                    fix_round,
+                    &mut Vec::new(),
+                    created_at,
+                    &start,
+                )
+                .await?
+            };
             mark_events_processed(state, &msg.run_id, &events).await;
             match end {
                 RoundEnd::Parked => return Ok(()),
@@ -4110,6 +4141,16 @@ async fn run_fix_round(
                 )
                 .await
             } else {
+                if round.kind == run_round::Kind::ReviewFix {
+                    Box::pin(super::own_review_ledger::record_round_end(
+                        state,
+                        &msg.team_id,
+                        &msg.run_id,
+                        vec![super::own_review_ledger::Blocker::NoTime],
+                        "",
+                    ))
+                    .await;
+                }
                 super::round::finish_incomplete(
                     state,
                     &msg.team_id,
@@ -4144,6 +4185,17 @@ async fn run_fix_round(
                     &round.feedback,
                     &r.evidence,
                 )
+                .await;
+                // What blocked it (a refused edit, checks skipped for time,
+                // a tool's input) is not the model failing: the next review
+                // reads it per finding (`own_review_ledger`).
+                Box::pin(super::own_review_ledger::record_round_end(
+                    state,
+                    &msg.team_id,
+                    &msg.run_id,
+                    super::own_review_ledger::blockers_of(refused, &r.conversation_log),
+                    r.evidence.latest_notes(),
+                ))
                 .await;
             }
             // Done: the round's changes land on the pull request as one
@@ -5840,6 +5892,141 @@ fn own_review_progress(
     }
 }
 
+/// How the next review-fix round runs, from the finding's own record.
+#[derive(Debug, Clone, Copy, Default)]
+struct OwnScope {
+    /// No file boundary: the last round's edit was refused.
+    unscoped: bool,
+    /// A fresh invocation with the full time: the last round ran out.
+    fresh: bool,
+}
+
+struct OwnDecided {
+    plan: super::own_review_ledger::Plan,
+    /// The ticket, its comments and the plan, as the round is told them.
+    ticket: String,
+}
+
+/// The ledger's decision for the findings `open` now
+/// (`own_review_ledger`): what the last round fixed or met, then the next
+/// round, the settled ending, or what is left unfixed. The round about to
+/// run is recorded on the ledger.
+async fn own_review_decide(
+    state: &WorkerState,
+    team_id: &str,
+    run_id: &str,
+    run_record: &std::collections::HashMap<String, AttributeValue>,
+    open: &[String],
+) -> OwnDecided {
+    use super::own_review_ledger as ledger;
+    // Read now: the record read at the start of the step may predate the
+    // round's end.
+    let mut l = ledger::load(state, team_id, run_id).await;
+    let ticket = ledger::ticket_text(state, team_id, run_record).await;
+    l.observe(open, &ticket);
+    let spent = super::run_ceiling::load(state, team_id, run_id)
+        .await
+        .map(|t| t.spend_usd)
+        .unwrap_or(0.0);
+    let plan = l.decide(open, spent, super::run_ceiling::MAX_RUN_SPEND_USD);
+    if let ledger::Plan::Round { focus, .. } = &plan {
+        l.start_round(focus);
+    }
+    ledger::save(state, team_id, run_id, &l).await;
+    info!(
+        run_id,
+        open = open.len(),
+        ?plan,
+        "Own review findings: the ledger's decision"
+    );
+    OwnDecided { plan, ticket }
+}
+
+/// The completion guard (`own_review_ledger::completion`): a run is never
+/// marked completed while its own review's latest verdict on the pull
+/// request's head asks for changes, nor with a deferred finding that has no
+/// person-gate reason. `Continue`: the run went back to its checks and its
+/// review. `Hold`: why it can't complete.
+async fn own_review_completion(
+    state: &WorkerState,
+    msg: &TicketMessage,
+    run_id: &str,
+    pr_number: u64,
+    branch: &str,
+) -> super::own_review_ledger::Completion {
+    use super::own_review_ledger::{self as ledger, Completion};
+    let Ok(github) = GitHubClient::new(
+        &state.secrets.github_app_id,
+        &state.secrets.github_private_key,
+        msg.installation_id,
+        &state.http,
+    ) else {
+        return Completion::Complete;
+    };
+    let Ok(pr) = github
+        .get_pull_request(&msg.repo_owner, &msg.repo_name, pr_number)
+        .await
+    else {
+        return Completion::Complete;
+    };
+    // A person's pull request, or a closed one, is not held here.
+    if pr["state"].as_str() != Some("open") {
+        return Completion::Complete;
+    }
+    let head = pr["head"]["sha"].as_str().unwrap_or("").to_string();
+    let verdict = super::review_pr::own_verdict(
+        state,
+        &msg.team_id,
+        &msg.repo_owner,
+        &msg.repo_name,
+        pr_number,
+    )
+    .await;
+    let mut l = ledger::load(state, &msg.team_id, run_id).await;
+    let said = ledger::completion(
+        verdict.as_ref().map(|(v, s)| (v.as_str(), s.as_str())),
+        &head,
+        &l,
+    );
+    let Completion::Continue(why) = &said else {
+        return said;
+    };
+    l.continues += 1;
+    ledger::save(state, &msg.team_id, run_id, &l).await;
+    let item = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(&msg.team_id))
+        .key("run_id", attr_s(run_id))
+        .consistent_read(true)
+        .send()
+        .await
+        .ok()
+        .and_then(|o| o.item)
+        .unwrap_or_default();
+    let Some((ticket, _)) = super::recheck::message_of(&item) else {
+        return Completion::Hold(format!("{why}, but the run's record lacks what that needs"));
+    };
+    let body = pr["body"].as_str().unwrap_or("");
+    match super::recheck_at_checks(
+        state,
+        &ticket,
+        run_id,
+        branch,
+        super::recheck::carry_of(body).as_ref(),
+        why,
+    )
+    .await
+    {
+        super::Handoff::Continued => {
+            info!(run_id, pr_number, %head, "Own review asks for changes on the head: the run goes on instead of completing");
+            said
+        }
+        super::Handoff::Stopped(reason) => Completion::Hold(format!("{why}; {reason}")),
+    }
+}
+
 /// Records the own-review progress on the run. Best-effort.
 async fn record_own_review_progress(
     state: &WorkerState,
@@ -5949,9 +6136,10 @@ pub(crate) enum OwnRound {
     /// No round runs now (the run isn't finished, a round already ran on
     /// this head, the record couldn't be read). Why, for the log.
     Person(String),
-    /// The run's rounds on them are over (`own_review::rounds_over`): they
-    /// are deferred with this reason and hold nothing.
-    Defer(String),
+    /// Every finding left is settled with its own reason
+    /// (`own_review_ledger`): a person-gate reason, or the ticket's words.
+    /// The lines, each with its reason, are listed as deferred.
+    Defer(Vec<String>),
 }
 
 /// The record fields that say what a finished run has left for a round on
@@ -6061,23 +6249,54 @@ pub(crate) async fn queue_own_review_round(
     let cycles = load_cycle_from_checkpoint(state, team_id, run_id).await;
     let mut budget = own_round_budget(&item, cycles);
     budget.open_now = Some(items.len());
-    if let Err(why) =
-        super::own_review::round_left(&budget, head, super::MAX_AUTO_FIX_PUSHES, MAX_CI_FIX_CYCLES)
-    {
-        // The rounds are over by the supervisor's rule: the findings are
-        // deferred, never held for a person.
-        let finished = common::run_status::COMPLETED == status
-            || common::run_status::SUCCESS == status
-            || common::run_status::NEEDS_INPUT == status;
-        if finished && !budget.guard_open {
-            if let Some(over) = super::own_review::rounds_over(
-                &budget,
-                super::MAX_AUTO_FIX_PUSHES,
-                MAX_CI_FIX_CYCLES,
-            ) {
-                return OwnRound::Defer(over);
-            }
+    // Each finding on its own record (`own_review_ledger`): another round
+    // while a finding has an approach left, deferred only with a person-gate
+    // reason or settled by the ticket, never ended by a count of rounds.
+    let mut ledger = super::own_review_ledger::of_item(&item);
+    let ticket_text = super::own_review_ledger::ticket_text(state, team_id, &item).await;
+    ledger.observe(items, &ticket_text);
+    let spent = super::run_ceiling::load(state, team_id, run_id)
+        .await
+        .map(|t| t.spend_usd)
+        .unwrap_or(0.0);
+    let plan = ledger.decide(items, spent, super::run_ceiling::MAX_RUN_SPEND_USD);
+    let (focus, approach, unscoped) = match plan {
+        super::own_review_ledger::Plan::Round {
+            focus,
+            approach,
+            unscoped,
+            ..
+        } => (focus, approach, unscoped),
+        super::own_review_ledger::Plan::Settle {
+            deferred,
+            by_ticket,
+        } => {
+            super::own_review_ledger::save(state, team_id, run_id, &ledger).await;
+            return OwnRound::Defer(super::own_review_ledger::settled_lines(
+                &deferred, &by_ticket,
+            ));
         }
+        super::own_review_ledger::Plan::Unfixed { why } => {
+            super::own_review_ledger::save(state, team_id, run_id, &ledger).await;
+            return OwnRound::Person(why);
+        }
+        super::own_review_ledger::Plan::Ready => {
+            return OwnRound::Person("nothing the review raised is open".into());
+        }
+    };
+    if let Err(why) = super::own_review::round_left(
+        &super::own_review::RoundBudget {
+            // The ledger bounds the rounds, finding by finding.
+            rounds: 0,
+            pushes: 0,
+            cycles: 0,
+            handed: false,
+            ..budget.clone()
+        },
+        head,
+        super::MAX_AUTO_FIX_PUSHES,
+        MAX_CI_FIX_CYCLES,
+    ) {
         return OwnRound::Person(why);
     }
     let Some((ticket, branch)) = super::recheck::message_of(&item) else {
@@ -6118,15 +6337,13 @@ pub(crate) async fn queue_own_review_round(
         .expression_attribute_values(":one", attr_n(1))
         // `round_left` decided by the supervisor's rule; the claim keeps the
         // ceilings (twice each cap) so two deciders can't overshoot them.
-        .expression_attribute_values(
-            ":maxr",
-            attr_n(super::supervisor::ceiling(
-                super::own_review::MAX_FIX_ROUNDS,
-            )),
-        )
+        .expression_attribute_values(":maxr", attr_n(super::own_review_ledger::MAX_ROUNDS))
         .expression_attribute_values(
             ":maxp",
-            attr_n(super::supervisor::ceiling(super::MAX_AUTO_FIX_PUSHES)),
+            attr_n(
+                super::supervisor::ceiling(super::MAX_AUTO_FIX_PUSHES)
+                    + super::own_review_ledger::MAX_ROUNDS,
+            ),
         )
         .expression_attribute_values(":t", attr_s(&now))
         .send()
@@ -6165,7 +6382,8 @@ pub(crate) async fn queue_own_review_round(
         state,
         team_id,
         run_id,
-        super::supervisor::ceiling(super::MAX_AUTO_FIX_PUSHES),
+        super::supervisor::ceiling(super::MAX_AUTO_FIX_PUSHES)
+            + super::own_review_ledger::MAX_ROUNDS,
     )
     .await
     {
@@ -6174,21 +6392,25 @@ pub(crate) async fn queue_own_review_round(
     let base_sha =
         super::round::branch_head(github, &ticket.repo_owner, &ticket.repo_name, &branch).await;
     let progress = own_review_progress(&item);
-    let feedback = super::own_review::fix_feedback(
-        items,
+    let mut feedback = super::own_review::fix_feedback(
+        &focus,
         "The findings are listed under \"Open review findings\" at the top of the pull \
          request's description; CoderHelm's review comments on the pull request say more.",
         &progress.notes,
     );
+    feedback.push_str(&super::own_review_ledger::instruction(&approach, &focus));
+    feedback.push_str(&super::own_review_ledger::round_rules(&ticket_text));
     let round = run_round::Round::start(
         run_round::Kind::ReviewFix,
         (cycles + 1).min(u32::MAX as usize) as u32,
         &base_sha,
         &feedback,
-        true,
+        !unscoped,
         chrono::Utc::now(),
     )
     .parked(false);
+    ledger.start_round(&focus);
+    super::own_review_ledger::save(state, team_id, run_id, &ledger).await;
     super::round::record(state, team_id, run_id, &round).await;
     let body = serde_json::json!({
         "type": "resume",
@@ -6213,10 +6435,14 @@ pub(crate) async fn queue_own_review_round(
         team_id,
         run_id,
         &format!(
-            "{}: a review fix round takes them (round {}; up to {} while rounds make progress).",
+            "{}: a review fix round takes {} (round {}).",
             super::own_review::fixing_why(items.len()),
+            if focus.len() == items.len() {
+                "them".to_string()
+            } else {
+                format!("this one first: {}", focus.join("; "))
+            },
             budget.rounds + 1,
-            super::supervisor::ceiling(super::own_review::MAX_FIX_ROUNDS)
         ),
     )
     .await;
@@ -6972,6 +7198,21 @@ async fn wait_on_person(
             super::fail_run(state, msg, run_id, &why, usage, duration).await;
             return Ok(());
         }
+        // The completion guard: never "completed" while the run's own
+        // review asks for changes on the head. It goes on while it can; past
+        // every approach it ends naming what its review still asks for.
+        if pr_number > 0 {
+            match Box::pin(own_review_completion(state, msg, run_id, pr_number, branch)).await {
+                super::own_review_ledger::Completion::Complete => {}
+                super::own_review_ledger::Completion::Continue(_) => return Ok(()),
+                super::own_review_ledger::Completion::Hold(why) => {
+                    let why = format!("{reason}\n{why}");
+                    warn!(run_id, reason = %why, "Own review still asks for changes after every approach: the run is not completed");
+                    super::fail_run(state, msg, run_id, &why, usage, duration).await;
+                    return Ok(());
+                }
+            }
+        }
         super::add_progress_note(
             state,
             &msg.team_id,
@@ -7316,6 +7557,20 @@ async fn complete_run_with_status(
                 state, msg, run_id, &reason, pr_url, pr_number, branch, usage, duration,
             )
             .await;
+        }
+    }
+    // Never completed while its own review asks for changes on the head:
+    // the run goes on, or ends saying what is open (`wait_on_person`).
+    if status == common::run_status::COMPLETED && pr_number > 0 {
+        match Box::pin(own_review_completion(state, msg, run_id, pr_number, branch)).await {
+            super::own_review_ledger::Completion::Complete => {}
+            super::own_review_ledger::Completion::Continue(_) => return Ok(()),
+            super::own_review_ledger::Completion::Hold(why) => {
+                return wait_for_review(
+                    state, msg, run_id, &why, pr_url, pr_number, branch, usage, duration,
+                )
+                .await;
+            }
         }
     }
     end_run(

@@ -268,7 +268,7 @@ fn neither_loop_ends_by_waiting_on_a_comment() {
     // The ready decision defers a finished run's findings once its rounds
     // are over, instead of holding them for a person.
     let ready = include_str!("../ready.rs");
-    assert!(fn_src(ready, "\nasync fn fix_own_findings(").contains("OwnRound::Defer(why)"));
+    assert!(fn_src(ready, "\nasync fn fix_own_findings(").contains("OwnRound::Defer(lines)"));
     // The words the old endings used are on the hand-off list, so the
     // source scan (`ownership`) fails if one comes back.
     for p in [

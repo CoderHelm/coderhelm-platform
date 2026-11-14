@@ -185,6 +185,12 @@ pub async fn execute(
     let snapshot = c.clone();
     for i in 0..c.steps.len() {
         let s = &mut c.steps[i];
+        // Adding labels is CoderHelm's, whoever the plan named.
+        if s.doer() == Doer::Person && s.adds_labels_only() && !s.done {
+            s.by = "coderhelm".to_string();
+            s.why_person.clear();
+            s.grant.clear();
+        }
         if s.doer() != Doer::CoderHelm || s.done {
             continue;
         }
@@ -467,17 +473,49 @@ async fn start(
     let since = chrono::Utc::now() - chrono::Duration::seconds(5);
     let file = r.file.rsplit('/').next().unwrap_or(&r.file).to_string();
     let started = match label {
-        Some(l) => cx
-            .github
-            .add_label(cx.owner, cx.repo, cx.pr_number, l)
-            .await
-            .map(|_| {
+        Some(l) => {
+            // Every label the step names, and the route's own.
+            let mut labels = s.labels_named();
+            for one in l.split(',').map(str::trim).filter(|x| !x.is_empty()) {
+                if !labels.iter().any(|x| x == one) {
+                    labels.push(one.to_string());
+                }
+            }
+            let added = cx
+                .github
+                .add_labels(cx.owner, cx.repo, cx.pr_number, &labels)
+                .await;
+            let names = labels
+                .iter()
+                .map(|x| format!("`{x}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            if r.file.is_empty() {
+                // No workflow to wait for: the labels are the step.
+                match added {
+                    Ok(_) => {
+                        s.done = true;
+                        s.run = Some(StepRun {
+                            state: DONE.to_string(),
+                            ..Default::default()
+                        });
+                        s.result = format!("added {names} to #{}", cx.pr_number);
+                    }
+                    Err(e) => {
+                        s.run = None;
+                        s.result = format!("not done: adding {names} failed: {e}");
+                    }
+                }
+                return;
+            }
+            added.map(|_| {
                 format!(
-                    "added the `{l}` label to #{}, which starts {}",
+                    "added {names} to #{}, which starts {}",
                     cx.pr_number,
                     r.line()
                 )
-            }),
+            })
+        }
         None => cx
             .github
             .dispatch_workflow(cx.owner, cx.repo, &file, cx.branch, &json!({}))
