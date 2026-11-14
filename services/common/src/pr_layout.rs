@@ -1,14 +1,15 @@
-//! Where each part of a description goes: what a reader needs first stays
-//! in sight, everything else is collapsed below it, and a section with
-//! nothing in it is dropped.
+//! Where each part of a description goes: the visible part (Summary,
+//! Needed from you, Review focus, Risk and Rollback, Verification) stays in
+//! sight, everything else goes in one of three collapsed blocks with fixed
+//! names, and a one-line footer ends it.
 //!
 //! Descriptions were disliked because many code paths each appended a
-//! section and nothing read the result as a person would. The visible part
-//! is now a budget: the lead (`pr_facts::lead`: the change, how to check
-//! it, the risk, what the reader has to do), and the few blocks that exist
-//! only when something is wrong (why it is a draft, a reviewer's objection,
-//! open findings, planned work not done). Every other section, whoever
-//! wrote it, sits in a collapsed block with a stable anchor.
+//! section and nothing read the result as a person would; the old layout
+//! then gave every section its own fold, seven of them on one pull request,
+//! one called "More". Now every writer's section lands in the first fold
+//! ("Implementation notes", or "All N updates" for a dependency update),
+//! the checks, commands and open records in "Full test evidence", and the
+//! plan and run in "How CoderHelm built this" (`pr_body`).
 //!
 //! [`layout`] is pure text and is applied on every write
 //! (`worker::passes::description::save`): it takes its own fold lines out
@@ -16,14 +17,16 @@
 //! can never leave the folds unbalanced. A body with no lead (one never
 //! built from facts) is left as it is.
 //!
-//! [`rubric`] reads a finished description the way its reader does. It is
-//! what the quality eval asserts for every case
+//! [`rubric`] reads a finished description the way its reader does: the
+//! layout's checklist (`pr_body::defects`), raw machinery in sight, and
+//! statements the facts refute. The quality eval asserts it for every case
 //! (`worker::passes::description_eval`).
 
 use crate::pr_facts::{Facts, LEAD_END, LEAD_START};
 
 /// What marks a line as one of this module's fold lines.
 const FOLD_MARK: &str = "<!-- fold -->";
+const FOLD_OPEN: &str = "<details><!-- fold -->";
 const FOLD_CLOSE: &str = "</details><!-- fold -->";
 
 /// The blocks of CoderHelm's that stay in sight: each exists only when
@@ -38,7 +41,8 @@ const SUPERSEDED: &[(&str, &str)] = &[(
 
 fn is_fold_line(line: &str) -> bool {
     let t = line.trim();
-    t.ends_with(FOLD_MARK) && (t.starts_with("<details>") || t.starts_with("</details>"))
+    t.ends_with(FOLD_MARK)
+        && (t.starts_with("<details>") || t.starts_with("</details>") || t.starts_with("<summary>"))
 }
 
 /// `body` without this module's fold lines.
@@ -85,8 +89,6 @@ fn is_ticket_line(line: &str) -> bool {
 /// One part of the body below the lead.
 #[derive(Debug)]
 struct Part {
-    /// What its fold is called.
-    title: String,
     lines: Vec<String>,
     /// It stays in sight.
     visible: bool,
@@ -115,27 +117,6 @@ fn heading_text(line: &str) -> Option<String> {
         return Some(t.trim_matches('*').trim().to_string());
     }
     None
-}
-
-fn title_case(name: &str) -> String {
-    let words = name.replace(['-', '_'], " ");
-    let mut c = words.chars();
-    match c.next() {
-        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
-        None => String::new(),
-    }
-}
-
-fn slug(title: &str) -> String {
-    let mut out = String::new();
-    for c in title.chars() {
-        if c.is_ascii_alphanumeric() {
-            out.push(c.to_ascii_lowercase());
-        } else if !out.ends_with('-') && !out.is_empty() {
-            out.push('-');
-        }
-    }
-    out.trim_matches('-').chars().take(40).collect()
 }
 
 /// The lead, the lines that stay at the very end (a `<sub>` credit, hidden
@@ -193,15 +174,13 @@ fn parts(lines: &[String]) -> (Vec<String>, Vec<Part>) {
     let mut block: Option<String> = None;
     let mut dropping: Option<&str> = None;
     let mut cur = Part {
-        title: "Description".to_string(),
         lines: Vec::new(),
         visible: false,
     };
-    let flush = |cur: &mut Part, out: &mut Vec<Part>, title: String, visible: bool| {
+    let flush = |cur: &mut Part, out: &mut Vec<Part>, visible: bool| {
         let done = std::mem::replace(
             cur,
             Part {
-                title,
                 lines: Vec::new(),
                 visible,
             },
@@ -231,7 +210,7 @@ fn parts(lines: &[String]) -> (Vec<String>, Vec<Part>) {
             cur.lines.push(l.clone());
             if t == close {
                 block = None;
-                flush(&mut cur, &mut out, "More".to_string(), false);
+                flush(&mut cur, &mut out, false);
             }
             continue;
         }
@@ -244,20 +223,14 @@ fn parts(lines: &[String]) -> (Vec<String>, Vec<Part>) {
         if let Some(name) = block_name(l) {
             let close = format!("<!-- /coderhelm:{name} -->");
             if lines[i + 1..].iter().any(|x| x.trim() == close) {
-                let title = lines[i + 1..]
-                    .iter()
-                    .take_while(|x| x.trim() != close)
-                    .find_map(|x| heading_text(x))
-                    .unwrap_or_else(|| title_case(name));
-                flush(&mut cur, &mut out, title, VISIBLE_BLOCKS.contains(&name));
+                flush(&mut cur, &mut out, VISIBLE_BLOCKS.contains(&name));
                 cur.lines.push(l.clone());
                 block = Some(close);
                 continue;
             }
         }
         if t.starts_with("## ") || t.starts_with("# ") {
-            let title = heading_text(l).unwrap_or_else(|| "More".to_string());
-            flush(&mut cur, &mut out, title, false);
+            flush(&mut cur, &mut out, false);
             cur.lines.push(l.clone());
             continue;
         }
@@ -267,38 +240,182 @@ fn parts(lines: &[String]) -> (Vec<String>, Vec<Part>) {
         }
         cur.lines.push(l.clone());
     }
-    flush(&mut cur, &mut out, String::new(), false);
+    flush(&mut cur, &mut out, false);
     (ticket, out)
 }
 
-/// `body` in its order: the lead, the blocks that exist only when something
-/// is wrong, the ticket line, then every other part collapsed under its own
-/// name with a stable anchor, then the footer. A part with nothing in it is
-/// dropped, and a line that repeats the lead's first line goes. A body with
-/// no lead is returned as it is. Laying out twice changes nothing.
+/// Takes the block from `start` to `end` (both lines included) out of
+/// `lines`, when both are there.
+fn take_block(lines: &mut Vec<String>, start: &str, end: &str) -> Vec<String> {
+    let Some(a) = lines.iter().position(|l| l.trim() == start) else {
+        return Vec::new();
+    };
+    let Some(b) = lines[a..].iter().position(|l| l.trim() == end) else {
+        return Vec::new();
+    };
+    lines.drain(a..=a + b).collect()
+}
+
+/// A closing keyword's line (`Closes #12`): GitHub reads it anywhere, and it
+/// stays on the footer line.
+fn is_closing(line: &str) -> bool {
+    let l = line.trim().to_lowercase();
+    ["closes #", "fixes #", "resolves #"]
+        .iter()
+        .any(|k| l.starts_with(k))
+}
+
+/// The closing keywords a footer line carries after the footer itself.
+fn closing_of_footer(footer: &str) -> Vec<String> {
+    footer
+        .split(" · ")
+        .filter(|p| is_closing(p))
+        .map(|p| p.trim().to_string())
+        .collect()
+}
+
+/// `body` without CoderHelm's generated blocks (the lead, the folds'
+/// generated parts, the evidence and the footer): the written text, with
+/// a closing keyword the footer carried kept as its own line.
+pub fn strip_generated(body: &str) -> String {
+    let mut lines: Vec<String> = unfold(body).lines().map(str::to_string).collect();
+    let mut kept: Vec<String> = Vec::new();
+    for (start, end) in crate::pr_body::GENERATED.iter().copied().chain([
+        (LEAD_START, LEAD_END),
+        (
+            crate::pr_steps::EVIDENCE_START,
+            crate::pr_steps::EVIDENCE_END,
+        ),
+    ]) {
+        let taken = take_block(&mut lines, start, end);
+        if start == crate::pr_body::FOOTER_START {
+            for l in &taken {
+                kept.extend(closing_of_footer(l));
+            }
+        }
+    }
+    let mut text = squeeze(&lines.join("\n"));
+    for k in kept {
+        if !text.lines().any(|l| l.trim() == k) {
+            text.push_str(&format!("\n\n{k}"));
+        }
+    }
+    text
+}
+
+fn fold(label: &str, parts: &[String]) -> String {
+    let joined = parts
+        .iter()
+        .map(|p| p.trim())
+        .filter(|p| !p.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    // A heading that only repeats the fold's name goes.
+    let text = squeeze(
+        &joined
+            .lines()
+            .filter(|l| {
+                !(l.trim_start().starts_with('#')
+                    && heading_text(l).is_some_and(|h| h.eq_ignore_ascii_case(label)))
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+    let part = Part {
+        lines: text.lines().map(str::to_string).collect(),
+        visible: false,
+    };
+    if !part.has_content() {
+        return String::new();
+    }
+    format!(
+        "{FOLD_OPEN}\n<summary>{}</summary>{FOLD_MARK}\n\n{text}\n\n{FOLD_CLOSE}",
+        label.replace('<', "&lt;")
+    )
+}
+
+/// `body` in its order: the visible part (the lead), the blocks that exist
+/// only when something is wrong, then at most three folds with fixed names
+/// (every written section in the first, the checks and open records in
+/// "Full test evidence", the plan and run in "How CoderHelm built this"),
+/// then the footer line and the hidden marks. A section with nothing in it
+/// is dropped, and a line that repeats the summary goes. A body with no
+/// lead is returned as it is. Laying out twice changes nothing.
 pub fn layout(body: &str) -> String {
+    use crate::pr_body::{self as pb};
     let flat = unfold(body);
-    let Some((lead, lines, footer)) = split(&flat) else {
+    let Some((lead, mut lines, footer)) = split(&flat) else {
         return body.to_string();
     };
-    let first = lead
+    let label = lead
         .lines()
-        .nth(1)
-        .map(str::trim)
-        .filter(|l| l.len() >= 20)
+        .find_map(|l| {
+            l.trim()
+                .strip_prefix(pb::LABEL_START)
+                .and_then(|r| r.strip_suffix("-->"))
+        })
+        .map(|l| l.trim().to_string())
+        .unwrap_or_else(|| pb::NOTES.to_string());
+    let ticket_key = lead
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("<!-- coderhelm:body v1 ticket="))
+        .and_then(|r| r.split_whitespace().next())
+        .filter(|k| *k != "none")
         .unwrap_or("")
         .to_string();
+    let first = lead
+        .lines()
+        .find(|l| l.contains(pb::SUMMARY_END))
+        .map(|l| pb::summary_core(l, &ticket_key))
+        .filter(|l| l.len() >= 20)
+        .unwrap_or_default();
+    let notes_top = take_block(&mut lines, pb::NOTES_TOP_START, pb::NOTES_TOP_END);
+    let checks = take_block(&mut lines, pb::CHECKS_START, pb::CHECKS_END);
+    let evidence = take_block(
+        &mut lines,
+        crate::pr_steps::EVIDENCE_START,
+        crate::pr_steps::EVIDENCE_END,
+    );
+    let mut unverified = take_block(
+        &mut lines,
+        "<!-- coderhelm:unverified -->",
+        "<!-- /coderhelm:unverified -->",
+    );
+    // A record of open items with none in it says nothing.
+    if !unverified
+        .iter()
+        .any(|l| l.trim_start().starts_with("- ") || l.trim_start().starts_with("* "))
+    {
+        unverified.clear();
+    }
+    let built = take_block(&mut lines, pb::BUILT_START, pb::BUILT_END);
+    let foot = take_block(&mut lines, pb::FOOTER_START, pb::FOOTER_END);
+    let mut closing: Vec<String> = foot.iter().flat_map(|l| closing_of_footer(l)).collect();
+    lines.retain(|l| {
+        if is_closing(l) {
+            let t = l.trim().to_string();
+            if !closing.contains(&t) {
+                closing.push(t);
+            }
+            false
+        } else {
+            true
+        }
+    });
+    // Credit lines belong with how it was built.
+    let (credits, footer): (Vec<String>, Vec<String>) = footer
+        .into_iter()
+        .partition(|l| l.trim().starts_with("<sub>"));
     let (ticket, parts) = parts(&lines);
     let mut out = lead;
     for p in parts.iter().filter(|p| p.visible) {
         out.push_str("\n\n");
         out.push_str(squeeze(&p.lines.join("\n")).trim());
     }
+    let mut notes: Vec<String> = vec![notes_top.join("\n")];
     if !ticket.is_empty() {
-        out.push_str("\n\n");
-        out.push_str(&ticket.join("\n"));
+        notes.push(ticket.join("\n"));
     }
-    let mut used: Vec<String> = Vec::new();
     for p in parts.iter().filter(|p| !p.visible) {
         let kept: Vec<&str> = p
             .lines
@@ -307,29 +424,55 @@ pub fn layout(body: &str) -> String {
             .filter(|l| first.is_empty() || l.trim() != first)
             .collect();
         let text = squeeze(&kept.join("\n"));
-        let text = text.trim();
         let check = Part {
-            title: String::new(),
             lines: text.lines().map(str::to_string).collect(),
             visible: false,
         };
-        if !check.has_content() {
-            continue;
+        if check.has_content() {
+            notes.push(text);
         }
-        let mut anchor = slug(&p.title);
-        if anchor.is_empty() {
-            anchor = "more".to_string();
+    }
+    for (name, parts) in [
+        (label.as_str(), notes),
+        (
+            pb::EVIDENCE,
+            vec![
+                checks.join("\n"),
+                evidence.join("\n"),
+                unverified.join("\n"),
+            ],
+        ),
+        (pb::BUILT, vec![built.join("\n"), credits.join("\n")]),
+    ] {
+        let f = fold(name, &parts);
+        if !f.is_empty() {
+            out.push_str("\n\n");
+            out.push_str(&f);
         }
-        let mut n = 2;
-        let base = anchor.clone();
-        while used.contains(&anchor) {
-            anchor = format!("{base}-{n}");
-            n += 1;
-        }
-        used.push(anchor.clone());
+    }
+    // The footer line, with the closing keywords on it.
+    let mut line = foot
+        .iter()
+        .map(|l| l.trim())
+        .find(|l| l.starts_with("Opened by CoderHelm"))
+        .map(|l| {
+            l.split(" · ")
+                .filter(|p| !is_closing(p))
+                .collect::<Vec<_>>()
+                .join(" · ")
+        })
+        .unwrap_or_default();
+    if line.is_empty() && !closing.is_empty() {
+        line = "Opened by CoderHelm".to_string();
+    }
+    for c in &closing {
+        line.push_str(&format!(" · {c}"));
+    }
+    if !line.is_empty() {
         out.push_str(&format!(
-            "\n\n<details><summary><a name=\"coderhelm-{anchor}\"></a>{}</summary>{FOLD_MARK}\n\n{text}\n\n{FOLD_CLOSE}",
-            p.title.replace('<', "&lt;")
+            "\n\n{}\n{line}\n{}",
+            pb::FOOTER_START,
+            pb::FOOTER_END
         ));
     }
     if !footer.is_empty() {
@@ -365,16 +508,12 @@ pub fn visible(body: &str) -> String {
 /// One way a description fails its reader.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Flaw {
-    /// What the reader has to do is not in the first five lines.
-    ActionNotFirst,
+    /// A rule of the layout's checklist (`pr_body::defects`) broken.
+    Layout(String),
     /// A raw error, query, id or internal name in the visible text.
     Machinery(String),
     /// A statement the recorded facts do not bear out.
     Contradiction(String),
-    /// The visible part is longer than the change allows.
-    TooLong { lines: usize, budget: usize },
-    /// The same thing said twice in the visible part.
-    Repeated(String),
 }
 
 /// What must never be in sight: raw machinery and the phrases of the old
@@ -412,48 +551,19 @@ pub fn machinery(text: &str) -> Vec<String> {
     out
 }
 
-/// How a finished description fails its reader, if it does: can they find
-/// what they must do in the first five lines, is any raw machinery in
-/// sight, does anything contradict a recorded fact, is the visible part
-/// within the budget for the change, is anything said twice.
+/// How a finished description fails its reader, if it does: the layout's
+/// checklist, raw machinery in sight, and anything that contradicts a
+/// recorded fact.
 pub fn rubric(body: &str, facts: &Facts) -> Vec<Flaw> {
-    let mut flaws = Vec::new();
-    let seen = visible(body);
-    let lines: Vec<&str> = seen.lines().filter(|l| !l.trim().is_empty()).collect();
-    if !lines
-        .iter()
-        .take(5)
-        .any(|l| l.trim_start().starts_with("**Needed from you:**"))
-    {
-        flaws.push(Flaw::ActionNotFirst);
-    }
-    for m in machinery(&seen) {
+    let mut flaws: Vec<Flaw> = crate::pr_body::defects(body, facts.short_head())
+        .into_iter()
+        .map(Flaw::Layout)
+        .collect();
+    for m in machinery(&visible(body)) {
         flaws.push(Flaw::Machinery(m));
     }
     for c in crate::pr_claims::check(body, facts) {
         flaws.push(Flaw::Contradiction(c.said));
-    }
-    // The blocks that exist only when something is wrong are counted with
-    // the budget: each is one more thing out of the ordinary.
-    let extra = body
-        .lines()
-        .filter(|l| block_name(l).is_some_and(|n| VISIBLE_BLOCKS.contains(&n)))
-        .count()
-        * 4;
-    let budget = crate::pr_facts::visible_budget(facts) + extra;
-    if lines.len() > budget {
-        flaws.push(Flaw::TooLong {
-            lines: lines.len(),
-            budget,
-        });
-    }
-    let mut said: Vec<&str> = Vec::new();
-    for l in &lines {
-        let t = l.trim();
-        if t.len() >= 30 && said.contains(&t) {
-            flaws.push(Flaw::Repeated(t.to_string()));
-        }
-        said.push(t);
     }
     flaws
 }
@@ -461,58 +571,65 @@ pub fn rubric(body: &str, facts: &Facts) -> Vec<Flaw> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pr_body::{FOOTER_END, FOOTER_START};
 
-    const LEAD: &str = "<!-- coderhelm:lead -->\nRetries the export poller three times before it gives up.\n\n**Check:** 2 recorded checks passed on `abc1234`.\n**Needed from you:** Nothing.\n**Review:** decide whether this is right to merge. Feedback wanted: nothing specific is flagged.\n<!-- /coderhelm:lead -->";
+    const LEAD: &str = "<!-- coderhelm:lead -->\n<!-- coderhelm:body v1 ticket=OPS-41 head=abc1234 -->\nRetries the export poller three times before it gives up (OPS-41).<!-- ch:summary-end -->\n\n### Review focus\n\n- Approach: does this do what OPS-41 asks?\n\n**Risk:** Low. One module changes.\n\n**Rollback:** Revert this pull request.\n\n### Verification\n\nOn abc1234 (head of this PR):\n\n| Check | Result |\n|---|---|\n| lint (CI) | Passed |\n\n<!-- /coderhelm:lead -->";
 
     fn body() -> String {
         format!(
-            "<!-- coderhelm:draft-status -->\n**Draft:** CI is still running.\n<!-- /coderhelm:draft-status -->\n\nSource ticket: OPS-41\n\n{LEAD}\n\n## Summary\n\nRetries the export poller three times before it gives up.\n\n## Changes\n\n* `src/export/poller.rs`: the retry loop.\n\n<!-- coderhelm:reviewer-guide -->\n**For the reviewer**\n* **Roll back:** revert this pull request.\n<!-- /coderhelm:reviewer-guide -->\n\n## Risk\n\n**Low**: one module.\n\n## Verification\n\n<!-- coderhelm:unverified -->\n## Open items\n- The staging secret is not set.\n<!-- /coderhelm:unverified -->\n\n<sub>Consulted: the platform agent</sub>\n\n<!-- coderhelm:built-for abc1234 0f -->"
+            "<!-- coderhelm:draft-status -->\n**Draft:** CI is still running.\n<!-- /coderhelm:draft-status -->\n\nSource ticket: OPS-41\n\n{LEAD}\n\n## Summary\n\nRetries the export poller three times before it gives up.\n\n## Changes\n\n* `src/export/poller.rs`: the retry loop.\n\n<!-- coderhelm:reviewer-guide -->\n**For the reviewer**\n* **Roll back:** revert this pull request.\n<!-- /coderhelm:reviewer-guide -->\n\n## Risk\n\n**Low**: one module.\n\n## Verification\n\n<!-- coderhelm:unverified -->\n## Open items\n- The staging secret is not set.\n<!-- /coderhelm:unverified -->\n\n{FOOTER_START}\nOpened by CoderHelm from OPS-41\n{FOOTER_END}\n\nCloses #12\n\n<sub>Consulted: the platform agent</sub>\n\n<!-- coderhelm:built-for abc1234 0f -->"
         )
     }
 
     #[test]
-    fn the_lead_comes_first_and_the_rest_is_collapsed() {
+    fn the_lead_comes_first_and_the_rest_is_in_three_folds() {
         let out = layout(&body());
         assert!(out.starts_with(LEAD), "{out}");
         let seen = visible(&out);
         assert!(seen.contains("**Draft:** CI is still running."), "{seen}");
-        assert!(seen.contains("Source ticket: OPS-41"), "{seen}");
-        assert!(
-            !seen.contains("## Changes") && !seen.contains("Open items"),
-            "{seen}"
-        );
-        // Each part is under its own name, with an anchor that stays.
-        for (anchor, title) in [
-            ("coderhelm-changes", "Changes"),
-            ("coderhelm-for-the-reviewer", "For the reviewer"),
-            ("coderhelm-risk", "Risk"),
-            ("coderhelm-open-items", "Open items"),
-        ] {
-            assert!(
-                out.contains(&format!(
-                    "<details><summary><a name=\"{anchor}\"></a>{title}</summary>"
-                )),
-                "{anchor}: {out}"
-            );
+        for gone in ["## Changes", "Open items", "Source ticket", "Consulted"] {
+            assert!(!seen.contains(gone), "{gone}: {seen}");
         }
+        let labels: Vec<&str> = out
+            .lines()
+            .filter_map(|l| l.strip_prefix("<summary>"))
+            .collect();
+        assert_eq!(
+            labels,
+            vec![
+                "Implementation notes</summary><!-- fold -->",
+                "Full test evidence</summary><!-- fold -->",
+                "How CoderHelm built this</summary><!-- fold -->",
+            ],
+            "{out}"
+        );
         // The Summary only repeated the lead; Verification said nothing.
-        assert!(!out.contains("## Summary"), "{out}");
-        assert!(!out.contains("## Verification"), "{out}");
+        assert!(!out.contains("\n## Summary"), "{out}");
+        assert!(!out.contains("\n## Verification"), "{out}");
         assert_eq!(
             out.matches("Retries the export poller three times").count(),
             1
         );
-        // The footer and the stamp stay last, outside every fold.
+        // The footer line carries the closing keyword, and the stamp stays
+        // last.
         assert!(
-            out.ends_with(
-                "<sub>Consulted: the platform agent</sub>\n<!-- coderhelm:built-for abc1234 0f -->"
-            ),
+            out.contains("Opened by CoderHelm from OPS-41 · Closes #12\n"),
+            "{out}"
+        );
+        assert!(
+            out.ends_with("<!-- coderhelm:built-for abc1234 0f -->"),
             "{out}"
         );
         assert_eq!(
             out.matches("<details>").count(),
             out.matches("</details>").count()
         );
+        // A blank line after each summary, so what is inside is parsed.
+        for (i, l) in out.lines().enumerate() {
+            if l.starts_with("<summary>") {
+                assert_eq!(out.lines().nth(i + 1), Some(""), "{out}");
+            }
+        }
     }
 
     #[test]
@@ -527,6 +644,7 @@ mod tests {
             "- The staging secret is not set.",
             "<!-- coderhelm:unverified -->",
             "<!-- /coderhelm:unverified -->",
+            "Source ticket: OPS-41",
         ] {
             assert!(flat.lines().any(|x| x == l), "lost: {l}\n{flat}");
         }
@@ -555,22 +673,19 @@ mod tests {
     }
 
     #[test]
-    fn a_section_appended_after_the_stamp_goes_above_it() {
+    fn a_section_appended_after_the_stamp_goes_in_the_first_fold() {
         let once = layout(&body());
         let appended = format!(
             "{once}\n\n<!-- coderhelm:ci-notes -->\n**CI notes**\n- `e2e` was re-run once.\n<!-- /coderhelm:ci-notes -->"
         );
         let out = layout(&appended);
         assert!(
-            out.ends_with(
-                "<sub>Consulted: the platform agent</sub>\n<!-- coderhelm:built-for abc1234 0f -->"
-            ),
+            out.ends_with("<!-- coderhelm:built-for abc1234 0f -->"),
             "{out}"
         );
-        assert!(
-            out.contains("<a name=\"coderhelm-ci-notes\"></a>CI notes</summary>"),
-            "{out}"
-        );
+        assert!(!visible(&out).contains("CI notes"), "{out}");
+        assert!(out.contains("- `e2e` was re-run once."), "{out}");
+        assert!(out.matches("<details>").count() <= 3, "{out}");
         assert_eq!(layout(&out), out);
     }
 
@@ -581,13 +696,24 @@ mod tests {
     }
 
     #[test]
-    fn the_old_not_done_block_gives_way_to_the_lead() {
+    fn the_old_folds_and_not_done_block_give_way() {
         let b = format!(
-            "<!-- coderhelm:not-done:start -->\n**Not done: this ticket still needs access CoderHelm doesn't have**\n\n- Deploy the staging Studio\n<!-- coderhelm:not-done:end -->\n\n{LEAD}\n\n## Changes\n\n* one\n"
+            "<!-- coderhelm:not-done:start -->\n**Not done: this ticket still needs access CoderHelm doesn't have**\n\n- Deploy the staging Studio\n<!-- coderhelm:not-done:end -->\n\n{LEAD}\n\n<details><summary><a name=\"coderhelm-more\"></a>More</summary><!-- fold -->\n\n* one\n\n</details><!-- fold -->\n"
         );
         let out = layout(&b);
         assert!(!out.contains("Not done: this ticket"), "{out}");
+        assert!(!out.contains(">More<"), "{out}");
         assert!(out.contains("* one"), "{out}");
+    }
+
+    #[test]
+    fn generated_blocks_are_stripped_and_the_closing_keyword_kept() {
+        let once = layout(&body());
+        let written = strip_generated(&once);
+        assert!(!written.contains("### Review focus"), "{written}");
+        assert!(!written.contains("Opened by CoderHelm"), "{written}");
+        assert!(written.contains("Closes #12"), "{written}");
+        assert!(written.contains("* `src/export/poller.rs`"), "{written}");
     }
 
     #[test]
@@ -598,10 +724,9 @@ mod tests {
         };
         let good = layout(&body());
         assert_eq!(rubric(&good, &facts), vec![]);
-        // Raw machinery in sight, the action buried, and a line twice.
-        let bad = "## Summary\n\nDeploys the Studio.\n\nCoderHelm could not do it: HTTP status client error (403 Forbidden) for url (https://api.github.com/repos/acme/site/actions/workflows/test.yml/dispatches): {\"message\":\"Resource not accessible by integration\"}\n\nHow: query_content on production with the confirm query. (owner: the owner of the last step)\nHow: query_content on production with the confirm query. (owner: the owner of the last step)\n";
+        // Raw machinery in sight, and the old labels.
+        let bad = "Deploys the Studio.\n\nCoderHelm could not do it: HTTP status client error (403 Forbidden) for url (https://api.github.com/repos/acme/site/actions/workflows/test.yml/dispatches): {\"message\":\"Resource not accessible by integration\"}\n\nHow: query_content on production with the confirm query. (owner: the owner of the last step)\n";
         let flaws = rubric(bad, &facts);
-        assert!(flaws.contains(&Flaw::ActionNotFirst), "{flaws:?}");
         for m in [
             "HTTP status",
             "403 Forbidden",
@@ -616,23 +741,16 @@ mod tests {
             );
         }
         assert!(
-            flaws.iter().any(|f| matches!(f, Flaw::Repeated(_))),
+            flaws
+                .iter()
+                .any(|f| matches!(f, Flaw::Layout(d) if d.contains("no Review focus"))),
             "{flaws:?}"
         );
         // Folded away, the same machinery is evidence, not a flaw.
         let folded = format!(
-            "{LEAD}\n\n<details><summary>Evidence</summary>\n\nquery_content returned [{{\"n\":392}}]\n\n</details>"
+            "{}\n\n<details>\n<summary>Full test evidence</summary>\n\nquery_content returned [{{\"n\":392}}]\n\n</details>\n\nOpened by CoderHelm",
+            LEAD
         );
         assert_eq!(rubric(&folded, &facts), vec![]);
-        let long = format!(
-            "{LEAD}\n\n{}",
-            (0..30)
-                .map(|i| format!("line {i}"))
-                .collect::<Vec<_>>()
-                .join("\n\n")
-        );
-        assert!(rubric(&long, &facts)
-            .iter()
-            .any(|f| matches!(f, Flaw::TooLong { .. })));
     }
 }

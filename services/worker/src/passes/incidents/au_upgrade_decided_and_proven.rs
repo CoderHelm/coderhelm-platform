@@ -988,6 +988,7 @@ fn the_description_carries_all_five_for_the_head_it_is_of() {
             run_url: "",
             notes: vec![],
             evidence: vec![],
+            repo_url: "https://github.com/acme/site",
         }),
         None,
     );

@@ -10,11 +10,14 @@
 //!
 //! - every failure the reviewer flagged is gone ([`Case::flagged`]) and
 //!   what they needed is in sight ([`Case::in_sight`]);
-//! - the rubric finds nothing (`pr_layout::rubric`): what the reader has to
-//!   do is in the first five lines, no raw error, query, id or internal
-//!   tool name is in the visible text, nothing contradicts a recorded fact,
-//!   the visible part is within the budget for the change, nothing is said
-//!   twice;
+//! - the rubric finds nothing (`pr_layout::rubric`): the layout's checklist
+//!   (`pr_body::defects`: the fixed order, the word budget, at most three
+//!   folds, the sha once, no "did not run" rows, no arrows or ellipses), no
+//!   raw error, query, id or internal tool name in the visible text, and
+//!   nothing that contradicts a recorded fact;
+//! - the same checklist holds on the HTML a CommonMark renderer makes of it
+//!   ([`rendered_defects`]): nothing swallowed into a list item, every
+//!   collapsed block parsed, no heading in sight but the three;
 //! - shaping the result again changes nothing.
 //!
 //! It runs with `cargo test --workspace`, which CI runs on every change, so
@@ -40,8 +43,13 @@
 
 use std::collections::HashMap;
 
-use common::pr_facts::{Advisories, DepLine, DependencyFacts, Facts, Why};
+use common::pr_body::{HumanItem, ItemKind, Merge, Screens};
+use common::pr_facts::{
+    Advisories, CheckFact, DepLine, DependencyFacts, Facts, FileChange, MajorEvidence, Outcome,
+    Probe, Risk, Why,
+};
 use common::pr_layout::{self, Flaw};
+use common::pr_steps::{Checked, State as StepState, Step, When};
 
 use super::description_facts::{self, Inputs, Shaped};
 use super::fix_location::{FixDecision, FixLocation, OutsideChange};
@@ -123,6 +131,7 @@ pub fn dependency_facts() -> Facts {
                     moved: true,
                     major: false,
                     remaining: vec![],
+                    fixed: vec![],
                 },
                 DepLine {
                     package: "tiny-yaml".into(),
@@ -131,6 +140,7 @@ pub fn dependency_facts() -> Facts {
                     moved: true,
                     major: true,
                     remaining: vec![],
+                    fixed: vec![],
                 },
                 DepLine {
                     package: "left-trim".into(),
@@ -139,6 +149,7 @@ pub fn dependency_facts() -> Facts {
                     moved: false,
                     major: false,
                     remaining: vec!["GHSA-aaaa-bbbb-cccc".into()],
+                    fixed: vec![],
                 },
             ],
             advisories: Advisories {
@@ -153,6 +164,7 @@ pub fn dependency_facts() -> Facts {
         run_url: "https://app.example.com/runs/detail?id=run-dep",
         notes: vec![],
         evidence: vec![],
+        repo_url: "https://github.com/acme/site",
     })
 }
 
@@ -173,14 +185,16 @@ pub fn dependency_case() -> Case {
             // A blanket claim with nothing behind it, and a wrong total.
             "contract is unchanged",
             "Fixes 31 advisories",
+            // Nothing is needed: the section is not there at all.
+            "### Needed from you",
         ],
         in_sight: vec![
-            "**Needed from you:** Nothing.",
             // Why each major jump is safe, or that nothing says so.
-            "`tiny-yaml` 1.2.0 to 2.0.0 crosses a major version. No safety evidence is recorded",
-            "2 advisories are not fixed by this pull request (2 high)",
-            "Fixes 2 advisories in 3 package version lines. 2 high advisories remain.",
-            "3 recorded checks passed on `5e4d3c2`",
+            "| `tiny-yaml` | 1.2.0 to 2.0.0 | Major; no safety evidence is recorded: read its upgrade notes |",
+            "| `left-trim` | 0.9.1 | Security: GHSA-aaaa-bbbb-cccc still open. Not moved on the head |",
+            "Updates 2 packages: 1 major, 1 patch. Fixes 2 security advisories; 2 stay open (2 high). 1 line the plan named did not move on the head.",
+            "On 5e4d3c2 (head of this PR):",
+            "| build (CI) | Passed |",
         ],
         collapsed: vec![
             "| `glob-walk` | 2.1.0 to 2.1.4 |",
@@ -321,6 +335,7 @@ pub fn feature_facts(c: &OutsideChange, body: &str) -> Facts {
         run_url: "https://app.example.com/runs/detail?id=run-web",
         notes: vec![],
         evidence: vec![],
+        repo_url: "https://github.com/acme/site",
     })
 }
 
@@ -351,11 +366,16 @@ pub fn feature_case() -> Case {
             "`none, because",
             // The ticket restated.
             "New work: the ticket asks",
+            // How to let CoderHelm is for its settings, not the team's PR.
+            "To let it:",
+            "(the reviewer)",
+            "(a repository admin)",
         ],
         in_sight: vec![
-            "**Needed from you:**\n1. After merging: Deploy the staging Studio: run `cd apps/studio && npm run deploy:staging`. CoderHelm could not: CoderHelm's GitHub App is not allowed to start workflows in this repository. To let it: grant the app \"Actions: write\" (GitHub, Settings, Installed GitHub Apps, CoderHelm, Permissions). (a repository admin)",
-            "2. Look at Studio: the page document, the title field. CoderHelm cannot: how a page looks is a judgement only a person can make. (the reviewer)",
-            "**Check:** `npm test --workspace apps/studio`; 2 recorded checks passed on `9f8e7d6`.",
+            "### Needed from you\n- [ ] <!-- ch:deploy-the-staging-studio --> **Repository admin**, after merge: Deploy the staging Studio. Why a person: CoderHelm's GitHub App is not allowed to start workflows in this repository.\n  ```sh\n  cd apps/studio && npm run deploy:staging\n  ```",
+            // Looking at the change is review work.
+            "- See it: Studio: the page document, the title field.",
+            "| Test Suite (CI) | Passed |",
         ],
         collapsed: vec![
             // Waiting on a named event, with who approves and where.
@@ -409,6 +429,7 @@ pub fn ticket_case() -> Case {
             run_url: "https://app.example.com/runs/detail?id=run-ops",
             notes: vec![],
             evidence: vec![],
+            repo_url: "https://github.com/acme/site",
         }),
         reply: Some(
             r#"{"summary": "Retries a timed-out export poll three times before giving up. All tests pass.", "check": "make ship", "drop": []}"#,
@@ -422,19 +443,326 @@ pub fn ticket_case() -> Case {
             "contract unchanged",
             // A command the description never gave.
             "make ship",
+            "### Needed from you",
+            "**Check:**",
         ],
         in_sight: vec![
-            "Retries a timed-out export poll three times before giving up.",
-            "**Check:** `cargo test -p export`; 1 of 2 recorded checks passed on `abc1234`.",
-            "**Needed from you:** Nothing.",
-            "[`unit tests`](https://ci.example.com/unit-tests) failed on `abc1234`",
-            "Source ticket: OPS-41",
+            "Retries a timed-out export poll three times before giving up (OPS-41).",
+            "| unit tests (CI) | Failed: [log](https://ci.example.com/unit-tests) |",
+            "On abc1234 (head of this PR):",
         ],
         collapsed: vec![
             "* `src/export/poller.rs`: the retry loop and its limit.",
             "* **Roll back:** revert this pull request.",
+            "How to check: `cargo test -p export`.",
+            "Source ticket: OPS-41",
         ],
     }
+}
+
+// ── The layout's filled examples, as golden files ────────────────────────
+
+fn file(path: &str, status: &str, changed: usize) -> FileChange {
+    FileChange {
+        path: path.into(),
+        status: status.into(),
+        changed,
+        ..Default::default()
+    }
+}
+
+fn ci(name: &str, outcome: Outcome) -> CheckFact {
+    CheckFact {
+        name: name.into(),
+        outcome,
+        url: format!("https://ci.example.com/{}", name.replace(' ', "-")),
+    }
+}
+
+/// The written walkthrough of the UI change: what the model wrote.
+pub const UI_WRITTEN: &str = "## Implementation notes\n\n- `hero-block-validation.ts`: a `Rule.custom` that returns a warning (not an error) above 160 characters, so publishing is never blocked.\n- `hero-block.ts` and `schemaTypes/index.ts`: register the rule on the Default variant only; other Hero variants have their own layouts.\n- Rejected: `Rule.max(160)`, which is an error and would block 23 published documents from being re-saved.\n";
+
+/// Example A of the layout: a small UI validation change with one thing a
+/// person must do after merge.
+pub fn ui_facts() -> Facts {
+    Facts {
+        head: "d78bb24e1f0a9c3b5d7e2f4a6c8b0d1e3f5a7c9b".into(),
+        summary: "Adds a Studio warning when a Hero (Default) subtitle is longer than 160 characters, so editors fix long subtitles before they break the hero layout. Editors can still publish.".into(),
+        why: Some(Why {
+            reference: "KEY-123".into(),
+            title: "Hero subtitle character limit".into(),
+            url: "https://tracker.example.com/browse/KEY-123".into(),
+        }),
+        files: vec![
+            file("apps/studio/schemaTypes/blocks/hero-block-validation.ts", "added", 21),
+            file("apps/studio/schemaTypes/blocks/hero-block.ts", "modified", 4),
+            file("apps/studio/schemaTypes/index.ts", "modified", 2),
+        ],
+        files_complete: true,
+        checks: vec![
+            ci("Lint and typecheck", Outcome::Passed),
+            ci("Unit tests", Outcome::Passed),
+            ci("Studio build", Outcome::Passed),
+            // A deploy workflow's job, skipped on a pull request: never listed.
+            ci("Deploy to Production", Outcome::DidNotRun),
+        ],
+        checks_read: true,
+        risk: Some(Risk {
+            level: "Low".into(),
+            why: "warning-level validation only; no schema, data, or publish-flow change".into(),
+            look_first: Some((
+                "apps/studio/schemaTypes/blocks/hero-block-validation.ts".into(),
+                "the rule, +21 lines".into(),
+            )),
+            rollback: "revert this PR and redeploy Studio; nothing to undo in data".into(),
+        }),
+        needed: vec![HumanItem {
+            id: "deploy-staging".into(),
+            kind: ItemKind::Run,
+            owner: "@studio-owner".into(),
+            merge: Merge::After,
+            action: "Deploy Studio to staging so editors see the warning".into(),
+            why: "the repo has no deploy workflow CoderHelm can start".into(),
+            command: "cd apps/studio && npm run deploy:staging".into(),
+            ..Default::default()
+        }],
+        steps: vec![
+            Step {
+                what: "Post the 23 documents already over the limit on KEY-123".into(),
+                how: String::new(),
+                when: When::Any,
+                owner: "CoderHelm".into(),
+                state: StepState::Done {
+                    evidence: "posted on the ticket for the content team".into(),
+                },
+            },
+            Step {
+                what: "Look at document `/private-events/weddings`, Hero, Sub Title field".into(),
+                how: String::new(),
+                when: When::Any,
+                owner: "the reviewer".into(),
+                state: StepState::Person {
+                    why: "how a page looks is a judgement only a person can make".into(),
+                    unblock: String::new(),
+                },
+            },
+        ],
+        checked: vec![Checked {
+            what: "Studio in local dev, manual".into(),
+            result: "warning shows at 161 characters; Publish stays enabled".into(),
+            when: String::new(),
+        }],
+        how_to_check: "`npm test -- hero-block-validation`".into(),
+        review_question: "Approach: is a non-blocking warning what KEY-123 asks for, or should over-limit subtitles block publishing?".into(),
+        preview_url: "https://preview.example.com/studio".into(),
+        screens: Some(Screens::Images {
+            before: "https://github.com/user-attachments/assets/before-example".into(),
+            before_alt: "Sub Title field with a 190-character subtitle and no warning".into(),
+            after: "https://github.com/user-attachments/assets/after-example".into(),
+            after_alt: "Same field showing the warning 'Over 160 characters (190)'".into(),
+        }),
+        run_url: "https://app.example.com/runs/detail?id=run-4812".into(),
+        repo_url: "https://github.com/acme/site".into(),
+        ..Default::default()
+    }
+}
+
+/// Example B of the layout: 48 npm packages, three of them major.
+pub fn dependency_48_facts() -> Facts {
+    let mut lines = vec![
+        DepLine {
+            package: "next".into(),
+            from: "14.2.15".into(),
+            to: "15.1.0".into(),
+            moved: true,
+            major: true,
+            ..Default::default()
+        },
+        DepLine {
+            package: "eslint".into(),
+            from: "8.57.0".into(),
+            to: "9.17.0".into(),
+            moved: true,
+            major: true,
+            ..Default::default()
+        },
+        DepLine {
+            package: "@types/node".into(),
+            from: "20.17.6".into(),
+            to: "22.10.2".into(),
+            moved: true,
+            major: true,
+            ..Default::default()
+        },
+        DepLine {
+            package: "cookie-jar".into(),
+            from: "0.6.0".into(),
+            to: "0.7.2".into(),
+            moved: true,
+            fixed: vec!["GHSA-aaaa-bbbb-0001".into()],
+            ..Default::default()
+        },
+        DepLine {
+            package: "route-match".into(),
+            from: "6.2.2".into(),
+            to: "6.3.0".into(),
+            moved: true,
+            fixed: vec!["GHSA-aaaa-bbbb-0002".into()],
+            ..Default::default()
+        },
+    ];
+    // Seven more minor updates and thirty-six patches.
+    for i in 0..43 {
+        let minor = i < 7;
+        lines.push(DepLine {
+            package: format!("util-{i:02}"),
+            from: "1.4.2".into(),
+            to: if minor {
+                "1.5.0".into()
+            } else {
+                "1.4.3".into()
+            },
+            moved: true,
+            ..Default::default()
+        });
+    }
+    let majors = vec![
+        MajorEvidence {
+            package: "next".into(),
+            from: "14.2.15".into(),
+            to: "15.1.0".into(),
+            evidence: vec!["`fetch` is no longer cached by default; restored with explicit `cache: \"force-cache\"` in 2 routes".into()],
+        },
+        MajorEvidence {
+            package: "eslint".into(),
+            from: "8.57.0".into(),
+            to: "9.17.0".into(),
+            evidence: vec!["`.eslintrc` replaced with `eslint.config.mjs`; same rules".into()],
+        },
+        MajorEvidence {
+            package: "@types/node".into(),
+            from: "20.17.6".into(),
+            to: "22.10.2".into(),
+            evidence: vec!["types only; matches the Node 22 runtime already in use".into()],
+        },
+    ];
+    Facts {
+        head: "4be19a07c1d2e3f405162738495a6b7c8d9e0f1a".into(),
+        why: Some(Why {
+            reference: "KEY-456".into(),
+            title: "Monthly dependency maintenance".into(),
+            url: "https://tracker.example.com/browse/KEY-456".into(),
+        }),
+        files: vec![
+            file("package.json", "modified", 96),
+            file("package-lock.json", "modified", 2400),
+            file("next.config.ts", "modified", 12),
+            file("eslint.config.mjs", "added", 40),
+            file(".eslintrc.json", "removed", 30),
+            file("app/products/page.ts", "modified", 2),
+        ],
+        files_complete: true,
+        checks: vec![
+            ci("Install from lockfile, npm ci", Outcome::Passed),
+            ci("Lint", Outcome::Passed),
+            ci("Typecheck", Outcome::Passed),
+            ci("Unit tests (1/3)", Outcome::Passed),
+            ci("Unit tests (2/3)", Outcome::Passed),
+            ci("Unit tests (3/3)", Outcome::Passed),
+            ci("Build", Outcome::Passed),
+            ci("E2E on preview", Outcome::Passed),
+            ci("Deploy preview to production", Outcome::DidNotRun),
+        ],
+        checks_read: true,
+        risk: Some(Risk {
+            level: "Medium".into(),
+            why: "Next 15 changes request caching across all pages; a missed caching default would surface as stale or uncached data, not a crash".into(),
+            look_first: Some((
+                "next.config.ts".into(),
+                "caching defaults changed in Next 15".into(),
+            )),
+            rollback: "revert this PR; the lockfile restores every version. No data or config outside the repo changes".into(),
+        }),
+        dependency: Some(DependencyFacts {
+            lines,
+            advisories: Advisories {
+                fixed: vec!["GHSA-aaaa-bbbb-0001".into(), "GHSA-aaaa-bbbb-0002".into()],
+                ..Default::default()
+            },
+            majors,
+            probes: vec![Probe {
+                what: "Cached routes `/products` and `/blog`".into(),
+                before: "cache HIT on second request".into(),
+                after: "cache HIT on second request".into(),
+            }],
+            ecosystem: "npm".into(),
+            ..Default::default()
+        }),
+        run_url: "https://app.example.com/runs/detail?id=run-4907".into(),
+        repo_url: "https://github.com/acme/site".into(),
+        ..Default::default()
+    }
+}
+
+/// What the run wrote for the dependency update.
+pub const DEPENDENCY_48_WRITTEN: &str = "## Changes\n\n### next 14.2.15 to 15.1.0\n\n- `next.config.ts`: explicit `cache: \"force-cache\"` on the 2 routes that relied on the old default.\n\n### eslint 8.57.0 to 9.17.0\n\n- `eslint.config.mjs` replaces `.eslintrc.json` with the same rules.\n";
+
+/// The description as the layout before this one wrote it for example A:
+/// a lead of bold labels, a numbered list that swallowed the lines after
+/// it, workflows that never run on a pull request listed as not run, and
+/// seven folds.
+pub const OLD_LAYOUT_BEFORE: &str = "<!-- coderhelm:lead -->\nAdds a Studio warning when a Hero (Default) subtitle is longer than 160 characters.\n\n**Check:** `cd apps/studio && npm run deploy:staging`; 6 recorded checks passed on `d78bb24`.\n**Risk:** **Low**.\n**Needed from you:**\n1. After merging: Deploy the staging Studio: run `cd apps/studio && npm run deploy:staging`. CoderHelm could not: CoderHelm's GitHub App is not allowed to start workflows in this repository. To let it: add `workflow_dispatch` to the deploy workflow. (a person on the team)\n2. Look at Studio: /private-events/weddings, hero Sub Title field. (the reviewer)\n3. Missing from the end-to-end checklist: the documents already over the limit. Add a checklist step owned by CoderHelm to query and post them. (a person)\n   **Review:** decide whether this does what KEY-123 asks. Feedback wanted: is a warning enough.\n   **Look at first:**\n- `Deploy to Production` did not run on `d78bb24`. What it checks is not verified.\n- `Deploy Preview` did not run on `d78bb24`. What it checks is not verified.\n- and 6 more: [the full list is on the run page](https://app.example.com/runs/detail?id=run-4812).\n<!-- /coderhelm:lead -->\n\nSource ticket: KEY-123\n\n<details><summary><a name=\"coderhelm-description\"></a>Description</summary><!-- fold -->\n\nAdds the warning rule.\n\n</details><!-- fold -->\n\n<details><summary><a name=\"coderhelm-more\"></a>More</summary><!-- fold -->\n\n## Implementation notes\n\n- `hero-block-validation.ts`: a `Rule.custom` that returns a warning (not an error) above 160 characters, so publishing is never blocked.\n\n</details><!-- fold -->";
+
+/// Where the golden files are.
+fn golden_path(name: &str) -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src/passes/description_goldens")
+        .join(format!("{name}.md"))
+}
+
+/// The examples, shaped by the same function production runs: `(name,
+/// title, body, facts)`.
+pub fn golden_cases() -> Vec<(&'static str, &'static str, String, Facts)> {
+    vec![
+        (
+            "ui_change",
+            "feat(studio): warn when Hero subtitle exceeds 160 characters",
+            UI_WRITTEN.to_string(),
+            ui_facts(),
+        ),
+        (
+            "dependency_48",
+            "chore(deps): update 48 npm packages (3 major)",
+            DEPENDENCY_48_WRITTEN.to_string(),
+            dependency_48_facts(),
+        ),
+        (
+            "before_rewritten",
+            "KEY-123: Warn when the Hero subtitle exceeds 160 characters",
+            OLD_LAYOUT_BEFORE.to_string(),
+            Facts {
+                needed: vec![],
+                steps: vec![
+                    Step {
+                        what: "Deploy the staging Studio".into(),
+                        how: "cd apps/studio && npm run deploy:staging".into(),
+                        when: When::AfterMerge,
+                        owner: "Studio owner".into(),
+                        state: StepState::Failed {
+                            cause: "the repo has no deploy workflow CoderHelm can start".into(),
+                            unblock: "add `workflow_dispatch` to the deploy workflow".into(),
+                        },
+                    },
+                    ui_facts().steps[1].clone(),
+                    ui_facts().steps[0].clone(),
+                ],
+                review_question: String::new(),
+                screens: None,
+                preview_url: String::new(),
+                ..ui_facts()
+            },
+        ),
+    ]
 }
 
 /// Every case of the eval.
@@ -465,22 +793,154 @@ pub fn failures(case: &Case, out: &Shaped) -> Vec<String> {
     }
     for flaw in pr_layout::rubric(&out.body, &out.facts) {
         why.push(match flaw {
-            Flaw::ActionNotFirst => {
-                "what the reader has to do is not in the first five lines".to_string()
-            }
+            Flaw::Layout(d) => format!("layout: {d}"),
             Flaw::Machinery(m) => format!("raw machinery in sight: {m}"),
             Flaw::Contradiction(s) => format!("contradicts a recorded fact: {s}"),
-            Flaw::TooLong { lines, budget } => {
-                format!("{lines} visible lines, the budget for this change is {budget}")
-            }
-            Flaw::Repeated(l) => format!("said twice: {l}"),
         });
+    }
+    for d in rendered_defects(&out.body) {
+        why.push(format!("as GitHub renders it: {d}"));
     }
     let again = description_facts::shape(&out.body, case.title, case.facts.clone(), None);
     if again.body != out.body {
         why.push("shaping it again changes it".to_string());
     }
     why
+}
+
+/// The HTML a CommonMark (GFM) renderer makes of `body`.
+pub fn rendered(body: &str) -> String {
+    use pulldown_cmark::{html, Options, Parser};
+    let opts = Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS | Options::ENABLE_STRIKETHROUGH;
+    let mut out = String::new();
+    html::push_html(&mut out, Parser::new_ext(body, opts));
+    out
+}
+
+/// `html` without its comments.
+fn without_comments(html: &str) -> String {
+    let mut t = html.to_string();
+    while let (Some(a), Some(b)) = (t.find("<!--"), t.find("-->")) {
+        if b < a {
+            break;
+        }
+        t.replace_range(a..b + 3, "");
+    }
+    t
+}
+
+/// Each `<tag ...>...</tag>` of `html`, outermost first (no nesting of the
+/// same tag is expected in a description).
+fn elements<'a>(html: &'a str, tag: &str) -> Vec<&'a str> {
+    let (open, close) = (format!("<{tag}"), format!("</{tag}>"));
+    let mut out = Vec::new();
+    let mut at = 0;
+    while let Some(a) = html[at..].find(&open) {
+        let a = at + a;
+        let Some(b) = html[a..].find(&close) else {
+            break;
+        };
+        out.push(&html[a..a + b + close.len()]);
+        at = a + b + close.len();
+    }
+    out
+}
+
+/// The layout's checklist on the rendered structure: what a reader of the
+/// pull request page gets, not what the source says.
+pub fn rendered_defects(body: &str) -> Vec<String> {
+    let html = without_comments(&rendered(body));
+    let mut d = Vec::new();
+    let folds = elements(&html, "details");
+    if folds.len() > common::pr_body::MAX_FOLDS {
+        d.push(format!("{} <details>", folds.len()));
+    }
+    for f in &folds {
+        let inner = f.split("</summary>").nth(1).unwrap_or("");
+        if !["<p>", "<ul>", "<ol>", "<table>", "<h", "<pre>"]
+            .iter()
+            .any(|t| inner.contains(t))
+        {
+            d.push(format!(
+                "a <details> whose content was not parsed: {}",
+                common::truncate_str(f, 120)
+            ));
+        }
+        let label = f
+            .split("<summary>")
+            .nth(1)
+            .and_then(|x| x.split("</summary>").next())
+            .unwrap_or("");
+        if label.contains("**") || label.contains('`') {
+            d.push(format!("markup shown raw in a summary: {label}"));
+        }
+        for raw in ["**", "|---", "| ---"] {
+            if inner
+                .split('<')
+                .filter(|seg| !seg.starts_with("code") && !seg.starts_with("pre"))
+                .any(|seg| seg.contains(raw))
+            {
+                d.push(format!("raw `{raw}` inside a <details>"));
+            }
+        }
+    }
+    let mut visible = html.clone();
+    for f in &folds {
+        visible = visible.replacen(f, "", 1);
+    }
+    let start = visible.trim_start();
+    let opens_with_summary = start.starts_with("<p>")
+        || (start.starts_with("<blockquote>")
+            && start
+                .split_once("</blockquote>")
+                .is_some_and(|(_, rest)| rest.trim_start().starts_with("<p>")));
+    if !opens_with_summary {
+        d.push(format!(
+            "the first block is not the Summary: {}",
+            common::truncate_str(start, 80)
+        ));
+    }
+    let allowed = ["Needed from you", "Review focus", "Verification"];
+    for h in ["h1", "h2", "h3"] {
+        for e in elements(&visible, h) {
+            let text = e
+                .split_once('>')
+                .map(|(_, r)| r.trim_end_matches(&format!("</{h}>")))
+                .unwrap_or("");
+            if h != "h3" || !allowed.contains(&text) {
+                d.push(format!("a heading in sight: {e}"));
+            }
+        }
+    }
+    for li in elements(&visible, "li") {
+        for label in [
+            "Review",
+            "Look at",
+            "Risk",
+            "Rollback",
+            "Verification",
+            "Feedback",
+        ] {
+            if li.contains(&format!("<strong>{label}")) {
+                d.push(format!("a section label inside a list item: {li}"));
+            }
+        }
+        if li.matches("<strong>").count() > 1 {
+            d.push(format!("a list item holds more than one bold label: {li}"));
+        }
+    }
+    let boxes = visible.matches("type=\"checkbox\"").count();
+    if boxes > common::pr_body::MAX_ITEMS {
+        d.push(format!("{boxes} task items in sight"));
+    }
+    for t in elements(&visible, "table") {
+        let head = t.split("</thead>").next().unwrap_or("");
+        let cols = head.matches("<th>").count() + head.matches("<th ").count();
+        if cols > 4 {
+            d.push(format!("a table of {cols} columns"));
+        }
+    }
+    d
 }
 
 #[cfg(test)]
@@ -539,7 +999,7 @@ mod tests {
         // section: the buried action and each piece of raw machinery.
         let c = feature_case();
         let flaws = pr_layout::rubric(FEATURE_BEFORE, &c.facts);
-        assert!(flaws.contains(&Flaw::ActionNotFirst));
+        assert!(flaws.iter().any(|f| matches!(f, Flaw::Layout(_))));
         for m in [
             "HTTP status",
             "403 Forbidden",
@@ -551,7 +1011,6 @@ mod tests {
                 "{m}: {flaws:?}"
             );
         }
-        assert!(flaws.iter().any(|f| matches!(f, Flaw::TooLong { .. })));
     }
 
     /// The ticket comment about the outside steps is held to the same
@@ -588,13 +1047,88 @@ mod tests {
         );
     }
 
+    /// The layout's filled examples and the old layout's output, rewritten:
+    /// each matches its golden file (`UPDATE_GOLDENS=1` writes them), passes
+    /// the checklist on its source and as GitHub renders it, and shaping it
+    /// again changes nothing.
+    #[test]
+    fn the_examples_match_their_golden_files() {
+        for (name, title, body, facts) in golden_cases() {
+            let out = description_facts::shape(&body, title, facts.clone(), None);
+            println!("──── {name} ────\n{}\n", out.body);
+            let path = golden_path(name);
+            if std::env::var("UPDATE_GOLDENS").is_ok() {
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(&path, &out.body).unwrap();
+            }
+            let want = std::fs::read_to_string(&path)
+                .unwrap_or_else(|_| panic!("{name}: no golden file; run with UPDATE_GOLDENS=1"));
+            assert_eq!(
+                out.body, want,
+                "{name}: the output moved from its golden file"
+            );
+            let flaws = pr_layout::rubric(&out.body, &out.facts);
+            assert_eq!(flaws, vec![], "{name}");
+            assert_eq!(rendered_defects(&out.body), Vec::<String>::new(), "{name}");
+            let again = description_facts::shape(&out.body, title, facts, None);
+            assert_eq!(again.body, out.body, "{name}: shaping twice");
+            assert!(
+                common::pr_body::visible_words(&out.body) <= common::pr_body::WORD_BUDGET,
+                "{name}: {} words in sight",
+                common::pr_body::visible_words(&out.body)
+            );
+        }
+    }
+
+    /// A tick a person made survives the rewrite, by its hidden id.
+    #[test]
+    fn a_tick_survives_the_rewrite() {
+        let (_, title, body, facts) = golden_cases().remove(0);
+        let out = description_facts::shape(&body, title, facts.clone(), None);
+        assert!(out.body.contains("- [ ] <!-- ch:deploy-staging -->"));
+        let ticked = out.body.replace(
+            "- [ ] <!-- ch:deploy-staging -->",
+            "- [x] <!-- ch:deploy-staging -->",
+        );
+        let again = description_facts::shape(&ticked, title, facts, None);
+        assert!(
+            again.body.contains("- [x] <!-- ch:deploy-staging -->"),
+            "{}",
+            again.body
+        );
+    }
+
+    /// The checklist catches the old layout on its source and as rendered:
+    /// the numbered list swallowed the review line, the deploy workflows
+    /// that never run on a pull request were listed, the sha was in prose.
+    #[test]
+    fn the_checklist_catches_the_old_layout() {
+        let found = common::pr_body::defects(OLD_LAYOUT_BEFORE, "d78bb24");
+        for want in [
+            "in sight: did not run",
+            "in sight: (a person",
+            "in sight: **Check:**",
+            "no Review focus section",
+            "the risk has no level and reason",
+            "short sha is in sight",
+        ] {
+            assert!(found.iter().any(|f| f.contains(want)), "{want}: {found:#?}");
+        }
+        let html = rendered_defects(OLD_LAYOUT_BEFORE);
+        assert!(
+            html.iter()
+                .any(|d| d.contains("a section label inside a list item")),
+            "{html:#?}"
+        );
+    }
+
     /// Nothing to do is said in so many words, and no block of steps
     /// appears.
     #[test]
     fn with_nothing_to_do_the_description_says_so() {
         let out = ticket_case().shaped();
         let seen = pr_layout::visible(&out.body);
-        assert!(seen.contains("**Needed from you:** Nothing."), "{seen}");
+        assert!(!seen.contains("Needed from you"), "{seen}");
         assert!(!out.body.contains("Steps and evidence"), "{}", out.body);
     }
 }

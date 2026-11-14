@@ -89,7 +89,7 @@ fn the_description_check_catches_every_statement_the_head_refutes() {
         end.never_says(old);
     }
     assert!(end.says(
-        "`tiny-yaml` 1.2.0 to 2.0.0 crosses a major version. No safety evidence is recorded"
+        "| `tiny-yaml` | 1.2.0 to 2.0.0 | Major; no safety evidence is recorded: read its upgrade notes |"
     ));
     assert!(pr_claims::check(&out.body, &out.facts).is_empty());
 }
@@ -141,7 +141,7 @@ fn the_convention_check_catches_the_title_and_the_sample_key() {
     let now = run.title(OLD_TITLE);
     assert_eq!(
         now.text,
-        "OPS-431: Security updates for web (3 packages, 4 advisories)"
+        "OPS-431: Update 3 packages to fix 4 security advisories"
     );
     assert_eq!(
         pr_conventions::violation(&c, &now.text, &["OPS-431".to_string()]),
@@ -155,17 +155,17 @@ fn the_convention_check_catches_the_title_and_the_sample_key() {
         ..run
     };
     let now = keyless.title(OLD_TITLE);
-    assert_eq!(
-        now.text,
-        "Security updates for web (3 packages, 4 advisories)"
-    );
+    assert_eq!(now.text, "Update 3 packages to fix 4 security advisories");
     assert!(now.note.is_some(), "said once on the pull request");
     assert!(common::placeholders::found(&keyless.commit(OLD_COMMIT), &[]).is_empty());
     // The pipeline applies it where the title and commits are written.
     let pr = include_str!("../pr.rs");
     let run_src = fn_src(pr, "\npub async fn run(");
     assert!(run_src.contains("super::conventions::for_run("));
-    assert!(run_src.contains("form.title(&title)") && run_src.contains("form.commit(&squash_msg)"));
+    assert!(
+        run_src.contains("form.title_for(&title, &paths)")
+            && run_src.contains("form.commit(&squash_msg)")
+    );
     let dep = include_str!("../dep_fix.rs");
     assert!(dep.matches("super::conventions::commit_for(").count() >= 4);
     assert!(!dep.contains("let message = format!(\"fix(deps)"));
@@ -173,6 +173,7 @@ fn the_convention_check_catches_the_title_and_the_sample_key() {
         form: Form::Plain,
         source: Source::Default,
         evidence: String::new(),
+        ..Default::default()
     };
 }
 

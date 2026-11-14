@@ -648,7 +648,11 @@ Return ONLY the markdown body text."#,
         !team_set && (is_security || !super::conventions::keeps_ticket_form(c))
     };
     let (title, form_note) = if follows(&form.title, conventions.pr_title.is_some()) {
-        let w = form.title(&title);
+        let paths: Vec<String> = super::pr_risk::diff_files(&diff)
+            .into_iter()
+            .map(|(p, _, _)| p)
+            .collect();
+        let w = form.title_for(&title, &paths);
         (common::pr_body_fit::fit_title(&w.text), w.note)
     } else {
         (title, None)
