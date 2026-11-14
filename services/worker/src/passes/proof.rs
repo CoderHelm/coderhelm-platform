@@ -2011,8 +2011,6 @@ pub async fn prove(
                 let _ = super::update_pass(w.state, &w.msg.team_id, w.run_id, "implement").await;
                 let pass_start = std::time::Instant::now();
                 let usage_before = usage.clone();
-                // Planned work may need files the branch doesn't change yet.
-                let scoped = planned_work(&gaps).is_empty();
                 let fixed = super::implement::run(
                     w.state,
                     w.msg,
@@ -2028,7 +2026,9 @@ pub async fn prove(
                     w.file_cache,
                     Some(w.run_id),
                     w.deadline,
-                    scoped, // bot-driven proof fix — scoped to the PR
+                    // The plan's task files and the files the gaps name are this
+                    // round's: a gap is work the branch has not done yet.
+                    super::write_guard::RoundFor::ProofGap,
                 )
                 .await;
                 super::write_pass_trace(
