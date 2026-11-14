@@ -319,7 +319,9 @@ async fn one_budget_runs_first_sweeps_last() {
     );
     // Every message's requests are labelled, written and logged.
     let main = include_str!("../../main.rs");
-    assert!(main.contains("github_budget::scoped(label, handle_message_inner("));
+    assert!(main.contains(
+        "github_budget::scoped(\n        label,\n        Box::pin(handle_message_inner("
+    ));
     assert!(main.contains("github_budget::flush(&state).await;"));
     for sweep in [
         "who::SWEEP_PR_WATCH",

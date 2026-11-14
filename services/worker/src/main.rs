@@ -102,8 +102,9 @@ async fn main() -> Result<(), Error> {
     });
 
     lambda_runtime::run(service_fn(move |event: LambdaEvent<serde_json::Value>| {
-        let state = Arc::clone(&state);
-        async move { handle_event(state, event).await }
+        // Boxed: the event's future lives on the heap, never on the main
+        // thread's stack (see `future_sizes` below).
+        Box::pin(handle_event(Arc::clone(&state), event))
     }))
     .await
 }
@@ -135,7 +136,7 @@ async fn handle_event(
         };
         let call = clients::github_budget::scoped(
             common::github_budget::caller::CHAT,
-            passes::plan_chat::handle(&state, req),
+            Box::pin(passes::plan_chat::handle(&state, req)),
         );
         Ok(common::usage::with_feature(feature, call).await)
     } else if let Some(req) = payload.get("model_check") {
@@ -240,7 +241,7 @@ async fn handle_sqs(state: Arc<WorkerState>, event: LambdaEvent<SqsEvent>) -> Re
             passes::run_ceiling::worked(
                 &state,
                 &ceiling_ref,
-                handle_message(Arc::clone(&state), message),
+                Box::pin(handle_message(Arc::clone(&state), message)),
             ),
         ))
         .await;
@@ -339,7 +340,11 @@ async fn handle_message(state: Arc<WorkerState>, message: models::WorkerMessage)
         }
     }
     let label = github_caller(&message);
-    github_budget::scoped(label, handle_message_inner(Arc::clone(&state), message)).await;
+    github_budget::scoped(
+        label,
+        Box::pin(handle_message_inner(Arc::clone(&state), message)),
+    )
+    .await;
     github_budget::scoped(
         common::github_budget::caller::DESCRIPTION,
         passes::description::reconcile_moved(&state, team.as_deref()),
@@ -974,5 +979,38 @@ async fn handle_message_inner(state: Arc<WorkerState>, message: models::WorkerMe
         }
         // Handled in `handle_sqs`, where a failure fails the message.
         models::WorkerMessage::UsageRecord(_) => {}
+    }
+}
+
+/// Lambda runs the worker on the main thread's 8 MB stack, and an event's
+/// future is built on that stack before it is boxed by anything. Unboxed,
+/// every wrapper around a pass (a task-local scope, the run ceiling, the
+/// stop watch) holds its argument and its awaited copy of the pass, so each
+/// layer doubles the size: v0.8.108 crashed every invocation with a stack
+/// overflow (SIGSEGV) this way. Each entry point stays small by boxing what
+/// it awaits.
+#[cfg(test)]
+mod future_sizes {
+    use super::*;
+
+    /// The most an entry point's future may take on the stack.
+    const BUDGET: usize = 64 * 1024;
+
+    fn size_of_future<A, B, F>(_: &impl Fn(A, B) -> F) -> usize {
+        std::mem::size_of::<F>()
+    }
+
+    #[test]
+    fn entry_points_stay_small() {
+        for (name, size) in [
+            ("handle_event", size_of_future(&handle_event)),
+            ("handle_sqs", size_of_future(&handle_sqs)),
+            ("handle_message", size_of_future(&handle_message)),
+        ] {
+            assert!(
+                size <= BUDGET,
+                "{name}'s future is {size} bytes, over {BUDGET}: box what it awaits"
+            );
+        }
     }
 }
