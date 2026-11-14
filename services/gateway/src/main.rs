@@ -1296,6 +1296,10 @@ fn build_app(state: Arc<AppState>) -> Router {
             post(routes::mcp_servers::connect),
         )
         .route(
+            "/mcp-servers/:id/sign-in",
+            delete(routes::mcp_servers::cancel_sign_in),
+        )
+        .route(
             "/mcp-servers/:id/connection",
             delete(routes::mcp_servers::disconnect),
         )

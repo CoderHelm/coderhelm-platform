@@ -44,9 +44,11 @@ const RESULT_CHARS: usize = 12_000;
 struct Loaded {
     conn: Connector,
     /// The opened key (New Relic, Confluence); empty for AWS ones. For
-    /// Confluence through the Jira app, the app's shared secret.
+    /// Confluence through the Jira app, the app's shared secret; with the
+    /// team's Atlassian sign-in, its `Bearer` header.
     key: String,
-    /// Confluence through the Jira app: the app's Confluence trigger.
+    /// Confluence through the Jira app: the app's Confluence trigger. With
+    /// the team's Atlassian sign-in: where its REST API is.
     app_url: String,
 }
 
@@ -402,7 +404,13 @@ fn describe_line(c: &Connector) -> String {
         ConnKind::Confluence => format!(
             "Confluence at {}{}: search and read pages, list a page's children{}{}",
             c.site,
-            if c.via_jira_app() { " (through the Jira app)" } else { "" },
+            if c.via_jira_app() {
+                " (through the Jira app)"
+            } else if c.via_sign_in() {
+                " (with the team's Atlassian sign-in, reading only)"
+            } else {
+                ""
+            },
             if c.spaces.is_empty() { String::new() } else { format!(" in spaces {}", c.spaces.join(", ")) },
             if c.write_enabled && !c.write_pages.is_empty() {
                 format!("; may append to pages {}", c.write_pages.join(", "))
@@ -508,6 +516,26 @@ impl OpsTools {
                                 key: a.secret.clone(),
                                 app_url: a.confluence_url.clone(),
                             });
+                        }
+                        continue;
+                    }
+                    if conn.via_sign_in() {
+                        // Confluence with the sign-in the team made for
+                        // Knowledge: no key, opened for this pass.
+                        match common::live::atlassian::confluence(
+                            &sign_in_runtime(state, team_id),
+                            &conn.site,
+                        )
+                        .await
+                        {
+                            Ok(a) => loaded.push(Loaded {
+                                conn,
+                                key: a.bearer,
+                                app_url: a.base,
+                            }),
+                            Err(e) => {
+                                warn!(error = %e, "Could not open the team's Atlassian sign-in; skipping Confluence")
+                            }
                         }
                         continue;
                     }
@@ -1111,6 +1139,11 @@ impl OpsTools {
                             url: &l.app_url,
                             secret: &l.key,
                         }
+                    } else if l.conn.via_sign_in() {
+                        Access::SignIn {
+                            base: &l.app_url,
+                            bearer: &l.key,
+                        }
                     } else {
                         Access::Token(&l.key)
                     },
@@ -1221,6 +1254,23 @@ fn pick_named<'a>(
         },
         format!("Pass `{param}` as one of: {}.", names.join(", ")),
     ))
+}
+
+/// Where the team's sign-ins are kept, to open the one a Confluence
+/// connection reads with.
+fn sign_in_runtime(state: &WorkerState, team_id: &str) -> common::mcp_remote::runtime::Runtime {
+    let table = if state.config.mcp_configs_table_name.is_empty() {
+        &state.config.settings_table_name
+    } else {
+        &state.config.mcp_configs_table_name
+    };
+    common::mcp_remote::runtime::Runtime::aws(
+        state.dynamo.clone(),
+        table,
+        state.kms.clone(),
+        &state.config.secrets_key_id,
+        team_id,
+    )
 }
 
 /// The team's connections, with Confluence through its Jira app folded in.
