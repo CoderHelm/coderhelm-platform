@@ -62,6 +62,7 @@ mod tests {
         ("common/src/agent_file.rs", "writes Coderhelm's own agent file"),
         ("common/src/guide.rs", "writes the repository's guide"),
         ("common/src/repo_read.rs", "lists files for reading code"),
+        ("common/src/pr_conventions.rs", "reads how pull request titles are written, not steps to run"),
         ("common/src/setup/facts.rs", "gathers the facts setup/ai.rs reads (routed)"),
         ("common/src/skill_apply.rs", "fits team standards into a reader's prompt; each reader is routed"),
         ("common/src/tool_registry.rs", "tool risk table"),
