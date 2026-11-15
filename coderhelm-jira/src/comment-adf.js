@@ -2,8 +2,9 @@
 
 /**
  * A reply to a person's comment opens with their name: it becomes a mention
- * of them, so the comment reads as an answer to theirs (Jira's public API
- * has no threaded comment replies).
+ * of them, so the comment reads as an answer to theirs. It is posted under
+ * their comment in Jira's thread where the site takes that (thread-reply.js),
+ * and as a new comment where it doesn't; the mention notifies them either way.
  */
 function mentionFirst(paragraphs, replyTo) {
   if (!replyTo || !replyTo.accountId || !replyTo.author || paragraphs.length === 0) {

@@ -8,6 +8,8 @@
  * the author's account type and name), so they are passed through as they are.
  */
 
+const { parentIdOf } = require("./thread-reply");
+
 /** The most comments sent with one ticket event: the newest ones. */
 const MAX_COMMENTS = 20;
 
@@ -21,7 +23,7 @@ const MAX_TOTAL_CHARS = 200000;
 
 /**
  * @param {object} fields The ticket's fields, as the issue REST API returns them.
- * @returns {{id: string, author: {displayName: string, accountType: string}, body: string}[]}
+ * @returns {{id: string, author: {displayName: string, accountType: string}, body: string, parentId?: string}[]}
  */
 function existingComments(fields) {
   const all = (fields && fields.comment && fields.comment.comments) || [];
@@ -35,6 +37,8 @@ function existingComments(fields) {
       },
       // A comment body is a document (JSON); the gateway reads its words.
       body: typeof c.body === "string" ? c.body : JSON.stringify(c.body),
+      // The comment it replies to, when Jira says (a reply in a thread).
+      ...(parentIdOf(c) ? { parentId: parentIdOf(c) } : {}),
     }));
   // Keep the newest comments that fit; a body is never cut in the middle
   // (it is a JSON document, and half of one cannot be read).

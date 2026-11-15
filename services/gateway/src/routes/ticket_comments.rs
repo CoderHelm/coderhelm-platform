@@ -45,6 +45,8 @@ pub struct Incoming<'a> {
     /// The tracker's id of the author (Jira's account id), for a mention
     /// in a reply to the comment.
     pub author_id: &'a str,
+    /// The comment it replies to, when it is a reply in a Jira thread.
+    pub parent_id: &'a str,
     pub text: &'a str,
     pub title: &'a str,
     /// The ticket's latest run and its status; empty when it has none.
@@ -79,6 +81,7 @@ pub async fn take(store: &dyn Store, inc: &Incoming<'_>) -> Result<Received, Str
         comment_id: tc::comment_id(inc.comment_id, inc.author, inc.text),
         author: inc.author.trim().to_string(),
         author_id: inc.author_id.trim().to_string(),
+        parent_id: inc.parent_id.trim().to_string(),
         text: common::truncate_str(inc.text.trim(), tc::MAX_TEXT_CHARS).to_string(),
         at: chrono::Utc::now().to_rfc3339(),
         run_id: if working {
@@ -272,6 +275,7 @@ pub async fn keep_existing_in(
             comment_id: &c.id,
             author: &c.author,
             author_kind: &c.kind,
+            parent_id: &c.parent_id,
             text: &c.text,
             ..Default::default()
         };
@@ -290,7 +294,24 @@ pub struct Existing {
     pub id: String,
     pub author: String,
     pub kind: String,
+    /// The comment it replies to, when it is a reply in a Jira thread.
+    pub parent_id: String,
     pub text: String,
+}
+
+/// A Jira comment's `parentId` (a number or a string; Jira's REST docs don't
+/// list it): the comment it replies to, or empty when it is not a reply.
+pub fn jira_parent_id(comment: &Value) -> String {
+    let id = match &comment["parentId"] {
+        Value::String(s) => s.trim().to_string(),
+        Value::Number(n) => n.to_string(),
+        _ => String::new(),
+    };
+    if matches!(id.as_str(), "0" | "-1") {
+        String::new()
+    } else {
+        id
+    }
 }
 
 /// Most comments read from a ticket when a run starts on it (the newest).
@@ -323,6 +344,7 @@ pub fn existing_jira_comments(payload: &Value) -> Vec<Existing> {
                     .as_str()
                     .unwrap_or("")
                     .to_string(),
+                parent_id: jira_parent_id(c),
                 text,
             })
         })
@@ -395,6 +417,7 @@ pub async fn on_github_issue_comment(
             author,
             author_kind: kind,
             author_id: "",
+            parent_id: "",
             text,
             title: payload["issue"]["title"].as_str().unwrap_or(""),
             run_id: &run.run_id,
@@ -579,6 +602,34 @@ async fn note(state: &AppState, team_id: &str, run_id: &str, message: &str) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_jira_reply_carries_the_comment_it_replies_to() {
+        assert_eq!(
+            jira_parent_id(&json!({"id": "2", "parentId": 10001})),
+            "10001"
+        );
+        assert_eq!(
+            jira_parent_id(&json!({"id": "2", "parentId": "10001"})),
+            "10001"
+        );
+        assert_eq!(jira_parent_id(&json!({"id": "2", "parentId": null})), "");
+        assert_eq!(jira_parent_id(&json!({"id": "2", "parentId": 0})), "");
+        assert_eq!(jira_parent_id(&json!({"id": "2"})), "");
+        let got = existing_jira_comments(&json!({"comments": [
+            {"id": "10001", "author": {"displayName": "Coderhelm", "accountType": "app"}, "body": "Keep the old column?"},
+            {"id": "10002", "parentId": "10001", "author": {"displayName": "Pat Doe", "accountType": "atlassian"}, "body": "Yes, keep it."}
+        ]}));
+        assert_eq!(got[0].parent_id, "");
+        assert_eq!(got[1].parent_id, "10001");
+    }
+
+    #[test]
+    fn the_jira_comment_event_reads_the_parent() {
+        let src = include_str!("jira_webhook.rs");
+        assert!(src.contains(".map(super::ticket_comments::jira_parent_id)"));
+        assert_eq!(src.matches("parent_id: &comment_parent,").count(), 2);
+    }
+
     use super::*;
     use common::ticket_comments::Memory;
 

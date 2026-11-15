@@ -307,8 +307,13 @@ mod tests {
     fn every_allowed_place_still_exists() {
         // An allowlist entry for text that is gone would hide the next one.
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+        let common = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../common/src");
         for (file, ctx) in ALLOWED {
-            let text = said(&std::fs::read_to_string(root.join(file)).unwrap());
+            let path = match file.strip_prefix("common/") {
+                Some(rest) => common.join(rest),
+                None => root.join(file),
+            };
+            let text = said(&std::fs::read_to_string(path).unwrap());
             assert!(
                 text.contains(&ctx.to_lowercase()),
                 "stale allowlist entry: {file}: {ctx}"

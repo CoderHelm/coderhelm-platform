@@ -5,6 +5,22 @@ const { storage } = api;
 const { route } = api;
 const { GATEWAY_URL } = require("./gateway");
 const { existingComments } = require("./comments");
+const { postReply, parentIdOf } = require("./thread-reply");
+
+/** Jira's comment calls as the app, for a threaded reply (see thread-reply.js). */
+const jiraComments = {
+  createComment: (issueKey, payload) =>
+    api.asApp().requestJira(route`/rest/api/3/issue/${issueKey}/comment`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }),
+  getComment: (issueKey, id) => api.asApp().requestJira(route`/rest/api/3/issue/${issueKey}/comment/${id}`),
+};
+
+// The event's comment keys are logged once per running instance: enough to
+// see whether Jira's comment events carry a parent id.
+let loggedCommentKeys = false;
 
 /** The parts of a Jira user CoderHelm keeps: account id, name, email. */
 function jiraUser(u) {
@@ -46,7 +62,10 @@ exports.handler = async (event, context) => {
     // Forge comment events include event.comment with author/body metadata.
     // Use it directly; fall back to REST API fetch if missing.
     let comment = event.comment || null;
-    console.log(`Comment event on ${issue.key}: event.comment keys=${comment ? Object.keys(comment).join(",") : "null"}, atlassianId=${event.atlassianId || "none"}`);
+    if (!loggedCommentKeys) {
+      loggedCommentKeys = true;
+      console.log(`Comment event on ${issue.key}: event.comment keys=${comment ? Object.keys(comment).join(",") : "null"}, atlassianId=${event.atlassianId || "none"}`);
+    }
 
     if (!comment || !comment.body) {
       // Fallback: fetch the specific comment by ID, or latest if no ID
@@ -136,6 +155,9 @@ exports.handler = async (event, context) => {
       comment: {
         id: comment.id,
         body: commentBody,
+        // The comment it replies to, when it is a reply in a Jira thread
+        // (an undocumented field; absent on sites that don't send it).
+        parentId: parentIdOf(comment) || undefined,
         // accountType tells a person ("atlassian") from an app ("app"): the
         // gateway never reads an app's comment as a person's.
         author: { ...jiraUser(author), displayName: authorName, accountType: author.accountType },
@@ -324,29 +346,40 @@ exports.addCommentHandler = async (request) => {
 
     // CoderHelm keeps one live comment per subject: it edits its own
     // comment in place instead of adding another.
-    const res = commentId
-      ? await api.asApp().requestJira(route`/rest/api/3/issue/${issueKey}/comment/${commentId}`, {
-          method: "PUT",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ body: adfBody }),
-        })
-      : await api.asApp().requestJira(route`/rest/api/3/issue/${issueKey}/comment`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ body: adfBody }),
-        });
-
-    if (!res.ok) {
-      const err = await res.text();
-      console.error("addComment failed:", res.status, err);
-      return { statusCode: res.status, body: JSON.stringify({ error: "Failed to add comment", details: err }) };
+    if (commentId) {
+      const res = await api.asApp().requestJira(route`/rest/api/3/issue/${issueKey}/comment/${commentId}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ body: adfBody }),
+      });
+      if (!res.ok) {
+        const err = await res.text();
+        console.error("addComment failed:", res.status, err);
+        return { statusCode: res.status, body: JSON.stringify({ error: "Failed to add comment", details: err }) };
+      }
+      const edited = await res.json();
+      return {
+        statusCode: 200,
+        headers: { "Content-Type": ["application/json"] },
+        body: JSON.stringify({ id: edited.id, edited: true }),
+      };
     }
 
-    const created = await res.json();
+    // A new comment. An answer to a person's comment goes under it in Jira's
+    // thread where the site takes it; otherwise it is an ordinary comment
+    // (its text mentions and quotes the person either way).
+    const posted = await postReply({ jira: jiraComments, storage, issueKey, adfBody, replyTo });
+    if (!posted.ok) {
+      console.error("addComment failed:", posted.status, posted.error);
+      return {
+        statusCode: posted.status,
+        body: JSON.stringify({ error: "Failed to add comment", details: posted.error }),
+      };
+    }
     return {
-      statusCode: commentId ? 200 : 201,
+      statusCode: 201,
       headers: { "Content-Type": ["application/json"] },
-      body: JSON.stringify({ id: created.id, edited: Boolean(commentId) }),
+      body: JSON.stringify({ id: posted.id, edited: false, threaded: posted.threaded }),
     };
   } catch (e) {
     console.error("addComment error:", e);

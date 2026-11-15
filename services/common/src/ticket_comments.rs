@@ -236,6 +236,10 @@ pub struct Comment {
     /// comment mentions them by it.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub author_id: String,
+    /// The comment it replies to, when it is a reply in a Jira thread (Jira's
+    /// `parentId`, which its REST docs don't list); empty otherwise.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub parent_id: String,
     pub text: String,
     /// When CoderHelm received it (RFC 3339).
     pub at: String,
@@ -510,9 +514,43 @@ pub fn schema() -> Value {
     })
 }
 
+/// The open question (its index in `questions`) a reply in a Jira thread
+/// answers: the one question CoderHelm's comment above it asked
+/// (`parent_asks`) that is still open. None when that comment asked none of
+/// the open questions, or more than one (the model tells which, by the
+/// reply's words, as for any comment).
+pub fn thread_question(questions: &[String], parent_asks: &[String]) -> Option<usize> {
+    let hits: Vec<usize> = questions
+        .iter()
+        .enumerate()
+        .filter(|(_, q)| {
+            parent_asks
+                .iter()
+                .any(|a| a.trim() == q.trim() || crate::conversation::same_question(a, q))
+        })
+        .map(|(i, _)| i)
+        .collect();
+    match hits.as_slice() {
+        [one] => Some(*one),
+        _ => None,
+    }
+}
+
 /// The prompt: the ticket, the run's open questions (numbered from 1) and
 /// the comments (numbered from 1).
 pub fn prompt(title: &str, questions: &[String], comments: &[Comment]) -> String {
+    prompt_in_threads(title, questions, comments, &[])
+}
+
+/// [`prompt`], with each comment's place in a Jira thread: `threads[i]` is
+/// the open question (index) CoderHelm's comment above comment `i` asked
+/// (see [`thread_question`]).
+pub fn prompt_in_threads(
+    title: &str,
+    questions: &[String],
+    comments: &[Comment],
+    threads: &[Option<usize>],
+) -> String {
     let mut out = format!(
         "## Ticket\n{}\n\n## The agent's open questions\n",
         title.trim()
@@ -535,6 +573,13 @@ pub fn prompt(title: &str, questions: &[String], comments: &[Comment]) -> String
             },
             crate::truncate_str(c.text.trim(), MAX_TEXT_CHARS)
         ));
+        if let Some(Some(q)) = threads.get(i) {
+            out.push_str(&format!(
+                "(Comment {} is a reply under the agent's comment that asked open question {}.)\n\n",
+                i + 1,
+                q + 1
+            ));
+        }
     }
     out.push_str(
         "For each comment give its number (n), its class, and the number of the open question \
@@ -554,6 +599,20 @@ pub struct Reading {
 /// order. A comment the reply leaves out or names no class for reads as
 /// [`unread`]; an answer that names no open question is an instruction.
 pub fn readings(reply: &Value, questions: &[String], comments: usize) -> Vec<Reading> {
+    readings_in_threads(reply, questions, &vec![None; comments])
+}
+
+/// [`readings`], for comments some of which are replies in a Jira thread
+/// (`threads`, one per comment, see [`thread_question`]): an answer posted
+/// under CoderHelm's comment answers the question that comment asked, even
+/// when the model named another one or none. Comments outside a thread are
+/// read as the model read them (by their words, order and mentions).
+pub fn readings_in_threads(
+    reply: &Value,
+    questions: &[String],
+    threads: &[Option<usize>],
+) -> Vec<Reading> {
+    let comments = threads.len();
     let mut out: Vec<Reading> = (0..comments).map(|_| unread()).collect();
     for item in reply["comments"].as_array().into_iter().flatten() {
         let n = item["n"].as_u64().unwrap_or(0) as usize;
@@ -563,7 +622,14 @@ pub fn readings(reply: &Value, questions: &[String], comments: usize) -> Vec<Rea
         let Some(class) = Class::parse(item["class"].as_str().unwrap_or("")) else {
             continue;
         };
-        let q = item["question"].as_u64().unwrap_or(0) as usize;
+        let mut q = item["question"].as_u64().unwrap_or(0) as usize;
+        if class == Class::Answer {
+            if let Some(Some(t)) = threads.get(n - 1) {
+                if *t < questions.len() {
+                    q = t + 1;
+                }
+            }
+        }
         let question = match q {
             0 => String::new(),
             n => questions.get(n - 1).cloned().unwrap_or_default(),
@@ -1056,6 +1122,53 @@ pub async fn settle_open(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_reply_in_a_thread_answers_the_question_asked_above_it() {
+        let questions = vec![
+            "Which environments get the flag?".to_string(),
+            "Keep the old column?".to_string(),
+        ];
+        // CoderHelm's comment above asked question 2 only.
+        let asked = vec!["Keep the old column?".to_string()];
+        assert_eq!(thread_question(&questions, &asked), Some(1));
+        // Asked both, or none still open: the words decide.
+        assert_eq!(thread_question(&questions, &questions), None);
+        assert_eq!(thread_question(&questions, &["Another?".to_string()]), None);
+
+        let reply = json!({"comments": [
+            {"n": 1, "class": "answer", "question": 1, "reason": ""},
+            {"n": 2, "class": "answer", "question": 0, "reason": ""},
+            {"n": 3, "class": "answer", "question": 1, "reason": ""},
+            {"n": 4, "class": "instruction", "question": 0, "reason": ""}
+        ]});
+        let threads = vec![Some(1), Some(1), None, Some(1)];
+        let r = readings_in_threads(&reply, &questions, &threads);
+        // Under the comment that asked question 2: it answers question 2.
+        assert_eq!(r[0].question, questions[1]);
+        assert_eq!(
+            (r[1].class, r[1].question.as_str()),
+            (Class::Answer, questions[1].as_str())
+        );
+        // Outside a thread: as the model read it.
+        assert_eq!(r[2].question, questions[0]);
+        // A reply that isn't an answer stays what it is.
+        assert_eq!(r[3].class, Class::Instruction);
+        assert!(r[3].question.is_empty());
+        // Without threads, nothing changes.
+        assert_eq!(readings(&reply, &questions, 4)[1].class, Class::Instruction);
+
+        let p = prompt_in_threads(
+            "Add the flag",
+            &questions,
+            &[comment("1", "No."), comment("2", "Also staging.")],
+            &[Some(1), None],
+        );
+        assert!(p.contains(
+            "(Comment 1 is a reply under the agent's comment that asked open question 2.)"
+        ));
+        assert!(!p.contains("Comment 2 is a reply"));
+    }
+
     use super::*;
 
     fn comment(id: &str, text: &str) -> Comment {
