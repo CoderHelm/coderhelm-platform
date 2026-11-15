@@ -2251,8 +2251,44 @@ fn keeps_ticket_line(old: &str, new: &str) -> bool {
     }
 }
 
-/// Try to fetch a PR template from common locations in the repo.
-async fn fetch_pr_template(
+/// How long a repository's template is kept between reads: every rebuild of
+/// a description lays it into the template, and rebuilds come often while
+/// checks run.
+const TEMPLATE_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
+type TemplateCache = std::collections::HashMap<String, (std::time::Instant, Option<String>)>;
+
+fn template_cache() -> &'static std::sync::Mutex<TemplateCache> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<TemplateCache>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// The repository's pull request template, from its common locations: the
+/// first draft is written to it, and every rebuild lays the description into
+/// it (`common::pr_template`). Kept for a few minutes per repository and
+/// branch.
+pub(crate) async fn fetch_pr_template(
+    github: &GitHubClient,
+    owner: &str,
+    repo: &str,
+    base_branch: &str,
+) -> Option<String> {
+    let key = format!("{owner}/{repo}@{base_branch}").to_lowercase();
+    if let Ok(c) = template_cache().lock() {
+        if let Some((at, t)) = c.get(&key) {
+            if at.elapsed() < TEMPLATE_TTL {
+                return t.clone();
+            }
+        }
+    }
+    let found = read_pr_template(github, owner, repo, base_branch).await;
+    if let Ok(mut c) = template_cache().lock() {
+        c.insert(key, (std::time::Instant::now(), found.clone()));
+    }
+    found
+}
+
+async fn read_pr_template(
     github: &GitHubClient,
     owner: &str,
     repo: &str,

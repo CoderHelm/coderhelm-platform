@@ -188,9 +188,15 @@ impl Level {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Outcome {
     Failed,
+    /// Still running: shown as running, never as a result, and replaced
+    /// when it ends (the stamp marks the description for a rebuild).
+    Running,
     NotRun,
     Passed,
 }
+
+/// How a row still running reads.
+pub const RUNNING: &str = "Running";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row {
@@ -209,6 +215,8 @@ impl Row {
             (Outcome::Passed, false) => format!("Passed; {d}"),
             (Outcome::Failed, true) => "Failed".into(),
             (Outcome::Failed, false) => format!("Failed: {d}"),
+            (Outcome::Running, true) => format!("{RUNNING}; updated here when it ends"),
+            (Outcome::Running, false) => format!("{RUNNING}; {d}"),
             (Outcome::NotRun, true) => "Not run: nothing reported it".into(),
             (Outcome::NotRun, false) => format!("Not run: {d}"),
         }
@@ -689,10 +697,19 @@ pub fn table_rows(rows: &[Row]) -> Vec<Row> {
     let rest = sorted.split_off(MAX_ROWS - 1);
     let failed = rest.iter().filter(|r| r.outcome == Outcome::Failed).count();
     let not_run = rest.iter().filter(|r| r.outcome == Outcome::NotRun).count();
+    let running = rest
+        .iter()
+        .filter(|r| r.outcome == Outcome::Running)
+        .count();
     let (outcome, detail) = if failed > 0 {
         (
             Outcome::Failed,
             format!("{failed} of them; all are listed in {EVIDENCE}"),
+        )
+    } else if running > 0 {
+        (
+            Outcome::Running,
+            format!("{running} of them; updated here when they end"),
         )
     } else if not_run > 0 {
         (
@@ -750,8 +767,57 @@ fn screens_markdown(s: &Screens) -> String {
     }
 }
 
-/// The body's parts, rendered.
-pub fn render(b: &Body) -> Rendered {
+/// The visible part's blocks, each rendered on its own (empty when the
+/// body has none): what [`render`] lays out in its fixed order and
+/// [`render_templated`] lays into a repository's template.
+#[derive(Debug, Clone, Default)]
+struct Blocks {
+    header: String,
+    alert: String,
+    summary: String,
+    /// With its `### Needed from you` heading.
+    needed: String,
+    /// With its `### Review focus` heading.
+    focus: String,
+    deps: String,
+    risk: String,
+    rollback: String,
+    /// With its `### Verification` heading.
+    verification: String,
+    screens: String,
+}
+
+impl Blocks {
+    /// The blocks in the fixed order.
+    fn in_order(&self) -> Vec<&str> {
+        [
+            &self.alert,
+            &self.summary,
+            &self.needed,
+            &self.focus,
+            &self.deps,
+            &self.risk,
+            &self.rollback,
+            &self.verification,
+            &self.screens,
+        ]
+        .into_iter()
+        .map(String::as_str)
+        .filter(|b| !b.is_empty())
+        .collect()
+    }
+}
+
+/// A block without its `### ` heading line.
+fn under_heading(block: &str) -> String {
+    match block.split_once('\n') {
+        Some((first, rest)) if first.starts_with("### ") => rest.trim().to_string(),
+        _ => block.trim().to_string(),
+    }
+}
+
+fn blocks(b: &Body) -> Blocks {
+    let mut out = Blocks::default();
     let mut v: Vec<String> = Vec::new();
     let ticket = b.ticket.as_ref().filter(|t| !t.key.trim().is_empty());
     v.push(format!(
@@ -763,7 +829,7 @@ pub fn render(b: &Body) -> Rendered {
     if !label.is_empty() && label != NOTES {
         v.push(format!("{LABEL_START}{label} -->"));
     }
-    let mut blocks: Vec<String> = Vec::new();
+    out.header = v.join("\n");
     // An alert when merging without an action breaks something, or when
     // the risk is High and nobody is asked for anything.
     let alert = if !b.alert.trim().is_empty() {
@@ -777,9 +843,9 @@ pub fn render(b: &Body) -> Rendered {
         String::new()
     };
     if !alert.is_empty() {
-        blocks.push(format!("> [!IMPORTANT]\n> {alert}."));
+        out.alert = format!("> [!IMPORTANT]\n> {alert}.");
     }
-    blocks.push(summary_paragraph(&b.summary, ticket, &b.outside));
+    out.summary = summary_paragraph(&b.summary, ticket, &b.outside);
     if !b.needed.is_empty() {
         let mut s = String::from("### Needed from you\n\n");
         let items: Vec<String> = b
@@ -790,19 +856,19 @@ pub fn render(b: &Body) -> Rendered {
             .collect();
         let loose = items.iter().any(|i| i.contains('\n'));
         s.push_str(&items.join(if loose { "\n\n" } else { "\n" }));
-        blocks.push(s);
+        out.needed = s;
     }
     let focus = focus_markdown(&b.focus);
-    blocks.push(format!(
+    out.focus = format!(
         "### Review focus\n\n{}",
         focus
             .iter()
             .map(|f| format!("- {f}"))
             .collect::<Vec<_>>()
             .join("\n")
-    ));
+    );
     if !b.dep_rows.is_empty() {
-        blocks.push(table(
+        out.deps = table(
             &["Package", "Change", "Why it matters"],
             &b.dep_rows
                 .iter()
@@ -815,7 +881,7 @@ pub fn render(b: &Body) -> Rendered {
                     ]
                 })
                 .collect::<Vec<_>>(),
-        ));
+        );
     }
     let risk = part(&b.risk);
     let risk = if risk.chars().count() < 10 {
@@ -823,18 +889,14 @@ pub fn render(b: &Body) -> Rendered {
     } else {
         risk
     };
-    blocks.push(format!(
-        "**Risk:** {}. {}.",
-        b.level.word(),
-        upper_first(&risk)
-    ));
+    out.risk = format!("**Risk:** {}. {}.", b.level.word(), upper_first(&risk));
     let rollback = part(&b.rollback);
     let rollback = if rollback.is_empty() {
         "Revert this pull request; nothing outside the code changes with it".to_string()
     } else {
         upper_first(&rollback)
     };
-    blocks.push(format!("**Rollback:** {rollback}."));
+    out.rollback = format!("**Rollback:** {rollback}.");
     let lead_in = if !b.results_of.is_empty() && b.results_of != b.head {
         format!(
             "Results below are for {}; the head is now {}.",
@@ -854,14 +916,151 @@ pub fn render(b: &Body) -> Rendered {
             .map(|r| vec![one_line(&r.check), r.result()])
             .collect::<Vec<_>>(),
     ));
-    blocks.push(verification);
+    out.verification = verification;
     if let Some(s) = &b.screens {
-        blocks.push(screens_markdown(s));
+        out.screens = screens_markdown(s);
     }
-    let mut visible = v.join("\n");
-    visible.push('\n');
-    visible.push_str(&blocks.join("\n\n"));
+    out
+}
 
+/// The body's parts, rendered.
+pub fn render(b: &Body) -> Rendered {
+    let bl = blocks(b);
+    let mut visible = bl.header.clone();
+    visible.push('\n');
+    visible.push_str(&bl.in_order().join("\n\n"));
+    finish(b, visible)
+}
+
+/// The body laid into a repository's template (`pr_template`): the
+/// template's headings, in its order, each filled with what it asks for;
+/// what a person must do and the review focus after the first section.
+/// `written` is the text the writer wrote (its sections are read by
+/// heading). Returns the rendering and the written sections' titles it put
+/// in sight, so they are not said again below. With a template of no
+/// headings it is [`render`].
+pub fn render_templated(b: &Body, template: &str, written: &str) -> (Rendered, Vec<String>) {
+    use crate::pr_template::{self as tpl, Slot};
+    let sections = tpl::sections(template);
+    if sections.is_empty() {
+        return (render(b), Vec::new());
+    }
+    let bl = blocks(b);
+    let own = tpl::written_sections(written);
+    let mut used: Vec<String> = Vec::new();
+    let mut by_title = |title: &str, also: &[&str]| -> Option<String> {
+        let found = own
+            .iter()
+            .find(|(t, x)| t.eq_ignore_ascii_case(title) && !x.trim().is_empty())
+            .or_else(|| {
+                own.iter().find(|(t, x)| {
+                    let l = t.to_lowercase();
+                    !x.trim().is_empty() && also.iter().any(|a| l.contains(a))
+                })
+            })?;
+        used.push(found.0.clone());
+        Some(found.1.clone())
+    };
+    let ticket = b.ticket.as_ref().filter(|t| !t.key.trim().is_empty());
+    let slots: Vec<Slot> = sections.iter().map(tpl::slot).collect();
+    let has = |s: Slot| slots.contains(&s);
+    let mut out: Vec<String> = Vec::new();
+    if !bl.alert.is_empty() {
+        out.push(bl.alert.clone());
+    }
+    // The summary opens the body; a template without a section for it gets
+    // it above its first heading.
+    if !has(Slot::Summary) {
+        out.push(bl.summary.clone());
+    }
+    let review_block = |out: &mut Vec<String>| {
+        if !bl.needed.is_empty() {
+            out.push(bl.needed.clone());
+        }
+        if !has(Slot::Review) {
+            out.push(bl.focus.clone());
+        }
+        if !bl.deps.is_empty() {
+            out.push(bl.deps.clone());
+        }
+    };
+    if !has(Slot::Summary) {
+        review_block(&mut out);
+    }
+    let mut placed_review = !has(Slot::Summary);
+    for (s, slot) in sections.iter().zip(slots.iter().copied()) {
+        let fill = match slot {
+            Slot::Summary => {
+                // The writer's own words for it are what the summary was
+                // read from: not said again below.
+                let _ = by_title(&s.title, &[]);
+                bl.summary.clone()
+            }
+            Slot::Testing => under_heading(&bl.verification),
+            Slot::Risk => format!("{}\n\n{}", bl.risk, bl.rollback),
+            Slot::Screens => {
+                if bl.screens.is_empty() {
+                    "No screenshot: nothing in this change shows on a page.".to_string()
+                } else {
+                    bl.screens.clone()
+                }
+            }
+            Slot::Ticket => match ticket {
+                Some(t) => format!("Ticket: {}", t.link()),
+                None => by_title(&s.title, &[])
+                    .unwrap_or_else(|| "No ticket names this change.".to_string()),
+            },
+            Slot::Review => under_heading(&bl.focus),
+            Slot::Checklist => {
+                by_title(&s.title, &["checklist"]).unwrap_or_else(|| tpl::boxes(s).join("\n"))
+            }
+            Slot::Changes => by_title(&s.title, &["change"])
+                .unwrap_or_else(|| "Listed under Implementation notes below.".to_string()),
+            Slot::Other => by_title(&s.title, &[]).unwrap_or_else(|| {
+                let own: Vec<String> = s
+                    .lines
+                    .iter()
+                    .filter(|l| !l.trim().is_empty())
+                    .cloned()
+                    .collect();
+                if own.is_empty() {
+                    "Nothing for this change.".to_string()
+                } else {
+                    own.join("\n")
+                }
+            }),
+        };
+        out.push(format!("{}\n\n{}", s.heading(), fill.trim()));
+        if !placed_review {
+            review_block(&mut out);
+            placed_review = true;
+        }
+    }
+    if !has(Slot::Risk) {
+        out.push(bl.risk.clone());
+        out.push(bl.rollback.clone());
+    }
+    if !has(Slot::Testing) {
+        out.push(bl.verification.clone());
+    }
+    if !has(Slot::Screens) && !bl.screens.is_empty() {
+        out.push(bl.screens.clone());
+    }
+    let mut visible = format!("{}\n{}\n", bl.header, tpl::MARK);
+    visible.push_str(
+        &out.into_iter()
+            .filter(|x| !x.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+    );
+    used.sort();
+    used.dedup();
+    (finish(b, visible), used)
+}
+
+/// The generated parts below the visible one.
+fn finish(b: &Body, visible: String) -> Rendered {
+    let ticket = b.ticket.as_ref().filter(|t| !t.key.trim().is_empty());
     let footer = {
         let from = ticket
             .map(|t| format!(" from {}", t.link()))
@@ -1008,10 +1207,12 @@ pub fn defects(body: &str, head: &str) -> Vec<String> {
     if seen.matches("> [!").count() > 1 {
         d.push("more than one alert".into());
     }
-    // Headings: only these three, in this order.
+    // Headings: only these three, in this order; a body laid into the
+    // repository's template has the template's headings.
+    let templated = body.contains(crate::pr_template::MARK);
     let allowed = ["Needed from you", "Review focus", "Verification"];
     let mut last = 0usize;
-    for l in &lines {
+    for l in lines.iter().filter(|_| !templated) {
         let t = l.trim();
         if t.starts_with('#') {
             let h = t.trim_start_matches('#').trim();
@@ -1021,7 +1222,10 @@ pub fn defects(body: &str, head: &str) -> Vec<String> {
             }
         }
     }
-    for h in ["Review focus", "Verification"] {
+    for h in ["Review focus", "Verification"]
+        .iter()
+        .filter(|_| !templated)
+    {
         if !seen.contains(&format!("### {h}\n")) {
             d.push(format!("no {h} section"));
         }
@@ -1180,9 +1384,9 @@ pub fn defects(body: &str, head: &str) -> Vec<String> {
             if seen_pass {
                 d.push(format!("a failed row after a passed one: {r}"));
             }
-        } else if !result.starts_with("Not run: ") {
+        } else if !result.starts_with("Not run: ") && !result.starts_with(RUNNING) {
             d.push(format!(
-                "a result that is not Passed, Failed or Not run: {r}"
+                "a result that is not Passed, Failed, Running or Not run: {r}"
             ));
         }
     }
