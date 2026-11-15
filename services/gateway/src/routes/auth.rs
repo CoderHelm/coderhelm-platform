@@ -1715,7 +1715,10 @@ fn github_not_set_up(state: &AppState, step: &'static str) -> Option<Response> {
 /// GET /auth/github — Redirect to GitHub OAuth (sign in, or connect a GitHub
 /// account). Without an OAuth client of its own, a hybrid install goes
 /// through CoderHelm's GitHub App (routes::github_hybrid).
-pub async fn github_login(State(state): State<Arc<AppState>>) -> Response {
+pub async fn github_login(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<GithubLoginQuery>,
+) -> Response {
     if !own_github_client(&state) && super::github_hybrid::available() {
         return super::github_hybrid::start(&state).await;
     }
@@ -1731,14 +1734,63 @@ pub async fn github_login(State(state): State<Arc<AppState>>) -> Response {
     let url = format!(
         "https://github.com/login/oauth/authorize?client_id={client_id}&redirect_uri={redirect_uri}&scope=read:user,read:org&state={csrf}"
     );
-    (
+    let mut resp = (
         [(
             header::SET_COOKIE,
             oauth_signin::state_cookie(Provider::Github, &csrf),
         )],
         Redirect::temporary(&url),
     )
-        .into_response()
+        .into_response();
+    // Signing in from an AI tool's consent page: come back to it after.
+    if let Some(back) = q.return_to.as_deref().and_then(safe_return_to) {
+        if let Ok(v) = HeaderValue::from_str(&return_to_cookie(&back)) {
+            resp.headers_mut().append(header::SET_COOKIE, v);
+        }
+    }
+    resp
+}
+
+#[derive(Deserialize, Default)]
+pub struct GithubLoginQuery {
+    #[serde(default)]
+    pub return_to: Option<String>,
+}
+
+const RETURN_TO_COOKIE: &str = "coderhelm_return_to";
+
+/// Where a sign-in may send the person back to: only the consent page of an
+/// AI tool's sign-in, as a path on the dashboard, never another site.
+pub fn safe_return_to(raw: &str) -> Option<String> {
+    let r = raw.trim();
+    let ok = r.starts_with("/authorize/?request=")
+        && r.len() <= 4_000
+        && !r.contains("//")
+        && !r.contains('\\')
+        && r.chars().all(|c| c.is_ascii_graphic());
+    ok.then(|| r.to_string())
+}
+
+fn return_to_cookie(path: &str) -> String {
+    format!(
+        "{RETURN_TO_COOKIE}={}; HttpOnly; Secure; SameSite=Lax; Path=/auth; Max-Age=900",
+        urlencoding::encode(path)
+    )
+}
+
+/// The consent page a sign-in started from, when it did.
+fn return_to_of(headers: &HeaderMap) -> Option<String> {
+    let raw = extract_cookie(cookie_header(headers), RETURN_TO_COOKIE)?;
+    let path = urlencoding::decode(raw).ok()?;
+    safe_return_to(&path)
+}
+
+/// Whether a first GitHub sign-in may join `team` as a reader: the team lets
+/// people connect AI tools as readers, and GitHub just showed, with the
+/// person's own token, that they can reach the team's installation (they
+/// are in its organization).
+pub(crate) fn may_join_as_reader(readers_enabled: bool, owns_installation: bool) -> bool {
+    readers_enabled && owns_installation
 }
 
 /// GET /auth/github/callback — GitHub OAuth callback.
@@ -2127,8 +2179,34 @@ pub(crate) async fn github_sign_in_with_token(
 
     let has_existing_record = existing_user.is_some();
 
+    // A first sign-in from the organization of a team that lets people
+    // connect AI tools as readers: a reader of that team (no seat, no
+    // invite). Otherwise the rules below.
+    let mut reader_team: Option<String> = None;
+    if !has_existing_record && from == TokenFrom::OwnClient {
+        for (inst_id, org) in &all_installations {
+            if let Some(owner) =
+                super::github_webhook::resolve_team_by_installation(state, *inst_id).await
+            {
+                if may_join_as_reader(crate::bases::readers_enabled(state, &owner).await, true) {
+                    info!(
+                        github_login,
+                        org = org.as_str(),
+                        team_id = %owner,
+                        "First GitHub sign-in joins as a reader"
+                    );
+                    reader_team = Some(owner);
+                    break;
+                }
+            }
+        }
+    }
+
     // Open beta: a first sign-in starts a team, a few times an hour per address.
-    if !has_existing_record && super::open_signup::allow_new_team(state, ip).await.is_err() {
+    if !has_existing_record
+        && reader_team.is_none()
+        && super::open_signup::allow_new_team(state, ip).await.is_err()
+    {
         let dash = common::public_urls::app_url(&state.config.stage);
         return Ok(Redirect::temporary(&format!("{dash}?error=signup_limit")).into_response());
     }
@@ -2138,7 +2216,7 @@ pub(crate) async fn github_sign_in_with_token(
     // installation (each such team split the org and stole its webhooks).
     // The person needs an invite from that team; an invited person already
     // has a record and never reaches this branch.
-    if !has_existing_record {
+    if !has_existing_record && reader_team.is_none() {
         for (inst_id, org) in &all_installations {
             if let Some(owner) =
                 super::github_webhook::resolve_team_by_installation(state, *inst_id).await
@@ -2174,6 +2252,12 @@ pub(crate) async fn github_sign_in_with_token(
             .cloned()
             .unwrap_or_else(|| "member".to_string());
         (tid, uid, r)
+    } else if let Some(team) = reader_team.clone() {
+        (
+            team,
+            github_user_id.clone(),
+            crate::bases::READER_ROLE.to_string(),
+        )
     } else {
         // Brand new user — create a new team with ULID
         let new_team_id = format!("TEAM#{}", ulid::Ulid::new().to_string().to_lowercase());
@@ -2238,7 +2322,7 @@ pub(crate) async fn github_sign_in_with_token(
         .map_or(email, |e| e.as_str());
 
     // Ensure teams table record exists (for new users without an existing record)
-    if !has_existing_record {
+    if !has_existing_record && reader_team.is_none() {
         let _ = state
             .dynamo
             .put_item()
@@ -2257,6 +2341,8 @@ pub(crate) async fn github_sign_in_with_token(
     // Link GitHub installations to the team in the teams table — only when no
     // OTHER team owns the installation already.
     let link_target = match all_installations.first() {
+        // A reader never links an installation.
+        Some(_) if reader_team.is_some() => None,
         Some(&(inst_id, _)) => {
             let owner = super::github_webhook::resolve_team_by_installation(state, inst_id).await;
             if may_link_installation(owner.as_deref(), &team_id) {
@@ -2388,7 +2474,17 @@ pub(crate) async fn github_sign_in_with_token(
     .map_err(|e| SignInFailure::new(P, Reason::Server, "session_token", e))?;
 
     let dashboard_url = common::public_urls::app_url(&state.config.stage);
-    Ok(session_redirect(P, &token, dashboard_url))
+    let back = match return_to_of(headers) {
+        Some(path) => format!("{dashboard_url}{path}"),
+        None => dashboard_url.to_string(),
+    };
+    let mut resp = session_redirect(P, &token, &back);
+    if let Ok(v) = HeaderValue::from_str(&format!(
+        "{RETURN_TO_COOKIE}=; HttpOnly; Secure; SameSite=Lax; Path=/auth; Max-Age=0"
+    )) {
+        resp.headers_mut().append(header::SET_COOKIE, v);
+    }
+    Ok(resp)
 }
 
 /// Record when a member last signed in (shown on the team page). Only that one
@@ -3749,5 +3845,35 @@ mod github_link_tests {
         assert_eq!(link_outcome(false, 2, 0), "not_admin");
         assert_eq!(link_outcome(true, 2, 0), "owned_elsewhere");
         assert_eq!(link_outcome(true, 2, 1), "linked");
+    }
+
+    #[test]
+    fn a_reader_joins_only_where_the_team_lets_readers_in() {
+        assert!(crate::routes::auth::may_join_as_reader(true, true));
+        assert!(!crate::routes::auth::may_join_as_reader(false, true));
+        assert!(!crate::routes::auth::may_join_as_reader(true, false));
+    }
+
+    #[test]
+    fn a_sign_in_returns_only_to_an_ai_tools_consent_page() {
+        let ok = "/authorize/?request=eyJhbGciOi.abc_DEF-123";
+        assert_eq!(crate::routes::auth::safe_return_to(ok).as_deref(), Some(ok));
+        for bad in [
+            "https://evil.example.net/authorize/?request=x",
+            "//evil.example.net/authorize/?request=x",
+            "/settings/",
+            "/authorize/?request=a//b",
+            "/authorize/?request=a b",
+            "/authorize/?request=a\\b",
+        ] {
+            assert!(crate::routes::auth::safe_return_to(bad).is_none(), "{bad}");
+        }
+        assert!(crate::routes::auth::safe_return_to(&format!(
+            "/authorize/?request={}",
+            "a".repeat(5_000)
+        ))
+        .is_none());
+        let c = crate::routes::auth::return_to_cookie(ok);
+        assert!(c.contains("HttpOnly") && c.contains("Secure") && c.contains("Path=/auth"));
     }
 }

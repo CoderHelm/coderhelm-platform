@@ -10,8 +10,8 @@
 //! - [`RUNS`]: runs, current and past (`chat_work_runs`).
 //! - [`FINDINGS`]: security findings (dependency advisories and CVEs),
 //!   infrastructure findings and quarantined tests.
-//! - [`RECORDS`]: reviews and their verdicts, alerts, log findings and
-//!   plans (`chat_work_records`).
+//! - [`RECORDS`]: reviews and their verdicts, alerts, log findings, plans
+//!   and the team's AWS resources (`chat_work_records`).
 //!
 //! Each tool is offered only when the asker could see what it reads in the
 //! dashboard: the route that shows it is named ([`Kind::handler`]) and
@@ -141,6 +141,12 @@ pub const KINDS: &[Kind] = &[
         tool: FINDINGS,
     },
     Kind {
+        key: "resources",
+        label: "AWS resources",
+        handler: "infra_security::resources",
+        tool: RECORDS,
+    },
+    Kind {
         key: "tests",
         label: "quarantined tests",
         handler: "tests::list_tests",
@@ -263,14 +269,14 @@ pub fn defs(readable: &[&str], repos: &[String], can_github: bool) -> Vec<Value>
             }, "required": ["kind"]}
         }));
     }
-    let record_kinds: Vec<&str> = ["reviews", "alerts", "log_findings", "plans"]
+    let record_kinds: Vec<&str> = ["reviews", "alerts", "log_findings", "plans", "resources"]
         .into_iter()
         .filter(|k| may(readable, k))
         .collect();
     if !record_kinds.is_empty() {
         out.push(json!({
             "name": RECORDS,
-            "description": "Find other records Coderhelm keeps, newest first: reviews (Coderhelm's pull request reviews and their verdicts), alerts (alerts that came in and what was done), log_findings (problems found in the logs and their fixes), plans (plans and their tickets). Search by words, a repository or a pull request number.",
+            "description": "Find other records Coderhelm keeps, newest first: reviews (Coderhelm's pull request reviews and their verdicts), alerts (alerts that came in and what was done), log_findings (problems found in the logs and their fixes), plans (plans and their tickets), resources (the team's AWS resources: name, kind, account, region, versions, whether the internet reaches it, what AWS has pending for it, and where it is defined: repository, file, Terraform address, CloudFormation stack or CDK construct). Search by words, a repository or a pull request number. Use resources for \"what runs where\", \"which stack or file defines X\", \"what updates are pending\".",
             "input_schema": {"type": "object", "properties": {
                 "kind": {"type": "string", "enum": record_kinds},
                 "query": {"type": "string"},

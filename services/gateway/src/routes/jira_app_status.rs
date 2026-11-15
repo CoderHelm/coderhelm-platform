@@ -145,7 +145,8 @@ pub async fn for_team(state: &AppState, team_id: &str) -> Option<Behind> {
 
 /// GET /api/integrations/jira/app: `{ "behind": null }` when the team's
 /// Jira site runs the latest app (or nothing is known), otherwise what it
-/// runs, what it lacks and the Manage apps page.
+/// runs, what it lacks, where a site admin accepts the update (Atlassian
+/// Administration, Connected apps) and the installation link when published.
 pub async fn get_status(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,

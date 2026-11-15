@@ -165,6 +165,11 @@ pub struct OAuthSettings {
     /// Where a refresh token is exchanged, when the provider uses its own
     /// address for that (Figma). Empty means the token endpoint.
     pub refresh_endpoint: String,
+    /// Unix seconds when the settings above were last read from the
+    /// server's own metadata (0: never, or a provider whose addresses are
+    /// fixed). A sign-in starts from metadata at most
+    /// [`super::runtime::DISCOVERY_TTL_SECS`] old.
+    pub discovered_at: i64,
 }
 
 impl OAuthSettings {
@@ -182,6 +187,7 @@ impl OAuthSettings {
             resource: p.resource.clone(),
             scopes: p.scopes.clone(),
             legacy: p.legacy,
+            discovered_at: chrono::Utc::now().timestamp(),
             ..Default::default()
         }
     }
@@ -220,6 +226,7 @@ impl OAuthSettings {
             "extra_authorize": self.extra_authorize,
             "token_body_json": self.token_body_json,
             "refresh_endpoint": self.refresh_endpoint,
+            "discovered_at": self.discovered_at,
         })
     }
 
@@ -255,6 +262,7 @@ impl OAuthSettings {
                 .unwrap_or_default(),
             token_body_json: v["token_body_json"].as_bool().unwrap_or(false),
             refresh_endpoint: st("refresh_endpoint"),
+            discovered_at: v["discovered_at"].as_i64().unwrap_or(0),
         }
     }
 }

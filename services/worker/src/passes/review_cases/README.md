@@ -97,6 +97,30 @@ findings, whether the verdict blocked as it should, and the tokens and cost.
 They run only on demand (`reviewer-evals.yml`, `suite: route-review`, with the
 reviewer and critic models as inputs), never nightly.
 
+## Replaying the team's own reviews (`route_review_real_live`)
+
+Before a team's reviews move to the measured route (Settings, Model Provider,
+`review_model_route: measured_light`), its own past reviews are replayed on
+both reviewer models. `scripts/export_real_review_cases.py` writes one case
+per past review to a directory outside the repository (the cases hold the
+team's code and are never committed): the diff and files at the reviewed
+head, the repository's instruction files, and each finding whose fate is
+known from its GitHub thread, `accepted` (the code under it changed, or a
+person agreed) or `dismissed` (resolved or answered with no change on a
+settled PR). Then, once per reviewer model, with the critic on the strongest:
+
+```sh
+EVAL_REAL_CASES=<dir> ANTHROPIC_API_KEY=<the operator's own key> \
+  EVAL_REVIEW_MODEL=claude-sonnet-5-5 EVAL_CRITIC_MODEL=claude-opus-5-5 \
+  cargo test -p worker route_review_real_live -- --ignored --nocapture
+```
+
+Each `ROUTE_EVAL_SUMMARY` line (overall and per diff size) gives the recall
+on accepted findings, the recall on accepted blocking ones, how often a
+re-found finding has the same say on the merge, and how many dismissed
+findings come back. The route moves only where the lighter reviewer matches
+the strongest on the first three and raises no more dismissed findings.
+
 ## Add a case from a real PR (one step)
 
 ```sh

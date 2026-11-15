@@ -79,6 +79,15 @@ pub struct InventoryReport {
     pub resources: usize,
 }
 
+/// A list call that stopped at its page cap: what it did not read is not
+/// gone, so the read of that kind is partial (`RawAccount::complete_kinds`).
+fn capped(raw: &mut RawAccount, call: &str) {
+    raw.errors.push((
+        call.to_string(),
+        format!("more than {MAX_PAGES} pages: the rest was not read"),
+    ));
+}
+
 fn tags_of<'a>(it: impl IntoIterator<Item = (&'a str, &'a str)>) -> Vec<(String, String)> {
     it.into_iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -146,6 +155,9 @@ async fn read_ec2(s: &Session, raw: &mut RawAccount) {
                 return;
             }
         }
+    }
+    if token.is_some() {
+        capped(raw, "DescribeInstances");
     }
     let ids: BTreeSet<String> = raw
         .instances
@@ -219,6 +231,9 @@ async fn read_asgs(s: &Session, raw: &mut RawAccount) {
                 return;
             }
         }
+    }
+    if token.is_some() {
+        capped(raw, "DescribeAutoScalingGroups");
     }
 }
 
@@ -377,22 +392,42 @@ async fn read_eks(s: &Session, raw: &mut RawAccount) {
 /// start times; the task definition's environment is never read).
 async fn read_ecs(s: &Session, raw: &mut RawAccount) {
     let ecs = client!(aws_sdk_ecs, s);
-    let Ok(clusters) = ecs.list_clusters().max_results(100).send().await else {
-        return;
+    // Every failure and every cap is noted: services this read did not see
+    // are not gone.
+    let clusters = match ecs.list_clusters().max_results(100).send().await {
+        Ok(c) => c,
+        Err(e) => {
+            note!(raw, "ListClusters (ECS)", e);
+            return;
+        }
     };
+    if clusters.next_token().is_some() || clusters.cluster_arns().len() > 20 {
+        capped(raw, "ListClusters (ECS)");
+    }
     for c in clusters.cluster_arns().iter().take(20) {
-        let Ok(svcs) = ecs.list_services().cluster(c).max_results(100).send().await else {
-            continue;
+        let svcs = match ecs.list_services().cluster(c).max_results(100).send().await {
+            Ok(v) => v,
+            Err(e) => {
+                note!(raw, "ListServices", e);
+                continue;
+            }
         };
+        if svcs.next_token().is_some() || svcs.service_arns().len() > 50 {
+            capped(raw, "ListServices");
+        }
         for chunk in svcs.service_arns().chunks(10).take(5) {
-            let Ok(d) = ecs
+            let d = match ecs
                 .describe_services()
                 .cluster(c)
                 .set_services(Some(chunk.to_vec()))
                 .send()
                 .await
-            else {
-                continue;
+            {
+                Ok(d) => d,
+                Err(e) => {
+                    note!(raw, "DescribeServices", e);
+                    continue;
+                }
             };
             for sv in d.services() {
                 let launch = sv
@@ -557,6 +592,9 @@ async fn read_rds(s: &Session, raw: &mut RawAccount) {
             break;
         }
     }
+    if marker.is_some() {
+        capped(raw, "DescribeDBClusters");
+    }
     let mut marker: Option<String> = None;
     for _ in 0..MAX_PAGES {
         match rds
@@ -643,6 +681,9 @@ async fn read_rds(s: &Session, raw: &mut RawAccount) {
             break;
         }
     }
+    if marker.is_some() {
+        capped(raw, "DescribeDBInstances");
+    }
     let mut marker: Option<String> = None;
     for _ in 0..MAX_PAGES {
         match rds
@@ -681,6 +722,9 @@ async fn read_rds(s: &Session, raw: &mut RawAccount) {
         if marker.is_none() {
             break;
         }
+    }
+    if marker.is_some() {
+        capped(raw, "DescribePendingMaintenanceActions");
     }
 }
 
@@ -907,6 +951,12 @@ async fn read_scans(s: &Session, raw: &mut RawAccount) {
     let mut seen = BTreeSet::new();
     let images: Vec<(String, String)> =
         raw.services.iter().flat_map(|s| s.images.clone()).collect();
+    if images.len() > 30 {
+        raw.errors.push((
+            "DescribeImageScanFindings".into(),
+            "more than 30 images: the rest was not read".into(),
+        ));
+    }
     for (image, digest) in images.into_iter().take(30) {
         // Only images in this account's ECR: `<acct>.dkr.ecr.<region>.amazonaws.com/<repo>:<tag>`.
         let Some((host, rest)) = image.split_once('/') else {
@@ -1296,8 +1346,24 @@ pub struct Placing {
     pub repos_not_searched: usize,
     pub files_read: usize,
     pub files_not_read: usize,
+    /// Trees and files GitHub did not return.
+    pub failed: usize,
     pub located: usize,
     pub sure: usize,
+    /// Lambda functions left out: declared in a Terraform module folder
+    /// nothing calls, so never applied.
+    pub uncalled: usize,
+}
+
+impl Placing {
+    /// Every connected repository was searched and every candidate file
+    /// read: the Lambda functions the code declares are all of them.
+    pub fn complete(&self) -> bool {
+        self.repos > 0
+            && self.repos_not_searched == 0
+            && self.files_not_read == 0
+            && self.failed == 0
+    }
 }
 
 /// The order a repository's candidate files are read in, within the cap:
@@ -1388,16 +1454,17 @@ async fn place(
                 marked.extend(hits.into_iter().map(|h| h.path));
             }
         }
-        let tree: Vec<String> = gh
-            .get_tree(owner, name, "HEAD")
-            .await
-            .map(|t| {
-                t.into_iter()
-                    .filter(|e| e.entry_type == "blob")
-                    .map(|e| e.path)
-                    .collect()
-            })
-            .unwrap_or_default();
+        let tree: Vec<String> = match gh.get_tree(owner, name, "HEAD").await {
+            Ok(t) => t
+                .into_iter()
+                .filter(|e| e.entry_type == "blob")
+                .map(|e| e.path)
+                .collect(),
+            Err(_) => {
+                report.failed += 1;
+                Vec::new()
+            }
+        };
         let order = read_order(&named, &marked, &tree);
         let mut read = 0;
         for path in &order {
@@ -1406,6 +1473,7 @@ async fn place(
                 continue;
             }
             let Ok(content) = gh.get_file_content(owner, name, path).await else {
+                report.failed += 1;
                 continue;
             };
             if content.len() > MAX_FILE_BYTES || locate::tool_of(path, &content).is_none() {
@@ -1433,14 +1501,77 @@ async fn place(
         }
     }
     let now = Utc::now().to_rfc3339();
+    // A module folder nothing calls is never applied: what it declares does
+    // not run. Only said when every Terraform file was read (an unread file
+    // could be its caller).
+    let uncalled = if report.files_not_read == 0 && report.failed == 0 {
+        inv::uncalled_modules(
+            &files
+                .iter()
+                .map(|f| (f.repo.as_str(), f.path.as_str(), f.content.as_str()))
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        BTreeSet::new()
+    };
     for f in &files {
         if f.path.ends_with(".tf") {
-            resources.extend(inv::lambdas_from_terraform(
-                &f.repo, &f.path, &f.content, account, region, &now,
-            ));
+            let dir = f.path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+            let found =
+                inv::lambdas_from_terraform(&f.repo, &f.path, &f.content, account, region, &now);
+            if uncalled.contains(&format!("{}:{dir}", f.repo)) {
+                report.uncalled += found.len();
+                continue;
+            }
+            resources.extend(found);
         }
     }
     report
+}
+
+/// The resource rows stored for one account and region.
+async fn stored_rows(
+    state: &WorkerState,
+    team_id: &str,
+    account: &str,
+    region: &str,
+) -> Result<Vec<Resource>, String> {
+    let prefix = format!("{}{account}#{region}#", inv::RESOURCE_PREFIX);
+    let mut out = Vec::new();
+    let mut start: Option<std::collections::HashMap<String, AttributeValue>> = None;
+    for _ in 0..50 {
+        let r = state
+            .dynamo
+            .query()
+            .table_name(&state.config.aws_insights_table_name)
+            .key_condition_expression("pk = :pk AND begins_with(sk, :p)")
+            .expression_attribute_values(":pk", attr_s(team_id))
+            .expression_attribute_values(":p", attr_s(&prefix))
+            .set_exclusive_start_key(start.take())
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        out.extend(r.items().iter().filter_map(|i| {
+            i.get("json")
+                .and_then(|v| v.as_s().ok())
+                .and_then(|j| serde_json::from_str::<Resource>(j).ok())
+        }));
+        match r.last_evaluated_key() {
+            Some(k) => start = Some(k.clone()),
+            None => return Ok(out),
+        }
+    }
+    Err("too many rows".into())
+}
+
+/// What a read saw in full: the kinds every AWS call answered for, and the
+/// Lambda functions when the code was read in full this time.
+pub fn complete_kinds(raw: &RawAccount, placing: Option<&Placing>) -> Vec<inv::Kind> {
+    let mut k = raw.complete_kinds();
+    if placing.is_some_and(Placing::complete) && !k.is_empty() {
+        k.push(inv::Kind::LambdaFunction);
+    }
+    k
 }
 
 async fn save(
@@ -1449,6 +1580,8 @@ async fn save(
     raw: &RawAccount,
     resources: &[Resource],
     placing: &Placing,
+    complete: &[inv::Kind],
+    stored: Option<&[Resource]>,
 ) -> usize {
     let ttl = (Utc::now() + Duration::days(inv::KEEP_DAYS)).timestamp();
     let mut n = 0;
@@ -1472,11 +1605,35 @@ async fn save(
             Err(e) => warn!(team_id, error = %e, "infra inventory: a resource could not be saved"),
         }
     }
+    // What the read no longer lists, of a kind it saw in full, is gone
+    // from the account: its rows go now, not when their TTL runs out. A
+    // kind the read did not see in full keeps every row.
+    let mut removed = 0;
+    if let Some(stored) = stored {
+        for sk in inv::gone(stored, resources, complete) {
+            match state
+                .dynamo
+                .delete_item()
+                .table_name(&state.config.aws_insights_table_name)
+                .key("pk", attr_s(team_id))
+                .key("sk", attr_s(&sk))
+                .send()
+                .await
+            {
+                Ok(_) => removed += 1,
+                Err(e) => {
+                    warn!(team_id, error = %e, "infra inventory: a removed resource could not be dropped")
+                }
+            }
+        }
+    }
     let summary = serde_json::json!({
         "account": raw.account,
         "region": raw.region,
         "read_at": raw.read_at,
         "resources": n,
+        "removed": removed,
+        "complete": complete,
         "errors": raw.errors.iter().map(|(c, w)| serde_json::json!({ "call": c, "why": w, "permission": common::infra_vuln::raw::CALLS.iter().find(|(x, _)| x == c).map(|(_, p)| *p) })).collect::<Vec<_>>(),
         "latest_al2023": raw.latest_al2023,
         "placing": placing,
@@ -1533,11 +1690,52 @@ async fn accounts(state: &WorkerState) -> Vec<(String, AwsAccount)> {
     out
 }
 
-/// One read now, for one account (a person's "check now", or the sweep).
+/// Asks AWS to apply one pending RDS or Aurora action on one ARN
+/// (`ApplyPendingMaintenanceAction`), `immediate` or `next-maintenance`.
+/// The error is `(code, message)`.
+pub async fn apply_pending(
+    s: &Session,
+    arn: &str,
+    action: &str,
+    opt_in: &str,
+) -> Result<(), (String, String)> {
+    let rds = client!(aws_sdk_rds, s);
+    rds.apply_pending_maintenance_action()
+        .resource_identifier(arn)
+        .apply_action(action)
+        .opt_in_type(opt_in)
+        .send()
+        .await
+        .map(|_| ())
+        .map_err(|e| match e.as_service_error() {
+            Some(se) => {
+                use aws_sdk_dynamodb::error::ProvideErrorMetadata;
+                (
+                    se.code().unwrap_or("error").to_string(),
+                    common::truncate_str(se.message().unwrap_or(""), 240).to_string(),
+                )
+            }
+            None => ("unreachable".into(), "AWS didn't answer".into()),
+        })
+}
+
+/// How much of the account a read covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Depth {
+    /// AWS and the team's code (the daily read, a person's "check now").
+    Full,
+    /// AWS only, each resource keeping where its code was found last time
+    /// (the refresh when someone opens the page): no GitHub calls, and
+    /// the Lambda functions read from the code are left as they are.
+    Aws,
+}
+
+/// One read now, for one account.
 pub async fn read_account(
     state: &WorkerState,
     team_id: &str,
     a: &AwsAccount,
+    depth: Depth,
 ) -> Result<usize, String> {
     let session = common::live::aws::assume(&state.sts, &a.target(), "infra-inventory")
         .await
@@ -1545,9 +1743,52 @@ pub async fn read_account(
     let cfg = infra_config(state, team_id).await;
     let mut raw = read_with(&session, &a.account, &cfg).await;
     let mut resources = raw.resources();
-    lookup_stacks(&session, &mut raw, &mut resources).await;
-    let placing = place(state, team_id, &a.account, &a.region, &mut resources).await;
-    Ok(save(state, team_id, &raw, &resources, &placing).await)
+    // What is stored now: what this read replaces. Unreadable, nothing is
+    // dropped (the read still saves what it saw).
+    let stored = stored_rows(state, team_id, &a.account, &raw.region)
+        .await
+        .ok();
+    let (placing, complete) = match depth {
+        Depth::Full => {
+            lookup_stacks(&session, &mut raw, &mut resources).await;
+            let placing = place(state, team_id, &a.account, &a.region, &mut resources).await;
+            let complete = complete_kinds(&raw, Some(&placing));
+            (placing, complete)
+        }
+        Depth::Aws => {
+            if let Some(old) = &stored {
+                carry_over(&mut resources, old);
+            }
+            (Placing::default(), complete_kinds(&raw, None))
+        }
+    };
+    Ok(save(
+        state,
+        team_id,
+        &raw,
+        &resources,
+        &placing,
+        &complete,
+        stored.as_deref(),
+    )
+    .await)
+}
+
+/// A refresh keeps where each resource's code was found by the last full
+/// read, and the stack it came from.
+pub fn carry_over(fresh: &mut [Resource], stored: &[Resource]) {
+    for r in fresh.iter_mut() {
+        if let Some(old) = stored.iter().find(|o| o.sk() == r.sk()) {
+            if r.defined_in.is_none() {
+                r.defined_in = old.defined_in.clone();
+            }
+            for (k, v) in &old.tags {
+                if k.starts_with("aws:cloudformation:") || k == locate::LOOKUP_TAG {
+                    r.tags.entry(k.clone()).or_insert_with(|| v.clone());
+                }
+            }
+        }
+    }
 }
 
 /// The daily read, on the review-reminder tick: each account once a day.
@@ -1569,7 +1810,7 @@ pub async fn sweep(state: &WorkerState) -> InventoryReport {
         if !matches!(won, common::claim::Claim::Won) {
             continue;
         }
-        match read_account(state, &team, &a).await {
+        match read_account(state, &team, &a, Depth::Full).await {
             Ok(n) => {
                 report.accounts += 1;
                 report.resources += n;

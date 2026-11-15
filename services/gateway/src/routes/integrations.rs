@@ -388,6 +388,139 @@ fn product_card(
     v
 }
 
+/// The one Atlassian card's pieces, in the order the card lists them, with
+/// what each does in a person's words. Each piece keeps its own record and
+/// its own card JSON (it is set up and fixed where it always was); the page
+/// shows one Atlassian.
+pub const ATLASSIAN_PARTS: [(&str, &str, &str); 3] = [
+    (
+        "jira",
+        "Jira",
+        "Coderhelm's Jira app (Forge): tickets start work, and their status and comments follow the pull request.",
+    ),
+    (
+        "confluence",
+        "Confluence",
+        "Agents read pages during runs and reviews, and Knowledge syncs the spaces you pick.",
+    ),
+    (
+        "agent_tools",
+        "Agent tools",
+        "Atlassian's own server (Rovo MCP): agents search and read Jira issues and Confluence pages with the tools you allow.",
+    ),
+];
+
+/// The one Atlassian card's state, from its pieces' cards: a piece that
+/// needs something comes first (named), then what is connected, then
+/// nothing set up.
+pub fn atlassian_state(parts: &[(&str, &Value)]) -> CardState {
+    fn name_of(id: &str) -> &str {
+        ATLASSIAN_PARTS
+            .iter()
+            .find(|p| p.0 == id)
+            .map(|p| p.1)
+            .unwrap_or(id)
+    }
+    let status = |v: &Value| v["status"].as_str().unwrap_or("not_connected").to_string();
+    if let Some((id, v)) = parts.iter().find(|(_, v)| {
+        matches!(
+            status(v).as_str(),
+            "needs_reconnect" | "needs_credentials" | "error"
+        )
+    }) {
+        let st: &'static str = match status(v).as_str() {
+            "needs_reconnect" => "needs_reconnect",
+            "needs_credentials" => "needs_credentials",
+            _ => "error",
+        };
+        let action: &'static str = match v["action"].as_str().unwrap_or("") {
+            "reconnect" => "reconnect",
+            "add_credentials" => "add_credentials",
+            _ => "check_again",
+        };
+        let why = v["reason"].as_str().unwrap_or("").trim().to_string();
+        let why = if why.is_empty() {
+            "needs attention.".to_string()
+        } else {
+            why
+        };
+        return cs(st, format!("{}: {why}", name_of(id)), action);
+    }
+    let names = |want: bool| -> Vec<&str> {
+        parts
+            .iter()
+            .filter(|(_, v)| (status(v) == "connected") == want)
+            .map(|(id, _)| name_of(id))
+            .collect()
+    };
+    let on = names(true);
+    if on.is_empty() {
+        return cs("not_connected", "", "connect");
+    }
+    let off = names(false);
+    let verb = |n: &[&str], one: &'static str, many: &'static str| {
+        if n.len() == 1 {
+            one
+        } else {
+            many
+        }
+    };
+    let mut reason = format!("{} {} connected.", join_and(&on), verb(&on, "is", "are"));
+    if !off.is_empty() {
+        reason.push_str(&format!(
+            " {} {} set up.",
+            join_and(&off),
+            verb(&off, "isn't", "aren't")
+        ));
+    }
+    cs("connected", reason, "manage")
+}
+
+/// "a", "a and b", "a, b and c".
+fn join_and(words: &[&str]) -> String {
+    match words {
+        [] => String::new(),
+        [one] => one.to_string(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
+/// The one Atlassian card: the Jira app, Confluence and Atlassian's own
+/// server as pieces of one connection. Each piece's card is kept whole
+/// under `detail.parts`, so its panel works as before.
+pub fn atlassian_card(jira: Value, confluence: Value, agent_tools: Value) -> Value {
+    let parts = [
+        ("jira", &jira),
+        ("confluence", &confluence),
+        ("agent_tools", &agent_tools),
+    ];
+    let st = atlassian_state(&parts);
+    let first_on = parts.iter().map(|(_, v)| *v).find(|v| {
+        v["status"] == "connected" && !v["connected_by"].as_str().unwrap_or("").is_empty()
+    });
+    let app_update = jira["detail"]["app_update"].clone();
+    let mut v = card(
+        "atlassian",
+        "Atlassian",
+        "Jira and Confluence in one connection: tickets start work and follow the pull request, agents read Confluence pages and Knowledge syncs them, and agents can use Atlassian's own tools.",
+        st,
+        "",
+        "",
+        json!({
+            "app_update": app_update,
+            "parts": parts.iter().map(|(id, item)| {
+                let (_, name, what) = ATLASSIAN_PARTS.iter().find(|p| p.0 == *id).copied().unwrap_or((id, id, ""));
+                json!({ "id": id, "name": name, "what": what, "item": item })
+            }).collect::<Vec<_>>(),
+        }),
+    );
+    if let Some(p) = first_on {
+        v["connected_by"] = p["connected_by"].clone();
+        v["connected_at"] = p["connected_at"].clone();
+    }
+    v
+}
+
 /// The sign-in a team (or, for Sanity, this person) made so Knowledge can
 /// sync a product: its record and its connection, when someone signed in.
 #[derive(Debug, Clone)]
@@ -530,7 +663,7 @@ pub fn confluence_product(
     }
     let needs = [Need {
         for_use: Use::Knowledge,
-        detail: "Syncing pages into Knowledge needs an Atlassian sign-in or an API token: the Jira app only reads pages during runs.".into(),
+        detail: "Syncing pages into Knowledge needs an Atlassian sign-in or an API token. The Jira app is Jira-only: sites that still read pages through it keep that until their app updates.".into(),
         action: Some(Action::link("Connect in Knowledge", KNOWLEDGE_HREF)),
     }];
     product_state(&[Use::Runs, Use::Knowledge], &ways, &needs)
@@ -962,7 +1095,9 @@ pub async fn list(
     } else {
         None
     };
-    items.push(card(
+    // Jira, Confluence and Atlassian's own server are one Atlassian card:
+    // each piece is worked out as before and kept under it.
+    let jira_part = card(
         "jira",
         "Jira",
         "Starts work from Jira tickets and keeps their status in step with the pull request.",
@@ -974,7 +1109,9 @@ pub async fn list(
         "",
         "/settings/integrations/jira",
         json!({ "app": forge, "app_update": app_update }),
-    ));
+    );
+    let mut confluence_part = Value::Null;
+    let mut agent_tools_part = Value::Null;
 
     // AWS accounts: one card each (or one to connect the first).
     if accounts.is_empty() {
@@ -1043,7 +1180,7 @@ pub async fn list(
                 let p = confluence_product(c, k, sources_of(&sources, SourceKind::Confluence));
                 let mut detail = detail;
                 detail["knowledge"] = json!(k.map(KnowledgeSignIn::json));
-                items.push(product_card(
+                confluence_part = product_card(
                     &id,
                     &name,
                     does,
@@ -1051,7 +1188,7 @@ pub async fn list(
                     c.map(|c| c.updated_at.as_str()).unwrap_or(""),
                     "",
                     detail,
-                ));
+                );
                 continue;
             }
             items.push(card(
@@ -1196,7 +1333,7 @@ pub async fn list(
             "knowledge": k.map(KnowledgeSignIn::json),
             "unused": unused,
         });
-        items.push(product_card(
+        let item = product_card(
             &id,
             p["name"].as_str().unwrap_or(&id),
             p["description"].as_str().unwrap_or(""),
@@ -1204,8 +1341,14 @@ pub async fn list(
             &tested_at,
             "",
             detail,
-        ));
+        );
+        if id == "atlassian" {
+            agent_tools_part = item;
+        } else {
+            items.push(item);
+        }
     }
+    items.push(atlassian_card(jira_part, confluence_part, agent_tools_part));
 
     // Google Drive is only ever synced into Knowledge: it has a card here
     // once the team signed in, so the sign-in is seen where sign-ins are.
@@ -1544,6 +1687,85 @@ mod tests {
             "2026-10-19T10:00:00Z",
         );
         a
+    }
+
+    fn part(id: &str, status: &str, reason: &str, action: &str) -> Value {
+        let mut v = card(
+            id,
+            id,
+            "",
+            cs("not_connected", "", "connect"),
+            "",
+            "",
+            json!({}),
+        );
+        v["status"] = json!(status);
+        v["reason"] = json!(reason);
+        v["action"] = json!(action);
+        v
+    }
+
+    #[test]
+    fn atlassian_is_one_card_over_its_three_pieces() {
+        // Nothing set up: one card to connect.
+        let off = |id| part(id, "not_connected", "", "connect");
+        let c = atlassian_card(off("jira"), off("confluence"), off("atlassian"));
+        assert_eq!(c["id"], "atlassian");
+        assert_eq!(c["name"], "Atlassian");
+        assert_eq!(c["section"], "code");
+        assert_eq!(c["status"], "not_connected");
+        assert_eq!(c["action"], "connect");
+        let parts = c["detail"]["parts"].as_array().unwrap();
+        let ids: Vec<_> = parts.iter().map(|p| p["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, vec!["jira", "confluence", "agent_tools"]);
+        // Each piece's own card is kept whole, so its panel works as before.
+        assert_eq!(parts[1]["item"]["id"], "confluence");
+        assert_eq!(parts[2]["item"]["id"], "atlassian");
+        assert!(parts
+            .iter()
+            .all(|p| p["what"].as_str().unwrap().ends_with('.')));
+
+        // An existing Jira app and Confluence sign-in: connected, saying which.
+        let mut jira = part("jira", "connected", "", "manage");
+        jira["connected_by"] = json!("admin@example.com");
+        jira["detail"]["app_update"] = json!({ "message": "Update the app." });
+        let c = atlassian_card(
+            jira,
+            part("confluence", "connected", "", "manage"),
+            off("atlassian"),
+        );
+        assert_eq!(c["status"], "connected");
+        assert_eq!(
+            c["reason"],
+            "Jira and Confluence are connected. Agent tools isn't set up."
+        );
+        assert_eq!(c["connected_by"], "admin@example.com");
+        // The Jira app's update notice still shows under the one row.
+        assert_eq!(c["detail"]["app_update"]["message"], "Update the app.");
+
+        // A piece that needs something comes first, named.
+        let c = atlassian_card(
+            part("jira", "connected", "", "manage"),
+            part(
+                "confluence",
+                "needs_reconnect",
+                "The sign-in has to be renewed.",
+                "reconnect",
+            ),
+            part("atlassian", "connected", "", "manage"),
+        );
+        assert_eq!(c["status"], "needs_reconnect");
+        assert_eq!(c["action"], "reconnect");
+        assert_eq!(c["reason"], "Confluence: The sign-in has to be renewed.");
+        let all = atlassian_state(&[
+            ("jira", &part("jira", "connected", "", "manage")),
+            ("confluence", &part("confluence", "connected", "", "manage")),
+            ("agent_tools", &part("atlassian", "connected", "", "manage")),
+        ]);
+        assert_eq!(
+            all.reason,
+            "Jira, Confluence and Agent tools are connected."
+        );
     }
 
     #[test]

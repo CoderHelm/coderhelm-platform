@@ -178,10 +178,16 @@ jobs:
       # numbers each deploy, so the version is read back from Forge.
       - name: Read the released version
         id: version
+        env:
+          # The app's installation link (developer console, Distribution),
+          # kept as a repository variable: site admins get it as the
+          # one-click update.
+          FORGE_INSTALL_URL: ${{ vars.FORGE_INSTALL_URL }}
         run: |
           if forge version list --environment production --non-interactive --json > "$RUNNER_TEMP/versions.json" 2> "$RUNNER_TEMP/versions.err" \
              && python3 "$RUNNER_TEMP/forge_release.py" latest --versions "$RUNNER_TEMP/versions.json" --manifest manifest.yml \
-                  --commit "$(git rev-parse HEAD)" --published-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$RUNNER_TEMP/jira-app.json"; then
+                  --commit "$(git rev-parse HEAD)" --published-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                  --install-url "${FORGE_INSTALL_URL}" > "$RUNNER_TEMP/jira-app.json"; then
             version=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["version"])' "$RUNNER_TEMP/jira-app.json")
             echo "Released version: $version"
             echo "version=$version" >> "$GITHUB_OUTPUT"
@@ -221,7 +227,7 @@ jobs:
           # Minor versions reach every site by themselves. Installations still
           # on an older major version are upgraded here; that works on sites
           # where the token's account is a site admin, and elsewhere waits for
-          # that site's admin to accept the update in Jira.
+          # that site's admin to accept the update in Atlassian Administration.
           forge install list --json > "$RUNNER_TEMP/installs.json" 2> "$RUNNER_TEMP/installs.err" || {
             echo "::warning::Could not list installations"; echo "listed=false" >> "$GITHUB_OUTPUT"; exit 0; }
           python3 "$RUNNER_TEMP/forge_release.py" pending --installs "$RUNNER_TEMP/installs.json" > "$RUNNER_TEMP/pending.tsv"
@@ -234,10 +240,15 @@ jobs:
           while IFS=$'\t' read -r site product major; do
             [ -n "$site" ] || continue
             echo "::add-mask::$site"
+            # The CLI's own refusal (insufficient permissions, or advice to
+            # install for another product) is about the token's account, not
+            # the site: it stays in the log, quietly, and the summary says
+            # what the site's admin does.
             if forge install --upgrade --site "$site" --product "$product" \
-                 --environment production --non-interactive --confirm-scopes; then
+                 --environment production --non-interactive --confirm-scopes > "$RUNNER_TEMP/upgrade.log" 2>&1; then
               upgraded=$((upgraded + 1))
             else
+              echo "Not upgraded from CI (the Forge token's account isn't an admin on this site); its admin accepts the update."
               failed=$((failed + 1))
               printf '%s\t%s\n' "$major" "$product" >> "$RUNNER_TEMP/behind.tsv"
             fi
@@ -269,6 +280,7 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           FAILED: ${{ steps.upgrade.outputs.failed || '0' }}
           BEHIND: ${{ steps.upgrade.outputs.warning }}
+          FORGE_INSTALL_URL: ${{ vars.FORGE_INSTALL_URL }}
         run: |
           # The issue holds counts and manifest facts only, never site names.
           title="Jira app update needs a site admin"
@@ -278,7 +290,7 @@ jobs:
             "$reasons" \
             "Installations not upgraded from CI: ${FAILED}." \
             "${BEHIND}" \
-            "On each site, a Jira admin accepts the update: Jira Settings, Apps, Manage apps, Coderhelm, Update." \
+            "$(python3 -c 'import sys;sys.path.insert(0,sys.argv[1]);import forge_release as f;print(f.admin_steps(sys.argv[2]))' "$RUNNER_TEMP" "${FORGE_INSTALL_URL}")" \
             "Run: ${RUN_URL}")
           existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "in:title \"$title\"" --json number --jq '.[0].number // empty')
           if [ -n "$existing" ]; then

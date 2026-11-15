@@ -489,6 +489,7 @@ async fn two_findings_with_one_cause_make_one_card_that_says_what_was_done() {
             assert_eq!(p.repo, "acme/infra-live");
             let s = Action::Started {
                 repo: p.repo.clone(),
+                why: String::new(),
             }
             .sentence(&inc.diagnosis);
             assert!(

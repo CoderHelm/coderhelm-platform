@@ -661,29 +661,13 @@ pub async fn run(
         &format!("PR #{}", msg.pr_number),
     )
     .await;
-    let system = format!(
-        "You are the engineer answering reviewer comments on a pull request in the \
-         {owner}/{repo} repository, by reading and writing files directly to the PR branch. \
-         {stance}Every change a comment asks for is made, checked and working when you \
-         finish; a reply says what you did and what you checked. \
-         If a comment requests a code change, commit it — use edit_file for targeted edits \
-         (the default, and the ONLY safe option for a few lines in a large file), and write_file \
-         or batch_write only for new files or whole-file rewrites — then confirm briefly. \
-         If a comment asks a question, read the code and answer clearly. \
-         If a comment asks to change the pull request's description (its text, a section, a \
-         banner, a name in it), call update_pr_description with exactly what to change; never \
-         edit files for that. CoderHelm rewrites the description and adds what changed to your \
-         reply. \
-         Change only what each comment asks for: code next to it that looks alike but that the \
-         comment did not name stays exactly as it is. \
-         Your changes land on the pull request as one commit in one push when you finish, after \
-         CoderHelm checks them (scope, logs, the full test suite). \
-         Your output is posted directly as a GitHub comment — write natural replies, no meta-commentary.{voice_block}{team_block}{tests_block}{logs_block}{memory_block}",
-        logs_block = super::review_fix::logs::GUIDANCE,
-        memory_block = repo_memory.text,
-        stance = super::ownership::coder_stance(),
-        owner = msg.repo_owner,
-        repo = msg.repo_name,
+    let system = feedback_system_prompt(
+        &msg.repo_owner,
+        &msg.repo_name,
+        &voice_block,
+        &team_block,
+        tests_block,
+        &repo_memory.text,
     );
 
     // The team's commit convention and the run's ticket: every commit this
@@ -4293,6 +4277,44 @@ async fn ensure_pr_open(
     }
 
     true
+}
+
+/// The feedback round's system prompt. The marker sits before the memories
+/// recalled for this round's comments: what comes before it (the role, the
+/// team's voice, instructions and rules) is the same for every round in the
+/// repository, so it is cached with the tools and read by the next round
+/// instead of written again. The text is unchanged; only the cache point is
+/// new (`crate::agent::anthropic::SHARED_PREFIX_END`).
+pub(crate) fn feedback_system_prompt(
+    owner: &str,
+    repo: &str,
+    voice_block: &str,
+    team_block: &str,
+    tests_block: &str,
+    memory_block: &str,
+) -> String {
+    format!(
+        "You are the engineer answering reviewer comments on a pull request in the \
+         {owner}/{repo} repository, by reading and writing files directly to the PR branch. \
+         {stance}Every change a comment asks for is made, checked and working when you \
+         finish; a reply says what you did and what you checked. \
+         If a comment requests a code change, commit it — use edit_file for targeted edits \
+         (the default, and the ONLY safe option for a few lines in a large file), and write_file \
+         or batch_write only for new files or whole-file rewrites — then confirm briefly. \
+         If a comment asks a question, read the code and answer clearly. \
+         If a comment asks to change the pull request's description (its text, a section, a \
+         banner, a name in it), call update_pr_description with exactly what to change; never \
+         edit files for that. CoderHelm rewrites the description and adds what changed to your \
+         reply. \
+         Change only what each comment asks for: code next to it that looks alike but that the \
+         comment did not name stays exactly as it is. \
+         Your changes land on the pull request as one commit in one push when you finish, after \
+         CoderHelm checks them (scope, logs, the full test suite). \
+         Your output is posted directly as a GitHub comment — write natural replies, no meta-commentary.{voice_block}{team_block}{tests_block}{logs_block}{shared}{memory_block}",
+        logs_block = super::review_fix::logs::GUIDANCE,
+        shared = crate::agent::anthropic::SHARED_PREFIX_END,
+        stance = super::ownership::coder_stance(),
+    )
 }
 
 #[cfg(test)]

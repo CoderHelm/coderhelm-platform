@@ -700,6 +700,83 @@ impl RawAccount {
     }
 }
 
+/// The calls whose full answer a read of each kind of resource needs. A
+/// call that failed, or stopped at a page cap (it is noted as failed too),
+/// leaves that kind unread: what the read did not see is not gone.
+pub fn calls_for(kind: Kind) -> &'static [&'static str] {
+    const AMI: &[&str] = &[
+        "DescribeInstances",
+        "DescribeImages",
+        "DescribeAutoScalingGroups",
+        "DescribeTargetGroups",
+        "DescribeLoadBalancers",
+        "GetParameters",
+        "ListInventoryEntries",
+    ];
+    match kind {
+        Kind::Ec2Instance | Kind::AutoScalingGroup => AMI,
+        Kind::EksCluster => &["ListClusters (EKS)", "DescribeCluster"],
+        Kind::EksNodegroup => &[
+            "ListClusters (EKS)",
+            "DescribeCluster",
+            "ListNodegroups",
+            "DescribeNodegroup",
+            "GetParameters",
+        ],
+        Kind::EcsFargateService => &[
+            "ListClusters (ECS)",
+            "ListServices",
+            "DescribeServices",
+            "DescribeTargetGroups",
+            "DescribeLoadBalancers",
+        ],
+        Kind::RdsCluster | Kind::RdsInstance => &[
+            "DescribeDBClusters",
+            "DescribeDBInstances",
+            "DescribePendingMaintenanceActions",
+        ],
+        Kind::ElasticacheGroup => &["DescribeServiceUpdates", "DescribeUpdateActions"],
+        Kind::OpensearchDomain => &["ListDomainNames", "DescribeDomains"],
+        Kind::ContainerImage => &[
+            "ListClusters (ECS)",
+            "ListServices",
+            "DescribeServices",
+            "DescribeImageScanFindings",
+        ],
+        // Read from the team's code, never from AWS: the read of the code
+        // decides ([`crate::infra_vuln::inventory::KindsRead`]).
+        Kind::LambdaFunction => &["(code)"],
+    }
+}
+
+/// Calls whose failure leaves every kind unread: what they add (Inspector
+/// findings, Health events) can be on any resource.
+pub const OPTIONAL_SOURCES: &[&str] = &[
+    "ListFindings (Inspector)",
+    "DescribeEvents (Health)",
+    "DescribeAffectedEntities (Health)",
+    "GetQueueUrl (Health events)",
+    "ReceiveMessage (Health events)",
+];
+
+impl RawAccount {
+    /// The kinds of resource this read saw in full: every call they need
+    /// answered, every page read. Lambda functions are never among them
+    /// (they come from the code).
+    pub fn complete_kinds(&self) -> Vec<Kind> {
+        let failed = |c: &str| self.errors.iter().any(|(x, _)| x == c);
+        if OPTIONAL_SOURCES.iter().any(|c| failed(c)) {
+            return Vec::new();
+        }
+        inv::ALL_KINDS
+            .iter()
+            .copied()
+            .filter(|k| *k != Kind::LambdaFunction)
+            .filter(|k| !calls_for(*k).iter().any(|c| failed(c)))
+            .collect()
+    }
+}
+
 /// The calls a read makes and the permission each needs, so a refusal can
 /// name it.
 pub const CALLS: &[(&str, &str)] = &[
