@@ -9674,9 +9674,8 @@ async fn stop_if_already_merged(
     if msg.same_run() || !mt::guards(&msg.source, &msg.ticket_id) {
         return false;
     }
-    let merged = history.merged_prs();
-    let allowed = history.allowed_after_merge();
-    let Some(pr) = mt::blocking(&merged, false, &allowed).cloned() else {
+    let repo = format!("{}/{}", msg.repo_owner, msg.repo_name);
+    let Some(pr) = history.blocking_merge(&msg.source, &repo) else {
         return false;
     };
     if msg.after_merge || msg.person_direction.is_some() {

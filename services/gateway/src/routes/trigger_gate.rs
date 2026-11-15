@@ -148,8 +148,8 @@ fn decide(latest: &LatestRun, new_hash: Option<&str>, reopened: bool) -> Decisio
             && !latest.changed(new_hash)
         {
             return Decision::Skip(
-                "its last runs failed and the ticket is unchanged; an edit, a reopen or a \
-                 person's Retry starts another",
+                "the ticket's last runs failed and it is unchanged; changing the ticket, \
+                 reopening it, or a person's explicit Retry or command starts another",
             );
         }
         return Decision::Enqueue;
