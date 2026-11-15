@@ -1620,6 +1620,9 @@ fn build_app(state: Arc<AppState>) -> Router {
         // CI calls signed with a GitHub Actions OIDC token
         .route("/ci/tests/results", post(routes::tests::ci_upload))
         .route("/ci/tests/quarantine", get(routes::tests::ci_quarantine))
+        // A screenshot in the Before and After table of CoderHelm's own pull
+        // request; the signed link is the credential (routes::tests).
+        .route("/ci/tests/screenshot", get(routes::tests::ci_screenshot))
         // Events CoderHelm's relay forwards to a hybrid install, and its
         // ownership proof (routes::hybrid_install).
         .route("/relay", post(routes::hybrid_install::intake))

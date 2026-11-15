@@ -1279,6 +1279,7 @@ pub mod e2e_attribution;
 /// preview before the pull request is called done.
 pub(crate) mod e2e_proof;
 pub mod e2e_reads;
+pub mod e2e_screens;
 pub mod e2e_setup;
 pub mod email_events;
 mod explore_guard;
