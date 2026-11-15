@@ -383,7 +383,7 @@ pub fn feature_case() -> Case {
         ],
         collapsed: vec![
             // Waiting on a named event, with who approves and where.
-            "Deploy the production Studio. CoderHelm does this once step 1 is done and a team admin has approved it on the Agent permissions page.",
+            "Deploy the production Studio. CoderHelm does this once \"Deploy the staging Studio after merge\" is done and a team admin has approved it on the Agent permissions page.",
             // What CoderHelm could check, it checked and reports.
             "- Checked: the content query returns exactly one item, n = 392, it does.",
             "- Checked: the tests the change names",

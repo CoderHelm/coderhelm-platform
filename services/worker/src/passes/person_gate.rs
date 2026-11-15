@@ -311,6 +311,89 @@ mod tests {
         }
     }
 
+    /// The body of `fn name` in a source: from its signature to the next
+    /// item at the same indentation.
+    fn body_of<'a>(text: &'a str, sig: &str) -> &'a str {
+        let at = text
+            .find(sig)
+            .unwrap_or_else(|| panic!("`{sig}` not found"));
+        let rest = &text[at..];
+        let end = rest[1..].find("\n}\n").map(|e| e + 3).unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    /// Enforced where nothing goes around it: every place text reaches a
+    /// person, and every status that waits on one. A producer that skips
+    /// the gate (the outside report once did) is still caught here.
+    #[test]
+    fn every_sink_and_every_waiting_status_goes_through_the_gate() {
+        // Comments (GitHub, Jira), pull request descriptions, chat.
+        let conv = src("../common/src/conversation.rs");
+        assert!(
+            body_of(code(&conv), "pub async fn speak_with(").contains("sink_decision("),
+            "comments are posted without the sink check"
+        );
+        assert!(
+            body_of(
+                code(&src("src/passes/description.rs")),
+                "pub async fn save("
+            )
+            .contains("person_gate::sink("),
+            "pull request descriptions are saved without the sink check"
+        );
+        assert!(
+            body_of(
+                code(&src("../common/src/notify/mod.rs")),
+                "pub async fn deliver("
+            )
+            .contains("sink_message("),
+            "chat messages are sent without the sink check"
+        );
+        // Every writer of the run page's outside report, and every writer
+        // of the waiting-on-a-person status.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = Vec::new();
+        rs_files(&root.join("src"), &mut files);
+        for f in files {
+            let text = std::fs::read_to_string(&f).unwrap();
+            let body = code(&text);
+            let name = f.display().to_string();
+            if body.contains("outside_change_report = :rep") {
+                assert!(
+                    body.contains("person_gate::sink(") || body.contains("sink_for_person("),
+                    "{name} writes the outside report without the sink check"
+                );
+            }
+            let waits = body.contains("attr_s(fix_location::STATUS_OUTSIDE)")
+                || body.contains("attr_s(super::fix_location::STATUS_OUTSIDE)")
+                || body.contains("super::fix_location::STATUS_OUTSIDE\n");
+            if waits {
+                assert!(
+                    body.contains("may_wait_on_person(") || body.contains("person_gate::sink("),
+                    "{name} sets a waiting-on-a-person status without the gate"
+                );
+            }
+        }
+        // What the run counts as a person's is what the gate let through.
+        let ow = src("src/passes/outside_work.rs");
+        for (sig, call) in [
+            ("pub fn held(", "needs_person"),
+            ("pub fn left(", "pr_steps::needed("),
+            ("pub fn classify(", "needs_person"),
+            ("pub fn ticket_note(", "pr_steps::needed("),
+        ] {
+            assert!(
+                body_of(code(&ow), sig).contains(call),
+                "outside_work `{sig}` decides without the gate"
+            );
+        }
+        let resume = src("src/passes/resume.rs");
+        assert!(
+            body_of(&resume, "fn end_status(").contains("may_wait_on_person("),
+            "the run's end status waits on a person without the gate"
+        );
+    }
+
     #[test]
     fn the_standard_is_in_front_of_every_model_that_writes_for_people() {
         for rel in [

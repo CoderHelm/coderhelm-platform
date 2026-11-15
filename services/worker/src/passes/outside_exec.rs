@@ -95,6 +95,26 @@ pub struct Progress {
     pub waiting: bool,
     /// A started end-to-end run failed.
     pub failed_e2e: Option<FailedRun>,
+    /// Steps a person was to do that the gate gave back to CoderHelm.
+    pub moved: usize,
+    /// CoderHelm's own tool failures, each once (`common::tool_health`):
+    /// for the run page and the health alert, never for a person.
+    pub problems: Vec<common::tool_health::Problem>,
+}
+
+/// Reports CoderHelm's own tool failures once each: one line on the run
+/// page, one error the health alerts read.
+pub async fn report_problems(state: &WorkerState, team_id: &str, run_id: &str, p: &Progress) {
+    for prob in &p.problems {
+        tracing::error!(
+            run_id,
+            tool = %prob.tool,
+            diagnosis = ?prob.diagnosis,
+            detail = %prob.detail,
+            "tool health: a CoderHelm tool failed; its steps used another way"
+        );
+        super::add_progress_note(state, team_id, run_id, &prob.line()).await;
+    }
 }
 
 // ── The gate ────────────────────────────────────────────────────────────────
@@ -144,7 +164,12 @@ pub fn gate_args(
                 "migration": s.migration,
             })),
         )),
-        Action::Query | Action::Cannot(_) => None,
+        Action::Query(_)
+        | Action::PageCheck { .. }
+        | Action::ReadRuns(_)
+        | Action::HeadChecks(_)
+        | Action::Release
+        | Action::Cannot(_) => None,
     }
 }
 
@@ -177,11 +202,15 @@ pub async fn execute(
     until: Instant,
 ) -> Progress {
     let mut p = Progress::default();
+    let mut health = common::tool_health::Health::new(cx.github.installation_id());
     c.placed = Some(Placement {
         repo: cx.full(),
         branch: cx.branch.to_string(),
         pr_number: cx.pr_number,
     });
+    // One executor: a step a person was to do that the gate finds
+    // CoderHelm's is done here, like the rest.
+    p.moved = outside_work::classify(c);
     let snapshot = c.clone();
     for i in 0..c.steps.len() {
         let s = &mut c.steps[i];
@@ -212,7 +241,7 @@ pub async fn execute(
                 poll(cx, s, &unknown_route(s), until, &mut p).await;
             }
         } else {
-            act(cx, a, &snapshot, s, action, until, &mut p).await;
+            Box::pin(act(cx, a, &snapshot, s, action, until, &mut p, &mut health)).await;
         }
         if outside_work::under_way(s) {
             p.waiting = true;
@@ -222,9 +251,10 @@ pub async fn execute(
             break;
         }
     }
-    if !p.waiting && confirm(cx, a, c).await {
+    if !p.waiting && confirm(cx, a, c, &mut health).await {
         p.changed = true;
     }
+    p.problems = health.take_reports();
     p
 }
 
@@ -252,14 +282,16 @@ fn unknown_route(s: &NoteStep) -> Route {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn act(
     cx: &Ctx<'_>,
     a: &Abilities,
-    c: &OutsideChange,
+    _c: &OutsideChange,
     s: &mut NoteStep,
     action: Action,
     until: Instant,
     p: &mut Progress,
+    health: &mut common::tool_health::Health,
 ) {
     match &action {
         Action::Cannot(why) => {
@@ -267,8 +299,28 @@ async fn act(
             s.result = format!("not done: {why}");
             return;
         }
-        Action::Query => {
-            query_step(cx, a, c, s).await;
+        Action::Query(q) => {
+            query_step(cx, a, s, q, health).await;
+            return;
+        }
+        Action::PageCheck { urls, find } => {
+            Box::pin(page_step(cx, a, s, urls, find, until, p, health)).await;
+            return;
+        }
+        Action::ReadRuns(names) => {
+            Box::pin(runs_step(cx, a, s, names, until, p, health)).await;
+            return;
+        }
+        Action::HeadChecks(cmd) => {
+            checks_step(cx, s, cmd, p, health).await;
+            return;
+        }
+        Action::Release => {
+            s.run = Some(StepRun {
+                state: outside_work::RELEASE.to_string(),
+                ..Default::default()
+            });
+            s.result = "the release steps do it after the merge".to_string();
             return;
         }
         Action::Write(Target::Production) => {
@@ -337,6 +389,21 @@ async fn act(
     match action {
         Action::Dispatch(r) | Action::Label(_, r) => {
             start(cx, s, &action_label(&args), &r, until, p).await;
+            // Not allowed to start a workflow: an end-to-end run that also
+            // runs on a label is started by the label (no Actions grant).
+            if s.result.contains(NO_ACTIONS_WRITE) && s.step_kind() == StepKind::E2e {
+                if let Some(lr) = a
+                    .e2e
+                    .iter()
+                    .find(|x| matches!(x.trigger, outside_work::Trigger::Label(_)))
+                    .cloned()
+                {
+                    if let outside_work::Trigger::Label(l) = &lr.trigger {
+                        let label = Some(l.clone());
+                        start(cx, s, &label, &lr, until, p).await;
+                    }
+                }
+            }
         }
         Action::Write(Target::Staging) => {
             if let Some((conn, token)) = conn {
@@ -753,37 +820,397 @@ pub fn failing_tests(log: &str) -> Vec<String> {
     out
 }
 
-/// Runs a verify step's query and records it.
-async fn query_step(cx: &Ctx<'_>, a: &Abilities, c: &OutsideChange, s: &mut NoteStep) {
-    let Some(q) = c
-        .confirm
-        .as_ref()
-        .map(|f| f.query.clone())
-        .filter(|q| !q.trim().is_empty())
-    else {
-        s.result = "not done: the note gives no confirm query to run".to_string();
-        return;
-    };
-    match read(cx, a, &q).await {
+/// Runs a verify step's own GROQ query and records it.
+async fn query_step(
+    cx: &Ctx<'_>,
+    a: &Abilities,
+    s: &mut NoteStep,
+    q: &str,
+    health: &mut common::tool_health::Health,
+) {
+    match read_retrying(cx, a, q, health).await {
         Ok((v, on)) => {
-            s.result = format!("ran `{}` on {on}: {}", one_line(&q), quote(&v.to_string()));
+            s.result = format!("ran `{}` on {on}: {}", one_line(q), quote(&v.to_string()));
             s.done = true;
         }
-        Err(e) => s.result = format!("not done: ran `{}`: {e}", one_line(&q)),
+        Err(e) => s.result = format!("not done: ran `{}`: {e}", one_line(q)),
     }
+}
+
+/// [`read`], retried as the failure's diagnosis allows; a failure that
+/// stays marks the content query degraded (reported once).
+async fn read_retrying(
+    cx: &Ctx<'_>,
+    a: &Abilities,
+    q: &str,
+    health: &mut common::tool_health::Health,
+) -> Result<(Value, String), String> {
+    if !outside_work::is_groq(q) {
+        // Never sent: the CMS read API takes GROQ only.
+        return Err(format!("`{}` is not a GROQ query", one_line(q)));
+    }
+    let mut last = match read(cx, a, q).await {
+        Ok(v) => return Ok(v),
+        Err(e) => e,
+    };
+    let d = common::tool_health::diagnose(&last);
+    for wait in common::tool_health::retry_after(d) {
+        tokio::time::sleep(*wait).await;
+        match read(cx, a, q).await {
+            Ok(v) => return Ok(v),
+            Err(e) => last = e,
+        }
+    }
+    health.failed(outside_work::TOOL, &last);
+    Err(last)
+}
+
+/// Whether a page check step loads its pages itself (`check_url`), or
+/// takes the other way because the page check is down.
+pub fn use_page_check(health: &mut common::tool_health::Health) -> bool {
+    health.degraded(super::web_check::TOOL).is_none()
+}
+
+/// A page check step: each page loaded and searched (`check_url`). When
+/// the page check is down (it failed on this run or recently on this
+/// installation), the preview's end-to-end run, which loads the same pages,
+/// is read instead.
+#[allow(clippy::too_many_arguments)]
+async fn page_step(
+    cx: &Ctx<'_>,
+    a: &Abilities,
+    s: &mut NoteStep,
+    urls: &[String],
+    find: &[String],
+    until: Instant,
+    p: &mut Progress,
+    health: &mut common::tool_health::Health,
+) {
+    let tool = super::web_check::TOOL;
+    if use_page_check(health) {
+        let web = super::web_check::WebCheck::load(
+            cx.state,
+            cx.team_id,
+            &cx.full(),
+            "CoderHelm (outside steps)",
+            cx.pr_number,
+            &urls.join(" "),
+        )
+        .await
+        .with_run(cx.run_id, "outside steps".to_string());
+        let mut lines: Vec<String> = Vec::new();
+        let mut missing: Vec<String> = Vec::new();
+        let mut broken: Option<super::web_check::CheckError> = None;
+        for u in urls {
+            match web.verify_find(cx.state, cx.github, u, find).await {
+                Ok(ck) => {
+                    let st = ck.status().unwrap_or(0);
+                    let absent: Vec<&str> = ck
+                        .found
+                        .iter()
+                        .filter(|(_, hits)| hits.is_empty())
+                        .map(|(t, _)| t.as_str())
+                        .collect();
+                    lines.push(format!("{u}: {st}"));
+                    if st != 200 || !absent.is_empty() {
+                        missing.push(if absent.is_empty() {
+                            format!("{u} returned {st}")
+                        } else {
+                            format!("{u} lacks \"{}\"", absent.join("\", \""))
+                        });
+                    }
+                }
+                Err(e) => {
+                    broken = Some(e);
+                    break;
+                }
+            }
+        }
+        match broken {
+            None if missing.is_empty() => {
+                s.done = true;
+                s.result = format!(
+                    "checked {} page(s): all 200 with {}",
+                    urls.len(),
+                    if find.is_empty() {
+                        "their titles".to_string()
+                    } else {
+                        format!("\"{}\"", find.join("\", \""))
+                    }
+                );
+                return;
+            }
+            None => {
+                s.result = format!("not done: {}", missing.join("; "));
+                return;
+            }
+            // The tool failed: diagnosed and reported once, then the
+            // other way. A host the check may not reach is not a failure of
+            // the tool: the other way, without marking it down.
+            Some(super::web_check::CheckError::Failed(e)) => {
+                health.failed(tool, &e);
+            }
+            Some(super::web_check::CheckError::Refused(_)) => {}
+        }
+    }
+    // The other way: the end-to-end run on the pull request's head loads
+    // the same pages.
+    runs_step(cx, a, s, &[], until, p, health).await;
+    if !s.result.is_empty() {
+        s.result = format!(
+            "{} (read from the end-to-end run; the page check is down)",
+            s.result
+        );
+    }
+}
+
+/// What the workflow runs on a commit say about the ones a step names.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunsVerdict {
+    pub passed: Vec<String>,
+    pub running: Vec<String>,
+    pub skipped: Vec<String>,
+    pub failed: Vec<(String, String, u64)>,
+    pub missing: Vec<String>,
+}
+
+impl RunsVerdict {
+    pub fn done(&self) -> bool {
+        !self.passed.is_empty()
+            && self.running.is_empty()
+            && self.skipped.is_empty()
+            && self.failed.is_empty()
+            && self.missing.is_empty()
+    }
+}
+
+/// Reads the runs of a commit (newest first, as GitHub lists them) for the
+/// named workflows, or for every workflow when none is named.
+pub fn runs_verdict(runs: &[Value], names: &[String]) -> RunsVerdict {
+    let mut v = RunsVerdict::default();
+    let mut seen: Vec<String> = Vec::new();
+    for r in runs {
+        let name = r["name"].as_str().unwrap_or("").to_string();
+        if name.is_empty() || seen.contains(&name) {
+            continue;
+        }
+        let wanted = names.is_empty()
+            || names.iter().any(|n| {
+                n.eq_ignore_ascii_case(&name) || name.to_lowercase().contains(&n.to_lowercase())
+            });
+        if !wanted {
+            continue;
+        }
+        seen.push(name.clone());
+        let status = r["status"].as_str().unwrap_or("");
+        let conclusion = r["conclusion"].as_str().unwrap_or("");
+        match (status, conclusion) {
+            ("completed", "success") => v.passed.push(name),
+            ("completed", "skipped") => v.skipped.push(name),
+            ("completed", other) => v.failed.push((
+                name,
+                format!("{other} {}", r["html_url"].as_str().unwrap_or(""))
+                    .trim()
+                    .to_string(),
+                r["id"].as_u64().unwrap_or(0),
+            )),
+            _ => v.running.push(name),
+        }
+    }
+    for n in names {
+        if !seen
+            .iter()
+            .any(|s| s.eq_ignore_ascii_case(n) || s.to_lowercase().contains(&n.to_lowercase()))
+        {
+            v.missing.push(n.clone());
+        }
+    }
+    v
+}
+
+async fn head_sha(cx: &Ctx<'_>) -> Result<String, String> {
+    let pr = cx
+        .github
+        .get_pull_request(cx.owner, cx.repo, cx.pr_number)
+        .await
+        .map_err(|e| e.to_string())?;
+    pr["head"]["sha"]
+        .as_str()
+        .map(String::from)
+        .ok_or_else(|| "the pull request has no head commit".to_string())
+}
+
+/// A step that reads workflow runs: each named run's conclusion on the
+/// head; a skipped end-to-end run is started again; a failed one goes to
+/// the run's CI fix round. Never a person's.
+async fn runs_step(
+    cx: &Ctx<'_>,
+    a: &Abilities,
+    s: &mut NoteStep,
+    names: &[String],
+    until: Instant,
+    p: &mut Progress,
+    health: &mut common::tool_health::Health,
+) {
+    let sha = match head_sha(cx).await {
+        Ok(x) => x,
+        Err(e) => {
+            health.failed("github_history", &e);
+            return;
+        }
+    };
+    let runs = match cx
+        .github
+        .list_workflow_runs_for_sha(cx.owner, cx.repo, &sha)
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            health.failed("github_history", &e.to_string());
+            return;
+        }
+    };
+    let v = runs_verdict(&runs, names);
+    let short = &sha[..sha.len().min(7)];
+    if v.done() {
+        s.done = true;
+        s.result = format!("passed on `{short}`: {}", v.passed.join(", "));
+        return;
+    }
+    if !v.running.is_empty() {
+        // Read again on the next step of the run.
+        p.waiting = true;
+        s.result.clear();
+        return;
+    }
+    if let Some((name, why, id)) = v.failed.first() {
+        s.result = format!(
+            "not done: `{name}` failed on `{short}` ({why}); the failure goes to the run's CI fix round"
+        );
+        if id > &0 {
+            p.failed_e2e = Some(FailedRun {
+                workflow_run_id: *id,
+                workflow: name.clone(),
+                head_sha: sha.clone(),
+                ..Default::default()
+            });
+        }
+        return;
+    }
+    // Skipped or never ran: CoderHelm starts the end-to-end run itself.
+    let why = if v.skipped.is_empty() {
+        format!("{} did not run", v.missing.join(", "))
+    } else {
+        format!("{} was skipped", v.skipped.join(", "))
+    };
+    match a.e2e.iter().find(|r| r.startable()).cloned() {
+        Some(r) => {
+            let label = match &r.trigger {
+                outside_work::Trigger::Label(l) => Some(l.clone()),
+                _ => None,
+            };
+            Box::pin(start(cx, s, &label, &r, until, p)).await;
+            s.result = format!("{why} on `{short}`; {}", s.result);
+        }
+        None => {
+            s.result = format!(
+                "not done: {why} on `{short}`, and the repository has no end-to-end workflow CoderHelm can start; CoderHelm reads it again on the next push"
+            );
+        }
+    }
+}
+
+/// A check of the change (a lint, a test): the pull request head's checks
+/// run it; their results are read.
+async fn checks_step(
+    cx: &Ctx<'_>,
+    s: &mut NoteStep,
+    cmd: &str,
+    p: &mut Progress,
+    health: &mut common::tool_health::Health,
+) {
+    let sha = match head_sha(cx).await {
+        Ok(x) => x,
+        Err(e) => {
+            health.failed("github_history", &e);
+            return;
+        }
+    };
+    let checks = match cx
+        .github
+        .list_check_runs_for_ref(cx.owner, cx.repo, &sha)
+        .await
+    {
+        Ok(v) => v["check_runs"].as_array().cloned().unwrap_or_default(),
+        Err(e) => {
+            health.failed("github_history", &e.to_string());
+            return;
+        }
+    };
+    let short = &sha[..sha.len().min(7)];
+    match checks_verdict(&checks) {
+        Some(Ok(n)) => {
+            s.done = true;
+            s.result = format!(
+                "the pull request's {n} checks passed on `{short}` (they run `{}`)",
+                one_line(cmd)
+            );
+        }
+        Some(Err(failed)) => {
+            s.result = format!("not done: {failed} failed on `{short}`; the failure goes to the run's CI fix round");
+        }
+        None => {
+            p.waiting = true;
+            s.result.clear();
+        }
+    }
+}
+
+/// The head's check runs: `Ok(count)` when every one completed without a
+/// failure, `Err(names)` when some failed, `None` while any runs (or none
+/// exist yet).
+pub fn checks_verdict(checks: &[Value]) -> Option<Result<usize, String>> {
+    if checks.is_empty() {
+        return None;
+    }
+    let mut failed: Vec<String> = Vec::new();
+    for c in checks {
+        if c["status"].as_str() != Some("completed") {
+            return None;
+        }
+        let ok = matches!(
+            c["conclusion"].as_str().unwrap_or(""),
+            "success" | "neutral" | "skipped"
+        );
+        if !ok {
+            failed.push(format!("`{}`", c["name"].as_str().unwrap_or("a check")));
+        }
+    }
+    Some(if failed.is_empty() {
+        Ok(checks.len())
+    } else {
+        Err(failed.join(", "))
+    })
 }
 
 /// Runs the confirm query once the steps ended, and quotes its result on
 /// `confirm`. True when it ran.
-async fn confirm(cx: &Ctx<'_>, a: &Abilities, c: &mut OutsideChange) -> bool {
+async fn confirm(
+    cx: &Ctx<'_>,
+    a: &Abilities,
+    c: &mut OutsideChange,
+    health: &mut common::tool_health::Health,
+) -> bool {
     let Some(f) = c.confirm.as_mut() else {
         return false;
     };
-    if f.query.trim().is_empty() || !f.result.is_empty() {
+    // Only a GROQ query goes to the CMS: a page check written here is run
+    // by the check steps that name it.
+    if !outside_work::is_groq(&f.query) || !f.result.is_empty() {
         return false;
     }
     let q = f.query.clone();
-    f.result = match read(cx, a, &q).await {
+    f.result = match read_retrying(cx, a, &q, health).await {
         Ok((v, on)) => format!("{} (on {on})", v),
         Err(e) => format!("the query failed: {e}"),
     };
@@ -868,9 +1295,23 @@ pub fn decision_of(
     serde_json::from_str(raw).ok()
 }
 
-/// The requirements a run leaves not done (a person's steps, CoderHelm
-/// steps that didn't work), from its record. Empty when every one is done.
-pub async fn left_undone(state: &WorkerState, team_id: &str, run_id: &str) -> Vec<String> {
+/// What a run leaves at its end, from its record, read through the gate.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Undone {
+    pub left: outside_work::Left,
+    pub installation_id: u64,
+    /// How many times the run went back to its own outside steps.
+    pub retries: u32,
+}
+
+/// How many times a run goes back to outside steps it can still do before
+/// it ends anyway (its spend ceiling bounds it too). What is left then is
+/// CoderHelm's own unfinished work, said on the run page, never a person's.
+pub const MAX_OWN_RETRIES: u32 = 3;
+
+/// What the run leaves: the items only a person can do and the steps
+/// CoderHelm can still do.
+pub async fn left_undone(state: &WorkerState, team_id: &str, run_id: &str) -> Undone {
     let Ok(out) = state
         .dynamo
         .get_item()
@@ -880,14 +1321,63 @@ pub async fn left_undone(state: &WorkerState, team_id: &str, run_id: &str) -> Ve
         .send()
         .await
     else {
-        return Vec::new();
+        return Undone::default();
     };
-    out.item
-        .as_ref()
-        .and_then(decision_of)
-        .and_then(|d| d.outside_change)
-        .map(|c| outside_work::not_done_lines(&c))
-        .unwrap_or_default()
+    let Some(item) = out.item.as_ref() else {
+        return Undone::default();
+    };
+    let n = |k: &str| {
+        item.get(k)
+            .and_then(|v| v.as_n().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    Undone {
+        left: decision_of(item)
+            .and_then(|d| d.outside_change)
+            .map(|c| outside_work::left(&c))
+            .unwrap_or_default(),
+        installation_id: n("installation_id"),
+        retries: n("outside_retries") as u32,
+    }
+}
+
+/// Sends the run back to the outside steps it can still do: their last
+/// attempt is cleared, so the executor tries them again (another way when
+/// a tool is down). True when there was something to retry.
+pub async fn retry_own(state: &WorkerState, team_id: &str, run_id: &str) -> bool {
+    let Ok(out) = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", super::attr_s(team_id))
+        .key("run_id", super::attr_s(run_id))
+        .send()
+        .await
+    else {
+        return false;
+    };
+    let Some(mut d) = out.item.as_ref().and_then(decision_of) else {
+        return false;
+    };
+    let Some(c) = d.outside_change.as_mut() else {
+        return false;
+    };
+    if outside_work::reopen_own(c) == 0 {
+        return false;
+    }
+    save(state, team_id, run_id, &d).await;
+    let _ = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", super::attr_s(team_id))
+        .key("run_id", super::attr_s(run_id))
+        .update_expression("ADD outside_retries :one")
+        .expression_attribute_values(":one", super::attr_n(1))
+        .send()
+        .await;
+    true
 }
 
 /// Writes a `ci_failed` event for a started end-to-end run that failed, with
@@ -1028,6 +1518,7 @@ pub async fn on_resume(
     };
     let before = c.clone();
     let p = execute(&cx, &abilities, c, Instant::now() + Duration::from_secs(45)).await;
+    report_problems(state, &msg.team_id, &msg.run_id, &p).await;
     if *c != before {
         let lines: Vec<String> = c
             .steps
@@ -1115,7 +1606,7 @@ mod tests {
             a1["mutations"], a2["mutations"],
             "other mutations ask again"
         );
-        assert!(gate_args(&w, &Action::Query, "acme/web", "feat").is_none());
+        assert!(gate_args(&w, &Action::Query("*[]".into()), "acme/web", "feat").is_none());
         // Both tools are known to the agent-permissions registry as writes:
         // the team's policy decides, and with no rule they ask.
         let reg = common::agent_policy::registry::default_registry();

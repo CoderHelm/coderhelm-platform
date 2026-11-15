@@ -559,12 +559,17 @@ pub async fn for_run(
     plan: &super::plan::PlanResult,
     git_ref: &str,
 ) -> Option<Planned> {
-    let release = plan
-        .fix
-        .as_ref()?
-        .release
-        .clone()
-        .filter(|r| !r.is_empty())?;
+    let fix = plan.fix.as_ref()?;
+    let release = fix.release.clone().filter(|r| !r.is_empty());
+    // No data migration, but the outside steps release to production (the
+    // tag, the purge, the checks after it): the release steps do those.
+    let outside = fix
+        .outside_change
+        .as_ref()
+        .filter(|c| c.steps.iter().any(super::outside_work::for_release));
+    if release.is_none() && outside.is_none() {
+        return None;
+    }
     let env = super::load_codegen_env(state, &msg.team_id, &msg.repo_owner, &msg.repo_name).await;
     let staging_write = super::feature::load_connection(
         state,
@@ -582,12 +587,106 @@ pub async fn for_run(
         staging_write,
     )
     .await;
-    let steps = steps(&release, &a.release);
+    let steps = match &release {
+        Some(r) => steps(r, &a.release),
+        None => release_only_steps(&a.release, &outside.map(checks_of).unwrap_or_default()),
+    };
     Some(Planned {
-        release,
+        release: release.unwrap_or_default(),
         mechanics: a.release,
         steps,
     })
+}
+
+/// The page checks the outside steps ask for after the release: each
+/// one's pages (its own, else the confirm's) and terms.
+pub fn checks_of(c: &super::fix_location::OutsideChange) -> Vec<(Vec<String>, Vec<String>)> {
+    use super::outside_work::{find_terms_in, for_release, urls_in};
+    let confirm = c
+        .confirm
+        .as_ref()
+        .map(|f| f.query.clone())
+        .unwrap_or_default();
+    c.steps
+        .iter()
+        .filter(|s| for_release(s))
+        .filter_map(|s| {
+            let words = format!("{} {}", s.step, s.how);
+            let mut urls = urls_in(&words);
+            let mut find = find_terms_in(&words);
+            let checks = words.to_lowercase().contains("check");
+            if urls.is_empty() && checks {
+                urls = urls_in(&confirm);
+                if find.is_empty() {
+                    find = find_terms_in(&confirm);
+                }
+            }
+            (!urls.is_empty()).then_some((urls, find))
+        })
+        .collect()
+}
+
+/// A release with no migration: production's deploy (the next tag under
+/// one approval, a dispatch, or the merge), the cache purge when the
+/// repository has a purge workflow, then the page checks after them.
+pub fn release_only_steps(m: &Mechanics, checks: &[(Vec<String>, Vec<String>)]) -> Vec<Step> {
+    let migration = Release {
+        migrations: vec![PlannedMigration {
+            file: String::new(),
+            phase: "expand".to_string(),
+        }],
+        ..Default::default()
+    };
+    // The deploy and purge steps exactly as a migrating release has them.
+    let mut out: Vec<Step> = steps(&migration, m)
+        .into_iter()
+        .filter(|s| (s.kind == Kind::Deploy && s.env == Env::Production) || s.kind == Kind::Purge)
+        .collect();
+    for s in out.iter_mut() {
+        s.after.clear();
+    }
+    if let (Some(d), Some(p)) = (
+        out.iter()
+            .find(|s| s.kind == Kind::Deploy)
+            .map(|s| s.id.clone()),
+        out.iter_mut().find(|s| s.kind == Kind::Purge),
+    ) {
+        p.after = vec![d];
+    }
+    let last = out.last().map(|s| s.id.clone());
+    for (i, (urls, find)) in checks.iter().enumerate() {
+        out.push(Step {
+            id: format!("check_production_{}", i + 1),
+            kind: Kind::Check,
+            env: Env::Production,
+            what: format!("Check {} production page(s) after the release", urls.len()),
+            how: if find.is_empty() {
+                "each returns 200".to_string()
+            } else {
+                format!("each returns 200 and shows \"{}\"", find.join("\", \""))
+            },
+            tool: String::new(),
+            after: last.clone().into_iter().collect(),
+            after_merge: true,
+            verify: String::new(),
+            status: Status::Pending,
+            detail: String::new(),
+            before: String::new(),
+            after_count: String::new(),
+            approval_id: String::new(),
+            run_id: 0,
+            tag: String::new(),
+            workflow: String::new(),
+            inputs: Vec::new(),
+            trigger: None,
+            project_id: String::new(),
+            dataset: String::new(),
+            started_at: 0,
+            urls: urls.clone(),
+            find: find.clone(),
+        });
+    }
+    out
 }
 
 // ── What the planner writes ─────────────────────────────────────────────────
@@ -1327,6 +1426,9 @@ pub enum Kind {
     Deploy,
     Contract,
     Purge,
+    /// Pages loaded and searched once what comes before it is done (the
+    /// production release's own check): read only, no approval.
+    Check,
 }
 
 /// Where a step stands.
@@ -1409,6 +1511,11 @@ pub struct Step {
     /// When it was started (unix seconds), to find its workflow run.
     #[serde(default)]
     pub started_at: i64,
+    /// For a check: the pages to load and the terms each must show.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub urls: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub find: Vec<String>,
 }
 
 /// Why CoderHelm can't run migrations itself, and the access to grant.
@@ -1433,6 +1540,7 @@ pub fn tool_for(kind: Kind, env: Env, on: Option<&On>) -> &'static str {
             _ => "release_production_deploy",
         },
         (Kind::Purge, _) => "release_cache_purge",
+        (Kind::Check, _) => "",
     }
 }
 
@@ -1533,6 +1641,8 @@ pub fn steps(r: &Release, m: &Mechanics) -> Vec<Step> {
         approval_id: String::new(),
         run_id: 0,
         tag: String::new(),
+        urls: Vec::new(),
+        find: Vec::new(),
     };
     let dry = m
         .migrations

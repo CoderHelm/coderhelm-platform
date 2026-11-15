@@ -127,6 +127,12 @@ pub enum Kind {
     Step,
     /// A question to put to a person.
     Question,
+    /// A step CoderHelm tried that did not work: `why_not` is the cause
+    /// from that attempt. It reaches a person only when the cause itself is
+    /// a listed reason (a permission, a credential, an approval); a tool
+    /// failure, a bad request or a missing workflow is CoderHelm's to work
+    /// around, never a person's chore.
+    Attempt,
 }
 
 impl Kind {
@@ -136,6 +142,7 @@ impl Kind {
             Kind::OpenItem => "open",
             Kind::Step => "step",
             Kind::Question => "question",
+            Kind::Attempt => "attempt",
         }
     }
 }
@@ -453,6 +460,31 @@ fn names_deploy(t: &str) -> bool {
     any(t, &["deploy", "release to", "publish to production"])
 }
 
+/// Whether the item's action is adding labels to a pull request.
+fn adds_labels(a: &Ask) -> bool {
+    let t = one_line(&a.text).to_lowercase();
+    let t = t
+        .trim_start_matches("after merging: ")
+        .trim_start_matches("before merging: ");
+    (t.starts_with("add pr label") || t.starts_with("add labels") || t.starts_with("add the label"))
+        && !t.contains("deploy")
+}
+
+/// Whether the item's action is a deploy: its words start with one, or the
+/// command it names deploys. A step that only names a workflow called
+/// "Deploy Preview" (to read its result) is not a deploy.
+fn asks_deploy(a: &Ask) -> bool {
+    let text = one_line(&a.text).to_lowercase();
+    let mut t = text.as_str();
+    for lead in ["after merging: ", "before merging: ", "after merge: "] {
+        t = t.strip_prefix(lead).unwrap_or(t);
+    }
+    let verb = ["deploy", "release", "publish", "redeploy", "ship"]
+        .iter()
+        .any(|v| t.starts_with(v));
+    verb || command_in(a).is_some_and(|c| names_deploy(&c.to_lowercase()))
+}
+
 /// A command a person was asked to run, when the item names one.
 fn command_in(a: &Ask) -> Option<String> {
     let cand = |s: &str| -> Option<String> {
@@ -678,6 +710,14 @@ fn reason_in(t: &str) -> Option<Reason> {
             "outside every system",
             "no system coderhelm reaches",
             "physical device",
+            "real device",
+            "payment method",
+            "paid checkout",
+            "paid registration",
+            "real payment",
+            "vendor admin",
+            "portal admin",
+            "third-party admin",
             "in person",
             "phone call",
             "call the vendor",
@@ -805,6 +845,45 @@ fn content_words(text: &str) -> Vec<String> {
 /// further ([`Gated::demote`]).
 pub fn decide(a: &Ask, ctx: &Context) -> Outcome {
     let t = a.all();
+    // A step CoderHelm tried: only a listed reason in the attempt's own
+    // cause reaches a person. Anything else (a tool that failed, a request
+    // the service refused as malformed, no workflow to start) is CoderHelm's
+    // to retry or do another way.
+    // Labels on a pull request go through the issues API: no workflow
+    // permission is involved, whatever a run said about one.
+    if adds_labels(a) {
+        return Outcome::Do(Work::Own(one_line(&a.text)));
+    }
+    if a.kind == Kind::Attempt {
+        let cause = one_line(&a.why_not).to_lowercase();
+        // Refused a workflow start, with a label that starts the same run:
+        // CoderHelm adds the label (no workflow permission needed).
+        let refused_start = cause.contains("start workflows")
+            || cause.contains("workflow_dispatch")
+            || cause.contains("resource not accessible");
+        if refused_start && t.contains("label") && !t.contains("deploy") {
+            return Outcome::Do(Work::Own(format!("{} (by its label)", one_line(&a.text))));
+        }
+        // A deploy it tried and could not start: the one missing thing (the
+        // permission, or the deploy credentials) is said once, as for any
+        // deploy; a deploy CoderHelm holds credentials for, it runs.
+        if names_deploy(&t) && asks_deploy(a) {
+            return deploy_item(a, &t, ctx);
+        }
+        return match reason_in(&cause) {
+            Some(reason @ (Reason::Grant | Reason::Credential | Reason::Approval)) => {
+                Outcome::Human(HumanItem {
+                    reason,
+                    action: first_nonempty(&a.how, &a.text),
+                    who: who_for(reason, &a.owner),
+                    why_not: first_nonempty(&a.why_not, reason.label()),
+                    options: Vec::new(),
+                    recommendation: String::new(),
+                })
+            }
+            _ => Outcome::Do(Work::Own(one_line(&a.text))),
+        };
+    }
     // 1. CoderHelm's own work, or work its access reaches.
     if owned_by_coderhelm(a, &t) {
         return Outcome::Do(Work::Own(one_line(&a.text)));
@@ -820,36 +899,8 @@ pub fn decide(a: &Ask, ctx: &Context) -> Outcome {
     }
     // A deploy: CoderHelm runs it when it holds the credentials; else the
     // one missing thing is said once.
-    if names_deploy(&t) && a.kind == Kind::Step {
-        if ctx.can_deploy {
-            if let Some(c) = command_in(a) {
-                return Outcome::Do(Work::Command(c));
-            }
-        }
-        let reason = reason_in(&t).unwrap_or(Reason::Credential);
-        let missing = match reason {
-            Reason::Grant => "grant CoderHelm's GitHub App permission to start the deploy workflow",
-            Reason::Credential => {
-                "give CoderHelm the deploy credentials for this environment (Settings, Agents, sandbox secrets)"
-            }
-            Reason::Approval => "approve the deploy where the team's policy asks (the Agent permissions page)",
-            _ => "",
-        };
-        let action = match (missing, command_in(a)) {
-            ("", _) => first_nonempty(&a.text, &a.how),
-            (m, Some(c)) if reason != Reason::Approval => {
-                format!("{} or run `{c}` once", sentence_start(m))
-            }
-            (m, _) => sentence_start(m),
-        };
-        return Outcome::Human(HumanItem {
-            reason,
-            action,
-            who: who_for(reason, &a.owner),
-            why_not: first_nonempty(&a.why_not, reason.label()),
-            options: Vec::new(),
-            recommendation: String::new(),
-        });
+    if a.kind == Kind::Step && names_deploy(&t) && asks_deploy(a) {
+        return deploy_item(a, &t, ctx);
     }
     // 2. A listed reason the item itself names.
     if let Some(reason) = reason_in(&t) {
@@ -920,6 +971,40 @@ pub fn decide(a: &Ask, ctx: &Context) -> Outcome {
     }
     // 4. Anything else left open is CoderHelm's own work.
     Outcome::Do(Work::Own(one_line(&first_nonempty(&a.how, &a.text))))
+}
+
+/// A deploy: CoderHelm runs it when it holds the credentials; else the one
+/// missing thing is said once.
+fn deploy_item(a: &Ask, t: &str, ctx: &Context) -> Outcome {
+    if ctx.can_deploy {
+        if let Some(c) = command_in(a) {
+            return Outcome::Do(Work::Command(c));
+        }
+    }
+    let reason = reason_in(t).unwrap_or(Reason::Credential);
+    let missing = match reason {
+        Reason::Grant => "grant CoderHelm's GitHub App permission to start the deploy workflow",
+        Reason::Credential => {
+            "give CoderHelm the deploy credentials for this environment (Settings, Agents, sandbox secrets)"
+        }
+        Reason::Approval => "approve the deploy where the team's policy asks (the Agent permissions page)",
+        _ => "",
+    };
+    let action = match (missing, command_in(a)) {
+        ("", _) => first_nonempty(&a.text, &a.how),
+        (m, Some(c)) if reason != Reason::Approval => {
+            format!("{} or run `{c}` once", sentence_start(m))
+        }
+        (m, _) => sentence_start(m),
+    };
+    Outcome::Human(HumanItem {
+        reason,
+        action,
+        who: who_for(reason, &a.owner),
+        why_not: first_nonempty(&a.why_not, reason.label()),
+        options: Vec::new(),
+        recommendation: String::new(),
+    })
 }
 
 impl Ask {
@@ -1169,6 +1254,192 @@ pub fn keeps_the_rules(text: &str) -> Result<(), String> {
         return Err("cuts text off with an ellipsis".to_string());
     }
     Ok(())
+}
+
+// ── The sink check: the last word before text reaches a person ──────────
+
+/// Words that mark a line as an item addressed to a person, wherever it
+/// sits in the text.
+pub const PERSON_MARKS: &[&str] = &[
+    "CoderHelm could not:",
+    "CoderHelm cannot:",
+    "CoderHelm can't:",
+    "(a person on the team)",
+];
+
+/// Whether a line opens the block of what a person has to do.
+fn opens_needed(l: &str) -> bool {
+    let t = l
+        .trim()
+        .trim_start_matches('#')
+        .trim()
+        .trim_matches('*')
+        .trim();
+    t.to_lowercase().starts_with("needed from you")
+}
+
+/// The text of a list item (`- `, `* `, `- [ ] `, `1. `), when the line is
+/// one.
+fn list_item(l: &str) -> Option<&str> {
+    let t = l.trim_start();
+    for lead in ["- [ ] ", "- [x] ", "- ", "* "] {
+        if let Some(r) = t.strip_prefix(lead) {
+            return Some(r.trim());
+        }
+    }
+    let digits = t.chars().take_while(|c| c.is_ascii_digit()).count();
+    if digits > 0 && t[digits..].starts_with(". ") {
+        return Some(t[digits + 2..].trim());
+    }
+    None
+}
+
+/// Every item a text addresses to a person: the list under "Needed from
+/// you", and any line that says CoderHelm could not or cannot. Returns the
+/// line's index and the item's text.
+pub fn person_lines(text: &str) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    let mut inside = false;
+    for (i, l) in text.lines().enumerate() {
+        if opens_needed(l) {
+            inside = true;
+            // "**Needed from you:** Nothing." and an item on the same line.
+            let rest = l.split_once(':').map(|(_, r)| r.trim()).unwrap_or("");
+            let rest = rest.trim_start_matches("**").trim();
+            if !rest.is_empty() && rest != crate::pr_steps::NOTHING_NEEDED {
+                out.push((i, rest.to_string()));
+            }
+            continue;
+        }
+        let t = l.trim();
+        if inside && (t.starts_with('#') || (t.starts_with("**") && list_item(l).is_none())) {
+            inside = false;
+        }
+        let item = list_item(l);
+        let marked = PERSON_MARKS.iter().any(|m| l.contains(m));
+        match item {
+            Some(it) if inside || marked => out.push((i, it.to_string())),
+            None if marked => out.push((i, t.to_string())),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// One line a person was to read, through the gate: a line saying
+/// CoderHelm could not is read as an attempt, with its cause.
+pub fn sink_outcome(item: &str) -> Outcome {
+    // "Only if X: ..." is not a person's until X is found: CoderHelm checks
+    // X first, and asks only then, without the condition.
+    let lower = item.trim().to_lowercase();
+    if lower.starts_with("only if ") {
+        return Outcome::Do(Work::Own(format!("check first: {}", one_line(item))));
+    }
+    // A line the gate let through carries its reason's words.
+    let split = item
+        .split_once("CoderHelm could not:")
+        .or_else(|| item.split_once("CoderHelm could not do it:"));
+    if let Some((what, why)) = split {
+        let a = Ask {
+            kind: Kind::Attempt,
+            text: one_line(what),
+            why_not: one_line(why),
+            ..Default::default()
+        };
+        return decide(&a, &Context::default());
+    }
+    line_outcome(Kind::Step, item)
+}
+
+/// What the sink check found in a text about to reach a person.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Sunk {
+    /// The text with every item a person was not to get taken out (an empty
+    /// "Needed from you" list says nothing is needed).
+    pub text: String,
+    /// The items taken out: CoderHelm's own work, sent back to the run.
+    pub sent_back: Vec<String>,
+    /// The items left for a person: each one the gate let through.
+    pub human: Vec<String>,
+}
+
+impl Sunk {
+    /// Whether anything had to be taken out: a defect upstream.
+    pub fn defect(&self) -> bool {
+        !self.sent_back.is_empty()
+    }
+}
+
+/// The final check every person-facing text passes before it is posted:
+/// each item addressed to a person goes through the gate again, and one a
+/// person was not to get (CoderHelm can do it, something settles it, it
+/// belongs to the review) is taken out and returned as work. Whatever wrote
+/// the text, nothing doable reaches a person.
+pub fn sink(text: &str) -> Sunk {
+    let items = person_lines(text);
+    if items.is_empty() {
+        return Sunk {
+            text: text.to_string(),
+            ..Default::default()
+        };
+    }
+    let mut drop: Vec<usize> = Vec::new();
+    let mut sunk = Sunk::default();
+    for (i, it) in &items {
+        match sink_outcome(it) {
+            Outcome::Human(_) => sunk.human.push(it.clone()),
+            _ => {
+                drop.push(*i);
+                sunk.sent_back.push(it.clone());
+            }
+        }
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    let mut kept: Vec<String> = Vec::new();
+    for (i, l) in lines.iter().enumerate() {
+        if drop.contains(&i) {
+            continue;
+        }
+        kept.push((*l).to_string());
+    }
+    // A "Needed from you" heading left with no item says nothing is needed.
+    let mut out: Vec<String> = Vec::new();
+    for (i, l) in kept.iter().enumerate() {
+        if opens_needed(l) && !l.contains(crate::pr_steps::NOTHING_NEEDED) {
+            let next_item = kept[i + 1..]
+                .iter()
+                .find(|n| !n.trim().is_empty())
+                .is_some_and(|n| list_item(n).is_some());
+            let same_line = l
+                .split_once(':')
+                .is_some_and(|(_, r)| !r.trim().trim_start_matches("**").trim().is_empty());
+            if !next_item && !same_line {
+                let head = l.trim_end().trim_end_matches(':').trim_end_matches("**");
+                let head = head.trim_end_matches(':');
+                if l.trim_start().starts_with('#') {
+                    out.push(l.clone());
+                    out.push(String::new());
+                    out.push(crate::pr_steps::NOTHING_NEEDED.to_string());
+                } else {
+                    out.push(format!("{head}:** {}", crate::pr_steps::NOTHING_NEEDED));
+                }
+                continue;
+            }
+        }
+        out.push(l.clone());
+    }
+    let mut t = out.join("\n");
+    if text.ends_with('\n') {
+        t.push('\n');
+    }
+    sunk.text = t;
+    sunk
+}
+
+/// Whether a run may wait on a person: only with at least one item the
+/// gate let through and nothing CoderHelm can still do itself.
+pub fn may_wait_on_person(human: usize, doable: usize) -> bool {
+    human > 0 && doable == 0
 }
 
 /// The prompt section that puts [`PRINCIPLE`] in front of a model that

@@ -278,6 +278,8 @@ pub mod ticket_comments;
 pub mod ticket_state;
 /// A team's monthly token limits: new tokens, cache read, cache write.
 pub mod token_limits;
+/// Whether a tool works right now: one failure, one diagnosis, one report.
+pub mod tool_health;
 /// Every tool an agent can be given, with its risk (read, write, consequential).
 pub mod tool_registry;
 /// Signed links that turn off one email for one person, without signing in.
