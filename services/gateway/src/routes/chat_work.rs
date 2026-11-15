@@ -509,7 +509,7 @@ pub async fn call(
             match Box::pin(super::chat_work_runs::find(&ctx.state, team, &ask)).await {
                 Ok(found) => register(reg, found, "runs", ""),
                 Err(e) => {
-                    tracing::warn!(error = %e, "Chat: runs lookup failed");
+                    tracing::warn!(tool = RUNS, error = %e, "Chat: a lookup failed");
                     fail("the runs couldn't be read just now.")
                 }
             }
@@ -548,9 +548,41 @@ pub async fn call(
                 sent: 0,
                 held,
             };
-            match Box::pin(super::chat_work_prs::find(&mut client, &ask, &ctx.repos)).await {
+            // A title or ticket finds its pull request through the run that
+            // opened it too, whatever GitHub's search makes of the words.
+            let known = if ask.number.is_none() && (!ask.words.is_empty() || ask.ticket.is_some()) {
+                let mut runs =
+                    super::chat_work_runs::RunAsk::from_input(&json!({}), chrono::Utc::now());
+                runs.words = ask.words.clone();
+                runs.ticket = ask.ticket.as_ref().map(|t| t.to_lowercase());
+                runs.repo = ask.repo.as_ref().map(|r| r.to_lowercase());
+                match Box::pin(super::chat_work_runs::pull_requests(
+                    &ctx.state, team, &runs,
+                ))
+                .await
+                {
+                    Ok(k) => k,
+                    Err(e) => {
+                        tracing::warn!(tool = PULL_REQUESTS, error = %e, "Chat: the runs behind a pull request search couldn't be read");
+                        Vec::new()
+                    }
+                }
+            } else {
+                Vec::new()
+            };
+            match Box::pin(super::chat_work_prs::find(
+                &mut client,
+                &ask,
+                &ctx.repos,
+                &known,
+            ))
+            .await
+            {
                 Ok(found) => register(reg, found, "pull requests", ""),
-                Err(e) => fail(&format!("GitHub couldn't be searched: {e}.")),
+                Err(e) => {
+                    tracing::warn!(tool = PULL_REQUESTS, error = %e, "Chat: a lookup failed");
+                    fail(&format!("GitHub couldn't be searched: {e}."))
+                }
             }
         }
         FINDINGS | RECORDS => {
@@ -581,7 +613,10 @@ pub async fn call(
                         ""
                     },
                 ),
-                Err(e) => fail(&e),
+                Err(e) => {
+                    tracing::warn!(tool = name, kind = kind.key, error = %e, "Chat: a lookup failed");
+                    fail(&e)
+                }
             }
         }
         _ => fail("unknown tool."),
@@ -596,10 +631,11 @@ async fn tickets(
 ) -> (String, String, bool) {
     use super::chat_work_runs as runs;
     use super::chat_work_tickets as t;
+    // Jira's keys and Coderhelm's own (a security bundle's `SEC-...`).
     let key = input["key"]
         .as_str()
         .map(|k| k.trim().to_ascii_uppercase())
-        .filter(|k| t::valid_key(k));
+        .filter(|k| t::valid_key(k) || runs::ticket_key(k));
     let query = input["query"]
         .as_str()
         .map(str::trim)
@@ -614,9 +650,13 @@ async fn tickets(
         Some(k) => ask.ticket = Some(k.to_lowercase()),
         None => ask.words = words_of(query.as_deref().unwrap_or("")),
     }
-    let found_runs = Box::pin(runs::find(&ctx.state, &ctx.claims.team_id, &ask))
-        .await
-        .unwrap_or_default();
+    let found_runs = match Box::pin(runs::find(&ctx.state, &ctx.claims.team_id, &ask)).await {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!(tool = TICKETS, error = %e, "Chat: the runs behind a ticket lookup couldn't be read");
+            Vec::new()
+        }
+    };
     let site = ctx
         .jira
         .as_ref()
@@ -631,10 +671,11 @@ async fn tickets(
         );
     };
     let http = common::mcp_remote::http::GuardedHttps;
-    let mut keys: Vec<String> = key.iter().cloned().collect();
+    // Only Jira's keys go to Jira; Coderhelm's own are answered from the runs.
+    let mut keys: Vec<String> = key.iter().filter(|k| t::valid_key(k)).cloned().collect();
     let mut issues: Vec<Value> = Vec::new();
     let mut jira_error: Option<String> = None;
-    if keys.is_empty() {
+    if key.is_none() {
         // Jira's text search, then the keys the matching runs worked on.
         match t::ask_jira(&http, app, &[], query.as_deref()).await {
             Ok(found) => issues = found,

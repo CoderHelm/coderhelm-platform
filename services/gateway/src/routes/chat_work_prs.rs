@@ -29,6 +29,22 @@ pub const MAX_REPO_PROBES: usize = 6;
 const MAX_QUERY: usize = 240;
 /// Replies kept for conditional requests.
 const CACHE_SIZE: usize = 400;
+/// Largest reply kept for a conditional request. A search reply carries each
+/// pull request's whole description (a security bundle's runs to 64 KB), so
+/// one page of them is read whole but not kept.
+const CACHE_MAX_BYTES: usize = 128 * 1024;
+/// How much of a reply is read: eight pull requests whose descriptions are
+/// GitHub's longest, with room for their labels and links.
+const REPLY_LIMIT: Limit = Limit::Mcp;
+
+// Eight hits whose descriptions are GitHub's longest (65,536 characters, up
+// to 4 bytes each), as a security bundle's are, fit in one read: the
+// metadata cap (256 KB) refused that page, so every title search that met
+// them failed. The kept replies stay small.
+const _: () = {
+    assert!(REPLY_LIMIT.max_bytes() >= MAX_RESULTS * 65_536 * 4 + 64 * 1024);
+    assert!(CACHE_MAX_BYTES * CACHE_SIZE <= 64 * 1024 * 1024);
+};
 
 /// Replies by URL with their ETag, shared by every lookup in this process.
 static CACHE: LazyLock<Mutex<HashMap<String, (String, Value)>>> =
@@ -282,7 +298,7 @@ impl Client<'_> {
             .header("Authorization", &self.auth)
             .header("Accept", "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28");
-        req.limit = Limit::Metadata;
+        req.limit = REPLY_LIMIT;
         if let Some((etag, _)) = &cached {
             req = req.header("If-None-Match", etag);
         }
@@ -296,7 +312,7 @@ impl Client<'_> {
             304 => Ok(cached.map(|(_, v)| v)),
             200 => {
                 let v = r.json().ok_or("GitHub sent something unreadable")?;
-                if let Some(etag) = r.header("etag") {
+                if let Some(etag) = r.header("etag").filter(|_| r.body.len() <= CACHE_MAX_BYTES) {
                     if let Ok(mut c) = CACHE.lock() {
                         if c.len() >= CACHE_SIZE {
                             c.clear();
@@ -319,10 +335,15 @@ impl Client<'_> {
 
 /// The pull requests (and Coderhelm branches) that match, newest activity
 /// first. `repos`: the team's enabled repositories; nothing else is read.
+///
+/// `known`: pull requests the team's matching runs opened (`owner/name`,
+/// number), read first and directly, so a title finds its pull request
+/// even when GitHub's search can't be read. Ones outside `repos` are skipped.
 pub async fn find(
     client: &mut Client<'_>,
     ask: &PrAsk,
     repos: &[String],
+    known: &[(String, u64)],
 ) -> Result<Vec<Found>, String> {
     let scope: Vec<String> = match &ask.repo {
         Some(r) => vec![r.clone()],
@@ -339,24 +360,55 @@ pub async fn find(
             }
         }
     } else {
+        let wanted = |repo: &str| scope.iter().find(|r| r.eq_ignore_ascii_case(repo)).cloned();
+        for (repo, n) in known.iter().take(MAX_DETAILED) {
+            if let Some(r) = wanted(repo) {
+                if let Some(pr) = client.get(&format!("/repos/{r}/pulls/{n}")).await? {
+                    hits.push((r, pr));
+                }
+            }
+        }
+        let mut search_failed: Option<String> = None;
         for q in search_queries(ask, &scope) {
             let path = format!(
                 "/search/issues?q={}&sort=updated&order=desc&per_page={MAX_RESULTS}",
                 urlencoding::encode(&q)
             );
-            if let Some(v) = client.get(&path).await? {
-                for h in v["items"].as_array().into_iter().flatten() {
-                    let repo = repo_of_hit(h);
-                    // Only the team's repositories, whatever the search sent.
-                    if scope.iter().any(|r| r.eq_ignore_ascii_case(&repo)) {
-                        hits.push((repo, h.clone()));
+            match client.get(&path).await {
+                Ok(Some(v)) => {
+                    for h in v["items"].as_array().into_iter().flatten() {
+                        let repo = repo_of_hit(h);
+                        // Only the team's repositories, whatever the search sent.
+                        if let Some(r) = wanted(&repo) {
+                            hits.push((r, h.clone()));
+                        }
                     }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    search_failed = Some(e);
+                    break;
                 }
             }
         }
+        // What the runs found stands; a failed search alone is a failure.
+        if let Some(e) = search_failed {
+            if hits.is_empty() {
+                return Err(e);
+            }
+            tracing::warn!(error = %e, found = hits.len(), "Chat: pull request search failed; kept what the runs opened");
+        }
     }
+    // One entry per pull request (a run's and the search's hit are the same
+    // one; the full pull request comes first and is kept), newest first.
+    let mut seen: Vec<(String, u64)> = Vec::new();
+    hits.retain(|(r, h)| {
+        let k = (r.to_lowercase(), h["number"].as_u64().unwrap_or(0));
+        let fresh = !seen.contains(&k);
+        seen.push(k);
+        fresh
+    });
     hits.sort_by(|a, b| b.1["updated_at"].as_str().cmp(&a.1["updated_at"].as_str()));
-    hits.dedup_by(|a, b| a.0 == b.0 && a.1["number"] == b.1["number"]);
     hits.truncate(MAX_RESULTS);
     let mut out = Vec::new();
     for (i, (repo, hit)) in hits.iter().enumerate() {
@@ -554,7 +606,7 @@ pub(crate) mod tests {
             ticket: Some("ABC-7".into()),
             ..Default::default()
         };
-        let out = find(&mut c, &a, &repos()).await.unwrap();
+        let out = find(&mut c, &a, &repos(), &[]).await.unwrap();
         let prs: Vec<&Found> = out.iter().filter(|f| f.title.starts_with('#')).collect();
         assert_eq!(prs.len(), 1, "{out:?}");
         let p = prs[0];
@@ -572,6 +624,79 @@ pub(crate) mod tests {
             .unwrap()
             .iter()
             .all(|r| !r.url.contains("other/secret")));
+    }
+
+    #[tokio::test]
+    async fn a_title_finds_the_pull_request_its_run_opened_when_search_fails() {
+        let gh = fake(|r| {
+            if r.url.contains("/search/issues") {
+                (403, json!({"message": "refused"}))
+            } else if r.url.ends_with("/repos/acme/api/pulls/609") {
+                (
+                    200,
+                    json!({"number": 609, "title": "fix(deps): security updates for api (3 packages, 4 advisories)",
+                    "state": "open", "updated_at": "2026-11-14T00:00:00Z", "head": {"sha": "s1", "ref": "coderhelm/sec-1"},
+                    "html_url": "https://github.com/acme/api/pull/609"}),
+                )
+            } else if r.url.contains("/check-runs") {
+                (200, json!({"check_runs": []}))
+            } else if r.url.contains("/reviews") {
+                (200, json!([]))
+            } else {
+                (404, json!({}))
+            }
+        });
+        let mut c = client(&gh);
+        let a = PrAsk::from_input(
+            &json!({"query": "fix(deps): security updates for api"}),
+            &repos(),
+        )
+        .unwrap();
+        // The run's pull request, and one in a repository the team doesn't have.
+        let known = vec![
+            ("acme/api".to_string(), 609),
+            ("other/secret".to_string(), 1),
+        ];
+        let out = find(&mut c, &a, &repos(), &known).await.unwrap();
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!(out[0].title.starts_with("#609 "));
+        assert!(gh
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|r| !r.url.contains("other/secret")));
+        // With nothing from the runs, the failed search is the answer.
+        let mut c = client(&gh);
+        let e = find(&mut c, &a, &repos(), &[]).await.unwrap_err();
+        assert!(e.contains("403"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn a_pull_request_found_twice_is_listed_once() {
+        let gh = fake(|r| {
+            if r.url.contains("/search/issues") {
+                (
+                    200,
+                    json!({"items": [{"number": 7, "title": "Bump", "state": "open", "updated_at": "2026-11-14T00:00:00Z",
+                        "repository_url": "https://api.github.com/repos/acme/web", "html_url": "https://github.com/acme/web/pull/7"}]}),
+                )
+            } else if r.url.ends_with("/pulls/7") {
+                (
+                    200,
+                    json!({"number": 7, "title": "Bump", "state": "open", "updated_at": "2026-11-14T00:00:00Z",
+                    "head": {"sha": "s"}, "html_url": "https://github.com/acme/web/pull/7"}),
+                )
+            } else {
+                (200, json!([]))
+            }
+        });
+        let mut c = client(&gh);
+        let a = PrAsk::from_input(&json!({"query": "bump"}), &repos()).unwrap();
+        let out = find(&mut c, &a, &repos(), &[("ACME/web".into(), 7)])
+            .await
+            .unwrap();
+        assert_eq!(out.len(), 1, "{out:?}");
     }
 
     #[tokio::test]

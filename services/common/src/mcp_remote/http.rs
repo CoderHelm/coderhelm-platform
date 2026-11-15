@@ -36,7 +36,7 @@ pub enum Limit {
 }
 
 impl Limit {
-    pub fn max_bytes(self) -> usize {
+    pub const fn max_bytes(self) -> usize {
         match self {
             Limit::Metadata => 256 * 1024,
             Limit::Mcp => 4 * 1024 * 1024,

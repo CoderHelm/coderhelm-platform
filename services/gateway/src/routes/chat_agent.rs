@@ -378,7 +378,12 @@ pub async fn run(
                 }),
             )
             .await;
-            used.push(json!({ "kind": kind, "label": label, "name": name, "repo": repo, "summary": summary }));
+            let mut step = json!({ "kind": kind, "label": label, "name": name, "repo": repo, "summary": summary });
+            // A saved answer shows its failed lookups the way the live one did.
+            if is_error {
+                step["status"] = json!("error");
+            }
+            used.push(step);
             let mut r = json!({ "type": "tool_result", "tool_use_id": tu["id"], "content": text });
             if is_error {
                 r["is_error"] = json!(true);
@@ -618,12 +623,14 @@ pub(crate) mod testing {
             name: &str,
             input: &Value,
         ) -> Called {
-            let out = chat_code::run(&self.reader, reg, name, input).await;
+            // The evals read code through the same layer Chat and /mcp do.
+            let (text, summary, is_error) =
+                crate::lookups::code(&self.reader, reg, name, input).await;
             Called::Done {
-                text: out.text,
+                text,
                 label: chat_code::label(name, input),
-                summary: out.summary,
-                is_error: out.is_error,
+                summary,
+                is_error,
                 kind: "code".into(),
             }
         }
