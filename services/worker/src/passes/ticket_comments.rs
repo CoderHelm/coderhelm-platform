@@ -178,6 +178,48 @@ pub async fn keep_asked(state: &WorkerState, team_id: &str, run_id: &str, questi
     }
 }
 
+/// For each unread comment, the open question it answers by its place: a
+/// reply in a Jira thread under CoderHelm's comment that asked one open
+/// question. The ledger is read only when some comment is such a reply;
+/// without it, every comment is read by its words, order and mentions.
+async fn threads_of(
+    state: &WorkerState,
+    t: &Ticket<'_>,
+    questions: &[String],
+    unread: &[Comment],
+) -> Vec<Option<usize>> {
+    if questions.is_empty() || unread.iter().all(|c| c.parent_id.is_empty()) {
+        return vec![None; unread.len()];
+    }
+    let said = common::conversation_io::jira_said(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        t.team_id,
+        t.ticket_id,
+    )
+    .await
+    .unwrap_or_default();
+    in_threads(&said, questions, unread)
+}
+
+/// [`threads_of`] once CoderHelm's comments on the ticket are read.
+pub fn in_threads(
+    said: &[common::conversation::Said],
+    questions: &[String],
+    unread: &[Comment],
+) -> Vec<Option<usize>> {
+    unread
+        .iter()
+        .map(|c| {
+            if c.parent_id.is_empty() {
+                return None;
+            }
+            let parent = said.iter().find(|s| s.id == c.parent_id)?;
+            tc::thread_question(questions, &parent.meta.asks)
+        })
+        .collect()
+}
+
 /// The model's reading of the unread comments, in order; every one reads
 /// as an instruction (never a stop) when the model can't be reached.
 async fn classify(
@@ -186,6 +228,7 @@ async fn classify(
     title: &str,
     questions: &[String],
     unread: &[Comment],
+    threads: &[Option<usize>],
     usage: &mut TokenUsage,
 ) -> Vec<tc::Reading> {
     let provider = match ModelProvider::load_for_team(
@@ -205,7 +248,7 @@ async fn classify(
         &provider.client(),
         provider.judgment_model_id(),
         tc::SYSTEM,
-        &tc::prompt(title, questions, unread),
+        &tc::prompt_in_threads(title, questions, unread, threads),
         &tc::schema(),
         true,
         common::stop_judge::JUDGMENT_EFFORT,
@@ -214,7 +257,7 @@ async fn classify(
     )
     .await
     {
-        Ok(reply) => tc::readings(&reply, questions, unread.len()),
+        Ok(reply) => tc::readings_in_threads(&reply, questions, threads),
         Err(e) => {
             warn!(team_id, error = %e, "Could not read the ticket comments; read as instructions");
             Vec::new()
@@ -337,12 +380,14 @@ async fn read(
 
     let unread: Vec<Comment> = open.iter().filter(|c| c.class.is_none()).cloned().collect();
     if !unread.is_empty() {
+        let threads = threads_of(state, t, &facts.questions, &unread).await;
         let readings = classify(
             state,
             t.team_id,
             &facts.title,
             &facts.questions,
             &unread,
+            &threads,
             usage,
         )
         .await;
@@ -885,6 +930,36 @@ pub fn existing_github(ticket_id: &str, comments: &[serde_json::Value]) -> Vec<C
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_reply_under_coderhelms_question_is_matched_by_its_parent() {
+        use common::conversation::{Meta, Said};
+        let questions = vec![
+            "Which environments get the flag?".to_string(),
+            "Keep the old column?".to_string(),
+        ];
+        let said = vec![Said {
+            id: "10001".into(),
+            at_ms: 1,
+            meta: Meta {
+                slot: "questions".into(),
+                asks: vec!["Keep the old column?".into()],
+                ..Default::default()
+            },
+            body: String::new(),
+        }];
+        let mut reply = comment("2", "Yes.", Class::Instruction);
+        reply.class = None;
+        reply.parent_id = "10001".into();
+        let mut elsewhere = reply.clone();
+        elsewhere.parent_id = "99999".into();
+        let mut top = reply.clone();
+        top.parent_id.clear();
+        assert_eq!(
+            in_threads(&said, &questions, &[reply, elsewhere, top]),
+            vec![Some(1), None, None]
+        );
+    }
+
     use super::*;
     use common::ticket_comments::{Class, Memory, State};
     use serde_json::json;
