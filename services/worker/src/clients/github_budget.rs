@@ -423,9 +423,8 @@ pub async fn refresh(state: &WorkerState, installation_id: u64) {
 
 /// The hour's counts by caller, from its record.
 pub fn counts_of(item: &HashMap<String, AttributeValue>) -> HashMap<String, u64> {
-    let known: Vec<&str> = rules::caller::BACKGROUND.iter().map(|(c, _)| *c).collect();
-    known
-        .into_iter()
+    rules::capped()
+        .map(|(c, _)| c)
         .map(|c| (c.to_string(), num(item, &rules::count_attr(c))))
         .filter(|(_, v)| *v > 0)
         .collect()

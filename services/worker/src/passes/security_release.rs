@@ -21,10 +21,14 @@
 //!
 //! It is bounded: at most `MAX_PRS_PER_SWEEP` pull requests and
 //! `MAX_TICKETS_PER_SWEEP` runs per team per sweep, the rest in turn on the
-//! following sweeps. It is idempotent: a fact applied twice writes nothing
-//! the second time.
+//! following sweeps. It always makes progress: while GitHub's budget holds
+//! the sweep, it still reads `FLOOR_READS_PER_SWEEP` of them, in a turn of
+//! their own, on the floor's small allowance (`github_budget::caller::FLOOR`).
+//! It is idempotent: a fact applied twice writes nothing the second time.
+//! Every sweep leaves one line saying what it read and decided (`said`).
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::time::Instant;
 
 use chrono::{DateTime, Utc};
@@ -82,6 +86,13 @@ pub(crate) struct Report {
     /// Pull requests and runs left for the next sweep (its turn or its
     /// time ran out).
     pub left: usize,
+    /// What GitHub said of the pull requests read.
+    pub prs_open: usize,
+    pub prs_merged: usize,
+    pub prs_closed: usize,
+    pub prs_unknown: usize,
+    /// Reads made while GitHub's budget held the sweep, on the floor.
+    pub floor_reads: usize,
 }
 
 impl Report {
@@ -116,7 +127,27 @@ pub(crate) trait ReleaseIo<C: Claim + Send + Sync>: Send + Sync {
     async fn opened(&self, _c: &mut C, _pr: &OpenPr) -> bool {
         false
     }
+    /// The time the reconciliation was given is spent.
     fn out_of_time(&self) -> bool;
+    /// GitHub's budget holds the caller's own requests now: only the floor's
+    /// few reads go on (`rel::FLOOR_READS_PER_SWEEP`).
+    fn held(&self) -> bool {
+        false
+    }
+}
+
+/// A release read: under the floor's label while the sweep's own is held,
+/// so it is sent on the floor's allowance instead of being refused.
+pub(crate) async fn on_floor<F: Future>(gh: &GitHubClient, read: F) -> F::Output {
+    if gh.held() {
+        crate::clients::github_budget::scoped(
+            common::github_budget::caller::SWEEP_SECURITY_FLOOR,
+            Box::pin(read),
+        )
+        .await
+    } else {
+        read.await
+    }
 }
 
 /// Brings the findings in `scope` in line with GitHub and the run records.
@@ -156,19 +187,30 @@ pub(crate) async fn reconcile<C: Claim + Send + Sync>(
         }
     }
     let all: Vec<((String, u64), (String, bool))> = prs.into_iter().collect();
-    let mine = if sweep {
-        rel::turn(&all, rel::MAX_PRS_PER_SWEEP, now)
-    } else {
+    // Held from the start: the floor's few reads, in a turn of their own,
+    // so every pull request is read within a few sweeps however long the
+    // budget stays low.
+    let mine = if !sweep {
         all.clone()
+    } else if io.held() {
+        rel::turn(&all, rel::FLOOR_READS_PER_SWEEP, now)
+    } else {
+        rel::turn(&all, rel::MAX_PRS_PER_SWEEP, now)
     };
     report.left += all.len() - mine.len();
     for (i, (key, (repo, open))) in mine.iter().enumerate() {
-        if io.out_of_time() {
+        if !may_read(io, &mut report) {
             report.left += mine.len() - i;
             break;
         }
         let fact = io.pr_now(repo, key.1, *open).await;
         report.prs_read += 1;
+        match &fact {
+            PrNow::Open => report.prs_open += 1,
+            PrNow::Merged => report.prs_merged += 1,
+            PrNow::Closed(_) | PrNow::Gone => report.prs_closed += 1,
+            PrNow::Unknown => report.prs_unknown += 1,
+        }
         let mut carded = false;
         for c in findings.iter_mut() {
             let same =
@@ -201,14 +243,16 @@ pub(crate) async fn reconcile<C: Claim + Send + Sync>(
         }
     }
     let all: Vec<(String, String)> = tickets.into_iter().collect();
-    let mine = if sweep {
-        rel::turn(&all, rel::MAX_TICKETS_PER_SWEEP, now)
-    } else {
+    let mine = if !sweep {
         all.clone()
+    } else if io.held() {
+        rel::turn(&all, rel::FLOOR_READS_PER_SWEEP, now)
+    } else {
+        rel::turn(&all, rel::MAX_TICKETS_PER_SWEEP, now)
     };
     report.left += all.len() - mine.len();
     for (i, (ticket, repo)) in mine.iter().enumerate() {
-        if io.out_of_time() {
+        if !may_read(io, &mut report) {
             report.left += mine.len() - i;
             break;
         }
@@ -266,6 +310,22 @@ pub(crate) async fn reconcile<C: Claim + Send + Sync>(
         }
     }
     report
+}
+
+/// Whether the next read may be made: time is left, and GitHub's budget
+/// takes it (or the floor still has reads this sweep, counted here).
+fn may_read<C: Claim + Send + Sync>(io: &dyn ReleaseIo<C>, report: &mut Report) -> bool {
+    if io.out_of_time() {
+        return false;
+    }
+    if !io.held() {
+        return true;
+    }
+    if report.floor_reads >= rel::FLOOR_READS_PER_SWEEP {
+        return false;
+    }
+    report.floor_reads += 1;
+    true
 }
 
 // ── The real edges ──────────────────────────────────────────────────────
@@ -447,11 +507,13 @@ impl<'a, 'c> Live<'a, 'c> {
 #[async_trait::async_trait]
 impl ReleaseIo<(Finding, FindingState)> for Live<'_, '_> {
     async fn pr_now(&self, repo: &str, number: u64, closer: bool) -> PrNow {
-        self.reads().pr_now(repo, number, closer).await
+        let reads = self.reads();
+        on_floor(&self.cx.gh, reads.pr_now(repo, number, closer)).await
     }
 
     async fn open_pr(&self, repo: &str, ticket: &str) -> Result<Option<OpenPr>, ()> {
-        self.reads().open_pr(repo, ticket).await
+        let reads = self.reads();
+        on_floor(&self.cx.gh, reads.open_pr(repo, ticket)).await
     }
 
     async fn run_now(&self, ticket: &str, since: Option<DateTime<Utc>>) -> RunNow {
@@ -489,9 +551,13 @@ impl ReleaseIo<(Finding, FindingState)> for Live<'_, '_> {
     }
 
     fn out_of_time(&self) -> bool {
-        // Out of time, or of the sweep's share of GitHub's budget: what is
-        // left is read at a later sweep (`Report::left`).
-        self.started.elapsed().as_secs() >= self.budget_secs || self.cx.gh.held()
+        self.started.elapsed().as_secs() >= self.budget_secs
+    }
+
+    fn held(&self) -> bool {
+        // The sweep's share of GitHub's budget is spent: the floor's few
+        // reads go on, the rest waits for a later sweep (`Report::left`).
+        self.cx.gh.held()
     }
 }
 
@@ -575,20 +641,26 @@ pub(super) async fn run(
     report
 }
 
-/// The line a reconciliation leaves in the log when it did something or
-/// left something for later.
+/// The line a reconciliation leaves in the log: every sweep, so whether it
+/// ran and what GitHub said is never a guess, and an event when it did
+/// something or left something for later.
 pub(crate) fn said(team_id: &str, store: &str, scope: &Scope, report: &Report) {
-    if report.changed() > 0 || report.left > 0 {
+    if *scope == Scope::All || report.changed() > 0 || report.left > 0 {
         info!(
             team_id,
             store,
             scope = ?scope,
             prs_read = report.prs_read,
+            prs_open = report.prs_open,
+            prs_merged = report.prs_merged,
+            prs_closed = report.prs_closed,
+            prs_unknown = report.prs_unknown,
             runs_read = report.runs_read,
             released = report.released,
             fixed = report.fixed,
             attached = report.attached,
             left = report.left,
+            floor_reads = report.floor_reads,
             "security: findings brought in line with their pull requests and runs"
         );
     }
@@ -624,6 +696,8 @@ pub(crate) mod fake {
         pub time_for: Option<usize>,
         /// GitHub is down for branch lookups.
         pub branches_down: bool,
+        /// GitHub's budget holds the sweep.
+        pub held: std::sync::atomic::AtomicBool,
     }
 
     impl Fake {
@@ -705,6 +779,9 @@ pub(crate) mod fake {
         }
         fn out_of_time(&self) -> bool {
             self.time_for.is_some_and(|n| self.reads() >= n)
+        }
+        fn held(&self) -> bool {
+            self.held.load(std::sync::atomic::Ordering::Relaxed)
         }
     }
 
@@ -796,6 +873,7 @@ mod tests {
             r,
             Report {
                 prs_read: 1,
+                prs_closed: 1,
                 released: 274,
                 ..Default::default()
             }
@@ -993,6 +1071,74 @@ mod tests {
             reconcile(&io, &mut findings, &Scope::All, t).await;
         }
         assert!(findings.iter().all(|(f, _)| f.status == Status::Open));
+    }
+
+    #[tokio::test]
+    async fn a_held_budget_still_reads_the_floor_and_every_pull_request_in_turn() {
+        // 12 pull requests closed by a person, while GitHub's budget holds
+        // the sweep every time it runs.
+        let mut findings: Vec<_> = (0..12u64)
+            .map(|i| in_pr(&format!("f{i}"), REPO, 200 + i, TICKET))
+            .collect();
+        let io = Fake::default();
+        io.held.store(true, std::sync::atomic::Ordering::Relaxed);
+        for i in 0..12u64 {
+            io.pr(REPO, 200 + i, closed_by("octo"));
+        }
+        let mut t = now();
+        let r = reconcile(&io, &mut findings, &Scope::All, t).await;
+        let floor = rel::FLOOR_READS_PER_SWEEP;
+        assert_eq!(
+            (r.prs_read, r.prs_closed, r.released, r.floor_reads, r.left),
+            (floor, floor, floor, floor, 12 - floor)
+        );
+        // Each sweep reads its own few, so all are given back within
+        // ceil(12 / floor) sweeps, none starved.
+        for _ in 1..12usize.div_ceil(floor) {
+            t += chrono::Duration::seconds(rel::SWEEP_SECS);
+            reconcile(&io, &mut findings, &Scope::All, t).await;
+        }
+        assert!(findings.iter().all(|(f, _)| f.status == Status::Open));
+    }
+
+    #[tokio::test]
+    async fn a_held_sweep_reads_the_floor_and_leaves_the_rest_for_later() {
+        let mut findings: Vec<_> = (0..20u64)
+            .map(|i| in_pr(&format!("f{i}"), REPO, 300 + i, TICKET))
+            .collect();
+        let io = Fake::default();
+        for i in 0..20u64 {
+            io.pr(REPO, 300 + i, PrNow::Open);
+        }
+        // Not held: every pull request is read, and the line says what
+        // GitHub answered, even though nothing changed.
+        let r = reconcile(&io, &mut findings, &Scope::All, now()).await;
+        assert_eq!((r.prs_read, r.prs_open, r.changed()), (20, 20, 0));
+        assert_eq!(r.floor_reads, 0);
+        // Held: the floor's reads, then the rest is left for later.
+        io.held.store(true, std::sync::atomic::Ordering::Relaxed);
+        let r = reconcile(&io, &mut findings, &Scope::All, now()).await;
+        assert_eq!(r.prs_read, rel::FLOOR_READS_PER_SWEEP);
+        assert_eq!(r.prs_read + r.left, 20);
+        // Still open on GitHub: the findings stay in their pull request.
+        assert!(findings.iter().all(|(f, _)| f.status == Status::PrOpen));
+    }
+
+    #[tokio::test]
+    async fn a_held_budget_still_releases_a_cancelled_runs_findings() {
+        let mut findings = vec![fixing("a", REPO, TICKET)];
+        let io = Fake::default();
+        io.held.store(true, std::sync::atomic::Ordering::Relaxed);
+        io.run(
+            TICKET,
+            RunNow::Ended {
+                status: "cancelled".into(),
+                by: Some("dev@example.com".into()),
+            },
+        );
+        let r = reconcile(&io, &mut findings, &Scope::All, now()).await;
+        assert_eq!((r.runs_read, r.released, r.floor_reads), (1, 1, 1));
+        assert_eq!(findings[0].0.status, Status::Open);
     }
 
     #[tokio::test]

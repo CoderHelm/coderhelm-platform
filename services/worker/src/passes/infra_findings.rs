@@ -668,10 +668,10 @@ struct Release<'a> {
 #[async_trait::async_trait]
 impl ReleaseIo<Record> for Release<'_> {
     async fn pr_now(&self, repo: &str, number: u64, closer: bool) -> PrNow {
-        self.reads.pr_now(repo, number, closer).await
+        rel::on_floor(self.reads.gh, self.reads.pr_now(repo, number, closer)).await
     }
     async fn open_pr(&self, repo: &str, ticket: &str) -> Result<Option<OpenPr>, ()> {
-        self.reads.open_pr(repo, ticket).await
+        rel::on_floor(self.reads.gh, self.reads.open_pr(repo, ticket)).await
     }
     async fn run_now(&self, ticket: &str, since: Option<chrono::DateTime<Utc>>) -> RunNow {
         self.reads.run_now(ticket, since).await
@@ -717,6 +717,9 @@ impl ReleaseIo<Record> for Release<'_> {
     }
     fn out_of_time(&self) -> bool {
         self.started.elapsed().as_secs() >= rel::TEAM_BUDGET_SECS
+    }
+    fn held(&self) -> bool {
+        self.reads.gh.held()
     }
 }
 
