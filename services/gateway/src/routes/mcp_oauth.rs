@@ -23,7 +23,7 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::Arc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::auth::jwt::SignInProof;
 use crate::mcp_oauth::{self as oauth, OAuthStore, StoredGrant, READ_SCOPE, SCOPES};
@@ -105,6 +105,10 @@ pub fn server_metadata(issuer: &str) -> Value {
         "revocation_endpoint_auth_methods_supported": ["none"],
         "scopes_supported": SCOPES,
         "authorization_response_iss_parameter_supported": true,
+        // An https client_id is read as the client's metadata document
+        // (the MCP spec's preferred registration); dynamic registration
+        // stays for clients that don't publish one.
+        "client_id_metadata_document_supported": true,
         "service_documentation": "https://docs.coderhelm.com/mcp",
     })
 }
@@ -193,6 +197,10 @@ pub async fn authorize(
         );
     }
     let client = match p.client_id.as_deref() {
+        Some(id) if oauth::is_metadata_client_id(id) => match metadata_client(&state, id).await {
+            Ok(c) => Some(c),
+            Err(m) => return refusal_page(&m),
+        },
         Some(id) => match oauth::store(&state).get_client(id).await {
             Ok(c) => c,
             Err(e) => {
@@ -225,6 +233,42 @@ pub async fn authorize(
         urlencoding::encode(&signed)
     ))
     .into_response()
+}
+
+/// The client a Client ID Metadata Document describes: the stored copy
+/// while it is fresh, else the document read again now, through the same
+/// guard every outside address passes (HTTPS only, never a private,
+/// loopback or link-local address).
+async fn metadata_client(state: &AppState, id: &str) -> Result<oauth::StoredClient, String> {
+    use common::mcp_remote::http::{GuardedHttps, Http, HttpRequest};
+    let store = oauth::store(state);
+    let now = chrono::Utc::now();
+    if let Ok(Some(c)) = store.get_client(id).await {
+        if !oauth::document_stale(&c, now) {
+            return Ok(c);
+        }
+    }
+    let unreadable = || {
+        "CoderHelm couldn't read this app's metadata document. Try again, or remove CoderHelm from the app and add it again.".to_string()
+    };
+    let r = GuardedHttps
+        .send(HttpRequest::get(id).header("Accept", "application/json"))
+        .await
+        .map_err(|e| {
+            warn!(error = %e, "MCP client metadata document not read");
+            unreadable()
+        })?;
+    if r.status != 200 {
+        return Err(unreadable());
+    }
+    let doc = r.json().ok_or_else(unreadable)?;
+    let c = oauth::client_from_document(id, &doc, now)?;
+    if let Err(e) = store.put_client(&c).await {
+        error!(error = %e, "MCP metadata client not saved");
+        return Err("CoderHelm couldn't answer just now. Try again shortly.".into());
+    }
+    info!(client_name = %c.client_name, "MCP client read from its metadata document");
+    Ok(c)
 }
 
 // ── Tokens ──────────────────────────────────────────────────────────
@@ -393,6 +437,15 @@ fn own_session(claims: &Claims) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// The built-in bases a scope opens, by name, for the consent page.
+pub fn scope_opens(scope: &str) -> Vec<&'static str> {
+    crate::lookups::BASES
+        .iter()
+        .filter(|b| b.scope == scope)
+        .map(|b| b.name)
+        .collect()
+}
+
 /// POST /api/mcp/authorize/describe — what the consent page shows.
 pub async fn describe_request(
     State(state): State<Arc<AppState>>,
@@ -408,6 +461,8 @@ pub async fn describe_request(
             json!({
                 "key": s,
                 "label": oauth::scope_label(s),
+                "plain": oauth::scope_plain(s),
+                "opens": scope_opens(s),
                 "requested": req.scopes.iter().any(|r| r == s),
                 "always": *s == READ_SCOPE,
             })
@@ -428,9 +483,12 @@ pub async fn describe_request(
         "mcp_url": oauth::resource(),
         // The team lookups the page may offer as choices (`allow_scopes`),
         // ticked by default when `default` is true.
+        "reader": claims.role == crate::bases::READER_ROLE,
         "lookup_scopes": oauth::LOOKUP_SCOPES.iter().map(|s| json!({
             "key": s,
             "label": oauth::scope_label(s),
+            "plain": oauth::scope_plain(s),
+            "opens": scope_opens(s),
             "requested": req.scopes.iter().any(|r| r == s),
             "default": oauth::DEFAULT_LOOKUP_SCOPES.contains(s),
         })).collect::<Vec<_>>(),
@@ -649,6 +707,8 @@ mod tests {
                 "knowledge:read",
                 "code:read",
                 "work:read",
+                "infra:read",
+                "logs:read",
                 "security:read"
             ])
         );

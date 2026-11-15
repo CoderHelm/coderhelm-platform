@@ -150,6 +150,10 @@ pub async fn fetch(
             .await
             .map(of)
             .map_err(read_failed(kind.key, "log findings"))?,
+        "resources" => Box::pin(super::infra_security::resources(st, ext))
+            .await
+            .map(of)
+            .map_err(read_failed(kind.key, "AWS resources"))?,
         "plans" => Box::pin(super::plans::list_plans(
             st,
             ext,
@@ -181,6 +185,7 @@ pub fn rows(kind: &str, v: &Value) -> Vec<Value> {
         "reviews" => "reviews",
         "alerts" => "alerts",
         "plans" => "plans",
+        "resources" => "resources",
         _ => "findings",
     };
     v[key].as_array().cloned().unwrap_or_default()
@@ -301,6 +306,7 @@ fn date_of(v: &Value) -> String {
         "received_at",
         "created_at",
         "first_seen_at",
+        "seen_at",
     ]
     .iter()
     .find_map(|k| v[*k].as_str().filter(|t| !t.is_empty()))
@@ -313,6 +319,7 @@ fn repo_of(v: &Value) -> String {
     ["repo", "fix_repo"]
         .iter()
         .find_map(|k| v[*k].as_str().filter(|t| !t.is_empty()))
+        .or_else(|| v["defined_in"]["repo"].as_str().filter(|t| !t.is_empty()))
         .unwrap_or("")
         .to_string()
 }
@@ -366,6 +373,27 @@ pub fn found(kind: &str, v: &Value) -> Found {
             Some("/logs".to_string()),
             None,
         ),
+        "resources" => {
+            let kind_word = s(v, "kind").replace('_', " ");
+            let name = if s(v, "name").is_empty() {
+                s(v, "id")
+            } else {
+                s(v, "name")
+            };
+            (
+                format!(
+                    "Resource: {} ({kind_word}, {} {})",
+                    clip(name, 100),
+                    s(v, "account"),
+                    s(v, "region")
+                ),
+                Some(format!(
+                    "/security/infrastructure?resource={}",
+                    enc(s(v, "id"))
+                )),
+                None,
+            )
+        }
         "plans" => (
             format!("Plan: {}", clip(s(v, "title"), 100)),
             Some(format!("/plans/detail?id={}", enc(s(v, "plan_id")))),

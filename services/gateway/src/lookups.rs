@@ -11,18 +11,19 @@
 //! registers what it found in the citation registry, which Chat cites and
 //! `/mcp` turns into structured results.
 //!
-//! [`BASES`] is the vocabulary results are named by: the six built-in bases
-//! (Code and docs, Work, Infrastructure, Logs and operations, Security,
-//! Team knowledge). The bases themselves, with their own audiences, come
-//! later; until then a base is the name of where a result came from and the
-//! scope that reaches it on `/mcp`.
+//! [`BASES`] are the six built-in bases (Code, Work, Infrastructure, Logs,
+//! Security, Knowledge): the name every result carries and the scope that
+//! reaches it on `/mcp`. Who may read each one is decided once, in
+//! `crate::bases::decide`.
 
 use common::knowledge::answer::Registry;
 use common::knowledge::search::{Embedder, Found, Retriever, Store};
 use common::repo_read::CodeReader;
 use serde_json::Value;
 
-use crate::mcp_oauth::{CODE_SCOPE, KNOWLEDGE_SCOPE, SECURITY_SCOPE, WORK_SCOPE};
+use crate::mcp_oauth::{
+    CODE_SCOPE, INFRA_SCOPE, KNOWLEDGE_SCOPE, LOGS_SCOPE, SECURITY_SCOPE, WORK_SCOPE,
+};
 use crate::routes::{chat_code, chat_work, plan_chat_tools};
 use crate::AppState;
 
@@ -110,10 +111,10 @@ pub async fn github_hold_now(
     github_hold(caller, chat_work::limited_until(state, id).await, now)
 }
 
-// ── The built-in bases, as names ────────────────────────────────────────────
+// ── The built-in bases ──────────────────────────────────────────────────────
 
 /// A built-in base: what results are named by, and the `/mcp` scope that
-/// reaches it.
+/// reaches it. Its audience, counts and freshness live in `crate::bases`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Base {
     pub key: &'static str,
@@ -126,18 +127,17 @@ pub struct Base {
 pub const CODE: &str = "code";
 pub const WORK: &str = "work";
 pub const INFRA: &str = "infra";
-pub const OPS: &str = "ops";
+pub const LOGS: &str = "logs";
 pub const SECURITY: &str = "security";
 pub const TEAM: &str = "team";
 
-/// The six built-in bases, in the order they are shown. Infrastructure and
-/// Logs and operations are reached with `security:read` until their own
-/// scopes come with those bases.
+/// The six built-in bases, in the order they are shown. Every team has all
+/// six with nothing to set up: each is fed from what CoderHelm already reads.
 pub const BASES: [Base; 6] = [
     Base {
         key: CODE,
-        name: "Code and docs",
-        about: "The team's repositories: files, code search, the code graph and history",
+        name: "Code",
+        about: "The connected repositories: files, symbols, the code graph and history",
         scope: CODE_SCOPE,
     },
     Base {
@@ -149,25 +149,25 @@ pub const BASES: [Base; 6] = [
     Base {
         key: INFRA,
         name: "Infrastructure",
-        about: "Infrastructure findings",
-        scope: SECURITY_SCOPE,
+        about: "AWS accounts and resources, where each is defined in Terraform, CDK or CloudFormation, pending updates and infrastructure findings",
+        scope: INFRA_SCOPE,
     },
     Base {
-        key: OPS,
-        name: "Logs and operations",
-        about: "Alerts and log findings",
-        scope: SECURITY_SCOPE,
+        key: LOGS,
+        name: "Logs",
+        about: "Problems found in the logs and alerts, with the repository and service each belongs to",
+        scope: LOGS_SCOPE,
     },
     Base {
         key: SECURITY,
         name: "Security",
-        about: "Dependency advisories and CVEs, and quarantined tests",
+        about: "Dependency advisories and CVEs, their fixes, and quarantined tests",
         scope: SECURITY_SCOPE,
     },
     Base {
         key: TEAM,
-        name: "Team knowledge",
-        about: "The knowledge bases people made: uploaded and synced documents",
+        name: "Knowledge",
+        about: "The team's documents: uploaded files and connected sources such as Confluence, Notion and Drive",
         scope: KNOWLEDGE_SCOPE,
     },
 ];
@@ -182,8 +182,8 @@ pub fn base_of(kind: &str) -> &'static Base {
     let key = match kind {
         "code" | "memory" => CODE,
         "security" | "tests" => SECURITY,
-        "infra" => INFRA,
-        "alerts" | "log_findings" => OPS,
+        "infra" | "resources" => INFRA,
+        "alerts" | "log_findings" => LOGS,
         "knowledge" | "upload" => TEAM,
         _ => WORK,
     };
@@ -225,14 +225,19 @@ mod tests {
             let b = base_of(k.key);
             assert!(BASES.contains(b), "{}", k.key);
         }
-        assert_eq!(base_of("code").name, "Code and docs");
+        assert_eq!(base_of("code").name, "Code");
         assert_eq!(base_of("runs").name, "Work");
         assert_eq!(base_of("security").name, "Security");
         assert_eq!(base_of("infra").name, "Infrastructure");
-        assert_eq!(base_of("log_findings").name, "Logs and operations");
-        assert_eq!(base_of("knowledge").name, "Team knowledge");
+        assert_eq!(base_of("resources").name, "Infrastructure");
+        assert_eq!(base_of("log_findings").name, "Logs");
+        assert_eq!(base_of("alerts").name, "Logs");
+        assert_eq!(base_of("knowledge").name, "Knowledge");
         let keys: Vec<&str> = BASES.iter().map(|b| b.key).collect();
-        assert_eq!(keys, [CODE, WORK, INFRA, OPS, SECURITY, TEAM]);
+        assert_eq!(keys, [CODE, WORK, INFRA, LOGS, SECURITY, TEAM]);
+        // Each base has a scope of its own.
+        let scopes: std::collections::BTreeSet<&str> = BASES.iter().map(|b| b.scope).collect();
+        assert_eq!(scopes.len(), BASES.len());
         let p = provenance("Work", "WEB-42 Checkout", "2026-11-12");
         assert_eq!(
             p,
