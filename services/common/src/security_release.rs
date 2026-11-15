@@ -45,6 +45,10 @@ pub const NO_RUN_GRACE_HOURS: i64 = 12;
 /// Pull requests one sweep reads per team at most; the rest are read on
 /// the following sweeps, in turn.
 pub const MAX_PRS_PER_SWEEP: usize = 100;
+/// Pull requests and runs one sweep still reads per team while GitHub's
+/// budget holds the sweep (`github_budget::caller::FLOOR`): a busy hour
+/// slows the release down, it never stops it.
+pub const FLOOR_READS_PER_SWEEP: usize = 5;
 /// Fix runs one sweep reads per team at most.
 pub const MAX_TICKETS_PER_SWEEP: usize = 50;
 /// Seconds between two sweeps: what the turn-taking counts in.

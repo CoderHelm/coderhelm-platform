@@ -49,6 +49,7 @@ mod bf_owns_the_work;
 mod bg_coder_reaches_for_a_shell;
 mod bh_round_checks_and_scope;
 mod bi_own_review_finishes;
+mod bj_release_through_a_busy_hour;
 mod c_codegen_egress;
 mod d_echoed_markers;
 mod e_large_generated_output;

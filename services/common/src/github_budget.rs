@@ -22,6 +22,10 @@
 //!   (the rest is the runs'), and never more than its own [`hourly_cap`] an
 //!   hour. The caps add up to less than the background share of the smallest
 //!   budget, so every sweep together can't reach the runs' share.
+//! - **Giving findings back has a floor** ([`caller::FLOOR`]): the security
+//!   release (a finding's pull request or run is over) may spend a few
+//!   requests an hour inside the runs' share, so a busy hour never leaves a
+//!   closed pull request's findings claimed. Its cap is small and its own.
 //! - **A spent limit sends nothing**: once GitHub said the hour's budget is
 //!   gone, no caller sends another request until the reset ([`decide`]); the
 //!   request comes back as the limit it would have met, and the caller waits
@@ -105,6 +109,16 @@ pub mod caller {
     /// Quarantined tests: releases, followed fixes and removals.
     pub const SWEEP_QUARANTINE: &str = "sweep:quarantine";
 
+    /// The security release's reads (a finding's pull request or run)
+    /// while `sweep:security` is held: a few each sweep, so the release
+    /// makes progress whatever the hour's budget (see [`FLOOR`]).
+    pub const SWEEP_SECURITY_FLOOR: &str = "sweep:security_floor";
+
+    /// Background callers that may spend inside the runs' share, with their
+    /// hourly cap of counted requests per installation. Their caps together
+    /// stay a small part of the smallest budget.
+    pub const FLOOR: &[(&str, u64)] = &[(SWEEP_SECURITY_FLOOR, 60)];
+
     /// Every background caller with its hourly cap of counted requests per
     /// installation (see [`super::hourly_cap`]).
     pub const BACKGROUND: &[(&str, u64)] = &[
@@ -131,7 +145,7 @@ pub mod caller {
 /// Whether `caller`'s requests are for someone waiting. An unknown label is
 /// foreground: work is never held because nobody labelled it.
 pub fn priority(caller: &str) -> Priority {
-    if caller::BACKGROUND.iter().any(|(c, _)| *c == caller) {
+    if capped().any(|(c, _)| c == caller) {
         Priority::Background
     } else {
         Priority::Foreground
@@ -141,10 +155,20 @@ pub fn priority(caller: &str) -> Priority {
 /// The most counted requests a background caller makes for one installation
 /// in one hour. None for foreground work, which has no cap of its own.
 pub fn hourly_cap(caller: &str) -> Option<u64> {
+    capped().find(|(c, _)| *c == caller).map(|(_, cap)| cap)
+}
+
+/// Every caller with an hourly cap: the sweeps, and those with a floor.
+pub fn capped() -> impl Iterator<Item = (&'static str, u64)> {
     caller::BACKGROUND
         .iter()
-        .find(|(c, _)| *c == caller)
-        .map(|(_, cap)| *cap)
+        .chain(caller::FLOOR)
+        .map(|(c, cap)| (*c, *cap))
+}
+
+/// Whether `caller` may spend inside the runs' share (its cap still holds).
+pub fn has_floor(caller: &str) -> bool {
+    caller::FLOOR.iter().any(|(c, _)| *c == caller)
 }
 
 /// GitHub's hourly REST budget for one installation, as its last response
@@ -230,7 +254,7 @@ pub fn decide(
     if priority(caller) == Priority::Foreground {
         return Spend::Go;
     }
-    if let Some(b) = budget.filter(|b| !b.is_past(now)) {
+    if let Some(b) = budget.filter(|b| !b.is_past(now) && !has_floor(caller)) {
         if b.background_left() == 0 {
             return Spend::Hold {
                 why: Hold::ReservedForRuns,
@@ -266,6 +290,7 @@ pub fn allowance(
             };
             let of_cap = cap.saturating_sub(spent_this_hour);
             match budget.filter(|b| !b.is_past(now)) {
+                Some(b) if has_floor(caller) => of_cap.min(b.remaining),
                 Some(b) => of_cap.min(b.background_left()),
                 None => of_cap,
             }
@@ -403,6 +428,46 @@ mod tests {
         names.sort();
         names.dedup();
         assert_eq!(names.len(), caller::BACKGROUND.len());
+    }
+
+    #[test]
+    fn the_release_floor_spends_inside_the_runs_share_up_to_its_own_cap() {
+        let c = caller::SWEEP_SECURITY_FLOOR;
+        assert_eq!(priority(c), Priority::Background);
+        // Below the reserve, where every sweep is held, the floor goes on.
+        assert_eq!(
+            decide(caller::SWEEP_SECURITY, budget(2_000), None, 0, NOW),
+            Spend::Hold {
+                why: Hold::ReservedForRuns,
+                wait_secs: 1_800
+            }
+        );
+        assert_eq!(decide(c, budget(2_000), None, 0, NOW), Spend::Go);
+        assert_eq!(allowance(c, budget(2_000), None, 10, NOW), 50);
+        // ...up to its own cap, then it waits for the next hour.
+        let cap = hourly_cap(c).unwrap();
+        assert!(matches!(
+            decide(c, budget(2_000), None, cap, NOW),
+            Spend::Hold {
+                why: Hold::HourlyCap,
+                ..
+            }
+        ));
+        // A spent limit holds it like everyone else.
+        assert!(matches!(
+            decide(c, budget(0), Some(NOW + 60), 0, NOW),
+            Spend::Hold {
+                why: Hold::LimitSpent,
+                ..
+            }
+        ));
+        // Every floor together is a small part of the smallest budget, and
+        // no floor is also a plain sweep.
+        let all: u64 = caller::FLOOR.iter().map(|(_, c)| c).sum();
+        assert!(all <= SMALLEST_LIMIT / 50, "{all}");
+        assert!(caller::FLOOR
+            .iter()
+            .all(|(f, _)| !caller::BACKGROUND.iter().any(|(b, _)| b == f)));
     }
 
     #[test]

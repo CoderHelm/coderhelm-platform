@@ -301,9 +301,11 @@ async fn one_budget_runs_first_sweeps_last() {
             "!budget.allows(state, c.installation_id, need).await",
         ),
         (include_str!("../security_fixes.rs"), "|| self.gh.held()"),
+        // The release asks too, and reads its floor's few while held
+        // (`bj_release_through_a_busy_hour`).
         (
             include_str!("../security_release.rs"),
-            "|| self.cx.gh.held()",
+            "fn held(&self) -> bool {\n        // The sweep's share",
         ),
         (include_str!("../skills.rs"), "if !force && gh.held() {"),
     ] {
