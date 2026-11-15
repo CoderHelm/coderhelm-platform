@@ -493,6 +493,21 @@ pub async fn run(state: &WorkerState, msg: ReleaseStepsMessage) -> Result<(), Bo
                         }
                     }
                 }
+                if s.kind == Kind::Check {
+                    let st = &mut rec.steps[i];
+                    page_check(
+                        state,
+                        &github,
+                        &msg.team_id,
+                        owner,
+                        repo,
+                        pr,
+                        &msg.run_id,
+                        st,
+                    )
+                    .await;
+                    continue;
+                }
                 if s.tool.is_empty() {
                     // A deploy that runs on merge: only waited for.
                     let st = &mut rec.steps[i];
@@ -594,6 +609,63 @@ pub async fn run(state: &WorkerState, msg: ReleaseStepsMessage) -> Result<(), Bo
         send(state, &next_msg, d).await;
     }
     Ok(())
+}
+
+/// A release check: each page loaded (`check_url`) and searched for its
+/// terms; done when all return 200 with every term.
+#[allow(clippy::too_many_arguments)]
+async fn page_check(
+    state: &WorkerState,
+    github: &GitHubClient,
+    team_id: &str,
+    owner: &str,
+    repo: &str,
+    pr: u64,
+    run_id: &str,
+    s: &mut Step,
+) {
+    let web = super::web_check::WebCheck::load(
+        state,
+        team_id,
+        &format!("{owner}/{repo}"),
+        "CoderHelm (release steps)",
+        pr,
+        &s.urls.join(" "),
+    )
+    .await
+    .with_run(run_id, "release steps".to_string());
+    let mut bad: Vec<String> = Vec::new();
+    for u in &s.urls {
+        match web.verify_find(state, github, u, &s.find).await {
+            Ok(c) => {
+                let st = c.status().unwrap_or(0);
+                let absent: Vec<&str> = c
+                    .found
+                    .iter()
+                    .filter(|(_, h)| h.is_empty())
+                    .map(|(t, _)| t.as_str())
+                    .collect();
+                if st != 200 || !absent.is_empty() {
+                    bad.push(format!(
+                        "{u}: {st}{}",
+                        if absent.is_empty() {
+                            String::new()
+                        } else {
+                            format!(", lacks \"{}\"", absent.join("\", \""))
+                        }
+                    ));
+                }
+            }
+            Err(e) => bad.push(format!("{u}: {}", e.text())),
+        }
+    }
+    if bad.is_empty() {
+        s.status = Status::Done;
+        s.detail = format!("{} page(s) return 200 with every term", s.urls.len());
+    } else {
+        s.status = Status::Failed;
+        s.detail = bad.join("; ");
+    }
 }
 
 /// The count a step's query returns now on its environment's dataset.

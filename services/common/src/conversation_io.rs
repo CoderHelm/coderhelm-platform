@@ -225,6 +225,47 @@ impl JiraChannel<'_> {
     }
 }
 
+/// The Jira account id behind a comment: its author id, or the author
+/// field when an older app put the id there.
+pub fn jira_id_of(h: &Heard) -> String {
+    let id = h.author_id.trim();
+    if !id.is_empty() {
+        return id.to_string();
+    }
+    let a = h.author.trim();
+    if crate::requester::is_jira_account_id(a) {
+        a.to_string()
+    } else {
+        String::new()
+    }
+}
+
+impl JiraChannel<'_> {
+    /// The display name kept for a Jira account (the gateway keeps every
+    /// named user a webhook shows), when there is one.
+    async fn jira_user_name(&self, account_id: &str) -> Option<String> {
+        let out = self
+            .dynamo
+            .get_item()
+            .table_name(self.settings_table)
+            .key(
+                "pk",
+                aws_sdk_dynamodb::types::AttributeValue::S(self.team_id.to_string()),
+            )
+            .key(
+                "sk",
+                aws_sdk_dynamodb::types::AttributeValue::S(crate::requester::jira_user_sk(
+                    account_id,
+                )),
+            )
+            .send()
+            .await
+            .ok()?;
+        let name = out.item()?.get("name")?.as_s().ok()?.trim().to_string();
+        (!name.is_empty() && !crate::requester::is_jira_account_id(&name)).then_some(name)
+    }
+}
+
 #[async_trait::async_trait]
 impl Channel for JiraChannel<'_> {
     fn place(&self) -> Place {
@@ -237,20 +278,31 @@ impl Channel for JiraChannel<'_> {
             client: self.dynamo,
             table: self.settings_table,
         };
-        let heard = crate::ticket_comments::Store::of_ticket(&store, self.team_id, &self.ticket)
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .map(|c| Heard {
-                id: c.comment_id,
-                author: c.author,
-                author_id: c.author_id,
-                parent_id: c.parent_id,
-                text: c.text,
-                at_ms: ms_of(&c.at),
-                ..Default::default()
-            })
-            .collect();
+        let mut heard: Vec<Heard> =
+            crate::ticket_comments::Store::of_ticket(&store, self.team_id, &self.ticket)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|c| Heard {
+                    id: c.comment_id,
+                    author: c.author,
+                    author_id: c.author_id,
+                    parent_id: c.parent_id,
+                    text: c.text,
+                    at_ms: ms_of(&c.at),
+                    ..Default::default()
+                })
+                .collect();
+        // An older Jira app sends the account id where the name belongs: the
+        // name CoderHelm has seen for that account is shown instead.
+        for h in heard.iter_mut() {
+            let id = jira_id_of(h);
+            if crate::conversation::shown_name(&h.author).is_empty() && !id.is_empty() {
+                if let Some(name) = self.jira_user_name(&id).await {
+                    h.author = name;
+                }
+            }
+        }
         Ok(View { said, heard })
     }
 

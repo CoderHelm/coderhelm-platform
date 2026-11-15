@@ -309,10 +309,59 @@ impl Delivery {
     }
 }
 
+/// The person gate's last check on a chat message: every text in it goes
+/// through `person_gate::sink`, so an item CoderHelm can do itself never
+/// reaches a channel. A taken-out item is logged as the writer's defect.
+pub fn sink_message(msg: &Message, what: &str) -> Message {
+    fn text(t: &str, out: &mut Vec<String>) -> String {
+        let s = crate::person_gate::sink(t);
+        out.extend(s.sent_back);
+        s.text
+    }
+    fn blocks(b: &[Block], out: &mut Vec<String>) -> Vec<Block> {
+        b.iter()
+            .map(|b| match b {
+                Block::Banner {
+                    text: t,
+                    tone,
+                    size,
+                } => Block::Banner {
+                    text: text(t, out),
+                    tone: *tone,
+                    size: *size,
+                },
+                Block::Text(t) => Block::Text(Text {
+                    text: text(&t.text, out),
+                    ..t.clone()
+                }),
+                Block::Group {
+                    blocks: inner,
+                    spacing,
+                } => Block::Group {
+                    blocks: blocks(inner, out),
+                    spacing: *spacing,
+                },
+                other => other.clone(),
+            })
+            .collect()
+    }
+    let mut taken: Vec<String> = Vec::new();
+    let m = Message {
+        summary: text(&msg.summary, &mut taken),
+        blocks: blocks(&msg.blocks, &mut taken),
+        ..msg.clone()
+    };
+    if !taken.is_empty() {
+        tracing::error!(what, items = ?taken, "person gate defect: a chat message handed people work CoderHelm can do; taken out");
+    }
+    m
+}
+
 /// Post `msg` to every channel of `to`, at the same time. Each channel's
 /// failure is logged and reported, and never stops the other channel or the
 /// caller.
 pub async fn deliver(poster: &dyn Poster, to: &Channels, msg: &Message, what: &str) -> Delivery {
+    let msg = &sink_message(msg, what);
     let send = |kind: ChannelKind| async move {
         let url = to.get(kind)?;
         let result = poster.post(url, &kind.render(msg)).await;

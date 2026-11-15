@@ -8227,16 +8227,55 @@ async fn set_run_complete(
     // A requirement the ticket needs that no connection let CoderHelm do
     // leaves the run open: it ends as needing that outside change, never as
     // completed, and the note says what is not done and the access to grant.
-    let left = super::outside_exec::left_undone(state, team_id, run_id).await;
-    let status = end_status(&left);
-    if !left.is_empty() {
+    let undone = super::outside_exec::left_undone(state, team_id, run_id).await;
+    // Steps CoderHelm can still do: it goes back to them (another way when
+    // a tool is down) instead of ending, a bounded number of times.
+    if !undone.left.doable.is_empty()
+        && undone.retries < super::outside_exec::MAX_OWN_RETRIES
+        && undone.installation_id > 0
+        && super::outside_exec::retry_own(state, team_id, run_id).await
+    {
         super::add_progress_note(
             state,
             team_id,
             run_id,
             &format!(
-                "Not done: {} requirement(s) still need access CoderHelm doesn't have; the pull request and the ticket list them at the top, with the access to grant",
-                left.len()
+                "Continuing: {} outside step(s) CoderHelm can still do ({}); trying them again",
+                undone.left.doable.len(),
+                undone.left.doable.join("; ")
+            ),
+        )
+        .await;
+        let msg = ResumeMessage {
+            team_id: team_id.to_string(),
+            run_id: run_id.to_string(),
+            installation_id: undone.installation_id,
+            model_retries: 0,
+            github_wait: Default::default(),
+        };
+        Box::pin(send_delayed_resume(state, &msg, 120)).await;
+        return;
+    }
+    let status = end_status(&undone.left);
+    if status != common::run_status::COMPLETED {
+        super::add_progress_note(
+            state,
+            team_id,
+            run_id,
+            &format!(
+                "Waiting on a person for {} item(s) only a person can do; the pull request and the ticket name each once",
+                undone.left.human.len()
+            ),
+        )
+        .await;
+    } else if !undone.left.doable.is_empty() {
+        super::add_progress_note(
+            state,
+            team_id,
+            run_id,
+            &format!(
+                "CoderHelm's own outside steps are not finished ({}): its own problem, on this page; nothing is asked of a person",
+                undone.left.doable.join("; ")
             ),
         )
         .await;
@@ -8280,11 +8319,13 @@ async fn set_run_complete(
 
 /// How a run whose CI passed ends: completed, or (with requirements left
 /// that need access CoderHelm lacks) needing that outside change.
-fn end_status(left: &[String]) -> &'static str {
-    if left.is_empty() {
-        "completed"
-    } else {
+fn end_status(left: &super::outside_work::Left) -> &'static str {
+    // Waiting on a person needs at least one item the gate let through and
+    // nothing CoderHelm can still do.
+    if common::person_gate::may_wait_on_person(left.human.len(), left.doable.len()) {
         super::fix_location::STATUS_OUTSIDE
+    } else {
+        "completed"
     }
 }
 
@@ -8294,11 +8335,22 @@ mod end_status_tests {
 
     #[test]
     fn a_requirement_left_for_a_person_keeps_the_run_from_completing() {
-        assert_eq!(end_status(&[]), "completed");
+        use crate::passes::outside_work::Left;
+        assert_eq!(end_status(&Left::default()), "completed");
+        let human = Left {
+            human: vec!["1. Replace the hero on production".to_string()],
+            doable: Vec::new(),
+        };
         assert_eq!(
-            end_status(&["1. Replace the hero on production".to_string()]),
+            end_status(&human),
             crate::passes::fix_location::STATUS_OUTSIDE
         );
+        // Never waits on a person while CoderHelm holds steps it can do.
+        let both = Left {
+            doable: vec!["Read the preview run".to_string()],
+            ..human
+        };
+        assert_eq!(end_status(&both), "completed");
     }
 }
 

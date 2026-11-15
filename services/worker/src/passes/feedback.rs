@@ -3724,7 +3724,10 @@ pub(crate) async fn close_own_pr_outside(
         .expression_attribute_values(":t", super::attr_s(&now))
         .expression_attribute_values(":cp", super::attr_s("done"))
         .expression_attribute_values(":fl", super::attr_s(FixLocation::OutsideCode.as_str()))
-        .expression_attribute_values(":rep", super::attr_s(&report))
+        .expression_attribute_values(
+            ":rep",
+            super::attr_s(&common::person_gate::sink(&report).text),
+        )
         .ended_values()
         .send()
         .await;

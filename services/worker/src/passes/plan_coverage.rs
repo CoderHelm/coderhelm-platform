@@ -1207,9 +1207,14 @@ mod tests {
         };
         let f = outside_findings(Some(&d));
         assert_eq!(f.len(), 1);
-        assert!(f[0]
-            .detail
-            .starts_with("Not done by this run: 1. Replace the hero on production"));
+        // A missing write connection is a permission only a person grants.
+        assert!(
+            f[0].detail.starts_with(
+                "Not done by this run (a person's step): 1. Replace the hero on production"
+            ),
+            "{}",
+            f[0].detail
+        );
         assert!(f[0].detail.contains("no production CMS write connection"));
     }
 

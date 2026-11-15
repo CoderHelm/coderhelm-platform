@@ -36,6 +36,15 @@ pub const PLAN_KEY_FILE: &str = "plan_key.txt";
 pub const PLAN_RUN_FILE: &str = "plan_run.txt";
 
 /// Records `run_id` as the run whose plan the cached files are.
+/// The tools the outside steps use, whose health the planner is told.
+const OUTSIDE_TOOLS: &[&str] = &[
+    "check_url",
+    "query_content",
+    "github_history",
+    "start_workflow",
+    "write_content",
+];
+
 pub async fn mark_plan_run(state: &WorkerState, msg: &TicketMessage, run_id: &str) {
     let prefix = crate::passes::openspec_prefix(
         &msg.team_id,
@@ -617,6 +626,11 @@ Then the ```fix_location.json block described above."#,
         tools.push(t);
     }
     full_system.push_str(&abilities.prompt_section());
+    // Tools that failed on this installation in the last few minutes: the
+    // plan goes around them, never through a person.
+    full_system.push_str(&common::tool_health::prompt_section(
+        &common::tool_health::degraded_now(msg.installation_id, OUTSIDE_TOOLS),
+    ));
     // Instructions written for a person's machine, and the steps the plan
     // writes for after the pull request: one rule for every step.
     full_system.push_str(&common::host_steps::section(

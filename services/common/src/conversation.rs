@@ -388,18 +388,31 @@ pub fn how_for(place: &Place, to: &Heard) -> How {
     }
 }
 
+/// The name a reply shows for an author: never a tracker's account id
+/// (an older Jira app sent the account id where the name belongs). Empty
+/// when only an id is known; the channel resolves ids to names on read.
+pub fn shown_name(author: &str) -> &str {
+    let n = author.trim().trim_start_matches('@');
+    if crate::requester::is_jira_account_id(n) {
+        ""
+    } else {
+        n
+    }
+}
+
 /// The reply's text: it opens on the person's comment (quoted and linked,
 /// or with a mention), never as a bare new comment.
 pub fn reply_body(to: &Heard, others: &[Heard], how: How, ack: &str, text: &str) -> String {
     let quote = cut_words(&one_line(&visible(&to.text)), QUOTE_CHARS);
-    let name = to.author.trim().trim_start_matches('@');
+    let name = shown_name(&to.author);
     let name = if name.is_empty() { "there" } else { name };
     let also: Vec<String> = others
         .iter()
         .filter(|o| o.id != to.id)
+        .filter(|o| !shown_name(&o.author).is_empty())
         .map(|o| match how {
-            How::Quote | How::Thread => format!("@{}", o.author.trim_start_matches('@')),
-            How::MentionQuote => o.author.clone(),
+            How::Quote | How::Thread => format!("@{}", shown_name(&o.author)),
+            How::MentionQuote => shown_name(&o.author).to_string(),
         })
         .collect();
     let also = if also.is_empty() {
@@ -416,6 +429,9 @@ pub fn reply_body(to: &Heard, others: &[Heard], how: How, ack: &str, text: &str)
                 format!("[your comment]({})", to.url)
             };
             format!("> {quote}\n\n@{name}, replying to {link}.{also}")
+        }
+        How::MentionQuote if name == "there" => {
+            format!("Replying to your comment (\"{quote}\").{also}")
         }
         How::MentionQuote => format!("{name}, replying to your comment (\"{quote}\").{also}"),
     };
@@ -904,6 +920,52 @@ pub async fn speak(
     speak_with(ch, judge, None, say, now_ms).await
 }
 
+/// The last check before a comment is written: every item it addresses to
+/// a person goes through the person gate again (`person_gate::sink`). One
+/// a person was not to get is taken out and logged as a defect of the
+/// writer upstream; it never reaches the thread.
+pub fn sink_decision(decision: Decision, thread: &str) -> Decision {
+    let clean = |body: String| {
+        let sunk = crate::person_gate::sink(&body);
+        if sunk.defect() {
+            tracing::error!(
+                thread,
+                taken_out = sunk.sent_back.len(),
+                items = ?sunk.sent_back,
+                "person gate defect: a comment handed people work CoderHelm can do; taken out before posting"
+            );
+        }
+        sunk.text
+    };
+    match decision {
+        Decision::Edit { id, body, meta } => Decision::Edit {
+            id,
+            body: clean(body),
+            meta,
+        },
+        Decision::Post { body, meta } => Decision::Post {
+            body: clean(body),
+            meta,
+        },
+        Decision::Reply {
+            to,
+            others,
+            how,
+            ack,
+            text,
+            meta,
+        } => Decision::Reply {
+            to,
+            others,
+            how,
+            ack,
+            text: clean(text),
+            meta,
+        },
+        d => d,
+    }
+}
+
 /// [`speak`] for a reply to a person: when the guards decide to answer
 /// someone, `compose` writes the words from the thread and the run's
 /// records (`crate::reply_compose`), held to the same guards.
@@ -929,6 +991,7 @@ pub async fn speak_with(
     if let Some(c) = compose {
         decision = Box::pin(crate::reply_compose::apply(c, &view, say, &place, decision)).await;
     }
+    let decision = sink_decision(decision, &place.key());
     match decision {
         Decision::Quiet { why } => {
             tracing::info!(thread = %place.key(), slot = %say.slot, why = %why, "Nothing new to say on the thread");

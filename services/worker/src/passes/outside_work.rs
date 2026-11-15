@@ -510,9 +510,15 @@ impl Abilities {
              permissions say to ask, CoderHelm raises an approval card and waits for it; needing \
              approval is never a reason to hand a step to a person.\n\
              3. Only what no connection or permission lets CoderHelm do at all goes to a person \
-             (`by: person`), each with `why_person` (the exact connection or permission missing) \
-             and `grant` (how to give CoderHelm that access). Such a requirement is reported as \
-             not done.\n\
+             (`by: person`), each with `reason` (one gate code: credential, grant, \
+             irreversible_choice, held_by_another, approval, outside_reach), `why_person` (the \
+             exact connection or permission missing) and `grant` (how to give CoderHelm that \
+             access). `by` defaults to coderhelm. Reading workflow runs and PR comments, running \
+             or re-running checks and end-to-end tests, labels, page checks, posting lists on the \
+             ticket and tagging a release after an approval are always CoderHelm's (`by: \
+             coderhelm`, `tool`: check_url, github_history, run_checks, start_workflow). A \
+             production release is one CoderHelm step that waits for one approval, never a \
+             person's step. A tool that fails is CoderHelm's to work around, never a person's.\n\
              Give every step `kind` (deploy, e2e, content, migration, verify, other) and `target` \
              (staging, production): the run decides each step's action from them.\n",
         );
@@ -569,6 +575,9 @@ pub enum Doer {
 }
 
 impl Doer {
+    /// The executor a step names. CoderHelm unless the step names a
+    /// person: a step with no executor, or one the planner wrote in other
+    /// words, is CoderHelm's (a person is asked only for a gate reason).
     pub fn parse(s: &str) -> Doer {
         match s
             .trim()
@@ -577,8 +586,10 @@ impl Doer {
             .as_str()
         {
             "this_pr" | "pr" | "change" => Doer::ThisPr,
-            "coderhelm" | "run" | "agent" => Doer::CoderHelm,
-            _ => Doer::Person,
+            "person" | "a_person" | "human" | "people" | "vendor" | "third_party" | "team" => {
+                Doer::Person
+            }
+            _ => Doer::CoderHelm,
         }
     }
 }
@@ -640,6 +651,115 @@ pub struct NoteStep {
     /// `outside_exec`): waiting on an approval card or a workflow run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run: Option<StepRun>,
+    /// For a person: the gate's reason code (`common::person_gate::Reason`:
+    /// credential, grant, irreversible_choice, held_by_another, approval,
+    /// outside_reach). A person step without one goes back to the planner.
+    #[serde(default)]
+    pub reason: String,
+    /// The tool or route CoderHelm uses for it (`check_url`,
+    /// `github_history`, `run_checks`, a workflow file).
+    #[serde(default)]
+    pub tool: String,
+}
+
+/// The reason codes a person step may give.
+pub fn reason_codes() -> Vec<&'static str> {
+    common::person_gate::REASONS
+        .iter()
+        .map(|r| r.code())
+        .collect()
+}
+
+// ── What a check step checks, from its own words ────────────────────────────
+
+/// Whether a query is GROQ (what the CMS read API takes): it starts with a
+/// filter, a projection, a function or a parameter. A page check written as
+/// a "query" (`check_url https://... find [...]`) is not, and sending it to
+/// the CMS is what made every check of one run fail with a 400.
+pub fn is_groq(q: &str) -> bool {
+    let t = q.trim().trim_matches('`').trim();
+    if t.is_empty() || t.contains("check_url") || t.starts_with("http") {
+        return false;
+    }
+    t.starts_with("*[")
+        || t.starts_with('*')
+        || t.starts_with('{')
+        || t.starts_with('$')
+        || t.starts_with("count(")
+        || t.starts_with("defined(")
+        || t.starts_with("array::")
+        || t.starts_with("math::")
+        || t.starts_with("string::")
+        || t.starts_with("select(")
+}
+
+/// The https URLs a text names, with `{a,b}` written out into one URL each.
+pub fn urls_in(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for raw in text.split(|c: char| c.is_whitespace() || c == '`' || c == '(' || c == ')') {
+        let w = raw.trim_matches(|c: char| ",;'\"[]".contains(c));
+        let w = w.trim_end_matches('.');
+        if !w.starts_with("https://") {
+            continue;
+        }
+        for u in expand_braces(w) {
+            if !out.contains(&u) {
+                out.push(u);
+            }
+        }
+    }
+    out
+}
+
+fn expand_braces(u: &str) -> Vec<String> {
+    let (Some(a), Some(b)) = (u.find('{'), u.find('}')) else {
+        return vec![u.to_string()];
+    };
+    if b < a {
+        return vec![u.to_string()];
+    }
+    let (head, opts, tail) = (&u[..a], &u[a + 1..b], &u[b + 1..]);
+    opts.split(',')
+        .flat_map(|o| expand_braces(&format!("{head}{}{tail}", o.trim())))
+        .collect()
+}
+
+/// The terms a page check looks for: the quoted strings after `find`.
+pub fn find_terms_in(text: &str) -> Vec<String> {
+    let lower = text.to_lowercase();
+    let Some(at) = lower.find("find") else {
+        return Vec::new();
+    };
+    quoted(&text[at..])
+}
+
+/// The quoted strings in a text ('a', "b", `c` are not included: code).
+pub fn quoted(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for q in ['\'', '"'] {
+        let mut parts = text.split(q);
+        parts.next();
+        while let Some(inside) = parts.next() {
+            let t = inside.trim();
+            if !t.is_empty() && t.len() <= 120 && !out.iter().any(|o| o == t) {
+                out.push(t.to_string());
+            }
+            parts.next();
+        }
+    }
+    out
+}
+
+/// A command a step runs in the sandbox (`sandbox: cd e2e && npx eslint
+/// ...`), when its `how` names one.
+pub fn sandbox_command(how: &str) -> Option<String> {
+    let h = how.trim();
+    let h = h
+        .strip_prefix("sandbox:")
+        .unwrap_or(h)
+        .trim()
+        .trim_matches('`');
+    common::pr_steps::is_check_command(h).then(|| h.to_string())
 }
 
 /// What a step is, from the planner's structured `kind`.
@@ -1127,11 +1247,35 @@ pub fn gaps(c: &OutsideChange, a: &Abilities, plan: PlanFacts) -> Vec<String> {
             ));
         }
         if s.doer() == Doer::Person {
-            if s.why_person.trim().is_empty() || s.grant.trim().is_empty() {
+            if !justified(s) {
                 out.push(format!(
                     "Step {n} (`{}`) goes to a person without saying why CoderHelm can't do it \
-                     (`why_person`: the exact permission or connection it lacks) and how to grant \
-                     it (`grant`). Do it in the change or as a CoderHelm step instead when you can.",
+                     (`reason`: one of {}; `why_person`: the exact permission or connection it \
+                     lacks) and how to grant it (`grant`). Do it in the change or as a CoderHelm \
+                     step instead when you can.",
+                    one_line(&s.step),
+                    reason_codes().join(", ")
+                ));
+            }
+            // A person step whose work is a CoderHelm tool's.
+            let t = format!("{} {}", s.step, s.how).to_lowercase();
+            if [
+                "check_url",
+                "github_history",
+                "workflow run",
+                "re-run",
+                "rerun",
+                "page check",
+                "post the list",
+                "post on the ticket",
+            ]
+            .iter()
+            .any(|w| t.contains(w))
+            {
+                out.push(format!(
+                    "Step {n} (`{}`) is work CoderHelm's own tools do (reading workflow runs, \
+                     checking pages, re-running checks, posting on the ticket): make it `by: \
+                     coderhelm` with the `tool`.",
                     one_line(&s.step)
                 ));
             }
@@ -1336,6 +1480,17 @@ pub fn step_now(c: &OutsideChange, i: usize, pr_open: bool) -> Option<Step> {
     };
     let (owner, state) = match s.doer() {
         Doer::ThisPr => return None,
+        // "Only if X: ..." is a person's only once X is found: CoderHelm
+        // checks X first (its own check steps), and until then nobody acts.
+        Doer::Person if conditional(&s.step).is_some() && s.result.trim().is_empty() => (
+            "CoderHelm".to_string(),
+            State::Waiting {
+                on: format!(
+                    "only if {}, which its checks find out first",
+                    conditional(&s.step).unwrap_or_default()
+                ),
+            },
+        ),
         Doer::Person => (
             match one_line(&s.owner) {
                 o if o.is_empty() => "a person on the team".to_string(),
@@ -1363,11 +1518,40 @@ pub fn step_now(c: &OutsideChange, i: usize, pr_open: bool) -> Option<Step> {
                         place: "on the Agent permissions page".to_string(),
                     },
                 )
+            } else if run_state == RELEASE {
+                // The release steps hold it: the production tag waits for
+                // one approval after the merge; what follows it runs then.
+                if s.step_kind() == StepKind::Deploy {
+                    (
+                        "a team admin".to_string(),
+                        State::Approval {
+                            who: "a team admin".to_string(),
+                            place: "after the merge, on the Agent permissions page (yes or no; CoderHelm prepares the tag and cuts it on yes)".to_string(),
+                        },
+                    )
+                } else {
+                    (
+                        "CoderHelm".to_string(),
+                        State::Waiting {
+                            on: "after the production release deploys (the release steps)"
+                                .to_string(),
+                        },
+                    )
+                }
             } else if run_state == "running" {
                 (
                     "CoderHelm".to_string(),
                     State::Waiting {
                         on: "when the workflow it started ends".to_string(),
+                    },
+                )
+            } else if s.adds_labels_only() && s.result.contains("start workflows") {
+                // Adding labels needs no Actions permission: a refusal to
+                // start a workflow is not this step's, which runs again.
+                (
+                    "CoderHelm".to_string(),
+                    State::Waiting {
+                        on: "on its next step (labels need no workflow permission)".to_string(),
                     },
                 )
             } else if !s.result.trim().is_empty() {
@@ -1379,10 +1563,12 @@ pub fn step_now(c: &OutsideChange, i: usize, pr_open: bool) -> Option<Step> {
                     }
                     None => pr_steps::plain_error(why),
                 };
+                // Who would act only matters when the cause is a permission
+                // or a credential; anything else stays CoderHelm's.
                 let owner = if unblock.contains("GitHub") || unblock.contains("Settings") {
                     "a repository admin"
                 } else {
-                    "a person on the team"
+                    "CoderHelm"
                 };
                 (owner.to_string(), State::Failed { cause, unblock })
             } else {
@@ -1395,9 +1581,14 @@ pub fn step_now(c: &OutsideChange, i: usize, pr_open: bool) -> Option<Step> {
                             StepKind::Deploy | StepKind::Content | StepKind::Migration
                         )
                 });
+                // The step it waits for, by its words: a number means nothing
+                // to a reader who sees only some of the steps.
                 let mut on = match (pr_open, blocked_by) {
                     (false, _) => "when the pull request opens".to_string(),
-                    (true, Some(b)) => format!("once step {} is done", b + 1),
+                    (true, Some(b)) => format!(
+                        "once \"{}\" is done",
+                        one_line(&c.steps[b].step).trim_end_matches('.')
+                    ),
                     (true, None) => "on its next step".to_string(),
                 };
                 // A production step is asked for first: who approves, where.
@@ -1413,8 +1604,14 @@ pub fn step_now(c: &OutsideChange, i: usize, pr_open: bool) -> Option<Step> {
             }
         }
     };
-    // What the step needs to be done right is part of what it is.
+    // What the step needs to be done right is part of what it is. A
+    // condition that was found true is not repeated to the person.
     let mut what = one_line(&s.step);
+    if s.doer() == Doer::Person && conditional(&s.step).is_some() {
+        if let Some((_, rest)) = what.split_once([':', ',']) {
+            what = rest.trim().to_string();
+        }
+    }
     let mut extra: Vec<String> = Vec::new();
     if !s.values.is_empty() {
         extra.push(format!(
@@ -1465,6 +1662,22 @@ pub fn step_now(c: &OutsideChange, i: usize, pr_open: bool) -> Option<Step> {
         owner,
         state,
     })
+}
+
+/// The executor's state for a step the release steps hold.
+pub const RELEASE: &str = "release";
+
+/// The condition of an "Only if X: ..." or "If X, ..." step.
+pub fn conditional(step: &str) -> Option<String> {
+    let t = one_line(step);
+    let l = t.to_lowercase();
+    let rest = l
+        .strip_prefix("only if ")
+        .or_else(|| l.strip_prefix("if "))?;
+    let end = rest.find([':', ',']).unwrap_or(rest.len());
+    let start = l.len() - rest.len();
+    let cond = t.get(start..start + end).unwrap_or(&rest[..end]).trim();
+    (!cond.is_empty()).then(|| cond.to_string())
 }
 
 /// Every step outside the pull request, each in its one state. A check
@@ -1691,6 +1904,72 @@ pub fn note_markdown(c: &OutsideChange) -> String {
     out
 }
 
+/// The ticket's comment for the outside work, in the plain style: what
+/// CoderHelm did, what it does next, and the one thing needed from a person
+/// (if any). The full report (every step, its evidence) is on the run page
+/// and the pull request, never dumped into the ticket.
+pub fn ticket_note(c: &OutsideChange) -> String {
+    let steps = steps_now(c, c.placed.is_some());
+    let done: Vec<String> = steps
+        .iter()
+        .filter(|s| matches!(s.state, State::Done { .. }))
+        .map(|s| short(&s.what))
+        .collect();
+    let needed = pr_steps::needed(&steps);
+    let approvals: Vec<&Step> = steps
+        .iter()
+        .filter(|s| matches!(s.state, State::Approval { .. }))
+        .collect();
+    let next = steps
+        .iter()
+        .filter(|s| {
+            matches!(s.state, State::Waiting { .. } | State::Failed { .. }) && !s.needs_person()
+        })
+        .count();
+    let mut out = String::new();
+    if !done.is_empty() {
+        out.push_str(&format!("Done outside the code: {}.\n", done.join("; ")));
+    }
+    if next > 0 || !approvals.is_empty() {
+        out.push_str(&format!(
+            "CoderHelm does the other {} step(s) itself{}.\n",
+            next,
+            if approvals.is_empty() {
+                String::new()
+            } else {
+                "; the production release waits for one approval after the merge".to_string()
+            }
+        ));
+    }
+    // An approval the release waits on is one of these, said once.
+    let asks = needed;
+    match asks.len() {
+        0 => out.push_str(&format!(
+            "**Needed from you:** {}\n",
+            pr_steps::NOTHING_NEEDED
+        )),
+        1 => out.push_str(&format!("**Needed from you:** {}\n", asks[0])),
+        _ => {
+            out.push_str("**Needed from you:**\n");
+            for (i, a) in asks.iter().enumerate() {
+                out.push_str(&format!("{}. {a}\n", i + 1));
+            }
+        }
+    }
+    out
+}
+
+fn sentence(s: &str) -> String {
+    one_line(s).trim_end_matches(['.', ';']).to_string()
+}
+
+fn short(s: &str) -> String {
+    let t = sentence(s);
+    let t = t.split(" (").next().unwrap_or(&t).to_string();
+    let t = t.split(", then").next().unwrap_or(&t).to_string();
+    common::truncate_str(&t, 90).to_string()
+}
+
 // ── Requirements a person holds, for the plan check ─────────────────────────
 
 /// What the plan check counts for the outside steps.
@@ -1710,23 +1989,174 @@ pub fn held(c: &OutsideChange) -> Held {
     let mut h = Held::default();
     for (i, s) in c.steps.iter().enumerate() {
         let (line, owner) = step_line(i + 1, s);
+        // Every step is read through the gate, as the note reads it: what
+        // the plan check counts as a person's is what a person is shown.
+        let gated = step_now(c, i, true);
+        let for_person = gated.as_ref().is_some_and(Step::needs_person);
         match s.doer() {
             Doer::ThisPr => {}
             Doer::CoderHelm => {
-                if !s.done && !s.result.trim().is_empty() && !under_way(s) {
-                    h.not_done.push(line);
+                if !s.done && !s.result.trim().is_empty() && !under_way(s) && !released(s) {
+                    if for_person {
+                        h.by_person.push(format!("{line} (owner: {owner})"));
+                    } else {
+                        h.not_done.push(line);
+                    }
                 }
             }
             Doer::Person => {
-                if s.why_person.trim().is_empty() || s.grant.trim().is_empty() {
+                if conditional(&s.step).is_some() && s.result.trim().is_empty() {
+                    continue;
+                }
+                if !justified(s) {
                     h.unjustified.push(format!("{line} (owner: {owner})"));
-                } else {
+                } else if for_person {
                     h.by_person.push(format!("{line} (owner: {owner})"));
+                } else {
+                    h.not_done.push(line);
                 }
             }
         }
     }
     h
+}
+
+/// Whether a person step says why: a gate reason code, or a reason and the
+/// access that would let CoderHelm.
+pub fn justified(s: &NoteStep) -> bool {
+    reason_codes().contains(&s.reason.trim())
+        || (!s.why_person.trim().is_empty() && !s.grant.trim().is_empty())
+}
+
+/// Whether the release steps hold a step.
+pub fn released(s: &NoteStep) -> bool {
+    s.run.as_ref().is_some_and(|r| r.state == RELEASE)
+}
+
+/// What the run leaves, read through the gate: items only a person can do
+/// (each one line, as a person reads it) and steps CoderHelm can still do.
+/// A run waits on a person only with the first and none of the second
+/// (`common::person_gate::may_wait_on_person`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Left {
+    pub human: Vec<String>,
+    pub doable: Vec<String>,
+}
+
+pub fn left(c: &OutsideChange) -> Left {
+    let mut l = Left::default();
+    let steps = steps_now(c, true);
+    l.human = pr_steps::needed(&steps);
+    for (i, s) in c.steps.iter().enumerate() {
+        if s.done || s.doer() == Doer::ThisPr || under_way(s) || released(s) {
+            continue;
+        }
+        let Some(st) = step_now(c, i, true) else {
+            continue;
+        };
+        if st.needs_person() || matches!(st.state, State::Waiting { .. } | State::Approval { .. }) {
+            continue;
+        }
+        if st.for_review().is_some() {
+            continue;
+        }
+        l.doable.push(one_line(&s.step));
+    }
+    l
+}
+
+/// Before anything runs or is posted: every step a person was to do goes
+/// through the gate, and one a person was not to get becomes CoderHelm's,
+/// with the tool its words name. One executor for every outside step.
+pub fn classify(c: &mut OutsideChange) -> usize {
+    let mut moved = 0;
+    for i in 0..c.steps.len() {
+        let s = &c.steps[i];
+        if s.doer() != Doer::Person || s.done {
+            continue;
+        }
+        if conditional(&s.step).is_some() {
+            continue;
+        }
+        let human = step_now(c, i, true).is_some_and(|st| st.needs_person());
+        if human {
+            continue;
+        }
+        let s = &mut c.steps[i];
+        s.by = "coderhelm".to_string();
+        if s.tool.trim().is_empty() {
+            s.tool = tool_named(&format!("{} {}", s.step, s.how));
+        }
+        s.why_person.clear();
+        s.grant.clear();
+        s.reason.clear();
+        moved += 1;
+    }
+    moved
+}
+
+/// The tool a step's words name, for a step moved to CoderHelm.
+fn tool_named(text: &str) -> String {
+    let t = text.to_lowercase();
+    for (w, tool) in [
+        ("check_url", "check_url"),
+        ("page check", "check_url"),
+        ("github_history", "github_history"),
+        ("workflow", "github_history"),
+        ("label", "add_labels"),
+        ("e2e", "start_workflow"),
+        ("eslint", "run_checks"),
+        ("lint", "run_checks"),
+        ("test", "run_checks"),
+    ] {
+        if t.contains(w) {
+            return tool.to_string();
+        }
+    }
+    String::new()
+}
+
+/// Clears the last attempt of every step CoderHelm can still do (not done,
+/// not a person's, not held by the release steps), so the executor tries
+/// it again. Returns how many.
+pub fn reopen_own(c: &mut OutsideChange) -> usize {
+    let mut n = 0;
+    for i in 0..c.steps.len() {
+        let s = &c.steps[i];
+        if s.done || s.doer() != Doer::CoderHelm || under_way(s) || released(s) {
+            continue;
+        }
+        if s.result.trim().is_empty() {
+            continue;
+        }
+        let person = step_now(c, i, true).is_some_and(|st| st.needs_person());
+        if person {
+            continue;
+        }
+        let s = &mut c.steps[i];
+        s.result.clear();
+        s.run = None;
+        n += 1;
+    }
+    n
+}
+
+/// What the run's gate counted for its outside steps, for the run's
+/// hand-off analytics: what was handed to a person is what was counted.
+pub fn counts(c: &OutsideChange) -> common::person_gate::Counts {
+    let mut k = common::person_gate::Counts::default();
+    let mut steps = steps_now(c, true);
+    steps.extend(person_checks(c));
+    for st in &steps {
+        if st.needs_person() {
+            k.human += 1;
+        } else if st.for_review().is_some() {
+            k.review += 1;
+        } else {
+            k.done += 1;
+        }
+    }
+    k
 }
 
 /// The questions a person is asked for each step handed out with no
@@ -1736,10 +2166,7 @@ pub fn unjustified_questions(c: &OutsideChange) -> Vec<common::run_questions::Qu
     c.steps
         .iter()
         .enumerate()
-        .filter(|(_, s)| {
-            s.doer() == Doer::Person
-                && (s.why_person.trim().is_empty() || s.grant.trim().is_empty())
-        })
+        .filter(|(_, s)| s.doer() == Doer::Person && !justified(s))
         .enumerate()
         .map(|(q, (i, s))| common::run_questions::Question {
             id: format!("q{}", q + 1),
@@ -1764,13 +2191,6 @@ pub fn unjustified_questions(c: &OutsideChange) -> Vec<common::run_questions::Qu
             ..Default::default()
         })
         .collect()
-}
-
-/// The requirements the run leaves not done, each with why and the access
-/// to grant: steps a person holds and CoderHelm steps that didn't work.
-pub fn not_done_lines(c: &OutsideChange) -> Vec<String> {
-    let h = held(c);
-    h.by_person.into_iter().chain(h.not_done).collect()
 }
 
 const NOT_DONE_START: &str = "<!-- coderhelm:not-done:start -->";
@@ -1817,7 +2237,10 @@ pub fn under_way(s: &NoteStep) -> bool {
 /// under way.
 pub fn unfinished(c: &OutsideChange) -> bool {
     c.steps.iter().any(|s| {
-        s.doer() == Doer::CoderHelm && !s.done && (s.result.trim().is_empty() || under_way(s))
+        s.doer() == Doer::CoderHelm
+            && !s.done
+            && !released(s)
+            && (s.result.trim().is_empty() || under_way(s))
     })
 }
 
@@ -1934,13 +2357,110 @@ pub enum Action {
     Dispatch(Route),
     /// Add this label to the PR, which starts the route.
     Label(String, Route),
-    /// Run the confirm query.
-    Query,
+    /// Run this GROQ query on the CMS read API.
+    Query(String),
+    /// Load these pages and look for these terms (`check_url`).
+    PageCheck {
+        urls: Vec<String>,
+        find: Vec<String>,
+    },
+    /// Read the pull request head's workflow runs with these names (all
+    /// of them when empty) and report each one's conclusion; a skipped one
+    /// is started again.
+    ReadRuns(Vec<String>),
+    /// A check of the change (a lint, a test, a build): the pull request's
+    /// own checks run it on the head; their results are read.
+    HeadChecks(String),
+    /// The production release (the tag under approval, the cache purge, the
+    /// checks after it): the release steps do it after the merge.
+    Release,
     /// Write content (mutations or a migration's file) to the target's CMS
     /// through a write connection.
     Write(Target),
     /// CoderHelm can't do it: why, and how to grant it.
     Cannot(String),
+}
+
+/// Whether a step belongs to the release after the merge: a production
+/// deploy or tag, a cache purge, or a check of production or of anything
+/// "after merge".
+pub fn for_release(s: &NoteStep) -> bool {
+    let t = s.text();
+    let purge = t.contains("purge");
+    let prod = s.target() == Target::Production;
+    match s.step_kind() {
+        StepKind::Deploy => prod,
+        StepKind::Content | StepKind::Migration => false,
+        _ => purge || (prod && (t.contains("check") || t.contains("confirm"))),
+    }
+}
+
+/// What a check step does, from its own words: never another step's query.
+pub fn check_action(s: &NoteStep, a: &Abilities, c: &OutsideChange) -> Action {
+    let words = format!("{} {} {}", s.step, s.how, s.values.join(" "));
+    let t = words.to_lowercase();
+    if let Some(q) = [s.how.as_str(), s.step.as_str()]
+        .into_iter()
+        .map(|x| {
+            x.trim()
+                .trim_start_matches("query:")
+                .trim()
+                .trim_matches('`')
+        })
+        .find(|x| is_groq(x))
+    {
+        return if a.source.is_some() {
+            Action::Query(q.to_string())
+        } else {
+            Action::Cannot("no CMS project id and dataset are named in the repository's config or codegen environment; add them to the codegen environment (Settings, repository, codegen environment)".to_string())
+        };
+    }
+    if t.contains("github_history")
+        || t.contains("workflow_runs")
+        || t.contains("workflow run")
+        || t.contains("not skipped")
+        || (t.contains(" ran ") && t.contains("passed"))
+    {
+        let names: Vec<String> = quoted(&s.step)
+            .into_iter()
+            .filter(|n| n.len() >= 3 && !n.contains(".ts") && !n.contains('/'))
+            .collect();
+        return Action::ReadRuns(names);
+    }
+    if let Some(cmd) = sandbox_command(&s.how) {
+        return Action::HeadChecks(cmd);
+    }
+    let page = t.contains("check_url") || t.contains("page check") || t.contains("read check");
+    let mut urls = urls_in(&words);
+    let mut find = find_terms_in(&words);
+    if page || !urls.is_empty() {
+        // Pages on the preview, named only in words: the preview's
+        // end-to-end run loads them on the head.
+        if urls.is_empty() && t.contains("preview") {
+            return Action::ReadRuns(Vec::new());
+        }
+        // The step's own pages; else the confirm's page check.
+        if urls.is_empty() {
+            if let Some(f) = c.confirm.as_ref() {
+                urls = urls_in(&f.query);
+                if find.is_empty() {
+                    find = find_terms_in(&f.query);
+                }
+            }
+        }
+        if urls.is_empty() {
+            return Action::ReadRuns(Vec::new());
+        }
+        return Action::PageCheck { urls, find };
+    }
+    match c.confirm.as_ref().map(|f| f.query.trim()) {
+        Some(q) if a.source.is_some() && is_groq(q) => Action::Query(q.to_string()),
+        Some(q) if !urls_in(q).is_empty() => Action::PageCheck {
+            urls: urls_in(q),
+            find: find_terms_in(q),
+        },
+        _ => Action::ReadRuns(Vec::new()),
+    }
 }
 
 /// Whether a route deploys staging.
@@ -1984,6 +2504,16 @@ pub fn action_for(s: &NoteStep, a: &Abilities, c: &OutsideChange) -> Action {
             _ => Action::Dispatch(r),
         })
     };
+    // The production release is the release steps' (the tag under
+    // approval, the purge, the checks after it), when the repository says
+    // how it releases.
+    if for_release(s)
+        && a.release
+            .deploy(super::release_plan::Env::Production)
+            .is_some()
+    {
+        return Action::Release;
+    }
     match s.step_kind() {
         StepKind::Deploy => {
             let fit = |r: &Route| match target {
@@ -1991,11 +2521,13 @@ pub fn action_for(s: &NoteStep, a: &Abilities, c: &OutsideChange) -> Action {
                 Target::Staging => true,
             };
             pick(&a.deploys, &fit).unwrap_or_else(|| {
-                // Said plainly, with the commands a person runs instead.
+                // The studio's scripts are named only for a studio deploy:
+                // an app release is not one.
+                let studio = s.words_deploy();
                 let scripts: Vec<String> = a
                     .deploys
                     .iter()
-                    .filter(|r| r.trigger == Trigger::Script && fit(r))
+                    .filter(|r| studio && r.trigger == Trigger::Script && fit(r))
                     .map(|r| format!("`{}`", r.command))
                     .collect();
                 Action::Cannot(format!(
@@ -2014,20 +2546,7 @@ pub fn action_for(s: &NoteStep, a: &Abilities, c: &OutsideChange) -> Action {
             Action::Cannot("the end-to-end workflow has no workflow_dispatch trigger; add `workflow_dispatch:` to it so CoderHelm can start it".to_string())
         }),
         StepKind::Content | StepKind::Migration => Action::Write(target),
-        StepKind::Verify => {
-            if a.source.is_some() {
-                Action::Query
-            } else {
-                Action::Cannot("no CMS project id and dataset are named in the repository's config or codegen environment; add them to the codegen environment (Settings, repository, codegen environment)".to_string())
-            }
-        }
-        StepKind::Other => {
-            if a.source.is_some() && c.confirm.as_ref().is_some_and(|f| !f.query.is_empty()) {
-                Action::Query
-            } else {
-                Action::Cannot("CoderHelm has no action for this step".to_string())
-            }
-        }
+        StepKind::Verify | StepKind::Other => check_action(s, a, c),
     }
 }
 
@@ -2304,7 +2823,13 @@ mod tests {
     fn each_coderhelm_step_gets_its_action() {
         let (tree, files) = repo();
         let a = abilities(&tree, &files, &[], false);
-        let c = OutsideChange::default();
+        let c = OutsideChange {
+            confirm: Some(Confirm {
+                query: "count(*[_type == \"hero\"])".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
         assert!(matches!(
             action_for(&step("coderhelm", "Deploy the studio schema to staging"), &a, &c),
             Action::Dispatch(r) if r.file.ends_with("studio-staging.yml")
@@ -2315,7 +2840,7 @@ mod tests {
         ));
         assert_eq!(
             action_for(&step("coderhelm", "Confirm with the query"), &a, &c),
-            Action::Query
+            Action::Query("count(*[_type == \"hero\"])".into())
         );
         assert!(matches!(
             action_for(
@@ -2336,7 +2861,13 @@ mod tests {
     fn the_step_kind_and_target_decide_the_action_not_the_wording() {
         let (tree, files) = repo();
         let a = abilities(&tree, &files, &[], true);
-        let c = OutsideChange::default();
+        let c = OutsideChange {
+            confirm: Some(Confirm {
+                query: "*[_type == \"hero\"]{_id}".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
         // Words say "content", the structured kind says deploy: deploy wins.
         let mut s = step("coderhelm", "Publish the new content fields");
         s.kind = "deploy".into();
@@ -2350,7 +2881,10 @@ mod tests {
             "Deploy check: confirm the studio has the field",
         );
         v.kind = "verify".into();
-        assert_eq!(action_for(&v, &a, &c), Action::Query);
+        assert_eq!(
+            action_for(&v, &a, &c),
+            Action::Query("*[_type == \"hero\"]{_id}".into())
+        );
         // The target is structured too: no word "production" needed.
         let mut w = step("coderhelm", "Replace the hero block");
         w.kind = "migration".into();

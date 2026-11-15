@@ -264,7 +264,13 @@ impl Step {
     /// The step as an item for the gate (`person_gate`).
     pub fn ask(&self) -> crate::person_gate::Ask {
         let (why_not, how) = match &self.state {
-            State::Failed { cause, unblock } => (format!("{cause}. {unblock}"), self.how.clone()),
+            State::Failed { cause, unblock } => (
+                format!("{cause}. {unblock}")
+                    .trim()
+                    .trim_end_matches('.')
+                    .to_string(),
+                self.how.clone(),
+            ),
             State::Person { why, unblock } => (format!("{why}. {unblock}"), self.how.clone()),
             State::Approval { who, place } => (
                 format!(
@@ -275,7 +281,12 @@ impl Step {
             _ => (String::new(), self.how.clone()),
         };
         crate::person_gate::Ask {
-            kind: crate::person_gate::Kind::Step,
+            // A step CoderHelm tried is judged by its attempt's cause.
+            kind: if matches!(self.state, State::Failed { .. }) {
+                crate::person_gate::Kind::Attempt
+            } else {
+                crate::person_gate::Kind::Step
+            },
             topic: String::new(),
             text: one_line(&self.what),
             how,
@@ -401,9 +412,39 @@ pub fn needed(steps: &[Step]) -> Vec<String> {
 pub fn others(steps: &[Step]) -> Vec<String> {
     steps
         .iter()
-        .filter(|s| !s.needs_person())
-        .map(Step::line)
+        .filter(|s| !s.needs_person() && s.for_review().is_none())
+        .map(Step::own_line)
         .collect()
+}
+
+/// The sign-offs that belong to the reviewer's merge decision, one line
+/// each, for the pull request's review line (never the ticket).
+pub fn review_lines(steps: &[Step]) -> Vec<String> {
+    steps.iter().filter_map(Step::for_review).collect()
+}
+
+impl Step {
+    /// The step as CoderHelm's own work: a step it tried and will do
+    /// another way says so, never "could not" to a reader who has nothing
+    /// to do.
+    pub fn own_line(&self) -> String {
+        match &self.state {
+            State::Failed { cause, .. } => format!(
+                "{}{}{}. Not done yet ({}); CoderHelm does it another way.",
+                self.when.words(),
+                sentence_part(&plain(&self.what)),
+                self.how_words(),
+                sentence_part(cause)
+            ),
+            State::Person { .. } => format!(
+                "{}{}{}. CoderHelm does this.",
+                self.when.words(),
+                sentence_part(&plain(&self.what)),
+                self.how_words()
+            ),
+            _ => self.line(),
+        }
+    }
 }
 
 /// The markers of the evidence block.

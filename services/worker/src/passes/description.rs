@@ -62,6 +62,17 @@ pub async fn save(
     body: &str,
 ) -> Result<(), Error> {
     let body = clean(body);
+    // The last word before people read it: an item for a person the gate
+    // does not let through is taken out, and logged as the writer's defect.
+    let sunk = common::person_gate::sink(&body);
+    if sunk.defect() {
+        tracing::error!(
+            pr = number,
+            items = ?sunk.sent_back,
+            "person gate defect: a pull request description handed people work CoderHelm can do; taken out"
+        );
+    }
+    let body = sunk.text;
     // What a reader sees first stays first, whoever wrote: the lead, then
     // everything else collapsed (a body never built from facts is left).
     let body = common::pr_layout::layout(&body);

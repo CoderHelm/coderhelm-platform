@@ -932,6 +932,28 @@ impl WebCheck {
         res
     }
 
+    /// [`WebCheck::verify`], looking for `find` in the page.
+    pub async fn verify_find(
+        &self,
+        state: &WorkerState,
+        github: &GitHubClient,
+        u: &str,
+        find: &[String],
+    ) -> Result<Checked, CheckError> {
+        let gate = RepoGate {
+            web: self,
+            search: github,
+        };
+        let (res, ms) = self.checked(&gate, &Net, u, find).await;
+        let (outcome, detail) = outcome_of(&res);
+        if !self.log(state, u, outcome, &detail, ms).await {
+            return Err(CheckError::Failed(
+                "the check could not be recorded, so its result is withheld".into(),
+            ));
+        }
+        res
+    }
+
     /// Writes one call to the team's activity log; false when it failed.
     async fn log(
         &self,

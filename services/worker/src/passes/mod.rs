@@ -8930,7 +8930,10 @@ async fn finish_without_code(
         )
         .expression_attribute_values(":fl", attr_s(decision.effective_location().as_str()))
         .expression_attribute_values(":fd", attr_s(&decision_json))
-        .expression_attribute_values(":rep", attr_s(&format!("{heading}{report}")))
+        .expression_attribute_values(
+            ":rep",
+            attr_s(&common::person_gate::sink(&format!("{heading}{report}")).text),
+        )
         .send()
         .await;
     if usage_res.is_ok() {
@@ -8977,14 +8980,29 @@ async fn report_also_outside(
         );
     let title = "Also needed outside the code";
     add_progress_note(state, &msg.team_id, run_id, title).await;
+    // What the gate made of every step is what the run counts as handed
+    // over: the hand-off analytics read these.
+    if let Some(c) = decision.outside_change.as_ref() {
+        person_gate::record_counts(state, &msg.team_id, run_id, &outside_work::counts(c)).await;
+    }
+    // The ticket gets the short note (what was done, the one thing needed);
+    // the full report stays on the run page and the pull request.
+    let ticket = decision
+        .outside_change
+        .as_ref()
+        .filter(|c| !c.steps.is_empty())
+        .map(outside_work::ticket_note)
+        .unwrap_or_else(|| report.clone());
+    let ticket = sink_for_person(state, &msg.team_id, run_id, &ticket).await;
+    let report = sink_for_person(state, &msg.team_id, run_id, &report).await;
     post_ticket_notice(
         state,
         msg,
         run_id,
         github,
         NOTICE_ALSO_OUTSIDE,
-        &report,
-        &fix_location::jira_text(&report),
+        &ticket,
+        &fix_location::jira_text(&ticket),
         title,
         &[],
     )
@@ -9006,6 +9024,31 @@ async fn report_also_outside(
         .expression_attribute_values(":rep", attr_s(&format!("**{title}**\n\n{report}")))
         .send()
         .await;
+}
+
+/// The sink check for a text the run is about to show people (the ticket,
+/// the run page's outside report): an item a person was not to get is
+/// taken out, logged as a defect, and noted on the run as CoderHelm's work.
+async fn sink_for_person(state: &WorkerState, team_id: &str, run_id: &str, text: &str) -> String {
+    let sunk = common::person_gate::sink(text);
+    if sunk.defect() {
+        error!(
+            run_id,
+            taken_out = sunk.sent_back.len(),
+            "person gate defect: the outside report handed people work CoderHelm can do"
+        );
+        add_progress_note(
+            state,
+            team_id,
+            run_id,
+            &format!(
+                "Kept as CoderHelm's own work (never shown to a person): {}",
+                sunk.sent_back.join("; ")
+            ),
+        )
+        .await;
+    }
+    sunk.text
 }
 
 /// How long the outside steps may wait in this invocation (for an approval
@@ -9122,6 +9165,7 @@ async fn after_pr_outside_work(
             if let Some(f) = &p.failed_e2e {
                 outside_exec::record_failed(state, run_id, f).await;
             }
+            outside_exec::report_problems(state, &msg.team_id, run_id, &p).await;
         }
         report_also_outside(state, msg, run_id, github, decision).await;
     }
