@@ -10,9 +10,9 @@
 //! The images go to the install's own bucket, the record to the settings
 //! table for the head, and the description is rebuilt: its table links each
 //! image through the API with a signed link that expires
-//! ([`screens_for`]). A head keeps the first pair found: its record is
-//! claimed before any image is kept, so a later or concurrent run on the
-//! same head changes nothing.
+//! ([`screens_for`]). A head keeps the first pair found: each run keeps its
+//! images under its own keys, then saves the head's record only when none
+//! is there, so a later or concurrent run on the same head changes nothing.
 
 use std::collections::HashMap;
 
@@ -53,7 +53,7 @@ pub async fn load(state: &WorkerState, team_id: &str, repo: &str, sha: &str) -> 
 /// Saves the record of a head unless one is there; whether this one is.
 /// The record lives as long as its links work.
 async fn claim(state: &WorkerState, team_id: &str, repo: &str, sha: &str, k: &Kept) -> bool {
-    state
+    match state
         .dynamo
         .put_item()
         .table_name(&state.config.settings_table_name)
@@ -67,22 +67,16 @@ async fn claim(state: &WorkerState, team_id: &str, repo: &str, sha: &str, k: &Ke
         .condition_expression("attribute_not_exists(sk)")
         .send()
         .await
-        .is_ok()
-}
-
-/// Drops a claimed record whose images could not be kept, so a later run
-/// on the head can keep its own.
-async fn release(state: &WorkerState, team_id: &str, repo: &str, sha: &str) {
-    if let Err(e) = state
-        .dynamo
-        .delete_item()
-        .table_name(&state.config.settings_table_name)
-        .key("pk", super::attr_s(team_id))
-        .key("sk", super::attr_s(&record_sk(repo, sha)))
-        .send()
-        .await
     {
-        warn!(error = %e, "Could not drop the record of a head whose screenshots were not kept");
+        Ok(_) => true,
+        Err(e) if format!("{e:?}").contains("ConditionalCheckFailed") => {
+            info!(repo, "Another run on this head kept its screenshots first");
+            false
+        }
+        Err(e) => {
+            warn!(error = %e, repo, "Could not save the end-to-end screenshots of a head");
+            false
+        }
     }
 }
 
@@ -267,6 +261,8 @@ async fn put(state: &WorkerState, key: &str, bytes: Vec<u8>) -> bool {
 /// Everything a run on a pull request's head brings for its table.
 pub struct Head<'a> {
     pub msg: &'a TestIngest,
+    /// This run's key in the store.
+    pub run_key: &'a str,
     pub pr: u64,
     pub tests: &'a [ParsedTest],
     /// The reports this run was read from (an upload's report).
@@ -382,6 +378,7 @@ pub async fn keep(
                 &repo,
                 h.pr,
                 &msg.head_sha,
+                h.run_key,
                 &t.id(),
                 side,
                 shots::extension(ct),
@@ -408,16 +405,15 @@ pub async fn keep(
         },
         expires_at: chrono::Utc::now().timestamp() + shots::LINK_VALID_SECS,
     };
-    if !claim(state, &msg.team_id, &repo, &msg.head_sha, &kept).await {
-        info!(repo = %repo, pr = h.pr, "Another run on this head kept its screenshots first");
+    if !put(state, &after_key, after_bytes).await {
         return;
     }
-    let mut kept_all = put(state, &after_key, after_bytes).await;
     if let Some((b, key, _)) = before {
-        kept_all = kept_all && put(state, &key, b).await;
+        if !put(state, &key, b).await {
+            return;
+        }
     }
-    if !kept_all {
-        release(state, &msg.team_id, &repo, &msg.head_sha).await;
+    if !claim(state, &msg.team_id, &repo, &msg.head_sha, &kept).await {
         return;
     }
     info!(repo = %repo, pr = h.pr, test = %kept.test, before = kept.before.is_some(), "End-to-end screenshots kept for the Before and After table");
