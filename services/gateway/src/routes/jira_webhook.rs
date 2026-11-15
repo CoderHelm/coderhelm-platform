@@ -608,13 +608,14 @@ async fn process_jira_payload(
     // will carry.
     let expected_keys = super::trigger_gate::expected_attachment_keys(team_id, ticket_key, payload);
     let context_hash = common::ticket_context_hash(&title, &body_text, &expected_keys);
+    let reopened = super::trigger_gate::jira_reopened(payload);
     match super::trigger_gate::gate_ticket_trigger(
         state,
         team_id,
         ticket_key,
         Some(&context_hash),
         false,
-        super::trigger_gate::jira_reopened(payload),
+        reopened,
     )
     .await
     {
@@ -794,6 +795,9 @@ async fn process_jira_payload(
         requester,
         image_attachments,
         ticket_type: common::messages::ticket_type_of_jira(issue),
+        // Reopening a ticket asks for more work, after a merge too
+        // (`merged_ticket`).
+        after_merge: reopened,
         ..Default::default()
     });
 

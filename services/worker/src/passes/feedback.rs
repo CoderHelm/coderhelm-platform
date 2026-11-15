@@ -3459,6 +3459,7 @@ async fn handle_wrong_repo(
         person_direction: None,
         answers: Vec::new(),
         new_run_id: None,
+        after_merge: false,
     });
 
     if state.config.ticket_queue_url.is_empty() {
@@ -4012,6 +4013,7 @@ fn run_ticket_message(
         person_direction: None,
         answers: Vec::new(),
         new_run_id: None,
+        after_merge: false,
     }
 }
 

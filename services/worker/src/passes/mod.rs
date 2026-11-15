@@ -2107,6 +2107,12 @@ async fn run_passes(
         }
         ticket_history::add_earlier_prs(&mut history, &github, &repos, &msg.ticket_id).await;
     }
+    // A ticket whose pull request already merged gets no second run unless
+    // a person asked for one after the merge (`common::merged_ticket`):
+    // stopped here, before a repo is picked or anything is built.
+    if stop_if_already_merged(state, msg, run_id, &github, &history, usage, start).await {
+        return Ok(());
+    }
 
     // --- Resolve repo for Jira tickets ---
     // For Jira: explicit pin on the message > the repo of the ticket's own
@@ -9644,6 +9650,153 @@ async fn stop_run_repo_not_enabled(
         &wait,
         &judged,
         supervisor::HumanOnly::MissingAccess,
+    )
+    .await;
+}
+
+/// The merged-ticket rule (`common::merged_ticket`), before a fresh run on
+/// a person's ticket does any work: when a pull request for the ticket
+/// already merged, the run stops, says which one merged where and how to
+/// run the ticket anyway, and waits on a person. A run a person asked for
+/// after the merge goes on, and its record says so, so its retries and
+/// later runs on the ticket aren't stopped by the same merge. `true` when
+/// it stopped the run.
+async fn stop_if_already_merged(
+    state: &WorkerState,
+    msg: &TicketMessage,
+    run_id: &str,
+    github: &GitHubClient,
+    history: &ticket_history::TicketHistory,
+    usage: &TokenUsage,
+    start: &std::time::Instant,
+) -> bool {
+    use common::merged_ticket as mt;
+    if msg.same_run() || !mt::guards(&msg.source, &msg.ticket_id) {
+        return false;
+    }
+    let merged = history.merged_prs();
+    let allowed = history.allowed_after_merge();
+    let Some(pr) = mt::blocking(&merged, false, &allowed).cloned() else {
+        return false;
+    };
+    if msg.after_merge || msg.person_direction.is_some() {
+        info!(run_id, pr = %pr.subject(), "The ticket's pull request merged; a person asked for this run anyway");
+        if let Err(e) = state
+            .dynamo
+            .update_item()
+            .table_name(&state.config.runs_table_name)
+            .key("team_id", attr_s(&msg.team_id))
+            .key("run_id", attr_s(run_id))
+            .update_expression("SET #am = :t")
+            .expression_attribute_names("#am", mt::FIELD_AFTER_MERGE)
+            .expression_attribute_values(":t", AttributeValue::Bool(true))
+            .send()
+            .await
+        {
+            warn!(run_id, error = %e, "Could not record that a person asked for the run after the merge");
+        }
+        add_progress_note(
+            state,
+            &msg.team_id,
+            run_id,
+            &format!(
+                "{} already merged for this ticket; a person asked for this run anyway, so it goes on",
+                pr.subject()
+            ),
+        )
+        .await;
+        return false;
+    }
+    let message = mt::refusal(&msg.source, &msg.ticket_id, &pr);
+    stop_run_already_merged(state, msg, run_id, github, usage, start, &pr, &message).await;
+    true
+}
+
+/// Stops a run the merged-ticket rule refused: the reason on the run and
+/// the ticket, the merged pull request on the record, and the run waiting
+/// on a person (whether more work is due after a merge is theirs to say).
+#[allow(clippy::too_many_arguments)]
+async fn stop_run_already_merged(
+    state: &WorkerState,
+    msg: &TicketMessage,
+    run_id: &str,
+    github: &GitHubClient,
+    usage: &TokenUsage,
+    start: &std::time::Instant,
+    pr: &common::merged_ticket::MergedPr,
+    message: &str,
+) {
+    use common::merged_ticket as mt;
+    info!(run_id, ticket_id = %msg.ticket_id, pr = %pr.subject(), "Run stopped: the ticket's pull request already merged");
+    add_progress_note(state, &msg.team_id, run_id, message).await;
+    if let Err(e) = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(&msg.team_id))
+        .key("run_id", attr_s(run_id))
+        .update_expression("SET stop_kind = :k, #mp = :p")
+        .expression_attribute_names("#mp", mt::FIELD_MERGED_PR)
+        .expression_attribute_values(":k", attr_s(mt::STOP_KIND))
+        .expression_attribute_values(":p", attr_s(&serde_json::to_string(pr).unwrap_or_default()))
+        .send()
+        .await
+    {
+        warn!(run_id, error = %e, "Could not record the merged pull request on the run");
+    }
+    match msg.source {
+        TicketSource::Jira => {
+            if let Err(e) = crate::passes::conversation::jira(
+                state,
+                &msg.team_id,
+                &msg.ticket_id,
+                common::conversation::Say::status("run", message),
+                "clarification",
+                "Already merged",
+            )
+            .await
+            .map(|_| ())
+            {
+                warn!(run_id, error = %e, "Could not post the already-merged Jira comment");
+            }
+        }
+        TicketSource::Github if msg.issue_number > 0 => {
+            if let Err(e) = crate::passes::conversation::github(
+                github,
+                &msg.repo_owner,
+                &msg.repo_name,
+                msg.issue_number,
+                common::conversation::Say::status("run", message),
+            )
+            .await
+            {
+                warn!(run_id, error = %e, "Could not post the already-merged issue comment");
+            }
+        }
+        _ => {}
+    }
+    let wait = WaitingOn::fixed(mt::WAIT_ACTION, message, "");
+    // Whether more work is due after a merge is a person's decision:
+    // recorded as the judge's, no model call.
+    let judged = stop_judge::cannot_proceed(
+        state,
+        &msg.team_id,
+        &stop_judge::run_subject(run_id),
+        stop_judge::Kind::Stop,
+        mt::STOP_KIND,
+        message,
+    )
+    .await;
+    mark_run_needs_input(
+        state,
+        msg,
+        run_id,
+        usage,
+        start,
+        &[],
+        &wait,
+        &judged,
+        supervisor::HumanOnly::ProductDecision,
     )
     .await;
 }

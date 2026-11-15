@@ -499,6 +499,7 @@ async fn start_fix(
         person_direction: None,
         answers: Vec::new(),
         new_run_id: None,
+        after_merge: false,
     };
     let Ok(body) = serde_json::to_string(&crate::models::WorkerMessage::Ticket(ticket)) else {
         return false;

@@ -31,7 +31,15 @@
 //!   run, and the closed run stays as history
 //! - a ticket a person marked done on the ticket itself ("fixed in the
 //!   booking system") stays done until its content changes
-//! - a failed / retried latest run never blocks
+//! - a run CoderHelm stopped because the ticket's pull request had already
+//!   merged (`common::merged_ticket`) counts as merged: a ticket edit starts
+//!   nothing, so it never refuses again and again; reopening the ticket
+//!   (which carries `after_merge`) or Retry on that run starts the work
+//! - a failed / retried latest run doesn't block, until
+//!   [`MAX_FAILED_RUNS_IN_A_ROW`] runs in a row have failed: then an event
+//!   that leaves the ticket unchanged starts nothing (a field or status
+//!   change used to start the same failing run every time). A content
+//!   change, a reopen, a person's Retry or command still start one
 //! - explicit human triggers (slash commands, comment retries) skip the
 //!   content check but still respect in-flight blocking
 
@@ -73,6 +81,11 @@ struct LatestRun<'a> {
     context_hash: Option<&'a str>,
     /// The hash of the newest edit already sent to the run's open PR.
     seen_hash: Option<&'a str>,
+    /// Why the run stopped, when it recorded one (`stop_kind`).
+    stop_kind: &'a str,
+    /// Runs in a row, newest first, that failed (or failed and a person
+    /// retried them), this one included.
+    failed_in_a_row: usize,
 }
 
 impl LatestRun<'_> {
@@ -83,8 +96,11 @@ impl LatestRun<'_> {
             && !matches!(self.pr_outcome, "closed" | "merged")
     }
 
+    /// Its PR merged, or it stopped because the ticket's PR had merged.
     fn merged(&self) -> bool {
-        self.status == "merged" || self.pr_outcome == "merged"
+        self.status == "merged"
+            || self.pr_outcome == "merged"
+            || self.stop_kind == common::merged_ticket::STOP_KIND
     }
 
     /// Its PR closed without merging. A cancelled run's PR was closed by a
@@ -120,9 +136,22 @@ enum Decision {
     ToOpenPr,
 }
 
+/// Failed runs in a row on one ticket after which an event that leaves the
+/// ticket unchanged starts no further run.
+pub const MAX_FAILED_RUNS_IN_A_ROW: usize = 3;
+
 fn decide(latest: &LatestRun, new_hash: Option<&str>, reopened: bool) -> Decision {
     if !handled(latest.status) {
-        // failed / retried: allow retry
+        // failed / retried: allow a retry, up to the cap while unchanged
+        if latest.failed_in_a_row >= MAX_FAILED_RUNS_IN_A_ROW
+            && !reopened
+            && !latest.changed(new_hash)
+        {
+            return Decision::Skip(
+                "its last runs failed and the ticket is unchanged; an edit, a reopen or a \
+                 person's Retry starts another",
+            );
+        }
         return Decision::Enqueue;
     }
     if latest.pr_open() {
@@ -309,6 +338,16 @@ pub async fn gate_ticket_trigger(
         pr_outcome: s("pr_outcome").unwrap_or(""),
         context_hash: s("context_hash"),
         seen_hash: s(SEEN_HASH_FIELD),
+        stop_kind: s("stop_kind").unwrap_or(""),
+        failed_in_a_row: failed_in_a_row(
+            items
+                .iter()
+                .map(|i| {
+                    let id = i.get("run_id").and_then(|v| v.as_s().ok()).cloned();
+                    (id.unwrap_or_default(), status_of(i))
+                })
+                .collect(),
+        ),
     };
     match decide(&run, new_context_hash, reopened) {
         Decision::Enqueue => {
@@ -375,6 +414,16 @@ pub async fn gate_ticket_trigger(
             })
         }
     }
+}
+
+/// How many of the ticket's runs in a row, newest first, failed (or failed
+/// and a person retried them), from `(run_id, status)` in any order. Run
+/// ids are ULIDs, which sort by creation time.
+fn failed_in_a_row(mut runs: Vec<(String, String)>) -> usize {
+    runs.sort_by(|a, b| b.0.cmp(&a.0));
+    runs.iter()
+        .take_while(|(_, status)| matches!(status.as_str(), "failed" | "retried"))
+        .count()
 }
 
 /// The run record's field holding the hash of the newest ticket edit sent
@@ -453,7 +502,10 @@ pub fn expected_attachment_keys(
 
 #[cfg(test)]
 mod tests {
-    use super::{decide, edit_note, handled, jira_reopened, Decision, LatestRun, OpenPr};
+    use super::{
+        decide, edit_note, failed_in_a_row, handled, jira_reopened, Decision, LatestRun, OpenPr,
+        MAX_FAILED_RUNS_IN_A_ROW,
+    };
 
     fn run<'a>(status: &'a str, pr: u64, outcome: &'a str, hash: &'a str) -> LatestRun<'a> {
         LatestRun {
@@ -462,7 +514,72 @@ mod tests {
             pr_outcome: outcome,
             context_hash: Some(hash),
             seen_hash: None,
+            stop_kind: "",
+            failed_in_a_row: 0,
         }
+    }
+
+    /// A run stopped because the ticket's PR had already merged: an edit
+    /// starts nothing (no refusal after refusal); a reopen starts the work.
+    #[test]
+    fn a_run_stopped_as_already_merged_counts_as_merged() {
+        let stopped = LatestRun {
+            stop_kind: common::merged_ticket::STOP_KIND,
+            ..run("needs_input", 0, "", "h1")
+        };
+        assert!(matches!(
+            decide(&stopped, Some("h2"), false),
+            Decision::Skip(_)
+        ));
+        assert!(matches!(
+            decide(&stopped, Some("h1"), false),
+            Decision::Skip(_)
+        ));
+        assert_eq!(decide(&stopped, Some("h1"), true), Decision::Enqueue);
+        // Any other needs_input still runs again on a content change.
+        assert_eq!(
+            decide(&run("needs_input", 0, "", "h1"), Some("h2"), false),
+            Decision::Enqueue
+        );
+    }
+
+    /// The same failing run used to start on every field or status change.
+    #[test]
+    fn failed_runs_in_a_row_stop_restarting_on_an_unchanged_ticket() {
+        let below = LatestRun {
+            failed_in_a_row: MAX_FAILED_RUNS_IN_A_ROW - 1,
+            ..run("failed", 0, "", "h1")
+        };
+        assert_eq!(decide(&below, Some("h1"), false), Decision::Enqueue);
+        let capped = LatestRun {
+            failed_in_a_row: MAX_FAILED_RUNS_IN_A_ROW,
+            ..run("failed", 0, "", "h1")
+        };
+        assert!(matches!(
+            decide(&capped, Some("h1"), false),
+            Decision::Skip(_)
+        ));
+        assert!(matches!(decide(&capped, None, false), Decision::Skip(_)));
+        // New content, or a reopen, starts one.
+        assert_eq!(decide(&capped, Some("h2"), false), Decision::Enqueue);
+        assert_eq!(decide(&capped, Some("h1"), true), Decision::Enqueue);
+    }
+
+    #[test]
+    fn failures_in_a_row_count_from_the_newest_run() {
+        let r = |id: &str, s: &str| (id.to_string(), s.to_string());
+        // Out of order on purpose: ids sort by creation time.
+        assert_eq!(
+            failed_in_a_row(vec![
+                r("01C", "failed"),
+                r("01A", "failed"),
+                r("01D", "retried"),
+                r("01B", "completed"),
+            ]),
+            2
+        );
+        assert_eq!(failed_in_a_row(vec![r("01A", "completed")]), 0);
+        assert_eq!(failed_in_a_row(vec![]), 0);
     }
 
     /// The prod duplicate: a Jira edit one second before the merge, while

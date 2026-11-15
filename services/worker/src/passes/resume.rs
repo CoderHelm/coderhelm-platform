@@ -3919,6 +3919,7 @@ async fn fix_context(
         person_direction: None,
         answers: Vec::new(),
         new_run_id: None,
+        after_merge: false,
     };
 
     let provider = ModelProvider::load_for_team(

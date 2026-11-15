@@ -43,6 +43,9 @@ pub struct PriorRun {
     pub pr_list: Vec<common::run_prs::RunPr>,
     /// The open pull request the run ended as covered by, if it did.
     pub covered_by: Option<common::stop_rules::covering::Record>,
+    /// A person asked for the run after the ticket's pull request merged
+    /// (`common::merged_ticket`).
+    pub after_merge: bool,
 }
 
 impl PriorRun {
@@ -93,6 +96,8 @@ pub struct EarlierPr {
     pub title: String,
     pub author: String,
     pub branch: String,
+    /// The branch it targets (for a merged one: the branch it merged into).
+    pub base: String,
     /// `open`, `merged` or `closed` (without merging).
     pub state: String,
     pub created_at: String,
@@ -216,6 +221,48 @@ impl TicketHistory {
 
     pub fn is_empty(&self) -> bool {
         self.runs.is_empty() && self.notes.is_empty() && self.prs.is_empty()
+    }
+
+    /// Every merged pull request for the ticket: the ones read from GitHub
+    /// (any author, any base branch), and any an earlier run's record says
+    /// merged that couldn't be read.
+    pub fn merged_prs(&self) -> Vec<common::merged_ticket::MergedPr> {
+        let mut out: Vec<common::merged_ticket::MergedPr> = self
+            .prs
+            .iter()
+            .filter(|p| p.state == "merged")
+            .map(|p| common::merged_ticket::MergedPr {
+                repo: p.repo.clone(),
+                number: p.number,
+                base: p.base.clone(),
+                merged_at: p.closed_at.clone(),
+            })
+            .collect();
+        for r in &self.runs {
+            let merged = r.pr_outcome == "merged" || r.status == common::run_status::MERGED;
+            let read = self
+                .prs
+                .iter()
+                .any(|p| p.number == r.pr_number && p.repo.eq_ignore_ascii_case(&r.repo));
+            if merged && r.pr_number > 0 && r.repo.contains('/') && !read {
+                out.push(common::merged_ticket::MergedPr {
+                    repo: r.repo.clone(),
+                    number: r.pr_number,
+                    ..Default::default()
+                });
+            }
+        }
+        out
+    }
+
+    /// Earlier runs a person asked for after the ticket's pull request
+    /// merged, by id.
+    pub fn allowed_after_merge(&self) -> Vec<&str> {
+        self.runs
+            .iter()
+            .filter(|r| r.after_merge)
+            .map(|r| r.run_id.as_str())
+            .collect()
     }
 
     /// Every earlier pull request for the ticket as `(repo, number)`: the
@@ -616,6 +663,11 @@ fn prior_run(item: &Item) -> PriorRun {
             .unwrap_or_default(),
         pr_list: common::run_prs::from_item(item),
         covered_by: serde_json::from_str(&s(item, "covered_by")).ok(),
+        after_merge: item
+            .get(common::merged_ticket::FIELD_AFTER_MERGE)
+            .and_then(|v| v.as_bool().ok())
+            .copied()
+            .unwrap_or(false),
     }
 }
 
@@ -790,6 +842,7 @@ pub(crate) async fn read_pr(
         title: text(&pr["title"]),
         author: text(&pr["user"]["login"]),
         branch: text(&pr["head"]["ref"]),
+        base: text(&pr["base"]["ref"]),
         state: state.to_string(),
         created_at: text(&pr["created_at"]),
         body: common::truncate_str(pr["body"].as_str().unwrap_or(""), 6000).to_string(),
@@ -989,6 +1042,54 @@ mod tests {
             created_at: at.into(),
             ..Default::default()
         }
+    }
+
+    /// Every merged PR for the ticket stops a new run: read from GitHub
+    /// (any author, its base branch kept), or named merged by a run record
+    /// when GitHub couldn't be read; never one listed twice.
+    #[test]
+    fn merged_pull_requests_come_from_github_and_the_run_records() {
+        let mut integration = earlier("acme/web", 5, "pat", "merged", "2026-10-01");
+        integration.base = "integration".into();
+        integration.closed_at = "2026-10-02T08:00:00Z".into();
+        let h = TicketHistory {
+            runs: vec![
+                PriorRun {
+                    run_id: "01A".into(),
+                    repo: "acme/web".into(),
+                    pr_number: 5,
+                    pr_outcome: "merged".into(),
+                    ..Default::default()
+                },
+                PriorRun {
+                    run_id: "01B".into(),
+                    repo: "acme/api".into(),
+                    pr_number: 3,
+                    status: "merged".into(),
+                    after_merge: true,
+                    ..Default::default()
+                },
+                PriorRun {
+                    run_id: "01C".into(),
+                    repo: "acme/api".into(),
+                    pr_number: 4,
+                    pr_outcome: "closed".into(),
+                    ..Default::default()
+                },
+            ],
+            prs: vec![
+                integration,
+                earlier("acme/web", 9, "coderhelm[bot]", "open", "2026-10-03"),
+            ],
+            ..Default::default()
+        };
+        let merged = h.merged_prs();
+        assert_eq!(merged.len(), 2, "{merged:?}");
+        assert_eq!(merged[0].subject(), "acme/web#5");
+        assert_eq!(merged[0].base, "integration");
+        assert_eq!(merged[0].merged_at, "2026-10-02T08:00:00Z");
+        assert_eq!(merged[1].subject(), "acme/api#3");
+        assert_eq!(h.allowed_after_merge(), vec!["01B"]);
     }
 
     /// A re-run continues on CoderHelm's own open PR in the same repo: the
