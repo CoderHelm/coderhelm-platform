@@ -221,6 +221,8 @@ pub mod problems;
 /// Where this deployment's dashboard and API are (links, redirects, webhooks).
 pub mod public_urls;
 pub mod registry_check;
+/// What CoderHelm says back to a person, written from the thread and the run's records.
+pub mod reply_compose;
 /// Who asked for a run: one identity per person, for per-person analytics.
 pub mod requester;
 /// What the reviewer did while it read a pull request, for the session page.
