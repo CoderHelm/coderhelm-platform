@@ -1324,6 +1324,10 @@ pub enum Skip {
     ForAPerson(String),
     /// AWS's side and still happening: tried again next sweep.
     Watching,
+    /// The error is at its usual rate ([`crate::log_triage`]): recorded,
+    /// nobody is told and no fix starts; looked at again next sweep. The
+    /// decision's reason.
+    Usual(String),
     /// The analyzer's checks say the error stopped while the service kept
     /// logging: nothing to fix now. Tried again if it comes back. What the
     /// checks found ([`activity_words`]).
@@ -1361,6 +1365,10 @@ impl Skip {
             Skip::Recovered(at) => format!("stopped on its own at {at}; nothing to change"),
             Skip::ForAPerson(why) => why.clone(),
             Skip::Watching => "on AWS's side; watching until it recovers".into(),
+            Skip::Usual(why) => format!(
+                "{}; counted, nothing to do unless it rises",
+                why.trim_end_matches('.')
+            ),
             Skip::Stopped(what) if what.is_empty() => {
                 "the error stopped; a fix starts if it comes back".into()
             }
@@ -1379,7 +1387,11 @@ impl Skip {
     pub fn auto_status(&self) -> &'static str {
         if matches!(
             self,
-            Skip::QuietHours | Skip::Watching | Skip::Stopped(_) | Skip::RepoPending
+            Skip::QuietHours
+                | Skip::Watching
+                | Skip::Usual(_)
+                | Skip::Stopped(_)
+                | Skip::RepoPending
         ) {
             "waiting"
         } else {

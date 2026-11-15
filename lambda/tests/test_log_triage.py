@@ -5,8 +5,6 @@ import json
 import unittest
 from datetime import datetime, timedelta, timezone
 
-from botocore.exceptions import ClientError
-
 from test_log_analyzer import h
 from test_log_attribution import ACCOUNT, NOW, FakeInsights, Patch, Table
 
@@ -49,12 +47,19 @@ class Calls:
         }])
 
 
+class Refused(Exception):
+    """DynamoDB's refusal of a condition, as boto3 raises it (whatever
+    botocore the test run loaded)."""
+
+    response = {"Error": {"Code": "ConditionalCheckFailedException"}}
+
+
 class BudgetTable(Table):
     """A table whose hourly analysis budget is spent."""
 
     def update_item(self, **kw):
         if kw["Key"]["sk"].startswith(T.BUDGET_PREFIX) and "calls" in kw["UpdateExpression"]:
-            raise ClientError({"Error": {"Code": "ConditionalCheckFailedException"}}, "UpdateItem")
+            raise Refused()
         super().update_item(**kw)
 
 
@@ -158,6 +163,26 @@ class Decisions(unittest.TestCase):
         self.assertEqual(back["days_seen"], 0)
         self.assertTrue(T.notifies(back, reopened=True))
         self.assertFalse(T.notifies(back))
+
+
+CASES = __import__("pathlib").Path(__file__).resolve().parents[2] / "services/common/tests/fixtures/log_triage_cases.json"
+
+
+class SharedCases(unittest.TestCase):
+    """The worker reads the same cases (common::log_triage)."""
+
+    def test_every_case_decides_the_same(self):
+        for c in json.loads(CASES.read_text())["cases"]:
+            item = None if c.get("new") else {"daily_lines": [
+                {"name": (NOW_DT.date() - timedelta(days=i + 1)).strftime("%Y-%m-%d"), "lines": n}
+                for i, n in enumerate(c["history"])
+            ] or [{"name": "1999-01-01", "lines": 1}]}
+            d = T.decide(item, c["lines"], NOW_DT, is_new=bool(c.get("new")), severity=c.get("severity", ""))
+            self.assertEqual((d["decision"], d["reason"]), (c["decision"], c["reason"]), c["name"])
+            if "notifies_new" in c:
+                self.assertEqual(T.notifies(d, is_new=True), c["notifies_new"], c["name"])
+            if "notifies_reopened" in c:
+                self.assertEqual(T.notifies(d, reopened=True), c["notifies_reopened"], c["name"])
 
 
 class SeenAgain(unittest.TestCase):

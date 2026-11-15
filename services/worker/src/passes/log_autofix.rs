@@ -583,7 +583,8 @@ async fn record(
     now: DateTime<Utc>,
     report: &mut Report,
 ) {
-    let again = matches!(skip, Skip::Watching | Skip::RepoPending) && f.auto_status == "waiting";
+    let again = matches!(skip, Skip::Watching | Skip::RepoPending | Skip::Usual(_))
+        && f.auto_status == "waiting";
     if !skip.recorded() || again {
         return;
     }
@@ -633,6 +634,23 @@ async fn act(
         }
         return;
     };
+
+    // At its usual rate (the error happens most days and this is no more):
+    // counted on the findings, nobody is told and no fix starts. Looked at
+    // again next sweep, so a rise is caught.
+    if inc.diagnosis.usual && plan(&inc.diagnosis) == Plan::Code {
+        let reason = inc
+            .diagnosis
+            .decision
+            .trim_start_matches("Noise: ")
+            .to_string();
+        for m in &inc.members {
+            if let Some((f, _)) = member(m) {
+                record(state, team_id, f, &Skip::Usual(reason.clone()), now, report).await;
+            }
+        }
+        return;
+    }
 
     let mut action: Option<Action> = None;
     let mut started_by: Option<String> = None;

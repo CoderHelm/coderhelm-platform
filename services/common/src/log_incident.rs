@@ -178,7 +178,7 @@ pub fn signals(texts: &[&str]) -> Vec<Signal> {
         r"(?i)(security_exception|AuthorizationException|status=40[13]\b|\b40[13] (?:Unauthorized|Forbidden)|InvalidSignatureException|UnrecognizedClientException|AccessDenied|authentication failed|password authentication failed)",
     );
     let unavailable = rx(
-        r"(?i)(status=50[234]\b|\b50[234] (?:Service|Bad Gateway|Gateway)|Service (?:Temporarily )?Unavailable|ServiceUnavailable)",
+        r"(?i)(status=50[234]\b|status code 50[234]\b|\b50[234] (?:Service|Bad Gateway|Gateway)|Service (?:Temporarily )?Unavailable|ServiceUnavailable)",
     );
     let timeout = rx(r"(?i)(TimeoutError|timed out|ETIMEDOUT|ESOCKETTIMEDOUT|deadline exceeded)");
     let refused = rx(r"(?i)(ECONNREFUSED|ECONNRESET|connection refused|connection reset)");
@@ -347,6 +347,11 @@ pub trait Look: Send + Sync {
     /// Lines of the finding's error in its log group since `since`
     /// (RFC 3339); None when it can't be told.
     async fn lines_since(&self, f: &Finding, since: &str) -> Option<u64>;
+    /// A file of the team's code at its default branch; None when it can't
+    /// be read.
+    async fn read(&self, _repo: &str, _path: &str) -> Option<String> {
+        None
+    }
 }
 
 // ─── The diagnosis ──────────────────────────────────────────────────────────
@@ -387,6 +392,14 @@ pub struct Diagnosis {
     pub changed_at: String,
     /// IAM actions that would have let CoderHelm check more.
     pub permissions: Vec<String>,
+    /// What the failing call reaches, as the code names it (a host, or the
+    /// setting that holds it), when the code was read.
+    pub upstream: String,
+    /// The decision on the latest sighting, in one line (`Act: Rising: …`),
+    /// from the finding's own week ([`crate::log_triage`]).
+    pub decision: String,
+    /// The decision is noise: the error is at its usual rate.
+    pub usual: bool,
 }
 
 /// What a diagnosis is given.
@@ -548,7 +561,42 @@ pub async fn diagnose(look: &dyn Look, input: &Input<'_>, now: DateTime<Utc>) ->
         d.place = Place::Code;
         d.headline = crate::truncate_str(f.title.trim(), 120).to_string();
         d.summary = crate::truncate_str(f.summary.trim(), 400).to_string();
+        // A call that failed: read the code that made it, as an engineer
+        // would, for what it calls and how.
+        if let Some(kind) = sigs.iter().map(|s| s.kind).find(|k| {
+            matches!(
+                k,
+                ErrorKind::Unavailable | ErrorKind::Timeout | ErrorKind::ConnectionRefused
+            )
+        }) {
+            trace_upstream(look, &input.samples, kind, &mut d).await;
+        }
     }
+
+    // How it compares with its own week, and how many it hit.
+    let t = crate::log_triage::of_finding(f, now.date_naive());
+    d.usual = t.decision == crate::log_triage::Decision::Noise;
+    d.decision = t.line();
+    let tasks = f.log_streams.len();
+    d.facts.push(format!(
+        "{} today{}; {} over the last {} days.",
+        lines_word(t.lines),
+        if tasks > 1 {
+            format!(" from {tasks} tasks")
+        } else {
+            String::new()
+        },
+        if t.days_seen == 0 {
+            "none".to_string()
+        } else {
+            format!(
+                "seen on {} of them, about {} a day",
+                t.days_seen,
+                (t.per_day + 0.5).floor() as u64
+            )
+        },
+        crate::log_triage::BASELINE_DAYS
+    ));
 
     // Still happening?
     if let Some(last) = parse_time(&f.last_seen_at) {
@@ -563,6 +611,133 @@ pub async fn diagnose(look: &dyn Look, input: &Input<'_>, now: DateTime<Utc>) ->
         }
     }
     d
+}
+
+fn lines_word(n: u64) -> String {
+    format!("{n} line{}", if n == 1 { "" } else { "s" })
+}
+
+/// What a piece of the team's code calls, read from its text.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Calls {
+    /// Hosts of the URLs it names.
+    pub hosts: Vec<String>,
+    /// Settings that hold an address (`AUTH_SERVICE_URL`).
+    pub settings: Vec<String>,
+    /// A timeout it sets, as written (`5000`).
+    pub timeout: String,
+    /// It retries.
+    pub retries: bool,
+}
+
+/// Pure: what `code` calls: URL hosts, the settings that hold addresses
+/// (`process.env.X`, `configService.get('X')`, `os.environ["X"]`,
+/// `getenv("X")`) whose names say they are one (URL, HOST, ENDPOINT,
+/// BASE), a timeout and whether it retries.
+pub fn calls_in(code: &str) -> Calls {
+    let url = rx(r#"https?://([A-Za-z0-9.-]+(?::\d+)?)"#);
+    let setting = rx(
+        r#"(?:process\.env\.|env\(\s*['"]|\.get(?:<[^>]*>)?\(\s*['"]|environ(?:\.get\(\s*|\[\s*)['"]|getenv\(\s*['"])([A-Z][A-Z0-9_]{2,60})"#,
+    );
+    let timeout = rx(r#"(?i)\btimeout\s*[:=]\s*([0-9_]+)"#);
+    let mut c = Calls::default();
+    for m in url.captures_iter(code) {
+        let h = m[1].to_ascii_lowercase();
+        if !c.hosts.contains(&h) && !h.ends_with("example.com") && h != "localhost" {
+            c.hosts.push(h);
+        }
+    }
+    for m in setting.captures_iter(code) {
+        let k = m[1].to_string();
+        let addr = ["URL", "HOST", "ENDPOINT", "BASE", "URI", "ADDR"]
+            .iter()
+            .any(|w| k.contains(w));
+        if addr && !c.settings.contains(&k) {
+            c.settings.push(k);
+        }
+    }
+    if let Some(m) = timeout.captures(code) {
+        c.timeout = m[1].replace('_', "");
+    }
+    let lower = code.to_ascii_lowercase();
+    c.retries = lower.contains("retry") || lower.contains("retries") || lower.contains("backoff");
+    c
+}
+
+/// Read the code that logged a failed call (the class its lines name), and
+/// say what it calls, with what timeout and whether it retries; the fix
+/// step follows from that.
+async fn trace_upstream(look: &dyn Look, samples: &[String], kind: ErrorKind, d: &mut Diagnosis) {
+    let target = crate::log_repo::Target {
+        samples: samples
+            .iter()
+            .map(|m| crate::log_repo::LogLine {
+                log_group: String::new(),
+                message: m.clone(),
+            })
+            .collect(),
+        ..Default::default()
+    };
+    for class in crate::log_repo::code_symbols(&target) {
+        let hits = look.code(&format!("class {class}")).await;
+        let Some(hit) = hits.iter().find(|h| {
+            let ext = h.path.rsplit('.').next().unwrap_or("");
+            [
+                "ts", "js", "mjs", "py", "rb", "go", "java", "kt", "cs", "php",
+            ]
+            .contains(&ext)
+                && !h.path.contains("node_modules/")
+        }) else {
+            continue;
+        };
+        let text = look.read(&hit.repo, &hit.path).await.unwrap_or_default();
+        let c = calls_in(&format!("{}\n{text}", hit.fragment));
+        let target = match (c.hosts.first(), c.settings.first()) {
+            (Some(h), Some(k)) => format!("{h} ({k})"),
+            (Some(h), None) => h.clone(),
+            (None, Some(k)) => format!("the address in {k}"),
+            (None, None) => continue,
+        };
+        d.upstream = c
+            .hosts
+            .first()
+            .cloned()
+            .or_else(|| c.settings.first().cloned())
+            .unwrap_or_default();
+        let what = match kind {
+            ErrorKind::Timeout => "timed out",
+            ErrorKind::ConnectionRefused => "was refused",
+            _ => "answered 503",
+        };
+        d.headline = format!("{class} call to {} {what}", d.upstream);
+        d.facts.insert(
+            0,
+            format!(
+                "{class} ({} in {}) calls {target}, {}, {}.",
+                hit.path,
+                hit.repo,
+                if c.timeout.is_empty() {
+                    "with no timeout set".to_string()
+                } else {
+                    format!("with a {} timeout", c.timeout)
+                },
+                if c.retries {
+                    "and retries"
+                } else {
+                    "and no retry"
+                }
+            ),
+        );
+        if !c.retries {
+            d.steps.push(format!(
+                "Retry {class}'s call to {} once with a short backoff{}, so a brief {} fails no request.",
+                d.upstream,
+                if c.timeout.is_empty() { " and a timeout" } else { "" },
+                if kind == ErrorKind::Timeout { "timeout" } else { "outage" }
+            ));
+        }
+        return;
+    }
 }
 
 fn service_title(service: &str) -> &'static str {
@@ -1359,6 +1534,12 @@ pub fn incident_message(
         ),
     };
     let mut facts: Vec<(String, String)> = Vec::new();
+    if !d.decision.is_empty() {
+        facts.push(("Decision".into(), d.decision.clone()));
+    }
+    if !d.upstream.is_empty() {
+        facts.push(("Upstream".into(), d.upstream.clone()));
+    }
     let names: Vec<String> = inc
         .members
         .iter()

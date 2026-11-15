@@ -66,7 +66,11 @@ def _per_day(avg):
         return "none"
     if avg < 1:
         return "less than one a day"
-    return f"about {round(avg)} a day"
+    return f"about {int(avg + 0.5)} a day"
+
+
+def _lines(n):
+    return f"{n} line{'s' if n != 1 else ''}"
 
 
 def decide(item, lines, now=None, is_new=False, severity=""):
@@ -80,19 +84,19 @@ def decide(item, lines, now=None, is_new=False, severity=""):
     rising = lines >= RISING_MIN_LINES and lines > RISING_FACTOR * max(avg, 1)
     if is_new or not (item or {}).get("daily_lines"):
         if severity == "critical":
-            return {**out, "decision": ACT, "reason": f"New and critical: {lines} lines."}
-        return {**out, "decision": WATCH, "reason": f"New: {lines} lines, not seen before."}
+            return {**out, "decision": ACT, "reason": f"New and critical: {_lines(lines)}."}
+        return {**out, "decision": WATCH, "reason": f"New: {_lines(lines)}, not seen before."}
     if rising:
         return {**out, "decision": ACT,
-                "reason": f"Rising: {lines} lines against {_per_day(avg)} over the last {BASELINE_DAYS} days."}
+                "reason": f"Rising: {_lines(lines)} against {_per_day(avg)} over the last {BASELINE_DAYS} days."}
     if seen >= USUAL_DAYS:
         return {**out, "decision": NOISE,
-                "reason": f"At its usual rate: {lines} lines, {_per_day(avg)} on {seen} of the last {BASELINE_DAYS} days."}
+                "reason": f"At its usual rate: {_lines(lines)}, {_per_day(avg)} on {seen} of the last {BASELINE_DAYS} days."}
     if seen == 0:
         return {**out, "decision": WATCH,
-                "reason": f"Back after a quiet week: {lines} lines, none in the last {BASELINE_DAYS} days."}
+                "reason": f"Back after a quiet week: {_lines(lines)}, none in the last {BASELINE_DAYS} days."}
     return {**out, "decision": WATCH,
-            "reason": f"Seen again: {lines} lines, on {seen} of the last {BASELINE_DAYS} days."}
+            "reason": f"Seen again: {_lines(lines)}, on {seen} of the last {BASELINE_DAYS} days."}
 
 
 def notifies(d, is_new=False, reopened=False):
