@@ -721,6 +721,28 @@ export class WorkerStack extends cdk.Stack {
         latest.addToPolicy(new iam.PolicyStatement({ actions: ["s3:PutObject"], resources: latestKeys, conditions: { Null: { "s3:if-none-match": "false" } } }));
         latest.addToPolicy(new iam.PolicyStatement({ actions: ["s3:PutObject"], resources: latestKeys, conditions: { Null: { "s3:if-match": "false" } } }));
         new cdk.CfnOutput(this, "ReleaseLatestRoleArn", { value: latest.roleArn });
+
+        // The Jira app's release (jira-app-release.yml, main's copy, run on
+        // main) publishes the production version it deployed as
+        // launch/jira-app.json. The gateway reads it without credentials to
+        // tell a team whose Jira site runs an older app what it lacks. This
+        // role writes that one key and nothing else.
+        const jiraAppLatest = new iam.Role(this, "JiraAppLatestRole", {
+          roleName: `${prefix}-jira-app-latest`,
+          description: "jira-app-release.yml on main: writes launch/jira-app.json (the Jira app's released version) only",
+          maxSessionDuration: cdk.Duration.hours(1),
+          assumedBy: new iam.WebIdentityPrincipal(githubOidc.openIdConnectProviderArn, {
+            StringEquals: {
+              "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+              "token.actions.githubusercontent.com:sub": `repo:${RELEASE_REPO}:ref:refs/heads/main`,
+              "token.actions.githubusercontent.com:job_workflow_ref": `${RELEASE_REPO}/.github/workflows/jira-app-release.yml@refs/heads/main`,
+            },
+          }),
+        });
+        jiraAppLatest.addToPolicy(
+          new iam.PolicyStatement({ actions: ["s3:PutObject"], resources: [`arn:aws:s3:::${cfg.publicBucketName}/launch/jira-app.json`] }),
+        );
+        new cdk.CfnOutput(this, "JiraAppLatestRoleArn", { value: jiraAppLatest.roleArn });
       }
     }
   }

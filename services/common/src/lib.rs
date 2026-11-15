@@ -99,6 +99,9 @@ pub mod github_wait;
 pub mod infra_vuln;
 /// Custom instructions, voice and agent context rows (routes and Setup).
 pub mod instructions;
+/// The Jira app version each site runs, the latest release, and what an
+/// older version lacks.
+pub mod jira_app_version;
 pub mod live;
 /// Log findings and the fix runs started from them.
 pub mod log_findings;

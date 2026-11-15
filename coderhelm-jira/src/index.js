@@ -6,6 +6,7 @@ const { route } = api;
 const { GATEWAY_URL } = require("./gateway");
 const { existingComments } = require("./comments");
 const { postReply, parentIdOf } = require("./thread-reply");
+const { versionFields } = require("./version");
 
 /** Jira's comment calls as the app, for a threaded reply (see thread-reply.js). */
 const jiraComments = {
@@ -168,6 +169,8 @@ exports.handler = async (event, context) => {
         repo_name: commentRepoName || undefined,
         team_id: config.teamId,
         forge_secret: config.forgeSecret,
+        // Which version of this app sent it (see version.js).
+        ...versionFields(),
       },
     };
 
@@ -241,6 +244,8 @@ exports.handler = async (event, context) => {
       repo_name: repoName || undefined,
       team_id: config.teamId,
       forge_secret: config.forgeSecret,
+      // Which version of this app sent it (see version.js).
+      ...versionFields(),
     },
   };
 

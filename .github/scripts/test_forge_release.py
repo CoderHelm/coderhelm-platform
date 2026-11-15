@@ -15,6 +15,7 @@ import yaml  # noqa: E402
 
 import forge_release as fr  # noqa: E402
 
+FEATURES = os.path.join(os.path.dirname(__file__), "..", "..", "services", "common", "src", "jira_app_features.json")
 REPO_MANIFEST = os.path.join(os.path.dirname(__file__), "..", "..", "coderhelm-jira", "manifest.yml")
 
 BASE = {
@@ -166,8 +167,40 @@ class CliTests(unittest.TestCase):
         ]
         with tempfile.TemporaryDirectory() as d:
             path = self.write(d, "i.json", installs, as_yaml=False)
-            self.assertEqual(self.run_cli("pending", "--installs", path), "a.example.net\tjira\n")
-            self.assertEqual(self.run_cli("pending", "--installs", path, "--environment", "staging"), "c.example.net\tjira\n")
+            self.assertEqual(self.run_cli("pending", "--installs", path), "a.example.net\tjira\t5\n")
+            self.assertEqual(self.run_cli("pending", "--installs", path, "--environment", "staging"), "c.example.net\tjira\t1\n")
+
+    def test_latest_pointer_is_the_highest_production_version(self):
+        versions = [{"version": "5.20.0"}, {"version": "6.11.0"}, {"version": "6.9.0"}, {"version": "soon"}]
+        manifest = {"app": {"id": "ari:cloud:ecosystem::app/00000000-0000-0000-0000-000000000001"}}
+        self.assertEqual(fr.latest_version(versions), "6.11.0")
+        self.assertEqual(fr.latest_version([]), None)
+        p = fr.latest_pointer(versions, manifest, "abc123", "2026-11-14T00:00:00Z")
+        self.assertEqual(p, {"version": "6.11.0", "appId": manifest["app"]["id"], "commit": "abc123", "publishedAt": "2026-11-14T00:00:00Z"})
+        self.assertIsNone(fr.latest_pointer([], manifest))
+        with tempfile.TemporaryDirectory() as d:
+            v = self.write(d, "v.json", versions, as_yaml=False)
+            m = self.write(d, "m.yml", manifest)
+            self.assertEqual(json.loads(self.run_cli("latest", "--versions", v, "--manifest", m))["version"], "6.11.0")
+
+    def test_behind_lists_each_site_by_number_with_what_it_lacks(self):
+        features = fr.load_features(FEATURES)
+        names = [n for _, n in features]
+        for f in ["full comment reading", "mentions", "in-place edits", "threaded replies", "issue type", "extended issue fields"]:
+            self.assertIn(f, names)
+        self.assertEqual(fr.missing_on_major(features, 5), names)
+        self.assertEqual(fr.missing_on_major(features, 6), [])
+        self.assertEqual(fr.missing_on_major(features, None), names)
+        md, warning = fr.behind_report(["5\tjira\n", "\n", "\tjira\n"], "6.11.0", features)
+        self.assertIn("- Site 1 (jira): major version 5 (latest 6.11.0). Missing: ", md)
+        self.assertIn("- Site 2 (jira): an unknown version (latest 6.11.0).", md)
+        self.assertIn("threaded replies", md)
+        self.assertNotIn("example", md)
+        self.assertTrue(warning.startswith("2 installation(s) still run an older Coderhelm app (latest 6.11.0). They lack: "))
+        self.assertIn("Jira Settings, Apps, Manage apps, Coderhelm, Update.", warning)
+        self.assertEqual(fr.behind_report([], "6.11.0", features), ("", ""))
+        self.assertEqual(fr.parse_version("6.10"), (6, 10, 0))
+        self.assertIsNone(fr.parse_version("6.x"))
 
 
 if __name__ == "__main__":

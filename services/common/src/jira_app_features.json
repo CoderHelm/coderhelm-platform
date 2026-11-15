@@ -1,0 +1,8 @@
+[
+  { "since": "6.6.0", "feature": "issue type", "commit": "c75f48d8" },
+  { "since": "6.8.0", "feature": "full comment reading", "commit": "2694170e" },
+  { "since": "6.9.0", "feature": "mentions", "commit": "0a1e381f" },
+  { "since": "6.9.0", "feature": "in-place edits", "commit": "0a1e381f" },
+  { "since": "6.9.0", "feature": "extended issue fields", "commit": "0a1e381f" },
+  { "since": "6.10.0", "feature": "threaded replies", "commit": "e9f25b6d" }
+]

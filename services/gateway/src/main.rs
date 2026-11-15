@@ -499,6 +499,10 @@ fn build_app(state: Arc<AppState>) -> Router {
             "/integrations/jira/events",
             get(routes::api::get_jira_events),
         )
+        .route(
+            "/integrations/jira/app",
+            get(routes::jira_app_status::get_status),
+        )
         .route("/stats", get(routes::api::get_stats))
         .route("/stats/history", get(routes::api::get_stats_history))
         .route("/analytics", get(routes::analytics::get_analytics))

@@ -335,7 +335,7 @@ pub const CAPABILITIES: &[Capability] = &[
 
         short_label: "See integrations",
         min_role: "member",
-        handlers: &["integrations::list"],
+        handlers: &["integrations::list", "jira_app_status::get_status"],
     },
     Capability {
         key: "plugins.run",

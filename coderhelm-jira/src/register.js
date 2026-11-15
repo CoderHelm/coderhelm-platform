@@ -10,6 +10,7 @@ const api = require("@forge/api");
 const { storage, webTrigger, route } = api;
 
 const { GATEWAY_URL } = require("./gateway");
+const { versionFields } = require("./version");
 
 /** The site's address (e.g. https://yourcompany.atlassian.net), or "". */
 async function siteUrl() {
@@ -56,6 +57,9 @@ async function registerWithGateway(config) {
       get_issues_url: await webTrigger.getUrl("get-issues-trigger"),
       confluence_trigger_url: (await hasConfluence()) ? await webTrigger.getUrl("confluence-trigger") : "",
       site_url: await siteUrl(),
+      // The version that registers: after an accepted update, CoderHelm
+      // knows the site caught up at once.
+      ...versionFields(),
     };
     const res = await api.fetch(`${GATEWAY_URL}/integrations/jira/forge-register`, {
       method: "POST",
