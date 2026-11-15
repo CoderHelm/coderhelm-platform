@@ -669,12 +669,15 @@ async fn handle_message_inner(state: Arc<WorkerState>, message: models::WorkerMe
             // Finished runs' pull requests: a conflict with a moved base,
             // checks that went red later, a reviewer verdict missing on the
             // head, a merge whose deploy nobody watches. Each is picked
-            // back up by the mechanism it already has.
+            // back up by the mechanism it already has. Then a few open pull
+            // requests per team whose description an earlier writer built
+            // are rebuilt by this one.
             let watch = as_sweep(who::SWEEP_PR_WATCH, passes::pr_watch::sweep(&state)).await;
             info!(
                 candidates = watch.candidates,
                 looked_at = watch.looked_at,
                 acted = ?watch.acted,
+                descriptions_rebuilt = ?watch.caught_up,
                 "Pull request watch sweep done"
             );
             // Deploy counts that stopped between passes carry on without
