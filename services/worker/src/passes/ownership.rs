@@ -144,6 +144,12 @@ pub fn escalation_note(reply: &str) -> Option<String> {
 pub const ALLOWED: &[(&str, &str)] = &[
     // The list itself, and the stance that forbids the phrases.
     ("passes/ownership.rs", ""),
+    // The reply composer: the hand-back phrases it takes out of every
+    // reply, and its prompt forbidding them. It names them only to remove
+    // them.
+    ("common/reply_compose.rs", ""),
+    // The reply eval's rubric, which fails a reply that says them.
+    ("passes/reply_eval.rs", "i read your comment"),
 ];
 
 #[cfg(test)]

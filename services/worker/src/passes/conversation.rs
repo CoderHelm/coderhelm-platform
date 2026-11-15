@@ -8,10 +8,16 @@
 //! - [`jira`]: a Jira ticket, through the team's Jira app, with a ledger of
 //!   what CoderHelm said there.
 //! - [`edit_own`]: a status comment a pass keeps by its own id.
-//! - [`review_reply`]: a reply in a pull request's review thread.
+//! - [`reply_github`], [`reply_jira`], [`reply_review`]: a reply to a
+//!   person (their comment, their review comment, their question, their
+//!   instruction, a refusal). The words are written by the composer
+//!   (`common::reply_compose`) from the thread and the run's records, on
+//!   the team's light model ([`Replier`]); the path's own text is the draft
+//!   and the fallback. Every person-facing reply goes through these (a
+//!   source guard below holds it to that).
 //!
 //! [`ModelJudge`] lets a run's model read the thread before it speaks; the
-//! guards in `common::conversation` hold whatever it says.
+//! guards in `common::conversation` hold whatever it or the composer says.
 //!
 //! The source scan at the bottom fails on any direct call to the trackers'
 //! comment endpoints outside this file and `common::conversation_io`.
@@ -21,8 +27,9 @@ use std::sync::{LazyLock, Mutex};
 use std::time::Instant;
 
 use common::conversation::{
-    self, Channel, Heard, How, Judge, Judged, Meta, Place, Say, Spoke, View,
+    self, Channel, Decision, Heard, How, Judge, Judged, Kind, Meta, Place, Say, Spoke, View,
 };
+use common::reply_compose::{self, Compose, Composer, Facts};
 use serde_json::{json, Value};
 use tracing::warn;
 
@@ -203,6 +210,102 @@ pub async fn github_judged(
     Ok(answer(owner, repo, number, &spoke))
 }
 
+/// A reply to people on an issue or pull request conversation: `say` is
+/// the path's draft; the composer writes it from the thread and `facts`.
+#[allow(clippy::too_many_arguments)]
+pub async fn reply_github(
+    r: &Replier<'_>,
+    gh: &GitHubClient,
+    owner: &str,
+    repo: &str,
+    number: u64,
+    say: Say,
+    facts: &Facts,
+) -> Result<Value, Error> {
+    let ch = GithubThread {
+        gh,
+        owner,
+        repo,
+        number,
+    };
+    let now = chrono::Utc::now().timestamp_millis();
+    let c = Compose { composer: r, facts };
+    let spoke = Box::pin(conversation::speak_with(&ch, None, Some(c), &say, now)).await?;
+    Ok(answer(owner, repo, number, &spoke))
+}
+
+/// The composer of replies to people, on the team's light model, loaded
+/// the first time a reply needs it (most say calls answer nobody).
+pub struct Replier<'a> {
+    pub state: &'a WorkerState,
+    pub team_id: &'a str,
+    provider: tokio::sync::OnceCell<Option<ModelProvider>>,
+    usage: tokio::sync::Mutex<TokenUsage>,
+}
+
+impl<'a> Replier<'a> {
+    pub fn new(state: &'a WorkerState, team_id: &'a str) -> Self {
+        Replier {
+            state,
+            team_id,
+            provider: tokio::sync::OnceCell::new(),
+            usage: tokio::sync::Mutex::new(TokenUsage::default()),
+        }
+    }
+
+    /// With the provider the pass already loaded.
+    pub fn with_provider(
+        state: &'a WorkerState,
+        team_id: &'a str,
+        provider: &ModelProvider,
+    ) -> Self {
+        Replier {
+            provider: tokio::sync::OnceCell::new_with(Some(Some(provider.clone()))),
+            ..Replier::new(state, team_id)
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Composer for Replier<'_> {
+    async fn compose(&self, system: &str, prompt: &str, schema: &Value) -> Option<Value> {
+        let provider = self
+            .provider
+            .get_or_init(|| async {
+                ModelProvider::load_for_team(
+                    &self.state.dynamo,
+                    &self.state.config.settings_table_name,
+                    self.team_id,
+                )
+                .await
+                .map_err(|e| warn!(team_id = self.team_id, error = %e, "No model to write the reply; the draft is posted"))
+                .ok()
+            })
+            .await
+            .as_ref()?;
+        let mut usage = self.usage.lock().await;
+        match Box::pin(crate::agent::anthropic::converse_json(
+            &provider.client(),
+            provider.primary_model_id(),
+            system,
+            prompt,
+            schema,
+            true,
+            "low",
+            reply_compose::MAX_TOKENS,
+            &mut usage,
+        ))
+        .await
+        {
+            Ok(v) => Some(v),
+            Err(e) => {
+                warn!(error = %e, "Could not write the reply with the model; the draft is posted");
+                None
+            }
+        }
+    }
+}
+
 /// Rewrites a status comment a pass keeps by its own id (`slot` names it):
 /// laid out like every other comment, and marked as CoderHelm's.
 pub async fn edit_own(
@@ -255,32 +358,200 @@ pub async fn edit_own_asking(
 static REPLIED: LazyLock<Mutex<HashMap<String, String>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// A reply in a pull request's review thread (to comment `comment_id`).
-/// The same words in the same thread again are not posted.
-pub async fn review_reply(
+/// The slot of a reply in a review thread.
+const REVIEW_SLOT: &str = "review-thread";
+
+/// A pull request's review comments read in the last [`CACHE_SECS`]
+/// seconds: one feedback round answers several threads.
+type ReadAt = (Instant, Vec<Value>);
+
+static REVIEW_COMMENTS: LazyLock<Mutex<HashMap<String, ReadAt>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+async fn review_comments(gh: &GitHubClient, owner: &str, repo: &str, pr: u64) -> Vec<Value> {
+    let key = format!("{owner}/{repo}#{pr}").to_ascii_lowercase();
+    if let Some(v) = REVIEW_COMMENTS.lock().ok().and_then(|c| {
+        c.get(&key)
+            .filter(|(at, _)| at.elapsed().as_secs() < CACHE_SECS)
+            .map(|(_, v)| v.clone())
+    }) {
+        return v;
+    }
+    let all = match gh.get_review_comments(owner, repo, pr).await {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(pr, error = %e, "Could not read the review threads before replying; replying on what is known");
+            return Vec::new();
+        }
+    };
+    if let Ok(mut c) = REVIEW_COMMENTS.lock() {
+        if c.len() > 200 {
+            c.clear();
+        }
+        c.insert(key, (Instant::now(), all.clone()));
+    }
+    all
+}
+
+/// One review thread as the composer reads it: the comments in the thread
+/// of `comment_id`, the comment itself, and the diff it sits on.
+pub fn review_thread(
+    all: &[Value],
+    comment_id: u64,
+) -> (View, Option<Heard>, Option<(String, u64, String)>) {
+    let id_of = |c: &Value| c["id"].as_u64().unwrap_or(0);
+    let target = all.iter().find(|c| id_of(c) == comment_id);
+    let root = target
+        .and_then(|t| t["in_reply_to_id"].as_u64())
+        .unwrap_or(comment_id);
+    let thread: Vec<Value> = all
+        .iter()
+        .filter(|c| id_of(c) == root || c["in_reply_to_id"].as_u64() == Some(root))
+        .cloned()
+        .collect();
+    let mut view = common::conversation_io::view_from_github(&thread);
+    // CoderHelm's replies from before they carried a marker are context too.
+    for c in &thread {
+        let bot = c["user"]["type"].as_str() == Some("Bot")
+            || c["user"]["login"]
+                .as_str()
+                .is_some_and(|l| l.ends_with("[bot]"));
+        let body = c["body"].as_str().unwrap_or("");
+        if bot && conversation::read_marker(body).is_none() {
+            let at = c["created_at"]
+                .as_str()
+                .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+                .map(|t| t.timestamp_millis())
+                .unwrap_or(0);
+            view.said.push(common::conversation::Said {
+                id: id_of(c).to_string(),
+                at_ms: at,
+                meta: Meta::default(),
+                body: body.to_string(),
+            });
+        }
+    }
+    let to = view
+        .heard
+        .iter()
+        .find(|h| h.id == comment_id.to_string())
+        .cloned()
+        .map(|h| Heard { line: true, ..h });
+    let code = target.map(|t| {
+        (
+            t["path"].as_str().unwrap_or("").to_string(),
+            t["line"]
+                .as_u64()
+                .or(t["original_line"].as_u64())
+                .unwrap_or(0),
+            t["diff_hunk"].as_str().unwrap_or("").to_string(),
+        )
+    });
+    (view, to, code)
+}
+
+/// A reply in a pull request's review thread, to a person's comment
+/// `comment_id`: `body` is the path's draft; the composer writes the reply
+/// from the thread, the diff under the comment and `facts`. The same reply
+/// in the same thread again is not posted.
+#[allow(clippy::too_many_arguments)]
+pub async fn reply_review(
+    r: &Replier<'_>,
     gh: &GitHubClient,
     owner: &str,
     repo: &str,
     pr: u64,
     comment_id: u64,
     body: &str,
+    facts: &Facts,
 ) -> Result<Value, Error> {
     let key = format!("{owner}/{repo}#{pr}/{comment_id}");
     let fp = conversation::fingerprint(body);
+    let quiet = || {
+        Ok(
+            json!({ "id": null, "spoke": "quiet", "why": "the same reply is already in the thread" }),
+        )
+    };
     if REPLIED
         .lock()
         .ok()
         .and_then(|r| r.get(&key).cloned())
         .is_some_and(|f| f == fp)
     {
-        return Ok(
-            json!({ "id": null, "spoke": "quiet", "why": "the same reply is already in the thread" }),
-        );
+        return quiet();
     }
-    let shaped = conversation::shape(body, Place::github(owner, repo, pr).budget(), true);
-    let v = gh
-        .reply_to_review_comment(owner, repo, pr, comment_id, &shaped)
-        .await?;
+    let all = Box::pin(review_comments(gh, owner, repo, pr)).await;
+    let (view, to, code) = review_thread(&all, comment_id);
+    // A retry in another process: the thread already holds this reply.
+    if view
+        .said
+        .iter()
+        .any(|s| s.meta.slot == REVIEW_SLOT && s.meta.fp == fp)
+    {
+        return quiet();
+    }
+    let mut facts = facts.clone();
+    if let Some((path, line, hunk)) = code.filter(|(p, _, _)| !p.is_empty()) {
+        facts = facts.code(&path, line, &hunk);
+    }
+    let to = to.unwrap_or(Heard {
+        id: comment_id.to_string(),
+        line: true,
+        ..Default::default()
+    });
+    let place = Place::github(owner, repo, pr);
+    let now = chrono::Utc::now().timestamp_millis();
+    let say = Say::reply(REVIEW_SLOT, body, vec![to.id.clone()]);
+    let meta = Meta {
+        slot: REVIEW_SLOT.to_string(),
+        kind: Kind::Reply,
+        fp: fp.clone(),
+        gist: conversation::cut_words(&conversation::visible(body), 160),
+        first_ms: now,
+        ..Default::default()
+    };
+    let decision = Decision::Reply {
+        to: to.clone(),
+        others: vec![to],
+        how: How::Thread,
+        ack: String::new(),
+        text: conversation::shape(body, place.budget(), true),
+        meta,
+    };
+    let decision = Box::pin(reply_compose::apply(
+        Compose {
+            composer: r,
+            facts: &facts,
+        },
+        &view,
+        &say,
+        &place,
+        decision,
+    ))
+    .await;
+    let v = match decision {
+        Decision::Reply { text, meta, .. } => {
+            let shaped = conversation::shape(&text, place.budget(), true);
+            gh.reply_to_review_comment(
+                owner,
+                repo,
+                pr,
+                comment_id,
+                &conversation::with_marker(&shaped, &meta),
+            )
+            .await?
+        }
+        Decision::React { content, .. } => {
+            if let Err(e) = gh
+                .add_reaction(owner, repo, comment_id, true, &content)
+                .await
+            {
+                warn!(pr, error = %e, "Could not react on the review comment");
+            }
+            json!({ "id": null, "spoke": "quiet", "why": "reacted on the comment" })
+        }
+        _ => return quiet(),
+    };
     if let Ok(mut r) = REPLIED.lock() {
         if r.len() > 2_000 {
             r.clear();
@@ -357,6 +628,53 @@ pub async fn jira_judged(
     title: &str,
     judge: Option<&dyn Judge>,
 ) -> Result<(Spoke, Option<String>), Error> {
+    Box::pin(jira_with(
+        state,
+        team_id,
+        ticket,
+        say,
+        comment_type,
+        title,
+        judge,
+        None,
+    ))
+    .await
+}
+
+/// A reply to people on a Jira ticket: `say` is the path's draft; the
+/// composer writes it from the ticket's thread and `facts`.
+pub async fn reply_jira(
+    r: &Replier<'_>,
+    ticket: &str,
+    say: Say,
+    facts: &Facts,
+    comment_type: &str,
+    title: &str,
+) -> Result<(Spoke, Option<String>), Error> {
+    Box::pin(jira_with(
+        r.state,
+        r.team_id,
+        ticket,
+        say,
+        comment_type,
+        title,
+        None,
+        Some(Compose { composer: r, facts }),
+    ))
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn jira_with(
+    state: &WorkerState,
+    team_id: &str,
+    ticket: &str,
+    say: Say,
+    comment_type: &str,
+    title: &str,
+    judge: Option<&dyn Judge>,
+    compose: Option<Compose<'_>>,
+) -> Result<(Spoke, Option<String>), Error> {
     let (url, site) = jira_config(state, team_id).await?;
     let ch = common::conversation_io::JiraChannel {
         http: &state.http,
@@ -369,7 +687,7 @@ pub async fn jira_judged(
         title: conversation::no_arrows(title),
     };
     let now = chrono::Utc::now().timestamp_millis();
-    let spoke = Box::pin(conversation::speak(&ch, judge, &say, now)).await?;
+    let spoke = Box::pin(conversation::speak_with(&ch, judge, compose, &say, now)).await?;
     let link = jira_link(site.as_deref(), ticket, spoke.id());
     Ok((spoke, link))
 }
@@ -581,6 +899,103 @@ mod tests {
         );
     }
 
+    /// Every reply to a person, in the worker and the gateway, goes through
+    /// the composer: a `Say::reply_all`, `Say::reply`, `Say::ack` (or a
+    /// person-facing status such as the comment acknowledgement) handed to
+    /// the plain `github`, `jira` or `jira_at`, or a reply in a review
+    /// thread written any other way than `reply_review`, fails here.
+    #[test]
+    fn every_reply_to_a_person_goes_through_the_composer() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let says = regex::Regex::new(
+            r#"Say::(?:reply_all|reply|ack)\(|Say::status\(\s*"comment-received""#,
+        )
+        .unwrap();
+        let calls = regex::Regex::new(
+            r"(?:\breply_github|\breply_jira_at|\breply_jira|\breply_review|conversation::github|conversation::jira_at|conversation::jira|github_judged|jira_judged|\bspeak)\(|let say =",
+        )
+        .unwrap();
+        let composed = |c: &str| {
+            [
+                "reply_github(",
+                "reply_jira_at(",
+                "reply_jira(",
+                "reply_review(",
+            ]
+            .iter()
+            .any(|k| c.ends_with(k))
+        };
+        let mut found = Vec::new();
+        let mut seen = 0;
+        let mut stack = vec![root.join("worker/src"), root.join("gateway/src")];
+        while let Some(dir) = stack.pop() {
+            for e in std::fs::read_dir(&dir).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                    continue;
+                }
+                if p.extension().and_then(|x| x.to_str()) != Some("rs") {
+                    continue;
+                }
+                let rel = p
+                    .strip_prefix(&root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                // This layer, and the eval (a test module) that feeds it.
+                if rel == "worker/src/passes/conversation.rs"
+                    || rel == "worker/src/passes/reply_eval.rs"
+                {
+                    continue;
+                }
+                let src = std::fs::read_to_string(&p).unwrap();
+                let code: String = super::scan::non_test_lines(&src)
+                    .into_iter()
+                    .filter(|(_, l)| !l.trim_start().starts_with("//"))
+                    .map(|(_, l)| l)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                // The plain reply in a review thread is gone; only
+                // `reply_review` writes there.
+                if code.contains("review_reply(") {
+                    found.push(format!("{rel}: a review thread reply outside reply_review"));
+                }
+                for m in says.find_iter(&code) {
+                    seen += 1;
+                    let before: Vec<regex::Match> = calls.find_iter(&code[..m.start()]).collect();
+                    let Some(open) = before.last() else {
+                        found.push(format!("{rel}: {} with no call", m.as_str()));
+                        continue;
+                    };
+                    let call = if open.as_str() == "let say =" {
+                        // The say goes to the next call.
+                        calls
+                            .find_iter(&code[m.end()..])
+                            .find(|c| c.as_str() != "let say =")
+                            .map(|c| c.as_str().to_string())
+                            .unwrap_or_default()
+                    } else {
+                        open.as_str().to_string()
+                    };
+                    if !composed(&call) {
+                        let line = code[..m.start()].matches('\n').count() + 1;
+                        found.push(format!("{rel}:~{line}: {} goes to {call}", m.as_str()));
+                    }
+                }
+            }
+        }
+        assert!(
+            seen >= 15,
+            "the scan found only {seen} replies: is it reading the sources?"
+        );
+        assert!(
+            found.is_empty(),
+            "replies to people that skip the composer:\n{}",
+            found.join("\n")
+        );
+    }
+
     /// No template CoderHelm posts carries an arrow glyph.
     #[test]
     fn no_posted_template_has_an_arrow() {
@@ -630,9 +1045,10 @@ mod tests {
     #[test]
     fn only_a_failed_run_asks_jira_for_a_red_line() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
-        let call =
-            regex::Regex::new(r#"(?s)(?:conversation::jira(?:_judged|_at)?)\((.{0,600}?)\.await"#)
-                .unwrap();
+        let call = regex::Regex::new(
+            r#"(?s)(?:conversation::(?:reply_)?jira(?:_judged|_at)?)\((.{0,600}?)\.await"#,
+        )
+        .unwrap();
         let typed = regex::Regex::new(r#""([a-z_]+)",\s*"([^"]*)""#).unwrap();
         let mut found = Vec::new();
         let mut stack = vec![root.join("worker/src"), root.join("gateway/src")];

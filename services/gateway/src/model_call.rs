@@ -57,6 +57,18 @@ pub async fn log_repo_turn(
     whole_turn(http, api_key, body, meter, model_id, feature::LOG_ANALYSIS).await
 }
 
+/// A reply to a person on a ticket or pull request, written by the
+/// composer (`common::reply_compose`): recorded under feature `feedback`.
+pub async fn reply_turn(
+    http: &reqwest::Client,
+    api_key: &str,
+    body: &Value,
+    meter: &UsageMeter,
+    model_id: &str,
+) -> Result<Value, ModelCallError> {
+    whole_turn(http, api_key, body, meter, model_id, feature::FEEDBACK).await
+}
+
 /// Where one call goes: Bedrock (with the id to call) or the Anthropic API.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Via {

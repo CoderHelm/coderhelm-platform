@@ -189,6 +189,9 @@ pub enum Class {
     Instruction,
     /// Says to stop the work.
     Stop,
+    /// Asks CoderHelm something about the work or the run (why it stopped,
+    /// what changed, whether it is done) without asking for a change.
+    Question,
     /// Not for CoderHelm (people talking to each other, a status note).
     NotForCoderhelm,
 }
@@ -204,6 +207,7 @@ impl Class {
             "answer" => Some(Class::Answer),
             "instruction" | "correction" | "new_instruction" => Some(Class::Instruction),
             "stop" => Some(Class::Stop),
+            "question" | "status_question" => Some(Class::Question),
             "not_for_coderhelm" | "not_for_us" | "other" => Some(Class::NotForCoderhelm),
             _ => None,
         }
@@ -214,6 +218,7 @@ impl Class {
             Class::Answer => "answer",
             Class::Instruction => "instruction",
             Class::Stop => "stop",
+            Class::Question => "question",
             Class::NotForCoderhelm => "not_for_coderhelm",
         }
     }
@@ -428,6 +433,9 @@ pub enum Action {
     Keep,
     /// Not for CoderHelm: left as it is, no reply.
     Leave,
+    /// A question to CoderHelm: answered on the ticket from the run's
+    /// records; nothing else changes.
+    Answer,
     /// Nothing yet: the next step reads it.
     Wait,
 }
@@ -442,6 +450,7 @@ pub fn decide(class: Class, stage: Stage, during_run: bool, deferred: bool) -> A
     );
     match class {
         Class::NotForCoderhelm => return Action::Leave,
+        Class::Question => return Action::Answer,
         Class::Stop if during_run && working => return Action::Stop,
         _ => {}
     }
@@ -469,6 +478,9 @@ pub const SYSTEM: &str = "You read the comments people wrote on a ticket that an
      stop: it tells the agent to stop working on this ticket (\"stop\", \"hold off\", \"don't \
      build this\", \"cancel\"). A request to stop doing one thing inside the work (\"stop adding \
      tests\") is an instruction, not stop. \
+     question: it asks the agent something about this ticket's work or its run (\"why did it \
+     stop?\", \"what did you change?\", \"is this done?\", \"how does the fix work?\") and asks \
+     for no change. A question that also asks for a change is an instruction. \
      not_for_coderhelm: people talking to each other, a status note (\"moved to QA\"), thanks, \
      or anything else that asks nothing of the agent and tells it nothing about the work. \
      Judge each comment as a whole. When in doubt between instruction and not_for_coderhelm, \
@@ -484,7 +496,7 @@ pub fn schema() -> Value {
                     "type": "object",
                     "properties": {
                         "n": {"type": "integer"},
-                        "class": {"type": "string", "enum": ["answer", "instruction", "stop", "not_for_coderhelm"]},
+                        "class": {"type": "string", "enum": ["answer", "instruction", "stop", "question", "not_for_coderhelm"]},
                         "question": {"type": "integer"},
                         "reason": {"type": "string"}
                     },
@@ -651,6 +663,7 @@ pub fn outcome(action: Action, c: &Comment, pr: Option<&str>) -> String {
             format!("an answer to \"{}\"", one_line(&c.question, 160))
         }
         (Some(Class::Stop), _) => "a request to stop".to_string(),
+        (Some(Class::Question), _) => "a question to CoderHelm".to_string(),
         (Some(Class::NotForCoderhelm), _) => "not for CoderHelm".to_string(),
         _ => "an instruction for this ticket".to_string(),
     };
@@ -669,6 +682,7 @@ pub fn outcome(action: Action, c: &Comment, pr: Option<&str>) -> String {
             "kept on the ticket's record; the next run on this ticket reads it".to_string()
         }
         Action::Leave => "left as it is".to_string(),
+        Action::Answer => "answered on the ticket from the run's record".to_string(),
         Action::Wait => "the next step reads it".to_string(),
     };
     format!("Read {}'s comment as {what}: {did}.", who(c))
@@ -695,12 +709,19 @@ pub fn ticket_reply(done: &[(Action, Comment)], pr: Option<&str>) -> Option<Stri
     let said: Vec<String> = done
         .iter()
         .filter(|(a, c)| {
-            matches!(a, Action::Stop | Action::Round | Action::Restart)
-                || (*a == Action::Fold && !c.question.trim().is_empty())
+            matches!(
+                a,
+                Action::Stop | Action::Round | Action::Restart | Action::Answer
+            ) || (*a == Action::Fold && !c.question.trim().is_empty())
         })
         .map(|(a, c)| {
             let pr = pr.filter(|p| !p.is_empty()).unwrap_or("the pull request");
             match (a, c.class, c.question.trim().is_empty()) {
+                (Action::Answer, _, _) => format!(
+                    "{}'s question (\"{}\"): where the work is now is below.",
+                    who(c),
+                    one_line(&c.text, 160)
+                ),
                 (Action::Stop, _, _) => format!(
                     "{} asked me to stop, so I stopped the run. What is built so far stays on \
                      its branch. Assign the ticket again, or reply here, and I take it up from \

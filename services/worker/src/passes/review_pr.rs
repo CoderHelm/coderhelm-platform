@@ -1235,6 +1235,17 @@ async fn post_reply(
     .await
 }
 
+/// What a review reply may name: the pull request and the commit reviewed.
+fn review_facts(msg: &ReviewMessage, head: &str) -> common::reply_compose::Facts {
+    let repo = format!("{}/{}", msg.repo_owner, msg.repo_name);
+    let f = common::reply_compose::Facts::default().github_pr(&repo, msg.pr_number, "", "open");
+    if head.trim().is_empty() {
+        f
+    } else {
+        f.github_commit(&repo, head, "the head commit reviewed")
+    }
+}
+
 /// Posts a reply where it was asked (the inline thread, or the PR
 /// conversation) and records it as a QUESTION record.
 #[allow(clippy::too_many_arguments)]
@@ -1250,26 +1261,32 @@ async fn send_reply(
     usage: &TokenUsage,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let body = format!("{answer}{consulted}{RATING_FOOTER}");
+    let replier = super::conversation::Replier::new(state, &msg.team_id);
+    let facts = review_facts(msg, head_sha);
     match msg.reply_to_comment_id {
         Some(comment_id) => {
-            crate::passes::conversation::review_reply(
+            Box::pin(crate::passes::conversation::reply_review(
+                &replier,
                 github,
                 &msg.repo_owner,
                 &msg.repo_name,
                 msg.pr_number,
                 comment_id,
                 &body,
-            )
+                &facts,
+            ))
             .await?;
         }
         None => {
-            crate::passes::conversation::github(
+            Box::pin(crate::passes::conversation::reply_github(
+                &replier,
                 github,
                 &msg.repo_owner,
                 &msg.repo_name,
                 msg.pr_number,
                 common::conversation::Say::reply_all("review", &body),
-            )
+                &facts,
+            ))
             .await?;
         }
     }
@@ -1459,24 +1476,32 @@ async fn review_failed_for_service(
         }
     };
     let note = gave_up_note(msg, head);
+    let replier = super::conversation::Replier::new(state, &msg.team_id);
+    let facts = review_facts(msg, head)
+        .state("the review didn't finish: every retry failed")
+        .stopped(common::truncate_str(reason, 600));
     let posted = match (msg.question.is_some(), msg.reply_to_comment_id) {
-        (true, Some(cid)) => crate::passes::conversation::review_reply(
+        (true, Some(cid)) => Box::pin(crate::passes::conversation::reply_review(
+            &replier,
             &github,
             &msg.repo_owner,
             &msg.repo_name,
             msg.pr_number,
             cid,
             &note,
-        )
+            &facts,
+        ))
         .await
         .map(|_| ()),
-        _ => crate::passes::conversation::github(
+        _ => Box::pin(crate::passes::conversation::reply_github(
+            &replier,
             &github,
             &msg.repo_owner,
             &msg.repo_name,
             msg.pr_number,
             common::conversation::Say::reply_all("review", &note),
-        )
+            &facts,
+        ))
         .await
         .map(|_| ()),
     };
@@ -4719,13 +4744,22 @@ async fn end_self_review_rounds(
     )
     .await
     {
-        let _ = crate::passes::conversation::github(
+        let replier = super::conversation::Replier::new(state, &msg.team_id);
+        let mut facts = review_facts(msg, "")
+            .state("the self-review rounds ended; the open findings are deferred")
+            .decision(why.to_string());
+        for f in open {
+            facts = facts.decision(format!("Deferred: {f}"));
+        }
+        let _ = Box::pin(crate::passes::conversation::reply_github(
+            &replier,
             github,
             &msg.repo_owner,
             &msg.repo_name,
             msg.pr_number,
             common::conversation::Say::reply_all("review", self_review_end_note(open, why)),
-        )
+            &facts,
+        ))
         .await;
     }
     info!(
