@@ -909,9 +909,9 @@ fn candidates(
     // A revert of the ticket's own pull request is the ticket's own too
     // (GitHub's Revert button names neither the ticket nor the issue).
     for (key, target) in reverts {
-        if found.contains(&(key.0.clone(), target)) {
+        if let Some(at) = found.iter().position(|f| f.0 == key.0 && f.1 == target) {
             mentioned.retain(|m| m != &key);
-            found.push(key);
+            found.insert(at, key);
         }
     }
     let own = found.len();
@@ -1552,8 +1552,8 @@ mod tests {
         assert_eq!(
             found,
             vec![
-                ("acme/api".to_string(), 7, true),
                 ("acme/api".to_string(), 8, true),
+                ("acme/api".to_string(), 7, true),
             ]
         );
         let read = |n: u64, title: &str, branch: &str, at: &str| {
@@ -1578,6 +1578,47 @@ mod tests {
         assert_eq!(reverted_pr("acme/api", "pat/undo", "Reverts #7."), Some(7));
         assert_eq!(reverted_pr("acme/api", "pat/undo", "Reverts acme/web#7"), None);
         assert_eq!(reverted_pr("acme/api", "pat/undo", "See #7"), None);
+    }
+
+    /// Seven earlier CoderHelm pull requests fill most of the list; a
+    /// person's acme/api#7 ("Fixes #42") merged and #8 reverted it. The
+    /// list keeps the revert along with what it reverts, so a new run on
+    /// GH-42 isn't refused.
+    #[test]
+    fn a_revert_survives_the_cut_whenever_its_target_does() {
+        use common::messages::TicketSource;
+        let history = TicketHistory {
+            runs: (20..27)
+                .map(|n| run_with_prs(&format!("01{n}"), &[("acme/api", n)]))
+                .collect(),
+            ..Default::default()
+        };
+        let listed = vec![(
+            "acme/api".to_string(),
+            serde_json::json!([
+                {"number": 8, "title": "Revert \"Fix login\"",
+                 "head": {"ref": "revert-7-pat/login"}, "body": "Reverts acme/api#7"},
+                {"number": 7, "title": "Fix login", "head": {"ref": "pat/login"},
+                 "body": "Fixes #42"},
+            ]),
+        )];
+        let found = candidates(&history, &listed, "GH-42", Some(("acme/api", 42)));
+        assert_eq!(found.len(), MAX_PRS);
+        assert!(found.contains(&("acme/api".to_string(), 8, true)), "{found:?}");
+        let mut h = history.clone();
+        for (repo, n, own) in found {
+            let mut p = earlier(&repo, n, "coderhelm[bot]", "closed", "2026-10-01");
+            if n == 7 || n == 8 {
+                p.state = "merged".into();
+                p.author = "pat".into();
+                p.title = if n == 8 { "Revert \"Fix login\"" } else { "Fix login" }.into();
+                p.branch = if n == 8 { "revert-7-pat/login" } else { "pat/login" }.into();
+                p.closed_at = format!("2026-11-0{}T10:00:00Z", n - 5);
+            }
+            p.for_ticket = own;
+            h.prs.push(p);
+        }
+        assert_eq!(h.blocking_merge(&TicketSource::Github, "acme/api"), None);
     }
 
     /// A re-run continues on CoderHelm's own open PR in the same repo: the
