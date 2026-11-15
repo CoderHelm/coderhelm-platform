@@ -37,10 +37,12 @@
 //!   never refuses again and again; only a person's explicit trigger
 //!   (Retry on that run, a command) starts the work
 //! - a failed / retried latest run doesn't block, until
-//!   [`MAX_FAILED_RUNS_IN_A_ROW`] runs in a row have failed: then an event
-//!   that leaves the ticket unchanged starts nothing (a field or status
-//!   change used to start the same failing run every time). A content
-//!   change, a reopen, a person's Retry or command still start one
+//!   [`MAX_FAILED_RUNS_IN_A_ROW`] runs in a row ended failed (a run a
+//!   person retried is passed over: it neither counts nor ends the streak):
+//!   then an event that leaves the ticket unchanged starts nothing (a field
+//!   or status change used to start the same failing run every time). A
+//!   content change, a reopen, a person's Retry or command still start one;
+//!   Retry and commands are never blocked by the cap
 //! - explicit human triggers (slash commands, comment retries) skip the
 //!   content check but still respect in-flight blocking
 
@@ -476,13 +478,15 @@ pub async fn gate_ticket_trigger(
     }
 }
 
-/// How many of the ticket's runs in a row, newest first, failed (or failed
-/// and a person retried them), from `(run_id, status)` in any order. Run
-/// ids are ULIDs, which sort by creation time.
+/// How many of the ticket's runs in a row, newest first, ended failed,
+/// from `(run_id, status)` in any order. A run a person retried (`retried`,
+/// whatever it ended as) is passed over: it neither counts nor ends the
+/// streak. Run ids are ULIDs, which sort by creation time.
 fn failed_in_a_row(mut runs: Vec<(String, String)>) -> usize {
     runs.sort_by(|a, b| b.0.cmp(&a.0));
     runs.iter()
-        .take_while(|(_, status)| matches!(status.as_str(), "failed" | "retried"))
+        .filter(|(_, status)| status != "retried")
+        .take_while(|(_, status)| status == "failed")
         .count()
 }
 
@@ -714,10 +718,30 @@ mod tests {
             failed_in_a_row(vec![
                 r("01C", "failed"),
                 r("01A", "failed"),
-                r("01D", "retried"),
+                r("01D", "failed"),
                 r("01B", "completed"),
             ]),
             2
+        );
+        // Two runs that asked a question and a person retried, then one
+        // failure: one failed run, not three.
+        assert_eq!(
+            failed_in_a_row(vec![
+                r("01A", "retried"),
+                r("01B", "retried"),
+                r("01C", "failed"),
+            ]),
+            1
+        );
+        // A retried run between failures doesn't end the streak.
+        assert_eq!(
+            failed_in_a_row(vec![
+                r("01A", "failed"),
+                r("01B", "retried"),
+                r("01C", "failed"),
+                r("01D", "failed"),
+            ]),
+            3
         );
         assert_eq!(failed_in_a_row(vec![r("01A", "completed")]), 0);
         assert_eq!(failed_in_a_row(vec![]), 0);

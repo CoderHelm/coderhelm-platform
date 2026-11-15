@@ -294,18 +294,6 @@ impl TicketHistory {
         common::merged_ticket::blocking(&merged, &allowed).cloned()
     }
 
-    /// Whether `p` is the ticket's own pull request: an earlier run of the
-    /// ticket opened it, its title or branch names the ticket, or, for a
-    /// GitHub issue (`issue`), it is in the issue's repository and its
-    /// title carries `#<n>` or its description closes the issue
-    /// ([`links_issue`]).
-    fn for_ticket(&self, p: &EarlierPr, ticket_id: &str, issue: Option<Issue>) -> bool {
-        self.opened_by_run(&p.repo, p.number)
-            || super::mentions_ticket(&p.title, ticket_id)
-            || super::mentions_ticket(&p.branch, ticket_id)
-            || links_issue(issue, &p.repo, &p.title, &p.body)
-    }
-
     /// Every earlier pull request for the ticket as `(repo, number)`: the
     /// ones read from GitHub, and any a run record names that wasn't.
     pub fn earlier_pr_numbers(&self) -> Vec<(String, u64)> {
@@ -865,13 +853,15 @@ fn closes_issue(body: &str, repo: &str, n: u64) -> bool {
 /// every one an earlier run opened, then the ones that are the ticket's own
 /// (the title or branch names the ticket, or they link the GitHub `issue`),
 /// then the ones that name it only in their description. A ticket many
-/// descriptions mention keeps its own pull requests in the list.
+/// descriptions mention keeps its own pull requests in the list. Each comes
+/// with whether it is the ticket's own ([`EarlierPr::for_ticket`]), decided
+/// here from the full listed description.
 fn candidates(
     history: &TicketHistory,
     listed: &[(String, serde_json::Value)],
     ticket_id: &str,
     issue: Option<Issue<'_>>,
-) -> Vec<(String, u64)> {
+) -> Vec<(String, u64, bool)> {
     let mut found: Vec<(String, u64)> = Vec::new();
     // Every pull request an earlier run opened, in its own repository (a
     // multi-repo run's record pairs its repo with only one of them).
@@ -908,9 +898,14 @@ fn candidates(
             }
         }
     }
+    let own = found.len();
     found.extend(mentioned);
     found.truncate(MAX_PRS);
     found
+        .into_iter()
+        .enumerate()
+        .map(|(i, (repo, number))| (repo, number, i < own))
+        .collect()
 }
 
 /// Adds every pull request for the ticket in `repos` (`owner/name`, the
@@ -942,9 +937,9 @@ pub async fn add_earlier_prs(
             }
         }
     }
-    for (repo, number) in candidates(history, &listed, ticket_id, issue) {
+    for (repo, number, for_ticket) in candidates(history, &listed, ticket_id, issue) {
         if let Some(mut p) = read_pr(github, &repo, number).await {
-            p.for_ticket = history.for_ticket(&p, ticket_id, issue);
+            p.for_ticket = for_ticket;
             history.prs.push(p);
         }
     }
@@ -1170,6 +1165,43 @@ mod tests {
         }
     }
 
+    /// Whether `p`, listed alone in its repository, is read as the ticket's
+    /// own pull request.
+    fn linked(h: &TicketHistory, p: &EarlierPr, ticket_id: &str, issue: Option<Issue>) -> bool {
+        let listed = vec![(
+            p.repo.clone(),
+            serde_json::json!([{
+                "number": p.number,
+                "title": p.title,
+                "head": {"ref": p.branch},
+                "body": p.body,
+            }]),
+        )];
+        candidates(h, &listed, ticket_id, issue)
+            .iter()
+            .any(|(repo, n, own)| *own && *n == p.number && repo == &p.repo)
+    }
+
+    /// "Closes #42" past the 6000 characters of a description kept when
+    /// the pull request is read still marks it as the issue's own: the
+    /// link is decided from the full listed description.
+    #[test]
+    fn a_closing_reference_deep_in_a_long_description_counts() {
+        let body = format!("{}\n\nCloses #42", "Checklist item. ".repeat(500));
+        assert!(body.find("Closes").unwrap() > 6000);
+        let listed = vec![(
+            "acme/api".to_string(),
+            serde_json::json!([{
+                "number": 7,
+                "title": "Fix login",
+                "head": {"ref": "pat/login"},
+                "body": body,
+            }]),
+        )];
+        let found = candidates(&TicketHistory::default(), &listed, "GH-42", Some(("acme/api", 42)));
+        assert_eq!(found, vec![("acme/api".to_string(), 7, true)]);
+    }
+
     fn earlier(repo: &str, n: u64, author: &str, state: &str, at: &str) -> EarlierPr {
         EarlierPr {
             repo: repo.into(),
@@ -1297,7 +1329,7 @@ mod tests {
         prep.branch = "feature/web-43".into();
         prep.body = "Prepares the API for WEB-42".into();
         prep.closed_at = "2026-11-02T10:00:00Z".into();
-        prep.for_ticket = h.for_ticket(&prep, "WEB-42", None);
+        prep.for_ticket = linked(&h, &prep, "WEB-42", None);
         assert!(!prep.for_ticket);
         h.prs.push(prep.clone());
         assert_eq!(h.blocking_merge(&TicketSource::Jira, "acme/app"), None);
@@ -1315,11 +1347,11 @@ mod tests {
             ..prep.clone()
         };
         for p in [&by_title, &by_branch, &by_run] {
-            assert!(h.for_ticket(p, "WEB-42", None), "{p:?}");
+            assert!(linked(&h, p, "WEB-42", None), "{p:?}");
         }
         let mut stopped = h.clone();
         let mut own = by_title.clone();
-        own.for_ticket = h.for_ticket(&own, "WEB-42", None);
+        own.for_ticket = linked(&h, &own, "WEB-42", None);
         stopped.prs.push(own);
         assert_eq!(
             stopped
@@ -1347,7 +1379,7 @@ mod tests {
             p.base = base.into();
             p.closed_at = "2026-11-02T10:00:00Z".into();
             let mut h = TicketHistory::default();
-            p.for_ticket = h.for_ticket(&p, "GH-42", issue);
+            p.for_ticket = linked(&h, &p, "GH-42", issue);
             h.prs.push(p);
             h.blocking_merge(&TicketSource::Github, "acme/api").is_some()
         };
@@ -1439,7 +1471,8 @@ mod tests {
         let listed = vec![("acme/app".to_string(), serde_json::Value::Array(list))];
         let found = candidates(&TicketHistory::default(), &listed, "WEB-42", None);
         assert_eq!(found.len(), MAX_PRS);
-        assert_eq!(found[0], ("acme/app".to_string(), 12));
+        assert_eq!(found[0], ("acme/app".to_string(), 12, true));
+        assert!(found[1..].iter().all(|(_, _, own)| !own));
         // A pull request that names another ticket isn't read at all.
         let other = vec![(
             "acme/app".to_string(),
