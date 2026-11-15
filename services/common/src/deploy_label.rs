@@ -29,7 +29,7 @@
 //!   never twice on the same head (the merge gate's record keeps the head it
 //!   was added for, `merge_gate::record_labels_added`), and never when a run
 //!   of the workflow already ran on the head. So it can't loop. Only a label
-//!   a workflow or CoderHelm took off ([`removed_by`]): one a person took
+//!   a workflow or CoderHelm took off ([`removed_by`]): one a person or another app took
 //!   off, or that CoderHelm can't tell who took off, stays off, and the
 //!   description says so ([`KeptOff`]).
 //! - A run held for a protected environment's approval waits for a person,
@@ -136,6 +136,13 @@ impl DeployRun {
         }
     }
 
+    /// A failed run whose jobs ran: its failing jobs are checks on the head
+    /// the CI fix loop reads (with their logs). One that failed to start
+    /// has nothing on the branch to fix.
+    pub fn fixable(&self) -> bool {
+        self.state() == RunState::Failed && self.conclusion != "startup_failure"
+    }
+
     /// `created_at` as epoch seconds.
     pub fn created_secs(&self) -> Option<i64> {
         chrono::DateTime::parse_from_rfc3339(&self.created_at)
@@ -166,7 +173,7 @@ impl DeployRun {
             RunState::Passed => "passed".to_string(),
             RunState::Failed => match self.conclusion.as_str() {
                 "timed_out" => "timed out".to_string(),
-                "startup_failure" => "failed to start".to_string(),
+                "startup_failure" => "failed to start, before any of its jobs ran".to_string(),
                 _ => "failed".to_string(),
             },
             RunState::DidNotRun => match self.conclusion.as_str() {
@@ -339,8 +346,22 @@ pub enum RemovedBy {
     /// A workflow (`github-actions[bot]`) or CoderHelm's own app.
     Workflow,
     Person,
+    /// Another app or bot account (GitHub's `Bot` actors, `…[bot]` logins).
+    OtherApp,
     /// The pull request's events couldn't be read, or show no removal.
     Unknown,
+}
+
+impl RemovedBy {
+    /// Who took the label off, in words.
+    pub fn who(self) -> &'static str {
+        match self {
+            RemovedBy::Workflow => "its workflow",
+            RemovedBy::Person => "a person",
+            RemovedBy::OtherApp => "another app",
+            RemovedBy::Unknown => "someone CoderHelm couldn't identify",
+        }
+    }
 }
 
 /// Who took `label` off last, from the pull request's events (oldest
@@ -357,9 +378,15 @@ pub fn removed_by(events: Option<&serde_json::Value>, label: &str, bots: &[&str]
                     .as_str()
                     .is_some_and(|n| n.eq_ignore_ascii_case(label))
         });
-    match last.and_then(|e| e["actor"]["login"].as_str()) {
+    let Some(actor) = last.map(|e| &e["actor"]) else {
+        return RemovedBy::Unknown;
+    };
+    match actor["login"].as_str() {
         None => RemovedBy::Unknown,
         Some(a) if bots.iter().any(|b| b.eq_ignore_ascii_case(a)) => RemovedBy::Workflow,
+        Some(a) if actor["type"].as_str() == Some("Bot") || a.ends_with("[bot]") => {
+            RemovedBy::OtherApp
+        }
         Some(_) => RemovedBy::Person,
     }
 }
@@ -376,10 +403,7 @@ impl KeptOff {
     /// One sentence for the full test evidence.
     pub fn evidence_line(&self) -> String {
         let label = self.label.replace('`', "'");
-        let by = match self.by {
-            RemovedBy::Person => "a person",
-            _ => "someone CoderHelm couldn't identify",
-        };
+        let by = self.by.who();
         format!(
             "`{label}` was taken off by {by}, so CoderHelm did not put it back on this head and \
              its workflow did not run here."
@@ -493,6 +517,12 @@ mod tests {
         for c in ["failure", "timed_out", "startup_failure"] {
             assert_eq!(run("completed", c, "").state(), RunState::Failed, "{c}");
         }
+        // Its jobs ran and failed: the fix loop has failing checks and logs.
+        assert!(run("completed", "failure", "").fixable());
+        assert!(run("completed", "timed_out", "").fixable());
+        // It never got to a job: nothing on the branch to fix.
+        assert!(!run("completed", "startup_failure", "").fixable());
+        assert!(!run("completed", "success", "").fixable());
         for c in [
             "skipped",
             "cancelled",
@@ -677,6 +707,24 @@ mod tests {
             kept.evidence_line(),
             "`CI:DEPLOY_PREVIEW` was taken off by a person, so CoderHelm did not put it back on \
              this head and its workflow did not run here."
+        );
+        let ev_bot = |login: &str, kind: &str| {
+            json!([{"event": "unlabeled", "label": {"name": "CI:DEPLOY_PREVIEW"},
+                    "actor": {"login": login, "type": kind}}])
+        };
+        for (login, kind) in [("deploy-bot[bot]", "Bot"), ("release-app", "Bot")] {
+            let by = removed_by(Some(&ev_bot(login, kind)), "CI:DEPLOY_PREVIEW", &bots);
+            assert_eq!(by, RemovedBy::OtherApp, "{login}");
+            let line = KeptOff {
+                label: "CI:DEPLOY_PREVIEW".into(),
+                by,
+            }
+            .evidence_line();
+            assert!(line.starts_with("`CI:DEPLOY_PREVIEW` was taken off by another app,"), "{line}");
+        }
+        assert_eq!(
+            removed_by(Some(&ev_bot("dana", "User")), "CI:DEPLOY_PREVIEW", &bots),
+            RemovedBy::Person
         );
         let unknown = KeptOff {
             by: RemovedBy::Unknown,

@@ -181,8 +181,7 @@ pub struct Facts {
     /// Where the repository's deploy label's workflows stand on the head
     /// (`deploy_label::before_ready`): a draft waits for them.
     pub deploy: common::deploy_label::Standing,
-    /// A deploy label a person (or someone CoderHelm couldn't identify) took
-    /// off was left off this head: the description says so.
+    /// A deploy label a workflow didn't take off was left off this head: the description says so.
     pub deploy_kept_off: bool,
 }
 
@@ -487,21 +486,27 @@ pub fn decide(f: &Facts) -> Decision {
             ));
         }
         common::deploy_label::Standing::Failed(runs) if !f.ci.failing() && !f.ci.running() => {
-            reasons.push(Reason::new(
-                format!(
-                    "The deploy label's workflow didn't pass on this head: {}",
-                    runs.iter()
-                        .map(|r| match r.link().as_str() {
-                            "" => format!("`{}` {}", r.workflow, r.result()),
-                            link => format!("`{}` {} ({link})", r.workflow, r.result()),
-                        })
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-                "Fix the failure on this branch (CoderHelm decides again on the push), or re-run \
-                 the workflow if the failure isn't the change's; the pull request leaves draft \
-                 once it passes.",
-            ));
+            let unstarted: Vec<&common::deploy_label::DeployRun> =
+                runs.iter().filter(|r| !r.fixable()).collect();
+            if !unstarted.is_empty() {
+                reasons.push(Reason::new(
+                    format!(
+                        "The deploy label's workflow didn't pass on this head: {}",
+                        unstarted
+                            .iter()
+                            .map(|r| match r.link().as_str() {
+                                "" => format!("`{}` {}", r.workflow, r.result()),
+                                link => format!("`{}` {} ({link})", r.workflow, r.result()),
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                    "No job ran, so there is nothing on this branch to fix: the workflow's \
+                     setup in the repository (its secrets, permissions or the environment it \
+                     deploys to) stopped it. Re-run the workflow once that is right; the pull \
+                     request leaves draft once it passes.",
+                ));
+            }
         }
         _ => {}
     }
@@ -1110,6 +1115,7 @@ async fn gather(ctx: &Ctx<'_>) -> Result<Facts, Refused> {
                 ctx.attempt,
             )
         })?;
+        f.ci = with_deploy_failures(&f.ci, &f.deploy);
         let verdict = common::merge_gate::bot_verdict_at_head(
             &ctx.state.dynamo,
             &ctx.state.config.settings_table_name,
@@ -1131,6 +1137,29 @@ async fn gather(ctx: &Ctx<'_>) -> Result<Facts, Refused> {
     }
     f.head = pr["head"]["sha"].as_str().unwrap_or("").to_string();
     Ok(f)
+}
+
+/// The head's CI with the deploy label's failed runs whose jobs ran counted
+/// as failing checks. A later skipped run of the same `labeled` workflow
+/// (started by another label) hides its failing job from the latest check
+/// of each name; counted here, the CI fix loop takes it like any other
+/// failing check.
+pub fn with_deploy_failures(ci: &Ci, deploy: &common::deploy_label::Standing) -> Ci {
+    let common::deploy_label::Standing::Failed(runs) = deploy else {
+        return ci.clone();
+    };
+    let names: Vec<String> = runs
+        .iter()
+        .filter(|r| r.fixable())
+        .map(|r| format!("`{}`", r.workflow.replace('`', "'")))
+        .collect();
+    if names.is_empty() || ci.failing() {
+        return ci.clone();
+    }
+    Ci {
+        green: false,
+        why: format!("CI fails on this head: {}", names.join(", ")),
+    }
 }
 
 /// Whether the run's CI fix loop ended because every failing check fails on
@@ -2474,14 +2503,52 @@ mod tests {
             ..green_approved()
         };
         match decide(&f) {
-            Decision::Held { reasons } => assert!(
-                reasons[0].line().contains(
-                    "`Deploy preview` failed to start ([run](https://github.com/o/r/actions/runs/3))"
-                ),
-                "{reasons:?}"
-            ),
+            Decision::Held { reasons } => {
+                let line = reasons[0].line();
+                assert!(
+                    line.contains(
+                        "`Deploy preview` failed to start, before any of its jobs ran \
+                         ([run](https://github.com/o/r/actions/runs/3))"
+                    ),
+                    "{line}"
+                );
+                assert!(line.contains("nothing on this branch to fix"), "{line}");
+                assert!(!line.contains("Fix the failure"), "{line}");
+            }
             d => panic!("{d:?}"),
         }
+        // Its jobs ran and failed, hidden behind a later skipped run of the
+        // same workflow: counted as failing CI, the CI fix loop's to take.
+        let ran = DeployRun {
+            conclusion: "failure".into(),
+            ..failed.clone()
+        };
+        let green = Ci {
+            green: true,
+            why: String::new(),
+        };
+        let deploy = Standing::Failed(vec![ran]);
+        let f = Facts {
+            ci: with_deploy_failures(&green, &deploy),
+            deploy,
+            ..green_approved()
+        };
+        assert!(f.ci.failing());
+        match decide(&f) {
+            Decision::Held { reasons } => {
+                assert_eq!(reasons.len(), 1, "{reasons:?}");
+                assert!(
+                    reasons[0].line().contains("CI is failing on this head: `Deploy preview`"),
+                    "{reasons:?}"
+                );
+            }
+            d => panic!("{d:?}"),
+        }
+        // One that never started leaves CI as it read.
+        assert_eq!(
+            with_deploy_failures(&green, &Standing::Failed(vec![failed.clone()])),
+            green
+        );
         // Failed while CI fails too: the failing checks say it, once.
         let f = Facts {
             deploy: Standing::Failed(vec![failed.clone()]),

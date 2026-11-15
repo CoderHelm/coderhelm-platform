@@ -467,6 +467,27 @@ async fn read(state: &WorkerState, github: &GitHubClient, c: &Candidate) -> Opti
                 .collect();
         }
     }
+    // A draft's deploy-label run whose jobs failed, hidden from the latest
+    // check of each name by a later skipped run of the same workflow: a
+    // failing check like any other, for the CI fix loop.
+    if seen.draft && seen.failing.is_empty() && !seen.checks_running {
+        let labels = super::deploy_label::labels(state, &c.team_id, &c.owner, &c.repo).await;
+        let (runs, _) = super::deploy_label::runs_on_head(
+            state,
+            github,
+            &c.team_id,
+            (c.owner.as_str(), c.repo.as_str()),
+            &seen.head,
+            &text("/head/ref"),
+            &labels,
+        )
+        .await;
+        seen.failing = runs
+            .into_iter()
+            .filter(|r| r.fixable())
+            .map(|r| r.workflow)
+            .collect();
+    }
     seen.reviewer_on =
         super::review_pr::reviewer_enabled(state, &c.team_id, &c.owner, &c.repo).await;
     seen.own_verdict =

@@ -8,8 +8,8 @@
 //! - [`before_ready`] puts a deploy label a workflow took off back on a new
 //!   head, once per head, and says whether the pull request waits for its
 //!   workflow before it leaves draft.
-//! - [`kept_off`] names the deploy labels a person (or someone CoderHelm
-//!   couldn't identify) took off, which CoderHelm leaves off, for the
+//! - [`kept_off`] names the deploy labels a person, another app or someone
+//!   CoderHelm couldn't identify took off, which CoderHelm leaves off, for the
 //!   description.
 
 use common::deploy_label::{self, DeployRun, KeptOff, RemovedBy, Standing};
@@ -94,7 +94,7 @@ pub async fn runs_on_head(
 
 /// Splits deploy labels to put back by who took them off last: those a
 /// workflow (`github-actions[bot]`) or CoderHelm's own app took off, and
-/// those a person, or someone CoderHelm can't identify, took off.
+/// those a person, another app, or someone CoderHelm can't identify took off.
 async fn by_remover(
     gh: &GitHubClient,
     (owner, repo): (&str, &str),
@@ -127,8 +127,8 @@ async fn by_remover(
     (add, kept)
 }
 
-/// The deploy labels CoderHelm leaves off this head because a person, or
-/// someone CoderHelm can't identify, took them off: what the description
+/// The deploy labels CoderHelm leaves off this head because a person,
+/// another app, or someone CoderHelm can't identify took them off: what the description
 /// says. Empty when `complete` is false or anything can't be read.
 #[allow(clippy::too_many_arguments)]
 pub async fn kept_off(
@@ -198,8 +198,7 @@ pub async fn record_added(
 
 /// Before a draft leaves draft: puts back a deploy label a workflow took
 /// off, once per head, and says where the deploy label's workflows stand on
-/// the head, and whether a label a person (or someone CoderHelm can't
-/// identify) took off was left off. A failed read never adds a label.
+/// the head, and whether a label a workflow didn't take off was left off. A failed read never adds a label.
 pub async fn before_ready(
     state: &WorkerState,
     gh: &GitHubClient,

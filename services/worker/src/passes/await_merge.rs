@@ -228,21 +228,25 @@ pub(crate) fn label_ci_settled(
     common::deploy_label::settled(labels_added_at, latest_start, now)
 }
 
-/// Pure: the deploy labels among `labels` that a person took off last, from
-/// the pull request's events (`common::deploy_label::removed_by`; `bots` are
-/// the logins that count as a workflow). A label never taken off isn't one.
-pub(crate) fn taken_off_by_person(
+/// Pure: the deploy labels among `labels` that a person or another app took
+/// off last, from the pull request's events
+/// (`common::deploy_label::removed_by`; `bots` are the logins that count as
+/// a workflow). A label never taken off isn't one.
+pub(crate) fn taken_off(
     events: &serde_json::Value,
     labels: &[String],
     bots: &[&str],
-) -> Vec<String> {
+) -> Vec<common::deploy_label::KeptOff> {
+    use common::deploy_label::{removed_by, KeptOff, RemovedBy};
     labels
         .iter()
-        .filter(|l| {
-            common::deploy_label::removed_by(Some(events), l, bots)
-                == common::deploy_label::RemovedBy::Person
+        .filter_map(|l| match removed_by(Some(events), l, bots) {
+            by @ (RemovedBy::Person | RemovedBy::OtherApp) => Some(KeptOff {
+                label: l.clone(),
+                by,
+            }),
+            _ => None,
         })
-        .cloned()
         .collect()
 }
 
@@ -281,8 +285,9 @@ pub(crate) struct GateView {
     pub present_labels: Vec<String>,
     /// The gate already added the deploy labels for this head, and when.
     pub labels_added_at: Option<i64>,
-    /// Deploy labels a person took off the pull request: never put back.
-    pub taken_off_by_person: Vec<String>,
+    /// Deploy labels a person or another app took off the pull request:
+    /// never put back.
+    pub taken_off: Vec<common::deploy_label::KeptOff>,
     /// CI on the head, quarantine applied. None until both keys are in (CI is
     /// not read for a PR that can't merge yet).
     pub ci: Option<CheckSummary>,
@@ -395,12 +400,19 @@ pub(crate) fn decide_gate(v: &GateView) -> GateDecision {
         .join(", ");
     if !v.want_labels.is_empty() {
         let has = |list: &[String], l: &str| list.iter().any(|p| p.eq_ignore_ascii_case(l));
-        let (kept_off, missing): (Vec<String>, Vec<String>) = v
+        let kept_off = |l: &str| v.taken_off.iter().find(|k| k.label.eq_ignore_ascii_case(l));
+        let missing: Vec<String> = v
+            .want_labels
+            .iter()
+            .filter(|l| !has(&v.present_labels, l) && kept_off(l).is_none())
+            .cloned()
+            .collect();
+        let left_off: Vec<&common::deploy_label::KeptOff> = v
             .want_labels
             .iter()
             .filter(|l| !has(&v.present_labels, l))
-            .cloned()
-            .partition(|l| has(&v.taken_off_by_person, l));
+            .filter_map(|l| kept_off(l))
+            .collect();
         if !missing.is_empty() && v.labels_added_at.is_none() {
             lines.push((
                 Mark::Waiting,
@@ -414,19 +426,19 @@ pub(crate) fn decide_gate(v: &GateView) -> GateDecision {
             };
         }
         // Present, or added earlier for this head and since removed by the
-        // repo's own workflow: never re-added in a loop. One a person took
-        // off stays off.
-        if kept_off.is_empty() {
+        // repo's own workflow: never re-added in a loop. One a person or
+        // another app took off stays off.
+        if left_off.is_empty() {
             lines.push((Mark::Done, format!("Deploy label {joined} applied")));
-        } else {
-            let named = kept_off
-                .iter()
-                .map(|l| format!("`{l}`"))
-                .collect::<Vec<_>>()
-                .join(", ");
+        }
+        for k in left_off {
             lines.push((
                 Mark::Done,
-                format!("Deploy label {named} was taken off by a person, so CoderHelm left it off"),
+                format!(
+                    "Deploy label `{}` was taken off by {}, so CoderHelm left it off",
+                    k.label,
+                    k.by.who()
+                ),
             ));
         }
     }
@@ -1267,7 +1279,7 @@ async fn evaluate(
         labels_added_at: (record.labels_added_head == msg.head_sha)
             .then_some(record.labels_added_at)
             .flatten(),
-        taken_off_by_person: vec![],
+        taken_off: vec![],
         ci: None,
         now,
     };
@@ -1285,7 +1297,7 @@ async fn evaluate(
         if !app.is_empty() {
             bots.push(&app);
         }
-        view.taken_off_by_person = taken_off_by_person(&events, &view.want_labels, &bots);
+        view.taken_off = taken_off(&events, &view.want_labels, &bots);
     }
     let mut decision = decide_gate(&view);
     let mut quarantined: Option<Vec<String>> = None;
@@ -1889,7 +1901,7 @@ mod ci_tests {
             want_labels: vec![],
             present_labels: vec![],
             labels_added_at: None,
-            taken_off_by_person: vec![],
+            taken_off: vec![],
             ci: None,
             now: 10_000,
         }
@@ -2068,13 +2080,25 @@ mod ci_tests {
         let by_person = json!([ev("labeled", "coderhelm[bot]"), ev("unlabeled", "dana")]);
         let mut v = view();
         v.want_labels = vec!["deploy:staging".into()];
-        v.taken_off_by_person = taken_off_by_person(&by_person, &v.want_labels, &bots);
-        assert_eq!(v.taken_off_by_person, vec!["deploy:staging".to_string()]);
+        v.taken_off = taken_off(&by_person, &v.want_labels, &bots);
         let d = decide_gate(&v);
         assert_eq!(d.action, Action::ReadCi);
         assert_eq!(
             d.lines.last().map(|(_, l)| l.as_str()),
             Some("Deploy label `deploy:staging` was taken off by a person, so CoderHelm left it off")
+        );
+        // Another app took it off: left off too, and named as an app.
+        let by_app = json!([
+            ev("labeled", "coderhelm[bot]"),
+            {"event": "unlabeled", "label": {"name": "deploy:staging"},
+             "actor": {"login": "deploy-bot[bot]", "type": "Bot"}}
+        ]);
+        v.taken_off = taken_off(&by_app, &v.want_labels, &bots);
+        let d = decide_gate(&v);
+        assert_eq!(d.action, Action::ReadCi);
+        assert_eq!(
+            d.lines.last().map(|(_, l)| l.as_str()),
+            Some("Deploy label `deploy:staging` was taken off by another app, so CoderHelm left it off")
         );
         // Its workflow took it off after its run, or it was never on: added.
         let by_workflow = json!([
@@ -2082,7 +2106,7 @@ mod ci_tests {
             ev("unlabeled", "github-actions[bot]")
         ]);
         for events in [by_workflow, json!([])] {
-            v.taken_off_by_person = taken_off_by_person(&events, &v.want_labels, &bots);
+            v.taken_off = taken_off(&events, &v.want_labels, &bots);
             assert_eq!(
                 decide_gate(&v).action,
                 Action::AddLabels(vec!["deploy:staging".into()])

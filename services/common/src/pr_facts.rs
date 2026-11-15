@@ -335,8 +335,8 @@ pub struct Facts {
     /// label starts (`deploy_label`): its conclusion and link are quoted.
     #[serde(default)]
     pub deploy: Vec<crate::deploy_label::DeployRun>,
-    /// Deploy labels a person (or someone CoderHelm couldn't identify) took
-    /// off, which CoderHelm left off this head.
+    /// Deploy labels a workflow didn't take off, which CoderHelm left off
+    /// this head.
     #[serde(default)]
     pub deploy_kept_off: Vec<crate::deploy_label::KeptOff>,
     pub unverified: Vec<Unverified>,
