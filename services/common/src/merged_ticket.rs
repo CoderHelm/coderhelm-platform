@@ -19,9 +19,14 @@
 //!
 //! - pressing Retry on the run that stopped (the dashboard, or
 //!   `POST /api/runs/{run_id}/retry`);
-//! - reopening the ticket in Jira;
-//! - replying on the ticket with what is still to do (the new run starts
-//!   with that person's direction).
+//! - on Jira, replying on the ticket with what is still to do (the new run
+//!   starts with that person's direction);
+//! - on GitHub, mentioning `@coderhelm` (or `/coderhelm`) on the issue with
+//!   what is still to do, or starting the issue from the dashboard.
+//!
+//! A Jira status change is never one: a ticket moving In Review -> QA
+//! after its pull request merged into an integration branch is the second
+//! run this rule exists to stop.
 //!
 //! A run started that way records it ([`FIELD_AFTER_MERGE`]), so its own
 //! retries and later runs on the ticket aren't stopped again by the same
@@ -41,9 +46,6 @@ pub const STOP_KIND: &str = "already_merged";
 /// The run record's field set when a person asked for the run after the
 /// ticket's pull request merged.
 pub const FIELD_AFTER_MERGE: &str = "after_merge";
-/// The run record's field holding the merged pull request ([`MergedPr`],
-/// JSON) a run stopped for.
-pub const FIELD_MERGED_PR: &str = "merged_pr";
 
 /// A merged pull request for the ticket.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -95,22 +97,13 @@ fn started_ms(run_id: &str) -> Option<i64> {
         .and_then(|u| i64::try_from(u.timestamp_ms()).ok())
 }
 
-/// The merged pull request that stops this run, or None.
+/// The merged pull request that stops a new run, or None.
 ///
-/// `asked`: a person asked for this run after the merge (Retry on the run
-/// that stopped, a reopened ticket, a reply with direction).
-/// `allowed_runs`: ids of the ticket's earlier runs a person asked for that
-/// way. Only the newest merge counts: a run allowed after it lets the
-/// ticket go on; one allowed before it doesn't. A merge with no known time
-/// is taken to be before any allowed run.
-pub fn blocking<'a>(
-    merged: &'a [MergedPr],
-    asked: bool,
-    allowed_runs: &[&str],
-) -> Option<&'a MergedPr> {
-    if asked {
-        return None;
-    }
+/// `allowed_runs`: ids of the ticket's earlier runs a person asked for
+/// after the merge. Only the newest merge counts: a run allowed after it
+/// lets the ticket go on; one allowed before it doesn't. A merge with no
+/// known time is taken to be before any allowed run.
+pub fn blocking<'a>(merged: &'a [MergedPr], allowed_runs: &[&str]) -> Option<&'a MergedPr> {
     let newest = merged.iter().max_by(|a, b| {
         a.merged_ms()
             .unwrap_or(i64::MIN)
@@ -141,12 +134,12 @@ pub fn refusal(source: &TicketSource, ticket: &str, pr: &MergedPr) -> String {
         .unwrap_or_default();
     let how = match source {
         TicketSource::Jira => {
-            "press Retry on the stopped run in CoderHelm, reopen the ticket, or reply on the \
-             ticket with what is still to do"
+            "press Retry on the stopped run in CoderHelm, or reply on the ticket with what is \
+             still to do"
         }
         _ => {
-            "press Retry on the stopped run in CoderHelm, or reply on the issue with what is \
-             still to do"
+            "press Retry on the stopped run in CoderHelm, or mention @coderhelm on the issue \
+             with what is still to do"
         }
     };
     format!(
@@ -159,8 +152,18 @@ pub fn refusal(source: &TicketSource, ticket: &str, pr: &MergedPr) -> String {
 }
 
 /// What the run's wait asks for.
-pub const WAIT_ACTION: &str =
-    "Press Retry to run the ticket again anyway, or reply on the ticket with what is still to do";
+pub fn wait_action(source: &TicketSource) -> &'static str {
+    match source {
+        TicketSource::Jira => {
+            "Press Retry to run the ticket again anyway, or reply on the ticket with what is \
+             still to do"
+        }
+        _ => {
+            "Press Retry to run the issue again anyway, or mention @coderhelm on the issue with \
+             what is still to do"
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -197,24 +200,23 @@ mod tests {
     #[test]
     fn a_merged_pull_request_stops_the_run() {
         let prs = [merged(12, "2026-11-02T10:00:00Z")];
-        assert_eq!(blocking(&prs, false, &[]), Some(&prs[0]));
+        assert_eq!(blocking(&prs, &[]), Some(&prs[0]));
         // Nothing merged: nothing stops it.
-        assert_eq!(blocking(&[], false, &[]), None);
+        assert_eq!(blocking(&[], &[]), None);
     }
 
     #[test]
     fn a_person_asking_after_the_merge_lets_it_run() {
         let prs = [merged(12, "2026-11-02T10:00:00Z")];
-        assert_eq!(blocking(&prs, true, &[]), None);
         // An earlier run a person asked for after the merge: its retries
         // and later runs go on.
         let after = run_at("2026-11-03T09:00:00Z");
-        assert_eq!(blocking(&prs, false, &[after.as_str()]), None);
+        assert_eq!(blocking(&prs, &[after.as_str()]), None);
         // One asked for before the merge doesn't count.
         let before = run_at("2026-11-01T09:00:00Z");
-        assert_eq!(blocking(&prs, false, &[before.as_str()]), Some(&prs[0]));
+        assert_eq!(blocking(&prs, &[before.as_str()]), Some(&prs[0]));
         // Not a run id: ignored.
-        assert_eq!(blocking(&prs, false, &["nope"]), Some(&prs[0]));
+        assert_eq!(blocking(&prs, &["nope"]), Some(&prs[0]));
     }
 
     #[test]
@@ -225,19 +227,19 @@ mod tests {
         ];
         let between = run_at("2026-11-05T09:00:00Z");
         assert_eq!(
-            blocking(&prs, false, &[between.as_str()]).map(|p| p.number),
+            blocking(&prs, &[between.as_str()]).map(|p| p.number),
             Some(30)
         );
         let later = run_at("2026-11-11T09:00:00Z");
-        assert_eq!(blocking(&prs, false, &[later.as_str()]), None);
+        assert_eq!(blocking(&prs, &[later.as_str()]), None);
     }
 
     #[test]
     fn a_merge_with_no_known_time_is_before_any_allowed_run() {
         let prs = [merged(12, "")];
-        assert_eq!(blocking(&prs, false, &[]), Some(&prs[0]));
+        assert_eq!(blocking(&prs, &[]), Some(&prs[0]));
         let any = run_at("2020-01-01T00:00:00Z");
-        assert_eq!(blocking(&prs, false, &[any.as_str()]), None);
+        assert_eq!(blocking(&prs, &[any.as_str()]), None);
     }
 
     #[test]
@@ -254,7 +256,8 @@ mod tests {
             "{jira}"
         );
         assert!(jira.contains("press Retry on the stopped run"), "{jira}");
-        assert!(jira.contains("reopen the ticket"), "{jira}");
+        assert!(jira.contains("reply on the ticket"), "{jira}");
+        assert!(!jira.contains("reopen"), "{jira}");
         let gh = refusal(
             &TicketSource::Github,
             "GH-7",
@@ -267,6 +270,8 @@ mod tests {
         assert!(gh.contains("merged. Another run"), "{gh}");
         assert!(!gh.contains("shipped"), "{gh}");
         assert!(!gh.contains("reopen"), "{gh}");
-        assert!(gh.contains("reply on the issue"), "{gh}");
+        assert!(gh.contains("mention @coderhelm on the issue"), "{gh}");
+        assert!(wait_action(&TicketSource::Github).contains("mention @coderhelm"));
+        assert!(wait_action(&TicketSource::Jira).contains("reply on the ticket"));
     }
 }

@@ -290,7 +290,7 @@ impl TicketHistory {
         let scope = matches!(source, common::messages::TicketSource::Github).then_some(repo);
         let merged = self.merged_prs(scope);
         let allowed = self.allowed_after_merge(scope);
-        common::merged_ticket::blocking(&merged, false, &allowed).cloned()
+        common::merged_ticket::blocking(&merged, &allowed).cloned()
     }
 
     /// Whether `p` is the ticket's own pull request: an earlier run of the

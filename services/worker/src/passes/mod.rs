@@ -9712,7 +9712,7 @@ async fn stop_if_already_merged(
 }
 
 /// Stops a run the merged-ticket rule refused: the reason on the run and
-/// the ticket, the merged pull request on the record, and the run waiting
+/// the ticket, `stop_kind` on the record, and the run waiting
 /// on a person (whether more work is due after a merge is theirs to say).
 #[allow(clippy::too_many_arguments)]
 async fn stop_run_already_merged(
@@ -9734,14 +9734,12 @@ async fn stop_run_already_merged(
         .table_name(&state.config.runs_table_name)
         .key("team_id", attr_s(&msg.team_id))
         .key("run_id", attr_s(run_id))
-        .update_expression("SET stop_kind = :k, #mp = :p")
-        .expression_attribute_names("#mp", mt::FIELD_MERGED_PR)
+        .update_expression("SET stop_kind = :k")
         .expression_attribute_values(":k", attr_s(mt::STOP_KIND))
-        .expression_attribute_values(":p", attr_s(&serde_json::to_string(pr).unwrap_or_default()))
         .send()
         .await
     {
-        warn!(run_id, error = %e, "Could not record the merged pull request on the run");
+        warn!(run_id, error = %e, "Could not record why the run stopped");
     }
     match msg.source {
         TicketSource::Jira => {
@@ -9774,7 +9772,7 @@ async fn stop_run_already_merged(
         }
         _ => {}
     }
-    let wait = WaitingOn::fixed(mt::WAIT_ACTION, message, "");
+    let wait = WaitingOn::fixed(mt::wait_action(&msg.source), message, "");
     // Whether more work is due after a merge is a person's decision:
     // recorded as the judge's, no model call.
     let judged = stop_judge::cannot_proceed(

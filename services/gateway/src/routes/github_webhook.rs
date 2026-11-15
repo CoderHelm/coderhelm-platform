@@ -1607,6 +1607,19 @@ async fn handle_issue_comment(
 
     let issue = &payload["issue"];
     let repo = &payload["repository"];
+    let sender = payload["sender"]["login"].as_str().unwrap_or("");
+    let stopped_as_merged = super::trigger_gate::github_issue_stopped_as_merged(
+        state,
+        team_id,
+        &format!("GH-{}", issue["number"].as_u64().unwrap_or(0)),
+        &format!(
+            "{}/{}",
+            repo["owner"]["login"].as_str().unwrap_or(""),
+            repo["name"].as_str().unwrap_or("")
+        ),
+    )
+    .await;
+    let (after_merge, person_direction) = command_after_merge(stopped_as_merged, sender, body);
 
     let message = WorkerMessage::Ticket(TicketMessage {
         team_id: team_id.to_string(),
@@ -1627,6 +1640,8 @@ async fn handle_issue_comment(
         ),
         image_attachments: vec![],
         ticket_type: common::messages::ticket_type_of_github(issue),
+        after_merge,
+        person_direction,
         ..Default::default()
     });
 
@@ -1662,6 +1677,22 @@ async fn handle_issue_comment(
     }
 
     send_to_queue(state, &state.config.ticket_queue_url, &message).await
+}
+
+/// What an `@coderhelm` / `/coderhelm` command on a GitHub issue carries
+/// when the issue's last run stopped because its pull request had already
+/// merged (`common::merged_ticket`): a person asking for the work anyway
+/// (`after_merge`), with their words as the run's direction
+/// ("author: words"). Otherwise neither.
+fn command_after_merge(
+    stopped_as_merged: bool,
+    sender: &str,
+    comment: &str,
+) -> (bool, Option<String>) {
+    if !stopped_as_merged {
+        return (false, None);
+    }
+    (true, Some(format!("{sender}: {}", comment.trim())))
 }
 
 /// The run's work on its own PR that a round left held or unfinished
@@ -5922,5 +5953,30 @@ mod restack_tests {
         ] {
             assert!(restack_message(&p, 7, "t1", "acme", "web").is_none());
         }
+    }
+}
+
+#[cfg(test)]
+mod command_after_merge_tests {
+    use super::command_after_merge;
+
+    /// A command on an issue whose last run stopped because its pull
+    /// request had already merged asks for the work anyway, with the
+    /// person's words as the run's direction; on any other issue it carries
+    /// neither, so the merged-ticket rule still applies.
+    #[test]
+    fn a_command_after_the_merge_stop_asks_for_the_work_anyway() {
+        assert_eq!(
+            command_after_merge(
+                true,
+                "pat",
+                "  @coderhelm the date picker on Android still crashes\n"
+            ),
+            (
+                true,
+                Some("pat: @coderhelm the date picker on Android still crashes".to_string())
+            )
+        );
+        assert_eq!(command_after_merge(false, "pat", "/coderhelm go"), (false, None));
     }
 }
