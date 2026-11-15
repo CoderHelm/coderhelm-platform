@@ -62,9 +62,21 @@ pub async fn save(
     body: &str,
 ) -> Result<(), Error> {
     let body = clean(body);
+    // The final review, as its reader would read it: no running check as a
+    // result, nothing CoderHelm can do handed to a person, nothing said
+    // twice, no filler, no raw id where a name exists (`pr_review`).
+    let reviewed = common::pr_review::review(&body);
+    for f in &reviewed.findings {
+        warn!(
+            pr_number = number,
+            kind = ?f.kind,
+            said = %common::truncate_str(&f.said, 200),
+            "The final review of the description fixed what a writer left"
+        );
+    }
     // The last word before people read it: an item for a person the gate
     // does not let through is taken out, and logged as the writer's defect.
-    let sunk = common::person_gate::sink(&body);
+    let sunk = common::person_gate::sink(&reviewed.body);
     if sunk.defect() {
         tracing::error!(
             pr = number,
@@ -274,12 +286,36 @@ pub fn stamp_of(body: &str) -> Option<&str> {
 /// The stamp's head and, when it carries one, the digest of the text the
 /// fact check read.
 fn stamp_parts(body: &str) -> Option<(&str, Option<&str>)> {
+    stamp_all(body).map(|(h, d, _)| (h, d))
+}
+
+/// The stamp's word for a description built while checks on its head were
+/// still running: it is not current until they end and it is rebuilt.
+const CHECKS_RUNNING: &str = "checks-running";
+
+/// The stamp's head, digest, and whether checks were running when it was
+/// built.
+fn stamp_all(body: &str) -> Option<(&str, Option<&str>, bool)> {
     let at = body.rfind(STAMP_START)? + STAMP_START.len();
     let rest = &body[at..];
     let inner = rest[..rest.find(STAMP_END)?].trim();
     let mut parts = inner.split_whitespace();
     let head = parts.next().filter(|h| !h.is_empty())?;
-    Some((head, parts.next()))
+    let digest = parts.next();
+    let running = parts.any(|p| p == CHECKS_RUNNING);
+    Some((head, digest, running))
+}
+
+/// Whether the description shows a check on its head as still running.
+pub fn shows_running(body: &str) -> bool {
+    common::pr_body::in_sight(body).lines().any(|l| {
+        let t = l.trim();
+        t.starts_with('|')
+            && t.trim_end_matches('|')
+                .rsplit(" | ")
+                .next()
+                .is_some_and(|r| r.trim().starts_with(common::pr_body::RUNNING))
+    })
 }
 
 fn without_stamp(body: &str) -> String {
@@ -309,8 +345,15 @@ pub fn with_stamp(body: &str, head: &str) -> String {
     }
     let digest = checked_digest(&body);
     let head = head.get(..STAMP_SHA).unwrap_or(head);
+    // Built while checks ran: the next reconcile builds it again, so the
+    // running rows are replaced by their results when the checks end.
+    let running = if shows_running(&body) {
+        format!(" {CHECKS_RUNNING}")
+    } else {
+        String::new()
+    };
     format!(
-        "{}\n\n{STAMP_START}{head} {digest}{STAMP_END}",
+        "{}\n\n{STAMP_START}{head} {digest}{running}{STAMP_END}",
         body.trim_end()
     )
 }
@@ -320,13 +363,15 @@ fn same_head(stamped: &str, head: &str) -> bool {
     stamped == head || (stamped.len() >= 7 && head.starts_with(stamped))
 }
 
-/// Whether the description was built for `head` and the text the fact check
-/// read is still the text that is there. A stamp from before the digest
-/// answers for its head alone.
+/// Whether the description was built for `head`, the text the fact check
+/// read is still the text that is there, and no check was running when it
+/// was built (a description showing running checks is rebuilt until they
+/// end). A stamp from before the digest answers for its head alone.
 pub fn is_current(body: &str, head: &str) -> bool {
-    match stamp_parts(body) {
-        Some((h, digest)) => {
+    match stamp_all(body) {
+        Some((h, digest, running)) => {
             !head.is_empty()
+                && !running
                 && same_head(h, head)
                 && digest.is_none_or(|d| d == checked_digest(body))
         }
@@ -722,11 +767,18 @@ async fn build(
                 Some(r) => ask_reader(state, r, &facts, &base).await,
                 None => None,
             };
-            let shaped = super::description_facts::shape(
+            // The repository's template, when it has one, is the
+            // description's structure (`pr_template`).
+            let template = match pr["base"]["ref"].as_str() {
+                Some(base_ref) => super::pr::fetch_pr_template(github, owner, repo, base_ref).await,
+                None => None,
+            };
+            let shaped = super::description_facts::shape_for(
                 &base,
                 pr["title"].as_str().unwrap_or(""),
                 facts,
                 reply.as_deref(),
+                template.as_deref(),
             );
             note_corrections(number, &shaped.corrections);
             tracing::info!(
@@ -988,6 +1040,7 @@ mod tests {
         };
         let save = body_of("\npub async fn save(", "\npub async fn save_checked(");
         assert!(save.contains("clean(body)"));
+        assert!(save.contains("pr_review::review("), "the final review");
         assert!(save.contains("pr_layout::layout("));
         let checked = body_of("\npub async fn save_checked(", "\nfn note_corrections(");
         assert!(checked.contains("pr_claims::enforce("));
@@ -996,7 +1049,8 @@ mod tests {
         for step in [
             "facts_of(",
             "ask_reader(",
-            "description_facts::shape(",
+            "fetch_pr_template(",
+            "description_facts::shape_for(",
             "with_stamp(",
             "save(github",
             "resolve_own_description_threads(",
@@ -1018,7 +1072,8 @@ mod tests {
                 continue;
             }
             assert!(
-                !code.contains("description_facts::shape("),
+                !code.contains("description_facts::shape(")
+                    && !code.contains("description_facts::shape_for("),
                 "{path} shapes a description outside the rebuild"
             );
         }

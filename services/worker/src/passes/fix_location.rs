@@ -650,8 +650,71 @@ pub fn route_for_plan(decision: Option<&FixDecision>, tasks: &str) -> Route {
         {
             Route::Code
         }
+        // Something outside the code never replaces the code change the
+        // plan makes: a plan with tasks is implemented and its pull request
+        // opened, and the outside part rides along (done by CoderHelm where
+        // it can, the rest listed once for a person). A run once ended with
+        // "do this, then I'll do it" and no pull request.
+        Route::OutsideOnly if plans_code(tasks) => Route::CodeAndOutside,
         r => r,
     }
+}
+
+/// How a run goes on when a person's feedback says (part of) the fix is
+/// outside the code: the code change stays and its pull request stays open
+/// whenever the plan changed code and the pull request carries it, with the
+/// outside part attached ([`Route::CodeAndOutside`], as [`route_for_plan`]
+/// routes a plan); only a pull request that changes nothing the plan
+/// decided as code is closed ([`Route::OutsideOnly`]).
+pub fn route_for_feedback(planned: Option<&FixDecision>, pr_changed_files: u64) -> Route {
+    let planned_code = match planned {
+        Some(d) => matches!(route(Some(d)), Route::Code | Route::CodeAndOutside),
+        // A run that opened a pull request with no recorded decision coded
+        // what its plan named.
+        None => true,
+    };
+    if pr_changed_files > 0 && planned_code {
+        Route::CodeAndOutside
+    } else {
+        Route::OutsideOnly
+    }
+}
+
+/// `planned` with the outside part a person named added: the location is
+/// both, and the outside change is the planner's when it had one, else
+/// what the person said.
+pub fn with_outside_part(planned: Option<&FixDecision>, where_: &str, cause: &str) -> FixDecision {
+    let mut d = planned.cloned().unwrap_or_default();
+    d.fix_location = FixLocation::Both;
+    let usable = d
+        .outside_change
+        .as_ref()
+        .is_some_and(OutsideChange::is_usable);
+    if !usable {
+        d.outside_change = Some(OutsideChange {
+            system: if where_.trim().is_empty() {
+                "the system that holds this data".to_string()
+            } else {
+                where_.trim().to_string()
+            },
+            change: cause.trim().to_string(),
+            ..Default::default()
+        });
+    }
+    if d.cause.trim().is_empty() {
+        d.cause = cause.trim().to_string();
+    }
+    d
+}
+
+/// Whether a plan's tasks change code: anything but the sentinels that say
+/// it changes none.
+pub fn plans_code(tasks: &str) -> bool {
+    let t = tasks.trim_start();
+    !t.is_empty()
+        && !t.starts_with(NO_CODE_CHANGE)
+        && !t.starts_with("NO_CHANGES_NEEDED:")
+        && !t.starts_with("CLARIFICATION_NEEDED:")
 }
 
 /// The report as Jira shows it: the Jira app turns each paragraph into one
@@ -1933,6 +1996,11 @@ mod tests {
         let d = parse(fixture::PLANNER_REPLY).unwrap();
         let tasks = "NO_CODE_CHANGE: the term's setting is off";
         assert_eq!(route_for_plan(Some(&d), tasks), Route::OutsideOnly);
+        // A plan with code to change is implemented whatever else it needs.
+        assert_eq!(
+            route_for_plan(Some(&d), "- [ ] a.rs: x"),
+            Route::CodeAndOutside
+        );
     }
 
     #[test]

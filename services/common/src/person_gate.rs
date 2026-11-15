@@ -976,10 +976,17 @@ pub fn decide(a: &Ask, ctx: &Context) -> Outcome {
 /// A deploy: CoderHelm runs it when it holds the credentials; else the one
 /// missing thing is said once.
 fn deploy_item(a: &Ask, t: &str, ctx: &Context) -> Outcome {
-    if ctx.can_deploy {
-        if let Some(c) = command_in(a) {
-            return Outcome::Do(Work::Command(c));
-        }
+    // A deploy CoderHelm can start (a workflow it dispatches or one a label
+    // starts, or credentials it holds) is its own: never a credential item
+    // for a person while it has not tried. An attempt whose own cause is a
+    // listed reason still reaches a person.
+    let tried_and_refused =
+        a.kind == Kind::Attempt && reason_in(&one_line(&a.why_not).to_lowercase()).is_some();
+    if ctx.can_deploy && !tried_and_refused {
+        return Outcome::Do(match command_in(a) {
+            Some(c) => Work::Command(c),
+            None => Work::Own(one_line(&a.text)),
+        });
     }
     let reason = reason_in(t).unwrap_or(Reason::Credential);
     let missing = match reason {
