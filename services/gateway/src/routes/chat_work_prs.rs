@@ -333,27 +333,6 @@ impl Client<'_> {
     }
 }
 
-/// The installation's spent limit, if GitHub said so: the worker keeps it
-/// on the analytics table (`common::github_budget`). Chat is foreground
-/// work, so only a spent limit holds it.
-pub fn hold_from_budget(limited_until: Option<u64>, now: u64) -> Option<String> {
-    use common::github_budget::{decide, Spend};
-    match decide(
-        common::github_budget::caller::CHAT,
-        None,
-        limited_until,
-        0,
-        now,
-    ) {
-        Spend::Go => None,
-        Spend::Hold { why, wait_secs } => Some(format!(
-            "{}; it refills in about {} min",
-            why.as_str(),
-            wait_secs.div_ceil(60).max(1)
-        )),
-    }
-}
-
 /// The pull requests (and Coderhelm branches) that match, newest activity
 /// first. `repos`: the team's enabled repositories; nothing else is read.
 ///
@@ -744,9 +723,6 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn a_spent_limit_sends_nothing_more() {
-        assert!(hold_from_budget(Some(2_000), 1_000).is_some());
-        assert!(hold_from_budget(Some(500), 1_000).is_none());
-        assert!(hold_from_budget(None, 1_000).is_none());
         let gh = fake(|_| (429, json!({})));
         let mut c = client(&gh);
         assert!(c.get("/a").await.is_err());

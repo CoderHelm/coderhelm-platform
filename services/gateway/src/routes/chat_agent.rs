@@ -623,12 +623,14 @@ pub(crate) mod testing {
             name: &str,
             input: &Value,
         ) -> Called {
-            let out = chat_code::run(&self.reader, reg, name, input).await;
+            // The evals read code through the same layer Chat and /mcp do.
+            let (text, summary, is_error) =
+                crate::lookups::code(&self.reader, reg, name, input).await;
             Called::Done {
-                text: out.text,
+                text,
                 label: chat_code::label(name, input),
-                summary: out.summary,
-                is_error: out.is_error,
+                summary,
+                is_error,
                 kind: "code".into(),
             }
         }

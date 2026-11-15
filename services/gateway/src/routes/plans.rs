@@ -2535,6 +2535,7 @@ async fn load_plan_chat_context(
         repo: chat_repo,
         first: messages_input.len() <= 1,
         brain: false,
+        mcp: false,
     };
     let worker = super::plan_chat_tools::setup(state, &scope).await;
 

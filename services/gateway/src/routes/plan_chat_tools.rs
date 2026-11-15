@@ -21,6 +21,22 @@ pub struct ChatScope {
     pub first: bool,
     /// The brain chat (its worker calls are metered as the brain's).
     pub brain: bool,
+    /// An AI tool on `/mcp` (metered as the brain's; its GitHub reads are
+    /// counted as `mcp`, and it may read the repository's history).
+    pub mcp: bool,
+}
+
+impl ChatScope {
+    /// What the worker is told about who asks.
+    pub fn feature(&self) -> &'static str {
+        if self.mcp {
+            "mcp"
+        } else if self.brain {
+            "brain"
+        } else {
+            ""
+        }
+    }
 }
 
 /// The worker's tools for this chat message, and what's told to the model.
@@ -81,7 +97,7 @@ pub async fn setup(state: &AppState, scope: &ChatScope) -> WorkerTools {
             "repo": scope.repo,
             "branch": scope.branch,
             "record_applied": scope.first,
-            "feature": if scope.brain { "brain" } else { "" },
+            "feature": scope.feature(),
         }),
     )
     .await;
@@ -146,7 +162,7 @@ pub async fn call(
             "input": input,
             "reads_used": used.reads,
             "asks_used": used.asks,
-            "feature": if scope.brain { "brain" } else { "" },
+            "feature": scope.feature(),
         }),
     )
     .await;

@@ -410,10 +410,13 @@ pub struct Ctx {
     /// The installation the token is for (its GitHub budget).
     pub installation_id: Option<u64>,
     pub jira: Option<super::chat_work_tickets::JiraApp>,
+    /// Who its GitHub reads are counted under (`github_budget::caller`):
+    /// Chat, or an AI tool on `/mcp`.
+    pub caller: &'static str,
 }
 
 /// The installation's spent-limit time, from the worker's record of it.
-async fn limited_until(state: &crate::AppState, installation_id: u64) -> Option<u64> {
+pub(crate) async fn limited_until(state: &crate::AppState, installation_id: u64) -> Option<u64> {
     let table = &state.config.analytics_table_name;
     if table.is_empty() {
         return None;
@@ -530,9 +533,11 @@ pub async fn call(
             };
             let now = chrono::Utc::now().timestamp().max(0) as u64;
             let held = match ctx.installation_id {
-                Some(id) => {
-                    super::chat_work_prs::hold_from_budget(limited_until(&ctx.state, id).await, now)
-                }
+                Some(id) => crate::lookups::github_hold(
+                    ctx.caller,
+                    limited_until(&ctx.state, id).await,
+                    now,
+                ),
                 None => None,
             };
             let http = common::mcp_remote::http::GuardedHttps;

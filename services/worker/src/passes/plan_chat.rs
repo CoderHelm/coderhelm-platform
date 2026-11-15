@@ -51,6 +51,8 @@ pub struct Request {
     pub asks_used: usize,
     /// "brain" when the brain chat asks: its calls are metered as the
     /// brain's, and it searches knowledge bases itself (no knowledge tool here).
+    /// "mcp" when an AI tool on `/mcp` asks: the same, plus the repository's
+    /// history (`github_history`), read only.
     #[serde(default)]
     pub feature: String,
 }
@@ -73,6 +75,8 @@ struct Loaded {
     graphs: Option<RepoGraphs>,
     /// Knowledge bases attached to the plan chat.
     knowledge: Option<super::knowledge::KnowledgeTools>,
+    /// The repository's history, for AI tools on `/mcp` only.
+    history: Option<super::github_history::GithubHistory>,
 }
 
 async fn load(state: &WorkerState, req: &Request) -> Loaded {
@@ -105,10 +109,25 @@ async fn load(state: &WorkerState, req: &Request) -> Loaded {
     } else {
         None
     };
-    let knowledge = if req.feature == "brain" {
+    let knowledge = if req.feature == "brain" || req.feature == "mcp" {
         None
     } else {
         super::knowledge::KnowledgeTools::load(state, &req.team_id, "plan_chat", None).await
+    };
+    let history = if req.feature == "mcp" && req.repo.contains('/') {
+        let team_repos = super::plan::fetch_team_repos(state, &req.team_id).await;
+        Some(
+            super::github_history::GithubHistory::new(
+                &req.team_id,
+                &req.repo,
+                team_repos,
+                "mcp",
+                0,
+            )
+            .with_run("", origin.clone()),
+        )
+    } else {
+        None
     };
     Loaded {
         skills,
@@ -116,6 +135,7 @@ async fn load(state: &WorkerState, req: &Request) -> Loaded {
         ops,
         graphs,
         knowledge,
+        history,
     }
 }
 
@@ -135,6 +155,9 @@ fn defs(l: &Loaded) -> Vec<ToolDefinition> {
     }
     if let Some(k) = &l.knowledge {
         tools.extend(k.tools());
+    }
+    if l.history.is_some() {
+        tools.push(super::github_history::tool());
     }
     tools.retain(|t| !writes(&t.name));
     tools
@@ -306,6 +329,18 @@ async fn call(state: &WorkerState, req: &Request, l: &Loaded) -> Value {
                 }
             });
             return json!({ "text": text, "used": used });
+        }
+    }
+    if let Some(h) = &l.history {
+        if name == super::github_history::TOOL {
+            let text = match github_for(state, &req.team_id).await {
+                Some(github) => h
+                    .handle(state, &github, name, input)
+                    .await
+                    .unwrap_or_default(),
+                None => "CoderHelm can't reach GitHub for this team right now.".to_string(),
+            };
+            return json!({ "text": text, "used": used("source", "GitHub history", "/data-sources/activity") });
         }
     }
     if let Some(k) = &l.knowledge {

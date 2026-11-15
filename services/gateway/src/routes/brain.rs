@@ -42,7 +42,7 @@ use axum::{
 use common::knowledge::answer::{finalize, CodeRef, Final, Registry, SourceRef};
 use common::knowledge::chunk::chunk;
 use common::knowledge::extract::{extract, Kind};
-use common::knowledge::search::{search, term_overlap, terms, Store, Titan};
+use common::knowledge::search::{term_overlap, terms, Store, Titan};
 use common::knowledge::{self as kb, read_data, MAX_ATTACHMENT_BYTES};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -602,7 +602,7 @@ pub async fn delete_thread(
 /// (and description, when one is stored) the team gave each. Every member
 /// who may ask reads every enabled repository; Coderhelm has no narrower
 /// repository access to honor.
-async fn load_repos(state: &AppState, team_id: &str) -> Vec<RepoInfo> {
+pub(crate) async fn load_repos(state: &AppState, team_id: &str) -> Vec<RepoInfo> {
     let mut out = Vec::new();
     let mut start: Option<HashMap<String, AttributeValue>> = None;
     loop {
@@ -1598,7 +1598,7 @@ async fn run_tool(
     let state = &run.state;
     if super::chat_work::is_work_tool(name) {
         return match &run.work {
-            Some(w) => Box::pin(super::chat_work::call(w, reg, name, input)).await,
+            Some(w) => crate::lookups::work(w, reg, name, input).await,
             None => (
                 "That source isn't part of this question.".into(),
                 "Not allowed".into(),
@@ -1616,7 +1616,7 @@ async fn run_tool(
             };
             let st = super::knowledge::store(state);
             let servers = super::knowledge::servers(state, &run.team_id);
-            match search(
+            match crate::lookups::knowledge(
                 &st,
                 &titan,
                 &super::knowledge::retriever(state, "brain", &servers, Some(&run.user_email)),
@@ -1731,8 +1731,7 @@ async fn run_tool(
         }
         _ => {
             let result: Value = if run.worker.names.contains(name) {
-                let (text, _) =
-                    super::plan_chat_tools::call(state, &run.scope, used, name, input).await;
+                let (text, _) = crate::lookups::worker(state, &run.scope, used, name, input).await;
                 json!(text)
             } else if let Some((server, tool)) = name.split_once("__") {
                 match invoke_mcp_tool(state, &run.team_id, &run.user_email, server, tool, input)
@@ -1870,10 +1869,7 @@ impl Toolbox for BrainTools<'_> {
         let (text, summary, is_error) = match verdict {
             super::chat_policy::Checked::Run if chat_code::is_code_tool(name) => {
                 match (&self.reader, self.run.picks.allows("code")) {
-                    (Some(reader), true) => {
-                        let o = chat_code::run(reader, reg, name, input).await;
-                        (o.text, o.summary, o.is_error)
-                    }
+                    (Some(reader), true) => crate::lookups::code(reader, reg, name, input).await,
                     _ => (
                         "Error: Coderhelm can't read the code for this question.".into(),
                         "Couldn't read".into(),
@@ -2204,6 +2200,7 @@ pub async fn brain_stream(
         repo,
         first: history.is_empty(),
         brain: true,
+        mcp: false,
     };
     let needs_worker = picks.skills || picks.data_sources || picks.code;
     let (worker, github, mcp_tools) = tokio::join!(
@@ -2253,6 +2250,7 @@ pub async fn brain_stream(
             github_token: github.clone(),
             installation_id,
             jira,
+            caller: common::github_budget::caller::CHAT,
         })
     } else {
         None
@@ -2509,7 +2507,7 @@ async fn answer(
         };
         let st = super::knowledge::store(state);
         let servers = super::knowledge::servers(state, &run.team_id);
-        match search(
+        match crate::lookups::knowledge(
             &st,
             &titan,
             &super::knowledge::retriever(state, "brain", &servers, Some(&run.user_email)),

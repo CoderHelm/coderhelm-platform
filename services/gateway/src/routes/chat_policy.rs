@@ -282,6 +282,8 @@ mod tests {
                 "execute_github_tool(",
                 "invoke_mcp_tool(",
                 "chat_code::run(",
+                "lookups::code(",
+                "lookups::worker(",
                 "run_tool(",
             ] {
                 for (at, _) in body.match_indices(runs) {
@@ -292,7 +294,9 @@ mod tests {
         // Chat runs its tools only from that gated toolbox.
         let chat = include_str!("brain.rs");
         let chat = &chat[..chat.find("#[cfg(test)]").unwrap_or(chat.len())];
-        assert_eq!(chat.matches("chat_code::run(").count(), 1);
+        // Code is read through the shared layer, once, behind the gate.
+        assert_eq!(chat.matches("chat_code::run(").count(), 0);
+        assert_eq!(chat.matches("lookups::code(").count(), 1);
         assert_eq!(
             chat.matches(" run_tool(").count(),
             2,
