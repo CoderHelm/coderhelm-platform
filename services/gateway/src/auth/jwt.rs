@@ -32,6 +32,10 @@ struct SessionToken<'a> {
     proof: &'a SignInProof,
 }
 
+/// A plain session token with no sign-in proof (tests only: the dashboard
+/// signs people in through the session code, and streams use
+/// [`create_scoped_token`]).
+#[cfg(test)]
 pub fn create_token(
     user_id: &str,
     team_id: &str,
