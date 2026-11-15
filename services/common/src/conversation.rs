@@ -278,6 +278,10 @@ pub struct Heard {
     /// A pull request's line comment: a reply goes in its review thread.
     #[serde(default)]
     pub line: bool,
+    /// The comment it replies to, when it is a reply in a Jira thread; a
+    /// reply to it goes under that one (threads are one level deep).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub parent_id: String,
 }
 
 /// The thread as read before speaking.
@@ -368,8 +372,10 @@ pub enum How {
     /// GitHub's conversation has no threads: a reaction on the comment,
     /// and a reply that quotes it and links to it.
     Quote,
-    /// Jira: a reply that mentions the person and quotes their words (the
-    /// public comment API has no threaded replies).
+    /// Jira: a reply that mentions the person and quotes their words. The
+    /// Jira app posts it under their comment in Jira's thread where the site
+    /// takes the (undocumented) parent field, and as a new comment where it
+    /// doesn't; the mention and quote read right either way.
     MentionQuote,
 }
 

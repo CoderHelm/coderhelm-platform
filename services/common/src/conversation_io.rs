@@ -89,25 +89,49 @@ pub struct JiraChannel<'a> {
     pub title: String,
 }
 
+/// What CoderHelm said on a Jira ticket, from its ledger.
+pub async fn jira_said(
+    dynamo: &aws_sdk_dynamodb::Client,
+    settings_table: &str,
+    team_id: &str,
+    ticket: &str,
+) -> Result<Vec<Said>, String> {
+    let item = dynamo
+        .get_item()
+        .table_name(settings_table)
+        .key("pk", AttributeValue::S(team_id.to_string()))
+        .key("sk", AttributeValue::S(ledger_sk(&Place::jira(ticket))))
+        .consistent_read(true)
+        .send()
+        .await
+        .map_err(|e| format!("{e:?}").chars().take(300).collect::<String>())?
+        .item;
+    Ok(item
+        .as_ref()
+        .and_then(|i| i.get("doc"))
+        .and_then(|v| v.as_s().ok())
+        .and_then(|d| serde_json::from_str(d).ok())
+        .unwrap_or_default())
+}
+
+/// The Jira app's `replyTo` for a reply to `h`: the comment, its author (a
+/// mention) and, when known, the comment it replies to (the reply goes
+/// under that one, since Jira's threads are one level deep).
+pub fn jira_reply_to(h: &Heard) -> Value {
+    let mut v = json!({
+        "commentId": h.id,
+        "accountId": h.author_id,
+        "author": h.author,
+    });
+    if !h.parent_id.is_empty() {
+        v["parentId"] = json!(h.parent_id);
+    }
+    v
+}
+
 impl JiraChannel<'_> {
     async fn said(&self) -> Result<Vec<Said>, String> {
-        let item = self
-            .dynamo
-            .get_item()
-            .table_name(self.settings_table)
-            .key("pk", AttributeValue::S(self.team_id.to_string()))
-            .key("sk", AttributeValue::S(ledger_sk(&self.place())))
-            .consistent_read(true)
-            .send()
-            .await
-            .map_err(|e| format!("{e:?}").chars().take(300).collect::<String>())?
-            .item;
-        Ok(item
-            .as_ref()
-            .and_then(|i| i.get("doc"))
-            .and_then(|v| v.as_s().ok())
-            .and_then(|d| serde_json::from_str(d).ok())
-            .unwrap_or_default())
+        jira_said(self.dynamo, self.settings_table, self.team_id, &self.ticket).await
     }
 
     async fn keep(&self, id: &str, replaced: Option<&str>, meta: &Meta, body: &str) {
@@ -161,13 +185,11 @@ impl JiraChannel<'_> {
             payload["commentId"] = json!(id);
         }
         // The Jira app turns the person's name that opens the reply into a
-        // mention, and quotes their comment (an older app shows the name).
+        // mention, and quotes their comment (an older app shows the name). A
+        // newer app posts it under their comment in Jira's thread where the
+        // site takes it.
         if let Some(h) = reply_to {
-            payload["replyTo"] = json!({
-                "commentId": h.id,
-                "accountId": h.author_id,
-                "author": h.author,
-            });
+            payload["replyTo"] = jira_reply_to(h);
         }
         let resp = self
             .http
@@ -191,6 +213,14 @@ impl JiraChannel<'_> {
             Value::Number(n) => n.to_string(),
             _ => String::new(),
         };
+        if let Some(h) = reply_to {
+            tracing::info!(
+                ticket = %self.ticket,
+                to = %h.id,
+                threaded = v["threaded"].as_bool().unwrap_or(false),
+                "Replied to a person's comment on the ticket"
+            );
+        }
         Ok((id, v["edited"].as_bool().unwrap_or(false)))
     }
 }
@@ -215,6 +245,7 @@ impl Channel for JiraChannel<'_> {
                 id: c.comment_id,
                 author: c.author,
                 author_id: c.author_id,
+                parent_id: c.parent_id,
                 text: c.text,
                 at_ms: ms_of(&c.at),
                 ..Default::default()
@@ -382,6 +413,25 @@ impl Channel for GithubRest<'_> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_jira_reply_names_the_comment_and_its_thread() {
+        let h = Heard {
+            id: "10005".into(),
+            author: "Pat Doe".into(),
+            author_id: "acc-1".into(),
+            ..Default::default()
+        };
+        let v = jira_reply_to(&h);
+        assert_eq!(v["commentId"], "10005");
+        assert_eq!(v["accountId"], "acc-1");
+        assert!(v.get("parentId").is_none());
+        let reply = Heard {
+            parent_id: "10001".into(),
+            ..h
+        };
+        assert_eq!(jira_reply_to(&reply)["parentId"], "10001");
+    }
+
     use super::*;
 
     #[test]

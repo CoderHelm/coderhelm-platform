@@ -1023,6 +1023,11 @@ async fn handle_jira_comment(
         Some(Value::Number(n)) => n.to_string(),
         _ => String::new(),
     };
+    // The comment it replies to, when it is a reply in a Jira thread.
+    let comment_parent = payload
+        .get("comment")
+        .map(super::ticket_comments::jira_parent_id)
+        .unwrap_or_default();
 
     info!(team_id, ticket_key, comment_author, "Jira comment received");
     let requester = payload
@@ -1106,6 +1111,7 @@ async fn handle_jira_comment(
                     .pointer("/comment/author/accountId")
                     .and_then(|v| v.as_str())
                     .unwrap_or(""),
+                parent_id: &comment_parent,
                 text: comment_body,
                 ..Default::default()
             },
@@ -1176,6 +1182,7 @@ async fn handle_jira_comment(
                     .pointer("/comment/author/accountId")
                     .and_then(|v| v.as_str())
                     .unwrap_or(""),
+                parent_id: &comment_parent,
                 text: comment_body,
                 title,
                 run_id,
