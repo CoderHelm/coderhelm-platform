@@ -137,6 +137,65 @@ pub fn input_summary(input: &Value) -> String {
     }
 }
 
+/// What a tool loop's answer is, for what it is told when a turn reaches the
+/// output limit before any tool call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnswerForm {
+    /// Decided from the tools: a loop that can edit files is told to act in
+    /// small edits; any other is told to make its next call or answer
+    /// shorter.
+    Auto,
+    /// A written document (the planner's plan): a cut turn's text is kept
+    /// and the model continues it where it stopped; the answer is the cut
+    /// text and its continuation, stitched ([`stitch`]).
+    Document,
+}
+
+/// What the model gets after a turn cut at the output limit before any
+/// tool call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CutWork {
+    /// It can edit files: act in small edits.
+    Edits,
+    /// It writes a document: continue it where it stopped.
+    Document,
+    /// Anything else: the next call, or a shorter answer.
+    Answer,
+}
+
+/// The tools that change files in a loop's working tree.
+pub const EDIT_TOOLS: &[&str] = &["edit_file", "write_file", "batch_write"];
+
+impl AnswerForm {
+    /// The work a cut turn is told to get on with.
+    pub fn work(self, tools: &[ToolDefinition]) -> CutWork {
+        match self {
+            AnswerForm::Document => CutWork::Document,
+            AnswerForm::Auto if tools.iter().any(|t| EDIT_TOOLS.contains(&t.name.as_str())) => {
+                CutWork::Edits
+            }
+            AnswerForm::Auto => CutWork::Answer,
+        }
+    }
+}
+
+/// A document cut at the output limit and the model's continuation of it,
+/// as one text. A continuation that starts with a code fence (the fence the
+/// cut text left open, or a file written again from its start) begins on a
+/// line of its own; any other continues the cut text exactly where it
+/// stopped, mid-line included.
+pub fn stitch(cut: &str, next: &str) -> String {
+    if cut.is_empty() {
+        return next.to_string();
+    }
+    let rest = next.trim_start();
+    if rest.starts_with("```") {
+        let sep = if cut.ends_with('\n') { "" } else { "\n" };
+        return format!("{cut}{sep}{rest}");
+    }
+    format!("{cut}{next}")
+}
+
 pub struct ToolDefinition {
     pub name: String,
     pub description: String,
@@ -151,6 +210,55 @@ pub trait ToolExecutor: Send + Sync {
         name: &str,
         input: &Value,
     ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>>;
+}
+
+#[cfg(test)]
+mod cut_tests {
+    use super::*;
+
+    fn tool(name: &str) -> ToolDefinition {
+        ToolDefinition {
+            name: name.into(),
+            description: String::new(),
+            input_schema: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn a_cut_turn_is_told_the_work_its_loop_does() {
+        let coder = [tool("read_file"), tool("edit_file")];
+        let reader = [tool("read_file"), tool("search_code")];
+        assert_eq!(AnswerForm::Auto.work(&coder), CutWork::Edits);
+        assert_eq!(AnswerForm::Auto.work(&reader), CutWork::Answer);
+        assert_eq!(AnswerForm::Auto.work(&[]), CutWork::Answer);
+        // The planner reads with tools and writes a document.
+        assert_eq!(AnswerForm::Document.work(&reader), CutWork::Document);
+        assert_eq!(AnswerForm::Document.work(&coder), CutWork::Document);
+    }
+
+    #[test]
+    fn a_continuation_is_stitched_where_the_cut_stopped() {
+        // Exactly where it stopped, mid-line.
+        assert_eq!(
+            stitch("```tasks.md\n- [ ] a.ts: [mod", "ify] Add\n```"),
+            "```tasks.md\n- [ ] a.ts: [modify] Add\n```"
+        );
+        // The fence it left open closes on its own line.
+        assert_eq!(
+            stitch("```design.md\nD", "\n```\n```spec.md\nS\n```"),
+            "```design.md\nD\n```\n```spec.md\nS\n```"
+        );
+        assert_eq!(stitch("```design.md\nD", "```"), "```design.md\nD\n```");
+        // A block written again from its start opens on its own line.
+        assert_eq!(
+            stitch(
+                "```fix_location.json\n{\"cause\": \"New wo",
+                "```fix_location.json\n{}\n```"
+            ),
+            "```fix_location.json\n{\"cause\": \"New wo\n```fix_location.json\n{}\n```"
+        );
+        assert_eq!(stitch("", "all of it"), "all of it");
+    }
 }
 
 #[cfg(test)]

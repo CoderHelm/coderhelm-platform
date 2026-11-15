@@ -546,11 +546,20 @@ pub fn send_back(repeats: &[Question], answers: &[Answer]) -> String {
     }
     out.push_str(
         "Plan with those answers now. Use CLARIFICATION_NEEDED only for something the answers \
-         leave open, asking about that alone. Output the COMPLETE plan again in exactly the same \
-         format as before (every file block, the fix decision included).",
+         leave open, asking about that alone. ",
     );
+    out.push_str(CHANGED_FILES_ONLY);
     out
 }
+
+/// How the planner answers a send-back: the decision and only the files
+/// the change touches, never the whole plan again. A revision that wrote
+/// every file again once reached the output limit and lost the plan; the
+/// worker keeps each file the revision leaves out (`plan_sections::merge`).
+pub const CHANGED_FILES_ONLY: &str = "Answer with the fix_location.json block, whole, and only \
+    the openspec files your changes touch, each whole in its own fence and in the same format as \
+    before. A file you leave out stays exactly as it was; never write a file again only to \
+    repeat it.";
 
 /// The words that carry a question's meaning: lowercase, three letters or
 /// more, common filler dropped.

@@ -546,10 +546,8 @@ pub fn send_back(s: &Screened, diagnosis: Option<&TicketDiagnosis>) -> String {
              the contradiction.\n",
         );
     }
-    out.push_str(
-        "\nPlan the change now. Output the COMPLETE plan again in exactly the same format as \
-         before (every file block, the fix decision included).",
-    );
+    out.push_str("\nPlan the change now. ");
+    out.push_str(crate::run_questions::CHANGED_FILES_ONLY);
     out
 }
 
