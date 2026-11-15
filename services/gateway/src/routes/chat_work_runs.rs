@@ -99,16 +99,68 @@ impl RunAsk {
             .as_u64()
             .filter(|d| *d > 0)
             .map(|d| (now - chrono::Duration::days(d.min(365) as i64)).to_rfc3339());
-        RunAsk {
+        let mut ask = RunAsk {
             run_id: s("run_id").filter(|id| super::brain::valid_run_id(id)),
             ticket: s("ticket").map(|t| t.to_lowercase()),
             pr,
             repo: s("repo").map(|r| r.to_lowercase()),
             group: s("status").map(|g| Group::parse(&g)).unwrap_or_default(),
-            words: s("query").map(|q| words_of(&q)).unwrap_or_default(),
+            words: Vec::new(),
             since,
+        };
+        // A query that is only a pull request number ("#609") or a ticket
+        // key ("SEC-1A2B") asks by that, not by title words: neither is in
+        // a run's title.
+        if let Some(q) = s("query") {
+            match query_names(&q) {
+                Named::Pr(n) if ask.pr.is_none() => ask.pr = Some(n),
+                Named::Ticket(k) if ask.ticket.is_none() => ask.ticket = Some(k),
+                Named::Words | Named::Pr(_) | Named::Ticket(_) => ask.words = words_of(&q),
+            }
+        }
+        ask
+    }
+}
+
+/// What a lookup's free text names on its own.
+#[derive(Debug, PartialEq)]
+enum Named {
+    Pr(u64),
+    /// Lower case.
+    Ticket(String),
+    Words,
+}
+
+fn query_names(q: &str) -> Named {
+    let q = q.trim();
+    let digits = q.strip_prefix('#').unwrap_or(q);
+    if !digits.is_empty() && digits.len() <= 9 && digits.bytes().all(|b| b.is_ascii_digit()) {
+        if let Ok(n) = digits.parse() {
+            return Named::Pr(n);
         }
     }
+    if ticket_key(q) {
+        return Named::Ticket(q.to_lowercase());
+    }
+    Named::Words
+}
+
+/// A ticket key as runs keep it: Jira's (`ABC-123`) and Coderhelm's own
+/// (`SEC-25142555683B`, `ALERT-3DCB8D72`, `E2E-FIX-1a2b`): letters first,
+/// then dash-joined parts with at least one digit after the first dash.
+pub fn ticket_key(k: &str) -> bool {
+    let Some((head, rest)) = k.split_once('-') else {
+        return false;
+    };
+    (2..=64).contains(&k.len())
+        && head.bytes().next().is_some_and(|b| b.is_ascii_alphabetic())
+        && head.bytes().all(|b| b.is_ascii_alphanumeric())
+        && head.bytes().any(|b| b.is_ascii_uppercase())
+        && !rest.is_empty()
+        && rest
+            .split('-')
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_alphanumeric()))
+        && rest.bytes().any(|b| b.is_ascii_digit())
 }
 
 fn st<'a>(item: &'a Item, k: &str) -> &'a str {
@@ -345,6 +397,19 @@ fn projection() -> (String, HashMap<String, String>) {
     (p, names)
 }
 
+/// A DynamoDB failure with its cause (AccessDenied, a missing index), not
+/// the SDK's bare "service error".
+fn why<E, R>(what: &str, e: aws_sdk_dynamodb::error::SdkError<E, R>) -> String
+where
+    E: std::error::Error + 'static,
+    R: std::fmt::Debug,
+{
+    format!(
+        "runs: couldn't {what}: {}",
+        aws_sdk_dynamodb::error::DisplayErrorContext(&e)
+    )
+}
+
 async fn get_run(state: &AppState, team_id: &str, run_id: &str) -> Result<Option<Item>, String> {
     state
         .dynamo
@@ -355,19 +420,12 @@ async fn get_run(state: &AppState, team_id: &str, run_id: &str) -> Result<Option
         .send()
         .await
         .map(|r| r.item().cloned())
-        .map_err(|e| format!("runs: {e}"))
+        .map_err(|e| why("read a run", e))
 }
 
-/// The team's runs that match, newest first, the first few read in full.
-/// Only `team_id`'s partition is read.
-pub async fn find(state: &AppState, team_id: &str, ask: &RunAsk) -> Result<Vec<Found>, String> {
-    if let Some(id) = &ask.run_id {
-        return Ok(get_run(state, team_id, id)
-            .await?
-            .iter()
-            .map(record)
-            .collect());
-    }
+/// The team's listed runs that match, best and newest first (what the list
+/// reads of each). Only `team_id`'s partition is read.
+async fn matching(state: &AppState, team_id: &str, ask: &RunAsk) -> Result<Vec<Item>, String> {
     let (projection, names) = projection();
     let mut items: Vec<Item> = Vec::new();
     let mut start: Option<Item> = None;
@@ -385,7 +443,7 @@ pub async fn find(state: &AppState, team_id: &str, ask: &RunAsk) -> Result<Vec<F
             .set_exclusive_start_key(start.take())
             .send()
             .await
-            .map_err(|e| format!("runs: {e}"))?;
+            .map_err(|e| why("list the runs", e))?;
         items.extend(r.items().iter().cloned());
         // An unfiltered "what's running" stops at the first page full of matches.
         let enough = ask.words.is_empty() && best(&items, ask, MAX_RESULTS).len() >= MAX_RESULTS;
@@ -394,23 +452,67 @@ pub async fn find(state: &AppState, team_id: &str, ask: &RunAsk) -> Result<Vec<F
             _ => break,
         }
     }
-    let picked: Vec<String> = best(&items, ask, MAX_RESULTS)
+    Ok(best(&items, ask, MAX_RESULTS)
         .into_iter()
-        .map(|i| st(i, "run_id").to_string())
-        .collect();
+        .cloned()
+        .collect())
+}
+
+/// The team's runs that match, newest first, the first few read in full.
+/// Only `team_id`'s partition is read.
+pub async fn find(state: &AppState, team_id: &str, ask: &RunAsk) -> Result<Vec<Found>, String> {
+    if let Some(id) = &ask.run_id {
+        return Ok(get_run(state, team_id, id)
+            .await?
+            .iter()
+            .map(record)
+            .collect());
+    }
+    let listed = Box::pin(matching(state, team_id, ask)).await?;
     let mut out = Vec::new();
-    for (n, id) in picked.iter().enumerate() {
-        let item = if n < MAX_DETAILED {
-            get_run(state, team_id, id).await.ok().flatten()
+    for (n, listed) in listed.iter().enumerate() {
+        let full = if n < MAX_DETAILED {
+            get_run(state, team_id, st(listed, "run_id"))
+                .await
+                .ok()
+                .flatten()
         } else {
             None
         };
-        match item.or_else(|| items.iter().find(|i| st(i, "run_id") == id).cloned()) {
-            Some(i) => out.push(record(&i)),
-            None => continue,
-        }
+        out.push(record(full.as_ref().unwrap_or(listed)));
     }
     Ok(out)
+}
+
+/// The pull requests the matching runs opened, as `(owner/name, number)`,
+/// best match first: a title search finds its pull request through the run
+/// that opened it, whatever GitHub's search makes of the title.
+pub async fn pull_requests(
+    state: &AppState,
+    team_id: &str,
+    ask: &RunAsk,
+) -> Result<Vec<(String, u64)>, String> {
+    let items = Box::pin(matching(state, team_id, ask)).await?;
+    Ok(prs_of(&items))
+}
+
+/// [`pull_requests`] from listed runs.
+pub fn prs_of(items: &[Item]) -> Vec<(String, u64)> {
+    let mut out: Vec<(String, u64)> = Vec::new();
+    for i in items {
+        let repo = st(i, "repo");
+        if repo.is_empty() {
+            continue;
+        }
+        let mut nums = pr_numbers(i);
+        nums.sort_unstable_by(|a, b| b.cmp(a));
+        for n in nums {
+            if !out.iter().any(|(r, m)| r == repo && *m == n) {
+                out.push((repo.to_string(), n));
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -499,6 +601,82 @@ pub(crate) mod tests {
         assert_eq!(
             best(&items, &ask(serde_json::json!({"repo": "acme/api"})), 10).len(),
             1
+        );
+    }
+
+    #[test]
+    fn a_number_or_a_key_in_the_query_asks_by_it() {
+        let now = chrono::Utc::now();
+        let a = RunAsk::from_input(&serde_json::json!({"query": "#609"}), now);
+        assert_eq!((a.pr, a.words.len()), (Some(609), 0));
+        let a = RunAsk::from_input(&serde_json::json!({"query": "SEC-25142555683B"}), now);
+        assert_eq!(a.ticket.as_deref(), Some("sec-25142555683b"));
+        assert!(a.words.is_empty());
+        // Words stay words; a number given twice keeps the field's.
+        let a = RunAsk::from_input(
+            &serde_json::json!({"query": "security updates gangway-api"}),
+            now,
+        );
+        assert_eq!(a.words, ["security", "updates", "gangway-api"]);
+        let a = RunAsk::from_input(&serde_json::json!({"query": "#5", "pr": 7}), now);
+        assert_eq!(a.pr, Some(7));
+        let items = vec![
+            run(
+                "01B",
+                "running",
+                "SEC-25142555683B",
+                "fix(deps): security updates for api",
+                "acme/api",
+            ),
+            run("01A", "retried", "ABC-1", "Other", "acme/web"),
+        ];
+        let a = RunAsk::from_input(&serde_json::json!({"query": "SEC-25142555683B"}), now);
+        let got = best(&items, &a, 10);
+        assert_eq!(got.len(), 1);
+        assert_eq!(st(got[0], "run_id"), "01B");
+    }
+
+    #[test]
+    fn ticket_keys_include_coderhelms_own() {
+        for k in [
+            "ABC-123",
+            "SEC-25142555683B",
+            "ALERT-3DCB8D72",
+            "E2E-FIX-9ebf132c",
+            "GH-12",
+        ] {
+            assert!(ticket_key(k), "{k}");
+        }
+        for k in [
+            "gangway-api",
+            "fix-deps",
+            "SEC-",
+            "-1",
+            "SEC-ABC",
+            "a b-1",
+            "#609",
+        ] {
+            assert!(!ticket_key(k), "{k}");
+        }
+    }
+
+    #[test]
+    fn the_pull_requests_runs_opened_are_listed_once_newest_first() {
+        let mut a = run("01B", "running", "SEC-1A", "t", "acme/api");
+        a.insert("pr_number".into(), AttributeValue::N("609".into()));
+        a.insert(
+            "pr_numbers".into(),
+            AttributeValue::L(vec![
+                AttributeValue::N("602".into()),
+                AttributeValue::N("609".into()),
+            ]),
+        );
+        let b = run("01A", "retried", "SEC-1A", "t", "acme/api");
+        let none = run("01C", "failed", "SEC-1A", "t", "");
+        let got = prs_of(&[a, b, none]);
+        assert_eq!(
+            got,
+            [("acme/api".to_string(), 609), ("acme/api".to_string(), 602)]
         );
     }
 

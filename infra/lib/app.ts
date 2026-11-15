@@ -95,6 +95,7 @@ export function buildApp(app: cdk.App, cfg: ResolvedConfig, opts: { accessStack?
     reposTable: database.reposTable,
     settingsTable: database.settingsTable,
     mcpConfigsTable: database.mcpConfigsTable,
+    testsTable: database.testsTable,
     bucket: storage.bucket,
     mcpProxyFunction: api.mcpProxyFunction,
     secretsKey: database.secretsKey,
