@@ -622,9 +622,29 @@ pub async fn ingest(state: &WorkerState, msg: TestIngest) -> Result<(), Err> {
         if run.rescued {
             note_rescued(&st, &gh, &msg, &run, pr).await;
         }
+        let own = is_own_pr(&gh, &msg, pr).await;
         // A run that failed only on quarantined tests needs no fix or re-run.
-        if failed > 0 && !run.rescued && is_own_pr(&gh, &msg, pr).await {
+        if failed > 0 && !run.rescued && own {
             own_pr_failures(state, &gh, &msg, &run, pr, &lines, &tests).await;
+        }
+        // CoderHelm's own pull request shows the screenshots this run took
+        // of the tests its change touches.
+        if own {
+            super::e2e_screens::keep(
+                state,
+                &gh,
+                &st,
+                super::e2e_screens::Head {
+                    msg: &msg,
+                    pr,
+                    tests: &tests,
+                    reports: &reports,
+                    changed: &changed,
+                    map: map.as_ref(),
+                },
+                |t| scoped_id(&repo, t),
+            )
+            .await;
         }
         recommend_from_pr(state, &gh, &msg, pr, &changed, map.as_ref()).await;
         follow_generated(state, &gh, &msg, &run, &tests).await;

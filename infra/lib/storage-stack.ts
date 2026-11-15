@@ -134,6 +134,13 @@ export class StorageStack extends cdk.Stack {
           noncurrentVersionExpiration: cdk.Duration.days(1),
         },
         {
+          // End-to-end screenshots in pull request descriptions: their links
+          // work for a year (common::e2e::shots), the images a month longer.
+          prefix: "e2e-shots/",
+          expiration: cdk.Duration.days(395),
+          noncurrentVersionExpiration: cdk.Duration.days(1),
+        },
+        {
           // Move old run artifacts to Infrequent Access after 90 days
           transitions: [
             {

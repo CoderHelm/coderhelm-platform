@@ -29,6 +29,9 @@
 //!   request comes from the change, from the page and the code it runs.
 //! - [`bug_rules`] tells a bug from a flake and holds a bug fix to the app,
 //!   with a unit test, keeping only the changes that matter.
+//! - [`shots`] finds the screenshots a report carries for the tests that
+//!   show a change, for the Before and After table of CoderHelm's own pull
+//!   request.
 
 pub mod attribution;
 pub mod bug_rules;
@@ -47,6 +50,7 @@ pub mod owners;
 pub mod parse;
 pub mod quarantine;
 pub mod report_source;
+pub mod shots;
 pub mod signature;
 pub mod stats;
 pub mod store;
