@@ -9163,7 +9163,7 @@ async fn after_pr_outside_work(
             )
             .await;
             if let Some(f) = &p.failed_e2e {
-                outside_exec::record_failed(state, run_id, f).await;
+                outside_exec::record_failed(state, &msg.team_id, run_id, f).await;
             }
             outside_exec::report_problems(state, &msg.team_id, run_id, &p).await;
         }

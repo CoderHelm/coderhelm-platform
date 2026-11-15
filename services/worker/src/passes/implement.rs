@@ -931,14 +931,7 @@ pub async fn run(
                         "started_at": started_at,
                         "outcome": outcome,
                     });
-                    let _ = dynamo
-                        .put_item()
-                        .table_name(&events_table)
-                        .item(
-                            "pk",
-                            aws_sdk_dynamodb::types::AttributeValue::S(format!("RUN#{rid}")),
-                        )
-                        .item("sk", aws_sdk_dynamodb::types::AttributeValue::S(sk))
+                    let _ = common::run_events::put(&dynamo, &events_table, &team, &rid, &sk)
                         .item(
                             "event_type",
                             aws_sdk_dynamodb::types::AttributeValue::S("tool_call".to_string()),

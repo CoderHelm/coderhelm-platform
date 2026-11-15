@@ -2068,13 +2068,12 @@ pub async fn get_agent_log(
     let mut live_events: Vec<Value> = Vec::new();
     let mut live_events_truncated = false;
     if !state.config.events_table_name.is_empty() {
-        let query = state
-            .dynamo
-            .query()
-            .table_name(&state.config.events_table_name)
-            .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
-            .expression_attribute_values(":pk", attr_s(&format!("RUN#{run_id}")))
-            .expression_attribute_values(":prefix", attr_s("TOOL#"));
+        let query = common::run_events::query(
+            &state.dynamo,
+            &state.config.events_table_name,
+            &run_id,
+            "TOOL#",
+        );
         match common::paged::all_pages(
             |start| {
                 let q = query.clone().set_exclusive_start_key(start);
@@ -2092,7 +2091,11 @@ pub async fn get_agent_log(
         {
             Ok((items, more)) => {
                 live_events_truncated = more;
-                for item in &items {
+                let today = common::run_events::today();
+                for item in items
+                    .iter()
+                    .filter(|item| common::run_events::owned_by(item, &claims.team_id, &today))
+                {
                     let payload: Value = item
                         .get("payload")
                         .and_then(|v| v.as_s().ok())
