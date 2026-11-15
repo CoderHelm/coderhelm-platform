@@ -2388,7 +2388,8 @@ async fn recommend(st: &Store<'_>, team: &str, rec: Recommendation) {
 /// Whether the PR is one CoderHelm opened: a branch in the default shape, or
 /// a PR whose author is CoderHelm's app (a team's own branch pattern).
 fn is_own_pr(msg: &TestIngest, pull: Option<&serde_json::Value>) -> bool {
-    msg.head_branch.starts_with(common::git_conventions::DEFAULT_BRANCH_PREFIX)
+    msg.head_branch
+        .starts_with(common::git_conventions::DEFAULT_BRANCH_PREFIX)
         || pull.is_some_and(|p| super::is_own_login(p["user"]["login"].as_str().unwrap_or("")))
 }
 
