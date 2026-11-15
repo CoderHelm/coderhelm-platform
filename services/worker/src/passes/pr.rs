@@ -2265,15 +2265,17 @@ fn template_cache() -> &'static std::sync::Mutex<TemplateCache> {
 
 /// The repository's pull request template, from its common locations: the
 /// first draft is written to it, and every rebuild lays the description into
-/// it (`common::pr_template`). Kept for a few minutes per repository and
-/// branch.
+/// it (`common::pr_template`). Kept for a few minutes per installation,
+/// repository and branch.
 pub(crate) async fn fetch_pr_template(
     github: &GitHubClient,
     owner: &str,
     repo: &str,
     base_branch: &str,
 ) -> Option<String> {
-    let key = format!("{owner}/{repo}@{base_branch}").to_lowercase();
+    // Keyed by the installation that read it, so one team never reuses
+    // another team's read (bm_teams_never_cross).
+    let key = format!("{}:{owner}/{repo}@{base_branch}", github.installation_id()).to_lowercase();
     if let Ok(c) = template_cache().lock() {
         if let Some((at, t)) = c.get(&key) {
             if at.elapsed() < TEMPLATE_TTL {

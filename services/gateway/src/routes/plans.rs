@@ -2375,12 +2375,11 @@ pub async fn stream_token(
                              // Mint a short-lived token (5 minutes) scoped for streaming
                              // The record's role, never the role this request runs as: the token
                              // must not carry more than the member's own role.
-    let token = crate::auth::jwt::create_token(
-        &claims.sub,
-        &claims.team_id,
-        &claims.email,
-        claims.session_role(),
-        claims.github_login.as_deref(),
+                             // Scoped to the plan chat stream: it is never a session, and a session
+                             // is never a stream token.
+    let token = crate::auth::jwt::create_scoped_token(
+        &claims,
+        crate::auth::jwt::PLAN_CHAT_AUDIENCE,
         &state.secrets.jwt_secret,
         300, // 5 minutes
     )
@@ -3562,11 +3561,15 @@ pub async fn plan_chat_stream(
         StatusCode::UNAUTHORIZED
     })?;
 
-    let claims =
-        crate::auth::jwt::validate_token(token, &state.secrets.jwt_secret).map_err(|e| {
-            warn!("plan_chat_stream: JWT validation failed: {e}");
-            StatusCode::UNAUTHORIZED
-        })?;
+    let claims = crate::auth::jwt::validate_scoped_token(
+        token,
+        crate::auth::jwt::PLAN_CHAT_AUDIENCE,
+        &state.secrets.jwt_secret,
+    )
+    .map_err(|e| {
+        warn!("plan_chat_stream: JWT validation failed: {e}");
+        StatusCode::UNAUTHORIZED
+    })?;
 
     let messages_input = body["messages"].as_array().ok_or_else(|| {
         warn!("plan_chat_stream: missing messages array in body");

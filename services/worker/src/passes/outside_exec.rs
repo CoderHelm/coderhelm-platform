@@ -1416,7 +1416,7 @@ pub async fn retry_own(state: &WorkerState, team_id: &str, run_id: &str) -> bool
 
 /// Writes a `ci_failed` event for a started end-to-end run that failed, with
 /// its workflow run id, so the resume's CI fix round reads its logs.
-pub async fn record_failed(state: &WorkerState, run_id: &str, f: &FailedRun) {
+pub async fn record_failed(state: &WorkerState, team_id: &str, run_id: &str, f: &FailedRun) {
     if state.config.events_table_name.is_empty() {
         return;
     }
@@ -1429,25 +1429,26 @@ pub async fn record_failed(state: &WorkerState, run_id: &str, f: &FailedRun) {
         "conclusion": "failure",
         "failing_tests": f.failing,
     });
-    if let Err(e) = state
-        .dynamo
-        .put_item()
-        .table_name(&state.config.events_table_name)
-        .item("pk", super::attr_s(&format!("RUN#{run_id}")))
-        .item("sk", super::attr_s(&sk))
-        .item("event_type", super::attr_s("ci_failed"))
-        .item("payload", super::attr_s(&payload.to_string()))
-        .item(
-            "processed",
-            aws_sdk_dynamodb::types::AttributeValue::Bool(false),
-        )
-        .item("created_at", super::attr_s(&now.to_rfc3339()))
-        .item(
-            "expires_at",
-            super::attr_n((now.timestamp() as u64 + 30 * 86400).to_string()),
-        )
-        .send()
-        .await
+    if let Err(e) = common::run_events::put(
+        &state.dynamo,
+        &state.config.events_table_name,
+        team_id,
+        run_id,
+        &sk,
+    )
+    .item("event_type", super::attr_s("ci_failed"))
+    .item("payload", super::attr_s(&payload.to_string()))
+    .item(
+        "processed",
+        aws_sdk_dynamodb::types::AttributeValue::Bool(false),
+    )
+    .item("created_at", super::attr_s(&now.to_rfc3339()))
+    .item(
+        "expires_at",
+        super::attr_n((now.timestamp() as u64 + 30 * 86400).to_string()),
+    )
+    .send()
+    .await
     {
         warn!(run_id, error = %e, "Could not record the failed end-to-end run");
     }
