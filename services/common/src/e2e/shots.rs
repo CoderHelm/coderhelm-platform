@@ -933,7 +933,16 @@ mod tests {
             "e2e-shots/TEAM_a/o/r/7/0123456789ab/12-1/e3b98a4da31a127d/after.png"
         );
         let other = |run: &str, test: &str| {
-            object_key("TEAM#a", "o/r", 7, "0123456789abcdef", run, test, "after", "png")
+            object_key(
+                "TEAM#a",
+                "o/r",
+                7,
+                "0123456789abcdef",
+                run,
+                test,
+                "after",
+                "png",
+            )
         };
         assert_ne!(key, other("12-1", "u"));
         assert_ne!(key, other("13-1", "t"));
