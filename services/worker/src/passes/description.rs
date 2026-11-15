@@ -407,6 +407,9 @@ struct Gathered {
     checks: Option<Vec<super::reviewer_guide::Check>>,
     /// The latest run on the head of each workflow the deploy label starts.
     deploy: Vec<common::deploy_label::DeployRun>,
+    /// Deploy labels left off this head because a workflow didn't take
+    /// them off.
+    deploy_kept_off: Vec<common::deploy_label::KeptOff>,
     run: RunBits,
     run_url: String,
 }
@@ -457,7 +460,7 @@ impl Gathered {
             title: self.run.title.clone(),
             url: self.run.ticket_url.clone(),
         });
-        super::description_facts::facts(&super::description_facts::Inputs {
+        let mut f = super::description_facts::facts(&super::description_facts::Inputs {
             head: self.head(),
             body,
             files: &self.files,
@@ -482,7 +485,9 @@ impl Gathered {
                 .collect(),
             repo_url: self.pr["base"]["repo"]["html_url"].as_str().unwrap_or(""),
             deploy: &self.deploy,
-        })
+        });
+        f.deploy_kept_off = self.deploy_kept_off.clone();
+        f
     }
 }
 
@@ -580,10 +585,10 @@ async fn gather(
             .ok()
             .map(|l| super::reviewer_guide::checks_of(&l))
     };
-    let deploy = {
+    let (deploy, deploy_kept_off) = {
         let labels = super::deploy_label::labels(state, team_id, owner, repo).await;
         let head_ref = pr["head"]["ref"].as_str().unwrap_or("");
-        super::deploy_label::runs_on_head(
+        let (runs, complete) = super::deploy_label::runs_on_head(
             state,
             github,
             team_id,
@@ -592,7 +597,19 @@ async fn gather(
             head_ref,
             &labels,
         )
-        .await
+        .await;
+        let kept = super::deploy_label::kept_off(
+            state,
+            github,
+            team_id,
+            (owner, repo),
+            number,
+            &pr,
+            &labels,
+            (runs.as_slice(), complete),
+        )
+        .await;
+        (runs, kept)
     };
     let (run, run_id) = run_bits(state, team_id, owner, repo, number).await;
     let app = common::public_urls::app_url(&state.config.stage);
@@ -607,6 +624,7 @@ async fn gather(
         floor,
         checks,
         deploy,
+        deploy_kept_off,
         run,
         run_url,
     })

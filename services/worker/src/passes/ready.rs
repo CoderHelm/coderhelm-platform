@@ -181,6 +181,9 @@ pub struct Facts {
     /// Where the repository's deploy label's workflows stand on the head
     /// (`deploy_label::before_ready`): a draft waits for them.
     pub deploy: common::deploy_label::Standing,
+    /// A deploy label a person (or someone CoderHelm couldn't identify) took
+    /// off was left off this head: the description says so.
+    pub deploy_kept_off: bool,
 }
 
 impl Ci {
@@ -445,12 +448,45 @@ pub fn decide(f: &Facts) -> Decision {
     // The deploy label's workflows are the repository's own verification of
     // the change (a preview deploy, end-to-end runs on devices): the draft
     // waits for them. A failed run is failing CI, which the run's CI fix
-    // loop takes; it is named here only when no failing check says it.
+    // loop takes; it is named here only when no check fails or runs, so
+    // nothing else says it. A run held for an environment's approval is
+    // the one thing only a person can move on.
     match &f.deploy {
         common::deploy_label::Standing::Waiting(why) => {
             proof_wait.get_or_insert_with(|| why.clone());
         }
-        common::deploy_label::Standing::Failed(runs) if !f.ci.failing() => {
+        common::deploy_label::Standing::Approval(runs) => {
+            let envs: Vec<String> = runs
+                .iter()
+                .filter(|r| !r.environment.is_empty())
+                .map(|r| format!("`{}`", r.environment.replace('`', "'")))
+                .collect();
+            let todo = if envs.len() == runs.len() {
+                format!(
+                    "Approve the deployment to {} on the workflow run; the pull request leaves \
+                     draft once the workflow passes.",
+                    envs.join(", ")
+                )
+            } else {
+                "Approve the waiting deployment on the workflow run; the pull request leaves \
+                 draft once the workflow passes."
+                    .to_string()
+            };
+            reasons.push(Reason::new(
+                format!(
+                    "The deploy label's workflow is waiting for an approval: {}",
+                    runs.iter()
+                        .map(|r| match r.link().as_str() {
+                            "" => format!("`{}` {}", r.workflow, r.result()),
+                            link => format!("`{}` {} ({link})", r.workflow, r.result()),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                todo,
+            ));
+        }
+        common::deploy_label::Standing::Failed(runs) if !f.ci.failing() && !f.ci.running() => {
             reasons.push(Reason::new(
                 format!(
                     "The deploy label's workflow didn't pass on this head: {}",
@@ -1055,7 +1091,7 @@ async fn gather(ctx: &Ctx<'_>) -> Result<Facts, Refused> {
     // The deploy label's workflows on the head, with a label its workflow
     // took off put back once on a new head.
     if f.draft && !f.closed && f.put_back_by.is_none() {
-        f.deploy = super::deploy_label::before_ready(
+        (f.deploy, f.deploy_kept_off) = super::deploy_label::before_ready(
             ctx.state,
             gh,
             ctx.team_id,
@@ -1468,11 +1504,13 @@ async fn make_ready(ctx: &Ctx<'_>, f: &Facts) -> Result<(), Refused> {
 
 /// The description once the deploy label's workflow finished on the head:
 /// rebuilt from the head's facts, so it quotes the run's conclusion and link
-/// rather than the run still going when it was last written. The body as
-/// read otherwise, or when the rebuild can't be read back.
+/// rather than the run still going when it was last written, or that a
+/// deploy label was left off this head. The body as read otherwise, or when
+/// the rebuild can't be read back.
 async fn with_deploy_result(ctx: &Ctx<'_>, run_id: &str, f: &Facts) -> String {
     use common::deploy_label::Standing;
-    if !matches!(f.deploy, Standing::Passed | Standing::Failed(_)) || run_id.is_empty() {
+    let finished = matches!(f.deploy, Standing::Passed | Standing::Failed(_));
+    if !(finished || f.deploy_kept_off) || run_id.is_empty() {
         return f.body.clone();
     }
     let rebuilt = crate::passes::description::rebuild_run(
@@ -2446,7 +2484,7 @@ mod tests {
         }
         // Failed while CI fails too: the failing checks say it, once.
         let f = Facts {
-            deploy: Standing::Failed(vec![failed]),
+            deploy: Standing::Failed(vec![failed.clone()]),
             ci: Ci {
                 green: false,
                 why: "CI fails on this head: `Deploy preview / e2e`".into(),
@@ -2458,6 +2496,65 @@ mod tests {
                 assert_eq!(reasons.len(), 1, "{reasons:?}");
                 assert!(reasons[0].line().contains("CI is failing on this head"));
             }
+            d => panic!("{d:?}"),
+        }
+        // Failed while other checks still run: a wait, not a hold; the CI fix
+        // loop takes the failure.
+        let f = Facts {
+            deploy: Standing::Failed(vec![failed]),
+            ci: Ci {
+                green: false,
+                why: "CI is still running on this head: `unit tests`".into(),
+            },
+            ..green_approved()
+        };
+        assert!(matches!(decide(&f), Decision::Wait { .. }), "{:?}", decide(&f));
+    }
+
+    #[test]
+    fn a_deploy_run_held_for_an_environment_approval_asks_for_that_approval() {
+        use common::deploy_label::{DeployRun, Standing};
+        let held = DeployRun {
+            workflow: "Deploy preview".into(),
+            status: "waiting".into(),
+            url: "https://github.com/o/r/actions/runs/5".into(),
+            environment: "staging".into(),
+            ..Default::default()
+        };
+        let f = Facts {
+            deploy: Standing::Approval(vec![held.clone()]),
+            ..green_approved()
+        };
+        match decide(&f) {
+            Decision::Held { reasons } => {
+                assert_eq!(reasons.len(), 1, "{reasons:?}");
+                assert_eq!(
+                    reasons[0].line(),
+                    "The deploy label's workflow is waiting for an approval: `Deploy preview` \
+                     waiting for an approval to deploy to `staging` \
+                     ([run](https://github.com/o/r/actions/runs/5)). Approve the deployment to \
+                     `staging` on the workflow run; the pull request leaves draft once the \
+                     workflow passes."
+                );
+            }
+            d => panic!("{d:?}"),
+        }
+        // The environment couldn't be read: the run link carries the ask.
+        let mut no_env = held;
+        no_env.environment.clear();
+        let f = Facts {
+            deploy: Standing::Approval(vec![no_env]),
+            ..green_approved()
+        };
+        match decide(&f) {
+            Decision::Held { reasons } => assert!(
+                reasons[0].line().ends_with(
+                    "([run](https://github.com/o/r/actions/runs/5)). Approve the waiting \
+                     deployment on the workflow run; the pull request leaves draft once the \
+                     workflow passes."
+                ),
+                "{reasons:?}"
+            ),
             d => panic!("{d:?}"),
         }
     }

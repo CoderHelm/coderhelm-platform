@@ -335,6 +335,10 @@ pub struct Facts {
     /// label starts (`deploy_label`): its conclusion and link are quoted.
     #[serde(default)]
     pub deploy: Vec<crate::deploy_label::DeployRun>,
+    /// Deploy labels a person (or someone CoderHelm couldn't identify) took
+    /// off, which CoderHelm left off this head.
+    #[serde(default)]
+    pub deploy_kept_off: Vec<crate::deploy_label::KeptOff>,
     pub unverified: Vec<Unverified>,
     /// Behaviour the change is known to alter, each with its evidence.
     pub behaviour: Vec<Evidenced>,
@@ -796,6 +800,7 @@ pub fn rows(f: &Facts) -> Vec<crate::pr_body::Row> {
                 other => (O::Failed, with(other)),
             },
             RunState::Running => (O::NotRun, with("still running when this was written")),
+            RunState::Approval => (O::NotRun, with(&r.result())),
             RunState::DidNotRun => (O::NotRun, with(&format!("{} on this head", r.result()))),
         };
         deploy.push(Row {
@@ -1413,6 +1418,9 @@ pub fn body_of(f: &Facts, ticked: &[String]) -> crate::pr_body::Body {
         }
         evidence.push(s.trim_end().to_string());
     }
+    for k in &f.deploy_kept_off {
+        evidence.push(k.evidence_line());
+    }
     let items = needed_items(f);
     let mut built: Vec<String> = Vec::new();
     // A look at the change is under Review focus, not here.
@@ -1589,6 +1597,7 @@ mod tests {
             conclusion: conclusion.into(),
             url: "https://github.com/acme/site/actions/runs/7".into(),
             created_at: "2026-11-14T10:00:00Z".into(),
+            ..Default::default()
         };
         let mut f = ticket_facts();
         f.deploy = vec![run("completed", "success")];
@@ -1608,6 +1617,19 @@ mod tests {
         assert!(lead(&f).contains("| Deploy preview and device E2E (deploy label) | Not run: still running when this was written; [run]("));
         f.deploy = vec![run("completed", "skipped")];
         assert!(lead(&f).contains("| Deploy preview and device E2E (deploy label) | Not run: skipped on this head; [run]("));
+        let mut held = run("waiting", "");
+        held.environment = "staging".into();
+        f.deploy = vec![held];
+        assert!(lead(&f).contains("| Deploy preview and device E2E (deploy label) | Not run: waiting for an approval to deploy to `staging`; [run]("));
+        // A label a person took off: said in the full evidence.
+        f.deploy_kept_off = vec![crate::deploy_label::KeptOff {
+            label: "CI:DEPLOY_PREVIEW".into(),
+            by: crate::deploy_label::RemovedBy::Person,
+        }];
+        assert!(body_of(&f, &[]).evidence.contains(
+            "`CI:DEPLOY_PREVIEW` was taken off by a person, so CoderHelm did not put it back on this head"
+        ));
+        f.deploy_kept_off.clear();
         // Kept in sight when the CI checks are too many to list one by one.
         f.deploy = vec![run("completed", "success")];
         f.checks = (0..12)

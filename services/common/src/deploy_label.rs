@@ -28,7 +28,13 @@
 //!   ([`to_add`]): only when CoderHelm put it on the pull request before,
 //!   never twice on the same head (the merge gate's record keeps the head it
 //!   was added for, `merge_gate::record_labels_added`), and never when a run
-//!   of the workflow already ran on the head. So it can't loop.
+//!   of the workflow already ran on the head. So it can't loop. Only a label
+//!   a workflow or CoderHelm took off ([`removed_by`]): one a person took
+//!   off, or that CoderHelm can't tell who took off, stays off, and the
+//!   description says so ([`KeptOff`]).
+//! - A run held for a protected environment's approval waits for a person,
+//!   not for time ([`Standing::Approval`]): the ready decision asks for that
+//!   approval.
 
 use serde::{Deserialize, Serialize};
 
@@ -62,10 +68,13 @@ pub fn starts(gate: &WorkflowGate, labels: &[String]) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunState {
     Running,
+    /// Held for a protected environment's required approval (GitHub's
+    /// `waiting`): it goes on only once a person approves the deployment.
+    Approval,
     Passed,
     Failed,
-    /// Skipped, cancelled, neutral or waiting for an approval: it proved
-    /// nothing on this head.
+    /// Skipped, cancelled, neutral or waiting for an approval to run at
+    /// all: it proved nothing on this head.
     DidNotRun,
 }
 
@@ -88,6 +97,13 @@ pub struct DeployRun {
     /// When it was created (RFC 3339).
     #[serde(default)]
     pub created_at: String,
+    /// The run's id.
+    #[serde(default)]
+    pub id: u64,
+    /// The environment a run held for an approval deploys to, when it could
+    /// be read.
+    #[serde(default)]
+    pub environment: String,
 }
 
 impl DeployRun {
@@ -101,10 +117,15 @@ impl DeployRun {
             conclusion: s("conclusion"),
             url: s("html_url"),
             created_at: s("created_at"),
+            id: run["id"].as_u64().unwrap_or(0),
+            environment: String::new(),
         }
     }
 
     pub fn state(&self) -> RunState {
+        if self.status == "waiting" {
+            return RunState::Approval;
+        }
         if self.status != "completed" {
             return RunState::Running;
         }
@@ -135,6 +156,13 @@ impl DeployRun {
     pub fn result(&self) -> String {
         match self.state() {
             RunState::Running => "still running".to_string(),
+            RunState::Approval => match self.environment.as_str() {
+                "" => "waiting for an approval to deploy".to_string(),
+                env => format!(
+                    "waiting for an approval to deploy to `{}`",
+                    env.replace('`', "'")
+                ),
+            },
             RunState::Passed => "passed".to_string(),
             RunState::Failed => match self.conclusion.as_str() {
                 "timed_out" => "timed out".to_string(),
@@ -196,6 +224,9 @@ pub enum Standing {
     /// A run is going, or the label was just added and its run hasn't
     /// started: the pull request waits (the why, in words).
     Waiting(String),
+    /// The runs held for a protected environment's approval: only a person
+    /// can let them go on.
+    Approval(Vec<DeployRun>),
     Passed,
     /// The runs that failed. They are failing CI on the head, fixed by the
     /// run's CI fix loop.
@@ -220,6 +251,14 @@ pub fn standing(
 ) -> Standing {
     if labels.is_empty() {
         return Standing::None;
+    }
+    let held: Vec<DeployRun> = runs
+        .iter()
+        .filter(|r| r.state() == RunState::Approval)
+        .cloned()
+        .collect();
+    if !held.is_empty() {
+        return Standing::Approval(held);
     }
     let running: Vec<&DeployRun> = runs
         .iter()
@@ -286,6 +325,60 @@ pub fn to_add(
         .collect()
 }
 
+/// Who last took a deploy label off the pull request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RemovedBy {
+    /// A workflow (`github-actions[bot]`) or CoderHelm's own app.
+    Workflow,
+    Person,
+    /// The pull request's events couldn't be read, or show no removal.
+    Unknown,
+}
+
+/// Who took `label` off last, from the pull request's events (oldest
+/// first, `None` when they couldn't be read). `bots` are the logins that
+/// count as a workflow.
+pub fn removed_by(events: Option<&serde_json::Value>, label: &str, bots: &[&str]) -> RemovedBy {
+    let last = events
+        .and_then(|e| e.as_array())
+        .into_iter()
+        .flatten()
+        .rfind(|e| {
+            e["event"].as_str() == Some("unlabeled")
+                && e["label"]["name"]
+                    .as_str()
+                    .is_some_and(|n| n.eq_ignore_ascii_case(label))
+        });
+    match last.and_then(|e| e["actor"]["login"].as_str()) {
+        None => RemovedBy::Unknown,
+        Some(a) if bots.iter().any(|b| b.eq_ignore_ascii_case(a)) => RemovedBy::Workflow,
+        Some(_) => RemovedBy::Person,
+    }
+}
+
+/// A deploy label CoderHelm left off this head because a workflow didn't
+/// take it off.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeptOff {
+    pub label: String,
+    pub by: RemovedBy,
+}
+
+impl KeptOff {
+    /// One sentence for the full test evidence.
+    pub fn evidence_line(&self) -> String {
+        let label = self.label.replace('`', "'");
+        let by = match self.by {
+            RemovedBy::Person => "a person",
+            _ => "someone CoderHelm couldn't identify",
+        };
+        format!(
+            "`{label}` was taken off by {by}, so CoderHelm did not put it back on this head and \
+             its workflow did not run here."
+        )
+    }
+}
+
 /// Pure: may a green result be trusted yet, given when deploy labels were
 /// added? Label-triggered workflows take a moment to register their checks;
 /// until one has started (or [`GRACE_SECS`] passed) green means "not yet".
@@ -311,6 +404,7 @@ mod tests {
             conclusion: conclusion.into(),
             url: "https://github.com/o/r/actions/runs/1".into(),
             created_at: created.into(),
+            ..Default::default()
         }
     }
 
@@ -386,7 +480,7 @@ mod tests {
     #[test]
     fn conclusions_read_as_the_gate_needs_them() {
         assert_eq!(run("queued", "", "").state(), RunState::Running);
-        assert_eq!(run("waiting", "", "").state(), RunState::Running);
+        assert_eq!(run("waiting", "", "").state(), RunState::Approval);
         assert_eq!(run("completed", "success", "").state(), RunState::Passed);
         for c in ["failure", "timed_out", "startup_failure"] {
             assert_eq!(run("completed", c, "").state(), RunState::Failed, "{c}");
@@ -483,6 +577,65 @@ mod tests {
         // CoderHelm never labelled this pull request: never added here.
         assert!(to_add(&want, &[], "", "new", &[]).is_empty());
         assert!(to_add(&[], &[], "old", "new", &[]).is_empty());
+    }
+
+    #[test]
+    fn a_run_held_for_an_environment_approval_is_asked_for_not_waited_on() {
+        let now = at("2026-11-14T10:10:00Z");
+        let mut held = run("waiting", "", "2026-11-14T10:01:00Z");
+        assert_eq!(held.result(), "waiting for an approval to deploy");
+        held.environment = "staging".into();
+        assert_eq!(
+            held.evidence_line(),
+            "- `Deploy preview`: waiting for an approval to deploy to `staging` \
+             ([run](https://github.com/o/r/actions/runs/1))"
+        );
+        // Held, even with another run still going: only a person moves it on.
+        let going = run("in_progress", "", "2026-11-14T10:02:00Z");
+        assert_eq!(
+            standing(&labels(), &[going, held.clone()], None, now),
+            Standing::Approval(vec![held.clone()])
+        );
+        // A held run ran on this head: the label is never put back over it.
+        assert!(to_add(&labels(), &[], "old", "new", &[held]).is_empty());
+    }
+
+    #[test]
+    fn only_a_label_a_workflow_took_off_counts_as_taken_off_by_a_workflow() {
+        let ev = |event: &str, label: &str, login: &str| {
+            json!({"event": event, "label": {"name": label}, "actor": {"login": login}})
+        };
+        let bots = ["github-actions[bot]", "coderhelm[bot]"];
+        let events = json!([
+            ev("labeled", "CI:DEPLOY_PREVIEW", "coderhelm[bot]"),
+            ev("unlabeled", "CI:DEPLOY_PREVIEW", "github-actions[bot]"),
+            ev("labeled", "e2e:devices", "coderhelm[bot]"),
+            ev("unlabeled", "e2e:devices", "github-actions[bot]"),
+            ev("labeled", "e2e:devices", "coderhelm[bot]"),
+            ev("unlabeled", "e2e:devices", "octocat"),
+        ]);
+        assert_eq!(removed_by(Some(&events), "ci:deploy_preview", &bots), RemovedBy::Workflow);
+        // The latest removal decides: a person's, after a workflow's.
+        assert_eq!(removed_by(Some(&events), "e2e:devices", &bots), RemovedBy::Person);
+        // No removal in the events, or the events unread: can't tell.
+        assert_eq!(removed_by(Some(&events), "other", &bots), RemovedBy::Unknown);
+        assert_eq!(removed_by(None, "CI:DEPLOY_PREVIEW", &bots), RemovedBy::Unknown);
+        let kept = KeptOff {
+            label: "CI:DEPLOY_PREVIEW".into(),
+            by: RemovedBy::Person,
+        };
+        assert_eq!(
+            kept.evidence_line(),
+            "`CI:DEPLOY_PREVIEW` was taken off by a person, so CoderHelm did not put it back on \
+             this head and its workflow did not run here."
+        );
+        let unknown = KeptOff {
+            by: RemovedBy::Unknown,
+            ..kept
+        };
+        assert!(unknown
+            .evidence_line()
+            .contains("taken off by someone CoderHelm couldn't identify"));
     }
 
     #[test]

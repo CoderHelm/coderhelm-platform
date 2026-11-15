@@ -609,9 +609,14 @@ fn live_rows(
     // DynamoDB deletes expired items late; an expired one is gone already.
     let current =
         |it: &&HashMap<String, AttributeValue>| item_i64(it, "ttl").is_none_or(|t| t >= now);
+    // A gate record that only keeps the head the deploy labels were added
+    // for (no state, never armed) is no gate: its pull request isn't listed.
+    let armed = |it: &&HashMap<String, AttributeValue>| {
+        !item_str(it, "state", "").is_empty() || item_i64(it, "armed_at").is_some()
+    };
     let (live, gates): (Vec<_>, Vec<_>) = (
         live.iter().filter(current).collect(),
-        gates.iter().filter(current).collect(),
+        gates.iter().filter(current).filter(armed).collect(),
     );
     for it in live {
         if let Some((repo, pr)) = pr_from_sk(&item_str(it, "sk", ""), rl::SK_PREFIX) {
@@ -1886,6 +1891,42 @@ mod tests {
             rows[2]["gate"]["checklist"][1]["text"],
             "Waiting for a person's approval"
         );
+    }
+
+    #[test]
+    fn a_gate_record_that_only_keeps_the_deploy_labels_head_is_not_listed() {
+        let now = 1_000_000;
+        let labels_only = |pr: &str| {
+            item(&[
+                ("sk", attr_s(&format!("MERGEGATE#acme/web#{pr}"))),
+                ("labels_added_head", attr_s("abc123")),
+                ("labels_added_at", attr_n(now - 60)),
+                ("ttl", attr_n(now + 86_400)),
+            ])
+        };
+        // Alone: no row at all, and no place taken under the row cap.
+        let gates: Vec<_> = (1..=LIVE_MAX_ROWS + 5)
+            .map(|i| labels_only(&format!("{i:06}")))
+            .collect();
+        assert!(live_rows(&[], &gates, now).is_empty());
+        // With a review going on the same pull request: the review's row,
+        // without a gate.
+        let live = vec![item(&[
+            ("sk", attr_s("REVIEWLIVE#acme/web#000001")),
+            ("phase", attr_s("reviewing")),
+            ("expires_at", attr_n(now + 600)),
+        ])];
+        let rows = live_rows(&live, &gates, now);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["status"], "reviewing");
+        assert_eq!(rows[0]["gate"], Value::Null);
+        // An armed gate is still listed.
+        let armed = vec![item(&[
+            ("sk", attr_s("MERGEGATE#acme/web#000002")),
+            ("armed_at", attr_n(now - 30)),
+            ("labels_added_head", attr_s("abc123")),
+        ])];
+        assert_eq!(live_rows(&[], &armed, now).len(), 1);
     }
 
     #[test]
