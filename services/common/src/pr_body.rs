@@ -228,11 +228,16 @@ impl Row {
 /// The screenshots of a UI change, or why there are none.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Screens {
+    /// One Before and After pair. An empty `before` is a side with no
+    /// image: its cell says `before_alt` instead.
     Images {
         before: String,
         before_alt: String,
         after: String,
         after_alt: String,
+        /// One line under the table: where the images came from.
+        #[serde(default)]
+        caption: String,
     },
     /// One line: why there is no screenshot.
     Missing(String),
@@ -798,19 +803,28 @@ fn screens_markdown(s: &Screens) -> String {
             before_alt,
             after,
             after_alt,
+            caption,
         } => {
             let img = |src: &str, alt: &str| {
+                if src.trim().is_empty() {
+                    return cell(&one_line(alt));
+                }
                 format!(
                     "<img src=\"{}\" width=\"380\" alt=\"{}\">",
                     src.replace('"', "%22"),
                     one_line(alt).replace('"', "'")
                 )
             };
-            format!(
+            let mut s = format!(
                 "| Before | After |\n|---|---|\n| {} | {} |",
                 img(before, before_alt),
                 img(after, after_alt)
-            )
+            );
+            let caption = one_line(caption);
+            if !caption.is_empty() {
+                s.push_str(&format!("\n\n{caption}"));
+            }
+            s
         }
         Screens::Missing(why) => format!("No screenshot: {}.", part(why)),
         Screens::Pages(pages) => {

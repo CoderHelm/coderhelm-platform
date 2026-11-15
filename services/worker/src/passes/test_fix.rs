@@ -367,6 +367,12 @@ pub trait Reports: Send + Sync {
     async fn reports(&self, run_id: u64, attempt: u32) -> Result<Vec<(String, Vec<u8>)>, String>;
     /// One file of the run's folder (an attachment of an HTML report).
     async fn file(&self, run_id: u64, attempt: u32, path: &str) -> Option<Vec<u8>>;
+    /// Every file of the run's folder, by the path [`Reports::file`]
+    /// reads: where a report's attachment is found when the report wrote
+    /// the runner's own path (`e2e_screens`).
+    async fn names(&self, _run_id: u64, _attempt: u32) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// What one run's reports say.
@@ -694,6 +700,17 @@ impl Reports for S3Reports {
             .map(|(_, s, _)| *s)?;
         self.get(&key, size).await
     }
+
+    async fn names(&self, run_id: u64, attempt: u32) -> Vec<String> {
+        let attempt = self.attempt_for(run_id, attempt);
+        let prefix = self.run_prefix(run_id, attempt);
+        self.index
+            .get(&(run_id, attempt))
+            .into_iter()
+            .flatten()
+            .map(|(k, _, _)| k.strip_prefix(&prefix).unwrap_or(k).to_string())
+            .collect()
+    }
 }
 
 /// Reports in a run's GitHub Actions artifacts.
@@ -836,6 +853,13 @@ impl Reports for CiReports<'_> {
             .into_iter()
             .find(|(n, _)| n == path)
             .map(|(_, b)| b)
+    }
+
+    async fn names(&self, run_id: u64, _attempt: u32) -> Vec<String> {
+        self.files(run_id)
+            .await
+            .map(|f| f.into_iter().map(|(n, _)| n).collect())
+            .unwrap_or_default()
     }
 }
 
