@@ -163,7 +163,7 @@ fn a_fix_round_that_meets_the_limit_waits_and_lands_after_the_reset() {
     assert!(
         known
             < run
-                .find("load_unprocessed_events(state, &msg.run_id)")
+                .find("load_unprocessed_events(state, &msg.team_id, &msg.run_id)")
                 .unwrap()
     );
     assert!(

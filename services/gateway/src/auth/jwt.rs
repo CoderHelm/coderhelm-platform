@@ -167,6 +167,10 @@ pub fn validate_second_step(
 /// `/api/brain/stream`, never as a session or a plan chat token.
 pub const BRAIN_AUDIENCE: &str = "coderhelm-brain";
 
+/// Audience of the plan chat's short-lived stream token: accepted only by
+/// `/api/plans/chat/stream`, never as a session or a brain token.
+pub const PLAN_CHAT_AUDIENCE: &str = "coderhelm-plan-chat";
+
 /// A short-lived token for `audience` carrying the member's stored role.
 pub fn create_scoped_token(
     claims: &Claims,
@@ -314,6 +318,19 @@ mod tests {
         assert!(validate_scoped_token(&session, BRAIN_AUDIENCE, secret).is_err());
         let back = validate_scoped_token(&brain, BRAIN_AUDIENCE, secret).unwrap();
         assert_eq!((back.sub.as_str(), back.role.as_str()), ("u", "member"));
+    }
+
+    #[test]
+    fn a_plan_chat_token_opens_only_the_plan_chat_stream() {
+        let secret = "test-jwt-secret-at-least-32-chars!";
+        let session = create_token("u", "TEAM#a", "e@x.com", "member", None, secret, 300).unwrap();
+        let claims = validate_token(&session, secret).unwrap();
+        let plan = create_scoped_token(&claims, PLAN_CHAT_AUDIENCE, secret, 300).unwrap();
+        assert!(validate_token(&plan, secret).is_err(), "never a session");
+        assert!(validate_scoped_token(&plan, BRAIN_AUDIENCE, secret).is_err());
+        assert!(validate_scoped_token(&session, PLAN_CHAT_AUDIENCE, secret).is_err());
+        let back = validate_scoped_token(&plan, PLAN_CHAT_AUDIENCE, secret).unwrap();
+        assert_eq!(back.team_id, "TEAM#a");
     }
 
     #[test]

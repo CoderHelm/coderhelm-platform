@@ -20,7 +20,6 @@ use axum::{
     response::{Html, IntoResponse, Response},
     Extension, Json,
 };
-use common::plugins::kv::Kv;
 use common::plugins::source::{self, Track};
 use common::plugins::{
     audit, brain, chat, code, drafts, flag, install, kv, limits, run, schedule, signed, Refusal,
@@ -294,22 +293,9 @@ pub async fn put_settings(
                 "That isn't a Slack workspace id.",
             )));
         }
-        if !s.slack_team_id.is_empty() {
-            let _ = kv
-                .delete(kv::CHAT_INDEX, &format!("slack|{}", s.slack_team_id))
-                .await;
-        }
-        if !id.is_empty() {
-            kv.put(
-                kv::CHAT_INDEX,
-                &format!("slack|{id}"),
-                &json!({ "team": team }),
-                kv::Expect::Any,
-            )
+        flag::link_slack(&kv, team, &mut s, &id)
             .await
-            .map_err(|e| refused(Refusal::new(code::STORE, e.to_string())))?;
-        }
-        s.slack_team_id = id;
+            .map_err(refused)?;
     }
     if let Some(sec) = body.slack_signing_secret.filter(|x| !x.trim().is_empty()) {
         s.slack_signing_secret_sealed = seal("plugin-slack", sec.trim().to_string()).await?;
@@ -317,15 +303,7 @@ pub async fn put_settings(
     if let Some(sec) = body.teams_secret.filter(|x| !x.trim().is_empty()) {
         s.teams_secret_sealed = seal("plugin-teams", sec.trim().to_string()).await?;
         if s.teams_token.is_empty() {
-            s.teams_token = common::plugins::new_id();
-            kv.put(
-                kv::CHAT_INDEX,
-                &format!("teams|{}", s.teams_token),
-                &json!({ "team": team }),
-                kv::Expect::Any,
-            )
-            .await
-            .map_err(|e| refused(Refusal::new(code::STORE, e.to_string())))?;
+            flag::link_teams(&kv, team, &mut s).await.map_err(refused)?;
         }
     }
     flag::save_settings(&kv, team, &s).await.map_err(refused)?;
@@ -1624,17 +1602,6 @@ pub async fn email_approve(
 
 // ── Public: briefs from Slack and Teams (signature verified) ────────────────
 
-async fn chat_team(state: &AppState, key: &str) -> Option<String> {
-    kv(state)
-        .get(kv::CHAT_INDEX, key)
-        .await
-        .ok()
-        .flatten()?
-        .data["team"]
-        .as_str()
-        .map(str::to_string)
-}
-
 async fn open_secret(state: &AppState, team: &str, purpose: &str, sealed: &str) -> Option<String> {
     use base64::Engine;
     use common::mcp_credentials::Cipher;
@@ -1700,7 +1667,7 @@ pub async fn slack_command(
     let form = chat::slack_form(&text);
     let slack_team = form.get("team_id").cloned().unwrap_or_default();
     let refuse = || (StatusCode::UNAUTHORIZED, "Not verified").into_response();
-    let Some(team) = chat_team(&state, &format!("slack|{slack_team}")).await else {
+    let Some(team) = flag::chat_team(&kv(&state), &flag::slack_key(&slack_team)).await else {
         return refuse();
     };
     let Ok(s) = flag::settings(&kv(&state), &team).await else {
@@ -1765,7 +1732,7 @@ pub async fn teams_message(
     body: axum::body::Bytes,
 ) -> Response {
     let refuse = || (StatusCode::UNAUTHORIZED, "Not verified").into_response();
-    let Some(team) = chat_team(&state, &format!("teams|{token}")).await else {
+    let Some(team) = flag::chat_team(&kv(&state), &flag::teams_key(&token)).await else {
         return refuse();
     };
     let Ok(s) = flag::settings(&kv(&state), &team).await else {
