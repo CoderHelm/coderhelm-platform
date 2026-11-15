@@ -31,6 +31,8 @@ pub(super) struct Fake {
     pub files: HashMap<String, Vec<String>>,
     /// Repos whose files can't be read.
     pub unreadable: Vec<String>,
+    /// Each repo's commits (a repo not listed has none).
+    pub commits: HashMap<String, Vec<String>>,
     pub answer: Answer,
     pub changed: bool,
     pub cache: Mutex<HashMap<String, Cached>>,
@@ -49,6 +51,7 @@ impl Fake {
             profiles: HashMap::new(),
             files: HashMap::new(),
             unreadable: Vec::new(),
+            commits: HashMap::new(),
             answer: Box::new(answer),
             changed: false,
             cache: Mutex::new(HashMap::new()),
@@ -96,6 +99,14 @@ impl Env for Fake {
             return None;
         }
         Some(self.files.get(&repo.name).cloned().unwrap_or_default())
+    }
+    async fn has_commit(&self, repo: &RepoInfo, sha: &str) -> Option<bool> {
+        self.calls.lock().unwrap().push("commit");
+        Some(
+            self.commits
+                .get(&repo.name)
+                .is_some_and(|c| c.iter().any(|x| x.starts_with(sha))),
+        )
     }
     async fn judge(&self, _system: &str, user: &str) -> Result<String, String> {
         self.calls.lock().unwrap().push("judge");
@@ -269,7 +280,7 @@ async fn terraform_that_defines_the_log_group_is_code_evidence() {
     let r = resolve(&env, &inp, t(NOW)).await;
     assert_eq!(r.repo.as_deref(), Some("acme/render-service"));
     assert_eq!(r.confidence, Confidence::Medium);
-    assert_eq!(r.decided_by[0].kind, Kind::Code);
+    assert_eq!(r.decided_by[0].kind, Kind::InfraCode);
     assert!(r.decided_by[0].detail.contains("deploy/terraform/ecs.tf"));
     // Searched with the log group itself.
     assert!(env.count("search") >= 1);
@@ -1240,4 +1251,406 @@ async fn files_are_evidence_only_when_every_repo_was_read() {
     let r = resolve(&env, &api_input(&many), t(NOW)).await;
     assert!(!r.is_sure(), "{r:?}");
     assert_eq!(env.count("files"), 0);
+}
+
+// ─── Tracing it like an engineer would ──────────────────────────────────────
+
+const SHA: &str = "4c1e9a07b2d85f6e3a90c71d2b48e5f60a1c3d97";
+
+fn traced_facts() -> AwsFacts {
+    let image = format!("111122223333.dkr.ecr.us-east-1.amazonaws.com/prod-ledger-api:sha-{SHA}");
+    AwsFacts {
+        connected: true,
+        ecs: vec![EcsFact {
+            cluster: "arn:aws:ecs:us-east-1:111122223333:cluster/prod-ledger-api-ecs-cluster"
+                .into(),
+            service: "prod-ledger-api-ecs-service".into(),
+            task_definition:
+                "arn:aws:ecs:us-east-1:111122223333:task-definition/prod-ledger-api:270".into(),
+            family: "prod-ledger-api".into(),
+            images: vec![image.clone()],
+            ..Default::default()
+        }],
+        images: vec![ImageFact {
+            image,
+            ecr_repo: "prod-ledger-api".into(),
+            tags: map(&[("App", "ledger-api"), ("Environment", "prod")]),
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+}
+
+fn traced_input() -> Input {
+    Input {
+        target: Target {
+            account: "111122223333".into(),
+            log_group: "/ecs/prod-ledger-api".into(),
+            about: "Secrets detected in CloudWatch Logs (2 instances)".into(),
+            samples: vec![LogLine {
+                log_group: "/ecs/prod-ledger-api".into(),
+                message: "[Nest] 1  - 11/12/2026, 10:19:20 AM   ERROR [SearchIndexService] Failed to reach the search cluster with password=[REDACTED_PASSWORD]".into(),
+            }],
+            ..Default::default()
+        },
+        repos: repos(&["acme/ledger-api", "acme/terraform-infra", "acme/ops-cli"]),
+        related: vec![(
+            "/ecs/prod-ledger-api-worker".into(),
+            "acme/ledger-api".into(),
+        )],
+        ..Default::default()
+    }
+}
+
+fn hit(repo: &str, path: &str, fragment: &str) -> SearchHit {
+    SearchHit {
+        repo: repo.into(),
+        path: path.into(),
+        fragments: vec![fragment.into()],
+    }
+}
+
+#[test]
+fn a_commit_id_is_read_from_the_image_tag_or_its_revision() {
+    assert_eq!(commit_in(&format!("sha-{SHA}")).as_deref(), Some(SHA));
+    assert_eq!(commit_in("main-1a2b3c4").as_deref(), Some("1a2b3c4"));
+    assert_eq!(commit_in("1A2B3C4D").as_deref(), Some("1a2b3c4d"));
+    for not_a_commit in [
+        "latest",
+        "v1.2.3",
+        "20261112",
+        "deadbeef",
+        "release-2026",
+        "",
+    ] {
+        assert_eq!(commit_in(not_a_commit), None, "{not_a_commit}");
+    }
+    let facts = traced_facts();
+    let found = image_commits(&facts);
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].1, SHA);
+    // The OCI revision annotation counts too; a digest pin is not a tag.
+    let mut facts = AwsFacts::default();
+    facts.images.push(ImageFact {
+        image: "111122223333.dkr.ecr.us-east-1.amazonaws.com/jobs@sha256:abc".into(),
+        ecr_repo: "jobs".into(),
+        annotations: map(&[("org.opencontainers.image.revision", "9e8d7c6b5a41")]),
+        ..Default::default()
+    });
+    assert_eq!(image_commits(&facts)[0].1, "9e8d7c6b5a41");
+}
+
+#[test]
+fn a_bare_name_counts_only_as_a_whole_repo_name() {
+    let rs = repos(&["acme/ledger-api", "acme/ledger-web", "acme/ops-cli"]);
+    assert_eq!(
+        bare_repo("ledger-api", &rs).as_deref(),
+        Some("acme/ledger-api")
+    );
+    assert_eq!(
+        bare_repo("prod-ledger-api", &rs).as_deref(),
+        Some("acme/ledger-api")
+    );
+    assert_eq!(
+        bare_repo("ledger-api-staging", &rs).as_deref(),
+        Some("acme/ledger-api")
+    );
+    for loose in ["ledger", "api", "prod", "team-ledger-api", "ledger-apis"] {
+        assert_eq!(bare_repo(loose, &rs), None, "{loose}");
+    }
+}
+
+#[test]
+fn the_image_repository_and_its_tags_name_the_app_repo() {
+    let rs = repos(&["acme/ledger-api", "acme/terraform-infra"]);
+    let ev = aws_evidence(&traced_facts(), &rs);
+    let kinds: Vec<(Kind, &str)> = ev.iter().map(|e| (e.kind, e.repo.as_str())).collect();
+    assert!(
+        kinds.contains(&(Kind::ImageRepo, "acme/ledger-api")),
+        "{ev:?}"
+    );
+    assert!(
+        kinds.contains(&(Kind::TagName, "acme/ledger-api")),
+        "{ev:?}"
+    );
+    // `Environment=prod` names no repo.
+    assert!(ev.iter().all(|e| e.repo == "acme/ledger-api"), "{ev:?}");
+}
+
+#[test]
+fn a_file_is_read_for_what_it_does() {
+    for ships in [
+        ".github/workflows/deploy.yml",
+        "Dockerfile",
+        "docker/api.Dockerfile",
+        "buildspec.yml",
+        "serverless.yml",
+        "template.yaml",
+        ".aws/task-definition.json",
+        "scripts/deploy-api.sh",
+        "Makefile",
+    ] {
+        assert_eq!(file_role(ships), FileRole::Ships, "{ships}");
+    }
+    for infra in [
+        "ecs.tf",
+        "modules/ecs/main.tf",
+        "envs/prod/terraform.tfvars",
+        "terraform/README.md",
+        "charts/api/values.yaml",
+        "cloudformation/api.yaml",
+    ] {
+        assert_eq!(file_role(infra), FileRole::Infra, "{infra}");
+    }
+    for other in [
+        "src/search/search-index.service.ts",
+        "README.md",
+        "scripts/seed.ts",
+    ] {
+        assert_eq!(file_role(other), FileRole::Other, "{other}");
+    }
+}
+
+#[test]
+fn a_workflow_ships_the_image_and_terraform_only_defines_it() {
+    let rs = repos(&["acme/ledger-api", "acme/terraform-infra"]);
+    let mut ev = Vec::new();
+    code_evidence(
+        "prod-ledger-api",
+        &[
+            hit(
+                "acme/terraform-infra",
+                "ecs.tf",
+                "name = \"prod-ledger-api\"",
+            ),
+            hit(
+                "acme/ledger-api",
+                ".github/workflows/deploy.yml",
+                "ECR_REPOSITORY: prod-ledger-api",
+            ),
+        ],
+        &rs,
+        &mut ev,
+    );
+    assert_eq!(ev[0].kind, Kind::InfraCode);
+    assert_eq!(ev[1].kind, Kind::Ships);
+    assert!(
+        ev[1].detail.contains("builds or deploys"),
+        "{}",
+        ev[1].detail
+    );
+    // The infrastructure repo never rivals the app repo.
+    assert!(decisive("acme/ledger-api", &ev));
+    assert!(!decisive("acme/terraform-infra", &ev));
+}
+
+#[test]
+fn the_error_lines_name_the_class_and_the_text_that_logged_them() {
+    let inp = traced_input();
+    assert_eq!(code_symbols(&inp.target), ["SearchIndexService"]);
+    assert_eq!(
+        message_phrase(&inp.target).as_deref(),
+        Some("Failed to reach the search cluster with")
+    );
+    // A framework's own names and dotted logger names.
+    let t = Target {
+        samples: vec![
+            LogLine {
+                log_group: "g".into(),
+                message: "ERROR [ExceptionsHandler] TypeError: x is undefined".into(),
+            },
+            LogLine {
+                log_group: "g".into(),
+                message: "at com.acme.billing.InvoiceJob.run(InvoiceJob.java:42)".into(),
+            },
+        ],
+        ..Default::default()
+    };
+    assert_eq!(code_symbols(&t), ["InvoiceJob"]);
+    // Only source files of the team's own code count.
+    let rs = repos(&["acme/ledger-api", "acme/ops-cli"]);
+    let mut ev = Vec::new();
+    symbol_evidence(
+        "the class SearchIndexService the error's lines name",
+        &[
+            hit(
+                "acme/ledger-api",
+                "src/search/search-index.service.ts",
+                "export class SearchIndexService {",
+            ),
+            hit("acme/ops-cli", "docs/notes.md", "class SearchIndexService"),
+            hit(
+                "acme/ops-cli",
+                "node_modules/x/index.js",
+                "class SearchIndexService",
+            ),
+        ],
+        &rs,
+        &mut ev,
+    );
+    assert_eq!(ev.len(), 1);
+    assert_eq!(
+        (ev[0].kind, ev[0].repo.as_str()),
+        (Kind::CodeSymbol, "acme/ledger-api")
+    );
+}
+
+#[tokio::test]
+async fn the_running_commit_decides_even_when_the_model_hedges() {
+    // The model hedges and cites only the lines and a similar log group.
+    let mut env = Fake::new(traced_facts(), |_p: &str| {
+        Ok(json!({
+            "repo": "acme/ledger-api",
+            "confidence": "medium",
+            "reason": "A sibling log group is saved here; no direct pointer.",
+            "evidence": [],
+            "candidates": [
+                {"repo": "acme/ledger-api", "reason": "backend"},
+                {"repo": "acme/terraform-infra", "reason": "infra"},
+                {"repo": "acme/ops-cli", "reason": "cli"},
+            ],
+        })
+        .to_string())
+    });
+    env.commits
+        .insert("acme/ledger-api".into(), vec![SHA.into()]);
+    let r = resolve(&env, &traced_input(), t(NOW)).await;
+    assert!(r.is_sure(), "{r:?}");
+    assert_eq!(choose(&r), Choice::Sure("acme/ledger-api".into()));
+    assert!(
+        r.decided_by.iter().any(|e| e.kind == Kind::ImageCommit),
+        "{:?}",
+        r.decided_by
+    );
+    assert!(
+        r.why_line().starts_with("from the running image's commit"),
+        "{}",
+        r.why_line()
+    );
+    // Every repo's history was asked once.
+    assert_eq!(env.count("commit"), 3);
+}
+
+#[tokio::test]
+async fn without_the_commit_the_build_files_and_the_code_still_decide() {
+    let mut env = Fake::new(traced_facts(), |_p: &str| {
+        Ok(
+            json!({"repo": "acme/ledger-api", "confidence": "low", "reason": "Unsure.",
+                  "evidence": [], "candidates": []})
+            .to_string(),
+        )
+    });
+    env.hits.insert(
+        "prod-ledger-api".into(),
+        vec![
+            hit(
+                "acme/terraform-infra",
+                "ecs.tf",
+                "name = \"prod-ledger-api\"",
+            ),
+            hit(
+                "acme/ledger-api",
+                ".github/workflows/deploy.yml",
+                "ECR_REPOSITORY: prod-ledger-api",
+            ),
+        ],
+    );
+    env.hits.insert(
+        "class SearchIndexService".into(),
+        vec![hit(
+            "acme/ledger-api",
+            "src/search/search-index.service.ts",
+            "export class SearchIndexService {",
+        )],
+    );
+    let r = resolve(&env, &traced_input(), t(NOW)).await;
+    assert_eq!(choose(&r), Choice::Sure("acme/ledger-api".into()), "{r:?}");
+    let p = env.prompts.lock().unwrap()[0].clone();
+    assert!(p.contains("[ships] (acme/ledger-api)"), "{p}");
+    assert!(p.contains("[infra_code] (acme/terraform-infra)"), "{p}");
+    assert!(p.contains("[code_symbol] (acme/ledger-api)"), "{p}");
+    assert!(p.contains("[sibling] (acme/ledger-api)"), "{p}");
+}
+
+#[test]
+fn a_split_call_starts_on_the_best_guess_and_only_nothing_asks() {
+    let guess = Resolution {
+        repo: Some("acme/ledger-api".into()),
+        confidence: Confidence::Low,
+        candidates: vec![
+            Candidate {
+                repo: "acme/ledger-api".into(),
+                reason: "a".into(),
+            },
+            Candidate {
+                repo: "acme/ledger-api-v2".into(),
+                reason: "b".into(),
+            },
+        ],
+        ..Default::default()
+    };
+    assert_eq!(
+        choose(&guess),
+        Choice::Guess {
+            repo: "acme/ledger-api".into(),
+            others: vec!["acme/ledger-api-v2".into()],
+        }
+    );
+    // No pick but candidates: the first is the guess.
+    let only = Resolution {
+        repo: None,
+        ..guess.clone()
+    };
+    assert!(matches!(choose(&only), Choice::Guess { repo, .. } if repo == "acme/ledger-api"));
+    assert_eq!(
+        choose(&Resolution {
+            unweighed: true,
+            ..guess
+        }),
+        Choice::Wait
+    );
+    assert_eq!(choose(&Resolution::default()), Choice::Ask);
+}
+
+#[tokio::test]
+async fn an_answer_from_an_older_resolver_or_an_unsure_one_is_worked_out_again() {
+    let env = Fake::new(traced_facts(), answer("acme/ledger-api", "low", "Thin."));
+    let inp = traced_input();
+    let unsure = Resolution {
+        repo: Some("acme/ledger-api".into()),
+        confidence: Confidence::Medium,
+        ..Default::default()
+    };
+    let old = Cached {
+        resolution: unsure.clone(),
+        anchor: Anchor::default(),
+        repos_key: repos_key(&inp.repos),
+        at: NOW.into(),
+        resolver: 0,
+    };
+    assert!(!fresh(&old, &inp.repos, t(NOW)));
+    let current = Cached {
+        resolver: RESOLVER,
+        ..old.clone()
+    };
+    assert!(fresh(&current, &inp.repos, t(NOW)));
+    // Unsure answers are gathered again within hours, sure ones keep.
+    let later = t(NOW) + chrono::Duration::hours(7);
+    assert!(!fresh(&current, &inp.repos, later));
+    let sure = Cached {
+        resolution: Resolution {
+            confidence: Confidence::High,
+            ..unsure
+        },
+        ..current
+    };
+    assert!(fresh(&sure, &inp.repos, later));
+    // The old cached answer is not served.
+    env.cache
+        .lock()
+        .unwrap()
+        .insert(inp.target.cache_key(), old);
+    let r = resolve(&env, &inp, t(NOW)).await;
+    assert!(!r.cached);
+    assert_eq!(env.count("aws"), 1);
 }

@@ -611,6 +611,15 @@ class MultiGroupAttribution(unittest.TestCase):
         advisories = h.secrets_advisories(batches, [], ACCOUNT)
         self.assertEqual([(a["log_group"], a["stats"]["count"]) for a in advisories], [(JOBS, 1), (API, 3)])
         self.assertEqual(advisories[1]["stats"]["streams"], {"a": 3})
+        # The lines that write the value are kept, masked: they show which
+        # statement to change. The card reads plainly.
+        jobs = advisories[0]
+        self.assertEqual([s["message"] for s in jobs["stats"]["samples"]], ["ERROR [REDACTED_PASSWORD]"])
+        self.assertNotIn("hunter2", str(jobs))
+        self.assertNotIn("a" * 40, str(advisories[1]))
+        self.assertTrue(jobs["summary"].startswith(f"{JOBS} has 1 passwords or tokens in plain text"))
+        self.assertNotIn("We detected", jobs["summary"])
+        self.assertIn("log statement", jobs["suggested_action"])
 
 
 # ── The one-off merge ─────────────────────────────────────────────

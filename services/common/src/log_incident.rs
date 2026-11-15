@@ -1256,8 +1256,18 @@ pub fn plan(d: &Diagnosis) -> Plan {
 pub enum Action {
     /// The errors stopped on their own; nothing to change.
     Recovered,
-    /// A fix run started in `repo` (its PR card follows when it opens).
-    Started { repo: String },
+    /// A fix run started in `repo` (its PR card follows when it opens), and
+    /// in a few words why that repo (empty when the incident's own plan
+    /// named it).
+    Started { repo: String, why: String },
+    /// The evidence for the repo was split or thin: the fix started on the
+    /// best guess anyway, and the card says so with the other repos and a
+    /// way to move it. Never a question that holds the fix.
+    Guessed {
+        repo: String,
+        others: Vec<String>,
+        why: String,
+    },
     /// Only a person can do what's left, for a reason on the human-only
     /// list ([`crate::handback::HumanOnly`]): a setting kept in a secret
     /// outside the code, a pipeline CoderHelm can only read.
@@ -1268,7 +1278,8 @@ pub enum Action {
     /// AWS's side and still happening: nothing for anyone to change in the
     /// team's code; CoderHelm keeps watching and says when it recovers.
     Watching,
-    /// The repo is genuinely split: a person picks, once per log group.
+    /// Nothing ties the log group to any of the team's repos, so there is
+    /// no repo to start in: a person picks, once per log group.
     WhichRepo {
         guess: Option<String>,
         candidates: Vec<String>,
@@ -1295,23 +1306,27 @@ impl Action {
                 }
                 s
             }
-            Action::Started { repo } => match &d.fix {
-                Some(p) => format!(
-                    "Started a fix in {repo}: {} The pull request follows here when it opens.",
-                    p.change
-                ),
-                None => format!(
-                    "Started a fix in {repo}. The pull request follows here when it opens."
-                ),
-            },
+            Action::Started { repo, why } => {
+                let chose = if why.trim().is_empty() {
+                    format!("Started a fix in {repo}")
+                } else {
+                    format!("Started a fix in {repo} ({})", why.trim().trim_end_matches('.'))
+                };
+                match &d.fix {
+                    Some(p) => format!(
+                        "{chose}: {} The pull request follows here when it opens.",
+                        p.change
+                    ),
+                    None => format!("{chose}. The pull request follows here when it opens."),
+                }
+            }
+            Action::Guessed { repo, why, .. } => format!(
+                "Started a fix in {repo}, the best guess ({}). Wrong repo? Move it once and every fix for this log group goes there.",
+                why.trim().trim_end_matches('.')
+            ),
             Action::ForAPerson { reason, .. } => reason.clone(),
             Action::Watching => "Nothing in the team's code or settings causes it. CoderHelm keeps watching and posts here when it recovers; if the code needs a change after all, it starts the fix.".into(),
-            Action::WhichRepo { guess, .. } => match guess {
-                Some(g) => format!(
-                    "The evidence is split between repos; the best guess is {g}. Pick the repo once for this log group and every fix after it starts on its own."
-                ),
-                None => "Nothing ties this log group to one repo yet. Pick the repo once and every fix after it starts on its own.".into(),
-            },
+            Action::WhichRepo { .. } => "Nothing CoderHelm can read ties this log group to one of the team's repos, so no fix started. Pick the repo once and every fix after it starts on its own.".into(),
         }
     }
 }
@@ -1335,6 +1350,7 @@ pub fn incident_message(
     let (title, tone) = match action {
         Action::Recovered => (format!("✅ Recovered on its own: {headline}"), Tone::Good),
         Action::Started { .. } => (format!("🛠️ Fixing: {headline}"), Tone::Accent),
+        Action::Guessed { repo, .. } => (format!("🛠️ Fixing in {repo}: {headline}"), Tone::Accent),
         Action::ForAPerson { .. } => (format!("🧭 Found the cause: {headline}"), Tone::Warning),
         Action::Watching => (format!("👀 Watching: {headline}"), Tone::Warning),
         Action::WhichRepo { .. } => (
@@ -1375,21 +1391,29 @@ pub fn incident_message(
         ));
     }
     facts.push(("Fix belongs in".into(), d.place.words().to_string()));
-    if let Action::WhichRepo {
-        guess,
-        candidates,
-        reason,
-    } = action
-    {
-        if let Some(g) = guess {
-            facts.push(("Best guess".into(), g.clone()));
+    match action {
+        Action::WhichRepo {
+            guess,
+            candidates,
+            reason,
+        } => {
+            if let Some(g) = guess {
+                facts.push(("Closest".into(), g.clone()));
+            }
+            if candidates.len() > 1 {
+                facts.push(("Also possible".into(), candidates[1..].join(", ")));
+            }
+            if !reason.is_empty() {
+                facts.push(("Why".into(), crate::truncate_str(reason, 300).to_string()));
+            }
         }
-        if candidates.len() > 1 {
-            facts.push(("Also possible".into(), candidates[1..].join(", ")));
+        Action::Guessed { repo, others, .. } => {
+            facts.push(("Repo".into(), format!("{repo} (best guess)")));
+            if !others.is_empty() {
+                facts.push(("Other candidates".into(), others.join(", ")));
+            }
         }
-        if !reason.is_empty() {
-            facts.push(("Why".into(), crate::truncate_str(reason, 300).to_string()));
-        }
+        _ => {}
     }
     facts.push(("What CoderHelm did".into(), action.sentence(d)));
     if let Action::ForAPerson { why, .. } = action {
@@ -1429,10 +1453,10 @@ pub fn incident_message(
     let mut buttons = Vec::new();
     if !url.is_empty() {
         buttons.push(Button::new(
-            if matches!(action, Action::WhichRepo { .. }) {
-                "Pick the repo"
-            } else {
-                "Open the incident"
+            match action {
+                Action::WhichRepo { .. } => "Pick the repo",
+                Action::Guessed { .. } => "Wrong repo? Move it",
+                _ => "Open the incident",
             },
             url,
         ));
