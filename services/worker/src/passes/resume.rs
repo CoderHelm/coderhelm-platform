@@ -435,27 +435,33 @@ async fn current_branch_head(
 /// that failed after a `ci_passed` already landed. The empty payload carries no
 /// `workflow_run_id`, so the fix path falls back to check-run annotations for the
 /// failure detail (see the log-collection block in the fix path).
-async fn record_synthetic_ci_failed(state: &WorkerState, run_id: &str, head_sha: Option<&str>) {
+async fn record_synthetic_ci_failed(
+    state: &WorkerState,
+    team_id: &str,
+    run_id: &str,
+    head_sha: Option<&str>,
+) {
     let now = chrono::Utc::now();
     let event_sk = format!("EVENT#{}#ci_failed", now.format("%Y%m%dT%H%M%S%.3fZ"));
     let payload = serde_json::json!({ "head_sha": head_sha.unwrap_or("") });
-    if let Err(e) = state
-        .dynamo
-        .put_item()
-        .table_name(&state.config.events_table_name)
-        .item("pk", attr_s(&format!("RUN#{run_id}")))
-        .item("sk", attr_s(&event_sk))
-        .item("event_type", attr_s("ci_failed"))
-        .item("payload", attr_s(&payload.to_string()))
-        .item("processed", AttributeValue::Bool(false))
-        .item("created_at", attr_s(&now.to_rfc3339()))
-        // The events table's TTL attribute (infra database-stack).
-        .item(
-            "expires_at",
-            attr_n((now.timestamp() as u64 + 30 * 86400).to_string()),
-        )
-        .send()
-        .await
+    if let Err(e) = common::run_events::put(
+        &state.dynamo,
+        &state.config.events_table_name,
+        team_id,
+        run_id,
+        &event_sk,
+    )
+    .item("event_type", attr_s("ci_failed"))
+    .item("payload", attr_s(&payload.to_string()))
+    .item("processed", AttributeValue::Bool(false))
+    .item("created_at", attr_s(&now.to_rfc3339()))
+    // The events table's TTL attribute (infra database-stack).
+    .item(
+        "expires_at",
+        attr_n((now.timestamp() as u64 + 30 * 86400).to_string()),
+    )
+    .send()
+    .await
     {
         warn!(run_id, error = %e, "Failed to write synthetic ci_failed event");
     }
@@ -1639,7 +1645,7 @@ pub async fn run(
 
     // Load all unprocessed events
     info!(run_id = %msg.run_id, events_table = %state.config.events_table_name, "Loading events");
-    let events = match load_unprocessed_events(state, &msg.run_id).await {
+    let events = match load_unprocessed_events(state, &msg.team_id, &msg.run_id).await {
         Ok(evts) => evts,
         Err(e) => {
             error!(run_id = %msg.run_id, "Failed to load events: {e:?}");
@@ -1672,7 +1678,7 @@ pub async fn run(
                 workflow_run_id = f.workflow_run_id,
                 "Started end-to-end run failed — sending it to the CI fix round"
             );
-            super::outside_exec::record_failed(state, &msg.run_id, &f).await;
+            super::outside_exec::record_failed(state, &msg.team_id, &msg.run_id, &f).await;
             send_delayed_resume(state, &msg, 0).await;
             return Ok(());
         }
@@ -1808,7 +1814,13 @@ pub async fn run(
                     run_id = msg.run_id,
                     "CI failed (missed webhook) — writing the event and starting the fix"
                 );
-                record_synthetic_ci_failed(state, &msg.run_id, branch_head.as_deref()).await;
+                record_synthetic_ci_failed(
+                    state,
+                    &msg.team_id,
+                    &msg.run_id,
+                    branch_head.as_deref(),
+                )
+                .await;
                 send_delayed_resume(state, &msg, 0).await;
                 return Ok(());
             }
@@ -3080,8 +3092,13 @@ pub async fn run(
                         super::round::clear(state, &msg.team_id, &msg.run_id).await;
                         super::webhooks::emit_ci_fix_completed(state, &ci_fix, "failed", 0).await;
                         mark_events_processed(state, &msg.run_id, &events).await;
-                        record_synthetic_ci_failed(state, &msg.run_id, branch_head.as_deref())
-                            .await;
+                        record_synthetic_ci_failed(
+                            state,
+                            &msg.team_id,
+                            &msg.run_id,
+                            branch_head.as_deref(),
+                        )
+                        .await;
                         if set_run_awaiting_ci(
                             state,
                             &ticket_msg,
@@ -3273,7 +3290,13 @@ pub async fn run(
                     run_id = msg.run_id,
                     "A workflow passed but another check failed — routing to the fix path"
                 );
-                record_synthetic_ci_failed(state, &msg.run_id, branch_head.as_deref()).await;
+                record_synthetic_ci_failed(
+                    state,
+                    &msg.team_id,
+                    &msg.run_id,
+                    branch_head.as_deref(),
+                )
+                .await;
                 let still_active = set_run_awaiting_ci(
                     state,
                     &ticket_msg,
@@ -5152,27 +5175,29 @@ async fn recheck_security(
 
 async fn load_unprocessed_events(
     state: &WorkerState,
+    team_id: &str,
     run_id: &str,
 ) -> Result<Vec<RunEvent>, Box<dyn std::error::Error + Send + Sync>> {
     if state.config.events_table_name.is_empty() {
         return Ok(vec![]);
     }
-    let result = state
-        .dynamo
-        .query()
-        .table_name(&state.config.events_table_name)
-        .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
-        .filter_expression("#p = :false")
-        .expression_attribute_names("#p", "processed")
-        .expression_attribute_values(":pk", attr_s(&format!("RUN#{run_id}")))
-        .expression_attribute_values(":prefix", attr_s("EVENT#"))
-        .expression_attribute_values(":false", AttributeValue::Bool(false))
-        .send()
-        .await?;
+    let result = common::run_events::query(
+        &state.dynamo,
+        &state.config.events_table_name,
+        run_id,
+        "EVENT#",
+    )
+    .filter_expression("#p = :false")
+    .expression_attribute_names("#p", "processed")
+    .expression_attribute_values(":false", AttributeValue::Bool(false))
+    .send()
+    .await?;
 
+    let today = common::run_events::today();
     let events = result
         .items()
         .iter()
+        .filter(|item| common::run_events::owned_by(item, team_id, &today))
         .filter_map(|item| {
             let sk = item.get("sk")?.as_s().ok()?.clone();
             let event_type = item.get("event_type")?.as_s().ok()?.clone();
@@ -5198,17 +5223,17 @@ async fn mark_events_processed(state: &WorkerState, run_id: &str, events: &[RunE
         return;
     }
     for event in events {
-        if let Err(e) = state
-            .dynamo
-            .update_item()
-            .table_name(&state.config.events_table_name)
-            .key("pk", attr_s(&format!("RUN#{run_id}")))
-            .key("sk", attr_s(&event.sk))
-            .update_expression("SET #p = :true")
-            .expression_attribute_names("#p", "processed")
-            .expression_attribute_values(":true", AttributeValue::Bool(true))
-            .send()
-            .await
+        if let Err(e) = common::run_events::update(
+            &state.dynamo,
+            &state.config.events_table_name,
+            run_id,
+            &event.sk,
+        )
+        .update_expression("SET #p = :true")
+        .expression_attribute_names("#p", "processed")
+        .expression_attribute_values(":true", AttributeValue::Bool(true))
+        .send()
+        .await
         {
             warn!(error = %e, "Failed to mark event processed: {}", event.sk);
         }
@@ -5296,6 +5321,7 @@ async fn record_flaky_pass(
 /// Workflows that passed at least once on this run's PR, any commit.
 async fn ci_passed_workflows(
     state: &WorkerState,
+    team_id: &str,
     run_id: &str,
 ) -> std::collections::HashSet<String> {
     let mut out = std::collections::HashSet::new();
@@ -5304,22 +5330,26 @@ async fn ci_passed_workflows(
     }
     let mut start = None;
     loop {
-        let resp = state
-            .dynamo
-            .query()
-            .table_name(&state.config.events_table_name)
-            .key_condition_expression("pk = :pk AND begins_with(sk, :prefix)")
-            .filter_expression("event_type = :t")
-            .expression_attribute_values(":pk", attr_s(&format!("RUN#{run_id}")))
-            .expression_attribute_values(":prefix", attr_s("EVENT#"))
-            .expression_attribute_values(":t", attr_s("ci_passed"))
-            .set_exclusive_start_key(start.take())
-            .send()
-            .await;
+        let resp = common::run_events::query(
+            &state.dynamo,
+            &state.config.events_table_name,
+            run_id,
+            "EVENT#",
+        )
+        .filter_expression("event_type = :t")
+        .expression_attribute_values(":t", attr_s("ci_passed"))
+        .set_exclusive_start_key(start.take())
+        .send()
+        .await;
         let Ok(resp) = resp else {
             return out;
         };
-        for item in resp.items() {
+        let today = common::run_events::today();
+        for item in resp
+            .items()
+            .iter()
+            .filter(|item| common::run_events::owned_by(item, team_id, &today))
+        {
             let payload: Value = item
                 .get("payload")
                 .and_then(|v| v.as_s().ok())
@@ -5410,7 +5440,7 @@ async fn try_rerun_once(
         .iter()
         .filter_map(|e| e.payload["workflow_name"].as_str().map(str::to_string))
         .collect();
-    let passed_before = ci_passed_workflows(state, &msg.run_id).await;
+    let passed_before = ci_passed_workflows(state, &msg.team_id, &msg.run_id).await;
     if !should_rerun(
         head,
         &rerun_heads(run_record),
@@ -5484,7 +5514,7 @@ async fn record_late_green(state: &WorkerState, msg: &ResumeMessage, run_record:
     if last.map(String::as_str) != Some("failed") {
         return;
     }
-    let Ok(events) = load_unprocessed_events(state, &msg.run_id).await else {
+    let Ok(events) = load_unprocessed_events(state, &msg.team_id, &msg.run_id).await else {
         return;
     };
     let ci: Vec<RunEvent> = events
@@ -7352,7 +7382,7 @@ async fn redrive_red_ci(
         return Ok(false);
     }
     add_run_number(state, &msg.team_id, run_id, "red_redrives").await;
-    record_synthetic_ci_failed(state, run_id, None).await;
+    record_synthetic_ci_failed(state, &msg.team_id, run_id, None).await;
     if !set_run_awaiting_ci(
         state, msg, run_id, pr_url, pr_number, branch, usage, duration,
     )
@@ -8020,7 +8050,7 @@ async fn resume_multi_repo(
         }
         open.push((owner, name, number));
     }
-    let events = load_unprocessed_events(state, &msg.run_id)
+    let events = load_unprocessed_events(state, &msg.team_id, &msg.run_id)
         .await
         .unwrap_or_default();
     let n_open = open.len();
