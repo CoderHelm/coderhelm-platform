@@ -5,11 +5,13 @@
 //! When a run on the pull request's head is read (`e2e::ingest`), the
 //! tests that show the change are chosen ([`shots::pick`]), and the first
 //! one with a screenshot on the head is kept with its screenshot from the
-//! newest passing run on the default branch, when one is kept there too.
+//! newest passing run on the pull request's base branch, when one is kept
+//! there too.
 //! The images go to the install's own bucket, the record to the settings
 //! table for the head, and the description is rebuilt: its table links each
 //! image through the API with a signed link that expires
-//! ([`screens_for`]). A head keeps the first pair found; a later run on the
+//! ([`screens_for`]). A head keeps the first pair found: its record is
+//! claimed before any image is kept, so a later or concurrent run on the
 //! same head changes nothing.
 
 use std::collections::HashMap;
@@ -17,7 +19,7 @@ use std::collections::HashMap;
 use aws_sdk_dynamodb::types::AttributeValue;
 use common::e2e::coverage::TestMap;
 use common::e2e::messages::TestIngest;
-use common::e2e::model::{Outcome, ParsedTest};
+use common::e2e::model::ParsedTest;
 use common::e2e::report_source::Location;
 use common::e2e::shots::{self, Image, Kept, Side};
 use common::e2e::store::Store;
@@ -29,8 +31,6 @@ use crate::WorkerState;
 
 /// Tests tried for a screenshot on the head.
 const MAX_TRIED: usize = 3;
-/// How long the record of a head is kept.
-const RECORD_DAYS: i64 = 90;
 
 fn record_sk(repo: &str, sha: &str) -> String {
     format!("E2E_SHOTS#{repo}#{sha}")
@@ -50,9 +50,10 @@ pub async fn load(state: &WorkerState, team_id: &str, repo: &str, sha: &str) -> 
     serde_json::from_str(item.get("data")?.as_s().ok()?).ok()
 }
 
-async fn save(state: &WorkerState, team_id: &str, repo: &str, sha: &str, k: &Kept) {
-    let ttl = (chrono::Utc::now() + chrono::Duration::days(RECORD_DAYS)).timestamp();
-    if let Err(e) = state
+/// Saves the record of a head unless one is there; whether this one is.
+/// The record lives as long as its links work.
+async fn claim(state: &WorkerState, team_id: &str, repo: &str, sha: &str, k: &Kept) -> bool {
+    state
         .dynamo
         .put_item()
         .table_name(&state.config.settings_table_name)
@@ -62,11 +63,26 @@ async fn save(state: &WorkerState, team_id: &str, repo: &str, sha: &str, k: &Kep
             "data",
             super::attr_s(&serde_json::to_string(k).unwrap_or_default()),
         )
-        .item("ttl", AttributeValue::N(ttl.to_string()))
+        .item("ttl", AttributeValue::N(k.expires_at.to_string()))
+        .condition_expression("attribute_not_exists(sk)")
+        .send()
+        .await
+        .is_ok()
+}
+
+/// Drops a claimed record whose images could not be kept, so a later run
+/// on the head can keep its own.
+async fn release(state: &WorkerState, team_id: &str, repo: &str, sha: &str) {
+    if let Err(e) = state
+        .dynamo
+        .delete_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", super::attr_s(team_id))
+        .key("sk", super::attr_s(&record_sk(repo, sha)))
         .send()
         .await
     {
-        warn!(error = %e, "Could not save the end-to-end screenshots of a head");
+        warn!(error = %e, "Could not drop the record of a head whose screenshots were not kept");
     }
 }
 
@@ -225,28 +241,25 @@ async fn images(
     out
 }
 
-/// Keeps one image in the install's bucket; its key.
-async fn put(
-    state: &WorkerState,
-    key_of: impl Fn(&str) -> String,
-    bytes: Vec<u8>,
-) -> Option<String> {
-    let content_type = shots::image_type(&bytes)?;
-    let key = key_of(shots::extension(content_type));
+/// Keeps one image in the install's bucket under `key`; whether it was.
+async fn put(state: &WorkerState, key: &str, bytes: Vec<u8>) -> bool {
+    let Some(content_type) = shots::image_type(&bytes) else {
+        return false;
+    };
     match state
         .s3
         .put_object()
         .bucket(&state.config.bucket_name)
-        .key(&key)
+        .key(key)
         .content_type(content_type)
         .body(bytes.into())
         .send()
         .await
     {
-        Ok(_) => Some(key),
+        Ok(_) => true,
         Err(e) => {
             warn!(error = %e, "Could not keep an end-to-end screenshot");
-            None
+            false
         }
     }
 }
@@ -320,19 +333,24 @@ pub async fn keep(
         info!(repo = %repo, pr = h.pr, tests = ids.len(), "No screenshot on the head for the tests that show the change");
         return;
     };
-    // The same test on the default branch: its newest passing run there.
+    // The same test on the branch the pull request goes into: its newest
+    // passing run there.
+    let Some(base) = gh
+        .get_pull_request(owner, name, h.pr)
+        .await
+        .ok()
+        .and_then(|p| p["base"]["ref"].as_str().map(str::to_string))
+        .filter(|b| !b.is_empty())
+    else {
+        warn!(repo = %repo, pr = h.pr, "Could not read the pull request's base branch; no screenshots kept");
+        return;
+    };
     let newest = st
         .record(&msg.team_id, &scoped(t))
         .await
         .ok()
         .flatten()
-        .and_then(|r| {
-            r.history.into_iter().rev().find(|e| {
-                e.branch == msg.default_branch
-                    && !e.bad_run
-                    && matches!(e.outcome, Outcome::Passed | Outcome::Flaky)
-            })
-        });
+        .and_then(|r| shots::newest_passing(&r.history, &base).cloned());
     let mut before: Option<(Vec<u8>, String)> = None;
     if let Some(e) = newest {
         let (src, run_id, attempt, run_url) = if e.run_key.starts_with("up-") {
@@ -357,33 +375,51 @@ pub async fn keep(
             .remove(&t.id())
             .map(|b| (b, run_url));
     }
-    let key_of = |side: &'static str| {
-        let (team, pr, sha) = (msg.team_id.clone(), h.pr, msg.head_sha.clone());
-        let repo = repo.clone();
-        move |ext: &str| shots::object_key(&team, &repo, pr, &sha, side, ext)
+    let key_of = |side: &str, bytes: &[u8]| {
+        shots::image_type(bytes).map(|ct| {
+            shots::object_key(
+                &msg.team_id,
+                &repo,
+                h.pr,
+                &msg.head_sha,
+                &t.id(),
+                side,
+                shots::extension(ct),
+            )
+        })
     };
-    let Some(after_key) = put(state, key_of("after"), after_bytes).await else {
+    let Some(after_key) = key_of("after", &after_bytes) else {
         return;
     };
-    let before = match before {
-        Some((b, run_url)) => put(state, key_of("before"), b)
-            .await
-            .map(|key| Side { key, run_url }),
-        None => None,
-    };
+    let before =
+        before.and_then(|(b, run_url)| key_of("before", &b).map(|key| (b, key, run_url)));
     let kept = Kept {
         pr: h.pr,
         test: t.full_title(),
         why: why.words(),
-        base: msg.default_branch.clone(),
-        before,
+        base,
+        before: before.as_ref().map(|(_, key, run_url)| Side {
+            key: key.clone(),
+            run_url: run_url.clone(),
+        }),
         after: Side {
-            key: after_key,
+            key: after_key.clone(),
             run_url: msg.html_url.clone(),
         },
         expires_at: chrono::Utc::now().timestamp() + shots::LINK_VALID_SECS,
     };
-    save(state, &msg.team_id, &repo, &msg.head_sha, &kept).await;
+    if !claim(state, &msg.team_id, &repo, &msg.head_sha, &kept).await {
+        info!(repo = %repo, pr = h.pr, "Another run on this head kept its screenshots first");
+        return;
+    }
+    let mut kept_all = put(state, &after_key, after_bytes).await;
+    if let Some((b, key, _)) = before {
+        kept_all = kept_all && put(state, &key, b).await;
+    }
+    if !kept_all {
+        release(state, &msg.team_id, &repo, &msg.head_sha).await;
+        return;
+    }
     info!(repo = %repo, pr = h.pr, test = %kept.test, before = kept.before.is_some(), "End-to-end screenshots kept for the Before and After table");
     if let super::description::Reconciled::Failed(why) =
         super::description::rebuild_pr(state, gh, &msg.team_id, owner, name, h.pr).await
