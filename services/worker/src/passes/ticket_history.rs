@@ -242,6 +242,7 @@ impl TicketHistory {
                 number: p.number,
                 base: p.base.clone(),
                 merged_at: p.closed_at.clone(),
+                revert: common::merged_ticket::is_revert(&p.title, &p.branch),
             })
             .collect();
         for r in &self.runs {
@@ -859,6 +860,59 @@ fn closes_issue(body: &str, repo: &str, n: u64) -> bool {
     })
 }
 
+/// The pull requests to read for the ticket, at most [`MAX_PRS`], from the
+/// team's repositories' listed pull requests (`(owner/name, list)`): first
+/// every one an earlier run opened, then the ones that are the ticket's own
+/// (the title or branch names the ticket, or they link the GitHub `issue`),
+/// then the ones that name it only in their description. A ticket many
+/// descriptions mention keeps its own pull requests in the list.
+fn candidates(
+    history: &TicketHistory,
+    listed: &[(String, serde_json::Value)],
+    ticket_id: &str,
+    issue: Option<Issue<'_>>,
+) -> Vec<(String, u64)> {
+    let mut found: Vec<(String, u64)> = Vec::new();
+    // Every pull request an earlier run opened, in its own repository (a
+    // multi-repo run's record pairs its repo with only one of them).
+    for p in history.runs.iter().flat_map(|r| r.pr_list.iter()) {
+        if p.pr_number > 0
+            && p.repo.contains('/')
+            && !found.contains(&(p.repo.clone(), p.pr_number))
+        {
+            found.push((p.repo.clone(), p.pr_number));
+        }
+    }
+    fn text(v: &serde_json::Value) -> &str {
+        v.as_str().unwrap_or("")
+    }
+    let mut mentioned: Vec<(String, u64)> = Vec::new();
+    if !ticket_id.is_empty() {
+        for (repo, v) in listed {
+            for p in v.as_array().into_iter().flatten() {
+                let number = p["number"].as_u64().unwrap_or(0);
+                let (title, branch, body) =
+                    (text(&p["title"]), text(&p["head"]["ref"]), text(&p["body"]));
+                let key = (repo.clone(), number);
+                if number == 0 || found.contains(&key) || mentioned.contains(&key) {
+                    continue;
+                }
+                if super::mentions_ticket(title, ticket_id)
+                    || super::mentions_ticket(branch, ticket_id)
+                    || links_issue(issue, repo, title, body)
+                {
+                    found.push(key);
+                } else if super::mentions_ticket(body, ticket_id) {
+                    mentioned.push(key);
+                }
+            }
+        }
+    }
+    found.extend(mentioned);
+    found.truncate(MAX_PRS);
+    found
+}
+
 /// Adds every pull request for the ticket in `repos` (`owner/name`, the
 /// team's repositories, searched in order): the ones the ticket's runs
 /// opened, any whose title, branch or description names the ticket, and,
@@ -874,46 +928,21 @@ pub async fn add_earlier_prs(
     ticket_id: &str,
     issue: Option<Issue<'_>>,
 ) {
-    let mut found: Vec<(String, u64)> = Vec::new();
-    // Every pull request an earlier run opened, in its own repository (a
-    // multi-repo run's record pairs its repo with only one of them).
-    for p in history.runs.iter().flat_map(|r| r.pr_list.iter()) {
-        if p.pr_number > 0
-            && p.repo.contains('/')
-            && !found.contains(&(p.repo.clone(), p.pr_number))
-        {
-            found.push((p.repo.clone(), p.pr_number));
-        }
-    }
+    let mut listed: Vec<(String, serde_json::Value)> = Vec::new();
     if !ticket_id.is_empty() {
         for repo in repos.iter().take(MAX_REPOS) {
             let Some((owner, name)) = repo.split_once('/') else {
                 continue;
             };
             match github.list_pull_requests(owner, name, "all", 100).await {
-                Ok(v) => {
-                    for p in v.as_array().into_iter().flatten() {
-                        let number = p["number"].as_u64().unwrap_or(0);
-                        let text = |v: &serde_json::Value| v.as_str().unwrap_or("").to_string();
-                        let (title, body) = (text(&p["title"]), text(&p["body"]));
-                        let names = [&title, &text(&p["head"]["ref"]), &body]
-                            .iter()
-                            .any(|t| super::mentions_ticket(t, ticket_id))
-                            || links_issue(issue, repo, &title, &body);
-                        let key = (repo.clone(), number);
-                        if number > 0 && names && !found.contains(&key) {
-                            found.push(key);
-                        }
-                    }
-                }
+                Ok(v) => listed.push((repo.clone(), v)),
                 Err(e) => {
                     warn!(repo, error = %e, "Could not list pull requests for the ticket's history")
                 }
             }
         }
     }
-    found.truncate(MAX_PRS);
-    for (repo, number) in found {
+    for (repo, number) in candidates(history, &listed, ticket_id, issue) {
         if let Some(mut p) = read_pr(github, &repo, number).await {
             p.for_ticket = history.for_ticket(&p, ticket_id, issue);
             history.prs.push(p);
@@ -1336,6 +1365,87 @@ mod tests {
         assert!(!stops("Fix login (#420)", "Fixes #421", "acme/api", "main"));
         assert!(!stops("Bump acme/web#42", "Fixes acme/web#42", "acme/api", "main"));
         assert!(!stops("Fix login (#42)", "Fixes #42", "acme/web", "main"));
+    }
+
+    /// WEB-42's PR merged, then GitHub's Revert button undid it: the work
+    /// is gone, so a new run goes ahead. When a fix merges after the
+    /// revert, that fix stops the next run, and the refusal cites it.
+    #[test]
+    fn a_reverted_merge_doesnt_stop_the_run_until_a_new_one_merges() {
+        use common::messages::TicketSource;
+        let pr = |n: u64, title: &str, branch: &str, at: &str| {
+            let mut p = earlier("acme/app", n, "pat", "merged", "2026-11-01");
+            p.title = title.into();
+            p.branch = branch.into();
+            p.closed_at = at.into();
+            p.for_ticket = true;
+            p
+        };
+        let first = pr(12, "WEB-42: rate limit the API", "pat/web-42", "2026-11-02T10:00:00Z");
+        let revert = pr(
+            13,
+            "Revert \"WEB-42: rate limit the API\"",
+            "revert-12-pat/web-42",
+            "2026-11-03T10:00:00Z",
+        );
+        let again = pr(
+            14,
+            "WEB-42: rate limit the API, take two",
+            "pat/web-42-b",
+            "2026-11-05T10:00:00Z",
+        );
+        let reverted = TicketHistory {
+            prs: vec![first.clone(), revert.clone()],
+            ..Default::default()
+        };
+        assert_eq!(
+            reverted.blocking_merge(&TicketSource::Jira, "acme/app"),
+            None
+        );
+        let remerged = TicketHistory {
+            prs: vec![first, revert, again],
+            ..Default::default()
+        };
+        assert_eq!(
+            remerged
+                .blocking_merge(&TicketSource::Jira, "acme/app")
+                .map(|p| p.subject()),
+            Some("acme/app#14".to_string())
+        );
+    }
+
+    /// Nine pull requests name WEB-42 only in their description ("part of
+    /// WEB-42"); the ticket's own merged PR is the oldest of the listed ten.
+    /// It is still read, so a run on WEB-42 stops.
+    #[test]
+    fn the_tickets_own_pull_requests_come_before_description_mentions() {
+        let mut list: Vec<serde_json::Value> = (20..29)
+            .rev()
+            .map(|n| {
+                serde_json::json!({
+                    "number": n,
+                    "title": format!("Chore {n}"),
+                    "head": {"ref": format!("chore-{n}")},
+                    "body": "Part of WEB-42",
+                })
+            })
+            .collect();
+        list.push(serde_json::json!({
+            "number": 12,
+            "title": "WEB-42: rate limit the API",
+            "head": {"ref": "pat/limits"},
+            "body": "",
+        }));
+        let listed = vec![("acme/app".to_string(), serde_json::Value::Array(list))];
+        let found = candidates(&TicketHistory::default(), &listed, "WEB-42", None);
+        assert_eq!(found.len(), MAX_PRS);
+        assert_eq!(found[0], ("acme/app".to_string(), 12));
+        // A pull request that names another ticket isn't read at all.
+        let other = vec![(
+            "acme/app".to_string(),
+            serde_json::json!([{"number": 5, "title": "WEB-43", "head": {"ref": "x"}, "body": ""}]),
+        )];
+        assert!(candidates(&TicketHistory::default(), &other, "WEB-42", None).is_empty());
     }
 
     /// A re-run continues on CoderHelm's own open PR in the same repo: the

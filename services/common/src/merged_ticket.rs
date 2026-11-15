@@ -59,6 +59,15 @@ pub struct MergedPr {
     /// When it merged (RFC 3339), when known.
     #[serde(default)]
     pub merged_at: String,
+    /// It reverted earlier work ([`is_revert`]).
+    #[serde(default)]
+    pub revert: bool,
+}
+
+/// A revert pull request: GitHub's Revert button titles it `Revert "…"`
+/// and names its branch `revert-…`.
+pub fn is_revert(title: &str, branch: &str) -> bool {
+    title.trim_start().starts_with("Revert \"") || branch.starts_with("revert-")
 }
 
 impl MergedPr {
@@ -102,7 +111,10 @@ fn started_ms(run_id: &str) -> Option<i64> {
 /// `allowed_runs`: ids of the ticket's earlier runs a person asked for
 /// after the merge. Only the newest merge counts: a run allowed after it
 /// lets the ticket go on; one allowed before it doesn't. A merge with no
-/// known time is taken to be before any allowed run.
+/// known time is taken to be before any allowed run. When the newest merge
+/// is a revert ([`MergedPr::revert`]), the ticket's work was undone and
+/// nothing stops the run; a pull request that merges after the revert
+/// stops it again.
 pub fn blocking<'a>(merged: &'a [MergedPr], allowed_runs: &[&str]) -> Option<&'a MergedPr> {
     let newest = merged.iter().max_by(|a, b| {
         a.merged_ms()
@@ -110,6 +122,9 @@ pub fn blocking<'a>(merged: &'a [MergedPr], allowed_runs: &[&str]) -> Option<&'a
             .cmp(&b.merged_ms().unwrap_or(i64::MIN))
             .then(a.number.cmp(&b.number))
     })?;
+    if newest.revert {
+        return None;
+    }
     let at = newest.merged_ms().unwrap_or(i64::MIN);
     let allowed_since = allowed_runs
         .iter()
@@ -175,6 +190,7 @@ mod tests {
             number: n,
             base: "develop".into(),
             merged_at: at.into(),
+            revert: false,
         }
     }
 
