@@ -358,6 +358,7 @@ const CACHES: &[(&str, &str)] = &[
     ("worker/src/clients/github.rs::LIMITED", "installation id"),
     ("worker/src/clients/github_budget.rs::LEDGER", "installation id"),
     ("worker/src/passes/conversation.rs::CACHE", "GitHub `owner/repo#n`: the thread itself, read with the run's own installation"),
+    ("worker/src/passes/pr.rs::CACHE", "installation id plus `owner/repo@branch`: the PR template read with that installation"),
     ("worker/src/passes/conversation.rs::REPLIED", "GitHub `owner/repo#n`: the thread itself"),
     ("worker/src/passes/conversation.rs::REVIEW_COMMENTS", "GitHub `owner/repo#n`: the thread itself"),
     ("worker/src/passes/run_guard.rs::REENTRY", "run id (a ULID)"),
