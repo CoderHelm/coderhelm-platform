@@ -8287,18 +8287,23 @@ async fn set_run_complete(
         return;
     }
     let status = end_status(&undone.left);
-    if status != common::run_status::COMPLETED {
+    if !undone.left.human.is_empty() {
+        // Delivered: the pull request is open with the work; what only a
+        // person can do is listed once, under "Needed from you", there and
+        // on the ticket. The run does not wait on it.
         super::add_progress_note(
             state,
             team_id,
             run_id,
             &format!(
-                "Waiting on a person for {} item(s) only a person can do; the pull request and the ticket name each once",
-                undone.left.human.len()
+                "Delivered: the pull request is open. Needed from a person ({}), listed once under \"Needed from you\": {}",
+                undone.left.human.len(),
+                undone.left.human.join("; ")
             ),
         )
         .await;
-    } else if !undone.left.doable.is_empty() {
+    }
+    if !undone.left.doable.is_empty() {
         super::add_progress_note(
             state,
             team_id,
@@ -8347,16 +8352,20 @@ async fn set_run_complete(
     }
 }
 
-/// How a run whose CI passed ends: completed, or (with requirements left
-/// that need access CoderHelm lacks) needing that outside change.
+/// How a run whose CI passed ends: completed. The work was asked for and
+/// its pull request is open, so the run is delivered; what is left for a
+/// person (only what the gate let through: `may_wait_on_person` counts
+/// them) is attached to it under "Needed from you", never a waiting status
+/// that reads as "do this, then I'll do it".
 fn end_status(left: &super::outside_work::Left) -> &'static str {
-    // Waiting on a person needs at least one item the gate let through and
-    // nothing CoderHelm can still do.
-    if common::person_gate::may_wait_on_person(left.human.len(), left.doable.len()) {
-        super::fix_location::STATUS_OUTSIDE
-    } else {
-        "completed"
+    let waiting = common::person_gate::may_wait_on_person(left.human.len(), left.doable.len());
+    if waiting {
+        tracing::info!(
+            items = left.human.len(),
+            "Delivered with items only a person can do, listed on the pull request"
+        );
     }
+    common::run_status::COMPLETED
 }
 
 #[cfg(test)]
@@ -8364,17 +8373,16 @@ mod end_status_tests {
     use super::end_status;
 
     #[test]
-    fn a_requirement_left_for_a_person_keeps_the_run_from_completing() {
+    fn a_requirement_left_for_a_person_never_keeps_the_delivered_run_open() {
         use crate::passes::outside_work::Left;
         assert_eq!(end_status(&Left::default()), "completed");
         let human = Left {
             human: vec!["1. Replace the hero on production".to_string()],
             doable: Vec::new(),
         };
-        assert_eq!(
-            end_status(&human),
-            crate::passes::fix_location::STATUS_OUTSIDE
-        );
+        // The pull request is open with the work: delivered, with the item
+        // attached to it.
+        assert_eq!(end_status(&human), "completed");
         // Never waits on a person while CoderHelm holds steps it can do.
         let both = Left {
             doable: vec!["Read the preview run".to_string()],

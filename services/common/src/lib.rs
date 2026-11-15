@@ -180,9 +180,13 @@ pub mod pr_layout;
 pub mod pr_outcome;
 /// The last read of a description before it is saved, verified.
 pub mod pr_reader;
+/// The final read of a description before it is posted.
+pub mod pr_review;
 /// The work around a pull request that is not in its diff, each step with
 /// one owner and one state.
 pub mod pr_steps;
+/// A repository's pull request template as the description's structure.
+pub mod pr_template;
 pub mod run_prs;
 // review_stats: time-ordered review records for analytics
 /// What people write on a ticket while a run works on it: kept, acknowledged, acted on.
