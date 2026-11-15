@@ -24,10 +24,10 @@ use base64::Engine;
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 
 use super::coverage::TestMap;
-use super::model::{test_id, Framework, Outcome, ParsedTest};
+use super::model::{test_id, Framework, HistoryEntry, Outcome, ParsedTest};
 
 /// Largest image kept.
 pub const MAX_IMAGE: usize = 5 * 1024 * 1024;
@@ -553,7 +553,7 @@ pub fn screens(k: &Kept, link: impl Fn(&str) -> String) -> crate::pr_body::Scree
         ),
         None => (
             String::new(),
-            format!("No screenshot of this test from a passing run on {base}"),
+            format!("No passing run on {base} with a screenshot of this test yet"),
         ),
     };
     let runs = [
@@ -578,12 +578,31 @@ pub fn screens(k: &Kept, link: impl Fn(&str) -> String) -> crate::pr_body::Scree
     }
 }
 
-/// The key an image is kept under in the install's bucket.
-pub fn object_key(team: &str, repo: &str, pr: u64, sha: &str, side: &str, ext: &str) -> String {
+/// The newest run of a test on `branch` that passed: where its Before
+/// screenshot is read.
+pub fn newest_passing<'a>(history: &'a [HistoryEntry], branch: &str) -> Option<&'a HistoryEntry> {
+    history.iter().rev().find(|e| {
+        e.branch == branch && !e.bad_run && matches!(e.outcome, Outcome::Passed | Outcome::Flaky)
+    })
+}
+
+/// The key an image of test `test` is kept under in the install's bucket;
+/// two tests never share one.
+pub fn object_key(
+    team: &str,
+    repo: &str,
+    pr: u64,
+    sha: &str,
+    test: &str,
+    side: &str,
+    ext: &str,
+) -> String {
+    let test = hex::encode(Sha256::digest(test.as_bytes()));
     format!(
-        "{KEY_PREFIX}/{}/{repo}/{pr}/{}/{side}.{ext}",
+        "{KEY_PREFIX}/{}/{repo}/{pr}/{}/{}/{side}.{ext}",
         team_folder(team),
-        sha.get(..12).unwrap_or(sha)
+        sha.get(..12).unwrap_or(sha),
+        &test[..16]
     )
 }
 
@@ -890,14 +909,22 @@ mod tests {
         assert!(before.is_empty());
         assert_eq!(
             before_alt,
-            "No screenshot of this test from a passing run on main"
+            "No passing run on main with a screenshot of this test yet"
         );
     }
 
     #[test]
     fn a_link_reads_one_image_of_its_own_team_until_it_expires() {
-        let key = object_key("TEAM#a", "o/r", 7, "0123456789abcdef", "after", "png");
-        assert_eq!(key, "e2e-shots/TEAM_a/o/r/7/0123456789ab/after.png");
+        let key = object_key("TEAM#a", "o/r", 7, "0123456789abcdef", "t", "after", "png");
+        // sha256("t") = e3b98a4da31a127d...
+        assert_eq!(
+            key,
+            "e2e-shots/TEAM_a/o/r/7/0123456789ab/e3b98a4da31a127d/after.png"
+        );
+        assert_ne!(
+            key,
+            object_key("TEAM#a", "o/r", 7, "0123456789abcdef", "u", "after", "png")
+        );
         let t = sign("s", "TEAM#a", &key, 100);
         assert_eq!(verify("s", &t, 99), Ok(key.clone()));
         assert_eq!(verify("s", &t, 100), Err(TokenError::Expired));
@@ -914,6 +941,48 @@ mod tests {
         assert!(verify("s", &u, 99).is_err());
         assert!(url("https://api.example.com/", &t)
             .starts_with("https://api.example.com/webhooks/ci/tests/screenshot?t="));
+    }
+
+    #[test]
+    fn before_comes_from_the_newest_passing_run_on_the_pull_requests_base() {
+        let e = |run: &str, branch: &str, outcome, bad_run| HistoryEntry {
+            run_key: run.into(),
+            sha: "s".into(),
+            branch: branch.into(),
+            pr: None,
+            at: "t".into(),
+            outcome,
+            bad_run,
+            attempts: vec![],
+        };
+        let history = vec![
+            e("1-1", "develop", Outcome::Passed, false),
+            e("2-1", "develop", Outcome::Failed, false),
+            e("3-1", "develop", Outcome::Passed, true),
+            e("4-1", "main", Outcome::Passed, false),
+        ];
+        // A pull request into develop never shows main's newer run.
+        assert_eq!(
+            newest_passing(&history, "develop").map(|e| e.run_key.as_str()),
+            Some("1-1")
+        );
+        assert_eq!(
+            newest_passing(&history, "main").map(|e| e.run_key.as_str()),
+            Some("4-1")
+        );
+        assert_eq!(newest_passing(&history, "release"), None);
+        let k = Kept {
+            base: "develop".into(),
+            ..Default::default()
+        };
+        let crate::pr_body::Screens::Images { before_alt, .. } = screens(&k, |key| key.into())
+        else {
+            panic!("images");
+        };
+        assert_eq!(
+            before_alt,
+            "No passing run on develop with a screenshot of this test yet"
+        );
     }
 
     #[test]
