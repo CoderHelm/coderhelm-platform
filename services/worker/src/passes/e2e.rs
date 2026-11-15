@@ -622,7 +622,11 @@ pub async fn ingest(state: &WorkerState, msg: TestIngest) -> Result<(), Err> {
         if run.rescued {
             note_rescued(&st, &gh, &msg, &run, pr).await;
         }
-        let own = is_own_pr(&gh, &msg, pr).await;
+        let pull = gh
+            .get_pull_request(&msg.repo_owner, &msg.repo_name, pr)
+            .await
+            .ok();
+        let own = is_own_pr(&msg, pull.as_ref());
         // A run that failed only on quarantined tests needs no fix or re-run.
         if failed > 0 && !run.rescued && own {
             own_pr_failures(state, &gh, &msg, &run, pr, &lines, &tests).await;
@@ -640,6 +644,7 @@ pub async fn ingest(state: &WorkerState, msg: TestIngest) -> Result<(), Err> {
                     pr,
                     tests: &tests,
                     reports: &reports,
+                    pull: pull.as_ref(),
                     changed: &changed,
                     map: map.as_ref(),
                 },
@@ -2380,16 +2385,9 @@ async fn recommend(st: &Store<'_>, team: &str, rec: Recommendation) {
 
 /// Whether the PR is one CoderHelm opened: a branch in the default shape, or
 /// a PR whose author is CoderHelm's app (a team's own branch pattern).
-async fn is_own_pr(gh: &GitHubClient, msg: &TestIngest, pr: u64) -> bool {
-    if msg
-        .head_branch
-        .starts_with(common::git_conventions::DEFAULT_BRANCH_PREFIX)
-    {
-        return true;
-    }
-    gh.get_pull_request(&msg.repo_owner, &msg.repo_name, pr)
-        .await
-        .is_ok_and(|p| super::is_own_login(p["user"]["login"].as_str().unwrap_or("")))
+fn is_own_pr(msg: &TestIngest, pull: Option<&serde_json::Value>) -> bool {
+    msg.head_branch.starts_with(common::git_conventions::DEFAULT_BRANCH_PREFIX)
+        || pull.is_some_and(|p| super::is_own_login(p["user"]["login"].as_str().unwrap_or("")))
 }
 
 async fn recommend_from_pr(

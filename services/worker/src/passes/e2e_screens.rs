@@ -270,7 +270,9 @@ pub struct Head<'a> {
     pub tests: &'a [ParsedTest],
     /// The reports this run was read from (an upload's report).
     pub reports: &'a [(String, Vec<u8>)],
-    /// The files the pull request changes.
+    /// The pull request, as GitHub returns it.
+    pub pull: Option<&'a serde_json::Value>,
+    /// The files the head changes against the default branch.
     pub changed: &'a [String],
     pub map: Option<&'a TestMap>,
 }
@@ -291,12 +293,32 @@ pub async fn keep(
     if state.secrets.jwt_secret.is_empty() || msg.head_sha.is_empty() {
         return;
     }
-    let picked = shots::pick(h.tests, h.changed, h.map);
-    if picked.is_empty()
-        || load(state, &msg.team_id, &repo, &msg.head_sha)
-            .await
-            .is_some()
+    if load(state, &msg.team_id, &repo, &msg.head_sha)
+        .await
+        .is_some()
     {
+        return;
+    }
+    // The branch the pull request goes into: the tests its change touches
+    // are read against it, and the Before image comes from it.
+    let Some(base) = h
+        .pull
+        .and_then(|p| p["base"]["ref"].as_str())
+        .filter(|b| !b.is_empty())
+        .map(str::to_string)
+    else {
+        warn!(repo = %repo, pr = h.pr, "Could not read the pull request's base branch; no screenshots kept");
+        return;
+    };
+    let changed = if base == msg.default_branch {
+        h.changed.to_vec()
+    } else {
+        gh.compare_changed_files(owner, name, &base, &msg.head_sha)
+            .await
+            .unwrap_or_default()
+    };
+    let picked = shots::pick(h.tests, &changed, h.map);
+    if picked.is_empty() {
         return;
     }
     let location = st
@@ -332,18 +354,7 @@ pub async fn keep(
         info!(repo = %repo, pr = h.pr, tests = ids.len(), "No screenshot on the head for the tests that show the change");
         return;
     };
-    // The same test on the branch the pull request goes into: its newest
-    // passing run there.
-    let Some(base) = gh
-        .get_pull_request(owner, name, h.pr)
-        .await
-        .ok()
-        .and_then(|p| p["base"]["ref"].as_str().map(str::to_string))
-        .filter(|b| !b.is_empty())
-    else {
-        warn!(repo = %repo, pr = h.pr, "Could not read the pull request's base branch; no screenshots kept");
-        return;
-    };
+    // The same test on the base branch: its newest passing run there.
     let newest = st
         .record(&msg.team_id, &scoped(t))
         .await
