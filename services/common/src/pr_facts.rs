@@ -686,10 +686,22 @@ pub fn conclusion(f: &Facts) -> String {
         parts.push("all checks on this head passed".to_string());
     } else if f.checks.is_empty() {
         parts.push("no check has reported on this head yet".to_string());
+    } else {
+        let running = f
+            .checks
+            .iter()
+            .filter(|c| c.outcome == Outcome::Running)
+            .count();
+        if running > 0 {
+            parts.push(format!(
+                "{} still running on this head; this is updated when {}",
+                plural(running, "check is", "checks are"),
+                if running == 1 { "it ends" } else { "they end" }
+            ));
+        }
     }
-    if parts.is_empty() {
-        return "nothing is out of the ordinary".to_string();
-    }
+    // Nothing to conclude is said by saying nothing: a sentence that
+    // carries no fact is filler (`pr_review`).
     parts.join("; ")
 }
 
@@ -791,10 +803,12 @@ pub fn rows(f: &Facts) -> Vec<crate::pr_body::Row> {
                 outcome: O::Failed,
                 detail: log,
             }),
+            // Running is never a result: it is said as running, and the
+            // description is rebuilt when it ends (`description::with_stamp`).
             Outcome::Running => ci.push(Row {
                 check,
-                outcome: O::NotRun,
-                detail: "still running when this was written".into(),
+                outcome: O::Running,
+                detail: String::new(),
             }),
             Outcome::DidNotRun => {}
         }
@@ -1170,6 +1184,8 @@ fn conclusion_with_signoffs(f: &Facts) -> String {
     let c = conclusion(f);
     if notes.is_empty() {
         c
+    } else if c.is_empty() {
+        format!("your merge decision also signs off: {}", notes.join("; "))
     } else {
         format!(
             "{c}. Your merge decision also signs off: {}",
@@ -1228,12 +1244,13 @@ pub fn body_of(f: &Facts, ticked: &[String]) -> crate::pr_body::Body {
         .iter()
         .find(|s| is_look(s))
         .map(|s| {
-            sentence_part(
+            // A page is named by its name; its raw id stays in the evidence.
+            sentence_part(&crate::pr_review::without_raw_ids(
                 s.what
                     .trim_start()
                     .trim_start_matches("Look at")
                     .trim_start(),
-            )
+            ))
         })
         .unwrap_or_default();
     let see_it = match (f.preview_url.starts_with("https://"), look.is_empty()) {

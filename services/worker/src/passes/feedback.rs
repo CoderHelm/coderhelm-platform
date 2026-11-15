@@ -63,25 +63,36 @@ pub async fn run(
     if let Some(judgment) =
         super::lessons::check_comment(state, &provider, &github, &msg, &mut usage).await
     {
-        info!(run_id = %msg.run_id, "Feedback says the fix is outside the code — lesson recorded, no code change");
-        let closed = close_own_pr_outside(
-            state,
-            &github,
-            &OwnPr {
-                team_id: &msg.team_id,
-                run_id: &msg.run_id,
-                owner: &msg.repo_owner,
-                repo: &msg.repo_name,
-                pr_number: msg.pr_number,
-            },
-            &judgment.where_,
-            &judgment.lesson,
-        )
-        .await;
-        if !closed {
-            finish_without_change(state, &msg).await;
+        // Part of the fix outside the code never undoes the code change: a
+        // pull request that carries the plan's code stays open, with the
+        // outside part attached (`fix_location::route_for_feedback`).
+        if keep_code_with_outside(state, &github, &msg, &judgment.where_, &judgment.lesson).await {
+            if !judgment.also_wants_code_change {
+                finish_without_change(state, &msg).await;
+                return Ok(());
+            }
+            info!(run_id = %msg.run_id, "Feedback also asks for a code change — handled as feedback");
+        } else {
+            info!(run_id = %msg.run_id, "Feedback says the fix is outside the code — lesson recorded, no code change");
+            let closed = close_own_pr_outside(
+                state,
+                &github,
+                &OwnPr {
+                    team_id: &msg.team_id,
+                    run_id: &msg.run_id,
+                    owner: &msg.repo_owner,
+                    repo: &msg.repo_name,
+                    pr_number: msg.pr_number,
+                },
+                &judgment.where_,
+                &judgment.lesson,
+            )
+            .await;
+            if !closed {
+                finish_without_change(state, &msg).await;
+            }
+            return Ok(());
         }
-        return Ok(());
     }
 
     if !ensure_pr_open(state, &github, &mut msg).await {
@@ -3770,6 +3781,59 @@ async fn finish_without_change(state: &WorkerState, msg: &FeedbackMessage) {
     if wrote {
         super::webhooks::emit_run(state, &msg.team_id, &msg.run_id, "completed").await;
     }
+}
+
+/// A person said part of the fix is outside the code: when the run's plan
+/// coded and its pull request carries that code, the pull request stays
+/// open, the outside part is recorded on the run's decision and listed on
+/// the pull request (done by CoderHelm where it can, the rest once under
+/// "Needed from you"), and true is returned. False when there is no code to
+/// keep: the caller closes the pull request as before.
+async fn keep_code_with_outside(
+    state: &WorkerState,
+    github: &GitHubClient,
+    msg: &FeedbackMessage,
+    where_: &str,
+    cause: &str,
+) -> bool {
+    use super::fix_location::{self, Route};
+    let Ok(pr) = github
+        .get_pull_request(&msg.repo_owner, &msg.repo_name, msg.pr_number)
+        .await
+    else {
+        return false;
+    };
+    if pr["state"].as_str() != Some("open") {
+        return false;
+    }
+    let changed = pr["changed_files"].as_u64().unwrap_or(0);
+    let record = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", super::attr_s(&msg.team_id))
+        .key("run_id", super::attr_s(&msg.run_id))
+        .send()
+        .await
+        .ok()
+        .and_then(|o| o.item)
+        .unwrap_or_default();
+    let planned = super::outside_exec::decision_of(&record);
+    if fix_location::route_for_feedback(planned.as_ref(), changed) != Route::CodeAndOutside {
+        return false;
+    }
+    let d = fix_location::with_outside_part(planned.as_ref(), where_, cause);
+    super::outside_exec::save(state, &msg.team_id, &msg.run_id, &d).await;
+    super::outside_exec::refresh_pr(github, &msg.repo_owner, &msg.repo_name, msg.pr_number, &d)
+        .await;
+    super::add_progress_note(
+        state,
+        &msg.team_id,
+        &msg.run_id,
+        "A person said part of the fix is outside the code: the code change stays in the open pull request, and the outside part is listed on it",
+    )
+    .await;
+    true
 }
 
 /// While a run is awaiting CI or running, the resume flow owns CI fixing

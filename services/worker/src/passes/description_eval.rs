@@ -449,6 +449,8 @@ pub fn ticket_case() -> Case {
             "make ship",
             "### Needed from you",
             "**Check:**",
+            // The reviewer guide says what the lead says: it gives way.
+            "**Roll back:**",
         ],
         in_sight: vec![
             "Retries a timed-out export poll three times before giving up (OPS-41).",
@@ -457,7 +459,6 @@ pub fn ticket_case() -> Case {
         ],
         collapsed: vec![
             "* `src/export/poller.rs`: the retry loop and its limit.",
-            "* **Roll back:** revert this pull request.",
             "How to check: `cargo test -p export`.",
             "Source ticket: OPS-41",
         ],
