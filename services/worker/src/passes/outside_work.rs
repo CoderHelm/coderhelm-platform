@@ -286,23 +286,86 @@ fn workflow_name(text: &str) -> Option<String> {
         .filter(|n| !n.is_empty())
 }
 
-/// The label a workflow runs on, when it runs on a labelled pull request.
+/// The label a workflow runs on, when it runs on a labelled pull request:
+/// `github.event.label.name == 'x'` or `contains(...labels.*.name, 'x')`,
+/// with or without spaces, at the workflow's or a job's `if:`.
 fn workflow_label(text: &str) -> Option<String> {
     if !text.contains("labeled") {
         return None;
     }
-    for pat in ["github.event.label.name == ", "labels.*.name, "] {
-        if let Some(i) = text.find(pat) {
-            let rest = &text[i + pat.len()..];
-            let q = rest.chars().next()?;
+    for pat in ["label.name", "labels.*.name"] {
+        let mut from = 0;
+        while let Some(i) = text[from..].find(pat) {
+            let at = from + i + pat.len();
+            from = at;
+            let rest = text[at..].trim_start_matches([' ', '=', ',', '\t']);
+            let Some(q) = rest.chars().next() else {
+                break;
+            };
             if q == '\'' || q == '"' {
                 let inner = &rest[1..];
-                let end = inner.find(q)?;
-                return Some(inner[..end].to_string());
+                if let Some(end) = inner.find(q) {
+                    let l = inner[..end].trim();
+                    if !l.is_empty() {
+                        return Some(l.to_string());
+                    }
+                }
             }
         }
     }
     None
+}
+
+/// The package scripts that deploy (`deploy`, `deploy:staging`, or any
+/// script whose command deploys), by name.
+fn deploy_scripts(files: &[(String, String)]) -> Vec<String> {
+    let mut out = Vec::new();
+    for (path, text) in files {
+        if path.rsplit('/').next() != Some("package.json") {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(text) else {
+            continue;
+        };
+        for (name, cmd) in v["scripts"].as_object().into_iter().flatten() {
+            let cmd = cmd.as_str().unwrap_or("").to_lowercase();
+            if name.to_lowercase().starts_with("deploy") || cmd.contains("deploy") {
+                out.push(name.clone());
+            }
+        }
+    }
+    out
+}
+
+/// A deploy a workflow runs that is not the CMS's: a `run` line that
+/// deploys, or that runs a package script that does. Only for a workflow
+/// about staging or a preview, so a production deploy is never taken for
+/// the staging one.
+fn staging_deploy_command(path: &str, text: &str, scripts: &[String]) -> Option<String> {
+    let about = format!("{path} {}", workflow_name(text).unwrap_or_default()).to_lowercase()
+        + &workflow_label(text).unwrap_or_default().to_lowercase();
+    let staging = ["staging", "stage", "preview"]
+        .iter()
+        .any(|w| about.contains(w));
+    if !staging {
+        return None;
+    }
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.starts_with('#'))
+        .map(|l| l.trim_start_matches("- ").trim())
+        .filter_map(|l| l.strip_prefix("run:").map(str::trim))
+        .find(|l| {
+            let c = l.to_lowercase();
+            c.contains("deploy")
+                || scripts.iter().any(|s| {
+                    let s = s.to_lowercase();
+                    c.contains(&format!("run {s}"))
+                        || c.contains(&format!("pnpm {s}"))
+                        || c.contains(&format!("yarn {s}"))
+                })
+        })
+        .map(str::to_string)
 }
 
 /// The command a workflow runs that deploys the studio or schema: a `run`
@@ -363,6 +426,7 @@ fn route_for(path: &str, text: &str, command: &str) -> Route {
 pub fn routes(tree: &[String], files: &[(String, String)]) -> (Vec<Route>, Vec<Route>) {
     let mut deploys = Vec::new();
     let mut e2e = Vec::new();
+    let scripts = deploy_scripts(files);
     for (path, text) in files {
         let workflow = path.starts_with(".github/workflows/")
             && (path.ends_with(".yml") || path.ends_with(".yaml"));
@@ -370,6 +434,13 @@ pub fn routes(tree: &[String], files: &[(String, String)]) -> (Vec<Route>, Vec<R
             if deploys_studio(text) {
                 let cmd = deploy_command(text).unwrap_or_default();
                 deploys.push(route_for(path, text, &cmd));
+            } else if let Some(cmd) = staging_deploy_command(path, text, &scripts) {
+                // A staging deploy job a label or a dispatch starts: one
+                // CoderHelm can start itself.
+                let r = route_for(path, text, &cmd);
+                if r.startable() {
+                    deploys.push(r);
+                }
             }
             if runs_e2e(text) {
                 e2e.push(route_for(path, text, ""));
@@ -556,7 +627,22 @@ impl Abilities {
     }
 
     fn startable_deploy(&self) -> Option<&Route> {
-        self.deploys.iter().find(|r| r.startable())
+        self.deploys
+            .iter()
+            .find(|r| r.startable() && !is_production_route(r))
+    }
+
+    /// Whether CoderHelm can start a deploy to `target` itself: a workflow
+    /// it dispatches or one a pull request label starts. What the gate is
+    /// told (`person_gate::Context::can_deploy`).
+    pub fn can_deploy(&self, target: Target) -> bool {
+        self.deploys.iter().any(|r| {
+            r.startable()
+                && match target {
+                    Target::Staging => !is_production_route(r),
+                    Target::Production => !is_staging_route(r),
+                }
+        })
     }
 
     fn startable_e2e(&self) -> Option<&Route> {
@@ -2113,7 +2199,7 @@ pub fn own_startable(c: &mut OutsideChange, a: &Abilities) -> usize {
         let Some(r) = a
             .deploys
             .iter()
-            .filter(|r| r.startable() && !(s.is_production() && is_staging_route(r)))
+            .filter(|r| r.startable() && !is_production_route(r))
             .find(|r| r.named_in(&text))
             .or_else(|| a.startable_deploy())
         else {
@@ -2131,6 +2217,45 @@ pub fn own_startable(c: &mut OutsideChange, a: &Abilities) -> usize {
         s.grant.clear();
         s.reason.clear();
         moved += 1;
+    }
+    moved
+}
+
+/// [`classify`] with what the repository lets CoderHelm do: each person
+/// step goes through the gate with `can_deploy` read from the repository's
+/// deploy routes, so a deploy CoderHelm can start (and has not tried) is
+/// never a person's credential item; it becomes CoderHelm's step on that
+/// route ([`own_startable`]) and the executor starts it. Returns how many
+/// steps moved.
+pub fn classify_with(c: &mut OutsideChange, a: &Abilities) -> usize {
+    let mut moved = classify(c);
+    for i in 0..c.steps.len() {
+        let s = &c.steps[i];
+        if s.doer() != Doer::Person || s.done || !s.is_deploy() {
+            continue;
+        }
+        let ctx = common::person_gate::Context {
+            can_deploy: a.can_deploy(s.target()),
+            ..Default::default()
+        };
+        let human = step_now(c, i, true).is_some_and(|st| {
+            matches!(
+                common::person_gate::decide(&st.ask(), &ctx),
+                common::person_gate::Outcome::Human(_)
+            )
+        });
+        if human || s.is_production() {
+            continue;
+        }
+        let one = OutsideChange {
+            steps: vec![c.steps[i].clone()],
+            ..Default::default()
+        };
+        let mut one = one;
+        if own_startable(&mut one, a) == 1 {
+            c.steps[i] = one.steps.remove(0);
+            moved += 1;
+        }
     }
     moved
 }
@@ -2504,6 +2629,18 @@ pub fn check_action(s: &NoteStep, a: &Abilities, c: &OutsideChange) -> Action {
 }
 
 /// Whether a route deploys staging.
+/// A route that deploys production only: never started for staging.
+fn is_production_route(r: &Route) -> bool {
+    let t = format!("{} {} {}", r.name, r.file, r.command).to_lowercase();
+    let label = match &r.trigger {
+        Trigger::Label(l) => l.to_lowercase(),
+        _ => String::new(),
+    };
+    (t.contains("prod") || label.contains("prod"))
+        && !t.contains("staging")
+        && !label.contains("staging")
+}
+
 fn is_staging_route(r: &Route) -> bool {
     format!("{} {} {}", r.name, r.file, r.command)
         .to_lowercase()

@@ -660,6 +660,53 @@ pub fn route_for_plan(decision: Option<&FixDecision>, tasks: &str) -> Route {
     }
 }
 
+/// How a run goes on when a person's feedback says (part of) the fix is
+/// outside the code: the code change stays and its pull request stays open
+/// whenever the plan changed code and the pull request carries it, with the
+/// outside part attached ([`Route::CodeAndOutside`], as [`route_for_plan`]
+/// routes a plan); only a pull request that changes nothing the plan
+/// decided as code is closed ([`Route::OutsideOnly`]).
+pub fn route_for_feedback(planned: Option<&FixDecision>, pr_changed_files: u64) -> Route {
+    let planned_code = match planned {
+        Some(d) => matches!(route(Some(d)), Route::Code | Route::CodeAndOutside),
+        // A run that opened a pull request with no recorded decision coded
+        // what its plan named.
+        None => true,
+    };
+    if pr_changed_files > 0 && planned_code {
+        Route::CodeAndOutside
+    } else {
+        Route::OutsideOnly
+    }
+}
+
+/// `planned` with the outside part a person named added: the location is
+/// both, and the outside change is the planner's when it had one, else
+/// what the person said.
+pub fn with_outside_part(planned: Option<&FixDecision>, where_: &str, cause: &str) -> FixDecision {
+    let mut d = planned.cloned().unwrap_or_default();
+    d.fix_location = FixLocation::Both;
+    let usable = d
+        .outside_change
+        .as_ref()
+        .is_some_and(OutsideChange::is_usable);
+    if !usable {
+        d.outside_change = Some(OutsideChange {
+            system: if where_.trim().is_empty() {
+                "the system that holds this data".to_string()
+            } else {
+                where_.trim().to_string()
+            },
+            change: cause.trim().to_string(),
+            ..Default::default()
+        });
+    }
+    if d.cause.trim().is_empty() {
+        d.cause = cause.trim().to_string();
+    }
+    d
+}
+
 /// Whether a plan's tasks change code: anything but the sentinels that say
 /// it changes none.
 pub fn plans_code(tasks: &str) -> bool {

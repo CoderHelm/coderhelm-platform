@@ -210,10 +210,9 @@ pub async fn execute(
     });
     // One executor: a step a person was to do that the gate finds
     // CoderHelm's is done here, like the rest.
-    p.moved = outside_work::classify(c);
-    // A deploy the repository lets it start is its own, whoever the plan
-    // named (`outside_work::own_startable`).
-    p.moved += outside_work::own_startable(c, a);
+    // With what the repository lets it do: a deploy it can start is its own,
+    // whoever the plan named (`outside_work::classify_with`).
+    p.moved = outside_work::classify_with(c, a);
     let snapshot = c.clone();
     for i in 0..c.steps.len() {
         let s = &mut c.steps[i];
@@ -235,7 +234,9 @@ pub async fn execute(
             continue;
         }
         p.changed = true;
-        let action = outside_work::action_for(s, a, &snapshot);
+        let Some(action) = next_action(s, a, &snapshot) else {
+            continue;
+        };
         let running = s.run.as_ref().is_some_and(|r| r.state == RUNNING);
         if running {
             if let Some(Action::Dispatch(r) | Action::Label(_, r)) = Some(action.clone()) {
@@ -259,6 +260,21 @@ pub async fn execute(
     }
     p.problems = health.take_reports();
     p
+}
+
+/// What the executor does with a step now: `None` when the step is not
+/// CoderHelm's, is done, or ended earlier without being done. A deploy
+/// moved to CoderHelm (`outside_work::classify_with`) gets its route's
+/// action here: the label added or the workflow dispatched, then waited
+/// for and its result recorded ([`record_end`]).
+pub fn next_action(s: &NoteStep, a: &Abilities, c: &OutsideChange) -> Option<Action> {
+    if s.doer() != Doer::CoderHelm || s.done {
+        return None;
+    }
+    if !s.result.trim().is_empty() && !outside_work::under_way(s) {
+        return None;
+    }
+    Some(outside_work::action_for(s, a, c))
 }
 
 /// Whether later steps wait for this one when it isn't done: a deploy (the
@@ -722,7 +738,6 @@ async fn finish(
     p: &mut Progress,
 ) {
     let id = run["id"].as_u64().unwrap_or(0);
-    let url = run["html_url"].as_str().unwrap_or_default().to_string();
     let ok = conclusion == "success";
     let failing = if ok {
         Vec::new()
@@ -733,6 +748,25 @@ async fn finish(
             .map(|l| failing_tests(&l))
             .unwrap_or_default()
     };
+    if let Some(f) = record_end(s, r, run, conclusion, failing) {
+        p.failed_e2e = Some(f);
+    }
+    info!(run_id = cx.run_id, workflow = %r.file, conclusion, "Outside step's workflow ended");
+}
+
+/// A started workflow ended: the step records the run, its conclusion and
+/// result line (done on success), and a failed end-to-end run is returned
+/// for the CI fix round.
+pub fn record_end(
+    s: &mut NoteStep,
+    r: &Route,
+    run: &Value,
+    conclusion: &str,
+    failing: Vec<String>,
+) -> Option<FailedRun> {
+    let id = run["id"].as_u64().unwrap_or(0);
+    let url = run["html_url"].as_str().unwrap_or_default().to_string();
+    let ok = conclusion == "success";
     s.done = ok;
     s.run = Some(StepRun {
         state: if ok { DONE } else { FAILED }.to_string(),
@@ -744,16 +778,13 @@ async fn finish(
         ..s.run.clone().unwrap_or_default()
     });
     s.result = report_line(r, &url, conclusion, &failing);
-    if !ok && s.step_kind() == StepKind::E2e {
-        p.failed_e2e = Some(FailedRun {
-            workflow_run_id: id,
-            workflow: r.name.clone(),
-            url,
-            head_sha: run["head_sha"].as_str().unwrap_or_default().to_string(),
-            failing,
-        });
-    }
-    info!(run_id = cx.run_id, workflow = %r.file, conclusion, "Outside step's workflow ended");
+    (!ok && s.step_kind() == StepKind::E2e).then(|| FailedRun {
+        workflow_run_id: id,
+        workflow: r.name.clone(),
+        url,
+        head_sha: run["head_sha"].as_str().unwrap_or_default().to_string(),
+        failing,
+    })
 }
 
 /// The step's result line for a finished run.

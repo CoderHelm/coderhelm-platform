@@ -189,8 +189,7 @@ const TEMPLATE: &str = "## Description\n<!-- What and why -->\n\n## Type of chan
 /// the facts of the head, the shape, and the one save's review.
 fn built(state: State, template: Option<&str>) -> (String, common::pr_facts::Facts) {
     let mut c = the_note();
-    ow::classify(&mut c);
-    ow::own_startable(&mut c, &the_repo());
+    ow::classify_with(&mut c, &the_repo());
     let files = files();
     let floor = pr_risk::floor(&files, &std::collections::HashMap::new());
     let checks = checks(state);
@@ -390,8 +389,7 @@ fn outside_work_never_stops_the_change_or_the_pull_request() {
         reason: "outside_reach".into(),
         ..Default::default()
     });
-    ow::classify(&mut c);
-    ow::own_startable(&mut c, &the_repo());
+    ow::classify_with(&mut c, &the_repo());
     let left = ow::left(&c);
     assert_eq!(left.human.len(), 1, "{left:?}");
     let resume = include_str!("../resume.rs");
@@ -400,4 +398,183 @@ fn outside_work_never_stops_the_change_or_the_pull_request() {
     assert!(end.contains("COMPLETED"), "{end}");
     let done = fn_src(resume, "\nasync fn set_run_complete(");
     assert!(done.contains("Delivered: the pull request is open"));
+}
+
+/// The repository's files: a staging deploy job a pull request label
+/// starts (no dispatch), the package script it runs, and a production
+/// deploy that is dispatched.
+fn label_repo() -> Abilities {
+    let files: Vec<(String, String)> = vec![
+        (
+            ".github/workflows/deploy-staging.yml".into(),
+            "name: Deploy staging\non:\n  pull_request:\n    types: [labeled, synchronize]\njobs:\n  deploy:\n    if: contains(github.event.pull_request.labels.*.name, 'deploy-staging')\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - run: npm ci\n      - run: cd apps/studio && npm run deploy:staging\n".into(),
+        ),
+        (
+            ".github/workflows/deploy-production.yml".into(),
+            "name: Deploy production\non:\n  workflow_dispatch:\njobs:\n  deploy:\n    runs-on: ubuntu-latest\n    steps:\n      - run: npm run deploy:production\n".into(),
+        ),
+        (
+            "apps/studio/package.json".into(),
+            "{\"scripts\": {\"deploy:staging\": \"node scripts/ship.js --env staging\", \"deploy:production\": \"node scripts/ship.js --env production\"}}".into(),
+        ),
+    ];
+    let tree: Vec<String> = files.iter().map(|(p, _)| p.clone()).collect();
+    ow::abilities(&tree, &files, &[], false)
+}
+
+/// 5. A staging deploy defined by a label-triggered job is found, the gate
+///    is told CoderHelm can deploy, and the step is CoderHelm's: never a
+///    credential item while it has not tried.
+#[test]
+fn a_label_triggered_staging_deploy_job_is_coderhelms() {
+    let a = label_repo();
+    let staging = a
+        .deploys
+        .iter()
+        .find(|r| r.file.ends_with("deploy-staging.yml"))
+        .expect("the label-triggered staging deploy is found");
+    assert_eq!(staging.trigger, Trigger::Label("deploy-staging".into()));
+    assert!(staging.startable());
+    assert!(a.can_deploy(ow::Target::Staging));
+    // The gate, told what the repository lets CoderHelm do.
+    let mut c = the_note();
+    let ask = ow::step_now(&c, 0, true).unwrap().ask();
+    let ctx = common::person_gate::Context {
+        can_deploy: a.can_deploy(ow::Target::Staging),
+        ..Default::default()
+    };
+    assert!(!matches!(
+        common::person_gate::decide(&ask, &ctx),
+        common::person_gate::Outcome::Human(_)
+    ));
+    // Without that knowledge it was a credential item: the old failure.
+    assert!(matches!(
+        common::person_gate::decide(&ask, &common::person_gate::Context::default()),
+        common::person_gate::Outcome::Human(_)
+    ));
+    assert_eq!(ow::classify_with(&mut c, &a), 1);
+    let s = &c.steps[0];
+    assert_eq!(s.doer(), ow::Doer::CoderHelm);
+    assert!(s.reason.is_empty() && s.why_person.is_empty());
+    assert!(ow::left(&c).human.is_empty());
+    // A failed attempt whose own cause is a credential still reaches a
+    // person: the gate says what the attempt found, not a guess.
+    let tried = common::person_gate::Ask {
+        kind: common::person_gate::Kind::Attempt,
+        text: "Deploy the Studio schema to staging".into(),
+        how: DEPLOY.into(),
+        why_not: "the deploy token is missing; provide the token in the sandbox secrets".into(),
+        ..Default::default()
+    };
+    assert!(matches!(
+        common::person_gate::decide(&tried, &ctx),
+        common::person_gate::Outcome::Human(_)
+    ));
+}
+
+/// 6. "CoderHelm does this on its next step" is true: the executor's next
+///    action for the step adds the label that starts the job, the run it
+///    starts is waited for, and its end is recorded on the step and the
+///    run's decision.
+#[test]
+fn the_deploy_step_is_executed_not_only_reworded() {
+    use crate::passes::outside_exec::{self, record_end, START_WORKFLOW};
+    let a = label_repo();
+    let mut c = the_note();
+    ow::classify_with(&mut c, &a);
+    let snapshot = c.clone();
+    let action = outside_exec::next_action(&c.steps[0], &a, &snapshot).expect("it is done now");
+    let route = match &action {
+        ow::Action::Label(l, r) => {
+            assert_eq!(l, "deploy-staging");
+            r.clone()
+        }
+        other => panic!("not started: {other:?}"),
+    };
+    assert!(route.file.ends_with("deploy-staging.yml"));
+    let (tool, args) = outside_exec::gate_args(&c.steps[0], &action, "acme/site", "feat").unwrap();
+    assert_eq!(tool, START_WORKFLOW);
+    assert_eq!(args["label"], "deploy-staging");
+    // Started: the step waits on the job, and says so.
+    c.steps[0].run = Some(ow::StepRun {
+        state: outside_exec::RUNNING.into(),
+        workflow: route.file.clone(),
+        ..Default::default()
+    });
+    c.steps[0].result = format!(
+        "added `deploy-staging` to #88, which starts {}",
+        route.line()
+    );
+    let st = ow::step_now(&c, 0, true).unwrap();
+    assert!(
+        matches!(&st.state, common::pr_steps::State::Waiting { on } if on.contains("workflow it started ends")),
+        "{st:?}"
+    );
+    assert!(
+        outside_exec::next_action(&c.steps[0], &a, &c.clone()).is_some(),
+        "polled again"
+    );
+    // Ended: recorded, done, nothing left.
+    let run = serde_json::json!({"id": 4242, "html_url": "https://github.com/acme/site/actions/runs/4242", "head_sha": "6de2414"});
+    assert!(record_end(&mut c.steps[0], &route, &run, "success", vec![]).is_none());
+    let s = &c.steps[0];
+    assert!(s.done);
+    assert_eq!(s.run.as_ref().unwrap().workflow_run_id, 4242);
+    assert!(s.result.contains("concluded `success`"), "{}", s.result);
+    assert!(matches!(
+        ow::step_now(&c, 0, true).unwrap().state,
+        common::pr_steps::State::Done { .. }
+    ));
+    assert!(ow::left(&c).doable.is_empty() && ow::left(&c).human.is_empty());
+    assert!(outside_exec::next_action(&c.steps[0], &a, &c.clone()).is_none());
+    // The executor runs this path, and the resume saves it on the run.
+    let src = include_str!("../outside_exec.rs");
+    let exec = fn_src(src, "\npub async fn execute(");
+    assert!(exec.contains("outside_work::classify_with(") && exec.contains("next_action("));
+    let start = fn_src(src, "\nasync fn start(");
+    assert!(start.contains(".add_labels(") && start.contains("poll(cx, s, r, until, p)"));
+    assert!(fn_src(src, "\nasync fn finish(").contains("record_end("));
+    let resume = fn_src(src, "\npub async fn on_resume(");
+    assert!(resume.contains("save(state") && resume.contains("refresh_pr("));
+}
+
+/// 7. A person saying part of the fix is outside the code keeps the code
+///    change and its open pull request, with the outside part attached.
+#[test]
+fn feedback_naming_outside_work_keeps_the_code_change() {
+    let coded = FixDecision {
+        fix_location: FixLocation::Code,
+        cause: "Editors need the warning in the Studio.".into(),
+        ..Default::default()
+    };
+    assert_eq!(
+        fix_location::route_for_feedback(Some(&coded), 3),
+        Way::CodeAndOutside
+    );
+    assert_eq!(
+        fix_location::route_for_feedback(None, 3),
+        Way::CodeAndOutside
+    );
+    // Nothing coded to keep: closed as before.
+    assert_eq!(
+        fix_location::route_for_feedback(Some(&coded), 0),
+        Way::OutsideOnly
+    );
+    let d = fix_location::with_outside_part(
+        Some(&coded),
+        "the CMS",
+        "Set the limit field on the hero type",
+    );
+    assert_eq!(d.fix_location, FixLocation::Both);
+    assert_eq!(fix_location::route(Some(&d)), Way::CodeAndOutside);
+    assert_eq!(d.outside_change.as_ref().unwrap().system, "the CMS");
+    // The feedback pass keeps the code before it would close anything.
+    let fb = include_str!("../feedback.rs");
+    let keep = fb.find("keep_code_with_outside(state").expect("kept");
+    let close = fb
+        .find("let closed = close_own_pr_outside(")
+        .expect("closed");
+    assert!(keep < close);
+    let body = fn_src(fb, "\nasync fn keep_code_with_outside(");
+    assert!(body.contains("route_for_feedback(") && body.contains("refresh_pr("));
 }
