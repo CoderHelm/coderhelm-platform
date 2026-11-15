@@ -877,6 +877,7 @@ fn candidates(
         v.as_str().unwrap_or("")
     }
     let mut mentioned: Vec<(String, u64)> = Vec::new();
+    let mut reverts: Vec<((String, u64), u64)> = Vec::new();
     if !ticket_id.is_empty() {
         for (repo, v) in listed {
             for p in v.as_array().into_iter().flatten() {
@@ -892,10 +893,25 @@ fn candidates(
                     || links_issue(issue, repo, title, body)
                 {
                     found.push(key);
-                } else if super::mentions_ticket(body, ticket_id) {
-                    mentioned.push(key);
+                } else {
+                    if common::merged_ticket::is_revert(title, branch) {
+                        if let Some(target) = reverted_pr(repo, branch, body) {
+                            reverts.push((key.clone(), target));
+                        }
+                    }
+                    if super::mentions_ticket(body, ticket_id) {
+                        mentioned.push(key);
+                    }
                 }
             }
+        }
+    }
+    // A revert of the ticket's own pull request is the ticket's own too
+    // (GitHub's Revert button names neither the ticket nor the issue).
+    for (key, target) in reverts {
+        if found.contains(&(key.0.clone(), target)) {
+            mentioned.retain(|m| m != &key);
+            found.push(key);
         }
     }
     let own = found.len();
@@ -906,6 +922,30 @@ fn candidates(
         .enumerate()
         .map(|(i, (repo, number))| (repo, number, i < own))
         .collect()
+}
+
+/// The pull request in `repo` that a revert pull request reverts: from
+/// GitHub's Revert-button branch (`revert-<n>-…`) or its description
+/// (`Reverts #<n>`, `Reverts owner/name#<n>` naming the same repository).
+fn reverted_pr(repo: &str, branch: &str, body: &str) -> Option<u64> {
+    if let Some(n) = branch
+        .strip_prefix("revert-")
+        .and_then(|rest| rest.split_once('-'))
+        .and_then(|(n, _)| n.parse().ok())
+    {
+        return Some(n);
+    }
+    let lower = body.to_ascii_lowercase();
+    let own = format!("{}#", repo.to_ascii_lowercase());
+    let words: Vec<&str> = lower.split_whitespace().collect();
+    words.windows(2).find_map(|w| {
+        let word = w[0].trim_matches(|c: char| !c.is_ascii_alphanumeric());
+        let reference = w[1].trim_end_matches(|c: char| matches!(c, ',' | '.' | ')' | ';' | ':'));
+        let number = reference
+            .strip_prefix(&own)
+            .or_else(|| reference.strip_prefix('#'))?;
+        (word == "reverts").then(|| number.parse().ok()).flatten()
+    })
 }
 
 /// Adds every pull request for the ticket in `repos` (`owner/name`, the
@@ -1479,6 +1519,65 @@ mod tests {
             serde_json::json!([{"number": 5, "title": "WEB-43", "head": {"ref": "x"}, "body": ""}]),
         )];
         assert!(candidates(&TicketHistory::default(), &other, "WEB-42", None).is_empty());
+    }
+
+    /// A person's PR acme/api#7 ("Fix login", "Fixes #42") merged, then
+    /// GitHub's Revert button undid it: `Revert "Fix login"` on
+    /// `revert-7-pat/login`, "Reverts acme/api#7". The revert is read as
+    /// the issue's own, so a new run on GH-42 isn't refused. A revert of a
+    /// pull request that isn't the issue's is ignored.
+    #[test]
+    fn a_revert_button_pr_of_the_tickets_pr_is_the_tickets_own() {
+        use common::messages::TicketSource;
+        let pr = |n: u64, title: &str, branch: &str, body: &str, at: &str| {
+            serde_json::json!({
+                "number": n,
+                "title": title,
+                "head": {"ref": branch},
+                "body": body,
+                "merged_at": at,
+            })
+        };
+        let listed = vec![(
+            "acme/api".to_string(),
+            serde_json::json!([
+                pr(9, "Revert \"Bump deps\"", "revert-3-pat/deps", "Reverts acme/api#3", "x"),
+                pr(8, "Revert \"Fix login\"", "revert-7-pat/login", "Reverts acme/api#7", "x"),
+                pr(7, "Fix login", "pat/login", "Fixes #42", "x"),
+                pr(3, "Bump deps", "pat/deps", "", "x"),
+            ]),
+        )];
+        let issue = Some(("acme/api", 42));
+        let found = candidates(&TicketHistory::default(), &listed, "GH-42", issue);
+        assert_eq!(
+            found,
+            vec![
+                ("acme/api".to_string(), 7, true),
+                ("acme/api".to_string(), 8, true),
+            ]
+        );
+        let read = |n: u64, title: &str, branch: &str, at: &str| {
+            let mut p = earlier("acme/api", n, "pat", "merged", "2026-11-01");
+            p.title = title.into();
+            p.branch = branch.into();
+            p.closed_at = at.into();
+            p.for_ticket = true;
+            p
+        };
+        let h = TicketHistory {
+            prs: vec![
+                read(7, "Fix login", "pat/login", "2026-11-02T10:00:00Z"),
+                read(8, "Revert \"Fix login\"", "revert-7-pat/login", "2026-11-03T10:00:00Z"),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(h.blocking_merge(&TicketSource::Github, "acme/api"), None);
+        // Found through the description alone, too; never another
+        // repository's pull request.
+        assert_eq!(reverted_pr("acme/api", "pat/undo", "Reverts acme/api#7"), Some(7));
+        assert_eq!(reverted_pr("acme/api", "pat/undo", "Reverts #7."), Some(7));
+        assert_eq!(reverted_pr("acme/api", "pat/undo", "Reverts acme/web#7"), None);
+        assert_eq!(reverted_pr("acme/api", "pat/undo", "See #7"), None);
     }
 
     /// A re-run continues on CoderHelm's own open PR in the same repo: the
