@@ -1064,12 +1064,27 @@ pub(super) async fn live_review(
     prior: &str,
     usage: &mut crate::models::TokenUsage,
 ) -> Result<LiveOutcome, String> {
-    // Built as production builds it (`review_pr::run_once`); the cases carry
-    // no repo or team instructions, so both blocks are empty.
+    live_review_in_repo(client, model, critic_model, lr, prior, "", usage).await
+}
+
+/// [`live_review`] of a pull request whose repository has its own
+/// instruction files (`repo_instructions`, as `load_repo_instructions_at_ref`
+/// reads them): a replayed real review is held to the rules it was held to.
+pub(super) async fn live_review_in_repo(
+    client: &crate::agent::anthropic::AnthropicClient,
+    model: &str,
+    critic_model: &str,
+    lr: &LiveReview,
+    prior: &str,
+    repo_instructions: &str,
+    usage: &mut crate::models::TokenUsage,
+) -> Result<LiveOutcome, String> {
+    // Built as production builds it (`review_pr::run_once`); the synthetic
+    // cases carry no repo or team instructions, so both blocks are empty.
     let team_instructions = "";
     let instructions_block = format!(
         "{}{}",
-        super::format_instructions_block(""),
+        super::format_instructions_block(repo_instructions),
         review_agent::team_rules_block(team_instructions)
     );
     let system = review_agent::review_system_prompt("acme", "app", &instructions_block, false);

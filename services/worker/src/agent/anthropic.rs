@@ -2838,6 +2838,118 @@ mod shared_prefix_tests {
         assert_eq!(v["tools"][1]["cache_control"], json!({"type": "ephemeral"}));
     }
 
+    /// The texts of the system blocks a prompt is sent as.
+    fn system_texts(system_prompt: &str) -> Vec<String> {
+        system_blocks(system_prompt)
+            .into_iter()
+            .map(|SystemBlock::Text { text, .. }| text)
+            .collect()
+    }
+
+    /// Two reviews of different pull requests in one repository: the tools
+    /// and the system prompt up to the per-PR part (examples, prompt variant,
+    /// recalled memories) are the same bytes, so the second review reads them
+    /// from the cache. The model still reads the same text as before: the
+    /// blocks joined are the prompt without the marker.
+    #[test]
+    fn two_reviews_in_a_repository_share_their_prefix() {
+        use crate::passes::{review_agent, review_pr};
+        let repo_wide = "\n\n## Repository instructions\n- Handlers stay small\n\
+                         ## Team rules\n- Every migration is reversible";
+        let pr_a =
+            "\n## Examples\n- Good: names the caller\n## Memory\n- PR #12: retries are idempotent";
+        let pr_b =
+            "\n## Prompt variant\nBe brief.\n## Memory\n- PR #40: the cache key has the tenant";
+        let tools = review_agent::review_tools();
+        let prompt = |this_pr: &str| {
+            review_agent::review_system_prompt(
+                "acme",
+                "web",
+                &review_pr::review_instructions_block(repo_wide, this_pr),
+                true,
+            )
+        };
+        let (a, b) = (prompt(pr_a), prompt(pr_b));
+        let pa = shared_prefix_bytes(
+            "claude-opus-5-5",
+            &a,
+            "PR: Fix the cursor\n(diff a)",
+            &tools,
+        );
+        let pb = shared_prefix_bytes("claude-opus-5-5", &b, "PR: Add a cache\n(diff b)", &tools);
+        assert_eq!(pa, pb, "tools and the repository's prompt are identical");
+        assert!(
+            pa.0.contains("\"ttl\":\"1h\""),
+            "the tools are cached for an hour"
+        );
+        assert!(pa.1.contains("\"ttl\":\"1h\""));
+        assert!(pa.1.contains("Every migration is reversible"));
+        for part in [pr_a, pr_b, "When done exploring"] {
+            assert!(
+                !pa.1.contains(part.trim()),
+                "{part} is after the shared prefix"
+            );
+        }
+        assert!(!pa.1.contains(SHARED_PREFIX_END));
+        // The text the model reads is what it read before the split.
+        for this_pr in [pr_a, pr_b] {
+            let before = review_agent::review_system_prompt(
+                "acme",
+                "web",
+                &format!("{repo_wide}{this_pr}"),
+                true,
+            );
+            assert_eq!(system_texts(&prompt(this_pr)).concat(), before);
+        }
+    }
+
+    /// Two feedback rounds whose recalled memories differ share the tools
+    /// and the role, voice, team and rules part of the system prompt.
+    #[test]
+    fn two_feedback_rounds_share_their_prefix() {
+        use crate::passes::feedback::feedback_system_prompt;
+        let tools = vec![tool("read_file"), tool("edit_file"), tool("reply")];
+        let round = |memory: &str| {
+            feedback_system_prompt(
+                "acme",
+                "web",
+                " Match the team's voice: short.",
+                "\n## Team rules\n- Reversible migrations",
+                "",
+                memory,
+            ) + "\n\n## Web\nhosts: shop.acme.test"
+        };
+        let a = round("\n## Memory\n- tests run with make test");
+        let b = round("\n## Memory\n- the API retries twice");
+        let pa = shared_prefix_bytes(
+            "claude-sonnet-5-5",
+            &a,
+            "A reviewer left comments on PR #3",
+            &tools,
+        );
+        let pb = shared_prefix_bytes(
+            "claude-sonnet-5-5",
+            &b,
+            "A reviewer left comments on PR #9",
+            &tools,
+        );
+        assert_eq!(pa, pb);
+        assert!(pa.1.contains("Reversible migrations") && !pa.1.contains("Memory"));
+        // Joined, the blocks are the prompt as it was before the marker.
+        assert_eq!(system_texts(&a).concat(), a.replace(SHARED_PREFIX_END, ""),);
+        assert_eq!(a.matches(SHARED_PREFIX_END).count(), 1);
+    }
+
+    /// The review and feedback passes build their prompts through the
+    /// functions the tests above check.
+    #[test]
+    fn reviews_and_feedback_mark_their_shared_prefix() {
+        let review = include_str!("../passes/review_pr.rs");
+        assert!(review.contains("let instructions_block = review_instructions_block("));
+        let feedback = include_str!("../passes/feedback.rs");
+        assert!(feedback.contains("let system = feedback_system_prompt("));
+    }
+
     #[test]
     fn server_side_clearing_is_rare_and_large() {
         let edit = clear_tool_uses_edit();

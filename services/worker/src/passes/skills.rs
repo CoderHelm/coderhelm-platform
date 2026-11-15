@@ -2228,6 +2228,7 @@ mod tests {
             primary_model: "team-primary".into(),
             heavy_model: "team-heavy".into(),
             heavy_model_chosen: true,
+            review_route: Default::default(),
             meter: common::usage::UsageMeter::memory("t").0,
             scope: Default::default(),
         };

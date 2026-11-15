@@ -19,6 +19,10 @@ pub struct ModelProvider {
     /// runs on it; otherwise the routes measured to hold their quality on a
     /// lighter model (`MEASURED_LIGHT_MODEL`) run there.
     pub heavy_model_chosen: bool,
+    /// Which model writes the team's pull request reviews (Settings, Model
+    /// Provider, `review_model_route`). The strongest model unless the team
+    /// switched to the measured route.
+    pub review_route: ReviewRoute,
     /// Counts this team's model calls (set by `load_for_team`). Required:
     /// there is no provider, so no client, whose calls go uncounted.
     pub meter: common::usage::UsageMeter,
@@ -83,6 +87,11 @@ impl ModelProvider {
             .filter(|m| !m.trim().is_empty())
             .map(|m| common::model_ids::current(m).to_string())
             .unwrap_or_else(|| "claude-opus-5-5".to_string());
+        let review_route = ReviewRoute::parse(
+            item.get("review_model_route")
+                .and_then(|v| v.as_s().ok())
+                .map(String::as_str),
+        );
 
         info!(team_id, "Loaded Anthropic provider");
         let analytics_table = std::env::var("ANALYTICS_TABLE_NAME").unwrap_or_default();
@@ -97,6 +106,7 @@ impl ModelProvider {
             primary_model,
             heavy_model,
             heavy_model_chosen,
+            review_route,
             meter: common::usage::UsageMeter::dynamo(dynamo.clone(), &analytics_table, team_id),
             scope: super::policy::PolicyScope {
                 team: team_id.to_string(),
@@ -141,9 +151,14 @@ impl ModelProvider {
 
     /// The reviewer's reading and writing of a review (`generate_review`).
     /// It decides what the findings are and so what a review holds the merge
-    /// on: a judgment step, on [`Self::judgment_model_id`].
+    /// on: a judgment step, on [`Self::judgment_model_id`], unless the team
+    /// chose the measured route. The critic that decides which findings are
+    /// kept, and so what blocks, stays on the judgment model either way.
     pub fn review_model_id(&self) -> &str {
-        self.judgment_model_id()
+        match self.review_route {
+            ReviewRoute::Strongest => self.judgment_model_id(),
+            ReviewRoute::MeasuredLight => MEASURED_LIGHT_MODEL,
+        }
     }
 
     /// Every judgment step: the stop judge, planner decisions, the reviewer's
@@ -208,6 +223,29 @@ impl ModelProvider {
 /// writing ran here too until it was counted a judgment step (it decides what
 /// a review holds the merge on); it is back on the strongest model.
 pub const MEASURED_LIGHT_MODEL: &str = "claude-sonnet-5-5";
+
+/// Which model writes a team's reviews. `Strongest` (the default, and what
+/// any value but `measured_light` reads as) keeps them on the judgment model.
+/// `MeasuredLight` writes them on [`MEASURED_LIGHT_MODEL`] with the critic on
+/// the judgment model, the configuration the synthetic measurement
+/// (`passes/model_route_eval.rs`, `route_review_live`) scored at the same
+/// recall at about half the cost. A team turns it on only after the replay of
+/// its own past reviews (`route_review_real_live`) holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReviewRoute {
+    #[default]
+    Strongest,
+    MeasuredLight,
+}
+
+impl ReviewRoute {
+    pub fn parse(v: Option<&str>) -> Self {
+        match v.map(str::trim) {
+            Some("measured_light") => ReviewRoute::MeasuredLight,
+            _ => ReviewRoute::Strongest,
+        }
+    }
+}
 
 /// A heavy route that may run on [`MEASURED_LIGHT_MODEL`]: writing code for
 /// a medium ticket (an edit, not a judgment).
@@ -326,6 +364,7 @@ mod client_tests {
             primary_model: "claude-haiku-4-5".into(),
             heavy_model: heavy.into(),
             heavy_model_chosen: chosen,
+            review_route: ReviewRoute::Strongest,
             meter: common::usage::UsageMeter::memory("t").0,
             scope: Default::default(),
         }
@@ -352,5 +391,37 @@ mod client_tests {
         assert_eq!(chosen.implement_model_id("simple"), "claude-haiku-4-5");
         // The measured model is one this release calls.
         assert!(common::model_ids::is_selectable(MEASURED_LIGHT_MODEL));
+    }
+
+    #[test]
+    fn reviews_stay_on_the_strongest_model_unless_the_team_switches() {
+        // Nothing saved, or anything but the measured route's name: strongest.
+        for saved in [
+            None,
+            Some(""),
+            Some("strongest"),
+            Some("sonnet"),
+            Some("Measured_Light"),
+        ] {
+            assert_eq!(
+                ReviewRoute::parse(saved),
+                ReviewRoute::Strongest,
+                "{saved:?}"
+            );
+        }
+        assert_eq!(
+            ReviewRoute::parse(Some("measured_light")),
+            ReviewRoute::MeasuredLight
+        );
+        let mut p = provider("claude-opus-5-5", false);
+        assert_eq!(p.review_model_id(), "claude-opus-5-5");
+        p.review_route = ReviewRoute::MeasuredLight;
+        // The review is written on the measured model; every judgment step,
+        // the critic's included (it runs on the heavy model), stays.
+        assert_eq!(p.review_model_id(), MEASURED_LIGHT_MODEL);
+        assert_eq!(p.judgment_model_id(), "claude-opus-5-5");
+        assert_eq!(p.heavy_model_id(), "claude-opus-5-5");
+        let src = include_str!("../passes/review_agent.rs");
+        assert!(src.contains("provider::converse_simple(\n        state,\n        provider,\n        provider.heavy_model_id(),"));
     }
 }
