@@ -226,7 +226,11 @@ async fn images(
 }
 
 /// Keeps one image in the install's bucket; its key.
-async fn put(state: &WorkerState, key_of: impl Fn(&str) -> String, bytes: Vec<u8>) -> Option<String> {
+async fn put(
+    state: &WorkerState,
+    key_of: impl Fn(&str) -> String,
+    bytes: Vec<u8>,
+) -> Option<String> {
     let content_type = shots::image_type(&bytes)?;
     let key = key_of(shots::extension(content_type));
     match state
@@ -276,7 +280,11 @@ pub async fn keep(
         return;
     }
     let picked = shots::pick(h.tests, h.changed, h.map);
-    if picked.is_empty() || load(state, &msg.team_id, &repo, &msg.head_sha).await.is_some() {
+    if picked.is_empty()
+        || load(state, &msg.team_id, &repo, &msg.head_sha)
+            .await
+            .is_some()
+    {
         return;
     }
     let location = st
@@ -408,8 +416,14 @@ mod tests {
             ]}]
         });
         let held = Held(vec![
-            ("pw/results.json".into(), serde_json::to_vec(&report).unwrap()),
-            ("pw/test-results/a-shows-it/test-finished-1.png".into(), png.clone()),
+            (
+                "pw/results.json".into(),
+                serde_json::to_vec(&report).unwrap(),
+            ),
+            (
+                "pw/test-results/a-shows-it/test-finished-1.png".into(),
+                png.clone(),
+            ),
         ]);
         let tests = common::e2e::parse::parse_any(
             "results.json",
@@ -418,7 +432,7 @@ mod tests {
         )
         .unwrap();
         let id = tests[0].id();
-        let got = images(&held, 1, 1, &[id.clone()]).await;
+        let got = images(&held, 1, 1, std::slice::from_ref(&id)).await;
         assert_eq!(got.get(&id), Some(&png));
         // A test nobody asked for is not read.
         assert!(images(&held, 1, 1, &["other".into()]).await.is_empty());

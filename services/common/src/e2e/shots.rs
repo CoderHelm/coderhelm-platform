@@ -105,9 +105,9 @@ pub fn shots_in(name: &str, bytes: &[u8]) -> Vec<Shot> {
     } else if lower.ends_with(".json") {
         match serde_json::from_slice::<Value>(bytes) {
             Ok(v) if v.get("suites").is_some() && v.get("config").is_some() => playwright(&v),
-            Ok(v) if v
-                .as_array()
-                .is_some_and(|a| a.iter().any(|f| f.get("elements").is_some())) =>
+            Ok(v)
+                if v.as_array()
+                    .is_some_and(|a| a.iter().any(|f| f.get("elements").is_some())) =>
             {
                 cucumber(&v)
             }
@@ -159,7 +159,7 @@ fn cucumber(report: &Value) -> Vec<Shot> {
                     )
                 })
                 .filter_map(|e| e["data"].as_str().and_then(decoded))
-                .last();
+                .next_back();
             if let Some(bytes) = last {
                 out.push(Shot {
                     test_id: test_id(
@@ -191,7 +191,7 @@ fn pw_image(results: &Value) -> Option<Image> {
             (_, Some(p)) if !p.is_empty() && !p.contains("..") => Some(Image::File(p.to_string())),
             _ => None,
         })
-        .last()
+        .next_back()
 }
 
 fn project_of(test: &Value) -> Option<&str> {
@@ -358,20 +358,73 @@ impl Why {
         match self {
             Why::TestChanged => "this change edits the test".into(),
             Why::Mapped => "the repository's test map ties it to the changed files".into(),
-            Why::Named(w) => format!("its name and a changed UI file share the word \"{w}\""),
+            Why::Named(w) => format!("the test and a changed UI file share the word \"{w}\""),
         }
     }
 }
 
 /// Folder and file names that say nothing about what a file shows.
 const GENERIC: &[&str] = &[
-    "src", "app", "apps", "lib", "libs", "packages", "package", "components", "component",
-    "screens", "screen", "pages", "page", "views", "view", "styles", "style", "index", "main",
-    "common", "shared", "utils", "util", "hooks", "assets", "features", "feature", "layout",
-    "layouts", "containers", "container", "modules", "module", "default", "mobile", "native",
-    "client", "public", "test", "tests", "spec", "specs", "e2e", "ui", "tsx", "jsx", "scss",
-    "css", "vue", "svelte", "html", "styled", "theme", "types", "button", "text", "item",
-    "list", "card", "modal",
+    "src",
+    "app",
+    "apps",
+    "lib",
+    "libs",
+    "packages",
+    "package",
+    "components",
+    "component",
+    "screens",
+    "screen",
+    "pages",
+    "page",
+    "views",
+    "view",
+    "styles",
+    "style",
+    "index",
+    "main",
+    "common",
+    "shared",
+    "utils",
+    "util",
+    "hooks",
+    "assets",
+    "features",
+    "feature",
+    "layout",
+    "layouts",
+    "containers",
+    "container",
+    "modules",
+    "module",
+    "default",
+    "mobile",
+    "native",
+    "client",
+    "public",
+    "test",
+    "tests",
+    "spec",
+    "specs",
+    "e2e",
+    "ui",
+    "tsx",
+    "jsx",
+    "scss",
+    "css",
+    "vue",
+    "svelte",
+    "html",
+    "styled",
+    "theme",
+    "types",
+    "button",
+    "text",
+    "item",
+    "list",
+    "card",
+    "modal",
 ];
 
 /// The words of a path or title: split on anything but letters and digits
@@ -494,10 +547,13 @@ pub fn screens(k: &Kept, link: impl Fn(&str) -> String) -> crate::pr_body::Scree
         &k.base
     };
     let (before, before_alt) = match &k.before {
-        Some(s) => (link(&s.key), format!("{test} on {base}, before this change")),
+        Some(s) => (
+            link(&s.key),
+            format!("{test} on {base}, before this change"),
+        ),
         None => (
             String::new(),
-            format!("No screenshot of this test on {base} yet"),
+            format!("No screenshot of this test from a passing run on {base}"),
         ),
     };
     let runs = [
@@ -516,7 +572,7 @@ pub fn screens(k: &Kept, link: impl Fn(&str) -> String) -> crate::pr_body::Scree
         after: link(&k.after.key),
         after_alt: format!("{test} on this head"),
         caption: format!(
-            "From the end-to-end test `{test}` ({runs}), shown because {}.",
+            "Screenshots of the end-to-end test `{test}`, chosen because {}: {runs}.",
             k.why.trim_end_matches('.')
         ),
     }
@@ -816,7 +872,7 @@ mod tests {
         assert_eq!(after_alt, "Checkout › pays by 'card' on this head");
         assert_eq!(
             caption,
-            "From the end-to-end test `Checkout › pays by 'card'` ([main's run](https://github.com/o/r/actions/runs/1), [this head's run](https://github.com/o/r/actions/runs/2)), shown because its name and a changed UI file share the word \"checkout\"."
+            "Screenshots of the end-to-end test `Checkout › pays by 'card'`, chosen because the test and a changed UI file share the word \"checkout\": [main's run](https://github.com/o/r/actions/runs/1), [this head's run](https://github.com/o/r/actions/runs/2)."
         );
         let none = screens(
             &Kept {
@@ -832,7 +888,10 @@ mod tests {
             panic!("images");
         };
         assert!(before.is_empty());
-        assert_eq!(before_alt, "No screenshot of this test on main yet");
+        assert_eq!(
+            before_alt,
+            "No screenshot of this test from a passing run on main"
+        );
     }
 
     #[test]
