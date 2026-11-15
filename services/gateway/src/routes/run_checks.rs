@@ -9,7 +9,9 @@
 //! read goes through short in-memory caches: the pull request's head for
 //! [`PR_TTL`], the checks on a commit for [`CHECKS_TTL`] (keyed by repository
 //! and commit, see [`cache_key`]), the branch's required checks for
-//! [`REQUIRED_TTL`], and the installation token for [`TOKEN_TTL`]. A read
+//! [`REQUIRED_TTL`], and the installation token for [`TOKEN_TTL`]. Every
+//! cached read is keyed by the installation that made it ([`read_key`]), so
+//! a team only ever sees what its own installation could read. A read
 //! GitHub refused is cached as "nothing" for as long, so a limited install is
 //! not asked again on every poll. Anything that can't be read is `None`: the
 //! run itself is always returned.
@@ -272,6 +274,13 @@ pub fn cache_key(repo: &str, sha: &str) -> String {
     format!("{}@{sha}", repo.to_ascii_lowercase())
 }
 
+/// Pure: the key of a cached GitHub read: the installation whose token made
+/// it, then what was read. Two teams with a repository of the same name
+/// (or one that lost access) never share an entry.
+pub fn read_key(installation_id: u64, what: &str) -> String {
+    format!("{installation_id}|{what}")
+}
+
 /// Pure: the pull request the run's checks are for: its primary one, while
 /// it is open. `None` when the run has none or it has ended.
 pub fn open_pr(prs: &[common::run_prs::RunPr], run_repo: &str) -> Option<(String, u64)> {
@@ -432,8 +441,17 @@ async fn get_ok(state: &AppState, token: &str, path: &str) -> Option<Value> {
     }
 }
 
-async fn pr_head(state: &AppState, token: &str, repo: &str, pr: u64) -> Option<PrHead> {
-    let key = format!("{}#{pr}", repo.to_ascii_lowercase());
+async fn pr_head(
+    state: &AppState,
+    installation_id: u64,
+    token: &str,
+    repo: &str,
+    pr: u64,
+) -> Option<PrHead> {
+    let key = read_key(
+        installation_id,
+        &format!("{}#{pr}", repo.to_ascii_lowercase()),
+    );
     if let Some(h) = PR_HEADS.get(&key, Instant::now()) {
         return h;
     }
@@ -452,8 +470,17 @@ async fn pr_head(state: &AppState, token: &str, repo: &str, pr: u64) -> Option<P
 
 /// Required checks of `base` from the branch's rules and its classic
 /// protection, either of which may be unreadable (then it adds nothing).
-async fn required_checks(state: &AppState, token: &str, repo: &str, base: &str) -> Vec<String> {
-    let key = format!("{}:{base}", repo.to_ascii_lowercase());
+async fn required_checks(
+    state: &AppState,
+    installation_id: u64,
+    token: &str,
+    repo: &str,
+    base: &str,
+) -> Vec<String> {
+    let key = read_key(
+        installation_id,
+        &format!("{}:{base}", repo.to_ascii_lowercase()),
+    );
     if let Some(r) = REQUIRED.get(&key, Instant::now()) {
         return r;
     }
@@ -472,11 +499,12 @@ async fn required_checks(state: &AppState, token: &str, repo: &str, base: &str) 
 
 async fn commit_checks(
     state: &AppState,
+    installation_id: u64,
     token: &str,
     repo: &str,
     sha: &str,
 ) -> Option<Vec<RunCheck>> {
-    let key = cache_key(repo, sha);
+    let key = read_key(installation_id, &cache_key(repo, sha));
     if let Some(c) = CHECKS.get(&key, Instant::now()) {
         return c;
     }
@@ -506,13 +534,13 @@ async fn read_checks(
     pr: u64,
 ) -> Option<RunChecks> {
     let token = token(state, installation_id).await?;
-    let head = pr_head(state, &token, repo, pr).await?;
+    let head = pr_head(state, installation_id, &token, repo, pr).await?;
     if !head.open || !head.sha.chars().all(|c| c.is_ascii_hexdigit()) {
         return None;
     }
     let (items, required) = tokio::join!(
-        commit_checks(state, &token, repo, &head.sha),
-        required_checks(state, &token, repo, &head.base),
+        commit_checks(state, installation_id, &token, repo, &head.sha),
+        required_checks(state, installation_id, &token, repo, &head.base),
     );
     Some(with_required(&head.sha, items?, &required))
 }
@@ -551,7 +579,10 @@ pub async fn for_run(
 }
 
 async fn read_asks(state: &AppState, installation_id: u64, repo: &str, pr: u64) -> Option<u32> {
-    let key = format!("{}#{pr}", repo.to_ascii_lowercase());
+    let key = read_key(
+        installation_id,
+        &format!("{}#{pr}", repo.to_ascii_lowercase()),
+    );
     if let Some(n) = ASKS.get(&key, Instant::now()) {
         return n;
     }
@@ -826,6 +857,16 @@ mod tests {
         let none = with_required("abc", checks_of(&[], &[]), &[]);
         assert!(none.items.is_empty());
         assert_eq!(none.counts, RunCheckCounts::default());
+    }
+
+    #[test]
+    fn a_cached_read_belongs_to_the_installation_that_made_it() {
+        // Team A (installation 7) read acme/web's checks; team B (installation
+        // 8) asks about the same repository name. B must not get A's read.
+        let a = read_key(7, &cache_key("acme/web", "9fceb02"));
+        let b = read_key(8, &cache_key("acme/web", "9fceb02"));
+        assert_ne!(a, b, "team B would be served team A's cached checks");
+        assert_eq!(a, read_key(7, &cache_key("Acme/Web", "9fceb02")));
     }
 
     #[test]

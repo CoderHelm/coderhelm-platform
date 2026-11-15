@@ -918,13 +918,20 @@ pub fn finish(
 pub static CACHE: LazyLock<Mutex<HashMap<String, Composed>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-fn cache_key(place: &Place, to: Option<&Heard>, say: &Say, meta: &Meta) -> String {
+/// The cache key: the thread, the comment, the slot and the draft, plus a
+/// hash of the whole prompt the reply is written from. Thread keys are not
+/// unique across teams (two Jira sites can both have `ABC-1` and the same
+/// comment id), so a reply is only ever reused for the exact thread text,
+/// draft and facts it was written from.
+fn cache_key(place: &Place, to: Option<&Heard>, say: &Say, meta: &Meta, prompt: &str) -> String {
+    use sha2::{Digest, Sha256};
     format!(
-        "{}#{}#{}#{}",
+        "{}#{}#{}#{}#{}",
         place.key(),
         to.map(|h| h.id.as_str()).unwrap_or("-"),
         say.slot,
-        meta.fp
+        meta.fp,
+        hex::encode(Sha256::digest(prompt.as_bytes()))
     )
 }
 
@@ -937,14 +944,12 @@ pub async fn composed(
     place: &Place,
     meta: &Meta,
 ) -> Option<Composed> {
-    let key = cache_key(place, to, say, meta);
+    let asked = prompt(view, to, say, c.facts, place);
+    let key = cache_key(place, to, say, meta, &asked);
     if let Some(hit) = CACHE.lock().ok().and_then(|m| m.get(&key).cloned()) {
         return Some(hit);
     }
-    let v = c
-        .composer
-        .compose(SYSTEM, &prompt(view, to, say, c.facts, place), &schema())
-        .await?;
+    let v = c.composer.compose(SYSTEM, &asked, &schema()).await?;
     let (act, raw) = parse(&v)?;
     let g = Grounds::new(c.facts, &say.body, view, &say.asks);
     let out = match act {
@@ -1168,6 +1173,39 @@ mod tests {
         };
         assert_eq!(without_greeting("Hi dana-reyes, done.", Some(&to)), "Done.");
         assert_eq!(without_greeting("@dana-reyes: done.", Some(&to)), "Done.");
+    }
+
+    /// Two teams on different Jira sites can both have ticket `ABC-1` and a
+    /// comment with the same id. A reply written from team A's thread must
+    /// never be served for team B's.
+    #[test]
+    fn a_cached_reply_never_crosses_threads_with_the_same_ticket_key() {
+        let place = Place::jira("ABC-1");
+        let heard = |text: &str| Heard {
+            id: "10001".into(),
+            author: "pat".into(),
+            text: text.into(),
+            ..Default::default()
+        };
+        let say = Say::reply_all("run", "Working on it.");
+        let meta = Meta {
+            slot: "run".into(),
+            fp: "same".into(),
+            ..Default::default()
+        };
+        let key = |to: &Heard| {
+            let view = View {
+                said: vec![],
+                heard: vec![to.clone()],
+            };
+            let p = prompt(&view, Some(to), &say, &Facts::default(), &place);
+            cache_key(&place, Some(to), &say, &meta, &p)
+        };
+        let a_to = heard("Team A: the invoice totals are off by a cent.");
+        let b_to = heard("Team B: please rename the onboarding banner.");
+        assert_ne!(key(&a_to), key(&b_to), "team B would get team A's reply");
+        // The same thread asks again: the cached reply is reused.
+        assert_eq!(key(&a_to), key(&a_to));
     }
 
     #[test]

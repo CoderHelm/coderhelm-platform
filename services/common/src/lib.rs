@@ -249,6 +249,7 @@ pub mod reviewer_prefs;
 /// examples and evidence-backed lessons, per team.
 pub mod rewards;
 /// The one way a run is marked failed: always with a reason and a pass.
+pub mod run_events;
 pub mod run_fail;
 /// The questions a run asks when it needs a person's answer, and the
 /// answers people give in CoderHelm.
