@@ -4649,7 +4649,10 @@ async fn refresh_ci_sections(cx: &Ctx<'_>, repo: &str, number: u64, ticket: &str
 /// the base branch), "What to check" and Proof (where CI stands on this
 /// head). The rest (the draft status at its top, the run's words) stays.
 /// `None` for a pull request that is not a dependency fix's. Saved by
-/// `description::reconcile`, the only caller.
+/// `description::reconcile`, the only caller. `fresh`: the catch-up after
+/// an upgrade, on a description wholly CoderHelm's: nothing of the old
+/// body is kept but the lines that close an issue ([`fresh_body`]).
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn at_head(
     state: &WorkerState,
     gh: &GitHubClient,
@@ -4658,6 +4661,7 @@ pub(crate) async fn at_head(
     number: u64,
     ticket: &str,
     pr: &Value,
+    fresh_only: bool,
 ) -> Option<(String, common::pr_facts::DependencyFacts)> {
     let unit = load_unit(state, team_id, ticket).await?;
     if unit.ecosystem == common::infra_vuln::records::UNIT_ECOSYSTEM {
@@ -4701,7 +4705,27 @@ pub(crate) async fn at_head(
     // The same lockfile read, as facts: what the lead and the fact check of
     // the description are written from.
     let facts = common::pr_dependency::facts(&unit, &pairs, &head, &check);
+    if fresh_only {
+        return Some((fresh_body(&fresh, body), facts));
+    }
     Some((rebuilt_body(body, &fresh), facts))
+}
+
+/// A security pull request's description built again from its head alone
+/// (the catch-up after an upgrade, `description::catch_up_run`): the
+/// sections computed now, and of the old body only the lines that close an
+/// issue (`description::fresh_base`). No earlier writer's line (a frozen
+/// check row, a reviewer block, a lead without markers) is carried over.
+pub(crate) fn fresh_body(fresh: &str, old: &str) -> String {
+    let closing = crate::passes::description::fresh_base(old);
+    let closing: Vec<&str> = closing
+        .lines()
+        .filter(|l| !fresh.contains(l.trim()))
+        .collect();
+    if closing.is_empty() {
+        return fresh.to_string();
+    }
+    format!("{}\n\n{}", fresh.trim_end(), closing.join("\n"))
 }
 
 /// `body` with the sections computed from the head taken from `fresh`.
