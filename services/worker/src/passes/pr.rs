@@ -2275,7 +2275,7 @@ pub(crate) async fn fetch_pr_template(
 ) -> Option<String> {
     // Keyed by the installation that read it, so one team never reuses
     // another team's read (bm_teams_never_cross).
-    let key = format!("{}:{owner}/{repo}@{base_branch}", github.installation_id).to_lowercase();
+    let key = format!("{}:{owner}/{repo}@{base_branch}", github.installation_id()).to_lowercase();
     if let Ok(c) = template_cache().lock() {
         if let Some((at, t)) = c.get(&key) {
             if at.elapsed() < TEMPLATE_TTL {
