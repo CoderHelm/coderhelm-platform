@@ -352,7 +352,7 @@ pub async fn run(
     // The failing checks (names, and the log the fix reads).
     let (failing_checks, ci_logs) = if msg.review_id == 0 && !resume_owns_ci {
         let branch = get_pr_branch(state, &msg).await.unwrap_or_default();
-        fetch_ci_failures(&github, &msg, &branch)
+        fetch_ci_failures(state, &github, &msg, &branch)
             .await
             .unwrap_or_default()
     } else {
@@ -3812,8 +3812,11 @@ pub(crate) fn failed_check_lines(failed: &[&serde_json::Value]) -> String {
 }
 
 /// Check CI status for a PR branch. Returns the failing checks' names and
-/// their logs if there are failures, None if CI is green or absent.
+/// their logs if there are failures, None if CI is green or absent. The
+/// deploy label's failed runs whose jobs ran are among them, with their own
+/// logs, even when the check listing hides them ([`with_deploy_failures`]).
 async fn fetch_ci_failures(
+    state: &WorkerState,
     github: &GitHubClient,
     msg: &FeedbackMessage,
     branch: &str,
@@ -3821,6 +3824,83 @@ async fn fetch_ci_failures(
     if branch.is_empty() {
         return None;
     }
+    let (found, listed) = match check_failures(github, msg, branch).await {
+        Some((names, logs, ids)) => (Some((names, logs)), ids),
+        None => (None, Vec::new()),
+    };
+    let Ok(head) = github
+        .get_ref(&msg.repo_owner, &msg.repo_name, branch)
+        .await
+    else {
+        return found;
+    };
+    let runs = super::deploy_label::fixable_failures(
+        state,
+        github,
+        &msg.team_id,
+        (msg.repo_owner.as_str(), msg.repo_name.as_str()),
+        &head,
+        branch,
+    )
+    .await;
+    let mut deploy = Vec::new();
+    for r in runs.into_iter().filter(|r| !listed.contains(&r.id)) {
+        let log = match r.id {
+            0 => String::new(),
+            id => github
+                .get_workflow_run_logs(&msg.repo_owner, &msg.repo_name, id)
+                .await
+                .unwrap_or_default(),
+        };
+        deploy.push((r, log));
+    }
+    with_deploy_failures(found, &deploy)
+}
+
+/// The CI fix loop's input with the deploy label's failed runs added, each
+/// as a failing check with its link and log, so the fixer reads a failure a
+/// later skipped run of the same workflow hides from the check listing.
+fn with_deploy_failures(
+    found: Option<(Vec<String>, String)>,
+    deploy: &[(common::deploy_label::DeployRun, String)],
+) -> Option<(Vec<String>, String)> {
+    if deploy.is_empty() {
+        return found;
+    }
+    let (mut names, mut logs) = found.unwrap_or_default();
+    for (r, log) in deploy {
+        if !names.contains(&r.workflow) {
+            names.push(r.workflow.clone());
+        }
+        let link = if r.url.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", r.url)
+        };
+        if !logs.is_empty() {
+            logs.push_str("\n\n");
+        }
+        logs.push_str(&format!(
+            "The deploy label's workflow `{}` {} on this head{link}:\n{}",
+            r.workflow,
+            r.result(),
+            if log.is_empty() {
+                "(its log couldn't be read)"
+            } else {
+                log.as_str()
+            }
+        ));
+    }
+    Some((names, logs))
+}
+
+/// The failing check runs on a PR branch: their names, their logs, and the
+/// Actions runs they belong to. None when none fails.
+async fn check_failures(
+    github: &GitHubClient,
+    msg: &FeedbackMessage,
+    branch: &str,
+) -> Option<(Vec<String>, String, Vec<u64>)> {
 
     let checks = github
         .list_ci_for_ref(&msg.repo_owner, &msg.repo_name, branch)
@@ -3845,19 +3925,20 @@ async fn fetch_ci_failures(
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .collect();
+    let ids: Vec<u64> = failed
+        .iter()
+        .filter_map(|r| common::commit_ci::actions_run_id(r))
+        .collect();
 
     // Try to get workflow run logs for the first failed check
-    let workflow_run_id = failed
-        .iter()
-        .find_map(|r| common::commit_ci::actions_run_id(r))
-        .unwrap_or(0);
+    let workflow_run_id = ids.first().copied().unwrap_or(0);
 
     if workflow_run_id > 0 {
         if let Ok(logs) = github
             .get_workflow_run_logs(&msg.repo_owner, &msg.repo_name, workflow_run_id)
             .await
         {
-            return Some((names, logs));
+            return Some((names, logs, ids));
         }
     }
 
@@ -3867,14 +3948,14 @@ async fn fetch_ci_failures(
         .await
     {
         if !annotations.is_empty() {
-            return Some((names, annotations));
+            return Some((names, annotations, ids));
         }
     }
 
     // Last resort: the failed checks' names, and for a commit status (CI
     // outside GitHub Actions) what it said and where its log is.
     let lines = failed_check_lines(&failed);
-    Some((names, lines))
+    Some((names, lines, ids))
 }
 
 /// Make sure the run's PR is open before feedback work starts, reattaching or
@@ -4684,5 +4765,58 @@ mod graph_tests {
             assert!(tools.iter().any(|t| t.name == name), "{name}");
         }
         assert!(system.contains("graph_callers"));
+    }
+}
+
+#[cfg(test)]
+mod deploy_failure_tests {
+    use super::with_deploy_failures;
+    use common::deploy_label::{latest_per_workflow, DeployRun};
+    use serde_json::json;
+
+    fn hidden_failure() -> Vec<DeployRun> {
+        // The deploy job failed; the review label's run of the same
+        // `labeled` workflow skipped it a second later.
+        let run = |conclusion: &str, created: &str| {
+            json!({"id": 41, "name": "Deploy preview", "path": ".github/workflows/deploy.yml",
+                   "event": "pull_request", "status": "completed", "conclusion": conclusion,
+                   "html_url": "https://github.com/o/r/actions/runs/41", "created_at": created})
+        };
+        latest_per_workflow(
+            &[
+                run("failure", "2026-11-14T10:05:00Z"),
+                run("skipped", "2026-11-14T10:05:01Z"),
+            ],
+            &[".github/workflows/deploy.yml".to_string()],
+        )
+        .into_iter()
+        .filter(DeployRun::fixable)
+        .collect()
+    }
+
+    #[test]
+    fn a_deploy_failure_the_check_listing_hides_reaches_the_fixer() {
+        let deploy: Vec<(DeployRun, String)> = hidden_failure()
+            .into_iter()
+            .map(|r| (r, "Error: detox build failed".to_string()))
+            .collect();
+        // The listing showed nothing failing.
+        let (names, logs) = with_deploy_failures(None, &deploy).expect("a failure to fix");
+        assert_eq!(names, vec!["Deploy preview".to_string()]);
+        assert_eq!(
+            logs,
+            "The deploy label's workflow `Deploy preview` failed on this head \
+             (https://github.com/o/r/actions/runs/41):\nError: detox build failed"
+        );
+        // Beside a failing check the listing showed: both, the check first.
+        let (names, logs) = with_deploy_failures(
+            Some((vec!["unit tests".into()], "assert failed".into())),
+            &deploy,
+        )
+        .unwrap();
+        assert_eq!(names, vec!["unit tests".to_string(), "Deploy preview".to_string()]);
+        assert!(logs.starts_with("assert failed\n\nThe deploy label's workflow"));
+        // No deploy failure: the listing's answer stands.
+        assert_eq!(with_deploy_failures(None, &[]), None);
     }
 }

@@ -92,6 +92,23 @@ pub async fn runs_on_head(
     (found, complete)
 }
 
+/// The deploy label's failed runs on `head` whose jobs ran: failing CI the
+/// fix loop takes, even when a later skipped run of the same `labeled`
+/// workflow (started by another label) hides its failing jobs from the
+/// latest check of each name. Empty when anything can't be read.
+pub async fn fixable_failures(
+    state: &WorkerState,
+    gh: &GitHubClient,
+    team_id: &str,
+    (owner, repo): (&str, &str),
+    head: &str,
+    head_ref: &str,
+) -> Vec<DeployRun> {
+    let want = labels(state, team_id, owner, repo).await;
+    let (runs, _) = runs_on_head(state, gh, team_id, (owner, repo), head, head_ref, &want).await;
+    runs.into_iter().filter(DeployRun::fixable).collect()
+}
+
 /// Splits deploy labels to put back by who took them off last: those a
 /// workflow (`github-actions[bot]`) or CoderHelm's own app took off, and
 /// those a person, another app, or someone CoderHelm can't identify took off.

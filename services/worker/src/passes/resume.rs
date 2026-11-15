@@ -703,6 +703,17 @@ mod stale_ci_event_tests {
     }
 }
 
+/// The head's CI verdict with the deploy label's failed runs whose jobs ran
+/// (`deploy_failing`) counted: a later skipped run of the same `labeled`
+/// workflow hides their failing jobs from the check listing, which then
+/// reads green.
+fn with_deploy_failures(verdict: CiVerdict, deploy_failing: &[String]) -> CiVerdict {
+    match verdict {
+        CiVerdict::Green | CiVerdict::NoChecks if !deploy_failing.is_empty() => CiVerdict::Failed,
+        v => v,
+    }
+}
+
 /// Names of the checks that concluded failure or timed_out.
 fn failing_check_names(checks: &Value) -> std::collections::BTreeSet<String> {
     checks["check_runs"]
@@ -1195,6 +1206,49 @@ mod ci_triage_tests {
         assert_eq!(
             failing_check_names(&checks),
             set(&["Deploy Preview", "Test Suite"])
+        );
+    }
+
+    #[test]
+    fn a_deploy_failure_hidden_behind_a_later_skipped_run_is_fixed() {
+        // A `labeled` workflow's deploy job failed; the review label's run of
+        // the same workflow skipped the job a second later, and the listing
+        // keeps only that latest check.
+        let listing = json!({"total_count": 2, "check_runs": [
+            {"name": "unit tests", "status": "completed", "conclusion": "success"},
+            {"name": "deploy", "status": "completed", "conclusion": "skipped"},
+        ]});
+        assert_eq!(ci_verdict_from_checks(&listing), CiVerdict::Green);
+        let run = |conclusion: &str, created: &str| {
+            json!({"name": "Deploy preview", "path": ".github/workflows/deploy.yml",
+                   "event": "pull_request", "status": "completed", "conclusion": conclusion,
+                   "created_at": created})
+        };
+        let failing: Vec<String> = common::deploy_label::latest_per_workflow(
+            &[
+                run("failure", "2026-11-14T10:05:00Z"),
+                run("skipped", "2026-11-14T10:05:01Z"),
+            ],
+            &[".github/workflows/deploy.yml".to_string()],
+        )
+        .into_iter()
+        .filter(common::deploy_label::DeployRun::fixable)
+        .map(|r| r.workflow)
+        .collect();
+        assert_eq!(failing, vec!["Deploy preview".to_string()]);
+        assert_eq!(
+            with_deploy_failures(ci_verdict_from_checks(&listing), &failing),
+            CiVerdict::Failed
+        );
+        // Nothing failed on the deploy workflow: the verdict stands.
+        assert_eq!(
+            with_deploy_failures(ci_verdict_from_checks(&listing), &[]),
+            CiVerdict::Green
+        );
+        // Still running: still waited for.
+        assert_eq!(
+            with_deploy_failures(CiVerdict::Pending, &failing),
+            CiVerdict::Pending
         );
     }
 
@@ -1938,6 +1992,7 @@ pub async fn run(
     //    and a check that passed earlier on this PR is re-run once first.
     let mut on_base: Vec<String> = Vec::new();
     let mut red_on_base_only = false;
+    let mut deploy_failing: Vec<String> = Vec::new();
     if has_ci_fail && !repo_owner.is_empty() && !repo_name.is_empty() {
         if let Ok(gh) = GitHubClient::new(
             &state.secrets.github_app_id,
@@ -1946,8 +2001,28 @@ pub async fn run(
             &state.http,
         ) {
             let git_ref = branch_head.as_deref().unwrap_or(&branch).to_string();
-            match gh.list_ci_for_ref(&repo_owner, &repo_name, &git_ref).await {
-                Ok(checks) => match ci_verdict_from_checks(&checks) {
+            let listed = gh.list_ci_for_ref(&repo_owner, &repo_name, &git_ref).await;
+            if let Ok(checks) = &listed {
+                if ci_verdict_from_checks(checks) != CiVerdict::Pending {
+                    deploy_failing = super::deploy_label::fixable_failures(
+                        state,
+                        &gh,
+                        &msg.team_id,
+                        (repo_owner.as_str(), repo_name.as_str()),
+                        &git_ref,
+                        &branch,
+                    )
+                    .await
+                    .into_iter()
+                    .map(|r| r.workflow)
+                    .collect();
+                }
+            }
+            match listed {
+                Ok(checks) => match with_deploy_failures(
+                    ci_verdict_from_checks(&checks),
+                    &deploy_failing,
+                ) {
                     CiVerdict::Pending if !waited_long_for_full_ci(&events, chrono::Utc::now()) => {
                         info!(
                             run_id = msg.run_id,
@@ -1968,7 +2043,8 @@ pub async fn run(
                     }
                     CiVerdict::NoChecks => {}
                     CiVerdict::Failed => {
-                        let head_failing = failing_check_names(&checks);
+                        let mut head_failing = failing_check_names(&checks);
+                        head_failing.extend(deploy_failing.iter().cloned());
                         let base_failing = match gh
                             .list_ci_for_ref(&repo_owner, &repo_name, &base_branch)
                             .await
