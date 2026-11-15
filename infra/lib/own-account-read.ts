@@ -64,6 +64,8 @@ const OWN_CONDITIONS: Record<string, boolean> = {
   ReadsImportBuckets: false,
   SyncsKnowledgeBases: false,
   SyncsEveryKnowledgeBase: false,
+  // The install's own role only reads: it never applies database maintenance.
+  AppliesMaintenance: false,
 };
 
 /**

@@ -197,7 +197,9 @@ test("self-host: the gateway and worker read the install's own account with this
   };
   // Inspector and Health are switches (off by default) like infrastructure
   // vulnerabilities (on by default): their statements are there, each behind its condition.
-  const abilities = ["imports", "sync"].reduce(without, all);
+  // Applying approved database maintenance is a write a team grants its own
+  // CoderHelmLogReader role; the install's own role only reads.
+  const abilities = ["imports", "sync", "maintenance"].reduce(without, all);
   const needed = [...new Set([...abilities.matchAll(/"([a-z0-9-]+:[A-Za-z]+)"/g)].map((m) => m[1]))];
   assert.ok(needed.length > 20, `${needed.length} actions`);
   for (const [stack, fn] of [
