@@ -69,6 +69,9 @@ pub mod caller {
     pub const SECURITY_EVENT: &str = "security_event";
     /// The plan and brain chats' tools.
     pub const CHAT: &str = "chat";
+    /// AI tools connected to CoderHelm's MCP server (`/mcp`): someone is
+    /// waiting on the answer, so it is foreground like Chat.
+    pub const MCP: &str = "mcp";
     /// The description of a pull request rebuilt after CoderHelm's push.
     pub const DESCRIPTION: &str = "description";
     /// Anything not labelled (a spawned task).
@@ -357,6 +360,8 @@ mod tests {
             caller::REVIEW,
             caller::READY,
             caller::DESCRIPTION,
+            caller::CHAT,
+            caller::MCP,
             caller::OTHER,
             "a label nobody listed",
         ] {

@@ -47,8 +47,30 @@ pub const WRITE_SCOPE: &str = "runs:write";
 /// Searching the team's knowledge bases the person (or a knowledge key)
 /// can read, exactly as Chat does (`knowledge_search`, `knowledge_list`).
 pub const KNOWLEDGE_SCOPE: &str = "knowledge:read";
+/// Reading the team's code and docs: code search, files, the code graph and
+/// history (the Code and docs base).
+pub const CODE_SCOPE: &str = "code:read";
+/// Reading the team's work: tickets, pull requests, runs, reviews and plans
+/// (the Work base).
+pub const WORK_SCOPE: &str = "work:read";
+/// Reading security and infrastructure findings, quarantined tests, alerts
+/// and log findings (the Security base, and Infrastructure and Logs and
+/// operations until they have scopes of their own).
+pub const SECURITY_SCOPE: &str = "security:read";
 /// Every scope, in the order they are shown.
-pub const SCOPES: &[&str] = &[READ_SCOPE, WRITE_SCOPE, KNOWLEDGE_SCOPE];
+pub const SCOPES: &[&str] = &[
+    READ_SCOPE,
+    WRITE_SCOPE,
+    KNOWLEDGE_SCOPE,
+    CODE_SCOPE,
+    WORK_SCOPE,
+    SECURITY_SCOPE,
+];
+/// The scopes of the team lookups (`mcp_lookups`), which only read.
+pub const LOOKUP_SCOPES: &[&str] = &[CODE_SCOPE, WORK_SCOPE, SECURITY_SCOPE];
+/// The lookup scopes granted when the consent page doesn't say otherwise:
+/// code and work. Security findings only when asked for and allowed.
+pub const DEFAULT_LOOKUP_SCOPES: &[&str] = &[CODE_SCOPE, WORK_SCOPE];
 
 /// What a scope lets an app do, as the consent page says it.
 pub fn scope_label(scope: &str) -> &'static str {
@@ -56,6 +78,11 @@ pub fn scope_label(scope: &str) -> &'static str {
         READ_SCOPE => "See your team's runs and reviews",
         WRITE_SCOPE => "Start and retry runs, and ask for reviews",
         KNOWLEDGE_SCOPE => "Search the knowledge bases you can read in Chat",
+        CODE_SCOPE => "Read and search your team's code, as Chat does",
+        WORK_SCOPE => "Find tickets, pull requests, runs, reviews and plans you can see",
+        SECURITY_SCOPE => {
+            "Read security and infrastructure findings, alerts and log findings you can see"
+        }
         _ => "",
     }
 }
@@ -617,6 +644,8 @@ pub struct Consent {
     pub allow_write: bool,
     /// The person let the app search the knowledge bases they can read.
     pub allow_knowledge: bool,
+    /// The team lookups the person let the app use ([`LOOKUP_SCOPES`]).
+    pub lookups: BTreeSet<&'static str>,
 }
 
 /// A code waiting to be swapped, with everything the swap checks.
@@ -661,8 +690,13 @@ fn hash_matches(token: &str, stored: &str) -> bool {
 }
 
 /// The scopes a person granted: reading always, writing and searching
-/// knowledge when they allowed each.
-pub fn granted_scopes(allow_write: bool, allow_knowledge: bool) -> Vec<String> {
+/// knowledge when they allowed each, and the team lookups they allowed
+/// (only [`LOOKUP_SCOPES`] count).
+pub fn granted_scopes(
+    allow_write: bool,
+    allow_knowledge: bool,
+    lookups: &BTreeSet<&'static str>,
+) -> Vec<String> {
     let mut s = vec![READ_SCOPE.to_string()];
     if allow_write {
         s.push(WRITE_SCOPE.to_string());
@@ -670,7 +704,46 @@ pub fn granted_scopes(allow_write: bool, allow_knowledge: bool) -> Vec<String> {
     if allow_knowledge {
         s.push(KNOWLEDGE_SCOPE.to_string());
     }
+    for l in LOOKUP_SCOPES {
+        if lookups.contains(l) {
+            s.push(l.to_string());
+        }
+    }
     s
+}
+
+/// The lookup scopes a consent grants. `allowed`: what the consent page
+/// ticked, when it sends that. Otherwise the defaults (code and work) and
+/// security findings only when the app asked for them, which is what the
+/// page lists ([`listed_scopes`]).
+pub fn lookup_grant(allowed: Option<&[String]>, requested: &[String]) -> BTreeSet<&'static str> {
+    match allowed {
+        Some(a) => LOOKUP_SCOPES
+            .iter()
+            .copied()
+            .filter(|s| a.iter().any(|x| x == s))
+            .collect(),
+        None => LOOKUP_SCOPES
+            .iter()
+            .copied()
+            .filter(|s| DEFAULT_LOOKUP_SCOPES.contains(s) || requested.iter().any(|r| r == s))
+            .collect(),
+    }
+}
+
+/// The scopes the consent page lists for a request: every scope but an
+/// optional lookup scope the app didn't ask for (security findings), so a
+/// page that shows each listed reading scope as granted is right.
+pub fn listed_scopes(requested: &[String]) -> Vec<&'static str> {
+    SCOPES
+        .iter()
+        .copied()
+        .filter(|s| {
+            !LOOKUP_SCOPES.contains(s)
+                || DEFAULT_LOOKUP_SCOPES.contains(s)
+                || requested.iter().any(|r| r == s)
+        })
+        .collect()
 }
 
 /// The person said yes: a one-time code for the client, and what the swap
@@ -688,7 +761,7 @@ pub fn approve(
         client_name: client.client_name.clone(),
         redirect_uri: req.redirect_uri.clone(),
         code_challenge: req.code_challenge.clone(),
-        scopes: granted_scopes(who.allow_write, who.allow_knowledge),
+        scopes: granted_scopes(who.allow_write, who.allow_knowledge, &who.lookups),
         resource: req.resource.clone(),
         team_id: who.team_id.clone(),
         user_id: who.user_id.clone(),
@@ -1661,6 +1734,7 @@ pub(crate) mod tests {
             via: Some("password".into()),
             allow_write: write,
             allow_knowledge: false,
+            lookups: BTreeSet::new(),
         }
     }
 
@@ -1892,10 +1966,15 @@ pub(crate) mod tests {
             scope_string([WRITE_SCOPE, READ_SCOPE]),
             "runs:read runs:write"
         );
-        assert_eq!(granted_scopes(false, false), vec!["runs:read"]);
+        let none = BTreeSet::new();
+        assert_eq!(granted_scopes(false, false, &none), vec!["runs:read"]);
         assert_eq!(
-            granted_scopes(false, true),
+            granted_scopes(false, true, &none),
             vec!["runs:read", "knowledge:read"]
+        );
+        assert_eq!(
+            granted_scopes(false, false, &BTreeSet::from([CODE_SCOPE, "runs:write"])),
+            vec!["runs:read", "code:read"]
         );
     }
 

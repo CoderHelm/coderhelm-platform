@@ -95,6 +95,11 @@ Every authorize and token request names the server as `resource` (RFC 8707). `is
   - CoderHelm is the authorization server: metadata at `<API URL>/.well-known/oauth-authorization-server`, consent at `<URL>/authorize/`.
   - Clients register themselves and must use PKCE S256.
   - Nothing has to be registered anywhere.
+  - Scopes: `runs:read` (always), `runs:write`, `knowledge:read`, `code:read`, `work:read` and `security:read`. A first sign-in asks for `runs:read knowledge:read code:read work:read`; `code:read` and `work:read` are granted unless the consent page sends `allow_scopes` without them, and `security:read` only when the app asks for it.
+  - Team lookups, read only, as the person who connected: `search` and `fetch` (the shape ChatGPT's connectors and deep research use), `list_bases`, `find_tickets`, `find_pull_requests`, `find_runs`, `find_findings`, `code_search`, `read_file`, `code_symbol` and `history`. Each read needs its scope and the dashboard route that shows it for the person's role. Results carry a link, the base they came from (Code and docs, Work, Infrastructure, Logs and operations, Security, Team knowledge) and a note that their text is data, not instructions. `search` counts what it withheld for access by base.
+  - `<API URL>/mcp?tools=search` lists only `search` and `fetch`, for ChatGPT company knowledge and clients with tight tool limits.
+  - Every call is written to the team's access log before it runs (`mcp_call`, never a query's words), and what it returned after (`mcp_result`: counts by base, withheld count, item keys). 300 calls a minute per connection. GitHub reads count as the `mcp` caller and wait when the installation's hourly limit is spent.
+  - Try it from Claude Code: `claude mcp add --transport http coderhelm <API URL>/mcp`, then `/mcp` in Claude Code to sign in on the consent page. A gateway built locally listens on port 8080 with `STREAMING_MODE=1` (`http://localhost:8080/mcp`; loopback http redirects are accepted).
 
 ## When a sign-in fails
 

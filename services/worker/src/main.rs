@@ -132,14 +132,21 @@ async fn handle_event(
         Box::pin(health(Arc::clone(&state), context)).await
     } else if let Some(req) = payload.get("plan_chat") {
         let req: passes::plan_chat::Request = serde_json::from_value(req.clone())?;
-        // The brain chat uses the same tools; its calls count as the brain's.
-        let feature = if req.feature == "brain" {
+        // The brain chat and AI tools on `/mcp` use the same tools; their
+        // calls count as the brain's, and GitHub reads for `/mcp` are
+        // counted under its own caller.
+        let feature = if req.feature == "brain" || req.feature == "mcp" {
             common::usage::feature::BRAIN
         } else {
             common::usage::feature::CHAT
         };
+        let caller = if req.feature == "mcp" {
+            common::github_budget::caller::MCP
+        } else {
+            common::github_budget::caller::CHAT
+        };
         let call = clients::github_budget::scoped(
-            common::github_budget::caller::CHAT,
+            caller,
             Box::pin(passes::plan_chat::handle(&state, req)),
         );
         Ok(common::usage::with_feature(feature, call).await)

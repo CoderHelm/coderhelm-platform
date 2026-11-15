@@ -402,7 +402,7 @@ pub async fn describe_request(
     own_session(&claims)?;
     let (req, client) = pending(&state, &body.request).await?;
     let holder = claims.holder();
-    let scopes: Vec<Value> = SCOPES
+    let scopes: Vec<Value> = oauth::listed_scopes(&req.scopes)
         .iter()
         .map(|s| {
             json!({
@@ -426,6 +426,14 @@ pub async fn describe_request(
         // letting someone grant what they can't use.
         "can_act": holder.holds("runs") || holder.holds("plans") || holder.holds("reviews"),
         "mcp_url": oauth::resource(),
+        // The team lookups the page may offer as choices (`allow_scopes`),
+        // ticked by default when `default` is true.
+        "lookup_scopes": oauth::LOOKUP_SCOPES.iter().map(|s| json!({
+            "key": s,
+            "label": oauth::scope_label(s),
+            "requested": req.scopes.iter().any(|r| r == s),
+            "default": oauth::DEFAULT_LOOKUP_SCOPES.contains(s),
+        })).collect::<Vec<_>>(),
     })))
 }
 
@@ -438,6 +446,11 @@ pub struct DecisionBody {
     /// Searching the knowledge bases the person can read (`knowledge:read`).
     #[serde(default)]
     allow_knowledge: bool,
+    /// The team lookups the person ticked (`code:read`, `work:read`,
+    /// `security:read`). Left out, the listed ones are granted
+    /// (`mcp_oauth::lookup_grant`).
+    #[serde(default)]
+    allow_scopes: Option<Vec<String>>,
 }
 
 /// POST /api/mcp/authorize — the person's answer. Gives back where to send
@@ -468,6 +481,7 @@ pub async fn decide_request(
             via: proof.via.clone(),
             allow_write: body.allow_write,
             allow_knowledge: body.allow_knowledge,
+            lookups: oauth::lookup_grant(body.allow_scopes.as_deref(), &req.scopes),
         };
         let (code, stored) = oauth::approve(&req, &client, &who, chrono::Utc::now());
         // Written before the code goes out: no connection without a record.
@@ -629,7 +643,14 @@ mod tests {
         assert_eq!(r["authorization_servers"][0], "https://ch.example.org");
         assert_eq!(
             r["scopes_supported"],
-            json!(["runs:read", "runs:write", "knowledge:read"])
+            json!([
+                "runs:read",
+                "runs:write",
+                "knowledge:read",
+                "code:read",
+                "work:read",
+                "security:read"
+            ])
         );
         let s = server_metadata("https://ch.example.org");
         assert_eq!(s["issuer"], "https://ch.example.org");
