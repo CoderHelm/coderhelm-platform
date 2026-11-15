@@ -523,15 +523,41 @@ async fn reply(state: &AppState, inc: &Incoming<'_>) {
     // acknowledged by name and quote, and a second one before CoderHelm
     // spoke again is named in the same reply.
     let say = common::conversation::Say::status("comment-received", tc::ack_reply());
-    if let Err(e) = super::conversation::jira_at(
+    // What the run is doing now: the reply says how the comment is taken
+    // up (an instruction acknowledged with when it is applied).
+    let mut facts = common::reply_compose::Facts::default()
+        .ticket(
+            format!("{} {}", inc.ticket_id, inc.title)
+                .trim()
+                .to_string(),
+            "",
+        )
+        .state(format!(
+            "a run is {} on this ticket; it reads this comment at its next step and acts on it",
+            match inc.run_status {
+                "awaiting_ci" => "waiting for checks",
+                "queued" => "queued",
+                _ => "working",
+            }
+        ));
+    if inc.pr_number > 0 && !inc.repo_owner.is_empty() {
+        facts = facts.github_pr(
+            &format!("{}/{}", inc.repo_owner, inc.repo_name),
+            inc.pr_number,
+            "",
+            "open",
+        );
+    }
+    if let Err(e) = Box::pin(super::conversation::reply_jira_at(
         state,
         inc.team_id,
         url,
         inc.ticket_id,
         say,
+        &facts,
         "info",
         "Comment received",
-    )
+    ))
     .await
     {
         warn!(ticket_id = inc.ticket_id, error = %e, "Jira acknowledgement failed");

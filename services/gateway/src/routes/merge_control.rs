@@ -388,9 +388,23 @@ pub(crate) async fn on_comment(
     let reply = |text: String| {
         let token = token.clone();
         async move {
+            // The person gate's outcome is the record the reply names.
+            let facts = common::reply_compose::Facts::default()
+                .github_pr(&format!("{owner}/{name}"), pr_number, "", "open")
+                .gate(format!(
+                    "{commenter} asked to {} auto-merge: {}",
+                    if control == Control::Stop {
+                        "stop"
+                    } else {
+                        "resume"
+                    },
+                    common::conversation::cut_words(&text, 300)
+                ));
             let say = common::conversation::Say::reply_all("merge-control", text);
-            if let Err(e) =
-                super::conversation::github(state, &token, owner, name, pr_number, say).await
+            if let Err(e) = Box::pin(super::conversation::reply_github(
+                state, team_id, &token, owner, name, pr_number, say, &facts,
+            ))
+            .await
             {
                 warn!(owner, name, pr_number, error = %e, "merge control: reply failed");
             }

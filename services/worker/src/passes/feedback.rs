@@ -9,6 +9,7 @@ use crate::clients::github::GitHubClient;
 use crate::models::{FeedbackMessage, ReviewComment, TicketSource, TokenUsage, WorkerMessage};
 use crate::passes::plan;
 use crate::WorkerState;
+use common::reply_compose::Facts;
 
 pub async fn run(
     state: &WorkerState,
@@ -157,6 +158,10 @@ pub async fn run(
     // The run's ticket and what its requester said not to do in earlier
     // rounds: a stored "one push" skips the extra update push below.
     let ticket_info = super::review_fix::Ticket::load(state, &msg.team_id, &msg.run_id).await;
+    // Replies to people are written from the thread and this round's
+    // records (`common::reply_compose`), on the team's light model.
+    let reply_team = msg.team_id.clone();
+    let replier = super::conversation::Replier::with_provider(state, &reply_team, &provider);
 
     // Work an earlier round left held or unfinished on this pull request
     // comes first (common::held_work): this round continues on its WIP
@@ -558,7 +563,10 @@ pub async fn run(
         let line = w.pickup_line();
         if constraints.may_comment() && !msg.trigger_author.trim().is_empty() {
             super::add_progress_note(state, &msg.team_id, &msg.run_id, &line).await;
-            if let Err(e) = crate::passes::conversation::github(
+            let facts = reply_facts(&msg, &ticket_info)
+                .state("picking up the changes an earlier round left held on this pull request");
+            if let Err(e) = Box::pin(crate::passes::conversation::reply_github(
+                &replier,
                 &github,
                 &msg.repo_owner,
                 &msg.repo_name,
@@ -567,7 +575,8 @@ pub async fn run(
                     "feedback",
                     addressed(&msg.trigger_author, &line),
                 ),
-            )
+                &facts,
+            ))
             .await
             {
                 warn!(run_id = %msg.run_id, error = %e, "Could not say the held work is being picked up");
@@ -755,6 +764,8 @@ Rules:
     let pr_files = github
         .compare_changed_files(&msg.repo_owner, &msg.repo_name, &base, &branch)
         .await;
+    // The files the replies may name.
+    let changed_files: Vec<String> = pr_files.as_ref().cloned().unwrap_or_default();
     let scope_guard = if ci_only {
         match &pr_files {
             Ok(files) => {
@@ -1583,6 +1594,34 @@ Rules:
             .unwrap_or_default()
     );
 
+    // What this round has on record: the replies name only these.
+    let round = {
+        let repo = format!("{}/{}", msg.repo_owner, msg.repo_name);
+        let mut f = reply_facts(&msg, &ticket_info).state(if fix_pushed {
+            "this round's change is pushed to the pull request"
+        } else {
+            "this round pushed no change"
+        });
+        if let Some(sha) = head_sha.as_deref() {
+            f = f.github_commit(&repo, sha, "this round's change");
+        }
+        for file in changed_files.iter().take(40) {
+            f = f.file(file);
+        }
+        for line in evidence_lines
+            .iter()
+            .filter(|l| l.starts_with("Full test suite "))
+        {
+            let outcome = if line.starts_with("Full test suite passed") {
+                "passed"
+            } else {
+                "failed"
+            };
+            f = f.check("Full test suite", outcome);
+        }
+        f
+    };
+
     // Only match against actionable (non-context) comments for reply posting
     let actionable_comments: Vec<&ReviewComment> = comments
         .iter()
@@ -1596,7 +1635,8 @@ Rules:
         }
         Some(line) => {
             // Inline threads carry the rest: the update gets its own reply.
-            crate::passes::conversation::github(
+            Box::pin(crate::passes::conversation::reply_github(
+                &replier,
                 &github,
                 &msg.repo_owner,
                 &msg.repo_name,
@@ -1605,7 +1645,8 @@ Rules:
                     "feedback",
                     addressed(&msg.trigger_author, line),
                 ),
-            )
+                &round,
+            ))
             .await?;
             response
         }
@@ -1638,13 +1679,15 @@ Rules:
         // A person's top-level comment (or review body) addressed to CoderHelm
         // has no inline thread to answer in: reply on the PR, to them, so
         // nobody is left unanswered.
-        crate::passes::conversation::github(
+        Box::pin(crate::passes::conversation::reply_github(
+            &replier,
             &github,
             &msg.repo_owner,
             &msg.repo_name,
             msg.pr_number,
             common::conversation::Say::reply_all("feedback", &reply),
-        )
+            &round,
+        ))
         .await?;
         info!(run_id = %msg.run_id, author = %msg.trigger_author, "Replied to a top-level PR comment");
     } else if actionable_comments.is_empty() {
@@ -1662,14 +1705,16 @@ Rules:
             if i == last {
                 reply.push_str(&consulted);
             }
-            crate::passes::conversation::review_reply(
+            Box::pin(crate::passes::conversation::reply_review(
+                &replier,
                 &github,
                 &msg.repo_owner,
                 &msg.repo_name,
                 msg.pr_number,
                 comment.comment_id.unwrap(),
                 &reply,
-            )
+                &round,
+            ))
             .await?;
         }
     } else {
@@ -1685,14 +1730,16 @@ Rules:
         };
         let reply = format!("{reply}{consulted}");
         if let Some(comment_id) = actionable_comments.first().and_then(|c| c.comment_id) {
-            crate::passes::conversation::review_reply(
+            Box::pin(crate::passes::conversation::reply_review(
+                &replier,
                 &github,
                 &msg.repo_owner,
                 &msg.repo_name,
                 msg.pr_number,
                 comment_id,
                 &reply,
-            )
+                &round,
+            ))
             .await?;
         }
     }
@@ -3279,13 +3326,26 @@ async fn handle_wrong_repo(
     let comment = format!(
         "🔀 Moving this work to `{target_repo}` as requested. This PR will be closed and a new one will be opened in the correct repository."
     );
-    let _ = crate::passes::conversation::github(
+    let replier = super::conversation::Replier::new(state, &msg.team_id);
+    let facts = Facts::default()
+        .github_pr(
+            &format!("{}/{}", msg.repo_owner, msg.repo_name),
+            msg.pr_number,
+            "",
+            "open",
+        )
+        .decision(format!(
+            "The work moves to {target_repo}: this pull request is closed and a new one opens there."
+        ));
+    let _ = Box::pin(crate::passes::conversation::reply_github(
+        &replier,
         github,
         &msg.repo_owner,
         &msg.repo_name,
         msg.pr_number,
         common::conversation::Say::reply_all("feedback", &comment),
-    )
+        &facts,
+    ))
     .await;
 
     // Close the PR
@@ -3499,8 +3559,22 @@ pub(crate) async fn close_own_pr_outside(
     if !author.contains("coderhelm") {
         return false;
     }
+    let replier = super::conversation::Replier::new(state, pr_ref.team_id);
+    let facts = Facts::default()
+        .github_pr(
+            &format!("{}/{}", pr_ref.owner, pr_ref.repo),
+            pr_ref.pr_number,
+            pr["title"].as_str().unwrap_or(""),
+            "open",
+        )
+        .decision(format!(
+            "The fix belongs outside the code ({}): {}",
+            where_.trim(),
+            cause.trim()
+        ));
     if pr["state"].as_str() == Some("open") {
-        let _ = crate::passes::conversation::github(
+        let _ = Box::pin(crate::passes::conversation::reply_github(
+            &replier,
             github,
             pr_ref.owner,
             pr_ref.repo,
@@ -3509,7 +3583,8 @@ pub(crate) async fn close_own_pr_outside(
                 "feedback",
                 super::lessons::closing_note(where_, cause),
             ),
-        )
+            &facts,
+        ))
         .await;
         match github
             .close_pull_request(pr_ref.owner, pr_ref.repo, pr_ref.pr_number)
@@ -3587,17 +3662,17 @@ pub(crate) async fn close_own_pr_outside(
             .unwrap_or(0);
         match field("ticket_source").as_str() {
             "jira" if !ticket.is_empty() => {
-                if let Err(e) = crate::passes::conversation::jira(
-                    state,
-                    pr_ref.team_id,
+                if let Err(e) = Box::pin(crate::passes::conversation::reply_jira(
+                    &replier,
                     &ticket,
                     common::conversation::Say::reply_all(
                         "feedback",
                         fix_location::jira_text(&format!("{body}{closed_line}")),
                     ),
+                    &facts,
                     "clarification",
                     "Needs a change outside the code",
-                )
+                ))
                 .await
                 .map(|_| ())
                 {
@@ -3605,7 +3680,8 @@ pub(crate) async fn close_own_pr_outside(
                 }
             }
             "github" if issue_number > 0 => {
-                let _ = crate::passes::conversation::github(
+                let _ = Box::pin(crate::passes::conversation::reply_github(
+                    &replier,
                     github,
                     pr_ref.owner,
                     pr_ref.repo,
@@ -3614,7 +3690,8 @@ pub(crate) async fn close_own_pr_outside(
                         "feedback",
                         format!("**Needs a change outside the code**\n\n{body}{closed_line}"),
                     ),
-                )
+                    &facts,
+                ))
                 .await;
             }
             _ => {}
@@ -4298,6 +4375,17 @@ async fn outstanding_work(
     Some(w)
 }
 
+/// The ticket and pull request a round's replies may name.
+fn reply_facts(msg: &FeedbackMessage, t: &super::review_fix::Ticket) -> Facts {
+    let repo = format!("{}/{}", msg.repo_owner, msg.repo_name);
+    Facts::default()
+        .ticket(
+            format!("{} {}", t.id, t.title).trim().to_string(),
+            common::truncate_str(t.body.trim(), 1_500).to_string(),
+        )
+        .github_pr(&repo, msg.pr_number, "", "open")
+}
+
 fn addressed(author: &str, text: &str) -> String {
     match author.trim() {
         "" => text.to_string(),
@@ -4321,6 +4409,12 @@ async fn finish_branch_update(
         .iter()
         .filter(|c| !c.is_context)
         .find_map(|c| c.comment_id);
+    let replier = super::conversation::Replier::new(state, &msg.team_id);
+    let facts = reply_facts(msg, ticket).state(if pushed {
+        "the branch update is pushed"
+    } else {
+        "the branch was already up to date; nothing pushed"
+    });
     match thread {
         // The requester said not to post on the pull request: the line goes
         // to them on the run page and the ticket.
@@ -4337,18 +4431,21 @@ async fn finish_branch_update(
             .await
         }
         Some(id) => {
-            crate::passes::conversation::review_reply(
+            Box::pin(crate::passes::conversation::reply_review(
+                &replier,
                 github,
                 &msg.repo_owner,
                 &msg.repo_name,
                 msg.pr_number,
                 id,
                 line,
-            )
+                &facts,
+            ))
             .await?;
         }
         None => {
-            crate::passes::conversation::github(
+            Box::pin(crate::passes::conversation::reply_github(
+                &replier,
                 github,
                 &msg.repo_owner,
                 &msg.repo_name,
@@ -4357,7 +4454,8 @@ async fn finish_branch_update(
                     "feedback",
                     addressed(&msg.trigger_author, line),
                 ),
-            )
+                &facts,
+            ))
             .await?;
         }
     }
