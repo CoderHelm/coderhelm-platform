@@ -86,8 +86,8 @@ struct LatestRun<'a> {
     seen_hash: Option<&'a str>,
     /// Why the run stopped, when it recorded one (`stop_kind`).
     stop_kind: &'a str,
-    /// Runs in a row, newest first, that failed (or failed and a person
-    /// retried them), this one included.
+    /// Runs in a row, newest first, that ended failed; runs a person
+    /// retried are passed over (they neither count nor end the streak).
     failed_in_a_row: usize,
 }
 
