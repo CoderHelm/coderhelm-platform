@@ -1265,6 +1265,9 @@ pub mod conversation;
 mod covering;
 mod cross_repo;
 pub mod dep_fix;
+/// The repository's deploy label on CoderHelm's own pull request: its
+/// workflow's runs on the head, and putting the label back once per head.
+pub mod deploy_label;
 pub(crate) mod deploy_revert;
 pub mod deploy_stats;
 pub mod description;

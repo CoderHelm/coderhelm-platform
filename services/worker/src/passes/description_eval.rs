@@ -165,6 +165,7 @@ pub fn dependency_facts() -> Facts {
         notes: vec![],
         evidence: vec![],
         repo_url: "https://github.com/acme/site",
+        deploy: &[],
     })
 }
 
@@ -336,6 +337,7 @@ pub fn feature_facts(c: &OutsideChange, body: &str) -> Facts {
         notes: vec![],
         evidence: vec![],
         repo_url: "https://github.com/acme/site",
+        deploy: &[],
     })
 }
 
@@ -434,6 +436,7 @@ pub fn ticket_case() -> Case {
             notes: vec![],
             evidence: vec![],
             repo_url: "https://github.com/acme/site",
+            deploy: &[],
         }),
         reply: Some(
             r#"{"summary": "Retries a timed-out export poll three times before giving up. All tests pass.", "check": "make ship", "drop": []}"#,
@@ -552,6 +555,7 @@ pub fn owned_case() -> Case {
         notes: vec![],
         evidence: vec![],
         repo_url: "https://github.com/acme/web",
+        deploy: &[],
     });
     Case {
         name: "a security update that handed its own work to a person",

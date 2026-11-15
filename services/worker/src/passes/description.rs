@@ -405,6 +405,8 @@ struct Gathered {
     files: Vec<(String, String, String)>,
     floor: super::pr_risk::Floor,
     checks: Option<Vec<super::reviewer_guide::Check>>,
+    /// The latest run on the head of each workflow the deploy label starts.
+    deploy: Vec<common::deploy_label::DeployRun>,
     run: RunBits,
     run_url: String,
 }
@@ -479,6 +481,7 @@ impl Gathered {
                 .into_iter()
                 .collect(),
             repo_url: self.pr["base"]["repo"]["html_url"].as_str().unwrap_or(""),
+            deploy: &self.deploy,
         })
     }
 }
@@ -577,6 +580,20 @@ async fn gather(
             .ok()
             .map(|l| super::reviewer_guide::checks_of(&l))
     };
+    let deploy = {
+        let labels = super::deploy_label::labels(state, team_id, owner, repo).await;
+        let head_ref = pr["head"]["ref"].as_str().unwrap_or("");
+        super::deploy_label::runs_on_head(
+            state,
+            github,
+            team_id,
+            (owner, repo),
+            &head,
+            head_ref,
+            &labels,
+        )
+        .await
+    };
     let (run, run_id) = run_bits(state, team_id, owner, repo, number).await;
     let app = common::public_urls::app_url(&state.config.stage);
     let run_url = if run_id.is_empty() || app.is_empty() {
@@ -589,6 +606,7 @@ async fn gather(
         files,
         floor,
         checks,
+        deploy,
         run,
         run_url,
     })
@@ -766,6 +784,20 @@ pub async fn reconcile_run(
 ) -> Reconciled {
     let ticket = run_ticket(state, team_id, run_id).await;
     reconcile(state, github, team_id, owner, repo, number, &ticket).await
+}
+
+/// [`rebuild`] for a run's pull request, its ticket read from the run.
+pub async fn rebuild_run(
+    state: &WorkerState,
+    github: &GitHubClient,
+    team_id: &str,
+    run_id: &str,
+    owner: &str,
+    repo: &str,
+    number: u64,
+) -> Reconciled {
+    let ticket = run_ticket(state, team_id, run_id).await;
+    rebuild(state, github, team_id, owner, repo, number, &ticket).await
 }
 
 async fn run_ticket(state: &WorkerState, team_id: &str, run_id: &str) -> String {

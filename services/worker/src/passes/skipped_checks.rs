@@ -132,27 +132,18 @@ pub async fn gates(
             None => None,
         };
         let gate = match path {
-            Some(p) => match cache.get(&p) {
-                Some(c) if now - c.at < CACHE_SECS => Some(c.gate.clone()),
-                _ => match gh.read_file(owner, repo, &p, head_ref).await {
-                    Ok(text) => {
-                        let gate = workflow_gate::read(&text);
-                        cache.insert(
-                            p.clone(),
-                            Cached {
-                                gate: gate.clone(),
-                                at: now,
-                            },
-                        );
-                        changed = true;
-                        Some(gate)
-                    }
-                    Err(e) => {
-                        warn!(path = %p, error = %e, "Could not read a skipped check's workflow");
-                        None
-                    }
-                },
-            },
+            Some(p) => {
+                read_gate(
+                    gh,
+                    (owner, repo),
+                    head_ref,
+                    &p,
+                    now,
+                    &mut cache,
+                    &mut changed,
+                )
+                .await
+            }
             None => None,
         };
         rows.push((name.clone(), gate));
@@ -161,6 +152,77 @@ pub async fn gates(
         save_cache(state, team_id, owner, repo, &cache).await;
     }
     rows
+}
+
+/// One workflow file's gate: from the cache while it is fresh, else read
+/// at `head_ref` and kept (`changed` set). `None` when it can't be read.
+#[allow(clippy::too_many_arguments)]
+async fn read_gate(
+    gh: &GitHubClient,
+    (owner, repo): (&str, &str),
+    head_ref: &str,
+    path: &str,
+    now: i64,
+    cache: &mut HashMap<String, Cached>,
+    changed: &mut bool,
+) -> Option<WorkflowGate> {
+    if let Some(c) = cache.get(path).filter(|c| now - c.at < CACHE_SECS) {
+        return Some(c.gate.clone());
+    }
+    match gh.read_file(owner, repo, path, head_ref).await {
+        Ok(text) => {
+            let gate = workflow_gate::read(&text);
+            cache.insert(
+                path.to_string(),
+                Cached {
+                    gate: gate.clone(),
+                    at: now,
+                },
+            );
+            *changed = true;
+            Some(gate)
+        }
+        Err(e) => {
+            warn!(path = %path, error = %e, "Could not read a workflow file");
+            None
+        }
+    }
+}
+
+/// The gate of each workflow file in `paths` (as GitHub names a run's
+/// file), `None` when it can't be read. Shares the per-repository cache.
+pub async fn gates_of_paths(
+    state: &WorkerState,
+    gh: &GitHubClient,
+    team_id: &str,
+    (owner, repo): (&str, &str),
+    head_ref: &str,
+    paths: &[String],
+) -> Vec<(String, Option<WorkflowGate>)> {
+    if paths.is_empty() {
+        return Vec::new();
+    }
+    let now = chrono::Utc::now().timestamp();
+    let mut cache = load_cache(state, team_id, owner, repo).await;
+    let mut changed = false;
+    let mut out = Vec::new();
+    for p in paths {
+        let gate = read_gate(
+            gh,
+            (owner, repo),
+            head_ref,
+            p,
+            now,
+            &mut cache,
+            &mut changed,
+        )
+        .await;
+        out.push((p.clone(), gate));
+    }
+    if changed {
+        save_cache(state, team_id, owner, repo, &cache).await;
+    }
+    out
 }
 
 /// The skipped checks among `names`, sorted by why they were skipped on

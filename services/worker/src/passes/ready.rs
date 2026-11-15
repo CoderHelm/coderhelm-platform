@@ -178,6 +178,9 @@ pub struct Facts {
     /// Its CI fix loop found every failing check failing on the base branch
     /// too (`ci_end` = `red_on_base`): not this change's failure.
     pub red_on_base: bool,
+    /// Where the repository's deploy label's workflows stand on the head
+    /// (`deploy_label::before_ready`): a draft waits for them.
+    pub deploy: common::deploy_label::Standing,
 }
 
 impl Ci {
@@ -438,6 +441,33 @@ pub fn decide(f: &Facts) -> Decision {
     }
     if let Some(w) = sec_wait {
         proof_wait.get_or_insert(w);
+    }
+    // The deploy label's workflows are the repository's own verification of
+    // the change (a preview deploy, end-to-end runs on devices): the draft
+    // waits for them. A failed run is failing CI, which the run's CI fix
+    // loop takes; it is named here only when no failing check says it.
+    match &f.deploy {
+        common::deploy_label::Standing::Waiting(why) => {
+            proof_wait.get_or_insert_with(|| why.clone());
+        }
+        common::deploy_label::Standing::Failed(runs) if !f.ci.failing() => {
+            reasons.push(Reason::new(
+                format!(
+                    "The deploy label's workflow didn't pass on this head: {}",
+                    runs.iter()
+                        .map(|r| match r.link().as_str() {
+                            "" => format!("`{}` {}", r.workflow, r.result()),
+                            link => format!("`{}` {} ({link})", r.workflow, r.result()),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                "Fix the failure on this branch (CoderHelm decides again on the push), or re-run \
+                 the workflow if the failure isn't the change's; the pull request leaves draft \
+                 once it passes.",
+            ));
+        }
+        _ => {}
     }
     // Every other pull request too (`outcome`): never ready with a failing
     // check, never ready while one runs. CoderHelm's own findings already
@@ -823,16 +853,18 @@ pub async fn settle(ctx: &Ctx<'_>) -> Outcome {
             Outcome::Closed
         }
         Decision::Ready { open } => {
+            let mut body = facts.body.clone();
             if facts.draft {
                 info!(pr = ctx.pr, open = ?open, "Marking PR ready");
                 if let Err(r) = make_ready(ctx, &facts).await {
                     return retry_or_give_up(ctx, &run_id, &pr_url, r).await;
                 }
                 info!(pr = ctx.pr, open = open.len(), "PR marked ready");
+                body = with_deploy_result(ctx, &run_id, &facts).await;
             } else {
                 info!(pr = ctx.pr, "PR already not a draft");
             }
-            write_body(ctx, &facts.body, &decision).await;
+            write_body(ctx, &body, &decision).await;
             record_settled(ctx.state, ctx.team_id, &run_id, "ready").await;
             Outcome::Ready
         }
@@ -1020,6 +1052,19 @@ async fn gather(ctx: &Ctx<'_>) -> Result<Facts, Refused> {
     f.body = pr["body"].as_str().unwrap_or("").to_string();
     f.title = pr["title"].as_str().unwrap_or("").to_string();
     f.security = f.body.contains(common::security_fixes::MARKER);
+    // The deploy label's workflows on the head, with a label its workflow
+    // took off put back once on a new head.
+    if f.draft && !f.closed && f.put_back_by.is_none() {
+        f.deploy = super::deploy_label::before_ready(
+            ctx.state,
+            gh,
+            ctx.team_id,
+            (ctx.owner, ctx.repo),
+            ctx.pr,
+            &pr,
+        )
+        .await;
+    }
     if reads_ci(&f) {
         let sha = pr["head"]["sha"].as_str().unwrap_or("");
         f.ci = ci_on(gh, ctx.owner, ctx.repo, sha).await.map_err(|e| {
@@ -1419,6 +1464,42 @@ async fn make_ready(ctx: &Ctx<'_>, f: &Facts) -> Result<(), Refused> {
         .await
         .map(|_| ())
         .map_err(|e| Refused::of("GitHub didn't mark it ready", &*e, ctx.attempt))
+}
+
+/// The description once the deploy label's workflow finished on the head:
+/// rebuilt from the head's facts, so it quotes the run's conclusion and link
+/// rather than the run still going when it was last written. The body as
+/// read otherwise, or when the rebuild can't be read back.
+async fn with_deploy_result(ctx: &Ctx<'_>, run_id: &str, f: &Facts) -> String {
+    use common::deploy_label::Standing;
+    if !matches!(f.deploy, Standing::Passed | Standing::Failed(_)) || run_id.is_empty() {
+        return f.body.clone();
+    }
+    let rebuilt = crate::passes::description::rebuild_run(
+        ctx.state,
+        ctx.github,
+        ctx.team_id,
+        run_id,
+        ctx.owner,
+        ctx.repo,
+        ctx.pr,
+    )
+    .await;
+    if let crate::passes::description::Reconciled::Failed(why) = rebuilt {
+        warn!(pr = ctx.pr, why = %why, "Could not rebuild the description with the deploy label's run");
+        return f.body.clone();
+    }
+    match ctx
+        .github
+        .get_pull_request(ctx.owner, ctx.repo, ctx.pr)
+        .await
+    {
+        Ok(pr) => pr["body"].as_str().unwrap_or(&f.body).to_string(),
+        Err(e) => {
+            warn!(pr = ctx.pr, error = %e, "Could not read the rebuilt description back");
+            f.body.clone()
+        }
+    }
 }
 
 async fn write_body(ctx: &Ctx<'_>, body: &str, d: &Decision) {
@@ -2318,6 +2399,67 @@ mod tests {
         assert!(matches!(decide(&f), Decision::Wait { .. }));
         let f = Facts { proven: true, ..f };
         assert!(matches!(decide(&f), Decision::Ready { .. }));
+    }
+
+    #[test]
+    fn a_draft_waits_for_the_deploy_labels_workflow_and_a_failure_holds_it() {
+        use common::deploy_label::{DeployRun, Standing};
+        // Running: the pull request waits, however green the rest is.
+        let f = Facts {
+            deploy: Standing::Waiting(
+                "the deploy label's workflow `Deploy preview` is still running on this head".into(),
+            ),
+            ..green_approved()
+        };
+        assert!(
+            matches!(decide(&f), Decision::Wait { why, .. } if why.contains("`Deploy preview`"))
+        );
+        // Passed, or nothing it started: ready.
+        for deploy in [Standing::Passed, Standing::None] {
+            let f = Facts {
+                deploy,
+                ..green_approved()
+            };
+            assert!(matches!(decide(&f), Decision::Ready { .. }));
+        }
+        // Failed with every check green (a workflow that failed to start): held,
+        // with the run named and linked.
+        let failed = DeployRun {
+            workflow: "Deploy preview".into(),
+            status: "completed".into(),
+            conclusion: "startup_failure".into(),
+            url: "https://github.com/o/r/actions/runs/3".into(),
+            ..Default::default()
+        };
+        let f = Facts {
+            deploy: Standing::Failed(vec![failed.clone()]),
+            ..green_approved()
+        };
+        match decide(&f) {
+            Decision::Held { reasons } => assert!(
+                reasons[0].line().contains(
+                    "`Deploy preview` failed to start ([run](https://github.com/o/r/actions/runs/3))"
+                ),
+                "{reasons:?}"
+            ),
+            d => panic!("{d:?}"),
+        }
+        // Failed while CI fails too: the failing checks say it, once.
+        let f = Facts {
+            deploy: Standing::Failed(vec![failed]),
+            ci: Ci {
+                green: false,
+                why: "CI fails on this head: `Deploy preview / e2e`".into(),
+            },
+            ..green_approved()
+        };
+        match decide(&f) {
+            Decision::Held { reasons } => {
+                assert_eq!(reasons.len(), 1, "{reasons:?}");
+                assert!(reasons[0].line().contains("CI is failing on this head"));
+            }
+            d => panic!("{d:?}"),
+        }
     }
 
     #[test]

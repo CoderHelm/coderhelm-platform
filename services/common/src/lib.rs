@@ -82,6 +82,10 @@ pub mod alert_budget;
 /// Dockerfile base images: their package lists matched against OSV's
 /// distribution data, fixed by pinning the same tag to a newer digest.
 pub mod base_images;
+/// The repository's deploy label as a verification gate: its workflow's
+/// runs on a head, the wait before ready, and putting the label back once
+/// per head.
+pub mod deploy_label;
 /// Why a finished run's pull request is still a draft, on the run record.
 pub mod draft_hold;
 /// Read-only lookups against a team's own systems (their API today). Shared so

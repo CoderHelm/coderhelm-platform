@@ -60,6 +60,8 @@ pub struct Inputs<'a> {
     pub evidence: Vec<String>,
     /// The repository's address, for links to files at the head.
     pub repo_url: &'a str,
+    /// The latest run on the head of each workflow the deploy label starts.
+    pub deploy: &'a [common::deploy_label::DeployRun],
 }
 
 /// Lines added and removed in a patch.
@@ -389,6 +391,7 @@ pub fn facts(i: &Inputs<'_>) -> Facts {
             .collect(),
         review_notes: signoffs(i.body),
         repo_url: i.repo_url.trim_end_matches('/').to_string(),
+        deploy: i.deploy.to_vec(),
         ..Default::default()
     };
     // A frozen install a check recorded on this head.
@@ -654,6 +657,7 @@ mod tests {
             notes: vec![],
             evidence: vec![],
             repo_url: "https://github.com/acme/site",
+            deploy: &[],
         }
     }
 

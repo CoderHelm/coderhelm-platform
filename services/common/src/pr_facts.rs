@@ -331,6 +331,10 @@ pub struct Facts {
     pub checks: Vec<CheckFact>,
     /// Whether the head's checks could be read at all.
     pub checks_read: bool,
+    /// The latest run on the head of each workflow the repository's deploy
+    /// label starts (`deploy_label`): its conclusion and link are quoted.
+    #[serde(default)]
+    pub deploy: Vec<crate::deploy_label::DeployRun>,
     pub unverified: Vec<Unverified>,
     /// Behaviour the change is known to alter, each with its evidence.
     pub behaviour: Vec<Evidenced>,
@@ -771,7 +775,35 @@ fn check_name(name: &str) -> String {
 /// workflow's conditions left this pull request out, and it is listed in
 /// the full evidence only.
 pub fn rows(f: &Facts) -> Vec<crate::pr_body::Row> {
+    use crate::deploy_label::RunState;
     use crate::pr_body::{Outcome as O, Row};
+    // The deploy label's workflows first: never grouped away, and with the
+    // run's link whatever its conclusion.
+    let mut deploy: Vec<Row> = Vec::new();
+    for r in &f.deploy {
+        let link = r.link();
+        let with = |words: &str| match (words.is_empty(), link.is_empty()) {
+            (true, _) => link.clone(),
+            (false, true) => words.to_string(),
+            (false, false) => format!("{words}; {link}"),
+        };
+        let (outcome, detail) = match r.state() {
+            RunState::Passed => (O::Passed, with("")),
+            // "Failed: failed" says nothing twice: the result only when it
+            // adds to the outcome (timed out, failed to start).
+            RunState::Failed => match r.result().as_str() {
+                "failed" => (O::Failed, with("")),
+                other => (O::Failed, with(other)),
+            },
+            RunState::Running => (O::NotRun, with("still running when this was written")),
+            RunState::DidNotRun => (O::NotRun, with(&format!("{} on this head", r.result()))),
+        };
+        deploy.push(Row {
+            check: format!("{} (deploy label)", check_name(&r.workflow)),
+            outcome,
+            detail,
+        });
+    }
     let mut ci: Vec<Row> = Vec::new();
     for c in &f.checks {
         let check = format!("{} (CI)", check_name(&c.name));
@@ -885,7 +917,7 @@ pub fn rows(f: &Facts) -> Vec<crate::pr_body::Row> {
         );
     }
     // Too many to list: passed CI checks grouped by what they check.
-    if ci.len() + own.len() > crate::pr_body::MAX_ROWS {
+    if deploy.len() + ci.len() + own.len() > crate::pr_body::MAX_ROWS {
         let mut grouped: Vec<Row> = ci
             .iter()
             .filter(|r| r.outcome != O::Passed)
@@ -915,8 +947,9 @@ pub fn rows(f: &Facts) -> Vec<crate::pr_body::Row> {
         }
         ci = grouped;
     }
-    ci.extend(own);
-    ci
+    deploy.extend(ci);
+    deploy.extend(own);
+    deploy
 }
 
 fn semver(v: &str) -> Vec<u64> {
@@ -1372,6 +1405,14 @@ pub fn body_of(f: &Facts, ticked: &[String]) -> crate::pr_body::Body {
         }
         evidence.push(s.trim_end().to_string());
     }
+    if !f.deploy.is_empty() {
+        let mut s = String::from("The deploy label's workflows on this head:\n");
+        for r in &f.deploy {
+            s.push_str(&r.evidence_line());
+            s.push('\n');
+        }
+        evidence.push(s.trim_end().to_string());
+    }
     let items = needed_items(f);
     let mut built: Vec<String> = Vec::new();
     // A look at the change is under Review focus, not here.
@@ -1536,6 +1577,45 @@ mod tests {
             crate::pr_body::defects(&out, "abc1234"),
             vec!["no footer".to_string()]
         );
+    }
+
+    #[test]
+    fn the_deploy_labels_workflow_is_quoted_with_its_conclusion_and_run() {
+        use crate::deploy_label::DeployRun;
+        let run = |status: &str, conclusion: &str| DeployRun {
+            workflow: "Deploy preview and device E2E".into(),
+            path: ".github/workflows/deploy.yml".into(),
+            status: status.into(),
+            conclusion: conclusion.into(),
+            url: "https://github.com/acme/site/actions/runs/7".into(),
+            created_at: "2026-11-14T10:00:00Z".into(),
+        };
+        let mut f = ticket_facts();
+        f.deploy = vec![run("completed", "success")];
+        let out = lead(&f);
+        assert!(
+            out.contains("| Deploy preview and device E2E (deploy label) | Passed; [run](https://github.com/acme/site/actions/runs/7) |"),
+            "{out}"
+        );
+        assert!(body_of(&f, &[]).evidence.contains(
+            "The deploy label's workflows on this head:\n- `Deploy preview and device E2E`: passed ([run](https://github.com/acme/site/actions/runs/7))"
+        ));
+        f.deploy = vec![run("completed", "failure")];
+        assert!(lead(&f).contains(
+            "| Deploy preview and device E2E (deploy label) | Failed: [run](https://github.com/acme/site/actions/runs/7) |"
+        ));
+        f.deploy = vec![run("in_progress", "")];
+        assert!(lead(&f).contains("| Deploy preview and device E2E (deploy label) | Not run: still running when this was written; [run]("));
+        f.deploy = vec![run("completed", "skipped")];
+        assert!(lead(&f).contains("| Deploy preview and device E2E (deploy label) | Not run: skipped on this head; [run]("));
+        // Kept in sight when the CI checks are too many to list one by one.
+        f.deploy = vec![run("completed", "success")];
+        f.checks = (0..12)
+            .map(|i| check(&format!("unit tests {i}"), Outcome::Passed))
+            .collect();
+        assert!(rows(&f)
+            .iter()
+            .any(|r| r.check == "Deploy preview and device E2E (deploy label)"));
     }
 
     #[test]

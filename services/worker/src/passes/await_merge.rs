@@ -62,8 +62,9 @@ const MAX_POLLS: u32 = 60;
 /// requeue delay). A pause still wakes on the next CI or review event.
 const MAX_ERROR_RETRIES: u32 = 100;
 /// After the gate adds deploy labels, how long a "green" CI result is not
-/// trusted unless a check has started since the labels were added.
-const LABEL_CI_GRACE_SECS: i64 = 180;
+/// trusted unless a check has started since the labels were added (shared
+/// with the ready decision's wait).
+const LABEL_CI_GRACE_SECS: i64 = common::deploy_label::GRACE_SECS;
 /// How long a gate record is kept after its last arming.
 const RECORD_TTL_SECS: u64 = 30 * 86_400;
 
@@ -217,20 +218,14 @@ async fn ci_summary(
     Ok(summary)
 }
 
-/// Pure: may a green result be trusted yet, given when the gate added deploy
-/// labels? Label-triggered workflows take a moment to register their checks;
-/// until one has started (or the grace period passed) green means "not yet".
+/// Pure: may a green result be trusted yet, given when the deploy labels
+/// were added (`common::deploy_label::settled`).
 pub(crate) fn label_ci_settled(
     labels_added_at: Option<i64>,
     latest_start: Option<i64>,
     now: i64,
 ) -> bool {
-    match labels_added_at {
-        None => true,
-        Some(added) => {
-            now - added >= LABEL_CI_GRACE_SECS || latest_start.is_some_and(|s| s >= added)
-        }
-    }
+    common::deploy_label::settled(labels_added_at, latest_start, now)
 }
 
 // ─── The decision (pure) ────────────────────────────────────────────────────
@@ -744,18 +739,17 @@ async fn record_labels_added(
     msg: &AwaitMergeMessage,
     now: i64,
 ) -> Result<(), BoxError> {
-    state
-        .dynamo
-        .update_item()
-        .table_name(&state.config.settings_table_name)
-        .key("pk", attr_s(&msg.team_id))
-        .key("sk", attr_s(&record_key(msg)))
-        .update_expression("SET labels_added_head = :h, labels_added_at = :t")
-        .expression_attribute_values(":h", attr_s(&msg.head_sha))
-        .expression_attribute_values(":t", attr_n(now))
-        .send()
-        .await?;
-    Ok(())
+    common::merge_gate::record_labels_added(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        &msg.team_id,
+        &msg.repo_owner,
+        &msg.repo_name,
+        msg.pr_number,
+        &msg.head_sha,
+        now,
+    )
+    .await
 }
 
 // ─── Status comment ─────────────────────────────────────────────────────────

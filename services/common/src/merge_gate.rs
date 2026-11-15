@@ -557,6 +557,69 @@ pub async fn finish_stopped(
     }
 }
 
+// ─── Deploy labels (the gate and the ready decision) ───────────────────────
+
+/// The head CoderHelm last added the repository's deploy labels for, and
+/// when (epoch seconds). One record for every path that adds them (the PR's
+/// opening, the ready decision on a new head, the merge gate), so each head
+/// gets them at most once (`deploy_label::to_add`). A failed read is an
+/// error, never "not added".
+pub async fn labels_added(
+    dynamo: &DynamoClient,
+    table: &str,
+    team_id: &str,
+    owner: &str,
+    repo: &str,
+    pr: u64,
+) -> Result<Option<(String, i64)>, BoxError> {
+    let item = read(dynamo, table, team_id, &record_sk(owner, repo, pr)).await?;
+    let head = item
+        .get("labels_added_head")
+        .and_then(|v| v.as_s().ok())
+        .cloned()
+        .unwrap_or_default();
+    if head.is_empty() {
+        return Ok(None);
+    }
+    let at = item
+        .get("labels_added_at")
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0);
+    Ok(Some((head, at)))
+}
+
+/// Records that CoderHelm added the deploy labels for `head` at `now`. Only
+/// the label fields: a record the gate never armed stays unarmed (no head,
+/// no state, so no event wakes it), and gets the gate's expiry.
+#[allow(clippy::too_many_arguments)]
+pub async fn record_labels_added(
+    dynamo: &DynamoClient,
+    table: &str,
+    team_id: &str,
+    owner: &str,
+    repo: &str,
+    pr: u64,
+    head: &str,
+    now: i64,
+) -> Result<(), BoxError> {
+    dynamo
+        .update_item()
+        .table_name(table)
+        .key("pk", s(team_id))
+        .key("sk", s(&record_sk(owner, repo, pr)))
+        .update_expression(
+            "SET labels_added_head = :h, labels_added_at = :t, #ttl = if_not_exists(#ttl, :ttl)",
+        )
+        .expression_attribute_names("#ttl", "ttl")
+        .expression_attribute_values(":h", s(head))
+        .expression_attribute_values(":t", n(now))
+        .expression_attribute_values(":ttl", n(now + CONTROL_TTL_SECS))
+        .send()
+        .await?;
+    Ok(())
+}
+
 /// CoderHelm's own latest verdict (`APPROVE` / `REQUEST_CHANGES`) recorded
 /// for this head, from the review records (`REVIEW#{owner}/{repo}#{pr:06}#…`,
 /// newest first). None = no verdict for this head yet. A failed read is an

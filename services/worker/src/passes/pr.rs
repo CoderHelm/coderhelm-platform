@@ -859,25 +859,42 @@ Return ONLY the markdown body text."#,
     .await
     {
         let mut to_add: Vec<String> = vec![label];
-        let cfg = super::review_actions::OnApproveConfig::load(
-            state,
-            &msg.team_id,
-            &msg.repo_owner,
-            &msg.repo_name,
-        )
-        .await;
-        to_add.extend(
-            cfg.deploy_label
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty()),
-        );
+        let deploy =
+            super::deploy_label::labels(state, &msg.team_id, &msg.repo_owner, &msg.repo_name).await;
+        to_add.extend(deploy.iter().cloned());
         match github
             .add_labels(&msg.repo_owner, &msg.repo_name, pr_number, &to_add)
             .await
         {
             Ok(_) => {
-                info!(pr_number, labels = ?to_add, "Labeled own PR (review + deploy) at creation")
+                info!(pr_number, labels = ?to_add, "Labeled own PR (review + deploy) at creation");
+                // The head they were added for: a workflow that takes its
+                // label off after its run gets it back on the next head
+                // only, once (`common::deploy_label::to_add`).
+                if !deploy.is_empty() {
+                    match github
+                        .get_pull_request(&msg.repo_owner, &msg.repo_name, pr_number)
+                        .await
+                    {
+                        Ok(pr) => {
+                            let head = pr["head"]["sha"].as_str().unwrap_or("");
+                            if !head.is_empty() {
+                                super::deploy_label::record_added(
+                                    state,
+                                    &msg.team_id,
+                                    (msg.repo_owner.as_str(), msg.repo_name.as_str()),
+                                    pr_number,
+                                    head,
+                                    chrono::Utc::now().timestamp(),
+                                )
+                                .await;
+                            }
+                        }
+                        Err(e) => {
+                            warn!(pr_number, error = %e, "Could not read the head the deploy labels were added for")
+                        }
+                    }
+                }
             }
             Err(e) => warn!(pr_number, error = %e, "Could not label own PR (non-fatal)"),
         }
