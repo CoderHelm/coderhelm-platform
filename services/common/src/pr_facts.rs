@@ -1630,6 +1630,22 @@ mod tests {
             "`CI:DEPLOY_PREVIEW` was taken off by a person, so CoderHelm did not put it back on this head"
         ));
         f.deploy_kept_off.clear();
+        // The review label's skipped run, a second after the deploy run,
+        // doesn't stand for it.
+        let listed = |conclusion: &str, created: &str| {
+            serde_json::json!({"name": "Deploy preview and device E2E",
+                "path": ".github/workflows/deploy.yml", "event": "pull_request",
+                "status": "completed", "conclusion": conclusion,
+                "html_url": "https://github.com/acme/site/actions/runs/7", "created_at": created})
+        };
+        f.deploy = crate::deploy_label::latest_per_workflow(
+            &[
+                listed("success", "2026-11-14T10:05:00Z"),
+                listed("skipped", "2026-11-14T10:05:01Z"),
+            ],
+            &[".github/workflows/deploy.yml".to_string()],
+        );
+        assert!(lead(&f).contains("| Deploy preview and device E2E (deploy label) | Passed; [run]("));
         // Kept in sight when the CI checks are too many to list one by one.
         f.deploy = vec![run("completed", "success")];
         f.checks = (0..12)

@@ -228,6 +228,24 @@ pub(crate) fn label_ci_settled(
     common::deploy_label::settled(labels_added_at, latest_start, now)
 }
 
+/// Pure: the deploy labels among `labels` that a person took off last, from
+/// the pull request's events (`common::deploy_label::removed_by`; `bots` are
+/// the logins that count as a workflow). A label never taken off isn't one.
+pub(crate) fn taken_off_by_person(
+    events: &serde_json::Value,
+    labels: &[String],
+    bots: &[&str],
+) -> Vec<String> {
+    labels
+        .iter()
+        .filter(|l| {
+            common::deploy_label::removed_by(Some(events), l, bots)
+                == common::deploy_label::RemovedBy::Person
+        })
+        .cloned()
+        .collect()
+}
+
 // ─── The decision (pure) ────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -263,6 +281,8 @@ pub(crate) struct GateView {
     pub present_labels: Vec<String>,
     /// The gate already added the deploy labels for this head, and when.
     pub labels_added_at: Option<i64>,
+    /// Deploy labels a person took off the pull request: never put back.
+    pub taken_off_by_person: Vec<String>,
     /// CI on the head, quarantine applied. None until both keys are in (CI is
     /// not read for a PR that can't merge yet).
     pub ci: Option<CheckSummary>,
@@ -374,12 +394,13 @@ pub(crate) fn decide_gate(v: &GateView) -> GateDecision {
         .collect::<Vec<_>>()
         .join(", ");
     if !v.want_labels.is_empty() {
-        let missing: Vec<String> = v
+        let has = |list: &[String], l: &str| list.iter().any(|p| p.eq_ignore_ascii_case(l));
+        let (kept_off, missing): (Vec<String>, Vec<String>) = v
             .want_labels
             .iter()
-            .filter(|l| !v.present_labels.iter().any(|p| p.eq_ignore_ascii_case(l)))
+            .filter(|l| !has(&v.present_labels, l))
             .cloned()
-            .collect();
+            .partition(|l| has(&v.taken_off_by_person, l));
         if !missing.is_empty() && v.labels_added_at.is_none() {
             lines.push((
                 Mark::Waiting,
@@ -393,8 +414,21 @@ pub(crate) fn decide_gate(v: &GateView) -> GateDecision {
             };
         }
         // Present, or added earlier for this head and since removed by the
-        // repo's own workflow: never re-added in a loop.
-        lines.push((Mark::Done, format!("Deploy label {joined} applied")));
+        // repo's own workflow: never re-added in a loop. One a person took
+        // off stays off.
+        if kept_off.is_empty() {
+            lines.push((Mark::Done, format!("Deploy label {joined} applied")));
+        } else {
+            let named = kept_off
+                .iter()
+                .map(|l| format!("`{l}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            lines.push((
+                Mark::Done,
+                format!("Deploy label {named} was taken off by a person, so CoderHelm left it off"),
+            ));
+        }
     }
 
     // Gate 3: CI.
@@ -1233,9 +1267,26 @@ async fn evaluate(
         labels_added_at: (record.labels_added_head == msg.head_sha)
             .then_some(record.labels_added_at)
             .flatten(),
+        taken_off_by_person: vec![],
         ci: None,
         now,
     };
+    let adds = view.labels_added_at.is_none()
+        && view.want_labels.iter().any(|l| {
+            !view
+                .present_labels
+                .iter()
+                .any(|p| p.eq_ignore_ascii_case(l))
+        });
+    if adds {
+        let events = github.list_issue_events(owner, repo, msg.pr_number).await?;
+        let app = github.bot_login().await.unwrap_or_default();
+        let mut bots = vec!["github-actions[bot]"];
+        if !app.is_empty() {
+            bots.push(&app);
+        }
+        view.taken_off_by_person = taken_off_by_person(&events, &view.want_labels, &bots);
+    }
     let mut decision = decide_gate(&view);
     let mut quarantined: Option<Vec<String>> = None;
     if decision.action == Action::ReadCi {
@@ -1838,6 +1889,7 @@ mod ci_tests {
             want_labels: vec![],
             present_labels: vec![],
             labels_added_at: None,
+            taken_off_by_person: vec![],
             ci: None,
             now: 10_000,
         }
@@ -2003,6 +2055,39 @@ mod ci_tests {
         w.want_labels = vec!["Deploy:Staging".into()];
         w.present_labels = vec!["deploy:staging".into()];
         assert_eq!(decide_gate(&w).action, Action::ReadCi);
+    }
+
+    #[test]
+    fn a_deploy_label_a_person_took_off_is_not_put_back_by_the_gate() {
+        // Opened with the label (recorded for H0), a person took it off, a fix
+        // pushed H1, and the gate arms on H1: nothing recorded for H1.
+        let ev = |event: &str, login: &str| {
+            json!({"event": event, "label": {"name": "deploy:staging"}, "actor": {"login": login}})
+        };
+        let bots = ["github-actions[bot]", "coderhelm[bot]"];
+        let by_person = json!([ev("labeled", "coderhelm[bot]"), ev("unlabeled", "dana")]);
+        let mut v = view();
+        v.want_labels = vec!["deploy:staging".into()];
+        v.taken_off_by_person = taken_off_by_person(&by_person, &v.want_labels, &bots);
+        assert_eq!(v.taken_off_by_person, vec!["deploy:staging".to_string()]);
+        let d = decide_gate(&v);
+        assert_eq!(d.action, Action::ReadCi);
+        assert_eq!(
+            d.lines.last().map(|(_, l)| l.as_str()),
+            Some("Deploy label `deploy:staging` was taken off by a person, so CoderHelm left it off")
+        );
+        // Its workflow took it off after its run, or it was never on: added.
+        let by_workflow = json!([
+            ev("labeled", "coderhelm[bot]"),
+            ev("unlabeled", "github-actions[bot]")
+        ]);
+        for events in [by_workflow, json!([])] {
+            v.taken_off_by_person = taken_off_by_person(&events, &v.want_labels, &bots);
+            assert_eq!(
+                decide_gate(&v).action,
+                Action::AddLabels(vec!["deploy:staging".into()])
+            );
+        }
     }
 
     #[test]

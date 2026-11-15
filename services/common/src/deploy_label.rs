@@ -192,7 +192,9 @@ impl DeployRun {
 /// The latest run of each deploy-label workflow among a head's workflow
 /// runs (GitHub's listing, any order), in the order the workflows were
 /// first seen. Only pull request runs count: a push run of the same file
-/// was not started by the label.
+/// was not started by the label. A run that ran wins over a newer one that
+/// didn't: another label on the pull request starts a run of a
+/// `labeled` workflow too, which its jobs skip.
 pub fn latest_per_workflow(runs: &[serde_json::Value], deploy_paths: &[String]) -> Vec<DeployRun> {
     let mut out: Vec<DeployRun> = Vec::new();
     for r in runs {
@@ -206,9 +208,14 @@ pub fn latest_per_workflow(runs: &[serde_json::Value], deploy_paths: &[String]) 
         if !deploy_paths.iter().any(|p| p == &run.path) {
             continue;
         }
+        let ran = |r: &DeployRun| r.state() != RunState::DidNotRun;
         match out.iter_mut().find(|o| o.path == run.path) {
-            Some(o) if o.created_at <= run.created_at => *o = run,
-            Some(_) => {}
+            Some(o) => {
+                let newer = o.created_at <= run.created_at;
+                if (ran(&run) && !ran(o)) || (ran(&run) == ran(o) && newer) {
+                    *o = run;
+                }
+            }
             None => out.push(run),
         }
     }
@@ -273,6 +280,7 @@ pub fn standing(
     if let Some(at) = added_at {
         let started = runs
             .iter()
+            .filter(|r| r.state() != RunState::DidNotRun)
             .any(|r| r.created_secs().is_some_and(|c| c >= at));
         if !started && now - at < GRACE_SECS {
             let named: Vec<String> = labels.iter().map(|l| format!("`{l}`")).collect();
@@ -556,6 +564,47 @@ mod tests {
             standing(&labels(), std::slice::from_ref(&failed), Some(added), now),
             Standing::Failed(vec![failed])
         );
+    }
+
+    #[test]
+    fn a_skipped_run_from_another_label_never_hides_the_deploy_run() {
+        // A `labeled` workflow gets a run per label: the deploy label's runs,
+        // the review label's (added in the same call) is skipped a second
+        // later.
+        let r = |status: &str, conclusion: &str, created: &str| {
+            json!({"name": "Deploy preview", "path": DEPLOY, "event": "pull_request",
+                   "status": status, "conclusion": conclusion,
+                   "html_url": "https://github.com/o/r/actions/runs/9", "created_at": created})
+        };
+        let paths = [DEPLOY.to_string()];
+        let added = at("2026-11-14T10:04:59Z");
+        let now = at("2026-11-14T10:20:00Z");
+        for (real, state) in [
+            ("success", Standing::Passed),
+            ("failure", Standing::Failed(vec![])),
+        ] {
+            let runs = vec![
+                r("completed", real, "2026-11-14T10:05:00Z"),
+                r("completed", "skipped", "2026-11-14T10:05:01Z"),
+            ];
+            let got = latest_per_workflow(&runs, &paths);
+            assert_eq!(got.len(), 1);
+            assert_eq!(got[0].conclusion, real);
+            match (standing(&labels(), &got, Some(added), now), state) {
+                (Standing::Failed(f), Standing::Failed(_)) => assert_eq!(f, got),
+                (s, want) => assert_eq!(s, want),
+            }
+            // A run ran on this head: the label is not put back over it.
+            assert!(to_add(&labels(), &[], "old", "new", &got).is_empty());
+        }
+        // Only the skipped run registered so far: the label's run is still
+        // waited for.
+        let only_skipped =
+            latest_per_workflow(&[r("completed", "skipped", "2026-11-14T10:05:01Z")], &paths);
+        assert!(matches!(
+            standing(&labels(), &only_skipped, Some(added), added + 30),
+            Standing::Waiting(_)
+        ));
     }
 
     #[test]
