@@ -391,8 +391,7 @@ pub async fn keep(
     let Some(after_key) = key_of("after", &after_bytes) else {
         return;
     };
-    let before =
-        before.and_then(|(b, run_url)| key_of("before", &b).map(|key| (b, key, run_url)));
+    let before = before.and_then(|(b, run_url)| key_of("before", &b).map(|key| (b, key, run_url)));
     let kept = Kept {
         pr: h.pr,
         test: t.full_title(),
