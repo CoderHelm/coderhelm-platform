@@ -61,10 +61,6 @@ const MAX_POLLS: u32 = 60;
 /// Errors in a row retried before the gate pauses (≈ a day at the longest
 /// requeue delay). A pause still wakes on the next CI or review event.
 const MAX_ERROR_RETRIES: u32 = 100;
-/// After the gate adds deploy labels, how long a "green" CI result is not
-/// trusted unless a check has started since the labels were added (shared
-/// with the ready decision's wait).
-const LABEL_CI_GRACE_SECS: i64 = common::deploy_label::GRACE_SECS;
 /// How long a gate record is kept after its last arming.
 const RECORD_TTL_SECS: u64 = 30 * 86_400;
 
@@ -1882,7 +1878,7 @@ mod ci_tests {
         assert!(label_ci_settled(
             Some(added),
             None,
-            added + LABEL_CI_GRACE_SECS
+            added + common::deploy_label::GRACE_SECS
         ));
         assert!(label_ci_settled(None, None, added));
     }
@@ -2060,7 +2056,7 @@ mod ci_tests {
         v.ci = Some(green());
         // Green right after adding is not trusted until label CI starts.
         assert_eq!(decide_gate(&v).action, Action::PollCi);
-        v.now += LABEL_CI_GRACE_SECS;
+        v.now += common::deploy_label::GRACE_SECS;
         assert_eq!(decide_gate(&v).action, Action::Merge);
         // Present already (case-insensitive): nothing to add.
         let mut w = view();
@@ -2073,9 +2069,7 @@ mod ci_tests {
     fn a_deploy_label_a_person_took_off_is_not_put_back_by_the_gate() {
         // Opened with the label (recorded for H0), a person took it off, a fix
         // pushed H1, and the gate arms on H1: nothing recorded for H1.
-        let ev = |event: &str, login: &str| {
-            json!({"event": event, "label": {"name": "deploy:staging"}, "actor": {"login": login}})
-        };
+        let ev = |event: &str, login: &str| json!({"event": event, "label": {"name": "deploy:staging"}, "actor": {"login": login}});
         let bots = ["github-actions[bot]", "coderhelm[bot]"];
         let by_person = json!([ev("labeled", "coderhelm[bot]"), ev("unlabeled", "dana")]);
         let mut v = view();
@@ -2085,7 +2079,9 @@ mod ci_tests {
         assert_eq!(d.action, Action::ReadCi);
         assert_eq!(
             d.lines.last().map(|(_, l)| l.as_str()),
-            Some("Deploy label `deploy:staging` was taken off by a person, so CoderHelm left it off")
+            Some(
+                "Deploy label `deploy:staging` was taken off by a person, so CoderHelm left it off"
+            )
         );
         // Another app took it off: left off too, and named as an app.
         let by_app = json!([

@@ -3911,7 +3911,6 @@ async fn check_failures(
     msg: &FeedbackMessage,
     branch: &str,
 ) -> Option<(Vec<String>, String, Vec<u64>)> {
-
     let checks = github
         .list_ci_for_ref(&msg.repo_owner, &msg.repo_name, branch)
         .await
@@ -4824,7 +4823,10 @@ mod deploy_failure_tests {
             &deploy,
         )
         .unwrap();
-        assert_eq!(names, vec!["unit tests".to_string(), "Deploy preview".to_string()]);
+        assert_eq!(
+            names,
+            vec!["unit tests".to_string(), "Deploy preview".to_string()]
+        );
         assert!(logs.starts_with("assert failed\n\nThe deploy label's workflow"));
         // No deploy failure: the listing's answer stands.
         assert_eq!(with_deploy_failures(None, &[]), None);
@@ -4837,14 +4839,14 @@ mod deploy_failure_tests {
             .collect::<String>()
             + "##[error]Detox: element not found\n";
         assert!(long.len() > super::CI_LOG_CHARS * 3);
-        let deploy: Vec<(DeployRun, String)> =
-            hidden_failure().into_iter().map(|r| (r, long.clone())).collect();
+        let deploy: Vec<(DeployRun, String)> = hidden_failure()
+            .into_iter()
+            .map(|r| (r, long.clone()))
+            .collect();
         let listed = "unit tests\n##[error]expected 2, got 3 in cart.test.ts\n";
-        let (_, logs) = with_deploy_failures(
-            Some((vec!["unit tests".into()], listed.into())),
-            &deploy,
-        )
-        .unwrap();
+        let (_, logs) =
+            with_deploy_failures(Some((vec!["unit tests".into()], listed.into())), &deploy)
+                .unwrap();
         // What the fixer's block keeps: the last CI_LOG_CHARS of the logs.
         let kept = common::tail_str(&logs, super::CI_LOG_CHARS);
         assert!(kept.contains("expected 2, got 3 in cart.test.ts"), "{kept}");

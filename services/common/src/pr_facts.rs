@@ -1645,7 +1645,9 @@ mod tests {
             ],
             &[".github/workflows/deploy.yml".to_string()],
         );
-        assert!(lead(&f).contains("| Deploy preview and device E2E (deploy label) | Passed; [run]("));
+        assert!(
+            lead(&f).contains("| Deploy preview and device E2E (deploy label) | Passed; [run](")
+        );
         // Kept in sight when the CI checks are too many to list one by one.
         f.deploy = vec![run("completed", "success")];
         f.checks = (0..12)

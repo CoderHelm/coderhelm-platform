@@ -2019,65 +2019,66 @@ pub async fn run(
                 }
             }
             match listed {
-                Ok(checks) => match with_deploy_failures(
-                    ci_verdict_from_checks(&checks),
-                    &deploy_failing,
-                ) {
-                    CiVerdict::Pending if !waited_long_for_full_ci(&events, chrono::Utc::now()) => {
-                        info!(
+                Ok(checks) => {
+                    match with_deploy_failures(ci_verdict_from_checks(&checks), &deploy_failing) {
+                        CiVerdict::Pending
+                            if !waited_long_for_full_ci(&events, chrono::Utc::now()) =>
+                        {
+                            info!(
                             run_id = msg.run_id,
                             "A check failed but others still run on this head — waiting for the full set before fixing"
                         );
-                        send_delayed_resume(state, &msg, 90).await;
-                        return Ok(());
-                    }
-                    // A check stuck queued must not hold the fix for a day.
-                    CiVerdict::Pending => {}
-                    CiVerdict::Green => {
-                        info!(
+                            send_delayed_resume(state, &msg, 90).await;
+                            return Ok(());
+                        }
+                        // A check stuck queued must not hold the fix for a day.
+                        CiVerdict::Pending => {}
+                        CiVerdict::Green => {
+                            info!(
                             run_id = msg.run_id,
                             "The failure is not on the current head, which is green — treating CI as passed"
                         );
-                        has_ci_fail = false;
-                        has_ci_pass = true;
-                    }
-                    CiVerdict::NoChecks => {}
-                    CiVerdict::Failed => {
-                        let mut head_failing = failing_check_names(&checks);
-                        head_failing.extend(deploy_failing.iter().cloned());
-                        let base_failing = match gh
-                            .list_ci_for_ref(&repo_owner, &repo_name, &base_branch)
-                            .await
-                        {
-                            Ok(b) => failing_check_names(&b),
-                            Err(e) => {
-                                warn!(run_id = msg.run_id, error = %e, "Could not read the base branch's checks");
-                                Default::default()
+                            has_ci_fail = false;
+                            has_ci_pass = true;
+                        }
+                        CiVerdict::NoChecks => {}
+                        CiVerdict::Failed => {
+                            let mut head_failing = failing_check_names(&checks);
+                            head_failing.extend(deploy_failing.iter().cloned());
+                            let base_failing = match gh
+                                .list_ci_for_ref(&repo_owner, &repo_name, &base_branch)
+                                .await
+                            {
+                                Ok(b) => failing_check_names(&b),
+                                Err(e) => {
+                                    warn!(run_id = msg.run_id, error = %e, "Could not read the base branch's checks");
+                                    Default::default()
+                                }
+                            };
+                            let (own, base) = split_base_failures(&head_failing, &base_failing);
+                            on_base = base;
+                            red_on_base_only = own.is_empty() && !on_base.is_empty();
+                            if !red_on_base_only
+                                && try_rerun_once(
+                                    state,
+                                    &msg,
+                                    &gh,
+                                    &run_record,
+                                    &repo_owner,
+                                    &repo_name,
+                                    branch_head.as_deref(),
+                                    &events,
+                                    None,
+                                    false,
+                                )
+                                .await
+                                    == Some(Rerun::Started)
+                            {
+                                return Ok(());
                             }
-                        };
-                        let (own, base) = split_base_failures(&head_failing, &base_failing);
-                        on_base = base;
-                        red_on_base_only = own.is_empty() && !on_base.is_empty();
-                        if !red_on_base_only
-                            && try_rerun_once(
-                                state,
-                                &msg,
-                                &gh,
-                                &run_record,
-                                &repo_owner,
-                                &repo_name,
-                                branch_head.as_deref(),
-                                &events,
-                                None,
-                                false,
-                            )
-                            .await
-                                == Some(Rerun::Started)
-                        {
-                            return Ok(());
                         }
                     }
-                },
+                }
                 Err(e) => {
                     warn!(run_id = msg.run_id, error = %e, "Could not read the head's checks — fixing from the events");
                 }

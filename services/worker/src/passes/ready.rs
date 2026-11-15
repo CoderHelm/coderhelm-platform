@@ -2538,7 +2538,9 @@ mod tests {
             Decision::Held { reasons } => {
                 assert_eq!(reasons.len(), 1, "{reasons:?}");
                 assert!(
-                    reasons[0].line().contains("CI is failing on this head: `Deploy preview`"),
+                    reasons[0]
+                        .line()
+                        .contains("CI is failing on this head: `Deploy preview`"),
                     "{reasons:?}"
                 );
             }
@@ -2575,7 +2577,11 @@ mod tests {
             },
             ..green_approved()
         };
-        assert!(matches!(decide(&f), Decision::Wait { .. }), "{:?}", decide(&f));
+        assert!(
+            matches!(decide(&f), Decision::Wait { .. }),
+            "{:?}",
+            decide(&f)
+        );
     }
 
     #[test]

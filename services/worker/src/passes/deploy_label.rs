@@ -272,5 +272,8 @@ pub async fn before_ready(
             }
         }
     }
-    (deploy_label::standing(&want, &runs, added_at, now), !kept.is_empty())
+    (
+        deploy_label::standing(&want, &runs, added_at, now),
+        !kept.is_empty(),
+    )
 }

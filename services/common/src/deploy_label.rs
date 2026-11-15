@@ -681,9 +681,7 @@ mod tests {
 
     #[test]
     fn only_a_label_a_workflow_took_off_counts_as_taken_off_by_a_workflow() {
-        let ev = |event: &str, label: &str, login: &str| {
-            json!({"event": event, "label": {"name": label}, "actor": {"login": login}})
-        };
+        let ev = |event: &str, label: &str, login: &str| json!({"event": event, "label": {"name": label}, "actor": {"login": login}});
         let bots = ["github-actions[bot]", "coderhelm[bot]"];
         let events = json!([
             ev("labeled", "CI:DEPLOY_PREVIEW", "coderhelm[bot]"),
@@ -693,12 +691,24 @@ mod tests {
             ev("labeled", "e2e:devices", "coderhelm[bot]"),
             ev("unlabeled", "e2e:devices", "octocat"),
         ]);
-        assert_eq!(removed_by(Some(&events), "ci:deploy_preview", &bots), RemovedBy::Workflow);
+        assert_eq!(
+            removed_by(Some(&events), "ci:deploy_preview", &bots),
+            RemovedBy::Workflow
+        );
         // The latest removal decides: a person's, after a workflow's.
-        assert_eq!(removed_by(Some(&events), "e2e:devices", &bots), RemovedBy::Person);
+        assert_eq!(
+            removed_by(Some(&events), "e2e:devices", &bots),
+            RemovedBy::Person
+        );
         // No removal in the events, or the events unread: can't tell.
-        assert_eq!(removed_by(Some(&events), "other", &bots), RemovedBy::Unknown);
-        assert_eq!(removed_by(None, "CI:DEPLOY_PREVIEW", &bots), RemovedBy::Unknown);
+        assert_eq!(
+            removed_by(Some(&events), "other", &bots),
+            RemovedBy::Unknown
+        );
+        assert_eq!(
+            removed_by(None, "CI:DEPLOY_PREVIEW", &bots),
+            RemovedBy::Unknown
+        );
         let kept = KeptOff {
             label: "CI:DEPLOY_PREVIEW".into(),
             by: RemovedBy::Person,
@@ -720,7 +730,10 @@ mod tests {
                 by,
             }
             .evidence_line();
-            assert!(line.starts_with("`CI:DEPLOY_PREVIEW` was taken off by another app,"), "{line}");
+            assert!(
+                line.starts_with("`CI:DEPLOY_PREVIEW` was taken off by another app,"),
+                "{line}"
+            );
         }
         assert_eq!(
             removed_by(Some(&ev_bot("dana", "User")), "CI:DEPLOY_PREVIEW", &bots),
