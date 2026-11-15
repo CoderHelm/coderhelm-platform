@@ -951,6 +951,17 @@ pub async fn list(
         .as_ref()
         .is_some_and(|i| !s(i, "add_comment_url").is_empty());
     let jira_on = forge || jira_secret.is_some();
+    // The site's app is older than the latest release: what it lacks and
+    // where its admin accepts the update.
+    let app_update = if forge {
+        Box::pin(super::jira_app_status::for_config(
+            &state,
+            jira_config.as_ref(),
+        ))
+        .await
+    } else {
+        None
+    };
     items.push(card(
         "jira",
         "Jira",
@@ -962,7 +973,7 @@ pub async fn list(
         },
         "",
         "/settings/integrations/jira",
-        json!({ "app": forge }),
+        json!({ "app": forge, "app_update": app_update }),
     ));
 
     // AWS accounts: one card each (or one to connect the first).

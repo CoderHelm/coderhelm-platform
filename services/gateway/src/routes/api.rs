@@ -3933,6 +3933,16 @@ pub async fn forge_register_urls(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
+    // Sent on install, on an accepted update and on a settings save: the
+    // version the site runs from now on.
+    Box::pin(super::jira_app_status::record(
+        &state,
+        &team_id,
+        config_item.as_ref(),
+        &body,
+    ))
+    .await;
+
     info!(team_id, "Forge trigger URLs registered");
     Ok(StatusCode::NO_CONTENT)
 }

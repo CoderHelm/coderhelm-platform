@@ -310,6 +310,11 @@ pub async fn process_relayed(
                 .and_then(|n| n.parse::<u64>().ok())
         })
         .unwrap_or(0);
+    // The hosted app's version, kept for this install's own record of the site.
+    Box::pin(super::jira_app_status::record(
+        state, team_id, None, payload,
+    ))
+    .await;
     process_jira_payload(state, team_id, installation_id, payload).await
 }
 
@@ -921,6 +926,16 @@ pub async fn handle_forge(
         );
         return Err(StatusCode::FORBIDDEN);
     }
+
+    // The app's version (none from builds before it reported one), so the
+    // team sees when its site runs an older app.
+    Box::pin(super::jira_app_status::record(
+        &state,
+        &team_id,
+        config_item.as_ref(),
+        &payload,
+    ))
+    .await;
 
     // Hosted side of hybrid: the team linked its Jira site to a self-hosted
     // install. The event passed the team's own check; it goes there, and is

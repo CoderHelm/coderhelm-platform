@@ -651,10 +651,29 @@ test("the release roles: only release.yml on a v* tag in the approved release en
   assert.ok(auto.includes("environment: release-auto"));
   assert.ok(auto.indexOf("Check the published release") < auto.indexOf("role/coderhelm-prod-release-publisher"));
   assert.ok(auto.indexOf("role/coderhelm-prod-release-latest") > auto.indexOf("role/coderhelm-prod-release-publisher"));
+  // The Jira app's release writes launch/jira-app.json alone, from main's copy of its workflow on main.
+  const jiraPolicies = policies.filter((p) => JSON.stringify(p.Properties.Roles).includes("JiraAppLatestRole"));
+  assert.equal(jiraPolicies.length, 1);
+  assert.deepEqual(plainStatements(jiraPolicies[0].Properties.PolicyDocument.Statement), [
+    { Action: "s3:PutObject", Effect: "Allow", Resource: "arn:aws:s3:::coderhelm-public/launch/jira-app.json" },
+  ]);
+  const jiraRole = Object.values(w.findResources("AWS::IAM::Role")).find((r: any) => r.Properties.RoleName === "coderhelm-prod-jira-app-latest") as any;
+  assert.equal(jiraRole.Properties.AssumeRolePolicyDocument.Statement.length, 1, "one way in");
+  assert.deepEqual(jiraRole.Properties.AssumeRolePolicyDocument.Statement[0].Condition, {
+    StringEquals: {
+      "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+      "token.actions.githubusercontent.com:sub": "repo:CoderHelm/coderhelm-platform:ref:refs/heads/main",
+      "token.actions.githubusercontent.com:job_workflow_ref": "CoderHelm/coderhelm-platform/.github/workflows/jira-app-release.yml@refs/heads/main",
+    },
+  });
+  const jiraWf = fs.readFileSync(path.join(INFRA, "..", ".github", "workflows", "jira-app-release.yml"), "utf8");
+  assert.ok(jiraWf.includes("role/coderhelm-prod-jira-app-latest"));
+  for (const l of jiraWf.split("\n").filter((l) => /s3api put-object|aws s3 cp/.test(l))) assert.match(l, /--key launch\/jira-app\.json/, l);
   // Self-host installs have no publisher.
   const sh = synth(selfHost());
   assert.ok(!json(sh["coderhelm-prod-worker"]).includes("release-publisher"));
   assert.ok(!json(sh["coderhelm-prod-worker"]).includes("release-latest"));
+  assert.ok(!json(sh["coderhelm-prod-worker"]).includes("jira-app-latest"));
 });
 
 // ── Your own domain (docs/self-host/domains.md) ────────────────────────────

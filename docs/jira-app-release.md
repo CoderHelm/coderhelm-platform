@@ -13,7 +13,9 @@ Each run:
 3. Deploys to `staging`, if that environment exists.
 4. Deploys to `production`.
 5. Moves the `jira-app-production` tag to the released commit.
-6. Lists production installations with `forge install list` and runs `forge install --upgrade --non-interactive` on each one that is behind. Site addresses are read at run time and are never printed. The repo is public, and so are its run logs.
+6. Reads the production version Forge just numbered (`forge version list`) and publishes it as `launch/jira-app.json` in the public bucket (`{"version", "appId", "commit", "publishedAt"}`), through the `coderhelm-prod-jira-app-latest` role, which writes that one key only.
+7. Lists production installations with `forge install list` and runs `forge install --upgrade --non-interactive` on each one that is behind. Site addresses are read at run time and are never printed. The repo is public, and so are its run logs.
+8. Lists in the run summary each installation still behind, by number (never by address), with its major version and what that version lacks, and says the same in the warning.
 
 Forge numbers versions itself on each deploy, so there is nothing to bump in `package.json`.
 
@@ -47,6 +49,14 @@ A major version still deploys. The run then:
 - opens an issue titled "Jira app update needs a site admin" in this repo, or comments on the open one, so GitHub notifies the repo's watchers. The issue gives counts and the changed permissions, never site names.
 
 On every other site, an admin must accept the update. In Jira, they open **Settings (gear) → Apps → Manage apps**, find **Coderhelm** and click **Update**. CI cannot do this for them. When the update is accepted, the app's lifecycle trigger sends the site's web trigger URLs to CoderHelm again, so nobody has to re-save the settings page.
+
+## Which version each site runs
+
+The app sends its own version (Forge's `appVersion`) and app id with every Jira event and every trigger registration. The gateway keeps the latest seen per site in the team's `JIRA#config` (`app_version`, `app_version_seen_at`, `app_id`) and compares it with `launch/jira-app.json`, read without credentials and kept for ten minutes. A site is behind when its version is older, or when its events carry no version at all (builds from before the app reported one).
+
+When a site is behind, the Integrations page's Jira row says which version it runs, the latest, what it lacks and how its admin accepts the update, with a link to the site's Manage apps page; a run on a ticket from that site says its comments may be incomplete. Both go away with the next event or registration from the updated app (accepting an update sends a registration at once).
+
+What each version lacks comes from `services/common/src/jira_app_features.json`: the first released version with each feature, from the app's git history and the version each release run deployed. Add a row when a release adds something a team would miss on an older site. The run summary reads the same table.
 
 These steps stay manual too:
 

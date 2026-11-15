@@ -14,9 +14,20 @@ Commands:
   summary   Print the run-summary text for a result saved by `diff --json`.
 
   pending   Read `forge install list --json` and print the installations that
-            are behind (one "site<TAB>product" line each), so the workflow can
-            upgrade them. The output holds site addresses: the workflow writes
-            it to a file and never prints it, because the run logs are public.
+            are behind (one "site<TAB>product<TAB>major" line each), so the
+            workflow can upgrade them. The output holds site addresses: the
+            workflow writes it to a file and never prints it, because the run
+            logs are public.
+
+  latest    Read `forge version list --json` and the manifest, and print the
+            pointer CoderHelm reads to know the newest production version
+            (launch/jira-app.json): {"version", "appId", "commit", "publishedAt"}.
+
+  behind    Read the installations still behind after the upgrade step (one
+            "major<TAB>product" line each, no site addresses) and print the run
+            summary's list and the warning, each with what that version lacks
+            (the feature table CoderHelm itself shows,
+            services/common/src/jira_app_features.json).
 
 Only the standard library and PyYAML are used.
 """
@@ -191,8 +202,14 @@ def summary_markdown(result):
 _BEHIND = re.compile(r"out-?of-?date|outdated", re.IGNORECASE)
 
 
+def major_of(text):
+    """The major version at the start of `forge install list`'s "5 (Out-of-date)"."""
+    m = re.match(r"\s*v?(\d+)", str(text or ""))
+    return int(m.group(1)) if m else None
+
+
 def pending_installs(installs, environment="production"):
-    """(site, product) for each installation in `environment` that is behind."""
+    """(site, product, major) for each installation in `environment` that is behind."""
     out = []
     for inst in installs or []:
         if str(inst.get("environment", "")).lower() != environment:
@@ -202,8 +219,85 @@ def pending_installs(installs, environment="production"):
             continue
         site, product = inst.get("site"), str(inst.get("product", "")).lower()
         if site and product:
-            out.append((site, product))
+            major = major_of(inst.get("majorVersion"))
+            out.append((site, product, "" if major is None else str(major)))
     return out
+
+
+# ---------------------------------------------------------------------------
+# Versions
+# ---------------------------------------------------------------------------
+
+
+def parse_version(text):
+    """(major, minor, patch) from "6.10.0" or "v6.10"; None otherwise."""
+    m = re.fullmatch(r"\s*v?(\d+)(?:\.(\d+))?(?:\.(\d+))?\s*", str(text or ""))
+    return tuple(int(g or 0) for g in m.groups()) if m else None
+
+
+def latest_version(versions):
+    """The highest version in `forge version list --json` (one entry per major)."""
+    found = [parse_version(v.get("version")) for v in versions or [] if isinstance(v, dict)]
+    found = [v for v in found if v]
+    return ".".join(map(str, max(found))) if found else None
+
+
+def latest_pointer(versions, manifest, commit="", published_at=""):
+    """The pointer CoderHelm reads; None when no version is known."""
+    version = latest_version(versions)
+    if not version:
+        return None
+    app_id = str(((manifest or {}).get("app") or {}).get("id") or "")
+    return {"version": version, "appId": app_id, "commit": commit, "publishedAt": published_at}
+
+
+def load_features(path):
+    """[(since, feature)] from the feature table, oldest first."""
+    with open(path, encoding="utf-8") as f:
+        rows = json.load(f)
+    out = [(parse_version(r.get("since")), str(r.get("feature", ""))) for r in rows]
+    return sorted([r for r in out if r[0] and r[1]])
+
+
+def missing_on_major(features, major):
+    """What a site on major version `major` lacks (None: unknown, so all of it)."""
+    return [name for since, name in features if major is None or since[0] > major]
+
+
+def behind_report(lines, latest, features):
+    """(summary markdown, warning text) for the installations still behind.
+
+    `lines` are "major<TAB>product": sites are numbered, never named, because
+    the run summary and log are public.
+    """
+    rows = []
+    for line in lines:
+        if not line.strip():
+            continue
+        parts = line.rstrip("\n").split("\t")
+        major = int(parts[0]) if parts[0].strip().isdigit() else None
+        product = parts[1].strip() if len(parts) > 1 else ""
+        rows.append((major, product))
+    if not rows:
+        return "", ""
+    latest_text = f"latest {latest}" if latest else "latest unknown"
+    md = ["", "## Sites still behind", ""]
+    md.append("Each one runs an older Coderhelm app until its Jira admin accepts the update:")
+    md.append("Jira Settings, Apps, Manage apps, Coderhelm, Update. CoderHelm shows the same on the team's Integrations page.")
+    md.append("")
+    lacking = []
+    for i, (major, product) in enumerate(rows, 1):
+        version = f"major version {major}" if major is not None else "an unknown version"
+        missing = missing_on_major(features, major)
+        lacks = f" Missing: {', '.join(missing)}." if missing else ""
+        md.append(f"- Site {i} ({product or 'jira'}): {version} ({latest_text}).{lacks}")
+        lacking += [m for m in missing if m not in lacking]
+    what = f" They lack: {', '.join(lacking)}." if lacking else ""
+    warning = (
+        f"{len(rows)} installation(s) still run an older Coderhelm app ({latest_text}).{what}"
+        " A Jira admin on each site must accept the update: Jira Settings, Apps, Manage apps, Coderhelm, Update."
+    )
+    return "\n".join(md) + "\n", warning
 
 
 # ---------------------------------------------------------------------------
@@ -228,6 +322,18 @@ def main(argv=None):
     pe.add_argument("--installs", required=True, help="output of `forge install list --json`")
     pe.add_argument("--environment", default="production")
 
+    la = sub.add_parser("latest", help="print the latest-version pointer")
+    la.add_argument("--versions", required=True, help="output of `forge version list --json`")
+    la.add_argument("--manifest", required=True)
+    la.add_argument("--commit", default="")
+    la.add_argument("--published-at", default="")
+
+    be = sub.add_parser("behind", help="summary and warning for installations still behind")
+    be.add_argument("--failed", required=True, help='"major<TAB>product" lines')
+    be.add_argument("--latest", default="")
+    be.add_argument("--features", required=True, help="the feature table (JSON)")
+    be.add_argument("--summary", help="append the markdown here")
+
     args = p.parse_args(argv)
 
     if args.cmd == "diff":
@@ -248,10 +354,30 @@ def main(argv=None):
             print(summary_markdown(json.load(f)), end="")
         return 0
 
+    if args.cmd == "latest":
+        with open(args.versions, encoding="utf-8") as f:
+            versions = json.load(f)
+        pointer = latest_pointer(versions, load_manifest(args.manifest), args.commit, args.published_at)
+        if not pointer:
+            print("no production version found", file=sys.stderr)
+            return 1
+        print(json.dumps(pointer))
+        return 0
+
+    if args.cmd == "behind":
+        with open(args.failed, encoding="utf-8") as f:
+            lines = f.readlines()
+        md, warning = behind_report(lines, args.latest, load_features(args.features))
+        if args.summary and md:
+            with open(args.summary, "a", encoding="utf-8") as f:
+                f.write(md)
+        print(warning)
+        return 0
+
     with open(args.installs, encoding="utf-8") as f:
         installs = json.load(f)
-    for site, product in pending_installs(installs, args.environment):
-        print(f"{site}\t{product}")
+    for site, product, major in pending_installs(installs, args.environment):
+        print(f"{site}\t{product}\t{major}")
     return 0
 
 
