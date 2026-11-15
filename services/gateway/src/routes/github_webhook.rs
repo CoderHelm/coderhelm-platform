@@ -2193,20 +2193,15 @@ async fn handle_pull_request(
             .await;
 
             // ── Plan task dependency continuation ──
-            // If this run's issue belongs to a plan task, check for waiting dependents.
-            if let Some(issue_num) = item
-                .get("issue_number")
-                .and_then(|v| v.as_n().ok())
-                .and_then(|n| n.parse::<u64>().ok())
-            {
-                if let Err(e) = trigger_plan_dependents(state, team_id, issue_num).await {
-                    warn!(
-                        team_id,
-                        issue_num,
-                        error = %e,
-                        "Failed to check plan task dependents"
-                    );
-                }
+            // If this run's ticket came from a plan task, start the tasks
+            // waiting on it.
+            if let Err(e) = trigger_plan_dependents(state, team_id, item).await {
+                warn!(
+                    team_id,
+                    run_id,
+                    error = %e,
+                    "Failed to check plan task dependents"
+                );
             }
         }
     }
@@ -4786,133 +4781,37 @@ async fn write_run_event(
     }
 }
 
-/// After a PR merges, check if the merged run's issue belongs to a plan task.
-/// If so, find waiting tasks that depend on it and dispatch them to the worker.
+/// After a PR merges, start the plan tasks waiting on the merged run's task,
+/// found through its ticket's plan link (see `common::plan_dependents`).
 async fn trigger_plan_dependents(
     state: &AppState,
     team_id: &str,
-    issue_number: u64,
+    run: &common::paged::Item,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use aws_sdk_dynamodb::types::AttributeValue;
+    use common::plan_dependents::{dependents_to_release, DynamoPlans, MergedRun};
 
-    // Query all items in the plans table for this team (plans + tasks share pk)
-    let mut exclusive_start_key = None;
-    let mut matched_plan_id = String::new();
-    let mut matched_task_id = String::new();
-
-    'outer: loop {
-        let mut query = state
-            .dynamo
-            .query()
-            .table_name(&state.config.plans_table_name)
-            .key_condition_expression("pk = :pk")
-            .expression_attribute_values(":pk", AttributeValue::S(team_id.to_string()));
-
-        if let Some(key) = exclusive_start_key.take() {
-            query = query.set_exclusive_start_key(Some(key));
-        }
-
-        let result = query.send().await?;
-
-        for item in result.items() {
-            // Only look at task items (sk contains #TASK#)
-            let sk = item
-                .get("sk")
-                .and_then(|v| v.as_s().ok())
-                .cloned()
-                .unwrap_or_default();
-            if !sk.contains("#TASK#") {
-                continue;
-            }
-
-            let item_issue = item
-                .get("issue_number")
-                .and_then(|v| v.as_n().ok())
-                .and_then(|n| n.parse::<u64>().ok())
-                .unwrap_or(0);
-            if item_issue == issue_number {
-                // Parse plan_id and task_id from sk: PLAN#<plan_id>#TASK#<task_id>
-                let parts: Vec<&str> = sk.split('#').collect();
-                if parts.len() >= 4 {
-                    matched_plan_id = parts[1].to_string();
-                    matched_task_id = parts[3].to_string();
-                }
-                break 'outer;
-            }
-        }
-
-        match result.last_evaluated_key() {
-            Some(key) => exclusive_start_key = Some(key.clone()),
-            None => break,
-        }
-    }
-
-    if matched_plan_id.is_empty() || matched_task_id.is_empty() {
-        return Ok(()); // Not a plan task — nothing to do
-    }
+    let store = DynamoPlans {
+        dynamo: state.dynamo.clone(),
+        settings_table: state.config.settings_table_name.clone(),
+        plans_table: state.config.plans_table_name.clone(),
+    };
+    let Some(release) = dependents_to_release(&store, team_id, &MergedRun::from_item(run)).await?
+    else {
+        return Ok(()); // Not a plan task, or nothing waits on it
+    };
 
     info!(
         team_id,
-        plan_id = %matched_plan_id,
-        task_id = %matched_task_id,
-        "Merged PR belongs to plan task — checking for waiting dependents"
-    );
-
-    // Query all tasks in this plan to find those waiting on the matched task
-    let tasks_result = state
-        .dynamo
-        .query()
-        .table_name(&state.config.plans_table_name)
-        .key_condition_expression("pk = :pk AND begins_with(sk, :sk_prefix)")
-        .expression_attribute_values(":pk", AttributeValue::S(team_id.to_string()))
-        .expression_attribute_values(
-            ":sk_prefix",
-            AttributeValue::S(format!("PLAN#{}#TASK#", matched_plan_id)),
-        )
-        .send()
-        .await?;
-
-    let mut tasks_to_continue: Vec<String> = Vec::new();
-    for item in tasks_result.items() {
-        let status = item
-            .get("status")
-            .and_then(|v| v.as_s().ok())
-            .map(String::as_str)
-            .unwrap_or("");
-        let depends_on = item
-            .get("depends_on")
-            .and_then(|v| v.as_s().ok())
-            .map(String::as_str)
-            .unwrap_or("");
-
-        if status == "waiting" && depends_on == matched_task_id {
-            let sk = item
-                .get("sk")
-                .and_then(|v| v.as_s().ok())
-                .map(String::as_str)
-                .unwrap_or("");
-            let parts: Vec<&str> = sk.split('#').collect();
-            if parts.len() >= 4 {
-                tasks_to_continue.push(parts[3].to_string());
-            }
-        }
-    }
-
-    if tasks_to_continue.is_empty() {
-        return Ok(());
-    }
-
-    info!(
-        team_id,
-        plan_id = %matched_plan_id,
-        tasks = tasks_to_continue.len(),
-        "Triggering waiting plan tasks"
+        plan_id = %release.plan_id,
+        task_id = %release.task_id,
+        tasks = release.tasks.len(),
+        "Merged PR belongs to plan task — triggering waiting plan tasks"
     );
 
     let message = WorkerMessage::PlanTaskContinue(PlanTaskContinueMessage {
         team_id: team_id.to_string(),
-        plan_id: matched_plan_id,
-        tasks: tasks_to_continue,
+        plan_id: release.plan_id,
+        tasks: release.tasks,
     });
 
     let body = serde_json::to_string(&message)?;
