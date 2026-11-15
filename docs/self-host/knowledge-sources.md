@@ -36,7 +36,7 @@ The token path stays as the second choice in the add flow ("Use an API token ins
 
 ### Notion and Confluence sign-ins
 
-Notion (`mcp.notion.com`) and Atlassian (`mcp.atlassian.com`) also run remote MCP servers with dynamic registration, but their tools can't keep a knowledge base in sync yet: Notion's can't list a page's children or give an edit time without reading each whole page, and cuts long pages short; Atlassian's doesn't publish its tools' arguments or answers. Their sources keep using the OAuth apps below, or the keys saved on the Integrations page. Agents can still use both servers through Connected apps.
+Notion (`mcp.notion.com`) and Atlassian (`mcp.atlassian.com/v2/mcp`, the agent tools part of the one Atlassian connection) also run remote MCP servers with dynamic registration, but their tools can't keep a knowledge base in sync yet: Notion's can't list a page's children or give an edit time without reading each whole page, and cuts long pages short; Atlassian's doesn't publish its tools' arguments or answers. Their sources keep using the OAuth apps below, or the keys saved on the Integrations page. Agents can still use both servers through Connected apps.
 
 ## Without a sign-in app: tokens in the add flow
 
@@ -84,7 +84,9 @@ People pick which pages to share on Notion's own consent screen; CoderHelm sees 
 
 Events are checked with `X-Notion-Signature` (HMAC-SHA256 with that token). An event only starts a sync; what changed is always read back with the team's own connection. Without it, Notion sources sync every hour.
 
-## Confluence (Atlassian)
+## Atlassian: the Confluence sign-in
+
+This is the Confluence part of the one Atlassian connection (Settings, Integrations, Atlassian).
 
 1. Open <https://developer.atlassian.com/console/myapps/> and create an **OAuth 2.0 integration**.
 2. Under **Permissions**, add the Confluence API, then add exactly the scopes CoderHelm asks for. A scope the sign-in asks for but the app doesn't have makes Atlassian's consent page fail.

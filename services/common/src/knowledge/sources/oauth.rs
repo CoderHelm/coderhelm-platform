@@ -308,6 +308,7 @@ pub fn connection_record(
             .collect(),
         token_body_json: p.json_body,
         refresh_endpoint: String::new(),
+        discovered_at: 0,
     });
     s
 }
@@ -352,6 +353,7 @@ pub fn brokered_connection_record(
         extra_authorize: vec![],
         token_body_json: false,
         refresh_endpoint: String::new(),
+        discovered_at: 0,
     });
     s
 }

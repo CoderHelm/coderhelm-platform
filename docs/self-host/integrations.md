@@ -87,7 +87,9 @@ Two ways. A team picks one in **Settings, Integrations, Jira**.
 
 ## Monitoring and data sources
 
-New Relic, Confluence, OpenSearch, REST APIs, SQL databases, CloudWatch metrics and Airflow connect from **Settings, Integrations** or **Data sources** with keys or the AWS role. None needs an app of its own or a URL of CoderHelm's. A team signed in to Confluence for Knowledge needs no token for runs: its Confluence card on Settings, Integrations reads Connected, and Use in runs too lets agents read pages with the same sign-in (reading only).
+New Relic, Confluence, OpenSearch, REST APIs, SQL databases, CloudWatch metrics and Airflow connect from **Settings, Integrations** or **Data sources** with keys or the AWS role. None needs an app of its own or a URL of CoderHelm's. A team signed in to Confluence for Knowledge needs no token for runs: the Confluence part of the Atlassian row on Settings, Integrations reads Connected, and Use in runs too lets agents read pages with the same sign-in (reading only).
+
+**Atlassian is one connection.** Settings, Integrations has one Atlassian row with three parts: Jira (CoderHelm's Jira app, or a webhook: ticket events, comments and ticket writes), Confluence (pages for runs and Knowledge: an Atlassian sign-in, an API token, or the Jira app) and agent tools (Atlassian's own MCP server). Connect signs in for Confluence, then agent tools; the Jira app is installed by a Jira admin from the Jira page. Connections made before keep working unchanged.
 
 - **New Relic**\
   A user API key, and the US or EU region.

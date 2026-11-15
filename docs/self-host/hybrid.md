@@ -11,7 +11,7 @@ A **hybrid** install runs entirely in your AWS account, like any self-hosted Cod
 | **A CoderHelm address**, `yourname.coderhelm.com` | buying a domain and adding DNS records | a real address with HTTPS in a few minutes, set up end to end |
 | **CoderHelm's GitHub App**, through the event relay | creating and keeping your own GitHub App | install one app on your organization; events and tokens arrive at your install |
 | **CoderHelm's Jira app**, through the event relay | setting up your own Jira app | link your Jira site once; its events arrive at your install, without the app's secret |
-| **CoderHelm's integration apps** (Notion, Confluence, Google Drive, Figma, and any CoderHelm adds later) | registering an app with each provider | sign in with one click, as on coderhelm.com |
+| **CoderHelm's integration apps** (Atlassian's Confluence sign-in, Notion, Google Drive, Figma, and any CoderHelm adds later) | registering an app with each provider | sign in with one click, as on coderhelm.com |
 
 Each part is a separate choice, at install time (the [install guide](/self-host/install/)) or later in **Settings, System, Hybrid**. **Fully private** (your own domain or the AWS address, your own GitHub App and apps) sends nothing to CoderHelm and needs no registration.
 
@@ -150,7 +150,7 @@ The Setup checks show the link as `hybrid_jira` (in Settings, Setup and the inst
 
 **Settings, System, Hybrid, Other apps** is one choice for the whole install. The install guide offers the same choice under **What CoderHelm sets up for you** and applies it when the install registers.
 
-- **Use Coderhelm's apps (easiest)** is the default. Every tool CoderHelm has an app for uses it: today Jira, Notion, Confluence, Google Drive and Figma. A tool CoderHelm adds in a later release is on as soon as your install runs that release, with nothing more to choose.
+- **Use Coderhelm's apps (easiest)** is the default. Every tool CoderHelm has an app for uses it: today Atlassian (the Jira app and the Confluence sign-in), Notion, Google Drive and Figma. A tool CoderHelm adds in a later release is on as soon as your install runs that release, with nothing more to choose.
 - **Fully private** means no tool signs in or sends events through CoderHelm. Each tool uses your team's own app, which you set up on that tool's card in **Settings, Integrations**.
 
 GitHub is not part of this choice: it keeps its own, under **GitHub** on the same page.
@@ -168,7 +168,7 @@ An install that chose per tool in an earlier release moves to this choice once, 
 | Integration | Through CoderHelm's app | Notes |
 |---|---|---|
 | GitHub | yes | relay and token broker |
-| Jira (Forge app) | yes | install CoderHelm's Jira app and enter your install id as the team id, or link a hosted team's site ([Jira through CoderHelm](#jira-through-coderhelm)) |
+| Atlassian: the Jira app | yes | install CoderHelm's Jira app and enter your install id as the team id, or link a hosted team's site ([Jira through CoderHelm](#jira-through-coderhelm)) |
 | Notion, Confluence, Google Drive | yes | one-click sign-in through CoderHelm; tokens brokered |
 | Figma | yes | one-click sign-in through CoderHelm's public Figma app (read-only); tokens brokered, your install calls Figma's API |
 | Slack and Teams notifications | not needed | your install posts to the incoming webhook you paste |

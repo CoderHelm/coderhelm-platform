@@ -518,7 +518,7 @@ pub const CATALOG: &[McpServerDef] = &[
     McpServerDef {
         id: "atlassian",
         name: "Atlassian",
-        description: "Search and read Jira issues and Confluence pages through Atlassian's remote MCP server.",
+        description: "Agent tools for Jira issues and Confluence pages, through Atlassian's own remote MCP server (Rovo). Part of the one Atlassian connection.",
         category: "Project Management",
         tier: 2,
         icon: "atlassian",
@@ -529,7 +529,10 @@ pub const CATALOG: &[McpServerDef] = &[
         recommended_permissions: "Sign in with an account that can read the projects and spaces agents need",
         npx_package: "",
         env_mapping: &[],
-        remote_url: "https://mcp.atlassian.com/v1/mcp",
+        // The current server. Its 401 names its protected resource metadata,
+        // and that names the sign-in server, so nothing about the sign-in is
+        // written down here (v1's sign-in page answers 500 to everyone).
+        remote_url: "https://mcp.atlassian.com/v2/mcp",
         remote_key: false,
         key_unavailable: "",
     },
@@ -538,6 +541,19 @@ pub const CATALOG: &[McpServerDef] = &[
 /// The catalog entry for a server id.
 pub fn find(id: &str) -> Option<&'static McpServerDef> {
     CATALOG.iter().find(|p| p.id == id)
+}
+
+/// The address a catalog server's saved record should use now: the
+/// catalog's, when the record was made from the catalog (its id is the
+/// catalog id) and the vendor has since moved its server. `None` when
+/// nothing changed or the record isn't a catalog one.
+pub fn moved_remote_url(record_id: &str, catalog_id: &str, url: &str) -> Option<&'static str> {
+    if record_id != catalog_id {
+        return None;
+    }
+    let p = find(catalog_id)?;
+    let now = p.remote_url;
+    (!now.is_empty() && now.trim_end_matches('/') != url.trim_end_matches('/')).then_some(now)
 }
 
 /// Where a person creates the key for a catalog server, in plain words, for
