@@ -294,11 +294,15 @@ impl TicketHistory {
     }
 
     /// Whether `p` is the ticket's own pull request: an earlier run of the
-    /// ticket opened it, or its title or branch names the ticket.
-    fn for_ticket(&self, p: &EarlierPr, ticket_id: &str) -> bool {
+    /// ticket opened it, its title or branch names the ticket, or, for a
+    /// GitHub issue (`issue`), it is in the issue's repository and its
+    /// title carries `#<n>` or its description closes the issue
+    /// ([`links_issue`]).
+    fn for_ticket(&self, p: &EarlierPr, ticket_id: &str, issue: Option<Issue>) -> bool {
         self.opened_by_run(&p.repo, p.number)
             || super::mentions_ticket(&p.title, ticket_id)
             || super::mentions_ticket(&p.branch, ticket_id)
+            || links_issue(issue, &p.repo, &p.title, &p.body)
     }
 
     /// Every earlier pull request for the ticket as `(repo, number)`: the
@@ -798,9 +802,68 @@ fn pr_note(p: &EarlierPr) -> String {
     out
 }
 
+/// A GitHub issue: its repository (`owner/name`) and number.
+pub type Issue<'a> = (&'a str, u64);
+
+/// Words that make a GitHub closing reference.
+const CLOSING_WORDS: [&str; 9] = [
+    "close", "closes", "closed", "fix", "fixes", "fixed", "resolve", "resolves", "resolved",
+];
+
+/// Whether a pull request in `repo` is for the GitHub issue `issue`: it is
+/// in the issue's own repository, and its title carries `#<n>` or its
+/// description has a closing reference to the issue ([`closes_issue`]).
+/// Any other mention of the issue is context, not a link.
+fn links_issue(issue: Option<Issue>, repo: &str, title: &str, body: &str) -> bool {
+    issue.is_some_and(|(own, n)| {
+        own.eq_ignore_ascii_case(repo) && (title_refs_issue(title, n) || closes_issue(body, own, n))
+    })
+}
+
+/// `#<n>` in a title as a whole reference: not `#<n>0`, and not another
+/// repository's (`acme/api#<n>`).
+fn title_refs_issue(title: &str, n: u64) -> bool {
+    let want = format!("#{n}");
+    let mut from = 0;
+    while let Some(i) = title[from..].find(&want) {
+        let at = from + i;
+        let before = title[..at].chars().next_back();
+        let after = title[at + want.len()..].chars().next();
+        let whole_before = before
+            .is_none_or(|c| !(c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_' | '.')));
+        let whole_after = after.is_none_or(|c| !c.is_ascii_alphanumeric());
+        if whole_before && whole_after {
+            return true;
+        }
+        from = at + want.len();
+    }
+    false
+}
+
+/// A GitHub closing reference to issue `n` of `repo` in a description: a
+/// closing word ([`CLOSING_WORDS`], any case) followed by `#<n>`,
+/// `owner/name#<n>` or the issue's URL.
+fn closes_issue(body: &str, repo: &str, n: u64) -> bool {
+    let lower = body.to_ascii_lowercase();
+    let repo = repo.to_ascii_lowercase();
+    let refs = [
+        format!("#{n}"),
+        format!("{repo}#{n}"),
+        format!("https://github.com/{repo}/issues/{n}"),
+    ];
+    let words: Vec<&str> = lower.split_whitespace().collect();
+    words.windows(2).any(|w| {
+        let word = w[0].trim_matches(|c: char| !c.is_ascii_alphanumeric());
+        let reference = w[1].trim_end_matches(|c: char| matches!(c, ',' | '.' | ')' | ';' | ':'));
+        CLOSING_WORDS.contains(&word) && refs.iter().any(|r| r == reference)
+    })
+}
+
 /// Adds every pull request for the ticket in `repos` (`owner/name`, the
 /// team's repositories, searched in order): the ones the ticket's runs
-/// opened, and any whose title, branch or description names the ticket.
+/// opened, any whose title, branch or description names the ticket, and,
+/// for a GitHub issue (`issue`), any in its repository that links it
+/// ([`links_issue`]).
 /// Each is read in full: description, comments, reviews, inline review
 /// threads, and how it ended (GitHub's `closed` event: who and when; for a
 /// merged one, who merged it). Best-effort, bounded by [`MAX_PRS`].
@@ -809,6 +872,7 @@ pub async fn add_earlier_prs(
     github: &crate::clients::github::GitHubClient,
     repos: &[String],
     ticket_id: &str,
+    issue: Option<Issue<'_>>,
 ) {
     let mut found: Vec<(String, u64)> = Vec::new();
     // Every pull request an earlier run opened, in its own repository (a
@@ -830,9 +894,12 @@ pub async fn add_earlier_prs(
                 Ok(v) => {
                     for p in v.as_array().into_iter().flatten() {
                         let number = p["number"].as_u64().unwrap_or(0);
-                        let names = [&p["title"], &p["head"]["ref"], &p["body"]]
+                        let text = |v: &serde_json::Value| v.as_str().unwrap_or("").to_string();
+                        let (title, body) = (text(&p["title"]), text(&p["body"]));
+                        let names = [&title, &text(&p["head"]["ref"]), &body]
                             .iter()
-                            .any(|t| super::mentions_ticket(t.as_str().unwrap_or(""), ticket_id));
+                            .any(|t| super::mentions_ticket(t, ticket_id))
+                            || links_issue(issue, repo, &title, &body);
                         let key = (repo.clone(), number);
                         if number > 0 && names && !found.contains(&key) {
                             found.push(key);
@@ -848,7 +915,7 @@ pub async fn add_earlier_prs(
     found.truncate(MAX_PRS);
     for (repo, number) in found {
         if let Some(mut p) = read_pr(github, &repo, number).await {
-            p.for_ticket = history.for_ticket(&p, ticket_id);
+            p.for_ticket = history.for_ticket(&p, ticket_id, issue);
             history.prs.push(p);
         }
     }
@@ -1201,7 +1268,7 @@ mod tests {
         prep.branch = "feature/web-43".into();
         prep.body = "Prepares the API for WEB-42".into();
         prep.closed_at = "2026-11-02T10:00:00Z".into();
-        prep.for_ticket = h.for_ticket(&prep, "WEB-42");
+        prep.for_ticket = h.for_ticket(&prep, "WEB-42", None);
         assert!(!prep.for_ticket);
         h.prs.push(prep.clone());
         assert_eq!(h.blocking_merge(&TicketSource::Jira, "acme/app"), None);
@@ -1219,11 +1286,11 @@ mod tests {
             ..prep.clone()
         };
         for p in [&by_title, &by_branch, &by_run] {
-            assert!(h.for_ticket(p, "WEB-42"), "{p:?}");
+            assert!(h.for_ticket(p, "WEB-42", None), "{p:?}");
         }
         let mut stopped = h.clone();
         let mut own = by_title.clone();
-        own.for_ticket = h.for_ticket(&own, "WEB-42");
+        own.for_ticket = h.for_ticket(&own, "WEB-42", None);
         stopped.prs.push(own);
         assert_eq!(
             stopped
@@ -1231,6 +1298,44 @@ mod tests {
                 .map(|p| p.subject()),
             Some("acme/app#43".to_string())
         );
+    }
+
+    /// A person's PR on a GitHub issue links it the way GitHub does: `#42`
+    /// in its title, or a closing reference ("Fixes #42") in its
+    /// description. Either one, merged (into `develop` too), stops a run on
+    /// acme/api's GH-42. "prepares for #42" is only a mention, and a
+    /// closing reference from another repository's PR names another
+    /// repository's issue 42.
+    #[test]
+    fn a_github_closing_reference_or_title_number_marks_the_issues_pr() {
+        use common::messages::TicketSource;
+        let issue = Some(("acme/api", 42));
+        let stops = |title: &str, body: &str, repo: &str, base: &str| {
+            let mut p = earlier(repo, 7, "pat", "merged", "2026-11-01");
+            p.title = title.into();
+            p.branch = "pat/login".into();
+            p.body = body.into();
+            p.base = base.into();
+            p.closed_at = "2026-11-02T10:00:00Z".into();
+            let mut h = TicketHistory::default();
+            p.for_ticket = h.for_ticket(&p, "GH-42", issue);
+            h.prs.push(p);
+            h.blocking_merge(&TicketSource::Github, "acme/api").is_some()
+        };
+        assert!(stops("Fix login (#42)", "", "acme/api", "main"));
+        assert!(stops("Fix login", "Fixes #42", "acme/api", "develop"));
+        assert!(stops("Fix login", "This resolves: acme/api#42.", "acme/api", "main"));
+        assert!(stops(
+            "Fix login",
+            "Closes https://github.com/acme/api/issues/42",
+            "acme/api",
+            "main"
+        ));
+        assert!(!stops("Fix login", "This prepares for #42", "acme/api", "main"));
+        assert!(!stops("Fix login", "See #42; related to #42", "acme/api", "main"));
+        assert!(!stops("Fix login (#420)", "Fixes #421", "acme/api", "main"));
+        assert!(!stops("Bump acme/web#42", "Fixes acme/web#42", "acme/api", "main"));
+        assert!(!stops("Fix login (#42)", "Fixes #42", "acme/web", "main"));
     }
 
     /// A re-run continues on CoderHelm's own open PR in the same repo: the

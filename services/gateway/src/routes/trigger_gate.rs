@@ -238,18 +238,32 @@ type Item = std::collections::HashMap<String, AttributeValue>;
 /// the issue's pull request had already merged (`common::merged_ticket`).
 /// A person's explicit start on that issue (a command, the dashboard) then
 /// asks for the work anyway and carries `after_merge`.
-pub fn latest_stopped_as_merged(items: &[Item], repo: &str) -> bool {
-    fn s<'a>(i: &'a Item, k: &str) -> &'a str {
-        i.get(k)
-            .and_then(|v| v.as_s().ok())
-            .map(|v| v.as_str())
-            .unwrap_or("")
-    }
+pub fn latest_stopped_as_merged(items: Vec<Item>, repo: &str) -> bool {
+    latest_run(&own_runs(items, Some(repo)))
+        .is_some_and(|i| field(i, "stop_kind") == common::merged_ticket::STOP_KIND)
+}
+
+fn field<'a>(i: &'a Item, k: &str) -> &'a str {
+    i.get(k)
+        .and_then(|v| v.as_s().ok())
+        .map(|v| v.as_str())
+        .unwrap_or("")
+}
+
+/// The ticket's runs in `repo` (`owner/name`), for a GitHub issue (its
+/// number names it only within its repository); all of them otherwise.
+fn own_runs(items: Vec<Item>, repo: Option<&str>) -> Vec<Item> {
+    items
+        .into_iter()
+        .filter(|i| repo.is_none_or(|r| field(i, "repo").eq_ignore_ascii_case(r)))
+        .collect()
+}
+
+/// The newest run (ULIDs sort lexicographically by creation time).
+fn latest_run(items: &[Item]) -> Option<&Item> {
     items
         .iter()
-        .filter(|i| s(i, "repo").eq_ignore_ascii_case(repo))
-        .max_by(|a, b| s(a, "run_id").cmp(s(b, "run_id")))
-        .is_some_and(|i| s(i, "stop_kind") == common::merged_ticket::STOP_KIND)
+        .max_by(|a, b| field(a, "run_id").cmp(field(b, "run_id")))
 }
 
 /// [`latest_stopped_as_merged`] for the GitHub issue `ticket_id` in `repo`,
@@ -262,7 +276,7 @@ pub async fn github_issue_stopped_as_merged(
     repo: &str,
 ) -> bool {
     match ticket_runs(state, team_id, ticket_id).await {
-        Ok(items) => latest_stopped_as_merged(&items, repo),
+        Ok(items) => latest_stopped_as_merged(items, repo),
         Err(e) => {
             warn!(team_id, ticket_id, error = %e, "Could not read the issue's runs");
             false
@@ -276,7 +290,9 @@ pub async fn github_issue_stopped_as_merged(
 /// content; pass `None` when the caller cannot compute it (treated as
 /// unchanged for completed tickets). `explicit` marks direct human commands,
 /// which bypass the content check. `reopened`: the event moved the ticket
-/// back to an open status ([`jira_reopened`]).
+/// back to an open status ([`jira_reopened`]). `repo` (`owner/name`): a
+/// GitHub issue's repository, so only its own runs count; `None` for any
+/// other ticket.
 ///
 /// Fails open on query errors — the worker's own active-run guard is the
 /// backstop, and dropping webhooks during a DynamoDB blip is worse than a
@@ -288,9 +304,10 @@ pub async fn gate_ticket_trigger(
     new_context_hash: Option<&str>,
     explicit: bool,
     reopened: bool,
+    repo: Option<&str>,
 ) -> TicketGate {
     let items = match ticket_runs(state, team_id, ticket_id).await {
-        Ok(items) => items,
+        Ok(items) => own_runs(items, repo),
         Err(e) => {
             warn!(team_id, ticket_id, error = %e, "Trigger gate query failed — allowing run");
             return TicketGate::Enqueue;
@@ -333,21 +350,7 @@ pub async fn gate_ticket_trigger(
         return TicketGate::Enqueue;
     }
 
-    // Latest run by run_id (ULIDs sort lexicographically by creation time).
-    let latest = items.iter().max_by(|a, b| {
-        let ra = a
-            .get("run_id")
-            .and_then(|v| v.as_s().ok())
-            .cloned()
-            .unwrap_or_default();
-        let rb = b
-            .get("run_id")
-            .and_then(|v| v.as_s().ok())
-            .cloned()
-            .unwrap_or_default();
-        ra.cmp(&rb)
-    });
-    let Some(latest) = latest else {
+    let Some(latest) = latest_run(&items) else {
         return TicketGate::Enqueue;
     };
 
@@ -560,8 +563,9 @@ pub fn expected_attachment_keys(
 #[cfg(test)]
 mod tests {
     use super::{
-        decide, edit_note, failed_in_a_row, handled, jira_reopened, latest_stopped_as_merged,
-        Decision, Item, LatestRun, OpenPr, MAX_FAILED_RUNS_IN_A_ROW,
+        decide, edit_note, failed_in_a_row, field, handled, jira_reopened, latest_run,
+        latest_stopped_as_merged, own_runs, Decision, Item, LatestRun, OpenPr,
+        MAX_FAILED_RUNS_IN_A_ROW,
     };
     use aws_sdk_dynamodb::types::AttributeValue;
 
@@ -606,17 +610,34 @@ mod tests {
     #[test]
     fn only_the_issues_own_newest_run_stopped_as_merged_counts() {
         let stop = common::merged_ticket::STOP_KIND;
-        let runs = [
+        let runs = vec![
             item("01A", "acme/web", stop),
             item("01B", "acme/web", ""),
             item("01C", "acme/api", stop),
         ];
-        assert!(latest_stopped_as_merged(&runs, "acme/api"));
-        assert!(latest_stopped_as_merged(&runs, "ACME/API"));
+        assert!(latest_stopped_as_merged(runs.clone(), "acme/api"));
+        assert!(latest_stopped_as_merged(runs.clone(), "ACME/API"));
         // acme/web's newest run (01B) didn't stop for a merge.
-        assert!(!latest_stopped_as_merged(&runs, "acme/web"));
-        assert!(!latest_stopped_as_merged(&runs, "acme/app"));
-        assert!(!latest_stopped_as_merged(&[], "acme/api"));
+        assert!(!latest_stopped_as_merged(runs.clone(), "acme/web"));
+        assert!(!latest_stopped_as_merged(runs, "acme/app"));
+        assert!(!latest_stopped_as_merged(vec![], "acme/api"));
+    }
+
+    /// acme/web#42's run stopped because its PR had merged; acme/api#42 is
+    /// also `GH-42`. Labelling acme/api#42 sees none of acme/web's runs, so
+    /// it starts (the gate enqueues a ticket with no run), while acme/web's
+    /// own next event still meets its stopped run and starts nothing.
+    #[test]
+    fn a_github_issue_is_gated_only_by_its_own_repositorys_runs() {
+        let runs = vec![
+            item("01A", "acme/web", ""),
+            item("01B", "acme/web", common::merged_ticket::STOP_KIND),
+        ];
+        assert!(latest_run(&own_runs(runs.clone(), Some("acme/api"))).is_none());
+        let web = own_runs(runs.clone(), Some("acme/web"));
+        assert_eq!(latest_run(&web).map(|i| field(i, "run_id")), Some("01B"));
+        // A Jira key is one ticket across the team's repositories.
+        assert_eq!(own_runs(runs, None).len(), 2);
     }
 
     fn run<'a>(status: &'a str, pr: u64, outcome: &'a str, hash: &'a str) -> LatestRun<'a> {

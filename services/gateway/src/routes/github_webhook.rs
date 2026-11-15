@@ -582,6 +582,11 @@ async fn handle_issue_event(
         issue["body"].as_str().unwrap_or(""),
         &[],
     );
+    let own_repo = format!(
+        "{}/{}",
+        repo["owner"]["login"].as_str().unwrap_or(""),
+        repo["name"].as_str().unwrap_or("")
+    );
     match super::trigger_gate::gate_ticket_trigger(
         state,
         team_id,
@@ -589,6 +594,7 @@ async fn handle_issue_event(
         Some(&context_hash),
         false,
         false,
+        Some(&own_repo),
     )
     .await
     {
@@ -1608,15 +1614,16 @@ async fn handle_issue_comment(
     let issue = &payload["issue"];
     let repo = &payload["repository"];
     let sender = payload["sender"]["login"].as_str().unwrap_or("");
+    let own_repo = format!(
+        "{}/{}",
+        repo["owner"]["login"].as_str().unwrap_or(""),
+        repo["name"].as_str().unwrap_or("")
+    );
     let stopped_as_merged = super::trigger_gate::github_issue_stopped_as_merged(
         state,
         team_id,
         &format!("GH-{}", issue["number"].as_u64().unwrap_or(0)),
-        &format!(
-            "{}/{}",
-            repo["owner"]["login"].as_str().unwrap_or(""),
-            repo["name"].as_str().unwrap_or("")
-        ),
+        &own_repo,
     )
     .await;
     let (after_merge, person_direction) = command_after_merge(stopped_as_merged, sender, body);
@@ -1659,8 +1666,16 @@ async fn handle_issue_comment(
     // enqueue a duplicate run with no dedup at all.
     let ticket_id_str = format!("GH-{}", issue["number"].as_u64().unwrap_or(0));
     if matches!(
-        super::trigger_gate::gate_ticket_trigger(state, team_id, &ticket_id_str, None, true, false)
-            .await,
+        super::trigger_gate::gate_ticket_trigger(
+            state,
+            team_id,
+            &ticket_id_str,
+            None,
+            true,
+            false,
+            Some(&own_repo),
+        )
+        .await,
         super::trigger_gate::TicketGate::SkipInFlight
     ) {
         // No second run: the run in flight gets the comment (kept,
