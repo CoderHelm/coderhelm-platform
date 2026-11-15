@@ -5992,6 +5992,9 @@ mod command_after_merge_tests {
                 Some("pat: @coderhelm the date picker on Android still crashes".to_string())
             )
         );
-        assert_eq!(command_after_merge(false, "pat", "/coderhelm go"), (false, None));
+        assert_eq!(
+            command_after_merge(false, "pat", "/coderhelm go"),
+            (false, None)
+        );
     }
 }

@@ -251,11 +251,7 @@ impl TicketHistory {
                 .prs
                 .iter()
                 .any(|p| p.number == r.pr_number && p.repo.eq_ignore_ascii_case(&r.repo));
-            if merged
-                && r.pr_number > 0
-                && r.repo.contains('/')
-                && in_repo(repo, &r.repo)
-                && !read
+            if merged && r.pr_number > 0 && r.repo.contains('/') && in_repo(repo, &r.repo) && !read
             {
                 out.push(common::merged_ticket::MergedPr {
                     repo: r.repo.clone(),
@@ -843,7 +839,7 @@ fn closes_issue(body: &str, repo: &str, n: u64) -> bool {
     let words: Vec<&str> = lower.split_whitespace().collect();
     words.windows(2).any(|w| {
         let word = w[0].trim_matches(|c: char| !c.is_ascii_alphanumeric());
-        let reference = w[1].trim_end_matches(|c: char| matches!(c, ',' | '.' | ')' | ';' | ':'));
+        let reference = w[1].trim_end_matches([',', '.', ')', ';', ':']);
         CLOSING_WORDS.contains(&word) && refs.iter().any(|r| r == reference)
     })
 }
@@ -940,7 +936,7 @@ fn reverted_pr(repo: &str, branch: &str, body: &str) -> Option<u64> {
     let words: Vec<&str> = lower.split_whitespace().collect();
     words.windows(2).find_map(|w| {
         let word = w[0].trim_matches(|c: char| !c.is_ascii_alphanumeric());
-        let reference = w[1].trim_end_matches(|c: char| matches!(c, ',' | '.' | ')' | ';' | ':'));
+        let reference = w[1].trim_end_matches([',', '.', ')', ';', ':']);
         let number = reference
             .strip_prefix(&own)
             .or_else(|| reference.strip_prefix('#'))?;
@@ -1238,7 +1234,12 @@ mod tests {
                 "body": body,
             }]),
         )];
-        let found = candidates(&TicketHistory::default(), &listed, "GH-42", Some(("acme/api", 42)));
+        let found = candidates(
+            &TicketHistory::default(),
+            &listed,
+            "GH-42",
+            Some(("acme/api", 42)),
+        );
         assert_eq!(found, vec![("acme/api".to_string(), 7, true)]);
     }
 
@@ -1342,13 +1343,15 @@ mod tests {
         };
         assert_eq!(h.blocking_merge(&TicketSource::Github, "acme/api"), None);
         assert_eq!(
-            h.blocking_merge(&TicketSource::Github, "acme/web").map(|p| p.subject()),
+            h.blocking_merge(&TicketSource::Github, "acme/web")
+                .map(|p| p.subject()),
             Some("acme/web#7".to_string())
         );
         let mut jira = h.clone();
         jira.runs.pop();
         assert_eq!(
-            jira.blocking_merge(&TicketSource::Jira, "acme/api").map(|p| p.subject()),
+            jira.blocking_merge(&TicketSource::Jira, "acme/api")
+                .map(|p| p.subject()),
             Some("acme/web#7".to_string())
         );
     }
@@ -1421,21 +1424,42 @@ mod tests {
             let mut h = TicketHistory::default();
             p.for_ticket = linked(&h, &p, "GH-42", issue);
             h.prs.push(p);
-            h.blocking_merge(&TicketSource::Github, "acme/api").is_some()
+            h.blocking_merge(&TicketSource::Github, "acme/api")
+                .is_some()
         };
         assert!(stops("Fix login (#42)", "", "acme/api", "main"));
         assert!(stops("Fix login", "Fixes #42", "acme/api", "develop"));
-        assert!(stops("Fix login", "This resolves: acme/api#42.", "acme/api", "main"));
+        assert!(stops(
+            "Fix login",
+            "This resolves: acme/api#42.",
+            "acme/api",
+            "main"
+        ));
         assert!(stops(
             "Fix login",
             "Closes https://github.com/acme/api/issues/42",
             "acme/api",
             "main"
         ));
-        assert!(!stops("Fix login", "This prepares for #42", "acme/api", "main"));
-        assert!(!stops("Fix login", "See #42; related to #42", "acme/api", "main"));
+        assert!(!stops(
+            "Fix login",
+            "This prepares for #42",
+            "acme/api",
+            "main"
+        ));
+        assert!(!stops(
+            "Fix login",
+            "See #42; related to #42",
+            "acme/api",
+            "main"
+        ));
         assert!(!stops("Fix login (#420)", "Fixes #421", "acme/api", "main"));
-        assert!(!stops("Bump acme/web#42", "Fixes acme/web#42", "acme/api", "main"));
+        assert!(!stops(
+            "Bump acme/web#42",
+            "Fixes acme/web#42",
+            "acme/api",
+            "main"
+        ));
         assert!(!stops("Fix login (#42)", "Fixes #42", "acme/web", "main"));
     }
 
@@ -1453,7 +1477,12 @@ mod tests {
             p.for_ticket = true;
             p
         };
-        let first = pr(12, "WEB-42: rate limit the API", "pat/web-42", "2026-11-02T10:00:00Z");
+        let first = pr(
+            12,
+            "WEB-42: rate limit the API",
+            "pat/web-42",
+            "2026-11-02T10:00:00Z",
+        );
         let revert = pr(
             13,
             "Revert \"WEB-42: rate limit the API\"",
@@ -1541,8 +1570,20 @@ mod tests {
         let listed = vec![(
             "acme/api".to_string(),
             serde_json::json!([
-                pr(9, "Revert \"Bump deps\"", "revert-3-pat/deps", "Reverts acme/api#3", "x"),
-                pr(8, "Revert \"Fix login\"", "revert-7-pat/login", "Reverts acme/api#7", "x"),
+                pr(
+                    9,
+                    "Revert \"Bump deps\"",
+                    "revert-3-pat/deps",
+                    "Reverts acme/api#3",
+                    "x"
+                ),
+                pr(
+                    8,
+                    "Revert \"Fix login\"",
+                    "revert-7-pat/login",
+                    "Reverts acme/api#7",
+                    "x"
+                ),
                 pr(7, "Fix login", "pat/login", "Fixes #42", "x"),
                 pr(3, "Bump deps", "pat/deps", "", "x"),
             ]),
@@ -1567,16 +1608,27 @@ mod tests {
         let h = TicketHistory {
             prs: vec![
                 read(7, "Fix login", "pat/login", "2026-11-02T10:00:00Z"),
-                read(8, "Revert \"Fix login\"", "revert-7-pat/login", "2026-11-03T10:00:00Z"),
+                read(
+                    8,
+                    "Revert \"Fix login\"",
+                    "revert-7-pat/login",
+                    "2026-11-03T10:00:00Z",
+                ),
             ],
             ..Default::default()
         };
         assert_eq!(h.blocking_merge(&TicketSource::Github, "acme/api"), None);
         // Found through the description alone, too; never another
         // repository's pull request.
-        assert_eq!(reverted_pr("acme/api", "pat/undo", "Reverts acme/api#7"), Some(7));
+        assert_eq!(
+            reverted_pr("acme/api", "pat/undo", "Reverts acme/api#7"),
+            Some(7)
+        );
         assert_eq!(reverted_pr("acme/api", "pat/undo", "Reverts #7."), Some(7));
-        assert_eq!(reverted_pr("acme/api", "pat/undo", "Reverts acme/web#7"), None);
+        assert_eq!(
+            reverted_pr("acme/api", "pat/undo", "Reverts acme/web#7"),
+            None
+        );
         assert_eq!(reverted_pr("acme/api", "pat/undo", "See #7"), None);
     }
 
@@ -1604,15 +1656,28 @@ mod tests {
         )];
         let found = candidates(&history, &listed, "GH-42", Some(("acme/api", 42)));
         assert_eq!(found.len(), MAX_PRS);
-        assert!(found.contains(&("acme/api".to_string(), 8, true)), "{found:?}");
+        assert!(
+            found.contains(&("acme/api".to_string(), 8, true)),
+            "{found:?}"
+        );
         let mut h = history.clone();
         for (repo, n, own) in found {
             let mut p = earlier(&repo, n, "coderhelm[bot]", "closed", "2026-10-01");
             if n == 7 || n == 8 {
                 p.state = "merged".into();
                 p.author = "pat".into();
-                p.title = if n == 8 { "Revert \"Fix login\"" } else { "Fix login" }.into();
-                p.branch = if n == 8 { "revert-7-pat/login" } else { "pat/login" }.into();
+                p.title = if n == 8 {
+                    "Revert \"Fix login\""
+                } else {
+                    "Fix login"
+                }
+                .into();
+                p.branch = if n == 8 {
+                    "revert-7-pat/login"
+                } else {
+                    "pat/login"
+                }
+                .into();
                 p.closed_at = format!("2026-11-0{}T10:00:00Z", n - 5);
             }
             p.for_ticket = own;

@@ -2108,8 +2108,7 @@ async fn run_passes(
         let own_repo = format!("{}/{}", msg.repo_owner, msg.repo_name);
         let issue = (matches!(msg.source, TicketSource::Github) && msg.issue_number > 0)
             .then_some((own_repo.as_str(), msg.issue_number));
-        ticket_history::add_earlier_prs(&mut history, &github, &repos, &msg.ticket_id, issue)
-            .await;
+        ticket_history::add_earlier_prs(&mut history, &github, &repos, &msg.ticket_id, issue).await;
     }
     // A ticket whose pull request already merged gets no second run unless
     // a person asked for one after the merge (`common::merged_ticket`):
