@@ -254,12 +254,27 @@ pub fn verified_lines(checks: &[Check], head: &str) -> Vec<String> {
             short(head)
         ));
     }
+    // Still running is not "not verified": it is said apart, as running,
+    // and the section is rebuilt when it ends.
+    let running: Vec<String> = checks
+        .iter()
+        .filter(|c| c.state == State::Running)
+        .map(linked)
+        .collect();
+    if !running.is_empty() {
+        out.push(format!(
+            "**Still running on `{}`:** {}; updated here when {}.",
+            short(head),
+            running.join(", "),
+            if running.len() == 1 {
+                "it ends"
+            } else {
+                "they end"
+            }
+        ));
+    }
     let mut not: Vec<String> = Vec::new();
-    for (state, word) in [
-        (State::Failed, "failed"),
-        (State::Running, "still running"),
-        (State::DidNotRun, "did not run"),
-    ] {
+    for (state, word) in [(State::Failed, "failed"), (State::DidNotRun, "did not run")] {
         let names: Vec<String> = checks
             .iter()
             .filter(|c| c.state == state)
@@ -479,16 +494,19 @@ mod tests {
         ]});
         let checks = checks_of(&listing);
         let lines = verified_lines(&checks, HEAD);
-        assert_eq!(lines.len(), 2);
+        assert_eq!(lines.len(), 3);
         assert_eq!(
             lines[0],
             "**Verified by:** [`unit`](https://github.com/acme/shop/actions/runs/7/job/4), \
              [`lint`](https://github.com/acme/shop/actions/runs/7/job/4) passed on `0a1b2c3`."
         );
-        assert!(lines[1].starts_with("**Not verified on `0a1b2c3`:**"));
-        assert!(lines[1].contains("job/5) (failed)"), "{}", lines[1]);
-        assert!(lines[1].contains("job/3) (still running)"), "{}", lines[1]);
-        assert!(lines[1].contains("job/14) (did not run)"), "{}", lines[1]);
+        // Still running is said apart from what did not verify the change.
+        assert!(lines[1].starts_with("**Still running on `0a1b2c3`:**"));
+        assert!(lines[1].contains("job/3)"), "{}", lines[1]);
+        assert!(lines[2].starts_with("**Not verified on `0a1b2c3`:**"));
+        assert!(lines[2].contains("job/5) (failed)"), "{}", lines[2]);
+        assert!(!lines[2].contains("still running"), "{}", lines[2]);
+        assert!(lines[2].contains("job/14) (did not run)"), "{}", lines[2]);
         // A check that did not pass is never among the verified.
         assert!(!lines[0].contains("e2e") && !lines[0].contains("types"));
     }

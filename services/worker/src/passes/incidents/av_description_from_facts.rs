@@ -239,7 +239,7 @@ fn a_rebuild_resolves_coderhelms_own_thread_about_the_description() {
     let build = fn_src(src, "\nasync fn build(");
     assert!(build.contains("resolve_own_description_threads("));
     // Every description takes the one path: facts, check, lead, layout.
-    assert!(build.contains("description_facts::shape("));
+    assert!(build.contains("description_facts::shape_for("));
     let save = fn_src(src, "\npub async fn save(");
     assert!(save.contains("pr_layout::layout("));
     let pr = include_str!("../pr.rs");

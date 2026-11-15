@@ -650,8 +650,24 @@ pub fn route_for_plan(decision: Option<&FixDecision>, tasks: &str) -> Route {
         {
             Route::Code
         }
+        // Something outside the code never replaces the code change the
+        // plan makes: a plan with tasks is implemented and its pull request
+        // opened, and the outside part rides along (done by CoderHelm where
+        // it can, the rest listed once for a person). A run once ended with
+        // "do this, then I'll do it" and no pull request.
+        Route::OutsideOnly if plans_code(tasks) => Route::CodeAndOutside,
         r => r,
     }
+}
+
+/// Whether a plan's tasks change code: anything but the sentinels that say
+/// it changes none.
+pub fn plans_code(tasks: &str) -> bool {
+    let t = tasks.trim_start();
+    !t.is_empty()
+        && !t.starts_with(NO_CODE_CHANGE)
+        && !t.starts_with("NO_CHANGES_NEEDED:")
+        && !t.starts_with("CLARIFICATION_NEEDED:")
 }
 
 /// The report as Jira shows it: the Jira app turns each paragraph into one
@@ -1933,6 +1949,11 @@ mod tests {
         let d = parse(fixture::PLANNER_REPLY).unwrap();
         let tasks = "NO_CODE_CHANGE: the term's setting is off";
         assert_eq!(route_for_plan(Some(&d), tasks), Route::OutsideOnly);
+        // A plan with code to change is implemented whatever else it needs.
+        assert_eq!(
+            route_for_plan(Some(&d), "- [ ] a.rs: x"),
+            Route::CodeAndOutside
+        );
     }
 
     #[test]

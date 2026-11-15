@@ -2095,6 +2095,46 @@ pub fn classify(c: &mut OutsideChange) -> usize {
     moved
 }
 
+/// A staging deploy a person was to run that the repository lets CoderHelm
+/// start itself (a workflow it can dispatch, or one a pull request label
+/// starts) becomes CoderHelm's step on that route. A description once asked
+/// a person for "the deploy credentials, or run `npm run deploy:staging`
+/// once" while the repository deployed staging from a label CoderHelm adds:
+/// CoderHelm never asks for what it can start, and a credential is claimed
+/// only by an attempt that failed for one. A production deploy stays with
+/// the release steps and their approval. Returns how many moved.
+pub fn own_startable(c: &mut OutsideChange, a: &Abilities) -> usize {
+    let mut moved = 0;
+    for s in c.steps.iter_mut() {
+        if s.doer() != Doer::Person || s.done || !s.is_deploy() || s.is_production() {
+            continue;
+        }
+        let text = format!("{} {}", s.step, s.how);
+        let Some(r) = a
+            .deploys
+            .iter()
+            .filter(|r| r.startable() && !(s.is_production() && is_staging_route(r)))
+            .find(|r| r.named_in(&text))
+            .or_else(|| a.startable_deploy())
+        else {
+            continue;
+        };
+        if !r.named_in(&text) {
+            s.how = r.file.clone();
+        }
+        s.by = "coderhelm".to_string();
+        s.tool = match &r.trigger {
+            Trigger::Label(_) => "add_labels".to_string(),
+            _ => "start_workflow".to_string(),
+        };
+        s.why_person.clear();
+        s.grant.clear();
+        s.reason.clear();
+        moved += 1;
+    }
+    moved
+}
+
 /// The tool a step's words name, for a step moved to CoderHelm.
 fn tool_named(text: &str) -> String {
     let t = text.to_lowercase();

@@ -211,6 +211,9 @@ pub async fn execute(
     // One executor: a step a person was to do that the gate finds
     // CoderHelm's is done here, like the rest.
     p.moved = outside_work::classify(c);
+    // A deploy the repository lets it start is its own, whoever the plan
+    // named (`outside_work::own_startable`).
+    p.moved += outside_work::own_startable(c, a);
     let snapshot = c.clone();
     for i in 0..c.steps.len() {
         let s = &mut c.steps[i];

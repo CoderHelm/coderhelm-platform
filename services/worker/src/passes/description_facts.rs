@@ -137,7 +137,11 @@ fn section<'a>(body: &'a str, names: &[&str]) -> Vec<&'a str> {
 /// What the description itself says the change is: the first sentences of
 /// its Summary.
 pub fn summary_of(body: &str) -> String {
-    let lines = section(body, &["summary"]);
+    // A template's "Description" is its summary.
+    let lines = match section(body, &["summary"]) {
+        l if l.iter().any(|x| !x.trim().is_empty()) => l,
+        _ => section(body, &["description"]),
+    };
     let para: Vec<&str> = lines
         .iter()
         .map(|l| l.trim())
@@ -475,8 +479,24 @@ pub fn written(body: &str) -> String {
 
 /// `body` (as it stands, in any earlier shape) in its final shape for
 /// `facts`. `reply` is the reader pass's answer when a model was asked.
-/// Shaping twice gives the same text.
-pub fn shape(body: &str, title: &str, mut facts: Facts, reply: Option<&str>) -> Shaped {
+/// Shaping twice gives the same text. The eval and the incident cases
+/// shape with no template; the rebuild calls [`shape_for`].
+#[cfg(test)]
+pub fn shape(body: &str, title: &str, facts: Facts, reply: Option<&str>) -> Shaped {
+    shape_for(body, title, facts, reply, None)
+}
+
+/// [`shape`], laid into the repository's pull request `template` when it
+/// has one: its headings are the visible structure and CoderHelm's content
+/// fills them (`pr_body::render_templated`); the written sections that went
+/// into sight are not said again below.
+pub fn shape_for(
+    body: &str,
+    title: &str,
+    mut facts: Facts,
+    reply: Option<&str>,
+    template: Option<&str>,
+) -> Shaped {
     let prior = Slots::from_body(body, &facts);
     // What a person ticked stays ticked.
     let ticked = common::pr_body::ticked_ids(body);
@@ -552,7 +572,14 @@ pub fn shape(body: &str, title: &str, mut facts: Facts, reply: Option<&str>) -> 
     let checked = pr_reader::without_sections(&checked, &slots.drop);
     // 3. The visible part, the generated blocks below it and the steps and
     //    evidence, from the facts; the written text goes in the first fold.
-    let r = common::pr_body::render(&common::pr_facts::body_of(&facts, &ticked));
+    let b = common::pr_facts::body_of(&facts, &ticked);
+    let (r, checked) = match template.filter(|t| !common::pr_template::sections(t).is_empty()) {
+        Some(t) => {
+            let (r, used) = common::pr_body::render_templated(&b, t, &written(&checked));
+            (r, pr_reader::without_sections(&checked, &used))
+        }
+        None => (common::pr_body::render(&b), checked),
+    };
     // The head is named once, in the Verification lead-in.
     let short = format!("on `{}`", facts.short_head());
     let own_checks: Vec<Checked> = facts

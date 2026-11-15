@@ -33,11 +33,20 @@ const FOLD_CLOSE: &str = "</details><!-- fold -->";
 /// something is wrong.
 const VISIBLE_BLOCKS: &[&str] = &["draft-status", "objections", "open-findings", "unfinished"];
 
-/// Blocks an earlier shape of the description wrote that the lead replaces.
-const SUPERSEDED: &[(&str, &str)] = &[(
-    "<!-- coderhelm:not-done:start -->",
-    "<!-- coderhelm:not-done:end -->",
-)];
+/// Blocks an earlier shape of the description wrote that the lead replaces:
+/// the old open-steps block, and the reviewer guide, whose file to read
+/// first, way back and checks the lead already says (a description showed
+/// "Read first" and "Look first", "Rollback" and "Roll back").
+const SUPERSEDED: &[(&str, &str)] = &[
+    (
+        "<!-- coderhelm:not-done:start -->",
+        "<!-- coderhelm:not-done:end -->",
+    ),
+    (
+        "<!-- coderhelm:reviewer-guide -->",
+        "<!-- /coderhelm:reviewer-guide -->",
+    ),
+];
 
 fn is_fold_line(line: &str) -> bool {
     let t = line.trim();
@@ -639,7 +648,6 @@ mod tests {
         let flat = unfold(&once);
         for l in [
             "* `src/export/poller.rs`: the retry loop.",
-            "* **Roll back:** revert this pull request.",
             "**Low**: one module.",
             "- The staging secret is not set.",
             "<!-- coderhelm:unverified -->",
@@ -649,6 +657,9 @@ mod tests {
             assert!(flat.lines().any(|x| x == l), "lost: {l}\n{flat}");
         }
         assert!(!flat.contains("<details>"), "{flat}");
+        // The reviewer guide says what the lead says: it gives way to it.
+        assert!(!flat.contains("**Roll back:**"), "{flat}");
+        assert!(!flat.contains("For the reviewer"), "{flat}");
     }
 
     #[test]
