@@ -363,7 +363,7 @@ pub async fn run(
     } else {
         format!(
             "\n## CI Failures\nThe following CI checks are failing. Fix these issues as well:\n\n```\n{}\n```\n",
-            if ci_logs.len() > 12000 { format!("... (truncated)\n{}", common::tail_str(&ci_logs, 12000)) } else { ci_logs.clone() }
+            if ci_logs.len() > CI_LOG_CHARS { format!("... (truncated)\n{}", common::tail_str(&ci_logs, CI_LOG_CHARS)) } else { ci_logs.clone() }
         )
     };
 
@@ -3857,9 +3857,16 @@ async fn fetch_ci_failures(
     with_deploy_failures(found, &deploy)
 }
 
+/// How much of the failing checks' logs the fixer's `## CI Failures` block
+/// keeps.
+const CI_LOG_CHARS: usize = 12_000;
+
 /// The CI fix loop's input with the deploy label's failed runs added, each
 /// as a failing check with its link and log, so the fixer reads a failure a
 /// later skipped run of the same workflow hides from the check listing.
+/// Each log gets its own share of [`CI_LOG_CHARS`], the failing step's part
+/// first (`resume::focus_failing_log`), so one long log never pushes
+/// another failure out of the block.
 fn with_deploy_failures(
     found: Option<(Vec<String>, String)>,
     deploy: &[(common::deploy_label::DeployRun, String)],
@@ -3867,7 +3874,10 @@ fn with_deploy_failures(
     if deploy.is_empty() {
         return found;
     }
-    let (mut names, mut logs) = found.unwrap_or_default();
+    let (mut names, listed) = found.unwrap_or_default();
+    let shares = deploy.len() + usize::from(!listed.is_empty());
+    let budget = (CI_LOG_CHARS / shares).saturating_sub(300);
+    let mut logs = super::resume::focus_failing_log(&listed, budget);
     for (r, log) in deploy {
         if !names.contains(&r.workflow) {
             names.push(r.workflow.clone());
@@ -3885,9 +3895,9 @@ fn with_deploy_failures(
             r.workflow,
             r.result(),
             if log.is_empty() {
-                "(its log couldn't be read)"
+                "(its log couldn't be read)".to_string()
             } else {
-                log.as_str()
+                super::resume::focus_failing_log(log, budget)
             }
         ));
     }
@@ -4818,5 +4828,26 @@ mod deploy_failure_tests {
         assert!(logs.starts_with("assert failed\n\nThe deploy label's workflow"));
         // No deploy failure: the listing's answer stands.
         assert_eq!(with_deploy_failures(None, &[]), None);
+    }
+
+    #[test]
+    fn a_long_deploy_log_never_pushes_the_listed_failure_out() {
+        let long: String = (0..4_000)
+            .map(|i| format!("device step {i} output\n"))
+            .collect::<String>()
+            + "##[error]Detox: element not found\n";
+        assert!(long.len() > super::CI_LOG_CHARS * 3);
+        let deploy: Vec<(DeployRun, String)> =
+            hidden_failure().into_iter().map(|r| (r, long.clone())).collect();
+        let listed = "unit tests\n##[error]expected 2, got 3 in cart.test.ts\n";
+        let (_, logs) = with_deploy_failures(
+            Some((vec!["unit tests".into()], listed.into())),
+            &deploy,
+        )
+        .unwrap();
+        // What the fixer's block keeps: the last CI_LOG_CHARS of the logs.
+        let kept = common::tail_str(&logs, super::CI_LOG_CHARS);
+        assert!(kept.contains("expected 2, got 3 in cart.test.ts"), "{kept}");
+        assert!(kept.contains("Detox: element not found"));
     }
 }

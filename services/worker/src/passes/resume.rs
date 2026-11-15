@@ -1161,7 +1161,7 @@ const ERROR_WINDOW_LINES: usize = 80;
 /// suite, a deploy) fails mid-log and then runs its upload and comment
 /// steps, so a head-and-tail cut showed only those and the fixer read the
 /// wrong part. Logs without markers keep the head and the tail.
-fn focus_failing_log(log: &str, budget: usize) -> String {
+pub(crate) fn focus_failing_log(log: &str, budget: usize) -> String {
     let lines: Vec<&str> = log.lines().collect();
     let marks: Vec<usize> = lines
         .iter()
