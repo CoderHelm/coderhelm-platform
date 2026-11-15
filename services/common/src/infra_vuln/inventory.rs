@@ -51,6 +51,141 @@ pub enum Kind {
     ContainerImage,
 }
 
+/// Every kind, in declaration order.
+pub const ALL_KINDS: &[Kind] = &[
+    Kind::Ec2Instance,
+    Kind::AutoScalingGroup,
+    Kind::EksNodegroup,
+    Kind::EksCluster,
+    Kind::EcsFargateService,
+    Kind::LambdaFunction,
+    Kind::RdsInstance,
+    Kind::RdsCluster,
+    Kind::ElasticacheGroup,
+    Kind::OpensearchDomain,
+    Kind::ContainerImage,
+];
+
+/// What one account and region's latest read saw in full, from its summary
+/// row: only these kinds may close a finding or drop a resource.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct KindsRead {
+    pub account: String,
+    pub region: String,
+    pub read_at: String,
+    /// Kinds every call answered for, every page read.
+    pub complete: Vec<Kind>,
+}
+
+/// Every account and region's latest full reads.
+#[derive(Debug, Clone, Default)]
+pub struct Coverage {
+    pub reads: Vec<KindsRead>,
+}
+
+impl Coverage {
+    /// The latest read of this account and region saw every resource of
+    /// this kind.
+    pub fn complete(&self, account: &str, region: &str, kind: Kind) -> bool {
+        self.reads
+            .iter()
+            .any(|r| r.account == account && r.region == region && r.complete.contains(&kind))
+    }
+
+    /// When the account and region was last read, empty when never.
+    pub fn read_at(&self, account: &str, region: &str) -> &str {
+        self.reads
+            .iter()
+            .find(|r| r.account == account && r.region == region)
+            .map(|r| r.read_at.as_str())
+            .unwrap_or("")
+    }
+}
+
+/// The resources a new read replaces: stored rows of this account and
+/// region that the read did not return, of a kind the read saw in full.
+/// Rows of a kind the read did not see in full are kept (a failed or
+/// partial read removes nothing). Returns their sort keys.
+pub fn gone(stored: &[Resource], fresh: &[Resource], complete: &[Kind]) -> Vec<String> {
+    let seen: std::collections::BTreeSet<String> = fresh.iter().map(Resource::sk).collect();
+    let mut out: Vec<String> = stored
+        .iter()
+        .filter(|r| complete.contains(&r.kind))
+        .map(Resource::sk)
+        .filter(|sk| !seen.contains(sk))
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Terraform module folders nothing calls: the `.tf` files read hold no
+/// provider, backend or `terraform` block there and no `module` block
+/// anywhere names the folder as its `source`. What is declared in them is
+/// never applied, so it is not something that runs. A folder is kept when
+/// unsure (a remote source that ends in its name, a root with no
+/// provider block of its own).
+pub fn uncalled_modules(files: &[(&str, &str, &str)]) -> std::collections::BTreeSet<String> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let dir_of = |p: &str| {
+        p.rsplit_once('/')
+            .map(|(d, _)| d.to_string())
+            .unwrap_or_default()
+    };
+    let source = re(r#"(?m)^\s*source\s*=\s*"([^"]+)""#);
+    let root = re(r#"(?m)^\s*(provider\s+"|terraform\s*\{|backend\s+")"#);
+    // (repo, dir) of each .tf file, and whether one of its files is a root.
+    let mut dirs: BTreeMap<(String, String), bool> = BTreeMap::new();
+    let mut called: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut remote_tails: BTreeSet<String> = BTreeSet::new();
+    for (repo, path, content) in files {
+        if !path.ends_with(".tf") {
+            continue;
+        }
+        let d = dir_of(path);
+        let is_root = root.is_match(content);
+        let e = dirs.entry((repo.to_string(), d.clone())).or_insert(false);
+        *e |= is_root;
+        for c in source.captures_iter(content) {
+            let src = c[1].to_string();
+            if src.starts_with("./") || src.starts_with("../") {
+                let mut parts: Vec<&str> = if d.is_empty() {
+                    Vec::new()
+                } else {
+                    d.split('/').collect()
+                };
+                for seg in src.split('/') {
+                    match seg {
+                        "." | "" => {}
+                        ".." => {
+                            parts.pop();
+                        }
+                        s => parts.push(s),
+                    }
+                }
+                called.insert((repo.to_string(), parts.join("/")));
+            } else if let Some(tail) = src
+                .split("//")
+                .last()
+                .and_then(|t| t.split('?').next())
+                .and_then(|t| t.trim_end_matches('/').rsplit('/').next())
+            {
+                remote_tails.insert(tail.to_string());
+            }
+        }
+    }
+    dirs.into_iter()
+        .filter(|((repo, d), is_root)| {
+            !is_root
+                && d.split('/').any(|s| s == "modules")
+                && !called.contains(&(repo.clone(), d.clone()))
+                && !remote_tails.contains(d.rsplit('/').next().unwrap_or(""))
+        })
+        .map(|((repo, d), _)| format!("{repo}:{d}"))
+        .collect()
+}
+
 impl Kind {
     pub fn label(self) -> &'static str {
         match self {

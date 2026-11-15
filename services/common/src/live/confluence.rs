@@ -259,7 +259,7 @@ impl Confluence<'_> {
                         if matches!(op, Op::Append { .. }) {
                             return Err(refused(
                                 "The Atlassian sign-in only reads Confluence.",
-                                "To add text to pages, connect Confluence with an API token or the Jira app.",
+                                "To add text to pages, save an API token in Settings, Integrations, Atlassian, Confluence.",
                             ));
                         }
                         (base.trim_end_matches('/').to_string(), bearer.to_string())
@@ -327,7 +327,7 @@ impl Confluence<'_> {
                     return Err(StepError::new(
                         "reach",
                         "The Coderhelm app in Jira hasn't shared its Confluence address.",
-                        "Update the app in Jira, then open Coderhelm Settings there and save.",
+                        "The Jira app no longer reads Confluence. Connect Confluence in Settings, Integrations, Atlassian (an Atlassian sign-in, or an API token).",
                     ));
                 }
                 let mut body = match op {
@@ -537,7 +537,7 @@ impl Confluence<'_> {
         if matches!(self.access, Access::SignIn { .. }) {
             return Err(refused(
                 "The Atlassian sign-in only reads Confluence.",
-                "To add text to pages, connect Confluence with an API token or the Jira app. Put the text in your reply for a person to add.",
+                "To add text to pages, save an API token in Settings, Integrations, Atlassian, Confluence. Put the text in your reply for a person to add.",
             ));
         }
         if !self.conn.may_write_page(id) {
@@ -921,7 +921,7 @@ mod tests {
         // An append is refused before anything is sent: the sign-in only reads.
         let e = cf.append("42", "note").await.unwrap_err();
         assert!(e.is_refusal(), "{e:?}");
-        assert!(e.fix.contains("API token or the Jira app"), "{e:?}");
+        assert!(e.fix.contains("save an API token"), "{e:?}");
         // A sign-in Confluence refuses says where to sign in again.
         let e = cf.page("42").await.unwrap_err();
         assert!(e.message.contains("Atlassian sign-in"), "{e:?}");

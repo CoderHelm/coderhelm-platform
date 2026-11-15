@@ -131,6 +131,11 @@ pub trait RepoHost: Send + Sync {
     ) -> Result<Vec<(String, String, String)>, ReadError> {
         Ok(vec![])
     }
+    /// Whether `sha` (a full or abbreviated commit id) is a commit of
+    /// `repo`. `None` when the host can't tell.
+    async fn has_commit(&self, _repo: &str, _sha: &str) -> Result<Option<bool>, ReadError> {
+        Ok(None)
+    }
 }
 
 // ── GitHub ──────────────────────────────────────────────────────────────────
@@ -317,6 +322,22 @@ impl RepoHost for GitHubHost<'_> {
         }
         Ok(commit_rows(&body))
     }
+
+    async fn has_commit(&self, repo: &str, sha: &str) -> Result<Option<bool>, ReadError> {
+        if !(7..=40).contains(&sha.len()) || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Ok(Some(false));
+        }
+        let url = format!("{GITHUB_API}/repos/{repo}/commits/{sha}");
+        let (status, _) = self
+            .send(self.get(&url, "application/vnd.github.sha", Limit::Metadata))
+            .await?;
+        match status {
+            200..=299 => Ok(Some(true)),
+            // No such commit (404), or an id GitHub can't resolve (422).
+            404 | 422 => Ok(Some(false)),
+            s => Err(github_status(s, repo)),
+        }
+    }
 }
 
 /// Pure: GitHub's list of commits as (sha, first line of the message, time).
@@ -405,6 +426,12 @@ impl RepoHost for MemHost {
         path: &str,
     ) -> Result<Option<String>, ReadError> {
         Ok(self.get(repo)?.1.get(path).cloned())
+    }
+
+    async fn has_commit(&self, repo: &str, sha: &str) -> Result<Option<bool>, ReadError> {
+        Ok(Some(
+            sha.len() >= 7 && self.get(repo).is_ok_and(|(c, _)| c.starts_with(sha)),
+        ))
     }
 
     async fn search(&self, repos: &[String], query: &str) -> Result<Vec<SearchHit>, ReadError> {

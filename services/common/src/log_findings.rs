@@ -1324,6 +1324,10 @@ pub enum Skip {
     ForAPerson(String),
     /// AWS's side and still happening: tried again next sweep.
     Watching,
+    /// The error is at its usual rate ([`crate::log_triage`]): recorded,
+    /// nobody is told and no fix starts; looked at again next sweep. The
+    /// decision's reason.
+    Usual(String),
     /// The analyzer's checks say the error stopped while the service kept
     /// logging: nothing to fix now. Tried again if it comes back. What the
     /// checks found ([`activity_words`]).
@@ -1361,6 +1365,10 @@ impl Skip {
             Skip::Recovered(at) => format!("stopped on its own at {at}; nothing to change"),
             Skip::ForAPerson(why) => why.clone(),
             Skip::Watching => "on AWS's side; watching until it recovers".into(),
+            Skip::Usual(why) => format!(
+                "{}; counted, nothing to do unless it rises",
+                why.trim_end_matches('.')
+            ),
             Skip::Stopped(what) if what.is_empty() => {
                 "the error stopped; a fix starts if it comes back".into()
             }
@@ -1379,7 +1387,11 @@ impl Skip {
     pub fn auto_status(&self) -> &'static str {
         if matches!(
             self,
-            Skip::QuietHours | Skip::Watching | Skip::Stopped(_) | Skip::RepoPending
+            Skip::QuietHours
+                | Skip::Watching
+                | Skip::Usual(_)
+                | Skip::Stopped(_)
+                | Skip::RepoPending
         ) {
             "waiting"
         } else {
@@ -2932,6 +2944,30 @@ pub fn pattern_literal(pattern: &str) -> Option<String> {
     (clean.chars().count() >= 6).then_some(clean)
 }
 
+/// The analyzer's title for credentials written to a log group
+/// (`lambda/log-analyzer`'s `secrets_advisories`).
+pub const SECRETS_TITLE: &str = "Secrets detected in CloudWatch Logs";
+
+/// Pure: the finding is about credentials written to its log group: the
+/// fix is the log statement that writes them, found from those very lines.
+pub fn is_secrets(f: &Finding) -> bool {
+    f.title.starts_with(SECRETS_TITLE)
+}
+
+/// Pure: the Insights filter for a finding's sample lines: its own pattern,
+/// the lines that carry a credential for a secrets finding (masked before
+/// anyone reads them, see [`scrub`]), else any error line.
+pub fn sample_filter(f: &Finding) -> String {
+    if is_secrets(f) {
+        // The analyzer's SECRET_PATTERNS, as one Insights expression.
+        return "filter @message like /(?i)((password|passwd|pwd|api[_-]?key|auth[_-]?token|access[_-]?token|secret[_-]?key|private[_-]?key|aws[_-]?session[_-]?token)\\s*[:=]|bearer\\s+[a-z0-9._-]{20,}|(mongodb|postgres|mysql|redis|amqp):\\/\\/\\S+@|BEGIN [A-Z ]*PRIVATE KEY|gh[pousr]_[a-z0-9]{36}|xox[baprs]-|eyJ[a-z0-9_-]{10,}\\.|(AKIA|ASIA)[0-9A-Z]{16})/".to_string();
+    }
+    match pattern_literal(&f.error_pattern) {
+        Some(lit) => format!("filter @message like \"{lit}\""),
+        None => "filter @message like /(?i)(error|exception|fatal|panic|traceback)/".to_string(),
+    }
+}
+
 /// One sample line.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Sample {
@@ -2965,10 +3001,7 @@ pub async fn fetch_samples(
         return Ok(vec![]);
     }
     let client = crate::live::aws::logs_client(session);
-    let filter = match pattern_literal(&f.error_pattern) {
-        Some(lit) => format!("filter @message like \"{lit}\""),
-        None => "filter @message like /(?i)(error|exception|fatal|panic|traceback)/".to_string(),
-    };
+    let filter = sample_filter(f);
     let query = format!(
         "fields @timestamp, @message, @log | {filter} | sort @timestamp desc | limit {MAX_SAMPLES}"
     );

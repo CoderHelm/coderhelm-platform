@@ -58,8 +58,9 @@ class DiffTests(unittest.TestCase):
         self.assertTrue(r["needs_admin"])
         self.assertEqual(r["scopes_added"], ["write:jira-work"])
         md = fr.summary_markdown(r)
-        self.assertIn("A site admin must accept", md)
-        self.assertIn("Apps → Manage apps", md)
+        self.assertIn("An Atlassian site admin must accept", md)
+        self.assertIn("Atlassian Administration (admin.atlassian.com): Apps, Sites, choose the site, Connected apps, Coderhelm, View app details, Update", md)
+        self.assertNotIn("Manage apps", md)
         self.assertIn("write:jira-work", md)
 
     def test_removed_scope_still_needs_admin(self):
@@ -141,7 +142,9 @@ class CliTests(unittest.TestCase):
             with open(out) as f:
                 self.assertEqual(json.load(f)["scopes_added"], ["read:me"])
             with open(summary) as f:
-                self.assertIn("Manage apps", f.read())
+                text = f.read()
+                self.assertIn("Connected apps", text)
+                self.assertNotIn("Manage apps", text)
 
     def test_summary_from_saved_result(self):
         with tempfile.TemporaryDirectory() as d:
@@ -151,7 +154,7 @@ class CliTests(unittest.TestCase):
             with open(out, "w") as f:
                 json.dump(r, f)
             text = self.run_cli("summary", "--json", out)
-            self.assertIn("A site admin must accept", text)
+            self.assertIn("An Atlassian site admin must accept", text)
             self.assertNotIn("no one needs to do anything", text)
 
     def test_diff_missing_old_file(self):
@@ -169,6 +172,15 @@ class CliTests(unittest.TestCase):
             path = self.write(d, "i.json", installs, as_yaml=False)
             self.assertEqual(self.run_cli("pending", "--installs", path), "a.example.net\tjira\t5\n")
             self.assertEqual(self.run_cli("pending", "--installs", path, "--environment", "staging"), "c.example.net\tjira\t1\n")
+
+    def test_the_installation_link_rides_on_the_pointer_and_the_steps(self):
+        link = "https://developer.atlassian.com/console/install/00000000-0000-0000-0000-000000000002?signature=abc&product=jira"
+        p = fr.latest_pointer([{"version": "7.0.0"}], {"app": {"id": "ari:x"}}, install_url=link)
+        self.assertEqual(p["installUrl"], link)
+        self.assertNotIn("installUrl", fr.latest_pointer([{"version": "7.0.0"}], {}, install_url="https://example.com/x"))
+        self.assertIn(link, fr.admin_steps(link))
+        self.assertIn("Connected apps", fr.admin_steps(link))
+        self.assertNotIn("Manage apps", fr.admin_steps() + fr.admin_steps(link))
 
     def test_latest_pointer_is_the_highest_production_version(self):
         versions = [{"version": "5.20.0"}, {"version": "6.11.0"}, {"version": "6.9.0"}, {"version": "soon"}]
@@ -197,7 +209,8 @@ class CliTests(unittest.TestCase):
         self.assertIn("threaded replies", md)
         self.assertNotIn("example", md)
         self.assertTrue(warning.startswith("2 installation(s) still run an older Coderhelm app (latest 6.11.0). They lack: "))
-        self.assertIn("Jira Settings, Apps, Manage apps, Coderhelm, Update.", warning)
+        self.assertIn("Connected apps, Coderhelm, View app details, Update.", warning)
+        self.assertNotIn("Manage apps", warning + md)
         self.assertEqual(fr.behind_report([], "6.11.0", features), ("", ""))
         self.assertEqual(fr.parse_version("6.10"), (6, 10, 0))
         self.assertIsNone(fr.parse_version("6.x"))

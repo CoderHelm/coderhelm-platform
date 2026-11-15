@@ -1,4 +1,4 @@
-//! bn. The description writer was upgraded (a final review in the one save,
+//! br. The description writer was upgraded (a final review in the one save,
 //! the repository's template as the structure, a running check never a
 //! result), and a pull request opened the day before kept its old text:
 //! six check rows "Not run: still running when this was written", "Look

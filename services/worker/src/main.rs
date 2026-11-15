@@ -770,9 +770,7 @@ async fn handle_message_inner(state: Arc<WorkerState>, message: models::WorkerMe
         }
         models::WorkerMessage::SecurityEvent(msg) => {
             info!(team_id = %msg.team_id, kind = %msg.kind, repo = %msg.repo, "Security event");
-            if msg.kind == passes::infra_findings::CHECK_KIND
-                || msg.kind == passes::infra_findings::FIX_KIND
-            {
+            if passes::infra_findings::handles(&msg.kind) {
                 passes::infra_findings::on_event(&state, &msg).await;
             } else {
                 passes::security_fixes::on_event(&state, &msg).await;

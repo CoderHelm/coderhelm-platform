@@ -149,6 +149,15 @@ pub fn target_in(description: &str) -> String {
         .unwrap_or_default()
 }
 
+/// The platform version a serverless update names (`Upgrade to platform
+/// version 4`), as `platform version 4`; empty when it names none.
+pub fn platform_in(description: &str) -> String {
+    re(r"(?i)platform version (\d+(?:\.\d+)*)")
+        .captures(description)
+        .map(|c| format!("platform version {}", &c[1]))
+        .unwrap_or_default()
+}
+
 /// The part of an engine version that names its major version.
 fn major_of(engine: &str, version: &str) -> String {
     if let Some(a) = version.split("mysql_aurora.").nth(1) {
@@ -434,6 +443,8 @@ pub fn reconcile(engine: &str, running: &str, lines: &[Line]) -> Vec<Pending> {
         let meaning = meaning_of(&l.action, scope, engine);
         let target = if matches!(meaning, Meaning::EngineUpgrade | Meaning::EnginePatch) {
             target_in(&l.description)
+        } else if meaning == Meaning::ServerlessPlatform {
+            platform_in(&l.description)
         } else {
             String::new()
         };

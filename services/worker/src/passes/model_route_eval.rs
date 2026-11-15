@@ -269,6 +269,318 @@ async fn route_review_live() {
     );
 }
 
+// ── Real reviews ─────────────────────────────────────────────────────────
+//
+// The team's own past reviews replayed on the same inputs: the PR's diff,
+// its files at the reviewed head and the repository's instruction files,
+// with what people did with each finding as the answer. Cases are exported
+// by `scripts/export_real_review_cases.py` into a directory OUTSIDE the
+// repository (they hold the team's code) and read from `EVAL_REAL_CASES`.
+// Never committed; nothing here names them.
+
+/// One replayed review.
+#[derive(Deserialize)]
+struct RealCase {
+    name: String,
+    title: String,
+    #[serde(default)]
+    body: String,
+    diff: String,
+    files: BTreeMap<String, String>,
+    /// The repository's instruction files at the reviewed head.
+    #[serde(default)]
+    instructions: String,
+    /// Findings people acted on: the code at the line changed after the
+    /// comment, or a person agreed with it.
+    #[serde(default)]
+    accepted: Vec<Known>,
+    /// Findings people rejected: resolved or answered with no change, or
+    /// rated down.
+    #[serde(default)]
+    dismissed: Vec<Known>,
+    /// Lines the diff adds and removes, for the per-size buckets.
+    #[serde(default)]
+    lines_changed: u64,
+}
+
+/// A finding whose fate is known, where it was anchored.
+#[derive(Deserialize, Clone)]
+struct Known {
+    file: String,
+    line: u64,
+    /// Whether the original finding held the merge.
+    #[serde(default)]
+    blocking: bool,
+}
+
+impl Known {
+    fn as_defect(&self) -> Defect {
+        Defect {
+            file: self.file.clone(),
+            line: self.line,
+            what: String::new(),
+        }
+    }
+}
+
+/// What one replay of a real review scored.
+#[derive(Debug, Default, PartialEq, serde::Serialize)]
+struct RealScore {
+    accepted: usize,
+    /// Accepted findings raised again.
+    found: usize,
+    /// ...with the same say on the merge (holds it, or doesn't) as before.
+    same_severity: usize,
+    /// Blocking accepted findings raised again as blocking.
+    accepted_blocking: usize,
+    found_blocking: usize,
+    dismissed: usize,
+    /// Dismissed findings raised again (the false positives people saw).
+    dismissed_raised: usize,
+    dismissed_raised_blocking: usize,
+    /// Findings about neither: unknown, not counted against either model.
+    other: usize,
+}
+
+fn score_real(case: &RealCase, findings: &[Finding]) -> RealScore {
+    // The findings about `k`, and whether any of them holds the merge.
+    let hit = |k: &Known| -> (bool, bool) {
+        let d = k.as_defect();
+        let on: Vec<&Finding> = findings.iter().filter(|f| finding_hits(f, &d)).collect();
+        (!on.is_empty(), on.iter().any(|f| f.holds_merge()))
+    };
+    let mut s = RealScore {
+        accepted: case.accepted.len(),
+        accepted_blocking: case.accepted.iter().filter(|k| k.blocking).count(),
+        dismissed: case.dismissed.len(),
+        ..Default::default()
+    };
+    for k in &case.accepted {
+        let (found, blocks) = hit(k);
+        if !found {
+            continue;
+        }
+        s.found += 1;
+        if blocks == k.blocking {
+            s.same_severity += 1;
+        }
+        if k.blocking && blocks {
+            s.found_blocking += 1;
+        }
+    }
+    for k in &case.dismissed {
+        let (found, blocks) = hit(k);
+        if found {
+            s.dismissed_raised += 1;
+            if blocks {
+                s.dismissed_raised_blocking += 1;
+            }
+        }
+    }
+    s.other = findings
+        .iter()
+        .filter(|f| {
+            !case
+                .accepted
+                .iter()
+                .chain(&case.dismissed)
+                .any(|k| finding_hits(f, &k.as_defect()))
+        })
+        .count();
+    s
+}
+
+/// The size bucket a case is reported in: the route can move only the
+/// sizes where the lighter model holds.
+fn size_bucket(lines_changed: u64) -> &'static str {
+    match lines_changed {
+        0..=80 => "small",
+        81..=400 => "medium",
+        _ => "large",
+    }
+}
+
+fn real_cases(dir: &std::path::Path) -> Vec<RealCase> {
+    let mut out: Vec<RealCase> = std::fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
+        .map(|p| {
+            let text = std::fs::read_to_string(&p).unwrap();
+            serde_json::from_str(&text).unwrap_or_else(|e| panic!("{}: {e}", p.display()))
+        })
+        .collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+#[test]
+fn a_real_review_scores_what_people_kept_and_what_they_rejected() {
+    let f = |file: &str, line: u64, severity: &str, evidence: &str| -> Finding {
+        serde_json::from_value(json!({
+            "file": file, "line": line, "severity": severity, "category": "bug",
+            "title": "t", "body": "b", "evidence": evidence,
+        }))
+        .unwrap()
+    };
+    let case = RealCase {
+        name: "c".into(),
+        title: "t".into(),
+        body: String::new(),
+        diff: String::new(),
+        files: BTreeMap::new(),
+        instructions: String::new(),
+        accepted: vec![
+            Known {
+                file: "a.rs".into(),
+                line: 10,
+                blocking: true,
+            },
+            Known {
+                file: "b.rs".into(),
+                line: 50,
+                blocking: false,
+            },
+            Known {
+                file: "c.rs".into(),
+                line: 5,
+                blocking: false,
+            },
+        ],
+        dismissed: vec![Known {
+            file: "d.rs".into(),
+            line: 7,
+            blocking: false,
+        }],
+        lines_changed: 40,
+    };
+    let blocking = f("a.rs", 12, "blocking", "verified-defect");
+    assert!(
+        blocking.holds_merge(),
+        "the fixture's blocking finding holds the merge"
+    );
+    let got = vec![
+        blocking,
+        f("b.rs", 51, "low", "unverified-concern"),
+        f("d.rs", 7, "medium", "unverified-concern"),
+        f("e.rs", 1, "low", "unverified-concern"),
+    ];
+    let s = score_real(&case, &got);
+    assert_eq!(
+        s,
+        RealScore {
+            accepted: 3,
+            found: 2,
+            same_severity: 2,
+            accepted_blocking: 1,
+            found_blocking: 1,
+            dismissed: 1,
+            dismissed_raised: 1,
+            dismissed_raised_blocking: 0,
+            other: 1,
+        }
+    );
+    assert_eq!(size_bucket(40), "small");
+    assert_eq!(size_bucket(300), "medium");
+    assert_eq!(size_bucket(2000), "large");
+}
+
+/// Live, on demand: the exported real reviews in `EVAL_REAL_CASES`, each
+/// reviewed with the chosen reviewer and critic, `EVAL_REPEAT` times. Prints
+/// one `ROUTE_EVAL` line per case and a `ROUTE_EVAL_SUMMARY` line per size
+/// bucket and overall. Run it once per reviewer model on the same cases and
+/// compare: the measured route is safe only where the lighter reviewer finds
+/// as many accepted findings, with the same say on the merge, and raises no
+/// more dismissed ones.
+#[tokio::test]
+#[ignore]
+async fn route_review_real_live() {
+    let Ok(dir) = std::env::var("EVAL_REAL_CASES") else {
+        panic!("set EVAL_REAL_CASES to the directory export_real_review_cases.py wrote");
+    };
+    let (client, model) = eval_client().await;
+    let model = std::env::var("EVAL_REVIEW_MODEL").unwrap_or(model);
+    let critic = std::env::var("EVAL_CRITIC_MODEL").unwrap_or_else(|_| model.clone());
+    let cases = real_cases(std::path::Path::new(&dir));
+    assert!(!cases.is_empty(), "no cases in {dir}");
+    let mut errors = vec![];
+    for rep in 0..repeats() {
+        // Per bucket and "all": the summed score, cases, cost.
+        let mut sums: BTreeMap<&str, (RealScore, usize, f64)> = BTreeMap::new();
+        for c in &cases {
+            let lr = LiveReview {
+                title: c.title.clone(),
+                body: c.body.clone(),
+                diff: c.diff.clone(),
+                files: c.files.clone(),
+                expect: LiveExpect::default(),
+                after_reply: None,
+            };
+            let mut usage = crate::models::TokenUsage::default();
+            let got = match super::review_eval::live_review_in_repo(
+                &client,
+                &model,
+                &critic,
+                &lr,
+                "",
+                &c.instructions,
+                &mut usage,
+            )
+            .await
+            {
+                Ok(got) => got,
+                Err(e) => {
+                    errors.push(format!("{}: {e}", c.name));
+                    continue;
+                }
+            };
+            let s = score_real(c, &got.findings);
+            println!(
+                "ROUTE_EVAL {}",
+                json!({
+                    "suite": "review-real", "rep": rep, "case": c.name, "model": model,
+                    "critic": critic, "bucket": size_bucket(c.lines_changed), "score": s,
+                    "verdict": got.verdict, "cost_usd": usage.cost_usd,
+                })
+            );
+            for key in ["all", size_bucket(c.lines_changed)] {
+                let e = sums.entry(key).or_default();
+                e.0.accepted += s.accepted;
+                e.0.found += s.found;
+                e.0.same_severity += s.same_severity;
+                e.0.accepted_blocking += s.accepted_blocking;
+                e.0.found_blocking += s.found_blocking;
+                e.0.dismissed += s.dismissed;
+                e.0.dismissed_raised += s.dismissed_raised;
+                e.0.dismissed_raised_blocking += s.dismissed_raised_blocking;
+                e.0.other += s.other;
+                e.1 += 1;
+                e.2 += usage.cost_usd;
+            }
+        }
+        let ratio = |a: usize, b: usize| if b == 0 { 0.0 } else { a as f64 / b as f64 };
+        for (bucket, (s, n, cost)) in &sums {
+            println!(
+                "ROUTE_EVAL_SUMMARY {}",
+                json!({
+                    "suite": "review-real", "rep": rep, "bucket": bucket, "model": model,
+                    "critic": critic, "cases": n, "score": s,
+                    "accepted_recall": ratio(s.found, s.accepted),
+                    "blocking_recall": ratio(s.found_blocking, s.accepted_blocking),
+                    "severity_agreement": ratio(s.same_severity, s.found),
+                    "dismissed_raised_rate": ratio(s.dismissed_raised, s.dismissed),
+                    "cost_usd": cost, "cost_per_review": cost / (*n).max(1) as f64,
+                })
+            );
+        }
+    }
+    assert!(
+        errors.is_empty(),
+        "review calls failed:\n{}",
+        errors.join("\n")
+    );
+}
+
 // ── Implement ────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]

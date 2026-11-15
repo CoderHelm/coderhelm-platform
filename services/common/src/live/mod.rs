@@ -30,6 +30,7 @@ pub mod aws_account;
 pub mod aws_settings;
 pub mod catalog;
 pub mod confluence;
+pub mod confluence_changelog;
 pub mod connectors;
 pub mod db;
 pub mod dialect;

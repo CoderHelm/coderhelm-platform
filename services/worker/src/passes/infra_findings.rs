@@ -18,11 +18,11 @@
 //! - New P0 and P1 findings post one card each, inside the day's card
 //!   limit shared with dependency findings (`SECCARDS#<day>`).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use aws_sdk_dynamodb::types::AttributeValue;
 use chrono::Utc;
-use common::infra_vuln::inventory::{Resource, RESOURCE_PREFIX};
+use common::infra_vuln::inventory::{Coverage, KindsRead, Resource, RESOURCE_PREFIX};
 use common::infra_vuln::matching::{self, Feeds, FixKind};
 use common::infra_vuln::records::{self, Record, Status};
 use common::infra_vuln::store;
@@ -40,6 +40,18 @@ type Item = HashMap<String, AttributeValue>;
 pub const CHECK_KIND: &str = "infrastructure_check";
 /// `SecurityEventMessage.kind` for "open the fix PR now" (`repo` = the id).
 pub const FIX_KIND: &str = "infrastructure_fix";
+/// `SecurityEventMessage.kind` for the refresh when someone opens the page
+/// and the last read is old: AWS only, then the match.
+pub const REFRESH_KIND: &str = "infrastructure_refresh";
+/// `SecurityEventMessage.kind` for a person's approval of a pending action
+/// CoderHelm applies in AWS (`repo` = the finding id, `action` = when:
+/// `next-maintenance` or `immediate`, `requested_by` = who).
+pub const APPLY_KIND: &str = "infrastructure_apply";
+
+/// Whether a security event is this pass's.
+pub fn handles(kind: &str) -> bool {
+    [CHECK_KIND, FIX_KIND, REFRESH_KIND, APPLY_KIND].contains(&kind)
+}
 
 fn s(i: &Item, k: &str) -> String {
     i.get(k)
@@ -113,11 +125,16 @@ async fn save(state: &WorkerState, team_id: &str, r: &Record) {
     }
 }
 
-/// The team's resources and, per account, AWS's latest AL2023 AMIs there.
+/// The team's resources, per account AWS's latest AL2023 AMIs there, and
+/// what each account and region's latest read saw in full.
 async fn inventory(
     state: &WorkerState,
     team_id: &str,
-) -> (Vec<Resource>, BTreeMap<String, BTreeMap<String, String>>) {
+) -> (
+    Vec<Resource>,
+    BTreeMap<String, BTreeMap<String, String>>,
+    Coverage,
+) {
     let table = &state.config.aws_insights_table_name;
     let res: Vec<Resource> = query(state, table, team_id, RESOURCE_PREFIX)
         .await
@@ -125,15 +142,21 @@ async fn inventory(
         .filter_map(|i| serde_json::from_str(&s(i, "json")).ok())
         .collect();
     let mut latest = BTreeMap::new();
+    let mut coverage = Coverage::default();
     for i in query(state, table, team_id, super::infra_inventory::READ_PREFIX).await {
         if let Ok(v) = serde_json::from_str::<Value>(&s(&i, "json")) {
             let acct = v["account"].as_str().unwrap_or("").to_string();
             let m: BTreeMap<String, String> =
                 serde_json::from_value(v["latest_al2023"].clone()).unwrap_or_default();
             latest.insert(acct, m);
+            // A summary written before reads said what they saw in full
+            // has no `complete`: it closes nothing.
+            if let Ok(k) = serde_json::from_value::<KindsRead>(v) {
+                coverage.reads.push(k);
+            }
         }
     }
-    (res, latest)
+    (res, latest, coverage)
 }
 
 async fn kev(state: &WorkerState) -> BTreeMap<String, String> {
@@ -154,7 +177,8 @@ async fn kev(state: &WorkerState) -> BTreeMap<String, String> {
 /// Matches the team's inventory now and saves what changed. Returns the
 /// stored records after the match.
 pub async fn match_team(state: &WorkerState, team_id: &str) -> Vec<Record> {
-    let (resources, latest) = inventory(state, team_id).await;
+    let (resources, latest, coverage) = inventory(state, team_id).await;
+    let present: BTreeSet<String> = resources.iter().map(|r| r.id.clone()).collect();
     let mut stored = load_records(state, team_id).await;
     if resources.is_empty() && stored.is_empty() {
         return stored;
@@ -184,7 +208,11 @@ pub async fn match_team(state: &WorkerState, team_id: &str) -> Vec<Record> {
         };
         fresh.extend(matching::findings(res, &feeds));
     }
-    let changed = records::reconcile(&stored, fresh, Utc::now());
+    let seen = records::Seen::Read {
+        coverage: &coverage,
+        present: &present,
+    };
+    let changed = records::reconcile_with(&stored, fresh, seen, Utc::now());
     for r in &changed {
         save(state, team_id, r).await;
         if let Some(e) = &r.event {
@@ -195,6 +223,8 @@ pub async fn match_team(state: &WorkerState, team_id: &str) -> Vec<Record> {
             None => stored.push(r.clone()),
         }
     }
+    // Approved actions whose turn came (the non-production copy is fixed).
+    apply_due(state, team_id, &mut stored).await;
     stored
 }
 
@@ -597,7 +627,13 @@ pub async fn on_event(state: &WorkerState, msg: &SecurityEventMessage) {
     let cfg = super::security_fixes::load_config(state, team)
         .await
         .unwrap_or_default();
-    if msg.kind == CHECK_KIND {
+    if msg.kind == CHECK_KIND || msg.kind == REFRESH_KIND {
+        use super::infra_inventory::Depth;
+        let depth = if msg.kind == CHECK_KIND {
+            Depth::Full
+        } else {
+            Depth::Aws
+        };
         for a in common::live::aws_account::list(
             &state.dynamo,
             &state.config.aws_insights_table_name,
@@ -607,13 +643,15 @@ pub async fn on_event(state: &WorkerState, msg: &SecurityEventMessage) {
         .unwrap_or_default()
         {
             if a.infra_on() {
-                if let Err(e) = super::infra_inventory::read_account(state, team, &a).await {
+                if let Err(e) = super::infra_inventory::read_account(state, team, &a, depth).await {
                     warn!(team_id = %team, account = %a.account, error = %e, "infra check: the role couldn't be taken on");
                 }
             }
         }
         let recs = match_team(state, team).await;
         cards(state, team, &cfg, &recs).await;
+    } else if msg.kind == APPLY_KIND {
+        approve(state, team, &msg.repo, &msg.action, &msg.requested_by).await;
     } else if msg.kind == FIX_KIND {
         let mut recs = load_records(state, team).await;
         let iid = if msg.installation_id > 0 {
@@ -648,6 +686,239 @@ pub async fn on_event(state: &WorkerState, msg: &SecurityEventMessage) {
                     .await;
                 }
             }
+        }
+    }
+}
+
+// ── Apply: a pending action CoderHelm applies after one approval ────────
+
+/// AWS's two answers for when to apply.
+pub const OPT_INS: &[&str] = &["next-maintenance", "immediate"];
+
+/// Why an approved action is not sent to AWS now, or `None` when it is
+/// due. Pure.
+pub(crate) fn not_due(r: &Record, all: &[Record], today: &str) -> Option<String> {
+    let a = r.apply.as_ref()?;
+    if a.sent() || !r.status.is_open() || r.finding.fix.kind != Some(FixKind::Apply) {
+        return Some(String::new());
+    }
+    if r.finding.fix.apply.is_none() {
+        return Some("Nothing to apply on this finding.".into());
+    }
+    // Production waits for its non-production copy to be fixed and read
+    // back healthy; AWS's own date close by does not wait.
+    records::held(r, all, today)
+}
+
+/// A person approved: recorded on the finding, then sent if it is due.
+async fn approve(state: &WorkerState, team_id: &str, id: &str, opt_in: &str, by: &str) {
+    let mut recs = load_records(state, team_id).await;
+    let Some(i) = recs.iter().position(|r| r.finding.id == id) else {
+        return;
+    };
+    let r = &mut recs[i];
+    if !r.status.is_open() || r.finding.fix.kind != Some(FixKind::Apply) {
+        super::security_fixes::add_event(
+            state,
+            team_id,
+            id,
+            "Approval not used: this finding has nothing to apply in AWS now",
+            None,
+        )
+        .await;
+        return;
+    }
+    let opt_in = if OPT_INS.contains(&opt_in) {
+        opt_in
+    } else {
+        "next-maintenance"
+    };
+    r.apply = Some(records::ApplyState {
+        opt_in: opt_in.into(),
+        approved_by: by.into(),
+        approved_at: Utc::now().to_rfc3339(),
+        ..Default::default()
+    });
+    r.updated_at = Utc::now().to_rfc3339();
+    save(state, team_id, r).await;
+    super::security_fixes::add_event(
+        state,
+        team_id,
+        id,
+        &format!(
+            "Approved by {}: CoderHelm applies it in AWS {}",
+            if by.is_empty() { "an admin" } else { by },
+            if opt_in == "immediate" {
+                "now"
+            } else {
+                "in the next maintenance window"
+            }
+        ),
+        None,
+    )
+    .await;
+    apply_due(state, team_id, &mut recs).await;
+}
+
+/// Sends every approved action that is due, and notes why the others wait.
+async fn apply_due(state: &WorkerState, team_id: &str, recs: &mut [Record]) {
+    let today = Utc::now().format("%Y-%m-%d").to_string();
+    for i in 0..recs.len() {
+        if recs[i].apply.is_none() {
+            continue;
+        }
+        match not_due(&recs[i], recs, &today) {
+            Some(why) if why.is_empty() => {}
+            Some(why) => {
+                let r = &mut recs[i];
+                if let Some(a) = r.apply.as_mut().filter(|a| a.note != why) {
+                    a.note = why;
+                    save(state, team_id, r).await;
+                }
+            }
+            None => {
+                let r = &mut recs[i];
+                send_apply(state, team_id, r).await;
+            }
+        }
+    }
+}
+
+/// What a refusal from AWS means for the page: the permission the role
+/// lacks, when that is why. Pure.
+pub(crate) fn refusal(code: &str, message: &str) -> (String, String) {
+    let denied = matches!(
+        code,
+        "AccessDenied" | "AccessDeniedException" | "UnauthorizedOperation" | "AuthorizationError"
+    ) || message.contains("not authorized");
+    if denied {
+        (
+            matching::APPLY_PERMISSION.to_string(),
+            format!(
+                "AWS refused: the CoderHelm role in this account may not call {}. Turn ApplyMaintenance on in the role's update stack (the account's Update link), or follow the runbook.",
+                matching::APPLY_PERMISSION
+            ),
+        )
+    } else {
+        (String::new(), format!("AWS refused ({code}): {message}"))
+    }
+}
+
+async fn send_apply(state: &WorkerState, team_id: &str, r: &mut Record) {
+    let Some(plan) = r.finding.fix.apply.clone() else {
+        return;
+    };
+    let opt_in = r
+        .apply
+        .as_ref()
+        .map(|a| a.opt_in.clone())
+        .unwrap_or_else(|| "next-maintenance".into());
+    let account = common::live::aws_account::list(
+        &state.dynamo,
+        &state.config.aws_insights_table_name,
+        team_id,
+    )
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .find(|a| a.account == r.finding.account);
+    let Some(account) = account else {
+        if let Some(a) = r.apply.as_mut() {
+            a.note = "The AWS account is no longer connected.".into();
+        }
+        save(state, team_id, r).await;
+        return;
+    };
+    let mut target = account.target();
+    if !r.finding.region.is_empty() {
+        target.region = r.finding.region.clone();
+    }
+    let session = match common::live::aws::assume(&state.sts, &target, "infra-apply").await {
+        Ok(s) => s,
+        Err(e) => {
+            if let Some(a) = r.apply.as_mut() {
+                a.note = format!("The role could not be taken on: {}", e.message);
+            }
+            save(state, team_id, r).await;
+            return;
+        }
+    };
+    let mut accepted: Vec<String> = r
+        .apply
+        .as_ref()
+        .map(|a| a.applied.clone())
+        .unwrap_or_default();
+    let todo: Vec<String> = plan
+        .arns
+        .iter()
+        .filter(|a| !accepted.contains(a))
+        .cloned()
+        .collect();
+    for arn in &todo {
+        match super::infra_inventory::apply_pending(&session, arn, &plan.action, &opt_in).await {
+            Ok(()) => accepted.push(arn.clone()),
+            Err((code, message)) => {
+                let (missing, note) = refusal(&code, &message);
+                if let Some(a) = r.apply.as_mut() {
+                    a.applied = accepted.clone();
+                    a.missing_permission = missing;
+                    a.note = note.clone();
+                }
+                r.updated_at = Utc::now().to_rfc3339();
+                save(state, team_id, r).await;
+                super::security_fixes::add_event(
+                    state,
+                    team_id,
+                    &r.finding.id,
+                    &format!("Not applied: {note}"),
+                    None,
+                )
+                .await;
+                warn!(team_id, code = %code, "infra apply: AWS refused");
+                return;
+            }
+        }
+    }
+    let when = if opt_in == "immediate" {
+        "now"
+    } else {
+        "in the next maintenance window"
+    };
+    if let Some(a) = r.apply.as_mut() {
+        a.applied = accepted;
+        a.applied_at = Utc::now().to_rfc3339();
+        a.missing_permission.clear();
+        a.note = format!(
+            "AWS accepted `{}` {when}. CoderHelm reads the account again and closes this when the action is no longer pending.",
+            plan.action
+        );
+    }
+    r.updated_at = Utc::now().to_rfc3339();
+    save(state, team_id, r).await;
+    super::security_fixes::add_event(
+        state,
+        team_id,
+        &r.finding.id,
+        &format!("Applied in AWS ({}) {when}", plan.action),
+        None,
+    )
+    .await;
+    // Applied now: read it back in a quarter of an hour.
+    if opt_in == "immediate" && !state.config.ticket_queue_url.is_empty() {
+        let msg = WorkerMessage::SecurityEvent(SecurityEventMessage {
+            team_id: team_id.to_string(),
+            kind: REFRESH_KIND.into(),
+            ..Default::default()
+        });
+        if let Ok(body) = serde_json::to_string(&msg) {
+            let _ = state
+                .sqs
+                .send_message()
+                .queue_url(&state.config.ticket_queue_url)
+                .message_body(body)
+                .delay_seconds(900)
+                .send()
+                .await;
         }
     }
 }

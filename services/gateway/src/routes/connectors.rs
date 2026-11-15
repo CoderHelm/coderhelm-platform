@@ -262,7 +262,7 @@ fn confluence_access<'a>(
         StepError::new(
             "reach",
             "The Coderhelm app in Jira can't reach Confluence.",
-            "Update the app in Jira, then open Coderhelm Settings there and save.",
+            "The Jira app no longer reads Confluence. Connect Confluence in Settings, Integrations, Atlassian (an Atlassian sign-in, or an API token).",
         )
     })?;
     Ok(Access::JiraApp {
@@ -651,7 +651,7 @@ pub async fn save(
             if c.write_enabled {
                 return Err(fail(
                     StatusCode::BAD_REQUEST,
-                    "The Atlassian sign-in only reads Confluence. To add text to pages, connect Confluence with an API token or the Jira app.",
+                    "The Atlassian sign-in only reads Confluence. To add text to pages, save an API token in Settings, Integrations, Atlassian, Confluence.",
                 ));
             }
         }
@@ -659,7 +659,7 @@ pub async fn save(
             let Some(a) = &app else {
                 return Err(fail(
                     StatusCode::BAD_REQUEST,
-                    "The Coderhelm app in Jira can't reach Confluence yet. Update the app in Jira, then open Coderhelm Settings there and save.",
+                    "The Coderhelm app in Jira can't reach Confluence. The Jira app no longer reads Confluence. Connect Confluence in Settings, Integrations, Atlassian (an Atlassian sign-in, or an API token).",
                 ));
             };
             c.site = a.site.clone();

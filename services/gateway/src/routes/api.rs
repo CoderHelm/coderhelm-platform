@@ -6038,9 +6038,66 @@ pub async fn get_model_provider(
         "api_key_masked": api_key_masked,
         "primary_model": current(&primary_saved),
         "heavy_model": current(&heavy_saved),
+        "review_model_route": review_model_route(saved("review_model_route").as_deref()),
         "retired_models": retired,
         "deployment_provider": deployment_provider(),
     })))
+}
+
+/// Which model writes the team's reviews: "measured_light" (the default:
+/// the review written on the lighter measured model, its critic on the
+/// strongest; see the worker's `ReviewRoute`) or "strongest" (a team that
+/// keeps every review on the strongest model). Anything else reads as the
+/// default.
+fn review_model_route(v: Option<&str>) -> &'static str {
+    match v.map(str::trim) {
+        Some("strongest") => "strongest",
+        _ => "measured_light",
+    }
+}
+
+/// The route a save keeps: the one in the request when it names one (an
+/// unknown name is refused), else the one saved before, so a client that
+/// doesn't know the field never resets it.
+fn review_route_to_save(body: &Value, saved: Option<&str>) -> Result<&'static str, StatusCode> {
+    match body.get("review_model_route").and_then(|v| v.as_str()) {
+        Some("strongest") => Ok("strongest"),
+        Some("measured_light") => Ok("measured_light"),
+        Some(_) => Err(StatusCode::BAD_REQUEST),
+        None => Ok(review_model_route(saved)),
+    }
+}
+
+#[cfg(test)]
+mod review_route_tests {
+    use super::*;
+
+    #[test]
+    fn the_review_route_is_measured_light_unless_a_team_picks_the_strongest() {
+        assert_eq!(review_model_route(None), "measured_light");
+        assert_eq!(review_model_route(Some("sonnet")), "measured_light");
+        assert_eq!(review_model_route(Some("strongest")), "strongest");
+        // A save without the field keeps what was saved.
+        let none = json!({"primary_model": "claude-sonnet-5-5"});
+        assert_eq!(review_route_to_save(&none, None), Ok("measured_light"));
+        assert_eq!(
+            review_route_to_save(&none, Some("measured_light")),
+            Ok("measured_light")
+        );
+        // A save with it sets it; an unknown name is refused.
+        let light = json!({"review_model_route": "measured_light"});
+        assert_eq!(review_route_to_save(&light, None), Ok("measured_light"));
+        let back = json!({"review_model_route": "strongest"});
+        assert_eq!(
+            review_route_to_save(&back, Some("measured_light")),
+            Ok("strongest")
+        );
+        let bad = json!({"review_model_route": "haiku"});
+        assert_eq!(
+            review_route_to_save(&bad, None),
+            Err(StatusCode::BAD_REQUEST)
+        );
+    }
 }
 
 /// How this deployment calls Claude: "bedrock" (its own AWS account, no team
@@ -6077,6 +6134,27 @@ pub async fn update_model_provider(
         return Err(StatusCode::BAD_REQUEST);
     }
 
+    let existing = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(&claims.team_id))
+        .key("sk", attr_s("SETTINGS#MODEL_PROVIDER"))
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to fetch existing model provider: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    let saved = |k: &str| {
+        existing
+            .item()
+            .and_then(|item| item.get(k))
+            .and_then(|v| v.as_s().ok())
+            .cloned()
+    };
+    let review_route = review_route_to_save(&body, saved("review_model_route").as_deref())?;
+
     // On Bedrock the install's own role calls the model: only the model
     // choices are saved, with no key to check.
     if common::model_provider::is_bedrock() {
@@ -6090,6 +6168,7 @@ pub async fn update_model_provider(
             .item("provider", attr_s(provider))
             .item("primary_model", attr_s(primary_model))
             .item("heavy_model", attr_s(heavy_model))
+            .item("review_model_route", attr_s(review_route))
             .item("updated_at", attr_s(&now))
             .send()
             .await
@@ -6101,27 +6180,9 @@ pub async fn update_model_provider(
     }
 
     // If no new key provided, try to reuse existing one
-    let api_key = if let Some(key) = api_key_from_body {
-        key
-    } else {
-        let existing = state
-            .dynamo
-            .get_item()
-            .table_name(&state.config.settings_table_name)
-            .key("pk", attr_s(&claims.team_id))
-            .key("sk", attr_s("SETTINGS#MODEL_PROVIDER"))
-            .send()
-            .await
-            .map_err(|e| {
-                error!("Failed to fetch existing model provider: {e}");
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
-        existing
-            .item()
-            .and_then(|item| item.get("api_key"))
-            .and_then(|v| v.as_s().ok())
-            .cloned()
-            .ok_or(StatusCode::BAD_REQUEST)?
+    let api_key = match api_key_from_body {
+        Some(key) => key,
+        None => saved("api_key").ok_or(StatusCode::BAD_REQUEST)?,
     };
 
     // Validate the key (and its access to the chosen model) via the Models API
@@ -6169,6 +6230,7 @@ pub async fn update_model_provider(
         .item("api_key", attr_s(&api_key))
         .item("primary_model", attr_s(primary_model))
         .item("heavy_model", attr_s(heavy_model))
+        .item("review_model_route", attr_s(review_route))
         .item("updated_at", attr_s(&now))
         .send()
         .await

@@ -4,6 +4,7 @@ Run: python3 -m unittest discover -s lambda/tests
 """
 
 import importlib.util
+import json
 import os
 import pathlib
 import sys
@@ -109,8 +110,8 @@ class Teams(unittest.TestCase):
         card = h.recommendations_card("123456789012", recs, "https://app.example")
         c = card["attachments"][0]["content"]
         self.assertEqual(c["body"][0]["style"], "attention")
-        self.assertIn("7 new log findings", c["body"][0]["items"][0]["text"])
-        self.assertIn("boom", c["body"][2]["items"][0]["text"])
+        self.assertIn("7 log findings to look at", c["body"][0]["items"][0]["text"])
+        self.assertIn("boom", c["body"][1]["items"][0]["text"])
         self.assertEqual(c["body"][-1]["text"], "+2 more")
         self.assertEqual(c["actions"][0]["url"], "https://app.example/logs")
 
@@ -380,9 +381,10 @@ class Slack(unittest.TestCase):
     def test_block_kit_lists_findings_with_a_button(self):
         recs = [{"title": "<boom>", "severity": "critical", "summary": "5xx & rising", "source_log_group": "/aws/lambda/x"}]
         msg = h.recommendations_slack("123456789012", recs, "https://app.example")
-        self.assertEqual(msg["text"], "🔎 1 new log finding in AWS account 123456789012")
+        self.assertEqual(msg["text"], "🔎 1 log finding to look at")
+        self.assertNotIn("123456789012", json.dumps(msg))
         self.assertEqual(msg["blocks"][0]["type"], "header")
-        section = msg["blocks"][3]["text"]["text"]
+        section = msg["blocks"][2]["text"]["text"]
         self.assertEqual(section, "🔴 *&lt;boom&gt;*\n5xx &amp; rising")
         self.assertEqual(msg["blocks"][-1]["elements"][0]["url"], "https://app.example/logs")
 

@@ -633,13 +633,20 @@ pub fn apply_settings(l: &mut Local, b: &SettingsBody) -> Result<(), &'static st
     }
     if let Some(list) = &b.integrations {
         let allowed: Vec<&str> = integrations::hosted_ids().collect();
-        if list.iter().any(|i| !allowed.contains(&i.as_str())) {
+        if expanded(list)
+            .iter()
+            .any(|i| !allowed.contains(&i.as_str()))
+        {
             return Err("an integration that can't use CoderHelm's app");
         }
     }
     if let Some(apps) = &b.apps {
         for (id, v) in apps {
-            if !integrations::app_choice_ids().any(|x| x == id) {
+            // An entry's own id (`atlassian`) stands for its pieces.
+            if !integrations::expand(id)
+                .iter()
+                .all(|p| integrations::app_choice_ids().any(|x| x == p))
+            {
                 return Err("an integration that can't use CoderHelm's app");
             }
             if v != "coderhelm" && v != "own" {
@@ -700,6 +707,12 @@ async fn do_settings(
     Ok(l)
 }
 
+/// A page's list of integration ids as the pieces installs store
+/// (`atlassian` as `jira` and `confluence`).
+fn expanded(list: &[String]) -> Vec<String> {
+    list.iter().flat_map(|i| integrations::expand(i)).collect()
+}
+
 /// A JSON array of strings, if it is one.
 fn strings(v: &Value) -> Option<Vec<String>> {
     v.as_array().map(|a| {
@@ -744,9 +757,10 @@ pub fn legacy_apps_mode(b: &SettingsBody) -> Option<&'static str> {
     if let Some(apps) = b.apps.as_ref().filter(|a| !a.is_empty()) {
         return Some(pick(apps.values().any(|v| v == "coderhelm")));
     }
-    b.integrations
-        .as_ref()
-        .map(|list| pick(integrations::app_choice_ids().any(|id| list.iter().any(|i| i == id))))
+    b.integrations.as_ref().map(|list| {
+        let list = expanded(list);
+        pick(integrations::app_choice_ids().any(|id| list.iter().any(|i| i == id)))
+    })
 }
 
 /// The integrations to ask CoderHelm for: GitHub when its mode is hosted,
@@ -1070,20 +1084,28 @@ async fn status_value(state: &AppState, deep: bool) -> Value {
         .map(|e| {
             let mut v = serde_json::to_value(e).unwrap_or_default();
             // Registered: what CoderHelm holds. Not yet: what registering applies.
+            // An entry that covers several pieces (Atlassian: the Jira
+            // app and the Confluence sign-in) is on when any of them is.
+            let ids = e.ids();
             let uses = if creds.is_some() {
-                l.integrations.iter().any(|i| i == e.id)
+                l.integrations.iter().any(|i| ids.contains(&i.as_str()))
             } else {
                 wanted_integrations(&l, |id| own_app_set(state, id))
                     .iter()
-                    .any(|i| i == e.id)
+                    .any(|i| ids.contains(&i.as_str()))
             };
             v["uses_coderhelm"] = json!(uses);
             // The install's own app for this tool, which it uses whichever
             // Other apps choice was made.
-            if integrations::app_choice_ids().any(|id| id == e.id) {
-                v["own_app"] = json!(own_app_set(state, e.id));
+            if ids
+                .iter()
+                .any(|p| integrations::app_choice_ids().any(|id| id == *p))
+            {
+                v["own_app"] = json!(ids.iter().any(|p| own_app_set(state, p)));
             }
-            v["offered"] = json!(offered.as_ref().is_none_or(|o| o.iter().any(|i| i == e.id)));
+            v["offered"] = json!(offered
+                .as_ref()
+                .is_none_or(|o| o.iter().any(|i| ids.contains(&i.as_str()))));
             v
         })
         .collect();
@@ -2432,7 +2454,7 @@ mod tests {
         l.github_mode = "hosted".into();
         assert_eq!(
             wanted_integrations(&l, own_figma),
-            vec!["github", "jira", "notion", "confluence", "google_drive"]
+            vec!["github", "jira", "confluence", "notion", "google_drive"]
         );
         // Fully private: no app through CoderHelm; GitHub keeps its own choice.
         l.apps_mode = "private".into();
@@ -2453,7 +2475,7 @@ mod tests {
         let hosted: Vec<&str> = integrations::CATALOG
             .iter()
             .filter(|e| e.mode == integrations::Mode::Hosted && e.id != "github")
-            .map(|e| e.id)
+            .flat_map(|e| e.ids().iter().copied())
             .collect();
         assert_eq!(wanted_integrations(&l, no_own_apps), hosted);
         // A record migrated by an earlier release, before an entry was added
@@ -2598,6 +2620,15 @@ mod tests {
         assert!(apply_settings(&mut l, &apps(&[("github", "own")])).is_err());
         assert!(apply_settings(&mut l, &apps(&[("slack_commands", "coderhelm")])).is_err());
         assert!(apply_settings(&mut l, &apps(&[("notion", "both")])).is_err());
+        // The one Atlassian entry stands for the Jira app and the Confluence
+        // sign-in an install chose before.
+        apply_settings(&mut l, &apps(&[("atlassian", "coderhelm")])).unwrap();
+        let listed = SettingsBody {
+            integrations: Some(vec!["atlassian".into()]),
+            ..Default::default()
+        };
+        assert_eq!(legacy_apps_mode(&listed), Some("coderhelm"));
+        apply_settings(&mut l, &listed).unwrap();
         // The guide's body takes the same fields.
         let g =
             guide_body(br#"{"setup_token":"t","apps_mode":"private","apps":{"confluence":"own"}}"#);

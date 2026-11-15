@@ -58,13 +58,17 @@ Servers are added by address. CoderHelm discovers their authorization server (RF
 
 Every authorize and token request names the server as `resource` (RFC 8707). `iss` (RFC 9207) is checked when the server advertises it.
 
+How a server signs in is never written down: each sign-in reads it from the server first (its `401` and `resource_metadata`, then its authorization server's RFC 8414 or OpenID metadata), reusing what was read in the last five minutes and reading again once when a start fails. A server whose sign-in moves is followed, with a new client on the new authorization server. Before anyone is sent to the sign-in page, CoderHelm asks it once: a `5xx` (or no answer) means the provider's sign-in is down, and the page says so with the status instead of sending the person to an error page.
+
+The redirect is the install's own callback (`<dashboard>/settings/integrations/mcp-callback/`) for every server CoderHelm registers with by metadata document or dynamic registration: each install registers itself, so the provider sends people straight back to it. Only CoderHelm's own pre-registered apps (Notion, Atlassian 3LO, Google Drive and Figma through hybrid) use the hosted callback on `app.coderhelm.com`, because those apps have one fixed redirect.
+
 | Server | Registration it accepts | Notes |
 |---|---|---|
 | Linear `mcp.linear.app` | metadata document or dynamic | |
 | Sentry `mcp.sentry.dev` | metadata document or dynamic | |
 | Vercel `mcp.vercel.com` | metadata document, or clients Vercel approved | A self-host install needs its metadata document (an https address). |
 | Stripe `mcp.stripe.com` | dynamic | An agent API key works too. |
-| Atlassian Rovo `mcp.atlassian.com` | dynamic | An Atlassian organization admin may need to allow the redirect domain under Atlassian Administration, Rovo, Rovo MCP server ("Your organization admin must authorize access from this redirect URL"). |
+| Atlassian Rovo `mcp.atlassian.com/v2/mcp` | metadata document or dynamic, on `auth.atlassian.com` | The agent tools part of the one Atlassian connection. The server's `401` names its protected resource metadata, which names the sign-in server; CoderHelm reads it at every sign-in, so nothing about it is written down. The retired `v1/mcp` address (whose sign-in page answers 500 to every request) is moved to `v2/mcp` at the next sign-in. An Atlassian organization admin may need to allow the redirect domain under Atlassian Administration, Rovo, Rovo MCP server ("Your organization admin must authorize access from this redirect URL"). |
 | Figma `mcp.figma.com` | only clients Figma approved | Use a Figma OAuth app instead: the team's own, or CoderHelm's through hybrid. Scopes `current_user:read` and `file_content:read`; redirect as above. |
 
 ## Integrations
@@ -79,7 +83,7 @@ Every authorize and token request names the server as `resource` (RFC 8707). `is
   - Asking an organization owner to approve the app returns `setup_action=request`; the page says the request was sent.
   - Connect GitHub to link returns `?github_link=` with what linking did: `linked`, `not_admin`, `owned_elsewhere` or `none_visible`.
   - Cancelling GitHub's sign-in during a hybrid link goes back to the install with `hybrid_github=declined`. The token used to check a hybrid link is revoked as soon as the check is done.
-- **Jira (Forge app):** no OAuth. The app registers its web triggers with `POST <API URL>/integrations/jira/forge-register`. Every trigger must be a Forge web trigger (https on `*.atlassian-dev.net`, no port or credentials), or the registration is refused.
+- **Atlassian, the Jira app (Forge):** no OAuth. The app registers its web triggers with `POST <API URL>/integrations/jira/forge-register`. Every trigger must be a Forge web trigger (https on `*.atlassian-dev.net`, no port or credentials), or the registration is refused.
 - **Slack and Microsoft Teams:** no OAuth. Slack uses a slash command with the app's signing secret, and Teams an incoming webhook or an outgoing webhook token ([integrations](./self-host/integrations.md)).
 
 ## Signing in to CoderHelm

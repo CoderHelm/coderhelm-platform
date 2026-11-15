@@ -673,6 +673,11 @@ impl Env for Live<'_> {
         Some(tree.files.into_iter().map(|f| f.path).collect())
     }
 
+    async fn has_commit(&self, repo: &RepoInfo, sha: &str) -> Option<bool> {
+        let host = self.host?;
+        host.has_commit(&repo.name, sha).await.ok().flatten()
+    }
+
     async fn judge(&self, system: &str, user: &str) -> Result<String, String> {
         self.judge.judge(system, user).await
     }

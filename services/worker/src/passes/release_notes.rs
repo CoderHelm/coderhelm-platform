@@ -420,6 +420,34 @@ async fn jira_summaries(
 }
 
 /// A registered Forge web trigger URL (by field) + the shared secret.
+/// What release notes say when nothing can publish to Confluence.
+pub const CONFLUENCE_NOT_CONNECTED: &str = "Confluence publishing needs the Confluence part of the Atlassian connection with an API token: Settings, Integrations, Atlassian, Confluence, Use an API token. The account needs edit access under the parent page.";
+
+/// The team's Confluence connection with a saved email and API token, and
+/// the token opened. `None` when the team has none (or it can't be opened).
+async fn confluence_token(
+    state: &WorkerState,
+    team_id: &str,
+) -> Option<(common::live::connectors::Connector, String)> {
+    use common::live::connectors::{self, ConnKind};
+    let list = connectors::list(&state.dynamo, &state.config.settings_table_name, team_id)
+        .await
+        .ok()?;
+    let conn = list.into_iter().find(|c| {
+        c.kind() == ConnKind::Confluence
+            && !c.via_jira_app()
+            && !c.via_sign_in()
+            && !c.key_sealed.is_empty()
+    })?;
+    match common::live::secret::open(&state.kms, team_id, &conn.key_sealed).await {
+        Ok(k) => Some((conn, k)),
+        Err(e) => {
+            warn!(error = %e, "Could not open the Confluence token for release notes");
+            None
+        }
+    }
+}
+
 async fn forge_trigger(
     state: &WorkerState,
     team_id: &str,
@@ -861,32 +889,54 @@ async fn run_locked(
     if !cfg.confluence_parent_id.trim().is_empty()
         && (regenerate || rec.get("confluence_url").is_none_or(|s| s.is_empty()))
     {
-        let (url, secret) = forge_trigger(state, &msg.team_id, "publish_release_url")
+        let entry_html = to_storage(&entry);
+        let key = format!("{owner}/{repo}@{tag}");
+        // The Confluence part of the team's Atlassian connection (its saved
+        // email and API token) publishes. A site whose Jira app still has
+        // Confluence access keeps publishing through it until the team saves
+        // a token; the Jira app no longer asks for Confluence access.
+        let url = if let Some((conn, token)) = confluence_token(state, &msg.team_id).await {
+            common::live::confluence_changelog::Site {
+                site: &conn.site,
+                email: &conn.email,
+                token: &token,
+                http: &common::live::http::Https,
+            }
+            .publish(&common::live::confluence_changelog::Entry {
+                parent_id: cfg.confluence_parent_id.trim(),
+                container: cfg.confluence_container.trim(),
+                year: &date[..4],
+                key: &key,
+                html: &entry_html,
+            })
             .await
-            .ok_or("Confluence publishing isn't connected — update the CoderHelm app in Jira and reconnect it in Settings under Integrations")?;
-        let resp = state
-            .http
-            .post(&url)
-            .json(&json!({
-                "forge_secret": secret,
-                "spaceKey": cfg.confluence_space.trim(),
-                "parentId": cfg.confluence_parent_id.trim(),
-                "containerTitle": cfg.confluence_container.trim(),
-                "year": &date[..4],
-                "entryKey": format!("{owner}/{repo}@{tag}"),
-                "entryHtml": to_storage(&entry),
-            }))
-            .send()
-            .await?;
-        let status = resp.status();
-        let body: Value = resp.json().await.unwrap_or(Value::Null);
-        if !status.is_success() {
-            return Err(format!("Confluence publish failed ({status}): {body}").into());
-        }
-        rec.insert(
-            "confluence_url".into(),
-            body["url"].as_str().unwrap_or("published").to_string(),
-        );
+            .map_err(|e| format!("Confluence publish failed: {e}"))?
+        } else {
+            let (url, secret) = forge_trigger(state, &msg.team_id, "publish_release_url")
+                .await
+                .ok_or(CONFLUENCE_NOT_CONNECTED)?;
+            let resp = state
+                .http
+                .post(&url)
+                .json(&json!({
+                    "forge_secret": secret,
+                    "spaceKey": cfg.confluence_space.trim(),
+                    "parentId": cfg.confluence_parent_id.trim(),
+                    "containerTitle": cfg.confluence_container.trim(),
+                    "year": &date[..4],
+                    "entryKey": key,
+                    "entryHtml": entry_html,
+                }))
+                .send()
+                .await?;
+            let status = resp.status();
+            let body: Value = resp.json().await.unwrap_or(Value::Null);
+            if !status.is_success() {
+                return Err(format!("Confluence publish failed ({status}): {body}").into());
+            }
+            body["url"].as_str().unwrap_or("published").to_string()
+        };
+        rec.insert("confluence_url".into(), url);
         save_record(state, &msg.team_id, &record_sk, tag, &rec).await;
     }
 

@@ -10,12 +10,18 @@
 //!   and the permissions it was refused, and the accounts where the option
 //!   is on but the role lacks the reads. Any team member.
 //! - `GET /api/security/infrastructure` — the findings, one per fix, the
-//!   counts and each account's state. Any team member.
+//!   counts and each account's state. Any team member. When the latest read
+//!   is older than [`REFRESH_AFTER_SECS`], it also starts a refresh of the
+//!   team's accounts in the background (at most one per team in that
+//!   time), and says so (`refreshing`) with when it last read (`read_at`).
 //! - `GET /api/security/infrastructure/insights` — Analytics' counts.
 //! - `POST /api/security/infrastructure/check` — read every switched-on
 //!   account again now. Admin.
 //! - `POST /api/security/infrastructure/findings/{id}/fix` — open the fix
 //!   PR now, within the day's limits. Admin.
+//! - `POST /api/security/infrastructure/findings/{id}/apply` — approve a
+//!   pending action CoderHelm applies in AWS (`{"when": "next-maintenance"}`
+//!   or `"immediate"`). Admin.
 //! - `GET`/`PUT /api/security/infrastructure/config` — the opt-in switches
 //!   (Amazon Inspector, AWS Health), with what each costs or needs. Saving
 //!   is Admin.
@@ -46,6 +52,11 @@ type Item = HashMap<String, AttributeValue>;
 const MAX_ROWS: usize = 2_000;
 /// The summary row of an account's last read (the worker writes it).
 const READ_PREFIX: &str = "RES_READ#";
+/// A read older than this starts a refresh when someone opens the page.
+pub const REFRESH_AFTER_SECS: i64 = 5 * 60;
+/// One refresh per team in this time, however often the page opens.
+const REFRESH_CLAIM_SECS: u64 = 5 * 60;
+const REFRESH_CLAIM_SK: &str = "INFRA_REFRESH";
 
 /// GET /api/security/infrastructure/sources
 pub async fn sources(
@@ -245,8 +256,40 @@ pub async fn health_template(
     )
 }
 
-fn account_states(accounts: &[aws_account::AwsAccount], reads: &[Value]) -> Vec<Value> {
-    account_states_with(accounts, reads, &records::InfraConfig::default())
+/// Each account's state ([`account_states_with`]), also saying whether its role may apply
+/// approved maintenance, and its update link asking for that when an
+/// approved action there was refused for the permission.
+pub fn account_states_for(
+    accounts: &[aws_account::AwsAccount],
+    reads: &[Value],
+    found: &[Record],
+) -> Vec<Value> {
+    let cfg = records::InfraConfig::default();
+    accounts
+        .iter()
+        .zip(account_states_with(accounts, reads, &cfg))
+        .map(|(a, mut v)| {
+            let may = a
+                .permissions
+                .as_ref()
+                .and_then(|p| p.optional_ability("maintenance"));
+            let refused = found.iter().any(|r| {
+                r.finding.account == a.account
+                    && r.status.is_open()
+                    && r.apply
+                        .as_ref()
+                        .is_some_and(|x| !x.missing_permission.is_empty())
+            });
+            v["apply_maintenance"] = json!(may);
+            if refused && may != Some(true) {
+                v["update_url"] = json!(super::connectors::update_stack_url(
+                    &a.region,
+                    &a.chosen().with_maintenance(true)
+                ));
+            }
+            v
+        })
+        .collect()
 }
 
 /// Each account's state; the update link also asks for Inspector's and
@@ -291,10 +334,13 @@ pub fn findings_view(
     reads: &[Value],
     now: chrono::DateTime<chrono::Utc>,
 ) -> Value {
+    // A merged duplicate is never shown (its finding carries both
+    // reasons); a fixed or removed one for 30 days, under its own filter.
     let mut shown: Vec<&Record> = found
         .iter()
+        .filter(|r| r.status != records::Status::Merged)
         .filter(|r| {
-            r.status != records::Status::Fixed
+            !r.status.is_closed()
                 || r.fixed_at
                     .as_deref()
                     .is_some_and(|t| t > (now - chrono::Duration::days(30)).to_rfc3339().as_str())
@@ -303,7 +349,7 @@ pub fn findings_view(
     shown.sort_by(|a, b| {
         let k = |r: &Record| {
             (
-                r.status == records::Status::Fixed,
+                r.status.is_closed(),
                 r.finding.fix.kind == Some(common::infra_vuln::matching::FixKind::Aws),
                 r.tier().is_none(),
                 r.tier(),
@@ -313,6 +359,9 @@ pub fn findings_view(
         k(a).cmp(&k(b))
     });
     let read_at = reads.iter().filter_map(|r| r["read_at"].as_str()).max();
+    // The oldest of the accounts' latest reads: what "checked N min ago"
+    // is honest about.
+    let oldest_read_at = reads.iter().filter_map(|r| r["read_at"].as_str()).min();
     json!({
         "enabled": cfg.enabled,
         "dry_run": cfg.dry_run,
@@ -320,7 +369,70 @@ pub fn findings_view(
         "accounts": accounts,
         "findings": shown.iter().map(|r| r.view()).collect::<Vec<_>>(),
         "read_at": read_at,
+        "oldest_read_at": oldest_read_at,
+        "refresh_after_secs": REFRESH_AFTER_SECS,
     })
+}
+
+/// The latest read is old enough that opening the page refreshes it: some
+/// account with the option on has never been read, or its last read is
+/// older than [`REFRESH_AFTER_SECS`]. Pure.
+pub fn stale(
+    accounts: &[aws_account::AwsAccount],
+    reads: &[Value],
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    accounts.iter().filter(|a| a.infra_on()).any(|a| {
+        let at = reads
+            .iter()
+            .filter(|r| r["account"] == a.account.as_str())
+            .filter_map(|r| r["read_at"].as_str())
+            .filter_map(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+            .max();
+        at.is_none_or(|t| (now - t.with_timezone(&chrono::Utc)).num_seconds() > REFRESH_AFTER_SECS)
+    })
+}
+
+/// Starts a background refresh when the reads are stale: one per team per
+/// [`REFRESH_CLAIM_SECS`]. Returns whether one is under way.
+async fn refresh_if_stale(
+    state: &AppState,
+    claims: &Claims,
+    accounts: &[aws_account::AwsAccount],
+    reads: &[Value],
+) -> bool {
+    if !stale(accounts, reads, chrono::Utc::now()) {
+        return false;
+    }
+    match common::claim::claim(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        &claims.team_id,
+        REFRESH_CLAIM_SK,
+        REFRESH_CLAIM_SECS,
+    )
+    .await
+    {
+        common::claim::Claim::Won => {
+            if queue(state, claims, "infrastructure_refresh", "")
+                .await
+                .is_err()
+            {
+                common::claim::release(
+                    &state.dynamo,
+                    &state.config.settings_table_name,
+                    &claims.team_id,
+                    REFRESH_CLAIM_SK,
+                )
+                .await;
+                return false;
+            }
+            true
+        }
+        // Another open of the page started it a moment ago.
+        common::claim::Claim::Held => true,
+        common::claim::Claim::Failed(_) => false,
+    }
 }
 
 pub(crate) async fn load_records(
@@ -364,13 +476,16 @@ pub async fn findings(
     let cfg = super::security::load_config(&state, &claims.team_id)
         .await?
         .unwrap_or_default();
-    Ok(Json(findings_view(
+    let refreshing = refresh_if_stale(&state, &claims, &accounts, &r).await;
+    let mut v = findings_view(
         &found,
-        account_states(&accounts, &r),
+        account_states_for(&accounts, &r, &found),
         &cfg,
         &r,
         chrono::Utc::now(),
-    )))
+    );
+    v["refreshing"] = json!(refreshing);
+    Ok(Json(v))
 }
 
 /// GET /api/security/infrastructure/insights
@@ -432,6 +547,9 @@ pub async fn fix(
         (Some(common::infra_vuln::matching::FixKind::Pr), _, _) => {
             Some("A fix is already open or done.")
         }
+        (Some(common::infra_vuln::matching::FixKind::Apply), _, _) => {
+            Some("This update is applied in AWS, not in code: approve it and CoderHelm applies it.")
+        }
         _ => Some("This fix happens in AWS or is AWS-managed: there is no PR to open."),
     };
     if let Some(reason) = skip {
@@ -440,6 +558,66 @@ pub async fn fix(
     queue(&state, &claims, "infrastructure_fix", &id).await?;
     tracing::info!(team = %claims.team_id, finding = %id, by = %claims.email, "Infrastructure fix requested");
     Ok(Json(json!({ "status": "queued", "reason": null })))
+}
+
+#[derive(Debug, serde::Deserialize, Default)]
+pub struct ApplyBody {
+    /// `next-maintenance` (the default) or `immediate`.
+    #[serde(default)]
+    pub when: String,
+}
+
+/// Why a finding cannot be approved for CoderHelm to apply, or `None`.
+/// Pure.
+pub fn apply_refusal(r: &Record) -> Option<&'static str> {
+    use common::infra_vuln::matching::FixKind;
+    if !r.status.is_open() {
+        return Some("This finding is closed: nothing to apply.");
+    }
+    if r.finding.fix.kind != Some(FixKind::Apply) || r.finding.fix.apply.is_none() {
+        return Some("This finding has no action CoderHelm applies in AWS.");
+    }
+    if r.apply.as_ref().is_some_and(|a| a.sent()) {
+        return Some("AWS already accepted it: it closes when the next read no longer lists it.");
+    }
+    None
+}
+
+/// POST /api/security/infrastructure/findings/{id}/apply
+pub async fn apply(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Path(id): Path<String>,
+    body: Option<Json<ApplyBody>>,
+) -> Result<Json<Value>, StatusCode> {
+    claims.require_role(3)?;
+    if id.len() > 64 || !id.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let when = body.map(|b| b.0.when).unwrap_or_default();
+    let when = match when.as_str() {
+        "" | "next-maintenance" => "next-maintenance",
+        "immediate" => "immediate",
+        _ => return Err(StatusCode::BAD_REQUEST),
+    };
+    let found = load_records(&state, &claims.team_id).await?;
+    let Some(r) = found.iter().find(|r| r.finding.id == id) else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    if let Some(reason) = apply_refusal(r) {
+        return Ok(Json(json!({ "status": "skipped", "reason": reason })));
+    }
+    let msg = WorkerMessage::SecurityEvent(SecurityEventMessage {
+        team_id: claims.team_id.clone(),
+        kind: "infrastructure_apply".into(),
+        repo: id.clone(),
+        action: when.into(),
+        requested_by: claims.email.clone(),
+        ..Default::default()
+    });
+    super::github_webhook::send_to_queue(&state, &state.config.ticket_queue_url, &msg).await?;
+    tracing::info!(team = %claims.team_id, finding = %id, by = %claims.email, when, "Infrastructure update approved");
+    Ok(Json(json!({ "status": "queued", "when": when })))
 }
 
 /// Pure: what a person's Retry of an infrastructure fix run does. When

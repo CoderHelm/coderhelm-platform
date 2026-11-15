@@ -12,6 +12,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 
 mod api_keys;
 mod auth;
+mod bases;
 mod bedrock_setup;
 mod clients;
 mod knowledge_keys;
@@ -621,6 +622,10 @@ fn build_app(state: Arc<AppState>) -> Router {
             post(routes::infra_security::fix),
         )
         .route(
+            "/security/infrastructure/findings/:id/apply",
+            post(routes::infra_security::apply),
+        )
+        .route(
             "/alert-routes",
             get(routes::alerts::list_routes)
                 .put(routes::alerts::put_route)
@@ -866,6 +871,26 @@ fn build_app(state: Arc<AppState>) -> Router {
             get(routes::knowledge::list_bases).post(routes::knowledge::create_base),
         )
         .route("/knowledge/bedrock", get(routes::knowledge::bedrock_bases))
+        // The six built-in bases and share links (routes::knowledge_builtin).
+        .route("/knowledge/builtin", get(routes::knowledge_builtin::list))
+        .route(
+            "/knowledge/builtin/:key",
+            put(routes::knowledge_builtin::update),
+        )
+        .route(
+            "/knowledge/builtin/:key/search",
+            get(routes::knowledge_builtin::search),
+        )
+        .route(
+            "/knowledge/readers",
+            put(routes::knowledge_builtin::set_readers),
+        )
+        .route("/share", post(routes::knowledge_builtin::create_share))
+        .route(
+            "/share/:id",
+            get(routes::knowledge_builtin::get_share)
+                .delete(routes::knowledge_builtin::delete_share),
+        )
         // Using the team's knowledge from Amazon Bedrock (routes::knowledge_bedrock).
         .route(
             "/knowledge/keys",

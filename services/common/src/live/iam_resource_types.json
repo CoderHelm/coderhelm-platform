@@ -200,6 +200,10 @@
    "cluster",
    "db"
   ],
+  "rds:ApplyPendingMaintenanceAction": [
+   "cluster",
+   "db"
+  ],
   "elasticache:DescribeServiceUpdates": [
    ""
   ],
