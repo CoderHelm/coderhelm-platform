@@ -2908,7 +2908,7 @@ mod shared_prefix_tests {
     #[test]
     fn two_feedback_rounds_share_their_prefix() {
         use crate::passes::feedback::feedback_system_prompt;
-        let tools = vec![tool("read_file"), tool("edit_file"), tool("reply")];
+        let tools = vec![tool("read_file"), tool("edit_file"), tool("write_file")];
         let round = |memory: &str| {
             feedback_system_prompt(
                 "acme",
