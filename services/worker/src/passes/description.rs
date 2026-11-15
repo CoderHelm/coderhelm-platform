@@ -286,24 +286,63 @@ pub fn stamp_of(body: &str) -> Option<&str> {
 /// The stamp's head and, when it carries one, the digest of the text the
 /// fact check read.
 fn stamp_parts(body: &str) -> Option<(&str, Option<&str>)> {
-    stamp_all(body).map(|(h, d, _)| (h, d))
+    stamp_all(body).map(|s| (s.head, s.digest))
 }
+
+/// The version of the description writer: what builds, lays out and reviews
+/// a description (`description_facts`, `common::pr_layout`,
+/// `common::pr_template`, `common::pr_review`). Raise it whenever any of
+/// them changes what a description says or how it is laid out: every
+/// description stamped by an earlier writer is then not current, and is
+/// rebuilt (by the pull request watch's catch-up, [`catch_up`]) even when
+/// its head has not moved.
+pub const WRITER: u32 = 2;
+
+/// The stamp's word for the writer version: `writer-<n>`.
+const WRITER_WORD: &str = "writer-";
 
 /// The stamp's word for a description built while checks on its head were
 /// still running: it is not current until they end and it is rebuilt.
 const CHECKS_RUNNING: &str = "checks-running";
 
-/// The stamp's head, digest, and whether checks were running when it was
-/// built.
-fn stamp_all(body: &str) -> Option<(&str, Option<&str>, bool)> {
+/// What a stamp says.
+struct Stamp<'a> {
+    head: &'a str,
+    /// The digest of the text the fact check read (none on the oldest
+    /// stamps).
+    digest: Option<&'a str>,
+    /// Checks on the head were running when it was built.
+    running: bool,
+    /// The writer version that built it (none on stamps from before the
+    /// version was kept).
+    writer: Option<u32>,
+}
+
+/// The stamp's head, digest, whether checks were running when it was
+/// built, and the writer version. A stamp from before any of these parses
+/// with that part missing.
+fn stamp_all(body: &str) -> Option<Stamp<'_>> {
     let at = body.rfind(STAMP_START)? + STAMP_START.len();
     let rest = &body[at..];
     let inner = rest[..rest.find(STAMP_END)?].trim();
     let mut parts = inner.split_whitespace();
     let head = parts.next().filter(|h| !h.is_empty())?;
-    let digest = parts.next();
-    let running = parts.any(|p| p == CHECKS_RUNNING);
-    Some((head, digest, running))
+    let mut stamp = Stamp {
+        head,
+        digest: None,
+        running: false,
+        writer: None,
+    };
+    for (i, p) in parts.enumerate() {
+        if p == CHECKS_RUNNING {
+            stamp.running = true;
+        } else if let Some(n) = p.strip_prefix(WRITER_WORD) {
+            stamp.writer = n.parse().ok();
+        } else if i == 0 {
+            stamp.digest = Some(p);
+        }
+    }
+    Some(stamp)
 }
 
 /// Whether the description shows a check on its head as still running.
@@ -353,7 +392,7 @@ pub fn with_stamp(body: &str, head: &str) -> String {
         String::new()
     };
     format!(
-        "{}\n\n{STAMP_START}{head} {digest}{running}{STAMP_END}",
+        "{}\n\n{STAMP_START}{head} {digest} {WRITER_WORD}{WRITER}{running}{STAMP_END}",
         body.trim_end()
     )
 }
@@ -363,19 +402,53 @@ fn same_head(stamped: &str, head: &str) -> bool {
     stamped == head || (stamped.len() >= 7 && head.starts_with(stamped))
 }
 
-/// Whether the description was built for `head`, the text the fact check
-/// read is still the text that is there, and no check was running when it
-/// was built (a description showing running checks is rebuilt until they
-/// end). A stamp from before the digest answers for its head alone.
+/// Whether the description was built for `head` by this writer
+/// ([`WRITER`]), the text the fact check read is still the text that is
+/// there, and no check was running when it was built (a description
+/// showing running checks is rebuilt until they end). A stamp from before
+/// the writer version is never current: an upgrade rebuilds it. A stamp
+/// from before the digest answers for its head and writer alone.
 pub fn is_current(body: &str, head: &str) -> bool {
     match stamp_all(body) {
-        Some((h, digest, running)) => {
+        Some(s) => {
             !head.is_empty()
-                && !running
-                && same_head(h, head)
-                && digest.is_none_or(|d| d == checked_digest(body))
+                && !s.running
+                && s.writer == Some(WRITER)
+                && same_head(s.head, head)
+                && s.digest.is_none_or(|d| d == checked_digest(body))
         }
         None => false,
+    }
+}
+
+/// What the catch-up after an upgrade does with an open pull request's
+/// description ([`catch_up`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatchUp {
+    /// Built for its head by this writer: nothing to do.
+    Current,
+    /// CoderHelm's own text, built by an earlier writer or for another
+    /// head: rebuilt through the one rebuild ([`reconcile`]).
+    Rebuild,
+    /// Not CoderHelm's to rebuild here: no stamp (a description CoderHelm
+    /// never built), or a person changed the text the fact check read
+    /// since CoderHelm built it. Left as it is; the paths that move the
+    /// head still rebuild it.
+    Leave,
+}
+
+/// Whether the catch-up rebuilds `body` on `head`. Only a description that
+/// carries CoderHelm's stamp and whose checked text is still what
+/// CoderHelm wrote is rebuilt; a person's edit is never written over by a
+/// sweep.
+pub fn catch_up(body: &str, head: &str) -> CatchUp {
+    if is_current(body, head) {
+        return CatchUp::Current;
+    }
+    match stamp_all(body) {
+        None => CatchUp::Leave,
+        Some(s) if s.digest.is_some_and(|d| d != checked_digest(body)) => CatchUp::Leave,
+        Some(_) => CatchUp::Rebuild,
     }
 }
 
@@ -1140,6 +1213,52 @@ mod tests {
             again,
             "stamping is idempotent"
         );
+    }
+
+    /// The stamp names the writer that built the description: one from
+    /// before the version, or from another writer, is not current on an
+    /// unchanged head; this writer's is.
+    #[test]
+    fn a_stamp_names_its_writer_version() {
+        let body = "## Summary\n\nKept glob-walk on the 2 line.\n";
+        let head = "aaa111bbb222ccc";
+        let stamped = with_stamp(body, head);
+        assert!(
+            stamped.contains(&format!(" {WRITER_WORD}{WRITER} ")),
+            "{stamped}"
+        );
+        assert!(is_current(&stamped, head));
+        assert_eq!(catch_up(&stamped, head), CatchUp::Current);
+        // The stamp as the writer before the version wrote it: same head,
+        // same digest, no checks running, and no version.
+        let digest = checked_digest(body);
+        let old = format!(
+            "{}\n\n{STAMP_START}aaa111bbb222 {digest}{STAMP_END}",
+            body.trim_end()
+        );
+        assert_eq!(
+            stamp_of(&old),
+            Some("aaa111bbb222"),
+            "an old stamp still parses"
+        );
+        assert!(!is_current(&old, head), "no version: not current");
+        assert_eq!(catch_up(&old, head), CatchUp::Rebuild);
+        // An old stamp built while checks ran parses the same way.
+        let old_running = old.replace(STAMP_END, &format!(" {CHECKS_RUNNING}{STAMP_END}"));
+        let s = stamp_all(&old_running).unwrap();
+        assert!(s.running && s.writer.is_none() && s.digest == Some(digest.as_str()));
+        // Another writer version: not current either.
+        let other = stamped.replace(
+            &format!("{WRITER_WORD}{WRITER}"),
+            &format!("{WRITER_WORD}{}", WRITER - 1),
+        );
+        assert!(!is_current(&other, head));
+        assert_eq!(catch_up(&other, head), CatchUp::Rebuild);
+        // A body with no stamp is not CoderHelm's to rebuild in the
+        // catch-up, and one whose checked text a person changed is left.
+        assert_eq!(catch_up(body, head), CatchUp::Leave);
+        let edited = old.replace("Kept glob-walk", "We kept glob-walk, see the thread");
+        assert_eq!(catch_up(&edited, head), CatchUp::Leave);
     }
 
     /// Every place that rests on the description reconciles it first, and

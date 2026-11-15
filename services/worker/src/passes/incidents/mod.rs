@@ -53,6 +53,7 @@ mod bj_release_through_a_busy_hour;
 mod bk_owns_the_outside_work;
 mod bl_description_final_review;
 mod bm_teams_never_cross;
+mod bn_description_writer_upgrade;
 mod c_codegen_egress;
 mod d_echoed_markers;
 mod e_large_generated_output;

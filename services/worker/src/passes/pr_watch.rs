@@ -49,6 +49,22 @@ pub const SWEEP_MAX_LOOKS: usize = 40;
 /// that didn't change costs none (see [`Probe`]).
 pub const LOOK_REQUESTS: u64 = 8;
 
+/// Open pull requests one sweep rebuilds for each team when their
+/// description was built by an earlier writer ([`catch_up_picks`]): a team
+/// with many open pull requests is caught up over several sweeps, never in
+/// one burst.
+pub const CATCH_UP_PER_TEAM: usize = 3;
+/// The most descriptions one sweep rebuilds, all teams together.
+pub const CATCH_UP_MAX: usize = 15;
+/// GitHub requests one catch-up may make (the pull request, then the
+/// rebuild: the pull request again, its diff, its checks, the template,
+/// the save, CoderHelm's own review threads): one isn't started with less
+/// than this left of the sweep's budget.
+pub const CATCH_UP_REQUESTS: u64 = 10;
+/// The run attribute naming the description writer version
+/// (`description::WRITER`) the catch-up last brought its pull request to.
+pub const DESCRIPTION_WRITER: &str = "description_writer";
+
 /// What a look read of the pull request.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
@@ -294,6 +310,11 @@ pub struct Candidate {
     /// When the run's last round stopped, if GitHub's rate limit is why
     /// (`round::ended_by_limit`); "" otherwise.
     pub limit_ended: String,
+    /// The description writer version the catch-up last brought the pull
+    /// request to ("" when never).
+    pub writer: String,
+    /// When the run last changed (RFC 3339).
+    pub updated_at: String,
 }
 
 pub fn candidate_of(item: &HashMap<String, AttributeValue>) -> Option<Candidate> {
@@ -335,6 +356,8 @@ pub fn candidate_of(item: &HashMap<String, AttributeValue>) -> Option<Candidate>
             .filter(|inc| !inc.held && super::round::ended_by_limit(&inc.reason))
             .map(|inc| inc.at)
             .unwrap_or_default(),
+        writer: s(DESCRIPTION_WRITER),
+        updated_at: s("updated_at"),
     };
     (pr > 0 && c.installation_id > 0 && !c.team_id.is_empty() && !c.run_id.is_empty()).then_some(c)
 }
@@ -348,6 +371,46 @@ pub fn order(mut all: Vec<Candidate>, max: usize) -> Vec<Candidate> {
     });
     all.truncate(max);
     all
+}
+
+/// Whether a run's open pull request is the catch-up's to rebuild: a run
+/// that ended with its pull request still CoderHelm's (whatever the age of
+/// the run), and not yet brought to this writer. A run in flight rebuilds
+/// its own description at every step; one a person cancelled or closed, or
+/// one retried or archived, is left; a merged one has nothing to rebuild.
+pub fn needs_catch_up(c: &Candidate) -> bool {
+    use common::run_status as rs;
+    let left = rs::IN_FLIGHT.contains(&c.status.as_str())
+        || rs::ENDED_BY_PERSON.contains(&c.status.as_str())
+        || [rs::MERGED, rs::RETRIED, rs::ARCHIVED].contains(&c.status.as_str());
+    !left && c.writer != super::description::WRITER.to_string()
+}
+
+/// The pull requests one sweep's catch-up reads: at most `per_team` for
+/// each team and `max` in all, the most recently changed run first (the
+/// pull requests people are reading now). The rest are reached by the next
+/// sweeps, as each one done is marked ([`DESCRIPTION_WRITER`]).
+pub fn catch_up_picks(all: Vec<Candidate>, per_team: usize, max: usize) -> Vec<Candidate> {
+    let mut all: Vec<Candidate> = all.into_iter().filter(needs_catch_up).collect();
+    all.sort_by(|a, b| {
+        b.updated_at
+            .cmp(&a.updated_at)
+            .then_with(|| a.run_id.cmp(&b.run_id))
+    });
+    let mut per: HashMap<String, usize> = HashMap::new();
+    let mut picks = Vec::new();
+    for c in all {
+        if picks.len() >= max {
+            break;
+        }
+        let n = per.entry(c.team_id.clone()).or_default();
+        if *n >= per_team {
+            continue;
+        }
+        *n += 1;
+        picks.push(c);
+    }
+    picks
 }
 
 /// Names of checks failing in a listing (the newest run of each name).
@@ -865,6 +928,9 @@ pub struct SweepReport {
     pub skipped_installations: usize,
     /// `owner/repo#pr: act` for each pull request picked back up.
     pub acted: Vec<String>,
+    /// `owner/repo#pr` for each description the catch-up rebuilt by this
+    /// writer (`description::WRITER`).
+    pub caught_up: Vec<String>,
 }
 
 /// Finished runs with a pull request, changed inside the watch window: each
@@ -938,8 +1004,157 @@ pub async fn sweep(state: &WorkerState) -> SweepReport {
                 .push(format!("{}/{}#{}: {act:?}", c.owner, c.repo, c.pr));
         }
     }
+    report.caught_up = catch_up(state, &mut budget, &mut clients).await;
     report.skipped_installations = budget.skipped();
     report
+}
+
+/// How one catch-up of a description ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaughtUp {
+    /// Rebuilt by this writer, or already was, or not CoderHelm's to
+    /// rebuild (no stamp, a person's edit, closed): marked done.
+    Done(bool),
+    /// GitHub refused for a while: the next sweep tries again. Any other
+    /// failure (a pull request gone, a write refused) is a real answer and
+    /// marks it done, so one pull request never holds its team's turn; the
+    /// paths that move its head still rebuild it.
+    Again,
+}
+
+/// Brings the descriptions of open pull requests CoderHelm opened to this
+/// writer: one built by an earlier writer on a head that has not moved is
+/// otherwise never rebuilt, and keeps the old layout and wording for good.
+/// A few per team each sweep, inside the sweep's GitHub budget; each one
+/// done is marked on its run, so it is read once per writer version.
+/// Returns `owner/repo#pr` for each rebuilt.
+async fn catch_up(
+    state: &WorkerState,
+    budget: &mut crate::clients::github_budget::SweepGate,
+    clients: &mut HashMap<u64, GitHubClient>,
+) -> Vec<String> {
+    let mut all = Vec::new();
+    let mut start: Option<HashMap<String, AttributeValue>> = None;
+    for _ in 0..200 {
+        let res = state
+            .dynamo
+            .scan()
+            .table_name(&state.config.runs_table_name)
+            .filter_expression(
+                "pr_number > :zero AND attribute_not_exists(pr_outcome) \
+                 AND (attribute_not_exists(#w) OR #w <> :w)",
+            )
+            .expression_attribute_names("#w", DESCRIPTION_WRITER)
+            .expression_attribute_values(":zero", attr_n(0))
+            .expression_attribute_values(":w", attr_s(&super::description::WRITER.to_string()))
+            .set_exclusive_start_key(start.take())
+            .send()
+            .await;
+        let page = match res {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(error = %aws_sdk_dynamodb::error::DisplayErrorContext(&e), "Description catch-up: scan failed");
+                break;
+            }
+        };
+        all.extend(page.items().iter().filter_map(candidate_of));
+        match page.last_evaluated_key {
+            Some(k) if !k.is_empty() => start = Some(k),
+            _ => break,
+        }
+    }
+    let mut rebuilt = Vec::new();
+    for c in catch_up_picks(all, CATCH_UP_PER_TEAM, CATCH_UP_MAX) {
+        if !budget
+            .allows(state, c.installation_id, CATCH_UP_REQUESTS)
+            .await
+        {
+            continue;
+        }
+        if let std::collections::hash_map::Entry::Vacant(v) = clients.entry(c.installation_id) {
+            match client(state, c.installation_id) {
+                Some(g) => {
+                    v.insert(g);
+                }
+                None => continue,
+            }
+        }
+        let github = &clients[&c.installation_id];
+        match catch_up_one(state, github, &c).await {
+            CaughtUp::Done(was_rebuilt) => {
+                mark_writer(state, &c).await;
+                if was_rebuilt {
+                    rebuilt.push(format!("{}/{}#{}", c.owner, c.repo, c.pr));
+                }
+            }
+            CaughtUp::Again => {}
+        }
+    }
+    if !rebuilt.is_empty() {
+        info!(prs = ?rebuilt, writer = super::description::WRITER, "Description catch-up: rebuilt by this writer");
+    }
+    rebuilt
+}
+
+async fn catch_up_one(state: &WorkerState, github: &GitHubClient, c: &Candidate) -> CaughtUp {
+    use super::description::{self, CatchUp, Reconciled};
+    let pr = match github.get_pull_request(&c.owner, &c.repo, c.pr).await {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(run_id = %c.run_id, pr = c.pr, error = %e, "Description catch-up: could not read the pull request");
+            return again_or_done(github);
+        }
+    };
+    if pr["state"].as_str() != Some("open") {
+        return CaughtUp::Done(false);
+    }
+    let body = pr["body"].as_str().unwrap_or("");
+    let head = pr["head"]["sha"].as_str().unwrap_or("");
+    match description::catch_up(body, head) {
+        CatchUp::Current => CaughtUp::Done(false),
+        CatchUp::Leave => {
+            info!(run_id = %c.run_id, pr = c.pr, "Description catch-up: no CoderHelm stamp, or a person edited it; left as it is");
+            CaughtUp::Done(false)
+        }
+        // The one rebuild, from the facts of the head; its save runs the
+        // final review.
+        CatchUp::Rebuild => match description::reconcile_run(
+            state, github, &c.team_id, &c.run_id, &c.owner, &c.repo, c.pr,
+        )
+        .await
+        {
+            Reconciled::Rebuilt => CaughtUp::Done(true),
+            Reconciled::Current => CaughtUp::Done(false),
+            Reconciled::Failed(why) => {
+                warn!(run_id = %c.run_id, pr = c.pr, why, "Description catch-up: not rebuilt");
+                again_or_done(github)
+            }
+        },
+    }
+}
+
+fn again_or_done(github: &GitHubClient) -> CaughtUp {
+    if github.outside().is_some() {
+        CaughtUp::Again
+    } else {
+        CaughtUp::Done(false)
+    }
+}
+
+/// Marks the run's pull request as brought to this writer.
+async fn mark_writer(state: &WorkerState, c: &Candidate) {
+    let _ = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(&c.team_id))
+        .key("run_id", attr_s(&c.run_id))
+        .update_expression("SET #w = :w")
+        .condition_expression("attribute_exists(run_id)")
+        .expression_attribute_names("#w", DESCRIPTION_WRITER)
+        .expression_attribute_values(":w", attr_s(&super::description::WRITER.to_string()))
+        .send()
+        .await;
 }
 
 #[cfg(test)]
@@ -1108,5 +1323,61 @@ mod tests {
         );
         let ids: Vec<&str> = picked.iter().map(|c| c.run_id.as_str()).collect();
         assert_eq!(ids, vec!["r1", "r2"]);
+    }
+
+    /// The catch-up picks open pull requests whose description an earlier
+    /// writer built, a few per team, the most recently changed first, and
+    /// never one already brought to this writer or a run still working.
+    #[test]
+    fn the_catch_up_picks_a_few_stale_descriptions_per_team() {
+        let now = crate::passes::description::WRITER.to_string();
+        let c = |team: &str, run: &str, status: &str, writer: &str, at: &str| Candidate {
+            team_id: team.into(),
+            run_id: run.into(),
+            status: status.into(),
+            writer: writer.into(),
+            updated_at: at.into(),
+            pr: 1,
+            installation_id: 1,
+            ..Default::default()
+        };
+        let mut all = vec![];
+        for i in 0..6 {
+            all.push(c(
+                "t1",
+                &format!("a{i}"),
+                "completed",
+                "",
+                &format!("2026-11-0{}", i + 1),
+            ));
+        }
+        all.push(c("t2", "b0", "needs_input", "1", "2026-10-01"));
+        all.push(c("t2", "b1", "completed", &now, "2026-11-09"));
+        all.push(c("t2", "b2", "running", "", "2026-11-09"));
+        all.push(c("t2", "b3", "cancelled", "", "2026-11-09"));
+        all.push(c("t2", "b4", "merged", "", "2026-11-09"));
+        all.push(c("t3", "c0", "failed", "", "2026-01-01"));
+        let ids = |v: Vec<Candidate>| v.into_iter().map(|c| c.run_id).collect::<Vec<_>>();
+        assert_eq!(
+            ids(catch_up_picks(all.clone(), CATCH_UP_PER_TEAM, CATCH_UP_MAX)),
+            vec!["a5", "a4", "a3", "b0", "c0"],
+            "three of t1's six, newest first; t2's stale one; t3's old one"
+        );
+        // The overall limit holds across teams.
+        assert_eq!(catch_up_picks(all.clone(), 3, 2).len(), 2);
+        // Once marked, the next sweep reaches the rest of t1.
+        let marked: Vec<Candidate> = all
+            .into_iter()
+            .map(|mut x| {
+                if ["a5", "a4", "a3", "b0", "c0"].contains(&x.run_id.as_str()) {
+                    x.writer = now.clone();
+                }
+                x
+            })
+            .collect();
+        assert_eq!(
+            ids(catch_up_picks(marked, CATCH_UP_PER_TEAM, CATCH_UP_MAX)),
+            vec!["a2", "a1", "a0"]
+        );
     }
 }
