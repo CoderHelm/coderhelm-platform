@@ -27,6 +27,7 @@ use crate::models::{
 };
 use crate::passes::attr_s;
 use crate::WorkerState;
+use common::reply_compose::Facts;
 use common::run_questions::Answer;
 use common::ticket_comments::{self as tc, Action, Comment, Settled, Source, Stage, Store};
 use common::ticket_state::{Intent, Note};
@@ -71,11 +72,64 @@ struct RunFacts {
     /// The questions the run told the ticket about and kept building
     /// without.
     questions: Vec<String>,
+    /// Why the run failed, waits or was stopped, as recorded.
+    error: String,
+    waiting_on: String,
+    cancelled_by: String,
 }
 
 impl RunFacts {
     fn pr_open(&self) -> bool {
         self.pr_number > 0 && !matches!(self.pr_outcome.as_str(), "closed" | "merged")
+    }
+
+    /// Where the run is, in one line, from its record.
+    fn state_line(&self) -> String {
+        let mut out = match self.status.as_str() {
+            "running" | "queued" => match self.current_pass.trim() {
+                "" => "working on this ticket".to_string(),
+                p => format!("working on this ticket (now: {p})"),
+            },
+            "awaiting_ci" => "waiting for the pull request's checks".to_string(),
+            "" => "unknown".to_string(),
+            s => s.to_string(),
+        };
+        if self.pr_number > 0 {
+            out.push_str(&format!(
+                "; pull request #{} is {}",
+                self.pr_number,
+                if self.pr_outcome.is_empty() {
+                    "open"
+                } else {
+                    &self.pr_outcome
+                }
+            ));
+        }
+        if !self.waiting_on.trim().is_empty() {
+            out.push_str(&format!("; waiting on {}", self.waiting_on.trim()));
+        }
+        if !self.cancelled_by.trim().is_empty() {
+            out.push_str(&format!("; stopped by {}", self.cancelled_by.trim()));
+        }
+        out
+    }
+
+    /// What the run has on record, for a reply on its ticket.
+    fn reply_facts(&self, ticket_id: &str, comments: &[(Action, Comment)]) -> Facts {
+        let mut f = Facts::default()
+            .ticket(format!("{ticket_id} {}", self.title).trim().to_string(), "")
+            .state(self.state_line())
+            .stopped(self.error.trim());
+        if self.pr_number > 0 && !self.repo.is_empty() {
+            f = f.github_pr(&self.repo, self.pr_number, "", &self.pr_outcome);
+        }
+        for (_, c) in comments {
+            f = f.decision(c.outcome.clone());
+            if !c.question.trim().is_empty() {
+                f = f.answered(&c.question, &c.text);
+            }
+        }
+        f
     }
 
     fn pr_link(&self) -> Option<String> {
@@ -131,6 +185,9 @@ async fn run_facts(state: &WorkerState, team_id: &str, run_id: &str) -> Option<R
         issue_number: number("issue_number"),
         updated_at: text("updated_at"),
         questions,
+        error: text("error_message"),
+        waiting_on: text("waiting_on"),
+        cancelled_by: text("cancelled_by"),
     })
 }
 
@@ -437,7 +494,18 @@ async fn read(
     super::jira_comment::record_notes(state, t.team_id, t.ticket_id, fx.ticket_notes.clone(), None)
         .await;
     if let Some(reply) = &fx.reply {
-        say_on_ticket(state, t, &facts, &open, reply).await;
+        // A question is answered from the run's record: where it is and why.
+        let reply = if settled.done.iter().any(|(a, _)| *a == Action::Answer) {
+            let mut r = format!("{reply}\n\nWhere the work is: {}.", facts.state_line());
+            if !facts.error.trim().is_empty() {
+                r.push_str(&format!(" Why it stopped: {}", facts.error.trim()));
+            }
+            r
+        } else {
+            reply.clone()
+        };
+        let record = facts.reply_facts(t.ticket_id, &settled.done);
+        Box::pin(say_on_ticket(state, t, &facts, &open, &reply, &record)).await;
     }
     // An answer to a question CoderHelm asked marks that question answered
     // in the comment that asked it.
@@ -612,18 +680,20 @@ async fn say_on_ticket(
     facts: &RunFacts,
     open: &[Comment],
     reply: &str,
+    record: &Facts,
 ) {
     let source = open.first().map(|c| c.source).unwrap_or_default();
+    let replier = super::conversation::Replier::new(state, t.team_id);
     match source {
         Source::Jira => {
-            if let Err(e) = crate::passes::conversation::jira(
-                state,
-                t.team_id,
+            if let Err(e) = Box::pin(crate::passes::conversation::reply_jira(
+                &replier,
                 t.ticket_id,
                 common::conversation::Say::reply_all("ticket-comments", reply),
+                record,
                 "info",
                 "Comments read",
-            )
+            ))
             .await
             .map(|_| ())
             {
@@ -649,13 +719,15 @@ async fn say_on_ticket(
                     return;
                 }
             };
-            if let Err(e) = crate::passes::conversation::github(
+            if let Err(e) = Box::pin(crate::passes::conversation::reply_github(
+                &replier,
                 &github,
                 owner,
                 name,
                 facts.issue_number,
                 common::conversation::Say::reply_all("ticket-comments", reply),
-            )
+                record,
+            ))
             .await
             {
                 warn!(ticket_id = t.ticket_id, error = %e, "Could not say on the issue what was done with its comments");

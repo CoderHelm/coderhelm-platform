@@ -284,13 +284,29 @@ pub async fn check_comment(
     if j.also_wants_code_change {
         // Feedback goes on to change the code; say what was learned first.
         let reply = ack_reply(&j);
-        let _ = crate::passes::conversation::github(
+        let replier = super::conversation::Replier::with_provider(state, &msg.team_id, provider);
+        let facts = common::reply_compose::Facts::default()
+            .ticket(ctx.ticket_title.clone(), ctx.ticket_body.clone())
+            .github_pr(
+                &format!("{}/{}", msg.repo_owner, msg.repo_name),
+                msg.pr_number,
+                &ctx.pr_title,
+                "open",
+            )
+            .decision(format!(
+                "Lesson kept for this repository: {}",
+                j.lesson.trim()
+            ))
+            .state("the round goes on to change the code as the comment also asks");
+        let _ = Box::pin(crate::passes::conversation::reply_github(
+            &replier,
             github,
             &msg.repo_owner,
             &msg.repo_name,
             msg.pr_number,
             common::conversation::Say::reply_all("lesson", &reply),
-        )
+            &facts,
+        ))
         .await;
         return None;
     }

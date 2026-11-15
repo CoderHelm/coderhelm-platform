@@ -144,6 +144,12 @@ pub fn escalation_note(reply: &str) -> Option<String> {
 pub const ALLOWED: &[(&str, &str)] = &[
     // The list itself, and the stance that forbids the phrases.
     ("passes/ownership.rs", ""),
+    // The reply composer: the hand-back phrases it takes out of every
+    // reply, and its prompt forbidding them. It names them only to remove
+    // them.
+    ("common/reply_compose.rs", ""),
+    // The reply eval's rubric, which fails a reply that says them.
+    ("passes/reply_eval.rs", "i read your comment"),
 ];
 
 #[cfg(test)]
@@ -301,8 +307,13 @@ mod tests {
     fn every_allowed_place_still_exists() {
         // An allowlist entry for text that is gone would hide the next one.
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+        let common = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../common/src");
         for (file, ctx) in ALLOWED {
-            let text = said(&std::fs::read_to_string(root.join(file)).unwrap());
+            let path = match file.strip_prefix("common/") {
+                Some(rest) => common.join(rest),
+                None => root.join(file),
+            };
+            let text = said(&std::fs::read_to_string(path).unwrap());
             assert!(
                 text.contains(&ctx.to_lowercase()),
                 "stale allowlist entry: {file}: {ctx}"

@@ -660,7 +660,16 @@ pub(crate) async fn on_keep_open_comment(
             "keep-open",
             format!("@{commenter} Only the author of this pull request or someone with write access can keep it open. Nothing changed."),
         );
-        if let Err(e) = super::conversation::github(state, &token, owner, name, number, say).await {
+        let facts = common::reply_compose::Facts::default()
+            .github_pr(&format!("{owner}/{name}"), number, pr["title"].as_str().unwrap_or(""), "open")
+            .gate(format!(
+                "{commenter} asked to keep this pull request open; refused: {commenter} is not its author and has no write access, so nothing changed"
+            ));
+        if let Err(e) = Box::pin(super::conversation::reply_github(
+            state, team_id, &token, owner, name, number, say, &facts,
+        ))
+        .await
+        {
             warn!(owner, name, pr = number, error = %e, "keep open: reply failed");
         }
         return Ok(StatusCode::OK);

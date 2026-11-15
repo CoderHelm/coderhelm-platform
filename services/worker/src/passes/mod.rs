@@ -1354,6 +1354,8 @@ pub mod release_run;
 pub mod remote_mcp;
 #[cfg(test)]
 mod replay;
+#[cfg(test)]
+mod reply_eval;
 pub(crate) mod repo_pick;
 mod resolve;
 mod resolved;
@@ -9800,6 +9802,20 @@ async fn notify_ticket_failed(
         Say::status("run", failure_comment(error_msg, &run_url, markdown))
             .meaning(format!("failed {:?} {error_msg}", cause_of(error_msg)))
     };
+    // Someone who asked since (a retry, "why did it stop?") is answered
+    // with the recorded reason; with nobody asking, the status stands.
+    let replier = conversation::Replier::new(state, &msg.team_id);
+    let facts = common::reply_compose::Facts::default()
+        .ticket(
+            format!("{} {}", msg.ticket_id, msg.title)
+                .trim()
+                .to_string(),
+            common::truncate_str(msg.body.trim(), 1_500).to_string(),
+        )
+        .state("the run failed and stopped")
+        .stopped(common::truncate_str(error_msg, 1_200))
+        .decision(common::conversation::next_step(cause_of(error_msg)))
+        .link(&run_url);
     if matches!(msg.source, TicketSource::Github) && msg.issue_number > 0 {
         if let Ok(gh) = GitHubClient::new(
             &state.secrets.github_app_id,
@@ -9807,27 +9823,29 @@ async fn notify_ticket_failed(
             msg.installation_id,
             &state.http,
         ) {
-            if let Err(e) = conversation::github(
+            if let Err(e) = Box::pin(conversation::reply_github(
+                &replier,
                 &gh,
                 &msg.repo_owner,
                 &msg.repo_name,
                 msg.issue_number,
                 say(true),
-            )
+                &facts,
+            ))
             .await
             {
                 error!("Failed to comment on issue about run failure: {e}");
             }
         }
     } else if matches!(msg.source, TicketSource::Jira) && !msg.ticket_id.is_empty() {
-        if let Err(e) = conversation::jira(
-            state,
-            &msg.team_id,
+        if let Err(e) = Box::pin(conversation::reply_jira(
+            &replier,
             &msg.ticket_id,
             say(false),
+            &facts,
             "error",
             "Run failed",
-        )
+        ))
         .await
         {
             error!("Failed to comment on Jira ticket about run failure: {e}");

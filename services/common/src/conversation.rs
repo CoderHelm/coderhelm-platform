@@ -735,6 +735,20 @@ pub fn decide(view: &View, say: &Say, place: &Place, now_ms: i64) -> Decision {
         };
     }
 
+    // A retried reply with nobody new to answer: what it says is already
+    // on the thread in this slot.
+    if say.kind == Kind::Reply
+        && targets.is_empty()
+        && view
+            .said
+            .iter()
+            .any(|s| s.meta.slot == say.slot && s.meta.fp == fp)
+    {
+        return Decision::Quiet {
+            why: "already answered on this thread, and nobody wrote since".into(),
+        };
+    }
+
     // People wrote since CoderHelm last spoke, or this answers them: a
     // reply to their comment, never a bare new one.
     if !unheard.is_empty() || say.kind == Kind::Reply {
@@ -887,6 +901,19 @@ pub async fn speak(
     say: &Say,
     now_ms: i64,
 ) -> Result<Spoke, String> {
+    speak_with(ch, judge, None, say, now_ms).await
+}
+
+/// [`speak`] for a reply to a person: when the guards decide to answer
+/// someone, `compose` writes the words from the thread and the run's
+/// records (`crate::reply_compose`), held to the same guards.
+pub async fn speak_with(
+    ch: &dyn Channel,
+    judge: Option<&dyn Judge>,
+    compose: Option<crate::reply_compose::Compose<'_>>,
+    say: &Say,
+    now_ms: i64,
+) -> Result<Spoke, String> {
     let place = ch.place();
     let view = match ch.read().await {
         Ok(v) => v,
@@ -898,6 +925,9 @@ pub async fn speak(
     let mut decision = decide(&view, say, &place, now_ms);
     if let Some(j) = judge {
         decision = judged(j, &view, say, &place, decision, now_ms).await;
+    }
+    if let Some(c) = compose {
+        decision = Box::pin(crate::reply_compose::apply(c, &view, say, &place, decision)).await;
     }
     match decision {
         Decision::Quiet { why } => {

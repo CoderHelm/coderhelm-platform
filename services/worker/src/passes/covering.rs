@@ -755,29 +755,51 @@ pub async fn finish(
         "Run covered by an open pull request"
     );
     super::add_progress_note(state, &msg.team_id, run_id, &rec.note).await;
+    // A person who asked for this run (a retry, a comment) is answered
+    // from the covering pull request's record; with nobody asking, the
+    // status note stands as it is.
+    let replier = super::conversation::Replier::new(state, &msg.team_id);
+    let mut facts = common::reply_compose::Facts::default()
+        .ticket(
+            format!("{} {}", msg.ticket_id, msg.title).trim().to_string(),
+            common::truncate_str(msg.body.trim(), 1_500).to_string(),
+        )
+        .pr(rec.number, rec.url.clone(), &rec.title, "open")
+        .state(format!(
+            "this run ended without building anything: open pull request #{} already covers the ticket ({})",
+            rec.number,
+            if rec.outcome.is_empty() { "covered" } else { &rec.outcome }
+        ))
+        .decision(rec.reason.clone())
+        .decision(rec.note.clone());
+    for item in &rec.open_items {
+        facts = facts.decision(format!("Still open in #{}: {item}", rec.number));
+    }
     match msg.source {
         TicketSource::Github if msg.issue_number > 0 => {
-            if let Err(e) = crate::passes::conversation::github(
+            if let Err(e) = Box::pin(crate::passes::conversation::reply_github(
+                &replier,
                 github,
                 &msg.repo_owner,
                 &msg.repo_name,
                 msg.issue_number,
                 common::conversation::Say::status("run", cov::ticket_note(rec, true)),
-            )
+                &facts,
+            ))
             .await
             {
                 warn!(run_id, error = %e, "Could not note the covering PR on the issue");
             }
         }
         TicketSource::Jira if !msg.ticket_id.is_empty() => {
-            if let Err(e) = crate::passes::conversation::jira(
-                state,
-                &msg.team_id,
+            if let Err(e) = Box::pin(crate::passes::conversation::reply_jira(
+                &replier,
                 &msg.ticket_id,
                 common::conversation::Say::status("run", cov::ticket_note(rec, false)),
+                &facts,
                 "covered",
                 "Already being fixed",
-            )
+            ))
             .await
             .map(|_| ())
             {
