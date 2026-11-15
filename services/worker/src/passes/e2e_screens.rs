@@ -69,7 +69,10 @@ async fn claim(state: &WorkerState, team_id: &str, repo: &str, sha: &str, k: &Ke
         .await
     {
         Ok(_) => true,
-        Err(e) if format!("{e:?}").contains("ConditionalCheckFailed") => {
+        Err(e)
+            if e.as_service_error()
+                .is_some_and(|s| s.is_conditional_check_failed_exception()) =>
+        {
             info!(repo, "Another run on this head kept its screenshots first");
             false
         }
