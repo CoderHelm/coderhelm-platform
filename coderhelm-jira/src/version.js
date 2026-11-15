@@ -10,14 +10,20 @@
 // Every call the app makes to CoderHelm (each Jira event and each trigger
 // registration) carries these two fields.
 
-const api = require("@forge/api");
+/**
+ * Forge's `getAppContext`. Loaded when first asked for, so this file (and its
+ * tests) load without the Forge SDK installed.
+ */
+function forgeAppContext() {
+  return require("@forge/api").getAppContext();
+}
 
 /**
  * { appVersion, appId } of the running app, from `getAppContext` (or a
  * stand-in for tests). Empty strings when the context isn't there, such as
  * outside Forge: the call to CoderHelm still goes out, only without them.
  */
-function appInfo(getAppContext = api.getAppContext) {
+function appInfo(getAppContext = forgeAppContext) {
   try {
     const ctx = (typeof getAppContext === "function" && getAppContext()) || {};
     return {
