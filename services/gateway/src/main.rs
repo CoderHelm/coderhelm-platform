@@ -621,6 +621,10 @@ fn build_app(state: Arc<AppState>) -> Router {
             post(routes::infra_security::fix),
         )
         .route(
+            "/security/infrastructure/findings/:id/apply",
+            post(routes::infra_security::apply),
+        )
+        .route(
             "/alert-routes",
             get(routes::alerts::list_routes)
                 .put(routes::alerts::put_route)

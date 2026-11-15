@@ -718,7 +718,7 @@ pub const CAPABILITIES: &[Capability] = &[
     },
     Capability {
         key: "security",
-        label: "Change security fix settings, dismiss or reopen findings, open fix PRs, check repositories now and preview what would open",
+        label: "Change security fix settings, dismiss or reopen findings, open fix PRs, approve infrastructure updates CoderHelm applies in AWS, check repositories now and preview what would open",
 
         short_label: "Manage security fixes",
         min_role: "admin",
@@ -727,6 +727,7 @@ pub const CAPABILITIES: &[Capability] = &[
             "infra_security::check",
             "infra_security::put_config",
             "infra_security::fix",
+            "infra_security::apply",
             "security::dismiss",
             "security::reopen",
             "security::scan",

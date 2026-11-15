@@ -222,12 +222,24 @@ pub const ABILITIES: &[Ability] = &[
         ],
         chosen: true,
     },
+    Ability {
+        key: "maintenance",
+        name: "Applying approved database maintenance",
+        why: "Applies a pending RDS or Aurora maintenance action (an operating system update, an engine patch or upgrade, a serverless platform update) after a person approves it on the infrastructure findings page: in the next maintenance window, or now when they pick that. Only the account's own clusters and instances, only when the stack's ApplyMaintenance parameter is on, and never without that approval.",
+        actions: &["rds:ApplyPendingMaintenanceAction"],
+        chosen: true,
+    },
 ];
 
 /// Optional abilities a team switches on per account: the live check
 /// asks about them too, but a missing one never makes the role "need an
 /// update" unless the team switched it on (`AwsAccount::infra_on`).
-pub const OPTIONAL: &[&str] = &["infra", "inspector", "health"];
+pub const OPTIONAL: &[&str] = &["infra", "inspector", "health", "maintenance"];
+
+/// The one action that changes a database, in [`ability`] `maintenance`:
+/// granted only when a team switches ApplyMaintenance on, and used only for
+/// a pending action a person approved.
+pub const MAINTENANCE_WRITES: &[&str] = &["rds:ApplyPendingMaintenanceAction"];
 
 /// The only actions that change anything, all in [`ability`] `sync` and
 /// granted only on the knowledge bases a team names in SyncKnowledgeBases.
@@ -252,6 +264,8 @@ pub struct Chosen<'a> {
     /// its API.
     pub inspector: bool,
     pub health: bool,
+    /// The team lets CoderHelm apply approved database maintenance.
+    pub maintenance: bool,
 }
 
 impl<'a> Chosen<'a> {
@@ -263,6 +277,7 @@ impl<'a> Chosen<'a> {
             infrastructure: false,
             inspector: false,
             health: false,
+            maintenance: false,
         }
     }
 
@@ -271,6 +286,14 @@ impl<'a> Chosen<'a> {
         Chosen {
             inspector,
             health,
+            ..self
+        }
+    }
+
+    /// The same, also applying approved database maintenance.
+    pub fn with_maintenance(self, on: bool) -> Chosen<'a> {
+        Chosen {
+            maintenance: on,
             ..self
         }
     }
@@ -298,6 +321,7 @@ impl<'a> Chosen<'a> {
             && !self.infrastructure
             && !self.inspector
             && !self.health
+            && !self.maintenance
     }
 }
 
@@ -525,6 +549,9 @@ pub fn update_url(update_template_url: &str, region: &str, chosen: &Chosen) -> S
     if chosen.health {
         u.push_str("&param_HealthEvents=on");
     }
+    if chosen.maintenance {
+        u.push_str("&param_ApplyMaintenance=on");
+    }
     u
 }
 
@@ -562,6 +589,9 @@ pub fn update_stack_name_for(chosen: &Chosen) -> String {
     }
     if chosen.health {
         seed.push_str("|health");
+    }
+    if chosen.maintenance {
+        seed.push_str("|maintenance");
     }
     format!(
         "{}-kb{}",
@@ -619,7 +649,8 @@ mod tests {
         let ok_reads = ["logs:StartQuery", "logs:StopQuery", "airflow:InvokeRestApi"];
         for a in all_actions() {
             let verb = a.split(':').nth(1).unwrap();
-            if ok_reads.contains(&a) || SYNC_WRITES.contains(&a) {
+            if ok_reads.contains(&a) || SYNC_WRITES.contains(&a) || MAINTENANCE_WRITES.contains(&a)
+            {
                 continue;
             }
             assert!(
@@ -654,6 +685,20 @@ mod tests {
                     "{w} only in the sync statement"
                 );
             }
+            // Database maintenance: only in its own statement, only behind
+            // ApplyMaintenance, only on the account's own databases.
+            for w in MAINTENANCE_WRITES {
+                assert_eq!(t.matches(&format!("\"{w}\"")).count(), 1, "{w}");
+            }
+            let m = t
+                .split("- AppliesMaintenance")
+                .nth(1)
+                .expect("the maintenance statement");
+            let m = m.split("- !Ref AWS::NoValue").next().unwrap();
+            assert!(m.contains("rds:ApplyPendingMaintenanceAction"));
+            assert!(m.contains(":cluster:*") && m.contains(":db:*"));
+            assert!(!m.contains("Resource: \"*\""));
+            assert!(t.contains("AppliesMaintenance: !Equals [!Ref ApplyMaintenance, \"on\"]"));
             // Imports: read objects only in the buckets named, decrypt only
             // through S3.
             assert!(t.contains("- Sid: ReadImportBuckets"));
@@ -816,8 +861,9 @@ mod tests {
         assert!(checked.contains(&"logs:StartQuery"));
         // Knowledge bases (6), imports (4), copying into Bedrock (6 more:
         // its Get calls are the knowledge bases' too) and infrastructure
-        // reads (20), Inspector (3) and Health (3).
-        assert_eq!(checked.len() + 42, all_actions().len());
+        // reads (20), Inspector (3), Health (3) and applying approved
+        // maintenance (1).
+        assert_eq!(checked.len() + 43, all_actions().len());
         assert!(!checked.contains(&"bedrock:IngestKnowledgeBaseDocuments"));
         // Copying into Bedrock rides along as its own parameter and stack.
         let sync = ["arn:aws:bedrock:us-east-1:111122223333:knowledge-base/SYNC123456".to_string()];

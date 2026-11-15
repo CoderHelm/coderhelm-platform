@@ -17,6 +17,10 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use std::collections::BTreeSet;
+
+use super::actions::Meaning;
+use super::inventory::Coverage;
 use super::matching::{FixKind, InfraFinding};
 use crate::security_fixes::Tier;
 
@@ -68,11 +72,52 @@ pub enum Status {
     Fixed,
     AwsManaged,
     Dismissed,
+    /// The resource is gone: a full read of its account and region no
+    /// longer lists it ([`Record::removed_at`] says when).
+    Removed,
+    /// The same problem as another finding, which now carries both
+    /// reasons ([`Record::merged_into`]). Never shown.
+    Merged,
 }
 
 impl Status {
     pub fn is_open(self) -> bool {
         matches!(self, Status::Open | Status::Fixing | Status::PrOpen)
+    }
+
+    /// Closed by a read of the account: fixed, or its resource removed.
+    pub fn is_closed(self) -> bool {
+        matches!(self, Status::Fixed | Status::Removed)
+    }
+}
+
+/// When CoderHelm applies a pending action itself (`apply`): a person's
+/// approval, what was asked of AWS, and what came back.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ApplyState {
+    /// `next-maintenance` (the default) or `immediate`.
+    pub opt_in: String,
+    pub approved_by: String,
+    pub approved_at: String,
+    /// When AWS accepted the request for every ARN.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub applied_at: String,
+    /// The ARNs AWS accepted it for, in order.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub applied: Vec<String>,
+    /// Why it has not been sent yet (the non-production copy first), or
+    /// what AWS answered when it refused.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub note: String,
+    /// The IAM action the team's role lacks, when AWS refused for that.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub missing_permission: String,
+}
+
+impl ApplyState {
+    pub fn sent(&self) -> bool {
+        !self.applied_at.is_empty()
     }
 }
 
@@ -135,6 +180,15 @@ pub struct Record {
     /// What the page says after a person ended its fix run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub release_note: Option<String>,
+    /// When a full read of the account no longer listed the resource.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removed_at: Option<String>,
+    /// The finding that now carries this one's reasons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merged_into: Option<String>,
+    /// A person approved CoderHelm applying the pending action in AWS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apply: Option<ApplyState>,
     /// A line for the timeline when something changed (not stored).
     #[serde(skip)]
     pub event: Option<String>,
@@ -167,6 +221,9 @@ impl Record {
             hold_until: None,
             claimed_at: None,
             release_note: None,
+            removed_at: None,
+            merged_into: None,
+            apply: None,
         }
     }
 
@@ -184,6 +241,11 @@ impl Record {
             o.insert("first_seen_at".into(), json!(self.first_seen_at));
             o.insert("updated_at".into(), json!(self.updated_at));
             o.insert("fixed_at".into(), json!(self.fixed_at));
+            o.insert("removed_at".into(), json!(self.removed_at));
+            o.insert("apply".into(), json!(self.apply));
+            // A closed finding offers nothing to do: no pull request to
+            // open, no runbook to follow, nothing to approve.
+            o.insert("actionable".into(), json!(self.status.is_open()));
             // The fix's kind as the contract names it.
             o["fix"]["kind"] = json!(self.finding.fix.kind);
             if !self.refused.is_empty() {
@@ -360,7 +422,9 @@ impl Claim for Record {
             Status::Fixing => Standing::Fixing,
             Status::PrOpen => Standing::InPr,
             Status::Fixed => Standing::Fixed,
-            Status::AwsManaged | Status::Dismissed => Standing::Other,
+            Status::AwsManaged | Status::Dismissed | Status::Removed | Status::Merged => {
+                Standing::Other
+            }
         }
     }
     /// An open pull request and a draft the guard held are read every
@@ -547,10 +611,83 @@ pub fn fix_round_body(r: &Record) -> String {
     format!("{}{}", ticket_body(r), super::guard::fix_round(&r.refused))
 }
 
+/// What the read behind a match saw.
+#[derive(Debug, Clone, Copy)]
+pub enum Seen<'a> {
+    /// Everything, in full (tests, and callers that pass one whole read).
+    All,
+    /// Each account and region's latest read: what it saw in full, and the
+    /// resources stored after it.
+    Read {
+        coverage: &'a Coverage,
+        present: &'a BTreeSet<String>,
+    },
+}
+
+/// The version an engine move ends at: the fix's target, or, for a record
+/// written before targets were kept, the version its title or AWS's
+/// description names.
+fn move_target(f: &InfraFinding) -> String {
+    if !f.fix.to.is_empty() {
+        return f.fix.to.clone();
+    }
+    let t = super::actions::target_in(&f.title);
+    if !t.is_empty() {
+        return t;
+    }
+    super::actions::target_in(&f.fix.reason)
+}
+
+fn engine_move(f: &InfraFinding) -> bool {
+    matches!(
+        f.kind,
+        Some(super::inventory::Kind::RdsCluster | super::inventory::Kind::RdsInstance)
+    ) && match f.fix.meaning {
+        Some(m) => matches!(m, Meaning::EnginePatch | Meaning::EngineUpgrade),
+        // Written before meanings were kept: an AWS action whose title
+        // names the version it moves to.
+        None => f.fix.kind != Some(FixKind::Aws),
+    }
+}
+
+/// Two findings are one problem: the same database moving to the same
+/// version (a CVE's upgrade target and the engine patch that reaches it).
+pub fn same_problem(a: &InfraFinding, b: &InfraFinding) -> bool {
+    a.id != b.id
+        && a.account == b.account
+        && a.region == b.region
+        && a.group == b.group
+        && engine_move(a)
+        && engine_move(b)
+        && {
+            let t = move_target(a);
+            !t.is_empty() && t == move_target(b)
+        }
+}
+
 /// A new read's findings against the stored ones: the records that
-/// changed (new, updated, or fixed). Dismissed ones stay dismissed while
-/// they still match.
+/// changed (new, updated, fixed, removed or merged). Dismissed ones stay
+/// dismissed while they still match. See [`reconcile_with`].
 pub fn reconcile(stored: &[Record], fresh: Vec<InfraFinding>, now: DateTime<Utc>) -> Vec<Record> {
+    reconcile_with(stored, fresh, Seen::All, now)
+}
+
+/// A new read's findings against the stored ones.
+///
+/// - A finding the read produces is new, or updated; a closed one found
+///   again opens again.
+/// - A stored finding that is the same problem as another (same database,
+///   same target version) is merged into it: one item, both reasons.
+/// - A stored finding the read no longer produces closes only when the
+///   latest read of its account and region saw its kind in full: as
+///   **removed** when none of its resources is listed any more, else as
+///   **fixed**. A failed or partial read closes nothing.
+pub fn reconcile_with(
+    stored: &[Record],
+    fresh: Vec<InfraFinding>,
+    seen: Seen,
+    now: DateTime<Utc>,
+) -> Vec<Record> {
     let now_s = now.to_rfc3339();
     let mut out = Vec::new();
     for f in &fresh {
@@ -558,7 +695,7 @@ pub fn reconcile(stored: &[Record], fresh: Vec<InfraFinding>, now: DateTime<Utc>
             None => out.push(Record::new(f.clone(), &now_s)),
             Some(r) => {
                 let mut r2 = r.clone();
-                let reopened = r.status == Status::Fixed;
+                let reopened = matches!(r.status, Status::Fixed | Status::Removed | Status::Merged);
                 r2.finding = f.clone();
                 if reopened {
                     r2.status = if f.is_open() {
@@ -567,6 +704,9 @@ pub fn reconcile(stored: &[Record], fresh: Vec<InfraFinding>, now: DateTime<Utc>
                         Status::AwsManaged
                     };
                     r2.fixed_at = None;
+                    r2.removed_at = None;
+                    r2.merged_into = None;
+                    r2.apply = None;
                     r2.pr = None;
                     r2.ticket.clear();
                     r2.clear_guard();
@@ -579,21 +719,77 @@ pub fn reconcile(stored: &[Record], fresh: Vec<InfraFinding>, now: DateTime<Utc>
             }
         }
     }
-    for r in stored
+    // What a duplicate merges into: a finding of this read, or a stored
+    // one written with today's shape.
+    let canonical: Vec<&InfraFinding> = fresh
         .iter()
-        .filter(|r| r.status != Status::Fixed && r.status != Status::Dismissed)
-    {
-        if fresh.iter().any(|f| f.id == r.finding.id) {
+        .chain(
+            stored
+                .iter()
+                .filter(|r| !matches!(r.status, Status::Merged) && r.finding.fix.meaning.is_some())
+                .filter(|r| !fresh.iter().any(|f| f.id == r.finding.id))
+                .map(|r| &r.finding),
+        )
+        .collect();
+    for r in stored.iter().filter(|r| {
+        !matches!(r.status, Status::Dismissed | Status::Merged)
+            && !fresh.iter().any(|f| f.id == r.finding.id)
+    }) {
+        let mut r2 = r.clone();
+        r2.updated_at = now_s.clone();
+        // Today's shape wins over a record written before it; between two
+        // of today's, the one this read produced.
+        let into = canonical.iter().find(|c| {
+            same_problem(&r.finding, c)
+                && (r.finding.fix.meaning.is_none() || fresh.iter().any(|f| f.id == c.id))
+        });
+        if let Some(c) = into {
+            r2.status = Status::Merged;
+            r2.merged_into = Some(c.id.clone());
+            r2.event = Some(format!(
+                "Merged into \"{}\": the same move to {} on the same database",
+                c.title,
+                move_target(c)
+            ));
+            out.push(r2);
             continue;
         }
-        let mut r2 = r.clone();
-        r2.status = Status::Fixed;
+        if r.status.is_closed() {
+            continue;
+        }
+        let closes_as = match seen {
+            Seen::All => Some(Status::Fixed),
+            Seen::Read { coverage, present } => match r.finding.kind {
+                Some(k) if coverage.complete(&r.finding.account, &r.finding.region, k) => {
+                    if r.finding.resources.iter().any(|id| present.contains(id)) {
+                        Some(Status::Fixed)
+                    } else {
+                        Some(Status::Removed)
+                    }
+                }
+                _ => None,
+            },
+        };
+        let Some(closes_as) = closes_as else {
+            continue;
+        };
+        r2.status = closes_as;
         r2.fixed_at = Some(now_s.clone());
-        r2.updated_at = now_s.clone();
-        r2.event = Some(if r.status == Status::AwsManaged {
-            "No longer applies (the resource or the bulletin changed)".into()
-        } else {
-            "Fixed: the latest read of the account shows the fix running".into()
+        r2.event = Some(match (closes_as, r.status) {
+            (Status::Removed, _) => {
+                r2.removed_at = Some(now_s.clone());
+                format!(
+                    "Resource removed: the latest full read of the account ({}) no longer lists {}",
+                    r.finding.region, r.finding.name
+                )
+            }
+            (_, Status::AwsManaged) => {
+                "No longer applies (the resource or the bulletin changed)".into()
+            }
+            _ if r.apply.as_ref().is_some_and(ApplyState::sent) => {
+                "Fixed: CoderHelm applied it in AWS and the latest read of the account no longer lists it".into()
+            }
+            _ => "Fixed: the latest read of the account shows the fix running".into(),
         });
         if let Some(p) = &mut r2.pr {
             if p.state == "open" {
@@ -620,6 +816,16 @@ pub fn counts(records: &[Record], now: DateTime<Utc>) -> Value {
                 .is_some_and(|t| t > since)
         })
         .count();
+    let removed_30d = records
+        .iter()
+        .filter(|r| r.status == Status::Removed)
+        .filter(|r| {
+            r.removed_at
+                .as_deref()
+                .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
+                .is_some_and(|t| t > since)
+        })
+        .count();
     json!({
         "open": open.len(),
         "p0": n(Tier::P0), "p1": n(Tier::P1), "p2": n(Tier::P2), "p3": n(Tier::P3),
@@ -627,6 +833,8 @@ pub fn counts(records: &[Record], now: DateTime<Utc>) -> Value {
         "runbooks": open.iter().filter(|r| r.finding.fix.kind == Some(FixKind::Runbook)).count(),
         "aws_managed": records.iter().filter(|r| r.status == Status::AwsManaged).count(),
         "fixed_30d": fixed_30d,
+        "removed_30d": removed_30d,
+        "applies": open.iter().filter(|r| r.finding.fix.kind == Some(FixKind::Apply)).count(),
     })
 }
 
@@ -640,7 +848,7 @@ pub fn insights(records: &[Record], now: DateTime<Utc>) -> Value {
     };
     let actionable: Vec<&Record> = records
         .iter()
-        .filter(|r| r.finding.fix.kind != Some(FixKind::Aws))
+        .filter(|r| r.finding.fix.kind != Some(FixKind::Aws) && r.status != Status::Merged)
         .collect();
     let mut days: Vec<f64> = actionable
         .iter()
