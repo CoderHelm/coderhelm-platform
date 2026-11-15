@@ -11,9 +11,11 @@
 //!
 //! Every read goes through the shared layer (`lookups`), as the person who
 //! connected the app: the connection must hold the read's scope
-//! (`code:read`, `work:read`, `security:read`, `knowledge:read`) and the
-//! person's role must open the dashboard route that shows it ([`decide`]),
-//! the same check Chat's own lookups make. Results name the built-in base
+//! (`code:read`, `work:read`, `infra:read`, `logs:read`, `security:read`,
+//! `knowledge:read`), the person's role must open the dashboard route that
+//! shows it ([`decide`]), the same check Chat's own lookups make, and the
+//! base must be open to them (`bases::decide`: its audience). Code is read
+//! only from repositories their linked GitHub account can read. Results name the built-in base
 //! they came from, link back to the dashboard, GitHub or Jira, carry a note
 //! that their text is data and not instructions, and `search` counts what
 //! it withheld for access without naming it.
@@ -30,8 +32,11 @@ use common::repo_read::{CodeReader, GitHubHost, RepoInfo};
 use serde_json::{json, Value};
 use tracing::warn;
 
+use crate::bases::{self, Decision};
 use crate::lookups::{self, base_of, Base, DATA_NOTE};
-use crate::mcp_oauth::{CODE_SCOPE, KNOWLEDGE_SCOPE, SECURITY_SCOPE, WORK_SCOPE};
+use crate::mcp_oauth::{
+    CODE_SCOPE, INFRA_SCOPE, KNOWLEDGE_SCOPE, LOGS_SCOPE, SECURITY_SCOPE, WORK_SCOPE,
+};
 use crate::mcp_server::Refusal;
 use crate::models::Claims;
 use crate::permissions::{resolve_access, Access, Holder};
@@ -49,6 +54,7 @@ pub const CODE_SEARCH: &str = "code_search";
 pub const READ_FILE: &str = "read_file";
 pub const CODE_SYMBOL: &str = "code_symbol";
 pub const HISTORY: &str = "history";
+pub const INFRA_RESOURCES: &str = "infra_resources";
 
 /// The knowledge search, as a lookup name (Chat's own is `search_knowledge`).
 pub const KNOWLEDGE: &str = "knowledge";
@@ -56,9 +62,9 @@ pub const KNOWLEDGE: &str = "knowledge";
 pub const GITHUB_HISTORY: &str = "github_history";
 pub const GRAPH_TOOLS: [&str; 3] = ["graph_definition", "graph_callers", "graph_impact"];
 
-/// The route that decides code and knowledge reads: asking in Chat, which
-/// is where those reads happen in the dashboard.
-pub const CHAT_ROUTE: &str = "brain::stream_token";
+/// The route that decides code and knowledge reads: reading the team's
+/// knowledge, which every member does (`bases::READ_ROUTE`).
+pub const CHAT_ROUTE: &str = bases::READ_ROUTE;
 
 /// Most results one `search` returns, and from each place it looks.
 pub const MAX_RESULTS: usize = 20;
@@ -103,6 +109,14 @@ fn repo_prop() -> Value {
     json!({ "type": "string", "description": "One of the team's repositories, owner/name or its short name." })
 }
 
+fn base_prop() -> Value {
+    json!({
+        "type": "string",
+        "enum": lookups::BASES.iter().map(|b| b.key).collect::<Vec<_>>(),
+        "description": "Only this base: code, work, infra, logs, security or team (the team's documents)."
+    })
+}
+
 fn search_output() -> Value {
     json!({
         "type": "object",
@@ -139,9 +153,12 @@ pub const TOOLS: &[Tool] = &[
     Tool {
         name: SEARCH,
         title: "Search the team's knowledge",
-        description: "Searches what the team knows that you can read: knowledge bases, tickets, pull requests, CoderHelm's runs, code and security findings. Returns results with an id, title and link; read one in full with fetch. Each result names the base it came from, and results not open to you are counted, never shown.",
+        description: "Searches what the team knows that you can read: code, tickets, pull requests, CoderHelm's runs, AWS resources, log findings and alerts, security findings and the team's documents. Give base to search one base only. Returns results with an id, title and link; read one in full with fetch. Each result names the base it came from, and results not open to you are counted, never shown.",
         scopes: &[],
-        schema: || obj(json!({ "query": { "type": "string", "description": "What to find, in plain words." } }), &["query"]),
+        schema: || obj(json!({
+            "query": { "type": "string", "description": "What to find, in plain words." },
+            "base": base_prop()
+        }), &["query"]),
         output: Some(search_output),
     },
     Tool {
@@ -149,13 +166,16 @@ pub const TOOLS: &[Tool] = &[
         title: "Read one result",
         description: "Reads one search result in full by its id: the text, a link to it (the lines on GitHub, the Jira ticket or the CoderHelm page) and where it came from. Access is checked again and the item is read again now.",
         scopes: &[],
-        schema: || obj(json!({ "id": { "type": "string", "description": "An id from search or another lookup." } }), &["id"]),
+        schema: || obj(json!({
+            "id": { "type": "string", "description": "An id from search or another lookup." },
+            "base": base_prop()
+        }), &["id"]),
         output: Some(fetch_output),
     },
     Tool {
         name: LIST_BASES,
         title: "List the bases",
-        description: "Lists where the team's knowledge lives (Code and docs, Work, Infrastructure, Logs and operations, Security, Team knowledge), which of them this connection and your role can read, and the knowledge bases you can read.",
+        description: "Lists the team's six built-in bases (Code, Work, Infrastructure, Logs, Security, Knowledge): what each holds, how many items and when it last changed, and whether you can read it through this connection (and why not). Also the knowledge bases you can read.",
         scopes: &[],
         schema: || obj(json!({}), &[]),
         output: None,
@@ -206,7 +226,7 @@ pub const TOOLS: &[Tool] = &[
         name: FIND_FINDINGS,
         title: "Find findings and records",
         description: "Finds the team's findings and records by kind: security (dependency advisories and CVEs), infra (infrastructure findings), tests (quarantined tests), reviews (CoderHelm's pull request reviews), alerts, log_findings and plans. Search by an advisory id, a package, a repository or words.",
-        scopes: &[WORK_SCOPE, SECURITY_SCOPE],
+        scopes: &[WORK_SCOPE, SECURITY_SCOPE, INFRA_SCOPE, LOGS_SCOPE],
         schema: || obj(json!({
             "kind": { "type": "string", "enum": FINDING_KINDS },
             "query": { "type": "string", "description": "A CVE or advisory id, a package or words." },
@@ -214,6 +234,17 @@ pub const TOOLS: &[Tool] = &[
             "state": { "type": "string", "enum": ["open", "fixed", "dismissed", "any"], "description": "Findings only; open by default." },
             "pr": { "type": "integer", "description": "Records only: a pull request number." }
         }), &["kind"]),
+        output: None,
+    },
+    Tool {
+        name: INFRA_RESOURCES,
+        title: "Find AWS resources",
+        description: "Finds the team's AWS resources from the daily read of its connected accounts: name, kind, account and region, versions, whether the internet reaches it, what AWS has pending for it, and where it is defined (repository, file, Terraform address, CloudFormation stack or CDK construct). Search by words, a name or a repository.",
+        scopes: &[INFRA_SCOPE],
+        schema: || obj(json!({
+            "query": { "type": "string", "description": "Words, a resource name, a kind like lambda or rds." },
+            "repo": repo_prop()
+        }), &[]),
         output: None,
     },
     Tool {
@@ -377,6 +408,38 @@ pub fn decide(
     }
 }
 
+/// The base a read belongs to.
+pub fn base_of_read(read: &Read) -> Option<&'static Base> {
+    needs(&read.lookup, &read.input).map(|(_, _, k)| base_of(k))
+}
+
+/// [`decide`], then the base's own decision (its audience): the one
+/// permission decision every read on `/mcp` passes.
+pub fn decide_open(
+    scopes: &BTreeSet<&'static str>,
+    holder: &Holder,
+    open: &BTreeMap<&'static str, Decision>,
+    read: &Read,
+) -> Result<(), Fail> {
+    refuse(decide(scopes, holder, read))?;
+    let base = base_of_read(read)
+        .ok_or_else(|| Fail::Message("That isn't a lookup apps may make.".into()))?;
+    match open.get(base.key) {
+        Some(Decision::Open) => Ok(()),
+        Some(d) => Err(Fail::Message(closed_message(base, d))),
+        None => Err(Fail::Message(closed_message(base, &Decision::Role))),
+    }
+}
+
+/// What a person is told when a base is closed to them.
+pub fn closed_message(base: &Base, d: &Decision) -> String {
+    format!(
+        "{} isn't open to you: {}",
+        base.name,
+        d.why(base).unwrap_or_default()
+    )
+}
+
 fn take(args: &Value, keys: &[&str]) -> Value {
     let mut out = serde_json::Map::new();
     for k in keys {
@@ -426,6 +489,11 @@ pub fn read_of(tool: &str, args: &Value) -> Result<Read, String> {
                 &["kind", "query", "repo", "pr"]
             };
             Read::new(k.tool, take(args, keys))
+        }
+        INFRA_RESOURCES => {
+            let mut r = take(args, &["query", "repo"]);
+            r["kind"] = json!("resources");
+            Read::new(chat_work::RECORDS, r)
         }
         CODE_SEARCH => {
             if args["query"]
@@ -837,9 +905,27 @@ pub struct Answer {
 /// The team's connections the reads of one call use.
 struct Conns {
     work: chat_work::Ctx,
+    /// The team's repositories this person may read (GitHub mirroring).
     repos: Vec<RepoInfo>,
+    /// Repositories left out because the person's GitHub account can't read
+    /// them.
+    repos_withheld: usize,
     /// Why GitHub reads wait now, when they do.
     hold: Option<String>,
+}
+
+/// Every base's decision for this connection and person.
+pub async fn open_bases(env: &Env) -> BTreeMap<&'static str, Decision> {
+    let auds = bases::audiences(&env.state, &env.claims.team_id).await;
+    let who = bases::Asker {
+        holder: &env.holder,
+        email: &env.claims.email,
+    };
+    bases::decide_all(&who, &auds, Some(&env.scopes))
+}
+
+fn reads_repos(lookup: &str) -> bool {
+    uses_github(lookup) || GRAPH_TOOLS.contains(&lookup)
 }
 
 fn uses_github(lookup: &str) -> bool {
@@ -849,10 +935,14 @@ fn uses_github(lookup: &str) -> bool {
     )
 }
 
-async fn connect(env: &Env, lookups_used: &[&str]) -> Conns {
+async fn connect(
+    env: &Env,
+    lookups_used: &[&str],
+    open: &BTreeMap<&'static str, Decision>,
+) -> Conns {
     let state = &env.state;
     let team = env.claims.team_id.as_str();
-    let github = lookups_used.iter().any(|l| uses_github(l));
+    let github = lookups_used.iter().any(|l| reads_repos(l));
     let tickets = lookups_used.contains(&chat_work::TICKETS);
     let (repos, installation_id) = tokio::join!(
         crate::routes::brain::load_repos(state, team),
@@ -882,11 +972,24 @@ async fn connect(env: &Env, lookups_used: &[&str]) -> Conns {
             }
         },
     );
+    let (repos, repos_withheld) = if github {
+        bases::visible_repos(
+            state,
+            team,
+            &env.holder.role,
+            env.claims.github_login.as_deref(),
+            token.as_deref(),
+            repos,
+        )
+        .await
+    } else {
+        (repos, 0)
+    };
     Conns {
         work: chat_work::Ctx {
             state: state.clone(),
             claims: env.claims.clone(),
-            readable: chat_work::readable(&env.holder),
+            readable: bases::readable_kinds(&env.holder, open),
             holder: env.holder.clone(),
             repos: repos.iter().map(|r| r.name.clone()).collect(),
             github_token: token,
@@ -895,6 +998,7 @@ async fn connect(env: &Env, lookups_used: &[&str]) -> Conns {
             caller: common::github_budget::caller::MCP,
         },
         repos,
+        repos_withheld,
         hold,
     }
 }
@@ -1112,7 +1216,7 @@ async fn knowledge_read(
     let mut withheld = Withheld::default();
     if !held.is_empty() {
         withheld.by_base.insert(
-            lookups::base(lookups::TEAM).map_or("Team knowledge", |b| b.name),
+            lookups::base(lookups::TEAM).map_or("Knowledge", |b| b.name),
             held.len(),
         );
     }
@@ -1145,7 +1249,9 @@ async fn knowledge_read(
 pub fn search_reads(
     scopes: &BTreeSet<&'static str>,
     holder: &Holder,
+    open: &BTreeMap<&'static str, Decision>,
     query: &str,
+    only: Option<&str>,
 ) -> (Vec<Read>, Withheld) {
     let q = json!(query);
     let candidates = [
@@ -1162,12 +1268,36 @@ pub fn search_reads(
             chat_work::FINDINGS,
             json!({ "kind": "infra", "query": q, "state": "any" }),
         ),
+        Read::new(
+            chat_work::RECORDS,
+            json!({ "kind": "resources", "query": q }),
+        ),
+        Read::new(
+            chat_work::RECORDS,
+            json!({ "kind": "log_findings", "query": q }),
+        ),
+        Read::new(chat_work::RECORDS, json!({ "kind": "alerts", "query": q })),
     ];
     let mut reads = Vec::new();
     let mut withheld = Withheld::default();
     for r in candidates {
+        let base = base_of_read(&r);
+        if only.is_some_and(|o| base.is_none_or(|b| b.key != o)) {
+            continue;
+        }
+        let base_open = base
+            .and_then(|b| open.get(b.key))
+            .is_some_and(Decision::is_open);
         match decide(scopes, holder, &r) {
-            Ok(_) => reads.push(r),
+            Ok(_) if base_open => reads.push(r),
+            Ok(_) => {
+                // The base's audience leaves it out: named, never read.
+                if let Some(b) = base {
+                    if !withheld.kinds.contains(&b.name) {
+                        withheld.kinds.push(b.name);
+                    }
+                }
+            }
             // Not in this connection's scopes: not searched, not counted.
             Err(Refusal::Scope(_)) | Err(Refusal::NotForApps) => {}
             Err(Refusal::Role(_)) => {
@@ -1189,6 +1319,24 @@ pub async fn run(env: &Env, tool: &str, args: &Value) -> Result<Answer, Fail> {
     match tool {
         LIST_BASES => Box::pin(list_bases(env)).await,
         SEARCH => {
+            let only = match args["base"]
+                .as_str()
+                .map(str::trim)
+                .filter(|b| !b.is_empty())
+            {
+                Some(b) => Some(
+                    lookups::BASES
+                        .iter()
+                        .find(|x| x.key == b || x.name.eq_ignore_ascii_case(b))
+                        .ok_or_else(|| {
+                            Fail::Message(
+                                "base must be one of: code, work, infra, logs, security, team."
+                                    .into(),
+                            )
+                        })?,
+                ),
+                None => None,
+            };
             let query = args["query"].as_str().map(str::trim).unwrap_or("");
             if query.is_empty() {
                 return Err(Fail::Message("Give query: what to find.".into()));
@@ -1198,9 +1346,24 @@ pub async fn run(env: &Env, tool: &str, args: &Value) -> Result<Answer, Fail> {
                     "Keep query under {MAX_QUERY_CHARS} characters."
                 )));
             }
-            let (reads, mut withheld) = search_reads(&env.scopes, &env.holder, query);
+            let open = open_bases(env).await;
+            if let Some(b) = only {
+                let d = open.get(b.key).cloned().unwrap_or(Decision::Role);
+                if let Decision::Scope(s) = d {
+                    return Err(Fail::Scope(s));
+                }
+                if !d.is_open() {
+                    return Err(Fail::Message(closed_message(b, &d)));
+                }
+            }
+            let (reads, mut withheld) =
+                search_reads(&env.scopes, &env.holder, &open, query, only.map(|b| b.key));
             let used: Vec<&str> = reads.iter().map(|r| r.lookup.as_str()).collect();
-            let conns = connect(env, &used).await;
+            let conns = connect(env, &used, &open).await;
+            if conns.repos_withheld > 0 && used.iter().any(|l| reads_repos(l)) {
+                let code = lookups::base(lookups::CODE).map_or("Code", |b| b.name);
+                *withheld.by_base.entry(code).or_default() += conns.repos_withheld;
+            }
             let mut out: Vec<Item> = Vec::new();
             let mut unread: Vec<Value> = Vec::new();
             for r in &reads {
@@ -1230,8 +1393,17 @@ pub async fn run(env: &Env, tool: &str, args: &Value) -> Result<Answer, Fail> {
         FETCH => {
             let id = args["id"].as_str().unwrap_or("");
             let Target { read, title, place } = decode_id(id).map_err(Fail::Message)?;
-            refuse(decide(&env.scopes, &env.holder, &read))?;
-            let conns = connect(env, &[read.lookup.as_str()]).await;
+            if let Some(b) = args["base"].as_str().filter(|b| !b.trim().is_empty()) {
+                if base_of_read(&read).is_none_or(|x| x.key != b.trim()) {
+                    return Err(Fail::Message(format!(
+                        "That id isn't from the {} base.",
+                        b.trim()
+                    )));
+                }
+            }
+            let open = open_bases(env).await;
+            decide_open(&env.scopes, &env.holder, &open, &read)?;
+            let conns = connect(env, &[read.lookup.as_str()], &open).await;
             let mut reg = Registry::default();
             let (text, _) = Box::pin(run_read(env, &conns, &mut reg, &read))
                 .await
@@ -1259,8 +1431,9 @@ pub async fn run(env: &Env, tool: &str, args: &Value) -> Result<Answer, Fail> {
         }
         _ => {
             let read = read_of(tool, args).map_err(Fail::Message)?;
-            refuse(decide(&env.scopes, &env.holder, &read))?;
-            let conns = connect(env, &[read.lookup.as_str()]).await;
+            let open = open_bases(env).await;
+            decide_open(&env.scopes, &env.holder, &open, &read)?;
+            let conns = connect(env, &[read.lookup.as_str()], &open).await;
             let mut reg = Registry::default();
             let (text, _) = Box::pin(run_read(env, &conns, &mut reg, &read))
                 .await
@@ -1301,33 +1474,23 @@ fn refuse(r: Result<&'static str, Refusal>) -> Result<(), Fail> {
     }
 }
 
-/// Whether the role opens what a base holds today.
-pub fn role_reads(holder: &Holder, base: &str) -> bool {
-    let route_ok = |h: &str| matches!(resolve_access(holder, Some(h)), Access::Allow { .. });
-    match base {
-        lookups::CODE | lookups::TEAM => route_ok(CHAT_ROUTE),
-        b => chat_work::KINDS
-            .iter()
-            .filter(|k| base_of(k.key).key == b)
-            .any(|k| route_ok(k.handler)),
-    }
-}
-
 /// `list_bases`: the six bases (what each holds now, and whether this
 /// connection and role read it) and the knowledge bases the person reads.
 async fn list_bases(env: &Env) -> Result<Answer, Fail> {
     use common::knowledge::search::Store;
-    let bases: Vec<Value> = lookups::BASES
-        .iter()
-        .map(|b| {
-            json!({
-                "key": b.key,
-                "name": b.name,
-                "holds": b.about,
-                "scope": b.scope,
-                "this_connection_may_read": env.scopes.contains(b.scope),
-                "your_role_may_read": role_reads(&env.holder, b.key),
-            })
+    let who = bases::Asker {
+        holder: &env.holder,
+        email: &env.claims.email,
+    };
+    let bases: Vec<Value> = bases::list(&env.state, &env.claims.team_id, &who, Some(&env.scopes))
+        .await
+        .into_iter()
+        .map(|mut b| {
+            // What an AI tool needs; the audience's names stay in CoderHelm.
+            if let Some(o) = b.as_object_mut() {
+                o.remove("audience");
+            }
+            b
         })
         .collect();
     let mut kbs: Vec<Value> = Vec::new();
@@ -1345,9 +1508,10 @@ async fn list_bases(env: &Env) -> Result<Answer, Fail> {
                 };
                 let open = crate::mcp_knowledge::readable(all, &reader).unwrap_or_default();
                 if total > open.len() {
-                    withheld
-                        .by_base
-                        .insert("Team knowledge", total - open.len());
+                    withheld.by_base.insert(
+                        lookups::base(lookups::TEAM).map_or("Knowledge", |b| b.name),
+                        total - open.len(),
+                    );
                 }
                 kbs = open
                     .iter()
@@ -1363,7 +1527,7 @@ async fn list_bases(env: &Env) -> Result<Answer, Fail> {
             "bases": bases,
             "knowledge_bases": kbs,
             "withheld": withheld.to_json(),
-            "note": "These six are the names results carry today. Each reads what your CoderHelm role opens in the dashboard, through the scopes this connection holds; their own audiences and settings come later.",
+            "note": "Each base is open to you when your CoderHelm role opens what it holds, its audience includes you, and this connection holds its scope. Code follows your GitHub access. Closed bases say why, never what is in them.",
         }),
         items: Vec::new(),
         withheld: n,
@@ -1485,6 +1649,13 @@ mod tests {
         crate::mcp_oauth::SCOPES.iter().copied().collect()
     }
 
+    fn all_open() -> BTreeMap<&'static str, Decision> {
+        lookups::BASES
+            .iter()
+            .map(|b| (b.key, Decision::Open))
+            .collect()
+    }
+
     fn custom(caps: &[&str]) -> Holder {
         let caps: Vec<String> = caps.iter().map(|c| c.to_string()).collect();
         Holder::custom("r1", Some(("Custom", &caps)))
@@ -1509,6 +1680,7 @@ mod tests {
             (FIND_PULL_REQUESTS, json!({ "ticket": "WEB-42" })),
             (FIND_RUNS, json!({ "status": "active" })),
             (CODE_SEARCH, json!({ "query": "refund" })),
+            (INFRA_RESOURCES, json!({ "query": "orders" })),
             (
                 READ_FILE,
                 json!({ "repo": "acme/web", "path": "src/pay.ts" }),
@@ -1540,6 +1712,7 @@ mod tests {
                 FIND_PULL_REQUESTS,
                 FIND_RUNS,
                 FIND_FINDINGS,
+                INFRA_RESOURCES,
                 CODE_SEARCH,
                 READ_FILE,
                 CODE_SYMBOL,
@@ -1672,14 +1845,14 @@ mod tests {
                 }
             }
         }
-        // A viewer reads runs, not code (Chat needs asking).
+        // Everyone on the team reads runs and code (reading knowledge is
+        // every member's; asking Chat is not needed to read).
         let viewer = Holder::builtin("viewer");
         let runs = read_of(FIND_RUNS, &json!({})).unwrap();
         assert!(decide(&all_scopes(), &viewer, &runs).is_ok());
         let code = read_of(CODE_SEARCH, &json!({ "query": "x" })).unwrap();
-        assert!(
-            matches!(decide(&all_scopes(), &viewer, &code), Err(Refusal::Role(c)) if c.key == "brain_ask")
-        );
+        assert!(decide(&all_scopes(), &viewer, &code).is_ok());
+        assert!(decide(&all_scopes(), &Holder::builtin(bases::READER_ROLE), &code).is_ok());
         // Nothing else: a write tool or a made-up lookup is never a read.
         for l in ["start_run", "write_file", "live_lookup", "db_query"] {
             assert_eq!(
@@ -1708,11 +1881,19 @@ mod tests {
         );
         assert_eq!(
             scope_needed(FIND_FINDINGS, &json!({"kind": "infra"})),
-            Some(SECURITY_SCOPE)
+            Some(INFRA_SCOPE)
+        );
+        assert_eq!(
+            scope_needed(INFRA_RESOURCES, &json!({"query": "orders"})),
+            Some(INFRA_SCOPE)
         );
         assert_eq!(
             scope_needed(FIND_FINDINGS, &json!({"kind": "alerts"})),
-            Some(SECURITY_SCOPE)
+            Some(LOGS_SCOPE)
+        );
+        assert_eq!(
+            scope_needed(FIND_FINDINGS, &json!({"kind": "log_findings"})),
+            Some(LOGS_SCOPE)
         );
         assert_eq!(
             scope_needed(FIND_FINDINGS, &json!({"kind": "reviews"})),
@@ -1747,6 +1928,8 @@ mod tests {
             ]
         );
         assert!(names(BTreeSet::from([SECURITY_SCOPE])).contains(&FIND_FINDINGS.to_string()));
+        assert!(names(BTreeSet::from([INFRA_SCOPE])).contains(&INFRA_RESOURCES.to_string()));
+        assert!(!names(BTreeSet::from([LOGS_SCOPE])).contains(&INFRA_RESOURCES.to_string()));
         // The search toolset: two tools, whatever the scopes.
         let two: Vec<Value> = listing(&all_scopes(), true);
         assert_eq!(two.len(), 2);
@@ -1757,12 +1940,18 @@ mod tests {
     #[test]
     fn search_reads_what_the_connection_and_role_reach_and_counts_the_rest() {
         let member = Holder::builtin("member");
-        let (reads, w) = search_reads(&all_scopes(), &member, "refund");
+        let (reads, w) = search_reads(&all_scopes(), &member, &all_open(), "refund", None);
         let looks: Vec<&str> = reads.iter().map(|r| r.lookup.as_str()).collect();
         assert!(looks.contains(&KNOWLEDGE) && looks.contains(&chat_code::SEARCH_CODE));
         assert!(looks.contains(&chat_work::TICKETS));
         // Only work scope: no code, no knowledge, no security.
-        let (reads, _) = search_reads(&BTreeSet::from([READ_SCOPE, WORK_SCOPE]), &member, "x");
+        let (reads, _) = search_reads(
+            &BTreeSet::from([READ_SCOPE, WORK_SCOPE]),
+            &member,
+            &all_open(),
+            "x",
+            None,
+        );
         for r in &reads {
             assert_eq!(needs(&r.lookup, &r.input).unwrap().0, WORK_SCOPE);
         }
@@ -1772,7 +1961,7 @@ mod tests {
             caps: Default::default(),
             custom: None,
         };
-        let (reads, w2) = search_reads(&all_scopes(), &none, "x");
+        let (reads, w2) = search_reads(&all_scopes(), &none, &all_open(), "x", None);
         assert!(!reads.iter().any(|r| r.lookup == chat_work::RUNS));
         assert!(
             w2.kinds.contains(&"runs") && w2.kinds.contains(&"tickets"),
@@ -1782,15 +1971,55 @@ mod tests {
         assert!(w.kinds.is_empty() || !w.kinds.contains(&"runs"));
     }
 
+    /// Each base searches on its own, and a base closed to the person (its
+    /// audience, or paused) is never read: it is named as not open, and
+    /// nothing from it comes back.
+    #[test]
+    fn each_base_searches_alone_and_a_closed_one_gives_nothing() {
+        let admin = Holder::builtin("admin");
+        for b in lookups::BASES.iter() {
+            let (reads, _) =
+                search_reads(&all_scopes(), &admin, &all_open(), "orders", Some(b.key));
+            assert!(!reads.is_empty(), "{} has nothing to search", b.key);
+            for r in &reads {
+                assert_eq!(base_of_read(r).unwrap().key, b.key, "{}", r.lookup);
+            }
+        }
+        let mut open = all_open();
+        open.insert(lookups::INFRA, Decision::Audience);
+        let (reads, w) = search_reads(&all_scopes(), &admin, &open, "orders", None);
+        assert!(reads
+            .iter()
+            .all(|r| base_of_read(r).unwrap().key != lookups::INFRA));
+        assert!(w.kinds.contains(&"Infrastructure"), "{:?}", w.kinds);
+        let (reads, w) = search_reads(&all_scopes(), &admin, &open, "orders", Some(lookups::INFRA));
+        assert!(reads.is_empty());
+        assert_eq!(w.kinds, ["Infrastructure"]);
+        // A typed lookup and a fetch into it are refused with the reason.
+        let read = read_of(INFRA_RESOURCES, &json!({ "query": "orders" })).unwrap();
+        match decide_open(&all_scopes(), &admin, &open, &read) {
+            Err(Fail::Message(m)) => {
+                assert!(m.starts_with("Infrastructure isn't open to you"), "{m}")
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(decide_open(&all_scopes(), &admin, &all_open(), &read).is_ok());
+        // Without the scope, the client is asked to step up.
+        assert_eq!(
+            decide_open(&BTreeSet::from([READ_SCOPE]), &admin, &all_open(), &read),
+            Err(Fail::Scope(INFRA_SCOPE))
+        );
+    }
+
     #[test]
     fn withheld_counts_never_name_what() {
         let mut w = Withheld::default();
-        w.by_base.insert("Team knowledge", 3);
+        w.by_base.insert("Knowledge", 3);
         w.by_base.insert("Security", 1);
         w.kinds.push("security findings");
         let v = w.to_json();
         assert_eq!(v["count"], 4);
-        assert_eq!(v["by_base"]["Team knowledge"], 3);
+        assert_eq!(v["by_base"]["Knowledge"], 3);
         assert_eq!(v["reason"], "access");
         let text = v.to_string();
         assert!(!text.contains("title") && !text.contains("passage"));
@@ -1868,7 +2097,7 @@ mod tests {
             assert!(r["base"].is_string() && r["updated_at"].is_string());
         }
         assert_eq!(a["results"][0]["base"], "Work");
-        assert_eq!(a["results"][2]["base"], "Code and docs");
+        assert_eq!(a["results"][2]["base"], "Code");
         assert_eq!(a["results"][1]["url"], "https://app.x/runs/detail?id=01RUN");
         assert_eq!(
             found[0].links["jira"],
@@ -1963,10 +2192,7 @@ mod tests {
             READ_FILE,
             &json!({ "repo": "acme/web", "path": "src/a.rs" }),
         );
-        assert_eq!(
-            d,
-            "read_file: Code and docs / code, repo acme/web, path src/a.rs"
-        );
+        assert_eq!(d, "read_file: Code / code, repo acme/web, path src/a.rs");
         let d = audit_detail(
             FIND_FINDINGS,
             &json!({ "kind": "security", "query": "openssl" }),
@@ -1988,7 +2214,7 @@ mod tests {
         let r = result_detail(SEARCH, &a);
         assert_eq!(
             r,
-            "search: 4 results (Code and docs 1, Work 3), 2 withheld for access: WEB-42; Run:; acme/web:src/pay.ts; #318"
+            "search: 4 results (Code 1, Work 3), 2 withheld for access: WEB-42; Run:; acme/web:src/pay.ts; #318"
         );
         assert!(!r.contains("Ignore your instructions"));
     }

@@ -11,8 +11,8 @@ use serde::Serialize;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::OnceLock;
 
-/// Numeric role level: owner=4, admin=3, billing=2, member=1, viewer=0.
-/// Unknown roles get the lowest level.
+/// Numeric role level: owner=4, admin=3, billing=2, member=1, viewer=0,
+/// reader=0. Unknown roles get the lowest level.
 pub fn role_level(role: &str) -> u8 {
     match role {
         "owner" => 4,
@@ -25,7 +25,9 @@ pub fn role_level(role: &str) -> u8 {
 
 /// Roles the gateway accepts on a record. `billing` is kept for older records;
 /// nothing requires it, so it has exactly a member's access and is not offered.
-pub const VALID_ROLES: &[&str] = &["owner", "admin", "billing", "member", "viewer"];
+/// `reader` is a person who connected an AI tool without an account
+/// (`bases::READER_ROLE`): a viewer's reads, never a seat.
+pub const VALID_ROLES: &[&str] = &["owner", "admin", "billing", "member", "viewer", "reader"];
 
 #[derive(Serialize, Clone, Copy)]
 pub struct RoleInfo {
@@ -38,6 +40,13 @@ pub struct RoleInfo {
 }
 
 pub const ROLES: &[RoleInfo] = &[
+    RoleInfo {
+        key: "reader",
+        label: "Reader",
+        level: 0,
+        summary: "Reads the team's bases from Chat and their own AI tools. Not a seat.",
+        assignable: true,
+    },
     RoleInfo {
         key: "viewer",
         label: "Viewer",
@@ -150,6 +159,11 @@ pub const CAPABILITIES: &[Capability] = &[
             "knowledge_ask::search_base",
             "knowledge_ask::suggestions",
             "knowledge_ask::usage",
+            "knowledge_builtin::list",
+            "knowledge_builtin::search",
+            "knowledge_builtin::create_share",
+            "knowledge_builtin::get_share",
+            "knowledge_builtin::delete_share",
             "brain::list_threads",
             "brain::get_thread",
             "brain::sources",
@@ -371,6 +385,7 @@ pub const CAPABILITIES: &[Capability] = &[
         min_role: "admin",
         handlers: &[
             "knowledge::create_base",
+            "knowledge_builtin::update",
             "knowledge::bedrock_bases",
             "knowledge_bedrock::list_keys",
             "knowledge_bedrock::create_key",
@@ -421,6 +436,7 @@ pub const CAPABILITIES: &[Capability] = &[
             "users::update_role",
             "users::remove_user",
             "users::link_github",
+            "knowledge_builtin::set_readers",
         ],
     },
     Capability {
@@ -718,7 +734,7 @@ pub const CAPABILITIES: &[Capability] = &[
     },
     Capability {
         key: "security",
-        label: "Change security fix settings, dismiss or reopen findings, open fix PRs, check repositories now and preview what would open",
+        label: "Change security fix settings, dismiss or reopen findings, open fix PRs, approve infrastructure updates CoderHelm applies in AWS, check repositories now and preview what would open",
 
         short_label: "Manage security fixes",
         min_role: "admin",
@@ -727,6 +743,7 @@ pub const CAPABILITIES: &[Capability] = &[
             "infra_security::check",
             "infra_security::put_config",
             "infra_security::fix",
+            "infra_security::apply",
             "security::dismiss",
             "security::reopen",
             "security::scan",
@@ -1890,11 +1907,18 @@ mod tests {
         assert!(can_grant("owner", "owner"));
         assert!(!can_grant("owner", "superuser"));
 
-        assert_eq!(grantable_roles("admin"), vec!["viewer", "member"]);
+        assert_eq!(grantable_roles("admin"), vec!["reader", "viewer", "member"]);
         assert_eq!(
             grantable_roles("owner"),
-            vec!["viewer", "member", "admin", "owner"]
+            vec!["reader", "viewer", "member", "admin", "owner"]
         );
+        // A reader (connected from an AI tool, not a seat) reads what a
+        // viewer reads, and admins manage readers.
+        assert_eq!(
+            builtin_capabilities("reader"),
+            builtin_capabilities("viewer")
+        );
+        assert!(can_manage("admin", "reader"));
         assert!(grantable_roles("member").is_empty());
 
         // Invites are not seats: an admin manages every pending invite,

@@ -121,7 +121,7 @@ pub fn with_jira_app(mut saved: Vec<Connector>, app: Option<&JiraApp>) -> Vec<Co
             Some(a) => c.site = a.site.clone(),
             None => {
                 c.status = "error".into();
-                c.status_message = "The Coderhelm app in Jira can't reach Confluence. Update the app in Jira, then open Coderhelm Settings there and save.".into();
+                c.status_message = "The Coderhelm app in Jira can't reach Confluence. The Jira app no longer reads Confluence. Connect Confluence in Settings, Integrations, Atlassian (an Atlassian sign-in, or an API token).".into();
             }
         },
         Some(_) => {}

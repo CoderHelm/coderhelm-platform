@@ -13,10 +13,12 @@
 //!   with the diagnosis on its ticket (its PR card carries the incident);
 //! - what's left is only a person's (a secret outside the code, a pipeline
 //!   CoderHelm can only read): one card says what was found and what is left;
-//! - the application code: its repo is worked out ([`common::log_repo`]);
+//! - the application code: its repo is traced ([`common::log_repo`]);
 //!   decisive evidence starts the run and saves the repo for the log group as
-//!   learned, so it is never asked again; genuinely split evidence asks once
-//!   per log group.
+//!   learned, so it is never asked again; split or thin evidence still starts
+//!   the run on the best guess and posts one card saying so, with the other
+//!   repos and a way to move it ([`common::log_repo::choose`]); only a log
+//!   group nothing ties to any repo asks, once.
 //!
 //! A finding that doesn't start records why, and the Logs page shows it. Off
 //! by default: nothing runs for a team that never turned it on.
@@ -581,7 +583,8 @@ async fn record(
     now: DateTime<Utc>,
     report: &mut Report,
 ) {
-    let again = matches!(skip, Skip::Watching | Skip::RepoPending) && f.auto_status == "waiting";
+    let again = matches!(skip, Skip::Watching | Skip::RepoPending | Skip::Usual(_))
+        && f.auto_status == "waiting";
     if !skip.recorded() || again {
         return;
     }
@@ -632,6 +635,23 @@ async fn act(
         return;
     };
 
+    // At its usual rate (the error happens most days and this is no more):
+    // counted on the findings, nobody is told and no fix starts. Looked at
+    // again next sweep, so a rise is caught.
+    if inc.diagnosis.usual && plan(&inc.diagnosis) == Plan::Code {
+        let reason = inc
+            .diagnosis
+            .decision
+            .trim_start_matches("Noise: ")
+            .to_string();
+        for m in &inc.members {
+            if let Some((f, _)) = member(m) {
+                record(state, team_id, f, &Skip::Usual(reason.clone()), now, report).await;
+            }
+        }
+        return;
+    }
+
     let mut action: Option<Action> = None;
     let mut started_by: Option<String> = None;
     let mut starter_skip: Option<Skip> = None;
@@ -640,56 +660,90 @@ async fn act(
         Plan::Watching => action = Some(Action::Watching),
         Plan::ForAPerson(why, reason) => action = Some(Action::ForAPerson { why, reason }),
         Plan::FixIn(p) => {
-            match start_fix(state, team_id, cfg, inc, titles, starter, &p.repo, now).await {
+            let started = Action::Started {
+                repo: p.repo.clone(),
+                why: String::new(),
+            };
+            let note = started.sentence(&inc.diagnosis);
+            match start_fix(
+                state, team_id, cfg, inc, titles, starter, &p.repo, &note, now,
+            )
+            .await
+            {
                 Ok(()) => {
                     started_by = Some(starter.rec_id.clone());
-                    action = Some(Action::Started { repo: p.repo });
+                    action = Some(started);
                 }
                 Err(skip) => starter_skip = Some(skip),
             }
         }
         Plan::Code => {
-            let repo = match screen {
-                Ok(Some(repo)) => Ok(repo.clone()),
+            use common::log_repo::Choice;
+            // What a senior engineer would do: trace the repo, start there,
+            // and say which and why. A split call still starts on the best
+            // guess, with a way to move it; only no repo at all asks.
+            let (choice, r) = match screen {
+                Ok(Some(repo)) => (
+                    Choice::Sure(repo.clone()),
+                    common::log_repo::Resolution {
+                        repo: Some(repo.clone()),
+                        source: common::log_repo::Source::Saved,
+                        ..Default::default()
+                    },
+                ),
                 _ => {
                     let r = resolve_repo(state, team_id, starter, cfg, all).await;
-                    match r.repo.clone() {
-                        Some(repo) if r.is_sure() => {
-                            info!(team_id, rec_id = %starter.rec_id, repo = %repo, reason = %r.reason, "Repo worked out for an automatic fix");
-                            if r.source == common::log_repo::Source::Resolved {
-                                learn(
-                                    state,
-                                    team_id,
-                                    &starter.source_log_group,
-                                    &repo,
-                                    &r.reason,
-                                    now,
-                                )
-                                .await;
-                            }
-                            Ok(repo)
-                        }
-                        guess => Err((r.clone(), guess)),
-                    }
+                    (common::log_repo::choose(&r), r)
                 }
             };
-            match repo {
-                Ok(repo) => {
-                    match start_fix(state, team_id, cfg, inc, titles, starter, &repo, now).await {
-                        Ok(()) => {
-                            started_by = Some(starter.rec_id.clone());
-                            action = Some(Action::Started { repo });
-                        }
-                        Err(skip) => starter_skip = Some(skip),
+            let planned = match &choice {
+                Choice::Sure(repo) => {
+                    info!(team_id, rec_id = %starter.rec_id, repo = %repo, reason = %r.reason, "Repo worked out for an automatic fix");
+                    if r.source == common::log_repo::Source::Resolved {
+                        learn(
+                            state,
+                            team_id,
+                            &starter.source_log_group,
+                            repo,
+                            &r.reason,
+                            now,
+                        )
+                        .await;
                     }
+                    Some(Action::Started {
+                        repo: repo.clone(),
+                        why: r.why_line(),
+                    })
+                }
+                Choice::Guess { repo, others } => {
+                    info!(team_id, rec_id = %starter.rec_id, repo = %repo, reason = %r.reason, "Fix starts on the best guess for the repo");
+                    // The choice stays on the finding, so its row can move
+                    // the fix in one click.
+                    if let Err(e) = lf::record_repo_ask(
+                        &state.dynamo,
+                        &state.config.aws_insights_table_name,
+                        team_id,
+                        &starter.rec_id,
+                        &common::log_repo::ask_json(&r),
+                    )
+                    .await
+                    {
+                        warn!(team_id, rec_id = %starter.rec_id, error = %e, "Could not keep the repo choice on the finding");
+                    }
+                    Some(Action::Guessed {
+                        repo: repo.clone(),
+                        others: others.clone(),
+                        why: r.why_line(),
+                    })
                 }
                 // The evidence couldn't be weighed (the model wasn't
                 // reachable): that is CoderHelm's to retry, not a question
                 // for a person. The next sweep weighs it again.
-                Err((r, _)) if r.unweighed => starter_skip = Some(Skip::RepoPending),
-                Err((r, guess)) => {
-                    // The question stays on the finding, so its row offers
-                    // the choice in one click.
+                Choice::Wait => {
+                    starter_skip = Some(Skip::RepoPending);
+                    None
+                }
+                Choice::Ask => {
                     if let Err(e) = lf::record_repo_ask(
                         &state.dynamo,
                         &state.config.aws_insights_table_name,
@@ -701,8 +755,8 @@ async fn act(
                     {
                         warn!(team_id, rec_id = %starter.rec_id, error = %e, "Could not keep the repo question on the finding");
                     }
-                    // Genuinely split: ask once for the log group, never per
-                    // finding.
+                    // Nothing to start in: ask once for the log group, never
+                    // per finding.
                     if lf::claim_repo_ask(
                         &state.dynamo,
                         &state.config.settings_table_name,
@@ -714,12 +768,28 @@ async fn act(
                     .await
                     {
                         action = Some(Action::WhichRepo {
-                            guess: guess.clone(),
+                            guess: None,
                             candidates: r.candidates.iter().map(|c| c.repo.clone()).collect(),
                             reason: r.reason.clone(),
                         });
                     }
-                    starter_skip = Some(Skip::RepoUnsure(guess.unwrap_or_default()));
+                    starter_skip = Some(Skip::RepoUnsure(String::new()));
+                    None
+                }
+            };
+            if let Some(a) = planned {
+                let repo = match &a {
+                    Action::Started { repo, .. } | Action::Guessed { repo, .. } => repo.clone(),
+                    _ => String::new(),
+                };
+                let note = a.sentence(&inc.diagnosis);
+                match start_fix(state, team_id, cfg, inc, titles, starter, &repo, &note, now).await
+                {
+                    Ok(()) => {
+                        started_by = Some(starter.rec_id.clone());
+                        action = Some(a);
+                    }
+                    Err(skip) => starter_skip = Some(skip),
                 }
             }
         }
@@ -771,7 +841,9 @@ async fn act(
                 (Some(Action::Recovered), _) => Skip::Recovered(inc.diagnosis.recovered_at.clone()),
                 (Some(Action::Watching), _) => Skip::Watching,
                 (Some(Action::ForAPerson { reason, .. }), _) => Skip::ForAPerson(reason.clone()),
-                (Some(Action::Started { .. }), _) => Skip::InIncident(lead_title.clone()),
+                (Some(Action::Started { .. } | Action::Guessed { .. }), _) => {
+                    Skip::InIncident(lead_title.clone())
+                }
                 (_, Err(s)) => s.clone(),
                 (_, Ok(_)) => Skip::InIncident(lead_title.clone()),
             }
@@ -780,13 +852,15 @@ async fn act(
     }
 
     // One card. A started fix posts when its pull request opens (its card
-    // carries the incident), so nothing posts now.
+    // carries the incident), so nothing posts now; one started on a best
+    // guess says so now, with a way to move it.
     if let Some(a) = &action {
         let outcome = match a {
             Action::Recovered => Some("recovered"),
             Action::Watching => Some("watching"),
             Action::ForAPerson { .. } => Some("person"),
             Action::WhichRepo { .. } => Some("repo"),
+            Action::Guessed { .. } => Some("guess"),
             Action::Started { .. } => None,
         };
         if let Some(outcome) = outcome {
@@ -833,13 +907,15 @@ async fn start_fix(
     titles: &[(String, String)],
     f: &Finding,
     repo: &str,
+    note: &str,
     now: DateTime<Utc>,
 ) -> Result<(), Skip> {
     let lines = samples(state, team_id, f).await;
-    // The ticket reads the incident from the finding.
+    // The ticket reads the incident from the finding, with which repo the
+    // fix starts in and why.
     let mut f = f.clone();
     f.incident_id = inc.id.clone();
-    f.incident = inc.to_json(titles, "").to_string();
+    f.incident = inc.to_json(titles, note).to_string();
     let env = WorkerEnv {
         state,
         finding: &f,

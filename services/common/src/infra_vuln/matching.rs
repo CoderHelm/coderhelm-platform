@@ -34,8 +34,31 @@ use crate::security_fixes::Tier;
 #[serde(rename_all = "snake_case")]
 pub enum FixKind {
     Pr,
+    /// CoderHelm applies AWS's pending action itself, after one person's
+    /// approval ([`ApplyPlan`]).
+    Apply,
     Runbook,
     Aws,
+}
+
+/// The IAM action CoderHelm needs to apply a pending RDS or Aurora action.
+pub const APPLY_PERMISSION: &str = "rds:ApplyPendingMaintenanceAction";
+
+/// How CoderHelm applies a pending action in AWS once a person approves:
+/// `apply-pending-maintenance-action` on each ARN, in order.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApplyPlan {
+    /// AWS's name for the action (`os-upgrade`, `system-update`,
+    /// `db-upgrade`, `serverless-platform-version-update`).
+    pub action: String,
+    /// Every ARN, in the order to apply it.
+    pub arns: Vec<String>,
+    /// The IAM action the team's role needs.
+    pub permission: String,
+    /// `next-maintenance` unless the person picks `immediate`.
+    pub default_opt_in: String,
+    /// What applying it does to the database, in a line.
+    pub effect: String,
 }
 
 /// One advisory or bulletin behind a finding.
@@ -79,9 +102,13 @@ pub struct Fix {
     /// What a pending action means on the ARN it is on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub meaning: Option<Meaning>,
-    /// The whole runbook, when a person applies the update in AWS.
+    /// The whole runbook, when a person applies the update in AWS (and
+    /// behind an apply, for when the role may not).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runbook: Option<Runbook>,
+    /// What CoderHelm applies after one approval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apply: Option<ApplyPlan>,
     /// What a pull request must say and check, for the tool that defines
     /// the resource.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -922,10 +949,18 @@ fn update(r: &Resource, p: &Pending, feeds: &Feeds, out: &mut Vec<InfraFinding>)
                     &v,
                     feeds.today,
                 ));
-                format!(
+                let mut d = format!(
                     "A pull request: an engine version change has a code equivalent, and the code that defines this resource was found. {}",
                     super::locate::describe(l)
-                )
+                );
+                if let Some(e) = l.edit.as_ref().filter(|e| !e.shared.is_empty()) {
+                    d.push_str(&format!(
+                        " The value is shared ({}): the pull request raises it for {} only, through that environment's own input, so no other environment changes by surprise.",
+                        e.shared,
+                        if l.environment.is_empty() { "this resource" } else { l.environment.as_str() }
+                    ));
+                }
+                d
             }
             _ => {
                 code_note = "If this resource is defined in code, raise its pinned version there to the new version once this is applied. A version pinned behind the live one makes the next apply a downgrade attempt, which the service refuses.".into();
@@ -934,10 +969,35 @@ fn update(r: &Resource, p: &Pending, feeds: &Feeds, out: &mut Vec<InfraFinding>)
         }
     };
 
+    // A step in AWS with no code change: CoderHelm applies it itself after
+    // one approval, through AWS's own pending-maintenance call. An engine
+    // upgrade whose code CoderHelm is unsure of stays a runbook (applying
+    // it in AWS would leave that code pinned behind the live version).
+    let rds = matches!(r.kind, Kind::RdsCluster | Kind::RdsInstance);
+    let unsure_code = m.in_code() && located.is_some() && sure.is_none();
+    let mut decision = decision;
+    let mut apply = None;
+    if rds && kind == FixKind::Runbook && m != Meaning::Unknown && !unsure_code {
+        kind = FixKind::Apply;
+        let why = decision
+            .strip_prefix("A runbook: ")
+            .map(str::to_string)
+            .unwrap_or(decision.clone());
+        decision = format!(
+            "CoderHelm applies this in AWS after one approval (apply-pending-maintenance-action, in the next maintenance window unless you pick now), non-production first, and checks the result on the next read. {why}"
+        );
+        apply = Some(apply_plan(m, &p));
+    }
+
     // Built for a pull request too: if the replacement guard gives up on
     // the code change, the finding falls back to it.
     let rb = Some(runbook::build(r, &p, feeds.today));
-    let (cli, console) = match rb.as_ref().filter(|_| kind == FixKind::Runbook) {
+    // An apply keeps the commands too: they are the runbook a person follows
+    // when the role may not apply it.
+    let (cli, console) = match rb
+        .as_ref()
+        .filter(|_| matches!(kind, FixKind::Runbook | FixKind::Apply))
+    {
         Some(rb) => (
             rb.steps
                 .iter()
@@ -956,6 +1016,21 @@ fn update(r: &Resource, p: &Pending, feeds: &Feeds, out: &mut Vec<InfraFinding>)
     } else {
         format!("{} to {}", m.label(), p.target)
     };
+    // The cluster-level action that stands for the same update on each
+    // instance says so in its title.
+    let members = r
+        .facts
+        .get("members")
+        .map(|m| m.split(',').filter(|x| !x.is_empty()).count())
+        .unwrap_or(0);
+    let what = if p.merged.iter().any(|x| x.starts_with("also listed")) && members > 0 {
+        format!(
+            "{what} (the cluster and its {members} instance{})",
+            if members == 1 { "" } else { "s" }
+        )
+    } else {
+        what
+    };
     let summary = match (kind, &sure) {
         (FixKind::Pr, Some(l)) => {
             let e = l.edit.as_ref();
@@ -967,6 +1042,10 @@ fn update(r: &Resource, p: &Pending, feeds: &Feeds, out: &mut Vec<InfraFinding>)
                 e.map(|e| e.file.as_str()).unwrap_or(l.file.as_str())
             )
         }
+        (FixKind::Apply, _) => format!(
+            "CoderHelm applies the {what} in AWS after your approval (`{}`)",
+            p.kind
+        ),
         _ => format!("Apply the {what} in AWS (`{}`)", p.kind),
     };
     let mut order = Vec::new();
@@ -989,6 +1068,7 @@ fn update(r: &Resource, p: &Pending, feeds: &Feeds, out: &mut Vec<InfraFinding>)
         decision,
         meaning: Some(m),
         runbook: rb,
+        apply,
         notes,
         code_note,
         order,
@@ -1055,7 +1135,61 @@ fn health(r: &Resource, p: &Pending, out: &mut Vec<InfraFinding>) {
     ));
 }
 
+fn apply_plan(m: Meaning, p: &Pending) -> ApplyPlan {
+    let effect = match m {
+        Meaning::OsUpdate => "Each instance restarts while its operating system is patched; on a cluster, readers go first and the writer last (a short failover).".to_string(),
+        Meaning::EnginePatch => format!("The engine is patched in place to {}: each instance restarts briefly.", p.target),
+        Meaning::EngineUpgrade => format!("The engine moves to {}: each instance restarts, and a major version takes longer.", if p.target.is_empty() { "the version AWS lists" } else { p.target.as_str() }),
+        Meaning::ServerlessPlatform => "The serverless instances move to the new platform version: connections pause briefly while each one moves.".to_string(),
+        Meaning::HardwareMaintenance => "AWS moves the instance to new hardware: it restarts.".to_string(),
+        Meaning::CertificateRotation => "The server certificate is rotated: clients that pin the old certificate authority must trust the new one first.".to_string(),
+        _ => String::new(),
+    };
+    ApplyPlan {
+        action: p.kind.clone(),
+        arns: p.arns.clone(),
+        permission: APPLY_PERMISSION.into(),
+        default_opt_in: "next-maintenance".into(),
+        effect,
+    }
+}
+
+/// A CVE that both an engine patch and an engine upgrade on the same
+/// database fix stands on the upgrade when the upgrade is a pull request:
+/// the code change fixes it for good (a patch applied in AWS alone leaves
+/// the code pinned behind). The patch keeps its row, without the CVE, and
+/// says where it went.
+fn cves_to_the_pull_request(found: &mut [InfraFinding]) {
+    let prs: Vec<(String, Vec<String>, String)> = found
+        .iter()
+        .filter(|f| {
+            f.fix.meaning == Some(Meaning::EngineUpgrade) && f.fix.kind == Some(FixKind::Pr)
+        })
+        .map(|f| (f.group.clone(), f.cves.clone(), f.fix.to.clone()))
+        .collect();
+    for f in found
+        .iter_mut()
+        .filter(|f| f.fix.meaning == Some(Meaning::EnginePatch))
+    {
+        let Some((_, cves, to)) = prs.iter().find(|(g, cves, _)| {
+            *g == f.group && !f.cves.is_empty() && f.cves.iter().all(|c| cves.contains(c))
+        }) else {
+            continue;
+        };
+        f.fix.advisory_note = format!(
+            "{} {} also fixed by the engine upgrade to {to}, whose pull request carries {}: that change fixes it in the code too.",
+            f.cves.join(", "),
+            if f.cves.len() == 1 { "is" } else { "are" },
+            if cves.len() == 1 { "it" } else { "them" }
+        );
+        f.cves.clear();
+        f.sources.retain(|s| s.kind != "bulletin");
+        f.kev = false;
+    }
+}
+
 fn match_managed(r: &Resource, feeds: &Feeds, out: &mut Vec<InfraFinding>) {
+    let start = out.len();
     for p in &r.pending {
         match meaning(r, p) {
             Meaning::Health => health(r, p, out),
@@ -1063,7 +1197,10 @@ fn match_managed(r: &Resource, feeds: &Feeds, out: &mut Vec<InfraFinding>) {
             | Meaning::EnginePatch
             | Meaning::EngineUpgrade
             | Meaning::ServiceUpdate
-            | Meaning::ServiceSoftware => update(r, p, feeds, out),
+            | Meaning::ServiceSoftware
+            | Meaning::ServerlessPlatform
+            | Meaning::HardwareMaintenance
+            | Meaning::CertificateRotation => update(r, p, feeds, out),
             // An update action AWS does not document for this ARN (a
             // cluster-level `system-update` on an engine other than Aurora
             // PostgreSQL): shown, named as AWS names it, with no meaning
@@ -1077,12 +1214,10 @@ fn match_managed(r: &Resource, feeds: &Feeds, out: &mut Vec<InfraFinding>) {
             {
                 update(r, p, feeds, out)
             }
-            // Hardware maintenance, certificate rotation and the
-            // serverless platform version are not security updates
-            // CoderHelm describes: they are not made into findings.
             _ => {}
         }
     }
+    cves_to_the_pull_request(&mut out[start..]);
 }
 
 /// The same resource in more than one environment: the non-production
@@ -1416,15 +1551,17 @@ mod tests {
     }
 
     #[test]
-    fn the_2026_160_example_gives_two_prs_one_runbook_and_aws_rows_for_fargate_and_lambda() {
+    fn the_2026_160_example_gives_two_prs_one_approved_apply_and_aws_rows_for_fargate_and_lambda() {
         let f = example();
         let prs: Vec<&InfraFinding> = f
             .iter()
             .filter(|x| x.fix.kind == Some(FixKind::Pr))
             .collect();
+        // The operating system update has no code change: CoderHelm applies
+        // it after an approval, with the runbook behind it.
         let runbooks: Vec<&InfraFinding> = f
             .iter()
-            .filter(|x| x.fix.kind == Some(FixKind::Runbook))
+            .filter(|x| x.fix.kind == Some(FixKind::Apply))
             .collect();
         let aws: Vec<&InfraFinding> = f
             .iter()
@@ -1496,8 +1633,8 @@ mod tests {
             "{}",
             db.fix.advisory_note
         );
-        // The cluster is in the team's Terraform, and it is still a
-        // runbook, because an OS update cannot be expressed in code.
+        // The cluster is in the team's Terraform, and it is still applied in
+        // AWS, because an OS update cannot be expressed in code.
         assert!(
             db.fix.decision.contains("cannot be expressed in code"),
             "{}",
@@ -1510,6 +1647,8 @@ mod tests {
         );
         let rb = db.fix.runbook.as_ref().expect("a full runbook");
         assert!(!rb.prechecks.is_empty() && !rb.backup.is_empty() && !rb.rollback.is_empty());
+        let plan = db.fix.apply.as_ref().expect("what CoderHelm applies");
+        assert_eq!(plan.permission, APPLY_PERMISSION);
 
         // AWS-managed rows, never counted as open.
         let fargate = aws
@@ -1913,11 +2052,12 @@ mod tests {
         ));
         assert!(x.fix.code_note.contains("raise its pinned version"));
 
-        // Not in any repository: a runbook.
+        // Not in any repository: applied in AWS after an approval, saying
+        // where code may need raising.
         let mut nowhere = r.clone();
         nowhere.defined_in = None;
         let x = &one(nowhere, &[])[0];
-        assert_eq!(x.fix.kind, Some(FixKind::Runbook));
+        assert_eq!(x.fix.kind, Some(FixKind::Apply));
         assert!(x
             .fix
             .decision
@@ -1932,7 +2072,7 @@ mod tests {
             inventory::Confidence::High,
         ));
         let x = &one(prefix, &[])[0];
-        assert_eq!(x.fix.kind, Some(FixKind::Runbook));
+        assert_eq!(x.fix.kind, Some(FixKind::Apply));
         assert!(
             x.fix.decision.contains("already allows version 8.0.40"),
             "{}",
@@ -1952,7 +2092,7 @@ mod tests {
         }
         unpinned.defined_in = Some(l);
         let x = &one(unpinned, &[])[0];
-        assert_eq!(x.fix.kind, Some(FixKind::Runbook));
+        assert_eq!(x.fix.kind, Some(FixKind::Apply));
         assert!(
             x.fix.decision.contains("does not pin a version"),
             "{}",
@@ -1968,12 +2108,12 @@ mod tests {
         );
         vague.defined_in = r.defined_in.clone();
         let x = &one(vague, &[])[0];
-        assert_eq!(x.fix.kind, Some(FixKind::Runbook));
+        assert_eq!(x.fix.kind, Some(FixKind::Apply));
         assert!(x.fix.decision.contains("does not name the version"));
     }
 
     #[test]
-    fn what_cannot_be_expressed_in_code_stays_a_runbook_even_when_the_resource_is_in_code() {
+    fn what_cannot_be_expressed_in_code_is_applied_in_aws_even_when_the_resource_is_in_code() {
         for (engine, version, action, description, meaning) in [
             (
                 "postgres",
@@ -2008,7 +2148,8 @@ mod tests {
             assert_eq!(f.len(), 1, "{action} on {engine}");
             let x = &f[0];
             assert_eq!(x.fix.meaning, Some(meaning));
-            assert_eq!(x.fix.kind, Some(FixKind::Runbook), "{action} on {engine}");
+            assert_eq!(x.fix.kind, Some(FixKind::Apply), "{action} on {engine}");
+            assert!(x.fix.apply.is_some(), "{action} on {engine}");
             assert!(
                 x.fix.decision.contains("cannot be expressed in code"),
                 "{}",
@@ -2024,9 +2165,9 @@ mod tests {
             assert!(x.fix.notes.is_none());
             assert!(x.cves.is_empty());
         }
-        // Hardware maintenance is not made into a finding. An update
-        // action AWS does not document for this ARN is shown under AWS's
-        // own name, with no meaning made up for it.
+        // Hardware maintenance is an item of its own, applied after an
+        // approval. An update action AWS does not document for this ARN is
+        // shown under AWS's own name, with no meaning made up for it.
         let r = database(
             "orders",
             "aurora-mysql",
@@ -2036,8 +2177,14 @@ mod tests {
                 ("system-update", "something", "2026-12-01"),
             ],
         );
-        let f = one(r, &[]);
-        assert_eq!(f.len(), 1);
+        let mut f = one(r, &[]);
+        assert_eq!(f.len(), 2);
+        let hw = f
+            .iter()
+            .find(|x| x.fix.meaning == Some(Meaning::HardwareMaintenance))
+            .expect("hardware maintenance");
+        assert_eq!(hw.fix.kind, Some(FixKind::Apply));
+        f.retain(|x| x.fix.meaning == Some(Meaning::Unknown));
         assert_eq!(f[0].fix.meaning, Some(Meaning::Unknown));
         assert!(
             f[0].title.contains("AWS action `system-update` pending"),

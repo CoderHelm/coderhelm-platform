@@ -27,21 +27,6 @@ async function siteUrl() {
 }
 
 /**
- * Whether this site has Confluence the app can read. Only then does the
- * Confluence trigger get registered, so CoderHelm shows Confluence as
- * connected only on sites that have it.
- */
-async function hasConfluence() {
-  try {
-    const res = await api.asApp().requestConfluence(route`/wiki/api/v2/spaces?limit=1`);
-    return res.ok;
-  } catch (e) {
-    console.log("Confluence isn't reachable on this site:", e);
-    return false;
-  }
-}
-
-/**
  * Sends every trigger URL to the gateway for `config` ({ teamId, forgeSecret }).
  * Returns { urlsRegistered, urlError? }.
  */
@@ -53,9 +38,12 @@ async function registerWithGateway(config) {
       list_projects_url: await webTrigger.getUrl("list-projects-trigger"),
       create_ticket_url: await webTrigger.getUrl("create-ticket-trigger"),
       add_comment_url: await webTrigger.getUrl("add-comment-trigger"),
-      publish_release_url: await webTrigger.getUrl("publish-release-trigger"),
+      // The app is Jira-only: Confluence (pages for agents, release notes)
+      // goes through the Atlassian connection in CoderHelm. Empty addresses
+      // tell CoderHelm this site's app no longer does either.
+      publish_release_url: "",
       get_issues_url: await webTrigger.getUrl("get-issues-trigger"),
-      confluence_trigger_url: (await hasConfluence()) ? await webTrigger.getUrl("confluence-trigger") : "",
+      confluence_trigger_url: "",
       site_url: await siteUrl(),
       // The version that registers: after an accepted update, CoderHelm
       // knows the site caught up at once.

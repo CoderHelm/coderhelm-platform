@@ -2742,12 +2742,12 @@ async fn run_once(
         &format!("PR #{}: {title}", msg.pr_number),
     )
     .await;
-    let instructions_block = format!(
-        "{}{org_block}{extra}{learning}{team_lessons}{}{}{}",
-        super::format_instructions_block(&repo_instructions),
-        reward.context,
-        reward.addendum,
-        repo_memory.text,
+    let instructions_block = review_instructions_block(
+        &format!(
+            "{}{org_block}{extra}{learning}{team_lessons}",
+            super::format_instructions_block(&repo_instructions)
+        ),
+        &format!("{}{}{}", reward.context, reward.addendum, repo_memory.text),
     );
     let critic_lessons = format!("{team_lessons}{}", reward.context);
     let changed = review_agent::changed_right_lines(&compare);
@@ -4991,6 +4991,21 @@ async fn feed_review_back_to_run(state: &WorkerState, msg: &ReviewMessage, revie
             warn!(pr = msg.pr_number, error = %e, "Failed to enqueue self-review feedback")
         }
     }
+}
+
+/// The review's instructions block: what holds for every pull request in the
+/// repository (its instruction files, the org's and team's rules, the
+/// lessons), then what was chosen for this one (examples by its files, the
+/// prompt variant, the memories recalled for it). The text is the two joined,
+/// unchanged; the marker between them lets the reviewer's system prompt be
+/// sent as two blocks, so the repository's part (with the tools before it) is
+/// cached once and read by the next review of any pull request in the
+/// repository instead of written again with every review.
+pub(crate) fn review_instructions_block(repo_wide: &str, this_pr: &str) -> String {
+    format!(
+        "{repo_wide}{}{this_pr}",
+        crate::agent::anthropic::SHARED_PREFIX_END
+    )
 }
 
 /// Build a "past feedback to learn from" block from this repo's recent review

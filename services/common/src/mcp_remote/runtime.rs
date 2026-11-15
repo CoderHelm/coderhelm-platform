@@ -28,8 +28,8 @@ use super::discovery::{self, OAuthPlan};
 use super::http::Http;
 use super::oauth::{self, Client, ClientAuth, Registration, TokenSet};
 use super::store::{
-    AuthKind, LogEntry, Owner, PendingAuth, ServerRecord, Status, Store, TokenRecord,
-    PENDING_TTL_SECS,
+    AuthKind, LogEntry, OAuthSettings, Owner, PendingAuth, ServerRecord, Status, Store,
+    TokenRecord, PENDING_TTL_SECS,
 };
 use super::tools;
 use crate::mcp_credentials::Cipher;
@@ -165,6 +165,49 @@ pub async fn detect(http: &dyn Http, url: &str) -> Result<Detected, String> {
         }
         Err(CallError::Forbidden(_)) => Ok(Detected::Header),
         Err(e) => Err(e.to_string()),
+    }
+}
+
+/// How long a server's sign-in metadata is trusted before a sign-in reads
+/// it again. Short: a vendor that moves its sign-in server (Atlassian
+/// moved from `mcp.atlassian.com/v1` to `auth.atlassian.com`) is followed
+/// within minutes, with no record to fix by hand.
+pub const DISCOVERY_TTL_SECS: i64 = 300;
+
+/// Whether a record's sign-in settings came from the server's own metadata
+/// (a remote MCP server), and so are read again before each sign-in. A
+/// provider's own API with addresses fixed in code (a knowledge source, a
+/// catalog server's app, the hybrid broker) is not.
+pub fn discovers(s: &ServerRecord) -> bool {
+    let Some(o) = &s.oauth else { return false };
+    s.auth == AuthKind::OAuth
+        && !(super::store::is_token_only(&s.catalog_id)
+            && o.registration == Registration::Manual.as_str())
+}
+
+/// The words for a sign-in page that is failing on the provider's side.
+pub fn provider_down(name: &str, status: u16) -> String {
+    format!(
+        "{name}'s sign-in page is failing on {name}'s side (HTTP {status}), so Coderhelm didn't send you there. Nothing on your side needs changing. Try again in a few minutes."
+    )
+}
+
+/// Asks the authorization page once before a person is sent to it. A `5xx`
+/// (or no answer) means the provider's sign-in is down: the person gets
+/// that in plain words instead of the provider's error page. Any other
+/// answer (a login page, a redirect, a `4xx` about the request) is left for
+/// the browser.
+pub async fn probe_authorize(http: &dyn Http, name: &str, url: &str) -> Result<(), String> {
+    let mut req = super::http::HttpRequest::get(url);
+    req.headers
+        .retain(|(k, _)| !k.eq_ignore_ascii_case("accept"));
+    req.headers.push(("Accept".into(), "text/html".into()));
+    match http.send(req).await {
+        Ok(r) if r.status >= 500 => Err(provider_down(name, r.status)),
+        Ok(_) | Err(super::http::HttpError::Refused(_)) => Ok(()),
+        Err(super::http::HttpError::Unreachable(m)) => Err(format!(
+            "Coderhelm couldn't reach {name}'s sign-in page ({m}). Try again in a few minutes."
+        )),
     }
 }
 
@@ -873,6 +916,125 @@ impl Runtime {
         return_to: &str,
     ) -> Result<String, String> {
         let flow = flow.unwrap_or_else(|| self.flow_of(s));
+        let discovered = discovers(s);
+        if discovered {
+            self.rediscover(s, false).await?;
+        }
+        match self
+            .start_once(
+                s,
+                owner,
+                user_sub,
+                user_email,
+                redirect_uri,
+                metadata_document_url,
+                flow,
+                return_to,
+                discovered,
+            )
+            .await
+        {
+            // Settings read a few minutes ago may already be out of date:
+            // read them again, once, and try with what the server says now.
+            Err(e) if discovered && !self.just_discovered(s) => {
+                if self.rediscover(s, true).await.is_err() {
+                    return Err(e);
+                }
+                self.start_once(
+                    s,
+                    owner,
+                    user_sub,
+                    user_email,
+                    redirect_uri,
+                    metadata_document_url,
+                    flow,
+                    return_to,
+                    discovered,
+                )
+                .await
+            }
+            r => r,
+        }
+    }
+
+    fn just_discovered(&self, s: &ServerRecord) -> bool {
+        s.oauth
+            .as_ref()
+            .is_some_and(|o| o.discovered_at >= self.now())
+    }
+
+    /// Reads a remote MCP server's sign-in settings again from its own
+    /// metadata (its `401`, its protected resource metadata, its
+    /// authorization server's metadata) unless they were read less than
+    /// [`DISCOVERY_TTL_SECS`] ago (`force` reads them anyway). A catalog
+    /// server the vendor moved gets the catalog's new address first. The
+    /// client Coderhelm has on the authorization server is kept while the
+    /// issuer is the same; a new issuer gets a new client. Saved when
+    /// anything changed. When the server can't be asked, the saved settings
+    /// stand (the sign-in itself then says what is wrong).
+    pub async fn rediscover(&self, s: &mut ServerRecord, force: bool) -> Result<(), String> {
+        let now = self.now();
+        let mut changed = false;
+        if let Some(url) = crate::mcp_catalog::moved_remote_url(&s.id, &s.catalog_id, &s.url) {
+            s.url = url.to_string();
+            changed = true;
+        }
+        let Some(old) = s.oauth.clone() else {
+            return Ok(());
+        };
+        let fresh = old.discovered_at > 0 && now - old.discovered_at < DISCOVERY_TTL_SECS;
+        if fresh && !force && !changed {
+            return Ok(());
+        }
+        let plan = match detect(self.http.as_ref(), &s.url).await {
+            Ok(Detected::OAuth(plan)) => plan,
+            Err(e) if changed => return Err(e),
+            other => {
+                let why = match other {
+                    Err(e) => e,
+                    Ok(_) => "the server didn't ask for a sign-in".into(),
+                };
+                tracing::warn!(team = %self.team, server = %s.id, error = %why, "Sign-in settings could not be read again; using the saved ones");
+                return Ok(());
+            }
+        };
+        let mut o = OAuthSettings::from_plan(&plan);
+        o.discovered_at = now;
+        if o.issuer == old.issuer {
+            o.client_id = old.client_id.clone();
+            o.client_auth = old.client_auth;
+            o.client_secret_sealed = old.client_secret_sealed.clone();
+            o.registration = old.registration.clone();
+        } else if old.registration == Registration::Manual.as_str() && !old.client_id.is_empty() {
+            return Err(format!(
+                "{} now signs in through {}, where the client id you pasted isn't registered. Register an OAuth app there and paste its client id.",
+                display_name(s),
+                o.issuer
+            ));
+        }
+        o.extra_authorize = old.extra_authorize.clone();
+        o.token_body_json = old.token_body_json;
+        o.refresh_endpoint = old.refresh_endpoint.clone();
+        if o.issuer != old.issuer || o.resource != old.resource {
+            tracing::info!(team = %self.team, server = %s.id, from = %old.issuer, to = %o.issuer, resource = %o.resource, "A server's sign-in moved; following it");
+        }
+        s.oauth = Some(o);
+        self.store.put_server(&self.team, s).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn start_once(
+        &self,
+        s: &mut ServerRecord,
+        owner: &Owner,
+        user_sub: &str,
+        user_email: &str,
+        redirect_uri: &str,
+        metadata_document_url: Option<&str>,
+        flow: oauth::Flow,
+        return_to: &str,
+        probe: bool,
+    ) -> Result<String, String> {
         let mut o = s
             .oauth
             .clone()
@@ -922,6 +1084,21 @@ impl Runtime {
         self.end_pending(&s.id, Some(owner), Some(user_sub)).await;
         let pkce = oauth::Pkce::new();
         let state = oauth::new_state_for(flow);
+        let url = oauth::authorize_url(
+            &o.auth_server(),
+            &o.client_id,
+            redirect_uri,
+            &pkce,
+            &state,
+            &scopes,
+            &o.resource,
+        )?;
+        let url = oauth::with_extra_params(&url, &o.extra_authorize)?;
+        // Nobody is sent to a sign-in page that is down; nothing is
+        // recorded for a sign-in that can't start.
+        if probe {
+            probe_authorize(self.http.as_ref(), &display_name(s), &url).await?;
+        }
         self.store
             .put_pending(
                 &self.team,
@@ -940,16 +1117,7 @@ impl Runtime {
                 },
             )
             .await?;
-        let url = oauth::authorize_url(
-            &o.auth_server(),
-            &o.client_id,
-            redirect_uri,
-            &pkce,
-            &state,
-            &scopes,
-            &o.resource,
-        )?;
-        oauth::with_extra_params(&url, &o.extra_authorize)
+        Ok(url)
     }
 
     /// Ends the team's sign-ins in progress for `server_id` (for one owner
@@ -2065,7 +2233,213 @@ mod tests {
             .await
             .unwrap();
         assert!(url.contains(&format!("client_id={}", urlencoding_like(doc))));
-        assert!(r.http.sent().is_empty(), "no registration request");
+        assert!(
+            r.http
+                .sent_to("https://auth.example.com/register")
+                .is_empty(),
+            "no registration request"
+        );
+    }
+
+    const PRM: &str = "https://mcp.example.com/.well-known/oauth-protected-resource/mcp";
+    const NEW_AS: &str = "https://login.example.net/t1";
+    const NEW_AUTHORIZE: &str = "https://login.example.net/authorize";
+
+    /// A server that moved its sign-in: its `401` names its protected
+    /// resource metadata, which names a new authorization server.
+    fn moved_server(f: &Fake, authorize_status: u16) {
+        f.with(|r| {
+            (r.url == MCP && r.method == Method::Post).then(|| {
+                resp(
+                    401,
+                    &[(
+                        "www-authenticate",
+                        &format!("Bearer resource_metadata=\"{PRM}\""),
+                    )],
+                    "",
+                )
+            })
+        });
+        f.on(
+            Method::Get,
+            PRM,
+            fjson(
+                200,
+                json!({"resource": MCP, "authorization_servers": [NEW_AS], "scopes_supported": ["read:docs", "offline_access"]}),
+            ),
+        );
+        f.on(
+            Method::Get,
+            "https://login.example.net/.well-known/oauth-authorization-server/t1",
+            fjson(
+                200,
+                json!({
+                    "issuer": NEW_AS,
+                    "authorization_endpoint": NEW_AUTHORIZE,
+                    "token_endpoint": "https://login.example.net/oauth/token",
+                    "registration_endpoint": "https://login.example.net/t1/register",
+                    "code_challenge_methods_supported": ["S256"],
+                    "token_endpoint_auth_methods_supported": ["none"],
+                }),
+            ),
+        );
+        f.on(
+            Method::Post,
+            "https://login.example.net/t1/register",
+            fjson(
+                201,
+                json!({"client_id": "fresh", "token_endpoint_auth_method": "none"}),
+            ),
+        );
+        f.with(move |r| {
+            r.url
+                .starts_with(NEW_AUTHORIZE)
+                .then(|| resp(authorize_status, &[], ""))
+        });
+    }
+
+    /// The sign-in starts from what the server says now (its `401`, its
+    /// protected resource metadata, its authorization server's metadata),
+    /// not from addresses saved when it was added: a vendor that moves its
+    /// sign-in server is followed, with a new client there.
+    #[tokio::test]
+    async fn a_sign_in_starts_from_the_servers_current_metadata() {
+        let r = rig("TEAM#a");
+        moved_server(&r.http, 302);
+        let mut s = server();
+        r.store.put_server("TEAM#a", &s).await.unwrap();
+        let url =
+            r.rt.start_sign_in(
+                &mut s,
+                &Owner::Team,
+                "USER#1",
+                "a@x.com",
+                "https://app.example.com/cb/",
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(url.starts_with(NEW_AUTHORIZE), "{url}");
+        let q: HashMap<String, String> = reqwest::Url::parse(&url)
+            .unwrap()
+            .query_pairs()
+            .into_owned()
+            .collect();
+        assert_eq!(q["client_id"], "fresh");
+        assert_eq!(q["resource"], MCP);
+        assert_eq!(q["code_challenge_method"], "S256");
+        assert_eq!(q["scope"], "read:docs offline_access");
+        let saved = r.store.get_server("TEAM#a", "docs").await.unwrap().unwrap();
+        let o = saved.oauth.unwrap();
+        assert_eq!(o.issuer, NEW_AS);
+        assert_eq!(o.client_id, "fresh");
+        assert_eq!(o.discovered_at, 1_000_000);
+        // Within a few minutes the saved settings are used as they are.
+        let before = r.http.sent_to(PRM).len();
+        let mut s = r.store.get_server("TEAM#a", "docs").await.unwrap().unwrap();
+        r.rt.start_sign_in(
+            &mut s,
+            &Owner::Team,
+            "USER#1",
+            "a@x.com",
+            "https://app.example.com/cb/",
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.http.sent_to(PRM).len(), before);
+        // After that they are read again.
+        r.now.fetch_add(DISCOVERY_TTL_SECS + 1, Ordering::SeqCst);
+        r.rt.start_sign_in(
+            &mut s,
+            &Owner::Team,
+            "USER#1",
+            "a@x.com",
+            "https://app.example.com/cb/",
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.http.sent_to(PRM).len(), before + 1);
+    }
+
+    /// A sign-in page that answers 5xx is never where a person is sent: the
+    /// start says the provider's sign-in is failing on its side, with the
+    /// status, and leaves nothing waiting.
+    #[tokio::test]
+    async fn a_sign_in_page_that_is_down_is_said_plainly() {
+        let r = rig("TEAM#a");
+        moved_server(&r.http, 500);
+        let mut s = server();
+        s.name = "Atlassian".into();
+        r.store.put_server("TEAM#a", &s).await.unwrap();
+        let e =
+            r.rt.start_sign_in(
+                &mut s,
+                &Owner::Team,
+                "USER#1",
+                "a@x.com",
+                "https://app.example.com/cb/",
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(e, provider_down("Atlassian", 500));
+        assert!(e.contains("failing on Atlassian's side (HTTP 500)"), "{e}");
+        assert!(r.store.list_pending("TEAM#a").await.unwrap().is_empty());
+        // It was asked once with fresh settings, and once more after reading
+        // them again: never more.
+        assert!(
+            r.http
+                .sent()
+                .iter()
+                .filter(|q| q.url.starts_with(NEW_AUTHORIZE))
+                .count()
+                <= 2
+        );
+        // A provider's own API with fixed addresses (a knowledge source) is
+        // neither read again nor probed.
+        let mut k = server();
+        k.id = "ks-notion".into();
+        k.catalog_id = "source:notion".into();
+        k.oauth.as_mut().unwrap().registration = "manual".into();
+        assert!(!discovers(&k));
+        assert!(discovers(&server()));
+    }
+
+    /// A catalog server whose vendor moved it (Atlassian's v1 address to
+    /// v2) is moved on its next sign-in, with nothing to fix by hand.
+    #[test]
+    fn a_catalog_server_follows_the_catalogs_address() {
+        assert_eq!(
+            crate::mcp_catalog::moved_remote_url(
+                "atlassian",
+                "atlassian",
+                "https://mcp.atlassian.com/v1/mcp"
+            ),
+            Some("https://mcp.atlassian.com/v2/mcp")
+        );
+        assert_eq!(
+            crate::mcp_catalog::moved_remote_url(
+                "atlassian",
+                "atlassian",
+                "https://mcp.atlassian.com/v2/mcp/"
+            ),
+            None
+        );
+        // A server added by address, or another record, keeps its own.
+        assert_eq!(
+            crate::mcp_catalog::moved_remote_url("wiki", "", "https://mcp.example.com/mcp"),
+            None
+        );
+        assert_eq!(
+            crate::mcp_catalog::moved_remote_url(
+                "ks-x",
+                "atlassian",
+                "https://mcp.atlassian.com/v1/mcp"
+            ),
+            None
+        );
     }
 
     fn urlencoding_like(s: &str) -> String {

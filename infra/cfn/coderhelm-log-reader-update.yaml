@@ -9,6 +9,8 @@ Description: >
   named in SyncKnowledgeBases. With InfrastructureVulnerabilities "on" it
   also reads, read-only, which versions your EC2, EKS, RDS, ElastiCache and
   OpenSearch resources run, for matching against security advisories.
+  With ApplyMaintenance "on" it may also apply a pending RDS or Aurora
+  maintenance action that a person approved in CoderHelm.
   It only adds: to drop a permission an older release granted, update the
   CoderHelmLogReader stack itself with the current role template.
   Created from the dashboard's Update link; you can delete older
@@ -85,6 +87,17 @@ Parameters:
       "on" lets CoderHelm read this account's AWS Health events through the
       Health API (read-only), which needs AWS Business Support or higher.
 
+  ApplyMaintenance:
+    Type: String
+    Default: "off"
+    AllowedValues: ["off", "on"]
+    Description: >
+      "on" lets CoderHelm apply a pending RDS or Aurora maintenance action
+      (an operating system update, an engine patch or upgrade, a serverless
+      platform update) that a person approved in CoderHelm, through AWS's
+      own ApplyPendingMaintenanceAction, only on this account's database
+      clusters and instances. Nothing is applied without that approval.
+
 Conditions:
   ReadsKnowledgeBases: !Not [!Equals [!Ref KnowledgeBases, ""]]
   ReadsEveryKnowledgeBase: !Equals [!Ref KnowledgeBases, "all"]
@@ -94,6 +107,7 @@ Conditions:
   ReadsInfrastructure: !Equals [!Ref InfrastructureVulnerabilities, "on"]
   ReadsInspector: !Equals [!Ref InspectorFindings, "on"]
   ReadsHealth: !Equals [!Ref HealthEvents, "on"]
+  AppliesMaintenance: !Equals [!Ref ApplyMaintenance, "on"]
 
 Resources:
   CoderHelmReadOnlyUpdate:
@@ -330,6 +344,19 @@ Resources:
                 - "inspector2:ListCoverage"
                 - "inspector2:BatchGetAccountStatus"
               Resource: "*"
+            - !Ref AWS::NoValue
+          # Applying a pending RDS or Aurora maintenance action, only when
+          # ApplyMaintenance is "on", and only after a person approved that
+          # action in CoderHelm. Only this account's clusters and instances.
+          - !If
+            - AppliesMaintenance
+            - Sid: ApplyApprovedMaintenance
+              Effect: Allow
+              Action:
+                - "rds:ApplyPendingMaintenanceAction"
+              Resource:
+                - !Sub "arn:aws:rds:*:${AWS::AccountId}:cluster:*"
+                - !Sub "arn:aws:rds:*:${AWS::AccountId}:db:*"
             - !Ref AWS::NoValue
           # AWS Health events, only when HealthEvents is "on" (the Health API needs
           # Business Support or higher). Read-only.

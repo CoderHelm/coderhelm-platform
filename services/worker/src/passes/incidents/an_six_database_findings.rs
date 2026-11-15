@@ -20,8 +20,9 @@
 //! resource type and attributes, module calls, variable files), graded,
 //! and a guess never becomes a pull request. An update with a code
 //! equivalent is a pull request against the line that sets the value; one
-//! that cannot be expressed in code stays a runbook and says so; a runbook
-//! is complete. A change that would replace a database is refused.
+//! that cannot be expressed in code is applied in AWS after an approval
+//! (`bn`) and says so, with a complete runbook behind it. A change that
+//! would replace a database is refused.
 
 use std::collections::BTreeMap;
 
@@ -513,10 +514,11 @@ fn a_generated_identifier_is_found_by_its_prefix_and_settings() {
 #[test]
 fn what_code_cannot_do_or_does_not_hold_is_a_complete_runbook_that_says_why() {
     let s = scene();
-    // In a CloudFormation template, found by its stack tags, and still a
-    // runbook: an operating system update cannot be expressed in code.
+    // In a CloudFormation template, found by its stack tags, and still
+    // applied in AWS (after an approval, with the runbook behind it): an
+    // operating system update cannot be expressed in code.
     let billing = find(&s, "billing-prod", Meaning::OsUpdate);
-    assert_eq!(billing.fix.kind, Some(FixKind::Runbook));
+    assert_eq!(billing.fix.kind, Some(FixKind::Apply));
     let l = billing.fix.location.as_ref().unwrap();
     assert_eq!(
         (l.how.as_str(), l.file.as_str(), l.address.as_str()),
@@ -534,10 +536,10 @@ fn what_code_cannot_do_or_does_not_hold_is_a_complete_runbook_that_says_why() {
         billing.fix.decision
     );
     assert!(infra_findings::unit_for(&Record::new(billing.clone(), "t")).is_none());
-    // Not in any connected repository: a runbook, with everything a
-    // person needs and the real identifiers.
+    // Not in any connected repository: applied in AWS after an approval,
+    // with a complete runbook behind it and the real identifiers.
     let reports = find(&s, "reports-prod", Meaning::EngineUpgrade);
-    assert_eq!(reports.fix.kind, Some(FixKind::Runbook));
+    assert_eq!(reports.fix.kind, Some(FixKind::Apply));
     assert!(reports
         .fix
         .decision

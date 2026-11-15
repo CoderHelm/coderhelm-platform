@@ -123,6 +123,7 @@ pub mod upgrade_quality;
 pub mod envelope;
 pub mod log_reader;
 pub mod log_repo;
+pub mod log_triage;
 /// The MCP servers a team can switch on: one catalog for gateway and worker.
 pub mod mcp_catalog;
 pub mod mcp_credentials;

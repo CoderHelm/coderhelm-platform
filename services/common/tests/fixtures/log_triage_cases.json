@@ -1,0 +1,27 @@
+{
+  "_comment": "One decision for a sighting, the same in the analyzer (lambda/log-analyzer/triage.py) and the worker (common::log_triage). history = lines per day for the days before today, newest first (index 0 = yesterday).",
+  "cases": [
+    {"name": "new, warning", "new": true, "severity": "warning", "history": [], "lines": 2,
+     "decision": "watch", "reason": "New: 2 lines, not seen before.", "notifies_new": true},
+    {"name": "new, critical", "new": true, "severity": "critical", "history": [], "lines": 2,
+     "decision": "act", "reason": "New and critical: 2 lines.", "notifies_new": true},
+    {"name": "two lines at the usual rate", "history": [3, 4, 0, 2, 5, 0, 0], "lines": 2,
+     "decision": "noise", "reason": "At its usual rate: 2 lines, about 2 a day on 4 of the last 7 days.",
+     "notifies_reopened": false},
+    {"name": "rising well above the usual day", "history": [3, 3, 3, 3, 3, 3, 3], "lines": 400,
+     "decision": "act", "reason": "Rising: 400 lines against about 3 a day over the last 7 days.",
+     "notifies_reopened": true},
+    {"name": "back after a quiet week", "history": [0, 0, 0, 0, 0, 0, 0], "lines": 2,
+     "decision": "watch", "reason": "Back after a quiet week: 2 lines, none in the last 7 days.",
+     "notifies_reopened": true},
+    {"name": "seen on one day only", "history": [0, 0, 6, 0, 0, 0, 0], "lines": 4,
+     "decision": "watch", "reason": "Seen again: 4 lines, on 1 of the last 7 days.",
+     "notifies_reopened": false},
+    {"name": "small but rare stays watch", "history": [0, 1, 0, 0, 0, 0, 0], "lines": 19,
+     "decision": "watch", "reason": "Seen again: 19 lines, on 1 of the last 7 days.",
+     "notifies_reopened": false},
+    {"name": "under one a day", "history": [1, 0, 0, 1, 0, 0, 0], "lines": 1,
+     "decision": "noise", "reason": "At its usual rate: 1 line, less than one a day on 2 of the last 7 days.",
+     "notifies_reopened": false}
+  ]
+}

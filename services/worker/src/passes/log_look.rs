@@ -180,6 +180,17 @@ impl Look for LiveLook<'_> {
             .collect()
     }
 
+    async fn read(&self, repo: &str, path: &str) -> Option<String> {
+        let host = self.host?;
+        if !self.repos.iter().any(|r| r == repo) {
+            return None;
+        }
+        // `HEAD` is the default branch's commit on GitHub.
+        let commit = host.head(repo, "HEAD").await.ok()?;
+        let text = host.file(repo, &commit, path).await.ok()??;
+        Some(common::truncate_str(&text, 60_000).to_string())
+    }
+
     async fn lines_since(&self, f: &Finding, since: &str) -> Option<u64> {
         let s = self.session.as_ref()?;
         if !lf::valid_log_group(&f.source_log_group) {

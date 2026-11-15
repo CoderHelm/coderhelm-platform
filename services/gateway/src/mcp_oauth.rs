@@ -53,10 +53,16 @@ pub const CODE_SCOPE: &str = "code:read";
 /// Reading the team's work: tickets, pull requests, runs, reviews and plans
 /// (the Work base).
 pub const WORK_SCOPE: &str = "work:read";
-/// Reading security and infrastructure findings, quarantined tests, alerts
-/// and log findings (the Security base, and Infrastructure and Logs and
-/// operations until they have scopes of their own).
+/// Reading security findings: dependency advisories and CVEs, quarantined
+/// tests (the Security base).
 pub const SECURITY_SCOPE: &str = "security:read";
+/// Reading the team's AWS: accounts, resources, where each is defined in
+/// Terraform, CDK or CloudFormation, pending updates and infrastructure
+/// findings (the Infrastructure base).
+pub const INFRA_SCOPE: &str = "infra:read";
+/// Reading alerts and log findings, and which repository and service they
+/// belong to (the Logs base).
+pub const LOGS_SCOPE: &str = "logs:read";
 /// Every scope, in the order they are shown.
 pub const SCOPES: &[&str] = &[
     READ_SCOPE,
@@ -64,25 +70,49 @@ pub const SCOPES: &[&str] = &[
     KNOWLEDGE_SCOPE,
     CODE_SCOPE,
     WORK_SCOPE,
+    INFRA_SCOPE,
+    LOGS_SCOPE,
     SECURITY_SCOPE,
 ];
 /// The scopes of the team lookups (`mcp_lookups`), which only read.
-pub const LOOKUP_SCOPES: &[&str] = &[CODE_SCOPE, WORK_SCOPE, SECURITY_SCOPE];
+pub const LOOKUP_SCOPES: &[&str] = &[
+    CODE_SCOPE,
+    WORK_SCOPE,
+    INFRA_SCOPE,
+    LOGS_SCOPE,
+    SECURITY_SCOPE,
+];
 /// The lookup scopes granted when the consent page doesn't say otherwise:
-/// code and work. Security findings only when asked for and allowed.
+/// code and work. Infrastructure, logs and security only when asked for and
+/// allowed.
 pub const DEFAULT_LOOKUP_SCOPES: &[&str] = &[CODE_SCOPE, WORK_SCOPE];
 
-/// What a scope lets an app do, as the consent page says it.
+/// What a scope lets an app do, in plain words, as the consent page says it.
 pub fn scope_label(scope: &str) -> &'static str {
     match scope {
         READ_SCOPE => "See your team's runs and reviews",
         WRITE_SCOPE => "Start and retry runs, and ask for reviews",
-        KNOWLEDGE_SCOPE => "Search the knowledge bases you can read in Chat",
-        CODE_SCOPE => "Read and search your team's code, as Chat does",
+        KNOWLEDGE_SCOPE => "Search the team's documents and knowledge bases you can read",
+        CODE_SCOPE => "Read and search the code in repositories you can see",
         WORK_SCOPE => "Find tickets, pull requests, runs, reviews and plans you can see",
-        SECURITY_SCOPE => {
-            "Read security and infrastructure findings, alerts and log findings you can see"
-        }
+        INFRA_SCOPE => "See the team's AWS resources, where each is defined, and pending updates",
+        LOGS_SCOPE => "See alerts and problems found in the logs",
+        SECURITY_SCOPE => "See security findings: advisories, CVEs, fixes and quarantined tests",
+        _ => "",
+    }
+}
+
+/// One word for a scope, as the consent page heads it.
+pub fn scope_plain(scope: &str) -> &'static str {
+    match scope {
+        READ_SCOPE => "Runs",
+        WRITE_SCOPE => "Act",
+        KNOWLEDGE_SCOPE => "Knowledge",
+        CODE_SCOPE => "Code",
+        WORK_SCOPE => "Work",
+        INFRA_SCOPE => "Infrastructure",
+        LOGS_SCOPE => "Logs",
+        SECURITY_SCOPE => "Security",
         _ => "",
     }
 }
@@ -389,6 +419,93 @@ pub fn register(
         redirect_uris: reg.redirect_uris.clone(),
         client_uri,
         created_at: now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+    })
+}
+
+// ── Client ID Metadata Documents ────────────────────────────────────
+
+/// A client's metadata document is read again after a day.
+pub const METADATA_DOCUMENT_TTL_SECS: i64 = 86_400;
+
+/// Is `id` a Client ID Metadata Document address (the MCP authorization
+/// spec's preferred way for a client to say who it is)? An `https` URL with
+/// a path, no fragment, no user name, no dot segments.
+pub fn is_metadata_client_id(id: &str) -> bool {
+    if id.len() > MAX_URI_LEN || !id.starts_with("https://") {
+        return false;
+    }
+    let Ok(u) = url::Url::parse(id) else {
+        return false;
+    };
+    let raw_path = id
+        .trim_start_matches("https://")
+        .split_once('/')
+        .map_or("", |(_, p)| p);
+    u.host().is_some()
+        && u.fragment().is_none()
+        && u.username().is_empty()
+        && u.password().is_none()
+        && u.path().len() > 1
+        && !raw_path
+            .split(['/', '?'])
+            .any(|seg| seg == "." || seg == "..")
+}
+
+/// The client a metadata document describes, checked: its `client_id` is
+/// exactly the address it was read from, it names where codes may go
+/// (checked as a registration's are), and it is a public client.
+pub fn client_from_document(
+    client_id: &str,
+    doc: &serde_json::Value,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<StoredClient, String> {
+    if !is_metadata_client_id(client_id) {
+        return Err("The app's address isn't a client metadata document.".into());
+    }
+    if doc["client_id"].as_str() != Some(client_id) {
+        return Err("The app's metadata document names a different client_id.".into());
+    }
+    let redirect_uris: Vec<String> = doc["redirect_uris"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    if redirect_uris.is_empty() || redirect_uris.len() > MAX_REDIRECT_URIS {
+        return Err("The app's metadata document needs 1 to 10 redirect_uris.".into());
+    }
+    for uri in &redirect_uris {
+        check_redirect_uri(uri)?;
+    }
+    match doc["token_endpoint_auth_method"].as_str() {
+        None | Some("none") => {}
+        Some(_) => {
+            return Err(
+                "CoderHelm signs in public clients only: token_endpoint_auth_method must be none."
+                    .into(),
+            )
+        }
+    }
+    let client_uri = doc["client_uri"]
+        .as_str()
+        .filter(|u| u.len() <= MAX_URI_LEN && u.starts_with("https://"))
+        .map(str::to_string);
+    Ok(StoredClient {
+        client_id: client_id.to_string(),
+        client_name: clean_name(doc["client_name"].as_str()),
+        redirect_uris,
+        client_uri,
+        created_at: now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+    })
+}
+
+/// Whether a stored client read from a metadata document is due to be read
+/// again.
+pub fn document_stale(c: &StoredClient, now: chrono::DateTime<chrono::Utc>) -> bool {
+    chrono::DateTime::parse_from_rfc3339(&c.created_at).map_or(true, |t| {
+        now.timestamp() - t.timestamp() >= METADATA_DOCUMENT_TTL_SECS
     })
 }
 
@@ -1323,6 +1440,13 @@ fn epoch(at: &str) -> i64 {
 impl OAuthStore for DynamoOAuth<'_> {
     async fn put_client(&self, c: &StoredClient) -> Result<(), String> {
         let ttl = epoch(&c.created_at) + CLIENT_TTL_DAYS * 86_400;
+        // A registered client is written once; a metadata document's client
+        // is its document, read again when stale.
+        let condition = if is_metadata_client_id(&c.client_id) {
+            None
+        } else {
+            Some("attribute_not_exists(pk)".to_string())
+        };
         self.dynamo
             .put_item()
             .table_name(self.table)
@@ -1334,7 +1458,7 @@ impl OAuthStore for DynamoOAuth<'_> {
                 s(&serde_json::to_string(c).map_err(|e| e.to_string())?),
             )
             .item("ttl", n(ttl))
-            .condition_expression("attribute_not_exists(pk)")
+            .set_condition_expression(condition)
             .send()
             .await
             .map_err(err)?;
@@ -1342,7 +1466,8 @@ impl OAuthStore for DynamoOAuth<'_> {
     }
 
     async fn get_client(&self, id: &str) -> Result<Option<StoredClient>, String> {
-        if !id.starts_with(CLIENT_PREFIX) || id.len() > 64 {
+        let registered = id.starts_with(CLIENT_PREFIX) && id.len() <= 64;
+        if !registered && !is_metadata_client_id(id) {
             return Ok(None);
         }
         let r = self
@@ -2326,5 +2451,75 @@ pub(crate) mod tests {
             .revoke_grant("TEAM#a", &gb, "USER#ann", "now")
             .await
             .unwrap());
+    }
+
+    #[test]
+    fn a_metadata_document_is_its_own_client() {
+        let id = "https://app.example.com/oauth/client.json";
+        assert!(is_metadata_client_id(id));
+        for bad in [
+            "mcpc_01abc",
+            "http://app.example.com/c.json",
+            "https://app.example.com",
+            "https://app.example.com/",
+            "https://app.example.com/c.json#x",
+            "https://user@app.example.com/c.json",
+            "https://app.example.com/a/../c.json",
+        ] {
+            assert!(!is_metadata_client_id(bad), "{bad}");
+        }
+        let now = chrono::Utc::now();
+        let doc = serde_json::json!({
+            "client_id": id,
+            "client_name": "Example Tool",
+            "redirect_uris": ["http://localhost/callback", "https://app.example.com/cb"],
+            "token_endpoint_auth_method": "none",
+        });
+        let c = client_from_document(id, &doc, now).unwrap();
+        assert_eq!(c.client_id, id);
+        assert_eq!(c.client_name, "Example Tool");
+        // A loopback redirect matches on any port (a native app picks one).
+        assert!(redirect_matches(
+            &c.redirect_uris,
+            "http://localhost:53682/callback"
+        ));
+        assert!(!redirect_matches(
+            &c.redirect_uris,
+            "https://evil.example.net/cb"
+        ));
+        // The document must name itself, list safe redirects, and be public.
+        let mut other = doc.clone();
+        other["client_id"] = serde_json::json!("https://evil.example.net/c.json");
+        assert!(client_from_document(id, &other, now).is_err());
+        let mut unsafe_uri = doc.clone();
+        unsafe_uri["redirect_uris"] = serde_json::json!(["javascript:alert(1)"]);
+        assert!(client_from_document(id, &unsafe_uri, now).is_err());
+        let mut secret = doc.clone();
+        secret["token_endpoint_auth_method"] = serde_json::json!("client_secret_basic");
+        assert!(client_from_document(id, &secret, now).is_err());
+        let mut none = doc;
+        none["redirect_uris"] = serde_json::json!([]);
+        assert!(client_from_document(id, &none, now).is_err());
+        // Read again after a day.
+        assert!(!document_stale(&c, now));
+        assert!(document_stale(
+            &c,
+            now + chrono::Duration::seconds(METADATA_DOCUMENT_TTL_SECS)
+        ));
+    }
+
+    #[test]
+    fn every_lookup_scope_says_what_it_opens_in_plain_words() {
+        for s in LOOKUP_SCOPES {
+            assert!(!scope_label(s).is_empty(), "{s}");
+            assert!(!scope_plain(s).is_empty(), "{s}");
+            assert!(SCOPES.contains(s));
+        }
+        // Infrastructure, logs and security are asked for, never given by default.
+        for s in [INFRA_SCOPE, LOGS_SCOPE, SECURITY_SCOPE] {
+            assert!(!DEFAULT_LOOKUP_SCOPES.contains(&s));
+            assert!(lookup_grant(None, &[]).iter().all(|g| *g != s));
+            assert!(lookup_grant(None, &[s.to_string()]).contains(s));
+        }
     }
 }

@@ -240,7 +240,7 @@ fn the_analyzer_and_the_sweep_still_make_these_decisions_where_they_run() {
     for call in [
         "note_changes(state, team_id, cfg, &findings).await;",
         "Err(Skip::QuietHours | Skip::Stopped(_)) if f.auto_status == \"waiting\" => None",
-        "Err((r, _)) if r.unweighed => starter_skip = Some(Skip::RepoPending)",
+        "Choice::Wait => {\n                    starter_skip = Some(Skip::RepoPending);",
         "lf::record_repo_ask(",
     ] {
         assert!(sweep.contains(call), "the sweep no longer has: {call}");

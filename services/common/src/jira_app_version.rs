@@ -119,6 +119,10 @@ pub struct Latest {
     /// The Forge app it belongs to; a site running another app (a
     /// self-hosted copy) is never compared with it.
     pub app_id: String,
+    /// The app's installation link from the developer console (Distribution),
+    /// when the release workflow publishes one: an admin who opens it updates
+    /// the app on their site in one step. Empty when none is published.
+    pub install_url: String,
 }
 
 impl Latest {
@@ -132,6 +136,13 @@ impl Latest {
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .trim()
+                .to_string(),
+            install_url: v
+                .get("installUrl")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|u| is_install_link(u))
+                .unwrap_or("")
                 .to_string(),
         })
     }
@@ -219,8 +230,14 @@ pub struct Behind {
     pub latest: String,
     /// What the site's version lacks, from the table.
     pub missing: Vec<String>,
-    /// The site's Manage apps page, where its admin accepts the update.
+    /// Atlassian Administration, where a site admin accepts the update
+    /// (Apps, Sites, the site, Connected apps). Named `manage_url` for
+    /// dashboards from before; it never points at Jira's Manage apps, which
+    /// doesn't list a pending Forge update.
     pub manage_url: String,
+    /// The app's installation link, which updates it in one step; empty
+    /// when none is published.
+    pub install_url: String,
     /// When the site was last heard from.
     pub seen_at: String,
     /// The Integrations page's notice.
@@ -229,17 +246,31 @@ pub struct Behind {
     pub run_note: String,
 }
 
-/// The site's Manage apps page (Jira settings, Apps, Manage apps), or empty
-/// when the site isn't an Atlassian Cloud address.
-pub fn manage_apps_url(site: &str) -> String {
-    crate::live::confluence::check_site(site)
-        .map(|s| format!("{s}/plugins/servlet/upm"))
-        .unwrap_or_default()
+/// Atlassian Administration, where a pending Forge update is accepted.
+pub const ADMIN_URL: &str = "https://admin.atlassian.com/";
+
+/// An installation link from Atlassian's developer console (Distribution).
+pub fn is_install_link(u: &str) -> bool {
+    reqwest::Url::parse(u).is_ok_and(|p| {
+        p.scheme() == "https"
+            && p.host_str() == Some("developer.atlassian.com")
+            && p.path().starts_with("/console/install/")
+    })
 }
 
-/// The admin's steps in Jira, said the same way everywhere.
-pub const ADMIN_STEPS: &str =
-    "A Jira admin needs to accept the update: Jira Settings, Apps, Manage apps, Coderhelm, Update.";
+/// The admin's steps, said the same way everywhere. A Forge update that asks
+/// for new access is accepted in Atlassian Administration, not in Jira: Jira's
+/// Manage apps page has no Update for it.
+pub const ADMIN_STEPS: &str = "An Atlassian site admin accepts the update in Atlassian Administration (admin.atlassian.com): Apps, Sites, choose the site, Connected apps, Coderhelm, View app details, Update. Jira's own Manage apps page doesn't list it.";
+
+/// The steps, with the one-click way first when there is an installation link.
+pub fn admin_steps(install_url: &str) -> String {
+    if install_url.is_empty() {
+        ADMIN_STEPS.to_string()
+    } else {
+        format!("An Atlassian site admin can open the app's installation link ({install_url}), choose the site and Update, or accept it in Atlassian Administration (admin.atlassian.com): Apps, Sites, choose the site, Connected apps, Coderhelm, View app details, Update.")
+    }
+}
 
 fn running(version: &str, latest: &str) -> String {
     let v = if version.is_empty() {
@@ -257,7 +288,7 @@ fn running(version: &str, latest: &str) -> String {
 /// Whether the site is behind, from what it last reported and the latest
 /// release. `None` when it is current, never seen, runs another app than
 /// the published one, or reports a version that can't be compared.
-pub fn assess(seen: Option<&Seen>, latest: Option<&Latest>, site: &str) -> Option<Behind> {
+pub fn assess(seen: Option<&Seen>, latest: Option<&Latest>, _site: &str) -> Option<Behind> {
     let seen = seen?;
     let reported = Version::parse(&seen.version);
     let missing = match reported {
@@ -274,6 +305,7 @@ pub fn assess(seen: Option<&Seen>, latest: Option<&Latest>, site: &str) -> Optio
         }
     };
     let version = reported.map(|v| v.to_string()).unwrap_or_default();
+    let install_url = latest.map(|l| l.install_url.clone()).unwrap_or_default();
     let latest = latest.map(|l| l.version.to_string()).unwrap_or_default();
     let what = running(&version, &latest);
     let lacks = if missing.is_empty() {
@@ -281,15 +313,17 @@ pub fn assess(seen: Option<&Seen>, latest: Option<&Latest>, site: &str) -> Optio
     } else {
         format!(" Missing: {}.", missing.join(", "))
     };
-    let message =
-        format!("Your Jira site runs an older Coderhelm app {what}.{lacks} {ADMIN_STEPS}");
+    let message = format!(
+        "Your Jira site runs an older Coderhelm app {what}.{lacks} {}",
+        admin_steps(&install_url)
+    );
     let run_note = if missing.is_empty() {
         format!(
-            "Comments on this ticket may be incomplete: its Jira site runs an older Coderhelm app {what}. A Jira admin can accept the update in Manage apps."
+            "Comments on this ticket may be incomplete: its Jira site runs an older Coderhelm app {what}. An Atlassian site admin can accept the update in Atlassian Administration, Connected apps."
         )
     } else {
         format!(
-            "Comments on this ticket may be incomplete: its Jira site runs an older Coderhelm app {what} without {}. A Jira admin can accept the update in Manage apps.",
+            "Comments on this ticket may be incomplete: its Jira site runs an older Coderhelm app {what} without {}. An Atlassian site admin can accept the update in Atlassian Administration, Connected apps.",
             missing.join(", ")
         )
     };
@@ -297,7 +331,8 @@ pub fn assess(seen: Option<&Seen>, latest: Option<&Latest>, site: &str) -> Optio
         version,
         latest,
         missing,
-        manage_url: manage_apps_url(site),
+        manage_url: ADMIN_URL.to_string(),
+        install_url,
         seen_at: seen.seen_at.clone(),
         message,
         run_note,
@@ -325,6 +360,7 @@ mod tests {
         Latest {
             version: Version::parse(v).unwrap(),
             app_id: APP.into(),
+            install_url: String::new(),
         }
     }
 
@@ -401,17 +437,19 @@ mod tests {
         let b = assess(Some(&seen("6.8.0")), Some(&latest("6.11.0")), SITE).unwrap();
         assert_eq!(b.version, "6.8.0");
         assert_eq!(b.latest, "6.11.0");
-        assert_eq!(
-            b.manage_url,
-            "https://yourcompany.atlassian.net/plugins/servlet/upm"
-        );
+        // Atlassian Administration, never Jira's Manage apps (no Update there).
+        assert_eq!(b.manage_url, "https://admin.atlassian.com/");
+        assert_eq!(b.install_url, "");
         assert!(b.message.starts_with(
             "Your Jira site runs an older Coderhelm app (version 6.8.0, latest 6.11.0). Missing: "
         ));
         assert!(b.message.contains("threaded replies"));
-        assert!(b.message.ends_with(
-            "A Jira admin needs to accept the update: Jira Settings, Apps, Manage apps, Coderhelm, Update."
-        ));
+        assert!(b.message.ends_with(ADMIN_STEPS));
+        assert!(b.message.contains("Atlassian Administration (admin.atlassian.com): Apps, Sites, choose the site, Connected apps, Coderhelm, View app details, Update."));
+        assert!(!b.run_note.contains("Manage apps"));
+        assert!(b
+            .run_note
+            .contains("Atlassian Administration, Connected apps"));
         assert!(b
             .run_note
             .starts_with("Comments on this ticket may be incomplete"));
@@ -516,12 +554,32 @@ mod tests {
     }
 
     #[test]
-    fn manage_apps_is_on_the_site_only() {
-        assert_eq!(
-            manage_apps_url("https://YourCompany.atlassian.net/"),
-            "https://yourcompany.atlassian.net/plugins/servlet/upm"
-        );
-        assert_eq!(manage_apps_url("https://example.com"), "");
-        assert_eq!(manage_apps_url(""), "");
+    fn the_installation_link_is_the_one_click_way_when_published() {
+        let link = "https://developer.atlassian.com/console/install/00000000-0000-0000-0000-000000000002?signature=abc&product=jira";
+        let l = Latest::parse(&format!(
+            r#"{{"version": "6.12.0", "appId": "{APP}", "installUrl": "{link}"}}"#
+        ))
+        .unwrap();
+        assert_eq!(l.install_url, link);
+        let b = assess(Some(&seen("6.8.0")), Some(&l), SITE).unwrap();
+        assert_eq!(b.install_url, link);
+        assert!(b.message.contains(&format!("installation link ({link})")));
+        assert!(b.message.contains("Connected apps"));
+        // Only a developer console installation link is passed on.
+        for bad in [
+            "https://example.com/console/install/x",
+            "http://developer.atlassian.com/console/install/x",
+            "https://developer.atlassian.com/apps/x",
+        ] {
+            let l = Latest::parse(&format!(
+                r#"{{"version": "6.12.0", "installUrl": "{bad}"}}"#
+            ))
+            .unwrap();
+            assert_eq!(l.install_url, "", "{bad}");
+        }
+        // Nowhere says Manage apps is where the update is.
+        for text in [ADMIN_STEPS.to_string(), admin_steps(link)] {
+            assert!(!text.contains("Manage apps, Coderhelm"), "{text}");
+        }
     }
 }

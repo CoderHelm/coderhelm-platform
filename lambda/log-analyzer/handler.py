@@ -35,6 +35,7 @@ from botocore.exceptions import ClientError
 import attribution
 import fingerprint
 import lifecycle
+import triage
 import usage
 
 logger = logging.getLogger()
@@ -364,8 +365,9 @@ def analyze_connection(conn, lookback_hours=None, only_groups=None, resolve=True
             resolve_stale_recommendations(team_id, existing, set(), skip_groups=failed_groups)
         return 0
 
-    # One entry per log group and message, each with its own counts and times.
-    evidence = attribution.build_evidence(batches, scrub_secrets)
+    # One entry per log group and error: lines that differ only by ids or
+    # numbers are one entry, so a burst is one entry with a big count.
+    evidence = triage.collapse(attribution.build_evidence(batches, scrub_secrets))
 
     seen_ids = set()
     new_recs = []
@@ -374,11 +376,26 @@ def analyze_connection(conn, lookback_hours=None, only_groups=None, resolve=True
         rec_id, is_new = store_finding(team_id, account_id, advisory, existing, None, (start, end))
         if rec_id:
             seen_ids.add(rec_id)
-        if is_new or advisory.get("seen_again"):
+        if advisory.get("notify"):
             new_recs.append(advisory)
 
-    # The model reads the attributed evidence and writes the words.
-    recommendations = analyze_with_anthropic(evidence, account_id, api_key, existing, team_id=team_id)
+    # Errors that already have a finding are counted on it, never analyzed
+    # again: only errors nobody has seen go to the model.
+    evidence, known = count_known(team_id, account_id, evidence, existing, cw_logs, (start, end))
+    for rec_id, cand in known:
+        seen_ids.add(rec_id)
+        if cand.get("notify"):
+            new_recs.append(cand)
+
+    # The model reads the new errors' evidence and writes the words, within
+    # the team's hourly budget of analysis calls.
+    if not evidence:
+        recommendations = []
+    elif not triage.take_model_call(aws_insights_table, team_id):
+        logger.warning(f"{team_id}/{account_id}: analysis budget reached; counting only this hour")
+        recommendations = None
+    else:
+        recommendations = analyze_with_anthropic(evidence, account_id, api_key, existing, team_id=team_id)
 
     # None = the analysis failed: we can't tell "no issues" from "API error",
     # so nothing is resolved.
@@ -393,15 +410,20 @@ def analyze_connection(conn, lookback_hours=None, only_groups=None, resolve=True
     # group at a time; then make its words match that evidence.
     candidates, check_failed = attribute_recommendations(cw_logs, recommendations, evidence, start, end)
     attribution.guard_texts(
-        candidates, log_groups, lambda prompt: ask_model(prompt, api_key, team_id)
+        candidates,
+        log_groups,
+        lambda prompt: ask_model(prompt, api_key, team_id)
+        if triage.take_model_call(aws_insights_table, team_id)
+        else None,
     )
 
     for cand in candidates:
         rec_id, is_new = store_finding(team_id, account_id, cand, existing, cw_logs, (start, end))
         if rec_id:
             seen_ids.add(rec_id)
-        # A resolved finding that came back is news; an ignored one is not.
-        if is_new or cand.get("seen_again"):
+        # Worth a message by its decision (triage): new, rising, or back
+        # after a quiet week; never a sighting at its usual rate.
+        if cand.get("notify"):
             new_recs.append(cand)
 
     # Resolve findings that stopped appearing for the quiet period, in every
@@ -442,6 +464,7 @@ def secrets_advisories(batches, evidence, account_id):
                 continue
             g = per_group.setdefault(group, {
                 "account": account, "found": 0, "types": set(), "lines": 0, "streams": {},
+                "samples": [],
             })
             n = attribution.as_int(row.get("n") or 1) or 1
             g["found"] += found
@@ -450,6 +473,15 @@ def secrets_advisories(batches, evidence, account_id):
             stream = str(row.get("@logStream", "") or "")
             if stream:
                 g["streams"][stream] = g["streams"].get(stream, 0) + n
+            # The line itself, masked: it shows which statement writes the
+            # value, which is where the fix goes.
+            if len(g["samples"]) < attribution.MAX_SAMPLES:
+                g["samples"].append({
+                    "log_group": group,
+                    "log_stream": stream,
+                    "timestamp": str(row.get("@timestamp", "") or ""),
+                    "message": scrub_secrets(raw.strip())[:attribution.SAMPLE_CHARS],
+                })
     out = []
     for group, g in sorted(per_group.items()):
         mine = [e for e in evidence if e["log_group"] == group]
@@ -461,16 +493,15 @@ def secrets_advisories(batches, evidence, account_id):
             "title": f"Secrets detected in CloudWatch Logs ({g['found']} instances)",
             "severity": "critical",
             "summary": (
-                f"We detected {g['found']} potential secrets or tokens in {group} "
-                f"(types: {types_str}). These were automatically scrubbed before AI analysis, "
-                f"but they still exist in your logs and could be exposed."
+                f"{group} has {g['found']} passwords or tokens in plain text ({types_str}). "
+                f"CoderHelm masks them before reading the lines, but anyone who can read "
+                f"the logs can see them."
             ),
             "suggested_action": (
-                "1. Rotate any exposed credentials immediately. "
-                "2. Add a CloudWatch Logs subscription filter or Lambda to strip secrets at ingestion. "
-                "3. Update your application to avoid logging sensitive values — use environment variables "
-                "and never pass secrets as command-line arguments or log them at any level. "
-                "4. Consider using AWS Secrets Manager or Parameter Store for credential management."
+                "Find the log statement that writes the value (the sample lines show it, masked) "
+                "and stop logging the value, or mask it there. Then rotate the credentials that "
+                "were written. A data protection policy on the log group masks what is already "
+                "being written until the change ships."
             ),
             "log_group": group,
             "account": g["account"] or account_id,
@@ -482,7 +513,7 @@ def secrets_advisories(batches, evidence, account_id):
                 "first": min(firsts) if firsts else None,
                 "last": max(lasts) if lasts else None,
                 "streams": g["streams"],
-                "samples": [],
+                "samples": g["samples"],
             },
         })
     return out
@@ -1074,6 +1105,8 @@ def store_finding(team_id, account_id, cand, existing, cw_logs=None, window=None
             else match.get("signature_hashes"),
             sighting["signature_hashes"],
         )
+        # What this sighting is worth, against the days before it.
+        decision = triage.decide(match, added, now_dt, severity=match.get("severity") or cand.get("severity", ""))
         history = lifecycle.add_history(match.get("daily_lines"), today, added)
         reopening = match.get("status") == "resolved"
         quiet = lifecycle.quiet_days_for({
@@ -1099,13 +1132,14 @@ def store_finding(team_id, account_id, cand, existing, cw_logs=None, window=None
             ":sig": sighting["signature"][:300],
             ":quiet": quiet,
             ":act": activity,
+            ":tri": stored_triage(decision, now),
         }
         sets = (
             "last_seen_at = :l, first_seen_at = :f, updated_at = :t, error_count = :c, "
             "seen_count = :seen, count_basis = :basis, samples = :samples, log_account_id = :acct, "
             "signature_hashes = :sigs, log_streams = :streams, also_in = :others, daily_lines = :hist, "
             "fingerprint = if_not_exists(fingerprint, :fp), #sig = if_not_exists(#sig, :sig), quiet_days = :quiet, "
-            "#act = :act"
+            "#act = :act, triage = :tri"
         )
         names = {"#sig": "signature", "#act": "activity"}
         reopened = match.get("status") == "resolved"
@@ -1150,10 +1184,22 @@ def store_finding(team_id, account_id, cand, existing, cw_logs=None, window=None
             "seen_count": seen, "count_basis": "events", "signature_hashes": hashes,
             "daily_lines": history, "quiet_days": quiet, "activity": activity,
         })
+        was = (match.get("triage") or {}).get("decision")
         if reopened:
             match.update({"status": "pending", "reopened_at": now})
             match.pop("resolved_at", None)
             cand["seen_again"] = True
+        cand["triage"] = decision
+        # An ignored finding is counted, never news. An open one is news
+        # only when it turns to act; a resolved one that came back by its
+        # decision (never at its usual rate).
+        cand["notify"] = match.get("status") != "dismissed" and (
+            triage.notifies(decision, reopened=reopened)
+            if reopened
+            else decision["decision"] == triage.ACT and was != triage.ACT
+        )
+        match["triage"] = values[":tri"]
+        cand.setdefault("rec_id", match["rec_id"])
         return match["rec_id"], False
 
     first, last = stats.get("first"), stats.get("last")
@@ -1195,6 +1241,11 @@ def store_finding(team_id, account_id, cand, existing, cw_logs=None, window=None
     location = suspected_location(cand)
     if location:
         item["suspected_location"] = location
+    decision = triage.decide(None, stats["count"], now_dt, is_new=True, severity=item["severity"])
+    item["triage"] = stored_triage(decision, now)
+    cand["triage"] = decision
+    cand["notify"] = triage.notifies(decision, is_new=True)
+    cand["rec_id"] = rec_id
     try:
         aws_insights_table.put_item(Item=item)
         emit_event(team_id, "log_finding.created", finding_event_data(rec_id, account_id, item))
@@ -1210,6 +1261,73 @@ def store_finding(team_id, account_id, cand, existing, cw_logs=None, window=None
     except Exception as e:
         logger.error(f"Failed to store recommendation: {e}")
         return None, False
+
+
+def stored_triage(decision, now):
+    """The decision as the finding keeps it (whole numbers only: DynamoDB
+    takes no floats)."""
+    return {
+        "decision": decision["decision"],
+        "reason": decision["reason"][:300],
+        "baseline": int(round(decision["baseline"])),
+        "days_seen": int(decision["days_seen"]),
+        "lines": int(decision["lines"]),
+        "at": now,
+    }
+
+
+def count_known(team_id, account_id, evidence, existing, cw_logs, window, now=None):
+    """Split this run's evidence into errors nobody has seen yet (for the
+    model) and errors that already have a finding: those are counted on it
+    (store_finding), with their decision, and never analyzed again. Returns
+    (unknown evidence, [(rec_id, cand)])."""
+    now = now or datetime.now(timezone.utc)
+    unknown, known = [], []
+    for e in evidence:
+        lines = [(e["message"], e.get("count") or 1)]
+        sighting = sighting_of(account_id, {"log_group": e["log_group"], "lines": lines})
+        match = lifecycle.find_match(sighting, existing, now)
+        if not match:
+            unknown.append(e)
+            continue
+        literal = match.get("error_pattern") or attribution.pattern_literal(e["message"]) or e["message"][:80]
+        # The exact count in its own group (discovery queries overlap), as an
+        # analyzed finding gets it; the discovery numbers when it can't run.
+        stats = None
+        if cw_logs is not None:
+            stats = attribution.check_group(cw_logs, e["log_group"], literal, window[0], window[1], scrub_secrets)
+        if not stats or not stats.get("count"):
+            streams = e.get("streams") or {}
+            top = max(streams, key=streams.get) if streams else ""
+            stats = {
+                "count": e.get("count") or 1,
+                "first": e.get("first"),
+                "last": e.get("last"),
+                "streams": streams,
+                "samples": [{
+                    "log_group": e["log_group"], "log_stream": top,
+                    "timestamp": attribution.iso(e.get("last")) or "", "message": e["message"],
+                }],
+            }
+        cand = {
+            "log_group": e["log_group"],
+            "account": e.get("account") or account_id,
+            "literal": literal,
+            "lines": lines,
+            "title": match.get("title", ""),
+            "summary": match.get("summary", ""),
+            "severity": match.get("severity", "info"),
+            "stats": stats,
+        }
+        rec_id, _ = store_finding(team_id, account_id, cand, existing, cw_logs, window, now)
+        if rec_id:
+            known.append((rec_id, cand))
+        else:
+            unknown.append(e)
+    # Ids stay as the model reads them.
+    for i, e in enumerate(unknown, 1):
+        e["id"] = f"e{i}"
+    return unknown, known
 
 
 def refresh_fixing(team_id, sk, sets, values, names=None):
@@ -1358,6 +1476,52 @@ def card_title(rec):
     return f"Seen again: {title}" if rec.get("seen_again") else title
 
 
+DECISION_WORDS = {triage.ACT: "Act", triage.WATCH: "Watch", triage.NOISE: "Noise"}
+_URL_HOST = re.compile(r"\bhttps?://([A-Za-z0-9.-]+(?::\d+)?)")
+_NET_HOST = re.compile(r"\b(?:ENOTFOUND|ECONNREFUSED|ECONNRESET|ETIMEDOUT|EAI_AGAIN)\s+([A-Za-z0-9.-]+(?::\d+)?)")
+
+
+def upstream_of(rec):
+    """The host the error's own lines name (a URL, or the host of a refused
+    or unresolved connection), or ""."""
+    lines = [str(s.get("message", "")) for s in (rec.get("stats") or {}).get("samples", [])]
+    lines += [str(l[0] if isinstance(l, tuple) else l) for l in rec.get("lines") or []]
+    for line in lines:
+        for pattern in (_URL_HOST, _NET_HOST):
+            m = pattern.search(line)
+            if m:
+                return m.group(1)
+    return ""
+
+
+def card_lines(rec, now=None):
+    """What one finding's entry says under its title: the decision and why
+    on one line, then the facts in numbers (lines, upstream, when, whether
+    it stopped). No account ids, no filler."""
+    now = now or datetime.now(timezone.utc)
+    d = rec.get("triage") or {}
+    top = ""
+    if d.get("decision"):
+        top = f"{DECISION_WORDS.get(d['decision'], d['decision'].title())}: {d.get('reason', '')}".strip()
+    stats = rec.get("stats") or {}
+    facts = []
+    n = stats.get("count")
+    group = rec.get("source_log_group") or rec.get("log_group")
+    if n and group:
+        streams = len(stats.get("streams") or {})
+        facts.append(f"{n} line{'s' if n != 1 else ''} in {group}" + (f" from {streams} tasks" if streams > 1 else ""))
+    host = upstream_of(rec)
+    if host:
+        facts.append(f"upstream {host}")
+    last = attribution.parse_ts(stats.get("last")) if not isinstance(stats.get("last"), datetime) else stats.get("last")
+    if last:
+        if last.tzinfo is None:
+            last = last.replace(tzinfo=timezone.utc)
+        at = last.strftime("%H:%M UTC")
+        facts.append(f"none since {at}" if (now - last).total_seconds() > 15 * 60 else f"last at {at}")
+    return top, " · ".join(facts)
+
+
 def recommendations_card(account_id, recs, dashboard_url):
     """Adaptive Card (Teams Workflows webhook) listing new findings."""
     recs = sorted(recs, key=lambda r: SEVERITY_ORDER.get(r.get("severity"), 3))
@@ -1374,34 +1538,32 @@ def recommendations_card(account_id, recs, dashboard_url):
             "style": style,
             "items": [{
                 "type": "TextBlock",
-                "text": f"🔎 {n} new log finding{'s' if n != 1 else ''}",
+                "text": f"🔎 {n} log finding{'s' if n != 1 else ''} to look at",
                 "weight": "Bolder", "size": "Large", "color": color, "wrap": True,
             }],
-        },
-        {
-            "type": "TextBlock",
-            "text": f"CloudWatch Logs · AWS account {account_id}",
-            "isSubtle": True, "spacing": "Small", "wrap": True,
         },
     ]
     for r in recs[:5]:
         sev = r.get("severity", "info")
+        top, facts = card_lines(r)
         items = [
             {
                 "type": "TextBlock",
                 "text": f"{SEVERITY_ICON.get(sev, '⚪')} {card_title(r)[:150]}",
                 "weight": "Bolder", "wrap": True,
             },
-            {
-                "type": "TextBlock",
-                "text": str(r.get("summary", ""))[:400],
-                "wrap": True, "spacing": "Small",
-            },
         ]
-        if r.get("source_log_group"):
+        if top:
+            items.append({"type": "TextBlock", "text": top[:300], "wrap": True, "spacing": "Small"})
+        items.append({
+            "type": "TextBlock",
+            "text": str(r.get("summary", ""))[:400],
+            "wrap": True, "spacing": "Small",
+        })
+        if facts:
             items.append({
                 "type": "TextBlock",
-                "text": str(r["source_log_group"])[:200],
+                "text": facts[:300],
                 "isSubtle": True, "size": "Small", "spacing": "None", "wrap": True,
             })
         body.append({"type": "Container", "separator": True, "spacing": "Medium", "items": items})
@@ -1420,12 +1582,19 @@ def recommendations_card(account_id, recs, dashboard_url):
                 "body": body,
                 "actions": [{
                     "type": "Action.OpenUrl",
-                    "title": "Review findings",
-                    "url": f"{dashboard_url}/logs",
+                    "title": "Open the finding" if n == 1 and recs[0].get("rec_id") else "Review findings",
+                    "url": link_for(recs, dashboard_url),
                 }],
             },
         }],
     }
+
+
+def link_for(recs, dashboard_url):
+    """The one finding's page when there is one, else the Logs page."""
+    if len(recs) == 1 and recs[0].get("rec_id"):
+        return f"{dashboard_url.rstrip('/')}/logs/?finding={recs[0]['rec_id']}"
+    return f"{dashboard_url}/logs"
 
 
 def slack_text(text):
@@ -1437,21 +1606,23 @@ def recommendations_slack(account_id, recs, dashboard_url):
     """Block Kit (Slack incoming webhook) listing new findings."""
     recs = sorted(recs, key=lambda r: SEVERITY_ORDER.get(r.get("severity"), 3))
     n = len(recs)
-    title = f"🔎 {n} new log finding{'s' if n != 1 else ''}"
+    title = f"🔎 {n} log finding{'s' if n != 1 else ''} to look at"
     blocks = [
         {"type": "header", "text": {"type": "plain_text", "text": title[:150], "emoji": True}},
-        {"type": "context", "elements": [{"type": "mrkdwn", "text": f"CloudWatch Logs · AWS account {account_id}"}]},
     ]
     for r in recs[:5]:
         sev = r.get("severity", "info")
+        top, facts = card_lines(r)
         head = f"{SEVERITY_ICON.get(sev, '⚪')} *{slack_text(card_title(r)[:150])}*"
+        if top:
+            head += f"\n{slack_text(top[:300])}"
         summary = slack_text(str(r.get("summary", ""))[:400])
         blocks.append({"type": "divider"})
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"{head}\n{summary}".strip()[:3000]}})
-        if r.get("source_log_group"):
+        if facts:
             blocks.append({
                 "type": "context",
-                "elements": [{"type": "mrkdwn", "text": slack_text(str(r["source_log_group"])[:200])}],
+                "elements": [{"type": "mrkdwn", "text": slack_text(facts[:300])}],
             })
     if n > 5:
         blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": f"+{n - 5} more"}]})
@@ -1460,11 +1631,11 @@ def recommendations_slack(account_id, recs, dashboard_url):
         "elements": [{
             "type": "button",
             "action_id": "link-0",
-            "text": {"type": "plain_text", "text": "Review findings", "emoji": True},
-            "url": f"{dashboard_url}/logs",
+            "text": {"type": "plain_text", "text": "Open the finding" if n == 1 and recs[0].get("rec_id") else "Review findings", "emoji": True},
+            "url": link_for(recs, dashboard_url),
         }],
     })
-    return {"text": f"{title} in AWS account {account_id}", "blocks": blocks}
+    return {"text": title, "blocks": blocks}
 
 
 RENDER = {"teams": recommendations_card, "slack": recommendations_slack}

@@ -2157,14 +2157,29 @@ pub async fn brain_stream(
 
     let (api_key, model_id, check_model_id) = load_provider(&state, &claims.team_id).await;
     let st = super::knowledge::store(&state);
-    let readable: Vec<String> = super::knowledge::chat_readable(
-        st.bases(&claims.team_id).await.unwrap_or_default(),
-        &holder,
-        &me,
-    )
-    .into_iter()
-    .map(|b| b.id)
-    .collect();
+    // The built-in bases decide what Chat reads, as they do for AI tools:
+    // a base closed to this person is never read for them (crate::bases).
+    let open = {
+        let auds = crate::bases::audiences(&state, &claims.team_id).await;
+        let who = crate::bases::Asker {
+            holder: &holder,
+            email: &claims.email,
+        };
+        crate::bases::decide_all(&who, &auds, None)
+    };
+    let base_open = |k: &str| open.get(k).is_some_and(crate::bases::Decision::is_open);
+    let readable: Vec<String> = if base_open(crate::lookups::TEAM) {
+        super::knowledge::chat_readable(
+            st.bases(&claims.team_id).await.unwrap_or_default(),
+            &holder,
+            &me,
+        )
+        .into_iter()
+        .map(|b| b.id)
+        .collect()
+    } else {
+        Vec::new()
+    };
     let all_repos = load_repos(&state, &claims.team_id).await;
     let repo_names: Vec<String> = all_repos.iter().map(|r| r.name.clone()).collect();
     let picks = resolve_picks(
@@ -2173,7 +2188,7 @@ pub async fn brain_stream(
         &readable,
         &repo_names,
     );
-    let code_repos: Vec<RepoInfo> = if picks.code {
+    let code_repos: Vec<RepoInfo> = if picks.code && base_open(crate::lookups::CODE) {
         all_repos
             .iter()
             .filter(|r| picks.repos.is_empty() || picks.repos.contains(&r.name))
@@ -2181,6 +2196,26 @@ pub async fn brain_stream(
             .collect()
     } else {
         Vec::new()
+    };
+    let github = if (picks.code && !code_repos.is_empty()) || (picks.work && !all_repos.is_empty())
+    {
+        github_token(&state, &claims.team_id).await
+    } else {
+        None
+    };
+    // Code only from repositories the person's GitHub account can read.
+    let (code_repos, _) = if code_repos.is_empty() {
+        (code_repos, 0)
+    } else {
+        crate::bases::visible_repos(
+            &state,
+            &claims.team_id,
+            &holder.role,
+            claims.github_login.as_deref(),
+            github.as_deref(),
+            code_repos,
+        )
+        .await
     };
     // The repository skills, data sources and the code graph start from: the
     // one named in the question, else the one picked, else the first.
@@ -2203,19 +2238,12 @@ pub async fn brain_stream(
         mcp: false,
     };
     let needs_worker = picks.skills || picks.data_sources || picks.code;
-    let (worker, github, mcp_tools) = tokio::join!(
+    let (worker, mcp_tools) = tokio::join!(
         async {
             if needs_worker {
                 super::plan_chat_tools::setup(&state, &scope).await
             } else {
                 WorkerTools::default()
-            }
-        },
-        async {
-            if (picks.code && !code_repos.is_empty()) || (picks.work && !all_repos.is_empty()) {
-                github_token(&state, &claims.team_id).await
-            } else {
-                None
             }
         },
         async {
@@ -2241,12 +2269,23 @@ pub async fn brain_stream(
             super::chat_work_tickets::load(&state, &claims.team_id),
             super::graph::installation_id(&state, &claims.team_id),
         );
+        // Pull requests only in repositories the person's GitHub account
+        // can read, as code.
+        let (work_repos, _) = crate::bases::visible_repos(
+            &state,
+            &claims.team_id,
+            &holder.role,
+            claims.github_login.as_deref(),
+            github.as_deref(),
+            all_repos.clone(),
+        )
+        .await;
         Some(super::chat_work::Ctx {
             state: state.clone(),
             claims: claims.clone(),
-            readable: super::chat_work::readable(&holder),
+            readable: crate::bases::readable_kinds(&holder, &open),
             holder: holder.clone(),
-            repos: repo_names.clone(),
+            repos: work_repos.iter().map(|r| r.name.clone()).collect(),
             github_token: github.clone(),
             installation_id,
             jira,

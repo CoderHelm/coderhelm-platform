@@ -168,20 +168,37 @@ def diff(old, new):
     return result
 
 
+# Where a pending Forge update is accepted. Jira's own Manage apps page has no
+# Update for it, so it is never named as the place.
+ADMIN_PATH = (
+    "Atlassian Administration (admin.atlassian.com): Apps, Sites, choose the site, "
+    "Connected apps, Coderhelm, View app details, Update"
+)
+
+
+def admin_steps(install_url=""):
+    """The admin's steps, with the installation link first when there is one."""
+    if install_url:
+        return (f"An Atlassian site admin opens the app's installation link ({install_url}), "
+                f"chooses the site and clicks Update, or uses {ADMIN_PATH}.")
+    return f"An Atlassian site admin accepts the update in {ADMIN_PATH}."
+
+
 def summary_markdown(result):
     """The run summary text. Holds manifest facts only, never site names."""
     lines = ["## Jira app permissions", ""]
     if result["needs_admin"]:
         lines += [
-            "**A site admin must accept this update in Jira.** The new version asks for:",
+            "**An Atlassian site admin must accept this update.** The new version asks for:",
             "",
             *[f"- {r}" for r in result["reasons"]],
             "",
             "Forge rolls out code-only changes by itself, but not new access. On each site,",
-            "an admin opens **Jira settings (gear) → Apps → Manage apps**, finds **Coderhelm**",
-            "and clicks **Update**. Until then the site keeps running the previous major version.",
+            admin_steps() + " Until then the site keeps running the previous major version.",
             "The workflow also runs `forge install --upgrade` itself; that succeeds only on",
-            "sites where the Forge token's account is a site admin.",
+            "sites where the Forge token's account is a site admin. Its refusals elsewhere",
+            "(\"insufficient permissions\", or a suggestion to install for another product) are",
+            "about the token's account, not something the site is missing.",
         ]
     else:
         lines.append("No new access. Every site gets this version automatically; no one needs to do anything.")
@@ -242,13 +259,24 @@ def latest_version(versions):
     return ".".join(map(str, max(found))) if found else None
 
 
-def latest_pointer(versions, manifest, commit="", published_at=""):
-    """The pointer CoderHelm reads; None when no version is known."""
+INSTALL_LINK = re.compile(r"^https://developer\.atlassian\.com/console/install/[^\s]+$")
+
+
+def latest_pointer(versions, manifest, commit="", published_at="", install_url=""):
+    """The pointer CoderHelm reads; None when no version is known.
+
+    `install_url` is the app's installation link from the developer console
+    (Distribution); CoderHelm offers it to site admins as the one-click update.
+    Anything else is left out.
+    """
     version = latest_version(versions)
     if not version:
         return None
     app_id = str(((manifest or {}).get("app") or {}).get("id") or "")
-    return {"version": version, "appId": app_id, "commit": commit, "publishedAt": published_at}
+    out = {"version": version, "appId": app_id, "commit": commit, "publishedAt": published_at}
+    if install_url and INSTALL_LINK.match(install_url.strip()):
+        out["installUrl"] = install_url.strip()
+    return out
 
 
 def load_features(path):
@@ -282,8 +310,8 @@ def behind_report(lines, latest, features):
         return "", ""
     latest_text = f"latest {latest}" if latest else "latest unknown"
     md = ["", "## Sites still behind", ""]
-    md.append("Each one runs an older Coderhelm app until its Jira admin accepts the update:")
-    md.append("Jira Settings, Apps, Manage apps, Coderhelm, Update. CoderHelm shows the same on the team's Integrations page.")
+    md.append("Each one runs an older Coderhelm app until a site admin accepts the update.")
+    md.append(admin_steps() + " CoderHelm shows the same on the team's Integrations page.")
     md.append("")
     lacking = []
     for i, (major, product) in enumerate(rows, 1):
@@ -295,7 +323,7 @@ def behind_report(lines, latest, features):
     what = f" They lack: {', '.join(lacking)}." if lacking else ""
     warning = (
         f"{len(rows)} installation(s) still run an older Coderhelm app ({latest_text}).{what}"
-        " A Jira admin on each site must accept the update: Jira Settings, Apps, Manage apps, Coderhelm, Update."
+        " " + admin_steps()
     )
     return "\n".join(md) + "\n", warning
 
@@ -327,6 +355,7 @@ def main(argv=None):
     la.add_argument("--manifest", required=True)
     la.add_argument("--commit", default="")
     la.add_argument("--published-at", default="")
+    la.add_argument("--install-url", default="", help="the app's installation link (developer console, Distribution)")
 
     be = sub.add_parser("behind", help="summary and warning for installations still behind")
     be.add_argument("--failed", required=True, help='"major<TAB>product" lines')
@@ -357,7 +386,7 @@ def main(argv=None):
     if args.cmd == "latest":
         with open(args.versions, encoding="utf-8") as f:
             versions = json.load(f)
-        pointer = latest_pointer(versions, load_manifest(args.manifest), args.commit, args.published_at)
+        pointer = latest_pointer(versions, load_manifest(args.manifest), args.commit, args.published_at, args.install_url)
         if not pointer:
             print("no production version found", file=sys.stderr)
             return 1
