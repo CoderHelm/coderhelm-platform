@@ -378,7 +378,12 @@ pub async fn run(
                 }),
             )
             .await;
-            used.push(json!({ "kind": kind, "label": label, "name": name, "repo": repo, "summary": summary }));
+            let mut step = json!({ "kind": kind, "label": label, "name": name, "repo": repo, "summary": summary });
+            // A saved answer shows its failed lookups the way the live one did.
+            if is_error {
+                step["status"] = json!("error");
+            }
+            used.push(step);
             let mut r = json!({ "type": "tool_result", "tool_use_id": tu["id"], "content": text });
             if is_error {
                 r["is_error"] = json!(true);

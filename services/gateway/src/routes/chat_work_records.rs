@@ -102,13 +102,12 @@ pub async fn fetch(
         .ok_or("Your role can't see these in the dashboard.")?;
     let st = State(state.clone());
     let ext = Extension(c.clone());
-    let failed = |what: &str| format!("Coderhelm couldn't read the {what} just now.");
     let v: Value = match kind.key {
         "security" => {
             // Every finding of the team (the page lists them a page at a time).
             let all = Box::pin(super::security::load_findings(state, &c.team_id))
                 .await
-                .map_err(|_| failed("security findings"))?;
+                .map_err(read_failed(kind.key, "security findings"))?;
             json!({ "findings": all.into_iter().map(|(f, s)| {
                 let mut v = json!(f);
                 if let Some(sev) = s.severity { v["severity"] = json!(sev); }
@@ -119,7 +118,7 @@ pub async fn fetch(
         "infra" => Box::pin(super::infra_security::findings(st, ext))
             .await
             .map(of)
-            .map_err(|_| failed("infrastructure findings"))?,
+            .map_err(read_failed(kind.key, "infrastructure findings"))?,
         "tests" => {
             let mut p = json!({});
             if ask.state != "any" {
@@ -131,7 +130,7 @@ pub async fn fetch(
             Box::pin(super::tests::list_tests(st, ext, q(p)?))
                 .await
                 .map(of)
-                .map_err(|_| failed("tests"))?
+                .map_err(read_failed(kind.key, "tests"))?
         }
         "reviews" => {
             let mut p = json!({ "limit": 100 });
@@ -141,16 +140,16 @@ pub async fn fetch(
             Box::pin(super::reviewer::list_reviews(st, ext, q(p)?))
                 .await
                 .map(of)
-                .map_err(|_| failed("reviews"))?
+                .map_err(read_failed(kind.key, "reviews"))?
         }
         "alerts" => Box::pin(super::alerts::list_events(st, ext, q(json!({}))?))
             .await
             .map(of)
-            .map_err(|_| failed("alerts"))?,
+            .map_err(read_failed(kind.key, "alerts"))?,
         "log_findings" => Box::pin(super::log_findings::list_findings(st, ext, q(json!({}))?))
             .await
             .map(of)
-            .map_err(|_| failed("log findings"))?,
+            .map_err(read_failed(kind.key, "log findings"))?,
         "plans" => Box::pin(super::plans::list_plans(
             st,
             ext,
@@ -158,10 +157,21 @@ pub async fn fetch(
         ))
         .await
         .map(of)
-        .map_err(|_| failed("plans"))?,
+        .map_err(read_failed(kind.key, "plans"))?,
         _ => return Err("Pick one of the listed kinds.".into()),
     };
     Ok(rows(kind.key, &v))
+}
+
+/// The page's own error, logged; the model gets a plain sentence.
+fn read_failed<E: std::fmt::Debug>(
+    kind: &'static str,
+    what: &'static str,
+) -> impl FnOnce(E) -> String {
+    move |e| {
+        tracing::warn!(kind, error = ?e, "Chat: a records read failed");
+        format!("Coderhelm couldn't read the {what} just now.")
+    }
 }
 
 /// The list in a page's reply.

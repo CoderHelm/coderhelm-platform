@@ -1229,3 +1229,28 @@ test("sealing: the gateway and the worker may make data keys for envelopes, host
     for (const a of ["kms:Decrypt", "kms:GenerateDataKey*"]) assert.ok(([] as string[]).concat(both.Action).includes(a), `gateway lacks ${a}`);
   }
 });
+
+test("Chat's lookups can read what they look up from the streaming function", () => {
+  const s = synth(selfHost())["coderhelm-prod-streaming"];
+  // A large role's statements spill into a managed "overflow" policy.
+  const statements = [
+    ...Object.values(s.findResources("AWS::IAM::Policy")),
+    ...Object.values(s.findResources("AWS::IAM::ManagedPolicy")),
+  ].flatMap((p: any) => p.Properties.PolicyDocument.Statement as any[]);
+  const allows = (action: string, resource: string) =>
+    statements.some((st) => {
+      const actions = [st.Action].flat();
+      return st.Effect === "Allow" && actions.includes(action) && JSON.stringify(st.Resource).includes(resource);
+    });
+  for (const table of ["coderhelm-prod-runs", "coderhelm-prod-aws-insights", "coderhelm-prod-jira-config"]) {
+    assert.ok(allows("dynamodb:Query", `table/${table}`), `queries ${table}`);
+    assert.ok(allows("dynamodb:GetItem", `table/${table}`), `reads ${table}`);
+  }
+  assert.ok(allows("dynamodb:Query", "table/coderhelm-prod-runs/index/*"), "queries the runs table's indexes");
+  assert.ok(allows("dynamodb:Query", "table/coderhelm-prod-aws-insights/index/*"), "queries the findings indexes");
+  assert.ok(allows("dynamodb:Query", "TestsTable"), "reads test results");
+  assert.ok(allows("dynamodb:PutItem", "McpConfigsTable"), "writes an MCP tool call's audit entry");
+  assert.ok(envOf(s, "coderhelm-prod-streaming").TESTS_TABLE_NAME, "knows the tests table");
+  // Still read only where Chat only reads.
+  assert.ok(!allows("dynamodb:PutItem", "table/coderhelm-prod-runs"), "never writes runs");
+});

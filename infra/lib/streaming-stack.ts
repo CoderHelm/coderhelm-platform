@@ -25,6 +25,8 @@ interface StreamingStackProps extends cdk.StackProps {
   reposTable: dynamodb.TableV2;
   settingsTable: dynamodb.TableV2;
   mcpConfigsTable: dynamodb.TableV2;
+  /** E2E test results (Chat's tests lookup reads them). */
+  testsTable: dynamodb.TableV2;
   bucket: s3.Bucket;
   mcpProxyFunction: lambda.Function;
   secretsKey: kms.Key;
@@ -93,6 +95,7 @@ export class StreamingStack extends cdk.Stack {
         REPOS_TABLE_NAME: props.reposTable.tableName,
         SETTINGS_TABLE_NAME: props.settingsTable.tableName,
         MCP_CONFIGS_TABLE_NAME: props.mcpConfigsTable.tableName,
+        TESTS_TABLE_NAME: props.testsTable.tableName,
         ANALYTICS_TABLE_NAME: `${prefix}-analytics`,
         RUNS_TABLE_NAME: `${prefix}-runs`,
         EVENTS_TABLE_NAME: `${prefix}-events`,
@@ -137,7 +140,33 @@ export class StreamingStack extends cdk.Stack {
     // Read: plan chat settings. Write: the brain chat keeps its threads and
     // messages here (BRAIN#T# / BRAIN#M# records).
     props.settingsTable.grantReadWriteData(this.streamingFunction);
+    // Read: the team's MCP servers. Write: each tool call's audit entry and a
+    // refreshed sign-in token.
     props.mcpConfigsTable.grantReadData(this.streamingFunction);
+    this.streamingFunction.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ["dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem"],
+        resources: [props.mcpConfigsTable.tableArn],
+      })
+    );
+    // Chat's lookups (routes/chat_work*.rs) read what the dashboard's pages
+    // read: runs (by team, and the ticket index), infrastructure and log
+    // findings, the team's Jira app record and test results. One statement,
+    // so the role's policy stays within its inline size.
+    const chatReads = ["runs", "aws-insights", "jira-config"].map(
+      (name) => `arn:aws:dynamodb:${this.region}:${this.account}:table/${prefix}-${name}`
+    );
+    this.streamingFunction.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ["dynamodb:GetItem", "dynamodb:BatchGetItem", "dynamodb:Query", "dynamodb:Scan"],
+        resources: [
+          ...chatReads,
+          ...chatReads.map((t) => `${t}/index/*`),
+          props.testsTable.tableArn,
+          `${props.testsTable.tableArn}/index/*`,
+        ],
+      })
+    );
     // Plan chat opens a team's sealed MCP credentials for a tool call; it
     // never seals (the gateway does), so decrypt only.
     props.secretsKey.grantDecrypt(this.streamingFunction);
