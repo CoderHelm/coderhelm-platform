@@ -224,25 +224,25 @@ impl ModelProvider {
 /// a review holds the merge on); it is back on the strongest model.
 pub const MEASURED_LIGHT_MODEL: &str = "claude-sonnet-5-5";
 
-/// Which model writes a team's reviews. `Strongest` (the default, and what
-/// any value but `measured_light` reads as) keeps them on the judgment model.
-/// `MeasuredLight` writes them on [`MEASURED_LIGHT_MODEL`] with the critic on
-/// the judgment model, the configuration the synthetic measurement
-/// (`passes/model_route_eval.rs`, `route_review_live`) scored at the same
-/// recall at about half the cost. A team turns it on only after the replay of
-/// its own past reviews (`route_review_real_live`) holds.
+/// Which model writes a team's reviews. `MeasuredLight` (the default, and
+/// what any value but `strongest` reads as) writes them on
+/// [`MEASURED_LIGHT_MODEL`] with the critic on the judgment model, the
+/// configuration the synthetic measurement (`passes/model_route_eval.rs`,
+/// `route_review_live`) scored at the same recall at about half the cost.
+/// `Strongest` keeps them on the judgment model for a team that sets it.
+/// `route_review_real_live` replays a team's own past reviews to check it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ReviewRoute {
-    #[default]
     Strongest,
+    #[default]
     MeasuredLight,
 }
 
 impl ReviewRoute {
     pub fn parse(v: Option<&str>) -> Self {
         match v.map(str::trim) {
-            Some("measured_light") => ReviewRoute::MeasuredLight,
-            _ => ReviewRoute::Strongest,
+            Some("strongest") => ReviewRoute::Strongest,
+            _ => ReviewRoute::MeasuredLight,
         }
     }
 }
@@ -394,24 +394,24 @@ mod client_tests {
     }
 
     #[test]
-    fn reviews_stay_on_the_strongest_model_unless_the_team_switches() {
-        // Nothing saved, or anything but the measured route's name: strongest.
+    fn reviews_use_the_measured_model_unless_the_team_keeps_the_strongest() {
+        // Nothing saved, or anything but the strongest route's name: measured.
         for saved in [
             None,
             Some(""),
-            Some("strongest"),
+            Some("measured_light"),
             Some("sonnet"),
-            Some("Measured_Light"),
+            Some("Strongest"),
         ] {
             assert_eq!(
                 ReviewRoute::parse(saved),
-                ReviewRoute::Strongest,
+                ReviewRoute::MeasuredLight,
                 "{saved:?}"
             );
         }
         assert_eq!(
-            ReviewRoute::parse(Some("measured_light")),
-            ReviewRoute::MeasuredLight
+            ReviewRoute::parse(Some("strongest")),
+            ReviewRoute::Strongest
         );
         let mut p = provider("claude-opus-5-5", false);
         assert_eq!(p.review_model_id(), "claude-opus-5-5");

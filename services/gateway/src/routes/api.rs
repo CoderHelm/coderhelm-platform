@@ -6044,14 +6044,15 @@ pub async fn get_model_provider(
     })))
 }
 
-/// Which model writes the team's reviews: "strongest" (the default) or
-/// "measured_light" (the review written on the lighter measured model, its
-/// critic on the strongest; see the worker's `ReviewRoute`). Anything else
-/// reads as the default.
+/// Which model writes the team's reviews: "measured_light" (the default:
+/// the review written on the lighter measured model, its critic on the
+/// strongest; see the worker's `ReviewRoute`) or "strongest" (a team that
+/// keeps every review on the strongest model). Anything else reads as the
+/// default.
 fn review_model_route(v: Option<&str>) -> &'static str {
     match v.map(str::trim) {
-        Some("measured_light") => "measured_light",
-        _ => "strongest",
+        Some("strongest") => "strongest",
+        _ => "measured_light",
     }
 }
 
@@ -6072,13 +6073,13 @@ mod review_route_tests {
     use super::*;
 
     #[test]
-    fn the_review_route_is_strongest_until_a_team_picks_the_measured_one() {
-        assert_eq!(review_model_route(None), "strongest");
-        assert_eq!(review_model_route(Some("sonnet")), "strongest");
-        assert_eq!(review_model_route(Some("measured_light")), "measured_light");
+    fn the_review_route_is_measured_light_unless_a_team_picks_the_strongest() {
+        assert_eq!(review_model_route(None), "measured_light");
+        assert_eq!(review_model_route(Some("sonnet")), "measured_light");
+        assert_eq!(review_model_route(Some("strongest")), "strongest");
         // A save without the field keeps what was saved.
         let none = json!({"primary_model": "claude-sonnet-5-5"});
-        assert_eq!(review_route_to_save(&none, None), Ok("strongest"));
+        assert_eq!(review_route_to_save(&none, None), Ok("measured_light"));
         assert_eq!(
             review_route_to_save(&none, Some("measured_light")),
             Ok("measured_light")
