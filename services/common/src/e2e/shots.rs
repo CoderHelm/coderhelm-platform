@@ -586,20 +586,22 @@ pub fn newest_passing<'a>(history: &'a [HistoryEntry], branch: &str) -> Option<&
     })
 }
 
-/// The key an image of test `test` is kept under in the install's bucket;
-/// two tests never share one.
+/// The key an image of test `test` from run `run` is kept under in the
+/// install's bucket; two tests or two runs never share one.
+#[allow(clippy::too_many_arguments)]
 pub fn object_key(
     team: &str,
     repo: &str,
     pr: u64,
     sha: &str,
+    run: &str,
     test: &str,
     side: &str,
     ext: &str,
 ) -> String {
     let test = hex::encode(Sha256::digest(test.as_bytes()));
     format!(
-        "{KEY_PREFIX}/{}/{repo}/{pr}/{}/{}/{side}.{ext}",
+        "{KEY_PREFIX}/{}/{repo}/{pr}/{}/{run}/{}/{side}.{ext}",
         team_folder(team),
         sha.get(..12).unwrap_or(sha),
         &test[..16]
@@ -915,16 +917,26 @@ mod tests {
 
     #[test]
     fn a_link_reads_one_image_of_its_own_team_until_it_expires() {
-        let key = object_key("TEAM#a", "o/r", 7, "0123456789abcdef", "t", "after", "png");
+        let key = object_key(
+            "TEAM#a",
+            "o/r",
+            7,
+            "0123456789abcdef",
+            "12-1",
+            "t",
+            "after",
+            "png",
+        );
         // sha256("t") = e3b98a4da31a127d...
         assert_eq!(
             key,
-            "e2e-shots/TEAM_a/o/r/7/0123456789ab/e3b98a4da31a127d/after.png"
+            "e2e-shots/TEAM_a/o/r/7/0123456789ab/12-1/e3b98a4da31a127d/after.png"
         );
-        assert_ne!(
-            key,
-            object_key("TEAM#a", "o/r", 7, "0123456789abcdef", "u", "after", "png")
-        );
+        let other = |run: &str, test: &str| {
+            object_key("TEAM#a", "o/r", 7, "0123456789abcdef", run, test, "after", "png")
+        };
+        assert_ne!(key, other("12-1", "u"));
+        assert_ne!(key, other("13-1", "t"));
         let t = sign("s", "TEAM#a", &key, 100);
         assert_eq!(verify("s", &t, 99), Ok(key.clone()));
         assert_eq!(verify("s", &t, 100), Err(TokenError::Expired));

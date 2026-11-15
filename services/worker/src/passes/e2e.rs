@@ -636,6 +636,7 @@ pub async fn ingest(state: &WorkerState, msg: TestIngest) -> Result<(), Err> {
                 &st,
                 super::e2e_screens::Head {
                     msg: &msg,
+                    run_key: &run_key,
                     pr,
                     tests: &tests,
                     reports: &reports,
