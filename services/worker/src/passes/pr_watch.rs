@@ -1116,9 +1116,9 @@ async fn catch_up_one(state: &WorkerState, github: &GitHubClient, c: &Candidate)
             info!(run_id = %c.run_id, pr = c.pr, "Description catch-up: no CoderHelm stamp, or a person edited it; left as it is");
             CaughtUp::Done(false)
         }
-        // The one rebuild, from the facts of the head; its save runs the
-        // final review.
-        CatchUp::Rebuild => match description::reconcile_run(
+        // Wholly CoderHelm's: built again from the facts of the head alone,
+        // nothing of the old text kept; its save runs the final review.
+        CatchUp::Rebuild => match description::catch_up_run(
             state, github, &c.team_id, &c.run_id, &c.owner, &c.repo, c.pr,
         )
         .await

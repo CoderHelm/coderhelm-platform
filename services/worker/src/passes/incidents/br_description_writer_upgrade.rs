@@ -17,9 +17,11 @@
 //! out), and a description built by another writer, or by one from before
 //! the version, is not current. The pull request watch's sweep catches up
 //! open pull requests CoderHelm opened, whatever the age of their run: a few
-//! per team each sweep, inside its GitHub budget, each rebuilt once through
-//! the one rebuild (the facts of the head, then the final review in the
-//! save) and marked on its run. A description with no CoderHelm stamp, or
+//! per team each sweep, inside its GitHub budget, each rebuilt once and
+//! marked on its run. A description still wholly CoderHelm's is built
+//! again from the facts of the head alone (then the final review in the
+//! save): nothing of the old text is kept, not even in a fold, except a
+//! line that closes an issue. A description with no CoderHelm stamp, or
 //! whose checked text a person changed, is left as it is.
 
 use super::fixture::*;
@@ -93,10 +95,15 @@ fn stamped_before(body: &str) -> String {
     )
 }
 
-/// The one rebuild on the same head, as `description::build` runs it: the
-/// facts of the head (the checks have passed), the shape, the stamp, then
-/// what the save writes.
+/// The catch-up's rebuild on the same head, as `description::catch_up_run`
+/// runs it: only a description wholly CoderHelm's is rebuilt, from the
+/// facts of the head alone (the checks have passed) with nothing of its
+/// old text kept, then stamped and written as the save writes.
 fn rebuilt(body: &str) -> String {
+    if description::catch_up(body, HEAD) != CatchUp::Rebuild {
+        return body.to_string();
+    }
+    let body = &description::fresh_base(body);
     let files = vec![(
         "apps/studio/blocks/banner-validation.ts".to_string(),
         "added".to_string(),
@@ -171,7 +178,74 @@ fn an_old_layout_description_on_an_unchanged_head_is_rebuilt_once() {
     // Rebuilt once: current on the head, nothing for the next sweep.
     assert!(description::is_current(&new, HEAD), "{new}");
     assert_eq!(description::catch_up(&new, HEAD), CatchUp::Current);
-    assert_eq!(rebuilt(&new), new, "a second rebuild changes nothing");
+    assert_eq!(rebuilt(&new), new, "a second catch-up changes nothing");
+}
+
+/// An older description, from before the lead and the reviewer block had
+/// markers: nothing tells its old lead from its prose. Wholly CoderHelm's
+/// (the digest still matches), it is built again from the facts and no
+/// old line survives anywhere, not even in a fold; the line that closes
+/// its issue is kept.
+#[test]
+fn an_old_description_without_markers_keeps_no_old_line() {
+    let unmarked = format!(
+        "Adds a length warning to the banner block's caption in the Studio (OPS-12).
+
+### Review focus
+
+- Approach: decide whether this does what OPS-12 asks. CoderHelm's conclusion: nothing is out of the ordinary.
+- Read first: `apps/studio/blocks/banner-validation.ts` (the largest change to code).
+- See it: Studio: Home page ({PAGE_ID}), banner caption field.
+
+**For the reviewer**
+* **Look first:** `apps/studio/blocks/banner-validation.ts`, the largest change to code.
+* **Roll back:** revert this pull request; nothing outside the code changes with it.
+* **Not verified on `5ab6c7d`:** `Lint` (still running); `Studio build` (did not run).
+
+**Rollback:** Revert this pull request; nothing outside the code changes with it.
+
+### Verification
+
+| Check | Result |
+|---|---|
+| Lint (CI) | Not run: still running when this was written |
+| Unit tests (CI) | Not run: still running when this was written |
+| Type check (CI) | Not run: still running when this was written |
+| Build (CI) | Not run: still running when this was written |
+| Studio build (CI) | Not run: still running when this was written |
+| Test Coverage Report (CI) | Not run: still running when this was written |
+
+Closes #12
+"
+    );
+    assert!(!unmarked.contains("<!-- coderhelm:lead -->"));
+    assert!(!unmarked.contains("<!-- coderhelm:reviewer-guide -->"));
+    let old = stamped_before(&unmarked);
+    assert_eq!(description::catch_up(&old, HEAD), CatchUp::Rebuild);
+    let new = rebuilt(&old);
+    for line in [
+        "still running when this was written",
+        "Look first",
+        "Roll back",
+        "For the reviewer",
+        "nothing is out of the ordinary",
+        "(still running)",
+        "Test Coverage Report",
+        PAGE_ID,
+    ] {
+        assert!(!new.contains(line), "{line:?} is still in: {new}");
+    }
+    assert!(new.contains("| Lint (CI) | Passed |"), "{new}");
+    assert!(new.contains("Closes #12"), "the issue still closes: {new}");
+    assert!(description::is_current(&new, HEAD), "{new}");
+    assert_eq!(rebuilt(&new), new, "rebuilt once");
+    // The catch-up runs this path, and the build drops the old body.
+    let src = include_str!("../description.rs");
+    let run = fn_src(src, "\npub async fn catch_up_run(");
+    assert!(run.contains("false, true, None"), "{run}");
+    let build = fn_src(src, "\nasync fn build(");
+    assert!(build.contains("None if fresh => (fresh_base(&body), None)"));
+    assert!(build.contains("fresh && catch_up(&body, &head) != CatchUp::Rebuild"));
 }
 
 /// The catch-up never writes over a person: a description with no stamp,
@@ -221,8 +295,8 @@ fn the_watch_sweep_catches_up_a_few_per_team() {
     let one = fn_src(src, "\nasync fn catch_up_one(");
     assert!(one.contains("description::catch_up("));
     assert!(
-        one.contains("description::reconcile_run("),
-        "the one rebuild"
+        one.contains("description::catch_up_run("),
+        "the rebuild from the facts alone"
     );
     let all = fn_src(src, "\nasync fn catch_up(");
     assert!(all.contains("budget\n            .allows(") || all.contains("budget.allows("));

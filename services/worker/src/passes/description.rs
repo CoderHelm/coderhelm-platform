@@ -249,6 +249,7 @@ pub async fn head_moved(
         m.number,
         m.ticket_id,
         true,
+        false,
         Some(Reader { provider, usage }),
     )
     .await;
@@ -479,7 +480,7 @@ pub async fn reconcile(
     ticket_id: &str,
 ) -> Reconciled {
     build(
-        state, github, team_id, owner, repo, number, ticket_id, false, None,
+        state, github, team_id, owner, repo, number, ticket_id, false, false, None,
     )
     .await
 }
@@ -506,6 +507,7 @@ pub async fn reconcile_read(
         number,
         ticket_id,
         true,
+        false,
         Some(reader),
     )
     .await
@@ -523,7 +525,7 @@ pub async fn rebuild(
     ticket_id: &str,
 ) -> Reconciled {
     build(
-        state, github, team_id, owner, repo, number, ticket_id, true, None,
+        state, github, team_id, owner, repo, number, ticket_id, true, false, None,
     )
     .await
 }
@@ -790,6 +792,9 @@ async fn build(
     number: u64,
     ticket_id: &str,
     force: bool,
+    // The catch-up's rebuild ([`catch_up_run`]): a description wholly
+    // CoderHelm's is built again from the facts alone.
+    fresh: bool,
     reader: Option<Reader<'_>>,
 ) -> Reconciled {
     if number == 0 {
@@ -808,6 +813,11 @@ async fn build(
         return Reconciled::Failed("the pull request names no head".into());
     }
     if !force && is_current(&body, &head) {
+        return Reconciled::Current;
+    }
+    // Read again here, as it is now: a person who edited it since the sweep
+    // looked is never written over.
+    if fresh && catch_up(&body, &head) != CatchUp::Rebuild {
         return Reconciled::Current;
     }
     // Everything computed from the branch, for this head: a dependency
@@ -829,6 +839,7 @@ async fn build(
     };
     let (base, dependency) = match computed {
         Some((b, d)) => (b, Some(d)),
+        None if fresh => (fresh_base(&body), None),
         None => (body.clone(), None),
     };
     // The facts of this head, and the description as a view of them: every
@@ -888,6 +899,45 @@ async fn build(
         }
         Err(e) => Reconciled::Failed(format!("the description could not be saved: {e}")),
     }
+}
+
+/// The catch-up's rebuild of a run's pull request after an upgrade: when
+/// the description is wholly CoderHelm's ([`catch_up`] says Rebuild), it is
+/// built again from the facts of the head alone and nothing of the earlier
+/// writer's text is kept ([`fresh_base`]), so no old line survives in a
+/// fold. Anything else is left as it is.
+pub async fn catch_up_run(
+    state: &WorkerState,
+    github: &GitHubClient,
+    team_id: &str,
+    run_id: &str,
+    owner: &str,
+    repo: &str,
+    number: u64,
+) -> Reconciled {
+    let ticket = run_ticket(state, team_id, run_id).await;
+    build(
+        state, github, team_id, owner, repo, number, &ticket, false, true, None,
+    )
+    .await
+}
+
+/// What a description wholly CoderHelm's keeps when the catch-up builds it
+/// again: only the lines that close an issue (`Closes #12`), which GitHub
+/// acts on at merge. Everything else an earlier writer wrote (its lead,
+/// its reviewer block, its frozen check rows) is dropped, and the body is
+/// rendered from the facts of the head.
+pub fn fresh_base(body: &str) -> String {
+    body.lines()
+        .map(str::trim)
+        .filter(|l| {
+            let l = l.to_lowercase();
+            ["closes #", "fixes #", "resolves #"]
+                .iter()
+                .any(|k| l.starts_with(k))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// [`reconcile`] for a run's pull request, its ticket read from the run.
