@@ -31,7 +31,7 @@ It uses GitHub's [manifest flow](https://docs.github.com/en/apps/sharing-github-
 | Pull requests | write | Open and update pull requests; post reviews |
 | Issues | write | Read assigned issues; post progress |
 | Checks | write | Read CI results to fix failures; show the "CoderHelm review" check on a pull request's commit from the moment CoderHelm accepts anything on it (a push, a reply, a re-review, an edited description), saying what it is doing, until it ends, linking to the session page; a reply that is only answered leaves the commit showing the standing verdict |
-| Actions | read | Read workflow runs and logs |
+| Actions | read | Read workflow runs and logs. Write is never asked for: with it, CoderHelm can also start a workflow with `workflow_dispatch` (setup checks names it once for the install, under Starting workflows); without it, workflows start through the pull request labels they run on and end-to-end results are read from the checks, runs, comments and published report, never handed to a person on a pull request |
 | Commit statuses | read | CI that reports statuses instead of checks |
 | Workflows | write | Change workflow files when a task asks for it |
 | Metadata | read | Repository list and details |

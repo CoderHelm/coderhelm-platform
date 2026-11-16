@@ -1640,6 +1640,24 @@ pub fn step_now(c: &OutsideChange, i: usize, pr_open: bool) -> Option<Step> {
                         on: "on its next step (labels need no workflow permission)".to_string(),
                     },
                 )
+            } else if s.result.contains(common::github_grants::INSTALL_LEVEL)
+                && !matches!(
+                    s.step_kind(),
+                    StepKind::Deploy | StepKind::Content | StepKind::Migration
+                )
+            {
+                // A permission the whole install lacks: one item on the
+                // install's setup checks, never a hand-off on this pull
+                // request. The step stays CoderHelm's (it reads the result
+                // by every route the installation can read).
+                let why = s.result.trim().trim_start_matches("not done:").trim();
+                (
+                    "CoderHelm".to_string(),
+                    State::Failed {
+                        cause: pr_steps::strip_machinery(why),
+                        unblock: String::new(),
+                    },
+                )
             } else if !s.result.trim().is_empty() {
                 let why = s.result.trim().trim_start_matches("not done:").trim();
                 // What the executor wrote: the reason, then the access to grant.
@@ -1651,7 +1669,10 @@ pub fn step_now(c: &OutsideChange, i: usize, pr_open: bool) -> Option<Step> {
                 };
                 // Who would act only matters when the cause is a permission
                 // or a credential; anything else stays CoderHelm's.
-                let owner = if unblock.contains("GitHub") || unblock.contains("Settings") {
+                let owner = if unblock.contains("GitHub")
+                    || unblock.contains("Settings")
+                    || common::github_grants::Denial::parse(&cause).is_some()
+                {
                     "a repository admin"
                 } else {
                     "CoderHelm"

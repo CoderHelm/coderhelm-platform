@@ -468,10 +468,13 @@ fn a_failed_attempt_reaches_a_person_only_for_a_permission_or_a_credential() {
             "{why}"
         );
     }
-    let refused = person_gate::decide(
+    // Words alone claim no permission; the refusal GitHub sent does.
+    let words = person_gate::decide(
         &attempt("CoderHelm's GitHub App is not allowed to start workflows in this repository"),
         &ctx,
     );
+    assert_eq!(words.class(), Class::Do, "{words:?}");
+    let refused = person_gate::decide(&attempt("GitHub answered 403 to `POST /repos/acme/site/actions/workflows/release.yml/dispatches`: the GitHub App needs Actions: write"), &ctx);
     assert!(matches!(refused, Outcome::Human(_)), "{refused:?}");
     // A step that names a workflow called "Deploy ..." is not a deploy.
     let read = person_gate::Ask {

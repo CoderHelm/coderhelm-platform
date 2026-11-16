@@ -408,20 +408,8 @@ async fn act(
     match action {
         Action::Dispatch(r) | Action::Label(_, r) => {
             start(cx, s, &action_label(&args), &r, until, p).await;
-            // Not allowed to start a workflow: an end-to-end run that also
-            // runs on a label is started by the label (no Actions grant).
-            if s.result.contains(NO_ACTIONS_WRITE) && s.step_kind() == StepKind::E2e {
-                if let Some(lr) = a
-                    .e2e
-                    .iter()
-                    .find(|x| matches!(x.trigger, outside_work::Trigger::Label(_)))
-                    .cloned()
-                {
-                    if let outside_work::Trigger::Label(l) = &lr.trigger {
-                        let label = Some(l.clone());
-                        start(cx, s, &label, &lr, until, p).await;
-                    }
-                }
+            if s.result.contains(NO_ACTIONS_WRITE) {
+                Box::pin(other_routes(cx, a, s, &r, until, p)).await;
             }
         }
         Action::Write(Target::Staging) => {
@@ -509,10 +497,12 @@ async fn write(
     }
 }
 
-/// What a step that needs a workflow started says where the app may not
-/// start one: the cause, then the access that lifts it (after `; grant:`,
-/// as every step's reason is written).
-pub const NO_ACTIONS_WRITE: &str = "CoderHelm's GitHub App is not allowed to start workflows in this repository; grant: give the app \"Actions: write\" (GitHub, Settings, Installed GitHub Apps, CoderHelm, Permissions), or run the command yourself";
+/// What a step that needs a workflow started by `workflow_dispatch` says
+/// where the installation's GitHub App lacks `Actions: write`: one
+/// install-level item (`github_grants::install_item`), never a hand-off on
+/// the pull request. The step still runs by every other route: the label
+/// the workflow runs on, and reading the results already on the head.
+pub const NO_ACTIONS_WRITE: &str = "the GitHub app needs Actions: write to start workflows with workflow_dispatch; an organization owner accepts the permission update once for the install (an install-level permission)";
 
 /// The attribute on a run that names a GitHub permission one of its steps
 /// needed and the app lacks: one item for an admin, whatever number of
@@ -614,11 +604,18 @@ async fn start(
             s.run = None;
             let text = e.to_string();
             let lower = text.to_lowercase();
-            if lower.contains("resource not accessible by integration") || lower.contains("403") {
+            let denial = if label.is_none() {
+                common::github_grants::Denial::from_error("POST", &text, "actions", "write")
+            } else {
+                None
+            };
+            if let Some(d) = denial {
                 // Remembered: the steps after this one say so without trying.
                 common::github_grants::refused_write(installation, "actions");
-                s.result = format!("not done: {NO_ACTIONS_WRITE}");
+                s.result = format!("not done: {}; {NO_ACTIONS_WRITE}", d.line());
                 note_permission_needed(cx).await;
+            } else if lower.contains("resource not accessible by integration") {
+                s.result = format!("not done: starting {} was refused: {text}", r.line());
             } else {
                 s.result = format!("not done: starting {} failed: {text}", r.line());
             }
@@ -641,6 +638,111 @@ async fn start(
         }
     }
     poll(cx, s, r, until, p).await;
+}
+
+/// The end-to-end route to start: one that runs on a label first when the
+/// installation can't start workflows by `workflow_dispatch` (a label needs
+/// no Actions permission).
+fn startable_e2e(a: &Abilities, installation: u64) -> Option<Route> {
+    let no_dispatch = common::github_grants::write_grant(installation, "actions")
+        == common::github_grants::Grant::Missing;
+    let label = a
+        .e2e
+        .iter()
+        .find(|r| matches!(r.trigger, outside_work::Trigger::Label(_)));
+    if no_dispatch {
+        if let Some(r) = label {
+            return Some(r.clone());
+        }
+    }
+    a.e2e.iter().find(|r| r.startable()).cloned()
+}
+
+/// The names a step reads that are workflows: those a run on the head or a
+/// route of the repository carries. A step that names none reads them all.
+pub fn known_names(names: &[String], runs: &[Value], a: &Abilities) -> Vec<String> {
+    let fits = |n: &str, have: &str| {
+        let (n, have) = (n.to_lowercase(), have.to_lowercase());
+        !have.is_empty() && (n == have || have.contains(&n) || n.contains(&have))
+    };
+    names
+        .iter()
+        .filter(|n| {
+            runs.iter()
+                .any(|r| fits(n, r["name"].as_str().unwrap_or("")))
+                || a.e2e
+                    .iter()
+                    .chain(a.deploys.iter())
+                    .any(|r| fits(n, &r.name) || fits(n, r.file.rsplit('/').next().unwrap_or("")))
+        })
+        .cloned()
+        .collect()
+}
+
+/// After a `workflow_dispatch` the installation can't make: the label the
+/// same work runs on, and, for a step that reads a result, the result
+/// already on the head from every route the installation can read
+/// (`e2e_reads`). Only when none of them answers does the step stay not
+/// done, with the one install-level permission named.
+async fn other_routes(
+    cx: &Ctx<'_>,
+    a: &Abilities,
+    s: &mut NoteStep,
+    r: &Route,
+    until: Instant,
+    p: &mut Progress,
+) {
+    let same_work = |x: &&Route| {
+        matches!(x.trigger, outside_work::Trigger::Label(_))
+            && (x.file == r.file
+                || s.step_kind() == StepKind::E2e
+                || super::e2e_reads::is_e2e_name(&r.name))
+    };
+    if let Some(lr) = a
+        .e2e
+        .iter()
+        .chain(a.deploys.iter())
+        .find(same_work)
+        .cloned()
+    {
+        if let outside_work::Trigger::Label(l) = &lr.trigger {
+            let label = Some(l.clone());
+            start(cx, s, &label, &lr, until, p).await;
+            if !s.result.contains(NO_ACTIONS_WRITE) {
+                return;
+            }
+        }
+    }
+    let reads = matches!(
+        s.step_kind(),
+        StepKind::E2e | StepKind::Verify | StepKind::Other
+    ) || super::e2e_reads::is_e2e_name(&r.name);
+    if !reads {
+        return;
+    }
+    let Ok(sha) = head_sha(cx).await else {
+        return;
+    };
+    let short = &sha[..sha.len().min(7)];
+    match super::e2e_reads::read(cx, &sha).await {
+        Some(super::e2e_reads::Verdict::Passed(how)) => {
+            s.done = true;
+            s.run = None;
+            s.result = format!("read on `{short}`: {how}");
+        }
+        Some(super::e2e_reads::Verdict::Failed(how)) => {
+            s.run = None;
+            s.result = format!(
+                "not done: read on `{short}`: {how}; the failure goes to the run's CI fix round"
+            );
+        }
+        Some(super::e2e_reads::Verdict::Running) => {
+            p.waiting = true;
+            s.run = None;
+            s.result.clear();
+        }
+        None => {}
+    }
 }
 
 /// Looks for the run a step started (the newest run of its workflow on the
@@ -1104,7 +1206,10 @@ async fn runs_step(
             return;
         }
     };
-    let v = runs_verdict(&runs, names);
+    // Only names that are workflows: a quoted phrase in the step's words
+    // (a page's text it looks for) is not a run to wait for.
+    let names = known_names(names, &runs, a);
+    let v = runs_verdict(&runs, &names);
     let short = &sha[..sha.len().min(7)];
     if v.done() {
         s.done = true;
@@ -1137,14 +1242,19 @@ async fn runs_step(
     } else {
         format!("{} was skipped", v.skipped.join(", "))
     };
-    match a.e2e.iter().find(|r| r.startable()).cloned() {
+    match startable_e2e(a, cx.github.installation_id()) {
         Some(r) => {
             let label = match &r.trigger {
                 outside_work::Trigger::Label(l) => Some(l.clone()),
                 _ => None,
             };
             Box::pin(start(cx, s, &label, &r, until, p)).await;
-            s.result = format!("{why} on `{short}`; {}", s.result);
+            if s.result.contains(NO_ACTIONS_WRITE) {
+                Box::pin(other_routes(cx, a, s, &r, until, p)).await;
+            }
+            if !s.done {
+                s.result = format!("{why} on `{short}`; {}", s.result);
+            }
         }
         None => {
             s.result = format!(
@@ -1608,6 +1718,67 @@ mod tests {
             command: "npx sanity deploy".into(),
             trigger,
         }
+    }
+
+    /// A run once handed a repository admin two "before merge" items for
+    /// reading its own end-to-end results: the token lacked Actions: write,
+    /// nothing was refused, and a quoted page text ("Page Not Found") was
+    /// read as a workflow to start.
+    #[test]
+    fn reading_an_end_to_end_result_never_becomes_a_persons_permission() {
+        let e2e = Route {
+            name: "E2E Playwright".into(),
+            file: ".github/workflows/e2e-playwright.yml".into(),
+            command: String::new(),
+            trigger: Trigger::Dispatch,
+        };
+        let by_label = Route {
+            name: "E2E Playwright".into(),
+            file: ".github/workflows/e2e-playwright.yml".into(),
+            command: String::new(),
+            trigger: Trigger::Label("CI:E2E".into()),
+        };
+        let a = Abilities {
+            e2e: vec![e2e.clone(), by_label.clone()],
+            ..Default::default()
+        };
+        // Quoted page text is not a workflow; a workflow's name is.
+        let runs = vec![serde_json::json!({"name": "E2E Playwright"})];
+        assert_eq!(
+            known_names(
+                &["Page Not Found".to_string(), "E2E Playwright".to_string()],
+                &runs,
+                &a
+            ),
+            vec!["E2E Playwright".to_string()]
+        );
+        // Without Actions: write the label route is the one started.
+        let installation = 7_700_001;
+        common::github_grants::record(installation, &serde_json::json!({"actions": "read"}));
+        assert_eq!(startable_e2e(&a, installation), Some(by_label));
+        // A step left on the install-level permission stays CoderHelm's:
+        // nothing on the pull request asks a person for it.
+        let mut s = step(
+            "e2e",
+            "staging",
+            "Read the end-to-end result on the preview",
+        );
+        s.result = format!("not done: {NO_ACTIONS_WRITE}");
+        let c = OutsideChange {
+            steps: vec![s],
+            ..Default::default()
+        };
+        let left = outside_work::left(&c);
+        assert!(left.human.is_empty(), "{:?}", left.human);
+        assert!(NO_ACTIONS_WRITE.contains(common::github_grants::INSTALL_LEVEL));
+        assert_eq!(
+            NO_ACTIONS_WRITE,
+            common::github_grants::install_item(
+                "actions",
+                "write",
+                "start workflows with workflow_dispatch"
+            )
+        );
     }
 
     #[test]
