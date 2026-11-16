@@ -122,12 +122,13 @@ fn a_finding_the_ticket_comment_rules_out_is_dropped_by_the_ticket_not_deferred(
     let Plan::Settle {
         deferred,
         by_ticket,
+        noted,
     } = l.decide(&[NAV_AGAIN.to_string()], 0.0, 200.0)
     else {
         panic!("settled by the ticket");
     };
-    assert!(deferred.is_empty());
-    let lines = ledger::settled_lines(&deferred, &by_ticket);
+    assert!(deferred.is_empty() && noted.is_empty());
+    let lines = ledger::settled_lines(&deferred, &by_ticket, &noted);
     assert!(lines[0].contains("the ticket rules it out"), "{lines:?}");
     // The review of the head then names it as a note, never a hold.
     let mut findings: Vec<crate::passes::review_agent::Finding> = serde_json::from_value(serde_json::json!([

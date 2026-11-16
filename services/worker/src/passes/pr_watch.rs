@@ -675,8 +675,8 @@ async fn perform(
                         _ => Performed::Settled,
                     }
                 }
-                super::resume::OwnRound::Person(why) => {
-                    info!(run_id = %c.run_id, why = %why, "PR watch: no fix round for the review's findings now");
+                super::resume::OwnRound::Later(why) => {
+                    info!(run_id = %c.run_id, why = %why, "PR watch: no fix round for the review's findings this moment");
                     Performed::NotStarted
                 }
             }

@@ -1661,6 +1661,7 @@ pub async fn implement_result(
         writes: Default::default(),
         outside_plan: Vec::new(),
         refused: Vec::new(),
+        owed: Vec::new(),
         evidence: super::proof::RunEvidence {
             notes: run.report_md(),
             checks: run
