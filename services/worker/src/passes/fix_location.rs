@@ -588,8 +588,9 @@ pub fn next_step_gaps(d: Option<&FixDecision>) -> Vec<String> {
 /// The message that sends a planner back with what its decision lacks.
 pub fn send_back(gaps: &[String]) -> String {
     format!(
-        "Before this decision stands:\n{}\nThen answer again in full: the four openspec files and the fix_location.json block, with `data_shows` saying only what your lookups returned.",
-        gaps.iter().map(|g| format!("- {g}")).collect::<Vec<_>>().join("\n")
+        "Before this decision stands:\n{}\nThen answer with `data_shows` saying only what your lookups returned. {}",
+        gaps.iter().map(|g| format!("- {g}")).collect::<Vec<_>>().join("\n"),
+        common::run_questions::CHANGED_FILES_ONLY
     )
 }
 

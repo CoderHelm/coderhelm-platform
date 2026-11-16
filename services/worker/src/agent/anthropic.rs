@@ -711,6 +711,7 @@ pub async fn converse_tool_loop(
     effort: Option<&str>,
     observer: Option<&dyn super::llm::LoopObserver>,
     mut conversation_log: Option<&mut Vec<Value>>,
+    form: super::llm::AnswerForm,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let family = ModelFamily::of(model_id);
     // Cache breakpoint on the last tool: caches the tool definitions, which
@@ -743,6 +744,14 @@ pub async fn converse_tool_loop(
     // [`MAX_CUT_RETRIES`] times.
     let mut effort = effort;
     let mut cut_retries: u32 = 0;
+    // What a cut turn is told depends on the work: a coder acts in small
+    // edits, a planner continues its document where it stopped (the
+    // planner was once told to make "small edit_file calls" it doesn't
+    // have, wrote only its last block again, and the run lost its plan).
+    let work = form.work(tools);
+    // A document's text written before a cut: the answer is that text and
+    // its continuation, never the continuation alone.
+    let mut written = String::new();
 
     loop {
         turns += 1;
@@ -898,6 +907,7 @@ pub async fn converse_tool_loop(
         ) {
             cut_retries += 1;
             effort = Some(lower_effort(effort));
+            let note = take_cut(work, cut, &blocks, &mut written);
             warn!(
                 max_tokens,
                 retry = cut_retries,
@@ -911,7 +921,7 @@ pub async fn converse_tool_loop(
                 call,
                 turns,
                 common::agent_log::NoteKind::OutputLimit,
-                OUTPUT_LIMIT_NOTE,
+                note,
             );
             if cut == CutTurn::ThinkingOnly {
                 // A reply that only thought is dropped: its thinking was cut
@@ -923,18 +933,18 @@ pub async fn converse_tool_loop(
                 messages.pop();
                 match messages.last_mut() {
                     Some((role, content)) if role == "user" => {
-                        content.push(json!({"type": "text", "text": OUTPUT_LIMIT_NOTE}));
+                        content.push(json!({"type": "text", "text": note}));
                     }
                     _ => messages.push((
                         "user".to_string(),
-                        vec![json!({"type": "text", "text": OUTPUT_LIMIT_NOTE})],
+                        vec![json!({"type": "text", "text": note})],
                     )),
                 }
             } else {
                 // What it said stays in history: the model sees where it was cut.
                 messages.push((
                     "user".to_string(),
-                    vec![json!({"type": "text", "text": OUTPUT_LIMIT_NOTE})],
+                    vec![json!({"type": "text", "text": note})],
                 ));
             }
             continue;
@@ -968,7 +978,8 @@ pub async fn converse_tool_loop(
                     "stop_reason": response.stop_reason
                 }));
             }
-            return extract_text(&blocks);
+            let text = extract_text(&blocks)?;
+            return Ok(super::llm::stitch(&written, &text));
         }
 
         // What the agent said before its calls: the "why" on an approval card.
@@ -1509,12 +1520,105 @@ fn read_message(
 /// before the loop reads the cut as the answer.
 const MAX_CUT_RETRIES: u32 = 3;
 
-/// What the model reads after a turn cut at the output limit before any
-/// tool call.
-const OUTPUT_LIMIT_NOTE: &str = "[SYSTEM NOTE] Your last turn reached the output limit before \
+/// What a loop that edits files (the coder, the feedback and fix rounds)
+/// reads after a turn cut at the output limit before any tool call.
+const EDIT_CUT_NOTE: &str = "[SYSTEM NOTE] Your last turn reached the output limit before \
     you made any tool call, so nothing was done. Think briefly, then act now: make the next tool \
     call, and make a change in small edit_file calls (a few lines each), one call per turn if \
     needed. If the task is not needed, say so in one sentence; otherwise give your final answer.";
+
+/// What a loop that writes a document (the planner) reads after a turn
+/// that wrote part of it and was cut at the output limit.
+const DOCUMENT_CUT_NOTE: &str = "[SYSTEM NOTE] Your last answer reached the output limit and \
+    was cut off mid-way. Continue it exactly where it stopped: start with the next characters of \
+    the cut text, repeat nothing already written, and finish every file and block that is still \
+    open, closing each fence. Keep it short: the files before the cut are kept as they are.";
+
+/// What a loop that writes a document reads after a turn that only
+/// thought, up to the output limit, and wrote nothing.
+const DOCUMENT_THOUGHT_NOTE: &str = "[SYSTEM NOTE] Your last turn reached the output limit while \
+    thinking, before it wrote anything. Think briefly, then act now: make the next lookup you \
+    need, or write the document, each file whole in its own fence and kept short.";
+
+/// What any other loop (a reviewer, a check, a question screen) reads after
+/// a turn cut at the output limit before any tool call.
+const ANSWER_CUT_NOTE: &str = "[SYSTEM NOTE] Your last turn reached the output limit before \
+    you made any tool call or finished your answer, so nothing was done. Think briefly, then act \
+    now: make the next tool call you need, or give your final answer, shorter than before.";
+
+/// One cut turn taken again: the note it reads, with a document's cut text
+/// kept in `written` (the answer is stitched from it).
+fn take_cut(
+    work: super::llm::CutWork,
+    cut: CutTurn,
+    blocks: &[ContentBlock],
+    written: &mut String,
+) -> &'static str {
+    if work == super::llm::CutWork::Document && cut == CutTurn::SaidSomething {
+        *written = super::llm::stitch(written, &text_of(blocks));
+    }
+    cut_note(work, cut)
+}
+
+fn text_of(blocks: &[ContentBlock]) -> String {
+    blocks
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The loop's handling of turns that made no tool call, replayed without a
+/// model: each turn as (its text, empty for one that only thought; its stop
+/// reason). The notes the model read, and the answer the loop returns.
+#[cfg(test)]
+pub(crate) fn replay_cut_turns(
+    form: super::llm::AnswerForm,
+    tools: &[ToolDefinition],
+    turns: &[(&str, &str)],
+) -> (Vec<&'static str>, String) {
+    let work = form.work(tools);
+    let mut written = String::new();
+    let mut notes = Vec::new();
+    let mut retries = 0;
+    for (text, stop) in turns {
+        let blocks = if text.is_empty() {
+            Vec::new()
+        } else {
+            vec![ContentBlock::Text {
+                text: text.to_string(),
+            }]
+        };
+        match cut_before_acting(
+            &blocks,
+            Some(stop),
+            false,
+            !tools.is_empty(),
+            false,
+            retries,
+        ) {
+            Some(cut) => {
+                retries += 1;
+                notes.push(take_cut(work, cut, &blocks, &mut written));
+            }
+            None => return (notes, super::llm::stitch(&written, &text_of(&blocks))),
+        }
+    }
+    (notes, written)
+}
+
+/// The note a cut turn reads, for the work its loop does.
+fn cut_note(work: super::llm::CutWork, cut: CutTurn) -> &'static str {
+    match (work, cut) {
+        (super::llm::CutWork::Edits, _) => EDIT_CUT_NOTE,
+        (super::llm::CutWork::Document, CutTurn::SaidSomething) => DOCUMENT_CUT_NOTE,
+        (super::llm::CutWork::Document, CutTurn::ThinkingOnly) => DOCUMENT_THOUGHT_NOTE,
+        (super::llm::CutWork::Answer, _) => ANSWER_CUT_NOTE,
+    }
+}
 
 /// A turn cut at the output limit before any tool call.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1674,6 +1778,16 @@ mod tests {
             cut(&thought, max, false, false, false, 0),
             Some(CutTurn::ThinkingOnly)
         );
+        // Each loop reads the note for its own work: only a loop that can
+        // edit files is told to make edit_file calls.
+        use super::super::llm::CutWork;
+        for c in [CutTurn::ThinkingOnly, CutTurn::SaidSomething] {
+            assert!(cut_note(CutWork::Edits, c).contains("small edit_file calls"));
+            assert!(!cut_note(CutWork::Document, c).contains("edit_file"));
+            assert!(!cut_note(CutWork::Answer, c).contains("edit_file"));
+        }
+        assert!(cut_note(CutWork::Document, CutTurn::SaidSomething)
+            .contains("Continue it exactly where it stopped"));
         assert_eq!(lower_effort(Some("high")), "medium");
         assert_eq!(lower_effort(Some("medium")), "low");
         assert_eq!(lower_effort(Some("low")), "low");
@@ -2153,6 +2267,7 @@ mod accounting_tests {
             None,
             observer,
             Some(log),
+            super::super::llm::AnswerForm::Auto,
         )
         .await
     }
@@ -2430,6 +2545,7 @@ mod accounting_tests {
             None,
             None,
             None,
+            super::super::llm::AnswerForm::Auto,
         )
         .await;
         let err = out.expect_err("the loop pauses");
@@ -2478,6 +2594,7 @@ mod accounting_tests {
             None,
             None,
             None,
+            super::super::llm::AnswerForm::Auto,
         )
         .await
     }

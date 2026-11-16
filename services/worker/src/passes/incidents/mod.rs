@@ -57,6 +57,7 @@ mod bn_infra_list_follows_aws;
 mod bp_repo_traced_not_asked;
 mod bq_upstream_read_not_guessed;
 mod br_description_writer_upgrade;
+mod bs_cut_plan_revision;
 mod c_codegen_egress;
 mod d_echoed_markers;
 mod e_large_generated_output;

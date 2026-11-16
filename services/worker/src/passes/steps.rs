@@ -246,6 +246,12 @@ impl Carry {
 /// open after it stays on the decision and planning moves on.
 pub const MAX_PLAN_REPLANS: u32 = 1;
 
+/// Fresh steps a run plans again in when its plan is still not usable after
+/// the planner was asked for the missing files (`plan_sections`). After
+/// them the run ends on CoderHelm's own failure, saying what the plan
+/// lacked; it never asks a person to retry it.
+pub const MAX_PLAN_RETRIES: u32 = 1;
+
 /// How far planning got, kept on the checkpoint so a step that runs out of
 /// time while planning hands off to the next one instead of failing.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -272,6 +278,10 @@ pub struct PlanState {
     /// The plan check's gaps still open on the latest plan.
     #[serde(default)]
     pub open_gaps: Vec<String>,
+    /// Fresh steps planning started again in because the plan was not
+    /// usable (see [`MAX_PLAN_RETRIES`]).
+    #[serde(default)]
+    pub plan_retries: u32,
 }
 
 impl PlanState {
@@ -298,6 +308,11 @@ impl PlanState {
         self.open_gaps = open_gaps.to_vec();
     }
 
+    /// Whether an unusable plan may be planned again in a fresh step.
+    pub fn may_plan_again(&self) -> bool {
+        self.plan_retries < MAX_PLAN_RETRIES
+    }
+
     /// Whether the checks may ask for another re-plan.
     pub fn may_replan(&self) -> bool {
         self.replans < MAX_PLAN_REPLANS
@@ -314,7 +329,13 @@ impl PlanState {
     pub fn mark(&self) -> String {
         progress_mark(
             "",
-            &format!("plan:r{}:g{}", self.revision, self.open_gaps.len()),
+            // A fresh step that plans again counts as a revision: it is
+            // progress, and bounded by its own count.
+            &format!(
+                "plan:r{}:g{}",
+                self.revision.saturating_add(self.plan_retries),
+                self.open_gaps.len()
+            ),
         )
     }
 }

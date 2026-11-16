@@ -303,3 +303,156 @@ fn the_watch_sweep_catches_up_a_few_per_team() {
     // No age window: an old run's open pull request is reached too.
     assert!(!all.contains(":cut"));
 }
+
+/// A security fix's pull request from before the upgrade: its old body has
+/// no lead or reviewer-block markers and its check rows froze as running.
+/// Its sections are computed from the lockfile on the head
+/// (`security_fixes::at_head`), which in an ordinary rebuild keeps the rest
+/// of the body. In the catch-up, wholly CoderHelm's, it is built from the
+/// sections computed now and the facts alone: no old line survives, and
+/// the line that closes its issue is kept.
+#[test]
+fn an_old_security_description_keeps_no_old_line() {
+    use crate::passes::security_fixes;
+    use common::dep_head::{self, LockAt};
+    use common::security_fixes::{self as sec, Advisory, Bump, Finding, FindingState, FixUnit};
+
+    let unit = FixUnit {
+        repo: format!("{OWNER}/{REPO}"),
+        ecosystem: "npm".into(),
+        bundle: true,
+        bumps: vec![Bump {
+            package: "xml-kit".into(),
+            from: "1.4.4".into(),
+            to: "1.4.9".into(),
+            major: false,
+            manifest: "pnpm-lock.yaml".into(),
+        }],
+        ..Default::default()
+    };
+    let finding = Finding {
+        id: "f-1".into(),
+        package: "xml-kit".into(),
+        version: "1.4.4".into(),
+        fixed_version: Some("1.4.9".into()),
+        manifest: "pnpm-lock.yaml".into(),
+        advisory: Advisory {
+            primary: "GHSA-xxxx-0011".into(),
+            ids: vec!["GHSA-xxxx-0011".into()],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let state = FindingState::default();
+    let copies = |v: &str| Some(vec![("xml-kit".to_string(), v.to_string())]);
+    let head = dep_head::resolve(
+        &unit,
+        HEAD,
+        &[LockAt {
+            path: "pnpm-lock.yaml".into(),
+            base: copies("1.4.4"),
+            head: copies("1.4.9"),
+            why: String::new(),
+        }],
+    );
+    let check = common::upgrade_notes::WhatToCheck::default();
+    let pairs = [(&finding, &state)];
+
+    let old_body = format!(
+        "{marker}
+Bumps xml-kit to fix GHSA-xxxx-0011.
+
+**For the reviewer**
+* **Look first:** `pnpm-lock.yaml`, the only change.
+* **Roll back:** revert this pull request; nothing outside the code changes with it.
+
+**Rollback:** Revert this pull request; nothing outside the code changes with it.
+
+### Verification
+
+| Check | Result |
+|---|---|
+| Lint (CI) | Not run: still running when this was written |
+| Unit tests (CI) | Not run: still running when this was written |
+| Audit (CI) | Not run: still running when this was written |
+
+Fixes #34
+",
+        marker = sec::MARKER
+    );
+    assert!(!old_body.contains("<!-- coderhelm:lead -->"));
+    let old = stamped_before(&old_body);
+    assert_eq!(description::catch_up(&old, HEAD), CatchUp::Rebuild);
+
+    // What `at_head` gives the build in the catch-up: the sections computed
+    // now, and only the closing line of the old body.
+    let computed = sec::pr_body_at_head(
+        &unit,
+        &pairs,
+        "Bumped.",
+        &check,
+        &sec::BodyLinks::default(),
+        &head,
+    );
+    // Before: the ordinary rebuild keeps the rest of the old body.
+    let kept = security_fixes::rebuilt_body(&description::flat(&old), &computed);
+    assert!(kept.contains("Look first") && kept.contains("still running when this was written"));
+    let base = security_fixes::fresh_body(&computed, &description::flat(&old));
+    let dependency = common::pr_dependency::facts(&unit, &pairs, &head, &check);
+    let files = vec![(
+        "pnpm-lock.yaml".to_string(),
+        "modified".to_string(),
+        "@@ -1 +1 @@\n-a\n+b\n".to_string(),
+    )];
+    let floor = pr_risk::floor(&files, &std::collections::HashMap::new());
+    let checks: Vec<Check> = ["Lint", "Unit tests"]
+        .iter()
+        .map(|n| Check {
+            name: n.to_string(),
+            url: format!("https://ci.example.com/{}", n.replace(' ', "-")),
+            state: State::Passed,
+        })
+        .collect();
+    let facts = description_facts::facts(&Inputs {
+        head: HEAD,
+        body: &base,
+        files: &files,
+        floor: &floor,
+        checks: Some(&checks),
+        why: None,
+        dependency: Some(dependency),
+        outside: None,
+        run_url: "",
+        notes: vec![],
+        evidence: vec![],
+        repo_url: "https://github.com/acme/site",
+    });
+    let shaped = description_facts::shape_for(&base, "Fix GHSA-xxxx-0011", facts, None, None);
+    let next = description::with_stamp(&shaped.body, HEAD);
+    let reviewed = common::pr_review::review(&description::clean(&next));
+    let new = common::pr_layout::layout(&common::person_gate::sink(&reviewed.body).text);
+
+    for line in [
+        "still running when this was written",
+        "Look first",
+        "Roll back",
+        "For the reviewer",
+        "| Audit (CI)",
+    ] {
+        assert!(!new.contains(line), "{line:?} is still in: {new}");
+    }
+    assert!(new.contains("xml-kit"), "the computed sections: {new}");
+    assert!(new.contains("Fixes #34"), "the issue still closes: {new}");
+    assert!(description::is_current(&new, HEAD), "{new}");
+    assert_eq!(description::catch_up(&new, HEAD), CatchUp::Current);
+
+    // The build passes the catch-up on to the security sections.
+    let src = include_str!("../description.rs");
+    let build = fn_src(src, "\nasync fn build(");
+    let at = &build[build.find("security_fixes::at_head(").unwrap()..];
+    assert!(at[..at.find(".await").unwrap()].contains("fresh,"), "{at}");
+    let sec_src = include_str!("../security_fixes.rs");
+    let at_head = fn_src(sec_src, "\npub(crate) async fn at_head(");
+    assert!(at_head.contains("if fresh_only {"));
+    assert!(at_head.contains("fresh_body(&fresh, body)"));
+}

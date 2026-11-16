@@ -1334,6 +1334,7 @@ pub mod plan_chat;
 pub(crate) mod plan_coverage;
 pub mod plan_execute;
 mod plan_judge;
+pub(crate) mod plan_sections;
 /// Plugin runs, publishing, source sync and results.
 pub mod plugins;
 mod pr;
@@ -3355,19 +3356,13 @@ async fn run_passes(
                 fix_route,
                 fix_location::Route::OutsideOnly | fix_location::Route::Ask
             ));
-    if !plan_is_directive
-        && (plan_result.tasks.trim().is_empty() || plan_result.design.trim().is_empty())
-    {
-        warn!(
-            run_id,
-            "Plan generation produced empty tasks/design — failing run"
-        );
+    // A plan the planner couldn't complete, even after it was asked for
+    // just the missing files (see `plan_sections`), is planned again in a
+    // fresh step, and only then reported, as CoderHelm's own failure.
+    if let Some(why) = plan_sections::unusable(&plan_result).filter(|_| !plan_is_directive) {
+        warn!(run_id, why = %why, "Plan not usable after its repairs");
         close_memory(state, agent_memory.take()).await;
-        return Err(
-            "Plan generation produced an empty or malformed plan (missing tasks/design). \
-             This is usually a transient model formatting issue — retry the run."
-                .into(),
-        );
+        return plan_again_or_stop(state, msg, run_id, &mut ps, &why).await;
     }
 
     // Not knowing where the fix belongs is a question only when a person
@@ -3438,11 +3433,15 @@ async fn run_passes(
                 "Plan has no decision and nothing to decide from — planner failure"
             );
             close_memory(state, agent_memory.take()).await;
-            return Err(
-                "Planner failure: the plan carried no fix_location decision and its tasks name \
-                 no files to decide from. Nothing was asked of a person; retry the run."
-                    .into(),
-            );
+            return plan_again_or_stop(
+                state,
+                msg,
+                run_id,
+                &mut ps,
+                "the plan carried no decision on where the fix belongs and its tasks name no \
+                 files to decide from",
+            )
+            .await;
         };
         if decision.cause.trim().is_empty() {
             // A plan that codes nothing but wrote no decision: its one line
@@ -3709,12 +3708,11 @@ async fn run_passes(
             .await?;
             if plan_result.tasks.starts_with("CLARIFICATION_NEEDED:") {
                 close_memory(state, agent_memory.take()).await;
-                return Err(format!(
-                    "Planner failure: the plan asked again after planning on the assumption \"{}\". \
-                     Nothing was asked of a person; retry the run.",
+                let why = format!(
+                    "the plan asked again after planning on the assumption \"{}\"",
                     judged.assumption().unwrap_or("")
-                )
-                .into());
+                );
+                return plan_again_or_stop(state, msg, run_id, &mut ps, &why).await;
             }
         }
     }
@@ -7268,6 +7266,60 @@ async fn record_open_pr(
 /// person can set): the gate's own reason, and where the work is kept.
 fn stopped_keeping(why: &str, kept: &str) -> String {
     format!("{why} The work so far is kept on branch `{kept}`.")
+}
+
+/// A plan that is not usable (see `plan_sections::unusable`) after the
+/// planner was asked for its missing files: planning starts again in a
+/// fresh step, up to `steps::MAX_PLAN_RETRIES` times, from nothing but
+/// the ticket. After that, or when no step can be queued, the run ends on
+/// CoderHelm's own failure, saying what the plan lacked; never on an
+/// instruction to a person.
+async fn plan_again_or_stop(
+    state: &WorkerState,
+    msg: &TicketMessage,
+    run_id: &str,
+    ps: &mut steps::PlanState,
+    why: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if !ps.may_plan_again() {
+        return Err(plan_failure(why, None).into());
+    }
+    ps.plan_retries = ps.plan_retries.saturating_add(1);
+    ps.checked = false;
+    steps::save_plan(state, &msg.team_id, run_id, ps).await;
+    plan::unmark_plan_run(state, msg).await;
+    match try_auto_continue(
+        state,
+        msg,
+        run_id,
+        &None,
+        &[],
+        true,
+        &format!("Plan check (format): {why}; planning again"),
+    )
+    .await
+    {
+        Handoff::Continued => Ok(()),
+        Handoff::Stopped(reason) => Err(plan_failure(why, Some(&reason)).into()),
+    }
+}
+
+/// The run's error when it has no usable plan: what the plan lacked and
+/// what CoderHelm already did about it, as CoderHelm's own failure.
+pub(crate) fn plan_failure(why: &str, no_step: Option<&str>) -> String {
+    let tried = match no_step {
+        Some(reason) => format!(
+            "after asking the planner again for what was missing; it couldn't plan again in a \
+             fresh step ({reason})"
+        ),
+        None => "after asking the planner again for what was missing and planning again in a \
+                 fresh step"
+            .to_string(),
+    };
+    format!(
+        "CoderHelm couldn't write a usable plan for this ticket: {why}, {tried}. This is \
+         CoderHelm's own failure, not the ticket's."
+    )
 }
 
 /// Continue the run in a fresh step at `gate`, with the branch as it is:
