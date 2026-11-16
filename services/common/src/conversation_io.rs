@@ -48,6 +48,7 @@ pub fn view_from_github(comments: &[Value]) -> View {
                     at_ms: at,
                     meta,
                     body: conversation::strip_marker(body),
+                    node_id: c["node_id"].as_str().unwrap_or("").to_string(),
                 });
             }
             continue;
@@ -143,6 +144,7 @@ impl JiraChannel<'_> {
             meta: meta.clone(),
             // Kept short: enough to rewrite a question as answered.
             body: crate::truncate_str(body, 4_000).to_string(),
+            node_id: String::new(),
         });
         let drop = said.len().saturating_sub(conversation::MAX_SAID);
         said.drain(..drop);
@@ -382,6 +384,36 @@ impl GithubRest<'_> {
     }
 }
 
+/// GitHub's GraphQL request that hides a comment as outdated
+/// (`minimizeComment`, classifier OUTDATED) or shows it again
+/// (`unminimizeComment`). Only CoderHelm's own comments are ever passed.
+pub fn hide_request(node_id: &str, hidden: bool) -> Value {
+    if hidden {
+        json!({
+            "query": "mutation($id: ID!) { minimizeComment(input: {subjectId: $id, classifier: OUTDATED}) { minimizedComment { isMinimized } } }",
+            "variables": { "id": node_id },
+        })
+    } else {
+        json!({
+            "query": "mutation($id: ID!) { unminimizeComment(input: {subjectId: $id}) { unminimizedComment { isMinimized } } }",
+            "variables": { "id": node_id },
+        })
+    }
+}
+
+/// The error in a GraphQL answer, when it has one.
+pub fn graphql_error(v: &Value) -> Option<String> {
+    v["errors"]
+        .as_array()
+        .filter(|e| !e.is_empty())
+        .map(|errs| {
+            errs.iter()
+                .filter_map(|e| e["message"].as_str())
+                .collect::<Vec<_>>()
+                .join("; ")
+        })
+}
+
 fn id_of(v: &Value) -> String {
     match &v["id"] {
         Value::Number(n) => n.to_string(),
@@ -460,6 +492,20 @@ impl Channel for GithubRest<'_> {
         )
         .await?;
         Ok(id.to_string())
+    }
+
+    async fn hide(&self, said: &Said, hidden: bool) -> Result<(), String> {
+        if said.node_id.is_empty() {
+            return Err("no node id for the comment".into());
+        }
+        let v = self
+            .call(
+                self.http
+                    .post("https://api.github.com/graphql")
+                    .json(&hide_request(&said.node_id, hidden)),
+            )
+            .await?;
+        graphql_error(&v).map_or(Ok(()), Err)
     }
 }
 

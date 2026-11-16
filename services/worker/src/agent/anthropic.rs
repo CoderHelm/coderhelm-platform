@@ -1067,6 +1067,7 @@ pub async fn converse_tool_loop(
                             duration_ms: 0,
                             is_error: true,
                             outcome: &outcome,
+                            result: &text,
                         });
                     }
                     logged.push(logged_result(
@@ -1120,6 +1121,7 @@ pub async fn converse_tool_loop(
                             duration_ms: 0,
                             is_error: true,
                             outcome: &outcome,
+                            result: &message,
                         });
                     }
                     info!(tool = %tool_name, "Tool not run: the policy gate said no");
@@ -1189,6 +1191,7 @@ pub async fn converse_tool_loop(
                     duration_ms,
                     is_error,
                     outcome: &outcome,
+                    result: &content,
                 });
             }
             let mut entry = logged_result(

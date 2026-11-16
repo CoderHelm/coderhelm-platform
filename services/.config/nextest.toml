@@ -1,0 +1,11 @@
+# cargo-nextest settings for the workspace (CI runs every Rust test step
+# through it; see .github/workflows/ci.yml).
+#
+# Each test runs in its own process, and one still running after two minutes
+# is ended and reported as failed under its own name, so a test that hangs
+# fails the step in minutes instead of holding the runner for an hour. The
+# slowest test in the workspace takes a few seconds.
+
+[profile.default]
+slow-timeout = { period = "30s", terminate-after = 4 }
+fail-fast = false

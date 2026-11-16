@@ -842,6 +842,7 @@ pub async fn run(
             time_told: std::sync::atomic::AtomicBool::new(false),
             locks_written_at: std::sync::Mutex::new(None),
             gen_edit_rejects: std::sync::Mutex::new(std::collections::HashMap::new()),
+            missing: std::sync::Mutex::new(std::collections::HashMap::new()),
             deadline,
             policy: Some(crate::agent::policy::gate(
                 state,
@@ -911,6 +912,8 @@ pub async fn run(
             let tool_use_id = ev.tool_use_id.to_string();
             let started_at = ev.started_at.to_string();
             let outcome = ev.outcome.to_value();
+            // A refused or failed call's reason, shown while the step runs.
+            let message = ev.message.map(str::to_string);
             let tool_name = ev.tool;
             // The same redaction as the agent log.
             let input_summary = common::agent_log::redact_text(ev.input_summary);
@@ -959,6 +962,7 @@ pub async fn run(
                         "tool_use_id": tool_use_id,
                         "started_at": started_at,
                         "outcome": outcome,
+                        "message": message,
                     });
                     let _ = common::run_events::put(&dynamo, &events_table, &team, &rid, &sk)
                         .item(
@@ -1521,15 +1525,101 @@ fn run_checks_tool() -> ToolDefinition {
 
 /// The script the sandbox runs for one `bash` command: in its folder,
 /// stopped after [`COMMAND_SECS`].
+#[cfg(test)]
 pub(crate) fn command_script(command: &str, dir: Option<&str>) -> String {
-    let inner = match dir {
-        Some(d) => format!("cd {} && {command}", common::coder_shell::quote(d)),
-        None => command.to_string(),
-    };
+    command_script_with(None, command, dir)
+}
+
+/// [`command_script`] after `setup`, the repository's install (what makes
+/// its package manager and tools available), run quietly first: its output
+/// is shown only when it fails.
+pub(crate) fn command_script_with(setup: Option<&str>, command: &str, dir: Option<&str>) -> String {
+    let mut inner = String::new();
+    if let Some(s) = setup {
+        inner.push_str(&format!(
+            "{{ {s} ; }} > /tmp/coderhelm-setup.log 2>&1 || {{ echo \"CoderHelm could not \
+             install the repository before this command ({s}):\"; tail -n 40 \
+             /tmp/coderhelm-setup.log; exit 1; }}; "
+        ));
+    }
+    if let Some(d) = dir {
+        inner.push_str(&format!("cd {} && ", common::coder_shell::quote(d)));
+    }
+    inner.push_str(command);
     format!(
         "timeout {COMMAND_SECS} bash -c {}",
         common::coder_shell::quote(&inner)
     )
+}
+
+/// The install a command runs after: the repository's whole install, or
+/// only the part that makes its package manager available (`corepack
+/// enable`) when the command installs on its own (`cd e2e && pnpm install
+/// --ignore-workspace && ...`). `None` when the repository's checks have
+/// no install.
+pub(crate) fn setup_for(checks_cmd: Option<&str>, parts: &[String]) -> Option<String> {
+    let full = checks_cmd.and_then(common::coder_shell::install_prefix)?;
+    if !parts.iter().any(|p| common::coder_shell::installs(p)) {
+        return Some(full);
+    }
+    let enable: Vec<&str> = full
+        .split("&&")
+        .map(str::trim)
+        .filter(|p| p.starts_with("corepack "))
+        .collect();
+    (!enable.is_empty()).then(|| enable.join(" && "))
+}
+
+/// The program a command part runs (`pnpm` of `CI=1 pnpm test`).
+pub(crate) fn part_program(part: &str) -> String {
+    part.split_whitespace()
+        .find(|w| {
+            !(w.contains('=')
+                && w.split('=').next().is_some_and(|k| {
+                    !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                }))
+        })
+        .map(|w| w.rsplit('/').next().unwrap_or(w).to_string())
+        .unwrap_or_default()
+}
+
+/// What the coder is told once a program wasn't found in the sandbox:
+/// what is missing, why, and the routes that work, so it switches route
+/// instead of sending the same command again.
+pub(crate) fn missing_note(prog: &str, setup: Option<&str>) -> String {
+    let why = match setup {
+        Some(s) => format!(
+            "The repository's install ran first (`{s}`), so `{prog}` is not one of the tools it \
+             makes available. Run it through the repository's own scripts (`npm run <script>`, \
+             `pnpm <script>`), a package's binary through its manager (`pnpm exec {prog}`, \
+             `npx {prog}`), or call run_checks for the build, type check, lint and tests."
+        ),
+        None => format!(
+            "This repository's checks have no install step CoderHelm knows, so the sandbox has \
+             only its base tools. Call run_checks for the repository's checks, or use `npx \
+             {prog}` for a Node tool."
+        ),
+    };
+    format!(
+        "`{prog}` isn't installed in the sandbox (exit 127: command not found). {why} CoderHelm \
+         won't start another build for `{prog}` in this step: a command that needs it gets this \
+         note back at once."
+    )
+}
+
+/// The run log's line for a refusal: its first sentence.
+pub(crate) fn refusal_summary(why: &str) -> String {
+    let first = why.split(". ").next().unwrap_or(why).trim_end_matches('.');
+    format!("not run: {}", common::truncate_str(first, 160))
+}
+
+/// The command line of a `bash` call.
+pub(crate) fn bash_line(input: &serde_json::Value) -> &str {
+    ["command", "cmd"]
+        .iter()
+        .find_map(|k| input.get(*k).and_then(|v| v.as_str()))
+        .unwrap_or("")
+        .trim()
 }
 
 /// Whether a pass's checks are owed when it ends: the repository has
@@ -1627,8 +1717,10 @@ pub(crate) fn bash_tool(sandbox: bool) -> ToolDefinition {
              `pytest tests/test_a.py`) run in the sandbox on the branch as committed, after its \
              install, and return the exit code, how long it took and the end of the output. \
              Each is a build of a few minutes, stopped after {} minutes, at most {} per step: \
-             prefer run_checks for the full checks. One plain command per call (a leading \
-             `cd dir &&` is fine; a pipe into head or tail is dropped).",
+             prefer run_checks for the full checks. The repository's install runs first, so \
+             its package manager (pnpm or yarn through corepack) and installed tools are there. \
+             Several commands may be chained with `&&` in one call (one build); a pipe into \
+             head or tail at the end is dropped.",
             COMMAND_SECS / 60,
             MAX_COMMANDS_PER_PASS
         )
@@ -1640,11 +1732,15 @@ pub(crate) fn bash_tool(sandbox: bool) -> ToolDefinition {
         description: format!(
             "Run a shell command line against the repository. Reads run at once as the file \
              tools: `cat`/`head`/`sed -n` read files, `grep`/`rg` search the code, `ls` lists a \
-             folder, `find` lists every file, `git diff`/`git status` show the change. {commands} \
-             Commands never change files (nothing they write is kept: use edit_file and \
-             write_file), never run git commands that change the branch (CoderHelm commits and \
-             pushes), and never reach the network beyond the sandbox's allowlist or any \
-             credentials."
+             folder, `find` lists every file, `git diff`/`git status` show the change, `git \
+             log`/`git show`/`git blame` read the history, and several reads chained with `;` \
+             or `&&` run one after another. A read-only `curl` or `wget` (GET or HEAD: `curl \
+             -sI URL` for the status and headers, `curl -sS URL` for the body too) runs as the \
+             page check, on public https pages, and returns the status, every response header \
+             and the start of the body. {commands} Commands never change files (nothing they \
+             write is kept: use edit_file and write_file), never run git commands that change \
+             the branch (CoderHelm commits and pushes), and never send data, credentials or \
+             cookies over the network."
         ),
         input_schema: json!({
             "type": "object",
@@ -1989,6 +2085,10 @@ struct WriteToolExecutor<'a> {
     /// that run_codegen cannot regenerate — or a false-positive banner match —
     /// can never deadlock the agent.
     gen_edit_rejects: std::sync::Mutex<std::collections::HashMap<String, u32>>,
+    /// Programs a command found missing in the sandbox (exit 127), with
+    /// what CoderHelm told the coder: a later command that needs one is
+    /// answered with it instead of another build.
+    missing: std::sync::Mutex<std::collections::HashMap<String, String>>,
     deadline: Option<std::time::Instant>,
     /// Agent permissions for the sandbox: each command run_checks and
     /// run_codegen would run is asked of the gate first.
@@ -2906,51 +3006,106 @@ impl<'a> WriteToolExecutor<'a> {
     }
 
     /// The coder's `bash` call: a read runs as its file tool (asked of the
-    /// gate as that tool), a command runs in the sandbox, anything else is
-    /// refused with what to use instead.
+    /// gate as that tool), a chain of reads runs as each tool in order, a
+    /// command (or a chain of them) runs in the sandbox, anything else is
+    /// refused with what to use instead. Page fetches and history reads run
+    /// one level up, where those tools are ([`CombinedWriteToolExecutor`]).
     async fn bash(
         &self,
         input: &serde_json::Value,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
         use common::coder_shell::Shell;
-        let line = ["command", "cmd"]
-            .iter()
-            .find_map(|k| input.get(*k).and_then(|v| v.as_str()))
-            .unwrap_or("")
-            .trim();
-        let (tool, args) = match common::coder_shell::classify(line) {
-            Shell::Read {
-                path,
-                lines: Some((a, b)),
-            } => (
-                "read_file_lines",
-                json!({"path": path, "start_line": a, "end_line": b}),
-            ),
-            Shell::Read { path, lines: None } => ("read_file", json!({ "path": path })),
-            Shell::List { path } => ("list_directory", json!({ "path": path })),
-            Shell::Search { query } => ("search_code", json!({ "query": query })),
-            Shell::Tree => ("read_tree", json!({})),
-            Shell::Diff => ("get_diff", json!({})),
+        let line = bash_line(input);
+        match common::coder_shell::classify(line) {
             Shell::Refuse(why) => {
-                note(LogOutcome::refused("not run: not a command for here"));
-                return Ok(json!(why));
+                note(LogOutcome::refused(refusal_summary(&why)));
+                Ok(json!(why))
             }
             Shell::Empty => {
                 note(LogOutcome::soft_fail("not run: no command"));
-                return Ok(json!(
+                Ok(json!(
                     "No command was sent: put the command line in `command`."
-                ));
+                ))
             }
             Shell::Run {
                 command,
                 dir,
                 dropped,
+                parts,
             } => {
-                return self
-                    .run_command(&command, dir.as_deref(), dropped.as_deref())
+                self.run_command(&command, dir.as_deref(), dropped.as_deref(), &parts)
                     .await
             }
-        };
+            Shell::Steps(steps) => {
+                let n = steps.len();
+                let mut tools = Vec::new();
+                let mut out = Vec::new();
+                for st in steps {
+                    let (tool, text) = self.shell_step(st).await?;
+                    out.push(format!("## {tool}\n{text}"));
+                    tools.push(tool);
+                }
+                note(LogOutcome::ok(format!(
+                    "{n} commands ran as {}",
+                    tools.join(", ")
+                )));
+                Ok(json!(format!(
+                    "(`{line}` ran as {n} tool calls, in order)\n{}",
+                    out.join("\n\n")
+                )))
+            }
+            other => {
+                let (tool, text) = self.shell_step(other).await?;
+                Ok(json!(format!("(`{line}` ran as {tool})\n{text}")))
+            }
+        }
+    }
+
+    /// One read of a `bash` line as its tool, asked of the gate as that
+    /// tool: `(tool, what it returned)`.
+    async fn shell_step(
+        &self,
+        st: common::coder_shell::Shell,
+    ) -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>> {
+        use common::coder_shell::Shell;
+        let mut at: Option<String> = None;
+        let (tool, args) =
+            match st {
+                Shell::Read {
+                    path,
+                    lines: Some((a, b)),
+                } => (
+                    "read_file_lines",
+                    json!({"path": path, "start_line": a, "end_line": b}),
+                ),
+                Shell::Read { path, lines: None } => ("read_file", json!({ "path": path })),
+                Shell::List { path } => ("list_directory", json!({ "path": path })),
+                Shell::Search { query } => ("search_code", json!({ "query": query })),
+                Shell::Tree => ("read_tree", json!({})),
+                Shell::Diff => ("get_diff", json!({})),
+                Shell::ReadAt { path, git_ref } => {
+                    at = Some(git_ref.clone());
+                    ("read_file", json!({ "path": path, "ref": git_ref }))
+                }
+                Shell::Fetch(_) => return Ok((
+                    "check_url".into(),
+                    "Pages can't be fetched in this step. Rely on the repository's code and the \
+                     ticket, and say in your summary which page wasn't read."
+                        .into(),
+                )),
+                Shell::History(_) => {
+                    return Ok((
+                        "github_history".into(),
+                        "The repository's history can't be read in this step. get_diff shows this \
+                     branch's change; read_file reads a file as it is on the branch."
+                            .into(),
+                    ))
+                }
+                Shell::Refuse(why) => return Ok(("bash".into(), why)),
+                Shell::Empty | Shell::Run { .. } | Shell::Steps(_) => {
+                    return Ok(("bash".into(), "Send that command on its own call.".into()))
+                }
+            };
         if let Some(gate) = &self.policy {
             match gate
                 .check(common::agent_policy::Request {
@@ -2968,16 +3123,55 @@ impl<'a> WriteToolExecutor<'a> {
                 common::agent_policy::Outcome::Refused { message, .. }
                 | common::agent_policy::Outcome::Pending { message, .. } => {
                     note(LogOutcome::refused("the agent policy did not allow it"));
-                    return Ok(json!(message));
+                    return Ok((tool.to_string(), message));
                 }
             }
+        }
+        if let Some(git_ref) = at {
+            let path = args["path"].as_str().unwrap_or_default();
+            let text = match self
+                .github
+                .read_file(&self.owner, &self.repo, path, &git_ref)
+                .await
+            {
+                Ok(t) => {
+                    note(LogOutcome::ok(format!("{path} at {git_ref}")));
+                    let cut = common::truncate_str(&t, 100_000);
+                    if cut.len() < t.len() {
+                        format!("{cut}\n[cut at 100 KB of {} KB]", t.len() / 1024)
+                    } else {
+                        t
+                    }
+                }
+                Err(e) => {
+                    note(LogOutcome::soft_fail(format!(
+                        "{path} not read at {git_ref}"
+                    )));
+                    format!(
+                        "Couldn't read {path} at {git_ref}: {e}. read_file reads it as it is on \
+                         the branch; github_history (kind commits, path {path}) lists the \
+                         commits that changed it."
+                    )
+                }
+            };
+            return Ok((format!("read_file at {git_ref}"), text));
         }
         let out = self.execute_tool(tool, &args).await?;
         let text = match out {
             serde_json::Value::String(t) => t,
             other => other.to_string(),
         };
-        Ok(json!(format!("(`{line}` ran as {tool})\n{text}")))
+        Ok((tool.to_string(), text))
+    }
+
+    /// The note for a command whose program was already found missing in
+    /// this step, if one is.
+    fn known_missing(&self, parts: &[String]) -> Option<(String, String)> {
+        let missing = self.missing.lock().unwrap();
+        parts.iter().find_map(|p| {
+            let prog = part_program(p);
+            missing.get(&prog).map(|n| (prog, n.clone()))
+        })
     }
 
     /// One command in the sandbox, on the branch as committed: its exit
@@ -2988,6 +3182,7 @@ impl<'a> WriteToolExecutor<'a> {
         command: &str,
         dir: Option<&str>,
         dropped: Option<&str>,
+        parts: &[String],
     ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
         use std::sync::atomic::Ordering;
         let (Some(sandbox), Some(run_id)) = (&self.sandbox, &self.run_id) else {
@@ -3010,6 +3205,12 @@ impl<'a> WriteToolExecutor<'a> {
                     "`cd {d}` isn't a folder of the repository. Name a folder under its root."
                 )));
             }
+        }
+        if let Some((prog, told)) = self.known_missing(parts) {
+            note(LogOutcome::soft_fail(format!(
+                "not run: `{prog}` isn't in the sandbox (found earlier in this step)"
+            )));
+            return Ok(json!(told));
         }
         let n = self.command_budget.fetch_add(1, Ordering::SeqCst);
         if n >= MAX_COMMANDS_PER_PASS {
@@ -3039,20 +3240,56 @@ impl<'a> WriteToolExecutor<'a> {
                  first. Save what you changed and stop now; don't write a result for it."
             ));
         }
+        // Each plain command of a chain is asked of the gate on its own: a
+        // chain never matches an allowlist entry as a whole.
+        let asked: Vec<&str> = if parts.is_empty() {
+            vec![command]
+        } else {
+            parts.iter().map(String::as_str).collect()
+        };
+        let mut setup = setup_for(self.checks_cmd.as_deref(), parts);
         if let Some(gate) = &self.policy {
-            match gate
-                .check_command(command, "Run a command the coder asked for")
-                .await
-            {
-                common::agent_policy::Outcome::Run { .. } => {}
-                common::agent_policy::Outcome::Stop(stop) => {
-                    crate::agent::policy::record_stop(&stop);
-                    return Err(Box::new(common::agent_policy::AgentStopped(stop)));
+            for part in &asked {
+                match gate
+                    .check_command(part, "Run a command the coder asked for")
+                    .await
+                {
+                    common::agent_policy::Outcome::Run { .. } => {}
+                    common::agent_policy::Outcome::Stop(stop) => {
+                        crate::agent::policy::record_stop(&stop);
+                        return Err(Box::new(common::agent_policy::AgentStopped(stop)));
+                    }
+                    common::agent_policy::Outcome::Refused { message, .. }
+                    | common::agent_policy::Outcome::Pending { message, .. } => {
+                        note(LogOutcome::refused(format!(
+                            "the agent policy did not allow `{}`",
+                            common::truncate_str(part, 120)
+                        )));
+                        return Ok(json!(if asked.len() > 1 {
+                            format!("`{part}` (part of this command line): {message}")
+                        } else {
+                            message
+                        }));
+                    }
                 }
-                common::agent_policy::Outcome::Refused { message, .. }
-                | common::agent_policy::Outcome::Pending { message, .. } => {
-                    note(LogOutcome::refused("the agent policy did not allow it"));
-                    return Ok(json!(message));
+            }
+            // The install runs only where the team's permissions let it.
+            if let Some(s) = setup.clone() {
+                for step in s.split("&&").map(str::trim) {
+                    match gate
+                        .check_command(step, "Install the repository before a command")
+                        .await
+                    {
+                        common::agent_policy::Outcome::Run { .. } => {}
+                        common::agent_policy::Outcome::Stop(stop) => {
+                            crate::agent::policy::record_stop(&stop);
+                            return Err(Box::new(common::agent_policy::AgentStopped(stop)));
+                        }
+                        _ => {
+                            setup = None;
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -3067,7 +3304,7 @@ impl<'a> WriteToolExecutor<'a> {
                 )));
             }
         };
-        let script = command_script(command, dir);
+        let script = command_script_with(setup.as_deref(), command, dir);
         let started = std::time::Instant::now();
         let ran = sandbox
             .run_checks(
@@ -3083,10 +3320,24 @@ impl<'a> WriteToolExecutor<'a> {
             Ok(o) if o.ran => {
                 crate::clients::sandbox::NoResults::clear(run_id);
                 let code = o.exit_code.unwrap_or(-1);
-                note(LogOutcome::ok(format!("exit {code}, {secs}s")));
-                Ok(json!(command_report(
-                    command, code, secs, dropped, &o.output
-                )))
+                let mut report = command_report(command, code, secs, dropped, &o.output);
+                // A program the sandbox doesn't have: said once, with the
+                // routes that work, and never built for again this step.
+                match (code, common::coder_shell::missing_program(&o.output)) {
+                    (127, Some(prog)) => {
+                        let told = missing_note(&prog, setup.as_deref());
+                        self.missing
+                            .lock()
+                            .unwrap()
+                            .insert(prog.clone(), told.clone());
+                        note(LogOutcome::soft_fail(format!(
+                            "exit 127: `{prog}` isn't in the sandbox, {secs}s"
+                        )));
+                        report = format!("{report}\n\n{told}");
+                    }
+                    _ => note(LogOutcome::ok(format!("exit {code}, {secs}s"))),
+                }
+                Ok(json!(report))
             }
             Ok(o) => {
                 if o.broken {
@@ -3703,6 +3954,11 @@ impl<'a> ToolExecutor for CombinedWriteToolExecutor<'a> {
         name: &str,
         input: &serde_json::Value,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        if name == "bash" {
+            if let Some(out) = self.bash_with_tools(input).await? {
+                return Ok(out);
+            }
+        }
         if let Some(k) = self.knowledge {
             if let Some(out) = k.handle(self.state, name, input).await {
                 return Ok(serde_json::json!(out));
@@ -3799,6 +4055,169 @@ impl<'a> ToolExecutor for CombinedWriteToolExecutor<'a> {
 
         // Fall through to write tools
         self.write_executor.execute(name, input).await
+    }
+}
+
+impl CombinedWriteToolExecutor<'_> {
+    /// A `bash` line that a page fetch (`curl`, `wget`) or a history read
+    /// (`git log`, `git show <sha>`) is part of: each runs as its tool, the
+    /// reads beside them as theirs. `None` for every other line, which the
+    /// write executor's `bash` takes.
+    async fn bash_with_tools(
+        &self,
+        input: &serde_json::Value,
+    ) -> Result<Option<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
+        use common::coder_shell::Shell;
+        let line = bash_line(input);
+        let needs = |s: &Shell| matches!(s, Shell::Fetch(_) | Shell::History(_));
+        let steps = match common::coder_shell::classify(line) {
+            s if needs(&s) => vec![s],
+            Shell::Steps(v) if v.iter().any(needs) => v,
+            _ => return Ok(None),
+        };
+        let n = steps.len();
+        let mut tools = Vec::new();
+        let mut out = Vec::new();
+        let mut last: Option<LogOutcome> = None;
+        for st in steps {
+            let (tool, text, outcome) = match st {
+                Shell::Fetch(f) => self.fetch_step(&f).await?,
+                Shell::History(h) => self.history_step(h).await?,
+                other => {
+                    let (tool, text) = self.write_executor.shell_step(other).await?;
+                    (tool, text, None)
+                }
+            };
+            if outcome.is_some() {
+                last = outcome;
+            }
+            out.push((tool.clone(), text));
+            tools.push(tool);
+        }
+        if n == 1 {
+            let (tool, text) = out.pop().expect("one step");
+            if let Some(o) = last {
+                note(o);
+            }
+            return Ok(Some(json!(format!("(`{line}` ran as {tool})\n{text}"))));
+        }
+        note(LogOutcome::ok(format!(
+            "{n} commands ran as {}",
+            tools.join(", ")
+        )));
+        let body: Vec<String> = out
+            .into_iter()
+            .map(|(tool, text)| format!("## {tool}\n{text}"))
+            .collect();
+        Ok(Some(json!(format!(
+            "(`{line}` ran as {n} tool calls, in order)\n{}",
+            body.join("\n\n")
+        ))))
+    }
+
+    /// A read-only `curl` or `wget` as a page fetch: asked of the gate as
+    /// `check_url`, then sent with its safety checks.
+    async fn fetch_step(
+        &self,
+        f: &common::coder_shell::Fetch,
+    ) -> Result<(String, String, Option<LogOutcome>), Box<dyn std::error::Error + Send + Sync>>
+    {
+        let tool = super::web_check::TOOL.to_string();
+        let Some(web) = self.web else {
+            return Ok((
+                tool,
+                "Pages can't be fetched in this step. Rely on the repository's code and the \
+                 ticket, and say in your summary which page wasn't read."
+                    .into(),
+                Some(LogOutcome::refused("not run: no page fetches in this step")),
+            ));
+        };
+        if let Some(gate) = &self.write_executor.policy {
+            let args = json!({ "urls": f.urls });
+            match gate
+                .check(common::agent_policy::Request {
+                    tool: super::web_check::TOOL,
+                    args: &args,
+                    why: "",
+                })
+                .await
+            {
+                common::agent_policy::Outcome::Run { .. } => {}
+                common::agent_policy::Outcome::Stop(stop) => {
+                    crate::agent::policy::record_stop(&stop);
+                    return Err(Box::new(common::agent_policy::AgentStopped(stop)));
+                }
+                common::agent_policy::Outcome::Refused { message, .. }
+                | common::agent_policy::Outcome::Pending { message, .. } => {
+                    return Ok((
+                        tool,
+                        message,
+                        Some(LogOutcome::refused("the agent policy did not allow it")),
+                    ));
+                }
+            }
+        }
+        let r = web.fetch(self.state, self.write_executor.github, f).await;
+        let outcome = match r.outcome {
+            "ok" => LogOutcome::ok(r.summary),
+            "refused" => LogOutcome::refused(r.summary),
+            _ => LogOutcome::soft_fail(r.summary),
+        };
+        Ok((tool, r.text, Some(outcome)))
+    }
+
+    /// `git log`, `git show <sha>`, `git blame` as `github_history`.
+    async fn history_step(
+        &self,
+        input: serde_json::Value,
+    ) -> Result<(String, String, Option<LogOutcome>), Box<dyn std::error::Error + Send + Sync>>
+    {
+        let tool = "github_history".to_string();
+        let Some(history) = self.history else {
+            return Ok((
+                tool,
+                "The repository's history can't be read in this step. get_diff shows this \
+                 branch's change; read_file reads a file as it is on the branch."
+                    .into(),
+                Some(LogOutcome::refused(
+                    "not run: no history reads in this step",
+                )),
+            ));
+        };
+        if let Some(gate) = &self.write_executor.policy {
+            match gate
+                .check(common::agent_policy::Request {
+                    tool: "github_history",
+                    args: &input,
+                    why: "",
+                })
+                .await
+            {
+                common::agent_policy::Outcome::Run { .. } => {}
+                common::agent_policy::Outcome::Stop(stop) => {
+                    crate::agent::policy::record_stop(&stop);
+                    return Err(Box::new(common::agent_policy::AgentStopped(stop)));
+                }
+                common::agent_policy::Outcome::Refused { message, .. }
+                | common::agent_policy::Outcome::Pending { message, .. } => {
+                    return Ok((
+                        tool,
+                        message,
+                        Some(LogOutcome::refused("the agent policy did not allow it")),
+                    ));
+                }
+            }
+        }
+        let text = history
+            .handle(
+                self.state,
+                self.write_executor.github,
+                "github_history",
+                &input,
+            )
+            .await
+            .unwrap_or_else(|| "github_history gave no answer.".into());
+        Ok((tool, text, None))
     }
 }
 

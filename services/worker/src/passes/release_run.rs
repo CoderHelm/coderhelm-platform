@@ -95,6 +95,24 @@ impl Record {
     }
 }
 
+/// The release steps a person must unblock (no workflow deploys an
+/// environment, ...), one line each: what, and the grant that lifts it.
+pub fn person_lines(steps: &[Step]) -> Vec<String> {
+    steps
+        .iter()
+        .filter(|s| s.status == Status::NoAccess)
+        .map(|s| {
+            let what = s.what.split_whitespace().collect::<Vec<_>>().join(" ");
+            let why = s.detail.split_whitespace().collect::<Vec<_>>().join(" ");
+            format!(
+                "- {}: {}.",
+                what.trim_end_matches('.'),
+                why.trim_end_matches('.')
+            )
+        })
+        .collect()
+}
+
 fn record_sk(owner: &str, repo: &str, pr: u64) -> String {
     format!("RELEASE#{owner}/{repo}#{pr:06}")
 }
@@ -293,38 +311,42 @@ pub async fn after_pr(
     if planned.steps.is_empty() {
         return;
     }
-    let lines = planned.lines();
-    let body = lines
-        .iter()
-        .map(|l| {
-            if l.starts_with(|c: char| c.is_ascii_digit()) {
-                l.clone()
-            } else {
-                format!("- {l}")
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
     let title = "Release steps (done by CoderHelm)";
     super::add_progress_note(
         state,
         &msg.team_id,
         run_id,
-        &format!("{title}: {} step(s) armed", planned.steps.len()),
+        &format!(
+            "{title}: {} {} armed (listed in the pull request description)",
+            planned.steps.len(),
+            if planned.steps.len() == 1 {
+                "step"
+            } else {
+                "steps"
+            }
+        ),
     )
     .await;
-    super::post_ticket_notice(
-        state,
-        msg,
-        run_id,
-        github,
-        NOTICE_RELEASE,
-        &format!("**{title}**\n\n{body}"),
-        &super::fix_location::jira_text(&body),
-        title,
-        &[],
-    )
-    .await;
+    // The steps are CoderHelm's own work: they live in the description and
+    // on the run page. Only a step nobody can do until a person grants
+    // something is said on the ticket, one line each.
+    let asks = person_lines(&planned.steps);
+    let sunk = common::person_gate::sink(&format!("**Needed from you:**\n{}", asks.join("\n")));
+    if !asks.is_empty() && !sunk.human.is_empty() {
+        let body = sunk.text;
+        super::post_ticket_notice(
+            state,
+            msg,
+            run_id,
+            github,
+            NOTICE_RELEASE,
+            &body,
+            &super::fix_location::jira_text(&body),
+            title,
+            &[],
+        )
+        .await;
+    }
     arm(
         state,
         &msg.team_id,

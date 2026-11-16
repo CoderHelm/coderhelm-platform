@@ -896,9 +896,12 @@ mod tests {
         assert_eq!(posted.len(), 1);
         assert_eq!(posted[0]["issueKey"], "ABC-7");
         let text = posted[0]["comment"].as_str().unwrap();
-        assert!(text.starts_with("Pat Doe answered in CoderHelm:"), "{text}");
+        assert!(text.starts_with("Pat Doe answered in CoderHelm"), "{text}");
         assert!(text.contains("Q: Which environments get the new limit?"));
-        assert!(text.contains("A: Production only.\nStaging keeps 100."));
+        assert!(
+            text.contains("A: Production only. Staging keeps 100."),
+            "{text}"
+        );
         assert!(text.contains("focusedCommentId=10001"));
         assert!(!text.contains("What is the new limit?"));
         // And its address is kept on the run.

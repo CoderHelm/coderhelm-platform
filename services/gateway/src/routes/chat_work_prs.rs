@@ -137,13 +137,19 @@ pub fn search_queries(ask: &PrAsk, repos: &[String]) -> Vec<String> {
         terms.push(format!("\"{t}\""));
     }
     terms.extend(ask.words.iter().take(6).cloned());
-    let head = terms.join(" ");
+    scoped_queries(&terms.join(" "), repos)
+}
+
+/// `head` once per query, with the repositories split so each query stays
+/// under GitHub's length: only the team's repositories are searched. At
+/// most three; none without repositories.
+pub fn scoped_queries(head: &str, repos: &[String]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    let mut cur = head.clone();
+    let mut cur = head.to_string();
     for r in repos {
         let q = format!(" repo:{r}");
         if cur.len() + q.len() > MAX_QUERY && cur != head {
-            out.push(std::mem::replace(&mut cur, head.clone()));
+            out.push(std::mem::replace(&mut cur, head.to_string()));
         }
         cur.push_str(&q);
     }
