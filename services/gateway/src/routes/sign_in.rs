@@ -225,6 +225,10 @@ pub struct Org {
     pub require_2fa: bool,
     /// When the rule was last turned on.
     pub require_2fa_since: Option<String>,
+    /// When the organization was made on this install. Anything dated
+    /// before it (an invite copied from the hosted CoderHelm) was never
+    /// sent from here.
+    pub created_at: Option<String>,
 }
 
 impl Org {
@@ -252,6 +256,9 @@ impl Org {
                 .copied()
                 .unwrap_or(false),
             require_2fa_since: Some(s(item, "require_2fa_since"))
+                .filter(|v| !v.is_empty())
+                .map(str::to_string),
+            created_at: Some(s(item, "created_at"))
                 .filter(|v| !v.is_empty())
                 .map(str::to_string),
         })

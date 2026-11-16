@@ -9,7 +9,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::models::Claims;
 use crate::permissions::{
@@ -171,6 +171,19 @@ pub(crate) fn invite_expires_at(item: &Item) -> Option<chrono::DateTime<chrono::
 
 pub(crate) fn invite_expired(item: &Item, now: chrono::DateTime<chrono::Utc>) -> bool {
     invite_expires_at(item).is_some_and(|t| t <= now)
+}
+
+/// An invite copied from the hosted CoderHelm that this install never sent:
+/// dated before the organization was made here (`org_since`) and with no
+/// set-up email since. Its only email links to the hosted CoderHelm, which
+/// no longer lets them in, so it is sent from here like a set-up email.
+pub(crate) fn copied_invite(item: &Item, org_since: Option<&str>) -> bool {
+    let Some(since) = org_since.and_then(rfc3339) else {
+        return false;
+    };
+    status_of(item) == "invited"
+        && setup_email_log(item).is_empty()
+        && invite_sent_at(item).is_some_and(|t| t < since)
 }
 
 /// What the team page shows for one record.
@@ -589,14 +602,22 @@ pub async fn list_users(
             .filter_map(|u| u["email"].as_str().map(normalize_email))
             .filter(|e| !e.is_empty())
             .collect();
+        let since = org_since(&state).await;
+        let copied: std::collections::HashSet<&str> = items
+            .iter()
+            .filter(|i| copied_invite(i, since.as_deref()))
+            .map(|i| bare_id(s(i, "sk")))
+            .collect();
         match pool_emails(&state, emails).await {
             Ok(pool) => {
                 for u in users.iter_mut() {
                     let email = u["email"].as_str().map(normalize_email).unwrap_or_default();
+                    let id = u["user_id"].as_str().unwrap_or("");
                     u["needs_setup"] = json!(needs_setup(
                         u["status"].as_str().unwrap_or(""),
                         &email,
-                        &pool
+                        &pool,
+                        copied.contains(id)
                     ));
                 }
             }
@@ -672,13 +693,21 @@ pub(crate) async fn pool_user(state: &AppState, email: &str) -> Result<PoolUser,
     }
 }
 
-/// A member (not an invite) with an email who has no sign-in on this install.
+/// Who a set-up email is for: a member with an email who has no sign-in on
+/// this install, or an invite this install never sent ([`copied_invite`]).
 pub(crate) fn needs_setup(
     status: &str,
     email: &str,
     pool: &std::collections::HashSet<String>,
+    copied_invite: bool,
 ) -> bool {
-    status != "invited" && !email.is_empty() && !pool.contains(email)
+    if email.is_empty() {
+        return false;
+    }
+    if status == "invited" {
+        return copied_invite;
+    }
+    !pool.contains(email)
 }
 
 // ── Invite user ──────────────────────────────────────────────────────
@@ -1070,7 +1099,7 @@ pub(crate) async fn deliver_setup_email(
         .table_name(&state.config.users_table_name)
         .key("pk", attr_s(team_id))
         .key("sk", attr_s(s(item, "sk")))
-        .update_expression("SET setup_email_sent_at = :now, setup_email_log = :log")
+        .update_expression(setup_record_expression(status_of(item)))
         .condition_expression("attribute_exists(pk)")
         .expression_attribute_values(":now", attr_s(&stamp))
         .expression_attribute_values(":log", AttributeValue::L(kept))
@@ -1078,6 +1107,28 @@ pub(crate) async fn deliver_setup_email(
         .await
         .map_err(|e| SetupSend::NotRecorded(e.to_string()))?;
     Ok(stamp)
+}
+
+/// What sending a set-up email writes on the record. To an invite it is the
+/// invite sent again, so its 30 days start now ([`INVITE_VALID_DAYS`]).
+pub(crate) fn setup_record_expression(status: &str) -> &'static str {
+    if status == "invited" {
+        "SET setup_email_sent_at = :now, setup_email_log = :log, invited_at = :now"
+    } else {
+        "SET setup_email_sent_at = :now, setup_email_log = :log"
+    }
+}
+
+/// When the organization was made on this install (see [`copied_invite`]).
+/// Unknown (no organization, or a failed read) copies nothing.
+pub(crate) async fn org_since(state: &AppState) -> Option<String> {
+    match super::sign_in::load_org(state).await {
+        Ok(org) => org.and_then(|o| o.created_at),
+        Err(e) => {
+            warn!(error = %e, "Organization not read; copied invites not offered set-up emails");
+            None
+        }
+    }
 }
 
 /// Whether a set-up email may go to this record now (an hour since the last one, five a week).
@@ -1159,11 +1210,13 @@ pub async fn send_setup_emails_all(
     let pool = pool_emails(&state, emails)
         .await
         .map_err(|e| internal("Sign-ins not checked", e))?;
+    let since = org_since(&state).await;
     let mut sent = serde_json::Map::new();
     let (mut skipped, mut failed) = (0usize, 0usize);
     for item in &items {
         let email = normalize_email(s(item, "email"));
-        if !needs_setup(status_of(item), &email, &pool) {
+        let copied = copied_invite(item, since.as_deref());
+        if !needs_setup(status_of(item), &email, &pool, copied) {
             continue;
         }
         if bulk_step(item, now) == BulkStep::SkipRecent {
@@ -2141,10 +2194,60 @@ mod tests {
     #[test]
     fn needs_setup_means_a_member_with_no_sign_in_here() {
         let pool: std::collections::HashSet<String> = ["in@example.com".to_string()].into();
-        assert!(needs_setup("active", "out@example.com", &pool));
-        assert!(!needs_setup("active", "in@example.com", &pool));
-        assert!(!needs_setup("invited", "out@example.com", &pool));
-        assert!(!needs_setup("active", "", &pool));
+        assert!(needs_setup("active", "out@example.com", &pool, false));
+        assert!(!needs_setup("active", "in@example.com", &pool, false));
+        assert!(!needs_setup("invited", "out@example.com", &pool, false));
+        assert!(!needs_setup("active", "", &pool, false));
+    }
+
+    fn copied(invited_at: &str, sent: &[&str]) -> Item {
+        let mut i = Item::new();
+        i.insert("pk".into(), attr_s("TEAM#acme"));
+        i.insert("sk".into(), attr_s("USER#invite_1"));
+        i.insert("email".into(), attr_s("new@acme.test"));
+        i.insert("status".into(), attr_s("invited"));
+        i.insert("invited_at".into(), attr_s(invited_at));
+        if !sent.is_empty() {
+            i.insert(
+                "setup_email_log".into(),
+                AttributeValue::L(sent.iter().map(|t| attr_s(t)).collect()),
+            );
+        }
+        i
+    }
+
+    #[test]
+    fn an_invite_copied_from_hosted_is_sent_from_here() {
+        // The failure: an invite made on the hosted CoderHelm before the team
+        // moved was copied over with its hosted email only. Nothing on the
+        // install ever sent it, and the bulk set-up email skipped invites.
+        let since = Some("2026-11-03T02:12:09+00:00");
+        let pool = std::collections::HashSet::new();
+        let hosted = copied("2026-10-27T14:33:25+00:00", &[]);
+        assert!(copied_invite(&hosted, since));
+        assert!(needs_setup("invited", "new@acme.test", &pool, true));
+        // Sent from here once: no longer copied (its own resend takes over).
+        assert!(!copied_invite(
+            &copied("2026-10-27T14:33:25+00:00", &["2026-11-16T12:00:00Z"]),
+            since
+        ));
+        // Made on this install: its invite email links here.
+        assert!(!copied_invite(
+            &copied("2026-11-05T10:00:00+00:00", &[]),
+            since
+        ));
+        // No organization date: nothing counts as copied.
+        assert!(!copied_invite(&hosted, None));
+        // A member is never a copied invite.
+        let mut m = hosted.clone();
+        m.insert("status".into(), attr_s("active"));
+        assert!(!copied_invite(&m, since));
+    }
+
+    #[test]
+    fn a_set_up_email_to_an_invite_restarts_its_thirty_days() {
+        assert!(setup_record_expression("invited").contains("invited_at = :now"));
+        assert!(!setup_record_expression("active").contains("invited_at"));
     }
 
     #[test]
