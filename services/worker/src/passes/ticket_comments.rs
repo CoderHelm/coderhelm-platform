@@ -1018,6 +1018,7 @@ mod tests {
                 ..Default::default()
             },
             body: String::new(),
+            node_id: String::new(),
         }];
         let mut reply = comment("2", "Yes.", Class::Instruction);
         reply.class = None;

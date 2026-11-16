@@ -379,6 +379,18 @@ pub struct Resp {
     pub content_type: String,
     /// The body (GET of an HTML page only), up to [`PAGE_SCAN_BYTES`].
     pub body: Vec<u8>,
+    /// Every response header, as sent (names lowercased).
+    pub headers: Vec<(String, String)>,
+}
+
+/// How one request is sent beyond its method: the request headers a page
+/// fetch carries (never credentials: [`common::coder_shell`] refuses them)
+/// and whether any text body is read (scripts and styles too, not only
+/// pages and JSON).
+#[derive(Debug, Clone, Default)]
+pub struct SendOpts {
+    pub headers: Vec<(String, String)>,
+    pub any_text: bool,
 }
 
 /// DNS and HTTP, behind a trait so the tests can script them.
@@ -388,6 +400,17 @@ pub trait Transport: Send + Sync {
     /// One request to `url`, connected to `addr` (already checked), no
     /// redirects followed.
     async fn send(&self, method: Method, url: &Url, addr: SocketAddr) -> Result<Resp, String>;
+    /// [`Transport::send`] with request headers and the body rule of a
+    /// page fetch.
+    async fn send_with(
+        &self,
+        method: Method,
+        url: &Url,
+        addr: SocketAddr,
+        _opts: &SendOpts,
+    ) -> Result<Resp, String> {
+        self.send(method, url, addr).await
+    }
 }
 
 /// The real network.
@@ -403,6 +426,17 @@ impl Transport for Net {
     }
 
     async fn send(&self, method: Method, url: &Url, addr: SocketAddr) -> Result<Resp, String> {
+        self.send_with(method, url, addr, &SendOpts::default())
+            .await
+    }
+
+    async fn send_with(
+        &self,
+        method: Method,
+        url: &Url,
+        addr: SocketAddr,
+        opts: &SendOpts,
+    ) -> Result<Resp, String> {
         let host = url.host_str().unwrap_or_default();
         // Pinned to the checked address; no redirects, cookies or proxy.
         let client = reqwest::Client::builder()
@@ -417,19 +451,19 @@ impl Transport for Net {
             Method::Head => client.head(url.clone()),
             Method::Get => client.get(url.clone()),
         };
-        let mut resp = req
-            .header("Accept", "text/html,*/*;q=0.8")
-            .send()
-            .await
-            .map_err(|e| {
-                if e.is_timeout() {
-                    "timed out".to_string()
-                } else if e.is_connect() {
-                    "couldn't connect".to_string()
-                } else {
-                    format!("request failed ({})", e.without_url())
-                }
-            })?;
+        let mut req = req.header("Accept", "text/html,*/*;q=0.8");
+        for (k, v) in &opts.headers {
+            req = req.header(k.as_str(), v.as_str());
+        }
+        let mut resp = req.send().await.map_err(|e| {
+            if e.is_timeout() {
+                "timed out".to_string()
+            } else if e.is_connect() {
+                "couldn't connect".to_string()
+            } else {
+                format!("request failed ({})", e.without_url())
+            }
+        })?;
         let header = |name: reqwest::header::HeaderName| {
             resp.headers()
                 .get(name)
@@ -439,8 +473,23 @@ impl Transport for Net {
         let location = header(reqwest::header::LOCATION);
         let content_type = header(reqwest::header::CONTENT_TYPE).unwrap_or_default();
         let status = resp.status().as_u16();
+        let headers: Vec<(String, String)> = resp
+            .headers()
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.as_str().to_string(),
+                    String::from_utf8_lossy(v.as_bytes()).into_owned(),
+                )
+            })
+            .collect();
         let mut body = Vec::new();
-        if method == Method::Get && is_readable(&content_type) {
+        let wanted = if opts.any_text {
+            is_text(&content_type)
+        } else {
+            is_readable(&content_type)
+        };
+        if method == Method::Get && wanted {
             while body.len() < PAGE_SCAN_BYTES {
                 match resp.chunk().await {
                     Ok(Some(c)) => body.extend_from_slice(&c),
@@ -454,6 +503,7 @@ impl Transport for Net {
             location,
             content_type,
             body,
+            headers,
         })
     }
 }
@@ -461,6 +511,19 @@ impl Transport for Net {
 fn is_html(content_type: &str) -> bool {
     let c = content_type.to_ascii_lowercase();
     c.starts_with("text/html") || c.starts_with("application/xhtml")
+}
+
+/// A body a page fetch shows: any text (a page, a script, a style, JSON,
+/// XML). A type the server didn't name is read as text too.
+fn is_text(content_type: &str) -> bool {
+    let c = content_type.to_ascii_lowercase();
+    c.is_empty()
+        || is_readable(&c)
+        || c.starts_with("text/")
+        || c.contains("javascript")
+        || c.contains("ecmascript")
+        || c.contains("xml")
+        || c.contains("css")
 }
 
 /// A body `find` can search: a page, JSON (an API's answer) or plain text.
@@ -633,6 +696,206 @@ async fn vetted_addr(t: &dyn Transport, host: &str) -> Result<SocketAddr, CheckE
     Ok(SocketAddr::new(ips[0], 443))
 }
 
+/// The refusal for a host that isn't one of the team's.
+fn not_the_teams(host: &str) -> CheckError {
+    refused(format!(
+        "{host} isn't one of the team's sites. Only hosts listed in the team's review \
+         settings, named in a URL in this work, used in the team's repositories, or a \
+         service API host built from an id in their config can be checked. A person can \
+         allow it by adding the domain in Settings, Integrations, Your websites (a domain \
+         covers its subdomains). Don't retry it in this run: record an open item that names \
+         {host} and what checking it would have confirmed, then go on without it."
+    ))
+}
+
+// ─── Page fetches (`curl`, `wget`) ──────────────────────────
+
+/// URLs one `curl` or `wget` line may fetch.
+pub const MAX_FETCH_URLS: usize = 3;
+/// Time for one fetch, all hops included.
+pub const FETCH_TIMEOUT: Duration = Duration::from_secs(20);
+/// Characters of a body shown.
+pub const FETCH_EXCERPT: usize = 6000;
+
+/// What a page fetch got: each hop, the last response's status, every one
+/// of its headers, and its body when one was asked for.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Fetched {
+    pub hops: Vec<Hop>,
+    pub status: u16,
+    pub final_url: String,
+    pub headers: Vec<(String, String)>,
+    pub content_type: String,
+    pub body: Vec<u8>,
+    /// Why the chain stopped before a final answer, if it did.
+    pub stopped: Option<String>,
+}
+
+/// One read-only request, the way `curl` or `wget` sent it: the same URL
+/// rules, team hosts and address checks as [`check_and_find`], every
+/// redirect re-checked, followed only when the command asked (`-L`).
+pub async fn fetch_page(
+    raw: &str,
+    req: &common::coder_shell::Fetch,
+    gate: &dyn HostGate,
+    t: &dyn Transport,
+) -> Result<Fetched, CheckError> {
+    let (mut url, mut host) = vet_url(raw)?;
+    if !gate.allowed(&host).await {
+        return Err(not_the_teams(&host));
+    }
+    let opts = SendOpts {
+        headers: req.headers.clone(),
+        any_text: req.body,
+    };
+    let method = if req.head { Method::Head } else { Method::Get };
+    let mut out = Fetched::default();
+    for hop in 0..=MAX_REDIRECTS {
+        let addr = match vetted_addr(t, &host).await {
+            Ok(a) => a,
+            Err(e) if hop == 0 => return Err(e),
+            Err(e) => {
+                out.stopped = Some(format!("redirect to {url} not followed: {}", e.text()));
+                return Ok(out);
+            }
+        };
+        let resp = match t.send_with(method, &url, addr, &opts).await {
+            Ok(r) => r,
+            Err(e) if hop == 0 => return Err(CheckError::Failed(format!("{url}: {e}"))),
+            Err(e) => {
+                out.stopped = Some(format!("{url}: {e}"));
+                return Ok(out);
+            }
+        };
+        out.hops.push(Hop {
+            url: url.to_string(),
+            status: resp.status,
+        });
+        out.final_url = url.to_string();
+        out.status = resp.status;
+        out.headers = resp.headers.clone();
+        out.content_type = resp.content_type.clone();
+        out.body = if req.body && !req.head {
+            resp.body.clone()
+        } else {
+            Vec::new()
+        };
+        let next = resp
+            .location
+            .as_deref()
+            .filter(|_| req.follow && (300..400).contains(&resp.status));
+        let Some(loc) = next else {
+            return Ok(out);
+        };
+        if hop == MAX_REDIRECTS {
+            out.stopped = Some(format!("more than {MAX_REDIRECTS} redirects"));
+            return Ok(out);
+        }
+        let Ok(joined) = url.join(loc) else {
+            out.stopped = Some(format!("redirect to an invalid URL ({loc})"));
+            return Ok(out);
+        };
+        match vet_url(joined.as_str()) {
+            Ok((u, h)) if gate.allowed(&h).await => {
+                url = u;
+                host = h;
+            }
+            Ok((u, h)) => {
+                out.stopped = Some(format!(
+                    "redirects to {u}, outside the team's sites ({h}); not followed"
+                ));
+                return Ok(out);
+            }
+            Err(e) => {
+                out.stopped = Some(format!("redirects to {joined}; not followed: {}", e.text()));
+                return Ok(out);
+            }
+        }
+    }
+    Ok(out)
+}
+
+impl Fetched {
+    /// The answer for one URL: the redirects, the status line, every
+    /// header (cookie values left out) and a bounded part of the body.
+    pub fn render(&self, asked: &str, req: &common::coder_shell::Fetch) -> String {
+        let method = if req.head { "HEAD" } else { "GET" };
+        let mut s = format!("{method} {asked}\n");
+        if let Some((_, earlier)) = self.hops.split_last() {
+            for h in earlier {
+                s.push_str(&format!("  {} {} (redirect, followed)\n", h.status, h.url));
+            }
+        }
+        if self.hops.is_empty() {
+            if let Some(why) = &self.stopped {
+                s.push_str(&format!("stopped: {why}\n"));
+            }
+            return s;
+        }
+        s.push_str(&format!("HTTP {} {}\n", self.status, self.final_url));
+        for (k, v) in &self.headers {
+            if k.eq_ignore_ascii_case("set-cookie") {
+                let name = v.split('=').next().unwrap_or("").trim();
+                s.push_str(&format!("{k}: {name}=[value not shown]\n"));
+            } else {
+                s.push_str(&format!("{k}: {v}\n"));
+            }
+        }
+        if let Some(why) = &self.stopped {
+            s.push_str(&format!("stopped: {why}\n"));
+        }
+        if req.head {
+            return s;
+        }
+        if !req.body {
+            s.push_str("(body not shown: the command discarded it)\n");
+            return s;
+        }
+        if self.body.is_empty() {
+            if is_text(&self.content_type) {
+                s.push_str("(empty body)\n");
+            } else {
+                s.push_str(&format!(
+                    "(a {} body, which isn't text: not shown)\n",
+                    self.content_type
+                ));
+            }
+            return s;
+        }
+        let text = String::from_utf8_lossy(&self.body);
+        let total = text.chars().count();
+        let excerpt: String = text.chars().take(FETCH_EXCERPT).collect();
+        let shown = excerpt.chars().count();
+        let capped = self.body.len() >= PAGE_SCAN_BYTES;
+        s.push_str(&format!(
+            "--- body: {} ---\n{excerpt}\n",
+            if shown < total || capped {
+                format!(
+                    "the first {shown} of {}{total} characters",
+                    if capped { "more than " } else { "" }
+                )
+            } else {
+                format!("{total} characters")
+            }
+        ));
+        s
+    }
+
+    /// One line for the activity log and the evidence.
+    pub fn line(&self) -> String {
+        let chain: Vec<String> = self.hops.iter().map(|h| h.status.to_string()).collect();
+        format!(
+            "{} to {}{}",
+            chain.join(" to "),
+            self.final_url,
+            self.stopped
+                .as_ref()
+                .map(|w| format!(" (stopped: {w})"))
+                .unwrap_or_default()
+        )
+    }
+}
+
 /// Checks one URL: HEAD, then GET when HEAD fails, errs, the page is HTML
 /// (for its title) or `find` has terms to look for in a JSON or text body;
 /// redirects followed with every hop re-vetted.
@@ -654,14 +917,7 @@ pub async fn check_and_find(
 ) -> Result<Checked, CheckError> {
     let (mut url, mut host) = vet_url(raw)?;
     if !gate.allowed(&host).await {
-        return Err(refused(format!(
-            "{host} isn't one of the team's sites. Only hosts listed in the team's review \
-             settings, named in a URL in this work, used in the team's repositories, or a \
-             service API host built from an id in their config can be checked. A person can \
-             allow it by adding the domain in Settings, Integrations, Your websites (a domain \
-             covers its subdomains). Don't retry it in this run: record an open item that names \
-             {host} and what checking it would have confirmed, then go on without it."
-        )));
+        return Err(not_the_teams(&host));
     }
     let mut out = Checked::default();
     for hop in 0..=MAX_REDIRECTS {
@@ -1183,6 +1439,139 @@ impl WebCheck {
     }
 }
 
+/// What a `curl` or `wget` line got, as the coder's bash tool reports it.
+pub struct FetchReport {
+    pub text: String,
+    /// `ok`, `refused` or `failed` for the line: refused when every URL
+    /// was refused.
+    pub outcome: &'static str,
+    /// A short line for the run log (`HTTP 200`, `refused: ...`).
+    pub summary: String,
+}
+
+impl WebCheck {
+    /// A page fetch from the coder's `bash` (`curl -sI`, `curl -sS`,
+    /// `wget -qO-`): the same hosts, addresses, budget and activity log as
+    /// `check_url`; the answer has the status, every header and part of
+    /// the body.
+    pub async fn fetch(
+        &self,
+        state: &WorkerState,
+        github: &GitHubClient,
+        req: &common::coder_shell::Fetch,
+    ) -> FetchReport {
+        let gate = RepoGate {
+            web: self,
+            search: github,
+        };
+        let mut parts = Vec::new();
+        for u in req.urls.iter().take(MAX_FETCH_URLS) {
+            let (outcome, text, detail, ms) = self.fetch_one(&gate, &Net, u, req).await;
+            let logged = self
+                .log(
+                    state,
+                    &format!("{} {u}", if req.head { "HEAD" } else { "GET" }),
+                    outcome,
+                    &detail,
+                    ms,
+                )
+                .await;
+            parts.push(if logged {
+                (outcome, text, detail)
+            } else {
+                (
+                    "failed",
+                    format!(
+                        "{u}\n  The request could not be recorded, so its result is withheld.\n"
+                    ),
+                    "not recorded".to_string(),
+                )
+            });
+        }
+        fetch_report(parts, req.urls.len())
+    }
+
+    /// One URL of a page fetch: `(outcome, answer, log detail, ms)`.
+    async fn fetch_one(
+        &self,
+        gate: &dyn HostGate,
+        t: &dyn Transport,
+        u: &str,
+        req: &common::coder_shell::Fetch,
+    ) -> (&'static str, String, String, u128) {
+        let started = Instant::now();
+        if !self.take() {
+            let m = format!(
+                "All {} page checks for this run are used (curl and wget count as checks). \
+                 Don't fetch pages again in this run; say which weren't read.",
+                self.limit
+            );
+            return ("refused", format!("{u}\n  refused: {m}\n"), m, 0);
+        }
+        let res = match tokio::time::timeout(FETCH_TIMEOUT, fetch_page(u, req, gate, t)).await {
+            Ok(r) => r,
+            Err(_) => Err(CheckError::Failed(format!(
+                "timed out after {}s",
+                FETCH_TIMEOUT.as_secs()
+            ))),
+        };
+        let ms = started.elapsed().as_millis();
+        match res {
+            Ok(f) => {
+                if let Ok(mut r) = self.results.lock() {
+                    r.push(format!("{u}: {}", f.line()));
+                }
+                let detail = format!("{} · {}", f.status, f.line());
+                ("ok", f.render(u, req), detail, ms)
+            }
+            Err(CheckError::Refused(m)) => {
+                self.note_unconfirmed(u, &format!("refused: {m}"));
+                ("refused", format!("{u}\n  refused: {m}\n"), m, ms)
+            }
+            Err(CheckError::Failed(m)) => {
+                self.note_unconfirmed(u, &format!("could not fetch: {m}"));
+                ("failed", format!("{u}\n  could not fetch: {m}\n"), m, ms)
+            }
+        }
+    }
+}
+
+/// The report for a fetch line from each URL's `(outcome, answer, detail)`.
+fn fetch_report(parts: Vec<(&'static str, String, String)>, asked: usize) -> FetchReport {
+    let mut text: String = parts
+        .iter()
+        .map(|p| p.1.trim_end().to_string())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if asked > MAX_FETCH_URLS {
+        text.push_str(&format!(
+            "\n\nOnly the first {MAX_FETCH_URLS} URLs were fetched: send the rest on another call."
+        ));
+    }
+    let outcome = if parts.iter().any(|p| p.0 == "ok") {
+        "ok"
+    } else if parts.iter().all(|p| p.0 == "refused") {
+        "refused"
+    } else {
+        "failed"
+    };
+    let summary = match (parts.len(), parts.first()) {
+        (1, Some(("ok", _, detail))) => {
+            format!("HTTP {}", detail.split(" · ").next().unwrap_or(""))
+        }
+        (1, Some((o, _, detail))) => format!("{o}: {detail}"),
+        (n, _) => format!(
+            "{} of {n} pages fetched",
+            parts.iter().filter(|p| p.0 == "ok").count()
+        ),
+    };
+    FetchReport {
+        text,
+        outcome,
+        summary: common::truncate_str(&summary, 180).to_string(),
+    }
+}
+
 impl WebCheck {
     /// One URL within the run's budget, timed: the check, or why not.
     async fn checked(
@@ -1350,8 +1739,16 @@ mod tests {
                     location: None,
                     content_type: ct.into(),
                     body: body.as_bytes().to_vec(),
+                    headers: vec![("content-type".into(), ct.into())],
                 },
             );
+            self
+        }
+        /// Response headers on a page already added.
+        fn headers(mut self, url: &str, h: &[(&str, &str)]) -> Self {
+            let r = self.routes.get_mut(url).expect("a page");
+            r.headers
+                .extend(h.iter().map(|(k, v)| (k.to_string(), v.to_string())));
             self
         }
         fn redirect(mut self, url: &str, status: u16, to: &str) -> Self {
@@ -1916,6 +2313,173 @@ mod tests {
             l[0].line.contains("ab12cd34.api.sanity.io"),
             "{}",
             l[0].line
+        );
+    }
+
+    fn get(url: &str) -> common::coder_shell::Fetch {
+        match common::coder_shell::classify(&format!("curl -sS {url}")) {
+            common::coder_shell::Shell::Fetch(f) => f,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_page_fetch_returns_the_status_every_header_and_the_body() {
+        let web = team_web();
+        let url = "https://www.example.com/statics/embed.js";
+        let t = Fake::default()
+            .host("www.example.com", PUBLIC)
+            .page(url, 200, "application/javascript", "window.embed = 1;")
+            .headers(
+                url,
+                &[
+                    ("x-frame-options", "SAMEORIGIN"),
+                    ("content-security-policy", "frame-ancestors 'self'"),
+                    ("set-cookie", "sid=abc123secret; Path=/"),
+                ],
+            );
+        let (outcome, text, _, _) = web
+            .fetch_one(&policy(&["example.com"]), &t, url, &get(url))
+            .await;
+        assert_eq!(outcome, "ok", "{text}");
+        assert!(text.contains("HTTP 200"), "{text}");
+        assert!(text.contains("x-frame-options: SAMEORIGIN"), "{text}");
+        assert!(
+            text.contains("content-security-policy: frame-ancestors 'self'"),
+            "{text}"
+        );
+        assert!(text.contains("window.embed = 1;"), "{text}");
+        // A cookie's value never reaches the agent.
+        assert!(!text.contains("abc123secret") && text.contains("set-cookie: sid="));
+        // It was a GET, pinned to the checked address.
+        assert_eq!(t.sent.lock().unwrap()[0].0, Method::Get);
+    }
+
+    #[tokio::test]
+    async fn a_head_fetch_sends_head_and_shows_headers_only() {
+        let web = team_web();
+        let url = "https://www.example.com/portal/1";
+        let t = Fake::default()
+            .host("www.example.com", PUBLIC)
+            .page(url, 200, "text/html", "<title>Portal</title>")
+            .headers(url, &[("x-frame-options", "DENY")]);
+        let req = match common::coder_shell::classify(&format!("curl -sI {url}")) {
+            common::coder_shell::Shell::Fetch(f) => f,
+            other => panic!("{other:?}"),
+        };
+        let (outcome, text, _, _) = web
+            .fetch_one(&policy(&["example.com"]), &t, url, &req)
+            .await;
+        assert_eq!(outcome, "ok");
+        assert!(text.starts_with("HEAD ") && text.contains("x-frame-options: DENY"));
+        assert!(!text.contains("<title>"), "{text}");
+        assert_eq!(t.sent.lock().unwrap()[0].0, Method::Head);
+    }
+
+    #[tokio::test]
+    async fn a_fetch_never_reaches_private_metadata_or_unlisted_hosts() {
+        let web = team_web();
+        let gate = policy(&["example.com"]);
+        let t = Fake::default()
+            .host("internal.example.com", "10.0.0.5")
+            .host("meta.example.com", "169.254.169.254");
+        for (u, why) in [
+            ("https://internal.example.com/", "non-public"),
+            ("https://meta.example.com/latest/meta-data/", "non-public"),
+            ("https://169.254.169.254/latest/meta-data/", "IP address"),
+            ("https://intranet.local/", "isn't a public host name"),
+            ("http://www.example.com/", "only https"),
+            (
+                "https://other.example.org/",
+                "isn't one of the team's sites",
+            ),
+        ] {
+            let (outcome, text, _, _) = web.fetch_one(&gate, &t, u, &get(u)).await;
+            assert_eq!(outcome, "refused", "{u}: {text}");
+            assert!(text.contains(why), "{u}: {text}");
+        }
+        assert!(t.sent.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn redirects_are_followed_only_when_asked_and_rechecked() {
+        let web = team_web();
+        let gate = policy(&["example.com"]);
+        let t = Fake::default()
+            .host("www.example.com", PUBLIC)
+            .redirect("https://www.example.com/old", 301, "/new")
+            .page(
+                "https://www.example.com/new",
+                200,
+                "text/html",
+                "<p>new</p>",
+            );
+        let (_, text, _, _) = web
+            .fetch_one(
+                &gate,
+                &t,
+                "https://www.example.com/old",
+                &get("https://www.example.com/old"),
+            )
+            .await;
+        assert!(text.contains("HTTP 301"), "{text}");
+        let mut follow = get("https://www.example.com/old");
+        follow.follow = true;
+        let (_, text, _, _) = web
+            .fetch_one(&gate, &t, "https://www.example.com/old", &follow)
+            .await;
+        assert!(
+            text.contains("301 https://www.example.com/old (redirect"),
+            "{text}"
+        );
+        assert!(
+            text.contains("HTTP 200 https://www.example.com/new"),
+            "{text}"
+        );
+        // A redirect off the team's hosts is reported, not followed.
+        let t = Fake::default().host("www.example.com", PUBLIC).redirect(
+            "https://www.example.com/away",
+            302,
+            "https://elsewhere.example.net/",
+        );
+        let mut follow = get("https://www.example.com/away");
+        follow.follow = true;
+        let (_, text, _, _) = web
+            .fetch_one(&gate, &t, "https://www.example.com/away", &follow)
+            .await;
+        assert!(text.contains("outside the team's sites"), "{text}");
+    }
+
+    #[test]
+    fn a_long_body_is_cut_and_says_so() {
+        let f = Fetched {
+            hops: vec![Hop {
+                url: "https://www.example.com/a.js".into(),
+                status: 200,
+            }],
+            status: 200,
+            final_url: "https://www.example.com/a.js".into(),
+            headers: vec![],
+            content_type: "application/javascript".into(),
+            body: "x".repeat(FETCH_EXCERPT + 500).into_bytes(),
+            stopped: None,
+        };
+        let text = f.render(
+            "https://www.example.com/a.js",
+            &get("https://www.example.com/a.js"),
+        );
+        assert!(
+            text.contains(&format!(
+                "the first {FETCH_EXCERPT} of {}",
+                FETCH_EXCERPT + 500
+            )),
+            "{}",
+            &text[..200]
+        );
+        let report = fetch_report(vec![("ok", text, "200 · 200 to x".into())], 1);
+        assert_eq!(
+            (report.outcome, report.summary.as_str()),
+            ("ok", "HTTP 200")
         );
     }
 

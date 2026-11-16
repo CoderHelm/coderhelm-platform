@@ -50,6 +50,7 @@ fn the_shell_call_runs_and_says_what_it_could_not_do() {
             command: "npx vitest run src/cart/total.test.ts".into(),
             dir: Some("apps/shop".into()),
             dropped: Some("| tail -40".into()),
+            parts: vec!["npx vitest run src/cart/total.test.ts".into()],
         }
     );
     assert_eq!(

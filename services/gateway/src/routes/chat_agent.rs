@@ -108,12 +108,15 @@ pub struct Ask<'a> {
 
 /// The tools a question's answer lives in (a status question: the tickets,
 /// pull requests and runs). An answer that says it found nothing without
-/// calling any of them is sent back once.
+/// calling any of them is sent back once; with `always`, any answer that
+/// didn't call one is ("what needs me" is only ever answered from its tool).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct MustLook {
     pub tools: Vec<String>,
     /// Where to look, in a few words ("the ticket, its pull requests and runs").
     pub what: String,
+    /// Send back any answer that didn't look there, found or not.
+    pub always: bool,
 }
 
 /// The note sent back when an answer found nothing without looking where
@@ -123,6 +126,16 @@ pub fn look_there(what: &str, tools: &[String]) -> String {
         "<check>Your answer says nothing was found, but you didn't look where the answer would \
          be: {what}. Look there now with {}, then answer with citations. If those don't have it \
          either, say which places you searched.</check>",
+        tools.join(", ")
+    )
+}
+
+/// The note sent back when an answer didn't read the one place its answer
+/// comes from.
+pub fn answer_from(what: &str, tools: &[String]) -> String {
+    format!(
+        "<check>This question is answered from {what}, and you didn't look there. Call {} now, \
+         then answer in the shape its result gives, with citations.</check>",
         tools.join(", ")
     )
 }
@@ -148,6 +161,9 @@ pub fn checked_in_code(
             .cloned()
             .collect();
         let looked = calls.iter().any(|c| m.tools.contains(c));
+        if !offered.is_empty() && !looked && m.always {
+            return Some(answer_from(&m.what, &offered));
+        }
         if !offered.is_empty() && !looked && says_nothing_found(answer) {
             return Some(look_there(&m.what, &offered));
         }

@@ -12,6 +12,8 @@
 //!   infrastructure findings and quarantined tests.
 //! - [`RECORDS`]: reviews and their verdicts, alerts, log findings, plans
 //!   and the team's AWS resources (`chat_work_records`).
+//! - [`NEEDS_ME`]: everything waiting on the asker, from the runs, Jira and
+//!   GitHub in one call, grouped by urgency (`chat_work_needs`).
 //!
 //! Each tool is offered only when the asker could see what it reads in the
 //! dashboard: the route that shows it is named ([`Kind::handler`]) and
@@ -34,9 +36,10 @@ pub const PULL_REQUESTS: &str = "work_pull_requests";
 pub const RUNS: &str = "work_runs";
 pub const FINDINGS: &str = "work_findings";
 pub const RECORDS: &str = "work_records";
+pub const NEEDS_ME: &str = "work_needs_me";
 
 /// Every tool of this source, in the order they are offered.
-pub const TOOLS: [&str; 5] = [TICKETS, PULL_REQUESTS, RUNS, FINDINGS, RECORDS];
+pub const TOOLS: [&str; 6] = [NEEDS_ME, TICKETS, PULL_REQUESTS, RUNS, FINDINGS, RECORDS];
 
 /// The tools a status question's answer lives in.
 pub const STATUS_TOOLS: [&str; 3] = [TICKETS, PULL_REQUESTS, RUNS];
@@ -213,6 +216,16 @@ pub fn defs(readable: &[&str], repos: &[String], can_github: bool) -> Vec<Value>
             repos.iter().take(40).cloned().collect::<Vec<_>>().join(", "))
     });
     let mut out = Vec::new();
+    if ["runs", "tickets", "pull_requests"]
+        .iter()
+        .any(|k| may(readable, k))
+    {
+        out.push(json!({
+            "name": NEEDS_ME,
+            "description": "Everything waiting on the person asking, in one call: questions Coderhelm's runs stopped on (with their options), runs waiting on an outside change, tool calls held for their approval, Jira tickets assigned to them or where someone asked them something they haven't answered, pull requests asking for their review, their own pull requests with changes asked for, failing checks or ready to merge, and comments mentioning them. It finds who they are itself (email, GitHub login, Jira account), reads only their team, and returns the items grouped by urgency with links, plus every source it couldn't read. Call it first, once, for any question about what is waiting on them, in any words: \"what needs my answer\", \"what needs me\", \"what's on my plate\", \"what should I work on\", \"anything waiting on me\", \"my reviews\", \"my tickets\", \"am I blocking anyone\". No input.",
+            "input_schema": {"type": "object", "properties": {}}
+        }));
+    }
     if may(readable, "tickets") {
         out.push(json!({
             "name": TICKETS,
@@ -301,6 +314,7 @@ pub fn label(name: &str, input: &Value) -> String {
         None => format!("Looked up {noun}"),
     };
     match name {
+        NEEDS_ME => "Checked what's waiting on you".into(),
         TICKETS => about("tickets"),
         PULL_REQUESTS => about("pull requests"),
         RUNS if input["status"] == "active" && what.is_none() => {
@@ -322,6 +336,11 @@ pub fn label(name: &str, input: &Value) -> String {
 /// names (`chat_hints`). Empty when it names nothing of the team's work.
 pub fn hint_note(h: &super::chat_hints::Hints, offered: &[&str]) -> String {
     let has = |t: &str| offered.contains(&t);
+    if h.needs_me && has(NEEDS_ME) {
+        return format!(
+            "\nThis question asks what is waiting on the person asking. Call {NEEDS_ME} first, once: it reads Coderhelm's runs, the held approvals, Jira and GitHub for them and says which of those it couldn't read. Answer in the shape its result gives. Look further only to explain one of its items.\n"
+        );
+    }
     let mut steps: Vec<String> = Vec::new();
     if h.running && has(RUNS) {
         steps.push(format!("{RUNS} with status \"active\""));
@@ -386,6 +405,7 @@ pub fn put_first(tools: &mut [Value], h: &super::chat_hints::Hints) {
     }
     let rank = |t: &Value| -> usize {
         match t["name"].as_str().unwrap_or("") {
+            NEEDS_ME if h.needs_me => 0,
             FINDINGS if h.findings => 0,
             RUNS if h.running => 0,
             TICKETS => 1,
@@ -393,10 +413,38 @@ pub fn put_first(tools: &mut [Value], h: &super::chat_hints::Hints) {
             RUNS => 3,
             FINDINGS => 4,
             RECORDS => 5,
+            NEEDS_ME => 6,
             _ => 9,
         }
     };
     tools.sort_by_key(rank);
+}
+
+/// Where a question's answer must be looked for before the answer may say
+/// nothing was found: "what needs me" must call [`NEEDS_ME`] whatever it
+/// says; a status question must look in the tickets, pull requests or runs
+/// before it says there's nothing.
+pub fn must_look(
+    h: &super::chat_hints::Hints,
+    offered: &[&str],
+) -> Option<super::chat_agent::MustLook> {
+    if h.needs_me && offered.contains(&NEEDS_ME) {
+        return Some(super::chat_agent::MustLook {
+            tools: vec![NEEDS_ME.to_string()],
+            what: "everything waiting on the person: Coderhelm's runs, approvals, Jira and GitHub"
+                .into(),
+            always: true,
+        });
+    }
+    h.about_work().then(|| super::chat_agent::MustLook {
+        tools: STATUS_TOOLS
+            .iter()
+            .filter(|t| offered.contains(t))
+            .map(|t| t.to_string())
+            .collect(),
+        what: "the team's tickets, pull requests and Coderhelm's runs".into(),
+        always: false,
+    })
 }
 
 // ── Running a call ──────────────────────────────────────────────────────────
@@ -507,6 +555,7 @@ pub async fn call(
     };
     let team = ctx.claims.team_id.as_str();
     match name {
+        NEEDS_ME => Box::pin(needs_me(ctx, reg)).await,
         RUNS => {
             if !may(&ctx.readable, "runs") {
                 return refused();
@@ -627,6 +676,59 @@ pub async fn call(
         }
         _ => fail("unknown tool."),
     }
+}
+
+/// Everything waiting on the asker (`chat_work_needs`), from their team only.
+async fn needs_me(
+    ctx: &Ctx,
+    reg: &mut common::knowledge::answer::Registry,
+) -> (String, String, bool) {
+    use super::chat_work_needs as needs;
+    let now = chrono::Utc::now();
+    let held = match ctx.installation_id {
+        Some(id) => crate::lookups::github_hold(
+            ctx.caller,
+            limited_until(&ctx.state, id).await,
+            now.timestamp().max(0) as u64,
+        ),
+        None => None,
+    };
+    let http = common::mcp_remote::http::GuardedHttps;
+    let store = needs::Dynamo { state: &ctx.state };
+    let src = needs::Sources {
+        team: &ctx.claims.team_id,
+        store: &store,
+        http: &http,
+        jira: ctx.jira.as_ref(),
+        github: ctx.github_token.as_ref().map(|t| needs::GitHub {
+            auth: format!("Bearer {t}"),
+            base: "https://api.github.com".into(),
+            held,
+        }),
+        repos: &ctx.repos,
+        readable: &ctx.readable,
+        budget: needs::SOURCE_BUDGET,
+    };
+    let me = needs::Me {
+        email: ctx.claims.email.trim().to_string(),
+        github: ctx
+            .claims
+            .github_login
+            .as_deref()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string),
+        jira_id: None,
+        is_admin: matches!(ctx.claims.role.as_str(), "admin" | "owner"),
+    };
+    let report = Box::pin(needs::gather(&src, me, now)).await;
+    for s in &report.sources {
+        if let needs::Read::Failed(e) = &s.read {
+            tracing::warn!(tool = NEEDS_ME, source = s.name, error = %e, "Chat: a source of what needs the asker couldn't be read");
+        }
+    }
+    let (text, summary) = needs::render(&report, reg, &live_stamp());
+    (text, summary, false)
 }
 
 /// Tickets: from Jira by key or text, and from the runs that worked on them.
@@ -753,6 +855,18 @@ mod tests {
         }
     }
 
+    /// The permission gate asks every call; a tool it doesn't know is denied.
+    #[test]
+    fn every_work_tool_is_known_to_the_permission_gate() {
+        for t in TOOLS {
+            assert_eq!(
+                common::agent_policy::registry::builtin(t),
+                Some(common::agent_policy::Risk::Read),
+                "{t}"
+            );
+        }
+    }
+
     #[test]
     fn a_viewer_reads_only_what_the_dashboard_shows_a_viewer() {
         let viewer = readable(&Holder::builtin("viewer"));
@@ -786,7 +900,11 @@ mod tests {
             .iter()
             .filter_map(|t| t["name"].as_str())
             .collect();
-        assert_eq!(names, [RUNS]);
+        assert_eq!(names, [NEEDS_ME, RUNS]);
+        // A role that reads none of runs, tickets or pull requests isn't
+        // offered what needs them.
+        let only_infra = defs(&["infra"], &repos, true);
+        assert!(!only_infra.iter().any(|t| t["name"] == NEEDS_ME));
         let every = defs(&all(), &repos, true);
         assert_eq!(every.len(), TOOLS.len());
         // No GitHub token: no pull request tool.
@@ -829,6 +947,40 @@ mod tests {
         assert!(hint_note(&h, &TOOLS).contains("status \"active\""));
         let h = super::super::chat_hints::read("How is harbor-api put together?");
         assert!(hint_note(&h, &TOOLS).is_empty());
+        assert!(must_look(&h, &TOOLS).is_none());
+    }
+
+    #[test]
+    fn what_needs_me_goes_to_its_tool_first_in_any_words() {
+        for q in [
+            "What needs my answer?",
+            "what needs me today",
+            "Anything waiting on me?",
+            "what's on my plate",
+            "What should I work on next?",
+            "Do I have any reviews pending?",
+            "am I blocking anyone?",
+            "show me my tickets",
+        ] {
+            let h = super::super::chat_hints::read(q);
+            assert!(h.needs_me, "{q}");
+            let mut tools = vec![
+                json!({"name": RUNS}),
+                json!({"name": TICKETS}),
+                json!({"name": NEEDS_ME}),
+            ];
+            put_first(&mut tools, &h);
+            assert_eq!(tools[0]["name"], NEEDS_ME, "{q}");
+            assert!(
+                hint_note(&h, &TOOLS).contains("Call work_needs_me first"),
+                "{q}"
+            );
+            let m = must_look(&h, &TOOLS).unwrap();
+            assert!(m.always && m.tools == [NEEDS_ME], "{q}");
+        }
+        // Without the tool on offer, the status rule stands.
+        let h = super::super::chat_hints::read("What needs my answer?");
+        assert!(!hint_note(&h, &[RUNS]).contains(NEEDS_ME));
     }
 
     #[test]
@@ -845,6 +997,7 @@ mod tests {
             label(FINDINGS, &json!({"kind": "infra"})),
             "Looked up infrastructure findings"
         );
+        assert_eq!(label(NEEDS_ME, &json!({})), "Checked what's waiting on you");
         assert_eq!(
             words_of("Embed the Portal, on sign-up pages!"),
             ["embed", "portal", "sign-up", "pages"]

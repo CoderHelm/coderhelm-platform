@@ -3598,6 +3598,26 @@ impl GitHubClient {
         self.get(&url).await
     }
 
+    /// Hides one of CoderHelm's own comments as outdated, or shows it again
+    /// (`common::conversation_io::hide_request`). Only the conversation
+    /// layer calls it, for comments that carry CoderHelm's marker.
+    pub async fn hide_own_comment(
+        &self,
+        node_id: &str,
+        hidden: bool,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let v = self
+            .post(
+                &format!("{API_BASE}/graphql"),
+                &common::conversation_io::hide_request(node_id, hidden),
+            )
+            .await?;
+        match common::conversation_io::graphql_error(&v) {
+            Some(e) => Err(e.into()),
+            None => Ok(()),
+        }
+    }
+
     /// One GraphQL query, refused unless it only reads.
     pub async fn graphql_read(
         &self,

@@ -1,7 +1,8 @@
 //! What a Chat question names, read without a model: a ticket key, a pull
 //! request number, a CVE or advisory id, a quoted title, a status question
 //! ("what's the latest", "where are we") or "what's running". The hints put
-//! the tool that holds the answer first and tell the model where to look;
+//! the tool that holds the answer first and tell the model where to look
+//! ("what needs me", in any words, goes to the tool that gathers it);
 //! they never route on their own (the model still picks its tools).
 //!
 //! The same reading tells the answer check (`chat_agent`) when an answer
@@ -87,6 +88,40 @@ const FINDING_WORDS: &[&str] = &[
     "security issue",
 ];
 
+/// Words that ask what is waiting on the asker ("what needs my answer").
+const NEEDS_ME_WORDS: &[&str] = &[
+    "needs my",
+    "need my",
+    "needs me",
+    "need me",
+    "waiting on me",
+    "waiting for me",
+    "waiting on my",
+    "blocked on me",
+    "blocking anyone",
+    "am i blocking",
+    "on my plate",
+    "should i work on",
+    "should i look at",
+    "for me to do",
+    "anything for me",
+    "my todo",
+    "my to-do",
+    "my to do",
+    "my queue",
+    "my inbox",
+    "my action items",
+    "my reviews",
+    "review requests",
+    "reviews pending",
+    "pending reviews",
+    "my tickets",
+    "my prs",
+    "my pull requests",
+    "assigned to me",
+    "mentioned me",
+];
+
 /// Prefixes of ids that look like ticket keys but are not.
 const NOT_TICKETS: &[&str] = &[
     "CVE", "GHSA", "UTF", "SHA", "ISO", "RFC", "HTTP", "TLS", "SSL", "AES", "MD", "ES", "IPV",
@@ -107,6 +142,8 @@ pub struct Hints {
     pub running: bool,
     /// It asks about security or infrastructure findings.
     pub findings: bool,
+    /// It asks what is waiting on the asker.
+    pub needs_me: bool,
 }
 
 /// The most of each kind a question carries into the note.
@@ -158,6 +195,8 @@ pub fn read(question: &str) -> Hints {
     h.running = RUNNING_WORDS.iter().any(|w| lower.contains(w));
     h.findings = !h.advisories.is_empty() || FINDING_WORDS.iter().any(|w| lower.contains(w));
     h.status = h.running || STATUS_WORDS.iter().any(|w| has_word(&lower, w));
+    let plain = lower.replace('\u{2019}', "'");
+    h.needs_me = NEEDS_ME_WORDS.iter().any(|w| has_word(&plain, w));
     h
 }
 
@@ -175,6 +214,7 @@ impl Hints {
     /// a run, a finding, a quoted title, or where something stands.
     pub fn about_work(&self) -> bool {
         self.status
+            || self.needs_me
             || self.running
             || self.findings
             || !self.tickets.is_empty()
@@ -264,6 +304,31 @@ mod tests {
     fn what_is_running_is_its_own_question() {
         let h = read("What's running now?");
         assert!(h.running && h.status && h.about_work());
+    }
+
+    #[test]
+    fn what_is_waiting_on_me_is_its_own_question() {
+        for q in [
+            "What needs my answer?",
+            "what needs me?",
+            "Is anything waiting on me?",
+            "What\u{2019}s on my plate today?",
+            "what should I work on next",
+            "show my pull requests",
+            "Am I blocking anyone?",
+        ] {
+            let h = read(q);
+            assert!(h.needs_me && h.about_work(), "{q}: {h:?}");
+        }
+        for q in [
+            "What does the runner need?",
+            "Where are refunds handled?",
+            "Does the tool need memory?",
+            "What should I do to fix the login redirect?",
+            "Do I need to restart the worker after a config change?",
+        ] {
+            assert!(!read(q).needs_me, "{q}");
+        }
     }
 
     #[test]

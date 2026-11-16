@@ -39,6 +39,8 @@ pub struct ToolEnded<'a> {
     /// It failed or was refused.
     pub is_error: bool,
     pub outcome: &'a common::agent_log::ToolOutcome,
+    /// What the agent got back (the refusal's reason for a refused call).
+    pub result: &'a str,
 }
 
 /// A tool call as a [`ToolCallFn`] gets it: the input as a short summary
@@ -51,6 +53,9 @@ pub struct ToolEvent<'a> {
     pub duration_ms: u64,
     pub is_error: bool,
     pub outcome: &'a common::agent_log::ToolOutcome,
+    /// For a call that didn't go through: the message the agent got,
+    /// redacted and cut ([`common::agent_log::live_message`]).
+    pub message: Option<&'a str>,
 }
 
 /// Observer invoked after each tool call.
@@ -87,10 +92,12 @@ impl LoopObserver for ToolCallFn {
             duration_ms,
             is_error,
             outcome: &outcome,
+            result: "",
         });
     }
     fn on_tool_ended(&self, call: &ToolEnded<'_>) {
         let summary = input_summary(call.input);
+        let message = common::agent_log::live_message(call.outcome, call.result);
         (self.0)(&ToolEvent {
             tool: call.name,
             input_summary: &summary,
@@ -99,6 +106,7 @@ impl LoopObserver for ToolCallFn {
             duration_ms: call.duration_ms,
             is_error: call.is_error,
             outcome: call.outcome,
+            message: message.as_deref(),
         });
     }
 }
