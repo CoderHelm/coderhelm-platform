@@ -1862,6 +1862,7 @@ fn hybrid_routes() -> Router<Arc<AppState>> {
         // (routes::hybrid_email).
         .route("/email", post(routes::hybrid_email::send))
         .route("/email/recipients", post(routes::hybrid_email::recipients))
+        .route("/email/admins", post(routes::hybrid_email::admins))
         .route("/email/domain", post(routes::hybrid_email::domain))
         .route("/email/status", get(routes::hybrid_email::status))
         .route("/email/stats", post(routes::hybrid_email::stats_route))

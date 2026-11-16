@@ -615,7 +615,11 @@ pub async fn recipients(
         .ok()
         .map(|t| t.timestamp());
     let new_install = relay::is_new_install(verified_at, epoch());
-    relay::may_list(&req, by_kind, spent, new_today, new_install).map_err(refuse)?;
+    relay::may_list(&req, by_kind, spent, new_today, new_install).map_err(|r| {
+        // Logged, so a refusal can be found from this side too (no address).
+        info!(install = %install.id, code = r.code(), "email relay: listing refused");
+        refuse(r)
+    })?;
     let mut bootstrap = !spent && relay::bootstrap_request(&req);
     if bootstrap && !claim_bootstrap(&state, &install.id).await? {
         // Another request took the first listing meanwhile: this one is an
@@ -749,6 +753,169 @@ pub async fn recipients(
     Ok(Json(
         json!({ "ok": true, "added": added, "removed": removed }),
     ))
+}
+
+/// POST /hybrid/email/admins (signed): the install's admins, in full. Each
+/// becomes a listed admin; a listed admin it no longer names becomes a
+/// member. New addresses count against the day's new-address limit.
+pub async fn admins(
+    State(state): State<Arc<AppState>>,
+    method: Method,
+    uri: OriginalUri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Reply {
+    let (install, _) = verified(&state, &headers, &method, &uri, &body).await?;
+    let req: relay::AdminsRequest =
+        serde_json::from_slice(&body).map_err(|_| refuse(relay::Refusal::BadRequest))?;
+    first_use(&state, &install.id, &req.request_id).await?;
+    let list_meta = get(&state, &install.id, LIST_SK).await?;
+    relay::may_sync_admins(&req, bootstrap_spent(list_meta.as_ref())).map_err(|r| {
+        info!(install = %install.id, code = r.code(), "email relay: admin sync refused");
+        refuse(r)
+    })?;
+    let mut named: Vec<(String, String)> = req
+        .admins
+        .iter()
+        .map(|a| (relay::recipient_hash(&install.id, a), relay::normalize(a)))
+        .collect();
+    named.sort();
+    named.dedup_by(|a, b| a.0 == b.0);
+
+    // What is listed now, in one pass over the install's list.
+    let listed = listed_kinds(&state, &install.id).await?;
+    let fresh = named
+        .iter()
+        .filter(|(h, _)| !listed.contains_key(h))
+        .count() as u64;
+    if fresh > 0
+        && !count_up(
+            &state,
+            &install.id,
+            &relay::day_sk(&today()),
+            "new_recipients",
+            fresh,
+            Some(relay::NEW_RECIPIENTS_PER_DAY),
+            40 * 86_400,
+        )
+        .await?
+    {
+        return Err(refuse(relay::Refusal::TooManyNew));
+    }
+
+    let cipher = common::mcp_credentials::Kms {
+        client: &state.kms,
+        key_id: &state.config.secrets_key_id,
+    };
+    let mut promoted = 0u64;
+    for (hash, email) in &named {
+        if listed.get(hash) == Some(&relay::RecipientKind::Admin) {
+            continue;
+        }
+        let mut put = state
+            .dynamo
+            .put_item()
+            .table_name(&state.config.settings_table_name)
+            .item("pk", s(&hybrid_relay::install_pk(&install.id)))
+            .item("sk", s(&relay::recipient_sk(hash)))
+            .item("kind", s(relay::RecipientKind::Admin.as_str()))
+            .item("added_at", s(&chrono::Utc::now().to_rfc3339()));
+        if let Ok(sealed) = seal_admin(&cipher, &install.id, email).await {
+            put = put.item("sealed", s(&sealed));
+        }
+        put.send().await.map_err(|e| {
+            warn!(error = %e, "email relay: admin write failed");
+            unavailable()
+        })?;
+        promoted += 1;
+    }
+    let listed_admins: Vec<String> = listed
+        .iter()
+        .filter(|(_, k)| **k == relay::RecipientKind::Admin)
+        .map(|(h, _)| h.clone())
+        .collect();
+    let hashes: Vec<String> = named.iter().map(|(h, _)| h.clone()).collect();
+    let demote = relay::admins_to_demote(&listed_admins, &hashes);
+    for hash in &demote {
+        state
+            .dynamo
+            .update_item()
+            .table_name(&state.config.settings_table_name)
+            .key("pk", s(&hybrid_relay::install_pk(&install.id)))
+            .key("sk", s(&relay::recipient_sk(hash)))
+            .update_expression("SET kind = :m REMOVE sealed")
+            .expression_attribute_values(":m", s(relay::RecipientKind::Member.as_str()))
+            .send()
+            .await
+            .map_err(|e| {
+                warn!(error = %e, "email relay: admin demote failed");
+                unavailable()
+            })?;
+    }
+    let _ = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", s(&hybrid_relay::install_pk(&install.id)))
+        .key("sk", s(LIST_SK))
+        .update_expression("SET admins = :n")
+        .expression_attribute_values(":n", n(named.len() as i64))
+        .send()
+        .await;
+    audit(
+        &state,
+        &install.id,
+        "email_admins",
+        json!({ "admins": named.len(), "promoted": promoted, "demoted": demote.len() }),
+    )
+    .await;
+    Ok(Json(json!({
+        "ok": true,
+        "admins": named.len(),
+        "promoted": promoted,
+        "demoted": demote.len(),
+    })))
+}
+
+/// Every listed address's kind, by hash.
+async fn listed_kinds(
+    state: &AppState,
+    install: &str,
+) -> Result<HashMap<String, relay::RecipientKind>, (StatusCode, Json<Value>)> {
+    let mut out = HashMap::new();
+    let mut start = None;
+    loop {
+        let r = state
+            .dynamo
+            .query()
+            .table_name(&state.config.settings_table_name)
+            .key_condition_expression("pk = :p AND begins_with(sk, :s)")
+            .expression_attribute_values(":p", s(&hybrid_relay::install_pk(install)))
+            .expression_attribute_values(":s", s(&relay::recipient_sk("")))
+            .consistent_read(true)
+            .set_exclusive_start_key(start.take())
+            .send()
+            .await
+            .map_err(|e| {
+                warn!(error = %e, "email relay: list read failed");
+                unavailable()
+            })?;
+        for i in r.items() {
+            let hash = i
+                .get("sk")
+                .and_then(|v| v.as_s().ok())
+                .and_then(|sk| sk.strip_prefix(&relay::recipient_sk("")))
+                .map(str::to_string);
+            if let (Some(h), Some(k)) = (hash, kind_of(Some(i))) {
+                out.insert(h, k);
+            }
+        }
+        match r.last_evaluated_key() {
+            Some(k) => start = Some(k.clone()),
+            None => break,
+        }
+    }
+    Ok(out)
 }
 
 /// The install's list record: admin count, when it opted in, and when its

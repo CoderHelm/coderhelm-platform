@@ -608,22 +608,29 @@ pub async fn list(
     Ok(())
 }
 
-/// Lists one address as a pending invite, when the install sends through
-/// CoderHelm (nothing to do otherwise). `by` is the admin sending it.
-pub async fn list_invite(s: &Sender<'_>, by: &str, to: &str) -> Result<(), SendError> {
+/// The relay's credentials when this install sends through CoderHelm, else
+/// `None` (hosted, its own SES, or not registered).
+pub async fn relay_in_use(
+    s: &Sender<'_>,
+) -> Result<Option<crate::hybrid::client::Credentials>, SendError> {
     if deployment() == Deployment::Hosted {
-        return Ok(());
+        return Ok(None);
     }
     let stored = load(s.dynamo, s.settings_table)
         .await
         .map_err(|e| err("settings_unreadable", e))?;
-    let transport = transport_of(stored.as_ref(), transport_default());
-    let Some(creds) = crate::hybrid::client::credentials() else {
+    if transport_of(stored.as_ref(), transport_default()) != Transport::Coderhelm {
+        return Ok(None);
+    }
+    Ok(crate::hybrid::client::credentials())
+}
+
+/// Lists one address as a pending invite, when the install sends through
+/// CoderHelm (nothing to do otherwise). `by` is the admin sending it.
+pub async fn list_invite(s: &Sender<'_>, by: &str, to: &str) -> Result<(), SendError> {
+    let Some(creds) = relay_in_use(s).await? else {
         return Ok(());
     };
-    if transport != Transport::Coderhelm {
-        return Ok(());
-    }
     list(
         s.http,
         &creds,
@@ -634,6 +641,40 @@ pub async fn list_invite(s: &Sender<'_>, by: &str, to: &str) -> Result<(), SendE
         }],
     )
     .await
+}
+
+/// The addresses an admin sync names: valid, not CoderHelm's, each once,
+/// at most [`relay::MAX_ADMINS`]. `None` when there is none to name.
+pub fn admins_to_sync<'a>(admins: impl IntoIterator<Item = &'a str>) -> Option<Vec<String>> {
+    let mut out: Vec<String> = admins
+        .into_iter()
+        .map(relay::normalize)
+        .filter(|a| relay::valid_address(a) && !relay::is_coderhelm_address(a))
+        .collect();
+    out.sort();
+    out.dedup();
+    out.truncate(relay::MAX_ADMINS);
+    (!out.is_empty()).then_some(out)
+}
+
+/// Tells the relay who the install's admins are now ([`relay::AdminsRequest`]),
+/// when the install sends through CoderHelm (nothing to do otherwise).
+pub async fn sync_admins(s: &Sender<'_>, admins: &[String]) -> Result<(), SendError> {
+    let Some(creds) = relay_in_use(s).await? else {
+        return Ok(());
+    };
+    let Some(admins) = admins_to_sync(admins.iter().map(String::as_str)) else {
+        return Ok(());
+    };
+    let body = relay::AdminsRequest {
+        request_id: relay::new_request_id(),
+        admins,
+    };
+    let body = serde_json::to_value(&body).unwrap_or(Value::Null);
+    crate::hybrid::client::call(s.http, &creds, "POST", relay::PATH_ADMINS, Some(&body))
+        .await
+        .map(|_| ())
+        .map_err(|e| err(&e.code, e.message))
 }
 
 /// The Deliveries record for one send: domain only, never the address, and
@@ -745,6 +786,27 @@ mod tests {
         assert_eq!(back, s);
         assert_eq!(Transport::parse("coderhelm"), Some(Transport::Coderhelm));
         assert_eq!(Transport::parse("smtp"), None);
+    }
+
+    #[test]
+    fn an_admin_sync_names_each_real_admin_once() {
+        let got = admins_to_sync([
+            "Owner@Acme.test",
+            "owner@acme.test",
+            "",
+            "ops@coderhelm.com",
+            "admin@acme.test",
+        ]);
+        assert_eq!(
+            got,
+            Some(vec!["admin@acme.test".into(), "owner@acme.test".into()])
+        );
+        assert_eq!(admins_to_sync(["", "nope"]), None);
+        let many: Vec<String> = (0..80).map(|i| format!("a{i}@acme.test")).collect();
+        assert_eq!(
+            admins_to_sync(many.iter().map(String::as_str)).map(|v| v.len()),
+            Some(relay::MAX_ADMINS)
+        );
     }
 
     #[test]

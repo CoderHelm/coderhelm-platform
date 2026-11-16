@@ -58,6 +58,9 @@ pub const RATE_WINDOW_DAYS: i64 = 7;
 
 pub const PATH_SEND: &str = "/hybrid/email";
 pub const PATH_RECIPIENTS: &str = "/hybrid/email/recipients";
+/// The install's admins, in full: the relay lists each as an admin and
+/// stops counting anyone else as one ([`AdminsRequest`]).
+pub const PATH_ADMINS: &str = "/hybrid/email/admins";
 pub const PATH_STATUS: &str = "/hybrid/email/status";
 /// The install's email counts by kind, `{from, to}` days (signed POST).
 pub const PATH_STATS: &str = "/hybrid/email/stats";
@@ -191,6 +194,22 @@ pub struct RecipientsRequest {
     pub remove: Vec<String>,
 }
 
+/// Most admins one install may name ([`AdminsRequest`]).
+pub const MAX_ADMINS: usize = 50;
+
+/// `POST /hybrid/email/admins`: every address that is an install admin now
+/// (the install's admin-role users and its config's admins). The install is
+/// the only one who knows who its admins are, so its signed word decides:
+/// each is listed as an admin (a new address counts against the day's new
+/// addresses), and a listed admin it no longer names becomes a member. This
+/// is how an admin added after the first listing, or one copied from the
+/// hosted CoderHelm, can vouch for invites, and how a demoted one stops.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminsRequest {
+    pub request_id: String,
+    pub admins: Vec<String>,
+}
+
 /// `POST /hybrid/email`: one email.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SendRequest {
@@ -242,6 +261,9 @@ pub enum Refusal {
     NotApproved,
     /// That address got all the email it may get today.
     RecipientLimit,
+    /// The install hasn't listed its people with the relay yet (nothing to
+    /// sync admins into).
+    NotStarted,
 }
 
 impl Refusal {
@@ -261,6 +283,7 @@ impl Refusal {
             Self::Paused => "email_paused",
             Self::NotApproved => "relay_not_approved",
             Self::RecipientLimit => "recipient_daily_limit",
+            Self::NotStarted => "relay_not_started",
         }
     }
 
@@ -280,13 +303,14 @@ impl Refusal {
             Self::Paused => "Email through CoderHelm is paused for this install after bounces or complaints.",
             Self::NotApproved => "CoderHelm's mail service sends for installs linked to a GitHub organization through CoderHelm, or approved by CoderHelm. Until then, send with your own Amazon SES (Settings, Email).",
             Self::RecipientLimit => "That address already got today's share of email from CoderHelm.",
+            Self::NotStarted => "The install hasn't listed its people with CoderHelm's mail service yet.",
         }
     }
 
     pub fn status(self) -> u16 {
         match self {
             Self::BadRequest | Self::BadAddress => 400,
-            Self::Replayed => 409,
+            Self::Replayed | Self::NotStarted => 409,
             Self::RateLimited | Self::QuotaReached | Self::TooManyNew | Self::RecipientLimit => 429,
             _ => 403,
         }
@@ -372,6 +396,40 @@ pub fn may_list(
         return Err(Refusal::TooManyNew);
     }
     Ok(())
+}
+
+/// May this admin sync change the list? `bootstrap_spent` as for
+/// [`may_list`]: before the first listing there is nothing to sync, and the
+/// first listing (which lists the admins) must not be used up by a sync.
+/// The new addresses it brings are counted by the caller against the day's
+/// limit, like any listing.
+pub fn may_sync_admins(req: &AdminsRequest, bootstrap_spent: bool) -> Result<(), Refusal> {
+    if req.admins.is_empty() || req.admins.len() > MAX_ADMINS {
+        return Err(Refusal::BadRequest);
+    }
+    for a in &req.admins {
+        if !valid_address(a) {
+            return Err(Refusal::BadAddress);
+        }
+        if is_coderhelm_address(a) {
+            return Err(Refusal::CoderhelmAddress);
+        }
+    }
+    if !bootstrap_spent {
+        return Err(Refusal::NotStarted);
+    }
+    Ok(())
+}
+
+/// What an admin sync does to the list: `listed_admins` are the hashes
+/// listed as admins now, `named` the hashes the install named. Returns the
+/// hashes to demote to member (listed admins it no longer names).
+pub fn admins_to_demote(listed_admins: &[String], named: &[String]) -> Vec<String> {
+    listed_admins
+        .iter()
+        .filter(|h| !named.contains(h))
+        .cloned()
+        .collect()
 }
 
 /// Whether an install that proved its address at `verified_at` (epoch
@@ -757,6 +815,63 @@ mod tests {
         let ch = req("admin@acme.test", &[("security@coderhelm.com", Invite)]);
         assert_eq!(
             may_list(&ch, Some(Admin), true, 0, false),
+            Err(Refusal::CoderhelmAddress)
+        );
+    }
+
+    #[test]
+    fn an_install_admin_listed_only_as_an_invite_cannot_vouch_until_synced() {
+        use RecipientKind::*;
+        // The failure: the install's owner and a copied-over admin were
+        // listed as invites (by their set-up emails), so an invite they
+        // send is refused.
+        let resend = req("owner@acme.test", &[("person@acme.test", Invite)]);
+        assert_eq!(
+            may_list(&resend, Some(Invite), true, 0, false),
+            Err(Refusal::NotAdmin)
+        );
+        // The install names its admins; the relay then counts them as admins.
+        let sync = AdminsRequest {
+            request_id: new_request_id(),
+            admins: vec!["first@acme.test".into(), "owner@acme.test".into()],
+        };
+        assert_eq!(may_sync_admins(&sync, true), Ok(()));
+        assert_eq!(may_list(&resend, Some(Admin), true, 0, false), Ok(()));
+        // A listed admin the install no longer names is demoted.
+        let listed = vec!["h-first".to_string(), "h-gone".to_string()];
+        let named = vec!["h-first".to_string(), "h-owner".to_string()];
+        assert_eq!(
+            admins_to_demote(&listed, &named),
+            vec!["h-gone".to_string()]
+        );
+    }
+
+    #[test]
+    fn an_admin_sync_is_checked() {
+        let sync = |admins: Vec<String>| AdminsRequest {
+            request_id: new_request_id(),
+            admins,
+        };
+        // Before the first listing: nothing to sync, and the first listing
+        // stays free for the install's people.
+        assert_eq!(
+            may_sync_admins(&sync(vec!["a@acme.test".into()]), false),
+            Err(Refusal::NotStarted)
+        );
+        assert_eq!(
+            may_sync_admins(&sync(vec![]), true),
+            Err(Refusal::BadRequest)
+        );
+        let many = (0..=MAX_ADMINS)
+            .map(|i| format!("a{i}@acme.test"))
+            .collect();
+        assert_eq!(may_sync_admins(&sync(many), true), Err(Refusal::BadRequest));
+        assert_eq!(
+            may_sync_admins(&sync(vec!["a@b.com, c@d.com".into()]), true),
+            Err(Refusal::BadAddress)
+        );
+        assert_eq!(
+            may_sync_admins(&sync(vec!["security@coderhelm.com".into()]), true),
             Err(Refusal::CoderhelmAddress)
         );
     }

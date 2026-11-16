@@ -186,8 +186,22 @@ pub async fn get(
     )))
 }
 
-/// Everyone the install may email: install admins, members, pending invites.
-async fn people(state: &AppState, actor: &str) -> Vec<relay::NewRecipient> {
+/// What one user record is on the relay's list: an owner or admin who has
+/// joined is an admin (they vouch for invites), an invite is an invite,
+/// anyone else a member.
+pub fn relay_kind(role: &str, status: &str) -> relay::RecipientKind {
+    if status == "invited" {
+        relay::RecipientKind::Invite
+    } else if matches!(role, "owner" | "admin") {
+        relay::RecipientKind::Admin
+    } else {
+        relay::RecipientKind::Member
+    }
+}
+
+/// Every user record on the install, as (email, kind), and the config's
+/// admins as admins. Copied-over records count like any other.
+async fn everyone(state: &AppState) -> BTreeMap<String, relay::RecipientKind> {
     let mut out: BTreeMap<String, relay::RecipientKind> = BTreeMap::new();
     let mut start = None;
     for _ in 0..50 {
@@ -197,8 +211,9 @@ async fn people(state: &AppState, actor: &str) -> Vec<relay::NewRecipient> {
             .table_name(&state.config.users_table_name)
             .filter_expression("begins_with(sk, :u)")
             .expression_attribute_values(":u", AttributeValue::S("USER#".into()))
-            .projection_expression("email, #st")
+            .projection_expression("email, #st, #ro")
             .expression_attribute_names("#st", "status")
+            .expression_attribute_names("#ro", "role")
             .set_exclusive_start_key(start.take())
             .send()
             .await;
@@ -210,16 +225,17 @@ async fn people(state: &AppState, actor: &str) -> Vec<relay::NewRecipient> {
             if !relay::valid_address(e) || relay::is_coderhelm_address(e) {
                 continue;
             }
-            let invited = i
-                .get("status")
-                .and_then(|v| v.as_s().ok())
-                .map(String::as_str)
-                == Some("invited");
-            out.entry(relay::normalize(e)).or_insert(if invited {
-                relay::RecipientKind::Invite
-            } else {
-                relay::RecipientKind::Member
-            });
+            let g = |k: &str| i.get(k).and_then(|v| v.as_s().ok()).map(String::as_str);
+            let kind = relay_kind(g("role").unwrap_or(""), g("status").unwrap_or(""));
+            // An admin on any team stays an admin; else the first seen.
+            let slot = out
+                .entry(relay::normalize(e))
+                .or_insert(relay::RecipientKind::Invite);
+            if kind == relay::RecipientKind::Admin
+                || (*slot == relay::RecipientKind::Invite && kind == relay::RecipientKind::Member)
+            {
+                *slot = kind;
+            }
         }
         match r.last_evaluated_key() {
             Some(k) => start = Some(k.clone()),
@@ -227,10 +243,19 @@ async fn people(state: &AppState, actor: &str) -> Vec<relay::NewRecipient> {
         }
     }
     let admins = std::env::var("PLATFORM_ADMIN_EMAILS").unwrap_or_default();
-    for a in admins.split(',').map(str::trim).chain([actor]) {
+    for a in admins.split(',').map(str::trim) {
         if relay::valid_address(a) && !relay::is_coderhelm_address(a) {
             out.insert(relay::normalize(a), relay::RecipientKind::Admin);
         }
+    }
+    out
+}
+
+/// Everyone the install may email: install admins, members, pending invites.
+async fn people(state: &AppState, actor: &str) -> Vec<relay::NewRecipient> {
+    let mut out = everyone(state).await;
+    if relay::valid_address(actor) && !relay::is_coderhelm_address(actor) {
+        out.insert(relay::normalize(actor), relay::RecipientKind::Admin);
     }
     // The admin who turns it on comes first (the relay's first listing).
     let actor = relay::normalize(actor);
@@ -241,6 +266,33 @@ async fn people(state: &AppState, actor: &str) -> Vec<relay::NewRecipient> {
     list.sort_by_key(|r| (r.email != actor, r.kind != relay::RecipientKind::Admin));
     list.truncate(relay::BOOTSTRAP_RECIPIENTS);
     list
+}
+
+/// The install's admins now: owner- and admin-role users who have joined,
+/// and the config's admins.
+pub async fn install_admins(state: &AppState) -> Vec<String> {
+    everyone(state)
+        .await
+        .into_iter()
+        .filter(|(_, k)| *k == relay::RecipientKind::Admin)
+        .map(|(e, _)| e)
+        .collect()
+}
+
+/// Tells CoderHelm's relay who the install's admins are now, when the
+/// install sends through it (nothing to do otherwise). Called when a role
+/// changes or someone is removed, and when the relay refuses an admin.
+pub async fn sync_relay_admins(state: &AppState) -> Result<(), mail::SendError> {
+    let admins = install_admins(state).await;
+    mail::sync_admins(&sender(state), &admins).await
+}
+
+/// [`sync_relay_admins`], logging a failure: for changes whose own answer
+/// doesn't depend on the relay (the next refusal syncs again).
+pub async fn sync_relay_admins_quietly(state: &AppState) {
+    if let Err(e) = sync_relay_admins(state).await {
+        warn!(error = %e, "relay admins not synced");
+    }
 }
 
 /// PUT /api/system/emails `{optional?: {id: bool}, transport?: "ses"|"coderhelm"}`
@@ -529,6 +581,19 @@ pub async fn put_sender(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_owner_or_admin_who_joined_is_listed_as_a_relay_admin() {
+        use relay::RecipientKind::*;
+        // Before: the first listing named only the config's admins as
+        // admins, so the team's owner and other admins (copied over from
+        // the hosted CoderHelm, or made admin later) couldn't vouch.
+        assert_eq!(relay_kind("owner", ""), Admin);
+        assert_eq!(relay_kind("admin", "active"), Admin);
+        assert_eq!(relay_kind("member", ""), Member);
+        assert_eq!(relay_kind("admin", "invited"), Invite);
+        assert_eq!(relay_kind("", ""), Member);
+    }
 
     #[test]
     fn optional_emails_start_off_and_the_install_sends_through_its_own_ses() {

@@ -614,16 +614,10 @@ pub(crate) async fn pool_emails(
     emails: Vec<String>,
 ) -> Result<std::collections::HashSet<String>, String> {
     let checks = emails.into_iter().map(|email| async move {
-        let r = state
-            .cognito
-            .admin_get_user()
-            .user_pool_id(&state.config.cognito_user_pool_id)
-            .username(&email)
-            .send()
-            .await;
-        match r {
-            Err(e) if format!("{e:?}").contains("UserNotFound") => None,
-            _ => Some(email),
+        match pool_user(state, &email).await {
+            // An error counts as an account: nobody is emailed on a guess.
+            Ok(PoolUser::Account) | Err(_) => Some(email),
+            Ok(PoolUser::None | PoolUser::Unconfirmed) => None,
         }
     });
     Ok(futures::future::join_all(checks)
@@ -631,6 +625,51 @@ pub(crate) async fn pool_emails(
         .into_iter()
         .flatten()
         .collect())
+}
+
+/// What the user pool has for an email.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PoolUser {
+    /// No sign-in here.
+    None,
+    /// Signed up but never entered the code: no way in yet. Counts as no
+    /// account (a set-up email, and signing up again replaces it).
+    Unconfirmed,
+    /// A sign-in that works.
+    Account,
+}
+
+impl PoolUser {
+    pub(crate) fn of(
+        status: Option<&aws_sdk_cognitoidentityprovider::types::UserStatusType>,
+    ) -> Self {
+        use aws_sdk_cognitoidentityprovider::types::UserStatusType;
+        match status {
+            Some(UserStatusType::Unconfirmed) => PoolUser::Unconfirmed,
+            _ => PoolUser::Account,
+        }
+    }
+
+    /// Whether they can sign in (or reset a password) with it.
+    pub(crate) fn has_account(self) -> bool {
+        self == PoolUser::Account
+    }
+}
+
+/// The user pool's word on `email`.
+pub(crate) async fn pool_user(state: &AppState, email: &str) -> Result<PoolUser, String> {
+    match state
+        .cognito
+        .admin_get_user()
+        .user_pool_id(&state.config.cognito_user_pool_id)
+        .username(email)
+        .send()
+        .await
+    {
+        Ok(u) => Ok(PoolUser::of(u.user_status())),
+        Err(e) if format!("{e:?}").contains("UserNotFound") => Ok(PoolUser::None),
+        Err(e) => Err(format!("{e:?}")),
+    }
 }
 
 /// A member (not an invite) with an email who has no sign-in on this install.
@@ -849,7 +888,7 @@ pub async fn resend_invite(
         role,
     )
     .await
-    .map_err(|_| internal("Failed to resend invite", "email send failed"))?;
+    .map_err(|e| not_sent("Invite not resent", &e))?;
 
     // The email went out, so the invite is good again from now (this is also
     // how an expired invite is renewed). Only while it is still an invite: if
@@ -962,28 +1001,24 @@ pub async fn send_setup_email(
     }
     let item = get_member(&state, &claims.team_id, &user_id).await?;
     let email = check_setup_email(&item)?.to_string();
-    match state
-        .cognito
-        .admin_get_user()
-        .user_pool_id(&state.config.cognito_user_pool_id)
-        .username(&email)
-        .send()
-        .await
-    {
-        Ok(_) => {
+    // Signed up but never confirmed counts as not set up: the email's link
+    // takes them to sign-up, which replaces that unconfirmed sign-in.
+    match pool_user(&state, &email).await {
+        Ok(PoolUser::Account) => {
             return Err(fail(
                 StatusCode::CONFLICT,
                 "They've already signed in on this install.",
             ))
         }
-        Err(e) if format!("{e:?}").contains("UserNotFound") => {}
+        Ok(PoolUser::None | PoolUser::Unconfirmed) => {}
         Err(e) => return Err(internal("Sign-in not checked", e)),
     }
     let stamp = deliver_setup_email(&state, &claims.team_id, &item, &claims.email)
         .await
         .map_err(|e| match e {
             SetupSend::Wait(m) => fail(StatusCode::TOO_MANY_REQUESTS, m),
-            SetupSend::Failed(e) => internal("Failed to send the set-up email", e),
+            SetupSend::Failed(e) => not_sent("Set-up email not sent", &e),
+            SetupSend::NotRecorded(e) => internal("Set-up email sent but not recorded", e),
         })?;
     info!(team_id = %claims.team_id, "Set-up email sent");
     Ok(Json(
@@ -996,7 +1031,10 @@ pub async fn send_setup_email(
 pub(crate) enum SetupSend {
     /// One went less than an hour ago, or five this week: the sentence says which.
     Wait(&'static str),
-    Failed(String),
+    /// It wasn't sent: the reason code and its words.
+    Failed(common::mail::SendError),
+    /// It went, but the record of it wasn't written.
+    NotRecorded(String),
 }
 
 /// Sends `item` (a member with an email, checked by the caller) the set-up email, at most
@@ -1017,7 +1055,7 @@ pub(crate) async fn deliver_setup_email(
     let team_name = team_name(state, team_id).await;
     send_invite_email(state, team_id, email, by, &team_name, role_of(item))
         .await
-        .map_err(|_| SetupSend::Failed("email send failed".into()))?;
+        .map_err(SetupSend::Failed)?;
 
     let stamp = now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let mut kept: Vec<AttributeValue> = log
@@ -1038,7 +1076,7 @@ pub(crate) async fn deliver_setup_email(
         .expression_attribute_values(":log", AttributeValue::L(kept))
         .send()
         .await
-        .map_err(|e| SetupSend::Failed(format!("record: {e}")))?;
+        .map_err(|e| SetupSend::NotRecorded(e.to_string()))?;
     Ok(stamp)
 }
 
@@ -1140,6 +1178,13 @@ pub async fn send_setup_emails_all(
             Err(SetupSend::Failed(e)) => {
                 error!(error = %e, "Set-up email not sent");
                 failed += 1;
+            }
+            Err(SetupSend::NotRecorded(e)) => {
+                error!(error = %e, "Set-up email sent but not recorded");
+                sent.insert(
+                    bare_id(s(item, "sk")).to_string(),
+                    Value::String(now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+                );
             }
         }
     }
@@ -1272,6 +1317,8 @@ pub async fn update_role(
     })?;
 
     info!(user_id = %sk, new_role = %body.role, team_id = %claims.team_id, "Role updated");
+    // The relay's list of who may vouch for invites follows the role.
+    super::email_settings::sync_relay_admins_quietly(&state).await;
 
     Ok(Json(json!({ "status": "updated", "role": body.role })))
 }
@@ -1322,6 +1369,9 @@ pub async fn remove_user(
             .any(|i| s(i, "sk") != sk && s(i, "email").eq_ignore_ascii_case(email))
     {
         super::plugin_pkgs::member_removed(&state, &claims.team_id, email, &claims.email).await;
+    }
+    if matches!(role_of(target), "owner" | "admin") {
+        super::email_settings::sync_relay_admins_quietly(&state).await;
     }
 
     Ok(Json(json!({ "status": "removed" })))
@@ -1806,7 +1856,7 @@ async fn send_invite_email(
     inviter: &str,
     org: &str,
     role: &str,
-) -> Result<(), StatusCode> {
+) -> Result<(), common::mail::SendError> {
     use common::mail::{self, templates::fit};
     let template_name = format!("{}-team-invite", state.config.ses_template_prefix);
     let template_data = serde_json::to_string(&json!({
@@ -1818,7 +1868,7 @@ async fn send_invite_email(
     let sender = super::email_settings::sender(state);
     // Through CoderHelm, the invite is listed first, vouched for by the
     // admin sending it (the gateway only lets admins invite).
-    let listed = mail::list_invite(&sender, inviter, to).await;
+    let listed = list_vouched(state, &sender, inviter, to).await;
     // Nothing was sent when the listing failed: that record stays untimed.
     let (result, send_ms) = match listed {
         Err(e) => (Err(e), None),
@@ -1848,14 +1898,170 @@ async fn send_invite_email(
         }
     };
     super::deliveries::record_mail(state, team, "invite", to, &result, send_ms).await;
-    result.map(|_| ()).map_err(|e| {
+    result.map(|_| ()).inspect_err(|e| {
         error!("Failed to send invite email: {e}");
-        StatusCode::INTERNAL_SERVER_ERROR
     })
+}
+
+/// What to do when the relay won't take an admin's word for an address.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Vouch {
+    /// Listed: send.
+    Done,
+    /// The relay doesn't count `by` as an admin: tell it who the install's
+    /// admins are, then ask again.
+    SyncThenRetry,
+    /// Still refused after the sync: the config's first admin (the one the
+    /// relay listed as an admin first) vouches instead.
+    AskConfigAdmin(String),
+    /// Nothing more to try: the refusal stands.
+    GiveUp,
+}
+
+/// The next step after a listing attempt. `attempt` counts from 0.
+pub(crate) fn next_vouch(
+    result: &Result<(), common::mail::SendError>,
+    attempt: u8,
+    by: &str,
+    config_admin: Option<&str>,
+) -> Vouch {
+    use common::mail::relay;
+    match result {
+        Ok(()) => Vouch::Done,
+        Err(e) if e.code == relay::Refusal::NotAdmin.code() => match attempt {
+            0 => Vouch::SyncThenRetry,
+            1 => match config_admin {
+                Some(a) if relay::normalize(a) != relay::normalize(by) => {
+                    Vouch::AskConfigAdmin(a.to_string())
+                }
+                _ => Vouch::GiveUp,
+            },
+            _ => Vouch::GiveUp,
+        },
+        Err(_) => Vouch::GiveUp,
+    }
+}
+
+/// Lists `to` with the relay on `by`'s word ([`common::mail::list_invite`]).
+/// An admin the relay doesn't know as one yet (added after the relay was
+/// turned on, or copied over from the hosted CoderHelm) isn't refused for
+/// it: the install tells the relay who its admins are and asks again.
+async fn list_vouched(
+    state: &AppState,
+    sender: &common::mail::Sender<'_>,
+    by: &str,
+    to: &str,
+) -> Result<(), common::mail::SendError> {
+    let config_admin = common::mail::install_admin();
+    let mut result = common::mail::list_invite(sender, by, to).await;
+    for attempt in 0..3u8 {
+        match next_vouch(&result, attempt, by, config_admin.as_deref()) {
+            Vouch::Done | Vouch::GiveUp => break,
+            Vouch::SyncThenRetry => {
+                if let Err(e) = super::email_settings::sync_relay_admins(state).await {
+                    tracing::warn!(error = %e, "relay admins not synced");
+                }
+                result = common::mail::list_invite(sender, by, to).await;
+            }
+            Vouch::AskConfigAdmin(a) => {
+                result = common::mail::list_invite(sender, &a, to).await;
+            }
+        }
+    }
+    result
+}
+
+/// The answer when an email wasn't sent: the true reason and its fix, never
+/// "something went wrong" (only admins send these).
+pub(crate) fn not_sent(context: &str, e: &common::mail::SendError) -> ApiError {
+    error!("{context}: {e}");
+    let r = common::deliveries::reason(&e.code);
+    let text = if r.code == "unknown" {
+        format!("The email wasn't sent: {}", e.message)
+    } else {
+        format!("The email wasn't sent. {} {}", r.message, r.fix)
+    };
+    (
+        StatusCode::BAD_GATEWAY,
+        Json(json!({ "error": text, "code": e.code })),
+    )
 }
 
 #[cfg(test)]
 mod tests {
+
+    fn refused(code: &str) -> Result<(), common::mail::SendError> {
+        Err(common::mail::SendError {
+            code: code.into(),
+            message: "no".into(),
+        })
+    }
+
+    #[test]
+    fn an_admin_the_relay_does_not_know_yet_is_synced_not_refused() {
+        // The failure: an admin's resend was refused (inviter_not_admin)
+        // and the install gave up at once.
+        let r = refused("inviter_not_admin");
+        assert_eq!(
+            next_vouch(&r, 0, "owner@acme.test", Some("first@acme.test")),
+            Vouch::SyncThenRetry
+        );
+        // Still refused after the sync (a relay from before it): the
+        // config's first admin vouches.
+        assert_eq!(
+            next_vouch(&r, 1, "owner@acme.test", Some("first@acme.test")),
+            Vouch::AskConfigAdmin("first@acme.test".into())
+        );
+        // Never the same admin twice, never a loop, and other refusals stand.
+        assert_eq!(
+            next_vouch(&r, 1, "First@acme.test", Some("first@acme.test")),
+            Vouch::GiveUp
+        );
+        assert_eq!(
+            next_vouch(&r, 2, "o@acme.test", Some("f@acme.test")),
+            Vouch::GiveUp
+        );
+        assert_eq!(
+            next_vouch(&refused("email_paused"), 0, "o@acme.test", None),
+            Vouch::GiveUp
+        );
+        assert_eq!(next_vouch(&Ok(()), 0, "o@acme.test", None), Vouch::Done);
+    }
+
+    #[test]
+    fn a_refused_email_says_why_instead_of_something_went_wrong() {
+        let e = common::mail::SendError {
+            code: "inviter_not_admin".into(),
+            message: "Only an install admin can add people to the email list.".into(),
+        };
+        let (status, Json(body)) = not_sent("test", &e);
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        let text = body["error"].as_str().unwrap();
+        assert!(!text.contains("Something went wrong"), "{text}");
+        assert!(text.contains("Only an install admin"), "{text}");
+        assert_eq!(body["code"], "inviter_not_admin");
+        let other = common::mail::SendError {
+            code: "brand_new".into(),
+            message: "The relay said no.".into(),
+        };
+        let (_, Json(body)) = not_sent("test", &other);
+        assert_eq!(body["error"], "The email wasn't sent: The relay said no.");
+    }
+
+    #[test]
+    fn an_unconfirmed_sign_up_is_not_an_account() {
+        use aws_sdk_cognitoidentityprovider::types::UserStatusType;
+        // The failure: a copied-over member who signed up but never got the
+        // code was "already signed in", so no set-up email could go and a
+        // reset code was asked of Cognito for a sign-in with no verified email.
+        let p = PoolUser::of(Some(&UserStatusType::Unconfirmed));
+        assert_eq!(p, PoolUser::Unconfirmed);
+        assert!(!p.has_account());
+        assert!(PoolUser::of(Some(&UserStatusType::Confirmed)).has_account());
+        assert!(PoolUser::of(Some(&UserStatusType::ResetRequired)).has_account());
+        assert!(PoolUser::of(None).has_account());
+        assert!(!PoolUser::None.has_account());
+    }
 
     #[test]
     fn a_setup_email_waits_an_hour_and_five_a_week() {

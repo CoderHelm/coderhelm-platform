@@ -183,26 +183,7 @@ pub async fn signup(
                 info!(email = %email, cognito_sub = %sub, "User signed up, verification pending")
             }
             Err(e) if e.contains("UsernameExistsException") => {
-                // Signed up before but never confirmed: a fresh code. Cognito
-                // refuses it for a confirmed account, and nothing is sent.
-                let hash = cognito_secret_hash(
-                    &state.cognito_client_secret,
-                    &email,
-                    &state.config.cognito_client_id,
-                );
-                let resent = state
-                    .cognito
-                    .resend_confirmation_code()
-                    .client_id(&state.config.cognito_client_id)
-                    .secret_hash(&hash)
-                    .username(&email)
-                    .send()
-                    .await
-                    .is_ok();
-                info!(
-                    resent,
-                    "Self-hosted sign-up for an email that has an account"
-                )
+                signed_up_again(&state, &email, &body).await;
             }
             Err(e) if e.contains("UserLambdaValidationException") => {
                 info!("Self-hosted sign-up refused by the pre-sign-up trigger")
@@ -295,6 +276,57 @@ pub fn signup_answer() -> Response {
         "message": "If that email can join here, we've sent a verification code."
     }))
     .into_response()
+}
+
+/// What a second sign-up for an email that is already in the user pool does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignUpAgain {
+    /// Never confirmed: the old sign-up goes and this one takes its place,
+    /// with the password just chosen and a fresh code. Nothing of theirs
+    /// hangs on it (their record is found by email at sign-in).
+    Replace,
+    /// A working account: nothing is sent (the answer is the same anyway).
+    Nothing,
+}
+
+pub fn sign_up_again(p: super::users::PoolUser) -> SignUpAgain {
+    match p {
+        super::users::PoolUser::Unconfirmed | super::users::PoolUser::None => SignUpAgain::Replace,
+        super::users::PoolUser::Account => SignUpAgain::Nothing,
+    }
+}
+
+/// A self-hosted sign-up for an email the pool already has
+/// ([`sign_up_again`]). Logged, never answered differently.
+async fn signed_up_again(state: &AppState, email: &str, body: &SignupRequest) {
+    let pool = match super::users::pool_user(state, email).await {
+        Ok(p) => p,
+        Err(e) => {
+            error!(error = %e, "Sign-up: sign-in not checked");
+            return;
+        }
+    };
+    if sign_up_again(pool) == SignUpAgain::Nothing {
+        info!("Self-hosted sign-up for an email that has an account");
+        return;
+    }
+    if pool == super::users::PoolUser::Unconfirmed {
+        if let Err(e) = state
+            .cognito
+            .admin_delete_user()
+            .user_pool_id(&state.config.cognito_user_pool_id)
+            .username(email)
+            .send()
+            .await
+        {
+            error!(error = %e, "Sign-up: unconfirmed sign-in not replaced");
+            return;
+        }
+    }
+    match cognito_sign_up(state, email, body).await {
+        Ok(sub) => info!(cognito_sub = %sub, "Unconfirmed sign-up replaced, verification pending"),
+        Err(e) => error!("Cognito signup failed: {e}"),
+    }
 }
 
 /// Cognito sign-up: the new user's sub, or Cognito's error (Debug form).
@@ -763,8 +795,8 @@ pub async fn mfa_verify(
     if resp.status().is_success() {
         let sub = format!("USER#{}", user.username());
         if sign_in::applies() {
-            if let Some(team) = cognito_member_team(&state, &email, &sub).await {
-                sign_in::note_factor(&state, &team, &sub, &email, Some("cognito")).await;
+            if let Some((team, user_id)) = cognito_member_record(&state, &email, &sub).await {
+                sign_in::note_factor(&state, &team, &user_id, &email, Some("cognito")).await;
             }
         } else {
             // Hosted: the person's own record, by email.
@@ -774,10 +806,17 @@ pub async fn mfa_verify(
     Ok(resp)
 }
 
-/// The organization team a Cognito user's own record is in, if any.
-async fn cognito_member_team(state: &AppState, email: &str, sub: &str) -> Option<String> {
+/// The organization record a Cognito user signs in to: `(team, user id)`.
+/// Their own record (keyed by this sign-in's sub), else the member record
+/// for their email, as sign-in lands them: a record copied over from the
+/// hosted CoderHelm keeps the sub it had there.
+async fn cognito_member_record(
+    state: &AppState,
+    email: &str,
+    sub: &str,
+) -> Option<(String, String)> {
     let org = sign_in::load_org(state).await.ok()??;
-    state
+    let own = state
         .dynamo
         .get_item()
         .table_name(&state.config.users_table_name)
@@ -792,8 +831,15 @@ async fn cognito_member_team(state: &AppState, email: &str, sub: &str) -> Option
                 .and_then(|v| v.as_s().ok())
                 .map(|e| normalize_email(e))
                 == Some(normalize_email(email))
-        })
-        .map(|_| org.team_id)
+        });
+    if own.is_some() {
+        return Some((org.team_id, sub.to_string()));
+    }
+    let facts = sign_in::facts_for(state, email).await.ok()?;
+    match sign_in::decide_join(&facts, chrono::Utc::now()) {
+        Join::Member { team_id, user_id } => Some((team_id, user_id)),
+        _ => None,
+    }
 }
 
 /// The answer to someone a self-hosted install won't let in.
@@ -1073,16 +1119,11 @@ async fn forgot_work(state: Arc<AppState>, email: String) -> Forgot {
         }
         return Forgot::ResetCode;
     }
-    let in_pool = match state
-        .cognito
-        .admin_get_user()
-        .user_pool_id(&state.config.cognito_user_pool_id)
-        .username(&email)
-        .send()
-        .await
-    {
-        Ok(_) => true,
-        Err(e) if format!("{e:?}").contains("UserNotFound") => false,
+    // An unconfirmed sign-up has no verified email, so Cognito can't send it
+    // a reset code: it counts as no account (a member gets the set-up email,
+    // and signing up again replaces it).
+    let in_pool = match super::users::pool_user(&state, &email).await {
+        Ok(p) => p.has_account(),
         Err(e) => {
             error!(error = %e, "Forgot password: sign-in not checked");
             return Forgot::NoAccount;
@@ -1133,6 +1174,9 @@ async fn forgot_work(state: Arc<AppState>, email: String) -> Forgot {
                 Err(super::users::SetupSend::Wait(_)) => return Forgot::SetUpRecent,
                 Err(super::users::SetupSend::Failed(e)) => {
                     warn!(%team_id, error = %e, "Set-up email not sent from the sign-in page");
+                }
+                Err(super::users::SetupSend::NotRecorded(e)) => {
+                    warn!(%team_id, error = %e, "Set-up email sent from the sign-in page, not recorded");
                 }
             }
         }
@@ -3875,5 +3919,46 @@ mod github_link_tests {
         .is_none());
         let c = crate::routes::auth::return_to_cookie(ok);
         assert!(c.contains("HttpOnly") && c.contains("Secure") && c.contains("Path=/auth"));
+    }
+}
+
+#[cfg(test)]
+mod unconfirmed_tests {
+    use super::*;
+    use crate::routes::users::PoolUser;
+
+    #[test]
+    fn a_copied_over_member_with_an_unconfirmed_sign_up_gets_the_set_up_email() {
+        // The failure: they signed up but the code never reached them, so
+        // forgot-password asked Cognito for a reset code it can't send (no
+        // verified email) and nothing went out.
+        let mut item = HashMap::new();
+        item.insert("email".to_string(), attr_s("person@acme.test"));
+        item.insert("sk".to_string(), attr_s("USER#copied"));
+        let join = Join::Member {
+            team_id: "TEAM#t".into(),
+            user_id: "USER#copied".into(),
+        };
+        let now = chrono::Utc::now();
+        assert_eq!(
+            plan_forgot(PoolUser::Unconfirmed.has_account(), &join, Some(&item), now),
+            Forgot::SetUp {
+                team_id: "TEAM#t".into(),
+                sk: "USER#copied".into(),
+            }
+        );
+        // A working account still gets a reset code.
+        assert_eq!(
+            plan_forgot(PoolUser::Account.has_account(), &join, Some(&item), now),
+            Forgot::ResetCode
+        );
+    }
+
+    #[test]
+    fn signing_up_again_replaces_an_unconfirmed_sign_up_only() {
+        // Replaced, so the password chosen now is the one that works after
+        // the code; their record is found by email, never duplicated.
+        assert_eq!(sign_up_again(PoolUser::Unconfirmed), SignUpAgain::Replace);
+        assert_eq!(sign_up_again(PoolUser::Account), SignUpAgain::Nothing);
     }
 }
