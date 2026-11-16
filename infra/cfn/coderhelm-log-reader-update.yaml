@@ -185,6 +185,17 @@ Resources:
               - "ecr:BatchGetImage"
               - "ecr:ListTagsForResource"
             Resource: "*"
+          # When an AWS WAF alarm fires: which web ACL it watches, the
+          # requests its rule matched (WAF's sampled requests) and where the
+          # web ACL logs. Only user agents, accept languages, header names, paths and countries
+          # are kept; never client addresses, cookies or other header values.
+          - Sid: ReadFirewallRequests
+            Effect: Allow
+            Action:
+              - "wafv2:ListWebACLs"
+              - "wafv2:GetSampledRequests"
+              - "wafv2:GetLoggingConfiguration"
+            Resource: "*"
           # Settings only, so a review can check a fact instead of asking: a
           # bucket's default encryption, its bucket policy and whether that
           # policy makes it public; a KMS key's description and key policy.

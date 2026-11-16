@@ -567,7 +567,7 @@ pub async fn select_repo(
                   1. Read the repository descriptions and languages carefully — match the ticket to the repo that OWNS that feature area. \
                   2. Data/analytics/ETL/pipeline repos (e.g. airflow, dbt) are ONLY for data pipeline work, NOT for application features or API integrations. \
                   3. If the ticket mentions specific services, APIs, SDKs, or integrations (e.g. a payments provider, a member-management API, billing), pick the repo that implements or calls those services — typically an API/backend repo, not a data repo. \
-                  4. Terraform/infrastructure repos are ONLY for infra changes (IAM, networking, deployment config). \
+                  4. Terraform/infrastructure repos are ONLY for infra changes (IAM, networking, deployment config, firewall and WAF rules, alarms, scaling). \
                   5. When unsure, prefer application/API repos over data or infrastructure repos. \
                   6. If the ticket says its work belongs in a repo listed as NOT turned on for runs, never substitute another repo — answer NOT_ENABLED: owner/name. \
                   Think step by step: (1) what is this ticket about, (2) which repo owns that area, (3) return ONLY the repo in owner/name format.";

@@ -1905,6 +1905,63 @@ async fn read_ticket_comments(
     Ok(())
 }
 
+/// Pure: an alert run that came without a repo (an alarm no rule names): its
+/// repo is picked from where the alarm's names appear in the team's code.
+pub(crate) fn alert_picks_repo(msg: &TicketMessage) -> bool {
+    matches!(msg.source, TicketSource::Alert)
+        && msg.sender == "alert"
+        && (msg.repo_owner.is_empty() || msg.repo_name.is_empty())
+}
+
+/// The evidence an alert run for an AWS WAF alarm reads before planning,
+/// through the team's read-only connection to the alarm's account (the
+/// alert's topic is in it). None for any other run, or when it is already in
+/// the ticket (a later step of the same run).
+async fn alarm_evidence_for_run(state: &WorkerState, msg: &TicketMessage) -> Option<String> {
+    use common::alarm_evidence as ae;
+    if !matches!(msg.source, TicketSource::Alert)
+        || msg.sender != "alert"
+        || msg.body.contains(ae::HEADING)
+    {
+        return None;
+    }
+    let alarm = ae::waf_alarm(&msg.body)?;
+    let topic = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(&msg.team_id))
+        .key("sk", attr_s(&format!("ALERT_TICKET#{}", msg.ticket_id)))
+        .send()
+        .await
+        .ok()?
+        .item()?
+        .get("topic_arn")?
+        .as_s()
+        .ok()?
+        .clone();
+    let account = topic.split(':').nth(4).unwrap_or_default().to_string();
+    let session = common::log_findings::session_for(
+        &state.dynamo,
+        &state.sts,
+        &state.config.aws_insights_table_name,
+        &msg.team_id,
+        &account,
+    )
+    .await;
+    Some(match session {
+        Ok(Some(s)) => ae::gather(&s, &alarm, chrono::Utc::now()).await,
+        Ok(None) => ae::render(
+            &alarm,
+            &[format!("No AWS connection for account {account}, so the requests the rule matched weren't read.")],
+        ),
+        Err(e) => ae::render(
+            &alarm,
+            &[format!("CoderHelm's AWS role for account {account} couldn't be taken on: {e}")],
+        ),
+    })
+}
+
 /// The agent a ticket run belongs to as a whole, when it isn't the planner
 /// and coder: a fix started by a log finding is log auto-fix's, one started
 /// by an alert is the alert fixer's.
@@ -2122,7 +2179,10 @@ async fn run_passes(
     // Set when Coderhelm chose the repo itself (repo, why), so a no-changes
     // result can say where it looked.
     let mut auto_pick: Option<(String, String)> = None;
-    if matches!(msg.source, TicketSource::Jira) {
+    // An alert run for an alarm no rule names comes with no repo: it is
+    // picked the same way, from where the alarm's names appear in the code.
+    let alert_picks = alert_picks_repo(msg);
+    if matches!(msg.source, TicketSource::Jira) || alert_picks {
         let team_repos = plan::fetch_team_repo_list(state, &msg.team_id).await;
         let repos: Vec<String> = team_repos
             .iter()
@@ -2191,7 +2251,7 @@ async fn run_passes(
                 info!(run_id, repo = %repo, why = %why, "Repo from the ticket's own pull request");
                 auto_pick = Some((repo.clone(), why));
                 resolved = Some(repo);
-            } else {
+            } else if !alert_picks {
                 // Check for explicit Jira project → repo mapping
                 let project_key = msg.ticket_id.split('-').next().unwrap_or("");
                 let mapped_repo = if !project_key.is_empty() {
@@ -2236,6 +2296,15 @@ async fn run_passes(
                         warn!(run_id, repo = %r, "Model judged the ticket belongs in a repo that isn't turned on");
                         stop = Some(repo_pick::not_enabled_message(&r));
                     }
+                    Err(e) if alert_picks => {
+                        // An alarm's cause is never guessed into the first
+                        // repo: the run fails and says why.
+                        return Err(format!(
+                            "Could not work out which repo this alarm's cause lives in (the repo \
+                             picker failed: {e}). Retry the run, or add a rule naming the alarm."
+                        )
+                        .into());
+                    }
                     Err(e) => {
                         // Fall back to first repo if LLM fails
                         warn!(run_id, error = %e, repo = %repos[0], "LLM repo selection failed, using first repo");
@@ -2254,7 +2323,7 @@ async fn run_passes(
             stop_run_repo_not_enabled(state, msg, run_id, usage, start, &message).await;
             return Ok(());
         }
-        let repo = resolved.ok_or("Could not resolve a repo for this Jira ticket")?;
+        let repo = resolved.ok_or("Could not resolve a repo for this ticket")?;
         let (owner, name) = repo.split_once('/').unwrap_or(("", ""));
         let changed = msg.repo_owner != owner || msg.repo_name != name;
         msg.repo_owner = owner.to_string();
@@ -2682,6 +2751,13 @@ async fn run_passes(
     // --- Evidence: a run started from a log finding reads the logs and the
     // ECS service behind them before planning, and every agent gets it ---
     let mut log_ev = log_evidence::gather_for_run(state, msg).await;
+    // --- Evidence: a run started by an AWS WAF alarm reads the requests its
+    // rule matched (sampled requests, TLS fingerprints from the web ACL's
+    // logs) before planning; it joins the ticket as data ---
+    if let Some(ev) = alarm_evidence_for_run(state, msg).await {
+        add_progress_note(state, &msg.team_id, run_id, "Read the requests the alarm's WAF rule matched (sampled requests and the web ACL's logs).").await;
+        msg.body = common::alarm_evidence::with_evidence(&msg.body, &ev);
+    }
     if let Some(ev) = log_ev.as_ref() {
         log_evidence::save(state, &msg.team_id, run_id, ev).await;
         add_progress_note(state, &msg.team_id, run_id, &log_evidence::summary_note(ev)).await;

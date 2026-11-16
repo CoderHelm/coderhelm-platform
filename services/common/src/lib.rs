@@ -69,6 +69,7 @@ pub mod agent_policy;
 // What a shell command an agent sent means here, and the tool names
 // models are trained on with their CoderHelm equivalents.
 /// Alert notifications: which channels an alert posts to, and its messages.
+pub mod alarm_evidence;
 pub mod alert_episodes;
 pub mod alert_notify;
 pub mod coder_shell;
