@@ -676,6 +676,8 @@ pub fn section(plan: &PlanResult, f: &PrFacts) -> String {
             }
             out.push('\n');
         }
+        // Only uses a search found: one that found nothing tells a reviewer
+        // nothing, so it is not written.
         let affected: Vec<&habits::Affected> = h
             .affected
             .iter()
@@ -703,11 +705,6 @@ pub fn section(plan: &PlanResult, f: &PrFacts) -> String {
                 out.push_str(&format!("- `{}`{uses}: {state}\n", a.where_.trim()));
             }
             out.push('\n');
-        } else if !h.no_outside_use.trim().is_empty() {
-            out.push_str(&format!(
-                "**Who this affects:** nothing outside this repository ({}).\n\n",
-                h.no_outside_use.trim().trim_end_matches('.')
-            ));
         }
     }
     if !f.outside_plan.is_empty() {

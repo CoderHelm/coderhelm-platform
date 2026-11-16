@@ -1486,9 +1486,21 @@ async fn make_ready(ctx: &Ctx<'_>, f: &Facts) -> Result<(), Refused> {
         let _ = gh.update_pr_title(ctx.owner, ctx.repo, ctx.pr, clean).await;
     }
     // Final squash: the run's whole history (the implementation and every
-    // fix round) as one clean commit, best-effort.
+    // fix round) as one clean commit, best-effort. A path that didn't ask
+    // for it still squashes fix-round churn (more than
+    // `common::git_conventions::MAX_READY_COMMITS` commits); `squash_branch`
+    // never rewrites a branch holding a person's commits.
+    let squash = match ctx.squash_keep_first {
+        Some(k) => Some(k),
+        None => gh
+            .list_pr_commits(ctx.owner, ctx.repo, ctx.pr)
+            .await
+            .ok()
+            .filter(|c| common::git_conventions::churn(c.len()))
+            .map(|_| false),
+    };
     if let (Some(keep_first), Some(head), Some(base)) = (
-        ctx.squash_keep_first,
+        squash,
         pr["head"]["ref"].as_str(),
         pr["base"]["ref"].as_str(),
     ) {

@@ -65,6 +65,14 @@ impl ForRun {
     /// `was` (a commit message) with its subject in the repository's form
     /// and its body kept.
     pub fn commit(&self, was: &str) -> String {
+        // A stand-in key (`KEY-1:`) an agent wrote never reaches a commit:
+        // the run's real key or none.
+        let real = match &self.key {
+            Key::Real(k) => Some(k.as_str()),
+            Key::None(_) => None,
+        };
+        let was = common::git_conventions::normalize_message(was, real);
+        let was = was.as_str();
         match was.split_once('\n') {
             Some((first, body)) => {
                 format!(

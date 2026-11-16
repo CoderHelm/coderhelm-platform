@@ -369,6 +369,15 @@ pub fn subject_key(subject: &str) -> Option<String> {
         .map(|l| l.key)
 }
 
+/// Commits a pull request may carry when it is marked ready; more is fix
+/// round churn, squashed first (a dependency pull request once had 50).
+pub const MAX_READY_COMMITS: usize = 5;
+
+/// Whether `commits` on a pull request are churn to squash before ready.
+pub fn churn(commits: usize) -> bool {
+    commits > MAX_READY_COMMITS
+}
+
 /// A whole commit message with its subject normalized as in
 /// [`normalize_subject`] (no key added), its body kept.
 pub fn normalize_message(message: &str, key: Option<&str>) -> String {
@@ -691,6 +700,13 @@ pub fn validate(kind: Kind, template: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fifty_commits_are_churn_to_squash_and_a_few_are_not() {
+        assert!(!super::churn(1));
+        assert!(!super::churn(super::MAX_READY_COMMITS));
+        assert!(super::churn(50));
+    }
+
     use super::*;
 
     fn tokens() -> Tokens {

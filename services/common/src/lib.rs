@@ -157,6 +157,9 @@ pub mod knowledge;
 pub mod repo_read;
 // The test that every model call site is a metered helper
 pub mod ci_cover;
+/// The last check on a pull request description: no section twice, no
+/// deploy maps, no empty "who this affects".
+pub mod description_lint;
 #[cfg(test)]
 mod model_call_sites;
 /// Which pull requests CoderHelm may push to, edit or close: its own.
