@@ -239,6 +239,25 @@ pub async fn update_now(
     answer(body)
 }
 
+/// DELETE /api/system/update: stop the Update press that waits, for the
+/// release check or to start again by itself after AWS turned the start
+/// away (lambda/updater, cancel_request). Nothing that already started.
+pub async fn cancel_update(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+) -> Reply {
+    claims.require_role(3).map_err(status_only)?;
+    allowed(&claims).map_err(status_only)?;
+    warn!(email = %claims.email, "Waiting update cancelled");
+    let body = call(
+        &state,
+        json!({ "action": "cancel_request", "actor": claims.email }),
+    )
+    .await
+    .map_err(status_only)?;
+    answer(body)
+}
+
 /// What a request may send to apply a prepared update: the update's id and,
 /// when it would replace or remove data or change permissions, `confirm`:
 /// the token the version route lists with exactly those changes (the

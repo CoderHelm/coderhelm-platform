@@ -183,7 +183,12 @@ fn build_app(state: Arc<AppState>) -> Router {
             "/system/uninstall-mode",
             put(routes::system::set_uninstall_mode),
         )
-        .route("/system/update", post(routes::system::update_now))
+        // DELETE: stop an Update press that waits (its release check, or
+        // starting again by itself after AWS was busy).
+        .route(
+            "/system/update",
+            post(routes::system::update_now).delete(routes::system::cancel_update),
+        )
         // Apply the prepared update waiting for an admin (a native install).
         .route("/system/update/apply", post(routes::system::apply_update))
         // What the install reads in its own account (Inspector, Health,

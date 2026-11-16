@@ -374,14 +374,126 @@ class Store:
 # ── Outside calls (swapped in tests) ──────────────────────────────────────
 
 _clients = {}
+# Each AWS call: botocore's adaptive retry mode (backoff with jitter, and it
+# slows its own rate once AWS throttles), a few attempts per call.
+AWS_ATTEMPTS = 4
 
 
 def client(name, region=None):
     key = f"{name}@{region}" if region else name
     if key not in _clients:
         import boto3
-        _clients[key] = boto3.client(name, region_name=region) if region else boto3.client(name)
+        kw = {"region_name": region} if region else {}
+        try:
+            from botocore.config import Config
+            kw["config"] = Config(retries={"max_attempts": AWS_ATTEMPTS, "mode": "adaptive"})
+        except ImportError:  # a stand-in boto3 (tests) has no botocore
+            pass
+        _clients[key] = boto3.client(name, **kw)
     return _clients[key]
+
+
+# ── AWS turning calls away (throttling) ───────────────────────────────────
+#
+# A throttled call says nothing about the release or the install: AWS was
+# busy. Before anything changed (preparing the change set, reading it for the
+# checks, the release and model checks) the updater retries by itself: a few
+# times within the call (busy_retry, on top of botocore's own retries), then
+# on each later poll or read of the page while the step stays waiting with
+# "AWS is busy, retrying (attempt n)". Only after BUSY_LIMIT does the update
+# fail, and then CoderHelm starts it again by itself after BUSY_RETRY_AFTER
+# (an UPDATE_REQUEST with retry_at) unless an admin cancels it.
+
+BUSY_LIMIT = timedelta(minutes=10)
+BUSY_RETRY_AFTER = timedelta(minutes=30)
+BUSY_TRIES = 3           # tries of one step within a call
+BUSY_CALL_BUDGET = 8     # seconds one call spends waiting between those tries
+BUSY_PAUSE = 1.0         # the first pause (full jitter, doubling, at most BUSY_PAUSE_CAP)
+BUSY_PAUSE_CAP = 4.0
+_THROTTLE_CODES = {
+    "Throttling", "ThrottlingException", "ThrottledException", "TooManyRequestsException",
+    "RequestLimitExceeded", "RequestThrottled", "RequestThrottledException", "SlowDown",
+    "ProvisionedThroughputExceededException",
+    "ServiceUnavailable", "ServiceUnavailableException", "EC2ThrottledException",
+}
+_THROTTLE_TEXT = re.compile(r"rate exceeded|too many requests|\((?:%s)\)|\b(?:%s)\b" % (
+    "|".join(sorted(_THROTTLE_CODES)), "ThrottlingException|TooManyRequestsException|RequestLimitExceeded"), re.I)
+
+
+def throttled(e):
+    """True when AWS turned the call away for being busy (throttling, a
+    request limit, 429 or 503), whatever wrapped it."""
+    seen = set()
+    while e is not None and id(e) not in seen:
+        seen.add(id(e))
+        resp = getattr(e, "response", None)
+        if isinstance(resp, dict):
+            code = (resp.get("Error") or {}).get("Code") or ""
+            http = (resp.get("ResponseMetadata") or {}).get("HTTPStatusCode")
+            if code in _THROTTLE_CODES or http in (429, 503):
+                return True
+        if type(e).__name__ in _THROTTLE_CODES or _THROTTLE_TEXT.search(str(e)):
+            return True
+        e = e.__cause__ or e.__context__
+    return False
+
+
+def busy_retry(fn, tries=BUSY_TRIES, budget=BUSY_CALL_BUDGET):
+    """fn(), tried again after a short pause (backoff with full jitter) when
+    AWS throttles it, within `budget` seconds and this invocation's time.
+    Anything else, and the last throttled try, raises as is."""
+    import random
+    start = _clock()
+    for i in range(tries):
+        try:
+            return fn()
+        except Exception as e:  # noqa: BLE001
+            pause = random.uniform(0, min(BUSY_PAUSE_CAP, BUSY_PAUSE * 2 ** i))
+            left = time_left()
+            if (not throttled(e) or i + 1 >= tries or _clock() - start + pause > budget
+                    or (left is not None and left < pause + 5)):
+                raise
+            logger.warning(f"AWS is busy ({type(e).__name__}); trying again in {pause:.1f}s")
+            _sleep(pause)
+
+
+def busy_mark(rec, now, why):
+    """Counts one more throttled try on `rec` (an update or a request, its
+    `busy`; `why`: what AWS said); True once AWS has turned it away for
+    BUSY_LIMIT or longer."""
+    b = dict(rec.get("busy") or {})
+    b.setdefault("since", now.isoformat())
+    b["attempts"] = int(b.get("attempts") or 0) + 1
+    b["last"] = str(why)[:300]
+    rec["busy"] = b
+    try:
+        return now - datetime.fromisoformat(b["since"]) >= BUSY_LIMIT
+    except ValueError:
+        return True
+
+
+def busy_note(rec):
+    return f"AWS is busy, retrying (attempt {int((rec.get('busy') or {}).get('attempts') or 1)})"
+
+
+def not_busy(rec):
+    """What AWS turned away went through: the count starts over."""
+    if rec.pop("busy", None) is not None and str(rec.get("reason") or "").startswith("AWS is busy"):
+        rec["reason"] = ""
+
+
+def busy_why(e):
+    return f"{type(e).__name__}: {str(e)[:250]}"
+
+
+def retry_time(at):
+    if isinstance(at, str):
+        try:
+            at = datetime.fromisoformat(at)
+        except ValueError:
+            return "in a little while"
+    return "at " + at.strftime("%H:%M UTC")
+
 
 
 def check_repo(repo):
@@ -1471,6 +1583,15 @@ class ReleaseNotReady(ValueError):
     check hasn't verified it): a wait. Nothing is recorded in history."""
 
 
+class AwsBusy(ReleaseNotReady):
+    """AWS throttled a step before anything changed: a wait like the one
+    above, retried by itself (`cause`: what AWS said)."""
+
+    def __init__(self, cause):
+        super().__init__("AWS is busy, retrying")
+        self.cause = cause
+
+
 class ModelsBlocked(ValueError):
     """Update now refused by the model check (the record goes with it)."""
 
@@ -1520,8 +1641,9 @@ def start_verify(store, env, now, version):
         if recent and (v.get("claim") or build_state(v.get("build")) in (None, "IN_PROGRESS")):
             return False
     try:
-        build = start_check(env, version)
+        build = busy_retry(lambda: start_check(env, version))
     except Exception as e:
+        # Throttled or not: the record stays pending and the next read starts it.
         logger.warning(f"Release check not started: {e}")
         return False
     state["verifying"] = {"version": version, "at": now.isoformat(), "build": build}
@@ -1754,9 +1876,22 @@ def model_check(store, env, now, version, repo, probe=invoke_worker):
         required = set(manifest.get("calls") or []) | set(configured_models(env))
         models = store.get("MODELS") or {}
         try:
-            answer = probe(env, {"targets": targets, "probe_team": models.get("probe_team")})
+            answer = busy_retry(lambda: probe(env, {"targets": targets, "probe_team": models.get("probe_team")}))
         except Exception as e:  # the worker didn't answer: unknown, not refused
             logger.warning(f"Model check not run: {e}")
+            old = store.get("MODEL_CHECK") or {}
+            if throttled(e):
+                # AWS was busy: pending (it holds the update, never refuses it), and
+                # every read of the page and every poll checks again by itself.
+                busy = {"busy": old["busy"]} if old.get("version") == version and old.get("busy") else {}
+                over = busy_mark(busy, now, busy_why(e))
+                note = busy_note(busy) + " the model check" + (
+                    "; it keeps checking by itself" if over else "")
+                record = {"version": version, "checked_at": now.isoformat(), "ok": False, "pending": True, "results": [],
+                          "started_at": busy["busy"]["since"], "busy": busy["busy"], "note": note,
+                          "notified": bool(old.get("version") == version and old.get("notified"))}
+                store.put("MODEL_CHECK", record)
+                return record
             answer = {"results": [{"model": t["model"], "id": t["model"], "status": "fail", "code": "unreachable",
                                    "detail": "The model check couldn't run.",
                                    "fix": "Check again in a few minutes; if it keeps failing, see the worker's log.",
@@ -1964,6 +2099,13 @@ def follow_request(store, env, now, probe=None, latest=None, record=None):
         return settle_request(store, req, now, "ended", "the requested version isn't a release")
     if parse_version(current) and compare(version, current) <= 0:
         return settle_request(store, req, now, "done", f"this install already runs {current}")
+    if req.get("retry_at") and not (latest and parse_version(latest) and compare(latest, version) > 0):
+        try:
+            later = now < datetime.fromisoformat(req["retry_at"])
+        except ValueError:
+            later = False
+        if later:
+            return req  # AWS was busy: it starts again by itself then
     if latest and parse_version(latest) and compare(latest, version) > 0:
         # A newer release came out while this one was checked: Update means the newest.
         req = record_request(store, now, latest, req.get("actor") or DIRECT_ACTOR, req.get("skip_check", False),
@@ -1979,6 +2121,9 @@ def follow_request(store, env, now, probe=None, latest=None, record=None):
         if not (is_native(env) and unapplied(live)):
             return req  # another update runs: this one waits for it
     mc = record if record and record.get("version") == version else (store.get("MODEL_CHECK") or {})
+    if mc.get("version") == version and mc.get("pending") and mc.get("busy") and verified_manifest(store, version)[0]:
+        # AWS turned the model check away: checked again here, by itself.
+        mc = model_check(store, env, now, version, env.get("RELEASE_REPO", RELEASE_REPO), probe or invoke_worker)
     if mc.get("version") != version or mc.get("pending"):
         try:
             old = now - datetime.fromisoformat(req.get("requested_at") or "") > REQUEST_LIMIT
@@ -1999,6 +2144,8 @@ def follow_request(store, env, now, probe=None, latest=None, record=None):
     try:
         started = begin(store, env, now, version, req.get("actor") or DIRECT_ACTOR, "update", note=note,
                         consent=req.get("accept_permissions", False))
+    except AwsBusy as e:
+        return busy_request(store, env, now, req, e)
     except ReleaseNotReady as e:
         req = dict(req, waiting_for=str(e))
         store.put("UPDATE_REQUEST", req)
@@ -2006,6 +2153,62 @@ def follow_request(store, env, now, probe=None, latest=None, record=None):
     except ValueError as e:
         return settle_request(store, req, now, "ended", str(e)[:500])
     return settle_request(store, req, now, "started", id=started.get("id"))
+
+
+def busy_request(store, env, now, req, e):
+    """An Update press AWS turned away before the change set existed: it
+    keeps waiting ("AWS is busy, retrying (attempt n)") and every poll tries
+    again. Past BUSY_LIMIT the try is recorded as failed, and it starts
+    again by itself after BUSY_RETRY_AFTER unless an admin cancels it."""
+    req = {k: v for k, v in req.items() if k != "retry_at"}
+    if not busy_mark(req, now, e.cause):
+        req["waiting_for"] = busy_note(req)
+        store.put("UPDATE_REQUEST", req)
+        return req
+    at = now + BUSY_RETRY_AFTER
+    current = env.get("CODERHELM_VERSION", "")
+    hid = f"UPDATE#{now.strftime('%Y-%m-%dT%H:%M:%SZ')}#{uuid.uuid4().hex[:8]}"
+    d = explain_failure(req["busy"]["last"], req.get("version"), current, PREPARE, retry_at=at)
+    store.put(hid, {"version": req.get("version"), "from_version": current, "actor": req.get("actor") or DIRECT_ACTOR,
+                    "mode": "update", "status": "failed", "started_at": req["busy"]["since"], "finished_at": now.isoformat(),
+                    "busy": req["busy"], "retry_at": at.isoformat(), **d})
+    req.pop("busy", None)
+    req.update(retry_at=at.isoformat(), failed_id=hid, retries=int(req.get("retries") or 0) + 1,
+               waiting_for=f"AWS was busy, so CoderHelm starts it again by itself {retry_time(at)}")
+    store.put("UPDATE_REQUEST", req)
+    return req
+
+
+def busy_retry_at(entry, now):
+    """When an update AWS kept turning away starts again by itself: an
+    update (an admin's press, or the window's), never a rollback or a switch."""
+    return now + BUSY_RETRY_AFTER if entry.get("mode") == "update" and parse_version(entry.get("version") or "") else None
+
+
+def busy_retry_later(store, now, entry, at, hid):
+    """Starts `entry`'s update again by itself at `at` (follow_request). The
+    window's own update is started again by the hourly check instead."""
+    if entry.get("scheduled"):
+        return None
+    note = str(entry.get("note") or "")
+    req = record_request(store, now, entry["version"], entry.get("actor") or DIRECT_ACTOR,
+                         skip_check=note.startswith("model check skipped"),
+                         waiting_for=f"AWS was busy, so CoderHelm starts it again by itself {retry_time(at)}",
+                         consent=consented(entry))
+    req.update(retry_at=at.isoformat(), failed_id=hid)
+    store.put("UPDATE_REQUEST", req)
+    return req
+
+
+def cancel_request(store, now, actor):
+    """An admin stops an Update press that waits (for the release check, or
+    to start again by itself after AWS was busy)."""
+    req = store.get("UPDATE_REQUEST") or {}
+    if req.get("status") != "waiting":
+        return {"cancelled": False, "request": None}
+    req = settle_request(store, {k: v for k, v in req.items() if k not in ("retry_at", "busy")}, now, "ended",
+                         f"cancelled by {actor}", cancelled_by=actor)
+    return {"cancelled": True, "request": req}
 
 
 def request_view(req, now, current=""):
@@ -2023,7 +2226,11 @@ def request_view(req, now, current=""):
                 return None
         except ValueError:
             return None
-    return {k: req.get(k) for k in ("version", "actor", "requested_at", "status", "waiting_for", "reason", "ended_at", "id", "replaces") if req.get(k) is not None}
+    view = {k: req.get(k) for k in ("version", "actor", "requested_at", "status", "waiting_for", "reason", "ended_at", "id", "replaces",
+                                    "retry_at", "failed_id") if req.get(k) is not None}
+    if req.get("busy") and req.get("status") == "waiting":
+        view["busy"] = {"attempts": int(req["busy"].get("attempts") or 1), "since": req["busy"].get("since")}
+    return view
 
 
 # ── The deploy window (hardened installs) ────────────────────────────────
@@ -3005,6 +3212,8 @@ def preflight(cfn, env, cs_id, stack, iam=None):
     try:
         access = deploy_role_access(env, iam)
     except Exception as e:  # noqa: BLE001
+        if throttled(e):
+            raise  # AWS was busy: the check is made again, never counted as a refusal
         return [f"couldn't check: the deploy role's policies couldn't be read ({type(e).__name__}: {str(e)[:160]})"]
     account, partition = stack_account(stack), stack_partition(stack)
     region = env.get("AWS_REGION") or stack_region(stack)
@@ -3033,6 +3242,8 @@ def preflight(cfn, env, cs_id, stack, iam=None):
     try:
         walk(cs_id, "parent", env["NATIVE_STACK"])
     except Exception as e:  # noqa: BLE001
+        if throttled(e):
+            raise
         out.append(f"couldn't check: the change set couldn't be read in full ({type(e).__name__}: {str(e)[:160]})")
     return out
 
@@ -3997,11 +4208,39 @@ def native_poll(store, env, now, cfn=None, wait=False):
         store.put(hid, e)
         return True
     region = env.get("AWS_REGION") or ""
+    executed = bool(entry.get("executed_at"))
+
+    def busy(e):
+        """AWS throttled a step before the change set ran: the update keeps
+        waiting and the next poll (or read of the page) tries again. Past
+        BUSY_LIMIT it fails, and starts again by itself (busy_retry_later)."""
+        if (store.get(hid, {}) or {}).get("status") != was:
+            return {"native": "moved on"}
+        if not busy_mark(entry, now, busy_why(e)):
+            entry["reason"] = busy_note(entry)
+            store.put(hid, entry)
+            logger.warning(f"{hid}: {entry['reason']} ({entry['busy']['last']})")
+            return {"native": "busy", "attempt": entry["busy"]["attempts"], "reason": entry["reason"]}
+        try:
+            cfn.delete_change_set(ChangeSetName=cs_id, StackName=env["NATIVE_STACK"])
+        except Exception as d:  # noqa: BLE001
+            logger.warning(f"change set not deleted: {d}")
+        at = busy_retry_at(entry, now)
+        if at:
+            entry["retry_at"] = at.isoformat()
+        entry["reason"] = ""
+        store.put(hid, entry)
+        out = native_finish(store, env, now, hid, "failed", entry["busy"]["last"], PREPARE)
+        if at:
+            busy_retry_later(store, now, entry, at, hid)
+        return out
     try:
-        cs = cfn.describe_change_set(ChangeSetName=cs_id, StackName=env["NATIVE_STACK"])
+        cs = busy_retry(lambda: cfn.describe_change_set(ChangeSetName=cs_id, StackName=env["NATIVE_STACK"]))
     except Exception as e:
         if "does not exist" in str(e) or "ChangeSetNotFound" in type(e).__name__:
             return native_finish(store, env, now, hid, "failed", "the proposed change set was deleted before it ran", PREPARE)
+        if throttled(e) and not executed:
+            return busy(e)
         raise
     summary = change_set_summary(cs, region, role=prepared_role(entry))
     entry["change_set"] = summary
@@ -4015,21 +4254,36 @@ def native_poll(store, env, now, cfn=None, wait=False):
         keep(entry)
         return {"native": "preparing"}
     if execution == "AVAILABLE" and "checked" not in entry:
-        if not fetched_template_matches(cfn, env, cs_id, entry.get("template_canonical")):
+        def check():
+            """What the change set does, read in full: AWS throttling any read
+            makes the whole check again, never a refusal."""
+            matches = fetched_template_matches(cfn, env, cs_id, entry.get("template_canonical"))
+            if not matches:
+                return None
+            out = {"data_changes": data_changes(cfn, cs), "admin_changes": admin_changes(cs),
+                   "permission_changes": permission_changes(cfn, cs_id, env["NATIVE_STACK"])}
+            if prepared_role(entry) or (prepared_role(entry) is None and entry.get("apply")):
+                stack = cfn.describe_stacks(StackName=env["NATIVE_STACK"])["Stacks"][0]
+                out["preflight"] = preflight(cfn, env, cs_id, stack)
+            return out
+        try:
+            found = busy_retry(check)
+        except Exception as e:
+            if throttled(e):
+                return busy(e)
+            raise
+        if found is None:
             try:
                 cfn.delete_change_set(ChangeSetName=cs_id, StackName=env["NATIVE_STACK"])
             except Exception as e:
                 logger.warning(f"change set not deleted: {e}")
             return native_finish(store, env, now, hid, "failed", "the template CloudFormation fetched is not the verified one, so the change set was deleted", PREPARE)
-        entry["data_changes"] = data_changes(cfn, cs)
-        entry["admin_changes"] = admin_changes(cs)
-        entry["permission_changes"] = permission_changes(cfn, cs_id, env["NATIVE_STACK"])
-        if prepared_role(entry) or (prepared_role(entry) is None and entry.get("apply")):
-            stack = cfn.describe_stacks(StackName=env["NATIVE_STACK"])["Stacks"][0]
-            entry["preflight"] = preflight(cfn, env, cs_id, stack)
+        entry.update(found)
         entry["checked"] = True
         summary["data_changes"] = entry["data_changes"]
         entry["change_set"] = summary
+        if not entry.get("apply"):
+            not_busy(entry)  # nothing left to call AWS for until an admin applies it
     never = never_runs(entry) if execution == "AVAILABLE" and entry.get("checked") else ""
     if never and not entry.get("executed_at"):
         # It runs as the deploy role whoever executes it (the stack's service
@@ -4067,8 +4321,14 @@ def native_poll(store, env, now, cfn=None, wait=False):
         if entry.get("apply") and not hold and not entry.get("executed_at"):
             if (store.get(hid, {}) or {}).get("status") != was:
                 return {"native": "moved on"}
-            cfn.execute_change_set(ChangeSetName=cs_id, StackName=env["NATIVE_STACK"])
+            try:
+                busy_retry(lambda: cfn.execute_change_set(ChangeSetName=cs_id, StackName=env["NATIVE_STACK"]))
+            except Exception as e:
+                if throttled(e):
+                    return busy(e)
+                raise
             entry.update({"executed_at": now.isoformat(), "status": "running"})
+            not_busy(entry)
             if entry.get("permission_changes") and consented(entry):
                 # What the press agreed to, as it turned out: kept with the update.
                 c = entry["consent"]
@@ -4910,8 +5170,9 @@ def _access_fix(access):
             else "An AWS admin applies the access stack update (Settings, System, Permissions has the link), then try again.")
 
 
-def _cause(raw, access=None, phase=None):
-    """(what went wrong, the next step) for CloudFormation's text, or (None, None)."""
+def _cause(raw, access=None, phase=None, retry_at=None):
+    """(what went wrong, the next step) for CloudFormation's text, or (None, None).
+    `retry_at`: when CoderHelm starts the update again by itself (AWS was busy)."""
     text = raw or ""
     low = text.lower()
     m = _NOT_ALLOWED.search(text)
@@ -4924,8 +5185,15 @@ def _cause(raw, access=None, phase=None):
     if m or "accessdenied" in low or "access denied" in low:
         return ("CoderHelm's update role isn't allowed to do something this release needs",
                 _NEXT_RELEASE + " If that one fails the same way, send the technical details to CoderHelm support.")
-    if "rate exceeded" in low or "throttl" in low or "too many requests" in low:
-        return ("AWS was busy and turned some calls away", "Press Update again in a few minutes.")
+    if "rate exceeded" in low or "throttl" in low or "too many requests" in low or throttled(Exception(text)):
+        # Never the release, and never a person's job to press again.
+        if phase == PREPARE:
+            what = f"AWS was busy and kept turning calls away for {int(BUSY_LIMIT.total_seconds() // 60)} minutes while CoderHelm retried"
+            if retry_at:
+                return (what, f"Nothing to do: CoderHelm starts it again by itself {retry_time(retry_at)}.")
+            return (what, "It wasn't the release or the install: try it again once AWS is less busy, in a few minutes.")
+        return ("AWS was busy and turned some calls away",
+                "It wasn't the release or the install: try it again once AWS is less busy, in a few minutes.")
     if "limitexceeded" in low or "limit exceeded" in low or "quota" in low:
         return ("your AWS account reached one of its limits",
                 "Raise the limit the technical details name (AWS console, Service Quotas) or remove what you don't use, then press Update again.")
@@ -4947,14 +5215,14 @@ def _cause(raw, access=None, phase=None):
     return (None, None)
 
 
-def explain_failure(raw, version, from_version, phase, access=None):
+def explain_failure(raw, version, from_version, phase, access=None, retry_at=None):
     """{summary, fix, technical, reason} for an update that didn't succeed.
     `access`: the access stack against the running release (access_stack_state),
     for a step that needs it first."""
     raw = str(raw or "").strip()
     v = version or "the new release"
     was = from_version or "the release it ran before"
-    what, fix = _cause(raw, access, phase)
+    what, fix = _cause(raw, access, phase, retry_at)
     part = re.match(r"([A-Za-z][A-Za-z0-9]{0,63}): ", raw)
     broken = f"the {part.group(1)} part of the install could not be updated" if part else "a part of the install could not be updated"
     if phase == UNANSWERED:
@@ -4995,7 +5263,7 @@ def native_finish(store, env, now, hid, status, reason, phase=None):
                     access_needed(store, env, now, dict(entry, access=access), [denied])
                 except Exception as e:  # noqa: BLE001
                     logger.warning(f"access card not marked: {e}")
-        event.update(explain_failure(reason, entry.get("version"), entry.get("from_version"), phase, access))
+        event.update(explain_failure(reason, entry.get("version"), entry.get("from_version"), phase, access, entry.get("retry_at")))
     elif (store.get(hid, {}) or {}).get("mode") == "options":
         # A change applied: whatever an earlier refusal needed is applied too.
         store.put("ACCESS_NEEDED", {})
@@ -5068,10 +5336,13 @@ def begin(store, env, now, version, actor, mode, extra=None, note=None, schedule
 
     if is_native(env):
         try:
-            entry.update(native_propose(store, env, version, mode, extra))
+            entry.update(busy_retry(lambda: native_propose(store, env, version, mode, extra)))
         except ReleaseNotReady:
             raise
         except Exception as e:  # noqa: BLE001  nothing changed: say so, never leave it running
+            if throttled(e):
+                # AWS was busy: a wait, never a refusal (busy_request).
+                raise AwsBusy(busy_why(e)) from e
             refused(e)
         entry["status"] = "preparing"
         store.put(hid, entry)
@@ -5079,8 +5350,14 @@ def begin(store, env, now, version, actor, mode, extra=None, note=None, schedule
     else:
         store.put(hid, entry)
         try:
-            entry["build_id"] = start_build(env, version, actor, mode, hid, extra) if extra else start_build(env, version, actor, mode, hid)
+            entry["build_id"] = busy_retry(lambda: start_build(env, version, actor, mode, hid, extra) if extra
+                                           else start_build(env, version, actor, mode, hid))
         except Exception as e:  # noqa: BLE001
+            if throttled(e):
+                # Nothing started: the press waits and is tried again (busy_request).
+                store.put(hid, dict(entry, status="not_started", finished_at=now.isoformat(),
+                                    reason="AWS was busy, so this try didn't start; CoderHelm tries again by itself"))
+                raise AwsBusy(busy_why(e)) from e
             refused(e)
     store.put(hid, entry)
     state.update({"running_since": now.isoformat(), "running_id": hid})
@@ -5249,6 +5526,12 @@ def handle(event, env, store, now, fetch=fetch_releases, probe=None, hint=None, 
             note = "model check skipped for " + ", ".join(f.get("model", "?") for f in failures(mc))
         try:
             started = begin(store, env, now, version, actor, "update", note=note, consent=bool(event.get("accept_permissions")))
+        except AwsBusy as e:
+            # AWS turned the start away: kept like a check, and tried again by itself.
+            req = record_request(store, now, version, actor, bool(event.get("skip_check")), waiting_for="AWS is busy, retrying",
+                                 consent=bool(event.get("accept_permissions")))
+            req = busy_request(store, env, now, req, e)
+            return {"state": "checking", "version": version, "request": request_view(req, now, env.get("CODERHELM_VERSION", "")), "model_check": mc}
         except ReleaseNotReady as e:
             # Still publishing, or its template not verified yet: a wait, kept like a check.
             req = record_request(store, now, version, actor, bool(event.get("skip_check")), waiting_for=str(e),
@@ -5364,6 +5647,9 @@ def handle(event, env, store, now, fetch=fetch_releases, probe=None, hint=None, 
     if action == "apply_update":
         return native_apply(store, env, now, event)
 
+    if action == "cancel_request":
+        return cancel_request(store, now, event.get("actor") or DIRECT_ACTOR)
+
     if action == "set_options":
         return set_options(store, env, now, event)
 
@@ -5395,7 +5681,8 @@ def handle(event, env, store, now, fetch=fetch_releases, probe=None, hint=None, 
             # about the release, so it never marks the version as failed.
             store.put("UPDATE_STATE", state)
             return domain_finished(store, env, now, entry, status)
-        if status != "succeeded" and version:
+        if status != "succeeded" and version and not entry.get("retry_at"):
+            # AWS being busy says nothing about the release: it isn't marked failed.
             failed = set(state.get("failed_versions") or [])
             failed.add(version)
             state["failed_versions"] = sorted(failed)
@@ -5415,7 +5702,8 @@ def handle(event, env, store, now, fetch=fetch_releases, probe=None, hint=None, 
                     "current": entry.get("from_version"),
                     "checked_at": checked_at(now),
                     "reason": entry.get("reason"),
-                    "action": "Open the update's log under Settings, System, Update history, fix what it names, then press Update now.",
+                    "action": (entry.get("fix") if entry.get("retry_at") else
+                               "Open the update's log under Settings, System, Update history, fix what it names, then press Update now."),
                 },
             )
         return {"status": status, "version": version}
@@ -5438,6 +5726,11 @@ def handle(event, env, store, now, fetch=fetch_releases, probe=None, hint=None, 
         if not is_native(env):
             raise ValueError("native_poll: not a native install")
         out = native_poll(store, env, now, wait=True)
+        # An Update press waiting (AWS was busy, or its check) carries on every 5 minutes.
+        try:
+            follow_request(store, env, now, probe)
+        except Exception as e:  # noqa: BLE001  the next poll tries again
+            logger.warning(f"waiting update not followed: {e}")
         # The release just installed: probed and watched, rolled back when it fails.
         w = watch_step(store, env, now, health)
         return dict(out, health_watch=w) if w else out
@@ -5482,7 +5775,12 @@ def handle(event, env, store, now, fetch=fetch_releases, probe=None, hint=None, 
                 d = {"action": "none", "version": d["version"],
                      "reason": "a model this release calls was refused; checking again daily"}
             else:
-                begin(store, env, now, d["version"], "auto", "update", scheduled=True)
+                try:
+                    begin(store, env, now, d["version"], "auto", "update", scheduled=True)
+                except AwsBusy as e:
+                    # Nothing changed: the next hourly check in the window starts it again.
+                    logger.warning(f"AWS is busy, the update starts at the next check: {e.cause}")
+                    d = dict(d, action="none", reason="AWS is busy, retrying at the next check")
         remind_waiting(store, env, now, current)
         send_digest(store, env, now, settings, rel, current)
         logger.info(json.dumps(d))
