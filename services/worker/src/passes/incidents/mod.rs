@@ -9,7 +9,7 @@
 //! never appears. Where a decision lives inside the pipeline itself, the
 //! case also checks that the pipeline still calls it at that place.
 //!
-//! CI runs the suite as its own job (`cargo test -p worker incidents::`),
+//! CI runs the suite as its own step (`docs/incidents.md` has the command),
 //! and `docs/incidents.md` lists each case with the guarantee it protects.
 //! A fix for a new failure adds a case here and a line there.
 

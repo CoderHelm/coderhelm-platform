@@ -93,6 +93,15 @@ jobs:
   rust-test:
     name: Rust (tests)
     runs-on: ubuntu-latest
+    # Five times since 13 November the runner stopped answering during the
+    # first cargo step and GitHub failed the job after 55 minutes as "lost
+    # communication": no test log, and every rerun passed. That step built
+    # the whole workspace with full debug info: about 19 GB of target and
+    # close to 14 GB of compiler memory at four jobs, on a runner with 16 GB
+    # and a few tens of GB of free disk. Line tables keep file:line in panics
+    # and backtraces at about a third of the disk and build time.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     defaults:
       run:
         working-directory: services
@@ -123,27 +132,51 @@ jobs:
         with:
           workspaces: services
           cache-on-failure: true
+      # Each test in its own process, ended and failed under its own name
+      # after two minutes (services/.config/nextest.toml).
+      - if: steps.changes.outputs.run == 'true'
+        uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2.89.0
+        with:
+          tool: cargo-nextest@0.9.151
+      # The build on its own step, with its own time limit. --workspace
+      # everywhere: one feature set, so one build (`-p worker` alone resolves
+      # features differently and compiles everything again).
+      # Disk and memory every minute while it builds, so a runner that runs
+      # out of either says so in the log.
+      - name: Build tests
+        if: steps.changes.outputs.run == 'true'
+        timeout-minutes: 30
+        run: |
+          usage() { echo "$(date -u +%T) disk free $(df -h --output=avail / | tail -1 | tr -d ' '), memory used $(free -m | awk '/^Mem/{print $3 " of " $2 " MB"}')"; }
+          usage
+          (while sleep 60; do usage; done) &
+          cargo test --workspace --no-run
+          usage
       # Every run failure that reached a person, replayed through the
       # pipeline's decision code with fakes only at the edges
       # (docs/incidents.md). Its own step, so a regression names itself.
-      # --workspace on both steps: one feature set, so one build (`-p worker`
-      # alone resolves features differently and compiles everything again).
       - name: Incident regressions
         if: steps.changes.outputs.run == 'true'
-        run: cargo test --workspace -- 'incidents::'
+        timeout-minutes: 10
+        run: cargo nextest run --workspace --no-fail-fast -E 'test(/incidents::/)'
       # Stops, asks, blocks and loops replayed through the real decision
       # functions and graded on the decision, with the stop judge's recorded
       # answers k = 3 times each (pass^k; passes/replay/README.md). It gates
       # any prompt, model or effort change to a judgment step.
       - name: Replay suite
         if: steps.changes.outputs.run == 'true'
-        run: cargo test --workspace -- 'replay::'
+        timeout-minutes: 10
+        run: cargo nextest run --workspace --no-fail-fast -E 'test(/replay::/)'
       # Includes the reviewer evals (worker passes::review_eval): recorded
       # review histories replayed through the real decision code, no model.
       # The incident and replay suites already ran above, on the same build.
+      # nextest runs no doc tests, so cargo test runs those.
       - name: Workspace tests
         if: steps.changes.outputs.run == 'true'
-        run: cargo test --workspace -- --skip 'incidents::' --skip 'replay::'
+        timeout-minutes: 15
+        run: |
+          cargo nextest run --workspace --no-fail-fast -E 'not (test(/incidents::/) | test(/replay::/))'
+          cargo test --workspace --doc
 
   rust:
     name: Rust (workspace)
