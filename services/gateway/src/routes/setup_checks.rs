@@ -201,6 +201,12 @@ pub const OPTIONAL_PERMISSIONS: &[(&str, &str, &str, &str)] = &[
         "Code quality",
         "Without Code quality, reviews don't see GitHub's code quality findings on the changed files.",
     ),
+    (
+        "actions",
+        "write",
+        "Actions",
+        "Without Actions: write, CoderHelm can't start a workflow itself (a deploy, an end-to-end run): it adds the label that starts one where the workflow has one, and otherwise the step waits.",
+    ),
 ];
 
 /// Events a new app subscribes to that CoderHelm works without (security
@@ -2884,9 +2890,9 @@ mod tests {
     fn each_missing_optional_permission_warns_with_the_feature_it_limits() {
         for (key, need, name, why) in OPTIONAL_PERMISSIONS {
             let mut a = full();
-            if *key == "checks" {
+            if *key == "checks" || *key == "actions" {
                 // Read is required; only write is optional.
-                a["permissions"]["checks"] = json!("read");
+                a["permissions"][*key] = json!("read");
             } else {
                 a["permissions"].as_object_mut().unwrap().remove(*key);
             }
