@@ -378,6 +378,118 @@ pub fn churn(commits: usize) -> bool {
     commits > MAX_READY_COMMITS
 }
 
+/// One commit of a branch, oldest first, as the final squash reads it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CommitInfo {
+    pub sha: String,
+    pub subject: String,
+}
+
+/// A commit the final squash writes: its message and the commit whose tree
+/// it takes (the last one of its run of commits).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Group {
+    pub message: String,
+    pub last_sha: String,
+    pub count: usize,
+}
+
+/// Commits a squashed pull request keeps, at most.
+pub const MAX_GROUPS: usize = 4;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Round {
+    Review,
+    Checks,
+    Other,
+}
+
+fn round_of(subject: &str) -> Round {
+    let l = subject.to_lowercase();
+    let has = |ws: &[&str]| {
+        l.split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|w| ws.contains(&w))
+    };
+    if has(&[
+        "review",
+        "feedback",
+        "address",
+        "comment",
+        "comments",
+        "suggestion",
+    ]) {
+        Round::Review
+    } else if has(&[
+        "test",
+        "tests",
+        "ci",
+        "lint",
+        "format",
+        "fmt",
+        "lockfile",
+        "build",
+        "types",
+        "typecheck",
+        "clippy",
+        "e2e",
+    ]) {
+        Round::Checks
+    } else {
+        Round::Other
+    }
+}
+
+fn round_words(r: Round) -> &'static str {
+    match r {
+        Round::Review => "Address review feedback",
+        Round::Checks => "Fix failing checks",
+        Round::Other => "Follow-up changes",
+    }
+}
+
+/// The final squash's commits: the first commit (the implementation) under
+/// `first` (its own subject, normalized to the run's key), then one commit
+/// per run of fix-round commits of one kind (review feedback, failing
+/// checks, other follow-ups), at most [`MAX_GROUPS`] in all. Runs stay in
+/// order, so each commit takes the tree of its run's last commit and the
+/// result is exactly the branch's code. Every message carries the run's
+/// real `key` or none.
+pub fn squash_groups(commits: &[CommitInfo], first: &str, key: Option<&str>) -> Vec<Group> {
+    let Some((head, rest)) = commits.split_first() else {
+        return Vec::new();
+    };
+    let mut runs: Vec<(Option<Round>, String, usize)> = vec![(None, head.sha.clone(), 1)];
+    for c in rest {
+        let r = round_of(&c.subject);
+        match runs.last_mut() {
+            Some((Some(k), last, n)) if *k == r => {
+                *last = c.sha.clone();
+                *n += 1;
+            }
+            _ => runs.push((Some(r), c.sha.clone(), 1)),
+        }
+    }
+    // Too many runs: the follow-ups after the first fold into one.
+    while runs.len() > MAX_GROUPS {
+        let tail = runs.split_off(MAX_GROUPS - 1);
+        let last = tail.last().map(|t| t.1.clone()).unwrap_or_default();
+        let n: usize = tail.iter().map(|t| t.2).sum();
+        let kind = tail[0].0.filter(|k| tail.iter().all(|t| t.0 == Some(*k)));
+        runs.push((kind.or(Some(Round::Other)), last, n));
+    }
+    let msg = |text: &str| normalize_message(&normalize_subject(text, key, key.is_some()), key);
+    runs.into_iter()
+        .map(|(kind, last_sha, count)| Group {
+            message: match kind {
+                None => normalize_message(first, key),
+                Some(k) => msg(round_words(k)),
+            },
+            last_sha,
+            count,
+        })
+        .collect()
+}
+
 /// A whole commit message with its subject normalized as in
 /// [`normalize_subject`] (no key added), its body kept.
 pub fn normalize_message(message: &str, key: Option<&str>) -> String {
@@ -700,6 +812,41 @@ pub fn validate(kind: Kind, template: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    fn c(sha: &str, subject: &str) -> super::CommitInfo {
+        super::CommitInfo {
+            sha: sha.into(),
+            subject: subject.into(),
+        }
+    }
+
+    #[test]
+    fn churn_squashes_into_a_few_logical_commits_with_the_runs_key() {
+        let commits = vec![
+            c("a1", "KEY-1: add the export retry"),
+            c("a2", "fix lint"),
+            c("a3", "fix failing test"),
+            c("a4", "address review feedback on naming"),
+            c("a5", "address review comment"),
+            c("a6", "fix ci"),
+            c("a7", "tidy the docs"),
+        ];
+        let g = super::squash_groups(&commits, "OPS-41: Add the export retry", Some("OPS-41"));
+        assert!(g.len() <= super::MAX_GROUPS, "{g:?}");
+        assert_eq!(g[0].message, "OPS-41: Add the export retry");
+        assert_eq!(g[0].last_sha, "a1");
+        assert_eq!(g[1].message, "OPS-41: Fix failing checks");
+        assert_eq!(g[1].last_sha, "a3");
+        assert_eq!(g[2].message, "OPS-41: Address review feedback");
+        // The rest folds into one, ending at the branch's tip.
+        assert_eq!(g.last().unwrap().last_sha, "a7");
+        assert_eq!(g.iter().map(|x| x.count).sum::<usize>(), 7);
+        // No stand-in key reaches a message.
+        assert!(g.iter().all(|x| !x.message.contains("KEY-1")), "{g:?}");
+        // Without a key, none is added.
+        let g = super::squash_groups(&commits[..2], "Add the export retry", None);
+        assert_eq!(g[1].message, "Fix failing checks");
+    }
+
     #[test]
     fn fifty_commits_are_churn_to_squash_and_a_few_are_not() {
         assert!(!super::churn(1));

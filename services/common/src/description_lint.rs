@@ -29,8 +29,15 @@ fn heading(l: &str) -> Option<String> {
     } else {
         return None;
     };
+    let level = t.chars().take_while(|c| *c == '#').count();
     let n = name.trim().trim_end_matches(':').trim().to_lowercase();
-    (!n.is_empty()).then_some(n)
+    (!n.is_empty()).then(|| {
+        if level == 0 {
+            n
+        } else {
+            format!("{} {n}", "#".repeat(level))
+        }
+    })
 }
 
 /// A line that ends a section without being one (a collapsed block's
@@ -38,6 +45,25 @@ fn heading(l: &str) -> Option<String> {
 fn boundary(l: &str) -> bool {
     let t = l.trim_start();
     t.starts_with("<!--") || t.starts_with("<details") || t.starts_with("</details")
+}
+
+/// Each line with whether it is inside a collapsed `<details>` block.
+fn with_depth(body: &str) -> Vec<(&str, bool)> {
+    let mut depth = 0usize;
+    body.lines()
+        .map(|l| {
+            let t = l.trim_start();
+            if t.starts_with("<details") {
+                depth += 1;
+                return (l, true);
+            }
+            if t.starts_with("</details") {
+                depth = depth.saturating_sub(1);
+                return (l, true);
+            }
+            (l, depth > 0)
+        })
+        .collect()
 }
 
 /// A line listing more than one deploy workflow.
@@ -56,7 +82,10 @@ fn empty_affects(l: &str) -> bool {
 pub fn defects(body: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut seen: Vec<String> = Vec::new();
-    for l in body.lines() {
+    for (l, folded) in with_depth(body) {
+        if folded {
+            continue;
+        }
         if let Some(h) = heading(l) {
             if seen.contains(&h)
                 && !out
@@ -81,9 +110,14 @@ pub fn defects(body: &str) -> Vec<String> {
 /// repeated section, deploy maps, an empty "who this affects".
 pub fn clean(body: &str) -> String {
     let lines: Vec<&str> = body.lines().collect();
-    // Where each section starts and ends.
+    let folded: Vec<bool> = with_depth(body).into_iter().map(|(_, f)| f).collect();
+    // Where each section starts and ends (in sight only: a collapsed block
+    // keeps what it holds).
     let mut sections: Vec<(String, usize, usize)> = Vec::new();
     for (i, l) in lines.iter().enumerate() {
+        if folded[i] {
+            continue;
+        }
         if let Some(h) = heading(l) {
             let end = lines[i + 1..]
                 .iter()
@@ -101,7 +135,7 @@ pub fn clean(body: &str) -> String {
         }
     }
     for (i, l) in lines.iter().enumerate() {
-        if deploy_map(l) || empty_affects(l) {
+        if !folded[i] && (deploy_map(l) || empty_affects(l)) {
             drop[i] = true;
         }
     }

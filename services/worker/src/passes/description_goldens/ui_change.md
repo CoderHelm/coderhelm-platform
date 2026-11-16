@@ -1,6 +1,14 @@
 <!-- coderhelm:lead -->
 <!-- coderhelm:body v1 ticket=KEY-123 head=d78bb24 -->
-Adds a Studio warning when a Hero (Default) subtitle is longer than 160 characters, so editors fix long subtitles before they break the hero layout ([KEY-123](https://tracker.example.com/browse/KEY-123)). Editors can still publish.<!-- ch:summary-end --> Done outside the diff: post the 23 documents already over the limit on KEY-123.
+### Problem
+
+Hero subtitle character limit ([KEY-123](https://tracker.example.com/browse/KEY-123)).
+
+### Changes
+
+Adds a Studio warning when a Hero (Default) subtitle is longer than 160 characters, so editors fix long subtitles before they break the hero layout. Editors can still publish.<!-- ch:summary-end --> Done outside the diff: post the 23 documents already over the limit on KEY-123.
+- Approach: is a non-blocking warning what KEY-123 asks for, or should over-limit subtitles block publishing? CoderHelm's conclusion: all checks on this head passed.
+- Read first: [`apps/studio/schemaTypes/blocks/hero-block-validation.ts`](https://github.com/acme/site/blob/d78bb24/apps/studio/schemaTypes/blocks/hero-block-validation.ts) (the rule, +21 lines); then the other 2 files.
 
 ### Needed from you
 
@@ -10,11 +18,7 @@ Adds a Studio warning when a Hero (Default) subtitle is longer than 160 characte
   cd apps/studio && npm run deploy:staging
   ```
 
-### Review focus
-
-- Approach: is a non-blocking warning what KEY-123 asks for, or should over-limit subtitles block publishing? CoderHelm's conclusion: all checks on this head passed.
-- Read first: [`apps/studio/schemaTypes/blocks/hero-block-validation.ts`](https://github.com/acme/site/blob/d78bb24/apps/studio/schemaTypes/blocks/hero-block-validation.ts) (the rule, +21 lines); then the other 2 files.
-- See it: [the preview](https://preview.example.com/studio), document `/private-events/weddings`, Hero, Sub Title field.
+### Risk
 
 **Risk:** Low. Warning-level validation only; no schema, data, or publish-flow change.
 
@@ -30,6 +34,10 @@ On d78bb24 (head of this PR):
 | Unit tests (CI) | Passed |
 | Studio build (CI) | Passed |
 | Studio in local dev, manual (CoderHelm) | Passed; warning shows at 161 characters; Publish stays enabled |
+
+See it: [the preview](https://preview.example.com/studio), document `/private-events/weddings`, Hero, Sub Title field.
+
+How to check: `npm test -- hero-block-validation`.
 
 | Before | After |
 |---|---|
@@ -50,8 +58,6 @@ On d78bb24 (head of this PR):
 <summary>Full test evidence</summary><!-- fold -->
 
 <!-- coderhelm:all-checks -->
-How to check: `npm test -- hero-block-validation`.
-
 Every check on this head:
 - [`Lint and typecheck`](https://ci.example.com/Lint-and-typecheck): passed
 - [`Unit tests`](https://ci.example.com/Unit-tests): passed

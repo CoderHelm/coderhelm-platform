@@ -378,7 +378,7 @@ pub fn feature_case() -> Case {
             "### Needed from you\n- [ ] <!-- ch:deploy-the-staging-studio --> **Repository admin**, after merge: Grant CoderHelm's GitHub App permission to start the deploy workflow or run the command below once. Why a person: a permission only a person grants.",
             "  ```sh\n  cd apps/studio && npm run deploy:staging\n  ```",
             // A look belongs to the merge decision, never a separate chore.
-            "- See it: Studio: the page document, the title field.",
+            "See it: Studio: the page document, the title field.",
             "| Test Suite (CI) | Passed |",
         ],
         collapsed: vec![
@@ -453,13 +453,14 @@ pub fn ticket_case() -> Case {
             "**Roll back:**",
         ],
         in_sight: vec![
-            "Retries a timed-out export poll three times before giving up (OPS-41).",
+            "Retries a timed-out export poll three times before giving up.",
             "| unit tests (CI) | Failed: [log](https://ci.example.com/unit-tests) |",
             "On abc1234 (head of this PR):",
+            // How to check is part of Verification.
+            "How to check: `cargo test -p export`.",
         ],
         collapsed: vec![
             "* `src/export/poller.rs`: the retry loop and its limit.",
-            "How to check: `cargo test -p export`.",
             "Source ticket: OPS-41",
         ],
     }
@@ -1014,18 +1015,24 @@ pub fn rendered_defects(body: &str) -> Vec<String> {
         visible = visible.replacen(f, "", 1);
     }
     let start = visible.trim_start();
-    let opens_with_summary = start.starts_with("<p>")
+    let opens_with_problem = start.starts_with("<h3>Problem</h3>")
         || (start.starts_with("<blockquote>")
             && start
                 .split_once("</blockquote>")
-                .is_some_and(|(_, rest)| rest.trim_start().starts_with("<p>")));
-    if !opens_with_summary {
+                .is_some_and(|(_, rest)| rest.trim_start().starts_with("<h3>Problem</h3>")));
+    if !opens_with_problem {
         d.push(format!(
-            "the first block is not the Summary: {}",
+            "the first block is not the Problem: {}",
             common::truncate_str(start, 80)
         ));
     }
-    let allowed = ["Needed from you", "Review focus", "Verification"];
+    let allowed = [
+        "Problem",
+        "Changes",
+        "Needed from you",
+        "Risk",
+        "Verification",
+    ];
     for h in ["h1", "h2", "h3"] {
         for e in elements(&visible, h) {
             let text = e
@@ -1233,7 +1240,7 @@ mod tests {
             "in sight: did not run",
             "in sight: (a person",
             "in sight: **Check:**",
-            "no Review focus section",
+            "no Problem section",
             "the risk has no level and reason",
             "short sha is in sight",
         ] {

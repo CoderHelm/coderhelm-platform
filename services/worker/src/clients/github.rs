@@ -2135,20 +2135,84 @@ impl GitHubClient {
         if base_tree.as_deref() == Some(tree_sha.as_str()) {
             return Ok(()); // no net change
         }
-        let new_commit = self
-            .post(
-                &format!("{API_BASE}/repos/{owner}/{repo}/git/commits"),
-                &serde_json::json!({
-                    "message": message,
-                    "tree": tree_sha,
-                    "parents": [base_sha],
-                }),
-            )
-            .await?;
-        let new_sha = new_commit
-            .get("sha")
+        // A linear history of the app's own commits is squashed into a few
+        // logical commits (`git_conventions::squash_groups`) on the commit
+        // it started from, each taking its run's last tree; anything else
+        // (a merge of the base in it) becomes one commit on the base.
+        let listed: Vec<serde_json::Value> = self
+            .get(&format!(
+                "{API_BASE}/repos/{owner}/{repo}/compare/{base_sha}...{branch_sha}"
+            ))
+            .await?
+            .get("commits")
+            .and_then(|c| c.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let linear = !listed.is_empty()
+            && listed.iter().all(|c| {
+                c.get("parents")
+                    .and_then(|p| p.as_array())
+                    .is_some_and(|p| p.len() == 1)
+            });
+        let infos: Vec<common::git_conventions::CommitInfo> = listed
+            .iter()
+            .map(|c| common::git_conventions::CommitInfo {
+                sha: c["sha"].as_str().unwrap_or("").to_string(),
+                subject: c["commit"]["message"]
+                    .as_str()
+                    .unwrap_or("")
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .to_string(),
+            })
+            .collect();
+        let key = common::git_conventions::subject_key(message);
+        let groups = common::git_conventions::squash_groups(&infos, message, key.as_deref());
+        let start = listed
+            .first()
+            .and_then(|c| c.pointer("/parents/0/sha"))
             .and_then(|v| v.as_str())
-            .ok_or("Missing sha in squash commit")?;
+            .map(String::from);
+        let new_sha = match (linear && groups.len() > 1, start) {
+            (true, Some(mut parent)) => {
+                for g in &groups {
+                    let (tree, _) = self.commit_tree_parents(owner, repo, &g.last_sha).await?;
+                    parent = self
+                        .put_commit(
+                            owner,
+                            repo,
+                            &g.message,
+                            &tree,
+                            std::slice::from_ref(&parent),
+                        )
+                        .await?;
+                }
+                parent
+            }
+            _ => {
+                let new_commit = self
+                    .post(
+                        &format!("{API_BASE}/repos/{owner}/{repo}/git/commits"),
+                        &serde_json::json!({
+                            "message": message,
+                            "tree": tree_sha,
+                            "parents": [base_sha],
+                        }),
+                    )
+                    .await?;
+                new_commit
+                    .get("sha")
+                    .and_then(|v| v.as_str())
+                    .ok_or("Missing sha in squash commit")?
+                    .to_string()
+            }
+        };
+        // Someone pushed since this was read: nothing is rewritten.
+        if self.get_ref(owner, repo, branch).await? != branch_sha {
+            return Ok(());
+        }
+        let new_sha = new_sha.as_str();
         // Force-update: intentional history rewrite (single-writer context).
         let ref_url = format!("{API_BASE}/repos/{owner}/{repo}/git/refs/heads/{branch}");
         self.patch(
