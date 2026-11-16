@@ -1035,6 +1035,7 @@ fn build_app(state: Arc<AppState>) -> Router {
         )
         // The company brain chat (asking streams from /api/brain/stream)
         .route("/brain/threads", get(routes::brain::list_threads))
+        .route("/brain/threads/delete", post(routes::brain::delete_threads))
         .route(
             "/brain/threads/:thread_id",
             get(routes::brain::get_thread)
