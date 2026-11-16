@@ -564,36 +564,195 @@ pub async fn delete_thread(
     if claims.require_role(1).is_err() {
         return Err(fail(StatusCode::FORBIDDEN, "Viewers can't delete threads."));
     }
-    let t = get_thread_record(&state, &claims.team_id, &id)
+    let store = DynamoThreads(&state);
+    let t = store
+        .thread(&claims.team_id, &id)
         .await
-        .map_err(|e| internal("chat thread", e))?
-        .filter(|t| can_read(t, &claims.sub))
-        .ok_or_else(|| fail(StatusCode::NOT_FOUND, "No such thread."))?;
-    if !can_write(&t, &claims.sub) {
-        return Err(fail(
+        .map_err(|e| internal("chat thread", e))?;
+    match delete_verdict(t.as_ref(), &claims.sub) {
+        Verdict::NotFound => Err(fail(StatusCode::NOT_FOUND, "No such thread.")),
+        Verdict::NotYours => Err(fail(
             StatusCode::FORBIDDEN,
             "Only the person who started a thread can delete it.",
-        ));
+        )),
+        Verdict::Delete => {
+            store
+                .remove(&claims.team_id, &id)
+                .await
+                .map_err(|e| internal("chat delete", e))?;
+            Ok(Json(json!({ "ok": true })))
+        }
     }
-    let messages: Vec<Message> = query(&state, &claims.team_id, &message_prefix(&t.id))
-        .await
-        .map_err(|e| internal("chat messages", e))?;
-    for sk in messages
+}
+
+/// How many chats one bulk delete takes.
+pub const MAX_BULK_DELETE: usize = 100;
+
+#[derive(Debug, Deserialize)]
+pub struct BulkDelete {
+    pub ids: Vec<String>,
+}
+
+/// What became of one id in a bulk delete.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DeleteOutcome {
+    pub id: String,
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Whether a caller may delete a thread, given the record found under their
+/// own team (`None` when there is none). The single and the bulk delete both
+/// decide here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    Delete,
+    /// Missing, or someone else's private thread: answered the same, so an
+    /// id never tells whether another person's chat exists.
+    NotFound,
+    /// A teammate's shared thread: readable, not theirs to delete.
+    NotYours,
+}
+
+pub fn delete_verdict(t: Option<&Thread>, user_id: &str) -> Verdict {
+    match t {
+        Some(t) if can_read(t, user_id) => {
+            if can_write(t, user_id) {
+                Verdict::Delete
+            } else {
+                Verdict::NotYours
+            }
+        }
+        _ => Verdict::NotFound,
+    }
+}
+
+/// The ids of a bulk delete, checked: at least one, at most
+/// [`MAX_BULK_DELETE`], blanks and repeats dropped (order kept).
+pub fn bulk_ids(ids: &[String]) -> Result<Vec<String>, String> {
+    let mut seen = std::collections::HashSet::new();
+    let ids: Vec<String> = ids
         .iter()
-        .map(|m| message_sk(&t.id, m.seq))
-        .chain(std::iter::once(thread_sk(&t.id)))
-    {
-        state
-            .dynamo
-            .delete_item()
-            .table_name(&state.config.settings_table_name)
-            .key("pk", AttributeValue::S(claims.team_id.clone()))
-            .key("sk", AttributeValue::S(sk))
-            .send()
-            .await
-            .map_err(|e| internal("chat delete", e.to_string()))?;
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty() && seen.insert(id.clone()))
+        .collect();
+    if ids.is_empty() {
+        return Err("Pick at least one chat to delete.".into());
     }
-    Ok(Json(json!({ "ok": true })))
+    if ids.len() > MAX_BULK_DELETE {
+        return Err(format!("Delete up to {MAX_BULK_DELETE} chats at a time."));
+    }
+    Ok(ids)
+}
+
+/// Where threads live: the settings table in production, a map in tests.
+/// Every call is scoped to one team; a thread of another team is never read.
+pub(crate) trait ThreadStore {
+    async fn thread(&self, team_id: &str, id: &str) -> Result<Option<Thread>, String>;
+    /// The thread and all its messages.
+    async fn remove(&self, team_id: &str, id: &str) -> Result<(), String>;
+}
+
+pub(crate) struct DynamoThreads<'a>(pub &'a AppState);
+
+impl ThreadStore for DynamoThreads<'_> {
+    async fn thread(&self, team_id: &str, id: &str) -> Result<Option<Thread>, String> {
+        get_thread_record(self.0, team_id, id).await
+    }
+
+    async fn remove(&self, team_id: &str, id: &str) -> Result<(), String> {
+        let state = self.0;
+        let messages: Vec<Message> = query(state, team_id, &message_prefix(id)).await?;
+        for sk in messages
+            .iter()
+            .map(|m| message_sk(id, m.seq))
+            .chain(std::iter::once(thread_sk(id)))
+        {
+            state
+                .dynamo
+                .delete_item()
+                .table_name(&state.config.settings_table_name)
+                .key("pk", AttributeValue::S(team_id.to_string()))
+                .key("sk", AttributeValue::S(sk))
+                .send()
+                .await
+                .map_err(|e| format!("delete: {e}"))?;
+        }
+        Ok(())
+    }
+}
+
+/// Deletes each id the caller may delete, a few at a time, and says what
+/// became of every one, in the order asked. One failure stops nothing else.
+pub(crate) async fn delete_many<S: ThreadStore>(
+    store: &S,
+    team_id: &str,
+    user_id: &str,
+    ids: &[String],
+) -> Vec<DeleteOutcome> {
+    use futures::stream::{self, StreamExt};
+    stream::iter(ids.iter().cloned())
+        .map(|id| async move {
+            let refused = |msg: &str| DeleteOutcome {
+                id: id.clone(),
+                ok: false,
+                error: Some(msg.to_string()),
+            };
+            let t = match store.thread(team_id, &id).await {
+                Ok(t) => t,
+                Err(e) => {
+                    error!(error = %e, "chat bulk delete: read");
+                    return refused("Something went wrong. Try again.");
+                }
+            };
+            match delete_verdict(t.as_ref(), user_id) {
+                Verdict::NotFound => refused("No such chat."),
+                Verdict::NotYours => refused("Only the person who started a chat can delete it."),
+                Verdict::Delete => match store.remove(team_id, &id).await {
+                    Ok(()) => DeleteOutcome {
+                        id: id.clone(),
+                        ok: true,
+                        error: None,
+                    },
+                    Err(e) => {
+                        error!(error = %e, "chat bulk delete");
+                        refused("Something went wrong. Try again.")
+                    }
+                },
+            }
+        })
+        .buffered(8)
+        .collect()
+        .await
+}
+
+/// POST /api/brain/threads/delete — several of the caller's own threads at
+/// once (`{"ids": [...]}`, up to [`MAX_BULK_DELETE`]), with the same checks as
+/// the single delete. Answers with one result per id: `{"results": [{"id",
+/// "ok", "error"?}], "deleted", "failed"}`.
+pub async fn delete_threads(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<BulkDelete>,
+) -> Reply {
+    if claims.require_role(1).is_err() {
+        return Err(fail(StatusCode::FORBIDDEN, "Viewers can't delete threads."));
+    }
+    let ids = bulk_ids(&body.ids).map_err(|m| fail(StatusCode::BAD_REQUEST, &m))?;
+    let results = delete_many(&DynamoThreads(&state), &claims.team_id, &claims.sub, &ids).await;
+    let deleted = results.iter().filter(|r| r.ok).count();
+    info!(
+        team_id = %claims.team_id,
+        deleted,
+        failed = results.len() - deleted,
+        "chat bulk delete"
+    );
+    Ok(Json(json!({
+        "results": results,
+        "deleted": deleted,
+        "failed": results.len() - deleted,
+    })))
 }
 
 // ── What can be picked ──────────────────────────────────────────────────────
@@ -2713,6 +2872,152 @@ mod tests {
             tool_label(ASK_TOOL, &json!({"plugin": "marketing"})),
             "Asked the marketing plugin"
         );
+    }
+
+    /// Threads by (team, id); ids in `broken` fail to delete.
+    #[derive(Default)]
+    struct MapThreads {
+        rows: std::sync::Mutex<HashMap<(String, String), Thread>>,
+        broken: Vec<String>,
+    }
+
+    impl MapThreads {
+        fn add(&self, team: &str, id: &str, owner: &str, shared: bool) {
+            let t = Thread {
+                id: id.into(),
+                owner: owner.into(),
+                shared,
+                ..Default::default()
+            };
+            self.rows
+                .lock()
+                .unwrap()
+                .insert((team.into(), id.into()), t);
+        }
+        fn has(&self, team: &str, id: &str) -> bool {
+            self.rows
+                .lock()
+                .unwrap()
+                .contains_key(&(team.to_string(), id.to_string()))
+        }
+    }
+
+    impl ThreadStore for MapThreads {
+        async fn thread(&self, team_id: &str, id: &str) -> Result<Option<Thread>, String> {
+            Ok(self
+                .rows
+                .lock()
+                .unwrap()
+                .get(&(team_id.to_string(), id.to_string()))
+                .cloned())
+        }
+        async fn remove(&self, team_id: &str, id: &str) -> Result<(), String> {
+            if self.broken.iter().any(|b| b == id) {
+                return Err("throttled".into());
+            }
+            self.rows
+                .lock()
+                .unwrap()
+                .remove(&(team_id.to_string(), id.to_string()));
+            Ok(())
+        }
+    }
+
+    fn ids(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[tokio::test]
+    async fn bulk_delete_removes_only_the_callers_own_chats_in_their_team() {
+        let store = MapThreads::default();
+        store.add("TEAM#a", "t1", "USER#me", false);
+        store.add("TEAM#a", "t2", "USER#me", true);
+        // Another person's chats in the same team: private, then shared.
+        store.add("TEAM#a", "t3", "USER#other", false);
+        store.add("TEAM#a", "t4", "USER#other", true);
+        // The caller's own user id, but a chat of another team.
+        store.add("TEAM#b", "t5", "USER#me", false);
+        let out = delete_many(
+            &store,
+            "TEAM#a",
+            "USER#me",
+            &ids(&["t1", "t2", "t3", "t4", "t5", "nope"]),
+        )
+        .await;
+        let got: Vec<(&str, bool, Option<&str>)> = out
+            .iter()
+            .map(|r| (r.id.as_str(), r.ok, r.error.as_deref()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("t1", true, None),
+                ("t2", true, None),
+                // Someone else's private chat reads as missing: no leak.
+                ("t3", false, Some("No such chat.")),
+                (
+                    "t4",
+                    false,
+                    Some("Only the person who started a chat can delete it.")
+                ),
+                ("t5", false, Some("No such chat.")),
+                ("nope", false, Some("No such chat.")),
+            ]
+        );
+        assert!(!store.has("TEAM#a", "t1") && !store.has("TEAM#a", "t2"));
+        assert!(store.has("TEAM#a", "t3"), "another person's chat is kept");
+        assert!(store.has("TEAM#a", "t4"), "a shared chat is kept");
+        assert!(store.has("TEAM#b", "t5"), "another team's chat is kept");
+    }
+
+    #[tokio::test]
+    async fn one_failed_delete_stops_nothing_else() {
+        let store = MapThreads {
+            broken: ids(&["t2"]),
+            ..Default::default()
+        };
+        for id in ["t1", "t2", "t3"] {
+            store.add("TEAM#a", id, "USER#me", false);
+        }
+        let out = delete_many(&store, "TEAM#a", "USER#me", &ids(&["t1", "t2", "t3"])).await;
+        assert_eq!(
+            out.iter().map(|r| r.ok).collect::<Vec<_>>(),
+            vec![true, false, true]
+        );
+        assert_eq!(
+            out[1].error.as_deref(),
+            Some("Something went wrong. Try again.")
+        );
+        assert!(store.has("TEAM#a", "t2") && !store.has("TEAM#a", "t3"));
+        // The answer the dashboard reads: one entry per id, `error` only on failures.
+        assert_eq!(
+            serde_json::to_value(&out[0]).unwrap(),
+            json!({ "id": "t1", "ok": true })
+        );
+    }
+
+    #[test]
+    fn bulk_delete_takes_one_to_a_hundred_distinct_ids() {
+        assert!(bulk_ids(&[]).is_err());
+        assert!(bulk_ids(&ids(&[" "])).is_err());
+        assert_eq!(bulk_ids(&ids(&["a", "b", "a"])).unwrap(), ids(&["a", "b"]));
+        let hundred: Vec<String> = (0..MAX_BULK_DELETE).map(|i| format!("t{i}")).collect();
+        assert_eq!(bulk_ids(&hundred).unwrap().len(), MAX_BULK_DELETE);
+        let more: Vec<String> = (0..=MAX_BULK_DELETE).map(|i| format!("t{i}")).collect();
+        assert_eq!(
+            bulk_ids(&more).unwrap_err(),
+            "Delete up to 100 chats at a time."
+        );
+    }
+
+    #[test]
+    fn single_and_bulk_delete_decide_the_same_way() {
+        let mine = thread("USER#a", false);
+        assert_eq!(delete_verdict(Some(&mine), "USER#a"), Verdict::Delete);
+        assert_eq!(delete_verdict(Some(&mine), "USER#b"), Verdict::NotFound);
+        let shared = thread("USER#a", true);
+        assert_eq!(delete_verdict(Some(&shared), "USER#b"), Verdict::NotYours);
+        assert_eq!(delete_verdict(None, "USER#a"), Verdict::NotFound);
     }
 
     #[test]

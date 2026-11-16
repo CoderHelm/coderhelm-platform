@@ -228,6 +228,7 @@ pub const CAPABILITIES: &[Capability] = &[
             "brain::create_attachment",
             "brain::update_thread",
             "brain::delete_thread",
+            "brain::delete_threads",
             "brain::rate_message",
         ],
     },
@@ -1732,6 +1733,26 @@ mod tests {
             Some("brain::update_thread")
         );
         assert_eq!(route("GET", "/brain/starters"), Some("brain::starters"));
+        assert_eq!(
+            route("POST", "/brain/threads/delete"),
+            Some("brain::delete_threads")
+        );
+        assert!(matches!(
+            resolve_access(
+                &Holder::builtin("viewer"),
+                route("POST", "/brain/threads/delete")
+            ),
+            Access::Deny { .. }
+        ));
+        assert_eq!(
+            resolve_access(
+                &custom(&["brain_ask"]),
+                route("POST", "/brain/threads/delete")
+            ),
+            Access::Allow {
+                effective_role: "member"
+            }
+        );
         assert_eq!(
             route("PUT", "/brain/threads/:thread_id/messages/:seq/feedback"),
             Some("brain::rate_message")
