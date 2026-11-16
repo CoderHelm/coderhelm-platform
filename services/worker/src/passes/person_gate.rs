@@ -230,6 +230,8 @@ mod tests {
         ("src/passes/settle.rs", "person_gate::decide"),
         // The ticket and the pull request's note for outside work.
         ("src/passes/outside_work.rs", "needed("),
+        // A release step only a person can unblock.
+        ("src/passes/release_run.rs", "person_gate::sink("),
         // Questions put to a person before a run stops.
         ("../common/src/stop_rules/screen.rs", "person_gate::"),
         // The judge's assumptions.
@@ -258,6 +260,9 @@ mod tests {
         "fix_location.rs",
         "proof.rs",
         "person_gate.rs",
+        // Lays out text the gate already passed (and names the words in its
+        // checks).
+        "comment_style.rs",
     ];
 
     fn rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {

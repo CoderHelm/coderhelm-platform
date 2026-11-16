@@ -2052,18 +2052,20 @@ async fn run_passes(
     msg.team_instructions =
         load_team_instructions(state, &msg.team_id, &msg.repo_owner, &msg.repo_name).await;
 
-    // Post "working on it" comment only for GitHub-sourced tickets.
+    // Progress is status for nobody: it is on the run page, never a comment
+    // (the layer drops a "run" status an earlier attempt left on the issue).
     let mut progress_comment_id: Option<u64> = None;
     if matches!(msg.source, TicketSource::Github) && msg.issue_number > 0 {
-        let resp = crate::passes::conversation::github(
+        crate::passes::conversation::github(
             &github,
             &msg.repo_owner,
             &msg.repo_name,
             msg.issue_number,
-            common::conversation::Say::status("run", format_progress("triage", run_id)),
+            common::conversation::Say::status("run", format_progress("triage", run_id))
+                .for_nobody(),
         )
         .await?;
-        progress_comment_id = resp["id"].as_u64();
+        progress_comment_id = Some(msg.issue_number);
     }
 
     // The ticket's history with CoderHelm: earlier runs, how their PRs
@@ -9038,8 +9040,10 @@ async fn report_also_outside(
     if let Some(c) = decision.outside_change.as_ref() {
         person_gate::record_counts(state, &msg.team_id, run_id, &outside_work::counts(c)).await;
     }
-    // The ticket gets the short note (what was done, the one thing needed);
-    // the full report stays on the run page and the pull request.
+    // The ticket gets only what a person must do; with nothing for anyone
+    // the comment says nothing (the conversation layer drops it from the
+    // status comment), and the full report stays on the run page and the
+    // pull request.
     let ticket = decision
         .outside_change
         .as_ref()
@@ -9293,7 +9297,7 @@ async fn post_ticket_notice(
                 github,
                 &msg.repo_owner,
                 &msg.repo_name,
-                earlier.comment_id,
+                msg.issue_number,
                 key,
                 github_body,
                 asks,
@@ -12556,21 +12560,21 @@ fn format_progress(current_phase: &str, run_id: &str) -> String {
     )
 }
 
-/// Update the progress comment on the GitHub issue.
+/// Progress on a GitHub issue (`issue`): status for nobody, so the layer
+/// keeps it off the thread (and drops an earlier one).
 async fn update_progress_comment(
     github: &crate::clients::github::GitHubClient,
     owner: &str,
     repo: &str,
-    comment_id: Option<u64>,
+    issue: Option<u64>,
     phase: &str,
     run_id: &str,
 ) {
-    if let Some(cid) = comment_id {
-        let body = format_progress(phase, run_id);
-        if let Err(e) =
-            crate::passes::conversation::edit_own(github, owner, repo, cid, "run", &body).await
-        {
-            tracing::warn!(error = %e, "Failed to update progress comment");
+    if let Some(n) = issue {
+        let say =
+            common::conversation::Say::status("run", format_progress(phase, run_id)).for_nobody();
+        if let Err(e) = crate::passes::conversation::github(github, owner, repo, n, say).await {
+            tracing::warn!(error = %e, "Failed to update progress on the issue");
         }
     }
 }

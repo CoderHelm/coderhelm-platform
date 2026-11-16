@@ -986,12 +986,12 @@ async fn upsert_comment(github: &GitHubClient, msg: &HealthCheckMessage, body: &
     let res = match existing {
         // Already says this (an approval wait seen again): nothing to edit.
         Some((_, true)) => return,
-        Some((Some(id), false)) => {
+        Some((Some(_), false)) => {
             crate::passes::conversation::edit_own(
                 github,
                 &msg.repo_owner,
                 &msg.repo_name,
-                id,
+                msg.pr_number,
                 &format!("health:{}", msg.merge_sha),
                 body,
             )

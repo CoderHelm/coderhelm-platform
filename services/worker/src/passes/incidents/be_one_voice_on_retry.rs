@@ -65,15 +65,14 @@ fn a_retry_with_nothing_new_keeps_the_covered_decision_and_edits_the_comment() {
                 ..Default::default()
             },
             body: note.clone(),
+            node_id: String::new(),
         }],
         heard: vec![],
     };
+    // The comment already says it: nothing is written, no "Retried at".
     match decide(&view, &earlier, &Place::jira("ABC-12"), T0 + 3_600_000) {
-        Decision::Edit { id, body, .. } => {
-            assert_eq!(id, "10001");
-            assert!(body.contains("same result"), "{body}");
-        }
-        other => panic!("a retry posted again: {other:?}"),
+        Decision::Quiet { .. } => {}
+        other => panic!("a retry wrote again: {other:?}"),
     }
 
     // A person asking for more decides afresh.
