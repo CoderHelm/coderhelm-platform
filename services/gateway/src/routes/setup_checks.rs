@@ -2957,7 +2957,12 @@ mod tests {
         assert_eq!(c.status, Status::Skip);
         assert!(c.detail.contains("Actions: write"), "{}", c.detail);
         assert!(c.why.contains("nothing on a pull request"), "{}", c.why);
-        assert_eq!(github_permissions(&a).status, Status::Pass);
+        // The permissions check names the optional Actions: write too, as a
+        // warning for the install (never a failure, never a pull request
+        // item).
+        let p = github_permissions(&a);
+        assert_eq!(p.status, Status::Warn);
+        assert!(p.detail.contains("Actions: write"), "{}", p.detail);
         a["permissions"]["actions"] = json!("write");
         assert_eq!(github_workflow_starts(&a).status, Status::Pass);
     }
