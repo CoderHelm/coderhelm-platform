@@ -9981,7 +9981,11 @@ flow) and the repository has an end-to-end suite (a Playwright or Cypress config
 an end-to-end spec in that suite for the new behaviour, in this same branch. Follow the suite's own \
 conventions: its folder, page objects and fixtures, tags and area labels, its test map, and the \
 AGENTS.md / CLAUDE.md files next to it. The spec must fail without the change and pass with it; \
-CoderHelm runs it on the pull request's preview. Unit tests alone don't cover a change a person sees.\n";
+CoderHelm runs it on the pull request's preview. Unit tests alone don't cover a change a person sees. \
+Assert what the person sees. Before writing selectors or reading JSON of a page another company serves \
+(a payment form, a sign-in widget), probe it with `probe_page` (on the preview or the vendor's URL), commit \
+the record it returns, quote the test ids and fields you use in the pull request, and use only those: the \
+review flags any it can't find in a probe.\n";
 
 pub(crate) fn attr_s(val: &str) -> aws_sdk_dynamodb::types::AttributeValue {
     aws_sdk_dynamodb::types::AttributeValue::S(val.to_string())

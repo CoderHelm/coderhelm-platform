@@ -86,6 +86,15 @@ async fn save(state: &WorkerState, p: Pr<'_>, st: &State) {
     }
 }
 
+/// An end-to-end check failing on the head whose report the state hasn't
+/// read: it is read before anything is said about it.
+pub fn unread_failure(st: &State, failing: &[String]) -> bool {
+    failing
+        .iter()
+        .filter(|f| pv::role_of(f) == pv::Role::E2e)
+        .any(|f| !st.failures.iter().any(|r| &r.check == f))
+}
+
 /// A state that needs nothing more on its head.
 pub fn settled(st: &State, head: &str) -> bool {
     st.head == head
@@ -237,6 +246,101 @@ async fn nudge(gh: &GitHubClient, owner: &str, repo: &str, branch: &str, head: &
         .unwrap_or(false)
 }
 
+/// Each failed end-to-end check on the head, read from its own report
+/// before anything is said about it: the e2e workflow's comment on the
+/// pull request, the check's annotations, the job's log
+/// (`common::e2e::failure_read`), with whether this change caused it (the
+/// same check on the base branch's head).
+async fn read_failures(
+    gh: &GitHubClient,
+    p: Pr<'_>,
+    base: &str,
+    runs: &serde_json::Value,
+    changed: &[String],
+) -> Vec<common::e2e::failure_read::FailureRead> {
+    use common::e2e::failure_read as fr;
+    let failed: Vec<&serde_json::Value> = runs["check_runs"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|r| outcome_of(r) == Outcome::Failed)
+        .filter(|r| pv::role_of(r["name"].as_str().unwrap_or("")) == pv::Role::E2e)
+        .take(3)
+        .collect();
+    if failed.is_empty() {
+        return Vec::new();
+    }
+    let comments = gh
+        .list_issue_comments(p.owner, p.repo, p.number)
+        .await
+        .unwrap_or_default();
+    let base_runs = match gh.get_ref(p.owner, p.repo, base).await {
+        Ok(sha) => gh
+            .list_check_runs_for_ref(p.owner, p.repo, &sha)
+            .await
+            .unwrap_or_default(),
+        Err(_) => serde_json::Value::Null,
+    };
+    let mut out = Vec::new();
+    for r in failed {
+        let name = r["name"].as_str().unwrap_or("").to_string();
+        let id = r["id"].as_u64().unwrap_or(0);
+        let comment = comments
+            .iter()
+            .rev()
+            .filter(|c| c["user"]["type"].as_str() == Some("Bot"))
+            .filter_map(|c| c["body"].as_str())
+            .find(|b| {
+                let l = b.to_ascii_lowercase();
+                (l.contains(&name.to_ascii_lowercase())
+                    || l.contains("e2e")
+                    || l.contains("playwright")
+                    || l.contains("end-to-end"))
+                    && (l.contains("fail") || l.contains('✘') || l.contains('❌'))
+            })
+            .unwrap_or("")
+            .to_string();
+        let annotations = if id > 0 {
+            gh.check_run_annotation_list(p.owner, p.repo, id)
+                .await
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let log = if id > 0 && comment.is_empty() && annotations.is_empty() {
+            gh.get_check_run_logs(p.owner, p.repo, id)
+                .await
+                .map(|l| {
+                    let lines: Vec<&str> = l.lines().collect();
+                    lines[lines.len().saturating_sub(300)..].join("\n")
+                })
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let sources = fr::Sources {
+            comment,
+            annotations,
+            log,
+        };
+        let Ok(mut read) = fr::read(&name, &sources) else {
+            // Nothing at all to read: said as such, and only then.
+            continue;
+        };
+        let base_failed = base_runs["check_runs"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|b| b["name"].as_str() == Some(name.as_str()))
+            .map(outcome_of)
+            .find(|o| matches!(o, Outcome::Passed | Outcome::Failed))
+            .map(|o| o == Outcome::Failed);
+        read.cause = fr::cause(&read, changed, base_failed);
+        out.push(read);
+    }
+    out
+}
+
 /// Reads where the preview of the pull request's head stands, starts what
 /// the repository's workflows need to run it, and records it. `pr` is the
 /// pull request as GitHub returns it. None when it couldn't be read.
@@ -255,7 +359,22 @@ pub async fn advance(
     }
     let prior = load(state, p.team_id, p.run_id).await;
     if let Some(st) = prior.as_ref().filter(|st| settled(st, &head)) {
-        return Some(st.clone());
+        // Settled, unless an end-to-end check failed since and its report
+        // hasn't been read.
+        let runs = gh
+            .list_check_runs_for_ref(p.owner, p.repo, &head)
+            .await
+            .unwrap_or_default();
+        let failing: Vec<String> = runs["check_runs"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|r| outcome_of(r) == Outcome::Failed)
+            .filter_map(|r| r["name"].as_str().map(str::to_string))
+            .collect();
+        if !unread_failure(st, &failing) {
+            return Some(st.clone());
+        }
     }
     let same_head = prior.as_ref().filter(|st| st.head == head);
     let changed: Vec<String> = gh
@@ -273,6 +392,15 @@ pub async fn advance(
             .unwrap_or_default(),
         ..Default::default()
     };
+    // The CI jobs that test the changed paths, for every change: "How to
+    // check" and Open items name these, never another folder's job.
+    let wfs = workflows(gh, p.owner, p.repo, &head).await;
+    st.ci_jobs = common::ci_cover::covering_jobs(&wfs, &changed, &base);
+    let runs = gh
+        .list_check_runs_for_ref(p.owner, p.repo, &head)
+        .await
+        .unwrap_or_default();
+    st.failures = read_failures(gh, p, &base, &runs, &changed).await;
     if !changed.iter().any(|c| pv::is_user_visible(c)) {
         st.why = "the change has no page a person sees".into();
         save(state, p, &st).await;
@@ -290,7 +418,6 @@ pub async fn advance(
         st.e2e_covered = *covered;
     }
     st.how_to_check = pv::how_to_check(&changed, suite.as_ref(), &pv::unit_cmd(&tree));
-    let wfs = workflows(gh, p.owner, p.repo, &head).await;
     let areas = map_areas(gh, p.owner, p.repo, &head, &tree, &changed).await;
     let repo_labels: Vec<String> = gh
         .list_repo_labels(p.owner, p.repo)
@@ -370,10 +497,6 @@ pub async fn advance(
                 .join(", ")
         ));
     }
-    let runs = gh
-        .list_check_runs_for_ref(p.owner, p.repo, &head)
-        .await
-        .unwrap_or_default();
     let (results, url) = covering_results(&runs, &plan.covers);
     st.checks = results;
     let triggered = !st.labels_added.is_empty() || draft;

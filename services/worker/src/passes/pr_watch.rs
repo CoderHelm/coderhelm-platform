@@ -950,7 +950,11 @@ pub async fn look(state: &WorkerState, github: &GitHubClient, c: &Candidate) -> 
         }
     };
     let mut seen = seen;
-    seen.preview_due = seen.open && preview_due(&c.preview, &seen.head, kept.is_none());
+    seen.preview_due = seen.open
+        && (preview_due(&c.preview, &seen.head, kept.is_none())
+            || common::preview::State::from_json(&c.preview).is_some_and(|st| {
+                st.head == seen.head && super::preview::unread_failure(&st, &seen.failing)
+            }));
     let mut act = resume_after_limit(&c.status, &seen, &c.marks, &c.limit_ended)
         .unwrap_or_else(|| decide_all(&c.status, &seen, &c.marks));
     let mut performed = Performed::NotStarted;

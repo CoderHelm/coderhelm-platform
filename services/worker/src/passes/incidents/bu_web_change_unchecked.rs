@@ -268,3 +268,72 @@ fn the_run_page_says_what_it_waits_on_in_one_line() {
         "Waiting on: an approving review from a person on #42 (this repo requires one before CoderHelm merges). Ready for review: checks passed, preview checked."
     );
 }
+
+/// The same review, a second pull request: its Open items told a reader to
+/// run `npm test` in an unrelated function's folder, and it said the e2e
+/// log couldn't be read while the e2e workflow's comment named the failing
+/// test. "How to check" and Open items come from the jobs that test the
+/// changed paths; a failure is said from its own report.
+#[test]
+fn open_items_name_the_job_that_covers_the_change_and_failures_are_read() {
+    use common::e2e::failure_read as fr;
+    use common::pr_facts::{Closer, OpenItem};
+    let jobs = common::ci_cover::covering_jobs(
+        &[(
+            "web.yml".to_string(),
+            "on:\n  pull_request:\n    paths: ['apps/web/**']\njobs:\n  unit:\n    name: Web unit tests\n    defaults:\n      run:\n        working-directory: apps/web\n    steps:\n      - run: npm test\n".to_string(),
+        )],
+        &changed(),
+        "main",
+    );
+    let mut failure = fr::read(
+        "E2E on preview",
+        &fr::Sources {
+            comment: "1 failed\n  1) [chromium] › tests/signup.spec.ts:9:3 › Signup › shows the age error\n    Error: expect(locator).toBeVisible() failed".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    failure.cause = fr::cause(&failure, &changed(), Some(false));
+    let st = pv::State {
+        head: "abc1234def".into(),
+        stage: Stage::Failed,
+        ci_jobs: jobs,
+        failures: vec![failure],
+        ..Default::default()
+    };
+    let mut f = facts(None);
+    f.open = vec![
+        OpenItem {
+            text: "Run `cd services/uploader-fn && npm test` before merge".into(),
+            closer: Closer::CoderHelm,
+        },
+        OpenItem {
+            text: "CoderHelm couldn't read the log of the E2E run".into(),
+            closer: Closer::CoderHelm,
+        },
+        OpenItem {
+            text: "Run `cd apps/web && npm test`".into(),
+            closer: Closer::CoderHelm,
+        },
+    ];
+    f.how_to_check = "`cd services/uploader-fn && npm test`".into();
+    crate::passes::description_facts::with_preview(&mut f, Some(&st));
+    let texts: Vec<&str> = f.open.iter().map(|o| o.text.as_str()).collect();
+    assert_eq!(texts, vec!["Run `cd apps/web && npm test`"]);
+    assert_eq!(f.how_to_check, "`cd apps/web && npm test`");
+    assert!(f
+        .evidence
+        .iter()
+        .any(|e| e.contains("`Web unit tests` in `apps/web` runs `npm test`")));
+    let read = f
+        .evidence
+        .iter()
+        .find(|e| e.starts_with("`E2E on preview` failed"))
+        .expect("the failure, read");
+    assert!(
+        read.contains("tests/signup.spec.ts › shows the age error"),
+        "{read}"
+    );
+    assert!(read.contains("This change caused it"), "{read}");
+}

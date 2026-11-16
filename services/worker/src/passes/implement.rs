@@ -700,6 +700,7 @@ pub async fn run(
         ),
     );
     tools.push(super::web_check::tool());
+    tools.push(super::web_check::probe_tool());
     full_system.push_str(&web.prompt_section());
     full_system.push_str(super::link_checks::CODER_NOTE);
     let ops = super::ops_tools::OpsTools::load(

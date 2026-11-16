@@ -891,6 +891,7 @@ Rules:
         format!("{}/{}#{}", msg.repo_owner, msg.repo_name, msg.pr_number),
     );
     tools.push(super::web_check::tool());
+    tools.push(super::web_check::probe_tool());
     full_system.push_str(&web.prompt_section());
     let ops = super::ops_tools::OpsTools::load(
         state,

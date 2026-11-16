@@ -676,6 +676,13 @@ pub struct State {
     pub draft_gated: Vec<String>,
     /// The commands that check the changed area ([`how_to_check`]).
     pub how_to_check: String,
+    /// The CI jobs that run on the changed paths (`crate::ci_cover`):
+    /// "How to check" and Open items name these, never another folder's.
+    pub ci_jobs: Vec<crate::ci_cover::CoveringJob>,
+    /// The failed end-to-end checks on the head, each as its own report
+    /// says (`crate::e2e::failure_read`), with whether this change caused
+    /// it.
+    pub failures: Vec<crate::e2e::failure_read::FailureRead>,
 }
 
 impl State {

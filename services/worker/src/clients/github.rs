@@ -4418,6 +4418,28 @@ impl GitHubClient {
 
     // ─── Check runs ─────────────────────────────────────────────
 
+    /// One check run's annotations, as (path, title, message).
+    pub async fn check_run_annotation_list(
+        &self,
+        owner: &str,
+        repo: &str,
+        check_run_id: u64,
+    ) -> Result<Vec<(String, String, String)>, Box<dyn std::error::Error + Send + Sync>> {
+        let v = self
+            .get(&format!(
+                "{API_BASE}/repos/{owner}/{repo}/check-runs/{check_run_id}/annotations?per_page=50"
+            ))
+            .await?;
+        Ok(v.as_array()
+            .into_iter()
+            .flatten()
+            .map(|a| {
+                let t = |k: &str| a[k].as_str().unwrap_or("").to_string();
+                (t("path"), t("title"), t("message"))
+            })
+            .collect())
+    }
+
     /// Download check run / action job logs.
     pub async fn get_check_run_logs(
         &self,

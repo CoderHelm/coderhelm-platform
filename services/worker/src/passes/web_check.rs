@@ -70,6 +70,37 @@ const SOURCE_NAME: &str = "Public page check";
 pub const SETTINGS_SK: &str = "REVIEW_CONFIG#GLOBAL";
 pub const SETTINGS_ATTR: &str = common::web_domains::ATTR;
 
+/// Probes a page before end-to-end code is written against it.
+pub const PROBE_TOOL: &str = "probe_page";
+
+/// The coder's probe of a page another company serves (a payment form, a
+/// sign-in widget), or of the preview: it loads the page with Playwright
+/// in the sandbox and returns its test ids and the field names of the JSON
+/// it fetches, as a record to commit (`common::e2e::probe`). Selectors and
+/// fields no probe observed are a must-fix finding of the review.
+pub fn probe_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: PROBE_TOOL.to_string(),
+        description: format!(
+            "Load a page in a real browser (Playwright, in the sandbox) and list what is really \
+             there: every test id (data-testid, data-test, data-cy, also inside frames) and the \
+             field names of the JSON responses it fetches. Use it BEFORE writing end-to-end \
+             selectors or reading JSON fields of a page another company serves (or a page on \
+             the preview), and build the spec only from what it found. Commit the record it \
+             returns at `{}`, and quote what it found in the pull request. Only hosts this run \
+             may check are allowed.",
+            common::e2e::probe::record_path("<host>")
+        ),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "url": { "type": "string", "description": "The https page to probe" }
+            },
+            "required": ["url"]
+        }),
+    }
+}
+
 pub fn tool() -> ToolDefinition {
     ToolDefinition {
         name: TOOL.to_string(),
@@ -996,6 +1027,13 @@ impl WebCheck {
         name: &str,
         input: &Value,
     ) -> Option<String> {
+        if name == PROBE_TOOL {
+            let gate = RepoGate {
+                web: self,
+                search: github,
+            };
+            return Some(self.probe(state, &gate, input).await);
+        }
         if name != TOOL {
             return None;
         }
@@ -1004,6 +1042,73 @@ impl WebCheck {
             search: github,
         };
         Some(self.run_urls(state, &gate, &Net, input).await)
+    }
+
+    /// Runs [`probe_tool`]: the page's host must be one this run may check.
+    async fn probe(&self, state: &WorkerState, gate: &dyn HostGate, input: &Value) -> String {
+        let url = input["url"].as_str().unwrap_or("").trim().to_string();
+        let (parsed, host) = match vet_url(&url) {
+            Ok(v) => v,
+            Err(CheckError::Refused(m)) | Err(CheckError::Failed(m)) => {
+                return format!("{url}: refused: {m}")
+            }
+        };
+        if !gate.allowed(&host).await {
+            return format!(
+                "{url}: refused: `{host}` isn't a host this run may load (name it in the work at hand, or it must be used in the team's repositories)"
+            );
+        }
+        let source = match super::skill_run::pack(&[(
+            "probe.mjs".to_string(),
+            common::e2e::probe::probe_script(parsed.as_str()),
+        )]) {
+            Ok(b) => b,
+            Err(e) => return format!("The probe couldn't be packed: {e}"),
+        };
+        let sandbox = crate::clients::sandbox::SandboxClient::new(
+            &state.codebuild,
+            &state.s3,
+            &state.logs,
+            &state.config.sandbox_bucket_name,
+            &state.config.sandbox_project_name,
+        )
+        .with_egress(crate::agent::policy::sandbox_egress(state, &self.team_id).await);
+        let mut hosts: Vec<String> = common::preview::CAPTURE_HOSTS
+            .iter()
+            .map(|h| h.to_string())
+            .collect();
+        hosts.push(host.clone());
+        let cmd = common::preview::capture_command().replace("capture.mjs", "probe.mjs");
+        let key = format!("probe-{}", uuid::Uuid::new_v4().simple());
+        let out = sandbox
+            .run_script(
+                crate::clients::sandbox::ScriptRun {
+                    key: &key,
+                    source,
+                    cmd: &cmd,
+                    secret: None,
+                    hosts,
+                },
+                None,
+            )
+            .await;
+        let record = match out {
+            Ok(o) => match o.files.iter().find(|(n, _)| n.ends_with("probe.json")) {
+                Some((_, body)) => body.clone(),
+                None => {
+                    return format!(
+                        "{url}: the probe gave no record ({})",
+                        common::truncate_str(o.output.lines().last().unwrap_or(""), 200)
+                    )
+                }
+            },
+            Err(e) => return format!("{url}: the sandbox couldn't run the probe ({e})"),
+        };
+        format!(
+            "Probe of {url}. Commit this record at `{}` and quote the test ids and fields you use in the pull request; write selectors and field reads only from it:\n{}",
+            common::e2e::probe::record_path(&host),
+            common::truncate_str(&record, 12_000)
+        )
     }
 
     async fn run_urls(

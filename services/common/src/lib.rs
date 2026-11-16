@@ -156,6 +156,7 @@ pub mod knowledge;
 // Reading the team's repositories for Chat (overview, files, search).
 pub mod repo_read;
 // The test that every model call site is a metered helper
+pub mod ci_cover;
 #[cfg(test)]
 mod model_call_sites;
 /// Which pull requests CoderHelm may push to, edit or close: its own.

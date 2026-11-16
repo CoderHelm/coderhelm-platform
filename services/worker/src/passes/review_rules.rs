@@ -69,6 +69,28 @@ pub fn e2e_finding(changed: &[String], tree: &[String]) -> Option<Finding> {
     })
 }
 
+/// The rule that end-to-end code against another company's page uses only
+/// what a probe of that page observed.
+pub const PROBE_RULE: &str = "end-to-end selectors and JSON fields on another company's page come from a probe of that page (`probe_page`)";
+
+/// The review's findings for end-to-end code that uses test ids or JSON
+/// fields of an outside page no probe observed (`common::e2e::probe`).
+pub fn probe_findings(gaps: &[common::e2e::probe::Unprobed]) -> Vec<Finding> {
+    gaps.iter()
+        .map(|g| Finding {
+            file: g.path.clone(),
+            severity: "blocking".into(),
+            category: "tests".into(),
+            title: format!("Selectors on `{}` that no probe observed", g.origin),
+            body: g.body(),
+            evidence: Some("verified-defect".into()),
+            caused_by_diff: Some(true),
+            required: Some(PROBE_RULE.to_string()),
+            ..Default::default()
+        })
+        .collect()
+}
+
 /// Why a required rule broken blocks.
 pub const REQUIRED_WHY: &str = "a rule this repository requires is broken";
 /// Why a failing check blocks.
@@ -629,6 +651,21 @@ pub fn settles(thread_body: &str, status: &str) -> bool {
 #[cfg(test)]
 mod e2e_rule_tests {
     use super::*;
+
+    #[test]
+    fn unobserved_outside_selectors_are_a_must_fix() {
+        let code =
+            "const url = 'https://pay.vendor.test/s';\nawait page.getByTestId('pay-now').click();";
+        let gaps = common::e2e::probe::unprobed(
+            &[("e2e/pages/pay.ts".into(), code.into(), code.into())],
+            &[],
+            &["web.example.org".into()],
+        );
+        let f = probe_findings(&gaps);
+        assert_eq!(f.len(), 1);
+        assert_eq!(mandatory(&f[0]), Some(REQUIRED_WHY));
+        assert!(f[0].body.contains("`pay-now`"));
+    }
 
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|x| x.to_string()).collect()
