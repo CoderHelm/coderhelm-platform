@@ -4075,6 +4075,7 @@ async fn run_passes(
             writes: Default::default(),
             outside_plan: Vec::new(),
             refused: Vec::new(),
+            owed: Vec::new(),
             // The first attempt's lookups weren't kept; the proof check's
             // fix round can make them again.
             evidence: proof::RunEvidence {

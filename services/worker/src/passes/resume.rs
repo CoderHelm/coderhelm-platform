@@ -3537,8 +3537,10 @@ pub async fn run(
                     super::own_review_ledger::Plan::Settle {
                         deferred,
                         by_ticket,
+                        noted,
                     } => {
-                        let lines = super::own_review_ledger::settled_lines(&deferred, &by_ticket);
+                        let lines =
+                            super::own_review_ledger::settled_lines(&deferred, &by_ticket, &noted);
                         finish_on_own_findings(
                             state,
                             &ticket_msg,
@@ -3557,13 +3559,20 @@ pub async fn run(
                         return Ok(());
                     }
                     super::own_review_ledger::Plan::Unfixed { why } => {
-                        // Never "completed" with its own review asking for
-                        // changes: the run ends with what is open, named.
-                        wait_for_review(
+                        // CoderHelm's own rounds took every approach they
+                        // have: its limit, never a person's to-do. What is
+                        // left is listed as its note and the pull request
+                        // goes ready for review.
+                        let lines =
+                            note_own_findings(state, &msg.team_id, &msg.run_id, &own_open, &why)
+                                .await;
+                        finish_on_own_findings(
                             state,
                             &ticket_msg,
+                            &github,
                             &msg.run_id,
-                            &why,
+                            &lines,
+                            "CoderHelm's notes, each with what its rounds left",
                             &pr_url,
                             pr_number,
                             &branch,
@@ -3725,19 +3734,25 @@ pub async fn run(
             mark_events_processed(state, &msg.run_id, &events).await;
             match end {
                 RoundEnd::Parked => return Ok(()),
+                // A review-fix round that used every step it had: what it
+                // landed and its account are the head's to review now, and
+                // the ledger takes the next round in a fresh step. Never a
+                // run that finishes on a round cut short.
                 RoundEnd::Incomplete => {
-                    complete_run_with_status(
+                    if set_run_awaiting_ci(
                         state,
                         &ctx.ticket_msg,
                         &msg.run_id,
-                        "completed",
                         &pr_url,
                         pr_number,
                         &branch,
                         &ctx.usage,
                         wall_clock_secs(created_at, &start),
                     )
-                    .await?;
+                    .await?
+                    {
+                        send_delayed_resume(state, &msg, 5).await;
+                    }
                     return Ok(());
                 }
                 RoundEnd::Done { files: 0 } if !own_open.is_empty() => {
@@ -4150,7 +4165,10 @@ async fn run_fix_round(
         branch: pr.branch,
     };
     match result {
-        Ok(r) if r.timed_out => {
+        Ok(mut r) if r.timed_out => {
+            // What this step was too short to start is owed: the next step
+            // of the round runs it first, with its full time.
+            round.feedback = super::implement::owed_first(&round.feedback, &r.owed);
             if round.may_continue() {
                 park_round(
                     state,
@@ -4165,12 +4183,33 @@ async fn run_fix_round(
                 .await
             } else {
                 if round.kind == run_round::Kind::ReviewFix {
+                    // Cut short, not blocked: the review of the head reads
+                    // what it did, and the ledger's next round starts in a
+                    // fresh step that runs what is owed first.
+                    if !r.owed.is_empty() {
+                        r.evidence.notes.push_str(&format!(
+                            "\n\nOwed (cut short by the step's time, to run first next): {}",
+                            r.owed
+                                .iter()
+                                .map(|c| format!("`{c}`"))
+                                .collect::<Vec<_>>()
+                                .join("; ")
+                        ));
+                    }
+                    record_own_round_note(
+                        state,
+                        &msg.team_id,
+                        &msg.run_id,
+                        &round.feedback,
+                        &r.evidence,
+                    )
+                    .await;
                     Box::pin(super::own_review_ledger::record_round_end(
                         state,
                         &msg.team_id,
                         &msg.run_id,
                         vec![super::own_review_ledger::Blocker::NoTime],
-                        "",
+                        r.evidence.latest_notes(),
                     ))
                     .await;
                 }
@@ -4589,6 +4628,31 @@ async fn run_pending_round(
                 state, msg, &mut ctx, &pr, &planned, end, &refused, created_at, start,
             )
             .await?;
+        }
+        return Ok(());
+    }
+    // A review-fix round that pushed nothing (it answered with proof or a
+    // check it ran) or used every step it had: no push starts a review, so
+    // the run goes back to its review of the same head, which reads the
+    // round's account and closes what it answered. It once marked the pull
+    // request ready and completed here, with the finding left open on a
+    // head nothing would review again.
+    if kind == run_round::Kind::ReviewFix
+        && matches!(end, RoundEnd::Incomplete | RoundEnd::Done { files: 0 })
+    {
+        if set_run_awaiting_ci(
+            state,
+            &ctx.ticket_msg,
+            &msg.run_id,
+            &pr_url,
+            pr_number,
+            &branch,
+            &ctx.usage,
+            wall_clock_secs(created_at, start),
+        )
+        .await?
+        {
+            send_delayed_resume(state, msg, 5).await;
         }
         return Ok(());
     }
@@ -5986,7 +6050,7 @@ async fn own_review_completion(
     msg: &TicketMessage,
     run_id: &str,
     pr_number: u64,
-    branch: &str,
+    _branch: &str,
 ) -> super::own_review_ledger::Completion {
     use super::own_review_ledger::{self as ledger, Completion};
     let Ok(github) = GitHubClient::new(
@@ -6022,43 +6086,77 @@ async fn own_review_completion(
         &head,
         &l,
     );
-    let Completion::Continue(why) = &said else {
-        return said;
+    let body = pr["body"].as_str().unwrap_or("");
+    let why = match &said {
+        Completion::Continue(why) => why.clone(),
+        // CoderHelm took every approach it has: what its review still asks
+        // for is listed as its note and the pull request goes ready for a
+        // person's review. Its own limit, never a person's to-do.
+        Completion::Defer(why) => {
+            let open: Vec<String> = {
+                let listed = super::own_review::listed(body);
+                if listed.is_empty() {
+                    l.findings
+                        .iter()
+                        .filter(|t| t.settled.is_none())
+                        .map(|t| t.item.clone())
+                        .collect()
+                } else {
+                    listed
+                }
+            };
+            let lines = note_own_findings(state, &msg.team_id, run_id, &open, why).await;
+            let now = super::own_review::defer_findings(
+                body,
+                &lines,
+                "CoderHelm's notes, each with what its rounds left",
+            );
+            if now != body {
+                if let Err(e) = crate::passes::description::save(
+                    &github,
+                    &msg.repo_owner,
+                    &msg.repo_name,
+                    pr_number,
+                    &now,
+                )
+                .await
+                {
+                    warn!(run_id, error = %e, "Could not list CoderHelm's notes on the pull request");
+                }
+            }
+            super::add_progress_note(
+                state,
+                &msg.team_id,
+                run_id,
+                &super::own_review::finish_reason(&lines, why),
+            )
+            .await;
+            mark_pr_ready(
+                state,
+                &msg.team_id,
+                &github,
+                &msg.repo_owner,
+                &msg.repo_name,
+                pr_number,
+            )
+            .await;
+            return Completion::Complete;
+        }
+        _ => return said,
     };
     l.continues += 1;
     ledger::save(state, &msg.team_id, run_id, &l).await;
-    let item = state
-        .dynamo
-        .get_item()
-        .table_name(&state.config.runs_table_name)
-        .key("team_id", attr_s(&msg.team_id))
-        .key("run_id", attr_s(run_id))
-        .consistent_read(true)
-        .send()
-        .await
-        .ok()
-        .and_then(|o| o.item)
-        .unwrap_or_default();
-    let Some((ticket, _)) = super::recheck::message_of(&item) else {
-        return Completion::Hold(format!("{why}, but the run's record lacks what that needs"));
-    };
-    let body = pr["body"].as_str().unwrap_or("");
-    match super::recheck_at_checks(
-        state,
-        &ticket,
-        run_id,
-        branch,
-        super::recheck::carry_of(body).as_ref(),
-        why,
-    )
-    .await
-    {
-        super::Handoff::Continued => {
-            info!(run_id, pr_number, %head, "Own review asks for changes on the head: the run goes on instead of completing");
-            said
-        }
-        super::Handoff::Stopped(reason) => Completion::Hold(format!("{why}; {reason}")),
+    // The run goes back to its review of the head: the review reads what
+    // the last round found and closes what it answered, or the ledger takes
+    // the next round. Rechecking the run's own checks never reviews the
+    // head, and a run once completed again on the same open finding.
+    if review_head_again(state, &msg.team_id, run_id, msg.installation_id, &why).await {
+        info!(run_id, pr_number, %head, "Own review asks for changes on the head: the run goes back to its review instead of completing");
+        return said;
     }
+    // The review couldn't be queued this moment: the pull request's watch
+    // and the ready sweep take it from here (`queue_own_review_round`).
+    Completion::Complete
 }
 
 /// Records the own-review progress on the run. Best-effort.
@@ -6165,14 +6263,18 @@ async fn record_own_round_note(
 /// (`ready::settle`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum OwnRound {
-    /// A review-fix round for them is queued or running on this head.
+    /// A review-fix round for them, or CoderHelm's review of the head
+    /// reading what the last round found, is queued or running.
     Fixing,
-    /// No round runs now (the run isn't finished, a round already ran on
-    /// this head, the record couldn't be read). Why, for the log.
-    Person(String),
+    /// Nothing is queued this moment for a reason that passes by itself (a
+    /// race with another decision, the record or the head not read, the run
+    /// still working): the next look takes them. Why, for the log. A wait,
+    /// never a person's to-do.
+    Later(String),
     /// Every finding left is settled with its own reason
-    /// (`own_review_ledger`): a person-gate reason, or the ticket's words.
-    /// The lines, each with its reason, are listed as deferred.
+    /// (`own_review_ledger`): a person-gate reason, the ticket's words, or
+    /// CoderHelm's note on what its own rounds left. The lines, each with
+    /// its reason, are listed as deferred and the pull request goes ready.
     Defer(Vec<String>),
 }
 
@@ -6232,8 +6334,120 @@ pub(crate) async fn run_finished(state: &WorkerState, team_id: &str, run_id: &st
     [COMPLETED, SUCCESS, NEEDS_INPUT].contains(&status.as_str())
 }
 
+/// CoderHelm's review reads the head again, for a run whose last word on
+/// its own findings no review has read: a fix round that answered with
+/// proof or a check and pushed nothing (the head didn't move, so no push
+/// starts a review), or a completion its own review still asks changes of.
+/// The run goes back to waiting on its CI and its review
+/// (`awaiting_ci`), and the resume reviews the head with the round's
+/// account in hand (`review_pr::review_for_run`). Never for a run a person
+/// ended or the run guard stopped. True when the review is on its way.
+pub(crate) async fn review_head_again(
+    state: &WorkerState,
+    team_id: &str,
+    run_id: &str,
+    installation_id: u64,
+    why: &str,
+) -> bool {
+    use common::run_status::AWAITING_CI;
+    if state.config.ci_fix_queue_url.is_empty() || run_id.is_empty() {
+        return false;
+    }
+    let status = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(team_id))
+        .key("run_id", attr_s(run_id))
+        .projection_expression("#s")
+        .expression_attribute_names("#s", "status")
+        .consistent_read(true)
+        .send()
+        .await
+        .ok()
+        .and_then(|o| o.item)
+        .and_then(|i| i.get("status").and_then(|v| v.as_s().ok()).cloned())
+        .unwrap_or_default();
+    if !may_review_again(&status) {
+        return false;
+    }
+    let claimed = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(team_id))
+        .key("run_id", attr_s(run_id))
+        .update_expression(
+            "SET #s = :aw, status_run_id = :sri, current_pass = :aw, updated_at = :t \
+             REMOVE waiting_on, wait_reminded_at",
+        )
+        .condition_expression("#s = :was AND attribute_not_exists(guard_open)")
+        .expression_attribute_names("#s", "status")
+        .expression_attribute_values(":aw", attr_s(AWAITING_CI))
+        .expression_attribute_values(":sri", attr_s(&format!("{AWAITING_CI}#{run_id}")))
+        .expression_attribute_values(":was", attr_s(&status))
+        .expression_attribute_values(":t", attr_s(&chrono::Utc::now().to_rfc3339()))
+        .send()
+        .await;
+    if let Err(e) = claimed {
+        if !format!("{e:?}").contains("ConditionalCheckFailed") {
+            warn!(run_id, error = %e, "Could not send the run back to its review");
+        }
+        return false;
+    }
+    let body = serde_json::json!({
+        "type": "resume",
+        "team_id": team_id,
+        "run_id": run_id,
+        "installation_id": installation_id,
+    });
+    let sent = state
+        .sqs
+        .send_message()
+        .queue_url(&state.config.ci_fix_queue_url)
+        .message_body(body.to_string())
+        .delay_seconds(5)
+        .send()
+        .await;
+    if let Err(e) = sent {
+        warn!(run_id, error = %e, "Could not queue the review of the head");
+        // Back as it was: the next look tries again.
+        let _ = state
+            .dynamo
+            .update_item()
+            .table_name(&state.config.runs_table_name)
+            .key("team_id", attr_s(team_id))
+            .key("run_id", attr_s(run_id))
+            .update_expression("SET #s = :was, status_run_id = :sri")
+            .condition_expression("#s = :aw")
+            .expression_attribute_names("#s", "status")
+            .expression_attribute_values(":was", attr_s(&status))
+            .expression_attribute_values(":sri", attr_s(&format!("{status}#{run_id}")))
+            .expression_attribute_values(":aw", attr_s(AWAITING_CI))
+            .send()
+            .await;
+        return false;
+    }
+    super::add_progress_note(
+        state,
+        team_id,
+        run_id,
+        &format!("{why}: CoderHelm's review reads the head again with what the round found."),
+    )
+    .await;
+    info!(run_id, why, "The run goes back to its review of the head");
+    true
+}
+
+/// Whether a run in `status` may be sent back to its review: finished,
+/// waiting on a person, or still working; never one a person ended.
+pub(crate) fn may_review_again(status: &str) -> bool {
+    use common::run_status::{COMPLETED, IN_FLIGHT, NEEDS_INPUT, SUCCESS};
+    [COMPLETED, SUCCESS, NEEDS_INPUT].contains(&status) || IN_FLIGHT.contains(&status)
+}
+
 /// On the run: the head a review-fix round was queued for after the run
-/// finished, so one is queued once per head.
+/// finished.
 pub(crate) const OWN_FIX_HEAD: &str = "own_fix_head";
 /// On the run: its rounds on its own review's findings stopped and a
 /// person has them; nothing queues another.
@@ -6243,6 +6457,30 @@ pub(crate) const OWN_REVIEW_HANDED: &str = "own_review_handed";
 /// `head`): queues one review-fix round for them while the run has rounds
 /// left, once per head, under the same budgets as the run's own rounds, and
 /// says whether one is on its way. Never promises a round nothing queued.
+/// CoderHelm's own rounds left `items` open (`why`): recorded on the
+/// ledger as its notes, so the review no longer lists them as holding the
+/// draft, and returned as the lines the pull request lists. Never a
+/// person's to-do.
+async fn note_own_findings(
+    state: &WorkerState,
+    team_id: &str,
+    run_id: &str,
+    items: &[String],
+    why: &str,
+) -> Vec<String> {
+    let mut l = super::own_review_ledger::load(state, team_id, run_id).await;
+    l.note(items, why);
+    super::own_review_ledger::save(state, team_id, run_id, &l).await;
+    super::own_review_ledger::note_lines(items, why)
+}
+
+fn n_of(item: &std::collections::HashMap<String, AttributeValue>, k: &str) -> u64 {
+    item.get(k)
+        .and_then(|v| v.as_n().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
 pub(crate) async fn queue_own_review_round(
     state: &WorkerState,
     github: &GitHubClient,
@@ -6251,8 +6489,13 @@ pub(crate) async fn queue_own_review_round(
     head: &str,
     items: &[String],
 ) -> OwnRound {
+    // Every way out that isn't a round: CoderHelm's own limit, listed on
+    // the pull request as its note, never held for a person.
+    let note = |why: String| async move {
+        OwnRound::Defer(note_own_findings(state, team_id, run_id, items, &why).await)
+    };
     if run_id.is_empty() || items.is_empty() {
-        return OwnRound::Person("no run or nothing listed".into());
+        return OwnRound::Later("no run or nothing listed".into());
     }
     let item = match state
         .dynamo
@@ -6267,7 +6510,7 @@ pub(crate) async fn queue_own_review_round(
         Ok(o) => o.item.unwrap_or_default(),
         Err(e) => {
             warn!(run_id, error = %e, "Could not read the run to fix its own review's findings");
-            return OwnRound::Person("the run couldn't be read".into());
+            return OwnRound::Later("the run couldn't be read".into());
         }
     };
     let status = item
@@ -6287,6 +6530,34 @@ pub(crate) async fn queue_own_review_round(
     // while a finding has an approach left, deferred only with a person-gate
     // reason or settled by the ticket, never ended by a count of rounds.
     let mut ledger = super::own_review_ledger::of_item(&item);
+    // The last round's account no review has read (it answered with proof,
+    // ran a check, or was cut short, and pushed nothing): the review of this
+    // same head reads it first. A finding answered with proof closes there.
+    if ledger.round_unread() {
+        // The run is working (its own loop reviews the head when it is
+        // done): nothing is sent from here.
+        if common::run_status::IN_FLIGHT.contains(&status.as_str()) {
+            return OwnRound::Later("the run is still working".into());
+        }
+        let installation_id = item
+            .get("installation_id")
+            .and_then(|v| v.as_n().ok())
+            .and_then(|n| n.parse::<u64>().ok())
+            .unwrap_or_else(|| github.installation_id());
+        return if review_head_again(
+            state,
+            team_id,
+            run_id,
+            installation_id,
+            "The last fix round on CoderHelm's review findings pushed nothing new",
+        )
+        .await
+        {
+            OwnRound::Fixing
+        } else {
+            OwnRound::Later("the review of the head couldn't be queued now".into())
+        };
+    }
     let ticket_text = super::own_review_ledger::ticket_text(state, team_id, &item).await;
     ledger.observe(items, &ticket_text);
     let spent = super::run_ceiling::load(state, team_id, run_id)
@@ -6304,40 +6575,52 @@ pub(crate) async fn queue_own_review_round(
         super::own_review_ledger::Plan::Settle {
             deferred,
             by_ticket,
+            noted,
         } => {
             super::own_review_ledger::save(state, team_id, run_id, &ledger).await;
             return OwnRound::Defer(super::own_review_ledger::settled_lines(
-                &deferred, &by_ticket,
+                &deferred, &by_ticket, &noted,
             ));
         }
         super::own_review_ledger::Plan::Unfixed { why } => {
             super::own_review_ledger::save(state, team_id, run_id, &ledger).await;
-            return OwnRound::Person(why);
+            return note(why).await;
         }
         super::own_review_ledger::Plan::Ready => {
-            return OwnRound::Person("nothing the review raised is open".into());
+            return OwnRound::Later("nothing the review raised is open".into());
         }
     };
     if let Err(why) = super::own_review::round_left(
         &super::own_review::RoundBudget {
-            // The ledger bounds the rounds, finding by finding.
+            // The ledger bounds the rounds, finding by finding, and the
+            // review of the head reads every round before the next one
+            // (`round_unread` above): a round on the same head after a
+            // proof-only answer is the ledger's call, not a once-per-head
+            // rule.
             rounds: 0,
             pushes: 0,
             cycles: 0,
             handed: false,
+            queued_head: String::new(),
             ..budget.clone()
         },
         head,
         super::MAX_AUTO_FIX_PUSHES,
         MAX_CI_FIX_CYCLES,
     ) {
-        return OwnRound::Person(why);
+        // The run guard stopped the run: CoderHelm's limit, listed as its
+        // note. Anything else (the head not read, the run still working)
+        // passes by itself.
+        if budget.guard_open {
+            return note(why).await;
+        }
+        return OwnRound::Later(why);
     }
     let Some((ticket, branch)) = super::recheck::message_of(&item) else {
-        return OwnRound::Person("the run's record lacks what a round needs".into());
+        return note("the run's record lacks what a fix round needs".into()).await;
     };
     if state.config.ci_fix_queue_url.is_empty() {
-        return OwnRound::Person("no queue to run the round on".into());
+        return note("no queue to run a fix round on".into()).await;
     }
     // Claim it: the run is working again, on this head, with one more round
     // taken. The same conditions as `round_left`, so two deciders can't both
@@ -6356,7 +6639,6 @@ pub(crate) async fn queue_own_review_round(
         )
         .condition_expression(
             "#s = :was AND attribute_not_exists(guard_open) AND attribute_not_exists(#hd) \
-             AND (attribute_not_exists(#fh) OR #fh <> :h) \
              AND (attribute_not_exists(own_review_rounds) OR own_review_rounds < :maxr) \
              AND (attribute_not_exists(auto_fix_pushes) OR auto_fix_pushes < :maxp)",
         )
@@ -6385,8 +6667,20 @@ pub(crate) async fn queue_own_review_round(
     if let Err(e) = claim {
         if !format!("{e:?}").contains("ConditionalCheckFailed") {
             warn!(run_id, error = %e, "Could not claim a fix round for the own review's findings");
+            return OwnRound::Later("the fix round couldn't be claimed now".into());
         }
-        return OwnRound::Person("another decision changed the run first".into());
+        // Its rounds ended (`own_review_handed`) or reached the ceiling:
+        // CoderHelm's limit, its note. Otherwise another decision changed
+        // the run first, and the next look sees what it did.
+        if item.contains_key(OWN_REVIEW_HANDED)
+            || n_of(&item, "own_review_rounds") >= u64::from(super::own_review_ledger::MAX_ROUNDS)
+        {
+            return note(
+                "CoderHelm's fix rounds on its own review's findings reached their ceiling".into(),
+            )
+            .await;
+        }
+        return OwnRound::Later("another decision changed the run first".into());
     }
     let give_back = |why: String| async move {
         let _ = state
@@ -6410,7 +6704,7 @@ pub(crate) async fn queue_own_review_round(
             .send()
             .await;
         warn!(run_id, why = %why, "The fix round for the own review's findings couldn't be queued");
-        OwnRound::Person(why)
+        OwnRound::Later(why)
     };
     if !super::claim_auto_fix_slot_upto(
         state,
@@ -6421,7 +6715,8 @@ pub(crate) async fn queue_own_review_round(
     )
     .await
     {
-        return give_back("the run's automatic fix budget is spent".into()).await;
+        let _ = give_back("the run's automatic fix budget is spent".into()).await;
+        return note("the run's automatic fix budget is spent".into()).await;
     }
     let base_sha =
         super::round::branch_head(github, &ticket.repo_owner, &ticket.repo_name, &branch).await;
@@ -7237,7 +7532,10 @@ async fn wait_on_person(
         // every approach it ends naming what its review still asks for.
         if pr_number > 0 {
             match Box::pin(own_review_completion(state, msg, run_id, pr_number, branch)).await {
-                super::own_review_ledger::Completion::Complete => {}
+                // Defer: CoderHelm's notes were listed and the pull request
+                // marked ready (`own_review_completion`); the run completes.
+                super::own_review_ledger::Completion::Complete
+                | super::own_review_ledger::Completion::Defer(_) => {}
                 super::own_review_ledger::Completion::Continue(_) => return Ok(()),
                 super::own_review_ledger::Completion::Hold(why) => {
                     let why = format!("{reason}\n{why}");
@@ -7597,7 +7895,8 @@ async fn complete_run_with_status(
     // the run goes on, or ends saying what is open (`wait_on_person`).
     if status == common::run_status::COMPLETED && pr_number > 0 {
         match Box::pin(own_review_completion(state, msg, run_id, pr_number, branch)).await {
-            super::own_review_ledger::Completion::Complete => {}
+            super::own_review_ledger::Completion::Complete
+            | super::own_review_ledger::Completion::Defer(_) => {}
             super::own_review_ledger::Completion::Continue(_) => return Ok(()),
             super::own_review_ledger::Completion::Hold(why) => {
                 return wait_for_review(

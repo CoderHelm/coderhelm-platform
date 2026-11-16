@@ -2874,8 +2874,26 @@ async fn run_once(
         Some(run_id) => Box::pin(ticket_context_for_pr(state, &msg.team_id, run_id)).await,
         None => String::new(),
     };
-    let extra_context =
-        format!("{graph_context}{ci_context}{quality_context}{plan_context}{ticket_context}");
+    // What the run's last fix round answered: a round that answered a
+    // finding with proof (a check run on this head) pushed nothing, and
+    // only this review of the same head can read it and close the finding.
+    let round_context = match &own_run {
+        Some(run_id) => {
+            let ledger =
+                Box::pin(super::own_review_ledger::load(state, &msg.team_id, run_id)).await;
+            round_answer_section(
+                ledger
+                    .last
+                    .as_ref()
+                    .filter(|l| l.ended)
+                    .map_or("", |l| l.account.as_str()),
+            )
+        }
+        None => String::new(),
+    };
+    let extra_context = format!(
+        "{graph_context}{ci_context}{quality_context}{plan_context}{ticket_context}{round_context}"
+    );
 
     // CoderHelm's own threads from earlier reviews, with the replies under them.
     // Still-open ones: the re-review reports each as fixed or answered (→ resolved
@@ -5157,22 +5175,29 @@ pub(crate) fn settle_own_findings(
                 format!(": {what}")
             }
         ),
-        Settled::Fixed => String::new(),
+        Settled::Fixed | Settled::Noted { .. } => String::new(),
     };
     let mut settled = Vec::new();
     for f in findings.iter_mut() {
         let line = super::own_review::thread_line(&f.file, f.line, &f.title);
         if let Some(s) = ledger.settled_item(&line) {
+            // CoderHelm's own note: listed on the ready pull request, still
+            // a finding of this review, never approved over.
+            if matches!(s, Settled::Noted { .. }) {
+                continue;
+            }
             super::review_policy::demote(f, &why(s));
             settled.push(line);
         }
     }
     own_open.retain(|o| {
-        let keep = ledger.settled_item(o).is_none();
-        if !keep && !settled.contains(o) {
+        let s = ledger.settled_item(o);
+        // A noted finding leaves the list that holds the draft, and keeps
+        // holding the merge (its thread stays open).
+        if s.is_some_and(|s| !matches!(s, Settled::Noted { .. })) && !settled.contains(o) {
             settled.push(o.clone());
         }
-        keep
+        s.is_none()
     });
     settled
 }
@@ -5196,6 +5221,27 @@ async fn ticket_context_for_pr(state: &WorkerState, team_id: &str, run_id: &str)
     };
     let text = super::own_review_ledger::ticket_text(state, team_id, &item).await;
     own_ticket_section(&text)
+}
+
+/// The reviewer's section for what the run's last fix round answered on
+/// the head: its own account, with the rule for judging proof. Empty when
+/// no round ended unread.
+pub(crate) fn round_answer_section(account: &str) -> String {
+    let account = account.trim();
+    if account.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n## What CoderHelm's last fix round answered on this head\nThe round below was asked \
+         to fix your earlier findings on this pull request. Where it answered a finding with \
+         proof rather than a code change (a check it ran on this head: the command, the commit \
+         and the result), judge that proof. A finding that asked for proof is fixed when the \
+         proof is of this head and shows the check passing: report it fixed and don't raise it \
+         again. A claim with no command or result is not proof. A check the round names as not \
+         confirmed is a finding only when the change rests on it; say exactly which check and \
+         why.\n\n{}\n",
+        common::truncate_str(account, 8_000)
+    )
 }
 
 /// The reviewer's section for the ticket of CoderHelm's own pull request.

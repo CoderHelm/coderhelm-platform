@@ -32,7 +32,16 @@
 //!   reaches), claimed by two honest rounds or by the round that exhausted
 //!   every approach;
 //! - a finding that survives every approach without such a reason is
-//!   [`Plan::Unfixed`]: the run says so and never reports itself finished.
+//!   [`Plan::Unfixed`]: CoderHelm's own limit, never a person's to-do. The
+//!   pull request is marked ready with it listed as a deferred note.
+//!
+//! A round cut short by its step's time ([`Blocker::NoTime`]) is neither a
+//! stall nor a block: the check it started is owed, and the next round
+//! starts in a fresh step with its full time and runs that check first
+//! ([`Track::cut_short`], up to [`MAX_CUT_SHORT`]). A security run once
+//! answered a proof-only finding with every check passing on the head but
+//! one runtime check the sandbox ran out of time for, and the finding was
+//! handed to a person as "still open".
 
 use serde::{Deserialize, Serialize};
 
@@ -48,6 +57,11 @@ pub const MAX_STALLED: u32 = 5;
 /// Rounds on one finding that a tool or a guard blocked, each followed by a
 /// round that removes the block.
 pub const MAX_BLOCKED: u32 = 3;
+/// Rounds on one finding cut short by their step's time, each followed by a
+/// round in a fresh step with its full time. Only a safety bound: a check
+/// cut short is resumed, and a round that keeps being cut short points at
+/// something else, which the pull request then lists as a note.
+pub const MAX_CUT_SHORT: u32 = 6;
 /// The most fix rounds a run takes on its own findings in all: every
 /// finding's bound, for the record's claim.
 pub const MAX_ROUNDS: u32 = 24;
@@ -72,7 +86,8 @@ pub enum Blocker {
     Scope,
     /// An edit was refused for another reason.
     Refused,
-    /// Checks were skipped, or the round stopped, for lack of time.
+    /// A check was cut short, or the round stopped, by its step's time:
+    /// never a block, the check is owed to a fresh step.
     NoTime,
     /// A tool call failed on its own input (an `edits` sent as a string).
     ToolInput,
@@ -83,7 +98,9 @@ impl Blocker {
         match self {
             Blocker::Scope => "an edit the fix needed was refused as outside the round's files",
             Blocker::Refused => "an edit the fix needed was refused",
-            Blocker::NoTime => "its checks were skipped because not enough time was left",
+            Blocker::NoTime => {
+                "a check it started was cut short by its step's time, before it finished"
+            }
             Blocker::ToolInput => "an edit failed on the tool's input shape",
         }
     }
@@ -113,7 +130,9 @@ pub fn blockers_of(
         if text.contains("outside the round's files") {
             add(Blocker::Scope);
         }
-        if text.contains("not run: not enough time left") {
+        if text.contains("not run: not enough time left")
+            || text.contains("not run yet: owed to the next step")
+        {
             add(Blocker::NoTime);
         }
         if text.contains("edit_file not applied") {
@@ -133,6 +152,12 @@ pub enum Settled {
     ByTicket { quote: String },
     /// A person-gate reason: only a person can do it.
     Deferred { reason: String, what: String },
+    /// CoderHelm's own rounds left it open after every approach they have
+    /// (`why`): listed on the pull request as CoderHelm's note, and the pull
+    /// request goes ready for review. Never a person's to-do, and never
+    /// approved over: CoderHelm's verdict on the head stays as it is, so
+    /// nothing merges on it.
+    Noted { why: String },
 }
 
 /// One finding of the run's own review and every round taken on it.
@@ -149,6 +174,10 @@ pub struct Track {
     /// Rounds a tool or a guard blocked.
     #[serde(default)]
     pub blocked: u32,
+    /// Rounds cut short by their step's time ([`Blocker::NoTime`]): neither
+    /// a stall nor a block, the next round resumes in a fresh step.
+    #[serde(default)]
+    pub cut_short: u32,
     /// What blocked the last round on it (empty when nothing did).
     #[serde(default)]
     pub last_blocked: Vec<Blocker>,
@@ -209,6 +238,8 @@ pub enum Plan {
     Settle {
         deferred: Vec<(String, String)>,
         by_ticket: Vec<(String, String)>,
+        /// CoderHelm's notes: item, and what its rounds left ([`Settled::Noted`]).
+        noted: Vec<(String, String)>,
     },
     /// Findings that survived every approach without a person-gate reason:
     /// the run is not finished and says so.
@@ -418,12 +449,19 @@ impl Ledger {
                 t.person_reason = code;
                 t.person_what = what;
             }
-            if l.blocked.is_empty() {
-                t.stalled += 1;
-                t.last_blocked.clear();
-            } else {
-                t.blocked += 1;
-                t.last_blocked = l.blocked.clone();
+            match round_ending(&l.blocked) {
+                RoundEnding::Honest => {
+                    t.stalled += 1;
+                    t.last_blocked.clear();
+                }
+                RoundEnding::CutShort => {
+                    t.cut_short += 1;
+                    t.last_blocked = vec![Blocker::NoTime];
+                }
+                RoundEnding::Blocked => {
+                    t.blocked += 1;
+                    t.last_blocked = l.blocked.clone();
+                }
             }
             // Two honest rounds that said the same person-gate reason.
             if t.person_claims >= 2 && t.last_blocked.is_empty() {
@@ -436,7 +474,15 @@ impl Ledger {
     }
 
     fn exhausted(t: &Track) -> bool {
-        t.stalled >= MAX_STALLED || t.blocked >= MAX_BLOCKED
+        t.stalled >= MAX_STALLED || t.blocked >= MAX_BLOCKED || t.cut_short >= MAX_CUT_SHORT
+    }
+
+    /// A round ended and no review has read it yet: its account (proof it
+    /// gave, a check it ran) is what the next review of the head judges.
+    /// A round that pushed nothing leaves the head where it was, so only a
+    /// review of that same head can read it.
+    pub fn round_unread(&self) -> bool {
+        self.last.as_ref().is_some_and(|l| l.ended)
     }
 
     /// What follows for the findings `open` now, by each one's own record.
@@ -458,8 +504,10 @@ impl Ledger {
         let settle = || {
             let mut deferred = Vec::new();
             let mut by_ticket = Vec::new();
+            let mut noted = Vec::new();
             for t in tracks.iter().copied() {
                 match &t.settled {
+                    Some(Settled::Noted { why }) => noted.push((t.item.clone(), why.clone())),
                     Some(Settled::ByTicket { quote }) => {
                         by_ticket.push((t.item.clone(), quote.clone()))
                     }
@@ -476,6 +524,7 @@ impl Ledger {
             Plan::Settle {
                 deferred,
                 by_ticket,
+                noted,
             }
         };
         if live.is_empty() {
@@ -504,8 +553,8 @@ impl Ledger {
                         count(not.len()),
                         not.iter()
                             .map(|t| format!(
-                                "{} rounds, {} blocked by tools or guards",
-                                t.attempts, t.blocked
+                                "{} rounds, {} blocked by tools or guards, {} cut short by time",
+                                t.attempts, t.blocked, t.cut_short
                             ))
                             .collect::<Vec<_>>()
                             .join("; "),
@@ -556,6 +605,29 @@ impl Ledger {
         }
     }
 
+    /// Records `items` as CoderHelm's notes ([`Settled::Noted`]): its own
+    /// rounds left them open for `why`. The pull request lists them and goes
+    /// ready; the review no longer holds the draft on them.
+    pub fn note(&mut self, items: &[String], why: &str) {
+        for item in items {
+            if self.find_mut(item).is_none() {
+                self.findings.push(Track {
+                    item: item.clone(),
+                    ..Default::default()
+                });
+            }
+            let t = self.find_mut(item).expect("tracked above");
+            if !matches!(
+                t.settled,
+                Some(Settled::ByTicket { .. } | Settled::Deferred { .. })
+            ) {
+                t.settled = Some(Settled::Noted {
+                    why: why.to_string(),
+                });
+            }
+        }
+    }
+
     /// Whether every finding still open on `open` is settled with a reason
     /// (a person-gate reason, or the ticket), so the review's verdict on the
     /// head must not hold on it.
@@ -568,6 +640,37 @@ impl Ledger {
                 Some(s) => Some(s),
             })
     }
+}
+
+/// How a round ended, from what it met.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RoundEnding {
+    /// Nothing blocked it: the model tried.
+    Honest,
+    /// Only its step's time cut it short: the check is owed, not blocked.
+    CutShort,
+    /// A tool or a guard blocked it.
+    Blocked,
+}
+
+fn round_ending(blocked: &[Blocker]) -> RoundEnding {
+    if blocked.is_empty() {
+        RoundEnding::Honest
+    } else if blocked.iter().all(|b| *b == Blocker::NoTime) {
+        RoundEnding::CutShort
+    } else {
+        RoundEnding::Blocked
+    }
+}
+
+/// The deferred note for findings CoderHelm's own rounds left open (`why`):
+/// listed on the pull request, which is marked ready. Never a person's
+/// to-do: it says what CoderHelm did and what is left.
+pub fn note_lines(items: &[String], why: &str) -> Vec<String> {
+    items
+        .iter()
+        .map(|i| format!("{i}: CoderHelm's note, left open after its own rounds ({why})"))
+        .collect()
 }
 
 fn deferred_words(code: &str, what: &str) -> String {
@@ -600,6 +703,13 @@ pub fn instruction(approach: &Approach, focus: &[String]) -> String {
     match approach {
         Approach::All => String::new(),
         Approach::Ladder(r) => super::supervisor::round_instruction(*r, &what),
+        Approach::Unblock(b) if b.iter().all(|x| *x == Blocker::NoTime) => format!(
+            "\n\n## This round's approach\nThe last round on {what} was cut short by its step's \
+             time before a check it started finished. That check is owed: this round starts in a \
+             fresh step with its full time. Run the check the last round's account names as not \
+             confirmed first, as its own `bash` call, then finish what is left. Write a result \
+             only from output you have here."
+        ),
         Approach::Unblock(b) => format!(
             "\n\n## This round's approach\nThe last round on {what} didn't fail on the code: {}. \
              This round removes that: it has no file boundary (edit the file the fix needs, and \
@@ -613,7 +723,11 @@ pub fn instruction(approach: &Approach, focus: &[String]) -> String {
 
 /// The deferred lines for the pull request: each item with its person-gate
 /// reason, and each item the ticket rules out with its words.
-pub fn settled_lines(deferred: &[(String, String)], by_ticket: &[(String, String)]) -> Vec<String> {
+pub fn settled_lines(
+    deferred: &[(String, String)],
+    by_ticket: &[(String, String)],
+    noted: &[(String, String)],
+) -> Vec<String> {
     deferred
         .iter()
         .map(|(i, why)| format!("{i}: needs a person ({why})"))
@@ -621,6 +735,11 @@ pub fn settled_lines(deferred: &[(String, String)], by_ticket: &[(String, String
             by_ticket
                 .iter()
                 .map(|(i, q)| format!("{i}: not done, the ticket rules it out (\"{q}\")")),
+        )
+        .chain(
+            noted
+                .iter()
+                .flat_map(|(i, why)| note_lines(std::slice::from_ref(i), why)),
         )
         .collect()
 }
@@ -634,8 +753,13 @@ pub enum Completion {
     /// Its review still asks for changes on the head: the run goes back to
     /// its checks and its review, not to "completed".
     Continue(String),
-    /// It asked for changes on the head after every approach: never
-    /// "completed"; the run ends with this, named.
+    /// It asked for changes on the head after every approach CoderHelm
+    /// has: CoderHelm's own limit, never a person's to-do. What is open is
+    /// listed on the pull request as a deferred note with this, and the
+    /// pull request is marked ready.
+    Defer(String),
+    /// A deferred finding has no reason only a person can give: never
+    /// "completed" on it.
     Hold(String),
 }
 
@@ -658,9 +782,18 @@ pub fn completion(verdict: Option<(&str, &str)>, head: &str, ledger: &Ledger) ->
     if !changes {
         return Completion::Complete;
     }
+    // What the review still asks for is CoderHelm's own notes, listed on the
+    // ready pull request: nothing more to do, and nothing approved over.
+    let noted = ledger
+        .findings
+        .iter()
+        .any(|t| matches!(t.settled, Some(Settled::Noted { .. })));
+    if noted && ledger.findings.iter().all(|t| t.settled.is_some()) {
+        return Completion::Complete;
+    }
     let short = head.get(..7).unwrap_or(head);
     if ledger.continues >= MAX_CONTINUES {
-        return Completion::Hold(format!(
+        return Completion::Defer(format!(
             "CoderHelm's review still asks for changes on `{short}` after the run went back to \
              its checks {} times",
             ledger.continues
@@ -671,7 +804,7 @@ pub fn completion(verdict: Option<(&str, &str)>, head: &str, ledger: &Ledger) ->
         .iter()
         .find(|t| t.settled.is_none() && Ledger::exhausted(t) && t.person_reason.is_empty())
     {
-        return Completion::Hold(format!(
+        return Completion::Defer(format!(
             "CoderHelm's review still asks for changes on `{short}` and every approach on this \
              finding was taken: {}",
             t.item
@@ -899,10 +1032,10 @@ mod tests {
             Plan::Unfixed { why } => assert!(why.contains("every approach"), "{why}"),
             other => panic!("{other:?}"),
         }
-        // Never "completed" with it: the guard holds.
+        // CoderHelm's own limit: listed as its note, never held for a person.
         assert!(matches!(
             completion(Some(("REQUEST_CHANGES", "abcdef1234")), "abcdef1234", &l),
-            Completion::Hold(_)
+            Completion::Defer(_)
         ));
     }
 
@@ -955,10 +1088,11 @@ mod tests {
             Plan::Settle {
                 deferred,
                 by_ticket,
+                noted,
             } => {
                 assert!(deferred.is_empty());
                 assert_eq!(by_ticket.len(), 1);
-                let lines = settled_lines(&deferred, &by_ticket);
+                let lines = settled_lines(&deferred, &by_ticket, &noted);
                 assert!(lines[0].contains("the ticket rules it out"), "{lines:?}");
             }
             other => panic!("{other:?}"),
@@ -1036,7 +1170,7 @@ mod tests {
         };
         assert!(matches!(
             completion(Some(("REQUEST_CHANGES", "h")), "h", &spent),
-            Completion::Hold(_)
+            Completion::Defer(_)
         ));
         let bad = Ledger {
             findings: vec![Track {

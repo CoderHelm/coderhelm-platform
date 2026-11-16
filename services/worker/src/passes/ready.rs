@@ -63,12 +63,14 @@
 //!   request once stayed a draft for days on "CoderHelm fixes them in its
 //!   review rounds" after its run had spent its fix budget: no round ever
 //!   ran. CoderHelm's own open review findings on a finished run's draft
-//!   queue one review-fix round, once per head, while the run has rounds
-//!   left (`resume::queue_own_review_round`), and the pull request waits for
-//!   it ("CoderHelm is fixing N findings from its review"); with no round
-//!   left, or once one ran on the head and the findings are still there, the
-//!   hold names what a person does. Every other hold says only what CoderHelm
-//!   does when something is queued to do it.
+//!   are CoderHelm's to finish (`resume::queue_own_review_round`): a round
+//!   no review has read yet sends the same head back to review, otherwise a
+//!   review-fix round is queued while the ledger has an approach left, and
+//!   the pull request waits for it ("CoderHelm is fixing N findings from its
+//!   review"). What is left after every approach is listed as CoderHelm's
+//!   note and the pull request goes ready; no CoderHelm limit holds it for a
+//!   person. Every other hold says only what CoderHelm does when something
+//!   is queued to do it.
 
 use std::collections::HashMap;
 
@@ -1152,8 +1154,12 @@ async fn fix_own_findings(ctx: &Ctx<'_>, run_id: &str, f: &mut Facts) {
     .await
     {
         super::resume::OwnRound::Fixing => f.own_fixing = true,
-        super::resume::OwnRound::Person(why) => {
-            info!(pr = ctx.pr, run_id, why = %why, "No fix round for the own review's findings now");
+        // Nothing queued this moment, for a reason that passes by itself:
+        // CoderHelm takes them on its next look, a wait and never a
+        // person's to-do.
+        super::resume::OwnRound::Later(why) => {
+            info!(pr = ctx.pr, run_id, why = %why, "No fix round for the own review's findings this moment; the next look takes them");
+            f.own_fixing = true;
         }
         super::resume::OwnRound::Defer(lines) => {
             // Every finding left is settled with its own reason (a

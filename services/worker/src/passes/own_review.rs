@@ -26,10 +26,11 @@
 //!   rounds at a cap once deferred a one-line config omission the tools had
 //!   blocked. The run's spend ceiling still bounds every loop.
 //! - A finished run's PR held on its findings never waits on a round
-//!   nothing queued. The ready decision queues one review-fix round for
-//!   them, once per head, while the run has rounds left ([`round_left`]),
-//!   and waits for it; when the run's rounds are over ([`rounds_over`]) the
-//!   findings are deferred the same way instead of held for a person.
+//!   nothing queued. A round that pushed nothing is read by a review of the
+//!   same head first; otherwise the ready decision queues a review-fix round
+//!   while the ledger has an approach left, and waits for it. What is left
+//!   is listed as CoderHelm's note and the PR goes ready, never held for a
+//!   person.
 //! - Each round is told what the rounds before it found and looked up
 //!   ([`round_note`], [`fix_feedback`]), so it doesn't repeat the same
 //!   database and live-data lookups from scratch.

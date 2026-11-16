@@ -144,6 +144,34 @@ pub struct ImplementResult {
     pub outside_plan: Vec<(String, String)>,
     /// Edits the round was refused and never made.
     pub refused: Vec<super::write_guard::Refusal>,
+    /// Commands (and `run_checks`) the coder asked for that this step had
+    /// too little time left to start: owed, never dropped. The pass then
+    /// counts as cut short, and the round continues in a fresh step that
+    /// runs them first ([`owed_first`]).
+    pub owed: Vec<String>,
+}
+
+/// The name an owed `run_checks` call carries in [`ImplementResult::owed`].
+pub const OWED_CHECKS: &str = "run_checks (the repository's checks)";
+const OWED_START: &str = "\n\n## Owed from the step before\n";
+
+/// A continuing round's instructions with the checks its last step was too
+/// short to start, to run first. Replaces an earlier such section, so a
+/// round continued twice carries the newest list once.
+pub fn owed_first(feedback: &str, owed: &[String]) -> String {
+    let base = feedback
+        .find(OWED_START)
+        .map_or(feedback, |i| &feedback[..i]);
+    if owed.is_empty() {
+        return base.to_string();
+    }
+    let list: Vec<String> = owed.iter().map(|c| format!("- `{c}`")).collect();
+    format!(
+        "{base}{OWED_START}The step before this one was too short to start these. Run each \
+         first, as its own call, with this step's full time, then go on. Write a result only \
+         from output you have here:\n{}",
+        list.join("\n")
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -800,6 +828,7 @@ pub async fn run(
             ci_steps,
             check_results: std::sync::Mutex::new(Vec::new()),
             sandbox_record: std::sync::Mutex::new(Default::default()),
+            owed: std::sync::Mutex::new(Vec::new()),
             last_checks_passed: std::sync::atomic::AtomicBool::new(true),
             codegen_cmd,
             codegen_env,
@@ -1192,7 +1221,12 @@ pub async fn run(
 
     // Cut short by the deadline: the loop's own marker, or the pass ended
     // inside the wrap-up window (the agent summarized what was left).
-    let timed_out = reached_deadline(&closing, deadline, std::time::Instant::now());
+    // A command or check this step was too short to start is owed: the pass
+    // is cut short and continues in a fresh step that runs it first, never
+    // a round that ends with the check unrun.
+    let owed = std::mem::take(&mut *executor.write_executor.owed.lock().unwrap());
+    let timed_out =
+        reached_deadline(&closing, deadline, std::time::Instant::now()) || !owed.is_empty();
     if closing == crate::agent::anthropic::TIMED_OUT_REPLY {
         closing.clear();
     }
@@ -1255,6 +1289,7 @@ pub async fn run(
         writes,
         outside_plan,
         refused,
+        owed,
         evidence: super::proof::RunEvidence {
             sources,
             lookups,
@@ -1917,6 +1952,8 @@ struct WriteToolExecutor<'a> {
     /// or why it gave no result: the proof check names the real reason a
     /// check didn't run.
     sandbox_record: std::sync::Mutex<super::proof::SandboxRecord>,
+    /// Commands the step had too little time to start ([`ImplementResult::owed`]).
+    owed: std::sync::Mutex<Vec<String>>,
     /// Verdict of the most recent run_checks (incl. tests). Starts true (nothing
     /// run yet ⇒ no red seen); set on every run_checks so the finish path can
     /// warn when the agent stops on a red result.
@@ -2774,6 +2811,14 @@ impl<'a> WriteToolExecutor<'a> {
         Some(check_now_text(left, build))
     }
 
+    /// A command this step was too short to start: owed to the next one.
+    fn owe(&self, command: &str) {
+        let mut owed = self.owed.lock().unwrap();
+        if !owed.iter().any(|c| c == command) {
+            owed.push(command.to_string());
+        }
+    }
+
     /// Should a hand-edit to `path` (whose current content is `existing`) be
     /// rejected and steered to run_codegen? True only when the repo HAS a codegen
     /// command, the file looks generated, AND this path hasn't already been
@@ -2984,10 +3029,14 @@ impl<'a> WriteToolExecutor<'a> {
             )));
         }
         if !sandbox.has_time(self.deadline) {
-            note(LogOutcome::soft_fail("not run: not enough time left"));
+            note(LogOutcome::soft_fail(
+                "not run yet: owed to the next step, which has its full time",
+            ));
+            self.owe(command);
             return Ok(json!(
-                "This step has too little time left for a sandbox build. Finish your changes; \
-                 CoderHelm runs the repository's checks before the run finishes."
+                "This step has too little time left to start that command. It is owed, not \
+                 dropped: this round continues in a fresh step with its full time and runs it \
+                 first. Save what you changed and stop now; don't write a result for it."
             ));
         }
         if let Some(gate) = &self.policy {
@@ -3097,11 +3146,13 @@ impl<'a> WriteToolExecutor<'a> {
         }
         if !sandbox.has_time(self.deadline) {
             note(LogOutcome::soft_fail(
-                "not run: not enough time left in this step; the checks run in the next step",
+                "not run yet: owed to the next step, which has its full time",
             ));
             // The check is owed, not dropped: the settle stage runs it in a
-            // step with a full window before the run finishes (`settle`).
+            // step with a full window before the run finishes (`settle`),
+            // and a fix round continues in a fresh step that runs it first.
             self.sandbox_record.lock().unwrap().refused_for_time = true;
+            self.owe(OWED_CHECKS);
             return Ok(json!(
                 "This step has too little time left for a sandbox build. Finish your changes \
                  now; CoderHelm runs the repository's checks on the branch in a fresh step \
@@ -3440,9 +3491,14 @@ impl<'a> WriteToolExecutor<'a> {
             )));
         }
         if !sandbox.has_time(self.deadline) {
-            note(LogOutcome::soft_fail("not run: not enough time left"));
+            note(LogOutcome::soft_fail(
+                "not run yet: owed to the next step, which has its full time",
+            ));
+            self.owe("run_codegen");
             return Ok(json!(
-                "Not enough time remains to run codegen; finalize your changes now."
+                "This step has too little time left to run codegen. It is owed, not dropped: \
+                 this round continues in a fresh step with its full time and runs it first. Save \
+                 what you changed and stop now."
             ));
         }
         let source = match self.sandbox_source(sandbox, run_id).await {
