@@ -31,7 +31,7 @@ It uses GitHub's [manifest flow](https://docs.github.com/en/apps/sharing-github-
 | Pull requests | write | Open and update pull requests; post reviews |
 | Issues | write | Read assigned issues; post progress |
 | Checks | write | Read CI results to fix failures; show the "CoderHelm review" check on a pull request's commit from the moment CoderHelm accepts anything on it (a push, a reply, a re-review, an edited description), saying what it is doing, until it ends, linking to the session page; a reply that is only answered leaves the commit showing the standing verdict |
-| Actions | read | Read workflow runs and logs |
+| Actions | write | Read workflow runs and logs; start a workflow a step needs (a deploy, an end-to-end run) with `workflow_dispatch`. Read is required; write is optional: without it CoderHelm adds the label that starts a workflow where the workflow has one, and otherwise the step waits |
 | Commit statuses | read | CI that reports statuses instead of checks |
 | Workflows | write | Change workflow files when a task asks for it |
 | Metadata | read | Repository list and details |
@@ -50,6 +50,8 @@ You can remove **Workflows: write** in the app's settings if CoderHelm should ne
 An app created before security fixes keeps working without **Dependabot alerts: read** and the `dependabot_alert` and `security_advisory` events. Setup checks warns about them, never fails: security fixes then read OSV and GitHub's advisories, and see Dependabot's alerts once you add the permission and the events on the app's Permissions and events page and accept them on each installation. Dismissing a finding in CoderHelm also dismisses its Dependabot alert only when the app has **Dependabot alerts: write**; with read it is recorded in CoderHelm only.
 
 With CoderHelm's hosted app (hybrid installs), each token asks only for the permissions your installation has granted: one added to the app later is left out until an owner accepts it on the installation, and a token never fails for it. Accepting it takes effect within an hour, when the next token is issued.
+
+An app created before CoderHelm asked for **Actions: write** keeps working with **Actions: read**. Setup checks warns about it once, on the install's setup page, never on a pull request: set Actions to write on the app's Permissions and events page and accept the new permission on each installation. Until then CoderHelm starts workflows through their labels where they have one (adding a label needs only pull request write).
 
 An app created before CoderHelm asked for **Checks: write** keeps working with **Checks: read**: reviews are posted as before, but pull requests don't show the "CoderHelm review" check. Setup checks warns about it until you set Checks to write on the app's Permissions and events page and accept the new permission on each installation.
 

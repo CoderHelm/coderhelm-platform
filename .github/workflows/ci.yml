@@ -58,21 +58,50 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+          # The merge commit and its first parent (the base it merged onto).
+          fetch-depth: 2
+      # Skip the steps below when nothing the Rust build reads changed (a pin
+      # bump in selfhost/versions.json): the job still reports, in seconds.
+      # The list and why: .github/scripts/rust_affected.py.
+      - name: Rust-affecting changes
+        id: changes
+        working-directory: .
+        run: |
+          if git rev-parse --verify -q HEAD^2 >/dev/null; then
+            run=$(git diff --name-only HEAD^1 HEAD | python3 .github/scripts/rust_affected.py)
+          else
+            run=true
+          fi
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+          echo "Rust steps run: $run"
+      - if: steps.changes.outputs.run == 'true'
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - if: steps.changes.outputs.run == 'true'
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: services
           cache-on-failure: true
-      - run: cargo fmt --check --all
+      - if: steps.changes.outputs.run == 'true'
+        run: cargo fmt --check --all
       # --all-targets: tests are linted too (a test-only lint once failed
       # only on a local --all-targets run).
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - if: steps.changes.outputs.run == 'true'
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
   rust-test:
     name: Rust (tests)
     runs-on: ubuntu-latest
+    # Five times since 13 November the runner stopped answering during the
+    # first cargo step and GitHub failed the job after 55 minutes as "lost
+    # communication": no test log, and every rerun passed. That step built
+    # the whole workspace with full debug info at four jobs, on a runner with
+    # 16 GB of memory (disk is not short: 87 GB free). With line tables the
+    # build peaks near 11 GB (the build step logs it each minute), builds in
+    # about a third of the time, and panics and backtraces keep file:line.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     defaults:
       run:
         working-directory: services
@@ -80,29 +109,74 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+          # The merge commit and its first parent (the base it merged onto).
+          fetch-depth: 2
+      # Skip the steps below when nothing the Rust build reads changed (a pin
+      # bump in selfhost/versions.json): the job still reports, in seconds.
+      # The list and why: .github/scripts/rust_affected.py.
+      - name: Rust-affecting changes
+        id: changes
+        working-directory: .
+        run: |
+          if git rev-parse --verify -q HEAD^2 >/dev/null; then
+            run=$(git diff --name-only HEAD^1 HEAD | python3 .github/scripts/rust_affected.py)
+          else
+            run=true
+          fi
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+          echo "Rust steps run: $run"
+      - if: steps.changes.outputs.run == 'true'
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - if: steps.changes.outputs.run == 'true'
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: services
           cache-on-failure: true
+      # Each test in its own process, ended and failed under its own name
+      # after two minutes (services/.config/nextest.toml).
+      - if: steps.changes.outputs.run == 'true'
+        uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2.89.0
+        with:
+          tool: cargo-nextest@0.9.151
+      # The build on its own step, with its own time limit. --workspace
+      # everywhere: one feature set, so one build (`-p worker` alone resolves
+      # features differently and compiles everything again).
+      # Disk and memory every minute while it builds, so a runner that runs
+      # out of either says so in the log.
+      - name: Build tests
+        if: steps.changes.outputs.run == 'true'
+        timeout-minutes: 30
+        run: |
+          usage() { echo "$(date -u +%T) disk free $(df -h --output=avail / | tail -1 | tr -d ' '), memory used $(free -m | awk '/^Mem/{print $3 " of " $2 " MB"}')"; }
+          usage
+          (while sleep 60; do usage; done) &
+          cargo test --workspace --no-run
+          usage
       # Every run failure that reached a person, replayed through the
       # pipeline's decision code with fakes only at the edges
       # (docs/incidents.md). Its own step, so a regression names itself.
-      # --workspace on both steps: one feature set, so one build (`-p worker`
-      # alone resolves features differently and compiles everything again).
       - name: Incident regressions
-        run: cargo test --workspace -- 'incidents::'
+        if: steps.changes.outputs.run == 'true'
+        timeout-minutes: 10
+        run: cargo nextest run --workspace --no-fail-fast -E 'test(/incidents::/)'
       # Stops, asks, blocks and loops replayed through the real decision
       # functions and graded on the decision, with the stop judge's recorded
       # answers k = 3 times each (pass^k; passes/replay/README.md). It gates
       # any prompt, model or effort change to a judgment step.
       - name: Replay suite
-        run: cargo test --workspace -- 'replay::'
+        if: steps.changes.outputs.run == 'true'
+        timeout-minutes: 10
+        run: cargo nextest run --workspace --no-fail-fast -E 'test(/replay::/)'
       # Includes the reviewer evals (worker passes::review_eval): recorded
       # review histories replayed through the real decision code, no model.
       # The incident and replay suites already ran above, on the same build.
+      # nextest runs no doc tests, so cargo test runs those.
       - name: Workspace tests
-        run: cargo test --workspace -- --skip 'incidents::' --skip 'replay::'
+        if: steps.changes.outputs.run == 'true'
+        timeout-minutes: 15
+        run: |
+          cargo nextest run --workspace --no-fail-fast -E 'not (test(/incidents::/) | test(/replay::/))'
+          cargo test --workspace --doc
 
   rust:
     name: Rust (workspace)

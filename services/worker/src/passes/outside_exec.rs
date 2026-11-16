@@ -1137,7 +1137,15 @@ async fn runs_step(
     } else {
         format!("{} was skipped", v.skipped.join(", "))
     };
-    match a.e2e.iter().find(|r| r.startable()).cloned() {
+    // A route its label starts first: adding a label needs only the pull
+    // request write the app has, never Actions: write.
+    match a
+        .e2e
+        .iter()
+        .filter(|r| r.startable())
+        .min_by_key(|r| !matches!(r.trigger, outside_work::Trigger::Label(_)))
+        .cloned()
+    {
         Some(r) => {
             let label = match &r.trigger {
                 outside_work::Trigger::Label(l) => Some(l.clone()),

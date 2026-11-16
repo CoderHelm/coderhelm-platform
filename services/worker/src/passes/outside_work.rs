@@ -1990,70 +1990,25 @@ pub fn note_markdown(c: &OutsideChange) -> String {
     out
 }
 
-/// The ticket's comment for the outside work, in the plain style: what
-/// CoderHelm did, what it does next, and the one thing needed from a person
-/// (if any). The full report (every step, its evidence) is on the run page
-/// and the pull request, never dumped into the ticket.
+/// The ticket's comment for the outside work: only what a person must do,
+/// one line each (who, what, why), or nothing when nobody has to act. What
+/// CoderHelm did and does next is status for nobody: it stays on the run
+/// page and in the pull request description, never pasted into a comment
+/// ("Done outside the code: ...", "CoderHelm does the other N steps").
 pub fn ticket_note(c: &OutsideChange) -> String {
     let steps = steps_now(c, c.placed.is_some());
-    let done: Vec<String> = steps
-        .iter()
-        .filter(|s| matches!(s.state, State::Done { .. }))
-        .map(|s| short(&s.what))
-        .collect();
     let needed = pr_steps::needed(&steps);
-    let approvals: Vec<&Step> = steps
-        .iter()
-        .filter(|s| matches!(s.state, State::Approval { .. }))
-        .collect();
-    let next = steps
-        .iter()
-        .filter(|s| {
-            matches!(s.state, State::Waiting { .. } | State::Failed { .. }) && !s.needs_person()
-        })
-        .count();
-    let mut out = String::new();
-    if !done.is_empty() {
-        out.push_str(&format!("Done outside the code: {}.\n", done.join("; ")));
-    }
-    if next > 0 || !approvals.is_empty() {
-        out.push_str(&format!(
-            "CoderHelm does the other {} step(s) itself{}.\n",
-            next,
-            if approvals.is_empty() {
-                String::new()
-            } else {
-                "; the production release waits for one approval after the merge".to_string()
-            }
-        ));
-    }
-    // An approval the release waits on is one of these, said once.
-    let asks = needed;
-    match asks.len() {
-        0 => out.push_str(&format!(
-            "**Needed from you:** {}\n",
-            pr_steps::NOTHING_NEEDED
-        )),
-        1 => out.push_str(&format!("**Needed from you:** {}\n", asks[0])),
+    match needed.len() {
+        0 => String::new(),
+        1 => format!("**Needed from you:** {}\n", needed[0]),
         _ => {
-            out.push_str("**Needed from you:**\n");
-            for (i, a) in asks.iter().enumerate() {
-                out.push_str(&format!("{}. {a}\n", i + 1));
+            let mut out = String::from("**Needed from you:**\n");
+            for a in &needed {
+                out.push_str(&format!("- {a}\n"));
             }
+            out
         }
     }
-    out
-}
-
-fn sentence(s: &str) -> String {
-    one_line(s).trim_end_matches(['.', ';']).to_string()
-}
-
-fn short(s: &str) -> String {
-    let t = sentence(s);
-    let t = t.split(" (").next().unwrap_or(&t).to_string();
-    let t = t.split(", then").next().unwrap_or(&t).to_string();
-    common::truncate_str(&t, 90).to_string()
 }
 
 // ── Requirements a person holds, for the plan check ─────────────────────────
