@@ -428,7 +428,7 @@ const REASONS: &[Reason] = &[
     Reason { code: "relay_turned_off", message: "Email is set to go through CoderHelm, but the install's config turned hybrid off.", fix: "Switch Settings, Emails back to Amazon SES, or remove hybridUrl: null from the config." },
     Reason { code: "recipient_not_listed", message: "CoderHelm's mail relay only emails this install's people and pending invites.", fix: "Invite the person from the team page; the relay learns invites as they are sent." },
     Reason { code: "recipient_suppressed", message: "This address bounced or marked an earlier email as spam, so CoderHelm's relay sends nothing more to it.", fix: "Check the address on the team page. Ask CoderHelm support to clear it once it works again." },
-    Reason { code: "inviter_not_admin", message: "Only an install admin can add people to the relay's list.", fix: "Send the invite as an install admin." },
+    Reason { code: "inviter_not_admin", message: "Only an install admin can add people to the relay's list.", fix: "The install lists its admins with CoderHelm and tries once more by itself. If this stays, check that the person sending has the admin role on the team page." },
     Reason { code: "too_many_new_recipients", message: "The install added more new addresses today than the relay allows.", fix: "Wait until tomorrow (UTC), or send through the install's own Amazon SES." },
     Reason { code: "email_rate_limited", message: "Too many emails through CoderHelm this minute.", fix: "Usually passes on its own; the next email goes out." },
     Reason { code: "email_quota_reached", message: "The install reached today's email quota through CoderHelm.", fix: "Wait until tomorrow (UTC), or send through the install's own Amazon SES." },
