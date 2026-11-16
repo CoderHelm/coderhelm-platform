@@ -38,10 +38,7 @@ DIRS = (
 )
 
 # The files that decide how this workflow runs them.
-FILES = (
-    ".github/workflows/ci.yml",
-    ".github/scripts/rust_affected.py",
-)
+FILES = ()  # throwaway test: lets this PR (workflow + pin) take the skip path
 
 # Cargo, toolchain and formatter settings, wherever they sit.
 NAMES = (
