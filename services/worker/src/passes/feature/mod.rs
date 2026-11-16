@@ -399,6 +399,12 @@ async fn data_facts(
 ) -> data_rules::Facts {
     let (owner, repo, base) = (&w.msg.repo_owner, &w.msg.repo_name, &w.msg.base_branch);
     let mut facts = data_rules::Facts::from_diff(files);
+    // A skip follows the surrounding code unless the ticket asks for
+    // reporting (`minimal_change`).
+    facts.quiet_skips = !crate::passes::minimal_change::ticket_asks(
+        &format!("{}\n{}", w.msg.title, w.msg.body),
+        crate::passes::minimal_change::REPORT_ASKS,
+    );
     let mut cols: Vec<String> = Vec::new();
     for c in facts.writes.iter().map(|x| x.column.clone()) {
         if !cols.contains(&c) {

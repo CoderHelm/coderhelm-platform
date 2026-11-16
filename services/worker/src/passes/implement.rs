@@ -499,6 +499,21 @@ pub async fn run(
         all_tools()
     };
 
+    // The build searches before its first write and names what it reuses;
+    // every round explains a new structure beside an existing one
+    // (`explore_guard`).
+    let explore = if round_for == super::write_guard::RoundFor::Build {
+        super::explore_guard::ExploreGuard::for_build()
+    } else {
+        super::explore_guard::ExploreGuard::for_fix()
+    };
+    for t in tools
+        .iter_mut()
+        .filter(|t| matches!(t.name.as_str(), "write_file" | "edit_file" | "batch_write"))
+    {
+        super::explore_guard::offer_fields(&mut t.input_schema);
+    }
+
     // A bounded round's write tools take the reason for an edit outside
     // its files.
     if scope_guard.bounded() {
@@ -837,6 +852,7 @@ pub async fn run(
             codegen_cmd,
             codegen_env,
             scope_guard,
+            explore,
             run_id: run_id.map(|s| s.to_string()),
             node_version,
             terraform_version,
@@ -1286,6 +1302,12 @@ pub async fn run(
         lines if lines.is_empty() => closing.trim().to_string(),
         lines => format!("{}\n{lines}", closing.trim()),
     };
+    // What the build reused, and each structure it kept beside an existing
+    // one with why (the habits check reads these lines).
+    let notes = match executor.write_executor.explore.evidence_lines() {
+        lines if lines.is_empty() => notes,
+        lines => format!("{notes}\n{}", lines.trim_end()),
+    };
     Ok(ImplementResult {
         files_modified: files,
         timed_out,
@@ -1380,10 +1402,11 @@ pub(super) fn task_prompt(p: &TaskPrompt) -> String {
 {design}{continuation}{openspec}{files_hint}{feedback}{issue}
 
 ## Instructions — SIMPLE CHANGE
-Go DIRECTLY to the target files listed in the OpenSpec.
-- Use `read_file_lines` on the exact section, make the change with `edit_file`, done.
+Go to the target files listed in the OpenSpec.
+- `search_code` once for the structure the change extends (the map, helper or query the plan names under Reuse), read that section, make the change with `edit_file`, done.
 - Use `edit_file` for modifying existing files (search/replace). Only use `write_file` for new files.
-- You should need 2-5 tool calls total, plus any lookups the rules below call for.
+- You should need 3-6 tool calls total, plus any lookups the rules below call for.
+{smallest}
 - Only implement the listed tasks. Do not add extras.
 - Write each file as soon as its change is done; never hold finished changes back for one write at the end.
 - NEVER leave placeholder text like TODO, FIXME, REPLACE_ME, or stub implementations. Every line you write must be complete, working code.
@@ -1402,6 +1425,7 @@ Go DIRECTLY to the target files listed in the OpenSpec.
             evidence_output = super::proof::EVIDENCE_OUTPUT,
             proof_rules = super::proof::CODER_RULES,
             data_rules = super::feature::data_rules::CODER_RULES,
+            smallest = SMALLEST_CHANGE_RULES,
         )
     } else {
         format!(
@@ -1422,6 +1446,7 @@ Go DIRECTLY to the target files listed in the OpenSpec.
 - {commit}
 - {evidence_output}
 - Only implement the listed tasks. Do not add extras.
+{smallest}
 {proof_rules}{data_rules}{schema_rules}"#,
             number = p.number,
             title = p.title,
@@ -1435,9 +1460,17 @@ Go DIRECTLY to the target files listed in the OpenSpec.
             proof_rules = super::proof::CODER_RULES,
             data_rules = super::feature::data_rules::CODER_RULES,
             schema_rules = SCHEMA_CHANGE_RULES,
+            smallest = SMALLEST_CHANGE_RULES,
         )
     }
 }
+
+/// The smallest change, as the coder's loop and the habits check hold it
+/// (`explore_guard`, `minimal_change`).
+pub(crate) const SMALLEST_CHANGE_RULES: &str = "- The smallest change that does the ticket: before the first write, `search_code` for the structure you would add and pass `reuses` naming what you extend. Add entries to the existing map, a parameter to the existing helper, a key to the existing config; never a second one beside it.
+- Never widen behaviour past the ticket: an insert-only path stays insert-only (no `DELETE`, no `ON CONFLICT DO UPDATE`, no replacing sync), log levels and shared logging stay as they are, and no counters or reports the ticket doesn't ask for.
+- Tests sized to the change: the new behaviour and that nothing else changed, through the real entry point. Never invent another system's payload, page or test ids: probe it (`probe_page`) or reuse an existing fixture. Run the tests and quote their output in your Evidence.
+- When an acceptance criterion and an outside system disagree, change the product so the criterion holds; never change the test to expect the outside behaviour without the measured reason.";
 
 /// What a change to a table's schema, constraints, ids or stored data must
 /// do before it is written. Each rule is a way such a change shipped broken.
@@ -1970,6 +2003,8 @@ struct WriteToolExecutor<'a> {
     /// Which existing files the round may edit, by what it is for
     /// (`write_guard`). No boundary on the build and a person's ask.
     scope_guard: super::write_guard::ScopeGuard,
+    /// Search before the first write; no twin beside an existing structure.
+    explore: super::explore_guard::ExploreGuard,
     /// Node major version to switch the sandbox to (None -> buildspec default).
     node_version: Option<String>,
     /// Exact Terraform version the sandbox installs (None when the repo has
@@ -2018,8 +2053,17 @@ impl<'a> ToolExecutor for WriteToolExecutor<'a> {
         name: &str,
         input: &serde_json::Value,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        self.explore.saw(name, input);
         if name == "bash" {
             return Box::pin(self.bash(input)).await;
+        }
+        if matches!(name, "write_file" | "edit_file" | "batch_write") {
+            if let Err(refusal) = self.explore.check_first_write(input) {
+                note(LogOutcome::soft_fail(
+                    "not written: search and name what it reuses first",
+                ));
+                return Ok(json!(refusal));
+            }
         }
         let out = self.execute_tool(name, input).await;
         let out = match out {
@@ -2315,6 +2359,12 @@ impl<'a> WriteToolExecutor<'a> {
                         )));
                         return Ok(json!(refusal));
                     }
+                    if let Err(refusal) = self.explore.check_edit(path, old, content, input) {
+                        note(LogOutcome::soft_fail(
+                            "not written: a twin of an existing structure",
+                        ));
+                        return Ok(json!(refusal));
+                    }
                     if let Some(problem) = validate_edit_safety(old, content, path) {
                         note(LogOutcome::soft_fail("rejected: it would gut the file"));
                         return Ok(json!(format!(
@@ -2447,6 +2497,16 @@ impl<'a> WriteToolExecutor<'a> {
                         "Edit REJECTED for {path} — it would break the file's syntax: {problem}. \
                          Read the file again and retry with a corrected edit."
                     )));
+                }
+                // A new map or helper beside an existing equivalent.
+                if let Err(refusal) =
+                    self.explore
+                        .check_edit(path, &original_content, &content, input)
+                {
+                    note(LogOutcome::soft_fail(
+                        "not edited: a twin of an existing structure",
+                    ));
+                    return Ok(json!(refusal));
                 }
                 // Deletion guardrail: reject edits that gut the file
                 if let Some(problem) = validate_edit_safety(&original_content, &content, path) {

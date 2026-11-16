@@ -91,6 +91,57 @@ pub fn probe_findings(gaps: &[common::e2e::probe::Unprobed]) -> Vec<Finding> {
         .collect()
 }
 
+/// The rule every change is held to: it does what its ticket asks and no
+/// more (`minimal_change`).
+pub const SMALLEST_RULE: &str = "the change does what the ticket asks and no more: no deletes or overwrites where the code only added, no test payload nobody observed, no test changed to match another company's page against an acceptance criterion";
+
+/// The review's findings for a change wider than its ticket. Deleting or
+/// overwriting where the base only added, and a payload nobody observed,
+/// block by rule; the rest block as verified defects the fix round makes
+/// smaller.
+pub fn wider_findings(found: &[super::minimal_change::Widening]) -> Vec<Finding> {
+    use super::minimal_change::Kind;
+    found
+        .iter()
+        .map(|w| Finding {
+            file: w.path.clone(),
+            severity: "blocking".into(),
+            category: match w.kind {
+                Kind::TestSize | Kind::InventedPayload => "tests",
+                Kind::Replacing => "data",
+                _ => "scope",
+            }
+            .into(),
+            title: w.point().to_string(),
+            body: w.instruction(),
+            evidence: Some("verified-defect".into()),
+            caused_by_diff: Some(true),
+            required: (!w.excusable()).then(|| SMALLEST_RULE.to_string()),
+            ..Default::default()
+        })
+        .collect()
+}
+
+/// The review's findings for test assertions changed to match another
+/// company's page while an acceptance criterion says otherwise: the
+/// product changes first.
+pub fn vendor_flip_findings(flips: &[super::minimal_change::VendorFlip]) -> Vec<Finding> {
+    flips
+        .iter()
+        .map(|f| Finding {
+            file: f.path.clone(),
+            severity: "blocking".into(),
+            category: "tests".into(),
+            title: "A test changed to the outside page's behaviour against a criterion".into(),
+            body: f.body(),
+            evidence: Some("verified-defect".into()),
+            caused_by_diff: Some(true),
+            required: Some(SMALLEST_RULE.to_string()),
+            ..Default::default()
+        })
+        .collect()
+}
+
 /// Why a required rule broken blocks.
 pub const REQUIRED_WHY: &str = "a rule this repository requires is broken";
 /// Why a failing check blocks.
@@ -625,6 +676,9 @@ pub fn mandatory_label(f: &Finding) -> Option<String> {
         REQUIRED_WHY if f.required.as_deref() == Some(E2E_RULE) => {
             "Blocking (required: end-to-end test)".to_string()
         }
+        REQUIRED_WHY if f.required.as_deref() == Some(SMALLEST_RULE) => {
+            "Blocking (required: the ticket's scope)".to_string()
+        }
         REQUIRED_WHY => "Blocking (required rule)".to_string(),
         FAILING_CHECK_WHY => "Blocking (failing check)".to_string(),
         MAIN_PATH_WHY if f.evidence() == super::review_agent::Evidence::VerifiedDefect => {
@@ -651,6 +705,38 @@ pub fn settles(thread_body: &str, status: &str) -> bool {
 #[cfg(test)]
 mod e2e_rule_tests {
     use super::*;
+
+    #[test]
+    fn wider_than_the_ticket_and_vendor_flips_are_findings() {
+        use crate::passes::minimal_change::{Kind, VendorFlip, Widening};
+        let f = wider_findings(&[
+            Widening {
+                kind: Kind::Replacing,
+                path: "dags/sync.py".into(),
+                what: "`DELETE FROM`".into(),
+            },
+            Widening {
+                kind: Kind::Parallel,
+                path: "dags/camps.py".into(),
+                what: "`A_MAP` next to the existing `B_MAP`".into(),
+            },
+        ]);
+        assert_eq!(mandatory(&f[0]), Some(REQUIRED_WHY));
+        assert_eq!(
+            mandatory_label(&f[0]).as_deref(),
+            Some("Blocking (required: the ticket's scope)")
+        );
+        assert!(f[1].required.is_none());
+        assert_eq!(f[1].severity, "blocking");
+        let v = vendor_flip_findings(&[VendorFlip {
+            path: "e2e/portal.spec.ts".into(),
+            removed: "expect(x).toBe(false)".into(),
+            added: "expect(x).toBe(true)".into(),
+            criterion: "No double scrollbars on desktop".into(),
+        }]);
+        assert_eq!(mandatory(&v[0]), Some(REQUIRED_WHY));
+        assert!(v[0].body.contains("No double scrollbars"));
+    }
 
     #[test]
     fn unobserved_outside_selectors_are_a_must_fix() {

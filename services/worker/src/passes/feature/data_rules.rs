@@ -59,10 +59,11 @@ find any other path that makes the same choice (full and incremental, batch and 
 and live) and name it with its ordering key under `### Same selection elsewhere` (or what you \
 searched when none exists). Both paths use the identical ordering key, tie-breaks and null \
 handling included; plan a test with ties and nulls in both modes.\n\
-- Unexpected data: records without the expected shape are collected and reported in ONE warning \
-per run naming their ids (deduplicated, capped), with counts in the run's summary; never a log \
-line per row and never a silent skip. Expected exclusions are counted, not warned. Where the \
-repository or the team's instructions already set a format, follow it.\n\
+- Unexpected data: a record the change skips is handled the way the surrounding code already \
+handles a skipped record. Plan new reporting (ONE warning per run naming the ids, counts in the \
+run's summary) only when the ticket asks for it; never a log line per row, never a change to \
+existing log levels. Where the repository or the team's instructions already set a format, \
+follow it.\n\
 - Real data: when the change affects stored data and a read-only data source is connected, plan \
 to read the records the ticket names and the edge cases the change touches (ties, nulls, missing \
 records) before and after, for the pull request's Verification section.\n";
@@ -72,7 +73,7 @@ pub const CODER_RULES: &str = "
 ## Changes to stored data (every change that reads or writes it)
 - Cursor columns: when you change how a timestamp, sequence or version column is written (set it conditionally, stop advancing it, move it back), first search for every reader of that column: SQL `MAX(col)`, `GREATEST(... col ...)`, `WHERE col >`, `ORDER BY col`, and code that compares it. List them in your notes. Keep the column advancing (`GREATEST(existing, new)`), even when another column must stay stable, and add a test proving it still advances.
 - Same selection everywhere: when code picks a winner, latest or first among rows and another path makes the same choice (full and incremental sync, batch and stream, backfill and live), use the identical ordering key in both, tie-breaks and null handling included (a shared function where you can). Add a test with ties and nulls that both modes pass.
-- Unexpected data: collect records that don't have the expected shape and report them in ONE warning per run naming their ids (deduplicated, capped), with counts in the run's summary. Never a log line per row, never a silent `continue`. Expected exclusions (filtered-out categories) are counted, not warned. Follow the repository's or team's format when one is set.
+- Unexpected data: a record your change skips is handled the way the surrounding code already handles a skipped record. Add reporting (ONE warning per run naming the ids, counts in the run's summary) only when the ticket asks for it. Never a log line per row, and never change an existing log level. Follow the repository's or team's format when one is set.
 ";
 
 /// A code or SQL file whose lines count.
@@ -939,6 +940,11 @@ pub struct Facts {
     pub others: Vec<Selection>,
     pub skips: Vec<Skip>,
     pub reports_once: bool,
+    /// The ticket asks for no reporting: a skip follows the surrounding
+    /// code's own handling, and only a log line per row is a problem (a
+    /// change once grew counters, a warning and a log level change in
+    /// shared code for a four-entry fix, to settle this item).
+    pub quiet_skips: bool,
     /// The test text the diff adds ([`tests_added`]).
     pub tests: String,
 }
@@ -1104,7 +1110,7 @@ pub fn items(f: &Facts, text: &str) -> Vec<Item> {
             .filter(|s| !s.counted)
             .map(|s| format!("`{}`: `{}`", s.path, s.line))
             .collect();
-        if !silent.is_empty() {
+        if !silent.is_empty() && !f.quiet_skips {
             problems.push(format!("skipped silently: {}", shown(&silent)));
         }
         let per_row: Vec<String> = f
@@ -1116,7 +1122,7 @@ pub fn items(f: &Facts, text: &str) -> Vec<Item> {
         if !per_row.is_empty() {
             problems.push(format!("a log line per row: {}", shown(&per_row)));
         }
-        if f.skips.iter().any(|s| s.collected) && !f.reports_once {
+        if f.skips.iter().any(|s| s.collected) && !f.reports_once && !f.quiet_skips {
             problems
                 .push("records are collected but no single WARNING per run names them".to_string());
         }
@@ -1566,6 +1572,20 @@ mod tests {
         let per_row = vec![file("pipeline/sync_items.py", PER_ROW)];
         let it = items(&Facts::from_diff(&per_row), "");
         assert!(it[0].detail.contains("a log line per row"), "{it:?}");
+        // A ticket that asks for no reporting: the skip follows the
+        // surrounding code; only a log line per row is still a problem.
+        let quiet = Facts {
+            quiet_skips: true,
+            ..Facts::from_diff(&silent)
+        };
+        assert_eq!(items(&quiet, "")[0].status, Status::Pass);
+        let quiet_per_row = Facts {
+            quiet_skips: true,
+            ..Facts::from_diff(&per_row)
+        };
+        assert!(items(&quiet_per_row, "")[0]
+            .detail
+            .contains("a log line per row"));
         let once = vec![file("pipeline/sync_items.py", ONCE)];
         let f = Facts::from_diff(&once);
         assert!(f.reports_once);
