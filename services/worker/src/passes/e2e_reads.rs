@@ -133,11 +133,11 @@ pub fn comment_verdict(body: &str) -> Option<CommentVerdict> {
             .unwrap_or(rest.len());
         let url = &rest[..end];
         let low = url.to_ascii_lowercase();
-        if low.contains("report") || low.ends_with(".html") || low.ends_with('/') {
-            if !low.contains("github.com/") || low.contains("/artifacts/") {
-                v.report = Some(url.to_string());
-                break;
-            }
+        if (low.contains("report") || low.ends_with(".html") || low.ends_with('/'))
+            && (!low.contains("github.com/") || low.contains("/artifacts/"))
+        {
+            v.report = Some(url.to_string());
+            break;
         }
     }
     v.sha = t
