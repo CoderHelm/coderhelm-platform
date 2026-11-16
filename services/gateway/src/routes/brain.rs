@@ -752,6 +752,9 @@ pub struct Starter {
 /// How many starter questions the empty chat shows.
 pub const STARTERS: usize = 4;
 
+/// The starter that asks what is waiting on the person.
+pub const NEEDS_ME_STARTER: &str = "What needs my answer?";
+
 fn short_repo(repo: &str) -> &str {
     repo.rsplit('/').next().unwrap_or(repo)
 }
@@ -819,29 +822,27 @@ pub fn starter_questions(
         .find(|r| repos.contains(r))
         .or(repos.first());
 
-    // Runs waiting on an answer lead: they are what someone has to act on.
-    let waiting: Vec<&RecentRun> = runs
+    // What waits on the person leads: it's what they have to act on. The
+    // answer reads every source for them (`chat_work_needs`), so it's
+    // offered whenever there's work to read, not only when a run waits.
+    let waiting = runs
         .iter()
         .filter(|r| r.status == common::run_status::NEEDS_INPUT && valid_run_id(&r.id))
-        .take(MAX_RUN_CONTEXT)
-        .collect();
-    if !waiting.is_empty() {
+        .count();
+    if waiting > 0 || !repos.is_empty() {
         push(
             Starter {
-                question: "What needs my answer?".into(),
-                why: if waiting.len() == 1 {
-                    "1 run is waiting on an answer".into()
-                } else {
-                    format!("{} runs are waiting on an answer", waiting.len())
+                question: NEEDS_ME_STARTER.into(),
+                why: match waiting {
+                    0 => "Runs, tickets and pull requests waiting on you".into(),
+                    1 => "1 run is waiting on an answer".into(),
+                    n => format!("{n} runs are waiting on an answer"),
                 },
-                sources: Picks::default(),
-                mentions: waiting
-                    .iter()
-                    .map(|r| Mention {
-                        kind: "run".into(),
-                        id: r.id.clone(),
-                    })
-                    .collect(),
+                sources: Picks {
+                    work: true,
+                    ..Default::default()
+                },
+                mentions: Vec::new(),
             },
             &mut out,
         );
@@ -1162,7 +1163,8 @@ How to work:
 - "What does file Y do?": read it (in ranges when it is long) and the files it leans on when that matters.
 - Never hand work back. Don't ask the person to open, read, paste or attach a file, to say which repository or who owns it, or to look something up: your tools do that. When a tool fails, try another way (another path, a search, the file listing). Say something isn't there only after you looked, and say where you looked.
 - Ask the person only for what no tool can reach, such as a decision or a preference.
-- The team's own work lives in the work tools (work_tickets, work_pull_requests, work_runs, work_findings, work_records), not in the code or the docs. "What's the latest on X", "where are we on", "status of", a ticket key, a pull request number, a run, "what's running", a CVE id or a package, a quoted title: look it up there first (the ticket, then its pull requests and Coderhelm's runs on it), then read code or docs only for context. Give a dated status: say when each record last changed. Never say there's nothing on it before you searched the tickets, pull requests and runs. Once a record gives you a ticket key or a pull request number, look the rest up by that key or number, not by the title again.
+- The team's own work lives in the work tools (work_needs_me, work_tickets, work_pull_requests, work_runs, work_findings, work_records), not in the code or the docs. "What's the latest on X", "where are we on", "status of", a ticket key, a pull request number, a run, "what's running", a CVE id or a package, a quoted title: look it up there first (the ticket, then its pull requests and Coderhelm's runs on it), then read code or docs only for context. Give a dated status: say when each record last changed. Never say there's nothing on it before you searched the tickets, pull requests and runs. Once a record gives you a ticket key or a pull request number, look the rest up by that key or number, not by the title again.
+- What is waiting on the person asking ("what needs my answer", "what needs me", "what's on my plate", "what should I work on", their reviews, their tickets, "am I blocking anyone"): call work_needs_me first, once. It finds who they are and reads Coderhelm's runs, approvals, Jira and GitHub for them. Answer in the shape its result gives: the count line, then the groups most urgent first, one line per item with its link and exactly what to do, a run's questions with their options, then a plain sentence for each source it couldn't read.
 - When a lookup the answer needed couldn't be read and no other way found it, say so in one short sentence in the answer (which records, such as "Coderhelm's runs couldn't be read just now"), then answer from what you did read. Don't mention a failed lookup that another one made up for.
 - Don't guess a field, column, type or property name. Before you query a data source, a CMS or a database, read its schema (its describe, schema or mapping tool) and query with the names it lists.
 
@@ -1473,8 +1475,37 @@ fn tool_label(name: &str, input: &Value) -> String {
             let (server, tool) = n.split_once("__").unwrap_or((n, ""));
             format!("{server}: {}", tool.replace('_', " "))
         }
-        n => n.replace('_', " "),
+        n => data_source_label(n, input).unwrap_or_else(|| n.replace('_', " ")),
     }
+}
+
+/// What the dashboard shows for a data source's lookup (the worker's
+/// `api_get`, `db_query`, ...), in words: "Read /v1/orders from Orders API".
+/// `None` for a tool that isn't one.
+pub fn data_source_label(name: &str, input: &Value) -> Option<String> {
+    let source = input["source"]
+        .as_str()
+        .or_else(|| input["api"].as_str())
+        .map(|s| common::truncate_str(s.trim(), 40).to_string())
+        .filter(|s| !s.is_empty());
+    let from = |default: &str| source.clone().unwrap_or_else(|| default.to_string());
+    Some(match name {
+        "api_get" => {
+            let path = common::truncate_str(input["path"].as_str().unwrap_or("").trim(), 60);
+            if path.is_empty() {
+                format!("Read from {}", from("the team's API"))
+            } else {
+                format!("Read {path} from {}", from("the team's API"))
+            }
+        }
+        "live_lookup" => format!("Looked up {}", from("a live source")),
+        "live_describe" => format!("Read the shape of {}", from("a live source")),
+        "db_query" => format!("Queried {}", from("the database")),
+        "logs_search" => format!("Searched the logs in {}", from("the team's logs")),
+        "search_read" | "opensearch_search" => format!("Searched {}", from("the search index")),
+        "opensearch_mapping" => format!("Read the fields of {}", from("the search index")),
+        _ => return None,
+    })
 }
 
 /// The plugins store (settings table), for the plugins source.
@@ -2615,14 +2646,7 @@ async fn answer(
     notes.push_str(&super::chat_work::hint_note(&hints, &offered));
     // A status question's answer is in the tickets, pull requests and runs:
     // an answer that found nothing without looking there goes back once.
-    let must_look = hints.about_work().then(|| chat_agent::MustLook {
-        tools: super::chat_work::STATUS_TOOLS
-            .iter()
-            .filter(|t| offered.contains(t))
-            .map(|t| t.to_string())
-            .collect(),
-        what: "the team's tickets, pull requests and Coderhelm's runs".into(),
-    });
+    let must_look = super::chat_work::must_look(&hints, &offered);
     notes.push_str(&run.run_note);
     if !problems.is_empty() {
         notes.push_str(&format!(
@@ -2811,24 +2835,47 @@ mod tests {
     }
 
     #[test]
-    fn waiting_runs_lead_the_starters_and_carry_their_ids() {
+    fn a_data_source_lookup_says_what_it_read() {
+        assert_eq!(
+            tool_label(
+                "api_get",
+                &json!({"source": "Orders API", "path": "/v1/orders/42"})
+            ),
+            "Read /v1/orders/42 from Orders API"
+        );
+        assert_eq!(
+            tool_label("api_get", &json!({"path": "/v1/orders"})),
+            "Read /v1/orders from the team's API"
+        );
+        assert_eq!(
+            tool_label("db_query", &json!({"source": "billing"})),
+            "Queried billing"
+        );
+        // Nothing reads "api get" any more; an unknown tool keeps its name.
+        assert!(!tool_label("api_get", &json!({})).contains("api get"));
+        assert_eq!(tool_label("some_tool", &json!({})), "some tool");
+    }
+
+    #[test]
+    fn what_needs_me_leads_the_starters_and_reads_everything() {
         let mut waiting = run("Add a Heading component", "acme/web");
         waiting.id = "01RUNWAITING".into();
         waiting.status = "needs_input".into();
         let repos = vec!["acme/web".to_string()];
         let s = starter_questions(&[], &repos, &[waiting, run("Fix login", "acme/web")]);
-        assert_eq!(s[0].question, "What needs my answer?");
+        assert_eq!(s[0].question, NEEDS_ME_STARTER);
         assert_eq!(s[0].why, "1 run is waiting on an answer");
-        assert_eq!(
-            s[0].mentions,
-            vec![Mention {
-                kind: "run".into(),
-                id: "01RUNWAITING".into()
-            }]
-        );
-        // Without waiting runs there is no such starter.
+        // It reads everything waiting on the person, not only the runs: no
+        // run mentions, the team's work on.
+        assert!(s[0].mentions.is_empty());
+        assert!(s[0].sources.work);
+        assert!(crate::routes::chat_hints::read(NEEDS_ME_STARTER).needs_me);
+        // Without waiting runs it still leads, for tickets and reviews.
         let s = starter_questions(&[], &repos, &[run("Fix login", "acme/web")]);
-        assert!(s.iter().all(|x| x.question != "What needs my answer?"));
+        assert_eq!(s[0].question, NEEDS_ME_STARTER);
+        assert_eq!(s[0].why, "Runs, tickets and pull requests waiting on you");
+        // With nothing connected there is nothing to read.
+        assert!(starter_questions(&[], &[], &[]).is_empty());
     }
 
     #[test]
@@ -2890,19 +2937,20 @@ mod tests {
         ];
         let s = starter_questions(&bases, &repos, &runs);
         assert_eq!(s.len(), STARTERS);
-        assert_eq!(s[0].question, "What should I know from HR handbook?");
-        assert_eq!(s[0].sources.knowledge, vec!["kb1".to_string()]);
-        assert!(!s[0].sources.code);
+        // What waits on the person leads.
+        assert_eq!(s[0].question, NEEDS_ME_STARTER);
+        assert_eq!(s[1].question, "What should I know from HR handbook?");
+        assert_eq!(s[1].sources.knowledge, vec!["kb1".to_string()]);
+        assert!(!s[1].sources.code);
         assert_eq!(
-            s[1].question,
+            s[2].question,
             "What's the latest on “Add rate limiting to login”?"
         );
-        assert_eq!(s[1].why, "From recent work in web");
-        assert!(s[1].sources.code);
-        assert_eq!(s[1].sources.repo.as_deref(), Some("acme/web"));
+        assert_eq!(s[2].why, "From recent work in web");
+        assert!(s[2].sources.code);
+        assert_eq!(s[2].sources.repo.as_deref(), Some("acme/web"));
         // The repository with the latest run leads, not the first by name.
-        assert_eq!(s[2].question, "How is web put together?");
-        assert!(s[3].sources.memories && !s[3].sources.code);
+        assert_eq!(s[3].question, "How is web put together?");
         // A run in a repository that is no longer connected is never offered.
         assert!(s.iter().all(|q| !q.question.contains("Old work")));
         // Every starter turns on at least one source.
@@ -2922,8 +2970,8 @@ mod tests {
         assert!(s.iter().all(|q| q.sources.knowledge.len() == 1));
         let long = "word ".repeat(40);
         let s = starter_questions(&[], &["a/b".into()], &[run(&long, "a/b")]);
-        assert!(s[0].question.contains('…'));
-        assert!(s[0].question.chars().count() < 110);
+        assert!(s[1].question.contains('…'));
+        assert!(s[1].question.chars().count() < 110);
     }
 
     #[test]
