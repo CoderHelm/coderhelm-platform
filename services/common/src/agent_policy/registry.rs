@@ -233,6 +233,7 @@ pub const BUILTIN: &[(&str, Risk)] = &[
     ("work_runs", Risk::Read),
     ("work_findings", Risk::Read),
     ("work_records", Risk::Read),
+    ("work_needs_me", Risk::Read),
     // A chat asking the person to connect an account (shows a sign-in card).
     ("request_sign_in", Risk::Read),
     // Plugin runs: the plugin's own skills, and drafts kept in CoderHelm

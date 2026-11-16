@@ -346,8 +346,17 @@ fn the_run_does_its_steps_and_asks_once_for_the_release_and_the_device_checkout(
     ] {
         assert!(!note.contains(never), "`{never}` in:\n{note}");
     }
-    assert!(note.starts_with("Done outside the code: "), "{note}");
-    assert!(note.contains("**Needed from you:**\n1. "), "{note}");
+    // Only what a person must do: no pasted plan status, and it keeps the
+    // comment style once rendered.
+    assert!(!note.contains("Done outside the code"), "{note}");
+    assert!(!note.contains("step(s)"), "{note}");
+    assert!(note.starts_with("**Needed from you:**"), "{note}");
+    let shown = common::comment_style::render(&note, true);
+    assert!(
+        common::comment_style::lint(&shown).is_empty(),
+        "{shown}\n{:?}",
+        common::comment_style::lint(&shown)
+    );
     assert_eq!(
         person_gate::sink(&note).sent_back,
         Vec::<String>::new(),
@@ -452,7 +461,7 @@ fn a_tool_failure_is_one_diagnosis_one_report_and_never_a_persons() {
 fn a_failed_attempt_reaches_a_person_only_for_a_permission_or_a_credential() {
     let attempt = |why: &str| person_gate::Ask {
         kind: Kind::Attempt,
-        text: "Confirm 'Deploy Preview' ran".into(),
+        text: "Start the release workflow on the merge commit".into(),
         why_not: why.into(),
         ..Default::default()
     };
@@ -476,6 +485,13 @@ fn a_failed_attempt_reaches_a_person_only_for_a_permission_or_a_credential() {
     assert_eq!(words.class(), Class::Do, "{words:?}");
     let refused = person_gate::decide(&attempt("GitHub answered 403 to `POST /repos/acme/site/actions/workflows/release.yml/dispatches`: the GitHub App needs Actions: write"), &ctx);
     assert!(matches!(refused, Outcome::Human(_)), "{refused:?}");
+    // Testing stopped by the same refusal is still CoderHelm's: the
+    // permission is said once in setup checks, never as a tester's chore.
+    let testing = person_gate::Ask {
+        text: "Confirm 'Deploy Preview' ran".into(),
+        ..attempt("CoderHelm's GitHub App is not allowed to start workflows in this repository")
+    };
+    assert_eq!(person_gate::decide(&testing, &ctx).class(), Class::Do);
     // A step that names a workflow called "Deploy ..." is not a deploy.
     let read = person_gate::Ask {
         kind: Kind::Step,

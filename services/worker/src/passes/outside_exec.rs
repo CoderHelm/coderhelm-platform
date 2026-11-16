@@ -644,18 +644,17 @@ async fn start(
 /// installation can't start workflows by `workflow_dispatch` (a label needs
 /// no Actions permission).
 fn startable_e2e(a: &Abilities, installation: u64) -> Option<Route> {
-    let no_dispatch = common::github_grants::write_grant(installation, "actions")
-        == common::github_grants::Grant::Missing;
-    let label = a
-        .e2e
+    // A route its label starts first, whatever the app may do: adding a
+    // label needs only the pull request write the app has, never Actions:
+    // write. Otherwise a dispatch; without Actions: write its start records
+    // the missing permission once for the install and the result is read
+    // from the other routes (`other_routes`).
+    let _ = installation;
+    a.e2e
         .iter()
-        .find(|r| matches!(r.trigger, outside_work::Trigger::Label(_)));
-    if no_dispatch {
-        if let Some(r) = label {
-            return Some(r.clone());
-        }
-    }
-    a.e2e.iter().find(|r| r.startable()).cloned()
+        .filter(|r| r.startable())
+        .min_by_key(|r| !matches!(r.trigger, outside_work::Trigger::Label(_)))
+        .cloned()
 }
 
 /// The names a step reads that are workflows: those a run on the head or a

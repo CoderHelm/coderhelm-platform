@@ -161,6 +161,16 @@ impl Channel for GithubThread<'_> {
         remember(&self.place().key(), id, meta);
         Ok(id.to_string())
     }
+
+    async fn hide(&self, said: &common::conversation::Said, hidden: bool) -> Result<(), String> {
+        if said.node_id.is_empty() {
+            return Err("no node id for the comment".into());
+        }
+        self.gh
+            .hide_own_comment(&said.node_id, hidden)
+            .await
+            .map_err(|e| e.to_string())
+    }
 }
 
 /// GitHub's shape of a written comment, for callers that read `id` and
@@ -306,51 +316,40 @@ impl Composer for Replier<'_> {
     }
 }
 
-/// Rewrites a status comment a pass keeps by its own id (`slot` names it):
-/// laid out like every other comment, and marked as CoderHelm's.
+/// Updates a status a pass keeps (`slot` names it) on issue or pull request
+/// `number`. It goes through the layer like every other status: into the
+/// thread's one status comment, edited in place and held to the comment
+/// style; a pass's own comment id is never written to directly, so no pass
+/// can keep a second status comment beside it.
 pub async fn edit_own(
     gh: &GitHubClient,
     owner: &str,
     repo: &str,
-    comment_id: u64,
+    number: u64,
     slot: &str,
     body: &str,
 ) -> Result<Value, Error> {
-    edit_own_asking(gh, owner, repo, comment_id, slot, body, &[]).await
+    edit_own_asking(gh, owner, repo, number, slot, body, &[]).await
 }
 
-/// [`edit_own`] for a comment that asks `asks`.
+/// [`edit_own`] for a status that asks `asks`.
 pub async fn edit_own_asking(
     gh: &GitHubClient,
     owner: &str,
     repo: &str,
-    comment_id: u64,
+    number: u64,
     slot: &str,
     body: &str,
     asks: &[String],
 ) -> Result<Value, Error> {
-    let place = Place::github(owner, repo, 0);
-    let shaped = conversation::shape(body, place.budget(), true);
-    let meta = Meta {
-        slot: slot.to_string(),
-        fp: conversation::fingerprint(body),
-        gist: conversation::cut_words(&conversation::visible(body), 160),
-        first_ms: chrono::Utc::now().timestamp_millis(),
-        asks: conversation::merge_questions(asks)
-            .iter()
-            .map(|q| conversation::cut_words(q, 200))
-            .collect(),
-        ..Default::default()
-    };
-    let v = gh
-        .edit_issue_comment(
-            owner,
-            repo,
-            comment_id,
-            &conversation::with_marker(&shaped, &meta),
-        )
-        .await?;
-    Ok(v)
+    github(
+        gh,
+        owner,
+        repo,
+        number,
+        Say::status(slot, body).asks(asks.to_vec()),
+    )
+    .await
 }
 
 /// What CoderHelm last replied in each review thread (this process), so a
@@ -428,6 +427,7 @@ pub fn review_thread(
                 at_ms: at,
                 meta: Meta::default(),
                 body: body.to_string(),
+                node_id: String::new(),
             });
         }
     }

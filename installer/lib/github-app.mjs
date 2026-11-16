@@ -22,8 +22,11 @@ export const PERMISSIONS = {
   // check on a pull request while it is reviewed. Only read is required
   // (REQUIRED_PERMISSIONS): reviews work without the check.
   checks: "write",
-  // Read workflow runs and their logs (CI fixes).
-  actions: "read",
+  // Read workflow runs and their logs (CI fixes), and start a workflow a
+  // step needs (workflow_dispatch: a deploy, an end-to-end run that has no
+  // label to start it). Only read is required (REQUIRED_PERMISSIONS):
+  // without write, CoderHelm starts what a label starts and lists the rest.
+  actions: "write",
   // Read commit statuses (CI that reports statuses, not checks).
   statuses: "read",
   // Change workflow files when a task asks for it.
@@ -56,6 +59,7 @@ export const OPTIONAL_WHY = {
   deployments: "Without Deployments, what shipped where is worked out from workflow names instead of GitHub's deployments.",
   repository_advisories: "Without Repository security advisories, security fixes don't see a repository's own advisories and private vulnerability reports.",
   code_quality: "Without Code quality, reviews don't see GitHub's code quality findings on the changed files.",
+  actions: "Without Actions: write, CoderHelm can't start a workflow itself (a deploy, an end-to-end run): it adds the label that starts one where the workflow has one, and otherwise the step waits.",
 };
 
 /**
@@ -64,8 +68,9 @@ export const OPTIONAL_WHY = {
  * (services/gateway/src/routes/setup_checks.rs REQUIRED_PERMISSIONS).
  */
 export const REQUIRED_PERMISSIONS = (() => {
-  const out = { ...PERMISSIONS, checks: "read" };
-  for (const k of Object.keys(OPTIONAL_WHY)) if (k !== "checks") delete out[k];
+  // Checks and Actions: read is required, write is optional.
+  const out = { ...PERMISSIONS, checks: "read", actions: "read" };
+  for (const k of Object.keys(OPTIONAL_WHY)) if (k !== "checks" && k !== "actions") delete out[k];
   return out;
 })();
 

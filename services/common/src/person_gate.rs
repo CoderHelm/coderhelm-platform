@@ -460,6 +460,56 @@ fn names_deploy(t: &str) -> bool {
     any(t, &["deploy", "release to", "publish to production"])
 }
 
+/// Whether the item asks a person to test: run a flow or a suite, read an
+/// end-to-end result, check a preview in a browser. Testing is CoderHelm's
+/// own work, whatever stopped it (a missing permission is an install item,
+/// said once in setup checks, never a tester's chore on a pull request).
+fn asks_testing(a: &Ask) -> bool {
+    let t = one_line(&a.text).to_lowercase();
+    let t = t
+        .trim_start_matches("after merging: ")
+        .trim_start_matches("before merging: ")
+        .trim_start_matches(['-', '*', ' ']);
+    let verb = t.split_whitespace().next().unwrap_or("");
+    let testing_verb = matches!(
+        verb,
+        "run"
+            | "rerun"
+            | "re-run"
+            | "read"
+            | "check"
+            | "confirm"
+            | "verify"
+            | "test"
+            | "try"
+            | "open"
+            | "watch"
+    );
+    testing_verb
+        && any(
+            t,
+            &[
+                "e2e",
+                "end-to-end",
+                "end to end",
+                "chromium",
+                "webkit",
+                "firefox",
+                "safari",
+                "playwright",
+                "cypress",
+                "browser",
+                "smoke test",
+                "test result",
+                "the tests",
+                "the test suite",
+                "the spec",
+                "the flow",
+                "preview",
+            ],
+        )
+}
+
 /// Whether the item's action is adding labels to a pull request.
 fn adds_labels(a: &Ask) -> bool {
     let t = one_line(&a.text).to_lowercase();
@@ -888,6 +938,10 @@ pub fn decide(a: &Ask, ctx: &Context) -> Outcome {
     // Labels on a pull request go through the issues API: no workflow
     // permission is involved, whatever a run said about one.
     if adds_labels(a) {
+        return Outcome::Do(Work::Own(one_line(&a.text)));
+    }
+    // Testing is never a person's item.
+    if asks_testing(a) {
         return Outcome::Do(Work::Own(one_line(&a.text)));
     }
     if a.kind == Kind::Attempt {
@@ -1496,6 +1550,22 @@ pub fn prompt_section() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Reading an end-to-end result or running a flow in browsers is
+    /// CoderHelm's work, even when a missing permission stopped it.
+    #[test]
+    fn testing_is_never_a_persons_item() {
+        let text = "**Needed from you:**\n\
+1. Read the Deploy Preview e2e result. CoderHelm could not: CoderHelm's GitHub App is not allowed to start workflows in this repository\n\
+2. Run the sign-up flow inside the frame in a fresh browser context in Chromium and WebKit. CoderHelm could not: CoderHelm's GitHub App is not allowed to start workflows in this repository\n";
+        let sunk = sink(text);
+        assert_eq!(sunk.sent_back.len(), 2, "{sunk:?}");
+        assert!(sunk.human.is_empty(), "{sunk:?}");
+        assert!(!sunk.text.contains("e2e"), "{}", sunk.text);
+        // A real person item stays.
+        let keep = "**Needed from you:**\n1. One paid registration on real devices. CoderHelm cannot: No real devices or payment method. (QA)\n";
+        assert_eq!(sink(keep).human.len(), 1, "{:?}", sink(keep));
+    }
 
     fn assumption(topic: &str, text: &str) -> Ask {
         Ask {
