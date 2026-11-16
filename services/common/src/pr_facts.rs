@@ -373,6 +373,14 @@ pub struct Facts {
     /// A UI change's screenshots, or why there are none.
     #[serde(default)]
     pub screens: Option<crate::pr_body::Screens>,
+    /// What the pull request waits on, one line (`crate::waiting_line`).
+    #[serde(default)]
+    pub waiting: String,
+    /// Where the preview of the head stands (`crate::preview`): its
+    /// checks, address and captured pages. A preview or end-to-end check
+    /// that covers the change and was skipped is a gap, never evidence.
+    #[serde(default)]
+    pub preview: Option<crate::preview::State>,
     /// The feedback wanted, when something more specific than the records
     /// says it.
     #[serde(default)]
@@ -1196,6 +1204,70 @@ fn conclusion_with_signoffs(f: &Facts) -> String {
 
 /// The body every description shows, from the facts of its head. `ticked`:
 /// the item ids a person ticked in the body this one replaces.
+/// How a skipped check that covers the change reads: a gap CoderHelm
+/// closes, never "nothing to do".
+pub const GAP_WORDS: &str =
+    "not run yet: it covers this change, so CoderHelm starts it on the preview and reads its result";
+
+/// The preview's captures, or the one line saying why there are none.
+fn screens_of(p: &crate::preview::State, visible: bool) -> Option<crate::pr_body::Screens> {
+    use crate::pr_body::Screens;
+    use crate::preview::Stage;
+    if !p.shots.is_empty() {
+        let mut pages: Vec<(String, String, String)> = Vec::new();
+        for s in &p.shots {
+            let at = match pages.iter().position(|x| x.0 == s.page) {
+                Some(i) => i,
+                None => {
+                    pages.push((s.page.clone(), String::new(), String::new()));
+                    pages.len() - 1
+                }
+            };
+            if s.width == "phone" {
+                pages[at].2 = s.src.clone();
+            } else {
+                pages[at].1 = s.src.clone();
+            }
+        }
+        return Some(Screens::Pages(pages));
+    }
+    let why = match p.stage {
+        Stage::Triggered | Stage::Deploying => {
+            "the preview is still deploying; its pages are captured once it is up".to_string()
+        }
+        Stage::Ready => "the preview is up and its pages are being captured".to_string(),
+        Stage::Failed => {
+            "the preview checks failed; its pages are captured once they pass".to_string()
+        }
+        _ if !p.why.trim().is_empty() => p.why.clone(),
+        _ if !visible => "the change has no page a person sees".to_string(),
+        _ => return None,
+    };
+    Some(Screens::Missing(why))
+}
+
+/// The checks that cover the change and haven't run on the head.
+pub fn preview_gaps(f: &Facts) -> Vec<String> {
+    let visible = f
+        .files
+        .iter()
+        .any(|x| crate::preview::is_user_visible(&x.path));
+    let covers = f
+        .preview
+        .as_ref()
+        .map(|p| p.covers.as_slice())
+        .unwrap_or(&[]);
+    f.checks
+        .iter()
+        .filter(|c| {
+            c.outcome == Outcome::DidNotRun
+                && (crate::preview::is_covering(covers, &c.name)
+                    || crate::preview::skipped_is_gap(&c.name, visible))
+        })
+        .map(|c| c.name.clone())
+        .collect()
+}
+
 pub fn body_of(f: &Facts, ticked: &[String]) -> crate::pr_body::Body {
     use crate::pr_body::{Body, Focus, Level, ReadFirst, Screens, Ticket};
     let head = f.short_head().to_string();
@@ -1360,12 +1432,17 @@ pub fn body_of(f: &Facts, ticked: &[String]) -> crate::pr_body::Body {
             };
         }
     }
-    let screens = match &f.screens {
-        Some(s) => Some(s.clone()),
-        None if f.files.iter().any(|x| is_ui(&x.path)) => Some(Screens::Missing(
+    let visible = f
+        .files
+        .iter()
+        .any(|x| crate::preview::is_user_visible(&x.path));
+    let screens = match (&f.screens, &f.preview) {
+        (Some(s), _) => Some(s.clone()),
+        (None, Some(p)) => screens_of(p, visible),
+        (None, None) if f.files.iter().any(|x| is_ui(&x.path)) => Some(Screens::Missing(
             "CoderHelm had no runnable preview to capture for this run".into(),
         )),
-        None => None,
+        (None, None) => None,
     };
     // The full list of checks, and how to check by hand.
     let mut evidence: Vec<String> = Vec::new();
@@ -1373,9 +1450,22 @@ pub fn body_of(f: &Facts, ticked: &[String]) -> crate::pr_body::Body {
     if !how.is_empty() {
         evidence.push(format!("How to check: {how}."));
     }
+    if let Some(p) = &f.preview {
+        if p.url.starts_with("https://") {
+            evidence.push(format!("Preview: {}", p.url));
+        }
+    }
     if !f.checks.is_empty() {
+        let covers = f
+            .preview
+            .as_ref()
+            .map(|p| p.covers.as_slice())
+            .unwrap_or(&[]);
         let mut s = String::from("Every check on this head:\n");
         for c in &f.checks {
+            let gap = c.outcome == Outcome::DidNotRun
+                && (crate::preview::is_covering(covers, &c.name)
+                    || crate::preview::skipped_is_gap(&c.name, visible));
             s.push_str(&format!(
                 "- {}: {}\n",
                 linked(c),
@@ -1383,6 +1473,7 @@ pub fn body_of(f: &Facts, ticked: &[String]) -> crate::pr_body::Body {
                     Outcome::Passed => "passed",
                     Outcome::Failed => "failed",
                     Outcome::Running => "still running",
+                    Outcome::DidNotRun if gap => GAP_WORDS,
                     Outcome::DidNotRun => "skipped (its conditions left this PR out)",
                 }
             ));
@@ -1426,6 +1517,7 @@ pub fn body_of(f: &Facts, ticked: &[String]) -> crate::pr_body::Body {
         head,
         results_of: String::new(),
         alert: String::new(),
+        waiting: f.waiting.clone(),
         summary,
         outside,
         needed: items,

@@ -180,7 +180,20 @@ pub struct Facts {
     /// Its CI fix loop found every failing check failing on the base branch
     /// too (`ci_end` = `red_on_base`): not this change's failure.
     pub red_on_base: bool,
+    /// The head's preview (`preview::advance`): a web change is ready only
+    /// once its preview deploy and end-to-end checks passed on it, and only
+    /// with an end-to-end spec when the repository has a suite.
+    pub preview: Option<common::preview::State>,
 }
+
+/// The hold for a change a person sees that has no end-to-end spec in a
+/// repository with a suite.
+pub const E2E_MISSING: &str =
+    "The change alters what a person sees and adds no end-to-end spec to the repository's suite";
+
+/// What a draft waits for while its preview checks run.
+pub const PREVIEW_WAIT: &str =
+    "the preview deploy and its end-to-end checks are running on this head";
 
 impl Ci {
     /// A check failed on the head (not merely running or missing).
@@ -431,6 +444,53 @@ pub fn decide(f: &Facts) -> Decision {
                         .to_string()
                 });
             }
+        }
+    }
+    // A web change: its preview checks are proof like any other, and a
+    // visible change needs its end-to-end spec.
+    if let Some(p) = f
+        .preview
+        .as_ref()
+        .filter(|p| f.head.is_empty() || p.head == f.head)
+    {
+        use common::preview::{Outcome as PvOutcome, Stage};
+        if p.e2e_required && !p.e2e_covered {
+            reasons.push(Reason::new(
+                E2E_MISSING,
+                "CoderHelm writes the spec in its next round on this branch (its Tests and scope check sends it back), runs it on the preview, and marks the pull request ready once it passes.",
+            ));
+        }
+        match p.stage {
+            Stage::Failed => {
+                let failed: Vec<String> = p
+                    .checks
+                    .iter()
+                    .filter(|c| c.outcome == PvOutcome::Failed)
+                    .map(|c| c.name.clone())
+                    .collect();
+                reasons.push(Reason::new(
+                    format!("The preview checks failed: {}", check_names(&failed)),
+                    "CoderHelm fixes the cause like any failing check and pushes; the preview runs again on the new head.",
+                ));
+            }
+            Stage::Triggered | Stage::Deploying => {
+                let not_run: Vec<String> = p
+                    .draft_gated
+                    .iter()
+                    .filter(|g| {
+                        !p.checks
+                            .iter()
+                            .any(|c| &c.name == *g && c.outcome != PvOutcome::Skipped)
+                    })
+                    .cloned()
+                    .collect();
+                if f.draft && !not_run.is_empty() {
+                    runs_when_ready.extend(not_run);
+                } else {
+                    proof_wait.get_or_insert_with(|| PREVIEW_WAIT.to_string());
+                }
+            }
+            _ => {}
         }
     }
     // A security fix leaves draft on green CI only.
@@ -999,6 +1059,7 @@ async fn gather(ctx: &Ctx<'_>) -> Result<Facts, Refused> {
         f.feature =
             super::feature::ready_hold(ctx.state, gh, ctx.team_id, ctx.owner, ctx.repo, ctx.pr)
                 .await;
+        f.preview = preview_of(ctx, &pr).await;
     }
     // The description as it is now (the link check may have rewritten it).
     let pr = read_pr().await?;
@@ -1054,6 +1115,30 @@ async fn gather(ctx: &Ctx<'_>) -> Result<Facts, Refused> {
     Ok(f)
 }
 
+/// The head's preview, moved on now (`preview::advance`): its labels added,
+/// its checks read. None for a pull request no run of CoderHelm's opened.
+async fn preview_of(ctx: &Ctx<'_>, pr: &serde_json::Value) -> Option<common::preview::State> {
+    let run_id = if ctx.run_id.is_empty() {
+        super::review_pr::lookup_run_by_pr(ctx.state, ctx.team_id, ctx.owner, ctx.repo, ctx.pr)
+            .await?
+    } else {
+        ctx.run_id.clone()
+    };
+    super::preview::advance(
+        ctx.state,
+        ctx.github,
+        super::preview::Pr {
+            team_id: ctx.team_id,
+            run_id: &run_id,
+            owner: ctx.owner,
+            repo: ctx.repo,
+            number: ctx.pr,
+        },
+        pr,
+    )
+    .await
+}
+
 /// Whether the run's CI fix loop ended because every failing check fails on
 /// the base branch too.
 async fn red_on_base(ctx: &Ctx<'_>) -> bool {
@@ -1080,6 +1165,27 @@ async fn red_on_base(ctx: &Ctx<'_>) -> bool {
         .and_then(|o| o.item)
         .and_then(|i| i.get("ci_end").and_then(|v| v.as_s().ok()).cloned())
         .is_some_and(|e| e == "red_on_base")
+}
+
+/// Asks for the ready decision of a pull request again, now: the preview's
+/// checks it waits on moved (`preview`).
+pub async fn request_for(
+    state: &WorkerState,
+    team_id: &str,
+    installation_id: u64,
+    owner: &str,
+    repo: &str,
+    pr_number: u64,
+) -> bool {
+    let m = MarkReadyMessage {
+        team_id: team_id.to_string(),
+        installation_id,
+        repo_owner: owner.to_string(),
+        repo_name: repo.to_string(),
+        pr_number,
+        ..Default::default()
+    };
+    send(state, &m, 0).await
 }
 
 /// Asks for the ready decision of a PR again, now: CoderHelm's review of its
@@ -2107,6 +2213,78 @@ mod tests {
             approved: true,
             ..Default::default()
         }
+    }
+
+    fn preview(stage: common::preview::Stage) -> common::preview::State {
+        common::preview::State {
+            head: "abc".into(),
+            stage,
+            draft_gated: vec!["Deploy Preview".into(), "E2E on preview".into()],
+            ..Default::default()
+        }
+    }
+
+    /// A web change was once marked ready with its preview deploy and
+    /// preview end-to-end checks skipped (they skip drafts), and nothing
+    /// waited for them. Now the draft is marked ready for them and stays
+    /// "being proven" until they pass.
+    #[test]
+    fn a_draft_web_change_is_proven_on_its_preview_before_it_is_ready() {
+        let f = Facts {
+            head: "abc".into(),
+            preview: Some(preview(common::preview::Stage::Triggered)),
+            ..green_approved()
+        };
+        let d = decide(&f);
+        let Decision::Proving { why, reasons } = &d else {
+            panic!("proving expected, got {d:?}");
+        };
+        assert!(reasons.is_empty());
+        assert!(
+            why.contains("`Deploy Preview`") && why.contains("`E2E on preview`"),
+            "{why}"
+        );
+        // Marked ready and still deploying: it waits, never plain ready.
+        let running = Facts {
+            draft: false,
+            body: PROVING_MARK.into(),
+            preview: Some(preview(common::preview::Stage::Deploying)),
+            ..f.clone()
+        };
+        assert_eq!(
+            decide(&running),
+            Decision::Proving {
+                why: PREVIEW_WAIT.into(),
+                reasons: Vec::new()
+            }
+        );
+        // Checked: ready.
+        let checked = Facts {
+            preview: Some(preview(common::preview::Stage::Checked)),
+            ..running.clone()
+        };
+        assert!(matches!(decide(&checked), Decision::Ready { .. }));
+    }
+
+    #[test]
+    fn a_visible_change_with_no_e2e_spec_is_not_ready() {
+        let mut p = preview(common::preview::Stage::Checked);
+        p.e2e_required = true;
+        let f = Facts {
+            head: "abc".into(),
+            preview: Some(p.clone()),
+            ..green_approved()
+        };
+        let Decision::Held { reasons } = decide(&f) else {
+            panic!("held expected");
+        };
+        assert!(reasons[0].what.starts_with(E2E_MISSING));
+        p.e2e_covered = true;
+        let ok = Facts {
+            preview: Some(p),
+            ..f
+        };
+        assert!(matches!(decide(&ok), Decision::Ready { .. }));
     }
 
     /// A security fix whose CI the fix loop couldn't get green (it handed

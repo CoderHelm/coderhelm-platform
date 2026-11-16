@@ -460,6 +460,34 @@ pub fn facts(i: &Inputs<'_>) -> Facts {
     f
 }
 
+/// The head's preview in the facts: its state, its address, the commands
+/// that check the changed area, and each check that covers the change and
+/// didn't run, as something not verified yet (never as evidence).
+pub fn with_preview(f: &mut Facts, preview: Option<&common::preview::State>) {
+    let Some(p) = preview else {
+        return;
+    };
+    f.preview = Some(p.clone());
+    if p.url.starts_with("https://") {
+        f.preview_url = p.url.clone();
+    }
+    if !p.how_to_check.trim().is_empty() {
+        f.how_to_check = p.how_to_check.clone();
+    }
+    for g in common::pr_facts::preview_gaps(f) {
+        f.unverified.push(Unverified {
+            what: format!("`{g}` on this head"),
+            why: "it covers this change and hasn't run yet; CoderHelm starts it on the preview and reads its result".into(),
+        });
+    }
+    if p.e2e_required && !p.e2e_covered {
+        f.unverified.push(Unverified {
+            what: "an end-to-end spec for the change a person sees".into(),
+            why: "the repository has an end-to-end suite and the change adds no spec to it; CoderHelm writes one".into(),
+        });
+    }
+}
+
 /// A description in its final shape, the facts it shows and what the check
 /// corrected on the way.
 #[derive(Debug, Clone)]
@@ -568,7 +596,14 @@ pub fn shape_for(
         &earlier,
         if own.is_empty() { from_title } else { own },
     );
-    facts.how_to_check = first(&slots.check, &prior.check, check_of(&checked));
+    // The commands read from the change itself (its specs and tests) come
+    // before any written one: a bare suite command never stands for them.
+    let computed = std::mem::take(&mut facts.how_to_check);
+    facts.how_to_check = if computed.trim().is_empty() {
+        first(&slots.check, &prior.check, check_of(&checked))
+    } else {
+        computed
+    };
     let checked = pr_reader::without_sections(&checked, &slots.drop);
     // 3. The visible part, the generated blocks below it and the steps and
     //    evidence, from the facts; the written text goes in the first fold.

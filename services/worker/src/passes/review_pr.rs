@@ -3357,6 +3357,28 @@ async fn run_once(
             "Findings held to the repository's required rules"
         );
     }
+    // A change a person sees, in a repository with an end-to-end suite,
+    // carries a spec for it: a finding by rule, read from the paths and the
+    // tree, whatever the model said.
+    if changed_list
+        .iter()
+        .any(|p| common::preview::is_user_visible(p))
+    {
+        if let Ok(tree) = github
+            .get_tree(&msg.repo_owner, &msg.repo_name, &head_sha)
+            .await
+        {
+            let tree: Vec<String> = tree.into_iter().map(|e| e.path).collect();
+            if let Some(f) = super::review_rules::e2e_finding(&changed_list, &tree) {
+                info!(
+                    pr = msg.pr_number,
+                    "A visible change with no end-to-end spec: must fix"
+                );
+                findings.retain(|x| x.title != f.title);
+                findings.push(f);
+            }
+        }
+    }
     review_agent::enforce_source_data_override(&mut findings);
     // A request to test something by hand is a note, never a block.
     review_agent::enforce_manual_checks_are_notes(&mut findings);

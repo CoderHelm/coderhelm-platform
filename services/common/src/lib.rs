@@ -188,7 +188,9 @@ pub mod pr_review;
 pub mod pr_steps;
 /// A repository's pull request template as the description's structure.
 pub mod pr_template;
+pub mod preview;
 pub mod run_prs;
+pub mod waiting_line;
 // review_stats: time-ordered review records for analytics
 /// What people write on a ticket while a run works on it: kept, acknowledged, acted on.
 /// One engineer's voice per ticket and per pull request: every comment

@@ -3982,6 +3982,17 @@
               "null"
             ]
           },
+          "preview": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RunPreview",
+                "description": "Where the preview of the pull request's head stands: its checks,\naddress and captured pages. Null when nothing was recorded."
+              }
+            ]
+          },
           "progress_notes": {
             "description": "Notes it wrote while working, in order.",
             "examples": [
@@ -4159,6 +4170,16 @@
             "description": "When it last changed (RFC 3339).",
             "examples": [
               "2026-10-22T14:15:25Z"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "waiting_line": {
+            "description": "What the run's pull request waits on, in one plain line, and\nwhether it is ready for review: \"Waiting on: an approving review from\na person on #12 (this repo requires one before CoderHelm merges).\nReady for review: checks passed, preview checked.\" Built from\n`merge_standing`, `draft_hold` and `preview`. Null before the run\nhas a pull request.",
+            "examples": [
+              null
             ],
             "type": [
               "string",
@@ -4801,6 +4822,165 @@
           "review_sk",
           "reviewed_sha",
           "at"
+        ],
+        "type": "object"
+      },
+      "RunPreview": {
+        "description": "Where the preview of the run's pull request head stands\n(`common::preview`).",
+        "properties": {
+          "checks": {
+            "description": "The preview and end-to-end checks that cover the change, on the head.",
+            "examples": [
+              [
+                {
+                  "name": "E2E on preview",
+                  "outcome": "passed",
+                  "url": "https://github.com/acme/web/actions/runs/1/job/2"
+                }
+              ]
+            ],
+            "items": {
+              "$ref": "#/components/schemas/RunPreviewCheck"
+            },
+            "type": "array"
+          },
+          "e2e_covered": {
+            "description": "The change adds or updates an end-to-end spec.",
+            "examples": [
+              true
+            ],
+            "type": "boolean"
+          },
+          "e2e_required": {
+            "description": "The change alters what a person sees in a repository with an\nend-to-end suite, so it needs an end-to-end spec.",
+            "examples": [
+              true
+            ],
+            "type": "boolean"
+          },
+          "labels_added": {
+            "description": "Labels CoderHelm added to start the preview and its end-to-end checks.",
+            "examples": [
+              [
+                "E2E:signup"
+              ]
+            ],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "shots": {
+            "description": "The changed pages captured on the preview, at desktop and phone width.",
+            "examples": [
+              [
+                {
+                  "page": "/signup",
+                  "src": "https://github.com/acme/web/blob/abc/pr-1/abc/signup-desktop.png?raw=true",
+                  "width": "desktop"
+                }
+              ]
+            ],
+            "items": {
+              "$ref": "#/components/schemas/RunPreviewShot"
+            },
+            "type": "array"
+          },
+          "stage": {
+            "description": "`not_needed`, `triggered`, `deploying`, `ready`, `checked`,\n`failed` or `blocked`.",
+            "examples": [
+              "checked"
+            ],
+            "type": "string"
+          },
+          "url": {
+            "description": "The preview's address; empty when it isn't known.",
+            "examples": [
+              "https://pr-1.preview-web.example.com"
+            ],
+            "type": "string"
+          },
+          "why": {
+            "description": "Why there is no preview or no capture, one line; empty otherwise.",
+            "examples": [
+              ""
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "stage",
+          "url",
+          "labels_added",
+          "checks",
+          "shots",
+          "why",
+          "e2e_required",
+          "e2e_covered"
+        ],
+        "type": "object"
+      },
+      "RunPreviewCheck": {
+        "description": "One preview or end-to-end check on the head of the run's pull request.",
+        "properties": {
+          "name": {
+            "description": "The check's name, as GitHub shows it.",
+            "examples": [
+              "E2E on preview"
+            ],
+            "type": "string"
+          },
+          "outcome": {
+            "description": "`passed`, `failed`, `running` or `skipped`.",
+            "examples": [
+              "passed"
+            ],
+            "type": "string"
+          },
+          "url": {
+            "description": "The check's page on GitHub; empty when it has none.",
+            "examples": [
+              "https://github.com/acme/web/actions/runs/1/job/2"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "outcome",
+          "url"
+        ],
+        "type": "object"
+      },
+      "RunPreviewShot": {
+        "description": "One page captured on the preview.",
+        "properties": {
+          "page": {
+            "description": "The page's path on the preview.",
+            "examples": [
+              "/signup"
+            ],
+            "type": "string"
+          },
+          "src": {
+            "description": "The image's address.",
+            "examples": [
+              "https://github.com/acme/web/blob/abc/pr-1/abc/signup-desktop.png?raw=true"
+            ],
+            "type": "string"
+          },
+          "width": {
+            "description": "`desktop` or `phone`.",
+            "examples": [
+              "desktop"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "page",
+          "width",
+          "src"
         ],
         "type": "object"
       },

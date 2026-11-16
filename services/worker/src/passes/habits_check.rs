@@ -90,6 +90,12 @@ pub struct PrFacts {
     /// Dependents the plan updates that the branch doesn't touch.
     #[serde(default)]
     pub not_updated: Vec<String>,
+    /// The change alters what a person sees in a repository with an
+    /// end-to-end suite and adds or updates no spec in it: the line the
+    /// coder acts on (`common::preview::E2eNeed::instruction`). Empty when
+    /// no spec is needed or one is there.
+    #[serde(default)]
+    pub e2e_missing: String,
 }
 
 /// Why the check didn't give a result.
@@ -441,6 +447,54 @@ fn repro_waived(plan: &PlanResult) -> bool {
         .is_some_and(|d| !d.habits.repro.not_feasible.trim().is_empty())
 }
 
+/// The line for a change no changed test proves.
+pub const UNPROVEN: &str = "No changed test fails without the change, so nothing proves it. Write a test that fails on the base code and passes with the change (a unit test, or an end-to-end spec when the behaviour is what a person sees in the browser), through code that exists on the base.";
+
+/// Whether the change's tests prove nothing: test files were changed with
+/// the code, and none fails without the change. A new feature's test that
+/// can't build without the new code covers it; a bug fix's must show the
+/// failure. Not when the plan says no failing test can be written.
+pub fn unproven(f: &PrFacts, plan: &PlanResult) -> bool {
+    if f.tests.is_empty() || repro_waived(plan) {
+        return false;
+    }
+    let proven = f.tests.iter().any(|t| {
+        t.verdict == Verdict::Proven || (!f.bug && t.verdict == Verdict::FailsBeforeAsserting)
+    });
+    !proven
+}
+
+/// The progress note for the check's result: "passed" only when a changed
+/// test proves the change (or none needs to) and nothing blocks.
+pub fn verdict_note(f: &PrFacts, plan: &PlanResult, blocking: &[String]) -> String {
+    let proven = f
+        .tests
+        .iter()
+        .filter(|t| t.verdict == Verdict::Proven)
+        .count();
+    let counts = format!(
+        "{proven} of {} changed test file(s) fail without the change and pass with it",
+        f.tests.len()
+    );
+    if unproven(f, plan) {
+        let why = if f.tests.iter().all(|t| t.verdict == Verdict::NotRun) {
+            "no test could be run both ways here"
+        } else {
+            "nothing proves the change"
+        };
+        return format!("Tests and scope check not passed: {counts}; {why}. Listed under Open items until a test that fails without the change is added.");
+    }
+    if !blocking.is_empty() {
+        return format!(
+            "Tests and scope check not passed: {counts}; {} item(s) open",
+            blocking.len()
+        );
+    }
+    format!(
+        "Tests and scope check passed: {counts}; no file changed outside the plan without a reason"
+    )
+}
+
 /// What the coder must fix, one line each. Empty when the change holds.
 pub fn blocking(f: &PrFacts, plan: &PlanResult) -> Vec<String> {
     let mut out = Vec::new();
@@ -465,6 +519,14 @@ pub fn blocking(f: &PrFacts, plan: &PlanResult) -> Vec<String> {
             )),
             _ => {}
         }
+    }
+    // Nothing proves the change: changed tests ran both ways and not one
+    // fails without it. A passing count of zero is never a pass.
+    if unproven(f, plan) && f.tests.iter().any(|t| t.verdict != Verdict::NotRun) {
+        out.push(UNPROVEN.to_string());
+    }
+    if !f.e2e_missing.is_empty() {
+        out.push(f.e2e_missing.clone());
     }
     if f.bug && f.tests.is_empty() && !repro_waived(plan) && f.no_tests.contains("no test file") {
         out.push("This is a bug fix and the change has no test that fails without it. Add the test that reproduces the reported failure (it must fail on the base code and pass with the fix).".to_string());
@@ -497,7 +559,11 @@ pub fn fix_feedback(lines: &[String]) -> String {
 
 /// What is still open after the fix rounds, for Open items.
 pub fn open_findings(f: &PrFacts, plan: &PlanResult) -> Vec<Finding> {
-    blocking(f, plan)
+    let mut lines = blocking(f, plan);
+    if unproven(f, plan) && !lines.iter().any(|l| l == UNPROVEN) {
+        lines.push(UNPROVEN.to_string());
+    }
+    lines
         .into_iter()
         .map(|l| {
             let (point, settle) = if l.contains("no task of the plan") {
@@ -509,6 +575,11 @@ pub fn open_findings(f: &PrFacts, plan: &PlanResult) -> Vec<Finding> {
                 (
                     "Dependent not updated",
                     "CoderHelm updates it in its next round on this pull request.",
+                )
+            } else if l.contains("no end-to-end spec there covers it") {
+                (
+                    "No end-to-end test for a visible change",
+                    "CoderHelm writes the spec in its next round on this pull request and runs it on the preview.",
                 )
             } else {
                 (
@@ -923,6 +994,31 @@ pub async fn gate(
     outcome
 }
 
+/// The missing end-to-end spec's line for a change a person sees in the
+/// browser, read from the changed paths and the repository's tree (its
+/// e2e suite). Empty when none is needed, one is there, or the tree
+/// can't be read.
+async fn e2e_missing(w: &super::proof::Work<'_>, paths: &[String]) -> String {
+    if !paths.iter().any(|p| common::preview::is_user_visible(p)) {
+        return String::new();
+    }
+    let tree: Vec<String> = match w
+        .github
+        .get_tree(&w.msg.repo_owner, &w.msg.repo_name, w.branch)
+        .await
+    {
+        Ok(t) => t.into_iter().map(|e| e.path).collect(),
+        Err(e) => {
+            warn!(run_id = w.run_id, error = %e, "Could not read the tree for the e2e suite");
+            return String::new();
+        }
+    };
+    let suite = common::preview::e2e_suite(&tree);
+    common::preview::e2e_need(paths, suite.as_ref())
+        .instruction()
+        .unwrap_or_default()
+}
+
 /// A bench for a step with no time for the sandbox: nothing runs, and each
 /// test says so.
 struct NoTime;
@@ -986,7 +1082,7 @@ async fn check_and_fix(
             branch: w.branch,
         };
         let bench: &dyn Bench = if short { &NoTime } else { &sandbox };
-        let facts = check_once(
+        let mut facts = check_once(
             bench,
             &diff,
             w.plan,
@@ -995,6 +1091,7 @@ async fn check_and_fix(
             &evidence.notes,
         )
         .await;
+        facts.e2e_missing = e2e_missing(w, &paths).await;
         let blocking = blocking(&facts, w.plan);
         info!(
             run_id = w.run_id,
@@ -1004,20 +1101,12 @@ async fn check_and_fix(
             rounds = w.ledger.update(|l| l.habits.rounds),
             "Check of the change against the plan's habits complete"
         );
-        let proven = facts
-            .tests
-            .iter()
-            .filter(|t| t.verdict == Verdict::Proven)
-            .count();
         if blocking.is_empty() {
             super::add_progress_note(
                 w.state,
                 &w.msg.team_id,
                 w.run_id,
-                &format!(
-                    "Tests and scope check passed: {proven} of {} changed test file(s) fail without the change and pass with it; no file changed outside the plan without a reason",
-                    facts.tests.len()
-                ),
+                &verdict_note(&facts, w.plan, &blocking),
             )
             .await;
             return Ok(Some(facts));
@@ -1212,6 +1301,73 @@ mod tests {
         assert_eq!(runs[2], run(2, "No test files found"));
     }
 
+    /// A run's check once read "passed: 0 of 6 changed test file(s) fail
+    /// without the change": six tests, none proving anything, called a
+    /// pass. Zero is never a pass.
+    #[tokio::test]
+    async fn six_changed_tests_none_failing_without_the_change_is_not_passed() {
+        let p = plan(TASKS, TicketIntent::Bug, Habits::default());
+        let six: Vec<String> = (1..=6).map(|i| format!("src/cart/t{i}.test.ts")).collect();
+        let mut paths: Vec<&str> = six.iter().map(String::as_str).collect();
+        paths.push("src/cart/total.ts");
+        let bench = Fake(Ok(Runs {
+            with: vec![run(0, ""); 6],
+            without: vec![run(0, ""); 6],
+        }));
+        let f = check_once(&bench, &diff(&paths), &p, "acme/shop-api", &[], "").await;
+        assert_eq!(f.tests.len(), 6);
+        assert!(unproven(&f, &p));
+        let b = blocking(&f, &p);
+        assert!(b.contains(&UNPROVEN.to_string()), "{b:?}");
+        let note = verdict_note(&f, &p, &b);
+        assert!(
+            note.starts_with("Tests and scope check not passed: 0 of 6"),
+            "{note}"
+        );
+        assert!(!note.contains("check passed"));
+        // A feature's own tests too: the gap is closed by writing one that
+        // fails without the change.
+        let feature = plan(TASKS, TicketIntent::Feature, Habits::default());
+        assert!(blocking(&f, &feature).contains(&UNPROVEN.to_string()));
+    }
+
+    #[tokio::test]
+    async fn tests_that_could_not_run_both_ways_are_not_a_pass_either() {
+        let p = plan(TASKS, TicketIntent::Bug, Habits::default());
+        let bench = Fake(Err("the sandbox gave no result".into()));
+        let d = diff(&["src/cart/total.ts", "src/cart/total.test.ts"]);
+        let f = check_once(&bench, &d, &p, "acme/shop-api", &[], "").await;
+        // No fix round can make the sandbox run: open, never "passed".
+        assert!(!blocking(&f, &p).contains(&UNPROVEN.to_string()));
+        assert!(verdict_note(&f, &p, &[]).starts_with("Tests and scope check not passed"));
+        assert!(open_findings(&f, &p)
+            .iter()
+            .any(|o| o.point == "Test doesn't prove the change"));
+    }
+
+    #[tokio::test]
+    async fn a_visible_change_with_no_e2e_spec_goes_back_to_the_coder() {
+        let p = plan(TASKS, TicketIntent::Feature, Habits::default());
+        let mut f = PrFacts::default();
+        let suite = common::preview::Suite {
+            dir: "e2e".into(),
+            runner: "playwright".into(),
+        };
+        f.e2e_missing = common::preview::e2e_need(
+            &["web/src/components/cart/total.tsx".to_string()],
+            Some(&suite),
+        )
+        .instruction()
+        .unwrap();
+        let b = blocking(&f, &p);
+        assert_eq!(b.len(), 1);
+        assert!(b[0].contains("no end-to-end spec there covers it"));
+        assert_eq!(
+            open_findings(&f, &p)[0].point,
+            "No end-to-end test for a visible change"
+        );
+    }
+
     #[tokio::test]
     async fn a_test_that_passes_either_way_goes_back_to_the_coder() {
         let p = plan(TASKS, TicketIntent::Bug, Habits::default());
@@ -1223,8 +1379,9 @@ mod tests {
         let f = check_once(&bench, &d, &p, "acme/shop-api", &[], "").await;
         assert_eq!(f.tests[0].verdict, Verdict::PassesEitherWay);
         let b = blocking(&f, &p);
-        assert_eq!(b.len(), 1);
+        assert_eq!(b.len(), 2);
         assert!(b[0].contains("passes with the change taken out"));
+        assert_eq!(b[1], UNPROVEN);
         assert!(fix_feedback(&b).contains("Do not delete or skip a test"));
         let open = open_findings(&f, &p);
         assert_eq!(open[0].point, "Test doesn't prove the change");

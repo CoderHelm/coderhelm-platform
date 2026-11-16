@@ -2701,11 +2701,14 @@ impl GitHubClient {
                 }),
             })
             .collect();
+        // An empty base: a tree of only these entries.
+        let body = if base_tree.is_empty() {
+            serde_json::json!({"tree": entries})
+        } else {
+            serde_json::json!({"base_tree": base_tree, "tree": entries})
+        };
         let t = self
-            .post(
-                &format!("{API_BASE}/repos/{owner}/{repo}/git/trees"),
-                &serde_json::json!({"base_tree": base_tree, "tree": entries}),
-            )
+            .post(&format!("{API_BASE}/repos/{owner}/{repo}/git/trees"), &body)
             .await?;
         t["sha"]
             .as_str()
@@ -2728,6 +2731,91 @@ impl GitHubClient {
             serde_json::json!({"message": message, "tree": tree, "parents": parents}),
         )
         .await
+    }
+
+    /// The address each deployment of `sha` reports, as (environment, url):
+    /// the newest status of each deployment that has one.
+    pub async fn deployment_urls(
+        &self,
+        owner: &str,
+        repo: &str,
+        sha: &str,
+    ) -> Result<Vec<(String, String)>, Box<dyn std::error::Error + Send + Sync>> {
+        let deps = self
+            .get(&format!(
+                "{API_BASE}/repos/{owner}/{repo}/deployments?sha={sha}&per_page=10"
+            ))
+            .await?;
+        let mut out = Vec::new();
+        for d in deps.as_array().into_iter().flatten().take(10) {
+            let (Some(id), env) = (d["id"].as_u64(), d["environment"].as_str().unwrap_or(""))
+            else {
+                continue;
+            };
+            let st = self
+                .get(&format!(
+                    "{API_BASE}/repos/{owner}/{repo}/deployments/{id}/statuses?per_page=5"
+                ))
+                .await?;
+            if let Some(url) = st
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|s| {
+                    s["environment_url"]
+                        .as_str()
+                        .or_else(|| s["target_url"].as_str())
+                })
+                .find(|u| u.starts_with("https://"))
+            {
+                out.push((env.to_string(), url.to_string()));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Points a ref outside `refs/heads/` (no workflow starts on it) at
+    /// `sha`, creating it when it doesn't exist. Only for CoderHelm's own
+    /// refs, such as the one its pull request screenshots are kept on.
+    pub async fn set_own_ref(
+        &self,
+        owner: &str,
+        repo: &str,
+        name: &str,
+        sha: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let name = name.trim_start_matches("refs/");
+        if name.starts_with("heads/") || name.starts_with("tags/") || !name.contains('/') {
+            return Err(
+                format!("`refs/{name}` is not a ref CoderHelm keeps its own files on").into(),
+            );
+        }
+        let patched = self
+            .patch(
+                &format!("{API_BASE}/repos/{owner}/{repo}/git/refs/{name}"),
+                &serde_json::json!({"sha": sha, "force": true}),
+            )
+            .await;
+        if patched.is_ok() {
+            return Ok(());
+        }
+        self.post(
+            &format!("{API_BASE}/repos/{owner}/{repo}/git/refs"),
+            &serde_json::json!({"ref": format!("refs/{name}"), "sha": sha}),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// The commit a ref outside `refs/heads/` points at, if it exists.
+    pub async fn own_ref(&self, owner: &str, repo: &str, name: &str) -> Option<String> {
+        let name = name.trim_start_matches("refs/");
+        self.get(&format!("{API_BASE}/repos/{owner}/{repo}/git/ref/{name}"))
+            .await
+            .ok()?
+            .pointer("/object/sha")?
+            .as_str()
+            .map(str::to_string)
     }
 
     /// Moves `branch` forward to `to` only if it still points at `lease` and

@@ -192,7 +192,10 @@ async fn a_test_that_passes_without_the_fix_and_a_stray_file_go_back_to_the_code
     let f =
         habits_check::check_once(&both_pass, &first, &p, OWN, &[], "Evidence: none needed").await;
     let blocking = habits_check::blocking(&f, &p);
-    assert_eq!(blocking.len(), 3, "{blocking:?}");
+    // Plus: no changed test fails without the change, so nothing proves
+    // it (`habits_check::UNPROVEN`): never a pass.
+    assert_eq!(blocking.len(), 4, "{blocking:?}");
+    assert!(blocking.contains(&habits_check::UNPROVEN.to_string()));
     let feedback = habits_check::fix_feedback(&blocking);
     assert!(feedback.contains("`src/cart/total.test.ts` passes with the change taken out"));
     assert!(feedback.contains("`src/utils/format.ts` was changed and is no task of the plan"));

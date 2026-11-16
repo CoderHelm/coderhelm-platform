@@ -384,7 +384,7 @@ fn the_watch_costs_nothing_while_nothing_changed_and_picks_the_round_back_up() {
     );
     assert!(
         look.find("resume_after_limit(").unwrap()
-            < look.find("decide(&c.status, &seen, &c.marks)").unwrap()
+            < look.find("decide_all(&c.status, &seen, &c.marks)").unwrap()
     );
     // Once per round: claimed against when that round stopped.
     let done = Marks {

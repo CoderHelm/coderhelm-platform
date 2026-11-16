@@ -66,6 +66,7 @@ mod tests {
         ("common/src/setup/facts.rs", "gathers the facts setup/ai.rs reads (routed)"),
         ("common/src/skill_apply.rs", "fits team standards into a reader's prompt; each reader is routed"),
         ("common/src/tool_registry.rs", "tool risk table"),
+        ("common/src/preview.rs", "names the conventions an end-to-end spec follows in a line the coder (routed) reads; runs nothing"),
         ("common/src/agent_policy/registry.rs", "tool risk table"),
         ("common/src/agent_policy/model.rs", "records an admin's accepted sandbox host"),
         ("common/src/agent_policy/sandbox.rs", "suggests sandbox hosts from AGENTS.md for an admin to accept; runs nothing"),

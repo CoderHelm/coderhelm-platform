@@ -41,6 +41,34 @@ use super::review_agent::Finding;
 pub const TESTS_RULE: &str =
     "tests with behavior changes (this repository's \"Require tests\" setting)";
 
+/// The rule every repository with an end-to-end suite has: a change a
+/// person sees in the browser carries a spec for it.
+pub const E2E_RULE: &str = "an end-to-end spec with every change a person sees in the browser (the repository has an end-to-end suite)";
+
+/// The review's finding for a change a person sees that adds no
+/// end-to-end spec to the repository's suite, from the changed paths and
+/// the repository's tree alone. It blocks by rule (`mandatory`): the fix
+/// round writes the spec. None when no spec is needed or one is there.
+pub fn e2e_finding(changed: &[String], tree: &[String]) -> Option<Finding> {
+    let suite = common::preview::e2e_suite(tree);
+    let need = common::preview::e2e_need(changed, suite.as_ref());
+    let body = need.instruction()?;
+    let common::preview::E2eNeed::Required { visible, .. } = &need else {
+        return None;
+    };
+    Some(Finding {
+        file: visible.first().cloned().unwrap_or_default(),
+        severity: "blocking".into(),
+        category: "tests".into(),
+        title: "No end-to-end spec for a change a person sees".into(),
+        body,
+        evidence: Some("verified-defect".into()),
+        caused_by_diff: Some(true),
+        required: Some(E2E_RULE.to_string()),
+        ..Default::default()
+    })
+}
+
 /// Why a required rule broken blocks.
 pub const REQUIRED_WHY: &str = "a rule this repository requires is broken";
 /// Why a failing check blocks.
@@ -572,6 +600,9 @@ pub fn mandatory_label(f: &Finding) -> Option<String> {
         REQUIRED_WHY if f.required.as_deref() == Some(TESTS_RULE) => {
             "Blocking (required: tests)".to_string()
         }
+        REQUIRED_WHY if f.required.as_deref() == Some(E2E_RULE) => {
+            "Blocking (required: end-to-end test)".to_string()
+        }
         REQUIRED_WHY => "Blocking (required rule)".to_string(),
         FAILING_CHECK_WHY => "Blocking (failing check)".to_string(),
         MAIN_PATH_WHY if f.evidence() == super::review_agent::Evidence::VerifiedDefect => {
@@ -592,6 +623,42 @@ pub fn settles(thread_body: &str, status: &str) -> bool {
         ["fixed", "answered", "accepted"]
             .iter()
             .any(|s| status.eq_ignore_ascii_case(s))
+    }
+}
+
+#[cfg(test)]
+mod e2e_rule_tests {
+    use super::*;
+
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    /// A visible web change with no new or updated e2e spec, in a
+    /// repository with a suite, is a must-fix finding the fix round acts
+    /// on; nothing after it makes it a note.
+    #[test]
+    fn a_visible_change_with_no_e2e_spec_requests_changes() {
+        let tree = s(&["e2e/playwright.config.ts", "e2e/tests/cart.spec.ts"]);
+        let changed = s(&[
+            "web/src/components/cart/Total.tsx",
+            "web/src/components/cart/Total.test.tsx",
+        ]);
+        let f = e2e_finding(&changed, &tree).expect("a finding");
+        assert_eq!(f.severity, "blocking");
+        assert_eq!(mandatory(&f), Some(REQUIRED_WHY));
+        assert_eq!(
+            mandatory_label(&f).as_deref(),
+            Some("Blocking (required: end-to-end test)")
+        );
+        assert!(f.body.contains("`e2e/`"));
+        // With a spec, or with no suite, nothing is asked.
+        let mut with_spec = changed.clone();
+        with_spec.push("e2e/tests/cart.spec.ts".into());
+        assert!(e2e_finding(&with_spec, &tree).is_none());
+        assert!(e2e_finding(&changed, &s(&["README.md"])).is_none());
+        // A change nobody sees needs none.
+        assert!(e2e_finding(&s(&["web/src/lib/money.ts"]), &tree).is_none());
     }
 }
 
