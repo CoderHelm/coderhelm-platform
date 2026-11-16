@@ -113,6 +113,18 @@ enum Ended {
 async fn adversary(message: &WorkerMessage, pass: &str, layers: Layers) -> (Ended, Totals) {
     let record = Record::default();
     let usd_per_step = 4.0;
+    // One meter for every step: building an SDK client is the costly part,
+    // and 100,000 of them took a minute of the CI runner's CPU. No team, so
+    // `admit` asks nothing outside: only the allowance.
+    let meter = common::usage::UsageMeter::dynamo(
+        aws_sdk_dynamodb::Client::from_conf(
+            aws_sdk_dynamodb::Config::builder()
+                .behavior_version_latest()
+                .build(),
+        ),
+        "",
+        "",
+    );
     for _ in 0..100_000u32 {
         if layers.entry && !admit(&record, message).await {
             assert_eq!(*record.ended_by_entry.borrow(), 1);
@@ -128,13 +140,6 @@ async fn adversary(message: &WorkerMessage, pass: &str, layers: Layers) -> (Ende
         }));
         let refused = common::usage::with_run_allowance(allowance, async {
             // A step's calls: refused once the allowance is spent.
-            let client = aws_sdk_dynamodb::Client::from_conf(
-                aws_sdk_dynamodb::Config::builder()
-                    .behavior_version_latest()
-                    .build(),
-            );
-            // No team, so `admit` asks nothing outside: only the allowance.
-            let meter = common::usage::UsageMeter::dynamo(client, "", "");
             for _ in 0..4 {
                 if meter.admit().await.is_err() {
                     return true;

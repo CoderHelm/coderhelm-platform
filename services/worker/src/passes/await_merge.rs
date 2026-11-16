@@ -801,8 +801,15 @@ async fn publish_status(
     }
     let mut comment_id = None;
     if let Some(id) = record.status_comment_id {
-        match crate::passes::conversation::edit_own(github, owner, repo, id, "merge-status", body)
-            .await
+        match crate::passes::conversation::edit_own(
+            github,
+            owner,
+            repo,
+            msg.pr_number,
+            "merge-status",
+            body,
+        )
+        .await
         {
             Ok(_) => comment_id = Some(id),
             Err(e) => {

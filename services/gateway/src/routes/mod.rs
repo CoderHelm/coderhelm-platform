@@ -15,6 +15,7 @@ pub mod chat_eval;
 pub mod chat_hints;
 pub mod chat_policy;
 pub mod chat_work;
+pub mod chat_work_needs;
 pub mod chat_work_prs;
 pub mod chat_work_records;
 pub mod chat_work_runs;

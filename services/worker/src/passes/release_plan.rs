@@ -1926,15 +1926,20 @@ fn gate_words(tool: &str) -> &'static str {
 /// The release lines, numbered, for the ticket note and the PR.
 pub fn note_lines(r: &Release, steps: &[Step], m: &Mechanics) -> Vec<String> {
     let mut out = Vec::new();
-    if !m.deploys.is_empty() {
-        out.push(format!(
-            "How it deploys: {}.",
-            m.deploys
+    // Only the deploys this release waits on: a repository's other deploy
+    // workflows (another service, another app) are not this change's.
+    let relevant: Vec<String> = m
+        .deploys
+        .iter()
+        .filter(|d| {
+            steps
                 .iter()
-                .map(Deploy::line)
-                .collect::<Vec<_>>()
-                .join("; ")
-        ));
+                .any(|s| !s.workflow.is_empty() && s.workflow == d.file)
+        })
+        .map(Deploy::line)
+        .collect();
+    if !relevant.is_empty() {
+        out.push(format!("How it deploys: {}.", relevant.join("; ")));
     }
     for i in &r.impact {
         let env = i

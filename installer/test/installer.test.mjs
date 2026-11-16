@@ -11,7 +11,7 @@ import path from "node:path";
 import http from "node:http";
 import { main } from "../lib/cli.mjs";
 import * as cmd from "../lib/commands.mjs";
-import { buildManifest, convertCode, EVENTS, formPage, newAppUrl, PERMISSIONS, runManifestFlow, secretKeysFromApp } from "../lib/github-app.mjs";
+import { buildManifest, convertCode, EVENTS, formPage, newAppUrl, PERMISSIONS, REQUIRED_PERMISSIONS, runManifestFlow, secretKeysFromApp } from "../lib/github-app.mjs";
 import { parseSums, verifySums } from "../lib/release.mjs";
 import { initialSecret, hasGithubApp } from "../lib/secrets.mjs";
 import { checkPrereqs } from "../lib/prereqs.mjs";
@@ -213,9 +213,12 @@ test("manifest: URLs, permissions and events", () => {
   assert.deepEqual(m.default_events, EVENTS);
   // Security fixes: Dependabot alerts and the advisory events are asked for.
   assert.equal(m.default_permissions.vulnerability_alerts, "read");
-  for (const k of ["deployments", "repository_advisories", "code_quality", "actions", "statuses"]) {
+  for (const k of ["deployments", "repository_advisories", "code_quality", "statuses"]) {
     assert.equal(m.default_permissions[k], "read", k);
   }
+  // Starting a workflow a step needs (workflow_dispatch); read stays required.
+  assert.equal(m.default_permissions.actions, "write");
+  assert.equal(REQUIRED_PERMISSIONS.actions, "read");
   assert.equal(m.default_permissions.checks, "write");
   assert.equal(m.default_permissions.workflows, "write");
   assert.ok(m.default_events.includes("dependabot_alert"));
