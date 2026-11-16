@@ -680,6 +680,9 @@ async fn handle_message_inner(state: Arc<WorkerState>, message: models::WorkerMe
                 descriptions_rebuilt = ?watch.caught_up,
                 "Pull request watch sweep done"
             );
+            // A sweep GitHub's budget skipped looks again once the budget
+            // refills, not at the next scheduled sweep.
+            passes::ready::sweep_follow_up(&state, &[drafts.retry_in, watch.retry_in]).await;
             // Deploy counts that stopped between passes carry on without
             // waiting for someone to open Analytics.
             let resumed = as_sweep(who::SWEEP_DEPLOYS, passes::deploy_stats::sweep(&state)).await;
