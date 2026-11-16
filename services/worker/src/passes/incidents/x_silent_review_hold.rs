@@ -85,7 +85,7 @@ fn says(d: &Decision) -> String {
             .map(|r| r.line())
             .collect::<Vec<_>>()
             .join("\n"),
-        Decision::Wait { why, .. } => why.clone(),
+        Decision::Wait { why, .. } | Decision::Retry { why, .. } => why.clone(),
         Decision::Ready { open } => open.join("\n"),
         Decision::Closed => String::new(),
     }
@@ -121,7 +121,7 @@ fn a_missing_review_is_queued_and_waited_for_never_held_on() {
         ..held_facts()
     };
     assert!(ready::wants_review(&ci_red));
-    let d = ready::decide(&ci_red);
+    let d = ready::found(&ci_red);
     assert!(matches!(d, Decision::Held { .. }));
     assert!(
         says(&d).contains("CoderHelm is reviewing this head"),
@@ -140,7 +140,7 @@ fn a_review_that_never_comes_is_named() {
         ..held_facts()
     };
     assert!(!ready::wants_review(&off));
-    let d = ready::decide(&off);
+    let d = ready::found(&off);
     assert!(matches!(d, Decision::Held { .. }));
     assert!(
         says(&d).contains("reviewer is off for this repository"),

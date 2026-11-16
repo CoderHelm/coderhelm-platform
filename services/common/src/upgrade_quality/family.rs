@@ -60,6 +60,10 @@ pub enum Evidence {
     },
     /// The members share a scope or a name stem. Supporting only.
     NamePattern { pattern: String },
+    /// No registry record named a source repository, and the base branch's
+    /// lockfile installs every member of the scope on one minor line
+    /// ([`scope_siblings`]).
+    ScopeAndLine { scope: String, line: String },
 }
 
 impl Evidence {
@@ -75,6 +79,9 @@ impl Evidence {
                 format!("`{from}` declares the peer range `{range}` for `{on}`")
             }
             Evidence::NamePattern { pattern } => format!("the names share `{pattern}`"),
+            Evidence::ScopeAndLine { scope, line } => format!(
+                "the base branch's lockfile installs each package of `{scope}/` it has on {line}"
+            ),
         }
     }
 }
@@ -298,8 +305,27 @@ pub fn detect(
             range: range.clone(),
         });
     }
+    // No registry record named a source repository: the lockfile alone.
+    // Packages of the bumped one's scope the base branch installs on its
+    // minor line are released together (`@scope/common`, `@scope/core`,
+    // `@scope/platform-x`). A dependency pull request once raised one of
+    // them and left its siblings a minor behind.
+    let mut scope_line: Option<(String, String)> = None;
+    if source.is_none() && members.is_empty() {
+        let siblings = scope_siblings(package, from, base);
+        if !siblings.is_empty() {
+            scope_line = Some((stem(package).to_string(), minor_line(from).to_string()));
+            members.extend(siblings);
+        }
+    }
     if members.is_empty() && independent.is_empty() {
         return None;
+    }
+    if let Some((scope, line)) = &scope_line {
+        evidence.push(Evidence::ScopeAndLine {
+            scope: scope.clone(),
+            line: line.clone(),
+        });
     }
     let mut patterns: Vec<String> = members
         .iter()
@@ -312,6 +338,7 @@ pub fn detect(
     }
     let key = match (&source, evidence.first()) {
         (Some(repo), Some(Evidence::SameSource { .. })) | (Some(repo), None) => repo.clone(),
+        (_, Some(Evidence::ScopeAndLine { scope, line })) => format!("{scope}/ on {line}"),
         _ => format!("peers of {package}"),
     };
     members.insert(package.to_string());
@@ -325,6 +352,39 @@ pub fn detect(
         independent,
         ..Default::default()
     })
+}
+
+/// `major.minor` of a version (`1.4.2` is `1.4`); the version itself when
+/// it has fewer parts.
+pub fn minor_line(v: &str) -> &str {
+    let v = v.trim().trim_start_matches(['v', '=', '^', '~']);
+    match v.match_indices('.').nth(1) {
+        Some((i, _)) => &v[..i],
+        None => v,
+    }
+}
+
+/// The packages of `package`'s scope the base branch's lockfile installs
+/// on the minor line of `from`: its siblings when no registry record names
+/// a source repository. Only scoped names (`@scope/x`); the scope of type
+/// declarations, whose packages are versioned one by one, is never a
+/// family.
+pub fn scope_siblings(package: &str, from: &str, base: &[(String, String)]) -> Vec<String> {
+    let scope = stem(package);
+    if !scope.starts_with('@') || scope.eq_ignore_ascii_case("@types") {
+        return vec![];
+    }
+    let line = minor_line(from);
+    let mut out: Vec<String> = base
+        .iter()
+        .filter(|(n, _)| !n.eq_ignore_ascii_case(package))
+        .filter(|(n, _)| stem(n).eq_ignore_ascii_case(scope))
+        .filter(|(_, v)| minor_line(v) == line)
+        .map(|(n, _)| n.clone())
+        .collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// The version a family moves to: the lowest of `wanted` (the versions
