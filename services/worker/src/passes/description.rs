@@ -832,6 +832,7 @@ async fn build(
             number,
             ticket_id,
             &pr,
+            fresh,
         )
         .await
     } else {

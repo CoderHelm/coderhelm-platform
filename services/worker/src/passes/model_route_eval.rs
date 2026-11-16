@@ -983,6 +983,7 @@ async fn route_implement_live() {
                     None,
                     None,
                     None,
+                    crate::agent::llm::AnswerForm::Auto,
                 )
                 .await
                 .map_err(|e| e.to_string());

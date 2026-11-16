@@ -263,9 +263,9 @@ pub fn send_back(asked: &[(Question, Verdict)], settled: &[Answer]) -> String {
     }
     out.push_str(
         "Plan with what is settled now. Use CLARIFICATION_NEEDED only for something still \
-         open, asking about that alone. Output the COMPLETE plan again in exactly the same \
-         format as before (every file block, the fix decision included).",
+         open, asking about that alone. ",
     );
+    out.push_str(common::run_questions::CHANGED_FILES_ONLY);
     out
 }
 

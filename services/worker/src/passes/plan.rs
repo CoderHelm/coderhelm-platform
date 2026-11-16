@@ -13,7 +13,7 @@ use crate::WorkerState;
 /// any change to how plans are made or what a plan must carry, so a plan
 /// written by an older planner is never reused.
 pub const PLANNER_VERSION: &str =
-    "2026-11-13.intent-history-env-near-match-stop-rules-data-rules-cross-repo-asking-reproduce-decision-reask-series-habits";
+    "2026-11-15.intent-history-env-near-match-stop-rules-data-rules-cross-repo-asking-reproduce-decision-reask-series-habits-sections";
 
 /// The openspec file holding the plan's end-to-end checklist, readable.
 pub const END_TO_END_FILE: &str = "end_to_end.md";
@@ -46,6 +46,16 @@ const OUTSIDE_TOOLS: &[&str] = &[
 ];
 
 pub async fn mark_plan_run(state: &WorkerState, msg: &TicketMessage, run_id: &str) {
+    write_plan_run(state, msg, run_id).await
+}
+
+/// The cached plan belongs to no run: the run's next step plans again
+/// instead of taking up a plan that was not usable.
+pub async fn unmark_plan_run(state: &WorkerState, msg: &TicketMessage) {
+    write_plan_run(state, msg, "").await
+}
+
+async fn write_plan_run(state: &WorkerState, msg: &TicketMessage, run_id: &str) {
     let prefix = crate::passes::openspec_prefix(
         &msg.team_id,
         &msg.ticket_id,
@@ -114,33 +124,91 @@ pub fn review_draft(files: &PlanResult) -> String {
 }
 
 /// What the planner is told after the review: the notes as advice, and to
-/// answer with the whole plan again.
+/// answer with only the files the notes change (see
+/// `common::run_questions::CHANGED_FILES_ONLY`).
 pub fn revision_prompt(advice: &str) -> String {
     format!(
         "{advice}\n\nRevise your plan once with these notes: change it only where a note points \
-         to a real gap for this change. Then output the COMPLETE plan again in exactly the same \
-         format as before (every file block, the fix decision included), not just the changes."
+         to a real gap for this change. {}",
+        common::run_questions::CHANGED_FILES_ONLY
     )
 }
 
-/// The revised plan when it parsed into a plan, else the draft. The
+/// The draft with the revision's files over it (see `plan_sections::merge`):
+/// a file the revision wrote in full replaces the draft's, anything else
+/// keeps the draft's. A revision that turns the plan into a directive
+/// (nothing needed, a question) is not taken from a review's notes. The
 /// decision on where the fix belongs stays the draft's: it was checked
-/// against the planner's trace, and a review doesn't move it.
-pub fn take_revision(draft: PlanResult, revised: PlanResult) -> (PlanResult, bool) {
-    let lost_design = revised.design.trim().is_empty() && !draft.design.trim().is_empty();
-    if !reviewable(&revised) || lost_design {
+/// against the planner's trace, and a review doesn't move it. True when the
+/// revision changed a file.
+pub fn take_revision(
+    draft: PlanResult,
+    text: &str,
+    intent: super::triage::TicketIntent,
+) -> (PlanResult, bool) {
+    use super::plan_sections::{read, valid, State, FILES};
+    let answer = read(text);
+    let wrote = |n: &str| answer.state(n) == State::Complete && valid(n, answer.complete(n));
+    if wrote("tasks.md") && super::plan_sections::directive(answer.complete("tasks.md")) {
         return (draft, false);
     }
-    (
-        PlanResult {
-            fix: draft.fix,
-            ..revised
-        },
-        true,
-    )
+    let took = FILES.iter().any(|n| wrote(n));
+    let fix = draft.fix.clone();
+    let (mut out, _) = super::plan_sections::merge(draft, plan_of(&answer, intent), &answer);
+    out.fix = fix;
+    (out, took)
+}
+
+/// Reads a revision's reply over the plan before it (see
+/// `plan_sections::merge`): a reply that failed, or came back empty, cut
+/// off or malformed, never replaces a valid file. `answer` becomes the
+/// reply's own blocks.
+fn revise(
+    files: &mut PlanResult,
+    answer: &mut super::plan_sections::Answer,
+    reply: Result<String, Box<dyn std::error::Error + Send + Sync>>,
+    intent: super::triage::TicketIntent,
+    ticket_id: &str,
+    what: &str,
+) {
+    let text = match reply {
+        Ok(t) => t,
+        Err(e) => {
+            warn!(ticket_id = %ticket_id, error = %e, what, "Plan revision failed; the plan before it stands");
+            return;
+        }
+    };
+    let read = super::plan_sections::read(&text);
+    let revised = plan_of(&read, intent);
+    let (merged, lost) = super::plan_sections::merge(std::mem::take(files), revised, &read);
+    if !lost.is_empty() {
+        warn!(ticket_id = %ticket_id, files = ?lost, what, "Plan revision lost files (cut off or empty); the earlier ones stand");
+    }
+    *files = merged;
+    *answer = read;
+}
+
+/// A repair's options: the planner's own, a few turns to finish the files
+/// (a cut file continues where it stopped); the second repair with twice
+/// the output budget and more effort.
+fn repair_opts(plan_opts: llm::ConverseOptions, repair: u32) -> llm::ConverseOptions {
+    if repair <= 1 {
+        llm::ConverseOptions {
+            max_turns: 3,
+            ..plan_opts
+        }
+    } else {
+        llm::ConverseOptions {
+            max_turns: 3,
+            max_tokens: plan_opts.max_tokens.saturating_mul(2),
+            effort: Some("xhigh"),
+            ..plan_opts
+        }
+    }
 }
 
 /// Result of the plan pass: the four openspec files.
+#[derive(Clone, Default)]
 pub struct PlanResult {
     pub proposal: String,
     pub design: String,
@@ -785,7 +853,7 @@ Then the ```fix_location.json block described above."#,
     let model_id = provider.judgment_model_id();
     let can_look_up = live.as_ref().is_some_and(|l| !l.tools().is_empty());
     let lookups = || live.as_ref().map_or(0, |l| l.lookups_made());
-    let mut response = provider::converse(
+    let response = provider::converse_document(
         state,
         provider,
         common::agent_policy::Agent::Planner,
@@ -796,8 +864,6 @@ Then the ```fix_location.json block described above."#,
         &executor,
         usage,
         plan_opts,
-        None,
-        None,
     )
     .await?;
     // A decision about data that skipped part of the trace (no lookups, no
@@ -810,7 +876,8 @@ Then the ```fix_location.json block described above."#,
             .map(|r| r.clone())
             .unwrap_or_default()
     };
-    let draft = parse_openspec_files(&response, intent);
+    let mut answer = super::plan_sections::read(&response);
+    let draft = plan_of(&answer, intent);
     info!(
         ticket_id = %msg.ticket_id,
         consulted = ?executor.read_only.consulted.repos(),
@@ -892,6 +959,10 @@ Then the ```fix_location.json block described above."#,
             super::plan_file_gaps(github, &msg.repo_owner, &msg.repo_name, &draft.tasks).await,
         );
     }
+    // The plan as it stands: the draft, then each revision over it (see
+    // `plan_sections::merge`). A revision that comes back empty, cut off or
+    // malformed never replaces a file of a valid plan.
+    let mut files = draft.clone();
     if !back.is_empty() {
         info!(
             ticket_id = %msg.ticket_id,
@@ -905,32 +976,31 @@ Then the ```fix_location.json block described above."#,
                 serde_json::json!({"type": "text", "text": super::fix_location::send_back(&back)}),
             ],
         ));
-        response = provider::converse(
-            state,
-            provider,
-            common::agent_policy::Agent::Planner,
-            model_id,
-            &full_system,
-            &mut messages,
-            &tools,
-            &executor,
-            usage,
-            plan_opts,
-            None,
-            None,
-        )
-        .await?;
+        revise(
+            &mut files,
+            &mut answer,
+            provider::converse_document(
+                state,
+                provider,
+                common::agent_policy::Agent::Planner,
+                model_id,
+                &full_system,
+                &mut messages,
+                &tools,
+                &executor,
+                usage,
+                plan_opts,
+            )
+            .await,
+            intent,
+            &msg.ticket_id,
+            "plan check",
+        );
     }
     if let Some(s) = &skills {
         s.drain_usage_into(usage);
     }
 
-    let mut files = parse_openspec_files(&response, intent);
-    // A plan that asks what is settled on the ticket (answers given in
-    // CoderHelm, choices people made on its notices), or what CoderHelm
-    // decides itself, goes back once with the answers (the model judges
-    // each question against them, see `resolved`). What it still asks
-    // after that is filtered below.
     let asked = clarification_of(&files.tasks);
     let verdicts = super::resolved::judge(state, provider, &asked, &msg.answers, usage).await;
     let repeats: Vec<(common::run_questions::Question, super::resolved::Verdict)> = asked
@@ -952,22 +1022,26 @@ Then the ```fix_location.json block described above."#,
                 "text": super::resolved::send_back(&repeats, &msg.answers),
             })],
         ));
-        response = provider::converse(
-            state,
-            provider,
-            common::agent_policy::Agent::Planner,
-            model_id,
-            &full_system,
-            &mut messages,
-            &tools,
-            &executor,
-            usage,
-            plan_opts,
-            None,
-            None,
-        )
-        .await?;
-        files = parse_openspec_files(&response, intent);
+        revise(
+            &mut files,
+            &mut answer,
+            provider::converse_document(
+                state,
+                provider,
+                common::agent_policy::Agent::Planner,
+                model_id,
+                &full_system,
+                &mut messages,
+                &tools,
+                &executor,
+                usage,
+                plan_opts,
+            )
+            .await,
+            intent,
+            &msg.ticket_id,
+            "settled questions",
+        );
     }
     // The stop rules (see stop_gate): a question about the run's own
     // tooling is never asked, one resting on a difference between
@@ -1005,22 +1079,26 @@ Then the ```fix_location.json block described above."#,
                     "text": common::stop_rules::screen::send_back(&s, diagnosis.as_ref()),
                 })],
             ));
-            response = provider::converse(
-                state,
-                provider,
-                common::agent_policy::Agent::Planner,
-                model_id,
-                &full_system,
-                &mut messages,
-                &tools,
-                &executor,
-                usage,
-                plan_opts,
-                None,
-                None,
-            )
-            .await?;
-            files = parse_openspec_files(&response, intent);
+            revise(
+                &mut files,
+                &mut answer,
+                provider::converse_document(
+                    state,
+                    provider,
+                    common::agent_policy::Agent::Planner,
+                    model_id,
+                    &full_system,
+                    &mut messages,
+                    &tools,
+                    &executor,
+                    usage,
+                    plan_opts,
+                )
+                .await,
+                intent,
+                &msg.ticket_id,
+                "stop rules",
+            );
             let again = clarification_of(&files.tasks);
             if !again.is_empty() {
                 let s = super::stop_gate::screen_questions(
@@ -1067,13 +1145,86 @@ Then the ```fix_location.json block described above."#,
             }
         }
     }
+    // Files still missing or cut off after the send-backs (the output limit,
+    // a revision that wrote only its last block): the planner is asked for
+    // just those files, at most `plan_sections::MAX_REPAIRS` times, the
+    // second with twice the output budget and more effort. Each answer is
+    // read file by file and merged; a valid file is never replaced by a
+    // worse one.
+    let mut repairs: u32 = 0;
+    let mut repaired: Vec<&'static str> = Vec::new();
+    while repairs < super::plan_sections::MAX_REPAIRS {
+        let names = super::plan_sections::to_repair(&files);
+        if names.is_empty() {
+            break;
+        }
+        repairs += 1;
+        warn!(
+            ticket_id = %msg.ticket_id,
+            files = ?names,
+            repair = repairs,
+            "Plan files missing or cut off — asking the planner for just those"
+        );
+        for n in &names {
+            if !repaired.contains(n) {
+                repaired.push(n);
+            }
+        }
+        messages.push((
+            "user".to_string(),
+            vec![serde_json::json!({
+                "type": "text",
+                "text": super::plan_sections::repair_prompt(&names, &answer),
+            })],
+        ));
+        let opts = repair_opts(plan_opts, repairs);
+        revise(
+            &mut files,
+            &mut answer,
+            provider::converse_document(
+                state,
+                provider,
+                common::agent_policy::Agent::Planner,
+                model_id,
+                &full_system,
+                &mut messages,
+                &tools,
+                &executor,
+                usage,
+                opts,
+            )
+            .await,
+            intent,
+            &msg.ticket_id,
+            "repair",
+        );
+    }
+    if repairs > 0 {
+        let left = super::plan_sections::missing(&files);
+        let outcome = if left.is_empty() {
+            "got them".to_string()
+        } else {
+            format!("still missing {}", left.join(", "))
+        };
+        super::add_progress_note(
+            state,
+            &msg.team_id,
+            run_id,
+            &format!(
+                "Plan check (format): {} missing or cut off; asked the planner for just those \
+                 ({repairs} time(s)): {outcome}.",
+                repaired.join(", ")
+            ),
+        )
+        .await;
+    }
     // A plan whose answer carried no decision that reads is a format
     // failure, never a question for a person: the planner is asked once
     // more for only the block (one small call, no tools), and when that
     // still gives none, the plan itself decides (see `fix_location::fallback`).
     let mut block_failure: Option<String> = None;
     if files.fix.is_none() && needs_decision(&files.tasks) {
-        let problem = match super::fix_location::parse_detailed(&response) {
+        let problem = match super::fix_location::parse_detailed(&answer.decision_text()) {
             Err(p) => p,
             Ok(_) => super::fix_location::BlockProblem::Missing,
         };
@@ -1184,11 +1335,10 @@ Then the ```fix_location.json block described above."#,
                 files.fix = Some(d);
             }
             None => {
-                return Err(format!(
-                    "Planner failure: {line}, and the plan has no tasks to decide from. \
-                     Nothing was asked of a person; retry the run."
-                )
-                .into());
+                // No decision and no tasks to decide from: the plan is not
+                // usable, and the run plans again in a fresh step (see
+                // `plan_sections::unusable` where the run reads it).
+                warn!(ticket_id = %msg.ticket_id, problem = %line, "Plan has no decision and no tasks to decide from");
             }
         }
     }
@@ -1358,7 +1508,7 @@ Then the ```fix_location.json block described above."#,
                     effort: Some(super::skills::review_effort("plan")),
                     ..plan_opts
                 };
-                match provider::converse(
+                match provider::converse_document(
                     state,
                     provider,
                     common::agent_policy::Agent::Planner,
@@ -1369,14 +1519,11 @@ Then the ```fix_location.json block described above."#,
                     &executor,
                     usage,
                     one_turn,
-                    None,
-                    None,
                 )
                 .await
                 {
                     Ok(text) => {
-                        let (kept, took) =
-                            take_revision(files, parse_openspec_files(&text, intent));
+                        let (kept, took) = take_revision(files.clone(), &text, intent);
                         files = kept;
                         revised = took;
                         if !took {
@@ -1804,43 +1951,37 @@ fn with_questions(proposal: &str, d: &super::fix_location::FixDecision) -> Strin
 /// The proposal's heading for what only a person can answer.
 const QUESTIONS_HEADING: &str = "## Questions only a person can answer";
 
+/// The plan in an answer: each openspec file the answer wrote in full (a
+/// file cut off before its fence closed reads as empty, never as complete;
+/// see `plan_sections`), and the decision block.
+#[cfg(test)]
 fn parse_openspec_files(response: &str, intent: super::triage::TicketIntent) -> PlanResult {
-    let filenames = ["proposal.md", "design.md", "tasks.md", "spec.md"];
-    let mut contents: Vec<String> = Vec::new();
+    plan_of(&super::plan_sections::read(response), intent)
+}
 
-    for filename in &filenames {
-        let marker = format!("```{filename}");
-        if let Some(start) = response.find(&marker) {
-            let content_start = response[start..]
-                .find('\n')
-                .map(|i| start + i + 1)
-                .unwrap_or(start);
-            let end = response[content_start..]
-                .find("```")
-                .map(|i| content_start + i)
-                .unwrap_or(response.len());
-            contents.push(response[content_start..end].trim().to_string());
-        } else {
-            contents.push(String::new());
-        }
-    }
-
-    let tasks_content = contents[2].clone();
-    let repo_tasks = parse_repo_tasks(&tasks_content);
-
+fn plan_of(
+    answer: &super::plan_sections::Answer,
+    intent: super::triage::TicketIntent,
+) -> PlanResult {
+    let tasks = answer.complete("tasks.md").to_string();
     PlanResult {
-        proposal: contents.remove(0),
-        design: contents.remove(0),
-        tasks: contents.remove(0),
-        spec: contents.remove(0),
-        repo_tasks,
+        proposal: answer.complete("proposal.md").to_string(),
+        design: answer.complete("design.md").to_string(),
+        repo_tasks: parse_repo_tasks(&tasks),
+        tasks,
+        spec: answer.complete("spec.md").to_string(),
         // A doubt asked early is one of the decision's questions from the
         // start, so every check of them reads it (see habits).
-        fix: super::fix_location::parse_for(response, intent).map(|mut d| {
+        fix: super::fix_location::parse_for(&answer.decision_text(), intent).map(|mut d| {
             super::habits::fold_questions(&mut d);
             d
         }),
     }
+}
+
+/// The per-repo task breakdown of a task list (see [`parse_repo_tasks`]).
+pub(super) fn repo_tasks_of(tasks: &str) -> Vec<RepoTasks> {
+    parse_repo_tasks(tasks)
 }
 
 /// Parse `## owner/repo` headers in tasks.md for multi-repo support.
@@ -2452,23 +2593,54 @@ mod plan_review_tests {
     #[test]
     fn a_revision_that_doesnt_parse_keeps_the_draft() {
         let draft = plan("- [ ] 1. Add the path");
-        let (kept, took) = take_revision(
-            draft,
-            parse_openspec_files("Sorry, here are my thoughts.", Default::default()),
-        );
+        let (kept, took) = take_revision(draft, "Sorry, here are my thoughts.", Default::default());
         assert!(!took);
         assert_eq!(kept.tasks, "- [ ] 1. Add the path");
 
         let revised = "```proposal.md\nAdd a rollback path, tested\n```\n```design.md\nD2\n```\n\
                        ```tasks.md\n- [ ] 1. Add the path\n- [ ] 2. Test the rollback\n```\n\
                        ```spec.md\nS2\n```";
-        let (kept, took) = take_revision(
-            plan("- [ ] 1. Add the path"),
-            parse_openspec_files(revised, Default::default()),
-        );
+        let (kept, took) =
+            take_revision(plan("- [ ] 1. Add the path"), revised, Default::default());
         assert!(took);
         assert!(kept.tasks.contains("Test the rollback"));
-        assert!(revision_prompt("## notes").contains("COMPLETE plan again"));
+        assert!(revision_prompt("## notes").contains("only the openspec files your changes touch"));
+    }
+
+    #[test]
+    fn a_revision_of_one_file_keeps_the_others() {
+        // The notes changed only the tasks: the design, proposal and spec
+        // stay the draft's, and the decision stays the draft's.
+        let mut draft = plan("- [ ] 1. Add the path");
+        draft.fix = Some(crate::passes::fix_location::FixDecision {
+            cause: "draft".into(),
+            ..Default::default()
+        });
+        let (kept, took) = take_revision(
+            draft,
+            "```tasks.md\n- [ ] 1. Add the path\n- [ ] 2. Test it\n```\n```fix_location.json\n{\"fix_location\":\"code\",\"cause\":\"moved\"}\n```",
+            Default::default(),
+        );
+        assert!(took);
+        assert!(kept.tasks.contains("Test it"));
+        assert_eq!(kept.proposal, "Add a rollback path");
+        assert_eq!(kept.fix.unwrap().cause, "draft");
+        // A revision cut off in its only file changes nothing.
+        let (kept, took) = take_revision(
+            plan("- [ ] 1. Add the path"),
+            "```tasks.md\n- [ ] 1. Add the path\n- [ ] 2. Te",
+            Default::default(),
+        );
+        assert!(!took);
+        assert_eq!(kept.tasks, "- [ ] 1. Add the path");
+        // Nor does one that turns the plan into "nothing needed".
+        let (kept, took) = take_revision(
+            plan("- [ ] 1. Add the path"),
+            "```tasks.md\nNO_CHANGES_NEEDED: done\n```",
+            Default::default(),
+        );
+        assert!(!took);
+        assert_eq!(kept.tasks, "- [ ] 1. Add the path");
     }
 
     #[test]

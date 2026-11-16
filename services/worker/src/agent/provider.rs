@@ -286,6 +286,75 @@ pub async fn converse(
     observer: Option<&dyn super::llm::LoopObserver>,
     conversation_log: Option<&mut Vec<serde_json::Value>>,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    converse_as(
+        state,
+        provider,
+        agent,
+        model_id,
+        system_prompt,
+        messages,
+        tools,
+        tool_executor,
+        usage,
+        opts,
+        observer,
+        conversation_log,
+        super::llm::AnswerForm::Auto,
+    )
+    .await
+}
+
+/// [`converse`] for a loop whose answer is a written document (the
+/// planner's plan): a turn cut at the output limit continues the document
+/// where it stopped, and the answer is the cut text and its continuation
+/// together (see `llm::AnswerForm::Document`).
+#[allow(clippy::too_many_arguments)]
+pub async fn converse_document(
+    state: &crate::WorkerState,
+    provider: &ModelProvider,
+    agent: common::agent_policy::Agent,
+    model_id: &str,
+    system_prompt: &str,
+    messages: &mut Vec<(String, Vec<serde_json::Value>)>,
+    tools: &[ToolDefinition],
+    tool_executor: &dyn ToolExecutor,
+    usage: &mut TokenUsage,
+    opts: ConverseOptions,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    converse_as(
+        state,
+        provider,
+        agent,
+        model_id,
+        system_prompt,
+        messages,
+        tools,
+        tool_executor,
+        usage,
+        opts,
+        None,
+        None,
+        super::llm::AnswerForm::Document,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn converse_as(
+    state: &crate::WorkerState,
+    provider: &ModelProvider,
+    agent: common::agent_policy::Agent,
+    model_id: &str,
+    system_prompt: &str,
+    messages: &mut Vec<(String, Vec<serde_json::Value>)>,
+    tools: &[ToolDefinition],
+    tool_executor: &dyn ToolExecutor,
+    usage: &mut TokenUsage,
+    opts: ConverseOptions,
+    observer: Option<&dyn super::llm::LoopObserver>,
+    conversation_log: Option<&mut Vec<serde_json::Value>>,
+    form: super::llm::AnswerForm,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     // A switch in Settings, System, Models reaches the next loop.
     common::model_provider::refresh(&state.dynamo, &state.config.settings_table_name).await;
     let client = provider.client();
@@ -318,6 +387,7 @@ pub async fn converse(
         opts.effort,
         observer,
         log,
+        form,
     )
     .await;
     if own_log {

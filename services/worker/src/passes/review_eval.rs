@@ -1116,6 +1116,7 @@ pub(super) async fn live_review_in_repo(
         None,
         None,
         None,
+        crate::agent::llm::AnswerForm::Auto,
     )
     .await
     .map_err(|e| format!("the review call failed: {e}"))?;
