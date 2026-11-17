@@ -215,7 +215,9 @@ fn the_open_branch_is_unverified_until_a_run_takes_it() {
     assert_eq!(open_arm.state, "unverified");
     let section = closed.section();
     assert!(section.contains("**Outside pages, as a probe saw them**"));
-    assert!(section.contains("unverified: no recorded run took it; CoderHelm runs it once the page shows that state"));
+    assert!(section.contains(
+        "unverified: no recorded run took it; CoderHelm runs it once the page shows that state"
+    ));
     let lines = closed.blocking();
     assert_eq!(lines.len(), 1);
     assert!(lines[0].contains(" when false: <the command"));
