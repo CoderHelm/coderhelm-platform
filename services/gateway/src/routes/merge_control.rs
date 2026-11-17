@@ -435,7 +435,7 @@ pub(crate) async fn on_comment(
             owner,
             name, pr_number, commenter, "merge control: refused (no write access)"
         );
-        reply(refusal(commenter, control)).await;
+        reply(refusal(control)).await;
         return Ok(StatusCode::OK);
     }
     let actor = Actor {
@@ -464,20 +464,20 @@ pub(crate) async fn on_comment(
     // The status comment shows a stop or re-arm; anything else (already
     // stopped, a queued review, a refusal) gets a short reply.
     if !out.ok || !matches!(out.status, "stopped" | "rearmed") || out.message.contains("queued") {
-        reply(format!("@{commenter} {}", out.message)).await;
+        reply(out.message.clone()).await;
     }
     Ok(StatusCode::OK)
 }
 
 /// Pure: the reply to someone without write access.
-pub(crate) fn refusal(commenter: &str, control: Control) -> String {
+pub(crate) fn refusal(control: Control) -> String {
     let what = match control {
         Control::Stop => "stop",
         Control::Rearm => "re-arm",
     };
     format!(
-        "@{commenter} only people with write access to this repository can {what} auto-merge, \
-         so nothing changed. Someone with write access can comment `{}` or use CoderHelm.",
+        "Only people with write access to this repository can {what} auto-merge, so nothing \
+         changed. Someone with write access can comment `{}` or use CoderHelm.",
         match control {
             Control::Stop => merge_gate::STOP_COMMAND,
             Control::Rearm => merge_gate::RESUME_COMMAND,
@@ -501,11 +501,12 @@ mod tests {
 
     #[test]
     fn a_read_only_commenter_is_refused_politely() {
-        let r = refusal("a-reader", Control::Stop);
-        assert!(r.starts_with("@a-reader only people with write access"));
+        let r = refusal(Control::Stop);
+        assert!(r.starts_with("Only people with write access"));
+        assert!(!r.contains("@a-reader"));
         assert!(r.contains("nothing changed"));
         assert!(r.contains("`@coderhelm stop auto-merge`"));
-        assert!(refusal("a-reader", Control::Rearm).contains("`@coderhelm resume auto-merge`"));
+        assert!(refusal(Control::Rearm).contains("`@coderhelm resume auto-merge`"));
     }
 
     #[test]

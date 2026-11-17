@@ -251,31 +251,36 @@ fn short(sha: &str) -> &str {
     &sha[..7.min(sha.len())]
 }
 
-/// The reply: one or two lines, the outcome first. `squash_hint` adds the
+/// The reply: one line, the outcome first, the way a colleague says it
+/// ("Merged main in (15401ad)."). A reason follows only when the outcome
+/// differs from what they asked: a merge where they asked for a rebase.
+/// `asked_rebase`: their words asked for a rebase. `squash_hint` adds the
 /// squash-on-merge note (only when they asked for a linear history and the
 /// repository allows squash merging).
-pub(crate) fn reply(outcome: &Outcome, base: &str, squash_hint: bool) -> String {
+pub(crate) fn reply(
+    outcome: &Outcome,
+    base: &str,
+    asked_rebase: bool,
+    squash_hint: bool,
+) -> String {
     let mut out = match outcome {
         Outcome::UpToDate { head } => {
-            format!(
-                "Already up to date with {base} ({}); nothing to update.",
-                short(head)
-            )
+            format!("Already up to date with {base} ({}).", short(head))
         }
-        Outcome::Rebased { sha } => format!("Done: rebased onto {base} ({}).", short(sha)),
+        Outcome::Rebased { sha } => format!("Rebased onto {base} ({}).", short(sha)),
         Outcome::Merged { sha, why } => {
-            let because = match why {
-                MergeWhy::ForcePushNotAllowed => "since force pushes aren't allowed here",
-                MergeWhy::OthersCommits => {
-                    "since the branch has commits from other people that a rebase would rewrite"
-                }
-                MergeWhy::RebaseNotClean => "since its commits didn't replay cleanly",
-                MergeWhy::BranchMoved => "since the branch changed while rebasing",
-            };
-            format!(
-                "Done: updated with {base} as a merge commit ({}), {because}. Same code as a rebase.",
-                short(sha)
-            )
+            let done = format!("Merged {base} in ({}).", short(sha));
+            if !asked_rebase {
+                done
+            } else {
+                let because = match why {
+                    MergeWhy::ForcePushNotAllowed => "Force pushes are off here",
+                    MergeWhy::OthersCommits => "The branch has other people's commits",
+                    MergeWhy::RebaseNotClean => "The commits didn't rebase cleanly",
+                    MergeWhy::BranchMoved => "The branch moved during the rebase",
+                };
+                format!("{done} {because}, so it's a merge instead of a rebase.")
+            }
         }
         Outcome::Conflict { files } => {
             let list = files
@@ -284,19 +289,27 @@ pub(crate) fn reply(outcome: &Outcome, base: &str, squash_hint: bool) -> String 
                 .collect::<Vec<_>>()
                 .join(", ");
             if list.is_empty() {
-                format!("Couldn't update with {base}: the merge conflicts and needs a decision. Nothing was pushed.")
+                format!(
+                    "Couldn't merge {base} in: it conflicts and needs a decision. Nothing pushed."
+                )
             } else {
-                format!("Couldn't update with {base}: these files conflict and need a decision: {list}. Nothing was pushed.")
+                format!("Couldn't merge {base} in: {list} conflict and need a decision. Nothing pushed.")
             }
         }
         Outcome::Failed { why } => {
-            format!("Couldn't update with {base} ({why}). Nothing was pushed.")
+            format!("Couldn't update with {base} ({why}). Nothing pushed.")
         }
     };
     if squash_hint && matches!(outcome, Outcome::Merged { .. }) {
-        out.push_str(" Squash on merge gives a linear history.");
+        out.push_str(" Squash on merge keeps the history linear.");
     }
     out
+}
+
+/// Whether the person's words asked for a rebase (not a merge, a sync or
+/// an update).
+pub(crate) fn asks_rebase(quote: &str) -> bool {
+    quote.to_ascii_lowercase().contains("rebase")
 }
 
 /// Whether the round's start-of-round update may push. An update the
@@ -519,7 +532,10 @@ pub(crate) async fn run(
     let squash_hint = ask.linear_history
         && matches!(outcome, Outcome::Merged { .. })
         && github.allows_squash_merge(owner, repo).await == Some(true);
-    (reply(&outcome, base, squash_hint), outcome.pushed())
+    (
+        reply(&outcome, base, asks_rebase(&ask.quote), squash_hint),
+        outcome.pushed(),
+    )
 }
 
 #[cfg(test)]
@@ -595,10 +611,16 @@ mod tests {
         let out = update(&fake, "coderhelm/x", "main", m).await;
         assert_eq!(fake.calls(), vec!["merge"]);
         assert!(out.pushed());
-        let text = reply(&out, "main", false);
+        let text = reply(&out, "main", true, false);
         assert_eq!(
             text,
-            "Done: updated with main as a merge commit (bbbbbbb), since force pushes aren't allowed here. Same code as a rebase."
+            "Merged main in (bbbbbbb). Force pushes are off here, so it's a merge instead of a rebase."
+        );
+        // They asked to merge main in or update the branch: nothing to
+        // explain.
+        assert_eq!(
+            reply(&out, "main", false, false),
+            "Merged main in (bbbbbbb)."
         );
         // Never hands the work back or talks about tools.
         for banned in ["locally", "force-push", "tool", "please"] {
@@ -615,7 +637,9 @@ mod tests {
         );
         // Squash on merge only when they asked for a linear history and the
         // repository allows it.
-        assert!(reply(&out, "main", true).ends_with("Squash on merge gives a linear history."));
+        assert!(
+            reply(&out, "main", true, true).ends_with("Squash on merge keeps the history linear.")
+        );
     }
 
     #[tokio::test]
@@ -628,8 +652,8 @@ mod tests {
         // One push: the rebase, leased on the head it read; no merge.
         assert_eq!(fake.calls(), vec!["rebase lease=aaaaaaa1111"]);
         assert_eq!(
-            reply(&out, "main", true),
-            "Done: rebased onto main (ccccccc)."
+            reply(&out, "main", true, true),
+            "Rebased onto main (ccccccc)."
         );
         // Someone else's commits on it: merged, not rewritten.
         assert_eq!(
@@ -658,8 +682,8 @@ mod tests {
             assert!(fake.calls().is_empty());
             assert!(!out.pushed());
             assert_eq!(
-                reply(&out, "main", true),
-                "Already up to date with main (aaaaaaa); nothing to update."
+                reply(&out, "main", true, true),
+                "Already up to date with main (aaaaaaa)."
             );
         }
     }
@@ -678,8 +702,8 @@ mod tests {
         .await;
         assert!(!out.pushed());
         assert_eq!(
-            reply(&out, "main", false),
-            "Couldn't update with main: these files conflict and need a decision: `src/a.rs`, `src/b.rs`. Nothing was pushed."
+            reply(&out, "main", false, false),
+            "Couldn't merge main in: `src/a.rs`, `src/b.rs` conflict and need a decision. Nothing pushed."
         );
     }
 

@@ -232,7 +232,7 @@ fn cases() -> Vec<Case> {
             },
             say: Say::reply_all(
                 "feedback",
-                "@dana-reyes Removed the H1 and the intro block from the catalog page; it now opens on the title.",
+                "Removed the H1 and the intro block from the catalog page; it now opens on the title.",
             ),
             facts: Facts::default()
                 .ticket("SHOP-210 Catalog page header", "Build the spring catalog page.")
@@ -243,7 +243,7 @@ fn cases() -> Vec<Case> {
                 .state("this round's change is pushed to the pull request"),
             model: json!({"action": "reply", "text": "Done: no H1 and no intro copy, the catalog page now opens on the title \"Spring Catalog\". The change is in `src/pages/catalog.tsx`, commit 4f9c2a1, and the full test suite passed."}),
             out: Out::Reply,
-            has: vec!["4f9c2a1", "Spring Catalog", "catalog.tsx", "@dana-reyes"],
+            has: vec!["4f9c2a1", "Spring Catalog", "catalog.tsx"],
             not: vec!["Thanks", "I read your comment", "?"],
         },
         // The real shape: someone retries a ticket an open pull request
@@ -275,7 +275,7 @@ fn cases() -> Vec<Case> {
                 .decision("Still open in #41: the cart total test"),
             model: json!({"action": "reply", "text": "#41 is still open and already carries this ticket's change, so a retry would only build the same fix twice; I didn't start one. What's left there is the cart total test, and the ticket is done when #41 merges."}),
             out: Out::Reply,
-            has: vec!["#41", "Lee Park", "cart total test"],
+            has: vec!["#41", "cart total test"],
             not: vec!["?", "Thanks"],
         },
         Case {
@@ -442,6 +442,11 @@ fn rubric(text: &str, case: &Case, view: &View) -> Vec<String> {
     if text.chars().any(cv::is_arrow) {
         bad.push("an arrow glyph".into());
     }
+    // The thread rules: no header, one mention, no link to the thread, no
+    // request said back.
+    for p in common::comment_style::lint_on(text, &case.place) {
+        bad.push(format!("thread rule: {p}"));
+    }
     if text.chars().count() > rc::MAX_REPLY_CHARS {
         bad.push(format!("{} characters", text.chars().count()));
     }
@@ -455,8 +460,8 @@ fn rubric(text: &str, case: &Case, view: &View) -> Vec<String> {
     bad
 }
 
-/// What was written to the person, without the quote and greeting the
-/// layer opens a reply with.
+/// What was written to the person, without the quote the layer opens a
+/// reply to an older comment with (old replies also carried a header).
 fn reply_text(entry: &str) -> String {
     let body = entry.split_once(": ").map(|(_, b)| b).unwrap_or(entry);
     let mut lines: Vec<&str> = body.lines().collect();
