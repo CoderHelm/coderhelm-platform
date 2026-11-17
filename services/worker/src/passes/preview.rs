@@ -163,7 +163,7 @@ fn covering_results(
 }
 
 /// The workflow files at `git_ref`, with their text.
-async fn workflows(
+pub(crate) async fn workflows(
     gh: &GitHubClient,
     owner: &str,
     repo: &str,

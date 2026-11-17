@@ -298,6 +298,7 @@ pub mod stop_judge;
 pub mod stop_rules;
 /// A team's run and PR-reviewed counts, each added exactly once.
 pub mod team_counts;
+pub mod test_env;
 pub mod ticket_comments;
 /// What a person answered on the ticket is a decision in every run on it; a
 /// description never lists an answered item as pending.

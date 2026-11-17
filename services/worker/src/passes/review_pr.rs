@@ -228,6 +228,72 @@ async fn probe_gaps(
     super::review_rules::probe_findings(&common::e2e::probe::unprobed(&files, &probes, &own))
 }
 
+/// The review's findings for a change wider than its ticket
+/// (`minimal_change`) and for test assertions changed to match another
+/// company's page against an acceptance criterion. `ticket` is the
+/// ticket's words the review has (its context and the PR body).
+async fn smallest_change_gaps(
+    state: &WorkerState,
+    github: &GitHubClient,
+    (team_id, owner, repo): (&str, &str, &str),
+    head_sha: &str,
+    compare: &serde_json::Value,
+    tree: &[String],
+    ticket: &str,
+) -> Vec<super::review_agent::Finding> {
+    let files: Vec<(String, String, String)> = compare["files"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .take(80)
+        .map(|f| {
+            (
+                f["filename"].as_str().unwrap_or("").to_string(),
+                f["status"].as_str().unwrap_or("").to_string(),
+                f["patch"].as_str().unwrap_or("").to_string(),
+            )
+        })
+        .filter(|(p, _, _)| !p.is_empty())
+        .collect();
+    let mut base = Vec::new();
+    if let Some(sha) = compare["merge_base_commit"]["sha"].as_str() {
+        for (p, _, _) in files
+            .iter()
+            .filter(|(p, s, _)| s == "modified" && !super::habits::is_test_path(p))
+            .take(12)
+        {
+            if let Ok(text) = github.read_file(owner, repo, p, sha).await {
+                base.push((p.clone(), text));
+            }
+        }
+    }
+    let has_probe = tree.iter().any(|p| common::e2e::probe::is_record(p));
+    let mut out = super::review_rules::wider_findings(&super::minimal_change::check(
+        &files, &base, ticket, has_probe,
+    ));
+    let criteria = super::stop_judge::acceptance(ticket);
+    if !criteria.is_empty() {
+        let own = super::web_check::team_domains(state, team_id).await;
+        let mut flips = Vec::new();
+        for (path, _, patch) in files.iter().filter(|(p, s, patch)| {
+            s != "removed" && super::habits::is_test_path(p) && patch.contains("expect(")
+        }) {
+            let full = github
+                .read_file(owner, repo, path, head_sha)
+                .await
+                .unwrap_or_else(|_| patch.clone());
+            let outside = !common::e2e::probe::outside_origins(&full, &own).is_empty()
+                || full.contains("frameLocator(")
+                || full.contains("contentFrame(");
+            flips.extend(super::minimal_change::vendor_flips(
+                path, patch, outside, &criteria,
+            ));
+        }
+        out.extend(super::review_rules::vendor_flip_findings(&flips));
+    }
+    out
+}
+
 /// True when the repo turned on "Require tests" (and review isn't off/killed).
 /// The same switch makes the reviewer block untested behavior changes and makes
 /// CoderHelm's own coding passes write those tests.
@@ -3444,6 +3510,23 @@ async fn run_once(
         .await
         {
             info!(pr = msg.pr_number, file = %f.file, "End-to-end selectors no probe observed: must fix");
+            findings.retain(|x| x.title != f.title || x.file != f.file);
+            findings.push(f);
+        }
+        // The change does what its ticket asks and no more, and a test is
+        // never bent to another company's page against a criterion.
+        for f in smallest_change_gaps(
+            state,
+            &github,
+            (&msg.team_id, &msg.repo_owner, &msg.repo_name),
+            &head_sha,
+            &compare,
+            &tree,
+            &format!("{ticket_context}\n{pr_body}"),
+        )
+        .await
+        {
+            info!(pr = msg.pr_number, file = %f.file, title = %f.title, "Wider than the ticket: must fix");
             findings.retain(|x| x.title != f.title || x.file != f.file);
             findings.push(f);
         }

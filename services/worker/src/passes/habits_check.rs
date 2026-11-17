@@ -96,6 +96,13 @@ pub struct PrFacts {
     /// no spec is needed or one is there.
     #[serde(default)]
     pub e2e_missing: String,
+    /// Where the change is wider than its ticket and the coder gave no
+    /// reason it may keep (`minimal_change`): a parallel structure,
+    /// deleting or overwriting where the code only added, a log level,
+    /// reporting nobody asked for, tests out of proportion, a payload
+    /// nobody observed.
+    #[serde(default)]
+    pub wider: Vec<super::minimal_change::Widening>,
 }
 
 /// Why the check didn't give a result.
@@ -528,6 +535,21 @@ pub fn blocking(f: &PrFacts, plan: &PlanResult) -> Vec<String> {
     if !f.e2e_missing.is_empty() {
         out.push(f.e2e_missing.clone());
     }
+    // A test that never ran proves nothing, whatever CI says later.
+    for t in f
+        .tests
+        .iter()
+        .filter(|t| t.verdict == Verdict::NotRun && t.detail.contains("found no tests"))
+    {
+        out.push(format!(
+            "`{}`: {}. Make it run under the repository's test command, run it, and quote its output in your Evidence.",
+            t.path, t.detail
+        ));
+    }
+    // The change is held to the ticket: smaller, not wider.
+    for w in &f.wider {
+        out.push(w.instruction());
+    }
     if f.bug && f.tests.is_empty() && !repro_waived(plan) && f.no_tests.contains("no test file") {
         out.push("This is a bug fix and the change has no test that fails without it. Add the test that reproduces the reported failure (it must fail on the base code and pass with the fix).".to_string());
     }
@@ -548,7 +570,7 @@ pub fn blocking(f: &PrFacts, plan: &PlanResult) -> Vec<String> {
 /// The fix round's instructions.
 pub fn fix_feedback(lines: &[String]) -> String {
     format!(
-        "The check after the build ran each new or changed test with and without your change, and compared the changed files with the plan. Fix every item:\n{}\nDo not delete or skip a test to settle an item.",
+        "The check after the build ran each new or changed test with and without your change, compared the changed files with the plan, and compared the change with the ticket. Fix every item; where the change is wider than the ticket, make it smaller:\n{}\nDo not delete or skip a test to settle an item.",
         lines
             .iter()
             .map(|l| format!("- {l}"))
@@ -566,7 +588,13 @@ pub fn open_findings(f: &PrFacts, plan: &PlanResult) -> Vec<Finding> {
     lines
         .into_iter()
         .map(|l| {
-            let (point, settle) = if l.contains("no task of the plan") {
+            let wider = f.wider.iter().find(|w| w.instruction() == l);
+            let (point, settle) = if let Some(w) = wider {
+                (
+                    w.point(),
+                    "CoderHelm makes the change smaller in its next round on this pull request.",
+                )
+            } else if l.contains("no task of the plan") {
                 (
                     "Changed outside the plan",
                     "CoderHelm restores it or records why the change needs it in its next round on this pull request.",
@@ -1016,6 +1044,46 @@ async fn e2e_missing(w: &super::proof::Work<'_>, paths: &[String]) -> String {
         .unwrap_or_default()
 }
 
+/// Where the change is wider than its ticket (`minimal_change`), read
+/// against the base text of the changed code files and the ticket's own
+/// words, less what the coder's notes keep with a reason.
+async fn wider(
+    w: &super::proof::Work<'_>,
+    diff: &Diff,
+    notes: &str,
+) -> Vec<super::minimal_change::Widening> {
+    let (owner, repo) = (&w.msg.repo_owner, &w.msg.repo_name);
+    let mut base = Vec::new();
+    for (path, _, _) in diff
+        .iter()
+        .filter(|(p, s, _)| s == "modified" && !is_test_path(p))
+        .take(12)
+    {
+        if let Ok(text) = w
+            .github
+            .read_file(owner, repo, path, &w.msg.base_branch)
+            .await
+        {
+            base.push((path.clone(), text));
+        }
+    }
+    let has_probe = match w.github.get_tree(owner, repo, w.branch).await {
+        Ok(t) => t.iter().any(|e| common::e2e::probe::is_record(&e.path)),
+        Err(_) => false,
+    };
+    let ticket = format!(
+        "{}\n{}{}",
+        w.msg.title,
+        w.msg.body,
+        common::run_questions::answers_note(&w.msg.answers)
+    );
+    let found = super::minimal_change::check(diff, &base, &ticket, has_probe);
+    super::minimal_change::standing(&found, notes)
+        .into_iter()
+        .cloned()
+        .collect()
+}
+
 /// A bench for a step with no time for the sandbox: nothing runs, and each
 /// test says so.
 struct NoTime;
@@ -1089,6 +1157,7 @@ async fn check_and_fix(
         )
         .await;
         facts.e2e_missing = e2e_missing(w, &paths).await;
+        facts.wider = wider(w, &diff, &evidence.notes).await;
         let blocking = blocking(&facts, w.plan);
         info!(
             run_id = w.run_id,

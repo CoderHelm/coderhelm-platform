@@ -305,11 +305,12 @@ pub async fn run(
          that CoderHelm carries out to the end, verification included.\n\n\
          You have access to these repos:\n{repos_list}\n\n\
          All tools default to {owner}/{repo} when the `repo` parameter is omitted. \
-         To explore another repo, pass `repo` as `owner/name` (e.g. `\"{default_repo}\"`).{cross_repo}{instructions_block}{team_block}{tests_block}{feature_block}",
+         To explore another repo, pass `repo` as `owner/name` (e.g. `\"{default_repo}\"`).{cross_repo}{instructions_block}{team_block}{tests_block}{feature_block}{smallest}",
         owner = msg.repo_owner,
         repo = msg.repo_name,
         stance = super::ownership::planner_stance(),
         feature_block = super::feature::planner_block(intent),
+        smallest = super::plan_shape::PLANNER,
         cross_repo = if team_repos.len() > 1 {
             super::cross_repo::PLANNER_LINE
         } else {
@@ -321,10 +322,10 @@ pub async fn run(
         "simple" => {
             r#"## Complexity: SIMPLE (1-3 files)
 
-This is a simple change. Be extremely efficient:
-- Use 1-2 `search_code` calls to locate the relevant file(s) and line numbers
-- Use `read_file_lines` on the specific section (max 100 lines), NOT whole files
-- You should need 2-4 tool calls total, then output the plan
+This is a simple change. Be efficient, but read what the change extends:
+- Use `search_code` to locate the relevant file(s), and once more for the structure the change would add (an existing map, helper or config that already does part of it)
+- Use `read_file_lines` on that structure in full (the whole map, function or query) and on its writers
+- You should need 3-6 tool calls, then output the plan
 - The plan usually has 1-2 tasks; when the change needs more files, list every one"#
         }
         "medium" => {
@@ -836,6 +837,18 @@ Then the ```fix_location.json block described above."#,
         state,
     };
 
+    // Explore before planning: what the ticket's own words find in the
+    // repository goes to the planner with the ticket, so the plan extends
+    // it (a plan once added a second map beside the one it needed).
+    let found = super::plan_shape::existing_for_ticket(
+        &executor.read_only,
+        &default_repo,
+        &msg.title,
+        &msg.body,
+    )
+    .await;
+    let existing_names = super::plan_shape::existing_names(&found);
+    let prompt = format!("{prompt}{}", super::plan_shape::existing_block(&found));
     let mut content_blocks = vec![serde_json::json!({"type": "text", "text": prompt})];
     for img in &msg.image_attachments {
         if let Some(b64) =
@@ -938,6 +951,34 @@ Then the ```fix_location.json block described above."#,
     // reuse and the closest sibling.
     let feature_gaps = super::feature::plan_gaps(&draft, intent, &ticket_history.prior);
     back.extend(feature_gaps.iter().cloned());
+    // The smallest correct change (see plan_shape): its five sections, no
+    // parallel structure, no widening the ticket doesn't ask for, outside
+    // systems measured, the product changed before a test.
+    let ticket_words = format!(
+        "{}\n{}{}",
+        msg.title,
+        msg.body,
+        common::run_questions::answers_note(&msg.answers)
+    );
+    let is_feature = intent == super::triage::TicketIntent::Feature;
+    let mut shape_gaps =
+        super::plan_shape::plan_gaps(&draft, &ticket_words, is_feature, &existing_names);
+    // What the reused helpers do to stored rows, read from their bodies: a
+    // replacing helper on a path that only inserts deleted rows nobody asked
+    // about.
+    let write_facts = super::plan_shape::read_write_facts(
+        &executor.read_only,
+        github,
+        (&msg.repo_owner, &msg.repo_name, &msg.base_branch),
+        &draft,
+    )
+    .await;
+    shape_gaps.extend(super::plan_shape::write_gaps(
+        &draft,
+        &ticket_words,
+        &write_facts,
+    ));
+    back.extend(shape_gaps.iter().cloned());
     // A decision that stops without a fix names the one step a person takes.
     back.extend(super::fix_location::next_step_gaps(draft.fix.as_ref()));
     // What a careful engineer settles before code (see habits): the worker
@@ -1416,6 +1457,31 @@ Then the ```fix_location.json block described above."#,
                 &msg.team_id,
                 run_id,
                 &format!("Plan check (new-feature rules): {}", left.join(" ")),
+            )
+            .await;
+            if let Some(d) = files.fix.as_mut() {
+                d.open_gaps.extend(left);
+            }
+        }
+    }
+    if !shape_gaps.is_empty() {
+        let mut left =
+            super::plan_shape::plan_gaps(&files, &ticket_words, is_feature, &existing_names);
+        let facts = super::plan_shape::read_write_facts(
+            &executor.read_only,
+            github,
+            (&msg.repo_owner, &msg.repo_name, &msg.base_branch),
+            &files,
+        )
+        .await;
+        left.extend(super::plan_shape::write_gaps(&files, &ticket_words, &facts));
+        if !left.is_empty() {
+            warn!(ticket_id = %msg.ticket_id, gaps = ?left, "Plan is still not the smallest change after one send-back");
+            super::add_progress_note(
+                state,
+                &msg.team_id,
+                run_id,
+                &format!("Plan check (smallest change): {}", left.join(" ")),
             )
             .await;
             if let Some(d) = files.fix.as_mut() {

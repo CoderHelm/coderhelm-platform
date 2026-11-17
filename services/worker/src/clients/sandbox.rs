@@ -471,6 +471,10 @@ pub struct SandboxClient<'a> {
     generator_hosts: Vec<String>,
     /// The commands that run the repository's generators.
     generator_cmds: Vec<String>,
+    /// The run's test environment and its install's cache key
+    /// (`common::test_env`): every check build runs inside it, restoring
+    /// the cached install or saving the first one.
+    test_env: Option<(common::test_env::TestEnv, String)>,
 }
 
 /// The allowlist one build gets: the team's list (None: the network is
@@ -572,7 +576,42 @@ impl<'a> SandboxClient<'a> {
             egress: None,
             generator_hosts: Vec::new(),
             generator_cmds: Vec::new(),
+            test_env: None,
         }
+    }
+
+    /// Runs every check build inside the run's test environment
+    /// (`passes::test_setup::for_run`), so no round installs it again.
+    pub fn with_test_env(mut self, env: Option<(common::test_env::TestEnv, String)>) -> Self {
+        self.test_env = env;
+        self
+    }
+
+    /// The command a check build runs and the variable that restores or
+    /// saves the cached install: restore when it exists, save when not.
+    async fn in_test_env(
+        &self,
+        checks_cmd: &str,
+    ) -> Result<(String, Option<EnvironmentVariable>), Box<dyn std::error::Error + Send + Sync>>
+    {
+        let Some((env, key)) = &self.test_env else {
+            return Ok((checks_cmd.to_string(), None));
+        };
+        let cached = self
+            .s3
+            .head_object()
+            .bucket(self.bucket)
+            .key(key)
+            .send()
+            .await
+            .is_ok();
+        let var = if cached {
+            env_var("ENV_CACHE_GET_URL", &self.presigned_get(key).await?)?
+        } else {
+            env_var("ENV_CACHE_PUT_URL", &self.presigned_put(key).await?)?
+        };
+        info!(key = %key, cached, "sandbox: the run's test environment");
+        Ok((env.wrap(checks_cmd), Some(var)))
     }
 
     /// Is the sandbox configured (both bucket and project set)?
@@ -1019,10 +1058,12 @@ impl<'a> SandboxClient<'a> {
         terraform_version: Option<&str>,
         deadline: Option<Instant>,
     ) -> Result<CheckOutcome, Box<dyn std::error::Error + Send + Sync>> {
+        let (cmd, cache) = self.in_test_env(checks_cmd).await?;
         let mut env = vec![
             env_var("SANDBOX_GET_URL", &self.presigned_get(key).await?)?,
-            env_var("CHECKS_CMD", checks_cmd)?,
+            env_var("CHECKS_CMD", &cmd)?,
         ];
+        env.extend(cache);
         env.extend(self.egress_env(Some(checks_cmd))?);
         // The buildspec switches Node to this via `n` before running checks, so
         // "green in the sandbox" tracks the repo's real toolchain (it defaults

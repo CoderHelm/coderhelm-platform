@@ -1277,6 +1277,7 @@ pub mod e2e_attribution;
 pub mod e2e_reads;
 pub mod e2e_setup;
 pub mod email_events;
+mod explore_guard;
 pub mod feature;
 pub mod feedback;
 pub mod file_claims;
@@ -1316,6 +1317,7 @@ mod log_fix_checks;
 #[cfg(test)]
 mod log_fix_eval;
 pub mod log_look;
+pub mod minimal_change;
 pub mod model_check;
 #[cfg(test)]
 mod model_route_eval;
@@ -1336,6 +1338,7 @@ pub(crate) mod plan_coverage;
 pub mod plan_execute;
 mod plan_judge;
 pub(crate) mod plan_sections;
+mod plan_shape;
 /// Plugin runs, publishing, source sync and results.
 pub mod plugins;
 mod pr;
@@ -1423,6 +1426,7 @@ pub(crate) mod terraform;
 mod test;
 pub mod test_bug;
 pub mod test_fix;
+pub(crate) mod test_setup;
 pub mod ticket_base;
 pub mod ticket_comments;
 pub mod ticket_history;
