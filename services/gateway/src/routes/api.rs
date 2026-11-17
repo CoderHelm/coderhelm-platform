@@ -1334,7 +1334,9 @@ pub struct Run {
     pub outside_change_report: Option<String>,
     /// Why the run stopped, when it was its own environment rather than a
     /// question: `tooling` (a command the run ran failed for want of a
-    /// dependency or tool; see `tooling_failure`).
+    /// dependency or tool; see `tooling_failure`), or `already_merged` (a
+    /// pull request for the ticket had already merged, so no new work
+    /// started; Retry runs the ticket again anyway).
     #[schema(example = json!(null))]
     pub stop_kind: Option<String>,
     /// For a tooling failure: the exact command, the error it printed and
@@ -2372,6 +2374,10 @@ pub struct RunActionResult {
         retried; the old run \
         becomes `retried`, so retrying it twice is refused with `400`. Find the new run with \
         `GET /api/runs?q=<ticket id>`.\n\n\
+        A run whose `stop_kind` is `already_merged` stopped before any work because a pull \
+        request for its ticket had already merged. Retrying it is how a person asks for the \
+        ticket to run again anyway: the new run goes ahead, and later runs on the ticket \
+        aren't stopped by that merge again.\n\n\
         A `completed` run whose `round_incomplete` is set (its pull request is open but the last \
         fix round on it didn't finish) is resumed instead: the same run picks the round up again \
         on the same pull request, with a fresh time budget, and the answer's status is \
@@ -2652,8 +2658,18 @@ pub(crate) async fn retry_message(
             .and_then(|v| v.as_s().ok())
             .and_then(|s| serde_json::from_str(s).ok())
             .unwrap_or_default(),
+        // Retry on a run stopped because the ticket's pull request already
+        // merged is a person asking for it anyway (`merged_ticket`).
+        after_merge: stopped_as_merged(item),
         ..Default::default()
     })
+}
+
+/// The run stopped because its ticket's pull request already merged.
+fn stopped_as_merged(item: &std::collections::HashMap<String, AttributeValue>) -> bool {
+    item.get("stop_kind")
+        .and_then(|v| v.as_s().ok())
+        .is_some_and(|k| k == common::merged_ticket::STOP_KIND)
 }
 
 /// How Resume picks up a run's unfinished fix round.

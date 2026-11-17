@@ -500,6 +500,7 @@ async fn start_fix(
         answers: Vec::new(),
         related: Vec::new(),
         new_run_id: None,
+        after_merge: false,
     };
     let Ok(body) = serde_json::to_string(&crate::models::WorkerMessage::Ticket(ticket)) else {
         return false;

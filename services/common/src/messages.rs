@@ -1177,6 +1177,12 @@ pub struct TicketMessage {
     /// that picks the answers up). A continuation keeps its own id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub new_run_id: Option<String>,
+    /// A person asked for this run after the ticket's pull request merged
+    /// (Retry on the run that stopped for it, or a command or dashboard
+    /// start on the GitHub issue whose run stopped for it), so the
+    /// merged-ticket rule doesn't stop it (`merged_ticket`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub after_merge: bool,
 }
 
 fn is_zero_u32(n: &u32) -> bool {
@@ -1280,6 +1286,7 @@ impl Default for TicketMessage {
             answers: Vec::new(),
             related: Vec::new(),
             new_run_id: None,
+            after_merge: false,
         }
     }
 }
