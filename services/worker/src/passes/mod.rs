@@ -1391,6 +1391,7 @@ pub(crate) mod review_session;
 pub mod review_severity;
 pub mod review_sweep;
 pub mod review_thread_reply;
+pub mod review_tidy;
 pub mod review_verdict;
 mod reviewer_guide;
 pub mod rewards;
