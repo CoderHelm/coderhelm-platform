@@ -2,16 +2,21 @@
 //!
 //! The team creates a role in its own account that Coderhelm may use, with a
 //! private ID only that team is given (so nobody else using Coderhelm can point
-//! it at their role), and with permissions that only read. The setup is one
-//! script the team pastes into AWS CloudShell ([`setup_script`]); it prints a
-//! line they paste back into Coderhelm ([`parse_setup_code`]).
+//! it at their role), and with permissions that only read. The role and all
+//! its permissions come from one CloudFormation template
+//! (`infra/cfn/coderhelm-log-reader.yaml`, `CoderHelmLogReader`); a database
+//! or a warehouse also needs a read-only user inside it, which the script a
+//! team pastes into AWS CloudShell makes ([`setup_script`]) before it creates
+//! or updates that stack. It prints a line they paste back into Coderhelm
+//! ([`parse_setup_code`]). Roles the older script made (`CoderhelmReadOnly`)
+//! are still accepted, and move to the stack's role
+//! (`crate::role_move`).
 //!
 //! Every use takes a fresh, 15-minute session on that role, named after the
 //! agent using it, so the team's own AWS records show who looked at what.
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 
 use super::StepError;
 
@@ -289,359 +294,37 @@ pub fn new_external_id() -> String {
     format!("coderhelm-{}{}", ulid::Ulid::new(), ulid::Ulid::new()).to_lowercase()
 }
 
-pub fn trust_policy(our_account: &str, external_id: &str) -> serde_json::Value {
-    json!({
-        "Version": "2012-10-17",
-        "Statement": [{
-            "Effect": "Allow",
-            "Principal": { "AWS": format!("arn:aws:iam::{our_account}:root") },
-            "Action": "sts:AssumeRole",
-            "Condition": { "StringEquals": { "sts:ExternalId": external_id } }
-        }]
-    })
-}
-
-/// Reads logs. Masked values stay masked: unmasking is explicitly denied.
-pub fn logs_policy() -> serde_json::Value {
-    json!({
-        "Version": "2012-10-17",
-        "Statement": [
-            {
-                "Sid": "ReadLogs",
-                "Effect": "Allow",
-                "Action": [
-                    "logs:DescribeLogGroups",
-                    "logs:GetLogGroupFields",
-                    "logs:StartQuery",
-                    "logs:GetQueryResults",
-                    "logs:StopQuery"
-                ],
-                "Resource": "*"
-            },
-            {
-                "Sid": "DescribeTasksBehindLogErrors",
-                "Effect": "Allow",
-                "Action": [
-                    "ecs:ListClusters",
-                    "ecs:ListServices",
-                    "ecs:DescribeServices",
-                    "ecs:DescribeTaskDefinition",
-                    "ecs:ListTasks",
-                    "ecs:DescribeTasks"
-                ],
-                "Resource": "*"
-            },
-            { "Sid": "NeverUnmask", "Effect": "Deny", "Action": "logs:Unmask", "Resource": "*" }
-        ]
-    })
-}
-
-/// Queries one database, inside transactions that can be started and rolled
-/// back but never committed, as the read-only user whose password is the only
-/// secret readable.
-pub fn database_policy_template(account: &str) -> serde_json::Value {
-    json!({
-        "Version": "2012-10-17",
-        "Statement": [
-            {
-                "Sid": "QueryOneDatabase",
-                "Effect": "Allow",
-                "Action": ["rds-data:BeginTransaction", "rds-data:ExecuteStatement", "rds-data:RollbackTransaction"],
-                "Resource": "CLUSTER_ARN"
-            },
-            {
-                "Sid": "ReadOnlyUserPassword",
-                "Effect": "Allow",
-                "Action": "secretsmanager:GetSecretValue",
-                "Resource": format!("arn:aws:secretsmanager:*:{account}:secret:{SECRET_PREFIX}*")
-            },
-            { "Sid": "NeverCommit", "Effect": "Deny", "Action": ["rds-data:CommitTransaction", "rds-data:BatchExecuteStatement"], "Resource": "*" }
-        ]
-    })
-}
-
-/// Reads one Redshift warehouse: may sign in only as the read-only user, with
-/// no password, and only run single statements and read their own results.
-pub fn warehouse_policy_template(account: &str) -> serde_json::Value {
-    json!({
-        "Version": "2012-10-17",
-        "Statement": [
-            {
-                "Sid": "SignInAsTheReadOnlyUser",
-                "Effect": "Allow",
-                "Action": "redshift:GetClusterCredentials",
-                "Resource": [
-                    format!("arn:aws:redshift:*:{account}:dbuser:RS_CLUSTER/{DB_USER}"),
-                    format!("arn:aws:redshift:*:{account}:dbname:RS_CLUSTER/*")
-                ]
-            },
-            {
-                "Sid": "RunOneStatement",
-                "Effect": "Allow",
-                "Action": "redshift-data:ExecuteStatement",
-                "Resource": format!("arn:aws:redshift:*:{account}:cluster:RS_CLUSTER")
-            },
-            {
-                "Sid": "ReadOwnResults",
-                "Effect": "Allow",
-                "Action": ["redshift-data:DescribeStatement", "redshift-data:GetStatementResult", "redshift-data:CancelStatement"],
-                "Resource": "*",
-                "Condition": { "StringEquals": { "redshift-data:statement-owner-iam-userid": "${aws:userid}" } }
-            },
-            {
-                "Sid": "NothingElse",
-                "Effect": "Deny",
-                "Action": ["redshift-data:BatchExecuteStatement", "redshift:CreateClusterUser", "redshift:GetClusterCredentialsWithIAM", "redshift:ModifyCluster*", "redshift:Delete*"],
-                "Resource": "*"
-            }
-        ]
-    })
-}
-
-/// The role's inline policy for AWS WAF and its logs.
-pub const WAF_POLICY_NAME: &str = "coderhelm-read-waf";
-
-/// Placeholders the setup script fills with what it finds in the account:
-/// the Athena workgroups for WAF logs (`WAF_WORKGROUPS`, their ARNs), the
-/// Glue databases and tables over `aws-waf-logs-*` buckets (`WAF_GLUE`),
-/// and where each of those workgroups writes its query results
-/// (`WAF_RESULT_OBJECTS`, `WAF_RESULT_BUCKETS`, `WAF_RESULT_PREFIXES`).
-/// Each sits alone in a JSON array, as a string, so a list of quoted ARNs
-/// replaces it.
-pub const WAF_PLACEHOLDERS: &[&str] = &[
-    "WAF_WORKGROUPS",
-    "WAF_GLUE",
-    "WAF_RESULT_OBJECTS",
-    "WAF_RESULT_BUCKETS",
-    "WAF_RESULT_PREFIXES",
-];
-
-/// What the WAF policy never allows, whatever else on the role does: every
-/// change to WAF, Athena, Glue or a bucket, and Glue's connections (they
-/// carry passwords).
-const WAF_NEVER: &[&str] = &[
-    "wafv2:Create*",
-    "wafv2:Update*",
-    "wafv2:Delete*",
-    "wafv2:Put*",
-    "wafv2:Associate*",
-    "wafv2:Disassociate*",
-    "wafv2:Tag*",
-    "wafv2:Untag*",
-    "athena:Create*",
-    "athena:Update*",
-    "athena:Delete*",
-    "athena:Put*",
-    "athena:Import*",
-    "athena:Tag*",
-    "athena:Untag*",
-    "glue:Create*",
-    "glue:Update*",
-    "glue:Delete*",
-    "glue:Put*",
-    "glue:Batch*",
-    "glue:GetConnection",
-    "glue:GetConnections",
-    "s3:Delete*",
-    "s3:PutBucket*",
-    "s3:PutObjectAcl",
-    "s3:PutObjectTagging",
-];
-
-/// Reads AWS WAF (web ACLs, sampled requests, where a web ACL logs) and,
-/// with `athena`, the web ACL's logs held in S3 through their Athena table:
-/// read-only queries in the WAF log workgroups the script found, over the
-/// Glue tables on `aws-waf-logs-*` buckets, with results written only
-/// under those workgroups' own results prefix. Everything that changes
-/// WAF, Athena, Glue or a bucket is denied, and so is any object written
-/// anywhere but the results prefix. Without `athena` (no WAF log
-/// workgroup or table in the account) it reads WAF and the log buckets'
-/// objects only, and writes nothing.
-pub fn waf_policy_template(account: &str, athena: bool) -> serde_json::Value {
-    let mut statements = vec![
-        json!({
-            "Sid": "ReadWaf",
-            "Effect": "Allow",
-            "Action": ["wafv2:Get*", "wafv2:List*"],
-            "Resource": "*"
-        }),
-        json!({
-            "Sid": "ReadWafLogObjects",
-            "Effect": "Allow",
-            "Action": ["s3:GetObject"],
-            "Resource": "arn:aws:s3:::aws-waf-logs-*/*"
-        }),
-        json!({
-            "Sid": "ListWafLogBuckets",
-            "Effect": "Allow",
-            "Action": ["s3:ListBucket", "s3:GetBucketLocation"],
-            "Resource": "arn:aws:s3:::aws-waf-logs-*"
-        }),
-    ];
-    if athena {
-        statements.extend([
-            json!({
-                "Sid": "FindWafLogWorkgroups",
-                "Effect": "Allow",
-                "Action": ["athena:ListWorkGroups"],
-                "Resource": "*"
-            }),
-            json!({
-                "Sid": "FindWafLogDatabases",
-                "Effect": "Allow",
-                "Action": ["glue:GetDatabases"],
-                "Resource": [
-                    format!("arn:aws:glue:*:{account}:catalog"),
-                    format!("arn:aws:glue:*:{account}:database/*")
-                ]
-            }),
-            json!({
-                "Sid": "ReadWafLogTables",
-                "Effect": "Allow",
-                "Action": ["glue:Get*"],
-                "Resource": [format!("arn:aws:glue:*:{account}:catalog"), "WAF_GLUE".to_string()]
-            }),
-            json!({
-                "Sid": "QueryWafLogs",
-                "Effect": "Allow",
-                "Action": ["athena:StartQueryExecution", "athena:Get*", "athena:StopQueryExecution"],
-                "Resource": ["WAF_WORKGROUPS"]
-            }),
-            json!({
-                "Sid": "WriteQueryResultsOnly",
-                "Effect": "Allow",
-                "Action": ["s3:PutObject", "s3:GetObject"],
-                "Resource": ["WAF_RESULT_OBJECTS"]
-            }),
-            json!({
-                "Sid": "FindQueryResults",
-                "Effect": "Allow",
-                "Action": ["s3:GetBucketLocation", "s3:ListBucket"],
-                "Resource": ["WAF_RESULT_BUCKETS"],
-                "Condition": { "StringLike": { "s3:prefix": ["WAF_RESULT_PREFIXES"] } }
-            }),
-            json!({
-                "Sid": "NoWritesButQueryResults",
-                "Effect": "Deny",
-                "Action": "s3:PutObject",
-                "NotResource": ["WAF_RESULT_OBJECTS"]
-            }),
-        ]);
-    } else {
-        statements.push(json!({
-            "Sid": "NoWrites",
-            "Effect": "Deny",
-            "Action": "s3:PutObject",
-            "Resource": "*"
-        }));
-    }
-    statements.push(json!({
-        "Sid": "NeverChange",
-        "Effect": "Deny",
-        "Action": WAF_NEVER,
-        "Resource": "*"
-    }));
-    json!({ "Version": "2012-10-17", "Statement": statements })
-}
-
-/// The part of the setup script that finds the account's WAF log
-/// workgroups and tables and puts [`WAF_POLICY_NAME`] on `$ROLE`. Needs
-/// `ROLE`, `REGION` and `ACCOUNT`; asks nothing, and changes nothing but
-/// that one policy, so running it again is safe.
-fn waf_policy_step() -> String {
-    let athena = waf_policy_template("ACCOUNT_ID", true).to_string();
-    let plain = waf_policy_template("ACCOUNT_ID", false).to_string();
-    format!(
-        r##"WAF_WG=""; WAF_OBJ=""; WAF_BKT=""; WAF_PFX=""; WAF_GLUE=""
-for W in $(aws athena list-work-groups --region "$REGION" --query 'WorkGroups[].Name' --output text 2>/dev/null | tr '\t' '\n' | grep -i waf || true); do
-  OUT=$(aws athena get-work-group --region "$REGION" --work-group "$W" --query 'WorkGroup.Configuration.ResultConfiguration.OutputLocation' --output text 2>/dev/null || true)
-  case "$OUT" in s3://*) ;; *) continue;; esac
-  B="${{OUT#s3://}}"; B="${{B%%/*}}"; P="${{OUT#s3://$B}}"; P="${{P#/}}"
-  WAF_WG="$WAF_WG${{WAF_WG:+,}}\"arn:aws:athena:$REGION:$ACCOUNT:workgroup/$W\""
-  WAF_OBJ="$WAF_OBJ${{WAF_OBJ:+,}}\"arn:aws:s3:::$B/$P*\""
-  WAF_BKT="$WAF_BKT${{WAF_BKT:+,}}\"arn:aws:s3:::$B\""
-  WAF_PFX="$WAF_PFX${{WAF_PFX:+,}}\"$P*\""
-done
-for D in $(aws glue get-databases --region "$REGION" --query 'DatabaseList[].Name' --output text 2>/dev/null | tr '\t' '\n'); do
-  T=$(aws glue get-tables --region "$REGION" --database-name "$D" --query "TableList[?StorageDescriptor.Location && starts_with(StorageDescriptor.Location, 's3://aws-waf-logs-')].Name" --output text 2>/dev/null || true)
-  if [ -n "$T" ] && [ "$T" != "None" ]; then
-    WAF_GLUE="$WAF_GLUE${{WAF_GLUE:+,}}\"arn:aws:glue:$REGION:$ACCOUNT:database/$D\",\"arn:aws:glue:$REGION:$ACCOUNT:table/$D/*\""
-  fi
-done
-if [ -n "$WAF_WG" ] && [ -n "$WAF_GLUE" ]; then
-  WAF_DOC=$(echo '{athena}' | sed -e "s#\"WAF_WORKGROUPS\"#$WAF_WG#g" -e "s#\"WAF_GLUE\"#$WAF_GLUE#g" -e "s#\"WAF_RESULT_OBJECTS\"#$WAF_OBJ#g" -e "s#\"WAF_RESULT_BUCKETS\"#$WAF_BKT#g" -e "s#\"WAF_RESULT_PREFIXES\"#$WAF_PFX#g" -e "s#ACCOUNT_ID#$ACCOUNT#g")
-  WAF_SAID="AWS WAF, and its logs in S3 through Athena (results only under the workgroup's results prefix)"
-else
-  WAF_DOC=$(echo '{plain}' | sed -e "s#ACCOUNT_ID#$ACCOUNT#g")
-  WAF_SAID="AWS WAF and its log buckets (no Athena workgroup with waf in its name, or no Glue table on an aws-waf-logs- bucket, in $REGION)"
-fi
-aws iam put-role-policy --role-name "$ROLE" --policy-name {WAF_POLICY_NAME} --policy-document "$WAF_DOC"
-echo "WAF reads ready: $WAF_SAID."
-"##
-    )
-}
-
-/// Pure: a role name the update line may name.
-fn is_role_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 64
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "+=,.@_-".contains(c))
-}
-
-/// The update that adds only [`WAF_POLICY_NAME`] to an existing role
-/// (`role`, its name), for a team whose role was made before it: no
-/// questions, nothing pasted back, and safe to run again.
-pub fn waf_update_script(role: &str) -> Option<String> {
-    is_role_name(role).then(|| {
-        format!(
-            "coderhelm_waf_update() (\nset -euo pipefail\nROLE={role}\nREGION=\"${{AWS_REGION:-us-east-1}}\"\nACCOUNT=$(aws sts get-caller-identity --query Account --output text)\necho \"Adding read-only AWS WAF access to $ROLE in account $ACCOUNT ($REGION)...\"\n{}\n)\ncoderhelm_waf_update\n",
-            waf_policy_step()
-        )
-    })
-}
-
-/// [`waf_update_script`] as the one line a person pastes into AWS
-/// CloudShell in the role's account (and the region of its Athena
-/// workgroup).
-pub fn waf_update_line(role_arn: &str) -> Option<String> {
-    let role = role_arn.rsplit('/').next().unwrap_or(role_arn);
-    let script = waf_update_script(role)?;
-    Some(format!(
-        "echo {} | base64 -d | bash",
-        STANDARD.encode(script)
-    ))
-}
-
-/// The script a team pastes into AWS CloudShell. It creates (or updates) the
-/// role, lets them pick a database to share, creates a database user that can
-/// only read, and prints the line to paste back. It defines a function and
-/// calls it on the last line, so the questions it asks read from the keyboard
-/// rather than from the rest of the paste. The function runs in a subshell, so
-/// a failed step stops the script without closing the person's terminal.
-pub fn setup_script(our_account: &str, external_id: &str) -> String {
-    let trust = trust_policy(our_account, external_id).to_string();
-    let logs = logs_policy().to_string();
-    let db = database_policy_template("ACCOUNT_ID").to_string();
-    let wh = warehouse_policy_template("ACCOUNT_ID").to_string();
-    let waf = waf_policy_step();
+/// The script a team pastes into AWS CloudShell to read a database or a
+/// warehouse. It makes only what a CloudFormation stack can't: the
+/// read-only database user (and its password secret) inside the database
+/// they pick. The role's permissions are never written by the script: it
+/// creates, or updates, CoderHelm's role stack (`CoderHelmLogReader`) with
+/// this release's template (`template_url`), naming the database or the
+/// warehouse in the stack's DatabaseClusters or Warehouses parameter and
+/// keeping every other parameter as it was. So every read the role has is
+/// in that one template, and a later release reaches it through the same
+/// one-click update as every other read. It prints the line to paste back
+/// into CoderHelm. It defines a function and calls it on the last line, so
+/// the questions it asks read from the keyboard rather than from the rest
+/// of the paste. The function runs in a subshell, so a failed step stops
+/// the script without closing the person's terminal.
+pub fn setup_script(
+    our_account: &str,
+    external_id: &str,
+    template_url: &str,
+    trusted_prefix: &str,
+) -> String {
+    let stack = crate::log_reader::ROLE_STACK;
     format!(
         r#"coderhelm_setup() (
 set -euo pipefail
-ROLE={ROLE_PREFIX}
+ROLE={LOG_READER_ROLE}
+STACK={stack}
+TEMPLATE_URL='{template_url}'
 REGION="${{AWS_REGION:-us-east-1}}"
 ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
 echo "Setting up read-only access for Coderhelm in account $ACCOUNT ($REGION)..."
-if aws iam get-role --role-name "$ROLE" >/dev/null 2>&1; then
-  aws iam update-assume-role-policy --role-name "$ROLE" --policy-document '{trust}'
-else
-  aws iam create-role --role-name "$ROLE" --description "Coderhelm: read-only access to logs and one database" --max-session-duration 3600 --assume-role-policy-document '{trust}' >/dev/null
-fi
-aws iam put-role-policy --role-name "$ROLE" --policy-name coderhelm-read-logs --policy-document '{logs}'
-{waf}ROLE_ARN=$(aws iam get-role --role-name "$ROLE" --query Role.Arn --output text)
-echo "Role ready: $ROLE_ARN (it can read logs and AWS WAF; it can't change anything)."
-DB_PART=""
+DB_ARN=""; RS_ID=""; DB_PART=""; RS_PART=""
 CLUSTERS=$(aws rds describe-db-clusters --region "$REGION" --query "DBClusters[?Engine=='aurora-postgresql' && HttpEndpointEnabled].DBClusterIdentifier" --output text | tr '\t' '\n' | sed '/^$/d')
 if [ -n "$CLUSTERS" ]; then
   echo
@@ -682,12 +365,11 @@ if [ -n "$CLUSTERS" ]; then
       aws secretsmanager create-secret --region "$REGION" --name "$SECRET_NAME" --description "Coderhelm read-only database user" --secret-string "$SECRET_VALUE" >/dev/null
     fi
     SECRET_ARN=$(aws secretsmanager describe-secret --region "$REGION" --secret-id "$SECRET_NAME" --query ARN --output text)
-    aws iam put-role-policy --role-name "$ROLE" --policy-name "coderhelm-read-database-$CLUSTER_ID" --policy-document "$(echo '{db}' | sed -e "s#CLUSTER_ARN#$CLUSTER_ARN#" -e "s#ACCOUNT_ID#$ACCOUNT#")"
+    DB_ARN="$CLUSTER_ARN"
     DB_PART=",\"cluster_arn\":\"$CLUSTER_ARN\",\"secret_arn\":\"$SECRET_ARN\",\"database\":\"$DB_NAME\""
     echo "Database user ready. It can read every table and change none."
   fi
 fi
-RS_PART=""
 WAREHOUSES=$(aws redshift describe-clusters --region "$REGION" --query 'Clusters[].ClusterIdentifier' --output text 2>/dev/null | tr '\t' '\n' | sed '/^$/d')
 if [ -n "$WAREHOUSES" ]; then
   echo
@@ -724,11 +406,42 @@ if [ -n "$WAREHOUSES" ]; then
       RS_JSON="$RS_JSON${{RS_JSON:+,}}\"$D\""
       echo "  $D: can read, can't change"
     done
-    aws iam put-role-policy --role-name "$ROLE" --policy-name "coderhelm-read-warehouse-$RS_ID" --policy-document "$(echo '{wh}' | sed -e "s#RS_CLUSTER#$RS_ID#g" -e "s#ACCOUNT_ID#$ACCOUNT#g")"
     RS_PART=",\"engine\":\"redshift\",\"cluster_id\":\"$RS_ID\",\"db_user\":\"{DB_USER}\",\"databases\":[$RS_JSON]"
     echo "Warehouse user ready."
   fi
 fi
+# The role's permissions: only through CoderHelm's role stack, with this
+# release's template. A list parameter keeps what it named and adds the new one.
+add_to() {{ if [ -z "$1" ] || [ "$1" = "None" ]; then echo "$2"; elif [ -z "$2" ] || echo ",$1," | grep -q ",$2,"; then echo "$1"; else echo "$1,$2"; fi; }}
+STACK_REGION=""
+for R in "$REGION" $(aws ec2 describe-regions --region "$REGION" --query 'Regions[].RegionName' --output text 2>/dev/null); do
+  if aws cloudformation describe-stacks --region "$R" --stack-name "$STACK" >/dev/null 2>&1; then STACK_REGION="$R"; break; fi
+done
+if [ -n "$STACK_REGION" ]; then
+  q() {{ aws cloudformation describe-stacks --region "$STACK_REGION" --stack-name "$STACK" --query "$1" --output text; }}
+  KEYS=$(q 'Stacks[0].Parameters[].ParameterKey')
+  DBS=$(add_to "$(q "Stacks[0].Parameters[?ParameterKey=='DatabaseClusters'].ParameterValue | [0]")" "$DB_ARN")
+  WHS=$(add_to "$(q "Stacks[0].Parameters[?ParameterKey=='Warehouses'].ParameterValue | [0]")" "$RS_ID")
+  P="[{{\"ParameterKey\":\"DatabaseClusters\",\"ParameterValue\":\"$DBS\"}},{{\"ParameterKey\":\"Warehouses\",\"ParameterValue\":\"$WHS\"}}"
+  for K in $KEYS; do case "$K" in DatabaseClusters|Warehouses) ;; *) P="$P,{{\"ParameterKey\":\"$K\",\"UsePreviousValue\":true}}";; esac; done
+  P="$P]"
+  echo "Updating CoderHelm's role stack $STACK ($STACK_REGION) to this release's template..."
+  if OUT=$(aws cloudformation update-stack --region "$STACK_REGION" --stack-name "$STACK" --template-url "$TEMPLATE_URL" --capabilities CAPABILITY_NAMED_IAM --parameters "$P" 2>&1); then
+    aws cloudformation wait stack-update-complete --region "$STACK_REGION" --stack-name "$STACK"
+  elif ! echo "$OUT" | grep -q "No updates are to be performed"; then
+    echo "$OUT"; echo "The role stack wasn't updated; see its Events tab in CloudFormation."; exit 1
+  fi
+elif aws iam get-role --role-name "$ROLE" >/dev/null 2>&1; then
+  echo "The role $ROLE exists, but not from CoderHelm's stack $STACK, so its permissions can't be kept current."
+  echo "Delete the role (or the stack that made it), then run this again."; exit 1
+else
+  echo "Creating CoderHelm's role stack $STACK ($REGION)..."
+  P="[{{\"ParameterKey\":\"ExternalId\",\"ParameterValue\":\"{external_id}\"}},{{\"ParameterKey\":\"CoderHelmAccountId\",\"ParameterValue\":\"{our_account}\"}},{{\"ParameterKey\":\"TrustedRolePrefix\",\"ParameterValue\":\"{trusted_prefix}\"}},{{\"ParameterKey\":\"DatabaseClusters\",\"ParameterValue\":\"$DB_ARN\"}},{{\"ParameterKey\":\"Warehouses\",\"ParameterValue\":\"$RS_ID\"}}]"
+  aws cloudformation create-stack --region "$REGION" --stack-name "$STACK" --template-url "$TEMPLATE_URL" --capabilities CAPABILITY_NAMED_IAM --parameters "$P" >/dev/null
+  aws cloudformation wait stack-create-complete --region "$REGION" --stack-name "$STACK"
+fi
+ROLE_ARN=$(aws iam get-role --role-name "$ROLE" --query Role.Arn --output text)
+echo "Role ready: $ROLE_ARN (it reads; the only change it may make is an Athena query's results, only when you turn WAF logs on)."
 CODE=$(printf '{{"role_arn":"%s","region":"%s"%s%s}}' "$ROLE_ARN" "$REGION" "$DB_PART" "$RS_PART" | base64 | tr -d '\n')
 echo
 echo "Done. Copy this whole line and paste it into Coderhelm:"
@@ -809,12 +522,15 @@ pub fn in_install_account(role_arn: &str, own: Option<&str>) -> bool {
 pub fn install_target(target: &AwsTarget, own: Option<&str>) -> Option<AwsTarget> {
     let own = own?;
     let name = target.role_arn.rsplit('/').next().unwrap_or("");
-    (name == LOG_READER_ROLE && in_install_account(&target.role_arn, Some(own))).then(|| {
-        AwsTarget {
+    // A database or a warehouse is read through the role stack's own
+    // groups (DatabaseClusters, Warehouses), never the install's role.
+    let data = !target.cluster_arn.is_empty() || !target.cluster_id.is_empty();
+    (name == LOG_READER_ROLE && !data && in_install_account(&target.role_arn, Some(own))).then(
+        || AwsTarget {
             role_arn: own.to_string(),
             ..target.clone()
-        }
-    })
+        },
+    )
 }
 
 /// A session on the function's own role (its environment's credentials),
@@ -966,7 +682,6 @@ pub fn rdsdata_client(s: &Session) -> aws_sdk_rdsdata::Client {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::Value;
 
     const ROLE: &str = "arn:aws:iam::123456789012:role/CoderhelmReadOnly";
 
@@ -1158,193 +873,53 @@ mod tests {
         assert!(!t.allows_log_group("/aws/lambda/other"));
     }
 
+    const TEMPLATE_URL: &str =
+        "https://coderhelm-public.s3.amazonaws.com/launch/v1.2.3/coderhelm-log-reader.yaml";
+
+    fn script() -> String {
+        setup_script(
+            "654654210434",
+            "0b5f1a5e-0000-4000-8000-000000000000",
+            TEMPLATE_URL,
+            "",
+        )
+    }
+
+    /// The script writes no permission itself: every read is the role
+    /// stack's, created or updated with this release's template, keeping
+    /// every parameter but the database or warehouse it adds.
     #[test]
-    fn the_script_carries_the_private_id_and_only_read_permissions() {
-        let s = setup_script("654654210434", "coderhelm-abc");
-        assert!(s.contains("\"sts:ExternalId\":\"coderhelm-abc\""));
-        assert!(s.contains("arn:aws:iam::654654210434:root"));
-        assert!(s.contains("logs:StartQuery"));
-        assert!(s.contains("\"Action\":\"logs:Unmask\""));
-        assert!(s.contains("rds-data:CommitTransaction"));
-        assert!(s.contains("default_transaction_read_only = on"));
-        assert!(s.trim_end().ends_with("coderhelm_setup"));
-        // one permission per database, so adding a second keeps the first
-        assert!(s.contains("--policy-name \"coderhelm-read-database-$CLUSTER_ID\""));
-        assert!(s.contains("PASSWORD DISABLE"));
-        assert!(s.contains("redshift-data:BatchExecuteStatement"));
-        // nothing in the policies can write
-        for p in [
-            logs_policy(),
-            database_policy_template("1"),
-            warehouse_policy_template("1"),
+    fn the_script_only_creates_or_updates_the_role_stack() {
+        let s = script();
+        for no in [
+            "put-role-policy",
+            "create-role",
+            "update-assume-role-policy",
+            "attach-role-policy",
+            "coderhelm-read-waf",
         ] {
-            for st in p["Statement"].as_array().unwrap() {
-                if st["Effect"] == "Allow" {
-                    let actions = st["Action"].to_string();
-                    for w in [
-                        "Put", "Create", "Delete", "Update", "Commit", "Batch", "Unmask",
-                    ] {
-                        assert!(!actions.contains(w), "{actions}");
-                    }
-                }
-            }
+            assert!(!s.contains(no), "{no}");
         }
+        assert!(s.contains("STACK=CoderHelmLogReader\n"));
+        assert!(s.contains(&format!("TEMPLATE_URL='{TEMPLATE_URL}'")));
+        assert!(s.contains("aws cloudformation update-stack"));
+        assert!(s.contains("aws cloudformation create-stack"));
+        assert!(s.contains("\\\"UsePreviousValue\\\":true"));
+        assert!(s.contains("ParameterKey\\\":\\\"DatabaseClusters"));
+        assert!(s.contains("ParameterKey\\\":\\\"Warehouses"));
+        assert!(s.contains("\\\"ParameterValue\\\":\\\"0b5f1a5e-0000-4000-8000-000000000000\\\""));
+        assert!(s.contains("No updates are to be performed"));
+        // A role the stack didn't make is never patched by hand.
+        assert!(s.contains("not from CoderHelm's stack"));
+        // Inside the database: a user that can only read.
+        assert!(s.contains("default_transaction_read_only = on"));
+        assert!(s.contains("PASSWORD DISABLE"));
+        assert!(s.trim_end().ends_with("coderhelm_setup"));
         assert_eq!(
             session_name("a person@example.com"),
             "coderhelm-a-person@example.com"
         );
         assert!(new_external_id().starts_with("coderhelm-"));
-    }
-
-    #[test]
-    fn the_waf_policy_reads_waf_and_queries_only_its_logs() {
-        let never = serde_json::to_value(WAF_NEVER).unwrap();
-        assert_eq!(
-            waf_policy_template("111122223333", true),
-            json!({
-                "Version": "2012-10-17",
-                "Statement": [
-                    { "Sid": "ReadWaf", "Effect": "Allow",
-                      "Action": ["wafv2:Get*", "wafv2:List*"], "Resource": "*" },
-                    { "Sid": "ReadWafLogObjects", "Effect": "Allow",
-                      "Action": ["s3:GetObject"], "Resource": "arn:aws:s3:::aws-waf-logs-*/*" },
-                    { "Sid": "ListWafLogBuckets", "Effect": "Allow",
-                      "Action": ["s3:ListBucket", "s3:GetBucketLocation"],
-                      "Resource": "arn:aws:s3:::aws-waf-logs-*" },
-                    { "Sid": "FindWafLogWorkgroups", "Effect": "Allow",
-                      "Action": ["athena:ListWorkGroups"], "Resource": "*" },
-                    { "Sid": "FindWafLogDatabases", "Effect": "Allow",
-                      "Action": ["glue:GetDatabases"],
-                      "Resource": ["arn:aws:glue:*:111122223333:catalog",
-                                   "arn:aws:glue:*:111122223333:database/*"] },
-                    { "Sid": "ReadWafLogTables", "Effect": "Allow", "Action": ["glue:Get*"],
-                      "Resource": ["arn:aws:glue:*:111122223333:catalog", "WAF_GLUE"] },
-                    { "Sid": "QueryWafLogs", "Effect": "Allow",
-                      "Action": ["athena:StartQueryExecution", "athena:Get*",
-                                 "athena:StopQueryExecution"],
-                      "Resource": ["WAF_WORKGROUPS"] },
-                    { "Sid": "WriteQueryResultsOnly", "Effect": "Allow",
-                      "Action": ["s3:PutObject", "s3:GetObject"],
-                      "Resource": ["WAF_RESULT_OBJECTS"] },
-                    { "Sid": "FindQueryResults", "Effect": "Allow",
-                      "Action": ["s3:GetBucketLocation", "s3:ListBucket"],
-                      "Resource": ["WAF_RESULT_BUCKETS"],
-                      "Condition": { "StringLike": { "s3:prefix": ["WAF_RESULT_PREFIXES"] } } },
-                    { "Sid": "NoWritesButQueryResults", "Effect": "Deny",
-                      "Action": "s3:PutObject", "NotResource": ["WAF_RESULT_OBJECTS"] },
-                    { "Sid": "NeverChange", "Effect": "Deny", "Action": never, "Resource": "*" }
-                ]
-            })
-        );
-        assert_eq!(
-            waf_policy_template("111122223333", false),
-            json!({
-                "Version": "2012-10-17",
-                "Statement": [
-                    { "Sid": "ReadWaf", "Effect": "Allow",
-                      "Action": ["wafv2:Get*", "wafv2:List*"], "Resource": "*" },
-                    { "Sid": "ReadWafLogObjects", "Effect": "Allow",
-                      "Action": ["s3:GetObject"], "Resource": "arn:aws:s3:::aws-waf-logs-*/*" },
-                    { "Sid": "ListWafLogBuckets", "Effect": "Allow",
-                      "Action": ["s3:ListBucket", "s3:GetBucketLocation"],
-                      "Resource": "arn:aws:s3:::aws-waf-logs-*" },
-                    { "Sid": "NoWrites", "Effect": "Deny", "Action": "s3:PutObject",
-                      "Resource": "*" },
-                    { "Sid": "NeverChange", "Effect": "Deny", "Action": never, "Resource": "*" }
-                ]
-            })
-        );
-        // Every allow is a read but the one write, which is held to the
-        // workgroup's results prefix by its own deny.
-        for athena in [true, false] {
-            let p = waf_policy_template("1", athena);
-            for st in p["Statement"].as_array().unwrap() {
-                let actions: Vec<&str> = match &st["Action"] {
-                    Value::String(a) => vec![a.as_str()],
-                    v => v
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .map(|a| a.as_str().unwrap())
-                        .collect(),
-                };
-                if st["Effect"] == "Allow" {
-                    for a in &actions {
-                        let verb = a.split(':').nth(1).unwrap();
-                        let read = ["Get", "List"].iter().any(|r| verb.starts_with(r))
-                            || matches!(
-                                *a,
-                                "athena:StartQueryExecution" | "athena:StopQueryExecution"
-                            );
-                        assert!(read || *a == "s3:PutObject", "{a} is not a read");
-                        if *a == "s3:PutObject" {
-                            assert_eq!(st["Resource"], json!(["WAF_RESULT_OBJECTS"]));
-                        }
-                    }
-                    assert_ne!(st["Action"], json!("*"));
-                }
-            }
-            // Every placeholder is alone in its array, so the script's list replaces it.
-            let text = p.to_string();
-            for ph in WAF_PLACEHOLDERS {
-                if athena {
-                    assert!(text.contains(&format!("\"{ph}\"")), "{ph}");
-                } else {
-                    assert!(!text.contains(ph), "{ph}");
-                }
-            }
-        }
-        // Glue's connections carry passwords: never readable.
-        assert!(WAF_NEVER.contains(&"glue:GetConnection"));
-    }
-
-    #[test]
-    fn the_setup_script_adds_the_waf_policy_and_the_update_line_only_that() {
-        let s = setup_script("654654210434", "coderhelm-abc");
-        assert!(s.contains(&format!("--policy-name {WAF_POLICY_NAME}")));
-        assert!(s.contains("grep -i waf"));
-        assert!(s.contains("starts_with(StorageDescriptor.Location, 's3://aws-waf-logs-')"));
-        let line = waf_update_line("arn:aws:iam::111122223333:role/CoderhelmReadOnly").unwrap();
-        assert!(line.starts_with("echo ") && line.ends_with(" | base64 -d | bash"));
-        assert!(!line.contains('\n'));
-        let b64 = line
-            .trim_start_matches("echo ")
-            .trim_end_matches(" | base64 -d | bash");
-        let script = String::from_utf8(STANDARD.decode(b64).unwrap()).unwrap();
-        assert!(script.contains("ROLE=CoderhelmReadOnly\n"));
-        assert!(script.contains(&format!("--policy-name {WAF_POLICY_NAME}")));
-        // Nothing else: no trust change, no other policy, nothing pasted back.
-        assert_eq!(script.matches("put-role-policy").count(), 1);
-        for no in [
-            "update-assume-role-policy",
-            "create-role",
-            "coderhelm:$CODE",
-            "read -r",
-        ] {
-            assert!(!script.contains(no), "{no}");
-        }
-        assert!(waf_update_line("arn:aws:iam::111122223333:role/x;rm -rf").is_none());
-        for sh in [script, s] {
-            use std::io::Write;
-            let mut child = std::process::Command::new("bash")
-                .arg("-n")
-                .stdin(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .spawn()
-                .expect("bash is installed");
-            child
-                .stdin
-                .take()
-                .unwrap()
-                .write_all(sh.as_bytes())
-                .unwrap();
-            let out = child.wait_with_output().unwrap();
-            assert!(
-                out.status.success(),
-                "{}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-        }
     }
 
     #[test]
@@ -1360,7 +935,7 @@ mod tests {
             .stdin
             .take()
             .unwrap()
-            .write_all(setup_script("654654210434", "coderhelm-abc").as_bytes())
+            .write_all(script().as_bytes())
             .unwrap();
         let out = child.wait_with_output().unwrap();
         assert!(
@@ -1368,6 +943,17 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+
+    #[test]
+    fn a_database_on_the_log_reader_is_read_with_that_role_in_the_install_account() {
+        let mut t = db_target();
+        t.role_arn = format!("arn:aws:iam::111122223333:role/{LOG_READER_ROLE}");
+        assert!(install_target(&t, Some(OWN)).is_none());
+        let mut w = t.clone();
+        w.cluster_arn.clear();
+        w.cluster_id = "analytics".into();
+        assert!(install_target(&w, Some(OWN)).is_none());
     }
 
     /// Writes the setup script to the file named by SETUP_SCRIPT_OUT, for
@@ -1378,7 +964,12 @@ mod tests {
         let env = |k: &str| std::env::var(k).unwrap_or_else(|_| panic!("{k} not set"));
         std::fs::write(
             env("SETUP_SCRIPT_OUT"),
-            setup_script(&env("SETUP_ACCOUNT"), &env("SETUP_EXTERNAL_ID")),
+            setup_script(
+                &env("SETUP_ACCOUNT"),
+                &env("SETUP_EXTERNAL_ID"),
+                &crate::public_urls::log_reader_template_url(),
+                "",
+            ),
         )
         .unwrap();
     }

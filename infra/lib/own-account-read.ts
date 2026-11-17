@@ -66,6 +66,20 @@ const OWN_CONDITIONS: Record<string, boolean> = {
   SyncsEveryKnowledgeBase: false,
   // The install's own role only reads: it never applies database maintenance.
   AppliesMaintenance: false,
+  // WAF logs, databases and warehouses are read through the connected
+  // account's role stack (CoderHelmLogReader), in the install's own account
+  // too: a WAF alarm run reads with the connection's role (log_findings.rs,
+  // session_for) and a database or warehouse is never read through the
+  // install's role (live/aws.rs, install_target). So these groups reach a
+  // team by the same one-click update of that stack, an AWS admin's step,
+  // and never widen the install's runtime roles or their boundary (no
+  // Athena, Glue or results write on the gateway and worker).
+  ReadsWafLogs: false,
+  QueriesWafLogs: false,
+  NoWafLogQueries: false,
+  DecryptsWafLogs: false,
+  ReadsDatabases: false,
+  ReadsWarehouses: false,
 };
 
 /**
@@ -134,7 +148,7 @@ export function decideConditions(v: unknown, conditions: Record<string, boolean>
  */
 export function updateTemplateStatements(): Statement[] {
   const scratch = new cdk.Stack(new cdk.App(), "Scratch");
-  const inc = new CfnInclude(scratch, "T", { templateFile: repoPath(UPDATE_TEMPLATE), parameters: { RoleName: ROLE_NAME_MARK, KnowledgeBases: OWN_KNOWLEDGE_BASES, ImportBuckets: "", SyncKnowledgeBases: "", InfrastructureVulnerabilities: "on", InspectorFindings: "on", HealthEvents: "on" } });
+  const inc = new CfnInclude(scratch, "T", { templateFile: repoPath(UPDATE_TEMPLATE), parameters: { RoleName: ROLE_NAME_MARK, KnowledgeBases: OWN_KNOWLEDGE_BASES, ImportBuckets: "", SyncKnowledgeBases: "", InfrastructureVulnerabilities: "on", InspectorFindings: "on", HealthEvents: "on", WafLogs: "off", WafLogResults: "", WafLogKey: "", DatabaseClusters: "", Warehouses: "" } });
   const p = inc.getResource(UPDATE_POLICY_ID) as iam.CfnPolicy;
   const kept = Object.fromEntries(OWN_OPTIONS.map((o) => [o.condition, o.own]));
   return decideConditions(scratch.resolve(p.policyDocument).Statement, OWN_CONDITIONS, kept) as Statement[];

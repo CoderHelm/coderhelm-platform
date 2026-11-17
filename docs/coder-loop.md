@@ -68,6 +68,16 @@ The causes were in the loop, not only in prompt wording:
    ticket asks to replace. The camps run's plan named the right map, then
    reused the link helper that deletes every link it isn't given.
 
+   The plan also writes `## Criteria map`: one line for each acceptance
+   criterion (or Expected line, when the ticket has no acceptance list) that
+   names a page or what a person sees, with the page, an end-to-end test in
+   the repository's suite that loads it, and what it asserts
+   (`common::e2e_proof`). A plan without that line, or with a unit test in
+   place of the end-to-end test, is sent back (`plan_shape::criteria_gaps`).
+   Unit tests may go with it; they never replace it. A ticket once asked
+   for one chip on one page and got about 530 lines of unit tests and no
+   test of the page (`incidents::cp_criteria_proven_both_ways`).
+
    Whatever is still open after the one send-back stays on the decision.
 
 4. **Implement.** In the coder's tool loop (`explore_guard`):
@@ -75,6 +85,10 @@ The causes were in the loop, not only in prompt wording:
      names what it reuses (`reuses`).
    - An edit that adds a top-level map, helper or config beside a similar existing
      one is refused unless it says why (`why_new`).
+   - An edit that adds a helper whose name or body nearly matches one this
+     build already added (in that edit or an earlier one) is refused unless
+     it names what they share (`shares`). The check above compares new code
+     with old, so three near-identical helpers added together once passed it.
 
    Both are kept as evidence lines. The coder's prompt carries the same rules
    (`SMALLEST_CHANGE_RULES`). The data rules ask for reporting on a skip only when
@@ -83,6 +97,9 @@ The causes were in the loop, not only in prompt wording:
 5. **Review against the ticket.** After the build, the habits check reads the diff
    against the base and the ticket (`minimal_change::check`). It flags:
    - parallel structures;
+   - twin helpers: two new helpers in the same diff whose names parallel each
+     other, or whose signatures and bodies nearly match
+     (`minimal_change::twin_helpers`);
    - deleting or overwriting semantics where the base only added;
    - log level changes;
    - new counters and log calls nobody asked for;
@@ -124,6 +141,27 @@ The causes were in the loop, not only in prompt wording:
    A proof fix round that answers a gap by looking (a query, a page, a check
    run) is judged again with what it found, even when it wrote no code
    (`proof::round_answered`, `incidents::cn_proof_answer_judged`).
+
+   **Two ways, end to end.** Before the pull request is called done, once
+   its preview is up and its own end-to-end checks passed, the pull request
+   watch runs each criterion's test (the one the criteria map names, else a
+   changed spec that loads the criterion's page) on the base branch's
+   deployment (staging) and on the preview, in the sandbox, with the runner
+   that reproduces a red check (`ci_repro::two_way`, from #754). Both results
+   are kept on the run (`e2e_proof`), said on the run page, and written into
+   the pull request: a proven criterion as a check with both results,
+   anything else as unverified with what each side did
+   (`description_facts::with_two_way`).
+   - Fails on staging, passes on the preview: proven.
+   - Passes on both: it doesn't test the ticket; back to the coder.
+   - Fails on the preview, or no test of the page on the head: back to the
+     coder.
+   - A side that couldn't run (no browser, no network, no address):
+     unverified, with the reason, on the pull request. Never a silent pass.
+
+   Work it sends back is a fix round (`resume::queue_own_review_round`), and
+   the ready decision waits while the proof runs or the round fixes it
+   (`ready::decide`, `e2e_proof::standing`).
 
 7. **Commit and push.**
    Each gate runs where the commit is made, not as a line in the prompt

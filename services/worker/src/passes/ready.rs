@@ -184,7 +184,14 @@ pub struct Facts {
     /// once its preview deploy and end-to-end checks passed on it, and only
     /// with an end-to-end spec when the repository has a suite.
     pub preview: Option<common::preview::State>,
+    /// Each ticket criterion's end-to-end test run on staging and on the
+    /// preview (`e2e_proof`).
+    pub two_way: super::e2e_proof::Standing,
 }
+
+/// What a draft waits for while its criteria are proven both ways.
+pub const TWO_WAY_WAIT: &str =
+    "each ticket criterion's end-to-end test runs on staging (where it must fail) and on the preview (where it must pass)";
 
 /// What a change a person sees waits on while it has no end-to-end spec in
 /// a repository with a suite: CoderHelm writes it in its next round, so it
@@ -457,7 +464,7 @@ fn decide_raw(f: &Facts) -> Decision {
     if f.closed {
         return Decision::Closed;
     }
-    let open = match (&f.feature, f.ci.green && f.approved) {
+    let mut open = match (&f.feature, f.ci.green && f.approved) {
         (Some(h), true) => h.items(),
         _ => Vec::new(),
     };
@@ -563,6 +570,24 @@ fn decide_raw(f: &Facts) -> Decision {
         use common::preview::{Outcome as PvOutcome, Stage};
         if p.e2e_required && !p.e2e_covered {
             proof_wait.get_or_insert_with(|| E2E_WAIT.to_string());
+        }
+        // Each criterion proven both ways before it is done: a test that
+        // passes on staging too, or fails on the preview, is the coder's.
+        match &f.two_way {
+            super::e2e_proof::Standing::Pending => {
+                proof_wait.get_or_insert_with(|| TWO_WAY_WAIT.to_string());
+            }
+            super::e2e_proof::Standing::Fixing(n) => {
+                wait.get_or_insert_with(|| {
+                    format!(
+                        "CoderHelm is fixing {n} criterion test(s) the two-way proof sent back (a test that passes on staging too, fails on the preview, or is missing)"
+                    )
+                });
+            }
+            super::e2e_proof::Standing::Done(notes) => {
+                open.extend(notes.iter().map(|n| note_line(n)));
+            }
+            super::e2e_proof::Standing::None => {}
         }
         match p.stage {
             Stage::Failed => {
@@ -1225,6 +1250,21 @@ async fn gather(ctx: &Ctx<'_>) -> Result<Facts, Refused> {
             super::feature::ready_hold(ctx.state, gh, ctx.team_id, ctx.owner, ctx.repo, ctx.pr)
                 .await;
         f.preview = preview_of(ctx, &pr).await;
+        let run_id = if ctx.run_id.is_empty() {
+            super::review_pr::lookup_run_by_pr(ctx.state, ctx.team_id, ctx.owner, ctx.repo, ctx.pr)
+                .await
+                .unwrap_or_default()
+        } else {
+            ctx.run_id.clone()
+        };
+        f.two_way = super::e2e_proof::standing(
+            ctx.state,
+            ctx.team_id,
+            &run_id,
+            &f.head,
+            f.preview.as_ref(),
+        )
+        .await;
     }
     // The description as it is now (the link check may have rewritten it).
     let pr = read_pr().await?;

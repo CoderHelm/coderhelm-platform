@@ -78,13 +78,32 @@ pub struct AwsAccount {
     /// by the caller, never stored here): an update keeps the role able to
     /// read them.
     pub import_buckets: Vec<String>,
+    /// An alert route took an AWS WAF alarm in this account, so its role
+    /// stack keeps the WAF log group on (stored: `waf_logs`), with what a
+    /// WAF alarm run found: the Athena workgroup's results location
+    /// (`bucket/prefix/`) and the log bucket's own KMS key, empty until
+    /// known. Every update link for the account carries them.
+    pub waf_logs: bool,
+    pub waf_log_results: String,
+    pub waf_log_key: String,
+    /// The Aurora clusters (ARNs) and Redshift clusters (names) the team's
+    /// data sources read in this account (filled by the caller, never
+    /// stored here): an update keeps the role able to query them.
+    pub database_clusters: Vec<String>,
+    pub warehouses: Vec<String>,
 }
 
 impl AwsAccount {
     /// What the team chose for the role here.
     pub fn chosen(&self) -> crate::log_reader::Chosen<'_> {
-        crate::log_reader::Chosen::new(&self.knowledge_bases, &self.import_buckets)
+        let c = crate::log_reader::Chosen::new(&self.knowledge_bases, &self.import_buckets)
             .with_infrastructure(self.abilities.infra_on)
+            .with_data_sources(&self.database_clusters, &self.warehouses);
+        if self.waf_logs {
+            c.with_waf_logs(&self.waf_log_results, &self.waf_log_key)
+        } else {
+            c
+        }
     }
 
     /// Infrastructure vulnerabilities is on here.
@@ -166,6 +185,11 @@ impl AwsAccount {
             status: s(item, "status"),
             knowledge_bases: Vec::new(),
             import_buckets: Vec::new(),
+            waf_logs: b(item, "waf_logs"),
+            waf_log_results: s(item, "waf_log_results"),
+            waf_log_key: s(item, "waf_log_key"),
+            database_clusters: Vec::new(),
+            warehouses: Vec::new(),
             permissions: item
                 .get("permissions_check")
                 .and_then(|v| v.as_s().ok())
@@ -433,6 +457,55 @@ pub async fn save_permissions(
         .await
         .map(|_| ())
         .map_err(|e| format!("save aws permissions: {e}"))
+}
+
+/// Pure: the WAF log group's settings after a WAF alarm run in the
+/// account, from what was stored and what the run found: the group stays
+/// on, and a location or key found replaces an unknown one (a found one
+/// that differs replaces it too: the workgroup or the bucket changed).
+pub fn waf_logs_after(
+    stored_results: &str,
+    stored_key: &str,
+    found_results: &str,
+    found_key: &str,
+) -> (String, String) {
+    let pick = |stored: &str, found: &str| {
+        if found.is_empty() {
+            stored.to_string()
+        } else {
+            found.to_string()
+        }
+    };
+    (
+        pick(stored_results, found_results),
+        pick(stored_key, found_key),
+    )
+}
+
+/// Turns the WAF log group on for the account and stores what a WAF alarm
+/// run found (results location, KMS key), only while it is still connected.
+pub async fn save_waf_logs(
+    dynamo: &aws_sdk_dynamodb::Client,
+    table: &str,
+    team_id: &str,
+    account: &str,
+    results: &str,
+    key: &str,
+) -> Result<(), String> {
+    dynamo
+        .update_item()
+        .table_name(table)
+        .key("pk", av_s(team_id))
+        .key("sk", av_s(&format!("{PREFIX}{account}")))
+        .condition_expression("attribute_exists(pk)")
+        .update_expression("SET waf_logs = :on, waf_log_results = :r, waf_log_key = :k")
+        .expression_attribute_values(":on", AttributeValue::Bool(true))
+        .expression_attribute_values(":r", av_s(results))
+        .expression_attribute_values(":k", av_s(key))
+        .send()
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("save waf log settings: {e}"))
 }
 
 /// Writes only the ability fields, and only while the account is still

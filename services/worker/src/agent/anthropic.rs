@@ -1261,7 +1261,8 @@ pub async fn converse_tool_loop(
 }
 
 /// The note the loop sends when every tool step is used.
-const TOOLS_OFF_NOTE: &str = "[SYSTEM NOTE] You have used every tool step. Tools are now off. \
+pub(crate) const TOOLS_OFF_NOTE: &str =
+    "[SYSTEM NOTE] You have used every tool step. Tools are now off. \
      Write your final answer NOW, in exactly the format you were asked for, using what you have \
      already learned. Where something is still unknown, say so in the answer instead of guessing.";
 

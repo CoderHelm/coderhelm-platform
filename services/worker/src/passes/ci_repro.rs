@@ -199,11 +199,58 @@ pub(crate) async fn compare(
     {
         return Some(r);
     }
-    let (owner, repo) = (&msg.repo_owner, &msg.repo_name);
+    let r = two_way(
+        state,
+        github,
+        provider.scope.ctx(common::agent_policy::Agent::Coder),
+        Target {
+            team_id: &msg.team_id,
+            run_id,
+            owner: &msg.repo_owner,
+            repo: &msg.repo_name,
+            pr,
+            branch,
+            head,
+        },
+        &ev.check,
+        &test,
+    )
+    .await;
+    info!(run_id, verdict = ?r.verdict(), "Failing test compared with the base branch");
+    record(state, &msg.team_id, run_id, r.clone(), true).await;
+    Some(r)
+}
+
+/// The pull request a test is run for.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Target<'a> {
+    pub team_id: &'a str,
+    pub run_id: &'a str,
+    pub owner: &'a str,
+    pub repo: &'a str,
+    pub pr: u64,
+    pub branch: &'a str,
+    pub head: &'a str,
+}
+
+/// One Playwright test (`file › title`) with the head's test code, run in
+/// the sandbox against the base branch's deployment (`base`, staging) and
+/// against the pull request's preview (`change`). A side that couldn't run
+/// says why in its note. Nothing is recorded here: the red-check
+/// comparison ([`compare`]) and the two-way proof (`e2e_proof`) keep it.
+pub(crate) async fn two_way(
+    state: &WorkerState,
+    github: &GitHubClient,
+    ctx: common::agent_policy::GateCtx,
+    t: Target<'_>,
+    check: &str,
+    test: &str,
+) -> Record {
+    let (owner, repo, head) = (t.owner, t.repo, t.head);
     let mut r = Record {
         head: head.to_string(),
-        check: ev.check.clone(),
-        tests: vec![test.clone()],
+        check: check.to_string(),
+        tests: vec![test.to_string()],
         source: "sandbox".into(),
         at: chrono::Utc::now().to_rfc3339(),
         ..Default::default()
@@ -212,13 +259,12 @@ pub(crate) async fn compare(
         r.base.note = why.to_string();
         r.change.note = why.to_string();
     };
-    let (spec, title) = ci_repro::spec_and_title(&test);
+    let (spec, title) = ci_repro::spec_and_title(test);
     let tree: Vec<String> = match github.get_tree(owner, repo, head).await {
         Ok(t) => t.into_iter().map(|e| e.path).collect(),
         Err(e) => {
             not_run(&mut r, &format!("the head's files couldn't be read ({e})"));
-            record(state, &msg.team_id, run_id, r.clone(), true).await;
-            return Some(r);
+            return r;
         }
     };
     let Some(path) = tree
@@ -227,8 +273,7 @@ pub(crate) async fn compare(
         .cloned()
     else {
         not_run(&mut r, &format!("`{spec}` isn't a file on the head"));
-        record(state, &msg.team_id, run_id, r.clone(), true).await;
-        return Some(r);
+        return r;
     };
     // The package the spec lives in, and its runner.
     let mut texts: HashMap<String, String> = HashMap::new();
@@ -245,8 +290,7 @@ pub(crate) async fn compare(
             &mut r,
             "the spec's runner isn't Playwright, the one CoderHelm runs against an address",
         );
-        record(state, &msg.team_id, run_id, r.clone(), true).await;
-        return Some(r);
+        return r;
     };
     let rel = path
         .strip_prefix(&format!("{}/", pkg.dir))
@@ -254,7 +298,7 @@ pub(crate) async fn compare(
         .to_string();
     // Where each side runs: the configured test address and the preview,
     // else the staging address the repository's end-to-end setup names.
-    let configured = test_address(state, &msg.team_id, &format!("{owner}/{repo}")).await;
+    let configured = test_address(state, t.team_id, &format!("{owner}/{repo}")).await;
     let mut setup: Vec<(String, String)> = Vec::new();
     for p in tree
         .iter()
@@ -266,12 +310,12 @@ pub(crate) async fn compare(
         })
         .take(6)
     {
-        if let Ok(t) = github.read_file(owner, repo, p, head).await {
-            setup.push((p.clone(), t));
+        if let Ok(text) = github.read_file(owner, repo, p, head).await {
+            setup.push((p.clone(), text));
         }
     }
     let base_url = ci_repro::base_target(configured.as_deref(), &setup);
-    let preview = super::preview::load(state, &msg.team_id, run_id)
+    let preview = super::preview::load(state, t.team_id, t.run_id)
         .await
         .filter(|p| p.head == head && !p.url.trim().is_empty())
         .map(|p| p.url);
@@ -279,7 +323,7 @@ pub(crate) async fn compare(
         configured
             .as_deref()
             .filter(|c| c.contains("{pr}"))
-            .map(|c| c.replace("{pr}", &pr.to_string()))
+            .map(|c| c.replace("{pr}", &t.pr.to_string()))
     });
     r.base.target = base_url.clone().unwrap_or_default();
     r.change.target = change_url.clone().unwrap_or_default();
@@ -288,8 +332,7 @@ pub(crate) async fn compare(
             &mut r,
             "no address for the base branch's deployment: the Tests settings have none without `{pr}`, and the end-to-end setup names no staging address",
         );
-        record(state, &msg.team_id, run_id, r.clone(), true).await;
-        return Some(r);
+        return r;
     };
     let mut legs: Vec<(&str, String)> = Vec::new();
     match ci_repro::leg_cmd(&pkg.dir, &rel, &title, &base_url) {
@@ -304,20 +347,14 @@ pub(crate) async fn compare(
         None => r.change.note = "no preview address for this pull request's head".into(),
     }
     if legs.is_empty() {
-        record(state, &msg.team_id, run_id, r.clone(), true).await;
-        return Some(r);
+        return r;
     }
     if state.config.sandbox_bucket_name.is_empty() || state.config.sandbox_project_name.is_empty() {
         not_run(&mut r, "no sandbox here to run the test");
-        record(state, &msg.team_id, run_id, r.clone(), true).await;
-        return Some(r);
+        return r;
     }
     // The team's agent permissions decide whether the commands may run.
-    let gate = crate::agent::policy::gate(
-        state,
-        provider.scope.ctx(common::agent_policy::Agent::Coder),
-        None,
-    );
+    let gate = crate::agent::policy::gate(state, ctx, None);
     let install = test_package::install_cmd(&pkg);
     let mut steps: Vec<(&str, String)> = vec![("install", install)];
     steps.extend(legs);
@@ -325,7 +362,7 @@ pub(crate) async fn compare(
         if !matches!(
             gate.check_command(
                 cmd,
-                "Run the failing test against the base branch and the preview"
+                "Run the test against the base branch's deployment and the preview"
             )
             .await,
             common::agent_policy::Outcome::Run { .. }
@@ -334,8 +371,7 @@ pub(crate) async fn compare(
                 &mut r,
                 &format!("the team's agent permissions don't allow the {side} command"),
             );
-            record(state, &msg.team_id, run_id, r.clone(), true).await;
-            return Some(r);
+            return r;
         }
     }
     let sandbox = crate::clients::sandbox::SandboxClient::new(
@@ -345,9 +381,11 @@ pub(crate) async fn compare(
         &state.config.sandbox_bucket_name,
         &state.config.sandbox_project_name,
     )
-    .with_egress(crate::agent::policy::sandbox_egress(state, &msg.team_id).await);
+    .with_egress(crate::agent::policy::sandbox_egress(state, t.team_id).await);
     let source = match sandbox
-        .ensure_source(run_id, head, || github.download_tarball(owner, repo, head))
+        .ensure_source(t.run_id, head, || {
+            github.download_tarball(owner, repo, head)
+        })
         .await
     {
         Ok(k) => k,
@@ -356,12 +394,11 @@ pub(crate) async fn compare(
                 &mut r,
                 &format!("the branch couldn't be prepared in the sandbox ({e})"),
             );
-            record(state, &msg.team_id, run_id, r.clone(), true).await;
-            return Some(r);
+            return r;
         }
     };
     let script = ci_repro::script(&steps);
-    let node = super::detect_node_version(github, owner, repo, branch).await;
+    let node = super::detect_node_version(github, owner, repo, t.branch).await;
     match sandbox
         .run_checks(&source, &script, node.as_deref(), None, None)
         .await
@@ -386,9 +423,7 @@ pub(crate) async fn compare(
         ),
         Err(e) => not_run(&mut r, &format!("the sandbox couldn't run ({e})")),
     }
-    info!(run_id, verdict = ?r.verdict(), "Failing test compared with the base branch");
-    record(state, &msg.team_id, run_id, r.clone(), true).await;
-    Some(r)
+    r
 }
 
 /// The team's test address for the repository (Tests settings), as set.

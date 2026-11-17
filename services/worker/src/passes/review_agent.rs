@@ -383,16 +383,20 @@ impl<'de> Deserialize<'de> for UnconfirmedFact {
 #[derive(Debug, Clone, Deserialize)]
 pub struct PriorStatus {
     pub index: usize,
-    /// "fixed" | "answered" | "accepted" | "open"
+    /// "fixed" | "answered" | "accepted" | "gone" | "open"
     #[serde(default)]
     pub status: String,
 }
 
+/// A thread's status when the code it was about is no longer in the change.
+pub const GONE: &str = "gone";
+
 impl PriorStatus {
     /// Nothing is left to do on the thread: the code fixed it, a person's
-    /// reply answered it, or the author accepted or decided on a suggestion.
+    /// reply answered it, the author accepted or decided on a suggestion,
+    /// or the code it was about is no longer in the change.
     pub fn is_settled(&self) -> bool {
-        ["fixed", "answered", "accepted"]
+        ["fixed", "answered", "accepted", GONE]
             .iter()
             .any(|s| self.status.eq_ignore_ascii_case(s))
     }
@@ -1636,21 +1640,77 @@ pub fn fold_inline_into_body(body: &str, inline: &[InlineComment]) -> String {
 }
 
 /// Build a bounded diff string for the prompt (per-file patch, head+tail capped).
+///
+/// Every changed file is in it, whatever its size: a diff over `cap` keeps
+/// each file's header and gives each patch a fair share of the room (a
+/// small patch whole, the large ones cut in the middle), then names the
+/// files it cut so the reviewer reads them before its verdict. Cutting the
+/// middle of the whole diff once dropped the files in the middle from the
+/// first review, and their findings came rounds later, on code that review
+/// had been given.
 pub fn format_diff(compare: &serde_json::Value, cap: usize) -> String {
-    let mut diff = String::new();
-    if let Some(files) = compare["files"].as_array() {
-        for f in files {
+    let files: Vec<(String, String, String)> = compare["files"]
+        .as_array()
+        .map(|a| a.as_slice())
+        .unwrap_or(&[])
+        .iter()
+        .map(|f| {
             let path = f["filename"].as_str().unwrap_or("");
             let status = f["status"].as_str().unwrap_or("");
             let adds = f["additions"].as_u64().unwrap_or(0);
             let dels = f["deletions"].as_u64().unwrap_or(0);
             let patch = f["patch"].as_str().unwrap_or("(no textual diff)");
-            diff.push_str(&format!(
-                "\n### {path} ({status}, +{adds}/-{dels})\n{patch}\n"
-            ));
+            (
+                path.to_string(),
+                format!("\n### {path} ({status}, +{adds}/-{dels})\n"),
+                patch.to_string(),
+            )
+        })
+        .collect();
+    let whole: usize = files.iter().map(|(_, h, p)| h.len() + p.len() + 1).sum();
+    if whole <= cap {
+        return files.iter().map(|(_, h, p)| format!("{h}{p}\n")).collect();
+    }
+    // Room for the patches once every header and the closing note are in.
+    let headers: usize = files.iter().map(|(_, h, _)| h.len() + 1).sum();
+    let note_room = 200 + files.iter().map(|(p, _, _)| p.len() + 6).sum::<usize>();
+    let mut room = cap.saturating_sub(headers + note_room);
+    // Fair shares, smallest first: a patch under its share is kept whole and
+    // leaves the rest to the others.
+    let mut order: Vec<usize> = (0..files.len()).collect();
+    order.sort_by_key(|&i| files[i].2.len());
+    let mut share = vec![0usize; files.len()];
+    for (n, &i) in order.iter().enumerate() {
+        let left = files.len() - n;
+        let fair = room / left.max(1);
+        share[i] = files[i].2.len().min(fair);
+        room -= share[i];
+    }
+    let mut out = String::new();
+    let mut cut: Vec<&str> = Vec::new();
+    for (i, (path, header, patch)) in files.iter().enumerate() {
+        out.push_str(header);
+        if patch.len() <= share[i] {
+            out.push_str(patch);
+        } else {
+            out.push_str(&common::head_tail_str(patch, share[i].max(400)));
+            cut.push(path);
+        }
+        out.push('\n');
+    }
+    if !cut.is_empty() {
+        out.push_str(&format!(
+            "\n(The diff is longer than this review's room, so the middle of {} patch{} was cut \
+             above. Read each of these at the PR head with read_file before your verdict: every \
+             finding belongs in this review, not a later one.)\n",
+            cut.len(),
+            if cut.len() == 1 { "" } else { "es" }
+        ));
+        for p in cut {
+            out.push_str(&format!("- `{p}`\n"));
         }
     }
-    common::head_tail_str(&diff, cap)
+    out
 }
 
 /// What the reviewer is told: its job, the rules a finding must meet, and the
@@ -1744,7 +1804,7 @@ pub fn review_system_prompt(
          \"caused_by_diff\": <bool, false when the PR's change didn't cause it>, \"tracked\": <bool, true for a follow-up the PR tracks or work outside the repo>, \"prompted_by_reply\": <bool, true when a person's reply since your previous review made it relevant>,\n    \
          \"body\": \"why it's a problem, be specific\", \"suggestion\": \"optional exact replacement code for the anchored line(s)\"\n  }}],\n  \
          \"unconfirmed_facts\": [{{\"fact\": \"...\", \"blocks\": <bool>, \"why\": \"one short sentence\"}}]  (each fact about a system the repository doesn't own that the PR's OWN description or evidence says is unconfirmed, unverified, not measured or never read from a real payload, in a few words, copying a listed fact's text as given; `blocks` and `why` per UNCONFIRMED FACTS; empty when it says none),\n  \
-         \"prior\": [{{\"index\": <int>, \"status\": \"fixed\" | \"answered\" | \"open\"}}]  (one per earlier unresolved comment listed, if any),\n  \
+         \"prior\": [{{\"index\": <int>, \"status\": \"fixed\" | \"answered\" | \"gone\" | \"open\"}}]  (one per earlier unresolved comment listed, if any; \"gone\" when the code it was about is no longer in the change. A comment you call settled or no longer applying in the summary gets that status here: one verdict per comment),\n  \
          \"labels\": [{{\"name\": \"label\", \"reason\": \"changed file(s) that need it\"}}]  (only if a PR-labels section is given),\n  \
          \"tests_note\": \"which tests will run and where, or why none are needed\"  (only if a PR-labels section is given),\n  \
          \"change_of_mind\": \"one sentence: the new information that changed your verdict\"  (only when your previous review of this same commit is listed and your verdict differs)\n}}\n\
@@ -1836,10 +1896,6 @@ pub async fn generate_review(
         diff,
         &format!("{graph_context}{prior_context}{live_context}{skills_context}"),
     );
-    let mut messages = vec![(
-        "user".to_string(),
-        vec![json!({"type": "text", "text": prompt})],
-    )];
     let executor = PrReviewToolExecutor {
         github,
         owner,
@@ -1879,34 +1935,161 @@ pub async fn generate_review(
         tools.extend(s.tools());
         s.offer(&tools);
     }
-    let reply = provider::converse(
-        state,
-        provider,
-        common::agent_policy::Agent::Reviewer,
-        provider.review_model_id(),
-        &system,
-        &mut messages,
-        &tools,
-        &executor,
-        usage,
-        llm::ConverseOptions {
-            max_turns: 30,
-            max_tokens: 8192,
-            deadline: None,
-            effort: None,
-        },
-        observer,
-        None,
-    )
-    .await;
+    // A review that runs out of tool steps is asked for its answer with the
+    // tools off, and that answer reads as a whole review: the files it
+    // hadn't reached came up rounds later, on code it had been given. Such a
+    // review goes on in a second pass over what it didn't reach, in this same
+    // review, and the two are one answer.
+    let mut first: Option<ReviewOutput> = None;
+    let mut prompt_now = prompt;
+    let result = loop {
+        let mut messages = vec![(
+            "user".to_string(),
+            vec![json!({"type": "text", "text": prompt_now.clone()})],
+        )];
+        let reply = provider::converse(
+            state,
+            provider,
+            common::agent_policy::Agent::Reviewer,
+            provider.review_model_id(),
+            &system,
+            &mut messages,
+            &tools,
+            &executor,
+            usage,
+            llm::ConverseOptions {
+                max_turns: REVIEW_MAX_TURNS,
+                max_tokens: 8192,
+                deadline: None,
+                effort: None,
+            },
+            observer,
+            None,
+        )
+        .await;
+        let out = match (reply, first.take()) {
+            (Ok(text), earlier) => match (parse_review(&text), earlier) {
+                (Ok(o), Some(e)) => break Ok(merge_review(e, o)),
+                (Ok(o), None) => o,
+                (Err(_), Some(e)) => break Ok(e),
+                (Err(why), None) => break Err(why),
+            },
+            (Err(_), Some(e)) => break Ok(e),
+            (Err(e), None) => break Err(format!("the model call failed: {e}")),
+        };
+        if !ran_out_of_steps(&messages) {
+            break Ok(out);
+        }
+        tracing::info!(
+            owner,
+            repo,
+            findings = out.findings.len(),
+            "The review ran out of tool steps: a second pass reviews what it didn't reach"
+        );
+        prompt_now = continue_prompt(&prompt_now, &out, &opened_files(&messages));
+        first = Some(out);
+    };
     if let Some(s) = skills {
         s.drain_usage_into(usage);
     }
+    result
+}
 
-    match reply {
-        Ok(text) => parse_review(&text),
-        Err(e) => Err(format!("the model call failed: {e}")),
+/// Tool steps one review pass has.
+pub const REVIEW_MAX_TURNS: usize = 30;
+
+/// The pass was asked for its answer with the tools off: it ran out of
+/// steps before it was done.
+pub fn ran_out_of_steps(messages: &[(String, Vec<serde_json::Value>)]) -> bool {
+    messages.iter().any(|(role, blocks)| {
+        role == "user"
+            && blocks.iter().any(|b| {
+                b["text"]
+                    .as_str()
+                    .is_some_and(|t| t == crate::agent::anthropic::TOOLS_OFF_NOTE)
+            })
+    })
+}
+
+/// The files a pass opened with its read tools.
+pub fn opened_files(messages: &[(String, Vec<serde_json::Value>)]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for (_, blocks) in messages {
+        for b in blocks {
+            if b["type"].as_str() != Some("tool_use") {
+                continue;
+            }
+            if !matches!(b["name"].as_str(), Some("read_file" | "read_file_lines")) {
+                continue;
+            }
+            if let Some(p) = b["input"]["path"].as_str() {
+                if !out.iter().any(|o| o == p) {
+                    out.push(p.to_string());
+                }
+            }
+        }
     }
+    out
+}
+
+/// The second pass's prompt: the review so far, and what it hadn't read.
+pub fn continue_prompt(prompt: &str, so_far: &ReviewOutput, opened: &[String]) -> String {
+    let found: Vec<String> = so_far
+        .findings
+        .iter()
+        .map(|f| format!("- `{}:{}` {}", f.file, f.line, one_line(&f.title)))
+        .collect();
+    let read = if opened.is_empty() {
+        "none".to_string()
+    } else {
+        opened
+            .iter()
+            .map(|p| format!("`{p}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    format!(
+        "{prompt}\n\n## This review goes on\nA first pass of this same review ran out of tool \
+         steps before it finished. Files it opened: {read}. What it found (don't repeat these):\n{}\n\
+         Finish the review now: read the changed files and the callers it didn't reach, and give \
+         every finding it missed in `findings`. Every finding belongs in this review: none is \
+         left for a later round. Answer in the same JSON.",
+        if found.is_empty() {
+            "- nothing yet".to_string()
+        } else {
+            found.join("\n")
+        }
+    )
+}
+
+/// The two passes of one review as one answer: the first pass's findings
+/// and statuses, the second's added where they are new.
+pub fn merge_review(mut first: ReviewOutput, second: ReviewOutput) -> ReviewOutput {
+    for f in second.findings {
+        let dup = first
+            .findings
+            .iter()
+            .any(|e| e.file == f.file && e.title.eq_ignore_ascii_case(&f.title));
+        if !dup {
+            first.findings.push(f);
+        }
+    }
+    for p in second.prior {
+        if !first.prior.iter().any(|e| e.index == p.index) {
+            first.prior.push(p);
+        }
+    }
+    for u in second.unconfirmed_facts {
+        if !first.unconfirmed_facts.iter().any(|e| e.fact == u.fact) {
+            first.unconfirmed_facts.push(u);
+        }
+    }
+    if !second.summary.trim().is_empty() {
+        first.summary = format!("{} {}", first.summary.trim(), second.summary.trim())
+            .trim()
+            .to_string();
+    }
+    first
 }
 
 /// The review in the model's final answer, or why there is none. An answer

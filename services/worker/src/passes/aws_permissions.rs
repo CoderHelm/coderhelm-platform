@@ -4,6 +4,11 @@
 //! tells each team once per new set of permissions when an account needs
 //! the update (where the team's notifications post: Slack, Teams).
 //!
+//! The same sweep moves data sources off the script-made
+//! `CoderhelmReadOnly` role onto the account's role stack
+//! (`common::role_move`): a source switches only when the stack's role
+//! passed the source's own connection check end to end.
+//!
 //! "Once" is a team record (`AWS_PERMS_NOTICE`) holding the permissions id
 //! it was told about, written with a condition before the message is sent,
 //! so two sweeps never post twice.
@@ -24,6 +29,8 @@ pub struct Report {
     pub accounts: usize,
     pub need_update: usize,
     pub teams_told: usize,
+    /// Data sources moved onto their account's role stack.
+    pub sources_moved: usize,
 }
 
 /// Every connected account, by team.
@@ -112,6 +119,48 @@ async fn told(state: &WorkerState, team_id: &str) -> Option<String> {
         .cloned()
 }
 
+/// Moves each of the team's data sources that still reads through a
+/// script-made role onto its account's role stack, when the stack's role
+/// reads it end to end; the rest stay as they are and are tried again on
+/// the next sweep. Returns how many moved.
+async fn move_sources(state: &WorkerState, team_id: &str, accounts: &[AwsAccount]) -> usize {
+    use common::live::store;
+    use common::role_move;
+    let table = &state.config.settings_table_name;
+    let Ok(sources) = store::list_sources(&state.dynamo, table, team_id).await else {
+        return 0;
+    };
+    let mut moved = 0;
+    for src in &sources {
+        let Some(t) = src.aws.as_ref() else { continue };
+        let Some(account) = accounts.iter().find(|a| a.account == t.account()) else {
+            continue;
+        };
+        let Some(candidate) = role_move::candidate(t, account) else {
+            continue;
+        };
+        match role_move::try_move(&state.sts, src, &candidate).await {
+            Ok(next) => {
+                let mut s = src.clone();
+                s.aws = Some(next);
+                match store::put_source(&state.dynamo, table, team_id, &s).await {
+                    Ok(()) => {
+                        moved += 1;
+                        info!(team_id, source = %src.id, account = %account.account, "Data source moved onto the account's role stack");
+                    }
+                    Err(e) => {
+                        warn!(team_id, source = %src.id, error = %e, "Could not save the moved data source")
+                    }
+                }
+            }
+            Err(why) => {
+                info!(team_id, source = %src.id, account = %account.account, why = %why, "Data source stays on the script-made role until the role stack reads it")
+            }
+        }
+    }
+    moved
+}
+
 pub async fn run(state: &WorkerState) -> Result<Report, String> {
     let teams = accounts_by_team(state).await?;
     let mut report = Report::default();
@@ -136,6 +185,7 @@ pub async fn run(state: &WorkerState) -> Result<Report, String> {
             }
             checks.push(c);
         }
+        report.sources_moved += move_sources(state, team_id, accounts).await;
         let last = told(state, team_id).await;
         if !should_tell(&checks, last.as_deref()) || !claim_notice(state, team_id).await {
             continue;
@@ -180,6 +230,7 @@ pub async fn run(state: &WorkerState) -> Result<Report, String> {
         accounts = report.accounts,
         need_update = report.need_update,
         teams_told = report.teams_told,
+        sources_moved = report.sources_moved,
         "AWS permissions sweep"
     );
     Ok(report)

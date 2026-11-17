@@ -78,6 +78,7 @@ pub mod coder_shell;
 /// Chat notifications (Teams and Slack): one message model, a renderer per
 /// channel, sealed webhook URLs.
 pub mod notify;
+pub mod role_move;
 pub mod tool_aliases;
 
 /// The team's daily alert token budget (alerts route and Setup).
@@ -173,6 +174,9 @@ pub mod fixture_ids;
 // A diff holds the lines the change needs: formatting-only hunks are told
 // apart and put back.
 pub mod diff_shape;
+/// Each ticket criterion mapped to an end-to-end test and proven both
+/// ways: failing on staging, passing on the preview.
+pub mod e2e_proof;
 #[cfg(test)]
 mod model_call_sites;
 /// Which pull requests CoderHelm may push to, edit or close: its own.

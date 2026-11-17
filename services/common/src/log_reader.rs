@@ -234,6 +234,55 @@ pub const ABILITIES: &[Ability] = &[
         chosen: true,
     },
     Ability {
+        key: "waf_logs",
+        name: "AWS WAF logs in S3",
+        why: "When a WAF alarm on an alert route fires, reads what the web ACL logged to its aws-waf-logs-* bucket: the log objects, the Glue table definitions Athena needs to plan a query, and the Athena workgroups' settings (which one queries the logs, where it writes results). With a results location (WafLogResults) it runs one bounded, read-only Athena query over the alarm's rule and writes the query's results only under that location: the role's one write, held there by a deny. Decrypts with the log bucket's own KMS key only through S3 (WafLogKey). Only when the stack's WafLogs parameter is on; every change to WAF, Athena, Glue or a bucket is denied.",
+        actions: &[
+            "s3:GetObject",
+            "s3:ListBucket",
+            "s3:GetBucketLocation",
+            "glue:GetDatabases",
+            "glue:GetDatabase",
+            "glue:GetTables",
+            "glue:GetTable",
+            "glue:GetPartitions",
+            "athena:ListWorkGroups",
+            "athena:GetWorkGroup",
+            "athena:StartQueryExecution",
+            "athena:GetQueryExecution",
+            "athena:GetQueryResults",
+            "athena:StopQueryExecution",
+            "s3:PutObject",
+            "kms:Decrypt",
+        ],
+        chosen: true,
+    },
+    Ability {
+        key: "databases",
+        name: "Databases",
+        why: "Queries the Aurora PostgreSQL clusters a team connects as data sources, as the read-only database user coderhelm_readonly, through the RDS Data API inside transactions that are rolled back and never committed; reads only that user's password secret (coderhelm-readonly-*). Only the clusters named in the stack's DatabaseClusters parameter.",
+        actions: &[
+            "rds-data:BeginTransaction",
+            "rds-data:ExecuteStatement",
+            "rds-data:RollbackTransaction",
+            "secretsmanager:GetSecretValue",
+        ],
+        chosen: true,
+    },
+    Ability {
+        key: "warehouses",
+        name: "Redshift warehouses",
+        why: "Queries the Redshift clusters a team connects as data sources, signed in only as the passwordless read-only user coderhelm_readonly, one statement at a time, reading only its own results. Only the clusters named in the stack's Warehouses parameter.",
+        actions: &[
+            "redshift:GetClusterCredentials",
+            "redshift-data:ExecuteStatement",
+            "redshift-data:DescribeStatement",
+            "redshift-data:GetStatementResult",
+            "redshift-data:CancelStatement",
+        ],
+        chosen: true,
+    },
+    Ability {
         key: "maintenance",
         name: "Applying approved database maintenance",
         why: "Applies a pending RDS or Aurora maintenance action (an operating system update, an engine patch or upgrade, a serverless platform update) after a person approves it on the infrastructure findings page: in the next maintenance window, or now when they pick that. Only the account's own clusters and instances, only when the stack's ApplyMaintenance parameter is on, and never without that approval.",
@@ -260,6 +309,11 @@ pub const SYNC_WRITES: &[&str] = &[
     "bedrock:StartIngestionJob",
 ];
 
+/// The one write of [`ability`] `waf_logs`: an Athena query's results,
+/// allowed only under the stack's WafLogResults location and denied
+/// everywhere else by the same policy.
+pub const WAF_RESULT_WRITES: &[&str] = &["s3:PutObject"];
+
 /// What a team chose for the role in one account: the knowledge bases it
 /// connects and the buckets it imports. The update stack grants exactly
 /// these.
@@ -277,6 +331,17 @@ pub struct Chosen<'a> {
     pub health: bool,
     /// The team lets CoderHelm apply approved database maintenance.
     pub maintenance: bool,
+    /// An alert route takes AWS WAF alarms in this account: the WAF log
+    /// group is on, with the workgroup's results location
+    /// (`bucket/prefix/`, empty until known) and the log bucket's own KMS
+    /// key (empty when it has none).
+    pub waf_logs: bool,
+    pub waf_log_results: &'a str,
+    pub waf_log_key: &'a str,
+    /// Aurora clusters (ARNs) and Redshift clusters (names) the team's data
+    /// sources in this account read.
+    pub database_clusters: &'a [String],
+    pub warehouses: &'a [String],
 }
 
 impl<'a> Chosen<'a> {
@@ -289,6 +354,31 @@ impl<'a> Chosen<'a> {
             inspector: false,
             health: false,
             maintenance: false,
+            waf_logs: false,
+            waf_log_results: "",
+            waf_log_key: "",
+            database_clusters: &[],
+            warehouses: &[],
+        }
+    }
+
+    /// The same, with the WAF log group on (`results` and `key` as the
+    /// stack's WafLogResults and WafLogKey; empty when not known).
+    pub fn with_waf_logs(self, results: &'a str, key: &'a str) -> Chosen<'a> {
+        Chosen {
+            waf_logs: true,
+            waf_log_results: results,
+            waf_log_key: key,
+            ..self
+        }
+    }
+
+    /// The same, with the team's data sources' databases and warehouses.
+    pub fn with_data_sources(self, clusters: &'a [String], warehouses: &'a [String]) -> Chosen<'a> {
+        Chosen {
+            database_clusters: clusters,
+            warehouses,
+            ..self
         }
     }
 
@@ -333,6 +423,9 @@ impl<'a> Chosen<'a> {
             && !self.inspector
             && !self.health
             && !self.maintenance
+            && !self.waf_logs
+            && self.database_clusters.is_empty()
+            && self.warehouses.is_empty()
     }
 }
 
@@ -563,7 +656,81 @@ pub fn update_url(update_template_url: &str, region: &str, chosen: &Chosen) -> S
     if chosen.maintenance {
         u.push_str("&param_ApplyMaintenance=on");
     }
+    if chosen.waf_logs {
+        u.push_str("&param_WafLogs=on");
+        if let Some(r) = waf_log_results(chosen.waf_log_results) {
+            u.push_str(&format!("&param_WafLogResults={}", urlencoding::encode(&r)));
+        }
+        if is_kms_key(chosen.waf_log_key) {
+            u.push_str(&format!(
+                "&param_WafLogKey={}",
+                urlencoding::encode(chosen.waf_log_key)
+            ));
+        }
+    }
+    if !chosen.database_clusters.is_empty() {
+        u.push_str(&format!(
+            "&param_DatabaseClusters={}",
+            urlencoding::encode(&sorted(chosen.database_clusters).join(","))
+        ));
+    }
+    if !chosen.warehouses.is_empty() {
+        u.push_str(&format!(
+            "&param_Warehouses={}",
+            urlencoding::encode(&sorted(chosen.warehouses).join(","))
+        ));
+    }
     u
+}
+
+/// Pure: an Athena workgroup's results location as the stack's
+/// WafLogResults (`bucket/prefix/`, always ending in `/` so the write
+/// covers that prefix and no sibling): from `s3://bucket/prefix` or
+/// `bucket/prefix`. `None` when it isn't a bucket and a prefix the
+/// template accepts. A bare bucket gets `bucket/`.
+pub fn waf_log_results(location: &str) -> Option<String> {
+    let l = location.trim();
+    let l = l.strip_prefix("s3://").unwrap_or(l);
+    let (bucket, prefix) = l.split_once('/').unwrap_or((l, ""));
+    let bucket_ok = (3..=63).contains(&bucket.len())
+        && bucket
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '-')
+        && bucket
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric())
+        && bucket
+            .chars()
+            .last()
+            .is_some_and(|c| c.is_ascii_alphanumeric());
+    let prefix_ok = prefix
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "!_.'()=/-".contains(c));
+    if !bucket_ok || !prefix_ok {
+        return None;
+    }
+    let mut out = format!("{bucket}/{prefix}");
+    if !out.ends_with('/') {
+        out.push('/');
+    }
+    Some(out)
+}
+
+/// Pure: a KMS key ARN the template's WafLogKey accepts.
+pub fn is_kms_key(arn: &str) -> bool {
+    let p: Vec<&str> = arn.split(':').collect();
+    p.len() == 6
+        && p[0] == "arn"
+        && p[1] == "aws"
+        && p[2] == "kms"
+        && !p[3].is_empty()
+        && is_account(p[4])
+        && p[5].strip_prefix("key/").is_some_and(|k| {
+            k.len() == 36
+                && k.chars()
+                    .all(|c| c == '-' || c.is_ascii_digit() || ('a'..='f').contains(&c))
+        })
 }
 
 fn sorted(v: &[String]) -> Vec<&str> {
@@ -603,6 +770,25 @@ pub fn update_stack_name_for(chosen: &Chosen) -> String {
     }
     if chosen.maintenance {
         seed.push_str("|maintenance");
+    }
+    if chosen.waf_logs {
+        seed.push_str(&format!(
+            "|waf:{}:{}",
+            waf_log_results(chosen.waf_log_results).unwrap_or_default(),
+            if is_kms_key(chosen.waf_log_key) {
+                chosen.waf_log_key
+            } else {
+                ""
+            }
+        ));
+    }
+    if !chosen.database_clusters.is_empty() {
+        seed.push_str("|db:");
+        seed.push_str(&sorted(chosen.database_clusters).join(","));
+    }
+    if !chosen.warehouses.is_empty() {
+        seed.push_str("|wh:");
+        seed.push_str(&sorted(chosen.warehouses).join(","));
     }
     format!(
         "{}-kb{}",
@@ -657,10 +843,20 @@ mod tests {
             "Put", "Create", "Delete", "Update", "Start", "Stop", "Run", "Invoke", "Attach",
             "Pass", "Tag", "Untag", "Register",
         ];
-        let ok_reads = ["logs:StartQuery", "logs:StopQuery", "airflow:InvokeRestApi"];
+        let ok_reads = [
+            "logs:StartQuery",
+            "logs:StopQuery",
+            "airflow:InvokeRestApi",
+            // Run and stop one read-only query; its results are the one write.
+            "athena:StartQueryExecution",
+            "athena:StopQueryExecution",
+        ];
         for a in all_actions() {
             let verb = a.split(':').nth(1).unwrap();
-            if ok_reads.contains(&a) || SYNC_WRITES.contains(&a) || MAINTENANCE_WRITES.contains(&a)
+            if ok_reads.contains(&a)
+                || SYNC_WRITES.contains(&a)
+                || MAINTENANCE_WRITES.contains(&a)
+                || WAF_RESULT_WRITES.contains(&a)
             {
                 continue;
             }
@@ -804,7 +1000,12 @@ mod tests {
                 .find("Sid: ReadImportBuckets")
                 .expect("the import statements");
             let end = t.find("kms:ViaService").expect("decrypt only through S3");
-            let rest = format!("{}{}", &t[..start], &t[end..]);
+            // And but the WAF log group, which reads only aws-waf-logs-*
+            // objects and decrypts only through S3 with its named key
+            // (the_waf_log_group_reads_and_writes_only_query_results).
+            let waf = t.find("# AWS WAF logs in S3").expect("the WAF log group");
+            assert!(end < waf);
+            let rest = format!("{}{}", &t[..start], &t[end..waf]);
             let all = template_actions(&rest);
             for x in a.actions {
                 assert!(template_actions(t).iter().any(|y| y == x), "{x}");
@@ -873,8 +1074,9 @@ mod tests {
         // Knowledge bases (6), imports (4), copying into Bedrock (6 more:
         // its Get calls are the knowledge bases' too) and infrastructure
         // reads (20), Inspector (3), Health (3) and applying approved
-        // maintenance (1).
-        assert_eq!(checked.len() + 43, all_actions().len());
+        // maintenance (1), WAF logs (12 more: Glue, Athena and the results
+        // write), databases (4) and warehouses (5).
+        assert_eq!(checked.len() + 64, all_actions().len());
         assert!(!checked.contains(&"bedrock:IngestKnowledgeBaseDocuments"));
         // Copying into Bedrock rides along as its own parameter and stack.
         let sync = ["arn:aws:bedrock:us-east-1:111122223333:knowledge-base/SYNC123456".to_string()];
@@ -1040,5 +1242,132 @@ mod tests {
         assert_eq!(trusted_role_prefix_from(None), "");
         assert_eq!(trusted_role_prefix_from(Some(" ".into())), "");
         assert_eq!(trusted_role_prefix_from(Some("a*b".into())), "");
+    }
+
+    /// The WAF log group: on only with WafLogs, its one write held to the
+    /// results location by a deny, decrypt only through S3 with the named
+    /// key, and every change to WAF, Athena, Glue or a bucket denied.
+    #[test]
+    fn the_waf_log_group_reads_and_writes_only_query_results() {
+        let a = ability("waf_logs").unwrap();
+        assert!(a.chosen && !OPTIONAL.contains(&"waf_logs"));
+        for t in [ROLE_TEMPLATE, UPDATE_TEMPLATE] {
+            assert!(t.contains("ReadsWafLogs: !Equals [!Ref WafLogs, \"on\"]"));
+            assert!(t.contains(
+                "QueriesWafLogs: !And [!Condition ReadsWafLogs, !Not [!Equals [!Ref WafLogResults, \"\"]]]"
+            ));
+            // The one write: listed once, on the results location only.
+            assert_eq!(t.matches("- \"s3:PutObject\"").count(), 1);
+            let w = t.split("Sid: WriteQueryResultsOnly").nth(1).unwrap();
+            let w = w.split("- !Ref AWS::NoValue").next().unwrap();
+            assert!(
+                w.contains("Resource: !Sub \"arn:aws:s3:::${WafLogResults}*\""),
+                "{w}"
+            );
+            // And denied everywhere else, or everywhere without a location.
+            let d = t.split("Sid: NoWritesButQueryResults").nth(1).unwrap();
+            let d = d.split("- !Ref AWS::NoValue").next().unwrap();
+            assert!(
+                d.contains("Effect: Deny")
+                    && d.contains("NotResource: !Sub \"arn:aws:s3:::${WafLogResults}*\"")
+            );
+            let n = t.split("Sid: NoWrites\n").nth(1).unwrap();
+            assert!(n.contains("Effect: Deny") && n.contains("Resource: \"*\""));
+            assert!(t.contains("NoWafLogQueries: !And [!Condition ReadsWafLogs, !Equals [!Ref WafLogResults, \"\"]]"));
+            // Log objects only in the buckets AWS requires WAF logs to use.
+            let o = t.split("Sid: ReadWafLogObjects").nth(1).unwrap();
+            assert!(o.contains("arn:aws:s3:::aws-waf-logs-*/*"));
+            // KMS: the named key, only through S3.
+            let k = t.split("Sid: DecryptWafLogsThroughS3").nth(1).unwrap();
+            let k = k.split("- !Ref AWS::NoValue").next().unwrap();
+            assert!(
+                k.contains("Resource: !Ref WafLogKey")
+                    && k.contains("kms:ViaService: \"s3.*.amazonaws.com\"")
+            );
+            // Never a change, never Glue's connections (they hold passwords).
+            let never = t.split("Sid: NeverChangeWafOrItsLogs").nth(1).unwrap();
+            for x in [
+                "wafv2:Update*",
+                "athena:Delete*",
+                "glue:Update*",
+                "glue:GetConnection*",
+                "s3:Delete*",
+                "s3:PutBucket*",
+            ] {
+                assert!(never.lines().take(3).any(|l| l.contains(x)), "{x}");
+            }
+            // Databases and warehouses: only the clusters named, never a commit.
+            assert!(t.contains("!Split [\",\", !Ref DatabaseClusters]"));
+            assert!(t.contains("secret:coderhelm-readonly-*"));
+            assert!(
+                t.contains("[\"rds-data:CommitTransaction\", \"rds-data:BatchExecuteStatement\"]")
+            );
+            assert!(t.contains("dbuser:${Ids}/coderhelm_readonly"));
+            assert!(t.contains("redshift-data:statement-owner-iam-userid: \"${aws:userid}\""));
+        }
+    }
+
+    #[test]
+    fn the_update_link_carries_the_waf_log_group_and_data_sources() {
+        let none = update_url("https://b/x/y.yaml", "us-east-1", &Chosen::default());
+        assert!(!none.contains("WafLogs") && !none.contains("DatabaseClusters"));
+        let key = "arn:aws:kms:us-east-1:111122223333:key/1234abcd-12ab-34cd-56ef-1234567890ab";
+        let c = Chosen::default().with_waf_logs("s3://aws-waf-logs-acme/athena-results", key);
+        let u = update_url("https://b/x/y.yaml", "us-east-1", &c);
+        assert!(u.contains("&param_WafLogs=on"), "{u}");
+        assert!(
+            u.contains("&param_WafLogResults=aws-waf-logs-acme%2Fathena-results%2F"),
+            "{u}"
+        );
+        assert!(u.contains("&param_WafLogKey=arn%3Aaws%3Akms%3Aus-east-1%3A111122223333%3Akey%2F1234abcd-12ab-34cd-56ef-1234567890ab"), "{u}");
+        // Not known yet: the group still turns on, without queries.
+        let bare = Chosen::default().with_waf_logs("", "");
+        let u2 = update_url("https://b/x/y.yaml", "us-east-1", &bare);
+        assert!(
+            u2.contains("&param_WafLogs=on")
+                && !u2.contains("WafLogResults")
+                && !u2.contains("WafLogKey")
+        );
+        // Each is its own stack, so a newer one never collides with an older one.
+        assert_ne!(update_stack_name_for(&c), update_stack_name_for(&bare));
+        assert_ne!(update_stack_name_for(&bare), update_stack_name());
+        assert!(update_stack_name_for(&c).len() <= 128);
+        let dbs = ["arn:aws:rds:us-east-1:111122223333:cluster:app-db".to_string()];
+        let whs = ["analytics".to_string()];
+        let d = Chosen::default().with_data_sources(&dbs, &whs);
+        let u3 = update_url("https://b/x/y.yaml", "us-east-1", &d);
+        assert!(u3.contains("&param_DatabaseClusters=arn%3Aaws%3Ards%3Aus-east-1%3A111122223333%3Acluster%3Aapp-db"), "{u3}");
+        assert!(u3.contains("&param_Warehouses=analytics"));
+        assert!(!d.is_empty());
+    }
+
+    #[test]
+    fn the_results_location_is_a_bucket_and_prefix_the_template_accepts() {
+        assert_eq!(
+            waf_log_results("s3://aws-waf-logs-acme/athena-results/").as_deref(),
+            Some("aws-waf-logs-acme/athena-results/")
+        );
+        assert_eq!(
+            waf_log_results("results-bucket").as_deref(),
+            Some("results-bucket/")
+        );
+        assert_eq!(
+            waf_log_results("s3://q.results/a/b").as_deref(),
+            Some("q.results/a/b/")
+        );
+        for bad in ["", "s3://", "Bad_Bucket/x", "b/x y", "s3://ab/x", "x;rm/"] {
+            assert!(waf_log_results(bad).is_none(), "{bad}");
+        }
+        assert!(is_kms_key(
+            "arn:aws:kms:eu-west-1:111122223333:key/1234abcd-12ab-34cd-56ef-1234567890ab"
+        ));
+        for bad in [
+            "",
+            "alias/aws/s3",
+            "arn:aws:kms:eu-west-1:111122223333:alias/x",
+            "arn:aws:kms:eu-west-1:1:key/1234abcd-12ab-34cd-56ef-1234567890ab",
+        ] {
+            assert!(!is_kms_key(bad), "{bad}");
+        }
     }
 }

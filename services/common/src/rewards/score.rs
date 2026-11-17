@@ -47,6 +47,9 @@ pub fn default_weight(kind: RewardKind) -> f64 {
         // the team decides otherwise.
         RewardKind::RereviewRequested => 0.0,
         RewardKind::IncidentLinked => -2.5,
+        // Every finding belongs in the first review of the code: one raised
+        // rounds later cost the author a push and a review each round.
+        RewardKind::FindingMissed => -1.0,
     }
 }
 
@@ -329,6 +332,7 @@ mod tests {
             RewardKind::PrReverted,
             RewardKind::CiFixRounds,
             RewardKind::IncidentLinked,
+            RewardKind::FindingMissed,
         ] {
             assert!(score(&ev("t", k, 1.0), &w) < 0.0, "{k:?}");
         }

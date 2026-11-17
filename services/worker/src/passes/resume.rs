@@ -3658,7 +3658,14 @@ pub async fn run(
         // Findings of CoderHelm's own review the run must fix before the PR
         // is marked ready (`own_review`).
         let mut own_open: Vec<String> = Vec::new();
-        if review_result.passed {
+        // The PR reviewer reviews every head the run pushes, whatever the
+        // run's own review pass said: its posted review is what people see,
+        // and a fix round driven by the run's own pass once left the posted
+        // review on an old head for nine rounds, until a person typed
+        // "re-review". Its verdict decides the run only when the run's own
+        // pass passed.
+        let own_pass_passed = review_result.passed;
+        {
             let budget =
                 std::time::Duration::from_secs(super::remaining_secs(&start).saturating_sub(150));
             if let Some(rr) = super::review_pr::review_for_run(
@@ -3715,7 +3722,7 @@ pub async fn run(
                         return Ok(());
                     }
                 }
-                if rr.blocks() {
+                if own_pass_passed && rr.blocks() {
                     info!(
                         run_id = msg.run_id,
                         open = rr.open_findings.len(),

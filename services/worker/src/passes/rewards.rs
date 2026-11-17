@@ -811,6 +811,63 @@ pub async fn record_dismissed(
     }
 }
 
+/// Records each finding a review raised late, on lines an earlier review of
+/// the same pull request had read, as that review's miss
+/// (`review_policy::Late::missed`): the reviewer's score drops, and the
+/// finding is kept as an example of what a first review must raise.
+pub async fn record_missed(
+    state: &WorkerState,
+    team_id: &str,
+    repo: &str,
+    pr: u64,
+    missed: &[Finding],
+) {
+    if missed.is_empty() {
+        return;
+    }
+    // The earlier review that missed it: this one isn't recorded yet.
+    let review = latest_review(state, team_id, repo, pr).await;
+    let at = chrono::Utc::now().to_rfc3339();
+    let st = store(state);
+    let weights = st.weights(team_id).await;
+    for f in missed {
+        let dedup = common::review_supersede::finding_key(&f.file, &f.title);
+        let mut e = RewardEvent::new(
+            team_id,
+            RewardKind::FindingMissed,
+            rev::AGENT_REVIEWER,
+            &at,
+            &format!("finding_missed#{repo}#{pr}#{dedup}"),
+        )
+        .with_repo(repo, pr)
+        .with_detail(&format!(
+            "{} (`{}`): raised late, on lines an earlier review had read",
+            f.title, f.file
+        ))
+        .with_source("worker:review_pr");
+        e.category = f.category.trim().to_ascii_lowercase();
+        credit(&mut e, &review);
+        match st.record(&e).await {
+            Ok(true) => {
+                let ex = Exemplar {
+                    id: exemplars::id_for(repo, pr, &dedup),
+                    repo: repo.to_string(),
+                    kind: exemplars::KIND_FINDING.into(),
+                    category: e.category.clone(),
+                    area: rev::file_area(&f.file),
+                    pr,
+                    reason: exemplars::finding_reason(RewardKind::FindingMissed),
+                    ..Default::default()
+                }
+                .with_text(&f.title, common::truncate_str(&f.body, 4000));
+                add_example(state, team_id, ex, score::score(&e, &weights)).await;
+            }
+            Ok(false) => {}
+            Err(err) => warn!(error = %err, "Could not record the missed review comment"),
+        }
+    }
+}
+
 // ── What the agents are given ─────────────────────────────────────────
 
 /// What the reviewer is given for one review.

@@ -1405,6 +1405,8 @@ async fn load_account(
     let kbs = common::knowledge::remote::arns_in(&team_bases(state, team_id).await, account);
     let buckets =
         common::knowledge::sources::s3::buckets_in(&team_sources(state, team_id).await, account);
+    let (dbs, whs) =
+        common::role_move::data_sources_in(&team_data_sources(state, team_id).await, account);
     aws_account::list(
         &state.dynamo,
         &state.config.aws_insights_table_name,
@@ -1418,22 +1420,38 @@ async fn load_account(
     .map(|mut a| {
         a.knowledge_bases = kbs;
         a.import_buckets = buckets;
+        a.database_clusters = dbs;
+        a.warehouses = whs;
         a
     })
 }
 
-/// Each account's connected knowledge bases and import buckets, so its
-/// update link keeps the role able to search and read them.
-async fn with_knowledge_bases(
+/// The team's data sources (the databases and warehouses its accounts'
+/// role stacks must name).
+pub(crate) async fn team_data_sources(
+    state: &AppState,
+    team_id: &str,
+) -> Vec<common::live::store::Source> {
+    common::live::store::list_sources(&state.dynamo, &state.config.settings_table_name, team_id)
+        .await
+        .unwrap_or_default()
+}
+
+/// Each account's connected knowledge bases, import buckets and data
+/// sources' databases and warehouses, so its update link keeps the role
+/// able to search, read and query them.
+pub(crate) async fn with_knowledge_bases(
     state: &AppState,
     team_id: &str,
     accounts: &mut [AwsAccount],
 ) -> Vec<common::knowledge::sources::Source> {
     let bases = team_bases(state, team_id).await;
     let sources = team_sources(state, team_id).await;
+    let data = team_data_sources(state, team_id).await;
     for a in accounts {
         a.knowledge_bases = common::knowledge::remote::arns_in(&bases, &a.account);
         a.import_buckets = common::knowledge::sources::s3::buckets_in(&sources, &a.account);
+        (a.database_clusters, a.warehouses) = common::role_move::data_sources_in(&data, &a.account);
     }
     sources
 }
