@@ -1193,6 +1193,9 @@ async fn check_and_fix(
         facts
             .wider
             .extend(super::minimal_change::made_up_ids(&diff, &looked));
+        // A page whose state a test branch reads is probed again while
+        // there is time: an arm that couldn't run before is re-checked.
+        facts.live = super::live_guard::facts_for(w, &diff, &evidence.notes, !short).await;
         let mut ledger =
             super::scope_ledger::load_or_seed(w.state, &w.msg.team_id, w.run_id, w.msg, w.plan)
                 .await;
@@ -1207,9 +1210,6 @@ async fn check_and_fix(
             &diff,
         )
         .await;
-        // A page whose state a test branch reads is probed again while
-        // there is time: an arm that couldn't run before is re-checked.
-        facts.live = super::live_guard::facts_for(w, &diff, &evidence.notes, !short).await;
         let blocking = blocking(&facts, w.plan);
         info!(
             run_id = w.run_id,
