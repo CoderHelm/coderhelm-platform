@@ -1349,6 +1349,7 @@ pub mod quarantine_work;
 /// Whether a finished run's pull request leaves draft, decided in one place.
 pub mod ready;
 pub mod recheck;
+pub mod related;
 pub mod relay_retry;
 pub mod release_notes;
 pub mod release_plan;
@@ -1899,6 +1900,18 @@ async fn read_ticket_comments(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let read = ticket_comments::at_boundary(state, msg, run_id, usage).await;
     common::run_questions::merge(&mut msg.answers, &read.folded);
+    // Before the next build or round and before any description: the
+    // ticket's answers are decisions, never pending items.
+    msg.answers = ticket_comments::know_decisions(
+        state,
+        msg.installation_id,
+        &msg.team_id,
+        &msg.ticket_id,
+        &format!("{}/{}", msg.repo_owner, msg.repo_name),
+        &msg.body,
+        &msg.answers,
+    )
+    .await;
     if read.stopped {
         // The text `orchestrate_ticket` reads as a person's cancel.
         return Err("Run cancelled by user".into());
@@ -2087,6 +2100,15 @@ async fn run_passes(
         .map(common::ticket_state::decision_answer)
         .collect();
     common::run_questions::merge(&mut msg.answers, &decided);
+    // And every answer people wrote on the ticket itself, whichever earlier
+    // run handled it: an answer handled by the run before this one is
+    // still the answer (a new run once built what an answer had ruled out
+    // and listed it as pending).
+    let earlier = ticket_comments::earlier_answers(state, &msg.team_id, &msg.ticket_id).await;
+    common::run_questions::merge(&mut msg.answers, &earlier);
+    // The linked tickets' acceptance criteria are this run's too: kept so
+    // the pull request is checked against them before it is called ready.
+    related::keep(state, &msg.team_id, run_id, &msg.related).await;
     // What people wrote on the ticket itself: before this run started
     // (context for the plan) and since its last step. Read here, before
     // the run spends more work, and again at each boundary below.

@@ -3955,7 +3955,19 @@ async fn fix_context(
             .await,
         coder_learning: String::new(),
         person_direction: None,
-        answers: Vec::new(),
+        // What people answered on the ticket: every fix and review round
+        // builds with it, and the description never lists it as pending.
+        answers: super::ticket_comments::know_decisions(
+            state,
+            msg.installation_id,
+            &msg.team_id,
+            t.ticket_id,
+            &format!("{}/{}", t.owner, t.repo),
+            "",
+            &[],
+        )
+        .await,
+        related: Vec::new(),
         new_run_id: None,
     };
 

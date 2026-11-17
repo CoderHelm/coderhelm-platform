@@ -474,9 +474,12 @@ Then the ```fix_location.json block described above."#,
         Some(h) if !h.trim().is_empty() => format!("{prompt}{h}"),
         _ => prompt,
     };
+    // The tickets linked to this one: their acceptance criteria are part
+    // of the change (`related_tickets`).
     let prompt = format!(
-        "{prompt}{}",
-        common::run_questions::answers_note(&msg.answers)
+        "{prompt}{}{}",
+        common::run_questions::answers_note(&msg.answers),
+        common::related_tickets::plan_note(&msg.related)
     );
     // One part of a numbered series: the other parts' pull requests, so
     // the plan builds on them (see `series`).
@@ -901,9 +904,10 @@ Then the ```fix_location.json block described above."#,
         super::plan_judge::prompt(
             &msg.title,
             &format!(
-                "{}{}",
+                "{}{}{}",
                 msg.body,
-                common::run_questions::answers_note(&msg.answers)
+                common::run_questions::answers_note(&msg.answers),
+                common::related_tickets::plan_note(&msg.related)
             ),
             history_note,
             &live.as_ref().map(|l| l.connected()).unwrap_or_default(),

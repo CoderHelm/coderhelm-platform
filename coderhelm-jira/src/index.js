@@ -7,6 +7,7 @@ const { GATEWAY_URL } = require("./gateway");
 const { existingComments } = require("./comments");
 const { postReply, parentIdOf } = require("./thread-reply");
 const { versionFields } = require("./version");
+const { relatedTickets } = require("./related");
 
 /** Jira's comment calls as the app, for a threaded reply (see thread-reply.js). */
 const jiraComments = {
@@ -22,6 +23,14 @@ const jiraComments = {
 // The event's comment keys are logged once per running instance: enough to
 // see whether Jira's comment events carry a parent id.
 let loggedCommentKeys = false;
+
+/** A related ticket's summary, status and description, read as the app. */
+async function readRelatedIssue(key) {
+  const res = await api.asApp().requestJira(route`/rest/api/3/issue/${key}?fields=summary,description,status`);
+  if (!res.ok) return null;
+  const full = await res.json();
+  return full.fields || null;
+}
 
 /** The parts of a Jira user CoderHelm keeps: account id, name, email. */
 function jiraUser(u) {
@@ -188,7 +197,7 @@ exports.handler = async (event, context) => {
   let fields = {};
   if (issue.id) {
     try {
-      const res = await api.asApp().requestJira(route`/rest/api/3/issue/${issue.id}?fields=summary,description,labels,assignee,reporter,creator,project,attachment,issuetype,comment`);
+      const res = await api.asApp().requestJira(route`/rest/api/3/issue/${issue.id}?fields=summary,description,labels,assignee,reporter,creator,project,attachment,issuetype,comment,issuelinks`);
       if (res.ok) {
         const full = await res.json();
         fields = full.fields || {};
@@ -238,6 +247,9 @@ exports.handler = async (event, context) => {
     // What people already wrote on the ticket: the run that starts reads it
     // before it plans (the gateway keeps each comment once, by its id).
     comments: existingComments(fields),
+    // The tickets linked to this one and the ones its text names: their
+    // acceptance criteria are part of the change (see related.js).
+    related: await relatedTickets(issue.key, fields, readRelatedIssue),
     user: requester(event.atlassianId, fields),
     coderhelm: {
       repo_owner: repoOwner || undefined,

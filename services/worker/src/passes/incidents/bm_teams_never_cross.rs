@@ -335,6 +335,7 @@ const CACHES: &[(&str, &str)] = &[
     ("common/src/hybrid/client.rs::FAILING", "installation id"),
     ("common/src/knowledge/search.rs::C", "S3 key under `{team}/knowledge/`, checked by owns_key before the lookup"),
     ("common/src/knowledge/sources/pace.rs::GATES", "provider rate gate; no data"),
+    ("common/src/ticket_decisions.rs::KNOWN", "installation id plus `owner/repo@ticket`: read back only by description writes made with that installation"),
     ("common/src/reply_compose.rs::CACHE", "thread key plus a hash of the whole prompt it was written from"),
     ("common/src/review_check.rs::REFUSED", "installation id"),
     ("common/src/usage.rs::P", "model prices; install-wide config"),

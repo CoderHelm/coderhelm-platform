@@ -33,6 +33,54 @@ use common::ticket_comments::{self as tc, Action, Comment, Settled, Source, Stag
 use common::ticket_state::{Intent, Note};
 use tracing::{info, warn};
 
+/// Every answer and instruction people wrote on the ticket, whatever run
+/// handled it (`common::ticket_decisions::from_comments`): a new run on the
+/// ticket starts from them, never from the question again.
+pub async fn earlier_answers(state: &WorkerState, team_id: &str, ticket_id: &str) -> Vec<Answer> {
+    match store(state).of_ticket(team_id, ticket_id).await {
+        Ok(c) => common::ticket_decisions::from_comments(&c),
+        Err(e) => {
+            warn!(ticket_id, error = %e, "Could not read the ticket's earlier answers");
+            Vec::new()
+        }
+    }
+}
+
+/// Keeps the ticket's decisions and acceptance criteria where the
+/// description is written (`description::save`), so no description lists
+/// an answered item as pending. `answers`: those already in hand; the
+/// ticket's own are read and added.
+pub async fn know_decisions(
+    state: &WorkerState,
+    installation_id: u64,
+    team_id: &str,
+    ticket_id: &str,
+    repo: &str,
+    ticket_body: &str,
+    answers: &[Answer],
+) -> Vec<Answer> {
+    let mut all = answers.to_vec();
+    common::run_questions::merge(&mut all, &earlier_answers(state, team_id, ticket_id).await);
+    // A caller without the ticket's text keeps the criteria read before.
+    let criteria = if ticket_body.trim().is_empty() {
+        common::ticket_decisions::recall(installation_id, repo, ticket_id)
+            .map(|k| k.criteria)
+            .unwrap_or_default()
+    } else {
+        common::related_tickets::criteria(ticket_body)
+    };
+    common::ticket_decisions::remember(
+        installation_id,
+        repo,
+        ticket_id,
+        common::ticket_decisions::Known {
+            answers: all.clone(),
+            criteria,
+        },
+    );
+    all
+}
+
 /// What a boundary read gives the run.
 #[derive(Debug, Default)]
 pub struct Read {

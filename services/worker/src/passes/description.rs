@@ -61,6 +61,21 @@ pub async fn save(
     number: u64,
     body: &str,
 ) -> Result<(), Error> {
+    // An item a person answered on the ticket is a decision, never pending
+    // (`ticket_decisions`).
+    let settled = common::ticket_decisions::settle_known(
+        github.installation_id(),
+        &format!("{owner}/{repo}"),
+        body,
+    );
+    if !settled.removed.is_empty() {
+        warn!(
+            pr_number = number,
+            items = ?settled.removed,
+            "The description listed answered items as pending; moved to the decisions"
+        );
+    }
+    let body = settled.body.as_str();
     let body = clean(body);
     // The final review, as its reader would read it: no running check as a
     // result, nothing CoderHelm can do handed to a person, nothing said

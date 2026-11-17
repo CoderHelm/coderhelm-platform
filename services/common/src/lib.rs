@@ -232,6 +232,9 @@ pub mod problems;
 /// Where this deployment's dashboard and API are (links, redirects, webhooks).
 pub mod public_urls;
 pub mod registry_check;
+/// Linked tickets and pull requests closed in favor of this one: their criteria are
+/// part of the change and checked before it is called ready.
+pub mod related_tickets;
 /// What CoderHelm says back to a person, written from the thread and the run's records.
 pub mod reply_compose;
 /// Who asked for a run: one identity per person, for per-person analytics.
@@ -283,6 +286,9 @@ pub mod stop_rules;
 /// A team's run and PR-reviewed counts, each added exactly once.
 pub mod team_counts;
 pub mod ticket_comments;
+/// What a person answered on the ticket is a decision in every run on it; a
+/// description never lists an answered item as pending.
+pub mod ticket_decisions;
 /// A ticket's comments as CoderHelm read them, and whether its work is done.
 pub mod ticket_state;
 /// A team's monthly token limits: new tokens, cache read, cache write.
