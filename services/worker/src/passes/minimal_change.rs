@@ -438,6 +438,12 @@ pub fn parallel_in_edit(path: &str, old: &str, new: &str) -> Vec<(Def, Def)> {
 /// The parallel structures a diff adds: new top-level definitions next to
 /// a similar existing one in the same file's base (`base`, by path) or its
 /// patch's context, or in another changed file's base.
+///
+/// Both sides are checked against the base: a definition the base already
+/// has is never new (a changed signature shows as removed and added), and
+/// when the file's base was read, "existing" means on the base. A review
+/// once called a function that had been on the main branch for months the
+/// new one, beside the builder the branch had really added.
 pub fn parallel_structures(diff: &Diff, base: &[(String, String)]) -> Vec<Widening> {
     let mut out = Vec::new();
     for (path, status, patch) in diff {
@@ -448,25 +454,35 @@ pub fn parallel_structures(diff: &Diff, base: &[(String, String)]) -> Vec<Wideni
             .into_iter()
             .filter_map(|l| top_level_def(l, path))
             .collect();
-        let mut existing: Vec<Def> = base
+        let added: Vec<Def> = lines_of(patch, '+')
+            .into_iter()
+            .filter_map(|l| top_level_def(l, path))
+            .collect();
+        let base_read = base.iter().any(|(p, _)| p == path);
+        let on_base: Vec<Def> = base
             .iter()
             .filter(|(p, _)| p == path)
             .flat_map(|(_, t)| defs(t, path))
             .collect();
+        let mut existing: Vec<Def> = on_base.clone();
         existing.extend(
             context_of(patch)
                 .into_iter()
-                .filter_map(|l| top_level_def(l, path)),
+                .filter_map(|l| top_level_def(l, path))
+                .filter(|d| !base_read || on_base.iter().any(|b| b.name == d.name)),
         );
-        existing.retain(|e| !removed.iter().any(|r| r.name == e.name));
-        for d in lines_of(patch, '+')
-            .into_iter()
-            .filter_map(|l| top_level_def(l, path))
-        {
-            if existing.iter().any(|e| e.name == d.name) {
+        // Removed and not added back: gone. Removed and added back: its
+        // signature changed, and it is still the existing one.
+        existing.retain(|e| {
+            !removed.iter().any(|r| r.name == e.name) || added.iter().any(|a| a.name == e.name)
+        });
+        for d in &added {
+            let was_there = on_base.iter().any(|b| b.name == d.name)
+                || removed.iter().any(|r| r.name == d.name);
+            if was_there || existing.iter().any(|e| e.name == d.name) {
                 continue;
             }
-            if let Some(e) = existing.iter().find(|e| parallels(&d, e)) {
+            if let Some(e) = existing.iter().find(|e| parallels(d, e)) {
                 let what = format!("`{}` next to the existing `{}`", d.name, e.name);
                 if !out.iter().any(|w: &Widening| w.what == what) {
                     out.push(Widening {

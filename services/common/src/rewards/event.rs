@@ -51,6 +51,10 @@ pub enum RewardKind {
     RereviewRequested,
     /// An alert named a merged CoderHelm change.
     IncidentLinked,
+    /// A review raised a finding late: on lines unchanged since an earlier
+    /// review of the same pull request had read them. The earlier review
+    /// missed it.
+    FindingMissed,
 }
 
 impl RewardKind {
@@ -71,6 +75,7 @@ impl RewardKind {
         RewardKind::TimeToMerge,
         RewardKind::RereviewRequested,
         RewardKind::IncidentLinked,
+        RewardKind::FindingMissed,
     ];
 
     pub fn key(self) -> &'static str {
@@ -91,6 +96,7 @@ impl RewardKind {
             RewardKind::TimeToMerge => "time_to_merge",
             RewardKind::RereviewRequested => "rereview_requested",
             RewardKind::IncidentLinked => "incident_linked",
+            RewardKind::FindingMissed => "finding_missed",
         }
     }
 
@@ -117,6 +123,7 @@ impl RewardKind {
             RewardKind::TimeToMerge => "Time to merge",
             RewardKind::RereviewRequested => "Re-review requested",
             RewardKind::IncidentLinked => "Alert tied to a merged change",
+            RewardKind::FindingMissed => "Review comment missed by an earlier review",
         }
     }
 

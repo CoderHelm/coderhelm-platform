@@ -1384,6 +1384,7 @@ pub(crate) mod review_fingerprint;
 pub mod review_fix;
 pub mod review_labels;
 pub mod review_lessons;
+pub mod review_one_verdict;
 pub mod review_policy;
 #[cfg(test)]
 mod review_policy_eval;

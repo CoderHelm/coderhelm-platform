@@ -743,7 +743,7 @@ async fn learn(
 }
 
 /// The lesson a review keeps when it held back a blocker raised late
-/// (round 3 or later, on code already reviewed): one fixed lesson per
+/// (a later round, on code an earlier review already read): one fixed lesson per
 /// repository, counted again each time instead of stored twice.
 pub fn raise_early_plan(
     existing: &[ReviewLesson],

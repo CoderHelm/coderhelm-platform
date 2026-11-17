@@ -240,6 +240,9 @@ pub fn finding_reason(kind: RewardKind) -> String {
         RewardKind::FindingAccepted => "The author changed the code it pointed at",
         RewardKind::FindingDismissed => "The team pushed back and the comment was judged wrong",
         RewardKind::FindingIgnored => "Still open when the pull request closed",
+        RewardKind::FindingMissed => {
+            "Raised late, on code an earlier review of the same pull request had read"
+        }
         _ => "",
     }
     .to_string()

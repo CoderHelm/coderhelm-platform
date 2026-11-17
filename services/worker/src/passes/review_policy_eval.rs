@@ -290,6 +290,7 @@ impl Sim {
                 changed_since_previous: changed.as_ref(),
                 earlier_threads: &earlier,
                 person_spoke: spoke.is_some(),
+                previous_review_at: "",
             },
         );
         if late.self_lesson {
