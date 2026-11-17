@@ -658,7 +658,7 @@ pub(crate) async fn on_keep_open_comment(
         );
         let say = common::conversation::Say::reply_all(
             "keep-open",
-            format!("@{commenter} Only the author of this pull request or someone with write access can keep it open. Nothing changed."),
+            "Only the author or someone with write access can keep this open. Nothing changed.",
         );
         let facts = common::reply_compose::Facts::default()
             .github_pr(&format!("{owner}/{name}"), number, pr["title"].as_str().unwrap_or(""), "open")

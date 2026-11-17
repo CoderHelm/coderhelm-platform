@@ -8,7 +8,9 @@
 //! On CoderHelm's own PRs every finding that isn't pure style (a
 //! preference the reviewer inferred: wording, naming, layout, see
 //! [`super::review_severity::pure_style`]) is work the
-//! run does itself:
+//! run does itself. A finding that asks for a test is work whatever made it
+//! a note (tracked, a question, the stop judge), and one about a script
+//! carries how to test it ([`test_how`]):
 //!
 //! - The review lists them at the top of the description under "Open review
 //!   findings" ([`section`]). While the section is there the PR stays a
@@ -62,14 +64,44 @@ pub fn required(findings: &[Finding], held_late: &[Finding]) -> Vec<String> {
         .filter(|f| {
             f.holds_merge()
                 || about_description(f)
+                || super::review_severity::asks_for_a_test(f)
                 || (f.note_only.is_none()
                     && f.evidence() != Evidence::Question
                     && !super::review_severity::pure_style(f))
         })
         .chain(held_late.iter())
-        .map(line)
+        .map(|f| match test_how(f) {
+            Some(how) if super::review_severity::asks_for_a_test(f) => {
+                format!("{} ({how})", line(f))
+            }
+            _ => line(f),
+        })
         .collect()
 }
+
+/// How the coder tests a script CI or a person runs (a shell script, a
+/// workflow, a CI helper), for a finding that asks for a test of one. A
+/// review once asked for a test of a CI script that reads cloud rules, and
+/// the run handed it back: the test needed only a stub of the cloud
+/// command on PATH and a fixture of its answer.
+pub fn test_how(f: &Finding) -> Option<&'static str> {
+    let path = f.file.trim().to_ascii_lowercase();
+    let script = path.ends_with(".sh")
+        || path.ends_with(".bash")
+        || path.starts_with(".github/")
+        || path.starts_with("scripts/")
+        || path.contains("/scripts/")
+        || path.contains("/bin/")
+        || path.ends_with("makefile")
+        || path.ends_with("justfile");
+    script.then_some(SCRIPT_TEST)
+}
+
+/// [`test_how`]'s instruction.
+pub const SCRIPT_TEST: &str = "test the script itself: put stub commands first on PATH (a \
+     fake `aws`, `gh` or `curl` that prints a fixture and records its arguments), keep the \
+     fixtures beside the test, run the script against them in the repository's test runner, \
+     and assert on its output, exit code and the stub's recorded calls";
 
 /// A finding that says the pull request's description does not match the
 /// code: it names the description and says it is behind. Never optional

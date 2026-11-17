@@ -644,6 +644,24 @@ pub async fn reply_review(
     .await;
     let v = match decision {
         Decision::Reply { text, meta, .. } => {
+            // The same house style and thread rules as every other comment.
+            let text = match common::comment_style::for_thread(
+                &text,
+                &place,
+                common::comment_style::REPLY_LINES,
+            ) {
+                Ok(t) if !t.trim().is_empty() => t,
+                Ok(_) => return quiet(),
+                Err(problems) => {
+                    let why = problems
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    tracing::error!(pr, problems = %why, "comment style defect: a review thread reply broke the style; not posted");
+                    return Ok(json!({ "id": null, "spoke": "quiet", "why": why }));
+                }
+            };
             let shaped = conversation::shape(&text, place.budget(), true);
             gh.reply_to_review_comment(
                 owner,

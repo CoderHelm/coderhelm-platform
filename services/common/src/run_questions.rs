@@ -386,30 +386,22 @@ pub fn plain(questions: &[Question]) -> String {
 }
 
 /// The reply posted on the ticket for answers given in CoderHelm. `markdown`
-/// for GitHub; plain paragraphs for Jira. `asked_at` links to the comment
-/// with the questions, when known.
-pub fn reply(author: &str, answers: &[Answer], asked_at: Option<&str>, markdown: bool) -> String {
+/// for GitHub; plain paragraphs for Jira.
+pub fn reply(author: &str, answers: &[Answer], markdown: bool) -> String {
     let who = if author.trim().is_empty() {
         "Someone on the team"
     } else {
         author.trim()
     };
-    // Short, like every comment: one line saying who answered and where,
-    // then one line per answer.
-    let link = asked_at.filter(|u| !u.is_empty()).map(|url| {
-        if markdown {
-            format!(" (in reply to [CoderHelm's questions]({url}))")
-        } else {
-            format!(" (in reply to CoderHelm's questions: {url})")
-        }
-    });
+    // Short, like every comment: one line saying who answered, then one
+    // line per answer. Never a link to the questions: they are on this
+    // same thread.
     let mut out = if markdown {
         format!("**{who} answered in CoderHelm**")
     } else {
         format!("{who} answered in CoderHelm")
     };
-    out.push_str(&link.unwrap_or_default());
-    out.push_str(". CoderHelm is continuing the work with these answers.");
+    out.push_str(". Continuing with these answers.");
     for a in answers {
         let q = one_line(&a.question);
         let ans = one_line(&a.answer);
@@ -897,11 +889,11 @@ mod tests {
     #[test]
     fn the_reply_names_who_answered() {
         let a = [answer("Which page?", "The pricing page.")];
-        let md = reply("Pat Doe", &a, Some("https://example.com/c/1"), true);
+        let md = reply("Pat Doe", &a, true);
         assert!(md.starts_with("**Pat Doe answered in CoderHelm**"));
         assert!(md.contains("\n- Which page? The pricing page."), "{md}");
-        assert!(md.contains("(https://example.com/c/1)"));
-        let plain = reply("", &a, None, false);
+        assert!(!md.contains("in reply to") && !md.contains("http"), "{md}");
+        let plain = reply("", &a, false);
         assert!(plain.starts_with("Someone on the team answered in CoderHelm"));
         assert!(
             plain.contains("\nQ: Which page? A: The pricing page."),

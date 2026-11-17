@@ -230,6 +230,12 @@ pub async fn run(
                 &msg.base_branch,
                 branch,
                 rid,
+                // The CI job chosen is the one whose tests run for the
+                // plan's files, never another package's.
+                &super::feature::plan_files::planned_files(&plan.tasks)
+                    .into_iter()
+                    .map(|f| f.path)
+                    .collect::<Vec<_>>(),
             )
             .await
         }
@@ -545,6 +551,13 @@ pub async fn run(
     {
         super::explore_guard::offer_fields(&mut t.input_schema);
     }
+    // Selectors on another company's page come from a probe of it, and a
+    // write carries only the lines the change needs (`live_guard`).
+    let live_guard = super::live_guard::LiveGuard::new(
+        super::live_guard::format_cmds(&ci_steps),
+        super::web_check::team_domains(state, &msg.team_id).await,
+        super::live_guard::branch_records(github, &msg.repo_owner, &msg.repo_name, branch).await,
+    );
 
     // A bounded round's write tools take the reason for an edit outside
     // its files.
@@ -885,6 +898,7 @@ pub async fn run(
             codegen_env,
             scope_guard,
             explore,
+            live: live_guard,
             run_id: run_id.map(|s| s.to_string()),
             node_version,
             terraform_version,
@@ -1344,6 +1358,12 @@ pub async fn run(
         lines if lines.is_empty() => notes,
         lines => format!("{notes}\n{}", lines.trim_end()),
     };
+    // Selectors kept without a probe (none could run) and formatting put
+    // back: the habits check and the pull request read these lines.
+    let notes = match executor.write_executor.live.evidence_lines() {
+        lines if lines.is_empty() => notes,
+        lines => format!("{notes}\n{}", lines.trim_end()),
+    };
     // A file this round (or the rounds before it) changed and then put
     // back leaves no commit of its own on the pull request.
     super::round::fold_churn(github, &msg.repo_owner, &msg.repo_name, branch).await;
@@ -1508,7 +1528,7 @@ Go to the target files listed in the OpenSpec.
 /// (`explore_guard`, `minimal_change`).
 pub(crate) const SMALLEST_CHANGE_RULES: &str = "- The smallest change that does the ticket: before the first write, `search_code` for the structure you would add and pass `reuses` naming what you extend. Add entries to the existing map, a parameter to the existing helper, a key to the existing config; never a second one beside it.
 - Never widen behaviour past the ticket: an insert-only path stays insert-only (no `DELETE`, no `ON CONFLICT DO UPDATE`, no replacing sync), log levels and shared logging stay as they are, and no counters or reports the ticket doesn't ask for.
-- Tests sized to the change: the new behaviour and that nothing else changed, through the real entry point. Never invent another system's payload, page or test ids: probe it (`probe_page`) or reuse an existing fixture. Run the tests and quote their output in your Evidence.
+- Tests sized to the change: the new behaviour and that nothing else changed, through the real entry point. Never invent another system's payload, page or test ids: probe it (`probe_page`, with `clicks` that reach each state a branch of the test reads) or reuse an existing fixture. A test branch on a page's state that no run has taken is unverified: the pull request says so until a run takes it. Run the tests and quote their output in your Evidence. Change only the lines the fix needs: a write that only reformats is not made.
 - When an acceptance criterion and an outside system disagree, change the product so the criterion holds; never change the test to expect the outside behaviour without the measured reason.";
 
 /// What a change to a table's schema, constraints, ids or stored data must
@@ -2136,6 +2156,9 @@ struct WriteToolExecutor<'a> {
     scope_guard: super::write_guard::ScopeGuard,
     /// Search before the first write; no twin beside an existing structure.
     explore: super::explore_guard::ExploreGuard,
+    /// Selectors on another company's page from a probe of it; no write
+    /// that only reformats (`live_guard`).
+    live: super::live_guard::LiveGuard,
     /// Node major version to switch the sandbox to (None -> buildspec default).
     node_version: Option<String>,
     /// Exact Terraform version the sandbox installs (None when the repo has
@@ -2509,6 +2532,19 @@ impl<'a> WriteToolExecutor<'a> {
                         )));
                     }
                 }
+                // Selectors on another company's page come from a probe of
+                // it, and only the lines the change needs are written
+                // (`live_guard`).
+                let shaped = match self.live_write(path, existing.as_deref(), content).await {
+                    Ok(t) => t,
+                    Err(refusal) => {
+                        note(LogOutcome::soft_fail(
+                            "not written: unprobed selectors or only formatting",
+                        ));
+                        return Ok(json!(refusal));
+                    }
+                };
+                let content: &str = &shaped;
                 // The blob sha is looked up here, never taken from the model:
                 // it cannot know it, and a guessed/stale one made GitHub reject
                 // the write as a false "changed concurrently" conflict.
@@ -2651,6 +2687,19 @@ impl<'a> WriteToolExecutor<'a> {
                          Read the file again and retry with a smaller, more precise edit."
                     )));
                 }
+                // Selectors from a probe; only the lines the change needs.
+                let content = match self
+                    .live_write(path, Some(&original_content), &content)
+                    .await
+                {
+                    Ok(t) => t,
+                    Err(refusal) => {
+                        note(LogOutcome::soft_fail(
+                            "not edited: unprobed selectors or only formatting",
+                        ));
+                        return Ok(json!(refusal));
+                    }
+                };
 
                 // Write the modified file back
                 // Get sha for update
@@ -2783,9 +2832,23 @@ impl<'a> WriteToolExecutor<'a> {
                                 )));
                             }
                         }
+                        // Selectors from a probe; only the lines the change
+                        // needs (`live_guard`).
+                        let content =
+                            match self.live_write(path, bw_existing.as_deref(), content).await {
+                                Ok(t) => t,
+                                Err(refusal) => {
+                                    note(LogOutcome::soft_fail(
+                                        "nothing committed: unprobed selectors or only formatting",
+                                    ));
+                                    return Ok(json!(format!(
+                                        "Batch write REJECTED: nothing was committed. {refusal}"
+                                    )));
+                                }
+                            };
                         ops.push(FileOp::Write {
                             path: path.to_string(),
-                            content: content.to_string(),
+                            content,
                         });
                     }
                 }
@@ -2998,6 +3061,54 @@ impl<'a> WriteToolExecutor<'a> {
 
 impl<'a> WriteToolExecutor<'a> {
     /// A file this pass committed: part of the change, and not checked yet.
+    /// The live guard's say on a write of `path` from `old` (`None`: a new
+    /// file) to `new`: the text to write, or the refusal the coder reads.
+    async fn live_write(&self, path: &str, old: Option<&str>, new: &str) -> Result<String, String> {
+        let text = match old {
+            Some(old) => {
+                // Whether the change already changes the file: a reformat
+                // of a file it doesn't is never written.
+                let touched = match self
+                    .github
+                    .read_file(&self.owner, &self.repo, path, &self.base_branch)
+                    .await
+                {
+                    Ok(base) => base != old,
+                    Err(_) => true,
+                };
+                match self.live.shape(path, old, new, touched) {
+                    super::live_guard::Shaped::Write(t, _) => t,
+                    super::live_guard::Shaped::Refused(why) => return Err(why),
+                }
+            }
+            None => new.to_string(),
+        };
+        self.live.check_e2e(path, &text)?;
+        Ok(text)
+    }
+
+    /// Commits a probe's record at its path on the branch. A failure is
+    /// logged: the record is still in the round's guard.
+    async fn commit_probe(&self, record: &common::e2e::probe::ProbeRecord) {
+        let message = self.commit_message(&format!("record the probe of {}", record.origin));
+        match super::live_guard::commit_record(
+            self.github,
+            (&self.owner, &self.repo, &self.branch),
+            record,
+            &message,
+        )
+        .await
+        {
+            Ok(path) => {
+                self.mark_written(path.clone());
+                self.scope_guard.allow(&path);
+            }
+            Err(e) => {
+                warn!(error = %e, origin = %record.origin, "Could not commit the probe record")
+            }
+        }
+    }
+
     fn mark_written(&self, path: String) -> bool {
         self.unchecked
             .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -4099,6 +4210,13 @@ impl<'a> ToolExecutor for CombinedWriteToolExecutor<'a> {
                 .handle(self.state, self.write_executor.github, name, input)
                 .await
             {
+                // A probe's record is committed on the branch by the round
+                // itself: the gate and the review read it from there.
+                if name == super::web_check::PROBE_TOOL {
+                    if let Some(record) = self.write_executor.live.saw_probe(input, &out) {
+                        self.write_executor.commit_probe(&record).await;
+                    }
+                }
                 return Ok(serde_json::json!(out));
             }
         }

@@ -10,13 +10,21 @@
 //! signature) is fixed by updating the block rule's match to what these say.
 //!
 //! Reads only: `wafv2:ListWebACLs`, `wafv2:GetSampledRequests`,
-//! `wafv2:GetLoggingConfiguration` and a Logs Insights query on the web
-//! ACL's log group (a web ACL logging to S3 is named, not read: CoderHelm's
-//! roles read no bucket objects). Request values
+//! `wafv2:GetLoggingConfiguration`, and the web ACL's logs: a Logs Insights
+//! query on its log group, or, when it logs to an `aws-waf-logs-*` bucket,
+//! one bounded Athena query over the Glue table on that bucket ([`athena_query`]:
+//! the last three hours, the alarm's rule only), in a WAF log workgroup
+//! the role may query (`live::aws::waf_policy_template`). Request values
 //! that can carry secrets or people's data (client addresses, cookies,
-//! authorization and every other header value but the user agent, query
-//! strings) are never kept. What remains came from outside parties and is
-//! handed to the run as data, fenced.
+//! authorization and every other header value but the user agent and
+//! accept language, query strings) are never kept; from the logs in S3,
+//! only JA4, JA3, user agent, accept language, path, whether a cookie was
+//! sent, and counts. What remains came from outside parties and is handed
+//! to the run as data, fenced.
+//!
+//! A read the role is refused is the install's setup item
+//! (`aws_role_reads`), named once in [`Gathered::refused`] and in one line
+//! of the evidence, never a question on the run.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -40,6 +48,12 @@ const TOP: usize = 5;
 const MAX_VALUE: usize = 200;
 /// How long the Logs Insights query is waited for.
 const QUERY_WAIT: Duration = Duration::from_secs(20);
+/// How long the Athena query is waited for before it is stopped.
+const ATHENA_WAIT: Duration = Duration::from_secs(45);
+/// Most rows the Athena query returns.
+const ATHENA_ROWS: i32 = 20;
+/// Most Glue databases and Athena workgroups looked through.
+const MAX_LISTED: usize = 50;
 
 /// The web ACL and rule an AWS WAF alarm watches, from its dimensions.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -284,6 +298,193 @@ pub fn bucket_of(destination: &str) -> Option<String> {
     b.starts_with("aws-waf-logs-").then(|| b.to_string())
 }
 
+/// Pure: a Glue database, table or column name that is safe to quote in a
+/// query.
+fn is_sql_name(v: &str) -> bool {
+    !v.is_empty()
+        && v.len() <= 255
+        && v.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// Pure: whether a Glue table's location is in `bucket`.
+pub fn table_in_bucket(location: &str, bucket: &str) -> bool {
+    location
+        .strip_prefix("s3://")
+        .and_then(|l| l.strip_prefix(bucket))
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
+/// The Glue table over a web ACL's log bucket: what a query needs of it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LogTable {
+    pub database: String,
+    pub table: String,
+    /// Column names, lower case.
+    pub columns: Vec<String>,
+    /// Partition keys with a projected date format (`projection.<key>.format`),
+    /// so the query reads only the last three hours' partitions.
+    pub date_partitions: Vec<(String, String)>,
+}
+
+impl LogTable {
+    fn has(&self, column: &str) -> bool {
+        self.columns.iter().any(|c| c == column)
+    }
+}
+
+/// Pure: a projected partition's Java date format (`yyyy/MM/dd/HH`) as a
+/// chrono format, when it is made only of year, month, day, hour and
+/// minute fields and separators, so its values sort as text in time order.
+pub fn date_format(java: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut rest = java;
+    let mut fields = 0;
+    while !rest.is_empty() {
+        let token = ["yyyy", "MM", "dd", "HH", "mm"]
+            .iter()
+            .find(|t| rest.starts_with(**t));
+        if let Some(t) = token {
+            out.push_str(match *t {
+                "yyyy" => "%Y",
+                "MM" => "%m",
+                "dd" => "%d",
+                "HH" => "%H",
+                _ => "%M",
+            });
+            rest = &rest[t.len()..];
+            fields += 1;
+            continue;
+        }
+        let c = rest.chars().next()?;
+        if !"/-_ :".contains(c) {
+            return None;
+        }
+        out.push(c);
+        rest = &rest[c.len_utf8()..];
+    }
+    (fields > 0 && java.starts_with("yyyy")).then_some(out)
+}
+
+/// Pure: the date-projected partition keys of a table, from its keys and
+/// its parameters.
+pub fn date_partitions(
+    keys: &[String],
+    parameters: &std::collections::HashMap<String, String>,
+) -> Vec<(String, String)> {
+    keys.iter()
+        .filter(|k| is_sql_name(k))
+        .filter(|k| {
+            parameters
+                .get(&format!("projection.{k}.type"))
+                .is_some_and(|t| t.eq_ignore_ascii_case("date"))
+        })
+        .filter_map(|k| {
+            let f = parameters.get(&format!("projection.{k}.format"))?;
+            date_format(f).map(|f| (k.to_lowercase(), f))
+        })
+        .collect()
+}
+
+/// Pure: the one Athena query over a web ACL's logs: the rule's matches in
+/// the last three hours, counted by JA4, JA3, user agent, accept language,
+/// path and whether a cookie was sent. Nothing else of a request is
+/// selected (no client address, no cookie or other header value, no query
+/// string). `None` when a name can't be quoted safely or the table isn't a
+/// WAF log table.
+pub fn athena_query(t: &LogTable, rule: &str, start: i64, end: i64) -> Option<String> {
+    if !is_waf_name(rule) || !is_sql_name(&t.database) || !is_sql_name(&t.table) {
+        return None;
+    }
+    if !(t.has("timestamp") && t.has("httprequest") && t.has("terminatingruleid")) {
+        return None;
+    }
+    let col = |c: &str, name: &str| {
+        if t.has(c) {
+            format!("{c} AS {name}")
+        } else {
+            format!("CAST(NULL AS varchar) AS {name}")
+        }
+    };
+    let header = |h: &str| {
+        format!(
+            "element_at(transform(filter(httprequest.headers, x -> lower(x.name) = '{h}'), x -> x.value), 1)"
+        )
+    };
+    let fmt = |secs: i64, f: &str| {
+        DateTime::<Utc>::from_timestamp(secs, 0)
+            .map(|d| d.format(f).to_string())
+            .unwrap_or_default()
+    };
+    let mut filter = format!("\"timestamp\" BETWEEN {} AND {}", start * 1000, end * 1000);
+    for (k, f) in &t.date_partitions {
+        filter.push_str(&format!(
+            " AND \"{k}\" BETWEEN '{}' AND '{}'",
+            fmt(start, f),
+            fmt(end, f)
+        ));
+    }
+    let matched = if t.has("nonterminatingmatchingrules") {
+        format!(
+            "(terminatingruleid = '{rule}' OR cardinality(filter(nonterminatingmatchingrules, r -> r.ruleid = '{rule}')) > 0)"
+        )
+    } else {
+        format!("terminatingruleid = '{rule}'")
+    };
+    Some(format!(
+        "SELECT {ja4}, {ja3}, {ua} AS ua, {lang} AS accept_language, \
+         split_part(httprequest.uri, '?', 1) AS path, \
+         cardinality(filter(httprequest.headers, x -> lower(x.name) = 'cookie')) > 0 AS has_cookie, \
+         count(*) AS requests \
+         FROM \"{db}\".\"{table}\" \
+         WHERE {filter} AND {matched} \
+         GROUP BY 1, 2, 3, 4, 5, 6 ORDER BY requests DESC LIMIT {ATHENA_ROWS}",
+        ja4 = col("ja4fingerprint", "ja4"),
+        ja3 = col("ja3fingerprint", "ja3"),
+        ua = header("user-agent"),
+        lang = header("accept-language"),
+        db = t.database,
+        table = t.table,
+    ))
+}
+
+/// Pure: the Athena query's result rows (its first row is the header) as
+/// evidence lines, each value clipped.
+pub fn athena_lines(rows: &[Vec<Option<String>>]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let Some((head, body)) = rows.split_first() else {
+        return out;
+    };
+    let at = |name: &str| head.iter().position(|h| h.as_deref() == Some(name));
+    let get = |row: &[Option<String>], name: &str| {
+        at(name)
+            .and_then(|i| row.get(i).cloned().flatten())
+            .map(|v| clip(&v))
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "-".into())
+    };
+    for row in body {
+        let cookie = match get(row, "has_cookie").as_str() {
+            "true" => "a cookie",
+            "false" => "no cookie",
+            _ => "cookie unknown",
+        };
+        out.push(format!(
+            "  - {} requests: JA4 {} · JA3 {} · {} · Accept-Language {} · {} · {cookie}",
+            get(row, "requests"),
+            get(row, "ja4"),
+            get(row, "ja3"),
+            get(row, "ua"),
+            get(row, "accept_language"),
+            get(row, "path"),
+        ));
+    }
+    if out.is_empty() {
+        out.push("  - none in the last three hours".into());
+    }
+    out
+}
+
 /// Pure: the evidence as the ticket's section: fenced, and labelled as data.
 pub fn render(alarm: &WafAlarm, lines: &[String]) -> String {
     format!(
@@ -335,26 +536,64 @@ fn waf_client(s: &Session) -> aws_sdk_wafv2::Client {
     )
 }
 
+/// What [`gather`] read: the ticket's section, and the IAM actions the
+/// team's role was refused (the install's setup item, `aws_role_reads`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Gathered {
+    pub text: String,
+    pub refused: Vec<String>,
+}
+
+/// The evidence lines and the refusals met while reading them.
+#[derive(Default)]
+struct Notes {
+    lines: Vec<String>,
+    refused: Vec<String>,
+}
+
+impl Notes {
+    /// A lookup that failed: a refusal names the action and counts toward
+    /// the install's setup item; anything else says AWS's own words.
+    fn failed(&mut self, what: &str, action: &str, code: Option<&str>, msg: Option<&str>) {
+        if refused(code) {
+            if !self.refused.iter().any(|a| a == action) {
+                self.refused.push(action.to_string());
+            }
+            self.lines.push(format!(
+                "Couldn't {what}: CoderHelm's AWS role doesn't allow {action} yet."
+            ));
+        } else {
+            self.lines.push(format!(
+                "Couldn't {what}: {}",
+                clip(msg.or(code).unwrap_or("no answer"))
+            ));
+        }
+    }
+
+    fn done(self, alarm: &WafAlarm) -> Gathered {
+        evidence(alarm, self.lines, self.refused)
+    }
+}
+
+/// Pure: the ticket's section from what was read, with the one line that
+/// names the install's setup item when the role was refused a read.
+pub fn evidence(alarm: &WafAlarm, mut lines: Vec<String>, refused: Vec<String>) -> Gathered {
+    if !refused.is_empty() {
+        lines.push(crate::aws_role_reads::run_line(&refused));
+    }
+    Gathered {
+        text: render(alarm, &lines),
+        refused,
+    }
+}
+
 /// Read the evidence for a WAF alarm. Every lookup that fails says why in
 /// the result, so a missing permission is named, not silent.
-pub async fn gather(session: &Session, alarm: &WafAlarm, now: DateTime<Utc>) -> String {
+pub async fn gather(session: &Session, alarm: &WafAlarm, now: DateTime<Utc>) -> Gathered {
     use aws_sdk_wafv2::error::ProvideErrorMetadata;
     let (scope, region) = alarm.scope_and_region();
     let waf = waf_client(&session_in(session, &region));
-    let mut lines: Vec<String> = Vec::new();
-    let failed = |what: &str, action: &str, code: Option<&str>, msg: Option<&str>| {
-        if refused(code) {
-            format!(
-                "Couldn't {what}: CoderHelm's AWS role doesn't allow {action} yet (the role update \
-                 on the AWS card adds it)."
-            )
-        } else {
-            format!(
-                "Couldn't {what}: {}",
-                clip(msg.or(code).unwrap_or("no answer"))
-            )
-        }
-    };
+    let mut n = Notes::default();
 
     // The web ACL's ARN, by its name.
     let mut arn: Option<String> = None;
@@ -384,21 +623,22 @@ pub async fn gather(session: &Session, alarm: &WafAlarm, now: DateTime<Utc>) -> 
                 }
             }
             Err(e) => {
-                lines.push(failed(
+                n.failed(
                     "find the web ACL",
                     "wafv2:ListWebACLs",
                     e.code(),
                     e.message(),
-                ));
+                );
                 break;
             }
         }
     }
     let Some(arn) = arn else {
-        if lines.is_empty() {
-            lines.push(format!("No web ACL named {} in {region}.", alarm.web_acl));
+        if n.lines.is_empty() {
+            n.lines
+                .push(format!("No web ACL named {} in {region}.", alarm.web_acl));
         }
-        return render(alarm, &lines);
+        return n.done(alarm);
     };
 
     // The requests the rule matched.
@@ -450,17 +690,20 @@ pub async fn gather(session: &Session, alarm: &WafAlarm, now: DateTime<Utc>) -> 
                         )
                     })
                     .collect();
-                lines.push(format!("Sampled requests the rule {} matched:", alarm.rule));
-                lines.extend(summarize(&samples));
+                n.lines
+                    .push(format!("Sampled requests the rule {} matched:", alarm.rule));
+                n.lines.extend(summarize(&samples));
             }
-            Err(e) => lines.push(failed(
+            Err(e) => n.failed(
                 "read the sampled requests",
                 "wafv2:GetSampledRequests",
                 e.code(),
                 e.message(),
-            )),
+            ),
         },
-        Err(e) => lines.push(format!("Couldn't read the sampled requests: {e}")),
+        Err(e) => n
+            .lines
+            .push(format!("Couldn't read the sampled requests: {e}")),
     }
 
     // TLS fingerprints come only from the web ACL's logs.
@@ -475,19 +718,19 @@ pub async fn gather(session: &Session, alarm: &WafAlarm, now: DateTime<Utc>) -> 
             .map(|c| c.log_destination_configs().to_vec())
             .unwrap_or_default(),
         Err(e) if e.code() == Some("WAFNonexistentItemException") => {
-            lines.push(
+            n.lines.push(
                 "The web ACL has no logging, so no TLS fingerprints (JA3, JA4) are recorded."
                     .into(),
             );
             vec![]
         }
         Err(e) => {
-            lines.push(failed(
+            n.failed(
                 "read where the web ACL logs",
                 "wafv2:GetLoggingConfiguration",
                 e.code(),
                 e.message(),
-            ));
+            );
             vec![]
         }
     };
@@ -495,21 +738,380 @@ pub async fn gather(session: &Session, alarm: &WafAlarm, now: DateTime<Utc>) -> 
     let bucket = destinations.iter().find_map(|d| bucket_of(d));
     match (group, bucket, insights_query(&alarm.rule)) {
         (Some((region, name)), _, Some(query)) => {
-            lines.extend(fingerprints(session, &region, &name, &query, start, end).await);
+            n.lines
+                .extend(fingerprints(session, &region, &name, &query, start, end).await);
         }
-        (None, Some(bucket), _) => lines.push(format!(
-            "The web ACL logs to the S3 bucket {bucket}, which CoderHelm doesn't read: TLS \
-             fingerprints (JA3, JA4) are in those log records (an Athena table on the bucket, \
-             for one); the sampled requests above have the user agent and header order."
-        )),
-        (None, None, _) if !destinations.is_empty() => lines.push(
+        (None, Some(bucket), _) => {
+            let mut regions = vec![session.region.clone()];
+            if region != session.region {
+                regions.push(region.clone());
+            }
+            athena_fingerprints(session, &regions, alarm, &bucket, start, end, &mut n).await;
+        }
+        (None, None, _) if !destinations.is_empty() => n.lines.push(
             "The web ACL logs through Firehose, which CoderHelm doesn't read: TLS fingerprints \
              (JA3, JA4) need its log records."
                 .into(),
         ),
         _ => {}
     }
-    render(alarm, &lines)
+    n.done(alarm)
+}
+
+fn glue_client(s: &Session) -> aws_sdk_glue::Client {
+    use aws_sdk_glue::config::{BehaviorVersion, Credentials, Region};
+    let creds = Credentials::new(
+        &s.access_key_id,
+        &s.secret_access_key,
+        Some(s.session_token.clone()),
+        None,
+        "coderhelm-team-role",
+    );
+    aws_sdk_glue::Client::from_conf(
+        aws_sdk_glue::Config::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .region(Region::new(s.region.clone()))
+            .credentials_provider(creds)
+            .build(),
+    )
+}
+
+fn athena_client(s: &Session) -> aws_sdk_athena::Client {
+    use aws_sdk_athena::config::{BehaviorVersion, Credentials, Region};
+    let creds = Credentials::new(
+        &s.access_key_id,
+        &s.secret_access_key,
+        Some(s.session_token.clone()),
+        None,
+        "coderhelm-team-role",
+    );
+    aws_sdk_athena::Client::from_conf(
+        aws_sdk_athena::Config::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .region(Region::new(s.region.clone()))
+            .credentials_provider(creds)
+            .build(),
+    )
+}
+
+/// The Glue table over `bucket` in `region`: every database the role may
+/// list, and the tables of those it may read (the WAF log databases; the
+/// others refuse, which is expected). A refused listing is noted in `n`.
+async fn find_log_table(
+    glue: &aws_sdk_glue::Client,
+    bucket: &str,
+    n: &mut Notes,
+) -> Option<LogTable> {
+    use aws_sdk_glue::error::ProvideErrorMetadata;
+    let mut databases: Vec<String> = Vec::new();
+    let mut token: Option<String> = None;
+    loop {
+        match glue
+            .get_databases()
+            .set_next_token(token.take())
+            .max_results(100)
+            .send()
+            .await
+        {
+            Ok(o) => {
+                databases.extend(o.database_list().iter().map(|d| d.name().to_string()));
+                token = o.next_token().filter(|t| !t.is_empty()).map(str::to_string);
+                if token.is_none() || databases.len() >= MAX_LISTED {
+                    break;
+                }
+            }
+            Err(e) => {
+                n.failed(
+                    "list the Glue databases to find the web ACL's log table",
+                    "glue:GetDatabases",
+                    e.code(),
+                    e.message(),
+                );
+                return None;
+            }
+        }
+    }
+    for db in databases.iter().take(MAX_LISTED) {
+        let mut token: Option<String> = None;
+        for _ in 0..5 {
+            let Ok(o) = glue
+                .get_tables()
+                .database_name(db)
+                .set_next_token(token.take())
+                .send()
+                .await
+            else {
+                break;
+            };
+            for t in o.table_list() {
+                let Some(sd) = t.storage_descriptor() else {
+                    continue;
+                };
+                if !sd.location().is_some_and(|l| table_in_bucket(l, bucket)) {
+                    continue;
+                }
+                let keys: Vec<String> = t
+                    .partition_keys()
+                    .iter()
+                    .map(|k| k.name().to_lowercase())
+                    .collect();
+                let params: std::collections::HashMap<String, String> = t
+                    .parameters()
+                    .map(|p| p.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                    .unwrap_or_default();
+                return Some(LogTable {
+                    database: db.clone(),
+                    table: t.name().to_string(),
+                    columns: sd
+                        .columns()
+                        .iter()
+                        .map(|c| c.name().to_lowercase())
+                        .chain(keys.iter().cloned())
+                        .collect(),
+                    date_partitions: date_partitions(&keys, &params),
+                });
+            }
+            token = o.next_token().filter(|t| !t.is_empty()).map(str::to_string);
+            if token.is_none() {
+                break;
+            }
+        }
+    }
+    None
+}
+
+/// A workgroup the role may query: one of the account's, WAF log ones
+/// first (`live::aws::waf_policy_template` allows only those), enabled,
+/// with a results location; and whether it caps the bytes a query scans.
+async fn find_workgroup(athena: &aws_sdk_athena::Client, n: &mut Notes) -> Option<(String, bool)> {
+    use aws_sdk_athena::error::ProvideErrorMetadata;
+    use aws_sdk_athena::types::WorkGroupState;
+    let mut names: Vec<String> = Vec::new();
+    let mut token: Option<String> = None;
+    loop {
+        match athena
+            .list_work_groups()
+            .set_next_token(token.take())
+            .max_results(50)
+            .send()
+            .await
+        {
+            Ok(o) => {
+                names.extend(
+                    o.work_groups()
+                        .iter()
+                        .filter_map(|w| w.name())
+                        .map(str::to_string),
+                );
+                token = o.next_token().filter(|t| !t.is_empty()).map(str::to_string);
+                if token.is_none() || names.len() >= MAX_LISTED {
+                    break;
+                }
+            }
+            Err(e) => {
+                n.failed(
+                    "list the Athena workgroups",
+                    "athena:ListWorkGroups",
+                    e.code(),
+                    e.message(),
+                );
+                return None;
+            }
+        }
+    }
+    names.sort_by_key(|w| !w.to_lowercase().contains("waf"));
+    for name in names.iter().take(MAX_LISTED) {
+        let Ok(o) = athena.get_work_group().work_group(name).send().await else {
+            continue;
+        };
+        let Some(wg) = o.work_group() else { continue };
+        if wg.state() == Some(&WorkGroupState::Disabled) {
+            continue;
+        }
+        let cfg = wg.configuration();
+        let has_results = cfg
+            .and_then(|c| c.result_configuration())
+            .and_then(|r| r.output_location())
+            .is_some_and(|l| l.starts_with("s3://"));
+        if !has_results {
+            continue;
+        }
+        let capped = cfg
+            .and_then(|c| c.bytes_scanned_cutoff_per_query())
+            .is_some_and(|b| b > 0);
+        return Some((name.clone(), capped));
+    }
+    None
+}
+
+/// The rule's matches in the web ACL's logs held in S3, through Athena:
+/// the Glue table over the bucket, a workgroup the role may query, one
+/// bounded query (stopped if it runs long), its rows.
+async fn athena_fingerprints(
+    session: &Session,
+    regions: &[String],
+    alarm: &WafAlarm,
+    bucket: &str,
+    start: i64,
+    end: i64,
+    n: &mut Notes,
+) {
+    use aws_sdk_athena::error::ProvideErrorMetadata;
+    use aws_sdk_athena::types::{QueryExecutionContext, QueryExecutionState};
+    let mut found: Option<(Session, LogTable)> = None;
+    for r in regions {
+        let s = session_in(session, r);
+        if let Some(t) = find_log_table(&glue_client(&s), bucket, n).await {
+            found = Some((s, t));
+            break;
+        }
+        if !n.refused.is_empty() {
+            break;
+        }
+    }
+    let Some((s, table)) = found else {
+        if n.refused.is_empty() {
+            n.lines.push(format!(
+                "The web ACL logs to the S3 bucket {bucket}, and no Glue table CoderHelm's role \
+                 may read is on it, so its log records (with the TLS fingerprints JA3 and JA4) \
+                 weren't queried; the sampled requests above have the user agent and header order."
+            ));
+        }
+        return;
+    };
+    let athena = athena_client(&s);
+    let Some((workgroup, capped)) = find_workgroup(&athena, n).await else {
+        if n.refused.is_empty() {
+            n.lines.push(format!(
+                "The web ACL's logs are in the Athena table {}.{}, and no Athena workgroup \
+                 CoderHelm's role may query has a results location, so they weren't queried.",
+                table.database, table.table
+            ));
+        }
+        return;
+    };
+    if table.date_partitions.is_empty() && !capped {
+        n.lines.push(format!(
+            "The web ACL's logs are in the Athena table {}.{}, which has no projected date \
+             partition to bound a query to the last three hours, and the workgroup {workgroup} \
+             sets no scan limit, so they weren't queried (it would read the whole bucket).",
+            table.database, table.table
+        ));
+        return;
+    }
+    let Some(query) = athena_query(&table, &alarm.rule, start, end) else {
+        n.lines.push(format!(
+            "The table {}.{} on the bucket {bucket} isn't one of WAF's log tables (it lacks \
+             timestamp, httprequest or terminatingruleid), so it wasn't queried.",
+            table.database, table.table
+        ));
+        return;
+    };
+    let id = match athena
+        .start_query_execution()
+        .query_string(&query)
+        .work_group(&workgroup)
+        .query_execution_context(
+            QueryExecutionContext::builder()
+                .database(&table.database)
+                .build(),
+        )
+        .send()
+        .await
+    {
+        Ok(o) => o.query_execution_id().unwrap_or_default().to_string(),
+        Err(e) => {
+            n.failed(
+                "query the web ACL's logs in S3",
+                "athena:StartQueryExecution",
+                e.code(),
+                e.message(),
+            );
+            return;
+        }
+    };
+    let started = std::time::Instant::now();
+    loop {
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        let state = athena
+            .get_query_execution()
+            .query_execution_id(&id)
+            .send()
+            .await
+            .ok()
+            .and_then(|o| {
+                o.query_execution().and_then(|q| q.status()).and_then(|st| {
+                    st.state()
+                        .cloned()
+                        .map(|s| (s, st.state_change_reason().map(str::to_string)))
+                })
+            });
+        match state {
+            Some((QueryExecutionState::Succeeded, _)) => break,
+            Some((QueryExecutionState::Failed | QueryExecutionState::Cancelled, why)) => {
+                n.lines.push(format!(
+                    "The query of the web ACL's logs ({}.{}) didn't finish: {}",
+                    table.database,
+                    table.table,
+                    clip(why.as_deref().unwrap_or("no reason given"))
+                ));
+                return;
+            }
+            _ if started.elapsed() > ATHENA_WAIT => {
+                // Only this run's own query is ever stopped.
+                let _ = athena
+                    .stop_query_execution()
+                    .query_execution_id(&id)
+                    .send()
+                    .await;
+                n.lines.push(format!(
+                    "The query of the web ACL's logs ({}.{}) took longer than {} seconds and was \
+                     stopped.",
+                    table.database,
+                    table.table,
+                    ATHENA_WAIT.as_secs()
+                ));
+                return;
+            }
+            _ => {}
+        }
+    }
+    match athena
+        .get_query_results()
+        .query_execution_id(&id)
+        .max_results(ATHENA_ROWS + 1)
+        .send()
+        .await
+    {
+        Ok(o) => {
+            let rows: Vec<Vec<Option<String>>> = o
+                .result_set()
+                .map(|r| {
+                    r.rows()
+                        .iter()
+                        .map(|row| {
+                            row.data()
+                                .iter()
+                                .map(|d| d.var_char_value().map(str::to_string))
+                                .collect()
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            n.lines.push(format!(
+                "Matching requests in the web ACL's logs in S3 (Athena table {}.{}), by TLS \
+                 fingerprint, user agent, accept language, path and cookie presence:",
+                table.database, table.table
+            ));
+            n.lines.extend(athena_lines(&rows));
+        }
+        Err(e) => n.failed(
+            "read the query's results",
+            "athena:GetQueryResults",
+            e.code(),
+            e.message(),
+        ),
+    }
 }
 
 /// The rule's matches in the web ACL's log group, by TLS fingerprint and
@@ -673,6 +1275,156 @@ mod tests {
             Some("aws-waf-logs-example".into())
         );
         assert_eq!(bucket_of("arn:aws:s3:::another-bucket"), None);
+    }
+
+    /// The Glue table over a web ACL's log bucket, as WAF's documented
+    /// table defines it, with a projected hourly partition.
+    pub(crate) fn waf_log_table() -> LogTable {
+        let keys = vec!["log_time".to_string()];
+        let params: std::collections::HashMap<String, String> = [
+            ("projection.enabled", "true"),
+            ("projection.log_time.type", "date"),
+            ("projection.log_time.format", "yyyy/MM/dd/HH"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        LogTable {
+            database: "acme_waf_logs".into(),
+            table: "waf_logs".into(),
+            columns: [
+                "timestamp",
+                "terminatingruleid",
+                "action",
+                "httprequest",
+                "ja3fingerprint",
+                "ja4fingerprint",
+                "nonterminatingmatchingrules",
+                "log_time",
+            ]
+            .iter()
+            .map(|c| c.to_string())
+            .collect(),
+            date_partitions: date_partitions(&keys, &params),
+        }
+    }
+
+    #[test]
+    fn the_athena_query_is_bounded_to_the_rule_and_keeps_no_private_values() {
+        let t = waf_log_table();
+        assert_eq!(
+            t.date_partitions,
+            vec![("log_time".into(), "%Y/%m/%d/%H".into())]
+        );
+        // 2026-11-17 12:00 UTC, three hours back.
+        let end = 1_794_916_800;
+        let q = athena_query(&t, "ExampleCrawlerCount", end - WINDOW_SECS, end).unwrap();
+        assert!(q.contains("FROM \"acme_waf_logs\".\"waf_logs\""), "{q}");
+        assert!(
+            q.contains("\"timestamp\" BETWEEN 1794906000000 AND 1794916800000"),
+            "{q}"
+        );
+        assert!(
+            q.contains("\"log_time\" BETWEEN '2026/11/17/09' AND '2026/11/17/12'"),
+            "{q}"
+        );
+        assert!(q.contains("terminatingruleid = 'ExampleCrawlerCount'"));
+        assert!(q.contains("r.ruleid = 'ExampleCrawlerCount'"));
+        assert!(q.contains("LIMIT 20"));
+        for kept in [
+            "ja4fingerprint AS ja4",
+            "ja3fingerprint AS ja3",
+            "'user-agent'",
+            "'accept-language'",
+            "AS path",
+            "AS has_cookie",
+            "count(*) AS requests",
+        ] {
+            assert!(q.contains(kept), "{kept}");
+        }
+        // No client address, no cookie or other header value, no query string.
+        for never in [
+            "clientip",
+            "x.value) = 'cookie'",
+            "args",
+            "httprequest.headers AS",
+            "SELECT *",
+        ] {
+            assert!(!q.contains(never), "{never}: {q}");
+        }
+        // A cookie header is only counted, never read.
+        assert!(q.contains(
+            "cardinality(filter(httprequest.headers, x -> lower(x.name) = 'cookie')) > 0"
+        ));
+        // Names that can't be quoted safely, or a table that isn't WAF's.
+        assert_eq!(athena_query(&t, "a' OR 1=1 --", 0, 1), None);
+        let mut bad = waf_log_table();
+        bad.table = "waf\"; DROP".into();
+        assert_eq!(athena_query(&bad, "ExampleCrawlerCount", 0, 1), None);
+        let mut other = waf_log_table();
+        other.columns.retain(|c| c != "httprequest");
+        assert_eq!(athena_query(&other, "ExampleCrawlerCount", 0, 1), None);
+        // An older table without fingerprint columns still reads.
+        let mut old = waf_log_table();
+        old.columns.retain(|c| !c.ends_with("fingerprint"));
+        let q = athena_query(&old, "ExampleCrawlerCount", 0, 1).unwrap();
+        assert!(q.contains("CAST(NULL AS varchar) AS ja4"));
+    }
+
+    #[test]
+    fn projected_date_formats_sort_as_text_or_are_left_out() {
+        assert_eq!(date_format("yyyy/MM/dd/HH").as_deref(), Some("%Y/%m/%d/%H"));
+        assert_eq!(date_format("yyyy-MM-dd").as_deref(), Some("%Y-%m-%d"));
+        assert_eq!(date_format("dd/MM/yyyy"), None);
+        assert_eq!(date_format("yyyy/MM/dd'T'HH"), None);
+        assert!(table_in_bucket(
+            "s3://aws-waf-logs-acme/AWSLogs/",
+            "aws-waf-logs-acme"
+        ));
+        assert!(table_in_bucket(
+            "s3://aws-waf-logs-acme",
+            "aws-waf-logs-acme"
+        ));
+        assert!(!table_in_bucket(
+            "s3://aws-waf-logs-acme-old/x",
+            "aws-waf-logs-acme"
+        ));
+    }
+
+    #[test]
+    fn athena_rows_become_lines_with_only_what_is_kept() {
+        let row = |v: &[&str]| v.iter().map(|x| Some(x.to_string())).collect::<Vec<_>>();
+        let rows = vec![
+            row(&[
+                "ja4",
+                "ja3",
+                "ua",
+                "accept_language",
+                "path",
+                "has_cookie",
+                "requests",
+            ]),
+            row(&[
+                "t13d1516h2_8daaf6152771_e5627efa2ab1",
+                "773906b0efdefa24a7f2b8eb6985bf37",
+                "CrawlerA/3.1",
+                "en-US",
+                "/listings/42",
+                "false",
+                "812",
+            ]),
+        ];
+        let lines = athena_lines(&rows);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("812 requests"));
+        assert!(lines[0].contains("JA4 t13d1516h2_8daaf6152771_e5627efa2ab1"));
+        assert!(lines[0].contains("CrawlerA/3.1"));
+        assert!(lines[0].contains("no cookie"));
+        assert_eq!(
+            athena_lines(&rows[..1]),
+            vec!["  - none in the last three hours"]
+        );
+        assert!(athena_lines(&[]).is_empty());
     }
 
     #[test]

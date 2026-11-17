@@ -398,6 +398,222 @@ pub fn warehouse_policy_template(account: &str) -> serde_json::Value {
     })
 }
 
+/// The role's inline policy for AWS WAF and its logs.
+pub const WAF_POLICY_NAME: &str = "coderhelm-read-waf";
+
+/// Placeholders the setup script fills with what it finds in the account:
+/// the Athena workgroups for WAF logs (`WAF_WORKGROUPS`, their ARNs), the
+/// Glue databases and tables over `aws-waf-logs-*` buckets (`WAF_GLUE`),
+/// and where each of those workgroups writes its query results
+/// (`WAF_RESULT_OBJECTS`, `WAF_RESULT_BUCKETS`, `WAF_RESULT_PREFIXES`).
+/// Each sits alone in a JSON array, as a string, so a list of quoted ARNs
+/// replaces it.
+pub const WAF_PLACEHOLDERS: &[&str] = &[
+    "WAF_WORKGROUPS",
+    "WAF_GLUE",
+    "WAF_RESULT_OBJECTS",
+    "WAF_RESULT_BUCKETS",
+    "WAF_RESULT_PREFIXES",
+];
+
+/// What the WAF policy never allows, whatever else on the role does: every
+/// change to WAF, Athena, Glue or a bucket, and Glue's connections (they
+/// carry passwords).
+const WAF_NEVER: &[&str] = &[
+    "wafv2:Create*",
+    "wafv2:Update*",
+    "wafv2:Delete*",
+    "wafv2:Put*",
+    "wafv2:Associate*",
+    "wafv2:Disassociate*",
+    "wafv2:Tag*",
+    "wafv2:Untag*",
+    "athena:Create*",
+    "athena:Update*",
+    "athena:Delete*",
+    "athena:Put*",
+    "athena:Import*",
+    "athena:Tag*",
+    "athena:Untag*",
+    "glue:Create*",
+    "glue:Update*",
+    "glue:Delete*",
+    "glue:Put*",
+    "glue:Batch*",
+    "glue:GetConnection",
+    "glue:GetConnections",
+    "s3:Delete*",
+    "s3:PutBucket*",
+    "s3:PutObjectAcl",
+    "s3:PutObjectTagging",
+];
+
+/// Reads AWS WAF (web ACLs, sampled requests, where a web ACL logs) and,
+/// with `athena`, the web ACL's logs held in S3 through their Athena table:
+/// read-only queries in the WAF log workgroups the script found, over the
+/// Glue tables on `aws-waf-logs-*` buckets, with results written only
+/// under those workgroups' own results prefix. Everything that changes
+/// WAF, Athena, Glue or a bucket is denied, and so is any object written
+/// anywhere but the results prefix. Without `athena` (no WAF log
+/// workgroup or table in the account) it reads WAF and the log buckets'
+/// objects only, and writes nothing.
+pub fn waf_policy_template(account: &str, athena: bool) -> serde_json::Value {
+    let mut statements = vec![
+        json!({
+            "Sid": "ReadWaf",
+            "Effect": "Allow",
+            "Action": ["wafv2:Get*", "wafv2:List*"],
+            "Resource": "*"
+        }),
+        json!({
+            "Sid": "ReadWafLogObjects",
+            "Effect": "Allow",
+            "Action": ["s3:GetObject"],
+            "Resource": "arn:aws:s3:::aws-waf-logs-*/*"
+        }),
+        json!({
+            "Sid": "ListWafLogBuckets",
+            "Effect": "Allow",
+            "Action": ["s3:ListBucket", "s3:GetBucketLocation"],
+            "Resource": "arn:aws:s3:::aws-waf-logs-*"
+        }),
+    ];
+    if athena {
+        statements.extend([
+            json!({
+                "Sid": "FindWafLogWorkgroups",
+                "Effect": "Allow",
+                "Action": ["athena:ListWorkGroups"],
+                "Resource": "*"
+            }),
+            json!({
+                "Sid": "FindWafLogDatabases",
+                "Effect": "Allow",
+                "Action": ["glue:GetDatabases"],
+                "Resource": [
+                    format!("arn:aws:glue:*:{account}:catalog"),
+                    format!("arn:aws:glue:*:{account}:database/*")
+                ]
+            }),
+            json!({
+                "Sid": "ReadWafLogTables",
+                "Effect": "Allow",
+                "Action": ["glue:Get*"],
+                "Resource": [format!("arn:aws:glue:*:{account}:catalog"), "WAF_GLUE".to_string()]
+            }),
+            json!({
+                "Sid": "QueryWafLogs",
+                "Effect": "Allow",
+                "Action": ["athena:StartQueryExecution", "athena:Get*", "athena:StopQueryExecution"],
+                "Resource": ["WAF_WORKGROUPS"]
+            }),
+            json!({
+                "Sid": "WriteQueryResultsOnly",
+                "Effect": "Allow",
+                "Action": ["s3:PutObject", "s3:GetObject"],
+                "Resource": ["WAF_RESULT_OBJECTS"]
+            }),
+            json!({
+                "Sid": "FindQueryResults",
+                "Effect": "Allow",
+                "Action": ["s3:GetBucketLocation", "s3:ListBucket"],
+                "Resource": ["WAF_RESULT_BUCKETS"],
+                "Condition": { "StringLike": { "s3:prefix": ["WAF_RESULT_PREFIXES"] } }
+            }),
+            json!({
+                "Sid": "NoWritesButQueryResults",
+                "Effect": "Deny",
+                "Action": "s3:PutObject",
+                "NotResource": ["WAF_RESULT_OBJECTS"]
+            }),
+        ]);
+    } else {
+        statements.push(json!({
+            "Sid": "NoWrites",
+            "Effect": "Deny",
+            "Action": "s3:PutObject",
+            "Resource": "*"
+        }));
+    }
+    statements.push(json!({
+        "Sid": "NeverChange",
+        "Effect": "Deny",
+        "Action": WAF_NEVER,
+        "Resource": "*"
+    }));
+    json!({ "Version": "2012-10-17", "Statement": statements })
+}
+
+/// The part of the setup script that finds the account's WAF log
+/// workgroups and tables and puts [`WAF_POLICY_NAME`] on `$ROLE`. Needs
+/// `ROLE`, `REGION` and `ACCOUNT`; asks nothing, and changes nothing but
+/// that one policy, so running it again is safe.
+fn waf_policy_step() -> String {
+    let athena = waf_policy_template("ACCOUNT_ID", true).to_string();
+    let plain = waf_policy_template("ACCOUNT_ID", false).to_string();
+    format!(
+        r##"WAF_WG=""; WAF_OBJ=""; WAF_BKT=""; WAF_PFX=""; WAF_GLUE=""
+for W in $(aws athena list-work-groups --region "$REGION" --query 'WorkGroups[].Name' --output text 2>/dev/null | tr '\t' '\n' | grep -i waf || true); do
+  OUT=$(aws athena get-work-group --region "$REGION" --work-group "$W" --query 'WorkGroup.Configuration.ResultConfiguration.OutputLocation' --output text 2>/dev/null || true)
+  case "$OUT" in s3://*) ;; *) continue;; esac
+  B="${{OUT#s3://}}"; B="${{B%%/*}}"; P="${{OUT#s3://$B}}"; P="${{P#/}}"
+  WAF_WG="$WAF_WG${{WAF_WG:+,}}\"arn:aws:athena:$REGION:$ACCOUNT:workgroup/$W\""
+  WAF_OBJ="$WAF_OBJ${{WAF_OBJ:+,}}\"arn:aws:s3:::$B/$P*\""
+  WAF_BKT="$WAF_BKT${{WAF_BKT:+,}}\"arn:aws:s3:::$B\""
+  WAF_PFX="$WAF_PFX${{WAF_PFX:+,}}\"$P*\""
+done
+for D in $(aws glue get-databases --region "$REGION" --query 'DatabaseList[].Name' --output text 2>/dev/null | tr '\t' '\n'); do
+  T=$(aws glue get-tables --region "$REGION" --database-name "$D" --query "TableList[?StorageDescriptor.Location && starts_with(StorageDescriptor.Location, 's3://aws-waf-logs-')].Name" --output text 2>/dev/null || true)
+  if [ -n "$T" ] && [ "$T" != "None" ]; then
+    WAF_GLUE="$WAF_GLUE${{WAF_GLUE:+,}}\"arn:aws:glue:$REGION:$ACCOUNT:database/$D\",\"arn:aws:glue:$REGION:$ACCOUNT:table/$D/*\""
+  fi
+done
+if [ -n "$WAF_WG" ] && [ -n "$WAF_GLUE" ]; then
+  WAF_DOC=$(echo '{athena}' | sed -e "s#\"WAF_WORKGROUPS\"#$WAF_WG#g" -e "s#\"WAF_GLUE\"#$WAF_GLUE#g" -e "s#\"WAF_RESULT_OBJECTS\"#$WAF_OBJ#g" -e "s#\"WAF_RESULT_BUCKETS\"#$WAF_BKT#g" -e "s#\"WAF_RESULT_PREFIXES\"#$WAF_PFX#g" -e "s#ACCOUNT_ID#$ACCOUNT#g")
+  WAF_SAID="AWS WAF, and its logs in S3 through Athena (results only under the workgroup's results prefix)"
+else
+  WAF_DOC=$(echo '{plain}' | sed -e "s#ACCOUNT_ID#$ACCOUNT#g")
+  WAF_SAID="AWS WAF and its log buckets (no Athena workgroup with waf in its name, or no Glue table on an aws-waf-logs- bucket, in $REGION)"
+fi
+aws iam put-role-policy --role-name "$ROLE" --policy-name {WAF_POLICY_NAME} --policy-document "$WAF_DOC"
+echo "WAF reads ready: $WAF_SAID."
+"##
+    )
+}
+
+/// Pure: a role name the update line may name.
+fn is_role_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "+=,.@_-".contains(c))
+}
+
+/// The update that adds only [`WAF_POLICY_NAME`] to an existing role
+/// (`role`, its name), for a team whose role was made before it: no
+/// questions, nothing pasted back, and safe to run again.
+pub fn waf_update_script(role: &str) -> Option<String> {
+    is_role_name(role).then(|| {
+        format!(
+            "coderhelm_waf_update() (\nset -euo pipefail\nROLE={role}\nREGION=\"${{AWS_REGION:-us-east-1}}\"\nACCOUNT=$(aws sts get-caller-identity --query Account --output text)\necho \"Adding read-only AWS WAF access to $ROLE in account $ACCOUNT ($REGION)...\"\n{}\n)\ncoderhelm_waf_update\n",
+            waf_policy_step()
+        )
+    })
+}
+
+/// [`waf_update_script`] as the one line a person pastes into AWS
+/// CloudShell in the role's account (and the region of its Athena
+/// workgroup).
+pub fn waf_update_line(role_arn: &str) -> Option<String> {
+    let role = role_arn.rsplit('/').next().unwrap_or(role_arn);
+    let script = waf_update_script(role)?;
+    Some(format!(
+        "echo {} | base64 -d | bash",
+        STANDARD.encode(script)
+    ))
+}
+
 /// The script a team pastes into AWS CloudShell. It creates (or updates) the
 /// role, lets them pick a database to share, creates a database user that can
 /// only read, and prints the line to paste back. It defines a function and
@@ -409,6 +625,7 @@ pub fn setup_script(our_account: &str, external_id: &str) -> String {
     let logs = logs_policy().to_string();
     let db = database_policy_template("ACCOUNT_ID").to_string();
     let wh = warehouse_policy_template("ACCOUNT_ID").to_string();
+    let waf = waf_policy_step();
     format!(
         r#"coderhelm_setup() (
 set -euo pipefail
@@ -422,8 +639,8 @@ else
   aws iam create-role --role-name "$ROLE" --description "Coderhelm: read-only access to logs and one database" --max-session-duration 3600 --assume-role-policy-document '{trust}' >/dev/null
 fi
 aws iam put-role-policy --role-name "$ROLE" --policy-name coderhelm-read-logs --policy-document '{logs}'
-ROLE_ARN=$(aws iam get-role --role-name "$ROLE" --query Role.Arn --output text)
-echo "Role ready: $ROLE_ARN (it can read logs; it can't change anything)."
+{waf}ROLE_ARN=$(aws iam get-role --role-name "$ROLE" --query Role.Arn --output text)
+echo "Role ready: $ROLE_ARN (it can read logs and AWS WAF; it can't change anything)."
 DB_PART=""
 CLUSTERS=$(aws rds describe-db-clusters --region "$REGION" --query "DBClusters[?Engine=='aurora-postgresql' && HttpEndpointEnabled].DBClusterIdentifier" --output text | tr '\t' '\n' | sed '/^$/d')
 if [ -n "$CLUSTERS" ]; then
@@ -749,6 +966,7 @@ pub fn rdsdata_client(s: &Session) -> aws_sdk_rdsdata::Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
 
     const ROLE: &str = "arn:aws:iam::123456789012:role/CoderhelmReadOnly";
 
@@ -976,6 +1194,157 @@ mod tests {
             "coderhelm-a-person@example.com"
         );
         assert!(new_external_id().starts_with("coderhelm-"));
+    }
+
+    #[test]
+    fn the_waf_policy_reads_waf_and_queries_only_its_logs() {
+        let never = serde_json::to_value(WAF_NEVER).unwrap();
+        assert_eq!(
+            waf_policy_template("111122223333", true),
+            json!({
+                "Version": "2012-10-17",
+                "Statement": [
+                    { "Sid": "ReadWaf", "Effect": "Allow",
+                      "Action": ["wafv2:Get*", "wafv2:List*"], "Resource": "*" },
+                    { "Sid": "ReadWafLogObjects", "Effect": "Allow",
+                      "Action": ["s3:GetObject"], "Resource": "arn:aws:s3:::aws-waf-logs-*/*" },
+                    { "Sid": "ListWafLogBuckets", "Effect": "Allow",
+                      "Action": ["s3:ListBucket", "s3:GetBucketLocation"],
+                      "Resource": "arn:aws:s3:::aws-waf-logs-*" },
+                    { "Sid": "FindWafLogWorkgroups", "Effect": "Allow",
+                      "Action": ["athena:ListWorkGroups"], "Resource": "*" },
+                    { "Sid": "FindWafLogDatabases", "Effect": "Allow",
+                      "Action": ["glue:GetDatabases"],
+                      "Resource": ["arn:aws:glue:*:111122223333:catalog",
+                                   "arn:aws:glue:*:111122223333:database/*"] },
+                    { "Sid": "ReadWafLogTables", "Effect": "Allow", "Action": ["glue:Get*"],
+                      "Resource": ["arn:aws:glue:*:111122223333:catalog", "WAF_GLUE"] },
+                    { "Sid": "QueryWafLogs", "Effect": "Allow",
+                      "Action": ["athena:StartQueryExecution", "athena:Get*",
+                                 "athena:StopQueryExecution"],
+                      "Resource": ["WAF_WORKGROUPS"] },
+                    { "Sid": "WriteQueryResultsOnly", "Effect": "Allow",
+                      "Action": ["s3:PutObject", "s3:GetObject"],
+                      "Resource": ["WAF_RESULT_OBJECTS"] },
+                    { "Sid": "FindQueryResults", "Effect": "Allow",
+                      "Action": ["s3:GetBucketLocation", "s3:ListBucket"],
+                      "Resource": ["WAF_RESULT_BUCKETS"],
+                      "Condition": { "StringLike": { "s3:prefix": ["WAF_RESULT_PREFIXES"] } } },
+                    { "Sid": "NoWritesButQueryResults", "Effect": "Deny",
+                      "Action": "s3:PutObject", "NotResource": ["WAF_RESULT_OBJECTS"] },
+                    { "Sid": "NeverChange", "Effect": "Deny", "Action": never, "Resource": "*" }
+                ]
+            })
+        );
+        assert_eq!(
+            waf_policy_template("111122223333", false),
+            json!({
+                "Version": "2012-10-17",
+                "Statement": [
+                    { "Sid": "ReadWaf", "Effect": "Allow",
+                      "Action": ["wafv2:Get*", "wafv2:List*"], "Resource": "*" },
+                    { "Sid": "ReadWafLogObjects", "Effect": "Allow",
+                      "Action": ["s3:GetObject"], "Resource": "arn:aws:s3:::aws-waf-logs-*/*" },
+                    { "Sid": "ListWafLogBuckets", "Effect": "Allow",
+                      "Action": ["s3:ListBucket", "s3:GetBucketLocation"],
+                      "Resource": "arn:aws:s3:::aws-waf-logs-*" },
+                    { "Sid": "NoWrites", "Effect": "Deny", "Action": "s3:PutObject",
+                      "Resource": "*" },
+                    { "Sid": "NeverChange", "Effect": "Deny", "Action": never, "Resource": "*" }
+                ]
+            })
+        );
+        // Every allow is a read but the one write, which is held to the
+        // workgroup's results prefix by its own deny.
+        for athena in [true, false] {
+            let p = waf_policy_template("1", athena);
+            for st in p["Statement"].as_array().unwrap() {
+                let actions: Vec<&str> = match &st["Action"] {
+                    Value::String(a) => vec![a.as_str()],
+                    v => v
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|a| a.as_str().unwrap())
+                        .collect(),
+                };
+                if st["Effect"] == "Allow" {
+                    for a in &actions {
+                        let verb = a.split(':').nth(1).unwrap();
+                        let read = ["Get", "List"].iter().any(|r| verb.starts_with(r))
+                            || matches!(
+                                *a,
+                                "athena:StartQueryExecution" | "athena:StopQueryExecution"
+                            );
+                        assert!(read || *a == "s3:PutObject", "{a} is not a read");
+                        if *a == "s3:PutObject" {
+                            assert_eq!(st["Resource"], json!(["WAF_RESULT_OBJECTS"]));
+                        }
+                    }
+                    assert_ne!(st["Action"], json!("*"));
+                }
+            }
+            // Every placeholder is alone in its array, so the script's list replaces it.
+            let text = p.to_string();
+            for ph in WAF_PLACEHOLDERS {
+                if athena {
+                    assert!(text.contains(&format!("\"{ph}\"")), "{ph}");
+                } else {
+                    assert!(!text.contains(ph), "{ph}");
+                }
+            }
+        }
+        // Glue's connections carry passwords: never readable.
+        assert!(WAF_NEVER.contains(&"glue:GetConnection"));
+    }
+
+    #[test]
+    fn the_setup_script_adds_the_waf_policy_and_the_update_line_only_that() {
+        let s = setup_script("654654210434", "coderhelm-abc");
+        assert!(s.contains(&format!("--policy-name {WAF_POLICY_NAME}")));
+        assert!(s.contains("grep -i waf"));
+        assert!(s.contains("starts_with(StorageDescriptor.Location, 's3://aws-waf-logs-')"));
+        let line = waf_update_line("arn:aws:iam::111122223333:role/CoderhelmReadOnly").unwrap();
+        assert!(line.starts_with("echo ") && line.ends_with(" | base64 -d | bash"));
+        assert!(!line.contains('\n'));
+        let b64 = line
+            .trim_start_matches("echo ")
+            .trim_end_matches(" | base64 -d | bash");
+        let script = String::from_utf8(STANDARD.decode(b64).unwrap()).unwrap();
+        assert!(script.contains("ROLE=CoderhelmReadOnly\n"));
+        assert!(script.contains(&format!("--policy-name {WAF_POLICY_NAME}")));
+        // Nothing else: no trust change, no other policy, nothing pasted back.
+        assert_eq!(script.matches("put-role-policy").count(), 1);
+        for no in [
+            "update-assume-role-policy",
+            "create-role",
+            "coderhelm:$CODE",
+            "read -r",
+        ] {
+            assert!(!script.contains(no), "{no}");
+        }
+        assert!(waf_update_line("arn:aws:iam::111122223333:role/x;rm -rf").is_none());
+        for sh in [script, s] {
+            use std::io::Write;
+            let mut child = std::process::Command::new("bash")
+                .arg("-n")
+                .stdin(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("bash is installed");
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(sh.as_bytes())
+                .unwrap();
+            let out = child.wait_with_output().unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
     }
 
     #[test]

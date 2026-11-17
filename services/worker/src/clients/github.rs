@@ -1128,7 +1128,12 @@ impl GitHubClient {
             m.insert(key, all.clone());
             all
         };
-        let body = pl::note(&all);
+        // Written here, not through the conversation layer: it still keeps
+        // the thread rules.
+        let body = common::comment_style::tidy(
+            &pl::note(&all),
+            &common::conversation::Place::github(owner, repo, pr),
+        );
         let existing = self
             .list_issue_comments(owner, repo, pr)
             .await

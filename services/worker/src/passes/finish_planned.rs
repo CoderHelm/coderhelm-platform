@@ -69,24 +69,19 @@ pub fn round_feedback(items: &[String]) -> String {
 /// The first planned-work round, parked for a fresh invocation after the
 /// pull request opens. `None` when nothing is listed.
 pub fn first_round(section: &str, now: chrono::DateTime<chrono::Utc>) -> Option<Round> {
-    let items = listed(section);
+    first_round_of(&listed(section), now)
+}
+
+/// [`first_round`] for these items (the section's, after
+/// `round_agree::sort`).
+pub fn first_round_of(items: &[String], now: chrono::DateTime<chrono::Utc>) -> Option<Round> {
     if items.is_empty() {
         return None;
     }
     // Recorded as not scoped (no pull-request-files boundary): a planned-work
     // round is bounded by the plan, whose task files the branch may not
     // change yet (`write_guard::RoundFor::of_round`).
-    Some(
-        Round::start(
-            Kind::PlannedWork,
-            1,
-            "",
-            &round_feedback(&items),
-            false,
-            now,
-        )
-        .parked(false),
-    )
+    Some(Round::start(Kind::PlannedWork, 1, "", &round_feedback(items), false, now).parked(false))
 }
 
 /// The round after `prev`, for the tasks still listed. It is told the

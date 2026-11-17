@@ -105,13 +105,28 @@ The causes were in the loop, not only in prompt wording:
    and the manifests' blob ids. Only the first build installs and saves it.
    The coder is told the environment is ready and how the tests run. One run
    reinstalled its dependencies eighteen times, about 25 minutes of builds.
+   The CI job chosen is the one whose tests run for the plan's files
+   (`test_env::from_workflows_for`). A workflow filtered to other paths, or a
+   job in a folder none of the files is in, is used only when nothing fits
+   better. A web change in a monorepo was once given a lambda's `npm ci` and
+   `npm test` (`incidents::cm_test_env_for_the_change`).
 
    Each new or changed test runs in the sandbox with and without the
    change (`habits_check`). A test the runner finds nothing in goes back to the
    coder, and the coder quotes the run's output in its Evidence. End-to-end code
    against another company's page uses only what a probe observed (#734).
 
-7. **Commit and push.**
+   A proof fix round that answers a gap by looking (a query, a page, a check
+   run) is judged again with what it found, even when it wrote no code
+   (`proof::round_answered`, `incidents::cn_proof_answer_judged`).
+
+7. **Rounds agree.**
+   Planned work that a review commit on the pull request took out is not
+   built again by a planned-work round, and the run says which commit took it
+   out. When an acceptance criterion of the ticket asks for it, the ticket
+   wins: it is built, and the reply to the review says why
+   (`round_agree`, `incidents::co_rounds_agree`).
+8. **Commit and push.**
    Each gate runs where the commit is made, not as a line in the prompt
    (`common::push_gate`, `passes/push_checks.rs`).
 

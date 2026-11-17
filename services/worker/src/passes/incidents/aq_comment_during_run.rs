@@ -170,7 +170,7 @@ async fn an_answer_written_while_the_run_builds_is_acknowledged_read_and_applied
         "Where this answer differs from the default that was built, change the code in the place the plan put that choice"
     ));
     assert!(round.contains("Say in the pull request"));
-    assert!(end.says("I'm now changing the code where that choice lives to match the answer"));
+    assert!(end.says("changing that code to match it"));
     assert!(end.says(pr));
     end.status = "completed".into();
     end.pr = Some(12);

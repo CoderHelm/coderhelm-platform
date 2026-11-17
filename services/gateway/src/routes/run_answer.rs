@@ -269,8 +269,7 @@ pub async fn answer(
         &given,
     )
     .await;
-    let asked_at = asked.and_then(|a| a.comment_url);
-    let comment_url = post_reply(state, &item, &person.public, &answers, asked_at.as_deref()).await;
+    let comment_url = post_reply(state, &item, &person.public, &answers).await;
     let posted = comment_url.is_some();
     if let Some(Some(url)) = &comment_url {
         let _ = state
@@ -470,7 +469,6 @@ async fn post_reply(
     item: &Item,
     author: &str,
     answers: &[Answer],
-    asked_at: Option<&str>,
 ) -> Option<Option<String>> {
     let run_id = s(item, "run_id");
     let source = match s(item, "ticket_source").as_str() {
@@ -496,7 +494,7 @@ async fn post_reply(
             let team = s(item, "team_id");
             let say = common::conversation::Say::note(
                 "answer",
-                run_questions::reply(author, answers, asked_at, false),
+                run_questions::reply(author, answers, false),
             );
             match super::conversation::jira_at(
                 state,
@@ -538,7 +536,7 @@ async fn post_reply(
                 .ok()?;
             let say = common::conversation::Say::note(
                 "answer",
-                run_questions::reply(author, answers, asked_at, true),
+                run_questions::reply(author, answers, true),
             );
             match super::conversation::github(state, &token, owner, name, issue, say).await {
                 Ok(spoke) => Some(super::conversation::github_url(owner, name, issue, &spoke)),
@@ -902,7 +900,8 @@ mod tests {
             text.contains("A: Production only. Staging keeps 100."),
             "{text}"
         );
-        assert!(text.contains("focusedCommentId=10001"));
+        // Never a link to the questions: they are on this same ticket.
+        assert!(!text.contains("focusedCommentId=10001"), "{text}");
         assert!(!text.contains("What is the new limit?"));
         // And its address is kept on the run.
         assert_eq!(
