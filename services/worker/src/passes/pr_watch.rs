@@ -217,24 +217,37 @@ pub fn watched(status: &str) -> bool {
     )
 }
 
+/// Run statuses whose merged pull request is followed through its deploy:
+/// every finished one, and one a person ended (closed by hand, cancelled)
+/// or that failed, since the merge still shipped the change. A person's
+/// merge and CoderHelm's go through the same follow ([`Act::WatchDeploy`]).
+pub fn follows_merge(status: &str) -> bool {
+    watched(status)
+        || matches!(
+            status,
+            common::run_status::CLOSED | common::run_status::CANCELLED | common::run_status::FAILED
+        )
+}
+
 /// What to do, first need first. A merged pull request gets its deploy
-/// watched; a closed one nothing. An open one: a conflict before anything
+/// watched and its release followed, whatever the run's status says
+/// ([`follows_merge`]); a closed one nothing. An open one: a conflict before anything
 /// (nothing else can be judged on a branch that can't merge), then red
 /// checks, then the reviewer's verdict on the head: none on this commit
 /// asks for one, and changes requested on this commit are fixed. Each only
 /// once per commit.
 pub fn decide(status: &str, seen: &Seen, marks: &Marks) -> Act {
-    if !watched(status) {
-        return Act::Nothing;
-    }
     if seen.merged {
-        return if !seen.merge_sha.is_empty() && marks.deploy_sha != seen.merge_sha {
+        return if follows_merge(status)
+            && !seen.merge_sha.is_empty()
+            && marks.deploy_sha != seen.merge_sha
+        {
             Act::WatchDeploy
         } else {
             Act::Nothing
         };
     }
-    if !seen.open || seen.head.is_empty() {
+    if !watched(status) || !seen.open || seen.head.is_empty() {
         return Act::Nothing;
     }
     if seen.conflict {
@@ -694,17 +707,31 @@ async fn perform(
                 .await
                 .into()
         }
-        Act::WatchDeploy => super::health_check::schedule_own(
-            state,
-            github,
-            &c.team_id,
-            c.installation_id,
-            (&c.owner, &c.repo, c.pr),
-            &c.base_branch,
-            &seen.merge_sha,
-        )
-        .await
-        .into(),
+        Act::WatchDeploy => {
+            // The release follows the same merge: the deploys that run for
+            // its files, staging then production by the repository's own
+            // path (the tag under one approval when the team asks for it).
+            super::release_run::follow_merge(
+                state,
+                github,
+                &c.team_id,
+                c.installation_id,
+                (&c.owner, &c.repo, c.pr),
+                &c.run_id,
+            )
+            .await;
+            super::health_check::schedule_own(
+                state,
+                github,
+                &c.team_id,
+                c.installation_id,
+                (&c.owner, &c.repo, c.pr),
+                &c.base_branch,
+                &seen.merge_sha,
+            )
+            .await
+            .into()
+        }
     }
 }
 
@@ -919,12 +946,20 @@ pub async fn after_completion(state: &WorkerState, team_id: &str, run_id: &str) 
     let Some(c) = item.as_ref().and_then(candidate_of) else {
         return;
     };
-    if !watched(&c.status) {
+    if !watched(&c.status) && !follows_merge(&c.status) {
         return;
     }
     if let Some(github) = client(state, c.installation_id) {
         look(state, &github, &c).await;
     }
+}
+
+/// A pull request with a run closed or merged (the webhook): it is looked
+/// at now, so a merge is followed through its deploy within the minute,
+/// whoever merged it and whatever the run's status. Best effort; the sweep
+/// looks again.
+pub async fn after_pr_closed(state: &WorkerState, team_id: &str, run_id: &str) {
+    after_completion(state, team_id, run_id).await;
 }
 
 /// What one sweep did.
@@ -944,6 +979,14 @@ pub struct SweepReport {
     pub caught_up: Vec<String>,
 }
 
+/// The sweep's scan: finished runs with a pull request, changed inside the
+/// watch window; and a run a person ended (or that failed) whose pull
+/// request merged and whose deploy nobody follows yet, so a merge the
+/// webhook's look missed is still followed (the catch-up).
+pub const SWEEP_FILTER: &str = "pr_number > :zero AND updated_at >= :cut AND \
+     ((#s IN (:done, :old_done, :merged) AND (attribute_not_exists(pr_outcome) OR pr_outcome = :merged)) \
+     OR (#s IN (:closed, :cancelled, :failed) AND pr_outcome = :merged AND attribute_not_exists(#wd)))";
+
 /// Finished runs with a pull request, changed inside the watch window: each
 /// pull request is looked at, least recently looked at first.
 pub async fn sweep(state: &WorkerState) -> SweepReport {
@@ -956,14 +999,15 @@ pub async fn sweep(state: &WorkerState) -> SweepReport {
             .dynamo
             .scan()
             .table_name(&state.config.runs_table_name)
-            .filter_expression(
-                "#s IN (:done, :old_done, :merged) AND pr_number > :zero AND updated_at >= :cut \
-                 AND (attribute_not_exists(pr_outcome) OR pr_outcome = :merged)",
-            )
+            .filter_expression(SWEEP_FILTER)
             .expression_attribute_names("#s", "status")
+            .expression_attribute_names("#wd", Marks::DEPLOY)
             .expression_attribute_values(":done", attr_s(common::run_status::COMPLETED))
             .expression_attribute_values(":old_done", attr_s(common::run_status::SUCCESS))
             .expression_attribute_values(":merged", attr_s("merged"))
+            .expression_attribute_values(":closed", attr_s(common::run_status::CLOSED))
+            .expression_attribute_values(":cancelled", attr_s(common::run_status::CANCELLED))
+            .expression_attribute_values(":failed", attr_s(common::run_status::FAILED))
             .expression_attribute_values(":zero", attr_n(0))
             .expression_attribute_values(":cut", attr_s(&cutoff))
             .set_exclusive_start_key(start.take())
@@ -984,6 +1028,9 @@ pub async fn sweep(state: &WorkerState) -> SweepReport {
     }
     // A merged pull request whose deploy is already watched needs no look.
     all.retain(|c| c.status != "merged" || c.marks.deploy_sha.is_empty());
+    // A run a person ended is looked at only for its merge (the scan reads
+    // only merged ones), and only until its deploy is followed.
+    all.retain(|c| watched(&c.status) || c.marks.deploy_sha.is_empty());
     report.candidates = all.len();
     let mut clients: HashMap<u64, GitHubClient> = HashMap::new();
     // Asked before each look: the sweep never spends the runs' share of
