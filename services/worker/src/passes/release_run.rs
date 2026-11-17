@@ -36,7 +36,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::{info, warn};
 
-use super::release_plan::{self, Kind, On, Planned, Status, Step};
+use super::release_plan::{self, Env, Kind, On, Planned, Status, Step};
 use crate::clients::github::GitHubClient;
 use crate::models::ReleaseStepsMessage;
 use crate::WorkerState;
@@ -255,7 +255,33 @@ pub async fn arm(
     }
     let mut context = planned.lines();
     context.retain(|l| !l.starts_with(|c: char| c.is_ascii_digit()));
-    let mut steps = planned.steps.clone();
+    arm_steps(
+        state,
+        team_id,
+        installation_id,
+        (owner, repo, pr_number),
+        run_id,
+        (head_branch, base_branch),
+        planned.steps.clone(),
+        context,
+    )
+    .await;
+}
+
+/// Saves `steps` as the pull request's release (with a fresh tick chain,
+/// so any older chain stops) and starts its ticks. Steps unchanged from
+/// the saved release keep their progress.
+#[allow(clippy::too_many_arguments)]
+async fn arm_steps(
+    state: &WorkerState,
+    team_id: &str,
+    installation_id: u64,
+    (owner, repo, pr_number): (&str, &str, u64),
+    run_id: &str,
+    (head_branch, base_branch): (&str, &str),
+    mut steps: Vec<Step>,
+    context: Vec<String>,
+) {
     if let Ok(Some(old)) = load(state, team_id, owner, repo, pr_number).await {
         for s in steps.iter_mut() {
             if let Some(o) = old
@@ -364,6 +390,160 @@ pub async fn after_pr(
 
 /// Notice key: a ticket's release steps, one comment per ticket.
 const NOTICE_RELEASE: &str = "release_steps";
+
+/// The status slot the release keeps in the pull request's one status
+/// comment: said only while a step waits on a person's approval.
+const SLOT_RELEASE: &str = "release";
+
+/// The deploys a merge goes through, laid over the release already armed
+/// (`old`): each deploy step that is not done and now names another
+/// workflow or trigger (it waited on a deploy that never runs for this
+/// change) is pointed at `fresh`'s, a deploy missing from it is added
+/// (staging's before production's, which then waits for it), and every
+/// other step keeps what it has. `None` when nothing changes.
+pub fn refollow(old: &[Step], fresh: &[Step]) -> Option<Vec<Step>> {
+    let mut out = old.to_vec();
+    for f in fresh.iter().filter(|f| f.kind == Kind::Deploy) {
+        match out.iter().position(|o| o.id == f.id) {
+            Some(i) => {
+                let o = &out[i];
+                if o.status == Status::Done || (o.how == f.how && o.workflow == f.workflow) {
+                    continue;
+                }
+                let after = o.after.clone();
+                out[i] = Step { after, ..f.clone() };
+            }
+            None => {
+                let mut s = f.clone();
+                s.after.retain(|a| out.iter().any(|o| &o.id == a));
+                let at = match f.env {
+                    // Before the first production deploy, which then waits
+                    // for staging's.
+                    Env::Staging => out
+                        .iter()
+                        .position(|o| o.kind == Kind::Deploy && o.env == Env::Production),
+                    Env::Production => None,
+                };
+                match at {
+                    Some(at) => {
+                        if !out[at].after.contains(&s.id) {
+                            out[at].after.push(s.id.clone());
+                        }
+                        out.insert(at, s);
+                    }
+                    None => out.push(s),
+                }
+            }
+        }
+    }
+    (out != old).then_some(out)
+}
+
+/// A merged pull request, whoever merged it: its release follows the
+/// deploys that run for the files it changed. A release the plan armed is
+/// re-pointed where it waited on a deploy that never runs for this change
+/// ([`refollow`]); a pull request with none gets its deploys followed
+/// ([`release_plan::follow_steps`]). Each finished step is said on the run
+/// page in one line; a step that needs a person's approval is said once on
+/// the pull request. Safe to call again: an unchanged release is left as
+/// it is, its tick chain running.
+pub async fn follow_merge(
+    state: &WorkerState,
+    github: &GitHubClient,
+    team_id: &str,
+    installation_id: u64,
+    (owner, repo, pr): (&str, &str, u64),
+    run_id: &str,
+) {
+    let p = match github.get_pull_request(owner, repo, pr).await {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(pr, error = %e, "release: could not read the merged pull request");
+            return;
+        }
+    };
+    let merge_sha = p["merge_commit_sha"].as_str().unwrap_or("");
+    if !p["merged"].as_bool().unwrap_or(false) || merge_sha.is_empty() {
+        return;
+    }
+    let base = p["base"]["ref"].as_str().unwrap_or("");
+    let head = p["head"]["ref"].as_str().unwrap_or("");
+    let changed: Vec<String> = match github.list_pull_files(owner, repo, pr).await {
+        Ok(f) => f.into_iter().map(|(path, _)| path).collect(),
+        Err(e) => {
+            warn!(pr, error = %e, "release: could not list the merged pull request's files");
+            Vec::new()
+        }
+    };
+    let m = super::outside_work::load(github, owner, repo, merge_sha, &[], false)
+        .await
+        .release
+        .for_change(&changed);
+    let fresh = release_plan::follow_steps(&m);
+    let old = load(state, team_id, owner, repo, pr).await.ok().flatten();
+    let (steps, mut context) = match &old {
+        None if fresh.is_empty() => return,
+        None => (fresh, Vec::new()),
+        Some(o) => match refollow(&o.steps, &fresh) {
+            None => return,
+            Some(s) => (s, o.context.clone()),
+        },
+    };
+    // The deploy line names the deploys this release now waits on.
+    context.retain(|l| !l.starts_with("How it deploys:"));
+    let lines = release_plan::note_lines(&release_plan::Release::default(), &steps, &m);
+    context.splice(
+        0..0,
+        lines
+            .into_iter()
+            .filter(|l| !l.starts_with(|c: char| c.is_ascii_digit())),
+    );
+    let names: Vec<String> = steps
+        .iter()
+        .filter(|s| s.kind == Kind::Deploy && !s.status.finished())
+        .map(|s| format!("{} ({})", s.env.word(), s.how))
+        .collect();
+    info!(
+        pr,
+        run_id,
+        steps = steps.len(),
+        "release: following the merge's deploys"
+    );
+    if !run_id.is_empty() && !names.is_empty() {
+        super::add_progress_note(
+            state,
+            team_id,
+            run_id,
+            &format!("Following the merge's deploys: {}", names.join("; then ")),
+        )
+        .await;
+    }
+    arm_steps(
+        state,
+        team_id,
+        installation_id,
+        (owner, repo, pr),
+        run_id,
+        (head, base),
+        steps,
+        context,
+    )
+    .await;
+}
+
+/// The one short line said on the pull request while a release step waits
+/// for a person's approval; `None` when none waits.
+pub fn approval_line(steps: &[Step]) -> Option<String> {
+    let s = steps.iter().find(|s| s.status == Status::Approval)?;
+    let what = match (&s.trigger, s.env) {
+        (Some(On::Tag(p)), _) => format!("The production release tag (`{p}`)"),
+        (_, env) => format!("The {} step \"{}\"", env.word(), s.what),
+    };
+    Some(format!(
+        "{what} waits for a person's approval on the Agent permissions page, as the team's release \
+         settings ask. CoderHelm does the rest once it is approved."
+    ))
+}
 
 async fn load(
     state: &WorkerState,
@@ -474,6 +654,7 @@ pub async fn run(state: &WorkerState, msg: ReleaseStepsMessage) -> Result<(), Bo
     let gate = crate::agent::policy::gate(state, ctx, None).with_wait(Wait::Return);
     let store = crate::agent::policy::store(state);
     let before = rec.lines();
+    let asked_before = approval_line(&rec.steps);
     for i in 0..rec.steps.len() {
         match next(&rec.steps, i, merged) {
             Next::Wait | Next::Held(_) => {}
@@ -623,6 +804,21 @@ pub async fn run(state: &WorkerState, msg: ReleaseStepsMessage) -> Result<(), Bo
                     .await;
                 }
             }
+        }
+    }
+    // A step waiting on a person's approval is said once, in the pull
+    // request's one status comment; once decided the line is dropped.
+    let asked = approval_line(&rec.steps);
+    if asked != asked_before {
+        let say = match &asked {
+            Some(line) => common::conversation::Say::status(SLOT_RELEASE, line.clone()),
+            None => {
+                common::conversation::Say::status(SLOT_RELEASE, "The release approval was decided.")
+                    .for_nobody()
+            }
+        };
+        if let Err(e) = super::conversation::github(&github, owner, repo, pr, say).await {
+            warn!(pr, error = %e, "release: could not update the approval line");
         }
     }
     if let (Some(d), false) = (again, rec.parked) {

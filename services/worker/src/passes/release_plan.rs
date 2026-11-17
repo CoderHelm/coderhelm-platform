@@ -114,9 +114,88 @@ pub struct Deploy {
     pub name: String,
     pub file: String,
     pub on: On,
+    /// The `push` trigger's `paths` and `paths-ignore` filters (a merge
+    /// deploy only): a merge that changes none of the files they let
+    /// through never starts this workflow.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths_ignore: Vec<String>,
+}
+
+/// Whether a workflow path filter pattern matches `path`, as GitHub reads
+/// it: `*` stops at `/`, `**` crosses it, `?` is one character.
+pub fn glob_matches(pattern: &str, path: &str) -> bool {
+    let mut re = String::from("^");
+    let p: Vec<char> = pattern.chars().collect();
+    let mut i = 0;
+    while i < p.len() {
+        match p[i] {
+            '*' if p.get(i + 1) == Some(&'*') => {
+                if p.get(i + 2) == Some(&'/') {
+                    re.push_str("(?:.*/)?");
+                    i += 3;
+                } else {
+                    re.push_str(".*");
+                    i += 2;
+                }
+                continue;
+            }
+            '*' => re.push_str("[^/]*"),
+            '?' => re.push_str("[^/]"),
+            c => re.push_str(&regex::escape(&c.to_string())),
+        }
+        i += 1;
+    }
+    re.push('$');
+    Regex::new(&re).is_ok_and(|r| r.is_match(path))
+}
+
+/// Whether a list of filter patterns (a later `!pattern` takes a file back
+/// out) selects `path`.
+fn filter_selects(patterns: &[String], path: &str) -> bool {
+    let mut hit = false;
+    for p in patterns {
+        match p.strip_prefix('!') {
+            Some(neg) if glob_matches(neg, path) => hit = false,
+            None if glob_matches(p, path) => hit = true,
+            _ => {}
+        }
+    }
+    hit
 }
 
 impl Deploy {
+    /// Whether a merge changing `changed` starts this deploy: always for a
+    /// tag or a dispatch (GitHub reads no path filter there), and for a
+    /// merge when its path filters let one of the files through. `changed`
+    /// empty means the files aren't known: it is taken to run.
+    pub fn runs_for(&self, changed: &[String]) -> bool {
+        if !matches!(self.on, On::Merge(_)) || changed.is_empty() {
+            return true;
+        }
+        let paths_ok =
+            self.paths.is_empty() || changed.iter().any(|f| filter_selects(&self.paths, f));
+        let ignore_ok = self.paths_ignore.is_empty()
+            || changed
+                .iter()
+                .any(|f| !filter_selects(&self.paths_ignore, f));
+        paths_ok && ignore_ok
+    }
+
+    /// Whether only some merges start it (a path filter).
+    pub fn filtered(&self) -> bool {
+        matches!(self.on, On::Merge(_)) && !(self.paths.is_empty() && self.paths_ignore.is_empty())
+    }
+
+    /// Whether the workflow is named for its environment (`Deploy
+    /// Production`, `deploy-staging.yml`), not one service's deploy that has
+    /// a job in it.
+    fn named_for_env(&self) -> bool {
+        let base = self.file.rsplit('/').next().unwrap_or(&self.file);
+        Env::of(&self.name) == Some(self.env) || Env::of(base) == Some(self.env)
+    }
+
     pub fn line(&self) -> String {
         format!(
             "{} deploys {} (`{}`, {})",
@@ -176,12 +255,45 @@ pub struct Mechanics {
 }
 
 impl Mechanics {
-    /// The deploy of `env`: one started by merge, else tag, else dispatch.
+    /// The deploy of `env`. A workflow every merge starts goes before one a
+    /// path filter limits to some files (another service's deploy with a
+    /// job for this environment); then one named for the environment
+    /// (`Deploy Production`); then started by merge, else tag, else
+    /// dispatch; then one whose name says it deploys.
     pub fn deploy(&self, env: Env) -> Option<&Deploy> {
-        let of = |f: fn(&On) -> bool| self.deploys.iter().find(|d| d.env == env && f(&d.on));
-        of(|o| matches!(o, On::Merge(_)))
-            .or_else(|| of(|o| matches!(o, On::Tag(_))))
-            .or_else(|| of(|o| matches!(o, On::Dispatch)))
+        let rank = |d: &Deploy| {
+            let on = match d.on {
+                On::Merge(_) => 0,
+                On::Tag(_) => 1,
+                On::Dispatch => 2,
+            };
+            (
+                d.filtered(),
+                !d.named_for_env(),
+                on,
+                !(is_deploy_text(&d.name) || is_deploy_text(&d.file)),
+            )
+        };
+        self.deploys
+            .iter()
+            .filter(|d| d.env == env)
+            .min_by_key(|d| rank(d))
+    }
+
+    /// How the repository releases this change (`changed`, the files the
+    /// pull request changes): a merge deploy whose path filters let none of
+    /// them through never runs for it, so it is not this change's deploy. A
+    /// filter that does let them through then counts as every merge's.
+    pub fn for_change(&self, changed: &[String]) -> Mechanics {
+        let mut m = self.clone();
+        m.deploys.retain(|d| d.runs_for(changed));
+        if !changed.is_empty() {
+            for d in m.deploys.iter_mut() {
+                d.paths.clear();
+                d.paths_ignore.clear();
+            }
+        }
+        m
     }
 
     pub fn source(&self, env: Env) -> Option<&ContentSource> {
@@ -377,6 +489,14 @@ pub fn workflow_deploys(path: &str, text: &str) -> Vec<Deploy> {
     if ons.is_empty() {
         return Vec::new();
     }
+    // The push trigger's path filters: GitHub reads them for branch pushes
+    // only, never for a tag.
+    let push = doc
+        .get("on")
+        .or_else(|| doc.get(serde_yaml::Value::Bool(true)))
+        .and_then(|o| o.get("push"));
+    let push_paths = yaml_list(push.and_then(|p| p.get("paths")));
+    let push_ignore = yaml_list(push.and_then(|p| p.get("paths-ignore")));
     let file_env = Env::of(&name).or_else(|| Env::of(path.rsplit('/').next().unwrap_or(path)));
     let workflow_deploys = is_deploy_text(&name) || is_deploy_text(path);
     let mut out: Vec<Deploy> = Vec::new();
@@ -401,11 +521,22 @@ pub fn workflow_deploys(path: &str, text: &str) -> Vec<Deploy> {
         let cond = job.get("if").map(yaml_str).unwrap_or_default();
         for on in &ons {
             if job_allows(&cond, on) {
+                let merge = matches!(on, On::Merge(_));
                 let d = Deploy {
                     env,
                     name: name.clone(),
                     file: path.to_string(),
                     on: on.clone(),
+                    paths: if merge {
+                        push_paths.clone()
+                    } else {
+                        Vec::new()
+                    },
+                    paths_ignore: if merge {
+                        push_ignore.clone()
+                    } else {
+                        Vec::new()
+                    },
                 };
                 if !out.contains(&d) {
                     out.push(d);
@@ -626,9 +757,45 @@ pub fn checks_of(c: &super::fix_location::OutsideChange) -> Vec<(Vec<String>, Ve
         .collect()
 }
 
-/// A release with no migration: production's deploy (the next tag under
-/// one approval, a dispatch, or the merge), the cache purge when the
-/// repository has a purge workflow, then the page checks after them.
+/// The deploys a merge goes through, in order: staging's when a workflow
+/// deploys staging, then production's (the next tag under one approval, a
+/// dispatch, or the merge), which waits for staging's to succeed.
+pub fn deploy_steps(m: &Mechanics) -> Vec<Step> {
+    let migration = Release {
+        migrations: vec![PlannedMigration {
+            file: String::new(),
+            phase: "expand".to_string(),
+        }],
+        ..Default::default()
+    };
+    // The deploy steps exactly as a migrating release has them.
+    let mut out: Vec<Step> = steps(&migration, m)
+        .into_iter()
+        .filter(|s| {
+            s.kind == Kind::Deploy && (s.env == Env::Production || m.deploy(s.env).is_some())
+        })
+        .collect();
+    let mut prev: Option<String> = None;
+    for s in out.iter_mut() {
+        s.after = prev.clone().into_iter().collect();
+        prev = Some(s.id.clone());
+    }
+    out
+}
+
+/// The release a merge is followed through when the plan armed none: the
+/// deploys that run for it, and only those a workflow does (a repository
+/// that deploys outside its workflows has nothing to follow here).
+pub fn follow_steps(m: &Mechanics) -> Vec<Step> {
+    deploy_steps(m)
+        .into_iter()
+        .filter(|s| s.status != Status::NoAccess)
+        .collect()
+}
+
+/// A release with no migration: the deploys ([`deploy_steps`]), the cache
+/// purge when the repository has a purge workflow, then the page checks
+/// after them.
 pub fn release_only_steps(m: &Mechanics, checks: &[(Vec<String>, Vec<String>)]) -> Vec<Step> {
     let migration = Release {
         migrations: vec![PlannedMigration {
@@ -637,21 +804,17 @@ pub fn release_only_steps(m: &Mechanics, checks: &[(Vec<String>, Vec<String>)]) 
         }],
         ..Default::default()
     };
-    // The deploy and purge steps exactly as a migrating release has them.
-    let mut out: Vec<Step> = steps(&migration, m)
+    let mut out = deploy_steps(m);
+    let prod = out
+        .iter()
+        .find(|s| s.kind == Kind::Deploy && s.env == Env::Production)
+        .map(|s| s.id.clone());
+    if let Some(mut p) = steps(&migration, m)
         .into_iter()
-        .filter(|s| (s.kind == Kind::Deploy && s.env == Env::Production) || s.kind == Kind::Purge)
-        .collect();
-    for s in out.iter_mut() {
-        s.after.clear();
-    }
-    if let (Some(d), Some(p)) = (
-        out.iter()
-            .find(|s| s.kind == Kind::Deploy)
-            .map(|s| s.id.clone()),
-        out.iter_mut().find(|s| s.kind == Kind::Purge),
-    ) {
-        p.after = vec![d];
+        .find(|s| s.kind == Kind::Purge)
+    {
+        p.after = prod.into_iter().collect();
+        out.push(p);
     }
     let last = out.last().map(|s| s.id.clone());
     for (i, (urls, find)) in checks.iter().enumerate() {
@@ -2186,6 +2349,43 @@ jobs:
         assert!(m
             .prompt_section()
             .contains("Production deploys on a `v*` tag"));
+    }
+
+    #[test]
+    fn path_filters_read_as_github_reads_them() {
+        assert!(glob_matches("services/api/**", "services/api/src/a.ts"));
+        assert!(glob_matches("**/*.md", "README.md"));
+        assert!(glob_matches("**/*.md", "docs/a/b.md"));
+        assert!(glob_matches("src/*.ts", "src/a.ts"));
+        assert!(!glob_matches("src/*.ts", "src/x/a.ts"));
+        assert!(!glob_matches("services/api/**", "apps/web/page.tsx"));
+        let d = |paths: &[&str], ignore: &[&str]| Deploy {
+            env: Env::Production,
+            name: "Deploy".into(),
+            file: ".github/workflows/deploy.yml".into(),
+            on: On::Merge("main".into()),
+            paths: paths.iter().map(|p| p.to_string()).collect(),
+            paths_ignore: ignore.iter().map(|p| p.to_string()).collect(),
+        };
+        let web = ["apps/web/page.tsx".to_string()];
+        let docs = ["docs/a.md".to_string()];
+        assert!(!d(&["services/api/**"], &[]).runs_for(&web));
+        assert!(d(&["apps/**", "!apps/web/**.md"], &[]).runs_for(&web));
+        assert!(!d(&["apps/**", "!apps/web/**"], &[]).runs_for(&web));
+        assert!(!d(&[], &["docs/**"]).runs_for(&docs));
+        assert!(d(&[], &["docs/**"]).runs_for(&web));
+        // Files unknown: taken to run. A tag never reads a path filter.
+        assert!(d(&["services/api/**"], &[]).runs_for(&[]));
+        let mut tag = d(&["services/api/**"], &[]);
+        tag.on = On::Tag("v*".into());
+        assert!(tag.runs_for(&web));
+        // Read from the workflow: the push trigger's filters, on merge only.
+        let text = "name: Deploy api\non:\n  push:\n    branches: [main]\n    tags: ['v*']\n    paths: ['services/api/**']\njobs:\n  production:\n    environment: production\n    runs-on: ubuntu-latest\n    steps:\n      - run: ./deploy\n";
+        let ds = workflow_deploys(".github/workflows/api.yml", text);
+        let merge = ds.iter().find(|d| matches!(d.on, On::Merge(_))).unwrap();
+        assert_eq!(merge.paths, vec!["services/api/**".to_string()]);
+        let tagged = ds.iter().find(|d| matches!(d.on, On::Tag(_))).unwrap();
+        assert!(tagged.paths.is_empty());
     }
 
     #[test]

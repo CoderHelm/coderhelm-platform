@@ -156,6 +156,8 @@ fn the_repo() -> Abilities {
                 name: "Deploy Production".into(),
                 file: ".github/workflows/deploy-production.yml".into(),
                 on: On::Tag("v*".into()),
+                paths: Vec::new(),
+                paths_ignore: Vec::new(),
             }],
             purge: Some(release_plan::Runner {
                 name: "Purge cache".into(),
