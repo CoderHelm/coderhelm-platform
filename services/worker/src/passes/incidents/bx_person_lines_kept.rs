@@ -13,11 +13,11 @@
 //! since CoderHelm's last commit. A part that puts back a line a person
 //! removed, or takes out one they added, is not committed; the rest is.
 //! The pull request gets one note, edited in place, that names what was
-//! kept and asks. A round a person asked for is their answer. The revert
-//! after red checks puts back only CoderHelm's own changes.
+//! kept and asks. A round a person asked for is their answer. Red checks
+//! never roll the branch back to an older head, so no revert writes over
+//! a person's lines either.
 
 use crate::clients::github::{person_commits, FileOp};
-use crate::passes::supervisor::{own_revert_paths, AfterGreen};
 use common::person_lines::{guard, note, refusal, PersonEdit, Undo, NOTE_MARKER};
 use serde_json::json;
 
@@ -125,32 +125,11 @@ fn the_persons_commit_counts_after_coderhelm_commits_on_top_of_it() {
 }
 
 #[test]
-fn the_revert_after_red_checks_puts_back_only_coderhelms_own_files() {
-    let changed: Vec<String> = [SPEC, "src/blocks/portal.tsx", "src/lib/base-only.ts"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-    let after = vec![
-        AfterGreen {
-            own: false,
-            merge: false,
-            files: vec![SPEC.into()],
-        },
-        AfterGreen {
-            own: true,
-            merge: false,
-            files: vec!["src/blocks/portal.tsx".into()],
-        },
-        AfterGreen {
-            own: true,
-            merge: true,
-            files: vec!["src/lib/base-only.ts".into()],
-        },
-    ];
-    assert_eq!(
-        own_revert_paths(&changed, &after),
-        vec!["src/blocks/portal.tsx".to_string()]
-    );
+fn red_checks_never_roll_the_branch_back_over_a_persons_files() {
+    let resume = include_str!("../resume.rs");
+    let out = super::fixture::fn_src(resume, "async fn take_out_failing_bumps(");
+    assert!(!out.contains("list_pr_commits(") && !out.contains("own_revert_paths("));
+    assert!(!include_str!("../supervisor.rs").contains("pub fn own_revert_paths("));
 }
 
 /// Every commit path goes through the hold, and a person's round lifts it.

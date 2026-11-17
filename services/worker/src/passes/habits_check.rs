@@ -1170,6 +1170,11 @@ async fn check_and_fix(
         .await;
         facts.e2e_missing = e2e_missing(w, &paths).await;
         facts.wider = wider(w, &diff, &evidence.notes).await;
+        // Fixture ids invented while the run looked up the real ones.
+        let looked: Vec<String> = evidence.lookups.iter().map(|l| l.line.clone()).collect();
+        facts
+            .wider
+            .extend(super::minimal_change::made_up_ids(&diff, &looked));
         // A page whose state a test branch reads is probed again while
         // there is time: an arm that couldn't run before is re-checked.
         facts.live = super::live_guard::facts_for(w, &diff, &evidence.notes, !short).await;

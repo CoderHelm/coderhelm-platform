@@ -76,7 +76,7 @@ fn a_security_fix_with_red_ci_goes_ready_with_the_failing_checks_as_its_note() {
         .find("finish_security_red(")
         .expect("the security ending");
     // Every set that can come out comes out first; the ending comes after.
-    assert!(hand_off.find("revert_to_green(").unwrap() < ending);
+    assert!(hand_off.find("take_out_failing_bumps(").unwrap() < ending);
     assert!(ending < hand_off.find("wait_for_review(").unwrap());
     let rounds = fn_src(resume, "\npub(crate) async fn end_red_ci_rounds(");
     assert!(rounds.find("finish_security_red(").unwrap() < rounds.find("fail_run(").unwrap());

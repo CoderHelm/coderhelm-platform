@@ -1352,6 +1352,7 @@ mod pr_risk;
 pub mod pr_watch;
 pub mod preview;
 mod proof;
+mod push_checks;
 pub mod quarantine;
 pub mod quarantine_work;
 /// Whether a finished run's pull request leaves draft, decided in one place.
