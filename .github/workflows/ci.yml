@@ -85,6 +85,10 @@ jobs:
           cache-on-failure: true
       - if: steps.changes.outputs.run == 'true'
         run: cargo fmt --check --all
+      # The incident cases are compiled through a generated include
+      # (worker/build.rs), which cargo fmt doesn't follow: checked by name.
+      - if: steps.changes.outputs.run == 'true'
+        run: rustfmt --check --edition 2021 worker/src/passes/incidents/*.rs
       # --all-targets: tests are linted too (a test-only lint once failed
       # only on a local --all-targets run).
       - if: steps.changes.outputs.run == 'true'

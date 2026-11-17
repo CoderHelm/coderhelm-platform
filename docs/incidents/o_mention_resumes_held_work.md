@@ -1,0 +1,5 @@
+# o. `o_mention_resumes_held_work`
+
+**What happened:** A requester asked for five changes on a PR CoderHelm opened, and for no PR comments. The feedback round did all five, then the sandbox test step broke on CoderHelm's own setup, so the round was held and its WIP branch kept, with nothing about it on the run record. The next day the owner commented a bare `@coderhelm` to get the work landed. A bare mention was the re-review command, so CoderHelm posted a fresh verdict and nothing landed.
+
+**The guarantee:** Work a round left held or unfinished on CoderHelm's own PR comes first. A held round stays on the run record (its WIP branch, where it started, what it was asked) until it lands, and a WIP branch ahead of the PR counts too. A bare mention resumes that round: the checks run again on the WIP with the current setup, and the work lands, or is fixed and then lands. Words are read by the model, told about the held work: "do it", "redo", "continue" and fix requests run a fix round on the held WIP, and only an ask for a review is a review. The person is told what CoderHelm is doing, on the run and the ticket when the requester asked for no PR comments.
