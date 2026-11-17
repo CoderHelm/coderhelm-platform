@@ -2809,6 +2809,17 @@ impl<'a> WriteToolExecutor<'a> {
                         "Cannot modify {path}: CI/CD workflow files are protected."
                     )));
                 }
+                // A round on the pull request never restores a planned file,
+                // and restores others only to the base (`ScopeGuard::restore`).
+                let asked_ref = input
+                    .get("from_ref")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or(&self.base_branch);
+                if let Err(refusal) = self.scope_guard.restore(path, asked_ref, &self.base_branch) {
+                    note(LogOutcome::soft_fail(format!("not restored: {path}")));
+                    return Ok(json!(refusal));
+                }
                 // A file outside the round's files is identical to base in
                 // this PR — a "restore" of it is a no-op commit or churn.
                 if let Err(refusal) = self

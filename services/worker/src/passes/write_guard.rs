@@ -270,6 +270,13 @@ impl Scope {
         s
     }
 
+    /// Whether a task of the plan names `path` (or its folder), whatever
+    /// else names it.
+    pub fn in_plan(&self, path: &str) -> bool {
+        let p = normalize(path);
+        self.plan.contains(p) || self.plan_dirs.iter().any(|d| p.starts_with(d.as_str()))
+    }
+
     /// Whether the plan names any file or folder of this repository.
     pub fn has_plan(&self) -> bool {
         !self.plan.is_empty() || !self.plan_dirs.is_empty()
@@ -656,6 +663,40 @@ impl ScopeGuard {
             scope: Some((round, scope)),
             ..Self::unscoped()
         }
+    }
+
+    /// Whether this round may `restore_file` `path` from `from_ref`. In a
+    /// round on the pull request (planned work, a proof gap, a fix of any
+    /// kind), a file the plan changes is never restored: the round edits
+    /// what is on the branch. Audited runs restored such a file and wrote
+    /// it again from scratch, up to fourteen times in one run. A file
+    /// outside the plan is restored only to the pull request's base, never
+    /// from an older commit. The build of the plan and rounds with no
+    /// boundary are not held here.
+    pub fn restore(&self, path: &str, from_ref: &str, base: &str) -> Result<(), String> {
+        let Some((round, scope)) = &self.scope else {
+            return Ok(());
+        };
+        if *round == RoundFor::PlanTasks {
+            return Ok(());
+        }
+        if scope.in_plan(path) {
+            return Err(format!(
+                "Not restored: `{}` is a file the plan changes. This round ({}) edits what is on \
+                 the branch: read the file and change only what the round is for, with edit_file. \
+                 Never restore a planned file and rebuild it.",
+                normalize(path),
+                round.what()
+            ));
+        }
+        if from_ref.trim() != base.trim() {
+            return Err(format!(
+                "Not restored: a file outside the plan is put back only to the pull request's \
+                 base (`{base}`), never from `{}`. Leave from_ref out.",
+                from_ref.trim()
+            ));
+        }
+        Ok(())
     }
 
     /// Whether the round has a file boundary.

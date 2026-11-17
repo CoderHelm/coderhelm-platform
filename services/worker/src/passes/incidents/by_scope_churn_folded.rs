@@ -180,3 +180,44 @@ fn churn_is_folded_after_every_round_and_before_ready() {
     assert!(!passes.contains("write_guard::RoundFor::Build,"));
     assert!(passes.matches("write_guard::RoundFor::PlanTasks,").count() >= 4);
 }
+
+/// Audited runs: a planned-work round restored the shared file the plan
+/// changes and rebuilt it four times; a web run restored fourteen times and
+/// edited its page object ten. In planned-work, proof and fix rounds a
+/// planned file is never restored; any other file only to the base.
+#[test]
+fn a_round_on_the_pull_request_never_restores_a_planned_file() {
+    let pr = s(PLANNED);
+    for round in [
+        RoundFor::PlannedWork,
+        RoundFor::ProofGap,
+        RoundFor::OwnReview,
+        RoundFor::CiFix,
+        RoundFor::TestFix,
+        RoundFor::Habits,
+    ] {
+        let g = ScopeGuard::for_round(round, &pr, Some(&plan()), "acme/site", "");
+        let page = PLANNED[2];
+        let no = g.restore(page, "main", "main").unwrap_err();
+        assert!(no.contains("a file the plan changes"), "{round:?}: {no}");
+        // Not from an older commit either.
+        assert!(g.restore(page, "3e4679a", "main").is_err(), "{round:?}");
+        // A file outside the plan goes back to the base, and only there.
+        assert!(
+            g.restore(BASE_FILES[0], "main", "main").is_ok(),
+            "{round:?}"
+        );
+        let old = g.restore(BASE_FILES[0], "9a32d16", "main").unwrap_err();
+        assert!(old.contains("only to the pull request's base"), "{old}");
+    }
+    // The build of the plan and a person's ask are not held by it.
+    let build = ScopeGuard::for_round(RoundFor::PlanTasks, &pr, Some(&plan()), "acme/site", "");
+    assert!(build.restore(PLANNED[2], "main", "main").is_ok());
+    let person = ScopeGuard::for_round(RoundFor::PersonAsk, &pr, Some(&plan()), "acme/site", "");
+    assert!(person.restore(PLANNED[2], "main", "main").is_ok());
+    // Both restore tools ask it before anything else is done.
+    assert!(
+        include_str!("../implement.rs").contains(".restore(path, asked_ref, &self.base_branch)")
+    );
+    assert!(include_str!("../feedback.rs").contains(".restore(path, asked_ref, self.base_branch)"));
+}
