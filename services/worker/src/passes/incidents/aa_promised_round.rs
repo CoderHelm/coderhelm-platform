@@ -89,13 +89,19 @@ fn says_coderhelm_works(text: &str) -> bool {
 }
 
 #[test]
-fn with_no_round_left_the_hold_is_a_persons_and_promises_nothing() {
+fn with_no_round_left_the_findings_are_coderhelms_note_and_promise_nothing() {
     // The run's budget as its record shows it: no round may be queued.
     let budget = resume::own_round_budget(&record("needs_input", 8), 0);
     let why = own_review::round_left(&budget, HEAD, 8, 10).unwrap_err();
     assert!(why.contains("fix budget is spent"), "{why}");
 
-    let d = ready::decide(&facts(false));
+    // CoderHelm's limit: its note on a ready pull request, never a
+    // person's hold (incident bv).
+    assert!(
+        matches!(ready::decide(&facts(false)), Decision::Ready { open }
+        if open.iter().any(|o| o.starts_with(ready::NOTE_PREFIX)))
+    );
+    let d = ready::found(&facts(false));
     let Decision::Held { reasons } = &d else {
         panic!("{d:?}")
     };
@@ -203,13 +209,11 @@ fn the_wait_for_a_round_is_bounded_like_every_wait() {
     f.now = Some(t("2026-11-10T04:31:00Z"));
     assert!(matches!(ready::decide(&f), Decision::Wait { .. }));
     f.now = Some(t("2026-11-10T05:32:00Z"));
-    let d = ready::decide(&f);
-    let Decision::Held { reasons } = &d else {
-        panic!("{d:?}")
-    };
-    assert!(reasons[0]
-        .what
-        .contains("hasn't changed in 2 hours on this head"));
+    // Stalled: CoderHelm's own next action, never a person's hold.
+    assert!(matches!(
+        ready::decide(&f),
+        Decision::Retry { attempt: 1, .. }
+    ));
 }
 
 #[test]
