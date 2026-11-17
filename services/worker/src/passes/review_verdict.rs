@@ -853,17 +853,25 @@ mod tests {
                     .unwrap()
                     .to_string_lossy()
                     .replace('\\', "/");
-                // The client defines the calls; this module is their one user.
+                // The client defines the calls; this module is their one user,
+                // and the conversation layer, which collapses CoderHelm's own
+                // earlier reviews after this module posted a new one
+                // (`conversation::supersede_reviews`), never posts one.
                 if rel == "clients/github.rs" || rel == "passes/review_verdict.rs" {
                     continue;
                 }
                 let text = std::fs::read_to_string(&path).unwrap();
+                let superseding = rel == "passes/conversation.rs";
                 for call in [
                     ".create_pr_review(",
                     ".create_pr_review_inline(",
                     ".dismiss_review(",
                     ".update_pr_review(",
+                    ".update_review_body(",
                 ] {
+                    if superseding && matches!(call, ".dismiss_review(" | ".update_review_body(") {
+                        continue;
+                    }
                     if text.contains(call) {
                         offenders.push(format!("{rel}: {call}"));
                     }
