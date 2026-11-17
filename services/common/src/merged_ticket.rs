@@ -9,21 +9,25 @@
 //! A merged pull request is read the way an open one is
 //! (`stop_rules::existing_work`): before a run on a person's ticket (a Jira
 //! key or a GitHub issue) builds anything, after its triage and the
-//! ticket's own diagnosis, the ticket's newest merged pull request
-//! ([`blocking`]: CoderHelm's or anyone's, into any base branch, an
-//! integration branch included, never a revert) is compared with the ticket
-//! by the same verdict ([`check`]):
+//! ticket's own diagnosis, the ticket's merged pull requests since its
+//! last revert ([`blocking`]: CoderHelm's or anyone's, into any base
+//! branch, an integration branch included, never a revert; the newest
+//! [`MAX_JUDGED`]) are compared with the ticket together, by the same
+//! verdict ([`check`]):
 //!
-//! - it did all of what the ticket asks: the run ends covered by it
-//!   (`covered_by_pr`), linked to it, with [`covered_note`]; nothing is
-//!   built;
-//! - it did part of it: the run goes on and builds only what is missing;
-//!   the planner and the pull request description are told what merged
-//!   ([`partial_note`]), and the run's pull request adds to it;
-//! - it did something else (prep work, another change on the same files):
+//! - together they did all of what the ticket asks: the run ends covered
+//!   by the newest (`covered_by_pr`), linked to it, with [`covered_note`];
+//!   nothing is built;
+//! - they did part of it: the run goes on and builds only what is missing;
+//!   the planner, the coder and the pull request description are told what
+//!   merged ([`partial_note`], kept on the run's message as
+//!   `merged_note` so every step has it, [`with_note`]), and the run's pull
+//!   request adds to it;
+//! - they did something else (prep work, another change on the same files):
 //!   the run takes its normal path;
-//! - the verdict couldn't be read: the only case that waits on a person
-//!   ([`unsure_note`], [`STOP_KIND`] on the record).
+//! - the verdict couldn't be read, after one more try ([`ask_again`]): the
+//!   only case that waits on a person ([`unsure_note`], [`STOP_KIND`] on
+//!   the record).
 //!
 //! The ticket asking for a separate change skips the check, as it does for
 //! open pull requests. A ticket edited after its pull request merged reaches
@@ -119,34 +123,57 @@ fn started_ms(run_id: &str) -> Option<i64> {
         .and_then(|u| i64::try_from(u.timestamp_ms()).ok())
 }
 
-/// The merged pull request a new run is checked against, or None.
+/// The most merged pull requests one verdict reads.
+pub const MAX_JUDGED: usize = 3;
+
+/// The merged pull requests a new run is checked against, newest first
+/// (empty when nothing is checked): every one since the ticket's newest
+/// revert, at most [`MAX_JUDGED`].
 ///
 /// `allowed_runs`: ids of the ticket's earlier runs a person asked for
-/// after the merge. Only the newest merge counts: a run allowed after it
-/// skips the check; one allowed before it doesn't. A merge with no known
-/// time is taken to be before any allowed run. When the newest merge is a
-/// revert ([`MergedPr::revert`]), the ticket's work was undone and nothing
-/// is checked; a pull request that merges after the revert is checked
-/// again.
-pub fn blocking<'a>(merged: &'a [MergedPr], allowed_runs: &[&str]) -> Option<&'a MergedPr> {
-    let newest = merged.iter().max_by(|a, b| {
-        a.merged_ms()
+/// after the merge. The newest merge decides: a run allowed after it skips
+/// the check; one allowed before it doesn't. A merge with no known time is
+/// taken to be before any allowed run. When the newest merge is a revert
+/// ([`MergedPr::revert`]), the ticket's work was undone and nothing is
+/// checked; merges at or before a revert are never checked, and a pull
+/// request that merges after it is.
+pub fn blocking<'a>(merged: &'a [MergedPr], allowed_runs: &[&str]) -> Vec<&'a MergedPr> {
+    let mut newest_first: Vec<&MergedPr> = merged.iter().collect();
+    newest_first.sort_by(|a, b| {
+        b.merged_ms()
             .unwrap_or(i64::MIN)
-            .cmp(&b.merged_ms().unwrap_or(i64::MIN))
-            .then(a.number.cmp(&b.number))
-    })?;
-    if newest.revert {
-        return None;
-    }
+            .cmp(&a.merged_ms().unwrap_or(i64::MIN))
+            .then(b.number.cmp(&a.number))
+    });
+    let Some(newest) = newest_first.first() else {
+        return Vec::new();
+    };
     let at = newest.merged_ms().unwrap_or(i64::MIN);
     let allowed_since = allowed_runs
         .iter()
         .filter_map(|id| started_ms(id))
         .any(|started| started >= at);
-    (!allowed_since).then_some(newest)
+    if newest.revert || allowed_since {
+        return Vec::new();
+    }
+    newest_first
+        .into_iter()
+        .take_while(|p| !p.revert)
+        .take(MAX_JUDGED)
+        .collect()
 }
 
-/// What the check found about the merged pull request ([`check`]).
+/// How many times the verdict is asked before a person is: a model or
+/// GitHub error is tried once more.
+const VERDICT_TRIES: usize = 2;
+
+/// Whether the verdict is asked again after `tries` attempts that couldn't
+/// be read.
+pub fn ask_again(tries: usize) -> bool {
+    tries < VERDICT_TRIES
+}
+
+/// What the check found about the merged pull requests ([`check`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Check {
     /// It did all of what the ticket asks: the run ends covered by it.
@@ -162,8 +189,8 @@ pub enum Check {
     Unsure,
 }
 
-/// The check, from the coverage verdict on the merged pull request
-/// (`None` when it couldn't be read).
+/// The check, from the coverage verdict on the merged pull requests
+/// together (`None` when it couldn't be read).
 pub fn check(verdict: Option<&Verdict>) -> Check {
     match verdict {
         None => Check::Unsure,
@@ -214,15 +241,31 @@ fn link(pr: &MergedPr) -> String {
     format!("[{}]({})", pr.subject(), pr.url())
 }
 
-/// What the run page and the ticket say when the merged pull request did
-/// all of what the ticket asks.
-pub fn covered_note(source: &TicketSource, ticket: &str, pr: &MergedPr, reason: &str) -> String {
+/// ", after acme/app#12 and acme/app#9" for the earlier merges judged with
+/// the newest, linked or by name.
+fn after(earlier: &[MergedPr], linked: bool) -> String {
+    let names: Vec<String> = earlier
+        .iter()
+        .map(|p| if linked { link(p) } else { p.subject() })
+        .collect();
+    match names.as_slice() {
+        [] => String::new(),
+        [one] => format!(", after {one}"),
+        [rest @ .., last] => format!(", after {} and {last}", rest.join(", ")),
+    }
+}
+
+/// What the run page and the ticket say when the merged pull requests
+/// (`prs`, newest first, never empty) did all of what the ticket asks.
+pub fn covered_note(source: &TicketSource, ticket: &str, prs: &[MergedPr], reason: &str) -> String {
+    let (pr, earlier) = prs.split_first().expect("a merged pull request");
     let why = reason.trim().trim_end_matches('.');
     format!(
-        "{ticket}'s work already merged in {}{}{}. CoderHelm didn't build a second change.\n\n\
+        "{ticket}'s work already merged in {}{}{}{}. CoderHelm didn't build a second change.\n\n\
          To run the ticket again anyway, {}.",
         link(pr),
         where_when(pr),
+        after(earlier, true),
         if why.is_empty() {
             String::new()
         } else {
@@ -233,39 +276,64 @@ pub fn covered_note(source: &TicketSource, ticket: &str, pr: &MergedPr, reason: 
 }
 
 /// What the run page and the ticket say when the verdict on the merged
-/// pull request couldn't be read: the one case that waits on a person.
-pub fn unsure_note(source: &TicketSource, ticket: &str, pr: &MergedPr) -> String {
+/// pull requests (`prs`, newest first, never empty) couldn't be read: the
+/// one case that waits on a person.
+pub fn unsure_note(source: &TicketSource, ticket: &str, prs: &[MergedPr]) -> String {
+    let (pr, earlier) = prs.split_first().expect("a merged pull request");
     format!(
-        "{} merged{} for {ticket}, and CoderHelm couldn't tell whether it already does what the \
-         ticket asks, so it didn't start a second change.\n\n\
+        "{} merged{}{} for {ticket}, and CoderHelm couldn't tell whether {} already does what \
+         the ticket asks, so it didn't start a second change.\n\n\
          To run the ticket anyway, {}.",
         link(pr),
         where_when(pr),
+        after(earlier, true),
+        if earlier.is_empty() {
+            "it"
+        } else {
+            "that work"
+        },
         how(source),
     )
 }
 
 /// The section the planner, the coder and the pull request description get
-/// when the merged pull request did part of the ticket.
-pub fn partial_note(pr: &MergedPr, reason: &str, missing: &[String]) -> String {
+/// when the merged pull requests (`prs`, newest first, never empty) did
+/// part of the ticket.
+pub fn partial_note(prs: &[MergedPr], reason: &str, missing: &[String]) -> String {
+    let (pr, earlier) = prs.split_first().expect("a merged pull request");
     let why = reason.trim().trim_end_matches('.');
     let mut out = format!(
-        "## Already merged for this ticket\n\n{} merged{}{}. Build only what it didn't do; \
-         don't redo or revert its work. The pull request description says this change adds to \
+        "## Already merged for this ticket\n\n{} merged{}{}{}. Build only what {} didn't do; \
+         don't redo or revert {} work. The pull request description says this change adds to \
          {}.\n\nStill to do:\n",
         pr.subject(),
         where_when(pr),
-        if why.is_empty() {
-            String::new()
-        } else {
-            format!(" and already does part of this ticket: {why}")
+        after(earlier, false),
+        match (why.is_empty(), earlier.is_empty()) {
+            (true, _) => String::new(),
+            (false, true) => format!(" and already does part of this ticket: {why}"),
+            (false, false) => format!(", and together they already do part of this ticket: {why}"),
         },
+        if earlier.is_empty() { "it" } else { "they" },
+        if earlier.is_empty() { "its" } else { "their" },
         pr.subject(),
     );
     for m in missing {
         out.push_str(&format!("- {}\n", m.trim()));
     }
     out
+}
+
+/// The team's `instructions` with the run's section on what already merged
+/// (`TicketMessage::merged_note`, from [`partial_note`]) after them, when it
+/// has one: applied each time the instructions are loaded, so every step,
+/// repository and agent of the run has it.
+pub fn with_note(instructions: &str, note: Option<&str>) -> String {
+    match note.map(str::trim).filter(|n| !n.is_empty()) {
+        None => instructions.to_string(),
+        Some(n) if instructions.trim().is_empty() => n.to_string(),
+        Some(n) => format!("{}\n\n{n}", instructions.trim_end()),
+    }
 }
 
 /// What the run's wait asks for.
@@ -317,9 +385,9 @@ mod tests {
     #[test]
     fn a_merged_pull_request_stops_the_run() {
         let prs = [merged(12, "2026-11-02T10:00:00Z")];
-        assert_eq!(blocking(&prs, &[]), Some(&prs[0]));
+        assert_eq!(blocking(&prs, &[]), vec![&prs[0]]);
         // Nothing merged: nothing stops it.
-        assert_eq!(blocking(&[], &[]), None);
+        assert!(blocking(&[], &[]).is_empty());
     }
 
     #[test]
@@ -328,12 +396,12 @@ mod tests {
         // An earlier run a person asked for after the merge: its retries
         // and later runs go on.
         let after = run_at("2026-11-03T09:00:00Z");
-        assert_eq!(blocking(&prs, &[after.as_str()]), None);
+        assert!(blocking(&prs, &[after.as_str()]).is_empty());
         // One asked for before the merge doesn't count.
         let before = run_at("2026-11-01T09:00:00Z");
-        assert_eq!(blocking(&prs, &[before.as_str()]), Some(&prs[0]));
+        assert_eq!(blocking(&prs, &[before.as_str()]), vec![&prs[0]]);
         // Not a run id: ignored.
-        assert_eq!(blocking(&prs, &["nope"]), Some(&prs[0]));
+        assert_eq!(blocking(&prs, &["nope"]), vec![&prs[0]]);
     }
 
     #[test]
@@ -343,20 +411,60 @@ mod tests {
             merged(30, "2026-11-10T10:00:00Z"),
         ];
         let between = run_at("2026-11-05T09:00:00Z");
-        assert_eq!(
-            blocking(&prs, &[between.as_str()]).map(|p| p.number),
-            Some(30)
-        );
+        let numbers = |b: Vec<&MergedPr>| b.iter().map(|p| p.number).collect::<Vec<_>>();
+        // The newer merge stops it, judged with the one before it.
+        assert_eq!(numbers(blocking(&prs, &[between.as_str()])), vec![30, 12]);
         let later = run_at("2026-11-11T09:00:00Z");
-        assert_eq!(blocking(&prs, &[later.as_str()]), None);
+        assert!(blocking(&prs, &[later.as_str()]).is_empty());
+    }
+
+    /// The fix (#12) merged, then a prep or follow-up pull request naming
+    /// the ticket (#30): both are judged, newest first, so the fix isn't
+    /// built again because the newest one alone doesn't do the ticket.
+    #[test]
+    fn every_merge_since_the_last_revert_is_judged() {
+        let prs = [
+            merged(30, "2026-11-10T10:00:00Z"),
+            merged(12, "2026-11-02T10:00:00Z"),
+        ];
+        let numbers = |b: Vec<&MergedPr>| b.iter().map(|p| p.number).collect::<Vec<_>>();
+        assert_eq!(numbers(blocking(&prs, &[])), vec![30, 12]);
+        // A merge at or before a revert isn't judged.
+        let revert = MergedPr {
+            revert: true,
+            ..merged(20, "2026-11-05T10:00:00Z")
+        };
+        let with_revert = [prs[0].clone(), revert.clone(), prs[1].clone()];
+        assert_eq!(numbers(blocking(&with_revert, &[])), vec![30]);
+        // A revert newest of all: nothing is checked.
+        let reverted = [
+            prs[1].clone(),
+            MergedPr {
+                revert: true,
+                ..merged(40, "2026-11-12T10:00:00Z")
+            },
+        ];
+        assert!(blocking(&reverted, &[]).is_empty());
+        // More than three merged: the newest three.
+        let many: Vec<MergedPr> = (1..=5)
+            .map(|d| merged(d, &format!("2026-11-0{d}T10:00:00Z")))
+            .collect();
+        assert_eq!(numbers(blocking(&many, &[])), vec![5, 4, 3]);
+    }
+
+    /// An unreadable verdict is asked once more, then a person is asked.
+    #[test]
+    fn an_unread_verdict_is_tried_once_more() {
+        assert!(ask_again(1));
+        assert!(!ask_again(2));
     }
 
     #[test]
     fn a_merge_with_no_known_time_is_before_any_allowed_run() {
         let prs = [merged(12, "")];
-        assert_eq!(blocking(&prs, &[]), Some(&prs[0]));
+        assert_eq!(blocking(&prs, &[]), vec![&prs[0]]);
         let any = run_at("2020-01-01T00:00:00Z");
-        assert_eq!(blocking(&prs, &[any.as_str()]), None);
+        assert!(blocking(&prs, &[any.as_str()]).is_empty());
     }
 
     fn verdict(addresses: bool, missing: &[&str]) -> Verdict {
@@ -395,13 +503,35 @@ mod tests {
         assert_eq!(check(None), Check::Unsure);
     }
 
+    /// The partial section follows the team's instructions each time they
+    /// are loaded, while the run carries it; a run without it gets the
+    /// instructions alone.
+    #[test]
+    fn the_partial_section_follows_every_reload() {
+        let section = partial_note(
+            &[merged(12, "2026-11-02T10:00:00Z")],
+            "It adds the index.",
+            &["the CSV export".into()],
+        );
+        let loaded = "Use pnpm.";
+        let with = with_note(loaded, Some(&section));
+        assert!(
+            with.starts_with("Use pnpm.\n\n## Already merged for this ticket"),
+            "{with}"
+        );
+        assert!(with.ends_with("- the CSV export"), "{with}");
+        assert_eq!(with_note(loaded, None), loaded);
+        assert_eq!(with_note(loaded, Some("  ")), loaded);
+        assert_eq!(with_note("", Some(&section)), section.trim());
+    }
+
     #[test]
     fn the_notes_say_what_merged_where_and_how_to_run_anyway() {
         let pr = merged(12, "2026-11-02T10:00:00Z");
         let jira = covered_note(
             &TicketSource::Jira,
             "WEB-42",
-            &pr,
+            std::slice::from_ref(&pr),
             "It adds the same index.",
         );
         assert!(
@@ -416,13 +546,13 @@ mod tests {
             merged_at: String::new(),
             ..pr.clone()
         };
-        let gh = covered_note(&TicketSource::Github, "GH-7", &bare, "");
+        let gh = covered_note(&TicketSource::Github, "GH-7", &[bare], "");
         assert!(
             gh.contains("acme/app/pull/12). CoderHelm didn't build"),
             "{gh}"
         );
         assert!(gh.contains("mention @coderhelm on the issue"), "{gh}");
-        let unsure = unsure_note(&TicketSource::Jira, "WEB-42", &pr);
+        let unsure = unsure_note(&TicketSource::Jira, "WEB-42", std::slice::from_ref(&pr));
         assert!(
             unsure.contains("couldn't tell whether it already does"),
             "{unsure}"
@@ -431,10 +561,30 @@ mod tests {
             unsure.contains("merged into `develop` on 2026-11-02"),
             "{unsure}"
         );
-        let part = partial_note(&pr, "It adds the index.", &["the CSV export".into()]);
+        let part = partial_note(
+            std::slice::from_ref(&pr),
+            "It adds the index.",
+            &["the CSV export".into()],
+        );
         assert!(part.contains("acme/app#12 merged into `develop` on 2026-11-02 and already does part of this ticket: It adds the index."), "{part}");
         assert!(part.contains("adds to acme/app#12"), "{part}");
         assert!(part.ends_with("- the CSV export\n"), "{part}");
+        // Two merges judged together: the newest is named first, the
+        // earlier one after it, and the change adds to the newest.
+        let both = [merged(30, "2026-11-10T10:00:00Z"), pr.clone()];
+        let covered = covered_note(
+            &TicketSource::Jira,
+            "WEB-42",
+            &both,
+            "Together they add it.",
+        );
+        assert!(
+            covered.starts_with("WEB-42's work already merged in [acme/app#30](https://github.com/acme/app/pull/30) into `develop` on 2026-11-10, after [acme/app#12](https://github.com/acme/app/pull/12): Together they add it."),
+            "{covered}"
+        );
+        let part = partial_note(&both, "They add the index.", &["the CSV export".into()]);
+        assert!(part.contains("acme/app#30 merged into `develop` on 2026-11-10, after acme/app#12, and together they already do part of this ticket: They add the index."), "{part}");
+        assert!(part.contains("adds to acme/app#30."), "{part}");
         assert!(wait_action(&TicketSource::Github).contains("mention @coderhelm"));
         assert!(wait_action(&TicketSource::Jira).contains("reply on the ticket"));
     }

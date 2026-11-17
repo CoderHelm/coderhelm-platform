@@ -274,8 +274,9 @@ impl TicketHistory {
             .collect()
     }
 
-    /// The merged pull request that stops a new run on the ticket in `repo`
-    /// (`owner/name`), unless a person asks for it (`common::merged_ticket`).
+    /// The merged pull requests a new run on the ticket in `repo`
+    /// (`owner/name`) is checked against, newest first, unless a person
+    /// asks for it (`common::merged_ticket::blocking`).
     /// A GitHub issue's number names it only within its repository, so only
     /// that repository's pull requests and runs count; a Jira key counts
     /// across all the team's repositories.
@@ -283,11 +284,14 @@ impl TicketHistory {
         &self,
         source: &common::messages::TicketSource,
         repo: &str,
-    ) -> Option<common::merged_ticket::MergedPr> {
+    ) -> Vec<common::merged_ticket::MergedPr> {
         let scope = matches!(source, common::messages::TicketSource::Github).then_some(repo);
         let merged = self.merged_prs(scope);
         let allowed = self.allowed_after_merge(scope);
-        common::merged_ticket::blocking(&merged, &allowed).cloned()
+        common::merged_ticket::blocking(&merged, &allowed)
+            .into_iter()
+            .cloned()
+            .collect()
     }
 
     /// Every earlier pull request for the ticket as `(repo, number)`: the
@@ -1341,9 +1345,10 @@ mod tests {
             prs: vec![web],
             ..Default::default()
         };
-        assert_eq!(h.blocking_merge(&TicketSource::Github, "acme/api"), None);
+        assert_eq!(h.blocking_merge(&TicketSource::Github, "acme/api"), vec![]);
         assert_eq!(
             h.blocking_merge(&TicketSource::Github, "acme/web")
+                .first()
                 .map(|p| p.subject()),
             Some("acme/web#7".to_string())
         );
@@ -1351,6 +1356,7 @@ mod tests {
         jira.runs.pop();
         assert_eq!(
             jira.blocking_merge(&TicketSource::Jira, "acme/api")
+                .first()
                 .map(|p| p.subject()),
             Some("acme/web#7".to_string())
         );
@@ -1375,7 +1381,7 @@ mod tests {
         prep.for_ticket = linked(&h, &prep, "WEB-42", None);
         assert!(!prep.for_ticket);
         h.prs.push(prep.clone());
-        assert_eq!(h.blocking_merge(&TicketSource::Jira, "acme/app"), None);
+        assert_eq!(h.blocking_merge(&TicketSource::Jira, "acme/app"), vec![]);
 
         let by_title = EarlierPr {
             title: "WEB-42: rate limit the API".into(),
@@ -1399,6 +1405,7 @@ mod tests {
         assert_eq!(
             stopped
                 .blocking_merge(&TicketSource::Jira, "acme/app")
+                .first()
                 .map(|p| p.subject()),
             Some("acme/app#43".to_string())
         );
@@ -1424,8 +1431,8 @@ mod tests {
             let mut h = TicketHistory::default();
             p.for_ticket = linked(&h, &p, "GH-42", issue);
             h.prs.push(p);
-            h.blocking_merge(&TicketSource::Github, "acme/api")
-                .is_some()
+            !h.blocking_merge(&TicketSource::Github, "acme/api")
+                .is_empty()
         };
         assert!(stops("Fix login (#42)", "", "acme/api", "main"));
         assert!(stops("Fix login", "Fixes #42", "acme/api", "develop"));
@@ -1501,7 +1508,7 @@ mod tests {
         };
         assert_eq!(
             reverted.blocking_merge(&TicketSource::Jira, "acme/app"),
-            None
+            vec![]
         );
         let remerged = TicketHistory {
             prs: vec![first, revert, again],
@@ -1510,6 +1517,7 @@ mod tests {
         assert_eq!(
             remerged
                 .blocking_merge(&TicketSource::Jira, "acme/app")
+                .first()
                 .map(|p| p.subject()),
             Some("acme/app#14".to_string())
         );
@@ -1617,7 +1625,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        assert_eq!(h.blocking_merge(&TicketSource::Github, "acme/api"), None);
+        assert_eq!(h.blocking_merge(&TicketSource::Github, "acme/api"), vec![]);
         // Found through the description alone, too; never another
         // repository's pull request.
         assert_eq!(
@@ -1683,7 +1691,7 @@ mod tests {
             p.for_ticket = own;
             h.prs.push(p);
         }
-        assert_eq!(h.blocking_merge(&TicketSource::Github, "acme/api"), None);
+        assert_eq!(h.blocking_merge(&TicketSource::Github, "acme/api"), vec![]);
     }
 
     /// A re-run continues on CoderHelm's own open PR in the same repo: the

@@ -623,6 +623,29 @@ mod tests {
         }
     }
 
+    /// The prod duplicate: a Jira edit one second before the merge, while
+    /// auto-merge was armed, started a whole new run.
+    #[test]
+    fn an_edit_while_the_pr_is_open_goes_to_that_pr_never_a_new_run() {
+        let open = run("completed", 12, "", "h1");
+        assert_eq!(decide(&open, Some("h2"), false), Decision::ToOpenPr);
+        assert!(matches!(
+            decide(&open, Some("h1"), false),
+            Decision::Skip(_)
+        ));
+        assert!(matches!(decide(&open, Some("h1"), true), Decision::Skip(_)));
+        assert!(matches!(decide(&open, None, false), Decision::Skip(_)));
+        // The same edit, already sent to the PR, isn't sent again.
+        let seen = LatestRun {
+            seen_hash: Some("h2"),
+            ..open
+        };
+        assert!(matches!(
+            decide(&seen, Some("h2"), false),
+            Decision::Skip(_)
+        ));
+    }
+
     /// After a merge, new content or a reopen starts a run (the worker
     /// checks the merged PR against the ticket); a field change alone
     /// doesn't.

@@ -511,63 +511,72 @@ pub async fn existing_work(
     existing_work::decide(&read, false, &|p| decided.contains(&p.subject()))
 }
 
-/// The coverage verdict on a pull request for the ticket that already
-/// merged (`common::merged_ticket`), asked the same way as for an open one
-/// ([`existing_work`]): the pull request as the ticket history read it (or
-/// read now), its changed files and part of its diff. `None` when the
-/// verdict couldn't be read.
+/// The coverage verdict on the pull requests for the ticket that already
+/// merged (`common::merged_ticket::blocking`, newest first), read together
+/// in one call and asked the way an open one is ([`existing_work`]): each
+/// pull request as the ticket history read it (or read now), its changed
+/// files and part of its diff. `None` when the verdict couldn't be read.
 pub async fn merged_verdict(
     provider: &ModelProvider,
     usage: &mut TokenUsage,
     msg: &TicketMessage,
     github: &GitHubClient,
     run_id: &str,
-    pr: &common::merged_ticket::MergedPr,
-    earlier: Option<&super::ticket_history::EarlierPr>,
+    prs: &[common::merged_ticket::MergedPr],
+    history: &super::ticket_history::TicketHistory,
 ) -> Option<existing_work::Verdict> {
-    let read;
-    let earlier = match earlier {
-        Some(e) => e,
-        None => {
-            read = super::ticket_history::read_pr(github, &pr.repo, pr.number).await?;
-            &read
-        }
-    };
-    let mut open = OpenPr {
-        repo: pr.repo.clone(),
-        number: pr.number,
-        title: earlier.title.clone(),
-        body: earlier.body.clone(),
-        head: earlier.branch.clone(),
-        author: earlier.author.clone(),
-        url: format!("https://github.com/{}/pull/{}", pr.repo, pr.number),
-        files: Vec::new(),
-    };
-    let mut patch = String::new();
-    if let Some((owner, name)) = pr.repo.split_once('/') {
-        match github.list_pull_files(owner, name, pr.number).await {
-            Ok(files) => {
-                for (f, p) in &files {
-                    patch.push_str(&format!("--- {f}\n{p}\n"));
+    let mut read = Vec::with_capacity(prs.len());
+    for pr in prs {
+        let fetched;
+        let earlier = match history
+            .prs
+            .iter()
+            .find(|p| p.number == pr.number && p.repo.eq_ignore_ascii_case(&pr.repo))
+        {
+            Some(e) => e,
+            None => {
+                fetched = super::ticket_history::read_pr(github, &pr.repo, pr.number).await?;
+                &fetched
+            }
+        };
+        let mut open = OpenPr {
+            repo: pr.repo.clone(),
+            number: pr.number,
+            title: earlier.title.clone(),
+            body: earlier.body.clone(),
+            head: earlier.branch.clone(),
+            author: earlier.author.clone(),
+            url: format!("https://github.com/{}/pull/{}", pr.repo, pr.number),
+            files: Vec::new(),
+        };
+        let mut patch = String::new();
+        if let Some((owner, name)) = pr.repo.split_once('/') {
+            match github.list_pull_files(owner, name, pr.number).await {
+                Ok(files) => {
+                    for (f, p) in &files {
+                        patch.push_str(&format!("--- {f}\n{p}\n"));
+                    }
+                    open.files = files.into_iter().map(|(f, _)| f).collect();
                 }
-                open.files = files.into_iter().map(|(f, _)| f).collect();
-            }
-            Err(e) => {
-                warn!(run_id, pr = pr.number, error = %e, "Could not read the merged PR's files")
+                Err(e) => {
+                    warn!(run_id, pr = pr.number, error = %e, "Could not read the merged PR's files")
+                }
             }
         }
+        read.push((open, patch));
     }
-    // It counts for the ticket (`ticket_history::merged_prs`): it names it,
-    // closes it, or an earlier run opened it.
+    // They count for the ticket (`ticket_history::merged_prs`): each names
+    // it, closes it, or an earlier run opened it.
     let signals = existing_work::Signals {
         ticket_key: true,
         ..Default::default()
     };
+    let subjects: Vec<String> = prs.iter().map(|p| p.subject()).collect();
     match crate::agent::anthropic::converse_json(
         &provider.client(),
         provider.judgment_model_id(),
         existing_work::SYSTEM_MERGED,
-        &existing_work::merged_prompt(&msg.title, &msg.body, &open, &signals, &patch),
+        &existing_work::merged_prompt(&msg.title, &msg.body, &read, &signals),
         &existing_work::schema(),
         true,
         common::stop_judge::JUDGMENT_EFFORT,
@@ -578,11 +587,11 @@ pub async fn merged_verdict(
     {
         Ok(v) => {
             let v = existing_work::parse_verdict(&v);
-            info!(run_id, pr = pr.number, addresses = v.addresses, missing = v.missing.len(), reason = %v.reason, "Merged PR compared with the ticket");
+            info!(run_id, prs = ?subjects, addresses = v.addresses, missing = v.missing.len(), reason = %v.reason, "Merged PRs compared with the ticket");
             Some(v)
         }
         Err(e) => {
-            warn!(run_id, pr = pr.number, error = %e, "Could not compare the merged PR with the ticket");
+            warn!(run_id, prs = ?subjects, error = %e, "Could not compare the merged PRs with the ticket");
             None
         }
     }

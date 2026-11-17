@@ -2161,8 +2161,7 @@ async fn run_passes(
         load_repo_instructions(&github, &msg.repo_owner, &msg.repo_name).await;
     // The team's own instructions, loaded once: every agent in the run that
     // plans, writes, proves or describes the change gets them from `msg`.
-    msg.team_instructions =
-        load_team_instructions(state, &msg.team_id, &msg.repo_owner, &msg.repo_name).await;
+    msg.team_instructions = run_team_instructions(state, msg).await;
 
     // Progress is status for nobody: it is on the run page, never a comment
     // (the layer drops a "run" status an earlier attempt left on the issue).
@@ -2388,8 +2387,7 @@ async fn run_passes(
             // instructions join the team-wide ones now.
             repo_instructions =
                 load_repo_instructions(&github, &msg.repo_owner, &msg.repo_name).await;
-            msg.team_instructions =
-                load_team_instructions(state, &msg.team_id, &msg.repo_owner, &msg.repo_name).await;
+            msg.team_instructions = run_team_instructions(state, msg).await;
         }
     } else if msg.repo_owner.is_empty() || msg.repo_name.is_empty() {
         return Err("repo_owner and repo_name are required for GitHub tickets".into());
@@ -3267,9 +3265,7 @@ async fn run_passes(
                 )
                 .await
                 .implement;
-                msg.team_instructions =
-                    load_team_instructions(state, &msg.team_id, &msg.repo_owner, &msg.repo_name)
-                        .await;
+                msg.team_instructions = run_team_instructions(state, msg).await;
                 if let Some(ev) = log_ev.as_ref() {
                     msg.team_instructions =
                         log_evidence::with_instructions(&msg.team_instructions, ev);
@@ -5237,13 +5233,7 @@ async fn run_passes(
                 // Load repo-specific instructions
                 let repo_instr =
                     load_repo_instructions(&github, &repo_task.owner, &repo_task.name).await;
-                repo_msg.team_instructions = load_team_instructions(
-                    state,
-                    &repo_msg.team_id,
-                    &repo_task.owner,
-                    &repo_task.name,
-                )
-                .await;
+                repo_msg.team_instructions = run_team_instructions(state, &repo_msg).await;
                 if let Some(ev) = log_ev.as_ref() {
                     repo_msg.team_instructions =
                         log_evidence::with_instructions(&repo_msg.team_instructions, ev);
@@ -9872,10 +9862,12 @@ enum MergedWork {
 }
 
 /// The merged-ticket check (`common::merged_ticket`) for a fresh run on a
-/// person's ticket, after its triage and diagnosis: the ticket's newest
-/// merged pull request gets the coverage verdict open pull requests get.
-/// All of the work ends the run as covered by it; part of it tells every
-/// agent what merged and what is left; anything else changes nothing. A
+/// person's ticket, after its triage and diagnosis: the ticket's merged
+/// pull requests since its last revert get, together, the coverage verdict
+/// open pull requests get (asked once more when it can't be read). All of
+/// the work ends the run as covered by the newest; part of it tells every
+/// agent, in every step, what merged and what is left; anything else
+/// changes nothing. A
 /// person who asked for the run after the merge skips the check, and the
 /// run records it so its retries and later runs on the ticket skip it too.
 #[allow(clippy::too_many_arguments)]
@@ -9895,7 +9887,8 @@ async fn merged_work(
         return MergedWork::GoOn;
     }
     let repo = format!("{}/{}", msg.repo_owner, msg.repo_name);
-    let Some(pr) = history.blocking_merge(&msg.source, &repo) else {
+    let prs = history.blocking_merge(&msg.source, &repo);
+    let Some(pr) = prs.first() else {
         return MergedWork::GoOn;
     };
     if msg.after_merge || msg.person_direction.is_some() {
@@ -9930,12 +9923,28 @@ async fn merged_work(
         info!(run_id, pr = %pr.subject(), "The ticket asks for a separate change: the merged PR isn't checked");
         return MergedWork::GoOn;
     }
+    let mut tries = 0;
+    let verdict = loop {
+        tries += 1;
+        let verdict =
+            stop_gate::merged_verdict(provider, usage, msg, github, run_id, &prs, history).await;
+        if verdict.is_some() || !mt::ask_again(tries) {
+            break verdict;
+        }
+        warn!(
+            run_id,
+            tries, "The merged PRs' verdict couldn't be read: asking again"
+        );
+    };
     let earlier = history
         .prs
         .iter()
         .find(|p| p.number == pr.number && p.repo.eq_ignore_ascii_case(&pr.repo));
-    let verdict =
-        stop_gate::merged_verdict(provider, usage, msg, github, run_id, &pr, earlier).await;
+    let merged = prs
+        .iter()
+        .map(|p| p.subject())
+        .collect::<Vec<_>>()
+        .join(", ");
     match mt::check(verdict.as_ref()) {
         mt::Check::Covers { reason } => {
             let own = earlier.is_some_and(|e| is_own_login(&e.author))
@@ -9944,7 +9953,7 @@ async fn merged_work(
                         .iter()
                         .any(|p| p.pr_number == pr.number && p.repo.eq_ignore_ascii_case(&pr.repo))
                 });
-            let note = mt::covered_note(&msg.source, &msg.ticket_id, &pr, &reason);
+            let note = mt::covered_note(&msg.source, &msg.ticket_id, &prs, &reason);
             let rec = common::stop_rules::covering::Record {
                 repo: pr.repo.clone(),
                 number: pr.number,
@@ -9965,24 +9974,21 @@ async fn merged_work(
             MergedWork::Ended
         }
         mt::Check::Partly { reason, missing } => {
-            info!(run_id, pr = %pr.subject(), missing = missing.len(), "The merged PR did part of the ticket: building the rest");
+            info!(run_id, pr = %pr.subject(), merged = prs.len(), missing = missing.len(), "The merged PRs did part of the ticket: building the rest");
             add_progress_note(
                 state,
                 &msg.team_id,
                 run_id,
                 &format!(
                     "{} already merged part of this ticket; this run builds only what is still to do: {}",
-                    pr.subject(),
+                    merged,
                     missing.join("; ")
                 ),
             )
             .await;
-            let section = mt::partial_note(&pr, &reason, &missing);
-            msg.team_instructions = if msg.team_instructions.trim().is_empty() {
-                section
-            } else {
-                format!("{}\n\n{section}", msg.team_instructions.trim_end())
-            };
+            let section = mt::partial_note(&prs, &reason, &missing);
+            msg.team_instructions = mt::with_note(&msg.team_instructions, Some(&section));
+            msg.merged_note = Some(section);
             MergedWork::GoOn
         }
         mt::Check::Unrelated { reason } => {
@@ -9992,16 +9998,21 @@ async fn merged_work(
                 &msg.team_id,
                 run_id,
                 &format!(
-                    "{} merged for this ticket but doesn't do what it asks, so the run goes on",
-                    pr.subject()
+                    "{} merged for this ticket but {} what it asks, so the run goes on",
+                    merged,
+                    if prs.len() > 1 {
+                        "don't do"
+                    } else {
+                        "doesn't do"
+                    }
                 ),
             )
             .await;
             MergedWork::GoOn
         }
         mt::Check::Unsure => {
-            let message = mt::unsure_note(&msg.source, &msg.ticket_id, &pr);
-            stop_run_already_merged(state, msg, run_id, github, usage, start, &pr, &message).await;
+            let message = mt::unsure_note(&msg.source, &msg.ticket_id, &prs);
+            stop_run_already_merged(state, msg, run_id, github, usage, start, pr, &message).await;
             MergedWork::Ended
         }
     }
@@ -11407,6 +11418,15 @@ pub fn format_instructions_block(instructions: &str) -> String {
 /// The team's own instructions for a repository, as people wrote them in
 /// CoderHelm: the team-wide ones, then the repository's. Empty when none.
 /// Load once per run and pass down (`TicketMessage::team_instructions`).
+/// The team's instructions for `msg`'s repository, with what already merged
+/// for the ticket when the run builds only the rest (`merged_note`,
+/// `common::merged_ticket::with_note`): every step, repository and agent
+/// of the run gets it.
+async fn run_team_instructions(state: &WorkerState, msg: &TicketMessage) -> String {
+    let loaded = load_team_instructions(state, &msg.team_id, &msg.repo_owner, &msg.repo_name).await;
+    common::merged_ticket::with_note(&loaded, msg.merged_note.as_deref())
+}
+
 pub async fn load_team_instructions(
     state: &WorkerState,
     team_id: &str,
