@@ -62,10 +62,11 @@ pub fn notice(pr_url: &str, dismissed: &[String]) -> String {
     } else {
         "need"
     };
+    // The link is its own sentence: on the pull request itself the thread
+    // rules take it out whole (`comment_style::tidy`); on a ticket it stays.
     format!(
-        "The review fix was pushed to {pr_url} and the push dismissed the earlier approval \
-         (stale review dismissal). {who} {verb} to approve again before it can merge. Nothing \
-         was merged."
+        "The review fix push dismissed the earlier approval, so {who} {verb} to approve again \
+         before it can merge. Nothing was merged. {pr_url}"
     )
 }
 

@@ -357,6 +357,12 @@ pub async fn post(
             "refused to request changes without a named problem the stop judge held on".into(),
         );
     }
+    // A review is long by nature; it still keeps the thread rules: no link
+    // to its own pull request, one @-mention of a person, no request said
+    // back (`comment_style::tidy`).
+    let here = common::conversation::Place::github(&msg.repo_owner, &msg.repo_name, msg.pr_number);
+    let body = common::comment_style::tidy(body, &here);
+    let body = body.as_str();
     let posted = github
         .create_pr_review_inline(
             &msg.repo_owner,

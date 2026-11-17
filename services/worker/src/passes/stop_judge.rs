@@ -671,7 +671,16 @@ pub fn acceptance(body: &str) -> Vec<String> {
     for line in body.lines() {
         let t = line.trim();
         let lower = t.to_ascii_lowercase();
-        if t.starts_with('#') || (t.ends_with(':') && t.len() < 60) {
+        // A heading line: markdown, a short line ending in a colon, or a
+        // bare "Acceptance Criteria" line (Jira's plain text has no marks).
+        let bare = lower.trim_matches(|c: char| c == '*' || c == ':' || c.is_whitespace());
+        if t.starts_with('#')
+            || (t.ends_with(':') && t.len() < 60)
+            || matches!(
+                bare,
+                "acceptance criteria" | "acceptance criterion" | "done when"
+            )
+        {
             under = lower.contains("acceptance") || lower.contains("done when");
             continue;
         }
@@ -682,7 +691,12 @@ pub fn acceptance(body: &str) -> Vec<String> {
             .map(str::trim)
             .or_else(|| {
                 under
-                    .then(|| t.strip_prefix("- ").or_else(|| t.strip_prefix("* ")))
+                    .then(|| {
+                        t.strip_prefix("- ")
+                            .or_else(|| t.strip_prefix("* "))
+                            // Under the heading, a plain line is a criterion too.
+                            .or(Some(t))
+                    })
                     .flatten()
             });
         if let Some(i) = item.filter(|i| !i.is_empty()) {
@@ -1178,6 +1192,20 @@ mod tests {
         assert_eq!(
             acceptance(body),
             vec!["CSV download", "Totals row", "boxes count anywhere"]
+        );
+    }
+
+    /// A Jira body in plain text: a bare heading line and one criterion per
+    /// line, no bullets.
+    #[test]
+    fn plain_jira_acceptance_criteria_are_read() {
+        let body = "Acceptance Criteria\nRemove the new-tab link\nDon't freeze the header, allow the user to scroll\n\nNotes:\nnot this";
+        assert_eq!(
+            acceptance(body),
+            vec![
+                "Remove the new-tab link",
+                "Don't freeze the header, allow the user to scroll"
+            ]
         );
     }
 }

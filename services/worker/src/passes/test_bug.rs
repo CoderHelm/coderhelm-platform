@@ -92,6 +92,9 @@ impl Runner<'_> {
                 sha,
                 sha,
                 self.run_id,
+                // A failing test's run has no planned files: the job that
+                // runs on every change from the root comes first.
+                &[],
             )
             .await,
         );
