@@ -286,10 +286,10 @@ fn the_second_pull_requests_three_items() {
         ..Default::default()
     };
     let lead = pr_facts::lead(&f);
-    // The look is part of the review: shown under Review focus, never a
+    // The look is part of the review: shown in Verification, never a
     // chore under "Needed from you".
     assert!(
-        lead.contains("- See it: Studio: the landing document, hero Sub Title field."),
+        lead.contains("See it: Studio: the landing document, hero Sub Title field."),
         "{lead}"
     );
     assert!(!lead.contains("judgement only a person"), "{lead}");

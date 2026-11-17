@@ -812,8 +812,12 @@ mod tests {
         assert!(!s.body.contains("contract unchanged"), "{}", s.body);
         let seen = common::pr_layout::visible(&s.body);
         assert!(
-            seen.starts_with(
-                "The export poller retries a timed-out poll three times before it gives up (OPS-41)."
+            seen.starts_with("### Problem\nExport poller gives up on the first timeout (OPS-41)."),
+            "{seen}"
+        );
+        assert!(
+            seen.contains(
+                "### Changes\nThe export poller retries a timed-out poll three times before it gives up."
             ),
             "{seen}"
         );
@@ -827,12 +831,13 @@ mod tests {
         assert!(seen.contains("**Risk:** Low. "), "{seen}");
         // Nothing is needed: the section is not there.
         assert!(!seen.contains("Needed from you"), "{seen}");
-        // The ticket line, the walkthrough and the command are below.
-        for below in [
-            "Source ticket: OPS-41",
-            "the retry loop",
-            "How to check: `cargo test -p export`.",
-        ] {
+        // How to check is in Verification; the ticket line and the
+        // walkthrough are below.
+        assert!(
+            seen.contains("How to check: `cargo test -p export`."),
+            "{seen}"
+        );
+        for below in ["Source ticket: OPS-41", "the retry loop"] {
             assert!(
                 s.body.contains(below) && !seen.contains(below),
                 "{below}: {}",
@@ -910,7 +915,7 @@ mod tests {
         let s = shape(BODY, "t", f.clone(), Some(reply));
         assert!(
             s.body.contains(
-                "\nRetries a timed-out export poll three times (OPS-41).<!-- ch:summary-end -->\n"
+                "\nRetries a timed-out export poll three times.<!-- ch:summary-end -->\n"
             ),
             "{}",
             s.body

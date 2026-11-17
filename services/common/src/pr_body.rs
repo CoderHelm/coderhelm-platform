@@ -33,6 +33,8 @@ pub const WORD_BUDGET: usize = 200;
 /// Words in sight past which the body fails.
 pub const WORD_HARD: usize = 300;
 pub const SUMMARY_WORDS: usize = 60;
+/// Words the Problem line holds.
+pub const PROBLEM_WORDS: usize = 45;
 pub const ITEM_WORDS: usize = 30;
 pub const FOCUS_WORDS: usize = 25;
 pub const MAX_ITEMS: usize = 3;
@@ -259,10 +261,17 @@ impl Ticket {
     }
 }
 
-/// Everything one description shows.
+/// Everything one description shows, laid out as Problem, Changes, Risk
+/// and Verification (and Needed from you only when a person must act),
+/// two or three lines each.
 #[derive(Debug, Clone, Default)]
 pub struct Body {
     pub ticket: Option<Ticket>,
+    /// Why the change exists, in a sentence or two (the ticket's ask, the
+    /// advisories a dependency update fixes).
+    pub problem: String,
+    /// The one command or step that checks the change by hand.
+    pub how_to_check: String,
     /// The head's short sha.
     pub head: String,
     /// The head the results are of, when the description could not be
@@ -804,6 +813,11 @@ fn screens_markdown(s: &Screens) -> String {
 struct Blocks {
     header: String,
     alert: String,
+    /// With its `### Problem` heading.
+    problem: String,
+    /// With its `### Changes` heading: the summary, the review question and
+    /// what to read first.
+    changes: String,
     summary: String,
     /// With its `### Needed from you` heading.
     needed: String,
@@ -818,22 +832,24 @@ struct Blocks {
 }
 
 impl Blocks {
+    /// `### Risk` with its Risk and Rollback lines.
+    fn risk_section(&self) -> String {
+        format!("### Risk\n\n{}\n\n{}", self.risk, self.rollback)
+    }
+
     /// The blocks in the fixed order.
-    fn in_order(&self) -> Vec<&str> {
+    fn in_order(&self) -> Vec<String> {
         [
             &self.alert,
-            &self.summary,
+            &self.problem,
+            &self.changes,
             &self.needed,
-            &self.focus,
-            &self.deps,
-            &self.risk,
-            &self.rollback,
+            &self.risk_section(),
             &self.verification,
-            &self.screens,
         ]
         .into_iter()
-        .map(String::as_str)
         .filter(|b| !b.is_empty())
+        .cloned()
         .collect()
     }
 }
@@ -843,6 +859,24 @@ fn under_heading(block: &str) -> String {
     match block.split_once('\n') {
         Some((first, rest)) if first.starts_with("### ") => rest.trim().to_string(),
         _ => block.trim().to_string(),
+    }
+}
+
+/// The Problem line: why the change exists, the ticket linked in it.
+fn problem_line(b: &Body, ticket: Option<&Ticket>) -> String {
+    let link = ticket
+        .map(|t| format!(" ({})", t.link()))
+        .unwrap_or_default();
+    let p = part(&fit_words(&part(&b.problem), PROBLEM_WORDS));
+    if p.is_empty() {
+        // Nothing recorded why: the ticket, or that there is none (what
+        // the change does is in Changes, never said twice).
+        match ticket {
+            Some(t) => format!("Asked for in {}.", t.link()),
+            None => "No ticket or finding says why.".to_string(),
+        }
+    } else {
+        format!("{}{link}.", upper_first(&p))
     }
 }
 
@@ -872,14 +906,13 @@ fn blocks(b: &Body) -> Blocks {
     } else {
         String::new()
     };
-    let waiting = one_line(&b.waiting);
-    out.alert = match (waiting.is_empty(), alert.is_empty()) {
-        (true, true) => String::new(),
-        (true, false) => format!("> [!IMPORTANT]\n> {alert}."),
-        (false, true) => format!("> [!NOTE]\n> {waiting}"),
-        (false, false) => format!("> [!IMPORTANT]\n> {waiting} {alert}."),
-    };
+    // The alert is only for what breaks on merge; what the pull request
+    // waits on is the first line of Verification.
+    if !alert.is_empty() {
+        out.alert = format!("> [!IMPORTANT]\n> {alert}.");
+    }
     out.summary = summary_paragraph(&b.summary, ticket, &b.outside);
+    out.problem = format!("### Problem\n\n{}", problem_line(b, ticket));
     if !b.needed.is_empty() {
         let mut s = String::from("### Needed from you\n\n");
         let items: Vec<String> = b
@@ -931,6 +964,24 @@ fn blocks(b: &Body) -> Blocks {
         upper_first(&rollback)
     };
     out.rollback = format!("**Rollback:** {rollback}.");
+    // Changes: what the change does (the ticket is linked in Problem), then
+    // the review question with CoderHelm's conclusion and what to read
+    // first; where to see it is in Verification.
+    let mut changes = format!(
+        "### Changes\n\n{}",
+        summary_paragraph(&b.summary, None, &b.outside)
+    );
+    let no_see = Focus {
+        see_it: String::new(),
+        ..b.focus.clone()
+    };
+    for f in focus_markdown(&no_see).into_iter().take(2) {
+        changes.push_str(&format!("\n- {f}"));
+    }
+    if !out.deps.is_empty() {
+        changes.push_str(&format!("\n\n{}", out.deps));
+    }
+    out.changes = changes;
     let lead_in = if !b.results_of.is_empty() && b.results_of != b.head {
         format!(
             "Results below are for {}; the head is now {}.",
@@ -942,7 +993,12 @@ fn blocks(b: &Body) -> Blocks {
         format!("On {} (head of this PR):", b.head)
     };
     let rows = table_rows(&b.rows);
-    let mut verification = format!("### Verification\n\n{lead_in}\n\n");
+    let mut verification = String::from("### Verification\n\n");
+    let waiting = one_line(&b.waiting);
+    if !waiting.is_empty() {
+        verification.push_str(&format!("{waiting}\n\n"));
+    }
+    verification.push_str(&format!("{lead_in}\n\n"));
     verification.push_str(&table(
         &["Check", "Result"],
         &rows
@@ -950,10 +1006,19 @@ fn blocks(b: &Body) -> Blocks {
             .map(|r| vec![one_line(&r.check), r.result()])
             .collect::<Vec<_>>(),
     ));
-    out.verification = verification;
+    let see = part(&b.focus.see_it);
+    if !see.is_empty() {
+        verification.push_str(&format!("\n\nSee it: {see}."));
+    }
+    let how = part(&b.how_to_check);
+    if !how.is_empty() {
+        verification.push_str(&format!("\n\nHow to check: {how}."));
+    }
     if let Some(s) = &b.screens {
         out.screens = screens_markdown(s);
+        verification.push_str(&format!("\n\n{}", out.screens));
     }
+    out.verification = verification;
     out
 }
 
@@ -1224,16 +1289,17 @@ pub fn defects(body: &str, head: &str) -> Vec<String> {
     let mut d: Vec<String> = Vec::new();
     let seen = in_sight(body);
     let lines: Vec<&str> = seen.lines().filter(|l| !l.trim().is_empty()).collect();
-    // The first block is the Summary, or one alert and then the Summary.
+    let templated = body.contains(crate::pr_template::MARK);
+    // The first block is Problem, or one alert and then Problem.
     match lines.first().map(|l| l.trim()) {
         Some(l) if l.starts_with("> [!") => {
             let after = lines.iter().find(|l| !l.trim().starts_with('>'));
-            if after.is_none_or(|l| is_block_start(l.trim())) {
-                d.push("an alert is not followed by the Summary".into());
+            if !templated && after.is_none_or(|l| l.trim() != "### Problem") {
+                d.push("an alert is not followed by the Problem".into());
             }
         }
-        Some(l) if is_block_start(l) => {
-            d.push(format!("the body does not open with the Summary: {l}"))
+        Some(l) if !templated && l != "### Problem" => {
+            d.push(format!("the body does not open with the Problem: {l}"))
         }
         None => d.push("nothing is in sight".into()),
         _ => {}
@@ -1241,10 +1307,15 @@ pub fn defects(body: &str, head: &str) -> Vec<String> {
     if seen.matches("> [!").count() > 1 {
         d.push("more than one alert".into());
     }
-    // Headings: only these three, in this order; a body laid into the
+    // Headings: only these, in this order; a body laid into the
     // repository's template has the template's headings.
-    let templated = body.contains(crate::pr_template::MARK);
-    let allowed = ["Needed from you", "Review focus", "Verification"];
+    let allowed = [
+        "Problem",
+        "Changes",
+        "Needed from you",
+        "Risk",
+        "Verification",
+    ];
     let mut last = 0usize;
     for l in lines.iter().filter(|_| !templated) {
         let t = l.trim();
@@ -1256,7 +1327,7 @@ pub fn defects(body: &str, head: &str) -> Vec<String> {
             }
         }
     }
-    for h in ["Review focus", "Verification"]
+    for h in ["Problem", "Changes", "Risk", "Verification"]
         .iter()
         .filter(|_| !templated)
     {
@@ -1264,14 +1335,57 @@ pub fn defects(body: &str, head: &str) -> Vec<String> {
             d.push(format!("no {h} section"));
         }
     }
-    // The Summary.
-    if let Some(p) = lines
-        .iter()
-        .find(|l| !is_block_start(l.trim()) && !l.trim().starts_with('>'))
-    {
-        let n = words(p);
-        if n > SUMMARY_WORDS {
-            d.push(format!("the Summary has {n} words"));
+    // No section twice, no deploy map, no empty "who this affects".
+    d.extend(crate::description_lint::defects(&seen));
+    // Each section is short: two or three lines of prose (Verification
+    // holds the waiting line, the head and how to check, and its tables).
+    if !templated {
+        let mut prose: Vec<(String, usize)> = Vec::new();
+        for l in seen.lines() {
+            let t = l.trim();
+            if let Some(h) = t.strip_prefix("### ") {
+                prose.push((h.to_string(), 0));
+                continue;
+            }
+            let counted = !t.is_empty()
+                && !t.starts_with('|')
+                && !t.starts_with("- [")
+                && !t.starts_with('>')
+                && !t.starts_with("```")
+                && !t.starts_with("<")
+                && !l.starts_with("  ")
+                && !t.starts_with("Opened by CoderHelm");
+            if counted {
+                if let Some(last) = prose.last_mut() {
+                    last.1 += 1;
+                }
+            }
+        }
+        for (h, n) in prose {
+            let max = match h.as_str() {
+                "Verification" => 4,
+                "Needed from you" => MAX_ITEMS,
+                _ => 3,
+            };
+            if n > max {
+                d.push(format!("{h} has {n} lines"));
+            }
+        }
+    }
+    // The summary sentence that opens Changes.
+    let mut in_changes = false;
+    for l in seen.lines() {
+        let t = l.trim();
+        if t.starts_with("### ") {
+            in_changes = t == "### Changes";
+            continue;
+        }
+        if in_changes && !t.is_empty() {
+            let n = words(t);
+            if n > SUMMARY_WORDS {
+                d.push(format!("the summary has {n} words"));
+            }
+            break;
         }
     }
     // Needed from you.
@@ -1323,34 +1437,6 @@ pub fn defects(body: &str, head: &str) -> Vec<String> {
             ticks.next();
         }
     }
-    // Review focus.
-    let focus: Vec<&str> = section("Review focus")
-        .into_iter()
-        .filter(|l| l.starts_with("- "))
-        .collect();
-    if !(1..=3).contains(&focus.len()) {
-        d.push(format!("Review focus has {} bullets", focus.len()));
-    }
-    if let Some(first) = focus.first() {
-        let kinds = [
-            "approach",
-            "naming",
-            "copy",
-            "security",
-            "performance",
-            "correctness",
-        ];
-        let lower = first.to_lowercase();
-        if !first.trim_end().ends_with('?') && !kinds.iter().any(|k| lower.contains(k)) {
-            d.push(format!("the first focus bullet names no feedback: {first}"));
-        }
-    }
-    for f in &focus {
-        let n = words(f);
-        if n > FOCUS_WORDS + 12 {
-            d.push(format!("a focus bullet has {n} words"));
-        }
-    }
     // Risk and Rollback.
     let risk = lines.iter().find(|l| l.starts_with("**Risk:** "));
     match risk {
@@ -1379,14 +1465,16 @@ pub fn defects(body: &str, head: &str) -> Vec<String> {
     }
     // Verification.
     let ver = section("Verification");
-    let lead_in = ver.iter().find(|l| !l.trim().is_empty());
+    let lead_in = ver
+        .iter()
+        .find(|l| l.starts_with("On ") || l.starts_with("Results below are for "));
     match lead_in {
-        Some(l) if l.starts_with("On ") || l.starts_with("Results below are for ") => {
+        Some(l) => {
             if !head.is_empty() && !l.contains(head) {
                 d.push(format!("the lead-in does not name the head {head}: {l}"));
             }
         }
-        _ => d.push("Verification has no lead-in with the head".into()),
+        None => d.push("Verification has no lead-in with the head".into()),
     }
     if !head.is_empty() {
         let n = readable(&seen).matches(head).count();
@@ -1394,11 +1482,14 @@ pub fn defects(body: &str, head: &str) -> Vec<String> {
             d.push(format!("the short sha is in sight {n} times"));
         }
     }
+    // The checks table: from its header to the first line that is not a row.
     let rows: Vec<&str> = ver
         .iter()
         .copied()
-        .filter(|l| l.starts_with('|') && !l.starts_with("|---") && !l.starts_with("| Check |"))
-        .take_while(|l| !l.starts_with("| Before |"))
+        .skip_while(|l| !l.starts_with("| Check |"))
+        .skip(1)
+        .take_while(|l| l.starts_with('|'))
+        .filter(|l| !l.starts_with("|---"))
         .collect();
     if rows.len() > MAX_ROWS {
         d.push(format!("Verification has {} rows", rows.len()));
@@ -1493,16 +1584,6 @@ pub fn defects(body: &str, head: &str) -> Vec<String> {
         d.push(format!("{} characters", body.chars().count()));
     }
     d
-}
-
-fn is_block_start(t: &str) -> bool {
-    t.starts_with('#')
-        || t.starts_with("- ")
-        || t.starts_with('|')
-        || t.starts_with("**")
-        || t.starts_with('<')
-        || t.starts_with("```")
-        || t.chars().next().is_some_and(|c| c.is_ascii_digit()) && t.contains(". ")
 }
 
 fn is_uuid(w: &str) -> bool {
@@ -1674,8 +1755,8 @@ mod tests {
         let bad = "**Check:** `cd apps/studio && npm run deploy:staging`; 6 recorded checks passed on d78bb24.\n**Risk:** Low.\n**Needed from you:**\n1. Deploy it (a person on the team)\n   **Review:** decide whether this is right.\n   **Look at first:**\n- `Deploy to Production` did not run on `d78bb24`.\n\n<details><summary>More</summary>\n*em*\n</details>\n";
         let found = defects(bad, "d78bb24");
         for want in [
-            "does not open with the Summary",
-            "no Review focus section",
+            "does not open with the Problem",
+            "no Changes section",
             "no Rollback line",
             "in sight: did not run",
             "in sight: (a person",
@@ -1732,5 +1813,77 @@ mod tests {
             r.visible, r.built, r.footer
         );
         assert_eq!(defects(&body, "d78bb24"), Vec::<String>::new(), "{body}");
+    }
+
+    /// The layout: Problem, Changes, (Needed from you), Risk, Verification,
+    /// two or three lines each; the preview's link, its screenshots, what
+    /// the pull request waits on and how to check are in Verification.
+    #[test]
+    fn the_body_is_problem_changes_risk_verification() {
+        let b = Body {
+            ticket: Some(Ticket {
+                key: "KEY-123".into(),
+                url: "https://tracker.example.com/browse/KEY-123".into(),
+            }),
+            problem: "The sign-up page loses the form when the session expires".into(),
+            how_to_check: "open `/sign-up`, wait out the session, submit".into(),
+            head: "d78bb24".into(),
+            waiting: "Waiting on the preview's end-to-end run.".into(),
+            summary: "Keeps the form's values across a session refresh.".into(),
+            focus: Focus {
+                question: "Approach: is keeping the values what KEY-123 asks for?".into(),
+                see_it: "[the preview](https://preview.example.com/sign-up)".into(),
+                ..Default::default()
+            },
+            level: Level::Low,
+            risk: "one page's form state only".into(),
+            rollback: "revert this PR".into(),
+            rows: vec![Row {
+                check: "Unit tests (CI)".into(),
+                outcome: Outcome::Passed,
+                detail: String::new(),
+            }],
+            screens: Some(Screens::Pages(vec![(
+                "/sign-up".into(),
+                "https://img.example.com/d.png".into(),
+                "https://img.example.com/p.png".into(),
+            )])),
+            run_url: "https://app.example.com/runs/1".into(),
+            ..Default::default()
+        };
+        let r = render(&b);
+        let v = &r.visible;
+        let at = |h: &str| v.find(h).unwrap_or_else(|| panic!("{h}: {v}"));
+        assert!(at("### Problem") < at("### Changes"));
+        assert!(at("### Changes") < at("### Risk"));
+        assert!(at("### Risk") < at("### Verification"));
+        assert!(
+            !v.contains("### Review focus") && !v.contains("> [!"),
+            "{v}"
+        );
+        let ver = &v[at("### Verification")..];
+        for want in [
+            "Waiting on the preview's end-to-end run.",
+            "See it: [the preview](https://preview.example.com/sign-up).",
+            "How to check: open `/sign-up`, wait out the session, submit.",
+            "| Page | Desktop | Phone |",
+        ] {
+            assert!(ver.contains(want), "{want}: {ver}");
+        }
+        assert!(v.contains(
+            "The sign-up page loses the form when the session expires ([KEY-123](https://tracker.example.com/browse/KEY-123))."
+        ));
+        let body = format!("{v}\n\n{}", r.footer);
+        assert_eq!(defects(&body, "d78bb24"), Vec::<String>::new(), "{body}");
+        // A section of more than three lines, or one said twice, is a defect.
+        let long = body.replace("### Risk\n\n", "### Risk\n\nOne.\n\nTwo.\n\nThree.\n\n");
+        assert!(
+            defects(&long, "d78bb24")
+                .iter()
+                .any(|d| d.contains("Risk has")),
+            "{long}"
+        );
+        let twice = format!("{body}\n\n### Risk\n\n**Risk:** Low. Again here.");
+        assert!(!defects(&twice, "d78bb24").is_empty());
     }
 }

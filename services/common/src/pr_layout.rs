@@ -582,7 +582,7 @@ mod tests {
     use super::*;
     use crate::pr_body::{FOOTER_END, FOOTER_START};
 
-    const LEAD: &str = "<!-- coderhelm:lead -->\n<!-- coderhelm:body v1 ticket=OPS-41 head=abc1234 -->\nRetries the export poller three times before it gives up (OPS-41).<!-- ch:summary-end -->\n\n### Review focus\n\n- Approach: does this do what OPS-41 asks?\n\n**Risk:** Low. One module changes.\n\n**Rollback:** Revert this pull request.\n\n### Verification\n\nOn abc1234 (head of this PR):\n\n| Check | Result |\n|---|---|\n| lint (CI) | Passed |\n\n<!-- /coderhelm:lead -->";
+    const LEAD: &str = "<!-- coderhelm:lead -->\n<!-- coderhelm:body v1 ticket=OPS-41 head=abc1234 -->\n### Problem\n\nThe export poller gives up on the first timeout (OPS-41).\n\n### Changes\n\nRetries the export poller three times before it gives up.<!-- ch:summary-end -->\n- Approach: does this do what OPS-41 asks?\n\n### Risk\n\n**Risk:** Low. One module changes.\n\n**Rollback:** Revert this pull request.\n\n### Verification\n\nOn abc1234 (head of this PR):\n\n| Check | Result |\n|---|---|\n| lint (CI) | Passed |\n\n<!-- /coderhelm:lead -->";
 
     fn body() -> String {
         format!(
@@ -596,7 +596,7 @@ mod tests {
         assert!(out.starts_with(LEAD), "{out}");
         let seen = visible(&out);
         assert!(seen.contains("**Draft:** CI is still running."), "{seen}");
-        for gone in ["## Changes", "Open items", "Source ticket", "Consulted"] {
+        for gone in ["\n## Changes", "Open items", "Source ticket", "Consulted"] {
             assert!(!seen.contains(gone), "{gone}: {seen}");
         }
         let labels: Vec<&str> = out
@@ -754,7 +754,7 @@ mod tests {
         assert!(
             flaws
                 .iter()
-                .any(|f| matches!(f, Flaw::Layout(d) if d.contains("no Review focus"))),
+                .any(|f| matches!(f, Flaw::Layout(d) if d.contains("no Problem"))),
             "{flaws:?}"
         );
         // Folded away, the same machinery is evidence, not a flaw.

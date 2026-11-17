@@ -1268,8 +1268,42 @@ pub fn preview_gaps(f: &Facts) -> Vec<String> {
         .collect()
 }
 
+/// The facts without what the head already settles: an open item or an
+/// unverified claim about a kind of check (the lockfile, the tests, the
+/// build) whose checks of that kind all passed on the head, and an item
+/// the pull request's CI closes once every check on the head passed. The
+/// evidence decides, never the item's wording: a fixed "lockfile out of
+/// sync" goes because the install check passed on this head.
+pub fn settled(f: &Facts) -> Facts {
+    let passed_family = |fam: Family| {
+        let of: Vec<&CheckFact> = f
+            .checks
+            .iter()
+            .filter(|c| Family::of(&c.name).contains(&fam))
+            .collect();
+        !of.is_empty() && of.iter().all(|c| c.outcome == Outcome::Passed)
+    };
+    let settled_by_checks = |text: &str| {
+        let fams = Family::of(text);
+        !fams.is_empty() && fams.into_iter().all(passed_family)
+    };
+    let all_passed = f.checks_read
+        && !f.checks.is_empty()
+        && f.checks
+            .iter()
+            .all(|c| matches!(c.outcome, Outcome::Passed | Outcome::DidNotRun))
+        && f.checks.iter().any(|c| c.outcome == Outcome::Passed);
+    let mut out = f.clone();
+    out.open
+        .retain(|o| !(o.closer == Closer::Ci && all_passed) && !settled_by_checks(&o.text));
+    out.unverified.retain(|u| !settled_by_checks(&u.what));
+    out
+}
+
 pub fn body_of(f: &Facts, ticked: &[String]) -> crate::pr_body::Body {
     use crate::pr_body::{Body, Focus, Level, ReadFirst, Screens, Ticket};
+    let settled_facts = settled(f);
+    let f = &settled_facts;
     let head = f.short_head().to_string();
     let ticket = f.why.as_ref().filter(|w| !w.reference.is_empty()).map(|w| {
         let url = if !w.url.is_empty() {
@@ -1446,10 +1480,6 @@ pub fn body_of(f: &Facts, ticked: &[String]) -> crate::pr_body::Body {
     };
     // The full list of checks, and how to check by hand.
     let mut evidence: Vec<String> = Vec::new();
-    let how = one_line(&f.how_to_check);
-    if !how.is_empty() {
-        evidence.push(format!("How to check: {how}."));
-    }
     if let Some(p) = &f.preview {
         if p.url.starts_with("https://") {
             evidence.push(format!("Preview: {}", p.url));
@@ -1512,8 +1542,27 @@ pub fn body_of(f: &Facts, ticked: &[String]) -> crate::pr_body::Body {
         }
         _ => (String::new(), String::new()),
     };
+    // Why: the ticket's or finding's own words; for a dependency update
+    // without one, the advisories it is about.
+    let problem = match (f.why.as_ref().map(|w| one_line(&w.title)), &f.dependency) {
+        (Some(t), _) if !t.is_empty() => t,
+        (_, Some(d)) => {
+            let n = d.advisories.fixed.len() + d.advisories.remaining.len();
+            if n > 0 {
+                format!(
+                    "{} in the dependency lines this updates",
+                    plural(n, "known security advisory", "known security advisories")
+                )
+            } else {
+                "Dependency lines behind their current releases".to_string()
+            }
+        }
+        _ => String::new(),
+    };
     Body {
         ticket,
+        problem,
+        how_to_check: one_line(&f.how_to_check),
         head,
         results_of: String::new(),
         alert: String::new(),
@@ -1627,10 +1676,13 @@ mod tests {
             out,
             "<!-- coderhelm:lead -->\n\
              <!-- coderhelm:body v1 ticket=OPS-41 head=abc1234 -->\n\
-             Retries the export poller three times before it gives up (OPS-41).<!-- ch:summary-end -->\n\n\
-             ### Review focus\n\n\
+             ### Problem\n\n\
+             Export poller gives up on the first timeout (OPS-41).\n\n\
+             ### Changes\n\n\
+             Retries the export poller three times before it gives up.<!-- ch:summary-end -->\n\
              - Approach: decide whether this does what OPS-41 asks. CoderHelm's conclusion: all checks on this head passed.\n\
              - Read first: [`src/export/poller.rs`](https://github.com/acme/site/blob/abc1234/src/export/poller.rs) (the retry loop decides when a poll is abandoned).\n\n\
+             ### Risk\n\n\
              **Risk:** Low. One module.\n\n\
              **Rollback:** Revert this pull request.\n\n\
              ### Verification\n\n\
@@ -1639,12 +1691,61 @@ mod tests {
              |---|---|\n\
              | unit tests (CI) | Passed |\n\
              | lint (CI) | Passed |\n\n\
+             How to check: `cargo test -p export`.\n\n\
              <!-- /coderhelm:lead -->"
         );
         assert_eq!(
             crate::pr_body::defects(&out, "abc1234"),
             vec!["no footer".to_string()]
         );
+    }
+
+    /// What the head's checks settle leaves the description: a fixed
+    /// "lockfile out of sync" goes once the install check passes on the
+    /// head, whatever the item's wording; one the head doesn't settle stays.
+    #[test]
+    fn items_the_head_settles_are_removed_from_the_evidence() {
+        let mut f = ticket_facts();
+        f.open = vec![
+            OpenItem {
+                text: "The lockfile is out of sync with the manifest".into(),
+                closer: Closer::CoderHelm,
+            },
+            OpenItem {
+                text: "Wait for CI to pass on this head".into(),
+                closer: Closer::Ci,
+            },
+            OpenItem {
+                text: "Confirm the vendor's rate limit".into(),
+                closer: Closer::Person,
+            },
+        ];
+        f.unverified = vec![Unverified {
+            what: "the build was not run".into(),
+            why: "no runner".into(),
+        }];
+        // Before the fix: the install check failed on the head.
+        f.checks = vec![
+            check("install (frozen lockfile)", Outcome::Failed),
+            check("unit tests", Outcome::Passed),
+        ];
+        let before = settled(&f);
+        assert_eq!(before.open.len(), 3, "{:?}", before.open);
+        assert_eq!(before.unverified.len(), 1);
+        // On the next head both passed, and a build ran.
+        f.checks = vec![
+            check("install (frozen lockfile)", Outcome::Passed),
+            check("unit tests", Outcome::Passed),
+            check("build", Outcome::Passed),
+        ];
+        let after = settled(&f);
+        let left: Vec<&str> = after.open.iter().map(|o| o.text.as_str()).collect();
+        assert_eq!(left, vec!["Confirm the vendor's rate limit"]);
+        assert!(after.unverified.is_empty(), "{:?}", after.unverified);
+        // The rendered description no longer shows them.
+        let out = lead(&f);
+        assert!(!out.contains("out of sync"), "{out}");
+        assert!(!out.contains("build was not run"), "{out}");
     }
 
     #[test]
@@ -1683,9 +1784,14 @@ mod tests {
             out.contains("| the export against the live bucket | Not run: the sandbox has no credentials for it |"),
             "{out}"
         );
-        // What a person must do comes right after the Summary.
+        // What a person must do comes right after Changes, before Risk.
         assert!(
-            out.contains("<!-- ch:summary-end -->\n\n### Needed from you\n\n- [ ] <!-- ch:set-the-staging-secret --> **Person who holds the credential**, before merge: Set the staging secret. Why a person: it needs a credential only a person can provide."),
+            out.find("### Changes") < out.find("### Needed from you")
+                && out.find("### Needed from you") < out.find("### Risk"),
+            "{out}"
+        );
+        assert!(
+            out.contains("\n\n### Needed from you\n\n- [ ] <!-- ch:set-the-staging-secret --> **Person who holds the credential**, before merge: Set the staging secret. Why a person: it needs a credential only a person can provide."),
             "{out}"
         );
         assert!(!out.contains("(a person)"), "{out}");
@@ -1743,10 +1849,7 @@ mod tests {
             "{out}"
         );
         assert!(!out.contains("Feedback wanted"), "{out}");
-        assert!(
-            out.contains("Updates 2 packages: 2 major (OPS-41)."),
-            "{out}"
-        );
+        assert!(out.contains("Updates 2 packages: 2 major."), "{out}");
     }
 
     #[test]

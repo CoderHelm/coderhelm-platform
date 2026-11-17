@@ -1,10 +1,13 @@
 <!-- coderhelm:lead -->
 <!-- coderhelm:body v1 ticket=KEY-456 head=4be19a0 -->
 <!-- coderhelm:fold-label All 48 updates -->
-Updates 48 npm packages: 3 major, 9 minor, 36 patch ([KEY-456](https://tracker.example.com/browse/KEY-456)). Fixes 2 security advisories.<!-- ch:summary-end -->
+### Problem
 
-### Review focus
+Monthly dependency maintenance ([KEY-456](https://tracker.example.com/browse/KEY-456)).
 
+### Changes
+
+Updates 48 npm packages: 3 major, 9 minor, 36 patch. Fixes 2 security advisories.<!-- ch:summary-end -->
 - Approach: decide whether to merge 48 dependency updates. CoderHelm's conclusion: all 3 major version jumps are safe for this code, each by the usages, checks and probes recorded beside it; all checks on this head passed.
 - Read first: [`next.config.ts`](https://github.com/acme/site/blob/4be19a0/next.config.ts) (caching defaults changed in Next 15); then the other 4 files; skip `package-lock.json`, which is generated.
 
@@ -15,6 +18,8 @@ Updates 48 npm packages: 3 major, 9 minor, 36 patch ([KEY-456](https://tracker.e
 | `@types/node` | 20.17.6 to 22.10.2 | Major. Types only; matches the Node 22 runtime already in use |
 | `cookie-jar` | 0.6.0 to 0.7.2 | Security: GHSA-aaaa-bbbb-0001 |
 | `route-match` | 6.2.2 to 6.3.0 | Security: GHSA-aaaa-bbbb-0002 |
+
+### Risk
 
 **Risk:** Medium. Next 15 changes request caching across all pages; a missed caching default would surface as stale or uncached data, not a crash.
 
