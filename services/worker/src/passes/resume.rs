@@ -7262,6 +7262,26 @@ async fn revert_to_green(
                 .compare_changed_files(pr.owner, pr.repo, &sha, pr.branch)
                 .await
                 .ok()?;
+            // Only what CoderHelm's own commits after the green head changed
+            // goes back (`supervisor::own_revert_paths`): never a file a
+            // merge of the base brought in, never one only a person changed.
+            let at = shas.iter().position(|s| *s == sha)?;
+            let mut after = Vec::new();
+            for c in commits.iter().skip(at + 1) {
+                let Some(c_sha) = c["sha"].as_str() else {
+                    continue;
+                };
+                let (_, files) = github.commit_stats(pr.owner, pr.repo, c_sha).await.ok()?;
+                after.push(sup::AfterGreen {
+                    own: crate::clients::github::is_bot_commit(c),
+                    merge: c["parents"].as_array().is_some_and(|p| p.len() > 1),
+                    files,
+                });
+            }
+            let changed = sup::own_revert_paths(&changed, &after);
+            if changed.is_empty() {
+                return None;
+            }
             let mut files = Vec::new();
             for path in &changed {
                 let was = github

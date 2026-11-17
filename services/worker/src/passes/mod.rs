@@ -5509,7 +5509,7 @@ async fn run_passes(
                 &file_cache,
                 Some(run_id),
                 implement_deadline,
-                write_guard::RoundFor::Build,
+                write_guard::RoundFor::PlanTasks,
             )
             .await?
         };
@@ -5577,7 +5577,7 @@ async fn run_passes(
                             &file_cache,
                             Some(run_id),
                             implement_deadline,
-                            write_guard::RoundFor::Build,
+                            write_guard::RoundFor::PlanTasks,
                         )
                         .await?;
                     }
@@ -5787,7 +5787,7 @@ async fn run_passes(
                     &file_cache,
                     Some(run_id),
                     implement_deadline,
-                    write_guard::RoundFor::Build,
+                    write_guard::RoundFor::PlanTasks,
                 )
                 .await?;
                 if again.files_modified.is_empty() {
@@ -7852,7 +7852,7 @@ async fn run_repo_pipeline(
         file_cache,
         Some(run_id),
         implement_deadline,
-        write_guard::RoundFor::Build,
+        write_guard::RoundFor::PlanTasks,
     )
     .await?;
     write_pass_trace(

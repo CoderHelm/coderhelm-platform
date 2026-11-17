@@ -754,6 +754,10 @@ Rules:
     // Correct a stale stored base so the rest of the system stays consistent.
     heal_run_base_branch(state, &msg, &base).await;
     let ci_only = comments.is_empty() && msg.review_body.trim().is_empty();
+    // A person's lines on the branch stay theirs (`GitHubClient::
+    // hold_for_people`) in a round CoderHelm started; a person's comment or
+    // review is their answer, so their round may change them.
+    let _person_asked = github.person_asked_round(!ci_only);
     // The PR's changed files: the scope of a CI-only cycle, and what the
     // team's always-applied skills scoped to paths are matched against.
     let pr_files = github
@@ -1341,6 +1345,7 @@ Rules:
             .await;
         }
         let head = if fix_pushed {
+            super::round::fold_churn(&github, &msg.repo_owner, &msg.repo_name, &branch).await;
             super::round::branch_head(&github, &msg.repo_owner, &msg.repo_name, &branch).await
         } else {
             String::new()
@@ -3175,6 +3180,21 @@ impl<'a> ToolExecutor for FeedbackToolExecutor<'a> {
                     return Ok(json!(format!(
                         "Cannot modify {path}: CI/CD workflow files are protected."
                     )));
+                }
+                // A round on the pull request never restores a planned file,
+                // and restores others only to the base (`ScopeGuard::restore`).
+                let asked_ref = input
+                    .get("from_ref")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or(self.base_branch);
+                if let Err(refusal) = self.scope_guard.restore(path, asked_ref, self.base_branch) {
+                    crate::agent::tool_outcome::note(
+                        crate::agent::tool_outcome::ToolOutcome::soft_fail(format!(
+                            "not restored: {path}"
+                        )),
+                    );
+                    return Ok(json!(refusal));
                 }
                 if let Some(refusal) = self
                     .scope_refusal(path, super::write_guard::reason_input(input))

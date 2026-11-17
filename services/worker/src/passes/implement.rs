@@ -203,6 +203,11 @@ pub async fn run(
     if let Some(run_id) = run_id {
         super::run_guard::check(state, &msg.team_id, run_id).await?;
     }
+    // A person's lines on the branch stay theirs (`GitHubClient::
+    // hold_for_people`) unless a person asked for this round: their ask is
+    // their answer.
+    let _person_asked =
+        github.person_asked_round(round_for == super::write_guard::RoundFor::PersonAsk);
     let rules_block = super::format_rules_block(rules);
     // Trim repo instructions for simple issues to reduce per-turn token cost
     let trimmed_instructions = if complexity == "simple" && repo_instructions.len() > 2000 {
@@ -1286,6 +1291,9 @@ pub async fn run(
         lines if lines.is_empty() => closing.trim().to_string(),
         lines => format!("{}\n{lines}", closing.trim()),
     };
+    // A file this round (or the rounds before it) changed and then put
+    // back leaves no commit of its own on the pull request.
+    super::round::fold_churn(github, &msg.repo_owner, &msg.repo_name, branch).await;
     Ok(ImplementResult {
         files_modified: files,
         timed_out,
@@ -2800,6 +2808,17 @@ impl<'a> WriteToolExecutor<'a> {
                     return Ok(json!(format!(
                         "Cannot modify {path}: CI/CD workflow files are protected."
                     )));
+                }
+                // A round on the pull request never restores a planned file,
+                // and restores others only to the base (`ScopeGuard::restore`).
+                let asked_ref = input
+                    .get("from_ref")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or(&self.base_branch);
+                if let Err(refusal) = self.scope_guard.restore(path, asked_ref, &self.base_branch) {
+                    note(LogOutcome::soft_fail(format!("not restored: {path}")));
+                    return Ok(json!(refusal));
                 }
                 // A file outside the round's files is identical to base in
                 // this PR — a "restore" of it is a no-op commit or churn.

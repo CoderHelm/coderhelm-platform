@@ -225,6 +225,9 @@ pub mod model_provider;
 /// Files a run keeps as its outputs (reports, tables, snapshots).
 pub mod outputs;
 pub mod person_gate;
+/// A person's lines on a CoderHelm branch stay theirs: writes that would undo them are
+/// kept out.
+pub mod person_lines;
 /// Plugins: packages of skills, agents, tools, triggers and outputs a team installs.
 pub mod plugins;
 /// One shape for "something is wrong": set by a check, cleared by the same
