@@ -3504,6 +3504,7 @@ async fn handle_wrong_repo(
         related: Vec::new(),
         new_run_id: None,
         after_merge: false,
+        merged_note: None,
     });
 
     if state.config.ticket_queue_url.is_empty() {
@@ -4112,6 +4113,7 @@ fn run_ticket_message(
         related: Vec::new(),
         new_run_id: None,
         after_merge: false,
+        merged_note: None,
     }
 }
 

@@ -515,7 +515,8 @@ pub async fn existing_work(
 /// merged (`common::merged_ticket::blocking`, newest first), read together
 /// in one call and asked the way an open one is ([`existing_work`]): each
 /// pull request as the ticket history read it (or read now), its changed
-/// files and part of its diff. `None` when the verdict couldn't be read.
+/// files and part of its diff; an older one that can't be read is left
+/// out. `None` when the verdict or the newest pull request couldn't be read.
 pub async fn merged_verdict(
     provider: &ModelProvider,
     usage: &mut TokenUsage,
@@ -526,7 +527,7 @@ pub async fn merged_verdict(
     history: &super::ticket_history::TicketHistory,
 ) -> Option<existing_work::Verdict> {
     let mut read = Vec::with_capacity(prs.len());
-    for pr in prs {
+    for (i, pr) in prs.iter().enumerate() {
         let fetched;
         let earlier = match history
             .prs
@@ -534,10 +535,17 @@ pub async fn merged_verdict(
             .find(|p| p.number == pr.number && p.repo.eq_ignore_ascii_case(&pr.repo))
         {
             Some(e) => e,
-            None => {
-                fetched = super::ticket_history::read_pr(github, &pr.repo, pr.number).await?;
-                &fetched
-            }
+            None => match super::ticket_history::read_pr(github, &pr.repo, pr.number).await {
+                Some(r) => {
+                    fetched = r;
+                    &fetched
+                }
+                None if i == 0 => return None,
+                None => {
+                    warn!(run_id, pr = %pr.subject(), "Could not read an earlier merged PR: judging the others");
+                    continue;
+                }
+            },
         };
         let mut open = OpenPr {
             repo: pr.repo.clone(),

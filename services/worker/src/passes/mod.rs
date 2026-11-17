@@ -11415,9 +11415,6 @@ pub fn format_instructions_block(instructions: &str) -> String {
     )
 }
 
-/// The team's own instructions for a repository, as people wrote them in
-/// CoderHelm: the team-wide ones, then the repository's. Empty when none.
-/// Load once per run and pass down (`TicketMessage::team_instructions`).
 /// The team's instructions for `msg`'s repository, with what already merged
 /// for the ticket when the run builds only the rest (`merged_note`,
 /// `common::merged_ticket::with_note`): every step, repository and agent
@@ -11427,6 +11424,9 @@ async fn run_team_instructions(state: &WorkerState, msg: &TicketMessage) -> Stri
     common::merged_ticket::with_note(&loaded, msg.merged_note.as_deref())
 }
 
+/// The team's own instructions for a repository, as people wrote them in
+/// CoderHelm: the team-wide ones, then the repository's. Empty when none.
+/// Load once per run and pass down (`TicketMessage::team_instructions`).
 pub async fn load_team_instructions(
     state: &WorkerState,
     team_id: &str,
