@@ -30,6 +30,8 @@ DIRS = (
     "services/",
     "lambda/",
     "docs/api/",
+    # The incident suite checks every case has its page.
+    "docs/incidents/",
     "infra/cfn/",
     "infra/lib/",
     "infra/bin/",

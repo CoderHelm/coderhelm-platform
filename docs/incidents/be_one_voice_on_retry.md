@@ -1,0 +1,5 @@
+# be. `be_one_voice_on_retry`
+
+**What happened:** A ticket collected CoderHelm comments across retries: "Already being fixed in #N, CoderHelm didn't build a second fix", then a retry asked the model again, got a different answer, built on #N's branch and failed as the pull request was about to open, with a red panel that listed commit hashes, was cut mid-word and ended with the generic "add more detail" advice and an arrow, above an older failure panel.
+
+**The guarantee:** A retry with nothing new keeps the covered decision before anything is built (`covering::on_retry`). Every comment on a ticket or pull request goes through one conversation layer (`common::conversation`): it reads the thread, keeps one live status comment per ticket edited in place with a short history, names what an earlier comment said when the status moves on, answers people in reply to their comment, never asks a question again while it is unanswered, and lays text out without mid-word cuts, arrows or raw hashes. A failure's advice fits its cause. Source scans fail on a direct comment call outside the layer and on an arrow in posted text.

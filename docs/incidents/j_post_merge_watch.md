@@ -1,0 +1,5 @@
+# j. `j_post_merge_watch`
+
+**What happened:** After an auto-merge, the health check gave up after about 22 minutes and posted "inconclusive" while the deploy was still running. It read the base branch, so later merges kept checks running and could put another commit's deploy in the verdict.
+
+**The guarantee:** The check judges the merge commit's own check runs and push workflow runs, and waits as long as they run, each look a new queue message. It posts a verdict only: green after a 15-minute window that starts when the deploy completes, or red naming each new failing job with its link. Baseline failures are ignored, later commits never change the verdict, and a superseded deploy is followed to the run that includes the commit. One comment per merge, edited in place. A deploy held for an environment approval is not stuck: the comment reports what finished and names the job waiting for approval, in which environment, with a link, and is updated once the approved deploy finishes; the safety ceiling does not count the wait. A deploy cancelled with no later run is reported as cancelled (yellow), never as a failure.
