@@ -347,10 +347,7 @@ pub fn ack_for(source: Source, person: bool, newly_recorded: bool, run_working: 
 
 /// The one short reply on a ticket without reactions.
 pub fn ack_reply() -> String {
-    format!(
-        "{ACK_OPENING} I'm working on this ticket now. I read this comment at my next step and \
-         act on it."
-    )
+    format!("{ACK_OPENING} I'm working on this ticket and act on this comment at my next step.")
 }
 
 /// Whether a run in this status is working on the ticket.
@@ -772,6 +769,13 @@ pub fn received_note(c: &Comment, ack: Ack) -> String {
 /// comment for all of them); `None` when there is nothing to say (every
 /// one was left alone, folded quietly into the plan, or is still waiting).
 pub fn ticket_reply(done: &[(Action, Comment)], pr: Option<&str>) -> Option<String> {
+    let said_on = |a: &Action, c: &Comment| {
+        matches!(
+            a,
+            Action::Stop | Action::Round | Action::Restart | Action::Answer
+        ) || (*a == Action::Fold && !c.question.trim().is_empty())
+    };
+    let many = done.iter().filter(|(a, c)| said_on(a, c)).count() > 1;
     let said: Vec<String> = done
         .iter()
         .filter(|(a, c)| {
@@ -782,42 +786,25 @@ pub fn ticket_reply(done: &[(Action, Comment)], pr: Option<&str>) -> Option<Stri
         })
         .map(|(a, c)| {
             let pr = pr.filter(|p| !p.is_empty()).unwrap_or("the pull request");
-            match (a, c.class, c.question.trim().is_empty()) {
-                (Action::Answer, _, _) => format!(
-                    "{}'s question (\"{}\"): where the work is now is below.",
-                    who(c),
-                    one_line(&c.text, 160)
-                ),
-                (Action::Stop, _, _) => format!(
-                    "{} asked me to stop, so I stopped the run. What is built so far stays on \
-                     its branch. Assign the ticket again, or reply here, and I take it up from \
-                     there.",
-                    who(c)
-                ),
+            // What was done, never their words said back. Named only when
+            // several people's comments are answered at once.
+            let line = match (a, c.class, c.question.trim().is_empty()) {
+                (Action::Answer, _, _) => "Here's where the work is.".to_string(),
+                (Action::Stop, _, _) => "I stopped the run. What's built so far stays on its \
+                     branch; assign the ticket again or reply here to pick it back up."
+                    .to_string(),
                 (Action::Round, Some(Class::Answer), false) => format!(
-                    "{}'s answer to \"{}\": I built my default for this before the answer came. \
-                     I'm now changing the code where that choice lives to match the answer, on \
-                     {pr}, and I say there what changed.",
-                    who(c),
-                    one_line(&c.question, 200)
+                    "I built my default before this answer came; changing that code to match it \
+                     on {pr} now."
                 ),
-                (Action::Fold, _, _) => format!(
-                    "{}'s answer to \"{}\": using it (\"{}\") in the plan I'm making now.",
-                    who(c),
-                    one_line(&c.question, 200),
-                    one_line(&c.text, 160)
-                ),
-                (Action::Round, _, _) => format!(
-                    "{}'s comment (\"{}\"): I'm applying it on {pr} now, and I say there what \
-                     changed.",
-                    who(c),
-                    one_line(&c.text, 160)
-                ),
-                _ => format!(
-                    "{}'s comment (\"{}\"): I'm starting the work on this ticket again with it.",
-                    who(c),
-                    one_line(&c.text, 160)
-                ),
+                (Action::Fold, _, _) => "Using this answer in the plan I'm making now.".to_string(),
+                (Action::Round, _, _) => format!("Applying this on {pr} now."),
+                _ => "Starting the work on this ticket again with this.".to_string(),
+            };
+            if many {
+                format!("{}: {line}", who(c))
+            } else {
+                line
             }
         })
         .collect();
@@ -1571,7 +1558,8 @@ mod tests {
         let pr = Some("https://example.test/pr/12");
         // The answer applied on the pull request is said on the ticket.
         let said = ticket_reply(&[(Action::Round, answer.clone())], pr).unwrap();
-        assert!(said.contains("Pat Doe's answer to \"Which environments get the flag?\""));
+        // What was done, never their words said back.
+        assert!(!said.contains("Production only") && !said.contains("Which environments"));
         assert!(said.contains("https://example.test/pr/12"));
         // Left alone, folded or waiting: no reply.
         assert_eq!(ticket_reply(&[(Action::Leave, chat.clone())], pr), None);

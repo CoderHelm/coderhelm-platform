@@ -24,9 +24,33 @@
 //!   lines of at most [`MAX_LINE_CHARS`] characters.
 //! - [`lint`] is the check: a text that still breaks a rule is never
 //!   posted; the layer keeps quiet and logs the defect.
+//!
+//! A person once wrote "@CoderHelm rebase with main" on a pull request and
+//! got back a quote of that very comment, an "@name, replying to your
+//! comment" header, a second @-mention, "you asked for a rebase with main:",
+//! two clauses on how the merge was done, and a link to the pull request the
+//! reply sat on. The owner called it insane. What a colleague writes is one
+//! line: "Merged main in (15401ad)."
+//!
+//! So every comment also passes the thread rules, which need to know where
+//! it is posted ([`Place`]): [`tidy`] fixes them, [`lint_on`] checks them.
+//!
+//! - no "replying to" header, ever (a reply that answers an older comment
+//!   quotes it instead: `conversation::reply_body`);
+//! - a quote and a header never both;
+//! - one @-mention of a person at most;
+//! - never a link to the thread the comment is posted on;
+//! - never the person's request said back to them ("you asked for ...").
+
+use crate::conversation::Place;
+use regex::Regex;
+use std::sync::LazyLock;
 
 /// Lines a comment shows, at most.
 pub const MAX_LINES: usize = 5;
+/// Lines a reply to a person shows, at most (a quote of an older comment
+/// aside).
+pub const REPLY_LINES: usize = 3;
 /// Characters one line holds, at most.
 pub const MAX_LINE_CHARS: usize = 320;
 
@@ -77,6 +101,16 @@ pub enum Problem {
     Repeated(String),
     /// An arrow glyph.
     Arrow,
+    /// A "replying to" header.
+    ReplyHeader,
+    /// A quote of the person's comment and a header both.
+    QuoteAndHeader,
+    /// The same person @-mentioned more than once.
+    MentionTwice(String),
+    /// A link to the thread the comment is posted on.
+    SelfLink(String),
+    /// The person's request said back to them.
+    EchoesRequest(String),
 }
 
 impl std::fmt::Display for Problem {
@@ -89,6 +123,11 @@ impl std::fmt::Display for Problem {
             Problem::PathDump(n) => write!(f, "{n} file paths"),
             Problem::Repeated(s) => write!(f, "says \"{s}\" twice"),
             Problem::Arrow => write!(f, "an arrow glyph"),
+            Problem::ReplyHeader => write!(f, "a \"replying to\" header"),
+            Problem::QuoteAndHeader => write!(f, "a quote and a header both"),
+            Problem::MentionTwice(n) => write!(f, "mentions @{n} more than once"),
+            Problem::SelfLink(u) => write!(f, "links to the thread it is posted on ({u})"),
+            Problem::EchoesRequest(s) => write!(f, "says the request back (\"{s}\")"),
         }
     }
 }
@@ -405,6 +444,464 @@ pub fn clean(body: &str, markdown: bool) -> Result<String, Vec<Problem>> {
     }
 }
 
+// ── The thread rules ──────────────────────────────────────────────────
+
+static MD_LINK: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\[([^\]\n]*)\]\(([^)\s]+)\)").unwrap());
+static BARE_URL: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"https?://[^\s)\]>"'`]+"#).unwrap());
+static HASH_REF: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)(?:^|[^\w&/#\[])((?:(?:this |the )?(?:pull request|pr|issue) )?#(\d+))\b")
+        .unwrap()
+});
+static MENTION: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?:^|[^\w`/@.])@([A-Za-z0-9][A-Za-z0-9-]*(?:\[bot\])?)").unwrap()
+});
+/// A link to the thread, taken out with the words that lead to it ("it's
+/// pushed to", "in", "see").
+static SELF_RUN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)[\s,;:-]*(?:\b(?:and|it's|it is|this is|is|are|was|now|pushed|posted|opened|up|see|in|on|to|at|into|via|under|here|over|from|for)\b[\s,]*)*\x{E000}[^\x{E001}]*\x{E001}",
+    )
+    .unwrap()
+});
+
+/// Opens what [`tidy`] marks as a link to the thread.
+const SELF_OPEN: char = '\u{E000}';
+/// Closes it.
+const SELF_CLOSE: char = '\u{E001}';
+
+/// Words that open a sentence that says the request back.
+const ECHO: &[&str] = &[
+    "you asked",
+    "you've asked",
+    "you have asked",
+    "you requested",
+    "you wanted",
+    "you want ",
+    "you'd like",
+    "you would like",
+    "you're asking",
+    "you are asking",
+    "as you asked",
+    "as you requested",
+    "as requested",
+    "per your request",
+    "your request",
+    "your comment asks",
+    "your comment asked",
+];
+
+/// A nod that says nothing ("Understood.", "Sure,"). "Got it." is not one
+/// here: it opens CoderHelm's own ticket acknowledgement, which is how that
+/// comment is told apart from a person's (`ticket_comments::ACK_OPENING`).
+const NOD: &[&str] = &["understood", "sure", "will do", "on it", "noted"];
+
+/// Whether `url` points at the thread a comment on `place` sits on: the
+/// pull request or issue itself (any anchor on it), or the Jira ticket. A
+/// pull request's files or a commit on it are code, not the thread.
+pub fn links_here(url: &str, place: &Place) -> bool {
+    let u = url
+        .trim()
+        .trim_end_matches(['.', ',', ';', ':', '!', '?'])
+        .to_ascii_lowercase();
+    match place {
+        Place::Github { repo, number } => {
+            let rest = u
+                .strip_prefix("https://")
+                .or_else(|| u.strip_prefix("http://"))
+                .unwrap_or(&u);
+            let Some((_, path)) = rest.split_once('/') else {
+                return false;
+            };
+            let path = path
+                .split(['#', '?'])
+                .next()
+                .unwrap_or("")
+                .trim_end_matches('/');
+            let repo = repo.to_ascii_lowercase();
+            path == format!("{repo}/pull/{number}") || path == format!("{repo}/issues/{number}")
+        }
+        Place::Jira { ticket } => {
+            let t = format!("/browse/{}", ticket.to_ascii_lowercase());
+            u.find(&t).is_some_and(|at| {
+                !u[at + t.len()..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '-')
+            })
+        }
+    }
+}
+
+fn wrap(s: &str) -> String {
+    format!("{SELF_OPEN}{s}{SELF_CLOSE}")
+}
+
+/// `f` applied to the parts of `s` outside the self markers.
+fn outside_marks(s: &str, f: impl Fn(&str) -> String) -> String {
+    let mut out = String::new();
+    let mut rest = s;
+    while let Some(at) = rest.find(SELF_OPEN) {
+        out.push_str(&f(&rest[..at]));
+        let end = rest[at..]
+            .find(SELF_CLOSE)
+            .map_or(rest.len(), |e| at + e + SELF_CLOSE.len_utf8());
+        out.push_str(&rest[at..end]);
+        rest = &rest[end..];
+    }
+    out.push_str(&f(rest));
+    out
+}
+
+/// The line with every link to the thread wrapped in the self markers.
+fn mark_self(line: &str, place: &Place) -> String {
+    let out = MD_LINK
+        .replace_all(line, |c: &regex::Captures| {
+            if links_here(&c[2], place) {
+                wrap(&c[1])
+            } else {
+                c[0].to_string()
+            }
+        })
+        .to_string();
+    let out = outside_marks(&out, |seg| {
+        BARE_URL
+            .replace_all(seg, |c: &regex::Captures| {
+                let m = &c[0];
+                let u = m.trim_end_matches(['.', ',', ';', ':', '!', '?']);
+                if links_here(u, place) {
+                    format!("{}{}", wrap(u), &m[u.len()..])
+                } else {
+                    m.to_string()
+                }
+            })
+            .to_string()
+    });
+    match place {
+        Place::Github { number, .. } => outside_marks(&out, |seg| {
+            HASH_REF
+                .replace_all(seg, |c: &regex::Captures| {
+                    let whole = &c[0];
+                    let r = c.get(1).map(|m| m.as_str()).unwrap_or("");
+                    if c[2].parse::<u64>().ok() == Some(*number) {
+                        whole.replacen(r, &wrap(r), 1)
+                    } else {
+                        whole.to_string()
+                    }
+                })
+                .to_string()
+        }),
+        Place::Jira { .. } => out,
+    }
+}
+
+/// A line's sentences, each with its end mark (a dot in a path, a link or
+/// code stays; "1." opening a list item is not a sentence).
+fn sentences(line: &str) -> Vec<String> {
+    let chars: Vec<char> = line.chars().collect();
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let (mut tick, mut paren) = (false, 0i32);
+    for (i, &c) in chars.iter().enumerate() {
+        cur.push(c);
+        match c {
+            '`' => tick = !tick,
+            '(' | '[' if !tick => paren += 1,
+            ')' | ']' if !tick => paren -= 1,
+            _ => {}
+        }
+        let ends = !tick
+            && paren <= 0
+            && matches!(c, '.' | '!' | '?')
+            && chars.get(i + 1).is_none_or(|n| n.is_whitespace());
+        let list_number = cur
+            .trim()
+            .trim_end_matches('.')
+            .chars()
+            .all(|d| d.is_ascii_digit());
+        if ends && !list_number {
+            out.push(std::mem::take(&mut cur).trim().to_string());
+        }
+    }
+    if !cur.trim().is_empty() {
+        out.push(cur.trim().to_string());
+    }
+    out.into_iter().filter(|s| !s.is_empty()).collect()
+}
+
+/// The sentence without the name it opens on ("@sam, ", "Sam: "), and how
+/// long that name was.
+fn after_address(s: &str) -> (&str, usize) {
+    let t = s.trim_start();
+    let first = t.split_whitespace().next().unwrap_or("");
+    let addressed = first.starts_with('@')
+        || (first.ends_with([',', ':'])
+            && first.len() > 1
+            && first.chars().next().is_some_and(char::is_uppercase));
+    if addressed && t.len() > first.len() {
+        let rest = t[first.len()..].trim_start_matches([',', ':']).trim_start();
+        (rest, t.len() - rest.len())
+    } else {
+        (t, 0)
+    }
+}
+
+fn capitalized(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+        None => String::new(),
+    }
+}
+
+/// Whether a sentence is a header naming what it replies to ("@sam,
+/// replying to your comment.", "I read kim's comment too.").
+fn is_header(s: &str) -> bool {
+    let (rest, _) = after_address(s);
+    let l = rest.to_lowercase();
+    l.starts_with("replying to")
+        || l.contains(", replying to ")
+        || l.starts_with("in reply to")
+        || l.contains(" in reply to ")
+        || (l.starts_with("i read ") && l.contains("comment"))
+}
+
+/// Whether a sentence opens by saying the request back.
+fn echoes(s: &str) -> bool {
+    let (rest, _) = after_address(s);
+    let l = rest.to_lowercase();
+    ECHO.iter().any(|e| l.starts_with(e))
+}
+
+/// Whether any sentence of `text` says a person's request back to them.
+pub fn says_back(text: &str) -> bool {
+    text.lines().flat_map(sentences).any(|s| echoes(&s))
+}
+
+/// The sentence without the request said back to the person: what follows
+/// the echo ("you asked for a rebase: the branch ..." keeps "The branch
+/// ..."), or nothing when it is all echo or a bare nod.
+fn without_echo(s: &str) -> Option<String> {
+    let (rest, _) = after_address(s);
+    let l = rest.to_lowercase();
+    let bare = l.trim_end_matches(['.', '!']);
+    if NOD.contains(&bare) {
+        return None;
+    }
+    if let Some(n) = NOD
+        .iter()
+        .find(|n| l.starts_with(*n) && l[n.len()..].starts_with([',', ':', ' ']))
+    {
+        if l[n.len()..].starts_with([',', ':']) {
+            return Some(capitalized(rest.get(n.len() + 1..)?.trim_start()));
+        }
+    }
+    if !echoes(s) {
+        return Some(s.to_string());
+    }
+    let cut = [
+        ": ",
+        "; ",
+        " - ",
+        " \u{2014} ",
+        ", so ",
+        ", and ",
+        ", which ",
+        ", ",
+    ]
+    .iter()
+    .filter_map(|sep| l.find(sep).map(|at| (at, sep.len())))
+    .min_by_key(|(at, _)| *at)?;
+    let after = rest.get(cut.0 + cut.1..)?.trim_start();
+    let after = after
+        .strip_prefix("so ")
+        .or_else(|| after.strip_prefix("and "))
+        .unwrap_or(after);
+    let after = capitalized(after.trim());
+    (after.split_whitespace().count() >= 2).then_some(after)
+}
+
+/// The sentence without its links to the thread (and the words leading to
+/// them), or nothing when that leaves no sentence.
+fn without_self(s: &str) -> Option<String> {
+    let Some(at) = s.find(SELF_OPEN) else {
+        return Some(s.to_string());
+    };
+    // A sentence that opens on the thread is about the thread.
+    if s[..at]
+        .trim_matches(|c: char| !c.is_alphanumeric())
+        .is_empty()
+    {
+        return None;
+    }
+    let out = SELF_RUN.replace_all(s, "").to_string();
+    let out = out.replace(" .", ".").replace(" ,", ",");
+    let words = out
+        .split_whitespace()
+        .filter(|w| w.chars().any(char::is_alphanumeric))
+        .count();
+    (words >= 2 && !out.contains(SELF_OPEN)).then_some(out)
+}
+
+/// Whether byte `at` of `s` is inside an inline code span.
+fn in_code(s: &str, at: usize) -> bool {
+    s[..at].matches('`').count() % 2 == 1
+}
+
+/// The sentence with a person already mentioned named without the `@`
+/// (or left out where it only addressed them).
+fn one_mention(s: &str, seen: &mut std::collections::BTreeSet<String>) -> String {
+    let mut out = String::new();
+    let mut last = 0;
+    for c in MENTION.captures_iter(s) {
+        let m = c.get(1).expect("login");
+        let at = m.start() - 1;
+        if in_code(s, at) {
+            continue;
+        }
+        let login = m.as_str().to_ascii_lowercase();
+        if seen.insert(login) {
+            continue;
+        }
+        out.push_str(&s[last..at]);
+        if s[..at].trim().is_empty() {
+            // It only addressed them: "@sam, done." is "Done."
+            let rest = s[m.end()..].trim_start_matches([',', ':']).trim_start();
+            out.push_str(&capitalized(rest));
+            return out;
+        }
+        out.push_str(m.as_str());
+        last = m.end();
+    }
+    out.push_str(&s[last..]);
+    out
+}
+
+/// The comment with the thread rules applied (see the module docs): no
+/// header, one @-mention of a person, no link to the thread it is posted
+/// on, no request said back. Quotes, code and hidden markers stay as they
+/// are.
+pub fn tidy(body: &str, place: &Place) -> String {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out: Vec<String> = Vec::new();
+    let mut fence = false;
+    for line in body.lines() {
+        let t = line.trim_start();
+        if t.starts_with("```") {
+            fence = !fence;
+            out.push(line.to_string());
+            continue;
+        }
+        if fence || t.starts_with('>') || t.starts_with("<!--") || t.is_empty() {
+            out.push(line.to_string());
+            continue;
+        }
+        let indent = &line[..line.len() - t.len()];
+        let marked = mark_self(line, place);
+        let mut kept: Vec<String> = Vec::new();
+        for s in sentences(&marked) {
+            if is_header(&s) {
+                continue;
+            }
+            let Some(s) = without_echo(&s) else { continue };
+            let Some(s) = without_self(&s) else { continue };
+            let s = one_mention(&s, &mut seen);
+            if !s.trim().is_empty() {
+                kept.push(s);
+            }
+        }
+        if kept.is_empty() {
+            continue;
+        }
+        let joined = kept.join(" ");
+        // Anything the rules didn't take out keeps its own words.
+        let joined = joined.replace([SELF_OPEN, SELF_CLOSE], "");
+        out.push(format!("{indent}{joined}"));
+    }
+    // No blank runs left behind, none at either end.
+    let mut tidy: Vec<String> = Vec::new();
+    for l in out {
+        if l.trim().is_empty() && tidy.last().is_none_or(|p| p.trim().is_empty()) {
+            continue;
+        }
+        tidy.push(l);
+    }
+    while tidy.last().is_some_and(|l| l.trim().is_empty()) {
+        tidy.pop();
+    }
+    tidy.join("\n")
+}
+
+/// [`lint`] and the thread rules for a comment posted on `place`.
+pub fn lint_on(text: &str, place: &Place) -> Vec<Problem> {
+    let mut out = lint(text);
+    let mut quoted = false;
+    let mut header = false;
+    let mut mentions: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut fence = false;
+    for line in text.lines() {
+        let t = line.trim_start();
+        if t.starts_with("```") {
+            fence = !fence;
+            continue;
+        }
+        if fence || t.starts_with("<!--") {
+            continue;
+        }
+        if t.starts_with('>') {
+            quoted = true;
+            continue;
+        }
+        for s in sentences(t) {
+            if is_header(&s) {
+                header = true;
+            }
+            if echoes(&s) {
+                out.push(Problem::EchoesRequest(crate::conversation::cut_words(
+                    &s, 80,
+                )));
+            }
+        }
+        for c in MENTION.captures_iter(t) {
+            let m = c.get(1).expect("login");
+            if !in_code(t, m.start() - 1) {
+                *mentions.entry(m.as_str().to_ascii_lowercase()).or_default() += 1;
+            }
+        }
+        let marked = mark_self(t, place);
+        let mut rest = marked.as_str();
+        while let Some(at) = rest.find(SELF_OPEN) {
+            let end = rest[at..].find(SELF_CLOSE).map_or(rest.len(), |e| at + e);
+            out.push(Problem::SelfLink(
+                rest[at + SELF_OPEN.len_utf8()..end].to_string(),
+            ));
+            rest = &rest[(end + SELF_CLOSE.len_utf8()).min(rest.len())..];
+        }
+    }
+    if header {
+        out.push(Problem::ReplyHeader);
+        if quoted {
+            out.push(Problem::QuoteAndHeader);
+        }
+    }
+    for (who, n) in mentions {
+        if n > 1 {
+            out.push(Problem::MentionTwice(who));
+        }
+    }
+    out
+}
+
+/// What is posted on `place`: [`tidy`], then [`render_within`] in
+/// `max_lines`, then [`lint_on`]. The text, or why it can't be posted.
+pub fn for_thread(body: &str, place: &Place, max_lines: usize) -> Result<String, Vec<Problem>> {
+    let text = render_within(&tidy(body, place), place.markdown(), max_lines);
+    let problems = lint_on(&text, place);
+    if problems.is_empty() {
+        Ok(text)
+    } else {
+        Err(problems)
+    }
+}
+
 /// The two comments a pull request got, with generic names: fixtures for
 /// the tests here and in `conversation`.
 #[cfg(test)]
@@ -536,5 +1033,171 @@ mod tests {
             .iter()
             .any(|p| matches!(p, Problem::PathDump(3))));
         assert!(lint("Build \u{2192} deploy").contains(&Problem::Arrow));
+    }
+
+    // ── The thread rules ──
+
+    fn pr() -> Place {
+        Place::github("acme", "web", 1547)
+    }
+
+    /// The reply the owner called insane, as the old layer and the model
+    /// wrote it (names changed).
+    const INSANE: &str = "@sam, replying to [your comment](https://github.com/acme/web/pull/1547#issuecomment-9).\n\n@sam you asked for a rebase with main: the branch is now up to date with main as a merge commit (15401ad), because force pushes aren't allowed here, so the result is the same code as a rebase. It's pushed to [pull request #1547](https://github.com/acme/web/pull/1547).";
+
+    #[test]
+    fn the_insane_reply_breaks_every_thread_rule() {
+        let p = lint_on(INSANE, &pr());
+        assert!(p.contains(&Problem::ReplyHeader), "{p:?}");
+        assert!(p.contains(&Problem::MentionTwice("sam".into())), "{p:?}");
+        assert!(p.iter().any(|x| matches!(x, Problem::SelfLink(_))), "{p:?}");
+        assert!(
+            p.iter().any(|x| matches!(x, Problem::EchoesRequest(_))),
+            "{p:?}"
+        );
+        let quoted = format!("> @CoderHelm rebase with main\n\n{INSANE}");
+        assert!(lint_on(&quoted, &pr()).contains(&Problem::QuoteAndHeader));
+    }
+
+    #[test]
+    fn tidy_takes_out_the_header_the_echo_the_second_mention_and_the_self_link() {
+        let out = tidy(INSANE, &pr());
+        assert_eq!(
+            out,
+            "The branch is now up to date with main as a merge commit (15401ad), because force pushes aren't allowed here, so the result is the same code as a rebase."
+        );
+        assert!(
+            lint_on(&out, &pr()).is_empty(),
+            "{:?}",
+            lint_on(&out, &pr())
+        );
+    }
+
+    #[test]
+    fn a_link_to_the_thread_goes_and_links_elsewhere_stay() {
+        let here = pr();
+        assert!(links_here("https://github.com/acme/web/pull/1547", &here));
+        assert!(links_here(
+            "https://github.com/ACME/web/pull/1547/#issuecomment-3",
+            &here
+        ));
+        assert!(links_here("https://github.com/acme/web/issues/1547", &here));
+        assert!(!links_here("https://github.com/acme/web/pull/1548", &here));
+        assert!(!links_here(
+            "https://github.com/acme/web/pull/1547/files",
+            &here
+        ));
+        assert!(!links_here(
+            "https://github.com/acme/web/commit/15401ad",
+            &here
+        ));
+        let jira = Place::jira("ABC-12");
+        assert!(links_here(
+            "https://acme.atlassian.net/browse/ABC-12",
+            &jira
+        ));
+        assert!(!links_here(
+            "https://acme.atlassian.net/browse/ABC-123",
+            &jira
+        ));
+
+        assert_eq!(
+            tidy(
+                "Fixed the null check in 15401ad, pushed to https://github.com/acme/web/pull/1547.",
+                &here
+            ),
+            "Fixed the null check in 15401ad."
+        );
+        assert_eq!(tidy("Done in #1547.", &here), "");
+        // The re-approval notice ends on the link: on the pull request it
+        // goes whole, on a ticket it stays.
+        let n = "Nothing was merged. https://github.com/acme/web/pull/1547";
+        assert_eq!(tidy(n, &here), "Nothing was merged.");
+        assert_eq!(tidy(n, &Place::jira("ABC-12")), n);
+        assert_eq!(
+            tidy(
+                "Renamed the flag. See [#1547](https://github.com/acme/web/pull/1547).",
+                &here
+            ),
+            "Renamed the flag."
+        );
+        // Another pull request, a commit and the run page stay.
+        let other = "Same fix as #41: [15401ad](https://github.com/acme/web/commit/15401ad), run at https://app.example/runs/1.";
+        assert_eq!(tidy(other, &here), other);
+        // On the ticket, its own link goes; the pull request's stays.
+        assert_eq!(
+            tidy("Opened https://github.com/acme/web/pull/52 for https://acme.atlassian.net/browse/ABC-12.", &jira),
+            "Opened https://github.com/acme/web/pull/52."
+        );
+    }
+
+    #[test]
+    fn a_person_is_mentioned_once_at_most() {
+        assert_eq!(
+            tidy("@kim, done. @kim the docs page too.", &pr()),
+            "@kim, done. The docs page too."
+        );
+        assert_eq!(
+            tidy("@kim and @lee need to approve; @kim first.", &pr()),
+            "@kim and @lee need to approve; kim first."
+        );
+        // A mention in a quote, code or an address is left alone.
+        let quoted = "> @kim wrote this\n\n@kim, done. Run `npm i @kim/pkg`.";
+        assert_eq!(tidy(quoted, &pr()), quoted);
+    }
+
+    #[test]
+    fn the_request_is_never_said_back() {
+        assert_eq!(
+            tidy(
+                "You asked for a rebase, so I merged main in (15401ad).",
+                &pr()
+            ),
+            "I merged main in (15401ad)."
+        );
+        assert_eq!(
+            tidy("As requested, renamed the flag.", &pr()),
+            "Renamed the flag."
+        );
+        assert_eq!(
+            tidy("Understood. Renamed the flag.", &pr()),
+            "Renamed the flag."
+        );
+        assert_eq!(tidy("You want the docs updated.", &pr()), "");
+        // CoderHelm's own ticket acknowledgement keeps the words it is
+        // recognized by.
+        let ack = crate::ticket_comments::ack_reply();
+        assert_eq!(tidy(&ack, &Place::jira("ABC-1")), ack);
+        assert!(says_back("Kim, you asked for the docs page too."));
+        assert!(!says_back("Updated the docs page."));
+    }
+
+    #[test]
+    fn a_header_goes_whatever_wrote_it() {
+        for h in [
+            "@sam, replying to your comment.",
+            "Sam Lee, replying to your comment (\"Use staging.\").",
+            "I read kim's comment too.",
+        ] {
+            assert_eq!(
+                tidy(&format!("{h} Switched to staging."), &pr()),
+                "Switched to staging.",
+                "{h}"
+            );
+        }
+    }
+
+    #[test]
+    fn plain_comments_pass_unchanged() {
+        for c in [
+            "Merged main in (15401ad).",
+            "Merged main in (15401ad). Force pushes are off here, so it's a merge instead of a rebase.",
+            "**Needed from you:** @owner, approve the production deploy: the team requires an approval.",
+            "1. Approve the deploy.\n2. Re-run the job.",
+            "<!-- coderhelm:merge-status -->\n**Auto-merge** \u{b7} waiting",
+        ] {
+            assert_eq!(tidy(c, &pr()), c);
+            assert!(lint_on(c, &pr()).is_empty(), "{c}: {:?}", lint_on(c, &pr()));
+        }
     }
 }

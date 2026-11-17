@@ -582,10 +582,7 @@ pub async fn run(
                 &msg.repo_owner,
                 &msg.repo_name,
                 msg.pr_number,
-                common::conversation::Say::reply_all(
-                    "feedback",
-                    addressed(&msg.trigger_author, &line),
-                ),
+                common::conversation::Say::reply_all("feedback", line.clone()),
                 &facts,
             ))
             .await
@@ -1658,11 +1655,8 @@ Rules:
                 &msg.repo_owner,
                 &msg.repo_name,
                 msg.pr_number,
-                common::conversation::Say::reply_all(
-                    "feedback",
-                    addressed(&msg.trigger_author, line),
-                ),
-                &round,
+                common::conversation::Say::reply_all("feedback", line.to_string()),
+                &round.clone().as_written(),
             ))
             .await?;
             response
@@ -3356,7 +3350,7 @@ async fn handle_wrong_repo(
 
     // Comment on the PR explaining the move
     let comment = format!(
-        "🔀 Moving this work to `{target_repo}` as requested. This PR will be closed and a new one will be opened in the correct repository."
+        "Moving this work to `{target_repo}`: this pull request closes and a new one opens there."
     );
     let replier = super::conversation::Replier::new(state, &msg.team_id);
     let facts = Facts::default()
@@ -4514,13 +4508,6 @@ fn reply_facts(msg: &FeedbackMessage, t: &super::review_fix::Ticket) -> Facts {
         .github_pr(&repo, msg.pr_number, "", "open")
 }
 
-fn addressed(author: &str, text: &str) -> String {
-    match author.trim() {
-        "" => text.to_string(),
-        a => format!("@{a} {text}"),
-    }
-}
-
 /// A round whose only request was to bring the branch up to date: the
 /// update's line answers it (in the thread it came from, else on the PR),
 /// and the run waits for CI when the update pushed.
@@ -4538,11 +4525,14 @@ async fn finish_branch_update(
         .filter(|c| !c.is_context)
         .find_map(|c| c.comment_id);
     let replier = super::conversation::Replier::new(state, &msg.team_id);
-    let facts = reply_facts(msg, ticket).state(if pushed {
-        "the branch update is pushed"
-    } else {
-        "the branch was already up to date; nothing pushed"
-    });
+    // The update's line is the whole answer: posted as written.
+    let facts = reply_facts(msg, ticket)
+        .state(if pushed {
+            "the branch update is pushed"
+        } else {
+            "the branch was already up to date; nothing pushed"
+        })
+        .as_written();
     match thread {
         // The requester said not to post on the pull request: the line goes
         // to them on the run page and the ticket.
@@ -4578,10 +4568,7 @@ async fn finish_branch_update(
                 &msg.repo_owner,
                 &msg.repo_name,
                 msg.pr_number,
-                common::conversation::Say::reply_all(
-                    "feedback",
-                    addressed(&msg.trigger_author, line),
-                ),
+                common::conversation::Say::reply_all("feedback", line.to_string()),
                 &facts,
             ))
             .await?;
@@ -4649,11 +4636,12 @@ pub(crate) fn top_level_reply(
         .collect::<Vec<_>>()
         .join("\n\n");
     let text = if text.is_empty() {
-        "Done — the changes are in the latest commit.".to_string()
+        "Done in the latest commit.".to_string()
     } else {
         common::truncate_str(&text, 60_000).to_string()
     };
-    Some(format!("@{author} {text}{consulted}"))
+    // The reply sits under their comment: no @-mention.
+    Some(format!("{text}{consulted}"))
 }
 
 /// A feedback round's write to a lockfile is refused, like the coder's
@@ -4772,20 +4760,21 @@ mod top_level_reply_tests {
     use super::top_level_reply;
 
     #[test]
-    fn a_person_s_top_level_ask_gets_an_addressed_reply() {
-        let r = top_level_reply("alice", 0, "Renamed the flag.", "").unwrap();
-        assert_eq!(r, "@alice Renamed the flag.");
-        let r = top_level_reply("alice", 0, "one---SPLIT---two", "").unwrap();
-        assert_eq!(r, "@alice one\n\ntwo");
-        assert!(top_level_reply("alice", 0, "", "")
-            .unwrap()
-            .starts_with("@alice "));
+    fn a_person_s_top_level_ask_gets_a_reply_with_no_mention() {
+        let r = top_level_reply("sam", 0, "Renamed the flag.", "").unwrap();
+        assert_eq!(r, "Renamed the flag.");
+        let r = top_level_reply("sam", 0, "one---SPLIT---two", "").unwrap();
+        assert_eq!(r, "one\n\ntwo");
+        assert_eq!(
+            top_level_reply("sam", 0, "", "").unwrap(),
+            "Done in the latest commit."
+        );
     }
 
     #[test]
     fn automated_feedback_and_inline_threads_get_no_top_level_reply() {
         assert_eq!(top_level_reply("", 0, "fixed CI", ""), None);
-        assert_eq!(top_level_reply("alice", 2, "fixed", ""), None);
+        assert_eq!(top_level_reply("sam", 2, "fixed", ""), None);
     }
 }
 

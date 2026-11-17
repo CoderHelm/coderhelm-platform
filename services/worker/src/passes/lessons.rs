@@ -379,8 +379,8 @@ pub fn ack_reply(j: &Judgment) -> String {
         format!("in {}", j.where_.trim())
     };
     let mut out = format!(
-        "Understood: the fix belongs {place}, not in this code. I've noted it for future tickets \
-         on this repository:\n\n> {}\n",
+        "The fix belongs {place}, not in this code. Noted for future tickets on this \
+         repository:\n\n> {}\n",
         j.lesson.trim()
     );
     if !j.also_wants_code_change {
@@ -723,7 +723,7 @@ mod tests {
         .unwrap();
         assert!(j.lesson_to_store().unwrap().starts_with("Classes missing"));
         let reply = ack_reply(&j);
-        assert!(reply.contains("the fix belongs in the booking system"));
+        assert!(reply.starts_with("The fix belongs in the booking system"));
         assert!(reply.contains("> Classes missing from the site"));
         assert!(reply.contains("I'm not changing the code"));
 

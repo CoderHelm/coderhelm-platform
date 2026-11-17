@@ -513,18 +513,22 @@ fn a_reply_names_the_person_never_their_account_id() {
         text: "Skip the H1 and intro copy. Just use the title.".into(),
         ..Default::default()
     };
-    let b = reply_body(&to, &[], How::MentionQuote, "", "Done.");
+    // Under an older comment: a quote of it, no name, no header.
+    let b = reply_body(&to, How::MentionQuote, false, "", "Done.");
     assert!(!b.contains("557058"), "{b}");
-    assert!(
-        b.starts_with("Replying to your comment (\"Skip the H1"),
-        "{b}"
+    assert_eq!(
+        b,
+        "\"Skip the H1 and intro copy. Just use the title.\"\n\nDone."
     );
+    // Under the newest: only the answer.
     let named = Heard {
         author: "Sam Lee".into(),
         ..to.clone()
     };
-    assert!(reply_body(&named, &[], How::MentionQuote, "", "Done.")
-        .starts_with("Sam Lee, replying to your comment"));
+    assert_eq!(
+        reply_body(&named, How::MentionQuote, true, "", "Done."),
+        "Done."
+    );
     assert_eq!(common::conversation_io::jira_id_of(&to), to.author_id);
 }
 
