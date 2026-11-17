@@ -64,8 +64,9 @@ const sha = (v: unknown) => crypto.createHash("sha256").update(canon(v)).digest(
  * release notes; the dashboard then offers it as one optional item.
  */
 const ACCESS_DOCS = {
-  // Private networks (access.ts BOUNDARY_OPTION_READS.PrivateNetworks, PRIVATE_NETWORK_DEPLOY_*).
-  boundary: "2a0bcf74a7dc5704294b908c9afba48626c2fbce5fbfc2dd3cf8e2b10e888154",
+  // Private networks (access.ts BOUNDARY_OPTION_READS.PrivateNetworks, PRIVATE_NETWORK_DEPLOY_*),
+  // then AWS WAF's reads for alarm investigations (wafv2:Get*, wafv2:List*).
+  boundary: "9b357fb381000b22452ca2a44d34bd1a61ef81bbe05755b6731250139e9e8c36",
   deployRole: "c55fb9759c36f7df55c4d8d25de2ebd792238d91a144fcd82ca5e765566a5117",
 };
 

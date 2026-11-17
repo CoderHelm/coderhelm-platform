@@ -69,6 +69,7 @@ pub mod agent_policy;
 // What a shell command an agent sent means here, and the tool names
 // models are trained on with their CoderHelm equivalents.
 /// Alert notifications: which channels an alert posts to, and its messages.
+pub mod alarm_evidence;
 pub mod alert_episodes;
 pub mod alert_notify;
 pub mod coder_shell;
@@ -251,6 +252,9 @@ pub mod review_live;
 pub mod review_overview;
 pub mod review_session;
 pub mod review_stats;
+/// CoderHelm's earlier reviews on a pull request, collapsed once it posts a
+/// new one: one line each, hidden comments, resolved threads, dismissed.
+pub mod review_supersede;
 pub mod reviewer_prefs;
 /// Learning from outcomes: reward events, scores, calibration, variants,
 /// examples and evidence-backed lessons, per team.

@@ -352,6 +352,119 @@ pub async fn edit_own_asking(
     .await
 }
 
+/// Whether a login is CoderHelm's app (`coderhelm[bot]`, an install's own
+/// app name containing it).
+fn own_login(login: &str) -> bool {
+    login.to_ascii_lowercase().contains("coderhelm")
+}
+
+/// The reviews on a PR as `common::review_supersede` reads them.
+pub fn reviews_of(v: &Value) -> Vec<common::review_supersede::Review> {
+    v.as_array()
+        .map(|a| a.as_slice())
+        .unwrap_or(&[])
+        .iter()
+        .map(|r| common::review_supersede::Review {
+            id: r["id"].as_u64().unwrap_or(0),
+            own: r["user"]["type"].as_str() == Some("Bot")
+                && own_login(r["user"]["login"].as_str().unwrap_or("")),
+            state: r["state"].as_str().unwrap_or("").to_string(),
+            body: r["body"].as_str().unwrap_or("").to_string(),
+        })
+        .collect()
+}
+
+/// The review threads as `common::review_supersede` reads them.
+pub fn threads_of(nodes: &[Value]) -> Vec<common::review_supersede::Thread> {
+    nodes
+        .iter()
+        .map(|t| {
+            let comments: Vec<&Value> = t["comments"]["nodes"]
+                .as_array()
+                .map(|a| a.iter().collect())
+                .unwrap_or_default();
+            common::review_supersede::Thread {
+                id: t["id"].as_str().unwrap_or("").to_string(),
+                resolved: t["isResolved"].as_bool().unwrap_or(false),
+                path: t["path"].as_str().unwrap_or("").to_string(),
+                first_body: comments
+                    .first()
+                    .and_then(|c| c["body"].as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                comments: comments
+                    .iter()
+                    .map(|c| common::review_supersede::ThreadComment {
+                        node_id: c["id"].as_str().unwrap_or("").to_string(),
+                        own: own_login(c["author"]["login"].as_str().unwrap_or("")),
+                        review_id: c["pullRequestReview"]["databaseId"].as_u64().unwrap_or(0),
+                        minimized: c["isMinimized"].as_bool().unwrap_or(false),
+                    })
+                    .collect(),
+            }
+        })
+        .collect()
+}
+
+/// After CoderHelm posted review `new_id` on a pull request, its earlier
+/// reviews get out of the way (`common::review_supersede`): bodies cut to
+/// one line, earlier inline comments hidden as outdated, threads the new
+/// review no longer raises resolved, its own earlier request for changes
+/// dismissed. Best effort: a step GitHub refuses (a repository that limits
+/// dismissals, a missing permission) is skipped with a log line; the review
+/// already posted stands.
+pub async fn supersede_reviews(
+    gh: &GitHubClient,
+    owner: &str,
+    repo: &str,
+    number: u64,
+    new_id: u64,
+    raised: &[String],
+) {
+    use common::review_supersede::{plan, DISMISS_MESSAGE, OUTDATED_BODY};
+    let reviews = match gh.list_pr_reviews(owner, repo, number).await {
+        Ok(v) => reviews_of(&v),
+        Err(e) => {
+            warn!(pr = number, error = %e, "Could not list reviews to supersede CoderHelm's earlier ones");
+            return;
+        }
+    };
+    let threads = match gh.list_review_threads_detail(owner, repo, number).await {
+        Ok(v) => threads_of(&v),
+        Err(e) => {
+            tracing::info!(pr = number, error = %e, "Could not read review threads; earlier reviews are only rewritten");
+            Vec::new()
+        }
+    };
+    let p = plan(&reviews, &threads, new_id, raised);
+    for id in &p.edit {
+        if let Err(e) = gh
+            .update_review_body(owner, repo, number, *id, OUTDATED_BODY)
+            .await
+        {
+            tracing::info!(pr = number, review_id = id, error = %e, "Skipped rewriting an earlier review");
+        }
+    }
+    for node in &p.minimize {
+        if let Err(e) = gh.hide_own_comment(node, true).await {
+            tracing::info!(pr = number, comment = %node, error = %e, "Skipped hiding an earlier review comment");
+        }
+    }
+    for t in &p.resolve {
+        if let Err(e) = gh.resolve_review_thread(t).await {
+            tracing::info!(pr = number, thread = %t, error = %e, "Skipped resolving a settled review thread");
+        }
+    }
+    for id in &p.dismiss {
+        if let Err(e) = gh
+            .dismiss_review(owner, repo, number, *id, DISMISS_MESSAGE)
+            .await
+        {
+            tracing::info!(pr = number, review_id = id, error = %e, "Skipped dismissing an earlier request for changes (the repository may limit dismissals)");
+        }
+    }
+}
+
 /// What CoderHelm last replied in each review thread (this process), so a
 /// retried round doesn't say the same thing in it twice.
 static REPLIED: LazyLock<Mutex<HashMap<String, String>>> =
@@ -828,6 +941,37 @@ mod scan {
 
 #[cfg(test)]
 mod tests {
+    /// GitHub's shapes, read for superseding: a person's review and a
+    /// person's thread are never CoderHelm's, whatever they say.
+    #[test]
+    fn supersede_reads_who_wrote_what() {
+        let reviews = serde_json::json!([
+            {"id": 1, "state": "CHANGES_REQUESTED", "body": "Fix the null check.", "user": {"login": "coderhelm[bot]", "type": "Bot"}},
+            {"id": 2, "state": "CHANGES_REQUESTED", "body": "Please rename this.", "user": {"login": "reviewer-one", "type": "User"}},
+            {"id": 3, "state": "COMMENTED", "body": "coderhelm said this", "user": {"login": "coderhelm-fan", "type": "User"}},
+            {"id": 4, "state": "APPROVED", "body": "All good.", "user": {"login": "coderhelm[bot]", "type": "Bot"}}
+        ]);
+        let r = super::reviews_of(&reviews);
+        assert_eq!(
+            r.iter().filter(|x| x.own).map(|x| x.id).collect::<Vec<_>>(),
+            vec![1, 4]
+        );
+        let threads = vec![serde_json::json!({
+            "id": "T1", "isResolved": false, "path": "src/a.ts",
+            "comments": {"nodes": [
+                {"id": "C1", "isMinimized": false, "body": "Null check missing.", "author": {"login": "coderhelm"}, "pullRequestReview": {"databaseId": 1}},
+                {"id": "P1", "isMinimized": false, "body": "Why?", "author": {"login": "reviewer-one"}, "pullRequestReview": {"databaseId": 2}}
+            ]}
+        })];
+        let t = super::threads_of(&threads);
+        assert!(t[0].own() && t[0].person_waiting());
+        let p = common::review_supersede::plan(&r, &t, 4, &[]);
+        assert_eq!(p.edit, vec![1]);
+        assert_eq!(p.dismiss, vec![1]);
+        // The person's question is unanswered: the thread stays in sight.
+        assert!(p.minimize.is_empty() && p.resolve.is_empty(), "{p:?}");
+    }
+
     /// Every place the services write a comment on a ticket or a pull
     /// request goes through this layer: a direct call to the trackers'
     /// comment endpoints anywhere else fails here.

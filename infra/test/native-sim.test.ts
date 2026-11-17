@@ -48,6 +48,10 @@ const REFUSED: Record<string, Verdict> = {
   "logs:PutIndexPolicy": "implicitDeny",
   "logs:DeleteIndexPolicy": "implicitDeny",
   "logs:PutBearerTokenAuthentication": "implicitDeny",
+  // AWS's registry now lists these in a Lambda function's handlers for container image
+  // functions; every CoderHelm function is a zip, so CloudFormation never makes them.
+  "ecr:BatchGetImage": "implicitDeny",
+  "ecr:GetDownloadUrlForLayer": "implicitDeny",
 };
 
 const pairs = () => (F.rows as any[]).flatMap((r) => Object.entries(r.actions as Record<string, Verdict>).map(([action, verdict]) => ({ action, verdict, resource: r.resource, context: r.context })));

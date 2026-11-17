@@ -384,7 +384,24 @@ pub async fn post(
                 .await?
         }
     };
-    if dismiss_stale {
+    // CoderHelm's earlier reviews get out of the way of this one (one path:
+    // the conversation layer), including its own superseded request for
+    // changes.
+    if let Some(id) = review["id"].as_u64() {
+        let raised: Vec<String> = inline
+            .iter()
+            .map(|c| common::review_supersede::finding_key(&c.path, &c.body))
+            .collect();
+        super::conversation::supersede_reviews(
+            github,
+            &msg.repo_owner,
+            &msg.repo_name,
+            msg.pr_number,
+            id,
+            &raised,
+        )
+        .await;
+    } else if dismiss_stale {
         dismiss_stale_change_requests(github, msg, head).await;
     }
     Ok(review["html_url"].as_str().unwrap_or_default().to_string())
@@ -836,17 +853,25 @@ mod tests {
                     .unwrap()
                     .to_string_lossy()
                     .replace('\\', "/");
-                // The client defines the calls; this module is their one user.
+                // The client defines the calls; this module is their one user,
+                // and the conversation layer, which collapses CoderHelm's own
+                // earlier reviews after this module posted a new one
+                // (`conversation::supersede_reviews`), never posts one.
                 if rel == "clients/github.rs" || rel == "passes/review_verdict.rs" {
                     continue;
                 }
                 let text = std::fs::read_to_string(&path).unwrap();
+                let superseding = rel == "passes/conversation.rs";
                 for call in [
                     ".create_pr_review(",
                     ".create_pr_review_inline(",
                     ".dismiss_review(",
                     ".update_pr_review(",
+                    ".update_review_body(",
                 ] {
+                    if superseding && matches!(call, ".dismiss_review(" | ".update_review_body(") {
+                        continue;
+                    }
                     if text.contains(call) {
                         offenders.push(format!("{rel}: {call}"));
                     }
