@@ -794,6 +794,9 @@ async fn process_jira_payload(
         requester,
         image_attachments,
         ticket_type: common::messages::ticket_type_of_jira(issue),
+        // The tickets linked to this one: their criteria are part of the
+        // change (`related_tickets`).
+        related: common::related_tickets::from_payload(payload),
         ..Default::default()
     });
 

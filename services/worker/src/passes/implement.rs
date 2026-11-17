@@ -277,6 +277,9 @@ pub async fn run(
     // (the snapshot reflects the branch, so the partial code is already visible).
     // A ticket update on an open PR uses the same slot: the branch already
     // holds work, and the agent must change it to match the new ticket.
+    // What people answered on the ticket is settled for every round, the
+    // build and each fix: never built against, never asked again.
+    let answers_note = common::run_questions::answers_note(&msg.answers);
     let continuation_note = if let Some(note) = msg.ticket_update_note.as_deref() {
         note
     } else if msg.continuation > 0 || msg.retry_of_run {
@@ -329,6 +332,7 @@ pub async fn run(
     let conventions = super::load_git_conventions(state, &msg.team_id, &msg.ticket_id).await;
     let tokens = super::ticket_tokens(msg);
     let commit_hint = conventions.commit_hint(&tokens);
+    let issue_with_answers = format!("{issue_source_block}{answers_note}");
     let prompt = task_prompt(&TaskPrompt {
         simple: complexity == "simple",
         number: msg.issue_number,
@@ -338,7 +342,7 @@ pub async fn run(
         openspec: &openspec_block,
         files_hint: &files_hint,
         feedback: &feedback_section,
-        issue: &issue_source_block,
+        issue: &issue_with_answers,
         commit: &commit_hint,
     });
 

@@ -323,6 +323,7 @@ mod tests {
             coder_learning: String::new(),
             person_direction: None,
             answers: Vec::new(),
+            related: Vec::new(),
             new_run_id: None,
         });
         let json = serde_json::to_string(&msg).unwrap();

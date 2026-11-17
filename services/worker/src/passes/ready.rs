@@ -1247,6 +1247,15 @@ async fn gather(ctx: &Ctx<'_>) -> Result<Facts, Refused> {
     f.draft = pr["draft"].as_bool().unwrap_or(f.draft);
     f.body = pr["body"].as_str().unwrap_or("").to_string();
     f.title = pr["title"].as_str().unwrap_or("").to_string();
+    // Before it is called ready: each criterion of the linked tickets, and
+    // each address a pull request closed in favor of this one moved, is
+    // checked where it can be or listed as not covered with why.
+    if f.draft && !f.closed {
+        let section = related_section(ctx, &pr, f.preview.as_ref()).await;
+        if !section.is_empty() || f.body.contains(common::related_tickets::MARKER) {
+            f.body = common::related_tickets::with_section(&f.body, &section);
+        }
+    }
     f.security = f.body.contains(common::security_fixes::MARKER);
     if reads_ci(&f) {
         let sha = pr["head"]["sha"].as_str().unwrap_or("");
@@ -1278,6 +1287,40 @@ async fn gather(ctx: &Ctx<'_>) -> Result<Facts, Refused> {
     }
     f.head = pr["head"]["sha"].as_str().unwrap_or("").to_string();
     Ok(f)
+}
+
+/// The description's related-tickets section for the head
+/// (`passes::related`): empty when the run took on no criterion and no
+/// pull request was closed in favor of this one.
+async fn related_section(
+    ctx: &Ctx<'_>,
+    pr: &serde_json::Value,
+    preview: Option<&common::preview::State>,
+) -> String {
+    let run_id = if ctx.run_id.is_empty() {
+        super::review_pr::lookup_run_by_pr(ctx.state, ctx.team_id, ctx.owner, ctx.repo, ctx.pr)
+            .await
+            .unwrap_or_default()
+    } else {
+        ctx.run_id.clone()
+    };
+    let criteria = if run_id.is_empty() {
+        Vec::new()
+    } else {
+        super::related::kept(ctx.state, ctx.team_id, &run_id).await
+    };
+    let results = super::related::check(
+        ctx.state,
+        ctx.github,
+        ctx.owner,
+        ctx.repo,
+        ctx.pr,
+        pr["head"]["sha"].as_str().unwrap_or(""),
+        preview.map(|p| p.url.as_str()).unwrap_or(""),
+        &criteria,
+    )
+    .await;
+    common::related_tickets::section(&results)
 }
 
 /// The head's preview, moved on now (`preview::advance`): its labels added,

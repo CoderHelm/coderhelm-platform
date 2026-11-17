@@ -1791,6 +1791,7 @@ pub(super) fn internal_ticket(
         coder_learning: String::new(),
         person_direction: None,
         answers: Vec::new(),
+        related: Vec::new(),
         new_run_id: Some(run_id.to_string()),
     }
 }
@@ -2010,6 +2011,7 @@ pub async fn act(state: &WorkerState, a: TestAction) -> Result<(), Err> {
                 coder_learning: String::new(),
                 person_direction: None,
                 answers: Vec::new(),
+                related: Vec::new(),
                 new_run_id: None,
             };
             enqueue(state, crate::models::WorkerMessage::Ticket(ticket)).await?;

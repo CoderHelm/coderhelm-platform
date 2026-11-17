@@ -1147,6 +1147,11 @@ pub struct TicketMessage {
     /// planner doesn't ask them again (see `run_questions`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub answers: Vec<crate::run_questions::Answer>,
+    /// The tickets linked to this one (Jira issue links, tickets its text
+    /// names), as the Jira app sends them: their acceptance criteria are
+    /// part of the change (`related_tickets`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub related: Vec<crate::related_tickets::Related>,
     /// The id the new run takes, when whoever sent the ticket named it
     /// first (answering on the dashboard links the asking run to the run
     /// that picks the answers up). A continuation keeps its own id.
@@ -1253,6 +1258,7 @@ impl Default for TicketMessage {
             coder_learning: String::new(),
             person_direction: None,
             answers: Vec::new(),
+            related: Vec::new(),
             new_run_id: None,
         }
     }

@@ -726,6 +726,22 @@ Rules:
         comments = formatted,
         ci_failures = ci_failure_block,
     );
+    // What people answered on the ticket is settled for this round too, and
+    // the description it may rewrite never lists it as pending.
+    let ticket_answers = super::ticket_comments::know_decisions(
+        state,
+        msg.installation_id,
+        &msg.team_id,
+        &ticket.0,
+        &format!("{}/{}", msg.repo_owner, msg.repo_name),
+        "",
+        &[],
+    )
+    .await;
+    let prompt = format!(
+        "{prompt}{}",
+        common::run_questions::answers_note(&ticket_answers)
+    );
     // The branch update was done before this round and its answer is added
     // to the reply for the agent.
     let prompt = match &update_reply {
@@ -3474,6 +3490,7 @@ async fn handle_wrong_repo(
         coder_learning: String::new(),
         person_direction: None,
         answers: Vec::new(),
+        related: Vec::new(),
         new_run_id: None,
     });
 
@@ -4080,6 +4097,7 @@ fn run_ticket_message(
         coder_learning: String::new(),
         person_direction: None,
         answers: Vec::new(),
+        related: Vec::new(),
         new_run_id: None,
     }
 }
