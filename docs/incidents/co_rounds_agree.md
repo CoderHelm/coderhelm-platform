@@ -1,0 +1,7 @@
+# co. `co_rounds_agree`
+
+**What happened:** A ticket asked two things of a vendor portal page: remove the "Open registration in a new tab" link, and "Don't freeze the header, allow the user to scroll". The build removed the link and sized the frame one window tall so the header scrolls away. CoderHelm's own review asked to take the sizing out, and a review round did. The check before the pull request then listed the sizing as planned work not done, and a planned-work round put it back. The review asked again and the next review round took it out again. That is four commits of build, take out, build, take out. The pull request ended up saying it "only removes the link", and the ticket's second criterion was gone. Seven branches that week had a review round and a planned-work round undoing each other.
+
+**The guarantee:** Planned work that a review commit on the pull request took out is not built again, and the run says which commit took it out. When an acceptance criterion of the ticket asks for that work, the ticket wins: it is built, and the item carries the criterion so the reply to the review says why it stays. Plain Jira criteria (a bare "Acceptance Criteria" line with one criterion per line) are read.
+
+**Where it's enforced:** `passes::round_agree` (`taken_out`, `sort`, `sort_findings`, `read`), called by `resume::start_planned_work` and `resume::recheck_planned_work`; `stop_judge::acceptance`.

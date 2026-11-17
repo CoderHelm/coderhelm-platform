@@ -1395,6 +1395,7 @@ pub mod review_verdict;
 mod reviewer_guide;
 pub mod rewards;
 pub(crate) mod round;
+pub(crate) mod round_agree;
 pub mod run_ceiling;
 mod run_end;
 pub(crate) mod run_files;

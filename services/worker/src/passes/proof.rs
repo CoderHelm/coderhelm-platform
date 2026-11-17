@@ -1856,6 +1856,14 @@ impl Work<'_> {
     }
 }
 
+/// Whether a fix round brought an answer the judge hasn't seen: a lookup it
+/// made or a check it ran. Most proof gaps ask to confirm something (a row,
+/// a page, a check's result), so a round that settles one often writes no
+/// code; its answer must still reach the judge.
+pub fn round_answered(round: &RunEvidence) -> bool {
+    !round.lookups.is_empty() || !round.checks.is_empty()
+}
+
 /// Judges the change, runs the fix rounds a gap earns, and judges again.
 /// Returns what is still open when the PR is about to open: proof gaps,
 /// checks the PR's CI will settle, and checks only a person can do (empty
@@ -2071,7 +2079,16 @@ pub async fn prove(
                 w.ledger.update(|l| l.proof.end_fix());
                 w.save_ledger().await;
                 match fixed {
-                    Ok(r) => evidence.merge(r.evidence),
+                    Ok(r) => {
+                        // A gap answered by looking (a query, a page, a check
+                        // run) is judged again with that answer, even when
+                        // the round wrote no code.
+                        if round_answered(&r.evidence) {
+                            w.ledger.update(|l| l.proof.answered());
+                            w.save_ledger().await;
+                        }
+                        evidence.merge(r.evidence);
+                    }
                     Err(e) => {
                         warn!(run_id = w.run_id, error = %e, "Proof fix round failed");
                         return gaps;

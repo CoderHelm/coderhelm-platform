@@ -4938,7 +4938,64 @@ async fn start_planned_work(
             return Ok(false);
         }
     };
-    let Some(round) = super::finish_planned::first_round(&body, chrono::Utc::now()) else {
+    // What a review took out is not built again unless the ticket asks for
+    // it (`round_agree`).
+    let items = super::finish_planned::listed(&body);
+    let taken = if items.is_empty() {
+        Vec::new()
+    } else {
+        super::round_agree::read(
+            &ctx.github,
+            pr.owner,
+            pr.repo,
+            pr.number,
+            &ctx.ticket_msg.base_branch,
+        )
+        .await
+    };
+    let sorted = super::round_agree::sort(
+        &items,
+        &taken,
+        &super::stop_judge::acceptance(&ctx.ticket_msg.body),
+    );
+    if !sorted.skipped.is_empty() {
+        super::add_progress_note(
+            state,
+            &msg.team_id,
+            &msg.run_id,
+            &super::round_agree::skipped_note(&sorted.skipped),
+        )
+        .await;
+        let left: Vec<super::proof::Finding> = sorted
+            .build
+            .iter()
+            .map(|i| super::proof::Finding {
+                point: "planned_work".into(),
+                detail: i.clone(),
+                ..Default::default()
+            })
+            .collect();
+        let updated = super::completeness::with_section(
+            &body,
+            super::completeness::Section::Unfinished,
+            super::proof::unfinished_section(&left),
+        );
+        if updated != body {
+            if let Err(e) = crate::passes::description::save(
+                &ctx.github,
+                pr.owner,
+                pr.repo,
+                pr.number,
+                &updated,
+            )
+            .await
+            {
+                warn!(run_id = msg.run_id, error = %e, "Could not update the PR's Not finished section");
+            }
+        }
+    }
+    let Some(round) = super::finish_planned::first_round_of(&sorted.build, chrono::Utc::now())
+    else {
         return Ok(false);
     };
     super::round::record(state, &msg.team_id, &msg.run_id, &round).await;
@@ -4986,7 +5043,7 @@ async fn recheck_planned_work(
         .map(|c| c.generated)
         .unwrap_or_default();
     let mut evidence = super::proof::RunEvidence::default();
-    super::proof::judge(
+    let found = super::proof::judge(
         state,
         &ctx.ticket_msg,
         &ctx.github,
@@ -4998,7 +5055,32 @@ async fn recheck_planned_work(
         &mut ctx.usage,
     )
     .await
-    .map(|f| super::proof::drop_settled_generated(f, &settled))
+    .map(|f| super::proof::drop_settled_generated(f, &settled))?;
+    // What a review took out is not planned work left, unless the ticket
+    // asks for it (`round_agree`): the rounds never undo each other.
+    let taken = super::round_agree::read(
+        &ctx.github,
+        pr.owner,
+        pr.repo,
+        pr.number,
+        &ctx.ticket_msg.base_branch,
+    )
+    .await;
+    let (found, skipped) = super::round_agree::sort_findings(
+        found,
+        &taken,
+        &super::stop_judge::acceptance(&ctx.ticket_msg.body),
+    );
+    if !skipped.is_empty() {
+        super::add_progress_note(
+            state,
+            &msg.team_id,
+            &msg.run_id,
+            &super::round_agree::skipped_note(&skipped),
+        )
+        .await;
+    }
+    Some(found)
 }
 
 /// After a planned-work round: judge the branch again, rewrite the "Not
