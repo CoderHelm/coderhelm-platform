@@ -21,6 +21,11 @@
 //!   smaller does it;
 //! - [`PROOF`]: the one test (or the check) that shows it, in proportion.
 //!
+//! - `## Criteria map` ([`criteria_gaps`], `common::e2e_proof`): each
+//!   acceptance criterion (or Expected line) that names a page or what a
+//!   person sees, with the page, an end-to-end test in the suite that loads
+//!   it, and what it asserts. Unit tests go with it, never in its place.
+//!
 //! [`plan_gaps`] holds the draft to them and rejects a plan that proposes a
 //! structure parallel to one it names under Reuse, replacing or deleting
 //! semantics or log changes the ticket doesn't ask for, assertions about an
@@ -329,6 +334,22 @@ pub fn plan_gaps(
         }
     }
     out
+}
+
+/// What the plan's criteria map misses (`common::e2e_proof::map_gaps`):
+/// the ticket's criteria read from its acceptance list or Expected lines,
+/// each that names a page or what a person sees mapped to an end-to-end
+/// test of that page. `suite`: the repository has an end-to-end suite.
+pub fn criteria_gaps(files: &PlanResult, title: &str, body: &str, suite: bool) -> Vec<String> {
+    if stops(files) {
+        return Vec::new();
+    }
+    let criteria = common::e2e_proof::criteria(title, body, &super::stop_judge::acceptance(body));
+    common::e2e_proof::map_gaps(
+        &criteria,
+        &common::e2e_proof::parse_map(&files.design),
+        suite,
+    )
 }
 
 // ── What reused helpers do to stored rows ──────────────────────────────────

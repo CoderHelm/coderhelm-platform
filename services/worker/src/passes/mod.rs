@@ -1275,6 +1275,9 @@ pub mod description_facts;
 pub mod dlq_cleanup;
 pub mod e2e;
 pub mod e2e_attribution;
+/// Each ticket criterion's end-to-end test run on staging and on the
+/// preview before the pull request is called done.
+pub(crate) mod e2e_proof;
 pub mod e2e_reads;
 pub mod e2e_setup;
 pub mod email_events;
