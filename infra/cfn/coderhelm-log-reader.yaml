@@ -246,6 +246,23 @@ Resources:
                   - "ecr:BatchGetImage"
                   - "ecr:ListTagsForResource"
                 Resource: "*"
+        - PolicyName: FirewallRequestsReadOnly
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # When an AWS WAF alarm fires: which web ACL it watches, the
+              # requests its rule matched (WAF's sampled requests) and where
+              # the web ACL logs, so a fix to the rule is based on what
+              # clients sent. CoderHelm keeps only user agents, header names,
+              # paths and countries from them; never client addresses,
+              # cookies or other header values. Nothing is changed.
+              - Sid: ReadFirewallRequests
+                Effect: Allow
+                Action:
+                  - "wafv2:ListWebACLs"
+                  - "wafv2:GetSampledRequests"
+                  - "wafv2:GetLoggingConfiguration"
+                Resource: "*"
         - PolicyName: BucketAndKeySettingsReadOnly
           PolicyDocument:
             Version: "2012-10-17"

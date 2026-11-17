@@ -1308,6 +1308,8 @@
             "ecs:List*",
             "ecr:BatchGetImage",
             "ecr:List*",
+            "wafv2:Get*",
+            "wafv2:List*",
             "apigateway:*",
             "autoscaling:Describe*",
             "ec2:DescribeI*",

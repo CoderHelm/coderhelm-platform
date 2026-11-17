@@ -521,8 +521,15 @@ async fn handle_message_inner(state: Arc<WorkerState>, message: models::WorkerMe
         }
         models::WorkerMessage::RewardOutcome(msg) => {
             info!(team_id = %msg.team_id, run_id = %msg.run_id, pr = msg.pr_number, "Scoring a closed pull request");
+            let (team_id, run_id) = (msg.team_id.clone(), msg.run_id.clone());
+            let follow = !run_id.is_empty() && !msg.review_only;
             if let Err(e) = passes::rewards::score_outcome(&state, msg).await {
                 error!("Reward outcome failed: {e}");
+            }
+            // The same pull request's merge is followed now, whoever merged
+            // it: its deploys and its release (`pr_watch`).
+            if follow {
+                passes::pr_watch::after_pr_closed(&state, &team_id, &run_id).await;
             }
         }
         models::WorkerMessage::ReviewLesson(msg) => {
