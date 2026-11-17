@@ -1171,7 +1171,7 @@ pub fn notify_line(
         Outcome::RunStarted => {
             format!("CoderHelm is working on a fix in {repo}. A follow-up card will link the pull request.")
         }
-        Outcome::NoMatch => "Notification only: no automatic fix for this alert.".to_string(),
+        Outcome::NoMatch => no_rule_line(None, ""),
         Outcome::Notified => String::new(),
         Outcome::NotAlarm if post_recoveries => String::new(),
         Outcome::NotAlarm => return None,
@@ -1193,6 +1193,20 @@ pub fn notify_line(
             return None
         }
     })
+}
+
+/// Pure: the card's line when no rule on the route takes the alert: says so
+/// plainly, and links to the route settings where a rule can be added (none
+/// when the dashboard's address isn't known). The route's rules decide which
+/// alerts get a run; this alert is posted only, at no token cost.
+pub fn no_rule_line(alarm: Option<&str>, base: &str) -> String {
+    let what = if alarm.is_some() { "alarm" } else { "alert" };
+    let add = if base.is_empty() {
+        "Add a rule for it in the alert route settings".to_string()
+    } else {
+        format!("[Add a rule for it]({base}/settings/alerts)")
+    };
+    format!("No rule on this route names this {what}, so no fix was started. {add} to have CoderHelm open a pull request when it fires.")
 }
 
 fn dashboard_base(state: &AppState) -> &'static str {
@@ -1247,6 +1261,14 @@ async fn notify_channels(
         // repeats stay quiet too.
         open_alert(state, &route.team_id, alert, &id, &msg.timestamp, false).await;
     }
+    let line_override = line_override.or_else(|| {
+        (outcome == Outcome::NoMatch).then(|| {
+            no_rule_line(
+                episodes::alarm_name(alert.kind, &alert.title),
+                dashboard_base(state),
+            )
+        })
+    });
     let Some(line) = notify_line(outcome, repo, route.post_recoveries, card_open)
         .map(|l| line_override.unwrap_or(l))
     else {
@@ -2941,6 +2963,36 @@ mod tests {
         assert_eq!(
             pick_rule(&all, &alarm("anything")).map(|r| r.id.as_str()),
             Some("all")
+        );
+    }
+
+    #[test]
+    fn an_alarm_no_rule_names_says_so_and_links_to_the_route_settings() {
+        let rules = vec![rule(
+            "crawler",
+            &[],
+            &["crawler TLS fingerprint"],
+            "example-org/infra",
+        )];
+        let a = alarm("example-crawler-signature-drift");
+        // Still posted only: no run for an alarm no rule takes.
+        assert_eq!(pick_rule(&rules, &a), None);
+        let line = no_rule_line(
+            Some("example-crawler-signature-drift"),
+            "https://app.example.com",
+        );
+        assert_eq!(
+            line,
+            "No rule on this route names this alarm, so no fix was started. \
+             [Add a rule for it](https://app.example.com/settings/alerts) to have CoderHelm open a \
+             pull request when it fires."
+        );
+        assert!(!line.contains("Notification only"));
+        assert!(no_rule_line(None, "").starts_with("No rule on this route names this alert"));
+        assert!(!no_rule_line(None, "").contains("]("));
+        assert_eq!(
+            notify_line(Outcome::NoMatch, "", false, false).as_deref(),
+            Some(no_rule_line(None, "").as_str())
         );
     }
 

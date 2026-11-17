@@ -159,8 +159,9 @@ test("boundary: fits IAM's managed policy limit (6,144 characters without whites
   const size = JSON.stringify(BOUNDARY).length;
   // Measured with the longest names an install can have (a 20-character stage).
   // About 140 characters to spare since Inspector's and Health's reads (own-account-read.ts, OWN_OPTIONS),
-  // about 60 since the private networks' (BOUNDARY_OPTION_READS.PrivateNetworks). Under 6,144 is IAM's own refusal.
-  assert.ok(size < 6100, `boundary is ${size} characters`);
+  // about 60 since the private networks' (BOUNDARY_OPTION_READS.PrivateNetworks), about 25 since AWS WAF's
+  // reads (wafv2:Get*, wafv2:List*), which leaves about 20. Under 6,144 is IAM's own refusal.
+  assert.ok(size < 6125, `boundary is ${size} characters`);
 });
 
 test("boundary: only the deploy role may set or remove the gateway and worker tag", () => {

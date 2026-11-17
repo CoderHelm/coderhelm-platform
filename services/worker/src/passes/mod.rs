@@ -1906,6 +1906,62 @@ async fn read_ticket_comments(
     Ok(())
 }
 
+/// The evidence a run an alert rule started (it has the rule's repo) reads
+/// before planning, when its alarm is an AWS WAF alarm: through the team's
+/// read-only connection to the alarm's account (the alert's topic is in it).
+/// None for any other run, or when it is already in the ticket (a later step
+/// of the same run).
+async fn alarm_evidence_for_run(state: &WorkerState, msg: &TicketMessage) -> Option<String> {
+    use common::alarm_evidence as ae;
+    if !matches!(msg.source, TicketSource::Alert)
+        || msg.sender != "alert"
+        || msg.repo_owner.is_empty()
+        || msg.repo_name.is_empty()
+        || msg.body.contains(ae::HEADING)
+    {
+        return None;
+    }
+    let alarm = ae::waf_alarm(&msg.body)?;
+    let topic = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(&msg.team_id))
+        .key("sk", attr_s(&format!("ALERT_TICKET#{}", msg.ticket_id)))
+        .send()
+        .await
+        .ok()?
+        .item()?
+        .get("topic_arn")?
+        .as_s()
+        .ok()?
+        .clone();
+    let account = topic.split(':').nth(4).unwrap_or_default().to_string();
+    let session = common::log_findings::session_for(
+        &state.dynamo,
+        &state.sts,
+        &state.config.aws_insights_table_name,
+        &msg.team_id,
+        &account,
+    )
+    .await;
+    Some(match session {
+        Ok(Some(s)) => ae::gather(&s, &alarm, chrono::Utc::now()).await,
+        Ok(None) => ae::render(
+            &alarm,
+            &[format!(
+                "No AWS connection for account {account}, so the requests the rule matched weren't read."
+            )],
+        ),
+        Err(e) => ae::render(
+            &alarm,
+            &[format!(
+                "CoderHelm's AWS role for account {account} couldn't be taken on: {e}"
+            )],
+        ),
+    })
+}
+
 /// The agent a ticket run belongs to as a whole, when it isn't the planner
 /// and coder: a fix started by a log finding is log auto-fix's, one started
 /// by an alert is the alert fixer's.
@@ -2683,6 +2739,20 @@ async fn run_passes(
     // --- Evidence: a run started from a log finding reads the logs and the
     // ECS service behind them before planning, and every agent gets it ---
     let mut log_ev = log_evidence::gather_for_run(state, msg).await;
+    // --- Evidence: a run an alert rule started for an AWS WAF alarm reads
+    // the requests the alarm's rule matched (sampled requests, TLS
+    // fingerprints from the web ACL's logs) before planning; it joins the
+    // ticket as data ---
+    if let Some(ev) = alarm_evidence_for_run(state, msg).await {
+        add_progress_note(
+            state,
+            &msg.team_id,
+            run_id,
+            "Read the requests the alarm's WAF rule matched (sampled requests and the web ACL's logs).",
+        )
+        .await;
+        msg.body = common::alarm_evidence::with_evidence(&msg.body, &ev);
+    }
     if let Some(ev) = log_ev.as_ref() {
         log_evidence::save(state, &msg.team_id, run_id, ev).await;
         add_progress_note(state, &msg.team_id, run_id, &log_evidence::summary_note(ev)).await;
