@@ -86,6 +86,11 @@ pub struct Seen {
     pub reviewer_on: bool,
     /// CoderHelm's latest review verdict and the commit it is on.
     pub own_verdict: Option<(String, String)>,
+    /// The head's preview isn't settled (`preview::settled`): its checks
+    /// are to be started, read or its pages captured. Decided per look,
+    /// never kept in the probe.
+    #[serde(skip)]
+    pub preview_due: bool,
 }
 
 /// What the last look read from GitHub, kept on the run (`watch_probe`):
@@ -191,6 +196,11 @@ pub enum Act {
     /// Run again the round GitHub's rate limit ended (the round's record,
     /// by when it stopped): `resume::resume_limit_ended`.
     ResumeRound(String),
+    /// Start, read or capture the head's preview (`preview::advance`,
+    /// `preview::capture`): a skipped preview or end-to-end check that
+    /// covers the change is closed by CoderHelm, also on pull requests
+    /// whose run finished before this existed.
+    Preview,
 }
 
 impl Act {
@@ -204,6 +214,9 @@ impl Act {
             Act::FixFindings => Some((Marks::FINDINGS, seen.head.clone())),
             Act::WatchDeploy => Some((Marks::DEPLOY, seen.merge_sha.clone())),
             Act::ResumeRound(at) => Some((Marks::LIMIT, at.clone())),
+            // Done on every look until the head's preview is settled; each
+            // step of it is idempotent per head (`preview_state`).
+            Act::Preview => None,
         }
     }
 }
@@ -268,6 +281,35 @@ pub fn decide(status: &str, seen: &Seen, marks: &Marks) -> Act {
     }
 }
 
+/// [`decide`], then the preview when nothing else is needed: a conflict,
+/// red checks and the review come first, the preview never waits behind
+/// nothing.
+pub fn decide_all(status: &str, seen: &Seen, marks: &Marks) -> Act {
+    match decide(status, seen, marks) {
+        Act::Nothing if watched(status) && seen.open && !seen.merged && seen.preview_due => {
+            Act::Preview
+        }
+        a => a,
+    }
+}
+
+/// Whether the head's preview needs a look: the change's recorded state is
+/// of another head or not settled. A look that read nothing new (`fresh`
+/// false) leaves a pending preview to the next change on the pull request.
+pub fn preview_due(stored: &str, head: &str, fresh: bool) -> bool {
+    if head.is_empty() {
+        return false;
+    }
+    match common::preview::State::from_json(stored) {
+        None => true,
+        Some(st) if st.head != head => true,
+        Some(st) if super::preview::settled(&st, head) => false,
+        // Ready: its pages are captured now, whatever else changed.
+        Some(st) if st.stage == common::preview::Stage::Ready => true,
+        Some(_) => fresh,
+    }
+}
+
 /// The round to run again before anything else is decided: one GitHub's
 /// rate limit ended (`limit_ended`: when that round stopped, "" when the
 /// run's last round wasn't ended by a limit), on a pull request still open,
@@ -315,9 +357,29 @@ pub struct Candidate {
     pub writer: String,
     /// When the run last changed (RFC 3339).
     pub updated_at: String,
+    /// The head's preview as last recorded (`preview_state`), "" when none.
+    pub preview: String,
+    /// Why the pull request is still a draft, as recorded (`draft_hold`).
+    pub hold: Option<common::draft_hold::DraftHold>,
+    /// The repository's checks passed on the head (`ci_last`).
+    pub checks_passed: bool,
     /// Its pull request is held as a draft (`draft_hold` on the run): the
     /// run's work waits on CoderHelm's next look, so it is looked at first.
     pub draft_held: bool,
+}
+
+impl Candidate {
+    /// What the pull request waits on with `standing` (`waiting_line`).
+    pub fn waiting_line(&self, standing: Option<&Standing>) -> String {
+        let preview = common::preview::State::from_json(&self.preview);
+        common::waiting_line::line(&common::waiting_line::Inputs {
+            pr: self.pr,
+            standing,
+            hold: self.hold.as_ref(),
+            preview: preview.as_ref(),
+            checks_passed: self.checks_passed,
+        })
+    }
 }
 
 pub fn candidate_of(item: &HashMap<String, AttributeValue>) -> Option<Candidate> {
@@ -361,6 +423,9 @@ pub fn candidate_of(item: &HashMap<String, AttributeValue>) -> Option<Candidate>
             .unwrap_or_default(),
         writer: s(DESCRIPTION_WRITER),
         updated_at: s("updated_at"),
+        preview: s(common::preview::FIELD),
+        hold: common::draft_hold::DraftHold::of_item(item),
+        checks_passed: s("ci_last") == "passed",
         draft_held: item.contains_key(common::draft_hold::FIELD),
     };
     (pr > 0 && c.installation_id > 0 && !c.team_id.is_empty() && !c.run_id.is_empty()).then_some(c)
@@ -622,6 +687,7 @@ async fn perform(
     .await;
     match act {
         Act::Nothing => Performed::Settled,
+        Act::Preview => preview(state, github, c).await,
         Act::ResolveConflict => super::resume::start_conflict_round(
             state,
             &c.team_id,
@@ -706,6 +772,58 @@ async fn perform(
         .await
         .into(),
     }
+}
+
+/// Captures at most one preview per process at a time: a capture runs a
+/// sandbox build for minutes, and a sweep looks at many pull requests.
+static CAPTURING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Moves the head's preview on: starts its checks, reads them, captures
+/// the pages once it is up. When what the description or the ready
+/// decision reads changed, the description is rebuilt and the ready
+/// decision asked again.
+async fn preview(state: &WorkerState, github: &GitHubClient, c: &Candidate) -> Performed {
+    let Ok(pr) = github.get_pull_request(&c.owner, &c.repo, c.pr).await else {
+        return Performed::NotStarted;
+    };
+    let p = super::preview::Pr {
+        team_id: &c.team_id,
+        run_id: &c.run_id,
+        owner: &c.owner,
+        repo: &c.repo,
+        number: c.pr,
+    };
+    let before = common::preview::State::from_json(&c.preview);
+    let Some(mut st) = super::preview::advance(state, github, p, &pr).await else {
+        return Performed::NotStarted;
+    };
+    if st.stage == common::preview::Stage::Ready
+        && !CAPTURING.swap(true, std::sync::atomic::Ordering::SeqCst)
+    {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(9 * 60);
+        super::preview::capture(state, github, p, &mut st, Some(deadline)).await;
+        CAPTURING.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+    let moved = before.as_ref().is_none_or(|b| {
+        b.head != st.head || b.stage != st.stage || b.shots != st.shots || b.checks != st.checks
+    });
+    if moved {
+        info!(run_id = %c.run_id, pr = c.pr, stage = ?st.stage, "PR watch: the preview moved; the description follows");
+        super::description::rebuild_run(
+            state, github, &c.team_id, &c.run_id, &c.owner, &c.repo, c.pr,
+        )
+        .await;
+        super::ready::request_for(
+            state,
+            &c.team_id,
+            c.installation_id,
+            &c.owner,
+            &c.repo,
+            c.pr,
+        )
+        .await;
+    }
+    Performed::Settled
 }
 
 /// Asks for CoderHelm's review of the head.
@@ -839,10 +957,18 @@ pub async fn look(state: &WorkerState, github: &GitHubClient, c: &Candidate) -> 
             (seen, validators)
         }
     };
+    let mut seen = seen;
+    seen.preview_due = seen.open
+        && (preview_due(&c.preview, &seen.head, kept.is_none())
+            || common::preview::State::from_json(&c.preview).is_some_and(|st| {
+                st.head == seen.head && super::preview::unread_failure(&st, &seen.failing)
+            }));
     let mut act = resume_after_limit(&c.status, &seen, &c.marks, &c.limit_ended)
-        .unwrap_or_else(|| decide(&c.status, &seen, &c.marks));
+        .unwrap_or_else(|| decide_all(&c.status, &seen, &c.marks));
     let mut performed = Performed::NotStarted;
-    if let Some((field, value)) = act.claim(&seen) {
+    if act == Act::Preview {
+        performed = perform(state, github, c, &seen, &act).await;
+    } else if let Some((field, value)) = act.claim(&seen) {
         if !claim(state, c, field, &value).await {
             act = Act::Nothing;
         } else {
@@ -871,6 +997,7 @@ pub async fn look(state: &WorkerState, github: &GitHubClient, c: &Candidate) -> 
         kept.as_ref().map(|p| p.human_approved),
     )
     .await;
+    let open = seen.open;
     let probe = match kept {
         // Unchanged: the probe stands as it is.
         Some(_) => None,
@@ -886,7 +1013,17 @@ pub async fn look(state: &WorkerState, github: &GitHubClient, c: &Candidate) -> 
             )
         }
     };
+    // The description's top line says what the pull request waits on:
+    // rebuilt when that changed.
+    let was = c.waiting_line(Standing::from_json(&c.standing).as_ref());
+    let now = c.waiting_line(Some(&s));
     record_look(state, c, Some(&s), probe.as_deref()).await;
+    if was != now && open && act != Act::Preview {
+        super::description::rebuild_run(
+            state, github, &c.team_id, &c.run_id, &c.owner, &c.repo, c.pr,
+        )
+        .await;
+    }
     act
 }
 
@@ -1186,6 +1323,51 @@ mod tests {
             own_verdict: Some(("APPROVE".into(), HEAD.into())),
             ..Default::default()
         }
+    }
+
+    /// A finished run's pull request whose preview checks were skipped
+    /// (its run ended before CoderHelm started previews) is picked back
+    /// up: once nothing else is needed, the watch starts its preview,
+    /// reads it and captures its pages, on every look until it is settled.
+    #[test]
+    fn an_unchecked_preview_is_picked_up_after_the_run_ended() {
+        let mut seen = open();
+        seen.preview_due = preview_due("", &seen.head, true);
+        assert!(seen.preview_due);
+        assert_eq!(
+            decide_all("completed", &seen, &Marks::default()),
+            Act::Preview
+        );
+        // A conflict or red checks come first.
+        let mut red = seen.clone();
+        red.failing = vec!["test".into()];
+        assert!(matches!(
+            decide_all("completed", &red, &Marks::default()),
+            Act::FixCi(_)
+        ));
+        // Settled on this head: nothing; a new head: again.
+        let done = common::preview::State {
+            head: seen.head.clone(),
+            stage: common::preview::Stage::Checked,
+            ..Default::default()
+        }
+        .to_json();
+        assert!(!preview_due(&done, &seen.head, true));
+        assert!(preview_due(&done, "another", false));
+        // Pending and nothing new on the pull request: the next change.
+        let pending = common::preview::State {
+            head: seen.head.clone(),
+            stage: common::preview::Stage::Deploying,
+            ..Default::default()
+        }
+        .to_json();
+        assert!(!preview_due(&pending, &seen.head, false));
+        assert!(preview_due(&pending, &seen.head, true));
+        // Never for a run still in flight.
+        assert_eq!(
+            decide_all("running", &seen, &Marks::default()),
+            Act::Nothing
+        );
     }
 
     #[test]

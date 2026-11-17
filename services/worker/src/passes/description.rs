@@ -554,6 +554,10 @@ struct RunBits {
     convention_evidence: String,
     /// The ticket's page in its tracker, when it is known.
     ticket_url: String,
+    /// Where the head's preview stands (`preview_state`).
+    preview: Option<common::preview::State>,
+    /// What the pull request waits on, one line (`waiting_line`).
+    waiting: String,
 }
 
 impl Gathered {
@@ -586,7 +590,7 @@ impl Gathered {
             title: self.run.title.clone(),
             url: self.run.ticket_url.clone(),
         });
-        super::description_facts::facts(&super::description_facts::Inputs {
+        let mut f = super::description_facts::facts(&super::description_facts::Inputs {
             head: self.head(),
             body,
             files: &self.files,
@@ -610,7 +614,11 @@ impl Gathered {
                 .into_iter()
                 .collect(),
             repo_url: self.pr["base"]["repo"]["html_url"].as_str().unwrap_or(""),
-        })
+        });
+        let preview = self.run.preview.as_ref().filter(|p| p.head == self.head());
+        super::description_facts::with_preview(&mut f, preview);
+        f.waiting = self.run.waiting.clone();
+        f
     }
 }
 
@@ -668,9 +676,35 @@ async fn run_bits(
             convention_note: get(CONVENTION_NOTE),
             convention_evidence: get(CONVENTION_EVIDENCE),
             ticket_url,
+            preview: common::preview::State::from_json(&get(common::preview::FIELD)),
+            waiting: waiting_of(&item, number),
         },
         run_id,
     )
+}
+
+/// What a run's pull request waits on, from what the run records
+/// (`common::waiting_line`).
+pub fn waiting_of(
+    item: &std::collections::HashMap<String, aws_sdk_dynamodb::types::AttributeValue>,
+    number: u64,
+) -> String {
+    let get = |k: &str| {
+        item.get(k)
+            .and_then(|v| v.as_s().ok())
+            .cloned()
+            .unwrap_or_default()
+    };
+    let standing = common::merge_standing::Standing::from_json(&get(common::merge_standing::FIELD));
+    let hold = common::draft_hold::DraftHold::of_item(item);
+    let preview = common::preview::State::from_json(&get(common::preview::FIELD));
+    common::waiting_line::line(&common::waiting_line::Inputs {
+        pr: number,
+        standing: standing.as_ref(),
+        hold: hold.as_ref(),
+        preview: preview.as_ref(),
+        checks_passed: get("ci_last") == "passed",
+    })
 }
 
 /// Reads what a build needs: the pull request, its diff, the head's checks
@@ -939,6 +973,22 @@ pub fn fresh_base(body: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// [`rebuild`] for a run's pull request, its ticket read from the run:
+/// something the description shows changed without a push (the preview's
+/// checks, its captured pages).
+pub async fn rebuild_run(
+    state: &WorkerState,
+    github: &GitHubClient,
+    team_id: &str,
+    run_id: &str,
+    owner: &str,
+    repo: &str,
+    number: u64,
+) -> Reconciled {
+    let ticket = run_ticket(state, team_id, run_id).await;
+    rebuild(state, github, team_id, owner, repo, number, &ticket).await
 }
 
 /// [`reconcile`] for a run's pull request, its ticket read from the run.

@@ -1019,6 +1019,125 @@ pub struct RunMergeStanding {
     pub link: Option<String>,
 }
 
+/// One preview or end-to-end check on the head of the run's pull request.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct RunPreviewCheck {
+    /// The check's name, as GitHub shows it.
+    #[schema(example = "E2E on preview")]
+    pub name: String,
+    /// `passed`, `failed`, `running` or `skipped`.
+    #[schema(example = "passed")]
+    pub outcome: String,
+    /// The check's page on GitHub; empty when it has none.
+    #[schema(example = "https://github.com/acme/web/actions/runs/1/job/2")]
+    pub url: String,
+}
+
+/// One page captured on the preview.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct RunPreviewShot {
+    /// The page's path on the preview.
+    #[schema(example = "/signup")]
+    pub page: String,
+    /// `desktop` or `phone`.
+    #[schema(example = "desktop")]
+    pub width: String,
+    /// The image's address.
+    #[schema(
+        example = "https://github.com/acme/web/blob/abc/pr-1/abc/signup-desktop.png?raw=true"
+    )]
+    pub src: String,
+}
+
+/// Where the preview of the run's pull request head stands
+/// (`common::preview`).
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct RunPreview {
+    /// `not_needed`, `triggered`, `deploying`, `ready`, `checked`,
+    /// `failed` or `blocked`.
+    #[schema(example = "checked")]
+    pub stage: String,
+    /// The preview's address; empty when it isn't known.
+    #[schema(example = "https://pr-1.preview-web.example.com")]
+    pub url: String,
+    /// Labels CoderHelm added to start the preview and its end-to-end checks.
+    #[schema(example = json!(["E2E:signup"]))]
+    pub labels_added: Vec<String>,
+    /// The preview and end-to-end checks that cover the change, on the head.
+    #[schema(example = json!([{"name": "E2E on preview", "outcome": "passed", "url": "https://github.com/acme/web/actions/runs/1/job/2"}]))]
+    pub checks: Vec<RunPreviewCheck>,
+    /// The changed pages captured on the preview, at desktop and phone width.
+    #[schema(example = json!([{"page": "/signup", "width": "desktop", "src": "https://github.com/acme/web/blob/abc/pr-1/abc/signup-desktop.png?raw=true"}]))]
+    pub shots: Vec<RunPreviewShot>,
+    /// Why there is no preview or no capture, one line; empty otherwise.
+    #[schema(example = "")]
+    pub why: String,
+    /// The change alters what a person sees in a repository with an
+    /// end-to-end suite, so it needs an end-to-end spec.
+    #[schema(example = true)]
+    pub e2e_required: bool,
+    /// The change adds or updates an end-to-end spec.
+    #[schema(example = true)]
+    pub e2e_covered: bool,
+}
+
+fn preview_of(item: &run_search::Item) -> Option<RunPreview> {
+    let st = item
+        .get(common::preview::FIELD)
+        .and_then(|v| v.as_s().ok())
+        .and_then(|s| common::preview::State::from_json(s))?;
+    let word = |v: serde_json::Value| v.as_str().unwrap_or("").to_string();
+    Some(RunPreview {
+        stage: word(serde_json::to_value(st.stage).unwrap_or_default()),
+        url: st.url,
+        labels_added: st.labels_added,
+        checks: st
+            .checks
+            .into_iter()
+            .map(|c| RunPreviewCheck {
+                name: c.name,
+                outcome: word(serde_json::to_value(c.outcome).unwrap_or_default()),
+                url: c.url,
+            })
+            .collect(),
+        shots: st
+            .shots
+            .into_iter()
+            .map(|s| RunPreviewShot {
+                page: s.page,
+                width: s.width,
+                src: s.src,
+            })
+            .collect(),
+        why: st.why,
+        e2e_required: st.e2e_required,
+        e2e_covered: st.e2e_covered,
+    })
+}
+
+/// What the run's pull request waits on, in one line, from what the run
+/// records (`common::waiting_line`). None before it has a pull request.
+fn waiting_line_of(item: &run_search::Item) -> Option<String> {
+    let s = |k: &str| item.get(k).and_then(|v| v.as_s().ok()).cloned();
+    let pr = item
+        .get("pr_number")
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse::<u64>().ok())
+        .filter(|n| *n > 0)?;
+    let standing = s(common::merge_standing::FIELD)
+        .and_then(|j| common::merge_standing::Standing::from_json(&j));
+    let hold = common::draft_hold::DraftHold::of_item(item);
+    let preview = s(common::preview::FIELD).and_then(|j| common::preview::State::from_json(&j));
+    let line = common::waiting_line::line(&common::waiting_line::Inputs {
+        pr,
+        standing: standing.as_ref(),
+        hold: hold.as_ref(),
+        preview: preview.as_ref(),
+        checks_passed: s("ci_last").as_deref() == Some("passed"),
+    });
+    (!line.is_empty()).then_some(line)
+}
+
 fn merge_standing_of(item: &run_search::Item) -> Option<RunMergeStanding> {
     let s = item
         .get(common::merge_standing::FIELD)
@@ -1296,6 +1415,18 @@ pub struct Run {
     /// at the pull request.
     #[schema(example = json!(null))]
     pub merge_standing: Option<RunMergeStanding>,
+    /// What the run's pull request waits on, in one plain line, and
+    /// whether it is ready for review: "Waiting on: an approving review from
+    /// a person on #12 (this repo requires one before CoderHelm merges).
+    /// Ready for review: checks passed, preview checked." Built from
+    /// `merge_standing`, `draft_hold` and `preview`. Null before the run
+    /// has a pull request.
+    #[schema(example = json!(null))]
+    pub waiting_line: Option<String>,
+    /// Where the preview of the pull request's head stands: its checks,
+    /// address and captured pages. Null when nothing was recorded.
+    #[schema(example = json!(null))]
+    pub preview: Option<RunPreview>,
     /// The CI checks on the head of the run's open pull request, read from
     /// GitHub (reused for up to a minute). Null when the run has no open
     /// pull request or GitHub can't be read.
@@ -1896,6 +2027,8 @@ fn run_of(
         },
         draft_hold: draft_hold_of(item),
         merge_standing: merge_standing_of(item),
+        waiting_line: waiting_line_of(item),
+        preview: preview_of(item),
         checks: None,
         pr_review: None,
         pr_review_comments: None,

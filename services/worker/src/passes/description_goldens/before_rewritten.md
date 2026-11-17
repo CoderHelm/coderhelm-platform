@@ -50,6 +50,8 @@ Adds the warning rule.
 <summary>Full test evidence</summary><!-- fold -->
 
 <!-- coderhelm:all-checks -->
+How to check: `npm test -- hero-block-validation`.
+
 Every check on this head:
 - [`Lint and typecheck`](https://ci.example.com/Lint-and-typecheck): passed
 - [`Unit tests`](https://ci.example.com/Unit-tests): passed

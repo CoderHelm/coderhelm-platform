@@ -157,6 +157,7 @@ pub mod knowledge;
 // Reading the team's repositories for Chat (overview, files, search).
 pub mod repo_read;
 // The test that every model call site is a metered helper
+pub mod ci_cover;
 #[cfg(test)]
 mod model_call_sites;
 /// Which pull requests CoderHelm may push to, edit or close: its own.
@@ -189,7 +190,9 @@ pub mod pr_review;
 pub mod pr_steps;
 /// A repository's pull request template as the description's structure.
 pub mod pr_template;
+pub mod preview;
 pub mod run_prs;
+pub mod waiting_line;
 // review_stats: time-ordered review records for analytics
 /// How a comment reads: the renderer and lint every comment passes before
 /// it is posted (short, plain, no pasted plans, no history).

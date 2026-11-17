@@ -217,14 +217,17 @@ pub async fn run(
         repo_instructions
     };
     let instructions_block = super::format_instructions_block(trimmed_instructions);
-    let tests_block =
+    let tests_block = format!(
+        "{}{}",
         if super::review_pr::tests_required(state, &msg.team_id, &msg.repo_owner, &msg.repo_name)
             .await
         {
             super::TESTS_REQUIRED_CODER_SECTION
         } else {
             ""
-        };
+        },
+        super::E2E_CODER_SECTION
+    );
     // The team's instructions are never trimmed: they are its working rules.
     // What outcomes taught the coder here (lessons naming what people
     // changed, and the prompt variant its bandit picked) sits with the
@@ -234,7 +237,7 @@ pub async fn run(
         &msg.repo_name,
         &format!("{rules_block}{instructions_block}{}", msg.coder_learning),
         &msg.team_instructions,
-        tests_block,
+        &tests_block,
     );
 
     let feedback_section = match review_feedback {
@@ -702,6 +705,7 @@ pub async fn run(
         ),
     );
     tools.push(super::web_check::tool());
+    tools.push(super::web_check::probe_tool());
     full_system.push_str(&web.prompt_section());
     full_system.push_str(super::link_checks::CODER_NOTE);
     let ops = super::ops_tools::OpsTools::load(

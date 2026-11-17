@@ -170,6 +170,64 @@ pub(crate) async fn named_labels(
         .unwrap_or_default()
 }
 
+/// The review's findings for changed end-to-end files that drive another
+/// company's page with test ids or JSON fields no probe recorded in the
+/// repository (`common::e2e::probe`) observed.
+async fn probe_gaps(
+    state: &WorkerState,
+    github: &GitHubClient,
+    (team_id, owner, repo): (&str, &str, &str),
+    head_sha: &str,
+    compare: &serde_json::Value,
+    tree: &[String],
+) -> Vec<super::review_agent::Finding> {
+    let suite = common::preview::e2e_suite(tree);
+    let mut files = Vec::new();
+    for f in compare["files"].as_array().into_iter().flatten().take(60) {
+        let path = f["filename"].as_str().unwrap_or("");
+        let is_e2e = match &suite {
+            Some(s) => common::preview::is_e2e_spec(path, s),
+            None => path.contains("e2e/") || path.contains(".spec.") || path.contains(".cy."),
+        };
+        if !is_e2e || f["status"].as_str() == Some("removed") {
+            continue;
+        }
+        let added: String = f["patch"]
+            .as_str()
+            .unwrap_or("")
+            .lines()
+            .filter(|l| l.starts_with('+') && !l.starts_with("+++"))
+            .map(|l| &l[1..])
+            .collect::<Vec<_>>()
+            .join("\n");
+        if added.is_empty() {
+            continue;
+        }
+        let full = github
+            .read_file(owner, repo, path, head_sha)
+            .await
+            .unwrap_or_else(|_| added.clone());
+        files.push((path.to_string(), full, added));
+    }
+    if files.is_empty() {
+        return Vec::new();
+    }
+    let mut probes = Vec::new();
+    for p in tree
+        .iter()
+        .filter(|p| common::e2e::probe::is_record(p))
+        .take(20)
+    {
+        if let Ok(text) = github.read_file(owner, repo, p, head_sha).await {
+            if let Ok(r) = serde_json::from_str::<common::e2e::probe::ProbeRecord>(&text) {
+                probes.push(r);
+            }
+        }
+    }
+    let own = super::web_check::team_domains(state, team_id).await;
+    super::review_rules::probe_findings(&common::e2e::probe::unprobed(&files, &probes, &own))
+}
+
 /// True when the repo turned on "Require tests" (and review isn't off/killed).
 /// The same switch makes the reviewer block untested behavior changes and makes
 /// CoderHelm's own coding passes write those tests.
@@ -3356,6 +3414,39 @@ async fn run_once(
             refused_exemptions = ruled.refused,
             "Findings held to the repository's required rules"
         );
+    }
+    // A change a person sees, in a repository with an end-to-end suite,
+    // carries a spec for it: a finding by rule, read from the paths and the
+    // tree, whatever the model said.
+    if let Ok(tree) = github
+        .get_tree(&msg.repo_owner, &msg.repo_name, &head_sha)
+        .await
+    {
+        let tree: Vec<String> = tree.into_iter().map(|e| e.path).collect();
+        if let Some(f) = super::review_rules::e2e_finding(&changed_list, &tree) {
+            info!(
+                pr = msg.pr_number,
+                "A visible change with no end-to-end spec: must fix"
+            );
+            findings.retain(|x| x.title != f.title);
+            findings.push(f);
+        }
+        // End-to-end code against another company's page: only test ids
+        // and fields a probe of that page observed.
+        for f in probe_gaps(
+            state,
+            &github,
+            (&msg.team_id, &msg.repo_owner, &msg.repo_name),
+            &head_sha,
+            &compare,
+            &tree,
+        )
+        .await
+        {
+            info!(pr = msg.pr_number, file = %f.file, "End-to-end selectors no probe observed: must fix");
+            findings.retain(|x| x.title != f.title || x.file != f.file);
+            findings.push(f);
+        }
     }
     review_agent::enforce_source_data_override(&mut findings);
     // A request to test something by hand is a note, never a block.

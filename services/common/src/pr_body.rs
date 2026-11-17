@@ -234,6 +234,9 @@ pub enum Screens {
     },
     /// One line: why there is no screenshot.
     Missing(String),
+    /// Each changed page captured on the preview: its path, then the
+    /// desktop and phone images (empty when that width didn't load).
+    Pages(Vec<(String, String, String)>),
 }
 
 // ── The body ───────────────────────────────────────────────────────────
@@ -267,6 +270,9 @@ pub struct Body {
     pub results_of: String,
     /// One sentence, only when merging without an action breaks something.
     pub alert: String,
+    /// What the pull request waits on, in one line (`waiting_line`): the
+    /// first thing a reader sees.
+    pub waiting: String,
     pub summary: String,
     /// Work CoderHelm did outside the diff, one sentence.
     pub outside: String,
@@ -764,6 +770,30 @@ fn screens_markdown(s: &Screens) -> String {
             )
         }
         Screens::Missing(why) => format!("No screenshot: {}.", part(why)),
+        Screens::Pages(pages) => {
+            let img = |src: &str, alt: String| {
+                if src.starts_with("https://") {
+                    format!(
+                        "<img src=\"{}\" width=\"{}\" alt=\"{}\">",
+                        src.replace('"', "%22"),
+                        if alt.contains("phone") { 180 } else { 380 },
+                        alt.replace('"', "'")
+                    )
+                } else {
+                    "didn't load".to_string()
+                }
+            };
+            let mut out = String::from("| Page | Desktop | Phone |\n|---|---|---|\n");
+            for (page, desktop, phone) in pages {
+                let p = one_line(page).replace('|', "/").replace('`', "'");
+                out.push_str(&format!(
+                    "| `{p}` | {} | {} |\n",
+                    img(desktop, format!("{p} at desktop width")),
+                    img(phone, format!("{p} at phone width"))
+                ));
+            }
+            out.trim_end().to_string()
+        }
     }
 }
 
@@ -842,9 +872,13 @@ fn blocks(b: &Body) -> Blocks {
     } else {
         String::new()
     };
-    if !alert.is_empty() {
-        out.alert = format!("> [!IMPORTANT]\n> {alert}.");
-    }
+    let waiting = one_line(&b.waiting);
+    out.alert = match (waiting.is_empty(), alert.is_empty()) {
+        (true, true) => String::new(),
+        (true, false) => format!("> [!IMPORTANT]\n> {alert}."),
+        (false, true) => format!("> [!NOTE]\n> {waiting}"),
+        (false, false) => format!("> [!IMPORTANT]\n> {waiting} {alert}."),
+    };
     out.summary = summary_paragraph(&b.summary, ticket, &b.outside);
     if !b.needed.is_empty() {
         let mut s = String::from("### Needed from you\n\n");

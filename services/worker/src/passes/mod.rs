@@ -1343,6 +1343,7 @@ mod pr_holder;
 pub mod pr_outcomes;
 mod pr_risk;
 pub mod pr_watch;
+pub mod preview;
 mod proof;
 pub mod quarantine;
 pub mod quarantine_work;
@@ -10043,6 +10044,23 @@ must be added to), follow those too.\n\
 config values, dependency bumps or generated files.\n\
 - Never weaken, skip, or delete an existing test to make it pass; fix the code, or update the \
 test only when the behavior change is intended.\n";
+
+/// Coding-agent instructions in every repository: a change a person sees in
+/// the browser, in a repository with an end-to-end suite, carries a spec.
+/// The rule is enforced in code (the Tests and scope check, the reviewer's
+/// required finding and the ready decision, all from
+/// `common::preview::e2e_need`); this tells the coder before it is asked.
+pub(crate) const E2E_CODER_SECTION: &str = "\n\n## End-to-end tests for what a person sees\n\
+When the change alters what a person sees or does in the browser (a page, a form, a message, a \
+flow) and the repository has an end-to-end suite (a Playwright or Cypress config), write or update \
+an end-to-end spec in that suite for the new behaviour, in this same branch. Follow the suite's own \
+conventions: its folder, page objects and fixtures, tags and area labels, its test map, and the \
+AGENTS.md / CLAUDE.md files next to it. The spec must fail without the change and pass with it; \
+CoderHelm runs it on the pull request's preview. Unit tests alone don't cover a change a person sees. \
+Assert what the person sees. Before writing selectors or reading JSON of a page another company serves \
+(a payment form, a sign-in widget), probe it with `probe_page` (on the preview or the vendor's URL), commit \
+the record it returns, quote the test ids and fields you use in the pull request, and use only those: the \
+review flags any it can't find in a probe.\n";
 
 pub(crate) fn attr_s(val: &str) -> aws_sdk_dynamodb::types::AttributeValue {
     aws_sdk_dynamodb::types::AttributeValue::S(val.to_string())

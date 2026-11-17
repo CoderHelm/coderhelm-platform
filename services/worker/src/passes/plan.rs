@@ -289,6 +289,16 @@ pub async fn run(
         } else {
             ""
         };
+    // Every repository: a change a person sees, where the repository has an
+    // end-to-end suite, plans its spec (enforced after the build by
+    // `common::preview::e2e_need`).
+    let tests_block = format!(
+        "{tests_block}\n\n## End-to-end tests\n\
+         When the change alters what a person sees in the browser and the repository has an \
+         end-to-end suite, tasks.md MUST include a task that writes or updates the end-to-end spec \
+         for the new behaviour, at its exact path in the suite, following the suite's conventions \
+         (page objects, tags, area labels, test map)."
+    );
     let system = format!(
         "You are the planning engineer for the {owner}/{repo} repository. {stance}\
          Research the codebase using the provided tools, then generate an implementation plan \

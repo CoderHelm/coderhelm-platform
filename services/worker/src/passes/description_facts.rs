@@ -460,6 +460,106 @@ pub fn facts(i: &Inputs<'_>) -> Facts {
     f
 }
 
+/// The head's preview in the facts: its state, its address, the commands
+/// that check the changed area, and each check that covers the change and
+/// didn't run, as something not verified yet (never as evidence).
+pub fn with_preview(f: &mut Facts, preview: Option<&common::preview::State>) {
+    let Some(p) = preview else {
+        return;
+    };
+    f.preview = Some(p.clone());
+    if p.url.starts_with("https://") {
+        f.preview_url = p.url.clone();
+    }
+    if !p.how_to_check.trim().is_empty() {
+        f.how_to_check = p.how_to_check.clone();
+    }
+    for g in common::pr_facts::preview_gaps(f) {
+        f.unverified.push(Unverified {
+            what: format!("`{g}` on this head"),
+            why: "it covers this change and hasn't run yet; CoderHelm starts it on the preview and reads its result".into(),
+        });
+    }
+    if p.e2e_required && !p.e2e_covered {
+        f.unverified.push(Unverified {
+            what: "an end-to-end spec for the change a person sees".into(),
+            why: "the repository has an end-to-end suite and the change adds no spec to it; CoderHelm writes one".into(),
+        });
+    }
+    scope_to_change(f);
+}
+
+/// The backticked check commands a line names.
+fn commands_in(text: &str) -> Vec<String> {
+    text.split('`')
+        .skip(1)
+        .step_by(2)
+        .filter(|c| common::ci_cover::is_check_command(c))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Holds "How to check" and Open items to the change: a check command
+/// aimed at a folder the change doesn't touch is dropped (the CI job that
+/// covers the change, or "no CI job covers this", is said instead), and a
+/// failed end-to-end check is said from its own report, never "couldn't be
+/// read" while it has one (`common::ci_cover`, `common::e2e::failure_read`).
+pub fn scope_to_change(f: &mut Facts) {
+    let Some(p) = f.preview.clone() else {
+        return;
+    };
+    let changed: Vec<String> = f.files.iter().map(|x| x.path.clone()).collect();
+    let fits = |t: &str| {
+        commands_in(t)
+            .iter()
+            .all(|c| common::ci_cover::command_fits(c, &changed))
+    };
+    let before = f.open.len() + f.unverified.len();
+    f.open.retain(|o| fits(&o.text));
+    f.unverified.retain(|u| fits(&u.what) && fits(&u.why));
+    if !p.failures.is_empty() {
+        let unread = |t: &str| common::e2e::failure_read::says_unreadable(t);
+        f.open.retain(|o| !unread(&o.text));
+        f.unverified.retain(|u| !unread(&u.what) && !unread(&u.why));
+    }
+    let dropped = before != f.open.len() + f.unverified.len();
+    if !fits(&f.how_to_check) {
+        f.how_to_check = match p.ci_jobs.first() {
+            Some(j) => {
+                let cmd = j.commands.first().cloned().unwrap_or_default();
+                if j.dir.is_empty() {
+                    format!("`{cmd}`")
+                } else {
+                    format!("`cd {} && {cmd}`", j.dir)
+                }
+            }
+            None => String::new(),
+        };
+    }
+    let ci = common::ci_cover::line(&p.ci_jobs);
+    if !f.evidence.contains(&ci) {
+        f.evidence.push(ci.clone());
+    }
+    if dropped && p.ci_jobs.is_empty() && !f.notes.contains(&format!("{ci}.")) {
+        f.notes.push(format!("{ci}."));
+    }
+    for r in &p.failures {
+        let line = r.line();
+        if !f.evidence.contains(&line) {
+            f.evidence.push(line.clone());
+        }
+        let what = format!("`{}` on this head", r.check);
+        if matches!(r.cause, common::e2e::failure_read::Cause::ThisChange(_))
+            && !f.unverified.iter().any(|u| u.what == what)
+        {
+            f.unverified.push(Unverified {
+                what,
+                why: "it fails because of this change (its report says why); CoderHelm fixes it like any failing check".into(),
+            });
+        }
+    }
+}
+
 /// A description in its final shape, the facts it shows and what the check
 /// corrected on the way.
 #[derive(Debug, Clone)]
@@ -568,7 +668,16 @@ pub fn shape_for(
         &earlier,
         if own.is_empty() { from_title } else { own },
     );
-    facts.how_to_check = first(&slots.check, &prior.check, check_of(&checked));
+    // The commands read from the change itself (its specs and tests) come
+    // before any written one: a bare suite command never stands for them.
+    let computed = std::mem::take(&mut facts.how_to_check);
+    facts.how_to_check = if computed.trim().is_empty() {
+        first(&slots.check, &prior.check, check_of(&checked))
+    } else {
+        computed
+    };
+    // Open items were read again from the text: held to the change again.
+    scope_to_change(&mut facts);
     let checked = pr_reader::without_sections(&checked, &slots.drop);
     // 3. The visible part, the generated blocks below it and the steps and
     //    evidence, from the facts; the written text goes in the first fold.
