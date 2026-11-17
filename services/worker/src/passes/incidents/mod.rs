@@ -61,6 +61,8 @@ mod bs_cut_plan_revision;
 mod bt_proof_answer_closes;
 mod bu_coder_shell_refusals;
 mod bu_held_draft_after_release;
+mod bv_no_limit_hands_to_a_person;
+mod bw_dependency_pr_review;
 mod c_codegen_egress;
 mod d_echoed_markers;
 mod e_large_generated_output;

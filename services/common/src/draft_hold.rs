@@ -19,7 +19,12 @@
 //! - a wait CoderHelm settles by itself ([`Kind::Waiting`]) leaves the
 //!   status alone and says what it waits for;
 //! - once the pull request is ready (or closed), the hold is removed and
-//!   `draft_settled` says how it ended, so the sweep stops looking at it.
+//!   `draft_settled` says how it ended, so the sweep stops looking at it;
+//! - only a reason on the human-only list (`crate::handback::HumanOnly`)
+//!   makes a hold a person's ([`Reason::person`], [`DraftHold::needs_person`]).
+//!   Every other reason is CoderHelm's own to finish, or to list as its note
+//!   on a pull request that goes ready: a red check, a stalled wait, a
+//!   finding its rounds left, planned work it deferred.
 
 use std::collections::HashMap;
 
@@ -59,6 +64,10 @@ pub struct Reason {
     /// What to do about it, in plain words.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub todo: String,
+    /// The human-only reason a person is needed for it (`HumanOnly::code`);
+    /// empty for everything CoderHelm finishes or notes itself.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub human: String,
 }
 
 fn one_line(s: &str, max: usize) -> String {
@@ -71,7 +80,26 @@ impl Reason {
         Reason {
             what: one_line(what.as_ref(), MAX_WHAT),
             todo: one_line(todo.as_ref(), MAX_TODO),
+            human: String::new(),
         }
+    }
+
+    /// A reason only a person can settle, for `why` on the human-only list:
+    /// the one way a hold becomes a person's.
+    pub fn person(
+        why: crate::handback::HumanOnly,
+        what: impl AsRef<str>,
+        todo: impl AsRef<str>,
+    ) -> Self {
+        Reason {
+            human: why.code().to_string(),
+            ..Reason::new(what, todo)
+        }
+    }
+
+    /// The human-only reason it needs a person for, if any.
+    pub fn human_only(&self) -> Option<crate::handback::HumanOnly> {
+        crate::handback::HumanOnly::from_code(&self.human)
     }
 
     /// `what. todo`, one sentence each.
@@ -116,6 +144,14 @@ pub struct DraftHold {
     /// every held draft at once, never an hour later.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub version: String,
+    /// Times CoderHelm took its own next action on a wait that stalled on
+    /// this head (`ready::MAX_STALL_RETRIES`).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub retried: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 /// A wait whose reason hasn't changed on the same head for this long is a
@@ -145,6 +181,7 @@ impl DraftHold {
             checked_at: now,
             head: String::new(),
             ready: false,
+            retried: 0,
             version: String::new(),
         })
     }
@@ -191,9 +228,12 @@ impl DraftHold {
         self.version != version
     }
 
-    /// Whether a person must act (the run waits on them).
+    /// Whether a person must act (the run waits on them): only a held
+    /// pull request with a reason on the human-only list. A hold for
+    /// anything else, and GitHub refusing to mark it ready, are CoderHelm's
+    /// to finish.
     pub fn needs_person(&self) -> bool {
-        matches!(self.kind, Kind::Held | Kind::Failed)
+        self.kind == Kind::Held && self.reasons.iter().any(|r| r.human_only().is_some())
     }
 
     fn pr_words(&self) -> String {
@@ -296,7 +336,8 @@ mod tests {
         );
         let h = DraftHold::new(
             Kind::Held,
-            vec![Reason::new(
+            vec![Reason::person(
+                crate::handback::HumanOnly::MissingAccess,
                 "Security items are open in the description",
                 "Fix them on this branch, or delete each line once it is checked.",
             )],
@@ -310,6 +351,9 @@ mod tests {
              description. Fix them on this branch, or delete each line once it is checked."
         );
         assert!(h.needs_person());
+        // The same reason without a human-only one is CoderHelm's to finish.
+        let own = DraftHold::new(Kind::Held, vec![Reason::new("x", "y")], 583, "").unwrap();
+        assert!(!own.needs_person());
         let w = h.waiting_on();
         assert_eq!(w.action, "Deal with what keeps pull request #583 a draft");
         assert!(w.detail.contains("Security items"));

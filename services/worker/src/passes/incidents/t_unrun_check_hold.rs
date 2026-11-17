@@ -66,7 +66,7 @@ fn facts(body: &str, ci_green: bool) -> Facts {
 fn a_tooling_failure_written_as_a_blocked_line_stops_holding_once_ci_is_green() {
     let body = the_description_as_written();
     // While CI hasn't passed, the check it couldn't run is still unsettled.
-    match ready::decide(&facts(&body, false)) {
+    match ready::found(&facts(&body, false)) {
         Decision::Held { reasons } => assert!(reasons.iter().any(|r| r.what.contains(OLD))),
         d => panic!("held while CI isn't green, got {d:?}"),
     }
@@ -107,7 +107,7 @@ fn a_check_the_change_really_failed_still_holds_with_ci_green() {
         "two new blocks aren't registered in the schema index",
     )]);
     let body = format!("## Summary\nx\n\n{gaps}");
-    match ready::decide(&facts(&body, true)) {
+    match ready::found(&facts(&body, true)) {
         Decision::Held { reasons } => assert!(reasons.iter().any(|r| r.what.contains(OLD))),
         d => panic!("a real failed check holds, got {d:?}"),
     }
@@ -177,6 +177,6 @@ fn the_pipeline_writes_gate_errors_through_check_item() {
         );
     }
     let ready = include_str!("../ready.rs");
-    assert!(super::fixture::fn_src(ready, "pub fn decide(")
+    assert!(super::fixture::fn_src(ready, "fn decide_raw(")
         .contains("body_holds_on(&f.body, f.ci.green)"));
 }
