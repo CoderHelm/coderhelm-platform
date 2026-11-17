@@ -161,6 +161,9 @@ pub mod ci_cover;
 /// The last check on a pull request description: no section twice, no
 /// deploy maps, no empty "who this affects".
 pub mod description_lint;
+// A diff holds the lines the change needs: formatting-only hunks are told
+// apart and put back.
+pub mod diff_shape;
 #[cfg(test)]
 mod model_call_sites;
 /// Which pull requests CoderHelm may push to, edit or close: its own.
