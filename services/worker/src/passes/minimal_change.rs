@@ -556,6 +556,101 @@ pub fn replacing(diff: &Diff, base: &[(String, String)]) -> Vec<Widening> {
     out
 }
 
+// ── What a helper does to stored rows ──────────────────────────────────────
+
+/// What a function does to rows already stored.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Writes {
+    /// It adds rows and leaves existing ones as they are.
+    InsertOnly,
+    /// It deletes, overwrites or replaces existing rows; the statements
+    /// that show it.
+    Replacing(Vec<String>),
+    /// It writes nothing the check can see.
+    None,
+}
+
+const INSERTS: &[&str] = &[
+    "insert into",
+    "do nothing",
+    "on_conflict_do_nothing",
+    "bulk_create(",
+    "insert_many(",
+    "insert_one(",
+    ".add(",
+    ".create(",
+    "get_or_create(",
+];
+
+/// The text of the top-level definition `name` in `text`: from its line to
+/// the next top-level definition (or a line back at the left margin that
+/// isn't a closing bracket or a decorator).
+pub fn body_of(text: &str, path: &str, name: &str) -> Option<String> {
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines
+        .iter()
+        .position(|l| top_level_def(l, path).is_some_and(|d| d.name == name))?;
+    let mut out = vec![lines[start]];
+    for l in &lines[start + 1..] {
+        let t = l.trim_start();
+        let at_margin = !l.is_empty() && !l.starts_with([' ', '\t']);
+        if at_margin && !(t.starts_with('}') || t.starts_with(')') || t.starts_with(']')) {
+            break;
+        }
+        out.push(l);
+    }
+    Some(out.join("\n"))
+}
+
+/// What a function body does to stored rows: deleting or overwriting
+/// statements (or a delete followed by an insert, a `.set(` that replaces a
+/// relation) make it replacing; an insert with none of them, insert only.
+pub fn write_semantics(body: &str) -> Writes {
+    let lines: Vec<&str> = body
+        .lines()
+        .filter(|l| {
+            let t = l.trim_start();
+            !(t.starts_with('#') || t.starts_with("//") || t.starts_with("--"))
+        })
+        .collect();
+    let low = lines.join("\n").to_lowercase();
+    let mut how: Vec<String> = REPLACING
+        .iter()
+        .filter(|(t, _)| low.contains(t))
+        .map(|(_, n)| n.to_string())
+        .collect();
+    let writes_db = [
+        "execute(", "query(", ".save(", "insert", "session.", "cursor",
+    ]
+    .iter()
+    .any(|w| low.contains(w));
+    if low.contains(".set(") && writes_db {
+        how.push("a `.set(` that replaces a relation".to_string());
+    }
+    let delete = low.find("delete ").or_else(|| low.find("delete("));
+    let insert = low.rfind("insert");
+    if let (Some(d), Some(i)) = (delete, insert) {
+        if d < i && !how.iter().any(|h| h.contains("DELETE")) {
+            how.push("a delete followed by an insert".to_string());
+        }
+    }
+    if !how.is_empty() {
+        return Writes::Replacing(how);
+    }
+    if INSERTS.iter().any(|t| low.contains(t)) {
+        return Writes::InsertOnly;
+    }
+    Writes::None
+}
+
+/// Whether the code paths in `texts` only insert: at least one insert and
+/// no deleting or overwriting statement.
+pub fn inserts_only(texts: &[&str]) -> bool {
+    let all = texts.join("\n");
+    matches!(write_semantics(&all), Writes::InsertOnly)
+}
+
 // ── Logging and reporting ──────────────────────────────────────────────────
 
 const LEVELS: &[&str] = &[
@@ -1077,6 +1172,39 @@ mod tests {
         // Our own page, or no criterion, is a test's own business.
         assert!(vendor_flips("e2e/portal.spec.ts", patch, false, &criteria).is_empty());
         assert!(vendor_flips("e2e/portal.spec.ts", patch, true, &[]).is_empty());
+    }
+
+    #[test]
+    fn what_a_helper_does_to_existing_rows() {
+        let text = "def upsert_multi_sport_links(cur, group_id, sport_ids):\n    cur.execute(\"DELETE FROM group_sport WHERE group_id = %s AND NOT (sport_id = ANY(%s))\", (group_id, sport_ids))\n    for s in sport_ids:\n        cur.execute(\"INSERT INTO group_sport VALUES (%s, %s) ON CONFLICT DO NOTHING\", (group_id, s))\n\n\ndef upsert_group_sport_link(cur, group_id, sport_id):\n    cur.execute(\"INSERT INTO group_sport VALUES (%s, %s) ON CONFLICT DO NOTHING\", (group_id, sport_id))\n\n\ndef sport_names(name):\n    return OVERRIDES.get(name, [])\n";
+        let replacing = body_of(text, "a.py", "upsert_multi_sport_links").unwrap();
+        assert!(!replacing.contains("def upsert_group_sport_link"));
+        assert_eq!(
+            write_semantics(&replacing),
+            Writes::Replacing(vec!["`DELETE FROM`".to_string()])
+        );
+        let insert = body_of(text, "a.py", "upsert_group_sport_link").unwrap();
+        assert_eq!(write_semantics(&insert), Writes::InsertOnly);
+        let read = body_of(text, "a.py", "sport_names").unwrap();
+        assert_eq!(write_semantics(&read), Writes::None);
+        assert!(inserts_only(&[&insert]));
+        assert!(!inserts_only(&[&insert, &replacing]));
+        // An upsert that overwrites, and a relation replaced with `.set(`.
+        assert!(matches!(
+            write_semantics("INSERT INTO t VALUES (1) ON CONFLICT (id) DO UPDATE SET v = 1"),
+            Writes::Replacing(_)
+        ));
+        assert!(matches!(
+            write_semantics("group.sports.set(ids)\ngroup.save()"),
+            Writes::Replacing(_)
+        ));
+        assert_eq!(write_semantics("cache.set(k, v)"), Writes::None);
+        // A TypeScript helper body ends at its closing brace.
+        let ts = "export function linkAll(db, ids) {\n  return db.query('DELETE FROM l WHERE id = $1', ids);\n}\nexport const other = 1;\n";
+        assert!(matches!(
+            write_semantics(&body_of(ts, "a.ts", "linkAll").unwrap()),
+            Writes::Replacing(_)
+        ));
     }
 
     #[test]

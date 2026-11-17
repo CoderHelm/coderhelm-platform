@@ -957,8 +957,23 @@ Then the ```fix_location.json block described above."#,
         common::run_questions::answers_note(&msg.answers)
     );
     let is_feature = intent == super::triage::TicketIntent::Feature;
-    let shape_gaps =
+    let mut shape_gaps =
         super::plan_shape::plan_gaps(&draft, &ticket_words, is_feature, &existing_names);
+    // What the reused helpers do to stored rows, read from their bodies: a
+    // replacing helper on a path that only inserts deleted rows nobody asked
+    // about.
+    let write_facts = super::plan_shape::read_write_facts(
+        &executor.read_only,
+        github,
+        (&msg.repo_owner, &msg.repo_name, &msg.base_branch),
+        &draft,
+    )
+    .await;
+    shape_gaps.extend(super::plan_shape::write_gaps(
+        &draft,
+        &ticket_words,
+        &write_facts,
+    ));
     back.extend(shape_gaps.iter().cloned());
     // A decision that stops without a fix names the one step a person takes.
     back.extend(super::fix_location::next_step_gaps(draft.fix.as_ref()));
@@ -1446,7 +1461,16 @@ Then the ```fix_location.json block described above."#,
         }
     }
     if !shape_gaps.is_empty() {
-        let left = super::plan_shape::plan_gaps(&files, &ticket_words, is_feature, &existing_names);
+        let mut left =
+            super::plan_shape::plan_gaps(&files, &ticket_words, is_feature, &existing_names);
+        let facts = super::plan_shape::read_write_facts(
+            &executor.read_only,
+            github,
+            (&msg.repo_owner, &msg.repo_name, &msg.base_branch),
+            &files,
+        )
+        .await;
+        left.extend(super::plan_shape::write_gaps(&files, &ticket_words, &facts));
         if !left.is_empty() {
             warn!(ticket_id = %msg.ticket_id, gaps = ?left, "Plan is still not the smallest change after one send-back");
             super::add_progress_note(

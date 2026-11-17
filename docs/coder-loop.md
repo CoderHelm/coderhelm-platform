@@ -60,6 +60,14 @@ The causes were in the loop, not only in prompt wording:
    - would change a test to match an outside system while the ticket's acceptance
      criteria say what the product must do.
 
+   The Reuse section also says, for each helper that writes data, whether it
+   only inserts or replaces and deletes. The worker reads each reused helper's
+   body (`minimal_change::write_semantics`: a `DELETE`, an `ON CONFLICT DO
+   UPDATE`, a delete-then-insert, a relation `.set(`). A plan that reuses a
+   replacing helper on a path that only inserts today is sent back unless the
+   ticket asks to replace. The camps run's plan named the right map, then
+   reused the link helper that deletes every link it isn't given.
+
    Whatever is still open after the one send-back stays on the decision.
 
 4. **Implement.** In the coder's tool loop (`explore_guard`):
@@ -88,7 +96,17 @@ The causes were in the loop, not only in prompt wording:
    behaviour against an acceptance criterion are required findings
    (`review_rules::SMALLEST_RULE`).
 
-6. **Prove.** Each new or changed test runs in the sandbox with and without the
+6. **Prove.**
+   The first round works out how the repository's CI installs and
+   runs its tests (`common::test_env`: the test job's working folder, Python
+   and Node versions, install steps and test steps). It records this on the
+   run (`test_setup`). Every sandbox build of every later round, and the proof
+   step's runs, restore that install from a cache named by the install steps
+   and the manifests' blob ids. Only the first build installs and saves it.
+   The coder is told the environment is ready and how the tests run. One run
+   reinstalled its dependencies eighteen times, about 25 minutes of builds.
+
+   Each new or changed test runs in the sandbox with and without the
    change (`habits_check`). A test the runner finds nothing in goes back to the
    coder, and the coder quotes the run's output in its Evidence. End-to-end code
    against another company's page uses only what a probe observed (#734).

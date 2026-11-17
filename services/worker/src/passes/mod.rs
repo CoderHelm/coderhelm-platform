@@ -1424,6 +1424,7 @@ pub(crate) mod terraform;
 mod test;
 pub mod test_bug;
 pub mod test_fix;
+pub(crate) mod test_setup;
 pub mod ticket_base;
 pub mod ticket_comments;
 pub mod ticket_history;

@@ -1,0 +1,575 @@
+//! How a repository's CI installs and runs its tests, found once and reused
+//! by every sandbox command of the run.
+//!
+//! A data-pipeline run reinstalled its test dependencies eighteen times in
+//! one run, about 25 minutes of sandbox builds. Each round started over: it
+//! ran the test file bare, read the CI workflow, then tried `pip install`
+//! lines until one worked. Each sandbox command is a fresh build, so nothing
+//! carried over.
+//!
+//! Now:
+//!
+//! - [`from_workflows`] reads the CI job that runs the tests: its working
+//!   directory, Python and Node versions, the install steps before its first
+//!   test step, the test steps, and the plain environment values it sets.
+//! - [`TestEnv::fingerprint`] names that install, from its steps and the
+//!   dependency manifests' blob ids. A changed requirements or lock file is
+//!   a new fingerprint and a fresh install.
+//! - [`TestEnv::wrap`] puts a command inside the environment. With a cached
+//!   environment (`ENV_CACHE_GET_URL`) it is restored, and a Python install is
+//!   not run again; without one the install runs once and the result is
+//!   saved (`ENV_CACHE_PUT_URL`) for every later command, round and proof
+//!   step of the run. Python installs go into one virtual environment and
+//!   Node package managers keep their download store there, so the archive
+//!   is one folder.
+//! - [`TestEnv::coder_note`] tells the coder the environment is ready, so it
+//!   runs the tests directly instead of reinstalling.
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+/// Where the environment lives in the sandbox; a test may move it.
+pub const ENV_ROOT: &str = "/tmp/coderhelm-env";
+
+/// The printed lines that say what the wrapper did.
+pub const RESTORED: &str = "===CODERHELM_ENV_RESTORED===";
+pub const INSTALLED: &str = "===CODERHELM_ENV_INSTALLED===";
+pub const SAVED: &str = "===CODERHELM_ENV_SAVED===";
+
+/// The language whose packages the install fills.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Kind {
+    Python,
+    Node,
+    #[default]
+    Other,
+}
+
+/// How the repository's CI installs and runs its tests.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TestEnv {
+    /// The workflow and job it came from.
+    pub source: String,
+    /// The folder the steps run in; "" for the repository root.
+    pub dir: String,
+    pub kind: Kind,
+    pub python: String,
+    pub node: String,
+    /// Plain `NAME=value` settings of the job (never an expression).
+    pub env: Vec<(String, String)>,
+    pub install: Vec<String>,
+    pub test: Vec<String>,
+    /// Files whose content decides the install (requirements, locks).
+    pub manifests: Vec<String>,
+}
+
+const INSTALL_WORDS: &[&str] = &[
+    "pip install",
+    "pip3 install",
+    "uv pip install",
+    "uv sync",
+    "poetry install",
+    "pipenv install",
+    "npm ci",
+    "npm install",
+    "pnpm install",
+    "yarn install",
+    "bun install",
+    "corepack enable",
+];
+
+const LOCKS: &[&str] = &[
+    "requirements.txt",
+    "requirement.txt",
+    "requirements-dev.txt",
+    "constraints.txt",
+    "pyproject.toml",
+    "poetry.lock",
+    "uv.lock",
+    "Pipfile.lock",
+    "package.json",
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "bun.lockb",
+];
+
+fn s(v: Option<&serde_yaml::Value>) -> String {
+    match v {
+        Some(serde_yaml::Value::String(x)) => x.trim().to_string(),
+        Some(serde_yaml::Value::Number(n)) => n.to_string(),
+        _ => String::new(),
+    }
+}
+
+fn plain_env(v: Option<&serde_yaml::Value>) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    if let Some(m) = v.and_then(|x| x.as_mapping()) {
+        for (k, val) in m {
+            let (k, val) = (s(Some(k)), s(Some(val)));
+            let safe_key =
+                !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+            let low = k.to_ascii_lowercase();
+            let secretish = ["token", "secret", "password", "key", "auth"]
+                .iter()
+                .any(|w| low.contains(w));
+            if safe_key && !secretish && !val.contains("${{") && !val.contains('\n') {
+                out.push((k, val));
+            }
+        }
+    }
+    out
+}
+
+fn lines_of(run: &str) -> Vec<String> {
+    run.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(str::to_string)
+        .collect()
+}
+
+fn is_install(line: &str) -> bool {
+    let l = line.to_ascii_lowercase();
+    INSTALL_WORDS.iter().any(|w| l.contains(w))
+}
+
+/// Files an install line reads (`-r`, `-c`, `--constraint`, `--requirement`).
+fn named_files(line: &str) -> Vec<String> {
+    let t: Vec<&str> = line.split_whitespace().collect();
+    let mut out = Vec::new();
+    for (i, w) in t.iter().enumerate() {
+        let next = t.get(i + 1).map(|x| x.trim_matches(['"', '\'']));
+        match *w {
+            "-r" | "-c" | "--constraint" | "--requirement" => {
+                if let Some(f) = next.filter(|f| !f.contains("://") && !f.contains('$')) {
+                    out.push(f.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn join(dir: &str, f: &str) -> String {
+    let f = f.trim_start_matches("./");
+    if dir.is_empty() || f.starts_with('/') {
+        f.to_string()
+    } else {
+        format!("{}/{f}", dir.trim_end_matches('/'))
+    }
+}
+
+/// The repository's test environment, from its workflow files
+/// (`(path, text)`): the first job with a test step, its setup before that
+/// step, and its test steps. `None` when no job runs tests.
+pub fn from_workflows(workflows: &[(String, String)], tree: &[String]) -> Option<TestEnv> {
+    for (path, text) in workflows {
+        let Ok(doc) = serde_yaml::from_str::<serde_yaml::Value>(text) else {
+            continue;
+        };
+        let Some(jobs) = doc.get("jobs").and_then(|j| j.as_mapping()) else {
+            continue;
+        };
+        for (name, job) in jobs {
+            let Some(steps) = job.get("steps").and_then(|x| x.as_sequence()) else {
+                continue;
+            };
+            let mut env = TestEnv {
+                source: format!("{path} ({})", s(Some(name))),
+                dir: s(job
+                    .get("defaults")
+                    .and_then(|d| d.get("run"))
+                    .and_then(|r| r.get("working-directory")))
+                .trim_start_matches("./")
+                .trim_end_matches('/')
+                .to_string(),
+                env: plain_env(doc.get("env")),
+                ..Default::default()
+            };
+            env.env.extend(plain_env(job.get("env")));
+            let mut seen_test = false;
+            for step in steps {
+                let uses = s(step.get("uses")).to_ascii_lowercase();
+                if uses.starts_with("actions/setup-python") {
+                    env.python = s(step.get("with").and_then(|w| w.get("python-version")));
+                }
+                if uses.starts_with("actions/setup-node") {
+                    env.node = s(step.get("with").and_then(|w| w.get("node-version")));
+                }
+                let run = s(step.get("run"));
+                if run.is_empty() || run.contains("${{") {
+                    continue;
+                }
+                let dir = s(step.get("working-directory"))
+                    .trim_start_matches("./")
+                    .to_string();
+                for line in lines_of(&run) {
+                    let line = if dir.is_empty() {
+                        line
+                    } else {
+                        format!("(cd {dir} && {line})")
+                    };
+                    if crate::ci_cover::is_check_command(&line) && !is_install(&line) {
+                        seen_test = true;
+                        env.test.push(line);
+                        env.env.extend(plain_env(step.get("env")));
+                    } else if is_install(&line) && !seen_test {
+                        env.install.push(line);
+                    }
+                }
+            }
+            if env.test.is_empty() {
+                continue;
+            }
+            let all = format!("{} {}", env.install.join(" "), env.test.join(" ")).to_lowercase();
+            env.kind = if !env.python.is_empty()
+                || ["pip", "pytest", "python", "poetry", "uv "]
+                    .iter()
+                    .any(|w| all.contains(w))
+            {
+                Kind::Python
+            } else if !env.node.is_empty()
+                || ["npm", "pnpm", "yarn", "npx", "vitest", "jest"]
+                    .iter()
+                    .any(|w| all.contains(w))
+            {
+                Kind::Node
+            } else {
+                Kind::Other
+            };
+            let mut manifests: Vec<String> = env
+                .install
+                .iter()
+                .flat_map(|l| named_files(l))
+                .map(|f| join(&env.dir, &f))
+                .collect();
+            for l in LOCKS {
+                let p = join(&env.dir, l);
+                if tree.iter().any(|t| t == &p) {
+                    manifests.push(p);
+                }
+            }
+            manifests.sort();
+            manifests.dedup();
+            env.manifests = manifests;
+            env.env.sort();
+            env.env.dedup();
+            return Some(env);
+        }
+    }
+    None
+}
+
+fn quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+impl TestEnv {
+    /// The install's name: its steps, versions and the manifests' blob ids
+    /// (`shas`: `(path, blob sha)` from the tree at the head).
+    pub fn fingerprint(&self, shas: &[(String, String)]) -> String {
+        let mut h = Sha256::new();
+        h.update(self.dir.as_bytes());
+        h.update(self.python.as_bytes());
+        h.update(self.node.as_bytes());
+        for l in &self.install {
+            h.update(l.as_bytes());
+            h.update(b"\n");
+        }
+        for m in &self.manifests {
+            let sha = shas
+                .iter()
+                .find(|(p, _)| p == m)
+                .map(|(_, s)| s.as_str())
+                .unwrap_or("-");
+            h.update(format!("{m}={sha}\n").as_bytes());
+        }
+        hex::encode(&h.finalize()[..12])
+    }
+
+    /// Whether a restored environment is complete: a Python install lives
+    /// whole in the virtual environment; a Node install keeps only the
+    /// package store there and runs again (fast, from the store).
+    pub fn restore_is_complete(&self) -> bool {
+        self.kind == Kind::Python
+    }
+
+    fn activate(&self) -> String {
+        let mut out = vec![format!(
+            "export E=\"${{CODERHELM_ENV:-{ENV_ROOT}}}\"; mkdir -p \"$E\""
+        )];
+        for (k, v) in &self.env {
+            out.push(format!("export {k}={}", quote(v)));
+        }
+        match self.kind {
+            Kind::Python => {
+                if !self.python.is_empty() {
+                    out.push(format!(
+                        "(command -v pyenv >/dev/null 2>&1 && pyenv global {} >/dev/null 2>&1) || true",
+                        quote(&self.python)
+                    ));
+                }
+                out.push(
+                    "[ -x \"$E/venv/bin/python\" ] || python3 -m venv \"$E/venv\"; . \"$E/venv/bin/activate\""
+                        .to_string(),
+                );
+            }
+            Kind::Node => {
+                out.push(
+                    "export npm_config_cache=\"$E/npm\" npm_config_store_dir=\"$E/pnpm-store\" YARN_CACHE_FOLDER=\"$E/yarn\""
+                        .to_string(),
+                );
+                if !self.node.is_empty() {
+                    out.push(format!(
+                        "n {} >/dev/null 2>&1 || true; hash -r",
+                        quote(&self.node)
+                    ));
+                }
+            }
+            Kind::Other => {}
+        }
+        out.join("\n")
+    }
+
+    /// `command` run inside the environment. The script restores the cached
+    /// environment when `ENV_CACHE_GET_URL` is set and fetches, installs
+    /// otherwise (or after a Node restore), saves a fresh install when
+    /// `ENV_CACHE_PUT_URL` is set, then runs `command` and exits with its
+    /// code.
+    pub fn wrap(&self, command: &str) -> String {
+        self.wrap_with(command, self.restore_is_complete())
+    }
+
+    /// [`Self::wrap`], saying whether a restored environment is complete.
+    pub fn wrap_with(&self, command: &str, complete: bool) -> String {
+        let install = if self.install.is_empty() {
+            "true".to_string()
+        } else {
+            self.install.join(" && ")
+        };
+        let cd = if self.dir.is_empty() {
+            String::new()
+        } else {
+            format!("cd {} || exit 1\n", quote(&self.dir))
+        };
+        let complete = if complete { "1" } else { "" };
+        format!(
+            r#"export E="${{CODERHELM_ENV:-{ENV_ROOT}}}"; mkdir -p "$E"
+ROOT="$PWD"
+RESTORED=""
+if [ -n "$ENV_CACHE_GET_URL" ] && curl -fsS --retry 2 --noproxy "*" -o /tmp/coderhelm-env.tgz "$ENV_CACHE_GET_URL" 2>/dev/null && tar xzf /tmp/coderhelm-env.tgz -C "$E"; then
+  RESTORED=1; echo "{RESTORED}"
+fi
+{activate}
+{cd}if [ -z "$RESTORED" ] || [ -z "{complete}" ]; then
+  ( {install} ) >/tmp/coderhelm-install.log 2>&1; ICODE=$?; tail -5 /tmp/coderhelm-install.log
+  if [ $ICODE -eq 0 ] && [ -z "$RESTORED" ]; then
+    echo "{INSTALLED}"
+    if [ -n "$ENV_CACHE_PUT_URL" ] && tar czf /tmp/coderhelm-env-out.tgz -C "$E" . && curl -fsS --retry 2 --noproxy "*" -T /tmp/coderhelm-env-out.tgz "$ENV_CACHE_PUT_URL"; then echo "{SAVED}"; fi
+  fi
+fi
+cd "$ROOT"
+bash -c {cmd}"#,
+            activate = self.activate(),
+            cmd = quote(command),
+        )
+    }
+
+    /// What the coder is told: the environment is ready in every command,
+    /// and how the tests run.
+    pub fn coder_note(&self) -> String {
+        format!(
+            "\n\n## The test environment (from CI: {})\nEvery sandbox command you run starts with this repository's test environment installed (CoderHelm installs it once per run and reuses it in every round). Don't reinstall dependencies: run the tests directly{}:\n{}\n",
+            self.source,
+            if self.dir.is_empty() {
+                String::new()
+            } else {
+                format!(" from `{}`", self.dir)
+            },
+            self.test
+                .iter()
+                .map(|t| format!("- `{t}`"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    }
+
+    /// One line for the run's notes.
+    pub fn summary(&self) -> String {
+        format!(
+            "Test environment from {}: install `{}`; tests `{}`",
+            self.source,
+            if self.install.is_empty() {
+                "nothing".to_string()
+            } else {
+                self.install.join(" && ")
+            },
+            self.test.join(" && ")
+        )
+    }
+}
+
+/// The S3 key of a cached environment: one per team, repository and
+/// fingerprint, so later rounds and runs of the same install reuse it.
+pub fn cache_key(team: &str, repo: &str, fingerprint: &str) -> String {
+    let safe = |x: &str| -> String {
+        x.chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect()
+    };
+    format!("env-cache/{}/{}/{fingerprint}.tgz", safe(team), safe(repo))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PY: &str = r#"
+name: Tests
+on: [pull_request]
+env:
+  PYTHONHASHSEED: "0"
+  GH_TOKEN: ${{ secrets.X }}
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: |
+          pip install 'apache-airflow[postgres]==2.10.3' -c dags/constraints-3.11.txt
+          pip install -r requirement.txt
+      - run: for t in tests/test_*.py; do python "$t" || exit 1; done
+        name: Run tests
+      - run: python -m pytest tests
+"#;
+
+    #[test]
+    fn the_test_job_is_read_from_ci() {
+        let tree = vec![
+            "requirement.txt".to_string(),
+            "dags/constraints-3.11.txt".to_string(),
+        ];
+        let e =
+            from_workflows(&[(".github/workflows/tests.yml".into(), PY.into())], &tree).unwrap();
+        assert_eq!(e.kind, Kind::Python);
+        assert_eq!(e.python, "3.11");
+        assert_eq!(e.install.len(), 2);
+        assert!(e.test.iter().any(|t| t.contains("pytest")));
+        assert_eq!(e.env, vec![("PYTHONHASHSEED".to_string(), "0".to_string())]);
+        assert_eq!(
+            e.manifests,
+            vec!["dags/constraints-3.11.txt", "requirement.txt"]
+        );
+        // A changed requirements file is a new install.
+        let a = e.fingerprint(&[("requirement.txt".into(), "aaa".into())]);
+        let b = e.fingerprint(&[("requirement.txt".into(), "bbb".into())]);
+        assert_ne!(a, b);
+        assert_eq!(
+            a,
+            e.fingerprint(&[("requirement.txt".into(), "aaa".into())])
+        );
+        assert!(e.coder_note().contains("Don't reinstall"));
+        assert!(cache_key("TEAM#x", "o/r", &a).starts_with("env-cache/TEAM_x/o_r/"));
+    }
+
+    #[test]
+    fn a_node_job_with_a_working_directory() {
+        let wf = "jobs:\n  web:\n    defaults:\n      run:\n        working-directory: ./apps/web\n    steps:\n      - uses: actions/setup-node@v4\n        with:\n          node-version: 20\n      - run: corepack enable && pnpm install --frozen-lockfile\n      - run: pnpm vitest run\n";
+        let e = from_workflows(
+            &[("ci.yml".into(), wf.into())],
+            &["apps/web/pnpm-lock.yaml".to_string()],
+        )
+        .unwrap();
+        assert_eq!(e.kind, Kind::Node);
+        assert_eq!(e.dir, "apps/web");
+        assert_eq!(e.node, "20");
+        assert_eq!(e.manifests, vec!["apps/web/pnpm-lock.yaml"]);
+        assert!(!e.restore_is_complete());
+        assert!(e.wrap("pnpm vitest run").contains("cd 'apps/web'"));
+        // No job with a test step: nothing.
+        assert!(from_workflows(
+            &[(
+                "d.yml".into(),
+                "jobs:\n  d:\n    steps:\n      - run: echo hi\n".into()
+            )],
+            &[]
+        )
+        .is_none());
+    }
+
+    /// The second round restores the first round's install instead of
+    /// installing again. Runs the real script with bash, tar and curl (file
+    /// URLs stand in for the presigned ones).
+    #[test]
+    fn a_second_round_restores_instead_of_reinstalling() {
+        for tool in ["bash", "tar", "curl"] {
+            if std::process::Command::new(tool)
+                .arg("--version")
+                .output()
+                .is_err()
+            {
+                return;
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("coderhelm-env-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("repo")).unwrap();
+        let log = dir.join("installs.log");
+        let cache = dir.join("cache.tgz");
+        let env = TestEnv {
+            source: "ci.yml (tests)".into(),
+            kind: Kind::Other,
+            install: vec![format!(
+                "echo install >> {} && echo ready > \"$E/marker\"",
+                log.display()
+            )],
+            test: vec!["true".into()],
+            ..Default::default()
+        };
+        // A complete restore (as for Python), without needing Python here.
+        let script = env.wrap_with("cat \"$E/marker\"", true);
+        let run = |get: Option<&std::path::Path>, put: Option<&std::path::Path>, env_root: &str| {
+            let mut c = std::process::Command::new("bash");
+            c.arg("-c")
+                .arg(&script)
+                .current_dir(dir.join("repo"))
+                .env("CODERHELM_ENV", dir.join(env_root));
+            match get {
+                Some(p) => c.env("ENV_CACHE_GET_URL", format!("file://{}", p.display())),
+                None => c.env_remove("ENV_CACHE_GET_URL"),
+            };
+            match put {
+                Some(p) => c.env("ENV_CACHE_PUT_URL", format!("file://{}", p.display())),
+                None => c.env_remove("ENV_CACHE_PUT_URL"),
+            };
+            let o = c.output().unwrap();
+            String::from_utf8_lossy(&o.stdout).to_string()
+        };
+        // Round one: nothing cached, so it installs and saves.
+        let first = run(None, Some(&cache), "env1");
+        assert!(first.contains(INSTALLED), "{first}");
+        assert!(first.contains(SAVED), "{first}");
+        assert!(first.contains("ready"), "{first}");
+        // Round two, a fresh build: restored, not installed again.
+        let second = run(Some(&cache), None, "env2");
+        assert!(second.contains(RESTORED), "{second}");
+        assert!(!second.contains(INSTALLED), "{second}");
+        assert!(second.contains("ready"), "{second}");
+        let installs = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(installs.lines().count(), 1, "installed {installs}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

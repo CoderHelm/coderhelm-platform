@@ -44,7 +44,10 @@ pub const PLANNER: &str = "\n\n## The smallest correct change (CoderHelm checks 
 Before you plan, read the code the change extends: the whole map, function or query, and its \
 writers and readers. Then write these sections in design.md:\n\
 - `## Reuse`: the existing maps, helpers, constants, config and tests this change extends, each \
-with its path (search the ticket's names and the structure you would add). Add entries to an \
+with its path (search the ticket's names and the structure you would add). For each helper that \
+writes data, read its body and say what it does to rows already stored: `inserts only` or \
+`replaces/deletes` (a `DELETE`, an `ON CONFLICT DO UPDATE`, a delete-then-insert). A helper that \
+replaces is never reused on a path that only inserts unless the ticket asks to replace. Add entries to an \
 existing map or a parameter to an existing helper; never a second map or helper beside it.\n\
 - `## Must not change`: what stays as it is. A path that only inserts keeps only inserting (no \
 `DELETE`, no `ON CONFLICT DO UPDATE`, no replacing sync) unless the ticket asks for it; log \
@@ -326,6 +329,157 @@ pub fn plan_gaps(
         }
     }
     out
+}
+
+// ── What reused helpers do to stored rows ──────────────────────────────────
+
+/// A helper the plan reuses, and what it does to stored rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Helper {
+    pub name: String,
+    pub path: String,
+    pub writes: minimal_change::Writes,
+}
+
+/// What the plan's reused helpers and the planned files do to stored rows.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WriteFacts {
+    pub helpers: Vec<Helper>,
+    /// The planned code files, without the reused helpers' own bodies, only
+    /// insert today.
+    pub path_inserts_only: bool,
+}
+
+/// The function-like names under the plan's Reuse section.
+pub fn reused_functions(files: &PlanResult) -> Vec<String> {
+    let reuse = section(&files.design, REUSE).unwrap_or("");
+    backticked(reuse)
+        .into_iter()
+        .filter(|n| n.chars().any(|c| c.is_ascii_lowercase()))
+        .collect()
+}
+
+/// The facts from the helpers' sources (`(name, path, file text)`) and the
+/// planned code files' base texts (`(path, text)`).
+pub fn write_facts(
+    sources: &[(String, String, String)],
+    planned: &[(String, String)],
+) -> WriteFacts {
+    let mut helpers = Vec::new();
+    let mut bodies: Vec<String> = Vec::new();
+    for (name, path, text) in sources {
+        if let Some(body) = minimal_change::body_of(text, path, name) {
+            helpers.push(Helper {
+                name: name.clone(),
+                path: path.clone(),
+                writes: minimal_change::write_semantics(&body),
+            });
+            bodies.push(body);
+        }
+    }
+    let rest: Vec<String> = planned
+        .iter()
+        .map(|(_, t)| {
+            let mut t = t.clone();
+            for b in &bodies {
+                t = t.replace(b.as_str(), "");
+            }
+            t
+        })
+        .collect();
+    let refs: Vec<&str> = rest.iter().map(String::as_str).collect();
+    WriteFacts {
+        helpers,
+        path_inserts_only: !refs.is_empty() && minimal_change::inserts_only(&refs),
+    }
+}
+
+const SAYS_REPLACES: &[&str] = &["replace", "delete", "overwrite", "do update", "prune"];
+
+/// What the plan misses about the rows its reused helpers touch: a
+/// replacing helper the Reuse section doesn't say replaces, and a replacing
+/// helper reused where the code only inserts, when the ticket asks for no
+/// replacement.
+pub fn write_gaps(files: &PlanResult, ticket: &str, facts: &WriteFacts) -> Vec<String> {
+    if stops(files) {
+        return Vec::new();
+    }
+    let reuse = section(&files.design, REUSE).unwrap_or("").to_lowercase();
+    let mut out = Vec::new();
+    for h in &facts.helpers {
+        let minimal_change::Writes::Replacing(how) = &h.writes else {
+            continue;
+        };
+        let line = reuse
+            .lines()
+            .find(|l| l.contains(&h.name.to_lowercase()))
+            .unwrap_or("");
+        if !SAYS_REPLACES.iter().any(|w| line.contains(w)) {
+            out.push(format!(
+                "`{REUSE}` names `{}` without what it does to stored rows: it replaces them ({}, in `{}`). Say so next to it.",
+                h.name,
+                how.join(", "),
+                h.path
+            ));
+        }
+        if facts.path_inserts_only
+            && !minimal_change::ticket_asks(ticket, minimal_change::REPLACE_ASKS)
+        {
+            out.push(format!(
+                "The plan reuses `{}`, which replaces stored rows ({}), on a path that only inserts today, and the ticket asks for no replacement. Keep the path additive: insert the new rows with `ON CONFLICT DO NOTHING` (or the insert-only helper the path already uses), and list the existing rows under `{MUST_NOT_CHANGE}`.",
+                h.name,
+                how.join(", ")
+            ));
+        }
+    }
+    out
+}
+
+/// Reads the facts: each reused function's definition (found by search,
+/// read at `base`) and the planned code files at `base`.
+pub async fn read_write_facts(
+    search: &dyn RepoSearch,
+    github: &crate::clients::github::GitHubClient,
+    (owner, repo, base): (&str, &str, &str),
+    files: &PlanResult,
+) -> WriteFacts {
+    let own = format!("{owner}/{repo}");
+    let mut sources = Vec::new();
+    for name in reused_functions(files).into_iter().take(6) {
+        let Ok(hits) = search.search(&own, &name).await else {
+            continue;
+        };
+        let defining = hits.iter().find_map(|h| {
+            let path = h.lines().next()?.to_string();
+            let defines = [
+                format!("def {name}("),
+                format!("function {name}"),
+                format!("fn {name}"),
+                format!("const {name} ="),
+            ];
+            h.lines()
+                .skip(1)
+                .any(|l| defines.iter().any(|d| l.contains(d.as_str())))
+                .then_some(path)
+        });
+        let Some(path) = defining else {
+            continue;
+        };
+        if let Ok(text) = github.read_file(owner, repo, &path, base).await {
+            sources.push((name, path, text));
+        }
+    }
+    let mut planned = Vec::new();
+    for f in super::feature::plan_files::planned_files(&files.tasks)
+        .into_iter()
+        .filter(|f| !super::habits::is_test_path(&f.path))
+        .take(8)
+    {
+        if let Ok(text) = github.read_file(owner, repo, &f.path, base).await {
+            planned.push((f.path.clone(), text));
+        }
+    }
+    write_facts(&sources, &planned)
 }
 
 // ── What the ticket's words find, before the plan ──────────────────────────

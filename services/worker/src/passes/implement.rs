@@ -212,8 +212,26 @@ pub async fn run(
         repo_instructions
     };
     let instructions_block = super::format_instructions_block(trimmed_instructions);
+    // How the repository's CI installs and runs its tests, found once per
+    // run and reused by every round's sandbox builds (`test_setup`).
+    let test_env = match run_id {
+        Some(rid) => {
+            super::test_setup::for_run(
+                state,
+                github,
+                &msg.team_id,
+                &msg.repo_owner,
+                &msg.repo_name,
+                &msg.base_branch,
+                branch,
+                rid,
+            )
+            .await
+        }
+        None => None,
+    };
     let tests_block = format!(
-        "{}{}",
+        "{}{}{}",
         if super::review_pr::tests_required(state, &msg.team_id, &msg.repo_owner, &msg.repo_name)
             .await
         {
@@ -221,7 +239,11 @@ pub async fn run(
         } else {
             ""
         },
-        super::E2E_CODER_SECTION
+        super::E2E_CODER_SECTION,
+        test_env
+            .as_ref()
+            .map(|(e, _)| e.coder_note())
+            .unwrap_or_default()
     );
     // The team's instructions are never trimmed: they are its working rules.
     // What outcomes taught the coder here (lessons naming what people
@@ -351,7 +373,8 @@ pub async fn run(
                 &state.config.sandbox_bucket_name,
                 &state.config.sandbox_project_name,
             )
-            .with_egress(crate::agent::policy::sandbox_egress(state, &msg.team_id).await),
+            .with_egress(crate::agent::policy::sandbox_egress(state, &msg.team_id).await)
+            .with_test_env(test_env.clone()),
         )
     } else {
         None

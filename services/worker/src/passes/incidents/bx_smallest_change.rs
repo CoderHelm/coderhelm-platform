@@ -267,3 +267,60 @@ fn a_test_bent_to_the_vendor_against_a_criterion_is_a_required_finding() {
     );
     assert!(f[0].body.contains("Change the product side first"));
 }
+
+/// The shape the data-pipeline run really had: its plan named the right
+/// map, then reused the existing multi-sport link helper, which deletes
+/// every link it isn't given, on a sync path that only inserted. The run
+/// deleted links nobody asked about. The helper's body says what it does,
+/// so the plan is sent back; the plan that inserts with `ON CONFLICT DO
+/// NOTHING` and reuses only the read-only lookup passes.
+#[test]
+fn a_replacing_helper_reused_on_an_insert_only_path_is_sent_back() {
+    const HELPERS: &str = "CAMP_MULTI_SPORT_OVERRIDES = {\n    \"sports academy break camp\": [\"multi-sport\"],\n}\n\n\ndef get_camp_multi_sport_names(name):\n    return CAMP_MULTI_SPORT_OVERRIDES.get(name.lower(), [])\n\n\ndef upsert_multi_sport_links(cur, group_id, sport_ids):\n    cur.execute(\"DELETE FROM camp_sports WHERE camp_id = %s AND NOT (sport_id = ANY(%s))\", (group_id, sport_ids))\n    for sport_id in sport_ids:\n        cur.execute(\"INSERT INTO camp_sports VALUES (%s, %s) ON CONFLICT DO NOTHING\", (group_id, sport_id))\n";
+    let reuse_replacing = plan(
+        "## Reuse\n- `CAMP_MULTI_SPORT_OVERRIDES` and `upsert_multi_sport_links` in dags/camps/sports.py (the other two sources already use them)\n\n\
+         ## Must not change\nSingle-sport camps.\n\n## Measure first\nNone: the change stays inside this repository.\n\n\
+         ## Smallest change\n4 entries in `CAMP_MULTI_SPORT_OVERRIDES`; call `upsert_multi_sport_links` in the 3 write branches.\n\n\
+         ## Proof\nOne test of the links per camp.\n",
+        &format!("- [ ] {MAP_FILE}: 4 entries\n- [ ] {SYNC_FILE}: link the extra sports\n- [ ] tests/test_sports.py: one test"),
+    );
+    let sources = |p: &PlanResult| -> Vec<(String, String, String)> {
+        plan_shape::reused_functions(p)
+            .into_iter()
+            .map(|n| (n, MAP_FILE.to_string(), HELPERS.to_string()))
+            .collect()
+    };
+    let planned = vec![
+        (MAP_FILE.to_string(), HELPERS.to_string()),
+        (SYNC_FILE.to_string(), BASE_SYNC.to_string()),
+    ];
+    let facts = plan_shape::write_facts(&sources(&reuse_replacing), &planned);
+    assert!(facts.path_inserts_only, "{facts:?}");
+    let g = plan_shape::write_gaps(&reuse_replacing, CAMP_TICKET, &facts);
+    assert!(
+        g.iter()
+            .any(|l| l.contains("`upsert_multi_sport_links` without what it does to stored rows")),
+        "{g:?}"
+    );
+    assert!(
+        g.iter()
+            .any(|l| l.contains("on a path that only inserts today")),
+        "{g:?}"
+    );
+    // Saying it replaces isn't enough when the ticket asks for no
+    // replacement; a ticket that asks to replace the links may.
+    let said = plan(
+        &reuse_replacing.design.replace(
+            "(the other two sources already use them)",
+            "(it replaces a camp's links: DELETE then insert)",
+        ),
+        &reuse_replacing.tasks,
+    );
+    let g = plan_shape::write_gaps(&said, CAMP_TICKET, &facts);
+    assert_eq!(g.len(), 1, "{g:?}");
+    assert!(plan_shape::write_gaps(&said, "Replace each camp's sport links", &facts).is_empty());
+    // The small plan reuses only the map and the read-only lookup.
+    let small = camps_plan_after();
+    let facts = plan_shape::write_facts(&sources(&small), &planned);
+    assert!(plan_shape::write_gaps(&small, CAMP_TICKET, &facts).is_empty());
+}

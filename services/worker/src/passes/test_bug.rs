@@ -80,7 +80,21 @@ impl Runner<'_> {
             &self.state.config.sandbox_bucket_name,
             &self.state.config.sandbox_project_name,
         )
-        .with_egress(crate::agent::policy::sandbox_egress(self.state, self.team_id).await);
+        .with_egress(crate::agent::policy::sandbox_egress(self.state, self.team_id).await)
+        // The proof step runs in the run's test environment too.
+        .with_test_env(
+            super::test_setup::for_run(
+                self.state,
+                self.github,
+                self.team_id,
+                self.owner,
+                self.repo,
+                sha,
+                sha,
+                self.run_id,
+            )
+            .await,
+        );
         let source = sandbox
             .ensure_source(self.run_id, sha, || {
                 self.github.download_tarball(self.owner, self.repo, sha)

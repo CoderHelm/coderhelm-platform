@@ -282,6 +282,7 @@ pub mod stop_judge;
 pub mod stop_rules;
 /// A team's run and PR-reviewed counts, each added exactly once.
 pub mod team_counts;
+pub mod test_env;
 pub mod ticket_comments;
 /// A ticket's comments as CoderHelm read them, and whether its work is done.
 pub mod ticket_state;
