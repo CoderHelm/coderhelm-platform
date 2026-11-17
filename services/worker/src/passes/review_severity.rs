@@ -285,7 +285,7 @@ const MISSING_TEST_PHRASES: &[&str] = &[
 
 /// A tests finding that asks for a test (a Suggestion), not one that shows
 /// a test fails or proves nothing (a correctness problem).
-fn asks_for_a_test(f: &Finding) -> bool {
+pub fn asks_for_a_test(f: &Finding) -> bool {
     let text = format!("{} {}", f.title, f.body).to_ascii_lowercase();
     MISSING_TEST_PHRASES.iter().any(|p| text.contains(p))
 }

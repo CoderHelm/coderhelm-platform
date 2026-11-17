@@ -112,6 +112,12 @@ pub struct PrFacts {
     /// out of scope (`common::scope_ledger`), in code or in tests.
     #[serde(default)]
     pub out_of_scope: Vec<common::scope_ledger::Breach>,
+    /// What the change's end-to-end files rest on and what its diff
+    /// carries (`live_guard`): the probes of outside pages, selectors no
+    /// probe saw, each test branch on a page's state and whether a run
+    /// took it, files only reformatted.
+    #[serde(default)]
+    pub live: super::live_guard::LiveFacts,
 }
 
 /// Why the check didn't give a result.
@@ -559,6 +565,9 @@ pub fn blocking(f: &PrFacts, plan: &PlanResult) -> Vec<String> {
     for w in &f.wider {
         out.push(w.instruction());
     }
+    // Selectors from a probe, branches run when they can run, no reformat
+    // of a file the fix doesn't change.
+    out.extend(f.live.blocking());
     if f.bug && f.tests.is_empty() && !repro_waived(plan) && f.no_tests.contains("no test file") {
         out.push("This is a bug fix and the change has no test that fails without it. Add the test that reproduces the reported failure (it must fail on the base code and pass with the fix).".to_string());
     }
@@ -612,6 +621,8 @@ pub fn open_findings(f: &PrFacts, plan: &PlanResult) -> Vec<Finding> {
                     "Out of scope brought back",
                     "CoderHelm takes it out, code and tests, in its next round on this pull request, or records the criterion or comment that moved it in.",
                 )
+            } else if let Some(p) = f.live.point_of(&l) {
+                p
             } else if l.contains("no task of the plan") {
                 (
                     "Changed outside the plan",
@@ -768,6 +779,7 @@ pub fn section(plan: &PlanResult, f: &PrFacts) -> String {
         }
         out.push('\n');
     }
+    out.push_str(&f.live.section());
     if out.is_empty() {
         return out;
     }
@@ -1190,6 +1202,9 @@ async fn check_and_fix(
             &diff,
         )
         .await;
+        // A page whose state a test branch reads is probed again while
+        // there is time: an arm that couldn't run before is re-checked.
+        facts.live = super::live_guard::facts_for(w, &diff, &evidence.notes, !short).await;
         let blocking = blocking(&facts, w.plan);
         info!(
             run_id = w.run_id,

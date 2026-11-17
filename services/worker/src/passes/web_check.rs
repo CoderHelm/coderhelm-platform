@@ -83,22 +83,88 @@ pub fn probe_tool() -> ToolDefinition {
         name: PROBE_TOOL.to_string(),
         description: format!(
             "Load a page in a real browser (Playwright, in the sandbox) and list what is really \
-             there: every test id (data-testid, data-test, data-cy, also inside frames) and the \
-             field names of the JSON responses it fetches. Use it BEFORE writing end-to-end \
-             selectors or reading JSON fields of a page another company serves (or a page on \
-             the preview), and build the spec only from what it found. Commit the record it \
-             returns at `{}`, and quote what it found in the pull request. Only hosts this run \
-             may check are allowed.",
+             there: every test id (data-testid, data-test, data-cy, also inside frames) with its \
+             state (visible, enabled, its text), and the field names of the JSON responses it \
+             fetches. With `clicks` (test ids or /patterns/), it clicks each in turn and lists \
+             what each click brings up, so the state every branch of a spec depends on is seen \
+             (what a signed-out visitor gets after choosing an item, a drawer, a disabled \
+             button). Use it BEFORE writing or keeping end-to-end selectors or JSON fields of a \
+             page another company serves (or a page on the preview), and build the spec only \
+             from what it found. The record is committed at `{}` for you; quote it in the pull \
+             request. Only hosts this run may check are allowed.",
             common::e2e::probe::record_path("<host>")
         ),
         input_schema: json!({
             "type": "object",
             "properties": {
-                "url": { "type": "string", "description": "The https page to probe" }
+                "url": { "type": "string", "description": "The https page to probe" },
+                "clicks": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Test ids (or /patterns/ matching them) to click in turn after the page loads, each listed with what it brings up: the path a spec takes, so each of its branches' states is observed"
+                }
             },
             "required": ["url"]
         }),
     }
+}
+
+/// Loads `url` (on `host`) in the sandbox with Playwright, clicks each of
+/// `clicks` in turn, and gives what it saw (`common::e2e::probe`). The
+/// probe tool runs it, and the habits check runs it again to re-check a
+/// test branch on a page whose state can change.
+pub async fn run_probe(
+    state: &WorkerState,
+    team_id: &str,
+    url: &str,
+    host: &str,
+    clicks: &[String],
+) -> Result<common::e2e::probe::ProbeRecord, String> {
+    let source = super::skill_run::pack(&[(
+        "probe.mjs".to_string(),
+        common::e2e::probe::probe_script(url, clicks),
+    )])
+    .map_err(|e| format!("the probe couldn't be packed: {e}"))?;
+    let sandbox = crate::clients::sandbox::SandboxClient::new(
+        &state.codebuild,
+        &state.s3,
+        &state.logs,
+        &state.config.sandbox_bucket_name,
+        &state.config.sandbox_project_name,
+    )
+    .with_egress(crate::agent::policy::sandbox_egress(state, team_id).await);
+    let mut hosts: Vec<String> = common::preview::CAPTURE_HOSTS
+        .iter()
+        .map(|h| h.to_string())
+        .collect();
+    hosts.push(host.to_string());
+    let cmd = common::preview::capture_command().replace("capture.mjs", "probe.mjs");
+    let key = format!("probe-{}", uuid::Uuid::new_v4().simple());
+    let out = sandbox
+        .run_script(
+            crate::clients::sandbox::ScriptRun {
+                key: &key,
+                source,
+                cmd: &cmd,
+                secret: None,
+                hosts,
+            },
+            None,
+        )
+        .await
+        .map_err(|e| format!("the sandbox couldn't run the probe ({e})"))?;
+    let body = out
+        .files
+        .iter()
+        .find(|(n, _)| n.ends_with("probe.json"))
+        .map(|(_, b)| b.clone())
+        .ok_or_else(|| {
+            format!(
+                "the probe gave no record ({})",
+                common::truncate_str(out.output.lines().last().unwrap_or(""), 200)
+            )
+        })?;
+    serde_json::from_str(&body).map_err(|e| format!("the probe's record couldn't be read ({e})"))
 }
 
 pub fn tool() -> ToolDefinition {
@@ -1303,6 +1369,17 @@ impl WebCheck {
     /// Runs [`probe_tool`]: the page's host must be one this run may check.
     async fn probe(&self, state: &WorkerState, gate: &dyn HostGate, input: &Value) -> String {
         let url = input["url"].as_str().unwrap_or("").trim().to_string();
+        let clicks: Vec<String> = input["clicks"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|c| c.as_str())
+                    .map(|c| c.trim().to_string())
+                    .filter(|c| !c.is_empty())
+                    .take(8)
+                    .collect()
+            })
+            .unwrap_or_default();
         let (parsed, host) = match vet_url(&url) {
             Ok(v) => v,
             Err(CheckError::Refused(m)) | Err(CheckError::Failed(m)) => {
@@ -1314,57 +1391,19 @@ impl WebCheck {
                 "{url}: refused: `{host}` isn't a host this run may load (name it in the work at hand, or it must be used in the team's repositories)"
             );
         }
-        let source = match super::skill_run::pack(&[(
-            "probe.mjs".to_string(),
-            common::e2e::probe::probe_script(parsed.as_str()),
-        )]) {
-            Ok(b) => b,
-            Err(e) => return format!("The probe couldn't be packed: {e}"),
-        };
-        let sandbox = crate::clients::sandbox::SandboxClient::new(
-            &state.codebuild,
-            &state.s3,
-            &state.logs,
-            &state.config.sandbox_bucket_name,
-            &state.config.sandbox_project_name,
-        )
-        .with_egress(crate::agent::policy::sandbox_egress(state, &self.team_id).await);
-        let mut hosts: Vec<String> = common::preview::CAPTURE_HOSTS
-            .iter()
-            .map(|h| h.to_string())
-            .collect();
-        hosts.push(host.clone());
-        let cmd = common::preview::capture_command().replace("capture.mjs", "probe.mjs");
-        let key = format!("probe-{}", uuid::Uuid::new_v4().simple());
-        let out = sandbox
-            .run_script(
-                crate::clients::sandbox::ScriptRun {
-                    key: &key,
-                    source,
-                    cmd: &cmd,
-                    secret: None,
-                    hosts,
-                },
-                None,
-            )
-            .await;
-        let record = match out {
-            Ok(o) => match o.files.iter().find(|(n, _)| n.ends_with("probe.json")) {
-                Some((_, body)) => body.clone(),
-                None => {
-                    return format!(
-                        "{url}: the probe gave no record ({})",
-                        common::truncate_str(o.output.lines().last().unwrap_or(""), 200)
-                    )
-                }
-            },
-            Err(e) => return format!("{url}: the sandbox couldn't run the probe ({e})"),
-        };
-        format!(
-            "Probe of {url}. Commit this record at `{}` and quote the test ids and fields you use in the pull request; write selectors and field reads only from it:\n{}",
-            common::e2e::probe::record_path(&host),
-            common::truncate_str(&record, 12_000)
-        )
+        match run_probe(state, &self.team_id, parsed.as_str(), &host, &clicks).await {
+            Ok(record) => format!(
+                "Probe of {url}. It is committed at `{}`; quote what it found in the pull request and write selectors, field reads and each branch's expectations only from it:\n{}\n{}\n{}",
+                common::e2e::probe::record_path(&host),
+                common::e2e::probe::quote(&record).trim_end(),
+                common::e2e::probe::RECORD_MARK,
+                common::truncate_str(
+                    &serde_json::to_string(&record).unwrap_or_default(),
+                    12_000
+                )
+            ),
+            Err(why) => format!("{url}: {why}"),
+        }
     }
 
     async fn run_urls(

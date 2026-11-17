@@ -5,6 +5,16 @@
 //! changed no code or data since then (docs, comments, whitespace) isn't
 //! reviewed at all; the approval stands. A push after a request for changes
 //! still gets a full review, so the whole change is checked again.
+//!
+//! What a pull request changes is always its merge-base diff with the base
+//! branch, never the diff from a commit CoderHelm reviewed. A pull request
+//! once had the base branch merged in after an approval; the diff from the
+//! approved commit then carried another pull request's file (already on the
+//! base branch, not in this one's change), and the review called it an
+//! unrelated change. A re-review covers only the files whose own change
+//! moved ([`own_files_moved`], [`own_part_of`]), and a finding that calls a
+//! file the pull request doesn't change unrelated or out of scope is
+//! dropped ([`drop_outside_claims`]).
 
 use serde_json::Value;
 
@@ -159,17 +169,8 @@ pub fn same_own_change(at_approval: &Value, now: &Value) -> bool {
     fn changes(compare: &Value) -> Option<Vec<(String, String, Vec<String>)>> {
         let mut out = Vec::new();
         for f in compare["files"].as_array()? {
-            let patch = f["patch"].as_str()?;
-            let lines: Vec<String> = patch
-                .lines()
-                .filter(|l| l.starts_with('+') || l.starts_with('-'))
-                .map(str::to_string)
-                .collect();
-            out.push((
-                f["filename"].as_str()?.to_string(),
-                f["status"].as_str().unwrap_or("").to_string(),
-                lines,
-            ));
+            let (name, status, lines) = own_file_change(f);
+            out.push((name?, status, lines?));
         }
         out.sort();
         Some(out)
@@ -178,6 +179,137 @@ pub fn same_own_change(at_approval: &Value, now: &Value) -> bool {
         (Some(a), Some(b)) => !a.is_empty() && a == b,
         _ => false,
     }
+}
+
+/// One file of a merge-base compare: its path, status and added and
+/// removed lines (`None` when GitHub sent no patch).
+fn own_file_change(f: &Value) -> (Option<String>, String, Option<Vec<String>>) {
+    let lines = f["patch"].as_str().map(|patch| {
+        patch
+            .lines()
+            .filter(|l| l.starts_with('+') || l.starts_with('-'))
+            .map(str::to_string)
+            .collect()
+    });
+    (
+        f["filename"].as_str().map(str::to_string),
+        f["status"].as_str().unwrap_or("").to_string(),
+        lines,
+    )
+}
+
+/// The paths a compare lists.
+pub fn compare_paths(compare: &Value) -> Vec<String> {
+    compare["files"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|f| f["filename"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The files of the pull request's own change now (its merge-base compare,
+/// `now`) whose change differs from the one at an earlier reviewed commit
+/// (`at_review`, that commit's merge-base compare): new to the pull
+/// request, or with other added or removed lines. A file only the base
+/// branch changed in between is in neither compare, so it is never here. A
+/// file whose patch GitHub didn't send counts as moved.
+pub fn own_files_moved(at_review: &Value, now: &Value) -> Vec<String> {
+    let before: Vec<(Option<String>, String, Option<Vec<String>>)> = at_review["files"]
+        .as_array()
+        .map(|a| a.iter().map(own_file_change).collect())
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    for f in now["files"].as_array().into_iter().flatten() {
+        let (Some(name), status, lines) = own_file_change(f) else {
+            continue;
+        };
+        let same = lines.is_some()
+            && before.iter().any(|(n, s, l)| {
+                n.as_deref() == Some(name.as_str()) && *s == status && *l == lines
+            });
+        if !same {
+            out.push(name);
+        }
+    }
+    out
+}
+
+/// The part of `since` (the compare from a reviewed commit to the head)
+/// that is the pull request's own: only the files in `moved`
+/// ([`own_files_moved`]). Everything a merge of the base branch brought in
+/// is left out. The compare keeps its status and commits.
+pub fn own_part_of(since: &Value, moved: &[String]) -> Value {
+    let mut out = since.clone();
+    let kept: Vec<Value> = since["files"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter(|f| {
+                    f["filename"]
+                        .as_str()
+                        .is_some_and(|n| moved.iter().any(|m| m == n))
+                })
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    out["files"] = Value::Array(kept);
+    out
+}
+
+/// Words that say a file's change doesn't belong in the pull request.
+const OUTSIDE_WORDS: &[&str] = &[
+    "unrelated",
+    "out of scope",
+    "outside the scope",
+    "outside this ticket",
+    "not part of this",
+    "doesn't belong",
+    "does not belong",
+    "not related to",
+    "another pull request",
+    "another pr",
+    "scope creep",
+    "drive-by",
+    "revert this file",
+    "revert the change to",
+];
+
+/// Drops the findings on a file the pull request doesn't change (`pr_files`,
+/// its merge-base compare's paths) that call the file's change unrelated,
+/// out of scope or another pull request's: there is no such change in this
+/// one. A finding about a file outside the diff that the change breaks (a
+/// caller, a config) is kept. Returns the dropped findings' titles.
+pub fn drop_outside_claims(
+    findings: &mut Vec<super::review_agent::Finding>,
+    pr_files: &[String],
+) -> Vec<String> {
+    let mut dropped = Vec::new();
+    findings.retain(|f| {
+        let holds = holds_on_diff(f, pr_files);
+        if !holds {
+            dropped.push(format!("{} ({})", f.title, f.file));
+        }
+        holds
+    });
+    dropped
+}
+
+/// Whether a finding still holds against a pull request's merge-base diff
+/// at a head (`pr_files`, [`compare_paths`] of its base...head compare):
+/// false for one that calls a file the pull request doesn't change
+/// unrelated, out of scope or another pull request's. Pure, so the thread
+/// cleanup can ask it of an earlier finding at a later head.
+pub fn holds_on_diff(f: &super::review_agent::Finding, pr_files: &[String]) -> bool {
+    let file = f.file.trim().trim_start_matches("./");
+    if file.is_empty() || pr_files.iter().any(|p| p == file) {
+        return true;
+    }
+    let text = format!("{} {}", f.title, f.body).to_ascii_lowercase();
+    !(OUTSIDE_WORDS.iter().any(|w| text.contains(w)) || f.category.eq_ignore_ascii_case("scope"))
 }
 
 fn file_touches_code(f: &Value) -> bool {

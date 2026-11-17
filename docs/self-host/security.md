@@ -37,7 +37,7 @@ order: 11
 
 - Each function has its own role with only the tables, queues, keys and actions it uses.
 - The build sandbox runs a repository's own build scripts, which are untrusted: its CodeBuild role can only read and write one bucket of short-lived source tarballs and write its logs. No GitHub token, no tables, no KMS.
-- Roles in teams' AWS accounts are assumed only by name (`CoderHelmLogReader`, `CoderhelmReadOnly*`) and with an external id. When the data is in the install's own account, see the exception in [The permissions boundary](#the-permissions-boundary).
+- Roles in teams' AWS accounts are assumed only by name (`CoderHelmLogReader`, `CoderhelmReadOnly*`) and with an external id. `CoderhelmReadOnly`'s one write is `s3:PutObject` for Athena query results, held by an explicit deny to the WAF log workgroup's own results prefix (see [Integrations](./integrations.md#connected-aws-accounts)). When the data is in the install's own account, see the exception in [The permissions boundary](#the-permissions-boundary).
 - An install made with Launch Stack holds no broad standing rights in your account: see [What an install can do in your account](#what-an-install-can-do-in-your-account).
 
 ## What an install can do in your account

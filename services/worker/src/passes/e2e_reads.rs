@@ -252,6 +252,73 @@ pub async fn read(cx: &Ctx<'_>, head: &str) -> Option<Verdict> {
     None
 }
 
+/// A passing end-to-end run on the head and the report it published.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PassingRun {
+    /// How it is known to have passed (check runs, the comment).
+    pub how: String,
+    /// The published report, when the end-to-end comment links one.
+    pub report: Option<String>,
+}
+
+/// Whether the head's end-to-end run passed, from its check runs (`checks`)
+/// and the pull request's end-to-end comments (`comments`, oldest first):
+/// none of its checks failed or is running, and a check or the comment on
+/// the head says it passed. The comment's report link comes with it.
+pub fn passing_run(checks: &[Value], comments: &[Value], head: &str) -> Option<PassingRun> {
+    let by_checks = checks_verdict(checks);
+    if matches!(by_checks, Some(Verdict::Failed(_)) | Some(Verdict::Running)) {
+        return None;
+    }
+    let comment = comments
+        .iter()
+        .rev()
+        .filter_map(|c| comment_verdict(c["body"].as_str().unwrap_or("")))
+        .find(|c| on_head(c, head));
+    if comment.as_ref().and_then(|c| c.failed).unwrap_or(0) > 0 {
+        return None;
+    }
+    let report = comment.as_ref().and_then(|c| c.report.clone());
+    match (by_checks, comment) {
+        (Some(Verdict::Passed(how)), _) => Some(PassingRun { how, report }),
+        (None, Some(c)) if c.passed.unwrap_or(0) > 0 => Some(PassingRun {
+            how: format!(
+                "{} end-to-end test(s) passed (the end-to-end comment on the pull request)",
+                c.passed.unwrap_or(0)
+            ),
+            report,
+        }),
+        _ => None,
+    }
+}
+
+/// The test ids (`ids`) a passing run's published report shows: each one
+/// the report's text holds was exercised by a test that passed. Read with
+/// the page check, so only a host the team's sites allow.
+pub async fn report_shows(
+    state: &crate::WorkerState,
+    github: &crate::clients::github::GitHubClient,
+    web: &super::web_check::WebCheck,
+    report: &str,
+    ids: &[String],
+) -> Vec<String> {
+    if ids.is_empty() {
+        return Vec::new();
+    }
+    let Ok(ck) = web.verify_find(state, github, report, ids).await else {
+        return Vec::new();
+    };
+    if ck.status() != Some(200) {
+        return Vec::new();
+    }
+    ck.found
+        .iter()
+        .filter(|(_, hits)| !hits.is_empty())
+        .map(|(id, _)| id.clone())
+        .filter(|id| ids.contains(id))
+        .collect()
+}
+
 /// The published report's verdict, read with the page check (only a host
 /// the team's sites allow).
 async fn report(cx: &Ctx<'_>, url: &str) -> Option<Verdict> {

@@ -29,8 +29,13 @@
 //!   request comes from the change, from the page and the code it runs.
 //! - [`bug_rules`] tells a bug from a flake and holds a bug fix to the app,
 //!   with a unit test, keeping only the changes that matter.
+//! - [`probe`] records what a page another company serves really has, and
+//!   holds end-to-end selectors to it.
+//! - [`branches`] finds test branches on a page's state and which of them a
+//!   recorded run, or the page as it is now, would run.
 
 pub mod attribution;
+pub mod branches;
 pub mod bug_rules;
 pub mod check_gate;
 pub mod ci_setup;

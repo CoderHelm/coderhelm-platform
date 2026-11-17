@@ -370,7 +370,8 @@ pub fn assumed_answers(
 /// stuck-run sweep can take the default once the deadline passes on
 /// reversible work (`lambda/stuck-run-cleanup`).
 pub async fn keep_ask_deadline(state: &WorkerState, team_id: &str, run_id: &str, judged: &Judged) {
-    let Some(q) = judged.question() else {
+    // Access has no default to take: nothing for the sweep to answer.
+    let Some(q) = judged.question().filter(|q| q.has_default()) else {
         return;
     };
     let due = chrono::Utc::now() + chrono::Duration::hours(i64::from(q.deadline_hours));

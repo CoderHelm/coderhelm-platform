@@ -54,6 +54,9 @@ aws-sdk-cloudwatchlogs = { version = "1", default-features = false, features = [
 aws-sdk-cloudwatch = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 # alarm_evidence: what an AWS WAF alarm's rule matched (sampled requests, read-only)
 aws-sdk-wafv2 = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+# alarm_evidence: a web ACL's logs held in S3, read through its Athena table (read-only query)
+aws-sdk-athena = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-glue = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 # log_repo: which repo a log group's code lives in (read-only lookups)
 aws-sdk-ecs = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-sdk-lambda = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
