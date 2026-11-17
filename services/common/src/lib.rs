@@ -166,6 +166,8 @@ pub mod ci_repro;
 /// The last check on a pull request description: no section twice, no
 /// deploy maps, no empty "who this affects".
 pub mod description_lint;
+/// A test fixture uses the ids the run looked up, not made-up ones.
+pub mod fixture_ids;
 #[cfg(test)]
 mod model_call_sites;
 /// Which pull requests CoderHelm may push to, edit or close: its own.
@@ -199,6 +201,8 @@ pub mod pr_steps;
 /// A repository's pull request template as the description's structure.
 pub mod pr_template;
 pub mod preview;
+/// What a fix must show before it is committed and pushed.
+pub mod push_gate;
 pub mod run_prs;
 pub mod waiting_line;
 // review_stats: time-ordered review records for analytics

@@ -107,7 +107,7 @@ pub fn wider_findings(found: &[super::minimal_change::Widening]) -> Vec<Finding>
             file: w.path.clone(),
             severity: "blocking".into(),
             category: match w.kind {
-                Kind::TestSize | Kind::InventedPayload => "tests",
+                Kind::TestSize | Kind::InventedPayload | Kind::MadeUpIds => "tests",
                 Kind::Replacing => "data",
                 _ => "scope",
             }

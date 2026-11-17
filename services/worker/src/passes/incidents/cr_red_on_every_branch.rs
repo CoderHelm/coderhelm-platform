@@ -159,19 +159,13 @@ fn nothing_is_reverted_without_a_comparison_that_shows_the_change_caused_it() {
         RevertGate::Refused(_)
     ));
 
-    // The pipeline: the gate comes before anything is chosen to come out,
-    // and a refusal returns before a write.
+    // The pipeline: a ticket run's own work never comes out for a red
+    // check at all now (`push_gate::FixLedger` stops the rounds with the
+    // test named instead); only a dependency run's bumps do.
     let src = include_str!("../resume.rs");
-    let revert = fn_src(src, "async fn revert_to_green(");
-    let gate = revert
-        .find("ci_repro::may_revert(")
-        .expect("the revert asks the gate");
-    assert!(gate < revert.find("sup::revert_for(").unwrap());
-    assert!(gate < revert.find("apply_revert(").unwrap());
-    assert!(
-        revert.find("revert_dep_commit(").unwrap() < gate,
-        "a dependency run keeps its own revert"
-    );
+    let revert = fn_src(src, "async fn take_out_failing_bumps(");
+    assert!(revert.contains("revert_dep_commit("));
+    assert!(!revert.contains("list_pr_commits("));
 }
 
 #[test]

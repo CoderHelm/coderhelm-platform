@@ -3529,7 +3529,19 @@ impl<'a> WriteToolExecutor<'a> {
             .iter()
             .cloned()
             .collect();
-        let steps = check_steps(cmd, &self.ci_steps, self.test_cmd.as_deref(), &changed);
+        // The owning packages' own scripts run the touched tests
+        // (`push_checks::merge_steps`), not the first workflow's test line.
+        let steps = super::push_checks::merge_steps(
+            check_steps(cmd, &self.ci_steps, self.test_cmd.as_deref(), &changed),
+            super::push_checks::package_steps(
+                self.github,
+                &self.owner,
+                &self.repo,
+                &self.branch,
+                &changed,
+            )
+            .await,
+        );
         let (steps, skipped) = match self.permitted_steps(steps).await {
             Ok(v) => v,
             Err(stop) => return Err(stop),

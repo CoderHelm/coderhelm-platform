@@ -55,6 +55,7 @@ pub enum Kind {
     Reporting,
     TestSize,
     InventedPayload,
+    MadeUpIds,
 }
 
 /// One way the change is wider than its ticket.
@@ -76,12 +77,16 @@ impl Widening {
             Kind::Reporting => "Reporting the ticket doesn't ask for",
             Kind::TestSize => "A test out of proportion to the change",
             Kind::InventedPayload => "A test payload nobody observed",
+            Kind::MadeUpIds => "Made-up ids where the run looked up real ones",
         }
     }
 
     /// Whether a reason in the coder's notes may keep it.
     pub fn excusable(&self) -> bool {
-        !matches!(self.kind, Kind::Replacing | Kind::InventedPayload)
+        !matches!(
+            self.kind,
+            Kind::Replacing | Kind::InventedPayload | Kind::MadeUpIds
+        )
     }
 
     /// What the coder is told to do, one line.
@@ -117,6 +122,10 @@ impl Widening {
             ),
             Kind::InventedPayload => format!(
                 "`{}` fakes an outside call with a payload nobody observed ({}). Build the fixture from a real response (probe it, or copy an existing fixture in the repository), or test the change below the outside call.",
+                self.path, self.what
+            ),
+            Kind::MadeUpIds => format!(
+                "`{}` uses made-up ids ({}) while this run looked up the real records' ids. Use the ids the lookups returned, so the test is about the records the bug is about.",
                 self.path, self.what
             ),
         };
@@ -798,6 +807,56 @@ pub fn test_size(diff: &Diff) -> Vec<Widening> {
     }]
 }
 
+/// Test cases in one file that check the same behaviour the same way:
+/// three or more added `it(`/`test(` cases whose bodies are the same once
+/// their literals (strings, numbers) are taken out. One case with the
+/// real ids, or one assertion over the list, covers them. A run once added
+/// four near-identical cases per helper, about 600 test lines for a
+/// 50-line fix.
+pub fn repeated_cases(diff: &Diff) -> Vec<Widening> {
+    let start =
+        regex::Regex::new(r#"^\s*(?:it|test)(?:\.each\b.*)?\(\s*["'`]"#).expect("valid regex");
+    let lit =
+        regex::Regex::new(r#""[^"]*"|'[^']*'|`[^`]*`|\b\d+(?:\.\d+)?\b"#).expect("valid regex");
+    let mut out = Vec::new();
+    for (path, status, patch) in diff {
+        if status == "removed" || !is_test(path) {
+            continue;
+        }
+        let mut cases: Vec<String> = Vec::new();
+        let mut open = false;
+        for line in lines_of(patch, '+') {
+            if start.is_match(line) {
+                cases.push(String::new());
+                open = true;
+            } else if line.trim_start().starts_with("})") {
+                // The case's closing line: what follows isn't its body.
+                open = false;
+            } else if let Some(c) = cases.last_mut().filter(|_| open) {
+                let shape = lit.replace_all(line.trim(), "_");
+                if !shape.is_empty() {
+                    c.push_str(&shape);
+                    c.push('\n');
+                }
+            }
+        }
+        let mut counts: std::collections::BTreeMap<&str, usize> = Default::default();
+        for c in cases.iter().filter(|c| c.lines().count() >= 2) {
+            *counts.entry(c.as_str()).or_default() += 1;
+        }
+        if let Some(n) = counts.values().copied().filter(|n| *n >= 3).max() {
+            out.push(Widening {
+                kind: Kind::TestSize,
+                path: path.clone(),
+                what: format!(
+                    "{n} added cases with the same body but their values: one case per behaviour"
+                ),
+            });
+        }
+    }
+    out
+}
+
 const FAKES: &[&str] = &[
     "class fake",
     "class mock",
@@ -832,6 +891,26 @@ fn payload_key(line: &str) -> bool {
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
         && rest[end + 1..].trim_start().starts_with(':')
+}
+
+/// Test fixtures with invented ids (`sport-a`, `id-1`) while the run's
+/// lookups (`lookups`: their recorded lines) returned real ones
+/// (`common::fixture_ids`).
+pub fn made_up_ids(diff: &Diff, lookups: &[String]) -> Vec<Widening> {
+    let looked = common::fixture_ids::looked_up_ids(lookups);
+    let found = common::fixture_ids::made_up(diff, &looked);
+    let mut out: Vec<Widening> = Vec::new();
+    for m in found {
+        match out.iter_mut().find(|w| w.path == m.path) {
+            Some(w) => w.what = format!("{}, `{}`", w.what, m.value),
+            None => out.push(Widening {
+                kind: Kind::MadeUpIds,
+                path: m.path,
+                what: format!("`{}`", m.value),
+            }),
+        }
+    }
+    out
 }
 
 /// Tests that fake an outside call with a large payload literal (twelve or
@@ -891,6 +970,7 @@ pub fn check(
         out.extend(reporting(diff));
     }
     out.extend(test_size(diff));
+    out.extend(repeated_cases(diff));
     out.extend(invented_payloads(diff, has_probe));
     out
 }
