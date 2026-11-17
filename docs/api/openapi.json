@@ -4094,7 +4094,7 @@
             ]
           },
           "stop_kind": {
-            "description": "Why the run stopped, when it was its own environment rather than a\nquestion: `tooling` (a command the run ran failed for want of a\ndependency or tool; see `tooling_failure`), or `already_merged` (a\npull request for the ticket had already merged, so no new work\nstarted; Retry runs the ticket again anyway).",
+            "description": "Why the run stopped, when it was its own environment rather than a\nquestion: `tooling` (a command the run ran failed for want of a\ndependency or tool; see `tooling_failure`), or `already_merged` (a\npull request for the ticket had already merged: the run ended\n`covered_by_pr` because it already did all of what the ticket asks,\nor waits because CoderHelm couldn't tell whether it does; Retry runs\nthe ticket again anyway).",
             "examples": [
               null
             ],
@@ -8631,7 +8631,7 @@
     },
     "/api/runs/{run_id}/retry": {
       "post": {
-        "description": "Starts the run's ticket again as a new run. Only a run that is `failed`, `needs_input`, `needs_outside_change`, `covered_by_pr`, `cancelled` or `closed` can be retried; the old run becomes `retried`, so retrying it twice is refused with `400`. Find the new run with `GET /api/runs?q=<ticket id>`.\n\nA run whose `stop_kind` is `already_merged` stopped before any work because a pull request for its ticket had already merged. Retrying it is how a person asks for the ticket to run again anyway: the new run goes ahead, and later runs on the ticket aren't stopped by that merge again.\n\nA `completed` run whose `round_incomplete` is set (its pull request is open but the last fix round on it didn't finish) is resumed instead: the same run picks the round up again on the same pull request, with a fresh time budget, and the answer's status is `resuming`.",
+        "description": "Starts the run's ticket again as a new run. Only a run that is `failed`, `needs_input`, `needs_outside_change`, `covered_by_pr`, `cancelled` or `closed` can be retried; the old run becomes `retried`, so retrying it twice is refused with `400`. Find the new run with `GET /api/runs?q=<ticket id>`.\n\nA run whose `stop_kind` is `already_merged` built nothing because a pull request for its ticket had already merged: it already did all of what the ticket asks (`covered_by_pr`), or CoderHelm couldn't tell whether it does (`needs_input`). Retrying it is how a person asks for the ticket to run again anyway: the new run goes ahead without that check, and later runs on the ticket skip it for the same merge.\n\nA `completed` run whose `round_incomplete` is set (its pull request is open but the last fix round on it didn't finish) is resumed instead: the same run picks the round up again on the same pull request, with a fresh time budget, and the answer's status is `resuming`.",
         "operationId": "retryRun",
         "parameters": [
           {

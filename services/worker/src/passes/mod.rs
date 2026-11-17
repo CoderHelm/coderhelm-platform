@@ -2234,12 +2234,6 @@ async fn run_passes(
             .then_some((own_repo.as_str(), msg.issue_number));
         ticket_history::add_earlier_prs(&mut history, &github, &repos, &msg.ticket_id, issue).await;
     }
-    // A ticket whose pull request already merged gets no second run unless
-    // a person asked for one after the merge (`common::merged_ticket`):
-    // stopped here, before a repo is picked or anything is built.
-    if stop_if_already_merged(state, msg, run_id, &github, &history, usage, start).await {
-        return Ok(());
-    }
 
     // --- Resolve repo for Jira tickets ---
     // For Jira: explicit pin on the message > the repo of the ticket's own
@@ -2876,6 +2870,18 @@ async fn run_passes(
             let mut rec = rec;
             rec.note = common::stop_rules::covering::retried_note(&rec);
             covering::finish(state, msg, run_id, &github, &rec, usage, start).await;
+            close_memory(state, agent_memory.take()).await;
+            return Ok(());
+        }
+        // A pull request for the ticket that already merged gets the same
+        // verdict as an open one (`common::merged_ticket`): all of the work
+        // ends the run as covered by it, part of it leaves only the rest to
+        // build.
+        if let MergedWork::Ended = merged_work(
+            state, msg, run_id, &github, &provider, &history, &diagnosis, usage, start,
+        )
+        .await
+        {
             close_memory(state, agent_memory.take()).await;
             return Ok(());
         }
@@ -9856,29 +9862,41 @@ async fn stop_run_repo_not_enabled(
     .await;
 }
 
-/// The merged-ticket rule (`common::merged_ticket`), before a fresh run on
-/// a person's ticket does any work: when a pull request for the ticket
-/// already merged, the run stops, says which one merged where and how to
-/// run the ticket anyway, and waits on a person. A run a person asked for
-/// after the merge goes on, and its record says so, so its retries and
-/// later runs on the ticket aren't stopped by the same merge. `true` when
-/// it stopped the run.
-async fn stop_if_already_merged(
+/// What [`merged_work`] left the run to do.
+enum MergedWork {
+    /// The run ended: covered by the merged pull request, or waiting on a
+    /// person because the verdict couldn't be read.
+    Ended,
+    /// The run goes on (with a note on what merged, when it did part).
+    GoOn,
+}
+
+/// The merged-ticket check (`common::merged_ticket`) for a fresh run on a
+/// person's ticket, after its triage and diagnosis: the ticket's newest
+/// merged pull request gets the coverage verdict open pull requests get.
+/// All of the work ends the run as covered by it; part of it tells every
+/// agent what merged and what is left; anything else changes nothing. A
+/// person who asked for the run after the merge skips the check, and the
+/// run records it so its retries and later runs on the ticket skip it too.
+#[allow(clippy::too_many_arguments)]
+async fn merged_work(
     state: &WorkerState,
-    msg: &TicketMessage,
+    msg: &mut TicketMessage,
     run_id: &str,
     github: &GitHubClient,
+    provider: &crate::agent::provider::ModelProvider,
     history: &ticket_history::TicketHistory,
-    usage: &TokenUsage,
+    diagnosis: &common::stop_rules::screen::TicketDiagnosis,
+    usage: &mut TokenUsage,
     start: &std::time::Instant,
-) -> bool {
+) -> MergedWork {
     use common::merged_ticket as mt;
     if msg.same_run() || !mt::guards(&msg.source, &msg.ticket_id) {
-        return false;
+        return MergedWork::GoOn;
     }
     let repo = format!("{}/{}", msg.repo_owner, msg.repo_name);
     let Some(pr) = history.blocking_merge(&msg.source, &repo) else {
-        return false;
+        return MergedWork::GoOn;
     };
     if msg.after_merge || msg.person_direction.is_some() {
         info!(run_id, pr = %pr.subject(), "The ticket's pull request merged; a person asked for this run anyway");
@@ -9906,16 +9924,112 @@ async fn stop_if_already_merged(
             ),
         )
         .await;
-        return false;
+        return MergedWork::GoOn;
     }
-    let message = mt::refusal(&msg.source, &msg.ticket_id, &pr);
-    stop_run_already_merged(state, msg, run_id, github, usage, start, &pr, &message).await;
-    true
+    if diagnosis.asks_separate_change() {
+        info!(run_id, pr = %pr.subject(), "The ticket asks for a separate change: the merged PR isn't checked");
+        return MergedWork::GoOn;
+    }
+    let earlier = history
+        .prs
+        .iter()
+        .find(|p| p.number == pr.number && p.repo.eq_ignore_ascii_case(&pr.repo));
+    let verdict =
+        stop_gate::merged_verdict(provider, usage, msg, github, run_id, &pr, earlier).await;
+    match mt::check(verdict.as_ref()) {
+        mt::Check::Covers { reason } => {
+            let own = earlier.is_some_and(|e| is_own_login(&e.author))
+                || history.runs.iter().any(|r| {
+                    r.pr_list
+                        .iter()
+                        .any(|p| p.pr_number == pr.number && p.repo.eq_ignore_ascii_case(&pr.repo))
+                });
+            let note = mt::covered_note(&msg.source, &msg.ticket_id, &pr, &reason);
+            let rec = common::stop_rules::covering::Record {
+                repo: pr.repo.clone(),
+                number: pr.number,
+                url: format!("https://github.com/{}/pull/{}", pr.repo, pr.number),
+                title: earlier.map(|e| e.title.clone()).unwrap_or_default(),
+                author: earlier.map(|e| e.author.clone()).unwrap_or_default(),
+                reason,
+                signals: vec!["names the ticket".to_string()],
+                own,
+                outcome: common::stop_rules::covering::Outcome::Merged
+                    .as_str()
+                    .to_string(),
+                note,
+                ..Default::default()
+            };
+            set_stop_kind(state, msg, run_id).await;
+            covering::finish(state, msg, run_id, github, &rec, usage, start).await;
+            MergedWork::Ended
+        }
+        mt::Check::Partly { reason, missing } => {
+            info!(run_id, pr = %pr.subject(), missing = missing.len(), "The merged PR did part of the ticket: building the rest");
+            add_progress_note(
+                state,
+                &msg.team_id,
+                run_id,
+                &format!(
+                    "{} already merged part of this ticket; this run builds only what is still to do: {}",
+                    pr.subject(),
+                    missing.join("; ")
+                ),
+            )
+            .await;
+            let section = mt::partial_note(&pr, &reason, &missing);
+            msg.team_instructions = if msg.team_instructions.trim().is_empty() {
+                section
+            } else {
+                format!("{}\n\n{section}", msg.team_instructions.trim_end())
+            };
+            MergedWork::GoOn
+        }
+        mt::Check::Unrelated { reason } => {
+            info!(run_id, pr = %pr.subject(), reason = %reason, "The merged PR doesn't do this ticket's work");
+            add_progress_note(
+                state,
+                &msg.team_id,
+                run_id,
+                &format!(
+                    "{} merged for this ticket but doesn't do what it asks, so the run goes on",
+                    pr.subject()
+                ),
+            )
+            .await;
+            MergedWork::GoOn
+        }
+        mt::Check::Unsure => {
+            let message = mt::unsure_note(&msg.source, &msg.ticket_id, &pr);
+            stop_run_already_merged(state, msg, run_id, github, usage, start, &pr, &message).await;
+            MergedWork::Ended
+        }
+    }
 }
 
-/// Stops a run the merged-ticket rule refused: the reason on the run and
-/// the ticket, `stop_kind` on the record, and the run waiting
-/// on a person (whether more work is due after a merge is theirs to say).
+/// Records on the run that the merged-ticket check ended it
+/// ([`common::merged_ticket::STOP_KIND`]): Retry, an `@coderhelm` command or
+/// a dashboard start on it is a person asking for the run anyway.
+async fn set_stop_kind(state: &WorkerState, msg: &TicketMessage, run_id: &str) {
+    if let Err(e) = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(&msg.team_id))
+        .key("run_id", attr_s(run_id))
+        .update_expression("SET stop_kind = :k")
+        .expression_attribute_values(":k", attr_s(common::merged_ticket::STOP_KIND))
+        .send()
+        .await
+    {
+        warn!(run_id, error = %e, "Could not record why the run ended");
+    }
+}
+
+/// Stops a run whose merged pull request couldn't be compared with the
+/// ticket (the verdict couldn't be read): the reason on the run and the
+/// ticket, `stop_kind` on the record, and the run waiting on a person, the
+/// one case the merged-ticket check asks one.
 #[allow(clippy::too_many_arguments)]
 async fn stop_run_already_merged(
     state: &WorkerState,
@@ -9928,21 +10042,9 @@ async fn stop_run_already_merged(
     message: &str,
 ) {
     use common::merged_ticket as mt;
-    info!(run_id, ticket_id = %msg.ticket_id, pr = %pr.subject(), "Run stopped: the ticket's pull request already merged");
+    info!(run_id, ticket_id = %msg.ticket_id, pr = %pr.subject(), "Run stopped: couldn't tell whether the merged PR does the ticket's work");
     add_progress_note(state, &msg.team_id, run_id, message).await;
-    if let Err(e) = state
-        .dynamo
-        .update_item()
-        .table_name(&state.config.runs_table_name)
-        .key("team_id", attr_s(&msg.team_id))
-        .key("run_id", attr_s(run_id))
-        .update_expression("SET stop_kind = :k")
-        .expression_attribute_values(":k", attr_s(mt::STOP_KIND))
-        .send()
-        .await
-    {
-        warn!(run_id, error = %e, "Could not record why the run stopped");
-    }
+    set_stop_kind(state, msg, run_id).await;
     match msg.source {
         TicketSource::Jira => {
             if let Err(e) = crate::passes::conversation::jira(

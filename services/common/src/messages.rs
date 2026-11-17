@@ -1178,9 +1178,9 @@ pub struct TicketMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub new_run_id: Option<String>,
     /// A person asked for this run after the ticket's pull request merged
-    /// (Retry on the run that stopped for it, or a command or dashboard
-    /// start on the GitHub issue whose run stopped for it), so the
-    /// merged-ticket rule doesn't stop it (`merged_ticket`).
+    /// (Retry on a run that ended on the merge, or a command or dashboard
+    /// start on the GitHub issue whose run did), so the run skips the
+    /// merged-ticket check (`merged_ticket`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub after_merge: bool,
 }

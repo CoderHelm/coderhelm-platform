@@ -12,10 +12,14 @@
 //!   changes the ticket's CONTENT goes to that PR's feedback path
 //!   ([`TicketGate::OpenPr`]); any other edit is ignored. A Jira edit one
 //!   second before the merge used to start a whole duplicate run
-//! - a merged latest run blocks on any ticket edit: the work shipped, and a
-//!   fresh run would rebuild it from scratch as a second PR (people closed
-//!   five of those in one afternoon). Only reopening the ticket (or a person
-//!   asking explicitly) starts follow-up work
+//! - after a merged latest run, a status change out of done (a reopen) or
+//!   an edit that changes the ticket's CONTENT starts a run; any other event
+//!   starts nothing. That run doesn't rebuild the merged work: the worker
+//!   gives the merged PR the same coverage verdict as an open one
+//!   (`common::merged_ticket`) and ends the run as covered by it, or builds
+//!   only what the ticket now asks that it didn't do (new acceptance
+//!   criteria). A fresh run used to rebuild it from scratch as a second PR
+//!   (people closed five of those in one afternoon)
 //! - after the PR closed without merging, a new run starts when the ticket is
 //!   reopened or its content changed since CoderHelm last saw it (an edit
 //!   already sent to the open PR doesn't count again)
@@ -31,18 +35,10 @@
 //!   run, and the closed run stays as history
 //! - a ticket a person marked done on the ticket itself ("fixed in the
 //!   booking system") stays done until its content changes
-//! - a run CoderHelm stopped because the ticket's pull request had already
-//!   merged (`common::merged_ticket`) is never followed by a run from a
-//!   ticket event, an edit or a status change out of done included, so it
-//!   never refuses again and again; only a person's explicit trigger
-//!   (Retry on that run, a command) starts the work
-//! - a failed / retried latest run doesn't block, until
-//!   [`MAX_FAILED_RUNS_IN_A_ROW`] runs in a row ended failed (a run a
-//!   person retried is passed over: it neither counts nor ends the streak):
-//!   then an event that leaves the ticket unchanged starts nothing (a field
-//!   or status change used to start the same failing run every time). A
-//!   content change, a reopen, a person's Retry or command still start one;
-//!   Retry and commands are never blocked by the cap
+//! - a run that ended covered by a merged PR, or waiting because the
+//!   worker couldn't tell whether the merged PR does the work, is a handled
+//!   ticket like any other: only a content change starts another run
+//! - a failed / retried latest run never blocks
 //! - explicit human triggers (slash commands, comment retries) skip the
 //!   content check but still respect in-flight blocking
 
@@ -84,11 +80,6 @@ struct LatestRun<'a> {
     context_hash: Option<&'a str>,
     /// The hash of the newest edit already sent to the run's open PR.
     seen_hash: Option<&'a str>,
-    /// Why the run stopped, when it recorded one (`stop_kind`).
-    stop_kind: &'a str,
-    /// Runs in a row, newest first, that ended failed; runs a person
-    /// retried are passed over (they neither count nor end the streak).
-    failed_in_a_row: usize,
 }
 
 impl LatestRun<'_> {
@@ -101,11 +92,6 @@ impl LatestRun<'_> {
 
     fn merged(&self) -> bool {
         self.status == "merged" || self.pr_outcome == "merged"
-    }
-
-    /// It stopped because the ticket's PR had already merged.
-    fn stopped_as_merged(&self) -> bool {
-        self.stop_kind == common::merged_ticket::STOP_KIND
     }
 
     /// Its PR closed without merging. A cancelled run's PR was closed by a
@@ -141,29 +127,10 @@ enum Decision {
     ToOpenPr,
 }
 
-/// Failed runs in a row on one ticket after which an event that leaves the
-/// ticket unchanged starts no further run.
-pub const MAX_FAILED_RUNS_IN_A_ROW: usize = 3;
-
 fn decide(latest: &LatestRun, new_hash: Option<&str>, reopened: bool) -> Decision {
     if !handled(latest.status) {
-        // failed / retried: allow a retry, up to the cap while unchanged
-        if latest.failed_in_a_row >= MAX_FAILED_RUNS_IN_A_ROW
-            && !reopened
-            && !latest.changed(new_hash)
-        {
-            return Decision::Skip(
-                "the ticket's last runs failed and it is unchanged; changing the ticket, \
-                 reopening it, or a person's explicit Retry or command starts another",
-            );
-        }
+        // failed / retried: allow retry
         return Decision::Enqueue;
-    }
-    if latest.stopped_as_merged() {
-        return Decision::Skip(
-            "its last run stopped because the ticket's PR had already merged; only a person's \
-             Retry or command starts another",
-        );
     }
     if latest.pr_open() {
         return if latest.changed(new_hash) {
@@ -173,10 +140,12 @@ fn decide(latest: &LatestRun, new_hash: Option<&str>, reopened: bool) -> Decisio
         };
     }
     if latest.merged() {
-        return if reopened {
+        // The worker checks the merged PR against the ticket before it
+        // builds anything (`common::merged_ticket`).
+        return if reopened || latest.changed(new_hash) {
             Decision::Enqueue
         } else {
-            Decision::Skip("its PR merged and the ticket wasn't reopened")
+            Decision::Skip("its PR merged and the ticket is unchanged and wasn't reopened")
         };
     }
     if (latest.pr_closed() || latest.closed_by_person()) && reopened {
@@ -236,13 +205,21 @@ async fn ticket_runs(
 type Item = std::collections::HashMap<String, AttributeValue>;
 
 /// Whether the newest of a GitHub issue's runs in `repo` (`owner/name`; an
-/// issue number names an issue only within its repository) stopped because
-/// the issue's pull request had already merged (`common::merged_ticket`).
-/// A person's explicit start on that issue (a command, the dashboard) then
-/// asks for the work anyway and carries `after_merge`.
-pub fn latest_stopped_as_merged(items: Vec<Item>, repo: &str) -> bool {
-    latest_run(&own_runs(items, Some(repo)))
-        .is_some_and(|i| field(i, "stop_kind") == common::merged_ticket::STOP_KIND)
+/// issue number names an issue only within its repository) ended on a
+/// merge: its pull request merged, or the merged-ticket check ended it
+/// (`common::merged_ticket`: covered by a merged pull request, or waiting
+/// because it couldn't tell). A person's explicit start on that issue (a
+/// command, the dashboard) then asks for the work anyway and carries
+/// `after_merge`.
+pub fn latest_ended_on_merge(items: Vec<Item>, repo: &str) -> bool {
+    latest_run(&own_runs(items, Some(repo))).is_some_and(ended_on_merge)
+}
+
+/// The run merged, or the merged-ticket check ended it.
+pub fn ended_on_merge(i: &Item) -> bool {
+    field(i, "stop_kind") == common::merged_ticket::STOP_KIND
+        || field(i, "status") == common::run_status::MERGED
+        || field(i, "pr_outcome") == "merged"
 }
 
 fn field<'a>(i: &'a Item, k: &str) -> &'a str {
@@ -268,17 +245,17 @@ fn latest_run(items: &[Item]) -> Option<&Item> {
         .max_by(|a, b| field(a, "run_id").cmp(field(b, "run_id")))
 }
 
-/// [`latest_stopped_as_merged`] for the GitHub issue `ticket_id` in `repo`,
-/// read now. False when the runs can't be read: the worker then refuses
-/// the run again with the same refusal, and Retry on it still works.
-pub async fn github_issue_stopped_as_merged(
+/// [`latest_ended_on_merge`] for the GitHub issue `ticket_id` in `repo`,
+/// read now. False when the runs can't be read: the worker then checks the
+/// merged pull request against the issue as for any run.
+pub async fn github_issue_ended_on_merge(
     state: &AppState,
     team_id: &str,
     ticket_id: &str,
     repo: &str,
 ) -> bool {
     match ticket_runs(state, team_id, ticket_id).await {
-        Ok(items) => latest_stopped_as_merged(items, repo),
+        Ok(items) => latest_ended_on_merge(items, repo),
         Err(e) => {
             warn!(team_id, ticket_id, error = %e, "Could not read the issue's runs");
             false
@@ -400,16 +377,6 @@ pub async fn gate_ticket_trigger(
         pr_outcome: s("pr_outcome").unwrap_or(""),
         context_hash: s("context_hash"),
         seen_hash: s(SEEN_HASH_FIELD),
-        stop_kind: s("stop_kind").unwrap_or(""),
-        failed_in_a_row: failed_in_a_row(
-            items
-                .iter()
-                .map(|i| {
-                    let id = i.get("run_id").and_then(|v| v.as_s().ok()).cloned();
-                    (id.unwrap_or_default(), status_of(i))
-                })
-                .collect(),
-        ),
     };
     match decide(&run, new_context_hash, reopened) {
         Decision::Enqueue => {
@@ -478,25 +445,14 @@ pub async fn gate_ticket_trigger(
     }
 }
 
-/// How many of the ticket's runs in a row, newest first, ended failed,
-/// from `(run_id, status)` in any order. A run a person retried (`retried`,
-/// whatever it ended as) is passed over: it neither counts nor ends the
-/// streak. Run ids are ULIDs, which sort by creation time.
-fn failed_in_a_row(mut runs: Vec<(String, String)>) -> usize {
-    runs.sort_by(|a, b| b.0.cmp(&a.0));
-    runs.iter()
-        .filter(|(_, status)| status != "retried")
-        .take_while(|(_, status)| status == "failed")
-        .count()
-}
-
 /// The run record's field holding the hash of the newest ticket edit sent
 /// to its open PR.
 const SEEN_HASH_FIELD: &str = "seen_context_hash";
 
 /// The latest run left the ticket handled: only a change to the ticket's
-/// content starts another run. "covered_by_pr": an open pull request already
-/// does the work; a ticket edit asking for a separate change starts one.
+/// content starts another run. "covered_by_pr": a pull request (open, or
+/// already merged) already does the work; a ticket edit asking for a
+/// separate change starts one.
 /// "needs_outside_change": the fix is a change in
 /// another system. "needs_input": CoderHelm asked; people answer by comment
 /// or by editing the ticket. "cancelled": a person stopped it, or closed its
@@ -567,9 +523,8 @@ pub fn expected_attachment_keys(
 #[cfg(test)]
 mod tests {
     use super::{
-        decide, edit_note, failed_in_a_row, field, handled, jira_reopened, latest_run,
-        latest_stopped_as_merged, own_runs, Decision, Item, LatestRun, OpenPr,
-        MAX_FAILED_RUNS_IN_A_ROW,
+        decide, edit_note, field, handled, jira_reopened, latest_ended_on_merge, latest_run,
+        own_runs, Decision, Item, LatestRun, OpenPr,
     };
     use aws_sdk_dynamodb::types::AttributeValue;
 
@@ -583,12 +538,18 @@ mod tests {
         i
     }
 
+    fn with(mut i: Item, k: &str, v: &str) -> Item {
+        i.insert(k.into(), AttributeValue::S(v.into()));
+        i
+    }
+
     /// WEB-42's PR merged into `develop` while the ticket stayed open; the
-    /// team then moved it In Review -> QA. The event reaches the worker
-    /// (which refuses it: the message carries no `after_merge`), and once
-    /// that refusal is the latest run the next status move starts nothing.
+    /// team then moved it In Review -> QA (or added acceptance criteria).
+    /// The event reaches the worker, which checks the merged PR against the
+    /// ticket instead of rebuilding it. Once that run ended covered by the
+    /// merged PR, the next status move starts nothing; only new content does.
     #[test]
-    fn a_status_move_after_a_merge_is_refused_once_then_starts_nothing() {
+    fn after_a_merge_a_status_move_or_an_edit_reaches_the_merged_check() {
         let to_qa = serde_json::json!({
             "changelog": {"items": [
                 {"field": "status", "fromString": "In Review", "toString": "QA"}
@@ -598,33 +559,41 @@ mod tests {
         let moved = jira_reopened(&to_qa);
         let merged = run("merged", 12, "merged", "h1");
         assert_eq!(decide(&merged, Some("h1"), moved), Decision::Enqueue);
-        let refused = LatestRun {
-            stop_kind: common::merged_ticket::STOP_KIND,
-            ..run("needs_input", 0, "", "h1")
-        };
+        assert_eq!(decide(&merged, Some("h2"), false), Decision::Enqueue);
         assert!(matches!(
-            decide(&refused, Some("h1"), moved),
+            decide(&merged, Some("h1"), false),
             Decision::Skip(_)
         ));
+        let covered = run("covered_by_pr", 0, "", "h1");
+        assert!(matches!(
+            decide(&covered, Some("h1"), moved),
+            Decision::Skip(_)
+        ));
+        assert_eq!(decide(&covered, Some("h2"), false), Decision::Enqueue);
     }
 
     /// A person's command or dashboard start on a GitHub issue asks for the
     /// work after a merge only when that issue's own newest run (in its own
-    /// repository: acme/api#42 is also `GH-42`) stopped for it.
+    /// repository: acme/api#42 is also `GH-42`) ended on a merge: it merged,
+    /// or the merged-ticket check ended it.
     #[test]
-    fn only_the_issues_own_newest_run_stopped_as_merged_counts() {
+    fn only_the_issues_own_newest_run_ending_on_a_merge_counts() {
         let stop = common::merged_ticket::STOP_KIND;
         let runs = vec![
             item("01A", "acme/web", stop),
             item("01B", "acme/web", ""),
             item("01C", "acme/api", stop),
+            with(item("01D", "acme/app", ""), "status", "merged"),
+            with(item("01E", "acme/ops", ""), "pr_outcome", "merged"),
         ];
-        assert!(latest_stopped_as_merged(runs.clone(), "acme/api"));
-        assert!(latest_stopped_as_merged(runs.clone(), "ACME/API"));
-        // acme/web's newest run (01B) didn't stop for a merge.
-        assert!(!latest_stopped_as_merged(runs.clone(), "acme/web"));
-        assert!(!latest_stopped_as_merged(runs, "acme/app"));
-        assert!(!latest_stopped_as_merged(vec![], "acme/api"));
+        assert!(latest_ended_on_merge(runs.clone(), "acme/api"));
+        assert!(latest_ended_on_merge(runs.clone(), "ACME/API"));
+        assert!(latest_ended_on_merge(runs.clone(), "acme/app"));
+        assert!(latest_ended_on_merge(runs.clone(), "acme/ops"));
+        // acme/web's newest run (01B) didn't end on a merge.
+        assert!(!latest_ended_on_merge(runs.clone(), "acme/web"));
+        assert!(!latest_ended_on_merge(runs, "acme/other"));
+        assert!(!latest_ended_on_merge(vec![], "acme/api"));
     }
 
     /// acme/web#42's run stopped because its PR had merged; acme/api#42 is
@@ -651,133 +620,21 @@ mod tests {
             pr_outcome: outcome,
             context_hash: Some(hash),
             seen_hash: None,
-            stop_kind: "",
-            failed_in_a_row: 0,
         }
     }
 
-    /// A run stopped because the ticket's PR had already merged: no ticket
-    /// event starts another (no refusal after refusal), a status change out
-    /// of done included; only an explicit trigger, which skips `decide`.
+    /// After a merge, new content or a reopen starts a run (the worker
+    /// checks the merged PR against the ticket); a field change alone
+    /// doesn't.
     #[test]
-    fn a_run_stopped_as_already_merged_starts_nothing_from_ticket_events() {
-        let stopped = LatestRun {
-            stop_kind: common::merged_ticket::STOP_KIND,
-            ..run("needs_input", 0, "", "h1")
-        };
-        assert!(matches!(
-            decide(&stopped, Some("h2"), false),
-            Decision::Skip(_)
-        ));
-        assert!(matches!(
-            decide(&stopped, Some("h1"), false),
-            Decision::Skip(_)
-        ));
-        assert!(matches!(
-            decide(&stopped, Some("h1"), true),
-            Decision::Skip(_)
-        ));
-        assert!(matches!(
-            decide(&stopped, Some("h2"), true),
-            Decision::Skip(_)
-        ));
-        // Any other needs_input still runs again on a content change.
-        assert_eq!(
-            decide(&run("needs_input", 0, "", "h1"), Some("h2"), false),
-            Decision::Enqueue
-        );
-    }
-
-    /// The same failing run used to start on every field or status change.
-    #[test]
-    fn failed_runs_in_a_row_stop_restarting_on_an_unchanged_ticket() {
-        let below = LatestRun {
-            failed_in_a_row: MAX_FAILED_RUNS_IN_A_ROW - 1,
-            ..run("failed", 0, "", "h1")
-        };
-        assert_eq!(decide(&below, Some("h1"), false), Decision::Enqueue);
-        let capped = LatestRun {
-            failed_in_a_row: MAX_FAILED_RUNS_IN_A_ROW,
-            ..run("failed", 0, "", "h1")
-        };
-        assert!(matches!(
-            decide(&capped, Some("h1"), false),
-            Decision::Skip(_)
-        ));
-        assert!(matches!(decide(&capped, None, false), Decision::Skip(_)));
-        // New content, or a reopen, starts one.
-        assert_eq!(decide(&capped, Some("h2"), false), Decision::Enqueue);
-        assert_eq!(decide(&capped, Some("h1"), true), Decision::Enqueue);
-    }
-
-    #[test]
-    fn failures_in_a_row_count_from_the_newest_run() {
-        let r = |id: &str, s: &str| (id.to_string(), s.to_string());
-        // Out of order on purpose: ids sort by creation time.
-        assert_eq!(
-            failed_in_a_row(vec![
-                r("01C", "failed"),
-                r("01A", "failed"),
-                r("01D", "failed"),
-                r("01B", "completed"),
-            ]),
-            2
-        );
-        // Two runs that asked a question and a person retried, then one
-        // failure: one failed run, not three.
-        assert_eq!(
-            failed_in_a_row(vec![
-                r("01A", "retried"),
-                r("01B", "retried"),
-                r("01C", "failed"),
-            ]),
-            1
-        );
-        // A retried run between failures doesn't end the streak.
-        assert_eq!(
-            failed_in_a_row(vec![
-                r("01A", "failed"),
-                r("01B", "retried"),
-                r("01C", "failed"),
-                r("01D", "failed"),
-            ]),
-            3
-        );
-        assert_eq!(failed_in_a_row(vec![r("01A", "completed")]), 0);
-        assert_eq!(failed_in_a_row(vec![]), 0);
-    }
-
-    /// The prod duplicate: a Jira edit one second before the merge, while
-    /// auto-merge was armed, started a whole new run.
-    #[test]
-    fn an_edit_while_the_pr_is_open_goes_to_that_pr_never_a_new_run() {
-        let open = run("completed", 12, "", "h1");
-        assert_eq!(decide(&open, Some("h2"), false), Decision::ToOpenPr);
-        assert!(matches!(
-            decide(&open, Some("h1"), false),
-            Decision::Skip(_)
-        ));
-        assert!(matches!(decide(&open, Some("h1"), true), Decision::Skip(_)));
-        assert!(matches!(decide(&open, None, false), Decision::Skip(_)));
-        // The same edit, already sent to the PR, isn't sent again.
-        let seen = LatestRun {
-            seen_hash: Some("h2"),
-            ..open
-        };
-        assert!(matches!(
-            decide(&seen, Some("h2"), false),
-            Decision::Skip(_)
-        ));
-    }
-
-    #[test]
-    fn after_a_merge_only_reopening_starts_work() {
+    fn after_a_merge_new_content_or_a_reopen_starts_work() {
         let merged = run("merged", 12, "merged", "h1");
+        assert_eq!(decide(&merged, Some("h2"), false), Decision::Enqueue);
+        assert_eq!(decide(&merged, Some("h1"), true), Decision::Enqueue);
         assert!(matches!(
-            decide(&merged, Some("h2"), false),
+            decide(&merged, Some("h1"), false),
             Decision::Skip(_)
         ));
-        assert_eq!(decide(&merged, Some("h1"), true), Decision::Enqueue);
     }
 
     #[test]

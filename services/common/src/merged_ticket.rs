@@ -1,5 +1,4 @@
-//! No second run on a ticket whose work already merged, unless a person
-//! asked for one after that merge.
+//! No second change on a ticket whose work already merged.
 //!
 //! Most of the pull requests people closed unmerged on one team were second
 //! runs on a ticket whose work had already merged: a retry, a ticket edit, or a
@@ -7,41 +6,55 @@
 //! branch and the ticket was still open. Each one rebuilt the same change
 //! from nothing.
 //!
-//! The rule, before a run on a person's ticket (a Jira key or a GitHub
-//! issue) does any work: when a pull request for the ticket merged
-//! (CoderHelm's or anyone's, into any base branch, an integration branch
-//! included), the run stops at once, says which pull request merged where
-//! and when, and says how to run it anyway ([`refusal`]). It ends waiting on
-//! a person (whether more work is due after a merge is theirs to
-//! decide), with [`STOP_KIND`] on its record.
+//! A merged pull request is read the way an open one is
+//! (`stop_rules::existing_work`): before a run on a person's ticket (a Jira
+//! key or a GitHub issue) builds anything, after its triage and the
+//! ticket's own diagnosis, the ticket's newest merged pull request
+//! ([`blocking`]: CoderHelm's or anyone's, into any base branch, an
+//! integration branch included, never a revert) is compared with the ticket
+//! by the same verdict ([`check`]):
 //!
-//! A person asks for a run after the merge, explicitly, by:
+//! - it did all of what the ticket asks: the run ends covered by it
+//!   (`covered_by_pr`), linked to it, with [`covered_note`]; nothing is
+//!   built;
+//! - it did part of it: the run goes on and builds only what is missing;
+//!   the planner and the pull request description are told what merged
+//!   ([`partial_note`]), and the run's pull request adds to it;
+//! - it did something else (prep work, another change on the same files):
+//!   the run takes its normal path;
+//! - the verdict couldn't be read: the only case that waits on a person
+//!   ([`unsure_note`], [`STOP_KIND`] on the record).
 //!
-//! - pressing Retry on the run that stopped (the dashboard, or
-//!   `POST /api/runs/{run_id}/retry`);
-//! - on Jira, replying on the ticket with what is still to do (the new run
+//! The ticket asking for a separate change skips the check, as it does for
+//! open pull requests. A ticket edited after its pull request merged reaches
+//! the check like any other run, so new acceptance criteria get built.
+//!
+//! A person asking for the run after the merge skips the check and the run
+//! goes ahead:
+//!
+//! - Retry on a run that ended covered by a merged pull request, waited on
+//!   this check, or merged (the dashboard, or `POST /api/runs/{run_id}/retry`);
+//! - on Jira, a reply on the ticket with what is still to do (the new run
 //!   starts with that person's direction);
-//! - on GitHub, mentioning `@coderhelm` (or `/coderhelm`) on the issue with
-//!   what is still to do, or starting the issue from the dashboard.
-//!
-//! A Jira status change is never one: a ticket moving In Review -> QA
-//! after its pull request merged into an integration branch is the second
-//! run this rule exists to stop.
+//! - on GitHub, `@coderhelm` (or `/coderhelm`) on the issue with what is
+//!   still to do, or starting the issue from the dashboard, when the issue's
+//!   latest run ended that way.
 //!
 //! A run started that way records it ([`FIELD_AFTER_MERGE`]), so its own
-//! retries and later runs on the ticket aren't stopped again by the same
-//! merge ([`blocking`]). A pull request that merges after it stops them
-//! again.
+//! retries and later runs on the ticket skip the check for the same merge;
+//! a pull request that merges after it is checked again.
 //!
 //! CoderHelm's own work (alerts, log findings, flaky tests, security fixes,
-//! plan tasks) is never stopped by this: the same finding can come back
-//! after its fix merged ([`guards`]).
+//! plan tasks) is never checked: the same finding can come back after its
+//! fix merged ([`guards`]).
 
 use serde::{Deserialize, Serialize};
 
 use crate::messages::TicketSource;
+use crate::stop_rules::existing_work::Verdict;
 
-/// The run record's `stop_kind` for a run this rule stopped.
+/// The run record's `stop_kind` for a run this rule ended: covered by a
+/// merged pull request, or waiting because the check couldn't be read.
 pub const STOP_KIND: &str = "already_merged";
 /// The run record's field set when a person asked for the run after the
 /// ticket's pull request merged.
@@ -106,15 +119,15 @@ fn started_ms(run_id: &str) -> Option<i64> {
         .and_then(|u| i64::try_from(u.timestamp_ms()).ok())
 }
 
-/// The merged pull request that stops a new run, or None.
+/// The merged pull request a new run is checked against, or None.
 ///
 /// `allowed_runs`: ids of the ticket's earlier runs a person asked for
 /// after the merge. Only the newest merge counts: a run allowed after it
-/// lets the ticket go on; one allowed before it doesn't. A merge with no
-/// known time is taken to be before any allowed run. When the newest merge
-/// is a revert ([`MergedPr::revert`]), the ticket's work was undone and
-/// nothing stops the run; a pull request that merges after the revert
-/// stops it again.
+/// skips the check; one allowed before it doesn't. A merge with no known
+/// time is taken to be before any allowed run. When the newest merge is a
+/// revert ([`MergedPr::revert`]), the ticket's work was undone and nothing
+/// is checked; a pull request that merges after the revert is checked
+/// again.
 pub fn blocking<'a>(merged: &'a [MergedPr], allowed_runs: &[&str]) -> Option<&'a MergedPr> {
     let newest = merged.iter().max_by(|a, b| {
         a.merged_ms()
@@ -133,9 +146,42 @@ pub fn blocking<'a>(merged: &'a [MergedPr], allowed_runs: &[&str]) -> Option<&'a
     (!allowed_since).then_some(newest)
 }
 
-/// What the run page and the ticket say when the rule stops a run: what
-/// merged where, why no new work starts, and how to run it anyway.
-pub fn refusal(source: &TicketSource, ticket: &str, pr: &MergedPr) -> String {
+/// What the check found about the merged pull request ([`check`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Check {
+    /// It did all of what the ticket asks: the run ends covered by it.
+    Covers { reason: String },
+    /// It did part of it: the run builds only the `missing` items.
+    Partly {
+        reason: String,
+        missing: Vec<String>,
+    },
+    /// It did something else: the run takes its normal path.
+    Unrelated { reason: String },
+    /// The verdict couldn't be read: a person decides.
+    Unsure,
+}
+
+/// The check, from the coverage verdict on the merged pull request
+/// (`None` when it couldn't be read).
+pub fn check(verdict: Option<&Verdict>) -> Check {
+    match verdict {
+        None => Check::Unsure,
+        Some(v) if !v.addresses => Check::Unrelated {
+            reason: v.reason.clone(),
+        },
+        Some(v) if v.missing.is_empty() => Check::Covers {
+            reason: v.reason.clone(),
+        },
+        Some(v) => Check::Partly {
+            reason: v.reason.clone(),
+            missing: v.missing.clone(),
+        },
+    }
+}
+
+/// " into `develop` on 2026-11-02", from what is known.
+fn where_when(pr: &MergedPr) -> String {
     let into = if pr.base.trim().is_empty() {
         String::new()
     } else {
@@ -147,35 +193,90 @@ pub fn refusal(source: &TicketSource, ticket: &str, pr: &MergedPr) -> String {
         .filter(|d| d.len() == 10)
         .map(|d| format!(" on {d}"))
         .unwrap_or_default();
-    let how = match source {
+    format!("{into}{on}")
+}
+
+/// How a person runs the ticket anyway.
+fn how(source: &TicketSource) -> &'static str {
+    match source {
         TicketSource::Jira => {
-            "press Retry on the stopped run in CoderHelm, or reply on the ticket with what is \
-             still to do"
+            "press Retry on this run in CoderHelm, or reply on the ticket with what is still to \
+             do"
         }
         _ => {
-            "press Retry on the stopped run in CoderHelm, or mention @coderhelm on the issue \
-             with what is still to do"
+            "press Retry on this run in CoderHelm, or mention @coderhelm on the issue with what \
+             is still to do"
         }
-    };
+    }
+}
+
+fn link(pr: &MergedPr) -> String {
+    format!("[{}]({})", pr.subject(), pr.url())
+}
+
+/// What the run page and the ticket say when the merged pull request did
+/// all of what the ticket asks.
+pub fn covered_note(source: &TicketSource, ticket: &str, pr: &MergedPr, reason: &str) -> String {
+    let why = reason.trim().trim_end_matches('.');
     format!(
-        "CoderHelm didn't start new work on {ticket}: its pull request [{}]({}) merged{into}{on}. \
-         Another run would build the same change again as a second pull request.\n\n\
-         To run the ticket again anyway, {how}.",
-        pr.subject(),
-        pr.url(),
+        "{ticket}'s work already merged in {}{}{}. CoderHelm didn't build a second change.\n\n\
+         To run the ticket again anyway, {}.",
+        link(pr),
+        where_when(pr),
+        if why.is_empty() {
+            String::new()
+        } else {
+            format!(": {why}")
+        },
+        how(source),
     )
+}
+
+/// What the run page and the ticket say when the verdict on the merged
+/// pull request couldn't be read: the one case that waits on a person.
+pub fn unsure_note(source: &TicketSource, ticket: &str, pr: &MergedPr) -> String {
+    format!(
+        "{} merged{} for {ticket}, and CoderHelm couldn't tell whether it already does what the \
+         ticket asks, so it didn't start a second change.\n\n\
+         To run the ticket anyway, {}.",
+        link(pr),
+        where_when(pr),
+        how(source),
+    )
+}
+
+/// The section the planner, the coder and the pull request description get
+/// when the merged pull request did part of the ticket.
+pub fn partial_note(pr: &MergedPr, reason: &str, missing: &[String]) -> String {
+    let why = reason.trim().trim_end_matches('.');
+    let mut out = format!(
+        "## Already merged for this ticket\n\n{} merged{}{}. Build only what it didn't do; \
+         don't redo or revert its work. The pull request description says this change adds to \
+         {}.\n\nStill to do:\n",
+        pr.subject(),
+        where_when(pr),
+        if why.is_empty() {
+            String::new()
+        } else {
+            format!(" and already does part of this ticket: {why}")
+        },
+        pr.subject(),
+    );
+    for m in missing {
+        out.push_str(&format!("- {}\n", m.trim()));
+    }
+    out
 }
 
 /// What the run's wait asks for.
 pub fn wait_action(source: &TicketSource) -> &'static str {
     match source {
         TicketSource::Jira => {
-            "Press Retry to run the ticket again anyway, or reply on the ticket with what is \
-             still to do"
+            "Press Retry to run the ticket anyway, or reply on the ticket with what is still to do"
         }
         _ => {
-            "Press Retry to run the issue again anyway, or mention @coderhelm on the issue with \
-             what is still to do"
+            "Press Retry to run the issue anyway, or mention @coderhelm on the issue with what is \
+             still to do"
         }
     }
 }
@@ -258,35 +359,82 @@ mod tests {
         assert_eq!(blocking(&prs, &[any.as_str()]), None);
     }
 
+    fn verdict(addresses: bool, missing: &[&str]) -> Verdict {
+        Verdict {
+            addresses,
+            reason: "same fix".into(),
+            missing: missing.iter().map(|m| m.to_string()).collect(),
+        }
+    }
+
+    /// The verdict decides the run: covered, partly covered, unrelated, or
+    /// a person decides when it couldn't be read.
     #[test]
-    fn the_refusal_says_what_merged_where_and_how_to_run_anyway() {
+    fn the_verdict_decides_what_the_run_does() {
+        assert_eq!(
+            check(Some(&verdict(true, &[]))),
+            Check::Covers {
+                reason: "same fix".into()
+            }
+        );
+        assert_eq!(
+            check(Some(&verdict(true, &["the CSV export"]))),
+            Check::Partly {
+                reason: "same fix".into(),
+                missing: vec!["the CSV export".into()]
+            }
+        );
+        // Prep work that names the ticket ("WEB-42: add logging for the
+        // investigation") is not the fix: the run goes on.
+        assert_eq!(
+            check(Some(&verdict(false, &[]))),
+            Check::Unrelated {
+                reason: "same fix".into()
+            }
+        );
+        assert_eq!(check(None), Check::Unsure);
+    }
+
+    #[test]
+    fn the_notes_say_what_merged_where_and_how_to_run_anyway() {
         let pr = merged(12, "2026-11-02T10:00:00Z");
-        let jira = refusal(&TicketSource::Jira, "WEB-42", &pr);
-        assert!(jira.contains("WEB-42"), "{jira}");
-        assert!(
-            jira.contains("[acme/app#12](https://github.com/acme/app/pull/12)"),
-            "{jira}"
+        let jira = covered_note(
+            &TicketSource::Jira,
+            "WEB-42",
+            &pr,
+            "It adds the same index.",
         );
         assert!(
-            jira.contains("merged into `develop` on 2026-11-02"),
+            jira.starts_with("WEB-42's work already merged in [acme/app#12](https://github.com/acme/app/pull/12) into `develop` on 2026-11-02: It adds the same index."),
             "{jira}"
         );
-        assert!(jira.contains("press Retry on the stopped run"), "{jira}");
+        assert!(jira.contains("press Retry on this run"), "{jira}");
         assert!(jira.contains("reply on the ticket"), "{jira}");
         assert!(!jira.contains("reopen"), "{jira}");
-        let gh = refusal(
-            &TicketSource::Github,
-            "GH-7",
-            &MergedPr {
-                base: String::new(),
-                merged_at: String::new(),
-                ..pr
-            },
+        let bare = MergedPr {
+            base: String::new(),
+            merged_at: String::new(),
+            ..pr.clone()
+        };
+        let gh = covered_note(&TicketSource::Github, "GH-7", &bare, "");
+        assert!(
+            gh.contains("acme/app/pull/12). CoderHelm didn't build"),
+            "{gh}"
         );
-        assert!(gh.contains("merged. Another run"), "{gh}");
-        assert!(!gh.contains("shipped"), "{gh}");
-        assert!(!gh.contains("reopen"), "{gh}");
         assert!(gh.contains("mention @coderhelm on the issue"), "{gh}");
+        let unsure = unsure_note(&TicketSource::Jira, "WEB-42", &pr);
+        assert!(
+            unsure.contains("couldn't tell whether it already does"),
+            "{unsure}"
+        );
+        assert!(
+            unsure.contains("merged into `develop` on 2026-11-02"),
+            "{unsure}"
+        );
+        let part = partial_note(&pr, "It adds the index.", &["the CSV export".into()]);
+        assert!(part.contains("acme/app#12 merged into `develop` on 2026-11-02 and already does part of this ticket: It adds the index."), "{part}");
+        assert!(part.contains("adds to acme/app#12"), "{part}");
+        assert!(part.ends_with("- the CSV export\n"), "{part}");
         assert!(wait_action(&TicketSource::Github).contains("mention @coderhelm"));
         assert!(wait_action(&TicketSource::Jira).contains("reply on the ticket"));
     }

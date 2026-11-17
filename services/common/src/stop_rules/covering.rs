@@ -45,6 +45,9 @@ pub enum Outcome {
     /// CoderHelm's own pull request, but the work couldn't be carried over
     /// without losing some of it: the run's work stays on its branch.
     NotCarried,
+    /// A pull request for the ticket already merged and did all of what the
+    /// ticket asks (`crate::merged_ticket`): nothing was built.
+    Merged,
 }
 
 impl Outcome {
@@ -55,6 +58,7 @@ impl Outcome {
             Outcome::Person => "person",
             Outcome::Busy => "busy",
             Outcome::NotCarried => "not_carried",
+            Outcome::Merged => "merged",
         }
     }
 }
@@ -407,6 +411,13 @@ pub fn ticket_note(record: &Record, markdown: bool) -> String {
         "complete" => format!(
             "{link} already has everything this ticket asks for. CoderHelm didn't build a second \
              fix."
+        ),
+        // Written by the run (`crate::merged_ticket::covered_note`): what
+        // merged where and when, why it covers the ticket, and how to run
+        // the ticket anyway.
+        "merged" if !record.note.trim().is_empty() => record.note.clone(),
+        "merged" => format!(
+            "This ticket's work already merged in {link}. CoderHelm didn't build a second fix."
         ),
         "person" => format!(
             "Already being fixed in {link}{}: {}. CoderHelm doesn't change a person's pull \

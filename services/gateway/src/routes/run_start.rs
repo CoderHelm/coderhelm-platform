@@ -204,12 +204,11 @@ async fn github_ticket(
     if let Some(refused) = gate_refusal(&gate) {
         return Err(refused);
     }
-    // Starting the issue from the dashboard after its run stopped because
-    // its pull request had already merged asks for the work anyway, as
-    // Retry on that run does (`common::merged_ticket`).
+    // Starting the issue from the dashboard after its run ended on a merge
+    // (it merged, or the merged-ticket check ended it) asks for the work
+    // anyway, as Retry on that run does (`common::merged_ticket`).
     let after_merge =
-        trigger_gate::github_issue_stopped_as_merged(state, &claims.team_id, &ticket_id, repo)
-            .await;
+        trigger_gate::github_issue_ended_on_merge(state, &claims.team_id, &ticket_id, repo).await;
     Ok((
         TicketMessage {
             team_id: claims.team_id.clone(),

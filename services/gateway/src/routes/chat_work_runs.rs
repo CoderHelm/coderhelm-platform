@@ -253,7 +253,7 @@ pub fn status_words(status: &str) -> &'static str {
         rs::AWAITING_CI => "waiting on the pull request's checks",
         rs::NEEDS_INPUT => "waiting on an answer from the team",
         rs::NEEDS_OUTSIDE_CHANGE => "waiting on a change outside its repository",
-        rs::COVERED_BY_PR => "an open pull request already does the work",
+        rs::COVERED_BY_PR => "a pull request already does the work",
         rs::COMPLETED | rs::SUCCESS => "finished; its pull request is open or done",
         rs::MERGED => "finished; its pull request was merged",
         rs::FAILED => "stopped with an error",

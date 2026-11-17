@@ -1620,14 +1620,14 @@ async fn handle_issue_comment(
         repo["owner"]["login"].as_str().unwrap_or(""),
         repo["name"].as_str().unwrap_or("")
     );
-    let stopped_as_merged = super::trigger_gate::github_issue_stopped_as_merged(
+    let ended_on_merge = super::trigger_gate::github_issue_ended_on_merge(
         state,
         team_id,
         &format!("GH-{}", issue["number"].as_u64().unwrap_or(0)),
         &own_repo,
     )
     .await;
-    let (after_merge, person_direction) = command_after_merge(stopped_as_merged, sender, body);
+    let (after_merge, person_direction) = command_after_merge(ended_on_merge, sender, body);
 
     let message = WorkerMessage::Ticket(TicketMessage {
         team_id: team_id.to_string(),
@@ -1696,16 +1696,17 @@ async fn handle_issue_comment(
 }
 
 /// What an `@coderhelm` / `/coderhelm` command on a GitHub issue carries
-/// when the issue's last run stopped because its pull request had already
-/// merged (`common::merged_ticket`): a person asking for the work anyway
+/// when the issue's last run ended on a merge (it merged, or the
+/// merged-ticket check ended it: `common::merged_ticket`): a person asking
+/// for the work anyway
 /// (`after_merge`), with their words as the run's direction
 /// ("author: words"). Otherwise neither.
 fn command_after_merge(
-    stopped_as_merged: bool,
+    ended_on_merge: bool,
     sender: &str,
     comment: &str,
 ) -> (bool, Option<String>) {
-    if !stopped_as_merged {
+    if !ended_on_merge {
         return (false, None);
     }
     (true, Some(format!("{sender}: {}", comment.trim())))
