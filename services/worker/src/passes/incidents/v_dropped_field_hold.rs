@@ -120,10 +120,7 @@ fn a_line_listing_only_dropped_fields_never_holds_the_pull_request() {
         "remove `isHeadingTwo` from every `activitiesCarousel` document that still has it",
         "give every `heroCenteredText` document a value for the now required `headingLevel`",
     );
-    assert!(matches!(
-        ready::decide(&facts(&real)),
-        Decision::Held { .. }
-    ));
+    assert!(matches!(ready::found(&facts(&real)), Decision::Held { .. }));
 }
 
 #[test]
