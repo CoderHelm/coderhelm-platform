@@ -1,0 +1,5 @@
+# l. `l_plan_time`
+
+**What happened:** A schedule data fix failed in planning after about 14 minutes: "no work is committed to continue from". It planned, switched repository and planned again, was sent back by a release check that read a column it writes (`updated_at`) as removed and by a demand for production and staging proof its claims never needed, then re-planned a third time for one file tag and ran out of time.
+
+**The guarantee:** Planning that runs out of time continues in a fresh step at the plan gate, from the repository it settled on, its last plan, its open gaps and its re-plans, and keeps going while each step makes a new plan revision or leaves fewer open gaps. The checks re-plan once in all: a switch plans once, with the file check in that plan's one send-back, and every check's gaps share that one send-back; what is still open stays on the decision. Writing a column is not removing it, and proof for an environment is asked only when the plan's claims rest on that environment's data.

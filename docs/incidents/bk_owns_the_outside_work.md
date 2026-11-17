@@ -1,0 +1,5 @@
+# bk. `bk_owns_the_outside_work`
+
+**What happened:** A run with its pull request open ended waiting on people and its ticket comment handed over work CoderHelm could do: reading workflow runs, a lint, page checks (all failing on one 400 because a page check written as the confirm "query" was sent to the CMS's GROQ API), the production release (a tag after one approval), a review look, and a step number the ticket never showed; it opened on a raw Jira account id and counted nothing as handed over.
+
+**The guarantee:** Each outside step's action comes from its own words; a failed attempt reaches a person only for a permission or credential in its own cause; a tool failure is diagnosed and reported once and its steps take another way; the release is one approval; a run waits on a person only with a gate-approved item and nothing it can still do; every comment, description, chat message and outside report passes the sink check; replies show names, never account ids; the team's history replays with no doable item reaching a person.

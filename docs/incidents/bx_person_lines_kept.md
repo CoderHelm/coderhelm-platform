@@ -1,0 +1,5 @@
+# bx. `bx_person_lines_kept`
+
+**What happened:** A person pushed a fixed end-to-end spec to a CoderHelm pull request: they took out assertions that failed and fixed a selector, and the suite passed on staging. CoderHelm's next rounds wrote the removed assertions back in from older versions of the spec, in two commits, and most of the tests broke. The branch guards stopped only resets and force pushes, and the snapshot check stopped only writes over commits the pass had never read.
+
+**The guarantee:** Every write CoderHelm commits (`write_file`, `batch_write`, so every edit, restore, revert and fix round, WIP branches included) is held against every commit a person made on the branch since its base. A line a person removed is never put back and a line they added is never taken out; the rest of the write goes through. The pull request gets one note, edited in place, that names what was kept and asks; a write with nothing left is refused with why. A round a person asked for is their answer. The revert after red checks puts back only CoderHelm's own changes.

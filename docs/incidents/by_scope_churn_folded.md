@@ -1,0 +1,5 @@
+# by. `by_scope_churn_folded`
+
+**What happened:** A web pull request ended with "restore ... to base" commits for files it never meant to touch. After red checks, the revert went back to the last green head and put back every file that differed from it, including files a merge of the base had brought in; the scope check then saw them changed and a round restored each to the base, a commit apiece. Other rounds restored a file the plan changes and rebuilt it from scratch, up to fourteen times in one run.
+
+**The guarantee:** The revert puts back only files CoderHelm's own commits changed after the green head. The build of the plan is bounded by the plan's files: any other existing file is refused until the call says why, and the pull request lists it. In planned-work, proof and fix rounds a planned file is never restored, and any other file only to the pull request's base. CoderHelm's own newest commits that change a file and put it back are folded into one commit (or dropped) after every coder round, after a review-fix round and before ready; a person's commits are never rewritten.
