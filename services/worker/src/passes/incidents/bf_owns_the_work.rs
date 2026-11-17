@@ -219,9 +219,18 @@ fn the_review_line_states_coderhelms_conclusion_and_asks_only_to_merge() {
 
 #[test]
 fn a_permission_only_an_owner_grants_still_reaches_a_person_with_one_action() {
-    let f = Finding {
+    // Words alone claim no permission (`person_gate::grant_backed`).
+    let words = Finding {
         point: "external_fact".into(),
         detail: "The release workflow can't be started: CoderHelm's GitHub App is not allowed to start workflows in this repository; an organization owner grants \"Actions: write\".".into(),
+        ..Default::default()
+    };
+    let settled = settle::apply(vec![words], &dep_run(), &Record::default());
+    assert_eq!(settled.counts.human, 0, "{:?}", settled.open);
+    // The refusal GitHub sent, on a named API, does.
+    let f = Finding {
+        point: "external_fact".into(),
+        detail: format!("The release workflow can't be started: {}.", "GitHub answered 403 to `POST /repos/acme/site/actions/workflows/release.yml/dispatches`: the GitHub App needs Actions: write"),
         ..Default::default()
     };
     let settled = settle::apply(vec![f], &dep_run(), &Record::default());

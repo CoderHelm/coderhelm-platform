@@ -201,6 +201,12 @@ pub const OPTIONAL_PERMISSIONS: &[(&str, &str, &str, &str)] = &[
         "Code quality",
         "Without Code quality, reviews don't see GitHub's code quality findings on the changed files.",
     ),
+    (
+        "actions",
+        "write",
+        "Actions",
+        "Without Actions: write, CoderHelm can't start a workflow itself (a deploy, an end-to-end run): it adds the label that starts one where the workflow has one, and otherwise the step waits.",
+    ),
 ];
 
 /// Events a new app subscribes to that CoderHelm works without (security
@@ -456,6 +462,37 @@ pub fn github_permissions(app: &Value) -> Check {
         detail,
         "Without them CoderHelm can't push some changes or misses the events that start work.",
         Fix::text("Open the app's Permissions and events page, set the values listed, save, then accept the new permissions on each installation.")
+            .url(format!("{}/permissions", app_settings_url(app))),
+    )
+}
+
+/// Whether CoderHelm may start a workflow with `workflow_dispatch`
+/// (`Actions: write`). Never required, and never asked for by the installer:
+/// a team may keep CoderHelm from starting workflows. Without it, workflows
+/// start through the pull request labels they run on and end-to-end results
+/// are read from the checks, runs, comments and published report; this is
+/// the one place that names the permission, for the whole install, never an
+/// item on a pull request.
+pub fn github_workflow_starts(app: &Value) -> Check {
+    let got = app["permissions"]["actions"].as_str().unwrap_or("none");
+    if level(got) >= level("write") {
+        return Check::pass(
+            "github_workflow_starts",
+            G,
+            "Starting workflows",
+            "The app may start workflows with workflow_dispatch (Actions: write).",
+        );
+    }
+    Check::not_ok(
+        Status::Skip,
+        "github_workflow_starts",
+        G,
+        "Starting workflows",
+        format!(
+            "The GitHub app needs Actions: write to start workflows with workflow_dispatch; it has Actions: {got}."
+        ),
+        "CoderHelm starts workflows through the pull request labels they run on and reads end-to-end results from the checks, runs, comments and published report; nothing on a pull request asks a person for this.",
+        Fix::text("Only if the team wants CoderHelm to start workflows itself: set Actions to Read and write on the app's Permissions and events page; an organization owner accepts the permission update once.")
             .url(format!("{}/permissions", app_settings_url(app))),
     )
 }
@@ -1786,6 +1823,7 @@ async fn github_checks(state: &AppState, deep: bool) -> Vec<Check> {
     }
     let app = app.map(|(_, b)| b).unwrap_or(Value::Null);
     out.push(github_permissions(&app));
+    out.push(github_workflow_starts(&app));
     let (installs, config, deliveries) = tokio::join!(
         github_get(state, &jwt, "/app/installations?per_page=100"),
         github_get(state, &jwt, "/app/hook/config"),
@@ -2884,9 +2922,9 @@ mod tests {
     fn each_missing_optional_permission_warns_with_the_feature_it_limits() {
         for (key, need, name, why) in OPTIONAL_PERMISSIONS {
             let mut a = full();
-            if *key == "checks" {
+            if *key == "checks" || *key == "actions" {
                 // Read is required; only write is optional.
-                a["permissions"]["checks"] = json!("read");
+                a["permissions"][*key] = json!("read");
             } else {
                 a["permissions"].as_object_mut().unwrap().remove(*key);
             }
@@ -2907,6 +2945,26 @@ mod tests {
                 "installer/lib/github-app.mjs doesn't ask for {key}: {need}"
             );
         }
+    }
+
+    /// Starting workflows is one install-level line, never a warning or a
+    /// failure: without Actions: write CoderHelm uses labels and reads.
+    #[test]
+    fn starting_workflows_is_named_once_for_the_install() {
+        let mut a = full();
+        a["permissions"]["actions"] = json!("read");
+        let c = github_workflow_starts(&a);
+        assert_eq!(c.status, Status::Skip);
+        assert!(c.detail.contains("Actions: write"), "{}", c.detail);
+        assert!(c.why.contains("nothing on a pull request"), "{}", c.why);
+        // The permissions check names the optional Actions: write too, as a
+        // warning for the install (never a failure, never a pull request
+        // item).
+        let p = github_permissions(&a);
+        assert_eq!(p.status, Status::Warn);
+        assert!(p.detail.contains("Actions: write"), "{}", p.detail);
+        a["permissions"]["actions"] = json!("write");
+        assert_eq!(github_workflow_starts(&a).status, Status::Pass);
     }
 
     #[test]

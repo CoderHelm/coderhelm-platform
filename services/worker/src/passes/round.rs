@@ -46,6 +46,17 @@ pub(crate) async fn branch_head(
         .unwrap_or_default()
 }
 
+/// Folds away CoderHelm's own commits on `branch` that changed a file and
+/// put it back (`GitHubClient::fold_own_churn`), best effort: a failure
+/// leaves the history as it is.
+pub(crate) async fn fold_churn(github: &GitHubClient, owner: &str, repo: &str, branch: &str) {
+    match github.fold_own_churn(owner, repo, branch).await {
+        Ok(Some(note)) => info!(branch, note = %note, "folded churn commits"),
+        Ok(None) => {}
+        Err(e) => warn!(branch, error = %e, "could not fold churn commits; history left as it is"),
+    }
+}
+
 /// Writes the round on the run record. A new round also clears an earlier
 /// round's "didn't finish": it is being worked again.
 pub(crate) async fn record(state: &WorkerState, team_id: &str, run_id: &str, round: &Round) {

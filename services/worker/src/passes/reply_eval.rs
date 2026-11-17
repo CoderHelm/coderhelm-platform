@@ -174,6 +174,7 @@ fn said(id: &str, slot: &str, body: &str, asks: &[&str], at_ms: i64) -> Said {
             ..Default::default()
         },
         body: body.into(),
+        node_id: String::new(),
     }
 }
 

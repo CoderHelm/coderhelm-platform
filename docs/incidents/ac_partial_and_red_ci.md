@@ -1,0 +1,5 @@
+# ac. `ac_partial_and_red_ci`
+
+**What happened:** A Jira run stopped after two steps that changed nothing (the coder twice said the last planned file needed no change, in words the plan check did not know) and a separate salvage path opened "⚠️ Partial", "Closes #0", "ran out of time" and marked it completed; another run's CI fix changed nothing and the run was completed with its pull request marked ready while every check was red.
+
+**The guarantee:** One path opens a stopped run's pull request (`stop_pr`: ticket line, Not finished with done and left tasks and the recorded reason); no body names issue `#0` (client guard); a planned file the coder says needs no change settles and stays settled across steps; a step after a stalled one takes one task with a different approach; a CI fix that changes nothing tries again with fresh evidence (reporter comments, annotations, rerun on infrastructure failures), then holds the draft with what fails and the run needs a person; `ready::decide` never marks a pull request ready with a failing or running check; a source scan allows `create_pull_request` and `mark_pr_ready` only in their one place each.

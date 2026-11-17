@@ -239,6 +239,11 @@ export const BOUNDARY_SERVICES = [
   "ecs:List*",
   "ecr:BatchGetImage",
   "ecr:List*",
+  // The requests an AWS WAF alarm's rule matched and where its web ACL logs
+  // (ListWebACLs, GetSampledRequests, GetLoggingConfiguration), read-only. It
+  // reaches an install only through the access stack an AWS admin applies.
+  "wafv2:Get*",
+  "wafv2:List*",
   "apigateway:*",
   // Infrastructure vulnerabilities, Amazon Inspector findings and AWS Health
   // events in the install's own account: the reads only a switch of the AWS

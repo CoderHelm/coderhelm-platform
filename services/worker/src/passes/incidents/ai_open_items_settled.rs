@@ -412,10 +412,14 @@ fn what_stays_on_the_pull_request_names_why() {
     assert_eq!(settled.open.len(), 3);
     let section = proof::gaps_section(&settled.open);
     // Each names why CoderHelm can't, through the person gate
-    // (`bf_owns_the_work`): access only a person grants, a yes/no on
+    // (`bf_owns_the_work`): a connection only a person sets up (a
+    // permission is claimed only on a recorded refusal), a yes/no on
     // CoderHelm's recommendation for a key rotation, a credential.
+    assert!(
+        !section.contains("a permission only a person can grant"),
+        "{section}"
+    );
     for why in [
-        "CoderHelm can't: it needs a permission only a person can grant",
         "CoderHelm recommends going ahead as built and has done the work that way",
         "CoderHelm can't: a credential only a person can provide",
     ] {

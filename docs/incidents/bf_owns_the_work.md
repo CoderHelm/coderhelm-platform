@@ -1,0 +1,5 @@
+# bf. `bf_owns_the_work`
+
+**What happened:** A security update's pull request asked its reader to run a registry lookup CoderHelm could run, listed one decision the ticket settled nine times in nine wordings as "a product decision only a person can settle", told the reader to delete CoderHelm's own lines, cut sentences with an ellipsis, and asked the reviewer to judge CoderHelm's evidence. A second pull request gave a person a staging deploy, a look at a field and a step CoderHelm owned; a third asked the same page-copy question twice.
+
+**The guarantee:** Every item headed to a person goes through one gate (`common::person_gate`): CoderHelm does what its access reaches (the registry lookup runs in the settle stage), what the ticket, repository or team settles is a note with its source, a choice nothing settles is decided and noted, a sign-off folds into the review line, and only a listed reason reaches "Needed from you", with one action and, for a hard-to-reverse choice, a yes/no on CoderHelm's recommendation. One entry per decision; never "delete this line", never an ellipsis; the review line states CoderHelm's conclusion.

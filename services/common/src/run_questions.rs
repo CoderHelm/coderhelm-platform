@@ -394,38 +394,31 @@ pub fn reply(author: &str, answers: &[Answer], asked_at: Option<&str>, markdown:
     } else {
         author.trim()
     };
+    // Short, like every comment: one line saying who answered and where,
+    // then one line per answer.
+    let link = asked_at.filter(|u| !u.is_empty()).map(|url| {
+        if markdown {
+            format!(" (in reply to [CoderHelm's questions]({url}))")
+        } else {
+            format!(" (in reply to CoderHelm's questions: {url})")
+        }
+    });
     let mut out = if markdown {
-        format!("**{who} answered in CoderHelm:**\n\n")
+        format!("**{who} answered in CoderHelm**")
     } else {
-        format!("{who} answered in CoderHelm:\n\n")
+        format!("{who} answered in CoderHelm")
     };
+    out.push_str(&link.unwrap_or_default());
+    out.push_str(". CoderHelm is continuing the work with these answers.");
     for a in answers {
+        let q = one_line(&a.question);
+        let ans = one_line(&a.answer);
         if markdown {
-            let quoted = a
-                .question
-                .lines()
-                .map(|l| format!("> {l}"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            out.push_str(&format!("{quoted}\n\n{}\n\n", a.answer));
+            out.push_str(&format!("\n- {q} {ans}"));
         } else {
-            out.push_str(&format!(
-                "Q: {}\n\nA: {}\n\n",
-                one_line(&a.question),
-                a.answer
-            ));
+            out.push_str(&format!("\nQ: {q} A: {ans}"));
         }
     }
-    if let Some(url) = asked_at.filter(|u| !u.is_empty()) {
-        if markdown {
-            out.push_str(&format!(
-                "_In reply to [CoderHelm's questions]({url})._\n\n"
-            ));
-        } else {
-            out.push_str(&format!("In reply to CoderHelm's questions: {url}\n\n"));
-        }
-    }
-    out.push_str("CoderHelm is continuing the work with these answers.");
     out
 }
 
@@ -905,12 +898,16 @@ mod tests {
     fn the_reply_names_who_answered() {
         let a = [answer("Which page?", "The pricing page.")];
         let md = reply("Pat Doe", &a, Some("https://example.com/c/1"), true);
-        assert!(md.starts_with("**Pat Doe answered in CoderHelm:**"));
-        assert!(md.contains("> Which page?\n\nThe pricing page."));
+        assert!(md.starts_with("**Pat Doe answered in CoderHelm**"));
+        assert!(md.contains("\n- Which page? The pricing page."), "{md}");
         assert!(md.contains("(https://example.com/c/1)"));
         let plain = reply("", &a, None, false);
-        assert!(plain.starts_with("Someone on the team answered in CoderHelm:"));
-        assert!(plain.contains("Q: Which page?\n\nA: The pricing page."));
+        assert!(plain.starts_with("Someone on the team answered in CoderHelm"));
+        assert!(
+            plain.contains("\nQ: Which page? A: The pricing page."),
+            "{plain}"
+        );
+        assert!(crate::comment_style::lint(&md).is_empty(), "{md}");
         assert!(!plain.contains("**"));
     }
 

@@ -460,6 +460,56 @@ fn names_deploy(t: &str) -> bool {
     any(t, &["deploy", "release to", "publish to production"])
 }
 
+/// Whether the item asks a person to test: run a flow or a suite, read an
+/// end-to-end result, check a preview in a browser. Testing is CoderHelm's
+/// own work, whatever stopped it (a missing permission is an install item,
+/// said once in setup checks, never a tester's chore on a pull request).
+fn asks_testing(a: &Ask) -> bool {
+    let t = one_line(&a.text).to_lowercase();
+    let t = t
+        .trim_start_matches("after merging: ")
+        .trim_start_matches("before merging: ")
+        .trim_start_matches(['-', '*', ' ']);
+    let verb = t.split_whitespace().next().unwrap_or("");
+    let testing_verb = matches!(
+        verb,
+        "run"
+            | "rerun"
+            | "re-run"
+            | "read"
+            | "check"
+            | "confirm"
+            | "verify"
+            | "test"
+            | "try"
+            | "open"
+            | "watch"
+    );
+    testing_verb
+        && any(
+            t,
+            &[
+                "e2e",
+                "end-to-end",
+                "end to end",
+                "chromium",
+                "webkit",
+                "firefox",
+                "safari",
+                "playwright",
+                "cypress",
+                "browser",
+                "smoke test",
+                "test result",
+                "the tests",
+                "the test suite",
+                "the spec",
+                "the flow",
+                "preview",
+            ],
+        )
+}
+
 /// Whether the item's action is adding labels to a pull request.
 fn adds_labels(a: &Ask) -> bool {
     let t = one_line(&a.text).to_lowercase();
@@ -640,8 +690,34 @@ fn cited_source(t: &str, ctx: &Context) -> Option<Source> {
     None
 }
 
-/// The listed reason the words name, read against the handback list.
+/// Whether words may claim "a permission only a person grants": only with
+/// a concrete refusal GitHub sent on a named API, recorded as
+/// `github_grants::Denial::line` (status, API and the permission it needs),
+/// and never for an install-level permission, which is one item on the
+/// install's setup checks rather than a hand-off on a pull request. Words
+/// like "not allowed to" or "permission" claim nothing by themselves.
+pub fn grant_backed(t: &str) -> bool {
+    let l = t.to_lowercase();
+    !l.contains(&crate::github_grants::INSTALL_LEVEL.to_lowercase())
+        && crate::github_grants::Denial::parse(&l).is_some()
+}
+
+/// The listed reason the words name: [`reason_named`], with a permission
+/// claimed only when [`grant_backed`].
 fn reason_in(t: &str) -> Option<Reason> {
+    // A recorded refusal on a named API is the permission, whatever words
+    // carry it.
+    if grant_backed(t) {
+        return Some(Reason::Grant);
+    }
+    match reason_named(t) {
+        Some(Reason::Grant) => grant_backed(t).then_some(Reason::Grant),
+        r => r,
+    }
+}
+
+/// The listed reason the words name, read against the handback list.
+fn reason_named(t: &str) -> Option<Reason> {
     // A line the gate already let through says its reason in these words.
     if let Some(r) = REASONS
         .iter()
@@ -682,14 +758,24 @@ fn reason_in(t: &str) -> Option<Reason> {
             "turn the repository on",
             "not turned on",
             "app isn't installed",
+        ],
+    ) {
+        return Some(Reason::Grant);
+    }
+    // A connection or token no one has set up (a system CoderHelm has no
+    // connection to): a credential a person provides, not a permission.
+    if any(
+        t,
+        &[
             "no connection can",
+            "no connection reaches",
             "connection exists",
             "write connection",
             "write token",
             "no access to",
         ],
     ) {
-        return Some(Reason::Grant);
+        return Some(Reason::Credential);
     }
     // Content on production is changed by the people who own it, under
     // the team's rules: CoderHelm prepares it and never writes it there.
@@ -852,6 +938,10 @@ pub fn decide(a: &Ask, ctx: &Context) -> Outcome {
     // Labels on a pull request go through the issues API: no workflow
     // permission is involved, whatever a run said about one.
     if adds_labels(a) {
+        return Outcome::Do(Work::Own(one_line(&a.text)));
+    }
+    // Testing is never a person's item.
+    if asks_testing(a) {
         return Outcome::Do(Work::Own(one_line(&a.text)));
     }
     if a.kind == Kind::Attempt {
@@ -1051,6 +1141,8 @@ fn strip_question_marks(s: &str) -> String {
 pub fn for_reason(why: HumanOnly, a: &Ask) -> Option<HumanItem> {
     let reason = match why {
         HumanOnly::Credential => Reason::Credential,
+        // A permission is claimed only on a recorded refusal.
+        HumanOnly::MissingAccess if !grant_backed(&a.all()) => return None,
         HumanOnly::MissingAccess => Reason::Grant,
         HumanOnly::HeldByAnother => Reason::HeldByAnother,
         HumanOnly::Approval => Reason::Approval,
@@ -1459,6 +1551,22 @@ pub fn prompt_section() -> String {
 mod tests {
     use super::*;
 
+    /// Reading an end-to-end result or running a flow in browsers is
+    /// CoderHelm's work, even when a missing permission stopped it.
+    #[test]
+    fn testing_is_never_a_persons_item() {
+        let text = "**Needed from you:**\n\
+1. Read the Deploy Preview e2e result. CoderHelm could not: CoderHelm's GitHub App is not allowed to start workflows in this repository\n\
+2. Run the sign-up flow inside the frame in a fresh browser context in Chromium and WebKit. CoderHelm could not: CoderHelm's GitHub App is not allowed to start workflows in this repository\n";
+        let sunk = sink(text);
+        assert_eq!(sunk.sent_back.len(), 2, "{sunk:?}");
+        assert!(sunk.human.is_empty(), "{sunk:?}");
+        assert!(!sunk.text.contains("e2e"), "{}", sunk.text);
+        // A real person item stays.
+        let keep = "**Needed from you:**\n1. One paid registration on real devices. CoderHelm cannot: No real devices or payment method. (QA)\n";
+        assert_eq!(sink(keep).human.len(), 1, "{:?}", sink(keep));
+    }
+
     fn assumption(topic: &str, text: &str) -> Ask {
         Ask {
             kind: Kind::Assumption,
@@ -1573,23 +1681,71 @@ mod tests {
 
     #[test]
     fn a_permission_only_an_owner_grants_reaches_a_person_with_one_action() {
-        let a = Ask {
+        // Words alone ("not allowed to", "permission") claim nothing: the
+        // step stays CoderHelm's.
+        let words = Ask {
             kind: Kind::Step,
-            text: "Start the release workflow".into(),
+            text: "Read the end-to-end result on the preview".into(),
             how: "Grant the app \"Actions: write\" on the repository".into(),
             why_not: "CoderHelm's GitHub App is not allowed to start workflows in this repository"
                 .into(),
             owner: "an organization owner".into(),
             ..Default::default()
         };
-        match decide(&a, &Context::default()) {
+        assert!(
+            !matches!(decide(&words, &Context::default()), Outcome::Human(_)),
+            "a permission was claimed with no refusal recorded"
+        );
+        let mut tried = words.clone();
+        tried.kind = Kind::Attempt;
+        assert!(!matches!(
+            decide(&tried, &Context::default()),
+            Outcome::Human(_)
+        ));
+        // A refusal GitHub sent on a named API, with the permission it
+        // needs: a person grants it.
+        let d = crate::github_grants::Denial::from_error(
+            "PUT",
+            "HTTP status client error (403 Forbidden) for url (https://api.github.com/repos/acme/site/contents/a.txt): {\"message\":\"Resource not accessible by integration\"}",
+            "contents",
+            "write",
+        )
+        .unwrap();
+        let denied = Ask {
+            kind: Kind::Step,
+            text: "Write the file on the repository".into(),
+            why_not: d.line(),
+            owner: "an organization owner".into(),
+            ..Default::default()
+        };
+        match decide(&denied, &Context::default()) {
             Outcome::Human(h) => {
                 assert_eq!(h.reason(), Reason::Grant);
                 assert_eq!(h.who(), "an organization owner");
+                assert!(
+                    h.line().contains("PUT /repos/acme/site/contents/a.txt"),
+                    "{}",
+                    h.line()
+                );
+                assert!(h.line().contains("Contents: write"), "{}", h.line());
                 assert!(keeps_the_rules(&h.line()).is_ok());
             }
             o => panic!("{o:?}"),
         }
+        // A permission the whole install lacks is one install-level item,
+        // never a hand-off on a pull request, refused or not.
+        let install = Ask {
+            why_not: format!(
+                "{}; {}",
+                d.line(),
+                crate::github_grants::install_item("actions", "write", "start workflows")
+            ),
+            ..denied
+        };
+        assert!(!matches!(
+            decide(&install, &Context::default()),
+            Outcome::Human(_)
+        ));
     }
 
     #[test]

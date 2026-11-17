@@ -9,80 +9,38 @@
 //! never appears. Where a decision lives inside the pipeline itself, the
 //! case also checks that the pipeline still calls it at that place.
 //!
-//! CI runs the suite as its own job (`cargo test -p worker incidents::`),
-//! and `docs/incidents.md` lists each case with the guarantee it protects.
-//! A fix for a new failure adds a case here and a line there.
+//! CI runs the suite as its own step (`docs/incidents.md` has the command).
+//! Each case is one file here and one page in `docs/incidents/` (what
+//! happened, and the guarantee it protects), named alike. A fix for a new
+//! failure adds those two files and edits nothing shared: `worker/build.rs`
+//! finds every case file and writes its `mod` line, so two pull requests
+//! that each add a case never collide.
 
 mod fixture;
 
-mod a_whole_branch;
-mod aa_promised_round;
-mod ab_label_prefix;
-mod ac_partial_and_red_ci;
-mod ad_hand_back_reply;
-mod ae_budget_rounds;
-mod af_lockfiles_out_of_sync;
-mod ag_red_ci_ships_what_passes;
-mod ah_dep_run_choice_and_proof;
-mod ai_open_items_settled;
-mod aj_coder_habits;
-mod al_learning_loop;
-mod am_description_from_the_head;
-mod an_six_database_findings;
-mod ao_stopped_log_finding;
-mod ap_closed_pr_keeps_findings;
-mod aq_comment_during_run;
-mod ar_description_stamped_to_the_head;
-mod as_infra_closed_pr_keeps_record;
-mod at_round_scope;
-mod au_upgrade_decided_and_proven;
-mod av_description_from_facts;
-mod aw_quarantine_dead_end;
-mod ax_github_budget;
-mod b_open_pr_retry;
-mod ba_verdict_on_old_commit;
-mod bb_flaky_not_broken;
-mod bc_stays_through_merge_and_deploy;
-mod bd_skill_runs_on_coderhelm;
-mod be_one_voice_on_retry;
-mod bf_owns_the_work;
-mod bg_coder_reaches_for_a_shell;
-mod bh_round_checks_and_scope;
-mod bi_own_review_finishes;
-mod bj_release_through_a_busy_hour;
-mod bk_owns_the_outside_work;
-mod bl_description_final_review;
-mod bm_teams_never_cross;
-mod bn_infra_list_follows_aws;
-mod bp_repo_traced_not_asked;
-mod bq_upstream_read_not_guessed;
-mod br_description_writer_upgrade;
-mod bs_cut_plan_revision;
-mod bt_proof_answer_closes;
-mod bu_web_change_unchecked;
-mod bz_ticket_answer_decides;
-mod c_codegen_egress;
-mod ca_related_ticket_covered;
-mod d_echoed_markers;
-mod e_large_generated_output;
-mod f_steps;
-mod g_large_plan;
-mod h_pr_updates;
-mod i_finished_work_pr;
-mod j_post_merge_watch;
-mod k_own_review_findings;
-mod l_plan_time;
-mod m_data_pipeline_rules;
-mod n_suite_setup_broke;
-mod o_mention_resumes_held_work;
-mod p_finished_work_loop;
-mod q_run_ceiling;
-mod r_github_limit;
-mod s_silent_draft;
-mod t_unrun_check_hold;
-mod u_stacked_plan_check;
-mod v_dropped_field_hold;
-mod w_stale_hold_recheck;
-mod x_silent_review_hold;
-mod y_skipped_checks_wait;
-mod z_run_facts;
+// One `mod` line per case file (`worker/build.rs`), and `CASES`.
+include!(concat!(env!("OUT_DIR"), "/incidents.rs"));
+
+#[test]
+fn every_case_has_its_page_and_every_page_its_case() {
+    let docs = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/incidents");
+    let mut pages: Vec<String> = std::fs::read_dir(&docs)
+        .expect("docs/incidents")
+        .flatten()
+        .filter_map(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .strip_suffix(".md")
+                .map(str::to_string)
+        })
+        .collect();
+    pages.sort();
+    let cases: Vec<String> = CASES.iter().map(|c| c.to_string()).collect();
+    let no_page: Vec<&String> = cases.iter().filter(|c| !pages.contains(c)).collect();
+    let no_case: Vec<&String> = pages.iter().filter(|p| !cases.contains(p)).collect();
+    assert!(
+        no_page.is_empty() && no_case.is_empty(),
+        "each incident case needs docs/incidents/<case>.md, and each page its case: no page for {no_page:?}; no case for {no_case:?}"
+    );
+    assert!(cases.len() >= 70, "only {} cases found", cases.len());
+}

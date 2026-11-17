@@ -30,6 +30,11 @@
 //! holds two teams, and pass only when the answer looked where the answer
 //! lives, cites those records, states their facts and dates, and says
 //! nothing of the other team. `live_work_eval` runs them against the model.
+//!
+//! "What needs me", in other words than the starter's, is a work case too:
+//! it passes only when the answer came from `work_needs_me` (the real
+//! gathering over `chat_work_needs`' two-team fixture), leads with the count,
+//! keeps a run's options, and cites a run, a ticket and a pull request.
 
 use super::brain::system_prompt;
 use super::chat_agent::testing::{CodeBox, Recorder};
@@ -591,6 +596,41 @@ impl<'a> WorkBox<'a> {
     }
 }
 
+impl WorkBox<'_> {
+    /// "What needs me" over `chat_work_needs`' fixture (runs, approvals,
+    /// Jira and GitHub for two teams), as this box's team.
+    async fn needs_me(&self, reg: &mut Registry) -> Called {
+        use super::chat_work_needs::{self as needs, tests as fx};
+        let store = fx::store();
+        let http = fx::http();
+        let app = fx::app();
+        let repos = vec!["acme/web".to_string(), "acme/api".to_string()];
+        let src = needs::Sources {
+            team: if self.team == TEAM {
+                fx::TEAM
+            } else {
+                fx::OTHER
+            },
+            store: &store,
+            http: &http,
+            jira: Some(&app),
+            github: Some(fx::gh()),
+            repos: &repos,
+            readable: &self.readable,
+            budget: needs::SOURCE_BUDGET,
+        };
+        let report = needs::gather(&src, fx::me(), fx::now()).await;
+        let (text, summary) = needs::render(&report, reg, "2026-11-16 12:00 UTC");
+        Called::Done {
+            text,
+            label: work::label(work::NEEDS_ME, &json!({})),
+            summary,
+            is_error: false,
+            kind: "work".into(),
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl Toolbox for WorkBox<'_> {
     fn defs(&self) -> &[Value] {
@@ -603,6 +643,9 @@ impl Toolbox for WorkBox<'_> {
         name: &str,
         input: &Value,
     ) -> Called {
+        if name == work::NEEDS_ME {
+            return self.needs_me(reg).await;
+        }
         let (text, summary, is_error) = match self.find(name, input) {
             Ok((found, noun)) => work::register(reg, found, noun, ""),
             Err(e) => (e, "Not allowed".into(), true),
@@ -680,6 +723,19 @@ pub const WORK_CASES: &[WorkCase] = &[
         never: &["Old container image", "Secret bucket"],
     },
     WorkCase {
+        name: "what needs me, in other words",
+        question: "Anything waiting on me today?",
+        uses_all: &[work::NEEDS_ME],
+        cites: &["run", "ticket", "pull_request"],
+        facts: &[
+            &["things need you"],
+            &["3 tries"],
+            &["ABC-10"],
+            &["acme/web#41", "#41"],
+        ],
+        never: &["OTH-9", "drop_table", "other/secret"],
+    },
+    WorkCase {
         name: "a ticket the asker can't see",
         question: "What's the latest on OTH-9?",
         uses_all: &[work::TICKETS],
@@ -743,14 +799,7 @@ pub async fn ask_work(
     work::put_first(&mut tb.defs, &hints);
     let offered: Vec<&str> = tb.defs.iter().filter_map(|t| t["name"].as_str()).collect();
     let notes = work::hint_note(&hints, &offered);
-    let must_look = hints.about_work().then(|| chat_agent::MustLook {
-        tools: work::STATUS_TOOLS
-            .iter()
-            .filter(|t| offered.contains(t))
-            .map(|t| t.to_string())
-            .collect(),
-        what: "the team's tickets, pull requests and Coderhelm's runs".into(),
-    });
+    let must_look = work::must_look(&hints, &offered);
     let sink = Recorder::default();
     let mut reg = Registry::default();
     let (_, repos) = fixture();
@@ -999,6 +1048,7 @@ mod tests {
                     ))
                 }),
             ],
+            "what needs me, in other words" => needs_script(),
             _ => vec![
                 Box::new(|_| calls("a", work::TICKETS, json!({"key": "OTH-9"}))),
                 Box::new(|_| calls("b", work::RUNS, json!({"ticket": "OTH-9"}))),
@@ -1007,6 +1057,65 @@ mod tests {
                 }),
             ],
         }
+    }
+
+    /// A good "what needs me" answer: one call, then the shape it gives.
+    fn needs_script() -> Vec<Step> {
+        vec![
+            Box::new(|_| calls("n", work::NEEDS_ME, json!({}))),
+            Box::new(|b| {
+                let r = last_result(b);
+                let count = r
+                    .lines()
+                    .find_map(|l| l.strip_prefix("Count line: "))
+                    .unwrap_or("")
+                    .to_string();
+                let (run, ticket, pr) = (
+                    ids_of(b, "run")[0].clone(),
+                    ids_of(b, "ticket")[0].clone(),
+                    ids_of(b, "pull_request")[0].clone(),
+                );
+                say(&format!(
+                    "{count}\n\n**Needs you now**\n- [ABC-1 Retry the export job](/runs/detail?id=01A): answer the run's question, since Nov 14 [{run}]\n  - Which retry limit should the job use? Possible answers: 3 tries; 5 tries\n                     - [ABC-10 Payments fail on retry](https://team.atlassian.net/browse/ABC-10): move it forward, Highest priority [{ticket}]\n                     - [acme/web#41 Add slips](https://github.com/acme/web/pull/41): review it, your review was asked for [{pr}]"
+                ))
+            }),
+        ]
+    }
+
+    /// "What needs me" is never answered from the runs alone: an answer
+    /// that didn't gather everything is sent back once, whatever it says.
+    #[tokio::test]
+    async fn offline_what_needs_me_is_never_answered_from_the_runs_alone() {
+        let store = work_store();
+        let case = WORK_CASES
+            .iter()
+            .find(|c| c.name == "what needs me, in other words")
+            .unwrap();
+        let mut steps: Vec<Step> = vec![
+            Box::new(|_| calls("r", work::RUNS, json!({"status": "waiting"}))),
+            Box::new(|_| say("One run is waiting on your answer.")),
+        ];
+        steps.extend(needs_script());
+        let model = Scripted::new(steps, vec![r#"{"hands_back": false}"#]);
+        let (out, _) = ask_work(&model, &store, all_kinds(), case).await;
+        assert!(out.rechecked);
+        assert!(
+            grade_work(case, &out).is_empty(),
+            "{:?}\n{}",
+            grade_work(case, &out),
+            out.fin.text
+        );
+        let bodies = model.bodies.lock().unwrap();
+        // The first turn offered the tool first and said to call it.
+        assert_eq!(bodies[0]["tools"][0]["name"], work::NEEDS_ME);
+        assert!(bodies[0]["messages"]
+            .to_string()
+            .contains("Call work_needs_me first"));
+        let nudged = bodies[2]["messages"].to_string();
+        assert!(
+            nudged.contains("you didn't look there") && nudged.contains(work::NEEDS_ME),
+            "{nudged}"
+        );
     }
 
     #[tokio::test]

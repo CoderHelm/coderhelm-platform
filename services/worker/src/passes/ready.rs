@@ -186,10 +186,11 @@ pub struct Facts {
     pub preview: Option<common::preview::State>,
 }
 
-/// The hold for a change a person sees that has no end-to-end spec in a
-/// repository with a suite.
-pub const E2E_MISSING: &str =
-    "The change alters what a person sees and adds no end-to-end spec to the repository's suite";
+/// What a change a person sees waits on while it has no end-to-end spec in
+/// a repository with a suite: CoderHelm writes it in its next round, so it
+/// is CoderHelm's own wait (bounded like every wait), never a person's hold.
+pub const E2E_WAIT: &str =
+    "the change alters what a person sees, so CoderHelm writes its end-to-end spec and runs it on the preview";
 
 /// What a draft waits for while its preview checks run.
 pub const PREVIEW_WAIT: &str =
@@ -252,6 +253,26 @@ pub enum Decision {
     /// With no `reasons` it waits for them (`why`); with reasons they
     /// failed or can't run, and a person deals with each.
     Proving { why: String, reasons: Vec<Reason> },
+    /// A wait stalled on this head: CoderHelm takes its own next action
+    /// (its checks run again on the head in a fresh step) and waits again,
+    /// `attempt` of [`MAX_STALL_RETRIES`].
+    Retry { why: String, attempt: u32 },
+}
+
+/// Times CoderHelm acts on a wait that stalled on the same head before
+/// what it waits for is listed as its note and the pull request goes ready.
+pub const MAX_STALL_RETRIES: u32 = 2;
+
+/// How a CoderHelm-side reason is listed on a pull request that goes ready.
+pub const NOTE_PREFIX: &str = "CoderHelm's note: ";
+
+/// What a stalled wait becomes ([`stalled`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Stall {
+    /// CoderHelm acts again ([`Decision::Retry`]).
+    Retry { why: String, attempt: u32 },
+    /// Its attempts are spent: listed as its note on a ready pull request.
+    Note(String),
 }
 
 fn check_names(v: &[String]) -> String {
@@ -261,23 +282,45 @@ fn check_names(v: &[String]) -> String {
         .join(", ")
 }
 
-/// The hold a wait becomes once it stalled on this head
-/// (`DraftHold::stalled`), or `None` while it may still settle.
-fn stalled(f: &Facts, why: &str) -> Option<Reason> {
+/// What a wait becomes once it stalled on this head
+/// (`DraftHold::stalled`), or `None` while it may still settle. Never a
+/// person's to-do: CoderHelm acts again, and once its attempts are spent
+/// what it waited for is its note on a ready pull request. A stalled wait
+/// once became "Look at why it didn't happen ... or mark it ready
+/// yourself" after two hours.
+fn stalled(f: &Facts, why: &str) -> Option<Stall> {
     let (prior, now) = (f.prior.as_ref()?, f.now?);
     if !prior.stalled(why, &f.head, now) {
         return None;
     }
-    Some(Reason::new(
-        format!(
-            "{}, and that hasn't changed in {} hours on this head",
-            why.trim().trim_end_matches('.'),
-            common::draft_hold::WAIT_LIMIT_SECS / 3600
-        ),
-        "Look at why it didn't happen (the checks on the pull request say), then push a fix, \
-         start what didn't run, or mark it ready yourself; CoderHelm decides again on the next \
-         push.",
-    ))
+    let tried = if prior.head == f.head {
+        prior.retried
+    } else {
+        0
+    };
+    if tried < MAX_STALL_RETRIES {
+        return Some(Stall::Retry {
+            why: why.trim().trim_end_matches('.').to_string(),
+            attempt: tried + 1,
+        });
+    }
+    Some(Stall::Note(format!(
+        "{}; it hadn't changed in {} hours on this head after CoderHelm ran its checks again {} \
+         times",
+        why.trim().trim_end_matches('.'),
+        common::draft_hold::WAIT_LIMIT_SECS / 3600,
+        tried
+    )))
+}
+
+/// The open item a CoderHelm-side reason becomes on a ready pull request.
+pub fn note_line(what: &str) -> String {
+    format!("{NOTE_PREFIX}{}", what.trim().trim_end_matches('.'))
+}
+
+/// Whether a reason needs a person: only one on the human-only list.
+pub fn needs_person(r: &Reason) -> bool {
+    r.human_only().is_some()
 }
 
 /// The reasons the description itself holds the draft for, each with what a
@@ -328,14 +371,19 @@ pub fn body_holds_on(body: &str, ci_green: bool) -> Vec<Reason> {
     // An infrastructure fix the replacement guard gave up on: it would
     // replace or destroy a resource that holds data.
     if let Some(why) = common::infra_vuln::guard::hold(body) {
-        out.push(Reason::new(
+        // Replacing or destroying a resource that holds data is hard to
+        // reverse: a person's decision.
+        out.push(Reason::person(
+            common::handback::HumanOnly::ProductDecision,
             why,
             "Correct the lines named at the top of the description on this branch, then remove that section and mark the pull request ready; or apply the update with the runbook on the finding.",
         ));
     }
     // A stacked change asks a person to look first.
     if let Some(why) = super::stack::hold(body) {
-        out.push(Reason::new(
+        // The change it builds on is someone else's to settle first.
+        out.push(Reason::person(
+            common::handback::HumanOnly::HeldByAnother,
             why,
             "Look at the change it builds on, then remove the hold line from its \"Builds on\" \
              section.",
@@ -350,8 +398,62 @@ fn own_review_reason(body: &str) -> Option<Reason> {
     super::own_review::hold(body).map(|why| Reason::new(why, super::own_review::person_todo()))
 }
 
-/// The one decision. Pure, so every case is tested.
+/// The one decision. Pure, so every case is tested. Only a reason on the
+/// human-only list keeps the draft for a person (`common::handback`):
+/// every other reason, once CoderHelm's own attempts are spent, is listed
+/// as its note and the pull request goes ready.
 pub fn decide(f: &Facts) -> Decision {
+    finish(f, decide_raw(f))
+}
+
+/// What the decision's reasons come to: the human-only ones hold; the rest
+/// are CoderHelm's notes on a ready pull request.
+fn finish(f: &Facts, raw: Decision) -> Decision {
+    let split = |reasons: Vec<Reason>| -> (Vec<Reason>, Vec<String>) {
+        let (person, own): (Vec<Reason>, Vec<Reason>) = reasons.into_iter().partition(needs_person);
+        (person, own.iter().map(|r| note_line(&r.what)).collect())
+    };
+    let base_open = || match (&f.feature, f.ci.green && f.approved) {
+        (Some(h), true) => h.items(),
+        _ => Vec::new(),
+    };
+    match raw {
+        Decision::Held { reasons } => {
+            let (person, notes) = split(reasons);
+            if person.is_empty() {
+                let mut open = base_open();
+                open.extend(notes);
+                Decision::Ready { open }
+            } else {
+                Decision::Held { reasons: person }
+            }
+        }
+        Decision::Proving { why, reasons } if !reasons.is_empty() => {
+            let (person, notes) = split(reasons);
+            if person.is_empty() {
+                let mut open = base_open();
+                open.extend(notes);
+                Decision::Ready { open }
+            } else {
+                Decision::Proving {
+                    why,
+                    reasons: person,
+                }
+            }
+        }
+        other => other,
+    }
+}
+
+/// What holds the pull request before the human-only rule
+/// ([`decide`]): every reason CoderHelm finds, each with its words. Tests
+/// read the reasons here; what becomes of them is [`decide`]'s.
+#[cfg(test)]
+pub fn found(f: &Facts) -> Decision {
+    decide_raw(f)
+}
+
+fn decide_raw(f: &Facts) -> Decision {
     if f.closed {
         return Decision::Closed;
     }
@@ -367,7 +469,8 @@ pub fn decide(f: &Facts) -> Decision {
     // decides undoes it.
     if let Some(who) = f.put_back_by.as_ref().filter(|_| f.draft) {
         return Decision::Held {
-            reasons: vec![Reason::new(
+            reasons: vec![Reason::person(
+                common::handback::HumanOnly::PersonAction,
                 format!("`{who}` put it back to draft"),
                 "It stays a draft until a person marks it ready; CoderHelm doesn't undo that.",
             )],
@@ -412,7 +515,11 @@ pub fn decide(f: &Facts) -> Decision {
             format!("This failing-test fix never cleared its ready check: {why}"),
             "Run the affected test on the branch and mark it ready yourself, or push a fix.",
         )),
-        Some(TestHold::Untriggered { what, todo }) => reasons.push(Reason::new(
+        // Checks only a person can start (a label the app may not add, a
+        // trigger the workflow doesn't offer CoderHelm): missing access.
+        Some(TestHold::Untriggered { what, todo }) => reasons.push(Reason::person(
+            common::handback::human_only_in(todo)
+                .unwrap_or(common::handback::HumanOnly::MissingAccess),
             format!("This failing-test fix can't be proven yet: {what}"),
             todo,
         )),
@@ -455,10 +562,7 @@ pub fn decide(f: &Facts) -> Decision {
     {
         use common::preview::{Outcome as PvOutcome, Stage};
         if p.e2e_required && !p.e2e_covered {
-            reasons.push(Reason::new(
-                E2E_MISSING,
-                "CoderHelm writes the spec in its next round on this branch (its Tests and scope check sends it back), runs it on the preview, and marks the pull request ready once it passes.",
-            ));
+            proof_wait.get_or_insert_with(|| E2E_WAIT.to_string());
         }
         match p.stage {
             Stage::Failed => {
@@ -580,10 +684,12 @@ pub fn decide(f: &Facts) -> Decision {
     if proving {
         return match proof_wait.or(wait) {
             Some(why) => match stalled(f, &why) {
-                Some(r) => Decision::Proving {
-                    why: String::new(),
-                    reasons: vec![r],
-                },
+                Some(Stall::Retry { why, attempt }) => Decision::Retry { why, attempt },
+                Some(Stall::Note(note)) => {
+                    let mut open = open;
+                    open.push(note_line(&note));
+                    Decision::Ready { open }
+                }
                 None => Decision::Proving {
                     why,
                     reasons: Vec::new(),
@@ -593,10 +699,15 @@ pub fn decide(f: &Facts) -> Decision {
         };
     }
     if let Some(why) = wait.or(proof_wait) {
-        if let Some(r) = stalled(f, &why) {
-            return Decision::Held { reasons: vec![r] };
+        match stalled(f, &why) {
+            Some(Stall::Retry { why, attempt }) => return Decision::Retry { why, attempt },
+            Some(Stall::Note(note)) => {
+                let mut open = open;
+                open.push(note_line(&note));
+                return Decision::Ready { open };
+            }
+            None => return Decision::Wait { why, until: None },
         }
-        return Decision::Wait { why, until: None };
     }
     Decision::Ready { open }
 }
@@ -606,7 +717,7 @@ pub fn decide(f: &Facts) -> Decision {
 /// (see `recheck`). Never for a pull request a person put back to draft, or
 /// one that isn't held.
 pub fn recheck_due(f: &Facts, d: &Decision, version: &str) -> bool {
-    matches!(d, Decision::Held { .. })
+    matches!(d, Decision::Held { .. } | Decision::Ready { .. })
         && f.draft
         && !f.closed
         && f.put_back_by.is_none()
@@ -647,6 +758,14 @@ pub fn status_section(d: &Decision) -> String {
                 items.join("\n")
             )
         }
+        Decision::Retry { why, attempt } => format!(
+            "{STATUS_START}\n**This pull request stays a draft for now:** {}, and that hadn't \
+             changed in {} hours, so CoderHelm runs its checks on this head again (attempt {attempt} \
+             of {MAX_STALL_RETRIES}). It marks it ready when that is done, with anything still \
+             open listed as its note.\n{STATUS_END}",
+            why.trim().trim_end_matches('.'),
+            common::draft_hold::WAIT_LIMIT_SECS / 3600
+        ),
         Decision::Ready { .. } | Decision::Closed => String::new(),
     }
 }
@@ -677,6 +796,14 @@ pub fn open_item_lines(body: &str, open: &[String]) -> Vec<String> {
                 .any(|l| !l.contains(super::proof::READY_OPEN_MARK) && l.contains(core))
         })
         .map(|o| {
+            if o.starts_with(NOTE_PREFIX) {
+                return format!(
+                    "- {}. CoderHelm finished what its own access reaches and lists this for the \
+                     review; it doesn't keep the draft. {}",
+                    o.trim().trim_end_matches('.'),
+                    super::proof::READY_OPEN_MARK
+                );
+            }
             format!(
                 "- {}. CI is green and the review approved, so this doesn't keep the draft: \
                  look at it before merging. {}",
@@ -884,21 +1011,7 @@ pub async fn settle(ctx: &Ctx<'_>) -> Outcome {
             record_settled(ctx.state, ctx.team_id, &run_id, "closed").await;
             Outcome::Closed
         }
-        Decision::Ready { open } => {
-            if facts.draft {
-                info!(pr = ctx.pr, open = ?open, "Marking PR ready");
-                if let Err(r) = make_ready(ctx, &facts).await {
-                    return retry_or_give_up(ctx, &run_id, &pr_url, r).await;
-                }
-                info!(pr = ctx.pr, open = open.len(), "PR marked ready");
-            } else {
-                info!(pr = ctx.pr, "PR already not a draft");
-            }
-            write_body(ctx, &facts.body, &decision).await;
-            record_settled(ctx.state, ctx.team_id, &run_id, "ready").await;
-            Outcome::Ready
-        }
-        Decision::Held { .. }
+        Decision::Held { .. } | Decision::Ready { .. }
             if recheck_due(&facts, &decision, super::proof::checks_version())
                 && super::recheck::start(
                     ctx.state,
@@ -926,6 +1039,20 @@ pub async fn settle(ctx: &Ctx<'_>) -> Outcome {
             }
             Outcome::Rechecking
         }
+        Decision::Ready { open } => {
+            if facts.draft {
+                info!(pr = ctx.pr, open = ?open, "Marking PR ready");
+                if let Err(r) = make_ready(ctx, &facts).await {
+                    return retry_or_give_up(ctx, &run_id, &pr_url, r).await;
+                }
+                info!(pr = ctx.pr, open = open.len(), "PR marked ready");
+            } else {
+                info!(pr = ctx.pr, "PR already not a draft");
+            }
+            write_body(ctx, &facts.body, &decision).await;
+            record_settled(ctx.state, ctx.team_id, &run_id, "ready").await;
+            Outcome::Ready
+        }
         Decision::Held { reasons } => {
             let lines: Vec<String> = reasons.iter().map(Reason::line).collect();
             // The sweep decides a held pull request again every hour: the
@@ -948,9 +1075,40 @@ pub async fn settle(ctx: &Ctx<'_>) -> Outcome {
         Decision::Wait { why, .. } => {
             info!(pr = ctx.pr, run_id = %run_id, why = %why, "The PR stays a draft for now");
             write_body(ctx, &facts.body, &decision).await;
-            if let Some(h) =
+            if let Some(mut h) =
                 DraftHold::new(Kind::Waiting, vec![Reason::new(why, "")], ctx.pr, &pr_url)
             {
+                // CoderHelm's attempts on this head carry over the wait.
+                h.retried = carried_retries(facts.prior.as_ref(), &facts.head);
+                record_hold(ctx.state, ctx.team_id, &run_id, on_head(h)).await;
+            }
+            Outcome::Waiting
+        }
+        Decision::Retry { why, attempt } => {
+            // CoderHelm's own next action on a wait that stalled: its checks
+            // run on the head again in a fresh step (once per attempt), and
+            // the wait starts over. Never a person's to-do.
+            let started = super::recheck::start(
+                ctx.state,
+                ctx.team_id,
+                &run_id,
+                ctx.pr,
+                &facts.body,
+                &format!("{}#stall{attempt}", super::proof::checks_version()),
+            )
+            .await;
+            info!(pr = ctx.pr, run_id = %run_id, why = %why, attempt, started, "A wait stalled on this head: CoderHelm acts again");
+            write_body(ctx, &facts.body, &decision).await;
+            if let Some(mut h) = DraftHold::new(
+                Kind::Waiting,
+                vec![Reason::new(
+                    format!("CoderHelm acts again on a stalled wait ({why})"),
+                    "",
+                )],
+                ctx.pr,
+                &pr_url,
+            ) {
+                h.retried = *attempt;
                 record_hold(ctx.state, ctx.team_id, &run_id, on_head(h)).await;
             }
             Outcome::Waiting
@@ -982,6 +1140,13 @@ pub async fn settle(ctx: &Ctx<'_>) -> Outcome {
             }
         }
     }
+}
+
+/// The stalled-wait attempts a new wait on `head` keeps from the last hold.
+pub fn carried_retries(prior: Option<&DraftHold>, head: &str) -> u32 {
+    prior
+        .filter(|p| !head.is_empty() && p.head == head)
+        .map_or(0, |p| p.retried)
 }
 
 /// Reads what [`decide`] needs. A closed or ready pull request is decided
@@ -1528,6 +1693,11 @@ async fn make_ready(ctx: &Ctx<'_>, f: &Facts) -> Result<(), Refused> {
     if let Some(clean) = f.title.strip_prefix("⚠️ Partial: ") {
         let _ = gh.update_pr_title(ctx.owner, ctx.repo, ctx.pr, clean).await;
     }
+    // A file changed and put back never leaves commits of its own, even
+    // when a person's commit keeps the whole history from being squashed.
+    if let Some(head) = pr["head"]["ref"].as_str() {
+        super::round::fold_churn(gh, ctx.owner, ctx.repo, head).await;
+    }
     // Final squash: the run's whole history (the implementation and every
     // fix round) as one clean commit, best-effort.
     if let (Some(keep_first), Some(head), Some(base)) = (
@@ -1775,7 +1945,9 @@ async fn record_hold(state: &WorkerState, team_id: &str, run_id: &str, hold: Dra
         return;
     }
     let before = run_hold(state, team_id, run_id).await;
-    let hold = hold.continuing(before.as_ref().and_then(|(_, h)| h.as_ref()));
+    let mut hold = hold.continuing(before.as_ref().and_then(|(_, h)| h.as_ref()));
+    // Which code decided it: another version decides it again at once.
+    hold.version = super::proof::checks_version().to_string();
     let now = chrono::Utc::now().to_rfc3339();
     // `:held` is a condition value, never a status written here: the write
     // goes through `NeedsInput::needs_input`.
@@ -2037,8 +2209,13 @@ pub enum SweepStep {
     Skip,
 }
 
-/// Pure: what the sweep does with a candidate at `now`.
-pub fn sweep_step(c: &Candidate, now: chrono::DateTime<chrono::Utc>) -> SweepStep {
+/// Pure: what the sweep does with a candidate at `now`, run by the code of
+/// `version` (`proof::checks_version`). A hold that other code decided is
+/// decided again on this sweep, whatever its age: after a release a held
+/// draft once waited out the hour since its last decision, the one sweep
+/// that hour skipped it for GitHub's budget, and a person reset the run
+/// before the fix that would have finished it ever looked.
+pub fn sweep_step(c: &Candidate, now: chrono::DateTime<chrono::Utc>, version: &str) -> SweepStep {
     let finished = matches!(
         c.status.as_str(),
         common::run_status::COMPLETED | common::run_status::SUCCESS
@@ -2053,6 +2230,7 @@ pub fn sweep_step(c: &Candidate, now: chrono::DateTime<chrono::Utc>) -> SweepSte
         // Waiting on a person for something that isn't the draft.
         (None, false, _) => SweepStep::Skip,
         (Some(h), _, _) if h.stale(RECHECK_HELD_SECS, now) => SweepStep::Decide,
+        (Some(h), true, _) | (Some(h), _, true) if h.other_version(version) => SweepStep::Decide,
         (Some(_), true, _) | (Some(_), _, true) => SweepStep::Peek,
         (Some(_), false, false) => SweepStep::Skip,
     }
@@ -2095,6 +2273,9 @@ pub struct SweepReport {
     pub decided: usize,
     /// `owner/repo#pr: outcome` for each one decided.
     pub settled: Vec<String>,
+    /// GitHub's budget skipped an installation this sweep: seconds until it
+    /// may spend again (`SweepGate::retry_in`).
+    pub retry_in: Option<u64>,
 }
 
 /// Finished runs (in the last [`SWEEP_WINDOW_DAYS`]) whose pull request
@@ -2150,11 +2331,14 @@ pub async fn sweep(state: &WorkerState) -> SweepReport {
     // GitHub's budget and says a skip once per installation.
     let mut budget =
         crate::clients::github_budget::SweepGate::new(common::github_budget::caller::SWEEP_DRAFTS);
+    let version = super::proof::checks_version();
+    // Decisions first, so a short budget goes to the drafts that need one.
+    let candidates = sweep_order(candidates, now, version);
     for c in candidates {
         if report.decided >= SWEEP_MAX_DECISIONS {
             break;
         }
-        let step = sweep_step(&c, now);
+        let step = sweep_step(&c, now, version);
         if step == SweepStep::Skip || c.installation_id == 0 || c.team_id.is_empty() {
             continue;
         }
@@ -2210,7 +2394,75 @@ pub async fn sweep(state: &WorkerState) -> SweepReport {
             .settled
             .push(format!("{}/{}#{}: {outcome:?}", c.owner, c.repo, c.pr));
     }
+    report.retry_in = budget.retry_in();
     report
+}
+
+/// How often the sweeps run (the `review_sweep` schedule), in seconds.
+pub const SWEEP_EVERY_SECS: u64 = 15 * 60;
+/// The settings item a follow-up sweep is claimed under, once per gap.
+const FOLLOW_UP_PK: &str = "SWEEP";
+const FOLLOW_UP_SK: &str = "review_sweep#follow_up";
+
+/// When to run the sweeps again after GitHub's budget skipped an
+/// installation (`waits`: each sweep's `retry_in`): the shortest wait, when
+/// it ends well before the next scheduled sweep. A skip at a quarter past
+/// once waited fifteen minutes for a budget that refilled ten seconds later.
+pub fn follow_up_delay(waits: &[Option<u64>]) -> Option<u64> {
+    let soonest = waits.iter().flatten().copied().min()?;
+    (soonest + 60 < SWEEP_EVERY_SECS).then_some(soonest.clamp(30, SWEEP_EVERY_SECS - 60))
+}
+
+/// Runs the sweeps again once the budget that skipped them refills
+/// ([`follow_up_delay`]): one delayed `review_sweep` per gap, claimed so
+/// several workers never send more than one.
+pub async fn sweep_follow_up(state: &WorkerState, waits: &[Option<u64>]) {
+    let Some(delay) = follow_up_delay(waits) else {
+        return;
+    };
+    if state.config.ticket_queue_url.is_empty() {
+        return;
+    }
+    let claimed = common::claim::claim(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        FOLLOW_UP_PK,
+        FOLLOW_UP_SK,
+        delay + 60,
+    )
+    .await;
+    if !matches!(claimed, common::claim::Claim::Won) {
+        return;
+    }
+    let sent = state
+        .sqs
+        .send_message()
+        .queue_url(&state.config.ticket_queue_url)
+        .message_body(serde_json::json!({"type": "review_sweep"}).to_string())
+        .delay_seconds(delay as i32)
+        .send()
+        .await;
+    match sent {
+        Ok(_) => info!(
+            delay_secs = delay,
+            "GitHub's budget skipped a sweep: the sweeps run again once it refills"
+        ),
+        Err(e) => warn!(error = %e, "Could not send the follow-up sweep"),
+    }
+}
+
+/// The candidates in the order the sweep takes them: those it decides
+/// first (in their scan order), then those it only peeks at.
+pub fn sweep_order(
+    candidates: Vec<Candidate>,
+    now: chrono::DateTime<chrono::Utc>,
+    version: &str,
+) -> Vec<Candidate> {
+    let (mut decide, peek): (Vec<Candidate>, Vec<Candidate>) = candidates
+        .into_iter()
+        .partition(|c| sweep_step(c, now, version) == SweepStep::Decide);
+    decide.extend(peek);
+    decide
 }
 
 #[cfg(test)]
@@ -2318,10 +2570,13 @@ mod tests {
             preview: Some(p.clone()),
             ..green_approved()
         };
-        let Decision::Held { reasons } = decide(&f) else {
-            panic!("held expected");
-        };
-        assert!(reasons[0].what.starts_with(E2E_MISSING));
+        // CoderHelm's own work: a wait while it writes the spec, never a
+        // person's hold.
+        assert!(
+            matches!(decide(&f), Decision::Wait { ref why, .. } if why == E2E_WAIT),
+            "{:?}",
+            decide(&f)
+        );
         p.e2e_covered = true;
         let ok = Facts {
             preview: Some(p),
@@ -2352,7 +2607,11 @@ mod tests {
         assert!(super::super::proof::holds_security_items(
             "- Token logged in plain text <!-- coderhelm:security -->"
         ));
-        let d = decide(&f);
+        // CoderHelm's note on a ready pull request (incident bv); the
+        // reason as found names the checks.
+        assert!(matches!(decide(&f), Decision::Ready { open }
+            if open.iter().any(|o| o.starts_with(NOTE_PREFIX))));
+        let d = found(&f);
         let Decision::Held { reasons } = &d else {
             panic!("held expected, got {d:?}");
         };
@@ -2363,14 +2622,13 @@ mod tests {
         let section = status_section(&d);
         assert!(section.contains("**This pull request stays a draft.**"));
         assert!(section.contains("`test`"));
-        // The same pull request without the marker is any other run's: it
-        // is held on its failing check too, never marked ready red
-        // (`outcome::ci_blocker`).
+        // The same pull request without the marker is any other run's: its
+        // failing check is found the same way (`outcome::ci_blocker`).
         let plain = Facts {
             security: false,
             ..f.clone()
         };
-        let Decision::Held { reasons } = decide(&plain) else {
+        let Decision::Held { reasons } = found(&plain) else {
             panic!("held expected");
         };
         assert!(reasons[0]
@@ -2457,7 +2715,7 @@ mod tests {
             draft: true,
             ..Default::default()
         };
-        match decide(&f) {
+        match found(&f) {
             Decision::Held { reasons } => {
                 assert_eq!(reasons.len(), 1);
                 assert!(reasons[0].what.contains("npm run test:unit"));
@@ -2471,7 +2729,7 @@ mod tests {
             approved: false,
             ..green_approved()
         };
-        assert!(matches!(decide(&f), Decision::Held { reasons }
+        assert!(matches!(found(&f), Decision::Held { reasons }
             if reasons[0].what.contains("review hasn't approved")));
     }
 
@@ -2487,8 +2745,11 @@ mod tests {
             body: security,
             ..green_approved()
         };
-        assert!(matches!(decide(&f), Decision::Held { reasons }
+        // Found as a hold, and listed as CoderHelm's note: not a person's.
+        assert!(matches!(found(&f), Decision::Held { reasons }
             if reasons[0].what.contains("Security items")));
+        assert!(matches!(decide(&f), Decision::Ready { open }
+            if open.iter().any(|o| o.contains("Security items"))));
 
         let f = Facts {
             put_back_by: Some("dana".into()),
@@ -2503,26 +2764,26 @@ mod tests {
             )),
             ..green_approved()
         };
-        assert!(matches!(decide(&f), Decision::Held { .. }));
+        assert!(matches!(found(&f), Decision::Held { .. }));
 
         let f = Facts {
             links_blocking: vec!["/old redirects to a 404".into()],
             ..green_approved()
         };
-        assert!(matches!(decide(&f), Decision::Held { reasons }
+        assert!(matches!(found(&f), Decision::Held { reasons }
             if reasons[0].what.contains("/old redirects to a 404")));
 
         let f = Facts {
             e2e: E2e::Refused,
             ..green_approved()
         };
-        assert!(matches!(decide(&f), Decision::Held { .. }));
+        assert!(matches!(found(&f), Decision::Held { .. }));
 
         let f = Facts {
             test_fix: Some(TestHold::GaveUp("the repeat run never passed".into())),
             ..green_approved()
         };
-        assert!(matches!(decide(&f), Decision::Held { reasons }
+        assert!(matches!(found(&f), Decision::Held { reasons }
             if reasons[0].todo.contains("mark it ready yourself")));
     }
 
@@ -2722,16 +2983,20 @@ mod tests {
             installation_id: 1,
             hold: None,
         };
-        assert_eq!(sweep_step(&c, now), SweepStep::Decide);
+        assert_eq!(sweep_step(&c, now, ""), SweepStep::Decide);
         let held = DraftHold::new(Kind::Held, vec![Reason::new("a", "")], 583, "").unwrap();
         let c2 = Candidate {
             status: "needs_input".into(),
             hold: Some(held.clone()),
             ..c.clone()
         };
-        assert_eq!(sweep_step(&c2, now), SweepStep::Peek);
+        assert_eq!(sweep_step(&c2, now, ""), SweepStep::Peek);
         assert_eq!(
-            sweep_step(&c2, now + chrono::Duration::seconds(RECHECK_HELD_SECS + 1)),
+            sweep_step(
+                &c2,
+                now + chrono::Duration::seconds(RECHECK_HELD_SECS + 1),
+                ""
+            ),
             SweepStep::Decide
         );
         // Waiting on a person for something that isn't the draft.
@@ -2740,7 +3005,7 @@ mod tests {
             hold: None,
             ..c.clone()
         };
-        assert_eq!(sweep_step(&c3, now), SweepStep::Skip);
+        assert_eq!(sweep_step(&c3, now, ""), SweepStep::Skip);
     }
 
     #[test]

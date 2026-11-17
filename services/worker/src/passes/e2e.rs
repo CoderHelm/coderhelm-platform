@@ -1165,12 +1165,12 @@ pub(crate) fn rescued_note(workflow: &str, sha: &str, tests: &[String]) -> Strin
 async fn note_rescued(st: &Store<'_>, gh: &GitHubClient, msg: &TestIngest, run: &Run, pr: u64) {
     let repo = format!("{}/{}", msg.repo_owner, msg.repo_name);
     let body = rescued_note(&run.workflow, &run.sha, &run.quarantined_tests);
-    if let Ok(Some(id)) = st.pr_note(&msg.team_id, &repo, pr).await {
+    if let Ok(Some(_)) = st.pr_note(&msg.team_id, &repo, pr).await {
         if crate::passes::conversation::edit_own(
             gh,
             &msg.repo_owner,
             &msg.repo_name,
-            id,
+            pr,
             "e2e-rescued",
             &body,
         )

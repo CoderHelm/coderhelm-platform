@@ -60,9 +60,17 @@ pub const REASON_INPUT: &str = "outside_plan";
 /// round may edit and how the files its instructions name are read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoundFor {
-    /// The build of the plan (the first pass, a continuation, a dependency
-    /// or generator run): any file.
+    /// A dependency or generator run: the files it touches are the
+    /// tool's, not a plan's, so any file.
     Build,
+    /// The build of the plan (the first pass, a continuation, the tasks a
+    /// build left): the files its tasks name, their tests and module
+    /// files. Any other existing file is refused until the call says why
+    /// the change needs it, and that reason is added to what the plan
+    /// changes (the pull request lists it). A plan that names no file has
+    /// no boundary. The build once rewrote twelve files no task named;
+    /// a round later put each one back, a commit apiece.
+    PlanTasks,
     /// A person asked (a review, a comment): their ask is the
     /// authorization, any file.
     PersonAsk,
@@ -125,7 +133,8 @@ impl RoundFor {
     /// What the round was started for, in the refusal's words.
     pub fn what(self) -> &'static str {
         match self {
-            RoundFor::Build => "the plan",
+            RoundFor::Build => "the dependency or generator run",
+            RoundFor::PlanTasks => "the plan's tasks",
             RoundFor::PersonAsk => "a person's request",
             RoundFor::AppBug => "the bug the tests showed",
             RoundFor::FeatureRules => "the new-feature rules",
@@ -259,6 +268,18 @@ impl Scope {
             }
         }
         s
+    }
+
+    /// Whether a task of the plan names `path` (or its folder), whatever
+    /// else names it.
+    pub fn in_plan(&self, path: &str) -> bool {
+        let p = normalize(path);
+        self.plan.contains(p) || self.plan_dirs.iter().any(|d| p.starts_with(d.as_str()))
+    }
+
+    /// Whether the plan names any file or folder of this repository.
+    pub fn has_plan(&self) -> bool {
+        !self.plan.is_empty() || !self.plan_dirs.is_empty()
     }
 
     /// Every file the scope names (not its directories).
@@ -623,13 +644,59 @@ impl ScopeGuard {
         own_repo: &str,
         reason: &str,
     ) -> Self {
-        if !round.bounded() || pr_files.is_empty() || pr_files.len() >= MAX_TRUSTED_SCOPE_FILES {
+        if !round.bounded() || pr_files.len() >= MAX_TRUSTED_SCOPE_FILES {
+            return Self::unscoped();
+        }
+        let scope = Scope::of(round, pr_files, plan, own_repo, reason);
+        // The build of the plan is anchored by the plan's files, even
+        // before the branch changes any; every other round by the pull
+        // request's.
+        let anchored = if round == RoundFor::PlanTasks {
+            scope.has_plan()
+        } else {
+            !pr_files.is_empty()
+        };
+        if !anchored {
             return Self::unscoped();
         }
         Self {
-            scope: Some((round, Scope::of(round, pr_files, plan, own_repo, reason))),
+            scope: Some((round, scope)),
             ..Self::unscoped()
         }
+    }
+
+    /// Whether this round may `restore_file` `path` from `from_ref`. In a
+    /// round on the pull request (planned work, a proof gap, a fix of any
+    /// kind), a file the plan changes is never restored: the round edits
+    /// what is on the branch. Audited runs restored such a file and wrote
+    /// it again from scratch, up to fourteen times in one run. A file
+    /// outside the plan is restored only to the pull request's base, never
+    /// from an older commit. The build of the plan and rounds with no
+    /// boundary are not held here.
+    pub fn restore(&self, path: &str, from_ref: &str, base: &str) -> Result<(), String> {
+        let Some((round, scope)) = &self.scope else {
+            return Ok(());
+        };
+        if *round == RoundFor::PlanTasks {
+            return Ok(());
+        }
+        if scope.in_plan(path) {
+            return Err(format!(
+                "Not restored: `{}` is a file the plan changes. This round ({}) edits what is on \
+                 the branch: read the file and change only what the round is for, with edit_file. \
+                 Never restore a planned file and rebuild it.",
+                normalize(path),
+                round.what()
+            ));
+        }
+        if from_ref.trim() != base.trim() {
+            return Err(format!(
+                "Not restored: a file outside the plan is put back only to the pull request's \
+                 base (`{base}`), never from `{}`. Leave from_ref out.",
+                from_ref.trim()
+            ));
+        }
+        Ok(())
     }
 
     /// Whether the round has a file boundary.
@@ -815,8 +882,9 @@ mod scope_guard_tests {
     const TASKS: &str = "- [x] apps/web/src/routes/gift.tsx: [create] The gift route\n\
                          - [ ] apps/web/src/lib/metadata.ts: [modify] Page metadata for the gift route\n";
 
-    const ROUNDS: [RoundFor; 13] = [
+    const ROUNDS: [RoundFor; 14] = [
         RoundFor::Build,
+        RoundFor::PlanTasks,
         RoundFor::PersonAsk,
         RoundFor::AppBug,
         RoundFor::FeatureRules,

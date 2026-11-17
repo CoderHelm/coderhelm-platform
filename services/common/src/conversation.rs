@@ -17,17 +17,22 @@
 //!   said there ([`fingerprint`] of the meaning-bearing words) and nothing
 //!   changed, or when it would ask a question it already asked and nobody
 //!   answered since;
-//! - **update its own comment in place** for a status that moved on or a
-//!   retry of the same thing: one live comment per [`Say::slot`], with a
-//!   short history ("Retried at 10:12 UTC; same result."), and an earlier
-//!   outcome it now replaces is named, so it never contradicts itself
-//!   silently;
-//! - **reply to people**: what a person wrote since CoderHelm last spoke is
-//!   acknowledged, by name and quote, in the next thing it posts, and that
-//!   post is a new comment beneath theirs;
-//! - **post** only genuinely new information, and at most
-//!   [`RATE_MAX_NEW`] new comments per thread in [`RATE_WINDOW_MS`]; past
-//!   that, the newest one is updated instead.
+//! - **one status comment per thread**: every status and note goes in the
+//!   thread's one live status comment, edited in place, one part per
+//!   [`Say::slot`] ([`Part`]). Never "This replaces what I wrote", never a
+//!   history block: the comment says what is true now, and the pull
+//!   request description holds the details. CoderHelm's earlier status
+//!   comments are folded into it on the next update: rewritten to
+//!   [`FOLD_LINE`] and hidden as outdated, never deleted;
+//! - **only what someone needs**: a status that needs nothing from anyone
+//!   ([`Say::for_nobody`], or text `comment_style` empties) is never
+//!   posted; it goes on the run page and in the description, and a live
+//!   comment that said it drops it (hidden once nothing is left);
+//! - **reply to people**: an answer to people ([`Kind::Reply`]) is a reply
+//!   beneath their comment, quoting it;
+//! - **the house style**: every comment passes `comment_style::render` and
+//!   `comment_style::lint` before it is written; one that still breaks the
+//!   style is not posted.
 //!
 //! Every text is laid out by [`shape`] first: no arrow glyphs, no raw
 //! commit hashes in the visible part, and a long text is cut at a sentence
@@ -43,11 +48,6 @@ pub const MARK_CLOSE: &str = " -->";
 /// The settings-table sort key prefix of what CoderHelm said on a thread
 /// that can't carry a hidden marker (a Jira ticket).
 pub const SK_PREFIX: &str = "CONVERSATION#";
-/// New comments on one thread within this window, at most [`RATE_MAX_NEW`].
-pub const RATE_WINDOW_MS: i64 = 10 * 60 * 1000;
-pub const RATE_MAX_NEW: usize = 3;
-/// History lines a comment keeps.
-pub const MAX_HISTORY: usize = 6;
 /// What a person wrote, quoted in an acknowledgement, in characters.
 const QUOTE_CHARS: usize = 90;
 /// In [`Say::answers`]: the text answers everyone who wrote since.
@@ -138,6 +138,10 @@ pub struct Say {
     pub asks: Vec<String>,
     /// People's comments (ids) the body already answers itself.
     pub answers: Vec<String>,
+    /// A status that needs nothing from anyone (progress, work CoderHelm
+    /// does itself): it goes on the run page and in the description, never
+    /// in a comment. A comment that said it before is updated to drop it.
+    pub nobody: bool,
 }
 
 impl Say {
@@ -207,6 +211,18 @@ impl Say {
         self
     }
 
+    /// Marks a status that needs nothing from anyone ([`Say::nobody`]).
+    pub fn for_nobody(mut self) -> Say {
+        self.nobody = true;
+        self
+    }
+
+    /// Whether this is a status or a note: it lives in the thread's one
+    /// status comment.
+    pub fn is_status(&self) -> bool {
+        matches!(self.kind, Kind::Status | Kind::Note)
+    }
+
     fn gist_or_first(&self) -> String {
         let g = if self.gist.trim().is_empty() {
             first_sentence(&visible(&self.body))
@@ -248,6 +264,26 @@ pub struct Meta {
     /// When it was first posted (ms).
     #[serde(default)]
     pub first_ms: i64,
+    /// The status comment's parts, newest first: one per slot that has
+    /// something for a person or a reviewer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parts: Vec<Part>,
+    /// Hidden as outdated (it says nothing anyone needs now).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hidden: bool,
+    /// An earlier status comment folded into the live one: never edited
+    /// again.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub outdated: bool,
+}
+
+/// One part of the thread's status comment: what one slot says now.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Part {
+    pub slot: String,
+    pub body: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub asks: Vec<String>,
 }
 
 /// One of CoderHelm's own comments on the thread.
@@ -260,6 +296,9 @@ pub struct Said {
     /// What it says now (without its marker), when known.
     #[serde(default)]
     pub body: String,
+    /// The tracker's global id (GitHub's node id), for hiding it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub node_id: String,
 }
 
 /// A person's comment on the thread.
@@ -305,24 +344,6 @@ impl View {
         out
     }
 
-    fn latest_in(&self, slot: &str) -> Option<&Said> {
-        self.said
-            .iter()
-            .filter(|s| s.meta.slot == slot)
-            .max_by_key(|s| s.at_ms)
-    }
-
-    fn latest(&self) -> Option<&Said> {
-        self.said.iter().max_by_key(|s| s.at_ms)
-    }
-
-    fn new_since(&self, since_ms: i64) -> usize {
-        self.said
-            .iter()
-            .filter(|s| s.meta.first_ms.max(1) >= since_ms && s.meta.first_ms > 0)
-            .count()
-    }
-
     /// Records what was just written, so a second say in the same run reads
     /// it without asking the tracker again.
     pub fn remember(&mut self, id: &str, at_ms: i64, meta: &Meta) {
@@ -332,9 +353,36 @@ impl View {
             at_ms,
             meta: meta.clone(),
             body: String::new(),
+            node_id: String::new(),
         });
     }
+
+    /// The thread's one live status comment: CoderHelm's newest status or
+    /// note that wasn't folded into another.
+    pub fn live_status(&self) -> Option<&Said> {
+        self.said
+            .iter()
+            .filter(|s| matches!(s.meta.kind, Kind::Status | Kind::Note) && !s.meta.outdated)
+            .max_by_key(|s| (s.at_ms, s.id.clone()))
+    }
+
+    /// CoderHelm's other status comments on the thread: folded into the
+    /// live one ([`FOLD_LINE`]) and hidden as outdated.
+    pub fn to_fold(&self, live: &str) -> Vec<&Said> {
+        self.said
+            .iter()
+            .filter(|s| s.id != live)
+            .filter(|s| matches!(s.meta.kind, Kind::Status | Kind::Note) && !s.meta.outdated)
+            .collect()
+    }
 }
+
+/// What an earlier status comment says once folded into the live one.
+pub const FOLD_LINE: &str = "Outdated. The current status is in CoderHelm's latest comment.";
+
+/// What the live status comment says when nothing is needed from anyone
+/// any more (then it is hidden).
+pub const NOTHING_NOW: &str = "Nothing is needed from anyone here now.";
 
 /// What [`decide`] chose.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -696,7 +744,7 @@ pub fn decide(view: &View, say: &Say, place: &Place, now_ms: i64) -> Decision {
         .iter()
         .map(|q| cut_words(&one_line(q), 200))
         .collect();
-    let mut meta = Meta {
+    let meta = Meta {
         slot: say.slot.clone(),
         kind: say.kind,
         fp: fp.clone(),
@@ -705,10 +753,10 @@ pub fn decide(view: &View, say: &Say, place: &Place, now_ms: i64) -> Decision {
         answered: Vec::new(),
         history: Vec::new(),
         first_ms: now_ms,
+        ..Default::default()
     };
     let unheard = say.unanswered(view);
     let answered_any = !say.answers.is_empty();
-    let prev = view.latest_in(&say.slot);
 
     // A question already asked, with nobody answering since: still waiting.
     if !asks.is_empty() && unheard.is_empty() && !answered_any {
@@ -765,117 +813,122 @@ pub fn decide(view: &View, say: &Say, place: &Place, now_ms: i64) -> Decision {
         };
     }
 
-    // People wrote since CoderHelm last spoke, or this answers them: a
-    // reply to their comment, never a bare new one.
-    if !unheard.is_empty() || say.kind == Kind::Reply {
-        let mut text = body.clone();
-        if let Some(p) = prev.filter(|p| p.meta.fp != fp && !p.meta.gist.is_empty()) {
-            text = format!("{text}\n\n{}", changed_line(&p.meta.gist, p.at_ms));
-        }
+    // People wrote since CoderHelm last spoke, or this answers them: a reply
+    // beneath their comment (every person's comment is acknowledged), never
+    // a bare new status. A status for nobody answers nobody.
+    if say.kind == Kind::Reply || (!unheard.is_empty() && !say.nobody) {
         if let Some(to) = targets.last().cloned() {
             return Decision::Reply {
                 how: how_for(place, &to),
                 to,
                 others: targets,
                 ack: String::new(),
-                text: shape(&text, place.budget(), markdown),
+                text: body,
                 meta,
             };
         }
-        return Decision::Post {
-            body: shape(&text, place.budget(), markdown),
-            meta,
-        };
+        return Decision::Post { body, meta };
     }
-
-    if let Some(p) = prev {
-        let same = p.meta.fp == fp;
-        if same && now_ms - p.at_ms < 60_000 && say.kind != Kind::Status {
-            return Decision::Quiet {
-                why: "said the same a moment ago".into(),
-            };
-        }
-        if same && say.kind == Kind::Note {
-            return Decision::Quiet {
-                why: "already said on this thread, and nothing changed".into(),
-            };
-        }
-        // A status keeps one live comment: a retry of the same thing, or a
-        // state that moved on, rewrites it, naming what it said before.
-        if say.kind == Kind::Status {
-            let mut history = p.meta.history.clone();
-            meta.first_ms = p.meta.first_ms;
-            meta.answered = p.meta.answered.clone();
-            let text = if same {
-                history.push(format!("Retried at {}; same result.", clock(now_ms)));
-                body.clone()
-            } else {
-                history.push(format!("{}: {}", clock(p.at_ms), p.meta.gist));
-                format!("{body}\n\n{}", changed_line(&p.meta.gist, p.at_ms))
-            };
-            let keep = history.len().saturating_sub(MAX_HISTORY);
-            history.drain(..keep);
-            meta.history = history;
-            return Decision::Edit {
-                id: p.id.clone(),
-                body: with_history(&text, &meta.history, place.budget(), markdown),
-                meta,
-            };
-        }
-        // A note with new information is posted below.
-    }
-
-    // The same meaning already on the thread under another slot.
-    if view.said.iter().any(|s| s.meta.fp == fp) {
-        return Decision::Quiet {
-            why: "already said on this thread, and nothing changed".into(),
-        };
-    }
-
-    // Too many new comments lately: the newest one takes the update.
-    if view.new_since(now_ms - RATE_WINDOW_MS) >= RATE_MAX_NEW {
-        if let Some(l) = view.latest() {
-            let mut m = l.meta.clone();
-            m.history
-                .push(format!("{}: {}", clock(now_ms), say.gist_or_first()));
-            let keep = m.history.len().saturating_sub(MAX_HISTORY);
-            m.history.drain(..keep);
-            return Decision::Edit {
-                id: l.id.clone(),
-                body: with_history(&body, &m.history, place.budget(), markdown),
-                meta: Meta { fp, ..m },
-            };
-        }
-    }
-
-    Decision::Post { body, meta }
+    let _ = now_ms;
+    status_decision(view, say, place, meta)
 }
 
-/// The line that says an earlier comment is replaced, and what it said.
-pub fn changed_line(gist: &str, at_ms: i64) -> String {
-    format!(
-        "This replaces what I wrote at {} (\"{}\").",
-        clock(at_ms),
-        gist.trim().trim_end_matches('.')
-    )
-}
-
-fn with_history(body: &str, history: &[String], budget: usize, markdown: bool) -> String {
-    if history.is_empty() {
-        return shape(body, budget, markdown);
-    }
-    let lines = if markdown {
-        history
-            .iter()
-            .map(|h| format!("- {h}"))
-            .collect::<Vec<_>>()
-            .join("\n")
+/// A status or a note, in the thread's one status comment: each slot's part
+/// replaced by what it says now, a part that needs nothing from anyone
+/// dropped, the whole laid out by `comment_style`. No comment yet and
+/// nothing for anyone: nothing is posted (the run page and the description
+/// carry it). The text unchanged: nothing is written.
+fn status_decision(view: &View, say: &Say, place: &Place, mut meta: Meta) -> Decision {
+    let markdown = place.markdown();
+    let part_body = if say.nobody {
+        String::new()
     } else {
-        history.join(" ")
+        // Work a person was not to get never reaches the comment (the same
+        // check `sink_decision` makes on every comment).
+        let sunk = crate::person_gate::sink(&shape(&say.body, place.budget(), markdown));
+        if sunk.defect() {
+            tracing::error!(
+                thread = %place.key(),
+                slot = %say.slot,
+                taken_out = sunk.sent_back.len(),
+                items = ?sunk.sent_back,
+                "person gate defect: a status handed people work CoderHelm can do; taken out before posting"
+            );
+        }
+        crate::comment_style::render(&sunk.text, markdown)
     };
-    let tail = format!("\n\nHistory:\n{lines}");
-    let room = budget.saturating_sub(tail.chars().count());
-    format!("{}{tail}", shape(body, room, markdown))
+    let live = view.live_status();
+    let mut parts: Vec<Part> = live.map(|l| l.meta.parts.clone()).unwrap_or_default();
+    // A comment written before parts existed: what it asked a person is kept
+    // (cleaned); the rest was status, replaced by this one.
+    if let Some(l) = live.filter(|l| l.meta.parts.is_empty() && !l.meta.asks.is_empty()) {
+        let old = crate::comment_style::render(&l.body, markdown);
+        if !old.is_empty() && l.meta.slot != say.slot {
+            parts.push(Part {
+                slot: l.meta.slot.clone(),
+                body: old,
+                asks: l.meta.asks.clone(),
+            });
+        }
+    }
+    parts.retain(|p| p.slot != say.slot);
+    if !part_body.is_empty() {
+        parts.insert(
+            0,
+            Part {
+                slot: say.slot.clone(),
+                body: part_body,
+                asks: meta.asks.clone(),
+            },
+        );
+    }
+    let joined = parts
+        .iter()
+        .map(|p| p.body.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let combined = crate::comment_style::render(&joined, markdown);
+    let mut asks: Vec<String> = Vec::new();
+    for p in &parts {
+        for a in &p.asks {
+            if !asks.contains(a) {
+                asks.push(a.clone());
+            }
+        }
+    }
+    meta.asks = asks;
+    meta.parts = parts;
+    meta.history = Vec::new();
+    meta.hidden = combined.is_empty();
+    let body = if combined.is_empty() {
+        NOTHING_NOW.to_string()
+    } else {
+        combined
+    };
+    meta.fp = fingerprint(&body);
+    meta.gist = cut_words(&first_sentence(&body), 160);
+    let Some(l) = live else {
+        if meta.hidden {
+            return Decision::Quiet {
+                why: "needs nothing from anyone: it is on the run page and in the description"
+                    .into(),
+            };
+        }
+        return Decision::Post { body, meta };
+    };
+    meta.first_ms = l.meta.first_ms;
+    meta.answered = l.meta.answered.clone();
+    let folds = !view.to_fold(&l.id).is_empty();
+    if l.meta.fp == meta.fp && l.meta.hidden == meta.hidden && !folds {
+        return Decision::Quiet {
+            why: "the status comment already says this".into(),
+        };
+    }
+    Decision::Edit {
+        id: l.id.clone(),
+        body,
+        meta,
+    }
 }
 
 /// `HH:MM UTC` of a time in ms.
@@ -907,6 +960,13 @@ pub trait Channel: Send + Sync {
     async fn react(&self, to: &Heard, content: &str) -> Result<(), String> {
         let _ = (to, content);
         Err("no reactions here".into())
+    }
+    /// Hides CoderHelm's own comment as outdated (`hidden`), or shows it
+    /// again. Trackers without hiding say so; the comment's text already
+    /// says it is outdated.
+    async fn hide(&self, said: &Said, hidden: bool) -> Result<(), String> {
+        let _ = (said, hidden);
+        Err("no hiding here".into())
     }
 }
 
@@ -966,6 +1026,114 @@ pub fn sink_decision(decision: Decision, thread: &str) -> Decision {
     }
 }
 
+/// The house style, the last step before writing: every comment is laid
+/// out by `comment_style::render` and held to `comment_style::lint`. A new
+/// comment left with nothing to say is not posted; one that still breaks
+/// the style is not posted and is logged as a defect of its writer.
+pub fn style_decision(decision: Decision, place: &Place) -> Decision {
+    let markdown = place.markdown();
+    let check = |text: &str, max: usize| -> Result<String, String> {
+        let out = crate::comment_style::render_within(text, markdown, max);
+        let problems = crate::comment_style::lint(&out);
+        if problems.is_empty() {
+            Ok(out)
+        } else {
+            Err(problems
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; "))
+        }
+    };
+    let defect = |why: String| {
+        tracing::error!(thread = %place.key(), problems = %why, "comment style defect: a comment broke the style after rendering; not posted");
+        Decision::Quiet {
+            why: format!("the comment breaks the comment style: {why}"),
+        }
+    };
+    match decision {
+        Decision::Post { body, meta } => match check(&body, crate::comment_style::MAX_LINES) {
+            Ok(b) if b.is_empty() => Decision::Quiet {
+                why: "nothing left to say after the house style".into(),
+            },
+            Ok(body) => Decision::Post { body, meta },
+            Err(why) => defect(why),
+        },
+        Decision::Edit { id, body, meta } => match check(&body, crate::comment_style::MAX_LINES) {
+            Ok(b) if b.is_empty() => Decision::Edit {
+                id,
+                body: NOTHING_NOW.to_string(),
+                meta: Meta {
+                    hidden: true,
+                    ..meta
+                },
+            },
+            Ok(body) => Decision::Edit { id, body, meta },
+            Err(why) => defect(why),
+        },
+        Decision::Reply {
+            to,
+            others,
+            how,
+            ack,
+            text,
+            meta,
+        } => {
+            // The reply opens with one line naming the person; the
+            // acknowledgement takes one more.
+            let room = crate::comment_style::MAX_LINES - 1 - usize::from(!ack.trim().is_empty());
+            match check(&text, room) {
+                Ok(text) => Decision::Reply {
+                    to,
+                    others,
+                    how,
+                    ack: crate::comment_style::render_within(&ack, markdown, 1),
+                    text,
+                    meta,
+                },
+                Err(why) => defect(why),
+            }
+        }
+        d => d,
+    }
+}
+
+/// After the status comment `written` was written: CoderHelm's earlier
+/// status comments on the thread are folded into it (rewritten to
+/// [`FOLD_LINE`] and hidden as outdated; never deleted), and it is hidden
+/// when it says nothing anyone needs, or shown again when it does.
+async fn tidy_status(ch: &dyn Channel, view: &View, written: &str, meta: &Meta) {
+    let place = ch.place();
+    for old in view.to_fold(written) {
+        let folded = Meta {
+            outdated: true,
+            hidden: true,
+            parts: Vec::new(),
+            asks: Vec::new(),
+            ..old.meta.clone()
+        };
+        if let Err(e) = ch.edit(&old.id, FOLD_LINE, &folded).await {
+            tracing::warn!(thread = %place.key(), comment = %old.id, error = %e, "Could not fold an earlier status comment");
+            continue;
+        }
+        if let Err(e) = ch.hide(old, true).await {
+            tracing::info!(thread = %place.key(), comment = %old.id, error = %e, "Could not hide an earlier status comment; its text says it is outdated");
+        }
+    }
+    let was = view.said.iter().find(|s| s.id == written);
+    let was_hidden = was.is_some_and(|s| s.meta.hidden);
+    if meta.hidden != was_hidden || (meta.hidden && was.is_none()) {
+        let said = was.cloned().unwrap_or_else(|| Said {
+            id: written.to_string(),
+            meta: meta.clone(),
+            ..Default::default()
+        });
+        if let Err(e) = ch.hide(&said, meta.hidden).await {
+            tracing::info!(thread = %place.key(), comment = %written, error = %e, "Could not change whether the status comment is hidden");
+        }
+    }
+}
+
 /// [`speak`] for a reply to a person: when the guards decide to answer
 /// someone, `compose` writes the words from the thread and the run's
 /// records (`crate::reply_compose`), held to the same guards.
@@ -991,7 +1159,7 @@ pub async fn speak_with(
     if let Some(c) = compose {
         decision = Box::pin(crate::reply_compose::apply(c, &view, say, &place, decision)).await;
     }
-    let decision = sink_decision(decision, &place.key());
+    let decision = style_decision(sink_decision(decision, &place.key()), &place);
     match decision {
         Decision::Quiet { why } => {
             tracing::info!(thread = %place.key(), slot = %say.slot, why = %why, "Nothing new to say on the thread");
@@ -999,13 +1167,22 @@ pub async fn speak_with(
         }
         Decision::Edit { id, body, meta } => {
             let written = ch.edit(&id, &body, &meta).await?;
+            if say.is_status() {
+                tidy_status(ch, &view, &written, &meta).await;
+            }
             Ok(if written == id {
                 Spoke::Edited(id)
             } else {
                 Spoke::Posted(written)
             })
         }
-        Decision::Post { body, meta } => Ok(Spoke::Posted(ch.create(&body, &meta).await?)),
+        Decision::Post { body, meta } => {
+            let id = ch.create(&body, &meta).await?;
+            if say.is_status() {
+                tidy_status(ch, &view, &id, &meta).await;
+            }
+            Ok(Spoke::Posted(id))
+        }
         Decision::React { to, content } => {
             for h in &to {
                 if let Err(e) = ch.react(h, &content).await {
@@ -1028,11 +1205,20 @@ pub async fn speak_with(
                     let _ = ch.react(h, "eyes").await;
                 }
             }
-            let body = shape(
-                &reply_body(&to, &others, how, &ack, &text),
-                place.budget(),
-                place.markdown(),
-            );
+            // Laid out already (`style_decision`): no collapsed section added.
+            let body = no_arrows(&reply_body(&to, &others, how, &ack, &text));
+            let problems = crate::comment_style::lint(&body);
+            if !problems.is_empty() {
+                let why = problems
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                tracing::error!(thread = %place.key(), slot = %say.slot, problems = %why, "comment style defect: a reply broke the style after rendering; not posted");
+                return Ok(Spoke::Quiet(format!(
+                    "the reply breaks the comment style: {why}"
+                )));
+            }
             let id = ch.reply(&to, how, &body, &meta).await?;
             // An answer closes what they asked: a thumbs up on their
             // comments.
@@ -1096,30 +1282,16 @@ async fn judged(
     let Decision::Post { body, meta } = decision else {
         return decision;
     };
+    // A status never reaches here as a new comment while one exists: the
+    // model may only keep a reply-less post quiet.
     match v.action.as_str() {
         "quiet" => Decision::Quiet {
             why: "the model read it as a repeat of what is already on the thread".into(),
         },
-        "edit" => match view.latest() {
-            Some(l) => {
-                let mut m = meta;
-                m.history = l.meta.history.clone();
-                m.history
-                    .push(format!("{}: {}", clock(l.at_ms), l.meta.gist));
-                m.first_ms = l.meta.first_ms;
-                let keep = m.history.len().saturating_sub(MAX_HISTORY);
-                m.history.drain(..keep);
-                let text = format!("{body}\n\n{}", changed_line(&l.meta.gist, l.at_ms));
-                let _ = now_ms;
-                Decision::Edit {
-                    id: l.id.clone(),
-                    body: with_history(&text, &m.history, place.budget(), place.markdown()),
-                    meta: m,
-                }
-            }
-            None => Decision::Post { body, meta },
-        },
-        _ => Decision::Post { body, meta },
+        _ => {
+            let _ = (place, now_ms);
+            Decision::Post { body, meta }
+        }
     }
 }
 
@@ -1685,6 +1857,7 @@ mod tests {
                 ..Default::default()
             },
             body: String::new(),
+            node_id: format!("N{id}"),
         }
     }
 
@@ -1699,21 +1872,15 @@ mod tests {
     }
 
     #[test]
-    fn an_identical_retry_edits_and_never_posts() {
+    fn an_identical_retry_writes_nothing() {
         let body = "Already being fixed in #41. CoderHelm didn't build a second fix.";
         let view = View {
             said: vec![said("100", "run", body, T0)],
             heard: vec![],
         };
+        // The status comment already says it: no edit, no "Retried at".
         let d = decide(&view, &Say::status("run", body), &gh(), T0 + 3_600_000);
-        match d {
-            Decision::Edit { id, body, meta } => {
-                assert_eq!(id, "100");
-                assert!(body.contains("same result"), "{body}");
-                assert_eq!(meta.history.len(), 1);
-            }
-            other => panic!("{other:?}"),
-        }
+        assert!(matches!(d, Decision::Quiet { .. }), "{d:?}");
         // A note that repeats is not said at all.
         let d = decide(&view, &Say::note("run", body), &gh(), T0 + 3_600_000);
         assert!(matches!(d, Decision::Quiet { .. }), "{d:?}");
@@ -1732,7 +1899,7 @@ mod tests {
     }
 
     #[test]
-    fn a_status_that_moves_on_edits_one_comment_and_says_what_changed() {
+    fn a_status_that_moves_on_edits_one_comment_with_only_what_is_true_now() {
         let view = View {
             said: vec![said("100", "run", "Started work on this ticket.", T0)],
             heard: vec![],
@@ -1747,13 +1914,13 @@ mod tests {
             panic!("{d:?}")
         };
         assert_eq!(id, "100");
-        assert!(body.starts_with("Opened #52"), "{body}");
-        assert!(body.contains("This replaces what I wrote at"), "{body}");
-        assert!(meta.history[0].contains("Started work on this ticket"));
+        assert_eq!(body, "Opened #52 for this ticket.");
+        assert!(meta.history.is_empty(), "{meta:?}");
+        assert_eq!(meta.parts.len(), 1);
     }
 
     #[test]
-    fn a_contradiction_states_what_changed() {
+    fn a_changed_status_never_names_its_earlier_version() {
         let view = View {
             said: vec![said(
                 "100",
@@ -1772,11 +1939,8 @@ mod tests {
         let Decision::Edit { body, .. } = d else {
             panic!("{d:?}")
         };
-        assert!(
-            body.contains("This replaces what I wrote at")
-                && body.contains("Already being fixed in #41"),
-            "{body}"
-        );
+        assert_eq!(body, "The run failed: the sandbox could not start.");
+        assert!(!body.contains("This replaces") && !body.contains("History"));
     }
 
     #[test]
@@ -1800,7 +1964,7 @@ mod tests {
         };
         let d = decide(
             &view,
-            &Say::status("run", "Changed the orders endpoint and opened #52."),
+            &Say::reply_all("run", "Changed the orders endpoint and opened #52."),
             &gh(),
             T0 + 2_000,
         );
@@ -1925,7 +2089,7 @@ mod tests {
         // Something to say: a reply that quotes and names them.
         let d = decide(
             &view,
-            &Say::status("run", "Covered the empty case in #52."),
+            &Say::reply_all("run", "Covered the empty case in #52."),
             &gh(),
             T0 + 1,
         );
@@ -1959,7 +2123,7 @@ mod tests {
         };
         let d = decide(
             &view,
-            &Say::status("run", "Switched to the staging bucket."),
+            &Say::reply_all("run", "Switched to the staging bucket."),
             &Place::jira("ABC-1"),
             T0 + 1,
         );
@@ -2048,7 +2212,7 @@ mod tests {
     }
 
     #[test]
-    fn new_comments_are_rate_limited_into_an_edit() {
+    fn every_status_and_note_goes_in_one_comment() {
         let mut view = View::default();
         for (i, s) in ["a", "b", "c"].iter().enumerate() {
             view.said.push(said(
@@ -2068,6 +2232,17 @@ mod tests {
             matches!(d, Decision::Edit { ref id, .. } if id == "2"),
             "{d:?}"
         );
+        // The two older ones are folded into it.
+        let folded: Vec<&str> = view.to_fold("2").iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(folded, vec!["0", "1"]);
+        // On a fresh thread a status is posted once.
+        let d = decide(
+            &View::default(),
+            &Say::note("d", "Something else entirely."),
+            &gh(),
+            T0,
+        );
+        assert!(matches!(d, Decision::Post { .. }), "{d:?}");
     }
 
     #[test]
@@ -2306,6 +2481,13 @@ mod tests {
                 .push(format!("react {} {content}", to.id));
             Ok(())
         }
+        async fn hide(&self, said: &Said, hidden: bool) -> Result<(), String> {
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("hide {} {hidden}", said.id));
+            Ok(())
+        }
     }
 
     struct Model(Judged);
@@ -2333,7 +2515,8 @@ mod tests {
             1,
             "{log:?}"
         );
-        assert_eq!(log.iter().filter(|l| l.starts_with("edit")).count(), 2);
+        // Nothing changed: nothing is rewritten either.
+        assert_eq!(log.iter().filter(|l| l.starts_with("edit")).count(), 0);
     }
 
     #[tokio::test]
@@ -2357,7 +2540,7 @@ mod tests {
         let out = speak(
             &ch,
             Some(&quiet),
-            &Say::status("run", "Pushed the docs change to #52."),
+            &Say::reply("run", "Pushed the docs change to #52.", Vec::new()),
             T0 + 20,
         )
         .await
@@ -2391,7 +2574,7 @@ mod tests {
         speak(
             &ch2,
             Some(&good),
-            &Say::status("run", "Pushed the docs change to #52."),
+            &Say::reply("run", "Pushed the docs change to #52.", Vec::new()),
             T0 + 20,
         )
         .await
@@ -2402,5 +2585,136 @@ mod tests {
             reply.contains("Kim, you asked for the docs page too"),
             "{l:?}"
         );
+    }
+
+    /// The deploy and outside-work comments a pull request got, with generic
+    /// names, as CoderHelm's own status comments on the thread.
+    fn spammed_thread() -> View {
+        let deploy = Said {
+            body: crate::comment_style::tests_fixtures::DEPLOY_BEFORE.to_string(),
+            ..said("500", "release_steps", "x", T0)
+        };
+        let outside = Said {
+            body: crate::comment_style::tests_fixtures::OUTSIDE_BEFORE.to_string(),
+            ..said("501", "also_outside", "y", T0 + 1_000)
+        };
+        View {
+            said: vec![deploy, outside],
+            heard: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn the_spammed_pull_request_ends_with_one_short_comment() {
+        let ch = Fake {
+            view: std::sync::Mutex::new(spammed_thread()),
+            log: Default::default(),
+        };
+        // The outside-work status again: its only person items are testing,
+        // which is CoderHelm's own work, and the rest is plan status.
+        let out = speak(
+            &ch,
+            None,
+            &Say::status(
+                "also_outside",
+                crate::comment_style::tests_fixtures::OUTSIDE_BEFORE,
+            ),
+            T0 + 5_000,
+        )
+        .await
+        .unwrap();
+        let log = ch.log.lock().unwrap().clone();
+        assert!(!log.iter().any(|l| l.starts_with("create")), "{log:?}");
+        // The live comment now says nothing is needed and is hidden; the
+        // older one is folded and hidden; nothing is deleted.
+        assert!(
+            matches!(out, Spoke::Edited(ref id) if id == "501"),
+            "{out:?}"
+        );
+        assert!(log.contains(&format!("edit 501: {NOTHING_NOW}")), "{log:?}");
+        assert!(log.contains(&format!("edit 500: {FOLD_LINE}")), "{log:?}");
+        assert!(log.contains(&"hide 500 true".to_string()), "{log:?}");
+        assert!(log.contains(&"hide 501 true".to_string()), "{log:?}");
+        // A later status for nobody writes nothing more.
+        let n = log.len();
+        let out = speak(
+            &ch,
+            None,
+            &Say::status("run", "Working on it.").for_nobody(),
+            T0 + 6_000,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(out, Spoke::Quiet(_)), "{out:?}");
+        assert_eq!(ch.log.lock().unwrap().len(), n);
+    }
+
+    #[tokio::test]
+    async fn a_real_person_item_is_one_short_line_in_the_one_comment() {
+        let ch = Fake {
+            view: std::sync::Mutex::new(spammed_thread()),
+            log: Default::default(),
+        };
+        let body = "Done outside the code: Open the PR ready for review.\nCoderHelm does the other 4 step(s) itself.\n**Needed from you:** One paid registration on real devices. CoderHelm cannot: No real devices or payment method. (QA)";
+        speak(&ch, None, &Say::status("also_outside", body), T0 + 5_000)
+            .await
+            .unwrap();
+        let log = ch.log.lock().unwrap().clone();
+        let edit = log.iter().find(|l| l.starts_with("edit 501:")).unwrap();
+        let text = edit.trim_start_matches("edit 501: ");
+        assert!(crate::comment_style::lint(text).is_empty(), "{text}");
+        assert_eq!(text.lines().count(), 1, "{text}");
+        assert!(
+            text.contains("One paid registration on real devices"),
+            "{text}"
+        );
+        assert!(!log.iter().any(|l| l.starts_with("create")), "{log:?}");
+        assert!(!log.contains(&"hide 501 true".to_string()), "{log:?}");
+    }
+
+    #[test]
+    fn a_status_for_nobody_is_never_posted() {
+        let d = decide(
+            &View::default(),
+            &Say::status("run", "Working on it: planning.").for_nobody(),
+            &gh(),
+            T0,
+        );
+        assert!(matches!(d, Decision::Quiet { .. }), "{d:?}");
+        // Text the style empties (plan status only) is status for nobody too.
+        let d = decide(
+            &View::default(),
+            &Say::status(
+                "release_steps",
+                crate::comment_style::tests_fixtures::DEPLOY_BEFORE,
+            ),
+            &gh(),
+            T0,
+        );
+        assert!(matches!(d, Decision::Quiet { .. }), "{d:?}");
+    }
+
+    #[test]
+    fn every_written_comment_keeps_the_style() {
+        let long = (1..=12)
+            .map(|i| format!("- Line {i} with some words in it for the reader."))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for d in [
+            decide(&View::default(), &Say::status("run", &long), &gh(), T0),
+            decide(
+                &View::default(),
+                &Say::status("run", "Took 3 attempt(s)."),
+                &gh(),
+                T0,
+            ),
+        ] {
+            match style_decision(d, &gh()) {
+                Decision::Post { body, .. } => {
+                    assert!(crate::comment_style::lint(&body).is_empty(), "{body}")
+                }
+                other => panic!("{other:?}"),
+            }
+        }
     }
 }
