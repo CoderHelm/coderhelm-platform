@@ -600,6 +600,9 @@ struct RunBits {
     preview: Option<common::preview::State>,
     /// What the pull request waits on, one line (`waiting_line`).
     waiting: String,
+    /// Each criterion's end-to-end test on staging and the preview
+    /// (`e2e_proof`).
+    two_way: Vec<common::e2e_proof::Proof>,
     /// The scope decided at plan time (`common::scope_ledger`).
     scope: Option<common::scope_ledger::Ledger>,
 }
@@ -661,6 +664,7 @@ impl Gathered {
         });
         let preview = self.run.preview.as_ref().filter(|p| p.head == self.head());
         super::description_facts::with_preview(&mut f, preview);
+        super::description_facts::with_two_way(&mut f, &self.run.two_way);
         super::description_facts::with_scope(&mut f, self.run.scope.as_ref(), &self.files);
         f.waiting = self.run.waiting.clone();
         f.e2e_screens = self.screens.clone();
@@ -724,6 +728,7 @@ async fn run_bits(
             ticket_url,
             preview: common::preview::State::from_json(&get(common::preview::FIELD)),
             waiting: waiting_of(&item, number),
+            two_way: common::e2e_proof::from_json(&get(common::e2e_proof::FIELD)),
             scope: item
                 .get(common::scope_ledger::FIELD)
                 .and_then(|v| v.as_s().ok())

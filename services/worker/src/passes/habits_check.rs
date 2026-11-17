@@ -252,6 +252,33 @@ pub fn scoped_cmd(base_cmd: &str, file: &str) -> Option<String> {
         .map(|c| c.replace(" --passWithNoTests", ""))
 }
 
+/// The command that runs one test file on its own: the CI test command
+/// CoderHelm knows, narrowed to the file, else the file run the way the CI
+/// job's test step runs it (`TestEnv::file_command`). `Err` says why none
+/// can, and the test is then recorded as not run, never as passing.
+pub fn file_cmd(
+    ci_cmd: Option<&str>,
+    env: Option<&common::test_env::TestEnv>,
+    file: &str,
+) -> Result<String, String> {
+    if let Some(c) = ci_cmd.and_then(|c| scoped_cmd(c, file)) {
+        return Ok(c);
+    }
+    if let Some(c) = env.and_then(|e| e.file_command(file)) {
+        return Ok(c);
+    }
+    Err(match (ci_cmd, env) {
+        (Some(c), _) => format!("the test command `{c}` can't be narrowed to `{file}`"),
+        (None, Some(e)) => format!(
+            "the CI test step ({}) doesn't run `{file}` on its own",
+            e.source
+        ),
+        (None, None) => {
+            "the repository's CI runs no unit test command CoderHelm can read".to_string()
+        }
+    })
+}
+
 /// The output of each failing step of a sandbox script, in step order.
 pub fn failing_outputs(output: &str, kind: &str) -> Vec<String> {
     let mark = format!("--- {kind} failed (exit ");
@@ -469,6 +496,10 @@ fn repro_waived(plan: &PlanResult) -> bool {
         .is_some_and(|d| !d.habits.repro.not_feasible.trim().is_empty())
 }
 
+/// The pull request's line for a bug fix that no test was shown to fail on
+/// the base for.
+pub const UNVERIFIED_FIX: &str = "Unverified: no test of this fix was shown to fail on the base code, so the reported failure is not reproduced here.";
+
 /// The line for a change no changed test proves.
 pub const UNPROVEN: &str = "No changed test fails without the change, so nothing proves it. Write a test that fails on the base code and passes with the change (a unit test, or an end-to-end spec when the behaviour is what a person sees in the browser), through code that exists on the base.";
 
@@ -616,6 +647,11 @@ pub fn open_findings(f: &PrFacts, plan: &PlanResult) -> Vec<Finding> {
                     w.point(),
                     "CoderHelm makes the change smaller in its next round on this pull request.",
                 )
+            } else if l.contains("what a person asked for is never reverted") {
+                (
+                    "A person's ask taken out",
+                    "CoderHelm puts it back in its next round on this pull request.",
+                )
             } else if l.contains("decided is out of scope") {
                 (
                     "Out of scope brought back",
@@ -701,6 +737,12 @@ pub fn section(plan: &PlanResult, f: &PrFacts) -> String {
         });
         for t in &f.tests {
             out.push_str(&test_line(t));
+            out.push('\n');
+        }
+        // A bug fix no test was shown to fail on the base for says so, in
+        // so many words: it is unverified, never quietly proven by CI.
+        if f.bug && !f.tests.iter().any(|t| t.verdict == Verdict::Proven) {
+            out.push_str(UNVERIFIED_FIX);
             out.push('\n');
         }
         out.push('\n');
@@ -916,9 +958,7 @@ const KIND: &str = "unit";
 impl Bench for SandboxBench<'_> {
     async fn run(&self, files: &[String]) -> Result<Runs, String> {
         let r = &self.runner;
-        let base_cmd = super::detect_ci_test(r.github, r.owner, r.repo, self.base_branch)
-            .await
-            .ok_or("the repository's CI runs no unit test command CoderHelm can read")?;
+        let ci_cmd = super::detect_ci_test(r.github, r.owner, r.repo, self.base_branch).await;
         let mut steps: Vec<Step> = Vec::new();
         let tree: Vec<String> = r
             .github
@@ -928,6 +968,16 @@ impl Bench for SandboxBench<'_> {
             .into_iter()
             .map(|e| e.path)
             .collect();
+        // A test step CoderHelm's runner list doesn't know (a loop running
+        // each file with `python`) still runs the file the way CI does.
+        let narrowed = |f: &String| ci_cmd.as_deref().and_then(|c| scoped_cmd(c, f));
+        let env = if files.iter().all(|f| narrowed(f).is_some()) {
+            None
+        } else {
+            let workflows =
+                super::preview::workflows(r.github, r.owner, r.repo, self.base_branch).await;
+            common::test_env::from_workflows_for(&workflows, &tree, files)
+        };
         let install: Vec<Step> = files
             .first()
             .and_then(|f| test_package::package_of(&tree, f, &|_| None))
@@ -937,9 +987,7 @@ impl Bench for SandboxBench<'_> {
         let installs = install.len();
         steps.extend(install);
         for f in files {
-            let cmd = scoped_cmd(&base_cmd, f).ok_or_else(|| {
-                format!("the test command `{base_cmd}` can't be narrowed to one file")
-            })?;
+            let cmd = file_cmd(ci_cmd.as_deref(), env.as_ref(), f)?;
             steps.push(Step { kind: KIND, cmd });
         }
         let head = r
@@ -1196,10 +1244,17 @@ async fn check_and_fix(
         // A page whose state a test branch reads is probed again while
         // there is time: an arm that couldn't run before is re-checked.
         facts.live = super::live_guard::facts_for(w, &diff, &evidence.notes, !short).await;
-        let mut ledger =
-            super::scope_ledger::load_or_seed(w.state, &w.msg.team_id, w.run_id, w.msg, w.plan)
-                .await;
         let comments = super::scope_ledger::comments(w.github, w.msg, w.branch).await;
+        let people = super::scope_ledger::people(w.msg, &comments);
+        let mut ledger = super::scope_ledger::load_or_seed(
+            w.state,
+            &w.msg.team_id,
+            w.run_id,
+            w.msg,
+            w.plan,
+            &people,
+        )
+        .await;
         facts.out_of_scope = super::scope_ledger::held(
             w.state,
             &w.msg.team_id,
@@ -1207,6 +1262,7 @@ async fn check_and_fix(
             &mut ledger,
             &evidence.notes,
             &super::scope_ledger::sources(w.msg, &comments),
+            &people,
             &diff,
         )
         .await;

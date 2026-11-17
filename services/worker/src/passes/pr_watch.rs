@@ -824,16 +824,35 @@ async fn preview(state: &WorkerState, github: &GitHubClient, c: &Candidate) -> P
     let Some(mut st) = super::preview::advance(state, github, p, &pr).await else {
         return Performed::NotStarted;
     };
-    if st.stage == common::preview::Stage::Ready
-        && !CAPTURING.swap(true, std::sync::atomic::Ordering::SeqCst)
+    let mut proved = false;
+    if matches!(
+        st.stage,
+        common::preview::Stage::Ready | common::preview::Stage::Checked
+    ) && !CAPTURING.swap(true, std::sync::atomic::Ordering::SeqCst)
     {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(9 * 60);
-        super::preview::capture(state, github, p, &mut st, Some(deadline)).await;
+        if st.stage == common::preview::Stage::Ready {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(9 * 60);
+            super::preview::capture(state, github, p, &mut st, Some(deadline)).await;
+        }
+        // Each criterion's end-to-end test, on staging and on the preview
+        // (`e2e_proof`), once per head; what it sends back is a fix round.
+        let branch = pr["head"]["ref"].as_str().unwrap_or("").to_string();
+        let (proofs, fresh) = super::e2e_proof::prove(state, github, p, &st, &branch).await;
         CAPTURING.store(false, std::sync::atomic::Ordering::SeqCst);
+        proved = fresh;
+        let items = common::e2e_proof::coder_items(&proofs, &st.head);
+        if fresh && !items.is_empty() {
+            let queued = super::resume::queue_own_review_round(
+                state, github, &c.team_id, &c.run_id, &st.head, &items,
+            )
+            .await;
+            info!(run_id = %c.run_id, pr = c.pr, items = items.len(), queued = ?matches!(queued, super::resume::OwnRound::Fixing), "PR watch: the two-way proof sent work back to the coder");
+        }
     }
-    let moved = before.as_ref().is_none_or(|b| {
-        b.head != st.head || b.stage != st.stage || b.shots != st.shots || b.checks != st.checks
-    });
+    let moved = proved
+        || before.as_ref().is_none_or(|b| {
+            b.head != st.head || b.stage != st.stage || b.shots != st.shots || b.checks != st.checks
+        });
     if moved {
         info!(run_id = %c.run_id, pr = c.pr, stage = ?st.stage, "PR watch: the preview moved; the description follows");
         super::description::rebuild_run(

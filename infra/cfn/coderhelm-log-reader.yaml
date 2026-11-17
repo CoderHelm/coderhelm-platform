@@ -7,7 +7,12 @@ Description: >
   InfrastructureVulnerabilities "on" it also reads, read-only, which versions
   your EC2, EKS, RDS, ElastiCache and OpenSearch resources run. With
   ApplyMaintenance "on" it may also apply a pending RDS or Aurora
-  maintenance action that a person approved in CoderHelm.
+  maintenance action that a person approved in CoderHelm. With WafLogs "on"
+  it reads your AWS WAF logs in S3 through Athena, writing query results
+  only under WafLogResults. With DatabaseClusters or Warehouses it queries
+  those databases and warehouses as their read-only user. Every read is
+  declared here, by group; a CoderHelm release reaches this role only
+  through an update you create from its template.
   This role uses an External ID to prevent confused deputy attacks.
 
 Parameters:
@@ -108,6 +113,63 @@ Parameters:
       own ApplyPendingMaintenanceAction, only on this account's database
       clusters and instances. Nothing is applied without that approval.
 
+  WafLogs:
+    Type: String
+    Default: "off"
+    AllowedValues: ["off", "on"]
+    Description: >
+      "on" lets CoderHelm read what an AWS WAF web ACL logs to S3 (the
+      aws-waf-logs-* buckets, the names AWS requires) when a WAF alarm on
+      one of your alert routes fires: the log objects, the Glue table
+      definitions Athena needs, and your Athena workgroups' settings. With
+      WafLogResults set it also runs read-only Athena queries over those
+      logs, writing their results only under that location. Every change to
+      WAF, Athena, Glue or a bucket is denied.
+
+  WafLogResults:
+    Type: String
+    Default: ""
+    Description: >
+      Where the Athena workgroup that queries your WAF logs writes query
+      results: its "Query result location" without s3:// (bucket/prefix/).
+      CoderHelm fills it in from the workgroup when it can. Empty: no Athena
+      query and nothing written anywhere.
+    AllowedPattern: "^(|[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]/[A-Za-z0-9!_.'()=/-]*)$"
+    ConstraintDescription: A bucket name, a slash and a prefix (bucket/prefix/), or empty.
+
+  WafLogKey:
+    Type: String
+    Default: ""
+    Description: >
+      The ARN of the customer-managed KMS key the WAF log bucket is
+      encrypted with, if it is. CoderHelm fills it in from the bucket's
+      default encryption. The role may decrypt with it only through S3, so
+      only objects it may read anyway. Empty: none (SSE-S3 needs nothing).
+    AllowedPattern: "^(|arn:aws:kms:[a-z0-9-]+:[0-9]{12}:key/[a-f0-9-]{36})$"
+    ConstraintDescription: A KMS key ARN, or empty.
+
+  DatabaseClusters:
+    Type: String
+    Default: ""
+    Description: >
+      Aurora PostgreSQL clusters CoderHelm may query as the read-only
+      database user coderhelm_readonly (their ARNs separated by commas),
+      through the RDS Data API inside transactions that are always rolled
+      back. The user and its password secret (coderhelm-readonly-*) are made
+      by the data source setup on Settings, Data sources, AWS. Empty: none.
+    AllowedPattern: "^(|arn:aws:rds:[a-z0-9-]+:[0-9]{12}:cluster:[a-z][a-z0-9-]{0,62}(,arn:aws:rds:[a-z0-9-]+:[0-9]{12}:cluster:[a-z][a-z0-9-]{0,62})*)$"
+    ConstraintDescription: Aurora cluster ARNs separated by commas, or empty.
+
+  Warehouses:
+    Type: String
+    Default: ""
+    Description: >
+      Redshift clusters CoderHelm may query, signed in only as the
+      passwordless read-only user coderhelm_readonly (their names separated
+      by commas). Empty: none.
+    AllowedPattern: "^(|[a-z][a-z0-9-]{0,62}(,[a-z][a-z0-9-]{0,62})*)$"
+    ConstraintDescription: Redshift cluster names separated by commas, or empty.
+
 Conditions:
   ReadsKnowledgeBases: !Not [!Equals [!Ref KnowledgeBases, ""]]
   ReadsEveryKnowledgeBase: !Equals [!Ref KnowledgeBases, "all"]
@@ -118,6 +180,12 @@ Conditions:
   ReadsInspector: !Equals [!Ref InspectorFindings, "on"]
   ReadsHealth: !Equals [!Ref HealthEvents, "on"]
   AppliesMaintenance: !Equals [!Ref ApplyMaintenance, "on"]
+  ReadsWafLogs: !Equals [!Ref WafLogs, "on"]
+  QueriesWafLogs: !And [!Condition ReadsWafLogs, !Not [!Equals [!Ref WafLogResults, ""]]]
+  NoWafLogQueries: !And [!Condition ReadsWafLogs, !Equals [!Ref WafLogResults, ""]]
+  DecryptsWafLogs: !And [!Condition ReadsWafLogs, !Not [!Equals [!Ref WafLogKey, ""]]]
+  ReadsDatabases: !Not [!Equals [!Ref DatabaseClusters, ""]]
+  ReadsWarehouses: !Not [!Equals [!Ref Warehouses, ""]]
 
 Resources:
   CoderHelmLogReaderRole:
@@ -465,6 +533,188 @@ Resources:
                     - "health:DescribeEvents"
                     - "health:DescribeAffectedEntities"
                     - "health:DescribeEventDetails"
+                  Resource: "*"
+          - !Ref AWS::NoValue
+
+        # AWS WAF logs in S3, only when WafLogs is "on" (an alert route takes
+        # WAF alarms): the log objects, the table definitions and workgroup
+        # settings Athena needs, and, with WafLogResults, read-only queries whose
+        # results are written only there (the role's one write, held there by a
+        # deny). Everything that changes WAF, Athena, Glue or a bucket is denied.
+        - !If
+          - ReadsWafLogs
+          - PolicyName: WafLogsReadOnly
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Sid: ReadWafLogObjects
+                  Effect: Allow
+                  Action:
+                    - "s3:GetObject"
+                  Resource: "arn:aws:s3:::aws-waf-logs-*/*"
+                - Sid: ListWafLogBuckets
+                  Effect: Allow
+                  Action:
+                    - "s3:ListBucket"
+                    - "s3:GetBucketLocation"
+                  Resource: "arn:aws:s3:::aws-waf-logs-*"
+                # Table definitions only (names, columns, where the data is): Athena
+                # reads them to plan a query. The data itself is readable only in the
+                # aws-waf-logs-* buckets above.
+                - Sid: FindWafLogTables
+                  Effect: Allow
+                  Action:
+                    - "glue:GetDatabases"
+                    - "glue:GetDatabase"
+                    - "glue:GetTables"
+                    - "glue:GetTable"
+                    - "glue:GetPartitions"
+                  Resource:
+                    - !Sub "arn:aws:glue:*:${AWS::AccountId}:catalog"
+                    - !Sub "arn:aws:glue:*:${AWS::AccountId}:database/*"
+                    - !Sub "arn:aws:glue:*:${AWS::AccountId}:table/*/*"
+                # Which workgroup queries the logs and where it writes its results.
+                - Sid: FindWafLogWorkgroups
+                  Effect: Allow
+                  Action:
+                    - "athena:ListWorkGroups"
+                    - "athena:GetWorkGroup"
+                  Resource: "*"
+                - !If
+                  - QueriesWafLogs
+                  - Sid: QueryWafLogs
+                    Effect: Allow
+                    Action:
+                      - "athena:StartQueryExecution"
+                      - "athena:GetQueryExecution"
+                      - "athena:GetQueryResults"
+                      - "athena:StopQueryExecution"
+                    Resource: !Sub "arn:aws:athena:*:${AWS::AccountId}:workgroup/*"
+                  - !Ref AWS::NoValue
+                - !If
+                  - QueriesWafLogs
+                  - Sid: WriteQueryResultsOnly
+                    Effect: Allow
+                    Action:
+                      - "s3:PutObject"
+                      - "s3:GetObject"
+                    Resource: !Sub "arn:aws:s3:::${WafLogResults}*"
+                  - !Ref AWS::NoValue
+                - !If
+                  - QueriesWafLogs
+                  - Sid: FindQueryResults
+                    Effect: Allow
+                    Action:
+                      - "s3:ListBucket"
+                      - "s3:GetBucketLocation"
+                    Resource: !Sub
+                      - "arn:aws:s3:::${Bucket}"
+                      - Bucket: !Select [0, !Split ["/", !Ref WafLogResults]]
+                  - !Ref AWS::NoValue
+                - !If
+                  - QueriesWafLogs
+                  - Sid: NoWritesButQueryResults
+                    Effect: Deny
+                    Action: ["s3:PutObject"]
+                    NotResource: !Sub "arn:aws:s3:::${WafLogResults}*"
+                  - !Ref AWS::NoValue
+                - !If
+                  - NoWafLogQueries
+                  - Sid: NoWrites
+                    Effect: Deny
+                    Action: ["s3:PutObject"]
+                    Resource: "*"
+                  - !Ref AWS::NoValue
+                - !If
+                  - DecryptsWafLogs
+                  - Sid: DecryptWafLogsThroughS3
+                    Effect: Allow
+                    Action:
+                      - "kms:Decrypt"
+                    Resource: !Ref WafLogKey
+                    Condition:
+                      StringLike:
+                        kms:ViaService: "s3.*.amazonaws.com"
+                  - !Ref AWS::NoValue
+                - Sid: NeverChangeWafOrItsLogs
+                  Effect: Deny
+                  Action: ["wafv2:Create*", "wafv2:Update*", "wafv2:Delete*", "wafv2:Put*", "wafv2:Associate*", "wafv2:Disassociate*", "wafv2:Tag*", "wafv2:Untag*", "athena:Create*", "athena:Update*", "athena:Delete*", "athena:Put*", "athena:Import*", "athena:Tag*", "athena:Untag*", "glue:Create*", "glue:Update*", "glue:Delete*", "glue:Put*", "glue:BatchCreate*", "glue:BatchDelete*", "glue:BatchUpdate*", "glue:GetConnection*", "s3:Delete*", "s3:PutBucket*", "s3:PutObjectAcl*", "s3:PutObjectTagging*"]
+                  Resource: "*"
+          - !Ref AWS::NoValue
+        # Databases, only those named in DatabaseClusters: queries as the
+        # read-only database user inside transactions that are rolled back, never
+        # committed; the only secret readable is that user's password.
+        - !If
+          - ReadsDatabases
+          - PolicyName: DatabasesReadOnly
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Sid: QueryChosenDatabases
+                  Effect: Allow
+                  Action:
+                    - "rds-data:BeginTransaction"
+                    - "rds-data:ExecuteStatement"
+                    - "rds-data:RollbackTransaction"
+                  Resource: !Split [",", !Ref DatabaseClusters]
+                - Sid: ReadOnlyUserPassword
+                  Effect: Allow
+                  Action:
+                    - "secretsmanager:GetSecretValue"
+                  Resource: !Sub "arn:aws:secretsmanager:*:${AWS::AccountId}:secret:coderhelm-readonly-*"
+                - Sid: NeverCommit
+                  Effect: Deny
+                  Action: ["rds-data:CommitTransaction", "rds-data:BatchExecuteStatement"]
+                  Resource: "*"
+          - !Ref AWS::NoValue
+        # Warehouses, only those named in Warehouses: signed in only as the
+        # passwordless read-only user, single statements, its own results.
+        - !If
+          - ReadsWarehouses
+          - PolicyName: WarehousesReadOnly
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Sid: SignInAsTheReadOnlyUser
+                  Effect: Allow
+                  Action:
+                    - "redshift:GetClusterCredentials"
+                  Resource: !Split
+                    - ","
+                    - !Sub
+                      - "arn:aws:redshift:*:*:dbuser:${Ids}/coderhelm_readonly"
+                      - Ids: !Join ["/coderhelm_readonly,arn:aws:redshift:*:*:dbuser:", !Split [",", !Ref Warehouses]]
+                - Sid: IntoTheirDatabases
+                  Effect: Allow
+                  Action:
+                    - "redshift:GetClusterCredentials"
+                  Resource: !Split
+                    - ","
+                    - !Sub
+                      - "arn:aws:redshift:*:*:dbname:${Ids}/*"
+                      - Ids: !Join ["/*,arn:aws:redshift:*:*:dbname:", !Split [",", !Ref Warehouses]]
+                - Sid: RunOneStatement
+                  Effect: Allow
+                  Action:
+                    - "redshift-data:ExecuteStatement"
+                  Resource: !Split
+                    - ","
+                    - !Sub
+                      - "arn:aws:redshift:*:*:cluster:${Ids}"
+                      - Ids: !Join [",arn:aws:redshift:*:*:cluster:", !Split [",", !Ref Warehouses]]
+                - Sid: ReadOwnResults
+                  Effect: Allow
+                  Action:
+                    - "redshift-data:DescribeStatement"
+                    - "redshift-data:GetStatementResult"
+                    - "redshift-data:CancelStatement"
+                  Resource: "*"
+                  Condition:
+                    StringEquals:
+                      redshift-data:statement-owner-iam-userid: "${aws:userid}"
+                - Sid: NothingElseInTheWarehouse
+                  Effect: Deny
+                  Action: ["redshift-data:BatchExecuteStatement", "redshift:CreateClusterUser", "redshift:GetClusterCredentialsWithIAM", "redshift:ModifyCluster*", "redshift:Delete*"]
                   Resource: "*"
           - !Ref AWS::NoValue
 

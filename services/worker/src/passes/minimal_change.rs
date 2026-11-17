@@ -15,6 +15,13 @@
 //!   list, constant table or helper whose name shares its words with an
 //!   existing one in the same file (or another changed file). Extend the
 //!   existing one.
+//! - **Twin helpers in one change** ([`Kind::Twin`]): two new top-level
+//!   helpers in the same diff whose names parallel each other, or whose
+//!   signatures and bodies nearly match ([`twin_helpers`]). The parallel
+//!   check above compares a new definition with the code that was already
+//!   there, so three near-identical helpers added together passed it: one
+//!   change once added `slugToIds`, `dedupeSportsBySlug` and
+//!   `dedupeSportOptionsBySlug` side by side. Share the logic in one.
 //! - **Replacing where the base was additive** ([`Kind::Replacing`]): the
 //!   diff adds deleting or overwriting semantics (`DELETE`, `ON CONFLICT DO
 //!   UPDATE`, `TRUNCATE TABLE`, `REPLACE INTO`, an ORM delete) the base
@@ -50,12 +57,14 @@ pub type Diff = [(String, String, String)];
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
     Parallel,
+    Twin,
     Replacing,
     LogLevel,
     Reporting,
     TestSize,
     InventedPayload,
     MadeUpIds,
+    WholePath,
 }
 
 /// One way the change is wider than its ticket.
@@ -72,12 +81,14 @@ impl Widening {
     pub fn point(&self) -> &'static str {
         match self.kind {
             Kind::Parallel => "A parallel structure next to an existing one",
+            Kind::Twin => "Near-identical helpers added together",
             Kind::Replacing => "Deletes or overwrites where the code only added",
             Kind::LogLevel => "A log level changed",
             Kind::Reporting => "Reporting the ticket doesn't ask for",
             Kind::TestSize => "A test out of proportion to the change",
             Kind::InventedPayload => "A test payload nobody observed",
             Kind::MadeUpIds => "Made-up ids where the run looked up real ones",
+            Kind::WholePath => "A whole code path rewritten for a few named records",
         }
     }
 
@@ -104,6 +115,10 @@ impl Widening {
                 "`{}` adds {}. Extend the existing one (add the entries or the parameter there) and remove the new one.",
                 self.path, self.what
             ),
+            Kind::Twin => format!(
+                "`{}` adds {}. Keep one helper with the shared logic (a parameter for what differs) and call it from both places.",
+                self.path, self.what
+            ),
             Kind::Replacing => format!(
                 "`{}` now deletes or overwrites stored data ({}) where the base only added, and the ticket doesn't ask for that. Keep the write additive (insert, `ON CONFLICT DO NOTHING`) and remove the delete or overwrite.",
                 self.path, self.what
@@ -127,6 +142,10 @@ impl Widening {
             Kind::MadeUpIds => format!(
                 "`{}` uses made-up ids ({}) while this run looked up the real records' ids. Use the ids the lookups returned, so the test is about the records the bug is about.",
                 self.path, self.what
+            ),
+            Kind::WholePath => format!(
+                "The change rewrites how every record of its kind is processed ({}), while the ticket names only a few. Narrow it to those records and things exactly like them: fix the lookup, table or mapping they go through (its matching or its entries) and leave the shared path as it is.",
+                self.what
             ),
         };
         format!("{what}{why}")
@@ -332,9 +351,16 @@ pub fn top_level_def(line: &str, path: &str) -> Option<Def> {
             let name = ident(decl)?;
             let rhs = decl.split_once('=')?.1.trim_start();
             let rhs_l = rhs.to_lowercase();
+            // A generic arrow function: `<T extends X>(items: T[]) =>`, its
+            // parameters often on the next lines.
+            let generic_arrow = rhs_l.starts_with('<')
+                && (rhs_l.contains("=>")
+                    || rhs_l.contains(">(")
+                    || rhs_l.trim_end().ends_with('('));
             if rhs_l.starts_with("(") && (rhs_l.contains("=>") || rhs_l.starts_with("(async"))
                 || rhs_l.starts_with("async")
                 || rhs_l.starts_with("function")
+                || generic_arrow
             {
                 return Some(Def {
                     name,
@@ -447,6 +473,12 @@ pub fn parallel_in_edit(path: &str, old: &str, new: &str) -> Vec<(Def, Def)> {
 /// The parallel structures a diff adds: new top-level definitions next to
 /// a similar existing one in the same file's base (`base`, by path) or its
 /// patch's context, or in another changed file's base.
+///
+/// Both sides are checked against the base: a definition the base already
+/// has is never new (a changed signature shows as removed and added), and
+/// when the file's base was read, "existing" means on the base. A review
+/// once called a function that had been on the main branch for months the
+/// new one, beside the builder the branch had really added.
 pub fn parallel_structures(diff: &Diff, base: &[(String, String)]) -> Vec<Widening> {
     let mut out = Vec::new();
     for (path, status, patch) in diff {
@@ -457,25 +489,35 @@ pub fn parallel_structures(diff: &Diff, base: &[(String, String)]) -> Vec<Wideni
             .into_iter()
             .filter_map(|l| top_level_def(l, path))
             .collect();
-        let mut existing: Vec<Def> = base
+        let added: Vec<Def> = lines_of(patch, '+')
+            .into_iter()
+            .filter_map(|l| top_level_def(l, path))
+            .collect();
+        let base_read = base.iter().any(|(p, _)| p == path);
+        let on_base: Vec<Def> = base
             .iter()
             .filter(|(p, _)| p == path)
             .flat_map(|(_, t)| defs(t, path))
             .collect();
+        let mut existing: Vec<Def> = on_base.clone();
         existing.extend(
             context_of(patch)
                 .into_iter()
-                .filter_map(|l| top_level_def(l, path)),
+                .filter_map(|l| top_level_def(l, path))
+                .filter(|d| !base_read || on_base.iter().any(|b| b.name == d.name)),
         );
-        existing.retain(|e| !removed.iter().any(|r| r.name == e.name));
-        for d in lines_of(patch, '+')
-            .into_iter()
-            .filter_map(|l| top_level_def(l, path))
-        {
-            if existing.iter().any(|e| e.name == d.name) {
+        // Removed and not added back: gone. Removed and added back: its
+        // signature changed, and it is still the existing one.
+        existing.retain(|e| {
+            !removed.iter().any(|r| r.name == e.name) || added.iter().any(|a| a.name == e.name)
+        });
+        for d in &added {
+            let was_there = on_base.iter().any(|b| b.name == d.name)
+                || removed.iter().any(|r| r.name == d.name);
+            if was_there || existing.iter().any(|e| e.name == d.name) {
                 continue;
             }
-            if let Some(e) = existing.iter().find(|e| parallels(&d, e)) {
+            if let Some(e) = existing.iter().find(|e| parallels(d, e)) {
                 let what = format!("`{}` next to the existing `{}`", d.name, e.name);
                 if !out.iter().any(|w: &Widening| w.what == what) {
                     out.push(Widening {
@@ -485,6 +527,219 @@ pub fn parallel_structures(diff: &Diff, base: &[(String, String)]) -> Vec<Wideni
                     });
                 }
             }
+        }
+    }
+    out
+}
+
+// ── Twin helpers in one change ─────────────────────────────────────────────
+
+/// The new side of a patch: its added and unchanged lines, in order.
+fn new_side(patch: &str) -> String {
+    patch
+        .lines()
+        .filter(|l| (l.starts_with('+') && !l.starts_with("+++")) || l.starts_with(' '))
+        .map(|l| &l[1..])
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+const KEYWORDS: &[&str] = &[
+    "export",
+    "const",
+    "let",
+    "var",
+    "return",
+    "if",
+    "else",
+    "function",
+    "async",
+    "await",
+    "new",
+    "true",
+    "false",
+    "null",
+    "undefined",
+    "is",
+    "fn",
+    "pub",
+    "def",
+    "self",
+    "this",
+    "in",
+    "of",
+    "for",
+    "extends",
+    "None",
+    "True",
+    "False",
+    "not",
+    "and",
+    "or",
+    "mut",
+    "impl",
+];
+
+/// A body's shape: keywords, punctuation and member names (`.filter`,
+/// `.has`) kept; every other name made `_`, so two helpers that differ only
+/// in their names and types read the same.
+pub fn shape(body: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let chars: Vec<char> = body.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c.is_whitespace() {
+            i += 1;
+            continue;
+        }
+        if c.is_ascii_alphanumeric() || c == '_' || c == '$' {
+            let start = i;
+            while i < chars.len()
+                && (chars[i].is_ascii_alphanumeric() || chars[i] == '_' || chars[i] == '$')
+            {
+                i += 1;
+            }
+            let word: String = chars[start..i].iter().collect();
+            let member = start > 0 && chars[start - 1] == '.';
+            if KEYWORDS.contains(&word.as_str()) || member {
+                out.push(word);
+            } else {
+                out.push("_".to_string());
+            }
+            continue;
+        }
+        out.push(c.to_string());
+        i += 1;
+    }
+    out
+}
+
+/// How alike two bodies' shapes are, 0 to 1: shared runs of four tokens.
+pub fn shape_similarity(a: &str, b: &str) -> f64 {
+    let grams = |s: &str| -> std::collections::BTreeSet<String> {
+        let t = shape(s);
+        t.windows(4).map(|w| w.join(" ")).collect()
+    };
+    let (a, b) = (grams(a), grams(b));
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    a.intersection(&b).count() as f64 / a.union(&b).count() as f64
+}
+
+/// A definition's signature shape: its first line up to the body, with
+/// generic parameters dropped (`<T extends {...}>`).
+fn signature(body: &str) -> String {
+    let first = body.lines().next().unwrap_or("");
+    let mut out = String::new();
+    let mut depth = 0;
+    for c in first.chars() {
+        match c {
+            '<' => depth += 1,
+            '>' if depth > 0 => depth -= 1,
+            _ if depth == 0 => out.push(c),
+            _ => {}
+        }
+    }
+    let s = shape(&out);
+    let start = s.iter().position(|t| t == "(").unwrap_or(s.len());
+    s[start..].join(" ")
+}
+
+/// Whether two new helpers are twins: names that parallel each other
+/// ([`parallels`]); or the same signature shape and bodies at least half
+/// alike; or bodies at least seven tenths alike. Bodies of fewer than
+/// three lines are too short to compare.
+pub fn twins(a: &Def, a_body: &str, b: &Def, b_body: &str) -> bool {
+    if a.kind != DefKind::Function || b.kind != DefKind::Function || a.name == b.name {
+        return false;
+    }
+    if parallels(a, b) {
+        return true;
+    }
+    let lines = |s: &str| s.lines().filter(|l| !l.trim().is_empty()).count();
+    if lines(a_body) < 3 || lines(b_body) < 3 {
+        return false;
+    }
+    let sim = shape_similarity(a_body, b_body);
+    sim >= 0.7 || (sim >= 0.5 && signature(a_body) == signature(b_body))
+}
+
+/// A new helper of a diff with its body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewHelper {
+    pub path: String,
+    pub def: Def,
+    pub body: String,
+}
+
+/// The top-level definitions a diff adds (not renames of removed ones),
+/// with their bodies from the patch's new side.
+pub fn new_helpers(diff: &Diff) -> Vec<NewHelper> {
+    let mut out = Vec::new();
+    for (path, status, patch) in diff {
+        if status == "removed" || !code_file(path) || is_test(path) {
+            continue;
+        }
+        let removed: Vec<String> = lines_of(patch, '-')
+            .into_iter()
+            .filter_map(|l| top_level_def(l, path))
+            .map(|d| d.name)
+            .collect();
+        let context: Vec<String> = context_of(patch)
+            .into_iter()
+            .filter_map(|l| top_level_def(l, path))
+            .map(|d| d.name)
+            .collect();
+        let text = new_side(patch);
+        for d in lines_of(patch, '+')
+            .into_iter()
+            .filter_map(|l| top_level_def(l, path))
+        {
+            if removed.contains(&d.name)
+                || context.contains(&d.name)
+                || out
+                    .iter()
+                    .any(|h: &NewHelper| h.path == *path && h.def.name == d.name)
+            {
+                continue;
+            }
+            let body = body_of(&text, path, &d.name).unwrap_or_default();
+            out.push(NewHelper {
+                path: path.clone(),
+                def: d,
+                body,
+            });
+        }
+    }
+    out
+}
+
+/// New helpers in one diff that are twins of one added before them in it
+/// ([`twins`]): the parallel check compares new code with old, never new
+/// with new.
+pub fn twin_helpers(diff: &Diff) -> Vec<Widening> {
+    let found = new_helpers(diff);
+    let mut out = Vec::new();
+    for (i, b) in found.iter().enumerate() {
+        if let Some(a) = found[..i]
+            .iter()
+            .find(|a| twins(&a.def, &a.body, &b.def, &b.body))
+        {
+            let where_a = if a.path == b.path {
+                String::new()
+            } else {
+                format!(" (in `{}`)", a.path)
+            };
+            out.push(Widening {
+                kind: Kind::Twin,
+                path: b.path.clone(),
+                what: format!(
+                    "`{}` next to `{}`{where_a}, added in the same change",
+                    b.def.name, a.def.name
+                ),
+            });
         }
     }
     out
@@ -948,6 +1203,87 @@ pub fn invented_payloads(diff: &Diff, has_probe: bool) -> Vec<Widening> {
     out
 }
 
+// ── A whole path rewritten for a few records ───────────────────────────────
+
+/// Changed code lines (added and removed, not entries of a map or list, not
+/// comments) past which a change for a few named records rewrites a path.
+pub const WHOLE_PATH_LINES: usize = 40;
+/// Up to this many records named, a ticket is about those records.
+pub const FEW_RECORDS: usize = 12;
+
+/// Ticket words that ask for every record of a kind.
+const EVERY_ASKS: &[&str] = &[
+    "all records",
+    "all camps",
+    "every record",
+    "every camp",
+    "for all ",
+    "for every ",
+    "across all",
+    "refactor",
+    "rewrite",
+];
+
+/// A changed line that is an entry of a map or list, a bracket, or a
+/// comment: what a lookup fix adds without changing how records flow.
+fn entry_line(line: &str) -> bool {
+    let t = line.trim();
+    if t.is_empty()
+        || t.starts_with('#')
+        || t.starts_with("//")
+        || t.starts_with("--")
+        || t.chars()
+            .all(|c| matches!(c, '{' | '}' | '[' | ']' | '(' | ')' | ',' | ';'))
+    {
+        return true;
+    }
+    let quoted = t.starts_with('\'') || t.starts_with('"');
+    quoted && (t.contains("':") || t.contains("\":") || t.ends_with("',") || t.ends_with("\","))
+}
+
+/// A change that rewrites a code path while its ticket names a few records
+/// (`common::repro_first::ticket_ids`): more than [`WHOLE_PATH_LINES`]
+/// changed code lines that are no entries of a map or list. A ticket that
+/// named four camps filed under the wrong sport got 900 changed lines
+/// across the pipeline that loads every camp; the fix was a suffix
+/// stripped in the existing lookup and two entries. A `Wider than the
+/// ticket:` line keeps it, with the reason the narrower change can't work.
+pub fn whole_path(diff: &Diff, ticket: &str) -> Vec<Widening> {
+    let named = common::repro_first::ticket_ids(ticket).len();
+    if named == 0 || named > FEW_RECORDS || ticket_asks(ticket, EVERY_ASKS) {
+        return Vec::new();
+    }
+    let mut lines = 0;
+    let mut files: Vec<(&str, usize)> = Vec::new();
+    for (path, status, patch) in diff {
+        if status == "removed" || !code_file(path) || is_test(path) {
+            continue;
+        }
+        let n = lines_of(patch, '+')
+            .into_iter()
+            .chain(lines_of(patch, '-'))
+            .filter(|l| !entry_line(l))
+            .count();
+        if n > 0 {
+            lines += n;
+            files.push((path, n));
+        }
+    }
+    if lines <= WHOLE_PATH_LINES {
+        return Vec::new();
+    }
+    files.sort_by_key(|f| std::cmp::Reverse(f.1));
+    vec![Widening {
+        kind: Kind::WholePath,
+        path: files[0].0.to_string(),
+        what: format!(
+            "{lines} changed code lines across {} file(s), most in `{}`, for a ticket that names {named} record(s)",
+            files.len(),
+            files[0].0
+        ),
+    }]
+}
+
 // ── The check ──────────────────────────────────────────────────────────────
 
 /// Everything a diff adds past its ticket. `base` holds the base text of
@@ -960,6 +1296,7 @@ pub fn check(
     has_probe: bool,
 ) -> Vec<Widening> {
     let mut out = parallel_structures(diff, base);
+    out.extend(twin_helpers(diff));
     if !ticket_asks(ticket, REPLACE_ASKS) {
         out.extend(replacing(diff, base));
     }
@@ -972,6 +1309,7 @@ pub fn check(
     out.extend(test_size(diff));
     out.extend(repeated_cases(diff));
     out.extend(invented_payloads(diff, has_probe));
+    out.extend(whole_path(diff, ticket));
     out
 }
 
@@ -1133,12 +1471,13 @@ mod tests {
         assert_eq!(got.len(), 2);
         assert_eq!(got[0].kind, DefKind::Table);
         assert_eq!(got[1].kind, DefKind::Function);
-        let ts = "export const SPORT_MAP: Record<string, string> = {\nexport function sportFor(x) {\nconst handler = async (e) => {";
+        let ts = "export const SPORT_MAP: Record<string, string> = {\nexport function sportFor(x) {\nconst handler = async (e) => {\nexport const firstBy = <T extends { value: string }>(";
         let got = defs(ts, "src/a.ts");
         assert_eq!(
             got.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
-            vec!["SPORT_MAP", "sportFor", "handler"]
+            vec!["SPORT_MAP", "sportFor", "handler", "firstBy"]
         );
+        assert_eq!(got[3].kind, DefKind::Function);
         let rs = "pub const RULES: &[&str] = &[\npub(crate) fn rules_for() {}";
         assert_eq!(defs(rs, "a.rs").len(), 2);
     }
@@ -1287,6 +1626,37 @@ mod tests {
             write_semantics(&body_of(ts, "a.ts", "linkAll").unwrap()),
             Writes::Replacing(_)
         ));
+    }
+
+    #[test]
+    fn twin_helpers_added_together_are_found() {
+        // Two new helpers whose names parallel each other.
+        let patch = "@@ -1,3 +1,20 @@\n export const keyOf = (s: Item) => s.label.toLowerCase();\n+export const dedupeItemsByKey = (items: Item[]): Item[] => {\n+  const seen = new Set<string>();\n+  return items.filter((item) => {\n+    const key = keyOf(item);\n+    if (seen.has(key)) return false;\n+    seen.add(key);\n+    return true;\n+  });\n+};\n+export const dedupeItemOptionsByKey = <T extends { value: string }>(options: T[]): T[] => {\n+  const seen = new Set<string>();\n+  return options.filter((option) => {\n+    if (seen.has(option.value)) return false;\n+    seen.add(option.value);\n+    return true;\n+  });\n+};\n";
+        let w = twin_helpers(&[d("src/utils/maps.ts", "modified", patch)]);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert_eq!(w[0].kind, Kind::Twin);
+        assert!(w[0]
+            .what
+            .contains("`dedupeItemOptionsByKey` next to `dedupeItemsByKey`"));
+        assert!(w[0].instruction().contains("Keep one helper"));
+        // Different names, the same body shape: still twins.
+        let a = "export const uniqueRows = (rows: Row[]): Row[] => {\n  const seen = new Set<string>();\n  return rows.filter((r) => {\n    if (seen.has(r.id)) return false;\n    seen.add(r.id);\n    return true;\n  });\n};";
+        let b = "export const firstPerCode = (codes: Code[]): Code[] => {\n  const seen = new Set<string>();\n  return codes.filter((c) => {\n    if (seen.has(c.code)) return false;\n    seen.add(c.code);\n    return true;\n  });\n};";
+        let def = |n: &str| Def {
+            name: n.into(),
+            kind: DefKind::Function,
+        };
+        assert!(shape_similarity(a, b) >= 0.5, "{}", shape_similarity(a, b));
+        assert!(twins(&def("uniqueRows"), a, &def("firstPerCode"), b));
+        // Two unrelated helpers are not.
+        let c = "export const priceLabel = (cents: number): string => {\n  const dollars = Math.floor(cents / 100);\n  return `$${dollars}`;\n};";
+        assert!(!twins(&def("uniqueRows"), a, &def("priceLabel"), c));
+        // A helper added next to an existing one is the parallel check's,
+        // not reported twice.
+        let one = "@@ -1,2 +1,4 @@\n export const slugToId = (all: Item[], slug: string) => {\n+export const slugToIds = (all: Item[], slug: string): string[] =>\n+  all.filter((s) => s.slug === slug).map((s) => s.id);\n";
+        let diff = [d("src/utils/maps.ts", "modified", one)];
+        assert!(twin_helpers(&diff).is_empty());
+        assert_eq!(parallel_structures(&diff, &[]).len(), 1);
     }
 
     #[test]

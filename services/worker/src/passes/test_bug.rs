@@ -46,6 +46,26 @@ impl Runner<'_> {
         steps: &[Step],
         repeat: Option<&str>,
     ) -> Result<(Vec<Option<i32>>, String), String> {
+        let cmds: Vec<&str> = steps
+            .iter()
+            .map(|s| s.cmd.as_str())
+            .chain(repeat.iter().copied())
+            .collect();
+        let script = test_package::sandbox_script(steps, repeat);
+        let output = self.run_script_at(sha, &cmds, &script).await?;
+        let n = steps.len() + usize::from(repeat.is_some());
+        Ok((test_package::step_codes(&output, n), output))
+    }
+
+    /// Runs `script` on commit `sha` in the sandbox, in the run's test
+    /// environment, once each of `cmds` (the commands it runs) passes the
+    /// team's agent permissions: the output. `Err` says why nothing ran.
+    pub async fn run_script_at(
+        &self,
+        sha: &str,
+        cmds: &[&str],
+        script: &str,
+    ) -> Result<String, String> {
         if !self.sandbox_on() {
             return Err("no sandbox is set up here".into());
         }
@@ -57,11 +77,7 @@ impl Runner<'_> {
             self.provider.scope.ctx(common::agent_policy::Agent::Coder),
             None,
         );
-        let cmds = steps
-            .iter()
-            .map(|s| s.cmd.as_str())
-            .chain(repeat.iter().copied());
-        for cmd in cmds {
+        for cmd in cmds.iter().copied() {
             match gate.check_command(cmd, "Check a failing test").await {
                 common::agent_policy::Outcome::Run { .. } => {}
                 common::agent_policy::Outcome::Refused { message, .. }
@@ -105,15 +121,11 @@ impl Runner<'_> {
             .await
             .map_err(|e| format!("the commit couldn't be prepared ({e})"))?;
         let node = super::detect_node_version(self.github, self.owner, self.repo, sha).await;
-        let script = test_package::sandbox_script(steps, repeat);
         match sandbox
-            .run_checks(&source, &script, node.as_deref(), None, None)
+            .run_checks(&source, script, node.as_deref(), None, None)
             .await
         {
-            Ok(o) if o.ran => {
-                let n = steps.len() + usize::from(repeat.is_some());
-                Ok((test_package::step_codes(&o.output, n), o.output))
-            }
+            Ok(o) if o.ran => Ok(o.output),
             Ok(o) => Err(format!("the sandbox gave no result ({})", o.reason)),
             Err(e) => Err(format!("the sandbox couldn't run ({e})")),
         }

@@ -19,8 +19,10 @@
 //!    failures the base branch has too are notes ([`apply_blocking_policy`]).
 //! 4. Blockers up front: after the first reviewed head, a new blocker may
 //!    only sit on lines changed since the previous reviewed head (or be one
-//!    a person's reply made relevant); any other is a note, and from round 3
-//!    on it is also a lesson for the reviewer ([`hold_late_blockers`]).
+//!    a person's reply made relevant); any other is a note on every pull
+//!    request. One the previous review missed (not one a newer check found)
+//!    is also a lesson and a recorded miss for the reviewer
+//!    ([`hold_late_blockers`]).
 
 use super::review_agent::{Evidence, Finding};
 use super::review_fingerprint::{in_words, Changed};
@@ -399,6 +401,9 @@ pub struct UpFront<'a> {
     pub earlier_threads: &'a [(String, u64)],
     /// A person wrote something since the previous review.
     pub person_spoke: bool,
+    /// When the previous review ran (RFC 3339; empty when unknown): a check
+    /// that started after it couldn't have raised what it finds now.
+    pub previous_review_at: &'a str,
 }
 
 /// What rule 4 held back.
@@ -406,22 +411,28 @@ pub struct UpFront<'a> {
 pub struct Late {
     /// New blockers on code already reviewed, now notes, out of `findings`.
     pub held: Vec<Finding>,
-    /// From round 3: the reviewer should have raised them earlier, and
-    /// learns so.
+    /// Of `held`, those the previous review missed: its model read the same
+    /// lines, or one of its checks ran on them. Each is a reviewer miss the
+    /// review lessons and rewards learn from (`review_lessons`,
+    /// `rewards::record_missed`).
+    pub missed: Vec<Finding>,
+    /// The reviewer missed something earlier and learns so.
     pub self_lesson: bool,
 }
 
 pub const LATE_NOTE: &str =
-    "On code unchanged since my previous review, so a note, not a block: it should have been raised then.";
+    "On code unchanged since my previous review, so a note, not a block: my previous review missed it.";
+
+/// [`LATE_NOTE`] for a finding of a check that started running after the
+/// previous review (`review_rules::check_newer_than`): not a miss.
+pub const NEW_CHECK_NOTE: &str =
+    "On code unchanged since my previous review, so a note, not a block: the check that found it started running after that review.";
 
 /// Rule 4. Every blocker belongs in the first review of the code it is
 /// about. After the first reviewed head, a new blocker on lines unchanged
 /// since the previous reviewed head is held back as a note, unless it repeats
 /// an earlier thread or a person's reply since made it relevant.
 pub fn hold_late_blockers(findings: &mut Vec<Finding>, ctx: &UpFront<'_>) -> Late {
-    let Some(changed) = ctx.changed_since_previous else {
-        return Late::default();
-    };
     if ctx.round.number < 2 {
         return Late::default();
     }
@@ -430,25 +441,54 @@ pub fn hold_late_blockers(findings: &mut Vec<Finding>, ctx: &UpFront<'_>) -> Lat
             .iter()
             .any(|(p, l)| *p == f.file && l.abs_diff(f.line) <= NEAR_LINES)
     };
-    let (mut held, keep): (Vec<Finding>, Vec<Finding>) =
-        std::mem::take(findings).into_iter().partition(|f| {
-            f.holds_merge()
-                // A required rule, a failing check and an unproven critical
-                // path hold until the change meets them, raised late or not.
-                && super::review_rules::mandatory(f).is_none()
+    // On lines unchanged since the previous reviewed head: that review read
+    // them.
+    let on_old_lines = |f: &Finding| {
+        ctx.changed_since_previous.is_some_and(|changed| {
+            super::review_rules::mandatory(f).is_none()
                 && !on_changed_lines(f, changed)
                 && !earlier(f)
                 && !(ctx.person_spoke && f.prompted_by_reply == Some(true))
-        });
+        })
+    };
+    let (mut held, keep): (Vec<Finding>, Vec<Finding>) = std::mem::take(findings)
+        .into_iter()
+        .partition(|f| f.holds_merge() && (on_old_lines(f) || after_first_round(f)));
     *findings = keep;
+    let mut missed = Vec::new();
     for f in held.iter_mut() {
-        demote(f, LATE_NOTE);
+        if !on_old_lines(f) {
+            demote(f, ADVISORY_LATE_NOTE);
+        } else if super::review_rules::check_newer_than(f, ctx.previous_review_at) {
+            demote(f, NEW_CHECK_NOTE);
+        } else {
+            demote(f, LATE_NOTE);
+            missed.push(f.clone());
+        }
     }
     Late {
-        self_lesson: !held.is_empty() && ctx.round.number >= 3,
+        self_lesson: !missed.is_empty(),
+        missed,
         held,
     }
 }
+
+/// A finding of a smallest-change check the coder may keep with a reason
+/// (a parallel structure, a test out of proportion, a log level, reporting)
+/// first raised after the first review. Those checks read the whole change,
+/// so each fix round can tip one over: on one pull request each round's
+/// review raised a new one (a test out of proportion, then a parallel
+/// structure), every one held the merge, and the run went review, fix,
+/// review for nine rounds past its spend ceiling. After the first review
+/// they are notes.
+fn after_first_round(f: &Finding) -> bool {
+    super::review_rules::advisory_check(f)
+}
+
+/// [`LATE_NOTE`] for an advisory smallest-change finding raised after the
+/// first review ([`after_first_round`]).
+pub const ADVISORY_LATE_NOTE: &str =
+    "A note, not a block: the smallest-change checks raise what blocks in the first review; after it, what they find is advice.";
 
 /// The lesson a review that raised a blocker late keeps for the repository.
 pub const RAISE_EARLY_LESSON: &str =
@@ -982,6 +1022,7 @@ mod tests {
                 changed_since_previous: Some(&changed),
                 earlier_threads: &threads,
                 person_spoke: true,
+                previous_review_at: "2026-11-16T23:21:58Z",
             },
         );
         assert_eq!(
@@ -1005,10 +1046,14 @@ mod tests {
                 changed_since_previous: Some(&changed),
                 earlier_threads: &[],
                 person_spoke: false,
+                previous_review_at: "",
             },
         );
         assert_eq!(late.held.len(), 1);
-        assert!(!late.self_lesson);
+        // Missed in round 1 and found in round 2: a miss the reviewer
+        // learns from, in any later round.
+        assert!(late.self_lesson);
+        assert_eq!(late.missed.len(), 1);
         let mut fs = vec![defect("b.rs", 5, "high", "bug")];
         let late = hold_late_blockers(
             &mut fs,
@@ -1017,6 +1062,7 @@ mod tests {
                 changed_since_previous: None,
                 earlier_threads: &[],
                 person_spoke: false,
+                previous_review_at: "",
             },
         );
         assert!(late.held.is_empty() && fs.len() == 1);
@@ -1032,6 +1078,7 @@ mod tests {
                 changed_since_previous: Some(&changed),
                 earlier_threads: &[],
                 person_spoke: false,
+                previous_review_at: "",
             },
         );
         assert_eq!(late.held.len(), 1);

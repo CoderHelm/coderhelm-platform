@@ -344,6 +344,13 @@ async fn smallest_change_gaps(
     let mut out = super::review_rules::wider_findings(&super::minimal_change::check(
         &files, &base, ticket, has_probe,
     ));
+    // Each one names the line it is about, or it can't block
+    // (`review_discipline::unactionable`).
+    for f in out.iter_mut() {
+        if let Some((_, _, patch)) = files.iter().find(|(p, _, _)| *p == f.file) {
+            f.line = super::review_rules::anchor_line(patch, &f.body);
+        }
+    }
     let criteria = super::stop_judge::acceptance(ticket);
     if !criteria.is_empty() {
         let own = super::web_check::team_domains(state, team_id).await;
@@ -3585,11 +3592,21 @@ async fn run_once(
     // A change a person sees, in a repository with an end-to-end suite,
     // carries a spec for it: a finding by rule, read from the paths and the
     // tree, whatever the model said.
-    if let Ok(tree) = github
-        .get_tree(&msg.repo_owner, &msg.repo_name, &head_sha)
-        .await
+    // Every check with no model runs on every review, the first one
+    // included: a tree that can't be read leaves those that need it without
+    // their answer, never the others without a run (a check held for a later
+    // round raises its finding on code an earlier review already read).
     {
-        let tree: Vec<String> = tree.into_iter().map(|e| e.path).collect();
+        let tree: Vec<String> = match github
+            .get_tree(&msg.repo_owner, &msg.repo_name, &head_sha)
+            .await
+        {
+            Ok(t) => t.into_iter().map(|e| e.path).collect(),
+            Err(e) => {
+                warn!(pr = msg.pr_number, error = %e, "Could not read the head's tree: the checks still run without it");
+                Vec::new()
+            }
+        };
         if let Some(f) = super::review_rules::e2e_finding(&changed_list, &tree) {
             info!(
                 pr = msg.pr_number,
@@ -3714,6 +3731,7 @@ async fn run_once(
             changed_since_previous: changed_since_previous.as_ref(),
             earlier_threads: &earlier_threads,
             person_spoke: spoke_since_previous.is_some(),
+            previous_review_at: &previous_review_at,
         },
     );
     if !late.held.is_empty() {
@@ -3721,8 +3739,19 @@ async fn run_once(
             pr = msg.pr_number,
             round = review_round.number,
             held = late.held.len(),
+            missed = late.missed.len(),
             "New blockers on code unchanged since the previous review kept as notes"
         );
+        // Each one the previous review missed is that review's miss: the
+        // reviewer's rewards and examples learn from it.
+        super::rewards::record_missed(
+            state,
+            &msg.team_id,
+            &format!("{}/{}", msg.repo_owner, msg.repo_name),
+            msg.pr_number,
+            &late.missed,
+        )
+        .await;
         if late.self_lesson {
             super::review_lessons::learn_raise_early(
                 state,
@@ -3750,6 +3779,65 @@ async fn run_once(
     )
     .await;
     super::review_severity::finalize(&mut findings);
+    // What may hold the merge, from facts this review already has: a
+    // blocking finding is actionable, doesn't move to another file, doesn't
+    // undo an earlier request, isn't one CoderHelm's rounds deferred on
+    // unchanged code, doesn't call out of scope what a person asked for, and
+    // once the ticket's criteria are proven with CI green what is left that
+    // isn't a shown defect is a follow-up (`review_discipline`).
+    let own_ledger = match (&own_run, self_authored) {
+        (Some(run_id), true) => {
+            Some(Box::pin(super::own_review_ledger::load(state, &msg.team_id, run_id)).await)
+        }
+        _ => None,
+    };
+    {
+        let mut earlier: Vec<super::review_discipline::Earlier> = bot_threads
+            .iter()
+            .map(|t| super::review_discipline::Earlier::of_thread(&t.path, &t.body))
+            .collect();
+        if let Some(l) = &own_ledger {
+            earlier.extend(
+                l.findings
+                    .iter()
+                    .map(|t| super::review_discipline::Earlier::of_item(&t.item)),
+            );
+        }
+        let deferred = own_ledger
+            .as_ref()
+            .map(super::review_discipline::deferred_items)
+            .unwrap_or_default();
+        let mut people: Vec<String> = people_wrote
+            .iter()
+            .filter(|c| super::review_policy::is_person(&c["user"]))
+            .filter_map(|c| c["body"].as_str().map(str::to_string))
+            .collect();
+        people.push(ticket_context.clone());
+        let criteria_proven = match &own_run {
+            Some(run_id) => run_e2e_proofs(state, &msg.team_id, run_id)
+                .await
+                .and_then(|j| super::review_discipline::criteria_met(&j, &head_sha))
+                .unwrap_or(false),
+            None => false,
+        };
+        let ci_green = !findings.iter().any(|f| {
+            super::review_rules::mandatory(f) == Some(super::review_rules::FAILING_CHECK_WHY)
+        }) && base_failing.is_empty();
+        let made = super::review_discipline::judge(
+            &mut findings,
+            &super::review_discipline::Facts {
+                earlier: &earlier,
+                deferred: &deferred,
+                changed_since_previous: changed_since_previous.as_ref(),
+                people: &people,
+                criteria_proven,
+                ci_green,
+            },
+        );
+        for m in &made {
+            info!(pr = msg.pr_number, file = %m.file, title = %m.title, why = %m.why, "A finding that would hold the merge made a note");
+        }
+    }
     info!(
         pr = msg.pr_number,
         checked = second.checked,
@@ -3842,8 +3930,16 @@ async fn run_once(
             findings.retain(|f| f.holds_merge() || !super::own_review::about_description(f));
         }
     }
+    // Findings raised late are notes on every pull request; on CoderHelm's
+    // own they are still work, fixed in this round with the rest, and
+    // listed apart so they never hold the merge (`review_one_verdict`).
     let mut own_open = if self_authored {
-        super::own_review::required(&findings, &held_late)
+        super::own_review::required(&findings, &[])
+    } else {
+        Vec::new()
+    };
+    let own_late = if self_authored {
+        super::review_one_verdict::late_lines(&held_late)
     } else {
         Vec::new()
     };
@@ -3864,13 +3960,9 @@ async fn run_once(
     // On CoderHelm's own pull request, a finding its fix loop settled with a
     // reason (the ticket rules it out, or only a person can do it) is a note
     // naming that reason, never a request for changes on the head.
-    let settled_by_run = match (&own_run, self_authored) {
-        (Some(run_id), true) => {
-            let ledger =
-                Box::pin(super::own_review_ledger::load(state, &msg.team_id, run_id)).await;
-            settle_own_findings(&ledger, &mut findings, &mut own_open)
-        }
-        _ => Vec::new(),
+    let settled_by_run = match &own_ledger {
+        Some(ledger) => settle_own_findings(ledger, &mut findings, &mut own_open),
+        None => Vec::new(),
     };
     // The one verdict the rest of this review may use: what holds the merge,
     // by name. Nothing named holding means approve, whatever came before.
@@ -3888,15 +3980,47 @@ async fn run_once(
         })
         .map(|t| (t.path.clone(), t.line, t.body.clone()))
         .collect();
-    let mut final_verdict =
-        super::review_verdict::Verdict::from_holding(super::review_policy::named_holding(
+    // One state per finding before anything is written: a thread that is
+    // resolved, settled by this review or about code no longer in the
+    // change, a finding raised late, and an earlier hold this review calls a
+    // note never hold the merge (`review_one_verdict`).
+    let closed = closed_threads(&bot_threads, &fixed_threads, &output.prior, &changed_list);
+    own_open.retain(|o| {
+        let k = super::review_one_verdict::Key::of_line(o);
+        !closed.iter().any(|(c, _)| c.same(&k))
+    });
+    let late_keys: Vec<super::review_one_verdict::Key> = held_late
+        .iter()
+        .map(super::review_one_verdict::Key::of_finding)
+        .collect();
+    let note_keys: Vec<super::review_one_verdict::Key> = findings
+        .iter()
+        .filter(|f| !f.holds_merge())
+        .map(super::review_one_verdict::Key::of_finding)
+        .collect();
+    let one = super::review_one_verdict::settle(super::review_one_verdict::Inputs {
+        holding: super::review_policy::named_holding(
             &findings,
             &open_holding,
             &unconfirmed,
             verify_failed,
             &own_open,
             &stable.kept,
-        ));
+        ),
+        closed: &closed,
+        late: &late_keys,
+        notes: &note_keys,
+        prose: &output.summary,
+    });
+    for e in one
+        .entries
+        .iter()
+        .filter(|e| e.state != super::review_one_verdict::State::Blocking)
+    {
+        info!(pr = msg.pr_number, finding = %e.name, state = e.state.words(), why = %e.why, "Named as holding the merge, but not blocking at the head: left out");
+    }
+    output.summary = one.prose;
+    let mut final_verdict = super::review_verdict::Verdict::from_holding(one.holding);
     // A request for changes on someone's PR is a costly decision: the stop
     // judge sees the whole picture and either holds on a named correctness,
     // security or data-loss problem, or the review approves with the
@@ -4013,6 +4137,14 @@ async fn run_once(
     }
     // The description this review leaves: CoderHelm's own PR gets its open
     // findings written into it.
+    // Late notes ride along with a round that has work that holds; on their
+    // own they start no round, so a run whose findings left are only notes
+    // ends. The verdict above was made without them.
+    let own_open: Vec<String> = if own_open.is_empty() {
+        own_open
+    } else {
+        own_open.into_iter().chain(own_late).collect()
+    };
     let mut description_after = pr_body.to_string();
     if self_authored {
         let section = super::own_review::section(&own_open);
@@ -4172,12 +4304,7 @@ async fn run_once(
             visible.push_str(&findings_md);
         }
     }
-    if !held_late.is_empty() {
-        full_body.push_str("\n\n#### Also worth a look\nOn code that hasn't changed since my previous review, so these are notes and don't change the verdict (they should have been raised then):\n");
-        for f in &held_late {
-            full_body.push_str(&format!("- `{}:{}` {}\n", f.file, f.line, f.title));
-        }
-    }
+    full_body.push_str(&super::review_one_verdict::late_markdown(&held_late));
     full_body.push_str(&super::review_labels::markdown(
         labels_live,
         &label_decision,
@@ -4221,6 +4348,14 @@ async fn run_once(
             msg.pr_number,
         ),
     );
+    // The last word before posting: no finding listed as holding the merge
+    // is also called a note, settled or no longer applying in the same
+    // review.
+    let (one_body, two_verdicts) = super::review_one_verdict::enforce(&full_body);
+    if !two_verdicts.is_empty() {
+        warn!(pr = msg.pr_number, contradictions = ?two_verdicts, "A finding had two verdicts in the review body; the words that contradict the hold were removed");
+    }
+    let full_body = one_body;
 
     // Check the head again before speaking: the review takes minutes, and a
     // commit pushed seconds before this one started may not have been the PR's
@@ -4279,6 +4414,12 @@ async fn run_once(
     // A push and a re-review ask for the same commit run two reviews; the
     // first to finish speaks for both.
     // A person's ask is never silenced by it: it always gets its own answer.
+    // CoderHelm's own pull request: every head its fix rounds push gets its
+    // own review posted, news or not, so the review on the pull request is
+    // always of the head (the older ones collapse under it). A person never
+    // has to ask for a re-review to see where it stands.
+    let new_own_head =
+        self_authored && own_head_is_new(prev.as_ref().map(|p| p.head_sha.as_str()), &head_sha);
     let already_answered = !explicit
         && prev
             .as_ref()
@@ -4286,7 +4427,7 @@ async fn run_once(
     let decision = super::review_verdict::decide(
         super::review_verdict::Input::Review {
             verdict,
-            has_news: has_news || new_human_commit,
+            has_news: has_news || new_human_commit || new_own_head,
             explicit,
             already_answered,
         },
@@ -4662,6 +4803,32 @@ async fn run_once(
         posted: posted_event,
         run_review,
     })
+}
+
+/// The run's two-way end-to-end proofs as JSON (`e2e_proof` on the run,
+/// kept by `common::e2e_proof` once that lands), if it has any.
+async fn run_e2e_proofs(state: &WorkerState, team_id: &str, run_id: &str) -> Option<String> {
+    state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(team_id))
+        .key("run_id", attr_s(run_id))
+        .projection_expression("e2e_proof")
+        .send()
+        .await
+        .ok()?
+        .item?
+        .get("e2e_proof")?
+        .as_s()
+        .ok()
+        .cloned()
+}
+
+/// On CoderHelm's own pull request, the head reviewed now isn't the one its
+/// last review was of (or there was none): the review is posted.
+pub(crate) fn own_head_is_new(last_reviewed: Option<&str>, head: &str) -> bool {
+    !head.is_empty() && last_reviewed != Some(head)
 }
 
 /// The trigger of a review a ticket run asks for on its own PR before it
@@ -5477,9 +5644,11 @@ pub(crate) fn settle_own_findings(
     for f in findings.iter_mut() {
         let line = super::own_review::thread_line(&f.file, f.line, &f.title);
         if let Some(s) = ledger.settled_item(&line) {
-            // CoderHelm's own note: listed on the ready pull request, still
-            // a finding of this review, never approved over.
+            // CoderHelm's own note (its rounds made no progress on it): a
+            // follow-up, not a hold. A finding of it on code changed since
+            // is new evidence and holds on its own (`review_discipline`).
             if matches!(s, Settled::Noted { .. }) {
+                settled.push(line);
                 continue;
             }
             super::review_policy::demote(f, &why(s));
@@ -5488,9 +5657,9 @@ pub(crate) fn settle_own_findings(
     }
     own_open.retain(|o| {
         let s = ledger.settled_item(o);
-        // A noted finding leaves the list that holds the draft, and keeps
-        // holding the merge (its thread stays open).
-        if s.is_some_and(|s| !matches!(s, Settled::Noted { .. })) && !settled.contains(o) {
+        // A settled or noted finding leaves the list that holds the draft,
+        // and its thread holds the merge no more.
+        if s.is_some() && !settled.contains(o) {
             settled.push(o.clone());
         }
         s.is_none()
@@ -6426,6 +6595,48 @@ fn settled_prior_threads<'a>(
                 && seen.insert(s.index)
         })
         .map(|s| prior[s.index])
+        .collect()
+}
+
+/// CoderHelm's earlier threads that hold nothing at this head, each with
+/// its state: resolved on GitHub or settled by this review (settled), or
+/// about code no longer in the change (the review called it gone, or the
+/// pull request no longer changes its file). `changed` is the PR's changed
+/// files at the head.
+pub(crate) fn closed_threads(
+    threads: &[crate::clients::github::BotReviewThread],
+    settled_now: &[&crate::clients::github::BotReviewThread],
+    statuses: &[review_agent::PriorStatus],
+    changed: &[String],
+) -> Vec<(
+    super::review_one_verdict::Key,
+    super::review_one_verdict::State,
+)> {
+    use super::review_one_verdict::{Key, State};
+    let gone_now: Vec<&str> = {
+        let open: Vec<&crate::clients::github::BotReviewThread> =
+            threads.iter().filter(|t| !t.resolved).collect();
+        statuses
+            .iter()
+            .filter(|s| s.status.eq_ignore_ascii_case(review_agent::GONE))
+            .filter_map(|s| open.get(s.index).map(|t| t.id.as_str()))
+            .collect()
+    };
+    threads
+        .iter()
+        .filter_map(|t| {
+            let key = Key::of_line(&super::own_review::thread_line(&t.path, t.line, &t.body));
+            let state = if gone_now.contains(&t.id.as_str())
+                || (!t.path.is_empty() && !changed.contains(&t.path))
+            {
+                State::NoLongerApplies
+            } else if t.resolved || settled_now.iter().any(|s| s.id == t.id) {
+                State::Settled
+            } else {
+                return None;
+            };
+            Some((key, state))
+        })
         .collect()
 }
 

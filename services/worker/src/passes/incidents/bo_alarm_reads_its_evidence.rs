@@ -8,13 +8,14 @@
 //! setup script had never added any WAF read. The web ACL logs to an
 //! `aws-waf-logs-*` bucket with an Athena table, and nothing read it.
 //!
-//! Guarantee: the role's setup script adds `coderhelm-read-waf` (WAF reads,
-//! Athena queries over the WAF log tables with results only under the
-//! workgroup's results prefix). With those reads the run gathers the rule's
-//! matches (sampled requests, and the logs in S3 by JA4, JA3, user agent,
-//! accept language, path and cookie presence) before it plans, and goes on
-//! to its pull request. Without them, the refusal is the install's one
-//! setup item ("AWS role reads", with the one-line CloudShell update),
+//! Guarantee: the role stack's template has the WAF reads, and a WAF log
+//! group (`WafLogs`: Athena queries over the WAF log tables with results
+//! only under the workgroup's results location). With those reads the run
+//! gathers the rule's matches (sampled requests, and the logs in S3 by JA4,
+//! JA3, user agent, accept language, path and cookie presence) before it
+//! plans, and goes on to its pull request. Without them, the refusal is the
+//! install's one setup item ("AWS role reads", with the role stack's
+//! one-click update, `cw_role_reads_arrive_by_stack_update`),
 //! never a question or a wait on the run: the stop judge turns such an ask
 //! or hold into a proceed, the hand-back list doesn't carry it, and an
 //! access question never shows a default that can't happen.
@@ -193,8 +194,8 @@ fn without_waf_reads_no_question_and_one_install_item() {
     // One short line in the run names the install's setup item.
     assert!(got.text.contains("\"AWS role reads\""));
     assert!(got.text.contains("asks nobody"));
-    // The install-level item exists, with the one-line update for the role.
-    let role = "arn:aws:iam::111122223333:role/CoderhelmReadOnly";
+    // The install-level item exists, with the role stack's update.
+    let role = "arn:aws:iam::111122223333:role/CoderHelmLogReader";
     let gap = aws_role_reads::gap(
         "111122223333",
         role,
@@ -204,8 +205,20 @@ fn without_waf_reads_no_question_and_one_install_item() {
     )
     .expect("the install item");
     assert_eq!(gap.actions, refused);
-    let line = common::live::aws::waf_update_line(&gap.role_arn).unwrap();
-    assert!(line.ends_with("| base64 -d | bash"));
+    let account = common::live::aws_account::AwsAccount {
+        account: "111122223333".into(),
+        role_arn: role.into(),
+        region: "us-east-1".into(),
+        ..Default::default()
+    };
+    let u = aws_role_reads::role_update(
+        &account,
+        Some(&gap),
+        0,
+        "https://b/launch/v1/coderhelm-log-reader-update.yaml",
+    )
+    .expect("the update");
+    assert!(u.url.contains("#/stacks/quickcreate?"));
     let checks = include_str!("../../../../gateway/src/routes/setup_checks.rs");
     assert!(checks.contains("aws_role_reads(&gaps)"));
     assert!(checks.contains("common::aws_role_reads::list("));

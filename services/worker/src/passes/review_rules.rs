@@ -122,6 +122,110 @@ pub fn wider_findings(found: &[super::minimal_change::Widening]) -> Vec<Finding>
         .collect()
 }
 
+/// When each check the review runs with no model started running (the
+/// merge of the change that added it), by the title its findings carry.
+/// A finding such a check raises on code an earlier review read is new to
+/// the review because the check is, not because that review missed it
+/// ([`check_started`]). Add a row with every new check.
+pub const CHECKS_STARTED: &[(&str, &str)] = &[
+    (
+        "A parallel structure next to an existing one",
+        "2026-11-17T14:31:17Z",
+    ),
+    (
+        "Deletes or overwrites where the code only added",
+        "2026-11-17T14:31:17Z",
+    ),
+    ("A log level changed", "2026-11-17T14:31:17Z"),
+    (
+        "Reporting the ticket doesn't ask for",
+        "2026-11-17T14:31:17Z",
+    ),
+    (
+        "A test out of proportion to the change",
+        "2026-11-17T14:31:17Z",
+    ),
+    ("A test payload nobody observed", "2026-11-17T14:31:17Z"),
+    (
+        "A test changed to the outside page's behaviour against a criterion",
+        "2026-11-17T14:31:17Z",
+    ),
+    (
+        "No end-to-end spec for a change a person sees",
+        "2026-11-17T03:33:40Z",
+    ),
+];
+
+/// When the check that raised `f` started running, for a finding of a
+/// check with no model; `None` for the model's own findings.
+pub fn check_started(f: &Finding) -> Option<&'static str> {
+    CHECKS_STARTED
+        .iter()
+        .find(|(title, _)| f.title == *title)
+        .map(|(_, since)| *since)
+}
+
+/// The head line a check's finding is about in `patch`: the added line that
+/// carries the first backticked name its `body` gives (the new definition),
+/// else the first added line. 0 when the patch adds nothing.
+pub fn anchor_line(patch: &str, body: &str) -> u64 {
+    let names: Vec<&str> = body
+        .split('`')
+        .skip(1)
+        .step_by(2)
+        .filter(|n| !n.contains('/') && !n.is_empty())
+        .collect();
+    let mut line = 0u64;
+    let mut first_added = 0u64;
+    for l in patch.lines() {
+        if let Some(hdr) = l.strip_prefix("@@") {
+            line = hdr
+                .split('+')
+                .nth(1)
+                .and_then(|p| p.trim().split([',', ' ']).next())
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(0);
+            continue;
+        }
+        match l.chars().next() {
+            Some('+') => {
+                if first_added == 0 {
+                    first_added = line.max(1);
+                }
+                if names.first().is_some_and(|n| l.contains(n)) {
+                    return line.max(1);
+                }
+                line += 1;
+            }
+            Some('-') | Some('\\') => {}
+            _ => line += 1,
+        }
+    }
+    first_added
+}
+
+/// A finding of a smallest-change check that a reason in the coder's notes
+/// may keep (`minimal_change::Widening::excusable`): advice once the first
+/// review has run (`review_policy::hold_late_blockers`).
+pub fn advisory_check(f: &Finding) -> bool {
+    check_started(f).is_some() && f.required.is_none()
+}
+
+/// Whether the check behind `f` started after `previous_review_at` (an
+/// RFC 3339 time): the earlier review could not have raised it.
+pub fn check_newer_than(f: &Finding, previous_review_at: &str) -> bool {
+    let Some(since) = check_started(f) else {
+        return false;
+    };
+    match (
+        chrono::DateTime::parse_from_rfc3339(since),
+        chrono::DateTime::parse_from_rfc3339(previous_review_at),
+    ) {
+        (Ok(s), Ok(p)) => s > p,
+        _ => false,
+    }
+}
+
 /// The review's findings for test assertions changed to match another
 /// company's page while an acceptance criterion says otherwise: the
 /// product changes first.
@@ -693,10 +797,12 @@ pub fn mandatory_label(f: &Finding) -> Option<String> {
 /// thread for a required rule is settled only by a fix: an answer that
 /// explains why the test is missing leaves the rule broken.
 pub fn settles(thread_body: &str, status: &str) -> bool {
+    let gone = super::review_agent::GONE;
     if thread_body.contains(REQUIRED_MARK) {
-        status.eq_ignore_ascii_case("fixed")
+        // Code no longer in the change breaks no rule either.
+        status.eq_ignore_ascii_case("fixed") || status.eq_ignore_ascii_case(gone)
     } else {
-        ["fixed", "answered", "accepted"]
+        ["fixed", "answered", "accepted", gone]
             .iter()
             .any(|s| status.eq_ignore_ascii_case(s))
     }

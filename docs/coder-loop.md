@@ -68,6 +68,16 @@ The causes were in the loop, not only in prompt wording:
    ticket asks to replace. The camps run's plan named the right map, then
    reused the link helper that deletes every link it isn't given.
 
+   The plan also writes `## Criteria map`: one line for each acceptance
+   criterion (or Expected line, when the ticket has no acceptance list) that
+   names a page or what a person sees, with the page, an end-to-end test in
+   the repository's suite that loads it, and what it asserts
+   (`common::e2e_proof`). A plan without that line, or with a unit test in
+   place of the end-to-end test, is sent back (`plan_shape::criteria_gaps`).
+   Unit tests may go with it; they never replace it. A ticket once asked
+   for one chip on one page and got about 530 lines of unit tests and no
+   test of the page (`incidents::cp_criteria_proven_both_ways`).
+
    Whatever is still open after the one send-back stays on the decision.
 
 4. **Implement.** In the coder's tool loop (`explore_guard`):
@@ -75,6 +85,10 @@ The causes were in the loop, not only in prompt wording:
      names what it reuses (`reuses`).
    - An edit that adds a top-level map, helper or config beside a similar existing
      one is refused unless it says why (`why_new`).
+   - An edit that adds a helper whose name or body nearly matches one this
+     build already added (in that edit or an earlier one) is refused unless
+     it names what they share (`shares`). The check above compares new code
+     with old, so three near-identical helpers added together once passed it.
 
    Both are kept as evidence lines. The coder's prompt carries the same rules
    (`SMALLEST_CHANGE_RULES`). The data rules ask for reporting on a skip only when
@@ -83,6 +97,9 @@ The causes were in the loop, not only in prompt wording:
 5. **Review against the ticket.** After the build, the habits check reads the diff
    against the base and the ticket (`minimal_change::check`). It flags:
    - parallel structures;
+   - twin helpers: two new helpers in the same diff whose names parallel each
+     other, or whose signatures and bodies nearly match
+     (`minimal_change::twin_helpers`);
    - deleting or overwriting semantics where the base only added;
    - log level changes;
    - new counters and log calls nobody asked for;
@@ -119,6 +136,27 @@ The causes were in the loop, not only in prompt wording:
    A proof fix round that answers a gap by looking (a query, a page, a check
    run) is judged again with what it found, even when it wrote no code
    (`proof::round_answered`, `incidents::cn_proof_answer_judged`).
+
+   **Two ways, end to end.** Before the pull request is called done, once
+   its preview is up and its own end-to-end checks passed, the pull request
+   watch runs each criterion's test (the one the criteria map names, else a
+   changed spec that loads the criterion's page) on the base branch's
+   deployment (staging) and on the preview, in the sandbox, with the runner
+   that reproduces a red check (`ci_repro::two_way`, from #754). Both results
+   are kept on the run (`e2e_proof`), said on the run page, and written into
+   the pull request: a proven criterion as a check with both results,
+   anything else as unverified with what each side did
+   (`description_facts::with_two_way`).
+   - Fails on staging, passes on the preview: proven.
+   - Passes on both: it doesn't test the ticket; back to the coder.
+   - Fails on the preview, or no test of the page on the head: back to the
+     coder.
+   - A side that couldn't run (no browser, no network, no address):
+     unverified, with the reason, on the pull request. Never a silent pass.
+
+   Work it sends back is a fix round (`resume::queue_own_review_round`), and
+   the ready decision waits while the proof runs or the round fixes it
+   (`ready::decide`, `e2e_proof::standing`).
 
 7. **Commit and push.**
    Each gate runs where the commit is made, not as a line in the prompt
@@ -202,6 +240,16 @@ The causes were in the loop, not only in prompt wording:
      comment on the pull request, and the ledger records who moved it in.
    (`incidents::sl_scope_decided_once`)
 
+   What people say decides scope as they say it (`Ledger::take_people`).
+   When the ledger is seeded, and on each round's comments (the habits check
+   and the planned-work rounds), an out-of-scope entry that a person's answer
+   or comment asks for moves into scope and records who asked. No
+   `Scope change:` line is needed. From then on, a diff that takes that work
+   out is a breach that goes back to be put back. A comment that keeps the
+   item out moves nothing. One run replied "Understood" to a reviewer's answer
+   and then reverted the work the answer asked for
+   (`incidents::sn_person_answer_moves_scope`).
+
 10. **The description describes the head.**
    On every push the description is rebuilt from the head's facts
    (`description::build`; Problem, Changes, Risk, Verification). The written
@@ -220,6 +268,45 @@ The causes were in the loop, not only in prompt wording:
    verified until it is taken out or moved in. `pr_body::defects` fails a body
    that asks an open product question.
    (`incidents::sm_description_of_the_head`)
+
+11. **A bug is reproduced before it is planned.**
+   For a bug, the planner has `reproduce_on_base` (`passes::reproduce`). The
+   tool runs one call or command in the sandbox on the base branch's head, in
+   the run's test environment, and returns its exit code and output. Each run
+   is kept.
+
+   design.md has a `## Reproduce` section (`common::repro_first::reproduce_gaps`)
+   with these fields:
+   - `Inputs:` lists the ticket's ids and names, with every stored variant a
+     read-only lookup found, and says where they came from.
+   - `Ran on base:` is a command this run ran with the tool.
+   - `Output:` quotes what that command printed.
+   - `Wrong line:` names the `path:line` where the existing code goes wrong.
+
+   A run that tried and can't reproduce writes `Unverified:` with why. It is
+   kept as unverified, never skipped silently.
+
+   The fix goes in the mechanism the wrong line is in (`reuse_gaps`).
+   `## Smallest change` names it, or says why it can't hold the fix. A plan
+   that adds a new resolution path beside it (a keyword match, a new
+   resolver) goes back.
+
+   A question the plan decides with a default goes back unless it carries
+   `Looked up: <what it showed>` or `No lookup settles it: <why>`. This
+   applies when a page load or a query would answer it (`question_gaps`).
+
+   After the build:
+   - **Diff size.** A diff that changes more than 40 lines of code (map and
+     list entries aside) for a ticket that names 1 to 12 records goes back to
+     be narrowed (`minimal_change::whole_path`). A `Wider than the ticket:`
+     line keeps it, with the reason.
+   - **Fail on the base.** Each new test runs on the base and on the head the
+     way CI runs it. That includes a CI loop such as `for t in tests/test_*.py;
+     do python "$t"` (`TestEnv::file_command`, `habits_check::file_cmd`). A
+     bug fix that no test was shown to fail on the base for says `Unverified:`
+     in its description.
+
+   (`incidents::rp_reproduce_before_planning`)
 
 ## What is deterministic
 

@@ -1275,6 +1275,9 @@ pub mod description_facts;
 pub mod dlq_cleanup;
 pub mod e2e;
 pub mod e2e_attribution;
+/// Each ticket criterion's end-to-end test run on staging and on the
+/// preview before the pull request is called done.
+pub(crate) mod e2e_proof;
 pub mod e2e_reads;
 pub mod e2e_screens;
 pub mod e2e_setup;
@@ -1370,6 +1373,8 @@ mod replay;
 #[cfg(test)]
 mod reply_eval;
 pub(crate) mod repo_pick;
+/// The planner reproduces a bug on the base before it plans code.
+mod reproduce;
 mod resolve;
 mod resolved;
 pub mod restack;
@@ -1380,12 +1385,14 @@ pub mod review_activity;
 pub mod review_agent;
 pub mod review_ci;
 pub mod review_configs;
+pub mod review_discipline;
 #[cfg(test)]
 mod review_eval;
 pub(crate) mod review_fingerprint;
 pub mod review_fix;
 pub mod review_labels;
 pub mod review_lessons;
+pub mod review_one_verdict;
 pub mod review_policy;
 #[cfg(test)]
 mod review_policy_eval;
@@ -1935,6 +1942,39 @@ async fn read_ticket_comments(
     Ok(())
 }
 
+/// Turns the account's WAF log group on and keeps what a WAF alarm run
+/// found (best effort): the account's update link carries them from then on.
+async fn remember_waf_logs(
+    state: &WorkerState,
+    team_id: &str,
+    account: &str,
+    got: &common::alarm_evidence::Gathered,
+) {
+    use common::live::aws_account;
+    let table = &state.config.aws_insights_table_name;
+    let stored = aws_account::list(&state.dynamo, table, team_id)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .find(|a| a.account == account);
+    let Some(stored) = stored else { return };
+    let (results, key) = aws_account::waf_logs_after(
+        &stored.waf_log_results,
+        &stored.waf_log_key,
+        &got.waf_log_results,
+        &got.waf_log_key,
+    );
+    let same = stored.waf_logs && results == stored.waf_log_results && key == stored.waf_log_key;
+    if same {
+        return;
+    }
+    if let Err(e) =
+        aws_account::save_waf_logs(&state.dynamo, table, team_id, account, &results, &key).await
+    {
+        warn!(team_id, account, error = %e, "Could not save the account's WAF log settings");
+    }
+}
+
 /// The evidence a run an alert rule started (it has the rule's repo) reads
 /// before planning, when its alarm is an AWS WAF alarm: through the team's
 /// read-only connection to the alarm's account (the alert's topic is in it).
@@ -1977,6 +2017,12 @@ async fn alarm_evidence_for_run(state: &WorkerState, msg: &TicketMessage) -> Opt
     Some(match session {
         Ok(Some(s)) => {
             let got = ae::gather(&s, &alarm, chrono::Utc::now()).await;
+            // The web ACL logs to S3: the account's role stack keeps its
+            // WAF log group on from now on, with the results location and
+            // key this run found, so every later update link carries them.
+            if got.logs_to_s3 {
+                remember_waf_logs(state, &msg.team_id, &account, &got).await;
+            }
             // A refused read is the install's setup item, recorded once for
             // the account; a read that works again clears it.
             let table = &state.config.settings_table_name;
@@ -1996,7 +2042,12 @@ async fn alarm_evidence_for_run(state: &WorkerState, msg: &TicketMessage) -> Opt
                     &got.refused,
                     "an AWS WAF alarm's evidence",
                     &chrono::Utc::now().to_rfc3339(),
-                ) {
+                )
+                .map(|g| common::aws_role_reads::Gap {
+                    waf_log_results: got.waf_log_results.clone(),
+                    waf_log_key: got.waf_log_key.clone(),
+                    ..g
+                }) {
                     common::aws_role_reads::record(&state.dynamo, table, &msg.team_id, &gap).await;
                 }
                 info!(team_id = %msg.team_id, account = %account, refused = ?got.refused, "AWS role lacks reads an alert route needs: install setup item");
@@ -3165,7 +3216,15 @@ async fn run_passes(
         add_progress_note(state, &msg.team_id, run_id, "Plan generated").await;
         // Scope is decided once, here, from the ticket's criteria and the
         // plan, before any code; every later round is held to it.
-        scope_ledger::load_or_seed(state, &msg.team_id, run_id, msg, &plan_result).await;
+        scope_ledger::load_or_seed(
+            state,
+            &msg.team_id,
+            run_id,
+            msg,
+            &plan_result,
+            &scope_ledger::people(msg, &[]),
+        )
+        .await;
     }
     if !plan_final {
         if !plan_was_reused {
