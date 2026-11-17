@@ -13,6 +13,11 @@
 //!   reason for, goes back to be restored or justified.
 //! - **Dependents.** A dependent the plan said it updates, and the branch
 //!   doesn't touch, goes back too.
+//! - **Scope decided once.** What the run's scope ledger put out of scope
+//!   (`common::scope_ledger`) and the change brings back, in code or in a
+//!   test file (tests are exempt from "inside the plan", never from the
+//!   ledger), goes back to be taken out, unless a `Scope change:` line
+//!   cites an acceptance criterion or a person's comment.
 //!
 //! The sandbox runs take up to its full wait, so the check asks for a step
 //! of its own when this one has too little time left
@@ -103,6 +108,10 @@ pub struct PrFacts {
     /// nobody observed.
     #[serde(default)]
     pub wider: Vec<super::minimal_change::Widening>,
+    /// What the change brings back that the run's scope ledger decided is
+    /// out of scope (`common::scope_ledger`), in code or in tests.
+    #[serde(default)]
+    pub out_of_scope: Vec<common::scope_ledger::Breach>,
 }
 
 /// Why the check didn't give a result.
@@ -553,6 +562,10 @@ pub fn blocking(f: &PrFacts, plan: &PlanResult) -> Vec<String> {
     if f.bug && f.tests.is_empty() && !repro_waived(plan) && f.no_tests.contains("no test file") {
         out.push("This is a bug fix and the change has no test that fails without it. Add the test that reproduces the reported failure (it must fail on the base code and pass with the fix).".to_string());
     }
+    // Scope was decided once: what it left out stays out, tests included.
+    for b in &f.out_of_scope {
+        out.push(b.instruction());
+    }
     for o in f.outside_plan.iter().filter(|o| o.why.is_empty()) {
         out.push(format!(
             "`{}` was changed and is no task of the plan. Put it back with `restore_file` (omit `from_ref`), or, when the change truly needs it, say why in your Evidence on a line `Outside the plan: {}: <why>`.",
@@ -593,6 +606,11 @@ pub fn open_findings(f: &PrFacts, plan: &PlanResult) -> Vec<Finding> {
                 (
                     w.point(),
                     "CoderHelm makes the change smaller in its next round on this pull request.",
+                )
+            } else if l.contains("decided is out of scope") {
+                (
+                    "Out of scope brought back",
+                    "CoderHelm takes it out, code and tests, in its next round on this pull request, or records the criterion or comment that moved it in.",
                 )
             } else if l.contains("no task of the plan") {
                 (
@@ -1158,6 +1176,20 @@ async fn check_and_fix(
         .await;
         facts.e2e_missing = e2e_missing(w, &paths).await;
         facts.wider = wider(w, &diff, &evidence.notes).await;
+        let mut ledger =
+            super::scope_ledger::load_or_seed(w.state, &w.msg.team_id, w.run_id, w.msg, w.plan)
+                .await;
+        let comments = super::scope_ledger::comments(w.github, w.msg, w.branch).await;
+        facts.out_of_scope = super::scope_ledger::held(
+            w.state,
+            &w.msg.team_id,
+            w.run_id,
+            &mut ledger,
+            &evidence.notes,
+            &super::scope_ledger::sources(w.msg, &comments),
+            &diff,
+        )
+        .await;
         let blocking = blocking(&facts, w.plan);
         info!(
             run_id = w.run_id,

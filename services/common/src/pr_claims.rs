@@ -45,6 +45,9 @@ pub enum Kind {
     LockfileSync,
     /// A fixed advisory listed as open, or an open one as fixed.
     AdvisoryState,
+    /// Something said out of scope, untouched or put back that the diff
+    /// brings in (`scope_ledger::contradictions`).
+    ScopeContradiction,
 }
 
 /// One statement corrected.

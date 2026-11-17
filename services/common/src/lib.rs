@@ -200,6 +200,9 @@ pub mod pr_steps;
 pub mod pr_template;
 pub mod preview;
 pub mod run_prs;
+/// Scope decided once at plan time, held in every round and in the
+/// description.
+pub mod scope_ledger;
 pub mod waiting_line;
 // review_stats: time-ordered review records for analytics
 /// How a comment reads: the renderer and lint every comment passes before
