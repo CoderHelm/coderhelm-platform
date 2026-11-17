@@ -992,7 +992,9 @@ const CODE_WORDS: &[&str] = &[
     "tohave",
 ];
 
-fn stems(text: &str) -> Vec<String> {
+/// The words of `text` worth matching between a change and a criterion:
+/// five-letter stems, code words left out.
+pub(crate) fn stems(text: &str) -> Vec<String> {
     text.split(|c: char| !c.is_ascii_alphanumeric())
         .flat_map(name_words)
         .filter(|w| w.len() >= 5 && !CODE_WORDS.iter().any(|c| c.eq_ignore_ascii_case(w)))

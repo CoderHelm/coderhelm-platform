@@ -987,6 +987,15 @@ impl CheckRecord {
         !self.stopped && self.rounds < max_rounds
     }
 
+    /// The fix round changed no code but brought what the check asked for
+    /// (a lookup, a check run): the next check judges again on the same
+    /// head, with it, instead of reusing the result from before the round.
+    /// Fewer open findings or not then decides whether fixing goes on
+    /// ([`Self::checked`]).
+    pub fn answered(&mut self) {
+        self.head.clear();
+    }
+
     /// A fix round starts. The first needs no judgment; any later one only
     /// with the stop judge's licence (`passes::stop_judge::CycleLicence`).
     pub fn start_fix(&mut self, _licence: super::stop_judge::CycleLicence) {

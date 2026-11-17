@@ -56,6 +56,8 @@ async fn write_record(state: &WorkerState, run_id: &str, env: &TestEnv) {
 
 /// The run's test environment and the cache key of its install at
 /// `git_ref`, or `None` without a sandbox or a CI job that runs tests.
+/// `focus`: the files the run changes or plans to; the CI job chosen is the
+/// one whose tests run for them (`test_env::from_workflows_for`).
 #[allow(clippy::too_many_arguments)]
 pub async fn for_run(
     state: &WorkerState,
@@ -66,6 +68,7 @@ pub async fn for_run(
     base_branch: &str,
     git_ref: &str,
     run_id: &str,
+    focus: &[String],
 ) -> Option<(TestEnv, String)> {
     if state.config.sandbox_bucket_name.is_empty() || state.config.sandbox_project_name.is_empty() {
         return None;
@@ -78,12 +81,14 @@ pub async fn for_run(
         .filter(|e| e.entry_type == "blob")
         .map(|e| (e.path, e.sha))
         .collect();
+    // A record made for another package's job (an earlier version chose the
+    // first job of the first workflow) is worked out again for these files.
     let env = match read_record(state, run_id).await {
-        Some(env) => env,
-        None => {
+        Some(env) if !env.misses(focus) => env,
+        _ => {
             let workflows = super::preview::workflows(github, owner, repo, base_branch).await;
             let paths: Vec<String> = tree.iter().map(|(p, _)| p.clone()).collect();
-            let env = test_env::from_workflows(&workflows, &paths)?;
+            let env = test_env::from_workflows_for(&workflows, &paths, focus)?;
             write_record(state, run_id, &env).await;
             super::add_progress_note(state, team_id, run_id, &env.summary()).await;
             env

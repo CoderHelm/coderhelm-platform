@@ -164,9 +164,85 @@ fn join(dir: &str, f: &str) -> String {
 }
 
 /// The repository's test environment, from its workflow files
-/// (`(path, text)`): the first job with a test step, its setup before that
-/// step, and its test steps. `None` when no job runs tests.
+/// (`(path, text)`), with no files to aim it at: [`from_workflows_for`].
 pub fn from_workflows(workflows: &[(String, String)], tree: &[String]) -> Option<TestEnv> {
+    from_workflows_for(workflows, tree, &[])
+}
+
+/// The `paths` filters of a workflow's `pull_request` and `push` triggers.
+/// Empty when it runs on every change.
+fn path_filters(doc: &serde_yaml::Value) -> Vec<String> {
+    let Some(on) = doc.get("on") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for event in ["pull_request", "push"] {
+        let Some(e) = on.get(event) else {
+            continue;
+        };
+        if let Some(list) = e.get("paths").and_then(|p| p.as_sequence()) {
+            out.extend(list.iter().map(|p| s(Some(p))).filter(|p| !p.is_empty()));
+        }
+    }
+    out
+}
+
+/// How well a job fits the files a run changes: 0 aims at them (its
+/// workflow's `paths` filter or its working directory covers one), 1 runs
+/// on every change from the repository root, 2 is another package's job
+/// (a filter or a folder none of the files is in). `None` with no files:
+/// every job fits, unfiltered ones first.
+fn fit(filters: &[String], dir: &str, focus: &[String]) -> u8 {
+    let in_dir = |f: &String| dir.is_empty() || f.starts_with(&format!("{dir}/"));
+    if focus.is_empty() {
+        return if filters.is_empty() && dir.is_empty() {
+            1
+        } else {
+            2
+        };
+    }
+    let filtered_in = !filters.is_empty()
+        && focus.iter().any(|f| {
+            filters.iter().any(|g| {
+                !g.starts_with('!') && crate::skill_apply::glob_match(g.trim_start_matches("./"), f)
+            })
+        });
+    if !filters.is_empty() && !filtered_in {
+        return 2;
+    }
+    if !focus.iter().any(in_dir) {
+        return 2;
+    }
+    if filtered_in || !dir.is_empty() {
+        0
+    } else {
+        1
+    }
+}
+
+/// The repository's test environment, from its workflow files
+/// (`(path, text)`): the job whose tests run for `focus` (the files the run
+/// changes or plans to), its setup before its first test step, and its test
+/// steps. `None` when no job runs tests.
+///
+/// A monorepo's first workflow is often another package's (a lambda's
+/// deploy, filtered to its own folder): its `npm ci` and `npm test` say
+/// nothing about a web change, and told to the coder as "the test
+/// environment" they send every sandbox command through the wrong install.
+/// So a job whose workflow filters to other paths, or that runs in a folder
+/// none of the files is in, is taken only when nothing fits better; with no
+/// files, a job that runs on every change from the root comes first.
+pub fn from_workflows_for(
+    workflows: &[(String, String)],
+    tree: &[String],
+    focus: &[String],
+) -> Option<TestEnv> {
+    let focus: Vec<String> = focus
+        .iter()
+        .map(|f| f.trim_start_matches("./").to_string())
+        .filter(|f| !f.is_empty())
+        .collect();
+    let mut best: Option<(u8, TestEnv)> = None;
     for (path, text) in workflows {
         let Ok(doc) = serde_yaml::from_str::<serde_yaml::Value>(text) else {
             continue;
@@ -174,6 +250,7 @@ pub fn from_workflows(workflows: &[(String, String)], tree: &[String]) -> Option
         let Some(jobs) = doc.get("jobs").and_then(|j| j.as_mapping()) else {
             continue;
         };
+        let filters = path_filters(&doc);
         for (name, job) in jobs {
             let Some(steps) = job.get("steps").and_then(|x| x.as_sequence()) else {
                 continue;
@@ -258,10 +335,36 @@ pub fn from_workflows(workflows: &[(String, String)], tree: &[String]) -> Option
             env.manifests = manifests;
             env.env.sort();
             env.env.dedup();
-            return Some(env);
+            // A job whose test steps all run in one folder belongs there.
+            let dir = if env.dir.is_empty() {
+                common_step_dir(&env.test)
+            } else {
+                env.dir.clone()
+            };
+            let rank = fit(&filters, &dir, &focus);
+            if best.as_ref().is_none_or(|(r, _)| rank < *r) {
+                best = Some((rank, env));
+            }
+            if rank == 0 {
+                return best.map(|(_, e)| e);
+            }
         }
     }
-    None
+    best.map(|(_, e)| e)
+}
+
+/// The folder every test step `cd`s into (`(cd <dir> && ...)`), when they
+/// all share one; "" otherwise.
+fn common_step_dir(test: &[String]) -> String {
+    let dirs: Vec<&str> = test
+        .iter()
+        .filter_map(|t| t.strip_prefix("(cd ")?.split(" && ").next())
+        .map(|d| d.trim_end_matches('/'))
+        .collect();
+    match dirs.first() {
+        Some(d) if dirs.len() == test.len() && dirs.iter().all(|x| x == d) => d.to_string(),
+        _ => String::new(),
+    }
 }
 
 fn quote(s: &str) -> String {
@@ -269,6 +372,21 @@ fn quote(s: &str) -> String {
 }
 
 impl TestEnv {
+    /// Whether this is another package's job for `focus` (the files a run
+    /// changes): its tests run in a folder none of them is in.
+    pub fn misses(&self, focus: &[String]) -> bool {
+        let dir = if self.dir.is_empty() {
+            common_step_dir(&self.test)
+        } else {
+            self.dir.clone()
+        };
+        !dir.is_empty()
+            && !focus.is_empty()
+            && !focus
+                .iter()
+                .any(|f| f.trim_start_matches("./").starts_with(&format!("{dir}/")))
+    }
+
     /// The install's name: its steps, versions and the manifests' blob ids
     /// (`shas`: `(path, blob sha)` from the tree at the head).
     pub fn fingerprint(&self, shas: &[(String, String)]) -> String {

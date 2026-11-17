@@ -230,6 +230,12 @@ pub async fn run(
                 &msg.base_branch,
                 branch,
                 rid,
+                // The CI job chosen is the one whose tests run for the
+                // plan's files, never another package's.
+                &super::feature::plan_files::planned_files(&plan.tasks)
+                    .into_iter()
+                    .map(|f| f.path)
+                    .collect::<Vec<_>>(),
             )
             .await
         }
