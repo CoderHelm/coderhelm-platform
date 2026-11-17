@@ -102,7 +102,10 @@ fn with_waf_reads_the_run_gathers_the_evidence_and_moves_to_a_pr() {
     assert_eq!(alarm.rule, "CrawlerASignatureCount");
     // The logging configuration names the bucket; its Glue table is found.
     let bucket = ae::bucket_of("arn:aws:s3:::aws-waf-logs-acme").unwrap();
-    assert!(ae::table_in_bucket("s3://aws-waf-logs-acme/AWSLogs/", &bucket));
+    assert!(ae::table_in_bucket(
+        "s3://aws-waf-logs-acme/AWSLogs/",
+        &bucket
+    ));
     let end = 1_794_916_800;
     let q = ae::athena_query(&log_table(), &alarm.rule, end - 3 * 3600, end).unwrap();
     assert!(q.contains("\"log_time\" BETWEEN '2026/11/17/09' AND '2026/11/17/12'"));
@@ -122,7 +125,15 @@ fn with_waf_reads_the_run_gathers_the_evidence_and_moves_to_a_pr() {
         &[],
     )];
     let rows: Vec<Vec<Option<String>>> = [
-        vec!["ja4", "ja3", "ua", "accept_language", "path", "has_cookie", "requests"],
+        vec![
+            "ja4",
+            "ja3",
+            "ua",
+            "accept_language",
+            "path",
+            "has_cookie",
+            "requests",
+        ],
         vec![
             "t13d1516h2_8daaf6152771_e5627efa2ab1",
             "773906b0efdefa24a7f2b8eb6985bf37",
@@ -157,7 +168,10 @@ fn with_waf_reads_the_run_gathers_the_evidence_and_moves_to_a_pr() {
         "assumption":"update BlockCrawlerASignature to match the JA4 and user agent the logs show",
         "question":"","person_only":"","tried":[],"options":[],"default":"","deadline_hours":0,
         "blocker":"","evidence":[],"category":"","location":""})]));
-    let j = run(sj::judge(&m, Picture::new(Kind::Ask, "plan", "the planner asks")));
+    let j = run(sj::judge(
+        &m,
+        Picture::new(Kind::Ask, "plan", "the planner asks"),
+    ));
     assert!(j.proceeds());
 }
 
@@ -170,7 +184,10 @@ fn without_waf_reads_no_question_and_one_install_item() {
     ];
     let got = ae::evidence(
         &alarm,
-        vec!["Couldn't find the web ACL: CoderHelm's AWS role doesn't allow wafv2:ListWebACLs yet.".into()],
+        vec![
+            "Couldn't find the web ACL: CoderHelm's AWS role doesn't allow wafv2:ListWebACLs yet."
+                .into(),
+        ],
         refused.clone(),
     );
     // One short line in the run names the install's setup item.
@@ -178,8 +195,14 @@ fn without_waf_reads_no_question_and_one_install_item() {
     assert!(got.text.contains("asks nobody"));
     // The install-level item exists, with the one-line update for the role.
     let role = "arn:aws:iam::111122223333:role/CoderhelmReadOnly";
-    let gap = aws_role_reads::gap("111122223333", role, &got.refused, "an AWS WAF alarm's evidence", "t")
-        .expect("the install item");
+    let gap = aws_role_reads::gap(
+        "111122223333",
+        role,
+        &got.refused,
+        "an AWS WAF alarm's evidence",
+        "t",
+    )
+    .expect("the install item");
     assert_eq!(gap.actions, refused);
     let line = common::live::aws::waf_update_line(&gap.role_arn).unwrap();
     assert!(line.ends_with("| base64 -d | bash"));
