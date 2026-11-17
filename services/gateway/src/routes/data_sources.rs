@@ -1585,12 +1585,18 @@ pub async fn aws_setup(
         .and_then(|o| o.account().map(str::to_string))
         .ok_or_else(|| internal("read our account id", "no account".into()))?;
     Ok(Json(json!({
-        "script": live_aws::setup_script(&our_account, &ext),
+        // The database user is made inside the database; the role's
+        // permissions only through CoderHelm's role stack, from this
+        // release's template.
+        "script": live_aws::setup_script(
+            &our_account,
+            &ext,
+            &common::public_urls::log_reader_template_url(),
+            &common::log_reader::trusted_role_prefix(),
+        ),
         "existing": existing_connections(&state, &claims.team_id).await,
         "role_prefix": live_aws::ROLE_PREFIX,
-        // For a role made before the WAF reads: the one line that adds
-        // only those (the install's "AWS role reads" setup item).
-        "waf_update": live_aws::waf_update_line(live_aws::ROLE_PREFIX),
+        "role_name": live_aws::LOG_READER_ROLE,
     })))
 }
 

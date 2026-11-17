@@ -1005,64 +1005,90 @@ pub fn aws_connections(
     }
 }
 
-/// Reads an alert route needs that a team's connected AWS role was
-/// refused (`common::aws_role_reads`): one item for the whole install,
-/// with the one line that adds them in AWS CloudShell. Never a failure,
-/// and never a question on a run: alarm runs go on with what they could
-/// read until it is done. Passes when every connected role read what it
-/// was asked to.
-pub fn aws_role_reads(gaps: &[common::aws_role_reads::Gap]) -> Check {
+/// Every connected AWS account whose role stack needs this release's
+/// one-click update (`common::aws_role_reads::role_update`): a read an
+/// alert route needed was refused (the WAF log group for a WAF alarm), the
+/// role is older than this release, or data sources still read through the
+/// script-made role. One item for the whole install, with the update link,
+/// which an AWS admin of the account reviews and creates: a release never
+/// widens a team's role by itself. Never a failure, and never a question on
+/// a run: runs go on with what they can read until it is done.
+pub fn aws_role_reads(updates: &[common::aws_role_reads::RoleUpdate]) -> Check {
     use common::aws_role_reads::{CHECK_KEY, ITEM_LABEL};
-    let Some(first) = gaps.first() else {
+    let Some(first) = updates.first() else {
         return Check::pass(
             CHECK_KEY,
             X,
             ITEM_LABEL,
-            "Every connected AWS role has the reads its alert routes used.",
+            "Every connected AWS account's role stack has the reads this release and its alert routes use.",
         );
     };
-    let accounts: Vec<&str> = gaps.iter().map(|g| g.account.as_str()).collect();
-    let mut actions: Vec<&str> = Vec::new();
-    for a in gaps.iter().flat_map(|g| g.actions.iter()) {
-        if !actions.contains(&a.as_str()) {
-            actions.push(a);
-        }
-    }
-    let role = if first.role_arn.is_empty() {
-        format!(
-            "arn:aws:iam::{}:role/{}",
-            first.account,
-            common::live::aws::ROLE_PREFIX
-        )
+    let detail = updates
+        .iter()
+        .map(|u| format!("Account {}: {}.", u.account, u.reasons.join("; ")))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let adds = if first.adds.is_empty() {
+        "this release's reads".to_string()
     } else {
-        first.role_arn.clone()
+        first.adds.join(", ")
     };
-    let mut fix = Fix::text(format!(
-        "Paste this one line into AWS CloudShell in account {} (in the region of its WAF log \
-         Athena workgroup). It adds the read-only {} policy to the role: AWS WAF reads, and \
-         queries of the WAF logs through Athena with results only under the workgroup's own \
-         results prefix.",
-        accounts.join(", "),
-        common::live::aws::WAF_POLICY_NAME
-    ))
-    .url("https://docs.coderhelm.com/self-host/integrations#connected-aws-accounts");
-    if let Some(line) = common::live::aws::waf_update_line(&role) {
-        fix = fix.command(line);
+    let mut text = format!(
+        "An AWS admin of account {} opens this link signed in to that account, reviews it and \
+         presses Create stack ({}). It updates CoderHelm's read-only role from this release's \
+         template, adding: {adds}. Every read it adds is listed with its reason on Settings, \
+         Integrations, AWS.",
+        first.account, first.stack_name
+    );
+    if updates.len() > 1 {
+        let others: Vec<&str> = updates[1..].iter().map(|u| u.account.as_str()).collect();
+        text.push_str(&format!(
+            " Accounts {} have their own link on that page.",
+            others.join(", ")
+        ));
     }
     Check::not_ok(
         Status::Warn,
         CHECK_KEY,
         X,
         ITEM_LABEL,
-        format!(
-            "CoderHelm's AWS role in account {} was refused {} ({}).",
-            accounts.join(", "),
-            actions.join(", "),
-            first.needed_for
-        ),
-        "Alarm runs read what the role allows and go on without the rest; no run asks for this.",
-        fix,
+        detail,
+        "Runs read what the role allows and go on without the rest; no run asks for this.",
+        Fix::text(text).url(first.url.clone()),
     )
+}
+
+/// The update each connected account's role stack needs, from the
+/// accounts (with what the team chose in each), the reads runs were
+/// refused and the team's data sources.
+async fn aws_role_updates(
+    state: &AppState,
+    team_id: &str,
+) -> Vec<common::aws_role_reads::RoleUpdate> {
+    let Some(template) =
+        common::log_reader::update_template_url(&common::public_urls::log_reader_template_url())
+    else {
+        return Vec::new();
+    };
+    let (accounts, gaps, sources) = tokio::join!(
+        common::live::aws_account::list(
+            &state.dynamo,
+            &state.config.aws_insights_table_name,
+            team_id
+        ),
+        common::aws_role_reads::list(&state.dynamo, &state.config.settings_table_name, team_id),
+        super::integrations::team_data_sources(state, team_id),
+    );
+    let mut accounts = accounts.unwrap_or_default();
+    super::integrations::with_knowledge_bases(state, team_id, &mut accounts).await;
+    accounts
+        .iter()
+        .filter_map(|a| {
+            let gap = gaps.iter().find(|g| g.account == a.account);
+            let legacy = common::role_move::legacy_in(&sources, &a.account);
+            common::aws_role_reads::role_update(a, gap, legacy, &template)
+        })
+        .collect()
 }
 
 // ── Your own domain ───────────────────────────────────────────────────────
@@ -2048,7 +2074,7 @@ async fn integration_checks(state: &AppState, team_id: &str) -> Vec<Check> {
         super::api::load_jira_secret(state, team_id),
         get_item(state, &state.config.jira_config_table_name, &jira_key),
         aws_connections_check(state),
-        common::aws_role_reads::list(&state.dynamo, &state.config.settings_table_name, team_id),
+        aws_role_updates(state, team_id),
     );
     let forge = jira_config.as_ref().is_some_and(|i| {
         i.get("add_comment_url")
@@ -2894,44 +2920,58 @@ mod tests {
     }
 
     #[test]
-    fn a_read_the_aws_role_lacks_is_one_install_item_with_the_update_line() {
+    fn a_read_the_aws_role_lacks_is_one_install_item_with_the_update_link() {
         use super::{aws_role_reads, Status};
-        use common::aws_role_reads::Gap;
+        use common::aws_role_reads::{role_update, Gap};
+        use common::live::aws_account::AwsAccount;
         let ok = aws_role_reads(&[]);
         assert_eq!(ok.status, Status::Pass);
+        let account = |id: &str| AwsAccount {
+            account: id.into(),
+            role_arn: format!("arn:aws:iam::{id}:role/CoderHelmLogReader"),
+            region: "us-east-1".into(),
+            ..Default::default()
+        };
         let gap = Gap {
             account: "111122223333".into(),
-            role_arn: "arn:aws:iam::111122223333:role/CoderhelmReadOnly".into(),
-            actions: vec![
-                "wafv2:ListWebACLs".into(),
-                "wafv2:GetSampledRequests".into(),
-            ],
+            role_arn: "arn:aws:iam::111122223333:role/CoderHelmLogReader".into(),
+            actions: vec!["glue:GetDatabases".into()],
             needed_for: "an AWS WAF alarm's evidence".into(),
-            seen_at: "2026-11-17T10:00:00Z".into(),
+            ..Default::default()
         };
-        let c = aws_role_reads(&[
-            gap.clone(),
-            Gap {
-                account: "444455556666".into(),
-                ..gap
-            },
-        ]);
+        let t = "https://b.s3.amazonaws.com/launch/v1.2.3/coderhelm-log-reader-update.yaml";
+        let updates = vec![
+            role_update(&account("111122223333"), Some(&gap), 0, t).unwrap(),
+            role_update(&account("444455556666"), None, 2, t).unwrap(),
+        ];
+        let c = aws_role_reads(&updates);
         // A warning for the install, never a failure that blocks an update.
         assert_eq!(c.status, Status::Warn);
         assert_eq!(c.key, "aws_role_reads");
         assert!(
-            c.detail.contains("111122223333, 444455556666"),
+            c.detail.contains(
+                "Account 111122223333: The role CoderHelmLogReader was refused glue:GetDatabases"
+            ),
             "{}",
             c.detail
         );
-        assert!(c
-            .detail
-            .contains("wafv2:ListWebACLs, wafv2:GetSampledRequests"));
+        assert!(
+            c.detail
+                .contains("Account 444455556666: 2 data sources still read"),
+            "{}",
+            c.detail
+        );
         assert!(c.why.contains("no run asks"));
         let fix = c.fix.unwrap();
-        let line = fix.command.unwrap();
-        assert!(line.ends_with(" | base64 -d | bash") && !line.contains('\n'));
-        assert!(fix.text.contains("coderhelm-read-waf"));
+        // The one-click stack update, never a script to paste.
+        assert!(fix.command.is_none());
+        let url = fix.url.unwrap();
+        assert!(
+            url.contains("#/stacks/quickcreate?") && url.contains("param_WafLogs=on"),
+            "{url}"
+        );
+        assert!(fix.text.contains("AWS WAF logs in S3") && fix.text.contains("Create stack"));
+        assert!(fix.text.contains("444455556666"));
     }
 
     #[test]

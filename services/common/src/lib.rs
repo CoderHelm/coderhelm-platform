@@ -78,6 +78,7 @@ pub mod coder_shell;
 /// Chat notifications (Teams and Slack): one message model, a renderer per
 /// channel, sealed webhook URLs.
 pub mod notify;
+pub mod role_move;
 pub mod tool_aliases;
 
 /// The team's daily alert token budget (alerts route and Setup).

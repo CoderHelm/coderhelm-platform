@@ -14,7 +14,8 @@
 //! query on its log group, or, when it logs to an `aws-waf-logs-*` bucket,
 //! one bounded Athena query over the Glue table on that bucket ([`athena_query`]:
 //! the last three hours, the alarm's rule only), in a WAF log workgroup
-//! the role may query (`live::aws::waf_policy_template`). Request values
+//! the role may query (the role template's WAF log group,
+//! `infra/cfn/coderhelm-log-reader.yaml`, `WafLogs`). Request values
 //! that can carry secrets or people's data (client addresses, cookies,
 //! authorization and every other header value but the user agent and
 //! accept language, query strings) are never kept; from the logs in S3,
@@ -542,6 +543,14 @@ fn waf_client(s: &Session) -> aws_sdk_wafv2::Client {
 pub struct Gathered {
     pub text: String,
     pub refused: Vec<String>,
+    /// What the run found for the role stack's WAF log group, so its update
+    /// link names them: the Athena workgroup's results location
+    /// (`bucket/prefix/`, the stack's WafLogResults) and the log bucket's
+    /// customer-managed KMS key (WafLogKey). Empty when not found.
+    pub waf_log_results: String,
+    pub waf_log_key: String,
+    /// The web ACL logs to an S3 bucket (so the WAF log group is needed).
+    pub logs_to_s3: bool,
 }
 
 /// The evidence lines and the refusals met while reading them.
@@ -549,6 +558,9 @@ pub struct Gathered {
 struct Notes {
     lines: Vec<String>,
     refused: Vec<String>,
+    results: String,
+    key: String,
+    logs_to_s3: bool,
 }
 
 impl Notes {
@@ -571,7 +583,12 @@ impl Notes {
     }
 
     fn done(self, alarm: &WafAlarm) -> Gathered {
-        evidence(alarm, self.lines, self.refused)
+        Gathered {
+            waf_log_results: self.results,
+            waf_log_key: self.key,
+            logs_to_s3: self.logs_to_s3,
+            ..evidence(alarm, self.lines, self.refused)
+        }
     }
 }
 
@@ -584,7 +601,28 @@ pub fn evidence(alarm: &WafAlarm, mut lines: Vec<String>, refused: Vec<String>) 
     Gathered {
         text: render(alarm, &lines),
         refused,
+        ..Default::default()
     }
+}
+
+/// Pure: the customer-managed KMS key a bucket's default encryption names,
+/// as an ARN (a bare key id is in the bucket's `region` and `account`).
+/// `None` for SSE-S3, an AWS managed key or an alias: S3 decrypts those
+/// for anyone who may read the object.
+pub fn bucket_key_arn(
+    rules: &[crate::live::aws_settings::EncryptionRule],
+    region: &str,
+    account: &str,
+) -> Option<String> {
+    let id = rules
+        .iter()
+        .filter(|r| r.algorithm.starts_with("aws:kms"))
+        .find_map(|r| r.kms_key.clone())?;
+    if crate::log_reader::is_kms_key(&id) {
+        return Some(id);
+    }
+    let arn = format!("arn:aws:kms:{region}:{account}:key/{id}");
+    crate::log_reader::is_kms_key(&arn).then_some(arn)
 }
 
 /// Read the evidence for a WAF alarm. Every lookup that fails says why in
@@ -742,6 +780,15 @@ pub async fn gather(session: &Session, alarm: &WafAlarm, now: DateTime<Utc>) -> 
                 .extend(fingerprints(session, &region, &name, &query, start, end).await);
         }
         (None, Some(bucket), _) => {
+            n.logs_to_s3 = true;
+            // The bucket's own KMS key, for the role stack's WafLogKey
+            // (its settings, read with the role's settings reads).
+            let b = crate::live::aws_settings::read_bucket(session, &bucket).await;
+            if let crate::live::aws_settings::Read::Got(rules) = &b.encryption {
+                let account = arn.split(':').nth(4).unwrap_or_default();
+                let at = b.region.clone().unwrap_or_else(|| session.region.clone());
+                n.key = bucket_key_arn(rules, &at, account).unwrap_or_default();
+            }
             let mut regions = vec![session.region.clone()];
             if region != session.region {
                 regions.push(region.clone());
@@ -880,9 +927,9 @@ async fn find_log_table(
     None
 }
 
-/// A workgroup the role may query: one of the account's, WAF log ones
-/// first (`live::aws::waf_policy_template` allows only those), enabled,
-/// with a results location; and whether it caps the bytes a query scans.
+/// A workgroup to query: one of the account's, WAF log ones first,
+/// enabled, with a results location (kept in `n` for the role stack's
+/// WafLogResults); and whether it caps the bytes a query scans.
 async fn find_workgroup(athena: &aws_sdk_athena::Client, n: &mut Notes) -> Option<(String, bool)> {
     use aws_sdk_athena::error::ProvideErrorMetadata;
     use aws_sdk_athena::types::WorkGroupState;
@@ -929,13 +976,14 @@ async fn find_workgroup(athena: &aws_sdk_athena::Client, n: &mut Notes) -> Optio
             continue;
         }
         let cfg = wg.configuration();
-        let has_results = cfg
+        let location = cfg
             .and_then(|c| c.result_configuration())
             .and_then(|r| r.output_location())
-            .is_some_and(|l| l.starts_with("s3://"));
-        if !has_results {
+            .filter(|l| l.starts_with("s3://"));
+        let Some(location) = location else {
             continue;
-        }
+        };
+        n.results = crate::log_reader::waf_log_results(location).unwrap_or_default();
         let capped = cfg
             .and_then(|c| c.bytes_scanned_cutoff_per_query())
             .is_some_and(|b| b > 0);
