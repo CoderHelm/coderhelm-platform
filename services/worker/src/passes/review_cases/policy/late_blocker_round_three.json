@@ -1,5 +1,5 @@
 {
-  "description": "Round 1 requested changes on one line; the author fixed it. Round 2 raised a new blocker on a file the fix never touched, and round 3 another: both were on code already reviewed. They become notes, the PR is approved, and round 3 teaches the reviewer to raise blockers up front.",
+  "description": "Round 1 requested changes on one line; the author fixed it. Round 2 raised a new blocker on a file the fix never touched, and round 3 another: both were on code already reviewed. They become notes, the PR is approved, and each one teaches the reviewer to raise blockers up front.",
   "steps": [
     {"push": {"head": "e1e1e1e"}},
     {"review": {"trigger": "synchronize", "dedup_key": "head#e1e1e1e",
@@ -22,9 +22,9 @@
     "formal": [["e1e1e1e", "REQUEST_CHANGES"], ["e2e2e2e", "APPROVE"], ["e3e3e3e", "REQUEST_CHANGES"]],
     "lessons": ["raiseblockersearly"],
     "body_contains": [
-      [1, "should have been raised then"],
+      [1, "my previous review missed it"],
       [2, "Off by one in the new loop"],
-      [2, "should have been raised then"]
+      [2, "my previous review missed it"]
     ]
   }
 }
