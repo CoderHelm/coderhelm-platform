@@ -1000,7 +1000,12 @@ mod tests {
                 .find("Sid: ReadImportBuckets")
                 .expect("the import statements");
             let end = t.find("kms:ViaService").expect("decrypt only through S3");
-            let rest = format!("{}{}", &t[..start], &t[end..]);
+            // And but the WAF log group, which reads only aws-waf-logs-*
+            // objects and decrypts only through S3 with its named key
+            // (the_waf_log_group_reads_and_writes_only_query_results).
+            let waf = t.find("# AWS WAF logs in S3").expect("the WAF log group");
+            assert!(end < waf);
+            let rest = format!("{}{}", &t[..start], &t[end..waf]);
             let all = template_actions(&rest);
             for x in a.actions {
                 assert!(template_actions(t).iter().any(|y| y == x), "{x}");
