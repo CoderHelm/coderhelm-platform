@@ -49,14 +49,21 @@ fn taken() -> Vec<round_agree::TakenOut> {
 fn the_review_commit_is_known_and_what_it_took_out_is_read() {
     assert!(answers_review("CPM-1: Address the review"));
     assert!(answers_review("Address the review comments\n\nbody"));
-    assert!(!answers_review("CPM-1: Finish the planned work still not done"));
+    assert!(!answers_review(
+        "CPM-1: Finish the planned work still not done"
+    ));
     let t = taken();
     assert_eq!(t.len(), 1);
     assert_eq!(t[0].path, EMBED);
     assert!(t[0].lines.iter().any(|l| l.contains("h-svh!")));
     // A trim of a line or two is no take-out.
     let trim = "@@ -1,2 +1,1 @@\n-        className=\"h-svh!\"\n";
-    assert!(round_agree::taken_out(&[(EMBED.into(), BUILD.into())], &[(EMBED.into(), trim.into())], "x").is_empty());
+    assert!(round_agree::taken_out(
+        &[(EMBED.into(), BUILD.into())],
+        &[(EMBED.into(), trim.into())],
+        "x"
+    )
+    .is_empty());
 }
 
 #[test]
@@ -74,7 +81,11 @@ fn a_criterion_keeps_what_the_review_took_out() {
     assert!(sorted.skipped.is_empty(), "{sorted:?}");
     assert_eq!(sorted.build.len(), 1);
     assert!(sorted.build[0].contains("a1b2c3d"), "{}", sorted.build[0]);
-    assert!(sorted.build[0].contains("allow the user to scroll"), "{}", sorted.build[0]);
+    assert!(
+        sorted.build[0].contains("allow the user to scroll"),
+        "{}",
+        sorted.build[0]
+    );
 }
 
 /// No criterion asks for it: the planned-work round doesn't build it again,

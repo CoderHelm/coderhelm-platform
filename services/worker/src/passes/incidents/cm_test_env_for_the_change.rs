@@ -103,7 +103,11 @@ fn a_web_change_gets_the_web_suite_not_the_lambdas() {
     assert!(env.dir.is_empty());
     assert_eq!(env.install, vec!["pnpm install --frozen-lockfile"]);
     assert!(env.test.iter().any(|t| t.contains("--filter web")));
-    assert!(!env.summary().contains("image-resizer"), "{}", env.summary());
+    assert!(
+        !env.summary().contains("image-resizer"),
+        "{}",
+        env.summary()
+    );
     assert!(!env.misses(&focus));
 }
 
