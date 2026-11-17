@@ -710,7 +710,7 @@ mod stale_ci_event_tests {
 }
 
 /// Names of the checks that concluded failure or timed_out.
-fn failing_check_names(checks: &Value) -> std::collections::BTreeSet<String> {
+pub(crate) fn failing_check_names(checks: &Value) -> std::collections::BTreeSet<String> {
     checks["check_runs"]
         .as_array()
         .map(|rs| {
@@ -825,6 +825,12 @@ pub(crate) fn failure_excerpt(logs: &str) -> String {
     let clean = |l: &str| -> String {
         // GitHub's timestamp prefix (`2026-11-11T19:52:01.1234567Z `).
         let t = l.trim();
+        // A step's command echoed back (`\u{1b}[36;1m...`) is the script,
+        // never what failed: a pull request once quoted a comment line of
+        // the workflow as its error.
+        if t.contains("\u{1b}[36;1m") || t.contains("[36;1m") {
+            return String::new();
+        }
         let t = match t.split_once(' ') {
             Some((ts, rest)) if ts.len() >= 20 && ts.as_bytes()[4] == b'-' && ts.ends_with('Z') => {
                 rest
@@ -843,11 +849,20 @@ pub(crate) fn failure_excerpt(logs: &str) -> String {
         MARKS.iter().any(|m| low.contains(m))
             && !low.contains("0 failed")
             && !low.contains("failed: 0")
+            && !zero_errors(&low)
+            && !low.contains("potentially fixable")
     }) else {
         return String::new();
     };
     let joined = lines[i..lines.len().min(i + 4)].join(" / ");
     common::truncate_str(&joined, 400).to_string()
+}
+
+/// A summary that counts no errors (`0 errors and 1 warning`, `(0 errors,`)
+/// says nothing failed.
+fn zero_errors(low: &str) -> bool {
+    low.match_indices("0 error")
+        .any(|(i, _)| i == 0 || !low.as_bytes()[i - 1].is_ascii_digit())
 }
 
 /// Whether a pull request comment is a CI reporter's (a bot that isn't
@@ -1035,9 +1050,11 @@ pub(crate) fn next_attempt_feedback(
          only shows an upload step.\n\
          3. If a test this pull request added or changed fails, read that test and the code it \
          drives, and fix whichever is wrong.\n\
-         4. Only if the failure truly isn't this pull request's (a service outside the repository \
-         is down, a secret is missing), write one line starting `Not this change:` naming the \
-         check, the error line, and what a person must do.\n\n\
+         4. Never call the failure the base branch's, flaky or not this pull request's unless the \
+         comparison of the failing test against the base branch (above) shows it fails there \
+         too; then fix the test, or the code it checks, on this branch and say so in one line \
+         starting `Fails on the base branch too:`. Never take this pull request's work out to \
+         make a check pass.\n\n\
          Fresh evidence:\n{fresh}",
         tried.join("\n")
     )
@@ -1045,10 +1062,13 @@ pub(crate) fn next_attempt_feedback(
 
 /// The pull request's section while CI fails and CoderHelm stopped fixing
 /// it: the checks, the error, what was tried, what is needed.
-pub(crate) const CI_FAILING_START: &str = "<!-- coderhelm:ci-failing -->";
-pub(crate) const CI_FAILING_END: &str = "<!-- /coderhelm:ci-failing -->";
+pub(crate) const CI_FAILING_START: &str = common::ci_lines::FAILING_START;
 
+/// The section names the head it was written on (`common::ci_lines`): every
+/// build of the description takes it out once the head moved or its checks
+/// show no failure.
 pub(crate) fn ci_failing_section(
+    head: &str,
     checks: &[String],
     excerpt: &str,
     tried: &[String],
@@ -1076,22 +1096,13 @@ pub(crate) fn ci_failing_section(
         lines.push(format!("- **Tried:** {}", tried.join("; ")));
     }
     lines.push(format!("- **Needed:** {}", needed.trim()));
-    format!(
-        "{CI_FAILING_START}\n## CI is failing\n{}\n{CI_FAILING_END}",
-        lines.join("\n")
-    )
+    common::ci_lines::failing_section(head, &format!("## CI is failing\n{}", lines.join("\n")))
 }
 
 /// The description with the CI failing section in place (replacing an older
 /// one), right after the ticket line.
 pub(crate) fn with_ci_failing(body: &str, section: &str) -> String {
-    let mut rest = body.to_string();
-    if let (Some(a), Some(b)) = (rest.find(CI_FAILING_START), rest.find(CI_FAILING_END)) {
-        if b > a {
-            rest.replace_range(a..b + CI_FAILING_END.len(), "");
-        }
-    }
-    let rest = rest.replace("\n\n\n\n", "\n\n");
+    let rest = common::ci_lines::without_failing(body);
     let first = rest.lines().next().unwrap_or("").trim().to_string();
     let ticket_first = first.starts_with("Source ticket:")
         || first.starts_with("Closes #")
@@ -1320,13 +1331,14 @@ mod ci_triage_tests {
         let checks = vec!["Deploy Preview".to_string()];
         let excerpt = "Error: expect(received).toBeLessThanOrEqual(expected) / Expected: <= 1";
         let section = ci_failing_section(
+            "abc1234",
             &checks,
             excerpt,
             &["3 attempts changed nothing".into()],
             "a person reads the end-to-end report",
         );
         let body = with_ci_failing("Source ticket: WEB-14\n\n## Summary\nx", &section);
-        assert!(body.starts_with("Source ticket: WEB-14\n\n<!-- coderhelm:ci-failing -->\n## CI is failing\n**CI is failing:** `Deploy Preview`."), "{body}");
+        assert!(body.starts_with("Source ticket: WEB-14\n\n<!-- coderhelm:ci-failing head=abc1234 -->\n## CI is failing\n**CI is failing:** `Deploy Preview`."), "{body}");
         assert!(body.contains("- **Error:** `Error: expect(received)"));
         assert!(body.contains("## Summary\nx"));
         // Written again, it replaces the old section.
@@ -1993,7 +2005,13 @@ pub async fn run(
                         };
                         let (own, base) = split_base_failures(&head_failing, &base_failing);
                         on_base = base;
-                        red_on_base_only = own.is_empty() && !on_base.is_empty();
+                        // An end-to-end check red on the base too names a
+                        // check, not a test: a different test can fail
+                        // there. It is compared test by test in the fix
+                        // round (`ci_repro`) before anything is called not
+                        // this change's.
+                        let e2e_on_base = on_base.iter().any(|c| super::e2e_reads::is_e2e_name(c));
+                        red_on_base_only = own.is_empty() && !on_base.is_empty() && !e2e_on_base;
                         if !red_on_base_only
                             && try_rerun_once(
                                 state,
@@ -2094,7 +2112,7 @@ pub async fn run(
     }
 
     let FixContext {
-        ticket_msg,
+        mut ticket_msg,
         provider,
         github,
         mut usage,
@@ -2161,7 +2179,12 @@ pub async fn run(
         }
         if red_on_base_only {
             // Every failing check fails on the base branch too: red before
-            // this PR. Not a fix attempt, and not Coderhelm's to "fix".
+            // this PR. Not a fix attempt, and not Coderhelm's to "fix". The
+            // comparison is kept on the run first (`ci_repro`).
+            if let Some(h) = branch_head.as_deref().filter(|h| !h.is_empty()) {
+                super::ci_repro::from_ci(state, &github, &ticket_msg, &msg.run_id, h, &on_base)
+                    .await;
+            }
             info!(
                 run_id = msg.run_id,
                 checks = ?on_base,
@@ -2451,6 +2474,67 @@ pub async fn run(
             }
         }
 
+        // The failure as its own report says (the failing test, its error,
+        // the screenshot), and the failing test run against the base
+        // branch's deployment and this pull request's: on record before any
+        // fix, revert or "not this change's" (`ci_repro`).
+        let repro_head = branch_head.clone().unwrap_or_default();
+        let evidence = match failing_wf.first() {
+            Some(check) => {
+                super::ci_repro::read_failure(
+                    &github,
+                    &repo_owner,
+                    &repo_name,
+                    pr_number,
+                    check,
+                    &logs,
+                )
+                .await
+            }
+            None => None,
+        };
+        if !repro_head.is_empty() {
+            if let Some(ev) = evidence.as_ref().filter(|e| !e.tests.is_empty()) {
+                if super::round::may_start(start, std::time::Instant::now()) {
+                    super::ci_repro::compare(
+                        state,
+                        &ticket_msg,
+                        &github,
+                        &provider,
+                        &msg.run_id,
+                        (pr_number, &branch, &repro_head),
+                        ev,
+                    )
+                    .await;
+                }
+            }
+            super::ci_repro::from_ci(
+                state,
+                &github,
+                &ticket_msg,
+                &msg.run_id,
+                &repro_head,
+                &failing_wf,
+            )
+            .await;
+        }
+        let repro = super::ci_repro::load(state, &msg.team_id, &msg.run_id).await;
+        let repro_brief = common::ci_repro::brief(evidence.as_ref(), &repro, &repro_head);
+        // What the pull request and the run say fails: the report's test and
+        // error when it was read, never a line of the workflow script.
+        let excerpt_line = evidence
+            .as_ref()
+            .map(|e| e.line())
+            .unwrap_or_else(|| failure_excerpt(&logs));
+        // The screenshot the failure comment carries is the fixer's to see.
+        if let Some(shot) = evidence.as_ref().and_then(|e| e.shots.first()) {
+            if let Some(img) =
+                super::ci_repro::screenshot(state, &msg.team_id, &msg.run_id, shot).await
+            {
+                ticket_msg.image_attachments.push(img);
+            }
+        }
+
         // Load checkpoint for review cycle count
         let cycle = load_cycle_from_checkpoint(state, &msg.team_id, &msg.run_id).await;
 
@@ -2460,7 +2544,7 @@ pub async fn run(
             state,
             &msg.team_id,
             &msg.run_id,
-            &lock_cause.clone().unwrap_or_else(|| failure_excerpt(&logs)),
+            &lock_cause.clone().unwrap_or_else(|| excerpt_line.clone()),
         )
         .await;
         // A lockfile out of sync with its manifest is repaired by code:
@@ -2558,7 +2642,7 @@ pub async fn run(
                 wall_clock_secs(created_at, &start),
                 &events,
                 super::GaveUp::Budget,
-                &failure_excerpt(&logs),
+                &excerpt_line,
                 &[format!("{cycle} fix cycle(s) on this pull request")],
                 "CoderHelm's fix budget for this run is spent: fix the failing check on this branch, or re-run it if it isn't the change's.",
             )
@@ -2590,7 +2674,7 @@ pub async fn run(
                 wall_clock_secs(created_at, &start),
                 &events,
                 super::GaveUp::Stalled,
-                &failure_excerpt(&logs),
+                &excerpt_line,
                 &["the same failure came back after each fix".to_string()],
                 "A person looks at the failing check: CoderHelm's fixes keep meeting the same failure.",
             )
@@ -2635,13 +2719,23 @@ pub async fn run(
         } else {
             format!("\n\nPR review comments (also address if relevant):\n{review_feedback}")
         };
-        let base_note = if on_base.is_empty() {
+        // A check red on the base too is left alone, except an end-to-end
+        // one: its failing test is compared with the base below.
+        let base_plain: Vec<&String> = on_base
+            .iter()
+            .filter(|c| !super::e2e_reads::is_e2e_name(c))
+            .collect();
+        let base_note = if base_plain.is_empty() {
             String::new()
         } else {
             format!(
                 "\n\nThese checks also fail on {base_branch}, so this PR did not cause them. \
                  Leave them alone: {}.",
-                on_base.join(", ")
+                base_plain
+                    .iter()
+                    .map(|c| c.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             )
         };
 
@@ -2659,7 +2753,7 @@ pub async fn run(
              - NEVER replace a real file with a stub or placeholder to make an error go away — write the complete, working implementation. If you broke a file, use restore_file to recover it, then fix it properly.\n\
              - Before you finish, call run_checks to verify your fix builds and type-checks against real output. Do not finish on a red result if run_checks is available.\n\
              - You may create new test files or edit existing ones if needed.\n\n\
-             Failure summary:\n{failure_logs}\n\n\
+             Failure summary:\n{failure_logs}{repro_brief}\n\n\
              Full logs:\n{logs}{review_context}{base_note}{lock_context}"
         );
 
@@ -2824,7 +2918,7 @@ pub async fn run(
                         wall_clock_secs(created_at, &start),
                         &events,
                         super::GaveUp::Budget,
-                        &failure_excerpt(&logs),
+                        &excerpt_line,
                         &tried,
                         "The failing check needs a change CoderHelm's fix rounds didn't reach in their time: fix it on this branch, or press Retry to give the run a new budget.",
                     )
@@ -2895,9 +2989,14 @@ pub async fn run(
                                 .map(str::trim)
                                 .find(|l| !l.is_empty())
                                 .unwrap_or("no explanation");
+                            // Its account goes on the pull request only as
+                            // far as the record bears it out.
+                            let said =
+                                held_tried(&[said.to_string()], &repro, &repro_head, &excerpt_line)
+                                    .remove(0);
                             tried.push(format!(
                                 "attempt {attempt} changed nothing ({})",
-                                common::truncate_str(said, 240)
+                                common::truncate_str(&said, 240)
                             ));
                             if attempt < max_attempts
                                 && super::round::may_start(start, std::time::Instant::now())
@@ -3000,7 +3099,7 @@ pub async fn run(
                         wall_clock_secs(created_at, &start),
                         &events,
                         super::GaveUp::NoChange,
-                        &failure_excerpt(&logs),
+                        &excerpt_line,
                         &tried,
                         "A person reads the failing check's report (its test name and error are above) and fixes it on this branch, or re-runs it if the failure isn't this change's.",
                     )
@@ -3134,7 +3233,7 @@ pub async fn run(
                             wall_clock_secs(created_at, &start),
                             &events,
                             super::GaveUp::FixError,
-                            &failure_excerpt(&logs),
+                            &excerpt_line,
                             &tried,
                             "Retry the run from its page, or fix the failing check on this branch.",
                         )
@@ -3181,7 +3280,7 @@ pub async fn run(
                 wall_clock_secs(created_at, &start),
                 &events,
                 super::GaveUp::NoProgress,
-                &failure_excerpt(&logs),
+                &excerpt_line,
                 &["fixes stopped changing the code (same files, same bytes)".to_string()],
                 "A person looks at the failing check: CoderHelm's fixes stopped changing the code.",
             )
@@ -6896,6 +6995,27 @@ fn failing_workflows(events: &[RunEvent]) -> Vec<String> {
         .collect()
 }
 
+/// What the fix attempts said, as far as the record bears it out: a line
+/// that calls the failure the base branch's, flaky or not this change's
+/// with no comparison on this head that shows it, or that says the failure
+/// couldn't be confirmed while its report was read (`excerpt`), is
+/// replaced (`common::ci_repro::hold_blame`, `hold_unread`).
+pub(crate) fn held_tried(
+    tried: &[String],
+    records: &[common::ci_repro::Record],
+    head: &str,
+    excerpt: &str,
+) -> Vec<String> {
+    let read = Some(excerpt).filter(|e| !e.trim().is_empty());
+    tried
+        .iter()
+        .map(|t| {
+            let (t, _) = common::ci_repro::hold_blame(t, records, head);
+            common::ci_repro::hold_unread(&t, read).0
+        })
+        .collect()
+}
+
 /// The one way a run stops fixing a red CI: the pull request says what
 /// fails (the check, the error, what was tried, what is needed), stays a
 /// draft through the one ready decision (`ready::decide` holds on a failing
@@ -6967,7 +7087,12 @@ async fn hand_off_red_ci(
         )
         .await;
     }
-    let section = ci_failing_section(&checks, excerpt, tried, needed);
+    // What the fix rounds said goes on the pull request only as far as the
+    // record bears it out (`common::ci_repro`).
+    let head = super::round::branch_head(github, pr.owner, pr.repo, pr.branch).await;
+    let records = super::ci_repro::load(state, &msg.team_id, &msg.run_id).await;
+    let tried = held_tried(tried, &records, &head, excerpt);
+    let section = ci_failing_section(&head, &checks, excerpt, &tried, needed);
     match github.get_pull_request(pr.owner, pr.repo, pr.number).await {
         Ok(p) => {
             let body = with_ci_failing(p["body"].as_str().unwrap_or(""), &section);
@@ -7061,10 +7186,14 @@ pub(crate) async fn end_red_ci_rounds(
         checks.to_vec()
     };
     let ending = super::supervisor::end_of_rounds(&[], &tried.join("; "), &failing);
+    let head = super::round::branch_head(github, pr.owner, pr.repo, branch).await;
+    let records = super::ci_repro::load(state, &msg.team_id, run_id).await;
+    let held = held_tried(tried, &records, &head, excerpt);
     let section = ci_failing_section(
+        &head,
         checks,
         excerpt,
-        tried,
+        &held,
         "Nothing on this branch can come out to make these checks pass, so the run ended \
          failed with this cause; the pull request stays a draft while they fail.",
     );
@@ -7146,7 +7275,8 @@ async fn finish_security_red(
     excerpt: &str,
     tried: &[String],
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let section = ci_failing_section(checks, excerpt, tried, SECURITY_RED_NEEDED);
+    let head = super::round::branch_head(github, pr.owner, pr.repo, pr.branch).await;
+    let section = ci_failing_section(&head, checks, excerpt, tried, SECURITY_RED_NEEDED);
     match github.get_pull_request(pr.owner, pr.repo, pr.number).await {
         Ok(p) => {
             let body = with_ci_failing(p["body"].as_str().unwrap_or(""), &section);
@@ -7213,6 +7343,38 @@ async fn revert_to_green(
     if let Some(note) = revert_dep_commit(state, msg, ticket_msg, github, pr, excerpt).await {
         return Some(note);
     }
+    // Nothing comes out without a comparison on this head that shows this
+    // change makes a check fail (`common::ci_repro::may_revert`): a failure
+    // red on the base branch too, or one nobody compared, is not a reason
+    // to take the pull request's work out. The checks' own results on the
+    // base branch are compared here when nothing else is on record.
+    let head = super::round::branch_head(github, pr.owner, pr.repo, pr.branch).await;
+    let mut records = super::ci_repro::load(state, &msg.team_id, &msg.run_id).await;
+    if common::ci_repro::on_head(&records, &head).is_empty() && !head.is_empty() {
+        let failing: Vec<String> = match github.list_ci_for_ref(pr.owner, pr.repo, &head).await {
+            Ok(c) => failing_check_names(&c).into_iter().collect(),
+            Err(_) => Vec::new(),
+        };
+        super::ci_repro::from_ci(state, github, ticket_msg, &msg.run_id, &head, &failing).await;
+        records = super::ci_repro::load(state, &msg.team_id, &msg.run_id).await;
+    }
+    let shown = match common::ci_repro::may_revert(&records, &head) {
+        common::ci_repro::RevertGate::Allowed(why) => why,
+        common::ci_repro::RevertGate::Refused(why) => {
+            super::add_progress_note(
+                state,
+                &msg.team_id,
+                &msg.run_id,
+                &format!(
+                    "Not reverted: {why}. CoderHelm takes its own work out for a red check only \
+                     after the failing test is shown to pass on the base branch and fail with \
+                     this change."
+                ),
+            )
+            .await;
+            return None;
+        }
+    };
     let reverts = run_number(state, &msg.team_id, &msg.run_id, "sup_reverts").await;
     // Earlier heads of the pull request, newest first, and whether their
     // checks passed (at most ten are read).
@@ -7267,9 +7429,11 @@ async fn revert_to_green(
             common::truncate_str(excerpt.trim(), 200)
         )
     };
+    let mut reverted_to: Option<String> = None;
     let (files, deferred, note): Reverted = match sup::revert_for(&heads, &done, reverts) {
         Revert::Nothing => return None,
         Revert::ToHead(sha) => {
+            reverted_to = Some(sha.clone());
             let changed = github
                 .compare_changed_files(pr.owner, pr.repo, &sha, pr.branch)
                 .await
@@ -7319,9 +7483,10 @@ async fn revert_to_green(
                 files,
                 deferred,
                 format!(
-                    "CI stayed red after the fix attempts: reverted {} file(s) to {short}, the \
-                         last head of this pull request whose checks passed, and deferred what \
-                         came after it. CI decides again.",
+                    "CI stayed red after the fix attempts and the comparison shows this change \
+                         caused it ({shown}): reverted {} file(s) to {short}, the last head of \
+                         this pull request whose checks passed, and deferred what came after it. \
+                         CI decides again.",
                     changed.len()
                 ),
             )
@@ -7341,14 +7506,29 @@ async fn revert_to_green(
                 vec![(path.clone(), was)],
                 deferred,
                 format!(
-                    "CI stayed red after the fix attempts: took out the last planned task \
-                         (`{path}`: {}) and deferred it. CI decides again.",
+                    "CI stayed red after the fix attempts and the comparison shows this change \
+                         caused it ({shown}): took out the last planned task (`{path}`: {}) and \
+                         deferred it. CI decides again.",
                     common::truncate_str(&task, 160)
                 ),
             )
         }
     };
-    apply_revert(state, msg, github, pr, files, &note).await?;
+    let back_to = match &reverted_to {
+        Some(sha) => sha.clone(),
+        None => ticket_msg.base_branch.clone(),
+    };
+    let paths: Vec<String> = files.iter().map(|(p, _)| p.clone()).collect();
+    apply_revert(
+        state,
+        msg,
+        github,
+        pr,
+        files,
+        &note,
+        Some((&back_to, &paths)),
+    )
+    .await?;
     if let Some(mut p) = plan {
         if !deferred.is_empty() {
             p.tasks = super::plan_coverage::with_deferred(&p.tasks, &deferred);
@@ -7420,7 +7600,7 @@ async fn revert_dep_commit(
         files.push((path.clone(), was));
     }
     let note = dep_revert_note(&out.lines, run.commits.len());
-    apply_revert(state, msg, github, pr, files, &note).await?;
+    apply_revert(state, msg, github, pr, files, &note, None).await?;
     super::dep_fix::save(state, ticket_msg, &msg.run_id, &run).await;
     super::dep_fix::settle(state, ticket_msg, &run).await;
     // The head lost a set of bumps: the table and the headline say what it
@@ -7484,7 +7664,7 @@ pub(crate) async fn take_out_dep_set(
         number: pr_number,
         url: "",
     };
-    apply_revert(state, &msg, github, &pr, files, &note).await?;
+    apply_revert(state, &msg, github, &pr, files, &note, None).await?;
     super::dep_fix::save(state, ticket_msg, run_id, &run).await;
     super::dep_fix::settle(state, ticket_msg, &run).await;
     Some(note)
@@ -7520,6 +7700,9 @@ pub(crate) fn dep_revert_note(lines: &[String], commits_left: usize) -> String {
 
 /// Writes a revert as one commit and names it under "Deferred" on the pull
 /// request. `None` when there is nothing to write or GitHub refused it.
+/// `mark`: the ref the files went back to and the files, kept on the line
+/// so the description drops it once that work is back
+/// (`common::ci_lines::reconcile`).
 async fn apply_revert(
     state: &WorkerState,
     msg: &ResumeMessage,
@@ -7527,6 +7710,7 @@ async fn apply_revert(
     pr: &PrRef<'_>,
     files: Vec<(String, Option<String>)>,
     note: &str,
+    mark: Option<(&str, &[String])>,
 ) -> Option<()> {
     use crate::clients::github::FileOp;
     if files.is_empty() {
@@ -7555,7 +7739,10 @@ async fn apply_revert(
     add_run_number(state, &msg.team_id, &msg.run_id, "sup_reverts").await;
     if let Ok(p) = github.get_pull_request(pr.owner, pr.repo, pr.number).await {
         let body = p["body"].as_str().unwrap_or("");
-        let line = format!("- {note}");
+        let line = match mark {
+            Some((to, paths)) => common::ci_lines::revert_line(note, to, paths),
+            None => format!("- {note}"),
+        };
         let now = if body.contains("## Deferred") {
             format!("{}\n{line}", body.trim_end())
         } else {
