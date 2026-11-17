@@ -466,6 +466,8 @@ pub fn held(installation_id: u64) -> bool {
 pub struct SweepGate {
     caller: &'static str,
     skipped: HashSet<u64>,
+    /// The shortest wait a skip named, in seconds.
+    soonest: Option<u64>,
 }
 
 impl SweepGate {
@@ -473,7 +475,16 @@ impl SweepGate {
         Self {
             caller,
             skipped: HashSet::new(),
+            soonest: None,
         }
+    }
+
+    /// Seconds until an installation this sweep skipped may spend again
+    /// (the shortest wait), `None` when it skipped none. The skip line says
+    /// "it looks again in about N min": the sweep's caller makes that true
+    /// (`sweep_follow_up`).
+    pub fn retry_in(&self) -> Option<u64> {
+        self.soonest
     }
 
     /// Installations this sweep skipped.
@@ -499,6 +510,7 @@ impl SweepGate {
             return true;
         };
         self.skipped.insert(installation_id);
+        self.soonest = Some(self.soonest.map_or(wait_secs, |s| s.min(wait_secs)));
         info!(
             installation = installation_id,
             caller = self.caller,
