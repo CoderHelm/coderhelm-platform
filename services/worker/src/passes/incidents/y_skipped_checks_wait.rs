@@ -172,9 +172,14 @@ fn the_draft_is_marked_ready_so_the_checks_that_skip_drafts_run() {
     };
     let red = test_fix::decide(&[], &failed, &Skipped::default(), false, Some(true));
     assert!(matches!(&red, Hold::Failed(w) if w.contains("E2E after staging deploy")));
-    let d = ready::decide(&facts(red, false, &body));
+    let d = ready::found(&facts(red.clone(), false, &body));
     assert!(
         matches!(&d, Decision::Proving { reasons, .. } if reasons[0].what.contains("isn't proven"))
+    );
+    // CoderHelm's note on the ready pull request (incident bv).
+    assert!(
+        matches!(ready::decide(&facts(red, false, &body)), Decision::Ready { open }
+        if open.iter().any(|o| o.contains("isn't proven")))
     );
     let held = ready::body_for(&body, &d).unwrap();
     assert!(held.contains("it isn't proven") && held.contains("E2E after staging deploy"));
@@ -268,19 +273,18 @@ fn a_wait_that_does_not_change_for_two_hours_is_a_hold() {
     f.now = Some(t("2026-11-10T07:35:00Z"));
     assert!(matches!(ready::decide(&f), Decision::Wait { .. }));
     f.now = Some(t("2026-11-10T08:36:00Z"));
-    let d = ready::decide(&f);
-    let Decision::Held { reasons } = &d else {
-        panic!("{d:?}")
-    };
-    assert!(reasons[0]
-        .what
-        .contains("hasn't changed in 2 hours on this head"));
-    assert!(reasons[0].what.starts_with(why));
-    // The hold it became stays one on that head, and a push starts over.
-    let mut held = DraftHold::new(Kind::Held, reasons.clone(), 1508, "").unwrap();
-    held.head = "bcf845d".into();
-    f.prior = Some(held);
-    assert!(matches!(ready::decide(&f), Decision::Held { .. }));
+    // Stalled: CoderHelm acts again on that head (incident bv), and once its
+    // attempts are spent the wait is its note on a ready pull request.
+    assert!(matches!(
+        ready::decide(&f),
+        Decision::Retry { attempt: 1, .. }
+    ));
+    let mut spent = prior.clone();
+    spent.retried = ready::MAX_STALL_RETRIES;
+    f.prior = Some(spent);
+    assert!(matches!(ready::decide(&f), Decision::Ready { open }
+        if open.iter().any(|o| o.contains(why))));
+    // A push starts over.
     f.head = "0a1b2c3".into();
     assert!(matches!(ready::decide(&f), Decision::Wait { .. }));
 }

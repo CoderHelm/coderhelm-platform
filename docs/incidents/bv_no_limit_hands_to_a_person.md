@@ -1,0 +1,5 @@
+# bv. `bv_no_limit_hands_to_a_person`
+
+**What happened:** Four paths still ended a pull request "for a person" over CoderHelm's own limits: a security fix whose CI stayed red after its fix rounds stayed a draft with "Fix the failing checks on this branch" and the run waited or failed; a wait unchanged for two hours on one head became "Look at why it didn't happen ... or mark it ready yourself"; description lines (security items, planned work not finished, a check the change didn't pass, review findings) each held the draft with a person's to-do; and GitHub refusing to mark a pull request ready counted as a person's.
+
+**The guarantee:** Only a reason on the human-only list keeps a draft for a person, made only by `Reason::person`; everything else, once CoderHelm's attempts are spent, is its note on a pull request that goes ready. A stalled wait is CoderHelm's next action (its checks run on the head again), twice, then its note. A security fix whose CI stays red after every set of bumps that could come out did is completed and ready with the failing checks as its note. The run guard waits on a person only with a human-only reason.
