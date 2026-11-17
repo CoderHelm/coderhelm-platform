@@ -1258,6 +1258,7 @@ pub mod base_images;
 pub mod bedrock_sync;
 mod branch_update;
 mod checks;
+pub(crate) mod ci_repro;
 pub mod code_graph;
 mod completeness;
 pub mod conventions;

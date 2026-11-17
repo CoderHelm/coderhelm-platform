@@ -160,6 +160,11 @@ pub mod knowledge;
 pub mod repo_read;
 // The test that every model call site is a metered helper
 pub mod ci_cover;
+/// The lines a pull request carries about its own CI, true for its head.
+pub mod ci_lines;
+/// A red check reproduced against the base branch before anything is
+/// decided about it.
+pub mod ci_repro;
 /// The last check on a pull request description: no section twice, no
 /// deploy maps, no empty "who this affects".
 pub mod description_lint;
