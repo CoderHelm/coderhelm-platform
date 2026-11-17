@@ -127,7 +127,58 @@ The causes were in the loop, not only in prompt wording:
    wins: it is built, and the reply to the review says why
    (`round_agree`, `incidents::co_rounds_agree`).
 
-8. **Scope is decided once.**
+8. **Commit and push.**
+   Each gate runs where the commit is made, not as a line in the prompt
+   (`common::push_gate`, `passes/push_checks.rs`).
+
+   - **The checks come from the repository.** `run_checks` adds the scripts
+     of each package that owns a touched file: its test script, its type
+     check (`check-types`, `typecheck`) and its lint. When a non-test file
+     changed, the package's whole unit suite runs, because a shared helper
+     breaks callers outside the diff. Only a change to nothing but test
+     files runs just those files. This step replaces the test line taken
+     from the first workflow that had one. On one pull request that line was
+     another package's `npm test --passWithNoTests`: it reported "2 of 2
+     checks passed" while `vitest` on the touched files exited 1.
+   - **Checks before every push** (`push_checks::before_push`, in the CI fix
+     round before `round::land`). If the checks ran on the fix's last edit
+     and passed, the fix is pushed and the commit records what ran. If they
+     failed, or never ran on the last edit, the fix is not pushed: the next
+     attempt continues on the same edits with the failing output. If the
+     sandbox couldn't run them (the install failed, or there is no sandbox),
+     the fix is pushed with an `Unverified:` line saying why and what ran.
+   - **The message matches the diff** (`round::land`,
+     `push_gate::true_message`). A message is rewritten from the diff when
+     it says revert, remove or drop while the diff adds test lines or more
+     than it removes, when it says add while the diff only removes, or when
+     it names a file the commit doesn't touch.
+   - **A revert takes its tests with it** (`push_gate::removed_symbols`,
+     `still_expected`). A commit that removes a definition a test still
+     names is held until that test is reverted or updated in the same
+     commit.
+   - **Two fixes per failing test** (`push_gate::FixLedger`, kept on the run
+     as `ci_test_fixes`). The failing tests are read from the failure report
+     or the log (vitest, jest, Playwright, pytest, cargo, go), or, when they
+     can't be, the failing checks are used. After two pushed fixes a test that
+     is still red stops the rounds: the pull request and the run name the
+     test and its error, and nothing more is pushed. The branch is never
+     rolled back to an older green head, and a planned task is never taken
+     out to turn CI green. Only a dependency run's newest set of bumps comes
+     out (`resume::take_out_failing_bumps`). Five of 53 runs had rolled back,
+     two of them with tests left behind that expected the reverted code.
+   - **No log is no reason to stop** (`push_gate::logs_unread_brief`,
+     `hold_no_logs`). When CI's job log can't be read, the fix brief gives
+     the owning package's commands so the fixer reproduces the failure in the
+     sandbox. Any sentence that blames the missing log is replaced.
+   - **Fixtures use looked-up ids, and tests are sized to the behaviour**
+     (`minimal_change::made_up_ids`, `repeated_cases`, in the habits check).
+     Ids like `sport-a` or `id-1` are sent back when the run's lookups
+     returned real ids. Three or more added cases that differ only in their
+     values are sent back as one case per behaviour. The size check (test
+     lines against code lines) runs too; it fires on the roughly 415 test
+     lines one run added for 50 lines of code.
+
+9. **Scope is decided once.**
    The plan writes `## Out of scope` in design.md, one `- <item>: <why>` line
    each, naming the code that would show it (backticked names, paths, routes).
    A product question the ticket doesn't settle is decided there with its
@@ -151,7 +202,7 @@ The causes were in the loop, not only in prompt wording:
      comment on the pull request, and the ledger records who moved it in.
    (`incidents::sl_scope_decided_once`)
 
-9. **The description describes the head.**
+10. **The description describes the head.**
    On every push the description is rebuilt from the head's facts
    (`description::build`; Problem, Changes, Risk, Verification). The written
    text is held to the head and the ledger (`description_facts::hold_scope`):

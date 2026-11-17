@@ -2285,6 +2285,8 @@ pub async fn run(
             }
         }
 
+        // No job log read: the fixer reproduces the failure locally first.
+        let logs_unread = all_logs.is_empty();
         let logs = if !all_logs.is_empty() {
             all_logs.join("\n\n--- Next workflow ---\n\n")
         } else {
@@ -2527,6 +2529,29 @@ pub async fn run(
             .as_ref()
             .map(|e| e.line())
             .unwrap_or_else(|| failure_excerpt(&logs));
+        // CI's job log couldn't be read: the fixer gets the owning packages'
+        // own commands to reproduce the failure in the sandbox, never a
+        // reason to stop (`common::push_gate::logs_unread_brief`).
+        let logs_brief = if logs_unread {
+            let changed = github
+                .compare_changed_files(&repo_owner, &repo_name, &base_branch, &branch)
+                .await
+                .unwrap_or_default();
+            let cmds: Vec<String> = super::push_checks::package_steps(
+                &github,
+                &repo_owner,
+                &repo_name,
+                &branch,
+                &changed,
+            )
+            .await
+            .into_iter()
+            .map(|s| s.cmd)
+            .collect();
+            common::push_gate::logs_unread_brief(&failing_wf, &cmds)
+        } else {
+            String::new()
+        };
         // The screenshot the failure comment carries is the fixer's to see.
         if let Some(shot) = evidence.as_ref().and_then(|e| e.shots.first()) {
             if let Some(img) =
@@ -2682,6 +2707,51 @@ pub async fn run(
             .await;
         }
 
+        // Two pushed fixes per failing test (`common::push_gate::FixLedger`):
+        // a test still red after them stops the rounds, named with its error
+        // on the pull request and the run. No more pushes, and never a
+        // rollback of the branch.
+        let failing_keys = super::push_checks::failing_keys(
+            evidence.as_ref().map_or(&[][..], |e| &e.tests[..]),
+            &logs,
+            &failing_wf,
+        );
+        let ledger = super::push_checks::load_ledger(state, &msg.team_id, &msg.run_id).await;
+        if let Some(stop) = ledger.stop(&failing_keys) {
+            let error = evidence
+                .as_ref()
+                .map(|e| e.error.clone())
+                .filter(|e| !e.trim().is_empty())
+                .unwrap_or_else(|| excerpt_line.clone());
+            let text = stop.text(&error);
+            warn!(
+                run_id = msg.run_id,
+                test = stop.test,
+                "A failing test stayed red after two pushed fixes: the fix rounds stop"
+            );
+            return hand_off_red_ci(
+                state,
+                &msg,
+                &ticket_msg,
+                &github,
+                &PrRef {
+                    owner: &repo_owner,
+                    repo: &repo_name,
+                    branch: &branch,
+                    number: pr_number,
+                    url: &pr_url,
+                },
+                &usage,
+                wall_clock_secs(created_at, &start),
+                &events,
+                super::GaveUp::Stalled,
+                &excerpt_line,
+                std::slice::from_ref(&text),
+                &text,
+            )
+            .await;
+        }
+
         // Implement fix
         let repo_full = format!("{repo_owner}/{repo_name}");
         let ci_fix = super::webhooks::CiFix {
@@ -2754,7 +2824,7 @@ pub async fn run(
              - NEVER replace a real file with a stub or placeholder to make an error go away — write the complete, working implementation. If you broke a file, use restore_file to recover it, then fix it properly.\n\
              - Before you finish, call run_checks to verify your fix builds and type-checks against real output. Do not finish on a red result if run_checks is available.\n\
              - You may create new test files or edit existing ones if needed.\n\n\
-             Failure summary:\n{failure_logs}{repro_brief}\n\n\
+             Failure summary:\n{failure_logs}{repro_brief}{logs_brief}\n\n\
              Full logs:\n{logs}{review_context}{base_note}{lock_context}"
         );
 
@@ -2926,20 +2996,90 @@ pub async fn run(
                     .await;
                     }
                     Ok(mut result) => {
-                        // One commit, one push: the fix lands on the pull request.
-                        let message = super::round::round_message(
-                            state,
-                            &msg.team_id,
-                            &ticket_msg,
-                            &ci_round,
-                        )
-                        .await;
                         let gh = super::round::Pr {
                             github: &github,
                             owner: &repo_owner,
                             repo: &repo_name,
                             branch: &branch,
                         };
+                        // The push gate (`push_checks::before_push`): a fix
+                        // whose checks are red or never ran on its last
+                        // edit, or that takes out what a test still names,
+                        // isn't pushed. One the sandbox couldn't check goes
+                        // with an `Unverified:` line.
+                        let mut unverified = None;
+                        if !result.files_modified.is_empty() {
+                            match super::push_checks::before_push(
+                                &gh,
+                                &ci_round.wip_branch,
+                                &ci_round.base_sha,
+                                &result.evidence.sandbox,
+                                &result.evidence.checks,
+                                &result.files_modified,
+                            )
+                            .await
+                            {
+                                super::push_checks::Gate::Push(line) => unverified = line,
+                                super::push_checks::Gate::Hold(why) => {
+                                    let why = why.join(" ");
+                                    tried.push(format!("attempt {attempt} wasn't pushed: {why}"));
+                                    if attempt < max_attempts
+                                        && super::round::may_start(start, std::time::Instant::now())
+                                    {
+                                        attempt += 1;
+                                        super::add_progress_note(
+                                            state,
+                                            &msg.team_id,
+                                            &msg.run_id,
+                                            &format!(
+                                                "CI fix attempt {} wasn't pushed: {why} Attempt {attempt} continues on its edits.",
+                                                attempt - 1
+                                            ),
+                                        )
+                                        .await;
+                                        feedback = next_attempt_feedback(
+                                            &base_feedback,
+                                            attempt,
+                                            max_attempts,
+                                            &tried,
+                                            &why,
+                                        );
+                                        continue 'fix;
+                                    }
+                                    super::round::clear(state, &msg.team_id, &msg.run_id).await;
+                                    super::webhooks::emit_ci_fix_completed(
+                                        state, &ci_fix, "held", 0,
+                                    )
+                                    .await;
+                                    return hand_off_red_ci(
+                                        state,
+                                        &msg,
+                                        &ticket_msg,
+                                        &github,
+                                        &pr_ref,
+                                        &usage,
+                                        wall_clock_secs(created_at, &start),
+                                        &events,
+                                        super::GaveUp::Stalled,
+                                        &excerpt_line,
+                                        &tried,
+                                        &format!("No fix was pushed: {why}"),
+                                    )
+                                    .await;
+                                }
+                            }
+                        }
+                        // One commit, one push: the fix lands on the pull request.
+                        let mut message = super::round::round_message(
+                            state,
+                            &msg.team_id,
+                            &ticket_msg,
+                            &ci_round,
+                        )
+                        .await;
+                        if let Some(line) = &unverified {
+                            message = format!("{message}\n\n{line}");
+                        }
                         match super::round::land(
                             &gh,
                             &ci_round.wip_branch,
@@ -2948,7 +3088,16 @@ pub async fn run(
                         )
                         .await
                         {
-                            super::round::Landed::Pushed { .. } => {}
+                            super::round::Landed::Pushed { .. } => {
+                                // One more pushed fix for each failing test.
+                                super::push_checks::record_push(
+                                    state,
+                                    &msg.team_id,
+                                    &msg.run_id,
+                                    &failing_keys,
+                                )
+                                .await;
+                            }
                             super::round::Landed::Nothing => result.files_modified.clear(),
                             super::round::Landed::Refused(why) => break 'attempt Some(why),
                         }
@@ -7138,7 +7287,9 @@ pub(crate) fn held_tried(
         .iter()
         .map(|t| {
             let (t, _) = common::ci_repro::hold_blame(t, records, head);
-            common::ci_repro::hold_unread(&t, read).0
+            let t = common::ci_repro::hold_unread(&t, read).0;
+            // An unreadable job log is never the reason given.
+            common::push_gate::hold_no_logs(&t, "").0
         })
         .collect()
 }
@@ -7163,12 +7314,11 @@ async fn hand_off_red_ci(
     tried: &[String],
     needed: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // The supervisor's last rungs before a run with red checks ends: take
-    // out what broke them (back to the last green head of this pull
-    // request, else the last planned task), defer it with why, and let CI
-    // decide again. Only when nothing can come out does the run end, failed
-    // with exactly what fails (`wait_on_person`), never as a wait.
-    if let Some(note) = revert_to_green(state, msg, ticket_msg, github, pr, excerpt).await {
+    // A dependency fix run's newest set of bumps comes out first, deferred
+    // with why, and CI decides again. Nothing else ever comes out: a ticket
+    // run's branch keeps its work, and the pull request says exactly what
+    // fails (`wait_on_person`), never as a wait.
+    if let Some(note) = take_out_failing_bumps(state, msg, ticket_msg, github, pr, excerpt).await {
         mark_events_processed(state, &msg.run_id, events).await;
         super::add_progress_note(state, &msg.team_id, &msg.run_id, &note).await;
         if set_run_awaiting_ci(
@@ -7253,10 +7403,10 @@ async fn hand_off_red_ci(
 
 /// The CI fix rounds outside the run's own CI loop (the CI-only rounds on a
 /// finished run's pull request) ended by the supervisor's rule with checks
-/// still red: the supervisor's ending, as [`hand_off_red_ci`] has it. What
-/// broke the checks comes out first ([`revert_to_green`]), deferred and
-/// named on the pull request, and the run waits for CI on the result like
-/// any finished run. When nothing can come out the run ends failed, with
+/// still red: the supervisor's ending, as [`hand_off_red_ci`] has it. A
+/// dependency run's newest set of bumps comes out first
+/// ([`take_out_failing_bumps`]), deferred and named on the pull request,
+/// and the run waits for CI on the result. Otherwise the run ends failed, with
 /// the failing checks, the error and what was tried on the pull request
 /// and as the run's cause (`supervisor::end_of_rounds`); the pull request
 /// stays a draft while the checks are red. Never a wait on a person.
@@ -7286,7 +7436,8 @@ pub(crate) async fn end_red_ci_rounds(
         number,
         url,
     };
-    if let Some(note) = revert_to_green(state, &msg, ticket_msg, github, &pr, excerpt).await {
+    if let Some(note) = take_out_failing_bumps(state, &msg, ticket_msg, github, &pr, excerpt).await
+    {
         super::add_progress_note(state, &msg.team_id, run_id, &note).await;
         set_run_awaiting_ci(
             state, ticket_msg, run_id, url, number, branch, usage, duration,
@@ -7446,17 +7597,17 @@ async fn finish_security_red(
     .await
 }
 
-/// What a revert writes (each path with its content, or `None` to remove
-/// it), the tasks it defers with why, and the note to record.
-type Reverted = (Vec<(String, Option<String>)>, Vec<(String, String)>, String);
-
-/// Takes out what broke the checks, per [`super::supervisor::revert_for`]:
-/// one commit that puts every file changed since the last green head back
-/// as it was there, or the last planned task's file back as the base branch
-/// has it. The reverted work is deferred on the checklist and named on the
-/// pull request. Returns the note to record, or `None` when nothing can
-/// come out (no green head, one task or none, or the reverts are spent).
-async fn revert_to_green(
+/// What comes out of a pull request whose checks stay red after the fix
+/// attempts: only a dependency fix run's newest set of verified bumps
+/// ([`revert_dep_commit`]), deferred with the check that failed; a set of
+/// bumps is the run's own scope to narrow. Never a rollback of the code: a
+/// ticket run's branch is never put back to an older green head or stripped
+/// of a planned task to turn CI green. Two pull requests had seven and one
+/// of their files put back that way, each with tests left behind that
+/// expected the reverted code. Their rounds stop instead, naming the
+/// failing test and its error (`common::push_gate::FixLedger`). Returns the
+/// note to record, or `None` when nothing comes out.
+async fn take_out_failing_bumps(
     state: &WorkerState,
     msg: &ResumeMessage,
     ticket_msg: &TicketMessage,
@@ -7464,205 +7615,7 @@ async fn revert_to_green(
     pr: &PrRef<'_>,
     excerpt: &str,
 ) -> Option<String> {
-    use super::supervisor::{self as sup, Revert};
-    // A dependency fix run takes out its newest commit of verified bumps
-    // and keeps the ones before it: only what breaks CI is deferred.
-    if let Some(note) = revert_dep_commit(state, msg, ticket_msg, github, pr, excerpt).await {
-        return Some(note);
-    }
-    // Nothing comes out without a comparison on this head that shows this
-    // change makes a check fail (`common::ci_repro::may_revert`): a failure
-    // red on the base branch too, or one nobody compared, is not a reason
-    // to take the pull request's work out. The checks' own results on the
-    // base branch are compared here when nothing else is on record.
-    let head = super::round::branch_head(github, pr.owner, pr.repo, pr.branch).await;
-    let mut records = super::ci_repro::load(state, &msg.team_id, &msg.run_id).await;
-    if common::ci_repro::on_head(&records, &head).is_empty() && !head.is_empty() {
-        let failing: Vec<String> = match github.list_ci_for_ref(pr.owner, pr.repo, &head).await {
-            Ok(c) => failing_check_names(&c).into_iter().collect(),
-            Err(_) => Vec::new(),
-        };
-        super::ci_repro::from_ci(state, github, ticket_msg, &msg.run_id, &head, &failing).await;
-        records = super::ci_repro::load(state, &msg.team_id, &msg.run_id).await;
-    }
-    let shown = match common::ci_repro::may_revert(&records, &head) {
-        common::ci_repro::RevertGate::Allowed(why) => why,
-        common::ci_repro::RevertGate::Refused(why) => {
-            super::add_progress_note(
-                state,
-                &msg.team_id,
-                &msg.run_id,
-                &format!(
-                    "Not reverted: {why}. CoderHelm takes its own work out for a red check only \
-                     after the failing test is shown to pass on the base branch and fail with \
-                     this change."
-                ),
-            )
-            .await;
-            return None;
-        }
-    };
-    let reverts = run_number(state, &msg.team_id, &msg.run_id, "sup_reverts").await;
-    // Earlier heads of the pull request, newest first, and whether their
-    // checks passed (at most ten are read).
-    let commits = github
-        .list_pr_commits(pr.owner, pr.repo, pr.number)
-        .await
-        .unwrap_or_default();
-    let shas: Vec<String> = commits
-        .iter()
-        .filter_map(|c| c["sha"].as_str().map(str::to_string))
-        .collect();
-    let mut heads = Vec::new();
-    for sha in shas.iter().rev().skip(1).take(10) {
-        let green = match github.list_ci_for_ref(pr.owner, pr.repo, sha).await {
-            Ok(c) => matches!(ci_verdict_from_checks(&c), CiVerdict::Green),
-            Err(_) => false,
-        };
-        heads.push((sha.clone(), green));
-        if green {
-            break;
-        }
-    }
-    // The planned tasks done, in plan order.
-    let mut done: Vec<(String, String)> = Vec::new();
-    let plan = super::run_plan_files(state, ticket_msg).await;
-    if let Some(p) = &plan {
-        let tasks =
-            super::plan_coverage::tasks_for(github, pr.owner, pr.repo, pr.branch, &p.tasks).await;
-        if let Some(c) = super::plan_coverage::plan_changes(
-            github,
-            pr.owner,
-            pr.repo,
-            &ticket_msg.base_branch,
-            pr.branch,
-        )
-        .await
-        {
-            done = c
-                .coverage(&tasks)
-                .done
-                .into_iter()
-                .filter(|t| !t.generated)
-                .map(|t| (t.path, t.task))
-                .collect();
-        }
-    }
-    let what = if excerpt.trim().is_empty() {
-        "the failing checks".to_string()
-    } else {
-        format!(
-            "the failing checks ({})",
-            common::truncate_str(excerpt.trim(), 200)
-        )
-    };
-    let mut reverted_to: Option<String> = None;
-    let (files, deferred, note): Reverted = match sup::revert_for(&heads, &done, reverts) {
-        Revert::Nothing => return None,
-        Revert::ToHead(sha) => {
-            reverted_to = Some(sha.clone());
-            let changed = github
-                .compare_changed_files(pr.owner, pr.repo, &sha, pr.branch)
-                .await
-                .ok()?;
-            // Only what CoderHelm's own commits after the green head changed
-            // goes back (`supervisor::own_revert_paths`): never a file a
-            // merge of the base brought in, never one only a person changed.
-            let at = shas.iter().position(|s| *s == sha)?;
-            let mut after = Vec::new();
-            for c in commits.iter().skip(at + 1) {
-                let Some(c_sha) = c["sha"].as_str() else {
-                    continue;
-                };
-                let (_, files) = github.commit_stats(pr.owner, pr.repo, c_sha).await.ok()?;
-                after.push(sup::AfterGreen {
-                    own: crate::clients::github::is_bot_commit(c),
-                    merge: c["parents"].as_array().is_some_and(|p| p.len() > 1),
-                    files,
-                });
-            }
-            let changed = sup::own_revert_paths(&changed, &after);
-            if changed.is_empty() {
-                return None;
-            }
-            let mut files = Vec::new();
-            for path in &changed {
-                let was = github
-                    .read_file_if_exists(pr.owner, pr.repo, path, &sha)
-                    .await
-                    .ok()?;
-                files.push((path.clone(), was));
-            }
-            let deferred: Vec<(String, String)> = done
-                .iter()
-                .filter(|(p, _)| changed.contains(p))
-                .map(|(p, _)| {
-                    (
-                        p.clone(),
-                        format!(
-                            "deferred: its change broke {what}; reverted to the last green head"
-                        ),
-                    )
-                })
-                .collect();
-            let short: String = sha.chars().take(7).collect();
-            (
-                files,
-                deferred,
-                format!(
-                    "CI stayed red after the fix attempts and the comparison shows this change \
-                         caused it ({shown}): reverted {} file(s) to {short}, the last head of \
-                         this pull request whose checks passed, and deferred what came after it. \
-                         CI decides again.",
-                    changed.len()
-                ),
-            )
-        }
-        Revert::Task { path, task } => {
-            let was = github
-                .read_file_if_exists(pr.owner, pr.repo, &path, &ticket_msg.base_branch)
-                .await
-                .ok()?;
-            let deferred = vec![(
-                path.clone(),
-                format!(
-                    "deferred: its change broke {what} and the fixes didn't repair it; reverted"
-                ),
-            )];
-            (
-                vec![(path.clone(), was)],
-                deferred,
-                format!(
-                    "CI stayed red after the fix attempts and the comparison shows this change \
-                         caused it ({shown}): took out the last planned task (`{path}`: {}) and \
-                         deferred it. CI decides again.",
-                    common::truncate_str(&task, 160)
-                ),
-            )
-        }
-    };
-    let back_to = match &reverted_to {
-        Some(sha) => sha.clone(),
-        None => ticket_msg.base_branch.clone(),
-    };
-    let paths: Vec<String> = files.iter().map(|(p, _)| p.clone()).collect();
-    apply_revert(
-        state,
-        msg,
-        github,
-        pr,
-        files,
-        &note,
-        Some((&back_to, &paths)),
-    )
-    .await?;
-    if let Some(mut p) = plan {
-        if !deferred.is_empty() {
-            p.tasks = super::plan_coverage::with_deferred(&p.tasks, &deferred);
-            super::save_checked_tasks(state, ticket_msg, &msg.run_id, &p.tasks).await;
-        }
-    }
-    Some(note)
+    revert_dep_commit(state, msg, ticket_msg, github, pr, excerpt).await
 }
 
 /// What fails, for a deferral's reason: the cause the fix round recorded
@@ -7855,7 +7808,7 @@ async fn apply_revert(
             pr.owner,
             pr.repo,
             pr.branch,
-            "Revert the change that broke CI; it is deferred on the pull request",
+            "Take out the newest set of dependency bumps; CI failed with it, and it is deferred on the pull request",
             &ops,
         )
         .await

@@ -168,6 +168,8 @@ pub mod ci_repro;
 /// The last check on a pull request description: no section twice, no
 /// deploy maps, no empty "who this affects".
 pub mod description_lint;
+/// A test fixture uses the ids the run looked up, not made-up ones.
+pub mod fixture_ids;
 // A diff holds the lines the change needs: formatting-only hunks are told
 // apart and put back.
 pub mod diff_shape;
@@ -204,6 +206,8 @@ pub mod pr_steps;
 /// A repository's pull request template as the description's structure.
 pub mod pr_template;
 pub mod preview;
+/// What a fix must show before it is committed and pushed.
+pub mod push_gate;
 pub mod run_prs;
 /// Scope decided once at plan time, held in every round and in the
 /// description.

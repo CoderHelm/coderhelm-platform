@@ -28,11 +28,14 @@
 //!     tasks left are deferred with why, the pull request opens with a
 //!     "Deferred" section, and the run goes on to CI and the ready decision
 //!     like any finished run;
-//!   - red checks the fix attempts couldn't repair are taken out
-//!     (`resume::revert_to_green`, [`revert_for`]): back to the last green
-//!     head of the pull request, else the last planned task, deferred; CI
-//!     decides again. Only when nothing can come out does the run end, as
-//!     `failed` with exactly what fails, never as a wait;
+//!   - red checks the fix attempts couldn't repair stop the fix rounds
+//!     after two pushed fixes per failing test
+//!     (`common::push_gate::FixLedger`): the pull request and the run name
+//!     the test and its error, and nothing more is pushed. The branch is
+//!     never rolled back to an older green head or stripped of a planned
+//!     task to turn CI green (two pull requests lost their work that way,
+//!     with tests left behind that expected it); only a dependency run's
+//!     newest set of bumps comes out (`resume::take_out_failing_bumps`);
 //!   - the own-review and guard stops finish on the pull request, with what
 //!     is open listed there (`resume::wait_on_person`,
 //!     `run_guard::finish_open_pr`);
@@ -399,82 +402,6 @@ mod progress_tests {
 
 // ── Red checks ──────────────────────────────────────────────────────────────
 
-/// How many reverts the supervisor makes on one pull request before the
-/// run ends with what still fails. Enough to take a plan apart task by task
-/// down to the part that passes (three used to end a run failed with tasks
-/// left that could still have come out); the run's spend ceiling and its
-/// fix cycles bound it as well.
-pub const MAX_REVERTS: u32 = 8;
-
-/// What the supervisor takes out so what ships is green.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Revert {
-    /// Back to this earlier head of the pull request, whose checks passed.
-    ToHead(String),
-    /// The last planned task's file, back to the base branch's version.
-    Task { path: String, task: String },
-    /// Nothing can come out without emptying the pull request.
-    Nothing,
-}
-
-/// The revert for red checks after the fix attempts: the newest earlier
-/// head whose checks passed (`heads`: older heads, newest first, with
-/// whether their checks passed), else the last done task when more than one
-/// is done (`done`: path and task, in plan order), else nothing.
-pub fn revert_for(heads: &[(String, bool)], done: &[(String, String)], reverts: u32) -> Revert {
-    if reverts >= MAX_REVERTS {
-        return Revert::Nothing;
-    }
-    if let Some((sha, _)) = heads.iter().find(|(_, green)| *green) {
-        return Revert::ToHead(sha.clone());
-    }
-    match done {
-        [_, .., (path, task)] => Revert::Task {
-            path: path.clone(),
-            task: task.clone(),
-        },
-        _ => Revert::Nothing,
-    }
-}
-
-/// One commit of a pull request after the green head a revert goes back
-/// to.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct AfterGreen {
-    /// CoderHelm made it.
-    pub own: bool,
-    /// It merges another branch (the base brought up to date).
-    pub merge: bool,
-    pub files: Vec<String>,
-}
-
-/// The files a revert to the last green head may put back: the ones
-/// CoderHelm's own commits after it changed. A file a merge of the base
-/// brought in is the base's: putting it back to the green head's version
-/// writes old base code into the pull request (a revert once did that to
-/// twelve unrelated files, and the scope check then spent a round putting
-/// each one back to the base, a commit apiece). A file only a person
-/// changed is theirs. A file both CoderHelm and a merge changed can't be
-/// taken apart file by file, so it stays.
-pub fn own_revert_paths(changed: &[String], after: &[AfterGreen]) -> Vec<String> {
-    use std::collections::HashSet;
-    let own: HashSet<&str> = after
-        .iter()
-        .filter(|c| c.own && !c.merge)
-        .flat_map(|c| c.files.iter().map(String::as_str))
-        .collect();
-    let merged: HashSet<&str> = after
-        .iter()
-        .filter(|c| c.merge)
-        .flat_map(|c| c.files.iter().map(String::as_str))
-        .collect();
-    changed
-        .iter()
-        .filter(|p| own.contains(p.as_str()) && !merged.contains(p.as_str()))
-        .cloned()
-        .collect()
-}
-
 // ── The ending ──────────────────────────────────────────────────────────────
 
 /// What a run's ending is decided from.
@@ -646,18 +573,10 @@ pub fn replay(stop: ReplayStop, done: u32, total: u32) -> Ending {
             f.ladder_spent = true;
         }
         ReplayStop::RedCi => {
-            // The fix attempts didn't repair it: take out the last task
-            // while more than one is done (no green head is assumed).
-            let tasks: Vec<(String, String)> = (1..=done)
-                .map(|i| (format!("src/f{i}.rs"), format!("task {i}")))
-                .collect();
-            match revert_for(&[], &tasks, 0) {
-                Revert::Task { task, .. } => f
-                    .deferred
-                    .push(format!("{task} (deferred: its change broke the checks)")),
-                Revert::ToHead(_) => {}
-                Revert::Nothing => f.ci_failing = vec!["the checks".to_string()],
-            }
+            // The fix attempts didn't repair it: the rounds stop with the
+            // failing test named and the branch's work kept. Nothing is
+            // taken out to turn the checks green.
+            f.ci_failing = vec!["the checks".to_string()];
             f.deferred
                 .extend(open.iter().map(|t| format!("{t} (deferred)")));
             f.ladder_spent = true;
@@ -797,23 +716,12 @@ mod tests {
     }
 
     #[test]
-    fn red_checks_revert_to_green_then_by_task_and_never_empty_the_pull_request() {
-        let heads = vec![("c3".to_string(), false), ("c2".to_string(), true)];
-        let done = vec![
-            ("src/a.rs".to_string(), "fix a".to_string()),
-            ("src/b.rs".to_string(), "fix b".to_string()),
-        ];
-        assert_eq!(revert_for(&heads, &done, 0), Revert::ToHead("c2".into()));
-        let red = vec![("c1".to_string(), false)];
-        assert_eq!(
-            revert_for(&red, &done, 1),
-            Revert::Task {
-                path: "src/b.rs".into(),
-                task: "fix b".into()
-            }
-        );
-        assert_eq!(revert_for(&red, &done[..1], 0), Revert::Nothing);
-        assert_eq!(revert_for(&heads, &done, MAX_REVERTS), Revert::Nothing);
+    fn red_checks_stop_with_the_work_kept_never_a_rollback() {
+        // Eight tasks done and CI still red after the fixes: the run ends
+        // failed with the checks named, never finished on a rolled-back
+        // branch and never a wait on a person.
+        assert_eq!(replay(ReplayStop::RedCi, 8, 8), Ending::Failed);
+        assert_eq!(replay(ReplayStop::RedCi, 1, 3), Ending::Failed);
     }
 
     #[test]
@@ -851,13 +759,14 @@ mod tests {
     /// run stuck on its ninth task (a readme line); a finished security run
     /// whose pull request GitHub refused; a run stuck after seven of eight
     /// tasks; a CI fix that gave up after one try. None waits on a person.
+    /// The last one now stops with its failing test named (its work kept)
+    /// instead of finishing on a branch rolled back to an older head.
     #[test]
     fn the_four_named_runs_finish_now() {
         for (stop, done, total) in [
             (ReplayStop::Stall, 8, 9),
             (ReplayStop::Errored, 24, 24),
             (ReplayStop::Stall, 7, 8),
-            (ReplayStop::RedCi, 8, 8),
         ] {
             let e = replay(stop, done, total);
             assert!(
@@ -865,6 +774,7 @@ mod tests {
                 "{stop:?} {done}/{total}: {e:?}"
             );
         }
+        assert_eq!(replay(ReplayStop::RedCi, 8, 8), Ending::Failed);
     }
 
     /// The invariant over the whole replay suite: no run ends waiting on a
@@ -897,8 +807,15 @@ mod tests {
             }
             // A run that had work and stopped on something CoderHelm owns
             // ships it now.
-            if !c.human_only && c.done > 1 && !matches!(c.stop, ReplayStop::Asked(_)) {
+            if !c.human_only
+                && c.done > 1
+                && !matches!(c.stop, ReplayStop::Asked(_) | ReplayStop::RedCi)
+            {
                 assert!(matches!(e, Ending::Finished { .. }), "{}: {e:?}", c.name);
+            }
+            // Red checks after the fixes stop with the work kept, named.
+            if c.stop == ReplayStop::RedCi {
+                assert_eq!(e, Ending::Failed, "{}", c.name);
             }
         }
         assert_eq!(finished + failed + waits, replays::CASES.len());
@@ -1085,11 +1002,12 @@ mod tests {
         let resume = find("passes/resume.rs");
         let hand_off = body(&resume, "\nasync fn hand_off_red_ci(");
         match (
-            hand_off.find("revert_to_green("),
+            hand_off.find("take_out_failing_bumps("),
             hand_off.find("record_ci_outcome("),
         ) {
             (Some(r), Some(o)) if r < o => {}
-            _ => bad.push("resume.rs: hand_off_red_ci gives up before reverting to green".into()),
+            _ => bad
+                .push("resume.rs: hand_off_red_ci gives up before taking out failing bumps".into()),
         }
         for (rel, head, needle) in [
             (
@@ -1196,17 +1114,23 @@ mod tests {
                 ));
             }
         }
-        // Red checks take out only what breaks them: a dependency run's
-        // newest commit of bumps before any task of the plan. Every kind
-        // of fix round takes the one fault decision. A stopped run's
-        // lockfiles are written before its pull request opens.
-        let revert = body(&resume, "\nasync fn revert_to_green(");
-        match (
-            revert.find("revert_dep_commit("),
-            revert.find("sup::revert_for("),
-        ) {
-            (Some(d), Some(t)) if d < t => {}
-            _ => bad.push("resume.rs: revert_to_green takes a dependency run apart by task".into()),
+        // Red checks take out only a dependency run's newest commit of
+        // bumps; a ticket run's branch is never rolled back. Every kind of
+        // fix round takes the one fault decision. A stopped run's lockfiles
+        // are written before its pull request opens.
+        let revert = body(&resume, "\nasync fn take_out_failing_bumps(");
+        if !revert.contains("revert_dep_commit(") {
+            bad.push(
+                "resume.rs: take_out_failing_bumps doesn't take out a dependency run's bumps"
+                    .into(),
+            );
+        }
+        for rollback in ["list_pr_commits(", "compare_changed_files(", "revert_for("] {
+            if revert.contains(rollback) {
+                bad.push(format!(
+                    "resume.rs: take_out_failing_bumps rolls the branch back ({rollback})"
+                ));
+            }
         }
         let fix_round = body(&resume, "\nasync fn run_fix_round(");
         if fix_round.contains("finish_incomplete(")
@@ -1289,8 +1213,8 @@ mod tests {
         assert_eq!(arg, "kind_of(stall");
         assert!(!arg.contains("HumanOnly::"));
         let src =
-            "x\nasync fn hand_off_red_ci(\n  record_ci_outcome(a);\n  revert_to_green(b);\n}\n";
+            "x\nasync fn hand_off_red_ci(\n  record_ci_outcome(a);\n  take_out_failing_bumps(b);\n}\n";
         let b = body(src, "\nasync fn hand_off_red_ci(");
-        assert!(b.find("record_ci_outcome(").unwrap() < b.find("revert_to_green(").unwrap());
+        assert!(b.find("record_ci_outcome(").unwrap() < b.find("take_out_failing_bumps(").unwrap());
     }
 }
