@@ -205,7 +205,8 @@ pub fn on_head<'a>(records: &'a [Record], head: &str) -> Vec<&'a Record> {
     out
 }
 
-fn same_sha(a: &str, b: &str) -> bool {
+/// Whether two commit ids name the same commit (one may be short).
+pub fn same_sha(a: &str, b: &str) -> bool {
     let (a, b) = (a.trim(), b.trim());
     !a.is_empty() && !b.is_empty() && (a.starts_with(b) || b.starts_with(a))
 }

@@ -489,6 +489,34 @@ pub fn with_preview(f: &mut Facts, preview: Option<&common::preview::State>) {
     scope_to_change(f);
 }
 
+/// The two-way proof of each criterion on this head (`common::e2e_proof`):
+/// a test that failed on staging and passed on the preview is a check made
+/// with both results; anything else is unverified with what each side did.
+pub fn with_two_way(f: &mut Facts, proofs: &[common::e2e_proof::Proof]) {
+    use common::e2e_proof::{on_head, outcome, Outcome};
+    let short: String = f.head.chars().take(7).collect();
+    for p in on_head(proofs, &f.head) {
+        let what = format!(
+            "\"{}\" end to end on staging and on the preview",
+            p.criterion
+        );
+        match outcome(p) {
+            Outcome::Proven(w) => f.checked.push(common::pr_steps::Checked {
+                what,
+                result: w,
+                when: format!("on {short}"),
+            }),
+            Outcome::Unverified(w) => f.unverified.push(Unverified { what, why: w }),
+            Outcome::NotTheTicket(w) | Outcome::CoderWork(w) | Outcome::Missing(w) => {
+                f.unverified.push(Unverified {
+                    what,
+                    why: format!("{w}; CoderHelm is fixing it"),
+                })
+            }
+        }
+    }
+}
+
 /// The run's scope decisions in the facts (`common::scope_ledger`): what
 /// the change leaves out, as the ledger says, and each out-of-scope item
 /// the diff (`files`: path, status, patch; tests included) brings back,
