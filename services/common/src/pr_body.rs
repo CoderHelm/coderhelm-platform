@@ -301,6 +301,9 @@ pub struct Body {
     pub rows: Vec<Row>,
     /// `Some` for a UI change.
     pub screens: Option<Screens>,
+    /// A Before and After pair from the end-to-end run on the head, shown
+    /// under [`Body::screens`] (never instead of the preview's pages).
+    pub e2e_screens: Option<Screens>,
     /// The first fold's name ([`NOTES`] when empty).
     pub notes_label: String,
     /// Generated text at the top of the first fold.
@@ -1067,8 +1070,14 @@ fn blocks(b: &Body) -> Blocks {
     if !how.is_empty() {
         verification.push_str(&format!("\n\nHow to check: {how}."));
     }
-    if let Some(s) = &b.screens {
-        out.screens = screens_markdown(s);
+    // The preview's pages first, then the end-to-end pair under them; a
+    // "No screenshot" line goes when the pair is there.
+    let parts: Vec<String> = match (&b.screens, &b.e2e_screens) {
+        (Some(Screens::Missing(_)), Some(e)) | (None, Some(e)) => vec![screens_markdown(e)],
+        (s, e) => s.iter().chain(e).map(screens_markdown).collect(),
+    };
+    if !parts.is_empty() {
+        out.screens = parts.join("\n\n");
         verification.push_str(&format!("\n\n{}", out.screens));
     }
     out.verification = verification;
@@ -1885,6 +1894,53 @@ mod tests {
             r.visible, r.built, r.footer
         );
         assert_eq!(defects(&body, "d78bb24"), Vec::<String>::new(), "{body}");
+    }
+
+    /// The end-to-end pair is an addition: under the preview's pages, never
+    /// instead of them; it takes the place of a "No screenshot" line.
+    #[test]
+    fn the_end_to_end_pair_goes_under_the_preview_pages() {
+        let pair = Screens::Images {
+            before: "https://github.com/o/r/blob/c1/pr-7/abc/e2e-1-before.png?raw=true".into(),
+            before_alt: "Checkout on main, before this change".into(),
+            after: "https://github.com/o/r/blob/c1/pr-7/abc/e2e-1-after.png?raw=true".into(),
+            after_alt: "Checkout on this head".into(),
+            caption: "Screenshots of the end-to-end test `Checkout`, chosen because this change edits the test: this head's run.".into(),
+        };
+        let body = |screens: Option<Screens>| Body {
+            head: "d78bb24".into(),
+            summary: "Shows the total on the checkout page.".into(),
+            level: Level::Low,
+            risk: "one page's layout only".into(),
+            rollback: "revert this PR".into(),
+            rows: vec![Row {
+                check: "Unit tests (CI)".into(),
+                outcome: Outcome::Passed,
+                detail: String::new(),
+            }],
+            screens,
+            e2e_screens: Some(pair.clone()),
+            ..Default::default()
+        };
+        let r = render(&body(Some(Screens::Pages(vec![(
+            "/checkout".into(),
+            "https://img.example.com/d.png".into(),
+            "https://img.example.com/p.png".into(),
+        )]))));
+        let pages = r.visible.clone();
+        let at = |v: &str, h: &str| v.find(h).unwrap_or_else(|| panic!("{h}: {v}"));
+        assert!(at(&pages, "| Page | Desktop | Phone |") < at(&pages, "| Before | After |"));
+        assert!(pages.contains("Screenshots of the end-to-end test `Checkout`"));
+        let whole = format!("{pages}\n\n{}", r.footer);
+        assert_eq!(defects(&whole, "d78bb24"), Vec::<String>::new(), "{whole}");
+        let missing = render(&body(Some(Screens::Missing(
+            "CoderHelm had no runnable preview to capture for this run".into(),
+        ))))
+        .visible;
+        assert!(!missing.contains("No screenshot"), "{missing}");
+        assert!(missing.contains("| Before | After |"), "{missing}");
+        let alone = render(&body(None)).visible;
+        assert!(alone.contains("| Before | After |"), "{alone}");
     }
 
     /// The layout: Problem, Changes, (Needed from you), Risk, Verification,
