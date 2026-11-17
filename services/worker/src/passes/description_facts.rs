@@ -489,6 +489,105 @@ pub fn with_preview(f: &mut Facts, preview: Option<&common::preview::State>) {
     scope_to_change(f);
 }
 
+/// The run's scope decisions in the facts (`common::scope_ledger`): what
+/// the change leaves out, as the ledger says, and each out-of-scope item
+/// the diff (`files`: path, status, patch; tests included) brings back,
+/// said as not verified and never as out of scope.
+pub fn with_scope(
+    f: &mut Facts,
+    ledger: Option<&common::scope_ledger::Ledger>,
+    files: &[(String, String, String)],
+) {
+    let Some(l) = ledger else {
+        return;
+    };
+    let breaches = common::scope_ledger::breaches(l, files);
+    for line in l.lines_kept(&breaches) {
+        if !f.out_of_scope.contains(&line) {
+            f.out_of_scope.push(line);
+        }
+    }
+    for b in &breaches {
+        if f.scope_breaches.iter().any(|x| x.item == b.item) {
+            continue;
+        }
+        f.unverified.push(Unverified {
+            what: format!(
+                "`{}` brings back \"{}\", decided out of scope at plan time",
+                b.path,
+                b.item.trim_end_matches('.')
+            ),
+            why: "CoderHelm takes it out, code and tests, or records the acceptance criterion or comment that moved it in".into(),
+        });
+        f.scope_breaches.push(b.clone());
+    }
+}
+
+/// Changed lines of code: tests and generated files left out.
+pub fn code_lines(f: &Facts) -> usize {
+    f.files
+        .iter()
+        .filter(|x| {
+            !super::habits::is_test_path(&x.path) && !common::pr_facts::is_generated(&x.path)
+        })
+        .map(|x| x.changed)
+        .sum()
+}
+
+/// The written text held to scope and to the head (`common::scope_ledger`):
+/// open product questions become out-of-scope entries decided with their
+/// default, sections about earlier attempts go, a sentence the diff refutes
+/// (out of scope or put back, while the diff changes it) goes, the written
+/// out-of-scope lines join the facts' unless the diff brings them back,
+/// and the notes fit a length scaled to the change.
+pub fn hold_scope(text: &str, facts: &mut Facts) -> (String, Vec<Correction>) {
+    use common::scope_ledger as sl;
+    let (text, defaults) = sl::questions_to_defaults(text);
+    let (text, _history) = sl::drop_history(&text);
+    let changed: Vec<String> = facts.files.iter().map(|x| x.path.clone()).collect();
+    let (text, refuted) = sl::contradictions(&text, &facts.scope_breaches, &changed);
+    let corrections = refuted
+        .into_iter()
+        .map(|r| Correction {
+            kind: pr_claims::Kind::ScopeContradiction,
+            said: r.said,
+            why: r.why,
+            wrote: None,
+        })
+        .collect();
+    let brought_back = |e: &sl::Entry| {
+        facts.scope_breaches.iter().any(|b| {
+            b.item == e.item
+                || e.marks.iter().any(|m| m == &b.mark)
+                || e.item.to_lowercase().contains(&b.mark.to_lowercase())
+        })
+    };
+    let mut outs: Vec<String> = Vec::new();
+    for e in sl::written_outs(&text).into_iter().chain(defaults) {
+        if !brought_back(&e) {
+            outs.push(e.line());
+        }
+    }
+    for line in outs {
+        let key = line.to_lowercase();
+        let known = facts.out_of_scope.iter().any(|x| {
+            let x = x.to_lowercase();
+            x == key || x.starts_with(&key) || key.starts_with(&x)
+        });
+        if !known {
+            facts.out_of_scope.push(line);
+        }
+    }
+    // A dependency update's sections are computed from the lockfile, not
+    // written: they are never cut.
+    let text = if facts.dependency.is_some() {
+        text
+    } else {
+        sl::fit(&text, sl::budget_words(code_lines(facts))).0
+    };
+    (text, corrections)
+}
+
 /// The backticked check commands a line names.
 fn commands_in(text: &str) -> Vec<String> {
     text.split('`')
@@ -601,8 +700,12 @@ pub fn shape_for(
     // What a person ticked stays ticked.
     let ticked = common::pr_body::ticked_ids(body);
     let flat = common::pr_layout::strip_generated(body);
-    // 1. Every written sentence against the facts.
-    let (checked, corrections) = pr_claims::enforce(&flat, &facts);
+    // 1. Every written sentence against the facts, then against the scope
+    //    decided at plan time and the head: no open question, no history,
+    //    no claim the diff refutes, a length scaled to the change.
+    let (checked, mut corrections) = pr_claims::enforce(&flat, &facts);
+    let (checked, scope_corrections) = hold_scope(&checked, &mut facts);
+    corrections.extend(scope_corrections);
     // What is open is what the checked text still lists: an item the facts
     // refuted is gone from the lead as well.
     let open = open_of(&checked);

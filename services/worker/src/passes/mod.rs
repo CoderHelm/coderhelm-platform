@@ -1408,6 +1408,7 @@ mod run_end;
 pub(crate) mod run_files;
 pub mod run_guard;
 pub(crate) mod run_lists;
+pub(crate) mod scope_ledger;
 mod security;
 pub mod security_fixes;
 #[cfg(test)]
@@ -3160,6 +3161,9 @@ async fn run_passes(
         // again before implement saved a new one.
         save_checkpoint(state, &msg.team_id, run_id, "plan", "", 0, usage).await;
         add_progress_note(state, &msg.team_id, run_id, "Plan generated").await;
+        // Scope is decided once, here, from the ticket's criteria and the
+        // plan, before any code; every later round is held to it.
+        scope_ledger::load_or_seed(state, &msg.team_id, run_id, msg, &plan_result).await;
     }
     if !plan_final {
         if !plan_was_reused {

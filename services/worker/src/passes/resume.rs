@@ -5190,6 +5190,24 @@ async fn start_planned_work(
     // What a review took out is not built again unless the ticket asks for
     // it (`round_agree`).
     let items = super::finish_planned::listed(&body);
+    // What the plan decided is out of scope is not built again
+    // (`common::scope_ledger`).
+    let items = match super::scope_ledger::load(state, &msg.team_id, &msg.run_id).await {
+        Some(l) => {
+            let (keep, gone) = super::scope_ledger::drop_covered(&l, items);
+            if !gone.is_empty() {
+                super::add_progress_note(
+                    state,
+                    &msg.team_id,
+                    &msg.run_id,
+                    &super::scope_ledger::dropped_note(&gone),
+                )
+                .await;
+            }
+            keep
+        }
+        None => items,
+    };
     let taken = if items.is_empty() {
         Vec::new()
     } else {
@@ -5315,6 +5333,32 @@ async fn recheck_planned_work(
         &ctx.ticket_msg.base_branch,
     )
     .await;
+    // Nor what the plan decided is out of scope (`common::scope_ledger`).
+    let found = match super::scope_ledger::load(state, &msg.team_id, &msg.run_id).await {
+        Some(l) => {
+            let (keep, gone): (Vec<_>, Vec<_>) = found
+                .into_iter()
+                .partition(|f| l.covers(&f.detail).is_none());
+            if !gone.is_empty() {
+                let lines: Vec<(String, String)> = gone
+                    .iter()
+                    .map(|f| {
+                        let why = l.covers(&f.detail).map(|e| e.line()).unwrap_or_default();
+                        (f.detail.clone(), why)
+                    })
+                    .collect();
+                super::add_progress_note(
+                    state,
+                    &msg.team_id,
+                    &msg.run_id,
+                    &super::scope_ledger::dropped_note(&lines),
+                )
+                .await;
+            }
+            keep
+        }
+        None => found,
+    };
     let (found, skipped) = super::round_agree::sort_findings(
         found,
         &taken,

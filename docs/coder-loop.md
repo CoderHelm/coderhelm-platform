@@ -178,6 +178,49 @@ The causes were in the loop, not only in prompt wording:
    wins: it is built, and the reply to the review says why
    (`round_agree`, `incidents::co_rounds_agree`).
 
+9. **Scope is decided once.**
+   The plan writes `## Out of scope` in design.md, one `- <item>: <why>` line
+   each, naming the code that would show it (backticked names, paths, routes).
+   A product question the ticket doesn't settle is decided there with its
+   default; it is never asked in the pull request. The plan goes back when the
+   section is missing, a question is left open, an item has no reason, an
+   acceptance criterion asks for an item it leaves out, a task names an
+   out-of-scope item, or a task is open-ended ("switch any other caller")
+   (`scope_ledger::plan_gaps`).
+   When the plan is generated, before any code, the run keeps a scope ledger
+   (`common::scope_ledger`, run attribute `scope_ledger`): the ticket's
+   acceptance criteria as read by `stop_judge::acceptance` (the same list the
+   criteria-to-test mapping reads) are in scope, the plan's out-of-scope lines
+   are out. A plan revision never rewrites it. Every later round is held to it:
+   - the tests and scope check reads the diff, tests included, and sends back
+     each out-of-scope item it brings in (tests are exempt from "inside the
+     plan", never from the ledger);
+   - a planned-work round never builds an item the ledger leaves out, next to
+     `round_agree`'s rule for what a review took out;
+   - a round that must build one writes `Scope change: <item>: <why>`; it is
+     accepted only when the why cites an acceptance criterion or a person's
+     comment on the pull request, and the ledger records who moved it in.
+   (`incidents::sl_scope_decided_once`)
+
+10. **The description describes the head.**
+   On every push the description is rebuilt from the head's facts
+   (`description::build`; Problem, Changes, Risk, Verification). The written
+   text is held to the head and the ledger (`description_facts::hold_scope`):
+   - sections about earlier attempts, pushes and waits go; the revert and
+     "CI is failing" lines stay for `ci_lines`, which drops them once untrue;
+   - a sentence saying something is out of scope, untouched or put back while
+     the diff changes it goes (`scope_ledger::contradictions`), and a change
+     to a file not in the diff goes (`pr_claims`);
+   - open product questions become out-of-scope defaults;
+   - the written notes fit a length scaled to the changed lines of code, tests
+     and generated files left out (150 to 600 words), with the run page for
+     the rest.
+   Changes ends with one Out of scope line rendered from the ledger. An item
+   the diff brings back is never shown as out of scope; it is listed as not
+   verified until it is taken out or moved in. `pr_body::defects` fails a body
+   that asks an open product question.
+   (`incidents::sm_description_of_the_head`)
+
 ## What is deterministic
 
 Everything above except the model's own writing: the searches, section checks,
