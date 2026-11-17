@@ -199,7 +199,10 @@ test("self-host: the gateway and worker read the install's own account with this
   // vulnerabilities (on by default): their statements are there, each behind its condition.
   // Applying approved database maintenance is a write a team grants its own
   // CoderHelmLogReader role; the install's own role only reads.
-  const abilities = ["imports", "sync", "maintenance"].reduce(without, all);
+  // WAF logs, databases and warehouses are read through the connected account's
+  // CoderHelmLogReader role in every account, the install's own too (own-account-read.ts,
+  // OWN_CONDITIONS): the install's own role gains no Athena, Glue, bucket or database reads.
+  const abilities = ["imports", "sync", "maintenance", "waf_logs", "databases", "warehouses"].reduce(without, all);
   const needed = [...new Set([...abilities.matchAll(/"([a-z0-9-]+:[A-Za-z]+)"/g)].map((m) => m[1]))];
   assert.ok(needed.length > 20, `${needed.length} actions`);
   for (const [stack, fn] of [

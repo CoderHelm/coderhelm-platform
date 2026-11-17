@@ -182,7 +182,9 @@ test("boundary: the read role names are the ones CoderHelm's own template and se
   assert.match(tmpl, /^\s+RoleName: CoderHelmLogReader$/m);
   const aws = fs.readFileSync(repoPath("services", "common", "src", "live", "aws.rs"), "utf8");
   assert.match(aws, /pub const ROLE_PREFIX: &str = "CoderhelmReadOnly";/);
-  assert.match(aws, /^ROLE=\{ROLE_PREFIX\}$/m, "the setup script creates exactly ROLE_PREFIX");
+  // The setup script now creates or updates the role stack's CoderHelmLogReader; roles an
+  // older script made under ROLE_PREFIX are still taken on until their sources move.
+  assert.match(aws, /^ROLE=\{LOG_READER_ROLE\}$/m, "the setup script uses exactly LOG_READER_ROLE");
   assert.match(aws, /pub const LOG_READER_ROLE: &str = "CoderHelmLogReader";/);
   assert.deepEqual(OWN_READ_ROLES, ["CoderHelmLogReader", "CoderhelmReadOnly"]);
   const stacks = hardened();
