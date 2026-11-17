@@ -165,6 +165,45 @@ pub fn check_started(f: &Finding) -> Option<&'static str> {
         .map(|(_, since)| *since)
 }
 
+/// The head line a check's finding is about in `patch`: the added line that
+/// carries the first backticked name its `body` gives (the new definition),
+/// else the first added line. 0 when the patch adds nothing.
+pub fn anchor_line(patch: &str, body: &str) -> u64 {
+    let names: Vec<&str> = body
+        .split('`')
+        .skip(1)
+        .step_by(2)
+        .filter(|n| !n.contains('/') && !n.is_empty())
+        .collect();
+    let mut line = 0u64;
+    let mut first_added = 0u64;
+    for l in patch.lines() {
+        if let Some(hdr) = l.strip_prefix("@@") {
+            line = hdr
+                .split('+')
+                .nth(1)
+                .and_then(|p| p.trim().split([',', ' ']).next())
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(0);
+            continue;
+        }
+        match l.chars().next() {
+            Some('+') => {
+                if first_added == 0 {
+                    first_added = line.max(1);
+                }
+                if names.first().is_some_and(|n| l.contains(n)) {
+                    return line.max(1);
+                }
+                line += 1;
+            }
+            Some('-') | Some('\\') => {}
+            _ => line += 1,
+        }
+    }
+    first_added
+}
+
 /// A finding of a smallest-change check that a reason in the coder's notes
 /// may keep (`minimal_change::Widening::excusable`): advice once the first
 /// review has run (`review_policy::hold_late_blockers`).

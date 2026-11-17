@@ -1378,6 +1378,7 @@ pub mod review_activity;
 pub mod review_agent;
 pub mod review_ci;
 pub mod review_configs;
+pub mod review_discipline;
 #[cfg(test)]
 mod review_eval;
 pub(crate) mod review_fingerprint;

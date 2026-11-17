@@ -237,8 +237,23 @@ fn what_is_left_after_every_approach_is_a_note_on_a_ready_pull_request() {
     let mut own_open = open.clone();
     let settled = crate::passes::review_pr::settle_own_findings(&l, &mut findings, &mut own_open);
     assert!(own_open.is_empty());
-    assert!(settled.is_empty(), "a note never clears the merge hold");
-    assert!(findings[0].holds_merge());
+    // Deferred after every approach with no progress, it holds the merge no
+    // more: its thread is settled, and the review makes the finding a
+    // follow-up unless new code gives it new evidence (`review_discipline`).
+    assert_eq!(
+        settled.len(),
+        1,
+        "a deferred note no longer holds the merge"
+    );
+    let deferred = crate::passes::review_discipline::deferred_items(&l);
+    crate::passes::review_discipline::judge(
+        &mut findings,
+        &crate::passes::review_discipline::Facts {
+            deferred: &deferred,
+            ..Default::default()
+        },
+    );
+    assert!(!findings[0].holds_merge());
     // A completion on that verdict completes: nothing more to do.
     assert_eq!(
         ledger::completion(Some(("REQUEST_CHANGES", HEAD)), HEAD, &l),

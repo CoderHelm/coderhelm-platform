@@ -344,6 +344,13 @@ async fn smallest_change_gaps(
     let mut out = super::review_rules::wider_findings(&super::minimal_change::check(
         &files, &base, ticket, has_probe,
     ));
+    // Each one names the line it is about, or it can't block
+    // (`review_discipline::unactionable`).
+    for f in out.iter_mut() {
+        if let Some((_, _, patch)) = files.iter().find(|(p, _, _)| *p == f.file) {
+            f.line = super::review_rules::anchor_line(patch, &f.body);
+        }
+    }
     let criteria = super::stop_judge::acceptance(ticket);
     if !criteria.is_empty() {
         let own = super::web_check::team_domains(state, team_id).await;
@@ -3772,6 +3779,65 @@ async fn run_once(
     )
     .await;
     super::review_severity::finalize(&mut findings);
+    // What may hold the merge, from facts this review already has: a
+    // blocking finding is actionable, doesn't move to another file, doesn't
+    // undo an earlier request, isn't one CoderHelm's rounds deferred on
+    // unchanged code, doesn't call out of scope what a person asked for, and
+    // once the ticket's criteria are proven with CI green what is left that
+    // isn't a shown defect is a follow-up (`review_discipline`).
+    let own_ledger = match (&own_run, self_authored) {
+        (Some(run_id), true) => {
+            Some(Box::pin(super::own_review_ledger::load(state, &msg.team_id, run_id)).await)
+        }
+        _ => None,
+    };
+    {
+        let mut earlier: Vec<super::review_discipline::Earlier> = bot_threads
+            .iter()
+            .map(|t| super::review_discipline::Earlier::of_thread(&t.path, &t.body))
+            .collect();
+        if let Some(l) = &own_ledger {
+            earlier.extend(
+                l.findings
+                    .iter()
+                    .map(|t| super::review_discipline::Earlier::of_item(&t.item)),
+            );
+        }
+        let deferred = own_ledger
+            .as_ref()
+            .map(super::review_discipline::deferred_items)
+            .unwrap_or_default();
+        let mut people: Vec<String> = people_wrote
+            .iter()
+            .filter(|c| super::review_policy::is_person(&c["user"]))
+            .filter_map(|c| c["body"].as_str().map(str::to_string))
+            .collect();
+        people.push(ticket_context.clone());
+        let criteria_proven = match &own_run {
+            Some(run_id) => run_e2e_proofs(state, &msg.team_id, run_id)
+                .await
+                .and_then(|j| super::review_discipline::criteria_met(&j, &head_sha))
+                .unwrap_or(false),
+            None => false,
+        };
+        let ci_green = !findings.iter().any(|f| {
+            super::review_rules::mandatory(f) == Some(super::review_rules::FAILING_CHECK_WHY)
+        }) && base_failing.is_empty();
+        let made = super::review_discipline::judge(
+            &mut findings,
+            &super::review_discipline::Facts {
+                earlier: &earlier,
+                deferred: &deferred,
+                changed_since_previous: changed_since_previous.as_ref(),
+                people: &people,
+                criteria_proven,
+                ci_green,
+            },
+        );
+        for m in &made {
+            info!(pr = msg.pr_number, file = %m.file, title = %m.title, why = %m.why, "A finding that would hold the merge made a note");
+        }
+    }
     info!(
         pr = msg.pr_number,
         checked = second.checked,
@@ -3894,13 +3960,9 @@ async fn run_once(
     // On CoderHelm's own pull request, a finding its fix loop settled with a
     // reason (the ticket rules it out, or only a person can do it) is a note
     // naming that reason, never a request for changes on the head.
-    let settled_by_run = match (&own_run, self_authored) {
-        (Some(run_id), true) => {
-            let ledger =
-                Box::pin(super::own_review_ledger::load(state, &msg.team_id, run_id)).await;
-            settle_own_findings(&ledger, &mut findings, &mut own_open)
-        }
-        _ => Vec::new(),
+    let settled_by_run = match &own_ledger {
+        Some(ledger) => settle_own_findings(ledger, &mut findings, &mut own_open),
+        None => Vec::new(),
     };
     // The one verdict the rest of this review may use: what holds the merge,
     // by name. Nothing named holding means approve, whatever came before.
@@ -4738,6 +4800,26 @@ async fn run_once(
     })
 }
 
+/// The run's two-way end-to-end proofs as JSON (`e2e_proof` on the run,
+/// kept by `common::e2e_proof` once that lands), if it has any.
+async fn run_e2e_proofs(state: &WorkerState, team_id: &str, run_id: &str) -> Option<String> {
+    state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(team_id))
+        .key("run_id", attr_s(run_id))
+        .projection_expression("e2e_proof")
+        .send()
+        .await
+        .ok()?
+        .item?
+        .get("e2e_proof")?
+        .as_s()
+        .ok()
+        .cloned()
+}
+
 /// On CoderHelm's own pull request, the head reviewed now isn't the one its
 /// last review was of (or there was none): the review is posted.
 pub(crate) fn own_head_is_new(last_reviewed: Option<&str>, head: &str) -> bool {
@@ -5557,9 +5639,11 @@ pub(crate) fn settle_own_findings(
     for f in findings.iter_mut() {
         let line = super::own_review::thread_line(&f.file, f.line, &f.title);
         if let Some(s) = ledger.settled_item(&line) {
-            // CoderHelm's own note: listed on the ready pull request, still
-            // a finding of this review, never approved over.
+            // CoderHelm's own note (its rounds made no progress on it): a
+            // follow-up, not a hold. A finding of it on code changed since
+            // is new evidence and holds on its own (`review_discipline`).
             if matches!(s, Settled::Noted { .. }) {
+                settled.push(line);
                 continue;
             }
             super::review_policy::demote(f, &why(s));
@@ -5568,9 +5652,9 @@ pub(crate) fn settle_own_findings(
     }
     own_open.retain(|o| {
         let s = ledger.settled_item(o);
-        // A noted finding leaves the list that holds the draft, and keeps
-        // holding the merge (its thread stays open).
-        if s.is_some_and(|s| !matches!(s, Settled::Noted { .. })) && !settled.contains(o) {
+        // A settled or noted finding leaves the list that holds the draft,
+        // and its thread holds the merge no more.
+        if s.is_some() && !settled.contains(o) {
             settled.push(o.clone());
         }
         s.is_none()
