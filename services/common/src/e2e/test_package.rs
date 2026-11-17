@@ -224,7 +224,9 @@ pub fn packages_outside(
         out.push(TestPackage {
             dir: dir.clone(),
             manager: lock.map(|(_, m)| *m).unwrap_or(Manager::Npm),
-            lockfile: lock.map(|(n, _)| n.to_string()),
+            // From the repository root, as `package_of` names it: a lockfile
+            // outside the package's folder is a workspace's.
+            lockfile: lock.map(|(n, _)| join(&dir, n)),
             has_tsconfig: tree.iter().any(|p| *p == join(&dir, "tsconfig.json")),
             lint: has_eslint(tree, &dir, &pj),
             runner: runner_of(&pj),
@@ -316,14 +318,65 @@ pub fn ensure_manager(m: Manager) -> &'static str {
     }
 }
 
-/// Installs the package's dependencies on their own, never the parent
-/// workspace's, after making its manager available.
+/// Whether the package is a member of a workspace whose lockfile sits at the
+/// workspace's root (`lockfile` names a file outside the package's folder):
+/// its dependencies install from that root, the way its CI installs them.
+/// A package with its own lockfile, or none, installs on its own.
+pub fn workspace_member(p: &TestPackage) -> bool {
+    let dir = p.dir.trim_end_matches('/');
+    p.lockfile
+        .as_deref()
+        .is_some_and(|l| !dir.is_empty() && dir != "." && !l.starts_with(&format!("{dir}/")))
+}
+
+/// The folder the install runs in: the workspace's root for a member
+/// ([`workspace_member`]), else the package's own.
+pub fn install_dir(p: &TestPackage) -> String {
+    if workspace_member(p) {
+        p.lockfile
+            .as_deref()
+            .map(|l| parent(l).to_string())
+            .filter(|d| !d.is_empty())
+            .unwrap_or_else(|| ".".into())
+    } else {
+        p.dir.clone()
+    }
+}
+
+/// Installs the package's dependencies, after making its manager
+/// available: a package on its own never reaches for the parent
+/// workspace's; a workspace member installs the workspace from its root
+/// lockfile (run in [`install_dir`]). A member's install that fails as a
+/// whole falls back to the narrowest one that still runs its tests: the
+/// member and what it depends on.
+///
+/// Six pull requests' new tests never ran because a member of a pnpm
+/// workspace was installed on its own (`cd apps/web && pnpm install
+/// --ignore-workspace --frozen-lockfile`): its folder has no lockfile, so
+/// pnpm stopped with `ERR_PNPM_NO_LOCKFILE` before any test.
 pub fn install_cmd(p: &TestPackage) -> String {
     format!("{}{}", ensure_manager(p.manager), install_only(p))
 }
 
 fn install_only(p: &TestPackage) -> String {
     let frozen = p.lockfile.is_some();
+    if workspace_member(p) {
+        let member = format!("./{}", p.dir.trim_start_matches("./"));
+        return match p.manager {
+            Manager::Npm => format!(
+                "(npm ci --no-audit --no-fund || npm ci --no-audit --no-fund --workspace {})",
+                q(&member).unwrap_or_else(|| "'.'".into())
+            ),
+            Manager::Pnpm => match q(&format!("{member}...")) {
+                Some(f) => {
+                    format!("(pnpm install --frozen-lockfile || pnpm install --frozen-lockfile --filter {f})")
+                }
+                None => "pnpm install --frozen-lockfile".into(),
+            },
+            Manager::Yarn => "yarn install --ignore-engines --frozen-lockfile".into(),
+            Manager::Bun => "bun install --frozen-lockfile".into(),
+        };
+    }
     match p.manager {
         Manager::Npm if frozen => "npm ci --no-audit --no-fund --workspaces=false".into(),
         Manager::Npm => "npm install --no-audit --no-fund --workspaces=false".into(),
@@ -362,7 +415,7 @@ pub fn check_steps(p: &TestPackage) -> Option<Vec<Step>> {
     let dir = q(&p.dir)?;
     let mut steps = vec![Step {
         kind: "install",
-        cmd: format!("cd {dir} && {}", install_cmd(p)),
+        cmd: format!("cd {} && {}", q(&install_dir(p))?, install_cmd(p)),
     }];
     if p.has_tsconfig {
         steps.push(Step {
@@ -697,7 +750,7 @@ mod tests {
         let mut p = TestPackage {
             dir: "tests/e2e".into(),
             manager: Manager::Pnpm,
-            lockfile: Some("pnpm-lock.yaml".into()),
+            lockfile: Some("tests/e2e/pnpm-lock.yaml".into()),
             has_tsconfig: false,
             lint: false,
             runner: None,
@@ -710,6 +763,7 @@ mod tests {
                 ensure_manager(Manager::Pnpm)
             )
         );
+        assert_eq!(install_dir(&p), "tests/e2e");
         p.manager = Manager::Yarn;
         assert!(install_cmd(&p).contains("--frozen-lockfile"));
         p.manager = Manager::Npm;
@@ -720,6 +774,62 @@ mod tests {
         assert_eq!(check_steps(&p).unwrap().len(), 1);
         p.dir = "bad dir; rm -rf /".into();
         assert!(check_steps(&p).is_none());
+    }
+
+    /// A pnpm workspace's member (`apps/web`, lockfile at the root): it
+    /// installs the workspace from the root, never on its own, where pnpm
+    /// stops with `ERR_PNPM_NO_LOCKFILE`.
+    #[test]
+    fn a_workspace_member_installs_from_the_workspace_root() {
+        let t = tree(&[
+            "package.json",
+            "pnpm-lock.yaml",
+            "pnpm-workspace.yaml",
+            "apps/web/package.json",
+            "apps/web/src/test/a.test.ts",
+            "e2e/package.json",
+            "e2e/pnpm-lock.yaml",
+            "e2e/tests/a.spec.ts",
+        ]);
+        let web = package_of(&t, "apps/web/src/test/a.test.ts", &|_| None).unwrap();
+        assert_eq!(web.dir, "apps/web");
+        assert_eq!(web.lockfile.as_deref(), Some("pnpm-lock.yaml"));
+        assert!(workspace_member(&web));
+        assert_eq!(install_dir(&web), ".");
+        let steps = check_steps(&web).unwrap();
+        assert!(steps[0].cmd.starts_with("cd '.' && "), "{}", steps[0].cmd);
+        assert!(
+            !steps[0].cmd.contains("--ignore-workspace"),
+            "{}",
+            steps[0].cmd
+        );
+        assert!(steps[0].cmd.contains("pnpm install --frozen-lockfile"));
+        // The narrowest fallback: the member and what it depends on.
+        assert!(steps[0].cmd.contains("--filter './apps/web...'"));
+        // Type-check and lint still run in the member's folder.
+        assert!(steps
+            .iter()
+            .skip(1)
+            .all(|s| s.cmd.starts_with("cd 'apps/web'")));
+        // A package with its own lockfile stays on its own.
+        let e2e = package_of(&t, "e2e/tests/a.spec.ts", &|_| None).unwrap();
+        assert!(!workspace_member(&e2e));
+        assert_eq!(install_dir(&e2e), "e2e");
+        assert!(check_steps(&e2e).unwrap()[0]
+            .cmd
+            .contains("pnpm install --ignore-workspace --frozen-lockfile"));
+        // As `packages_outside` names it, the same.
+        let out = packages_outside(&t, &["e2e/tests/a.spec.ts".into()], &[], &|_| None);
+        assert_eq!(out[0].lockfile.as_deref(), Some("e2e/pnpm-lock.yaml"));
+        assert!(!workspace_member(&out[0]));
+        // The root package installs where it is.
+        let root = package_of(
+            &tree(&["package.json", "pnpm-lock.yaml", "a.test.ts"]),
+            "a.test.ts",
+            &|_| None,
+        )
+        .unwrap();
+        assert!(!workspace_member(&root));
     }
 
     #[test]

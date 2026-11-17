@@ -282,8 +282,9 @@ fn the_pipeline_still_does_each_of_these_at_its_place() {
     let pr_src = include_str!("../pr.rs");
     let with_checks = fn_src(pr_src, "fn with_checks(");
     assert!(with_checks.contains("super::habits_check::shape_body("));
-    // It asks for a step once, and the sandbox wait fits a step.
+    // It owes the runs to a fresh step, which runs them first (see
+    // `tq_tests_run`), and the sandbox wait fits a step.
     let check_src = include_str!("../habits_check.rs");
-    assert!(check_src.contains("std::mem::replace(&mut l.habits_waited, true)"));
+    assert!(check_src.contains("l.proof_owed = head.clone();"));
     const { assert!(habits_check::SANDBOX_STEP_SECS < 900) };
 }

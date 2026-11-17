@@ -35,6 +35,9 @@ pub const ENV_ROOT: &str = "/tmp/coderhelm-env";
 pub const RESTORED: &str = "===CODERHELM_ENV_RESTORED===";
 pub const INSTALLED: &str = "===CODERHELM_ENV_INSTALLED===";
 pub const SAVED: &str = "===CODERHELM_ENV_SAVED===";
+/// Printed with the install's exit code when CI's install failed: what
+/// follows ran without it, so a test result after it says nothing.
+pub const INSTALL_FAILED: &str = "===CODERHELM_ENV_INSTALL_FAILED===";
 
 /// The language whose packages the install fills.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -57,6 +60,8 @@ pub struct TestEnv {
     pub kind: Kind,
     pub python: String,
     pub node: String,
+    /// The pnpm version CI's `pnpm/action-setup` pins ("" when none).
+    pub pnpm: String,
     /// Plain `NAME=value` settings of the job (never an expression).
     pub env: Vec<(String, String)>,
     pub install: Vec<String>,
@@ -277,6 +282,9 @@ pub fn from_workflows_for(
                 if uses.starts_with("actions/setup-node") {
                     env.node = s(step.get("with").and_then(|w| w.get("node-version")));
                 }
+                if uses.starts_with("pnpm/action-setup") {
+                    env.pnpm = s(step.get("with").and_then(|w| w.get("version")));
+                }
                 let run = s(step.get("run"));
                 if run.is_empty() || run.contains("${{") {
                     continue;
@@ -433,6 +441,307 @@ fn quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// Whether a path is safe to put on a command line as it is.
+fn safe_path(p: &str) -> bool {
+    !p.is_empty()
+        && !p.starts_with('-')
+        && p.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '/'))
+        && !p.contains("..")
+}
+
+/// A test command narrowed to one test file (`file`, relative to the folder
+/// the command runs in), or `None` when its runner can't take one. The one
+/// place CoderHelm narrows a runner: pytest and `python -m unittest` take
+/// the path, Vitest and Jest take it as a filter (they print "no test files
+/// found" when it matches nothing, never a pass), `go test` takes the
+/// file's package, `cargo test` an integration test's target. A runner's
+/// own flags after it are dropped with the rest of the line.
+pub fn narrow(cmd: &str, file: &str) -> Option<String> {
+    if !safe_path(file) {
+        return None;
+    }
+    let words: Vec<&str> = cmd.split_whitespace().collect();
+    let low: Vec<String> = words.iter().map(|w| w.to_ascii_lowercase()).collect();
+    // Up to and including word `i`, never across a `&&`, `;` or `|`.
+    let prefix = |i: usize| -> String {
+        let start = words[..i]
+            .iter()
+            .rposition(|w| matches!(*w, "&&" | ";" | "||" | "|"))
+            .map_or(0, |p| p + 1);
+        words[start..=i].join(" ")
+    };
+    for (i, w) in low.iter().enumerate() {
+        let w = w.trim_matches(['"', '\'']);
+        let base = w.rsplit('/').next().unwrap_or(w);
+        if base == "pytest" || (base == "unittest" && i > 0 && low[i - 1] == "-m") {
+            return Some(format!("{} {file}", prefix(i)));
+        }
+        if base == "vitest" {
+            let run = low.get(i + 1).is_some_and(|n| n == "run");
+            let end = if run { i + 1 } else { i };
+            let run = if run { "" } else { " run" };
+            return Some(format!("{}{run} {file}", prefix(end)));
+        }
+        if base == "jest" {
+            return Some(format!("{} {file}", prefix(i)));
+        }
+        if w == "go" && low.get(i + 1).is_some_and(|n| n == "test") && file.ends_with("_test.go") {
+            let dir = file.rsplit_once('/').map_or(".", |(d, _)| d);
+            let pre = prefix(i + 1);
+            return Some(format!("{pre} ./{dir}/"));
+        }
+        if w == "cargo" && low.get(i + 1).is_some_and(|n| n == "test") {
+            // An integration test, `tests/<name>.rs`, is a target of its own.
+            let name = file
+                .strip_prefix("tests/")
+                .and_then(|n| n.strip_suffix(".rs"))
+                .filter(|n| !n.contains('/'))?;
+            return Some(format!("{} --test {name}", prefix(i + 1)));
+        }
+    }
+    None
+}
+
+/// What a package script or a make target runs, from the manifests:
+/// `npm test`, `npm run <s>`, `pnpm [--filter <name>] [run] <s>`, `yarn
+/// [workspace <name>] <s>`, `bun run <s>`, `make <target>`, run in `dir`.
+/// `(folder, command)` with the command the script or target holds, so a
+/// runner in it can be narrowed. `read` gives a file's text; `tree` finds a
+/// workspace package by name. `None` when it is no script call or the
+/// script can't be read.
+pub fn resolve_script(
+    line: &str,
+    dir: &str,
+    tree: &[String],
+    read: &dyn Fn(&str) -> Option<String>,
+) -> Option<(String, String)> {
+    resolve_depth(line, dir, tree, read, 0)
+}
+
+fn package_dir_named(
+    tree: &[String],
+    read: &dyn Fn(&str) -> Option<String>,
+    name: &str,
+) -> Option<String> {
+    let name = name.trim_matches(['"', '\'']);
+    if name.starts_with("./") || name.contains('/') && !name.starts_with('@') {
+        return Some(
+            name.trim_start_matches("./")
+                .trim_end_matches('/')
+                .to_string(),
+        );
+    }
+    tree.iter()
+        .filter(|p| *p == "package.json" || p.ends_with("/package.json"))
+        .filter(|p| !p.contains("node_modules/"))
+        .find(|p| {
+            read(p)
+                .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+                .is_some_and(|v| v["name"].as_str() == Some(name))
+        })
+        .map(|p| {
+            p.trim_end_matches("package.json")
+                .trim_end_matches('/')
+                .to_string()
+        })
+}
+
+fn resolve_depth(
+    line: &str,
+    dir: &str,
+    tree: &[String],
+    read: &dyn Fn(&str) -> Option<String>,
+    depth: u8,
+) -> Option<(String, String)> {
+    if depth > 3 {
+        return None;
+    }
+    let words: Vec<&str> = line.split_whitespace().collect();
+    let (tool, rest) = words.split_first()?;
+    let mut at = dir.to_string();
+    let mut args: Vec<&str> = Vec::new();
+    let mut i = 0;
+    while i < rest.len() {
+        let w = rest[i];
+        match (*tool, w) {
+            ("pnpm", "--filter" | "-F") | ("npm", "--workspace" | "-w") => {
+                at = package_dir_named(tree, read, rest.get(i + 1)?)?;
+                i += 2;
+                continue;
+            }
+            ("pnpm" | "npm" | "yarn", "-C" | "--dir" | "--prefix" | "--cwd") | ("make", "-C") => {
+                let d = rest
+                    .get(i + 1)?
+                    .trim_matches(['"', '\''])
+                    .trim_end_matches('/');
+                at = join(&at, d);
+                i += 2;
+                continue;
+            }
+            ("yarn", "workspace") => {
+                at = package_dir_named(tree, read, rest.get(i + 1)?)?;
+                i += 2;
+                continue;
+            }
+            _ if w.starts_with("--filter=") && *tool == "pnpm" => {
+                at = package_dir_named(tree, read, &w["--filter=".len()..])?;
+            }
+            _ if w.starts_with('-') => {}
+            _ => args.push(w),
+        }
+        i += 1;
+    }
+    let script = match (*tool, args.as_slice()) {
+        ("make", [target, ..]) => {
+            let mk = read(&join(&at, "Makefile"))?;
+            let recipe = make_recipe(&mk, target)?;
+            return resolve_depth(&recipe, &at, tree, read, depth + 1).or(Some((at, recipe)));
+        }
+        ("make", []) => return None,
+        ("npm" | "pnpm" | "yarn" | "bun", ["run" | "run-script", s, ..]) => s.to_string(),
+        ("npm" | "pnpm" | "yarn", ["test" | "t", ..]) => "test".to_string(),
+        ("pnpm" | "yarn", [s, ..])
+            if !matches!(*s, "install" | "add" | "exec" | "dlx" | "i" | "ci" | "x") =>
+        {
+            s.to_string()
+        }
+        _ => return None,
+    };
+    let pj = read(&join(&at, "package.json"))?;
+    let v: serde_json::Value = serde_json::from_str(&pj).ok()?;
+    let body = v["scripts"][script.as_str()].as_str()?.trim().to_string();
+    if body.is_empty() {
+        return None;
+    }
+    resolve_depth(&body, &at, tree, read, depth + 1).or(Some((at, body)))
+}
+
+/// A script's command run from a shell: a Node runner a package script
+/// finds in `node_modules/.bin` (`vitest`, `jest`) goes through `npx`.
+fn via_bin(cmd: &str) -> String {
+    let first = cmd.split_whitespace().next().unwrap_or("");
+    if matches!(
+        first,
+        "vitest" | "jest" | "mocha" | "ava" | "tsx" | "ts-node"
+    ) {
+        format!("npx --no-install {cmd}")
+    } else {
+        cmd.to_string()
+    }
+}
+
+fn in_folder(at: &str, cmd: &str) -> String {
+    if at.is_empty() || at == "." {
+        cmd.to_string()
+    } else {
+        format!("(cd {at} && {cmd})")
+    }
+}
+
+/// The first recipe line of `target` in a Makefile that runs a check, its
+/// `@`/`-` prefix dropped.
+fn make_recipe(makefile: &str, target: &str) -> Option<String> {
+    let mut lines = makefile.lines();
+    while let Some(l) = lines.next() {
+        let Some((name, _)) = l.split_once(':') else {
+            continue;
+        };
+        if l.starts_with('\t') || name.split_whitespace().all(|n| n != target) {
+            continue;
+        }
+        for r in lines.by_ref() {
+            if !r.starts_with('\t') {
+                if r.trim().is_empty() {
+                    continue;
+                }
+                break;
+            }
+            let r = r.trim().trim_start_matches(['@', '-']).trim();
+            let says = matches!(
+                r.split_whitespace().next(),
+                Some("echo" | "printf" | "true")
+            );
+            if !says && crate::ci_cover::is_check_command(r) {
+                return Some(r.to_string());
+            }
+        }
+        return None;
+    }
+    None
+}
+
+/// The files [`TestEnv::resolve_scripts`] and [`package_test_command`] may
+/// read: the manifests and Makefiles of the folders the test steps run in,
+/// the workspace's package manifests (a `--filter` names a package), and
+/// each test file's nearest manifest. At most 40.
+pub fn script_files(env: Option<&TestEnv>, tree: &[String], files: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut add = |p: String| {
+        if tree.contains(&p) && !out.contains(&p) && out.len() < 40 {
+            out.push(p);
+        }
+    };
+    if let Some(e) = env {
+        let mut dirs = vec![e.dir.clone()];
+        dirs.extend(e.test.iter().map(|t| unwrap_cd(t).0));
+        for d in dirs {
+            add(join(&d, "package.json"));
+            add(join(&d, "Makefile"));
+        }
+    }
+    for f in files {
+        if let Some(d) = crate::e2e::test_package::package_dir(tree, f) {
+            add(join(&d, "package.json"));
+        }
+    }
+    for p in tree
+        .iter()
+        .filter(|p| p.ends_with("/package.json") && !p.contains("node_modules/"))
+    {
+        add(p.clone());
+    }
+    out
+}
+
+/// The test file run by its own package's test script, narrowed to it: the
+/// narrowest command that still runs it when CI's test step can't be
+/// narrowed (a `turbo` or a root script running every package). `None`
+/// when the package has no test script with a runner that takes a file.
+pub fn package_test_command(
+    file: &str,
+    tree: &[String],
+    read: &dyn Fn(&str) -> Option<String>,
+) -> Option<String> {
+    let dir = crate::e2e::test_package::package_dir(tree, file)?;
+    let pj = read(&join(&dir, "package.json"))?;
+    let v: serde_json::Value = serde_json::from_str(&pj).ok()?;
+    let rel = if dir.is_empty() {
+        file
+    } else {
+        file.strip_prefix(&format!("{dir}/"))?
+    };
+    for script in ["test:unit", "test:run", "test"] {
+        let Some(body) = v["scripts"][script].as_str() else {
+            continue;
+        };
+        let (at, body) =
+            resolve_depth(body, &dir, tree, read, 1).unwrap_or((dir.clone(), body.to_string()));
+        let rel = if at == dir {
+            rel.to_string()
+        } else {
+            match file.strip_prefix(&format!("{at}/")) {
+                Some(r) => r.to_string(),
+                None => continue,
+            }
+        };
+        if let Some(c) = narrow(&via_bin(&body), &rel) {
+            return Some(in_folder(&at, &c));
+        }
+    }
+    None
+}
+
 impl TestEnv {
     /// Whether this is another package's job for `focus` (the files a run
     /// changes): its tests run in a folder none of them is in.
@@ -449,6 +758,29 @@ impl TestEnv {
                 .any(|f| f.trim_start_matches("./").starts_with(&format!("{dir}/")))
     }
 
+    /// Each test step that calls a package script or a make target
+    /// (`pnpm --filter web test`, `npm run test:unit`, `make test`) put as
+    /// the command the script holds, in its folder, so its runner can be
+    /// narrowed to one file ([`Self::file_command`]). `read` gives the
+    /// manifests' text ([`script_files`]).
+    pub fn resolve_scripts(&mut self, tree: &[String], read: &dyn Fn(&str) -> Option<String>) {
+        for line in self.test.iter_mut() {
+            let (dir, cmd) = unwrap_cd(line);
+            let dir = if dir.is_empty() {
+                self.dir.clone()
+            } else {
+                dir
+            };
+            if let Some((at, body)) = resolve_script(&cmd, &dir, tree, read) {
+                let at = at
+                    .strip_prefix(&format!("{}/", self.dir))
+                    .map(str::to_string)
+                    .unwrap_or(if at == self.dir { String::new() } else { at });
+                *line = in_folder(&at, &via_bin(&body));
+            }
+        }
+    }
+
     /// The install's name: its steps, versions and the manifests' blob ids
     /// (`shas`: `(path, blob sha)` from the tree at the head).
     pub fn fingerprint(&self, shas: &[(String, String)]) -> String {
@@ -456,6 +788,7 @@ impl TestEnv {
         h.update(self.dir.as_bytes());
         h.update(self.python.as_bytes());
         h.update(self.node.as_bytes());
+        h.update(self.pnpm.as_bytes());
         for l in &self.install {
             h.update(l.as_bytes());
             h.update(b"\n");
@@ -509,6 +842,24 @@ impl TestEnv {
                         quote(&self.node)
                     ));
                 }
+                // The package manager CI sets up with an action (no `run`
+                // line installs it), at the version it pins, before any
+                // install line calls it.
+                let all = format!("{} {}", self.install.join(" "), self.test.join(" "));
+                for (tool, pinned) in [("pnpm", &self.pnpm), ("yarn", &String::new())] {
+                    if !all.split_whitespace().any(|w| w == tool) {
+                        continue;
+                    }
+                    let at = if pinned.is_empty() {
+                        String::new()
+                    } else {
+                        format!("@{pinned}")
+                    };
+                    out.push(format!(
+                        "command -v {tool} >/dev/null 2>&1 || corepack enable {tool} >/dev/null 2>&1 || npm install -g {} >/dev/null 2>&1 || true; hash -r",
+                        quote(&format!("{tool}{at}"))
+                    ));
+                }
             }
             Kind::Other => {}
         }
@@ -547,6 +898,7 @@ fi
 {activate}
 {cd}if [ -z "$RESTORED" ] || [ -z "{complete}" ]; then
   ( {install} ) >/tmp/coderhelm-install.log 2>&1; ICODE=$?; tail -5 /tmp/coderhelm-install.log
+  if [ $ICODE -ne 0 ]; then echo "{INSTALL_FAILED} $ICODE"; tail -c 1500 /tmp/coderhelm-install.log; fi
   if [ $ICODE -eq 0 ] && [ -z "$RESTORED" ]; then
     echo "{INSTALLED}"
     if [ -n "$ENV_CACHE_PUT_URL" ] && tar czf /tmp/coderhelm-env-out.tgz -C "$E" . && curl -fsS --retry 2 --noproxy "*" -T /tmp/coderhelm-env-out.tgz "$ENV_CACHE_PUT_URL"; then echo "{SAVED}"; fi
@@ -584,16 +936,19 @@ bash -c {cmd}"#,
             let rel = file.strip_prefix(&format!("{}/", dir.trim_end_matches('/')))?;
             Some(format!("(cd {dir} && {})", cmd.replace(file, rel)))
         };
-        // A runner that takes file paths.
+        // A runner that takes file paths (`narrow`).
+        // The wrapper runs the command from the repository root: a job's
+        // working directory and a step's folder are both cd'd into.
+        let job = self.dir.trim_end_matches('/');
         for (dir, line) in &steps {
-            let low = line.to_ascii_lowercase();
-            for runner in ["pytest", "-m unittest"] {
-                if let Some(i) = low.find(runner) {
-                    let prefix = line[..i + runner.len()].trim();
-                    if let Some(c) = in_dir(dir, format!("{prefix} {file}")) {
-                        return Some(c);
-                    }
-                }
+            let at = join(job, dir);
+            let rel = if at.is_empty() {
+                Some(file)
+            } else {
+                file.strip_prefix(&format!("{}/", at.trim_end_matches('/')))
+            };
+            if let Some(c) = rel.and_then(|r| narrow(line, r)) {
+                return Some(in_folder(&at, &c));
             }
         }
         // A loop over test files, its body running each one.
@@ -835,6 +1190,129 @@ jobs:
         assert_eq!(e.file_command("tests/test_a.py"), None);
         e.test = vec!["npm run build".into()];
         assert_eq!(e.file_command("tests/test_a.py"), None);
+    }
+
+    #[test]
+    fn every_runner_is_narrowed_to_one_file_in_one_place() {
+        assert_eq!(
+            narrow("python -m pytest tests -q", "tests/test_a.py").as_deref(),
+            Some("python -m pytest tests/test_a.py")
+        );
+        assert_eq!(
+            narrow("python -m unittest discover", "tests/test_a.py").as_deref(),
+            Some("python -m unittest tests/test_a.py")
+        );
+        assert_eq!(
+            narrow("pnpm exec vitest run --coverage", "src/a.test.ts").as_deref(),
+            Some("pnpm exec vitest run src/a.test.ts")
+        );
+        assert_eq!(
+            narrow("npx --no-install vitest", "src/a.test.ts").as_deref(),
+            Some("npx --no-install vitest run src/a.test.ts")
+        );
+        assert_eq!(
+            narrow("npx jest --ci", "src/a.test.ts").as_deref(),
+            Some("npx jest src/a.test.ts")
+        );
+        assert_eq!(
+            narrow("go test ./... -race", "pkg/cart/total_test.go").as_deref(),
+            Some("go test ./pkg/cart/")
+        );
+        assert_eq!(
+            narrow("cargo test --workspace", "tests/cart.rs").as_deref(),
+            Some("cargo test --test cart")
+        );
+        // Never across a chain, never a file it can't take.
+        assert_eq!(
+            narrow("tsc --noEmit && vitest run", "a.test.ts").as_deref(),
+            Some("vitest run a.test.ts")
+        );
+        assert_eq!(narrow("cargo test", "src/lib.rs"), None);
+        assert_eq!(narrow("npm run build", "a.test.ts"), None);
+        assert_eq!(narrow("pytest", "a; rm -rf /"), None);
+    }
+
+    #[test]
+    fn package_scripts_and_make_targets_are_read_to_their_runner() {
+        let tree: Vec<String> = [
+            "package.json",
+            "apps/web/package.json",
+            "apps/web/src/a.test.ts",
+            "Makefile",
+            "tests/test_a.py",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let read = |p: &str| -> Option<String> {
+            match p {
+                "package.json" => {
+                    Some(r#"{"name":"root","scripts":{"test":"turbo run test"}}"#.into())
+                }
+                "apps/web/package.json" => Some(
+                    r#"{"name":"web","scripts":{"test":"vitest","test:run":"vitest run"}}"#.into(),
+                ),
+                "Makefile" => Some(
+                    "lint:\n\truff .\ntest: deps\n\t@echo testing\n\tpython -m pytest -q tests\n"
+                        .into(),
+                ),
+                _ => None,
+            }
+        };
+        assert_eq!(
+            resolve_script("pnpm --filter web test", "", &tree, &read),
+            Some(("apps/web".into(), "vitest".into()))
+        );
+        assert_eq!(
+            resolve_script("pnpm -F web run test:run", "", &tree, &read),
+            Some(("apps/web".into(), "vitest run".into()))
+        );
+        assert_eq!(
+            resolve_script("make test", "", &tree, &read),
+            Some((String::new(), "python -m pytest -q tests".into()))
+        );
+        assert_eq!(resolve_script("pnpm install", "", &tree, &read), None);
+        // A CI step that calls a script is narrowed through it.
+        let mut e = TestEnv {
+            test: vec!["pnpm --filter web test".into(), "make test".into()],
+            ..Default::default()
+        };
+        e.resolve_scripts(&tree, &read);
+        assert_eq!(
+            e.file_command("apps/web/src/a.test.ts").as_deref(),
+            Some("(cd apps/web && npx --no-install vitest run src/a.test.ts)")
+        );
+        assert_eq!(
+            e.file_command("tests/test_a.py").as_deref(),
+            Some("python -m pytest tests/test_a.py")
+        );
+        // CI runs every package through turbo: the file's own package's
+        // script runs it.
+        assert_eq!(
+            package_test_command("apps/web/src/a.test.ts", &tree, &read).as_deref(),
+            Some("(cd apps/web && npx --no-install vitest run src/a.test.ts)")
+        );
+        let wanted = script_files(Some(&e), &tree, &["apps/web/src/a.test.ts".into()]);
+        assert!(wanted.contains(&"apps/web/package.json".to_string()));
+        assert!(wanted.contains(&"Makefile".to_string()));
+    }
+
+    #[test]
+    fn a_failed_install_and_the_pinned_manager_are_in_the_script() {
+        let e = TestEnv {
+            kind: Kind::Node,
+            pnpm: "10.28.2".into(),
+            install: vec!["pnpm install --frozen-lockfile".into()],
+            test: vec!["pnpm test".into()],
+            ..Default::default()
+        };
+        let w = e.wrap("true");
+        assert!(w.contains(INSTALL_FAILED));
+        assert!(w.contains("npm install -g 'pnpm@10.28.2'"));
+        assert!(w.find("corepack enable pnpm").unwrap() < w.find("pnpm install --frozen").unwrap());
+        let wf = "jobs:\n  t:\n    steps:\n      - uses: pnpm/action-setup@v4\n        with:\n          version: 10.28.2\n      - run: pnpm install --frozen-lockfile\n      - run: pnpm --filter web test\n";
+        let e = from_workflows(&[("ci.yml".into(), wf.into())], &[]).unwrap();
+        assert_eq!(e.pnpm, "10.28.2");
     }
 
     /// The second round restores the first round's install instead of
