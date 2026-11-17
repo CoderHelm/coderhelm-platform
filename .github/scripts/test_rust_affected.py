@@ -32,6 +32,7 @@ class AffectsRust(unittest.TestCase):
             "lambda/log-analyzer/model_prices.json",
             "infra/cfn/coderhelm-log-reader.yaml",
             "docs/api/openapi.json",
+            "docs/incidents/a_whole_branch.md",
             "installer/lib/github-app.mjs",
             "coderhelm-jira/src/index.js",
             "selfhost/install.sh",
