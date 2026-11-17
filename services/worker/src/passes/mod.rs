@@ -1258,6 +1258,7 @@ pub mod base_images;
 pub mod bedrock_sync;
 mod branch_update;
 mod checks;
+pub(crate) mod ci_repro;
 pub mod code_graph;
 mod completeness;
 pub mod conventions;
@@ -1310,6 +1311,9 @@ pub mod lesson_cleanup;
 pub mod lessons;
 pub mod line_count;
 mod link_checks;
+/// Selectors on another company's page come from a probe of it; a write carries
+/// only the lines the change needs.
+pub mod live_guard;
 pub mod live_sources;
 pub mod log_autofix;
 pub mod log_evidence;
@@ -1372,6 +1376,7 @@ mod review;
 pub mod review_actions;
 pub mod review_activity;
 pub mod review_agent;
+pub mod review_ci;
 pub mod review_configs;
 #[cfg(test)]
 mod review_eval;
@@ -1383,6 +1388,7 @@ pub mod review_policy;
 #[cfg(test)]
 mod review_policy_eval;
 pub mod review_pr;
+pub mod review_probe;
 pub mod review_reminder;
 pub mod review_risk;
 pub mod review_rules;
@@ -1966,7 +1972,34 @@ async fn alarm_evidence_for_run(state: &WorkerState, msg: &TicketMessage) -> Opt
     )
     .await;
     Some(match session {
-        Ok(Some(s)) => ae::gather(&s, &alarm, chrono::Utc::now()).await,
+        Ok(Some(s)) => {
+            let got = ae::gather(&s, &alarm, chrono::Utc::now()).await;
+            // A refused read is the install's setup item, recorded once for
+            // the account; a read that works again clears it.
+            let table = &state.config.settings_table_name;
+            if got.refused.is_empty() {
+                common::aws_role_reads::clear(&state.dynamo, table, &msg.team_id, &account).await;
+            } else {
+                let role_arn = common::log_findings::connection_role(
+                    &state.dynamo,
+                    &state.config.aws_insights_table_name,
+                    &msg.team_id,
+                    &account,
+                )
+                .await;
+                if let Some(gap) = common::aws_role_reads::gap(
+                    &account,
+                    &role_arn,
+                    &got.refused,
+                    "an AWS WAF alarm's evidence",
+                    &chrono::Utc::now().to_rfc3339(),
+                ) {
+                    common::aws_role_reads::record(&state.dynamo, table, &msg.team_id, &gap).await;
+                }
+                info!(team_id = %msg.team_id, account = %account, refused = ?got.refused, "AWS role lacks reads an alert route needs: install setup item");
+            }
+            got.text
+        }
         Ok(None) => ae::render(
             &alarm,
             &[format!(
@@ -2773,13 +2806,17 @@ async fn run_passes(
     // fingerprints from the web ACL's logs) before planning; it joins the
     // ticket as data ---
     if let Some(ev) = alarm_evidence_for_run(state, msg).await {
-        add_progress_note(
-            state,
-            &msg.team_id,
-            run_id,
-            "Read the requests the alarm's WAF rule matched (sampled requests and the web ACL's logs).",
-        )
-        .await;
+        let note = if ev.contains(common::aws_role_reads::ITEM_LABEL) {
+            format!(
+                "Read what the alarm's WAF rule matched that the AWS role allows; the rest is the \
+                 install's setup item \"{}\", not a question on this run.",
+                common::aws_role_reads::ITEM_LABEL
+            )
+        } else {
+            "Read the requests the alarm's WAF rule matched (sampled requests and the web ACL's logs)."
+                .to_string()
+        };
+        add_progress_note(state, &msg.team_id, run_id, &note).await;
         msg.body = common::alarm_evidence::with_evidence(&msg.body, &ev);
     }
     if let Some(ev) = log_ev.as_ref() {
@@ -10061,6 +10098,10 @@ Every change that adds or changes behavior must ship with tests in this same bra
 - New behavior (a feature, endpoint, UI state, option, job): add tests that exercise it.\n\
 - Changed or fixed behavior: update the existing tests that cover that code so they assert the \
 new behavior. A bug fix gets a test that fails without the fix.\n\
+- Shell scripts, CI steps and workflow helpers are behavior too: test the script itself with \
+stub commands first on PATH (a fake `aws`, `gh` or `curl` that prints a fixture and records its \
+arguments) and fixtures beside the test, then assert on its output, exit code and the recorded \
+calls. Never hand such a test back as something only a person can run.\n\
 - Follow the repo's own testing conventions exactly: framework, where tests live and how they're \
 named, helpers and fixtures, how mocks are done, which command runs them. They are in AGENTS.md / \
 CLAUDE.md and in nested ones next to the code (e.g. `e2e/CLAUDE.md`, a package's CLAUDE.md): read \
@@ -10085,10 +10126,11 @@ an end-to-end spec in that suite for the new behaviour, in this same branch. Fol
 conventions: its folder, page objects and fixtures, tags and area labels, its test map, and the \
 AGENTS.md / CLAUDE.md files next to it. The spec must fail without the change and pass with it; \
 CoderHelm runs it on the pull request's preview. Unit tests alone don't cover a change a person sees. \
-Assert what the person sees. Before writing selectors or reading JSON of a page another company serves \
-(a payment form, a sign-in widget), probe it with `probe_page` (on the preview or the vendor's URL), commit \
-the record it returns, quote the test ids and fields you use in the pull request, and use only those: the \
-review flags any it can't find in a probe.\n";
+Assert what the person sees. Before writing or keeping selectors or reading JSON of a page another company \
+serves (a payment form, a sign-in widget, a portal in a frame), probe it with `probe_page` (on the preview or \
+the vendor's URL, with `clicks` that reach each state a branch of the spec reads); the record is committed for \
+you, the pull request quotes it, and a write using test ids no probe saw is not made. A branch on the page's \
+state (enabled or not, visible or not) that no run has taken is unverified, and the pull request says so.\n";
 
 pub(crate) fn attr_s(val: &str) -> aws_sdk_dynamodb::types::AttributeValue {
     aws_sdk_dynamodb::types::AttributeValue::S(val.to_string())

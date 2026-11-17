@@ -72,6 +72,8 @@ pub mod agent_policy;
 pub mod alarm_evidence;
 pub mod alert_episodes;
 pub mod alert_notify;
+/// A read the team's AWS role lacks: one install-level setup item.
+pub mod aws_role_reads;
 pub mod coder_shell;
 /// Chat notifications (Teams and Slack): one message model, a renderer per
 /// channel, sealed webhook URLs.
@@ -158,9 +160,17 @@ pub mod knowledge;
 pub mod repo_read;
 // The test that every model call site is a metered helper
 pub mod ci_cover;
+/// The lines a pull request carries about its own CI, true for its head.
+pub mod ci_lines;
+/// A red check reproduced against the base branch before anything is
+/// decided about it.
+pub mod ci_repro;
 /// The last check on a pull request description: no section twice, no
 /// deploy maps, no empty "who this affects".
 pub mod description_lint;
+// A diff holds the lines the change needs: formatting-only hunks are told
+// apart and put back.
+pub mod diff_shape;
 #[cfg(test)]
 mod model_call_sites;
 /// Which pull requests CoderHelm may push to, edit or close: its own.

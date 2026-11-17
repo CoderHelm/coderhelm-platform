@@ -425,6 +425,11 @@ fn same_head(stamped: &str, head: &str) -> bool {
 /// the writer version is never current: an upgrade rebuilds it. A stamp
 /// from before the digest answers for its head and writer alone.
 pub fn is_current(body: &str, head: &str) -> bool {
+    // A "CI is failing" section is checked against the head's checks on
+    // every look (`common::ci_lines`): it goes once they show no failure.
+    if common::ci_lines::failing_head(body).is_some() {
+        return false;
+    }
     match stamp_all(body) {
         Some(s) => {
             !head.is_empty()
@@ -892,6 +897,7 @@ async fn build(
         None if fresh => (fresh_base(&body), None),
         None => (body.clone(), None),
     };
+    let base = ci_lines_for_head(state, github, team_id, owner, repo, number, &head, &base).await;
     // The facts of this head, and the description as a view of them: every
     // written sentence checked, the lead rendered, the rest collapsed.
     let next = match gather(state, github, team_id, owner, repo, number).await {
@@ -949,6 +955,60 @@ async fn build(
         }
         Err(e) => Reconciled::Failed(format!("the description could not be saved: {e}")),
     }
+}
+
+/// The lines CoderHelm wrote about the pull request's CI, true for `head`
+/// (`common::ci_lines::reconcile`): "CI is failing" goes once the head moved
+/// or its checks show no failure, a revert's "Deferred" line once its work
+/// is back. When the run's failures were compared, no sentence calls one
+/// the base branch's, flaky or not this change's without a comparison on
+/// this head that shows it (`common::ci_repro::hold_blame`).
+#[allow(clippy::too_many_arguments)]
+async fn ci_lines_for_head(
+    state: &WorkerState,
+    github: &GitHubClient,
+    team_id: &str,
+    owner: &str,
+    repo: &str,
+    number: u64,
+    head: &str,
+    body: &str,
+) -> String {
+    let checks = github.list_ci_for_ref(owner, repo, head).await.ok();
+    let ci = common::ci_lines::HeadCi {
+        head: head.to_string(),
+        read: checks.is_some(),
+        failing: checks
+            .as_ref()
+            .map(|c| super::resume::failing_check_names(c).into_iter().collect())
+            .unwrap_or_default(),
+    };
+    let mut undone: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for m in common::ci_lines::reverts_in(body) {
+        if let Ok(changed) = github.compare_changed_files(owner, repo, &m.to, head).await {
+            if m.paths.iter().any(|p| changed.contains(p)) {
+                undone.insert(m.to.clone());
+            }
+        }
+    }
+    let out = common::ci_lines::reconcile(body, &ci, &|m| undone.contains(&m.to));
+    let Some(run_id) =
+        super::review_pr::lookup_run_by_pr(state, team_id, owner, repo, number).await
+    else {
+        return out;
+    };
+    let records = super::ci_repro::load(state, team_id, &run_id).await;
+    if records.is_empty() {
+        return out;
+    }
+    let (held, changed) = common::ci_repro::hold_blame(&out, &records, head);
+    if changed {
+        warn!(
+            pr_number = number,
+            "The description blamed a failure on the base branch with no comparison on record; that sentence was replaced"
+        );
+    }
+    held
 }
 
 /// The catch-up's rebuild of a run's pull request after an upgrade: when

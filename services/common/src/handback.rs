@@ -128,6 +128,10 @@ impl HandBack {
     /// From what the stop judge found only a person has.
     pub fn of_person_only(p: crate::stop_judge::PersonOnly, question: &str) -> Option<HandBack> {
         use crate::stop_judge::PersonOnly as P;
+        // A read the team's AWS role lacks is the install's setup item.
+        if crate::aws_role_reads::is_install_grant(question) {
+            return None;
+        }
         let why = match p {
             P::ProductChoice => HumanOnly::ProductDecision,
             P::Access => {
@@ -160,8 +164,13 @@ impl HandBack {
 
 /// Reads a reason on the list from words a run, a check or the judge wrote.
 /// `None` when they name none, which is the case for every stall, red
-/// check, tool error, time limit or budget.
+/// check, tool error, time limit or budget, and for a read the team's
+/// connected AWS role lacks: that is the install's setup item
+/// (`aws_role_reads`), asked once for the whole install, never a run's wait.
 pub fn human_only_in(text: &str) -> Option<HumanOnly> {
+    if crate::aws_role_reads::is_install_grant(text) {
+        return None;
+    }
     let t = text.to_lowercase();
     let any = |marks: &[&str]| marks.iter().any(|m| t.contains(m));
     if any(&[
@@ -253,6 +262,18 @@ mod tests {
         assert_eq!(
             human_only_in("It needs the API key for the payments sandbox"),
             Some(HumanOnly::Credential)
+        );
+    }
+
+    #[test]
+    fn a_read_the_aws_role_lacks_is_the_install_item_never_a_wait() {
+        let asked = "Grant access: the team's read-only role was denied wafv2:ListWebACLs and \
+                     wafv2:GetSampledRequests, and no source can read the WAF logs in Athena";
+        assert_eq!(human_only_in(asked), None);
+        // Other access stays on the list.
+        assert_eq!(
+            human_only_in("Grant access to the repository: the app isn't installed"),
+            Some(HumanOnly::MissingAccess)
         );
     }
 }

@@ -3060,6 +3060,29 @@ pub async fn fetch_samples(
     }
 }
 
+/// The role a team connected for `account` (from its AWS connection), for
+/// naming it in a setup item. Empty when there is none.
+pub async fn connection_role(
+    dynamo: &DynamoClient,
+    insights_table: &str,
+    team_id: &str,
+    account: &str,
+) -> String {
+    if account.is_empty() || !account.chars().all(|c| c.is_ascii_digit()) {
+        return String::new();
+    }
+    dynamo
+        .get_item()
+        .table_name(insights_table)
+        .key("pk", attr(team_id))
+        .key("sk", attr(&format!("AWS_CONN#{account}")))
+        .send()
+        .await
+        .ok()
+        .and_then(|o| o.item().map(|i| s(i, "role_arn")))
+        .unwrap_or_default()
+}
+
 /// Take on the team's log reader role for the finding's account.
 pub async fn session_for(
     dynamo: &DynamoClient,

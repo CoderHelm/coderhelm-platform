@@ -2764,6 +2764,23 @@ impl<'a> ToolExecutor for FeedbackToolExecutor<'a> {
         }
         if let Some(web) = self.web {
             if let Some(out) = web.handle(self.state, self.github, name, input).await {
+                // A probe's record is committed on the branch by the round
+                // (`live_guard`), as the tool's answer says.
+                if name == super::web_check::PROBE_TOOL {
+                    if let Some(record) = common::e2e::probe::record_in(&out) {
+                        let message = format!("Record the probe of {}", record.origin);
+                        if let Err(e) = super::live_guard::commit_record(
+                            self.github,
+                            (self.owner, self.repo, self.branch),
+                            &record,
+                            &message,
+                        )
+                        .await
+                        {
+                            tracing::warn!(error = %e, "Could not commit the probe record");
+                        }
+                    }
+                }
                 return Ok(serde_json::json!(out));
             }
         }

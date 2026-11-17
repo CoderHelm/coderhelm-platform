@@ -173,10 +173,16 @@ pub(crate) async fn named_labels(
 /// The review's findings for changed end-to-end files that drive another
 /// company's page with test ids or JSON fields no probe recorded in the
 /// repository (`common::e2e::probe`) observed.
+///
+/// What is unobserved is settled before it is a finding
+/// (`review_probe`): a passing end-to-end run on the head whose report
+/// shows the ids observes them, and for the rest the reviewer runs the
+/// probe itself and decides from its record.
 async fn probe_gaps(
     state: &WorkerState,
     github: &GitHubClient,
-    (team_id, owner, repo): (&str, &str, &str),
+    (team_id, owner, repo, pr_number): (&str, &str, &str, u64),
+    web: &super::web_check::WebCheck,
     head_sha: &str,
     compare: &serde_json::Value,
     tree: &[String],
@@ -212,7 +218,7 @@ async fn probe_gaps(
     if files.is_empty() {
         return Vec::new();
     }
-    let mut probes = Vec::new();
+    let mut probes: Vec<common::e2e::probe::ProbeRecord> = Vec::new();
     for p in tree
         .iter()
         .filter(|p| common::e2e::probe::is_record(p))
@@ -225,7 +231,74 @@ async fn probe_gaps(
         }
     }
     let own = super::web_check::team_domains(state, team_id).await;
-    super::review_rules::probe_findings(&common::e2e::probe::unprobed(&files, &probes, &own))
+    let gaps = common::e2e::probe::unprobed(&files, &probes, &own);
+    if gaps.is_empty() {
+        return Vec::new();
+    }
+    // A passing end-to-end run on the head: what its report shows was
+    // exercised against the live page, the same as a probe's record.
+    let checks = github
+        .list_check_runs_for_ref(owner, repo, head_sha)
+        .await
+        .ok()
+        .and_then(|v| v["check_runs"].as_array().cloned())
+        .unwrap_or_default();
+    let comments = github
+        .list_issue_comments(owner, repo, pr_number)
+        .await
+        .unwrap_or_default();
+    if let Some(run) = super::e2e_reads::passing_run(&checks, &comments, head_sha) {
+        if let Some(report) = &run.report {
+            let mut ids: Vec<String> = gaps.iter().flat_map(|g| g.missing.clone()).collect();
+            ids.sort();
+            ids.dedup();
+            let found = super::e2e_reads::report_shows(state, github, web, report, &ids).await;
+            info!(pr = pr_number, how = %run.how, report = %report, found = ?found, "End-to-end run on the head read for the selectors no probe observed");
+            if !found.is_empty() {
+                for origin in gaps.iter().map(|g| g.origin.clone()) {
+                    probes.push(super::review_probe::from_report(
+                        &origin, report, head_sha, &found,
+                    ));
+                }
+            }
+        }
+    }
+    let gaps = common::e2e::probe::unprobed(&files, &probes, &own);
+    // What is still unobserved: the reviewer probes the page itself.
+    let mut out = Vec::new();
+    for gap in &gaps {
+        let (full, added) = files
+            .iter()
+            .find(|(p, _, _)| *p == gap.path)
+            .map(|(_, f, a)| (f.as_str(), a.as_str()))
+            .unwrap_or(("", ""));
+        let probed = match super::review_probe::page_url(full, &gap.origin) {
+            None => super::review_probe::Probed::NotRun(format!(
+                "the spec names no https page on `{}`",
+                gap.origin
+            )),
+            Some(url) => {
+                let answer = web
+                    .handle(
+                        state,
+                        github,
+                        super::web_check::PROBE_TOOL,
+                        &serde_json::json!({ "url": url }),
+                    )
+                    .await
+                    .unwrap_or_default();
+                match super::review_probe::record_in_answer(&answer) {
+                    Some(r) => super::review_probe::Probed::Ran(r),
+                    None => super::review_probe::Probed::NotRun(
+                        common::truncate_str(answer.trim(), 200).to_string(),
+                    ),
+                }
+            }
+        };
+        info!(pr = pr_number, file = %gap.path, origin = %gap.origin, probed = ?matches!(probed, super::review_probe::Probed::Ran(_)), "Reviewer probed the page for selectors no probe observed");
+        out.extend(super::review_probe::decide(gap, full, added, &probed));
+    }
+    out
 }
 
 /// The review's findings for a change wider than its ticket
@@ -2663,16 +2736,19 @@ async fn run_once(
                 // and a rebase onto it leaves the approved commit off the
                 // branch: compare the PR's own change now with the one
                 // approved, whichever happened.
-                own_change_unchanged = match github
+                let at_approval = match github
                     .get_diff(&msg.repo_owner, &msg.repo_name, base, &approved)
                     .await
                 {
-                    Ok(at_approval) => super::review_scope::same_own_change(&at_approval, &compare),
+                    Ok(v) => Some(v),
                     Err(e) => {
                         warn!(pr = msg.pr_number, error = %e, "Could not read the PR's change at the approval — reviewing what changed since");
-                        false
+                        None
                     }
                 };
+                own_change_unchanged = at_approval
+                    .as_ref()
+                    .is_some_and(|a| super::review_scope::same_own_change(a, &compare));
                 let nothing_new =
                     (ahead && !super::review_scope::touches_code(&since)) || own_change_unchanged;
                 if nothing_new && unconfirmed_in_body.is_empty() {
@@ -2734,15 +2810,21 @@ async fn run_once(
                          nothing new in it; triage the facts the description marks \
                          unconfirmed.)\n{diff}"
                     );
-                } else if ahead {
-                    info!(pr = msg.pr_number, approved = %approved, head = %head_sha, files = ?super::review_scope::code_files(&since), "Reviewing only what changed since the approval");
+                } else if let (true, Some(at_approval)) = (ahead, at_approval.as_ref()) {
+                    // Only the PR's own change since the approval: a merge of
+                    // the base branch brings in files this PR doesn't change.
+                    let moved = super::review_scope::own_files_moved(at_approval, &compare);
+                    let own = super::review_scope::own_part_of(&since, &moved);
+                    info!(pr = msg.pr_number, approved = %approved, head = %head_sha, files = ?super::review_scope::code_files(&own), left_out = ?super::review_scope::compare_paths(&since).len().saturating_sub(super::review_scope::compare_paths(&own).len()), "Reviewing only the PR's own change since the approval");
                     review_diff = format!(
-                        "(CoderHelm approved {short} earlier. This review covers only what \
-                         changed since then; the rest of the PR was reviewed and approved.)\n{}",
-                        review_agent::format_diff(&since, 40_000)
+                        "(CoderHelm approved {short} earlier. This review covers only what the \
+                         PR's own change (its diff with the merge base) changed since then; the \
+                         rest of the PR was reviewed and approved. Files the base branch \
+                         brought in are not this PR's change and are left out.)\n{}",
+                        review_agent::format_diff(&own, 40_000)
                     );
                 } else {
-                    info!(pr = msg.pr_number, approved = %approved, "Approved commit isn't an ancestor of the head (rebased) and the change differs — full review");
+                    info!(pr = msg.pr_number, approved = %approved, "Approved commit isn't an ancestor of the head (rebased), or its change couldn't be read, and the change differs — full review");
                 }
             }
             Err(e) => {
@@ -2757,13 +2839,13 @@ async fn run_once(
         &head_sha,
     ) {
         let short = reviewed[..reviewed.len().min(7)].to_string();
-        own_change_unchanged = match github
+        let at_review = github
             .get_diff(&msg.repo_owner, &msg.repo_name, base, &reviewed)
             .await
-        {
-            Ok(at_review) => super::review_scope::same_own_change(&at_review, &compare),
-            Err(_) => false,
-        };
+            .ok();
+        own_change_unchanged = at_review
+            .as_ref()
+            .is_some_and(|a| super::review_scope::same_own_change(a, &compare));
         if own_change_unchanged && unconfirmed_in_body.is_empty() {
             let verdict = records
                 .iter()
@@ -2793,12 +2875,19 @@ async fn run_once(
                 .get_diff(&msg.repo_owner, &msg.repo_name, &reviewed, &head_sha)
                 .await
             {
-                Ok(since) if super::review_scope::builds_on(&since) => {
-                    info!(pr = msg.pr_number, reviewed = %reviewed, head = %head_sha, files = ?super::review_scope::code_files(&since), "Reviewing only the hunks changed since the previous review");
+                Ok(since) if super::review_scope::builds_on(&since) && at_review.is_some() => {
+                    // Only the PR's own change since that review: a merge of
+                    // the base branch brings in files this PR doesn't change.
+                    let moved = super::review_scope::own_files_moved(
+                        at_review.as_ref().unwrap_or(&serde_json::Value::Null),
+                        &compare,
+                    );
+                    let own = super::review_scope::own_part_of(&since, &moved);
+                    info!(pr = msg.pr_number, reviewed = %reviewed, head = %head_sha, files = ?super::review_scope::code_files(&own), "Reviewing only the hunks of the PR's own change since the previous review");
                     review_diff = format!(
                         "{}\n{}",
                         super::review_scope::since_review_note(&reviewed),
-                        review_agent::format_diff(&since, 40_000)
+                        review_agent::format_diff(&own, 40_000)
                     );
                     since_review = Some(reviewed.clone());
                 }
@@ -2957,36 +3046,48 @@ async fn run_once(
         }
     };
     // Checks that fail on the base branch too were not caused by this PR:
-    // the reviewer is told, and a finding resting on one is a note.
-    let base_failing: Vec<String> = if base.is_empty() {
-        Vec::new()
+    // the reviewer is told, and a finding resting on one is a note. An
+    // end-to-end check is compared test by test, from each failing test's
+    // own error (`review_ci`), never by the check's name.
+    let base_runs = if base.is_empty() {
+        serde_json::Value::Null
     } else {
         match github
             .list_ci_for_ref(&msg.repo_owner, &msg.repo_name, base)
             .await
         {
-            Ok(v) => super::review_policy::failing_checks(&v),
+            Ok(v) => v,
             Err(e) => {
                 warn!(pr = msg.pr_number, error = %e, "Could not fetch the base branch's check runs");
-                Vec::new()
+                serde_json::Value::Null
             }
         }
     };
-    let ci_context = if base_failing.is_empty() {
-        ci_context
-    } else {
-        format!(
-            "{ci_context}\n## Checks failing on the base branch too ({})\n{}\nThese fail without \
-             this PR's change: never block on them. Mention one as a note at most, with \
-             `caused_by_diff`: false.\n",
-            &base[..base.len().min(7)],
-            base_failing
-                .iter()
-                .map(|n| format!("- {n}"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        )
+    let ci_compare = {
+        let failing = |v: &serde_json::Value| !super::review_policy::failing_checks(v).is_empty();
+        let head_notes = match github
+            .list_ci_for_ref(&msg.repo_owner, &msg.repo_name, &head_sha)
+            .await
+        {
+            Ok(v) if failing(&v) => github
+                .get_check_run_annotations(&msg.repo_owner, &msg.repo_name, &head_sha)
+                .await
+                .unwrap_or_default(),
+            _ => String::new(),
+        };
+        let base_notes = if !head_notes.is_empty() && failing(&base_runs) {
+            github
+                .get_check_run_annotations(&msg.repo_owner, &msg.repo_name, base)
+                .await
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        super::review_ci::CiCompare::read(&head_sha, base, &head_notes, &base_notes, &base_runs)
+            .touching(changed_files(&compare).into_iter().collect())
     };
+    let base_failing: Vec<String> = ci_compare.base_failing();
+    let ci_context = format!("{ci_context}{}", ci_compare.context());
     // For CoderHelm's own PR: what its planner looked up and found about
     // where the fix belongs, so a diff that overrides source data can be
     // judged against it.
@@ -3280,7 +3381,7 @@ async fn run_once(
     .await;
     // A review that didn't finish has no verdict: the job is retried (see
     // `run`), and nothing is posted for it. Its tokens still count.
-    let output = match output {
+    let mut output = match output {
         Ok(o) => o,
         Err(reason) => {
             return Err(reason.into());
@@ -3502,14 +3603,15 @@ async fn run_once(
         for f in probe_gaps(
             state,
             &github,
-            (&msg.team_id, &msg.repo_owner, &msg.repo_name),
+            (&msg.team_id, &msg.repo_owner, &msg.repo_name, msg.pr_number),
+            &web,
             &head_sha,
             &compare,
             &tree,
         )
         .await
         {
-            info!(pr = msg.pr_number, file = %f.file, "End-to-end selectors no probe observed: must fix");
+            info!(pr = msg.pr_number, file = %f.file, blocks = f.required.is_some(), "End-to-end selectors no probe, run or reviewer's probe observed");
             findings.retain(|x| x.title != f.title || x.file != f.file);
             findings.push(f);
         }
@@ -3534,6 +3636,21 @@ async fn run_once(
     review_agent::enforce_source_data_override(&mut findings);
     // A request to test something by hand is a note, never a block.
     review_agent::enforce_manual_checks_are_notes(&mut findings);
+    // What the PR changes is its merge-base diff: a file it doesn't change
+    // is never "an unrelated change" of this PR.
+    let outside = super::review_scope::drop_outside_claims(&mut findings, &changed_list);
+    if !outside.is_empty() {
+        info!(pr = msg.pr_number, dropped = ?outside, "Findings calling a file this PR doesn't change an unrelated change dropped");
+    }
+    // A failing check is blamed on the base branch, or a revert asked for,
+    // only from the failing test's own runs on both heads.
+    let held_blame = super::review_ci::hold(&mut findings, &mut output.summary, &ci_compare);
+    if held_blame > 0 {
+        info!(
+            pr = msg.pr_number,
+            held_blame, "Blame or revert sentences without a test-level comparison held"
+        );
+    }
     // Rule 3: only a high-severity defect caused by the diff holds the merge.
     let made_notes = super::review_policy::apply_blocking_policy(&mut findings, &base_failing);
     if made_notes > 0 {
