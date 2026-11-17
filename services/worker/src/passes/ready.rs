@@ -186,10 +186,11 @@ pub struct Facts {
     pub preview: Option<common::preview::State>,
 }
 
-/// The hold for a change a person sees that has no end-to-end spec in a
-/// repository with a suite.
-pub const E2E_MISSING: &str =
-    "The change alters what a person sees and adds no end-to-end spec to the repository's suite";
+/// What a change a person sees waits on while it has no end-to-end spec in
+/// a repository with a suite: CoderHelm writes it in its next round, so it
+/// is CoderHelm's own wait (bounded like every wait), never a person's hold.
+pub const E2E_WAIT: &str =
+    "the change alters what a person sees, so CoderHelm writes its end-to-end spec and runs it on the preview";
 
 /// What a draft waits for while its preview checks run.
 pub const PREVIEW_WAIT: &str =
@@ -561,10 +562,7 @@ fn decide_raw(f: &Facts) -> Decision {
     {
         use common::preview::{Outcome as PvOutcome, Stage};
         if p.e2e_required && !p.e2e_covered {
-            reasons.push(Reason::new(
-                E2E_MISSING,
-                "CoderHelm writes the spec in its next round on this branch (its Tests and scope check sends it back), runs it on the preview, and marks the pull request ready once it passes.",
-            ));
+            proof_wait.get_or_insert_with(|| E2E_WAIT.to_string());
         }
         match p.stage {
             Stage::Failed => {
@@ -2536,10 +2534,13 @@ mod tests {
             preview: Some(p.clone()),
             ..green_approved()
         };
-        let Decision::Held { reasons } = decide(&f) else {
-            panic!("held expected");
-        };
-        assert!(reasons[0].what.starts_with(E2E_MISSING));
+        // CoderHelm's own work: a wait while it writes the spec, never a
+        // person's hold.
+        assert!(
+            matches!(decide(&f), Decision::Wait { ref why, .. } if why == E2E_WAIT),
+            "{:?}",
+            decide(&f)
+        );
         p.e2e_covered = true;
         let ok = Facts {
             preview: Some(p),
