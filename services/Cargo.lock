@@ -228,6 +228,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-athena"
+version = "1.131.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77552fe3d20252b306e00f1fd5a833259336693579b99731a127ea270fc90768"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema",
+ "aws-smithy-types",
+ "aws-types",
+ "fastrand",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-autoscaling"
 version = "1.143.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -647,6 +670,31 @@ dependencies = [
  "aws-smithy-types",
  "aws-smithy-xml",
  "aws-types",
+ "fastrand",
+ "http",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
+name = "aws-sdk-glue"
+version = "1.187.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9e708873404aca92a3a254a2e0590b3787b3ea337b35c2f27b3bb2350bd40264"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
  "fastrand",
  "http",
  "regex-lite",
@@ -1808,6 +1856,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "aws-config",
+ "aws-sdk-athena",
  "aws-sdk-bedrockagent",
  "aws-sdk-bedrockagentruntime",
  "aws-sdk-bedrockruntime",
@@ -1818,6 +1867,7 @@ dependencies = [
  "aws-sdk-ec2",
  "aws-sdk-ecr",
  "aws-sdk-ecs",
+ "aws-sdk-glue",
  "aws-sdk-iam",
  "aws-sdk-kms",
  "aws-sdk-lambda",

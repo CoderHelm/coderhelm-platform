@@ -392,6 +392,29 @@ pub struct Question {
     pub deadline_hours: u32,
 }
 
+impl Question {
+    /// Whether the run may take the default by itself once the deadline
+    /// passes: never for access, which only a person can grant.
+    pub fn has_default(&self) -> bool {
+        self.person_only != PersonOnly::Access
+    }
+
+    /// What happens without an answer, in one sentence.
+    pub fn unanswered(&self) -> String {
+        if self.has_default() {
+            format!(
+                "If there is no answer within {} hours, I go ahead with the recommended option ({}).",
+                self.deadline_hours,
+                self.default.trim()
+            )
+        } else {
+            "Access is only granted by a person, so this has no default: the rest of the work \
+             goes on without it."
+                .to_string()
+        }
+    }
+}
+
 /// A named blocker, on checked evidence.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Hold {
@@ -526,10 +549,8 @@ impl Judged {
             };
             s.push_str(&format!("{}. {}{}\n", i + 1, o.trim(), mark));
         }
-        s.push_str(&format!(
-            "\nIf there is no answer within {} hours, I go ahead with the recommended option.",
-            q.deadline_hours
-        ));
+        s.push('\n');
+        s.push_str(&q.unanswered());
         Some(s)
     }
 
@@ -539,10 +560,7 @@ impl Judged {
         Some(crate::run_questions::Question {
             id: "q1".into(),
             question: q.question.clone(),
-            why: format!(
-                "Default if unanswered in {} hours: {}",
-                q.deadline_hours, q.default
-            ),
+            why: q.unanswered(),
             suggestions: q.options.clone(),
             checked: q.tried.clone(),
             ..Default::default()
@@ -793,6 +811,15 @@ pub fn validate(p: &Picture, v: &Value) -> Result<Verdict, String> {
                 return Err("an ask must list what was tried in `tried`".into());
             }
             let options = list("options");
+            if person_only == PersonOnly::Access
+                && crate::aws_role_reads::is_install_grant(&format!(
+                    "{question} {} {}",
+                    tried.join(" "),
+                    options.join(" ")
+                ))
+            {
+                return Err(install_level_rule());
+            }
             if !(2..=4).contains(&options.len()) {
                 return Err(format!(
                     "an ask needs 2 to 4 `options`, not {}",
@@ -826,6 +853,9 @@ pub fn validate(p: &Picture, v: &Value) -> Result<Verdict, String> {
             let blocker = s("blocker");
             if blocker.is_empty() {
                 return Err("a hold must name its blocker in `blocker`".into());
+            }
+            if crate::aws_role_reads::is_install_grant(&blocker) {
+                return Err(install_level_rule());
             }
             let evidence = list("evidence");
             if evidence.is_empty() {
@@ -928,19 +958,65 @@ fn settled_by_rule(p: &Picture) -> Option<(Verdict, String)> {
     None
 }
 
+/// What the re-ask says when an answer asks a person for, or holds on, a
+/// read the team's AWS role lacks.
+fn install_level_rule() -> String {
+    format!(
+        "a read CoderHelm's connected AWS role lacks is the install's setup item \"{}\", asked \
+         once for the whole install, never a question or a hold on a run: proceed on the evidence \
+         the run has and name the setup item in `assumption`",
+        crate::aws_role_reads::ITEM_LABEL
+    )
+}
+
+/// An ask for access, or a hold, that is a read the team's connected AWS
+/// role lacks: a proceed instead. A missing install permission is one
+/// install-level item (`aws_role_reads`), never a run's question or wait.
+fn install_level(v: &Verdict) -> Option<Verdict> {
+    let words = match v {
+        Verdict::Ask(q) if q.person_only == PersonOnly::Access => {
+            format!(
+                "{} {} {}",
+                q.question,
+                q.tried.join(" "),
+                q.options.join(" ")
+            )
+        }
+        Verdict::Hold(h) => h.blocker.clone(),
+        _ => return None,
+    };
+    crate::aws_role_reads::is_install_grant(&words).then(|| Verdict::Proceed {
+        assumption: format!(
+            "the reads CoderHelm's AWS role lacks are the install's setup item \"{}\", asked once \
+             for the whole install {}; this run doesn't ask for them and goes on with what it \
+             could read",
+            crate::aws_role_reads::ITEM_LABEL,
+            crate::github_grants::INSTALL_LEVEL
+        ),
+    })
+}
+
 /// The decision. One model call; a rule-breaking answer is asked again once
 /// with what was wrong; then the deterministic fallback.
 pub async fn judge<M: JudgeModel>(model: &M, picture: Picture) -> Judged {
     let picture = picture.with_ids();
     let kind = picture.kind();
     let step = picture.step.clone();
-    let make = |verdict, source, replies| Judged {
-        kind,
-        step: step.clone(),
-        verdict,
-        source,
-        replies,
-        _sealed: (),
+    // Every answer, the model's, a rule's or the fallback's, passes the
+    // install-level rule last.
+    let make = |verdict: Verdict, source: Source, replies| {
+        let (verdict, source) = match install_level(&verdict) {
+            Some(v) => (v, Source::Rule("install-level item".into())),
+            None => (verdict, source),
+        };
+        Judged {
+            kind,
+            step: step.clone(),
+            verdict,
+            source,
+            replies,
+            _sealed: (),
+        }
     };
     if let Some((verdict, rule)) = settled_by_rule(&picture) {
         return make(verdict, Source::Rule(rule), Vec::new());
@@ -1211,6 +1287,70 @@ mod tests {
         assert!(md.contains("read the report code"));
         let rq = j.run_question().unwrap();
         assert_eq!(rq.suggestions, vec!["Monthly", "Yearly"]);
+    }
+
+    /// The alarm run's question, as the model asked it.
+    fn waf_access_ask(hours: u32) -> Value {
+        json!({"verdict":"ask","assumption":"","person_only":"access",
+            "question":"Grant the team's read-only role WAF and Athena access so the run can read \
+                        the crawler's new JA4 and user agent?",
+            "tried":["wafv2:ListWebACLs and GetSampledRequests were denied for CoderHelm's role",
+                     "no connected source reads the aws-waf-logs bucket"],
+            "options":["Grant access","Paste the JA4 and user agent here"],
+            "default":"Grant access","deadline_hours":hours,"blocker":"","evidence":[],
+            "category":"","location":""})
+    }
+
+    #[test]
+    fn a_read_the_aws_role_lacks_is_never_asked_or_held_on() {
+        // Asked twice: the rule is said once, then the fallback proceeds.
+        let m = Recorded::new(vec![Ok(waf_access_ask(4)), Ok(waf_access_ask(4))]);
+        let j = run(judge(&m, picture(Kind::Ask)));
+        assert!(j.proceeds(), "{:?}", j.verdict());
+        assert!(j.question().is_none());
+        assert!(j.run_question().is_none());
+        // Re-asked with the rule, the model proceeds on its own words.
+        let m = Recorded::new(vec![
+            Ok(waf_access_ask(4)),
+            Ok(proceed(
+                "the role's WAF reads are the install's setup item; plan from the alarm",
+            )),
+        ]);
+        let j = run(judge(&m, picture(Kind::Ask)));
+        assert_eq!(j.source(), &Source::ModelReasked);
+        assert!(j.proceeds());
+        // Irreversible work's fallback hold on the same words: still a proceed.
+        let mut p = picture(Kind::Stop);
+        p.reversible = false;
+        p.reason = "grant the read-only role wafv2:GetSampledRequests access".into();
+        let j = run(judge(&Recorded::new(vec![]), p));
+        assert!(j.proceeds(), "{:?}", j.verdict());
+        assert_eq!(j.source(), &Source::Rule("install-level item".into()));
+        assert!(j.assumption().unwrap().contains("\"AWS role reads\""));
+        assert!(crate::handback::HandBack::of_judged(&j).is_none());
+    }
+
+    #[test]
+    fn access_has_no_default_a_choice_keeps_its_own() {
+        let p = picture(Kind::Ask).with_ids();
+        let other_access = json!({"verdict":"ask","assumption":"","person_only":"access",
+            "question":"Add the staging API key to the sandbox secrets?","tried":["read the ticket"],
+            "options":["Add it","Skip the staging check"],"default":"Add it","deadline_hours":4,
+            "blocker":"","evidence":[],"category":"","location":""});
+        let Ok(Verdict::Ask(q)) = validate(&p, &other_access) else {
+            panic!("a credential is still asked");
+        };
+        assert!(!q.has_default());
+        assert!(!q.unanswered().contains("Add it"));
+        assert!(q.unanswered().contains("no default"));
+        let m = Recorded::new(vec![Ok(other_access)]);
+        let j = run(judge(&m, picture(Kind::Ask)));
+        assert!(!j
+            .run_question()
+            .unwrap()
+            .why
+            .contains("Default if unanswered"));
+        assert!(!j.question_markdown().unwrap().contains("I go ahead"));
     }
 
     #[test]

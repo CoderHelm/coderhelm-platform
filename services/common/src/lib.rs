@@ -72,6 +72,8 @@ pub mod agent_policy;
 pub mod alarm_evidence;
 pub mod alert_episodes;
 pub mod alert_notify;
+/// A read the team's AWS role lacks: one install-level setup item.
+pub mod aws_role_reads;
 pub mod coder_shell;
 /// Chat notifications (Teams and Slack): one message model, a renderer per
 /// channel, sealed webhook URLs.
