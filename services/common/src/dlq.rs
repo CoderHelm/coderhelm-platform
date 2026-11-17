@@ -40,6 +40,8 @@ pub const WORKER_MESSAGE_TYPES: &[&str] = &[
     "review",
     "review_reminder",
     "review_sweep",
+    // CoderHelm's own reviews and threads on one pull request tidied.
+    "review_tidy",
     "stale_prs_preview",
     "setup_analyze",
     // Security fixes: an alert, an advisory, a push or a check now.

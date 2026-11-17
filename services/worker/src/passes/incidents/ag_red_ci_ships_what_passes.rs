@@ -16,8 +16,9 @@
 //! dependency fix takes out its newest commit of verified bumps, defers
 //! those bumps with what CI printed and keeps the commits before it, again
 //! while CI stays red, never emptying the pull request. Any other run is
-//! taken apart task by task down to the part that passes. What ships is
-//! green with the rest under "Deferred". A stopped run's lockfiles are
+//! no longer taken apart at all (`ci-gates`, 2026-11-17): its rounds stop
+//! after two pushed fixes per failing test, with the test named, and the
+//! branch keeps its work. A stopped run's lockfiles are
 //! written by their package managers before its pull request opens. Every
 //! kind of fix round takes the same classified decision about a fault:
 //! while it may continue it runs again, keeping its work when only the
@@ -26,7 +27,6 @@
 use super::fixture::fn_src;
 use crate::passes::generators::LockRepair;
 use crate::passes::round::{self, AfterFault, Fault};
-use crate::passes::supervisor::{self, Revert};
 use crate::passes::{resume, stop_pr};
 use common::dep_fix::{self, DepPlan, DepRun, Group, PlanBump};
 use common::run_round::Kind;
@@ -104,10 +104,10 @@ fn a_dependency_fix_with_red_ci_defers_only_the_set_that_breaks_it() {
     // The pipeline: the revert asks the dependency run first, and only a
     // written revert moves the run's saved state.
     let src = include_str!("../resume.rs");
-    let revert = fn_src(src, "async fn revert_to_green(");
+    let revert = fn_src(src, "async fn take_out_failing_bumps(");
     assert!(
-        revert.find("revert_dep_commit(").unwrap() < revert.find("sup::revert_for(").unwrap(),
-        "a dependency run is taken apart by task again"
+        revert.contains("revert_dep_commit("),
+        "a dependency run's newest set of bumps comes out"
     );
     let dep = fn_src(src, "async fn revert_dep_commit(");
     let write = dep.find("apply_revert(").unwrap();
@@ -119,41 +119,19 @@ fn a_dependency_fix_with_red_ci_defers_only_the_set_that_breaks_it() {
     assert!(common_src.contains("self.commits.push(BatchCommit {"));
 }
 
+/// A ticket run's plan is no longer taken apart task by task to turn CI
+/// green (speedboat pull requests lost seven and one of their files that
+/// way, with tests left behind that expected them): only a dependency
+/// run's bumps come out, and the source says so.
 #[test]
-fn a_plan_is_taken_apart_down_to_the_part_that_passes() {
-    let done: Vec<(String, String)> = (1..=6)
-        .map(|i| (format!("src/part{i}.ts"), format!("part {i}")))
-        .collect();
-    // No earlier green head: the last task comes out, then the one before,
-    // past the three reverts that used to end the run failed.
-    let mut left = done.clone();
-    let mut reverts = 0u32;
-    while let Revert::Task { path, .. } = supervisor::revert_for(&[], &left, reverts) {
-        assert_eq!(path, left.last().unwrap().0);
-        left.pop();
-        reverts += 1;
+fn a_plan_is_never_taken_apart_to_turn_ci_green() {
+    let src = include_str!("../resume.rs");
+    let out = fn_src(src, "async fn take_out_failing_bumps(");
+    for rollback in ["revert_for(", "list_pr_commits(", "plan_coverage::"] {
+        assert!(!out.contains(rollback), "{rollback}");
     }
-    assert_eq!(
-        left.len(),
-        1,
-        "one task stays: the pull request is never emptied"
-    );
-    assert_eq!(reverts, 5);
-    assert!(
-        reverts > 3,
-        "the old cap ended the run with three tasks that could still come out"
-    );
-    // A green earlier head is still taken first.
-    let heads = vec![("c9".to_string(), false), ("c8".to_string(), true)];
-    assert_eq!(
-        supervisor::revert_for(&heads, &done, 4),
-        Revert::ToHead("c8".into())
-    );
-    // The bound stays.
-    assert_eq!(
-        supervisor::revert_for(&heads, &done, supervisor::MAX_REVERTS),
-        Revert::Nothing
-    );
+    let sup = include_str!("../supervisor.rs");
+    assert!(!sup.contains("pub fn revert_for("));
 }
 
 #[test]

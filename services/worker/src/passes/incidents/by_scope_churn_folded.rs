@@ -8,8 +8,9 @@
 //! and a round put each one back to the base, one commit apiece. The
 //! build itself had no file boundary either: it could edit any file.
 //!
-//! Guarantee: the revert puts back only files CoderHelm's own commits
-//! changed after the green head (`supervisor::own_revert_paths`). The
+//! Guarantee: red checks never roll the branch back to a green head at
+//! all (`resume::take_out_failing_bumps` takes out only a dependency run's
+//! bumps), so no revert writes base code into the pull request. The
 //! build of the plan is bounded by the plan's files: any other existing
 //! file is refused until the call says why, and that reason is added to
 //! what the plan changes. A run of CoderHelm's own commits that changes a
@@ -19,7 +20,6 @@
 //! person's commits and everything before them are never rewritten.
 
 use crate::clients::github::{fold_plan, own_tail_start};
-use crate::passes::supervisor::{own_revert_paths, AfterGreen};
 use crate::passes::write_guard::{RoundFor, ScopeGuard};
 use serde_json::json;
 
@@ -52,24 +52,13 @@ fn plan() -> crate::passes::plan::PlanResult {
 }
 
 #[test]
-fn the_revert_after_red_checks_never_puts_back_files_a_base_merge_brought() {
-    let mut changed = s(PLANNED);
-    changed.extend(s(BASE_FILES));
-    let after = vec![
-        AfterGreen {
-            own: true,
-            merge: true,
-            files: s(BASE_FILES),
-        },
-        AfterGreen {
-            own: true,
-            merge: false,
-            files: s(PLANNED),
-        },
-    ];
-    let back = own_revert_paths(&changed, &after);
-    assert_eq!(back, s(PLANNED));
-    assert!(BASE_FILES.iter().all(|f| !back.contains(&f.to_string())));
+fn red_checks_never_roll_back_to_a_green_head_so_no_base_file_comes_back() {
+    let resume = include_str!("../resume.rs");
+    let out = super::fixture::fn_src(resume, "async fn take_out_failing_bumps(");
+    assert!(!out.contains("compare_changed_files(") && !out.contains("list_pr_commits("));
+    // The files a merge of the base brought stay the base's: nothing reads
+    // them back from an older head.
+    assert!(BASE_FILES.iter().all(|f| !out.contains(f)));
 }
 
 #[test]

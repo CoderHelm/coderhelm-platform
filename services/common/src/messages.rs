@@ -55,6 +55,11 @@ pub enum WorkerMessage {
     /// review that didn't finish (a service error) for the PR's current head.
     #[serde(rename = "review_sweep")]
     ReviewSweep,
+    /// CoderHelm's own reviews and threads on one pull request tidied now
+    /// (`worker::passes::review_tidy`): sent on a push, on checks finishing
+    /// and on a merge or a close; the review sweep covers the rest.
+    #[serde(rename = "review_tidy")]
+    ReviewTidy(ReviewTidyMessage),
     /// Work out one repository's stale pull request plan now, without
     /// changing anything (the dashboard's "Preview"). The scheduled cleanup
     /// rides on the review-reminder tick.
@@ -427,6 +432,7 @@ impl WorkerMessage {
             | WorkerMessage::ReviewLesson(_)
             | WorkerMessage::ReviewReminder
             | WorkerMessage::ReviewSweep
+            | WorkerMessage::ReviewTidy(_)
             | WorkerMessage::StalePrsPreview(_) => f::REVIEW,
             WorkerMessage::SecurityEvent(_) => f::SECURITY,
             WorkerMessage::SkillSync(_) => f::SKILL_SYNC,
@@ -494,6 +500,7 @@ impl WorkerMessage {
             | WorkerMessage::Review(_)
             | WorkerMessage::ReviewReminder
             | WorkerMessage::ReviewSweep
+            | WorkerMessage::ReviewTidy(_)
             | WorkerMessage::StalePrsPreview(_)
             | WorkerMessage::SetupAnalyze(_)
             | WorkerMessage::SecurityEvent(_)
@@ -632,6 +639,19 @@ pub struct SecurityEventMessage {
     /// `run` and `retry`: the fix run's ticket (`SEC-...`).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub ticket: String,
+}
+
+/// One pull request whose CoderHelm reviews and threads are tidied
+/// (`crate::review_supersede::tidy`).
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReviewTidyMessage {
+    pub team_id: String,
+    pub installation_id: u64,
+    pub repo_owner: String,
+    pub repo_name: String,
+    pub pr_number: u64,
+    /// What sent it: `push`, `checks`, `merged`, `closed`.
+    pub reason: String,
 }
 
 /// One repository's stale pull request preview (`common::stale_prs`).

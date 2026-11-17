@@ -23,7 +23,7 @@
 //! the run fails with exactly what fails. Nothing waits on a comment.
 
 use super::fixture::fn_src;
-use crate::passes::supervisor::{self, Ending, Revert, RoundStep, Rung};
+use crate::passes::supervisor::{self, Ending, RoundStep, Rung};
 use crate::passes::{feedback, own_review, ownership, resume, review_pr, MAX_AUTO_FIX_PUSHES};
 
 const OLD_CI: &str = "a comment naming a change starts the next round right away";
@@ -122,14 +122,8 @@ fn ci_only_rounds_without_progress_change_approach_then_end_with_the_cause() {
         panic!("{steps:?}")
     };
     assert!(why.contains("made no progress"), "{why}");
-    // What broke the checks comes out first, deferred with the reason, and
-    // CI decides again.
-    let heads = vec![("c9".to_string(), false), ("c8".to_string(), true)];
-    assert_eq!(
-        supervisor::revert_for(&heads, &[], 0),
-        Revert::ToHead("c8".into())
-    );
-    // Nothing can come out: the run fails with what fails and why.
+    // Nothing is rolled back to make CI green: the run fails with what
+    // fails and why, its work kept on the branch.
     assert_eq!(
         supervisor::end_of_rounds(&[], why, &left),
         Ending::Failed,
@@ -237,9 +231,9 @@ fn self_review_rounds_without_progress_defer_the_findings_and_finish() {
 
 #[test]
 fn neither_loop_ends_by_waiting_on_a_comment() {
-    // The CI-only rounds end through the supervisor's red-CI ending
-    // (revert to green, else failed with the cause), never by completing
-    // the run with the checks red.
+    // The CI-only rounds end through the supervisor's red-CI ending (a
+    // dependency run's bumps out, else failed with the cause), never by
+    // completing the run with the checks red.
     let fb = include_str!("../feedback.rs");
     let end = fn_src(fb, "\nasync fn end_auto_fix_rounds(");
     assert!(end.contains("resume::end_red_ci_rounds("));
@@ -250,7 +244,7 @@ fn neither_loop_ends_by_waiting_on_a_comment() {
     let rs = include_str!("../resume.rs");
     let red = fn_src(rs, "\npub(crate) async fn end_red_ci_rounds(");
     let (revert, fail) = (
-        red.find("revert_to_green(").unwrap(),
+        red.find("take_out_failing_bumps(").unwrap(),
         red.find("super::fail_run(").unwrap(),
     );
     assert!(revert < fail);

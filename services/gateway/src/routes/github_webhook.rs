@@ -1911,6 +1911,9 @@ async fn handle_pull_request(
             )
             .await?;
         }
+        if let Some(reason) = tidy_reason("pull_request", action, false) {
+            queue_review_tidy(state, payload, installation_id, team_id, reason, "").await;
+        }
         return handle_review_trigger(state, payload, installation_id, team_id, action).await;
     }
 
@@ -1923,6 +1926,11 @@ async fn handle_pull_request(
     let merged = payload["pull_request"]["merged"].as_bool().unwrap_or(false);
     if action != "closed" {
         return Ok(StatusCode::OK);
+    }
+    // CoderHelm's review bodies on it become one line each, its resolved
+    // threads hidden (any pull request it reviewed, not only its own).
+    if let Some(reason) = tidy_reason("pull_request", action, merged) {
+        queue_review_tidy(state, payload, installation_id, team_id, reason, "").await;
     }
     // A Tests setup pull request: record it and check the workflow again.
     super::tests_setup::on_pr_closed(state, payload, installation_id, team_id, merged).await;
@@ -3262,6 +3270,15 @@ async fn handle_check_suite(
             "check suite completed",
         )
         .await?;
+        // A thread of CoderHelm's about a failing check settles once the
+        // head's checks pass.
+        if let Some(reason) = tidy_reason("check_suite", action, false) {
+            let one = serde_json::json!({
+                "repository": repo,
+                "pull_request": {"number": pr["number"]},
+            });
+            queue_review_tidy(state, &one, installation_id, team_id, reason, head_sha).await;
+        }
     }
 
     // CI result handling for CoderHelm's own runs is done by the
@@ -4596,6 +4613,89 @@ async fn claim_review_slot(
     c.won_or_failed_open()
 }
 
+/// Which events tidy CoderHelm's reviews on a pull request
+/// (`worker::passes::review_tidy`), and the reason they carry.
+fn tidy_reason(event: &str, action: &str, merged: bool) -> Option<&'static str> {
+    match (event, action) {
+        ("pull_request", "synchronize") => Some("push"),
+        ("pull_request", "closed") if merged => Some("merged"),
+        ("pull_request", "closed") => Some("closed"),
+        ("check_suite", "completed") => Some("checks"),
+        _ => None,
+    }
+}
+
+/// How long a tidy waits after its event: a push lets GitHub mark the moved
+/// lines outdated first, and several check suites finishing together fold
+/// into one tidy ([`TIDY_COALESCE_SECS`]).
+fn tidy_delay_secs(reason: &str) -> i32 {
+    match reason {
+        "push" | "checks" => 60,
+        _ => 15,
+    }
+}
+
+/// Check suites finishing on the same head within this window send one tidy.
+const TIDY_COALESCE_SECS: u64 = 60;
+
+/// Queues a tidy of CoderHelm's reviews on the event's pull request. Best
+/// effort: a tidy not sent is caught by the review sweep.
+async fn queue_review_tidy(
+    state: &AppState,
+    payload: &Value,
+    installation_id: u64,
+    team_id: &str,
+    reason: &'static str,
+    head_sha: &str,
+) {
+    let repo = &payload["repository"];
+    let owner = repo["owner"]["login"].as_str().unwrap_or("");
+    let name = repo["name"].as_str().unwrap_or("");
+    let pr_number = payload["pull_request"]["number"].as_u64().unwrap_or(0);
+    if owner.is_empty() || name.is_empty() || pr_number == 0 {
+        return;
+    }
+    if reason == "checks" {
+        let sk = format!("REVIEWTIDY#{owner}/{name}#{pr_number:0>6}#{head_sha}#checks");
+        let c = common::claim::claim(
+            &state.dynamo,
+            &state.config.settings_table_name,
+            team_id,
+            &sk,
+            TIDY_COALESCE_SECS,
+        )
+        .await;
+        if !c.won_or_failed_open() {
+            return;
+        }
+    }
+    let msg = WorkerMessage::ReviewTidy(common::messages::ReviewTidyMessage {
+        team_id: team_id.to_string(),
+        installation_id,
+        repo_owner: owner.to_string(),
+        repo_name: name.to_string(),
+        pr_number,
+        reason: reason.to_string(),
+    });
+    if send_to_queue_after(
+        state,
+        &state.config.ticket_queue_url,
+        &msg,
+        tidy_delay_secs(reason),
+    )
+    .await
+    .is_err()
+    {
+        warn!(
+            owner,
+            name,
+            pr_number,
+            reason,
+            "Could not queue a tidy of CoderHelm's reviews; the review sweep catches it"
+        );
+    }
+}
+
 pub(crate) async fn send_to_queue(
     state: &AppState,
     queue_url: &str,
@@ -5928,5 +6028,57 @@ mod restack_tests {
         ] {
             assert!(restack_message(&p, 7, "t1", "acme", "web").is_none());
         }
+    }
+}
+
+#[cfg(test)]
+mod review_tidy_tests {
+    use super::{tidy_delay_secs, tidy_reason};
+
+    /// A push, checks finishing, a merge and a close each tidy CoderHelm's
+    /// reviews; other events do not.
+    #[test]
+    fn the_events_that_tidy_reviews() {
+        assert_eq!(
+            tidy_reason("pull_request", "synchronize", false),
+            Some("push")
+        );
+        assert_eq!(tidy_reason("pull_request", "closed", true), Some("merged"));
+        assert_eq!(tidy_reason("pull_request", "closed", false), Some("closed"));
+        assert_eq!(
+            tidy_reason("check_suite", "completed", false),
+            Some("checks")
+        );
+        for (event, action) in [
+            ("pull_request", "opened"),
+            ("pull_request", "labeled"),
+            ("check_suite", "requested"),
+            ("check_run", "completed"),
+        ] {
+            assert_eq!(tidy_reason(event, action, false), None, "{event}/{action}");
+        }
+        // A push waits for GitHub to mark moved lines outdated.
+        assert!(tidy_delay_secs("push") >= 30);
+    }
+
+    /// Every trigger is wired where its event is handled.
+    #[test]
+    fn each_handler_queues_its_tidy() {
+        let src = include_str!("github_webhook.rs");
+        let body = |name: &str| {
+            let start = src.find(&format!("async fn {name}(")).unwrap();
+            let end = src[start + 10..]
+                .find("\nasync fn ")
+                .map(|e| start + 10 + e)
+                .unwrap_or(src.len());
+            &src[start..end]
+        };
+        assert!(
+            body("handle_pull_request")
+                .matches("queue_review_tidy(")
+                .count()
+                >= 2
+        );
+        assert!(body("handle_check_suite").contains("queue_review_tidy("));
     }
 }
