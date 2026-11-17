@@ -1799,14 +1799,15 @@ mod tests {
             "Read one payload and quote it.",
         );
         assert_eq!(classify(&vendor, &facts), Class::Own);
-        // A source no connection reaches is a person's to grant.
+        // A source no connection reaches is a person's to connect: a
+        // credential, never a permission no refusal was recorded for.
         let access = f(
             "external_fact",
             "The billing table's column is unconfirmed: no connection reaches the warehouse.",
             "",
         );
         match classify(&access, &facts) {
-            Class::Person(h) => assert_eq!(h.reason(), person_gate::Reason::Grant),
+            Class::Person(h) => assert_eq!(h.reason(), person_gate::Reason::Credential),
             c => panic!("{c:?}"),
         }
         // CI's are CI's.

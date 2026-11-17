@@ -254,7 +254,10 @@ fn the_sweep_heals_a_finished_run_left_a_draft_with_no_reason() {
         installation_id: 41,
         hold: None,
     };
-    assert_eq!(ready::sweep_step(&casualty, now), ready::SweepStep::Decide);
+    assert_eq!(
+        ready::sweep_step(&casualty, now, ""),
+        ready::SweepStep::Decide
+    );
     // A person's draft and a closed pull request are respected by the
     // decision it makes.
     let theirs = Facts {

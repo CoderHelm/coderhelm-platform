@@ -138,6 +138,12 @@ pub struct DraftHold {
     /// drafts run, and it is still being proven (or failed its proof).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub ready: bool,
+    /// The version of the code that decided it (the worker's
+    /// `checks_version`). A hold another version wrote is decided again on
+    /// the next sweep: a release that changes what holds a draft reaches
+    /// every held draft at once, never an hour later.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub version: String,
     /// Times CoderHelm took its own next action on a wait that stalled on
     /// this head (`ready::MAX_STALL_RETRIES`).
     #[serde(default, skip_serializing_if = "is_zero")]
@@ -176,6 +182,7 @@ impl DraftHold {
             head: String::new(),
             ready: false,
             retried: 0,
+            version: String::new(),
         })
     }
 
@@ -214,6 +221,11 @@ impl DraftHold {
             }
         }
         self
+    }
+
+    /// Whether code other than `version` decided it.
+    pub fn other_version(&self, version: &str) -> bool {
+        self.version != version
     }
 
     /// Whether a person must act (the run waits on them): only a held

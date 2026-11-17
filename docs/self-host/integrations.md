@@ -38,7 +38,7 @@ Teams connect their own AWS accounts so CoderHelm can read CloudWatch logs, alar
 - **What you need**\
   A GitHub App of your own, made in one click by the install guide or the command line. See [The GitHub App](./github-app.md). Its webhook, callback and setup URLs are your install's.
 - **Setup checks**\
-  `github_keys`, `github_app`, `github_permissions`, `github_installations` and `github_webhook`.
+  `github_keys`, `github_app`, `github_permissions`, `github_workflow_starts`, `github_installations` and `github_webhook`.
 - **With hybrid**\
   You can use CoderHelm's GitHub App instead. Events reach your install through CoderHelm's signed relay, and tokens come from CoderHelm's token broker, limited to the repositories you link. Setup checks then say whether CoderHelm's app is linked, and never block an update because the install has no app of its own.
 

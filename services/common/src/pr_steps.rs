@@ -190,10 +190,23 @@ pub fn plain_error(raw: &str) -> (String, String) {
         || l.contains("403")
         || l.contains("forbidden");
     if refused && l.contains("/actions/") && (l.contains("dispatches") || l.contains("rerun")) {
-        return (
-            "CoderHelm's GitHub App is not allowed to start workflows in this repository".into(),
-            "grant the app \"Actions: write\" (GitHub, Settings, Installed GitHub Apps, CoderHelm, Permissions)".into(),
-        );
+        // The refusal as recorded: the API that answered and the permission
+        // it needs (`github_grants::Denial`), the only way a permission may
+        // be claimed. Without one, the start is one install-level line.
+        return match crate::github_grants::Denial::from_error("POST", raw, "actions", "write") {
+            Some(d) => (
+                d.line(),
+                "an organization owner accepts Actions: write for the app once for the install, or a person runs the command".into(),
+            ),
+            None => (
+                crate::github_grants::install_item(
+                    "actions",
+                    "write",
+                    "start workflows with workflow_dispatch",
+                ),
+                String::new(),
+            ),
+        };
     }
     if refused && l.contains("github") {
         return (
@@ -489,18 +502,24 @@ mod tests {
 
     #[test]
     fn a_raw_error_becomes_a_cause_and_what_lifts_it() {
+        // A permission is claimed only with the refusal GitHub sent: the API
+        // and the permission it needs, never a URL or a response body.
         let (cause, unblock) = plain_error(RAW_403);
         assert_eq!(
             cause,
-            "CoderHelm's GitHub App is not allowed to start workflows in this repository"
+            "GitHub answered 403 to `POST /repos/acme/site/actions/workflows/test.yml/dispatches`: the GitHub App needs Actions: write"
         );
-        assert!(unblock.contains("Actions: write"), "{unblock}");
+        assert!(unblock.contains("once for the install"), "{unblock}");
         for t in [&cause, &unblock] {
-            assert!(
-                !t.contains("http") && !t.contains('{') && !t.contains("403"),
-                "{t}"
-            );
+            assert!(!t.contains("http") && !t.contains('{'), "{t}");
         }
+        // Words without a refusal are one install-level line, for no person.
+        let (cause, unblock) = plain_error("starting the workflow was refused (403) by /actions/workflows/x.yml/dispatches: not sent, what is left of GitHub's hourly budget is kept");
+        assert!(
+            cause.contains(crate::github_grants::INSTALL_LEVEL),
+            "{cause}"
+        );
+        assert_eq!(unblock, "");
         let (cause, _) = plain_error("the staging write failed: error sending request for url (https://x.api.example.com/v1/data/mutate/staging): operation timed out");
         assert_eq!(cause, "the service did not answer in time");
         let (cause, unblock) = plain_error("no mutations were given for this step");
@@ -530,7 +549,7 @@ mod tests {
         let failed = deploy(State::Failed { cause, unblock });
         assert_eq!(
             failed.line(),
-            "After merging: Deploy the staging Studio: run `cd apps/studio && npm run deploy:staging`. CoderHelm could not: CoderHelm's GitHub App is not allowed to start workflows in this repository. To let it: grant the app \"Actions: write\" (GitHub, Settings, Installed GitHub Apps, CoderHelm, Permissions)."
+            "After merging: Deploy the staging Studio: run `cd apps/studio && npm run deploy:staging`. CoderHelm could not: GitHub answered 403 to `POST /repos/acme/site/actions/workflows/test.yml/dispatches`: the GitHub App needs Actions: write. To let it: an organization owner accepts Actions: write for the app once for the install, or a person runs the command."
         );
         let done = deploy(State::Done {
             evidence: "the deploy workflow passed".into(),
@@ -586,7 +605,12 @@ mod tests {
         let lines = needed(&steps);
         assert_eq!(lines.len(), 2);
         assert!(lines[0].ends_with("(a repository admin)"), "{}", lines[0]);
-        assert_eq!(lines[0].matches("Actions: write").count(), 1);
+        assert_eq!(
+            lines[0].matches("Actions: write").count(),
+            2,
+            "{}",
+            lines[0]
+        );
         // The shared cause is said once.
         assert!(
             lines[1].contains("the same reason as above"),
@@ -595,7 +619,7 @@ mod tests {
         );
         assert!(!lines[1].contains("Actions: write"), "{}", lines[1]);
         let all = lines.join("\n");
-        assert!(!all.contains("403") && !all.contains("https://"), "{all}");
+        assert!(!all.contains("https://") && !all.contains('{'), "{all}");
         let rest = others(&steps);
         assert_eq!(
             rest,

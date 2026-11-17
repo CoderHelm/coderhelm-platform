@@ -1274,6 +1274,7 @@ pub mod description_facts;
 pub mod dlq_cleanup;
 pub mod e2e;
 pub mod e2e_attribution;
+pub mod e2e_reads;
 pub mod e2e_setup;
 pub mod email_events;
 pub mod feature;
