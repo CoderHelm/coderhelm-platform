@@ -328,7 +328,7 @@ fn a_draft_with_failing_ci_is_held_with_the_check_named() {
         ..Default::default()
     };
     assert!(ready::reads_ci(&f));
-    match ready::decide(&f) {
+    match ready::found(&f) {
         Decision::Held { reasons } => {
             assert!(
                 reasons[0]
@@ -392,9 +392,17 @@ fn the_ready_decision_keeps_the_rules_across_combinations() {
                             };
                             let d = ready::decide(&f);
                             let ci_state = CiState::of(&f.ci, f.red_on_base);
-                            if matches!(d, Decision::Ready { .. } | Decision::Proving { .. }) {
-                                assert!(ci_state.allows_done(), "ready with {ci_state:?}: {f:?}");
-                                assert!(!body_unfinished, "ready with planned work left");
+                            // Ready over red CI or planned work left only
+                            // with it listed as CoderHelm's note (incident bv).
+                            if let Decision::Ready { open } = &d {
+                                let noted = open.iter().any(|o| o.starts_with(ready::NOTE_PREFIX));
+                                if !ci_state.allows_done() || body_unfinished {
+                                    assert!(noted, "ready without a note: {f:?}");
+                                }
+                            }
+                            if matches!(d, Decision::Proving { .. }) {
+                                assert!(ci_state.allows_done(), "proving with {ci_state:?}: {f:?}");
+                                assert!(!body_unfinished, "proving with planned work left");
                             }
                             n += 1;
                         }

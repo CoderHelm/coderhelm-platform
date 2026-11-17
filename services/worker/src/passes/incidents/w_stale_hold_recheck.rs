@@ -83,9 +83,11 @@ fn a_hold_older_checks_wrote_is_checked_again_and_clears() {
     for body in [held_description(None), held_description(Some(OLD_VERSION))] {
         assert!(body.contains(proof::BLOCKED_MARK), "{body}");
         let f = facts(&body);
-        let d = ready::decide(&f);
+        let d = ready::found(&f);
         assert!(matches!(d, Decision::Held { .. }), "{d:?}");
         assert!(ready::recheck_due(&f, &d, now), "{body}");
+        // As CoderHelm's note it is checked again too, before it goes ready.
+        assert!(ready::recheck_due(&f, &ready::decide(&f), now), "{body}");
     }
     // The checks run again with the fixed rule and find nothing: the line
     // goes and the pull request is ready.
@@ -105,9 +107,10 @@ fn a_line_the_running_checks_wrote_never_starts_another_check() {
     assert!(body.contains(&proof::checked_by(now)), "{body}");
     assert_eq!(proof::checked_by_of(&body), Some(now));
     let f = facts(&body);
-    let d = ready::decide(&f);
+    let d = ready::found(&f);
     assert!(matches!(d, Decision::Held { .. }));
     assert!(!ready::recheck_due(&f, &d, now));
+    assert!(!ready::recheck_due(&f, &ready::decide(&f), now));
 
     // A person's draft and a closed pull request are never checked again.
     let old = held_description(None);

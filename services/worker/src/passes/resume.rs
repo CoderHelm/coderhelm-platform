@@ -6940,6 +6940,21 @@ async fn hand_off_red_ci(
     .await;
     mark_events_processed(state, &msg.run_id, events).await;
     let checks = failing_workflows(events);
+    if red_ci_ending(&ticket_msg.ticket_id) == RedCiEnding::NoteAndReady {
+        return finish_security_red(
+            state,
+            ticket_msg,
+            &msg.run_id,
+            github,
+            pr,
+            usage,
+            duration,
+            &checks,
+            excerpt,
+            tried,
+        )
+        .await;
+    }
     let section = ci_failing_section(&checks, excerpt, tried, needed);
     match github.get_pull_request(pr.owner, pr.repo, pr.number).await {
         Ok(p) => {
@@ -7022,6 +7037,12 @@ pub(crate) async fn end_red_ci_rounds(
         super::CiOutcome::HandedOff(super::GaveUp::NoProgress),
     )
     .await;
+    if red_ci_ending(&ticket_msg.ticket_id) == RedCiEnding::NoteAndReady {
+        return finish_security_red(
+            state, ticket_msg, run_id, github, &pr, usage, duration, checks, excerpt, tried,
+        )
+        .await;
+    }
     let failing = if checks.is_empty() {
         vec!["the repository's CI".to_string()]
     } else {
@@ -7063,6 +7084,97 @@ pub(crate) async fn end_red_ci_rounds(
     warn!(run_id, reason = %reason, "CI stays red after the fix rounds and nothing can come out: the run failed");
     super::fail_run(state, ticket_msg, run_id, &reason, usage, duration).await;
     Ok(())
+}
+
+/// How a run ends when its checks stay red and nothing more can come out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RedCiEnding {
+    /// A security fix: every set of bumps that could come out did (each
+    /// deferred with the check that failed and why); what is left is
+    /// CoderHelm's note on a pull request that goes ready, the run is
+    /// completed, and nothing merges while CI fails. Never a person's
+    /// to-do: a security fix once stayed a draft "for a person" with
+    /// "Fix the failing checks on this branch".
+    NoteAndReady,
+    /// Any other run: the run ends failed with exactly what fails.
+    Failed,
+}
+
+/// [`RedCiEnding`] for the run's ticket.
+pub(crate) fn red_ci_ending(ticket_id: &str) -> RedCiEnding {
+    if common::security_fixes::is_ticket(ticket_id) {
+        RedCiEnding::NoteAndReady
+    } else {
+        RedCiEnding::Failed
+    }
+}
+
+/// What the pull request says when a security fix's CI stays red after
+/// every set of bumps that could come out did.
+pub(crate) const SECURITY_RED_NEEDED: &str = "CoderHelm took out every set of bumps that could \
+     come out, each listed under \"Deferred\" with the check that failed; what is left is \
+     listed here as its note. The pull request is ready for review and isn't merged while these \
+     checks fail; CoderHelm's CI fix rounds take it again when the checks or the base branch \
+     change.";
+
+/// The [`RedCiEnding::NoteAndReady`] ending: the failing checks named on
+/// the pull request as CoderHelm's note, the pull request marked ready by
+/// the one ready decision (a failing check is a note there, never a
+/// person's hold), and the run completed.
+#[allow(clippy::too_many_arguments)]
+async fn finish_security_red(
+    state: &WorkerState,
+    ticket_msg: &TicketMessage,
+    run_id: &str,
+    github: &GitHubClient,
+    pr: &PrRef<'_>,
+    usage: &TokenUsage,
+    duration: u64,
+    checks: &[String],
+    excerpt: &str,
+    tried: &[String],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let section = ci_failing_section(checks, excerpt, tried, SECURITY_RED_NEEDED);
+    match github.get_pull_request(pr.owner, pr.repo, pr.number).await {
+        Ok(p) => {
+            let body = with_ci_failing(p["body"].as_str().unwrap_or(""), &section);
+            if let Err(e) =
+                crate::passes::description::save(github, pr.owner, pr.repo, pr.number, &body).await
+            {
+                warn!(run_id, error = %e, "Could not write what fails on the pull request");
+            }
+        }
+        Err(e) => warn!(run_id, error = %e, "Could not read the pull request to say what fails"),
+    }
+    let reason = format!(
+        "{}{}",
+        super::ready::NOTE_PREFIX,
+        ci_failing_reason(checks, excerpt, tried.len())
+    );
+    super::add_progress_note(state, &ticket_msg.team_id, run_id, &reason).await;
+    mark_pr_ready(
+        state,
+        &ticket_msg.team_id,
+        github,
+        pr.owner,
+        pr.repo,
+        pr.number,
+    )
+    .await;
+    warn!(run_id, reason = %reason, "A security fix's CI stays red after every set that could come out: ready with CoderHelm's note");
+    end_run(
+        state,
+        ticket_msg,
+        run_id,
+        common::run_status::COMPLETED,
+        None,
+        (pr.url, pr.number, pr.branch),
+        usage,
+        duration,
+        None,
+        None,
+    )
+    .await
 }
 
 /// What a revert writes (each path with its content, or `None` to remove
