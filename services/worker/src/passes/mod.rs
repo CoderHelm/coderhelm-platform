@@ -1372,6 +1372,8 @@ mod replay;
 #[cfg(test)]
 mod reply_eval;
 pub(crate) mod repo_pick;
+/// The planner reproduces a bug on the base before it plans code.
+mod reproduce;
 mod resolve;
 mod resolved;
 pub mod restack;
@@ -3169,7 +3171,15 @@ async fn run_passes(
         add_progress_note(state, &msg.team_id, run_id, "Plan generated").await;
         // Scope is decided once, here, from the ticket's criteria and the
         // plan, before any code; every later round is held to it.
-        scope_ledger::load_or_seed(state, &msg.team_id, run_id, msg, &plan_result).await;
+        scope_ledger::load_or_seed(
+            state,
+            &msg.team_id,
+            run_id,
+            msg,
+            &plan_result,
+            &scope_ledger::people(msg, &[]),
+        )
+        .await;
     }
     if !plan_final {
         if !plan_was_reused {

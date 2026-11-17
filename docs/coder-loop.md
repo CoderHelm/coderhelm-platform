@@ -240,6 +240,16 @@ The causes were in the loop, not only in prompt wording:
      comment on the pull request, and the ledger records who moved it in.
    (`incidents::sl_scope_decided_once`)
 
+   What people say decides scope as they say it (`Ledger::take_people`).
+   When the ledger is seeded, and on each round's comments (the habits check
+   and the planned-work rounds), an out-of-scope entry that a person's answer
+   or comment asks for moves into scope and records who asked. No
+   `Scope change:` line is needed. From then on, a diff that takes that work
+   out is a breach that goes back to be put back. A comment that keeps the
+   item out moves nothing. One run replied "Understood" to a reviewer's answer
+   and then reverted the work the answer asked for
+   (`incidents::sn_person_answer_moves_scope`).
+
 10. **The description describes the head.**
    On every push the description is rebuilt from the head's facts
    (`description::build`; Problem, Changes, Risk, Verification). The written
@@ -258,6 +268,45 @@ The causes were in the loop, not only in prompt wording:
    verified until it is taken out or moved in. `pr_body::defects` fails a body
    that asks an open product question.
    (`incidents::sm_description_of_the_head`)
+
+11. **A bug is reproduced before it is planned.**
+   For a bug, the planner has `reproduce_on_base` (`passes::reproduce`). The
+   tool runs one call or command in the sandbox on the base branch's head, in
+   the run's test environment, and returns its exit code and output. Each run
+   is kept.
+
+   design.md has a `## Reproduce` section (`common::repro_first::reproduce_gaps`)
+   with these fields:
+   - `Inputs:` lists the ticket's ids and names, with every stored variant a
+     read-only lookup found, and says where they came from.
+   - `Ran on base:` is a command this run ran with the tool.
+   - `Output:` quotes what that command printed.
+   - `Wrong line:` names the `path:line` where the existing code goes wrong.
+
+   A run that tried and can't reproduce writes `Unverified:` with why. It is
+   kept as unverified, never skipped silently.
+
+   The fix goes in the mechanism the wrong line is in (`reuse_gaps`).
+   `## Smallest change` names it, or says why it can't hold the fix. A plan
+   that adds a new resolution path beside it (a keyword match, a new
+   resolver) goes back.
+
+   A question the plan decides with a default goes back unless it carries
+   `Looked up: <what it showed>` or `No lookup settles it: <why>`. This
+   applies when a page load or a query would answer it (`question_gaps`).
+
+   After the build:
+   - **Diff size.** A diff that changes more than 40 lines of code (map and
+     list entries aside) for a ticket that names 1 to 12 records goes back to
+     be narrowed (`minimal_change::whole_path`). A `Wider than the ticket:`
+     line keeps it, with the reason.
+   - **Fail on the base.** Each new test runs on the base and on the head the
+     way CI runs it. That includes a CI loop such as `for t in tests/test_*.py;
+     do python "$t"` (`TestEnv::file_command`, `habits_check::file_cmd`). A
+     bug fix that no test was shown to fail on the base for says `Unverified:`
+     in its description.
+
+   (`incidents::rp_reproduce_before_planning`)
 
 ## What is deterministic
 

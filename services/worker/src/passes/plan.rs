@@ -744,6 +744,27 @@ Then the ```fix_location.json block described above."#,
     );
     tools.push(super::web_check::tool());
     full_system.push_str(&web.prompt_section());
+    // A bug is reproduced on the base before code is planned: the planner
+    // runs the ticket's inputs through the current code (`reproduce`).
+    let is_bug = intent == super::triage::TicketIntent::Bug;
+    let reproducer = super::reproduce::Reproducer::new(
+        super::test_bug::Runner {
+            state,
+            github,
+            owner: &msg.repo_owner,
+            repo: &msg.repo_name,
+            team_id: &msg.team_id,
+            run_id,
+            provider,
+        },
+        &msg.base_branch,
+    );
+    if is_bug {
+        if reproducer.can_run() {
+            tools.push(super::reproduce::tool());
+        }
+        full_system.push_str(&super::reproduce::prompt_section(reproducer.can_run()));
+    }
     let ops = super::ops_tools::OpsTools::load(
         state,
         &msg.team_id,
@@ -835,6 +856,7 @@ Then the ```fix_location.json block described above."#,
         knowledge: knowledge.as_ref(),
         web: Some(&web),
         abilities: Some(&abilities),
+        repro: is_bug.then_some(&reproducer),
         state,
     };
 
@@ -993,6 +1015,16 @@ Then the ```fix_location.json block described above."#,
         &draft,
         &ticket_words,
         &write_facts,
+    ));
+    // Reproduced on the base, fixed in the mechanism the reproduction lands
+    // in, questions looked up first (`reproduce`, `common::repro_first`).
+    shape_gaps.extend(super::reproduce::plan_gaps(
+        &draft,
+        is_bug,
+        &ticket_words,
+        &reproducer.attempts(),
+        reproducer.can_run(),
+        can_look_up,
     ));
     back.extend(shape_gaps.iter().cloned());
     // A decision that stops without a fix names the one step a person takes.
@@ -1494,6 +1526,14 @@ Then the ```fix_location.json block described above."#,
         )
         .await;
         left.extend(super::plan_shape::write_gaps(&files, &ticket_words, &facts));
+        left.extend(super::reproduce::plan_gaps(
+            &files,
+            is_bug,
+            &ticket_words,
+            &reproducer.attempts(),
+            reproducer.can_run(),
+            can_look_up,
+        ));
         if !left.is_empty() {
             warn!(ticket_id = %msg.ticket_id, gaps = ?left, "Plan is still not the smallest change after one send-back");
             super::add_progress_note(
@@ -2511,6 +2551,8 @@ struct CombinedToolExecutor<'a> {
     skills: Option<&'a super::skills::TeamSkills>,
     /// Knowledge bases attached to the planner.
     knowledge: Option<&'a super::knowledge::KnowledgeTools>,
+    /// `reproduce_on_base`, for a bug.
+    repro: Option<&'a super::reproduce::Reproducer<'a>>,
     state: &'a WorkerState,
 }
 
@@ -2521,6 +2563,11 @@ impl<'a> ToolExecutor for CombinedToolExecutor<'a> {
         name: &str,
         input: &serde_json::Value,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(r) = self.repro {
+            if let Some(out) = r.handle(name, input).await {
+                return Ok(serde_json::json!(out));
+            }
+        }
         if let Some(k) = self.knowledge {
             if let Some(out) = k.handle(self.state, name, input).await {
                 return Ok(serde_json::json!(out));

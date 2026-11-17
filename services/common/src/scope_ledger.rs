@@ -111,11 +111,24 @@ pub struct Breach {
     pub path: String,
     /// The mark found (a path, or a name on an added line).
     pub mark: String,
+    /// The diff takes out an item a person or a criterion moved into
+    /// scope (`why` says who asked), instead of bringing back one left out.
+    #[serde(default)]
+    pub reverted: bool,
 }
 
 impl Breach {
     /// The instruction for the round that fixes it.
     pub fn instruction(&self) -> String {
+        if self.reverted {
+            return format!(
+                "`{}` takes out \"{}\" (`{}`), which is in scope: {}. Put it back; what a person asked for is never reverted as out of scope.",
+                self.path,
+                self.item.trim_end_matches('.'),
+                self.mark,
+                self.why.trim_end_matches('.'),
+            );
+        }
         format!(
             "`{}` brings back \"{}\" (`{}`), which the plan decided is out of scope: {}. Take it out of the code and its tests, or, only when an acceptance criterion or a person's comment asks for it, add `Scope change: {}: <the criterion or comment, quoted>` to your Evidence.",
             self.path,
@@ -646,6 +659,34 @@ impl Ledger {
         (accepted, refused)
     }
 
+    /// What people said decides scope as they say it: each out-of-scope
+    /// entry that a person's answer or comment asks for (`said`: who, and
+    /// what they wrote; matched as [`asked_by`] matches a criterion) moves
+    /// in, recording who asked and their words. No `Scope change:` line is
+    /// needed. A reviewer once answered on a pull request that the path
+    /// pages should cover both rows; the run replied "Understood" and
+    /// reverted the path-page work as out of scope. A comment that keeps an
+    /// item out ("leave the path pages for a later ticket") moves nothing.
+    /// Returns a line for each item moved in. Run at seed and on each
+    /// round's comments.
+    pub fn take_people(&mut self, said: &[(String, String)]) -> Vec<String> {
+        let mut moved = Vec::new();
+        for e in self.entries.iter_mut().filter(|e| e.is_out()) {
+            let Some((who, text)) = said.iter().find(|(_, t)| person_asks_for(e, t)) else {
+                continue;
+            };
+            let words: String = one_line(text).chars().take(160).collect();
+            let who = if who.trim().is_empty() {
+                "a person"
+            } else {
+                who.trim()
+            };
+            e.moved_in = format!("{who} asked for it: \"{words}\"");
+            moved.push(format!("\"{}\" moved into scope: {}", e.item, e.moved_in));
+        }
+        moved
+    }
+
     /// The out-of-scope entry a piece of planned work names (one of its
     /// marks, or its item said in full): that work is not built again.
     pub fn covers(&self, text: &str) -> Option<&Entry> {
@@ -688,6 +729,31 @@ fn significant(text: &str) -> Vec<String> {
         .filter(|w| w.chars().count() >= 4)
         .map(str::to_string)
         .collect()
+}
+
+/// Words of a comment that keeps an item out rather than asking for it.
+const KEEPS_OUT: &[&str] = &[
+    "out of scope",
+    "leave out",
+    "leave it out",
+    "leave them out",
+    "leave the",
+    "not needed",
+    "no need",
+    "don't",
+    "do not",
+    "skip",
+    "separate ticket",
+    "later ticket",
+    "another ticket",
+    "not in this",
+];
+
+/// Whether a person's words ask for an out-of-scope entry: they cite it the
+/// way a criterion would, and don't keep it out.
+pub fn person_asks_for(e: &Entry, text: &str) -> bool {
+    let l = lower(text);
+    !KEEPS_OUT.iter().any(|w| l.contains(w)) && asked_by(e, &[text.to_string()]).is_some()
 }
 
 /// The criterion that asks for an entry's item, when one does.
@@ -753,11 +819,39 @@ pub fn breaches(ledger: &Ledger, files: &[(String, String, String)]) -> Vec<Brea
                     why: e.why.clone(),
                     path: path.clone(),
                     mark,
+                    reverted: false,
+                });
+            }
+        }
+    }
+    // An item moved into scope that the diff takes out: a mark on a
+    // removed line the file's added lines no longer carry.
+    for e in ledger.entries.iter().filter(|e| !e.is_out()) {
+        for (path, _, patch) in files {
+            let mark = e.marks.iter().find(|m| {
+                removed(patch).any(|l| l.contains(m.as_str()))
+                    && !added(patch).any(|l| l.contains(m.as_str()))
+            });
+            if let Some(mark) = mark {
+                out.push(Breach {
+                    item: e.item.clone(),
+                    why: e.moved_in.clone(),
+                    path: path.clone(),
+                    mark: mark.clone(),
+                    reverted: true,
                 });
             }
         }
     }
     out
+}
+
+/// Lines removed in a patch.
+fn removed(patch: &str) -> impl Iterator<Item = &str> {
+    patch
+        .lines()
+        .filter(|l| l.starts_with('-') && !l.starts_with("---"))
+        .map(|l| &l[1..])
 }
 
 /// Phrases of a task that reach past the files it names.
@@ -1400,6 +1494,7 @@ mod tests {
             why: "one id".into(),
             path: "apps/web/src/services/classService.ts".into(),
             mark: "/classes/<sport>".into(),
+            reverted: false,
         }];
         let changed = vec![
             "apps/web/src/services/classService.ts".to_string(),

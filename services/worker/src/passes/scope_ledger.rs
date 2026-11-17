@@ -71,17 +71,30 @@ pub(crate) async fn load_or_seed(
     run_id: &str,
     msg: &TicketMessage,
     plan: &PlanResult,
+    people: &[(String, String)],
 ) -> Ledger {
     if let Some(l) = load(state, team_id, run_id).await {
         return l;
     }
-    let l = Ledger::from_ticket_and_plan(
+    let mut l = Ledger::from_ticket_and_plan(
         &super::stop_judge::acceptance(&msg.body),
         &plan.proposal,
         &plan.design,
         &plan.tasks,
     );
+    // What people already answered or commented is in scope from the
+    // start: the plan never writes a person's ask as out of scope.
+    let moved = l.take_people(people);
     save(state, team_id, run_id, &l).await;
+    if !moved.is_empty() {
+        super::add_progress_note(
+            state,
+            team_id,
+            run_id,
+            &format!("In scope because a person asked: {}", moved.join(" ")),
+        )
+        .await;
+    }
     if !l.is_empty() {
         super::add_progress_note(
             state,
@@ -97,25 +110,77 @@ pub(crate) async fn load_or_seed(
     l
 }
 
+/// The ledger on the run with the people's answers and the comments on
+/// pull request `number` taken in (`Ledger::take_people`), saved when one
+/// moved an item in. A planned-work round reads scope through this, so a
+/// person's answer since the last check is never built around.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn load_with_people(
+    state: &WorkerState,
+    github: &crate::clients::github::GitHubClient,
+    msg: &TicketMessage,
+    team_id: &str,
+    run_id: &str,
+    owner: &str,
+    repo: &str,
+    number: u64,
+) -> Option<Ledger> {
+    let mut l = load(state, team_id, run_id).await?;
+    let comments = match github.list_issue_comments(owner, repo, number).await {
+        Ok(c) => super::review_pr::human_comments(&c, 30),
+        Err(_) => Vec::new(),
+    };
+    let moved = l.take_people(&people(msg, &comments));
+    if !moved.is_empty() {
+        save(state, team_id, run_id, &l).await;
+        super::add_progress_note(
+            state,
+            team_id,
+            run_id,
+            &format!("Scope changed: {}", moved.join(" ")),
+        )
+        .await;
+    }
+    Some(l)
+}
+
 /// What a scope change may cite: the ticket's acceptance criteria, the
 /// answers people gave, and the people's `comments` (bodies).
-pub(crate) fn sources(msg: &TicketMessage, comments: &[String]) -> Vec<String> {
+pub(crate) fn sources(msg: &TicketMessage, comments: &[(String, String)]) -> Vec<String> {
     let mut out = super::stop_judge::acceptance(&msg.body);
     out.extend(
         msg.answers
             .iter()
             .map(|a| format!("{} {}", a.question, a.answer)),
     );
+    out.extend(comments.iter().map(|(_, b)| b.clone()));
+    out
+}
+
+/// What people said that decides scope, as (who, words): the answers
+/// they gave the run's questions (an answer that says no is left out, its
+/// question's words are not an ask) and their `comments`.
+pub(crate) fn people(msg: &TicketMessage, comments: &[(String, String)]) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = msg
+        .answers
+        .iter()
+        .filter(|a| {
+            let l = a.answer.trim().to_lowercase();
+            !(l == "no" || l.starts_with("no,") || l.starts_with("no.") || l.starts_with("no "))
+        })
+        .map(|a| (a.author.clone(), format!("{} {}", a.question, a.answer)))
+        .collect();
     out.extend(comments.iter().cloned());
     out
 }
 
-/// The people's comments on the run's pull request, when it has one.
+/// The people's comments on the run's pull request, when it has one, as
+/// (author, body).
 pub(crate) async fn comments(
     github: &crate::clients::github::GitHubClient,
     msg: &TicketMessage,
     branch: &str,
-) -> Vec<String> {
+) -> Vec<(String, String)> {
     let Ok(Some(pr)) = github
         .find_open_pr_for_branch(&msg.repo_owner, &msg.repo_name, branch)
         .await
@@ -129,10 +194,7 @@ pub(crate) async fn comments(
         .list_issue_comments(&msg.repo_owner, &msg.repo_name, number)
         .await
     {
-        Ok(c) => super::review_pr::human_comments(&c, 30)
-            .into_iter()
-            .map(|(_, body)| body)
-            .collect(),
+        Ok(c) => super::review_pr::human_comments(&c, 30),
         Err(_) => Vec::new(),
     }
 }
@@ -149,9 +211,14 @@ pub(crate) async fn held(
     ledger: &mut Ledger,
     notes: &str,
     sources: &[String],
+    people: &[(String, String)],
     diff: &[(String, String, String)],
 ) -> Vec<Breach> {
-    let (accepted, refused) = ledger.apply_changes(notes, sources);
+    // A person's answer or comment moves its item in on its own, every
+    // round; the coder's `Scope change:` lines come after.
+    let mut accepted = ledger.take_people(people);
+    let (by_coder, refused) = ledger.apply_changes(notes, sources);
+    accepted.extend(by_coder);
     if !accepted.is_empty() {
         save(state, team_id, run_id, ledger).await;
         info!(run_id, moved = ?accepted, "Scope changed with a cited reason; the ledger records it");

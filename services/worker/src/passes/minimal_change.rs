@@ -64,6 +64,7 @@ pub enum Kind {
     TestSize,
     InventedPayload,
     MadeUpIds,
+    WholePath,
 }
 
 /// One way the change is wider than its ticket.
@@ -87,6 +88,7 @@ impl Widening {
             Kind::TestSize => "A test out of proportion to the change",
             Kind::InventedPayload => "A test payload nobody observed",
             Kind::MadeUpIds => "Made-up ids where the run looked up real ones",
+            Kind::WholePath => "A whole code path rewritten for a few named records",
         }
     }
 
@@ -140,6 +142,10 @@ impl Widening {
             Kind::MadeUpIds => format!(
                 "`{}` uses made-up ids ({}) while this run looked up the real records' ids. Use the ids the lookups returned, so the test is about the records the bug is about.",
                 self.path, self.what
+            ),
+            Kind::WholePath => format!(
+                "The change rewrites how every record of its kind is processed ({}), while the ticket names only a few. Narrow it to those records and things exactly like them: fix the lookup, table or mapping they go through (its matching or its entries) and leave the shared path as it is.",
+                self.what
             ),
         };
         format!("{what}{why}")
@@ -1197,6 +1203,87 @@ pub fn invented_payloads(diff: &Diff, has_probe: bool) -> Vec<Widening> {
     out
 }
 
+// ── A whole path rewritten for a few records ───────────────────────────────
+
+/// Changed code lines (added and removed, not entries of a map or list, not
+/// comments) past which a change for a few named records rewrites a path.
+pub const WHOLE_PATH_LINES: usize = 40;
+/// Up to this many records named, a ticket is about those records.
+pub const FEW_RECORDS: usize = 12;
+
+/// Ticket words that ask for every record of a kind.
+const EVERY_ASKS: &[&str] = &[
+    "all records",
+    "all camps",
+    "every record",
+    "every camp",
+    "for all ",
+    "for every ",
+    "across all",
+    "refactor",
+    "rewrite",
+];
+
+/// A changed line that is an entry of a map or list, a bracket, or a
+/// comment: what a lookup fix adds without changing how records flow.
+fn entry_line(line: &str) -> bool {
+    let t = line.trim();
+    if t.is_empty()
+        || t.starts_with('#')
+        || t.starts_with("//")
+        || t.starts_with("--")
+        || t.chars()
+            .all(|c| matches!(c, '{' | '}' | '[' | ']' | '(' | ')' | ',' | ';'))
+    {
+        return true;
+    }
+    let quoted = t.starts_with('\'') || t.starts_with('"');
+    quoted && (t.contains("':") || t.contains("\":") || t.ends_with("',") || t.ends_with("\","))
+}
+
+/// A change that rewrites a code path while its ticket names a few records
+/// (`common::repro_first::ticket_ids`): more than [`WHOLE_PATH_LINES`]
+/// changed code lines that are no entries of a map or list. A ticket that
+/// named four camps filed under the wrong sport got 900 changed lines
+/// across the pipeline that loads every camp; the fix was a suffix
+/// stripped in the existing lookup and two entries. A `Wider than the
+/// ticket:` line keeps it, with the reason the narrower change can't work.
+pub fn whole_path(diff: &Diff, ticket: &str) -> Vec<Widening> {
+    let named = common::repro_first::ticket_ids(ticket).len();
+    if named == 0 || named > FEW_RECORDS || ticket_asks(ticket, EVERY_ASKS) {
+        return Vec::new();
+    }
+    let mut lines = 0;
+    let mut files: Vec<(&str, usize)> = Vec::new();
+    for (path, status, patch) in diff {
+        if status == "removed" || !code_file(path) || is_test(path) {
+            continue;
+        }
+        let n = lines_of(patch, '+')
+            .into_iter()
+            .chain(lines_of(patch, '-'))
+            .filter(|l| !entry_line(l))
+            .count();
+        if n > 0 {
+            lines += n;
+            files.push((path, n));
+        }
+    }
+    if lines <= WHOLE_PATH_LINES {
+        return Vec::new();
+    }
+    files.sort_by_key(|f| std::cmp::Reverse(f.1));
+    vec![Widening {
+        kind: Kind::WholePath,
+        path: files[0].0.to_string(),
+        what: format!(
+            "{lines} changed code lines across {} file(s), most in `{}`, for a ticket that names {named} record(s)",
+            files.len(),
+            files[0].0
+        ),
+    }]
+}
+
 // ── The check ──────────────────────────────────────────────────────────────
 
 /// Everything a diff adds past its ticket. `base` holds the base text of
@@ -1222,6 +1309,7 @@ pub fn check(
     out.extend(test_size(diff));
     out.extend(repeated_cases(diff));
     out.extend(invented_payloads(diff, has_probe));
+    out.extend(whole_path(diff, ticket));
     out
 }
 

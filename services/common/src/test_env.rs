@@ -284,13 +284,19 @@ pub fn from_workflows_for(
                 let dir = s(step.get("working-directory"))
                     .trim_start_matches("./")
                     .to_string();
+                // A step that runs tests keeps its whole script (a loop's
+                // body, a counter it sets), so a test file can be run the
+                // way the step runs it (`TestEnv::file_command`).
+                let step_tests = lines_of(&run)
+                    .iter()
+                    .any(|l| crate::ci_cover::is_check_command(l) && !is_install(l));
                 for line in lines_of(&run) {
                     let line = if dir.is_empty() {
                         line
                     } else {
                         format!("(cd {dir} && {line})")
                     };
-                    if crate::ci_cover::is_check_command(&line) && !is_install(&line) {
+                    if step_tests && !is_install(&line) {
                         seen_test = true;
                         env.test.push(line);
                         env.env.extend(plain_env(step.get("env")));
@@ -365,6 +371,62 @@ fn common_step_dir(test: &[String]) -> String {
         Some(d) if dirs.len() == test.len() && dirs.iter().all(|x| x == d) => d.to_string(),
         _ => String::new(),
     }
+}
+
+/// Interpreters that run a test file given its path.
+const SCRIPT_RUNNERS: &[&str] = &["python", "python3", "node", "bash", "sh"];
+
+/// A test step without its `(cd <dir> && ...)` wrapper: (dir, command).
+fn unwrap_cd(line: &str) -> (String, String) {
+    if let Some(rest) = line.strip_prefix("(cd ") {
+        if let Some((dir, cmd)) = rest.split_once(" && ") {
+            let cmd = cmd.strip_suffix(')').unwrap_or(cmd);
+            return (
+                dir.trim().trim_end_matches('/').to_string(),
+                cmd.trim().to_string(),
+            );
+        }
+    }
+    (String::new(), line.trim().to_string())
+}
+
+/// A shell loop's head, `for <var> in <globs>; do`: its variable and globs.
+fn loop_head(line: &str) -> Option<(String, Vec<String>)> {
+    let rest = line.trim().strip_prefix("for ")?;
+    let (var, rest) = rest.split_once(" in ")?;
+    let list = rest.split(';').next()?.trim_end_matches(" do").trim();
+    let globs: Vec<String> = list
+        .split_whitespace()
+        .map(|g| {
+            g.trim_matches(['"', '\''])
+                .trim_start_matches("./")
+                .to_string()
+        })
+        .filter(|g| !g.is_empty() && !g.contains('$'))
+        .collect();
+    let var = var.trim();
+    (!var.is_empty() && !globs.is_empty()).then(|| (var.to_string(), globs))
+}
+
+/// The interpreter a loop body runs the loop's file with: `python "$t"`
+/// gives `python`.
+fn runs_var(line: &str, var: &str) -> Option<String> {
+    let line = line.trim();
+    for form in [
+        format!("\"${var}\""),
+        format!("\"${{{var}}}\""),
+        format!("${{{var}}}"),
+        format!("${var}"),
+    ] {
+        if let Some(i) = line.find(&form) {
+            let runner = line[..i].trim();
+            let first = runner.split_whitespace().next().unwrap_or("");
+            if SCRIPT_RUNNERS.contains(&first) && !runner.contains(['|', ';', '&']) {
+                return Some(runner.to_string());
+            }
+        }
+    }
+    None
 }
 
 fn quote(s: &str) -> String {
@@ -497,6 +559,90 @@ bash -c {cmd}"#,
         )
     }
 
+    /// The command that runs one test file (`file`, from the repository
+    /// root) the way CI runs its tests, or `None` when no test step can be
+    /// narrowed to it. CI may run a runner (`pytest`, `python -m
+    /// unittest`), a loop over test files (`for t in tests/test_*.py; do
+    /// python "$t"`), or the file by name. A data-pipeline repository ran
+    /// its tests with that loop, no runner CoderHelm knew, so a bug fix's
+    /// new test was never run on the base and the pull request said
+    /// nothing about it.
+    pub fn file_command(&self, file: &str) -> Option<String> {
+        let safe = !file.is_empty()
+            && file
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '/'))
+            && !file.contains("..");
+        if !safe {
+            return None;
+        }
+        let steps: Vec<(String, String)> = self.test.iter().map(|l| unwrap_cd(l)).collect();
+        let in_dir = |dir: &str, cmd: String| -> Option<String> {
+            if dir.is_empty() {
+                return Some(cmd);
+            }
+            let rel = file.strip_prefix(&format!("{}/", dir.trim_end_matches('/')))?;
+            Some(format!("(cd {dir} && {})", cmd.replace(file, rel)))
+        };
+        // A runner that takes file paths.
+        for (dir, line) in &steps {
+            let low = line.to_ascii_lowercase();
+            for runner in ["pytest", "-m unittest"] {
+                if let Some(i) = low.find(runner) {
+                    let prefix = line[..i + runner.len()].trim();
+                    if let Some(c) = in_dir(dir, format!("{prefix} {file}")) {
+                        return Some(c);
+                    }
+                }
+            }
+        }
+        // A loop over test files, its body running each one.
+        for (i, (dir, line)) in steps.iter().enumerate() {
+            let Some((var, globs)) = loop_head(line) else {
+                continue;
+            };
+            let rel = if dir.is_empty() {
+                file
+            } else {
+                match file.strip_prefix(&format!("{dir}/")) {
+                    Some(r) => r,
+                    None => continue,
+                }
+            };
+            if !globs.iter().any(|g| {
+                crate::skill_apply::glob_match(g, rel) && g.contains('/') == rel.contains('/')
+            }) {
+                continue;
+            }
+            // The body: the rest of this line after `do`, then the lines
+            // that follow it.
+            let after_do = line.split_once("; do").map(|(_, b)| b.to_string());
+            let body = after_do
+                .into_iter()
+                .chain(steps.iter().skip(i + 1).map(|(_, l)| l.clone()));
+            for b in body {
+                if let Some(runner) = runs_var(&b, &var) {
+                    return in_dir(dir, format!("{runner} {file}"));
+                }
+                if b.trim_start().starts_with("done") {
+                    break;
+                }
+            }
+        }
+        // The file by name.
+        for (dir, line) in &steps {
+            let words: Vec<&str> = line.split_whitespace().collect();
+            if words.len() == 2
+                && SCRIPT_RUNNERS.contains(&words[0])
+                && (format!("{dir}/{}", words[1]).trim_start_matches('/') == file
+                    || words[1] == file)
+            {
+                return in_dir(dir, line.replace(words[1], file));
+            }
+        }
+        None
+    }
+
     /// What the coder is told: the environment is ready in every command,
     /// and how the tests run.
     pub fn coder_note(&self) -> String {
@@ -626,6 +772,69 @@ jobs:
             &[]
         )
         .is_none());
+    }
+
+    /// A data-pipeline repository's CI: a loop runs each test file with
+    /// `python`, no runner CoderHelm knew.
+    const LOOP: &str = r#"
+name: Tests
+on: [pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: uv pip install --quiet "apache-airflow[postgres]==2.10.3" -r requirement.txt
+      - name: Run tests
+        env:
+          PYTHONHASHSEED: "0"
+        run: |
+          failed=0
+          for t in tests/test_*.py; do
+            echo "::group::$t"
+            python "$t" || failed=1
+            echo "::endgroup::"
+          done
+          exit $failed
+"#;
+
+    #[test]
+    fn one_test_file_runs_the_way_ci_runs_its_tests() {
+        let e = from_workflows(&[("t.yml".into(), LOOP.into())], &[]).unwrap();
+        assert!(
+            e.test.iter().any(|t| t.contains("python \"$t\"")),
+            "{:?}",
+            e.test
+        );
+        assert_eq!(
+            e.file_command("tests/test_camp_sport.py").as_deref(),
+            Some("python tests/test_camp_sport.py")
+        );
+        // A file the loop doesn't run, and a path that isn't safe.
+        assert_eq!(e.file_command("dags/camp_sport.py"), None);
+        assert_eq!(e.file_command("tests/test_a.py; rm -rf /"), None);
+        // A runner takes the file.
+        let e = from_workflows(&[("t.yml".into(), PY.into())], &[]).unwrap();
+        assert_eq!(
+            e.file_command("tests/test_a.py").as_deref(),
+            Some("python -m pytest tests/test_a.py")
+        );
+        // A one-line loop, in a folder.
+        let mut e = TestEnv {
+            test: vec![
+                "(cd etl && for t in tests/test_*.py; do python3 \"$t\" || exit 1; done)".into(),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            e.file_command("etl/tests/test_a.py").as_deref(),
+            Some("(cd etl && python3 tests/test_a.py)")
+        );
+        assert_eq!(e.file_command("tests/test_a.py"), None);
+        e.test = vec!["npm run build".into()];
+        assert_eq!(e.file_command("tests/test_a.py"), None);
     }
 
     /// The second round restores the first round's install instead of

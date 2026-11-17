@@ -5199,7 +5199,18 @@ async fn start_planned_work(
     let items = super::finish_planned::listed(&body);
     // What the plan decided is out of scope is not built again
     // (`common::scope_ledger`).
-    let items = match super::scope_ledger::load(state, &msg.team_id, &msg.run_id).await {
+    let items = match super::scope_ledger::load_with_people(
+        state,
+        &ctx.github,
+        &ctx.ticket_msg,
+        &msg.team_id,
+        &msg.run_id,
+        pr.owner,
+        pr.repo,
+        pr.number,
+    )
+    .await
+    {
         Some(l) => {
             let (keep, gone) = super::scope_ledger::drop_covered(&l, items);
             if !gone.is_empty() {
@@ -5341,7 +5352,18 @@ async fn recheck_planned_work(
     )
     .await;
     // Nor what the plan decided is out of scope (`common::scope_ledger`).
-    let found = match super::scope_ledger::load(state, &msg.team_id, &msg.run_id).await {
+    let found = match super::scope_ledger::load_with_people(
+        state,
+        &ctx.github,
+        &ctx.ticket_msg,
+        &msg.team_id,
+        &msg.run_id,
+        pr.owner,
+        pr.repo,
+        pr.number,
+    )
+    .await
+    {
         Some(l) => {
             let (keep, gone): (Vec<_>, Vec<_>) = found
                 .into_iter()
