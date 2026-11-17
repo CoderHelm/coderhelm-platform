@@ -1,23 +1,16 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
-  Brings the existing CoderHelmLogReader role up to date with the read-only
-  permissions the current CoderHelm release uses, lets it search the
-  Bedrock knowledge bases named in KnowledgeBases, and lets it read the
-  documents in the S3 buckets named in ImportBuckets. Every permission is
-  read-only (list, describe and query), except one you opt into: copying
-  your chosen CoderHelm knowledge bases into the Bedrock knowledge bases
-  named in SyncKnowledgeBases. With InfrastructureVulnerabilities "on" it
-  also reads, read-only, which versions your EC2, EKS, RDS, ElastiCache and
-  OpenSearch resources run, for matching against security advisories.
-  With ApplyMaintenance "on" it may also apply a pending RDS or Aurora
-  maintenance action that a person approved in CoderHelm. With WafLogs "on"
-  it reads your AWS WAF logs in S3 through Athena, writing query results
-  only under WafLogResults. With DatabaseClusters or Warehouses it queries
-  those databases and warehouses as their read-only user.
-  It only adds: to drop a permission an older release granted, update the
-  CoderHelmLogReader stack itself with the current role template.
-  Created from the dashboard's Update link; you can delete older
-  CoderHelmLogReaderUpdate stacks once this one is in place.
+  Brings the existing CoderHelmLogReader role up to this CoderHelm release's
+  template: its read-only permissions, plus the groups its parameters switch
+  on (Bedrock knowledge bases, S3 imports, infrastructure versions,
+  Inspector, Health, WAF logs, databases, warehouses). Every permission is
+  read-only except three you opt into: copying chosen knowledge bases into
+  Bedrock (SyncKnowledgeBases), applying approved RDS maintenance
+  (ApplyMaintenance), and writing Athena query results only under
+  WafLogResults. It only adds: to drop a permission an older release
+  granted, update the CoderHelmLogReader stack itself. Created from the
+  dashboard's Update link; delete older CoderHelmLogReaderUpdate stacks
+  once this one is in place.
 
 Parameters:
   RoleName:
