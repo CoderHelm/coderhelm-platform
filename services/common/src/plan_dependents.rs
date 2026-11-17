@@ -12,6 +12,13 @@
 //! with no issue number, in any plan. GitHub issue numbers repeat across
 //! repositories, so a merge in one repository could release the dependents
 //! of a task in another.
+//!
+//! The link is written best effort, and plans from before it existed have
+//! none. Without a link the task is found by the ticket each task row
+//! records ([`task_has_ticket`]): the issue's URL (repository and number)
+//! or the Jira key, never a number alone. It is looked for in the run's plan
+//! when the run names one, otherwise in all the team's plans, and a ticket
+//! that more than one task names releases nothing.
 
 use aws_sdk_dynamodb::types::AttributeValue;
 use std::collections::HashMap;
@@ -46,6 +53,8 @@ pub struct MergedRun {
     pub repo: String,
     /// The GitHub issue number; 0 for a ticket that is not a GitHub issue.
     pub issue_number: u64,
+    /// The plan the run's record names ("" for none).
+    pub plan_id: String,
 }
 
 impl MergedRun {
@@ -66,6 +75,7 @@ impl MergedRun {
                 .and_then(|v| v.as_n().ok())
                 .and_then(|n| n.parse().ok())
                 .unwrap_or(0),
+            plan_id: s("plan_id"),
         }
     }
 }
@@ -88,10 +98,49 @@ pub fn link_sk(run: &MergedRun) -> Option<String> {
 /// A task of a plan, as far as releasing it goes.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Task {
+    pub plan_id: String,
     pub task_id: String,
     pub status: String,
     /// The task this one waits on ("" for none).
     pub depends_on: String,
+    /// The GitHub issue the task opened (`https://<host>/<owner>/<repo>/issues/<n>`).
+    pub issue_url: String,
+    /// The Jira ticket the task opened.
+    pub jira_ticket_key: String,
+}
+
+/// `(owner/repo lowercased, number)` of a GitHub issue URL.
+fn issue_of_url(url: &str) -> Option<(String, u64)> {
+    let path = url.trim().split_once("://")?.1;
+    let parts: Vec<&str> = path.trim_end_matches('/').split('/').collect();
+    match parts.as_slice() {
+        [_host, owner, repo, "issues", n] if !owner.is_empty() && !repo.is_empty() => {
+            let n: u64 = n.parse().ok()?;
+            (n > 0).then(|| (format!("{owner}/{repo}").to_lowercase(), n))
+        }
+        _ => None,
+    }
+}
+
+/// Whether the task row records the run's ticket: the same repository and
+/// issue number (from the issue's URL), or the same Jira key. Issue number
+/// 0, a missing repository or a number alone never match.
+pub fn task_has_ticket(task: &Task, run: &MergedRun) -> bool {
+    match run.source.as_str() {
+        "jira" => {
+            let key = run.ticket_id.trim();
+            !key.is_empty()
+                && key != "UNKNOWN"
+                && task.jira_ticket_key.trim().eq_ignore_ascii_case(key)
+        }
+        "github" => {
+            let repo = run.repo.trim().to_lowercase();
+            run.issue_number > 0
+                && !repo.is_empty()
+                && issue_of_url(&task.issue_url) == Some((repo, run.issue_number))
+        }
+        _ => false,
+    }
 }
 
 /// The waiting tasks a merge releases.
@@ -115,11 +164,14 @@ pub trait PlanStore: Send + Sync {
     ) -> Result<Option<(String, String)>, String>;
     /// Every task of a plan.
     async fn plan_tasks(&self, team: &str, plan_id: &str) -> Result<Vec<Task>, String>;
+    /// Every task of every plan of the team.
+    async fn team_tasks(&self, team: &str) -> Result<Vec<Task>, String>;
 }
 
-/// The waiting tasks a merged run releases: those that wait on the task its
-/// ticket's plan link names. None when the ticket has no plan link or no
-/// task waits on it.
+/// The waiting tasks a merged run releases: those that wait on the run's
+/// task. The task is the one its ticket's plan link names; without a link,
+/// the one task row that records the ticket (see the module docs). None
+/// when no task is found for the ticket or no task waits on it.
 pub async fn dependents_to_release(
     store: &dyn PlanStore,
     team: &str,
@@ -128,12 +180,27 @@ pub async fn dependents_to_release(
     let Some(sk) = link_sk(run) else {
         return Ok(None);
     };
-    let Some((plan_id, task_id)) = store.linked_task(team, &sk).await? else {
-        return Ok(None);
+    let linked = store
+        .linked_task(team, &sk)
+        .await?
+        .filter(|(p, t)| !p.is_empty() && !t.is_empty());
+    let (plan_id, task_id) = match linked {
+        Some(found) => found,
+        None => {
+            let scope = if run.plan_id.trim().is_empty() {
+                store.team_tasks(team).await?
+            } else {
+                store.plan_tasks(team, run.plan_id.trim()).await?
+            };
+            let mut named = scope.into_iter().filter(|t| task_has_ticket(t, run));
+            match (named.next(), named.next()) {
+                (Some(t), None) if !t.plan_id.is_empty() && !t.task_id.is_empty() => {
+                    (t.plan_id, t.task_id)
+                }
+                _ => return Ok(None),
+            }
+        }
     };
-    if plan_id.is_empty() || task_id.is_empty() {
-        return Ok(None);
-    }
     let tasks: Vec<String> = store
         .plan_tasks(team, &plan_id)
         .await?
@@ -177,8 +244,19 @@ impl PlanStore for DynamoPlans {
     }
 
     async fn plan_tasks(&self, team: &str, plan_id: &str) -> Result<Vec<Task>, String> {
-        let prefix = format!("PLAN#{plan_id}#TASK#");
-        let (items, _) = crate::paged::all_pages(
+        self.tasks_under(team, &format!("PLAN#{plan_id}#TASK#"))
+            .await
+    }
+
+    async fn team_tasks(&self, team: &str) -> Result<Vec<Task>, String> {
+        self.tasks_under(team, "PLAN#").await
+    }
+}
+
+impl DynamoPlans {
+    /// The task rows whose sort key starts with `prefix` (`PLAN#<plan>#TASK#<task>`).
+    async fn tasks_under(&self, team: &str, prefix: &str) -> Result<Vec<Task>, String> {
+        let (items, more) = crate::paged::all_pages(
             |start| {
                 let q = self
                     .dynamo
@@ -186,7 +264,7 @@ impl PlanStore for DynamoPlans {
                     .table_name(&self.plans_table)
                     .key_condition_expression("pk = :pk AND begins_with(sk, :p)")
                     .expression_attribute_values(":pk", AttributeValue::S(team.to_string()))
-                    .expression_attribute_values(":p", AttributeValue::S(prefix.clone()))
+                    .expression_attribute_values(":p", AttributeValue::S(prefix.to_string()))
                     .set_exclusive_start_key(start);
                 async move {
                     let out = q.send().await.map_err(|e| {
@@ -195,18 +273,25 @@ impl PlanStore for DynamoPlans {
                     Ok::<_, String>((out.items.unwrap_or_default(), out.last_evaluated_key))
                 }
             },
-            100,
+            1_000,
         )
         .await?;
+        // A partial list could make a ticket look named by one task only.
+        if more {
+            return Err(format!("{team}: too many plan rows under {prefix} to read"));
+        }
         Ok(items
             .iter()
             .filter_map(|i| {
                 let sk = s_of(i, "sk");
-                let task_id = sk.strip_prefix(&prefix)?;
+                let (plan_id, task_id) = sk.strip_prefix("PLAN#")?.split_once("#TASK#")?;
                 Some(Task {
+                    plan_id: plan_id.to_string(),
                     task_id: task_id.to_string(),
                     status: s_of(i, "status"),
                     depends_on: s_of(i, "depends_on"),
+                    issue_url: s_of(i, "issue_url"),
+                    jira_ticket_key: s_of(i, "jira_ticket_key"),
                 })
             })
             .collect())
@@ -240,16 +325,26 @@ impl MemoryPlans {
 
     /// Adds a task to a plan.
     pub fn task(&self, team: &str, plan_id: &str, task_id: &str, status: &str, depends_on: &str) {
-        self.tasks
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .entry((team.to_string(), plan_id.to_string()))
-            .or_default()
-            .push(Task {
+        self.add(
+            team,
+            Task {
+                plan_id: plan_id.to_string(),
                 task_id: task_id.to_string(),
                 status: status.to_string(),
                 depends_on: depends_on.to_string(),
-            });
+                ..Task::default()
+            },
+        );
+    }
+
+    /// Adds a task to its plan (`task.plan_id`).
+    pub fn add(&self, team: &str, task: Task) {
+        self.tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry((team.to_string(), task.plan_id.clone()))
+            .or_default()
+            .push(task);
     }
 }
 
@@ -277,6 +372,13 @@ impl PlanStore for MemoryPlans {
             .cloned()
             .unwrap_or_default())
     }
+
+    async fn team_tasks(&self, team: &str) -> Result<Vec<Task>, String> {
+        let tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+        let mut plans: Vec<_> = tasks.keys().filter(|(t, _)| t == team).collect();
+        plans.sort();
+        Ok(plans.into_iter().flat_map(|k| tasks[k].clone()).collect())
+    }
 }
 
 #[cfg(test)]
@@ -291,6 +393,7 @@ mod tests {
             ticket_id: key.into(),
             repo: "acme/web".into(),
             issue_number: 0,
+            plan_id: String::new(),
         }
     }
 
@@ -300,6 +403,193 @@ mod tests {
             ticket_id: format!("GH-{n}"),
             repo: repo.into(),
             issue_number: n,
+            plan_id: String::new(),
+        }
+    }
+
+    /// A task row that opened a ticket, as the plan records it.
+    fn ticket_task(plan: &str, id: &str, issue_url: &str, jira: &str) -> Task {
+        Task {
+            plan_id: plan.into(),
+            task_id: id.into(),
+            status: "done".into(),
+            issue_url: issue_url.into(),
+            jira_ticket_key: jira.into(),
+            ..Task::default()
+        }
+    }
+
+    fn in_plan(run: MergedRun, plan: &str) -> MergedRun {
+        MergedRun {
+            plan_id: plan.into(),
+            ..run
+        }
+    }
+
+    #[tokio::test]
+    async fn without_a_link_the_runs_plan_is_searched_for_the_issue() {
+        let s = MemoryPlans::default();
+        // One plan, two repositories, both issues #12; no links were written.
+        s.add(
+            T,
+            ticket_task("p1", "t-web", "https://github.com/acme/web/issues/12", ""),
+        );
+        s.add(
+            T,
+            ticket_task("p1", "t-api", "https://github.com/Acme/API/issues/12", ""),
+        );
+        s.task(T, "p1", "t-web-next", WAITING, "t-web");
+        s.task(T, "p1", "t-api-next", WAITING, "t-api");
+
+        let got = dependents_to_release(&s, T, &in_plan(github_run("acme/api", 12), "p1"))
+            .await
+            .unwrap();
+        assert_eq!(
+            got,
+            Some(Release {
+                plan_id: "p1".into(),
+                task_id: "t-api".into(),
+                tasks: vec!["t-api-next".into()],
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn without_a_link_or_a_plan_on_the_run_one_task_naming_the_ticket_is_found() {
+        // A plan from before links existed: its runs name no plan either.
+        let s = MemoryPlans::default();
+        s.add(
+            T,
+            ticket_task("p-old", "t1", "https://github.com/acme/web/issues/7/", ""),
+        );
+        s.task(T, "p-old", "t2", WAITING, "t1");
+        s.add(T, ticket_task("p-jira", "j1", "", "PROJ-3"));
+        s.task(T, "p-jira", "j2", WAITING, "j1");
+        // The same number in another repository, in another plan.
+        s.add(
+            T,
+            ticket_task("p-other", "o1", "https://github.com/acme/api/issues/7", ""),
+        );
+        s.task(T, "p-other", "o2", WAITING, "o1");
+
+        let got = dependents_to_release(&s, T, &github_run("acme/web", 7))
+            .await
+            .unwrap()
+            .expect("the old plan's waiting task is released");
+        assert_eq!(
+            (got.plan_id.as_str(), got.task_id.as_str()),
+            ("p-old", "t1")
+        );
+        assert_eq!(got.tasks, vec!["t2".to_string()]);
+
+        let got = dependents_to_release(&s, T, &jira_run("proj-3"))
+            .await
+            .unwrap()
+            .expect("the Jira task's waiting task is released");
+        assert_eq!(
+            (got.plan_id.as_str(), got.task_id.as_str()),
+            ("p-jira", "j1")
+        );
+        assert_eq!(got.tasks, vec!["j2".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_ticket_two_tasks_name_releases_nothing_without_a_link() {
+        let s = MemoryPlans::default();
+        for plan in ["p1", "p2"] {
+            s.add(
+                T,
+                ticket_task(plan, "t1", "https://github.com/acme/web/issues/4", "OPS-9"),
+            );
+            s.task(T, plan, "t2", WAITING, "t1");
+        }
+        for run in [github_run("acme/web", 4), jira_run("OPS-9")] {
+            assert_eq!(dependents_to_release(&s, T, &run).await.unwrap(), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn without_a_link_the_search_stays_in_the_runs_plan() {
+        let s = MemoryPlans::default();
+        s.add(
+            T,
+            ticket_task("p-other", "t1", "https://github.com/acme/web/issues/4", ""),
+        );
+        s.task(T, "p-other", "t2", WAITING, "t1");
+        s.task(T, "p-mine", "m1", "running", "");
+        let run = in_plan(github_run("acme/web", 4), "p-mine");
+        assert_eq!(dependents_to_release(&s, T, &run).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn without_a_link_a_bare_number_or_number_zero_never_matches() {
+        let s = MemoryPlans::default();
+        // A task with an issue number but no URL, and one whose URL is #0.
+        s.add(
+            T,
+            Task {
+                plan_id: "p1".into(),
+                task_id: "t-bare".into(),
+                ..Task::default()
+            },
+        );
+        s.task(T, "p1", "t-bare-next", WAITING, "t-bare");
+        s.add(
+            T,
+            ticket_task("p2", "t-zero", "https://github.com/acme/web/issues/0", ""),
+        );
+        s.task(T, "p2", "t-zero-next", WAITING, "t-zero");
+        for run in [
+            github_run("acme/web", 0),
+            in_plan(github_run("acme/web", 0), "p2"),
+            in_plan(github_run("", 5), "p1"),
+            in_plan(github_run("acme/web", 5), "p1"),
+            jira_run(""),
+        ] {
+            assert_eq!(dependents_to_release(&s, T, &run).await.unwrap(), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_link_is_looked_up_before_the_task_rows() {
+        let s = MemoryPlans::default();
+        s.task(T, "p-linked", "t1", "running", "");
+        s.task(T, "p-linked", "t2", WAITING, "t1");
+        s.link(T, &github_link_sk("acme/web", 8), "p-linked", "t1");
+        // Another plan's row also names the issue; the link wins.
+        s.add(
+            T,
+            ticket_task("p-row", "r1", "https://github.com/acme/web/issues/8", ""),
+        );
+        s.task(T, "p-row", "r2", WAITING, "r1");
+        let got = dependents_to_release(&s, T, &github_run("acme/web", 8))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (got.plan_id.as_str(), got.task_id.as_str()),
+            ("p-linked", "t1")
+        );
+    }
+
+    #[test]
+    fn issue_urls_give_repository_and_number() {
+        assert_eq!(
+            issue_of_url("https://github.com/Acme/Web/issues/12"),
+            Some(("acme/web".into(), 12))
+        );
+        assert_eq!(
+            issue_of_url("https://ghe.example.com/acme/web/issues/3/"),
+            Some(("acme/web".into(), 3))
+        );
+        for bad in [
+            "",
+            "https://github.com/acme/web/pull/12",
+            "https://github.com/acme/web/issues/0",
+            "https://github.com/acme/web/issues/x",
+            "github.com/acme/web/issues/12",
+        ] {
+            assert_eq!(issue_of_url(bad), None, "{bad}");
         }
     }
 
@@ -348,7 +638,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_merge_whose_ticket_has_no_plan_link_releases_nothing() {
+    async fn a_merge_whose_ticket_no_plan_opened_releases_nothing() {
         let s = MemoryPlans::default();
         // A plan task whose issue is #5 in acme/web, linked there.
         s.task(T, "p1", "t1", "running", "");

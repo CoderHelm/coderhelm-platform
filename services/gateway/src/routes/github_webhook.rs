@@ -4782,7 +4782,8 @@ async fn write_run_event(
 }
 
 /// After a PR merges, start the plan tasks waiting on the merged run's task,
-/// found through its ticket's plan link (see `common::plan_dependents`).
+/// found through its ticket's plan link, or without one through the task row
+/// that records the ticket (see `common::plan_dependents`).
 async fn trigger_plan_dependents(
     state: &AppState,
     team_id: &str,
