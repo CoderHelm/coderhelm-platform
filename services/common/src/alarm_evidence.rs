@@ -1,4 +1,4 @@
-//! The evidence a run started by a CloudWatch alarm reads before it plans,
+//! The evidence a run an alert rule started for a CloudWatch alarm reads before it plans,
 //! through the team's read-only AWS connection, so the fix is based on what
 //! the alarm saw rather than on its name.
 //!

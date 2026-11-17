@@ -6,12 +6,8 @@
 //! topic's route: each rule names the alarms (or alert text) it takes, the
 //! repository to fix them in, and how to act. An alert a rule takes becomes a
 //! ticket run against that rule's repository: CoderHelm analyzes it, makes the
-//! change the instructions call for, and opens a pull request. A CloudWatch
-//! alarm no rule names, on a route that fixes alerts, gets a run that
-//! investigates it: the worker reads its evidence and picks the repo its
-//! cause lives in ([`unnamed`]). Only a person's setting (a notify route, the
-//! route's `notify_alarms`) or an alarm with no cause in code keeps an alert
-//! to a post in the team's chat channels (Teams, Slack). The PR goes through the normal review, and a
+//! change the instructions call for, and opens a pull request. Alerts no rule
+//! takes are only posted to the team's chat channels (Teams, Slack). The PR goes through the normal review, and a
 //! CoderHelm-authored PR never merges without a person's approval.
 //!
 //! Safety:
@@ -74,23 +70,6 @@ const MAX_RULE_TERMS: usize = 20;
 /// Id of the rule a route saved before rules existed becomes. Its daily cap
 /// keeps the counter it had as a route.
 const LEGACY_RULE_ID: &str = "default";
-/// Id of the run CoderHelm starts for an alarm no rule names (its daily cap
-/// is per topic). A saved rule's id can't hold `_`, so it never collides.
-const INVESTIGATE_RULE_ID: &str = "_investigate";
-/// In a route's `notify_alarms`: every alarm no rule names only posts.
-pub const NOTIFY_EVERY_UNNAMED: &str = "*";
-/// What a run for an alarm no rule names is told to do. Plain words only: the
-/// repo picker searches the ticket's identifiers, and these must be the
-/// alarm's.
-const INVESTIGATE_INSTRUCTIONS: &str = "No rule on this topic names this alarm, so this \
-    repository was chosen from where the alarm's names appear in the team's code. Work out what \
-    the alarm measures and why it fired from its description, metric, dimensions and the \
-    evidence below it (requests and log fields AWS recorded for it). When the cause is something \
-    this repository defines (application code, configuration, or infrastructure such as firewall \
-    rules, alarms or scaling settings), make the smallest change that resolves it, written the \
-    way the repository's existing code is. Base every value in the change on the evidence, never \
-    on a guess. When the alarm is working as intended, or the change belongs somewhere else, \
-    make no changes and explain why.";
 /// Most alert text passed to a run.
 const MAX_ALERT_BODY: usize = 12_000;
 
@@ -376,75 +355,6 @@ pub fn pick_rule<'a>(rules: &'a [Rule], alert: &Alert) -> Option<&'a Rule> {
     })
 }
 
-/// What happens to an alert no rule on its route takes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Unnamed {
-    /// The route has no rules: a person set it to only post.
-    NotifyRoute,
-    /// The route lists this alarm (or every unnamed one) as post-only.
-    NotifyChosen,
-    /// Not a CloudWatch alarm (a message or an event): no rule, no run.
-    NotAlarm,
-    /// What the alarm measures has no cause in code (the bill, quotas, AWS's
-    /// own hardware or health): posted only.
-    NoCodeCause,
-    /// A run investigates it and fixes the cause in the repo it lives in.
-    Investigate,
-}
-
-/// Pure: the decision for an alert no rule takes. Only a person's setting or
-/// an alarm with no cause in code keeps it to a post; any other alarm on a
-/// route that fixes alerts gets a run that works out the cause and the repo.
-pub fn unnamed(rules: &[Rule], notify_alarms: &[String], alert: &Alert) -> Unnamed {
-    if rules.is_empty() {
-        return Unnamed::NotifyRoute;
-    }
-    let Some(name) = alarm_name(alert) else {
-        return Unnamed::NotAlarm;
-    };
-    if notify_alarms
-        .iter()
-        .any(|a| a == NOTIFY_EVERY_UNNAMED || a == name)
-    {
-        return Unnamed::NotifyChosen;
-    }
-    if no_code_cause(alert) {
-        return Unnamed::NoCodeCause;
-    }
-    Unnamed::Investigate
-}
-
-/// Pure: the alarm measures something no code change fixes: the account's
-/// bill or service quotas, Trusted Advisor or AWS Health, or an EC2 host's own
-/// hardware. Read from the alarm's metric line (`- Metric: <namespace> / <name>`).
-pub fn no_code_cause(alert: &Alert) -> bool {
-    let Some(metric) = alert
-        .body
-        .lines()
-        .find_map(|l| l.strip_prefix("- Metric: "))
-    else {
-        return false;
-    };
-    let (namespace, name) = metric.split_once(" / ").unwrap_or((metric, ""));
-    match namespace.trim() {
-        "AWS/Billing" | "AWS/Usage" | "AWS/TrustedAdvisor" | "AWS/Health" => true,
-        "AWS/EC2" => name.trim() == "StatusCheckFailed_System",
-        _ => false,
-    }
-}
-
-/// The rule a run for an alarm no rule names runs under: no repo (the
-/// worker picks it from the evidence), the investigation's instructions.
-fn investigate_rule() -> Rule {
-    Rule {
-        id: INVESTIGATE_RULE_ID.to_string(),
-        alarms: vec![],
-        terms: vec![],
-        repo: String::new(),
-        instructions: INVESTIGATE_INSTRUCTIONS.to_string(),
-    }
-}
-
 /// Pure: the ticket a run receives. The alert is fenced and labelled as data;
 /// only the route's own instructions are instructions.
 pub fn ticket_body(topic_arn: &str, alert: &Alert, instructions: &str) -> String {
@@ -518,9 +428,6 @@ struct Route {
     repeat: Repeat,
     /// Alarms with their own setting, by exact alarm name.
     alarm_repeat: BTreeMap<String, Repeat>,
-    /// Alarms no rule names that a person chose to only post, by exact name
-    /// (`*` = every one). Any other alarm no rule names is investigated.
-    notify_alarms: Vec<String>,
 }
 
 fn strings(v: Option<&AttributeValue>) -> Vec<String> {
@@ -599,7 +506,6 @@ fn route_from_item(item: &HashMap<String, AttributeValue>) -> Option<Route> {
         rules,
         repeat,
         alarm_repeat,
-        notify_alarms: strings(item.get("notify_alarms")),
         enabled: item
             .get("enabled")
             .and_then(|v| v.as_bool().ok())
@@ -710,9 +616,7 @@ pub struct SnsEnvelope {
         checked (signature versions 1 and 2) and the signing certificate must come from SNS. The \
         subscription is confirmed automatically once the topic has an enabled route; messages from \
         topics without one are accepted and ignored. A message that matches one of the route's \
-        rules becomes a run that opens a pull request; a CloudWatch alarm no rule names \
-        becomes a run that investigates it, unless the route lists it as post-only or it has no \
-        cause in code.",
+        rules becomes a run that opens a pull request.",
     request_body(content = SnsEnvelope, description = "The SNS message.", content_type = "application/json"),
     responses(
         (status = 200, description = "Accepted."),
@@ -786,12 +690,8 @@ pub enum Outcome {
     RoutePaused,
     NotAlarm,
     NoMatch,
-    /// The route only notifies, or a person set this alarm to only post: the
-    /// alert was posted to Teams, no run.
+    /// The route only notifies: the alert was posted to Teams, no run.
     Notified,
-    /// No rule names the alarm and what it measures has no cause in code:
-    /// posted, no run.
-    NoCodeCause,
     Duplicate,
     /// A recovery whose alert had a card still open: one resolved card posted.
     Recovered,
@@ -822,7 +722,6 @@ impl Outcome {
             Outcome::NotAlarm => "not_alarm",
             Outcome::NoMatch => "no_match",
             Outcome::Notified => "notified",
-            Outcome::NoCodeCause => "no_code_cause",
             Outcome::Duplicate => "duplicate",
             Outcome::Recovered => "recovered",
             Outcome::NoOpenAlert => "no_open_alert",
@@ -1269,17 +1168,10 @@ pub fn notify_line(
     card_open: bool,
 ) -> Option<String> {
     Some(match outcome {
-        Outcome::RunStarted if repo.is_empty() => "No rule names this alarm, so CoderHelm is \
-            investigating it: it reads the evidence, finds the repository the cause lives in and \
-            opens a fix there. A follow-up card will link the pull request."
-            .to_string(),
         Outcome::RunStarted => {
             format!("CoderHelm is working on a fix in {repo}. A follow-up card will link the pull request.")
         }
-        Outcome::NoMatch => "Notification only: no automatic fix for this alert.".to_string(),
-        Outcome::NoCodeCause => "Notification only: this alarm measures something no code change \
-            fixes (the AWS bill, service quotas, AWS Health or a host's own hardware)."
-            .to_string(),
+        Outcome::NoMatch => no_rule_line(None, ""),
         Outcome::Notified => String::new(),
         Outcome::NotAlarm if post_recoveries => String::new(),
         Outcome::NotAlarm => return None,
@@ -1301,6 +1193,20 @@ pub fn notify_line(
             return None
         }
     })
+}
+
+/// Pure: the card's line when no rule on the route takes the alert: says so
+/// plainly, and links to the route settings where a rule can be added (none
+/// when the dashboard's address isn't known). The route's rules decide which
+/// alerts get a run; this alert is posted only, at no token cost.
+pub fn no_rule_line(alarm: Option<&str>, base: &str) -> String {
+    let what = if alarm.is_some() { "alarm" } else { "alert" };
+    let add = if base.is_empty() {
+        "Add a rule for it in the alert route settings".to_string()
+    } else {
+        format!("[Add a rule for it]({base}/settings/alerts)")
+    };
+    format!("No rule on this route names this {what}, so no fix was started. {add} to have CoderHelm open a pull request when it fires.")
 }
 
 fn dashboard_base(state: &AppState) -> &'static str {
@@ -1355,6 +1261,14 @@ async fn notify_channels(
         // repeats stay quiet too.
         open_alert(state, &route.team_id, alert, &id, &msg.timestamp, false).await;
     }
+    let line_override = line_override.or_else(|| {
+        (outcome == Outcome::NoMatch).then(|| {
+            no_rule_line(
+                episodes::alarm_name(alert.kind, &alert.title),
+                dashboard_base(state),
+            )
+        })
+    });
     let Some(line) = notify_line(outcome, repo, route.post_recoveries, card_open)
         .map(|l| line_override.unwrap_or(l))
     else {
@@ -1546,32 +1460,13 @@ async fn decide(
         info!(topic, ticket = %tid, title = %alert.title, "Alert ignored — not an alarm state");
         return Ok(Outcome::NotAlarm);
     }
-    let investigate;
-    let rule = match rule {
-        Some(rule) => rule,
-        None => match unnamed(&route.rules, &route.notify_alarms, alert) {
-            Unnamed::NotifyRoute => {
-                info!(topic, ticket = %tid, title = %alert.title, "Alert posted — route only notifies");
-                return Ok(Outcome::Notified);
-            }
-            Unnamed::NotifyChosen => {
-                info!(topic, ticket = %tid, title = %alert.title, "Alert posted — the route sets this alarm to only post");
-                return Ok(Outcome::Notified);
-            }
-            Unnamed::NotAlarm => {
-                info!(topic, ticket = %tid, title = %alert.title, "Alert posted — no rule takes it");
-                return Ok(Outcome::NoMatch);
-            }
-            Unnamed::NoCodeCause => {
-                info!(topic, ticket = %tid, title = %alert.title, "Alert posted — no rule names it and it has no cause in code");
-                return Ok(Outcome::NoCodeCause);
-            }
-            Unnamed::Investigate => {
-                info!(topic, ticket = %tid, title = %alert.title, "No rule names this alarm — starting a run that investigates it");
-                investigate = investigate_rule();
-                &investigate
-            }
-        },
+    let Some(rule) = rule else {
+        if route.rules.is_empty() {
+            info!(topic, ticket = %tid, title = %alert.title, "Alert posted — route only notifies");
+            return Ok(Outcome::Notified);
+        }
+        info!(topic, ticket = %tid, title = %alert.title, "Alert posted — no rule takes it");
+        return Ok(Outcome::NoMatch);
     };
 
     let table = &state.config.settings_table_name;
@@ -1649,14 +1544,7 @@ async fn start_run(
         }
     }
 
-    // An investigation has no repo yet: the worker picks it from where the
-    // alarm's names appear in the team's code.
-    let investigating = rule.id == INVESTIGATE_RULE_ID && rule.repo.is_empty();
-    let Some((owner, name)) = rule
-        .repo
-        .split_once('/')
-        .or(investigating.then_some(("", "")))
-    else {
+    let Some((owner, name)) = rule.repo.split_once('/') else {
         error!(topic, repo = %rule.repo, "Alert rule has a malformed repo");
         return Ok(Outcome::Misconfigured);
     };
@@ -2026,7 +1914,6 @@ pub async fn list_routes(
                 "post_recoveries": r.post_recoveries,
                 "repeat": r.repeat.as_str(),
                 "alarm_repeat": r.alarm_repeat.iter().map(|(k, v)| (k.clone(), json!(v.as_str()))).collect::<serde_json::Map<_, _>>(),
-                "notify_alarms": r.notify_alarms,
                 "updated_at": it.get("updated_at").and_then(|v| v.as_s().ok()),
             }))
         })
@@ -2085,33 +1972,6 @@ pub struct PutRouteRequest {
     /// Alarms with their own repeat setting, by exact alarm name.
     #[serde(default)]
     alarm_repeat: BTreeMap<String, String>,
-    /// Alarms no rule names that only post, by exact name (`*` = every
-    /// one). Any other alarm no rule names is investigated by a run.
-    #[serde(default)]
-    notify_alarms: Vec<String>,
-}
-
-/// Pure: the post-only alarms a request saves, trimmed and deduplicated.
-/// Err = bad request.
-pub fn notify_alarms_from_request(req: &PutRouteRequest) -> Result<Vec<String>, StatusCode> {
-    let mut out: Vec<String> = Vec::new();
-    for a in req
-        .notify_alarms
-        .iter()
-        .map(|a| a.trim())
-        .filter(|a| !a.is_empty())
-    {
-        if a.len() > 255 {
-            return Err(StatusCode::BAD_REQUEST);
-        }
-        if !out.iter().any(|o| o == a) {
-            out.push(a.to_string());
-        }
-    }
-    if out.len() > MAX_RULE_ALARMS {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-    Ok(out)
 }
 
 /// Pure: the repeat setting a request saves, and its per-alarm overrides,
@@ -2234,7 +2094,6 @@ pub async fn put_route(
     let account = topic_account(topic).ok_or(StatusCode::BAD_REQUEST)?;
     let rules = rules_from_request(&req)?;
     let (repeat, alarm_repeat) = repeat_from_request(&req)?;
-    let notify_alarms = notify_alarms_from_request(&req)?;
     if rules.is_empty() && notify_mode_of(&req) == Some(alert_notify::MODE_OFF) {
         // A route that neither fixes nor notifies would do nothing.
         return Err(StatusCode::BAD_REQUEST);
@@ -2305,10 +2164,6 @@ pub async fn put_route(
             .item("post_recoveries", AttributeValue::Bool(req.post_recoveries))
             .item("repeat", attr_s(repeat.as_str()))
             .item("alarm_repeat", alarm_repeat_attr.clone())
-            .item(
-                "notify_alarms",
-                AttributeValue::L(notify_alarms.iter().map(|a| attr_s(a)).collect()),
-            )
             .item("updated_at", attr_s(&now))
             .item("updated_by", attr_s(&claims.email));
         for (k, v) in &webhooks {
@@ -3111,156 +2966,34 @@ mod tests {
         );
     }
 
-    /// A CloudWatch alarm as SNS delivers it, normalized.
-    fn delivered(name: &str, description: &str, namespace: &str, metric: &str) -> Alert {
-        normalize(
-            Some(&format!("ALARM: \"{name}\" in US East (N. Virginia)")),
-            &json!({
-                "AlarmName": name,
-                "AlarmDescription": description,
-                "AlarmArn": format!("arn:aws:cloudwatch:us-east-1:123456789012:alarm:{name}"),
-                "NewStateValue": "ALARM",
-                "OldStateValue": "OK",
-                "NewStateReason": "Threshold Crossed: 1 datapoint [521.0] was greater than the threshold (500.0).",
-                "Region": "US East (N. Virginia)",
-                "Trigger": {
-                    "MetricName": metric,
-                    "Namespace": namespace,
-                    "Statistic": "SUM",
-                    "ComparisonOperator": "GreaterThanThreshold",
-                    "Threshold": 500.0,
-                    "Dimensions": [
-                        {"name": "WebACL", "value": "example-web-acl"},
-                        {"name": "Rule", "value": "ExampleCrawlerCount"},
-                        {"name": "Region", "value": "us-east-1"}
-                    ]
-                }
-            })
-            .to_string(),
-        )
-    }
-
-    fn waf_drift() -> Alert {
-        delivered(
-            "example-crawler-signature-drift",
-            "ExampleCrawlerCount counts crawler-shaped requests ExampleCrawlerBlock didn't block: \
-             the crawler has probably changed its user agent or TLS fingerprint.",
-            "AWS/WAFV2",
-            "CountedRequests",
-        )
-    }
-
-    /// A route that fixes one named alarm in the infra repo, as teams set
-    /// them up.
-    fn fix_route() -> Vec<Rule> {
-        vec![rule(
+    #[test]
+    fn an_alarm_no_rule_names_says_so_and_links_to_the_route_settings() {
+        let rules = vec![rule(
             "crawler",
-            &["example-crawler-fingerprint"],
             &[],
+            &["crawler TLS fingerprint"],
             "example-org/infra",
-        )]
-    }
-
-    #[test]
-    fn a_waf_drift_alarm_no_rule_names_starts_an_investigation_run() {
-        let a = waf_drift();
-        assert_eq!(pick_rule(&fix_route(), &a), None);
-        assert_eq!(unnamed(&fix_route(), &[], &a), Unnamed::Investigate);
-        // The run picks its repo from the evidence, under the investigation's
-        // own daily cap, and is told to read the evidence first.
-        let r = investigate_rule();
-        assert!(r.repo.is_empty());
-        assert!(!valid_rule_id(&r.id), "never a saved rule's id");
-        let body = ticket_body(
-            "arn:aws:sns:us-east-1:123456789012:alarms",
-            &a,
-            &r.instructions,
+        )];
+        let a = alarm("example-crawler-signature-drift");
+        // Still posted only: no run for an alarm no rule takes.
+        assert_eq!(pick_rule(&rules, &a), None);
+        let line = no_rule_line(
+            Some("example-crawler-signature-drift"),
+            "https://app.example.com",
         );
-        assert!(body.contains("ExampleCrawlerBlock didn't block"));
-        assert!(body.contains("AWS/WAFV2 / CountedRequests"));
-        assert!(body.contains("Rule=ExampleCrawlerCount"));
-        assert!(body.contains("firewall"));
-        // Its card says so instead of "Notification only".
-        let line = notify_line(Outcome::RunStarted, "", false, false).unwrap();
-        assert!(line.contains("investigating"), "{line}");
-        assert!(!line.contains("Notification only"));
-    }
-
-    #[test]
-    fn the_investigation_instructions_add_no_identifiers_to_the_repo_search() {
-        // The worker's repo picker searches the ticket's identifiers: only the
-        // alarm's may be there.
-        assert!(!INVESTIGATE_INSTRUCTIONS.split_whitespace().any(|w| {
-            let w = w.trim_matches(|c: char| !c.is_ascii_alphanumeric());
-            // kebab, snake, camel or Pascal case (an acronym like AWS isn't).
-            w.contains('-')
-                || w.contains('_')
-                || w.as_bytes()
-                    .windows(2)
-                    .any(|p| p[0].is_ascii_lowercase() && p[1].is_ascii_uppercase())
-        }));
-    }
-
-    #[test]
-    fn an_explicit_notify_only_route_or_alarm_stays_notify_only() {
-        let a = waf_drift();
-        // The route's action is "notify": it has no rules.
-        assert_eq!(unnamed(&[], &[], &a), Unnamed::NotifyRoute);
-        // A fix route where a person set this alarm, or every unnamed one, to
-        // only post.
-        let this = vec!["example-crawler-signature-drift".to_string()];
-        assert_eq!(unnamed(&fix_route(), &this, &a), Unnamed::NotifyChosen);
-        let every = vec![NOTIFY_EVERY_UNNAMED.to_string()];
-        assert_eq!(unnamed(&fix_route(), &every, &a), Unnamed::NotifyChosen);
-        // Another alarm's name doesn't cover it.
-        let other = vec!["example-other-alarm".to_string()];
-        assert_eq!(unnamed(&fix_route(), &other, &a), Unnamed::Investigate);
-        // The setting round-trips through Dynamo and the request.
-        let mut item = route_item(Some(ACTION_FIX), "example-org/infra");
-        item.insert(
-            "notify_alarms".into(),
-            AttributeValue::L(vec![attr_s("example-crawler-signature-drift")]),
-        );
-        assert_eq!(route_from_item(&item).unwrap().notify_alarms, this);
-        let req = PutRouteRequest {
-            notify_alarms: vec![" a ".into(), "a".into(), "".into(), "*".into()],
-            ..Default::default()
-        };
-        assert_eq!(notify_alarms_from_request(&req).unwrap(), vec!["a", "*"]);
-        let long = PutRouteRequest {
-            notify_alarms: vec!["x".repeat(256)],
-            ..Default::default()
-        };
         assert_eq!(
-            notify_alarms_from_request(&long),
-            Err(StatusCode::BAD_REQUEST)
+            line,
+            "No rule on this route names this alarm, so no fix was started. \
+             [Add a rule for it](https://app.example.com/settings/alerts) to have CoderHelm open a \
+             pull request when it fires."
         );
-    }
-
-    #[test]
-    fn an_alarm_with_no_code_cause_stays_notify_only() {
-        let bill = delivered(
-            "example-monthly-spend",
-            "Estimated charges are above budget.",
-            "AWS/Billing",
-            "EstimatedCharges",
+        assert!(!line.contains("Notification only"));
+        assert!(no_rule_line(None, "").starts_with("No rule on this route names this alert"));
+        assert!(!no_rule_line(None, "").contains("]("));
+        assert_eq!(
+            notify_line(Outcome::NoMatch, "", false, false).as_deref(),
+            Some(no_rule_line(None, "").as_str())
         );
-        assert_eq!(unnamed(&fix_route(), &[], &bill), Unnamed::NoCodeCause);
-        let host = delivered(
-            "example-host-check",
-            "The host failed its system status check.",
-            "AWS/EC2",
-            "StatusCheckFailed_System",
-        );
-        assert_eq!(unnamed(&fix_route(), &[], &host), Unnamed::NoCodeCause);
-        let line = notify_line(Outcome::NoCodeCause, "", false, false).unwrap();
-        assert!(line.starts_with("Notification only"), "{line}");
-        // An instance's own check can be the code's doing: investigated.
-        let cpu = delivered("example-api-cpu", "", "AWS/EC2", "CPUUtilization");
-        assert_eq!(unnamed(&fix_route(), &[], &cpu), Unnamed::Investigate);
-        // Not an alarm (a plain message): no rule, no run, as before.
-        let msg = normalize(Some("Nightly load failed"), "The extract task failed.");
-        assert_eq!(unnamed(&fix_route(), &[], &msg), Unnamed::NotAlarm);
     }
 
     #[test]

@@ -55,7 +55,7 @@ SERVICES = ["apigateway", "acm", "acm-pca", "cloudfront", "cloudwatch", "codebui
 SERVICE_OF = {"ApiGatewayV2": "apigateway", "CertificateManager": "acm", "CloudFront": "cloudfront", "CloudWatch": "cloudwatch", "CodeBuild": "codebuild",
               "Cognito": "cognito-idp", "DynamoDB": "dynamodb", "Events": "events", "IAM": "iam", "KMS": "kms", "Lambda": "lambda", "Logs": "logs",
               "Route53": "route53", "S3": "s3", "SES": "ses", "SNS": "sns", "SQS": "sqs", "SSM": "ssm", "Scheduler": "scheduler",
-              "SecretsManager": "secretsmanager", "CloudFormation": "cloudformation"}
+              "SecretsManager": "secretsmanager", "CloudFormation": "cloudformation", "EC2": "ec2"}
 
 SYNTH_JS = r"""
 const fs = require("fs"), os = require("os"), path = require("path");
