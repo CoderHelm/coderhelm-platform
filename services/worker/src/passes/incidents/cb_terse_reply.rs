@@ -18,9 +18,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use common::comment_style::{lint_on, tidy};
-use common::conversation::{
-    self as cv, Channel, Heard, How, Kind, Meta, Place, Said, Say, View,
-};
+use common::conversation::{self as cv, Channel, Heard, How, Kind, Meta, Place, Said, Say, View};
 use common::reply_compose::{Compose, Composer, Facts};
 use serde_json::{json, Value};
 
@@ -201,13 +199,7 @@ async fn whatever_a_model_writes_the_thread_rules_hold() {
     let model = Recorded(AtomicUsize::new(0));
     let mut facts = facts();
     facts.state = "the branch update is pushed".into();
-    let log = replay(
-        thread(false),
-        "Merged main in (15401ad).",
-        &facts,
-        &model,
-    )
-    .await;
+    let log = replay(thread(false), "Merged main in (15401ad).", &facts, &model).await;
     assert_eq!(model.0.load(Ordering::SeqCst), 1);
     assert_eq!(log.len(), 1, "{log:?}");
     let body = log[0].strip_prefix("reply 900: ").expect("a reply to sam");
@@ -239,7 +231,10 @@ async fn under_an_older_comment_the_reply_quotes_it_and_nothing_more() {
     // or quotes the one it answers; never a header, never a name.
     assert_eq!(log.len(), 1, "{log:?}");
     let body = log[0].split_once(": ").unwrap().1;
-    assert!(!body.contains("replying to") && !body.contains('@'), "{body}");
+    assert!(
+        !body.contains("replying to") && !body.contains('@'),
+        "{body}"
+    );
     assert!(body.ends_with("Merged main in (15401ad)."), "{body}");
     assert!(lint_on(body, &place()).is_empty(), "{body}");
 }
@@ -251,7 +246,10 @@ fn the_old_reply_breaks_the_rules_and_tidy_fixes_what_it_can() {
     );
     assert!(!lint_on(&old, &place()).is_empty());
     let after = tidy(&old, &place());
-    assert!(!after.contains("replying to") && !after.contains("@sam") && !after.contains("pull/1547"), "{after}");
+    assert!(
+        !after.contains("replying to") && !after.contains("@sam") && !after.contains("pull/1547"),
+        "{after}"
+    );
     assert!(!after.to_lowercase().contains("you asked"), "{after}");
     assert!(lint_on(&after, &place()).is_empty(), "{after}");
 }

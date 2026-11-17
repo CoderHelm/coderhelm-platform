@@ -525,7 +525,10 @@ fn a_reply_names_the_person_never_their_account_id() {
         author: "Sam Lee".into(),
         ..to.clone()
     };
-    assert_eq!(reply_body(&named, How::MentionQuote, true, "", "Done."), "Done.");
+    assert_eq!(
+        reply_body(&named, How::MentionQuote, true, "", "Done."),
+        "Done."
+    );
     assert_eq!(common::conversation_io::jira_id_of(&to), to.author_id);
 }
 
