@@ -305,6 +305,40 @@ pub struct Body {
     /// The plan, steps and where the run is.
     pub built: String,
     pub run_url: String,
+    /// What the change leaves out, `item (why)` each: one line at the end
+    /// of Changes (`scope_ledger`).
+    pub out_of_scope: Vec<String>,
+}
+
+/// Out-of-scope items said in sight; the rest are on the run page.
+pub const MAX_OUT_OF_SCOPE: usize = 3;
+/// Words for one out-of-scope item.
+pub const OUT_OF_SCOPE_WORDS: usize = 18;
+/// The label of the out-of-scope line in Changes.
+pub const OUT_OF_SCOPE: &str = "**Out of scope:**";
+
+/// The out-of-scope line, empty with nothing left out.
+pub fn out_of_scope_line(items: &[String]) -> String {
+    let items: Vec<String> = items
+        .iter()
+        .map(|i| one_line(i))
+        .filter(|i| !i.is_empty())
+        .collect();
+    if items.is_empty() {
+        return String::new();
+    }
+    let mut parts: Vec<String> = items
+        .iter()
+        .take(MAX_OUT_OF_SCOPE)
+        .map(|i| part(&fit_words(i, OUT_OF_SCOPE_WORDS)))
+        .collect();
+    if items.len() > MAX_OUT_OF_SCOPE {
+        parts.push(format!(
+            "{} more on the run page",
+            items.len() - MAX_OUT_OF_SCOPE
+        ));
+    }
+    format!("{OUT_OF_SCOPE} {}.", parts.join("; "))
 }
 
 /// A rendered body, split where `pr_layout` takes its parts.
@@ -981,6 +1015,11 @@ fn blocks(b: &Body) -> Blocks {
     if !out.deps.is_empty() {
         changes.push_str(&format!("\n\n{}", out.deps));
     }
+    // Scope, decided once: what the change leaves out and why.
+    let scope = out_of_scope_line(&b.out_of_scope);
+    if !scope.is_empty() {
+        changes.push_str(&format!("\n\n{scope}"));
+    }
     out.changes = changes;
     let lead_in = if !b.results_of.is_empty() && b.results_of != b.head {
         format!(
@@ -1113,8 +1152,16 @@ pub fn render_templated(b: &Body, template: &str, written: &str) -> (Rendered, V
             Slot::Checklist => {
                 by_title(&s.title, &["checklist"]).unwrap_or_else(|| tpl::boxes(s).join("\n"))
             }
-            Slot::Changes => by_title(&s.title, &["change"])
-                .unwrap_or_else(|| "Listed under Implementation notes below.".to_string()),
+            Slot::Changes => {
+                let c = by_title(&s.title, &["change"])
+                    .unwrap_or_else(|| "Listed under Implementation notes below.".to_string());
+                let scope = out_of_scope_line(&b.out_of_scope);
+                if scope.is_empty() {
+                    c
+                } else {
+                    format!("{}\n\n{scope}", c.trim())
+                }
+            }
             Slot::Other => by_title(&s.title, &[]).unwrap_or_else(|| {
                 let own: Vec<String> = s
                     .lines
@@ -1361,10 +1408,13 @@ pub fn defects(body: &str, head: &str) -> Vec<String> {
                 }
             }
         }
+        let scoped = seen.lines().any(|l| l.trim().starts_with(OUT_OF_SCOPE));
         for (h, n) in prose {
             let max = match h.as_str() {
                 "Verification" => 4,
                 "Needed from you" => MAX_ITEMS,
+                // The out-of-scope line is Changes' one extra.
+                "Changes" if scoped => 4,
                 _ => 3,
             };
             if n > max {
@@ -1582,6 +1632,14 @@ pub fn defects(body: &str, head: &str) -> Vec<String> {
     }
     if body.chars().count() >= BODY_MAX {
         d.push(format!("{} characters", body.chars().count()));
+    }
+    // A product question is decided with its default, never asked
+    // (`scope_ledger`), in sight or folded.
+    let low = body.to_lowercase();
+    for asked in ["open product question", "please answer on the pull request"] {
+        if low.contains(asked) {
+            d.push(format!("an open product question: {asked}"));
+        }
     }
     d
 }

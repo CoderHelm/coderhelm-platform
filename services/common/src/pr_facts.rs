@@ -385,6 +385,15 @@ pub struct Facts {
     /// says it.
     #[serde(default)]
     pub review_question: String,
+    /// What the change leaves out, each `item (why)`: the run's scope
+    /// ledger and the written out-of-scope lines, without what the diff
+    /// brings back (`crate::scope_ledger`).
+    #[serde(default)]
+    pub out_of_scope: Vec<String>,
+    /// The ledger's out-of-scope items the diff brings back: never said as
+    /// out of scope; each is not verified until it is taken out or moved in.
+    #[serde(default)]
+    pub scope_breaches: Vec<crate::scope_ledger::Breach>,
 }
 
 impl Facts {
@@ -1593,6 +1602,7 @@ pub fn body_of(f: &Facts, ticked: &[String]) -> crate::pr_body::Body {
         evidence: evidence.join("\n\n"),
         built: built.trim().to_string(),
         run_url: f.run_url.clone(),
+        out_of_scope: f.out_of_scope.clone(),
     }
 }
 

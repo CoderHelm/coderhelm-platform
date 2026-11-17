@@ -19,7 +19,11 @@
 //!   against them (a `probe_page` record, a lookup), or that there are none;
 //! - [`SMALLEST_CHANGE`]: the change in a few lines, and why nothing
 //!   smaller does it;
-//! - [`PROOF`]: the one test (or the check) that shows it, in proportion.
+//! - [`PROOF`]: the one test (or the check) that shows it, in proportion;
+//! - [`OUT_OF_SCOPE`]: what the change leaves out, each with why: the one
+//!   scope decision every later round and the description are held to
+//!   (`common::scope_ledger`). An open product question is decided here
+//!   with its default, never left for the pull request to ask.
 //!
 //! - `## Criteria map` ([`criteria_gaps`], `common::e2e_proof`): each
 //!   acceptance criterion (or Expected line) that names a page or what a
@@ -43,6 +47,8 @@ pub const MUST_NOT_CHANGE: &str = "## Must not change";
 pub const MEASURE_FIRST: &str = "## Measure first";
 pub const SMALLEST_CHANGE: &str = "## Smallest change";
 pub const PROOF: &str = "## Proof";
+/// Scope decided once (`common::scope_ledger`).
+pub const OUT_OF_SCOPE: &str = common::scope_ledger::OUT_HEADING;
 
 /// What the planner is told, for every ticket kind.
 pub const PLANNER: &str = "\n\n## The smallest correct change (CoderHelm checks these)\n\
@@ -69,7 +75,14 @@ nothing smaller does it.\n\
 - `## Proof`: the one test or check that shows it, sized to the change: the new behaviour and \
 that nothing else changed, through the real entry point, with real or probed data. When an \
 acceptance criterion and an outside system disagree, plan the product change that meets the \
-criterion first; a test is changed to match the outside system only with the measured reason.\n";
+criterion first; a test is changed to match the outside system only with the measured reason.\n\
+- `## Out of scope`: scope is decided once, here. One `- <item>: <why>` line for each thing the \
+change leaves out, naming the code (backticked names, paths, routes) that would show it, or \
+`None`. A product decision the ticket doesn't settle is decided now with its default (today's \
+behaviour, or the smallest choice the ticket allows) and listed here as `- <item>: decided with \
+the default: <default>`; never write open questions for the team. No task may name an item \
+listed here, and no task is open-ended (\"switch any other caller\"): search now and name each \
+file. Every later round and the pull request description are held to this list.\n";
 
 fn names_something(s: &str) -> bool {
     s.contains('`')
@@ -237,16 +250,19 @@ pub fn plan_gaps(
     let mut out = Vec::new();
     let design = &files.design;
     let mut need = vec![MUST_NOT_CHANGE, MEASURE_FIRST, SMALLEST_CHANGE, PROOF];
+    if !common::scope_ledger::has_out_section(design) {
+        need.push(OUT_OF_SCOPE);
+    }
     if !is_feature {
         need.insert(0, REUSE);
     }
     let missing: Vec<&str> = need
         .into_iter()
-        .filter(|h| !section(design, h).is_some_and(|s| !s.trim().is_empty()))
+        .filter(|h| *h == OUT_OF_SCOPE || !section(design, h).is_some_and(|s| !s.trim().is_empty()))
         .collect();
     if !missing.is_empty() {
         out.push(format!(
-            "design.md lacks {}. Write each: Reuse (existing structures by path), Must not change, Measure first (outside systems and how they are measured, or `None`), Smallest change (the change in a few lines), Proof (the one test or check).",
+            "design.md lacks {}. Write each: Reuse (existing structures by path), Must not change, Measure first (outside systems and how they are measured, or `None`), Smallest change (the change in a few lines), Proof (the one test or check), Out of scope (`- <item>: <why>` for each thing left out, open product questions decided with their default, or `None`).",
             missing
                 .iter()
                 .map(|h| format!("`{h}`"))
@@ -333,6 +349,14 @@ pub fn plan_gaps(
             }
         }
     }
+    // Scope decided once: no question left open, a reason for each item, no
+    // task naming an item left out, no open-ended task.
+    out.extend(common::scope_ledger::decision_gaps(
+        &files.proposal,
+        &files.design,
+        &files.tasks,
+        &super::stop_judge::acceptance(ticket),
+    ));
     out
 }
 
@@ -664,7 +688,7 @@ mod tests {
         }
     }
 
-    const GOOD: &str = "## Reuse\n- `CAMP_MULTI_SPORT_OVERRIDES` and `get_camp_multi_sport_names` in dags/camps/sports.py\n\n## Must not change\nNo deletes: existing links stay. Logging stays as it is.\n\n## Measure first\nNone: the change stays inside this repository.\n\n## Smallest change\n4 entries in `CAMP_MULTI_SPORT_OVERRIDES`; in the 3 write branches insert links for `get_camp_multi_sport_names` with ON CONFLICT DO NOTHING.\n\n## Proof\nOne test: the 4 names get Swimming and their own sport, others only their own, nothing deleted.\n";
+    const GOOD: &str = "## Reuse\n- `CAMP_MULTI_SPORT_OVERRIDES` and `get_camp_multi_sport_names` in dags/camps/sports.py\n\n## Must not change\nNo deletes: existing links stay. Logging stays as it is.\n\n## Measure first\nNone: the change stays inside this repository.\n\n## Smallest change\n4 entries in `CAMP_MULTI_SPORT_OVERRIDES`; in the 3 write branches insert links for `get_camp_multi_sport_names` with ON CONFLICT DO NOTHING.\n\n## Proof\nOne test: the 4 names get Swimming and their own sport, others only their own, nothing deleted.\n\n## Out of scope\nNone: the ticket names the four camps and nothing else.\n";
 
     #[test]
     fn the_small_plan_passes() {
@@ -692,6 +716,7 @@ mod tests {
             MEASURE_FIRST,
             SMALLEST_CHANGE,
             PROOF,
+            OUT_OF_SCOPE,
         ] {
             assert!(g[0].contains(h), "{h}");
         }
