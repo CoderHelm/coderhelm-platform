@@ -4063,7 +4063,8 @@ impl GitHubClient {
 
     /// Hides one of CoderHelm's own comments as outdated, or shows it again
     /// (`common::conversation_io::hide_request`). Only the conversation
-    /// layer calls it, for comments that carry CoderHelm's marker.
+    /// layer and the review tidy (`passes::review_tidy`) call it, for
+    /// CoderHelm's own comments.
     pub async fn hide_own_comment(
         &self,
         node_id: &str,
@@ -4533,7 +4534,7 @@ impl GitHubClient {
         for _ in 0..10 {
             let data = self
                 .graphql_read(
-                    "query($owner:String!,$name:String!,$pr:Int!,$after:String){ repository(owner:$owner,name:$name){ pullRequest(number:$pr){ reviewThreads(first:100, after:$after){ pageInfo{ hasNextPage endCursor } nodes{ id isResolved path comments(first:50){ nodes{ id isMinimized body author{ login } pullRequestReview{ databaseId } } } } } } } }",
+                    "query($owner:String!,$name:String!,$pr:Int!,$after:String){ repository(owner:$owner,name:$name){ pullRequest(number:$pr){ reviewThreads(first:100, after:$after){ pageInfo{ hasNextPage endCursor } nodes{ id isResolved isOutdated line path comments(first:50){ nodes{ id isMinimized body author{ login } pullRequestReview{ databaseId } } } } } } } }",
                     serde_json::json!({ "owner": owner, "name": repo, "pr": pr_number, "after": cursor }),
                 )
                 .await?;

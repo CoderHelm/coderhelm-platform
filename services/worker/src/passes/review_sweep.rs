@@ -377,6 +377,31 @@ async fn sweep_repo(
             info!(repo = %r.repo, pr = number, head, stale, "review_sweep: completed stale CoderHelm review checks");
         }
         let records = review_records(state, &r.team_id, &r.repo, number, 10).await;
+        // A pull request CoderHelm reviewed is tidied once per head per
+        // window: what a push, checks finishing or a delivery that never
+        // came left standing (`review_tidy`).
+        if !records.is_empty() {
+            let sk = format!("REVIEWTIDY#{}#{number:0>6}#{head}", r.repo);
+            if super::review_pr::claim_once_ttl(
+                state,
+                &r.team_id,
+                &sk,
+                super::review_tidy::SWEEP_TIDY_TTL_SECS,
+            )
+            .await
+            {
+                match super::review_tidy::pull_request(&github, owner, name, number, Some(pr)).await
+                {
+                    Ok(t) if !t.is_empty() => {
+                        info!(repo = %r.repo, pr = number, collapsed = t.collapse.len(), resolved = t.resolve.len(), hidden = t.minimize.len(), "review_sweep: tidied CoderHelm's reviews")
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        warn!(repo = %r.repo, pr = number, error = %e, "review_sweep: could not tidy CoderHelm's reviews")
+                    }
+                }
+            }
+        }
         let note = failure_note(state, &r.team_id, &r.repo, number).await;
         let Some(why) = stuck(&records, note.as_ref(), head, now) else {
             continue;
