@@ -126,6 +126,7 @@ The causes were in the loop, not only in prompt wording:
    out. When an acceptance criterion of the ticket asks for it, the ticket
    wins: it is built, and the reply to the review says why
    (`round_agree`, `incidents::co_rounds_agree`).
+
 8. **Commit and push.**
    Each gate runs where the commit is made, not as a line in the prompt
    (`common::push_gate`, `passes/push_checks.rs`).
