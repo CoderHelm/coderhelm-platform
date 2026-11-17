@@ -363,6 +363,9 @@ pub struct Candidate {
     pub hold: Option<common::draft_hold::DraftHold>,
     /// The repository's checks passed on the head (`ci_last`).
     pub checks_passed: bool,
+    /// Its pull request is held as a draft (`draft_hold` on the run): the
+    /// run's work waits on CoderHelm's next look, so it is looked at first.
+    pub draft_held: bool,
 }
 
 impl Candidate {
@@ -423,15 +426,20 @@ pub fn candidate_of(item: &HashMap<String, AttributeValue>) -> Option<Candidate>
         preview: s(common::preview::FIELD),
         hold: common::draft_hold::DraftHold::of_item(item),
         checks_passed: s("ci_last") == "passed",
+        draft_held: item.contains_key(common::draft_hold::FIELD),
     };
     (pr > 0 && c.installation_id > 0 && !c.team_id.is_empty() && !c.run_id.is_empty()).then_some(c)
 }
 
-/// The candidates a sweep reads, least recently looked at first.
+/// The candidates a sweep reads: pull requests held as drafts first (their
+/// run's work waits on this look), then least recently looked at first. A
+/// held draft once went three sweeps without a look while the sweep's
+/// hourly budget went to merged pull requests looked at less recently.
 pub fn order(mut all: Vec<Candidate>, max: usize) -> Vec<Candidate> {
     all.sort_by(|a, b| {
-        a.looked_at
-            .cmp(&b.looked_at)
+        b.draft_held
+            .cmp(&a.draft_held)
+            .then_with(|| a.looked_at.cmp(&b.looked_at))
             .then_with(|| a.run_id.cmp(&b.run_id))
     });
     all.truncate(max);
@@ -1063,6 +1071,9 @@ pub struct SweepReport {
     pub looked_at: usize,
     /// Installations skipped this cycle for GitHub's budget.
     pub skipped_installations: usize,
+    /// Seconds until a skipped installation may spend again
+    /// (`SweepGate::retry_in`).
+    pub retry_in: Option<u64>,
     /// `owner/repo#pr: act` for each pull request picked back up.
     pub acted: Vec<String>,
     /// `owner/repo#pr` for each description the catch-up rebuilt by this
@@ -1143,6 +1154,7 @@ pub async fn sweep(state: &WorkerState) -> SweepReport {
     }
     report.caught_up = catch_up(state, &mut budget, &mut clients).await;
     report.skipped_installations = budget.skipped();
+    report.retry_in = budget.retry_in();
     report
 }
 

@@ -1159,7 +1159,7 @@ mod tests {
         );
         assert_eq!(pr_layout::machinery(&note), Vec::<String>::new(), "{note}");
         assert_eq!(
-            note.matches("not allowed to start workflows").count(),
+            note.matches("the GitHub App needs Actions: write").count(),
             1,
             "{note}"
         );

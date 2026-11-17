@@ -60,6 +60,7 @@ mod br_description_writer_upgrade;
 mod bs_cut_plan_revision;
 mod bt_proof_answer_closes;
 mod bu_coder_shell_refusals;
+mod bu_held_draft_after_release;
 mod bu_web_change_unchecked;
 mod c_codegen_egress;
 mod d_echoed_markers;

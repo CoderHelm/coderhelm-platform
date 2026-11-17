@@ -1744,7 +1744,9 @@ async fn record_hold(state: &WorkerState, team_id: &str, run_id: &str, hold: Dra
         return;
     }
     let before = run_hold(state, team_id, run_id).await;
-    let hold = hold.continuing(before.as_ref().and_then(|(_, h)| h.as_ref()));
+    let mut hold = hold.continuing(before.as_ref().and_then(|(_, h)| h.as_ref()));
+    // Which code decided it: another version decides it again at once.
+    hold.version = super::proof::checks_version().to_string();
     let now = chrono::Utc::now().to_rfc3339();
     // `:held` is a condition value, never a status written here: the write
     // goes through `NeedsInput::needs_input`.
@@ -2006,8 +2008,13 @@ pub enum SweepStep {
     Skip,
 }
 
-/// Pure: what the sweep does with a candidate at `now`.
-pub fn sweep_step(c: &Candidate, now: chrono::DateTime<chrono::Utc>) -> SweepStep {
+/// Pure: what the sweep does with a candidate at `now`, run by the code of
+/// `version` (`proof::checks_version`). A hold that other code decided is
+/// decided again on this sweep, whatever its age: after a release a held
+/// draft once waited out the hour since its last decision, the one sweep
+/// that hour skipped it for GitHub's budget, and a person reset the run
+/// before the fix that would have finished it ever looked.
+pub fn sweep_step(c: &Candidate, now: chrono::DateTime<chrono::Utc>, version: &str) -> SweepStep {
     let finished = matches!(
         c.status.as_str(),
         common::run_status::COMPLETED | common::run_status::SUCCESS
@@ -2022,6 +2029,7 @@ pub fn sweep_step(c: &Candidate, now: chrono::DateTime<chrono::Utc>) -> SweepSte
         // Waiting on a person for something that isn't the draft.
         (None, false, _) => SweepStep::Skip,
         (Some(h), _, _) if h.stale(RECHECK_HELD_SECS, now) => SweepStep::Decide,
+        (Some(h), true, _) | (Some(h), _, true) if h.other_version(version) => SweepStep::Decide,
         (Some(_), true, _) | (Some(_), _, true) => SweepStep::Peek,
         (Some(_), false, false) => SweepStep::Skip,
     }
@@ -2064,6 +2072,9 @@ pub struct SweepReport {
     pub decided: usize,
     /// `owner/repo#pr: outcome` for each one decided.
     pub settled: Vec<String>,
+    /// GitHub's budget skipped an installation this sweep: seconds until it
+    /// may spend again (`SweepGate::retry_in`).
+    pub retry_in: Option<u64>,
 }
 
 /// Finished runs (in the last [`SWEEP_WINDOW_DAYS`]) whose pull request
@@ -2119,11 +2130,14 @@ pub async fn sweep(state: &WorkerState) -> SweepReport {
     // GitHub's budget and says a skip once per installation.
     let mut budget =
         crate::clients::github_budget::SweepGate::new(common::github_budget::caller::SWEEP_DRAFTS);
+    let version = super::proof::checks_version();
+    // Decisions first, so a short budget goes to the drafts that need one.
+    let candidates = sweep_order(candidates, now, version);
     for c in candidates {
         if report.decided >= SWEEP_MAX_DECISIONS {
             break;
         }
-        let step = sweep_step(&c, now);
+        let step = sweep_step(&c, now, version);
         if step == SweepStep::Skip || c.installation_id == 0 || c.team_id.is_empty() {
             continue;
         }
@@ -2179,7 +2193,75 @@ pub async fn sweep(state: &WorkerState) -> SweepReport {
             .settled
             .push(format!("{}/{}#{}: {outcome:?}", c.owner, c.repo, c.pr));
     }
+    report.retry_in = budget.retry_in();
     report
+}
+
+/// How often the sweeps run (the `review_sweep` schedule), in seconds.
+pub const SWEEP_EVERY_SECS: u64 = 15 * 60;
+/// The settings item a follow-up sweep is claimed under, once per gap.
+const FOLLOW_UP_PK: &str = "SWEEP";
+const FOLLOW_UP_SK: &str = "review_sweep#follow_up";
+
+/// When to run the sweeps again after GitHub's budget skipped an
+/// installation (`waits`: each sweep's `retry_in`): the shortest wait, when
+/// it ends well before the next scheduled sweep. A skip at a quarter past
+/// once waited fifteen minutes for a budget that refilled ten seconds later.
+pub fn follow_up_delay(waits: &[Option<u64>]) -> Option<u64> {
+    let soonest = waits.iter().flatten().copied().min()?;
+    (soonest + 60 < SWEEP_EVERY_SECS).then_some(soonest.clamp(30, SWEEP_EVERY_SECS - 60))
+}
+
+/// Runs the sweeps again once the budget that skipped them refills
+/// ([`follow_up_delay`]): one delayed `review_sweep` per gap, claimed so
+/// several workers never send more than one.
+pub async fn sweep_follow_up(state: &WorkerState, waits: &[Option<u64>]) {
+    let Some(delay) = follow_up_delay(waits) else {
+        return;
+    };
+    if state.config.ticket_queue_url.is_empty() {
+        return;
+    }
+    let claimed = common::claim::claim(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        FOLLOW_UP_PK,
+        FOLLOW_UP_SK,
+        delay + 60,
+    )
+    .await;
+    if !matches!(claimed, common::claim::Claim::Won) {
+        return;
+    }
+    let sent = state
+        .sqs
+        .send_message()
+        .queue_url(&state.config.ticket_queue_url)
+        .message_body(serde_json::json!({"type": "review_sweep"}).to_string())
+        .delay_seconds(delay as i32)
+        .send()
+        .await;
+    match sent {
+        Ok(_) => info!(
+            delay_secs = delay,
+            "GitHub's budget skipped a sweep: the sweeps run again once it refills"
+        ),
+        Err(e) => warn!(error = %e, "Could not send the follow-up sweep"),
+    }
+}
+
+/// The candidates in the order the sweep takes them: those it decides
+/// first (in their scan order), then those it only peeks at.
+pub fn sweep_order(
+    candidates: Vec<Candidate>,
+    now: chrono::DateTime<chrono::Utc>,
+    version: &str,
+) -> Vec<Candidate> {
+    let (mut decide, peek): (Vec<Candidate>, Vec<Candidate>) = candidates
+        .into_iter()
+        .partition(|c| sweep_step(c, now, version) == SweepStep::Decide);
+    decide.extend(peek);
+    decide
 }
 
 #[cfg(test)]
@@ -2691,16 +2773,20 @@ mod tests {
             installation_id: 1,
             hold: None,
         };
-        assert_eq!(sweep_step(&c, now), SweepStep::Decide);
+        assert_eq!(sweep_step(&c, now, ""), SweepStep::Decide);
         let held = DraftHold::new(Kind::Held, vec![Reason::new("a", "")], 583, "").unwrap();
         let c2 = Candidate {
             status: "needs_input".into(),
             hold: Some(held.clone()),
             ..c.clone()
         };
-        assert_eq!(sweep_step(&c2, now), SweepStep::Peek);
+        assert_eq!(sweep_step(&c2, now, ""), SweepStep::Peek);
         assert_eq!(
-            sweep_step(&c2, now + chrono::Duration::seconds(RECHECK_HELD_SECS + 1)),
+            sweep_step(
+                &c2,
+                now + chrono::Duration::seconds(RECHECK_HELD_SECS + 1),
+                ""
+            ),
             SweepStep::Decide
         );
         // Waiting on a person for something that isn't the draft.
@@ -2709,7 +2795,7 @@ mod tests {
             hold: None,
             ..c.clone()
         };
-        assert_eq!(sweep_step(&c3, now), SweepStep::Skip);
+        assert_eq!(sweep_step(&c3, now, ""), SweepStep::Skip);
     }
 
     #[test]
