@@ -208,6 +208,9 @@ pub mod pr_template;
 pub mod preview;
 /// What a fix must show before it is committed and pushed.
 pub mod push_gate;
+/// A bug reproduced on the base before code is planned, fixed in the
+/// mechanism the reproduction lands in, questions looked up first.
+pub mod repro_first;
 pub mod run_prs;
 /// Scope decided once at plan time, held in every round and in the
 /// description.

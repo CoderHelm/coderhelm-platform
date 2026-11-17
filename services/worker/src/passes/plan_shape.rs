@@ -216,7 +216,7 @@ const TEST_TO_VENDOR: &[&str] = &[
 
 /// The plan's words that propose things, without its Must not change
 /// section (where "no deletes" is said).
-fn proposing_text(files: &PlanResult) -> String {
+pub(crate) fn proposing_text(files: &PlanResult) -> String {
     let design = match section(&files.design, MUST_NOT_CHANGE) {
         Some(s) => files.design.replace(s, ""),
         None => files.design.clone(),
