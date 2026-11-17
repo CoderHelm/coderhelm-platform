@@ -1,4 +1,4 @@
-//! bx. Two pull requests did far more than their tickets, and guessed
+//! bz. Two pull requests did far more than their tickets, and guessed
 //! where they should have measured.
 //!
 //! A data-pipeline ticket asked to link four full-day camps to Swimming as

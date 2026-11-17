@@ -1274,6 +1274,7 @@ pub mod description_facts;
 pub mod dlq_cleanup;
 pub mod e2e;
 pub mod e2e_attribution;
+pub mod e2e_reads;
 pub mod e2e_setup;
 pub mod email_events;
 mod explore_guard;
@@ -1910,6 +1911,62 @@ async fn read_ticket_comments(
     Ok(())
 }
 
+/// The evidence a run an alert rule started (it has the rule's repo) reads
+/// before planning, when its alarm is an AWS WAF alarm: through the team's
+/// read-only connection to the alarm's account (the alert's topic is in it).
+/// None for any other run, or when it is already in the ticket (a later step
+/// of the same run).
+async fn alarm_evidence_for_run(state: &WorkerState, msg: &TicketMessage) -> Option<String> {
+    use common::alarm_evidence as ae;
+    if !matches!(msg.source, TicketSource::Alert)
+        || msg.sender != "alert"
+        || msg.repo_owner.is_empty()
+        || msg.repo_name.is_empty()
+        || msg.body.contains(ae::HEADING)
+    {
+        return None;
+    }
+    let alarm = ae::waf_alarm(&msg.body)?;
+    let topic = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(&msg.team_id))
+        .key("sk", attr_s(&format!("ALERT_TICKET#{}", msg.ticket_id)))
+        .send()
+        .await
+        .ok()?
+        .item()?
+        .get("topic_arn")?
+        .as_s()
+        .ok()?
+        .clone();
+    let account = topic.split(':').nth(4).unwrap_or_default().to_string();
+    let session = common::log_findings::session_for(
+        &state.dynamo,
+        &state.sts,
+        &state.config.aws_insights_table_name,
+        &msg.team_id,
+        &account,
+    )
+    .await;
+    Some(match session {
+        Ok(Some(s)) => ae::gather(&s, &alarm, chrono::Utc::now()).await,
+        Ok(None) => ae::render(
+            &alarm,
+            &[format!(
+                "No AWS connection for account {account}, so the requests the rule matched weren't read."
+            )],
+        ),
+        Err(e) => ae::render(
+            &alarm,
+            &[format!(
+                "CoderHelm's AWS role for account {account} couldn't be taken on: {e}"
+            )],
+        ),
+    })
+}
+
 /// The agent a ticket run belongs to as a whole, when it isn't the planner
 /// and coder: a fix started by a log finding is log auto-fix's, one started
 /// by an alert is the alert fixer's.
@@ -2057,18 +2114,20 @@ async fn run_passes(
     msg.team_instructions =
         load_team_instructions(state, &msg.team_id, &msg.repo_owner, &msg.repo_name).await;
 
-    // Post "working on it" comment only for GitHub-sourced tickets.
+    // Progress is status for nobody: it is on the run page, never a comment
+    // (the layer drops a "run" status an earlier attempt left on the issue).
     let mut progress_comment_id: Option<u64> = None;
     if matches!(msg.source, TicketSource::Github) && msg.issue_number > 0 {
-        let resp = crate::passes::conversation::github(
+        crate::passes::conversation::github(
             &github,
             &msg.repo_owner,
             &msg.repo_name,
             msg.issue_number,
-            common::conversation::Say::status("run", format_progress("triage", run_id)),
+            common::conversation::Say::status("run", format_progress("triage", run_id))
+                .for_nobody(),
         )
         .await?;
-        progress_comment_id = resp["id"].as_u64();
+        progress_comment_id = Some(msg.issue_number);
     }
 
     // The ticket's history with CoderHelm: earlier runs, how their PRs
@@ -2685,6 +2744,20 @@ async fn run_passes(
     // --- Evidence: a run started from a log finding reads the logs and the
     // ECS service behind them before planning, and every agent gets it ---
     let mut log_ev = log_evidence::gather_for_run(state, msg).await;
+    // --- Evidence: a run an alert rule started for an AWS WAF alarm reads
+    // the requests the alarm's rule matched (sampled requests, TLS
+    // fingerprints from the web ACL's logs) before planning; it joins the
+    // ticket as data ---
+    if let Some(ev) = alarm_evidence_for_run(state, msg).await {
+        add_progress_note(
+            state,
+            &msg.team_id,
+            run_id,
+            "Read the requests the alarm's WAF rule matched (sampled requests and the web ACL's logs).",
+        )
+        .await;
+        msg.body = common::alarm_evidence::with_evidence(&msg.body, &ev);
+    }
     if let Some(ev) = log_ev.as_ref() {
         log_evidence::save(state, &msg.team_id, run_id, ev).await;
         add_progress_note(state, &msg.team_id, run_id, &log_evidence::summary_note(ev)).await;
@@ -5441,7 +5514,7 @@ async fn run_passes(
                 &file_cache,
                 Some(run_id),
                 implement_deadline,
-                write_guard::RoundFor::Build,
+                write_guard::RoundFor::PlanTasks,
             )
             .await?
         };
@@ -5509,7 +5582,7 @@ async fn run_passes(
                             &file_cache,
                             Some(run_id),
                             implement_deadline,
-                            write_guard::RoundFor::Build,
+                            write_guard::RoundFor::PlanTasks,
                         )
                         .await?;
                     }
@@ -5719,7 +5792,7 @@ async fn run_passes(
                     &file_cache,
                     Some(run_id),
                     implement_deadline,
-                    write_guard::RoundFor::Build,
+                    write_guard::RoundFor::PlanTasks,
                 )
                 .await?;
                 if again.files_modified.is_empty() {
@@ -7784,7 +7857,7 @@ async fn run_repo_pipeline(
         file_cache,
         Some(run_id),
         implement_deadline,
-        write_guard::RoundFor::Build,
+        write_guard::RoundFor::PlanTasks,
     )
     .await?;
     write_pass_trace(
@@ -9043,8 +9116,10 @@ async fn report_also_outside(
     if let Some(c) = decision.outside_change.as_ref() {
         person_gate::record_counts(state, &msg.team_id, run_id, &outside_work::counts(c)).await;
     }
-    // The ticket gets the short note (what was done, the one thing needed);
-    // the full report stays on the run page and the pull request.
+    // The ticket gets only what a person must do; with nothing for anyone
+    // the comment says nothing (the conversation layer drops it from the
+    // status comment), and the full report stays on the run page and the
+    // pull request.
     let ticket = decision
         .outside_change
         .as_ref()
@@ -9298,7 +9373,7 @@ async fn post_ticket_notice(
                 github,
                 &msg.repo_owner,
                 &msg.repo_name,
-                earlier.comment_id,
+                msg.issue_number,
                 key,
                 github_body,
                 asks,
@@ -12578,21 +12653,21 @@ fn format_progress(current_phase: &str, run_id: &str) -> String {
     )
 }
 
-/// Update the progress comment on the GitHub issue.
+/// Progress on a GitHub issue (`issue`): status for nobody, so the layer
+/// keeps it off the thread (and drops an earlier one).
 async fn update_progress_comment(
     github: &crate::clients::github::GitHubClient,
     owner: &str,
     repo: &str,
-    comment_id: Option<u64>,
+    issue: Option<u64>,
     phase: &str,
     run_id: &str,
 ) {
-    if let Some(cid) = comment_id {
-        let body = format_progress(phase, run_id);
-        if let Err(e) =
-            crate::passes::conversation::edit_own(github, owner, repo, cid, "run", &body).await
-        {
-            tracing::warn!(error = %e, "Failed to update progress comment");
+    if let Some(n) = issue {
+        let say =
+            common::conversation::Say::status("run", format_progress(phase, run_id)).for_nobody();
+        if let Err(e) = crate::passes::conversation::github(github, owner, repo, n, say).await {
+            tracing::warn!(error = %e, "Failed to update progress on the issue");
         }
     }
 }

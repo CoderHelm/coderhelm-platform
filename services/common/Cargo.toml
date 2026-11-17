@@ -52,6 +52,8 @@ aws-sdk-redshiftdata = { version = "1", default-features = false, features = ["d
 aws-sdk-cloudwatchlogs = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 # live: CloudWatch metrics and Airflow (MWAA) through the team's log reader role
 aws-sdk-cloudwatch = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+# alarm_evidence: what an AWS WAF alarm's rule matched (sampled requests, read-only)
+aws-sdk-wafv2 = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 # log_repo: which repo a log group's code lives in (read-only lookups)
 aws-sdk-ecs = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-sdk-lambda = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }

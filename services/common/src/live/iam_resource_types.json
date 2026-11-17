@@ -243,6 +243,15 @@
   ],
   "health:DescribeEventDetails": [
    "event"
+  ],
+  "wafv2:ListWebACLs": [
+   ""
+  ],
+  "wafv2:GetSampledRequests": [
+   "webacl"
+  ],
+  "wafv2:GetLoggingConfiguration": [
+   "webacl"
   ]
  }
 }

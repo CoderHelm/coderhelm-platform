@@ -736,6 +736,143 @@ pub struct GitHubClient {
     /// While a caller records ([`Self::record_validators`]): the URL and
     /// `ETag` of each read it made, to ask later whether any changed.
     validators: Mutex<Option<Vec<(String, String)>>>,
+    /// The commits people made on each branch CoderHelm writes to, keyed by
+    /// "owner/repo:branch" and read again only when the branch gains a
+    /// commit that isn't CoderHelm's (`common::person_lines`).
+    person_edits: tokio::sync::Mutex<HashMap<String, PersonCache>>,
+    /// A person asked for the round now writing: their ask is their answer,
+    /// so their own lines may change ([`Self::set_person_asked`]).
+    person_asked: std::sync::atomic::AtomicBool,
+    /// What writes left as a person had it, per pull request
+    /// ("owner/repo#n"): the one note on it lists them all.
+    person_kept: Mutex<HashMap<String, Vec<common::person_lines::Kept>>>,
+}
+
+/// The most of CoderHelm's newest commits [`GitHubClient::fold_own_churn`]
+/// reads one by one.
+const MAX_FOLD_COMMITS: usize = 40;
+
+/// Where CoderHelm's newest run of its own commits starts among a
+/// compare's `commits` (oldest first): after the last commit that is a
+/// person's or a merge. `commits.len()` when the newest isn't its own.
+pub fn own_tail_start(commits: &[serde_json::Value]) -> usize {
+    commits
+        .iter()
+        .rposition(|c| !is_bot_commit(c) || c["parents"].as_array().is_some_and(|p| p.len() > 1))
+        .map_or(0, |i| i + 1)
+}
+
+/// How a run of CoderHelm's own commits folds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fold {
+    /// Files the commits changed and then put back.
+    pub churn: Vec<String>,
+    /// The one commit's message; `None` when the commits change nothing
+    /// together and are dropped.
+    pub message: Option<String>,
+}
+
+impl Fold {
+    /// The progress note for folding `n` commits.
+    pub fn note(&self, n: usize) -> String {
+        let files: Vec<String> = self
+            .churn
+            .iter()
+            .take(5)
+            .map(|f| format!("`{f}`"))
+            .collect();
+        let more = self.churn.len().saturating_sub(5);
+        let files = if more > 0 {
+            format!("{} and {more} more", files.join(", "))
+        } else {
+            files.join(", ")
+        };
+        match self.message {
+            None => format!(
+                "Dropped CoderHelm's last {n} commits: together they changed nothing ({files} \
+                 changed and put back)"
+            ),
+            Some(_) => format!(
+                "Folded CoderHelm's last {n} commits into one: {files} changed and put back, so \
+                 no commit carries them"
+            ),
+        }
+    }
+}
+
+/// The fold of a run of CoderHelm's own commits (`touched`: each commit's
+/// message and files, oldest first) whose changes together are `net`:
+/// `None` when no file was changed and put back. The one commit keeps the
+/// message of the first commit that changed a file that stays changed.
+pub fn fold_plan(touched: &[(String, Vec<String>)], net: &[String]) -> Option<Fold> {
+    let mut churn: Vec<String> = Vec::new();
+    for (_, files) in touched {
+        for f in files {
+            if !net.contains(f) && !churn.contains(f) {
+                churn.push(f.clone());
+            }
+        }
+    }
+    if churn.is_empty() {
+        return None;
+    }
+    let message = if net.is_empty() {
+        None
+    } else {
+        touched
+            .iter()
+            .find(|(_, files)| files.iter().any(|f| net.contains(f)))
+            .map(|(m, _)| m.clone())
+            .or_else(|| Some("Apply changes".to_string()))
+    };
+    Some(Fold { churn, message })
+}
+
+/// A round a person may or may not have asked for: see
+/// [`GitHubClient::person_asked_round`].
+pub struct PersonAskedRound<'a>(&'a GitHubClient);
+
+impl Drop for PersonAskedRound<'_> {
+    fn drop(&mut self) {
+        self.0.set_person_asked(false);
+    }
+}
+
+/// The people's commits on a branch, as of its tip `tip`.
+#[derive(Clone, Default)]
+struct PersonCache {
+    tip: String,
+    /// The branch's open pull request.
+    pr: Option<u64>,
+    edits: Vec<common::person_lines::PersonEdit>,
+}
+
+/// The most of a branch's people's commits whose patches are read: the
+/// newest, which are the ones a round is likely to write over.
+const MAX_PERSON_COMMITS: usize = 30;
+
+/// The people's commits among a compare's `commits` (oldest first): not
+/// CoderHelm's ([`is_bot_commit`]) and not a merge of another branch (its
+/// lines are that branch's, not this person's work), newest
+/// [`MAX_PERSON_COMMITS`] kept.
+pub fn person_commits(commits: &[serde_json::Value]) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = commits
+        .iter()
+        .filter(|c| !is_bot_commit(c))
+        .filter(|c| c["parents"].as_array().map_or(0, |p| p.len()) <= 1)
+        .filter_map(|c| {
+            let sha = c["sha"].as_str()?.to_string();
+            let who = c["author"]["login"]
+                .as_str()
+                .or_else(|| c["commit"]["author"]["name"].as_str())
+                .unwrap_or("a person")
+                .to_string();
+            Some((sha, who))
+        })
+        .collect();
+    let skip = out.len().saturating_sub(MAX_PERSON_COMMITS);
+    out.drain(..skip);
+    out
 }
 
 #[derive(Serialize)]
@@ -787,7 +924,230 @@ impl GitHubClient {
             token_cache: Mutex::new(None),
             snapshots: tokio::sync::RwLock::new(HashMap::new()),
             validators: Mutex::new(None),
+            person_edits: tokio::sync::Mutex::new(HashMap::new()),
+            person_asked: std::sync::atomic::AtomicBool::new(false),
+            person_kept: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Whether a person asked for the round now writing (a review or a
+    /// comment of theirs): their ask is their answer, so a write may change
+    /// lines they wrote. Set at the start of such a round, cleared after.
+    pub fn set_person_asked(&self, asked: bool) {
+        self.person_asked
+            .store(asked, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// [`Self::set_person_asked`] for one round: cleared when the returned
+    /// value drops, however the round ends.
+    pub fn person_asked_round(&self, asked: bool) -> PersonAskedRound<'_> {
+        self.set_person_asked(asked);
+        PersonAskedRound(self)
+    }
+
+    /// The edits people made on `branch` past its pull request's base, and
+    /// the pull request. `None` when they couldn't be read (the write goes
+    /// on: an API hiccup never bricks a round).
+    async fn people_on(
+        &self,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+    ) -> Option<(Option<u64>, Vec<common::person_lines::PersonEdit>)> {
+        let key = format!("{owner}/{repo}:{branch}");
+        let tip = self.get_ref(owner, repo, branch).await.ok()?;
+        let cached = self.person_edits.lock().await.get(&key).cloned();
+        if let Some(c) = &cached {
+            if c.tip == tip {
+                return Some((c.pr, c.edits.clone()));
+            }
+            // Only CoderHelm's own commits since: the people's are as read.
+            if let Ok(new) = self.compare_commits(owner, repo, &c.tip, &tip, 100).await {
+                if !new.is_empty() && new.len() < 100 && new.iter().all(is_bot_commit) {
+                    let mut c = c.clone();
+                    c.tip = tip.clone();
+                    self.person_edits.lock().await.insert(key, c.clone());
+                    return Some((c.pr, c.edits));
+                }
+            }
+        }
+        // A round's WIP branch starts at its pull request's head: the
+        // people's commits are the pull request's.
+        let wip = common::run_round::wip_branch("");
+        let pr_branch = branch.strip_prefix(wip.as_str()).unwrap_or(branch);
+        let prs = self
+            .get(&format!(
+                "{API_BASE}/repos/{owner}/{repo}/pulls?head={owner}:{pr_branch}&state=open&per_page=1"
+            ))
+            .await
+            .ok()?;
+        let Some(pr) = prs.as_array().and_then(|a| a.first()) else {
+            // No pull request: nobody reviews the branch yet, and a
+            // person's commits on it keep it from being restarted
+            // (`start_branch`).
+            let c = PersonCache {
+                tip,
+                ..Default::default()
+            };
+            self.person_edits.lock().await.insert(key, c);
+            return Some((None, Vec::new()));
+        };
+        let number = pr["number"].as_u64();
+        let base = pr["base"]["ref"].as_str()?.to_string();
+        let commits = self
+            .compare_commits(owner, repo, &base, branch, 250)
+            .await
+            .ok()?;
+        let mut edits = Vec::new();
+        for (sha, who) in person_commits(&commits) {
+            let c = self
+                .get(&format!("{API_BASE}/repos/{owner}/{repo}/commits/{sha}"))
+                .await
+                .ok()?;
+            for f in c["files"].as_array().into_iter().flatten() {
+                let (Some(path), Some(patch)) = (f["filename"].as_str(), f["patch"].as_str())
+                else {
+                    continue;
+                };
+                edits.push(common::person_lines::PersonEdit::from_patch(
+                    &sha, &who, path, patch,
+                ));
+            }
+        }
+        let c = PersonCache {
+            tip,
+            pr: number,
+            edits,
+        };
+        self.person_edits.lock().await.insert(key, c.clone());
+        Some((c.pr, c.edits))
+    }
+
+    /// `ops` held against the commits people made on `branch`
+    /// (`common::person_lines`): a part of a write that takes out a line a
+    /// person added, or puts back one they removed, is not committed, and
+    /// the pull request's one note says what CoderHelm disagrees with and
+    /// asks them. `Err` (the refusal the coder reads) when nothing of the
+    /// write is left.
+    pub async fn hold_for_people(
+        &self,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+        ops: Vec<FileOp>,
+    ) -> Result<Vec<FileOp>, String> {
+        use common::person_lines as pl;
+        if self.person_asked.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(ops);
+        }
+        let Some((pr, edits)) = self.people_on(owner, repo, branch).await else {
+            tracing::warn!(
+                branch,
+                "could not read the people's commits on the branch; the write goes on unheld"
+            );
+            return Ok(ops);
+        };
+        if edits.is_empty() {
+            return Ok(ops);
+        }
+        let mut kept: Vec<pl::Kept> = Vec::new();
+        let mut out = Vec::with_capacity(ops.len());
+        for op in ops {
+            let path = match &op {
+                FileOp::Write { path, .. } | FileOp::Delete { path } => path.clone(),
+            };
+            if !edits.iter().any(|e| e.path == path) {
+                out.push(op);
+                continue;
+            }
+            let current = match self.read_file_live(owner, repo, &path, branch).await {
+                Ok(c) => Some(c),
+                Err(e) if is_not_found(&*e) => None,
+                Err(_) => {
+                    out.push(op);
+                    continue;
+                }
+            };
+            match op {
+                FileOp::Write { path, content } => {
+                    let g = pl::guard(&path, current.as_deref(), &content, &edits);
+                    if g.kept.is_empty() {
+                        out.push(FileOp::Write { path, content });
+                        continue;
+                    }
+                    kept.extend(g.kept);
+                    if current.as_deref() != Some(g.content.as_str()) {
+                        out.push(FileOp::Write {
+                            path,
+                            content: g.content,
+                        });
+                    }
+                }
+                FileOp::Delete { path } => {
+                    match current
+                        .as_deref()
+                        .and_then(|c| pl::guard_delete(&path, c, &edits))
+                    {
+                        Some(k) => kept.push(k),
+                        None => out.push(FileOp::Delete { path }),
+                    }
+                }
+            }
+        }
+        if kept.is_empty() {
+            return Ok(out);
+        }
+        tracing::warn!(
+            branch,
+            kept = kept.len(),
+            "a write would undo a person's commit on the branch: their version kept"
+        );
+        if let Some(n) = pr {
+            self.note_people_kept(owner, repo, n, &kept).await;
+        }
+        if out.is_empty() {
+            return Err(pl::refusal(&kept));
+        }
+        Ok(out)
+    }
+
+    /// Writes the pull request's one note on what CoderHelm left as a person
+    /// had it: edited in place, never a second comment.
+    async fn note_people_kept(
+        &self,
+        owner: &str,
+        repo: &str,
+        pr: u64,
+        kept: &[common::person_lines::Kept],
+    ) {
+        use common::person_lines as pl;
+        let key = format!("{owner}/{repo}#{pr}");
+        let all = {
+            let mut m = self.person_kept.lock().unwrap();
+            let all = pl::merge(m.get(&key).map(Vec::as_slice).unwrap_or(&[]), kept);
+            m.insert(key, all.clone());
+            all
+        };
+        let body = pl::note(&all);
+        let existing = self
+            .list_issue_comments(owner, repo, pr)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .find(|c| {
+                c["body"]
+                    .as_str()
+                    .is_some_and(|b| b.contains(pl::NOTE_MARKER))
+                    && c["user"]["type"].as_str() == Some("Bot")
+            })
+            .and_then(|c| c["id"].as_u64());
+        let res = match existing {
+            Some(id) => self.edit_issue_comment(owner, repo, id, &body).await,
+            None => self.create_issue_comment(owner, repo, pr, &body).await,
+        };
+        if let Err(e) = res {
+            tracing::warn!(pr, error = %e, "could not write the note on a person's lines kept");
+        }
     }
 
     /// Starts recording the validator (`ETag`) of every read made from now
@@ -2160,6 +2520,81 @@ impl GitHubClient {
         Ok(())
     }
 
+    /// Folds away churn in the newest of CoderHelm's commits on `branch`:
+    /// when its own commits since the last commit that isn't its own (a
+    /// person's, or a merge) change a file and then put it back, those
+    /// commits become one commit that carries only what changed (or none,
+    /// when nothing did), so the pull request never shows an edit and its
+    /// "restore" as commits of their own. A person's commits and every
+    /// commit before them are never rewritten; the branch moves only if no
+    /// one pushed since it was read. `Ok(Some(note))` when it folded.
+    pub async fn fold_own_churn(
+        &self,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+    ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+        let prs = self
+            .get(&format!(
+                "{API_BASE}/repos/{owner}/{repo}/pulls?head={owner}:{branch}&state=open&per_page=1"
+            ))
+            .await?;
+        let Some(base) = prs
+            .as_array()
+            .and_then(|a| a.first())
+            .and_then(|p| p["base"]["ref"].as_str())
+        else {
+            return Ok(None);
+        };
+        let commits = self.compare_commits(owner, repo, base, branch, 250).await?;
+        if commits.len() >= 250 {
+            return Ok(None);
+        }
+        let start = own_tail_start(&commits);
+        let tail = &commits[start..];
+        if tail.len() < 2 || tail.len() > MAX_FOLD_COMMITS {
+            return Ok(None);
+        }
+        let (Some(tip), Some(parent)) = (
+            tail.last().and_then(|c| c["sha"].as_str()),
+            tail[0]["parents"][0]["sha"].as_str(),
+        ) else {
+            return Ok(None);
+        };
+        let mut touched: Vec<(String, Vec<String>)> = Vec::new();
+        for c in tail {
+            let sha = c["sha"].as_str().unwrap_or_default();
+            let (_, files) = self.commit_stats(owner, repo, sha).await?;
+            touched.push((
+                c["commit"]["message"].as_str().unwrap_or("").to_string(),
+                files,
+            ));
+        }
+        let net = self.changed_files_between(owner, repo, parent, tip).await?;
+        let Some(fold) = fold_plan(&touched, &net) else {
+            return Ok(None);
+        };
+        let to = match &fold.message {
+            None => parent.to_string(),
+            Some(message) => {
+                let tree = self.git_commit(owner, repo, tip).await?["tree"]["sha"]
+                    .as_str()
+                    .ok_or("Missing tree sha in tip commit")?
+                    .to_string();
+                self.new_commit(
+                    owner,
+                    repo,
+                    serde_json::json!({ "message": message, "tree": tree, "parents": [parent] }),
+                )
+                .await?
+            }
+        };
+        if !self.move_with_lease(owner, repo, branch, tip, &to).await? {
+            return Ok(None);
+        }
+        Ok(Some(fold.note(tail.len())))
+    }
+
     /// Create a new branch from an existing ref.
     pub async fn create_branch(
         &self,
@@ -2948,6 +3383,23 @@ impl GitHubClient {
         message: &str,
         sha: Option<&str>,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        // A person's lines on the branch stay theirs: what of this write
+        // would undo one is not committed (`hold_for_people`).
+        let held = self
+            .hold_for_people(
+                owner,
+                repo,
+                branch,
+                vec![FileOp::Write {
+                    path: path.to_string(),
+                    content: content.to_string(),
+                }],
+            )
+            .await?;
+        let content: &str = match held.first() {
+            Some(FileOp::Write { content, .. }) => content,
+            _ => return Err(format!("nothing of the write to '{path}' is left to commit").into()),
+        };
         self.guard_empty_overwrite(owner, repo, path, branch, content)
             .await?;
         let url = format!("{API_BASE}/repos/{owner}/{repo}/contents/{path}");
@@ -3058,6 +3510,12 @@ impl GitHubClient {
         message: &str,
         files: &[FileOp],
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        // A person's lines on the branch stay theirs: what of this write
+        // would undo one is not committed (`hold_for_people`).
+        let held = self
+            .hold_for_people(owner, repo, branch, files.to_vec())
+            .await?;
+        let files = held.as_slice();
         // An empty Write over a file with bytes is refused before anything is
         // created; a removal must come as FileOp::Delete.
         for f in files {
@@ -3534,6 +3992,26 @@ impl GitHubClient {
         self.get(&url).await
     }
 
+    /// Hides one of CoderHelm's own comments as outdated, or shows it again
+    /// (`common::conversation_io::hide_request`). Only the conversation
+    /// layer calls it, for comments that carry CoderHelm's marker.
+    pub async fn hide_own_comment(
+        &self,
+        node_id: &str,
+        hidden: bool,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let v = self
+            .post(
+                &format!("{API_BASE}/graphql"),
+                &common::conversation_io::hide_request(node_id, hidden),
+            )
+            .await?;
+        match common::conversation_io::graphql_error(&v) {
+            Some(e) => Err(e.into()),
+            None => Ok(()),
+        }
+    }
+
     /// One GraphQL query, refused unless it only reads.
     pub async fn graphql_read(
         &self,
@@ -3947,6 +4425,60 @@ impl GitHubClient {
             }
         }
         Ok(serde_json::Value::Array(items))
+    }
+
+    /// Rewrites the body of a submitted review (CoderHelm rewrites only its
+    /// own superseded reviews, through the conversation layer).
+    pub async fn update_review_body(
+        &self,
+        owner: &str,
+        repo: &str,
+        pr_number: u64,
+        review_id: u64,
+        body: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!("{API_BASE}/repos/{owner}/{repo}/pulls/{pr_number}/reviews/{review_id}");
+        let headers = self.auth_headers().await?;
+        let mut req = self
+            .http
+            .put(&url)
+            .json(&serde_json::json!({ "body": body }));
+        for (k, v) in headers {
+            req = req.header(k, v);
+        }
+        ok_or_body(self.send_tracked(req).await?).await?;
+        Ok(())
+    }
+
+    /// Every review thread on a PR with its comments' authors, review ids
+    /// and whether each is hidden (what superseding CoderHelm's earlier
+    /// reviews reads). Raw GraphQL nodes, oldest comment first.
+    pub async fn list_review_threads_detail(
+        &self,
+        owner: &str,
+        repo: &str,
+        pr_number: u64,
+    ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut out = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..10 {
+            let data = self
+                .graphql_read(
+                    "query($owner:String!,$name:String!,$pr:Int!,$after:String){ repository(owner:$owner,name:$name){ pullRequest(number:$pr){ reviewThreads(first:100, after:$after){ pageInfo{ hasNextPage endCursor } nodes{ id isResolved path comments(first:50){ nodes{ id isMinimized body author{ login } pullRequestReview{ databaseId } } } } } } } }",
+                    serde_json::json!({ "owner": owner, "name": repo, "pr": pr_number, "after": cursor }),
+                )
+                .await?;
+            let threads = &data["repository"]["pullRequest"]["reviewThreads"];
+            out.extend(threads["nodes"].as_array().cloned().unwrap_or_default());
+            if !threads["pageInfo"]["hasNextPage"]
+                .as_bool()
+                .unwrap_or(false)
+            {
+                break;
+            }
+            cursor = threads["pageInfo"]["endCursor"].as_str().map(String::from);
+        }
+        Ok(out)
     }
 
     /// Dismiss a review on a PR (CoderHelm dismisses only its own stale
@@ -5292,6 +5824,7 @@ pub struct CommitFile {
 }
 
 /// File operation for batch_write.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileOp {
     Write { path: String, content: String },
     Delete { path: String },

@@ -69,6 +69,7 @@ pub mod agent_policy;
 // What a shell command an agent sent means here, and the tool names
 // models are trained on with their CoderHelm equivalents.
 /// Alert notifications: which channels an alert posts to, and its messages.
+pub mod alarm_evidence;
 pub mod alert_episodes;
 pub mod alert_notify;
 pub mod coder_shell;
@@ -193,6 +194,9 @@ pub mod preview;
 pub mod run_prs;
 pub mod waiting_line;
 // review_stats: time-ordered review records for analytics
+/// How a comment reads: the renderer and lint every comment passes before
+/// it is posted (short, plain, no pasted plans, no history).
+pub mod comment_style;
 /// What people write on a ticket while a run works on it: kept, acknowledged, acted on.
 /// One engineer's voice per ticket and per pull request: every comment
 /// CoderHelm writes reads the thread first, then stays quiet, edits its own
@@ -224,6 +228,9 @@ pub mod model_provider;
 /// Files a run keeps as its outputs (reports, tables, snapshots).
 pub mod outputs;
 pub mod person_gate;
+/// A person's lines on a CoderHelm branch stay theirs: writes that would undo them are
+/// kept out.
+pub mod person_lines;
 /// Plugins: packages of skills, agents, tools, triggers and outputs a team installs.
 pub mod plugins;
 /// One shape for "something is wrong": set by a check, cleared by the same
@@ -248,6 +255,9 @@ pub mod review_live;
 pub mod review_overview;
 pub mod review_session;
 pub mod review_stats;
+/// CoderHelm's earlier reviews on a pull request, collapsed once it posts a
+/// new one: one line each, hidden comments, resolved threads, dismissed.
+pub mod review_supersede;
 pub mod reviewer_prefs;
 /// Learning from outcomes: reward events, scores, calibration, variants,
 /// examples and evidence-backed lessons, per team.

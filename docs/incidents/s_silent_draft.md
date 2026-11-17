@@ -1,0 +1,5 @@
+# s. `s_silent_draft`
+
+**What happened:** A new-feature run finished with CI green and CoderHelm's review approving, and its pull request stayed a draft. Four of CoderHelm's own sandbox checks had failed on the head, the mark-ready step returned without a word, and the run page said completed. The same day, mark-ready messages that hit GitHub's rate limit were dropped and five more pull requests stayed drafts.
+
+**The guarantee:** One decision settles every pull request a finished run leaves, on every path. With CI green and the review approving, CoderHelm's own sandbox failures and checklist items never hold the draft: the pull request is marked ready with them under Open items. A hold that remains names each reason and what to do at the top of the description, at warn in the log, and on the run, which is `needs_input` while a person must act. A mark-ready GitHub refuses is tried again after its reset, a bounded number of times, and the last refusal is recorded on the run. A sweep decides again for finished runs left a draft with no recorded reason, respecting a person's draft and a closed pull request.

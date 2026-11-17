@@ -182,6 +182,20 @@ fn shell_call(line: &str, offered: &dyn Fn(&str) -> bool) -> Resolution {
         Shell::Tree => run("read_tree", json!({}), offered)
             .or_else(|| run("list_directory", json!({"path": ""}), offered)),
         Shell::Diff => run("get_diff", json!({}), offered),
+        Shell::ReadAt { path, git_ref } => {
+            return Resolution::Answer(format!(
+                "{path} as it is at {git_ref} isn't readable in this step: read_file reads it as \
+                 it is on the branch, and github_history (kind commits, path {path}) lists the \
+                 commits that changed it."
+            ))
+        }
+        Shell::History(input) => run("github_history", input, offered),
+        Shell::Fetch(f) => run("check_url", json!({"urls": f.urls}), offered),
+        Shell::Steps(_) => {
+            return Resolution::Answer(
+                "Send one command per call here: each read runs as its own tool call.".into(),
+            )
+        }
         Shell::Refuse(why) => return Resolution::Answer(why),
         Shell::Empty => return Resolution::Answer("The command was empty.".into()),
         Shell::Run { .. } => None,

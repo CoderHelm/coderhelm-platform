@@ -104,7 +104,7 @@ fn a_green_approved_pr_is_marked_ready_with_the_sandbox_failures_listed() {
 }
 
 #[test]
-fn a_hold_that_remains_is_named_everywhere_and_the_run_waits_on_a_person() {
+fn a_hold_that_remains_is_named_everywhere_and_waits_on_a_person_only_for_a_human_only_reason() {
     let mut end = Ending {
         status: "completed".into(),
         pr: Some(21),
@@ -119,9 +119,20 @@ fn a_hold_that_remains_is_named_everywhere_and_the_run_waits_on_a_person() {
         },
         ..the_pull_request_at_completion()
     };
-    let d = ready::decide(&f);
-    let Decision::Held { reasons } = &d else {
-        panic!("{d:?}")
+    // What CoderHelm's own checks find is its note on a ready pull request
+    // (incident bv); a hold names a human-only reason, as here.
+    assert!(matches!(ready::decide(&f), Decision::Ready { open }
+        if open.iter().any(|o| o.starts_with(ready::NOTE_PREFIX))));
+    let Decision::Held { reasons } = ready::found(&f) else {
+        panic!("found")
+    };
+    let reasons: Vec<Reason> = reasons
+        .into_iter()
+        .map(|r| Reason::person(common::handback::HumanOnly::MissingAccess, &r.what, &r.todo))
+        .collect();
+    let reasons = &reasons;
+    let d = Decision::Held {
+        reasons: reasons.clone(),
     };
     // The description says it at the top, with what to do.
     let body = ready::body_for(&f.body, &d).unwrap();
@@ -223,8 +234,8 @@ fn a_refused_mark_ready_is_tried_again_and_the_last_refusal_is_recorded() {
         "",
     )
     .unwrap();
-    assert!(failed.needs_person());
-    end.status = common::run_status::NEEDS_INPUT.into();
+    // GitHub refusing is CoderHelm's to try again, never a person's wait.
+    assert!(!failed.needs_person());
     end.said(failed.summary());
     assert!(end.says("couldn't mark it: GitHub didn't mark it ready (GitHub's rate limit)"));
     end.never_says(OLD);
@@ -243,7 +254,10 @@ fn the_sweep_heals_a_finished_run_left_a_draft_with_no_reason() {
         installation_id: 41,
         hold: None,
     };
-    assert_eq!(ready::sweep_step(&casualty, now), ready::SweepStep::Decide);
+    assert_eq!(
+        ready::sweep_step(&casualty, now, ""),
+        ready::SweepStep::Decide
+    );
     // A person's draft and a closed pull request are respected by the
     // decision it makes.
     let theirs = Facts {

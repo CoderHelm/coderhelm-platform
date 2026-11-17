@@ -115,7 +115,7 @@ The causes were in the loop, not only in prompt wording:
 
 Everything above except the model's own writing: the searches, section checks,
 word checks, definition parsing, diff checks and refusals are plain code with unit
-tests. `incidents::bx_smallest_change` replays both pull requests through the plan
+tests. `incidents::bz_smallest_change` replays both pull requests through the plan
 gate, the coder's guard, the habits check and the reviewer. The plans and diffs
 as they were are sent back; the small ones pass.
 

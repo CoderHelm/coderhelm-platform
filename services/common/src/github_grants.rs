@@ -138,6 +138,10 @@ pub fn label(permission: &str) -> &'static str {
         "statuses" => "Commit statuses",
         "deployments" => "Deployments",
         "actions" => "Actions",
+        "contents" => "Contents",
+        "pull_requests" => "Pull requests",
+        "issues" => "Issues",
+        "metadata" => "Metadata",
         "checks" => "Checks",
         "repository_advisories" => "Repository security advisories",
         "vulnerability_alerts" => "Dependabot alerts",
@@ -154,6 +158,142 @@ pub fn limit_note(permission: &str, instead: &str) -> String {
     format!(
         "{instead} because CoderHelm can't read {} on this installation; add {}: read to the GitHub App.",
         label(permission),
+        label(permission)
+    )
+}
+
+// ── A denial, as recorded ──────────────────────────────────────────────────
+
+/// Marks a line about a GitHub App permission the installation lacks as an
+/// install-level item: one for the install's admin, shown on the install's
+/// setup checks, never a per-pull-request hand-off.
+pub const INSTALL_LEVEL: &str = "(an install-level permission)";
+
+/// A concrete refusal GitHub sent: the API that answered, its status, and
+/// the permission it needs. The only way CoderHelm may say a permission is
+/// missing ("a permission only a person grants"): a claim without one is
+/// never made. Built only from an answer that came back, never from a
+/// request CoderHelm held for its own rate budget, a rate limit or a
+/// network error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Denial {
+    /// `POST /repos/{owner}/{repo}/actions/workflows/{file}/dispatches`,
+    /// with the owner and repository as GitHub named them.
+    pub api: String,
+    pub status: u16,
+    /// GitHub's permission key (`actions`).
+    pub permission: String,
+    /// `read` or `write`.
+    pub level: String,
+}
+
+const ANSWERED: &str = "GitHub answered ";
+
+impl Denial {
+    /// A denial from an answer: 403 or 404 that is a refusal for want of
+    /// permission ([`is_refusal`]), never a rate limit.
+    pub fn from_answer(
+        method: &str,
+        path: &str,
+        status: u16,
+        body: &Value,
+        permission: &str,
+        level: &str,
+    ) -> Option<Denial> {
+        if !matches!(status, 403 | 404) || !is_refusal(status, body) {
+            return None;
+        }
+        Self::new(method, path, status, permission, level)
+    }
+
+    /// A denial from a client error's text (`HTTP status client error (403
+    /// Forbidden) for url (https://api.github.com/...)`): the status and the
+    /// API are read from it. None for a request that was never sent (held
+    /// for the rate budget), a rate limit, or any other failure.
+    pub fn from_error(method: &str, err: &str, permission: &str, level: &str) -> Option<Denial> {
+        let l = err.to_ascii_lowercase();
+        if l.contains("not sent") || l.contains("rate limit") || l.contains("budget") {
+            return None;
+        }
+        let status = if l.contains("(403 forbidden)") {
+            403
+        } else if l.contains("(404 not found)") {
+            404
+        } else {
+            return None;
+        };
+        if status == 404 && !l.contains("resource not accessible by integration") {
+            // A 404 alone is a missing thing as often as a hidden one.
+            return None;
+        }
+        let at = err.find("https://api.github.com")?;
+        let rest = &err[at + "https://api.github.com".len()..];
+        let end = rest
+            .find(|c: char| c == ')' || c == '?' || c.is_whitespace())
+            .unwrap_or(rest.len());
+        Self::new(method, &rest[..end], status, permission, level)
+    }
+
+    fn new(method: &str, path: &str, status: u16, permission: &str, level: &str) -> Option<Denial> {
+        let path = path.trim();
+        if !path.starts_with('/') || permission.trim().is_empty() {
+            return None;
+        }
+        Some(Denial {
+            api: format!("{} {path}", method.trim().to_ascii_uppercase()),
+            status,
+            permission: permission.trim().to_string(),
+            level: if level == "write" { "write" } else { "read" }.to_string(),
+        })
+    }
+
+    /// The permission as GitHub's app settings name it (`Actions: write`).
+    pub fn needs(&self) -> String {
+        format!("{}: {}", label(&self.permission), self.level)
+    }
+
+    /// The recorded line: the API, its answer and the permission it needs.
+    /// [`Denial::parse`] reads it back.
+    pub fn line(&self) -> String {
+        format!(
+            "{ANSWERED}{} to `{}`: the GitHub App needs {}",
+            self.status,
+            self.api,
+            self.needs()
+        )
+    }
+
+    /// The denial a line records, if it records one (any case).
+    pub fn parse(text: &str) -> Option<(u16, String, String)> {
+        let l = text.to_ascii_lowercase();
+        let at = l.find(&ANSWERED.to_ascii_lowercase())?;
+        let rest = &l[at + ANSWERED.len()..];
+        let status: u16 = rest.get(..3)?.parse().ok()?;
+        if !matches!(status, 403 | 404) {
+            return None;
+        }
+        let api_start = rest.find('`')? + 1;
+        let api_len = rest[api_start..].find('`')?;
+        let api = rest[api_start..api_start + api_len].to_string();
+        if !api.contains(" /") {
+            return None;
+        }
+        let needs_at = rest.find("the github app needs ")? + "the github app needs ".len();
+        let needs = rest[needs_at..]
+            .split([';', '.', ','])
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        (needs.contains(':')).then_some((status, api, needs))
+    }
+}
+
+/// The one install-level item for a permission the installation lacks:
+/// what it limits, and who lifts it, once for the whole install.
+pub fn install_item(permission: &str, level: &str, limits: &str) -> String {
+    format!(
+        "the GitHub app needs {}: {level} to {limits}; an organization owner accepts the permission update once for the install {INSTALL_LEVEL}",
         label(permission)
     )
 }
@@ -240,5 +380,56 @@ mod tests {
             "Deploys are inferred from workflow names because CoderHelm can't read Deployments \
              on this installation; add Deployments: read to the GitHub App."
         );
+    }
+
+    #[test]
+    fn a_denial_needs_a_real_answer_on_a_named_api() {
+        let raw = "HTTP status client error (403 Forbidden) for url (https://api.github.com/repos/acme/site/actions/workflows/e2e.yml/dispatches): {\"message\":\"Resource not accessible by integration\"}";
+        let d = Denial::from_error("post", raw, "actions", "write").unwrap();
+        assert_eq!(
+            d.api,
+            "POST /repos/acme/site/actions/workflows/e2e.yml/dispatches"
+        );
+        assert_eq!(
+            d.line(),
+            "GitHub answered 403 to `POST /repos/acme/site/actions/workflows/e2e.yml/dispatches`: the GitHub App needs Actions: write"
+        );
+        let (status, api, needs) = Denial::parse(&d.line()).unwrap();
+        assert_eq!((status, needs.as_str()), (403, "actions: write"));
+        assert!(api.starts_with("post /repos/"));
+        // A request held for CoderHelm's own budget was never answered.
+        let held = "HTTP status client error (403 Forbidden) for url (https://api.github.com/repos/acme/site/issues/7/comments): not sent, what is left of GitHub's hourly budget is kept";
+        assert_eq!(Denial::from_error("GET", held, "issues", "read"), None);
+        // A rate limit, a timeout, or a plain 404 is no denial.
+        assert_eq!(Denial::from_error("GET", "HTTP status client error (403 Forbidden) for url (https://api.github.com/x): API rate limit exceeded", "actions", "read"), None);
+        assert_eq!(
+            Denial::from_error("GET", "operation timed out", "actions", "read"),
+            None
+        );
+        assert_eq!(Denial::from_error("GET", "HTTP status client error (404 Not Found) for url (https://api.github.com/repos/a/b/x)", "actions", "read"), None);
+        assert_eq!(
+            Denial::from_answer(
+                "GET",
+                "/repos/a/b/x",
+                403,
+                &serde_json::json!({"message": "API rate limit exceeded"}),
+                "actions",
+                "read"
+            ),
+            None
+        );
+        // Words alone record nothing.
+        assert_eq!(
+            Denial::parse("the app is not allowed to start workflows; grant Actions: write"),
+            None
+        );
+    }
+
+    #[test]
+    fn the_install_item_names_the_permission_once_for_the_install() {
+        let t = install_item("actions", "write", "start workflows with workflow_dispatch");
+        assert!(t.starts_with("the GitHub app needs Actions: write"), "{t}");
+        assert!(t.contains("organization owner accepts the permission update once"));
+        assert!(t.ends_with(INSTALL_LEVEL));
     }
 }

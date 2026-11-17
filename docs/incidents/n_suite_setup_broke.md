@@ -1,0 +1,5 @@
+# n. `n_suite_setup_broke`
+
+**What happened:** A review fix round finished every requested change, then ran the full test suite in the sandbox. The suite came from the CI workflow, and its `uses: astral-sh/setup-uv` step was written into the setup as words. The sandbox's `/bin/sh` failed on a "(" (exit 2, no counts), and the round was held as "Full test suite FAILED". The test loop the requester named never ran.
+
+**The guarantee:** A `uses:` step becomes real shell or is left out with a note, never words. The suite runs under bash after `bash -n`, with its setup and its tests marked apart. A command CoderHelm built that breaks before any test runs (not valid bash, a missing tool, a failed setup, exit 2 within seconds with no counts) is CoderHelm's own failure. The round then tries the requester's command, the repository's instructions, and the simplest test command, in that order. When none runs, the fix lands and the description says plainly that the tests didn't run in the sandbox and why. A command the requester named runs first and is quoted in the result. Tests that ran and failed still hold the fix.

@@ -1,0 +1,5 @@
+# as. `as_infra_closed_pr_keeps_record`
+
+**What happened:** The same gap as `ap` in the other store. An infrastructure finding keeps its own record and nothing released it: after a person closed its fix pull request the record stayed `pr_open`, so the Infrastructure tab kept the closed pull request and never offered "Open fix PR" again; a cancelled or failed fix run left the record `fixing` for good; a reopened pull request was never noticed.
+
+**The guarantee:** Infrastructure records go through the same reconciliation as dependency findings (one `reconcile` over `common::security_release::Claim`, not a copy): the same reads of GitHub and the run records, events, sweep bounds, person-closed record, holds and Retry. What is this store's own stays: a merge never closes a finding (only a read of the account does), a pull request the replacement guard made a draft is not closed and is left as it is, a finding on its runbook stays there until its code or target changes, a pull request is recorded only after the guard read it, and a fix round that ends without settling its pull request becomes the guard's second step (a draft), never a ready pull request.
