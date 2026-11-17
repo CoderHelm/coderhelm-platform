@@ -15,13 +15,13 @@
 //! ([`ParsedTest::id`]), and [`pick`] chooses the tests that show the change:
 //! a test the change edits, a test the repository's test map ties to the
 //! changed files, or a test whose name shares a word with a changed UI file.
-//! The worker keeps the images in the install's own bucket
-//! ([`object_key`]); the description links them with a signed link
-//! ([`sign`]) that the API serves at [`LINK_PATH`] until it expires.
+//! The worker commits the images to the ref CoderHelm keeps its pull
+//! request screenshots on in the repository itself (`refs/coderhelm/screenshots`,
+//! next to the preview's page captures, at [`ref_path`]) and links them by
+//! commit, so only people who can read the repository see them.
 
-use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
-use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -31,14 +31,6 @@ use super::model::{test_id, Framework, HistoryEntry, Outcome, ParsedTest};
 
 /// Largest image kept.
 pub const MAX_IMAGE: usize = 5 * 1024 * 1024;
-/// Where the images are kept in the install's bucket.
-pub const KEY_PREFIX: &str = "e2e-shots";
-/// How long an image link works (the bucket keeps the images a little
-/// longer, see `infra/lib/storage-stack.ts`).
-pub const LINK_VALID_SECS: i64 = 365 * 86_400;
-/// The path the API serves an image at.
-pub const LINK_PATH: &str = "/webhooks/ci/tests/screenshot";
-const MAX_TOKEN_LEN: usize = 2048;
 
 /// One test's screenshot in one report.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -503,8 +495,9 @@ pub fn pick<'a>(
 /// One side of the table: the kept image and the run it came from.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Side {
-    /// The image's key in the install's bucket.
-    pub key: String,
+    /// The image's address on the screenshots ref, at the commit that
+    /// added it.
+    pub src: String,
     /// The run's page; empty for an upload with no run page.
     #[serde(default)]
     pub run_url: String,
@@ -525,9 +518,6 @@ pub struct Kept {
     pub before: Option<Side>,
     /// The test on the head.
     pub after: Side,
-    /// When the links stop working (unix seconds); fixed when kept, so the
-    /// description is the same text on every rebuild.
-    pub expires_at: i64,
 }
 
 fn md_link(text: &str, url: &str) -> String {
@@ -538,8 +528,8 @@ fn md_link(text: &str, url: &str) -> String {
     }
 }
 
-/// The table for `k`; `link` gives an image's link from its key.
-pub fn screens(k: &Kept, link: impl Fn(&str) -> String) -> crate::pr_body::Screens {
+/// The Before and After table for `k`.
+pub fn screens(k: &Kept) -> crate::pr_body::Screens {
     let test = k.test.replace('`', "'");
     let base: &str = if k.base.is_empty() {
         "the base branch"
@@ -548,7 +538,7 @@ pub fn screens(k: &Kept, link: impl Fn(&str) -> String) -> crate::pr_body::Scree
     };
     let (before, before_alt) = match &k.before {
         Some(s) => (
-            link(&s.key),
+            s.src.clone(),
             format!("{test} on {base}, before this change"),
         ),
         None => (
@@ -569,7 +559,7 @@ pub fn screens(k: &Kept, link: impl Fn(&str) -> String) -> crate::pr_body::Scree
     crate::pr_body::Screens::Images {
         before,
         before_alt,
-        after: link(&k.after.key),
+        after: k.after.src.clone(),
         after_alt: format!("{test} on this head"),
         caption: format!(
             "Screenshots of the end-to-end test `{test}`, chosen because {}: {runs}.",
@@ -586,102 +576,26 @@ pub fn newest_passing<'a>(history: &'a [HistoryEntry], branch: &str) -> Option<&
     })
 }
 
-/// The key an image of test `test` from run `run` is kept under in the
-/// install's bucket; two tests or two runs never share one.
-#[allow(clippy::too_many_arguments)]
-pub fn object_key(
-    team: &str,
-    repo: &str,
-    pr: u64,
-    sha: &str,
-    run: &str,
-    test: &str,
-    side: &str,
-    ext: &str,
-) -> String {
+/// Where an image of test `test` from run `run` is kept on the screenshots
+/// ref, beside the preview's captures of the same head (`pr-<n>/<head>/`);
+/// two tests or two runs never share a path.
+pub fn ref_path(pr: u64, sha: &str, run: &str, test: &str, side: &str, ext: &str) -> String {
     let test = hex::encode(Sha256::digest(test.as_bytes()));
+    let run: String = run
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
     format!(
-        "{KEY_PREFIX}/{}/{repo}/{pr}/{}/{run}/{}/{side}.{ext}",
-        team_folder(team),
+        "pr-{pr}/{}/e2e-{}-{run}-{side}.{ext}",
         sha.get(..12).unwrap_or(sha),
         &test[..16]
     )
-}
-
-fn team_folder(team: &str) -> String {
-    team.replace(['#', '/'], "_")
-}
-
-// ── Signed links ──────────────────────────────────────────────────────────
-
-type HmacSha256 = Hmac<Sha256>;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TokenError {
-    Malformed,
-    BadSignature,
-    Expired,
-}
-
-fn mac(secret: &str, payload: &str) -> HmacSha256 {
-    // A key for screenshot links only, so a link never stands in for a
-    // session or for any other signed link.
-    let mut kdf = HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC takes any key");
-    kdf.update(b"coderhelm/e2e-screenshot/v1");
-    let key = kdf.finalize().into_bytes();
-    let mut m = HmacSha256::new_from_slice(&key).expect("HMAC takes any key");
-    m.update(payload.as_bytes());
-    m
-}
-
-/// A token that reads one kept image of one team until `expires_at`. The
-/// token is `base64url(team \n key \n expiry) . base64url(HMAC-SHA256)`.
-pub fn sign(secret: &str, team: &str, key: &str, expires_at: i64) -> String {
-    let payload = format!("{team}\n{key}\n{expires_at}");
-    let sig = mac(secret, &payload).finalize().into_bytes();
-    format!(
-        "{}.{}",
-        URL_SAFE_NO_PAD.encode(payload.as_bytes()),
-        URL_SAFE_NO_PAD.encode(sig)
-    )
-}
-
-/// The image key a token reads, if it is genuine, current, and names one of
-/// its own team's kept images.
-pub fn verify(secret: &str, token: &str, now: i64) -> Result<String, TokenError> {
-    if token.is_empty() || token.len() > MAX_TOKEN_LEN {
-        return Err(TokenError::Malformed);
-    }
-    let (body, sig) = token.split_once('.').ok_or(TokenError::Malformed)?;
-    let payload = URL_SAFE_NO_PAD
-        .decode(body)
-        .ok()
-        .and_then(|b| String::from_utf8(b).ok())
-        .ok_or(TokenError::Malformed)?;
-    let sig = URL_SAFE_NO_PAD
-        .decode(sig)
-        .map_err(|_| TokenError::Malformed)?;
-    mac(secret, &payload)
-        .verify_slice(&sig)
-        .map_err(|_| TokenError::BadSignature)?;
-    let p: Vec<&str> = payload.split('\n').collect();
-    let [team, key, exp] = p.as_slice() else {
-        return Err(TokenError::Malformed);
-    };
-    let exp: i64 = exp.parse().map_err(|_| TokenError::Malformed)?;
-    let own = format!("{KEY_PREFIX}/{}/", team_folder(team));
-    if team.is_empty() || !key.starts_with(&own) || key.split('/').any(|s| s == "..") {
-        return Err(TokenError::Malformed);
-    }
-    if now >= exp {
-        return Err(TokenError::Expired);
-    }
-    Ok(key.to_string())
-}
-
-/// The link for a token on this deployment's API.
-pub fn url(api: &str, token: &str) -> String {
-    format!("{}{LINK_PATH}?t={token}", api.trim_end_matches('/'))
 }
 
 #[cfg(test)]
@@ -868,16 +782,15 @@ mod tests {
             why: Why::Named("checkout".into()).words(),
             base: "main".into(),
             before: Some(Side {
-                key: "e2e-shots/T/o/r/7/abc/before.png".into(),
+                src: "https://github.com/o/r/blob/c1/pr-7/abc/e2e-x-1-1-before.png?raw=true".into(),
                 run_url: "https://github.com/o/r/actions/runs/1".into(),
             }),
             after: Side {
-                key: "e2e-shots/T/o/r/7/abc/after.png".into(),
+                src: "https://github.com/o/r/blob/c1/pr-7/abc/e2e-x-2-1-after.png?raw=true".into(),
                 run_url: "https://github.com/o/r/actions/runs/2".into(),
             },
-            expires_at: 10,
         };
-        let s = screens(&k, |key| format!("https://api.example.com/x?k={key}"));
+        let s = screens(&k);
         let crate::pr_body::Screens::Images {
             before,
             after,
@@ -888,20 +801,17 @@ mod tests {
         else {
             panic!("images");
         };
-        assert!(before.ends_with("before.png"));
-        assert!(after.ends_with("after.png"));
+        assert!(before.ends_with("before.png?raw=true"));
+        assert!(after.ends_with("after.png?raw=true"));
         assert_eq!(after_alt, "Checkout › pays by 'card' on this head");
         assert_eq!(
             caption,
             "Screenshots of the end-to-end test `Checkout › pays by 'card'`, chosen because the test and a changed UI file share the word \"checkout\": [main's run](https://github.com/o/r/actions/runs/1), [this head's run](https://github.com/o/r/actions/runs/2)."
         );
-        let none = screens(
-            &Kept {
-                before: None,
-                ..k.clone()
-            },
-            |key| key.to_string(),
-        );
+        let none = screens(&Kept {
+            before: None,
+            ..k.clone()
+        });
         let crate::pr_body::Screens::Images {
             before, before_alt, ..
         } = none
@@ -916,52 +826,26 @@ mod tests {
     }
 
     #[test]
-    fn a_link_reads_one_image_of_its_own_team_until_it_expires() {
-        let key = object_key(
-            "TEAM#a",
-            "o/r",
-            7,
-            "0123456789abcdef",
-            "12-1",
-            "t",
-            "after",
-            "png",
-        );
+    fn each_test_and_run_has_its_own_path_beside_the_preview_captures() {
+        let path = ref_path(7, "0123456789abcdef", "12-1", "t", "after", "png");
         // sha256("t") = e3b98a4da31a127d...
         assert_eq!(
-            key,
-            "e2e-shots/TEAM_a/o/r/7/0123456789ab/12-1/e3b98a4da31a127d/after.png"
+            path,
+            "pr-7/0123456789ab/e2e-e3b98a4da31a127d-12-1-after.png"
         );
-        let other = |run: &str, test: &str| {
-            object_key(
-                "TEAM#a",
-                "o/r",
-                7,
-                "0123456789abcdef",
-                run,
-                test,
-                "after",
-                "png",
-            )
-        };
-        assert_ne!(key, other("12-1", "u"));
-        assert_ne!(key, other("13-1", "t"));
-        let t = sign("s", "TEAM#a", &key, 100);
-        assert_eq!(verify("s", &t, 99), Ok(key.clone()));
-        assert_eq!(verify("s", &t, 100), Err(TokenError::Expired));
-        assert_eq!(verify("other", &t, 99), Err(TokenError::BadSignature));
-        // Signed, but for another team's image or anything else in the bucket.
-        let theirs = sign("s", "TEAM#a", "e2e-shots/TEAM_b/o/r/1/x/after.png", 100);
-        assert_eq!(verify("s", &theirs, 99), Err(TokenError::Malformed));
-        let raw = sign("s", "TEAM#a", "e2e/TEAM_a/o/r/raw/1-1/report.json", 100);
-        assert_eq!(verify("s", &raw, 99), Err(TokenError::Malformed));
-        let up = sign("s", "TEAM#a", "e2e-shots/TEAM_a/../../secret", 100);
-        assert_eq!(verify("s", &up, 99), Err(TokenError::Malformed));
-        // An unsubscribe token never reads an image.
-        let u = crate::unsubscribe::sign("s", "TEAM#a", "USER#1", "weekly_summary", 100);
-        assert!(verify("s", &u, 99).is_err());
-        assert!(url("https://api.example.com/", &t)
-            .starts_with("https://api.example.com/webhooks/ci/tests/screenshot?t="));
+        assert_ne!(
+            path,
+            ref_path(7, "0123456789abcdef", "12-1", "u", "after", "png")
+        );
+        assert_ne!(
+            path,
+            ref_path(7, "0123456789abcdef", "13-1", "t", "after", "png")
+        );
+        // An upload's run key is kept to letters, digits and dashes.
+        assert_eq!(
+            ref_path(7, "0123456789abcdef", "up-9/../x", "t", "before", "jpg"),
+            "pr-7/0123456789ab/e2e-e3b98a4da31a127d-up-9____x-before.jpg"
+        );
     }
 
     #[test]
@@ -996,8 +880,7 @@ mod tests {
             base: "develop".into(),
             ..Default::default()
         };
-        let crate::pr_body::Screens::Images { before_alt, .. } = screens(&k, |key| key.into())
-        else {
+        let crate::pr_body::Screens::Images { before_alt, .. } = screens(&k) else {
             panic!("images");
         };
         assert_eq!(

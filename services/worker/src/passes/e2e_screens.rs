@@ -7,12 +7,14 @@
 //! one with a screenshot on the head is kept with its screenshot from the
 //! newest passing run on the pull request's base branch, when one is kept
 //! there too.
-//! The images go to the install's own bucket, the record to the settings
-//! table for the head, and the description is rebuilt: its table links each
-//! image through the API with a signed link that expires
-//! ([`screens_for`]). A head keeps the first pair found: each run keeps its
-//! images under its own keys, then saves the head's record only when none
-//! is there, so a later or concurrent run on the same head changes nothing.
+//! The images are committed to the screenshots ref in the repository
+//! (`preview::SHOTS_REF`, next to the preview's page captures) and linked
+//! by commit, so only people who can read the repository see them; the
+//! record goes to the settings table for the head and the description is
+//! rebuilt, the pair under the preview's pages ([`screens_for`]). A head
+//! keeps the first pair found: each run commits its images under its own
+//! paths, then saves the head's record only when none is there, so a later
+//! or concurrent run on the same head changes nothing.
 
 use std::collections::HashMap;
 
@@ -31,6 +33,9 @@ use crate::WorkerState;
 
 /// Tests tried for a screenshot on the head.
 const MAX_TRIED: usize = 3;
+/// How long the record of a head is kept: the description of an open pull
+/// request is rebuilt from it.
+const RECORD_DAYS: i64 = 365;
 
 fn record_sk(repo: &str, sha: &str) -> String {
     format!("E2E_SHOTS#{repo}#{sha}")
@@ -51,8 +56,8 @@ pub async fn load(state: &WorkerState, team_id: &str, repo: &str, sha: &str) -> 
 }
 
 /// Saves the record of a head unless one is there; whether this one is.
-/// The record lives as long as its links work.
 async fn claim(state: &WorkerState, team_id: &str, repo: &str, sha: &str, k: &Kept) -> bool {
+    let ttl = (chrono::Utc::now() + chrono::Duration::days(RECORD_DAYS)).timestamp();
     match state
         .dynamo
         .put_item()
@@ -63,7 +68,7 @@ async fn claim(state: &WorkerState, team_id: &str, repo: &str, sha: &str, k: &Ke
             "data",
             super::attr_s(&serde_json::to_string(k).unwrap_or_default()),
         )
-        .item("ttl", AttributeValue::N(k.expires_at.to_string()))
+        .item("ttl", AttributeValue::N(ttl.to_string()))
         .condition_expression("attribute_not_exists(sk)")
         .send()
         .await
@@ -84,24 +89,16 @@ async fn claim(state: &WorkerState, team_id: &str, repo: &str, sha: &str, k: &Ke
 }
 
 /// The Before and After table for a pull request's head, when a run on it
-/// kept screenshots. `None` without a signing secret or a public API
-/// address: GitHub fetches the images from the API, so a link must reach
-/// it.
+/// kept screenshots.
 pub async fn screens_for(
     state: &WorkerState,
     team_id: &str,
     repo: &str,
     sha: &str,
 ) -> Option<common::pr_body::Screens> {
-    let secret = state.secrets.jwt_secret.as_str();
-    let api = common::public_urls::api_url(&state.config.stage);
-    if secret.is_empty() || !api.starts_with("https://") {
-        return None;
-    }
-    let k = load(state, team_id, repo, sha).await?;
-    Some(shots::screens(&k, |key| {
-        shots::url(api, &shots::sign(secret, team_id, key, k.expires_at))
-    }))
+    load(state, team_id, repo, sha)
+        .await
+        .map(|k| shots::screens(&k))
 }
 
 /// Report files held in memory: an uploaded report, or the raw reports kept
@@ -238,29 +235,6 @@ async fn images(
     out
 }
 
-/// Keeps one image in the install's bucket under `key`; whether it was.
-async fn put(state: &WorkerState, key: &str, bytes: Vec<u8>) -> bool {
-    let Some(content_type) = shots::image_type(&bytes) else {
-        return false;
-    };
-    match state
-        .s3
-        .put_object()
-        .bucket(&state.config.bucket_name)
-        .key(key)
-        .content_type(content_type)
-        .body(bytes.into())
-        .send()
-        .await
-    {
-        Ok(_) => true,
-        Err(e) => {
-            warn!(error = %e, "Could not keep an end-to-end screenshot");
-            false
-        }
-    }
-}
-
 /// Everything a run on a pull request's head brings for its table.
 pub struct Head<'a> {
     pub msg: &'a TestIngest,
@@ -290,7 +264,7 @@ pub async fn keep(
     let msg = h.msg;
     let (owner, name) = (msg.repo_owner.as_str(), msg.repo_name.as_str());
     let repo = format!("{owner}/{name}");
-    if state.secrets.jwt_secret.is_empty() || msg.head_sha.is_empty() {
+    if msg.head_sha.is_empty() {
         return;
     }
     if load(state, &msg.team_id, &repo, &msg.head_sha)
@@ -329,20 +303,20 @@ pub async fn keep(
     let location = location.as_ref();
     // Where the team keeps the repository's reports, else the run's
     // artifacts: the same places the failure attribution reads.
-    let open = |run_id: u64| async move {
+    let open = |run_id: u64, attempt: u32| async move {
         if let Some(l @ Location::S3 { .. }) = location {
             let mut tried = Vec::new();
             if let Some(r) = super::test_fix::open_s3(state, &msg.team_id, l, &mut tried).await {
                 return Source::S3(Box::new(r));
             }
         }
-        Source::Ci(CiReports::new(gh, owner, name, vec![(run_id, 1)]))
+        Source::Ci(CiReports::new(gh, owner, name, vec![(run_id, attempt)]))
     };
     // The head's run.
     let head = if msg.upload_key.is_some() {
         Source::Held(Held(h.reports.to_vec()))
     } else {
-        open(msg.run_id).await
+        open(msg.run_id, msg.run_attempt).await
     };
     let tried: Vec<&(&ParsedTest, shots::Why)> = picked.iter().take(MAX_TRIED).collect();
     let ids: Vec<String> = tried.iter().map(|(t, _)| t.id()).collect();
@@ -372,7 +346,7 @@ pub async fn keep(
             )
         } else if let Some((run_id, attempt)) = run_of(&e.run_key) {
             (
-                open(run_id).await,
+                open(run_id, attempt).await,
                 run_id,
                 attempt,
                 format!("https://github.com/{repo}/actions/runs/{run_id}"),
@@ -385,11 +359,11 @@ pub async fn keep(
             .remove(&t.id())
             .map(|b| (b, run_url));
     }
-    let key_of = |side: &str, bytes: &[u8]| {
+    // Both images in one commit on the screenshots ref, each at a path of
+    // its own test and run.
+    let path_of = |side: &str, bytes: &[u8]| {
         shots::image_type(bytes).map(|ct| {
-            shots::object_key(
-                &msg.team_id,
-                &repo,
+            shots::ref_path(
                 h.pr,
                 &msg.head_sha,
                 h.run_key,
@@ -399,33 +373,44 @@ pub async fn keep(
             )
         })
     };
-    let Some(after_key) = key_of("after", &after_bytes) else {
+    let Some(after_path) = path_of("after", &after_bytes) else {
         return;
     };
-    let before = before.and_then(|(b, run_url)| key_of("before", &b).map(|key| (b, key, run_url)));
+    let before = before.and_then(|(b, run_url)| path_of("before", &b).map(|p| (b, p, run_url)));
+    let mut files = vec![(after_path.clone(), after_bytes)];
+    if let Some((b, p, _)) = &before {
+        files.push((p.clone(), b.clone()));
+    }
+    let short = msg.head_sha.get(..12).unwrap_or(&msg.head_sha);
+    let commit = match super::preview::keep_on_ref(
+        gh,
+        owner,
+        name,
+        &format!("End-to-end screenshots of #{} at {short}", h.pr),
+        &files,
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(error = %e, repo = %repo, pr = h.pr, "Could not keep the end-to-end screenshots on the screenshots ref");
+            return;
+        }
+    };
     let kept = Kept {
         pr: h.pr,
         test: t.full_title(),
         why: why.words(),
         base,
-        before: before.as_ref().map(|(_, key, run_url)| Side {
-            key: key.clone(),
-            run_url: run_url.clone(),
+        before: before.map(|(_, path, run_url)| Side {
+            src: super::preview::image_url(owner, name, &commit, &path),
+            run_url,
         }),
         after: Side {
-            key: after_key.clone(),
+            src: super::preview::image_url(owner, name, &commit, &after_path),
             run_url: msg.html_url.clone(),
         },
-        expires_at: chrono::Utc::now().timestamp() + shots::LINK_VALID_SECS,
     };
-    if !put(state, &after_key, after_bytes).await {
-        return;
-    }
-    if let Some((b, key, _)) = before {
-        if !put(state, &key, b).await {
-            return;
-        }
-    }
     if !claim(state, &msg.team_id, &repo, &msg.head_sha, &kept).await {
         return;
     }

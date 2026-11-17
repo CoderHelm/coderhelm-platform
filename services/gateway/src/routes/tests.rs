@@ -1382,66 +1382,6 @@ pub async fn ci_quarantine(
     }))
 }
 
-#[derive(Deserialize)]
-pub struct ShotQuery {
-    #[serde(default)]
-    t: String,
-}
-
-/// GET /webhooks/ci/tests/screenshot?t= — one end-to-end screenshot kept for
-/// the Before and After table of CoderHelm's own pull request
-/// (`common::e2e::shots`). Public, because GitHub fetches the image for the
-/// pull request's readers: the signed token is the credential, and it names
-/// one image of one team until it expires. Anything else is a 404 that says
-/// nothing.
-pub async fn ci_screenshot(
-    State(state): State<Arc<AppState>>,
-    Query(q): Query<ShotQuery>,
-) -> axum::response::Response {
-    use axum::http::header;
-    use axum::response::IntoResponse;
-    use common::e2e::shots;
-    let not_found = || (StatusCode::NOT_FOUND, "Not found").into_response();
-    let secret = state.secrets.jwt_secret.as_str();
-    if secret.is_empty() {
-        return not_found();
-    }
-    let key = match shots::verify(secret, q.t.trim(), chrono::Utc::now().timestamp()) {
-        Ok(k) => k,
-        Err(e) => {
-            info!(reason = ?e, "Screenshot link refused");
-            return not_found();
-        }
-    };
-    let Ok(obj) = state
-        .s3
-        .get_object()
-        .bucket(&state.config.bucket_name)
-        .key(&key)
-        .send()
-        .await
-    else {
-        return not_found();
-    };
-    let Ok(body) = obj.body.collect().await else {
-        return not_found();
-    };
-    let bytes = body.into_bytes();
-    let Some(content_type) = shots::image_type(&bytes) else {
-        return not_found();
-    };
-    (
-        StatusCode::OK,
-        [
-            (header::CONTENT_TYPE, content_type),
-            (header::CACHE_CONTROL, "public, max-age=86400"),
-            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
-        ],
-        bytes,
-    )
-        .into_response()
-}
-
 #[cfg(test)]
 mod unit {
     use super::*;

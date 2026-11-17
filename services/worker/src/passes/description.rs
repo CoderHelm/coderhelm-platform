@@ -663,9 +663,7 @@ impl Gathered {
         super::description_facts::with_preview(&mut f, preview);
         super::description_facts::with_scope(&mut f, self.run.scope.as_ref(), &self.files);
         f.waiting = self.run.waiting.clone();
-        if self.screens.is_some() {
-            f.screens = self.screens.clone();
-        }
+        f.e2e_screens = self.screens.clone();
         f
     }
 }

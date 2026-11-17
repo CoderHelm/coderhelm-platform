@@ -3278,15 +3278,20 @@ impl GitHubClient {
         Ok(out)
     }
 
-    /// Points a ref outside `refs/heads/` (no workflow starts on it) at
-    /// `sha`, creating it when it doesn't exist. Only for CoderHelm's own
-    /// refs, such as the one its pull request screenshots are kept on.
-    pub async fn set_own_ref(
+    /// Moves a ref outside `refs/heads/` (no workflow starts on it; only for
+    /// CoderHelm's own refs, such as the one its pull request screenshots
+    /// are kept on) from `from` to `to` without force: GitHub refuses the
+    /// move when the ref no longer points at an ancestor of `to`, so a
+    /// commit another writer put on it in the meantime is never dropped.
+    /// With `from` `None` the ref is
+    /// created, and creating one that exists is refused the same way.
+    pub async fn advance_own_ref(
         &self,
         owner: &str,
         repo: &str,
         name: &str,
-        sha: &str,
+        from: Option<&str>,
+        to: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let name = name.trim_start_matches("refs/");
         if name.starts_with("heads/") || name.starts_with("tags/") || !name.contains('/') {
@@ -3294,21 +3299,22 @@ impl GitHubClient {
                 format!("`refs/{name}` is not a ref CoderHelm keeps its own files on").into(),
             );
         }
-        let patched = self
-            .patch(
-                &format!("{API_BASE}/repos/{owner}/{repo}/git/refs/{name}"),
-                &serde_json::json!({"sha": sha, "force": true}),
-            )
-            .await;
-        if patched.is_ok() {
-            return Ok(());
+        match from {
+            Some(_) => self
+                .patch(
+                    &format!("{API_BASE}/repos/{owner}/{repo}/git/refs/{name}"),
+                    &serde_json::json!({"sha": to, "force": false}),
+                )
+                .await
+                .map(|_| ()),
+            None => self
+                .post(
+                    &format!("{API_BASE}/repos/{owner}/{repo}/git/refs"),
+                    &serde_json::json!({"ref": format!("refs/{name}"), "sha": to}),
+                )
+                .await
+                .map(|_| ()),
         }
-        self.post(
-            &format!("{API_BASE}/repos/{owner}/{repo}/git/refs"),
-            &serde_json::json!({"ref": format!("refs/{name}"), "sha": sha}),
-        )
-        .await
-        .map(|_| ())
     }
 
     /// The commit a ref outside `refs/heads/` points at, if it exists.
