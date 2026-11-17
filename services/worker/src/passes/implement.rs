@@ -203,6 +203,11 @@ pub async fn run(
     if let Some(run_id) = run_id {
         super::run_guard::check(state, &msg.team_id, run_id).await?;
     }
+    // A person's lines on the branch stay theirs (`GitHubClient::
+    // hold_for_people`) unless a person asked for this round: their ask is
+    // their answer.
+    let _person_asked =
+        github.person_asked_round(round_for == super::write_guard::RoundFor::PersonAsk);
     let rules_block = super::format_rules_block(rules);
     // Trim repo instructions for simple issues to reduce per-turn token cost
     let trimmed_instructions = if complexity == "simple" && repo_instructions.len() > 2000 {
@@ -1282,6 +1287,9 @@ pub async fn run(
         lines if lines.is_empty() => closing.trim().to_string(),
         lines => format!("{}\n{lines}", closing.trim()),
     };
+    // A file this round (or the rounds before it) changed and then put
+    // back leaves no commit of its own on the pull request.
+    super::round::fold_churn(github, &msg.repo_owner, &msg.repo_name, branch).await;
     Ok(ImplementResult {
         files_modified: files,
         timed_out,

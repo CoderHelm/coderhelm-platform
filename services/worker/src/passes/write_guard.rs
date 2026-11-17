@@ -60,9 +60,17 @@ pub const REASON_INPUT: &str = "outside_plan";
 /// round may edit and how the files its instructions name are read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoundFor {
-    /// The build of the plan (the first pass, a continuation, a dependency
-    /// or generator run): any file.
+    /// A dependency or generator run: the files it touches are the
+    /// tool's, not a plan's, so any file.
     Build,
+    /// The build of the plan (the first pass, a continuation, the tasks a
+    /// build left): the files its tasks name, their tests and module
+    /// files. Any other existing file is refused until the call says why
+    /// the change needs it, and that reason is added to what the plan
+    /// changes (the pull request lists it). A plan that names no file has
+    /// no boundary. The build once rewrote twelve files no task named;
+    /// a round later put each one back, a commit apiece.
+    PlanTasks,
     /// A person asked (a review, a comment): their ask is the
     /// authorization, any file.
     PersonAsk,
@@ -125,7 +133,8 @@ impl RoundFor {
     /// What the round was started for, in the refusal's words.
     pub fn what(self) -> &'static str {
         match self {
-            RoundFor::Build => "the plan",
+            RoundFor::Build => "the dependency or generator run",
+            RoundFor::PlanTasks => "the plan's tasks",
             RoundFor::PersonAsk => "a person's request",
             RoundFor::AppBug => "the bug the tests showed",
             RoundFor::FeatureRules => "the new-feature rules",
@@ -259,6 +268,11 @@ impl Scope {
             }
         }
         s
+    }
+
+    /// Whether the plan names any file or folder of this repository.
+    pub fn has_plan(&self) -> bool {
+        !self.plan.is_empty() || !self.plan_dirs.is_empty()
     }
 
     /// Every file the scope names (not its directories).
@@ -623,11 +637,23 @@ impl ScopeGuard {
         own_repo: &str,
         reason: &str,
     ) -> Self {
-        if !round.bounded() || pr_files.is_empty() || pr_files.len() >= MAX_TRUSTED_SCOPE_FILES {
+        if !round.bounded() || pr_files.len() >= MAX_TRUSTED_SCOPE_FILES {
+            return Self::unscoped();
+        }
+        let scope = Scope::of(round, pr_files, plan, own_repo, reason);
+        // The build of the plan is anchored by the plan's files, even
+        // before the branch changes any; every other round by the pull
+        // request's.
+        let anchored = if round == RoundFor::PlanTasks {
+            scope.has_plan()
+        } else {
+            !pr_files.is_empty()
+        };
+        if !anchored {
             return Self::unscoped();
         }
         Self {
-            scope: Some((round, Scope::of(round, pr_files, plan, own_repo, reason))),
+            scope: Some((round, scope)),
             ..Self::unscoped()
         }
     }
@@ -815,8 +841,9 @@ mod scope_guard_tests {
     const TASKS: &str = "- [x] apps/web/src/routes/gift.tsx: [create] The gift route\n\
                          - [ ] apps/web/src/lib/metadata.ts: [modify] Page metadata for the gift route\n";
 
-    const ROUNDS: [RoundFor; 13] = [
+    const ROUNDS: [RoundFor; 14] = [
         RoundFor::Build,
+        RoundFor::PlanTasks,
         RoundFor::PersonAsk,
         RoundFor::AppBug,
         RoundFor::FeatureRules,

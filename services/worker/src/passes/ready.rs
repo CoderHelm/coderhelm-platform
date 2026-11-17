@@ -1379,6 +1379,11 @@ async fn make_ready(ctx: &Ctx<'_>, f: &Facts) -> Result<(), Refused> {
     if let Some(clean) = f.title.strip_prefix("⚠️ Partial: ") {
         let _ = gh.update_pr_title(ctx.owner, ctx.repo, ctx.pr, clean).await;
     }
+    // A file changed and put back never leaves commits of its own, even
+    // when a person's commit keeps the whole history from being squashed.
+    if let Some(head) = pr["head"]["ref"].as_str() {
+        super::round::fold_churn(gh, ctx.owner, ctx.repo, head).await;
+    }
     // Final squash: the run's whole history (the implementation and every
     // fix round) as one clean commit, best-effort.
     if let (Some(keep_first), Some(head), Some(base)) = (

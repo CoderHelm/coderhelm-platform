@@ -754,6 +754,10 @@ Rules:
     // Correct a stale stored base so the rest of the system stays consistent.
     heal_run_base_branch(state, &msg, &base).await;
     let ci_only = comments.is_empty() && msg.review_body.trim().is_empty();
+    // A person's lines on the branch stay theirs (`GitHubClient::
+    // hold_for_people`) in a round CoderHelm started; a person's comment or
+    // review is their answer, so their round may change them.
+    let _person_asked = github.person_asked_round(!ci_only);
     // The PR's changed files: the scope of a CI-only cycle, and what the
     // team's always-applied skills scoped to paths are matched against.
     let pr_files = github
@@ -1341,6 +1345,7 @@ Rules:
             .await;
         }
         let head = if fix_pushed {
+            super::round::fold_churn(&github, &msg.repo_owner, &msg.repo_name, &branch).await;
             super::round::branch_head(&github, &msg.repo_owner, &msg.repo_name, &branch).await
         } else {
             String::new()

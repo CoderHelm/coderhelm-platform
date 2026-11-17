@@ -437,6 +437,44 @@ pub fn revert_for(heads: &[(String, bool)], done: &[(String, String)], reverts: 
     }
 }
 
+/// One commit of a pull request after the green head a revert goes back
+/// to.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AfterGreen {
+    /// CoderHelm made it.
+    pub own: bool,
+    /// It merges another branch (the base brought up to date).
+    pub merge: bool,
+    pub files: Vec<String>,
+}
+
+/// The files a revert to the last green head may put back: the ones
+/// CoderHelm's own commits after it changed. A file a merge of the base
+/// brought in is the base's: putting it back to the green head's version
+/// writes old base code into the pull request (a revert once did that to
+/// twelve unrelated files, and the scope check then spent a round putting
+/// each one back to the base, a commit apiece). A file only a person
+/// changed is theirs. A file both CoderHelm and a merge changed can't be
+/// taken apart file by file, so it stays.
+pub fn own_revert_paths(changed: &[String], after: &[AfterGreen]) -> Vec<String> {
+    use std::collections::HashSet;
+    let own: HashSet<&str> = after
+        .iter()
+        .filter(|c| c.own && !c.merge)
+        .flat_map(|c| c.files.iter().map(String::as_str))
+        .collect();
+    let merged: HashSet<&str> = after
+        .iter()
+        .filter(|c| c.merge)
+        .flat_map(|c| c.files.iter().map(String::as_str))
+        .collect();
+    changed
+        .iter()
+        .filter(|p| own.contains(p.as_str()) && !merged.contains(p.as_str()))
+        .cloned()
+        .collect()
+}
+
 // ── The ending ──────────────────────────────────────────────────────────────
 
 /// What a run's ending is decided from.
