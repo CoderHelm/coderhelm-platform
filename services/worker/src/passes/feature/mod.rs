@@ -25,8 +25,8 @@
 //!    tests per acceptance case, the spec and its test map entry, test
 //!    packages outside the workspace, repeat runs and responsive checks,
 //!    with counts in the pull request; a failing item keeps it a draft.
-//! 8. **Open product questions** ([`questions`]): raised in the pull request,
-//!    never decided.
+//! 8. **Product questions** ([`questions`]): decided with their default
+//!    and stated under Out of scope, never asked in the pull request.
 //!
 //! For every ticket kind, the data rules ([`data_rules`]): a cursor column
 //! keeps advancing with its readers listed, a selection uses the same
@@ -183,13 +183,8 @@ impl PrFacts {
 /// The description's sections, after what the writer wrote.
 pub fn sections(f: &PrFacts) -> String {
     let mut s = String::new();
-    if !f.attempts.is_empty() {
-        s.push_str("## Earlier attempts\nThis branch starts from the default branch; only what fits was reused.\n");
-        for a in &f.attempts {
-            s.push_str(&format!("- {a}\n"));
-        }
-        s.push('\n');
-    }
+    // Earlier attempts are history: the plan reads them, the description
+    // describes the head only (`common::scope_ledger::drop_history`).
     if f.sibling.is_some()
         || !f.duplicates.is_empty()
         || !f.unregistered.is_empty()
@@ -1549,10 +1544,10 @@ mod tests {
         let f = planner_block(TicketIntent::Feature);
         assert!(f.contains(reuse::REUSE_HEADING));
         assert!(f.contains(reuse::SIBLING_HEADING));
-        assert!(f.contains("Open product questions"));
+        assert!(f.contains("decided with the default"));
         let b = planner_block(TicketIntent::Bug);
         assert!(!b.contains(reuse::REUSE_HEADING));
-        assert!(b.contains("Open product questions"));
+        assert!(b.contains("decided with the default"));
     }
 
     #[test]
@@ -1571,11 +1566,12 @@ mod tests {
             ..Default::default()
         };
         let body = shape_body("## Summary\nAdds the block.".into(), &f);
-        assert!(body.contains("## Earlier attempts"));
+        assert!(!body.contains("Earlier attempts"));
         assert!(body.contains("Follows the closest sibling: `src/blocks/Cards.tsx`"));
         assert!(body.contains("## Staging content\n- No staging content was changed."));
         assert!(body.contains("## Verification checklist\n- [PASS] lint"));
-        assert!(body.contains("## Open product questions"));
+        assert!(!body.contains("Open product questions"));
+        assert!(body.contains("### Out of scope\n- Who sees the block: decided with the default"));
         // Added once.
         assert_eq!(shape_body(body.clone(), &f), body);
     }

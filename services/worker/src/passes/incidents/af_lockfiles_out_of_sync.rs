@@ -602,11 +602,12 @@ fn red_checks_send_the_run_back_to_fixing_and_its_ending_names_the_cause_once() 
     end.status = "failed".into();
     end.never_says(OLD_ENDING);
 
-    // The scan the supervisor keeps: the red ending still takes out what
-    // broke the checks before it gives anything up.
+    // The scan the supervisor keeps: the red ending takes out a dependency
+    // run's failing bumps before it gives anything up.
     let hand_off = fn_src(src, "async fn hand_off_red_ci(");
     assert!(
-        hand_off.find("revert_to_green(").unwrap() < hand_off.find("record_ci_outcome(").unwrap()
+        hand_off.find("take_out_failing_bumps(").unwrap()
+            < hand_off.find("record_ci_outcome(").unwrap()
     );
     let _: LockRepair = LockRepair::default();
 }

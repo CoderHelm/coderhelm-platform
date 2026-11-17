@@ -370,6 +370,7 @@ pub fn reviews_of(v: &Value) -> Vec<common::review_supersede::Review> {
                 && own_login(r["user"]["login"].as_str().unwrap_or("")),
             state: r["state"].as_str().unwrap_or("").to_string(),
             body: r["body"].as_str().unwrap_or("").to_string(),
+            commit_id: r["commit_id"].as_str().unwrap_or("").to_string(),
         })
         .collect()
 }
@@ -401,6 +402,9 @@ pub fn threads_of(nodes: &[Value]) -> Vec<common::review_supersede::Thread> {
                         minimized: c["isMinimized"].as_bool().unwrap_or(false),
                     })
                     .collect(),
+                outdated: t["isOutdated"].as_bool().unwrap_or(false),
+                line_gone: t["line"].is_null(),
+                holds_at_head: None,
             }
         })
         .collect()
@@ -461,6 +465,23 @@ pub async fn supersede_reviews(
             .await
         {
             tracing::info!(pr = number, review_id = id, error = %e, "Skipped dismissing an earlier request for changes (the repository may limit dismissals)");
+        }
+    }
+}
+
+/// Cuts CoderHelm's own review bodies to the one line
+/// `common::review_supersede::tidy` decided (`review_tidy`), here with the
+/// other rewrites of its earlier reviews. Best effort, logged.
+pub async fn collapse_own_reviews(
+    gh: &GitHubClient,
+    owner: &str,
+    repo: &str,
+    number: u64,
+    collapse: &[(u64, String)],
+) {
+    for (id, body) in collapse {
+        if let Err(e) = gh.update_review_body(owner, repo, number, *id, body).await {
+            tracing::info!(pr = number, review_id = id, error = %e, "Skipped cutting a review of CoderHelm's to one line");
         }
     }
 }

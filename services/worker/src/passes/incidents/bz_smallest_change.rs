@@ -78,7 +78,8 @@ fn camps_plan_after() -> PlanResult {
          ## Measure first\nNone: the change stays inside this repository.\n\n\
          ## Smallest change\n4 entries in `CAMP_MULTI_SPORT_OVERRIDES`; in the 3 write branches insert links for \
          `get_camp_multi_sport_names` with ON CONFLICT DO NOTHING.\n\n\
-         ## Proof\nOne test: the 4 names get Swimming and their own sport, others only their own, nothing deleted.\n",
+         ## Proof\nOne test: the 4 names get Swimming and their own sport, others only their own, nothing deleted.\n\n\
+         ## Out of scope\nNone: the ticket names the four camps and nothing else.\n",
         &format!("- [ ] {MAP_FILE}: 4 entries\n- [ ] {SYNC_FILE}: insert the extra links\n- [ ] tests/test_sports.py: one test"),
     )
 }
@@ -98,7 +99,8 @@ fn portal_plan_after() -> PlanResult {
         "## Reuse\n- `CampsPage` in web/src/pages/camps.tsx and its layout\n\n## Must not change\nThe header and other pages.\n\n\
          ## Measure first\nprobe_page on the portal at 1280x900: the embed script caps the frame at the window height below its top (663px) and the portal scrolls inside it; every camp button is disabled until registration opens; weeks are `program-portals-segment-tag-guest-N`.\n\n\
          ## Smallest change\nAn iframe block on the camps page; drop the footer and bottom padding there so the frame fills the window, as the vendor's embed docs recommend.\n\n\
-         ## Proof\nOne e2e spec from the probe record: the page itself has no scrollbar at 1280x900, the frame is 663px, week tags are listed.\n",
+         ## Proof\nOne e2e spec from the probe record: the page itself has no scrollbar at 1280x900, the frame is 663px, week tags are listed.\n\n\
+         ## Out of scope\n- Registration after it opens: decided with the default: the spec checks only what the probe saw.\n",
         "- [ ] web/src/pages/camps.tsx: embed, no footer\n- [ ] e2e/portal.spec.ts: spec from the probe",
     )
 }

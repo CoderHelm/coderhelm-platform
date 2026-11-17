@@ -4261,18 +4261,15 @@ async fn run_once(
         &common::review_overview::changed_files(&compare),
     );
     let overview_md = common::review_overview::markdown(&overview);
-    let verdict_line = if overview_md.is_empty() {
-        verdict_line
-    } else {
-        format!("{overview_md}\n{verdict_line}")
-    };
-    let mut full_body = match &stable.note {
-        Some(n) => format!(
-            "{verdict_line}\n\n{n}\n\n{summary}\n\n{}",
-            risk_report.markdown()
-        ),
-        None => format!("{verdict_line}\n\n{summary}\n\n{}", risk_report.markdown()),
-    };
+    // Short from the start (`review_supersede::fold`): the verdict, what
+    // holds the merge and why stay in sight; the overview and its file
+    // table, the risk, the FYI and unconfirmed items, the verification, the
+    // tests and the earlier comments fold under one collapsed block.
+    let mut visible = verdict_line;
+    if let Some(n) = &stable.note {
+        visible.push_str(&format!("\n\n{n}"));
+    }
+    let mut full_body = format!("{overview_md}\n\n{summary}\n\n{}", risk_report.markdown());
     full_body.push_str(&judge_note);
     full_body.push_str(&review_agent::unconfirmed_markdown(&unconfirmed));
     // Memories the code of this change contradicts: noted on the review and
@@ -4298,10 +4295,14 @@ async fn run_once(
         full_body.push_str(&format!("\n\n{verify_md}"));
     }
     if !postable.unanchored_md.is_empty() {
-        full_body.push_str(&format!(
-            "\n\n#### Additional findings\n{}",
-            postable.unanchored_md
-        ));
+        let findings_md = format!("\n\n#### Additional findings\n{}", postable.unanchored_md);
+        // Findings with no line to sit on stay in sight when something
+        // holds the merge: they may be what holds it.
+        if final_verdict.holding().is_empty() {
+            full_body.push_str(&findings_md);
+        } else {
+            visible.push_str(&findings_md);
+        }
     }
     full_body.push_str(&super::review_one_verdict::late_markdown(&held_late));
     full_body.push_str(&super::review_labels::markdown(
@@ -4337,12 +4338,16 @@ async fn run_once(
     if let Some(s) = &skills {
         full_body.push_str(&s.consulted_markdown(super::skills::app_url(&state.config.stage)));
     }
-    full_body.push_str(&rating_footer(
-        common::public_urls::app_url(&state.config.stage),
-        &msg.repo_owner,
-        &msg.repo_name,
-        msg.pr_number,
-    ));
+    let full_body = common::review_supersede::fold(
+        &visible,
+        &full_body,
+        &rating_footer(
+            common::public_urls::app_url(&state.config.stage),
+            &msg.repo_owner,
+            &msg.repo_name,
+            msg.pr_number,
+        ),
+    );
     // The last word before posting: no finding listed as holding the merge
     // is also called a note, settled or no longer applying in the same
     // review.

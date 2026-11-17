@@ -695,6 +695,11 @@ async fn handle_message_inner(state: Arc<WorkerState>, message: models::WorkerMe
             let resumed = as_sweep(who::SWEEP_DEPLOYS, passes::deploy_stats::sweep(&state)).await;
             info!(resumed, "Deploys backfill sweep done");
         }
+        models::WorkerMessage::ReviewTidy(msg) => {
+            if let Err(e) = passes::review_tidy::run(&state, &msg).await {
+                warn!(pr = msg.pr_number, reason = %msg.reason, error = %e, "Could not tidy CoderHelm's reviews on the pull request");
+            }
+        }
         models::WorkerMessage::ReviewReminder => {
             info!("Running review-reminder sweep");
             if let Err(e) = passes::review_reminder::run(&state).await {

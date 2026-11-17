@@ -741,17 +741,24 @@ async fn blobs(
         .collect())
 }
 
-/// What a round changed on its WIP branch since `base_sha`. `Ok(None)`
+/// What a round changed on its WIP branch since `base_sha`, with each
+/// file's counts and patch when the compare gave them (the commit message
+/// is checked against them, `common::push_gate::true_message`). `Ok(None)`
 /// when the WIP branch isn't there (the round saved nothing). A compare
 /// GitHub refuses is read another way: the two trees, file by file.
 async fn round_changes(
     pr: &Pr<'_>,
     wip: &str,
     base_sha: &str,
-) -> Result<Option<Vec<Changed>>, String> {
+) -> Result<Option<(Vec<Changed>, Vec<common::push_gate::FileChange>)>, String> {
     let (github, owner, repo) = (pr.github, pr.owner, pr.repo);
     let first = match github.get_diff(owner, repo, base_sha, wip).await {
-        Ok(c) => return Ok(Some(changed_from_compare(&c))),
+        Ok(c) => {
+            return Ok(Some((
+                changed_from_compare(&c),
+                common::push_gate::changes_of(&c),
+            )))
+        }
         Err(e) => e,
     };
     if let Err(e) = github.get_ref(owner, repo, wip).await {
@@ -765,7 +772,7 @@ async fn round_changes(
         blobs(github, owner, repo, base_sha).await,
         blobs(github, owner, repo, wip).await,
     ) {
-        (Ok(before), Ok(after)) => Ok(Some(changed_from_trees(&before, &after))),
+        (Ok(before), Ok(after)) => Ok(Some((changed_from_trees(&before, &after), Vec::new()))),
         (Err(e), _) | (_, Err(e)) => Err(format!(
             "its changes couldn't be read ({first}; reading the trees: {e})"
         )),
@@ -786,7 +793,7 @@ pub(crate) async fn land(pr: &Pr<'_>, wip: &str, base_sha: &str, message: &str) 
     if wip.is_empty() || wip == pr.branch || base_sha.is_empty() {
         return Landed::Refused("the round has no WIP branch to land".into());
     }
-    let ours = match round_changes(pr, wip, base_sha).await {
+    let (ours, counts) = match round_changes(pr, wip, base_sha).await {
         Ok(Some(c)) => c,
         Ok(None) => return Landed::Nothing,
         Err(why) => return Landed::Refused(why),
@@ -844,6 +851,22 @@ pub(crate) async fn land(pr: &Pr<'_>, wip: &str, base_sha: &str, message: &str) 
             }
         }
     }
+    // The message says what the diff does: one that says revert and adds
+    // test lines, or names a file the commit doesn't touch, is rewritten
+    // from the diff (`common::push_gate::true_message`).
+    let checked;
+    let message = if counts.is_empty() {
+        message
+    } else {
+        checked = common::push_gate::true_message(message, &counts);
+        if checked != message {
+            warn!(
+                wip,
+                "The round's commit message didn't match its diff; rewritten from it"
+            );
+        }
+        checked.as_str()
+    };
     // A refused commit is pushed once more: the write reads the pull
     // request's head again, so a head that moved under the first try (the
     // files don't clash, checked above) takes the second.
