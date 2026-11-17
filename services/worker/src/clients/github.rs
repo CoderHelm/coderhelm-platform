@@ -3881,6 +3881,60 @@ impl GitHubClient {
         Ok(serde_json::Value::Array(items))
     }
 
+    /// Rewrites the body of a submitted review (CoderHelm rewrites only its
+    /// own superseded reviews, through the conversation layer).
+    pub async fn update_review_body(
+        &self,
+        owner: &str,
+        repo: &str,
+        pr_number: u64,
+        review_id: u64,
+        body: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!("{API_BASE}/repos/{owner}/{repo}/pulls/{pr_number}/reviews/{review_id}");
+        let headers = self.auth_headers().await?;
+        let mut req = self
+            .http
+            .put(&url)
+            .json(&serde_json::json!({ "body": body }));
+        for (k, v) in headers {
+            req = req.header(k, v);
+        }
+        ok_or_body(self.send_tracked(req).await?).await?;
+        Ok(())
+    }
+
+    /// Every review thread on a PR with its comments' authors, review ids
+    /// and whether each is hidden (what superseding CoderHelm's earlier
+    /// reviews reads). Raw GraphQL nodes, oldest comment first.
+    pub async fn list_review_threads_detail(
+        &self,
+        owner: &str,
+        repo: &str,
+        pr_number: u64,
+    ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut out = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..10 {
+            let data = self
+                .graphql_read(
+                    "query($owner:String!,$name:String!,$pr:Int!,$after:String){ repository(owner:$owner,name:$name){ pullRequest(number:$pr){ reviewThreads(first:100, after:$after){ pageInfo{ hasNextPage endCursor } nodes{ id isResolved path comments(first:50){ nodes{ id isMinimized body author{ login } pullRequestReview{ databaseId } } } } } } } }",
+                    serde_json::json!({ "owner": owner, "name": repo, "pr": pr_number, "after": cursor }),
+                )
+                .await?;
+            let threads = &data["repository"]["pullRequest"]["reviewThreads"];
+            out.extend(threads["nodes"].as_array().cloned().unwrap_or_default());
+            if !threads["pageInfo"]["hasNextPage"]
+                .as_bool()
+                .unwrap_or(false)
+            {
+                break;
+            }
+            cursor = threads["pageInfo"]["endCursor"].as_str().map(String::from);
+        }
+        Ok(out)
+    }
+
     /// Dismiss a review on a PR (CoderHelm dismisses only its own stale
     /// "changes requested" reviews). A repo may restrict who can dismiss.
     pub async fn dismiss_review(

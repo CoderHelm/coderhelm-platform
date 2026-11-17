@@ -384,7 +384,24 @@ pub async fn post(
                 .await?
         }
     };
-    if dismiss_stale {
+    // CoderHelm's earlier reviews get out of the way of this one (one path:
+    // the conversation layer), including its own superseded request for
+    // changes.
+    if let Some(id) = review["id"].as_u64() {
+        let raised: Vec<String> = inline
+            .iter()
+            .map(|c| common::review_supersede::finding_key(&c.path, &c.body))
+            .collect();
+        super::conversation::supersede_reviews(
+            github,
+            &msg.repo_owner,
+            &msg.repo_name,
+            msg.pr_number,
+            id,
+            &raised,
+        )
+        .await;
+    } else if dismiss_stale {
         dismiss_stale_change_requests(github, msg, head).await;
     }
     Ok(review["html_url"].as_str().unwrap_or_default().to_string())
