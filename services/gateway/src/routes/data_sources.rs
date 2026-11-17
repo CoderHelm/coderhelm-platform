@@ -1588,6 +1588,9 @@ pub async fn aws_setup(
         "script": live_aws::setup_script(&our_account, &ext),
         "existing": existing_connections(&state, &claims.team_id).await,
         "role_prefix": live_aws::ROLE_PREFIX,
+        // For a role made before the WAF reads: the one line that adds
+        // only those (the install's "AWS role reads" setup item).
+        "waf_update": live_aws::waf_update_line(live_aws::ROLE_PREFIX),
     })))
 }
 

@@ -1968,7 +1968,34 @@ async fn alarm_evidence_for_run(state: &WorkerState, msg: &TicketMessage) -> Opt
     )
     .await;
     Some(match session {
-        Ok(Some(s)) => ae::gather(&s, &alarm, chrono::Utc::now()).await,
+        Ok(Some(s)) => {
+            let got = ae::gather(&s, &alarm, chrono::Utc::now()).await;
+            // A refused read is the install's setup item, recorded once for
+            // the account; a read that works again clears it.
+            let table = &state.config.settings_table_name;
+            if got.refused.is_empty() {
+                common::aws_role_reads::clear(&state.dynamo, table, &msg.team_id, &account).await;
+            } else {
+                let role_arn = common::log_findings::connection_role(
+                    &state.dynamo,
+                    &state.config.aws_insights_table_name,
+                    &msg.team_id,
+                    &account,
+                )
+                .await;
+                if let Some(gap) = common::aws_role_reads::gap(
+                    &account,
+                    &role_arn,
+                    &got.refused,
+                    "an AWS WAF alarm's evidence",
+                    &chrono::Utc::now().to_rfc3339(),
+                ) {
+                    common::aws_role_reads::record(&state.dynamo, table, &msg.team_id, &gap).await;
+                }
+                info!(team_id = %msg.team_id, account = %account, refused = ?got.refused, "AWS role lacks reads an alert route needs: install setup item");
+            }
+            got.text
+        }
         Ok(None) => ae::render(
             &alarm,
             &[format!(
@@ -2775,13 +2802,17 @@ async fn run_passes(
     // fingerprints from the web ACL's logs) before planning; it joins the
     // ticket as data ---
     if let Some(ev) = alarm_evidence_for_run(state, msg).await {
-        add_progress_note(
-            state,
-            &msg.team_id,
-            run_id,
-            "Read the requests the alarm's WAF rule matched (sampled requests and the web ACL's logs).",
-        )
-        .await;
+        let note = if ev.contains(common::aws_role_reads::ITEM_LABEL) {
+            format!(
+                "Read what the alarm's WAF rule matched that the AWS role allows; the rest is the \
+                 install's setup item \"{}\", not a question on this run.",
+                common::aws_role_reads::ITEM_LABEL
+            )
+        } else {
+            "Read the requests the alarm's WAF rule matched (sampled requests and the web ACL's logs)."
+                .to_string()
+        };
+        add_progress_note(state, &msg.team_id, run_id, &note).await;
         msg.body = common::alarm_evidence::with_evidence(&msg.body, &ev);
     }
     if let Some(ev) = log_ev.as_ref() {
