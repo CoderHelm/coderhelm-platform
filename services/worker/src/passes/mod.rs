@@ -1310,6 +1310,9 @@ pub mod lesson_cleanup;
 pub mod lessons;
 pub mod line_count;
 mod link_checks;
+/// Selectors on another company's page come from a probe of it; a write carries
+/// only the lines the change needs.
+pub mod live_guard;
 pub mod live_sources;
 pub mod log_autofix;
 pub mod log_evidence;
@@ -10084,10 +10087,11 @@ an end-to-end spec in that suite for the new behaviour, in this same branch. Fol
 conventions: its folder, page objects and fixtures, tags and area labels, its test map, and the \
 AGENTS.md / CLAUDE.md files next to it. The spec must fail without the change and pass with it; \
 CoderHelm runs it on the pull request's preview. Unit tests alone don't cover a change a person sees. \
-Assert what the person sees. Before writing selectors or reading JSON of a page another company serves \
-(a payment form, a sign-in widget), probe it with `probe_page` (on the preview or the vendor's URL), commit \
-the record it returns, quote the test ids and fields you use in the pull request, and use only those: the \
-review flags any it can't find in a probe.\n";
+Assert what the person sees. Before writing or keeping selectors or reading JSON of a page another company \
+serves (a payment form, a sign-in widget, a portal in a frame), probe it with `probe_page` (on the preview or \
+the vendor's URL, with `clicks` that reach each state a branch of the spec reads); the record is committed for \
+you, the pull request quotes it, and a write using test ids no probe saw is not made. A branch on the page's \
+state (enabled or not, visible or not) that no run has taken is unverified, and the pull request says so.\n";
 
 pub(crate) fn attr_s(val: &str) -> aws_sdk_dynamodb::types::AttributeValue {
     aws_sdk_dynamodb::types::AttributeValue::S(val.to_string())
