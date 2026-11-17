@@ -1372,6 +1372,7 @@ mod review;
 pub mod review_actions;
 pub mod review_activity;
 pub mod review_agent;
+pub mod review_ci;
 pub mod review_configs;
 #[cfg(test)]
 mod review_eval;
@@ -1383,6 +1384,7 @@ pub mod review_policy;
 #[cfg(test)]
 mod review_policy_eval;
 pub mod review_pr;
+pub mod review_probe;
 pub mod review_reminder;
 pub mod review_risk;
 pub mod review_rules;
@@ -10060,6 +10062,10 @@ Every change that adds or changes behavior must ship with tests in this same bra
 - New behavior (a feature, endpoint, UI state, option, job): add tests that exercise it.\n\
 - Changed or fixed behavior: update the existing tests that cover that code so they assert the \
 new behavior. A bug fix gets a test that fails without the fix.\n\
+- Shell scripts, CI steps and workflow helpers are behavior too: test the script itself with \
+stub commands first on PATH (a fake `aws`, `gh` or `curl` that prints a fixture and records its \
+arguments) and fixtures beside the test, then assert on its output, exit code and the recorded \
+calls. Never hand such a test back as something only a person can run.\n\
 - Follow the repo's own testing conventions exactly: framework, where tests live and how they're \
 named, helpers and fixtures, how mocks are done, which command runs them. They are in AGENTS.md / \
 CLAUDE.md and in nested ones next to the code (e.g. `e2e/CLAUDE.md`, a package's CLAUDE.md): read \
