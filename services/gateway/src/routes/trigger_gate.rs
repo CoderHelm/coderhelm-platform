@@ -33,7 +33,13 @@
 //!   run, and the closed run stays as history
 //! - a ticket a person marked done on the ticket itself ("fixed in the
 //!   booking system") stays done until its content changes
-//! - a failed / retried latest run never blocks
+//! - a failed / retried latest run doesn't block, until
+//!   [`MAX_FAILED_RUNS_IN_A_ROW`] runs in a row ended failed (a run a
+//!   person retried is passed over: it neither counts nor ends the streak):
+//!   then an event that leaves the ticket unchanged starts nothing (a field
+//!   or status change used to start the same failing run every time). A
+//!   content change, a reopen, a person's Retry or command still start one;
+//!   Retry and commands are never blocked by the cap
 //! - explicit human triggers (slash commands, comment retries) skip the
 //!   content check but still respect in-flight blocking
 
@@ -75,6 +81,9 @@ struct LatestRun<'a> {
     context_hash: Option<&'a str>,
     /// The hash of the newest edit already sent to the run's open PR.
     seen_hash: Option<&'a str>,
+    /// Runs in a row, newest first, that ended failed; runs a person
+    /// retried are passed over (they neither count nor end the streak).
+    failed_in_a_row: usize,
 }
 
 impl LatestRun<'_> {
@@ -122,9 +131,22 @@ enum Decision {
     ToOpenPr,
 }
 
+/// Failed runs in a row on one ticket after which an event that leaves the
+/// ticket unchanged starts no further run.
+pub const MAX_FAILED_RUNS_IN_A_ROW: usize = 3;
+
 fn decide(latest: &LatestRun, new_hash: Option<&str>, reopened: bool) -> Decision {
     if !handled(latest.status) {
-        // failed / retried: allow retry
+        // failed / retried: allow a retry, up to the cap while unchanged
+        if latest.failed_in_a_row >= MAX_FAILED_RUNS_IN_A_ROW
+            && !reopened
+            && !latest.changed(new_hash)
+        {
+            return Decision::Skip(
+                "the ticket's last runs failed and it is unchanged; changing the ticket, \
+                 reopening it, or a person's explicit Retry or command starts another",
+            );
+        }
         return Decision::Enqueue;
     }
     if latest.pr_open() {
@@ -314,6 +336,15 @@ pub async fn gate_ticket_trigger(
         pr_outcome: s("pr_outcome").unwrap_or(""),
         context_hash: s("context_hash"),
         seen_hash: s(SEEN_HASH_FIELD),
+        failed_in_a_row: failed_in_a_row(
+            items
+                .iter()
+                .map(|i| {
+                    let id = i.get("run_id").and_then(|v| v.as_s().ok()).cloned();
+                    (id.unwrap_or_default(), status_of(i))
+                })
+                .collect(),
+        ),
     };
     match decide(&run, new_context_hash, reopened) {
         Decision::Enqueue => {
@@ -380,6 +411,18 @@ pub async fn gate_ticket_trigger(
             })
         }
     }
+}
+
+/// How many of the ticket's runs in a row, newest first, ended failed,
+/// from `(run_id, status)` in any order. A run a person retried (`retried`,
+/// whatever it ended as) is passed over: it neither counts nor ends the
+/// streak. Run ids are ULIDs, which sort by creation time.
+fn failed_in_a_row(mut runs: Vec<(String, String)>) -> usize {
+    runs.sort_by(|a, b| b.0.cmp(&a.0));
+    runs.iter()
+        .filter(|(_, status)| status != "retried")
+        .take_while(|(_, status)| status == "failed")
+        .count()
 }
 
 /// The run record's field holding the hash of the newest ticket edit sent
@@ -458,7 +501,10 @@ pub fn expected_attachment_keys(
 
 #[cfg(test)]
 mod tests {
-    use super::{decide, edit_note, handled, jira_reopened, Decision, LatestRun, OpenPr};
+    use super::{
+        decide, edit_note, failed_in_a_row, handled, jira_reopened, Decision, LatestRun, OpenPr,
+        MAX_FAILED_RUNS_IN_A_ROW,
+    };
 
     fn run<'a>(status: &'a str, pr: u64, outcome: &'a str, hash: &'a str) -> LatestRun<'a> {
         LatestRun {
@@ -467,7 +513,67 @@ mod tests {
             pr_outcome: outcome,
             context_hash: Some(hash),
             seen_hash: None,
+            failed_in_a_row: 0,
         }
+    }
+
+    /// The same failing run used to start on every field or status change.
+    #[test]
+    fn failed_runs_in_a_row_stop_restarting_on_an_unchanged_ticket() {
+        let below = LatestRun {
+            failed_in_a_row: MAX_FAILED_RUNS_IN_A_ROW - 1,
+            ..run("failed", 0, "", "h1")
+        };
+        assert_eq!(decide(&below, Some("h1"), false), Decision::Enqueue);
+        let capped = LatestRun {
+            failed_in_a_row: MAX_FAILED_RUNS_IN_A_ROW,
+            ..run("failed", 0, "", "h1")
+        };
+        assert!(matches!(
+            decide(&capped, Some("h1"), false),
+            Decision::Skip(_)
+        ));
+        assert!(matches!(decide(&capped, None, false), Decision::Skip(_)));
+        // New content, or a reopen, starts one.
+        assert_eq!(decide(&capped, Some("h2"), false), Decision::Enqueue);
+        assert_eq!(decide(&capped, Some("h1"), true), Decision::Enqueue);
+    }
+
+    #[test]
+    fn failures_in_a_row_count_from_the_newest_run() {
+        let r = |id: &str, s: &str| (id.to_string(), s.to_string());
+        // Out of order on purpose: ids sort by creation time.
+        assert_eq!(
+            failed_in_a_row(vec![
+                r("01C", "failed"),
+                r("01A", "failed"),
+                r("01D", "failed"),
+                r("01B", "completed"),
+            ]),
+            2
+        );
+        // Two runs that asked a question and a person retried, then one
+        // failure: one failed run, not three.
+        assert_eq!(
+            failed_in_a_row(vec![
+                r("01A", "retried"),
+                r("01B", "retried"),
+                r("01C", "failed"),
+            ]),
+            1
+        );
+        // A retried run between failures doesn't end the streak.
+        assert_eq!(
+            failed_in_a_row(vec![
+                r("01A", "failed"),
+                r("01B", "retried"),
+                r("01C", "failed"),
+                r("01D", "failed"),
+            ]),
+            3
+        );
+        assert_eq!(failed_in_a_row(vec![r("01A", "completed")]), 0);
+        assert_eq!(failed_in_a_row(vec![]), 0);
     }
 
     /// The prod duplicate: a Jira edit one second before the merge, while
