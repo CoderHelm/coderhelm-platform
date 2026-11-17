@@ -81,16 +81,27 @@ fn compared() -> Record {
 fn the_failure_is_read_from_its_report_and_compared_with_the_base() {
     let ev = ci_repro::evidence_of("Deploy Preview", &failure_comment(), "").expect("read");
     assert_eq!(ev.tests, vec![TEST.to_string()]);
-    assert!(ev.error.contains("did not add it to the portal's Order Summary"), "{ev:?}");
+    assert!(
+        ev.error
+            .contains("did not add it to the portal's Order Summary"),
+        "{ev:?}"
+    );
     assert_eq!(
         ev.shots,
         vec!["https://github.com/user-attachments/assets/0b7a-camp-drawer.png".to_string()]
     );
-    assert!(ci_repro::image_host_allowed("github.com", "/user-attachments/assets/0b7a-camp-drawer.png", &[]));
+    assert!(ci_repro::image_host_allowed(
+        "github.com",
+        "/user-attachments/assets/0b7a-camp-drawer.png",
+        &[]
+    ));
     // The test runs against both addresses with the head's test code.
     let (spec, title) = repro::spec_and_title(TEST);
     let cmd = repro::leg_cmd("e2e", &spec, &title, "https://staging-shop.example.com").unwrap();
-    assert!(cmd.contains("--grep 'selecting a camp adds it to the cart while registration is open'"), "{cmd}");
+    assert!(
+        cmd.contains("--grep 'selecting a camp adds it to the cart while registration is open'"),
+        "{cmd}"
+    );
     assert!(cmd.contains("--retries=0"));
 
     let r = compared();
@@ -100,10 +111,16 @@ fn the_failure_is_read_from_its_report_and_compared_with_the_base() {
     // The fixer reads the error, sees the screenshot and is told what a
     // failure red on the base means for the fix.
     let brief = repro::brief(Some(&ev), std::slice::from_ref(&r), HEAD);
-    assert!(brief.contains("Subtotal$0") || brief.contains("Order Summary"), "{brief}");
+    assert!(
+        brief.contains("Subtotal$0") || brief.contains("Order Summary"),
+        "{brief}"
+    );
     assert!(brief.contains("0b7a-camp-drawer.png"), "{brief}");
     assert!(brief.contains("attached to this message as an image"));
-    assert!(brief.contains("Fix the test, or the code it checks, on this branch"), "{brief}");
+    assert!(
+        brief.contains("Fix the test, or the code it checks, on this branch"),
+        "{brief}"
+    );
     assert!(brief.contains("Never revert this pull request's work for it"));
 }
 
@@ -118,23 +135,43 @@ fn nothing_is_reverted_without_a_comparison_that_shows_the_change_caused_it() {
     // as a preview deploy that hit the cloud account's limit): nothing comes
     // out either.
     let infra = repro::from_checks(HEAD, "121ea38c", "Deploy Preview", None);
-    assert!(matches!(repro::may_revert(&[infra], HEAD), RevertGate::Refused(_)));
+    assert!(matches!(
+        repro::may_revert(&[infra], HEAD),
+        RevertGate::Refused(_)
+    ));
     // A comparison on an older head proves nothing about this one.
     let ours = Record {
-        base: Leg { target: "s".into(), ran: true, passed: 1, failed: 0, note: String::new() },
+        base: Leg {
+            target: "s".into(),
+            ran: true,
+            passed: 1,
+            failed: 0,
+            note: String::new(),
+        },
         ..compared()
     };
-    assert!(matches!(repro::may_revert(std::slice::from_ref(&ours), HEAD), RevertGate::Allowed(_)));
-    assert!(matches!(repro::may_revert(&[ours], "b66dfd3d06d9"), RevertGate::Refused(_)));
+    assert!(matches!(
+        repro::may_revert(std::slice::from_ref(&ours), HEAD),
+        RevertGate::Allowed(_)
+    ));
+    assert!(matches!(
+        repro::may_revert(&[ours], "b66dfd3d06d9"),
+        RevertGate::Refused(_)
+    ));
 
     // The pipeline: the gate comes before anything is chosen to come out,
     // and a refusal returns before a write.
     let src = include_str!("../resume.rs");
     let revert = fn_src(src, "async fn revert_to_green(");
-    let gate = revert.find("ci_repro::may_revert(").expect("the revert asks the gate");
+    let gate = revert
+        .find("ci_repro::may_revert(")
+        .expect("the revert asks the gate");
     assert!(gate < revert.find("sup::revert_for(").unwrap());
     assert!(gate < revert.find("apply_revert(").unwrap());
-    assert!(revert.find("revert_dep_commit(").unwrap() < gate, "a dependency run keeps its own revert");
+    assert!(
+        revert.find("revert_dep_commit(").unwrap() < gate,
+        "a dependency run keeps its own revert"
+    );
 }
 
 #[test]
@@ -146,14 +183,18 @@ fn blame_and_unconfirmed_need_the_record_and_the_report() {
     assert!(held[0].contains(repro::BLAME_HELD));
     // With the comparison on record, the line that says so stays.
     let shown = "Fails on the base branch too: the test fails on staging as well.";
-    assert_eq!(resume::held_tried(&[shown.to_string()], &[compared()], HEAD, ""), vec![shown.to_string()]);
+    assert_eq!(
+        resume::held_tried(&[shown.to_string()], &[compared()], HEAD, ""),
+        vec![shown.to_string()]
+    );
 
     // "Couldn't confirm" while the report was read is replaced by it.
     let ev = ci_repro::evidence_of("Deploy Preview", &failure_comment(), "").unwrap();
     let unsure = "I couldn't confirm what the e2e test saw on the portal.";
     let held = resume::held_tried(&[unsure.to_string()], &[compared()], HEAD, &ev.line());
     assert!(held[0].starts_with("The failure's report says: `Deploy Preview` failed in `tests/browse/camp-registration.spec.ts"), "{held:?}");
-    assert!(held[0].contains("screenshot: https://github.com/user-attachments/assets/0b7a-camp-drawer.png"));
+    assert!(held[0]
+        .contains("screenshot: https://github.com/user-attachments/assets/0b7a-camp-drawer.png"));
 
     // The pipeline: every account goes through the hold before the pull
     // request, and the fixer's message carries the brief and the shot.
@@ -163,7 +204,9 @@ fn blame_and_unconfirmed_need_the_record_and_the_report() {
     assert!(src.contains("Failure summary:\\n{failure_logs}{repro_brief}"));
     assert!(src.contains("super::ci_repro::compare("));
     assert!(src.contains("super::ci_repro::screenshot("));
-    assert!(src.contains("let e2e_on_base = on_base.iter().any(|c| super::e2e_reads::is_e2e_name(c));"));
+    assert!(
+        src.contains("let e2e_on_base = on_base.iter().any(|c| super::e2e_reads::is_e2e_name(c));")
+    );
 }
 
 #[test]
@@ -215,5 +258,8 @@ fn the_ci_lines_are_true_for_the_head() {
     let src = include_str!("../description.rs");
     let build = fn_src(src, "async fn build(");
     assert!(build.find("ci_lines_for_head(").unwrap() < build.find("gather(").unwrap());
-    assert!(!crate::passes::description::is_current(&body, "43f1bdd46cc6"));
+    assert!(!crate::passes::description::is_current(
+        &body,
+        "43f1bdd46cc6"
+    ));
 }
