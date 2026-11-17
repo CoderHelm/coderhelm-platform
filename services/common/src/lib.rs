@@ -190,6 +190,9 @@ pub mod pr_steps;
 pub mod pr_template;
 pub mod run_prs;
 // review_stats: time-ordered review records for analytics
+/// How a comment reads: the renderer and lint every comment passes before
+/// it is posted (short, plain, no pasted plans, no history).
+pub mod comment_style;
 /// What people write on a ticket while a run works on it: kept, acknowledged, acted on.
 /// One engineer's voice per ticket and per pull request: every comment
 /// CoderHelm writes reads the thread first, then stays quiet, edits its own

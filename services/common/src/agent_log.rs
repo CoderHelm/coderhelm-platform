@@ -608,9 +608,32 @@ pub fn redact_entry(entry: &mut Value) {
     }
 }
 
+/// Characters of a refused or failed call's message kept on its live event.
+pub const MAX_LIVE_MESSAGE: usize = 2000;
+
+/// What a live event says of a call that did not go through (refused,
+/// soft fail, error): the message the agent got, redacted and cut to
+/// [`MAX_LIVE_MESSAGE`], so the run page shows the reason while the step
+/// runs, not only once its log is saved. `None` for a call that went
+/// through: its result can be long, and the saved log has it.
+pub fn live_message(outcome: &ToolOutcome, result: &str) -> Option<String> {
+    if outcome.status == OutcomeStatus::Ok {
+        return None;
+    }
+    // A JSON string result (`"Not run: ..."`) is shown as its text.
+    let text = serde_json::from_str::<String>(result).unwrap_or_else(|_| result.to_string());
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let cut = crate::truncate_str(text, MAX_LIVE_MESSAGE);
+    let more = if cut.len() < text.len() { "…" } else { "" };
+    Some(format!("{}{more}", redact_text(cut)))
+}
+
 /// One live tool event as the API returns it, from its stored `payload` and
 /// `timestamp` (when the call ended). Old events have no `pass`,
-/// `tool_use_id` or `started_at`: those come back null.
+/// `tool_use_id`, `started_at` or `message`: those come back null.
 pub fn live_event(payload: &Value, timestamp: &str) -> Value {
     let s = |k: &str| {
         payload
@@ -628,6 +651,7 @@ pub fn live_event(payload: &Value, timestamp: &str) -> Value {
         "tool_use_id": s("tool_use_id"),
         "started_at": s("started_at"),
         "outcome": payload.get("outcome").filter(|o| o.is_object()).cloned(),
+        "message": s("message"),
     })
 }
 
@@ -966,5 +990,31 @@ mod tests {
         assert_eq!(new["started_at"], "2026-11-10T09:59:59.960Z");
         assert_eq!(new["outcome"]["status"], "soft_fail");
         assert_eq!(new["duration_ms"], 40);
+        assert_eq!(new["message"], Value::Null);
+    }
+
+    #[test]
+    fn a_refused_live_event_carries_its_reason() {
+        let refused = ToolOutcome::refused("not run: writes files");
+        let why = "\"Commands don't change files here: use edit_file.\"";
+        let m = live_message(&refused, why).expect("a message");
+        assert_eq!(m, "Commands don't change files here: use edit_file.");
+        let ev = live_event(
+            &json!({"tool": "bash", "input_summary": "command: rm -rf dist", "duration_ms": 3,
+                    "is_error": false, "outcome": refused.to_value(), "message": m}),
+            "2026-11-10T10:00:00Z",
+        );
+        assert_eq!(
+            ev["message"],
+            "Commands don't change files here: use edit_file."
+        );
+        // A call that went through keeps its result for the saved log.
+        assert_eq!(live_message(&ToolOutcome::ok("exit 0"), "\"done\""), None);
+        // Secrets never reach the event; long messages are cut.
+        let tok = format!("ghp_{}", "a".repeat(36));
+        let m = live_message(&ToolOutcome::error("failed"), &format!("token {tok} bad")).unwrap();
+        assert!(!m.contains(&tok), "{m}");
+        let long = live_message(&ToolOutcome::soft_fail("x"), &"y".repeat(5000)).unwrap();
+        assert!(long.chars().count() <= MAX_LIVE_MESSAGE + 1 && long.ends_with('…'));
     }
 }

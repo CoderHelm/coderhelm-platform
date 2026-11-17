@@ -254,8 +254,10 @@ test("GitHub: no app, refused keys, missing permissions, wrong webhook, bad secr
 
   // Every optional permission a new app asks for warns with what it limits.
   for (const [key, why] of Object.entries(OPTIONAL_WHY)) {
-    const lacking = { ...APP, permissions: { ...PERMISSIONS, [key]: key === "checks" ? "read" : undefined } };
-    if (key !== "checks") delete lacking.permissions[key];
+    // Checks and Actions: read is required, only write is optional.
+    const readOnly = key === "checks" || key === "actions";
+    const lacking = { ...APP, permissions: { ...PERMISSIONS, [key]: readOnly ? "read" : undefined } };
+    if (!readOnly) delete lacking.permissions[key];
     const r = (await C.checkGithubApp({ fetchImpl: github({ "/app": json(200, lacking) }).fetchImpl }, SECRET, "https://helm.example.org")).find((x) => x.id === "github_permissions");
     assert.equal(r.status, C.WARN, key);
     assert.ok(r.why.includes(why), `${key}: ${r.why}`);
