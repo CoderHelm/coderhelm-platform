@@ -120,14 +120,7 @@ The causes were in the loop, not only in prompt wording:
    run) is judged again with what it found, even when it wrote no code
    (`proof::round_answered`, `incidents::cn_proof_answer_judged`).
 
-7. **Rounds agree.**
-   Planned work that a review commit on the pull request took out is not
-   built again by a planned-work round, and the run says which commit took it
-   out. When an acceptance criterion of the ticket asks for it, the ticket
-   wins: it is built, and the reply to the review says why
-   (`round_agree`, `incidents::co_rounds_agree`).
-
-8. **Commit and push.**
+7. **Commit and push.**
    Each gate runs where the commit is made, not as a line in the prompt
    (`common::push_gate`, `passes/push_checks.rs`).
 
@@ -177,6 +170,13 @@ The causes were in the loop, not only in prompt wording:
      values are sent back as one case per behaviour. The size check (test
      lines against code lines) runs too; it fires on the roughly 415 test
      lines one run added for 50 lines of code.
+
+8. **Rounds agree.**
+   Planned work that a review commit on the pull request took out is not
+   built again by a planned-work round, and the run says which commit took it
+   out. When an acceptance criterion of the ticket asks for it, the ticket
+   wins: it is built, and the reply to the review says why
+   (`round_agree`, `incidents::co_rounds_agree`).
 
 ## What is deterministic
 
