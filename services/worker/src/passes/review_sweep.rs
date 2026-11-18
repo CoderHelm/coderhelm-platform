@@ -41,6 +41,9 @@ pub struct ReviewRecord {
     pub fingerprint: Option<super::review_fingerprint::Fingerprint>,
     /// What held the merge, by name.
     pub holding: Vec<String>,
+    /// The review as posted, without the rating footer (empty on a record
+    /// older than it): a carried approval carries it to a new head.
+    pub posted_body: String,
 }
 
 impl ReviewRecord {
@@ -126,6 +129,7 @@ fn record_from_item(i: &HashMap<String, AttributeValue>) -> ReviewRecord {
         body: s_of(i, "body"),
         fingerprint: serde_json::from_str(&s_of(i, "fingerprint")).ok(),
         holding: serde_json::from_str(&s_of(i, "holding")).unwrap_or_default(),
+        posted_body: s_of(i, "posted_body"),
     }
 }
 
@@ -476,6 +480,7 @@ mod tests {
             body: body.into(),
             fingerprint: None,
             holding: Vec::new(),
+            posted_body: String::new(),
         }
     }
 

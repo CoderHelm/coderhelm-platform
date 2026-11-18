@@ -1502,6 +1502,7 @@ async fn send_reply(
         "QUESTION",
         "N/A",
         answer,
+        "",
         "COMMENT",
         "",
         &common::review_stats::ReviewCounts {
@@ -2758,7 +2759,21 @@ async fn run_once(
                     .is_some_and(|a| super::review_scope::same_own_change(a, &compare));
                 let nothing_new =
                     (ahead && !super::review_scope::touches_code(&since)) || own_change_unchanged;
-                if nothing_new && unconfirmed_in_body.is_empty() {
+                // What a carried approval carries: the stored review of the
+                // approved commit. Without it an approval would stand with no
+                // review in sight, so the PR is reviewed in full instead.
+                let carried = if nothing_new {
+                    carried_review(&records, &approved)
+                } else {
+                    None
+                };
+                if nothing_new && carried.is_none() {
+                    warn!(pr = msg.pr_number, approved = %approved, head = %head_sha, "No stored review of the approved commit to carry to the new head — full review");
+                    own_change_unchanged = false;
+                } else if let (true, Some(carried)) = (
+                    nothing_new && unconfirmed_in_body.is_empty(),
+                    carried.as_deref(),
+                ) {
                     info!(pr = msg.pr_number, approved = %approved, head = %head_sha, own_change_unchanged, "Push changed none of the PR's code or data since the approval — review skipped, approval carried");
                     live_job.settle(NotReviewed::UnchangedSinceApproval {
                         approved: &approved,
@@ -2772,8 +2787,12 @@ async fn run_once(
                         &msg,
                         live_job,
                         &head_sha,
-                        &approved,
-                        own_change_unchanged,
+                        &CarriedApproval {
+                            approved: &approved,
+                            only_base_merged: own_change_unchanged,
+                            base_branch,
+                            review: carried,
+                        },
                         standing.clone(),
                         self_authored,
                     )
@@ -2806,8 +2825,7 @@ async fn run_once(
                         )
                     };
                     return Ok(Outcome::Skipped { reason });
-                }
-                if own_change_unchanged {
+                } else if own_change_unchanged {
                     // Reviewed again only to triage the facts the description
                     // marks unconfirmed: the change itself is the approved one.
                     info!(pr = msg.pr_number, approved = %approved, head = %head_sha, "Only the base branch came in since the approval — re-checking the PR's unconfirmed facts");
@@ -4338,16 +4356,13 @@ async fn run_once(
     if let Some(s) = &skills {
         full_body.push_str(&s.consulted_markdown(super::skills::app_url(&state.config.stage)));
     }
-    let full_body = common::review_supersede::fold(
-        &visible,
-        &full_body,
-        &rating_footer(
-            common::public_urls::app_url(&state.config.stage),
-            &msg.repo_owner,
-            &msg.repo_name,
-            msg.pr_number,
-        ),
+    let footer = rating_footer(
+        common::public_urls::app_url(&state.config.stage),
+        &msg.repo_owner,
+        &msg.repo_name,
+        msg.pr_number,
     );
+    let full_body = common::review_supersede::fold(&visible, &full_body, &footer);
     // The last word before posting: no finding listed as holding the merge
     // is also called a note, settled or no longer applying in the same
     // review.
@@ -4356,6 +4371,9 @@ async fn run_once(
         warn!(pr = msg.pr_number, contradictions = ?two_verdicts, "A finding had two verdicts in the review body; the words that contradict the hold were removed");
     }
     let full_body = one_body;
+    // The review as posted, kept on its record: an approval carried to a
+    // later head carries it (`carried_review`).
+    let posted_body = full_body.strip_suffix(&footer).unwrap_or(&full_body);
 
     // Check the head again before speaking: the review takes minutes, and a
     // commit pushed seconds before this one started may not have been the PR's
@@ -4549,6 +4567,7 @@ async fn run_once(
         verdict,
         &risk,
         &record_body,
+        posted_body,
         effective_event,
         "",
         &common::review_stats::ReviewCounts {
@@ -4835,28 +4854,115 @@ pub(crate) fn own_head_is_new(last_reviewed: Option<&str>, head: &str) -> bool {
 /// completes (see [`review_for_run`]).
 pub(crate) const TRIGGER_RUN: &str = "run";
 
-/// The body of an approval carried to a new head without a review: the
-/// verdict and why in one line.
-pub(crate) fn carried_approval_body(approved: &str, only_base_merged: bool) -> String {
-    let short = &approved[..approved.len().min(7)];
-    let why = if only_base_merged {
+/// An approval carried to a new head without a review, and the review it
+/// carries.
+pub(crate) struct CarriedApproval<'a> {
+    /// The approved commit the verdict rests on.
+    pub approved: &'a str,
+    /// The new commits only bring in the base branch (else they change only
+    /// docs, comments or whitespace).
+    pub only_base_merged: bool,
+    pub base_branch: &'a str,
+    /// The review of `approved` as it was posted ([`carried_review`]).
+    pub review: &'a str,
+}
+
+/// The review CoderHelm posted for `approved`, from its stored record: the
+/// body as posted, or on a record older than that its summary and findings.
+/// `None` when no record of a finished approval of that commit is kept, or
+/// the record is a one-line carried approval with no review in it: the
+/// approval can't be carried with what was checked, so the PR is reviewed.
+pub(crate) fn carried_review(
+    records: &[super::review_sweep::ReviewRecord],
+    approved: &str,
+) -> Option<String> {
+    let same = |sha: &str| {
+        sha.len() >= 7
+            && approved.len() >= 7
+            && (sha.starts_with(approved) || approved.starts_with(sha))
+    };
+    let r = records
+        .iter()
+        .find(|r| r.is_review() && !r.failed() && r.verdict == "APPROVE" && same(&r.head_sha))?;
+    let posted = r.posted_body.trim();
+    let content = if posted.is_empty() {
+        r.body.trim()
+    } else {
+        posted
+    };
+    let one_line_carry = common::review_supersede::carried_from(content).is_some()
+        && !content.contains(common::review_supersede::CARRIED_REVIEW_MARK);
+    (!content.is_empty() && !one_line_carry).then(|| content.to_string())
+}
+
+/// The body of an approval carried to a new head without a review. It stands
+/// on its own: the verdict, why the earlier review still holds for `head`,
+/// then that review's own content (what was checked, the criteria, the
+/// tests, the notes and findings), so cutting the earlier review loses
+/// nothing. Its marks name the commit it rests on
+/// (`review_supersede::CARRIES_MARK`) and the one its review was written
+/// for, which a carry of a carry keeps.
+pub(crate) fn carried_approval_body(c: &CarriedApproval<'_>, head: &str) -> String {
+    use common::review_supersede::{CARRIED_REVIEW_MARK, CARRIES_MARK};
+    let short = |s: &str| s[..s.len().min(7)].to_string();
+    let (origin, review) = match c.review.find(CARRIED_REVIEW_MARK) {
+        Some(at) => {
+            let rest = &c.review[at + CARRIED_REVIEW_MARK.len()..];
+            let end = rest.find("-->").unwrap_or(0);
+            let origin = rest[..end].trim();
+            let body = rest.get(end + 3..).unwrap_or("");
+            let origin = if origin.is_empty() {
+                c.approved
+            } else {
+                origin
+            };
+            (origin.to_string(), body)
+        }
+        None => (c.approved.to_string(), c.review),
+    };
+    // The carried review's own content: no marks of CoderHelm's (a cut or
+    // brought-up-to-date body), no rating footer.
+    let review = review
+        .split("\n\n---\n**Was this review right?**")
+        .next()
+        .unwrap_or("");
+    let review: String = review
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("<!-- coderhelm:"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let verdict = if review.contains("Approved with notes") {
+        "✅ **Approved with notes**"
+    } else {
+        "✅ **Approved**"
+    };
+    let (approved, origin_short, head) = (short(c.approved), short(&origin), short(head));
+    let why = if c.only_base_merged {
         format!(
-            "the new commits only bring in the base branch; the PR's own change is the same as \
-             the approved `{short}`."
+            "the PR's own change is unchanged since `{approved}`; the new commits only bring in \
+             `{}`",
+            c.base_branch
         )
     } else {
         format!(
             "the new commits change only docs, comments or whitespace since the approved \
-             `{short}`."
+             `{approved}`"
         )
     };
-    format!("✅ **Approved**: {why}")
+    format!(
+        "{CARRIES_MARK}{} -->\n{verdict} on `{head}`: {why}. The review of `{origin_short}` \
+         below holds for this commit: what it checked, its notes and its findings.\n\n\
+         {CARRIED_REVIEW_MARK}{origin} -->\n{}",
+        c.approved,
+        review.trim(),
+    )
 }
 
-/// Posts the approval of `approved` again on `head` (a COMMENT on
-/// CoderHelm's own PR, where GitHub refuses a verdict) and records it, so
-/// the head carries a visible verdict and later pushes are reviewed from it.
-/// Best-effort: a failure is logged and the auto-merge gate still runs.
+/// Posts the approval of `carry.approved` again on `head` (a COMMENT on
+/// CoderHelm's own PR, where GitHub refuses a verdict), carrying the review
+/// it rests on, and records it, so the head carries a visible verdict with
+/// what was checked and later pushes are reviewed from it. Best-effort: a
+/// failure is logged and the auto-merge gate still runs.
 #[allow(clippy::too_many_arguments)]
 async fn carry_approval(
     state: &WorkerState,
@@ -4864,8 +4970,7 @@ async fn carry_approval(
     msg: &ReviewMessage,
     job: &LiveJob,
     head: &str,
-    approved: &str,
-    only_base_merged: bool,
+    carry: &CarriedApproval<'_>,
     standing: Option<super::review_verdict::StandingReview>,
     self_authored: bool,
 ) {
@@ -4882,9 +4987,9 @@ async fn carry_approval(
     else {
         return;
     };
-    let heading = carried_approval_body(approved, only_base_merged);
+    let carried = carried_approval_body(carry, head);
     let body = format!(
-        "{heading}{}",
+        "{carried}{}",
         rating_footer(
             common::public_urls::app_url(&state.config.stage),
             &msg.repo_owner,
@@ -4915,7 +5020,8 @@ async fn carry_approval(
         head,
         "APPROVE",
         "N/A",
-        &heading,
+        &carried,
+        &carried,
         event,
         "",
         &common::review_stats::ReviewCounts {
@@ -4924,7 +5030,7 @@ async fn carry_approval(
         },
     )
     .await;
-    info!(pr = msg.pr_number, head = %head, approved = %approved, event, "Approval carried to the new head");
+    info!(pr = msg.pr_number, head = %head, approved = %carry.approved, event, "Approval carried to the new head with the review it rests on");
 }
 
 /// The PR reviewer's verdict on a run's own PR, for the run.
@@ -6029,6 +6135,9 @@ struct ReviewRecord<'a> {
     verdict: &'a str,
     risk: &'a str,
     body: &'a str,
+    /// The review as posted, without the rating footer: what a carried
+    /// approval carries to a later head (`carried_review`).
+    posted_body: &'a str,
     posted_as: &'a str,
     action_summary: &'a str,
     /// RFC 3339; also the end of the sort key.
@@ -6068,6 +6177,12 @@ fn review_record_item(
     .into_iter()
     .map(|(k, v)| (k.to_string(), v))
     .collect();
+    if !r.posted_body.is_empty() {
+        item.insert(
+            "posted_body".to_string(),
+            attr_s(&common::head_tail_str(r.posted_body, 30_000)),
+        );
+    }
     if !r.action_summary.is_empty() {
         item.insert(
             "action_summary".to_string(),
@@ -6098,6 +6213,7 @@ async fn store_review_record(
     verdict: &str,
     risk: &str,
     body: &str,
+    posted_body: &str,
     posted_as: &str,
     action_summary: &str,
     counts: &common::review_stats::ReviewCounts,
@@ -6112,6 +6228,7 @@ async fn store_review_record(
             verdict,
             risk,
             body,
+            posted_body,
             posted_as,
             action_summary,
             created_at: &created_at,
@@ -7122,21 +7239,42 @@ mod verdict_tests {
         assert_eq!(super::findings_record(&[]), "[]");
     }
 
-    /// A carried approval says it is one, and why, in its one line.
+    /// A carried approval says it is one, why, and carries the review it
+    /// rests on (its own marks and rating footer left out); a carry of a
+    /// carry still names the review's own commit and nests nothing.
     #[test]
-    fn a_carried_approval_names_the_approved_commit_and_why() {
-        let merged = super::carried_approval_body("abc1234def", true);
-        assert_eq!(
-            merged,
-            "✅ **Approved**: the new commits only bring in the base branch; the PR's own \
-             change is the same as the approved `abc1234`."
+    fn a_carried_approval_names_the_approved_commit_and_carries_its_review() {
+        let review = "<!-- coderhelm:review-updated -->\n✅ **Approved with notes**: nothing \
+                      blocks.\n\n#### Verification\n- typecheck passed\n\n---\n**Was this \
+                      review right?** Rate it";
+        let carry = |approved, only_base_merged, review| super::CarriedApproval {
+            approved,
+            only_base_merged,
+            base_branch: "main",
+            review,
+        };
+        let merged = super::carried_approval_body(&carry("abc1234def", true, review), "fed9876");
+        assert!(
+            merged.starts_with("<!-- coderhelm:carries abc1234def -->\n"),
+            "{merged}"
         );
-        let docs = super::carried_approval_body("abc1234def", false);
-        assert!(docs.starts_with("✅ **Approved**: "), "{docs}");
-        assert!(docs.contains("only docs, comments or whitespace"));
-        for b in [merged, docs] {
-            assert_eq!(b.lines().count(), 1);
-        }
+        assert!(merged.contains(
+            "✅ **Approved with notes** on `fed9876`: the PR's own change is unchanged since \
+             `abc1234`; the new commits only bring in `main`. The review of `abc1234` below"
+        ));
+        assert!(merged.contains("#### Verification\n- typecheck passed"));
+        assert!(!merged.contains("review-updated") && !merged.contains("Was this review right"));
+        assert_eq!(
+            common::review_supersede::carried_from(&merged).as_deref(),
+            Some("abc1234def")
+        );
+        let docs = super::carried_approval_body(&carry("abc1234def", false, review), "fed9876");
+        assert!(docs.contains("only docs, comments or whitespace"), "{docs}");
+        let again = super::carried_approval_body(&carry("fed9876aaa", true, &merged), "0a1b2c3");
+        assert!(again.contains("unchanged since `fed9876`"), "{again}");
+        assert!(again.contains("The review of `abc1234` below"), "{again}");
+        assert_eq!(again.matches("coderhelm:carries").count(), 1);
+        assert_eq!(again.matches("#### Verification").count(), 1);
     }
 
     #[test]
@@ -7390,6 +7528,7 @@ mod failure_tests {
                     verdict: "APPROVE",
                     risk: "LOW",
                     body: "Looks right.",
+                    posted_body: "",
                     posted_as: "APPROVE",
                     action_summary: "",
                     created_at: "2026-11-10T12:00:00+00:00",

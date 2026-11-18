@@ -461,6 +461,7 @@ mod tests {
             body: "Looks good.".into(),
             fingerprint: None,
             holding: Vec::new(),
+            posted_body: String::new(),
         }
     }
 

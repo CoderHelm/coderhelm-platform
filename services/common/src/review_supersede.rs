@@ -116,9 +116,16 @@ pub fn finding_key(path: &str, body: &str) -> String {
 /// The plan once review `new_id` is posted, raising the findings `raised`
 /// ([`finding_key`] of each of its inline comments).
 pub fn plan(reviews: &[Review], threads: &[Thread], new_id: u64, raised: &[String]) -> Plan {
+    // A carried approval rests on the review it carries: that one, its
+    // comments and its threads stay as they are.
+    let carried = reviews
+        .iter()
+        .find(|r| r.id == new_id)
+        .and_then(|r| carried_from(&r.body));
     let earlier: Vec<&Review> = reviews
         .iter()
         .filter(|r| r.own && r.id != new_id && r.state != "PENDING")
+        .filter(|r| !rests_on(r, carried.as_deref()))
         .collect();
     let earlier_ids: Vec<u64> = earlier.iter().map(|r| r.id).collect();
     let mut out = Plan {
@@ -145,7 +152,12 @@ pub fn plan(reviews: &[Review], threads: &[Thread], new_id: u64, raised: &[Strin
                 out.minimize.push(c.node_id.clone());
             }
         }
-        if !t.resolved && !raised.contains(&finding_key(&t.path, &t.first_body)) {
+        let kept = t.comments.first().is_some_and(|c| {
+            reviews
+                .iter()
+                .any(|r| r.id == c.review_id && rests_on(r, carried.as_deref()))
+        });
+        if !kept && !t.resolved && !raised.contains(&finding_key(&t.path, &t.first_body)) {
             out.resolve.push(t.id.clone());
         }
     }
@@ -263,6 +275,62 @@ fn is_head(sha: &str, head: &str) -> bool {
     sha.len() >= 7 && head.len() >= 7 && (head.starts_with(sha) || sha.starts_with(head))
 }
 
+// ── Carried approvals ────────────────────────────────────────────────────
+//
+// A push that only brings in the base branch is not reviewed again: the
+// approval of the earlier commit is posted again on the new head. That
+// review's verdict rests on the earlier one, so the earlier one is never cut
+// or hidden while the carried approval is CoderHelm's latest word, and the
+// carried approval itself carries the earlier review's content.
+
+/// The mark a carried approval starts with, followed by the commit whose
+/// review it carries and ` -->`.
+pub const CARRIES_MARK: &str = "<!-- coderhelm:carries ";
+
+/// The mark before the carried review's own content in a carried approval,
+/// followed by the commit that review was written for and ` -->`.
+pub const CARRIED_REVIEW_MARK: &str = "<!-- coderhelm:carried-review ";
+
+/// The commit a carried approval's verdict rests on, when `body` is one:
+/// its [`CARRIES_MARK`], or the one-line wording carried approvals had
+/// before they carried the review ("the same as the approved `abc1234`").
+pub fn carried_from(body: &str) -> Option<String> {
+    let sha_after = |marker: &str, end: char| -> Option<String> {
+        let at = body.find(marker)?;
+        let rest = &body[at + marker.len()..];
+        let sha = rest[..rest.find(end)?].trim();
+        (sha.len() >= 7 && sha.chars().all(|c| c.is_ascii_hexdigit())).then(|| sha.to_string())
+    };
+    sha_after(CARRIES_MARK, '-').or_else(|| sha_after("the same as the approved `", '`'))
+}
+
+/// The commit CoderHelm's latest review on the pull request carries its
+/// verdict from, when that review is a carried approval: the review of that
+/// commit is the one the standing verdict rests on.
+pub fn live_carried_sha(reviews: &[Review]) -> Option<String> {
+    reviews
+        .iter()
+        .filter(|r| r.own && r.state != "PENDING" && !r.body.trim().is_empty())
+        .max_by_key(|r| r.id)
+        .and_then(|r| carried_from(&r.body))
+}
+
+/// The review a carried approval rests on: CoderHelm's own, for the commit
+/// `carried` names.
+fn rests_on(r: &Review, carried: Option<&str>) -> bool {
+    carried.is_some_and(|c| is_head(c, &reviewed_sha(r)))
+}
+
+/// The ids of the reviews the latest carried approval rests on.
+pub fn kept_for_carry(reviews: &[Review]) -> Vec<u64> {
+    let live = live_carried_sha(reviews);
+    reviews
+        .iter()
+        .filter(|r| r.own && rests_on(r, live.as_deref()))
+        .map(|r| r.id)
+        .collect()
+}
+
 /// The verdict a review gave, in two words and an icon.
 pub fn verdict_word(r: &Review) -> &'static str {
     let b = r.body.as_str();
@@ -310,8 +378,15 @@ pub fn one_line(r: &Review, pr: &PrNow, why: &str) -> String {
 pub fn tidy(reviews: &[Review], threads: &[Thread], pr: &PrNow) -> Tidy {
     let mut out = Tidy::default();
     let done = pr.state != PrState::Open;
+    // The review CoderHelm's latest carried approval rests on stays in full
+    // while the pull request is open: it is what the verdict says was checked.
+    let live = if done {
+        None
+    } else {
+        live_carried_sha(reviews)
+    };
     for r in reviews.iter().filter(|r| r.own && r.state != "PENDING") {
-        if r.body.trim().is_empty() || collapsed(&r.body) {
+        if r.body.trim().is_empty() || collapsed(&r.body) || rests_on(r, live.as_deref()) {
             continue;
         }
         let why = match pr.state {
