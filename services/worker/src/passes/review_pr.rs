@@ -5927,6 +5927,62 @@ async fn own_loop_hold(
     )
 }
 
+/// Pure: the review the merge gate queues for the head its own base merge
+/// made. It is a push's review of that head (`review_scope::TRIGGER_PUSH`),
+/// so an earlier approval is carried with the review it rests on when the
+/// PR's own change is the one approved (`review_scope::approved_base`), and
+/// only the PR's own change since is reviewed otherwise. Keyed like the
+/// gateway's push review of the same head (`head#<sha>`), so a labelled PR
+/// whose push the gateway also queued is reviewed once.
+pub(crate) fn base_merge_review(
+    team_id: &str,
+    installation_id: u64,
+    (owner, repo, pr_number): (&str, &str, u64),
+    head: &str,
+    label: &str,
+) -> ReviewMessage {
+    ReviewMessage {
+        team_id: team_id.to_string(),
+        installation_id,
+        repo_owner: owner.to_string(),
+        repo_name: repo.to_string(),
+        pr_number,
+        head_sha: head.to_string(),
+        label: label.to_string(),
+        trigger: super::review_scope::TRIGGER_PUSH.to_string(),
+        dedup_key: format!("head#{head}"),
+        ..Default::default()
+    }
+}
+
+/// After the merge gate merged the base into a PR's branch, it queues
+/// CoderHelm's review of the new head itself, whether or not the PR carries
+/// the review label: the gate never waits on a review it caused. False when
+/// review is off for the repo or the job couldn't be sent.
+pub(crate) async fn review_after_base_merge(
+    state: &WorkerState,
+    team_id: &str,
+    installation_id: u64,
+    pr: (&str, &str, u64),
+    head: &str,
+) -> bool {
+    let Some(label) = enabled_trigger_label(state, team_id, pr.0, pr.1).await else {
+        return false;
+    };
+    let msg = base_merge_review(team_id, installation_id, pr, head, &label);
+    // A moment for GitHub to settle the new head's compare.
+    let delay = 30;
+    if !enqueue_review(state, &msg, delay).await {
+        return false;
+    }
+    note_queued(state, &msg, delay).await;
+    info!(
+        pr = pr.2,
+        head, "The merge gate merged the base in — review of the new head queued"
+    );
+    true
+}
+
 /// The review a run asks for when it hands its PR over without the PR
 /// reviewer's verdict on its last head: CoderHelm's own pushes during the
 /// run weren't reviewed (`own_loop_hold`). The job reads the PR's head when
