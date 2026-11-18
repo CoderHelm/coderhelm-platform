@@ -357,16 +357,23 @@ pub fn with_note(instructions: &str, note: Option<&str>) -> String {
 /// [`partial_note`]; `None` when the verdict found the merges unrelated):
 /// the instructions hold one such section at most, the verdict's.
 pub fn replace_note(instructions: &str, carried: Option<&str>, fresh: Option<&str>) -> String {
-    let base = match carried.map(str::trim).filter(|n| !n.is_empty()) {
-        Some(n) if instructions.trim() == n => "",
-        Some(n) => instructions
-            .trim_end()
-            .strip_suffix(n)
-            .and_then(|b| b.strip_suffix("\n\n"))
-            .unwrap_or(instructions),
-        None => instructions,
+    let base = match carried
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .and_then(|n| instructions.find(n).map(|i| (i, n.len())))
+    {
+        Some((i, len)) => {
+            let head = instructions[..i].trim_end();
+            let tail = instructions[i + len..].trim_start();
+            match (head.is_empty(), tail.is_empty()) {
+                (true, _) => tail.to_string(),
+                (false, true) => head.to_string(),
+                (false, false) => format!("{head}\n\n{tail}"),
+            }
+        }
+        None => instructions.to_string(),
     };
-    with_note(base, fresh)
+    with_note(&base, fresh)
 }
 
 /// What the run's wait asks for.
@@ -608,6 +615,22 @@ mod tests {
         );
         assert_eq!(partly, format!("Use pnpm.\n\n{}", fresh.trim()));
         assert_eq!(replace_note(&loaded, Some(&carried), None), "Use pnpm.");
+        let diagnosis = "## Ticket diagnosis\n\nRoot cause: the missing index.";
+        let followed = format!("{loaded}\n\n{diagnosis}");
+        let partly = replace_note(&followed, Some(&carried), Some(&fresh));
+        assert_eq!(
+            partly.matches("## Already merged for this ticket").count(),
+            1
+        );
+        assert!(!partly.contains("- A\n"), "{partly}");
+        assert_eq!(
+            partly,
+            format!("Use pnpm.\n\n{diagnosis}\n\n{}", fresh.trim())
+        );
+        assert_eq!(
+            replace_note(&followed, Some(&carried), None),
+            format!("Use pnpm.\n\n{diagnosis}")
+        );
         let alone = with_note("", Some(&carried));
         assert_eq!(replace_note(&alone, Some(&carried), None), "");
         assert_eq!(
