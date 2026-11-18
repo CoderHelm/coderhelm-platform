@@ -627,6 +627,15 @@ pub async fn run(
     // code changes and the description rewrite all follow them.
     let team_instructions =
         super::load_team_instructions(state, &msg.team_id, &msg.repo_owner, &msg.repo_name).await;
+    // A run that builds only what merged pull requests didn't keeps saying
+    // so in this round, the description rewrite included
+    // (`common::merged_ticket`).
+    let team_instructions = common::merged_ticket::with_note(
+        &team_instructions,
+        super::run_merged_note(state, &msg.team_id, &msg.run_id)
+            .await
+            .as_deref(),
+    );
     // A failing-test fix's run keeps its failure evidence and rules.
     let team_instructions =
         super::test_fix::with_saved(state, &msg.team_id, &msg.run_id, team_instructions).await;

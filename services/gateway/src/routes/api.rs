@@ -2667,6 +2667,9 @@ pub(crate) async fn retry_message(
         // anyway (`merged_ticket`): the new run doesn't stop for that merge
         // and need a second retry.
         after_merge: super::trigger_gate::ended_on_merge(item),
+        // What already merged for the ticket, when the retried run built
+        // only the rest: the new run keeps building only that.
+        merged_note: common::merged_ticket::note_of(item),
         ..Default::default()
     })
 }

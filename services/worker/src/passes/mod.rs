@@ -2162,6 +2162,13 @@ async fn run_passes(
     // The team's own instructions, loaded once: every agent in the run that
     // plans, writes, proves or describes the change gets them from `msg`.
     msg.team_instructions = run_team_instructions(state, msg).await;
+    // A retried run that carries what already merged for its ticket keeps it
+    // on its own record too, for its pull request's fix rounds.
+    if !msg.same_run() {
+        if let Some(note) = msg.merged_note.clone() {
+            save_merged_note(state, &msg.team_id, run_id, &note).await;
+        }
+    }
 
     // Progress is status for nobody: it is on the run page, never a comment
     // (the layer drops a "run" status an earlier attempt left on the issue).
@@ -9988,6 +9995,7 @@ async fn merged_work(
             .await;
             let section = mt::partial_note(&prs, &reason, &missing);
             msg.team_instructions = mt::with_note(&msg.team_instructions, Some(&section));
+            save_merged_note(state, &msg.team_id, run_id, &section).await;
             msg.merged_note = Some(section);
             MergedWork::GoOn
         }
@@ -10016,6 +10024,46 @@ async fn merged_work(
             MergedWork::Ended
         }
     }
+}
+
+/// Keeps the "Already merged for this ticket" section on the run record
+/// (`common::merged_ticket::FIELD_MERGED_NOTE`), so Retry and the pull
+/// request's fix rounds re-apply it.
+async fn save_merged_note(state: &WorkerState, team_id: &str, run_id: &str, note: &str) {
+    if let Err(e) = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(team_id))
+        .key("run_id", attr_s(run_id))
+        .update_expression("SET #mn = :n")
+        .expression_attribute_names("#mn", common::merged_ticket::FIELD_MERGED_NOTE)
+        .expression_attribute_values(":n", attr_s(note))
+        .send()
+        .await
+    {
+        warn!(run_id, error = %e, "Could not keep what already merged on the run");
+    }
+}
+
+/// The run's saved "Already merged for this ticket" section, if it has one.
+pub(crate) async fn run_merged_note(
+    state: &WorkerState,
+    team_id: &str,
+    run_id: &str,
+) -> Option<String> {
+    let out = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(team_id))
+        .key("run_id", attr_s(run_id))
+        .projection_expression("#mn")
+        .expression_attribute_names("#mn", common::merged_ticket::FIELD_MERGED_NOTE)
+        .send()
+        .await
+        .ok()?;
+    common::merged_ticket::note_of(out.item()?)
 }
 
 /// Records on the run that the merged-ticket check ended it

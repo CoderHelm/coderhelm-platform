@@ -63,6 +63,22 @@ pub const STOP_KIND: &str = "already_merged";
 /// The run record's field set when a person asked for the run after the
 /// ticket's pull request merged.
 pub const FIELD_AFTER_MERGE: &str = "after_merge";
+/// The run record's field holding the "Already merged for this ticket"
+/// section ([`partial_note`]) when the check found the merged pull requests
+/// did part of the ticket: written once, so Retry and the pull request's fix
+/// rounds re-apply it ([`with_note`]).
+pub const FIELD_MERGED_NOTE: &str = "merged_note";
+
+/// The run's saved [`FIELD_MERGED_NOTE`], from its record. `None` when the
+/// run has none.
+pub fn note_of(
+    item: &std::collections::HashMap<String, aws_sdk_dynamodb::types::AttributeValue>,
+) -> Option<String> {
+    item.get(FIELD_MERGED_NOTE)
+        .and_then(|v| v.as_s().ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
 
 /// A merged pull request for the ticket.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -477,6 +493,30 @@ mod tests {
 
     /// The verdict decides the run: covered, partly covered, unrelated, or
     /// a person decides when it couldn't be read.
+    /// A partial merge's section is read back from the run record, so Retry
+    /// and the pull request's fix rounds keep it; a run without one has none.
+    #[test]
+    fn the_saved_note_is_read_back_from_the_run_record() {
+        use aws_sdk_dynamodb::types::AttributeValue;
+        let mut item = std::collections::HashMap::new();
+        assert_eq!(note_of(&item), None);
+        item.insert(
+            FIELD_MERGED_NOTE.to_string(),
+            AttributeValue::S("  ".into()),
+        );
+        assert_eq!(note_of(&item), None);
+        item.insert(
+            FIELD_MERGED_NOTE.to_string(),
+            AttributeValue::S("## Already merged for this ticket\n".into()),
+        );
+        let note = note_of(&item).unwrap();
+        assert_eq!(note, "## Already merged for this ticket");
+        assert_eq!(
+            with_note("Team rules.", Some(&note)),
+            "Team rules.\n\n## Already merged for this ticket"
+        );
+    }
+
     #[test]
     fn the_verdict_decides_what_the_run_does() {
         assert_eq!(
