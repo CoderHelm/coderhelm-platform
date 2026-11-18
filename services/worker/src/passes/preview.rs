@@ -170,6 +170,16 @@ pub(crate) fn covering_results(
         .collect()
 }
 
+/// The draft-gated checks that can still run on this head: one only a
+/// label left off starts is never a reason to mark the draft ready.
+pub(crate) fn runnable_gated(gated: &[String], waits: &[pv::Covering]) -> Vec<String> {
+    gated
+        .iter()
+        .filter(|g| pv::is_covering(waits, g))
+        .cloned()
+        .collect()
+}
+
 /// The covering checks that failed in a check listing although the newest
 /// check of their name doesn't say so: a later run of the same `labeled`
 /// workflow, started by another label, skipped the job and hides the
@@ -794,6 +804,7 @@ pub async fn advance(
             r.environment = super::deploy_label::environment_of(gh, p.owner, p.repo, &r.url).await;
         }
         st.checks = results;
+        st.draft_gated = runnable_gated(&st.draft_gated, &waits);
         let triggered = !st.labels_added.is_empty() || draft;
         let mut stage = pv::progress(&st.checks, triggered);
         let none_ran = st.checks.iter().all(|c| c.outcome == Outcome::Skipped);
@@ -1332,5 +1343,20 @@ mod tests {
         assert!(!settled(&st(vec![failed("Something else", true)]), "abc"));
         // The preview plan's own failure waits for the fix's push.
         assert!(settled(&st(vec![failed("E2E on preview", false)]), "abc"));
+    }
+
+    #[test]
+    fn a_draft_is_never_marked_ready_for_a_check_its_left_off_label_starts() {
+        let waits = vec![pv::Covering {
+            check: "E2E on preview".into(),
+            ..Default::default()
+        }];
+        let gated = vec!["E2E on preview".to_string(), "Deploy app".to_string()];
+        // `Deploy app` runs only with a label that was left off this head.
+        assert_eq!(
+            runnable_gated(&gated, &waits),
+            vec!["E2E on preview".to_string()]
+        );
+        assert!(runnable_gated(&gated, &[]).is_empty());
     }
 }
