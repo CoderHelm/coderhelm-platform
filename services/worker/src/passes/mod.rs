@@ -2166,7 +2166,7 @@ async fn run_passes(
     // on its own record too, for its pull request's fix rounds.
     if !msg.same_run() {
         if let Some(note) = msg.merged_note.clone() {
-            save_merged_note(state, &msg.team_id, run_id, &note).await;
+            save_merged_note(state, &msg.team_id, run_id, Some(&note)).await;
         }
     }
 
@@ -9994,8 +9994,12 @@ async fn merged_work(
             )
             .await;
             let section = mt::partial_note(&prs, &reason, &missing);
-            msg.team_instructions = mt::with_note(&msg.team_instructions, Some(&section));
-            save_merged_note(state, &msg.team_id, run_id, &section).await;
+            msg.team_instructions = mt::replace_note(
+                &msg.team_instructions,
+                msg.merged_note.as_deref(),
+                Some(&section),
+            );
+            save_merged_note(state, &msg.team_id, run_id, Some(&section)).await;
             msg.merged_note = Some(section);
             MergedWork::GoOn
         }
@@ -10016,6 +10020,11 @@ async fn merged_work(
                 ),
             )
             .await;
+            if let Some(carried) = msg.merged_note.take() {
+                msg.team_instructions =
+                    mt::replace_note(&msg.team_instructions, Some(&carried), None);
+                save_merged_note(state, &msg.team_id, run_id, None).await;
+            }
             MergedWork::GoOn
         }
         mt::Check::Unsure => {
@@ -10028,20 +10037,22 @@ async fn merged_work(
 
 /// Keeps the "Already merged for this ticket" section on the run record
 /// (`common::merged_ticket::FIELD_MERGED_NOTE`), so Retry and the pull
-/// request's fix rounds re-apply it.
-async fn save_merged_note(state: &WorkerState, team_id: &str, run_id: &str, note: &str) {
-    if let Err(e) = state
+/// request's fix rounds re-apply it; `None` removes it.
+async fn save_merged_note(state: &WorkerState, team_id: &str, run_id: &str, note: Option<&str>) {
+    let update = state
         .dynamo
         .update_item()
         .table_name(&state.config.runs_table_name)
         .key("team_id", attr_s(team_id))
         .key("run_id", attr_s(run_id))
-        .update_expression("SET #mn = :n")
-        .expression_attribute_names("#mn", common::merged_ticket::FIELD_MERGED_NOTE)
-        .expression_attribute_values(":n", attr_s(note))
-        .send()
-        .await
-    {
+        .expression_attribute_names("#mn", common::merged_ticket::FIELD_MERGED_NOTE);
+    let update = match note {
+        Some(n) => update
+            .update_expression("SET #mn = :n")
+            .expression_attribute_values(":n", attr_s(n)),
+        None => update.update_expression("REMOVE #mn"),
+    };
+    if let Err(e) = update.send().await {
         warn!(run_id, error = %e, "Could not keep what already merged on the run");
     }
 }

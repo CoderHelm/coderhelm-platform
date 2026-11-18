@@ -352,6 +352,23 @@ pub fn with_note(instructions: &str, note: Option<&str>) -> String {
     }
 }
 
+/// The team's `instructions` with the run's carried section on what
+/// already merged (`carried`) replaced by the fresh verdict's (`fresh`, from
+/// [`partial_note`]; `None` when the verdict found the merges unrelated):
+/// the instructions hold one such section at most, the verdict's.
+pub fn replace_note(instructions: &str, carried: Option<&str>, fresh: Option<&str>) -> String {
+    let base = match carried.map(str::trim).filter(|n| !n.is_empty()) {
+        Some(n) if instructions.trim() == n => "",
+        Some(n) => instructions
+            .trim_end()
+            .strip_suffix(n)
+            .and_then(|b| b.strip_suffix("\n\n"))
+            .unwrap_or(instructions),
+        None => instructions,
+    };
+    with_note(base, fresh)
+}
+
 /// What the run's wait asks for.
 pub fn wait_action(source: &TicketSource) -> &'static str {
     match source {
@@ -491,8 +508,6 @@ mod tests {
         }
     }
 
-    /// The verdict decides the run: covered, partly covered, unrelated, or
-    /// a person decides when it couldn't be read.
     /// A partial merge's section is read back from the run record, so Retry
     /// and the pull request's fix rounds keep it; a run without one has none.
     #[test]
@@ -517,6 +532,8 @@ mod tests {
         );
     }
 
+    /// The verdict decides the run: covered, partly covered, unrelated, or
+    /// a person decides when it couldn't be read.
     #[test]
     fn the_verdict_decides_what_the_run_does() {
         assert_eq!(
@@ -563,6 +580,40 @@ mod tests {
         assert_eq!(with_note(loaded, None), loaded);
         assert_eq!(with_note(loaded, Some("  ")), loaded);
         assert_eq!(with_note("", Some(&section)), section.trim());
+    }
+
+    /// A retried run carries #12's section; its fresh verdict on #12 and
+    /// #20 decides what stays: one section, the verdict's, on a partial
+    /// merge; none when the merges are unrelated.
+    #[test]
+    fn the_fresh_verdict_replaces_the_carried_section() {
+        let carried = partial_note(
+            &[merged(12, "2026-11-02T10:00:00Z")],
+            "It adds the index.",
+            &["A".into(), "B".into()],
+        );
+        let fresh = partial_note(
+            &[
+                merged(20, "2026-11-09T10:00:00Z"),
+                merged(12, "2026-11-02T10:00:00Z"),
+            ],
+            "They add the index and A.",
+            &["B".into()],
+        );
+        let loaded = with_note("Use pnpm.", Some(&carried));
+        let partly = replace_note(&loaded, Some(&carried), Some(&fresh));
+        assert_eq!(
+            partly.matches("## Already merged for this ticket").count(),
+            1
+        );
+        assert_eq!(partly, format!("Use pnpm.\n\n{}", fresh.trim()));
+        assert_eq!(replace_note(&loaded, Some(&carried), None), "Use pnpm.");
+        let alone = with_note("", Some(&carried));
+        assert_eq!(replace_note(&alone, Some(&carried), None), "");
+        assert_eq!(
+            replace_note("Use pnpm.", None, Some(&fresh)),
+            with_note("Use pnpm.", Some(&fresh))
+        );
     }
 
     #[test]

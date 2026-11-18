@@ -222,6 +222,16 @@ pub fn ended_on_merge(i: &Item) -> bool {
         || field(i, "pr_outcome") == "merged"
 }
 
+/// What already merged for the ticket, carried to a retry of the run
+/// (`common::merged_ticket::note_of`): only when the run didn't end on a
+/// merge, since that merge did the rest and the note is out of date.
+pub fn retry_note(i: &Item) -> Option<String> {
+    if ended_on_merge(i) {
+        return None;
+    }
+    common::merged_ticket::note_of(i)
+}
+
 fn field<'a>(i: &'a Item, k: &str) -> &'a str {
     i.get(k)
         .and_then(|v| v.as_s().ok())
@@ -524,7 +534,7 @@ pub fn expected_attachment_keys(
 mod tests {
     use super::{
         decide, edit_note, field, handled, jira_reopened, latest_ended_on_merge, latest_run,
-        own_runs, Decision, Item, LatestRun, OpenPr,
+        own_runs, retry_note, Decision, Item, LatestRun, OpenPr,
     };
     use aws_sdk_dynamodb::types::AttributeValue;
 
@@ -541,6 +551,26 @@ mod tests {
     fn with(mut i: Item, k: &str, v: &str) -> Item {
         i.insert(k.into(), AttributeValue::S(v.into()));
         i
+    }
+
+    /// R2 built only what #12 left (A, B) and its own PR merged: a Retry on
+    /// R2 must not tell the new run to build A and B again. A retry of a run
+    /// that didn't end on a merge keeps building only the rest.
+    #[test]
+    fn a_retry_carries_what_merged_only_when_the_run_did_not_merge() {
+        let note = "## Already merged for this ticket\n\nStill to do:\n- A\n- B";
+        let partial = with(
+            item("01R2", "acme/app", ""),
+            common::merged_ticket::FIELD_MERGED_NOTE,
+            note,
+        );
+        assert_eq!(retry_note(&partial).as_deref(), Some(note));
+        assert_eq!(retry_note(&with(partial.clone(), "status", "merged")), None);
+        assert_eq!(
+            retry_note(&with(partial.clone(), "pr_outcome", "merged")),
+            None
+        );
+        assert_eq!(retry_note(&item("01R1", "acme/app", "")), None);
     }
 
     /// WEB-42's PR merged into `develop` while the ticket stayed open; the
