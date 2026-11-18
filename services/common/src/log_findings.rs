@@ -3083,14 +3083,18 @@ pub async fn connection_role(
         .unwrap_or_default()
 }
 
-/// Take on the team's log reader role for the finding's account.
+/// Take on the team's log reader role for the finding's account: the
+/// account's connection ([`crate::live::aws_account::AwsAccount::target`])
+/// taken on with [`crate::live::aws::assume`], the one way a run's tools and
+/// a waiting run's re-check read the account, so both ask AWS as the same
+/// role.
 pub async fn session_for(
     dynamo: &DynamoClient,
     sts: &aws_sdk_sts::Client,
     insights_table: &str,
     team_id: &str,
     account: &str,
-) -> Result<Option<crate::live::aws::Session>, String> {
+) -> Result<Option<crate::live::aws::TeamSession>, String> {
     if account.is_empty() || !account.chars().all(|c| c.is_ascii_digit()) {
         return Ok(None);
     }
@@ -3102,32 +3106,23 @@ pub async fn session_for(
         .send()
         .await
         .map_err(|e| e.to_string())?;
-    let Some(item) = item.item() else {
+    let Some(target) = item.item().and_then(reader_target) else {
         return Ok(None);
     };
-    let (role, external) = (s(item, "role_arn"), s(item, "external_id"));
-    if role.is_empty() || external.is_empty() {
-        return Ok(None);
-    }
-    let region = Some(s(item, "region"))
-        .filter(|r| !r.is_empty())
-        .unwrap_or_else(|| "us-east-1".into());
-    let out = sts
-        .assume_role()
-        .role_arn(role)
-        .role_session_name("coderhelm-log-findings")
-        .external_id(external)
-        .duration_seconds(900)
-        .send()
+    crate::live::aws::assume(sts, &target, "log-findings")
         .await
-        .map_err(|e| aws_sdk_sts::error::DisplayErrorContext(e).to_string())?;
-    let c = out.credentials().ok_or("AWS returned no session")?;
-    Ok(Some(crate::live::aws::Session {
-        access_key_id: c.access_key_id().to_string(),
-        secret_access_key: c.secret_access_key().to_string(),
-        session_token: c.session_token().to_string(),
-        region,
-    }))
+        .map(Some)
+        .map_err(|e| e.message)
+}
+
+/// Pure: the role a stored connection reads with, the same target the
+/// run's tools take on (`AwsAccount::target`). `None` without a role or the
+/// team's private ID.
+pub fn reader_target(
+    item: &std::collections::HashMap<String, aws_sdk_dynamodb::types::AttributeValue>,
+) -> Option<crate::live::aws::AwsTarget> {
+    let a = crate::live::aws_account::AwsAccount::from_item(item)?;
+    (!a.external_id.is_empty()).then(|| a.target())
 }
 
 /// Pure: the log group's page in the CloudWatch console.

@@ -176,7 +176,7 @@ fn without_the_roles_waf_reads_the_run_waits_and_raises_the_item() {
     // The pipeline decides this way, and the re-checks are armed and sent.
     let m = include_str!("../mod.rs");
     let body = &m[m.find("async fn finish_without_code(").unwrap()..];
-    assert!(body.contains("common::role_wait::ending(&left.human"));
+    assert!(body.contains("common::role_wait::ending_after(&left.human"));
     assert!(body.contains("common::run_status::AWAITING_SETUP"));
     assert!(body.contains("role_wait::arm("));
     assert!(m.contains("NoCodeEnd::PlanAgain(why)"));

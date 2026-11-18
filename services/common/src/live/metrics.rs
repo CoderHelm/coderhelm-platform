@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use super::aws::Session;
+use super::aws::{Session, TeamSession};
 use super::http::window;
 use super::StepError;
 
@@ -413,7 +413,7 @@ pub fn format_list(list: &[MetricInfo]) -> String {
 
 /// The real reads, on a session of the team's role.
 pub struct Aws<'a> {
-    pub session: &'a Session,
+    pub session: &'a TeamSession,
 }
 
 fn client(s: &Session, region: Option<&str>) -> aws_sdk_cloudwatch::Client {
@@ -434,9 +434,15 @@ fn client(s: &Session, region: Option<&str>) -> aws_sdk_cloudwatch::Client {
     )
 }
 
-/// AWS's answer to a refused or failed call. A refusal is the role's: the
-/// install's setup item for `action`, named in one line.
-fn aws_error<E, R>(e: &aws_sdk_cloudwatch::error::SdkError<E, R>, action: &str) -> StepError
+/// AWS's answer to a refused or failed call. A refusal of the team's role
+/// (`role_arn`) is the install's setup item for `action`, named in one
+/// line; a refusal of any other principal is CoderHelm's own failure, named
+/// with the principal AWS refused.
+fn aws_error<E, R>(
+    e: &aws_sdk_cloudwatch::error::SdkError<E, R>,
+    action: &str,
+    role_arn: &str,
+) -> StepError
 where
     E: aws_sdk_cloudwatch::error::ProvideErrorMetadata + std::error::Error + 'static,
     R: std::fmt::Debug,
@@ -445,6 +451,21 @@ where
     let code = e.code().unwrap_or("").to_string();
     let msg = e.message().unwrap_or("").to_string();
     if is_denied(&code) {
+        if let Some(principal) = super::aws::refused_other_principal(&msg, role_arn) {
+            tracing::error!(
+                action,
+                principal = %principal,
+                "CoderHelm's own failure: a team read was made with a role that isn't the team's"
+            );
+            return StepError::new(
+                "read",
+                format!(
+                    "AWS refused {action} to {principal}, which isn't the team's role, so this \
+                     is CoderHelm's own failure, not the team's role."
+                ),
+                "",
+            );
+        }
         return StepError::role_refused(&[action]);
     }
     StepError::new(
@@ -477,7 +498,7 @@ impl MetricsApi for Aws<'_> {
         let out = req
             .send()
             .await
-            .map_err(|e| aws_error(&e, "cloudwatch:ListMetrics"))?;
+            .map_err(|e| aws_error(&e, "cloudwatch:ListMetrics", self.session.role_arn()))?;
         Ok(out
             .metrics()
             .iter()
@@ -530,7 +551,7 @@ impl MetricsApi for Aws<'_> {
         let out = req
             .send()
             .await
-            .map_err(|e| aws_error(&e, "cloudwatch:GetMetricData"))?;
+            .map_err(|e| aws_error(&e, "cloudwatch:GetMetricData", self.session.role_arn()))?;
         let mut series = Vec::new();
         for mq in &q.queries {
             let r = out
@@ -558,12 +579,12 @@ impl MetricsApi for Aws<'_> {
 
 /// Whether the role can read metrics: one ListMetrics. `Ok(false)` when AWS
 /// says the role isn't allowed.
-pub async fn probe(session: &Session) -> Result<bool, StepError> {
+pub async fn probe(session: &TeamSession) -> Result<bool, StepError> {
     let c = client(session, None);
     match c.list_metrics().namespace("AWS/Lambda").send().await {
         Ok(_) => Ok(true),
         Err(e) => {
-            let err = aws_error(&e, "cloudwatch:ListMetrics");
+            let err = aws_error(&e, "cloudwatch:ListMetrics", session.role_arn());
             if !err.role_refused.is_empty() {
                 Ok(false)
             } else {

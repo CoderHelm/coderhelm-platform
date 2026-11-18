@@ -35,7 +35,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 
-use crate::live::aws::Session;
+use crate::live::aws::{Session, TeamSession};
 
 /// The heading the evidence goes under in the ticket (and how a later step
 /// of the same run knows it is there).
@@ -582,6 +582,8 @@ pub struct Gathered {
 /// The evidence lines and the refusals met while reading them.
 #[derive(Default)]
 struct Notes {
+    /// The team's role the reads are made with (`TeamSession::role_arn`).
+    role: String,
     lines: Vec<String>,
     refused: Vec<String>,
     results: String,
@@ -590,22 +592,21 @@ struct Notes {
 }
 
 impl Notes {
+    fn on(session: &TeamSession) -> Notes {
+        Notes {
+            role: session.role_arn().to_string(),
+            ..Default::default()
+        }
+    }
+
     /// A lookup that failed: a refusal names the action and counts toward
     /// the install's setup item; anything else says AWS's own words.
     fn failed(&mut self, what: &str, action: &str, code: Option<&str>, msg: Option<&str>) {
-        if refused(code) {
-            if !self.refused.iter().any(|a| a == action) {
-                self.refused.push(action.to_string());
-            }
-            self.lines.push(format!(
-                "Couldn't {what}: CoderHelm's AWS role doesn't allow {action} yet."
-            ));
-        } else {
-            self.lines.push(format!(
-                "Couldn't {what}: {}",
-                clip(msg.or(code).unwrap_or("no answer"))
-            ));
+        let (line, team_gap) = failure_line(what, action, code, msg, &self.role);
+        if team_gap && !self.refused.iter().any(|a| a == action) {
+            self.refused.push(action.to_string());
         }
+        self.lines.push(line);
     }
 
     fn done(self, alarm: &WafAlarm) -> Gathered {
@@ -615,6 +616,48 @@ impl Notes {
             logs_to_s3: self.logs_to_s3,
             ..evidence(alarm, self.lines, self.refused)
         }
+    }
+}
+
+/// Pure: the line for a lookup that failed, and whether it is the team's
+/// setup item (the team's role `role_arn` was refused `action`). AWS
+/// refusing any other principal is CoderHelm's own failure: the line names
+/// the principal, and it is never counted against the team's role.
+pub fn failure_line(
+    what: &str,
+    action: &str,
+    code: Option<&str>,
+    msg: Option<&str>,
+    role_arn: &str,
+) -> (String, bool) {
+    if !refused(code) {
+        return (
+            format!(
+                "Couldn't {what}: {}",
+                clip(msg.or(code).unwrap_or("no answer"))
+            ),
+            false,
+        );
+    }
+    match crate::live::aws::refused_other_principal(msg.unwrap_or(""), role_arn) {
+        Some(principal) => {
+            tracing::error!(
+                action,
+                principal = %principal,
+                "CoderHelm's own failure: a team read was made with a role that isn't the team's"
+            );
+            (
+                format!(
+                    "Couldn't {what}: AWS refused {action} to {principal}, which isn't the \
+                     team's role, so this is CoderHelm's own failure, not the team's role."
+                ),
+                false,
+            )
+        }
+        None => (
+            format!("Couldn't {what}: CoderHelm's AWS role doesn't allow {action} yet."),
+            true,
+        ),
     }
 }
 
@@ -818,7 +861,7 @@ async fn log_destinations(waf: &aws_sdk_wafv2::Client, arn: &str, n: &mut Notes)
 /// The rule's matches in the web ACL's log objects, read straight from its
 /// bucket (no Athena); `true` when records naming the rule came back.
 async fn read_log_objects(
-    session: &Session,
+    session: &TeamSession,
     arn: &str,
     destination: &str,
     alarm: &WafAlarm,
@@ -842,10 +885,14 @@ async fn read_log_objects(
 /// The sampled requests the alarm's rule matched in the last three hours
 /// (for an agent's lookup): the lines, and the IAM actions the role was
 /// refused (the install's setup item).
-pub async fn sampled_requests(session: &Session, alarm: &WafAlarm, now: DateTime<Utc>) -> Gathered {
+pub async fn sampled_requests(
+    session: &TeamSession,
+    alarm: &WafAlarm,
+    now: DateTime<Utc>,
+) -> Gathered {
     let (_, region) = alarm.scope_and_region();
     let waf = waf_client(&session_in(session, &region));
-    let mut n = Notes::default();
+    let mut n = Notes::on(session);
     if let Some(arn) = find_web_acl(&waf, alarm, &mut n).await {
         let end = now.timestamp();
         read_samples(&waf, &arn, alarm, end - WINDOW_SECS + 60, end, &mut n).await;
@@ -857,7 +904,7 @@ pub async fn sampled_requests(session: &Session, alarm: &WafAlarm, now: DateTime
 /// agent's lookup), read straight from its `aws-waf-logs-*` bucket: the
 /// bucket named, else where the web ACL logs.
 pub async fn log_objects(
-    session: &Session,
+    session: &TeamSession,
     alarm: &WafAlarm,
     bucket: Option<&str>,
     start: i64,
@@ -865,7 +912,7 @@ pub async fn log_objects(
 ) -> Gathered {
     let (_, region) = alarm.scope_and_region();
     let waf = waf_client(&session_in(session, &region));
-    let mut n = Notes::default();
+    let mut n = Notes::on(session);
     let Some(arn) = find_web_acl(&waf, alarm, &mut n).await else {
         return n.done(alarm);
     };
@@ -891,10 +938,10 @@ pub async fn log_objects(
 /// the result, so a missing permission is named, not silent. The logs held
 /// in S3 are read straight from the bucket first; Athena only when that
 /// found nothing.
-pub async fn gather(session: &Session, alarm: &WafAlarm, now: DateTime<Utc>) -> Gathered {
+pub async fn gather(session: &TeamSession, alarm: &WafAlarm, now: DateTime<Utc>) -> Gathered {
     let (_, region) = alarm.scope_and_region();
     let waf = waf_client(&session_in(session, &region));
-    let mut n = Notes::default();
+    let mut n = Notes::on(session);
     let Some(arn) = find_web_acl(&waf, alarm, &mut n).await else {
         return n.done(alarm);
     };

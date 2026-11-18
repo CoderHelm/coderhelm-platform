@@ -1662,7 +1662,7 @@ async fn role_checks(
                 detail: "Coderhelm can use the role, and only with your private ID.".into(),
                 fix: None,
             }],
-            Ok(s),
+            Ok(s.into_session()),
         ),
         Err(e) => (
             vec![Check {

@@ -17,9 +17,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use super::aws::{
-    assume_exact, install_read_role, install_target, own_session, AwsTarget, Session,
-};
+use super::aws::{assume, AwsTarget, Session, TeamSession};
 use crate::log_reader::{self, ABILITIES};
 
 /// What the simulator said about one action.
@@ -554,7 +552,7 @@ async fn simulate(s: &Session, target: &AwsTarget) -> Result<Vec<Simulated>, boo
 }
 
 /// The cheapest real read per ability: `Some(false)` when refused.
-async fn probes(s: &Session) -> Vec<(&'static str, Option<bool>)> {
+async fn probes(s: &TeamSession) -> Vec<(&'static str, Option<bool>)> {
     let ok = |r: Result<(), bool>| match r {
         Ok(()) => Some(true),
         Err(true) => Some(false),
@@ -636,33 +634,22 @@ pub async fn check(
     actor: &str,
     now: &str,
 ) -> PermissionCheck {
-    let own = install_read_role();
-    let install_account = super::aws::in_install_account(&target.role_arn, own.as_deref());
-    if let Some(t) = install_target(target, own.as_deref()) {
-        if let Some(session) = own_session(&t.region) {
-            // The install's own role, checked as the role it is.
-            let mut c = check_with(session, &t, now).await;
-            c.install_account = true;
-            c.install_role = true;
-            return c;
-        }
-    }
+    // The role every read of the account is made with ([`assume`]), also in
+    // a self-hosted install's own account: the check and the reads can't
+    // disagree about which role lacks what.
     let mut c = PermissionCheck::new(target, now);
-    let session = match assume_exact(sts, target, actor).await {
+    let session = match assume(sts, target, actor).await {
         Ok(s) => s,
         Err(e) => {
             c.error = e.message;
-            c.install_account = install_account;
             return c;
         }
     };
-    let mut c = check_with(session, target, now).await;
-    c.install_account = install_account;
-    c
+    check_with(session, target, now).await
 }
 
 /// [`check`] with a session on `target`'s role.
-async fn check_with(session: Session, target: &AwsTarget, now: &str) -> PermissionCheck {
+async fn check_with(session: TeamSession, target: &AwsTarget, now: &str) -> PermissionCheck {
     let mut c = PermissionCheck::new(target, now);
     c.works = true;
     match simulate(&session, target).await {

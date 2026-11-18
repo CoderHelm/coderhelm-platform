@@ -9160,8 +9160,24 @@ async fn finish_without_code(
         )
         .await;
         let refused = common::role_wait::refused_this_run(&gaps, &run_started_at(msg, start));
-        match common::role_wait::ending(&left.human, refused) {
+        let went_on = common::role_wait::went_on(
+            &state.dynamo,
+            &state.config.settings_table_name,
+            &msg.team_id,
+            run_id,
+        )
+        .await;
+        match common::role_wait::ending_after(&left.human, refused, went_on.as_ref()) {
             common::role_wait::Ending::Person => {}
+            common::role_wait::Ending::OwnFailure(actions) => {
+                let line = common::role_wait::own_failure_line(&actions);
+                error!(run_id, actions = ?actions, "{line}");
+                add_progress_note(state, &msg.team_id, run_id, &line).await;
+                return NoCodeEnd::PlanAgain(format!(
+                    "the plan stopped on reads the re-check had read as the team's role ({})",
+                    actions.join(", ")
+                ));
+            }
             common::role_wait::Ending::AwaitRole(gaps) => {
                 waiting = Some(common::role_wait::Waiting::of(
                     run_id,

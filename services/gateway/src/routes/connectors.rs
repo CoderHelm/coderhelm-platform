@@ -931,13 +931,9 @@ pub async fn aws_check(
     Ok(Json(json!({
         "check": check,
         "missing": missing,
-        // The install's own account gets these with its version updates.
-        "update_url": if missing.is_empty()
-            || common::live::aws::in_install_account(
-                &t.role_arn,
-                common::live::aws::install_read_role().as_deref(),
-            )
-        {
+        // The team's role reads every account, the install's own too: its
+        // update stack is what adds a read.
+        "update_url": if missing.is_empty() {
             None
         } else {
             update_stack_url(&t.region, &common::log_reader::Chosen::default())

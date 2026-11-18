@@ -49,6 +49,11 @@ pub enum Ending {
     AwaitRole(Vec<Gap>),
     /// Nothing for a person and nothing to wait for: plan again.
     PlanAgain,
+    /// The run was started again because a re-check read these actions as
+    /// the team's role, and the run was refused them anyway: CoderHelm's own
+    /// failure (the run and the re-check disagreed). It never waits again;
+    /// it goes on with what it has.
+    OwnFailure(Vec<String>),
 }
 
 /// Pure: how the run ends. `person_items` are the items left for a person
@@ -62,6 +67,49 @@ pub fn ending(person_items: &[String], refused: Vec<Gap>) -> Ending {
     } else {
         Ending::PlanAgain
     }
+}
+
+/// Pure: [`ending`] for a run [`went_on`] started after a re-check read
+/// `went_on`'s actions: refused one of them again, it ends
+/// [`Ending::OwnFailure`] instead of waiting, so a run restarts at most once
+/// for the same refused read.
+pub fn ending_after(
+    person_items: &[String],
+    refused: Vec<Gap>,
+    went_on: Option<&Waiting>,
+) -> Ending {
+    match ending(person_items, refused) {
+        Ending::AwaitRole(gaps) => {
+            let again: Vec<String> = went_on
+                .map(|w| {
+                    let mut a: Vec<String> = Vec::new();
+                    for g in &gaps {
+                        for x in &g.actions {
+                            if w.actions.contains(x) && !a.contains(x) {
+                                a.push(x.clone());
+                            }
+                        }
+                    }
+                    a
+                })
+                .unwrap_or_default();
+            if again.is_empty() {
+                Ending::AwaitRole(gaps)
+            } else {
+                Ending::OwnFailure(again)
+            }
+        }
+        e => e,
+    }
+}
+
+/// Pure: the one line a run that ended [`Ending::OwnFailure`] says.
+pub fn own_failure_line(actions: &[String]) -> String {
+    format!(
+        "CoderHelm's own failure: the re-check read {} as the team's role, and this run was \
+         refused it anyway. It goes on with what it has instead of waiting again.",
+        actions.join(", ")
+    )
 }
 
 /// Pure: the install's recorded gaps this run met: refused at or after
@@ -215,6 +263,54 @@ pub async fn list(dynamo: &DynamoClient, table: &str, team_id: &str) -> Vec<Wait
         .filter_map(|i| i.get("waiting")?.as_s().ok())
         .filter_map(|j| serde_json::from_str(j).ok())
         .collect()
+}
+
+/// The run a re-check started again (`new_run`), and what that re-check
+/// read: [`ending_after`] never lets it wait for the same reads twice.
+pub const WENT_ON_PREFIX: &str = "ROLE_WENT_ON#";
+
+/// Records that `new_run` was started because the role read `w`'s actions
+/// (best effort).
+pub async fn record_went_on(
+    dynamo: &DynamoClient,
+    table: &str,
+    team_id: &str,
+    new_run: &str,
+    w: &Waiting,
+) {
+    let Ok(json) = serde_json::to_string(w) else {
+        return;
+    };
+    let res = dynamo
+        .put_item()
+        .table_name(table)
+        .item("pk", attr(team_id))
+        .item("sk", attr(&format!("{WENT_ON_PREFIX}{new_run}")))
+        .item("waiting", attr(&json))
+        .send()
+        .await;
+    if let Err(e) = res {
+        tracing::warn!(team_id, new_run, error = %e, "Could not record the run a role re-check started");
+    }
+}
+
+/// What the re-check that started `run_id` read, when one did.
+pub async fn went_on(
+    dynamo: &DynamoClient,
+    table: &str,
+    team_id: &str,
+    run_id: &str,
+) -> Option<Waiting> {
+    let out = dynamo
+        .get_item()
+        .table_name(table)
+        .key("pk", attr(team_id))
+        .key("sk", attr(&format!("{WENT_ON_PREFIX}{run_id}")))
+        .send()
+        .await
+        .ok()?;
+    let json = out.item()?.get("waiting")?.as_s().ok()?.clone();
+    serde_json::from_str(&json).ok()
 }
 
 /// The wait is over (the run went on, or ended another way).

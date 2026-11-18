@@ -48,7 +48,7 @@ pub trait Judge: Send + Sync {
 /// The real environment.
 pub struct Live<'a> {
     /// A session on the team's log reader role for the target's account.
-    pub session: Option<Session>,
+    pub session: Option<crate::live::aws::TeamSession>,
     /// The team's code, through its GitHub App installation.
     pub host: Option<&'a dyn RepoHost>,
     pub dynamo: &'a DynamoClient,

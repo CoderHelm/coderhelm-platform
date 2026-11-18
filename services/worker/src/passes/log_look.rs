@@ -44,7 +44,7 @@ fn refusal(e: &impl ProvideErrorMetadata, action: &str) -> Option<String> {
 
 pub struct LiveLook<'a> {
     /// A session on the team's log reader role in the finding's account.
-    pub session: Option<Session>,
+    pub session: Option<common::live::aws::TeamSession>,
     pub host: Option<&'a dyn RepoHost>,
     /// The team's enabled repos (`owner/name`).
     pub repos: Vec<String>,
