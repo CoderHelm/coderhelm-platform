@@ -503,6 +503,10 @@ pub const CAPABILITIES: &[Capability] = &[
             "graph::rebuild",
             "infrastructure::refresh_infrastructure",
             "infrastructure::refresh_repo_infrastructure",
+            // A repository's preview access (see routes::preview_access).
+            "preview_access::get",
+            "preview_access::put",
+            "preview_access::delete",
             // The staging-only CMS write connection (see routes::staging_cms).
             "staging_cms::get",
             "staging_cms::put",

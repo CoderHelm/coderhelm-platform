@@ -427,7 +427,7 @@ pub(crate) async fn two_way(
 }
 
 /// The team's test address for the repository (Tests settings), as set.
-async fn test_address(state: &WorkerState, team_id: &str, repo: &str) -> Option<String> {
+pub(crate) async fn test_address(state: &WorkerState, team_id: &str, repo: &str) -> Option<String> {
     let st = common::e2e::store::Store::new(&state.dynamo, &state.config.tests_table_name);
     if !st.enabled() {
         return None;

@@ -462,6 +462,12 @@ fn build_app(state: Arc<AppState>) -> Router {
         .route("/runs/close", post(routes::run_close::close_runs))
         .route("/repos", get(routes::api::list_repos))
         .route(
+            "/repos/:owner/:name/preview-access",
+            get(routes::preview_access::get)
+                .put(routes::preview_access::put)
+                .delete(routes::preview_access::delete),
+        )
+        .route(
             "/repos/:owner/:name/staging-cms",
             get(routes::staging_cms::get)
                 .put(routes::staging_cms::put)

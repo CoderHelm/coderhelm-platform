@@ -1,0 +1,10 @@
+[
+  {"id": 1, "user": {"login": "someone", "type": "User"},
+   "body": "Looks good, see https://pr-12.preview.example.com/old", "created_at": "2026-11-17T09:00:00Z", "updated_at": "2026-11-17T09:00:00Z"},
+  {"id": 2, "user": {"login": "preview-host[bot]", "type": "Bot"},
+   "body": "The latest updates on your projects.\n\n| Name | Status | Preview | Comments | Updated (UTC) |\n| :--- | :----- | :------ | :------- | :------ |\n| **admin** | ✅ Ready ([Inspect](https://console.host.example/team/admin/dpl_9)) | [Visit Preview](https://admin-git-feature-signup-form-team.host.example) | 💬 [**Add feedback**](https://host.example/feedback) | Nov 17, 2026 10:03am |\n| **web** | 🔄 Building ([Inspect](https://console.host.example/team/web/dpl_8)) | [Visit Preview](https://web-git-feature-signup-form-team.host.example) | 💬 [**Add feedback**](https://host.example/feedback) | Nov 17, 2026 10:02am |\n",
+   "created_at": "2026-11-16T15:00:00Z", "updated_at": "2026-11-17T10:03:30Z"},
+  {"id": 3, "user": {"login": "static-host[bot]", "type": "Bot"},
+   "body": "### ✅ Deploy Preview for *acme-web* ready!\n\n| Name | Link |\n|:-:|------------------------|\n|🔨 Latest commit | 0aa11bb22cc33dd44ee55ff6677889900aabbccd |\n|🔍 Latest deploy log | https://app.static-host.example/sites/acme-web/deploys/65aa |\n|😎 Deploy Preview | [https://deploy-preview-12--acme-web.static-host.example](https://deploy-preview-12--acme-web.static-host.example) |",
+   "created_at": "2026-11-16T15:00:00Z", "updated_at": "2026-11-16T15:05:00Z"}
+]

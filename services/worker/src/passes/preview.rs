@@ -15,14 +15,20 @@
 //!   the workflows need (only labels the team's settings allow, never a
 //!   shared environment's), starts a workflow that counts labels only from
 //!   a push with an empty commit on CoderHelm's own branch, and reads the
-//!   covering checks' results and the preview's address.
+//!   covering checks' results, and finds the head's preview wherever the
+//!   team's host or CI publishes it (`common::preview_find`: deployments,
+//!   deploy statuses, preview checks, bot comments, the description, the
+//!   team's address template), waiting a bounded time while it builds.
 //! - [`capture`] runs once the preview is up and its end-to-end checks
 //!   passed, in a step of the watch: a failed capture says why in one line
-//!   and is never retried into a pass.
+//!   and is never retried into a pass. A protected preview is opened with
+//!   the access the team saved for the repository (`common::preview_access`).
 
 use aws_sdk_dynamodb::types::AttributeValue;
 use base64::Engine as _;
 use common::preview::{self as pv, CheckResult, Outcome, Shot, Stage, State};
+use common::preview_access::{self as pa, PreviewAccess};
+use common::preview_find::{self as pf, Answer};
 use tracing::{info, warn};
 
 use super::attr_s;
@@ -113,12 +119,8 @@ fn outcome_of(run: &serde_json::Value) -> Outcome {
     }
 }
 
-/// The covering checks' newest runs on the head, and the preview address
-/// any of them printed.
-fn covering_results(
-    runs: &serde_json::Value,
-    covers: &[pv::Covering],
-) -> (Vec<CheckResult>, Option<String>) {
+/// The covering checks' newest runs on the head.
+fn covering_results(runs: &serde_json::Value, covers: &[pv::Covering]) -> Vec<CheckResult> {
     // The newest run of each covering check that ran: a check skipped on
     // the draft and run once it was ready reads as run, and a later event
     // that skips it (another label added) doesn't undo a run.
@@ -140,26 +142,193 @@ fn covering_results(
             None => newest.push((name, r)),
         }
     }
-    let mut out: Vec<CheckResult> = Vec::new();
-    let mut url = None;
-    for (name, r) in newest {
-        if url.is_none() {
-            url = [
-                r["output"]["summary"].as_str(),
-                r["output"]["text"].as_str(),
-                r["details_url"].as_str(),
-            ]
-            .into_iter()
-            .flatten()
-            .find_map(pv::url_in);
-        }
-        out.push(CheckResult {
+    newest
+        .into_iter()
+        .map(|(name, r)| CheckResult {
             name: name.to_string(),
             outcome: outcome_of(r),
             url: r["html_url"].as_str().unwrap_or("").to_string(),
+        })
+        .collect()
+}
+
+/// The repository's preview access with its opened secret ("" when it has
+/// none). None when the team saved none.
+pub(crate) async fn load_access(
+    state: &WorkerState,
+    team_id: &str,
+    repo: &str,
+) -> Option<(PreviewAccess, String)> {
+    let item = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(team_id))
+        .key("sk", attr_s(&pa::sk(repo)))
+        .send()
+        .await
+        .ok()?
+        .item?;
+    let a = PreviewAccess::from_item(&item)?;
+    let sealed = item
+        .get(pa::SECRET_ATTR)
+        .and_then(|v| v.as_s().ok())
+        .filter(|s| !s.is_empty());
+    let secret = match sealed {
+        Some(sealed) if a.kind != pa::Kind::None => {
+            let kms = common::mcp_credentials::Kms {
+                client: &state.kms,
+                key_id: &state.config.secrets_key_id,
+            };
+            match pa::open(&kms, team_id, repo, sealed).await {
+                Ok(t) => t,
+                Err(e) => {
+                    warn!(repo, error = %e, "Could not open the preview access secret");
+                    String::new()
+                }
+            }
+        }
+        _ => String::new(),
+    };
+    Some((a, secret))
+}
+
+/// The team's preview address template for the repository: its preview
+/// access, else a Tests settings test address that names the pull request.
+async fn template_of(
+    state: &WorkerState,
+    team_id: &str,
+    repo: &str,
+    access: Option<&PreviewAccess>,
+) -> Option<String> {
+    if let Some(a) = access.map(|a| a.address.trim()).filter(|a| !a.is_empty()) {
+        return Some(a.to_string());
+    }
+    super::ci_repro::test_address(state, team_id, repo)
+        .await
+        .filter(|t| pf::is_per_change(t))
+}
+
+/// Everything on the pull request that says where the head's preview is.
+#[allow(clippy::too_many_arguments)]
+async fn sightings(
+    gh: &GitHubClient,
+    p: Pr<'_>,
+    pr: &serde_json::Value,
+    head: &str,
+    branch: &str,
+    runs: &serde_json::Value,
+    covers: &[pv::Covering],
+    template: Option<&str>,
+) -> Vec<pf::Sighting> {
+    let mut all = Vec::new();
+    match gh.deployments_with_statuses(p.owner, p.repo, head).await {
+        Ok(d) => all.extend(pf::deployments(&d, head)),
+        Err(e) => warn!(pr = p.number, error = %e, "Could not read the head's deployments"),
+    }
+    match gh.commit_statuses(p.owner, p.repo, head).await {
+        Ok(Some(c)) => all.extend(pf::statuses(&c, head)),
+        Ok(None) => {}
+        Err(e) => warn!(pr = p.number, error = %e, "Could not read the head's statuses"),
+    }
+    all.extend(pf::check_runs(runs, head, covers));
+    let head_at = gh
+        .commit_time(p.owner, p.repo, head)
+        .await
+        .unwrap_or_default();
+    match gh.list_issue_comments(p.owner, p.repo, p.number).await {
+        Ok(c) => all.extend(pf::comments(&c, head, &head_at)),
+        Err(e) => warn!(pr = p.number, error = %e, "Could not read the pull request's comments"),
+    }
+    all.extend(pf::body(pr["body"].as_str().unwrap_or(""), head));
+    if let Some(url) = template.and_then(|t| {
+        pf::expand(
+            t,
+            pf::Vars {
+                pr: p.number,
+                branch,
+                sha: head,
+                owner: p.owner,
+                repo: p.repo,
+            },
+        )
+    }) {
+        all.push(pf::Sighting {
+            source: pf::Source::Template,
+            name: String::new(),
+            url,
+            ready: pf::Ready::Up,
+            tied: false,
         });
     }
-    (out, url)
+    all
+}
+
+/// Where the preview stands once the repository's own preview checks
+/// (`from_checks`, None when no workflow covers the change) and what the
+/// pull request publishes about the head's preview are put together, with
+/// the wait bounded. Pure: every case is tested.
+pub fn settle(st: &mut State, from_checks: Option<Stage>, answer: &Answer, now: &str) {
+    let waited = pf::minutes_between(&st.waiting_since, now);
+    let mut waiting_on = String::new();
+    match from_checks {
+        Some(stage) => st.stage = stage,
+        None => st.stage = Stage::Triggered,
+    }
+    match answer {
+        Answer::Up(f) => {
+            st.url = f.url.clone();
+            st.found = f.clone();
+            match from_checks {
+                // No workflow of the repository's covers it: the host's own
+                // preview of the head is up.
+                None => st.stage = Stage::Ready,
+                // The workflows couldn't be started, but the head has a
+                // preview: it is checked on that.
+                Some(Stage::Blocked) => {
+                    st.stage = Stage::Ready;
+                    st.why.clear();
+                }
+                Some(_) => {}
+            }
+        }
+        Answer::Building(what) => {
+            waiting_on = what.clone();
+            if from_checks.is_none() || st.stage == Stage::Ready {
+                st.stage = Stage::Deploying;
+            }
+        }
+        Answer::Failed(what) => {
+            if from_checks.is_none()
+                || matches!(st.stage, Stage::Ready | Stage::Deploying | Stage::Triggered)
+            {
+                st.stage = Stage::Failed;
+                st.why = format!("{what} for this commit, so its pages couldn't be captured");
+            }
+        }
+        Answer::Nothing if from_checks.is_none() => {
+            if waited >= pf::GRACE_MINS {
+                st.stage = Stage::Blocked;
+                st.why = format!(
+                    "nothing on this commit publishes a preview (no deployment, deploy status, preview check, bot comment or description link) and the team set no preview address in {}, so no page could be captured",
+                    pv::ACCESS_SETTING
+                );
+            }
+        }
+        Answer::Nothing => {}
+    }
+    if matches!(st.stage, Stage::Triggered | Stage::Deploying) && waited >= pf::WAIT_BUDGET_MINS {
+        let what = if waiting_on.is_empty() {
+            "its checks hadn't finished".to_string()
+        } else {
+            format!("{waiting_on} was still building")
+        };
+        st.stage = Stage::Blocked;
+        st.why = format!(
+            "the preview of this commit wasn't up within {} minutes ({what}), so its pages couldn't be captured; a new push starts the wait again",
+            pf::WAIT_BUDGET_MINS
+        );
+    }
 }
 
 /// The workflow files at `git_ref`, with their text.
@@ -437,85 +606,101 @@ pub async fn advance(
     });
     st.covers = plan.covers.clone();
     st.draft_gated = plan.draft_gated.clone();
-    if !plan.has_path() {
-        st.stage = Stage::Blocked;
-        st.why =
-            "the repository has no preview deploy for this change, so no page could be captured"
-                .into();
-        save(state, p, &st).await;
-        return Some(st);
-    }
-    // Start what the workflows need: once per label per head.
-    let mut add = Vec::new();
-    for l in &plan.add {
-        if st.labels_added.iter().any(|a| a.eq_ignore_ascii_case(l)) {
-            continue;
+    let now = chrono::Utc::now().to_rfc3339();
+    st.looked_at = now.clone();
+    st.waiting_since = same_head
+        .map(|s| s.waiting_since.clone())
+        .filter(|w| !w.is_empty())
+        .unwrap_or_else(|| now.clone());
+    let mut from_checks = None;
+    if plan.has_path() {
+        // Start what the workflows need: once per label per head.
+        let mut add = Vec::new();
+        for l in &plan.add {
+            if st.labels_added.iter().any(|a| a.eq_ignore_ascii_case(l)) {
+                continue;
+            }
+            if super::review_pr::may_add_label(state, p.team_id, p.owner, p.repo, l).await {
+                add.push(l.clone());
+            }
         }
-        if super::review_pr::may_add_label(state, p.team_id, p.owner, p.repo, l).await {
-            add.push(l.clone());
-        }
-    }
-    let mut blocked = plan.blocked.clone();
-    if !add.is_empty() {
-        match gh.add_labels(p.owner, p.repo, p.number, &add).await {
-            Ok(_) => {
-                info!(pr = p.number, labels = ?add, "Added the labels that start the preview and its end-to-end checks");
-                st.labels_added.extend(add.iter().cloned());
-                if plan.needs_push && !draft && !branch.is_empty() {
-                    let pushed = nudge(gh, p.owner, p.repo, &branch, &head).await;
-                    info!(
-                        pr = p.number,
-                        pushed, "Pushed an empty commit so the labels count"
-                    );
+        let mut blocked = plan.blocked.clone();
+        if !add.is_empty() {
+            match gh.add_labels(p.owner, p.repo, p.number, &add).await {
+                Ok(_) => {
+                    info!(pr = p.number, labels = ?add, "Added the labels that start the preview and its end-to-end checks");
+                    st.labels_added.extend(add.iter().cloned());
+                    if plan.needs_push && !draft && !branch.is_empty() {
+                        let pushed = nudge(gh, p.owner, p.repo, &branch, &head).await;
+                        info!(
+                            pr = p.number,
+                            pushed, "Pushed an empty commit so the labels count"
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!(pr = p.number, error = %e, "Could not add the preview labels");
+                    blocked.push(format!(
+                        "CoderHelm couldn't add {} ({})",
+                        add.join(", "),
+                        common::truncate_str(&e.to_string(), 120)
+                    ));
                 }
             }
-            Err(e) => {
-                warn!(pr = p.number, error = %e, "Could not add the preview labels");
-                blocked.push(format!(
-                    "CoderHelm couldn't add {} ({})",
-                    add.join(", "),
-                    common::truncate_str(&e.to_string(), 120)
-                ));
-            }
         }
+        let not_allowed: Vec<&String> = plan
+            .add
+            .iter()
+            .filter(|l| {
+                !st.labels_added.iter().any(|a| a.eq_ignore_ascii_case(l))
+                    && !on_pr.iter().any(|o| o.eq_ignore_ascii_case(l))
+            })
+            .collect();
+        if !not_allowed.is_empty() && add.is_empty() {
+            blocked.push(format!(
+                "the team's label settings don't let CoderHelm add {}",
+                not_allowed
+                    .iter()
+                    .map(|l| format!("`{l}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        st.checks = covering_results(&runs, &plan.covers);
+        let triggered = !st.labels_added.is_empty() || draft;
+        let mut stage = pv::progress(&st.checks, triggered);
+        let none_ran = st.checks.iter().all(|c| c.outcome == Outcome::Skipped);
+        if none_ran && !blocked.is_empty() && st.labels_added.is_empty() && !draft {
+            stage = Stage::Blocked;
+            st.why = blocked.join("; ");
+        }
+        from_checks = Some(stage);
     }
-    let not_allowed: Vec<&String> = plan
-        .add
-        .iter()
-        .filter(|l| {
-            !st.labels_added.iter().any(|a| a.eq_ignore_ascii_case(l))
-                && !on_pr.iter().any(|o| o.eq_ignore_ascii_case(l))
-        })
-        .collect();
-    if !not_allowed.is_empty() && add.is_empty() {
-        blocked.push(format!(
-            "the team's label settings don't let CoderHelm add {}",
-            not_allowed
-                .iter()
-                .map(|l| format!("`{l}`"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
-    }
-    let (results, url) = covering_results(&runs, &plan.covers);
-    st.checks = results;
-    let triggered = !st.labels_added.is_empty() || draft;
-    st.stage = pv::progress(&st.checks, triggered);
-    let none_ran = st.checks.iter().all(|c| c.outcome == Outcome::Skipped);
-    if none_ran && !blocked.is_empty() && st.labels_added.is_empty() && !draft {
-        st.stage = Stage::Blocked;
-        st.why = blocked.join("; ");
-    }
-    st.url = match url {
-        Some(u) => u,
-        None if matches!(st.stage, Stage::Ready | Stage::Deploying) => gh
-            .deployment_urls(p.owner, p.repo, &head)
-            .await
-            .ok()
-            .and_then(|d| pv::url_from_deployments(&d))
-            .unwrap_or_default(),
-        None => String::new(),
-    };
+    // Where the head's preview is, wherever the team's host or CI
+    // publishes it.
+    let repo_full = format!("{}/{}", p.owner, p.repo);
+    let access = load_access(state, p.team_id, &repo_full).await;
+    let template = template_of(
+        state,
+        p.team_id,
+        &repo_full,
+        access.as_ref().map(|(a, _)| a),
+    )
+    .await;
+    let seen = sightings(
+        gh,
+        p,
+        pr,
+        &head,
+        &branch,
+        &runs,
+        &plan.covers,
+        template.as_deref(),
+    )
+    .await;
+    let answer = pf::resolve(&seen, &changed, &pf::apps_of(&tree));
+    info!(pr = p.number, sightings = seen.len(), answer = ?answer, "Read where the head's preview is");
+    settle(&mut st, from_checks, &answer, &now);
     // Captured on this head already: it stays checked.
     if st.stage == Stage::Ready {
         if let Some(prev) = same_head.filter(|s| !s.shots.is_empty() || s.stage == Stage::Checked) {
@@ -544,7 +729,10 @@ pub async fn capture(
     }
     st.stage = Stage::Checked;
     if st.url.is_empty() {
-        st.why = "the preview's address wasn't in its deploy's output or deployments, so its pages couldn't be captured".into();
+        st.why = format!(
+            "the preview's checks passed but nothing on this commit published its address (no deployment, deploy status, preview check, bot comment or description link) and no preview address is set in {}, so its pages couldn't be captured",
+            pv::ACCESS_SETTING
+        );
         save(state, p, st).await;
         return;
     }
@@ -553,7 +741,19 @@ pub async fn capture(
         .next()
         .unwrap_or("")
         .to_string();
-    let base = format!("https://{host}");
+    let base = pv::capture_base(&st.url);
+    let repo_full = format!("{}/{}", p.owner, p.repo);
+    let (kind, secret) = match load_access(state, p.team_id, &repo_full).await {
+        Some((a, s)) if a.kind != pa::Kind::None && !s.is_empty() => (a.kind, s),
+        _ => (pa::Kind::None, String::new()),
+    };
+    let hide = |t: &str| {
+        if secret.is_empty() {
+            t.to_string()
+        } else {
+            t.replace(secret.as_str(), "***")
+        }
+    };
     let tree: Vec<String> = gh
         .get_tree(p.owner, p.repo, &st.head)
         .await
@@ -561,7 +761,7 @@ pub async fn capture(
         .unwrap_or_default();
     let changed = changed_of(gh, p).await;
     let pages = pv::routes(&tree, &changed);
-    let script = pv::capture_script(&base, &pages);
+    let script = pv::capture_script(&base, &pages, kind);
     let source = match super::skill_run::pack(&[("capture.mjs".to_string(), script)]) {
         Ok(b) => b,
         Err(e) => {
@@ -592,7 +792,7 @@ pub async fn capture(
                 key: &key,
                 source,
                 cmd: &cmd,
-                secret: None,
+                secret: (!secret.is_empty()).then_some(secret.as_str()),
                 hosts,
             },
             deadline,
@@ -603,13 +803,16 @@ pub async fn capture(
         Ok(o) => {
             st.why = format!(
                 "the capture didn't run in the sandbox ({})",
-                common::truncate_str(o.output.lines().next().unwrap_or(""), 120)
+                common::truncate_str(&hide(o.output.lines().next().unwrap_or("")), 120)
             );
             save(state, p, st).await;
             return;
         }
         Err(e) => {
-            st.why = format!("the sandbox couldn't run the capture ({e})");
+            st.why = format!(
+                "the sandbox couldn't run the capture ({})",
+                hide(&e.to_string())
+            );
             save(state, p, st).await;
             return;
         }
@@ -620,7 +823,7 @@ pub async fn capture(
         .find(|(n, _)| n.ends_with("shots.json"))
         .and_then(|(_, b)| serde_json::from_str(b).ok())
         .unwrap_or_default();
-    if let Some(why) = pv::why_no_shot(&report) {
+    if let Some(why) = pv::why_no_shot(&report, kind != pa::Kind::None) {
         st.why = why;
         save(state, p, st).await;
         return;
@@ -671,7 +874,7 @@ async fn keep_images(
     let short = head.get(..12).unwrap_or(head);
     let mut entries: Vec<(String, Option<GitEntry>)> = Vec::new();
     let mut shots: Vec<(Shot, String)> = Vec::new();
-    for c in report.iter().filter(|c| (1..400).contains(&c.status)) {
+    for c in report.iter().filter(|c| c.shot()) {
         let Some((_, b64)) = files
             .iter()
             .find(|(n, _)| n.ends_with(&format!("{}.png.b64", c.name)))
@@ -735,7 +938,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn covering_runs_are_read_with_the_preview_address_they_print() {
+    fn covering_runs_are_read_newest_first() {
         let runs = serde_json::json!({"check_runs": [
             {"name": "Deploy Preview Web App", "status": "completed", "conclusion": "success",
              "html_url": "https://github.com/o/r/runs/1",
@@ -754,11 +957,10 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let (r, url) = covering_results(&runs, &covers);
+        let r = covering_results(&runs, &covers);
         assert_eq!(r.len(), 2);
         assert_eq!(r[0].outcome, Outcome::Passed);
         assert_eq!(r[1].outcome, Outcome::Running);
-        assert_eq!(url.as_deref(), Some("https://pr-9.preview-web.example.com"));
         assert_eq!(pv::progress(&r, true), Stage::Deploying);
     }
 
@@ -776,7 +978,7 @@ mod tests {
             check: "E2E on preview".into(),
             ..Default::default()
         }];
-        let (r, _) = covering_results(&runs, &covers);
+        let r = covering_results(&runs, &covers);
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].outcome, Outcome::Passed);
     }
@@ -796,5 +998,118 @@ mod tests {
             ..Default::default()
         };
         assert!(!settled(&pending, "abc"));
+    }
+
+    const T0: &str = "2026-11-17T10:00:00Z";
+
+    fn waiting() -> State {
+        State {
+            head: "abc".into(),
+            waiting_since: T0.into(),
+            ..Default::default()
+        }
+    }
+
+    fn up(source: pf::Source) -> Answer {
+        Answer::Up(pf::Found {
+            url: "https://pr-12.preview.example.com".into(),
+            source,
+            name: String::new(),
+            tied: true,
+        })
+    }
+
+    #[test]
+    fn a_hosts_own_preview_counts_when_no_workflow_covers_the_change() {
+        let mut st = waiting();
+        settle(
+            &mut st,
+            None,
+            &up(pf::Source::Deployment),
+            "2026-11-17T10:03:00Z",
+        );
+        assert_eq!(st.stage, Stage::Ready);
+        assert_eq!(st.url, "https://pr-12.preview.example.com");
+        assert_eq!(st.found.source, pf::Source::Deployment);
+        let mut st = waiting();
+        settle(
+            &mut st,
+            None,
+            &Answer::Building("the deployment".into()),
+            "2026-11-17T10:03:00Z",
+        );
+        assert_eq!(st.stage, Stage::Deploying);
+        assert!(st.pending());
+    }
+
+    #[test]
+    fn a_preview_still_building_after_its_checks_passed_is_waited_on() {
+        let mut st = waiting();
+        settle(
+            &mut st,
+            Some(Stage::Ready),
+            &Answer::Building("the deployment `pr-12`".into()),
+            "2026-11-17T10:03:00Z",
+        );
+        assert_eq!(st.stage, Stage::Deploying);
+        // The workflows couldn't start, but the head has its preview.
+        let mut st = waiting();
+        st.why = "the label isn't allowed".into();
+        settle(
+            &mut st,
+            Some(Stage::Blocked),
+            &up(pf::Source::Comment),
+            "2026-11-17T10:03:00Z",
+        );
+        assert_eq!(st.stage, Stage::Ready);
+        assert!(st.why.is_empty());
+    }
+
+    #[test]
+    fn a_failed_head_deploy_is_said_with_where_it_was_read() {
+        let mut st = waiting();
+        settle(
+            &mut st,
+            None,
+            &Answer::Failed("the head commit's deployment `Preview` failed".into()),
+            "2026-11-17T10:03:00Z",
+        );
+        assert_eq!(st.stage, Stage::Failed);
+        assert!(st.why.contains("deployment `Preview` failed"), "{}", st.why);
+    }
+
+    #[test]
+    fn the_wait_is_bounded() {
+        // Nothing at all on the head: a short grace, then no preview.
+        let mut st = waiting();
+        settle(&mut st, None, &Answer::Nothing, "2026-11-17T10:02:00Z");
+        assert_eq!(st.stage, Stage::Triggered);
+        let mut st = waiting();
+        settle(&mut st, None, &Answer::Nothing, "2026-11-17T10:07:00Z");
+        assert_eq!(st.stage, Stage::Blocked);
+        assert!(st.why.contains(pv::ACCESS_SETTING), "{}", st.why);
+        // Building for longer than the budget: said, never waited on for ever.
+        let mut st = waiting();
+        settle(
+            &mut st,
+            None,
+            &Answer::Building("the deploy status `site/deploy-preview`".into()),
+            "2026-11-17T11:00:00Z",
+        );
+        assert_eq!(st.stage, Stage::Blocked);
+        assert!(
+            st.why.contains("60 minutes") && st.why.contains("still building"),
+            "{}",
+            st.why
+        );
+        let mut st = waiting();
+        settle(
+            &mut st,
+            Some(Stage::Deploying),
+            &Answer::Nothing,
+            "2026-11-17T11:05:00Z",
+        );
+        assert_eq!(st.stage, Stage::Blocked);
+        assert!(st.why.contains("checks hadn't finished"));
     }
 }

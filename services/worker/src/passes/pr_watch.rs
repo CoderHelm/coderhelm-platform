@@ -308,8 +308,10 @@ pub fn decide_all(status: &str, seen: &Seen, marks: &Marks) -> Act {
 
 /// Whether the head's preview needs a look: the change's recorded state is
 /// of another head or not settled. A look that read nothing new (`fresh`
-/// false) leaves a pending preview to the next change on the pull request.
-pub fn preview_due(stored: &str, head: &str, fresh: bool) -> bool {
+/// false) leaves a pending preview until `preview_find::POLL_SECS` after
+/// its last look (`now`): a host's deploy finishing changes nothing else
+/// on the pull request, and the wait is bounded (`preview::settle`).
+pub fn preview_due(stored: &str, head: &str, fresh: bool, now: &str) -> bool {
     if head.is_empty() {
         return false;
     }
@@ -319,7 +321,11 @@ pub fn preview_due(stored: &str, head: &str, fresh: bool) -> bool {
         Some(st) if super::preview::settled(&st, head) => false,
         // Ready: its pages are captured now, whatever else changed.
         Some(st) if st.stage == common::preview::Stage::Ready => true,
-        Some(_) => fresh,
+        Some(st) => {
+            fresh
+                || common::preview_find::seconds_between(&st.looked_at, now)
+                    >= common::preview_find::POLL_SECS
+        }
     }
 }
 
@@ -1005,10 +1011,14 @@ pub async fn look(state: &WorkerState, github: &GitHubClient, c: &Candidate) -> 
     };
     let mut seen = seen;
     seen.preview_due = seen.open
-        && (preview_due(&c.preview, &seen.head, kept.is_none())
-            || common::preview::State::from_json(&c.preview).is_some_and(|st| {
-                st.head == seen.head && super::preview::unread_failure(&st, &seen.failing)
-            }));
+        && (preview_due(
+            &c.preview,
+            &seen.head,
+            kept.is_none(),
+            &chrono::Utc::now().to_rfc3339(),
+        ) || common::preview::State::from_json(&c.preview).is_some_and(|st| {
+            st.head == seen.head && super::preview::unread_failure(&st, &seen.failing)
+        }));
     let mut act = resume_after_limit(&c.status, &seen, &c.marks, &c.limit_ended)
         .unwrap_or_else(|| decide_all(&c.status, &seen, &c.marks));
     let mut performed = Performed::NotStarted;
@@ -1398,7 +1408,8 @@ mod tests {
     #[test]
     fn an_unchecked_preview_is_picked_up_after_the_run_ended() {
         let mut seen = open();
-        seen.preview_due = preview_due("", &seen.head, true);
+        let now = "2026-11-17T10:00:00Z";
+        seen.preview_due = preview_due("", &seen.head, true, now);
         assert!(seen.preview_due);
         assert_eq!(
             decide_all("completed", &seen, &Marks::default()),
@@ -1418,17 +1429,25 @@ mod tests {
             ..Default::default()
         }
         .to_json();
-        assert!(!preview_due(&done, &seen.head, true));
-        assert!(preview_due(&done, "another", false));
-        // Pending and nothing new on the pull request: the next change.
+        assert!(!preview_due(&done, &seen.head, true, now));
+        assert!(preview_due(&done, "another", false, now));
+        // Pending and nothing new on the pull request: looked at again once
+        // a poll's time has passed since its last look.
         let pending = common::preview::State {
             head: seen.head.clone(),
             stage: common::preview::Stage::Deploying,
+            looked_at: "2026-11-17T09:59:30Z".into(),
             ..Default::default()
         }
         .to_json();
-        assert!(!preview_due(&pending, &seen.head, false));
-        assert!(preview_due(&pending, &seen.head, true));
+        assert!(!preview_due(&pending, &seen.head, false, now));
+        assert!(preview_due(&pending, &seen.head, true, now));
+        assert!(preview_due(
+            &pending,
+            &seen.head,
+            false,
+            "2026-11-17T10:02:00Z"
+        ));
         // Never for a run still in flight.
         assert_eq!(
             decide_all("running", &seen, &Marks::default()),

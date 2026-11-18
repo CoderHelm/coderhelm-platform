@@ -3237,45 +3237,59 @@ impl GitHubClient {
         .await
     }
 
-    /// The address each deployment of `sha` reports, as (environment, url):
-    /// the newest status of each deployment that has one.
-    pub async fn deployment_urls(
+    /// The deployments on commit `sha`, each with its newest statuses (the
+    /// deployments listing filtered by sha, then each one's statuses), for
+    /// `common::preview_find::deployments`. Empty when the installation
+    /// can't read deployments.
+    pub async fn deployments_with_statuses(
         &self,
         owner: &str,
         repo: &str,
         sha: &str,
-    ) -> Result<Vec<(String, String)>, Box<dyn std::error::Error + Send + Sync>> {
-        let deps = self
-            .get(&format!(
-                "{API_BASE}/repos/{owner}/{repo}/deployments?sha={sha}&per_page=10"
-            ))
-            .await?;
+    ) -> Result<
+        Vec<(serde_json::Value, Vec<serde_json::Value>)>,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        let Some(deps) = self
+            .get_granted(
+                "deployments",
+                &format!("/repos/{owner}/{repo}/deployments?sha={sha}&per_page=20"),
+            )
+            .await?
+        else {
+            return Ok(Vec::new());
+        };
         let mut out = Vec::new();
-        for d in deps.as_array().into_iter().flatten().take(10) {
-            let (Some(id), env) = (d["id"].as_u64(), d["environment"].as_str().unwrap_or(""))
-            else {
+        for d in deps.as_array().into_iter().flatten().take(20) {
+            let Some(id) = d["id"].as_u64() else {
                 continue;
             };
             let st = self
-                .get(&format!(
-                    "{API_BASE}/repos/{owner}/{repo}/deployments/{id}/statuses?per_page=5"
-                ))
-                .await?;
-            if let Some(url) = st
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|s| {
-                    s["environment_url"]
-                        .as_str()
-                        .or_else(|| s["target_url"].as_str())
-                })
-                .find(|u| u.starts_with("https://"))
-            {
-                out.push((env.to_string(), url.to_string()));
-            }
+                .get_granted(
+                    "deployments",
+                    &format!("/repos/{owner}/{repo}/deployments/{id}/statuses?per_page=10"),
+                )
+                .await?
+                .and_then(|v| v.as_array().cloned())
+                .unwrap_or_default();
+            out.push((d.clone(), st));
         }
         Ok(out)
+    }
+
+    /// When commit `sha` was made (its committer's time, RFC 3339).
+    pub async fn commit_time(
+        &self,
+        owner: &str,
+        repo: &str,
+        sha: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let c = self.git_commit(owner, repo, sha).await?;
+        Ok(c["committer"]["date"]
+            .as_str()
+            .or_else(|| c["author"]["date"].as_str())
+            .unwrap_or("")
+            .to_string())
     }
 
     /// Points a ref outside `refs/heads/` (no workflow starts on it) at

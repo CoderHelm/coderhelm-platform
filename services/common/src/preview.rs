@@ -32,6 +32,9 @@
 //! - [`routes`] picks the pages to capture from the repository's page files
 //!   and the changed paths; [`capture_script`] is the sandbox script that
 //!   captures them.
+//! - Where the preview is and whether it is up for the head commit is
+//!   `crate::preview_find`'s: deployments, statuses, checks, bot comments,
+//!   the description and the team's address template, tied to the head.
 //! - [`State`] is what the run records ([`FIELD`]) and the description and
 //!   the run page read.
 
@@ -683,6 +686,15 @@ pub struct State {
     /// says (`crate::e2e::failure_read`), with whether this change caused
     /// it.
     pub failures: Vec<crate::e2e::failure_read::FailureRead>,
+    /// Where the preview's address came from (`crate::preview_find`).
+    pub found: crate::preview_find::Found,
+    /// When this head's preview was first waited on (RFC 3339): the wait is
+    /// bounded by `preview_find::WAIT_BUDGET_MINS`.
+    pub waiting_since: String,
+    /// When the preview was last looked at (RFC 3339): a pending preview is
+    /// looked at again every `preview_find::POLL_SECS` even when nothing
+    /// else on the pull request changed.
+    pub looked_at: String,
 }
 
 impl State {
@@ -738,41 +750,6 @@ pub fn progress(results: &[CheckResult], triggered: bool) -> Stage {
         return Stage::Ready;
     }
     Stage::Triggered
-}
-
-/// A preview address in text (a check's output, a deployment, a comment):
-/// the first https URL whose host names a preview.
-pub fn url_in(text: &str) -> Option<String> {
-    for (i, _) in text.match_indices("https://") {
-        let rest = &text[i..];
-        let end = rest
-            .find(|c: char| {
-                c.is_whitespace() || matches!(c, ')' | '"' | '\'' | '>' | '<' | ']' | '`')
-            })
-            .unwrap_or(rest.len());
-        let url = rest[..end].trim_end_matches(['.', ',', ';']);
-        let host = url["https://".len()..].split('/').next().unwrap_or("");
-        if host.to_ascii_lowercase().contains("preview") && !host.contains('@') {
-            return Some(url.to_string());
-        }
-    }
-    None
-}
-
-/// The preview address from the head's deployments: (environment, url)
-/// pairs, a preview environment first, never a shared one.
-pub fn url_from_deployments(deps: &[(String, String)]) -> Option<String> {
-    let ok = |(env, url): &&(String, String)| {
-        url.starts_with("https://") && !is_shared_env_label(env) && role_of(env) != Role::Production
-    };
-    deps.iter()
-        .filter(ok)
-        .find(|(env, url)| {
-            env.to_ascii_lowercase().contains("preview")
-                || url.to_ascii_lowercase().contains("preview")
-        })
-        .or_else(|| deps.iter().find(ok))
-        .map(|(_, u)| u.clone())
 }
 
 // ── end-to-end specs ───────────────────────────────────────────────────────
@@ -1115,12 +1092,37 @@ pub fn shot_name(page: &str, width: &str) -> String {
     format!("{slug}-{width}")
 }
 
+/// The address pages are captured under: the preview's address without
+/// its query or fragment and without a trailing `/`, its path kept (a
+/// preview served under a path, `https://host/pr-12/`, keeps it).
+pub fn capture_base(url: &str) -> String {
+    url.split(['?', '#'])
+        .next()
+        .unwrap_or(url)
+        .trim_end_matches('/')
+        .to_string()
+}
+
+/// How long the capture waits between tries of a page that is still
+/// warming up (404, 502, 503 or 504 on a fresh preview), and how many
+/// tries it makes.
+pub const WARM_TRIES: u32 = 3;
+pub const WARM_WAIT_MS: u32 = 15_000;
+
 /// The sandbox script that captures each page at both widths. It writes
 /// each image base64-encoded (`<name>.png.b64`) and `shots.json` (each
-/// page's status and title) to `$CODERHELM_OUT`; a page that doesn't load
-/// is recorded with its status, never retried into a pass.
-pub fn capture_script(base: &str, pages: &[String]) -> String {
-    let base = base.trim_end_matches('/');
+/// page's status, title and, when the browser was sent to another host,
+/// that host) to `$CODERHELM_OUT`. A page still warming up is tried
+/// [`WARM_TRIES`] times; one that doesn't load is recorded with its status,
+/// never retried into a pass.
+///
+/// `access` is how the preview is protected (`crate::preview_access`). Its
+/// secret is never in the script: the sandbox hands the script its one-time
+/// secret in `GH_TOKEN` (the channel every sandbox script's secret takes),
+/// the script removes it from its environment at once, sends it only to the
+/// preview's own host, and blanks it out of anything it writes.
+pub fn capture_script(base: &str, pages: &[String], access: crate::preview_access::Kind) -> String {
+    let base = capture_base(base);
     let mut jobs = Vec::new();
     for p in pages {
         for (width, (w, h)) in [("desktop", DESKTOP), ("phone", PHONE)] {
@@ -1135,27 +1137,69 @@ pub fn capture_script(base: &str, pages: &[String]) -> String {
         }
     }
     let jobs = serde_json::to_string(&jobs).unwrap_or_else(|_| "[]".into());
+    let base_js = serde_json::to_string(&base).unwrap_or_else(|_| "\"\"".into());
+    let kind = serde_json::to_string(access.as_str()).unwrap_or_else(|_| "\"none\"".into());
     format!(
         r#"import {{ chromium }} from 'playwright';
 import {{ writeFileSync }} from 'node:fs';
 const out = process.env.CODERHELM_OUT || '.';
+const secret = (process.env.GH_TOKEN || '').trim();
+delete process.env.GH_TOKEN; delete process.env.GITHUB_TOKEN;
+const kind = {kind};
+const host = new URL({base_js}).host;
+const hide = (s) => secret ? String(s).split(secret).join('***') : String(s);
+const ctxOpts = {{}};
+const headers = {{}};
+if (kind === 'header' && secret) {{
+  for (const line of secret.split('\n')) {{
+    const i = line.indexOf(':');
+    if (i > 0) headers[line.slice(0, i).trim().toLowerCase()] = line.slice(i + 1).trim();
+  }}
+}}
+if (kind === 'basic' && secret) {{
+  const i = secret.indexOf(':');
+  ctxOpts.httpCredentials = {{ username: secret.slice(0, i), password: secret.slice(i + 1), origin: 'https://' + host }};
+}}
+const withQuery = (u) => (kind === 'query' && secret) ? u + (u.includes('?') ? '&' : '?') + secret : u;
+const warming = (s) => [404, 502, 503, 504].includes(s);
 const jobs = {jobs};
 const results = [];
 const browser = await chromium.launch();
 for (const j of jobs) {{
-  const page = await browser.newPage({{ viewport: {{ width: j.w, height: j.h }} }});
-  let status = 0, title = '', error = '';
+  const context = await browser.newContext({{ viewport: {{ width: j.w, height: j.h }}, ...ctxOpts }});
+  if (Object.keys(headers).length) {{
+    // The secret goes to the preview's own host only, never to a font, a
+    // script or an image another host serves.
+    await context.route('**/*', (route) => {{
+      const req = route.request();
+      let h = '';
+      try {{ h = new URL(req.url()).host; }} catch (e) {{}}
+      if (h === host) route.continue({{ headers: {{ ...req.headers(), ...headers }} }});
+      else route.continue();
+    }});
+  }}
+  const page = await context.newPage();
+  let status = 0, title = '', error = '', left = '';
+  for (let t = 1; t <= {WARM_TRIES}; t++) {{
+    error = '';
+    try {{
+      const res = await page.goto(withQuery(j.url), {{ waitUntil: 'networkidle', timeout: 45000 }});
+      status = res ? res.status() : 0;
+    }} catch (e) {{ status = 0; error = hide(String(e).slice(0, 300)); }}
+    if (!warming(status) && !(status === 0 && error) || t === {WARM_TRIES}) break;
+    await new Promise((r) => setTimeout(r, {WARM_WAIT_MS}));
+  }}
   try {{
-    const res = await page.goto(j.url, {{ waitUntil: 'networkidle', timeout: 45000 }});
-    status = res ? res.status() : 0;
-    title = await page.title();
-    if (status > 0 && status < 400) {{
+    const now = new URL(page.url()).host;
+    if (now && now !== host) left = now;
+    title = hide(await page.title());
+    if (status > 0 && status < 400 && !left) {{
       const png = await page.screenshot({{ fullPage: false }});
       writeFileSync(`${{out}}/${{j.name}}.png.b64`, png.toString('base64'));
     }}
-  }} catch (e) {{ error = String(e).slice(0, 300); }}
-  results.push({{ page: j.page, width: j.width, name: j.name, status, title, error }});
-  await page.close();
+  }} catch (e) {{ error = error || hide(String(e).slice(0, 300)); }}
+  results.push({{ page: j.page, width: j.width, name: j.name, status, title, error, left }});
+  await context.close();
 }}
 await browser.close();
 writeFileSync(`${{out}}/shots.json`, JSON.stringify(results));
@@ -1189,16 +1233,48 @@ pub struct Captured {
     pub status: u16,
     pub title: String,
     pub error: String,
+    /// The host the browser was sent to instead of the preview's (a
+    /// sign-in page), "" when it stayed.
+    pub left: String,
 }
 
-/// Why no page was captured, from the capture's report: a login wall, a
-/// page that didn't load, or nothing at all. None when one was.
-pub fn why_no_shot(report: &[Captured]) -> Option<String> {
-    if report.iter().any(|c| (1..400).contains(&c.status)) {
+impl Captured {
+    /// The page loaded on the preview itself.
+    pub fn shot(&self) -> bool {
+        (1..400).contains(&self.status) && self.left.is_empty()
+    }
+}
+
+/// Where a team gives CoderHelm a protected preview's access.
+pub const ACCESS_SETTING: &str = "Settings, Repositories, Preview access";
+
+/// Why no page was captured, from the capture's report: a sign-in wall
+/// (the preview answered 401 or 403, or sent the browser to another host),
+/// a page that didn't load, or nothing at all. None when one was.
+/// `has_access`: the team saved the preview's access, so a wall means that
+/// access was refused.
+pub fn why_no_shot(report: &[Captured], has_access: bool) -> Option<String> {
+    if report.iter().any(Captured::shot) {
         return None;
     }
-    if report.iter().any(|c| c.status == 401 || c.status == 403) {
-        return Some("the preview asks for a login, so its pages couldn't be captured".into());
+    let wall = report
+        .iter()
+        .find(|c| c.status == 401 || c.status == 403 || !c.left.is_empty());
+    if let Some(c) = wall {
+        let how = if c.left.is_empty() {
+            format!("it answered {}", c.status)
+        } else {
+            format!("it sent the browser to `{}`", c.left)
+        };
+        return Some(if has_access {
+            format!(
+                "the preview refused the access saved in {ACCESS_SETTING} ({how}), so its pages couldn't be captured"
+            )
+        } else {
+            format!(
+                "the preview asks for a sign-in ({how}), so its pages couldn't be captured; give CoderHelm its access in {ACCESS_SETTING}"
+            )
+        });
     }
     if let Some(c) = report.iter().find(|c| c.status >= 400) {
         return Some(format!(
@@ -1598,29 +1674,6 @@ jobs:
     }
 
     #[test]
-    fn a_preview_address_is_found_in_deployments_and_text() {
-        let deps = vec![
-            (
-                "staging".to_string(),
-                "https://staging.example.com".to_string(),
-            ),
-            (
-                "pr-12".to_string(),
-                "https://pr-12.preview-web.example.com".to_string(),
-            ),
-        ];
-        assert_eq!(
-            url_from_deployments(&deps).as_deref(),
-            Some("https://pr-12.preview-web.example.com")
-        );
-        assert_eq!(
-            url_in("Deployed to https://pr-7.preview-web.example.com/ (ready).").as_deref(),
-            Some("https://pr-7.preview-web.example.com/")
-        );
-        assert_eq!(url_in("see https://example.com/docs"), None);
-    }
-
-    #[test]
     fn a_visible_change_needs_an_e2e_spec_in_a_repo_with_a_suite() {
         let tree = s(&[
             "apps/web/e2e/playwright.config.ts",
@@ -1666,21 +1719,66 @@ jobs:
 
     #[test]
     fn the_capture_script_takes_each_page_at_desktop_and_phone_width() {
-        let js = capture_script("https://pr-1.preview-web.example.com/", &s(&["/signup"]));
+        use crate::preview_access::Kind;
+        let js = capture_script(
+            "https://pr-1.preview-web.example.com/",
+            &s(&["/signup"]),
+            Kind::None,
+        );
         assert!(js.contains("https://pr-1.preview-web.example.com/signup"));
         assert!(js.contains("signup-desktop") && js.contains("signup-phone"));
         assert!(js.contains("\"w\":390") && js.contains("\"w\":1280"));
+        // A preview served under a path keeps it; its query is dropped.
+        let js = capture_script(
+            "https://previews.example.com/pr-12/?x=1",
+            &s(&["/signup"]),
+            Kind::None,
+        );
+        assert!(js.contains("https://previews.example.com/pr-12/signup"));
         let report = vec![Captured {
             status: 401,
             page: "/signup".into(),
             ..Default::default()
         }];
-        assert!(why_no_shot(&report).unwrap().contains("login"));
+        let why = why_no_shot(&report, false).unwrap();
+        assert!(
+            why.contains("sign-in") && why.contains(ACCESS_SETTING),
+            "{why}"
+        );
+        assert!(why_no_shot(&report, true).unwrap().contains("refused"));
+        // Sent to a sign-in page on another host: a wall, never a shot.
+        let sent = vec![Captured {
+            status: 200,
+            left: "sso.example.org".into(),
+            ..Default::default()
+        }];
+        assert!(why_no_shot(&sent, false)
+            .unwrap()
+            .contains("sso.example.org"));
         let ok = vec![Captured {
             status: 200,
             ..Default::default()
         }];
-        assert_eq!(why_no_shot(&ok), None);
+        assert_eq!(why_no_shot(&ok, false), None);
+    }
+
+    #[test]
+    fn a_protected_previews_secret_never_enters_the_script_and_goes_only_to_its_host() {
+        use crate::preview_access::Kind;
+        for kind in [Kind::Header, Kind::Query, Kind::Basic] {
+            let js = capture_script("https://pr-1.preview.example.com", &s(&["/"]), kind);
+            assert!(js.contains(&format!("const kind = \"{}\"", kind.as_str())));
+            // Read once from the one-time secret, then removed from the
+            // environment, and blanked out of what is written.
+            assert!(js.contains("delete process.env.GH_TOKEN"));
+            assert!(js.contains("const hide ="));
+        }
+        let js = capture_script("https://pr-1.preview.example.com", &s(&["/"]), Kind::Header);
+        assert!(js.contains("if (h === host) route.continue({ headers:"));
+        assert!(js.contains("origin: 'https://' + host"));
+        // A page still warming up is tried again, a bounded number of times.
+        assert!(js.contains("[404, 502, 503, 504]"));
+        assert!(js.contains(&format!("t <= {WARM_TRIES}")));
     }
 
     #[test]
