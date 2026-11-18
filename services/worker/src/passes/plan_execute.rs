@@ -138,6 +138,7 @@ pub async fn run(
                         &msg.plan_id,
                         task_id,
                         PlanTicket::Jira(ticket_key),
+                        None,
                     )
                     .await;
                     let ticket_url = if let Some(ref site) = jira_site_url {
@@ -183,8 +184,31 @@ pub async fn run(
                 continue;
             }
 
+            // A task written for a ticket that already has a live run is
+            // that run's work: no issue of its own, so no second run.
+            let named = common::one_run::named_ticket(&task.title, &task.description);
+            if let Some(key) = named.as_deref() {
+                if let Some(live) =
+                    super::one_run::live_run(state, &msg.team_id, key, task_repo).await
+                {
+                    link_to_live_run(
+                        state,
+                        &msg.team_id,
+                        &msg.plan_id,
+                        task_id,
+                        key,
+                        task_repo,
+                        &live,
+                    )
+                    .await?;
+                    continue;
+                }
+            }
             let (owner, repo) = split_repo(task_repo);
-            let issue_body = format_issue_body(&task.description, &task.acceptance_criteria);
+            let issue_body = with_ticket_marker(
+                format_issue_body(&task.description, &task.acceptance_criteria),
+                named.as_deref(),
+            );
 
             match github
                 .create_issue(owner, repo, &task.title, &issue_body)
@@ -202,6 +226,7 @@ pub async fn run(
                             repo: task_repo,
                             issue_number,
                         },
+                        named.as_deref(),
                     )
                     .await;
                     // Label the issue FIRST to trigger the ticket pipeline
@@ -331,6 +356,55 @@ impl PlanTicket<'_> {
     }
 }
 
+/// An issue body with the marker naming the ticket it is opened for, so
+/// its run resolves to that ticket's key (`common::one_run`).
+pub(crate) fn with_ticket_marker(body: String, ticket: Option<&str>) -> String {
+    match ticket {
+        Some(k) if common::one_run::marked_ticket(&body).is_none() => {
+            format!("{}\n\n{}", body.trim_end(), common::one_run::marker(k))
+        }
+        _ => body,
+    }
+}
+
+/// A plan task whose ticket a live run already works: the task is linked to
+/// that ticket and done, and the live run's page says so. No issue opens.
+async fn link_to_live_run(
+    state: &WorkerState,
+    team_id: &str,
+    plan_id: &str,
+    task_id: &str,
+    key: &str,
+    repo: &str,
+    live: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let number = key
+        .to_ascii_uppercase()
+        .strip_prefix("GH-")
+        .and_then(|n| n.parse::<u64>().ok());
+    let ticket = match number {
+        Some(issue_number) => PlanTicket::Github { repo, issue_number },
+        None => PlanTicket::Jira(key),
+    };
+    link_ticket_to_plan(state, team_id, plan_id, task_id, ticket, None).await;
+    update_task_with_jira(state, team_id, plan_id, task_id, key, "").await?;
+    info!(
+        task_id,
+        key, live, "Plan task's ticket already has a live run: linked, no issue"
+    );
+    super::add_progress_note(
+        state,
+        team_id,
+        live,
+        &format!(
+            "A plan task was written for this ticket (`{key}`): it is this run's work, so \
+             CoderHelm opened no second issue and started no second run."
+        ),
+    )
+    .await;
+    Ok(())
+}
+
 /// The plan a run's ticket came from: `(plan_id, plan_title, plan_by)`.
 pub(crate) async fn plan_of_ticket(
     state: &WorkerState,
@@ -367,6 +441,7 @@ async fn link_ticket_to_plan(
     plan_id: &str,
     task_id: &str,
     ticket: PlanTicket<'_>,
+    source: Option<&str>,
 ) {
     if matches!(ticket, PlanTicket::Jira(k) if k.is_empty() || k == "UNKNOWN") {
         return;
@@ -403,6 +478,11 @@ async fn link_ticket_to_plan(
     }
     if !by.is_empty() {
         put = put.item("plan_by", AttributeValue::S(by.clone()));
+    }
+    // The ticket this one was opened for: its run is that ticket's run
+    // (`common::one_run`).
+    if let Some(src) = source.filter(|k| common::one_run::is_key(k)) {
+        put = put.item("source_ticket", AttributeValue::S(src.to_ascii_uppercase()));
     }
     if let Err(e) = put.send().await {
         tracing::warn!(team_id, plan_id, task_id, error = %e, "Could not link the ticket to its plan");
@@ -809,6 +889,7 @@ pub async fn continue_tasks(
                         &msg.plan_id,
                         task_id,
                         PlanTicket::Jira(ticket_key),
+                        None,
                     )
                     .await;
                     let ticket_url = if let Some(ref site) = jira_site_url {
@@ -850,8 +931,31 @@ pub async fn continue_tasks(
                 continue;
             }
 
+            // A task written for a ticket that already has a live run is
+            // that run's work: no issue of its own, so no second run.
+            let named = common::one_run::named_ticket(&task.title, &task.description);
+            if let Some(key) = named.as_deref() {
+                if let Some(live) =
+                    super::one_run::live_run(state, &msg.team_id, key, task_repo).await
+                {
+                    link_to_live_run(
+                        state,
+                        &msg.team_id,
+                        &msg.plan_id,
+                        task_id,
+                        key,
+                        task_repo,
+                        &live,
+                    )
+                    .await?;
+                    continue;
+                }
+            }
             let (owner, repo) = split_repo(task_repo);
-            let issue_body = format_issue_body(&task.description, &task.acceptance_criteria);
+            let issue_body = with_ticket_marker(
+                format_issue_body(&task.description, &task.acceptance_criteria),
+                named.as_deref(),
+            );
 
             match github
                 .create_issue(owner, repo, &task.title, &issue_body)
@@ -869,6 +973,7 @@ pub async fn continue_tasks(
                             repo: task_repo,
                             issue_number,
                         },
+                        named.as_deref(),
                     )
                     .await;
                     if let Err(e) = github

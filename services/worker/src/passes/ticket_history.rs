@@ -494,7 +494,13 @@ impl TicketHistory {
             return Guard::Proceed;
         }
         let closed = self.closed_unmerged();
-        if let Some(c) = self.outside_conclusion() {
+        // An earlier "outside the code" conclusion is judged again under
+        // today's rules: one whose own trace shows a working value our code
+        // passes over was a code fix all along, and never stops a plan.
+        let conclusion = self
+            .outside_conclusion()
+            .filter(|c| fix_location::working_alternative(&c.decision).is_none());
+        if let Some(c) = conclusion {
             let unchanged = c.context_hash.is_empty() || c.context_hash == current_hash;
             if unchanged || !answered {
                 let mut d = c.decision;

@@ -321,9 +321,58 @@ const BEFORE_ASSERT_MARKS: &[&str] = &[
     "build failed",
 ];
 
+/// The test runner itself isn't there: the sandbox's install didn't give the
+/// file's package its dependencies (an install for another package, none at
+/// all). Whatever the test says, it never ran, so it is never a failure of
+/// the change, nor a proof of it.
+const NO_RUNNER_MARKS: &[&str] = &[
+    "spawn enoent",
+    "node_modules missing",
+    "is not recognized as an internal or external command",
+    "no module named pytest",
+];
+
+/// Whether a run's output says its runner wasn't there: the shell couldn't
+/// find the command, or the package manager says the dependencies are missing.
+fn runner_missing(output: &str) -> bool {
+    has_any(output, NO_RUNNER_MARKS)
+        || output.lines().any(|l| {
+            let l = l.trim().to_ascii_lowercase();
+            ["sh:", "bash:", "/bin/sh:", "zsh:"]
+                .iter()
+                .any(|sh| l.starts_with(sh))
+                && l.contains("not found")
+        })
+}
+
+/// Why a file didn't run when its runner was missing, from what it printed.
+fn no_runner(output: &str) -> String {
+    format!(
+        "{INSTALL_FAILED}: the test runner wasn't installed for this file's package ({})",
+        excerpt_of(
+            output,
+            &["not found", "enoent", "missing", "not recognized"]
+        )
+    )
+}
+
 fn has_any(text: &str, marks: &[&str]) -> bool {
     let low = text.to_ascii_lowercase();
     marks.iter().any(|m| low.contains(m))
+}
+
+/// The first line of `output` with one of `words`, else its first line.
+fn excerpt_of(output: &str, words: &[&str]) -> String {
+    let line = output
+        .lines()
+        .map(str::trim)
+        .find(|l| {
+            let low = l.to_ascii_lowercase();
+            words.iter().any(|w| low.contains(w))
+        })
+        .or_else(|| output.lines().map(str::trim).find(|l| !l.is_empty()))
+        .unwrap_or("");
+    common::truncate_str(line, 200).replace('`', "'")
 }
 
 /// The first line of a failing run that says what failed.
@@ -355,12 +404,18 @@ pub fn verdict(with: &FileRun, without: &FileRun) -> (Verdict, String) {
             Verdict::NotRun,
             "the sandbox gave no result for it".to_string(),
         ),
+        (Some(w), _) if w != 0 && runner_missing(&with.output) => {
+            (Verdict::NotRun, no_runner(&with.output))
+        }
         (Some(w), _) if w != 0 && has_any(&with.output, NOT_FOUND_MARKS) => (
             Verdict::NotRun,
             "the test command, scoped to this file, found no tests in it".to_string(),
         ),
         (Some(w), _) if w != 0 => (Verdict::FailsWithChange, excerpt(&with.output)),
         (Some(_), Some(0)) => (Verdict::PassesEitherWay, String::new()),
+        (Some(_), Some(c)) if c != 0 && runner_missing(&without.output) => {
+            (Verdict::NotRun, no_runner(&without.output))
+        }
         (Some(_), Some(_)) if has_any(&without.output, NOT_FOUND_MARKS) => (
             Verdict::NotRun,
             "the test command found no tests in it without the change".to_string(),
@@ -700,6 +755,9 @@ fn repro_waived(plan: &PlanResult) -> bool {
 /// the base for.
 pub const UNVERIFIED_FIX: &str = "Unverified: no test of this fix was shown to fail on the base code, so the reported failure is not reproduced here.";
 
+/// The check's name on an Open items line that holds the draft.
+pub const TEST_CHECK: &str = "The changed tests";
+
 /// The line for a change no changed test proves.
 pub const UNPROVEN: &str = "No changed test fails without the change, so nothing proves it. Write a test that fails on the base code and passes with the change (a unit test, or an end-to-end spec when the behaviour is what a person sees in the browser), through code that exists on the base.";
 
@@ -835,6 +893,7 @@ pub fn fix_feedback(lines: &[String]) -> String {
 /// What is still open after the fix rounds, for Open items.
 pub fn open_findings(f: &PrFacts, plan: &PlanResult) -> Vec<Finding> {
     let mut lines = blocking(f, plan);
+    let ran = lines.clone();
     if unproven(f, plan) && !lines.iter().any(|l| l == UNPROVEN) {
         lines.push(UNPROVEN.to_string());
     }
@@ -874,6 +933,14 @@ pub fn open_findings(f: &PrFacts, plan: &PlanResult) -> Vec<Finding> {
                     "No end-to-end test for a visible change",
                     "CoderHelm writes the spec in its next round on this pull request and runs it on the preview.",
                 )
+            } else if ran.contains(&l) {
+                // A test that ran and fails with the change, passes without
+                // it, or proves nothing: the change isn't shown to work, so
+                // the run isn't done. It holds the draft like any check the
+                // change didn't pass (`proof::holds_blocked_on`), and it is a
+                // gap the run's next round works on.
+                let what = l.split(". ").next().unwrap_or(&l).trim_end_matches('.');
+                return super::proof::blocked_item(TEST_CHECK, what);
             } else {
                 (
                     "Test doesn't prove the change",
@@ -1173,6 +1240,22 @@ fn is_e2e_spec(tree: &[String], file: &str, texts: &dyn Fn(&str) -> Option<Strin
             .is_some_and(|s| file.starts_with(&format!("{}/", s.dir.trim_end_matches('/'))))
 }
 
+/// The files whose job the sandbox's environment is chosen for: those it
+/// runs, not the end-to-end specs (by the repository's suite folder; their
+/// package's runner is read later, with the manifests).
+pub fn unit_focus(tree: &[String], files: &[String]) -> Vec<String> {
+    let suite = common::preview::e2e_suite(tree);
+    files
+        .iter()
+        .filter(|f| {
+            !suite
+                .as_ref()
+                .is_some_and(|s| f.starts_with(&format!("{}/", s.dir.trim_end_matches('/'))))
+        })
+        .cloned()
+        .collect()
+}
+
 /// How the sandbox runs the files: the installs (none when CI's test job
 /// installs, through its environment), one command per file that has one,
 /// and why the others don't run.
@@ -1286,7 +1369,11 @@ impl Bench for SandboxBench<'_> {
             .map_err(|e| e.to_string())?;
         let tree: Vec<String> = tree_full.iter().map(|e| e.path.clone()).collect();
         // CI's job for these files: its install wraps every command, and
-        // its test steps (package scripts read through) run each file.
+        // its test steps (package scripts read through) run each file. Only
+        // the files this sandbox runs choose it: an end-to-end spec runs
+        // against a preview, and its job's install (its own folder) never
+        // installs a unit test's package.
+        let unit = unit_focus(&tree, files);
         let env = super::test_setup::for_run(
             r.state,
             r.github,
@@ -1296,7 +1383,7 @@ impl Bench for SandboxBench<'_> {
             self.base_branch,
             self.branch,
             r.run_id,
-            files,
+            &unit,
         )
         .await;
         let mut texts: std::collections::HashMap<String, String> = Default::default();
@@ -2093,8 +2180,11 @@ mod tests {
         assert!(b[0].contains("passes with the change taken out"));
         assert_eq!(b[1], UNPROVEN);
         assert!(fix_feedback(&b).contains("Do not delete or skip a test"));
+        // A test that ran and proves nothing is a check the change didn't
+        // pass: it holds the draft.
         let open = open_findings(&f, &p);
-        assert_eq!(open[0].point, "Test doesn't prove the change");
+        assert_eq!(open[0].point, "check_blocked");
+        assert!(open[0].detail.starts_with(TEST_CHECK), "{}", open[0].detail);
         assert!(section(&p, &f).contains("passes with and without the change"));
     }
 

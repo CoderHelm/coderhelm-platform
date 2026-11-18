@@ -458,6 +458,18 @@ pub enum Route {
 }
 
 impl FixDecision {
+    /// Adds the plan check's open gaps, each said once: the checks run
+    /// line by line (a task, an item), and one finding read on five task
+    /// lines is still one gap.
+    pub fn add_gaps<I: IntoIterator<Item = String>>(&mut self, lines: I) {
+        for l in lines {
+            let l = l.trim().to_string();
+            if !l.is_empty() && !self.open_gaps.iter().any(|g| g.trim() == l) {
+                self.open_gaps.push(l);
+            }
+        }
+    }
+
     /// What the decision actually supports. An outside change with nothing to
     /// change is not a decision: it is reported as unknown, never coded around.
     pub fn effective_location(&self) -> FixLocation {
@@ -470,6 +482,63 @@ impl FixDecision {
             l => l,
         }
     }
+}
+
+/// Whether a layer's `where` is code in a repository (`owner/repo:path`),
+/// as opposed to a system that holds data.
+fn is_code_layer(l: &Layer) -> bool {
+    let w = l.where_.trim();
+    w.split_once(':')
+        .is_some_and(|(repo, path)| repo.contains('/') && !repo.contains(' ') && !path.is_empty())
+}
+
+/// The kind of a layer, from its name's first word (`source`, `store`,
+/// `index`, `page`).
+fn layer_kind(l: &Layer) -> String {
+    l.layer
+        .split(|c: char| !c.is_alphanumeric())
+        .find(|w| !w.is_empty())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+}
+
+/// A wrong value from a source that has a working alternative in our own
+/// reach: the trace shows a layer of the same kind as a wrong one holding
+/// a working value (a sibling field, a parent record, a second source of the
+/// same thing), and a layer that is code in one of our repositories, which
+/// passes the wrong one along. Our code chooses which value reaches the
+/// page, so the fix is in that code: prefer, or fall back to, the working
+/// value. `None` when the trace shows no such alternative.
+///
+/// A ticket once reported a broken image on a page: a source record held an
+/// address that returned an error, a second source record of the same kind
+/// held a working one, and our pipeline gave the first priority. The run
+/// called it a change outside the code (edit the source record), though a
+/// thousand other records carried addresses of the same kind and our own
+/// pipeline already had the working one in hand.
+pub fn working_alternative(d: &FixDecision) -> Option<String> {
+    let layers = &d.evidence.layers;
+    let code = layers.iter().find(|l| is_code_layer(l))?;
+    let state = |l: &Layer| l.state.trim().to_ascii_lowercase();
+    let wrong: Vec<&Layer> = layers
+        .iter()
+        .filter(|l| state(l) == "wrong" && !is_code_layer(l))
+        .collect();
+    let ok = layers.iter().find(|o| {
+        state(o) == "ok"
+            && !is_code_layer(o)
+            && !o.shows.trim().is_empty()
+            && wrong
+                .iter()
+                .any(|w| !layer_kind(w).is_empty() && layer_kind(w) == layer_kind(o))
+    })?;
+    Some(format!(
+        "Your trace shows a working value in reach: `{}` holds \"{}\", and `{}` ({}) is our code, which passes the broken value along instead. A broken source value that our code chooses over a working one is a code fix: make that code prefer, or fall back to, the working value (`code`, or `both` when the source record should be corrected too), with a test of the fallback. `outside_code` is right only when no layer our code reads holds a working value.",
+        ok.layer.trim(),
+        common::truncate_str(ok.shows.trim(), 160),
+        code.where_.trim(),
+        code.layer.trim()
+    ))
 }
 
 /// What a settled decision about data still lacks, in plain instructions
@@ -528,6 +597,11 @@ pub fn gaps(
         return out;
     }
     let p = &d.evidence.producer;
+    if d.fix_location == FixLocation::OutsideCode {
+        if let Some(why) = working_alternative(d) {
+            out.push(why);
+        }
+    }
     if p.kind.trim() == "code" && d.fix_location == FixLocation::OutsideCode {
         out.push("You found that code writes the wrong value, so it is our bug: the fix is in that code (`code`, or `both` when a source record must change too), not outside it. A display fallback alone isn't the fix.".to_string());
     }
@@ -1152,6 +1226,7 @@ Before writing tasks, decide whether the fix belongs in this code at all.
 - Before your first query on a table, read its columns (describe it); don't guess column names from other tables' conventions.
 - Never name a cause in a system you couldn't read. If the trace through what you can read is complete and leads into another system, say so with that trace. If you couldn't finish the trace, use `unknown`, say where it stopped, and list the next lookups that would finish it, without a likely culprit.
 - If the code behaves as designed and the outcome comes from data or configuration in a source system (a booking or scheduling system, a CMS, a ticket tool's configuration, a feature flag held in another system, a cloud console setting), the fix is a change in that system, not in this code. Set `fix_location` to `outside_code`, describe the exact change, and set tasks.md to `NO_CODE_CHANGE: <one line>`.
+- When a source record holds a broken value (an address that errors, an empty or invalid field) and your trace shows a working value for the same thing that our code can read (a second source record of the same kind, a parent or group record, a value our pipeline already computes), and our code chooses the broken one, the fix is in that code: prefer or fall back to the working value, for every record, with a test. Use `code` (or `both` when the source record should be corrected too). `outside_code` is right only when nothing our code reads holds a working value.
 - Never override source data in code: no hardcoded record ids, allowlists, denylists or "force" lists that change behavior for specific records the source system already decides. That hides the cause and goes stale. If that is the only way you see to make the ticket's symptom go away, the fix is outside the code.
 - If a code change is needed AND a change in another system, use `both`: plan the code part normally and describe the outside change.
 - If you looked and still cannot tell whether the code or the data is at fault, use `unknown`, say what you checked and what a person needs to confirm, and set tasks.md to `NO_CODE_CHANGE: <what is unclear>`. Prefer asking over coding.

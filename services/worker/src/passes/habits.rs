@@ -477,7 +477,7 @@ pub fn keep_open(d: &mut FixDecision, facts: &Facts, left: &[String]) {
             why: String::new(),
         });
     }
-    d.open_gaps.extend(
+    d.add_gaps(
         left.iter()
             .map(|g| common::truncate_str(g.lines().next().unwrap_or(g), 400).to_string()),
     );

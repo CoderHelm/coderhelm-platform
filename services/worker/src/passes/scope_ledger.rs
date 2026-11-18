@@ -82,9 +82,11 @@ pub(crate) async fn load_or_seed(
         &plan.design,
         &plan.tasks,
     );
-    // What people already answered or commented is in scope from the
-    // start: the plan never writes a person's ask as out of scope.
-    let moved = l.take_people(people);
+    // What the ticket names, and what people already answered or
+    // commented, is in scope from the start: the plan never writes the
+    // ticket's own ask or a person's as out of scope.
+    let mut moved = l.named_by_ticket(&format!("{}\n{}", msg.title, msg.body));
+    moved.extend(l.take_people(people));
     save(state, team_id, run_id, &l).await;
     if !moved.is_empty() {
         super::add_progress_note(

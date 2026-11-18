@@ -62,10 +62,14 @@ pub const MAX_RULES_FIX_ROUNDS: u32 = 2;
 pub const MAX_LINK_FIX_ROUNDS: u32 = 1;
 /// Failing-test fix rounds in one run, across all its steps.
 pub const MAX_TEST_FIX_ROUNDS: u32 = 2;
-/// Continuations a run may take once its tasks are done. Findings going down
-/// don't reset this: opening the pull request and checking it take one step,
-/// and three more fresh 15-minute steps are far more than finished work needs.
-pub const MAX_CONTINUATIONS_AFTER_WORK: u32 = 3;
+/// Continuations in a row, once the tasks are done, that brought the run no
+/// closer to finished: no check that hadn't run ran, and the open items didn't
+/// fall below their best. There is no count of continuations after the work
+/// itself: a run goes on while each step closes something, and stops going on
+/// (shipping what it has, with what is open listed) at the first stale step
+/// past this one. A step the run asked for by design (the changed tests' own
+/// sandbox step) is never counted ([`Target::owed`]).
+pub const MAX_STALE_CONTINUATIONS: u32 = 1;
 /// Continuations without progress while the tasks are still being built: one
 /// task spread over six full steps (90 minutes) isn't happening.
 pub const MAX_CONTINUATIONS_WITHOUT_PROGRESS: u32 = 6;
@@ -112,11 +116,23 @@ const _: () = assert!(MAX_TRANSITIONS_WITHOUT_PROGRESS >= worst_normal_run());
 
 // ── The guard's state ──────────────────────────────────────────────────────
 
+/// The stored code of a [`Trip::Converged`] stop.
+pub const CONVERGED: &str = "converged_with_open_items";
+
+/// Stop codes that ship the work instead of handing it back: the current one
+/// and the after-work cap it replaced (still on older runs' records).
+pub fn ships_code(code: &str) -> bool {
+    matches!(code, CONVERGED | "continuations_after_work")
+}
+
 /// Why the guard ended a run. The stored code is what analytics counts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Trip {
-    /// Finished work kept continuing without a pull request.
-    ContinuationsAfterWork,
+    /// The tasks are done and continuing stopped closing anything (or left
+    /// nothing to close): the run ships what it has with what is open listed.
+    /// Never a hand-back: CI and comments on the pull request still start
+    /// rounds ([`Trip::ships`]).
+    Converged,
     /// Continuations without progress, tasks still open.
     Continuations,
     /// Pass transitions without progress.
@@ -128,20 +144,41 @@ pub enum Trip {
 impl Trip {
     pub fn code(self) -> &'static str {
         match self {
-            Trip::ContinuationsAfterWork => "continuations_after_work",
+            Trip::Converged => CONVERGED,
             Trip::Continuations => "continuations",
             Trip::Transitions => "pass_transitions",
             Trip::Spend => "spend",
         }
     }
 
+    /// A stop that ships the work rather than handing it back: the tasks are
+    /// done, so what is left is checks and fixes CoderHelm can still make,
+    /// and new evidence (a red check with its error, a comment) starts them.
+    pub fn ships(self) -> bool {
+        matches!(self, Trip::Converged)
+    }
+
     /// What the run page says, in plain words.
     pub fn reason(self, g: &GuardState) -> String {
+        if self == Trip::Converged {
+            let why = if g.nothing_left {
+                "nothing it can act on is open".to_string()
+            } else {
+                format!(
+                    "its last {} continuation(s) closed nothing that was open",
+                    g.stale
+                )
+            };
+            return format!(
+                "CoderHelm finished the work and shipped it on the pull request: its tasks are \
+                 done and {why}. What is still open is listed there under Open items with how each \
+                 is settled; CoderHelm fixes what CI reports on the pull request, and a push or a \
+                 comment there starts another round."
+            );
+        }
         let what = match self {
-            Trip::ContinuationsAfterWork => format!(
-                "its tasks were done and it had continued {} more times without finishing",
-                g.after_work
-            ),
+            // Answered above: it ships, it is never handed back.
+            Trip::Converged => String::new(),
             Trip::Continuations => format!(
                 "it continued {} times without finishing another task",
                 g.continuations
@@ -218,16 +255,130 @@ pub struct GuardState {
     /// a checker reporting 2, 4, 3, 2 has made no progress at all.
     #[serde(default)]
     pub low: BTreeMap<String, usize>,
+    /// Continuations in a row after the work that closed nothing
+    /// ([`MAX_STALE_CONTINUATIONS`]).
+    #[serde(default)]
+    pub stale: u32,
+    /// The fewest checks not yet run at an after-work continuation.
+    #[serde(default)]
+    pub best_unrun: Option<usize>,
+    /// The fewest open items at that many unrun checks.
+    #[serde(default)]
+    pub best_open: Option<usize>,
+    /// The last after-work continuation had no open item to work on.
+    #[serde(default)]
+    pub nothing_left: bool,
+}
+
+/// What a continuation after the work is for: the run's checks as they
+/// stand. Every continuation names its open items; one with none to work on
+/// has nothing to continue for.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Target {
+    /// The run asked for this step by design (the changed tests' sandbox
+    /// runs need a whole step): it is no sign of a loop, so it isn't counted.
+    pub owed: bool,
+    /// Checks that haven't given a result yet.
+    pub unrun: usize,
+    /// The open items the checks left, one line each.
+    pub open: Vec<String>,
+}
+
+impl Target {
+    /// The ledger's checks as a continuation's target.
+    pub fn of(ledger: &Ledger) -> Target {
+        let unrun = ledger.unrun_checks();
+        let mut open: Vec<String> = ledger
+            .open_findings()
+            .into_iter()
+            .filter(|f| !f.detail.contains("didn't finish"))
+            .map(|f| format!("{}: {}", f.point, f.detail))
+            .collect();
+        // The tests and scope check's items: what its fix rounds work on.
+        if let Some(Ok(Some(facts))) = &ledger.habits_outcome {
+            let plan = super::plan::PlanResult {
+                proposal: String::new(),
+                tasks: String::new(),
+                spec: String::new(),
+                design: String::new(),
+                repo_tasks: vec![],
+                fix: None,
+            };
+            open.extend(
+                super::habits_check::blocking(facts, &plan)
+                    .into_iter()
+                    .map(|l| format!("tests: {l}")),
+            );
+        }
+        open.sort();
+        open.dedup();
+        Target {
+            owed: false,
+            unrun,
+            open,
+        }
+    }
 }
 
 impl GuardState {
+    /// A continuation with what it is for. Before the work is done this is
+    /// [`Self::on_continuation`]. After it, the run goes on only while it
+    /// converges: a check runs that hadn't, or the open items fall below their
+    /// best. A step the run owes by design isn't counted at all. A
+    /// continuation with no check left to run and nothing open has nothing to
+    /// do, and the run ships ([`Trip::Converged`]).
+    pub fn on_continuation_to(&mut self, spent: f64, target: &Target) {
+        self.spend_usd += spent.max(0.0);
+        if target.owed {
+            return;
+        }
+        if !self.work_done {
+            self.continuations = self.continuations.saturating_add(1);
+            return;
+        }
+        self.after_work = self.after_work.saturating_add(1);
+        self.nothing_left = target.unrun == 0 && target.open.is_empty();
+        let open = target.open.len();
+        let closer = match (self.best_unrun, self.best_open) {
+            (None, _) => true,
+            (Some(u), _) if target.unrun < u => true,
+            (Some(u), Some(o)) if target.unrun == u => open < o,
+            (Some(u), None) => target.unrun == u,
+            _ => false,
+        };
+        if closer {
+            if self.best_unrun != Some(target.unrun) {
+                self.best_open = None;
+            }
+            self.best_unrun = Some(target.unrun);
+            self.best_open = Some(self.best_open.map_or(open, |o| o.min(open)));
+            self.stale = 0;
+        } else {
+            self.stale = self.stale.saturating_add(1);
+        }
+    }
+
+    /// The run shipped after a [`Trip::Converged`]: its convergence starts
+    /// over, so the rounds new evidence starts (CI, a comment) aren't stopped
+    /// by the steps before it.
+    pub fn shipped(&mut self) {
+        self.stale = 0;
+        self.nothing_left = false;
+        self.best_unrun = None;
+        self.best_open = None;
+        self.reset();
+    }
+
     /// One pass started, with what was spent since the guard last looked.
     pub fn on_pass(&mut self, spent: f64) {
         self.transitions = self.transitions.saturating_add(1);
         self.spend_usd += spent.max(0.0);
     }
 
-    /// One continuation, with what was spent since the guard last looked.
+    /// One continuation with no target known, with what was spent since the
+    /// guard last looked: counted against progress like any other. The
+    /// pipeline always names its target ([`Self::on_continuation_to`]).
+    #[cfg(test)]
     pub fn on_continuation(&mut self, spent: f64) {
         self.continuations = self.continuations.saturating_add(1);
         self.spend_usd += spent.max(0.0);
@@ -302,14 +453,14 @@ impl GuardState {
     /// A person acted on the run: everything starts again from here, and what
     /// the checks have reported stands.
     pub fn person_acted(&mut self) {
-        self.reset();
+        self.shipped();
         self.after_work = 0;
     }
 
     /// Whether the run has gone too far without progress.
     pub fn trip(&self) -> Option<Trip> {
-        if self.after_work > MAX_CONTINUATIONS_AFTER_WORK {
-            return Some(Trip::ContinuationsAfterWork);
+        if self.work_done && (self.nothing_left || self.stale > MAX_STALE_CONTINUATIONS) {
+            return Some(Trip::Converged);
         }
         if self.continuations > MAX_CONTINUATIONS_WITHOUT_PROGRESS {
             return Some(Trip::Continuations);
@@ -352,6 +503,8 @@ struct Loaded {
     totals: Totals,
     /// The reason, once the guard fired and no person has acted since.
     stopped: Option<String>,
+    /// The stop's code (`loop_stop_reason`), empty when none.
+    stop_code: String,
 }
 
 /// Fails open: a read that doesn't answer never stops a run.
@@ -363,8 +516,8 @@ async fn load(state: &WorkerState, team_id: &str, run_id: &str) -> Option<Loaded
         .key("team_id", attr_s(team_id))
         .key("run_id", attr_s(run_id))
         .projection_expression(
-            "run_guard, guard_open, loop_stop_detail, ceil_passes, ceil_continuations, \
-             ceil_worked_secs, ceil_spend_usd",
+            "run_guard, guard_open, loop_stop_detail, loop_stop_reason, ceil_passes, \
+             ceil_continuations, ceil_worked_secs, ceil_spend_usd",
         )
         .send()
         .await;
@@ -382,6 +535,11 @@ async fn load(state: &WorkerState, team_id: &str, run_id: &str) -> Option<Loaded
             .get("run_guard")
             .and_then(|v| v.as_s().ok())
             .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default(),
+        stop_code: item
+            .get("loop_stop_reason")
+            .and_then(|v| v.as_s().ok())
+            .cloned()
             .unwrap_or_default(),
         stopped: item.get("guard_open").map(|_| {
             item.get("loop_stop_detail")
@@ -482,6 +640,7 @@ async fn fire(
         continuations = guard.continuations,
         after_work = guard.after_work,
         spend_usd = guard.spend_usd,
+        ships = trip.ships(),
         "Run guard: no progress"
     );
     record_stop(state, team_id, run_id, trip.code(), &reason).await;
@@ -561,14 +720,35 @@ pub fn take_reentry(run_id: &str, pass: &str) -> bool {
 }
 
 /// A step is about to hand off (from `try_auto_continue`, so every
-/// continuation). `Some(reason)` when the next step must not start.
-pub async fn on_continuation(state: &WorkerState, team_id: &str, run_id: &str) -> Option<String> {
+/// continuation). `scope` is the repository whose checks the run keeps
+/// (`owner/repo`): after the work, the continuation's target is what they
+/// left open ([`Target::of`]). `owed`: the run asked for this step by design.
+/// `Some(reason)` when the next step must not start.
+pub async fn on_continuation(
+    state: &WorkerState,
+    team_id: &str,
+    run_id: &str,
+    scope: &str,
+    owed: bool,
+) -> Option<String> {
     let mut l = load(state, team_id, run_id).await?;
     if l.stopped.is_some() {
         return l.stopped;
     }
     let spent = take_spend();
-    l.guard.on_continuation(spent);
+    let target = if owed {
+        Target {
+            owed: true,
+            ..Default::default()
+        }
+    } else if l.guard.work_done {
+        LedgerCell::load(state, team_id, run_id, scope)
+            .await
+            .update(|ledger| Target::of(ledger))
+    } else {
+        Target::default()
+    };
+    l.guard.on_continuation_to(spent, &target);
     l.totals.continuations = l.totals.continuations.saturating_add(1);
     l.totals.spend_usd += spent;
     save(state, team_id, run_id, &l.guard, 0, 1, spent).await;
@@ -662,6 +842,46 @@ pub async fn person_acted(state: &WorkerState, team_id: &str, run_id: &str) {
     }
 }
 
+/// Takes back a stop that ships the work ([`ships_code`]) once the work is on
+/// its pull request: the stop ended the steps' loop, and nothing more. What
+/// CoderHelm can still act on (a red check with its error, a comment, the
+/// ready decision) goes on as on any open pull request; the run's lifetime
+/// ceiling still holds every round. True when a stop was taken back.
+pub async fn lift_shipped_stop(state: &WorkerState, team_id: &str, run_id: &str) -> bool {
+    let Some(mut l) = load(state, team_id, run_id).await else {
+        return false;
+    };
+    if l.stopped.is_none() || !ships_code(&l.stop_code) {
+        return false;
+    }
+    l.guard.shipped();
+    let Ok(json) = serde_json::to_string(&l.guard) else {
+        return false;
+    };
+    match state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(team_id))
+        .key("run_id", attr_s(run_id))
+        .update_expression("SET run_guard = :g REMOVE guard_open")
+        .condition_expression("attribute_exists(run_id) AND loop_stop_reason = :code")
+        .expression_attribute_values(":g", attr_s(&json))
+        .expression_attribute_values(":code", attr_s(&l.stop_code))
+        .send()
+        .await
+    {
+        Ok(_) => {
+            info!(run_id, code = %l.stop_code, "Run guard: the shipped run goes on from its pull request");
+            true
+        }
+        Err(e) => {
+            warn!(run_id, error = %e, "Run guard: could not take back a shipping stop");
+            false
+        }
+    }
+}
+
 /// A message is ending, perhaps because a model call was refused: what it spent
 /// is counted, and a run that has gone over its ceiling is marked as stopped.
 async fn flush(state: &WorkerState, team_id: &str, run_id: &str) {
@@ -752,10 +972,17 @@ pub async fn end_if_stopped(
         }
         None => Err("no branch to open a pull request from".into()),
     };
-    if let Err(e) = opened {
-        // Nothing to open (no work yet): still never silent.
-        warn!(run_id, error = %e, "Run guard: no draft pull request for the stopped run");
-        super::mark_run_stopped_by_guard(state, msg, run_id, &reason, &judged).await;
+    match opened {
+        Err(e) => {
+            // Nothing to open (no work yet): still never silent.
+            warn!(run_id, error = %e, "Run guard: no draft pull request for the stopped run");
+            super::mark_run_stopped_by_guard(state, msg, run_id, &reason, &judged).await;
+        }
+        // The work is shipped: a stop that ships ends here, and the pull
+        // request's own rounds (CI's errors, comments) are free to run.
+        Ok(_) => {
+            lift_shipped_stop(state, &msg.team_id, run_id).await;
+        }
     }
     true
 }
@@ -765,9 +992,19 @@ pub async fn end_if_stopped(
 /// when it had fired.
 pub async fn settle_open_pr(state: &WorkerState, team_id: &str, run_id: &str) -> bool {
     flush(state, team_id, run_id).await;
-    let Some(reason) = load(state, team_id, run_id).await.and_then(|l| l.stopped) else {
+    let Some(l) = load(state, team_id, run_id).await else {
         return false;
     };
+    let Some(reason) = l.stopped else {
+        return false;
+    };
+    // The tasks are done and the work is on its pull request: this stop is
+    // never a hand-back nor a failure. The run waits on its pull request's
+    // CI, whose red check with an error starts the next fix round.
+    if ships_code(&l.stop_code) && lift_shipped_stop(state, team_id, run_id).await {
+        await_ci_on_pr(state, team_id, run_id, &reason).await;
+        return true;
+    }
     let mut usage = crate::models::TokenUsage::default();
     let mut picture =
         super::stop_judge::Picture::new(super::stop_judge::Kind::Handoff, "run_guard", &reason);
@@ -903,6 +1140,37 @@ async fn finish_open_pr(state: &WorkerState, team_id: &str, run_id: &str, reason
             super::ready::after_completion(state, team_id, run_id).await;
         }
         Err(e) => warn!(run_id, error = %e, "Run guard: could not finish the run"),
+    }
+}
+
+/// A shipped run goes back to waiting on its pull request's CI, with what is
+/// still open as the deferred reason: CI's next result resumes it, and a red
+/// check with its error starts a fix round.
+async fn await_ci_on_pr(state: &WorkerState, team_id: &str, run_id: &str, reason: &str) {
+    let res = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(team_id))
+        .key("run_id", attr_s(run_id))
+        .update_expression(
+            "SET #s = :s, status_run_id = :sri, deferred_reason = :dr, updated_at = :t, \
+             current_pass = :s",
+        )
+        .condition_expression(run_status::not_ended("#s"))
+        .ended_values()
+        .expression_attribute_names("#s", "status")
+        .expression_attribute_values(":s", attr_s(run_status::AWAITING_CI))
+        .expression_attribute_values(
+            ":sri",
+            attr_s(&format!("{}#{run_id}", run_status::AWAITING_CI)),
+        )
+        .expression_attribute_values(":dr", attr_s(common::truncate_str(reason, 500)))
+        .expression_attribute_values(":t", attr_s(&chrono::Utc::now().to_rfc3339()))
+        .send()
+        .await;
+    if let Err(e) = res {
+        warn!(run_id, error = %e, "Run guard: could not put the shipped run back on its CI");
     }
 }
 
@@ -1137,6 +1405,21 @@ impl Ledger {
         set_aside
     }
 
+    /// The checks that have given no result yet, on any head: what a step
+    /// after the work still has to run.
+    pub fn unrun_checks(&self) -> usize {
+        [
+            self.proof_findings.is_none() && self.proof.head.is_empty(),
+            self.rules_outcome.is_none(),
+            self.links_outcome.is_none(),
+            self.test_outcome.is_none(),
+            self.habits_outcome.is_none(),
+        ]
+        .iter()
+        .filter(|u| **u)
+        .count()
+    }
+
     /// What is still open, for a run the guard stopped. Honest about both:
     /// what the checks found, and what they didn't get to.
     pub fn open_findings(&self) -> Vec<Finding> {
@@ -1362,18 +1645,63 @@ mod tests {
         .await;
     }
 
+    fn target(unrun: usize, open: usize) -> Target {
+        Target {
+            owed: false,
+            unrun,
+            open: (0..open).map(|i| format!("gap {i}")).collect(),
+        }
+    }
+
+    /// After the work, a run goes on while each continuation closes
+    /// something, however many that takes, and ships at the first stale
+    /// one past the allowance.
     #[test]
-    fn fewer_findings_never_buy_finished_work_more_continuations() {
+    fn finished_work_goes_on_while_it_converges_and_ships_when_it_stops() {
         let mut g = GuardState::default();
         g.apply(&Progress::WorkDone);
-        g.apply(&Progress::Findings("proof", 9));
-        for (i, open) in [8, 7, 6].into_iter().enumerate() {
-            g.on_continuation(1.0);
-            assert!(g.apply(&Progress::Findings("proof", open)));
+        for (i, (unrun, open)) in [(5, 0), (4, 3), (2, 3), (0, 6), (0, 4), (0, 2), (0, 1)]
+            .into_iter()
+            .enumerate()
+        {
+            g.on_continuation_to(1.0, &target(unrun, open));
             assert_eq!(g.trip(), None, "continuation {i}");
         }
-        g.on_continuation(1.0);
-        assert_eq!(g.trip(), Some(Trip::ContinuationsAfterWork));
+        g.on_continuation_to(1.0, &target(0, 1));
+        assert_eq!(g.trip(), None, "one stale continuation is allowed");
+        g.on_continuation_to(1.0, &target(0, 2));
+        assert_eq!(g.trip(), Some(Trip::Converged));
+        assert!(Trip::Converged.ships());
+        g.shipped();
+        assert_eq!(g.trip(), None, "shipping starts convergence over");
+    }
+
+    #[test]
+    fn nothing_open_and_nothing_to_run_ships_at_once() {
+        let mut g = GuardState::default();
+        g.apply(&Progress::WorkDone);
+        g.on_continuation_to(0.0, &target(0, 0));
+        assert_eq!(g.trip(), Some(Trip::Converged));
+        assert!(Trip::Converged
+            .reason(&g)
+            .contains("nothing it can act on is open"));
+    }
+
+    #[test]
+    fn an_owed_step_is_never_counted() {
+        let mut g = GuardState::default();
+        g.apply(&Progress::WorkDone);
+        g.on_continuation_to(0.0, &target(0, 3));
+        let owed = Target {
+            owed: true,
+            ..Default::default()
+        };
+        for _ in 0..20 {
+            g.on_continuation_to(0.1, &owed);
+            assert_eq!(g.trip(), None);
+        }
+        assert_eq!(g.stale, 0);
+        assert_eq!(g.after_work, 1);
     }
 
     #[test]
@@ -1422,13 +1750,19 @@ mod tests {
     #[test]
     fn the_reason_is_plain_and_says_what_to_do() {
         let g = GuardState {
-            after_work: 4,
+            stale: 2,
             ..Default::default()
         };
-        let why = Trip::ContinuationsAfterWork.reason(&g);
-        assert!(why.contains("tasks were done"), "{why}");
-        assert!(why.contains("continued 4 more times"), "{why}");
+        let why = Trip::Converged.reason(&g);
+        assert!(why.contains("tasks are done"), "{why}");
+        assert!(
+            why.contains("last 2 continuation(s) closed nothing"),
+            "{why}"
+        );
         assert!(why.contains("Open items"), "{why}");
+        assert!(why.contains("fixes what CI reports"), "{why}");
+        assert!(!why.contains("handed it to you"), "{why}");
+        let why = Trip::Continuations.reason(&GuardState::default());
         assert!(why.contains("Push to the branch or comment"), "{why}");
         let g = GuardState {
             spend_usd: 20.5,
@@ -1441,14 +1775,14 @@ mod tests {
     fn stop_codes_are_stable_for_analytics() {
         assert_eq!(
             [
-                Trip::ContinuationsAfterWork,
+                Trip::Converged,
                 Trip::Continuations,
                 Trip::Transitions,
                 Trip::Spend
             ]
             .map(Trip::code),
             [
-                "continuations_after_work",
+                "converged_with_open_items",
                 "continuations",
                 "pass_transitions",
                 "spend"

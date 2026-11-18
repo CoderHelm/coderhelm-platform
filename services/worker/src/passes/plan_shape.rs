@@ -351,13 +351,14 @@ pub fn plan_gaps(
     }
     // Scope decided once: no question left open, a reason for each item, no
     // task naming an item left out, no open-ended task.
-    out.extend(common::scope_ledger::decision_gaps(
+    out.extend(common::scope_ledger::decision_gaps_for(
         &files.proposal,
         &files.design,
         &files.tasks,
         &super::stop_judge::acceptance(ticket),
+        ticket,
     ));
-    out
+    common::scope_ledger::unique(out)
 }
 
 /// What the plan's criteria map misses (`common::e2e_proof::map_gaps`):

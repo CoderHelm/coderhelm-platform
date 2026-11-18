@@ -364,6 +364,13 @@ pub fn parse_line(line: &str, by: &str) -> Option<Entry> {
     } else {
         (t.clone(), String::new())
     };
+    // Bold the line's markers left behind ("**Item**: why" splits into
+    // "Item**" and "why") is no part of either.
+    let item = item.trim_matches('*').trim().to_string();
+    let why = why.trim_matches('*').trim().to_string();
+    if item.is_empty() {
+        return None;
+    }
     Some(Entry {
         item: item.trim_end_matches(['.', ',']).to_string(),
         why: why.trim_end_matches('.').to_string(),
@@ -480,6 +487,51 @@ const OUT_HEADINGS: &[&str] = &[
     "non goals",
 ];
 
+/// Openers of a line that records what a lookup showed: the evidence for
+/// the entry above it, never an item of its own. A plan once wrote
+/// "Looked up: the page returned 200 and `X` was not in it" under an item,
+/// and the check read it as an item left out, named `X`, and told the
+/// planner five times over that its tasks name an out-of-scope item.
+const EVIDENCE_OPENERS: &[&str] = &[
+    "looked up",
+    "lookup:",
+    "no lookup settles",
+    "no lookup",
+    "evidence:",
+    "checked:",
+    "measured:",
+    "source:",
+    "seen:",
+    "shows:",
+    "showed:",
+];
+
+fn is_evidence(text: &str) -> bool {
+    let l = lower(text.trim().trim_matches('*').trim());
+    EVIDENCE_OPENERS.iter().any(|o| l.starts_with(o))
+}
+
+/// The items an out-of-scope section lists: its top-level bullets. A
+/// bullet nested under one (deeper than the section's first bullet) is
+/// that item's evidence or detail, and a line that records a lookup is
+/// evidence wherever it stands; neither is an item.
+fn out_bullets(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut top: Option<usize> = None;
+    for l in sections(text, OUT_HEADINGS) {
+        let Some(b) = bullet(l) else {
+            continue;
+        };
+        let indent = l.len() - l.trim_start().len();
+        let top = *top.get_or_insert(indent);
+        if indent > top || is_evidence(&b) {
+            continue;
+        }
+        out.push(b);
+    }
+    out
+}
+
 /// Adds `e` unless an entry already says it: the same item, one item
 /// opening the other ("`/x` pages" and "`/x` pages also cover y"), or a
 /// path or route both name; marks are merged.
@@ -570,7 +622,7 @@ impl Ledger {
     pub fn from_plan(proposal: &str, design: &str, tasks: &str) -> Ledger {
         let mut entries: Vec<Entry> = Vec::new();
         for text in [design, proposal] {
-            for b in sections(text, OUT_HEADINGS).into_iter().filter_map(bullet) {
+            for b in out_bullets(text) {
                 if let Some(e) = parse_line(&b, BY_PLAN) {
                     push_entry(&mut entries, e);
                 }
@@ -617,6 +669,28 @@ impl Ledger {
         }
         l.criteria = criteria.to_vec();
         l
+    }
+
+    /// What the ticket itself names is in scope, whatever the plan wrote
+    /// (`ticket`: its title and body). A name or path the ticket says is no
+    /// mark of an out-of-scope item (a task may name it, a diff may add it),
+    /// and an item the ticket says in full is moved in with that reason.
+    /// Returns a line for each item moved in.
+    pub fn named_by_ticket(&mut self, ticket: &str) -> Vec<String> {
+        let t = lower(ticket);
+        if t.trim().is_empty() {
+            return Vec::new();
+        }
+        let mut moved = Vec::new();
+        for e in self.entries.iter_mut().filter(|e| e.is_out()) {
+            e.marks.retain(|m| !t.contains(&lower(m)));
+            let item = lower(e.item.trim().trim_end_matches('.'));
+            if item.chars().count() >= 12 && t.contains(&item) {
+                e.moved_in = "the ticket names it".to_string();
+                moved.push(format!("\"{}\" moved into scope: {}", e.item, e.moved_in));
+            }
+        }
+        moved
     }
 
     /// Moves an item into scope, recording who asked and why. False when no
@@ -723,12 +797,30 @@ pub fn changes(notes: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Words that tell no item apart from another: a criterion and an item
+/// that share only these share nothing. "No layout shift when the page
+/// loads or when items toggle" once matched an item about one script per
+/// page, on "when" (counted twice) and "page".
+const COMMON_WORDS: &[&str] = &[
+    "when", "with", "that", "this", "from", "have", "will", "into", "each", "only", "then", "than",
+    "there", "their", "what", "which", "while", "also", "does", "should", "must", "they", "them",
+    "been", "being", "were", "more", "most", "some", "such", "other", "after", "before", "about",
+    "over", "under", "same", "both", "every", "where", "there", "here", "page", "pages", "user",
+    "users", "make", "made", "work", "works", "show", "shows",
+];
+
+/// The distinct words of `text` that tell an item apart.
 fn significant(text: &str) -> Vec<String> {
-    lower(text)
+    let mut out: Vec<String> = Vec::new();
+    for w in lower(text)
         .split(|c: char| !c.is_alphanumeric() && c != '-' && c != '_')
-        .filter(|w| w.chars().count() >= 4)
-        .map(str::to_string)
-        .collect()
+        .filter(|w| w.chars().count() >= 4 && !COMMON_WORDS.contains(w))
+    {
+        if !out.iter().any(|o| o == w) {
+            out.push(w.to_string());
+        }
+    }
+    out
 }
 
 /// Words of a comment that keeps an item out rather than asking for it.
@@ -884,7 +976,7 @@ pub fn plan_gaps(proposal: &str, design: &str, tasks: &str, criteria: &[String])
         ));
     }
     out.extend(decision_gaps(proposal, design, tasks, criteria));
-    out
+    unique(out)
 }
 
 /// Whether design.md has its out-of-scope section.
@@ -901,6 +993,19 @@ pub fn decision_gaps(
     design: &str,
     tasks: &str,
     criteria: &[String],
+) -> Vec<String> {
+    decision_gaps_for(proposal, design, tasks, criteria, "")
+}
+
+/// [`decision_gaps`] read against the ticket's own words (`ticket`: its
+/// title and body): what the ticket names is in scope, so a task naming it
+/// is never a task naming an out-of-scope item ([`Ledger::named_by_ticket`]).
+pub fn decision_gaps_for(
+    proposal: &str,
+    design: &str,
+    tasks: &str,
+    criteria: &[String],
+    ticket: &str,
 ) -> Vec<String> {
     let t = tasks.trim_start();
     if t.is_empty() || t.starts_with("NO_CHANGES_NEEDED") || t.starts_with("CLARIFICATION_NEEDED") {
@@ -920,7 +1025,8 @@ pub fn decision_gaps(
             one_line(&asks[0])
         ));
     }
-    let ledger = Ledger::from_plan(proposal, design, "");
+    let mut ledger = Ledger::from_plan(proposal, design, "");
+    ledger.named_by_ticket(ticket);
     for e in ledger.outs() {
         if let Some(c) = asked_by(e, criteria) {
             out.push(format!(
@@ -954,6 +1060,18 @@ pub fn decision_gaps(
                     .take(160)
                     .collect::<String>()
             ));
+        }
+    }
+    unique(out)
+}
+
+/// `lines` in their order, each said once: a check that finds the same
+/// thing on five task lines says it once.
+pub fn unique(lines: Vec<String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for l in lines {
+        if !out.iter().any(|o| o.trim() == l.trim()) {
+            out.push(l);
         }
     }
     out
