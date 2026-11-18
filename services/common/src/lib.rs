@@ -185,6 +185,8 @@ pub mod own_pr;
 pub mod paged;
 /// Placeholder tokens: never learned, never written into a commit or title.
 pub mod placeholders;
+/// Which waiting plan tasks a merged run releases.
+pub mod plan_dependents;
 /// Every body CoderHelm sends GitHub fits GitHub's limit.
 pub mod pr_body;
 pub mod pr_body_fit;

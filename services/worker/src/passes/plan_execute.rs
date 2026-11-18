@@ -307,9 +307,9 @@ impl PlanTicket<'_> {
     pub(crate) fn sk(&self) -> String {
         match self {
             PlanTicket::Github { repo, issue_number } => {
-                format!("PLAN_TICKET#github#{}#{issue_number}", repo.to_lowercase())
+                common::plan_dependents::github_link_sk(repo, *issue_number)
             }
-            PlanTicket::Jira(key) => format!("PLAN_TICKET#jira#{}", key.to_uppercase()),
+            PlanTicket::Jira(key) => common::plan_dependents::jira_link_sk(key),
         }
     }
 
