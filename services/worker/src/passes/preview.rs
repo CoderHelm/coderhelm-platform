@@ -103,7 +103,18 @@ pub fn unread_failure(st: &State, failing: &[String]) -> bool {
 
 /// A state that needs nothing more on its head.
 pub fn settled(st: &State, head: &str) -> bool {
+    let deploy: Vec<pv::Covering> = st
+        .covers
+        .iter()
+        .filter(|c| !c.label.is_empty())
+        .cloned()
+        .collect();
+    let rerunnable = st.stage == Stage::Failed
+        && st.checks.iter().any(|c| {
+            c.outcome == Outcome::Failed && (c.no_jobs || pv::is_covering(&deploy, &c.name))
+        });
     st.head == head
+        && !rerunnable
         && matches!(
             st.stage,
             Stage::NotNeeded | Stage::Checked | Stage::Blocked | Stage::Failed
@@ -115,12 +126,17 @@ fn outcome_of(run: &serde_json::Value) -> Outcome {
         (Some("completed"), Some("success")) => Outcome::Passed,
         (Some("completed"), Some("skipped" | "neutral")) => Outcome::Skipped,
         (Some("completed"), _) => Outcome::Failed,
+        // Held for a protected environment's approval.
+        (Some("waiting"), _) => Outcome::Waiting,
         _ => Outcome::Running,
     }
 }
 
 /// The covering checks' newest runs on the head.
-fn covering_results(runs: &serde_json::Value, covers: &[pv::Covering]) -> Vec<CheckResult> {
+pub(crate) fn covering_results(
+    runs: &serde_json::Value,
+    covers: &[pv::Covering],
+) -> Vec<CheckResult> {
     // The newest run of each covering check that ran: a check skipped on
     // the draft and run once it was ready reads as run, and a later event
     // that skips it (another label added) doesn't undo a run.
@@ -148,7 +164,28 @@ fn covering_results(runs: &serde_json::Value, covers: &[pv::Covering]) -> Vec<Ch
             name: name.to_string(),
             outcome: outcome_of(r),
             url: r["html_url"].as_str().unwrap_or("").to_string(),
+            environment: String::new(),
+            no_jobs: false,
         })
+        .collect()
+}
+
+/// The covering checks that failed in a check listing although the newest
+/// check of their name doesn't say so: a later run of the same `labeled`
+/// workflow, started by another label, skipped the job and hides the
+/// failure from every reading that takes the newest check of each name.
+/// Check names, so they compare with the base branch's checks like any
+/// other. The CI fix loop counts them as failing.
+pub(crate) fn hidden_failures(listing: &serde_json::Value, covers: &[pv::Covering]) -> Vec<String> {
+    let newest_failed: Vec<String> = super::reviewer_guide::checks_of(listing)
+        .into_iter()
+        .filter(|c| c.state == super::reviewer_guide::State::Failed)
+        .map(|c| c.name)
+        .collect();
+    covering_results(listing, covers)
+        .into_iter()
+        .filter(|r| r.outcome == Outcome::Failed && !newest_failed.contains(&r.name))
+        .map(|r| r.name)
         .collect()
 }
 
@@ -570,40 +607,58 @@ pub async fn advance(
         .await
         .unwrap_or_default();
     st.failures = read_failures(gh, p, &base, &runs, &changed).await;
-    if !changed.iter().any(|c| pv::is_user_visible(c)) {
+    // The deploy label's workflows cover every change, a page a person sees
+    // or not (`common::deploy_label`).
+    let deploy_labels = super::deploy_label::labels(state, p.team_id, p.owner, p.repo).await;
+    let deploy_covers = common::deploy_label::covers(&wfs, &deploy_labels);
+    let visible = changed.iter().any(|c| pv::is_user_visible(c));
+    if !visible && deploy_covers.is_empty() {
         st.why = "the change has no page a person sees".into();
         save(state, p, &st).await;
         return Some(st);
     }
-    let tree: Vec<String> = gh
-        .get_tree(p.owner, p.repo, &head)
-        .await
-        .map(|t| t.into_iter().map(|e| e.path).collect())
-        .unwrap_or_default();
-    let suite = pv::e2e_suite(&tree);
-    let need = pv::e2e_need(&changed, suite.as_ref());
-    if let pv::E2eNeed::Required { covered, .. } = &need {
-        st.e2e_required = true;
-        st.e2e_covered = *covered;
-    }
-    st.how_to_check = pv::how_to_check(&changed, suite.as_ref(), &pv::unit_cmd(&tree));
-    let areas = map_areas(gh, p.owner, p.repo, &head, &tree, &changed).await;
-    let repo_labels: Vec<String> = gh
-        .list_repo_labels(p.owner, p.repo)
-        .await
-        .map(|v| v.into_iter().map(|(n, _)| n).collect())
-        .unwrap_or_default();
-    let preferred = super::review_pr::named_labels(state, p.team_id, p.owner, p.repo).await;
     let on_pr = super::skipped_checks::labels_of(pr);
-    let plan = pv::plan(&pv::PlanInput {
-        workflows: &wfs,
-        changed: &changed,
-        base: &base,
-        repo_labels: &repo_labels,
-        on_pr: &on_pr,
-        preferred: &preferred,
-        areas: &areas,
-    });
+    let tree: Vec<String> = if visible {
+        gh.get_tree(p.owner, p.repo, &head)
+            .await
+            .map(|t| t.into_iter().map(|e| e.path).collect())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let mut plan = if visible {
+        let suite = pv::e2e_suite(&tree);
+        let need = pv::e2e_need(&changed, suite.as_ref());
+        if let pv::E2eNeed::Required { covered, .. } = &need {
+            st.e2e_required = true;
+            st.e2e_covered = *covered;
+        }
+        st.how_to_check = pv::how_to_check(&changed, suite.as_ref(), &pv::unit_cmd(&tree));
+        let areas = map_areas(gh, p.owner, p.repo, &head, &tree, &changed).await;
+        let repo_labels: Vec<String> = gh
+            .list_repo_labels(p.owner, p.repo)
+            .await
+            .map(|v| v.into_iter().map(|(n, _)| n).collect())
+            .unwrap_or_default();
+        let preferred = super::review_pr::named_labels(state, p.team_id, p.owner, p.repo).await;
+        pv::plan(&pv::PlanInput {
+            workflows: &wfs,
+            changed: &changed,
+            base: &base,
+            repo_labels: &repo_labels,
+            on_pr: &on_pr,
+            preferred: &preferred,
+            areas: &areas,
+        })
+    } else {
+        pv::Plan::default()
+    };
+    plan.covers = common::deploy_label::with_covers(&plan.covers, &deploy_covers);
+    for g in common::deploy_label::draft_gated(&wfs, &deploy_covers) {
+        if !plan.draft_gated.contains(&g) {
+            plan.draft_gated.push(g);
+        }
+    }
     st.covers = plan.covers.clone();
     st.draft_gated = plan.draft_gated.clone();
     let now = chrono::Utc::now().to_rfc3339();
@@ -614,15 +669,49 @@ pub async fn advance(
         .unwrap_or_else(|| now.clone());
     let mut from_checks = None;
     if plan.has_path() {
-        // Start what the workflows need: once per label per head.
-        let mut add = Vec::new();
+        let mut results = covering_results(&runs, &plan.covers);
+        // Start what the workflows need: once per label per head. The
+        // preview plan's labels only as the team's settings allow; the
+        // settings-named deploy labels as the team named them, but never on
+        // a head where their workflow already ran (the pull request's
+        // opening added them).
+        let added = |l: &str| st.labels_added.iter().any(|a| a.eq_ignore_ascii_case(l));
+        let on = |l: &str| on_pr.iter().any(|a| a.eq_ignore_ascii_case(l));
+        let mut want = Vec::new();
         for l in &plan.add {
-            if st.labels_added.iter().any(|a| a.eq_ignore_ascii_case(l)) {
-                continue;
+            if !added(l)
+                && super::review_pr::may_add_label(state, p.team_id, p.owner, p.repo, l).await
+            {
+                want.push(l.clone());
             }
-            if super::review_pr::may_add_label(state, p.team_id, p.owner, p.repo, l).await {
-                add.push(l.clone());
+        }
+        for l in &deploy_labels {
+            let mine: Vec<pv::Covering> = deploy_covers
+                .iter()
+                .filter(|c| c.label.eq_ignore_ascii_case(l))
+                .cloned()
+                .collect();
+            let ran = results
+                .iter()
+                .any(|r| r.outcome != Outcome::Skipped && pv::is_covering(&mine, &r.name));
+            if !mine.is_empty()
+                && !ran
+                && !added(l)
+                && !on(l)
+                && !want.iter().any(|w| w.eq_ignore_ascii_case(l))
+            {
+                want.push(l.clone());
             }
+        }
+        // A label a person or another app took off stays off, whoever's it is.
+        let mut add = Vec::new();
+        if !want.is_empty() {
+            let events = gh.list_issue_events(p.owner, p.repo, p.number).await.ok();
+            let bots = super::deploy_label::workflow_logins(gh).await;
+            let bots: Vec<&str> = bots.iter().map(String::as_str).collect();
+            let (put, off) = common::deploy_label::put_back(&want, events.as_ref(), &bots);
+            add = put;
+            st.kept_off = off;
         }
         let mut blocked = plan.blocked.clone();
         if !add.is_empty() {
@@ -653,7 +742,8 @@ pub async fn advance(
             .iter()
             .filter(|l| {
                 !st.labels_added.iter().any(|a| a.eq_ignore_ascii_case(l))
-                    && !on_pr.iter().any(|o| o.eq_ignore_ascii_case(l))
+                    && !on(l)
+                    && !st.kept_off.iter().any(|k| k.label.eq_ignore_ascii_case(l))
             })
             .collect();
         if !not_allowed.is_empty() && add.is_empty() {
@@ -666,15 +756,74 @@ pub async fn advance(
                     .join(", ")
             ));
         }
-        st.checks = covering_results(&runs, &plan.covers);
+        // A check only a kept-off label starts doesn't run on this head: it
+        // is said, never waited for.
+        let waits: Vec<pv::Covering> = plan
+            .covers
+            .iter()
+            .filter(|c| {
+                c.label.is_empty()
+                    || !st
+                        .kept_off
+                        .iter()
+                        .any(|k| k.label.eq_ignore_ascii_case(&c.label))
+            })
+            .cloned()
+            .collect();
+        results.retain(|r| r.outcome != Outcome::Skipped || pv::is_covering(&waits, &r.name));
+        for k in &st.kept_off {
+            blocked.push(k.line());
+        }
+        // A deploy workflow that failed before any job ran has no check:
+        // read from its run, so it is said rather than waited on.
+        let unread: Vec<&pv::Covering> = waits
+            .iter()
+            .filter(|c| {
+                !c.label.is_empty()
+                    && !results
+                        .iter()
+                        .any(|r| pv::is_covering(std::slice::from_ref(*c), &r.name))
+            })
+            .collect();
+        if !unread.is_empty() {
+            results
+                .extend(super::deploy_label::unstarted(gh, p.owner, p.repo, &head, &unread).await);
+        }
+        // A check held for an environment's approval names the environment.
+        for r in results.iter_mut().filter(|r| r.outcome == Outcome::Waiting) {
+            r.environment = super::deploy_label::environment_of(gh, p.owner, p.repo, &r.url).await;
+        }
+        st.checks = results;
         let triggered = !st.labels_added.is_empty() || draft;
         let mut stage = pv::progress(&st.checks, triggered);
         let none_ran = st.checks.iter().all(|c| c.outcome == Outcome::Skipped);
-        if none_ran && !blocked.is_empty() && st.labels_added.is_empty() && !draft {
+        if (none_ran && !blocked.is_empty() && st.labels_added.is_empty() && !draft)
+            || waits.is_empty()
+        {
             stage = Stage::Blocked;
             st.why = blocked.join("; ");
+        } else if !st.kept_off.is_empty() {
+            st.why = st
+                .kept_off
+                .iter()
+                .map(common::deploy_label::KeptOff::line)
+                .collect::<Vec<_>>()
+                .join("; ");
         }
         from_checks = Some(stage);
+    }
+    if !visible {
+        // No page to find or capture: the deploy label's checks are the
+        // whole check.
+        st.stage = match from_checks.unwrap_or_default() {
+            Stage::Ready => {
+                st.why = "the change has no page a person sees".into();
+                Stage::Checked
+            }
+            s => s,
+        };
+        save(state, p, &st).await;
+        return Some(st);
     }
     // Where the head's preview is, wherever the team's host or CI
     // publishes it.
@@ -1111,5 +1260,77 @@ mod tests {
         );
         assert_eq!(st.stage, Stage::Blocked);
         assert!(st.why.contains("checks hadn't finished"));
+    }
+
+    #[test]
+    fn a_covering_failure_a_later_skipped_run_hides_is_failing() {
+        // A `labeled` workflow's deploy job failed; the review label's run of
+        // the same workflow skipped the job a second later, so the newest
+        // check of that name reads skipped.
+        let listing = serde_json::json!({"total_count": 3, "check_runs": [
+            {"name": "unit tests", "status": "completed", "conclusion": "success",
+             "started_at": "2026-11-17T10:00:00Z", "output": {}},
+            {"name": "Deploy app", "status": "completed", "conclusion": "failure",
+             "started_at": "2026-11-17T10:05:00Z", "output": {}},
+            {"name": "Deploy app", "status": "completed", "conclusion": "skipped",
+             "started_at": "2026-11-17T10:05:01Z", "output": {}}
+        ]});
+        let covers = vec![pv::Covering {
+            check: "Deploy app".into(),
+            label: "CI:DEPLOY_PREVIEW".into(),
+            ..Default::default()
+        }];
+        // By check name, so it compares with the base branch's checks.
+        assert_eq!(
+            hidden_failures(&listing, &covers),
+            vec!["Deploy app".to_string()]
+        );
+        // Not a covering check: nothing.
+        assert!(hidden_failures(&listing, &[]).is_empty());
+        // The newest check of its name says failed already: not hidden.
+        let shown = serde_json::json!({"total_count": 1, "check_runs": [
+            {"name": "Deploy app", "status": "completed", "conclusion": "failure",
+             "started_at": "2026-11-17T10:05:00Z", "output": {}}
+        ]});
+        assert!(hidden_failures(&shown, &covers).is_empty());
+    }
+
+    #[test]
+    fn a_failed_deploy_label_check_is_read_again_on_the_same_head_a_failed_plan_check_is_not() {
+        let failed = |name: &str, no_jobs: bool| CheckResult {
+            name: name.into(),
+            outcome: Outcome::Failed,
+            url: String::new(),
+            environment: String::new(),
+            no_jobs,
+        };
+        let covers = vec![
+            pv::Covering {
+                check: "Deploy app".into(),
+                workflow: ".github/workflows/deploy.yml".into(),
+                label: "CI:DEPLOY_PREVIEW".into(),
+                ..Default::default()
+            },
+            pv::Covering {
+                check: "E2E on preview".into(),
+                ..Default::default()
+            },
+        ];
+        let st = |checks| State {
+            head: "abc".into(),
+            stage: Stage::Failed,
+            covers: covers.clone(),
+            checks,
+            ..Default::default()
+        };
+        // A person can re-run either on this head and it may pass.
+        assert!(!settled(&st(vec![failed("Deploy app", false)]), "abc"));
+        assert!(!settled(
+            &st(vec![failed("Deploy app / build", false)]),
+            "abc"
+        ));
+        assert!(!settled(&st(vec![failed("Something else", true)]), "abc"));
+        // The preview plan's own failure waits for the fix's push.
+        assert!(settled(&st(vec![failed("E2E on preview", false)]), "abc"));
     }
 }
