@@ -368,6 +368,7 @@ impl Handoff {
 /// step starts, see `steps`); only the team's usage limit, a person
 /// cancelling and the runaway ceiling stop it here. `why` is what the run
 /// page reads ("... continuing in step N").
+#[allow(clippy::too_many_arguments)]
 async fn try_auto_continue(
     state: &WorkerState,
     msg: &TicketMessage,
@@ -376,6 +377,8 @@ async fn try_auto_continue(
     continuable_passes: &[&str],
     planning: bool,
     why: &str,
+    // A step the run asks for by design (`run_guard::Target::owed`).
+    owed: bool,
 ) -> Handoff {
     // Gate on the checkpoint's pass IDENTITY, not just on there being a branch.
     // The wall-clock-timeout arm passes the broad set (any late pass with work
@@ -403,7 +406,10 @@ async fn try_auto_continue(
             steps::MAX_RUN_STEPS
         ));
     }
-    if let Some(reason) = run_guard::on_continuation(state, &msg.team_id, run_id).await {
+    let scope = format!("{}/{}", msg.repo_owner, msg.repo_name);
+    if let Some(reason) =
+        run_guard::on_continuation(state, &msg.team_id, run_id, &scope, owed).await
+    {
         return Handoff::Stopped(reason);
     }
     let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
@@ -1661,6 +1667,7 @@ pub async fn orchestrate_ticket(
                         &["implement", "implement_started", "security"],
                         false,
                         "The coder used this step's turns with work left",
+                        false,
                     )
                     .await
                     .continued();
@@ -1683,6 +1690,7 @@ pub async fn orchestrate_ticket(
                             &["implement", "implement_started", "security"],
                             false,
                             "A step after the work stopped on an error; the next one tries again",
+                            false,
                         )
                         .await
                         .continued();
@@ -1797,6 +1805,7 @@ pub async fn orchestrate_ticket(
                 } else {
                     "This step reached its time limit with work left"
                 },
+                false,
             )
             .await;
 
@@ -4234,7 +4243,8 @@ async fn run_passes(
                 None,
                 "The remaining planned tasks made no progress; the run goes on with the work on the branch",
                 usage,
-            )
+false,
+)
             .await;
         }
         info!(run_id, step, stalled, at = %at, "Continuing the run in this step");
@@ -5533,6 +5543,7 @@ async fn run_passes(
                 &["implement_started"],
                 false,
                 "Planning used most of this step; the coder starts in a fresh one",
+                false,
             )
             .await;
             if handoff.continued() {
@@ -5589,6 +5600,7 @@ async fn run_passes(
                         &["implement_started"],
                         false,
                         "The dependency checks continue in a fresh step",
+                        false,
                     )
                     .await;
                     if handoff.continued() {
@@ -5882,6 +5894,7 @@ async fn run_passes(
                     &["implement_started"],
                     false,
                     "The coder ran out of this step's time before writing a file",
+                    false,
                 )
                 .await;
                 if handoff.continued() {
@@ -6285,6 +6298,7 @@ async fn run_passes(
                         "{} planned task(s) not done yet",
                         cov.required_missing().len()
                     ),
+                    false,
                 )
                 .await;
                 if handoff.continued() {
@@ -6327,6 +6341,7 @@ async fn run_passes(
             None,
             "The work is built; its test and security audit need more time than this step has left",
             usage,
+            false,
         )
         .await;
     }
@@ -6373,7 +6388,8 @@ async fn run_passes(
                     None,
                     "The work changed files a code generator reads and this step has too little time left for the generator's build",
                     usage,
-                )
+false,
+)
                 .await;
             }
         }
@@ -6745,7 +6761,8 @@ async fn run_passes(
                     Some(&carry),
                     "The generator check needs a sandbox build and this step has too little time left for one",
                     usage,
-                )
+false,
+)
                 .await;
             }
             Err(generators::GateStop::Blocked(why)) => {
@@ -6888,7 +6905,8 @@ async fn run_passes(
                 Some(&carry),
                 "The work is built; opening the pull request needs more time than this step has left",
                 usage,
-            )
+false,
+)
             .await;
         }
         update_pass(state, &msg.team_id, run_id, "pr").await?;
@@ -7092,6 +7110,7 @@ async fn run_passes(
                     Some(&carry),
                     $why,
                     usage,
+                    false,
                 )
                 .await;
             }
@@ -7205,6 +7224,7 @@ async fn run_passes(
                 Some(&carry),
                 "Running the changed tests with and without the change needs a step of its own",
                 usage,
+                true,
             )
             .await;
         }
@@ -7503,6 +7523,7 @@ async fn plan_again_or_stop(
         &[],
         true,
         &format!("Plan check (format): {why}; planning again"),
+        false,
     )
     .await
     {
@@ -7545,11 +7566,14 @@ async fn hand_off_at(
     carry: Option<&steps::Carry>,
     why: &str,
     usage: &TokenUsage,
+    // The run asks for this step by design (the changed tests' sandbox
+    // runs need a whole one): the run guard doesn't count it.
+    owed: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     save_checkpoint(state, &msg.team_id, run_id, "implement", branch, 0, usage).await;
     steps::save_gate(state, &msg.team_id, run_id, gate, carry).await;
     let from = Some(("implement".to_string(), branch.to_string(), 0u8));
-    match try_auto_continue(state, msg, run_id, &from, &["implement"], false, why).await {
+    match try_auto_continue(state, msg, run_id, &from, &["implement"], false, why, owed).await {
         Handoff::Continued => Ok(()),
         Handoff::Stopped(reason) => {
             let kept = keep_wip_branch(github, &msg.repo_owner, &msg.repo_name, branch).await;
@@ -7586,7 +7610,9 @@ async fn settle_in_fresh_step(
     .await;
     steps::save_mark(state, &msg.team_id, run_id, "", 0, 0).await;
     let from = Some(("implement".to_string(), branch.to_string(), 0u8));
-    try_auto_continue(state, msg, run_id, &from, &["implement"], false, why).await
+    // Owed: the settle stage's own steps are bounded (`settle::MAX_STEPS`)
+    // and wait for a sandbox window, which is no sign of a loop.
+    try_auto_continue(state, msg, run_id, &from, &["implement"], false, why, true).await
 }
 
 /// A finished run's checks, again, in a fresh step of the run that resumes

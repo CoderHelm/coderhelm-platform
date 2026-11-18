@@ -2772,6 +2772,11 @@ pub async fn run(
         super::webhooks::emit_ci_fix_started(state, &ci_fix, &failing_checks).await;
         let pass_start = std::time::Instant::now();
         let usage_before = usage.clone();
+        // A red check with its error is new evidence on a shipped run: a stop
+        // that shipped the work (its tasks done) never keeps this round from
+        // starting. The round's own bounds (the fix ledger, the pushes, the
+        // run's ceiling) still hold.
+        super::run_guard::lift_shipped_stop(state, &msg.team_id, &msg.run_id).await;
         super::update_pass(state, &msg.team_id, &msg.run_id, "implement").await?;
 
         let plan_result = plan::PlanResult {

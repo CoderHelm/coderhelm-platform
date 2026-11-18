@@ -362,7 +362,15 @@ fn run_loop(c: &Case, model: &Model) -> Result<(), String> {
                 fix_rounds += 1;
             }
         }
-        guard.on_continuation(usd);
+        // The continuation names its target: the proof check's open items.
+        guard.on_continuation_to(
+            usd,
+            &crate::passes::run_guard::Target {
+                owed: false,
+                unrun: 0,
+                open: (0..open).map(|n| format!("gap {n}")).collect(),
+            },
+        );
         totals.continuations += 1;
         totals.spend_usd += usd;
         if guard.trip().is_some() || totals.over().is_some() {

@@ -729,6 +729,9 @@ pub fn ended_wrong(runs: &[&RunRow]) -> Value {
 fn loop_stop_label(code: &str) -> String {
     match code {
         "continuations_after_work" => "Kept continuing after its tasks were done".into(),
+        "converged_with_open_items" => {
+            "Shipped with open items once continuing closed nothing".into()
+        }
         "continuations" => "Kept continuing without finishing a task".into(),
         "pass_transitions" => "Kept moving between steps without progress".into(),
         "spend" => "Spent too much without progress".into(),

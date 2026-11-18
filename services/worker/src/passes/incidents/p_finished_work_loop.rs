@@ -7,7 +7,8 @@
 //! Guarantee: the draft pull request opens as soon as the work is built, before
 //! the checks, which then can't hold it back. A check runs once on a head and
 //! keeps its rounds for the whole run. And whatever any pass does, a run with no
-//! real progress ends one way: a draft with its Open items, waiting on a person.
+//! real progress ends its steps one way: a draft with its Open items, shipped
+//! once the tasks are done (`da_finished_run_ships`).
 
 use crate::passes::proof::{self, Finding, Next};
 use crate::passes::run_guard::*;
@@ -70,7 +71,18 @@ fn replay(work_done: bool) -> Replayed {
                 };
             }
         }
-        g.on_continuation(0.0);
+        // Each continuation names what it is for: the proof check's open
+        // items as that step left them.
+        g.on_continuation_to(
+            0.0,
+            &Target {
+                owed: false,
+                unrun: 0,
+                open: (0..counts[step % counts.len()])
+                    .map(|i| format!("gap {i}"))
+                    .collect(),
+            },
+        );
         if let Some(trip) = g.trip() {
             return Replayed {
                 trip: Some(trip),
@@ -88,16 +100,18 @@ fn replay(work_done: bool) -> Replayed {
     }
 }
 
-/// With nothing else changed, the guard alone stops that run at its fourth
-/// continuation: 22 passes and about $15.26, 36% of what it spent.
+/// With nothing else changed, the guard alone ends that run's steps at its
+/// third continuation, the second in a row that closed nothing (the proof
+/// check's count went 2, 4, 3 with the tasks done), and ships it: 16 passes,
+/// under a third of what it spent.
 #[test]
-fn the_recorded_run_stops_at_its_fourth_continuation() {
+fn the_recorded_run_ships_once_its_continuations_stop_closing_anything() {
     let r = replay(true);
-    assert_eq!(r.trip, Some(Trip::ContinuationsAfterWork));
-    assert_eq!(r.continuations, 4);
-    assert_eq!(r.passes, 22);
-    assert!((r.usd - 15.26).abs() < 0.01, "{}", r.usd);
-    assert!(r.usd < INCIDENT_USD / 2.0);
+    assert_eq!(r.trip, Some(Trip::Converged));
+    assert!(Trip::Converged.ships());
+    assert_eq!(r.continuations, 3);
+    assert_eq!(r.passes, 16);
+    assert!(r.usd < INCIDENT_USD / 3.0, "{}", r.usd);
 }
 
 /// Even if the run never reported its tasks done, it doesn't go the distance.
@@ -645,9 +659,13 @@ fn a_normal_large_ticket_never_trips_the_guard() {
 fn the_steps_are_ended_by_a_reason_a_person_can_act_on() {
     let r = replay(true);
     let g = GuardState {
-        after_work: r.continuations as u32,
+        stale: 2,
         ..Default::default()
     };
     let why = r.trip.unwrap().reason(&g);
-    assert!(why.contains("handed it to you"), "{why}");
+    // Finished work is shipped, never handed back: what is open is on the
+    // pull request, and CI or a comment starts the next round.
+    assert!(!why.contains("handed it to you"), "{why}");
+    assert!(why.contains("Open items"), "{why}");
+    assert!(why.contains("a push or a comment"), "{why}");
 }

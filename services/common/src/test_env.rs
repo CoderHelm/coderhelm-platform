@@ -744,7 +744,10 @@ pub fn package_test_command(
 
 impl TestEnv {
     /// Whether this is another package's job for `focus` (the files a run
-    /// changes): its tests run in a folder none of them is in.
+    /// changes or runs): its tests run in a folder one of them is not in. A
+    /// job is kept only when it covers every file: a job chosen for one file
+    /// (an end-to-end suite in its own folder) installs nothing for a file
+    /// in another package, whose runner is then missing.
     pub fn misses(&self, focus: &[String]) -> bool {
         let dir = if self.dir.is_empty() {
             common_step_dir(&self.test)
@@ -752,10 +755,9 @@ impl TestEnv {
             self.dir.clone()
         };
         !dir.is_empty()
-            && !focus.is_empty()
-            && !focus
+            && focus
                 .iter()
-                .any(|f| f.trim_start_matches("./").starts_with(&format!("{dir}/")))
+                .any(|f| !f.trim_start_matches("./").starts_with(&format!("{dir}/")))
     }
 
     /// Each test step that calls a package script or a make target
