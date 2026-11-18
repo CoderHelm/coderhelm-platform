@@ -74,6 +74,8 @@ pub const WORKER_MESSAGE_TYPES: &[&str] = &[
     "agent_resume_sweep",
     // A run waiting on a person: its reminder (from the stuck-run sweep).
     "run_waiting",
+    // A run waiting for the AWS role's reads: its re-check (`role_wait`).
+    "role_reads_wait",
     // A model call's usage, held because its counters couldn't be written.
     "usage_record",
     // Knowledge sources: the scheduled sweep, and one source's sync.

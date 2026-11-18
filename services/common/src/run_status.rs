@@ -20,6 +20,12 @@ pub const PENDING: &str = "pending";
 pub const QUEUED: &str = "queued";
 pub const RUNNING: &str = "running";
 pub const AWAITING_CI: &str = "awaiting_ci";
+/// Waiting for the install's setup item "AWS role reads": the run read what
+/// the team's AWS role allows, the rest needs a read the role stack's
+/// template has and the account's role lacks, and nothing else would get
+/// the data. It asks nobody and goes on by itself once a re-check shows
+/// the role has the read (`role_wait`).
+pub const AWAITING_SETUP: &str = "awaiting_setup";
 pub const NEEDS_INPUT: &str = "needs_input";
 pub const NEEDS_OUTSIDE_CHANGE: &str = "needs_outside_change";
 /// An open pull request (anyone's) already does the work: the run linked it
@@ -39,11 +45,12 @@ pub const RETRIED: &str = "retried";
 pub const ARCHIVED: &str = "archived";
 
 /// Every status a run record carries.
-pub const ALL: [&str; 15] = [
+pub const ALL: [&str; 16] = [
     PENDING,
     QUEUED,
     RUNNING,
     AWAITING_CI,
+    AWAITING_SETUP,
     NEEDS_INPUT,
     NEEDS_OUTSIDE_CHANGE,
     COVERED_BY_PR,
@@ -218,6 +225,7 @@ mod tests {
             QUEUED,
             RUNNING,
             AWAITING_CI,
+            AWAITING_SETUP,
             NEEDS_INPUT,
             NEEDS_OUTSIDE_CHANGE,
             COVERED_BY_PR,
@@ -250,6 +258,9 @@ mod tests {
         assert_eq!(reopen_status(NEEDS_OUTSIDE_CHANGE), NEEDS_OUTSIDE_CHANGE);
         assert_eq!(reopen_status(COVERED_BY_PR), COVERED_BY_PR);
         assert_eq!(reopen_status(NEEDS_INPUT), NEEDS_INPUT);
+        // A reopened run waiting for the role's reads waits again: the
+        // daily role check still finds it.
+        assert_eq!(reopen_status(AWAITING_SETUP), AWAITING_SETUP);
         for s in IN_FLIGHT {
             assert_eq!(reopen_status(s), NEEDS_INPUT, "{s}");
         }

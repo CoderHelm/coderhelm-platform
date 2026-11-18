@@ -116,6 +116,12 @@ pub struct StepError {
     /// ([`source_errors::for_source`] words it for the kind of source).
     #[serde(skip)]
     pub cause: Option<source_errors::Cause>,
+    /// The IAM actions AWS refused the team's connected role: reads the role
+    /// stack's template has that this account's deployed role lacks. They
+    /// are the install's setup item (`aws_role_reads`), never a refusal of
+    /// ours and never a question on a run.
+    #[serde(skip)]
+    pub role_refused: Vec<String>,
 }
 
 impl StepError {
@@ -125,6 +131,17 @@ impl StepError {
             message: message.into(),
             fix: fix.into(),
             cause: None,
+            role_refused: Vec::new(),
+        }
+    }
+
+    /// AWS refused the team's connected role `actions`: the lookup names the
+    /// install's setup item "AWS role reads" in one line and goes on.
+    pub fn role_refused(actions: &[&str]) -> Self {
+        let actions: Vec<String> = actions.iter().map(|a| a.to_string()).collect();
+        Self {
+            role_refused: actions.clone(),
+            ..Self::new("sign_in", crate::aws_role_reads::run_line(&actions), "")
         }
     }
 

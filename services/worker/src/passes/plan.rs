@@ -911,7 +911,16 @@ Then the ```fix_location.json block described above."#,
 
     let model_id = provider.judgment_model_id();
     let can_look_up = live.as_ref().is_some_and(|l| !l.tools().is_empty());
-    let lookups = || live.as_ref().map_or(0, |l| l.lookups_made());
+    // Every lookup the planner made counts: the data sources' and the
+    // monitoring tools' (metrics, New Relic, AWS WAF, Airflow). A decision
+    // backed by five NRQL and metric lookups was once marked "no lookups
+    // were made" because only the data sources' were counted.
+    let lookups = || {
+        super::fix_location::lookups_made(
+            live.as_ref().map_or(0, |l| l.lookups_made()),
+            ops.as_ref().map_or(0, |o| o.lookups().len()),
+        )
+    };
     let response = provider::converse_document(
         state,
         provider,
@@ -1153,9 +1162,16 @@ Then the ```fix_location.json block described above."#,
     // Held-back questions send the plan back once; what is still not
     // admissible after that never reaches a person.
     let lookup_lines = || {
-        live.as_ref()
+        let mut lines: Vec<String> = live
+            .as_ref()
             .map(|l| l.lookups().into_iter().map(|x| x.line).collect::<Vec<_>>())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        lines.extend(
+            ops.as_ref()
+                .map(|o| o.lookups().into_iter().map(|x| x.line).collect::<Vec<_>>())
+                .unwrap_or_default(),
+        );
+        lines
     };
     let reads = can_read(&team_repos, &tools);
     let asked = clarification_of(&files.tasks);
