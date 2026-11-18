@@ -36,9 +36,26 @@ A proof is one of `proven`, `not_the_ticket` (passes without the change),
 ## Gaps
 
 A criterion is an open gap when no change in the diff is traced to it, no
-test on the head covers it, or its proof doesn't hold. Each gap is listed in
-the description's open items with what is missing. A gap that the two-way
-proof already reports is listed once.
+test on the head covers it, or its proof doesn't hold. Each gap is listed
+in the description's open items with what is missing.
+
+The gaps are also work for the coder (`common::trace::coder_items`), fed
+into the same loop as the run's other open gaps:
+
+- Each build of the description records them on the run's checks ledger
+  (`run_guard::Ledger::trace`, for the head it was built for). There they
+  are open items like any check's: they hold the draft (`open_findings`)
+  and the run converges on them (`run_guard::Target`).
+- When the two-way proof runs on a fresh head (`pr_watch`), the
+  description is built first, then the proof's items and the trace's go
+  back to the coder together, in one fix round
+  (`resume::queue_own_review_round`).
+- For a pull request with no preview, where no two-way proof runs, the
+  description build sends the trace's items itself.
+- A criterion whose two-way proof already sends an item (a test missing,
+  failing on the preview, or passing on staging too) is sent once, by the
+  proof. The trace adds an item for it only when no changed code is traced
+  to it.
 
 ## Where it shows
 

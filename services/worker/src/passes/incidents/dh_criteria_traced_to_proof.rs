@@ -160,3 +160,81 @@ fn the_trace_is_kept_on_the_run_and_served_by_the_api() {
     let t = the_trace();
     assert_eq!(trace::Trace::from_json(&t.to_json()), Some(t));
 }
+
+#[test]
+fn an_open_criterion_drives_a_fix_round_like_any_open_gap() {
+    use crate::passes::run_guard::{Ledger, Target, TraceGaps};
+    let t = the_trace();
+    // The untested criterion is the coder's work; the proven one is not.
+    let items = trace::coder_items(&t);
+    assert_eq!(items.len(), 1, "{items:?}");
+    assert!(items[0].starts_with(trace::CODER_ITEM));
+    assert!(items[0].contains("Page views") && items[0].contains("no test"));
+
+    // A criterion whose two-way proof sends its own item is sent once.
+    let mut both_green = proven_chip();
+    both_green.record.base = Leg {
+        ran: true,
+        passed: 1,
+        ..Default::default()
+    };
+    let acceptance = crate::passes::stop_judge::acceptance(TICKET);
+    let map = ep::parse_map(DESIGN);
+    let criteria = ep::criteria_or_map("Duplicate chip", TICKET, &acceptance, &map);
+    let not_the_ticket = trace::build(&Inputs {
+        head: HEAD,
+        criteria: &criteria,
+        from_plan: false,
+        map: &map,
+        files: &diff(),
+        proofs: std::slice::from_ref(&both_green),
+        test_runs: &[],
+    });
+    let proof_items = ep::coder_items(std::slice::from_ref(&both_green), HEAD);
+    assert_eq!(proof_items.len(), 1);
+    let trace_items = trace::coder_items(&not_the_ticket);
+    assert!(
+        !trace_items.iter().any(|i| i.contains("multi-sport")),
+        "{trace_items:?}"
+    );
+    let merged =
+        crate::passes::pr_watch::with_trace_items(proof_items.clone(), trace_items.clone());
+    assert_eq!(merged.len(), 2, "{merged:?}");
+    assert_eq!(
+        crate::passes::pr_watch::with_trace_items(merged.clone(), trace_items).len(),
+        2
+    );
+
+    // On the run's ledger the trace's items are open items: the run
+    // converges on them and they hold the draft.
+    let mut l = Ledger::default();
+    let before = Target::of(&l).open.len();
+    l.trace = TraceGaps {
+        head: HEAD.into(),
+        items: items.clone(),
+    };
+    let target = Target::of(&l);
+    assert_eq!(target.open.len(), before + 1, "{:?}", target.open);
+    assert!(target.open.iter().any(|o| o.contains("Page views")));
+    assert!(l
+        .open_findings()
+        .iter()
+        .any(|f| f.point == "check_blocked" && f.detail.contains("The criteria trace")));
+    assert_eq!(l.trace.on(HEAD), items.as_slice());
+    assert!(l.trace.on("0000000").is_empty());
+
+    // Wired: the description records them, the watch sends them with the
+    // proof's in one round, and without a preview the trace sends them.
+    let description = include_str!("../description.rs");
+    assert!(description.contains("record_trace_gaps(state, team_id"));
+    assert!(description.contains("g.run.preview.is_none() && !gaps.is_empty()"));
+    assert!(description.contains("queue_own_review_round("));
+    let watch = include_str!("../pr_watch.rs");
+    let at = watch
+        .find("super::description::trace_items(")
+        .expect("the watch reads them");
+    let queue = watch[at..]
+        .find("queue_own_review_round(")
+        .expect("and queues them");
+    assert!(watch[at..at + queue].contains("with_trace_items(items, trace)"));
+}

@@ -542,6 +542,54 @@ pub fn gaps(t: &Trace) -> Vec<Gap> {
     out
 }
 
+/// What goes back to the coder for the trace's gaps: one instruction per
+/// gap the two-way proof doesn't already send (`e2e_proof::coder_items`),
+/// each starting with [`CODER_ITEM`]. A proof still running or a side that
+/// couldn't run is not coder work.
+pub fn coder_items(t: &Trace) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for r in &t.rows {
+        // The two-way proof sends its own item for a test it found missing,
+        // failing or not testing the ticket: only the untraced code is
+        // the trace's to send for that criterion.
+        let two_way = r.proof.by.starts_with("end to end");
+        let c = r.criterion.trim();
+        let item = if r.code.is_empty() {
+            format!(
+                "{CODER_ITEM} \"{c}\": no change in the diff is traced to it. Build it, or name the code that already does it in the plan's criteria map (`| code: <files or functions>`)."
+            )
+        } else if two_way {
+            continue;
+        } else if r.tests.is_empty() {
+            format!(
+                "{CODER_ITEM} \"{c}\": no test on the head covers it. Add a test that fails without the change and passes with it."
+            )
+        } else {
+            match r.proof.state {
+                State::Failing => format!(
+                    "{CODER_ITEM} \"{c}\": its test fails with the change ({}). Fix the code, not the test.",
+                    r.proof.detail
+                ),
+                State::NotTheTicket => format!(
+                    "{CODER_ITEM} \"{c}\": its test passes without the change too ({}). Make it assert what the criterion asks, so it fails without the change.",
+                    r.proof.detail
+                ),
+                State::Missing => format!(
+                    "{CODER_ITEM} \"{c}\": no test of it on the head. Add one that fails without the change and passes with it."
+                ),
+                _ => continue,
+            }
+        };
+        if !out.contains(&item) {
+            out.push(item);
+        }
+    }
+    out
+}
+
+/// How a trace item starts, so it is told from the two-way proof's.
+pub const CODER_ITEM: &str = "Criteria trace:";
+
 fn cell(s: &str) -> String {
     s.replace('|', "\\|").replace('\n', " ")
 }

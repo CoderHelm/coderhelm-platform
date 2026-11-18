@@ -1003,6 +1003,26 @@ async fn build(
             // The trace of this head, on the run for its API.
             if let Some(t) = facts.trace.as_ref() {
                 save_trace(state, team_id, &g.run.run_id, t).await;
+                let gaps = record_trace_gaps(state, team_id, &g.run.run_id, owner, repo, t).await;
+                // Without a preview no two-way proof runs to send the trace's
+                // items with its own (`pr_watch`): the trace sends them.
+                if g.run.preview.is_none() && !gaps.is_empty() {
+                    let queued = super::resume::queue_own_review_round(
+                        state,
+                        github,
+                        team_id,
+                        &g.run.run_id,
+                        &head,
+                        &gaps,
+                    )
+                    .await;
+                    tracing::info!(
+                        pr_number = number,
+                        items = gaps.len(),
+                        fixing = matches!(queued, super::resume::OwnRound::Fixing),
+                        "The criteria trace sent work back to the coder"
+                    );
+                }
             }
             let reply = match reader {
                 Some(r) => ask_reader(state, r, &facts, &base).await,
@@ -1078,6 +1098,53 @@ async fn save_trace(state: &WorkerState, team_id: &str, run_id: &str, t: &common
     {
         warn!(run_id, error = %e, "Could not keep the criteria trace on the run");
     }
+}
+
+/// The trace's open items on the run's checks ledger (`run_guard`), so the
+/// run converges on them and the next fix round works them; a head with
+/// none clears them.
+async fn record_trace_gaps(
+    state: &WorkerState,
+    team_id: &str,
+    run_id: &str,
+    owner: &str,
+    repo: &str,
+    t: &common::trace::Trace,
+) -> Vec<String> {
+    if run_id.is_empty() {
+        return Vec::new();
+    }
+    let gaps = super::run_guard::TraceGaps {
+        head: t.head.clone(),
+        items: common::trace::coder_items(t),
+    };
+    let cell =
+        super::run_guard::LedgerCell::load(state, team_id, run_id, &format!("{owner}/{repo}"))
+            .await;
+    let items = gaps.items.clone();
+    let changed = cell.update(|l| {
+        let changed = l.trace != gaps;
+        l.trace = gaps;
+        changed
+    });
+    if changed {
+        cell.save(state, team_id, run_id).await;
+    }
+    items
+}
+
+/// The trace's open items for `head`, as the run's ledger holds them.
+pub(crate) async fn trace_items(
+    state: &WorkerState,
+    team_id: &str,
+    run_id: &str,
+    owner: &str,
+    repo: &str,
+    head: &str,
+) -> Vec<String> {
+    super::run_guard::LedgerCell::load(state, team_id, run_id, &format!("{owner}/{repo}"))
+        .await
+        .update(|l| l.trace.on(head).to_vec())
 }
 
 /// The lines CoderHelm wrote about the pull request's CI, true for `head`
