@@ -110,6 +110,9 @@ pub mod live;
 /// Log findings and the fix runs started from them.
 pub mod log_findings;
 pub mod log_incident;
+/// One ticket, one run: the canonical ticket key and the claim every run
+/// start takes on it.
+pub mod one_run;
 /// Reachability read from the code: imports, calls, lockfile parents.
 pub mod reachability;
 /// One repo's reviewer settings: the page's view and the saved item.

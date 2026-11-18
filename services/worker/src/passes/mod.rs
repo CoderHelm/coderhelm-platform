@@ -1335,6 +1335,7 @@ pub mod model_check;
 #[cfg(test)]
 mod model_route_eval;
 pub mod onboard;
+pub mod one_run;
 pub mod open_pr_choice;
 pub mod ops_tools;
 pub mod outcome;
@@ -1536,6 +1537,21 @@ pub async fn orchestrate_ticket(
             "Skipping duplicate: another run for this ticket is already active"
         );
         return Ok(());
+    }
+    // One ticket, one run, from any source: the claim on the ticket's
+    // canonical key (`common::one_run`). A second trigger for a ticket a live
+    // run holds (its tracker and an issue CoderHelm opened for it) starts
+    // nothing; the live run's page says it arrived.
+    if !is_continuation {
+        if let Err(live) = one_run::claim(state, &msg, &run_id).await {
+            info!(
+                run_id,
+                live = %live,
+                ticket_id = %msg.ticket_id,
+                "Skipping duplicate: a live run holds this ticket"
+            );
+            return Ok(());
+        }
     }
 
     if is_continuation {
