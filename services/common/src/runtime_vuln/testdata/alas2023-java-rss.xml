@@ -1,0 +1,131 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<rss version="2.0" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:atom="http://www.w3.org/2005/Atom">
+<channel>
+    <title>Amazon Linux 2023 Security Bulletins</title>
+    <description>Amazon Linux 2023 Security Bulletins</description>
+    <link>https://alas.aws.amazon.com</link>
+    <language>en-us</language>
+    <ttl>35</ttl>
+    
+    <item>
+        <title>ALAS2023-2026-3478 (important): java-17-amazon-corretto</title>
+        <description>
+            CVE-2026-114938
+        </description>
+        <pubDate>Tue, 17 Nov 2026 22:34:00 GMT</pubDate>
+        <lastBuildDate>Tue, 17 Nov 2026 23:01:00 GMT</lastBuildDate>
+        <guid>https://alas.aws.amazon.com/AL2023/ALAS2023-2026-3478.html</guid>
+        <link>https://alas.aws.amazon.com/AL2023/ALAS2023-2026-3478.html</link>
+    </item>
+<item>
+        <title>ALAS2023-2026-3479 (important): java-21-amazon-corretto</title>
+        <description>
+            CVE-2026-114938
+        </description>
+        <pubDate>Tue, 17 Nov 2026 22:34:00 GMT</pubDate>
+        <lastBuildDate>Tue, 17 Nov 2026 23:01:00 GMT</lastBuildDate>
+        <guid>https://alas.aws.amazon.com/AL2023/ALAS2023-2026-3479.html</guid>
+        <link>https://alas.aws.amazon.com/AL2023/ALAS2023-2026-3479.html</link>
+    </item>
+<item>
+        <title>ALAS2023-2026-3480 (important): java-25-amazon-corretto</title>
+        <description>
+            CVE-2026-114938
+        </description>
+        <pubDate>Tue, 17 Nov 2026 22:34:00 GMT</pubDate>
+        <lastBuildDate>Tue, 17 Nov 2026 23:01:00 GMT</lastBuildDate>
+        <guid>https://alas.aws.amazon.com/AL2023/ALAS2023-2026-3480.html</guid>
+        <link>https://alas.aws.amazon.com/AL2023/ALAS2023-2026-3480.html</link>
+    </item>
+<item>
+        <title>ALAS2023-2026-3481 (important): java-27-amazon-corretto</title>
+        <description>
+            CVE-2026-114938
+        </description>
+        <pubDate>Tue, 17 Nov 2026 22:34:00 GMT</pubDate>
+        <lastBuildDate>Tue, 17 Nov 2026 23:01:00 GMT</lastBuildDate>
+        <guid>https://alas.aws.amazon.com/AL2023/ALAS2023-2026-3481.html</guid>
+        <link>https://alas.aws.amazon.com/AL2023/ALAS2023-2026-3481.html</link>
+    </item>
+<item>
+        <title>ALAS2023-2026-3418 (medium): javapackages-bootstrap</title>
+        <description>
+            CVE-2026-102554
+        </description>
+        <pubDate>Mon, 09 Nov 2026 23:26:00 GMT</pubDate>
+        <lastBuildDate>Mon, 09 Nov 2026 23:26:00 GMT</lastBuildDate>
+        <guid>https://alas.aws.amazon.com/AL2023/ALAS2023-2026-3418.html</guid>
+        <link>https://alas.aws.amazon.com/AL2023/ALAS2023-2026-3418.html</link>
+    </item>
+<item>
+        <title>ALAS2023-2026-3372 (important): java-11-amazon-corretto</title>
+        <description>
+            CVE-2026-114820
+        </description>
+        <pubDate>Fri, 30 Oct 2026 21:00:00 GMT</pubDate>
+        <lastBuildDate>Mon, 02 Nov 2026 09:00:00 GMT</lastBuildDate>
+        <guid>https://alas.aws.amazon.com/AL2023/ALAS2023-2026-3372.html</guid>
+        <link>https://alas.aws.amazon.com/AL2023/ALAS2023-2026-3372.html</link>
+    </item>
+<item>
+        <title>ALAS2023-2026-3369 (important): java-25-amazon-corretto</title>
+        <description>
+            CVE-2026-114820
+        </description>
+        <pubDate>Fri, 30 Oct 2026 21:00:00 GMT</pubDate>
+        <lastBuildDate>Mon, 02 Nov 2026 09:00:00 GMT</lastBuildDate>
+        <guid>https://alas.aws.amazon.com/AL2023/ALAS2023-2026-3369.html</guid>
+        <link>https://alas.aws.amazon.com/AL2023/ALAS2023-2026-3369.html</link>
+    </item>
+<item>
+        <title>ALAS2023-2026-3368 (important): java-27-amazon-corretto</title>
+        <description>
+            CVE-2026-114820
+        </description>
+        <pubDate>Fri, 30 Oct 2026 21:00:00 GMT</pubDate>
+        <lastBuildDate>Mon, 02 Nov 2026 09:00:00 GMT</lastBuildDate>
+        <guid>https://alas.aws.amazon.com/AL2023/ALAS2023-2026-3368.html</guid>
+        <link>https://alas.aws.amazon.com/AL2023/ALAS2023-2026-3368.html</link>
+    </item>
+<item>
+        <title>ALAS2023-2026-3370 (important): java-21-amazon-corretto</title>
+        <description>
+            CVE-2026-114820
+        </description>
+        <pubDate>Fri, 30 Oct 2026 21:00:00 GMT</pubDate>
+        <lastBuildDate>Mon, 02 Nov 2026 09:00:00 GMT</lastBuildDate>
+        <guid>https://alas.aws.amazon.com/AL2023/ALAS2023-2026-3370.html</guid>
+        <link>https://alas.aws.amazon.com/AL2023/ALAS2023-2026-3370.html</link>
+    </item>
+<item>
+        <title>ALAS2023-2026-3371 (important): java-17-amazon-corretto</title>
+        <description>
+            CVE-2026-114820
+        </description>
+        <pubDate>Fri, 30 Oct 2026 21:00:00 GMT</pubDate>
+        <lastBuildDate>Mon, 02 Nov 2026 09:00:00 GMT</lastBuildDate>
+        <guid>https://alas.aws.amazon.com/AL2023/ALAS2023-2026-3371.html</guid>
+        <link>https://alas.aws.amazon.com/AL2023/ALAS2023-2026-3371.html</link>
+    </item>
+<item>
+        <title>ALAS2023-2026-3373 (important): java-1.8.0-amazon-corretto</title>
+        <description>
+            CVE-2026-114820
+        </description>
+        <pubDate>Fri, 30 Oct 2026 21:00:00 GMT</pubDate>
+        <lastBuildDate>Mon, 02 Nov 2026 09:00:00 GMT</lastBuildDate>
+        <guid>https://alas.aws.amazon.com/AL2023/ALAS2023-2026-3373.html</guid>
+        <link>https://alas.aws.amazon.com/AL2023/ALAS2023-2026-3373.html</link>
+    </item>
+<item>
+        <title>ALAS2023-2026-3317 (important): java-11-amazon-corretto</title>
+        <description>
+            CVE-2026-101516, CVE-2026-113470, CVE-2026-83374, CVE-2026-83376, CVE-2026-83378, CVE-2026-83380, CVE-2026-83381, CVE-2026-83387, CVE-2026-83400, CVE-2026-87255, CVE-2026-87290, CVE-2026-87291, CVE-2026-87292, CVE-2026-87293, CVE-2026-87294, CVE-2026-87367, CVE-2026-91332, CVE-2026-91334, CVE-2026-91335, CVE-2026-91373, CVE-2026-91374, CVE-2026-91375, CVE-2026-91379, CVE-2026-91380, CVE-2026-91381, CVE-2026-91382, CVE-2026-91394, CVE-2026-91395, CVE-2026-91396, CVE-2026-91397, CVE-2026-91398, CVE-2026-91400, CVE-2026-91403, CVE-2026-91409, CVE-2026-91410, CVE-2026-91411, CVE-2026-91415, CVE-2026-91418, CVE-2026-91451, CVE-2026-91452, CVE-2026-91453, CVE-2026-91461, CVE-2026-91462, CVE-2026-91463, CVE-2026-91464, CVE-2026-91487
+        </description>
+        <pubDate>Sat, 24 Oct 2026 20:57:00 GMT</pubDate>
+        <lastBuildDate>Wed, 04 Nov 2026 10:10:00 GMT</lastBuildDate>
+        <guid>https://alas.aws.amazon.com/AL2023/ALAS2023-2026-3317.html</guid>
+        <link>https://alas.aws.amazon.com/AL2023/ALAS2023-2026-3317.html</link>
+    </item>
+</channel>
+</rss>

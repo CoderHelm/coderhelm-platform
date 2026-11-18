@@ -34,6 +34,7 @@ pub const LAMBDA_RUNTIMES: &str =
 /// The hosts the feeds are read from (the self-host docs list them).
 pub const HOSTS: &[&str] = &[
     "alas.aws.amazon.com",
+    crate::runtime_vuln::advisories::HOST,
     "advisories.bottlerocket.aws",
     "aws.amazon.com",
     "docs.aws.amazon.com",
@@ -47,6 +48,10 @@ pub const FEEDS: &[(&str, &str)] = &[
     ("bulletins", "AWS security bulletins"),
     ("lambda_runtimes", "Lambda runtime deprecations"),
     ("latest_images", "AWS latest AMI parameters"),
+    (
+        crate::runtime_vuln::advisories::FEED,
+        "OpenJDK vulnerability advisories",
+    ),
 ];
 
 /// A feed whose read went wrong: why, in a line for the log and the page.
@@ -226,6 +231,10 @@ pub struct Advisory {
     /// carries everything).
     #[serde(default)]
     pub detailed: bool,
+    /// The page's issue overview, shortened: what is affected, on which
+    /// hardware (`runtime_vuln::advisories` reads it for runtime CVEs).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub overview: String,
 }
 
 impl Advisory {
@@ -284,6 +293,7 @@ pub struct AlasPage {
     pub cves: Vec<String>,
     pub releasever: String,
     pub fixed: Vec<Pkg>,
+    pub overview: String,
 }
 
 /// A package's full name (`kernel-6.1.189-236.400.amzn2023.x86_64`) as
@@ -348,7 +358,20 @@ pub fn parse_alas_page(html: &str) -> Result<AlasPage, ParseError> {
         .nth(1)
         .map(|r| r.split("</div>").next().unwrap_or(""))
         .unwrap_or("");
+    let overview = html
+        .split("id='issue_overview'")
+        .nth(1)
+        .map(|o| o.split("</div>").next().unwrap_or(""))
+        .map(|o| {
+            text_of(o)
+                .trim_start_matches("Issue Overview:")
+                .trim()
+                .to_string()
+        })
+        .map(|o| crate::truncate_str(&o, 1500).to_string())
+        .unwrap_or_default();
     Ok(AlasPage {
+        overview,
         id,
         severity: severity.split_whitespace().next().unwrap_or("").to_string(),
         released,
@@ -366,6 +389,9 @@ impl Advisory {
         }
         if !p.fixed.is_empty() {
             self.fixed = p.fixed.clone();
+        }
+        if !p.overview.is_empty() {
+            self.overview = p.overview.clone();
         }
         for c in &p.cves {
             if !self.cves.contains(c) {

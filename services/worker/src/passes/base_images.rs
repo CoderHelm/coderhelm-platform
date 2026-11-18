@@ -125,6 +125,21 @@ impl<'a> Registry<'a> {
         Err(format!("{} refused an anonymous pull", r.registry))
     }
 
+    /// The repository's tags (`tags/list`), as far as one page goes.
+    pub async fn tags(&mut self, r: &ImageRef) -> Result<Vec<String>, String> {
+        let (body, _) = self
+            .get(r, "tags/list?n=10000", "application/json", 8 * 1024 * 1024)
+            .await?;
+        let v: Value =
+            serde_json::from_slice(&body).map_err(|_| "the tag list isn't JSON".to_string())?;
+        Ok(v["tags"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|t| t.as_str().map(String::from))
+            .collect())
+    }
+
     /// Reads a reference: its digest and, when published, the linux/amd64
     /// package list.
     pub async fn read(&mut self, r: &ImageRef) -> Result<Read, String> {

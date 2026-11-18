@@ -33,7 +33,7 @@
 //!   pull request opening, CI passing and the merge, and at half the
 //!   deadline and the deadline. Every card is claimed once.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::Instant;
 
 use aws_sdk_dynamodb::types::AttributeValue;
@@ -523,6 +523,13 @@ async fn refresh_inventory(
     }
     for p in paths.iter().filter(|p| sec::is_dockerfile(p)).take(10) {
         if let Ok(text) = gh.read_file(owner, name, p, &branch).await {
+            // The runtime its images run (a JDK, Node.js, Python, Go).
+            for d in common::runtime_vuln::decls::from_dockerfile(p, &text) {
+                let dep = d.to_dep();
+                if !deps.contains(&dep) {
+                    deps.push(dep);
+                }
+            }
             for (image, tag) in sec::dockerfile_images(&text) {
                 let d = Dep {
                     ecosystem: "docker".into(),
@@ -538,8 +545,44 @@ async fn refresh_inventory(
             }
         }
     }
+    // Runtime declarations outside Dockerfiles: version files, build
+    // toolchains, CI setup steps. Lambda runtimes are the infrastructure
+    // findings' (`infra_inventory` reads them with the rest of the code).
+    let mut runtime_files: Vec<&String> = paths
+        .iter()
+        .filter(|p| common::runtime_vuln::decls::is_runtime_file(p) && !iac_template(p))
+        .collect();
+    runtime_files.sort();
+    for p in runtime_files.into_iter().take(MAX_RUNTIME_FILES) {
+        if let Ok(text) = gh.read_file(owner, name, p, &branch).await {
+            for d in common::runtime_vuln::decls::from_file(p, &text) {
+                if d.kind == common::runtime_vuln::decls::DeclKind::Lambda {
+                    continue;
+                }
+                let dep = d.to_dep();
+                if !deps.contains(&dep) {
+                    deps.push(dep);
+                }
+            }
+        }
+    }
     save_deps(state, team_id, repo, &deps, &status, unpinned, &branch).await;
     Ok(deps)
+}
+
+/// Runtime declaration files read per repository sync (Dockerfiles are
+/// read for their base images, up to ten).
+const MAX_RUNTIME_FILES: usize = 40;
+
+/// Infrastructure templates: their Lambda runtimes are read with the
+/// account's resources, not as the repository's runtime.
+fn iac_template(p: &str) -> bool {
+    let b = p.rsplit('/').next().unwrap_or(p).to_ascii_lowercase();
+    b.ends_with(".tf")
+        || b.ends_with(".template.json")
+        || b.ends_with(".template.yaml")
+        || b.starts_with("template.y")
+        || b.starts_with("serverless.y")
 }
 
 fn apply_scopes(
@@ -931,7 +974,12 @@ async fn osv_observations(
     cache: &mut HashMap<String, Value>,
 ) -> Result<Vec<Observation>, String> {
     use futures::StreamExt;
-    let lookup: Vec<&Dep> = deps.iter().filter(|d| d.ecosystem != "docker").collect();
+    // Base images and runtimes are matched on their own (`base_images`,
+    // `runtime_vuln`); `osv_queries` leaves them out too, so the indexes line up.
+    let lookup: Vec<&Dep> = deps
+        .iter()
+        .filter(|d| d.ecosystem != "docker" && d.ecosystem != common::runtime_vuln::ECOSYSTEM)
+        .collect();
     let mut hits: Vec<(usize, String)> = vec![];
     for (chunk_i, chunk) in lookup.chunks(500).enumerate() {
         let owned: Vec<Dep> = chunk.iter().map(|d| (*d).clone()).collect();
@@ -1778,6 +1826,7 @@ async fn triage_tick(cx: &Ctx<'_>, findings: &mut [(Finding, FindingState)]) -> 
         // Base images are not searched in code (common::base_images).
         if f.status.is_open()
             && f.ecosystem != common::base_images::ECOSYSTEM
+            && f.ecosystem != common::runtime_vuln::ECOSYSTEM
             && cx.cfg.repos.includes(&f.repo)
             && triage_due(f, st, now)
         {
@@ -1952,9 +2001,24 @@ struct Ctx<'a> {
     started: Instant,
     /// OSV records read this tick (repositories share packages).
     osv: tokio::sync::Mutex<HashMap<String, Value>>,
+    /// The runtime advisories, read once a tick when a repository needs them.
+    runtime: tokio::sync::OnceCell<Vec<common::runtime_vuln::advisories::RuntimeAdvisory>>,
 }
 
 impl Ctx<'_> {
+    async fn runtime(&self) -> Vec<common::runtime_vuln::advisories::RuntimeAdvisory> {
+        self.runtime
+            .get_or_init(|| async {
+                common::infra_vuln::store::runtime_advisories(
+                    &self.state.dynamo,
+                    &self.state.config.settings_table_name,
+                )
+                .await
+            })
+            .await
+            .clone()
+    }
+
     /// The tick's time is used, or the sweep may not spend GitHub's budget
     /// now (the runs' share, its own hour's cap, a spent limit): every loop
     /// here asks before its next item, so a sweep stops instead of failing
@@ -1971,14 +2035,17 @@ async fn sync_repo(
     findings: &mut Vec<(Finding, FindingState)>,
     with_alerts: bool,
 ) -> usize {
-    let deps = match refresh_inventory(cx.state, cx.team_id, &cx.gh, repo).await {
-        Ok(d) => d,
+    let (deps, fresh) = match refresh_inventory(cx.state, cx.team_id, &cx.gh, repo).await {
+        Ok(d) => (d, true),
         Err(e) => {
             warn!(team_id = cx.team_id, repo, error = %e, "security: inventory failed");
-            load_deps(cx.state, cx.team_id, repo)
-                .await
-                .map(|(d, _)| d)
-                .unwrap_or_default()
+            (
+                load_deps(cx.state, cx.team_id, repo)
+                    .await
+                    .map(|(d, _)| d)
+                    .unwrap_or_default(),
+                false,
+            )
         }
     };
     let mut obs: Vec<Observation> = vec![];
@@ -2014,6 +2081,9 @@ async fn sync_repo(
         super::base_images::sync(cx.state, repo, &deps, &mut cache).await
     };
     obs.extend(base_obs);
+    // Runtimes the code declares, against the runtime advisories.
+    let (runtime_obs, runtime_read) = runtime_observations(cx, repo, &deps, findings, fresh).await;
+    obs.extend(runtime_obs);
     let now = Utc::now().to_rfc3339();
     match osv {
         Ok(o) => {
@@ -2064,11 +2134,13 @@ async fn sync_repo(
     }
     let applied = upsert(cx.state, cx.team_id, cx.cfg, findings, obs).await;
     base_images_settle(cx, repo, findings, &base_reads).await;
+    runtime_settle(cx, repo, findings, &deps, &runtime_read).await;
     // The dependency list now shows some fixed: a merged bump, a removal.
     for (f, st) in findings.iter_mut() {
         if f.repo.eq_ignore_ascii_case(repo)
             && f.status.is_open()
             && f.ecosystem != "docker"
+            && f.ecosystem != common::runtime_vuln::ECOSYSTEM
             && sec::fixed_by_inventory(f, &deps)
         {
             f.status = Status::Fixed;
@@ -2093,6 +2165,98 @@ async fn sync_repo(
         }
     }
     applied.created
+}
+
+/// A repository's runtime declarations against the runtime advisories:
+/// the observations, and what the read saw (to close what the code no
+/// longer declares). A pinned image's fixed tag comes from its registry's
+/// tag list. An inventory that could not be read fresh closes nothing.
+async fn runtime_observations(
+    cx: &Ctx<'_>,
+    repo: &str,
+    deps: &[Dep],
+    findings: &[(Finding, FindingState)],
+    fresh: bool,
+) -> (Vec<Observation>, common::runtime_vuln::findings::Read) {
+    use common::runtime_vuln::{advisories as ra, decls::Decl, findings as rf};
+    let decls: Vec<Decl> = deps.iter().filter_map(Decl::from_dep).collect();
+    let advs = cx.runtime().await;
+    // Every file was read this time: a finding whose file no longer
+    // declares an affected runtime is fixed.
+    let files: BTreeSet<String> = if fresh {
+        findings
+            .iter()
+            .filter(|(f, _)| {
+                f.ecosystem == common::runtime_vuln::ECOSYSTEM && f.repo.eq_ignore_ascii_case(repo)
+            })
+            .map(|(f, _)| f.manifest.clone())
+            .chain(decls.iter().map(|d| d.file.clone()))
+            .collect()
+    } else {
+        BTreeSet::new()
+    };
+    let mut tags: BTreeMap<(String, String), String> = BTreeMap::new();
+    let mut reg = super::base_images::Registry::new(&cx.state.http);
+    let mut listed: HashMap<String, Vec<String>> = HashMap::new();
+    for d in decls
+        .iter()
+        .filter(|d| d.kind == common::runtime_vuln::decls::DeclKind::Image && d.exact)
+    {
+        for adv in advs.iter().filter(|a| a.runtime == d.runtime) {
+            let (st, line) = ra::standing(adv, &d.version, true);
+            let (ra::Standing::Affected, Some(line)) = (st, line) else {
+                continue;
+            };
+            if !listed.contains_key(&d.package) {
+                let list = match common::base_images::ImageRef::parse(&format!("{}:{}", d.package, d.written)) {
+                    Some(r) => reg.tags(&r).await.unwrap_or_else(|e| {
+                        warn!(team_id = cx.team_id, repo, image = %d.package, error = %e, "security: the image's tags couldn't be listed");
+                        Vec::new()
+                    }),
+                    None => Vec::new(),
+                };
+                listed.insert(d.package.clone(), list);
+            }
+            if let Some(t) = rf::fixed_tag(&d.written, &listed[&d.package], line) {
+                let key = (d.package.clone(), d.written.clone());
+                let higher = tags
+                    .get(&key)
+                    .is_none_or(|old| common::runtime_vuln::java_cmp(&t, old).is_gt());
+                if higher {
+                    tags.insert(key, t);
+                }
+            }
+        }
+    }
+    rf::observations(repo, &decls, &files, &advs, &tags)
+}
+
+/// Runtime findings after a read: fixed when the code no longer declares
+/// an affected runtime; else their verdict (never triaged in code) and tier.
+async fn runtime_settle(
+    cx: &Ctx<'_>,
+    repo: &str,
+    findings: &mut [(Finding, FindingState)],
+    deps: &[Dep],
+    read: &common::runtime_vuln::findings::Read,
+) {
+    use common::runtime_vuln::{decls::Decl, findings as rf};
+    let decls: Vec<Decl> = deps.iter().filter_map(Decl::from_dep).collect();
+    let advs = cx.runtime().await;
+    for (i, change) in rf::apply_reads(findings, repo, read, &decls, &advs, cx.cfg) {
+        let (f, st) = &findings[i];
+        save_finding(cx.state, cx.team_id, f, st).await;
+        if change == rf::Change::Fixed {
+            add_event(
+                cx.state,
+                cx.team_id,
+                &f.id,
+                "Fixed: the code no longer declares an affected runtime build",
+                None,
+            )
+            .await;
+        }
+    }
 }
 
 /// Base image findings after a read: fixed when the image no longer has
@@ -3636,6 +3800,7 @@ async fn team_tick(
         gh: github(state, installation_id)?,
         started,
         osv: Default::default(),
+        runtime: Default::default(),
     };
     let mut report = TeamReport::default();
     let mut findings = load_findings(state, team_id).await;
@@ -4125,6 +4290,7 @@ async fn event_for_team(
         gh: github(state, installation_id)?,
         started: Instant::now(),
         osv: Default::default(),
+        runtime: Default::default(),
     };
     let mut findings = load_findings(state, team_id).await;
     let mut report = TeamReport::default();
@@ -4835,6 +5001,7 @@ pub(crate) async fn dep_inputs(
     let unit = load_unit(state, team_id, ticket).await?;
     if unit.ecosystem == common::infra_vuln::records::UNIT_ECOSYSTEM
         || unit.ecosystem == common::base_images::ECOSYSTEM
+        || unit.ecosystem == common::runtime_vuln::ECOSYSTEM
     {
         return None;
     }

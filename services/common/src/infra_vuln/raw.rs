@@ -20,6 +20,18 @@ pub struct RawInstance {
     /// Has a public IPv4 address (the address itself isn't kept).
     pub public_ip: bool,
     pub tags: Vec<(String, String)>,
+    /// `m7i.large`, and AWS's `x86_64` or `arm64`.
+    pub instance_type: String,
+    pub architecture: String,
+}
+
+/// The packages SSM inventory lists on one instance: `(name,
+/// version-release)`, bounded by the read.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RawPackages {
+    pub instance: String,
+    pub packages: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,6 +92,8 @@ pub struct RawNodegroup {
     /// A custom launch template (its AMI is the team's, not EKS's).
     pub launch_template_id: String,
     pub tags: Vec<(String, String)>,
+    /// The node group's instance types.
+    pub instance_types: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -252,6 +266,8 @@ pub struct RawAccount {
     pub domains: Vec<RawDomain>,
     /// `(instance id, running kernel)` from SSM inventory.
     pub kernels: Vec<(String, String)>,
+    /// Every package SSM inventory lists, per instance (bounded).
+    pub packages: Vec<RawPackages>,
     pub scans: Vec<RawScan>,
     /// Amazon Inspector's active findings (when the team runs it).
     pub inspector: Vec<RawInspector>,
@@ -326,14 +342,34 @@ impl RawAccount {
             .iter()
             .map(|(i, k)| (i.as_str(), k.as_str()))
             .collect();
+        let packages: BTreeMap<&str, Vec<String>> = self
+            .packages
+            .iter()
+            .map(|p| {
+                (
+                    p.instance.as_str(),
+                    p.packages.iter().map(|(n, v)| format!("{n} {v}")).collect(),
+                )
+            })
+            .collect();
         let public_tgs = self.public_tgs();
         let mut out: Vec<Resource> = Vec::new();
 
         // EC2: instances, collapsed into their Auto Scaling group. Node
         // group members are the node group's record.
         let mut instances = Vec::new();
+        // Node group members' packages and types, for their node group.
+        let mut node_packages: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for i in &self.instances {
-            if tag(&i.tags, "eks:nodegroup-name").is_some() {
+            if let Some(ng) = tag(&i.tags, "eks:nodegroup-name") {
+                let e = node_packages.entry(ng).or_default();
+                inv::merge_packages(
+                    e,
+                    packages
+                        .get(i.id.as_str())
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]),
+                );
                 continue;
             }
             let asg = tag(&i.tags, "aws:autoscaling:groupName");
@@ -352,6 +388,13 @@ impl RawAccount {
                     .get(i.id.as_str())
                     .map(|k| k.to_string())
                     .unwrap_or_default(),
+                packages: packages.get(i.id.as_str()).cloned().unwrap_or_default(),
+                instance_types: if i.instance_type.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![i.instance_type.clone()]
+                },
+                arch: i.architecture.clone(),
                 ..Default::default()
             };
             r.inspector = self
@@ -460,6 +503,15 @@ impl RawAccount {
                     date: if date.len() == 8 { date } else { String::new() },
                     kernel_line: String::new(),
                 }),
+                instance_types: n.instance_types.clone(),
+                arch: if n.ami_type.contains("ARM_64") || n.ami_type.contains("arm64") {
+                    "arm64".into()
+                } else if n.ami_type.contains("x86_64") {
+                    "x86_64".into()
+                } else {
+                    String::new()
+                },
+                packages: node_packages.get(&n.name).cloned().unwrap_or_default(),
                 ..Default::default()
             };
             if !n.launch_template_id.is_empty() {

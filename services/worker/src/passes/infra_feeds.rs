@@ -17,6 +17,10 @@
 //! - The Lambda runtime table, and AWS's latest-image parameters (read with
 //!   the worker's own role in us-east-1: public parameters, no team's
 //!   account).
+//! - The OpenJDK Vulnerability Group's advisories: the index, then each
+//!   page not read yet (the newest few again every day), stored per CVE as
+//!   `RUNTIME_ADV#<id>` with what the Amazon Linux advisories for the java
+//!   packages, read just before, add (`common::runtime_vuln::advisories`).
 
 use std::collections::{BTreeSet, HashMap};
 use std::io::Read;
@@ -40,6 +44,10 @@ const PAGES_PER_DAY: usize = 60;
 const BULLETINS_PER_DAY: usize = 60;
 /// Advisories older than this aren't kept on a first read.
 const BACKFILL_DAYS: i64 = 400;
+/// OpenJDK advisory pages read per day, and how many of the newest are read
+/// again every day (a page is updated after it is published).
+const OPENJDK_PAGES_PER_DAY: usize = 12;
+const OPENJDK_REREAD: usize = 3;
 /// Largest response read (the AL2 feed is about 2 MB).
 const MAX_BYTES: usize = 12 * 1024 * 1024;
 
@@ -50,6 +58,7 @@ pub struct FeedReport {
     pub advisories: usize,
     pub pages: usize,
     pub bulletins: usize,
+    pub runtime: usize,
     pub failed: Vec<String>,
 }
 
@@ -167,6 +176,7 @@ pub fn merge_advisories(
                 if k.detailed {
                     a.releasever = k.releasever.clone();
                     a.fixed = k.fixed.clone();
+                    a.overview = k.overview.clone();
                     a.detailed = true;
                     for c in &k.cves {
                         if !a.cves.contains(c) {
@@ -372,6 +382,76 @@ async fn latest(state: &WorkerState, report: &mut FeedReport) {
     record(state, "latest_images", outcome, report).await;
 }
 
+/// The OpenJDK pages to read now: the newest [`OPENJDK_REREAD`] again,
+/// then those not read yet, newer than `oldest`, newest first.
+pub fn openjdk_pages_to_read(
+    dates: &[String],
+    read: &BTreeSet<String>,
+    oldest: &str,
+) -> Vec<String> {
+    dates
+        .iter()
+        .enumerate()
+        .filter(|(i, d)| d.as_str() >= oldest && (*i < OPENJDK_REREAD || !read.contains(*d)))
+        .map(|(_, d)| d.clone())
+        .take(OPENJDK_PAGES_PER_DAY)
+        .collect()
+}
+
+async fn openjdk(state: &WorkerState, report: &mut FeedReport) {
+    use common::runtime_vuln::{self as rv, advisories as ra};
+    let outcome = async {
+        let html = fetch_text(state, ra::OPENJDK_INDEX).await?;
+        let dates = ra::parse_openjdk_index(&html).map_err(|e| e.to_string())?;
+        let known = store::runtime_advisories(&state.dynamo, &state.config.settings_table_name).await;
+        let pages_read: BTreeSet<String> = known
+            .iter()
+            .filter_map(|a| a.url.rsplit('/').find(|p| !p.is_empty()).map(String::from))
+            .collect();
+        let oldest = (Utc::now() - Duration::days(BACKFILL_DAYS)).format("%Y-%m-%d").to_string();
+        let mut all: Vec<ra::RuntimeAdvisory> = known.clone();
+        let mut failures = 0usize;
+        let mut parsed = 0usize;
+        for d in openjdk_pages_to_read(&dates, &pages_read, &oldest) {
+            let url = ra::openjdk_page(&d);
+            match fetch_text(state, &url).await.and_then(|h| ra::parse_openjdk_page(&h, &url).map_err(|e| e.to_string())) {
+                Ok(advs) => {
+                    parsed += 1;
+                    for a in advs {
+                        // A page read again replaces what it said; what the
+                        // enrichment added is added again below.
+                        match all.iter_mut().find(|x| x.id == a.id) {
+                            Some(x) => *x = a,
+                            None => all.push(a),
+                        }
+                    }
+                }
+                // The stored copy of this page's advisories stays as it was.
+                Err(e) => {
+                    warn!(page = %url, error = %e, "infra feeds: OpenJDK advisory page not read; keeping the last good copy");
+                    failures += 1;
+                }
+            }
+        }
+        if parsed == 0 && failures > 0 {
+            return Err(format!("none of {failures} OpenJDK advisory pages could be read (the page format may have changed)"));
+        }
+        let alas = advisories(state).await;
+        ra::enrich(&mut all, &alas, &ra::notes());
+        for a in &all {
+            if known.iter().any(|k| k == a) {
+                continue;
+            }
+            if put_json(state, &rv::advisory_sk(&a.id), a, &[]).await {
+                report.runtime += 1;
+            }
+        }
+        Ok::<usize, String>(all.len())
+    }
+    .await;
+    record(state, ra::FEED, outcome, report).await;
+}
+
 /// The daily read, on the review-reminder tick. Only the first tick of a
 /// UTC day reads; a read that failed outright is tried again next tick.
 pub async fn sweep(state: &WorkerState) -> FeedReport {
@@ -403,6 +483,8 @@ pub async fn sweep(state: &WorkerState) -> FeedReport {
     bottlerocket(state, &mut report).await;
     lambda_runtimes(state, &mut report).await;
     latest(state, &mut report).await;
+    // After ALAS: the java advisories' pages add to the runtime advisories.
+    openjdk(state, &mut report).await;
     if report.failed.len() == feeds::FEEDS.len() {
         // Nothing answered (no network?): try again on the next tick.
         common::claim::release(
@@ -417,6 +499,7 @@ pub async fn sweep(state: &WorkerState) -> FeedReport {
         advisories = report.advisories,
         pages = report.pages,
         bulletins = report.bulletins,
+        runtime = report.runtime,
         failed = ?report.failed,
         "Infrastructure feeds read"
     );
@@ -484,6 +567,30 @@ mod tests {
         low.package = "vim".into();
         low.severity = "low".into();
         assert!(pages_to_read(&[low], &BTreeSet::new(), 5).is_empty());
+    }
+
+    #[test]
+    fn openjdk_pages_reread_the_newest_and_read_the_rest_once() {
+        let dates: Vec<String> = [
+            "2026-11-17",
+            "2026-10-24",
+            "2026-10-21",
+            "2026-10-20",
+            "2026-07-21",
+            "2024-01-16",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let read = BTreeSet::from([
+            "2026-11-17".to_string(),
+            "2026-10-24".to_string(),
+            "2026-10-20".to_string(),
+        ]);
+        assert_eq!(
+            openjdk_pages_to_read(&dates, &read, "2025-10-14"),
+            vec!["2026-11-17", "2026-10-24", "2026-10-21", "2026-07-21"]
+        );
     }
 
     #[test]

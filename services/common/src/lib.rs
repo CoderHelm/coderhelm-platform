@@ -114,6 +114,8 @@ pub mod log_incident;
 pub mod reachability;
 /// One repo's reviewer settings: the page's view and the saved item.
 pub mod review_config;
+/// Language runtimes (a JDK, Node.js, Python, Go) against their own advisories.
+pub mod runtime_vuln;
 /// Security fixes: advisories, triage, fix runs and cards (gateway and worker).
 pub mod security_fixes;
 pub mod security_release;
