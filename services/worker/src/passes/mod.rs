@@ -7097,6 +7097,9 @@ async fn run_passes(
             }
         };
     }
+    // Sandbox runs a step owed this one run first, with its whole budget,
+    // never after the other checks spent it.
+    habits_check::run_owed(&work, || remaining_secs(start)).await;
     hand_off_unless_time_for!(
         proof,
         "The proof check needs more time than this step has left"
@@ -8563,7 +8566,7 @@ async fn run_repo_pipeline(
     };
     // This path has no step of its own to give: with too little time the
     // tests are recorded as not run, with why.
-    ledger.update(|l| l.habits_waited = true);
+    ledger.update(|l| l.no_proof_step = true);
     let habits_pr = match habits_check::gate(
         &work,
         &mut evidence,

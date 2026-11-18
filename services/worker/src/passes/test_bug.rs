@@ -57,6 +57,20 @@ impl Runner<'_> {
         Ok((test_package::step_codes(&output, n), output))
     }
 
+    /// [`Self::run_at`] in a given test environment (`None`: none), not the
+    /// run's default one: the CI job that runs these steps' files.
+    pub async fn run_at_in(
+        &self,
+        sha: &str,
+        steps: &[Step],
+        env: Option<(common::test_env::TestEnv, String)>,
+    ) -> Result<(Vec<Option<i32>>, String), String> {
+        let cmds: Vec<&str> = steps.iter().map(|s| s.cmd.as_str()).collect();
+        let script = test_package::sandbox_script(steps, None);
+        let output = self.run_script_in(sha, &cmds, &script, env).await?;
+        Ok((test_package::step_codes(&output, steps.len()), output))
+    }
+
     /// Runs `script` on commit `sha` in the sandbox, in the run's test
     /// environment, once each of `cmds` (the commands it runs) passes the
     /// team's agent permissions: the output. `Err` says why nothing ran.
@@ -65,6 +79,31 @@ impl Runner<'_> {
         sha: &str,
         cmds: &[&str],
         script: &str,
+    ) -> Result<String, String> {
+        // A failing test's run has no planned files: the job that runs on
+        // every change from the root comes first.
+        let env = super::test_setup::for_run(
+            self.state,
+            self.github,
+            self.team_id,
+            self.owner,
+            self.repo,
+            sha,
+            sha,
+            self.run_id,
+            &[],
+        )
+        .await;
+        self.run_script_in(sha, cmds, script, env).await
+    }
+
+    /// [`Self::run_script_at`] in the test environment `env`.
+    pub async fn run_script_in(
+        &self,
+        sha: &str,
+        cmds: &[&str],
+        script: &str,
+        env: Option<(common::test_env::TestEnv, String)>,
     ) -> Result<String, String> {
         if !self.sandbox_on() {
             return Err("no sandbox is set up here".into());
@@ -98,22 +137,7 @@ impl Runner<'_> {
         )
         .with_egress(crate::agent::policy::sandbox_egress(self.state, self.team_id).await)
         // The proof step runs in the run's test environment too.
-        .with_test_env(
-            super::test_setup::for_run(
-                self.state,
-                self.github,
-                self.team_id,
-                self.owner,
-                self.repo,
-                sha,
-                sha,
-                self.run_id,
-                // A failing test's run has no planned files: the job that
-                // runs on every change from the root comes first.
-                &[],
-            )
-            .await,
-        );
+        .with_test_env(env);
         let source = sandbox
             .ensure_source(self.run_id, sha, || {
                 self.github.download_tarball(self.owner, self.repo, sha)

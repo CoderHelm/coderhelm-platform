@@ -233,6 +233,7 @@ fn the_new_test_runs_on_the_base_the_way_ci_runs_it() {
             path: "tests/test_camp_sport.py".into(),
             verdict: habits_check::verdict(&head, &head).0,
             detail: String::new(),
+            why: None,
         }],
         ..Default::default()
     };
@@ -246,6 +247,7 @@ fn the_new_test_runs_on_the_base_the_way_ci_runs_it() {
             path: "tests/test_camp_sport.py".into(),
             verdict: Verdict::NotRun,
             detail: "the sandbox gave no result for it".into(),
+            why: None,
         }],
         ..Default::default()
     };
@@ -256,6 +258,7 @@ fn the_new_test_runs_on_the_base_the_way_ci_runs_it() {
             path: "tests/test_camp_sport.py".into(),
             verdict: Verdict::Proven,
             detail: "AssertionError".into(),
+            why: None,
         }],
         ..Default::default()
     };

@@ -130,7 +130,12 @@ The causes were in the loop, not only in prompt wording:
 
    Each new or changed test runs in the sandbox with and without the
    change (`habits_check`). A test the runner finds nothing in goes back to the
-   coder, and the coder quotes the run's output in its Evidence. End-to-end code
+   coder, and the coder quotes the run's output in its Evidence.
+   These runs install through CI's job for the test files. Without one, a
+   workspace member installs from the workspace root. They have a budget
+   of their own: a short step owes them to a fresh step, which runs them
+   before any other check. How many ran, and why the rest didn't, is
+   counted on the run and in the pull request (`incidents::tq_tests_run`). End-to-end code
    against another company's page uses only what a probe observed (#734).
 
    A proof fix round that answers a gap by looking (a query, a page, a check

@@ -19,12 +19,27 @@
 //!   ledger), goes back to be taken out, unless a `Scope change:` line
 //!   cites an acceptance criterion or a person's comment.
 //!
-//! The sandbox runs take up to its full wait, so the check asks for a step
-//! of its own when this one has too little time left
-//! ([`GateStop::NeedsTime`]), once; a run that still has none records the
-//! tests as not run, with why. Like every check on the open pull request it
-//! runs once on a head, keeps its rounds in the run's ledger, and what it
-//! leaves goes under Open items.
+//! The sandbox runs take up to its full wait. They have a budget of their
+//! own, never the leftovers of the coding step: when this step has too
+//! little time left the check asks for a step of its own
+//! ([`GateStop::NeedsTime`]) and records the runs as owed; the next step
+//! runs them first, before any other check ([`run_owed`]), and the check
+//! reads their recorded result ([`RecordedRuns`]). A run asks at most
+//! [`MAX_PROOF_STEPS`] times; only past that are the tests recorded as not
+//! run, with why. Seven runs had recorded "no step of the run had the time"
+//! for every changed test: the fresh step ran every other check first and
+//! came to these runs short again, and the one request it had was spent.
+//!
+//! The runs install the way the repository's CI does: in the CI job that
+//! runs the files' tests (`common::test_env`, cached per manifest blob), or,
+//! when CI installs nothing CoderHelm can read, each test file's package
+//! (a workspace member from the workspace's root). Each test file runs with
+//! the command CI's test step runs, narrowed to it, else its own package's
+//! test script (`common::test_env::narrow`). Why a test didn't run is kept
+//! with it ([`NotRunWhy`]) and counted on the run ([`TestsRan`]).
+//!
+//! Like every check on the open pull request it runs once on a head, keeps
+//! its rounds in the run's ledger, and what it leaves goes under Open items.
 
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
@@ -40,6 +55,9 @@ pub const MAX_TEST_FILES: usize = 8;
 /// What the two sandbox runs need of a step: the sandbox's longest wait and
 /// room to record the result.
 pub const SANDBOX_STEP_SECS: u64 = 760;
+/// How many steps of its own the sandbox runs may ask for in a run: one per
+/// head a fix round leaves, and room for a step that was cut short.
+pub const MAX_PROOF_STEPS: u32 = 4;
 
 pub const START: &str = "<!-- coderhelm:habits -->";
 pub const END: &str = "<!-- /coderhelm:habits -->";
@@ -69,6 +87,127 @@ pub struct TestResult {
     /// The failure it printed without the change, or why it didn't run.
     #[serde(default)]
     pub detail: String,
+    /// Why it didn't run, as a kind to count (`None` when it ran).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub why: Option<NotRunWhy>,
+}
+
+/// Why a changed test wasn't run with and without the change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotRunWhy {
+    /// The dependencies' install failed in the sandbox.
+    InstallFailed,
+    /// No step had the time for the two sandbox runs.
+    NoTime,
+    /// No command CoderHelm can read runs the file on its own.
+    NoCommand,
+    /// An end-to-end spec: it runs against a preview, not in the sandbox.
+    EndToEnd,
+    /// The runner found no test in the file.
+    NoTestsFound,
+    /// More test files than are run on their own.
+    TooMany,
+    /// The sandbox gave no result, or something else stopped it.
+    Other,
+}
+
+/// Why nothing ran: the install failed in the sandbox.
+pub const INSTALL_FAILED: &str = "the package's install failed in the sandbox";
+/// Why nothing ran: past [`MAX_PROOF_STEPS`] steps, still no time.
+pub const NO_TIME: &str = "no step of the run had the time for the two sandbox runs";
+
+impl NotRunWhy {
+    /// The kind of a not-run detail line.
+    pub fn of(detail: &str) -> NotRunWhy {
+        let d = detail.to_ascii_lowercase();
+        if d.contains("install") && d.contains("fail") {
+            NotRunWhy::InstallFailed
+        } else if d.contains("had the time") {
+            NotRunWhy::NoTime
+        } else if d.contains("end-to-end spec") {
+            NotRunWhy::EndToEnd
+        } else if d.contains("found no tests") {
+            NotRunWhy::NoTestsFound
+        } else if d.contains("only the first") {
+            NotRunWhy::TooMany
+        } else if d.contains("no unit test command")
+            || d.contains("can't be narrowed")
+            || d.contains("doesn't run `")
+        {
+            NotRunWhy::NoCommand
+        } else {
+            NotRunWhy::Other
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            NotRunWhy::InstallFailed => "install failed",
+            NotRunWhy::NoTime => "no time",
+            NotRunWhy::NoCommand => "no test command",
+            NotRunWhy::EndToEnd => "end-to-end spec",
+            NotRunWhy::NoTestsFound => "no tests found",
+            NotRunWhy::TooMany => "past the file limit",
+            NotRunWhy::Other => "other",
+        }
+    }
+}
+
+/// Whether the changed tests ran with and without the change, and why not:
+/// the run's record of it (the ledger keeps the check's facts).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TestsRan {
+    /// Changed test files.
+    pub files: usize,
+    /// Of them, run both ways.
+    pub ran: usize,
+    /// The rest, by why.
+    #[serde(default)]
+    pub not_run: Vec<(NotRunWhy, usize)>,
+}
+
+impl TestsRan {
+    pub fn of(tests: &[TestResult]) -> TestsRan {
+        let mut not_run: Vec<(NotRunWhy, usize)> = Vec::new();
+        for t in tests.iter().filter(|t| t.verdict == Verdict::NotRun) {
+            let why = t.why.unwrap_or_else(|| NotRunWhy::of(&t.detail));
+            match not_run.iter_mut().find(|(w, _)| *w == why) {
+                Some((_, n)) => *n += 1,
+                None => not_run.push((why, 1)),
+            }
+        }
+        let n: usize = not_run.iter().map(|(_, n)| n).sum();
+        TestsRan {
+            files: tests.len(),
+            ran: tests.len() - n,
+            not_run,
+        }
+    }
+
+    /// One line: "Tests run with and without the change: 2 of 3 (not run:
+    /// 1 install failed)". Empty with no test files.
+    pub fn line(&self) -> String {
+        if self.files == 0 {
+            return String::new();
+        }
+        let why = if self.not_run.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " (not run: {})",
+                self.not_run
+                    .iter()
+                    .map(|(w, n)| format!("{n} {}", w.label()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        format!(
+            "Tests run with and without the change: {} of {}{why}",
+            self.ran, self.files
+        )
+    }
 }
 
 /// A changed file that is no part of the plan.
@@ -118,6 +257,9 @@ pub struct PrFacts {
     /// took it, files only reformatted.
     #[serde(default)]
     pub live: super::live_guard::LiveFacts,
+    /// Whether the changed tests ran both ways, and why not.
+    #[serde(default)]
+    pub tests_ran: TestsRan,
 }
 
 /// Why the check didn't give a result.
@@ -130,14 +272,15 @@ pub enum GateStop {
 }
 
 /// One test file's run: its exit code and, when it failed, what it printed.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// No code: it didn't run, and the output says why when it is known.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileRun {
     pub code: Option<i32>,
     pub output: String,
 }
 
 /// Both runs of the changed test files, in the files' order.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Runs {
     pub with: Vec<FileRun>,
     pub without: Vec<FileRun>,
@@ -207,6 +350,7 @@ fn excerpt(output: &str) -> String {
 /// What one file's two runs show.
 pub fn verdict(with: &FileRun, without: &FileRun) -> (Verdict, String) {
     match (with.code, without.code) {
+        (None, _) if !with.output.is_empty() => (Verdict::NotRun, with.output.clone()),
         (None, _) | (_, None) => (
             Verdict::NotRun,
             "the sandbox gave no result for it".to_string(),
@@ -244,9 +388,11 @@ pub fn scoped_cmd(base_cmd: &str, file: &str) -> Option<String> {
     if low.contains("pytest") {
         return Some(format!("{base_cmd} {file}"));
     }
-    if low.trim_start().starts_with("go test") {
-        let dir = file.rsplit_once('/').map_or(".", |(d, _)| d);
-        return Some(format!("go test ./{dir}/"));
+    // Runners that take a path or a package: one place narrows them.
+    if !low.contains("vitest") && !low.contains("jest") {
+        if let Some(c) = common::test_env::narrow(base_cmd, file) {
+            return Some(c);
+        }
     }
     super::build_scoped_test_cmd(base_cmd, &[file.to_string()])
         .map(|c| c.replace(" --passWithNoTests", ""))
@@ -325,6 +471,50 @@ pub fn changed_tests(diff: &Diff) -> Vec<String> {
         })
         .map(|(p, _, _)| p.clone())
         .collect()
+}
+
+/// Test data, not a test: fixtures, snapshots, recorded responses. Two
+/// runs listed a fixture's JSON as a test CoderHelm couldn't run.
+fn is_test_data(path: &str) -> bool {
+    let p = path.to_ascii_lowercase();
+    let data_dir = [
+        "/fixtures/",
+        "/__fixtures__/",
+        "/testdata/",
+        "/test-data/",
+        "/__snapshots__/",
+        "/cassettes/",
+    ]
+    .iter()
+    .any(|d| format!("/{p}").contains(d));
+    let ext = p.rsplit_once('.').map_or("", |(_, e)| e);
+    let data_ext = matches!(
+        ext,
+        "json"
+            | "yaml"
+            | "yml"
+            | "csv"
+            | "txt"
+            | "snap"
+            | "md"
+            | "html"
+            | "xml"
+            | "sql"
+            | "png"
+            | "jpg"
+            | "svg"
+    );
+    data_dir || data_ext
+}
+
+/// The changed test files a runner can run: not test data.
+pub fn bench_files(diff: &Diff) -> Vec<String> {
+    let mut tests: Vec<String> = changed_tests(diff)
+        .into_iter()
+        .filter(|p| !is_test_data(p))
+        .collect();
+    tests.truncate(MAX_TEST_FILES);
+    tests
 }
 
 fn changes_code(diff: &Diff) -> bool {
@@ -444,9 +634,14 @@ pub async fn check_once(
         not_updated: not_updated(&changed, plan, own_repo),
         ..Default::default()
     };
-    let tests = changed_tests(diff);
+    let all = changed_tests(diff);
+    let tests: Vec<String> = all.iter().filter(|p| !is_test_data(p)).cloned().collect();
     if tests.is_empty() {
-        facts.no_tests = "the change adds or changes no test file".to_string();
+        facts.no_tests = if all.is_empty() {
+            "the change adds or changes no test file".to_string()
+        } else {
+            "the change adds or changes only test data, no test file to run".to_string()
+        };
         return facts;
     }
     if !changes_code(diff) {
@@ -462,10 +657,12 @@ pub async fn check_once(
                     runs.with.get(i).unwrap_or(&none),
                     runs.without.get(i).unwrap_or(&none),
                 );
+                let why = (verdict == Verdict::NotRun).then(|| NotRunWhy::of(&detail));
                 facts.tests.push(TestResult {
                     path: path.clone(),
                     verdict,
                     detail,
+                    why,
                 });
             }
         }
@@ -475,6 +672,7 @@ pub async fn check_once(
                     path: path.clone(),
                     verdict: Verdict::NotRun,
                     detail: why.clone(),
+                    why: Some(NotRunWhy::of(&why)),
                 });
             }
         }
@@ -484,8 +682,10 @@ pub async fn check_once(
             path: path.clone(),
             verdict: Verdict::NotRun,
             detail: format!("only the first {MAX_TEST_FILES} test files are run on their own"),
+            why: Some(NotRunWhy::TooMany),
         });
     }
+    facts.tests_ran = TestsRan::of(&facts.tests);
     facts
 }
 
@@ -739,6 +939,11 @@ pub fn section(plan: &PlanResult, f: &PrFacts) -> String {
             out.push_str(&test_line(t));
             out.push('\n');
         }
+        // How many ran both ways, and why the rest didn't, counted.
+        let ran = TestsRan::of(&f.tests);
+        if ran.ran < ran.files {
+            out.push_str(&format!("{}.\n", ran.line()));
+        }
         // A bug fix no test was shown to fail on the base for says so, in
         // so many words: it is unverified, never quietly proven by CI.
         if f.bug && !f.tests.iter().any(|t| t.verdict == Verdict::Proven) {
@@ -954,42 +1159,178 @@ pub struct SandboxBench<'a> {
 
 const KIND: &str = "unit";
 
+/// The end-to-end spec's line: it runs against a preview, never in the
+/// unit sandbox (CI and the end-to-end proof run it there).
+pub const E2E_SPEC: &str = "an end-to-end spec: it runs against a preview, not in the unit sandbox";
+
+/// Whether `file` is an end-to-end spec: its package's runner drives a
+/// browser, or it sits in the repository's end-to-end suite.
+fn is_e2e_spec(tree: &[String], file: &str, texts: &dyn Fn(&str) -> Option<String>) -> bool {
+    use test_package::Runner as R;
+    let runner = test_package::package_of(tree, file, texts).and_then(|p| p.runner);
+    matches!(runner, Some(R::Playwright | R::Cypress | R::Wdio))
+        || common::preview::e2e_suite(tree)
+            .is_some_and(|s| file.starts_with(&format!("{}/", s.dir.trim_end_matches('/'))))
+}
+
+/// How the sandbox runs the files: the installs (none when CI's test job
+/// installs, through its environment), one command per file that has one,
+/// and why the others don't run.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BenchPlan {
+    pub install: Vec<Step>,
+    /// Per file, in order: its command, or why it doesn't run.
+    pub per_file: Vec<Result<String, String>>,
+}
+
+/// The sandbox plan for `files`, from the CI test command CoderHelm reads
+/// (`ci_cmd`), CI's test environment for these files (`env`, its package
+/// scripts already resolved) and the tree's manifests (`texts`). A file
+/// with no command is recorded as not run with why; the others still run.
+pub fn bench_plan(
+    files: &[String],
+    tree: &[String],
+    ci_cmd: Option<&str>,
+    env: Option<&common::test_env::TestEnv>,
+    texts: &dyn Fn(&str) -> Option<String>,
+) -> BenchPlan {
+    let mut plan = BenchPlan::default();
+    // CI's own install, in its order, at its versions, in its environment
+    // (cached per manifest blob); else each file's package's.
+    let ci_installs = env.is_some_and(|e| !e.install.is_empty());
+    let mut installed: Vec<String> = Vec::new();
+    for f in files {
+        if is_e2e_spec(tree, f, texts) {
+            plan.per_file.push(Err(E2E_SPEC.to_string()));
+            continue;
+        }
+        let cmd = file_cmd(ci_cmd, env, f)
+            .or_else(|why| common::test_env::package_test_command(f, tree, texts).ok_or(why));
+        if cmd.is_ok() && !ci_installs {
+            let steps = test_package::package_of(tree, f, texts)
+                .and_then(|p| test_package::check_steps(&p))
+                .unwrap_or_default();
+            for s in steps.into_iter().filter(|s| s.kind == "install") {
+                if !installed.contains(&s.cmd) {
+                    installed.push(s.cmd.clone());
+                    plan.install.push(s);
+                }
+            }
+        }
+        plan.per_file.push(cmd);
+    }
+    plan
+}
+
+/// The runs of the planned commands, per file: a file with no command did
+/// not run, and says why.
+fn spread(plan: &BenchPlan, runs: Vec<FileRun>) -> Vec<FileRun> {
+    let mut runs = runs.into_iter();
+    plan.per_file
+        .iter()
+        .map(|c| match c {
+            Ok(_) => runs.next().unwrap_or_default(),
+            Err(why) => FileRun {
+                code: None,
+                output: why.clone(),
+            },
+        })
+        .collect()
+}
+
+/// Why the install failed, from a sandbox script's output: CI's install in
+/// the test environment, or an install step; the error's last lines.
+pub fn install_failure(output: &str, codes: &[Option<i32>], installs: usize) -> Option<String> {
+    let tail = |t: &str| -> String {
+        let lines: Vec<&str> = t.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+        let pick: Vec<&str> = lines
+            .iter()
+            .filter(|l| {
+                let low = l.to_ascii_lowercase();
+                low.contains("err") || low.contains("error") || low.contains("not found")
+            })
+            .copied()
+            .collect();
+        let pick = if pick.is_empty() {
+            lines[lines.len().saturating_sub(2)..].to_vec()
+        } else {
+            pick[pick.len().saturating_sub(2)..].to_vec()
+        };
+        common::truncate_str(&pick.join(" "), 300).replace('`', "'")
+    };
+    if let Some(at) = output.find(common::test_env::INSTALL_FAILED) {
+        let rest = &output[at + common::test_env::INSTALL_FAILED.len()..];
+        let body = rest.split(test_package::STEP_MARK).next().unwrap_or(rest);
+        return Some(format!("{INSTALL_FAILED} (CI's install: {})", tail(body)));
+    }
+    if codes.iter().take(installs).any(|c| *c != Some(0)) {
+        let out = failing_outputs(output, "install").join("\n");
+        return Some(if out.is_empty() {
+            INSTALL_FAILED.to_string()
+        } else {
+            format!("{INSTALL_FAILED} ({})", tail(&out))
+        });
+    }
+    None
+}
+
 #[async_trait::async_trait]
 impl Bench for SandboxBench<'_> {
     async fn run(&self, files: &[String]) -> Result<Runs, String> {
         let r = &self.runner;
         let ci_cmd = super::detect_ci_test(r.github, r.owner, r.repo, self.base_branch).await;
-        let mut steps: Vec<Step> = Vec::new();
-        let tree: Vec<String> = r
+        let tree_full = r
             .github
             .get_tree(r.owner, r.repo, self.branch)
             .await
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .map(|e| e.path)
-            .collect();
-        // A test step CoderHelm's runner list doesn't know (a loop running
-        // each file with `python`) still runs the file the way CI does.
-        let narrowed = |f: &String| ci_cmd.as_deref().and_then(|c| scoped_cmd(c, f));
-        let env = if files.iter().all(|f| narrowed(f).is_some()) {
-            None
-        } else {
-            let workflows =
-                super::preview::workflows(r.github, r.owner, r.repo, self.base_branch).await;
-            common::test_env::from_workflows_for(&workflows, &tree, files)
-        };
-        let install: Vec<Step> = files
-            .first()
-            .and_then(|f| test_package::package_of(&tree, f, &|_| None))
-            .and_then(|p| test_package::check_steps(&p))
-            .map(|s| s.into_iter().filter(|s| s.kind == "install").collect())
-            .unwrap_or_default();
-        let installs = install.len();
-        steps.extend(install);
-        for f in files {
-            let cmd = file_cmd(ci_cmd.as_deref(), env.as_ref(), f)?;
-            steps.push(Step { kind: KIND, cmd });
+            .map_err(|e| e.to_string())?;
+        let tree: Vec<String> = tree_full.iter().map(|e| e.path.clone()).collect();
+        // CI's job for these files: its install wraps every command, and
+        // its test steps (package scripts read through) run each file.
+        let env = super::test_setup::for_run(
+            r.state,
+            r.github,
+            r.team_id,
+            r.owner,
+            r.repo,
+            self.base_branch,
+            self.branch,
+            r.run_id,
+            files,
+        )
+        .await;
+        let mut texts: std::collections::HashMap<String, String> = Default::default();
+        for p in common::test_env::script_files(env.as_ref().map(|(e, _)| e), &tree, files) {
+            if let Ok(t) = r.github.read_file(r.owner, r.repo, &p, self.branch).await {
+                texts.insert(p, t);
+            }
         }
+        let read = |p: &str| texts.get(p).cloned();
+        let resolved = env.as_ref().map(|(e, _)| {
+            let mut e = e.clone();
+            e.resolve_scripts(&tree, &read);
+            e
+        });
+        let plan = bench_plan(files, &tree, ci_cmd.as_deref(), resolved.as_ref(), &read);
+        let commands: Vec<&String> = plan
+            .per_file
+            .iter()
+            .filter_map(|c| c.as_ref().ok())
+            .collect();
+        if commands.is_empty() {
+            // Nothing to run: each file says why.
+            let none = spread(&plan, Vec::new());
+            return Ok(Runs {
+                with: none.clone(),
+                without: none,
+            });
+        }
+        let installs = plan.install.len();
+        let mut steps: Vec<Step> = plan.install.clone();
+        steps.extend(commands.iter().map(|c| Step {
+            kind: KIND,
+            cmd: (*c).clone(),
+        }));
         let head = r
             .github
             .get_ref(r.owner, r.repo, self.branch)
@@ -1035,8 +1376,8 @@ impl Bench for SandboxBench<'_> {
                 .map_err(|e| e.to_string())?;
             // Side by side: each waits on its own sandbox build.
             let (with, without) = tokio::join!(
-                r.run_at(&head, &steps, None),
-                r.run_at(&before_sha, &steps, None)
+                r.run_at_in(&head, &steps, env.clone()),
+                r.run_at_in(&before_sha, &steps, env.clone())
             );
             Ok::<_, String>((with?, without?))
         }
@@ -1045,17 +1386,22 @@ impl Bench for SandboxBench<'_> {
             warn!(error = %e, branch = %temp, "Could not delete the branch of the test check");
         }
         let ((with_codes, with_out), (without_codes, without_out)) = both?;
-        let per_file = |codes: &[Option<i32>], out: &str| {
-            let failed_installs = codes.iter().take(installs).any(|c| *c != Some(0));
-            let runs = file_runs(&codes[installs.min(codes.len())..], out, KIND);
-            (failed_installs, runs)
-        };
-        let (with_broken, with) = per_file(&with_codes, &with_out);
-        let (without_broken, without) = per_file(&without_codes, &without_out);
-        if with_broken || without_broken {
-            return Err("the package's install failed in the sandbox".to_string());
+        for (codes, out) in [(&with_codes, &with_out), (&without_codes, &without_out)] {
+            if let Some(why) = install_failure(out, codes, installs) {
+                warn!(run_id = r.run_id, why = %why, "The changed tests' install failed in the sandbox");
+                return Err(why);
+            }
         }
-        Ok(Runs { with, without })
+        let per_file = |codes: &[Option<i32>], out: &str| {
+            spread(
+                &plan,
+                file_runs(&codes[installs.min(codes.len())..], out, KIND),
+            )
+        };
+        Ok(Runs {
+            with: per_file(&with_codes, &with_out),
+            without: per_file(&without_codes, &without_out),
+        })
     }
 }
 
@@ -1162,15 +1508,188 @@ async fn wider(
         .collect()
 }
 
-/// A bench for a step with no time for the sandbox: nothing runs, and each
-/// test says so.
+/// A bench for a run whose steps never had the time for the sandbox, past
+/// [`MAX_PROOF_STEPS`] asks: nothing runs, and each test says so.
 struct NoTime;
 
 #[async_trait::async_trait]
 impl Bench for NoTime {
     async fn run(&self, _files: &[String]) -> Result<Runs, String> {
-        Err("no step of the run had the time for the two sandbox runs; the repository's CI runs the tests on this pull request".to_string())
+        Err(format!("{NO_TIME} in {MAX_PROOF_STEPS} steps of their own; the repository's CI runs the tests on this pull request"))
     }
+}
+
+/// The two sandbox runs of a head's changed test files, kept on the run's
+/// ledger: a step that runs them first ([`run_owed`]) leaves them for the
+/// check, which reads them instead of running them again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordedRuns {
+    pub head: String,
+    pub files: Vec<String>,
+    pub result: Result<Runs, String>,
+}
+
+impl RecordedRuns {
+    /// Whether these are the runs of `files` on `head`.
+    pub fn of(&self, head: &str, files: &[String]) -> bool {
+        !head.is_empty() && self.head == head && self.files == files
+    }
+}
+
+/// A bench that answers with recorded runs.
+struct Recorded(Result<Runs, String>);
+
+#[async_trait::async_trait]
+impl Bench for Recorded {
+    async fn run(&self, _files: &[String]) -> Result<Runs, String> {
+        self.0.clone()
+    }
+}
+
+/// A bench that keeps what another one gave, for the ledger.
+struct Recording<'b> {
+    inner: &'b dyn Bench,
+    got: std::sync::Mutex<Option<Result<Runs, String>>>,
+}
+
+#[async_trait::async_trait]
+impl Bench for Recording<'_> {
+    async fn run(&self, files: &[String]) -> Result<Runs, String> {
+        let r = self.inner.run(files).await;
+        *self.got.lock().unwrap() = Some(r.clone());
+        r
+    }
+}
+
+/// What the step does about the sandbox runs for a head.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProofTime {
+    /// They ran for this head and files: read them.
+    Recorded(Result<Runs, String>),
+    /// This step has their time: run them now.
+    Run,
+    /// Owed to a fresh step, which runs them first.
+    Owe,
+    /// No step had the time, past the asks a run has.
+    NoTime,
+}
+
+/// What a step does about the changed tests' sandbox runs: read the
+/// recorded ones, run them, owe them to a fresh step (at most
+/// [`MAX_PROOF_STEPS`] times a run, never on a path that has no step to
+/// give), or, only past that, record them as not run.
+pub fn proof_time(
+    recorded: Option<&RecordedRuns>,
+    head: &str,
+    files: &[String],
+    secs_left: u64,
+    steps_asked: u32,
+    can_hand_off: bool,
+) -> ProofTime {
+    if let Some(r) = recorded.filter(|r| r.of(head, files)) {
+        return ProofTime::Recorded(r.result.clone());
+    }
+    if secs_left >= SANDBOX_STEP_SECS {
+        return ProofTime::Run;
+    }
+    if can_hand_off && steps_asked < MAX_PROOF_STEPS {
+        return ProofTime::Owe;
+    }
+    ProofTime::NoTime
+}
+
+/// The diff the check reads: the run's work files, with their status.
+async fn work_diff(w: &super::proof::Work<'_>) -> Result<Vec<(String, String, String)>, String> {
+    let diff = w
+        .github
+        .compare_files_with_patches(
+            &w.msg.repo_owner,
+            &w.msg.repo_name,
+            &w.msg.base_branch,
+            w.branch,
+        )
+        .await
+        .map_err(|e| format!("the diff couldn't be read ({e})"))?;
+    let paths: Vec<String> = diff.iter().map(|(p, _, _)| p.clone()).collect();
+    let work = super::run_end::work_files(&paths, &w.msg.ticket_id);
+    Ok(diff
+        .into_iter()
+        .filter(|(p, _, _)| work.contains(p))
+        .collect())
+}
+
+fn sandbox_bench<'a>(w: &'a super::proof::Work<'a>) -> SandboxBench<'a> {
+    SandboxBench {
+        runner: super::test_bug::Runner {
+            state: w.state,
+            github: w.github,
+            owner: &w.msg.repo_owner,
+            repo: &w.msg.repo_name,
+            team_id: &w.msg.team_id,
+            run_id: w.run_id,
+            provider: w.provider,
+        },
+        base_branch: &w.msg.base_branch,
+        branch: w.branch,
+    }
+}
+
+/// The sandbox runs a step owed this one, run first, before any other
+/// check, with the step's whole budget; their result is recorded for the
+/// check ([`RecordedRuns`]). Nothing when none are owed, or the head moved
+/// since (the check asks again for the new one).
+pub async fn run_owed(w: &super::proof::Work<'_>, secs_left: impl Fn() -> u64) {
+    let owed = w.ledger.update(|l| l.proof_owed.clone());
+    if owed.is_empty() {
+        return;
+    }
+    let head = w.head().await;
+    if head != owed || secs_left() < SANDBOX_STEP_SECS {
+        if head != owed {
+            w.ledger.update(|l| l.proof_owed.clear());
+            w.save_ledger().await;
+        }
+        return;
+    }
+    let files = match work_diff(w).await {
+        Ok(d) if changes_code(&d) => bench_files(&d),
+        Ok(_) => Vec::new(),
+        Err(e) => {
+            warn!(run_id = w.run_id, error = %e, "The owed sandbox runs couldn't read the diff; the check runs them");
+            return;
+        }
+    };
+    if files.is_empty() {
+        w.ledger.update(|l| l.proof_owed.clear());
+        w.save_ledger().await;
+        return;
+    }
+    super::add_progress_note(
+        w.state,
+        &w.msg.team_id,
+        w.run_id,
+        &format!(
+            "Running the {} changed test file(s) with and without the change first in this step, with its whole time",
+            files.len()
+        ),
+    )
+    .await;
+    let result = sandbox_bench(w).run(&files).await;
+    info!(
+        run_id = w.run_id,
+        ok = result.is_ok(),
+        files = files.len(),
+        "The owed sandbox runs ran first in the step"
+    );
+    w.ledger.update(|l| {
+        l.proof_owed.clear();
+        l.proof_runs = Some(RecordedRuns {
+            head: head.clone(),
+            files: files.clone(),
+            result: result.clone(),
+        });
+    });
+    w.save_ledger().await;
 }
 
 async fn check_and_fix(
@@ -1185,46 +1704,44 @@ async fn check_and_fix(
         return Ok(None);
     }
     loop {
-        let diff = w
-            .github
-            .compare_files_with_patches(
-                &w.msg.repo_owner,
-                &w.msg.repo_name,
-                &w.msg.base_branch,
-                w.branch,
-            )
-            .await
-            .map_err(|e| GateStop::Why(format!("the diff couldn't be read ({e})")))?;
+        let diff = work_diff(w).await.map_err(GateStop::Why)?;
         let paths: Vec<String> = diff.iter().map(|(p, _, _)| p.clone()).collect();
-        let work = super::run_end::work_files(&paths, &w.msg.ticket_id);
-        let diff: Vec<(String, String, String)> = diff
-            .into_iter()
-            .filter(|(p, _, _)| work.contains(p))
-            .collect();
-        let needs_sandbox = !changed_tests(&diff).is_empty() && changes_code(&diff);
-        let short = needs_sandbox && secs_left() < SANDBOX_STEP_SECS;
-        if short
-            && !w
+        let files = bench_files(&diff);
+        let needs_sandbox = !files.is_empty() && changes_code(&diff);
+        let head = w.head().await;
+        // The proof runs have a budget of their own: read the recorded
+        // runs, run them now, or owe them to a fresh step that runs them
+        // first; only past the asks are they recorded as not run.
+        let time = if needs_sandbox {
+            let (recorded, asked, can) = w
                 .ledger
-                .update(|l| std::mem::replace(&mut l.habits_waited, true))
-        {
+                .update(|l| (l.proof_runs.clone(), l.proof_steps, !l.no_proof_step));
+            proof_time(recorded.as_ref(), &head, &files, secs_left(), asked, can)
+        } else {
+            ProofTime::Run
+        };
+        if time == ProofTime::Owe {
+            w.ledger.update(|l| {
+                l.proof_steps += 1;
+                l.proof_owed = head.clone();
+            });
             w.save_ledger().await;
             return Err(GateStop::NeedsTime);
         }
-        let sandbox = SandboxBench {
-            runner: super::test_bug::Runner {
-                state: w.state,
-                github: w.github,
-                owner: &w.msg.repo_owner,
-                repo: &w.msg.repo_name,
-                team_id: &w.msg.team_id,
-                run_id: w.run_id,
-                provider: w.provider,
-            },
-            base_branch: &w.msg.base_branch,
-            branch: w.branch,
+        let sandbox = sandbox_bench(w);
+        let recording = Recording {
+            inner: &sandbox,
+            got: Default::default(),
         };
-        let bench: &dyn Bench = if short { &NoTime } else { &sandbox };
+        let recorded;
+        let bench: &dyn Bench = match &time {
+            ProofTime::Recorded(r) => {
+                recorded = Recorded(r.clone());
+                &recorded
+            }
+            ProofTime::NoTime => &NoTime,
+            _ => &recording,
+        };
         let mut facts = check_once(
             bench,
             &diff,
@@ -1234,6 +1751,19 @@ async fn check_and_fix(
             &evidence.notes,
         )
         .await;
+        if let Some(result) = recording.got.lock().unwrap().take() {
+            w.ledger.update(|l| {
+                l.proof_runs = Some(RecordedRuns {
+                    head: head.clone(),
+                    files: files.clone(),
+                    result,
+                })
+            });
+        }
+        if !facts.tests_ran.line().is_empty() {
+            super::add_progress_note(w.state, &w.msg.team_id, w.run_id, &facts.tests_ran.line())
+                .await;
+        }
         facts.e2e_missing = e2e_missing(w, &paths).await;
         facts.wider = wider(w, &diff, &evidence.notes).await;
         // Fixture ids invented while the run looked up the real ones.
@@ -1243,7 +1773,13 @@ async fn check_and_fix(
             .extend(super::minimal_change::made_up_ids(&diff, &looked));
         // A page whose state a test branch reads is probed again while
         // there is time: an arm that couldn't run before is re-checked.
-        facts.live = super::live_guard::facts_for(w, &diff, &evidence.notes, !short).await;
+        facts.live = super::live_guard::facts_for(
+            w,
+            &diff,
+            &evidence.notes,
+            secs_left() >= SANDBOX_STEP_SECS,
+        )
+        .await;
         let comments = super::scope_ledger::comments(w.github, w.msg, w.branch).await;
         let people = super::scope_ledger::people(w.msg, &comments);
         let mut ledger = super::scope_ledger::load_or_seed(

@@ -1036,10 +1036,26 @@ pub struct Ledger {
     /// What the tests and scope check last came to.
     #[serde(default)]
     pub habits_outcome: Option<Result<Option<super::habits_check::PrFacts>, String>>,
-    /// That check has asked once for a step of its own for its sandbox
-    /// runs: it never asks twice.
+    /// Read by nothing now: it made the sandbox runs ask for a step of
+    /// their own once a run, and a fresh step that came to them short again
+    /// recorded every changed test as not run. Older checkpoints carry it.
     #[serde(default)]
     pub habits_waited: bool,
+    /// The changed tests' two sandbox runs for a head and its files, run
+    /// first in a step of their own or by the check (`habits_check`).
+    #[serde(default)]
+    pub proof_runs: Option<super::habits_check::RecordedRuns>,
+    /// The head whose sandbox runs are owed to the next step, which runs
+    /// them before any other check (`habits_check::run_owed`).
+    #[serde(default)]
+    pub proof_owed: String,
+    /// How many steps of their own the sandbox runs have asked for.
+    #[serde(default)]
+    pub proof_steps: u32,
+    /// This path has no step of its own to give the sandbox runs (a run
+    /// across repositories): short of time, they are recorded as not run.
+    #[serde(default)]
+    pub no_proof_step: bool,
     /// What the proof check last found (`None`: the judge couldn't answer).
     #[serde(default)]
     pub proof_findings: Option<Vec<Finding>>,
