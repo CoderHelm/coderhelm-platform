@@ -212,6 +212,8 @@ pub mod pr_steps;
 /// A repository's pull request template as the description's structure.
 pub mod pr_template;
 pub mod preview;
+pub mod preview_access;
+pub mod preview_find;
 /// What a fix must show before it is committed and pushed.
 pub mod push_gate;
 /// A bug reproduced on the base before code is planned, fixed in the

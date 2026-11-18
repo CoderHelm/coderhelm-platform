@@ -142,6 +142,22 @@ The causes were in the loop, not only in prompt wording:
    run) is judged again with what it found, even when it wrote no code
    (`proof::round_answered`, `incidents::cn_proof_answer_judged`).
 
+   **The preview, wherever it is published.** The head commit's preview is
+   found where the team's host or CI already publishes it, never only from
+   a workflow CoderHelm recognizes (`preview_find`): the commit's
+   deployments and their newest status, deploy statuses, preview checks,
+   bot comments (edited in place, read row by row for a monorepo), a
+   description link, then the team's address template (Settings,
+   Repositories, Preview access; `{pr}`, `{branch}`, `{branch_slug}`,
+   `{sha}`, `{short_sha}`). Only what is tied to the head commit counts
+   first; the changed app's preview is picked when several apps publish
+   one; a preview still building is waited on, looked at every two minutes,
+   for at most an hour (`preview::settle`). A protected preview is opened
+   with the one secret the team saved there (a header, a query parameter or
+   a password), sealed, handed to the sandbox once and sent only to the
+   preview's own host (`preview_access`); a sign-in wall is said with where
+   to give that access.
+
    **Two ways, end to end.** Before the pull request is called done, once
    its preview is up and its own end-to-end checks passed, the pull request
    watch runs each criterion's test (the one the criteria map names, else a
