@@ -1409,6 +1409,7 @@ pub mod review_tidy;
 pub mod review_verdict;
 mod reviewer_guide;
 pub mod rewards;
+pub mod role_wait;
 pub(crate) mod round;
 pub(crate) mod round_agree;
 pub mod run_ceiling;
@@ -2027,6 +2028,8 @@ async fn alarm_evidence_for_run(state: &WorkerState, msg: &TicketMessage) -> Opt
             let table = &state.config.settings_table_name;
             if got.refused.is_empty() {
                 common::aws_role_reads::clear(&state.dynamo, table, &msg.team_id, &account).await;
+                // The role reads again: runs waiting for it check now.
+                role_wait::wake(state, &msg.team_id, Some(&account)).await;
             } else {
                 let role_arn = common::log_findings::connection_role(
                     &state.dynamo,
@@ -3489,7 +3492,9 @@ async fn run_passes(
             )
             .await;
             if !judged.proceeds() {
-                finish_without_code(
+                // An ask (`Route::Ask` with a judged stop): never the
+                // outside path, so it always ends here.
+                let _ = finish_without_code(
                     state,
                     msg,
                     run_id,
@@ -3657,7 +3662,7 @@ async fn run_passes(
                 .trim()
                 .to_string();
         }
-        finish_without_code(
+        let ended = finish_without_code(
             state,
             msg,
             run_id,
@@ -3672,6 +3677,9 @@ async fn run_passes(
         )
         .await;
         close_memory(state, agent_memory.take()).await;
+        if let NoCodeEnd::PlanAgain(why) = ended {
+            return plan_again_or_stop(state, msg, run_id, &mut ps, &why).await;
+        }
         return Ok(());
     }
 
@@ -9040,10 +9048,39 @@ pub(crate) async fn record_ci_outcome(
     }
 }
 
+/// How [`finish_without_code`] ended the run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NoCodeEnd {
+    /// Reported and recorded: `needs_outside_change`, `needs_input` or
+    /// `awaiting_setup`.
+    Ended,
+    /// Nothing was left for a person and nothing to wait for: a report
+    /// would have said "Needed from you: Nothing" under a status that says
+    /// a person must act. The plan is CoderHelm's to make again, for this
+    /// reason.
+    PlanAgain(String),
+}
+
+/// When the run started (RFC 3339): its first attempt when the message
+/// says, else when this step started.
+fn run_started_at(msg: &TicketMessage, start: &std::time::Instant) -> String {
+    if msg.first_attempt_ms > 0 {
+        if let Some(t) = chrono::DateTime::from_timestamp_millis(msg.first_attempt_ms as i64) {
+            return t.to_rfc3339();
+        }
+    }
+    (chrono::Utc::now() - chrono::Duration::from_std(start.elapsed()).unwrap_or_default())
+        .to_rfc3339()
+}
+
 /// Ends a run whose fix is not (or not yet known to be) in the code: posts
 /// the findings on the ticket the run came from and records them on the run,
 /// with no branch and no pull request. A change outside the code ends the run
-/// as `needs_outside_change`; not knowing where the fix belongs ends it as
+/// as `needs_outside_change` when a person has an item in it; with nothing
+/// for a person, a run the team's AWS role was refused reads waits for the
+/// install's setup item "AWS role reads" (`awaiting_setup`, going on by
+/// itself once the role reads, `role_wait`), and any other run plans again
+/// ([`NoCodeEnd::PlanAgain`]). Not knowing where the fix belongs ends it as
 /// `needs_input`, so a reply picks it up again.
 #[allow(clippy::too_many_arguments)]
 async fn finish_without_code(
@@ -9058,12 +9095,55 @@ async fn finish_without_code(
     start: &std::time::Instant,
     mcp_ids: &[String],
     judged: Option<&stop_judge::Judged>,
-) {
+) -> NoCodeEnd {
     // Asking needs a judged ask or hold; without one the run reports what it
     // found and asks nothing.
     let judged = judged.filter(|j| !j.proceeds());
     let outside = route == fix_location::Route::OutsideOnly || judged.is_none();
-    let (report, jira_title, jira_type) = if outside {
+    // A change outside the code waits on a person only for an item the
+    // final check leaves them; with none, the run waits for the role's
+    // reads it was refused, or plans again.
+    let mut waiting: Option<common::role_wait::Waiting> = None;
+    if outside {
+        let report = fix_location::outside_report(decision, false);
+        let left =
+            common::person_gate::sink(&format!("**Needs a change outside the code**\n\n{report}"));
+        let gaps = common::aws_role_reads::list(
+            &state.dynamo,
+            &state.config.settings_table_name,
+            &msg.team_id,
+        )
+        .await;
+        let refused = common::role_wait::refused_this_run(&gaps, &run_started_at(msg, start));
+        match common::role_wait::ending(&left.human, refused) {
+            common::role_wait::Ending::Person => {}
+            common::role_wait::Ending::AwaitRole(gaps) => {
+                waiting = Some(common::role_wait::Waiting::of(
+                    run_id,
+                    &gaps,
+                    &chrono::Utc::now().to_rfc3339(),
+                ));
+            }
+            common::role_wait::Ending::PlanAgain => {
+                return NoCodeEnd::PlanAgain(format!(
+                    "the plan stopped on a change outside the code that leaves nothing for a \
+                     person and waits for nothing ({})",
+                    common::truncate_str(decision.cause.trim(), 300)
+                ));
+            }
+        }
+    }
+    let (report, jira_title, jira_type) = if let Some(w) = &waiting {
+        (
+            format!(
+                "{}\n\n{}",
+                fix_location::outside_report(decision, false),
+                common::role_wait::waiting_note(w)
+            ),
+            "Waiting for the AWS role's reads",
+            "clarification",
+        )
+    } else if outside {
         (
             fix_location::outside_report(decision, false),
             "Needs a change outside the code",
@@ -9153,7 +9233,9 @@ async fn finish_without_code(
         )
         .await;
     }
-    let status = if outside {
+    let status = if waiting.is_some() {
+        common::run_status::AWAITING_SETUP
+    } else if outside {
         fix_location::STATUS_OUTSIDE
     } else {
         "needs_input"
@@ -9198,6 +9280,11 @@ async fn finish_without_code(
     if usage_res.is_ok() {
         usage.mark_recorded(&delta);
     }
+    if let Some(w) = &waiting {
+        info!(run_id, actions = ?w.actions, "Waiting for the AWS role's reads: re-checks armed");
+        role_wait::arm(state, &msg.team_id, w).await;
+        return NoCodeEnd::Ended;
+    }
 
     if outside {
         let analytics_month = chrono::Utc::now().format("%Y-%m").to_string();
@@ -9214,6 +9301,7 @@ async fn finish_without_code(
                 .await;
         }
     }
+    NoCodeEnd::Ended
 }
 
 /// Tells the ticket about the part of the fix that has to be made outside the

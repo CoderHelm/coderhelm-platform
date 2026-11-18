@@ -1886,6 +1886,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "ed25519-dalek",
+ "flate2",
  "futures",
  "graphql-parser",
  "hex",

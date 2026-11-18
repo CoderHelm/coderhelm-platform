@@ -79,7 +79,9 @@ pub mod coder_shell;
 /// channel, sealed webhook URLs.
 pub mod notify;
 pub mod role_move;
+pub mod role_wait;
 pub mod tool_aliases;
+pub mod waf_logs;
 
 /// The team's daily alert token budget (alerts route and Setup).
 pub mod alert_budget;

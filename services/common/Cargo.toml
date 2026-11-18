@@ -84,6 +84,8 @@ serde_yaml = "0.9"
 # e2e: JUnit XML test reports
 quick-xml = "0.37"
 aws-sdk-s3 = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio", "sigv4a", "http-1x"] }
+# waf_logs: a web ACL's log objects (gzip JSON lines) read straight from its bucket
+flate2 = "1"
 lopdf = { version = "0.46", default-features = false }
 yaml-rust2 = "0.10"
 

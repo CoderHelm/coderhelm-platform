@@ -608,6 +608,13 @@ pub fn mark_untraced(mut d: FixDecision, gaps: &[String]) -> FixDecision {
     d
 }
 
+/// Pure: every lookup a planner made, from the data sources (`live`) and
+/// the monitoring tools (`ops`: CloudWatch metrics, New Relic, AWS WAF,
+/// Airflow). A decision is "unchecked" only when this is zero.
+pub fn lookups_made(live: usize, ops: usize) -> usize {
+    live + ops
+}
+
 /// A decision still unchecked after being sent back: no code is written on
 /// it. It becomes `unknown`, saying the data wasn't checked.
 pub fn mark_unchecked(mut d: FixDecision) -> FixDecision {

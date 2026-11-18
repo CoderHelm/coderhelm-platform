@@ -9,6 +9,10 @@
 //! (`common::role_move`): a source switches only when the stack's role
 //! passed the source's own connection check end to end.
 //!
+//! The same sweep sends a re-check of every run waiting for the role's
+//! reads (`role_wait`), so a run whose fast re-checks are over still goes
+//! on the day the role stack is updated.
+//!
 //! "Once" is a team record (`AWS_PERMS_NOTICE`) holding the permissions id
 //! it was told about, written with a condition before the message is sent,
 //! so two sweeps never post twice.
@@ -186,6 +190,9 @@ pub async fn run(state: &WorkerState) -> Result<Report, String> {
             checks.push(c);
         }
         report.sources_moved += move_sources(state, team_id, accounts).await;
+        // Runs waiting for the role's reads (`awaiting_setup`) check the
+        // role again now: the daily check after their fast re-checks.
+        super::role_wait::wake(state, team_id, None).await;
         let last = told(state, team_id).await;
         if !should_tell(&checks, last.as_deref()) || !claim_notice(state, team_id).await {
             continue;

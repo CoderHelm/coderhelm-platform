@@ -1021,6 +1021,9 @@ async fn handle_message_inner(state: Arc<WorkerState>, message: models::WorkerMe
         models::WorkerMessage::RunWaiting(msg) => {
             passes::webhooks::run_waiting(&state, &msg).await;
         }
+        models::WorkerMessage::RoleReadsWait(msg) => {
+            passes::role_wait::check(&state, &msg).await;
+        }
         // Handled in `handle_sqs`, where a failure fails the message.
         models::WorkerMessage::UsageRecord(_) => {}
     }

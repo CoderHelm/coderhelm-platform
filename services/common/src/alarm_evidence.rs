@@ -12,10 +12,13 @@
 //! Reads only: `wafv2:ListWebACLs`, `wafv2:GetSampledRequests`,
 //! `wafv2:GetLoggingConfiguration`, and the web ACL's logs: a Logs Insights
 //! query on its log group, or, when it logs to an `aws-waf-logs-*` bucket,
-//! one bounded Athena query over the Glue table on that bucket ([`athena_query`]:
-//! the last three hours, the alarm's rule only), in a WAF log workgroup
-//! the role may query (the role template's WAF log group,
-//! `infra/cfn/coderhelm-log-reader.yaml`, `WafLogs`). Request values
+//! its log objects read straight from the bucket (`crate::waf_logs`:
+//! `s3:ListBucket` and `s3:GetObject`, bounded, grouped in the process, no
+//! Athena), and only when they hold nothing, one bounded Athena query over
+//! the Glue table on that bucket ([`athena_query`]: the last three hours,
+//! the alarm's rule only), in a WAF log workgroup the role may query (the
+//! role template's WAF log group, `infra/cfn/coderhelm-log-reader.yaml`,
+//! `WafLogs`). Request values
 //! that can carry secrets or people's data (client addresses, cookies,
 //! authorization and every other header value but the user agent and
 //! accept language, query strings) are never kept; from the logs in S3,
@@ -67,6 +70,27 @@ pub struct WafAlarm {
 }
 
 impl WafAlarm {
+    /// A web ACL and rule an agent named, when the names are WAF names.
+    /// `region` is the web ACL's region; none for a CloudFront web ACL.
+    pub fn new(web_acl: &str, rule: &str, region: Option<&str>) -> Option<WafAlarm> {
+        let region = region
+            .map(str::trim)
+            .filter(|r| !r.is_empty() && !r.eq_ignore_ascii_case("global"));
+        if let Some(r) = region {
+            let ok = r.len() <= 30
+                && r.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+            if !ok {
+                return None;
+            }
+        }
+        (is_waf_name(web_acl.trim()) && is_waf_name(rule.trim())).then(|| WafAlarm {
+            web_acl: web_acl.trim().to_string(),
+            rule: rule.trim().to_string(),
+            region: region.map(str::to_string),
+        })
+    }
+
     /// WAF's scope for the web ACL, and the region its API is called in.
     fn scope_and_region(&self) -> (aws_sdk_wafv2::types::Scope, String) {
         match &self.region {
@@ -542,6 +566,8 @@ fn waf_client(s: &Session) -> aws_sdk_wafv2::Client {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Gathered {
     pub text: String,
+    /// The same evidence as lines, unfenced (an agent's lookup result).
+    pub lines: Vec<String>,
     pub refused: Vec<String>,
     /// What the run found for the role stack's WAF log group, so its update
     /// link names them: the Athena workgroup's results location
@@ -600,6 +626,7 @@ pub fn evidence(alarm: &WafAlarm, mut lines: Vec<String>, refused: Vec<String>) 
     }
     Gathered {
         text: render(alarm, &lines),
+        lines,
         refused,
         ..Default::default()
     }
@@ -625,16 +652,15 @@ pub fn bucket_key_arn(
     crate::log_reader::is_kms_key(&arn).then_some(arn)
 }
 
-/// Read the evidence for a WAF alarm. Every lookup that fails says why in
-/// the result, so a missing permission is named, not silent.
-pub async fn gather(session: &Session, alarm: &WafAlarm, now: DateTime<Utc>) -> Gathered {
+/// The web ACL's ARN, by its name. `None` (with why in `n`) when it isn't
+/// there or may not be listed.
+async fn find_web_acl(
+    waf: &aws_sdk_wafv2::Client,
+    alarm: &WafAlarm,
+    n: &mut Notes,
+) -> Option<String> {
     use aws_sdk_wafv2::error::ProvideErrorMetadata;
     let (scope, region) = alarm.scope_and_region();
-    let waf = waf_client(&session_in(session, &region));
-    let mut n = Notes::default();
-
-    // The web ACL's ARN, by its name.
-    let mut arn: Option<String> = None;
     let mut marker: Option<String> = None;
     for _ in 0..10 {
         match waf
@@ -646,17 +672,20 @@ pub async fn gather(session: &Session, alarm: &WafAlarm, now: DateTime<Utc>) -> 
             .await
         {
             Ok(o) => {
-                arn = o
+                let arn = o
                     .web_acls()
                     .iter()
                     .find(|w| w.name() == Some(alarm.web_acl.as_str()))
                     .and_then(|w| w.arn())
                     .map(str::to_string);
+                if arn.is_some() {
+                    return arn;
+                }
                 marker = o
                     .next_marker()
                     .filter(|m| !m.is_empty())
                     .map(str::to_string);
-                if arn.is_some() || marker.is_none() {
+                if marker.is_none() {
                     break;
                 }
             }
@@ -667,87 +696,99 @@ pub async fn gather(session: &Session, alarm: &WafAlarm, now: DateTime<Utc>) -> 
                     e.code(),
                     e.message(),
                 );
-                break;
+                return None;
             }
         }
     }
-    let Some(arn) = arn else {
-        if n.lines.is_empty() {
-            n.lines
-                .push(format!("No web ACL named {} in {region}.", alarm.web_acl));
-        }
-        return n.done(alarm);
-    };
+    n.lines
+        .push(format!("No web ACL named {} in {region}.", alarm.web_acl));
+    None
+}
 
-    // The requests the rule matched.
-    let end = now.timestamp();
-    let start = end - WINDOW_SECS + 60;
+/// The requests the rule matched in `[start, end]` (WAF keeps three hours),
+/// summarized into `n`.
+async fn read_samples(
+    waf: &aws_sdk_wafv2::Client,
+    arn: &str,
+    alarm: &WafAlarm,
+    start: i64,
+    end: i64,
+    n: &mut Notes,
+) {
+    use aws_sdk_wafv2::error::ProvideErrorMetadata;
+    let (scope, _) = alarm.scope_and_region();
     let window = aws_sdk_wafv2::types::TimeWindow::builder()
         .start_time(aws_smithy_types::DateTime::from_secs(start))
         .end_time(aws_smithy_types::DateTime::from_secs(end))
         .build();
-    match window {
-        Ok(window) => match waf
-            .get_sampled_requests()
-            .web_acl_arn(&arn)
-            .rule_metric_name(&alarm.rule)
-            .scope(scope.clone())
-            .time_window(window)
-            .max_items(MAX_SAMPLES)
-            .send()
-            .await
-        {
-            Ok(o) => {
-                let samples: Vec<Sample> = o
-                    .sampled_requests()
-                    .iter()
-                    .map(|s| {
-                        let r = s.request();
-                        let headers: Vec<(String, String)> = r
-                            .map(|r| {
-                                r.headers()
-                                    .iter()
-                                    .map(|h| {
-                                        (
-                                            h.name().unwrap_or_default().to_string(),
-                                            h.value().unwrap_or_default().to_string(),
-                                        )
-                                    })
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        let labels: Vec<String> =
-                            s.labels().iter().map(|l| l.name().to_string()).collect();
-                        sample(
-                            s.weight(),
-                            &headers,
-                            r.and_then(|r| r.method()).unwrap_or_default(),
-                            r.and_then(|r| r.uri()).unwrap_or_default(),
-                            r.and_then(|r| r.country()).unwrap_or_default(),
-                            &labels,
-                        )
-                    })
-                    .collect();
-                n.lines
-                    .push(format!("Sampled requests the rule {} matched:", alarm.rule));
-                n.lines.extend(summarize(&samples));
-            }
-            Err(e) => n.failed(
-                "read the sampled requests",
-                "wafv2:GetSampledRequests",
-                e.code(),
-                e.message(),
-            ),
-        },
-        Err(e) => n
-            .lines
-            .push(format!("Couldn't read the sampled requests: {e}")),
+    let window = match window {
+        Ok(w) => w,
+        Err(e) => {
+            n.lines
+                .push(format!("Couldn't read the sampled requests: {e}"));
+            return;
+        }
+    };
+    match waf
+        .get_sampled_requests()
+        .web_acl_arn(arn)
+        .rule_metric_name(&alarm.rule)
+        .scope(scope)
+        .time_window(window)
+        .max_items(MAX_SAMPLES)
+        .send()
+        .await
+    {
+        Ok(o) => {
+            let samples: Vec<Sample> = o
+                .sampled_requests()
+                .iter()
+                .map(|s| {
+                    let r = s.request();
+                    let headers: Vec<(String, String)> = r
+                        .map(|r| {
+                            r.headers()
+                                .iter()
+                                .map(|h| {
+                                    (
+                                        h.name().unwrap_or_default().to_string(),
+                                        h.value().unwrap_or_default().to_string(),
+                                    )
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let labels: Vec<String> =
+                        s.labels().iter().map(|l| l.name().to_string()).collect();
+                    sample(
+                        s.weight(),
+                        &headers,
+                        r.and_then(|r| r.method()).unwrap_or_default(),
+                        r.and_then(|r| r.uri()).unwrap_or_default(),
+                        r.and_then(|r| r.country()).unwrap_or_default(),
+                        &labels,
+                    )
+                })
+                .collect();
+            n.lines
+                .push(format!("Sampled requests the rule {} matched:", alarm.rule));
+            n.lines.extend(summarize(&samples));
+        }
+        Err(e) => n.failed(
+            "read the sampled requests",
+            "wafv2:GetSampledRequests",
+            e.code(),
+            e.message(),
+        ),
     }
+}
 
-    // TLS fingerprints come only from the web ACL's logs.
-    let destinations: Vec<String> = match waf
+/// Where the web ACL logs: its destinations, or none (with why in `n`).
+async fn log_destinations(waf: &aws_sdk_wafv2::Client, arn: &str, n: &mut Notes) -> Vec<String> {
+    use aws_sdk_wafv2::error::ProvideErrorMetadata;
+    match waf
         .get_logging_configuration()
-        .resource_arn(&arn)
+        .resource_arn(arn)
         .send()
         .await
     {
@@ -771,15 +812,107 @@ pub async fn gather(session: &Session, alarm: &WafAlarm, now: DateTime<Utc>) -> 
             );
             vec![]
         }
+    }
+}
+
+/// The rule's matches in the web ACL's log objects, read straight from its
+/// bucket (no Athena); `true` when records naming the rule came back.
+async fn read_log_objects(
+    session: &Session,
+    arn: &str,
+    destination: &str,
+    alarm: &WafAlarm,
+    start: i64,
+    end: i64,
+    n: &mut Notes,
+) -> bool {
+    let Some(loc) = crate::waf_logs::LogLocation::of(arn, destination) else {
+        return false;
     };
+    let got = crate::waf_logs::read(session, &loc, &alarm.rule, start, end).await;
+    for a in &got.refused {
+        if !n.refused.contains(a) {
+            n.refused.push(a.clone());
+        }
+    }
+    n.lines.extend(got.lines.iter().cloned());
+    got.found()
+}
+
+/// The sampled requests the alarm's rule matched in the last three hours
+/// (for an agent's lookup): the lines, and the IAM actions the role was
+/// refused (the install's setup item).
+pub async fn sampled_requests(session: &Session, alarm: &WafAlarm, now: DateTime<Utc>) -> Gathered {
+    let (_, region) = alarm.scope_and_region();
+    let waf = waf_client(&session_in(session, &region));
+    let mut n = Notes::default();
+    if let Some(arn) = find_web_acl(&waf, alarm, &mut n).await {
+        let end = now.timestamp();
+        read_samples(&waf, &arn, alarm, end - WINDOW_SECS + 60, end, &mut n).await;
+    }
+    n.done(alarm)
+}
+
+/// The rule's matches in the web ACL's log objects in `[start, end]` (for an
+/// agent's lookup), read straight from its `aws-waf-logs-*` bucket: the
+/// bucket named, else where the web ACL logs.
+pub async fn log_objects(
+    session: &Session,
+    alarm: &WafAlarm,
+    bucket: Option<&str>,
+    start: i64,
+    end: i64,
+) -> Gathered {
+    let (_, region) = alarm.scope_and_region();
+    let waf = waf_client(&session_in(session, &region));
+    let mut n = Notes::default();
+    let Some(arn) = find_web_acl(&waf, alarm, &mut n).await else {
+        return n.done(alarm);
+    };
+    let destinations: Vec<String> = match bucket {
+        Some(b) => vec![format!("arn:aws:s3:::{b}")],
+        None => log_destinations(&waf, &arn, &mut n).await,
+    };
+    match destinations.iter().find(|d| bucket_of(d).is_some()) {
+        Some(d) => {
+            read_log_objects(session, &arn, d, alarm, start, end, &mut n).await;
+        }
+        None if n.lines.is_empty() => n.lines.push(
+            "The web ACL doesn't log to an aws-waf-logs-* bucket; its sampled requests \
+             (waf_sampled_requests) have the user agent and header order."
+                .into(),
+        ),
+        None => {}
+    }
+    n.done(alarm)
+}
+
+/// Read the evidence for a WAF alarm. Every lookup that fails says why in
+/// the result, so a missing permission is named, not silent. The logs held
+/// in S3 are read straight from the bucket first; Athena only when that
+/// found nothing.
+pub async fn gather(session: &Session, alarm: &WafAlarm, now: DateTime<Utc>) -> Gathered {
+    let (_, region) = alarm.scope_and_region();
+    let waf = waf_client(&session_in(session, &region));
+    let mut n = Notes::default();
+    let Some(arn) = find_web_acl(&waf, alarm, &mut n).await else {
+        return n.done(alarm);
+    };
+    let end = now.timestamp();
+    let start = end - WINDOW_SECS + 60;
+    read_samples(&waf, &arn, alarm, start, end, &mut n).await;
+
+    // TLS fingerprints come only from the web ACL's logs.
+    let destinations = log_destinations(&waf, &arn, &mut n).await;
     let group = destinations.iter().find_map(|d| log_group_of(d));
-    let bucket = destinations.iter().find_map(|d| bucket_of(d));
-    match (group, bucket, insights_query(&alarm.rule)) {
+    let s3_destination = destinations.iter().find(|d| bucket_of(d).is_some());
+    match (group, s3_destination, insights_query(&alarm.rule)) {
         (Some((region, name)), _, Some(query)) => {
             n.lines
                 .extend(fingerprints(session, &region, &name, &query, start, end).await);
         }
-        (None, Some(bucket), _) => {
+        (None, Some(destination), _) => {
+            let bucket = bucket_of(destination).unwrap_or_default();
             n.logs_to_s3 = true;
             // The bucket's own KMS key, for the role stack's WafLogKey
             // (its settings, read with the role's settings reads).
@@ -789,11 +922,16 @@ pub async fn gather(session: &Session, alarm: &WafAlarm, now: DateTime<Utc>) -> 
                 let at = b.region.clone().unwrap_or_else(|| session.region.clone());
                 n.key = bucket_key_arn(rules, &at, account).unwrap_or_default();
             }
-            let mut regions = vec![session.region.clone()];
-            if region != session.region {
-                regions.push(region.clone());
+            // The log objects themselves first: no Athena needed.
+            let found =
+                read_log_objects(session, &arn, destination, alarm, start, end, &mut n).await;
+            if !found {
+                let mut regions = vec![session.region.clone()];
+                if region != session.region {
+                    regions.push(region.clone());
+                }
+                athena_fingerprints(session, &regions, alarm, &bucket, start, end, &mut n).await;
             }
-            athena_fingerprints(session, &regions, alarm, &bucket, start, end, &mut n).await;
         }
         (None, None, _) if !destinations.is_empty() => n.lines.push(
             "The web ACL logs through Firehose, which CoderHelm doesn't read: TLS fingerprints \

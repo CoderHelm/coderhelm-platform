@@ -281,6 +281,12 @@ fn is_settings_tool(name: &str) -> bool {
     matches!(name, "aws_bucket_settings" | "aws_kms_key")
 }
 
+/// The AWS WAF tools' names: a rule's sampled requests and its matches in
+/// the web ACL's log objects, read without Athena.
+fn is_waf_tool(name: &str) -> bool {
+    matches!(name, "waf_sampled_requests" | "waf_log_objects")
+}
+
 /// What the last permission check of `account` found about `action`:
 /// `Some(false)` the role lacks it, `Some(true)` it has it, `None` unknown
 /// (never checked, the check couldn't run, or it was for another release's
@@ -452,7 +458,7 @@ fn describe_metrics(aws: &AwsAbilities) -> String {
         .map(|m| format!("account {} ({})", m.account(), m.target.region))
         .collect();
     format!(
-        "CloudWatch metrics in {}: ECS, RDS, Lambda, CloudFront, load balancers, SQS, DynamoDB",
+        "CloudWatch metrics in {}: any namespace the role may read (ECS, RDS, Lambda, CloudFront, AWS WAF, load balancers, SQS, DynamoDB and more)",
         where_.join(", ")
     )
 }
@@ -666,6 +672,28 @@ impl OpsTools {
                 "Read a KMS key's description (customer or AWS managed, state, spec, origin) and its key policy in the team's AWS account. Never encrypts or decrypts. When access is denied the result names the missing permission.",
                 json!({ "type": "object", "properties": key_props, "required": ["key"] }),
             ));
+            let mut waf_props = json!({
+                "web_acl": { "type": "string", "description": "the web ACL's name (the WebACL dimension of its metrics)" },
+                "rule": { "type": "string", "description": "the rule's metric name (the Rule dimension); for the log objects, the rule's name when it differs" },
+                "region": { "type": "string", "description": "the web ACL's region; leave out for a CloudFront web ACL" },
+            });
+            if self.aws.accounts.len() > 1 {
+                waf_props["account"] = json!({ "type": "string", "description": format!("AWS account: {}", self.aws.accounts.iter().map(|a| a.account.clone()).collect::<Vec<_>>().join(", ")) });
+            }
+            out.push(tool(
+                "waf_sampled_requests",
+                "AWS WAF's sampled requests for one rule of a web ACL over the last three hours (wafv2:GetSampledRequests): user agents, Accept-Language, header order (names only), paths, countries and labels, each with its share. No Athena. Client addresses, cookies, other header values and query strings are never kept.",
+                json!({ "type": "object", "properties": waf_props.clone(), "required": ["web_acl", "rule"] }),
+            ));
+            let mut log_props = waf_props;
+            log_props["bucket"] = json!({ "type": "string", "description": "the aws-waf-logs-* bucket; default where the web ACL logs" });
+            log_props["since"] = since.clone();
+            log_props["until"] = until.clone();
+            out.push(tool(
+                "waf_log_objects",
+                &format!("Read a web ACL's log records straight from its aws-waf-logs-* bucket (s3:ListBucket, s3:GetObject; no Athena, no query results location) and group one rule's matches by JA4, user agent, Accept-Language, path and cookie presence, with JA4 prefixes, countries, labels, actions and matches per hour. Default window the last 3 hours, at most 24; at most {} objects, newest first. Read two windows (before and after a rise) to see which attribute changed. Client addresses, cookies, other header values and query strings are never kept.", common::waf_logs::MAX_OBJECTS),
+                json!({ "type": "object", "properties": log_props, "required": ["web_acl", "rule"] }),
+            ));
         }
         if let Some(l) = self.get(ConnKind::NewRelic) {
             let account = json!({ "type": "string", "description": format!("New Relic account id{}", if l.conn.account_ids.is_empty() { String::new() } else { format!(": {}", l.conn.account_ids.join(", ")) }) });
@@ -731,16 +759,17 @@ impl OpsTools {
         // `search_read`): connections of those kinds are moved at load and
         // never give tools here.
         if !self.aws.metrics.is_empty() {
-            let ns: Vec<String> = metrics::NAMESPACES
+            let ns: Vec<String> = metrics::NAMESPACE_HINTS
                 .iter()
                 .map(|(n, w)| format!("{n} ({w})"))
                 .collect();
-            let mut list_props = json!({ "namespace": { "type": "string" }, "metric": { "type": "string" }, "dimensions": { "type": "object" } });
+            let region = json!({ "type": "string", "description": "AWS region to read in, when it isn't where the metric is published (CloudFront and a CloudFront web ACL's WAF metrics are read in us-east-1 by themselves)" });
+            let mut list_props = json!({ "namespace": { "type": "string" }, "metric": { "type": "string" }, "dimensions": { "type": "object" }, "region": region });
             let mut query_props = json!({
                 "metrics": { "type": "array", "items": { "type": "object", "properties": {
                     "namespace": { "type": "string" }, "metric": { "type": "string" }, "dimensions": { "type": "object" }, "stat": { "type": "string" } }, "required": ["namespace", "metric"] } },
                 "period": { "type": "integer", "description": "seconds per point, a multiple of 60" },
-                "since": since, "until": until });
+                "since": since, "until": until, "region": region });
             if self.aws.metrics.len() > 1 {
                 let account = json!({ "type": "string", "description": format!("AWS account: {}", self.aws.metric_accounts().join(", ")) });
                 list_props["account"] = account.clone();
@@ -748,12 +777,12 @@ impl OpsTools {
             }
             out.push(tool(
                 "metrics_list",
-                &format!("List CloudWatch metrics that exist in a namespace, with their dimension values (find the ClusterName, ServiceName, DBInstanceIdentifier, FunctionName, DistributionId to query). Namespaces: {}", ns.join("; ")),
+                &format!("List CloudWatch metrics that exist in a namespace, with their dimension values (find the ClusterName, ServiceName, DBInstanceIdentifier, FunctionName, DistributionId, WebACL and Rule to query). Any namespace can be read; what the team's AWS role may read decides. Common ones: {}", ns.join("; ")),
                 json!({ "type": "object", "properties": list_props, "required": ["namespace"] }),
             ));
             out.push(tool(
                 "metrics_query",
-                "Read up to 5 CloudWatch metrics over a window (at most 14 days): e.g. ECS CPUUtilization/MemoryUtilization, RDS DatabaseConnections, Lambda Duration/Throttles, CloudFront CacheHitRate, ALB TargetResponseTime. Each metric is {namespace, metric, dimensions, stat} with stat Average, Sum, Minimum, Maximum, SampleCount, p50, p90, p95 or p99.",
+                "Read up to 5 CloudWatch metrics over a window (at most 14 days), in any namespace: e.g. ECS CPUUtilization/MemoryUtilization, RDS DatabaseConnections, Lambda Duration/Throttles, CloudFront CacheHitRate, ALB TargetResponseTime, AWS/WAFV2 CountedRequests/BlockedRequests by WebACL and Rule. Each metric is {namespace, metric, dimensions, stat} with stat Average, Sum, Minimum, Maximum, SampleCount, p50, p90, p95 or p99.",
                 json!({ "type": "object", "properties": query_props, "required": ["metrics"] }),
             ));
         }
@@ -792,6 +821,7 @@ impl OpsTools {
             s.push_str("- `aws_identity`: which AWS account, role and region Coderhelm uses, and whether each works.\n");
         }
         if !self.aws.accounts.is_empty() {
+            s.push_str("- `waf_sampled_requests` and `waf_log_objects`: what an AWS WAF rule matched, from WAF's sampled requests and from the web ACL's log objects in its bucket (JA4, user agent, Accept-Language, path, cookie presence), with no Athena. For a WAF alarm, read these before deciding what changed, and read the rule's metrics (`metrics_query`, namespace AWS/WAFV2) for the counts. A read the role lacks comes back as the install's setup item; say what was read and go on.\n");
             s.push_str("- `aws_bucket_settings` and `aws_kms_key`: an S3 bucket's encryption, bucket policy and public status, and a KMS key's manager, state and key policy. When a finding or an answer hinges on such a setting (is the bucket encrypted with a customer-managed key, does the key policy let a role decrypt, is the bucket public), look it up FIRST and state what came back, citing the lookup; never ask a person for something these can read. Ask a person only when the lookup can't be made, and then say exactly why, quoting the missing permission the result names.\n");
         }
         for l in &self.loaded {
@@ -817,6 +847,7 @@ impl OpsTools {
         let kind = match name {
             "aws_identity" => None,
             n if is_settings_tool(n) => None,
+            n if is_waf_tool(n) => None,
             n if is_report_tool(n) => None,
             n if n.starts_with("newrelic_") => Some(ConnKind::NewRelic),
             n if n.starts_with("confluence_") => Some(ConnKind::Confluence),
@@ -847,6 +878,7 @@ impl OpsTools {
             None if is_settings_tool(name) => {
                 ("connector-aws".to_string(), "AWS settings".to_string())
             }
+            None if is_waf_tool(name) => ("connector-aws".to_string(), "AWS WAF".to_string()),
             None => ("connector-aws".to_string(), "AWS identity".to_string()),
         };
         let logged = store::log_activity_in(
@@ -878,6 +910,8 @@ impl OpsTools {
             "Test reports".to_string()
         } else if is_settings_tool(name) {
             "AWS settings".to_string()
+        } else if is_waf_tool(name) {
+            "AWS WAF".to_string()
         } else {
             lookup_source(kind, input)
         };
@@ -994,17 +1028,128 @@ impl OpsTools {
         }
         let now = chrono::Utc::now().timestamp();
         let actor = format!("{}-pr{}", self.actor, self.pr);
-        let pretty = |v: &Value| serde_json::to_string_pretty(v).unwrap_or_default();
+        if is_waf_tool(name) {
+            return self.read_waf(state, name, input, &actor).await;
+        }
         if kind == Some(ConnKind::Metrics) {
             let target = &self.aws.metrics_for(s_in(input, "account"))?.target;
-            return match name {
+            let read = self
+                .read_metrics(state, name, input, target, &actor, now)
+                .await;
+            if let Err(e) = &read {
+                self.note_refused(
+                    state,
+                    target,
+                    &e.role_refused,
+                    "a CloudWatch metrics lookup",
+                )
+                .await;
+            }
+            return read;
+        }
+        self.run_rest(state, kind, name, input, &actor, now).await
+    }
+
+    /// Reads the team's role was refused (`actions`): the install's setup
+    /// item, recorded once for the account (best effort).
+    async fn note_refused(
+        &self,
+        state: &WorkerState,
+        target: &AwsTarget,
+        actions: &[String],
+        needed_for: &str,
+    ) {
+        let table = &state.config.settings_table_name;
+        if actions.is_empty() || table.is_empty() {
+            return;
+        }
+        if let Some(gap) = common::aws_role_reads::gap(
+            target.account(),
+            &target.role_arn,
+            actions,
+            needed_for,
+            &chrono::Utc::now().to_rfc3339(),
+        ) {
+            common::aws_role_reads::record(&state.dynamo, table, &self.team_id, &gap).await;
+        }
+    }
+
+    /// A WAF rule's sampled requests, or its matches in the web ACL's log
+    /// objects. Reads the role is refused are named in the result and
+    /// recorded as the install's setup item; what could be read comes back.
+    async fn read_waf(
+        &self,
+        state: &WorkerState,
+        name: &str,
+        input: &Value,
+        actor: &str,
+    ) -> Result<(String, String, bool), StepError> {
+        use common::alarm_evidence as ae;
+        let alarm = ae::WafAlarm::new(
+            s_in(input, "web_acl").unwrap_or(""),
+            s_in(input, "rule").unwrap_or(""),
+            s_in(input, "region"),
+        )
+        .ok_or_else(|| {
+            StepError::new(
+                "read_only",
+                "Name the web ACL and the rule (letters, digits, - and _).",
+                "The alarm's WebACL and Rule dimensions name them.",
+            )
+        })?;
+        let account = self.aws.settings_account(s_in(input, "account"), None)?;
+        let target = account.target();
+        let session = assume(&state.sts, &target, actor).await?;
+        let now = chrono::Utc::now();
+        let got = if name == "waf_sampled_requests" {
+            ae::sampled_requests(&session, &alarm, now).await
+        } else {
+            let bucket = s_in(input, "bucket");
+            if let Some(b) = bucket.filter(|b| !common::waf_logs::is_bucket(b)) {
+                return Err(StepError::new(
+                    "read_only",
+                    format!("{b} isn't a WAF log bucket (its name starts with aws-waf-logs-)."),
+                    "Leave the bucket out to read where the web ACL logs.",
+                ));
+            }
+            let (start, end) = common::live::http::window(
+                s_in(input, "since"),
+                s_in(input, "until"),
+                now.timestamp(),
+                std::time::Duration::from_secs(3 * 3600),
+                std::time::Duration::from_secs(common::waf_logs::MAX_WINDOW_SECS as u64),
+            )?;
+            ae::log_objects(&session, &alarm, bucket, start, end).await
+        };
+        self.note_refused(state, &target, &got.refused, "an AWS WAF rule's requests")
+            .await;
+        let note = format!("{name} {} {}", alarm.web_acl, alarm.rule);
+        if got.lines.is_empty() {
+            return Ok(("Nothing came back.".into(), note, true));
+        }
+        Ok((got.lines.join("\n"), note, false))
+    }
+
+    /// One CloudWatch metrics read.
+    async fn read_metrics(
+        &self,
+        state: &WorkerState,
+        name: &str,
+        input: &Value,
+        target: &AwsTarget,
+        actor: &str,
+        now: i64,
+    ) -> Result<(String, String, bool), StepError> {
+        {
+            match name {
                 "metrics_list" => {
                     let q = metrics::check_list(
                         s_in(input, "namespace").unwrap_or(""),
                         s_in(input, "metric"),
                         &input["dimensions"],
+                        s_in(input, "region"),
                     )?;
-                    let session = assume(&state.sts, target, &actor).await?;
+                    let session = assume(&state.sts, target, actor).await?;
                     let list =
                         metrics::MetricsApi::list(&metrics::Aws { session: &session }, &q).await?;
                     Ok((
@@ -1020,15 +1165,30 @@ impl OpsTools {
                         input["period"].as_i64(),
                         s_in(input, "since"),
                         s_in(input, "until"),
+                        s_in(input, "region"),
                         now,
                     )?;
-                    let session = assume(&state.sts, target, &actor).await?;
+                    let session = assume(&state.sts, target, actor).await?;
                     let series =
                         metrics::MetricsApi::get(&metrics::Aws { session: &session }, &q).await?;
                     Ok((metrics::format_series(&q, &series), q.describe(), false))
                 }
-            };
+            }
         }
+    }
+
+    /// The other tools: Airflow, New Relic, Confluence, identity, settings.
+    async fn run_rest(
+        &self,
+        state: &WorkerState,
+        kind: Option<ConnKind>,
+        name: &str,
+        input: &Value,
+        actor: &str,
+        now: i64,
+    ) -> Result<(String, String, bool), StepError> {
+        let actor = actor.to_string();
+        let pretty = |v: &Value| serde_json::to_string_pretty(v).unwrap_or_default();
         if kind == Some(ConnKind::Airflow) {
             let what = name.trim_start_matches("airflow_");
             let envs = self.aws.environments();

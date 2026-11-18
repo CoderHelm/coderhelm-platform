@@ -7,6 +7,8 @@
 //!
 //! - a run in flight (running / queued / awaiting_ci) always blocks — a new
 //!   run would force-reset the branch out from under the active one
+//! - a run waiting for the install's "AWS role reads" item
+//!   (`awaiting_setup`) blocks too: it goes on by itself once the role reads
 //! - a completed latest run whose PR is still open (auto-merge armed
 //!   included) has handled the ticket: no new run starts. An edit that
 //!   changes the ticket's CONTENT goes to that PR's feedback path
@@ -236,6 +238,9 @@ pub async fn gate_ticket_trigger(
         match status_of(i).as_str() {
             "running" | "queued" => h < 2,
             "awaiting_ci" => h < 26,
+            // Waiting for the role's reads goes on by itself (`role_wait`);
+            // a second run would wait for the same item.
+            "awaiting_setup" => h < 24 * 14,
             _ => false,
         }
     }) {

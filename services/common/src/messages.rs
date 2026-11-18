@@ -212,6 +212,12 @@ pub enum WorkerMessage {
     /// `run.needs_input` event (`common::run_wait`).
     #[serde(rename = "run_waiting")]
     RunWaiting(RunWaitingMessage),
+    /// A run waiting for the install's setup item "AWS role reads"
+    /// (`awaiting_setup`, `crate::role_wait`): re-check the role, and go on
+    /// once it reads (self-scheduled with SQS delay; the daily role check
+    /// sends one too).
+    #[serde(rename = "role_reads_wait")]
+    RoleReadsWait(RoleReadsWaitMessage),
     /// One plugin run: a brief, a schedule or a release (see
     /// `plugins::run`).
     #[serde(rename = "plugin_run")]
@@ -460,6 +466,7 @@ impl WorkerMessage {
             | WorkerMessage::KnowledgeSyncSweep
             | WorkerMessage::AgentResumeSweep
             | WorkerMessage::RunWaiting(_)
+            | WorkerMessage::RoleReadsWait(_)
             | WorkerMessage::LogAutofix
             | WorkerMessage::AwsPermissionsSweep
             | WorkerMessage::HybridNameCheck
@@ -536,6 +543,7 @@ impl WorkerMessage {
             | WorkerMessage::JiraComment(_)
             | WorkerMessage::AgentResumeSweep
             | WorkerMessage::RunWaiting(_)
+            | WorkerMessage::RoleReadsWait(_)
             | WorkerMessage::PluginRun(_)
             | WorkerMessage::PluginPublish(_)
             | WorkerMessage::PluginSync(_)
@@ -810,6 +818,21 @@ pub struct RunWaitingMessage {
     /// worker goes ahead with its recommended default.
     #[serde(default)]
     pub why: String,
+}
+
+/// Re-check the role of a run waiting for the install's "AWS role reads"
+/// item (`crate::role_wait`).
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct RoleReadsWaitMessage {
+    pub team_id: String,
+    pub run_id: String,
+    /// Re-checks sent so far on the fast schedule.
+    #[serde(default)]
+    pub polls: u32,
+    /// Sent by the daily role check or by a read that worked again: it
+    /// checks once and sends no next check.
+    #[serde(default)]
+    pub once: bool,
 }
 
 /// One webhook delivery to try (again).

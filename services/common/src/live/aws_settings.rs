@@ -391,7 +391,7 @@ const NO_BUCKET: (&str, &str) = (
 
 /// The region S3 says a bucket is in (`x-amz-bucket-region`), from a call
 /// made in another region.
-fn bucket_region<E>(
+pub fn bucket_region<E>(
     e: &aws_sdk_s3::error::SdkError<E, aws_sdk_s3::config::http::HttpResponse>,
 ) -> Option<String> {
     let r = e

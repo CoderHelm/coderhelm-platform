@@ -51,7 +51,11 @@ impl Group {
 
     fn holds(self, status: &str) -> bool {
         use common::run_status as rs;
-        let waiting = [rs::NEEDS_INPUT, rs::NEEDS_OUTSIDE_CHANGE];
+        let waiting = [
+            rs::NEEDS_INPUT,
+            rs::NEEDS_OUTSIDE_CHANGE,
+            rs::AWAITING_SETUP,
+        ];
         match self {
             // Archived runs show only when asked for by run id.
             Group::Any => status != rs::ARCHIVED,
