@@ -95,9 +95,22 @@ pub fn unread_failure(st: &State, failing: &[String]) -> bool {
         .any(|f| !st.failures.iter().any(|r| &r.check == f))
 }
 
-/// A state that needs nothing more on its head.
+/// A state that needs nothing more on its head. A failed deploy label's
+/// check, or a workflow that ran no job, can pass on a re-run of the same
+/// head: that state is read again.
 pub fn settled(st: &State, head: &str) -> bool {
+    let deploy: Vec<pv::Covering> = st
+        .covers
+        .iter()
+        .filter(|c| !c.label.is_empty())
+        .cloned()
+        .collect();
+    let rerunnable = st.stage == Stage::Failed
+        && st.checks.iter().any(|c| {
+            c.outcome == Outcome::Failed && (c.no_jobs || pv::is_covering(&deploy, &c.name))
+        });
     st.head == head
+        && !rerunnable
         && matches!(
             st.stage,
             Stage::NotNeeded | Stage::Checked | Stage::Blocked | Stage::Failed
@@ -592,8 +605,9 @@ pub async fn advance(
         })
         .collect();
     if !deploy_waiting.is_empty() {
-        let paths: Vec<String> = deploy_waiting.iter().map(|c| c.workflow.clone()).collect();
-        results.extend(super::deploy_label::unstarted(gh, p.owner, p.repo, &head, &paths).await);
+        results.extend(
+            super::deploy_label::unstarted(gh, p.owner, p.repo, &head, &deploy_waiting).await,
+        );
     }
     // A check held for an environment's approval names the environment.
     for r in results.iter_mut().filter(|r| r.outcome == Outcome::Waiting) {
@@ -948,5 +962,44 @@ mod tests {
             ..Default::default()
         };
         assert!(!settled(&pending, "abc"));
+    }
+
+    #[test]
+    fn a_failed_deploy_label_check_is_read_again_on_the_same_head_a_failed_plan_check_is_not() {
+        let failed = |name: &str, no_jobs: bool| CheckResult {
+            name: name.into(),
+            outcome: Outcome::Failed,
+            url: String::new(),
+            environment: String::new(),
+            no_jobs,
+        };
+        let covers = vec![
+            pv::Covering {
+                check: "Deploy app".into(),
+                workflow: ".github/workflows/deploy.yml".into(),
+                label: "CI:DEPLOY_PREVIEW".into(),
+                ..Default::default()
+            },
+            pv::Covering {
+                check: "E2E on preview".into(),
+                ..Default::default()
+            },
+        ];
+        let st = |checks| State {
+            head: "abc".into(),
+            stage: Stage::Failed,
+            covers: covers.clone(),
+            checks,
+            ..Default::default()
+        };
+        // A person can re-run either on this head and it may pass.
+        assert!(!settled(&st(vec![failed("Deploy app", false)]), "abc"));
+        assert!(!settled(
+            &st(vec![failed("Deploy app / build", false)]),
+            "abc"
+        ));
+        assert!(!settled(&st(vec![failed("Something else", true)]), "abc"));
+        // The preview plan's own failure waits for the fix's push.
+        assert!(settled(&st(vec![failed("E2E on preview", false)]), "abc"));
     }
 }

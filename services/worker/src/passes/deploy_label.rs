@@ -2,7 +2,7 @@
 //! pull request (`preview::advance`) and the auto-merge gate. The rules are
 //! `common::deploy_label`'s; this module reads the settings and GitHub.
 
-use common::preview::{CheckResult, Outcome};
+use common::preview::{CheckResult, Covering, Outcome};
 use tracing::warn;
 
 use crate::clients::github::GitHubClient;
@@ -25,16 +25,17 @@ pub async fn workflow_logins(gh: &GitHubClient) -> Vec<String> {
     out
 }
 
-/// The deploy workflows among `paths` whose newest run on `head` failed
-/// before any job ran (GitHub's `startup_failure`): they report no check,
-/// so each is a failed result of its own, with its run's link and nothing
-/// on the branch for a fix to act on. Empty when the runs can't be read.
+/// The deploy label's covering checks among `covers` whose workflow's
+/// newest run on `head` failed before any job ran (GitHub's
+/// `startup_failure`): they report no check, so each is a failed result
+/// under its covering check's name, with its run's link and nothing on the
+/// branch for a fix to act on. Empty when the runs can't be read.
 pub async fn unstarted(
     gh: &GitHubClient,
     owner: &str,
     repo: &str,
     head: &str,
-    paths: &[String],
+    covers: &[&Covering],
 ) -> Vec<CheckResult> {
     let runs = match gh.list_workflow_runs_for_sha(owner, repo, head).await {
         Ok(r) => r,
@@ -43,39 +44,32 @@ pub async fn unstarted(
             return Vec::new();
         }
     };
-    unstarted_of(&runs, paths)
+    unstarted_of(&runs, covers)
 }
 
-/// Pure half of [`unstarted`]: GitHub's runs listing, newest first.
-pub fn unstarted_of(runs: &[serde_json::Value], paths: &[String]) -> Vec<CheckResult> {
-    let mut out = Vec::new();
-    for path in paths {
-        if out.iter().any(|r: &(String, CheckResult)| &r.0 == path) {
-            continue;
-        }
-        let newest = runs
-            .iter()
-            .filter(|r| r["path"].as_str() == Some(path.as_str()))
-            .max_by(|a, b| {
-                a["created_at"]
-                    .as_str()
-                    .unwrap_or("")
-                    .cmp(b["created_at"].as_str().unwrap_or(""))
-            });
-        if let Some(r) = newest.filter(|r| r["conclusion"].as_str() == Some("startup_failure")) {
-            out.push((
-                path.clone(),
-                CheckResult {
-                    name: r["name"].as_str().unwrap_or(path).to_string(),
-                    outcome: Outcome::Failed,
-                    url: r["html_url"].as_str().unwrap_or("").to_string(),
-                    environment: String::new(),
-                    no_jobs: true,
-                },
-            ));
-        }
-    }
-    out.into_iter().map(|(_, r)| r).collect()
+/// Pure half of [`unstarted`]: GitHub's runs listing.
+pub fn unstarted_of(runs: &[serde_json::Value], covers: &[&Covering]) -> Vec<CheckResult> {
+    covers
+        .iter()
+        .filter_map(|c| {
+            let newest = runs
+                .iter()
+                .filter(|r| r["path"].as_str() == Some(c.workflow.as_str()))
+                .max_by(|a, b| {
+                    a["created_at"]
+                        .as_str()
+                        .unwrap_or("")
+                        .cmp(b["created_at"].as_str().unwrap_or(""))
+                })?;
+            (newest["conclusion"].as_str() == Some("startup_failure")).then(|| CheckResult {
+                name: c.check.clone(),
+                outcome: Outcome::Failed,
+                url: newest["html_url"].as_str().unwrap_or("").to_string(),
+                environment: String::new(),
+                no_jobs: true,
+            })
+        })
+        .collect()
 }
 
 /// The environment a check held for an approval waits for, from its
@@ -107,7 +101,7 @@ mod tests {
     #[test]
     fn a_deploy_workflow_that_failed_to_start_is_a_failed_result_with_no_jobs() {
         let run = |path: &str, conclusion: &str, created: &str| {
-            json!({"name": "Deploy app", "path": path, "conclusion": conclusion,
+            json!({"name": "Deploy preview", "path": path, "conclusion": conclusion,
                    "created_at": created, "html_url": "https://github.com/o/r/actions/runs/7"})
         };
         let runs = vec![
@@ -127,7 +121,15 @@ mod tests {
                 "2026-11-17T10:05:00Z",
             ),
         ];
-        let got = unstarted_of(&runs, &[".github/workflows/deploy.yml".to_string()]);
+        let cover = Covering {
+            check: "Deploy app".into(),
+            workflow: ".github/workflows/deploy.yml".into(),
+            label: "CI:DEPLOY_PREVIEW".into(),
+            ..Default::default()
+        };
+        // Named after the covering job, not the workflow's `name:`, so the
+        // Verification table, which lists covering checks, quotes it.
+        let got = unstarted_of(&runs, &[&cover]);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].name, "Deploy app");
         assert_eq!(got[0].outcome, Outcome::Failed);
@@ -146,6 +148,6 @@ mod tests {
                 "2026-11-17T10:05:00Z",
             ),
         ];
-        assert!(unstarted_of(&later, &[".github/workflows/deploy.yml".to_string()]).is_empty());
+        assert!(unstarted_of(&later, &[&cover]).is_empty());
     }
 }
