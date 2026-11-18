@@ -6,6 +6,9 @@ pub mod agent_file;
 /// The agent log of a run: its file format, outcomes, order and redaction
 /// (worker writes it, gateway serves it).
 pub mod agent_log;
+/// A repository's code map: sections stamped with the commit they describe,
+/// rebuilt only where a change touched them, given to the planner and coder.
+pub mod code_map;
 /// Distributed fencing lock for a team+repo memory snapshot. Lives in common
 /// because BOTH writers must honor it: the worker's run-scoped memory open and
 /// the gateway's dashboard memory-delete (an unlocked delete raced a concurrent
@@ -13,6 +16,11 @@ pub mod agent_log;
 pub mod memlock;
 pub mod model_access;
 pub mod model_ids;
+/// Non-functional checklists a plan answers when its change reaches
+/// infrastructure, performance, data, security or observability.
+pub mod nfr_check;
+/// Each acceptance criterion traced to the code, the tests and the proof.
+pub mod trace;
 
 /// Expiring once-only claims (dedup markers, leases) on the settings table.
 /// Shared so every claim compares its expiry the same way.

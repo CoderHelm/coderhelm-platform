@@ -422,7 +422,7 @@ async fn served_legs(
 
 /// The plan's design.md for the run's ticket and repository, empty when
 /// it can't be read.
-async fn design_of(
+pub(crate) async fn design_of(
     state: &WorkerState,
     team_id: &str,
     run_id: &str,

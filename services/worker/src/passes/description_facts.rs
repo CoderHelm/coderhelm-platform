@@ -517,6 +517,27 @@ pub fn with_two_way(f: &mut Facts, proofs: &[common::e2e_proof::Proof]) {
     }
 }
 
+/// Each criterion traced to its code, tests and proof on this head
+/// (`common::trace`): kept in the facts for the table, and every gap the
+/// two-way proof doesn't already report is an open item, said as not
+/// verified with what is missing.
+pub fn with_trace(f: &mut Facts, trace: common::trace::Trace) {
+    for g in common::trace::gaps(&trace) {
+        if g.by_two_way {
+            continue;
+        }
+        let what = format!("\"{}\" traced to the change", g.criterion);
+        if f.unverified
+            .iter()
+            .any(|u| u.what == what && u.why == g.what)
+        {
+            continue;
+        }
+        f.unverified.push(Unverified { what, why: g.what });
+    }
+    f.trace = Some(trace);
+}
+
 /// The run's scope decisions in the facts (`common::scope_ledger`): what
 /// the change leaves out, as the ledger says, and each out-of-scope item
 /// the diff (`files`: path, status, patch; tests included) brings back,
@@ -835,6 +856,13 @@ pub fn shape_for(
         })
         .collect();
     let evidence = pr_steps::evidence_block(&facts.steps, &own_checks, &facts.evidence);
+    // Each criterion traced to its code, tests and proof, with the checks:
+    // rebuilt from the facts of the head like everything around it.
+    let checks_block = match facts.trace.as_ref().map(common::trace::table) {
+        Some(t) if !t.is_empty() && r.evidence.trim().is_empty() => t,
+        Some(t) if !t.is_empty() => format!("{}\n\n{t}", r.evidence.trim_end()),
+        _ => r.evidence.clone(),
+    };
     let mut out = format!("{LEAD_START}\n{}\n\n{LEAD_END}\n\n", r.visible);
     out.push_str(checked.trim());
     for (start, inner, end) in [
@@ -845,7 +873,7 @@ pub fn shape_for(
         ),
         (
             common::pr_body::CHECKS_START,
-            r.evidence.as_str(),
+            checks_block.as_str(),
             common::pr_body::CHECKS_END,
         ),
         (EVIDENCE_START, "", EVIDENCE_END),

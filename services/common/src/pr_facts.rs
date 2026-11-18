@@ -394,6 +394,10 @@ pub struct Facts {
     /// out of scope; each is not verified until it is taken out or moved in.
     #[serde(default)]
     pub scope_breaches: Vec<crate::scope_ledger::Breach>,
+    /// Each acceptance criterion traced to its code, tests and proof on
+    /// this head (`crate::trace`): shown as a table with the checks.
+    #[serde(default)]
+    pub trace: Option<crate::trace::Trace>,
 }
 
 impl Facts {

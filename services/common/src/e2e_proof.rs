@@ -46,7 +46,8 @@ pub const PLANNER: &str = "\n\n## The criteria map (CoderHelm checks it)\n\
 Start from the ticket's acceptance criteria (or its Expected lines) and plan how each one is \
 proven end to end. Write a `## Criteria map` section in design.md with one line per criterion:\n\
 `- <the criterion> | page: <the page or URL path it is about> | e2e: <spec path in the \
-end-to-end suite> › <test title> | asserts: <what a person sees there>`\n\
+end-to-end suite> › <test title> | asserts: <what a person sees there> | code: <the files or \
+functions changed for it>`\n\
 - A criterion that names a page or something a person sees gets an end-to-end test that loads \
 that page and asserts it. Unit tests may go with it but never replace it.\n\
 - The test must fail on the base branch's deployment (staging) today, which shows the bug, and \
@@ -371,6 +372,9 @@ pub struct MapLine {
     /// The reason it has no end-to-end test (`e2e: none: <why>`).
     pub none: Option<String>,
     pub asserts: String,
+    /// The code the criterion is built in, as the plan names it (`code:
+    /// <paths or symbols>`): what the trace links it to (`common::trace`).
+    pub code: String,
 }
 
 impl MapLine {
@@ -426,6 +430,7 @@ pub fn parse_map(design: &str) -> Vec<MapLine> {
                     }
                 }
                 "asserts" | "assert" | "expect" => m.asserts = v,
+                "code" | "files" => m.code = v,
                 _ => {}
             }
         }

@@ -583,6 +583,15 @@ struct RunBits {
     two_way: Vec<common::e2e_proof::Proof>,
     /// The scope decided at plan time (`common::scope_ledger`).
     scope: Option<common::scope_ledger::Ledger>,
+    /// The run behind the pull request.
+    run_id: String,
+    /// The ticket's text, for its acceptance criteria.
+    ticket_body: String,
+    /// The plan's design.md, for its criteria map.
+    design: String,
+    /// The changed tests' runs with and without the change, and the head
+    /// they ran on (`habits_check`).
+    test_runs: (String, Vec<common::trace::TestRun>),
 }
 
 impl Gathered {
@@ -644,9 +653,79 @@ impl Gathered {
         super::description_facts::with_preview(&mut f, preview);
         super::description_facts::with_two_way(&mut f, &self.run.two_way);
         super::description_facts::with_scope(&mut f, self.run.scope.as_ref(), &self.files);
+        if let Some(t) = self.trace() {
+            super::description_facts::with_trace(&mut f, t);
+        }
         f.waiting = self.run.waiting.clone();
         f
     }
+
+    /// Each acceptance criterion traced to this head's code, tests and
+    /// proof (`common::trace`); `None` when the run has no criteria.
+    fn trace(&self) -> Option<common::trace::Trace> {
+        use common::e2e_proof as ep;
+        let acceptance = super::stop_judge::acceptance(&self.run.ticket_body);
+        let map = ep::parse_map(&self.run.design);
+        let from_ticket = ep::criteria(&self.run.title, &self.run.ticket_body, &acceptance);
+        let criteria =
+            ep::criteria_or_map(&self.run.title, &self.run.ticket_body, &acceptance, &map);
+        if criteria.is_empty() {
+            return None;
+        }
+        let (runs_head, runs) = &self.run.test_runs;
+        let runs: &[common::trace::TestRun] = if ci_same_head(runs_head, self.head()) {
+            runs
+        } else {
+            &[]
+        };
+        Some(common::trace::build(&common::trace::Inputs {
+            head: self.head(),
+            from_plan: criteria != from_ticket,
+            criteria: &criteria,
+            map: &map,
+            files: &self.files,
+            proofs: &self.run.two_way,
+            test_runs: runs,
+        }))
+    }
+}
+
+fn ci_same_head(a: &str, b: &str) -> bool {
+    !a.is_empty() && common::ci_repro::same_sha(a, b)
+}
+
+/// The changed tests' runs with and without the change, as the trace reads
+/// them, and the head they ran on: from the run's checks ledger
+/// (`run_guard`, the tests and scope check).
+async fn test_runs_of(
+    state: &WorkerState,
+    team_id: &str,
+    run_id: &str,
+    scope: &str,
+) -> (String, Vec<common::trace::TestRun>) {
+    use super::habits_check::Verdict;
+    use common::trace::{State, TestRun};
+    let cell = super::run_guard::LedgerCell::load(state, team_id, run_id, scope).await;
+    let (head, outcome) = cell.update(|l| (l.habits.head.clone(), l.habits_outcome.clone()));
+    let Some(Ok(Some(facts))) = outcome else {
+        return (head, Vec::new());
+    };
+    let runs = facts
+        .tests
+        .iter()
+        .map(|t| TestRun {
+            path: t.path.clone(),
+            state: match t.verdict {
+                Verdict::Proven => State::Proven,
+                Verdict::PassesEitherWay => State::NotTheTicket,
+                Verdict::FailsWithChange => State::Failing,
+                Verdict::FailsBeforeAsserting => State::Unverified,
+                Verdict::NotRun => State::NotRun,
+            },
+            detail: t.detail.clone(),
+        })
+        .collect();
+    (head, runs)
 }
 
 /// The attributes on a run that carry what its title's form was read from
@@ -689,6 +768,8 @@ async fn run_bits(
     } else {
         String::new()
     };
+    let design = super::e2e_proof::design_of(state, team_id, &run_id, owner, repo).await;
+    let test_runs = test_runs_of(state, team_id, &run_id, &format!("{owner}/{repo}")).await;
     (
         RunBits {
             ticket_id: get("ticket_id"),
@@ -710,6 +791,10 @@ async fn run_bits(
                 .get(common::scope_ledger::FIELD)
                 .and_then(|v| v.as_s().ok())
                 .map(|s| common::scope_ledger::Ledger::from_json(s)),
+            run_id: run_id.clone(),
+            ticket_body: get("ticket_body"),
+            design,
+            test_runs,
         },
         run_id,
     )
@@ -915,6 +1000,10 @@ async fn build(
     let next = match gather(state, github, team_id, owner, repo, number).await {
         Ok(g) if g.head() == head => {
             let facts = g.facts_of(&base, dependency);
+            // The trace of this head, on the run for its API.
+            if let Some(t) = facts.trace.as_ref() {
+                save_trace(state, team_id, &g.run.run_id, t).await;
+            }
             let reply = match reader {
                 Some(r) => ask_reader(state, r, &facts, &base).await,
                 None => None,
@@ -966,6 +1055,28 @@ async fn build(
             Reconciled::Rebuilt
         }
         Err(e) => Reconciled::Failed(format!("the description could not be saved: {e}")),
+    }
+}
+
+/// The trace of the head on the run (`common::trace::FIELD`), for the run
+/// API.
+async fn save_trace(state: &WorkerState, team_id: &str, run_id: &str, t: &common::trace::Trace) {
+    if run_id.is_empty() {
+        return;
+    }
+    if let Err(e) = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", super::attr_s(team_id))
+        .key("run_id", super::attr_s(run_id))
+        .update_expression("SET #f = :v")
+        .expression_attribute_names("#f", common::trace::FIELD)
+        .expression_attribute_values(":v", super::attr_s(&t.to_json()))
+        .send()
+        .await
+    {
+        warn!(run_id, error = %e, "Could not keep the criteria trace on the run");
     }
 }
 

@@ -1,0 +1,5 @@
+# di. `di_infra_checklist_answered`
+
+**What happened:** A ticket asked for a queue between the API and the worker. The plan read the Terraform and added the queue resource and the IAM statement. It left several things unsaid: how the queue rolls out across environments, how it rolls back, what else the worker role serves, what the queue costs and its limits, and which alarm shows it backing up. The change was right, but the reviewer had to ask about each of these, one comment at a time.
+
+**The guarantee:** When the plan's files or the ticket reach infrastructure, CI, auth and security, data, a hot path or observability, design.md answers that area's checklist under `## Non-functional checks` (`common::nfr_check`). The lists are data in one file, `services/common/src/nfr_checklists.json`. Each answer says where it comes from (a file, a command or a lookup), and an item that doesn't apply says why. Anything missing goes back with the plan's other gaps in the same send-back. It adds no stop and no approval.
