@@ -1,0 +1,125 @@
+{
+  "areas": [
+    {
+      "id": "infrastructure",
+      "title": "Infrastructure",
+      "when": "the change touches Terraform, CDK, CloudFormation, Kubernetes, containers or serverless config",
+      "paths": {
+        "ext": [".tf", ".tfvars"],
+        "names": ["cdk.json", "serverless.yml", "serverless.yaml", "template.yaml", "template.yml", "dockerfile", "chart.yaml", "values.yaml", "kustomization.yaml"],
+        "dirs": ["terraform", "cdk", "cloudformation", "k8s", "kubernetes", "helm", "charts", "infra", "infrastructure", "deploy"],
+        "prefixes": [],
+        "contains": []
+      },
+      "words": ["terraform", "cdk", "cloudformation", "kubernetes", "k8s", "helm", "load balancer", "autoscaling", "vpc", "subnet", "s3 bucket", "dynamodb table", "lambda function"],
+      "items": [
+        { "id": "rollout", "ask": "how it rolls out, in which order across environments" },
+        { "id": "rollback", "ask": "how it is rolled back, and what a rollback loses" },
+        { "id": "blast_radius", "ask": "what else the changed resources serve (services, environments, tenants)" },
+        { "id": "environments", "ask": "which environments it reaches, and whether each has the same resources today" },
+        { "id": "permissions", "ask": "the permissions it adds or changes, scoped to which resources" },
+        { "id": "cost", "ask": "what it adds to cost, from the resource's pricing and expected use" },
+        { "id": "limits", "ask": "the limits, quotas and timeouts it meets or changes" },
+        { "id": "monitoring", "ask": "the alarm, metric or log that shows it failing" }
+      ]
+    },
+    {
+      "id": "ci",
+      "title": "CI and deploy pipelines",
+      "when": "the change touches CI workflows or deploy pipelines",
+      "paths": {
+        "ext": [],
+        "names": [".gitlab-ci.yml", "jenkinsfile", "azure-pipelines.yml", "bitbucket-pipelines.yml"],
+        "dirs": [],
+        "prefixes": [".github/workflows/", ".circleci/", ".buildkite/"],
+        "contains": []
+      },
+      "words": ["github actions", "ci pipeline", "deploy pipeline", "workflow file"],
+      "items": [
+        { "id": "triggers", "ask": "which branches, events and environments run it" },
+        { "id": "rollback", "ask": "how a bad pipeline change is undone without a broken deploy" },
+        { "id": "permissions", "ask": "the tokens, secrets and permissions the jobs use, and their scope" },
+        { "id": "blast_radius", "ask": "which jobs, deploys or repositories depend on what changed" },
+        { "id": "limits", "ask": "timeouts, concurrency and runner time it adds" }
+      ]
+    },
+    {
+      "id": "security",
+      "title": "Auth and security",
+      "when": "the change touches authentication, authorization, IAM, WAF, secrets or untrusted input",
+      "paths": {
+        "ext": [],
+        "names": [],
+        "dirs": ["auth", "authz", "security", "iam", "waf"],
+        "prefixes": [],
+        "contains": ["auth", "login", "session", "oauth", "permission", "iam", "waf", "cors", "csrf", "secret", "crypto"]
+      },
+      "words": ["authentication", "authorization", "login", "password", "permission", "permissions", "iam", "waf", "cors", "csrf", "secret", "secrets", "encryption", "sso", "oauth", "xss", "injection", "access control"],
+      "items": [
+        { "id": "threat", "ask": "what someone could misuse in the change, and what stops it" },
+        { "id": "permissions", "ask": "who or what gains access to what, at the least it needs" },
+        { "id": "secrets", "ask": "where secrets and tokens come from, and that none is logged or committed" },
+        { "id": "input", "ask": "how untrusted input is validated or encoded" },
+        { "id": "compatibility", "ask": "whether existing sessions, tokens and clients keep working, or how they move" }
+      ]
+    },
+    {
+      "id": "data",
+      "title": "Data and migrations",
+      "when": "the change touches schemas, migrations, stored data or its shape",
+      "paths": {
+        "ext": [".sql"],
+        "names": ["schema.prisma", "schema.rb", "alembic.ini"],
+        "dirs": ["migrations", "migration", "migrate", "alembic", "seeds", "schema"],
+        "prefixes": [],
+        "contains": []
+      },
+      "words": ["migration", "migrate", "backfill", "schema", "column", "database", "data model"],
+      "items": [
+        { "id": "migration_safety", "ask": "how the migration runs on the real data: its size, locks and duration" },
+        { "id": "compatibility", "ask": "old and new code both working against the data during the deploy (expand and contract)" },
+        { "id": "rollback", "ask": "how the data change is undone, and what a rollback keeps" },
+        { "id": "environments", "ask": "each environment's data it meets, with counts from a lookup" },
+        { "id": "existing_rows", "ask": "existing rows: backfilled, defaulted or left, and why" }
+      ]
+    },
+    {
+      "id": "performance",
+      "title": "Performance",
+      "when": "the change touches a hot path, a query, a loop over stored data, caching or anything the ticket says is slow",
+      "paths": {
+        "ext": [],
+        "names": [],
+        "dirs": ["cache", "caching"],
+        "prefixes": [],
+        "contains": []
+      },
+      "words": ["latency", "slow", "slowness", "performance", "timeout", "timeouts", "throughput", "memory", "cpu", "n+1", "pagination", "cache", "caching", "p95", "p99", "rate limit"],
+      "items": [
+        { "id": "hot_path", "ask": "whether the changed code is on a hot path and how often it runs, from a lookup or the code" },
+        { "id": "cost_per_call", "ask": "what each call costs now: queries, network calls, memory" },
+        { "id": "limits", "ask": "the timeouts, payload sizes and rate limits it meets" },
+        { "id": "measurement", "ask": "how the effect is measured before and after" }
+      ]
+    },
+    {
+      "id": "observability",
+      "title": "Observability",
+      "when": "the change adds or changes alarms, metrics, dashboards, logs or tracing",
+      "paths": {
+        "ext": [],
+        "names": [],
+        "dirs": ["monitoring", "alarms", "alerts", "dashboards", "observability", "telemetry"],
+        "prefixes": [],
+        "contains": ["alarm", "alert", "dashboard", "metric", "telemetry", "otel", "sentry", "datadog", "newrelic"]
+      },
+      "words": ["alarm", "alarms", "alert", "alerts", "alerting", "dashboard", "metric", "metrics", "observability", "tracing", "on-call", "monitoring"],
+      "items": [
+        { "id": "signal", "ask": "the alarm, metric or log that shows it working and the one that shows it failing" },
+        { "id": "thresholds", "ask": "thresholds and periods, from the current baseline" },
+        { "id": "routing", "ask": "who or what is notified" },
+        { "id": "noise", "ask": "the expected volume, so it doesn't alert on noise" }
+      ]
+    }
+  ]
+}

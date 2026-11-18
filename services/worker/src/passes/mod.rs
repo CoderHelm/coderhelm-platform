@@ -1266,6 +1266,9 @@ mod branch_update;
 mod checks;
 pub(crate) mod ci_repro;
 pub mod code_graph;
+/// The repository's code map: brought to the base before planning, given
+/// to the planner and the coder (`common::code_map`).
+pub(crate) mod code_map;
 mod completeness;
 pub mod conventions;
 pub mod conversation;

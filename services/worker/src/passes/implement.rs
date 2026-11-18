@@ -260,10 +260,22 @@ pub async fn run(
     // What outcomes taught the coder here (lessons naming what people
     // changed, and the prompt variant its bandit picked) sits with the
     // repository's own instructions, capped by `rewards::implement_block`.
+    // The repository's code map (`code_map`), brought to the base when the
+    // run planned: the coder starts from it instead of exploring the layout.
+    let (code_map_block, code_map_commit) = match run_id {
+        Some(_) => (
+            super::code_map::block(state, &msg.team_id, &msg.repo_owner, &msg.repo_name).await,
+            super::code_map::commit(state, &msg.team_id, &msg.repo_owner, &msg.repo_name).await,
+        ),
+        None => (String::new(), None),
+    };
     let system = coder_system(
         &msg.repo_owner,
         &msg.repo_name,
-        &format!("{rules_block}{instructions_block}{}", msg.coder_learning),
+        &format!(
+            "{rules_block}{instructions_block}{code_map_block}{}",
+            msg.coder_learning
+        ),
         &msg.team_instructions,
         &tests_block,
     );
@@ -1367,6 +1379,17 @@ pub async fn run(
     // A file this round (or the rounds before it) changed and then put
     // back leaves no commit of its own on the pull request.
     super::round::fold_churn(github, &msg.repo_owner, &msg.repo_name, branch).await;
+    // How much the build explored before its first write, and whether it
+    // started from the code map: kept on the run to compare runs with and
+    // without one.
+    if let Some(rid) = run_id.filter(|_| round_for == super::write_guard::RoundFor::Build) {
+        let e = executor
+            .write_executor
+            .explore
+            .counter
+            .exploration(code_map_commit.clone());
+        super::code_map::record_exploration(state, &msg.team_id, rid, &e).await;
+    }
     Ok(ImplementResult {
         files_modified: files,
         timed_out,
@@ -2224,6 +2247,9 @@ impl<'a> ToolExecutor for WriteToolExecutor<'a> {
             }
         }
         let out = self.execute_tool(name, input).await;
+        if out.is_ok() && is_write_tool(name) {
+            self.explore.counter.wrote();
+        }
         let out = match out {
             Ok(serde_json::Value::String(text)) if is_write_tool(name) => {
                 Ok(json!(match self.check_now_note() {
@@ -4187,6 +4213,8 @@ impl<'a> ToolExecutor for CombinedWriteToolExecutor<'a> {
         name: &str,
         input: &serde_json::Value,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        // Every call counts toward the exploration before the first write.
+        self.write_executor.explore.counter.call();
         if name == "bash" {
             if let Some(out) = self.bash_with_tools(input).await? {
                 return Ok(out);

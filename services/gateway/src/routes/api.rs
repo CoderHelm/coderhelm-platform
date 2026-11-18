@@ -1343,6 +1343,19 @@ pub struct Run {
     /// For a `covered_by_pr` run: the open pull request that already does the
     /// work, and why.
     pub covered_by: Option<RunCoveredBy>,
+    /// Each acceptance criterion of the ticket (or of the plan's criteria
+    /// map) traced to the files and definitions changed for it, the tests
+    /// that cover it, and what proves it on the pull request's head. A row
+    /// whose proof isn't `proven`, or with no code or no tests, is an open
+    /// gap. Absent until the run's pull request has a description built for
+    /// its head.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub traceability: Option<RunTrace>,
+    /// What the run explored: the repository's code map brought to the base
+    /// before planning, and the build's tool calls before its first write.
+    /// Absent for a run that neither planned nor built.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exploration: Option<RunExploration>,
     /// A lesson recorded for the repository when the fix was elsewhere.
     #[schema(example = json!(null))]
     pub lesson: Option<String>,
@@ -1513,6 +1526,124 @@ pub struct RunToolingFailure {
     #[serde(default)]
     #[schema(example = json!(["`cd 'e2e' && (pnpm install --ignore-workspace --frozen-lockfile || pnpm install --ignore-workspace)` failed (exit 1)"]))]
     pub tried: Vec<String>,
+}
+
+/// Each acceptance criterion traced to the code, tests and proof of one
+/// head (`common::trace`).
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct RunTrace {
+    /// The pull request's head the trace is of.
+    #[schema(example = "c0ffee1234567890c0ffee1234567890c0ffee12")]
+    pub head: String,
+    /// One row per criterion.
+    pub rows: Vec<RunTraceRow>,
+}
+
+/// One criterion's row of the trace.
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct RunTraceRow {
+    /// The criterion, as written.
+    #[schema(example = "Only one sport filter chip shows on /camps")]
+    pub criterion: String,
+    /// Where it was written: `ticket` or `plan` (the plan's criteria map).
+    #[schema(example = "ticket")]
+    pub source: String,
+    /// The site path it is about, when it names one.
+    #[serde(default)]
+    #[schema(example = "/camps")]
+    pub page: String,
+    /// The changed files traced to it, each with the definitions it adds
+    /// or changes there.
+    #[serde(default)]
+    pub code: Vec<RunTraceCode>,
+    /// The tests that cover it (`file` or `file › title`).
+    #[serde(default)]
+    #[schema(example = json!(["e2e/camps.spec.ts › shows one chip"]))]
+    pub tests: Vec<String>,
+    /// What proves it on the head.
+    pub proof: RunTraceProof,
+}
+
+/// A changed file traced to a criterion.
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct RunTraceCode {
+    /// The file's path in the repository.
+    #[schema(example = "src/utils/filters.ts")]
+    pub path: String,
+    /// Functions, types and constants it adds or changes.
+    #[serde(default)]
+    #[schema(example = json!(["dedupeBySlug"]))]
+    pub symbols: Vec<String>,
+}
+
+/// What proves a criterion on the head.
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct RunTraceProof {
+    /// `proven`, `not_the_ticket` (passes without the change), `failing`,
+    /// `missing` (no test), `unverified` (a side couldn't run) or `not_run`.
+    #[schema(example = "proven")]
+    pub state: String,
+    /// What ran: `end to end on staging and the preview` or `tests with and
+    /// without the change`; empty when nothing did.
+    #[serde(default)]
+    #[schema(example = "end to end on staging and the preview")]
+    pub by: String,
+    /// What the run showed.
+    #[serde(default)]
+    #[schema(example = "fails on staging (1 failed) and passes on the preview (1 passed)")]
+    pub detail: String,
+}
+
+/// What a run explored, and what it started from.
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct RunExploration {
+    /// The repository's code map, brought to the run's base before
+    /// planning; absent when the run didn't plan.
+    pub code_map: Option<RunCodeMapRefresh>,
+    /// The build's exploration; absent before it built.
+    pub coder: Option<RunCoderExploration>,
+}
+
+/// What bringing the code map to the base did (`common::code_map`).
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct RunCodeMapRefresh {
+    /// The commit the map describes now.
+    #[schema(example = "c0ffee1234567890c0ffee1234567890c0ffee12")]
+    pub commit: String,
+    /// `new`, `current`, `changed` or `unknown changes`.
+    #[schema(example = "changed")]
+    pub why: String,
+    /// Sections kept as they were.
+    #[serde(default)]
+    #[schema(example = json!(["architecture", "stack", "area:apps"]))]
+    pub reused: Vec<String>,
+    /// Sections written again from the base.
+    #[serde(default)]
+    #[schema(example = json!(["build"]))]
+    pub rebuilt: Vec<String>,
+    /// Sections to rebuild that the model left out: the next run rebuilds
+    /// them.
+    #[serde(default)]
+    #[schema(example = json!([]))]
+    pub missed: Vec<String>,
+}
+
+/// The build's tool calls before its first write, and the map it had.
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct RunCoderExploration {
+    /// Tool calls before the first file was written; absent when it wrote
+    /// none.
+    #[schema(example = 4)]
+    pub calls_before_first_write: Option<u32>,
+    /// All the build's tool calls.
+    #[serde(default)]
+    #[schema(example = 31)]
+    pub tool_calls: u32,
+    /// The code map's commit the build started from; absent when it had
+    /// none.
+    #[serde(default)]
+    #[schema(example = "c0ffee1234567890c0ffee1234567890c0ffee12")]
+    pub map_commit: Option<String>,
 }
 
 /// The open pull request that already does a run's work.
@@ -1965,6 +2096,14 @@ fn run_of(
         stop_kind: st("stop_kind").filter(|s| !s.is_empty()),
         tooling_failure: st("tooling_failure").and_then(|s| serde_json::from_str(&s).ok()),
         covered_by: st("covered_by").and_then(|s| serde_json::from_str(&s).ok()),
+        traceability: st(common::trace::FIELD).and_then(|s| serde_json::from_str(&s).ok()),
+        exploration: {
+            let code_map: Option<RunCodeMapRefresh> =
+                st(common::code_map::REFRESH_FIELD).and_then(|s| serde_json::from_str(&s).ok());
+            let coder: Option<RunCoderExploration> =
+                st(common::code_map::EXPLORATION_FIELD).and_then(|s| serde_json::from_str(&s).ok());
+            (code_map.is_some() || coder.is_some()).then_some(RunExploration { code_map, coder })
+        },
         // A lesson recorded for the repository when the fix was elsewhere.
         lesson: st("lesson"),
         // A person closed the run on purpose (`run_close`): who, when, why,

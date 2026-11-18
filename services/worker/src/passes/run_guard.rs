@@ -1359,6 +1359,31 @@ pub struct Ledger {
     /// to (`settle::Record`).
     #[serde(default)]
     pub settle: super::settle::Record,
+    /// The criteria the trace leaves open on the newest head the
+    /// description was built for (`common::trace::coder_items`): open items
+    /// like any check's, so the run converges on them and a fix round works
+    /// them.
+    #[serde(default)]
+    pub trace: TraceGaps,
+}
+
+/// The trace's open items on one head.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct TraceGaps {
+    pub head: String,
+    pub items: Vec<String>,
+}
+
+impl TraceGaps {
+    /// The items for `head`; none for another head (the trace of that head
+    /// hasn't been read yet).
+    pub fn on(&self, head: &str) -> &[String] {
+        if !head.is_empty() && common::ci_repro::same_sha(&self.head, head) {
+            &self.items
+        } else {
+            &[]
+        }
+    }
 }
 
 /// A record larger than this drops its longest text: DynamoDB's item limit is
@@ -1455,6 +1480,10 @@ impl Ledger {
         }
         if let Some(Err(why)) = &self.habits_outcome {
             open.push(proof::check_item("The tests and scope check", why));
+        }
+        // The criteria the trace leaves open hold the draft like a check's.
+        for item in &self.trace.items {
+            open.push(proof::blocked_item("The criteria trace", item));
         }
         open
     }

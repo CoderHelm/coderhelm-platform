@@ -3779,6 +3779,17 @@
               "null"
             ]
           },
+          "exploration": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RunExploration",
+                "description": "What the run explored: the repository's code map brought to the base\nbefore planning, and the build's tool calls before its first write.\nAbsent for a run that neither planned nor built."
+              }
+            ]
+          },
           "files_modified": {
             "description": "The files the run changed.",
             "examples": [
@@ -4162,6 +4173,17 @@
               }
             ]
           },
+          "traceability": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RunTrace",
+                "description": "Each acceptance criterion of the ticket (or of the plan's criteria\nmap) traced to the files and definitions changed for it, the tests\nthat cover it, and what proves it on the pull request's head. A row\nwhose proof isn't `proven`, or with no code or no tests, is an open\ngap. Absent until the run's pull request has a description built for\nits head."
+              }
+            ]
+          },
           "trigger": {
             "$ref": "#/components/schemas/RunTrigger",
             "description": "How the run was started and by whom (as in the runs list)."
@@ -4437,6 +4459,103 @@
         ],
         "type": "object"
       },
+      "RunCodeMapRefresh": {
+        "description": "What bringing the code map to the base did (`common::code_map`).",
+        "properties": {
+          "commit": {
+            "description": "The commit the map describes now.",
+            "examples": [
+              "c0ffee1234567890c0ffee1234567890c0ffee12"
+            ],
+            "type": "string"
+          },
+          "missed": {
+            "description": "Sections to rebuild that the model left out: the next run rebuilds\nthem.",
+            "examples": [
+              []
+            ],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "rebuilt": {
+            "description": "Sections written again from the base.",
+            "examples": [
+              [
+                "build"
+              ]
+            ],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "reused": {
+            "description": "Sections kept as they were.",
+            "examples": [
+              [
+                "architecture",
+                "stack",
+                "area:apps"
+              ]
+            ],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "why": {
+            "description": "`new`, `current`, `changed` or `unknown changes`.",
+            "examples": [
+              "changed"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "commit",
+          "why"
+        ],
+        "type": "object"
+      },
+      "RunCoderExploration": {
+        "description": "The build's tool calls before its first write, and the map it had.",
+        "properties": {
+          "calls_before_first_write": {
+            "description": "Tool calls before the first file was written; absent when it wrote\nnone.",
+            "examples": [
+              4
+            ],
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "map_commit": {
+            "description": "The code map's commit the build started from; absent when it had\nnone.",
+            "examples": [
+              "c0ffee1234567890c0ffee1234567890c0ffee12"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tool_calls": {
+            "description": "All the build's tool calls.",
+            "examples": [
+              31
+            ],
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
       "RunCoveredBy": {
         "description": "The open pull request that already does a run's work.",
         "properties": {
@@ -4671,6 +4790,34 @@
           "what",
           "todo"
         ],
+        "type": "object"
+      },
+      "RunExploration": {
+        "description": "What a run explored, and what it started from.",
+        "properties": {
+          "code_map": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RunCodeMapRefresh",
+                "description": "The repository's code map, brought to the run's base before\nplanning; absent when the run didn't plan."
+              }
+            ]
+          },
+          "coder": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RunCoderExploration",
+                "description": "The build's exploration; absent before it built."
+              }
+            ]
+          }
+        },
         "type": "object"
       },
       "RunMergeStanding": {
@@ -5304,6 +5451,143 @@
         "required": [
           "command",
           "error"
+        ],
+        "type": "object"
+      },
+      "RunTrace": {
+        "description": "Each acceptance criterion traced to the code, tests and proof of one\nhead (`common::trace`).",
+        "properties": {
+          "head": {
+            "description": "The pull request's head the trace is of.",
+            "examples": [
+              "c0ffee1234567890c0ffee1234567890c0ffee12"
+            ],
+            "type": "string"
+          },
+          "rows": {
+            "description": "One row per criterion.",
+            "items": {
+              "$ref": "#/components/schemas/RunTraceRow"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "head",
+          "rows"
+        ],
+        "type": "object"
+      },
+      "RunTraceCode": {
+        "description": "A changed file traced to a criterion.",
+        "properties": {
+          "path": {
+            "description": "The file's path in the repository.",
+            "examples": [
+              "src/utils/filters.ts"
+            ],
+            "type": "string"
+          },
+          "symbols": {
+            "description": "Functions, types and constants it adds or changes.",
+            "examples": [
+              [
+                "dedupeBySlug"
+              ]
+            ],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      },
+      "RunTraceProof": {
+        "description": "What proves a criterion on the head.",
+        "properties": {
+          "by": {
+            "description": "What ran: `end to end on staging and the preview` or `tests with and\nwithout the change`; empty when nothing did.",
+            "examples": [
+              "end to end on staging and the preview"
+            ],
+            "type": "string"
+          },
+          "detail": {
+            "description": "What the run showed.",
+            "examples": [
+              "fails on staging (1 failed) and passes on the preview (1 passed)"
+            ],
+            "type": "string"
+          },
+          "state": {
+            "description": "`proven`, `not_the_ticket` (passes without the change), `failing`,\n`missing` (no test), `unverified` (a side couldn't run) or `not_run`.",
+            "examples": [
+              "proven"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "state"
+        ],
+        "type": "object"
+      },
+      "RunTraceRow": {
+        "description": "One criterion's row of the trace.",
+        "properties": {
+          "code": {
+            "description": "The changed files traced to it, each with the definitions it adds\nor changes there.",
+            "items": {
+              "$ref": "#/components/schemas/RunTraceCode"
+            },
+            "type": "array"
+          },
+          "criterion": {
+            "description": "The criterion, as written.",
+            "examples": [
+              "Only one sport filter chip shows on /camps"
+            ],
+            "type": "string"
+          },
+          "page": {
+            "description": "The site path it is about, when it names one.",
+            "examples": [
+              "/camps"
+            ],
+            "type": "string"
+          },
+          "proof": {
+            "$ref": "#/components/schemas/RunTraceProof",
+            "description": "What proves it on the head."
+          },
+          "source": {
+            "description": "Where it was written: `ticket` or `plan` (the plan's criteria map).",
+            "examples": [
+              "ticket"
+            ],
+            "type": "string"
+          },
+          "tests": {
+            "description": "The tests that cover it (`file` or `file › title`).",
+            "examples": [
+              [
+                "e2e/camps.spec.ts › shows one chip"
+              ]
+            ],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "criterion",
+          "source",
+          "proof"
         ],
         "type": "object"
       },

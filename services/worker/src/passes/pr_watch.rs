@@ -559,6 +559,18 @@ async fn release(state: &WorkerState, c: &Candidate, field: &str, value: &str) {
 
 /// Marks a head's red checks as dealt with (judged not this change's, see
 /// `flaky`): the sweep doesn't send them to the fix loop.
+/// The two-way proof's items for the head, then the trace's
+/// (`common::trace::coder_items`, which already leaves out what the proof
+/// sends), each once: one fix round works them all.
+pub fn with_trace_items(mut items: Vec<String>, trace: Vec<String>) -> Vec<String> {
+    for t in trace {
+        if !items.contains(&t) {
+            items.push(t);
+        }
+    }
+    items
+}
+
 pub(crate) async fn mark_ci_head(state: &WorkerState, team_id: &str, run_id: &str, head: &str) {
     if head.is_empty() {
         return;
@@ -847,12 +859,25 @@ async fn preview(state: &WorkerState, github: &GitHubClient, c: &Candidate) -> P
         CAPTURING.store(false, std::sync::atomic::Ordering::SeqCst);
         proved = fresh;
         let items = common::e2e_proof::coder_items(&proofs, &st.head);
-        if fresh && !items.is_empty() {
-            let queued = super::resume::queue_own_review_round(
-                state, github, &c.team_id, &c.run_id, &st.head, &items,
+        if fresh {
+            // The description is built for this head first: it records the
+            // criteria the trace leaves open on the run's ledger.
+            super::description::rebuild_run(
+                state, github, &c.team_id, &c.run_id, &c.owner, &c.repo, c.pr,
             )
             .await;
-            info!(run_id = %c.run_id, pr = c.pr, items = items.len(), queued = ?matches!(queued, super::resume::OwnRound::Fixing), "PR watch: the two-way proof sent work back to the coder");
+            let trace = super::description::trace_items(
+                state, &c.team_id, &c.run_id, &c.owner, &c.repo, &st.head,
+            )
+            .await;
+            let items = with_trace_items(items, trace);
+            if !items.is_empty() {
+                let queued = super::resume::queue_own_review_round(
+                    state, github, &c.team_id, &c.run_id, &st.head, &items,
+                )
+                .await;
+                info!(run_id = %c.run_id, pr = c.pr, items = items.len(), queued = ?matches!(queued, super::resume::OwnRound::Fixing), "PR watch: the two-way proof and the criteria trace sent work back to the coder");
+            }
         }
     }
     let moved = proved
@@ -861,10 +886,12 @@ async fn preview(state: &WorkerState, github: &GitHubClient, c: &Candidate) -> P
         });
     if moved {
         info!(run_id = %c.run_id, pr = c.pr, stage = ?st.stage, "PR watch: the preview moved; the description follows");
-        super::description::rebuild_run(
-            state, github, &c.team_id, &c.run_id, &c.owner, &c.repo, c.pr,
-        )
-        .await;
+        if !proved {
+            super::description::rebuild_run(
+                state, github, &c.team_id, &c.run_id, &c.owner, &c.repo, c.pr,
+            )
+            .await;
+        }
         super::ready::request_for(
             state,
             &c.team_id,

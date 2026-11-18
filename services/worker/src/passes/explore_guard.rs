@@ -102,6 +102,8 @@ pub struct ExploreGuard {
     kept: Mutex<Vec<(String, String)>>,
     /// The helpers this build added: (path, definition, body).
     added: Mutex<Vec<(String, minimal_change::Def, String)>>,
+    /// The round's tool calls up to its first write (`common::code_map`).
+    pub counter: common::code_map::ExploreCounter,
 }
 
 impl ExploreGuard {

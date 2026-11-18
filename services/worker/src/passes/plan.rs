@@ -299,13 +299,36 @@ pub async fn run(
          for the new behaviour, at its exact path in the suite, following the suite's conventions \
          (page objects, tags, area labels, test map)."
     );
+    // The repository's code map, brought to this run's base: only the
+    // sections the changes since its stamp touched are written again
+    // (`common::code_map`). The planner starts from it instead of
+    // exploring the layout again.
+    let code_map = match super::code_map::refresh(
+        state,
+        github,
+        provider,
+        usage,
+        &msg.team_id,
+        &msg.repo_owner,
+        &msg.repo_name,
+        &msg.base_branch,
+    )
+    .await
+    {
+        Some(m) => {
+            super::code_map::record_refresh(state, &msg.team_id, run_id, &m.record).await;
+            m.block
+        }
+        None => String::new(),
+    };
     let system = format!(
         "You are the planning engineer for the {owner}/{repo} repository. {stance}\
          Research the codebase using the provided tools, then generate an implementation plan \
          that CoderHelm carries out to the end, verification included.\n\n\
          You have access to these repos:\n{repos_list}\n\n\
          All tools default to {owner}/{repo} when the `repo` parameter is omitted. \
-         To explore another repo, pass `repo` as `owner/name` (e.g. `\"{default_repo}\"`).{cross_repo}{instructions_block}{team_block}{tests_block}{feature_block}{smallest}{criteria_map}",
+         To explore another repo, pass `repo` as `owner/name` (e.g. `\"{default_repo}\"`).{cross_repo}{instructions_block}{code_map}{team_block}{tests_block}{feature_block}{smallest}{criteria_map}{nfr}",
+        nfr = common::nfr_check::planner_section(),
         owner = msg.repo_owner,
         repo = msg.repo_name,
         stance = super::ownership::planner_stance(),
@@ -1061,6 +1084,19 @@ Then the ```fix_location.json block described above."#,
     // triggers, a fallback and its test, counts in every environment.
     let release_gaps = super::release_plan::plan_gaps(&draft, &abilities.release);
     back.extend(release_gaps.iter().cloned());
+    // The non-functional checklists (`common::nfr_check`): a change that
+    // reaches infrastructure, CI, auth, data, a hot path or observability
+    // answers its area's items from the code and lookups. A plan gap like
+    // the others: no stop, no approval.
+    let nfr_gaps = common::nfr_check::plan_gaps(
+        &draft.design,
+        &super::feature::plan_files::planned_files(&draft.tasks)
+            .into_iter()
+            .map(|f| f.path)
+            .collect::<Vec<_>>(),
+        &ticket_words,
+    );
+    back.extend(nfr_gaps.iter().cloned());
     // The repository's files, once the repository is settled (`check_files`:
     // a re-plan after a switch or a file mismatch): a task whose tag doesn't
     // match the repository goes back in this same send-back, never in a
