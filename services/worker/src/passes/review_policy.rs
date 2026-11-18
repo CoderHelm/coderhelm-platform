@@ -807,6 +807,7 @@ mod tests {
             body: "review".into(),
             fingerprint: None,
             holding: Vec::new(),
+            posted_body: String::new(),
         }
     }
 

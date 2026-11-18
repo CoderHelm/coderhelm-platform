@@ -464,6 +464,7 @@ impl Sim {
                 body: "review".into(),
                 fingerprint: None,
                 holding: Vec::new(),
+                posted_body: String::new(),
             },
         );
     }
