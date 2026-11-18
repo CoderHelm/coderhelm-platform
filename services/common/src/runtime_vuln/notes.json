@@ -1,0 +1,14 @@
+[
+  {
+    "id": "CVE-2026-114938",
+    "as_of": "2026-11-18",
+    "source": "OpenJDK Vulnerability Group advisory 2026-11-17 (https://openjdk.org/groups/vulnerability/advisories/2026-11-17) with the vendor advisories for the November 2026 updates",
+    "cpu_feature": "avx512_vbmi",
+    "arch": ["x86_64"],
+    "not_arch": ["arm64"],
+    "introduced": [["17", "17.0.6"]],
+    "fixed": [["17", "17.0.21.1"], ["21", "21.0.13.1"], ["25", "25.0.5.1"], ["27", "27.0.1.1"]],
+    "mitigations": ["-XX:-UseBASE64Intrinsics"],
+    "summary": "A heap overflow in the java.util.Base64 decoder's AVX-512 VBMI intrinsic: malformed Base64 reaching the decoder writes past its output buffer. Exploitable only on x86-64 CPUs with AVX-512 VBMI (Intel Ice Lake, Sapphire Rapids and newer; AMD Zen 4 and newer)."
+  }
+]

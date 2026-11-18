@@ -2061,6 +2061,7 @@ pub fn retry_of(
     // (`infra_security::retry_of`); base images have their own runs.
     if unit.ecosystem == common::infra_vuln::records::UNIT_ECOSYSTEM
         || unit.ecosystem == common::base_images::ECOSYSTEM
+        || unit.ecosystem == common::runtime_vuln::ECOSYSTEM
     {
         return None;
     }

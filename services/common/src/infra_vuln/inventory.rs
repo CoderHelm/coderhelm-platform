@@ -373,6 +373,40 @@ pub struct Versions {
     pub runtime: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub package_type: String,
+    /// The instance types that run it (an instance's, a group's, a node
+    /// group's), and the architecture AWS or the code says.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub instance_types: Vec<String>,
+    /// `x86_64` or `arm64`, empty when not known.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub arch: String,
+    /// Installed packages from SSM inventory, `name version-release`, the
+    /// oldest copy across the group (what a fix must replace).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub packages: Vec<String>,
+}
+
+/// Packages kept per resource.
+pub const MAX_PACKAGES: usize = 3_000;
+
+/// Adds `more` to `into`, keeping per package name the oldest version.
+pub fn merge_packages(into: &mut Vec<String>, more: &[String]) {
+    for p in more {
+        let (name, ver) = p.split_once(' ').unwrap_or((p.as_str(), ""));
+        match into
+            .iter()
+            .position(|x| x.split_once(' ').map(|(n, _)| n) == Some(name))
+        {
+            Some(i) => {
+                let old = into[i].split_once(' ').map(|(_, v)| v).unwrap_or("");
+                if super::matching::rpm_lt(ver, old) {
+                    into[i] = p.clone();
+                }
+            }
+            None if into.len() < MAX_PACKAGES => into.push(p.clone()),
+            None => {}
+        }
+    }
 }
 
 /// Whether the internet can reach the resource, and why it was decided.
@@ -715,6 +749,7 @@ pub fn lambdas_from_terraform(
     let runtime = re(r#"(?m)^\s*runtime\s*=\s*"([a-z0-9.]+)""#);
     let package = re(r#"(?m)^\s*package_type\s*=\s*"([A-Za-z]+)""#);
     let fname = re(r#"(?m)^\s*function_name\s*=\s*"([^"$]+)""#);
+    let archs = re(r#"(?m)^\s*architectures\s*=\s*\[\s*"([a-z0-9_]+)""#);
     let mut out = Vec::new();
     let starts: Vec<(usize, String)> = block
         .captures_iter(content)
@@ -749,6 +784,10 @@ pub fn lambdas_from_terraform(
             versions: Versions {
                 runtime: rt,
                 package_type: pt,
+                arch: archs
+                    .captures(body)
+                    .map(|c| c[1].to_string())
+                    .unwrap_or_default(),
                 ..Default::default()
             },
             exposure: Exposure {
@@ -786,6 +825,95 @@ pub fn lambdas_from_terraform(
     out
 }
 
+/// Lambda functions SAM, CloudFormation, Serverless or CDK code defines,
+/// from their runtime declarations (`runtime_vuln::decls`): named by the
+/// key that opens their block, placed at the runtime's line.
+pub fn lambdas_from_templates(
+    repo: &str,
+    path: &str,
+    content: &str,
+    account: &str,
+    region: &str,
+    now: &str,
+) -> Vec<Resource> {
+    if path.ends_with(".tf") {
+        return Vec::new();
+    }
+    let lines: Vec<&str> = content.lines().collect();
+    let key = re(r#"^(\s*)"?([A-Za-z][A-Za-z0-9_-]*)"?\s*:\s*\{?\s*$"#);
+    let mut out = Vec::new();
+    for d in crate::runtime_vuln::decls::lambda_runtimes(path, content) {
+        let at = d.line as usize;
+        let indent = lines
+            .get(at.saturating_sub(1))
+            .map(|l| l.len() - l.trim_start().len())
+            .unwrap_or(0);
+        // The nearest key above at a smaller indent that is not a property block.
+        let name = (0..at.saturating_sub(1))
+            .rev()
+            .filter_map(|i| {
+                key.captures(lines[i])
+                    .map(|c| (c[1].len(), c[2].to_string()))
+            })
+            .find(|(ind, n)| {
+                *ind < indent.saturating_sub(2)
+                    && !matches!(
+                        n.as_str(),
+                        "Properties"
+                            | "Globals"
+                            | "Function"
+                            | "provider"
+                            | "functions"
+                            | "Resources"
+                    )
+            })
+            .map(|(_, n)| n)
+            .unwrap_or_else(|| format!("{}:{}", path, d.line));
+        out.push(Resource {
+            id: format!("iac:{repo}:{path}:{name}"),
+            kind: Kind::LambdaFunction,
+            name: name.clone(),
+            account: account.into(),
+            region: region.into(),
+            group: name.clone(),
+            versions: Versions {
+                runtime: d.package.clone(),
+                package_type: "Zip".into(),
+                ..Default::default()
+            },
+            exposure: Exposure {
+                public: false,
+                why: "Lambda functions have no inbound ports".into(),
+            },
+            defined_in: Some(Location {
+                repo: repo.into(),
+                file: path.into(),
+                address: name,
+                line: d.line,
+                how: "search".into(),
+                tool: String::new(),
+                confidence: Confidence::Medium,
+                evidence: vec!["read from the runtime declaration in this file".into()],
+                edit: Some(Edit {
+                    file: path.into(),
+                    line: d.line,
+                    attribute: "runtime".into(),
+                    value: d.written.clone(),
+                    via: "template".into(),
+                    shared: String::new(),
+                }),
+                environment: super::locate::environment_of(&[path]),
+                ..Default::default()
+            }),
+            source: "iac".into(),
+            seen_at: now.into(),
+            count: 1,
+            ..Default::default()
+        });
+    }
+    out
+}
+
 /// Instances that one fix changes together collapse into their group's
 /// record: one row per launch template or Auto Scaling group, counting
 /// the instances and keeping the oldest AMI seen (what a fix must replace).
@@ -800,6 +928,13 @@ pub fn group_instances(instances: Vec<Resource>) -> Vec<Resource> {
         match by.get_mut(&key) {
             Some(g) => {
                 g.count += i.count.max(1);
+                for t in &i.versions.instance_types {
+                    if !g.versions.instance_types.contains(t) {
+                        g.versions.instance_types.push(t.clone());
+                    }
+                }
+                let mut pkgs = std::mem::take(&mut g.versions.packages);
+                merge_packages(&mut pkgs, &i.versions.packages);
                 g.exposure.public |= i.exposure.public;
                 if i.exposure.public && !g.exposure.why.starts_with("public") {
                     g.exposure.why = i.exposure.why.clone();
@@ -809,9 +944,12 @@ pub fn group_instances(instances: Vec<Resource>) -> Vec<Resource> {
                     (None, Some(_)) => true,
                     _ => false,
                 };
+                let types = std::mem::take(&mut g.versions.instance_types);
                 if older {
                     g.versions = i.versions.clone();
                 }
+                g.versions.packages = pkgs;
+                g.versions.instance_types = types;
                 for h in i.inspector {
                     if !g
                         .inspector

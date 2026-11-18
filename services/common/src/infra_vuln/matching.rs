@@ -27,6 +27,8 @@ use super::actions::{self, Meaning, Tie};
 use super::feeds::{Advisory, Bulletin, Distro, LatestImage, Runtime, Who};
 use super::inventory::{Exposure, Kind, Location, Os, Pending, Resource};
 use super::runbook::{self, PrNotes, Runbook};
+use crate::runtime_vuln::advisories::{RuntimeAdvisory, Standing};
+use crate::runtime_vuln::cpu::{self, Holds};
 use crate::security_fixes::Tier;
 
 /// What kind of fix a finding has.
@@ -159,6 +161,22 @@ pub struct InfraFinding {
     /// `production`, `staging`, ...; empty when not known.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub environment: String,
+    /// Whether the hardware the advisories need is what runs it, when
+    /// every advisory behind the finding names a hardware condition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hardware: Option<HardwareFacts>,
+}
+
+/// The hardware condition on a finding, as the instance types say.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HardwareFacts {
+    pub holds: Holds,
+    /// Why, in a line per instance type.
+    pub why: String,
+    /// What moving it means (to an affected family, when it does not hold
+    /// now).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub if_moved: String,
 }
 
 /// Amazon Inspector's facts on a finding.
@@ -188,6 +206,9 @@ pub struct Feeds<'a> {
     pub kev: &'a BTreeMap<String, String>,
     /// AWS's latest AL2023 AMI per architecture in the resource's region.
     pub latest_al2023: &'a BTreeMap<String, String>,
+    /// Runtime advisories (`runtime_vuln`), for Lambda runtimes and the
+    /// hardware an advisory needs.
+    pub runtime: &'a [RuntimeAdvisory],
     /// YYYY-MM-DD.
     pub today: &'a str,
 }
@@ -228,6 +249,55 @@ pub fn tier(severity: &str, kev: bool, public: bool) -> Tier {
     } else {
         Tier::P3
     }
+}
+
+/// Compares RPM `version-release` strings (`21.0.13.0.11-1.amzn2023.1`
+/// before `21.0.13.1.2-1.amzn2023.1`): segment by segment, numbers as
+/// numbers and words as words, as `rpmvercmp` does; an epoch (`1:`) is
+/// dropped.
+pub fn rpm_lt(a: &str, b: &str) -> bool {
+    fn segs(s: &str) -> Vec<(bool, String)> {
+        let s = match s.split_once(':') {
+            Some((e, rest)) if e.chars().all(|c| c.is_ascii_digit()) => rest,
+            _ => s,
+        };
+        let mut out = Vec::new();
+        let mut cur = String::new();
+        let mut num = false;
+        for c in s.chars() {
+            if c.is_ascii_alphanumeric() {
+                let n = c.is_ascii_digit();
+                if !cur.is_empty() && n != num {
+                    out.push((num, std::mem::take(&mut cur)));
+                }
+                num = n;
+                cur.push(c);
+            } else if !cur.is_empty() {
+                out.push((num, std::mem::take(&mut cur)));
+            }
+        }
+        if !cur.is_empty() {
+            out.push((num, cur));
+        }
+        out
+    }
+    let (x, y) = (segs(a), segs(b));
+    for (p, q) in x.iter().zip(y.iter()) {
+        let o = match (p.0, q.0) {
+            (true, true) => {
+                let (m, n) = (p.1.trim_start_matches('0'), q.1.trim_start_matches('0'));
+                m.len().cmp(&n.len()).then_with(|| m.cmp(n))
+            }
+            (false, false) => p.1.cmp(&q.1),
+            // A number is newer than a word.
+            (true, false) => std::cmp::Ordering::Greater,
+            (false, true) => std::cmp::Ordering::Less,
+        };
+        if o != std::cmp::Ordering::Equal {
+            return o == std::cmp::Ordering::Less;
+        }
+    }
+    x.len() < y.len()
 }
 
 /// Compares dotted versions (`1.68.1` and `1.67.0`, `2023.12.20261102`).
@@ -366,6 +436,7 @@ fn finding(r: &Resource, key: &str, title: String, hits: Hits, fix: Fix) -> Infr
         exposure: r.exposure.clone(),
         fix,
         inspector: None,
+        hardware: None,
         environment: r
             .defined_in
             .as_ref()
@@ -693,6 +764,7 @@ fn match_lambda(r: &Resource, feeds: &Feeds, out: &mut Vec<InfraFinding>) {
         // findings cover it.
         return;
     }
+    lambda_runtime_advisories(r, feeds, out);
     if let Some(runtime) = feeds.runtimes.iter().find(|x| &x.id == rt) {
         if runtime.deprecated_at(feeds.today) {
             let next = feeds
@@ -761,6 +833,101 @@ fn match_lambda(r: &Resource, feeds: &Feeds, out: &mut Vec<InfraFinding>) {
             );
         }
     }
+}
+
+/// A Lambda function on a managed runtime whose line a runtime advisory
+/// affects (`java21`): AWS ships the fixed build in the managed runtime, so
+/// the row is AWS-managed, with how the function's update mode takes it.
+fn lambda_runtime_advisories(r: &Resource, feeds: &Feeds, out: &mut Vec<InfraFinding>) {
+    let rt = r.versions.runtime.to_ascii_lowercase();
+    let Some(line) = rt
+        .strip_prefix("java")
+        .map(|l| l.trim_end_matches(".al2").to_string())
+    else {
+        return;
+    };
+    let arch = if r.versions.arch.is_empty() {
+        "x86_64"
+    } else {
+        r.versions.arch.as_str()
+    };
+    // One row per function: every advisory that affects its line.
+    let mut hits = Hits::new();
+    let mut fixed: Vec<String> = Vec::new();
+    let mut hardware: Vec<String> = Vec::new();
+    for adv in feeds
+        .runtime
+        .iter()
+        .filter(|a| a.runtime == crate::runtime_vuln::Runtime::Java)
+    {
+        let (st, l) = crate::runtime_vuln::advisories::standing(adv, &line, false);
+        if st == Standing::NotAffected {
+            continue;
+        }
+        if let Some(l) = l {
+            let f = if l.vendor_fixed.is_empty() {
+                l.fixed.clone()
+            } else {
+                l.vendor_fixed.join(", ")
+            };
+            if !f.is_empty() && !fixed.contains(&f) {
+                fixed.push(f);
+            }
+        }
+        if !adv.hardware.is_empty() {
+            let (h, why) = cpu::holds(
+                &adv.hardware,
+                &cpu::cpu_of("", arch),
+                &format!("this function ({arch})"),
+            );
+            hardware.push(match h {
+                Holds::No => format!("{}: {why}.", adv.id),
+                _ => format!(
+                    "{}: {why}; Lambda does not say which x86 CPU runs a function.",
+                    adv.id
+                ),
+            });
+        }
+        hits.add_cves(std::slice::from_ref(&adv.id), feeds.kev);
+        hits.severity(adv.severity());
+        hits.sources.push(Source {
+            id: adv.id.clone(),
+            kind: "runtime".into(),
+            url: adv.url.clone(),
+            severity: adv.severity().into(),
+        });
+    }
+    if hits.sources.is_empty() {
+        return;
+    }
+    let n = hits.cves.len();
+    out.push(finding(
+        r,
+        &format!("aws:runtime:{rt}"),
+        format!(
+            "Lambda {} ({rt}): AWS-managed runtime ({n} runtime advisor{})",
+            r.name,
+            if n == 1 { "y" } else { "ies" }
+        ),
+        hits,
+        Fix {
+            kind: Some(FixKind::Aws),
+            summary: "AWS-managed, nothing to do".into(),
+            reason: format!(
+                "AWS patches the {rt} managed runtime{}. A function on the Auto runtime update mode takes it on its own; one set to Function update takes it on its next deploy; one set to Manual stays on its pinned runtime version until that is changed.{}",
+                if fixed.is_empty() {
+                    String::new()
+                } else {
+                    format!(" with the fixed build ({})", fixed.join(", "))
+                },
+                hardware
+                    .iter()
+                    .map(|h| format!(" {h}"))
+                    .collect::<String>()
+            ),
+            ..Default::default()
+        },
+    ));
 }
 
 /// What a stored pending row means: its own reading, or, for a row saved
@@ -1431,7 +1598,259 @@ pub fn findings(resources: &[Resource], feeds: &Feeds) -> Vec<InfraFinding> {
     out
 }
 
+/// One source package's hits: the advisories, `(binary, installed, fixed)`
+/// per package, and the advisory ids.
+type PackageHits = (Hits, Vec<(String, String, String)>, Vec<String>);
+
+/// The installed packages SSM inventory lists, against every Amazon Linux
+/// advisory for a package other than the kernel (an AMI's kernel is
+/// [`match_ami`]'s): one finding per affected source package, a runbook
+/// (packages are updated on the instances, or baked into the next AMI).
+fn match_packages(r: &Resource, feeds: &Feeds, out: &mut Vec<InfraFinding>) {
+    if r.versions.packages.is_empty() {
+        return;
+    }
+    let installed: BTreeMap<&str, &str> = r
+        .versions
+        .packages
+        .iter()
+        .filter_map(|p| p.split_once(' '))
+        .collect();
+    let distro_of = |v: &str| {
+        if v.contains("amzn2023") {
+            Some(Distro::Al2023)
+        } else if v.contains("amzn2") {
+            Some(Distro::Al2)
+        } else {
+            None
+        }
+    };
+    // Source package to (hits, (binary, installed, fixed), advisory ids).
+    let mut by: BTreeMap<String, PackageHits> = BTreeMap::new();
+    for a in feeds
+        .advisories
+        .iter()
+        .filter(|a| a.distro != Distro::Bottlerocket && !a.is_kernel() && !a.fixed.is_empty())
+    {
+        for p in &a.fixed {
+            let Some(v) = installed.get(p.name.as_str()) else {
+                continue;
+            };
+            if distro_of(v) != Some(a.distro) {
+                continue;
+            }
+            let fixed = format!("{}-{}", p.version, p.release);
+            if !rpm_lt(v, &fixed) {
+                continue;
+            }
+            let e = by
+                .entry(a.package.clone())
+                .or_insert_with(|| (Hits::new(), Vec::new(), Vec::new()));
+            e.0.advisory(a, feeds.kev);
+            match e.1.iter_mut().find(|(n, _, _)| n == &p.name) {
+                Some(x) => {
+                    if rpm_lt(&x.2, &fixed) {
+                        x.2 = fixed;
+                    }
+                }
+                None => e.1.push((p.name.clone(), v.to_string(), fixed)),
+            }
+            if !e.2.contains(&a.id) {
+                e.2.push(a.id.clone());
+            }
+        }
+    }
+    for (source, (hits, pkgs, ids)) in by {
+        let al2023 = pkgs.iter().any(|(_, v, _)| v.contains("amzn2023"));
+        let names: Vec<String> = pkgs.iter().map(|(n, _, _)| n.clone()).collect();
+        let from = pkgs
+            .iter()
+            .map(|(n, v, _)| format!("{n} {v}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let to = pkgs
+            .iter()
+            .map(|(_, _, f)| f.clone())
+            .max_by(|a, b| {
+                if rpm_lt(a, b) {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Greater
+                }
+            })
+            .unwrap_or_default();
+        let mut cli = vec![if al2023 {
+            format!(
+                "sudo dnf upgrade -y {}",
+                ids.iter()
+                    .map(|i| format!("--advisory {i}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            )
+        } else {
+            format!("sudo yum update -y {}", names.join(" "))
+        }];
+        let jvm = source.starts_with("java-");
+        if jvm {
+            cli.push("Restart every service that runs on this JVM (it keeps the old build in memory until it restarts)".into());
+        }
+        let flags: Vec<String> = feeds
+            .runtime
+            .iter()
+            .filter(|ra| hits.cves.iter().any(|c| c.eq_ignore_ascii_case(&ra.id)))
+            .flat_map(|ra| ra.mitigations.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let reason = if flags.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "Until the update runs: start the JVM with {} (for example in JAVA_TOOL_OPTIONS), and remove it once the fixed build runs.",
+                flags.join(" ")
+            )
+        };
+        let what = match r.kind {
+            Kind::AutoScalingGroup => "the group's instances",
+            Kind::EksNodegroup => "the node group's nodes",
+            _ => "the instance",
+        };
+        let fix = Fix {
+            kind: Some(FixKind::Runbook),
+            summary: format!("Update {source} to {to} on {what}"),
+            location: r.defined_in.clone(),
+            from,
+            to: to.clone(),
+            cli,
+            console: "Systems Manager > Run Command > AWS-RunPatchBaseline (or Patch Manager), or an AMI with the update".into(),
+            reason,
+            decision: format!(
+                "A runbook: an installed package is updated on {what} (or baked into the next AMI it starts from); nothing in infrastructure code pins a package version."
+            ),
+            ..Default::default()
+        };
+        out.push(finding(
+            r,
+            &format!("pkg:{source}:{to}"),
+            format!(
+                "{} {}: {source} {} (fixed in {to})",
+                r.kind.label(),
+                r.name,
+                pkgs.first().map(|(_, v, _)| v.as_str()).unwrap_or("")
+            ),
+            hits,
+            fix,
+        ));
+    }
+}
+
+/// When every CVE behind a finding has a runtime advisory that names the
+/// hardware it needs: whether the resource's instance types have it. It
+/// holds: the top of the finding's exposure (P0 when internet-facing, else
+/// at least P1). It does not: P3, with the reason and what moving to an
+/// affected family would mean. Not known: the tier stays as matched.
+fn apply_hardware(f: &mut InfraFinding, r: &Resource, feeds: &Feeds) {
+    if f.cves.is_empty() || f.fix.kind == Some(FixKind::Aws) {
+        return;
+    }
+    let advs: Vec<&RuntimeAdvisory> = f
+        .cves
+        .iter()
+        .filter_map(|c| {
+            feeds
+                .runtime
+                .iter()
+                .find(|a| a.id.eq_ignore_ascii_case(c) && !a.hardware.is_empty())
+        })
+        .collect();
+    if advs.len() != f.cves.len() {
+        return;
+    }
+    let types: Vec<String> = if r.versions.instance_types.is_empty() {
+        vec![String::new()]
+    } else {
+        r.versions.instance_types.clone()
+    };
+    let mut results: Vec<(Holds, String)> = Vec::new();
+    for t in &types {
+        let c = cpu::cpu_of(t, &r.versions.arch);
+        let label = if t.is_empty() {
+            "the instance type (not read)".to_string()
+        } else {
+            t.clone()
+        };
+        // Holds when any advisory's condition holds.
+        let mut best = (Holds::No, String::new());
+        for a in &advs {
+            let h = cpu::holds(&a.hardware, &c, &label);
+            if h.0 == Holds::Yes
+                || (h.0 == Holds::Unknown && best.0 == Holds::No)
+                || best.1.is_empty()
+            {
+                best = h;
+            }
+        }
+        results.push(best);
+    }
+    let holds = if results.iter().any(|(h, _)| *h == Holds::Yes) {
+        Holds::Yes
+    } else if results.iter().all(|(h, _)| *h == Holds::No) {
+        Holds::No
+    } else {
+        Holds::Unknown
+    };
+    let why = results
+        .iter()
+        .map(|(_, w)| w.clone())
+        .collect::<Vec<_>>()
+        .join("; ");
+    let feature = advs
+        .iter()
+        .map(|a| a.hardware.cpu_feature.as_str())
+        .find(|f| !f.is_empty())
+        .unwrap_or("");
+    let if_moved = match holds {
+        Holds::No if !feature.is_empty() => format!(
+            "Moving it to {} makes this exploitable: its tier rises when a read sees that.",
+            cpu::families_with(feature)
+        ),
+        Holds::No => {
+            "Moving it to x86-64 makes this exploitable: its tier rises when a read sees that."
+                .into()
+        }
+        _ => String::new(),
+    };
+    f.tier = match holds {
+        Holds::Yes => Some(if f.exposure.public {
+            Tier::P0
+        } else {
+            f.tier.map_or(Tier::P1, |t| t.min(Tier::P1))
+        }),
+        Holds::No => Some(Tier::P3),
+        Holds::Unknown => f.tier,
+    };
+    f.hardware = Some(HardwareFacts {
+        holds,
+        why,
+        if_moved,
+    });
+}
+
 fn match_one(r: &Resource, feeds: &Feeds, out: &mut Vec<InfraFinding>) {
+    let start = out.len();
+    if matches!(
+        r.kind,
+        Kind::AutoScalingGroup | Kind::Ec2Instance | Kind::EksNodegroup
+    ) {
+        match_packages(r, feeds, out);
+    }
+    match_runs(r, feeds, out);
+    for f in &mut out[start..] {
+        apply_hardware(f, r, feeds);
+    }
+}
+
+fn match_runs(r: &Resource, feeds: &Feeds, out: &mut Vec<InfraFinding>) {
     {
         if !r.inspector.is_empty()
             && matches!(
@@ -1545,6 +1964,7 @@ mod tests {
             latest: &[],
             kev: &kev,
             latest_al2023: &raw.latest_al2023,
+            runtime: &[],
             today: "2026-11-10",
         };
         findings(&resources, &f)
@@ -1704,6 +2124,7 @@ mod tests {
                 latest: &[],
                 kev: &BTreeMap::new(),
                 latest_al2023: &BTreeMap::new(),
+                runtime: &[],
                 today: "2026-11-12",
             },
         );
@@ -1739,6 +2160,7 @@ mod tests {
                 latest: &[],
                 kev: &kev,
                 latest_al2023: &latest,
+                runtime: &[],
                 today: "2026-11-10",
             },
         );
@@ -1803,6 +2225,7 @@ mod tests {
                 latest: &[],
                 kev: &kev,
                 latest_al2023: &latest,
+                runtime: &[],
                 today: "2026-11-10",
             },
         );
@@ -1864,6 +2287,7 @@ mod tests {
                 latest: &[],
                 kev: &kev,
                 latest_al2023: &latest,
+                runtime: &[],
                 today: "2026-11-10",
             },
         );
@@ -1894,6 +2318,7 @@ mod tests {
             latest: &[],
             kev,
             latest_al2023: latest,
+            runtime: &[],
             today: "2026-11-13",
         }
     }

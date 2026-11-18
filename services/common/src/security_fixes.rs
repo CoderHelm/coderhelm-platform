@@ -2336,6 +2336,7 @@ pub fn ecosystem_label(ecosystem: &str) -> Option<&'static str> {
         "rubygems" | "gem" | "bundler" => "ruby",
         "cargo" | "crates.io" | "rust" => "rust",
         "docker" => "docker",
+        "runtime" => "runtime",
         "actions" | "github actions" | "github" => "github_actions",
         "nuget" => ".NET",
         "composer" | "packagist" => "php",
@@ -2954,6 +2955,9 @@ pub fn ticket_body_with(
 ) -> String {
     if unit.ecosystem == crate::base_images::ECOSYSTEM {
         return crate::base_images::ticket_body(unit, members);
+    }
+    if unit.ecosystem == crate::runtime_vuln::ECOSYSTEM {
+        return crate::runtime_vuln::findings::ticket_body(unit, members);
     }
     let mut s = String::new();
     s.push_str(&format!(
@@ -4955,7 +4959,7 @@ pub fn match_github_advisory(repo: &str, adv: &Value, deps: &[Dep]) -> Vec<Obser
 /// The OSV `querybatch` body for a repository's dependencies.
 pub fn osv_queries(deps: &[Dep]) -> Vec<Value> {
     deps.iter()
-        .filter(|d| d.ecosystem != "docker")
+        .filter(|d| d.ecosystem != "docker" && d.ecosystem != crate::runtime_vuln::ECOSYSTEM)
         .map(|d| json!({"package": {"name": d.name, "ecosystem": d.ecosystem}, "version": d.version}))
         .collect()
 }

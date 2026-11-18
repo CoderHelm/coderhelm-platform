@@ -303,6 +303,7 @@ fn find(resources: &[Resource], today: &str) -> Vec<InfraFinding> {
             latest: &[],
             kev: &kev,
             latest_al2023: &latest,
+            runtime: &[],
             today,
         },
     )

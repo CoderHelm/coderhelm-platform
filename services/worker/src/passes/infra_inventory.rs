@@ -137,6 +137,14 @@ async fn read_ec2(s: &Session, raw: &mut RawAccount) {
                             image_id: i.image_id().unwrap_or("").into(),
                             launch_time: i.launch_time().map(|t| t.to_string()).unwrap_or_default(),
                             public_ip: i.public_ip_address().is_some_and(|a| !a.is_empty()),
+                            instance_type: i
+                                .instance_type()
+                                .map(|t| t.as_str().to_string())
+                                .unwrap_or_default(),
+                            architecture: i
+                                .architecture()
+                                .map(|a| a.as_str().to_string())
+                                .unwrap_or_default(),
                             tags: tags_of(
                                 i.tags()
                                     .iter()
@@ -379,6 +387,7 @@ async fn read_eks(s: &Session, raw: &mut RawAccount) {
                                 .tags()
                                 .map(|t| tags_of(t.iter().map(|(k, v)| (k.as_str(), v.as_str()))))
                                 .unwrap_or_default(),
+                            instance_types: n.instance_types().to_vec(),
                         });
                     }
                 }
@@ -869,7 +878,34 @@ async fn read_opensearch(s: &Session, raw: &mut RawAccount) {
     }
 }
 
-/// Kernels of SSM-managed instances, and AWS's latest AL2023 AMIs here.
+/// Instances whose installed packages are read per account and region.
+const MAX_PACKAGE_INSTANCES: usize = 100;
+/// Pages of 50 inventory entries read per instance (a host has about 500
+/// to 1,500 packages).
+const MAX_PACKAGE_PAGES: usize = 40;
+
+/// SSM inventory's `AWS:Application` entry as `(name, version-release)`.
+fn package_of(e: &std::collections::HashMap<String, String>) -> Option<(String, String)> {
+    let name = e.get("Name")?.trim();
+    let version = e.get("Version").map(String::as_str).unwrap_or("").trim();
+    if name.is_empty() || version.is_empty() {
+        return None;
+    }
+    let release = e.get("Release").map(String::as_str).unwrap_or("").trim();
+    let epoch = e.get("Epoch").map(String::as_str).unwrap_or("").trim();
+    let mut v = if release.is_empty() {
+        version.to_string()
+    } else {
+        format!("{version}-{release}")
+    };
+    if !epoch.is_empty() && epoch != "0" && !v.contains(':') {
+        v = format!("{epoch}:{v}");
+    }
+    Some((name.to_string(), v))
+}
+
+/// Every package of SSM-managed instances (bounded), the kernels among
+/// them, and AWS's latest AL2023 AMIs here.
 async fn read_ssm(s: &Session, raw: &mut RawAccount) {
     let ssm = client!(aws_sdk_ssm, s);
     let names: Vec<String> = common::infra_vuln::feeds::AL2023_PARAMETERS
@@ -890,58 +926,88 @@ async fn read_ssm(s: &Session, raw: &mut RawAccount) {
         }
         Err(e) => note!(raw, "GetParameters", e),
     }
-    let ids: Vec<String> = raw
-        .instances
-        .iter()
-        .map(|i| i.id.clone())
-        .take(25)
-        .collect();
-    for id in ids {
-        let f = aws_sdk_ssm::types::InventoryFilter::builder()
-            .key("AWS:Application.Name")
-            .values("kernel")
-            .r#type(aws_sdk_ssm::types::InventoryQueryOperatorType::Equal)
-            .build();
-        let Ok(f) = f else {
-            continue;
-        };
-        match ssm
-            .list_inventory_entries()
-            .instance_id(&id)
-            .type_name("AWS:Application")
-            .filters(f)
-            .max_results(10)
-            .send()
-            .await
-        {
-            Ok(o) => {
-                // The newest kernel package is the one that boots after a reboot;
-                // the running one may be older until then.
-                let mut best = String::new();
-                for e in o.entries() {
-                    let v = format!(
-                        "{}-{}",
-                        e.get("Version").map(String::as_str).unwrap_or(""),
-                        e.get("Release").map(String::as_str).unwrap_or("")
-                    );
-                    if v > best {
-                        best = v;
+    // Instances in different Auto Scaling groups and node groups first, so
+    // the cap reaches every group before a second copy of one.
+    let group = |i: &RawInstance| {
+        i.tags
+            .iter()
+            .find(|(k, _)| k == "aws:autoscaling:groupName" || k == "eks:nodegroup-name")
+            .map(|(_, v)| v.clone())
+            .unwrap_or_else(|| i.id.clone())
+    };
+    let mut seen = BTreeSet::new();
+    let mut ids: Vec<String> = Vec::new();
+    for pass in 0..2 {
+        for i in &raw.instances {
+            let first = seen.insert(group(i));
+            if (pass == 0 && first) || (pass == 1 && !ids.contains(&i.id)) {
+                ids.push(i.id.clone());
+            }
+        }
+    }
+    // Past the cap, an instance's packages are not read; its kind's read
+    // stays complete (what was not read is not gone, it is not matched).
+    if ids.len() > MAX_PACKAGE_INSTANCES {
+        warn!(
+            account = %raw.account,
+            instances = ids.len(),
+            "infra inventory: packages read for the first {MAX_PACKAGE_INSTANCES} instances only"
+        );
+    }
+    'instances: for id in ids.into_iter().take(MAX_PACKAGE_INSTANCES) {
+        let mut token: Option<String> = None;
+        let mut list: Vec<(String, String)> = Vec::new();
+        for _ in 0..MAX_PACKAGE_PAGES {
+            match ssm
+                .list_inventory_entries()
+                .instance_id(&id)
+                .type_name("AWS:Application")
+                .max_results(50)
+                .set_next_token(token.take())
+                .send()
+                .await
+            {
+                Ok(o) => {
+                    list.extend(o.entries().iter().filter_map(package_of));
+                    token = o.next_token().map(String::from);
+                    if token.is_none() {
+                        break;
                     }
                 }
-                if !best.is_empty() && best != "-" {
-                    raw.kernels.push((id, best));
-                }
-            }
-            // Instances not managed by SSM say so; that's not a missing permission.
-            Err(e) => {
-                if e.as_service_error().is_some_and(|x| {
-                    use aws_sdk_dynamodb::error::ProvideErrorMetadata;
-                    x.code() == Some("AccessDeniedException")
-                }) {
-                    note!(raw, "ListInventoryEntries", e);
+                // Instances not managed by SSM say so; that's not a missing permission.
+                Err(e) => {
+                    if e.as_service_error().is_some_and(|x| {
+                        use aws_sdk_dynamodb::error::ProvideErrorMetadata;
+                        x.code() == Some("AccessDeniedException")
+                    }) {
+                        note!(raw, "ListInventoryEntries", e);
+                        break 'instances;
+                    }
                     break;
                 }
             }
+        }
+        // The newest kernel package is the one that boots after a reboot;
+        // the running one may be older until then.
+        let kernel = list
+            .iter()
+            .filter(|(n, _)| n == "kernel")
+            .map(|(_, v)| v.clone())
+            .max_by(|a, b| {
+                if common::infra_vuln::matching::rpm_lt(a, b) {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Greater
+                }
+            });
+        if let Some(k) = kernel {
+            raw.kernels.push((id.clone(), k));
+        }
+        if !list.is_empty() {
+            raw.packages.push(common::infra_vuln::raw::RawPackages {
+                instance: id,
+                packages: list,
+            });
         }
     }
 }
@@ -1515,6 +1581,14 @@ async fn place(
         BTreeSet::new()
     };
     for f in &files {
+        if !f.path.ends_with(".tf") {
+            let dir = f.path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+            if !uncalled.contains(&format!("{}:{dir}", f.repo)) {
+                resources.extend(inv::lambdas_from_templates(
+                    &f.repo, &f.path, &f.content, account, region, &now,
+                ));
+            }
+        }
         if f.path.ends_with(".tf") {
             let dir = f.path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
             let found =

@@ -78,6 +78,15 @@ pub async fn bulletins(dynamo: &aws_sdk_dynamodb::Client, table: &str) -> Vec<Bu
     all(dynamo, table, super::BULLETIN_PREFIX).await
 }
 
+/// The runtime advisories (`runtime_vuln::advisories`), as the daily read
+/// stored them with what Amazon Linux and the notes add.
+pub async fn runtime_advisories(
+    dynamo: &aws_sdk_dynamodb::Client,
+    table: &str,
+) -> Vec<crate::runtime_vuln::advisories::RuntimeAdvisory> {
+    all(dynamo, table, crate::runtime_vuln::ADVISORY_PREFIX).await
+}
+
 pub async fn runtimes(dynamo: &aws_sdk_dynamodb::Client, table: &str) -> Vec<Runtime> {
     get(dynamo, table, super::RUNTIMES_SK)
         .await

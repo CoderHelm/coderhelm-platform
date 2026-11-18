@@ -187,6 +187,7 @@ pub async fn match_team(state: &WorkerState, team_id: &str) -> Vec<Record> {
     let advisories = store::advisories(&state.dynamo, table).await;
     let bulletins = store::bulletins(&state.dynamo, table).await;
     let runtimes = store::runtimes(&state.dynamo, table).await;
+    let runtime_advisories = store::runtime_advisories(&state.dynamo, table).await;
     let images = store::latest_images(&state.dynamo, table).await;
     let kev = kev(state).await;
     let today = Utc::now().format("%Y-%m-%d").to_string();
@@ -204,6 +205,7 @@ pub async fn match_team(state: &WorkerState, team_id: &str) -> Vec<Record> {
             latest: &images,
             kev: &kev,
             latest_al2023: latest.get(account).unwrap_or(&empty),
+            runtime: &runtime_advisories,
             today: &today,
         };
         fresh.extend(matching::findings(res, &feeds));
