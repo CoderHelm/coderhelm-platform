@@ -774,7 +774,7 @@ mod tests {
         assert!(!aws::opens_without_private_id(&sts, &t).await);
         let session = aws::assume(&sts, &t, "integration-test").await.unwrap();
 
-        let report = connect_checks(Ok(session.clone()), &t).await;
+        let report = connect_checks(Ok(session.clone().into_session()), &t).await;
         for c in &report.checks {
             println!("check {} ok={} {}", c.id, c.ok, c.detail);
         }

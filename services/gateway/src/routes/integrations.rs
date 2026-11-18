@@ -314,14 +314,12 @@ pub fn aws_missing(a: &AwsAccount) -> Vec<&'static str> {
     out
 }
 
-/// The account is the self-hosted install's own. Its read-only permissions
-/// arrive with the install's version updates, so no update stack is offered.
+/// The account's last check ran on the install's own role (a check from
+/// before every read went through the team's role). Reads of the account,
+/// the install's own included, are made with the team's role, so its update
+/// stack is offered everywhere once the account is checked again.
 pub fn install_account(a: &AwsAccount) -> bool {
     a.permissions.as_ref().is_some_and(|p| p.install_account)
-        || common::live::aws::in_install_account(
-            &a.role_arn,
-            common::live::aws::install_read_role().as_deref(),
-        )
 }
 
 /// The one-click update stack's link, when the role lacks something and a

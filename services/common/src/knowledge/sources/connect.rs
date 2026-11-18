@@ -112,6 +112,7 @@ impl Env {
         // every bucket the role may read.
         crate::live::aws::assume_exact(&a.sts, &target, &a.actor)
             .await
+            .map(crate::live::aws::TeamSession::into_session)
             .map_err(|e| ConnectorError::Reconnect(format!("{} {}", e.message, e.fix)))
     }
 }

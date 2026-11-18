@@ -22,7 +22,7 @@ use std::io::{BufRead, BufReader, Read as _};
 use chrono::{DateTime, TimeZone, Utc};
 use serde_json::Value;
 
-use crate::live::aws::Session;
+use crate::live::aws::{Session, TeamSession};
 
 /// Most objects read in one lookup (four hours of five-minute files).
 pub const MAX_OBJECTS: usize = 48;
@@ -438,7 +438,7 @@ fn s3_client(s: &Session, region: &str) -> aws_sdk_s3::Client {
 /// Reads the rule's matches from the log objects in `[start, end]` (at
 /// most [`MAX_WINDOW_SECS`], newest first, within the bounds above).
 pub async fn read(
-    session: &Session,
+    session: &TeamSession,
     loc: &LogLocation,
     rule: &str,
     start: i64,

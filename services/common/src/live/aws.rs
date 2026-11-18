@@ -513,26 +513,6 @@ pub fn in_install_account(role_arn: &str, own: Option<&str>) -> bool {
     })
 }
 
-/// What to read through instead of `target`, when `target` is the log
-/// reader a person created in the install's own account: the install's own
-/// role, whose permissions arrive with each version update. `None` for any
-/// other role or account (the data-source role, another account, the
-/// hosted deployment). Connecting still proves the person's role with the
-/// team's private ID; this only changes how a connected account is read.
-pub fn install_target(target: &AwsTarget, own: Option<&str>) -> Option<AwsTarget> {
-    let own = own?;
-    let name = target.role_arn.rsplit('/').next().unwrap_or("");
-    // A database or a warehouse is read through the role stack's own
-    // groups (DatabaseClusters, Warehouses), never the install's role.
-    let data = !target.cluster_arn.is_empty() || !target.cluster_id.is_empty();
-    (name == LOG_READER_ROLE && !data && in_install_account(&target.role_arn, Some(own))).then(
-        || AwsTarget {
-            role_arn: own.to_string(),
-            ..target.clone()
-        },
-    )
-}
-
 /// A session on the function's own role (its environment's credentials),
 /// in `region`. `None` outside Lambda.
 pub fn own_session(region: &str) -> Option<Session> {
@@ -545,21 +525,87 @@ pub fn own_session(region: &str) -> Option<Session> {
     })
 }
 
+/// A session on the team's own role (the one connected for the account,
+/// taken on with the team's private ID). It is the only session a read of a
+/// team's AWS data accepts: it is made only by [`assume`] and
+/// [`assume_exact`], so the install's own role ([`own_session`]) or the
+/// function's ambient credentials can never read a team's data in its name.
+/// A run and the re-check of a waiting run (`role_wait`) both take it with
+/// [`assume`], so they ask AWS as the same principal.
+#[derive(Clone, Debug)]
+pub struct TeamSession {
+    session: Session,
+    role_arn: String,
+}
+
+impl TeamSession {
+    /// The team's role this session is on.
+    pub fn role_arn(&self) -> &str {
+        &self.role_arn
+    }
+
+    /// The same team role in another region.
+    pub fn in_region(&self, region: &str) -> TeamSession {
+        TeamSession {
+            session: Session {
+                region: region.to_string(),
+                ..self.session.clone()
+            },
+            role_arn: self.role_arn.clone(),
+        }
+    }
+
+    /// The keys, for a client a team read builds.
+    pub fn into_session(self) -> Session {
+        self.session
+    }
+}
+
+impl std::ops::Deref for TeamSession {
+    type Target = Session;
+    fn deref(&self) -> &Session {
+        &self.session
+    }
+}
+
+/// Pure: the role or user AWS refused, from an AccessDenied message
+/// ("User: arn:aws:sts::111122223333:assumed-role/NAME/session is not
+/// authorized to perform: ..."): `NAME`. `None` when the message names none.
+pub fn refused_principal(message: &str) -> Option<String> {
+    let arn = message.split_whitespace().find(|w| {
+        w.starts_with("arn:aws")
+            && (w.contains(":assumed-role/") || w.contains(":user/") || w.contains(":role/"))
+    })?;
+    let arn = arn.trim_end_matches([',', '.', ';']);
+    let rest = arn
+        .split_once(":assumed-role/")
+        .or_else(|| arn.split_once(":role/"))
+        .or_else(|| arn.split_once(":user/"))?
+        .1;
+    let name = rest.split('/').next().unwrap_or("");
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// Pure: AWS refused a principal that isn't the team's role `role_arn`
+/// (CoderHelm read with the wrong role): the refused principal's name. A
+/// refusal of the team's own role, or one that names nobody, is `None`.
+pub fn refused_other_principal(message: &str, role_arn: &str) -> Option<String> {
+    let name = refused_principal(message)?;
+    let team = role_arn.rsplit('/').next().unwrap_or("");
+    (name != team).then_some(name)
+}
+
 /// Takes on a team's role. `actor` names the session in the team's AWS
-/// records (`reviewer`, `planner`, a person's email). In a self-hosted
-/// install's own account the log reader is read with the install's own role
-/// ([`install_target`]).
+/// records (`reviewer`, `planner`, a person's email). Always the team's
+/// own role, also in a self-hosted install's own account: a read of a
+/// team's data is made, and refused, as the team's role, and the role's
+/// one-click update stack is what adds a read.
 pub async fn assume(
     sts: &aws_sdk_sts::Client,
     target: &AwsTarget,
     actor: &str,
-) -> Result<Session, StepError> {
+) -> Result<TeamSession, StepError> {
     check_target(target)?;
-    if install_target(target, install_read_role().as_deref()).is_some() {
-        if let Some(s) = own_session(&target.region) {
-            return Ok(s);
-        }
-    }
     assume_exact(sts, target, actor).await
 }
 
@@ -568,7 +614,7 @@ pub async fn assume_exact(
     sts: &aws_sdk_sts::Client,
     target: &AwsTarget,
     actor: &str,
-) -> Result<Session, StepError> {
+) -> Result<TeamSession, StepError> {
     let external_id = target.external_id.as_str();
     if external_id.is_empty() {
         return Err(StepError::new(
@@ -603,11 +649,14 @@ pub async fn assume_exact(
     let c = out
         .credentials()
         .ok_or_else(|| StepError::new("sign_in", "AWS returned no session.", "Try again."))?;
-    Ok(Session {
-        access_key_id: c.access_key_id().to_string(),
-        secret_access_key: c.secret_access_key().to_string(),
-        session_token: c.session_token().to_string(),
-        region: target.region.clone(),
+    Ok(TeamSession {
+        session: Session {
+            access_key_id: c.access_key_id().to_string(),
+            secret_access_key: c.secret_access_key().to_string(),
+            session_token: c.session_token().to_string(),
+            region: target.region.clone(),
+        },
+        role_arn: target.role_arn.clone(),
     })
 }
 
@@ -697,26 +746,16 @@ mod tests {
     }
 
     #[test]
-    fn the_install_account_reads_with_the_install_role() {
-        let t = install_target(&reader("111122223333"), Some(OWN)).expect("swapped");
-        assert_eq!(t.role_arn, OWN);
-        // The team's private ID and region carry over.
-        assert_eq!(t.external_id, "team-id");
-        assert_eq!(t.region, "us-east-1");
-    }
-
-    #[test]
-    fn other_accounts_roles_and_installs_keep_their_role() {
-        // Another account keeps the person's log reader and its update flow.
-        assert!(install_target(&reader("444455556666"), Some(OWN)).is_none());
-        // The data-source role is never swapped.
-        let data = AwsTarget {
-            role_arn: "arn:aws:iam::111122223333:role/CoderhelmReadOnly".into(),
-            ..reader("111122223333")
-        };
-        assert!(install_target(&data, Some(OWN)).is_none());
-        // No install role (the hosted deployment, or an install not updated yet).
-        assert!(install_target(&reader("111122223333"), None).is_none());
+    fn a_refusal_names_the_principal_aws_refused() {
+        let worker = "User: arn:aws:sts::111122223333:assumed-role/coderhelm-prod-ServiceRole-ABC123/coderhelm-prod-worker is not authorized to perform: wafv2:ListWebACLs on resource: arn:aws:wafv2:us-east-1:111122223333:regional/webacl/*";
+        let team = reader("111122223333").role_arn;
+        assert_eq!(
+            refused_other_principal(worker, &team).as_deref(),
+            Some("coderhelm-prod-ServiceRole-ABC123")
+        );
+        let as_team = "User: arn:aws:sts::111122223333:assumed-role/CoderHelmLogReader/coderhelm-x is not authorized to perform: wafv2:ListWebACLs";
+        assert_eq!(refused_other_principal(as_team, &team), None);
+        assert_eq!(refused_other_principal("Access denied", &team), None);
         assert!(!in_install_account(
             "arn:aws:iam::111122223333:role/x",
             None
@@ -725,6 +764,7 @@ mod tests {
             "arn:aws:iam::111122223333:role/x",
             Some("not-an-arn")
         ));
+        assert!(in_install_account(&team, Some(OWN)));
     }
 
     #[test]
@@ -943,17 +983,6 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&out.stderr)
         );
-    }
-
-    #[test]
-    fn a_database_on_the_log_reader_is_read_with_that_role_in_the_install_account() {
-        let mut t = db_target();
-        t.role_arn = format!("arn:aws:iam::111122223333:role/{LOG_READER_ROLE}");
-        assert!(install_target(&t, Some(OWN)).is_none());
-        let mut w = t.clone();
-        w.cluster_arn.clear();
-        w.cluster_id = "analytics".into();
-        assert!(install_target(&w, Some(OWN)).is_none());
     }
 
     /// Writes the setup script to the file named by SETUP_SCRIPT_OUT, for

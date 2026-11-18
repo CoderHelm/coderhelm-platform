@@ -248,6 +248,8 @@ async fn go_on(state: &WorkerState, team_id: &str, run_id: &str, item: &Item, w:
     }
     let table = &state.config.settings_table_name;
     role_wait::remove(&state.dynamo, table, team_id, run_id).await;
+    // The new run never waits for these reads again (`ending_after`).
+    role_wait::record_went_on(&state.dynamo, table, team_id, &new_run, w).await;
     for a in &w.accounts {
         common::aws_role_reads::clear(&state.dynamo, table, team_id, a).await;
     }

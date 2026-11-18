@@ -296,6 +296,7 @@ pub async fn session(
             };
             aws::assume(sts, &target, actor)
                 .await
+                .map(aws::TeamSession::into_session)
                 .map_err(|e| Refusal::new("access", e.message, e.fix))
         }
     }

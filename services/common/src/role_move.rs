@@ -88,7 +88,9 @@ pub async fn try_move(
     source: &Source,
     candidate: &AwsTarget,
 ) -> Result<AwsTarget, String> {
-    let session = crate::live::aws::assume_exact(sts, candidate, "role-move").await;
+    let session = crate::live::aws::assume_exact(sts, candidate, "role-move")
+        .await
+        .map(crate::live::aws::TeamSession::into_session);
     if !candidate.cluster_id.is_empty() {
         let s = session.map_err(|e| e.message)?;
         let r = crate::live::redshift::connect_checks(&s, candidate).await;
