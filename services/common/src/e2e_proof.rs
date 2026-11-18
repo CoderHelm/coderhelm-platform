@@ -73,6 +73,89 @@ impl Criterion {
     pub fn needs_e2e(&self) -> bool {
         self.visible || self.page.is_some()
     }
+
+    /// Whether it is about what the server sends, before any script runs
+    /// in the browser: the page's source, its server HTML, the page with
+    /// scripts turned off, what a crawler reads. A browser test runs the
+    /// page's scripts and can pass while the server sends none of it, so
+    /// such a criterion is also proven on the served page itself
+    /// ([`Served`]).
+    pub fn about_served(&self) -> bool {
+        let t = self.text.to_ascii_lowercase();
+        SERVED_WORDS.iter().any(|w| t.contains(w))
+    }
+}
+
+/// Words that say a criterion is about the served page ([`Criterion::about_served`]).
+const SERVED_WORDS: &[&str] = &[
+    "server html",
+    "server-rendered",
+    "server rendered",
+    "server-side render",
+    "server side render",
+    "rendered on the server",
+    "page source",
+    "view source",
+    "view-source",
+    "raw html",
+    "initial html",
+    "html response",
+    "curl",
+    "wget",
+    "without javascript",
+    "without js",
+    "javascript off",
+    "javascript turned off",
+    "javascript disabled",
+    "javascript is off",
+    "javascript is disabled",
+    "js off",
+    "js disabled",
+    "js turned off",
+    "no-js",
+    "no javascript",
+    "noscript",
+    "crawler",
+    "search engine",
+    "seo",
+    "json-ld",
+    "structured data",
+];
+
+/// The criteria to prove: the ticket's own ([`criteria`]), else the lines
+/// of the plan's criteria map. A run whose ticket text gives no criteria
+/// (an empty issue body, a ticket whose criteria only the plan wrote down)
+/// is still proven on what the plan said it would do, never waved through
+/// with nothing to prove.
+pub fn criteria_or_map(
+    title: &str,
+    body: &str,
+    acceptance: &[String],
+    map: &[MapLine],
+) -> Vec<Criterion> {
+    let from_ticket = criteria(title, body, acceptance);
+    if from_ticket.iter().any(Criterion::needs_e2e) {
+        return from_ticket;
+    }
+    let from_map: Vec<Criterion> = map
+        .iter()
+        .filter(|m| !m.criterion.trim().is_empty())
+        .map(|m| {
+            let page = Some(m.page.trim())
+                .filter(|p| !p.is_empty())
+                .map(|p| pages(p).into_iter().next().unwrap_or_else(|| p.to_string()));
+            Criterion {
+                text: m.criterion.trim().to_string(),
+                visible: page.is_some() || is_visible(&m.criterion),
+                page,
+            }
+        })
+        .collect();
+    if from_map.is_empty() {
+        from_ticket
+    } else {
+        from_map
+    }
 }
 
 /// Section names plain ticket text uses without any mark.
@@ -470,6 +553,167 @@ pub struct Proof {
     pub test: String,
     /// The two runs: `base` on staging, `change` on the preview.
     pub record: Record,
+    /// The criterion's page as the server sends it, no script run: on
+    /// staging (`served_base`) and on the preview (`served_change`), for a
+    /// criterion about the served page ([`Criterion::about_served`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub served_base: Option<Served>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub served_change: Option<Served>,
+}
+
+/// One fetch of a criterion's page as the server sends it (a plain GET, no
+/// cookies, no script run), and what the judgment read in it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Served {
+    /// The address fetched.
+    #[serde(default)]
+    pub url: String,
+    /// The fetch got an answer.
+    #[serde(default)]
+    pub fetched: bool,
+    #[serde(default)]
+    pub status: u16,
+    /// Whether the served page shows what the criterion asks: `None` when
+    /// nothing could judge it.
+    #[serde(default)]
+    pub shown: Option<bool>,
+    /// What in the served page settles it, quoted, or what is missing.
+    #[serde(default)]
+    pub quote: String,
+    /// Why it wasn't fetched or judged.
+    #[serde(default)]
+    pub note: String,
+}
+
+impl Served {
+    /// The server answered with a page.
+    pub fn ok(&self) -> bool {
+        self.fetched && (200..300).contains(&self.status)
+    }
+
+    fn why(&self) -> String {
+        let q = self.quote.trim();
+        let n = self.note.trim();
+        let w = if !q.is_empty() { q } else { n };
+        if w.is_empty() {
+            "no result".to_string()
+        } else {
+            crate::truncate_str(w, 200).to_string()
+        }
+    }
+
+    fn at(&self) -> String {
+        if self.url.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", self.url)
+        }
+    }
+}
+
+/// What the served-page legs show, when they settle the proof: `None` when
+/// they are absent or couldn't judge it (the end-to-end test decides).
+fn served_outcome(p: &Proof) -> Option<Outcome> {
+    let change = p.served_change.as_ref()?;
+    let what = format!("\"{}\" in the server HTML (no script run)", p.criterion);
+    if change.fetched && !change.ok() {
+        return Some(Outcome::CoderWork(format!(
+            "{what}: the preview{} answered {}",
+            change.at(),
+            change.status
+        )));
+    }
+    match change.shown {
+        Some(false) => {
+            return Some(Outcome::CoderWork(format!(
+                "{what}: not on the preview{}: {}",
+                change.at(),
+                change.why()
+            )))
+        }
+        Some(true) => {}
+        None => {
+            // Not judged: the test decides; with no test, it is unverified.
+            return p.test.is_empty().then(|| {
+                Outcome::Unverified(format!(
+                    "{what}: the preview{} couldn't be judged: {}",
+                    change.at(),
+                    change.why()
+                ))
+            });
+        }
+    }
+    // Shown on the preview: a failing browser test still sends work back.
+    if !p.test.is_empty() && p.record.change.ran && p.record.change.red() {
+        return None;
+    }
+    let base = p.served_base.as_ref();
+    Some(match base.and_then(|b| b.shown.filter(|_| b.ok())) {
+        Some(false) => Outcome::Proven(format!(
+            "{what}: missing on staging{} and shown on the preview{}: {}",
+            base.map(Served::at).unwrap_or_default(),
+            change.at(),
+            change.why()
+        )),
+        Some(true) => Outcome::Unverified(format!(
+            "{what}: shown on the preview{} and already on staging{}, so staging doesn't show what the ticket says is wrong",
+            change.at(),
+            base.map(Served::at).unwrap_or_default()
+        )),
+        None => Outcome::Unverified(format!(
+            "{what}: shown on the preview{}, staging couldn't be read{}",
+            change.at(),
+            base.map(|b| format!(": {}", b.why())).unwrap_or_default()
+        )),
+    })
+}
+
+/// Characters of a served page a judgment reads.
+pub const SERVED_VIEW_CHARS: usize = 60_000;
+
+/// The served page as a judgment reads it: its markup with scripts and
+/// styles taken out (structured data, `application/ld+json`, kept: the
+/// server sends it for crawlers), whitespace collapsed, bounded.
+pub fn served_view(html: &str) -> String {
+    let mut out = String::with_capacity(html.len().min(SERVED_VIEW_CHARS));
+    let low = html.to_ascii_lowercase();
+    let mut i = 0;
+    while i < html.len() {
+        let rest = &low[i..];
+        let skip_tag = ["<script", "<style"]
+            .iter()
+            .find(|t| rest.starts_with(**t))
+            .copied();
+        if let Some(tag) = skip_tag {
+            let open_end = rest.find('>').map(|e| i + e + 1).unwrap_or(html.len());
+            let open = &low[i..open_end];
+            let close = if tag == "<script" {
+                "</script>"
+            } else {
+                "</style>"
+            };
+            let end = low[open_end..]
+                .find(close)
+                .map(|e| open_end + e + close.len())
+                .unwrap_or(html.len());
+            if tag == "<script" && open.contains("ld+json") {
+                out.push_str(&html[i..end]);
+            }
+            i = end;
+            continue;
+        }
+        let c = html[i..].chars().next().unwrap_or(' ');
+        if c.is_whitespace() {
+            if !out.ends_with(' ') {
+                out.push(' ');
+            }
+        } else {
+            out.push(c);
+        }
+        i += c.len_utf8();
+    }
+    crate::truncate_str(out.trim(), SERVED_VIEW_CHARS).to_string()
 }
 
 /// What a proof shows.
@@ -516,6 +760,9 @@ fn at(l: &Leg) -> String {
 
 /// What the two runs show (see the module's rules).
 pub fn outcome(p: &Proof) -> Outcome {
+    if let Some(o) = served_outcome(p) {
+        return o;
+    }
     let (base, change) = (&p.record.base, &p.record.change);
     let what = if p.test.is_empty() {
         format!("\"{}\"", p.criterion)
@@ -598,6 +845,9 @@ impl Proof {
             Outcome::NotTheTicket(w) => Some(format!(
                 "Two-way proof: {w}. Make the test assert what the ticket says is wrong on {page} (\"{}\"), so it fails on staging and passes on this preview.",
                 self.criterion
+            )),
+            Outcome::CoderWork(w) if self.served_change.is_some() => Some(format!(
+                "Two-way proof: {w}. The criterion is about what the server sends, so a person (or a crawler) without scripts must get it from {page} as served: fix the code (not the test) so the server renders it, then fetch the preview's page source to see it there.",
             )),
             Outcome::CoderWork(w) => Some(format!(
                 "Two-way proof: {w}. The change doesn't do \"{}\" on the preview yet; fix the code (not the test) until it passes there.",
@@ -769,6 +1019,7 @@ mod tests {
                 source: "sandbox".into(),
                 at: String::new(),
             },
+            ..Default::default()
         }
     }
 

@@ -122,6 +122,7 @@ fn proof(test: &str, base_out: &str, change_out: &str) -> Proof {
             source: "sandbox".into(),
             at: String::new(),
         },
+        ..Default::default()
     }
 }
 

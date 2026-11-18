@@ -233,6 +233,33 @@ pub(crate) struct Target<'a> {
     pub head: &'a str,
 }
 
+/// The base branch's deployment (staging): the configured test address
+/// without `{pr}`, else the staging address the repository's end-to-end
+/// setup names (`ci_repro::base_target`), read from `tree` at the head.
+pub(crate) async fn base_address(
+    github: &GitHubClient,
+    (owner, repo, head): (&str, &str, &str),
+    tree: &[String],
+    configured: Option<&str>,
+) -> Option<String> {
+    let mut setup: Vec<(String, String)> = Vec::new();
+    for p in tree
+        .iter()
+        .filter(|p| {
+            let low = p.to_ascii_lowercase();
+            low.contains("playwright.config")
+                || (low.starts_with(".github/workflows/")
+                    && (low.contains("e2e") || low.contains("playwright")))
+        })
+        .take(6)
+    {
+        if let Ok(text) = github.read_file(owner, repo, p, head).await {
+            setup.push((p.clone(), text));
+        }
+    }
+    ci_repro::base_target(configured, &setup)
+}
+
 /// One Playwright test (`file › title`) with the head's test code, run in
 /// the sandbox against the base branch's deployment (`base`, staging) and
 /// against the pull request's preview (`change`). A side that couldn't run
@@ -299,22 +326,7 @@ pub(crate) async fn two_way(
     // Where each side runs: the configured test address and the preview,
     // else the staging address the repository's end-to-end setup names.
     let configured = test_address(state, t.team_id, &format!("{owner}/{repo}")).await;
-    let mut setup: Vec<(String, String)> = Vec::new();
-    for p in tree
-        .iter()
-        .filter(|p| {
-            let low = p.to_ascii_lowercase();
-            low.contains("playwright.config")
-                || (low.starts_with(".github/workflows/")
-                    && (low.contains("e2e") || low.contains("playwright")))
-        })
-        .take(6)
-    {
-        if let Ok(text) = github.read_file(owner, repo, p, head).await {
-            setup.push((p.clone(), text));
-        }
-    }
-    let base_url = ci_repro::base_target(configured.as_deref(), &setup);
+    let base_url = base_address(github, (owner, repo, head), &tree, configured.as_deref()).await;
     let preview = super::preview::load(state, t.team_id, t.run_id)
         .await
         .filter(|p| p.head == head && !p.url.trim().is_empty())
