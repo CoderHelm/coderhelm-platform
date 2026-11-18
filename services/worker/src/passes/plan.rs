@@ -1463,7 +1463,7 @@ Then the ```fix_location.json block described above."#,
             )
             .await;
             if let Some(d) = files.fix.as_mut() {
-                d.open_gaps.extend(left);
+                d.add_gaps(left);
             }
         }
     }
@@ -1479,7 +1479,7 @@ Then the ```fix_location.json block described above."#,
             )
             .await;
             if let Some(d) = files.fix.as_mut() {
-                d.open_gaps.extend(left);
+                d.add_gaps(left);
             }
         }
     }
@@ -1508,7 +1508,7 @@ Then the ```fix_location.json block described above."#,
             )
             .await;
             if let Some(d) = files.fix.as_mut() {
-                d.open_gaps.extend(left);
+                d.add_gaps(left);
             }
         }
     }
@@ -1534,6 +1534,8 @@ Then the ```fix_location.json block described above."#,
             reproducer.can_run(),
             can_look_up,
         ));
+        // Each check reads line by line: one finding is said once.
+        let left = common::scope_ledger::unique(left);
         if !left.is_empty() {
             warn!(ticket_id = %msg.ticket_id, gaps = ?left, "Plan is still not the smallest change after one send-back");
             super::add_progress_note(
@@ -1544,7 +1546,7 @@ Then the ```fix_location.json block described above."#,
             )
             .await;
             if let Some(d) = files.fix.as_mut() {
-                d.open_gaps.extend(left);
+                d.add_gaps(left);
             }
         }
     }
@@ -1608,7 +1610,7 @@ Then the ```fix_location.json block described above."#,
             )
             .await;
             if let Some(d) = files.fix.as_mut() {
-                d.open_gaps.extend(lines);
+                d.add_gaps(lines);
             }
         }
     }
