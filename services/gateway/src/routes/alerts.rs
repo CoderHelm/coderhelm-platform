@@ -1534,6 +1534,7 @@ async fn start_run(
         Some(&context_hash),
         false,
         false,
+        false,
     )
     .await
     {

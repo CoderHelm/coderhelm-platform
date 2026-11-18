@@ -575,7 +575,8 @@ async fn handle_issue_event(
     // run, re-trigger only if the issue content changed (re-labeling an
     // edited issue reworks it; re-labeling an unchanged one is a no-op).
     // Failed/needs_input runs no longer block — the old any-run-exists check
-    // made GitHub tickets unretriable by re-label.
+    // made GitHub tickets unretriable by re-label. Re-labeling still retries
+    // a failed issue, even past the failed-run cap.
     let ticket_id_str = format!("GH-{}", issue["number"].as_u64().unwrap_or(0));
     let context_hash = common::ticket_context_hash(
         issue["title"].as_str().unwrap_or(""),
@@ -589,6 +590,7 @@ async fn handle_issue_event(
         Some(&context_hash),
         false,
         false,
+        is_labeled,
     )
     .await
     {
@@ -1645,8 +1647,16 @@ async fn handle_issue_comment(
     // enqueue a duplicate run with no dedup at all.
     let ticket_id_str = format!("GH-{}", issue["number"].as_u64().unwrap_or(0));
     if matches!(
-        super::trigger_gate::gate_ticket_trigger(state, team_id, &ticket_id_str, None, true, false)
-            .await,
+        super::trigger_gate::gate_ticket_trigger(
+            state,
+            team_id,
+            &ticket_id_str,
+            None,
+            true,
+            false,
+            false,
+        )
+        .await,
         super::trigger_gate::TicketGate::SkipInFlight
     ) {
         // No second run: the run in flight gets the comment (kept,

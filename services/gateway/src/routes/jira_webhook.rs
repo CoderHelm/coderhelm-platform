@@ -615,6 +615,7 @@ async fn process_jira_payload(
         Some(&context_hash),
         false,
         super::trigger_gate::jira_reopened(payload),
+        false,
     )
     .await
     {

@@ -38,8 +38,9 @@
 //!   person retried is passed over: it neither counts nor ends the streak):
 //!   then an event that leaves the ticket unchanged starts nothing (a field
 //!   or status change used to start the same failing run every time). A
-//!   content change, a reopen, a person's Retry or command still start one;
-//!   Retry and commands are never blocked by the cap
+//!   content change, a reopen, a person's Retry or command, or a person
+//!   adding the trigger label to a GitHub issue still start one; Retry,
+//!   commands and the label are never blocked by the cap
 //! - explicit human triggers (slash commands, comment retries) skip the
 //!   content check but still respect in-flight blocking
 
@@ -84,6 +85,9 @@ struct LatestRun<'a> {
     /// Runs in a row, newest first, that ended failed; runs a person
     /// retried are passed over (they neither count nor end the streak).
     failed_in_a_row: usize,
+    /// The event is a person adding the trigger label, which the cap never
+    /// blocks.
+    label_added: bool,
 }
 
 impl LatestRun<'_> {
@@ -139,6 +143,7 @@ fn decide(latest: &LatestRun, new_hash: Option<&str>, reopened: bool) -> Decisio
     if !handled(latest.status) {
         // failed / retried: allow a retry, up to the cap while unchanged
         if latest.failed_in_a_row >= MAX_FAILED_RUNS_IN_A_ROW
+            && !latest.label_added
             && !reopened
             && !latest.changed(new_hash)
         {
@@ -203,7 +208,8 @@ fn attr_s(v: &str) -> AttributeValue {
 /// content; pass `None` when the caller cannot compute it (treated as
 /// unchanged for completed tickets). `explicit` marks direct human commands,
 /// which bypass the content check. `reopened`: the event moved the ticket
-/// back to an open status ([`jira_reopened`]).
+/// back to an open status ([`jira_reopened`]). `label_added`: a person added
+/// the trigger label, which the failed-run cap never blocks.
 ///
 /// Fails open on query errors — the worker's own active-run guard is the
 /// backstop, and dropping webhooks during a DynamoDB blip is worse than a
@@ -215,6 +221,7 @@ pub async fn gate_ticket_trigger(
     new_context_hash: Option<&str>,
     explicit: bool,
     reopened: bool,
+    label_added: bool,
 ) -> TicketGate {
     let result = state
         .dynamo
@@ -345,6 +352,7 @@ pub async fn gate_ticket_trigger(
                 })
                 .collect(),
         ),
+        label_added,
     };
     match decide(&run, new_context_hash, reopened) {
         Decision::Enqueue => {
@@ -514,6 +522,7 @@ mod tests {
             context_hash: Some(hash),
             seen_hash: None,
             failed_in_a_row: 0,
+            label_added: false,
         }
     }
 
@@ -537,6 +546,13 @@ mod tests {
         // New content, or a reopen, starts one.
         assert_eq!(decide(&capped, Some("h2"), false), Decision::Enqueue);
         assert_eq!(decide(&capped, Some("h1"), true), Decision::Enqueue);
+        // A person adding the trigger label retries anyway.
+        let labeled = LatestRun {
+            label_added: true,
+            ..capped
+        };
+        assert_eq!(decide(&labeled, Some("h1"), false), Decision::Enqueue);
+        assert_eq!(decide(&labeled, None, false), Decision::Enqueue);
     }
 
     #[test]
