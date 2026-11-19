@@ -40,7 +40,16 @@
 //! - a run that ended covered by a merged PR, or waiting because the
 //!   worker couldn't tell whether the merged PR does the work, is a handled
 //!   ticket like any other: only a content change starts another run
-//! - a failed / retried latest run never blocks
+//! - a failed / retried latest run doesn't block, until
+//!   [`MAX_FAILED_RUNS_IN_A_ROW`] runs in a row ended failed (a run a
+//!   person retried is passed over: it neither counts nor ends the streak):
+//!   then an event that leaves the ticket unchanged starts nothing (a field
+//!   or status change used to start the same failing run every time; no
+//!   status change skips the cap, a reopen included). A content change, a
+//!   person's Retry or command, or a person's retry gesture still starts
+//!   one: on GitHub adding the trigger label or assigning CoderHelm, on
+//!   Jira re-adding the trigger label or re-assigning to CoderHelm. Retry,
+//!   commands and those gestures are never blocked by the cap
 //! - explicit human triggers (slash commands, comment retries) skip the
 //!   content check but still respect in-flight blocking
 
@@ -82,6 +91,12 @@ struct LatestRun<'a> {
     context_hash: Option<&'a str>,
     /// The hash of the newest edit already sent to the run's open PR.
     seen_hash: Option<&'a str>,
+    /// Runs in a row, newest first, that ended failed; runs a person
+    /// retried are passed over (they neither count nor end the streak).
+    failed_in_a_row: usize,
+    /// The event is a person's retry gesture ([`github_retry_gesture`],
+    /// [`jira_retry_gesture`]), which the cap never blocks.
+    retry_gesture: bool,
 }
 
 impl LatestRun<'_> {
@@ -129,9 +144,22 @@ enum Decision {
     ToOpenPr,
 }
 
+/// Failed runs in a row on one ticket after which an event that leaves the
+/// ticket unchanged starts no further run.
+pub const MAX_FAILED_RUNS_IN_A_ROW: usize = 3;
+
 fn decide(latest: &LatestRun, new_hash: Option<&str>, reopened: bool) -> Decision {
     if !handled(latest.status) {
-        // failed / retried: allow retry
+        // failed / retried: allow a retry, up to the cap while unchanged
+        if latest.failed_in_a_row >= MAX_FAILED_RUNS_IN_A_ROW
+            && !latest.retry_gesture
+            && !latest.changed(new_hash)
+        {
+            return Decision::Skip(
+                "the ticket's last runs failed and it is unchanged; changing the ticket, \
+                 or a person's explicit Retry or command starts another",
+            );
+        }
         return Decision::Enqueue;
     }
     if latest.pr_open() {
@@ -158,6 +186,58 @@ fn decide(latest: &LatestRun, new_hash: Option<&str>, reopened: bool) -> Decisio
     } else {
         Decision::Skip("handled and unchanged")
     }
+}
+
+/// A person's retry gesture on a GitHub issue: adding the `coderhelm` label,
+/// or assigning the issue to CoderHelm. These are the only issue events that
+/// start runs, so the failed-run cap never applies to one.
+pub fn github_retry_gesture(payload: &serde_json::Value) -> bool {
+    let action = payload["action"].as_str().unwrap_or("");
+    let labeled = action == "labeled"
+        && payload["label"]["name"]
+            .as_str()
+            .is_some_and(|l| l.eq_ignore_ascii_case("coderhelm"));
+    let assigned = action == "assigned"
+        && payload["assignee"]["login"]
+            .as_str()
+            .is_some_and(|l| l.contains("coderhelm"));
+    labeled || assigned
+}
+
+/// Whether `label` is the team's trigger label: the label itself (case
+/// ignored), or the label with a repository pinned after it
+/// (`coderhelm:acme/web`). One rule for the Jira trigger and for
+/// [`jira_retry_gesture`].
+pub fn is_trigger_label(label: &str, trigger_label: &str) -> bool {
+    let trigger = trigger_label.trim().to_ascii_lowercase();
+    let label = label.trim().to_ascii_lowercase();
+    !trigger.is_empty() && (label == trigger || label.starts_with(&format!("{trigger}:")))
+}
+
+/// A person's retry gesture on a Jira ticket, read from the event's
+/// changelog like [`jira_reopened`]: the team's trigger label added (in the
+/// new labels, not the old), or the ticket assigned to CoderHelm (from
+/// someone else). Other field and status changes stay under the failed-run
+/// cap.
+pub fn jira_retry_gesture(payload: &serde_json::Value, trigger_label: &str) -> bool {
+    let has_label = |list: Option<&str>| {
+        list.unwrap_or("")
+            .split_whitespace()
+            .any(|l| is_trigger_label(l, trigger_label))
+    };
+    let names_bot = |v: Option<&str>| v.unwrap_or("").to_ascii_lowercase().contains("coderhelm");
+    payload
+        .pointer("/changelog/items")
+        .and_then(|v| v.as_array())
+        .is_some_and(|items| {
+            items.iter().any(|i| {
+                let field = i.get("field").and_then(|f| f.as_str()).unwrap_or("");
+                let from = i.get("fromString").and_then(|f| f.as_str());
+                let to = i.get("toString").and_then(|f| f.as_str());
+                (field.eq_ignore_ascii_case("labels") && has_label(to) && !has_label(from))
+                    || (field.eq_ignore_ascii_case("assignee") && names_bot(to) && !names_bot(from))
+            })
+        })
 }
 
 /// A Jira update that moved the ticket back to an open status: its changelog
@@ -278,11 +358,15 @@ pub async fn github_issue_ended_on_merge(
 /// which bypass the content check. `reopened`: the event moved the ticket
 /// back to an open status ([`jira_reopened`]). `repo` (`owner/name`): a
 /// GitHub issue's repository, so only its own runs count; `None` for any
-/// other ticket.
+/// other ticket. `retry_gesture`: a person's deliberate retry
+/// ([`github_retry_gesture`], [`jira_retry_gesture`]: the trigger label
+/// added, or the ticket assigned to CoderHelm), which the failed-run cap
+/// never blocks.
 ///
 /// Fails open on query errors — the worker's own active-run guard is the
 /// backstop, and dropping webhooks during a DynamoDB blip is worse than a
 /// rare duplicate.
+#[allow(clippy::too_many_arguments)]
 pub async fn gate_ticket_trigger(
     state: &AppState,
     team_id: &str,
@@ -291,6 +375,7 @@ pub async fn gate_ticket_trigger(
     explicit: bool,
     reopened: bool,
     repo: Option<&str>,
+    retry_gesture: bool,
 ) -> TicketGate {
     let items = match ticket_runs(state, team_id, ticket_id).await {
         Ok(items) => own_runs(items, repo),
@@ -387,6 +472,16 @@ pub async fn gate_ticket_trigger(
         pr_outcome: s("pr_outcome").unwrap_or(""),
         context_hash: s("context_hash"),
         seen_hash: s(SEEN_HASH_FIELD),
+        failed_in_a_row: failed_in_a_row(
+            items
+                .iter()
+                .map(|i| {
+                    let id = i.get("run_id").and_then(|v| v.as_s().ok()).cloned();
+                    (id.unwrap_or_default(), status_of(i))
+                })
+                .collect(),
+        ),
+        retry_gesture,
     };
     match decide(&run, new_context_hash, reopened) {
         Decision::Enqueue => {
@@ -453,6 +548,18 @@ pub async fn gate_ticket_trigger(
             })
         }
     }
+}
+
+/// How many of the ticket's runs in a row, newest first, ended failed,
+/// from `(run_id, status)` in any order. A run a person retried (`retried`,
+/// whatever it ended as) is passed over: it neither counts nor ends the
+/// streak. Run ids are ULIDs, which sort by creation time.
+fn failed_in_a_row(mut runs: Vec<(String, String)>) -> usize {
+    runs.sort_by(|a, b| b.0.cmp(&a.0));
+    runs.iter()
+        .filter(|(_, status)| status != common::run_status::RETRIED)
+        .take_while(|(_, status)| status == common::run_status::FAILED)
+        .count()
 }
 
 /// The run record's field holding the hash of the newest ticket edit sent
@@ -533,8 +640,9 @@ pub fn expected_attachment_keys(
 #[cfg(test)]
 mod tests {
     use super::{
-        decide, edit_note, field, handled, jira_reopened, latest_ended_on_merge, latest_run,
-        own_runs, retry_note, Decision, Item, LatestRun, OpenPr,
+        decide, edit_note, failed_in_a_row, field, github_retry_gesture, handled, is_trigger_label,
+        jira_reopened, jira_retry_gesture, latest_ended_on_merge, latest_run, own_runs, retry_note,
+        Decision, Item, LatestRun, OpenPr, MAX_FAILED_RUNS_IN_A_ROW,
     };
     use aws_sdk_dynamodb::types::AttributeValue;
 
@@ -650,7 +758,88 @@ mod tests {
             pr_outcome: outcome,
             context_hash: Some(hash),
             seen_hash: None,
+            failed_in_a_row: 0,
+            retry_gesture: false,
         }
+    }
+
+    /// The same failing run used to start on every field or status change.
+    #[test]
+    fn failed_runs_in_a_row_stop_restarting_on_an_unchanged_ticket() {
+        let below = LatestRun {
+            failed_in_a_row: MAX_FAILED_RUNS_IN_A_ROW - 1,
+            ..run("failed", 0, "", "h1")
+        };
+        assert_eq!(decide(&below, Some("h1"), false), Decision::Enqueue);
+        let capped = LatestRun {
+            failed_in_a_row: MAX_FAILED_RUNS_IN_A_ROW,
+            ..run("failed", 0, "", "h1")
+        };
+        assert!(matches!(
+            decide(&capped, Some("h1"), false),
+            Decision::Skip(_)
+        ));
+        assert!(matches!(decide(&capped, None, false), Decision::Skip(_)));
+        // New content starts one.
+        assert_eq!(decide(&capped, Some("h2"), false), Decision::Enqueue);
+        assert_eq!(decide(&capped, Some("h2"), true), Decision::Enqueue);
+        // No status move skips the cap: To Do -> In Progress, or Done -> To Do.
+        let status_move = |cat: &str| {
+            jira_reopened(&serde_json::json!({
+                "changelog": {"items": [{"field": "status"}]},
+                "issue": {"fields": {"status": {"statusCategory": {"key": cat}}}}
+            }))
+        };
+        for cat in ["indeterminate", "new"] {
+            assert!(matches!(
+                decide(&capped, Some("h1"), status_move(cat)),
+                Decision::Skip(_)
+            ));
+        }
+        // A person adding the trigger label retries anyway.
+        let labeled = LatestRun {
+            retry_gesture: true,
+            ..capped
+        };
+        assert_eq!(decide(&labeled, Some("h1"), false), Decision::Enqueue);
+        assert_eq!(decide(&labeled, None, false), Decision::Enqueue);
+    }
+
+    #[test]
+    fn failures_in_a_row_count_from_the_newest_run() {
+        let r = |id: &str, s: &str| (id.to_string(), s.to_string());
+        // Out of order on purpose: ids sort by creation time.
+        assert_eq!(
+            failed_in_a_row(vec![
+                r("01C", "failed"),
+                r("01A", "failed"),
+                r("01D", "failed"),
+                r("01B", "completed"),
+            ]),
+            2
+        );
+        // Two runs that asked a question and a person retried, then one
+        // failure: one failed run, not three.
+        assert_eq!(
+            failed_in_a_row(vec![
+                r("01A", "retried"),
+                r("01B", "retried"),
+                r("01C", "failed"),
+            ]),
+            1
+        );
+        // A retried run between failures doesn't end the streak.
+        assert_eq!(
+            failed_in_a_row(vec![
+                r("01A", "failed"),
+                r("01B", "retried"),
+                r("01C", "failed"),
+                r("01D", "failed"),
+            ]),
+            3
+        );
+        assert_eq!(failed_in_a_row(vec![r("01A", "completed")]), 0);
+        assert_eq!(failed_in_a_row(vec![]), 0);
     }
 
     /// The prod duplicate: a Jira edit one second before the merge, while
@@ -747,6 +936,79 @@ mod tests {
             decide(&run("failed", 0, "", "h1"), Some("h1"), false),
             Decision::Enqueue
         );
+    }
+
+    /// Every GitHub issue event that starts a run is a person's retry
+    /// gesture, so the failed-run cap never blocks one.
+    #[test]
+    fn github_label_adds_and_bot_assigns_are_retry_gestures() {
+        let ev = |action: &str, label: &str, assignee: &str| {
+            serde_json::json!({
+                "action": action,
+                "label": {"name": label},
+                "assignee": {"login": assignee}
+            })
+        };
+        assert!(github_retry_gesture(&ev("labeled", "CoderHelm", "")));
+        assert!(github_retry_gesture(&ev("assigned", "", "coderhelm[bot]")));
+        assert!(!github_retry_gesture(&ev("labeled", "bug", "")));
+        assert!(!github_retry_gesture(&ev("assigned", "", "pat")));
+        assert!(!github_retry_gesture(&ev("edited", "coderhelm", "")));
+    }
+
+    /// On Jira, re-adding the trigger label or re-assigning to CoderHelm is
+    /// a retry; a field or status change isn't.
+    #[test]
+    fn jira_relabels_and_reassigns_are_retry_gestures() {
+        let ev = |field: &str, from: &str, to: &str| {
+            serde_json::json!({"changelog": {"items": [
+                {"field": field, "fromString": from, "toString": to}
+            ]}})
+        };
+        assert!(jira_retry_gesture(
+            &ev("labels", "backend", "backend coderhelm"),
+            "coderhelm"
+        ));
+        assert!(jira_retry_gesture(&ev("labels", "", "AI"), "ai"));
+        assert!(jira_retry_gesture(
+            &ev("assignee", "Pat Doe", "CoderHelm"),
+            "coderhelm"
+        ));
+        // The repo-pinned form of the trigger label counts too.
+        assert!(jira_retry_gesture(
+            &ev("labels", "backend", "backend coderhelm:acme/web"),
+            "coderhelm"
+        ));
+        assert!(!jira_retry_gesture(
+            &ev("labels", "coderhelm:acme/web", "coderhelm:acme/web backend"),
+            "coderhelm"
+        ));
+        assert!(is_trigger_label("CoderHelm", "coderhelm"));
+        assert!(is_trigger_label("coderhelm:acme/web", "coderhelm"));
+        assert!(!is_trigger_label("coderhelmish", "coderhelm"));
+        // Still labelled, or still assigned: no new gesture.
+        assert!(!jira_retry_gesture(
+            &ev("labels", "coderhelm", "coderhelm backend"),
+            "coderhelm"
+        ));
+        assert!(!jira_retry_gesture(
+            &ev("assignee", "CoderHelm", "CoderHelm"),
+            "coderhelm"
+        ));
+        // Label removed, another field, a status move: capped.
+        assert!(!jira_retry_gesture(
+            &ev("labels", "coderhelm", ""),
+            "coderhelm"
+        ));
+        assert!(!jira_retry_gesture(
+            &ev("priority", "Low", "High"),
+            "coderhelm"
+        ));
+        assert!(!jira_retry_gesture(
+            &ev("status", "To Do", "In Progress"),
+            "coderhelm"
+        ));
+        assert!(!jira_retry_gesture(&serde_json::json!({}), "coderhelm"));
     }
 
     #[test]

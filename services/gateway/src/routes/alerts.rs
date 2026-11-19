@@ -1535,6 +1535,7 @@ async fn start_run(
         false,
         false,
         None,
+        false,
     )
     .await
     {

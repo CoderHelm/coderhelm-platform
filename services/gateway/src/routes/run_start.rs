@@ -199,6 +199,7 @@ async fn github_ticket(
         true,
         false,
         Some(repo),
+        false,
     )
     .await;
     if let Some(refused) = gate_refusal(&gate) {
@@ -267,9 +268,17 @@ async fn jira_ticket(
         .map_err(|e| internal("Run not read", e))?
         .item
         .ok_or_else(|| fail(StatusCode::NOT_FOUND, "That ticket's last run is gone."))?;
-    let gate =
-        trigger_gate::gate_ticket_trigger(state, &claims.team_id, key, None, true, false, None)
-            .await;
+    let gate = trigger_gate::gate_ticket_trigger(
+        state,
+        &claims.team_id,
+        key,
+        None,
+        true,
+        false,
+        None,
+        false,
+    )
+    .await;
     if let Some(refused) = gate_refusal(&gate) {
         return Err(refused);
     }
