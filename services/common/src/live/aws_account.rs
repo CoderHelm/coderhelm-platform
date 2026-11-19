@@ -173,6 +173,16 @@ impl AwsAccount {
             return None;
         }
         let region = s(item, "region");
+        let permissions = item
+            .get("permissions_check")
+            .and_then(|v| v.as_s().ok())
+            .and_then(|j| serde_json::from_str::<super::permissions::PermissionCheck>(j).ok())
+            .map(|mut c| {
+                // A check saved before the flag was set: the account is still
+                // the install's own, whose reader the release keeps current.
+                c.install_account |= super::aws::updates_with_release(&role_arn);
+                c
+            });
         Some(AwsAccount {
             account,
             role_arn,
@@ -190,10 +200,7 @@ impl AwsAccount {
             waf_log_key: s(item, "waf_log_key"),
             database_clusters: Vec::new(),
             warehouses: Vec::new(),
-            permissions: item
-                .get("permissions_check")
-                .and_then(|v| v.as_s().ok())
-                .and_then(|j| serde_json::from_str(j).ok()),
+            permissions,
             abilities: Abilities {
                 checked_at: s(item, "abilities_checked_at"),
                 check_error: s(item, "abilities_error"),

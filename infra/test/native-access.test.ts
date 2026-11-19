@@ -25,7 +25,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { accessNames, BOUNDARY_OPTION_READS, boundaryPolicy, PolicyDocument } from "../lib/access";
-import { ACCESS_PARAMETERS, ACCESS_SHAPE, ACCESS_WRITER_NAME, buildAccess, writerPolicy } from "../lib/native/access-stack";
+import { ACCESS_PARAMETERS, ACCESS_SHAPE, ACCESS_WRITER_NAME, buildAccess, READER_UPDATE_NAME, readerPolicy, writerPolicy } from "../lib/native/access-stack";
 import { buildNative } from "../lib/native/build";
 import { ACCESS_FILE, deployRolePolicy, nativeBoundaryDoc, nativeNames, pinnedAccess, subInstall } from "../lib/native/parent";
 import { plainStatements } from "../lib/own-account-read";
@@ -207,7 +207,9 @@ test("an admin's update of the access stack with a newer access.json changes eve
   const older = buildAccess("v9.8.6", "def write_policy(): pass\n");
   const newer = buildAccess("v9.8.7", "def write_policy(): pass  # newer\n");
   // The same logical ids, types and fixed names as every earlier release: nothing is replaced.
-  assert.deepEqual(Object.keys(newer.Resources).sort(), Object.keys(EARLIER).sort());
+  // What a release adds (the reader update) is added beside them, and kept from then on (ACCESS_SHAPE).
+  for (const id of Object.keys(EARLIER)) assert.ok(id in newer.Resources, id);
+  assert.deepEqual(Object.keys(newer.Resources).sort(), Object.keys(ACCESS_SHAPE).sort());
   for (const [id, want] of Object.entries(EARLIER)) {
     const r = newer.Resources[id];
     assert.equal(r.Type, want.Type, id);
@@ -281,5 +283,92 @@ test("every read the install's permission check expects is granted to the roles 
       if (v !== "allowed") refused.push(`${a} (${v})`);
     }
     assert.deepEqual(refused, [], `${part}.${id}`);
+  }
+});
+
+// ── The reader update: the release brings its reads to CoderHelmLogReader here ──
+
+test("after each update of the install's stack, the access stack's reader update brings the release's reads to CoderHelmLogReader in this account", () => {
+  const r = ACCESS.Resources;
+  // Its code is the signed template's, inline: lambda/native-reader/handler.py.
+  assert.equal(r.Reader.Properties.Code.ZipFile, fs.readFileSync(path.join(__dirname, "..", "..", "..", "lambda", "native-reader", "handler.py"), "utf8"));
+  assert.deepEqual(r.Reader.Properties.Environment.Variables.ROOT_STACK, { "Fn::Sub": "coderhelm-${Stage}" });
+  assert.match(r.Reader.Properties.Code.ZipFile, /STACK = "CoderHelmLogReaderUpdate-release"/);
+  assert.match(r.Reader.Properties.Code.ZipFile, /TEMPLATE = "coderhelm-log-reader-update.yaml"/);
+  // It runs when the install's stack finishes an update (a version update or a switch), once a day, and at once.
+  const pattern = r.ReaderAfterUpdate.Properties.EventPattern;
+  assert.deepEqual(pattern.source, ["aws.cloudformation"]);
+  assert.deepEqual(pattern.detail["status-details"].status, ["UPDATE_COMPLETE"]);
+  assert.deepEqual(pattern.detail["stack-id"], [{ prefix: { "Fn::Sub": "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/coderhelm-${Stage}/" } }]);
+  assert.equal(r.ReaderDaily.Properties.ScheduleExpression, "rate(1 day)");
+  for (const rule of ["ReaderAfterUpdate", "ReaderDaily"]) assert.deepEqual(r[rule].Properties.Targets, [{ Id: "reader", Arn: { "Fn::GetAtt": ["Reader", "Arn"] } }]);
+  assert.deepEqual(r.ReaderFromUpdate.Properties.SourceArn, { "Fn::GetAtt": ["ReaderAfterUpdate", "Arn"] });
+  assert.deepEqual(r.ReaderFromDaily.Properties.SourceArn, { "Fn::GetAtt": ["ReaderDaily", "Arn"] });
+  assert.equal(r.ReaderNow.Properties.Version, "v9.8.7");
+  assert.equal(r.ReaderNow.Type, "Custom::ReaderUpdate");
+});
+
+test("the reader update may write only CoderHelmLogReader's policy, only through CloudFormation, only from a release's update template", () => {
+  const p = resolveValue(readerPolicy(), { values: prodValues("111122223333", "us-east-1") }) as PolicyDocument;
+  const role = "arn:aws:iam::111122223333:role/CoderHelmLogReader";
+  const stack = "arn:aws:cloudformation:us-east-1:111122223333:stack/CoderHelmLogReaderUpdate-release/abc";
+  const release = { "cloudformation:TemplateUrl": "https://coderhelm-public.s3.amazonaws.com/launch/v9.8.7/coderhelm-log-reader-update.yaml" };
+  const via = { "aws:CalledVia": ["cloudformation.amazonaws.com"] };
+  const can = (action: string, resource: string, context: Record<string, string | string[]> = {}) => decision([p], null, { action, resource, context }) === "allowed";
+  // From the release's own update template: allowed.
+  assert.ok(can("cloudformation:CreateStack", stack, release));
+  assert.ok(can("cloudformation:UpdateStack", stack, release));
+  // Any other template, or none: refused.
+  for (const url of ["https://coderhelm-public.s3.amazonaws.com/launch/v9.8.7/coderhelm-log-reader.yaml", "https://example.com/launch/v9.8.7/coderhelm-log-reader-update.yaml", "https://coderhelm-public.s3.amazonaws.com/cfn/coderhelm-log-reader-update.yaml"]) {
+    assert.ok(!can("cloudformation:UpdateStack", stack, { "cloudformation:TemplateUrl": url }), url);
+  }
+  assert.ok(!can("cloudformation:CreateStack", stack));
+  // Any other stack: refused, the install's own included.
+  for (const other of ["arn:aws:cloudformation:us-east-1:111122223333:stack/coderhelm-prod/abc", "arn:aws:cloudformation:us-east-1:111122223333:stack/CoderHelmLogReader/abc", "arn:aws:cloudformation:us-east-1:111122223333:stack/CoderHelmLogReaderUpdate-1a2b3c4d/abc"]) {
+    assert.ok(!can("cloudformation:UpdateStack", other, release), other);
+  }
+  // The role's policy: through CloudFormation only, on that one role only.
+  assert.ok(can("iam:PutRolePolicy", role, via));
+  assert.ok(!can("iam:PutRolePolicy", role), "never directly");
+  assert.ok(!can("iam:PutRolePolicy", "arn:aws:iam::111122223333:role/coderhelm-prod-worker", via));
+  for (const a of ["iam:AttachRolePolicy", "iam:UpdateAssumeRolePolicy", "iam:CreateRole", "iam:PassRole", "iam:CreatePolicy", "iam:PutRolePermissionsBoundary", "iam:DeleteRolePermissionsBoundary"]) {
+    assert.ok(!can(a, role, via), a);
+  }
+  // No IAM action outside that role (GetRole is the one read).
+  for (const st of p.Statement) {
+    const acts = ([] as string[]).concat(st.Action ?? []);
+    if (acts.some((a) => a.startsWith("iam:"))) assert.equal(st.Resource, role, st.Sid);
+  }
+});
+
+test("no CoderHelm role can reach the reader update, its role or its rules", () => {
+  const names = { ...accessNames({ account: "111122223333", region: "us-east-1", prefix: "coderhelm-prod", suffix: "-111122223333", secretName: "coderhelm/prod/secrets", id: "stack" }), emailIdentity: "owner@example.org" };
+  const boundary = boundaryPolicy(names, ["arn:aws:iam::111122223333:policy/coderhelm-prod-deploy-boundary-stack"]);
+  const anything: PolicyDocument = { Version: "2012-10-17", Statement: [{ Sid: "All", Effect: "Allow", Action: "*", Resource: "*" }] };
+  const reader = READER_UPDATE_NAME.replace("${Stage}", "prod");
+  const calls: [string, string][] = [
+    ["lambda:InvokeFunction", `arn:aws:lambda:us-east-1:111122223333:function:${reader}`],
+    ["lambda:UpdateFunctionCode", `arn:aws:lambda:us-east-1:111122223333:function:${reader}`],
+    ["lambda:UpdateFunctionConfiguration", `arn:aws:lambda:us-east-1:111122223333:function:${reader}`],
+    ["lambda:AddPermission", `arn:aws:lambda:us-east-1:111122223333:function:${reader}`],
+    ["iam:PassRole", `arn:aws:iam::111122223333:role/${reader}`],
+    ["iam:PutRolePolicy", `arn:aws:iam::111122223333:role/${reader}`],
+    ["iam:UpdateAssumeRolePolicy", `arn:aws:iam::111122223333:role/${reader}`],
+    // And the reader role itself stays out of the install's reach, as before.
+    ["iam:PutRolePolicy", "arn:aws:iam::111122223333:role/CoderHelmLogReader"],
+    ["iam:AttachRolePolicy", "arn:aws:iam::111122223333:role/CoderHelmLogReader"],
+    ["cloudformation:UpdateStack", "arn:aws:cloudformation:us-east-1:111122223333:stack/CoderHelmLogReaderUpdate-release/abc"],
+  ];
+  for (const [action, resource] of calls) {
+    assert.notEqual(decision([anything], boundary, { action, resource, context: { "iam:PermissionsBoundary": names.boundaryArn } }), "allowed", `${action} on ${resource}`);
+  }
+});
+
+test("a one-stack install's gateway and worker know the release keeps their own account's reader current", () => {
+  for (const part of ["Api", "Worker"]) {
+    const t = JSON.parse(fs.readFileSync(path.join(OUT, "stacks", `${part}.json`), "utf8"));
+    const fns = Object.values<any>(t.Resources).filter((r) => r.Type === "AWS::Lambda::Function" && r.Properties?.Environment?.Variables?.INSTALL_OWN_ROLE_ARN);
+    assert.ok(fns.length > 0, part);
+    for (const f of fns) assert.equal(f.Properties.Environment.Variables.INSTALL_READER_KEPT, "1", part);
   }
 });

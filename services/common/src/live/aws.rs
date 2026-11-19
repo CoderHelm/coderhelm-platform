@@ -513,6 +513,35 @@ pub fn in_install_account(role_arn: &str, own: Option<&str>) -> bool {
     })
 }
 
+/// On a one-stack (native) self-hosted install: "1" when its access stack
+/// keeps the `CoderHelmLogReader` role in the install's own account current
+/// with each release (infra/lib/native/access-stack.ts, the reader update;
+/// lambda/native-reader). Set by infra/lib/service-env.ts.
+pub const READER_KEPT_ENV: &str = "INSTALL_READER_KEPT";
+
+/// This install brings each release's read-only permissions to the
+/// `CoderHelmLogReader` role in its own account by itself.
+pub fn reader_kept_by_release() -> bool {
+    std::env::var(READER_KEPT_ENV).is_ok_and(|v| v.trim() == "1")
+}
+
+/// Pure: `role_arn` is a reader whose permissions arrive with the release:
+/// it is in the install's own account (`own`, the install's read role) and
+/// the install keeps that account's reader current (`kept`). Nobody is ever
+/// asked to update such a role.
+pub fn reader_updates_with_release(role_arn: &str, own: Option<&str>, kept: bool) -> bool {
+    kept && in_install_account(role_arn, own)
+}
+
+/// [`reader_updates_with_release`] for this process (its environment).
+pub fn updates_with_release(role_arn: &str) -> bool {
+    reader_updates_with_release(
+        role_arn,
+        install_read_role().as_deref(),
+        reader_kept_by_release(),
+    )
+}
+
 /// A session on the function's own role (its environment's credentials),
 /// in `region`. `None` outside Lambda.
 pub fn own_session(region: &str) -> Option<Session> {
@@ -765,6 +794,18 @@ mod tests {
             Some("not-an-arn")
         ));
         assert!(in_install_account(&team, Some(OWN)));
+    }
+
+    #[test]
+    fn only_a_reader_the_install_keeps_updates_with_the_release() {
+        let own = reader("111122223333").role_arn;
+        let other = reader("999988887777").role_arn;
+        assert!(reader_updates_with_release(&own, Some(OWN), true));
+        // An install that doesn't keep the reader (installed from the CLI):
+        // its own account is updated like any other.
+        assert!(!reader_updates_with_release(&own, Some(OWN), false));
+        assert!(!reader_updates_with_release(&other, Some(OWN), true));
+        assert!(!reader_updates_with_release(&own, None, true));
     }
 
     #[test]
