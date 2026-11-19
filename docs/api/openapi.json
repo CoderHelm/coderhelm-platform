@@ -5034,7 +5034,7 @@
             "type": "array"
           },
           "stage": {
-            "description": "`not_needed`, `triggered`, `deploying`, `ready`, `checked`,\n`failed` or `blocked`.",
+            "description": "`not_needed`, `triggered`, `deploying`, `ready`, `checked`,\n`failed`, `approval` (a check waits for a person to approve its\nenvironment) or `blocked`.",
             "examples": [
               "checked"
             ],
@@ -5078,7 +5078,7 @@
             "type": "string"
           },
           "outcome": {
-            "description": "`passed`, `failed`, `running` or `skipped`.",
+            "description": "`passed`, `failed`, `running`, `waiting` (for a person to approve\nits environment) or `skipped`.",
             "examples": [
               "passed"
             ],

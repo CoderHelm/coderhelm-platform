@@ -282,6 +282,16 @@ enum Stall {
     Note(String),
 }
 
+/// A preview check as a hold names it: `` `name` what ([run](url)) ``.
+fn linked_check(c: &common::preview::CheckResult, what: &str) -> String {
+    let name = c.name.replace('`', "'");
+    if c.url.starts_with("https://") {
+        format!("`{name}` {what} ([run]({}))", c.url)
+    } else {
+        format!("`{name}` {what}")
+    }
+}
+
 fn check_names(v: &[String]) -> String {
     v.iter()
         .map(|n| format!("`{n}`"))
@@ -591,15 +601,93 @@ fn decide_raw(f: &Facts) -> Decision {
         }
         match p.stage {
             Stage::Failed => {
-                let failed: Vec<String> = p
+                // A failing check CI's hold already names isn't held twice.
+                let named_by_ci = |n: &str| f.ci.failing() && f.ci.why.contains(&format!("`{n}`"));
+                let failed: Vec<&common::preview::CheckResult> = p
                     .checks
                     .iter()
                     .filter(|c| c.outcome == PvOutcome::Failed)
+                    .collect();
+                let fixable: Vec<String> = failed
+                    .iter()
+                    .filter(|c| !c.no_jobs && !named_by_ci(&c.name))
                     .map(|c| c.name.clone())
                     .collect();
-                reasons.push(Reason::new(
-                    format!("The preview checks failed: {}", check_names(&failed)),
-                    "CoderHelm fixes the cause like any failing check and pushes; the preview runs again on the new head.",
+                if failed.is_empty() {
+                    reasons.push(Reason::new(
+                        "The preview checks failed",
+                        "CoderHelm fixes the cause like any failing check and pushes; the preview runs again on the new head.",
+                    ));
+                }
+                if !fixable.is_empty() {
+                    let deploy = fixable.iter().all(|n| {
+                        p.covers.iter().any(|c| {
+                            !c.label.is_empty()
+                                && common::preview::is_covering(std::slice::from_ref(c), n)
+                        })
+                    });
+                    reasons.push(Reason::new(
+                        format!(
+                            "The {} checks failed: {}",
+                            if deploy { "deploy label's" } else { "preview" },
+                            check_names(&fixable)
+                        ),
+                        "CoderHelm fixes the cause like any failing check and pushes; the preview runs again on the new head.",
+                    ));
+                }
+                let unstarted: Vec<String> = failed
+                    .iter()
+                    .filter(|c| c.no_jobs)
+                    .map(|c| linked_check(c, "failed to start"))
+                    .collect();
+                if !unstarted.is_empty() {
+                    // The workflow's setup (its secrets, permissions, the
+                    // environment it deploys to) is what CoderHelm can't reach.
+                    reasons.push(Reason::person(
+                        common::handback::HumanOnly::MissingAccess,
+                        format!(
+                            "The deploy label's workflow didn't pass on this head: {}",
+                            unstarted.join(", ")
+                        ),
+                        "No job ran, so there is nothing on this branch to fix: the workflow's \
+                         setup in the repository (its secrets, permissions or the environment it \
+                         deploys to) stopped it. Re-run the workflow once that is right; the pull \
+                         request leaves draft once it passes.",
+                    ));
+                }
+            }
+            Stage::Approval => {
+                let held: Vec<&common::preview::CheckResult> = p
+                    .checks
+                    .iter()
+                    .filter(|c| c.outcome == PvOutcome::Waiting)
+                    .collect();
+                let envs: Vec<String> = held
+                    .iter()
+                    .filter(|c| !c.environment.is_empty())
+                    .map(|c| format!("`{}`", c.environment.replace('`', "'")))
+                    .collect();
+                let todo = if !envs.is_empty() && envs.len() == held.len() {
+                    format!(
+                        "Approve the deployment to {} on the workflow run; the pull request leaves \
+                         draft once the checks pass.",
+                        envs.join(", ")
+                    )
+                } else {
+                    "Approve the waiting deployment on the workflow run; the pull request leaves \
+                     draft once the checks pass."
+                        .to_string()
+                };
+                reasons.push(Reason::person(
+                    common::handback::HumanOnly::Approval,
+                    format!(
+                        "A check is waiting for an environment's approval: {}",
+                        held.iter()
+                            .map(|c| linked_check(c, "waiting for an approval"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                    todo,
                 ));
             }
             Stage::Triggered | Stage::Deploying => {
@@ -2568,6 +2656,139 @@ mod tests {
             stage,
             draft_gated: vec!["Deploy Preview".into(), "E2E on preview".into()],
             ..Default::default()
+        }
+    }
+
+    fn deploy_check(name: &str, outcome: common::preview::Outcome) -> common::preview::CheckResult {
+        common::preview::CheckResult {
+            name: name.into(),
+            outcome,
+            url: format!("https://github.com/o/r/actions/runs/7/job/{}", name.len()),
+            environment: String::new(),
+            no_jobs: false,
+        }
+    }
+
+    fn deploy_preview(
+        stage: common::preview::Stage,
+        checks: Vec<common::preview::CheckResult>,
+    ) -> common::preview::State {
+        common::preview::State {
+            head: "abc".into(),
+            stage,
+            covers: vec![common::preview::Covering {
+                check: "Deploy app".into(),
+                workflow: ".github/workflows/deploy.yml".into(),
+                label: "CI:DEPLOY_PREVIEW".into(),
+                ..Default::default()
+            }],
+            checks,
+            ..Default::default()
+        }
+    }
+
+    /// The deploy label's workflow is also a failing CI check: one hold for
+    /// it, never one from CI and one from the preview.
+    #[test]
+    fn a_failed_deploy_label_check_is_held_once() {
+        use common::preview::{Outcome as O, Stage};
+        let failing = deploy_preview(Stage::Failed, vec![deploy_check("Deploy app", O::Failed)]);
+        // CI names it: only CI's hold.
+        let f = Facts {
+            head: "abc".into(),
+            ci: Ci {
+                green: false,
+                why: "CI fails on this head: `Deploy app`".into(),
+            },
+            preview: Some(failing.clone()),
+            ..green_approved()
+        };
+        match found(&f) {
+            Decision::Held { reasons } => {
+                assert_eq!(reasons.len(), 1, "{reasons:?}");
+                assert!(reasons[0].line().starts_with("CI is failing on this head"));
+            }
+            d => panic!("{d:?}"),
+        }
+        // A later skipped run hides it from CI, which reads green: the
+        // preview's hold names it, with the fix loop's words.
+        let f = Facts {
+            head: "abc".into(),
+            preview: Some(failing),
+            ..green_approved()
+        };
+        match found(&f) {
+            Decision::Held { reasons } => {
+                assert_eq!(reasons.len(), 1, "{reasons:?}");
+                assert!(reasons[0]
+                    .line()
+                    .starts_with("The deploy label's checks failed: `Deploy app`"));
+                assert!(reasons[0].line().contains("CoderHelm fixes the cause"));
+            }
+            d => panic!("{d:?}"),
+        }
+    }
+
+    /// A deploy workflow that failed before any job ran has nothing on the
+    /// branch to fix: a person re-runs it, and the hold says so.
+    #[test]
+    fn a_deploy_workflow_that_failed_to_start_is_a_persons_hold() {
+        use common::preview::{Outcome as O, Stage};
+        let mut c = deploy_check("Deploy app", O::Failed);
+        c.no_jobs = true;
+        let f = Facts {
+            head: "abc".into(),
+            preview: Some(deploy_preview(Stage::Failed, vec![c])),
+            ..green_approved()
+        };
+        match decide(&f) {
+            Decision::Held { reasons } => {
+                assert_eq!(reasons.len(), 1, "{reasons:?}");
+                let l = reasons[0].line();
+                assert!(l.contains("`Deploy app` failed to start ([run](https://github.com/o/r/actions/runs/7/job/10))"), "{l}");
+                assert!(l.contains("nothing on this branch to fix"), "{l}");
+                assert!(!l.contains("CoderHelm fixes the cause"), "{l}");
+            }
+            d => panic!("{d:?}"),
+        }
+    }
+
+    /// A check held for a protected environment asks for that approval,
+    /// naming the environment, instead of waiting on time.
+    #[test]
+    fn a_check_held_for_an_environment_asks_for_that_approval() {
+        use common::preview::{Outcome as O, Stage};
+        let mut c = deploy_check("Deploy app", O::Waiting);
+        c.environment = "preview".into();
+        let f = Facts {
+            head: "abc".into(),
+            preview: Some(deploy_preview(Stage::Approval, vec![c.clone()])),
+            ..green_approved()
+        };
+        match decide(&f) {
+            Decision::Held { reasons } => {
+                let l = reasons[0].line();
+                assert!(l.starts_with("A check is waiting for an environment's approval: `Deploy app` waiting for an approval ([run]("), "{l}");
+                assert!(
+                    l.contains("Approve the deployment to `preview` on the workflow run"),
+                    "{l}"
+                );
+            }
+            d => panic!("{d:?}"),
+        }
+        c.environment.clear();
+        let f = Facts {
+            head: "abc".into(),
+            preview: Some(deploy_preview(Stage::Approval, vec![c])),
+            ..green_approved()
+        };
+        match decide(&f) {
+            Decision::Held { reasons } => {
+                assert!(reasons[0]
+                    .line()
+                    .contains("Approve the waiting deployment on the workflow run"))
+            }
+            d => panic!("{d:?}"),
         }
     }
 
