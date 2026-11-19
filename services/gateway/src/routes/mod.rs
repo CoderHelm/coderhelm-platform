@@ -48,6 +48,7 @@ pub mod installation_owner;
 pub mod integration_status;
 pub mod integrations;
 pub mod jira_app_status;
+pub mod jira_heal;
 pub mod jira_webhook;
 pub mod knowledge;
 pub mod knowledge_ask;

@@ -115,6 +115,11 @@ pub struct Local {
     pub jira_site: String,
     #[serde(default)]
     pub jira_synced_at: String,
+    /// The triggers the copied settings hold links for, by name: when the
+    /// linked site registers another (an app update that adds one),
+    /// CoderHelm's list differs and the settings are copied again.
+    #[serde(default)]
+    pub jira_synced_triggers: Vec<String>,
 }
 
 static LOCAL: RwLock<Option<(Instant, Local)>> = RwLock::new(None);
@@ -1448,8 +1453,18 @@ pub enum JiraSync {
 pub fn jira_sync_plan(l: &Local, link: Option<&Value>) -> JiraSync {
     match link.filter(|v| v.is_object()) {
         Some(v) if l.jira_link => {
+            let hosted_triggers: Option<Vec<String>> = v["triggers"].as_array().map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            });
             if v["linked_at"].as_str() == Some(l.jira_synced_at.as_str())
                 && !l.jira_synced_at.is_empty()
+                && !common::jira_connection::copy_is_stale(
+                    hosted_triggers.as_deref(),
+                    &l.jira_synced_triggers,
+                )
             {
                 JiraSync::Nothing
             } else {
@@ -1459,6 +1474,42 @@ pub fn jira_sync_plan(l: &Local, link: Option<&Value>) -> JiraSync {
         _ if !l.jira_synced_at.is_empty() => JiraSync::Forget,
         _ => JiraSync::Nothing,
     }
+}
+
+/// The trigger names CoderHelm's `/hybrid/jira/config` answer holds a link
+/// for (it sends a link only for a trigger the site registered).
+pub fn copied_triggers(cfg: &Value) -> Vec<String> {
+    super::hybrid_jira::TRIGGERS
+        .iter()
+        .filter(|(field, _)| cfg[*field].as_str().is_some_and(|u| !u.is_empty()))
+        .map(|(_, name)| name.to_string())
+        .collect()
+}
+
+/// Copies the linked site's settings again now, whatever the last copy
+/// was: for a reader (chat) that found the copy missing a trigger. True when
+/// it copied.
+pub async fn refresh_jira_copy(state: &AppState) -> bool {
+    if !super::setup_checks::self_hosted() {
+        return false;
+    }
+    let mut l = local(state).await;
+    if !l.jira_link {
+        return false;
+    }
+    let Some(c) = creds_now().await else {
+        return false;
+    };
+    let Ok(hosted) = client::call(&state.http, &c, "GET", "/hybrid/status", None).await else {
+        return false;
+    };
+    if !hosted["jira"]["link"].is_object() {
+        return false;
+    }
+    // Forgetting which link was copied (in memory only) makes the plan copy;
+    // the copy saves the new marks.
+    l.jira_synced_at.clear();
+    sync_jira(state, &mut l, Some(&hosted)).await.is_ok()
 }
 
 /// Keeps this install's Jira settings in step with the link on CoderHelm:
@@ -1529,6 +1580,7 @@ pub async fn sync_jira(
             let v = link.cloned().unwrap_or_default();
             l.jira_site = v["site_url"].as_str().unwrap_or("").to_string();
             l.jira_synced_at = v["linked_at"].as_str().unwrap_or("").to_string();
+            l.jira_synced_triggers = copied_triggers(&cfg);
             save_local(state, l)
                 .await
                 .map_err(|_| "jira_link_unsynced")?;
@@ -1581,6 +1633,7 @@ async fn forget_jira(state: &AppState, l: &mut Local) {
     }
     l.jira_site.clear();
     l.jira_synced_at.clear();
+    l.jira_synced_triggers.clear();
 }
 
 /// The linked site's settings are copied here, fetching them now when they
@@ -2009,6 +2062,17 @@ pub async fn intake(
                             "This install has no team yet. Sign up first.",
                         )
                     })?;
+                    // The site's app runs another version than last seen, or
+                    // the copy lacks a link the app always registers: copy
+                    // CoderHelm's settings again (asking the app to register
+                    // first when CoderHelm lacks it too).
+                    let copy = team_jira_item(&state, &team).await;
+                    let version = payload
+                        .pointer("/coderhelm/app_version")
+                        .and_then(Value::as_str);
+                    if super::jira_heal::wants_heal(copy.as_ref(), version) {
+                        Box::pin(super::jira_heal::heal(&state, &team, copy.as_ref())).await;
+                    }
                     return super::jira_webhook::process_relayed(&state, &team, &payload)
                         .await
                         .map_err(|code| {
@@ -2820,6 +2884,61 @@ mod tests {
         assert_eq!(jira_sync_plan(&off, Some(&link)), JiraSync::Forget);
         off.jira_synced_at.clear();
         assert_eq!(jira_sync_plan(&off, Some(&link)), JiraSync::Nothing);
+    }
+
+    #[test]
+    fn a_trigger_the_site_registers_after_the_link_is_copied_again() {
+        // Linked and copied before the app had its ticket lookup.
+        let mut l = Local {
+            jira_link: true,
+            jira_synced_at: "2026-11-02T00:00:00Z".into(),
+            ..Default::default()
+        };
+        let before = json!({
+            "list_projects_url": "https://api.example.com/hybrid/jira/trigger/ins_a/list_projects/t",
+            "create_ticket_url": "https://api.example.com/hybrid/jira/trigger/ins_a/create_ticket/t",
+            "add_comment_url": "https://api.example.com/hybrid/jira/trigger/ins_a/add_comment/t",
+            "publish_release_url": "",
+            "get_issues_url": "",
+            "confluence_trigger_url": "",
+        });
+        l.jira_synced_triggers = copied_triggers(&before);
+        assert_eq!(
+            l.jira_synced_triggers,
+            vec!["list_projects", "create_ticket", "add_comment"]
+        );
+        let link = |triggers: &[&str]| json!({ "team_id": "TEAM#1", "linked_at": "2026-11-02T00:00:00Z", "triggers": triggers });
+        // CoderHelm's record unchanged: nothing to copy.
+        assert_eq!(
+            jira_sync_plan(
+                &l,
+                Some(&link(&["list_projects", "create_ticket", "add_comment"]))
+            ),
+            JiraSync::Nothing
+        );
+        // The site registered its lookup on CoderHelm: the same link, copied again.
+        assert_eq!(
+            jira_sync_plan(
+                &l,
+                Some(&link(&[
+                    "list_projects",
+                    "create_ticket",
+                    "add_comment",
+                    "get_issues"
+                ]))
+            ),
+            JiraSync::Copy
+        );
+        // An install copied before this change holds no list: it copies once.
+        let mut old = l.clone();
+        old.jira_synced_triggers.clear();
+        assert_eq!(
+            jira_sync_plan(&old, Some(&link(&["add_comment", "get_issues"]))),
+            JiraSync::Copy
+        );
+        // A hosted side that sends no list: only a relink copies, as before.
+        let bare = json!({ "team_id": "TEAM#1", "linked_at": "2026-11-02T00:00:00Z" });
+        assert_eq!(jira_sync_plan(&old, Some(&bare)), JiraSync::Nothing);
     }
 
     #[test]

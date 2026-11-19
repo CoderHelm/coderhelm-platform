@@ -614,6 +614,7 @@ impl WorkBox<'_> {
             store: &store,
             http: &http,
             jira: Some(&app),
+            jira_off: "",
             github: Some(fx::gh()),
             repos: &repos,
             readable: &self.readable,

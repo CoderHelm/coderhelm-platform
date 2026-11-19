@@ -1078,10 +1078,27 @@ pub async fn list(
     ));
 
     // Jira.
-    let forge = jira_config
+    // The one test of "connected" chat and the runs use too
+    // (`common::jira_connection`).
+    let conn = common::jira_connection::Connection::from_config(
+        jira_config.as_ref(),
+        jira_secret.is_some(),
+    );
+    let forge = conn.app;
+    let jira_on = conn.connected();
+    // An ability the app lacks is named, and put right by the system.
+    let ticket_reads = match conn.ticket_reads() {
+        common::jira_connection::TicketReads::Ready { .. } => json!({ "ready": true }),
+        common::jira_connection::TicketReads::Off(gap) => {
+            json!({ "ready": false, "why": gap.words() })
+        }
+    };
+    if jira_config
         .as_ref()
-        .is_some_and(|i| !s(i, "add_comment_url").is_empty());
-    let jira_on = forge || jira_secret.is_some();
+        .is_some_and(|i| !common::jira_connection::missing_registrations(i).is_empty())
+    {
+        Box::pin(super::jira_heal::heal(&state, &team, jira_config.as_ref())).await;
+    }
     // The site's app is older than the latest release: what it lacks and
     // where its admin accepts the update.
     let app_update = if forge {
@@ -1106,7 +1123,7 @@ pub async fn list(
         },
         "",
         "/settings/integrations/jira",
-        json!({ "app": forge, "app_update": app_update }),
+        json!({ "app": forge, "app_update": app_update, "ticket_reads": ticket_reads }),
     );
     let mut confluence_part = Value::Null;
     let mut agent_tools_part = Value::Null;

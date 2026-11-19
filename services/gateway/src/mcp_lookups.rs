@@ -960,7 +960,7 @@ async fn connect(
             if tickets {
                 crate::routes::chat_work_tickets::load(state, team).await
             } else {
-                None
+                crate::routes::chat_work_tickets::Jira::default()
             }
         },
         async {
