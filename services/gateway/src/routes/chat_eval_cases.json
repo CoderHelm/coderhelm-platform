@@ -1,0 +1,381 @@
+[
+  {
+    "name": "real: what caused a disk-full error",
+    "origin": "real",
+    "intent": "lookup",
+    "question": "what caused the ENOSPC error?",
+    "wants": "The cause of the 'no space left on device' errors the web app logs, from the logs and code, and whether it is still happening."
+  },
+  {
+    "name": "real: can you run skills in a repository",
+    "origin": "real",
+    "intent": "capability",
+    "question": "are you able to run skills in the harbor-web repo",
+    "wants": "A yes or no on whether Chat can run the team's skills in that repository, and what it can do instead."
+  },
+  {
+    "name": "real: is a linked pull request comment accurate",
+    "origin": "real",
+    "intent": "judgement",
+    "question": "is this comment accurate https://github.com/northwind/harbor-web/pull/88#issuecomment-5550001",
+    "wants": "A verdict on whether Coderhelm's comment on pull request 88 is accurate, from what can be checked about that pull request (its checks and runs), saying plainly that the comment's own text couldn't be read if so."
+  },
+  {
+    "name": "real: the same comment, pasted after a non-answer",
+    "origin": "real",
+    "intent": "judgement",
+    "history": [
+      ["user", "is this comment accurate https://github.com/northwind/harbor-web/pull/88#issuecomment-5550001"],
+      ["assistant", "I looked through your team's code and knowledge and found nothing that answers this, so I won't guess. If it lives in a document Coderhelm can't see yet, add it to Knowledge or attach it to your question."]
+    ],
+    "question": "on pr https://github.com/northwind/harbor-web/pull/88 coderhelm left this comment: Post-merge health check FAILED, the merge introduced NEW check failure(s): e2e. A human should decide on a rollback. Is it accurate?",
+    "wants": "A verdict on whether the e2e failure after merging pull request 88 is new and real, from the pull request's checks and runs, and what to look at before deciding on a rollback."
+  },
+  {
+    "name": "real: how to cancel a booking (from a knowledge page)",
+    "origin": "real",
+    "intent": "how_to",
+    "question": "How can I cancel a booking?",
+    "wants": "The steps and rules for cancelling a slip booking, from the team's own policy documents."
+  },
+  {
+    "name": "real: a new leader asks what could be useful to them",
+    "origin": "real",
+    "intent": "orientation",
+    "question": "this is my first time using coderhelm. i'm the cto of the company. are are a few things that you think could be useful to me",
+    "wants": "An orientation for a CTO new to Coderhelm: what Coderhelm already does for their team (from real data) and a few things it can do for someone in their role. Not a to-do list."
+  },
+  {
+    "name": "real: the leader questions a claim that Jira isn't connected",
+    "origin": "real",
+    "intent": "correction",
+    "history": [
+      ["user", "this is my first time using coderhelm. i'm the cto of the company. are are a few things that you think could be useful to me"],
+      ["assistant", "Welcome. Here are the things I think will matter most to you, starting with something already waiting on you.\n\n## 1. Questions only you can answer\nI checked what's waiting on you: **4 items: 2 need you now, 1 today, 1 when you can.** The first is [ABC-1 Retry the export job](/runs/detail?id=01A), which stopped on a question about its retry limit. Jira isn't connected to Coderhelm, so your Jira tickets aren't in this list.\n\n## 2. Status of any piece of work\nAsk things like \"where are we on HAR-27?\".\n\n## 3. Getting work done by Coderhelm\nAdd the coderhelm label to a Jira ticket."]
+    ],
+    "question": "what do you mean that jira isn't connected? i see atlassian in the integrations",
+    "wants": "A re-check of the Jira connection made now, a plain admission that the earlier claim was wrong (Jira is connected), and the right answer about what that means for their list."
+  },
+  {
+    "name": "real: what a crawler's name means",
+    "origin": "real",
+    "intent": "lookup",
+    "question": "what does B7 mean in reference to crawlers",
+    "wants": "What 'B7' names in the team's firewall setup, from the code that defines it."
+  },
+  {
+    "name": "orientation: what can you do",
+    "origin": "variant",
+    "intent": "orientation",
+    "question": "What can you do?",
+    "wants": "A short overview of what Chat and Coderhelm can do for this team, grounded in what is set up, with example questions."
+  },
+  {
+    "name": "orientation: a product manager asks how Coderhelm helps",
+    "origin": "variant",
+    "intent": "orientation",
+    "question": "I'm a product manager on the bookings team. How can coderhelm help me?",
+    "wants": "What Coderhelm does that matters to a product manager (where work stands, tickets to pull requests, answers from docs), grounded in this team's setup, with example questions."
+  },
+  {
+    "name": "orientation: first day, where to start",
+    "origin": "variant",
+    "intent": "orientation",
+    "question": "first day here, where do I start?",
+    "wants": "A brief welcome and a few first things to try in Coderhelm, based on what is set up for the team."
+  },
+  {
+    "name": "orientation: what is Coderhelm",
+    "origin": "variant",
+    "intent": "orientation",
+    "question": "what is coderhelm exactly?",
+    "wants": "A plain explanation of what Coderhelm is and what it does for this team, briefly."
+  },
+  {
+    "name": "orientation: an engineering leader asks what to use it for",
+    "origin": "variant",
+    "intent": "orientation",
+    "question": "As the VP of engineering, what should I use you for?",
+    "wants": "The few things that matter to a VP of engineering (where work stands, review and security posture, what Coderhelm ships), grounded in this team's data, with example questions."
+  },
+  {
+    "name": "capability: production logs",
+    "origin": "variant",
+    "intent": "capability",
+    "question": "Can you see our production logs?",
+    "wants": "A yes or no on whether Chat can read the team's logs, from what is connected, and what it can look at."
+  },
+  {
+    "name": "capability: merge pull requests",
+    "origin": "variant",
+    "intent": "capability",
+    "question": "can you merge PRs for me?",
+    "wants": "A clear no for Chat (it only reads), and how Coderhelm merges (auto merge after approval) or what to do instead."
+  },
+  {
+    "name": "capability: access to the wiki",
+    "origin": "variant",
+    "intent": "capability",
+    "question": "Do you have access to our Confluence?",
+    "wants": "Whether Confluence or the team's docs are readable, from what is connected and the knowledge bases, without guessing."
+  },
+  {
+    "name": "capability: run the tests",
+    "origin": "variant",
+    "intent": "capability",
+    "question": "can you run the harbor-api test suite?",
+    "wants": "A clear no (Chat can't run commands or tests) and what it can do instead (read the tests, or have a run do it)."
+  },
+  {
+    "name": "capability: review pull requests",
+    "origin": "variant",
+    "intent": "capability",
+    "question": "is coderhelm able to review our pull requests?",
+    "wants": "Yes, with how (the review label) and what this team's reviews look like if any are recorded."
+  },
+  {
+    "name": "needs me: what needs my answer",
+    "origin": "variant",
+    "intent": "needs_me",
+    "question": "What needs my answer?",
+    "wants": "The list of what is waiting on them, most urgent first, with links and what to do."
+  },
+  {
+    "name": "needs me: anything waiting on me",
+    "origin": "variant",
+    "intent": "needs_me",
+    "question": "anything waiting on me today?",
+    "wants": "The list of what is waiting on them, most urgent first."
+  },
+  {
+    "name": "needs me: am I blocking anyone",
+    "origin": "variant",
+    "intent": "needs_me",
+    "question": "am I blocking anyone?",
+    "wants": "Whether anything is waiting on them, especially reviews and questions others wait on."
+  },
+  {
+    "name": "needs me: my reviews",
+    "origin": "variant",
+    "intent": "needs_me",
+    "question": "do I have reviews pending?",
+    "wants": "The pull requests waiting on their review, and nothing unrelated in front of that."
+  },
+  {
+    "name": "status: the latest on a ticket by title",
+    "origin": "variant",
+    "intent": "status",
+    "question": "What's the latest on \"Embed the booking portal on the signup pages\"?",
+    "wants": "Where that ticket stands, its pull request and checks, with dates."
+  },
+  {
+    "name": "status: what is running",
+    "origin": "variant",
+    "intent": "status",
+    "question": "What's running now?",
+    "wants": "The runs working right now."
+  },
+  {
+    "name": "status: is a ticket merged",
+    "origin": "variant",
+    "intent": "status",
+    "question": "is HAR-27 merged yet?",
+    "wants": "Yes or no on whether HAR-27's pull request is merged, with where it stands and when it last changed."
+  },
+  {
+    "name": "status: why a run stopped",
+    "origin": "variant",
+    "intent": "status",
+    "question": "Why did the run for HAR-12 stop?",
+    "wants": "Why the HAR-12 run stopped, from the run's record."
+  },
+  {
+    "name": "status: is a CVE fixed",
+    "origin": "variant",
+    "intent": "status",
+    "question": "Is CVE-2026-1234 fixed in harbor-web?",
+    "wants": "Yes or no on whether that advisory is fixed in harbor-web, with the fix."
+  },
+  {
+    "name": "how-to: get Coderhelm to work on a ticket",
+    "origin": "variant",
+    "intent": "how_to",
+    "question": "how do I get coderhelm to work on a ticket?",
+    "wants": "The steps to hand a ticket to Coderhelm (the label or the comment), briefly."
+  },
+  {
+    "name": "how-to: run the API locally",
+    "origin": "variant",
+    "intent": "how_to",
+    "question": "How do I run harbor-api locally?",
+    "wants": "The steps to run harbor-api on a laptop, from its README."
+  },
+  {
+    "name": "how-to: get a full refund",
+    "origin": "variant",
+    "intent": "how_to",
+    "question": "how can a boater get a full refund?",
+    "wants": "The rule for a full refund (cancel at least 48 hours before arrival), from the code or policy."
+  },
+  {
+    "name": "how-to: transfer a booking",
+    "origin": "variant",
+    "intent": "how_to",
+    "question": "What's the process to move a booking to another date?",
+    "wants": "The rescheduling rules from the team's policy documents."
+  },
+  {
+    "name": "lookup: how a repository is put together",
+    "origin": "variant",
+    "intent": "lookup",
+    "question": "How is harbor-api put together?",
+    "wants": "The main parts of harbor-api and how a request moves through them, from the code."
+  },
+  {
+    "name": "lookup: where refunds are handled",
+    "origin": "variant",
+    "intent": "lookup",
+    "question": "Where are refunds handled?",
+    "wants": "The file and function that handle refunds."
+  },
+  {
+    "name": "lookup: what a file does",
+    "origin": "variant",
+    "intent": "lookup",
+    "question": "What does src/jobs/expireHolds.ts do?",
+    "wants": "What that job does and when it runs."
+  },
+  {
+    "name": "lookup: who owns a ticket",
+    "origin": "variant",
+    "intent": "lookup",
+    "question": "who is assigned to HAR-27?",
+    "wants": "The assignee of HAR-27, from the ticket."
+  },
+  {
+    "name": "lookup: open infrastructure findings",
+    "origin": "variant",
+    "intent": "lookup",
+    "question": "Which infra findings are open?",
+    "wants": "The open infrastructure findings."
+  },
+  {
+    "name": "judgement: roll back a pull request",
+    "origin": "variant",
+    "intent": "judgement",
+    "question": "should we roll back PR 88?",
+    "wants": "A verdict on rolling back pull request 88 (it isn't merged, so there's nothing to roll back), from its state and checks."
+  },
+  {
+    "name": "judgement: is an upgrade safe",
+    "origin": "variant",
+    "intent": "judgement",
+    "question": "is it safe to bump express in harbor-api to fix CVE-2026-5678?",
+    "wants": "A verdict with the evidence: the open finding, where express is used, and what would need checking."
+  },
+  {
+    "name": "judgement: is the refund rule right",
+    "origin": "variant",
+    "intent": "judgement",
+    "question": "do you think the half refund after 48 hours makes sense the way the code does it?",
+    "wants": "A view on the refund rule as coded (48 hours full, otherwise half, floor), with the code cited and any edge case."
+  },
+  {
+    "name": "judgement: retry a failed run",
+    "origin": "variant",
+    "intent": "judgement",
+    "question": "is the HAR-12 run worth retrying as is?",
+    "wants": "A verdict: the run failed because the change used 24 hours where the tests expect 48, so retrying unchanged would likely fail again."
+  },
+  {
+    "name": "correction: a wrong fact about the code",
+    "origin": "variant",
+    "intent": "correction",
+    "history": [
+      ["user", "how long before arrival does a boater have to cancel for a full refund?"],
+      ["assistant", "A boater gets a full refund when they cancel at least 24 hours before arrival."]
+    ],
+    "question": "that's wrong, I'm pretty sure it's 48 hours",
+    "wants": "A re-check of the code now, a plain admission that 24 hours was wrong, and the right rule (48 hours, half after that)."
+  },
+  {
+    "name": "correction: a wrong claim that nothing is running",
+    "origin": "variant",
+    "intent": "correction",
+    "history": [
+      ["user", "anything running?"],
+      ["assistant", "Nothing is running right now."]
+    ],
+    "question": "are you sure? I can see a run working on the waitlist",
+    "wants": "A re-check of the running runs now, an admission that a run is working (HAR-31, the waitlist), and its state."
+  },
+  {
+    "name": "correction: the answer missed the question",
+    "origin": "variant",
+    "intent": "correction",
+    "history": [
+      ["user", "who wrote the refund logic?"],
+      ["assistant", "Refunds are handled in `src/services/refundService.ts`, which gives a full refund 48 hours out and half after that."]
+    ],
+    "question": "that's not what I asked. I asked who wrote it",
+    "wants": "An acknowledgement that the answer missed the question, then an honest answer about who wrote it from what can be checked (or exactly what couldn't be checked)."
+  },
+  {
+    "name": "correction: a claim that GitHub isn't connected",
+    "origin": "variant",
+    "intent": "correction",
+    "history": [
+      ["user", "can you read our code?"],
+      ["assistant", "GitHub isn't connected to Coderhelm, so I can't read your code."]
+    ],
+    "question": "what do you mean github isn't connected? we installed the app last week",
+    "wants": "A re-check of GitHub made now, a plain admission that the claim was wrong (the app is installed and code is readable), and the right answer."
+  },
+  {
+    "name": "correction: a claim that was right",
+    "origin": "variant",
+    "intent": "correction",
+    "history": [
+      ["user", "Is CVE-2026-5678 fixed in harbor-api?"],
+      ["assistant", "No, CVE-2026-5678 (open redirect in express 4.19.2) is still open in harbor-api."]
+    ],
+    "question": "are you sure? I thought we fixed that one",
+    "wants": "A re-check of the finding now that confirms it is still open, said plainly, with the evidence."
+  },
+  {
+    "name": "small talk: thanks",
+    "origin": "variant",
+    "intent": "small_talk",
+    "history": [
+      ["user", "What's running now?"],
+      ["assistant", "One run is working now: HAR-31, adding a waitlist to full slips."]
+    ],
+    "question": "thanks!",
+    "wants": "A short, warm acknowledgement. No lookups, no unrequested dump."
+  },
+  {
+    "name": "small talk: hi",
+    "origin": "variant",
+    "intent": "small_talk",
+    "question": "hi",
+    "wants": "A short greeting and an offer of help, not a canned 'found nothing' line."
+  },
+  {
+    "name": "small talk: ok cool",
+    "origin": "variant",
+    "intent": "small_talk",
+    "history": [
+      ["user", "Is CVE-2026-1234 fixed in harbor-web?"],
+      ["assistant", "Yes. It was fixed by upgrading next to 15.0.4 in pull request 80."]
+    ],
+    "question": "ok cool",
+    "wants": "A one-line acknowledgement."
+  },
+  {
+    "name": "small talk: good morning",
+    "origin": "variant",
+    "intent": "small_talk",
+    "question": "good morning!",
+    "wants": "A short greeting, optionally one offer of help."
+  }
+]

@@ -366,7 +366,10 @@ pub fn hint_note(h: &super::chat_hints::Hints, offered: &[&str]) -> String {
     }
     for n in &h.prs {
         if has(PULL_REQUESTS) {
-            steps.push(format!("{PULL_REQUESTS} with number {n}"));
+            match h.repos.first() {
+                Some(r) => steps.push(format!("{PULL_REQUESTS} with number {n} and repo \"{r}\"")),
+                None => steps.push(format!("{PULL_REQUESTS} with number {n}")),
+            }
         }
         if has(RUNS) {
             steps.push(format!("{RUNS} with pr {n}"));
@@ -391,9 +394,14 @@ pub fn hint_note(h: &super::chat_hints::Hints, offered: &[&str]) -> String {
         return String::new();
     }
     steps.truncate(8);
+    let comment = if h.comment_link {
+        " The link points at a comment on that pull request: your lookups read a pull request's state, checks, reviews and the runs on it, not its comments, so judge what the comment claims from those records, and say plainly that you couldn't read the comment itself if its exact words matter."
+    } else {
+        ""
+    };
     format!(
         "\nThis question is about the team's own work. Look it up where it lives first: {}. \
-         Then read code or docs only for context. Give a dated status (when each record last changed).\n",
+         Then read code or docs only for context. Give a dated status (when each record last changed).{comment}\n",
         steps.join("; ")
     )
 }
@@ -468,6 +476,10 @@ pub struct Ctx {
     /// Who its GitHub reads are counted under (`github_budget::caller`):
     /// Chat, or an AI tool on `/mcp`.
     pub caller: &'static str,
+    /// The question is what's waiting on the person: "what needs me" comes
+    /// back in its list's shape. Any other question uses only what answers
+    /// it (`chat_work_needs::NOT_THE_LIST`).
+    pub needs_shape: bool,
 }
 
 /// The installation's spent-limit time, from the worker's record of it.
@@ -729,7 +741,7 @@ async fn needs_me(
             tracing::warn!(tool = NEEDS_ME, source = s.name, error = %e, "Chat: a source of what needs the asker couldn't be read");
         }
     }
-    let (text, summary) = needs::render(&report, reg, &live_stamp());
+    let (text, summary) = needs::render_for(&report, reg, &live_stamp(), ctx.needs_shape);
     (text, summary, false)
 }
 

@@ -12,8 +12,12 @@ pub mod chat_agent;
 pub mod chat_code;
 #[cfg(test)]
 pub mod chat_eval;
+#[cfg(test)]
+pub mod chat_eval_replay;
 pub mod chat_hints;
 pub mod chat_policy;
+pub mod chat_setup;
+pub mod chat_understand;
 pub mod chat_work;
 pub mod chat_work_needs;
 pub mod chat_work_prs;

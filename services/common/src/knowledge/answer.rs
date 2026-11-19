@@ -207,6 +207,12 @@ fn bracket_ids(inner: &str) -> Option<Vec<String>> {
 /// The answer as shown: brackets naming no registered source removed, the
 /// sources it cites listed, and the no-source answer when it cites nothing.
 pub fn finalize(text: &str, reg: &Registry) -> Final {
+    finalize_reply(text, reg, false)
+}
+
+/// [`finalize`], keeping an uncited reply as written when `uncited_ok` (a
+/// greeting or a thanks, which rests on no source).
+pub fn finalize_reply(text: &str, reg: &Registry, uncited_ok: bool) -> Final {
     let mut out = String::with_capacity(text.len());
     let mut cited: Vec<String> = Vec::new();
     let mut rest = text;
@@ -239,6 +245,13 @@ pub fn finalize(text: &str, reg: &Registry) -> Final {
         }
     }
     out.push_str(rest);
+    if cited.is_empty() && uncited_ok && !out.trim().is_empty() {
+        return Final {
+            text: out.replace(" .", ".").replace(" ,", ",").trim().to_string(),
+            citations: Vec::new(),
+            grounded: true,
+        };
+    }
     if cited.is_empty() {
         return Final {
             text: NO_SOURCE_ANSWER.to_string(),
@@ -333,6 +346,19 @@ mod tests {
         let f = finalize("I think it's 12 weeks [S5].", &reg_with(1));
         assert!(!f.grounded);
         assert_eq!(f.text, NO_SOURCE_ANSWER);
+    }
+
+    #[test]
+    fn only_a_reply_that_may_go_uncited_is_kept_uncited() {
+        let f = finalize_reply("You're welcome!", &Registry::default(), true);
+        assert!(f.grounded && f.citations.is_empty());
+        assert_eq!(f.text, "You're welcome!");
+        assert_eq!(
+            finalize_reply("You're welcome!", &Registry::default(), false).text,
+            NO_SOURCE_ANSWER
+        );
+        // An empty reply is never kept.
+        assert!(!finalize_reply("  ", &Registry::default(), true).grounded);
     }
 
     #[test]

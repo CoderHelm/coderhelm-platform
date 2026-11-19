@@ -14,7 +14,7 @@
 //! calls in `model_call`), the [`Toolbox`] (Chat's tools behind the agent
 //! permission gate) and the [`Sink`] (the answer stream).
 
-use common::knowledge::answer::{finalize, Final, Registry};
+use common::knowledge::answer::{finalize, finalize_reply, Final, Registry};
 use common::model_stream::SseParser;
 use common::usage::UsageMeter;
 use futures::StreamExt;
@@ -104,6 +104,8 @@ pub struct Ask<'a> {
     pub limits: Limits,
     /// Where this question's answer would be, when the question says so.
     pub must_look: Option<MustLook>,
+    /// A reply that cites nothing is kept as written (small talk only).
+    pub uncited_ok: bool,
 }
 
 /// The tools a question's answer lives in (a status question: the tickets,
@@ -135,8 +137,23 @@ pub fn look_there(what: &str, tools: &[String]) -> String {
 pub fn answer_from(what: &str, tools: &[String]) -> String {
     format!(
         "<check>This question is answered from {what}, and you didn't look there. Call {} now, \
-         then answer in the shape its result gives, with citations.</check>",
+         then answer the question that was asked, with citations.</check>",
         tools.join(", ")
+    )
+}
+
+/// The note sent back when an answer cites nothing it read this turn.
+pub fn cite_something(defs: &[Value]) -> String {
+    let setup = if defs.iter().any(|d| d["name"] == super::chat_setup::SETUP) {
+        " If the question is about Coderhelm itself (what it does, what is connected, what you can do), call coderhelm_setup and cite it."
+    } else {
+        ""
+    };
+    format!(
+        "<check>Your answer cites nothing read in this answer, so it can't be shown as written. \
+         Look up what the answer rests on with your tools and cite it.{setup} Then answer the \
+         question that was asked, first, sized to it. If nothing your tools reach holds the \
+         answer, say exactly where you looked.</check>"
     )
 }
 
@@ -264,6 +281,7 @@ pub async fn run(
         question,
         limits,
         must_look,
+        uncited_ok,
     } = ask;
     let mut used: Vec<Value> = Vec::new();
     let mut calls: Vec<String> = Vec::new();
@@ -315,14 +333,18 @@ pub async fn run(
         if t.stop != "tool_use" || tool_uses.is_empty() || must_answer {
             // An answer. Check it doesn't hand back work the tools can do.
             if has_tools && retries < limits.retries && !must_answer && !text.trim().is_empty() {
-                // In code first; the model's check only when that passes.
+                // In code first; the model's check only when that passes;
+                // then an answer that cites nothing (it would be replaced by
+                // the plain no-source line) looks once with its tools.
+                let cited = uncited_ok || finalize(&text, reg).grounded;
                 let note = match checked_in_code(&text, must_look.as_ref(), &calls, tools.defs()) {
                     Some(note) => Some(note),
                     None => model
                         .ask(check_body(model.check_id(), question, &text, tools.defs()))
                         .await
                         .and_then(|r| read_check(&r))
-                        .map(|what| nudge(&what)),
+                        .map(|what| nudge(&what))
+                        .or_else(|| (!cited).then(|| cite_something(tools.defs()))),
                 };
                 if let Some(note) = note {
                     retries += 1;
@@ -368,7 +390,7 @@ pub async fn run(
                     Called::Stop(note) => {
                         sink.send("text_delta", json!({ "text": note })).await;
                         return Ok(Answered {
-                            fin: finalize(&note, reg),
+                            fin: finalize_reply(&note, reg, true),
                             used,
                             rechecked: retries > 0,
                             calls,
@@ -411,7 +433,7 @@ pub async fn run(
         sink.send("text_reset", json!({})).await;
     }
     Ok(Answered {
-        fin: finalize(&last_text, reg),
+        fin: finalize_reply(&last_text, reg, uncited_ok),
         used,
         rechecked: retries > 0,
         calls,
@@ -709,6 +731,7 @@ mod tests {
             question: q,
             limits: LIMITS,
             must_look: None,
+            uncited_ok: false,
         }
     }
 

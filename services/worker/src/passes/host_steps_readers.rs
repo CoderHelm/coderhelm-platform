@@ -88,6 +88,7 @@ mod tests {
         ("gateway/src/routes/brain.rs", "chat answers questions; it offers read_skill as a source and carries out no steps"),
         ("gateway/src/routes/chat_code.rs", "chat's code reads"),
         ("gateway/src/routes/chat_eval.rs", "chat evaluations"),
+        ("gateway/src/routes/chat_eval_replay.rs", "chat's replay evaluations; a fake read_skill for the fixture team"),
         ("gateway/src/routes/learning.rs", "shows where lessons were written"),
         ("gateway/src/routes/memory.rs", "describes what reviews read"),
         ("gateway/src/routes/plan_chat_tools.rs", "forwards the plan chat's tools to the worker's plan_chat (routed)"),
