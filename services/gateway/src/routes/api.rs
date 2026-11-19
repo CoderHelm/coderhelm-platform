@@ -1025,7 +1025,8 @@ pub struct RunPreviewCheck {
     /// The check's name, as GitHub shows it.
     #[schema(example = "E2E on preview")]
     pub name: String,
-    /// `passed`, `failed`, `running` or `skipped`.
+    /// `passed`, `failed`, `running`, `waiting` (for a person to approve
+    /// its environment) or `skipped`.
     #[schema(example = "passed")]
     pub outcome: String,
     /// The check's page on GitHub; empty when it has none.
@@ -1054,7 +1055,8 @@ pub struct RunPreviewShot {
 #[derive(serde::Serialize, utoipa::ToSchema)]
 pub struct RunPreview {
     /// `not_needed`, `triggered`, `deploying`, `ready`, `checked`,
-    /// `failed` or `blocked`.
+    /// `failed`, `approval` (a check waits for a person to approve its
+    /// environment) or `blocked`.
     #[schema(example = "checked")]
     pub stage: String,
     /// The preview's address; empty when it isn't known.
