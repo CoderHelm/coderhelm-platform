@@ -4148,8 +4148,14 @@ pub async fn forge_register_urls(
     // read Confluence through the app (`common::live::jira_app`).
     let confluence_trigger_url = https_or_empty(common::live::jira_app::CONFLUENCE_TRIGGER_FIELD);
 
-    // Verify the team exists
-    state
+    // The team CoderHelm hosts, or one that moved to a self-hosted install
+    // with its id and whose site stays linked there (the test the Jira
+    // intake makes before it relays an event, `hybrid_jira::relay_team`).
+    // A moved team has no team record here; its hosted `JIRA#config` is the
+    // one the proxy and the install's copy read, so the links are saved on
+    // it, checked by the same secret. Nothing is relayed: the install keeps
+    // getting proxy links from `/hybrid/jira/config`, never these.
+    let team_record = state
         .dynamo
         .get_item()
         .table_name(&state.config.table_name)
@@ -4162,8 +4168,14 @@ pub async fn forge_register_urls(
             StatusCode::INTERNAL_SERVER_ERROR
         })?
         .item
-        .ok_or_else(|| {
-            warn!("forge-register: team not found: {team_id}");
+        .is_some();
+    let linked = !team_record
+        && super::hybrid_jira::standing_route(&state, &team_id)
+            .await
+            .is_some();
+    let registrant =
+        common::jira_connection::Registrant::of(team_record, linked).ok_or_else(|| {
+            warn!("forge-register: team not found and not linked to an install: {team_id}");
             StatusCode::NOT_FOUND
         })?;
 
@@ -4238,8 +4250,8 @@ pub async fn forge_register_urls(
     ))
     .await;
 
-    info!(team_id, "Forge trigger URLs registered");
-    Ok(StatusCode::NO_CONTENT)
+    info!(team_id, ?registrant, "Forge trigger URLs registered");
+    Ok(StatusCode::from_u16(registrant.status()).unwrap_or(StatusCode::OK))
 }
 
 /// GET /api/integrations/jira/config — get Jira config (trigger URLs, default project, label, projects).
@@ -7518,5 +7530,276 @@ mod agent_log_tests {
             super::forge_triggers_ok(&json!({})),
             Err("list_projects_url")
         );
+    }
+}
+
+/// `forge_register_urls` end to end against a stand-in DynamoDB (a local
+/// HTTP server speaking its JSON protocol), so each case runs the handler's
+/// own reads and writes.
+#[cfg(test)]
+mod forge_register_tests {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    use axum::{
+        body::Bytes,
+        extract::State,
+        http::{HeaderMap, StatusCode},
+        response::IntoResponse,
+        Json, Router,
+    };
+    use serde_json::{json, Value};
+
+    const JIRA: &str = "jira-config";
+    const MAIN: &str = "main";
+    const SETTINGS: &str = "settings";
+    const TEAM: &str = "TEAM#moved-team";
+    const INSTALL: &str = "ins_aaaaaaaaaaaaaaaaaaaaaaaa";
+    const SECRET: &str = "site-secret";
+    const FORGE: &str = "https://0a1b2c3d.hello.atlassian-dev.net/x1";
+
+    #[derive(Default)]
+    struct Store {
+        items: HashMap<String, Value>,
+        calls: Vec<(String, Value)>,
+    }
+
+    type Shared = Arc<Mutex<Store>>;
+
+    fn key_of(table: &str, key: &Value) -> String {
+        let s = |k: &str| key[k]["S"].as_str().unwrap_or("").to_string();
+        format!("{table}|{}|{}", s("pk"), s("sk"))
+    }
+
+    fn attrs(pairs: &[(&str, &str)]) -> Value {
+        Value::Object(
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), json!({ "S": v })))
+                .collect(),
+        )
+    }
+
+    async fn dynamo(
+        State(store): State<Shared>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> impl IntoResponse {
+        let target = headers
+            .get("x-amz-target")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .rsplit('.')
+            .next()
+            .unwrap_or("")
+            .to_string();
+        let req: Value = serde_json::from_slice(&body).unwrap_or_default();
+        let mut st = store.lock().unwrap();
+        st.calls.push((target.clone(), req.clone()));
+        let table = req["TableName"].as_str().unwrap_or("");
+        let out = match target.as_str() {
+            "GetItem" => match st.items.get(&key_of(table, &req["Key"])) {
+                Some(item) => json!({ "Item": item }),
+                None => json!({}),
+            },
+            "DeleteItem" => {
+                st.items.remove(&key_of(table, &req["Key"]));
+                json!({})
+            }
+            _ => json!({}),
+        };
+        (
+            [("content-type", "application/x-amz-json-1.0")],
+            out.to_string(),
+        )
+    }
+
+    /// A hosted gateway whose DynamoDB is the stand-in, holding `items`.
+    async fn hosted(items: Vec<(&str, &str, &str, Value)>) -> (Arc<crate::AppState>, Shared) {
+        let store: Shared = Arc::default();
+        for (table, pk, sk, item) in items {
+            let mut item = item;
+            item["pk"] = json!({ "S": pk });
+            item["sk"] = json!({ "S": sk });
+            store
+                .lock()
+                .unwrap()
+                .items
+                .insert(format!("{table}|{pk}|{sk}"), item);
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().fallback(dynamo).with_state(store.clone());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let conf = aws_sdk_dynamodb::Config::builder()
+            .behavior_version(aws_sdk_dynamodb::config::BehaviorVersion::latest())
+            .region(aws_sdk_dynamodb::config::Region::new("us-east-1"))
+            .credentials_provider(aws_sdk_dynamodb::config::Credentials::new(
+                "test", "test", None, None, "test",
+            ))
+            .endpoint_url(format!("http://{addr}"))
+            .build();
+        let Ok(mut state) = Arc::try_unwrap(crate::tests::hosted_state()) else {
+            panic!("a fresh state");
+        };
+        state.dynamo = aws_sdk_dynamodb::Client::from_conf(conf);
+        state.config.table_name = MAIN.into();
+        state.config.jira_config_table_name = JIRA.into();
+        state.config.settings_table_name = SETTINGS.into();
+        (Arc::new(state), store)
+    }
+
+    /// The moved team's records on hosted: its site's `JIRA#config` (no
+    /// lookup link yet), and the link and route to the install. No team record.
+    fn moved_team() -> Vec<(&'static str, &'static str, &'static str, Value)> {
+        vec![
+            (
+                JIRA,
+                TEAM,
+                "JIRA#config",
+                attrs(&[
+                    ("forge_secret", SECRET),
+                    (
+                        "list_projects_url",
+                        "https://0a1b2c3d.hello.atlassian-dev.net/x1/lp",
+                    ),
+                    (
+                        "create_ticket_url",
+                        "https://0a1b2c3d.hello.atlassian-dev.net/x1/ct",
+                    ),
+                    (
+                        "add_comment_url",
+                        "https://0a1b2c3d.hello.atlassian-dev.net/x1/ac",
+                    ),
+                    ("get_issues_url", ""),
+                    ("site_url", "https://example.atlassian.net"),
+                ]),
+            ),
+            (
+                SETTINGS,
+                "HYBRIDJIRA#TEAM#moved-team",
+                "LINK",
+                attrs(&[
+                    ("install_id", INSTALL),
+                    ("linked_at", "2026-11-01T00:00:00Z"),
+                ]),
+            ),
+            (
+                SETTINGS,
+                "HYBRID#ins_aaaaaaaaaaaaaaaaaaaaaaaa",
+                "JIRALINK",
+                attrs(&[
+                    ("team_id", TEAM),
+                    ("site_url", "https://example.atlassian.net"),
+                    ("linked_at", "2026-11-01T00:00:00Z"),
+                ]),
+            ),
+        ]
+    }
+
+    fn registration(team: &str, secret: &str) -> Value {
+        json!({
+            "team_id": team,
+            "forge_secret": secret,
+            "list_projects_url": format!("{FORGE}/lp"),
+            "create_ticket_url": format!("{FORGE}/ct"),
+            "add_comment_url": format!("{FORGE}/ac"),
+            "publish_release_url": "",
+            "get_issues_url": format!("{FORGE}/gi"),
+            "confluence_trigger_url": "",
+            "site_url": "https://example.atlassian.net",
+            "app_version": "7.4.0",
+        })
+    }
+
+    /// The trigger links saved: the update that sets the lookup link.
+    fn saved(store: &Shared) -> Vec<Value> {
+        store
+            .lock()
+            .unwrap()
+            .calls
+            .iter()
+            .filter(|(t, r)| {
+                t == "UpdateItem" && r["ExpressionAttributeValues"].get(":giu").is_some()
+            })
+            .map(|(_, r)| r.clone())
+            .collect()
+    }
+
+    async fn register(state: Arc<crate::AppState>, body: Value) -> Result<StatusCode, StatusCode> {
+        super::forge_register_urls(State(state), Json(body)).await
+    }
+
+    #[tokio::test]
+    async fn a_linked_team_that_moved_registers_on_its_hosted_record() {
+        let (state, store) = hosted(moved_team()).await;
+        let got = register(state, registration(TEAM, SECRET)).await;
+        assert_eq!(got, Ok(StatusCode::OK));
+        let saved = saved(&store);
+        assert_eq!(saved.len(), 1, "one save of the links");
+        let u = &saved[0];
+        assert_eq!(u["TableName"], JIRA);
+        assert_eq!(u["Key"]["pk"]["S"], TEAM);
+        assert_eq!(u["Key"]["sk"]["S"], "JIRA#config");
+        let v = &u["ExpressionAttributeValues"];
+        assert_eq!(v[":giu"]["S"], format!("{FORGE}/gi"));
+        assert_eq!(v[":lpu"]["S"], format!("{FORGE}/lp"));
+        assert_eq!(v[":su"]["S"], "https://example.atlassian.net");
+        // The version it registered with is kept too.
+        let calls = store.lock().unwrap().calls.clone();
+        assert!(calls.iter().any(|(t, r)| t == "UpdateItem"
+            && r["Key"]["pk"]["S"] == TEAM
+            && r["ExpressionAttributeValues"][":v"]["S"] == "7.4.0"));
+        // Nothing is written for the install: no relay delivery, and the
+        // link and route are left as they were.
+        assert!(!calls
+            .iter()
+            .any(|(t, r)| t != "GetItem" && r["TableName"] == SETTINGS));
+    }
+
+    #[tokio::test]
+    async fn a_linked_team_with_the_wrong_secret_is_refused() {
+        let (state, store) = hosted(moved_team()).await;
+        let got = register(state, registration(TEAM, "not-the-secret")).await;
+        assert_eq!(got, Err(StatusCode::FORBIDDEN));
+        assert!(saved(&store).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_team_with_neither_a_record_nor_a_link_is_not_found() {
+        let (state, store) = hosted(vec![]).await;
+        let got = register(state, registration("TEAM#unknown-team", SECRET)).await;
+        assert_eq!(got, Err(StatusCode::NOT_FOUND));
+        assert!(saved(&store).is_empty());
+        // A route left without its link is no link: still not found, and the
+        // route is removed.
+        let mut half = moved_team();
+        half.pop();
+        let (state, store) = hosted(half).await;
+        let got = register(state, registration(TEAM, SECRET)).await;
+        assert_eq!(got, Err(StatusCode::NOT_FOUND));
+        assert!(saved(&store).is_empty());
+        assert!(
+            store
+                .lock()
+                .unwrap()
+                .calls
+                .iter()
+                .any(|(t, r)| t == "DeleteItem"
+                    && r["Key"]["pk"]["S"] == "HYBRIDJIRA#TEAM#moved-team")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_hosted_team_registers_as_before() {
+        let mut items = moved_team();
+        items.truncate(1);
+        items.push((MAIN, TEAM, "META", attrs(&[("name", "A team")])));
+        let (state, store) = hosted(items).await;
+        let got = register(state, registration(TEAM, SECRET)).await;
+        assert_eq!(got, Ok(StatusCode::NO_CONTENT));
+        assert_eq!(saved(&store).len(), 1);
     }
 }

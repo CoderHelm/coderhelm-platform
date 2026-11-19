@@ -23,6 +23,9 @@
 //! - [`registered`] lists the triggers a record holds, so a self-hosted
 //!   install linked through CoderHelm knows when the hosted record gained one
 //!   and copies it again.
+//! - [`Registrant`] says whose record a site's registration updates: a
+//!   hosted team's, or that of a team that moved to a self-hosted install,
+//!   kept its id and stays linked (it has no team record on CoderHelm).
 
 use std::collections::HashMap;
 
@@ -235,6 +238,62 @@ pub fn copy_is_stale(hosted: Option<&[String]>, copied: &[String]) -> bool {
     })
 }
 
+/// Whose record a site's Forge registration (`/integrations/jira/forge-register`)
+/// updates on CoderHelm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Registrant {
+    /// A team CoderHelm hosts: its own record.
+    Hosted,
+    /// A team that moved to a self-hosted install and kept its id, whose
+    /// site stays linked to that install (route and link both stand). The
+    /// hosted record is the one CoderHelm's proxy and the install's copy
+    /// read; the site's real links and secret never go to the install.
+    Linked,
+}
+
+impl Registrant {
+    /// The registrant from what CoderHelm holds for the id: the team's own
+    /// record, or a standing link for a team that moved. None for an id
+    /// with neither (the app hears 404).
+    pub fn of(team_record: bool, linked: bool) -> Option<Self> {
+        match (team_record, linked) {
+            (true, _) => Some(Self::Hosted),
+            (false, true) => Some(Self::Linked),
+            (false, false) => None,
+        }
+    }
+
+    /// The answer the app hears once the links are saved.
+    pub fn status(self) -> u16 {
+        match self {
+            Self::Hosted => 204,
+            Self::Linked => 200,
+        }
+    }
+}
+
+/// The most of an app's refusal kept in a log line.
+pub const REFUSAL_MAX: usize = 300;
+
+/// What the app answered when it refused, for the log: its JSON `error`
+/// when there is one (nothing else from the body), otherwise its text, on
+/// one line, at most [`REFUSAL_MAX`] characters.
+pub fn refusal_words(body: &[u8]) -> String {
+    let text = match serde_json::from_slice::<serde_json::Value>(body) {
+        Ok(v) => match v.get("error") {
+            Some(serde_json::Value::String(e)) => e.clone(),
+            Some(other) => other.to_string(),
+            None => String::new(),
+        },
+        Err(_) => String::from_utf8_lossy(body).into_owned(),
+    };
+    let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    match line.char_indices().nth(REFUSAL_MAX) {
+        Some((at, _)) => format!("{}...", &line[..at]),
+        None => line,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -344,5 +403,29 @@ mod tests {
         assert!(!copy_is_stale(Some(&hosted), &shuffled));
         // An older hosted side that sends no list: nothing to compare.
         assert!(!copy_is_stale(None, &copied));
+    }
+
+    #[test]
+    fn a_moved_linked_team_registers_and_an_unknown_one_does_not() {
+        assert_eq!(Registrant::of(true, false), Some(Registrant::Hosted));
+        assert_eq!(Registrant::of(true, true), Some(Registrant::Hosted));
+        assert_eq!(Registrant::of(false, true), Some(Registrant::Linked));
+        assert_eq!(Registrant::of(false, false), None);
+        assert_eq!(Registrant::Linked.status(), 200);
+        assert_eq!(Registrant::Hosted.status(), 204);
+    }
+
+    #[test]
+    fn a_refusal_is_logged_by_its_error_capped_on_one_line() {
+        assert_eq!(
+            refusal_words(br#"{"error":"Gateway returned 404","detail":"x"}"#),
+            "Gateway returned 404"
+        );
+        assert_eq!(refusal_words(b"bad\n  gateway"), "bad gateway");
+        assert_eq!(refusal_words(br#"{"ok":false}"#), "");
+        let long = format!(r#"{{"error":"{}"}}"#, "é".repeat(400));
+        let w = refusal_words(long.as_bytes());
+        assert_eq!(w.chars().count(), REFUSAL_MAX + 3);
+        assert!(w.ends_with("..."));
     }
 }
