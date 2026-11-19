@@ -37,9 +37,9 @@
 //!   [`MAX_FAILED_RUNS_IN_A_ROW`] runs in a row ended failed (a run a
 //!   person retried is passed over: it neither counts nor ends the streak):
 //!   then an event that leaves the ticket unchanged starts nothing (a field
-//!   or status change used to start the same failing run every time). A
-//!   content change, a reopen, a person's Retry or command, or a person's
-//!   retry gesture still start one: on GitHub adding the trigger label or
+//!   or status change used to start the same failing run every time; no
+//!   status change skips the cap, a reopen included). A content change, a
+//!   person's Retry or command, or a person's retry gesture still start one: on GitHub adding the trigger label or
 //!   assigning CoderHelm, on Jira re-adding the trigger label or
 //!   re-assigning to CoderHelm. Retry, commands and those gestures are
 //!   never blocked by the cap
@@ -146,12 +146,11 @@ fn decide(latest: &LatestRun, new_hash: Option<&str>, reopened: bool) -> Decisio
         // failed / retried: allow a retry, up to the cap while unchanged
         if latest.failed_in_a_row >= MAX_FAILED_RUNS_IN_A_ROW
             && !latest.retry_gesture
-            && !reopened
             && !latest.changed(new_hash)
         {
             return Decision::Skip(
                 "the ticket's last runs failed and it is unchanged; changing the ticket, \
-                 reopening it, or a person's explicit Retry or command starts another",
+                 or a person's explicit Retry or command starts another",
             );
         }
         return Decision::Enqueue;
@@ -599,9 +598,22 @@ mod tests {
             Decision::Skip(_)
         ));
         assert!(matches!(decide(&capped, None, false), Decision::Skip(_)));
-        // New content, or a reopen, starts one.
+        // New content starts one.
         assert_eq!(decide(&capped, Some("h2"), false), Decision::Enqueue);
-        assert_eq!(decide(&capped, Some("h1"), true), Decision::Enqueue);
+        assert_eq!(decide(&capped, Some("h2"), true), Decision::Enqueue);
+        // No status move skips the cap: To Do -> In Progress, or Done -> To Do.
+        let status_move = |cat: &str| {
+            jira_reopened(&serde_json::json!({
+                "changelog": {"items": [{"field": "status"}]},
+                "issue": {"fields": {"status": {"statusCategory": {"key": cat}}}}
+            }))
+        };
+        for cat in ["indeterminate", "new"] {
+            assert!(matches!(
+                decide(&capped, Some("h1"), status_move(cat)),
+                Decision::Skip(_)
+            ));
+        }
         // A person adding the trigger label retries anyway.
         let labeled = LatestRun {
             retry_gesture: true,
