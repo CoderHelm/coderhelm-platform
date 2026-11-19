@@ -519,22 +519,11 @@ async fn handle_issue_event(
     installation_id: u64,
     team_id: &str,
 ) -> Result<StatusCode, StatusCode> {
-    let action = payload["action"].as_str().unwrap_or("");
-
-    // Trigger on: issue assigned to coderhelm[bot], or labeled "coderhelm"
-    let is_assigned_to_bot = action == "assigned"
-        && payload["assignee"]["login"]
-            .as_str()
-            .map(|l| l.contains("coderhelm"))
-            .unwrap_or(false);
-
-    let is_labeled = action == "labeled"
-        && payload["label"]["name"]
-            .as_str()
-            .map(|l| l.eq_ignore_ascii_case("coderhelm"))
-            .unwrap_or(false);
-
-    if !is_assigned_to_bot && !is_labeled {
+    // Trigger on: issue assigned to coderhelm[bot], or labeled "coderhelm".
+    // One rule for the trigger and for the failed-run cap, which never
+    // blocks a person's retry gesture.
+    let retry_gesture = super::trigger_gate::github_retry_gesture(payload);
+    if !retry_gesture {
         return Ok(StatusCode::OK);
     }
     let issue = &payload["issue"];
@@ -591,7 +580,7 @@ async fn handle_issue_event(
         Some(&context_hash),
         false,
         false,
-        super::trigger_gate::github_retry_gesture(payload),
+        retry_gesture,
     )
     .await
     {

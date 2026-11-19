@@ -38,9 +38,11 @@
 //!   person retried is passed over: it neither counts nor ends the streak):
 //!   then an event that leaves the ticket unchanged starts nothing (a field
 //!   or status change used to start the same failing run every time). A
-//!   content change, a reopen, a person's Retry or command, or a person
-//!   adding the trigger label to a GitHub issue still start one; Retry,
-//!   commands and the label are never blocked by the cap
+//!   content change, a reopen, a person's Retry or command, or a person's
+//!   retry gesture still start one: on GitHub adding the trigger label or
+//!   assigning CoderHelm, on Jira re-adding the trigger label or
+//!   re-assigning to CoderHelm. Retry, commands and those gestures are
+//!   never blocked by the cap
 //! - explicit human triggers (slash commands, comment retries) skip the
 //!   content check but still respect in-flight blocking
 
@@ -85,8 +87,8 @@ struct LatestRun<'a> {
     /// Runs in a row, newest first, that ended failed; runs a person
     /// retried are passed over (they neither count nor end the streak).
     failed_in_a_row: usize,
-    /// The event is a person adding the trigger label, which the cap never
-    /// blocks.
+    /// The event is a person's retry gesture ([`github_retry_gesture`],
+    /// [`jira_retry_gesture`]), which the cap never blocks.
     retry_gesture: bool,
 }
 
@@ -194,6 +196,16 @@ pub fn github_retry_gesture(payload: &serde_json::Value) -> bool {
     labeled || assigned
 }
 
+/// Whether `label` is the team's trigger label: the label itself (case
+/// ignored), or the label with a repository pinned after it
+/// (`coderhelm:acme/web`). One rule for the Jira trigger and for
+/// [`jira_retry_gesture`].
+pub fn is_trigger_label(label: &str, trigger_label: &str) -> bool {
+    let trigger = trigger_label.trim().to_ascii_lowercase();
+    let label = label.trim().to_ascii_lowercase();
+    !trigger.is_empty() && (label == trigger || label.starts_with(&format!("{trigger}:")))
+}
+
 /// A person's retry gesture on a Jira ticket, read from the event's
 /// changelog like [`jira_reopened`]: the team's trigger label added (in the
 /// new labels, not the old), or the ticket assigned to CoderHelm (from
@@ -203,7 +215,7 @@ pub fn jira_retry_gesture(payload: &serde_json::Value, trigger_label: &str) -> b
     let has_label = |list: Option<&str>| {
         list.unwrap_or("")
             .split_whitespace()
-            .any(|l| l.eq_ignore_ascii_case(trigger_label.trim()))
+            .any(|l| is_trigger_label(l, trigger_label))
     };
     let names_bot = |v: Option<&str>| v.unwrap_or("").to_ascii_lowercase().contains("coderhelm");
     payload
@@ -554,8 +566,8 @@ pub fn expected_attachment_keys(
 #[cfg(test)]
 mod tests {
     use super::{
-        decide, edit_note, failed_in_a_row, github_retry_gesture, handled, jira_reopened,
-        jira_retry_gesture, Decision, LatestRun, OpenPr, MAX_FAILED_RUNS_IN_A_ROW,
+        decide, edit_note, failed_in_a_row, github_retry_gesture, handled, is_trigger_label,
+        jira_reopened, jira_retry_gesture, Decision, LatestRun, OpenPr, MAX_FAILED_RUNS_IN_A_ROW,
     };
 
     fn run<'a>(status: &'a str, pr: u64, outcome: &'a str, hash: &'a str) -> LatestRun<'a> {
@@ -764,6 +776,18 @@ mod tests {
             &ev("assignee", "Pat Doe", "CoderHelm"),
             "coderhelm"
         ));
+        // The repo-pinned form of the trigger label counts too.
+        assert!(jira_retry_gesture(
+            &ev("labels", "backend", "backend coderhelm:acme/web"),
+            "coderhelm"
+        ));
+        assert!(!jira_retry_gesture(
+            &ev("labels", "coderhelm:acme/web", "coderhelm:acme/web backend"),
+            "coderhelm"
+        ));
+        assert!(is_trigger_label("CoderHelm", "coderhelm"));
+        assert!(is_trigger_label("coderhelm:acme/web", "coderhelm"));
+        assert!(!is_trigger_label("coderhelmish", "coderhelm"));
         // Still labelled, or still assigned: no new gesture.
         assert!(!jira_retry_gesture(
             &ev("labels", "coderhelm", "coderhelm backend"),
