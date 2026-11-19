@@ -152,6 +152,8 @@ The CloudFormation console has no link that opens an update with a new template 
 
 A stack of that name that something else made, like the boundary stack of an install hardened from the CLI, is never updated or deleted from here; the card says to ask CoderHelm support. No CoderHelm role can create, change or delete a stack of that name.
 
+The access stack also carries the reader update ([security.md](./security.md#the-reader-update)): after each update of the install's stack it brings that release's read-only permissions to `CoderHelmLogReader` in your install's own account, so that account never needs an **Update in AWS**. An access stack from before it shows **adds the reader update** once.
+
 Updates never wait for this item, and it never waits for an update.
 
 ### An install launched from v0.8.54-beta.20261108

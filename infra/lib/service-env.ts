@@ -43,6 +43,11 @@ export function serviceEnvironment(cfg: ResolvedConfig, account: string): Record
     // Whether "Sign in with Google" is on (Settings, then Setup checks it).
     env.GOOGLE_SIGN_IN = cfg.integrations.googleSignIn ? "true" : "false";
     if (cfg.updates.enabled) env.UPDATER_FUNCTION_NAME = `${cfg.prefix}-updater`;
+    // A one-stack install's access stack brings each release's read-only
+    // permissions to CoderHelmLogReader in its own account (the reader
+    // update, native/access-stack.ts): that account's role is never a
+    // person's update (services/common/src/live/aws.rs, READER_KEPT_ENV).
+    if (cfg.native) env.INSTALL_READER_KEPT = "1";
   }
   // Hybrid: a self-hosted install's hosted API (used only once an admin turns
   // a hybrid part on), and the zone `{name}.<zone>` addresses live in.

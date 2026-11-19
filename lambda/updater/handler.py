@@ -3461,20 +3461,33 @@ def access_stack_origin(cfn, st):
     boundary stack of an install hardened from the CLI, which is never touched.
     Unreadable counts as something else."""
     try:
-        meta = (deployed_template(cfn, st.get("StackId") or st.get("StackName")).get("Metadata") or {}).get("CoderHelm") or {}
+        template = deployed_template(cfn, st.get("StackId") or st.get("StackName"))
     except Exception as e:  # noqa: BLE001
         logger.warning(f"access stack template not read: {e}")
-        meta = {}
+        template = {}
+    meta = (template.get("Metadata") or {}).get("CoderHelm") or {}
     if meta.get("kind") == "access":
         out = {o.get("OutputKey"): o.get("OutputValue") for o in st.get("Outputs") or []}
         # The Version output is the release whose permissions the stack applied
         # (its template's metadata changes before an update has finished).
-        return {"kind": "access", "version": out.get("Version") or meta.get("version") or None}
+        return {"kind": "access", "version": out.get("Version") or meta.get("version") or None,
+                "reader": READER_RESOURCE in (template.get("Resources") or {})}
     return {"kind": "other", "version": None}
 
 
 def _iso(t):
     return t.isoformat() if hasattr(t, "isoformat") else (str(t) if t else None)
+
+
+# The access stack's reader update (infra/lib/native/access-stack.ts,
+# lambda/native-reader): after each update of the install's stack it brings
+# the release's read-only permissions to CoderHelmLogReader in this account.
+# An access stack made before it has none, so applying a release's access
+# stack once is what adds it; from then on no release needs a person for
+# that role's reads.
+READER_RESOURCE = "Reader"
+READER_LINE = ("adds the reader update: from then on each release brings its read-only permissions to "
+               "CoderHelmLogReader in this account by itself, with no update stack for anyone to create")
 
 
 def access_compute(env, cfn=None, iam=None, opener=None):
@@ -3544,6 +3557,9 @@ def access_compute(env, cfn=None, iam=None, opener=None):
             raise
         existing = None
     ours = bool(existing) and existing.get("kind") == "access"
+    if READER_RESOURCE in (access.get("Resources") or {}) and not (ours and existing.get("reader")):
+        changes.append({"resource": READER_RESOURCE, "lines": [READER_LINE]})
+        rules.append(READER_LINE)
     view = {
         "state": "pending" if changes else "applied",
         "version": version,
