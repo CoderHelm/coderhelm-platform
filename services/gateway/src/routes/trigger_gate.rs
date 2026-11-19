@@ -39,9 +39,9 @@
 //!   then an event that leaves the ticket unchanged starts nothing (a field
 //!   or status change used to start the same failing run every time; no
 //!   status change skips the cap, a reopen included). A content change, a
-//!   person's Retry or command, or a person's retry gesture still start one: on GitHub adding the trigger label or
-//!   assigning CoderHelm, on Jira re-adding the trigger label or
-//!   re-assigning to CoderHelm. Retry, commands and those gestures are
+//!   person's Retry or command, or a person's retry gesture still starts
+//!   one: on GitHub adding the trigger label or assigning CoderHelm, on
+//!   Jira re-adding the trigger label or re-assigning to CoderHelm. Retry, commands and those gestures are
 //!   never blocked by the cap
 //! - explicit human triggers (slash commands, comment retries) skip the
 //!   content check but still respect in-flight blocking
