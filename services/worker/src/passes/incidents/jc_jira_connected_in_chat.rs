@@ -19,8 +19,8 @@ use std::collections::HashMap;
 
 use aws_sdk_dynamodb::types::AttributeValue;
 use common::jira_connection::{
-    copy_is_stale, missing_registrations, registered, Connection, Gap, TicketReads,
-    NOT_CONNECTED, REGISTER_AGAIN,
+    copy_is_stale, missing_registrations, registered, Connection, Gap, TicketReads, NOT_CONNECTED,
+    REGISTER_AGAIN,
 };
 
 type Item = HashMap<String, AttributeValue>;

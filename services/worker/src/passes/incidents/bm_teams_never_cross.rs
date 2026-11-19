@@ -333,6 +333,7 @@ const CACHES: &[(&str, &str)] = &[
     ("common/src/github_grants.rs::KNOWN", "installation id"),
     ("common/src/hybrid/client.rs::TOKENS", "installation id"),
     ("common/src/hybrid/client.rs::FAILING", "installation id"),
+    ("gateway/src/routes/jira_heal.rs::LAST", "team id; holds only when that team last asked the Jira app to register again"),
     ("common/src/knowledge/search.rs::C", "S3 key under `{team}/knowledge/`, checked by owns_key before the lookup"),
     ("common/src/knowledge/sources/pace.rs::GATES", "provider rate gate; no data"),
     ("common/src/ticket_decisions.rs::KNOWN", "installation id plus `owner/repo@ticket`: read back only by description writes made with that installation"),
