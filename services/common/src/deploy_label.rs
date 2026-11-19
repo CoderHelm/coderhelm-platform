@@ -134,6 +134,32 @@ pub fn with_covers(plan: &[Covering], deploy: &[Covering]) -> Vec<Covering> {
     out
 }
 
+/// Whether the head's preview already ran `label` on `head`: CoderHelm
+/// added it there, or a check a cover with that label names ran (not
+/// skipped). The auto-merge gate then leaves it off, so one commit never
+/// gets a second deploy.
+pub fn ran_on(st: &pv::State, head: &str, label: &str) -> bool {
+    if st.head != head || head.is_empty() {
+        return false;
+    }
+    if st
+        .labels_added
+        .iter()
+        .any(|a| a.eq_ignore_ascii_case(label))
+    {
+        return true;
+    }
+    let covers: Vec<Covering> = st
+        .covers
+        .iter()
+        .filter(|c| c.label.eq_ignore_ascii_case(label))
+        .cloned()
+        .collect();
+    st.checks
+        .iter()
+        .any(|r| r.outcome != pv::Outcome::Skipped && pv::is_covering(&covers, &r.name))
+}
+
 /// Who last took a label off the pull request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RemovedBy {
@@ -401,6 +427,38 @@ jobs:
             "`CI:DEPLOY_PREVIEW` was taken off by someone CoderHelm couldn't identify, so \
              CoderHelm left it off this head"
         );
+    }
+
+    #[test]
+    fn a_label_the_preview_already_ran_on_this_head_is_known() {
+        let run = |name: &str, outcome: pv::Outcome| pv::CheckResult {
+            name: name.into(),
+            outcome,
+            url: String::new(),
+            environment: String::new(),
+            no_jobs: false,
+        };
+        let st = |labels_added: Vec<String>, checks: Vec<pv::CheckResult>| pv::State {
+            head: "H".into(),
+            covers: vec![Covering {
+                check: "Deploy app".into(),
+                label: "CI:DEPLOY_PREVIEW".into(),
+                ..Default::default()
+            }],
+            labels_added,
+            checks,
+            ..Default::default()
+        };
+        // Its check ran on this head (the workflow then took the label off).
+        let ran = st(vec![], vec![run("Deploy app", pv::Outcome::Passed)]);
+        assert!(ran_on(&ran, "H", "ci:deploy_preview"));
+        // CoderHelm added it on this head.
+        assert!(ran_on(&st(labels(), vec![]), "H", "CI:DEPLOY_PREVIEW"));
+        // Another head, only a skipped run, or another label: not run here.
+        assert!(!ran_on(&ran, "H2", "CI:DEPLOY_PREVIEW"));
+        let skipped = st(vec![], vec![run("Deploy app", pv::Outcome::Skipped)]);
+        assert!(!ran_on(&skipped, "H", "CI:DEPLOY_PREVIEW"));
+        assert!(!ran_on(&ran, "H", "other"));
     }
 
     #[test]

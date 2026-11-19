@@ -283,6 +283,10 @@ pub(crate) struct GateView {
     /// Deploy labels a person or another app took off the pull request:
     /// never put back.
     pub taken_off: Vec<common::deploy_label::KeptOff>,
+    /// Deploy labels the head's preview already ran on this commit
+    /// (`common::deploy_label::ran_on`): never added again, so one commit
+    /// never gets a second deploy.
+    pub preview_ran: Vec<String>,
     /// CI on the head, quarantine applied. None until both keys are in (CI is
     /// not read for a PR that can't merge yet).
     pub ci: Option<CheckSummary>,
@@ -554,8 +558,15 @@ pub(crate) fn decide_gate(v: &GateView) -> GateDecision {
         let missing: Vec<String> = v
             .want_labels
             .iter()
-            .filter(|l| !has(&v.present_labels, l) && kept_off(l).is_none())
+            .filter(|l| {
+                !has(&v.present_labels, l) && kept_off(l).is_none() && !has(&v.preview_ran, l)
+            })
             .cloned()
+            .collect();
+        let ran: Vec<&String> = v
+            .want_labels
+            .iter()
+            .filter(|l| !has(&v.present_labels, l) && has(&v.preview_ran, l))
             .collect();
         let left_off: Vec<&common::deploy_label::KeptOff> = v
             .want_labels
@@ -578,8 +589,14 @@ pub(crate) fn decide_gate(v: &GateView) -> GateDecision {
         // Present, or added earlier for this head and since removed by the
         // repo's own workflow: never re-added in a loop. One a person or
         // another app took off stays off.
-        if left_off.is_empty() {
+        if left_off.is_empty() && ran.is_empty() {
             lines.push((Mark::Done, format!("Deploy label {joined} applied")));
+        }
+        for l in ran {
+            lines.push((
+                Mark::Done,
+                format!("Deploy label `{l}` already ran on this commit's preview"),
+            ));
         }
         for k in left_off {
             lines.push((
@@ -1469,17 +1486,13 @@ async fn evaluate(
         bot_verdict,
         bot_holding,
         approvals,
-        want_labels: cfg
-            .deploy_label
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect(),
+        want_labels: common::deploy_label::configured(&cfg.deploy_label),
         present_labels,
         labels_added_at: (record.labels_added_head == msg.head_sha)
             .then_some(record.labels_added_at)
             .flatten(),
         taken_off: vec![],
+        preview_ran: vec![],
         ci: None,
         now,
         head: msg.head_sha.clone(),
@@ -1499,6 +1512,21 @@ async fn evaluate(
                 .any(|p| p.eq_ignore_ascii_case(l))
         });
     if adds {
+        // A label the head's preview already ran on this commit isn't added
+        // again: one commit, one deploy.
+        if let Some(run_id) =
+            super::review_pr::lookup_run_by_pr(state, &msg.team_id, owner, repo, msg.pr_number)
+                .await
+        {
+            if let Some(st) = crate::passes::preview::load(state, &msg.team_id, &run_id).await {
+                view.preview_ran = view
+                    .want_labels
+                    .iter()
+                    .filter(|l| common::deploy_label::ran_on(&st, &msg.head_sha, l))
+                    .cloned()
+                    .collect();
+            }
+        }
         // A failed read leaves the labels off (CoderHelm can't tell who took
         // them off) and never fails the gate.
         let events = match github.list_issue_events(owner, repo, msg.pr_number).await {
@@ -2586,6 +2614,7 @@ mod ci_tests {
             present_labels: vec![],
             labels_added_at: None,
             taken_off: vec![],
+            preview_ran: vec![],
             ci: None,
             now: 10_000,
             head: "0516eab0000".into(),
@@ -2813,6 +2842,58 @@ mod ci_tests {
                 "Deploy label `deploy:staging` was taken off by someone CoderHelm couldn't \
                  identify, so CoderHelm left it off"
             )
+        );
+    }
+
+    /// A "label as a button" workflow: the preview added the label on this
+    /// commit, the workflow ran and its bot took the label off, then the
+    /// gate arms on the same commit. It doesn't add the label again.
+    #[test]
+    fn the_gate_never_re_adds_a_deploy_label_the_preview_already_ran_on_this_commit() {
+        use common::preview::{CheckResult, Covering, Outcome as P, State};
+        let preview = State {
+            head: "abc".into(),
+            covers: vec![Covering {
+                check: "Deploy app".into(),
+                label: "deploy:staging".into(),
+                ..Default::default()
+            }],
+            checks: vec![CheckResult {
+                name: "Deploy app".into(),
+                outcome: P::Passed,
+                url: String::new(),
+                environment: String::new(),
+                no_jobs: false,
+            }],
+            ..Default::default()
+        };
+        let mut v = view();
+        v.want_labels = vec!["deploy:staging".into()];
+        // Its workflow took it off after its run: on its own, put back.
+        let by_workflow = json!([{"event": "unlabeled", "label": {"name": "deploy:staging"},
+                                  "actor": {"login": "github-actions[bot]"}}]);
+        v.taken_off = taken_off(Some(&by_workflow), &v.want_labels, &["github-actions[bot]"]);
+        v.preview_ran = v
+            .want_labels
+            .iter()
+            .filter(|l| common::deploy_label::ran_on(&preview, "abc", l))
+            .cloned()
+            .collect();
+        let d = decide_gate(&v);
+        assert_eq!(d.action, Action::ReadCi);
+        assert!(d.lines.iter().any(
+            |(_, l)| l == "Deploy label `deploy:staging` already ran on this commit's preview"
+        ));
+        // A new commit the preview hasn't run it on: added.
+        v.preview_ran = v
+            .want_labels
+            .iter()
+            .filter(|l| common::deploy_label::ran_on(&preview, "def", l))
+            .cloned()
+            .collect();
+        assert_eq!(
+            decide_gate(&v).action,
+            Action::AddLabels(vec!["deploy:staging".into()])
         );
     }
 

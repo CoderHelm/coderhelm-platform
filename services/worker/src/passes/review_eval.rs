@@ -517,6 +517,7 @@ impl Sim {
             present_labels: vec![],
             labels_added_at: None,
             taken_off: vec![],
+            preview_ran: vec![],
             ci: None,
             now: 1_800_000_000 + self.now * 60,
             head: self.head.clone(),

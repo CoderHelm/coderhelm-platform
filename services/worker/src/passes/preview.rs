@@ -378,6 +378,34 @@ pub fn settle(st: &mut State, from_checks: Option<Stage>, answer: &Answer, now: 
     }
 }
 
+/// Where a change with no page a person sees stands: the deploy label's
+/// checks (`from_checks`) are the whole check, under [`settle`]'s wait
+/// budget. Passed checks end it checked (a label left off keeps its why);
+/// checks that haven't finished within the budget end it blocked, so the
+/// draft never waits on them for good; a failure or an approval passes
+/// through for the ready decision. Pure: every case is tested.
+pub fn settle_backend(st: &mut State, from_checks: Option<Stage>, now: &str) {
+    st.stage = from_checks.unwrap_or_default();
+    match st.stage {
+        Stage::Ready => {
+            st.stage = Stage::Checked;
+            if st.why.trim().is_empty() {
+                st.why = "the change has no page a person sees".into();
+            }
+        }
+        Stage::Triggered | Stage::Deploying
+            if pf::minutes_between(&st.waiting_since, now) >= pf::WAIT_BUDGET_MINS =>
+        {
+            st.stage = Stage::Blocked;
+            st.why = format!(
+                "the deploy label's checks hadn't finished on this commit within {} minutes, so they weren't waited on any longer; a new push starts the wait again",
+                pf::WAIT_BUDGET_MINS
+            );
+        }
+        _ => {}
+    }
+}
+
 /// The workflow files at `git_ref`, with their text.
 pub(crate) async fn workflows(
     gh: &GitHubClient,
@@ -825,14 +853,8 @@ pub async fn advance(
     }
     if !visible {
         // No page to find or capture: the deploy label's checks are the
-        // whole check.
-        st.stage = match from_checks.unwrap_or_default() {
-            Stage::Ready => {
-                st.why = "the change has no page a person sees".into();
-                Stage::Checked
-            }
-            s => s,
-        };
+        // whole check, under the same wait budget.
+        settle_backend(&mut st, from_checks, &now);
         save(state, p, &st).await;
         return Some(st);
     }
@@ -1358,5 +1380,54 @@ mod tests {
             vec!["E2E on preview".to_string()]
         );
         assert!(runnable_gated(&gated, &[]).is_empty());
+    }
+
+    /// A backend-only change the deploy label covers: its checks are the
+    /// whole check, and the wait on them is bounded like the web path's.
+    #[test]
+    fn a_backend_only_change_covered_by_the_deploy_label_ends_checked_or_blocked() {
+        let since = "2026-11-19T00:00:00Z";
+        let at = |mins: i64| {
+            (chrono::DateTime::parse_from_rfc3339(since).unwrap() + chrono::Duration::minutes(mins))
+                .to_rfc3339()
+        };
+        let fresh = || State {
+            head: "abc".into(),
+            waiting_since: since.into(),
+            ..Default::default()
+        };
+        // Passed: checked, with the why.
+        let mut st = fresh();
+        settle_backend(&mut st, Some(Stage::Ready), &at(5));
+        assert_eq!(st.stage, Stage::Checked);
+        assert_eq!(st.why, "the change has no page a person sees");
+        assert!(settled(&st, "abc"));
+        // A label left off keeps its why.
+        let mut st = fresh();
+        st.why = "`CI:E2E` was taken off by a person, so CoderHelm left it off this head".into();
+        settle_backend(&mut st, Some(Stage::Ready), &at(5));
+        assert_eq!(st.stage, Stage::Checked);
+        assert!(st.why.starts_with("`CI:E2E` was taken off by a person"));
+        // Still waiting within the budget: waits.
+        let mut st = fresh();
+        settle_backend(
+            &mut st,
+            Some(Stage::Triggered),
+            &at(pf::WAIT_BUDGET_MINS - 1),
+        );
+        assert_eq!(st.stage, Stage::Triggered);
+        // Past the budget: blocked, never a wait for good.
+        for stage in [Stage::Triggered, Stage::Deploying] {
+            let mut st = fresh();
+            settle_backend(&mut st, Some(stage), &at(pf::WAIT_BUDGET_MINS));
+            assert_eq!(st.stage, Stage::Blocked, "{stage:?}");
+            assert!(st.why.contains("a new push starts the wait again"));
+        }
+        // A failure or an approval passes through, whatever the time.
+        for stage in [Stage::Failed, Stage::Approval] {
+            let mut st = fresh();
+            settle_backend(&mut st, Some(stage), &at(pf::WAIT_BUDGET_MINS * 3));
+            assert_eq!(st.stage, stage);
+        }
     }
 }

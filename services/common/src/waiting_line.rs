@@ -114,6 +114,9 @@ fn readiness(i: &Inputs) -> Option<String> {
         Some(p) if p.stage == Stage::Failed => {
             return Some("Not ready for review: the preview checks failed.".into());
         }
+        Some(p) if p.stage == Stage::Approval => {
+            return Some("Not ready for review yet: preview waiting for an approval.".into());
+        }
         Some(p) if p.pending() => {
             return Some(format!(
                 "Not ready for review yet: {}.",
@@ -204,6 +207,27 @@ mod tests {
         });
         assert!(
             l.ends_with("Not ready for review yet: preview deploying."),
+            "{l}"
+        );
+        assert!(!l.contains("Ready for review:"));
+    }
+
+    #[test]
+    fn a_preview_held_for_an_environment_approval_is_not_called_ready() {
+        let s = approval_standing();
+        let p = Preview {
+            stage: Stage::Approval,
+            ..Default::default()
+        };
+        let l = line(&Inputs {
+            pr: 42,
+            standing: Some(&s),
+            preview: Some(&p),
+            checks_passed: true,
+            ..Default::default()
+        });
+        assert!(
+            l.ends_with("Not ready for review yet: preview waiting for an approval."),
             "{l}"
         );
         assert!(!l.contains("Ready for review:"));
