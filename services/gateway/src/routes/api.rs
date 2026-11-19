@@ -1025,7 +1025,8 @@ pub struct RunPreviewCheck {
     /// The check's name, as GitHub shows it.
     #[schema(example = "E2E on preview")]
     pub name: String,
-    /// `passed`, `failed`, `running` or `skipped`.
+    /// `passed`, `failed`, `running`, `waiting` (for a person to approve
+    /// its environment) or `skipped`.
     #[schema(example = "passed")]
     pub outcome: String,
     /// The check's page on GitHub; empty when it has none.
@@ -1054,7 +1055,8 @@ pub struct RunPreviewShot {
 #[derive(serde::Serialize, utoipa::ToSchema)]
 pub struct RunPreview {
     /// `not_needed`, `triggered`, `deploying`, `ready`, `checked`,
-    /// `failed` or `blocked`.
+    /// `failed`, `approval` (a check waits for a person to approve its
+    /// environment) or `blocked`.
     #[schema(example = "checked")]
     pub stage: String,
     /// The preview's address; empty when it isn't known.
@@ -1334,7 +1336,11 @@ pub struct Run {
     pub outside_change_report: Option<String>,
     /// Why the run stopped, when it was its own environment rather than a
     /// question: `tooling` (a command the run ran failed for want of a
-    /// dependency or tool; see `tooling_failure`).
+    /// dependency or tool; see `tooling_failure`), or `already_merged` (a
+    /// pull request for the ticket had already merged: the run ended
+    /// `covered_by_pr` because it already did all of what the ticket asks,
+    /// or waits because CoderHelm couldn't tell whether it does; Retry runs
+    /// the ticket again anyway).
     #[schema(example = json!(null))]
     pub stop_kind: Option<String>,
     /// For a tooling failure: the exact command, the error it printed and
@@ -2511,6 +2517,12 @@ pub struct RunActionResult {
         retried; the old run \
         becomes `retried`, so retrying it twice is refused with `400`. Find the new run with \
         `GET /api/runs?q=<ticket id>`.\n\n\
+        A run whose `stop_kind` is `already_merged` built nothing because a pull request for \
+        its ticket had already merged: it already did all of what the ticket asks \
+        (`covered_by_pr`), or CoderHelm couldn't tell whether it does (`needs_input`). \
+        Retrying it is how a person asks for the ticket to run again anyway: the new run goes \
+        ahead without that check, and later runs on the ticket skip \
+        it for the same merge.\n\n\
         A `completed` run whose `round_incomplete` is set (its pull request is open but the last \
         fix round on it didn't finish) is resumed instead: the same run picks the round up again \
         on the same pull request, with a fresh time budget, and the answer's status is \
@@ -2791,6 +2803,14 @@ pub(crate) async fn retry_message(
             .and_then(|v| v.as_s().ok())
             .and_then(|s| serde_json::from_str(s).ok())
             .unwrap_or_default(),
+        // Retry on a run that ended on a merge (it merged, or the
+        // merged-ticket check ended it) is a person asking for the work
+        // anyway (`merged_ticket`): the new run doesn't stop for that merge
+        // and need a second retry.
+        after_merge: super::trigger_gate::ended_on_merge(item),
+        // What already merged for the ticket, when the retried run built
+        // only the rest and didn't merge: the new run keeps building only that.
+        merged_note: super::trigger_gate::retry_note(item),
         ..Default::default()
     })
 }

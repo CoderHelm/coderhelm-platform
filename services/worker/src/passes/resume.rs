@@ -4211,9 +4211,12 @@ async fn fix_context(
         ticket_history_note: None,
         plan_cache_key: None,
         // Loaded once here; the fix and review rounds read it from the
-        // message.
-        team_instructions: super::load_team_instructions(state, &msg.team_id, t.owner, t.repo)
-            .await,
+        // message, with what already merged for the ticket when the run
+        // builds only the rest (`common::merged_ticket`).
+        team_instructions: common::merged_ticket::with_note(
+            &super::load_team_instructions(state, &msg.team_id, t.owner, t.repo).await,
+            common::merged_ticket::note_of(run_record).as_deref(),
+        ),
         coder_learning: String::new(),
         person_direction: None,
         // What people answered on the ticket: every fix and review round
@@ -4230,6 +4233,8 @@ async fn fix_context(
         .await,
         related: Vec::new(),
         new_run_id: None,
+        after_merge: false,
+        merged_note: common::merged_ticket::note_of(run_record),
     };
 
     let provider = ModelProvider::load_for_team(

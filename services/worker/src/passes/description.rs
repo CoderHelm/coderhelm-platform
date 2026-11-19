@@ -550,6 +550,25 @@ pub async fn rebuild(
     .await
 }
 
+/// [`rebuild`] for a pull request, its ticket read from the run that opened
+/// it: something its description shows arrived on the same head (the
+/// screenshots of the end-to-end run, `e2e_screens`).
+pub async fn rebuild_pr(
+    state: &WorkerState,
+    github: &GitHubClient,
+    team_id: &str,
+    owner: &str,
+    repo: &str,
+    number: u64,
+) -> Reconciled {
+    let ticket = match super::review_pr::lookup_run_by_pr(state, team_id, owner, repo, number).await
+    {
+        Some(run_id) => run_ticket(state, team_id, &run_id).await,
+        None => String::new(),
+    };
+    rebuild(state, github, team_id, owner, repo, number, &ticket).await
+}
+
 /// What was read about a pull request for one build.
 struct Gathered {
     pr: serde_json::Value,
@@ -558,6 +577,9 @@ struct Gathered {
     checks: Option<Vec<super::reviewer_guide::Check>>,
     run: RunBits,
     run_url: String,
+    /// The Before and After table the end-to-end run on the head filled
+    /// (`e2e_screens`).
+    screens: Option<common::pr_body::Screens>,
 }
 
 /// What the run behind a pull request holds for its description.
@@ -657,6 +679,7 @@ impl Gathered {
             super::description_facts::with_trace(&mut f, t);
         }
         f.waiting = self.run.waiting.clone();
+        f.e2e_screens = self.screens.clone();
         f
     }
 
@@ -866,6 +889,11 @@ async fn gather(
     } else {
         format!("{app}/runs/detail?id={run_id}")
     };
+    let screens = if head.is_empty() {
+        None
+    } else {
+        super::e2e_screens::screens_for(state, team_id, &format!("{owner}/{repo}"), &head).await
+    };
     Ok(Gathered {
         pr,
         files,
@@ -873,6 +901,7 @@ async fn gather(
         checks,
         run,
         run_url,
+        screens,
     })
 }
 

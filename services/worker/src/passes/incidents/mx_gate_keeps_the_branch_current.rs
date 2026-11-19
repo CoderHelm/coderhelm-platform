@@ -51,6 +51,8 @@ fn view(person_state: &str, decision: Option<&str>) -> GateView {
         want_labels: vec![],
         present_labels: vec![],
         labels_added_at: None,
+        taken_off: vec![],
+        preview_ran: vec![],
         ci: None,
         now: 1_000,
         head: HEAD.into(),

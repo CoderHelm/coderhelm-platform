@@ -623,8 +623,44 @@ pub async fn ingest(state: &WorkerState, msg: TestIngest) -> Result<(), Err> {
             note_rescued(&st, &gh, &msg, &run, pr).await;
         }
         // A run that failed only on quarantined tests needs no fix or re-run.
-        if failed > 0 && !run.rescued && is_own_pr(&gh, &msg, pr).await {
+        let fix = failed > 0 && !run.rescued;
+        // Screenshots in this run's reports, for the description's table.
+        let shots = reports
+            .iter()
+            .any(|(n, b)| !common::e2e::shots::shots_in(n, b).is_empty());
+        // The pull request is read only when one of them needs it: whose it
+        // is (unless the branch says), and its base for the screenshots.
+        let pull = if (fix && !own_branch(&msg)) || shots {
+            gh.get_pull_request(&msg.repo_owner, &msg.repo_name, pr)
+                .await
+                .ok()
+        } else {
+            None
+        };
+        let own = is_own_pr(&msg, pull.as_ref());
+        if fix && own {
             own_pr_failures(state, &gh, &msg, &run, pr, &lines, &tests).await;
+        }
+        // CoderHelm's own pull request shows the screenshots this run took
+        // of the tests its change touches.
+        if shots && own {
+            super::e2e_screens::keep(
+                state,
+                &gh,
+                &st,
+                super::e2e_screens::Head {
+                    msg: &msg,
+                    run_key: &run_key,
+                    pr,
+                    tests: &tests,
+                    reports: &reports,
+                    pull: pull.as_ref(),
+                    changed: &changed,
+                    map: map.as_ref(),
+                },
+                |t| scoped_id(&repo, t),
+            )
+            .await;
         }
         recommend_from_pr(state, &gh, &msg, pr, &changed, map.as_ref()).await;
         follow_generated(state, &gh, &msg, &run, &tests).await;
@@ -1793,6 +1829,8 @@ pub(super) fn internal_ticket(
         answers: Vec::new(),
         related: Vec::new(),
         new_run_id: Some(run_id.to_string()),
+        after_merge: false,
+        merged_note: None,
     }
 }
 
@@ -2013,6 +2051,8 @@ pub async fn act(state: &WorkerState, a: TestAction) -> Result<(), Err> {
                 answers: Vec::new(),
                 related: Vec::new(),
                 new_run_id: None,
+                after_merge: false,
+                merged_note: None,
             };
             enqueue(state, crate::models::WorkerMessage::Ticket(ticket)).await?;
             rec.status = "generating".into();
@@ -2359,18 +2399,18 @@ async fn recommend(st: &Store<'_>, team: &str, rec: Recommendation) {
     }
 }
 
+/// Whether the run's branch is in CoderHelm's default shape: its pull
+/// request is CoderHelm's without reading it.
+fn own_branch(msg: &TestIngest) -> bool {
+    msg.head_branch
+        .starts_with(common::git_conventions::DEFAULT_BRANCH_PREFIX)
+}
+
 /// Whether the PR is one CoderHelm opened: a branch in the default shape, or
 /// a PR whose author is CoderHelm's app (a team's own branch pattern).
-async fn is_own_pr(gh: &GitHubClient, msg: &TestIngest, pr: u64) -> bool {
-    if msg
-        .head_branch
-        .starts_with(common::git_conventions::DEFAULT_BRANCH_PREFIX)
-    {
-        return true;
-    }
-    gh.get_pull_request(&msg.repo_owner, &msg.repo_name, pr)
-        .await
-        .is_ok_and(|p| super::is_own_login(p["user"]["login"].as_str().unwrap_or("")))
+fn is_own_pr(msg: &TestIngest, pull: Option<&serde_json::Value>) -> bool {
+    own_branch(msg)
+        || pull.is_some_and(|p| super::is_own_login(p["user"]["login"].as_str().unwrap_or("")))
 }
 
 async fn recommend_from_pr(

@@ -682,6 +682,7 @@ pub fn ui_facts() -> Facts {
             before_alt: "Sub Title field with a 190-character subtitle and no warning".into(),
             after: "https://github.com/user-attachments/assets/after-example".into(),
             after_alt: "Same field showing the warning 'Over 160 characters (190)'".into(),
+            caption: String::new(),
         }),
         run_url: "https://app.example.com/runs/detail?id=run-4812".into(),
         repo_url: "https://github.com/acme/site".into(),

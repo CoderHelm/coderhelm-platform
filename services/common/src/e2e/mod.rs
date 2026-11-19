@@ -33,6 +33,9 @@
 //!   holds end-to-end selectors to it.
 //! - [`branches`] finds test branches on a page's state and which of them a
 //!   recorded run, or the page as it is now, would run.
+//! - [`shots`] finds the screenshots a report carries for the tests that
+//!   show a change, for the Before and After table of CoderHelm's own pull
+//!   request.
 
 pub mod attribution;
 pub mod branches;
@@ -54,6 +57,7 @@ pub mod parse;
 pub mod probe;
 pub mod quarantine;
 pub mod report_source;
+pub mod shots;
 pub mod signature;
 pub mod stats;
 pub mod store;

@@ -573,6 +573,11 @@ async fn handle_issue_event(
         issue["body"].as_str().unwrap_or(""),
         &[],
     );
+    let own_repo = format!(
+        "{}/{}",
+        repo["owner"]["login"].as_str().unwrap_or(""),
+        repo["name"].as_str().unwrap_or("")
+    );
     match super::trigger_gate::gate_ticket_trigger(
         state,
         team_id,
@@ -580,6 +585,7 @@ async fn handle_issue_event(
         Some(&context_hash),
         false,
         false,
+        Some(&own_repo),
         retry_gesture,
     )
     .await
@@ -1600,6 +1606,20 @@ async fn handle_issue_comment(
 
     let issue = &payload["issue"];
     let repo = &payload["repository"];
+    let sender = payload["sender"]["login"].as_str().unwrap_or("");
+    let own_repo = format!(
+        "{}/{}",
+        repo["owner"]["login"].as_str().unwrap_or(""),
+        repo["name"].as_str().unwrap_or("")
+    );
+    let ended_on_merge = super::trigger_gate::github_issue_ended_on_merge(
+        state,
+        team_id,
+        &format!("GH-{}", issue["number"].as_u64().unwrap_or(0)),
+        &own_repo,
+    )
+    .await;
+    let (after_merge, person_direction) = command_after_merge(ended_on_merge, sender, body);
 
     let message = WorkerMessage::Ticket(TicketMessage {
         team_id: team_id.to_string(),
@@ -1620,6 +1640,8 @@ async fn handle_issue_comment(
         ),
         image_attachments: vec![],
         ticket_type: common::messages::ticket_type_of_github(issue),
+        after_merge,
+        person_direction,
         ..Default::default()
     });
 
@@ -1644,6 +1666,7 @@ async fn handle_issue_comment(
             None,
             true,
             false,
+            Some(&own_repo),
             false,
         )
         .await,
@@ -1663,6 +1686,23 @@ async fn handle_issue_comment(
     }
 
     send_to_queue(state, &state.config.ticket_queue_url, &message).await
+}
+
+/// What an `@coderhelm` / `/coderhelm` command on a GitHub issue carries
+/// when the issue's last run ended on a merge (it merged, or the
+/// merged-ticket check ended it: `common::merged_ticket`): a person asking
+/// for the work anyway
+/// (`after_merge`), with their words as the run's direction
+/// ("author: words"). Otherwise neither.
+fn command_after_merge(
+    ended_on_merge: bool,
+    sender: &str,
+    comment: &str,
+) -> (bool, Option<String>) {
+    if !ended_on_merge {
+        return (false, None);
+    }
+    (true, Some(format!("{sender}: {}", comment.trim())))
 }
 
 /// The run's work on its own PR that a round left held or unfinished
@@ -5980,5 +6020,33 @@ mod review_tidy_tests {
                 >= 2
         );
         assert!(body("handle_check_suite").contains("queue_review_tidy("));
+    }
+}
+
+#[cfg(test)]
+mod command_after_merge_tests {
+    use super::command_after_merge;
+
+    /// A command on an issue whose last run ended on a merge asks for the
+    /// work anyway, with the person's words as the run's direction; on any
+    /// other issue it carries neither, so the merged-ticket check still
+    /// applies.
+    #[test]
+    fn a_command_after_the_merge_stop_asks_for_the_work_anyway() {
+        assert_eq!(
+            command_after_merge(
+                true,
+                "pat",
+                "  @coderhelm the date picker on Android still crashes\n"
+            ),
+            (
+                true,
+                Some("pat: @coderhelm the date picker on Android still crashes".to_string())
+            )
+        );
+        assert_eq!(
+            command_after_merge(false, "pat", "/coderhelm go"),
+            (false, None)
+        );
     }
 }

@@ -373,6 +373,10 @@ pub struct Facts {
     /// A UI change's screenshots, or why there are none.
     #[serde(default)]
     pub screens: Option<crate::pr_body::Screens>,
+    /// A Before and After pair from the end-to-end run on the head
+    /// (`e2e::shots`): shown under the preview's pages, never instead.
+    #[serde(default)]
+    pub e2e_screens: Option<crate::pr_body::Screens>,
     /// What the pull request waits on, one line (`crate::waiting_line`).
     #[serde(default)]
     pub waiting: String,
@@ -805,8 +809,13 @@ fn check_name(name: &str) -> String {
 /// the full evidence only.
 pub fn rows(f: &Facts) -> Vec<crate::pr_body::Row> {
     use crate::pr_body::{Outcome as O, Row};
+    let deploy = deploy_rows(f);
+    let shown = |n: &str| {
+        let row = format!("{} (deploy label)", check_name(n));
+        deploy.iter().any(|r| r.check == row)
+    };
     let mut ci: Vec<Row> = Vec::new();
-    for c in &f.checks {
+    for c in f.checks.iter().filter(|c| !shown(&c.name)) {
         let check = format!("{} (CI)", check_name(&c.name));
         let log = if c.url.starts_with("https://") {
             format!("[log]({})", c.url)
@@ -920,14 +929,18 @@ pub fn rows(f: &Facts) -> Vec<crate::pr_body::Row> {
         );
     }
     // Too many to list: passed CI checks grouped by what they check.
-    if ci.len() + own.len() > crate::pr_body::MAX_ROWS {
+    if deploy.len() + ci.len() + own.len() > crate::pr_body::MAX_ROWS {
         let mut grouped: Vec<Row> = ci
             .iter()
             .filter(|r| r.outcome != O::Passed)
             .cloned()
             .collect();
         let mut groups: Vec<(&'static str, Vec<&str>)> = Vec::new();
-        for c in f.checks.iter().filter(|c| c.outcome == Outcome::Passed) {
+        for c in f
+            .checks
+            .iter()
+            .filter(|c| c.outcome == Outcome::Passed && !shown(&c.name))
+        {
             let l = family_label(&c.name);
             match groups.iter_mut().find(|(g, _)| *g == l) {
                 Some(g) => g.1.push(&c.name),
@@ -950,8 +963,68 @@ pub fn rows(f: &Facts) -> Vec<crate::pr_body::Row> {
         }
         ci = grouped;
     }
-    ci.extend(own);
-    ci
+    let mut out = deploy;
+    out.extend(ci);
+    out.extend(own);
+    out
+}
+
+/// The deploy label's checks on the head, as the head's preview read them
+/// (`crate::deploy_label`): first in Verification, never grouped away, each
+/// with its run. A failure a later skipped run hides from the newest check
+/// of its name still reads as failed.
+fn deploy_rows(f: &Facts) -> Vec<crate::pr_body::Row> {
+    use crate::pr_body::{Outcome as O, Row};
+    use crate::preview::Outcome as P;
+    let Some(p) = &f.preview else {
+        return Vec::new();
+    };
+    let covers: Vec<crate::preview::Covering> = p
+        .covers
+        .iter()
+        .filter(|c| !c.label.is_empty())
+        .cloned()
+        .collect();
+    let mut out = Vec::new();
+    for r in p
+        .checks
+        .iter()
+        .filter(|r| crate::preview::is_covering(&covers, &r.name))
+    {
+        let link = if r.url.starts_with("https://") {
+            format!("[run]({})", r.url)
+        } else {
+            String::new()
+        };
+        let with = |w: &str| match (w.is_empty(), link.is_empty()) {
+            (true, _) => link.clone(),
+            (false, true) => w.to_string(),
+            (false, false) => format!("{w}; {link}"),
+        };
+        let (outcome, detail) = match r.outcome {
+            P::Passed => (O::Passed, with("")),
+            P::Failed if r.no_jobs => (O::Failed, with("it failed to start")),
+            P::Failed => (O::Failed, with("")),
+            P::Running => (O::Running, with("")),
+            P::Waiting if r.environment.is_empty() => {
+                (O::NotRun, with("waiting for an environment's approval"))
+            }
+            P::Waiting => (
+                O::NotRun,
+                with(&format!(
+                    "waiting for approval to deploy to `{}`",
+                    r.environment.replace('`', "'")
+                )),
+            ),
+            P::Skipped => continue,
+        };
+        out.push(Row {
+            check: format!("{} (deploy label)", check_name(&r.name)),
+            outcome,
+            detail,
+        });
+    }
+    out
 }
 
 fn semver(v: &str) -> Vec<u64> {
@@ -1252,6 +1325,10 @@ fn screens_of(p: &crate::preview::State, visible: bool) -> Option<crate::pr_body
         Stage::Failed => {
             "the preview checks failed; its pages are captured once they pass".to_string()
         }
+        Stage::Approval => {
+            "the preview waits for an environment's approval; its pages are captured once it is up"
+                .to_string()
+        }
         _ if !p.why.trim().is_empty() => p.why.clone(),
         _ if !visible => "the change has no page a person sees".to_string(),
         _ => return None,
@@ -1484,8 +1561,8 @@ pub fn body_of(f: &Facts, ticked: &[String]) -> crate::pr_body::Body {
         .iter()
         .any(|x| crate::preview::is_user_visible(&x.path));
     let screens = match (&f.screens, &f.preview) {
-        (Some(s), _) => Some(s.clone()),
-        (None, Some(p)) => screens_of(p, visible),
+        (s, Some(p)) => screens_of(p, visible).or_else(|| s.clone()),
+        (Some(s), None) => Some(s.clone()),
         (None, None) if f.files.iter().any(|x| is_ui(&x.path)) => Some(Screens::Missing(
             "CoderHelm had no runnable preview to capture for this run".into(),
         )),
@@ -1522,6 +1599,11 @@ pub fn body_of(f: &Facts, ticked: &[String]) -> crate::pr_body::Body {
             ));
         }
         evidence.push(s.trim_end().to_string());
+    }
+    if let Some(p) = &f.preview {
+        for k in &p.kept_off {
+            evidence.push(format!("{}.", k.line()));
+        }
     }
     let items = needed_items(f);
     let mut built: Vec<String> = Vec::new();
@@ -1601,6 +1683,7 @@ pub fn body_of(f: &Facts, ticked: &[String]) -> crate::pr_body::Body {
         rollback,
         rows: rows(f),
         screens,
+        e2e_screens: f.e2e_screens.clone(),
         notes_label,
         notes_top,
         evidence: evidence.join("\n\n"),
@@ -1646,6 +1729,41 @@ mod tests {
         }
     }
 
+    /// The preview's captured pages are never hidden by another table: the
+    /// end-to-end pair travels on its own and is shown under them.
+    #[test]
+    fn the_preview_pages_win_and_the_end_to_end_pair_is_kept_beside_them() {
+        use crate::pr_body::Screens;
+        let pair = Screens::Images {
+            before: String::new(),
+            before_alt: "No passing run on main with a screenshot of this test yet".into(),
+            after: "https://github.com/o/r/blob/c1/pr-7/abc/e2e-1-after.png?raw=true".into(),
+            after_alt: "Checkout on this head".into(),
+            caption: String::new(),
+        };
+        let mut f = ticket_facts();
+        f.screens = Some(pair.clone());
+        f.e2e_screens = Some(pair.clone());
+        f.preview = Some(crate::preview::State {
+            shots: vec![crate::preview::Shot {
+                page: "/checkout".into(),
+                width: "desktop".into(),
+                src: "https://img.example.com/d.png".into(),
+            }],
+            ..Default::default()
+        });
+        let b = body_of(&f, &[]);
+        assert!(
+            matches!(b.screens, Some(Screens::Pages(_))),
+            "{:?}",
+            b.screens
+        );
+        assert_eq!(b.e2e_screens, Some(pair.clone()));
+        // Without a preview, a table someone set still shows.
+        f.preview = None;
+        assert_eq!(body_of(&f, &[]).screens, Some(pair));
+    }
+
     fn ticket_facts() -> Facts {
         Facts {
             head: "abc1234def".into(),
@@ -1678,6 +1796,76 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn the_deploy_labels_checks_are_quoted_once_with_their_run() {
+        use crate::preview::{CheckResult, Covering, Outcome as P, State};
+        let run = |name: &str, outcome: P| CheckResult {
+            name: name.into(),
+            outcome,
+            url: "https://github.com/acme/site/actions/runs/7/job/3".into(),
+            environment: String::new(),
+            no_jobs: false,
+        };
+        let preview = |checks: Vec<CheckResult>| State {
+            covers: vec![Covering {
+                check: "Deploy app".into(),
+                workflow: ".github/workflows/deploy.yml".into(),
+                label: "CI:DEPLOY_PREVIEW".into(),
+                ..Default::default()
+            }],
+            checks,
+            ..Default::default()
+        };
+        let mut f = ticket_facts();
+        f.checks.push(check("Deploy app", Outcome::Passed));
+        f.preview = Some(preview(vec![run("Deploy app", P::Passed)]));
+        let out = lead(&f);
+        // Shown once, as the deploy label's, with its run; not again as CI.
+        assert!(
+            out.contains("| Deploy app (deploy label) | Passed; [run](https://github.com/acme/site/actions/runs/7/job/3) |"),
+            "{out}"
+        );
+        assert!(!out.contains("| Deploy app (CI)"), "{out}");
+        // A later skipped run hid the failure from CI's newest check: the
+        // row says failed.
+        f.checks.pop();
+        f.checks.push(check("Deploy app", Outcome::DidNotRun));
+        f.preview = Some(preview(vec![run("Deploy app", P::Failed)]));
+        assert!(lead(&f).contains(
+            "| Deploy app (deploy label) | Failed: [run](https://github.com/acme/site/actions/runs/7/job/3) |"
+        ));
+        let mut started = run("Deploy app", P::Failed);
+        started.no_jobs = true;
+        f.preview = Some(preview(vec![started]));
+        assert!(
+            lead(&f).contains("| Deploy app (deploy label) | Failed: it failed to start; [run](")
+        );
+        let mut held = run("Deploy app", P::Waiting);
+        held.environment = "preview".into();
+        f.preview = Some(preview(vec![held]));
+        assert!(lead(&f).contains(
+            "| Deploy app (deploy label) | Not run: waiting for approval to deploy to `preview`; [run]("
+        ));
+        // Kept in sight when the CI checks are too many to list one by one.
+        f.preview = Some(preview(vec![run("Deploy app", P::Passed)]));
+        f.checks = (0..12)
+            .map(|i| check(&format!("unit tests {i}"), Outcome::Passed))
+            .collect();
+        assert!(rows(&f)
+            .iter()
+            .any(|r| r.check == "Deploy app (deploy label)"));
+        // A label left off is said in the full evidence.
+        let mut p = preview(vec![]);
+        p.kept_off = vec![crate::deploy_label::KeptOff {
+            label: "CI:DEPLOY_PREVIEW".into(),
+            by: crate::deploy_label::RemovedBy::Person,
+        }];
+        f.preview = Some(p);
+        assert!(body_of(&f, &[]).evidence.contains(
+            "`CI:DEPLOY_PREVIEW` was taken off by a person, so CoderHelm left it off this head."
+        ));
     }
 
     #[test]

@@ -1200,6 +1200,23 @@ pub struct TicketMessage {
     /// that picks the answers up). A continuation keeps its own id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub new_run_id: Option<String>,
+    /// A person asked for this run after the ticket's pull request merged
+    /// (Retry on a run that ended on the merge, or a command or dashboard
+    /// start on the GitHub issue whose run did), so the run skips the
+    /// merged-ticket check (`merged_ticket`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub after_merge: bool,
+    /// What already merged for the ticket and what is still to do, when the
+    /// merged-ticket check found its merged pull requests did part of it
+    /// (`merged_ticket::partial_note`): kept for the run's later steps and
+    /// added to the team's instructions each time they are loaded
+    /// (`merged_ticket::with_note`).
+    #[serde(default, skip_serializing_if = "is_blank")]
+    pub merged_note: Option<String>,
+}
+
+fn is_blank(s: &Option<String>) -> bool {
+    s.as_deref().is_none_or(|s| s.trim().is_empty())
 }
 
 fn is_zero_u32(n: &u32) -> bool {
@@ -1303,6 +1320,8 @@ impl Default for TicketMessage {
             answers: Vec::new(),
             related: Vec::new(),
             new_run_id: None,
+            after_merge: false,
+            merged_note: None,
         }
     }
 }

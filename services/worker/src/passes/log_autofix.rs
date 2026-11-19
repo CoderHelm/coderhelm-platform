@@ -137,6 +137,8 @@ impl StartEnv for WorkerEnv<'_> {
             answers: Vec::new(),
             related: Vec::new(),
             new_run_id: None,
+            after_merge: false,
+            merged_note: None,
         });
         let body = serde_json::to_string(&msg).map_err(|e| e.to_string())?;
         self.state

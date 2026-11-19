@@ -198,12 +198,18 @@ async fn github_ticket(
         Some(&hash),
         true,
         false,
+        Some(repo),
         false,
     )
     .await;
     if let Some(refused) = gate_refusal(&gate) {
         return Err(refused);
     }
+    // Starting the issue from the dashboard after its run ended on a merge
+    // (it merged, or the merged-ticket check ended it) asks for the work
+    // anyway, as Retry on that run does (`common::merged_ticket`).
+    let after_merge =
+        trigger_gate::github_issue_ended_on_merge(state, &claims.team_id, &ticket_id, repo).await;
     Ok((
         TicketMessage {
             team_id: claims.team_id.clone(),
@@ -225,6 +231,7 @@ async fn github_ticket(
             ),
             image_attachments: vec![],
             ticket_type: common::messages::ticket_type_of_github(&issue),
+            after_merge,
             ..Default::default()
         },
         ticket_id,
@@ -261,9 +268,17 @@ async fn jira_ticket(
         .map_err(|e| internal("Run not read", e))?
         .item
         .ok_or_else(|| fail(StatusCode::NOT_FOUND, "That ticket's last run is gone."))?;
-    let gate =
-        trigger_gate::gate_ticket_trigger(state, &claims.team_id, key, None, true, false, false)
-            .await;
+    let gate = trigger_gate::gate_ticket_trigger(
+        state,
+        &claims.team_id,
+        key,
+        None,
+        true,
+        false,
+        None,
+        false,
+    )
+    .await;
     if let Some(refused) = gate_refusal(&gate) {
         return Err(refused);
     }

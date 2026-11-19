@@ -325,6 +325,8 @@ mod tests {
             answers: Vec::new(),
             related: Vec::new(),
             new_run_id: None,
+            after_merge: false,
+            merged_note: None,
         });
         let json = serde_json::to_string(&msg).unwrap();
         let parsed: WorkerMessage = serde_json::from_str(&json).unwrap();
