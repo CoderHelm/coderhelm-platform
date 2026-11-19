@@ -698,7 +698,13 @@ pub fn fresh_run(
         person_direction: Some(direction.to_string()),
         answers: all,
         after_merge: carried.after_merge,
-        merged_note: carried.note.clone().or_else(|| msg.merged_note.clone()),
+        // The ended run's own note only when it didn't end on the merge
+        // (that merge did the rest: `common::merged_ticket::carried_note`).
+        merged_note: carried.note.clone().or_else(|| {
+            (!carried.after_merge)
+                .then(|| msg.merged_note.clone())
+                .flatten()
+        }),
         ..Default::default()
     }
 }
@@ -1271,6 +1277,18 @@ mod tests {
             note: None,
         };
         assert!(fresh_run(&msg, &direction, &answers, &ended).after_merge);
+        // The ended run's own (stale) note isn't carried after a merge.
+        let stale = TicketMessage {
+            merged_note: Some("## Already merged for this ticket\n- A\n- B".into()),
+            ..msg.clone()
+        };
+        let after = fresh_run(&stale, &direction, &answers, &ended);
+        assert!(after.after_merge);
+        assert_eq!(after.merged_note, None);
+        assert_eq!(
+            fresh_run(&stale, &direction, &answers, &Default::default()).merged_note,
+            stale.merged_note
+        );
     }
 
     #[tokio::test]

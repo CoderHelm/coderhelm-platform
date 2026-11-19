@@ -224,10 +224,7 @@ pub fn ended_on_merge(i: &Item) -> bool {
 /// (`common::merged_ticket::note_of`): only when the run didn't end on a
 /// merge, since that merge did the rest and the note is out of date.
 pub fn retry_note(i: &Item) -> Option<String> {
-    if ended_on_merge(i) {
-        return None;
-    }
-    common::merged_ticket::note_of(i)
+    common::merged_ticket::carried_note(i)
 }
 
 fn field<'a>(i: &'a Item, k: &str) -> &'a str {

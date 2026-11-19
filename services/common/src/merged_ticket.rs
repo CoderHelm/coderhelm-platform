@@ -108,8 +108,21 @@ pub fn carried_from(
 ) -> Carried {
     Carried {
         after_merge: item_ended_on_merge(item),
-        note: note_of(item),
+        note: carried_note(item),
     }
+}
+
+/// What already merged for the ticket, carried from a run into the next one
+/// (Retry, or a person's answer on the ticket): the run's saved note, only
+/// when the run didn't end on a merge, since that merge did the rest and the
+/// note is out of date. One rule for every path that starts a run again.
+pub fn carried_note(
+    item: &std::collections::HashMap<String, aws_sdk_dynamodb::types::AttributeValue>,
+) -> Option<String> {
+    if item_ended_on_merge(item) {
+        return None;
+    }
+    note_of(item)
 }
 
 /// The run's saved [`FIELD_MERGED_NOTE`], from its record. `None` when the
@@ -625,6 +638,22 @@ mod tests {
         ] {
             assert!(carried_from(&ended).after_merge, "{ended:?}");
         }
+        // A partial run whose pull request then merged: that merge did the
+        // rest, so its "still to do" note is out of date and isn't carried.
+        let merged_with_note = record(&[
+            ("status", "merged"),
+            (
+                FIELD_MERGED_NOTE,
+                "## Already merged for this ticket\n- the CSV export",
+            ),
+        ]);
+        assert_eq!(
+            carried_from(&merged_with_note),
+            Carried {
+                after_merge: true,
+                note: None
+            }
+        );
         assert_eq!(
             carried_from(&record(&[("status", "failed")])),
             Carried::default()
