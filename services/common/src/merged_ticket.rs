@@ -38,8 +38,10 @@
 //!
 //! - Retry on a run that ended covered by a merged pull request, waited on
 //!   this check, or merged (the dashboard, or `POST /api/runs/{run_id}/retry`);
-//! - on Jira, a reply on the ticket with what is still to do (the new run
-//!   starts with that person's direction);
+//! - on Jira, when the ticket's latest run ended on the merge, a reply on the
+//!   ticket with what is still to do (the new run starts with that person's
+//!   direction); an answer to any other run gets the check like a normal run
+//!   and keeps that run's "build only the rest" note ([`Carried`]);
 //! - on GitHub, `@coderhelm` (or `/coderhelm`) on the issue with what is
 //!   still to do, or starting the issue from the dashboard, when the issue's
 //!   latest run ended that way.
@@ -68,6 +70,47 @@ pub const FIELD_AFTER_MERGE: &str = "after_merge";
 /// did part of the ticket: written once, so Retry and the pull request's fix
 /// rounds re-apply it ([`with_note`]).
 pub const FIELD_MERGED_NOTE: &str = "merged_note";
+
+/// A run ended on a merge: the merged-ticket check ended it ([`STOP_KIND`]:
+/// covered by a merged pull request, or waiting because it couldn't tell),
+/// or its pull request merged.
+pub fn ended_on_merge(stop_kind: &str, status: &str, pr_outcome: &str) -> bool {
+    stop_kind == STOP_KIND || status == crate::run_status::MERGED || pr_outcome == "merged"
+}
+
+/// [`ended_on_merge`], from a run record.
+pub fn item_ended_on_merge(
+    item: &std::collections::HashMap<String, aws_sdk_dynamodb::types::AttributeValue>,
+) -> bool {
+    let f = |k: &str| {
+        item.get(k)
+            .and_then(|v| v.as_s().ok())
+            .map(String::as_str)
+            .unwrap_or("")
+    };
+    ended_on_merge(f("stop_kind"), f("status"), f("pr_outcome"))
+}
+
+/// What a run started again from a person's answer on the ticket takes from
+/// the run that ended: the after-merge override only when that run ended on
+/// the merge (the answer is then the person asking for the work anyway),
+/// and its saved "build only the rest" note, so the new run keeps it before
+/// a fresh verdict. Any other answer gets the check like a normal run.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Carried {
+    pub after_merge: bool,
+    pub note: Option<String>,
+}
+
+/// [`Carried`], from the ended run's record.
+pub fn carried_from(
+    item: &std::collections::HashMap<String, aws_sdk_dynamodb::types::AttributeValue>,
+) -> Carried {
+    Carried {
+        after_merge: item_ended_on_merge(item),
+        note: note_of(item),
+    }
+}
 
 /// The run's saved [`FIELD_MERGED_NOTE`], from its record. `None` when the
 /// run has none.
@@ -536,6 +579,55 @@ mod tests {
         assert_eq!(
             with_note("Team rules.", Some(&note)),
             "Team rules.\n\n## Already merged for this ticket"
+        );
+    }
+
+    fn record(
+        pairs: &[(&str, &str)],
+    ) -> std::collections::HashMap<String, aws_sdk_dynamodb::types::AttributeValue> {
+        pairs
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.to_string(),
+                    aws_sdk_dynamodb::types::AttributeValue::S(v.to_string()),
+                )
+            })
+            .collect()
+    }
+
+    /// An answer on the ticket asks for the work anyway only when the run it
+    /// answers ended on the merge; otherwise the new run gets the check and
+    /// keeps the ended run's "build only the rest" note.
+    #[test]
+    fn an_answer_carries_the_override_only_after_a_merge_and_always_the_note() {
+        let partial_waiting = record(&[
+            ("status", "needs_input"),
+            (
+                FIELD_MERGED_NOTE,
+                "## Already merged for this ticket\n- the CSV export",
+            ),
+        ]);
+        let c = carried_from(&partial_waiting);
+        assert!(
+            !c.after_merge,
+            "a run that ended waiting didn't end on the merge"
+        );
+        assert_eq!(
+            c.note.as_deref(),
+            Some("## Already merged for this ticket\n- the CSV export")
+        );
+        for ended in [
+            record(&[("status", "covered_by_pr"), ("stop_kind", STOP_KIND)]),
+            record(&[("status", "needs_input"), ("stop_kind", STOP_KIND)]),
+            record(&[("status", "merged")]),
+            record(&[("status", "completed"), ("pr_outcome", "merged")]),
+        ] {
+            assert!(carried_from(&ended).after_merge, "{ended:?}");
+        }
+        assert_eq!(
+            carried_from(&record(&[("status", "failed")])),
+            Carried::default()
         );
     }
 

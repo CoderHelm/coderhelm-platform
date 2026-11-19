@@ -275,14 +275,27 @@ pub(crate) async fn record_notes(
 
 /// Sends the prepared action: a run (under the ticket lock, so two
 /// comments can't start two runs) or feedback on the open PR.
-/// The comment's action carrying the person's direction onto the ticket
-/// run it starts (see `TicketMessage::person_direction`); `None` when there
-/// is no direction or the action isn't a ticket run.
-fn with_direction(action: &WorkerMessage, direction: Option<String>) -> Option<WorkerMessage> {
-    match (action, direction) {
-        (WorkerMessage::Ticket(t), Some(d)) => {
+/// The comment's action as the ticket run it starts: the person's
+/// direction when there is one (see `TicketMessage::person_direction`), and
+/// what the run the comment answers carries
+/// (`common::merged_ticket::Carried`: the after-merge override only when
+/// that run ended on the merge, and its "build only the rest" note). `None`
+/// when the action isn't a ticket run.
+fn with_direction(
+    action: &WorkerMessage,
+    direction: Option<String>,
+    carried: &common::merged_ticket::Carried,
+) -> Option<WorkerMessage> {
+    match action {
+        WorkerMessage::Ticket(t) => {
             let mut t = t.clone();
-            t.person_direction = Some(d);
+            if direction.is_some() {
+                t.person_direction = direction;
+            }
+            t.after_merge = carried.after_merge;
+            if carried.note.is_some() {
+                t.merged_note = carried.note.clone();
+            }
             Some(WorkerMessage::Ticket(t))
         }
         _ => None,
@@ -368,7 +381,12 @@ pub async fn run(
         Act::Dispatch => {
             record(state, &msg, note, None).await;
             if let Some(a) = msg.action.as_deref() {
-                let directed = with_direction(a, direction);
+                let carried = if matches!(a, WorkerMessage::Ticket(_)) {
+                    super::carried_from_run(state, &msg.team_id, &msg.run_id).await
+                } else {
+                    Default::default()
+                };
+                let directed = with_direction(a, direction, &carried);
                 dispatch(state, &msg, directed.as_ref().unwrap_or(a)).await;
             }
         }
@@ -397,6 +415,39 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reply on a Jira ticket whose run built only what a merged PR didn't
+    /// and then ended waiting: the new run keeps the note and still gets the
+    /// merged-ticket check. A reply after the run ended on the merge asks for
+    /// the work anyway.
+    #[test]
+    fn a_jira_reply_carries_the_override_only_after_a_merge() {
+        let action = WorkerMessage::Ticket(crate::models::TicketMessage {
+            ticket_id: "WEB-42".into(),
+            ..Default::default()
+        });
+        let partial = common::merged_ticket::Carried {
+            after_merge: false,
+            note: Some("## Already merged for this ticket\n- the CSV export".into()),
+        };
+        let Some(WorkerMessage::Ticket(t)) =
+            with_direction(&action, Some("pat: use v2".into()), &partial)
+        else {
+            panic!("a ticket run");
+        };
+        assert_eq!(t.person_direction.as_deref(), Some("pat: use v2"));
+        assert!(!t.after_merge);
+        assert_eq!(t.merged_note, partial.note);
+        let ended = common::merged_ticket::Carried {
+            after_merge: true,
+            note: None,
+        };
+        let Some(WorkerMessage::Ticket(t)) = with_direction(&action, None, &ended) else {
+            panic!("a ticket run");
+        };
+        assert!(t.after_merge);
+        assert_eq!(t.person_direction, None);
+    }
 
     #[test]
     fn an_informational_comment_never_starts_a_run() {

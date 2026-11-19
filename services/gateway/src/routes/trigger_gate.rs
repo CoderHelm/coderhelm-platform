@@ -217,9 +217,7 @@ pub fn latest_ended_on_merge(items: Vec<Item>, repo: &str) -> bool {
 
 /// The run merged, or the merged-ticket check ended it.
 pub fn ended_on_merge(i: &Item) -> bool {
-    field(i, "stop_kind") == common::merged_ticket::STOP_KIND
-        || field(i, "status") == common::run_status::MERGED
-        || field(i, "pr_outcome") == "merged"
+    common::merged_ticket::item_ended_on_merge(i)
 }
 
 /// What already merged for the ticket, carried to a retry of the run

@@ -9859,6 +9859,45 @@ async fn stop_run_repo_not_enabled(
     .await;
 }
 
+/// A person asked for this run after the merge (`after_merge`), so it skips
+/// the merged-ticket check. An answer on the ticket alone (`person_direction`)
+/// doesn't: it carries the override only when the run it answers ended on
+/// the merge (`common::merged_ticket::Carried`).
+fn skips_merged_check(msg: &TicketMessage) -> bool {
+    msg.after_merge
+}
+
+/// What the run that ended carries into a run started again from a person's
+/// answer on its ticket (`common::merged_ticket::Carried`), from its record.
+/// Nothing when the record can't be read.
+pub(crate) async fn carried_from_run(
+    state: &WorkerState,
+    team_id: &str,
+    run_id: &str,
+) -> common::merged_ticket::Carried {
+    match state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.runs_table_name)
+        .key("team_id", attr_s(team_id))
+        .key("run_id", attr_s(run_id))
+        .projection_expression("stop_kind, #s, pr_outcome, #mn")
+        .expression_attribute_names("#s", "status")
+        .expression_attribute_names("#mn", common::merged_ticket::FIELD_MERGED_NOTE)
+        .send()
+        .await
+    {
+        Ok(out) => out
+            .item()
+            .map(common::merged_ticket::carried_from)
+            .unwrap_or_default(),
+        Err(e) => {
+            warn!(run_id, error = %e, "Could not read what the ended run carries");
+            Default::default()
+        }
+    }
+}
+
 /// What [`merged_work`] left the run to do.
 enum MergedWork {
     /// The run ended: covered by the merged pull request, or waiting on a
@@ -9898,7 +9937,7 @@ async fn merged_work(
     let Some(pr) = prs.first() else {
         return MergedWork::GoOn;
     };
-    if msg.after_merge || msg.person_direction.is_some() {
+    if skips_merged_check(msg) {
         info!(run_id, pr = %pr.subject(), "The ticket's pull request merged; a person asked for this run anyway");
         if let Err(e) = state
             .dynamo
@@ -14398,5 +14437,29 @@ mod retry_resume_tests {
         assert!(pr.contains(
             "super::security_fixes::on_pr_opened(state, github, msg, number, &url).await;\n        }\n        (number, url, nid)"
         ));
+    }
+}
+
+#[cfg(test)]
+mod merged_check_tests {
+    use super::skips_merged_check;
+    use crate::models::TicketMessage;
+
+    /// A partial run ended waiting and a person answered on the ticket: the
+    /// new run starts with their direction but still gets the merged-ticket
+    /// check. Only a person asking after the merge skips it.
+    #[test]
+    fn an_answer_alone_doesnt_skip_the_merged_check() {
+        let answered = TicketMessage {
+            person_direction: Some("pat: use the v2 endpoint".into()),
+            merged_note: Some("## Already merged for this ticket\n- the CSV export".into()),
+            ..Default::default()
+        };
+        assert!(!skips_merged_check(&answered));
+        let asked_anyway = TicketMessage {
+            after_merge: true,
+            ..answered
+        };
+        assert!(skips_merged_check(&asked_anyway));
     }
 }
