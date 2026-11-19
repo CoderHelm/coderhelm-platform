@@ -121,6 +121,14 @@ pub(crate) async fn asked(
     }
     let team =
         super::load_team_instructions(state, &msg.team_id, &msg.repo_owner, &msg.repo_name).await;
+    // What already merged for the ticket, when the run builds only the rest
+    // (`common::merged_ticket`).
+    let team = common::merged_ticket::with_note(
+        &team,
+        super::run_merged_note(state, &msg.team_id, &msg.run_id)
+            .await
+            .as_deref(),
+    );
     match crate::agent::anthropic::converse_json(
         &provider.client(),
         provider.judgment_model_id(),

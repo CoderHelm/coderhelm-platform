@@ -1829,6 +1829,8 @@ pub(super) fn internal_ticket(
         answers: Vec::new(),
         related: Vec::new(),
         new_run_id: Some(run_id.to_string()),
+        after_merge: false,
+        merged_note: None,
     }
 }
 
@@ -2049,6 +2051,8 @@ pub async fn act(state: &WorkerState, a: TestAction) -> Result<(), Err> {
                 answers: Vec::new(),
                 related: Vec::new(),
                 new_run_id: None,
+                after_merge: false,
+                merged_note: None,
             };
             enqueue(state, crate::models::WorkerMessage::Ticket(ticket)).await?;
             rec.status = "generating".into();

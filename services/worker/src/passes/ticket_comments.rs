@@ -524,7 +524,7 @@ async fn read(
     }
     if let Some((direction, answers)) = &planned.restart {
         let started = match restart {
-            Some(msg) => start_again(state, msg, direction, answers).await,
+            Some(msg) => start_again(state, msg, t.run_id, direction, answers).await,
             None => false,
         };
         if !started {
@@ -655,6 +655,7 @@ async fn send_round(state: &WorkerState, t: &Ticket<'_>, facts: &RunFacts, body:
 async fn start_again(
     state: &WorkerState,
     msg: &TicketMessage,
+    ended_run_id: &str,
     direction: &str,
     answers: &[Answer],
 ) -> bool {
@@ -662,13 +663,21 @@ async fn start_again(
         info!(ticket_id = %msg.ticket_id, "Ticket lock held — the run starting on the ticket reads the comments");
         return false;
     }
-    let message = WorkerMessage::Ticket(fresh_run(msg, direction, answers));
+    let carried = super::carried_from_run(state, &msg.team_id, ended_run_id).await;
+    let message = WorkerMessage::Ticket(fresh_run(msg, direction, answers, &carried));
     send(state, &state.config.ticket_queue_url, &message).await
 }
 
 /// The ticket's message for a new run that takes up the comments: the
-/// same ticket, none of the ended run's own state.
-pub fn fresh_run(msg: &TicketMessage, direction: &str, answers: &[Answer]) -> TicketMessage {
+/// same ticket, none of the ended run's own state except what
+/// `common::merged_ticket::Carried` keeps (the after-merge override when the
+/// ended run ended on the merge, and its "build only the rest" note).
+pub fn fresh_run(
+    msg: &TicketMessage,
+    direction: &str,
+    answers: &[Answer],
+    carried: &common::merged_ticket::Carried,
+) -> TicketMessage {
     let mut all = msg.answers.clone();
     common::run_questions::merge(&mut all, answers);
     TicketMessage {
@@ -688,6 +697,14 @@ pub fn fresh_run(msg: &TicketMessage, direction: &str, answers: &[Answer]) -> Ti
         ticket_type: msg.ticket_type.clone(),
         person_direction: Some(direction.to_string()),
         answers: all,
+        after_merge: carried.after_merge,
+        // The ended run's own note only when it didn't end on the merge
+        // (that merge did the rest: `common::merged_ticket::carried_note`).
+        merged_note: carried.note.clone().or_else(|| {
+            (!carried.after_merge)
+                .then(|| msg.merged_note.clone())
+                .flatten()
+        }),
         ..Default::default()
     }
 }
@@ -1234,13 +1251,44 @@ mod tests {
             resume_from: Some("01OLD".into()),
             ..Default::default()
         };
-        let fresh = fresh_run(&msg, &direction, &answers);
+        let fresh = fresh_run(&msg, &direction, &answers, &Default::default());
         assert_eq!(fresh.ticket_id, "ABC-1");
         assert_eq!(fresh.continuation, 0, "a new run, not the ended one");
         assert_eq!(fresh.continuation_run_id, None);
         assert_eq!(fresh.resume_from, None);
         assert_eq!(fresh.person_direction.as_deref(), Some(direction.as_str()));
         assert_eq!(fresh.answers.len(), 2);
+        assert!(!fresh.after_merge);
+        assert_eq!(fresh.merged_note, None);
+        // A partial run (it built only what a merged PR didn't) ended
+        // waiting and was answered: the new run keeps "build only the rest"
+        // and still gets the merged-ticket check.
+        let partial = common::merged_ticket::Carried {
+            after_merge: false,
+            note: Some("## Already merged for this ticket\n- the CSV export".into()),
+        };
+        let fresh = fresh_run(&msg, &direction, &answers, &partial);
+        assert!(!fresh.after_merge);
+        assert_eq!(fresh.merged_note, partial.note);
+        // The run it answers ended on the merge: the answer asks for the
+        // work anyway.
+        let ended = common::merged_ticket::Carried {
+            after_merge: true,
+            note: None,
+        };
+        assert!(fresh_run(&msg, &direction, &answers, &ended).after_merge);
+        // The ended run's own (stale) note isn't carried after a merge.
+        let stale = TicketMessage {
+            merged_note: Some("## Already merged for this ticket\n- A\n- B".into()),
+            ..msg.clone()
+        };
+        let after = fresh_run(&stale, &direction, &answers, &ended);
+        assert!(after.after_merge);
+        assert_eq!(after.merged_note, None);
+        assert_eq!(
+            fresh_run(&stale, &direction, &answers, &Default::default()).merged_note,
+            stale.merged_note
+        );
     }
 
     #[tokio::test]

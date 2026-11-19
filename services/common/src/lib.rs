@@ -156,6 +156,9 @@ pub mod merge_gate;
 /// Where a finished run's pull request stands on its way to merge, in the
 /// one reason that is true.
 pub mod merge_standing;
+/// No second run on a ticket whose pull request already merged, unless a
+/// person asked for one after the merge.
+pub mod merged_ticket;
 /// Every message on the worker queues: one enum the gateway and worker share.
 pub mod messages;
 /// Retrying model API calls on transient failures, classified by status.

@@ -748,11 +748,15 @@ pub async fn finish(
     usage: &mut TokenUsage,
     start: &std::time::Instant,
 ) {
+    // A pull request that already merged (`common::merged_ticket`) is
+    // named as merged, never as open.
+    let merged = rec.outcome == cov::Outcome::Merged.as_str();
+    let pr_state = if merged { "merged" } else { "open" };
     info!(
         run_id,
         pr = rec.number,
         outcome = %rec.outcome,
-        "Run covered by an open pull request"
+        "Run covered by an {pr_state} pull request"
     );
     super::add_progress_note(state, &msg.team_id, run_id, &rec.note).await;
     // A person who asked for this run (a retry, a comment) is answered
@@ -764,9 +768,9 @@ pub async fn finish(
             format!("{} {}", msg.ticket_id, msg.title).trim().to_string(),
             common::truncate_str(msg.body.trim(), 1_500).to_string(),
         )
-        .pr(rec.number, rec.url.clone(), &rec.title, "open")
+        .pr(rec.number, rec.url.clone(), &rec.title, pr_state)
         .state(format!(
-            "this run ended without building anything: open pull request #{} already covers the ticket ({})",
+            "this run ended without building anything: {pr_state} pull request #{} already covers the ticket ({})",
             rec.number,
             if rec.outcome.is_empty() { "covered" } else { &rec.outcome }
         ))
@@ -798,7 +802,11 @@ pub async fn finish(
                 common::conversation::Say::status("run", cov::ticket_note(rec, false)),
                 &facts,
                 "covered",
-                "Already being fixed",
+                if merged {
+                    "Already merged"
+                } else {
+                    "Already being fixed"
+                },
             ))
             .await
             .map(|_| ())
