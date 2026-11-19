@@ -234,6 +234,12 @@ pub struct Approvals {
     pub blocking_by: Vec<String>,
     /// CoderHelm's own review of the head was dismissed and not posted again.
     pub bot_dismissed_at_head: bool,
+    /// Each approving person's approved commit, `(login, commit)`.
+    pub approved_on: Vec<(String, String)>,
+    /// People whose latest review was dismissed, with the commit it was of:
+    /// `(login, commit)`. A dismissal clears a verdict, so they are named
+    /// when the gate waits on a person.
+    pub dismissed: Vec<(String, String)>,
 }
 
 impl Approvals {
@@ -290,11 +296,20 @@ pub fn approval_state(reviews: &serde_json::Value, head_sha: &str) -> Approvals 
         .filter(|(_, (s, c))| *s == "APPROVED" && *c == head_sha)
         .map(|(l, _)| l.clone())
         .collect();
+    let on = |want: &str| -> Vec<(String, String)> {
+        latest
+            .iter()
+            .filter(|(_, (s, _))| *s == want)
+            .map(|(l, (_, c))| (l.clone(), c.to_string()))
+            .collect()
+    };
     Approvals {
         approved_by: with("APPROVED"),
         approved_at_head,
         blocking_by: with("CHANGES_REQUESTED"),
         bot_dismissed_at_head: bot_at_head == Some("DISMISSED"),
+        approved_on: on("APPROVED"),
+        dismissed: on("DISMISSED"),
     }
 }
 

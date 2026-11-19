@@ -5841,6 +5841,41 @@ impl GitHubClient {
         .await
     }
 
+    /// Classic branch protection of a branch (needs read access to
+    /// administration; callers treat an error as not known).
+    pub async fn branch_protection(
+        &self,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        self.get(&format!(
+            "{API_BASE}/repos/{owner}/{repo}/branches/{}/protection",
+            urlencoding::encode(branch)
+        ))
+        .await
+    }
+
+    /// GitHub's own reading of a pull request's required reviews: its
+    /// `reviewDecision` (`APPROVED`, `REVIEW_REQUIRED`, `CHANGES_REQUESTED`),
+    /// `None` when the branch requires no reviews.
+    pub async fn pr_review_decision(
+        &self,
+        owner: &str,
+        repo: &str,
+        pr_number: u64,
+    ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+        let data = self
+            .graphql_read(
+                "query($owner:String!,$name:String!,$pr:Int!){ repository(owner:$owner,name:$name){ pullRequest(number:$pr){ reviewDecision } } }",
+                serde_json::json!({ "owner": owner, "name": repo, "pr": pr_number }),
+            )
+            .await?;
+        Ok(data["repository"]["pullRequest"]["reviewDecision"]
+            .as_str()
+            .map(str::to_string))
+    }
+
     /// Classic branch protection's required status checks (needs read
     /// access to administration; callers treat an error as none).
     pub async fn required_status_checks(

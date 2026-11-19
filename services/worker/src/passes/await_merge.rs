@@ -64,6 +64,13 @@ const MAX_ERROR_RETRIES: u32 = 100;
 /// After the gate adds deploy labels, how long a "green" CI result is not
 /// trusted unless a check has started since the labels were added.
 const LABEL_CI_GRACE_SECS: i64 = 180;
+/// While the gate waits on people it still reads the PR again on this
+/// delay (the longest a queue delay can be), so a review event the webhook
+/// missed, or one it never sends, can't strand an approved PR.
+const PEOPLE_RECHECK_SECS: i32 = 900;
+/// How long one arming keeps re-reading while it waits on people. Any review
+/// event re-arms it after that.
+const PEOPLE_WATCH_SECS: i64 = 24 * 60 * 60;
 /// How long a gate record is kept after its last arming.
 const RECORD_TTL_SECS: u64 = 30 * 86_400;
 
@@ -272,6 +279,179 @@ pub(crate) struct GateView {
     /// not read for a PR that can't merge yet).
     pub ci: Option<CheckSummary>,
     pub now: i64,
+    /// The head commit and the base branch, to name them.
+    pub head: String,
+    pub base: String,
+    /// GitHub's own reading of the branch's required reviews
+    /// (`reviewDecision`): `APPROVED`, `REVIEW_REQUIRED`,
+    /// `CHANGES_REQUESTED`, or `None` when the branch requires none.
+    pub review_decision: Option<String>,
+    /// A person approved an earlier commit and every commit since only
+    /// brought the base in: the PR's own change is the one they approved
+    /// (`review_scope::same_own_change`, the reviewer's own comparison).
+    pub earlier_approval_holds: bool,
+    /// The branch's rules for reviews, where they could be read.
+    pub rules: ReviewRules,
+    /// People asked to review who haven't yet.
+    pub requested: Vec<String>,
+    /// This head is CoderHelm's own merge of the base into the branch.
+    pub base_merge_at_head: bool,
+}
+
+/// What the base branch's rules (classic protection and rulesets) say
+/// about reviews. `None` where they couldn't be read.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ReviewRules {
+    pub required_approvals: Option<u64>,
+    pub dismiss_stale: Option<bool>,
+}
+
+/// Pure: the review rules from classic protection and the branch's
+/// rulesets (`pull_request` rules); the strictest of them wins.
+pub(crate) fn review_rules(
+    protection: Option<&serde_json::Value>,
+    rulesets: Option<&serde_json::Value>,
+) -> ReviewRules {
+    let mut out = ReviewRules::default();
+    let mut take = |count: Option<u64>, dismiss: Option<bool>| {
+        if let Some(c) = count {
+            out.required_approvals = Some(out.required_approvals.map_or(c, |o| o.max(c)));
+        }
+        if let Some(d) = dismiss {
+            out.dismiss_stale = Some(out.dismiss_stale.unwrap_or(false) || d);
+        }
+    };
+    if let Some(p) = protection {
+        let r = &p["required_pull_request_reviews"];
+        if r.is_object() {
+            take(
+                r["required_approving_review_count"].as_u64(),
+                r["dismiss_stale_reviews"].as_bool(),
+            );
+        } else if p.is_object() {
+            take(Some(0), Some(false));
+        }
+    }
+    for rule in rulesets.and_then(|r| r.as_array()).into_iter().flatten() {
+        if rule["type"].as_str() == Some("pull_request") {
+            let params = &rule["parameters"];
+            take(
+                params["required_approving_review_count"].as_u64(),
+                params["dismiss_stale_reviews_on_push"].as_bool(),
+            );
+        }
+    }
+    out
+}
+
+/// Pure: the person key. Nobody's standing request for changes, and either
+/// a person approved this very commit, or a person's approval of an earlier
+/// commit still counts: GitHub's own required-review rule keeps it
+/// (`reviewDecision` is `APPROVED`), or every commit since only brought the
+/// base in. GitHub saying reviews are still required, or changes requested,
+/// is never outvoted.
+pub(crate) fn person_key(v: &GateView) -> bool {
+    let a = &v.approvals;
+    if !a.blocking_by.is_empty() {
+        return false;
+    }
+    match v.review_decision.as_deref() {
+        Some("REVIEW_REQUIRED") | Some("CHANGES_REQUESTED") => false,
+        Some("APPROVED") => !a.approved_by.is_empty(),
+        _ => {
+            !a.approved_at_head.is_empty()
+                || (!a.approved_by.is_empty() && v.earlier_approval_holds)
+        }
+    }
+}
+
+/// Pure: exactly what the person key is missing, in one line. Names a
+/// dismissed approval and the commit that dismissed it, the branch's
+/// required count, an approval of an earlier commit, and who was asked.
+pub(crate) fn missing_person_line(v: &GateView, rest_done: bool) -> (Mark, String) {
+    let a = &v.approvals;
+    let head = short(&v.head);
+    if !a.blocking_by.is_empty() {
+        return (
+            Mark::Blocked,
+            format!("Changes requested by {}", mention_list(&a.blocking_by)),
+        );
+    }
+    let tail = if rest_done {
+        "is all that's left"
+    } else {
+        "is needed too"
+    };
+    let dismissed: Vec<&(String, String)> =
+        a.dismissed.iter().filter(|(_, c)| c != &v.head).collect();
+    if !dismissed.is_empty() && a.approved_at_head.is_empty() {
+        let who: Vec<String> = dismissed
+            .iter()
+            .map(|(l, c)| format!("@{l}'s approval of {}", short(c)))
+            .collect();
+        let by = if v.base_merge_at_head {
+            format!("by CoderHelm's merge of `{}` at {head}", v.base)
+        } else {
+            format!("when new commits were pushed (the head is now {head})")
+        };
+        let was = if who.len() == 1 { "was" } else { "were" };
+        return (
+            Mark::Waiting,
+            format!(
+                "{} {was} dismissed {by}; a re-approval of {head} {tail}",
+                who.join(", ")
+            ),
+        );
+    }
+    if v.review_decision.as_deref() == Some("REVIEW_REQUIRED") {
+        let have = a.approved_by.len();
+        let need = match v.rules.required_approvals {
+            Some(n) if n > 0 => format!(
+                "{n} approving review{} from people",
+                if n == 1 { "" } else { "s" }
+            ),
+            _ => "an approving review from a person".to_string(),
+        };
+        let mut line = format!("The branch's rules need {need}; ");
+        if have == 0 {
+            line.push_str("none is in yet");
+        } else {
+            line.push_str(&format!("in so far: {}", mention_list(&a.approved_by)));
+        }
+        line.push_str(". CoderHelm's approval doesn't count toward them");
+        if !v.requested.is_empty() {
+            line.push_str(&format!(
+                ". Asked to review: {}",
+                mention_list(&v.requested)
+            ));
+        }
+        return (Mark::Waiting, line);
+    }
+    if !a.approved_on.is_empty() {
+        let who: Vec<String> = a
+            .approved_on
+            .iter()
+            .map(|(l, c)| format!("@{l} ({})", short(c)))
+            .collect();
+        return (
+            Mark::Waiting,
+            format!(
+                "Approved by {} on an earlier commit, and the PR's own change moved since; a \
+                 re-approval of {head} {tail}",
+                who.join(", ")
+            ),
+        );
+    }
+    if !v.requested.is_empty() {
+        return (
+            Mark::Waiting,
+            format!(
+                "Waiting for a person's approval (asked: {})",
+                mention_list(&v.requested)
+            ),
+        );
+    }
+    (Mark::Waiting, "Waiting for a person's approval".to_string())
 }
 
 /// What the gate does next.
@@ -310,7 +490,7 @@ fn short(sha: &str) -> &str {
 pub(crate) fn decide_gate(v: &GateView) -> GateDecision {
     let bot_dismissed = v.approvals.bot_dismissed_at_head;
     let bot_approved = v.bot_verdict.as_deref() == Some("APPROVE") && !bot_dismissed;
-    let human_present = v.approvals.human_key_at_head();
+    let human_present = person_key(v);
 
     let mut lines: Vec<(Mark, String)> = Vec::new();
     match (v.bot_verdict.as_deref(), bot_dismissed) {
@@ -326,32 +506,14 @@ pub(crate) fn decide_gate(v: &GateView) -> GateDecision {
     }
     if v.require_human {
         lines.push(if human_present {
-            (
-                Mark::Done,
-                format!(
-                    "Approved by {}",
-                    mention_list(&v.approvals.approved_at_head)
-                ),
-            )
-        } else if !v.approvals.blocking_by.is_empty() {
-            (
-                Mark::Blocked,
-                format!(
-                    "Changes requested by {}",
-                    mention_list(&v.approvals.blocking_by)
-                ),
-            )
-        } else if !v.approvals.approved_by.is_empty() {
-            (
-                Mark::Waiting,
-                format!(
-                    "Approved by {} on an earlier commit; waiting for a person's approval of \
-                     this one",
-                    mention_list(&v.approvals.approved_by)
-                ),
-            )
+            let by = if v.approvals.approved_at_head.is_empty() {
+                &v.approvals.approved_by
+            } else {
+                &v.approvals.approved_at_head
+            };
+            (Mark::Done, format!("Approved by {}", mention_list(by)))
         } else {
-            (Mark::Waiting, "Waiting for a person's approval".to_string())
+            missing_person_line(v, bot_approved && !v.draft)
         });
     }
     if v.draft {
@@ -637,6 +799,10 @@ struct GateRecord {
     labels_added_at: Option<i64>,
     /// A person's stop (see `common::merge_gate::stop`).
     stopped: Option<Stopped>,
+    /// The head CoderHelm's own merge of the base made, if it made one.
+    base_merge_head: String,
+    /// When the current chain started waiting on people (epoch seconds).
+    waiting_since: Option<i64>,
 }
 
 fn num(item: &HashMap<String, AttributeValue>, k: &str) -> Option<i64> {
@@ -676,6 +842,8 @@ async fn load_record(state: &WorkerState, msg: &AwaitMergeMessage) -> Result<Gat
         labels_added_head: text(item, "labels_added_head"),
         labels_added_at: num(item, "labels_added_at"),
         stopped: common::merge_gate::stopped(item),
+        base_merge_head: text(item, "base_merge_head"),
+        waiting_since: num(item, "waiting_since"),
     })
 }
 
@@ -694,7 +862,8 @@ async fn start_chain(
         .key("sk", attr_s(&record_key(msg)))
         .update_expression(
             "SET chain_id = :c, head_sha = :h, base_branch = :b, self_authored = :sa, \
-             installation_id = :i, armed_at = :now, #st = :st, #ttl = :ttl",
+             installation_id = :i, armed_at = :now, #st = :st, #ttl = :ttl \
+             REMOVE waiting_since",
         )
         .expression_attribute_names("#st", "state")
         .expression_attribute_names("#ttl", "ttl")
@@ -896,6 +1065,8 @@ async fn bot_verdict_at_head(
 enum Next {
     /// Evaluate again after a delay.
     Poll,
+    /// Waiting on people: read again on the slow timer, while the watch lasts.
+    Recheck,
     /// Nothing to poll for; an event re-arms the gate if needed.
     Stop,
 }
@@ -1003,6 +1174,10 @@ pub async fn run(state: &WorkerState, mut msg: AwaitMergeMessage) -> Result<(), 
 
     match evaluate(state, &github, &msg, &mut record, now).await {
         Ok(Next::Stop) => {}
+        Ok(Next::Recheck) => {
+            msg.error_retries = 0;
+            recheck_people(state, &msg, &mut record, now).await;
+        }
         Ok(Next::Poll) => {
             msg.error_retries = 0;
             if !poll_again(state, &msg, now, record.armed_at).await {
@@ -1224,12 +1399,41 @@ async fn evaluate(
         return Ok(Next::Stop);
     }
 
-    let approvals = fetch_approvals(github, owner, repo, msg.pr_number, &msg.head_sha).await?;
     let bot = bot_verdict_at_head(state, msg).await?;
     let (bot_verdict, bot_holding) = match bot {
         Some(b) => (Some(b.verdict), b.holding),
         None => (None, Vec::new()),
     };
+    // Behind or conflicting with the base: bring the base in now, as soon
+    // as the gate is armed (before a person's approval lands, where the
+    // branch's rules dismiss approvals on push), not at merge time. A review
+    // that holds changes is left to its author, who pushes anyway.
+    if let Some(need) = needs_base(&pr) {
+        if bot_verdict.as_deref().is_none_or(|v| v == "APPROVE") {
+            return keep_current(state, github, msg, record, &pr, need, Vec::new()).await;
+        }
+    }
+    let approvals = fetch_approvals(github, owner, repo, msg.pr_number, &msg.head_sha).await?;
+    // GitHub's own required-review rule decides whether an approval of an
+    // earlier commit still counts; unreadable, the gate's own rule does.
+    let review_decision = match github.pr_review_decision(owner, repo, msg.pr_number).await {
+        Ok(d) => d,
+        Err(e) => {
+            warn!(pr = msg.pr_number, error = %e, "await-merge: could not read GitHub's review decision");
+            None
+        }
+    };
+    let earlier_approval_holds = approvals.approved_at_head.is_empty()
+        && review_decision.is_none()
+        && earlier_approval_holds(github, msg, &approvals).await;
+    let requested: Vec<String> = pr["requested_reviewers"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|r| r["login"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
     let mut view = GateView {
         draft: pr["draft"].as_bool().unwrap_or(false),
         require_human: cfg.require_human_approval || msg.self_authored,
@@ -1248,8 +1452,22 @@ async fn evaluate(
             .flatten(),
         ci: None,
         now,
+        head: msg.head_sha.clone(),
+        base: msg.base_branch.clone(),
+        review_decision,
+        earlier_approval_holds,
+        rules: ReviewRules::default(),
+        requested,
+        base_merge_at_head: !record.base_merge_head.is_empty()
+            && record.base_merge_head == msg.head_sha,
     };
     let mut decision = decide_gate(&view);
+    // Waiting on a person: read the branch's review rules, so the wait names
+    // the required count.
+    if decision.action == Action::WaitForPeople && view.require_human && !person_key(&view) {
+        view.rules = read_review_rules(github, owner, repo, &msg.base_branch).await;
+        decision = decide_gate(&view);
+    }
     let mut quarantined: Option<Vec<String>> = None;
     if decision.action == Action::ReadCi {
         let summary = ci_summary(github, owner, repo, &msg.head_sha).await?;
@@ -1285,9 +1503,12 @@ async fn evaluate(
         decision = decide_gate(&view);
     }
 
+    // What the gate waits on, for the run page: the first item not done.
     let detail = decision
         .lines
-        .last()
+        .iter()
+        .find(|(m, _)| *m != Mark::Done)
+        .or(decision.lines.last())
         .map(|(_, l)| l.clone())
         .unwrap_or_default();
     let status = render_status(
@@ -1304,10 +1525,19 @@ async fn evaluate(
                 "await-merge: waiting on approvals — stopping until the next review event"
             );
             set_state(state, msg, decision.state, &detail).await;
-            if watched {
+            // A person's approval that no longer counts is never waited on
+            // silently: the PR's one status comment, and the team's channel
+            // once per commit.
+            let person_gap = view.require_human
+                && !person_key(&view)
+                && (!view.approvals.approved_by.is_empty() || !view.approvals.dismissed.is_empty());
+            if watched || person_gap {
                 publish_status(state, github, msg, record, &status).await;
             }
-            Ok(Next::Stop)
+            if person_gap {
+                tell_team(state, msg, &pr, &detail).await;
+            }
+            Ok(Next::Recheck)
         }
         Action::ReadCi => Err("the gate asked for CI after reading it".into()),
         Action::AddLabels(missing) => {
@@ -1464,14 +1694,12 @@ async fn merge(
             Ok(Next::Stop)
         }
         MergeOutcome::NotMergeable(reason) => {
-            // A conflict never clears by waiting: polling it kept the gate
-            // (and its status edits) going for hours. Stop on it.
-            let conflicted = github
-                .get_pull_request(owner, repo, msg.pr_number)
-                .await
-                .is_ok_and(|pr| common::merge_gate::is_conflict(&pr));
-            if conflicted {
-                return on_conflict(state, github, msg, record, lines).await;
+            // A conflict, or a branch the rules want current, never clears by
+            // waiting: CoderHelm brings the base in itself.
+            if let Ok(pr) = github.get_pull_request(owner, repo, msg.pr_number).await {
+                if let Some(need) = needs_base(&pr) {
+                    return keep_current(state, github, msg, record, &pr, need, lines).await;
+                }
             }
             // Branch protection, or a required check GitHub still counts as
             // missing. Keep polling: most of these clear on their own, and
@@ -1503,8 +1731,29 @@ async fn merge(
     }
 }
 
-/// The line the status comment shows for a conflict: CoderHelm updates its
-/// own PR's branch once, or a person resolves it.
+/// Why the base has to come in before the PR can merge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BaseNeed {
+    /// The PR conflicts with its base.
+    Conflict,
+    /// The branch's rules want it current with its base, and it isn't.
+    Behind,
+}
+
+/// Pure: whether GitHub reports the PR conflicting with, or behind, its
+/// base (`mergeable_state`).
+pub(crate) fn needs_base(pr: &serde_json::Value) -> Option<BaseNeed> {
+    if common::merge_gate::is_conflict(pr) {
+        Some(BaseNeed::Conflict)
+    } else if pr["mergeable_state"].as_str() == Some("behind") {
+        Some(BaseNeed::Behind)
+    } else {
+        None
+    }
+}
+
+/// The line the status comment shows while CoderHelm's own PR's run
+/// resolves a conflict in its conflict round.
 fn conflict_line(base: &str, updating: bool) -> (Mark, String) {
     if updating {
         (
@@ -1525,19 +1774,94 @@ fn conflict_line(base: &str, updating: bool) -> (Mark, String) {
     }
 }
 
-/// The PR conflicts with its base: the gate stops (no polls, one status
-/// update). On CoderHelm's own PR the first conflict starts a conflict round
-/// on its run, once per PR; after that, or on anyone else's PR, a person
-/// resolves it.
-async fn on_conflict(
+/// How bringing the base in went.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BaseMerge {
+    /// Merged in; the PR's own change is (or isn't) the one before.
+    Merged { sha: String, own_unchanged: bool },
+    /// Conflicts CoderHelm couldn't resolve on its own; nothing pushed.
+    Unresolved { files: Vec<String> },
+    /// The branch is somewhere CoderHelm can't push (a fork).
+    CannotPush,
+}
+
+/// Pure: the status line for a base merge.
+pub(crate) fn base_merge_line(base: &str, outcome: &BaseMerge) -> (Mark, String) {
+    match outcome {
+        BaseMerge::Merged {
+            sha,
+            own_unchanged: true,
+        } => (
+            Mark::Waiting,
+            format!(
+                "CoderHelm merged `{base}` into this branch ({}). The PR's own change is the \
+                 one approved, so the approval carries to it; auto-merge goes on once its checks \
+                 pass",
+                short(sha)
+            ),
+        ),
+        BaseMerge::Merged { sha, .. } => (
+            Mark::Waiting,
+            format!(
+                "CoderHelm merged `{base}` into this branch ({}). Resolving the conflict touched \
+                 the PR's own change, so CoderHelm reviews that part before auto-merge goes on",
+                short(sha)
+            ),
+        ),
+        BaseMerge::Unresolved { files } if !files.is_empty() => (
+            Mark::Blocked,
+            format!(
+                "Merge conflict with `{base}` that needs a person's call: {}. Nothing was pushed; \
+                 the review of the commit that resolves it starts auto-merge again",
+                code_list(files)
+            ),
+        ),
+        BaseMerge::Unresolved { .. } => (
+            Mark::Blocked,
+            format!(
+                "Merge conflict with `{base}` that needs a person's call. Nothing was pushed; \
+                 the review of the commit that resolves it starts auto-merge again"
+            ),
+        ),
+        BaseMerge::CannotPush => (
+            Mark::Blocked,
+            format!(
+                "Behind or conflicting with `{base}`, and the branch is in a fork CoderHelm can't \
+                 push to: merge `{base}` into it; the review of that commit starts auto-merge \
+                 again"
+            ),
+        ),
+    }
+}
+
+/// The PR is behind or conflicts with its base: CoderHelm brings the base
+/// in itself, once per head, on anyone's PR. The run's conflict round does
+/// it on CoderHelm's own PR when it has a run. After the merge the PR's own
+/// change is compared with the one before (the reviewer's comparison,
+/// `review_scope::same_own_change`); the push's review carries the approval
+/// or reviews what moved, CI runs on the new head, and the gate is armed on
+/// it. Only a conflict it can't resolve is reported, once, with the files.
+async fn keep_current(
     state: &WorkerState,
     github: &GitHubClient,
     msg: &AwaitMergeMessage,
     record: &mut GateRecord,
+    pr: &serde_json::Value,
+    need: BaseNeed,
     mut lines: Vec<(Mark, String)>,
 ) -> Result<Next, BoxError> {
     let (owner, repo) = (msg.repo_owner.as_str(), msg.repo_name.as_str());
-    let updating = msg.self_authored
+    let base = msg.base_branch.as_str();
+    if !claim_base_update(state, msg).await {
+        info!(
+            pr = msg.pr_number,
+            ?need,
+            "await-merge: the base was brought in for this head already — the gate stops"
+        );
+        return Ok(Next::Stop);
+    }
+    if need == BaseNeed::Conflict
+        && msg.self_authored
         && claim_conflict_round(state, msg).await
         && super::resume::start_conflict_round(
             state,
@@ -1547,23 +1871,227 @@ async fn on_conflict(
             repo,
             msg.pr_number,
         )
-        .await;
+        .await
+    {
+        info!(
+            pr = msg.pr_number,
+            "await-merge: merge conflict — the run's conflict round resolves it"
+        );
+        let line = conflict_line(base, true);
+        set_state(state, msg, common::merge_gate::STATE_CONFLICT, &line.1).await;
+        lines.push(line);
+        let body = render_status(
+            &msg.head_sha,
+            base,
+            &lines,
+            None,
+            Some(&control_url(state, msg, Control::Stop)),
+        );
+        publish_status(state, github, msg, record, &body).await;
+        return Ok(Next::Stop);
+    }
+    let outcome = match bring_base_in(state, github, msg, pr).await {
+        Ok(o) => o,
+        Err(e) => {
+            release_base_update(state, msg).await;
+            return Err(e);
+        }
+    };
     info!(
         pr = msg.pr_number,
-        updating, "await-merge: merge conflict — the gate stops"
+        ?need,
+        ?outcome,
+        "await-merge: brought the base in"
     );
-    let line = conflict_line(&msg.base_branch, updating);
-    set_state(state, msg, common::merge_gate::STATE_CONFLICT, &line.1).await;
-    lines.push(line);
+    let line = base_merge_line(base, &outcome);
+    lines.push(line.clone());
     let body = render_status(
         &msg.head_sha,
-        &msg.base_branch,
+        base,
         &lines,
         None,
         Some(&control_url(state, msg, Control::Stop)),
     );
-    publish_status(state, github, msg, record, &body).await;
+    match &outcome {
+        BaseMerge::Merged { sha, .. } => {
+            record_base_merge(state, msg, sha).await;
+            set_state(state, msg, STATE_HEAD_MOVED, &line.1).await;
+            publish_status(state, github, msg, record, &body).await;
+            // The gate never waits on a review it caused: it queues
+            // CoderHelm's review of the new head itself, labelled PR or not,
+            // which carries the approval when the PR's own change is the one
+            // approved and arms the gate again.
+            super::review_pr::review_after_base_merge(
+                state,
+                &msg.team_id,
+                msg.installation_id,
+                (owner, repo, msg.pr_number),
+                sha,
+            )
+            .await;
+            // The gate goes on on the new head: it waits for the review of
+            // it, then CI, then merges.
+            arm(
+                state,
+                &msg.team_id,
+                msg.installation_id,
+                owner,
+                repo,
+                msg.pr_number,
+                sha,
+                base,
+                msg.self_authored,
+            )
+            .await;
+        }
+        BaseMerge::Unresolved { .. } | BaseMerge::CannotPush => {
+            set_state(state, msg, common::merge_gate::STATE_CONFLICT, &line.1).await;
+            publish_status(state, github, msg, record, &body).await;
+            tell_team(state, msg, pr, &line.1).await;
+        }
+    }
     Ok(Next::Stop)
+}
+
+/// Merges the base into the PR's branch through the conflict resolution
+/// every run uses (`pr::resolve_conflicts`: a clean merge, or the
+/// conflicting files merged and checked, one merge commit).
+async fn bring_base_in(
+    state: &WorkerState,
+    github: &GitHubClient,
+    msg: &AwaitMergeMessage,
+    pr: &serde_json::Value,
+) -> Result<BaseMerge, BoxError> {
+    let (owner, repo) = (msg.repo_owner.as_str(), msg.repo_name.as_str());
+    let base = msg.base_branch.as_str();
+    let same_repo = pr["head"]["repo"]["full_name"].as_str().is_some()
+        && pr["head"]["repo"]["full_name"] == pr["base"]["repo"]["full_name"];
+    let Some(branch) = pr["head"]["ref"].as_str().filter(|_| same_repo) else {
+        return Ok(BaseMerge::CannotPush);
+    };
+    let before = github.get_diff(owner, repo, base, &msg.head_sha).await?;
+    let provider = crate::agent::provider::ModelProvider::load_for_team(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        &msg.team_id,
+    )
+    .await?
+    .for_run(
+        "",
+        &format!("{owner}/{repo}"),
+        "",
+        &format!("Base merge for pull request #{}", msg.pr_number),
+    );
+    let ticket = gate_ticket(msg)?;
+    let mut usage = crate::models::TokenUsage::default();
+    super::pr::resolve_conflicts(state, &ticket, github, branch, &provider, &mut usage).await?;
+    let head = github.get_ref(owner, repo, branch).await?;
+    if head == msg.head_sha {
+        let files = changed_on_both_sides(github, owner, repo, base, branch).await;
+        return Ok(BaseMerge::Unresolved { files });
+    }
+    let own_unchanged = match github.get_diff(owner, repo, base, &head).await {
+        Ok(after) => super::review_scope::same_own_change(&before, &after),
+        Err(_) => false,
+    };
+    Ok(BaseMerge::Merged {
+        sha: head,
+        own_unchanged,
+    })
+}
+
+/// Files both the branch and the base changed since they parted.
+async fn changed_on_both_sides(
+    github: &GitHubClient,
+    owner: &str,
+    repo: &str,
+    base: &str,
+    branch: &str,
+) -> Vec<String> {
+    let Ok(cmp) = github.get_diff(owner, repo, base, branch).await else {
+        return Vec::new();
+    };
+    let Some(fork) = cmp
+        .pointer("/merge_base_commit/sha")
+        .and_then(|v| v.as_str())
+    else {
+        return Vec::new();
+    };
+    match (
+        github
+            .compare_changed_files(owner, repo, fork, branch)
+            .await,
+        github.compare_changed_files(owner, repo, fork, base).await,
+    ) {
+        (Ok(ours), Ok(theirs)) => ours.into_iter().filter(|f| theirs.contains(f)).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The ticket the conflict resolution's merge commit is written for: a
+/// pull request with no tracker key, in the team's commit convention.
+fn gate_ticket(msg: &AwaitMergeMessage) -> Result<crate::models::TicketMessage, BoxError> {
+    Ok(serde_json::from_value(serde_json::json!({
+        "team_id": msg.team_id,
+        "installation_id": msg.installation_id,
+        "source": "github",
+        "ticket_id": "",
+        "title": format!("Pull request #{}", msg.pr_number),
+        "body": "",
+        "repo_owner": msg.repo_owner,
+        "repo_name": msg.repo_name,
+        "issue_number": 0,
+        "sender": "",
+        "base_branch": msg.base_branch,
+    }))?)
+}
+
+/// Claims the one base merge a head gets. False when it was claimed for
+/// this head before (or the record can't be written).
+async fn claim_base_update(state: &WorkerState, msg: &AwaitMergeMessage) -> bool {
+    state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(&msg.team_id))
+        .key("sk", attr_s(&record_key(msg)))
+        .update_expression("SET base_update_head = :h")
+        .condition_expression(
+            "attribute_exists(sk) AND (attribute_not_exists(base_update_head) OR base_update_head <> :h)",
+        )
+        .expression_attribute_values(":h", attr_s(&msg.head_sha))
+        .send()
+        .await
+        .is_ok()
+}
+
+/// A base merge that failed on an error is tried again on the retry.
+async fn release_base_update(state: &WorkerState, msg: &AwaitMergeMessage) {
+    let _ = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(&msg.team_id))
+        .key("sk", attr_s(&record_key(msg)))
+        .update_expression("REMOVE base_update_head")
+        .send()
+        .await;
+}
+
+async fn record_base_merge(state: &WorkerState, msg: &AwaitMergeMessage, sha: &str) {
+    if let Err(e) = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(&msg.team_id))
+        .key("sk", attr_s(&record_key(msg)))
+        .update_expression("SET base_merge_head = :h")
+        .expression_attribute_values(":h", attr_s(sha))
+        .send()
+        .await
+    {
+        warn!(pr = msg.pr_number, error = %e, "await-merge: could not record the base merge");
+    }
 }
 
 /// Claims the one conflict round a PR gets. False when it was claimed
@@ -1581,6 +2109,160 @@ async fn claim_conflict_round(state: &WorkerState, msg: &AwaitMergeMessage) -> b
         .send()
         .await
         .is_ok()
+}
+
+/// Whether a person's approval of an earlier commit still covers the PR:
+/// every commit since only brought the base in, so the PR's own change is
+/// the one they approved (the reviewer's comparison). Read only when GitHub
+/// has no required-review rule to say.
+async fn earlier_approval_holds(
+    github: &GitHubClient,
+    msg: &AwaitMergeMessage,
+    approvals: &Approvals,
+) -> bool {
+    let (owner, repo) = (msg.repo_owner.as_str(), msg.repo_name.as_str());
+    let Ok(now) = github
+        .get_diff(owner, repo, &msg.base_branch, &msg.head_sha)
+        .await
+    else {
+        return false;
+    };
+    for (_, commit) in approvals.approved_on.iter().take(3) {
+        if let Ok(then) = github.get_diff(owner, repo, &msg.base_branch, commit).await {
+            if super::review_scope::same_own_change(&then, &now) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// The base branch's review rules, from classic protection and rulesets.
+async fn read_review_rules(
+    github: &GitHubClient,
+    owner: &str,
+    repo: &str,
+    base: &str,
+) -> ReviewRules {
+    let protection = github.branch_protection(owner, repo, base).await.ok();
+    let rulesets = github.branch_rules(owner, repo, base).await.ok();
+    review_rules(protection.as_ref(), rulesets.as_ref())
+}
+
+/// One message to the team's channel, once per PR commit and wait: what
+/// the merge waits on. Silent where no channel is set up.
+async fn tell_team(
+    state: &WorkerState,
+    msg: &AwaitMergeMessage,
+    pr: &serde_json::Value,
+    line: &str,
+) {
+    let channels = super::security_fixes::team_channels(state, &msg.team_id).await;
+    if channels.is_empty() {
+        return;
+    }
+    let sk = format!(
+        "MERGEGATETOLD#{}/{}#{}#{}#{}",
+        msg.repo_owner,
+        msg.repo_name,
+        msg.pr_number,
+        msg.head_sha,
+        common::content_hash(line)
+    );
+    let claim = common::claim::claim(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        &msg.team_id,
+        &sk,
+        RECORD_TTL_SECS,
+    )
+    .await;
+    if !claim.won_or_failed_open() {
+        return;
+    }
+    let message = wait_message(
+        &msg.repo_owner,
+        &msg.repo_name,
+        msg.pr_number,
+        pr["title"].as_str().unwrap_or(""),
+        pr["html_url"].as_str().unwrap_or(""),
+        line,
+    );
+    common::notify::deliver_recorded(
+        &common::notify::Http(&state.http),
+        &channels,
+        &message,
+        "merge_gate_wait",
+        &state.dynamo,
+        &state.config.settings_table_name,
+        &msg.team_id,
+    )
+    .await;
+}
+
+/// Pure: the team channel's message for a merge that waits on something.
+pub(crate) fn wait_message(
+    owner: &str,
+    repo: &str,
+    pr: u64,
+    title: &str,
+    url: &str,
+    line: &str,
+) -> common::notify::Message {
+    use common::notify::{Block, Button, Message, Text};
+    let head = format!("Auto-merge waits on {owner}/{repo}#{pr}");
+    let mut buttons = Vec::new();
+    if !url.is_empty() {
+        buttons.push(Button::new("Open the pull request", url));
+    }
+    Message {
+        summary: format!("{head}: {}", common::truncate_str(line, 200)),
+        blocks: vec![
+            Block::Text(Text::new(head).bold()),
+            Block::Text(Text::new(common::truncate_str(title, 200).to_string()).subtle()),
+            Block::Text(Text::new(common::truncate_str(line, 600).to_string())),
+        ],
+        buttons,
+        full_width: false,
+    }
+}
+
+/// Waiting on people: read again on the slow timer while the watch lasts,
+/// so a review event the webhook missed can't strand the PR. The CI window
+/// starts when the keys are in, not when the wait began.
+async fn recheck_people(
+    state: &WorkerState,
+    msg: &AwaitMergeMessage,
+    record: &mut GateRecord,
+    now: i64,
+) {
+    let since = record.waiting_since.unwrap_or(now);
+    if now - since >= PEOPLE_WATCH_SECS {
+        info!(
+            pr = msg.pr_number,
+            "await-merge: waited a day on people — the next review event re-arms the gate"
+        );
+        return;
+    }
+    let res = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(&msg.team_id))
+        .key("sk", attr_s(&record_key(msg)))
+        .update_expression(
+            "SET waiting_since = if_not_exists(waiting_since, :now), armed_at = :now",
+        )
+        .condition_expression("chain_id = :c")
+        .expression_attribute_values(":now", attr_n(now))
+        .expression_attribute_values(":c", attr_s(&msg.chain_id))
+        .send()
+        .await;
+    if res.is_err() {
+        // Superseded (a newer arming or a stop), or unwritable: no timer.
+        return;
+    }
+    send(state, msg, 0, PEOPLE_RECHECK_SECS).await;
 }
 
 /// Arm the gate for a PR (called when CoderHelm approves; the gateway arms on
@@ -1846,6 +2528,7 @@ mod ci_tests {
             approvals: Approvals {
                 approved_by: vec!["alice".into()],
                 approved_at_head: vec!["alice".into()],
+                approved_on: vec![("alice".into(), "0516eab0000".into())],
                 ..Default::default()
             },
             want_labels: vec![],
@@ -1853,6 +2536,13 @@ mod ci_tests {
             labels_added_at: None,
             ci: None,
             now: 10_000,
+            head: "0516eab0000".into(),
+            base: "main".into(),
+            review_decision: None,
+            earlier_approval_holds: false,
+            rules: ReviewRules::default(),
+            requested: vec![],
+            base_merge_at_head: false,
         }
     }
 

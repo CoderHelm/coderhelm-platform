@@ -518,6 +518,13 @@ impl Sim {
             labels_added_at: None,
             ci: None,
             now: 1_800_000_000 + self.now * 60,
+            head: self.head.clone(),
+            base: "main".to_string(),
+            review_decision: None,
+            earlier_approval_holds: false,
+            rules: Default::default(),
+            requested: vec![],
+            base_merge_at_head: false,
         };
         let mut d = decide_gate(&view);
         if d.action == Action::ReadCi {
