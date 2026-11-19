@@ -1,4 +1,4 @@
-//! The parts of Google and GitHub sign-in that decide what a person sees when
+//! The parts of Google, GitHub, Microsoft and Okta sign-in that decide what a person sees when
 //! sign-in cannot finish, kept free of AWS and HTTP calls so each path has a
 //! unit test.
 //!
@@ -22,6 +22,8 @@ pub const STATE_MAX_AGE_SECS: u32 = 600;
 pub enum Provider {
     Google,
     Github,
+    Microsoft,
+    Okta,
 }
 
 impl Provider {
@@ -30,6 +32,8 @@ impl Provider {
         match self {
             Provider::Google => "google",
             Provider::Github => "github",
+            Provider::Microsoft => "microsoft",
+            Provider::Okta => "okta",
         }
     }
 
@@ -38,6 +42,18 @@ impl Provider {
         match self {
             Provider::Google => "__Host-oauth_state_g",
             Provider::Github => "__Host-oauth_state_gh",
+            Provider::Microsoft => "__Host-oauth_state_ms",
+            Provider::Okta => "__Host-oauth_state_okta",
+        }
+    }
+
+    /// The OpenID Connect trip's signed nonce and PKCE verifier
+    /// (routes::oidc_signin), for the providers the gateway runs itself.
+    pub fn flow_cookie(self) -> Option<&'static str> {
+        match self {
+            Provider::Google | Provider::Github => None,
+            Provider::Microsoft => Some("__Host-oauth_flow_ms"),
+            Provider::Okta => Some("__Host-oauth_flow_okta"),
         }
     }
 }
@@ -59,6 +75,14 @@ pub enum Reason {
     /// This install has no sign-in client for the provider, so the trip to
     /// the provider would only end on its error page.
     NotSetUp,
+    /// The provider signed the person in but vouched for no email address
+    /// CoderHelm can trust (routes::oidc_signin explains the rule).
+    NoVerifiedEmail,
+    /// No Okta sign-in is set up for the email the person typed.
+    NoOkta,
+    /// Okta signed in someone who isn't on (or invited to) the team whose
+    /// Okta it is.
+    NotOnTeam,
 }
 
 impl Reason {
@@ -70,6 +94,9 @@ impl Reason {
             Reason::Provider => "provider",
             Reason::Server => "server",
             Reason::NotSetUp => "not_set_up",
+            Reason::NoVerifiedEmail => "no_verified_email",
+            Reason::NoOkta => "okta_not_found",
+            Reason::NotOnTeam => "not_on_team",
         }
     }
 }
@@ -126,8 +153,10 @@ impl SignInFailure {
             )],
         )
             .into_response();
-        if let Ok(v) = HeaderValue::from_str(&clear_state_cookie(self.provider)) {
-            resp.headers_mut().append(header::SET_COOKIE, v);
+        for c in clear_cookies(self.provider) {
+            if let Ok(v) = HeaderValue::from_str(&c) {
+                resp.headers_mut().append(header::SET_COOKIE, v);
+            }
         }
         resp
     }
@@ -156,6 +185,18 @@ pub fn clear_state_cookie(provider: Provider) -> String {
         "{}=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0",
         provider.state_cookie()
     )
+}
+
+/// Every cookie a provider's trip left behind, cleared: the state cookie,
+/// and the OpenID Connect flow cookie where the provider has one.
+pub fn clear_cookies(provider: Provider) -> Vec<String> {
+    let mut out = vec![clear_state_cookie(provider)];
+    if let Some(name) = provider.flow_cookie() {
+        out.push(format!(
+            "{name}=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0"
+        ));
+    }
+    out
 }
 
 /// The first steps of every callback: a provider error, a missing code, and the
@@ -208,7 +249,7 @@ pub fn check_callback<'a>(
     }
 }
 
-fn cookie_value<'a>(cookie_header: &'a str, name: &str) -> Option<&'a str> {
+pub(crate) fn cookie_value<'a>(cookie_header: &'a str, name: &str) -> Option<&'a str> {
     cookie_header
         .split(';')
         .map(str::trim)
@@ -247,19 +288,31 @@ pub fn github_not_set_up(
 /// The sign-in methods that work here, which the sign-in page shows and
 /// nothing else: email and password always, Google only on the hosted
 /// deployment, GitHub with the install's own OAuth client or, on a hybrid
-/// install, through CoderHelm's GitHub App.
+/// install, through CoderHelm's GitHub App, Microsoft with the deployment's
+/// own Entra app registration, and Okta once a team (hosted) or the
+/// organization (self-hosted) has turned on an Okta sign-in that passed its
+/// test.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct SignInMethods {
     pub password: bool,
     pub google: bool,
     pub github: bool,
+    pub microsoft: bool,
+    pub okta: bool,
 }
 
-pub fn sign_in_methods(self_hosted: bool, github_ready: bool) -> SignInMethods {
+pub fn sign_in_methods(
+    self_hosted: bool,
+    github_ready: bool,
+    microsoft_ready: bool,
+    okta_ready: bool,
+) -> SignInMethods {
     SignInMethods {
         password: true,
         google: !self_hosted,
         github: github_ready,
+        microsoft: microsoft_ready,
+        okta: okta_ready,
     }
 }
 
@@ -322,16 +375,72 @@ mod tests {
 
     #[test]
     fn the_methods_list_has_only_what_works() {
-        let m = sign_in_methods(true, false);
+        let m = sign_in_methods(true, false, false, false);
         assert_eq!((m.password, m.google, m.github), (true, false, false));
-        let m = sign_in_methods(true, true);
+        let m = sign_in_methods(true, true, false, false);
         assert_eq!((m.password, m.google, m.github), (true, false, true));
-        let m = sign_in_methods(false, true);
+        let m = sign_in_methods(false, true, false, false);
         assert_eq!((m.password, m.google, m.github), (true, true, true));
         assert_eq!(
-            serde_json::to_value(sign_in_methods(true, false)).unwrap(),
-            serde_json::json!({ "password": true, "google": false, "github": false })
+            serde_json::to_value(sign_in_methods(true, false, false, false)).unwrap(),
+            serde_json::json!({ "password": true, "google": false, "github": false, "microsoft": false, "okta": false })
         );
+        // Microsoft and Okta, on either kind of deployment, only when ready.
+        for self_hosted in [true, false] {
+            let m = sign_in_methods(self_hosted, false, true, false);
+            assert_eq!((m.microsoft, m.okta), (true, false));
+            let m = sign_in_methods(self_hosted, false, false, true);
+            assert_eq!((m.microsoft, m.okta), (false, true));
+        }
+    }
+
+    #[test]
+    fn microsoft_and_okta_have_their_own_cookies_and_codes() {
+        let names: Vec<_> = [
+            Provider::Google,
+            Provider::Github,
+            Provider::Microsoft,
+            Provider::Okta,
+        ]
+        .iter()
+        .map(|p| p.state_cookie())
+        .collect();
+        // Every provider has its own cookie (a name is matched with its `=`).
+        let mut unique = names.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), names.len());
+        let f = check_callback(
+            Provider::Microsoft,
+            "__Host-oauth_state_okta=S1",
+            &q(Some("abc"), Some("S1"), None),
+        )
+        .unwrap_err();
+        assert_eq!(f.step, "state_cookie");
+        assert_eq!(Provider::Microsoft.slug(), "microsoft");
+        assert_eq!(Provider::Okta.slug(), "okta");
+        assert_eq!(Reason::NoVerifiedEmail.code(), "no_verified_email");
+        assert_eq!(Reason::NoOkta.code(), "okta_not_found");
+        assert_eq!(Reason::NotOnTeam.code(), "not_on_team");
+        // A failed Microsoft or Okta trip clears both of its cookies.
+        let resp =
+            SignInFailure::new(Provider::Okta, Reason::Provider, "token", "x").into_redirect(APP);
+        let set: Vec<_> = resp
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .collect();
+        assert_eq!(set.len(), 2, "{set:?}");
+        assert!(set[0].starts_with("__Host-oauth_state_okta=;"));
+        assert!(set[1].starts_with("__Host-oauth_flow_okta=;"));
+        assert!(set.iter().all(|c| c.contains("Max-Age=0")));
+        assert_eq!(
+            resp.headers()[header::LOCATION],
+            "https://app.coderhelm.com/?signin_error=provider&provider=okta"
+        );
+        // Google and GitHub have no flow cookie.
+        assert_eq!(clear_cookies(Provider::Github).len(), 1);
     }
 
     #[test]

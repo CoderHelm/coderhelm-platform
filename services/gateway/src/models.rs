@@ -135,6 +135,13 @@ pub struct Secrets {
     pub google_client_secret: Option<String>,
     #[serde(default)]
     pub jira_webhook_secret: Option<String>,
+    /// Sign in with Microsoft: the deployment's own Entra app registration
+    /// (multi-tenant, work, school and personal accounts). Without both, the
+    /// sign-in page has no Microsoft button (routes::oidc_signin).
+    #[serde(default)]
+    pub microsoft_client_id: Option<String>,
+    #[serde(default)]
+    pub microsoft_client_secret: Option<String>,
     /// Knowledge sources: the install's own OAuth apps for one-click
     /// sign-in. Each is optional; without one, that source uses the team's
     /// saved key where it has one (docs/self-host/knowledge-sources.md).

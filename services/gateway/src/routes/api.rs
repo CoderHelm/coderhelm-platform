@@ -219,6 +219,10 @@ pub async fn me(
         "github"
     } else if claims.sub.starts_with("USER#Google_") {
         "google"
+    } else if claims.sub.starts_with("USER#microsoft_") {
+        "microsoft"
+    } else if claims.sub.starts_with("USER#okta_") {
+        "okta"
     } else {
         "email"
     };
@@ -280,7 +284,21 @@ pub async fn me(
 pub async fn list_teams(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
+    proof: Option<Extension<jwt::SignInProof>>,
 ) -> Result<Json<Value>, StatusCode> {
+    // A hosted session from a team's Okta speaks for that team only: it
+    // lists no other team and accepts no invite to one.
+    if super::oidc_signin::held_to_team(
+        proof.as_ref().and_then(|p| p.via.as_deref()),
+        super::setup_checks::self_hosted(),
+    ) {
+        return Ok(Json(json!({ "teams": [{
+            "team_id": claims.team_id,
+            "org": claims.email,
+            "status": "active",
+            "current": true,
+        }] })));
+    }
     let github_id = claims
         .sub
         .strip_prefix("USER#")
@@ -445,6 +463,16 @@ pub async fn switch_team(
     Json(body): Json<Value>,
 ) -> Result<axum::response::Response, StatusCode> {
     let target_team = body["team_id"].as_str().ok_or(StatusCode::BAD_REQUEST)?;
+    // A hosted session from a team's Okta never moves to another team: that
+    // Okta organization vouches for its own team only.
+    if target_team != claims.team_id
+        && super::oidc_signin::held_to_team(
+            proof.as_ref().and_then(|p| p.via.as_deref()),
+            super::setup_checks::self_hosted(),
+        )
+    {
+        return Err(StatusCode::FORBIDDEN);
+    }
 
     // Verify user exists in target team and get their role there
     let target_item = state

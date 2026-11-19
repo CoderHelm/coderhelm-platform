@@ -1360,7 +1360,7 @@ fn session_redirect(provider: Provider, token: &str, dashboard_url: &str) -> Res
         [(header::LOCATION, dashboard_url.to_string())],
     )
         .into_response();
-    for c in [session, oauth_signin::clear_state_cookie(provider)] {
+    for c in std::iter::once(session).chain(oauth_signin::clear_cookies(provider)) {
         if let Ok(v) = HeaderValue::from_str(&c) {
             resp.headers_mut().append(header::SET_COOKIE, v);
         }
@@ -1699,6 +1699,167 @@ async fn google_callback_inner(
     Ok(session_redirect(P, &token, dashboard_url))
 }
 
+// ── Microsoft and Okta (routes::oidc_signin) ────────────────────────
+
+/// The end of a Microsoft or Okta sign-in, once the provider's id_token and
+/// the email in it are checked: the same gates as Google and GitHub.
+///
+/// - Self-hosted: [`selfhost_landing`] (decide_join: a member, an invite, an
+///   allowed domain or the first admin), else `?error=not_invited`.
+/// - Hosted, Okta (`team` set): only that team. The person's member record
+///   there by email, else their live invite to it (accepted now), else
+///   `not_on_team`. A team's Okta never makes a personal team or reaches
+///   the person's other teams.
+/// - Hosted, Microsoft (`team` unset): as Google. Their invites are
+///   accepted, they land on a team they joined over their personal team, and
+///   a first sign-in starts a personal team (open beta limit).
+///
+/// Then the person's second factor, whichever it is, before any session.
+pub(crate) async fn finish_oidc(
+    state: &Arc<AppState>,
+    ip: &str,
+    provider: Provider,
+    person: &super::oidc_signin::Person,
+    team: Option<&str>,
+) -> Result<Response, SignInFailure> {
+    let p = provider;
+    let via = p.slug();
+    let dash = common::public_urls::app_url(&state.config.stage);
+    let email = person.email.as_str();
+
+    let (team_id, user_id, role, github_login) = if sign_in::applies() {
+        let landed = selfhost_landing(state, email, &person.new_user_id, &person.name, "")
+            .await
+            .map_err(|e| SignInFailure::new(p, Reason::Server, "join", e))?;
+        let Some(record) = landed else {
+            return Ok(Redirect::temporary(&not_invited_url(dash)).into_response());
+        };
+        landing_parts(&record)
+    } else {
+        let existing = sign_in::records_by_email(state, email)
+            .await
+            .map_err(|e| SignInFailure::new(p, Reason::Server, "records", e))?;
+        match team {
+            Some(t) => {
+                let mine: Vec<_> = existing
+                    .iter()
+                    .filter(|i| {
+                        i.get("pk").and_then(|v| v.as_s().ok()).map(String::as_str) == Some(t)
+                            && i.get("sk")
+                                .and_then(|v| v.as_s().ok())
+                                .is_some_and(|s| s.starts_with("USER#"))
+                    })
+                    .cloned()
+                    .collect();
+                let accepted =
+                    accept_pending_invites(state, &mine, &person.new_user_id, email).await;
+                let pool = landing_records(&mine, accepted);
+                let Some(record) = pool.first() else {
+                    return Err(SignInFailure::new(
+                        p,
+                        Reason::NotOnTeam,
+                        "member",
+                        "no member record or live invite on the Okta setup's team",
+                    ));
+                };
+                landing_parts(record)
+            }
+            None => {
+                if existing.is_empty()
+                    && super::open_signup::allow_new_team(state, ip).await.is_err()
+                {
+                    return Ok(
+                        Redirect::temporary(&format!("{dash}?error=signup_limit")).into_response()
+                    );
+                }
+                let existing = super::open_signup::drop_moved_invites(state, existing).await;
+                let accepted =
+                    accept_pending_invites(state, &existing, &person.new_user_id, email).await;
+                let pool = landing_records(&existing, accepted);
+                let own_id = person.new_user_id.trim_start_matches("USER#");
+                match select_session_team(&pool, own_id) {
+                    Some(item) => landing_parts(item),
+                    None => {
+                        let tid = format!("TEAM#{}", ulid::Ulid::new().to_string().to_lowercase());
+                        super::open_signup::set_default_limits(state, &tid).await;
+                        let now = chrono::Utc::now().to_rfc3339();
+                        state
+                            .dynamo
+                            .put_item()
+                            .table_name(&state.config.table_name)
+                            .item("pk", attr_s(&tid))
+                            .item("sk", attr_s("META"))
+                            .item("status", attr_s("active"))
+                            .item("created_at", attr_s(&now))
+                            .condition_expression("attribute_not_exists(pk)")
+                            .send()
+                            .await
+                            .map_err(|e| SignInFailure::new(p, Reason::Server, "team", e))?;
+                        state
+                            .dynamo
+                            .put_item()
+                            .table_name(&state.config.users_table_name)
+                            .item("pk", attr_s(&tid))
+                            .item("sk", attr_s(&person.new_user_id))
+                            .item("email", attr_s(email))
+                            .item("avatar_url", attr_s(""))
+                            .item("role", attr_s("owner"))
+                            .item("name", attr_s(&person.name))
+                            .item("updated_at", attr_s(&now))
+                            .item(
+                                "gsi2pk",
+                                attr_s(&format!("EMAIL#{}", normalize_email(email))),
+                            )
+                            .item("gsi2sk", attr_s(&tid))
+                            .send()
+                            .await
+                            .map_err(|e| SignInFailure::new(p, Reason::Server, "member", e))?;
+                        info!(team_id = %tid, provider = via, "Personal team made at first sign-in");
+                        (tid, person.new_user_id.clone(), "owner".to_string(), None)
+                    }
+                }
+            }
+        }
+    };
+    touch_last_login(state, &team_id, &user_id).await;
+    let step = SecondStep {
+        sub: user_id.clone(),
+        team_id: team_id.clone(),
+        email: email.to_string(),
+        role: role.clone(),
+        github_login: github_login.clone(),
+        via: via.into(),
+        jti: String::new(),
+        aud: String::new(),
+        iat: 0,
+        exp: 0,
+    };
+    if let Some(resp) = sign_in::second_step(state, step, dash)
+        .await
+        .map_err(|e| SignInFailure::new(p, Reason::Server, "second_step", e))?
+    {
+        let mut resp = resp;
+        for c in oauth_signin::clear_cookies(p) {
+            if let Ok(v) = HeaderValue::from_str(&c) {
+                resp.headers_mut().append(header::SET_COOKIE, v);
+            }
+        }
+        return Ok(resp);
+    }
+    let token = jwt::create_session_token(
+        &user_id,
+        &team_id,
+        email,
+        &role,
+        github_login.as_deref(),
+        &SignInProof::new(false, via),
+        &state.secrets.jwt_secret,
+        SESSION_TTL_SECS,
+    )
+    .map_err(|e| SignInFailure::new(p, Reason::Server, "session_token", e))?;
+    Ok(session_redirect(p, &token, dash))
+}
+
 // ── GitHub OAuth (connect GitHub, not identity) ──────────────────────
 
 /// GET /auth/methods: the sign-in methods that work on this deployment
@@ -1706,7 +1867,12 @@ async fn google_callback_inner(
 pub async fn methods(State(state): State<Arc<AppState>>) -> Response {
     let github = own_github_client(&state) || super::github_hybrid::available();
     let self_hosted = super::setup_checks::self_hosted();
-    let m = oauth_signin::sign_in_methods(self_hosted, github);
+    let microsoft = super::oidc_signin::microsoft_ready(
+        state.secrets.microsoft_client_id.as_deref(),
+        state.secrets.microsoft_client_secret.as_deref(),
+    );
+    let okta = super::oidc_signin::okta_available(&state).await;
+    let m = oauth_signin::sign_in_methods(self_hosted, github, microsoft, okta);
     let mut v = serde_json::to_value(m).unwrap_or_default();
     if self_hosted {
         // Where the sign-in page's emails come from, so a person can ask IT to let them in.

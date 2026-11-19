@@ -223,12 +223,13 @@ mod tests {
     #[test]
     fn every_team_made_at_sign_in_gets_limits_and_is_counted() {
         let code = hosted_part(AUTH);
-        // Three places start a team: password (verify_email), Google, GitHub.
-        assert_eq!(code.matches("open_signup::set_default_limits(").count(), 3);
-        // Password sign-up, and a first Google or GitHub sign-in, are counted.
-        assert_eq!(code.matches("open_signup::allow_new_team(").count(), 3);
+        // Four places start a team: password (verify_email), Google, GitHub
+        // and Microsoft (finish_oidc; a team's Okta never starts one).
+        assert_eq!(code.matches("open_signup::set_default_limits(").count(), 4);
+        // Password sign-up, and a first Google, GitHub or Microsoft sign-in, are counted.
+        assert_eq!(code.matches("open_signup::allow_new_team(").count(), 4);
         // Invites from moved teams are dropped on every way in.
-        assert_eq!(code.matches("open_signup::drop_moved_invites(").count(), 3);
+        assert_eq!(code.matches("open_signup::drop_moved_invites(").count(), 4);
     }
 
     #[test]

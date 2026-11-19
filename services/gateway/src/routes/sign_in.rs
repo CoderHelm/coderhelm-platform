@@ -5,7 +5,7 @@
 //! on their own. A person joins only with an admin's invite, or with an email
 //! at a domain the admins allow. Every way in goes through [`decide_join`]:
 //! email sign-up, the email sign-in that makes a person's first record,
-//! Google, GitHub, and the Cognito pre-sign-up trigger
+//! Google, GitHub, Microsoft, Okta, and the Cognito pre-sign-up trigger
 //! (`lambda/pre-signup`, which reads the same cases from
 //! `lambda/pre-signup/cases.json`).
 //!
@@ -1245,7 +1245,24 @@ pub struct CodeBody {
 pub async fn app_setup(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
+    proof: Option<Extension<SignInProof>>,
 ) -> Result<Json<Value>, ApiError> {
+    // Hosted: a person's second factor protects every team they're on, and a
+    // team's Okta vouches for its own team only. From an Okta session it is
+    // set up only by someone on no other team.
+    if super::oidc_signin::held_to_team(proof.as_ref().and_then(|p| p.via.as_deref()), applies())
+        && records_by_email(&state, &claims.email)
+            .await
+            .map_err(|e| internal("Teams not read", e))?
+            .iter()
+            .any(|i| is_user(i) && s(i, "pk") != claims.team_id)
+    {
+        return Err(fail_code(
+            StatusCode::FORBIDDEN,
+            "Your two-factor sign-in also protects your other teams. Sign in with your password, Google, GitHub or Microsoft to set it up.",
+            "factor_from_okta",
+        ));
+    }
     // One second factor per member: none may be set up over another.
     let home = check_enroll(&state, &claims).await?;
     let (pk, sk) = (s(&home, "pk"), s(&home, "sk"));
@@ -3808,6 +3825,18 @@ mod tests {
             "sign_in::second_step",
             "SignInProof::new(false, \"github\")"
         ));
+        // Microsoft and Okta: one ending, the landing first on a
+        // self-hosted install, then the second factor before any session,
+        // and on hosted a team's Okta lands only on that team.
+        let oidc = body(auth, "finish_oidc");
+        assert!(before(oidc, "sign_in::applies()", "selfhost_landing"));
+        assert!(before(oidc, "selfhost_landing", "Ulid::new"));
+        assert!(before(oidc, "Reason::NotOnTeam", "Ulid::new"));
+        assert!(before(oidc, "sign_in::second_step", "create_session_token"));
+        let flows = include_str!("oidc_signin.rs");
+        assert!(body(flows, "microsoft_callback_inner").contains("finish_oidc("));
+        assert!(body(flows, "okta_callback_inner").contains("finish_oidc("));
+        assert!(!flows.contains("create_session_token"));
         // The landing makes teams only through the organization's own rules.
         let landing = body(auth, "selfhost_landing");
         for word in [
