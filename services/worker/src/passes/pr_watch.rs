@@ -621,7 +621,17 @@ async fn read(state: &WorkerState, github: &GitHubClient, c: &Candidate) -> Opti
         seen.base_sha = sha;
     }
     if let Ok(listing) = github.list_ci_for_ref(&c.owner, &c.repo, &seen.head).await {
-        let (failing, running) = failing_names(&listing);
+        let (mut failing, running) = failing_names(&listing);
+        // A covering check's failure a later skipped run hides from the
+        // newest check of its name is failing too (`preview::hidden_failures`).
+        let covers = common::preview::State::from_json(&c.preview)
+            .map(|st| st.covers)
+            .unwrap_or_default();
+        for h in super::preview::hidden_failures(&listing, &covers) {
+            if !failing.contains(&h) {
+                failing.push(h);
+            }
+        }
         seen.checks_running = running;
         if !failing.is_empty() {
             let on_base = match github.list_ci_for_ref(&c.owner, &c.repo, &base_ref).await {

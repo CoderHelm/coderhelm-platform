@@ -153,6 +153,7 @@ fn a_preview_job_named_by_the_workflows_counts_even_when_its_name_doesnt_say_pre
         check: "Ship web".into(),
         role: Some(crate::preview::Role::Preview),
         workflow: ".github/workflows/preview.yml".into(),
+        label: String::new(),
     }];
     let seen = check_runs(&runs, HEAD, &covers);
     assert_eq!(seen[0].url, "https://web-12.review.your-domain.example");

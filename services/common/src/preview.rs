@@ -282,6 +282,11 @@ pub struct Covering {
     pub check: String,
     pub role: Option<Role>,
     pub workflow: String,
+    /// The repository's deploy label (the reviewer setting) that starts it,
+    /// when the deploy label's workflow covers the change
+    /// (`crate::deploy_label::covers`); empty for the preview plan's own.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub label: String,
 }
 
 /// What it takes to run the preview and its end-to-end checks on the change.
@@ -505,6 +510,7 @@ pub fn plan(i: &PlanInput) -> Plan {
                 check: shown.clone(),
                 role: Some(role),
                 workflow: path.clone(),
+                label: String::new(),
             });
             if gate.draft {
                 push_unique(&mut out.draft_gated, &shown);
@@ -580,6 +586,9 @@ pub enum Outcome {
     Failed,
     Running,
     Skipped,
+    /// Held for a protected environment's approval (GitHub's `waiting`):
+    /// a person approves it, time doesn't.
+    Waiting,
 }
 
 /// Whether a check on the head is one of the covering jobs (a matrix or
@@ -631,6 +640,9 @@ pub enum Stage {
     Checked,
     /// The preview deploy or its end-to-end checks failed.
     Failed,
+    /// A covering check waits for a protected environment's approval: only
+    /// a person can give it, so the draft asks for it instead of waiting.
+    Approval,
     /// Something CoderHelm doesn't change keeps it from running.
     Blocked,
 }
@@ -653,6 +665,14 @@ pub struct CheckResult {
     pub outcome: Outcome,
     #[serde(default)]
     pub url: String,
+    /// The environment a [`Outcome::Waiting`] check waits for, when GitHub
+    /// says which.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub environment: String,
+    /// A failed workflow that ran no job (GitHub's `startup_failure`): no
+    /// log and nothing on the branch for a fix to act on.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_jobs: bool,
 }
 
 /// What the run records about the preview of its pull request's head.
@@ -695,6 +715,10 @@ pub struct State {
     /// looked at again every `preview_find::POLL_SECS` even when nothing
     /// else on the pull request changed.
     pub looked_at: String,
+    /// Labels CoderHelm would have put back on this head but left off,
+    /// because a person or another app took them off, or CoderHelm couldn't
+    /// tell who did (`crate::deploy_label::removed_by`).
+    pub kept_off: Vec<crate::deploy_label::KeptOff>,
 }
 
 impl State {
@@ -722,6 +746,7 @@ impl State {
             Stage::Ready => Some("preview up, pages being captured"),
             Stage::Checked => Some("preview checked"),
             Stage::Failed => Some("preview checks failed"),
+            Stage::Approval => Some("preview waiting for an approval"),
             Stage::Blocked => Some("preview not run"),
         }
     }
@@ -732,6 +757,9 @@ impl State {
 pub fn progress(results: &[CheckResult], triggered: bool) -> Stage {
     if results.iter().any(|r| r.outcome == Outcome::Failed) {
         return Stage::Failed;
+    }
+    if results.iter().any(|r| r.outcome == Outcome::Waiting) {
+        return Stage::Approval;
     }
     if results.iter().any(|r| r.outcome == Outcome::Running) {
         return Stage::Deploying;
@@ -1656,6 +1684,8 @@ jobs:
             name: "x".into(),
             outcome: o,
             url: String::new(),
+            environment: String::new(),
+            no_jobs: false,
         };
         assert_eq!(progress(&[], true), Stage::Triggered);
         assert_eq!(progress(&[r(Outcome::Skipped)], true), Stage::Triggered);
@@ -1671,6 +1701,21 @@ jobs:
             progress(&[r(Outcome::Passed), r(Outcome::Passed)], true),
             Stage::Ready
         );
+        // Held for an environment's approval: a person's ask, never a wait
+        // on time, and a failure still comes first.
+        assert_eq!(
+            progress(&[r(Outcome::Passed), r(Outcome::Waiting)], true),
+            Stage::Approval
+        );
+        assert_eq!(
+            progress(&[r(Outcome::Waiting), r(Outcome::Failed)], true),
+            Stage::Failed
+        );
+        assert!(!State {
+            stage: Stage::Approval,
+            ..Default::default()
+        }
+        .pending());
     }
 
     #[test]

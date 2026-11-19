@@ -1275,6 +1275,9 @@ pub mod conversation;
 mod covering;
 mod cross_repo;
 pub mod dep_fix;
+/// The repository's deploy label, read for the preview of CoderHelm's own
+/// pull request and the auto-merge gate (`common::deploy_label`).
+pub mod deploy_label;
 pub(crate) mod deploy_revert;
 pub mod deploy_stats;
 pub mod description;
