@@ -959,6 +959,37 @@ pub fn webhook_delivery_id(body: &[u8]) -> String {
     format!("jira-{}", &hex::encode(d)[..40])
 }
 
+/// The install a hosted team id's Jira site is linked to, while its route
+/// and its link both stand (the test [`relay_team`] makes before it
+/// forwards). Hosted side only. A route left without its link is removed,
+/// and the id then counts as not linked.
+///
+/// A team that moved to a self-hosted install keeps its id, so CoderHelm
+/// may hold no team record for it while its site is linked: callers that
+/// meet such an id ask this instead of the team record.
+pub async fn standing_route(state: &AppState, team_id: &str) -> Option<String> {
+    master(state)?;
+    let (install_id, routed_at) = route_of(state, team_id).await?;
+    if jira_link(state, &install_id)
+        .await
+        .is_none_or(|l| l.team_id != team_id)
+    {
+        let _ = state
+            .dynamo
+            .delete_item()
+            .table_name(&state.config.settings_table_name)
+            .key("pk", s(&reverse_pk(team_id)))
+            .key("sk", s("LINK"))
+            .condition_expression("install_id = :i AND linked_at = :at")
+            .expression_attribute_values(":i", s(&install_id))
+            .expression_attribute_values(":at", s(&routed_at))
+            .send()
+            .await;
+        return None;
+    }
+    Some(install_id)
+}
+
 /// The relay's part of the hosted Jira intake, called once the event has
 /// passed the team's own check (Forge secret or webhook signature): when
 /// the team's site is linked to an install, forward the event there and
@@ -975,25 +1006,7 @@ pub async fn relay_team(
     body: &[u8],
 ) -> Option<StatusCode> {
     let master = master(state)?;
-    let (install_id, routed_at) = route_of(state, team_id).await?;
-    if jira_link(state, &install_id)
-        .await
-        .is_none_or(|l| l.team_id != team_id)
-    {
-        // A route without its link: remove it, and handle the event here.
-        let _ = state
-            .dynamo
-            .delete_item()
-            .table_name(&state.config.settings_table_name)
-            .key("pk", s(&reverse_pk(team_id)))
-            .key("sk", s("LINK"))
-            .condition_expression("install_id = :i AND linked_at = :at")
-            .expression_attribute_values(":i", s(&install_id))
-            .expression_attribute_values(":at", s(&routed_at))
-            .send()
-            .await;
-        return None;
-    }
+    let install_id = standing_route(state, team_id).await?;
     let install = match load_install(state, &install_id).await {
         Ok(Some(i)) if i.verified() => i,
         _ => return None,

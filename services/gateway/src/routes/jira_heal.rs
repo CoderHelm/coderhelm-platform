@@ -85,9 +85,12 @@ pub async fn heal(state: &AppState, team_id: &str, item: Option<&Item>) -> bool 
             .await
         {
             Ok(r) if r.status == 200 => asked = true,
+            // The app's own answer (its JSON `error`, capped), so a refusal
+            // says why: e.g. CoderHelm refused the registration it sent.
             Ok(r) => warn!(
                 team_id,
                 status = r.status,
+                answer = %common::jira_connection::refusal_words(&r.body),
                 "Jira app: asking it to register again was refused"
             ),
             Err(e) => warn!(team_id, error = %e, "Jira app: couldn't ask it to register again"),
