@@ -8,6 +8,7 @@ const { existingComments } = require("./comments");
 const { postReply, parentIdOf } = require("./thread-reply");
 const { versionFields } = require("./version");
 const { relatedTickets } = require("./related");
+const { registerIfVersionChanged, registerAgainReply } = require("./register");
 
 /** Jira's comment calls as the app, for a threaded reply (see thread-reply.js). */
 const jiraComments = {
@@ -190,6 +191,7 @@ exports.handler = async (event, context) => {
     });
 
     console.log(`Forwarded comment on ${issue.key} → gateway (${response.status})`);
+    await registerIfVersionChanged(config);
     return;
   }
 
@@ -268,11 +270,24 @@ exports.handler = async (event, context) => {
   });
 
   console.log(`Forwarded ${issue.key} → gateway (${response.status})`);
+  // A new version (a minor one arrives with no lifecycle event) may have
+  // new web triggers: CoderHelm learns them now.
+  await registerIfVersionChanged(config);
 };
 
 // ── Web trigger: list Jira projects ──────────────────────────────────────────
 exports.listProjectsHandler = async (request) => {
   try {
+    // CoderHelm asking for every trigger link again (one was missing).
+    let asked = null;
+    try {
+      asked = JSON.parse((request && request.body) || "{}");
+    } catch (e) {
+      asked = null;
+    }
+    if (asked && asked.register_again === true) {
+      return await registerAgainReply(asked, await storage.get("coderhelm-config"));
+    }
     const res = await api.asApp().requestJira(route`/rest/api/3/project?expand=lead`);
     if (!res.ok) {
       return { statusCode: res.status, body: JSON.stringify({ error: "Failed to fetch projects" }) };

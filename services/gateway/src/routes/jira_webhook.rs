@@ -940,6 +940,22 @@ pub async fn handle_forge(
     ))
     .await;
 
+    // The app runs another version than last seen, or the record lacks a
+    // link the app always registers (a trigger it gained after it
+    // registered): the app is asked to register again, here, before anyone
+    // reads a missing link.
+    let event_version = payload
+        .pointer("/coderhelm/app_version")
+        .and_then(|v| v.as_str());
+    if super::jira_heal::wants_heal(config_item.as_ref(), event_version) {
+        Box::pin(super::jira_heal::heal(
+            &state,
+            &team_id,
+            config_item.as_ref(),
+        ))
+        .await;
+    }
+
     // Hosted side of hybrid: the team linked its Jira site to a self-hosted
     // install. The event passed the team's own check; it goes there, and is
     // not handled here as well.

@@ -463,7 +463,8 @@ pub struct Ctx {
     pub github_token: Option<String>,
     /// The installation the token is for (its GitHub budget).
     pub installation_id: Option<u64>,
-    pub jira: Option<super::chat_work_tickets::JiraApp>,
+    /// The team's Jira for ticket reads, or why it can't be read.
+    pub jira: super::chat_work_tickets::Jira,
     /// Who its GitHub reads are counted under (`github_budget::caller`):
     /// Chat, or an AI tool on `/mcp`.
     pub caller: &'static str,
@@ -699,7 +700,8 @@ async fn needs_me(
         team: &ctx.claims.team_id,
         store: &store,
         http: &http,
-        jira: ctx.jira.as_ref(),
+        jira: ctx.jira.app.as_ref(),
+        jira_off: ctx.jira.off_words(),
         github: ctx.github_token.as_ref().map(|t| needs::GitHub {
             auth: format!("Bearer {t}"),
             base: "https://api.github.com".into(),
@@ -767,13 +769,14 @@ async fn tickets(
     };
     let site = ctx
         .jira
+        .app
         .as_ref()
         .map(|j| j.site.clone())
         .unwrap_or_default();
-    let Some(app) = &ctx.jira else {
+    let Some(app) = &ctx.jira.app else {
         return register(
             reg,
-            t::from_runs(&found_runs, &site, "The team's Jira isn't connected to Coderhelm, so this is what Coderhelm's runs know."),
+            t::from_runs(&found_runs, &site, &t::off_note(ctx.jira.off_words())),
             "tickets",
             "",
         );

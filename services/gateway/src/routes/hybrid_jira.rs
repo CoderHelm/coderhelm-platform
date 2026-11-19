@@ -471,14 +471,26 @@ pub async fn delete_link(
 
 /// The Forge triggers a linked install may call through the proxy: the
 /// Jira settings field it reads and the trigger's name in the proxy path.
-pub const TRIGGERS: &[(&str, &str)] = &[
-    ("list_projects_url", "list_projects"),
-    ("create_ticket_url", "create_ticket"),
-    ("add_comment_url", "add_comment"),
-    ("publish_release_url", "publish_release"),
-    ("get_issues_url", "get_issues"),
-    ("confluence_trigger_url", "confluence"),
-];
+pub const TRIGGERS: &[(&str, &str)] = common::jira_connection::TRIGGERS;
+
+/// The triggers the linked team's site has registered here, by name: sent
+/// with the link on `/hybrid/status`, so the install copies the settings
+/// again whenever the site registers a trigger it didn't have (an app
+/// update that adds one), not only on a relink.
+pub async fn linked_triggers(state: &AppState, team_id: &str) -> Option<Vec<&'static str>> {
+    let item = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.jira_config_table_name)
+        .key("pk", s(team_id))
+        .key("sk", s("JIRA#config"))
+        .send()
+        .await
+        .ok()?
+        .item
+        .unwrap_or_default();
+    Some(common::jira_connection::registered(&item))
+}
 
 /// The proxy link the install calls for one trigger.
 pub fn proxy_url(

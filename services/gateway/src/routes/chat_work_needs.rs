@@ -147,6 +147,8 @@ pub struct Sources<'a> {
     pub store: &'a dyn Store,
     pub http: &'a dyn Http,
     pub jira: Option<&'a JiraApp>,
+    /// Why `jira` is `None`, in words (`chat_work_tickets::Jira::off_words`).
+    pub jira_off: &'a str,
     pub github: Option<GitHub>,
     /// The team's repositories the person may read.
     pub repos: &'a [String],
@@ -973,7 +975,11 @@ pub async fn gather(src: &Sources<'_>, mut me: Me, now: Time) -> Report {
                 Vec::new(),
                 Vec::new(),
                 0,
-                Read::Off("Jira isn't connected to Coderhelm".into()),
+                Read::Off(if src.jira_off.is_empty() {
+                    common::jira_connection::NOT_CONNECTED.into()
+                } else {
+                    src.jira_off.to_string()
+                }),
             );
         };
         let Some(account) = me.jira_id.clone() else {
@@ -1165,7 +1171,7 @@ fn read_words(r: &Read) -> String {
 }
 
 /// How the answer is written.
-pub const ANSWER_SHAPE: &str = "Write the answer in exactly this shape. First the count line. Then each group in the order given (skip an empty one), with its heading, and one line per item, most urgent first: a markdown link to the item named by what it is, then exactly what they need to do, then since when, and its citation. Under a run's line, keep its questions with their possible answers as a short nested list. Then, for every source that couldn't be read or wasn't checked, one plain sentence that says so (for example \"Jira isn't connected to Coderhelm, so your tickets aren't listed\"). Don't add items that aren't listed here.";
+pub const ANSWER_SHAPE: &str = "Write the answer in exactly this shape. First the count line. Then each group in the order given (skip an empty one), with its heading, and one line per item, most urgent first: a markdown link to the item named by what it is, then exactly what they need to do, then since when, and its citation. Under a run's line, keep its questions with their possible answers as a short nested list. Then, for every source that couldn't be read or wasn't checked, one plain sentence that says so (for example \"GitHub couldn't be read, so your pull requests aren't listed\"), in that source's own words: never say a system isn't connected unless its line says exactly that. Don't add items that aren't listed here.";
 
 /// Registers each item as a citable source and writes what the model reads.
 /// Returns the text and the step's summary.
@@ -1678,6 +1684,7 @@ pub(crate) mod tests {
             store,
             http: h,
             jira,
+            jira_off: "",
             github,
             repos: &repos,
             readable: &readable,
@@ -1803,6 +1810,7 @@ pub(crate) mod tests {
             store: &s,
             http: &down,
             jira: None,
+            jira_off: "",
             github: Some(gh()),
             repos: &repos,
             readable: &readable,
@@ -1816,6 +1824,21 @@ pub(crate) mod tests {
         );
         assert!(text.contains("isn't linked to a GitHub account"), "{text}");
         assert!(summary.contains("3 sources not read"), "{summary}");
+        // Connected, but the app's lookup isn't registered: the answer names
+        // that ability, never "not connected", and the runs still answer.
+        let lacking = common::jira_connection::Gap::LookupNotRegistered.words();
+        let src = Sources {
+            jira_off: lacking,
+            ..src
+        };
+        let r = gather(&src, me(), now()).await;
+        let (text, _) = render(&r, &mut Default::default(), "2026-11-16 12:00 UTC");
+        assert!(
+            text.contains("Jira: not checked: Jira is connected, but"),
+            "{text}"
+        );
+        assert!(!text.contains("Jira isn't connected"), "{text}");
+        assert!(!ANSWER_SHAPE.contains("Jira isn't connected"));
         // An old Jira app (no `mine` in its answer) is named as such.
         let old = fake(|_| (200, json!({"issues": []})));
         let e = ask_jira_mine(&old, &app(), JIRA_ME).await.unwrap_err();
@@ -1845,6 +1868,7 @@ pub(crate) mod tests {
             store: &s,
             http: &Slow,
             jira: Some(&a),
+            jira_off: "",
             github: Some(gh()),
             repos: &repos,
             readable: &readable,

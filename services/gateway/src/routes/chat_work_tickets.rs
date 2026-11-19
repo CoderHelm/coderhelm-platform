@@ -33,10 +33,64 @@ impl std::fmt::Debug for JiraApp {
     }
 }
 
-/// The team's Jira app from its `JIRA#config` record (only the asker's team
-/// is read), when it registered the get-issues trigger.
-pub async fn load(state: &crate::AppState, team_id: &str) -> Option<JiraApp> {
-    let item = state
+/// What chat's ticket reads can use: the app's lookup, or exactly why not
+/// (`common::jira_connection`, the same truth the integrations page shows).
+#[derive(Debug, Clone, Default)]
+pub struct Jira {
+    pub app: Option<JiraApp>,
+    /// Why `app` is `None`, in words for the answer.
+    pub off: String,
+}
+
+impl Jira {
+    /// From the team's `JIRA#config` and whether a plain webhook is set up
+    /// (pure; tested).
+    pub fn from_config(
+        item: Option<&std::collections::HashMap<String, aws_sdk_dynamodb::types::AttributeValue>>,
+        webhook: bool,
+    ) -> Jira {
+        use common::jira_connection::{Connection, TicketReads};
+        match Connection::from_config(item, webhook).ticket_reads() {
+            TicketReads::Ready {
+                issues_url,
+                secret,
+                site,
+            } => Jira {
+                app: Some(JiraApp {
+                    issues_url,
+                    secret,
+                    site,
+                }),
+                off: String::new(),
+            },
+            TicketReads::Off(gap) => Jira {
+                app: None,
+                off: gap.words().to_string(),
+            },
+        }
+    }
+
+    /// Why tickets can't be read, or the plain "not connected" when there's
+    /// no reason recorded.
+    pub fn off_words(&self) -> &str {
+        if self.off.is_empty() {
+            common::jira_connection::NOT_CONNECTED
+        } else {
+            &self.off
+        }
+    }
+}
+
+/// The note on tickets answered from the runs because Jira can't be read.
+pub fn off_note(why: &str) -> String {
+    format!("{why}, so this is what Coderhelm's runs know.")
+}
+
+async fn read_config(
+    state: &crate::AppState,
+    team_id: &str,
+) -> Option<std::collections::HashMap<String, aws_sdk_dynamodb::types::AttributeValue>> {
+    state
         .dynamo
         .get_item()
         .table_name(&state.config.jira_config_table_name)
@@ -53,20 +107,26 @@ pub async fn load(state: &crate::AppState, team_id: &str) -> Option<JiraApp> {
         .send()
         .await
         .ok()?
-        .item?;
-    let get = |k: &str| {
-        item.get(k)
-            .and_then(|v| v.as_s().ok())
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-    };
-    Some(JiraApp {
-        issues_url: get("get_issues_url").filter(|u| u.starts_with("https://"))?,
-        secret: get("forge_secret")?,
-        site: get("site_url")
-            .filter(|u| u.starts_with("https://"))
-            .unwrap_or_default(),
-    })
+        .item
+}
+
+/// The team's Jira as chat reads it (only the asker's team is read). When
+/// the app is connected but lacks the lookup, the system puts it right
+/// first (`jira_heal`: the app registers again, a linked install copies
+/// again) and reads once more, so the answer usually has the tickets.
+pub async fn load(state: &crate::AppState, team_id: &str) -> Jira {
+    let (item, hook) = tokio::join!(
+        read_config(state, team_id),
+        super::api::load_jira_secret(state, team_id),
+    );
+    let first = Jira::from_config(item.as_ref(), hook.is_some());
+    let lacks_lookup = first.app.is_none()
+        && common::jira_connection::Connection::from_config(item.as_ref(), false).app;
+    if !lacks_lookup || !super::jira_heal::heal(state, team_id, item.as_ref()).await {
+        return first;
+    }
+    let again = read_config(state, team_id).await;
+    Jira::from_config(again.as_ref(), hook.is_some())
 }
 
 /// A ticket key as Jira writes them.
@@ -264,6 +324,70 @@ mod tests {
     use super::*;
     use crate::routes::chat_work_prs::tests::fake;
     use crate::routes::chat_work_runs::{record, tests::run};
+
+    /// A linked install's record from before the app had its lookup: the
+    /// proxy links copied then, the secret, the site and a version seen
+    /// today, and no lookup link.
+    fn copied_before_lookup(
+    ) -> std::collections::HashMap<String, aws_sdk_dynamodb::types::AttributeValue> {
+        let p = "https://api.example.com/hybrid/jira/trigger/ins_a";
+        [
+            ("list_projects_url", format!("{p}/list_projects/t")),
+            ("create_ticket_url", format!("{p}/create_ticket/t")),
+            ("add_comment_url", format!("{p}/add_comment/t")),
+            ("publish_release_url", String::new()),
+            ("get_issues_url", String::new()),
+            ("confluence_trigger_url", String::new()),
+            ("forge_secret", "token-for-install".into()),
+            ("site_url", "https://example.atlassian.net".into()),
+            ("app_version", "7.3.0".into()),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), aws_sdk_dynamodb::types::AttributeValue::S(v)))
+        .collect()
+    }
+
+    #[test]
+    fn an_app_without_its_lookup_is_never_called_not_connected() {
+        let item = copied_before_lookup();
+        let j = Jira::from_config(Some(&item), false);
+        assert!(j.app.is_none());
+        assert!(
+            !j.off_words().contains("isn't connected"),
+            "{}",
+            j.off_words()
+        );
+        assert!(
+            j.off_words().starts_with("Jira is connected, but"),
+            "{}",
+            j.off_words()
+        );
+        assert!(j.off_words().contains("ticket lookup"), "{}", j.off_words());
+        let note = off_note(j.off_words());
+        assert!(
+            note.ends_with("so this is what Coderhelm's runs know."),
+            "{note}"
+        );
+        // The lookup registered: ready, with the site for links.
+        let mut full = item.clone();
+        full.insert(
+            "get_issues_url".into(),
+            aws_sdk_dynamodb::types::AttributeValue::S(
+                "https://api.example.com/hybrid/jira/trigger/ins_a/get_issues/t".into(),
+            ),
+        );
+        let j = Jira::from_config(Some(&full), false);
+        let app = j.app.expect("ready");
+        assert_eq!(app.site, "https://example.atlassian.net");
+        // Only no connection at all is "not connected".
+        assert_eq!(
+            Jira::from_config(None, false).off_words(),
+            common::jira_connection::NOT_CONNECTED
+        );
+        assert!(Jira::from_config(None, true)
+            .off_words()
+            .contains("Jira webhook"));
+    }
 
     fn app() -> JiraApp {
         JiraApp {

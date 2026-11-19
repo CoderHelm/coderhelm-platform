@@ -546,7 +546,16 @@ pub async fn status(
     let slug = crate::auth::github_app::app_slug(&state).await;
     let mut v = install.view();
     v["github"] = json!({ "links": links, "app_slug": slug });
-    v["jira"] = json!({ "link": super::hybrid_jira::jira_link(&state, &install.id).await });
+    let jira_link = super::hybrid_jira::jira_link(&state, &install.id).await;
+    let mut link_v = json!(jira_link);
+    if let Some(l) = &jira_link {
+        // The triggers the site registered here: the install copies again
+        // when they change (an app update that adds one).
+        if let Some(t) = super::hybrid_jira::linked_triggers(&state, &l.team_id).await {
+            link_v["triggers"] = json!(t);
+        }
+    }
+    v["jira"] = json!({ "link": link_v });
     v["offered"] = json!(offered_ids(&state));
     v["name_check"] = name_check_view(&state, &install.name).await;
     Ok(Json(v))
