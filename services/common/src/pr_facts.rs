@@ -373,6 +373,10 @@ pub struct Facts {
     /// A UI change's screenshots, or why there are none.
     #[serde(default)]
     pub screens: Option<crate::pr_body::Screens>,
+    /// A Before and After pair from the end-to-end run on the head
+    /// (`e2e::shots`): shown under the preview's pages, never instead.
+    #[serde(default)]
+    pub e2e_screens: Option<crate::pr_body::Screens>,
     /// What the pull request waits on, one line (`crate::waiting_line`).
     #[serde(default)]
     pub waiting: String,
@@ -1484,8 +1488,8 @@ pub fn body_of(f: &Facts, ticked: &[String]) -> crate::pr_body::Body {
         .iter()
         .any(|x| crate::preview::is_user_visible(&x.path));
     let screens = match (&f.screens, &f.preview) {
-        (Some(s), _) => Some(s.clone()),
-        (None, Some(p)) => screens_of(p, visible),
+        (s, Some(p)) => screens_of(p, visible).or_else(|| s.clone()),
+        (Some(s), None) => Some(s.clone()),
         (None, None) if f.files.iter().any(|x| is_ui(&x.path)) => Some(Screens::Missing(
             "CoderHelm had no runnable preview to capture for this run".into(),
         )),
@@ -1601,6 +1605,7 @@ pub fn body_of(f: &Facts, ticked: &[String]) -> crate::pr_body::Body {
         rollback,
         rows: rows(f),
         screens,
+        e2e_screens: f.e2e_screens.clone(),
         notes_label,
         notes_top,
         evidence: evidence.join("\n\n"),
@@ -1644,6 +1649,41 @@ mod tests {
             outcome,
             url: format!("https://ci.example.com/{}", name.replace(' ', "-")),
         }
+    }
+
+    /// The preview's captured pages are never hidden by another table: the
+    /// end-to-end pair travels on its own and is shown under them.
+    #[test]
+    fn the_preview_pages_win_and_the_end_to_end_pair_is_kept_beside_them() {
+        use crate::pr_body::Screens;
+        let pair = Screens::Images {
+            before: String::new(),
+            before_alt: "No passing run on main with a screenshot of this test yet".into(),
+            after: "https://github.com/o/r/blob/c1/pr-7/abc/e2e-1-after.png?raw=true".into(),
+            after_alt: "Checkout on this head".into(),
+            caption: String::new(),
+        };
+        let mut f = ticket_facts();
+        f.screens = Some(pair.clone());
+        f.e2e_screens = Some(pair.clone());
+        f.preview = Some(crate::preview::State {
+            shots: vec![crate::preview::Shot {
+                page: "/checkout".into(),
+                width: "desktop".into(),
+                src: "https://img.example.com/d.png".into(),
+            }],
+            ..Default::default()
+        });
+        let b = body_of(&f, &[]);
+        assert!(
+            matches!(b.screens, Some(Screens::Pages(_))),
+            "{:?}",
+            b.screens
+        );
+        assert_eq!(b.e2e_screens, Some(pair.clone()));
+        // Without a preview, a table someone set still shows.
+        f.preview = None;
+        assert_eq!(body_of(&f, &[]).screens, Some(pair));
     }
 
     fn ticket_facts() -> Facts {

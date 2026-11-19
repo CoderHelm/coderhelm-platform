@@ -872,7 +872,7 @@ async fn keep_images(
     files: &[(String, String)],
 ) -> Result<Vec<Shot>, Box<dyn std::error::Error + Send + Sync>> {
     let short = head.get(..12).unwrap_or(head);
-    let mut entries: Vec<(String, Option<GitEntry>)> = Vec::new();
+    let mut images: Vec<(String, Vec<u8>)> = Vec::new();
     let mut shots: Vec<(Shot, String)> = Vec::new();
     for c in report.iter().filter(|c| c.shot()) {
         let Some((_, b64)) = files
@@ -884,15 +884,7 @@ async fn keep_images(
         let clean: String = b64.chars().filter(|c| !c.is_whitespace()).collect();
         let bytes = base64::engine::general_purpose::STANDARD.decode(clean)?;
         let path = format!("pr-{}/{short}/{}.png", p.number, c.name);
-        let sha = gh.put_blob(p.owner, p.repo, &bytes).await?;
-        entries.push((
-            path.clone(),
-            Some(GitEntry {
-                mode: "100644".into(),
-                kind: "blob".into(),
-                sha,
-            }),
-        ));
+        images.push((path.clone(), bytes));
         shots.push((
             Shot {
                 page: c.page.clone(),
@@ -902,35 +894,86 @@ async fn keep_images(
             path,
         ));
     }
-    if entries.is_empty() {
+    if images.is_empty() {
         return Ok(Vec::new());
     }
-    let parent = gh.own_ref(p.owner, p.repo, SHOTS_REF).await;
-    let base_tree = match &parent {
-        Some(c) => gh.commit_tree_parents(p.owner, p.repo, c).await?.0,
-        None => String::new(),
-    };
-    let tree = gh.put_tree(p.owner, p.repo, &base_tree, &entries).await?;
-    let commit = gh
-        .put_commit(
-            p.owner,
-            p.repo,
-            &format!("Screenshots of #{} at {short}", p.number),
-            &tree,
-            &parent.into_iter().collect::<Vec<_>>(),
-        )
-        .await?;
-    gh.set_own_ref(p.owner, p.repo, SHOTS_REF, &commit).await?;
+    let commit = keep_on_ref(
+        gh,
+        p.owner,
+        p.repo,
+        &format!("Screenshots of #{} at {short}", p.number),
+        &images,
+    )
+    .await?;
     Ok(shots
         .into_iter()
         .map(|(mut s, path)| {
-            s.src = format!(
-                "https://github.com/{}/{}/blob/{commit}/{path}?raw=true",
-                p.owner, p.repo
-            );
+            s.src = image_url(p.owner, p.repo, &commit, &path);
             s
         })
         .collect())
+}
+
+/// Times a write to [`SHOTS_REF`] is tried again on top of a commit another
+/// writer put there first.
+const REF_TRIES: usize = 3;
+
+/// Commits `files` (path and bytes) on top of what [`SHOTS_REF`] holds and
+/// moves the ref to the new commit without force, so a commit another
+/// writer (another pull request's capture, an end-to-end run) added in the
+/// meantime is never dropped; then the commit is built again on top of it.
+/// The commit's id, which the images are linked by.
+pub async fn keep_on_ref(
+    gh: &GitHubClient,
+    owner: &str,
+    repo: &str,
+    message: &str,
+    files: &[(String, Vec<u8>)],
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let mut entries: Vec<(String, Option<GitEntry>)> = Vec::new();
+    for (path, bytes) in files {
+        let sha = gh.put_blob(owner, repo, bytes).await?;
+        entries.push((
+            path.clone(),
+            Some(GitEntry {
+                mode: "100644".into(),
+                kind: "blob".into(),
+                sha,
+            }),
+        ));
+    }
+    let mut last: Box<dyn std::error::Error + Send + Sync> = "nothing was tried".into();
+    for _ in 0..REF_TRIES {
+        let parent = gh.own_ref(owner, repo, SHOTS_REF).await;
+        let base_tree = match &parent {
+            Some(c) => gh.commit_tree_parents(owner, repo, c).await?.0,
+            None => String::new(),
+        };
+        let tree = gh.put_tree(owner, repo, &base_tree, &entries).await?;
+        let commit = gh
+            .put_commit(
+                owner,
+                repo,
+                message,
+                &tree,
+                &parent.iter().cloned().collect::<Vec<_>>(),
+            )
+            .await?;
+        match gh
+            .advance_own_ref(owner, repo, SHOTS_REF, parent.as_deref(), &commit)
+            .await
+        {
+            Ok(()) => return Ok(commit),
+            Err(e) => last = e,
+        }
+    }
+    Err(format!("{SHOTS_REF} kept moving under this write: {last}").into())
+}
+
+/// The address of `path` on the screenshots ref at `commit`: it shows only
+/// to people who can read the repository.
+pub fn image_url(owner: &str, repo: &str, commit: &str, path: &str) -> String {
+    format!("https://github.com/{owner}/{repo}/blob/{commit}/{path}?raw=true")
 }
 
 #[cfg(test)]
