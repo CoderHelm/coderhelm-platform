@@ -575,8 +575,9 @@ async fn handle_issue_event(
     // run, re-trigger only if the issue content changed (re-labeling an
     // edited issue reworks it; re-labeling an unchanged one is a no-op).
     // Failed/needs_input runs no longer block — the old any-run-exists check
-    // made GitHub tickets unretriable by re-label. Re-labeling still retries
-    // a failed issue, even past the failed-run cap.
+    // made GitHub tickets unretriable by re-label. Every issue event that
+    // gets here is a person's retry gesture (the label added, or CoderHelm
+    // assigned), so it retries a failed issue even past the failed-run cap.
     let ticket_id_str = format!("GH-{}", issue["number"].as_u64().unwrap_or(0));
     let context_hash = common::ticket_context_hash(
         issue["title"].as_str().unwrap_or(""),
@@ -590,7 +591,7 @@ async fn handle_issue_event(
         Some(&context_hash),
         false,
         false,
-        is_labeled,
+        super::trigger_gate::github_retry_gesture(payload),
     )
     .await
     {
