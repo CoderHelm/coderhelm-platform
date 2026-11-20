@@ -876,6 +876,10 @@ fn build_app(state: Arc<AppState>) -> Router {
         .route("/sign-in/okta/test", post(routes::oidc_signin::okta_test))
         .route("/sign-in/okta/save", post(routes::oidc_signin::okta_save))
         .route(
+            "/sign-in/okta/domains/verify",
+            post(routes::oidc_signin::okta_verify_domains),
+        )
+        .route(
             "/sign-in/okta/draft",
             delete(routes::oidc_signin::okta_discard_draft),
         )

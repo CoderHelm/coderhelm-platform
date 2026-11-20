@@ -1036,6 +1036,7 @@ async fn member_claims(
         support_view: None,
         custom: None,
         api_key: None,
+        held: false,
     }))
 }
 

@@ -271,6 +271,14 @@ pub struct Claims {
     /// and `email` and `github_login` are those of the admin who made it.
     #[serde(skip)]
     pub api_key: Option<ApiKeyRef>,
+    /// Set by the auth middleware, never read from or written to a token:
+    /// this session was signed in by a team's (or the organization's) own
+    /// Okta, which vouches for that team only (routes::oidc_signin). It is
+    /// never a platform admin, and on the hosted deployment it never reaches
+    /// the person's other teams or anything person-wide (their passwords and
+    /// second factor, their other sessions, linking another sign-in).
+    #[serde(skip)]
+    pub held: bool,
 }
 
 /// The API key a request was made with.
@@ -473,6 +481,7 @@ mod tests {
             support_view: None,
             custom: None,
             api_key: None,
+            held: false,
         };
         let json = serde_json::to_string(&c).unwrap();
         let parsed: Claims = serde_json::from_str(&json).unwrap();

@@ -458,6 +458,7 @@ pub const CAPABILITIES: &[Capability] = &[
             "oidc_signin::okta_toggle",
             "oidc_signin::okta_delete",
             "oidc_signin::okta_discard_draft",
+            "oidc_signin::okta_verify_domains",
         ],
     },
     Capability {

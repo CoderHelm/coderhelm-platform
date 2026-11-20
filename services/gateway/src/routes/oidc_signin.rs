@@ -77,6 +77,7 @@ type ApiError = (StatusCode, Json<Value>);
 /// Microsoft's sign-in service.
 pub const MS_AUTHORITY: &str = "https://login.microsoftonline.com";
 /// The tenant of personal Microsoft accounts (outlook.com, hotmail.com).
+#[cfg(test)]
 pub const MS_CONSUMER_TENANT: &str = "9188040d-6c67-4c5b-b112-36a304b66dad";
 /// Where Microsoft publishes the keys that sign every tenant's tokens.
 pub const MS_KEYS: &str = "https://login.microsoftonline.com/common/discovery/v2.0/keys";
@@ -278,26 +279,14 @@ fn truthy(v: &Value) -> bool {
 }
 
 /// The email a Microsoft token vouches for (see the module docs), or why
-/// there is none.
+/// there is none: the `email` claim, only when `xms_edov` is true in the
+/// same token, for every kind of account.
 pub fn microsoft_email(claims: &Value) -> Result<String, &'static str> {
-    let tid = claims["tid"].as_str().unwrap_or_default();
     let email = claims["email"].as_str().and_then(plain_email);
-    if tid.eq_ignore_ascii_case(MS_CONSUMER_TENANT) {
-        return email.ok_or("personal account with no email claim");
+    if !truthy(&claims["xms_edov"]) {
+        return Err("xms_edov is not true: Microsoft didn't vouch for the email's domain");
     }
-    if truthy(&claims["xms_edov"]) {
-        if let Some(e) = email {
-            return Ok(e);
-        }
-    }
-    let primary = match &claims["verified_primary_email"] {
-        Value::Array(a) => a.first().and_then(Value::as_str),
-        Value::String(s) => Some(s.as_str()),
-        _ => None,
-    };
-    primary.and_then(plain_email).ok_or(
-        "work account with no verified email (email without xms_edov, no verified_primary_email)",
-    )
+    email.ok_or("no usable email claim")
 }
 
 /// The email an Okta token vouches for: `email` with `email_verified: true`.
@@ -427,40 +416,42 @@ pub fn check_discovery(issuer: &str, doc: &Value) -> Result<Discovery, String> {
     })
 }
 
-/// The client for requests to an identity provider: no redirects followed
-/// (a redirect could lead anywhere), a short time limit.
-fn idp_http() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| e.to_string())
+/// Every request to an identity provider goes through CoderHelm's guarded
+/// transport (`common::mcp_remote::http::GuardedHttps`): https only, the
+/// host resolved first and refused when any answer is private, loopback,
+/// link-local or a metadata address, the connection pinned to the address
+/// that was checked (no DNS rebinding), no proxy, a time limit and a size
+/// cap. A setup's issuer therefore never reaches anything inside the
+/// network, whatever its name resolves to.
+pub type Idp = dyn common::mcp_remote::http::Http;
+
+pub fn idp() -> &'static Idp {
+    &common::mcp_remote::http::GuardedHttps
 }
 
-async fn get_json(url: &str) -> Result<Value, String> {
-    let resp = idp_http()?
-        .get(url)
-        .header(header::ACCEPT, "application/json")
-        .send()
+async fn get_json(http: &Idp, url: &str) -> Result<Value, String> {
+    use common::mcp_remote::http::HttpRequest;
+    let resp = http
+        .send(HttpRequest::get(url))
         .await
         .map_err(|e| format!("{url}: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("{url}: HTTP {}", resp.status().as_u16()));
+    if !(200..300).contains(&resp.status) {
+        return Err(format!("{url}: HTTP {}", resp.status));
     }
-    resp.json().await.map_err(|e| format!("{url}: {e}"))
+    resp.json().ok_or_else(|| format!("{url}: not JSON"))
 }
 
-pub async fn discover(issuer: &str) -> Result<Discovery, String> {
-    let doc = get_json(&format!("{issuer}/.well-known/openid-configuration")).await?;
+pub async fn discover(http: &Idp, issuer: &str) -> Result<Discovery, String> {
+    let doc = get_json(http, &format!("{issuer}/.well-known/openid-configuration")).await?;
     check_discovery(issuer, &doc)
 }
 
-async fn keys(jwks_uri: &str) -> Result<JwkSet, String> {
-    serde_json::from_value(get_json(jwks_uri).await?).map_err(|e| format!("keys: {e}"))
+async fn keys(http: &Idp, jwks_uri: &str) -> Result<JwkSet, String> {
+    serde_json::from_value(get_json(http, jwks_uri).await?).map_err(|e| format!("keys: {e}"))
 }
 
 /// How the client proves itself at the token endpoint.
-enum ClientAuth {
+pub enum ClientAuth {
     /// `client_secret_post` (Microsoft).
     Post,
     /// `client_secret_basic` (Okta's default for a Web app).
@@ -469,7 +460,9 @@ enum ClientAuth {
 
 /// Trades the code for tokens. Returns the id_token; the provider's error
 /// name (never the secret) on a refusal.
-async fn exchange(
+#[allow(clippy::too_many_arguments)]
+pub async fn exchange(
+    http: &Idp,
     token_endpoint: &str,
     client_id: &str,
     client_secret: &str,
@@ -478,6 +471,7 @@ async fn exchange(
     redirect_uri: &str,
     verifier: &str,
 ) -> Result<String, String> {
+    use common::mcp_remote::http::HttpRequest;
     let mut form = vec![
         ("grant_type", "authorization_code"),
         ("code", code),
@@ -485,28 +479,35 @@ async fn exchange(
         ("code_verifier", verifier),
         ("client_id", client_id),
     ];
-    let mut req = idp_http()?.post(token_endpoint);
-    match auth {
-        ClientAuth::Post => form.push(("client_secret", client_secret)),
-        ClientAuth::Basic => {
-            req = req.basic_auth(
-                urlencoding::encode(client_id),
-                Some(urlencoding::encode(client_secret)),
-            )
-        }
+    if let ClientAuth::Post = auth {
+        form.push(("client_secret", client_secret));
     }
-    let resp = req
-        .form(&form)
-        .send()
+    let mut req = HttpRequest::form(token_endpoint, &form);
+    if let ClientAuth::Basic = auth {
+        // RFC 6749 2.3.1: both halves form-encoded, then Basic.
+        let pair = format!(
+            "{}:{}",
+            urlencoding::encode(client_id),
+            urlencoding::encode(client_secret)
+        );
+        req = req.header(
+            "Authorization",
+            &format!(
+                "Basic {}",
+                base64::engine::general_purpose::STANDARD.encode(pair)
+            ),
+        );
+    }
+    let resp = http
+        .send(req)
         .await
         .map_err(|e| format!("token endpoint: {e}"))?;
-    let status = resp.status();
-    let body: Value = resp.json().await.unwrap_or(Value::Null);
+    let body = resp.json().unwrap_or(Value::Null);
     match body["id_token"].as_str() {
-        Some(t) if status.is_success() => Ok(t.to_string()),
+        Some(t) if (200..300).contains(&resp.status) => Ok(t.to_string()),
         _ => Err(format!(
             "HTTP {}: {}",
-            status.as_u16(),
+            resp.status,
             body["error"].as_str().unwrap_or("no id_token")
         )),
     }
@@ -642,6 +643,7 @@ async fn microsoft_callback_inner(
         SignInFailure::new(P, Reason::Expired, "flow_cookie", "no signed flow cookie")
     })?;
     let id_token = exchange(
+        idp(),
         &format!("{MS_AUTHORITY}/common/oauth2/v2.0/token"),
         client_id,
         client_secret,
@@ -652,7 +654,7 @@ async fn microsoft_callback_inner(
     )
     .await
     .map_err(|e| SignInFailure::new(P, Reason::Provider, "token_exchange", e))?;
-    let jwks = keys(MS_KEYS)
+    let jwks = keys(idp(), MS_KEYS)
         .await
         .map_err(|e| SignInFailure::new(P, Reason::Provider, "keys", e))?;
     let claims = verify_id_token(
@@ -918,31 +920,74 @@ pub async fn okta_available(state: &AppState) -> bool {
         .unwrap_or(false)
 }
 
-/// Among an email's records, the teams whose Okta could sign them in, in
-/// the order to try: teams they are a member of first, then live invites.
-pub fn okta_candidate_teams(records: &[Item], now: chrono::DateTime<chrono::Utc>) -> Vec<String> {
-    let mut members = Vec::new();
-    let mut invites = Vec::new();
-    for r in records {
-        if !s(r, "sk").starts_with("USER#") {
-            continue;
-        }
-        let team = s(r, "pk").to_string();
-        if s(r, "status") == "invited" {
-            if !super::users::invite_expired(r, now) && !invites.contains(&team) {
-                invites.push(team);
-            }
-        } else if !members.contains(&team) {
-            members.push(team);
+// ── Okta: proving a domain (hosted) ─────────────────────────────────
+
+/// Where a verified domain is recorded: one team per domain (settings
+/// table, `pk = OKTA_DOMAIN#<domain>`, `sk = OKTA`). Written only after the
+/// domain's DNS shows the team's TXT record.
+pub const OKTA_DOMAIN_PREFIX: &str = "OKTA_DOMAIN#";
+const OKTA_DOMAIN_SK: &str = "OKTA";
+
+/// The TXT record's name: `_coderhelm-okta.<domain>`.
+pub fn domain_txt_name(domain: &str) -> String {
+    format!("_coderhelm-okta.{domain}")
+}
+
+/// The TXT record's value for one team and one domain: an HMAC of both
+/// with the deployment's key, so nobody else can work it out and it never
+/// needs storing.
+pub fn domain_txt_value(secret: &str, team_id: &str, domain: &str) -> String {
+    use hmac::{Hmac, Mac};
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(secret.as_bytes())
+        .expect("HMAC takes any key length");
+    mac.update(format!("okta-domain|{team_id}|{domain}").as_bytes());
+    let tag = hex::encode(mac.finalize().into_bytes());
+    format!("coderhelm-okta={}", &tag[..32])
+}
+
+/// Whether any of a name's TXT strings is exactly the expected value.
+pub fn txt_proves(records: &[String], expected: &str) -> bool {
+    records
+        .iter()
+        .any(|r| r.trim().trim_matches('"') == expected)
+}
+
+/// The team that proved `domain`, if any.
+async fn domain_owner(state: &AppState, domain: &str) -> Result<Option<(String, String)>, String> {
+    let out = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(&format!("{OKTA_DOMAIN_PREFIX}{domain}")))
+        .key("sk", attr_s(OKTA_DOMAIN_SK))
+        .consistent_read(true)
+        .send()
+        .await
+        .map_err(|e| format!("{e}"))?;
+    Ok(out
+        .item()
+        .map(|i| (s(i, "team_id").to_string(), s(i, "verified_at").to_string()))
+        .filter(|(t, _)| !t.is_empty()))
+}
+
+/// Whether every domain of a hosted setup is proven by its own team.
+async fn all_domains_proven(state: &AppState, setup: &OktaSetup) -> Result<bool, String> {
+    if setup.domains.is_empty() {
+        return Ok(false);
+    }
+    for d in &setup.domains {
+        if domain_owner(state, d).await?.map(|(t, _)| t) != Some(setup.team_id.clone()) {
+            return Ok(false);
         }
     }
-    invites.retain(|t| !members.contains(t));
-    members.into_iter().chain(invites).collect()
+    Ok(true)
 }
 
 /// The live, turned-on Okta setup for `email`. Self-hosted: the
-/// organization's, when it covers the email. Hosted: the first team the
-/// email is on (or invited to) whose setup is on and lists its domain.
+/// organization's, when it covers the email. Hosted: the setup of the team
+/// that proved the email's domain in DNS, when it is on and lists that
+/// domain. The answer depends only on the email's domain, never on whether
+/// the person is on any team.
 async fn okta_for_email(state: &AppState, email: &str) -> Result<Option<OktaSetup>, String> {
     if super::sign_in::applies() {
         let Some(org) = super::sign_in::load_org(state).await? else {
@@ -952,15 +997,15 @@ async fn okta_for_email(state: &AppState, email: &str) -> Result<Option<OktaSetu
             .await?
             .filter(|s| s.enabled && okta_covers(s, &org.domains, true, email)));
     }
-    let records = super::sign_in::records_by_email(state, email).await?;
-    for team in okta_candidate_teams(&records, chrono::Utc::now()) {
-        if let Some(setup) = load_setup(state, &team, OKTA_SK).await? {
-            if setup.enabled && okta_covers(&setup, &[], false, email) {
-                return Ok(Some(setup));
-            }
-        }
-    }
-    Ok(None)
+    let Some(domain) = super::sign_in::email_domain(email) else {
+        return Ok(None);
+    };
+    let Some((team, _)) = domain_owner(state, &domain).await? else {
+        return Ok(None);
+    };
+    Ok(load_setup(state, &team, OKTA_SK)
+        .await?
+        .filter(|s| s.enabled && okta_covers(s, &[], false, email)))
 }
 
 // ── Okta: sign-in ───────────────────────────────────────────────────
@@ -1009,7 +1054,7 @@ async fn start_okta(
     login_hint: Option<&str>,
 ) -> Result<Response, SignInFailure> {
     const P: Provider = Provider::Okta;
-    let d = discover(&setup.issuer)
+    let d = discover(idp(), &setup.issuer)
         .await
         .map_err(|e| SignInFailure::new(P, Reason::Provider, "discovery", e))?;
     let flow = Flow::new(P, &setup.team_id, test);
@@ -1083,10 +1128,11 @@ async fn okta_claims(
     let secret = unseal_secret(state, setup)
         .await
         .map_err(|e| SignInFailure::new(P, Reason::Server, "secret", e))?;
-    let d = discover(&setup.issuer)
+    let d = discover(idp(), &setup.issuer)
         .await
         .map_err(|e| SignInFailure::new(P, Reason::Provider, "discovery", e))?;
     let id_token = exchange(
+        idp(),
         &d.token_endpoint,
         &setup.client_id,
         &secret,
@@ -1097,7 +1143,7 @@ async fn okta_claims(
     )
     .await
     .map_err(|e| SignInFailure::new(P, Reason::Provider, "token_exchange", e))?;
-    let jwks = keys(&d.jwks_uri)
+    let jwks = keys(idp(), &d.jwks_uri)
         .await
         .map_err(|e| SignInFailure::new(P, Reason::Provider, "keys", e))?;
     verify_id_token(
@@ -1159,6 +1205,22 @@ async fn okta_callback_inner(
             "Okta signed in an email at a domain this setup doesn't cover",
         ));
     }
+    if !super::sign_in::applies() {
+        // Hosted: the email's domain must be one this team proved in DNS,
+        // so a team's Okta can only vouch for addresses its owner controls.
+        let domain = super::sign_in::email_domain(&person.email).unwrap_or_default();
+        let owner = domain_owner(state, &domain)
+            .await
+            .map_err(|e| SignInFailure::new(P, Reason::Server, "domain", e))?;
+        if owner.map(|(t, _)| t).as_deref() != Some(setup.team_id.as_str()) {
+            return Err(SignInFailure::new(
+                P,
+                Reason::NotOnTeam,
+                "domain",
+                "the email's domain is not proven by this team",
+            ));
+        }
+    }
     let team = (!super::sign_in::applies()).then_some(setup.team_id.as_str());
     super::auth::finish_oidc(state, ip, P, &person, team).await
 }
@@ -1204,6 +1266,11 @@ fn read_ticket(token: &str, secret: &str) -> Option<TestTicket> {
     .map(|d| d.claims)
 }
 
+/// A Test sign-in link is used by the admin who made it, in their team.
+fn ticket_is_theirs(t: &TestTicket, session: Option<&Claims>) -> bool {
+    session.is_some_and(|c| c.sub == t.by && c.team_id == t.team)
+}
+
 /// Where a Test sign-in lands: Settings, Sign-in, with the outcome.
 pub fn test_result_url(app_url: &str, outcome: Result<(), &str>) -> String {
     let base = format!("{}/settings/sign-in/", app_url.trim_end_matches('/'));
@@ -1240,11 +1307,22 @@ pub struct TestQuery {
 /// draft setup. Okta asks for the password again.
 pub async fn okta_test_start(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Query(q): Query<TestQuery>,
 ) -> Response {
     let Some(t) = read_ticket(&q.ticket, &state.secrets.jwt_secret) else {
         return test_redirect(&state, Err("expired"));
     };
+    // The link works only in the browser of the admin who made it: their own
+    // session (sent on this same-site navigation) for the same team.
+    let session = oauth_signin::cookie_value(
+        super::auth::cookie_header(&headers),
+        "__Host-coderhelm_session",
+    )
+    .and_then(|tok| crate::auth::jwt::validate_token(tok, &state.secrets.jwt_secret).ok());
+    if !ticket_is_theirs(&t, session.as_ref()) {
+        return test_redirect(&state, Err("not_yours"));
+    }
     let draft = match load_setup(&state, &t.team, OKTA_DRAFT_SK).await {
         Ok(Some(d)) => d,
         Ok(None) => return test_redirect(&state, Err("no_draft")),
@@ -1391,6 +1469,37 @@ async fn okta_view(state: &AppState, team: &str) -> Result<Value, ApiError> {
     let draft = load_setup(state, team, OKTA_DRAFT_SK)
         .await
         .map_err(|e| internal("Okta draft not read", e))?;
+    // Hosted: each email domain is proven with a DNS TXT record first.
+    let mut domains: Vec<String> = Vec::new();
+    for d in draft
+        .iter()
+        .chain(live.iter())
+        .flat_map(|s| s.domains.iter())
+    {
+        if !domains.contains(d) {
+            domains.push(d.clone());
+        }
+    }
+    let mut proofs = Vec::new();
+    if !super::sign_in::applies() {
+        for d in &domains {
+            let owner = domain_owner(state, d)
+                .await
+                .map_err(|e| internal("Okta domain not read", e))?;
+            let (ours, theirs) = match &owner {
+                Some((t, _)) if t == team => (true, false),
+                Some(_) => (false, true),
+                None => (false, false),
+            };
+            proofs.push(json!({
+                "domain": d,
+                "txt_name": domain_txt_name(d),
+                "txt_value": domain_txt_value(&state.secrets.jwt_secret, team, d),
+                "verified_at": owner.filter(|_| ours).map(|(_, at)| at),
+                "other_team": theirs,
+            }));
+        }
+    }
     Ok(json!({
         "callback_url": okta_redirect_uri(api(state)),
         "sign_in_redirect_uri": okta_redirect_uri(api(state)),
@@ -1398,6 +1507,7 @@ async fn okta_view(state: &AppState, team: &str) -> Result<Value, ApiError> {
         "live": live.as_ref().map(OktaSetup::public),
         "draft": draft.as_ref().map(OktaSetup::public),
         "self_hosted": super::sign_in::applies(),
+        "domains": proofs,
     }))
 }
 
@@ -1422,6 +1532,16 @@ pub struct OktaDraftBody {
     pub client_secret: Option<String>,
     #[serde(default)]
     pub domains: Vec<String>,
+}
+
+/// The sealed secret to keep when the admin leaves the secret box empty:
+/// only one saved for exactly this issuer and client id.
+pub fn kept_secret(saved: &[Option<OktaSetup>], issuer: &str, client_id: &str) -> Option<String> {
+    saved
+        .iter()
+        .flatten()
+        .find(|s| s.issuer == issuer && s.client_id == client_id && !s.secret_sealed.is_empty())
+        .map(|s| s.secret_sealed.clone())
 }
 
 /// POST /api/sign-in/okta/test: saves the values as the draft (the secret
@@ -1466,25 +1586,24 @@ pub async fn okta_test(
             .await
             .map_err(|e| internal("Okta secret not sealed", e))?,
         None => {
-            let kept = match load_setup(&state, &team, OKTA_DRAFT_SK).await {
-                Ok(Some(d)) if !d.secret_sealed.is_empty() => Some(d.secret_sealed),
-                _ => load_setup(&state, &team, OKTA_SK)
-                    .await
-                    .ok()
-                    .flatten()
-                    .map(|l| l.secret_sealed)
-                    .filter(|v| !v.is_empty()),
-            };
+            // A saved secret is reused only for the same issuer and client:
+            // it is never sent to a different Okta.
+            let draft = load_setup(&state, &team, OKTA_DRAFT_SK)
+                .await
+                .ok()
+                .flatten();
+            let live = load_setup(&state, &team, OKTA_SK).await.ok().flatten();
+            let kept = kept_secret(&[draft, live], &issuer, &client_id);
             kept.ok_or_else(|| {
                 fail(
                     StatusCode::BAD_REQUEST,
-                    "Enter the client secret from your Okta app.",
+                    "Enter the client secret from your Okta app. A saved secret is kept only while the Okta domain and Client ID stay the same.",
                 )
             })?
         }
     };
     // Okta's discovery document first: a wrong domain is said here, not at Okta.
-    if let Err(e) = discover(&issuer).await {
+    if let Err(e) = discover(idp(), &issuer).await {
         warn!(error = %e, "Okta discovery failed");
         return Err(fail(
             StatusCode::BAD_REQUEST,
@@ -1546,6 +1665,9 @@ pub async fn okta_save(
             "Run Test sign-in first. Only settings that signed someone in can be saved.",
         ));
     }
+    if body.enabled {
+        require_proven(&state, &draft).await?;
+    }
     let live = OktaSetup {
         enabled: body.enabled,
         updated_at: Some(chrono::Utc::now().to_rfc3339()),
@@ -1604,6 +1726,9 @@ pub async fn okta_toggle(
     if body.enabled && live.tested_at.is_none() {
         return Err(fail(StatusCode::CONFLICT, "Run Test sign-in first."));
     }
+    if body.enabled {
+        require_proven(&state, &live).await?;
+    }
     if body.enabled != live.enabled {
         audit(
             &state,
@@ -1631,6 +1756,94 @@ pub async fn okta_toggle(
     Ok(Json(okta_view(&state, &team).await?))
 }
 
+/// Hosted: Okta sign-in turns on only once every one of its email domains
+/// is proven by this team in DNS.
+async fn require_proven(state: &AppState, setup: &OktaSetup) -> Result<(), ApiError> {
+    if super::sign_in::applies() {
+        return Ok(());
+    }
+    if all_domains_proven(state, setup)
+        .await
+        .map_err(|e| internal("Okta domains not read", e))?
+    {
+        return Ok(());
+    }
+    Err((
+        StatusCode::CONFLICT,
+        Json(json!({
+            "error": "Verify each email domain first: add its TXT record in DNS, then choose Verify domains.",
+            "code": "domains_not_verified",
+        })),
+    ))
+}
+
+/// POST /api/sign-in/okta/domains/verify (hosted): reads each email
+/// domain's `_coderhelm-okta` TXT record and records the domains that show
+/// this team's value. A domain proven by another team stays theirs.
+pub async fn okta_verify_domains(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<Value>, ApiError> {
+    admin(&claims)?;
+    let team = setup_team(&state, &claims).await?;
+    if super::sign_in::applies() {
+        return Err(fail(
+            StatusCode::BAD_REQUEST,
+            "A self-hosted install doesn't verify domains: its admins run it.",
+        ));
+    }
+    let mut domains: Vec<String> = Vec::new();
+    for sk in [OKTA_DRAFT_SK, OKTA_SK] {
+        if let Some(s) = load_setup(&state, &team, sk)
+            .await
+            .map_err(|e| internal("Okta setup not read", e))?
+        {
+            for d in s.domains {
+                if !domains.contains(&d) {
+                    domains.push(d);
+                }
+            }
+        }
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut proven = Vec::new();
+    for d in &domains {
+        let expected = domain_txt_value(&state.secrets.jwt_secret, &team, d);
+        let records = common::dns_txt::lookup(&domain_txt_name(d))
+            .await
+            .unwrap_or_default();
+        if !txt_proves(&records, &expected) {
+            continue;
+        }
+        let claimed = state
+            .dynamo
+            .put_item()
+            .table_name(&state.config.settings_table_name)
+            .item("pk", attr_s(&format!("{OKTA_DOMAIN_PREFIX}{d}")))
+            .item("sk", attr_s(OKTA_DOMAIN_SK))
+            .item("team_id", attr_s(&team))
+            .item("verified_at", attr_s(&now))
+            .item("verified_by", attr_s(&claims.display_name()))
+            .condition_expression("attribute_not_exists(pk) OR team_id = :t")
+            .expression_attribute_values(":t", attr_s(&team))
+            .send()
+            .await
+            .is_ok();
+        if claimed {
+            proven.push(d.clone());
+        }
+    }
+    if !proven.is_empty() {
+        audit(
+            &state,
+            &claims,
+            format!("Okta email domains verified: {}", proven.join(", ")),
+        )
+        .await?;
+    }
+    Ok(Json(okta_view(&state, &team).await?))
+}
+
 /// DELETE /api/sign-in/okta: remove the setup and any draft. People who
 /// signed in with Okta keep their accounts and sign in another way.
 pub async fn okta_delete(
@@ -1640,6 +1853,18 @@ pub async fn okta_delete(
     admin(&claims)?;
     let team = setup_team(&state, &claims).await?;
     audit(&state, &claims, "Okta sign-in removed".into()).await?;
+    // The team's proven domains are released, so their owner can use them again.
+    for sk in [OKTA_SK, OKTA_DRAFT_SK] {
+        if let Ok(Some(setup)) = load_setup(&state, &team, sk).await {
+            for d in &setup.domains {
+                if matches!(domain_owner(&state, d).await, Ok(Some((t, _))) if t == team) {
+                    let _ =
+                        delete_setup(&state, &format!("{OKTA_DOMAIN_PREFIX}{d}"), OKTA_DOMAIN_SK)
+                            .await;
+                }
+            }
+        }
+    }
     for sk in [OKTA_SK, OKTA_DRAFT_SK] {
         delete_setup(&state, &team, sk)
             .await
@@ -1664,9 +1889,49 @@ pub async fn okta_discard_draft(
     Ok(Json(okta_view(&state, &team).await?))
 }
 
-/// A hosted session made by a team's Okta speaks for that team only.
-pub fn held_to_team(via: Option<&str>, self_hosted: bool) -> bool {
-    !self_hosted && via == Some("okta")
+/// A session a team's (or the organization's) Okta signed in.
+pub fn signed_in_with_okta(via: Option<&str>) -> bool {
+    via == Some("okta")
+}
+
+/// On hosted CoderHelm a session from a team's Okta speaks for that team
+/// only: never the person's other teams, nor anything that belongs to the
+/// person rather than the team.
+pub fn team_only(claims: &Claims) -> bool {
+    claims.held && !super::setup_checks::self_hosted()
+}
+
+/// The handlers a hosted Okta session never reaches: moving to another
+/// team, and everything person-wide (the password account, the second
+/// factor, linking another sign-in, ending the person's other sessions).
+pub const HELD_REFUSED: &[&str] = &[
+    "api::switch_team",
+    "users::change_password",
+    "users::mfa_setup",
+    "users::mfa_verify_setup",
+    "users::mfa_disable",
+    "users::link_github",
+    "sign_in::app_setup",
+    "sign_in::app_verify",
+    "sign_in::app_disable",
+    "sign_in::replace_start",
+    "sign_in::replace_verify",
+];
+
+pub const TEAM_ONLY_MESSAGE: &str = "You signed in with your team's Okta, which works for this team only. Sign in with your password, Google, GitHub or Microsoft to do this.";
+
+/// The refusal for a held session asking for a person-wide handler.
+pub fn held_refusal(held: bool, handler: Option<&str>) -> Option<Response> {
+    let refused = held
+        && !super::setup_checks::self_hosted()
+        && handler.is_some_and(|h| HELD_REFUSED.contains(&h));
+    refused.then(|| {
+        (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": TEAM_ONLY_MESSAGE, "code": "okta_team_only" })),
+        )
+            .into_response()
+    })
 }
 
 #[cfg(test)]
@@ -1886,43 +2151,41 @@ mod tests {
 
     #[test]
     fn microsoft_email_is_taken_only_from_a_verified_claim() {
-        // Work account: email with xms_edov true.
+        // email with xms_edov true (Microsoft: "the user's email domain owner
+        // has been verified").
         assert_eq!(microsoft_email(&ms_claims()).unwrap(), "ada@example.com");
-        // xms_edov as the string "true" too.
         let mut c = ms_claims();
         c["xms_edov"] = json!("true");
         assert!(microsoft_email(&c).is_ok());
-        // Without xms_edov, or false: email is not trusted, preferred_username never.
+        // Without xms_edov, or false: email is not trusted.
         for edov in [json!(false), json!("false"), json!(1), Value::Null] {
             let mut c = ms_claims();
             c["xms_edov"] = edov.clone();
             assert!(microsoft_email(&c).is_err(), "{edov}");
         }
+        // preferred_username alone is never enough.
+        let mut c = ms_claims();
+        c.as_object_mut().unwrap().remove("email");
+        assert!(microsoft_email(&c).is_err());
+        // verified_primary_email is never a fallback (Microsoft's docs only
+        // say it is "Sourced from the user's PrimaryAuthoritativeEmail").
         let mut c = ms_claims();
         c.as_object_mut().unwrap().remove("xms_edov");
-        c.as_object_mut().unwrap().remove("email");
-        assert!(
-            microsoft_email(&c).is_err(),
-            "preferred_username alone is never enough"
-        );
-        // verified_primary_email counts when email can't be.
-        c["verified_primary_email"] = json!(["Ada@Example.com", "ada@other.example"]);
-        assert_eq!(microsoft_email(&c).unwrap(), "ada@example.com");
-        c["verified_primary_email"] = json!("ada@example.com");
-        assert_eq!(microsoft_email(&c).unwrap(), "ada@example.com");
-        c["verified_primary_email"] = json!(["not an email"]);
+        c["verified_primary_email"] = json!(["ceo@example.com"]);
         assert!(microsoft_email(&c).is_err());
-        // xms_edov true but no usable email, and no verified_primary_email.
+        c["xms_edov"] = json!(true);
+        c.as_object_mut().unwrap().remove("email");
+        assert!(microsoft_email(&c).is_err());
+        // xms_edov true but no usable email.
         let mut c = ms_claims();
         c["email"] = json!("not-an-email");
         assert!(microsoft_email(&c).is_err());
-        // Personal account (consumer tenant): the email claim, xms_edov or not.
+        // Personal accounts follow the same rule: no xms_edov, no email.
         let mut c = ms_claims();
         c["tid"] = json!(MS_CONSUMER_TENANT);
-        c.as_object_mut().unwrap().remove("xms_edov");
         c["email"] = json!("ada@outlook.com");
         assert_eq!(microsoft_email(&c).unwrap(), "ada@outlook.com");
-        c.as_object_mut().unwrap().remove("email");
+        c.as_object_mut().unwrap().remove("xms_edov");
         assert!(microsoft_email(&c).is_err());
     }
 
@@ -2135,24 +2398,6 @@ mod tests {
     }
 
     #[test]
-    fn okta_looks_only_at_teams_the_email_is_on() {
-        let now = chrono::Utc::now();
-        let records = vec![
-            rec("TEAM#invited", "USER#invite_1", "invited", None),
-            rec("TEAM#member", "USER#abc", "active", None),
-            rec("TEAM#member", "USER#abc2", "", None),
-            rec("TEAM#other", "SETTINGS", "", None),
-            rec("TEAM#both", "USER#invite_2", "invited", None),
-            rec("TEAM#both", "USER#abc", "active", None),
-        ];
-        assert_eq!(
-            okta_candidate_teams(&records, now),
-            vec!["TEAM#member", "TEAM#both", "TEAM#invited"]
-        );
-        assert!(okta_candidate_teams(&[], now).is_empty());
-    }
-
-    #[test]
     fn test_links_are_signed_and_short_lived() {
         let t = test_ticket("TEAM#1", "USER#a", "k").unwrap();
         let back = read_ticket(&t, "k").unwrap();
@@ -2215,10 +2460,151 @@ mod tests {
         );
     }
 
+    // ── The review's attacks ────────────────────────────────────────
+
+    use std::sync::Mutex;
+
+    /// An identity provider that answers from a table and records what was sent.
+    struct FakeIdp {
+        answers: Vec<(String, common::mcp_remote::http::HttpResponse)>,
+        sent: Mutex<Vec<common::mcp_remote::http::HttpRequest>>,
+    }
+
+    #[async_trait::async_trait]
+    impl common::mcp_remote::http::Http for FakeIdp {
+        async fn send(
+            &self,
+            req: common::mcp_remote::http::HttpRequest,
+        ) -> Result<common::mcp_remote::http::HttpResponse, common::mcp_remote::http::HttpError>
+        {
+            self.sent.lock().unwrap().push(req.clone());
+            self.answers
+                .iter()
+                .find(|(u, _)| *u == req.url)
+                .map(|(_, r)| r.clone())
+                .ok_or_else(|| common::mcp_remote::http::HttpError::Unreachable("no answer".into()))
+        }
+    }
+
+    fn answer(status: u16, body: Value) -> common::mcp_remote::http::HttpResponse {
+        common::mcp_remote::http::HttpResponse {
+            status,
+            headers: vec![("content-type".into(), "application/json".into())],
+            body: serde_json::to_vec(&body).unwrap(),
+        }
+    }
+
+    /// Attack 1: a team admin invites admin@ their target and has their own
+    /// Okta assert that email. An invite is never landed on, only an active
+    /// member record on the Okta's own team.
     #[test]
-    fn only_hosted_okta_sessions_are_held_to_their_team() {
-        assert!(held_to_team(Some("okta"), false));
-        assert!(!held_to_team(Some("okta"), true));
+    fn hosted_okta_never_lands_on_an_invite() {
+        use crate::routes::auth::okta_landing;
+        let invite = rec("TEAM#attacker", "USER#invite_1", "invited", None);
+        let other = rec("TEAM#victim", "USER#Google_1", "active", None);
+        assert!(okta_landing(&[invite.clone(), other.clone()], "TEAM#attacker").is_none());
+        let member = rec("TEAM#attacker", "USER#Google_1", "active", None);
+        let all = [invite, other, member];
+        let landed = okta_landing(&all, "TEAM#attacker").unwrap();
+        assert_eq!(s(landed, "pk"), "TEAM#attacker");
+        assert_eq!(s(landed, "sk"), "USER#Google_1");
+        // A record with no status (older records) is an active member.
+        let plain = rec("TEAM#t", "USER#abc", "", None);
+        assert!(okta_landing(&[plain], "TEAM#t").is_some());
+    }
+
+    /// Attack 1: whatever email an Okta session carries, it is never a
+    /// platform admin.
+    #[test]
+    fn an_okta_session_is_never_a_platform_admin() {
+        std::env::set_var("PLATFORM_ADMIN_EMAILS", "admin@coderhelm.example");
+        let mut c = Claims {
+            sub: "USER#Google_123".into(),
+            team_id: "TEAM#t".into(),
+            email: "admin@coderhelm.example".into(),
+            role: "owner".into(),
+            github_login: None,
+            aud: "coderhelm".into(),
+            exp: u64::MAX,
+            iat: 0,
+            support_view: None,
+            custom: None,
+            api_key: None,
+            held: false,
+        };
+        assert!(crate::routes::api::is_platform_admin(&c));
+        c.held = true;
+        assert!(!crate::routes::api::is_platform_admin(&c));
+        c.held = false;
+        c.sub = "USER#okta_00u1".into();
+        assert!(!crate::routes::api::is_platform_admin(&c));
+    }
+
+    /// Attack 1: a domain is the team's only with its own TXT value, which
+    /// no other team and no other domain shares.
+    #[test]
+    fn a_domain_is_proven_only_by_this_teams_txt_value() {
+        let k = "deployment-key";
+        let v = domain_txt_value(k, "TEAM#a", "acme.example");
+        assert!(v.starts_with("coderhelm-okta=") && v.len() == "coderhelm-okta=".len() + 32);
+        assert_ne!(v, domain_txt_value(k, "TEAM#b", "acme.example"));
+        assert_ne!(v, domain_txt_value(k, "TEAM#a", "other.example"));
+        assert_ne!(v, domain_txt_value("another-key", "TEAM#a", "acme.example"));
+        assert_eq!(
+            domain_txt_name("acme.example"),
+            "_coderhelm-okta.acme.example"
+        );
+        assert!(txt_proves(&["v=spf1 -all".into(), v.clone()], &v));
+        assert!(txt_proves(&[format!("\"{v}\"")], &v));
+        assert!(!txt_proves(
+            &[domain_txt_value(k, "TEAM#b", "acme.example")],
+            &v
+        ));
+        assert!(!txt_proves(&[format!("{v}x")], &v));
+        assert!(!txt_proves(&[], &v));
+    }
+
+    /// Attack 1 and 5: sign-in finds an Okta by the email's proven domain,
+    /// never by the person's memberships, and never through an invite.
+    #[test]
+    fn okta_lookup_reads_no_memberships() {
+        let src = include_str!("oidc_signin.rs");
+        let body = &src[src.find("async fn okta_for_email(").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        assert!(!body.contains("records_by_email"), "lookup by membership");
+        assert!(body.contains("domain_owner("));
+        // The callback checks the token's email domain is proven by this team.
+        let cb = &src[src.find("async fn okta_callback_inner(").unwrap()..];
+        let cb = &cb[..cb.find("\n}\n").unwrap()];
+        assert!(cb.find("domain_owner(").unwrap() < cb.find("finish_oidc(").unwrap());
+        // Turning Okta on (save or switch) needs every domain proven.
+        for f in ["pub async fn okta_save(", "pub async fn okta_toggle("] {
+            let b = &src[src.find(f).unwrap()..];
+            let b = &b[..b.find("\n}\n").unwrap()];
+            assert!(b.contains("require_proven("), "{f}");
+        }
+    }
+
+    /// Attack 2: a session a team's Okta signed in reaches nothing
+    /// person-wide on hosted CoderHelm.
+    #[test]
+    fn held_sessions_are_refused_everything_person_wide() {
+        for h in HELD_REFUSED {
+            let r = held_refusal(true, Some(h)).expect(h);
+            assert_eq!(r.status(), StatusCode::FORBIDDEN);
+            assert!(held_refusal(false, Some(h)).is_none());
+        }
+        for h in [
+            "api::switch_team",
+            "users::link_github",
+            "sign_in::app_setup",
+            "users::change_password",
+        ] {
+            assert!(HELD_REFUSED.contains(&h), "{h}");
+        }
+        assert!(held_refusal(true, Some("api::me")).is_none());
+        assert!(held_refusal(true, None).is_none());
+        assert!(signed_in_with_okta(Some("okta")));
         for via in [
             Some("google"),
             Some("github"),
@@ -2226,7 +2612,163 @@ mod tests {
             Some("password"),
             None,
         ] {
-            assert!(!held_to_team(via, false), "{via:?}");
+            assert!(!signed_in_with_okta(via), "{via:?}");
         }
+        // GitHub connect checks the session's way in before linking anything,
+        // and the middleware marks the session before the support view asks.
+        let auth = include_str!("auth.rs");
+        let gh = &auth[auth.find("async fn github_callback_inner(").unwrap()..];
+        assert!(
+            gh.find("Reason::TeamOnly").unwrap()
+                < gh.find("connect GitHub to their account").unwrap()
+        );
+        let mw = include_str!("../middleware/auth.rs");
+        assert!(
+            mw.find("claims.held =").unwrap() < mw.find("support_access::check_session").unwrap()
+        );
+        assert!(mw.contains("held_refusal(claims.held, handler)"));
+    }
+
+    /// Attack 3: every request to an identity provider goes through the
+    /// guarded transport, which refuses private and link-local addresses.
+    #[tokio::test]
+    async fn the_identity_provider_transport_refuses_private_addresses() {
+        for issuer in [
+            "https://127.0.0.1",
+            "https://169.254.169.254",
+            "https://10.0.0.5/oauth2/default",
+            "https://[::1]",
+        ] {
+            let e = discover(idp(), issuer).await.unwrap_err();
+            assert!(!e.is_empty(), "{issuer}");
+            assert!(exchange(
+                idp(),
+                &format!("{issuer}/token"),
+                "c",
+                "s",
+                ClientAuth::Basic,
+                "code",
+                "r",
+                "v"
+            )
+            .await
+            .is_err());
+        }
+        let src = include_str!("oidc_signin.rs");
+        let code = &src[..src.find("#[cfg(test)]\nmod tests").unwrap()];
+        assert!(!code.contains("reqwest::Client"), "no unguarded client");
+        assert!(code.contains("GuardedHttps"));
+    }
+
+    /// The token request: Okta's secret goes only in the Basic header, form
+    /// encoded; Microsoft's in the body; PKCE always.
+    #[tokio::test]
+    async fn the_token_request_carries_pkce_and_the_secret_where_it_belongs() {
+        let fake = FakeIdp {
+            answers: vec![(
+                "https://acme.okta.example/token".into(),
+                answer(200, json!({ "id_token": "t" })),
+            )],
+            sent: Mutex::new(Vec::new()),
+        };
+        let t = exchange(
+            &fake,
+            "https://acme.okta.example/token",
+            "id:1",
+            "s&c=t",
+            ClientAuth::Basic,
+            "C",
+            "R",
+            "V",
+        )
+        .await
+        .unwrap();
+        assert_eq!(t, "t");
+        let req = fake.sent.lock().unwrap()[0].clone();
+        assert!(!req.body_text().contains("client_secret"));
+        assert!(req.body_text().contains("code_verifier=V"));
+        let basic = req.header_value("Authorization").unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(basic.trim_start_matches("Basic "))
+            .unwrap();
+        assert_eq!(String::from_utf8(decoded).unwrap(), "id%3A1:s%26c%3Dt");
+        // A refusal names the provider's error, never the secret.
+        let fake = FakeIdp {
+            answers: vec![(
+                "https://x.example/token".into(),
+                answer(401, json!({ "error": "invalid_client" })),
+            )],
+            sent: Mutex::new(Vec::new()),
+        };
+        let e = exchange(
+            &fake,
+            "https://x.example/token",
+            "id",
+            "shh",
+            ClientAuth::Post,
+            "C",
+            "R",
+            "V",
+        )
+        .await
+        .unwrap_err();
+        assert!(e.contains("invalid_client") && !e.contains("shh"), "{e}");
+        assert!(fake.sent.lock().unwrap()[0]
+            .body_text()
+            .contains("client_secret=shh"));
+    }
+
+    /// Attack 4: a saved secret is never reused for another issuer or client.
+    #[test]
+    fn a_saved_secret_follows_only_its_own_issuer_and_client() {
+        let saved = setup(&["acme.example"]);
+        let both = [Some(saved.clone()), None];
+        assert_eq!(
+            kept_secret(&both, "https://acme.okta.com", "0oa1").as_deref(),
+            Some("c2VhbGVk")
+        );
+        assert!(kept_secret(&both, "https://evil.example", "0oa1").is_none());
+        assert!(kept_secret(&both, "https://acme.okta.com", "0oa-other").is_none());
+        assert!(kept_secret(&[None, None], "https://acme.okta.com", "0oa1").is_none());
+        // The live setup's secret counts when the draft is for another client.
+        let mut draft = saved.clone();
+        draft.client_id = "0oa-new".into();
+        draft.secret_sealed = "bmV3".into();
+        assert_eq!(
+            kept_secret(&[Some(draft), Some(saved)], "https://acme.okta.com", "0oa1").as_deref(),
+            Some("c2VhbGVk")
+        );
+    }
+
+    /// Attack 5: a Test sign-in link works only for the admin who made it.
+    #[test]
+    fn a_test_link_is_bound_to_its_admin() {
+        let t = TestTicket {
+            team: "TEAM#1".into(),
+            by: "USER#admin".into(),
+            aud: TEST_AUD.into(),
+            exp: u64::MAX,
+        };
+        let mut c = Claims {
+            sub: "USER#admin".into(),
+            team_id: "TEAM#1".into(),
+            email: "a@acme.example".into(),
+            role: "admin".into(),
+            github_login: None,
+            aud: "coderhelm".into(),
+            exp: u64::MAX,
+            iat: 0,
+            support_view: None,
+            custom: None,
+            api_key: None,
+            held: false,
+        };
+        assert!(ticket_is_theirs(&t, Some(&c)));
+        assert!(!ticket_is_theirs(&t, None));
+        c.sub = "USER#someone".into();
+        assert!(!ticket_is_theirs(&t, Some(&c)));
+        c.sub = "USER#admin".into();
+        c.team_id = "TEAM#2".into();
+        assert!(!ticket_is_theirs(&t, Some(&c)));
     }
 }

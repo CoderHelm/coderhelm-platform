@@ -284,14 +284,10 @@ pub async fn me(
 pub async fn list_teams(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
-    proof: Option<Extension<jwt::SignInProof>>,
 ) -> Result<Json<Value>, StatusCode> {
     // A hosted session from a team's Okta speaks for that team only: it
     // lists no other team and accepts no invite to one.
-    if super::oidc_signin::held_to_team(
-        proof.as_ref().and_then(|p| p.via.as_deref()),
-        super::setup_checks::self_hosted(),
-    ) {
+    if super::oidc_signin::team_only(&claims) {
         return Ok(Json(json!({ "teams": [{
             "team_id": claims.team_id,
             "org": claims.email,
@@ -465,12 +461,7 @@ pub async fn switch_team(
     let target_team = body["team_id"].as_str().ok_or(StatusCode::BAD_REQUEST)?;
     // A hosted session from a team's Okta never moves to another team: that
     // Okta organization vouches for its own team only.
-    if target_team != claims.team_id
-        && super::oidc_signin::held_to_team(
-            proof.as_ref().and_then(|p| p.via.as_deref()),
-            super::setup_checks::self_hosted(),
-        )
-    {
+    if target_team != claims.team_id && super::oidc_signin::team_only(&claims) {
         return Err(StatusCode::FORBIDDEN);
     }
 
@@ -563,7 +554,10 @@ pub(crate) fn is_platform_admin(claims: &Claims) -> bool {
         .unwrap_or_else(|_| common::public_urls::default_platform_admins().to_string());
     // A support-view session is the team's read-only view, never the admin's
     // own powers: the admin routes refuse it.
+    // A team's Okta can assert any email it likes: never a platform admin.
     claims.support_view.is_none()
+        && !claims.held
+        && !claims.sub.starts_with("USER#okta_")
         && verified_identity(&claims.sub)
         && platform_admin_listed(&admins, &claims.email)
 }

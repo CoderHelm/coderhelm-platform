@@ -22,8 +22,7 @@ When something fails, the person lands on the sign-in screen with one plain sent
 
 ## Which email is trusted
 
-- **Microsoft, personal account** (outlook.com, hotmail.com and other Microsoft accounts): the `email` claim.
-- **Microsoft, work or school account:** an Entra tenant can put any address in `email`, including one at a domain it doesn't own, and `preferred_username` is a name the tenant can change. So CoderHelm uses `email` only when the same token says `xms_edov: true` (Microsoft checked that the tenant owns the email's domain), else the first `verified_primary_email` (an address at one of the tenant's verified domains). `preferred_username` is never used. With neither, sign-in stops: "Microsoft didn't share a verified email address for this account".
+- **Microsoft (work, school and personal accounts):** the `email` claim, only when the same token says `xms_edov: true`. Microsoft's optional claims reference says `email` "isn't guaranteed to be correct, and is mutable over time", and describes `xms_edov` as "Boolean value indicating whether the user's email domain owner has been verified" ([optional claims reference](https://learn.microsoft.com/en-us/entra/identity-platform/optional-claims-reference)). `preferred_username` is never used. `verified_primary_email` is not used either: the same page says only that it is "Sourced from the user's PrimaryAuthoritativeEmail", not that it is at a verified domain. Without a verified email, sign-in stops: "Microsoft didn't share a verified email address for this account".
 - **Okta:** the `email` claim, only with `email_verified: true`.
 
 ## Sign in with Microsoft
@@ -43,9 +42,9 @@ One app registration in Microsoft Entra serves every Microsoft account. Create i
 ### 2. Add the email claims
 
 1. Open **Token configuration** and choose **Add optional claim**, token type **ID**.
-2. Tick `email`, `xms_edov` and `verified_primary_email`, and choose **Add**. When asked, tick **Turn on the Microsoft Graph email permission**.
+2. Tick `email` and `xms_edov`, and choose **Add**. When asked, tick **Turn on the Microsoft Graph email permission**.
 
-Without these, work and school accounts can't sign in (personal accounts can).
+Without both, nobody can sign in with Microsoft: CoderHelm needs `xms_edov` beside the email.
 
 ### 3. Make a client secret
 
@@ -94,8 +93,9 @@ In **Settings, Sign-in rules, Okta sign-in** (admins and owners):
 1. **Okta domain or issuer:** `acme.okta.com`, or the custom authorization server's issuer. It must be https, and CoderHelm reads its `/.well-known/openid-configuration`; every address in it must be on the same host.
 2. **Client ID** and **Client secret** from the Okta app. The secret is encrypted with the deployment's AWS KMS key before it is saved, and never shown again (leave the box empty to keep the saved one).
 3. **Email domains:** the work email domains that sign in with this Okta, for example `example.com`. Required on hosted CoderHelm. Optional on a self-hosted install: empty means the organization's allowed email domains, or everyone when there are none.
-4. Choose **Test sign-in**. Your Okta opens and asks you to sign in again. CoderHelm runs every check a real sign-in makes, then brings you back to the page with the outcome. Nobody else is affected by the test.
-5. When the test passed, choose **Save and turn on**. Only settings whose test passed can be saved; change anything and test again.
+4. Choose **Test sign-in**. Your Okta opens and asks you to sign in again. CoderHelm runs every check a real sign-in makes, then brings you back to the page with the outcome. Nobody else is affected by the test. The test link works only in your own browser, signed in as you, on this team.
+5. **Hosted CoderHelm: prove each email domain.** The section shows a TXT record for each domain: the name `_coderhelm-okta.<domain>` and a value `coderhelm-okta=<code>` made for your team and that domain. Add it in your domain's DNS, wait for it to publish, then choose **Verify domains**. CoderHelm reads the record itself and keeps when it was verified. A domain can be proven by one team only. Okta sign-in can't be turned on until every listed domain is verified, and a sign-in counts only for an email at a verified domain. Keep the record: removing Okta sign-in releases the domains.
+6. When the test passed (and, on hosted CoderHelm, the domains are verified), choose **Save and turn on**. Only settings whose test passed can be saved; change anything and test again. Changing the Okta domain or the Client ID needs the client secret entered again: a saved secret is never sent to a different Okta.
 
 Turn it off, or remove it, from the same section. People who signed in with Okta keep their accounts and sign in another way.
 
@@ -103,7 +103,8 @@ Turn it off, or remove it, from the same section. People who signed in with Okta
 
 **Continue with Okta** asks for the work email and sends the person to the Okta whose setup covers it, with the email filled in:
 
-- **Hosted CoderHelm:** a team whose Okta sign-in is on, whose email domains include the email's domain, and that the email is already on or invited to (an active member first, then a live invite). The sign-in lands on that team only: a team's Okta signs in only its own members, never makes a new team, and the session can't switch to the person's other teams. Someone Okta signs in who isn't on the team (nor invited) sees "you aren't on the team that uses this Okta". Their second factor protects every team they are on, so from an Okta session it can be set up only by someone on no other team.
+- **Hosted CoderHelm:** the Okta of the team that proved the email's domain in DNS, when its Okta sign-in is on. Which Okta it is depends only on the domain, never on whether the person is on a team. After Okta, CoderHelm signs in only someone who is already an active member of that team (they joined it some other way, with an invite and a password, Google, GitHub or Microsoft). Okta never accepts an invite, never makes an account or a team, and its email must be at one of that team's verified domains. Someone else sees "you aren't on the team that uses this Okta".
+- **What an Okta session can do (hosted):** everything on that team, and nothing beyond it. It can't switch to the person's other teams, see them in the team list, change their password or second factor, link a GitHub account, end their other sessions, or act as a CoderHelm platform admin. Those need a sign-in with a password, Google, GitHub or Microsoft. On any install, an Okta session is never a platform or install admin.
 - **A self-hosted install:** the organization's Okta, and then the same rules as every way in: already in the organization, invited, or at an allowed email domain.
 
 ## On CoderHelm's hosted deployment
@@ -112,7 +113,7 @@ What the deployment's owner sets up once:
 
 | What | Where it goes |
 |---|---|
-| Entra app registration: multitenant and personal accounts, Web redirect URI `https://api.coderhelm.com/auth/microsoft/callback`, optional ID token claims `email`, `xms_edov`, `verified_primary_email` | Microsoft Entra admin center |
+| Entra app registration: multitenant and personal accounts, Web redirect URI `https://api.coderhelm.com/auth/microsoft/callback`, optional ID token claims `email` and `xms_edov` | Microsoft Entra admin center |
 | `microsoft_client_id` (Application (client) ID) | `coderhelm/prod/secrets` |
 | `microsoft_client_secret` (client secret Value) | `coderhelm/prod/secrets` |
 | Okta | Nothing: each team's admins set up their own in Settings |

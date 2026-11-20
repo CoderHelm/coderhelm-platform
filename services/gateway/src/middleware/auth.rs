@@ -58,6 +58,13 @@ pub async fn require_auth(
         .map_err(|_| StatusCode::UNAUTHORIZED)?;
     // Only a support-view token carries a support view; a session never does.
     claims.support_view = None;
+    // A team's Okta vouches for that team only (routes::oidc_signin): set
+    // before anything (the support view included) asks who this is.
+    claims.held = crate::routes::oidc_signin::signed_in_with_okta(
+        jwt::read_proof(token, &state.secrets.jwt_secret)
+            .via
+            .as_deref(),
+    );
 
     // A support view: the platform admin's own session plus a support-view
     // cookie. Enforced here for every route: reads only, every request
@@ -135,6 +142,9 @@ pub async fn require_auth(
     }
     if let Err(held) = sign_in::check_session(&state, &claims.team_id, &proof, handler).await {
         return Ok(held);
+    }
+    if let Some(refused) = crate::routes::oidc_signin::held_refusal(claims.held, handler) {
+        return Ok(refused);
     }
 
     let holder = roles::holder_for(&state, &claims).await;
@@ -214,6 +224,10 @@ async fn app_request(
     };
     if let Err(held) = sign_in::check_session(state, &claims.team_id, &proof, handler).await {
         return held;
+    }
+    claims.held = crate::routes::oidc_signin::signed_in_with_okta(proof.via.as_deref());
+    if let Some(refused) = crate::routes::oidc_signin::held_refusal(claims.held, handler) {
+        return refused;
     }
     let holder = roles::holder_for(state, &claims).await;
     match mcp_server::decide(&caller.scopes, caller.tool_handlers, &holder, handler) {
@@ -306,6 +320,7 @@ async fn api_key_request(
         support_view: None,
         custom: None,
         api_key: None,
+        held: false,
     };
     let maker_holder = roles::holder_for(state, &maker_claims).await;
     let holder = api_keys::key_holder(&key, &maker_holder);
@@ -346,6 +361,7 @@ async fn api_key_request(
             created_by: key.created_by_name.clone(),
         }),
         custom: Some(holder),
+        held: false,
     };
     req.extensions_mut().insert(claims);
     let response = next.run(req).await;

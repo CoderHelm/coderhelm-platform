@@ -80,9 +80,12 @@ pub enum Reason {
     NoVerifiedEmail,
     /// No Okta sign-in is set up for the email the person typed.
     NoOkta,
-    /// Okta signed in someone who isn't on (or invited to) the team whose
+    /// Okta signed in someone who isn't an active member of the team whose
     /// Okta it is.
     NotOnTeam,
+    /// A session a team's Okta signed in tried something person-wide
+    /// (linking another sign-in).
+    TeamOnly,
 }
 
 impl Reason {
@@ -97,6 +100,7 @@ impl Reason {
             Reason::NoVerifiedEmail => "no_verified_email",
             Reason::NoOkta => "okta_not_found",
             Reason::NotOnTeam => "not_on_team",
+            Reason::TeamOnly => "okta_team_only",
         }
     }
 }

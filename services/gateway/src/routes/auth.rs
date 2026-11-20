@@ -1701,15 +1701,32 @@ async fn google_callback_inner(
 
 // ── Microsoft and Okta (routes::oidc_signin) ────────────────────────
 
+/// The record a hosted Okta sign-in may land on: the person's active member
+/// record on the Okta's own team. Never an invite (a team admin can invite
+/// any address), never a record on another team.
+pub(crate) fn okta_landing<'a>(
+    records: &'a [HashMap<String, AttributeValue>],
+    team: &str,
+) -> Option<&'a HashMap<String, AttributeValue>> {
+    let g = |i: &'a HashMap<String, AttributeValue>, k: &str| {
+        i.get(k).and_then(|v| v.as_s().ok()).map(String::as_str)
+    };
+    records.iter().find(|i| {
+        g(i, "pk") == Some(team)
+            && g(i, "sk").is_some_and(|s| s.starts_with("USER#"))
+            && g(i, "status") != Some("invited")
+    })
+}
+
 /// The end of a Microsoft or Okta sign-in, once the provider's id_token and
 /// the email in it are checked: the same gates as Google and GitHub.
 ///
 /// - Self-hosted: [`selfhost_landing`] (decide_join: a member, an invite, an
 ///   allowed domain or the first admin), else `?error=not_invited`.
-/// - Hosted, Okta (`team` set): only that team. The person's member record
-///   there by email, else their live invite to it (accepted now), else
-///   `not_on_team`. A team's Okta never makes a personal team or reaches
-///   the person's other teams.
+/// - Hosted, Okta (`team` set): only that team, and only the person's
+///   active member record there (they joined some other way), else
+///   `not_on_team`. A team's Okta never accepts an invite, never makes a
+///   record or a team, and its session is held to that team.
 /// - Hosted, Microsoft (`team` unset): as Google. Their invites are
 ///   accepted, they land on a team they joined over their personal team, and
 ///   a first sign-in starts a personal team (open beta limit).
@@ -1741,25 +1758,14 @@ pub(crate) async fn finish_oidc(
             .map_err(|e| SignInFailure::new(p, Reason::Server, "records", e))?;
         match team {
             Some(t) => {
-                let mine: Vec<_> = existing
-                    .iter()
-                    .filter(|i| {
-                        i.get("pk").and_then(|v| v.as_s().ok()).map(String::as_str) == Some(t)
-                            && i.get("sk")
-                                .and_then(|v| v.as_s().ok())
-                                .is_some_and(|s| s.starts_with("USER#"))
-                    })
-                    .cloned()
-                    .collect();
-                let accepted =
-                    accept_pending_invites(state, &mine, &person.new_user_id, email).await;
-                let pool = landing_records(&mine, accepted);
-                let Some(record) = pool.first() else {
+                // Only an active member of the Okta's own team who joined
+                // some other way: never an invite, never a new record.
+                let Some(record) = okta_landing(&existing, t) else {
                     return Err(SignInFailure::new(
                         p,
                         Reason::NotOnTeam,
                         "member",
-                        "no member record or live invite on the Okta setup's team",
+                        "no active member record on the Okta setup's team",
                     ));
                 };
                 landing_parts(record)
@@ -2213,6 +2219,19 @@ pub(crate) async fn github_sign_in_with_token(
 
     let now = chrono::Utc::now().to_rfc3339();
 
+    // A session from a team's Okta (hosted) links no other sign-in: a GitHub
+    // account linked here would sign in later without the team hold.
+    if existing_claims.is_some()
+        && super::oidc_signin::signed_in_with_okta(existing_proof.via.as_deref())
+        && !super::setup_checks::self_hosted()
+    {
+        return Err(SignInFailure::new(
+            P,
+            Reason::TeamOnly,
+            "connect",
+            "GitHub connect from a session a team's Okta signed in",
+        ));
+    }
     if let Some(claims) = existing_claims {
         // User is already logged in — connect GitHub to their account
         // Update their user record with github_id and github_login
