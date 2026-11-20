@@ -1037,6 +1037,7 @@ async fn member_claims(
         custom: None,
         api_key: None,
         held: false,
+        via_okta: false,
     }))
 }
 

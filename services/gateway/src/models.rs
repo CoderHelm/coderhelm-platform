@@ -279,6 +279,12 @@ pub struct Claims {
     /// second factor, their other sessions, linking another sign-in).
     #[serde(skip)]
     pub held: bool,
+    /// Set by the auth middleware, never read from or written to a token:
+    /// this session was signed in with an Okta, on any deployment. Such a
+    /// session is never a platform admin, and it ends when the member's Okta
+    /// link or the team's Okta setup no longer matches.
+    #[serde(skip)]
+    pub via_okta: bool,
 }
 
 /// The API key a request was made with.
@@ -482,6 +488,7 @@ mod tests {
             custom: None,
             api_key: None,
             held: false,
+            via_okta: false,
         };
         let json = serde_json::to_string(&c).unwrap();
         let parsed: Claims = serde_json::from_str(&json).unwrap();

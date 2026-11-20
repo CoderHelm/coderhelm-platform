@@ -58,6 +58,10 @@ pub struct HttpRequest {
     pub headers: Vec<(String, String)>,
     pub body: Option<Vec<u8>>,
     pub limit: Limit,
+    /// A GET follows redirects (each hop checked again) unless this is
+    /// false: an identity provider's discovery and keys are read from the
+    /// exact address asked for, never from wherever it redirects.
+    pub follow_redirects: bool,
 }
 
 // Written by hand: header values and bodies carry tokens and secrets, and a
@@ -79,6 +83,7 @@ impl HttpRequest {
             headers: vec![("Accept".into(), "application/json".into())],
             body: None,
             limit: Limit::Metadata,
+            follow_redirects: true,
         }
     }
 
@@ -100,6 +105,7 @@ impl HttpRequest {
             ],
             body: Some(s.finish().into_bytes()),
             limit: Limit::Metadata,
+            follow_redirects: true,
         }
     }
 
@@ -110,7 +116,14 @@ impl HttpRequest {
             headers: vec![("Content-Type".into(), "application/json".into())],
             body: Some(serde_json::to_vec(body).unwrap_or_default()),
             limit,
+            follow_redirects: true,
         }
+    }
+
+    /// Never follow a redirect: a 3xx is refused like any other wrong address.
+    pub fn no_redirects(mut self) -> Self {
+        self.follow_redirects = false;
+        self
     }
 
     pub fn header(mut self, k: &str, v: &str) -> Self {
@@ -254,7 +267,11 @@ impl Http for GuardedHttps {
                     .and_then(|v| v.to_str().ok())
                     .and_then(|loc| ep.url.join(loc).ok());
                 match next {
-                    Some(n) if req.method == Method::Get && hop < MAX_REDIRECTS => {
+                    Some(n)
+                        if req.method == Method::Get
+                            && req.follow_redirects
+                            && hop < MAX_REDIRECTS =>
+                    {
                         url = n.to_string();
                         continue;
                     }
@@ -400,6 +417,18 @@ pub mod fake {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_request_can_refuse_every_redirect() {
+        let r = HttpRequest::get("https://acme.example/.well-known/openid-configuration");
+        assert!(
+            r.follow_redirects,
+            "a plain GET keeps following checked redirects"
+        );
+        assert!(!r.no_redirects().follow_redirects);
+        assert!(HttpRequest::form("https://x.example/token", &[]).follow_redirects);
+    }
+
     use super::*;
 
     #[test]

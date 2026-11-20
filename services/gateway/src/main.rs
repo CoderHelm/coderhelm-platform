@@ -880,6 +880,16 @@ fn build_app(state: Arc<AppState>) -> Router {
             post(routes::oidc_signin::okta_verify_domains),
         )
         .route(
+            "/sign-in/okta/domains/:domain",
+            delete(routes::oidc_signin::okta_release_domain),
+        )
+        .route(
+            "/users/okta/link",
+            get(routes::oidc_signin::link_status)
+                .post(routes::oidc_signin::link_start)
+                .delete(routes::oidc_signin::link_remove),
+        )
+        .route(
             "/sign-in/okta/draft",
             delete(routes::oidc_signin::okta_discard_draft),
         )
@@ -1664,6 +1674,7 @@ fn build_app(state: Arc<AppState>) -> Router {
         .route("/okta", post(routes::oidc_signin::okta_login))
         .route("/okta/callback", get(routes::oidc_signin::okta_callback))
         .route("/okta/test", get(routes::oidc_signin::okta_test_start))
+        .route("/okta/link", get(routes::oidc_signin::link_begin))
         // An install's GitHub sign-in through CoderHelm's GitHub App comes
         // back here (routes::github_hybrid).
         .route(

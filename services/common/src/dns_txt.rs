@@ -23,6 +23,26 @@ pub fn query(id: u16, name: &str) -> Option<Vec<u8>> {
     Some(q)
 }
 
+/// Reads a (possibly compressed) name at `i`, lowercase without the final
+/// dot. Pointers are followed a bounded number of times.
+fn read_name(b: &[u8], mut i: usize) -> Option<String> {
+    let mut labels: Vec<String> = Vec::new();
+    for _ in 0..64 {
+        let len = *b.get(i)? as usize;
+        if len == 0 {
+            return Some(labels.join("."));
+        }
+        if len & 0xC0 == 0xC0 {
+            i = ((len & 0x3F) << 8) | *b.get(i + 1)? as usize;
+            continue;
+        }
+        let label = b.get(i + 1..i + 1 + len)?;
+        labels.push(String::from_utf8_lossy(label).to_ascii_lowercase());
+        i += 1 + len;
+    }
+    None
+}
+
 /// Skips a (possibly compressed) name at `i`; the index after it.
 fn skip_name(b: &[u8], mut i: usize) -> Option<usize> {
     loop {
@@ -41,6 +61,12 @@ fn skip_name(b: &[u8], mut i: usize) -> Option<usize> {
 /// joined). None for an answer that isn't one, or a server failure; an
 /// empty list for a name with no TXT record.
 pub fn parse(id: u16, b: &[u8]) -> Option<Vec<String>> {
+    parse_for(id, b, None)
+}
+
+/// As [`parse`], keeping only answers whose owner name is `name` (case
+/// insensitive): a TXT record at another name never counts for this one.
+pub fn parse_for(id: u16, b: &[u8], name: Option<&str>) -> Option<Vec<String>> {
     if b.len() < 12 || u16::from_be_bytes([b[0], b[1]]) != id || b[2] & 0x80 == 0 {
         return None;
     }
@@ -57,16 +83,40 @@ pub fn parse(id: u16, b: &[u8]) -> Option<Vec<String>> {
     for _ in 0..qd {
         i = skip_name(b, i)? + 4;
     }
-    let mut out = vec![];
+    // Every answer record first: (owner, type, data offset, data).
+    let mut records: Vec<(String, u16, usize, &[u8])> = Vec::new();
     for _ in 0..an {
+        let owner = read_name(b, i)?;
         i = skip_name(b, i)?;
         let ty = u16::from_be_bytes([*b.get(i)?, *b.get(i + 1)?]);
         let len = u16::from_be_bytes([*b.get(i + 8)?, *b.get(i + 9)?]) as usize;
         let data = b.get(i + 10..i + 10 + len)?;
+        records.push((owner, ty, i + 10, data));
         i += 10 + len;
-        if ty != 16 {
+    }
+    // The names that answer for the queried one: it, then each CNAME target
+    // in the answer section from it, a few hops at most.
+    let mut names: Vec<String> = Vec::new();
+    if let Some(n) = name {
+        names.push(n.trim_end_matches('.').to_ascii_lowercase());
+        for _ in 0..8 {
+            let last = names.last().cloned().unwrap_or_default();
+            let next = records
+                .iter()
+                .find(|(o, ty, _, _)| *ty == 5 && *o == last)
+                .and_then(|(_, _, at, _)| read_name(b, *at));
+            match next {
+                Some(t) if !names.contains(&t) => names.push(t),
+                _ => break,
+            }
+        }
+    }
+    let mut out = vec![];
+    for (owner, ty, _, data) in &records {
+        if *ty != 16 || (name.is_some() && !names.contains(owner)) {
             continue;
         }
+        let data: &[u8] = data;
         let mut s = String::new();
         let mut j = 0;
         while j < data.len() {
@@ -109,7 +159,7 @@ pub async fn lookup(name: &str) -> Result<Vec<String>, String> {
         sock.send(&q).await.map_err(|e| e.to_string())?;
         let mut buf = vec![0u8; 4096];
         if let Ok(Ok(n)) = tokio::time::timeout(Duration::from_secs(2), sock.recv(&mut buf)).await {
-            if let Some(v) = parse(id, &buf[..n]) {
+            if let Some(v) = parse_for(id, &buf[..n], Some(name)) {
                 return Ok(v);
             }
         }
@@ -192,5 +242,78 @@ mod tests {
             nameserver("# x\nnameserver 169.254.78.1\nnameserver 8.8.8.8"),
             Some("169.254.78.1:53".parse().unwrap())
         );
+    }
+
+    /// An answer to `query(9, asked)` whose one TXT record is owned by
+    /// `owner`, written out in full (no compression).
+    fn answer_owned_by(asked: &str, owner: &str, txt: &str) -> Vec<u8> {
+        let mut b = query(9, asked).unwrap();
+        b[2] = 0x81;
+        b[3] = 0x80;
+        b[7] = 1;
+        for label in owner.split('.') {
+            b.push(label.len() as u8);
+            b.extend_from_slice(label.as_bytes());
+        }
+        b.push(0);
+        b.extend_from_slice(&[0, 16, 0, 1, 0, 0, 0, 60]);
+        b.extend_from_slice(&((txt.len() + 1) as u16).to_be_bytes());
+        b.push(txt.len() as u8);
+        b.extend_from_slice(txt.as_bytes());
+        b
+    }
+
+    #[test]
+    fn an_answer_for_another_name_never_counts() {
+        let asked = "_coderhelm-okta.acme.example";
+        let same = answer_owned_by(asked, "_Coderhelm-Okta.ACME.example", "coderhelm-okta=1");
+        assert_eq!(
+            parse_for(9, &same, Some(asked)).unwrap(),
+            vec!["coderhelm-okta=1"]
+        );
+        let other = answer_owned_by(asked, "_coderhelm-okta.evil.example", "coderhelm-okta=1");
+        assert!(parse_for(9, &other, Some(asked)).unwrap().is_empty());
+        // A compressed owner pointing at the question is the question's name.
+        let a = answer(0, &["v=DMARC1; p=none"]);
+        assert_eq!(
+            parse_for(7, &a, Some("_dmarc.example.com.")).unwrap().len(),
+            1
+        );
+        assert!(parse_for(7, &a, Some("_dmarc.other.com"))
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn a_cname_chain_in_the_answer_is_followed() {
+        // _coderhelm-okta.acme.example CNAME proofs.dns.example, whose TXT counts.
+        let asked = "_coderhelm-okta.acme.example";
+        let mut b = query(9, asked).unwrap();
+        b[2] = 0x81;
+        b[3] = 0x80;
+        b[7] = 3;
+        let name = |b: &mut Vec<u8>, n: &str| {
+            for l in n.split('.') {
+                b.push(l.len() as u8);
+                b.extend_from_slice(l.as_bytes());
+            }
+            b.push(0);
+        };
+        // CNAME: owner = the question (pointer to 12), target written out.
+        b.extend_from_slice(&[0xC0, 12, 0, 5, 0, 1, 0, 0, 0, 60]);
+        let mut target = Vec::new();
+        name(&mut target, "proofs.dns.example");
+        b.extend_from_slice(&(target.len() as u16).to_be_bytes());
+        b.extend_from_slice(&target);
+        // TXT at the target.
+        name(&mut b, "proofs.dns.example");
+        b.extend_from_slice(&[0, 16, 0, 1, 0, 0, 0, 60, 0, 3, 2, b'o', b'k']);
+        // TXT at an unrelated name: never counts.
+        name(&mut b, "other.example");
+        b.extend_from_slice(&[0, 16, 0, 1, 0, 0, 0, 60, 0, 4, 3, b'b', b'a', b'd']);
+        assert_eq!(parse_for(9, &b, Some(asked)).unwrap(), vec!["ok"]);
+        assert!(parse_for(9, &b, Some("_coderhelm-okta.evil.example"))
+            .unwrap()
+            .is_empty());
     }
 }

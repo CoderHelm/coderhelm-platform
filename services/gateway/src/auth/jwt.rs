@@ -83,6 +83,7 @@ pub fn create_session_token(
         custom: None,
         api_key: None,
         held: false,
+        via_okta: false,
     };
     encode(
         &Header::default(),
@@ -199,6 +200,7 @@ pub fn create_scoped_token(
         // carries an API key, which only reaches the public routes.
         api_key: None,
         held: false,
+        via_okta: false,
     };
     encode(
         &Header::default(),

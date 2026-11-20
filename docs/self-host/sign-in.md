@@ -137,7 +137,7 @@ People connect their GitHub account in their own settings, so pull requests and 
 
 ## Microsoft and Okta
 
-People can also sign in with Microsoft (with an Entra app registration of the install's own) and with the organization's Okta (set up by an admin in **Settings, Sign-in rules**). Both follow the rules above: they land on the organization only for someone already in it, invited, or at an allowed domain, and the person's second factor is asked for after them. [Sign in with Microsoft and Okta](./microsoft-okta-sign-in.md) has the setup steps and which email each one trusts.
+People can also sign in with Microsoft (with an Entra app registration of the install's own) and with the organization's Okta (set up by an admin in **Settings, Sign-in rules**). Microsoft follows the rules above: it lands on the organization only for someone already in it, invited, or at an allowed domain. Okta signs in only a member who linked their own Okta account in Settings, Security, never anyone by email, and only the owner can save or turn on the Okta setup. The person's second factor is asked for after both. [Sign in with Microsoft and Okta](./microsoft-okta-sign-in.md) has the setup steps and which email each one trusts.
 
 ## Single sign-on with SAML
 

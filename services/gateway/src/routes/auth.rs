@@ -1701,32 +1701,15 @@ async fn google_callback_inner(
 
 // ── Microsoft and Okta (routes::oidc_signin) ────────────────────────
 
-/// The record a hosted Okta sign-in may land on: the person's active member
-/// record on the Okta's own team. Never an invite (a team admin can invite
-/// any address), never a record on another team.
-pub(crate) fn okta_landing<'a>(
-    records: &'a [HashMap<String, AttributeValue>],
-    team: &str,
-) -> Option<&'a HashMap<String, AttributeValue>> {
-    let g = |i: &'a HashMap<String, AttributeValue>, k: &str| {
-        i.get(k).and_then(|v| v.as_s().ok()).map(String::as_str)
-    };
-    records.iter().find(|i| {
-        g(i, "pk") == Some(team)
-            && g(i, "sk").is_some_and(|s| s.starts_with("USER#"))
-            && g(i, "status") != Some("invited")
-    })
-}
-
 /// The end of a Microsoft or Okta sign-in, once the provider's id_token and
 /// the email in it are checked: the same gates as Google and GitHub.
 ///
 /// - Self-hosted: [`selfhost_landing`] (decide_join: a member, an invite, an
 ///   allowed domain or the first admin), else `?error=not_invited`.
-/// - Hosted, Okta (`team` set): only that team, and only the person's
-///   active member record there (they joined some other way), else
-///   `not_on_team`. A team's Okta never accepts an invite, never makes a
-///   record or a team, and its session is held to that team.
+/// - Okta (`okta` set, both deployments): exactly the member record that
+///   linked this Okta identity (issuer and subject) from a session of its
+///   own (routes::oidc_signin). Never by email, never an invite, never a
+///   new record or team.
 /// - Hosted, Microsoft (`team` unset): as Google. Their invites are
 ///   accepted, they land on a team they joined over their personal team, and
 ///   a first sign-in starts a personal team (open beta limit).
@@ -1737,14 +1720,27 @@ pub(crate) async fn finish_oidc(
     ip: &str,
     provider: Provider,
     person: &super::oidc_signin::Person,
-    team: Option<&str>,
+    okta: Option<&HashMap<String, AttributeValue>>,
 ) -> Result<Response, SignInFailure> {
     let p = provider;
     let via = p.slug();
     let dash = common::public_urls::app_url(&state.config.stage);
-    let email = person.email.as_str();
+    // Okta: the member who linked this Okta identity, by their record's own
+    // email, never the token's.
+    let linked_email = okta
+        .and_then(|r| r.get("email"))
+        .and_then(|v| v.as_s().ok())
+        .cloned()
+        .unwrap_or_default();
+    let email = if okta.is_some() {
+        linked_email.as_str()
+    } else {
+        person.email.as_str()
+    };
 
-    let (team_id, user_id, role, github_login) = if sign_in::applies() {
+    let (team_id, user_id, role, github_login) = if let Some(record) = okta {
+        landing_parts(record)
+    } else if sign_in::applies() {
         let landed = selfhost_landing(state, email, &person.new_user_id, &person.name, "")
             .await
             .map_err(|e| SignInFailure::new(p, Reason::Server, "join", e))?;
@@ -1756,74 +1752,52 @@ pub(crate) async fn finish_oidc(
         let existing = sign_in::records_by_email(state, email)
             .await
             .map_err(|e| SignInFailure::new(p, Reason::Server, "records", e))?;
-        match team {
-            Some(t) => {
-                // Only an active member of the Okta's own team who joined
-                // some other way: never an invite, never a new record.
-                let Some(record) = okta_landing(&existing, t) else {
-                    return Err(SignInFailure::new(
-                        p,
-                        Reason::NotOnTeam,
-                        "member",
-                        "no active member record on the Okta setup's team",
-                    ));
-                };
-                landing_parts(record)
-            }
+        if existing.is_empty() && super::open_signup::allow_new_team(state, ip).await.is_err() {
+            return Ok(Redirect::temporary(&format!("{dash}?error=signup_limit")).into_response());
+        }
+        let existing = super::open_signup::drop_moved_invites(state, existing).await;
+        let accepted = accept_pending_invites(state, &existing, &person.new_user_id, email).await;
+        let pool = landing_records(&existing, accepted);
+        let own_id = person.new_user_id.trim_start_matches("USER#");
+        match select_session_team(&pool, own_id) {
+            Some(item) => landing_parts(item),
             None => {
-                if existing.is_empty()
-                    && super::open_signup::allow_new_team(state, ip).await.is_err()
-                {
-                    return Ok(
-                        Redirect::temporary(&format!("{dash}?error=signup_limit")).into_response()
-                    );
-                }
-                let existing = super::open_signup::drop_moved_invites(state, existing).await;
-                let accepted =
-                    accept_pending_invites(state, &existing, &person.new_user_id, email).await;
-                let pool = landing_records(&existing, accepted);
-                let own_id = person.new_user_id.trim_start_matches("USER#");
-                match select_session_team(&pool, own_id) {
-                    Some(item) => landing_parts(item),
-                    None => {
-                        let tid = format!("TEAM#{}", ulid::Ulid::new().to_string().to_lowercase());
-                        super::open_signup::set_default_limits(state, &tid).await;
-                        let now = chrono::Utc::now().to_rfc3339();
-                        state
-                            .dynamo
-                            .put_item()
-                            .table_name(&state.config.table_name)
-                            .item("pk", attr_s(&tid))
-                            .item("sk", attr_s("META"))
-                            .item("status", attr_s("active"))
-                            .item("created_at", attr_s(&now))
-                            .condition_expression("attribute_not_exists(pk)")
-                            .send()
-                            .await
-                            .map_err(|e| SignInFailure::new(p, Reason::Server, "team", e))?;
-                        state
-                            .dynamo
-                            .put_item()
-                            .table_name(&state.config.users_table_name)
-                            .item("pk", attr_s(&tid))
-                            .item("sk", attr_s(&person.new_user_id))
-                            .item("email", attr_s(email))
-                            .item("avatar_url", attr_s(""))
-                            .item("role", attr_s("owner"))
-                            .item("name", attr_s(&person.name))
-                            .item("updated_at", attr_s(&now))
-                            .item(
-                                "gsi2pk",
-                                attr_s(&format!("EMAIL#{}", normalize_email(email))),
-                            )
-                            .item("gsi2sk", attr_s(&tid))
-                            .send()
-                            .await
-                            .map_err(|e| SignInFailure::new(p, Reason::Server, "member", e))?;
-                        info!(team_id = %tid, provider = via, "Personal team made at first sign-in");
-                        (tid, person.new_user_id.clone(), "owner".to_string(), None)
-                    }
-                }
+                let tid = format!("TEAM#{}", ulid::Ulid::new().to_string().to_lowercase());
+                super::open_signup::set_default_limits(state, &tid).await;
+                let now = chrono::Utc::now().to_rfc3339();
+                state
+                    .dynamo
+                    .put_item()
+                    .table_name(&state.config.table_name)
+                    .item("pk", attr_s(&tid))
+                    .item("sk", attr_s("META"))
+                    .item("status", attr_s("active"))
+                    .item("created_at", attr_s(&now))
+                    .condition_expression("attribute_not_exists(pk)")
+                    .send()
+                    .await
+                    .map_err(|e| SignInFailure::new(p, Reason::Server, "team", e))?;
+                state
+                    .dynamo
+                    .put_item()
+                    .table_name(&state.config.users_table_name)
+                    .item("pk", attr_s(&tid))
+                    .item("sk", attr_s(&person.new_user_id))
+                    .item("email", attr_s(email))
+                    .item("avatar_url", attr_s(""))
+                    .item("role", attr_s("owner"))
+                    .item("name", attr_s(&person.name))
+                    .item("updated_at", attr_s(&now))
+                    .item(
+                        "gsi2pk",
+                        attr_s(&format!("EMAIL#{}", normalize_email(email))),
+                    )
+                    .item("gsi2sk", attr_s(&tid))
+                    .send()
+                    .await
+                    .map_err(|e| SignInFailure::new(p, Reason::Server, "member", e))?;
+                info!(team_id = %tid, provider = via, "Personal team made at first sign-in");
+                (tid, person.new_user_id.clone(), "owner".to_string(), None)
             }
         }
     };

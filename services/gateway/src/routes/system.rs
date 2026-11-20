@@ -723,6 +723,7 @@ mod tests {
             custom: None,
             api_key: None,
             held: false,
+            via_okta: false,
         }
     }
 

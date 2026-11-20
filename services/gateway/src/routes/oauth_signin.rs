@@ -86,6 +86,9 @@ pub enum Reason {
     /// A session a team's Okta signed in tried something person-wide
     /// (linking another sign-in).
     TeamOnly,
+    /// Okta signed in an identity no member has linked yet: they sign in
+    /// another way first and link Okta in their own settings.
+    OktaNotLinked,
 }
 
 impl Reason {
@@ -101,6 +104,7 @@ impl Reason {
             Reason::NoOkta => "okta_not_found",
             Reason::NotOnTeam => "not_on_team",
             Reason::TeamOnly => "okta_team_only",
+            Reason::OktaNotLinked => "okta_not_linked",
         }
     }
 }

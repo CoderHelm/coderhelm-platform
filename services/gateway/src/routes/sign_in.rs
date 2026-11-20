@@ -2229,7 +2229,7 @@ pub async fn check_member_session(state: &AppState, claims: &Claims) -> Result<(
         .table_name(&state.config.users_table_name)
         .key("pk", attr_s(&claims.team_id))
         .key("sk", attr_s(&claims.sub))
-        .projection_expression("pk, #st, #va")
+        .projection_expression("pk, #st, #va, okta_issuer, okta_sub, okta_valid_after")
         .expression_attribute_names("#st", "status")
         .expression_attribute_names("#va", VALID_AFTER)
         .send()
@@ -2241,7 +2241,21 @@ pub async fn check_member_session(state: &AppState, claims: &Claims) -> Result<(
             return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
         }
     };
-    session_state(item.as_ref(), claims.iat).map_err(session_ended)
+    session_state(item.as_ref(), claims.iat).map_err(session_ended)?;
+    // A session Okta signed in lasts only while the member's link and the
+    // team's Okta setup still match it: unlinking, a new issuer, removing
+    // Okta or turning it off end it. The member's other sessions stay.
+    if claims.via_okta {
+        let live = super::oidc_signin::live_setup_of(state, &claims.team_id)
+            .await
+            .map_err(|e| {
+                error!(error = %e, "Okta setup not read; request refused");
+                StatusCode::SERVICE_UNAVAILABLE.into_response()
+            })?;
+        super::oidc_signin::okta_session_state(item.as_ref(), live.as_ref(), claims.iat)
+            .map_err(session_ended)?;
+    }
+    Ok(())
 }
 
 /// Ends every session of a member issued before now. `include_now` also ends
@@ -2715,7 +2729,7 @@ async fn factor_of(state: &AppState, item: &Item) -> Option<String> {
     on.then(|| "cognito".to_string())
 }
 
-async fn team_members(state: &AppState, team_id: &str) -> Result<Vec<Item>, String> {
+pub(crate) async fn team_members(state: &AppState, team_id: &str) -> Result<Vec<Item>, String> {
     let mut items = Vec::new();
     let mut start: Option<Item> = None;
     loop {
@@ -3812,9 +3826,12 @@ mod tests {
         // self-hosted install, then the second factor before any session,
         // and on hosted a team's Okta lands only on that team.
         let oidc = body(auth, "finish_oidc");
-        assert!(before(oidc, "sign_in::applies()", "selfhost_landing"));
         assert!(before(oidc, "selfhost_landing", "Ulid::new"));
-        assert!(before(oidc, "Reason::NotOnTeam", "Ulid::new"));
+        assert!(before(
+            oidc,
+            "if let Some(record) = okta",
+            "selfhost_landing"
+        ));
         assert!(before(oidc, "sign_in::second_step", "create_session_token"));
         let flows = include_str!("oidc_signin.rs");
         assert!(body(flows, "microsoft_callback_inner").contains("finish_oidc("));
