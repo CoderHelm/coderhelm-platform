@@ -724,6 +724,7 @@ mod tests {
             api_key: None,
             held: false,
             via_okta: false,
+            okta_sub: None,
         }
     }
 

@@ -1437,6 +1437,7 @@ pub fn okta_session_state(
     member: Option<&Item>,
     live: Option<&OktaSetup>,
     iat: u64,
+    okta_sub: Option<&str>,
 ) -> Result<(), super::sign_in::Ended> {
     use super::sign_in::Ended;
     let (Some(m), Some(l)) = (member, live) else {
@@ -1447,18 +1448,99 @@ pub fn okta_session_state(
         .and_then(|v| v.as_n().ok())
         .and_then(|n| n.parse::<u64>().ok())
         .unwrap_or(0);
-    if !l.enabled || s(m, "okta_sub").is_empty() || s(m, "okta_issuer") != l.issuer || iat < after {
+    let linked = s(m, "okta_sub");
+    // The session's own Okta subject is the member's linked one: a session
+    // from an account the member re-linked away from ends.
+    if !l.enabled
+        || linked.is_empty()
+        || okta_sub != Some(linked)
+        || s(m, "okta_issuer") != l.issuer
+        || iat < after
+    {
         return Err(Ended::Revoked);
     }
     Ok(())
 }
 
+/// Marks claims made from an MCP connection the way the middleware marks a
+/// session: how it signed in, and the Okta subject.
+pub fn mark_okta(mut claims: Claims, via: Option<&str>, okta_sub: Option<String>) -> Claims {
+    claims.via_okta = signed_in_with_okta(via);
+    claims.held = is_held(via, super::setup_checks::self_hosted());
+    claims.okta_sub = okta_sub;
+    claims
+}
+
 /// The row that makes an Okta identity linkable once per team (settings
-/// table, `pk = OKTA_LINK#<team>#<issuer>#<sub>`, `sk = LINK`).
-pub fn link_row_key(team: &str, issuer: &str, sub: &str) -> String {
+/// table, `pk = OKTA_LINK#<team>`, `sk = <issuer>#<sub>`): one partition per
+/// team, so removing Okta deletes every row of the team directly.
+pub fn link_row(team: &str, issuer: &str, sub: &str) -> (String, String) {
+    (link_rows_pk(team), format!("{issuer}#{sub}"))
+}
+
+pub fn link_rows_pk(team: &str) -> String {
+    format!("OKTA_LINK#{team}")
+}
+
+/// The first release's row key (`pk = OKTA_LINK#<team>#<issuer>#<sub>`,
+/// `sk = LINK`), still deleted wherever a link goes.
+pub fn legacy_link_row_key(team: &str, issuer: &str, sub: &str) -> String {
     format!("OKTA_LINK#{team}#{issuer}#{sub}")
 }
-const LINK_ROW_SK: &str = "LINK";
+const LEGACY_LINK_ROW_SK: &str = "LINK";
+
+/// Deletes one link's rows (this layout and the first release's).
+pub async fn delete_link_row(state: &AppState, team: &str, issuer: &str, sub: &str) {
+    if issuer.is_empty() || sub.is_empty() {
+        return;
+    }
+    let (pk, sk) = link_row(team, issuer, sub);
+    let _ = delete_setup(state, &pk, &sk).await;
+    let _ = delete_setup(
+        state,
+        &legacy_link_row_key(team, issuer, sub),
+        LEGACY_LINK_ROW_SK,
+    )
+    .await;
+}
+
+/// Deletes every link row of `team` directly, whether or not its member is
+/// still on the team.
+async fn delete_team_link_rows(state: &AppState, team: &str) -> Result<usize, String> {
+    let mut n = 0;
+    let mut start: Option<Item> = None;
+    loop {
+        let out = state
+            .dynamo
+            .query()
+            .table_name(&state.config.settings_table_name)
+            .key_condition_expression("pk = :pk")
+            .expression_attribute_values(":pk", attr_s(&link_rows_pk(team)))
+            .set_exclusive_start_key(start)
+            .send()
+            .await
+            .map_err(|e| format!("{e}"))?;
+        for i in out.items() {
+            delete_setup(state, s(i, "pk"), s(i, "sk")).await?;
+            n += 1;
+        }
+        match out.last_evaluated_key() {
+            Some(k) if !k.is_empty() => start = Some(k.clone()),
+            _ => break,
+        }
+    }
+    Ok(n)
+}
+
+/// The member update a link makes. Re-linking to another Okta account
+/// (a previous link existed) also ends the old account's Okta sessions.
+pub fn link_update_expression(had_previous: bool) -> &'static str {
+    if had_previous {
+        "SET okta_issuer = :i, okta_sub = :s, okta_linked_at = :t, okta_valid_after = :n"
+    } else {
+        "SET okta_issuer = :i, okta_sub = :s, okta_linked_at = :t"
+    }
+}
 
 fn now_secs() -> u64 {
     chrono::Utc::now().timestamp().max(0) as u64
@@ -1468,9 +1550,7 @@ fn now_secs() -> u64 {
 /// sessions (`okta_valid_after`). Their other sessions are untouched.
 async fn unlink_member(state: &AppState, team: &str, member: &Item) -> Result<(), String> {
     let (issuer, sub) = (s(member, "okta_issuer"), s(member, "okta_sub"));
-    if !issuer.is_empty() && !sub.is_empty() {
-        let _ = delete_setup(state, &link_row_key(team, issuer, sub), LINK_ROW_SK).await;
-    }
+    delete_link_row(state, team, issuer, sub).await;
     state
         .dynamo
         .update_item()
@@ -1809,7 +1889,10 @@ async fn okta_link_return(
 
 /// The link written in one transaction: the uniqueness row (only if no
 /// member holds this identity yet) and the member's own record (an active
-/// member), and the member's previous row removed.
+/// The link written in one transaction: the uniqueness row (only if no
+/// member holds this identity yet) and the member's own record (an active
+/// member). A re-link removes the member's previous row and ends the
+/// previous account's Okta sessions (`okta_valid_after`).
 async fn link_transaction(
     state: &AppState,
     team: &str,
@@ -1820,13 +1903,31 @@ async fn link_transaction(
 ) -> Result<(), String> {
     use aws_sdk_dynamodb::types::{Delete, Put, TransactWriteItem, Update};
     let e = |e: aws_sdk_dynamodb::error::BuildError| e.to_string();
+    let (row_pk, row_sk) = link_row(team, issuer, sub);
+    let mut update = Update::builder()
+        .table_name(&state.config.users_table_name)
+        .key("pk", attr_s(team))
+        .key("sk", attr_s(member))
+        .update_expression(link_update_expression(previous.is_some()))
+        .condition_expression("attribute_exists(pk) AND (attribute_not_exists(#st) OR #st <> :inv)")
+        .expression_attribute_names("#st", "status")
+        .expression_attribute_values(":i", attr_s(issuer))
+        .expression_attribute_values(":s", attr_s(sub))
+        .expression_attribute_values(":t", attr_s(&chrono::Utc::now().to_rfc3339()))
+        .expression_attribute_values(":inv", attr_s("invited"));
+    if previous.is_some() {
+        update = update.expression_attribute_values(
+            ":n",
+            aws_sdk_dynamodb::types::AttributeValue::N(now_secs().to_string()),
+        );
+    }
     let mut items = vec![
         TransactWriteItem::builder()
             .put(
                 Put::builder()
                     .table_name(&state.config.settings_table_name)
-                    .item("pk", attr_s(&link_row_key(team, issuer, sub)))
-                    .item("sk", attr_s(LINK_ROW_SK))
+                    .item("pk", attr_s(&row_pk))
+                    .item("sk", attr_s(&row_sk))
                     .item("member", attr_s(member))
                     .condition_expression("attribute_not_exists(pk)")
                     .build()
@@ -1834,33 +1935,18 @@ async fn link_transaction(
             )
             .build(),
         TransactWriteItem::builder()
-            .update(
-                Update::builder()
-                    .table_name(&state.config.users_table_name)
-                    .key("pk", attr_s(team))
-                    .key("sk", attr_s(member))
-                    .update_expression("SET okta_issuer = :i, okta_sub = :s, okta_linked_at = :t")
-                    .condition_expression(
-                        "attribute_exists(pk) AND (attribute_not_exists(#st) OR #st <> :inv)",
-                    )
-                    .expression_attribute_names("#st", "status")
-                    .expression_attribute_values(":i", attr_s(issuer))
-                    .expression_attribute_values(":s", attr_s(sub))
-                    .expression_attribute_values(":t", attr_s(&chrono::Utc::now().to_rfc3339()))
-                    .expression_attribute_values(":inv", attr_s("invited"))
-                    .build()
-                    .map_err(e)?,
-            )
+            .update(update.build().map_err(e)?)
             .build(),
     ];
-    if let Some((pi, ps)) = previous {
+    if let Some((pi, ps)) = &previous {
+        let (ppk, psk) = link_row(team, pi, ps);
         items.push(
             TransactWriteItem::builder()
                 .delete(
                     Delete::builder()
                         .table_name(&state.config.settings_table_name)
-                        .key("pk", attr_s(&link_row_key(team, &pi, &ps)))
-                        .key("sk", attr_s(LINK_ROW_SK))
+                        .key("pk", attr_s(&ppk))
+                        .key("sk", attr_s(&psk))
                         .build()
                         .map_err(e)?,
                 )
@@ -1874,7 +1960,17 @@ async fn link_transaction(
         .send()
         .await
         .map(|_| ())
-        .map_err(|e| format!("{e:?}"))
+        .map_err(|e| format!("{e:?}"))?;
+    if let Some((pi, ps)) = &previous {
+        // A first-release row of the previous link, if there is one.
+        let _ = delete_setup(
+            state,
+            &legacy_link_row_key(team, pi, ps),
+            LEGACY_LINK_ROW_SK,
+        )
+        .await;
+    }
+    Ok(())
 }
 
 /// Every member's Okta link on `team`, dropped (the issuer changed, or Okta
@@ -1886,6 +1982,8 @@ async fn drop_links(state: &AppState, team: &str) -> Result<usize, String> {
         unlink_member(state, team, m).await?;
         n += 1;
     }
+    // Rows of members no longer on the team go too.
+    delete_team_link_rows(state, team).await?;
     Ok(n)
 }
 
@@ -3315,6 +3413,7 @@ mod tests {
             api_key: None,
             held: false,
             via_okta: false,
+            okta_sub: None,
         };
         assert!(crate::routes::api::is_platform_admin(&c));
         c.held = true;
@@ -3503,6 +3602,7 @@ mod tests {
             api_key: None,
             held: false,
             via_okta: false,
+            okta_sub: None,
         };
         assert!(ticket_is_theirs(&t, Some(&c)));
         assert!(!ticket_is_theirs(&t, None));
@@ -3592,6 +3692,7 @@ mod tests {
             api_key: None,
             held: false,
             via_okta: false,
+            okta_sub: None,
         }
     }
 
@@ -3792,17 +3893,23 @@ mod tests {
             "00uANN",
             "active",
         );
-        assert!(okta_session_state(Some(&m), Some(&live(iss, true)), 100).is_ok());
+        assert!(okta_session_state(Some(&m), Some(&live(iss, true)), 100, Some("00uANN")).is_ok());
         assert!(
-            okta_session_state(Some(&m), Some(&live(iss, false)), 100).is_err(),
+            okta_session_state(Some(&m), Some(&live(iss, false)), 100, Some("00uANN")).is_err(),
             "Okta off"
         );
         assert!(
-            okta_session_state(Some(&m), Some(&live("https://new.okta.com", true)), 100).is_err(),
+            okta_session_state(
+                Some(&m),
+                Some(&live("https://new.okta.com", true)),
+                100,
+                Some("00uANN")
+            )
+            .is_err(),
             "issuer changed"
         );
         assert!(
-            okta_session_state(Some(&m), None, 100).is_err(),
+            okta_session_state(Some(&m), None, 100, Some("00uANN")).is_err(),
             "Okta removed"
         );
         m.insert(
@@ -3810,13 +3917,14 @@ mod tests {
             aws_sdk_dynamodb::types::AttributeValue::N("200".into()),
         );
         assert!(
-            okta_session_state(Some(&m), Some(&live(iss, true)), 100).is_err(),
+            okta_session_state(Some(&m), Some(&live(iss, true)), 100, Some("00uANN")).is_err(),
             "relinked or ended since"
         );
-        assert!(okta_session_state(Some(&m), Some(&live(iss, true)), 300).is_ok());
+        assert!(okta_session_state(Some(&m), Some(&live(iss, true)), 300, Some("00uANN")).is_ok());
         let unlinked = linked("TEAM#o", "USER#ann", "ann@acme.example", "", "", "active");
         assert!(
-            okta_session_state(Some(&unlinked), Some(&live(iss, true)), 300).is_err(),
+            okta_session_state(Some(&unlinked), Some(&live(iss, true)), 300, Some("00uANN"))
+                .is_err(),
             "unlinked"
         );
         // Only Okta sessions are checked against the link.
@@ -3881,13 +3989,16 @@ mod tests {
     #[test]
     fn an_okta_identity_is_linked_once_per_team() {
         assert_eq!(
-            link_row_key("TEAM#o", "https://acme.okta.com", "00u1"),
-            "OKTA_LINK#TEAM#o#https://acme.okta.com#00u1"
+            link_row("TEAM#o", "https://acme.okta.com", "00u1"),
+            (
+                "OKTA_LINK#TEAM#o".to_string(),
+                "https://acme.okta.com#00u1".to_string()
+            )
         );
         let tx = body_src("async fn link_transaction(");
         assert!(tx.contains("transact_write_items()"));
         assert!(tx.contains("attribute_not_exists(pk)"));
-        assert!(body_src("async fn unlink_member(").contains("link_row_key("));
+        assert!(body_src("async fn unlink_member(").contains("delete_link_row("));
         assert!(body_src("async fn okta_link_return(").contains("link_transaction("));
     }
 
@@ -3951,5 +4062,105 @@ mod tests {
     fn session_checks_and_no_email_factor_setup() {
         assert!(body_src("async fn session_of(").contains("check_member_session("));
         assert!(body_src("pub async fn held_refusal(").contains("claims.email.contains('@')"));
+    }
+
+    // ── Final review ────────────────────────────────────────────────
+
+    /// 1: re-linking to another Okta account ends the old account's
+    /// sessions: by the subject each session carries, and by
+    /// `okta_valid_after` on the re-link itself.
+    #[test]
+    fn relinking_ends_the_previous_accounts_sessions() {
+        let iss = "https://acme.okta.com";
+        // The member re-linked from 00uOLD to 00uNEW.
+        let m = linked(
+            "TEAM#o",
+            "USER#ann",
+            "ann@acme.example",
+            iss,
+            "00uNEW",
+            "active",
+        );
+        let on = live(iss, true);
+        assert!(okta_session_state(Some(&m), Some(&on), 100, Some("00uNEW")).is_ok());
+        assert!(
+            okta_session_state(Some(&m), Some(&on), 100, Some("00uOLD")).is_err(),
+            "old account"
+        );
+        assert!(
+            okta_session_state(Some(&m), Some(&on), 100, None).is_err(),
+            "no subject"
+        );
+        // The re-link path: a previous link means the update also sets okta_valid_after.
+        assert!(link_update_expression(true).contains("okta_valid_after = :n"));
+        assert!(!link_update_expression(false).contains("okta_valid_after"));
+        let tx = body_src("async fn link_transaction(");
+        assert!(tx.contains("link_update_expression(previous.is_some())"));
+        assert!(tx.contains("if previous.is_some()"));
+        let ret = body_src("async fn okta_link_return(");
+        assert!(ret.contains(
+            "link_transaction(state, &flow.team, &flow.link, &live.issuer, sub, previous)"
+        ));
+        // The session token carries the subject, and the check reads it.
+        let proof =
+            crate::auth::jwt::SignInProof::new(false, "okta").with_okta_sub(Some("00uNEW".into()));
+        let t = crate::auth::jwt::create_session_token(
+            "USER#ann",
+            "TEAM#o",
+            "ann@acme.example",
+            "member",
+            None,
+            &proof,
+            "k",
+            600,
+        )
+        .unwrap();
+        assert_eq!(
+            crate::auth::jwt::read_proof(&t, "k").okta_sub.as_deref(),
+            Some("00uNEW")
+        );
+        let si = include_str!("sign_in.rs");
+        assert!(si.contains("claims.okta_sub.as_deref()"));
+        let auth = include_str!("auth.rs");
+        let fin = &auth[auth.find("pub(crate) async fn finish_oidc(").unwrap()..];
+        let fin = &fin[..fin.find("\n}\n").unwrap()];
+        assert!(fin.contains("with_okta_sub(okta_sub.clone())"));
+        assert!(fin.contains("okta_sub: okta_sub.clone()"));
+    }
+
+    /// 2: link rows go with their member and with the team's Okta.
+    #[test]
+    fn link_rows_do_not_outlive_their_member() {
+        let users = include_str!("users.rs");
+        let rm = &users[users.find("pub async fn remove_user(").unwrap()..];
+        let rm = &rm[..rm.find("\n}\n").unwrap()];
+        assert!(rm.contains("oidc_signin::delete_link_row("));
+        // drop_links (used by okta_delete and an issuer change) deletes the
+        // team's rows directly, members or not.
+        assert!(body_src("async fn drop_links(").contains("delete_team_link_rows("));
+        assert!(body_src("pub async fn okta_delete(").contains("drop_links("));
+        assert_eq!(link_rows_pk("TEAM#o"), link_row("TEAM#o", "i", "s").0);
+        assert_eq!(
+            legacy_link_row_key("TEAM#o", "i", "s"),
+            "OKTA_LINK#TEAM#o#i#s"
+        );
+    }
+
+    /// Self-hosted: an Okta landing still goes through the join rules, and
+    /// only onto the linked member's own record.
+    #[test]
+    fn self_hosted_okta_passes_the_join_rules() {
+        use crate::routes::auth::okta_landing_matches;
+        let r = linked("TEAM#org", "USER#ann", "ann@acme.example", "", "", "active");
+        assert!(okta_landing_matches(Some(&r), "TEAM#org", "USER#ann"));
+        assert!(!okta_landing_matches(Some(&r), "TEAM#org", "USER#bo"));
+        assert!(!okta_landing_matches(None, "TEAM#org", "USER#ann"));
+        let auth = include_str!("auth.rs");
+        let fin = &auth[auth.find("pub(crate) async fn finish_oidc(").unwrap()..];
+        let okta_branch = &fin[fin.find("if let Some(record) = okta").unwrap()..];
+        assert!(
+            okta_branch.find("selfhost_landing(").unwrap()
+                < okta_branch.find("} else if sign_in::applies()").unwrap()
+        );
     }
 }

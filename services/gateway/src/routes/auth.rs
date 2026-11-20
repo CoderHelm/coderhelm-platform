@@ -1563,6 +1563,7 @@ async fn google_callback_inner(
             github_login: github_login.clone(),
             via: "google".into(),
             jti: String::new(),
+            okta_sub: None,
             aud: String::new(),
             iat: 0,
             exp: 0,
@@ -1675,6 +1676,7 @@ async fn google_callback_inner(
         github_login: None,
         via: "google".into(),
         jti: String::new(),
+        okta_sub: None,
         aud: String::new(),
         iat: 0,
         exp: 0,
@@ -1700,6 +1702,19 @@ async fn google_callback_inner(
 }
 
 // ── Microsoft and Okta (routes::oidc_signin) ────────────────────────
+
+/// Whether the join rules landed a self-hosted Okta sign-in on exactly the
+/// linked member's record.
+pub(crate) fn okta_landing_matches(
+    landed: Option<&HashMap<String, AttributeValue>>,
+    team: &str,
+    user: &str,
+) -> bool {
+    landed.is_some_and(|r| {
+        let (t, u, _, _) = landing_parts(r);
+        t == team && u == user
+    })
+}
 
 /// The end of a Microsoft or Okta sign-in, once the provider's id_token and
 /// the email in it are checked: the same gates as Google and GitHub.
@@ -1738,7 +1753,22 @@ pub(crate) async fn finish_oidc(
         person.email.as_str()
     };
 
+    let okta_sub = okta
+        .and_then(|r| r.get("okta_sub"))
+        .and_then(|v| v.as_s().ok())
+        .cloned();
     let (team_id, user_id, role, github_login) = if let Some(record) = okta {
+        if sign_in::applies() {
+            // Self-hosted: the linked member still passes the organization's
+            // join rules, and lands on exactly their own record.
+            let (rec_team, rec_user, _, _) = landing_parts(record);
+            let landed = selfhost_landing(state, email, &rec_user, &person.name, "")
+                .await
+                .map_err(|e| SignInFailure::new(p, Reason::Server, "join", e))?;
+            if !okta_landing_matches(landed.as_ref(), &rec_team, &rec_user) {
+                return Ok(Redirect::temporary(&not_invited_url(dash)).into_response());
+            }
+        }
         landing_parts(record)
     } else if sign_in::applies() {
         let landed = selfhost_landing(state, email, &person.new_user_id, &person.name, "")
@@ -1810,6 +1840,7 @@ pub(crate) async fn finish_oidc(
         github_login: github_login.clone(),
         via: via.into(),
         jti: String::new(),
+        okta_sub: okta_sub.clone(),
         aud: String::new(),
         iat: 0,
         exp: 0,
@@ -1832,7 +1863,7 @@ pub(crate) async fn finish_oidc(
         email,
         &role,
         github_login.as_deref(),
-        &SignInProof::new(false, via),
+        &SignInProof::new(false, via).with_okta_sub(okta_sub.clone()),
         &state.secrets.jwt_secret,
         SESSION_TTL_SECS,
     )
@@ -2724,6 +2755,7 @@ pub(crate) async fn github_sign_in_with_token(
         github_login: Some(github_login.to_string()),
         via: "github".into(),
         jti: String::new(),
+        okta_sub: None,
         aud: String::new(),
         iat: 0,
         exp: 0,
@@ -3221,6 +3253,7 @@ async fn issue_session_from_cognito(
             github_login: github_login.clone(),
             via: "password".into(),
             jti: String::new(),
+            okta_sub: None,
             aud: String::new(),
             iat: 0,
             exp: 0,
@@ -3359,6 +3392,7 @@ async fn issue_session_from_cognito(
         github_login: github_login.clone(),
         via: "password".into(),
         jti: String::new(),
+        okta_sub: None,
         aud: String::new(),
         iat: 0,
         exp: 0,

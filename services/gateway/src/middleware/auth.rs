@@ -60,7 +60,9 @@ pub async fn require_auth(
     claims.support_view = None;
     // A team's Okta vouches for that team only (routes::oidc_signin): set
     // before anything (the support view included) asks who this is.
-    let signed_in_via = jwt::read_proof(token, &state.secrets.jwt_secret).via;
+    let signed_in = jwt::read_proof(token, &state.secrets.jwt_secret);
+    let signed_in_via = signed_in.via.clone();
+    claims.okta_sub = signed_in.okta_sub.clone();
     claims.via_okta = crate::routes::oidc_signin::signed_in_with_okta(signed_in_via.as_deref());
     claims.held = crate::routes::oidc_signin::is_held(
         signed_in_via.as_deref(),
@@ -218,6 +220,7 @@ async fn app_request(
     claims.support_view = None;
     claims.api_key = None;
     claims.via_okta = crate::routes::oidc_signin::signed_in_with_okta(caller.grant.via.as_deref());
+    claims.okta_sub = caller.grant.okta_sub.clone();
     claims.held = crate::routes::oidc_signin::is_held(
         caller.grant.via.as_deref(),
         crate::routes::setup_checks::self_hosted(),
@@ -228,6 +231,7 @@ async fn app_request(
     let proof = jwt::SignInProof {
         mfa: caller.grant.mfa,
         via: caller.grant.via.clone(),
+        okta_sub: caller.grant.okta_sub.clone(),
     };
     if let Err(held) = sign_in::check_session(state, &claims.team_id, &proof, handler).await {
         return held;
@@ -328,6 +332,7 @@ async fn api_key_request(
         api_key: None,
         held: false,
         via_okta: false,
+        okta_sub: None,
     };
     let maker_holder = roles::holder_for(state, &maker_claims).await;
     let holder = api_keys::key_holder(&key, &maker_holder);
@@ -370,6 +375,7 @@ async fn api_key_request(
         custom: Some(holder),
         held: false,
         via_okta: false,
+        okta_sub: None,
     };
     req.extensions_mut().insert(claims);
     let response = next.run(req).await;

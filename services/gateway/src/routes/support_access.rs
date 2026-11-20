@@ -432,6 +432,7 @@ pub fn view_claims(sv: &SupportView) -> Claims {
         api_key: None,
         held: false,
         via_okta: false,
+        okta_sub: None,
     }
 }
 

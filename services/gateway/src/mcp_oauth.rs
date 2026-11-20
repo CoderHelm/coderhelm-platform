@@ -757,6 +757,8 @@ pub struct Consent {
     /// The session passed a second factor.
     pub mfa: bool,
     pub via: Option<String>,
+    /// An Okta session's Okta subject (the connection ends with its link).
+    pub okta_sub: Option<String>,
     /// The person let the app start runs and ask for reviews.
     pub allow_write: bool,
     /// The person let the app search the knowledge bases they can read.
@@ -781,6 +783,8 @@ pub struct StoredCode {
     pub mfa: bool,
     #[serde(default)]
     pub via: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub okta_sub: Option<String>,
     /// Seconds since the epoch.
     pub expires_at: i64,
 }
@@ -885,6 +889,7 @@ pub fn approve(
         email: who.email.clone(),
         mfa: who.mfa,
         via: who.via.clone(),
+        okta_sub: who.okta_sub.clone(),
         expires_at: now.timestamp() + CODE_TTL_SECS,
     };
     (code, stored)
@@ -912,6 +917,8 @@ pub struct StoredGrant {
     pub mfa: bool,
     #[serde(default)]
     pub via: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub okta_sub: Option<String>,
     #[serde(default)]
     pub refresh_hash: String,
     #[serde(default)]
@@ -1198,6 +1205,7 @@ async fn swap_code(
         created_at_secs: now.timestamp().max(0) as u64,
         mfa: c.mfa,
         via: c.via,
+        okta_sub: c.okta_sub,
         refresh_hash: hash(&refresh_token),
         prev_refresh_hash: None,
         refresh_expires_at: refresh_expiry(now),
@@ -1857,6 +1865,7 @@ pub(crate) mod tests {
             email: "ann@example.org".into(),
             mfa: false,
             via: Some("password".into()),
+            okta_sub: None,
             allow_write: write,
             allow_knowledge: false,
             lookups: BTreeSet::new(),

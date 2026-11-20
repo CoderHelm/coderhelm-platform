@@ -1411,6 +1411,14 @@ pub async fn remove_user(
         .send()
         .await
         .map_err(|e| internal("Failed to remove user", e))?;
+    // Their Okta identity is free to link again.
+    super::oidc_signin::delete_link_row(
+        &state,
+        &claims.team_id,
+        s(target, "okta_issuer"),
+        s(target, "okta_sub"),
+    )
+    .await;
 
     info!(user_id = %sk, team_id = %claims.team_id, "User removed");
 
@@ -2308,6 +2316,7 @@ mod tests {
             api_key: None,
             held: false,
             via_okta: false,
+            okta_sub: None,
         }
     }
 

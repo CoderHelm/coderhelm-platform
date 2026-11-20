@@ -285,6 +285,11 @@ pub struct Claims {
     /// link or the team's Okta setup no longer matches.
     #[serde(skip)]
     pub via_okta: bool,
+    /// Set by the auth middleware, never read from or written to a token:
+    /// the Okta subject a `via_okta` session signed in as (from its proof).
+    /// It must still be the member's linked subject.
+    #[serde(skip)]
+    pub okta_sub: Option<String>,
 }
 
 /// The API key a request was made with.
@@ -489,6 +494,7 @@ mod tests {
             api_key: None,
             held: false,
             via_okta: false,
+            okta_sub: None,
         };
         let json = serde_json::to_string(&c).unwrap();
         let parsed: Claims = serde_json::from_str(&json).unwrap();
