@@ -1,6 +1,6 @@
 ---
 title: Sign-in and people
-description: One organization per install, how people join (an admin's invite), required two-factor sign-in, GitHub accounts, install admins and team roles.
+description: One organization per install, how people join (an admin's invite), required two-factor sign-in, GitHub, Microsoft and Okta sign-in, install admins and team roles.
 order: 6.5
 ---
 
@@ -135,9 +135,13 @@ An install that had Google sign-in on loses it at its next update, which removes
 
 People connect their GitHub account in their own settings, so pull requests and reviews are credited to them. Signing in with GitHub follows the same rules as everything else: it lands on the organization only for someone already in it, invited, or at an allowed domain (by the email on their GitHub account). It uses the GitHub App's own OAuth client, which the GitHub App step stores; nothing to set up. An install on CoderHelm's GitHub App (hybrid) has no client of its own: once it is registered with CoderHelm, GitHub sign-in goes through CoderHelm's app, and the install still checks the account with GitHub itself and applies these same rules and two-factor ([Sign in with GitHub through CoderHelm](./hybrid.md#sign-in-with-github-through-coderhelm)). The sign-in page offers **Continue with GitHub** only when one of the two works (it asks the API, `GET /auth/methods`). The `github_sign_in` check in **Settings, Setup** says which applies.
 
-## Single sign-on (SAML, OIDC)
+## Microsoft and Okta
 
-Not available yet: CoderHelm's sign-in page offers email and password, and GitHub. The Cognito user pool is in your account, so an identity provider added there by hand is not shown on the sign-in page and isn't supported.
+People can also sign in with Microsoft (with an Entra app registration of the install's own) and with the organization's Okta (set up by an admin in **Settings, Sign-in rules**). Microsoft follows the rules above: it lands on the organization only for someone already in it, invited, or at an allowed domain. Okta signs in only a member who linked their own Okta account in Settings, Security, never anyone by email, and only the owner can save or turn on the Okta setup. The person's second factor is asked for after both. [Sign in with Microsoft and Okta](./microsoft-okta-sign-in.md) has the setup steps and which email each one trusts.
+
+## Single sign-on with SAML
+
+Not available: CoderHelm signs people in with OpenID Connect (Microsoft and Okta, above), not SAML. The Cognito user pool is in your account, but an identity provider added there by hand is not shown on the sign-in page and isn't supported.
 
 ## Install admins and team roles
 

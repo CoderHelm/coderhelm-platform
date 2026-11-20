@@ -442,7 +442,7 @@ pub const CAPABILITIES: &[Capability] = &[
     },
     Capability {
         key: "sign_in",
-        label: "Require two-factor sign-in for the team, see who has it, reset a person's two-factor sign-in, and on a self-hosted install change who may join (allowed email domains)",
+        label: "Require two-factor sign-in for the team, see who has it, reset a person's two-factor sign-in, set up Okta sign-in, and on a self-hosted install change who may join (allowed email domains)",
 
         short_label: "Set sign-in rules",
         min_role: "admin",
@@ -452,6 +452,14 @@ pub const CAPABILITIES: &[Capability] = &[
             "sign_in::get_settings",
             "sign_in::update_settings",
             "sign_in::reset_two_factor",
+            "oidc_signin::okta_get",
+            "oidc_signin::okta_test",
+            "oidc_signin::okta_save",
+            "oidc_signin::okta_toggle",
+            "oidc_signin::okta_delete",
+            "oidc_signin::okta_discard_draft",
+            "oidc_signin::okta_verify_domains",
+            "oidc_signin::okta_release_domain",
         ],
     },
     Capability {

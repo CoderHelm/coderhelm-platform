@@ -219,6 +219,10 @@ pub async fn me(
         "github"
     } else if claims.sub.starts_with("USER#Google_") {
         "google"
+    } else if claims.sub.starts_with("USER#microsoft_") {
+        "microsoft"
+    } else if claims.sub.starts_with("USER#okta_") {
+        "okta"
     } else {
         "email"
     };
@@ -281,6 +285,16 @@ pub async fn list_teams(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
 ) -> Result<Json<Value>, StatusCode> {
+    // A hosted session from a team's Okta speaks for that team only: it
+    // lists no other team and accepts no invite to one.
+    if super::oidc_signin::team_only(&claims) {
+        return Ok(Json(json!({ "teams": [{
+            "team_id": claims.team_id,
+            "org": claims.email,
+            "status": "active",
+            "current": true,
+        }] })));
+    }
     let github_id = claims
         .sub
         .strip_prefix("USER#")
@@ -445,6 +459,11 @@ pub async fn switch_team(
     Json(body): Json<Value>,
 ) -> Result<axum::response::Response, StatusCode> {
     let target_team = body["team_id"].as_str().ok_or(StatusCode::BAD_REQUEST)?;
+    // A hosted session from a team's Okta never moves to another team: that
+    // Okta organization vouches for its own team only.
+    if target_team != claims.team_id && super::oidc_signin::team_only(&claims) {
+        return Err(StatusCode::FORBIDDEN);
+    }
 
     // Verify user exists in target team and get their role there
     let target_item = state
@@ -535,7 +554,11 @@ pub(crate) fn is_platform_admin(claims: &Claims) -> bool {
         .unwrap_or_else(|_| common::public_urls::default_platform_admins().to_string());
     // A support-view session is the team's read-only view, never the admin's
     // own powers: the admin routes refuse it.
+    // A team's Okta can assert any email it likes: never a platform admin.
     claims.support_view.is_none()
+        && !claims.held
+        && !claims.via_okta
+        && !claims.sub.starts_with("USER#okta_")
         && verified_identity(&claims.sub)
         && platform_admin_listed(&admins, &claims.email)
 }

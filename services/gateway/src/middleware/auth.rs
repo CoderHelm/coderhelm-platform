@@ -58,6 +58,14 @@ pub async fn require_auth(
         .map_err(|_| StatusCode::UNAUTHORIZED)?;
     // Only a support-view token carries a support view; a session never does.
     claims.support_view = None;
+    // A team's Okta vouches for that team only (routes::oidc_signin): set
+    // before anything (the support view included) asks who this is.
+    let signed_in_via = jwt::read_proof(token, &state.secrets.jwt_secret).via;
+    claims.via_okta = crate::routes::oidc_signin::signed_in_with_okta(signed_in_via.as_deref());
+    claims.held = crate::routes::oidc_signin::is_held(
+        signed_in_via.as_deref(),
+        crate::routes::setup_checks::self_hosted(),
+    );
 
     // A support view: the platform admin's own session plus a support-view
     // cookie. Enforced here for every route: reads only, every request
@@ -136,6 +144,10 @@ pub async fn require_auth(
     if let Err(held) = sign_in::check_session(&state, &claims.team_id, &proof, handler).await {
         return Ok(held);
     }
+    if let Some(refused) = crate::routes::oidc_signin::held_refusal(&state, &claims, handler).await
+    {
+        return Ok(refused);
+    }
 
     let holder = roles::holder_for(&state, &claims).await;
     match permissions::resolve_access(&holder, handler) {
@@ -205,6 +217,11 @@ async fn app_request(
     let mut claims = caller.claims.clone();
     claims.support_view = None;
     claims.api_key = None;
+    claims.via_okta = crate::routes::oidc_signin::signed_in_with_okta(caller.grant.via.as_deref());
+    claims.held = crate::routes::oidc_signin::is_held(
+        caller.grant.via.as_deref(),
+        crate::routes::setup_checks::self_hosted(),
+    );
     if let Err(ended) = sign_in::check_member_session(state, &claims).await {
         return ended;
     }
@@ -214,6 +231,9 @@ async fn app_request(
     };
     if let Err(held) = sign_in::check_session(state, &claims.team_id, &proof, handler).await {
         return held;
+    }
+    if let Some(refused) = crate::routes::oidc_signin::held_refusal(state, &claims, handler).await {
+        return refused;
     }
     let holder = roles::holder_for(state, &claims).await;
     match mcp_server::decide(&caller.scopes, caller.tool_handlers, &holder, handler) {
@@ -306,6 +326,8 @@ async fn api_key_request(
         support_view: None,
         custom: None,
         api_key: None,
+        held: false,
+        via_okta: false,
     };
     let maker_holder = roles::holder_for(state, &maker_claims).await;
     let holder = api_keys::key_holder(&key, &maker_holder);
@@ -346,6 +368,8 @@ async fn api_key_request(
             created_by: key.created_by_name.clone(),
         }),
         custom: Some(holder),
+        held: false,
+        via_okta: false,
     };
     req.extensions_mut().insert(claims);
     let response = next.run(req).await;

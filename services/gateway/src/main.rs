@@ -868,6 +868,32 @@ fn build_app(state: Arc<AppState>) -> Router {
             post(routes::sign_in::reset_two_factor),
         )
         .route(
+            "/sign-in/okta",
+            get(routes::oidc_signin::okta_get)
+                .put(routes::oidc_signin::okta_toggle)
+                .delete(routes::oidc_signin::okta_delete),
+        )
+        .route("/sign-in/okta/test", post(routes::oidc_signin::okta_test))
+        .route("/sign-in/okta/save", post(routes::oidc_signin::okta_save))
+        .route(
+            "/sign-in/okta/domains/verify",
+            post(routes::oidc_signin::okta_verify_domains),
+        )
+        .route(
+            "/sign-in/okta/domains/:domain",
+            delete(routes::oidc_signin::okta_release_domain),
+        )
+        .route(
+            "/users/okta/link",
+            get(routes::oidc_signin::link_status)
+                .post(routes::oidc_signin::link_start)
+                .delete(routes::oidc_signin::link_remove),
+        )
+        .route(
+            "/sign-in/okta/draft",
+            delete(routes::oidc_signin::okta_discard_draft),
+        )
+        .route(
             "/sign-in",
             get(routes::sign_in::get_settings).put(routes::sign_in::update_settings),
         )
@@ -1639,6 +1665,16 @@ fn build_app(state: Arc<AppState>) -> Router {
         .route("/google/callback", get(routes::auth::google_callback))
         .route("/github", get(routes::auth::github_login))
         .route("/github/callback", get(routes::auth::github_callback))
+        // Microsoft and Okta: OpenID Connect from the gateway (routes::oidc_signin).
+        .route("/microsoft", get(routes::oidc_signin::microsoft_login))
+        .route(
+            "/microsoft/callback",
+            get(routes::oidc_signin::microsoft_callback),
+        )
+        .route("/okta", post(routes::oidc_signin::okta_login))
+        .route("/okta/callback", get(routes::oidc_signin::okta_callback))
+        .route("/okta/test", get(routes::oidc_signin::okta_test_start))
+        .route("/okta/link", get(routes::oidc_signin::link_begin))
         // An install's GitHub sign-in through CoderHelm's GitHub App comes
         // back here (routes::github_hybrid).
         .route(
@@ -1941,15 +1977,18 @@ mod tests {
     /// A hosted-side state whose AWS clients have no credentials: a request
     /// that passes the signature check stops at the first store read.
     pub(crate) fn hosted_state() -> Arc<AppState> {
+        state_with_secrets(serde_json::json!({
+            "jwt_secret": "test",
+            "hybrid_master_key": MASTER,
+        }))
+    }
+
+    pub(crate) fn state_with_secrets(secrets: serde_json::Value) -> Arc<AppState> {
         let aws = aws_config::SdkConfig::builder()
             .behavior_version(aws_config::BehaviorVersion::latest())
             .region(aws_config::Region::new("us-east-1"))
             .build();
-        let secrets: models::Secrets = serde_json::from_value(serde_json::json!({
-            "jwt_secret": "test",
-            "hybrid_master_key": MASTER,
-        }))
-        .unwrap();
+        let secrets: models::Secrets = serde_json::from_value(secrets).unwrap();
         Arc::new(AppState {
             dynamo: aws_sdk_dynamodb::Client::new(&aws),
             sqs: aws_sdk_sqs::Client::new(&aws),
@@ -2170,6 +2209,216 @@ mod tests {
             let res = app.clone().oneshot(req).await.unwrap();
             assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{state}");
             assert!(res.headers().get("location").is_none(), "{state}");
+        }
+    }
+
+    fn location(res: &axum::response::Response) -> String {
+        res.headers()
+            .get("location")
+            .map(|v| v.to_str().unwrap().to_string())
+            .unwrap_or_default()
+    }
+
+    fn set_cookies(res: &axum::response::Response) -> Vec<String> {
+        res.headers()
+            .get_all("set-cookie")
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .collect()
+    }
+
+    fn microsoft_state() -> Arc<AppState> {
+        state_with_secrets(serde_json::json!({
+            "jwt_secret": "test",
+            "microsoft_client_id": "ms-client-1",
+            "microsoft_client_secret": "never-shown",
+        }))
+    }
+
+    fn get_req(uri: &str, cookies: &str) -> Request<Body> {
+        let mut b = Request::builder().uri(uri);
+        if !cookies.is_empty() {
+            b = b.header("cookie", cookies);
+        }
+        b.header("x-forwarded-for", "203.0.113.9")
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    /// Without the deployment's app registration, Microsoft goes back to the
+    /// sign-in screen with not_set_up, never to Microsoft with no client.
+    #[tokio::test]
+    async fn microsoft_without_a_client_is_not_set_up() {
+        let app = build_app(hosted_state());
+        for path in [
+            "/auth/microsoft",
+            "/auth/microsoft/callback?code=c&state=S1",
+        ] {
+            let res = app.clone().oneshot(get_req(path, "")).await.unwrap();
+            let to = location(&res);
+            assert!(
+                to.ends_with("?signin_error=not_set_up&provider=microsoft"),
+                "{path}: {to}"
+            );
+            assert!(!to.contains("microsoftonline"), "{to}");
+        }
+    }
+
+    /// The trip to Microsoft: the common endpoint, our client, S256 PKCE, a
+    /// nonce, and the state in the URL equal to the state cookie.
+    #[tokio::test]
+    async fn microsoft_sign_in_starts_with_pkce_a_nonce_and_the_state_cookie() {
+        let st = microsoft_state();
+        let app = build_app(st.clone());
+        let res = app
+            .clone()
+            .oneshot(get_req("/auth/microsoft", ""))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::SEE_OTHER);
+        let to = url::Url::parse(&location(&res)).unwrap();
+        assert_eq!(to.host_str(), Some("login.microsoftonline.com"));
+        assert_eq!(to.path(), "/common/oauth2/v2.0/authorize");
+        let q: std::collections::HashMap<_, _> = to.query_pairs().into_owned().collect();
+        assert_eq!(q["client_id"], "ms-client-1");
+        assert_eq!(q["response_type"], "code");
+        assert_eq!(q["code_challenge_method"], "S256");
+        assert_eq!(q["scope"], "openid email profile");
+        assert!(q["redirect_uri"].ends_with("/auth/microsoft/callback"));
+        assert!(
+            !to.as_str().contains("never-shown"),
+            "the secret never leaves"
+        );
+        let cookies = set_cookies(&res);
+        let state_c = cookies
+            .iter()
+            .find(|c| c.starts_with("__Host-oauth_state_ms="))
+            .unwrap();
+        let flow_c = cookies
+            .iter()
+            .find(|c| c.starts_with("__Host-oauth_flow_ms="))
+            .unwrap();
+        assert_eq!(
+            state_c.split(';').next().unwrap(),
+            format!("__Host-oauth_state_ms={}", q["state"])
+        );
+        let flow = routes::oidc_signin::read_flow(
+            routes::oauth_signin::Provider::Microsoft,
+            flow_c.split(';').next().unwrap(),
+            "test",
+        )
+        .unwrap();
+        assert_eq!(q["nonce"], flow.nonce);
+        assert_eq!(
+            q["code_challenge"],
+            routes::oidc_signin::pkce_challenge(&flow.verifier)
+        );
+        assert!(!to.as_str().contains(&flow.verifier));
+    }
+
+    /// Every callback failure before the provider is asked lands on the
+    /// sign-in screen with its code.
+    #[tokio::test]
+    async fn microsoft_and_okta_callbacks_fail_back_to_the_sign_in_screen() {
+        let app = build_app(microsoft_state());
+        let cases = [
+            (
+                "/auth/microsoft/callback?error=access_denied&state=S1",
+                "",
+                "cancelled",
+                "microsoft",
+            ),
+            (
+                "/auth/microsoft/callback?code=c&state=S1",
+                "",
+                "expired",
+                "microsoft",
+            ),
+            (
+                "/auth/microsoft/callback?code=c&state=S2",
+                "__Host-oauth_state_ms=S1",
+                "expired",
+                "microsoft",
+            ),
+            // The state matches but there is no signed flow cookie.
+            (
+                "/auth/microsoft/callback?code=c&state=S1",
+                "__Host-oauth_state_ms=S1",
+                "expired",
+                "microsoft",
+            ),
+            (
+                "/auth/microsoft/callback?code=c&state=S1",
+                "__Host-oauth_state_ms=S1; __Host-oauth_flow_ms=forged",
+                "expired",
+                "microsoft",
+            ),
+            (
+                "/auth/okta/callback?error=access_denied&state=S1",
+                "",
+                "cancelled",
+                "okta",
+            ),
+            (
+                "/auth/okta/callback?code=c&state=S1",
+                "__Host-oauth_state_okta=S1",
+                "expired",
+                "okta",
+            ),
+            (
+                "/auth/okta/callback?state=S1",
+                "__Host-oauth_state_okta=S1",
+                "provider",
+                "okta",
+            ),
+        ];
+        for (path, cookies, code, provider) in cases {
+            let res = app.clone().oneshot(get_req(path, cookies)).await.unwrap();
+            assert_eq!(res.status(), StatusCode::FOUND, "{path}");
+            let to = location(&res);
+            assert!(
+                to.ends_with(&format!("?signin_error={code}&provider={provider}")),
+                "{path} {cookies}: {to}"
+            );
+        }
+    }
+
+    /// Okta's form with something that isn't an email: back with okta_not_found.
+    #[tokio::test]
+    async fn okta_needs_an_email() {
+        let app = build_app(hosted_state());
+        for body in ["email=", "email=not-an-email", ""] {
+            let req = Request::builder()
+                .method("POST")
+                .uri("/auth/okta")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("x-forwarded-for", "203.0.113.9")
+                .body(Body::from(body))
+                .unwrap();
+            let res = app.clone().oneshot(req).await.unwrap();
+            assert!(
+                location(&res).ends_with("?signin_error=okta_not_found&provider=okta"),
+                "{body}: {}",
+                location(&res)
+            );
+        }
+    }
+
+    /// A Test sign-in link that isn't ours (or is old) goes back to Settings.
+    #[tokio::test]
+    async fn an_okta_test_link_must_be_signed() {
+        let app = build_app(hosted_state());
+        for q in ["", "?ticket=", "?ticket=abc.def.ghi"] {
+            let res = app
+                .clone()
+                .oneshot(get_req(&format!("/auth/okta/test{q}"), ""))
+                .await
+                .unwrap();
+            assert!(
+                location(&res).ends_with("/settings/sign-in/?okta_test=failed&reason=expired#okta"),
+                "{q}: {}",
+                location(&res)
+            );
         }
     }
 }

@@ -1142,6 +1142,8 @@ mod tests {
             support_view: None,
             custom: None,
             api_key: None,
+            held: false,
+            via_okta: false,
         }
     }
 

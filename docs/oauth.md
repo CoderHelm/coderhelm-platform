@@ -94,7 +94,11 @@ The redirect is the install's own callback (`<dashboard>/settings/integrations/m
   - The Google client must have `https://<Cognito domain>/oauth2/idpresponse` registered. A prefix domain lives in the user pool's region.
   - The state is a `__Host-` cookie that lasts 10 minutes and works once.
 - **GitHub:** the GitHub App's own client, as above.
-- **SSO (OIDC and SAML):** not available yet ([sign-in](./self-host/sign-in.md)).
+- **Microsoft:** OpenID Connect with PKCE from the API, no Cognito. Redirect URI `<API URL>/auth/microsoft/callback`, the deployment's own Entra app (`microsoft_client_id`, `microsoft_client_secret` in the deployment's secret). The ID token's signature, issuer (the token's own tenant), audience, nonce and expiry are checked ([setup](./self-host/microsoft-okta-sign-in.md)).
+- **Okta:** OpenID Connect with PKCE against each team's (self-hosted: the organization's) own Okta, set up in Settings, Sign-in rules. Redirect URI `<API URL>/auth/okta/callback`; the client secret is sealed with the deployment's KMS key. Same token checks, with the setup's exact issuer. It signs in only a member who linked that Okta account (issuer and subject) from their own settings, never by email. On hosted CoderHelm each email domain is proven with a `_coderhelm-okta` DNS TXT record first (read again when Okta is turned on and daily at sign-in), and an Okta session stays on its own team.
+- Discovery, keys and token requests to Microsoft and Okta go through the guarded transport that MCP sign-ins use: https only, no private, loopback, link-local or metadata addresses, pinned to the checked address. Discovery and keys never follow a redirect.
+- The state is a `__Host-` cookie that lasts 10 minutes and works once; the nonce and PKCE verifier travel in a second `__Host-` cookie signed by the API.
+- **SAML:** not available ([sign-in](./self-host/sign-in.md)).
 - **CoderHelm's own MCP server:**
   - CoderHelm is the authorization server: metadata at `<API URL>/.well-known/oauth-authorization-server`, consent at `<URL>/authorize/`.
   - Clients register themselves and must use PKCE S256.
