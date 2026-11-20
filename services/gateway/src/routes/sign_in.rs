@@ -1212,7 +1212,7 @@ pub fn session_with_second_factor(
         &claims.email,
         claims.session_role(),
         claims.github_login.as_deref(),
-        &SignInProof::new(true, via),
+        &SignInProof::new(true, via).with_okta_sub(claims.okta_sub.clone()),
         &state.secrets.jwt_secret,
         SESSION_TTL_SECS,
     )
@@ -2252,8 +2252,13 @@ pub async fn check_member_session(state: &AppState, claims: &Claims) -> Result<(
                 error!(error = %e, "Okta setup not read; request refused");
                 StatusCode::SERVICE_UNAVAILABLE.into_response()
             })?;
-        super::oidc_signin::okta_session_state(item.as_ref(), live.as_ref(), claims.iat)
-            .map_err(session_ended)?;
+        super::oidc_signin::okta_session_state(
+            item.as_ref(),
+            live.as_ref(),
+            claims.iat,
+            claims.okta_sub.as_deref(),
+        )
+        .map_err(session_ended)?;
     }
     Ok(())
 }
@@ -2683,7 +2688,7 @@ pub async fn verify_second_step(
             r => r,
         },
         step.github_login.as_deref(),
-        &SignInProof::new(true, &step.via),
+        &SignInProof::new(true, &step.via).with_okta_sub(step.okta_sub.clone()),
         &state.secrets.jwt_secret,
         SESSION_TTL_SECS,
     )
@@ -3667,6 +3672,7 @@ mod tests {
         let google = SignInProof {
             mfa: false,
             via: Some("google".into()),
+            okta_sub: None,
         };
         let passed = SignInProof::new(true, "github");
         // Off: everyone goes on.
@@ -3834,6 +3840,8 @@ mod tests {
         ));
         assert!(before(oidc, "sign_in::second_step", "create_session_token"));
         let flows = include_str!("oidc_signin.rs");
+        // The code, not its tests (which make tokens to check them).
+        let flows = &flows[..flows.find("#[cfg(test)]\nmod tests").unwrap()];
         assert!(body(flows, "microsoft_callback_inner").contains("finish_oidc("));
         assert!(body(flows, "okta_callback_inner").contains("finish_oidc("));
         assert!(!flows.contains("create_session_token"));
