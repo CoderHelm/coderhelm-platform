@@ -5419,6 +5419,19 @@ impl GitHubClient {
         Ok(())
     }
 
+    /// Move an open pull request onto another base branch.
+    pub async fn set_pull_base(
+        &self,
+        owner: &str,
+        repo: &str,
+        pr_number: u64,
+        base: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!("{API_BASE}/repos/{owner}/{repo}/pulls/{pr_number}");
+        self.patch(&url, &serde_json::json!({"base": base})).await?;
+        Ok(())
+    }
+
     /// Reopen a closed pull request.
     pub async fn reopen_pull_request(
         &self,
