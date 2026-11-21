@@ -1036,6 +1036,9 @@ async fn member_claims(
         support_view: None,
         custom: None,
         api_key: None,
+        held: false,
+        via_okta: false,
+        okta_sub: None,
     }))
 }
 
@@ -1190,10 +1193,16 @@ async fn person_claims(state: &AppState, a: &mcp_oauth::Authorized) -> Result<Cl
             return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
         }
     };
+    let claims = crate::routes::oidc_signin::mark_okta(
+        claims,
+        a.grant.via.as_deref(),
+        a.grant.okta_sub.clone(),
+    );
     crate::routes::sign_in::check_member_session(state, &claims).await?;
     let proof = crate::auth::jwt::SignInProof {
         mfa: a.grant.mfa,
         via: a.grant.via.clone(),
+        okta_sub: a.grant.okta_sub.clone(),
     };
     crate::routes::sign_in::check_session(state, &claims.team_id, &proof, None).await?;
     Ok(claims)
@@ -1515,6 +1524,11 @@ pub async fn post(
                         };
                         // The same checks a session of theirs gets: no session
                         // ended since they connected, the team's two-factor rule.
+                        let claims = crate::routes::oidc_signin::mark_okta(
+                            claims,
+                            a.grant.via.as_deref(),
+                            a.grant.okta_sub.clone(),
+                        );
                         if let Err(r) =
                             crate::routes::sign_in::check_member_session(&state, &claims).await
                         {
@@ -1523,6 +1537,7 @@ pub async fn post(
                         let proof = crate::auth::jwt::SignInProof {
                             mfa: a.grant.mfa,
                             via: a.grant.via.clone(),
+                            okta_sub: a.grant.okta_sub.clone(),
                         };
                         if let Err(r) = crate::routes::sign_in::check_session(
                             &state,
@@ -2064,6 +2079,7 @@ mod tests {
             created_at_secs: 0,
             mfa: false,
             via: None,
+            okta_sub: None,
             refresh_hash: String::new(),
             prev_refresh_hash: None,
             refresh_expires_at: String::new(),

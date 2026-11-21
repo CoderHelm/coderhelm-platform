@@ -356,10 +356,9 @@ fn assignee_of(issue: &Value) -> &str {
 /// CoderHelm). Either one starts a run, and either one is what lets a
 /// comment written before the run be kept for it.
 pub(crate) fn ticket_triggers(issue: &Value, trigger_label: &str) -> (bool, bool) {
-    let label = trigger_label.to_ascii_lowercase();
-    let has_label = labels_of(issue).iter().any(|l| {
-        l.eq_ignore_ascii_case(&label) || l.to_ascii_lowercase().starts_with(&format!("{label}:"))
-    });
+    let has_label = labels_of(issue)
+        .iter()
+        .any(|l| super::trigger_gate::is_trigger_label(l, trigger_label));
     let is_assigned = assignee_of(issue)
         .to_ascii_lowercase()
         .contains("coderhelm");
@@ -616,6 +615,7 @@ async fn process_jira_payload(
         false,
         super::trigger_gate::jira_reopened(payload),
         None,
+        super::trigger_gate::jira_retry_gesture(payload, &trigger_label),
     )
     .await
     {

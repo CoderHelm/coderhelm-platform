@@ -97,6 +97,12 @@ One list of everything you can set up, and where. Required items are steps in th
 - **Invite your team**\
   *Where:* Settings, People\
   *Guide:* [Sign-in and people](./sign-in.md)
+- **Sign in with Microsoft**\
+  *Where:* `microsoft_client_id` and `microsoft_client_secret` in the deployment's secret\
+  *Guide:* [Sign in with Microsoft and Okta](./microsoft-okta-sign-in.md)
+- **Sign in with Okta**\
+  *Where:* Settings, Sign-in rules, Okta sign-in\
+  *Guide:* [Sign in with Microsoft and Okta](./microsoft-okta-sign-in.md)
 - **Anthropic API key (Anthropic provider)**\
   *Where:* Settings, AI models (per team)\
   *Checked by:* `model`\
@@ -143,7 +149,7 @@ One list of everything you can set up, and where. Required items are steps in th
 
 ## Not available yet
 
-- **Single sign-on (SAML or OIDC):** sign-in is email and password (with passkeys and two-factor codes). A self-hosted install has no Google sign-in ([why](./sign-in.md#no-google-sign-in)).
+- **Single sign-on with SAML:** sign-in is email and password (with two-factor codes), GitHub, Microsoft and Okta (OpenID Connect, [setup](./microsoft-okta-sign-in.md)). A self-hosted install has no Google sign-in ([why](./sign-in.md#no-google-sign-in)).
 - **The install's own functions in a VPC:** they run without a VPC and reach GitHub, Anthropic and Bedrock over HTTPS. A search cluster inside a VPC is read through a [private network](./private-networks.md).
 - **GitHub Enterprise Server:** CoderHelm calls `api.github.com`.
 - **Instance sizes:** everything is serverless and pay per use; there is no size to pick. Model calls are most of the bill.

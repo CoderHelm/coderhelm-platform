@@ -268,12 +268,12 @@ pub fn aws_state(a: &AwsAccount) -> CardState {
     {
         let n = p.missing.len();
         let s_ = if n == 1 { "" } else { "s" };
-        // The install's own account gets them with the next version update:
-        // nothing to do in AWS.
+        // The install's own account: the release brings them to its reader
+        // (the access stack's reader update), so there is nothing to do.
         if install_account(a) {
             return cs(
                 "connected",
-                format!("{n} read-only permission{s_} arrive with the next Coderhelm update. Nothing is needed in AWS."),
+                format!("Updates with the release: {n} read-only permission{s_} arrive with this install's version updates. Nothing to do."),
                 "manage",
             );
         }
@@ -314,10 +314,9 @@ pub fn aws_missing(a: &AwsAccount) -> Vec<&'static str> {
     out
 }
 
-/// The account's last check ran on the install's own role (a check from
-/// before every read went through the team's role). Reads of the account,
-/// the install's own included, are made with the team's role, so its update
-/// stack is offered everywhere once the account is checked again.
+/// The account is the install's own, whose CoderHelmLogReader the release
+/// keeps current (`live::aws::updates_with_release`): never an update stack,
+/// never a person's step.
 pub fn install_account(a: &AwsAccount) -> bool {
     a.permissions.as_ref().is_some_and(|p| p.install_account)
 }

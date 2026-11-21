@@ -537,6 +537,7 @@ pub async fn decide_request(
             email: claims.email.clone(),
             mfa: proof.mfa,
             via: proof.via.clone(),
+            okta_sub: proof.okta_sub.clone(),
             allow_write: body.allow_write,
             allow_knowledge: body.allow_knowledge,
             lookups: oauth::lookup_grant(body.allow_scopes.as_deref(), &req.scopes),
@@ -762,6 +763,9 @@ mod tests {
             support_view: None,
             custom: None,
             api_key: None,
+            held: false,
+            via_okta: false,
+            okta_sub: None,
         }
     }
 

@@ -1411,6 +1411,14 @@ pub async fn remove_user(
         .send()
         .await
         .map_err(|e| internal("Failed to remove user", e))?;
+    // Their Okta identity is free to link again.
+    super::oidc_signin::delete_link_row(
+        &state,
+        &claims.team_id,
+        s(target, "okta_issuer"),
+        s(target, "okta_sub"),
+    )
+    .await;
 
     info!(user_id = %sk, team_id = %claims.team_id, "User removed");
 
@@ -1656,6 +1664,7 @@ pub async fn mfa_setup(
 pub async fn mfa_verify_setup(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
+    proof: Option<Extension<crate::auth::jwt::SignInProof>>,
     Json(body): Json<VerifyMfaRequest>,
 ) -> Result<axum::response::Response, StatusCode> {
     // One second factor per member (on every deployment), so none is set
@@ -1749,7 +1758,12 @@ pub async fn mfa_verify_setup(
         Some("cognito"),
     )
     .await;
-    let cookie = crate::routes::sign_in::session_with_second_factor(&state, &claims, "password")
+    // The re-issued session keeps how it signed in (an Okta session stays one).
+    let via = proof
+        .as_ref()
+        .and_then(|p| p.via.clone())
+        .unwrap_or_else(|| "password".to_string());
+    let cookie = crate::routes::sign_in::session_with_second_factor(&state, &claims, &via)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let mut resp = Json(json!({ "status": "enabled" })).into_response();
     if let Ok(v) = axum::http::HeaderValue::from_str(&cookie) {
@@ -2300,6 +2314,9 @@ mod tests {
             support_view: None,
             custom: None,
             api_key: None,
+            held: false,
+            via_okta: false,
+            okta_sub: None,
         }
     }
 

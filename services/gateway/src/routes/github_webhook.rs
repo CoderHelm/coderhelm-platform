@@ -519,22 +519,11 @@ async fn handle_issue_event(
     installation_id: u64,
     team_id: &str,
 ) -> Result<StatusCode, StatusCode> {
-    let action = payload["action"].as_str().unwrap_or("");
-
-    // Trigger on: issue assigned to coderhelm[bot], or labeled "coderhelm"
-    let is_assigned_to_bot = action == "assigned"
-        && payload["assignee"]["login"]
-            .as_str()
-            .map(|l| l.contains("coderhelm"))
-            .unwrap_or(false);
-
-    let is_labeled = action == "labeled"
-        && payload["label"]["name"]
-            .as_str()
-            .map(|l| l.eq_ignore_ascii_case("coderhelm"))
-            .unwrap_or(false);
-
-    if !is_assigned_to_bot && !is_labeled {
+    // Trigger on: issue assigned to coderhelm[bot], or labeled "coderhelm".
+    // One rule for the trigger and for the failed-run cap, which never
+    // blocks a person's retry gesture.
+    let retry_gesture = super::trigger_gate::github_retry_gesture(payload);
+    if !retry_gesture {
         return Ok(StatusCode::OK);
     }
     let issue = &payload["issue"];
@@ -575,7 +564,9 @@ async fn handle_issue_event(
     // run, re-trigger only if the issue content changed (re-labeling an
     // edited issue reworks it; re-labeling an unchanged one is a no-op).
     // Failed/needs_input runs no longer block — the old any-run-exists check
-    // made GitHub tickets unretriable by re-label.
+    // made GitHub tickets unretriable by re-label. Every issue event that
+    // gets here is a person's retry gesture (the label added, or CoderHelm
+    // assigned), so it retries a failed issue even past the failed-run cap.
     let ticket_id_str = format!("GH-{}", issue["number"].as_u64().unwrap_or(0));
     let context_hash = common::ticket_context_hash(
         issue["title"].as_str().unwrap_or(""),
@@ -595,6 +586,7 @@ async fn handle_issue_event(
         false,
         false,
         Some(&own_repo),
+        retry_gesture,
     )
     .await
     {
@@ -1675,6 +1667,7 @@ async fn handle_issue_comment(
             true,
             false,
             Some(&own_repo),
+            false,
         )
         .await,
         super::trigger_gate::TicketGate::SkipInFlight

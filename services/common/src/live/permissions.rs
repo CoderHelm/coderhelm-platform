@@ -66,6 +66,9 @@ pub struct PermissionCheck {
     /// permissions arrive with the install's version updates, never from a
     /// stack a person launches.
     #[serde(default)]
+    /// Set only where the install keeps that account's CoderHelmLogReader
+    /// current with each release ([`super::aws::reader_updates_with_release`]),
+    /// so nobody is asked to update it and no update stack is offered.
     pub install_account: bool,
     /// Checked on the install's own read role (its stack keeps it current).
     #[serde(default)]
@@ -96,7 +99,21 @@ pub struct Problem {
 }
 
 impl PermissionCheck {
+    /// A check of `target`'s role in this process: whether its account is
+    /// the install's own, with a reader the release keeps current
+    /// ([`super::aws::updates_with_release`]), is decided here, once.
     pub fn new(target: &AwsTarget, now: &str) -> Self {
+        Self::for_install(
+            target,
+            now,
+            super::aws::install_read_role().as_deref(),
+            super::aws::reader_kept_by_release(),
+        )
+    }
+
+    /// [`Self::new`] with the install's read role (`own`) and whether the
+    /// install keeps its own account's reader current (`kept`) given.
+    pub fn for_install(target: &AwsTarget, now: &str, own: Option<&str>, kept: bool) -> Self {
         PermissionCheck {
             account: target.account().to_string(),
             region: target.region.clone(),
@@ -109,7 +126,7 @@ impl PermissionCheck {
             scp_blocks: Vec::new(),
             update_stack: UpdateStack::Unknown,
             error: String::new(),
-            install_account: false,
+            install_account: super::aws::reader_updates_with_release(&target.role_arn, own, kept),
             install_role: false,
             optional_missing: Vec::new(),
             optional_checked: false,
@@ -220,7 +237,7 @@ impl PermissionCheck {
                     "IAM's policy simulator says {role} isn't allowed {}.",
                     self.missing.join(", "),
                 ),
-                fix: "A version update that grants it adds it to the install's own role; nothing is needed in AWS.".into(),
+                fix: "Nothing to do: the release brings its read-only permissions to this role in the install's own account (the reader update in the access stack, run after each version update).".into(),
             });
         }
         if !self.scp_blocks.is_empty() {
@@ -637,7 +654,18 @@ pub async fn check(
     // The role every read of the account is made with ([`assume`]), also in
     // a self-hosted install's own account: the check and the reads can't
     // disagree about which role lacks what.
-    let mut c = PermissionCheck::new(target, now);
+    check_for(sts, target, actor, PermissionCheck::new(target, now)).await
+}
+
+/// [`check`] filling in `c`, made for `target` ([`PermissionCheck::new`] or
+/// [`PermissionCheck::for_install`]): what it says about the account (the
+/// install's own or not) is kept whatever the role answers.
+pub async fn check_for(
+    sts: &aws_sdk_sts::Client,
+    target: &AwsTarget,
+    actor: &str,
+    mut c: PermissionCheck,
+) -> PermissionCheck {
     let session = match assume(sts, target, actor).await {
         Ok(s) => s,
         Err(e) => {
@@ -645,12 +673,15 @@ pub async fn check(
             return c;
         }
     };
-    check_with(session, target, now).await
+    check_with(session, target, c).await
 }
 
 /// [`check`] with a session on `target`'s role.
-async fn check_with(session: TeamSession, target: &AwsTarget, now: &str) -> PermissionCheck {
-    let mut c = PermissionCheck::new(target, now);
+async fn check_with(
+    session: TeamSession,
+    target: &AwsTarget,
+    mut c: PermissionCheck,
+) -> PermissionCheck {
     c.works = true;
     match simulate(&session, target).await {
         Ok(results) => apply_simulation(&mut c, &results),
@@ -720,7 +751,8 @@ mod tests {
         assert_eq!(v["install_account"], true);
         let p = c.problem(true).expect("says what happens");
         assert_eq!(p.code, "install_update");
-        assert!(p.fix.contains("version update that grants it"));
+        assert!(p.fix.starts_with("Nothing to do"));
+        assert!(p.fix.contains("the release brings"));
         assert!(!p.fix.contains("Update in AWS"));
     }
 

@@ -446,6 +446,54 @@ class AccessItem(Base):
         self.assertEqual(len(self.urls), 2, "an admin's finished access stack shows within a minute")
 
 
+class ReaderUpdate(Base):
+    """A release's access.json carries the reader update (lambda/native-reader):
+    an access stack made before it asks an admin to apply it once; after that,
+    no release asks anyone for CoderHelmLogReader's reads in this account."""
+
+    def access_json(self):
+        t = AccessItem.access_json(self)
+        t["Resources"]["Reader"] = {"Type": "AWS::Lambda::Function", "Properties": {"FunctionName": {"Fn::Sub": "CoderHelmReader-${Stage}"}}}
+        return t
+
+    def setUp(self):
+        Base.setUp(self)
+        self.body = json.dumps(self.access_json()).encode()
+        self.cfn.deployed = {"Resources": {"ReleaseAssets": {"Properties": {"Files": [
+            {"Key": "access.json", "Dest": "releases/v1.0.0/access.json", "Sha256": hashlib.sha256(self.body).hexdigest()}]}}}}
+        u.fetch_template = lambda url, opener=None: self.body
+
+    def stack(self, with_reader):
+        self.cfn.access_stack = {"StackId": "arn:aws:cloudformation:us-east-1:1:stack/coderhelm-prod-access/x", "StackName": "coderhelm-prod-access", "StackStatus": "UPDATE_COMPLETE"}
+        self.cfn.access_template = {"Metadata": {"CoderHelm": {"version": "v0.9.0", "kind": "access"}},
+                                    "Resources": {"Access": {}, **({"Reader": {}} if with_reader else {})}}
+
+    def test_an_access_stack_without_the_reader_update_is_asked_for_once(self):
+        self.stack(with_reader=False)
+        v = u.access_compute(self.env)
+        self.assertEqual(v["state"], "pending")
+        self.assertIn("Reader", v["resources"])
+        self.assertIn(u.READER_LINE, v["summary"])
+        self.assertEqual(v["apply"], "update")
+
+    def test_once_applied_the_reader_update_is_never_asked_for_again(self):
+        self.stack(with_reader=True)
+        v = u.access_compute(self.env)
+        self.assertNotIn("Reader", v["resources"])
+        self.assertNotIn(u.READER_LINE, v["summary"])
+
+    def test_an_install_without_an_access_stack_gets_it_with_the_one_link(self):
+        v = u.access_compute(self.env)
+        self.assertIn("Reader", v["resources"])
+        self.assertTrue(v["link"])
+
+    def test_an_access_json_without_it_asks_nothing_about_it(self):
+        self.body = json.dumps(AccessItem.access_json(self)).encode()
+        self.cfn.deployed["Resources"]["ReleaseAssets"]["Properties"]["Files"][0]["Sha256"] = hashlib.sha256(self.body).hexdigest()
+        self.stack(with_reader=False)
+        self.assertNotIn("Reader", u.access_compute(self.env)["resources"])
+
+
 class AccessForWhatIsUsed(Base):
     """A newer release's access, offered only for what the install uses, as an
     update of the access stack an admin already made (never a delete)."""

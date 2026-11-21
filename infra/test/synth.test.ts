@@ -370,6 +370,9 @@ test("updates: on by default for self-host, with a least-privilege build role; o
   // The gateway knows the updater and may call it.
   assert.equal(envOf(t["coderhelm-prod-api"], "coderhelm-prod-gateway").UPDATER_FUNCTION_NAME, "coderhelm-prod-updater");
   assert.ok(json(t["coderhelm-prod-api"]).includes("function:coderhelm-prod-updater"));
+  // An install from the CLI has no access stack's reader update: its own account's
+  // CoderHelmLogReader is updated like any other account's (native-access.test.ts has the one-stack install).
+  assert.equal(envOf(t["coderhelm-prod-api"], "coderhelm-prod-gateway").INSTALL_READER_KEPT, undefined);
 
   const off = synth(selfHost({ updates: { enabled: false } }));
   assert.equal(off["coderhelm-prod-updates"], undefined);

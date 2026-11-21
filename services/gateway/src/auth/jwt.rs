@@ -12,6 +12,10 @@ pub struct SignInProof {
     pub mfa: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub via: Option<String>,
+    /// An Okta sign-in: the Okta subject it was for. A session lasts only
+    /// while that is still the member's linked subject.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub okta_sub: Option<String>,
 }
 
 impl SignInProof {
@@ -19,7 +23,14 @@ impl SignInProof {
         Self {
             mfa,
             via: Some(via.to_string()),
+            okta_sub: None,
         }
+    }
+
+    /// The same, recording the Okta subject the sign-in was for.
+    pub fn with_okta_sub(mut self, okta_sub: Option<String>) -> Self {
+        self.okta_sub = okta_sub.filter(|s| !s.is_empty());
+        self
     }
 }
 
@@ -82,6 +93,9 @@ pub fn create_session_token(
         support_view: None,
         custom: None,
         api_key: None,
+        held: false,
+        via_okta: false,
+        okta_sub: None,
     };
     encode(
         &Header::default(),
@@ -121,6 +135,9 @@ pub struct SecondStep {
     #[serde(default)]
     pub github_login: Option<String>,
     pub via: String,
+    /// An Okta sign-in: the Okta subject, kept for the session it becomes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub okta_sub: Option<String>,
     /// This token's id: its wrong codes are counted, and it dies after five.
     #[serde(default)]
     pub jti: String,
@@ -197,6 +214,9 @@ pub fn create_scoped_token(
         // A scoped token is minted from a signed-in session; it never
         // carries an API key, which only reaches the public routes.
         api_key: None,
+        held: false,
+        via_okta: false,
+        okta_sub: None,
     };
     encode(
         &Header::default(),
@@ -362,6 +382,7 @@ mod tests {
             github_login: None,
             via: "github".into(),
             jti: String::new(),
+            okta_sub: None,
             aud: String::new(),
             iat: 0,
             exp: 0,

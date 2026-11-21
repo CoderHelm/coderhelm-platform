@@ -135,6 +135,13 @@ pub struct Secrets {
     pub google_client_secret: Option<String>,
     #[serde(default)]
     pub jira_webhook_secret: Option<String>,
+    /// Sign in with Microsoft: the deployment's own Entra app registration
+    /// (multi-tenant, work, school and personal accounts). Without both, the
+    /// sign-in page has no Microsoft button (routes::oidc_signin).
+    #[serde(default)]
+    pub microsoft_client_id: Option<String>,
+    #[serde(default)]
+    pub microsoft_client_secret: Option<String>,
     /// Knowledge sources: the install's own OAuth apps for one-click
     /// sign-in. Each is optional; without one, that source uses the team's
     /// saved key where it has one (docs/self-host/knowledge-sources.md).
@@ -264,6 +271,25 @@ pub struct Claims {
     /// and `email` and `github_login` are those of the admin who made it.
     #[serde(skip)]
     pub api_key: Option<ApiKeyRef>,
+    /// Set by the auth middleware, never read from or written to a token:
+    /// this session was signed in by a team's (or the organization's) own
+    /// Okta, which vouches for that team only (routes::oidc_signin). It is
+    /// never a platform admin, and on the hosted deployment it never reaches
+    /// the person's other teams or anything person-wide (their passwords and
+    /// second factor, their other sessions, linking another sign-in).
+    #[serde(skip)]
+    pub held: bool,
+    /// Set by the auth middleware, never read from or written to a token:
+    /// this session was signed in with an Okta, on any deployment. Such a
+    /// session is never a platform admin, and it ends when the member's Okta
+    /// link or the team's Okta setup no longer matches.
+    #[serde(skip)]
+    pub via_okta: bool,
+    /// Set by the auth middleware, never read from or written to a token:
+    /// the Okta subject a `via_okta` session signed in as (from its proof).
+    /// It must still be the member's linked subject.
+    #[serde(skip)]
+    pub okta_sub: Option<String>,
 }
 
 /// The API key a request was made with.
@@ -466,6 +492,9 @@ mod tests {
             support_view: None,
             custom: None,
             api_key: None,
+            held: false,
+            via_okta: false,
+            okta_sub: None,
         };
         let json = serde_json::to_string(&c).unwrap();
         let parsed: Claims = serde_json::from_str(&json).unwrap();

@@ -1360,7 +1360,7 @@ fn session_redirect(provider: Provider, token: &str, dashboard_url: &str) -> Res
         [(header::LOCATION, dashboard_url.to_string())],
     )
         .into_response();
-    for c in [session, oauth_signin::clear_state_cookie(provider)] {
+    for c in std::iter::once(session).chain(oauth_signin::clear_cookies(provider)) {
         if let Ok(v) = HeaderValue::from_str(&c) {
             resp.headers_mut().append(header::SET_COOKIE, v);
         }
@@ -1563,6 +1563,7 @@ async fn google_callback_inner(
             github_login: github_login.clone(),
             via: "google".into(),
             jti: String::new(),
+            okta_sub: None,
             aud: String::new(),
             iat: 0,
             exp: 0,
@@ -1675,6 +1676,7 @@ async fn google_callback_inner(
         github_login: None,
         via: "google".into(),
         jti: String::new(),
+        okta_sub: None,
         aud: String::new(),
         iat: 0,
         exp: 0,
@@ -1699,6 +1701,176 @@ async fn google_callback_inner(
     Ok(session_redirect(P, &token, dashboard_url))
 }
 
+// ── Microsoft and Okta (routes::oidc_signin) ────────────────────────
+
+/// Whether the join rules landed a self-hosted Okta sign-in on exactly the
+/// linked member's record.
+pub(crate) fn okta_landing_matches(
+    landed: Option<&HashMap<String, AttributeValue>>,
+    team: &str,
+    user: &str,
+) -> bool {
+    landed.is_some_and(|r| {
+        let (t, u, _, _) = landing_parts(r);
+        t == team && u == user
+    })
+}
+
+/// The end of a Microsoft or Okta sign-in, once the provider's id_token and
+/// the email in it are checked: the same gates as Google and GitHub.
+///
+/// - Self-hosted: [`selfhost_landing`] (decide_join: a member, an invite, an
+///   allowed domain or the first admin), else `?error=not_invited`.
+/// - Okta (`okta` set, both deployments): exactly the member record that
+///   linked this Okta identity (issuer and subject) from a session of its
+///   own (routes::oidc_signin). Never by email, never an invite, never a
+///   new record or team.
+/// - Hosted, Microsoft (`team` unset): as Google. Their invites are
+///   accepted, they land on a team they joined over their personal team, and
+///   a first sign-in starts a personal team (open beta limit).
+///
+/// Then the person's second factor, whichever it is, before any session.
+pub(crate) async fn finish_oidc(
+    state: &Arc<AppState>,
+    ip: &str,
+    provider: Provider,
+    person: &super::oidc_signin::Person,
+    okta: Option<&HashMap<String, AttributeValue>>,
+) -> Result<Response, SignInFailure> {
+    let p = provider;
+    let via = p.slug();
+    let dash = common::public_urls::app_url(&state.config.stage);
+    // Okta: the member who linked this Okta identity, by their record's own
+    // email, never the token's.
+    let linked_email = okta
+        .and_then(|r| r.get("email"))
+        .and_then(|v| v.as_s().ok())
+        .cloned()
+        .unwrap_or_default();
+    let email = if okta.is_some() {
+        linked_email.as_str()
+    } else {
+        person.email.as_str()
+    };
+
+    let okta_sub = okta
+        .and_then(|r| r.get("okta_sub"))
+        .and_then(|v| v.as_s().ok())
+        .cloned();
+    let (team_id, user_id, role, github_login) = if let Some(record) = okta {
+        if sign_in::applies() {
+            // Self-hosted: the linked member still passes the organization's
+            // join rules, and lands on exactly their own record.
+            let (rec_team, rec_user, _, _) = landing_parts(record);
+            let landed = selfhost_landing(state, email, &rec_user, &person.name, "")
+                .await
+                .map_err(|e| SignInFailure::new(p, Reason::Server, "join", e))?;
+            if !okta_landing_matches(landed.as_ref(), &rec_team, &rec_user) {
+                return Ok(Redirect::temporary(&not_invited_url(dash)).into_response());
+            }
+        }
+        landing_parts(record)
+    } else if sign_in::applies() {
+        let landed = selfhost_landing(state, email, &person.new_user_id, &person.name, "")
+            .await
+            .map_err(|e| SignInFailure::new(p, Reason::Server, "join", e))?;
+        let Some(record) = landed else {
+            return Ok(Redirect::temporary(&not_invited_url(dash)).into_response());
+        };
+        landing_parts(&record)
+    } else {
+        let existing = sign_in::records_by_email(state, email)
+            .await
+            .map_err(|e| SignInFailure::new(p, Reason::Server, "records", e))?;
+        if existing.is_empty() && super::open_signup::allow_new_team(state, ip).await.is_err() {
+            return Ok(Redirect::temporary(&format!("{dash}?error=signup_limit")).into_response());
+        }
+        let existing = super::open_signup::drop_moved_invites(state, existing).await;
+        let accepted = accept_pending_invites(state, &existing, &person.new_user_id, email).await;
+        let pool = landing_records(&existing, accepted);
+        let own_id = person.new_user_id.trim_start_matches("USER#");
+        match select_session_team(&pool, own_id) {
+            Some(item) => landing_parts(item),
+            None => {
+                let tid = format!("TEAM#{}", ulid::Ulid::new().to_string().to_lowercase());
+                super::open_signup::set_default_limits(state, &tid).await;
+                let now = chrono::Utc::now().to_rfc3339();
+                state
+                    .dynamo
+                    .put_item()
+                    .table_name(&state.config.table_name)
+                    .item("pk", attr_s(&tid))
+                    .item("sk", attr_s("META"))
+                    .item("status", attr_s("active"))
+                    .item("created_at", attr_s(&now))
+                    .condition_expression("attribute_not_exists(pk)")
+                    .send()
+                    .await
+                    .map_err(|e| SignInFailure::new(p, Reason::Server, "team", e))?;
+                state
+                    .dynamo
+                    .put_item()
+                    .table_name(&state.config.users_table_name)
+                    .item("pk", attr_s(&tid))
+                    .item("sk", attr_s(&person.new_user_id))
+                    .item("email", attr_s(email))
+                    .item("avatar_url", attr_s(""))
+                    .item("role", attr_s("owner"))
+                    .item("name", attr_s(&person.name))
+                    .item("updated_at", attr_s(&now))
+                    .item(
+                        "gsi2pk",
+                        attr_s(&format!("EMAIL#{}", normalize_email(email))),
+                    )
+                    .item("gsi2sk", attr_s(&tid))
+                    .send()
+                    .await
+                    .map_err(|e| SignInFailure::new(p, Reason::Server, "member", e))?;
+                info!(team_id = %tid, provider = via, "Personal team made at first sign-in");
+                (tid, person.new_user_id.clone(), "owner".to_string(), None)
+            }
+        }
+    };
+    touch_last_login(state, &team_id, &user_id).await;
+    let step = SecondStep {
+        sub: user_id.clone(),
+        team_id: team_id.clone(),
+        email: email.to_string(),
+        role: role.clone(),
+        github_login: github_login.clone(),
+        via: via.into(),
+        jti: String::new(),
+        okta_sub: okta_sub.clone(),
+        aud: String::new(),
+        iat: 0,
+        exp: 0,
+    };
+    if let Some(resp) = sign_in::second_step(state, step, dash)
+        .await
+        .map_err(|e| SignInFailure::new(p, Reason::Server, "second_step", e))?
+    {
+        let mut resp = resp;
+        for c in oauth_signin::clear_cookies(p) {
+            if let Ok(v) = HeaderValue::from_str(&c) {
+                resp.headers_mut().append(header::SET_COOKIE, v);
+            }
+        }
+        return Ok(resp);
+    }
+    let token = jwt::create_session_token(
+        &user_id,
+        &team_id,
+        email,
+        &role,
+        github_login.as_deref(),
+        &SignInProof::new(false, via).with_okta_sub(okta_sub.clone()),
+        &state.secrets.jwt_secret,
+        SESSION_TTL_SECS,
+    )
+    .map_err(|e| SignInFailure::new(p, Reason::Server, "session_token", e))?;
+    Ok(session_redirect(p, &token, dash))
+}
+
 // ── GitHub OAuth (connect GitHub, not identity) ──────────────────────
 
 /// GET /auth/methods: the sign-in methods that work on this deployment
@@ -1706,7 +1878,12 @@ async fn google_callback_inner(
 pub async fn methods(State(state): State<Arc<AppState>>) -> Response {
     let github = own_github_client(&state) || super::github_hybrid::available();
     let self_hosted = super::setup_checks::self_hosted();
-    let m = oauth_signin::sign_in_methods(self_hosted, github);
+    let microsoft = super::oidc_signin::microsoft_ready(
+        state.secrets.microsoft_client_id.as_deref(),
+        state.secrets.microsoft_client_secret.as_deref(),
+    );
+    let okta = super::oidc_signin::okta_available(&state).await;
+    let m = oauth_signin::sign_in_methods(self_hosted, github, microsoft, okta);
     let mut v = serde_json::to_value(m).unwrap_or_default();
     if self_hosted {
         // Where the sign-in page's emails come from, so a person can ask IT to let them in.
@@ -2047,6 +2224,19 @@ pub(crate) async fn github_sign_in_with_token(
 
     let now = chrono::Utc::now().to_rfc3339();
 
+    // A session from a team's Okta (hosted) links no other sign-in: a GitHub
+    // account linked here would sign in later without the team hold.
+    if existing_claims.is_some()
+        && super::oidc_signin::signed_in_with_okta(existing_proof.via.as_deref())
+        && !super::setup_checks::self_hosted()
+    {
+        return Err(SignInFailure::new(
+            P,
+            Reason::TeamOnly,
+            "connect",
+            "GitHub connect from a session a team's Okta signed in",
+        ));
+    }
     if let Some(claims) = existing_claims {
         // User is already logged in — connect GitHub to their account
         // Update their user record with github_id and github_login
@@ -2565,6 +2755,7 @@ pub(crate) async fn github_sign_in_with_token(
         github_login: Some(github_login.to_string()),
         via: "github".into(),
         jti: String::new(),
+        okta_sub: None,
         aud: String::new(),
         iat: 0,
         exp: 0,
@@ -3062,6 +3253,7 @@ async fn issue_session_from_cognito(
             github_login: github_login.clone(),
             via: "password".into(),
             jti: String::new(),
+            okta_sub: None,
             aud: String::new(),
             iat: 0,
             exp: 0,
@@ -3200,6 +3392,7 @@ async fn issue_session_from_cognito(
         github_login: github_login.clone(),
         via: "password".into(),
         jti: String::new(),
+        okta_sub: None,
         aud: String::new(),
         iat: 0,
         exp: 0,
