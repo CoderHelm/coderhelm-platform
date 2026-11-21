@@ -222,13 +222,17 @@ async fn reconcile_finished(
             still_open += 1;
             continue;
         };
+        // GitHub's event never brought this close: the run says so, and
+        // the learning page asks a person to check the GitHub App only for
+        // closes like this one (`common::rewards::unscored`).
         let expr = format!(
-            "SET {}",
+            "SET {}, {} = :from",
             fields
                 .iter()
                 .map(|(k, v, _)| format!("{k} = {v}"))
                 .collect::<Vec<_>>()
-                .join(", ")
+                .join(", "),
+            common::rewards::unscored::OUTCOME_FROM
         );
         let mut req = state
             .dynamo
@@ -238,6 +242,7 @@ async fn reconcile_finished(
             .key("run_id", attr_s(&p.run_id))
             // Never overwrite what the webhook recorded meanwhile.
             .condition_expression("attribute_not_exists(pr_outcome)")
+            .expression_attribute_values(":from", attr_s(common::rewards::unscored::FROM_SWEEP))
             .update_expression(expr);
         for (_, placeholder, value) in &fields {
             req = req.expression_attribute_values(*placeholder, attr_s(value));
@@ -453,15 +458,15 @@ fn missed_outcome(p: &Pending, owner: &str, repo: &str, number: u64) -> RewardOu
 /// A close the webhook missed is learned from like any other: the run's
 /// outcome was only written on the run before, so the coder's and the
 /// reviewer's rewards never saw it. Scoring is idempotent per signal, so a
-/// webhook that arrives late counts nothing twice.
+/// webhook that arrives late counts nothing twice; a scoring GitHub held
+/// waits and goes on (`learning_wait`), never dropped.
 async fn score_missed(state: &WorkerState, p: &Pending, owner: &str, repo: &str, number: u64) {
-    if let Err(e) =
-        super::rewards::score_outcome(state, missed_outcome(p, owner, repo, number)).await
-    {
-        warn!(run_id = %p.run_id, error = %e, "Reconcile: could not score the PR outcome");
-    } else {
+    let msg = missed_outcome(p, owner, repo, number);
+    let result = super::rewards::score_outcome(state, msg.clone()).await;
+    if result.is_ok() {
         info!(run_id = %p.run_id, pr = number, "Reconcile: scored a PR outcome the webhook missed");
     }
+    super::learning_wait::settle_outcome(state, &msg, result).await;
 }
 
 /// Stops retrying a run GitHub can't answer for.

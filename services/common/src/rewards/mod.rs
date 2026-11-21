@@ -29,6 +29,7 @@ pub mod mapping;
 pub mod score;
 pub mod store;
 pub mod summary;
+pub mod unscored;
 
 pub use event::{RewardEvent, RewardKind};
 
@@ -58,6 +59,18 @@ pub struct RewardOutcomeMessage {
     /// People's words that came with it: why they reverted.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub note: String,
+    /// GitHub held or refused the scoring's requests: when it goes on, and
+    /// how often it waited (`crate::github_wait`). A held request is a wait,
+    /// never a lost score.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::github_wait::GitHubWait::is_idle"
+    )]
+    pub github_wait: crate::github_wait::GitHubWait,
+    /// Sent again only to score it (after a wait for GitHub, or by the sweep
+    /// for a close with no score yet): what else follows a close already ran.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub rescore: bool,
 }
 
 pub const TRIGGER_REVERTED: &str = "reverted";

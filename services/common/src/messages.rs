@@ -386,6 +386,13 @@ pub struct LessonMessage {
     /// Retries while another run held the repository's memory.
     #[serde(default)]
     pub attempts: u32,
+    /// GitHub held or refused the lesson's requests: when it goes on, and
+    /// how often it waited (`crate::github_wait`).
+    #[serde(
+        default,
+        skip_serializing_if = "crate::github_wait::GitHubWait::is_idle"
+    )]
+    pub github_wait: crate::github_wait::GitHubWait,
 }
 
 /// A judgment of people's pushback on a CoderHelm review (gateway → worker,

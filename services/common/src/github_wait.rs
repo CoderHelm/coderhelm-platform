@@ -113,6 +113,30 @@ pub fn until(now: u64, wait_secs: u64) -> u64 {
     now + wait_secs.max(1) + RESET_SLACK_SECS
 }
 
+/// The wait a job takes after GitHub held or refused it for `wait_secs`
+/// (`cause`), when it already waited as `prior` says: the wait its next
+/// message carries, or None once it waited as often as [`may_wait`] allows.
+/// Background jobs (learning from a closed pull request) use it the way a
+/// run does: a held call is a wait, never the end of the job.
+pub fn next_wait(cause: Cause, wait_secs: u64, prior: &GitHubWait, now: u64) -> Option<GitHubWait> {
+    if !may_wait(cause, prior.waits) {
+        return None;
+    }
+    let wait = paced(cause, wait_secs.max(1), prior.waits);
+    Some(GitHubWait {
+        until: until(now, wait),
+        waits: prior.waits + 1,
+        pass: prior.pass.clone(),
+        cause,
+    })
+}
+
+/// The delay of the first message of a wait that ends at `until`: one hop,
+/// or a few seconds when the wait is already about over.
+pub fn first_hop(until: u64, now: u64) -> u64 {
+    hop(until, now).unwrap_or(RESET_SLACK_SECS + 1)
+}
+
 /// `HH:MM UTC` of an epoch time.
 pub fn clock(epoch: u64) -> String {
     chrono::DateTime::from_timestamp(epoch as i64, 0)
@@ -248,6 +272,26 @@ mod tests {
             .sum();
         assert!(least > 11 * 3600, "{least}");
         assert_eq!(paced(Cause::Outage, 60, 5), 60);
+    }
+
+    #[test]
+    fn a_background_job_waits_paced_and_then_stops_waiting() {
+        let now = 1_000_000;
+        let w = next_wait(Cause::RateLimit, 1_800, &GitHubWait::default(), now).unwrap();
+        assert_eq!(
+            (w.until, w.waits, w.cause),
+            (now + 1_805, 1, Cause::RateLimit)
+        );
+        assert_eq!(first_hop(w.until, now), MAX_HOP_SECS);
+        assert_eq!(first_hop(now, now), RESET_SLACK_SECS + 1);
+        // "In a minute" again and again is paced out like a run's.
+        let w2 = next_wait(Cause::RateLimit, 60, &w, now).unwrap();
+        assert_eq!(w2.until, now + 120 + RESET_SLACK_SECS);
+        let spent = GitHubWait {
+            waits: MAX_LIMIT_WAITS,
+            ..Default::default()
+        };
+        assert!(next_wait(Cause::RateLimit, 60, &spent, now).is_none());
     }
 
     #[test]

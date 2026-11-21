@@ -114,65 +114,24 @@ fn item_n(i: &Item, k: &str) -> f64 {
         .unwrap_or(0.0)
 }
 
-/// Pure: the CoderHelm pull requests that closed, from run items
-/// (`pr_url`, `merged_at` or `pr_closed_at`).
-pub fn closed_prs_of(runs: &[Item]) -> Vec<health::ClosedPr> {
-    runs.iter()
-        .filter_map(|r| {
-            let (owner, name, pr) = common::pr_outcome::parse_pr_url(&item_s(r, "pr_url"))?;
-            let closed_at = match item_s(r, "merged_at") {
-                m if !m.is_empty() => m,
-                _ => item_s(r, "pr_closed_at"),
-            };
-            // The coder arm its run picked; a run from before the coder had
-            // variants has none, and its PR can't be credited to one.
-            let variant = match item_s(r, "prompt_variant") {
-                v if bandit::arm(common::rewards::event::AGENT_CODER, &v).is_some() => v,
-                _ => String::new(),
-            };
-            (!closed_at.is_empty()).then(|| health::ClosedPr {
-                repo: format!("{owner}/{name}"),
-                pr,
-                closed_at,
-                variant,
-            })
-        })
-        .collect()
-}
+/// The CoderHelm pull requests that closed, from run items: the same
+/// reading the worker's retry sweep uses (`common::rewards::unscored`).
+pub use common::rewards::unscored::closed_prs_of;
 
 /// The team's runs whose PR merged or closed since `since`.
 async fn closed_runs(state: &AppState, team: &str, since: &str) -> Vec<Item> {
-    let mut out = Vec::new();
-    let mut start: Option<Item> = None;
-    for _ in 0..HEALTH_PAGES {
-        let page = state
-            .dynamo
-            .query()
-            .table_name(&state.config.runs_table_name)
-            .key_condition_expression("team_id = :t")
-            .filter_expression("merged_at >= :s OR pr_closed_at >= :s")
-            .projection_expression("pr_url, merged_at, pr_closed_at, prompt_variant")
-            .expression_attribute_values(
-                ":t",
-                aws_sdk_dynamodb::types::AttributeValue::S(team.into()),
-            )
-            .expression_attribute_values(
-                ":s",
-                aws_sdk_dynamodb::types::AttributeValue::S(since.into()),
-            )
-            .set_exclusive_start_key(start.take())
-            .send()
-            .await;
-        let Ok(page) = page else {
-            break;
-        };
-        out.extend(page.items().iter().cloned());
-        match page.last_evaluated_key() {
-            Some(k) if !k.is_empty() => start = Some(k.clone()),
-            _ => break,
-        }
-    }
-    out
+    common::rewards::unscored::closed_runs(
+        &state.dynamo,
+        &state.config.runs_table_name,
+        team,
+        since,
+        HEALTH_PAGES,
+    )
+    .await
+    .unwrap_or_else(|e| {
+        error!(error = %e, "Could not read the closed pull requests for the learning health");
+        Vec::new()
+    })
 }
 
 /// GET /api/learning/health — per learning loop: its last signal, its count

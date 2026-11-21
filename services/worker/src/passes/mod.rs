@@ -1323,6 +1323,7 @@ mod infra_repo;
 pub mod jira_comment;
 pub mod knowledge;
 pub mod knowledge_sync;
+pub mod learning_wait;
 pub mod lesson_cleanup;
 pub mod lessons;
 pub mod line_count;

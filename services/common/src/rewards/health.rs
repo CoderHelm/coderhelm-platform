@@ -16,6 +16,7 @@
 
 use super::event::{RewardEvent, RewardKind, AGENT_CODER, AGENT_REVIEWER};
 use super::lessons::{backed, is_coder_setback};
+use super::unscored;
 use crate::decision_log::Record;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -42,6 +43,10 @@ pub enum State {
     Ok,
     /// It should have fired and didn't: something is broken.
     Quiet,
+    /// It got its signal and is still learning from it: CoderHelm is trying
+    /// again by itself (GitHub held its requests for a while). Nothing for a
+    /// person to do, and the page is not red.
+    Retrying,
     /// Nothing happened that should feed it.
     Idle,
 }
@@ -60,6 +65,10 @@ pub struct Loop {
     pub expected: Option<u64>,
     /// What the numbers mean, in words.
     pub detail: String,
+    /// What a person should check, when the loop is quiet and the cause is
+    /// known; empty otherwise (the page has its own words per loop).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub check: String,
 }
 
 /// A CoderHelm pull request that closed (merged or not) in the window.
@@ -71,6 +80,27 @@ pub struct ClosedPr {
     /// The coder variant its run used; empty for a run started before the
     /// coder had variants (nothing can be credited to it).
     pub variant: String,
+    /// The run that opened it.
+    pub run_id: String,
+    pub installation_id: u64,
+    /// How its scoring goes (`super::unscored`).
+    pub retry: Retry,
+}
+
+/// How a closed pull request's scoring goes, from its run.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Retry {
+    /// Times its scoring was sent again.
+    pub tries: u32,
+    /// When the next try is due (RFC 3339), empty when none was sent.
+    pub retry_at: String,
+    /// The last error a try ended with.
+    pub error: String,
+    /// Why CoderHelm stopped trying, empty while it tries.
+    pub gave_up: String,
+    /// GitHub's event never brought the close: CoderHelm's own check found
+    /// it.
+    pub from_sweep: bool,
 }
 
 /// One review CoderHelm posted, from its record's key
@@ -169,42 +199,16 @@ pub fn loops(i: &Inputs<'_>, now: DateTime<Utc>) -> Vec<Loop> {
         reviews.iter().map(|r| (r.repo.clone(), r.pr)).collect();
     let mut out = Vec::new();
 
-    // 1. Outcomes of CoderHelm's own PRs.
-    let scored: BTreeSet<(String, u64)> = events
-        .iter()
-        .filter(|e| e.agent == AGENT_CODER)
-        .filter(|e| {
-            matches!(
-                e.kind,
-                Some(RewardKind::PrMergedUnchanged)
-                    | Some(RewardKind::PrMergedEdited)
-                    | Some(RewardKind::PrClosedUnmerged)
-                    | Some(RewardKind::TimeToMerge)
-            )
-        })
-        .map(|e| (e.repo.clone(), e.pr))
-        .collect();
-    let grace = now - chrono::Duration::minutes(SCORE_GRACE_MINUTES);
-    let due: BTreeSet<(String, u64)> = i
-        .closed_prs
-        .iter()
-        .filter(|p| within(&p.closed_at, since) && parse(&p.closed_at).is_some_and(|d| d <= grace))
-        .map(|p| (p.repo.clone(), p.pr))
-        .collect();
-    let missing: Vec<String> = due
-        .difference(&scored)
-        .map(|(r, n)| format!("{r}#{n}"))
-        .collect();
+    // 1. Outcomes of CoderHelm's own PRs: due and missing by the one rule
+    // the retry sweep uses too (`unscored`).
+    let due = unscored::due(i.closed_prs, now);
+    let missing = unscored::missing(i.closed_prs, events.iter().copied(), now);
+    let scored_due = due.len() - missing.len();
+    let (state, detail, check) = pr_outcomes_reading(&missing, scored_due, due.len(), now);
     out.push(Loop {
         key: "pr_outcomes",
         label: "Outcomes of CoderHelm's pull requests",
-        state: if due.is_empty() {
-            State::Idle
-        } else if missing.is_empty() {
-            State::Ok
-        } else {
-            State::Quiet
-        },
+        state,
         last_signal_at: newest(
             events
                 .iter()
@@ -213,26 +217,10 @@ pub fn loops(i: &Inputs<'_>, now: DateTime<Utc>) -> Vec<Loop> {
         ),
         // Scored among the due ones: a PR scored inside the grace, or one
         // that closed before the window, is not part of "of N".
-        count: due.intersection(&scored).count() as u64,
+        count: scored_due as u64,
         expected: Some(due.len() as u64),
-        detail: if missing.is_empty() {
-            format!(
-                "{} of {} pull requests that closed were scored",
-                due.intersection(&scored).count(),
-                due.len()
-            )
-        } else {
-            format!(
-                "{} closed pull request(s) were never scored: {}",
-                missing.len(),
-                missing
-                    .iter()
-                    .take(5)
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        },
+        detail,
+        check,
     });
 
     // 2. Outcomes of review comments (acted on, dismissed, left open).
@@ -266,6 +254,7 @@ pub fn loops(i: &Inputs<'_>, now: DateTime<Utc>) -> Vec<Loop> {
             by_kind(RewardKind::FindingDismissed),
             by_kind(RewardKind::FindingIgnored),
         ),
+        check: String::new(),
     });
 
     // 3. Calibration (counters, and the changes they make).
@@ -300,6 +289,7 @@ pub fn loops(i: &Inputs<'_>, now: DateTime<Utc>) -> Vec<Loop> {
             to("suppress"),
             to("none")
         ),
+        check: String::new(),
     });
 
     // 4 and 5. Prompt variants, per agent.
@@ -380,6 +370,7 @@ pub fn loops(i: &Inputs<'_>, now: DateTime<Utc>) -> Vec<Loop> {
             count: credited_here as u64,
             expected: Some(expected as u64),
             detail,
+            check: String::new(),
         });
     }
 
@@ -406,6 +397,7 @@ pub fn loops(i: &Inputs<'_>, now: DateTime<Utc>) -> Vec<Loop> {
             "{used_7d} of {} example(s) used this window",
             i.exemplar_last_used.len()
         ),
+        check: String::new(),
     });
 
     // 7. Coder lessons: an area with backed setbacks should have one.
@@ -442,6 +434,7 @@ pub fn loops(i: &Inputs<'_>, now: DateTime<Utc>) -> Vec<Loop> {
             by_area.values().map(Vec::len).sum::<usize>(),
             by_area.len()
         ),
+        check: String::new(),
     });
 
     // 8. Pushback judgments.
@@ -484,6 +477,7 @@ pub fn loops(i: &Inputs<'_>, now: DateTime<Utc>) -> Vec<Loop> {
             recent_pending.len(),
             judged.len()
         ),
+        check: String::new(),
     });
 
     // 9. The stop judge's outcome log.
@@ -515,8 +509,123 @@ pub fn loops(i: &Inputs<'_>, now: DateTime<Utc>) -> Vec<Loop> {
             "{} ask(s), stop(s) and block(s); {with_outcome} with a person's act recorded, {wrong} shown wrong (the judge is given those)",
             stops.len()
         ),
+        check: String::new(),
     });
     out
+}
+
+/// Short names of pull requests, by repository: `acme/web #1, #2`, at most
+/// [`NAMED`] of them, then how many more.
+fn names(prs: &[&ClosedPr]) -> String {
+    let mut by_repo: BTreeMap<&str, Vec<u64>> = BTreeMap::new();
+    for p in prs.iter().take(NAMED) {
+        by_repo.entry(p.repo.as_str()).or_default().push(p.pr);
+    }
+    let mut s = by_repo
+        .into_iter()
+        .map(|(repo, mut n)| {
+            n.sort_unstable();
+            let n: Vec<String> = n.iter().map(|n| format!("#{n}")).collect();
+            format!("{repo} {}", n.join(", "))
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    if prs.len() > NAMED {
+        s.push_str(&format!(" and {} more", prs.len() - NAMED));
+    }
+    s
+}
+
+/// Pull requests named in a loop's detail.
+const NAMED: usize = 5;
+
+/// What the pull request loop says: its state, its detail and what a
+/// person should check. A close the run recorded whose score isn't kept
+/// yet is CoderHelm's to finish, and it does so by itself ("retrying",
+/// with the next try's time). Only a close GitHub's event never brought
+/// asks a person to check the GitHub App, and only a scoring CoderHelm
+/// stopped trying says so, with why.
+fn pr_outcomes_reading(
+    missing: &[&ClosedPr],
+    scored: usize,
+    due: usize,
+    now: DateTime<Utc>,
+) -> (State, String, String) {
+    let done = format!("{scored} of {due} pull requests that closed were scored");
+    if due == 0 {
+        return (State::Idle, done, String::new());
+    }
+    if missing.is_empty() {
+        return (State::Ok, done, String::new());
+    }
+    let stopped: Vec<&ClosedPr> = missing
+        .iter()
+        .copied()
+        .filter(|p| !p.retry.gave_up.is_empty())
+        .collect();
+    let unheard: Vec<&ClosedPr> = missing
+        .iter()
+        .copied()
+        .filter(|p| p.retry.gave_up.is_empty() && p.retry.from_sweep)
+        .collect();
+    let retrying: Vec<&ClosedPr> = missing
+        .iter()
+        .copied()
+        .filter(|p| p.retry.gave_up.is_empty() && !p.retry.from_sweep)
+        .collect();
+    let mut detail = vec![done];
+    let mut check = Vec::new();
+    if !retrying.is_empty() {
+        let next = retrying
+            .iter()
+            .filter_map(|p| parse(&p.retry.retry_at))
+            .filter(|at| *at > now)
+            .min();
+        let when = match next {
+            Some(at) => format!(
+                "next try at {}",
+                crate::github_wait::clock(at.timestamp().max(0) as u64)
+            ),
+            None => format!(
+                "next try within {} minutes",
+                super::unscored::SWEEP_EVERY_MINUTES
+            ),
+        };
+        detail.push(format!(
+            "retrying the other {} automatically, {when} ({})",
+            retrying.len(),
+            names(&retrying)
+        ));
+    }
+    if !unheard.is_empty() {
+        detail.push(format!(
+            "{} closed with no pull request event from GitHub and are not scored yet ({})",
+            unheard.len(),
+            names(&unheard)
+        ));
+        check.push(
+            "GitHub's pull request events did not arrive for some closes. Check that the GitHub \
+             App still gets pull request events (Settings, Integrations, GitHub)."
+                .to_string(),
+        );
+    }
+    if !stopped.is_empty() {
+        detail.push(format!(
+            "{} could not be scored ({})",
+            stopped.len(),
+            names(&stopped)
+        ));
+        check.push(format!(
+            "{}. Look in the worker's log for \"Reward outcome\" on these pull requests.",
+            stopped[0].retry.gave_up.trim_end_matches('.')
+        ));
+    }
+    let state = if check.is_empty() {
+        State::Retrying
+    } else {
+        State::Quiet
+    };
+    (state, detail.join("; "), check.join(" "))
 }
 
 /// The page: every loop, and red when any is quiet.
@@ -527,11 +636,17 @@ pub fn build(i: &Inputs<'_>, now: DateTime<Utc>) -> serde_json::Value {
         .filter(|l| l.state == State::Quiet)
         .map(|l| l.key)
         .collect();
+    let retrying: Vec<&str> = loops
+        .iter()
+        .filter(|l| l.state == State::Retrying)
+        .map(|l| l.key)
+        .collect();
     serde_json::json!({
         "window_days": WINDOW_DAYS,
         "generated_at": now.to_rfc3339(),
         "state": if quiet.is_empty() { "ok" } else { "red" },
         "quiet": quiet,
+        "retrying": retrying,
         "loops": loops,
     })
 }
@@ -589,11 +704,36 @@ mod tests {
             closed_prs: &closed,
             ..Default::default()
         };
+        // The run recorded the close and its score isn't kept yet:
+        // CoderHelm is retrying, the page says when, and nothing is red.
+        let l = loops(&i, now());
+        let pr = by_key(&l, "pr_outcomes");
+        assert_eq!(pr.state, State::Retrying);
+        assert_eq!((pr.count, pr.expected), (1, Some(2)));
+        assert!(
+            pr.detail.contains("retrying the other 1 automatically")
+                && pr.detail.contains("acme/web #2"),
+            "{}",
+            pr.detail
+        );
+        assert!(pr.check.is_empty());
+        assert_eq!(build(&i, now())["state"], "ok");
+
+        // CoderHelm stopped trying: red, with why.
+        let mut stopped = closed.clone();
+        stopped[1].retry.gave_up = "Scoring did not finish after 8 tries".into();
+        let i = Inputs {
+            events: &events,
+            closed_prs: &stopped,
+            ..Default::default()
+        };
         let l = loops(&i, now());
         let pr = by_key(&l, "pr_outcomes");
         assert_eq!(pr.state, State::Quiet);
-        assert_eq!(pr.expected, Some(2));
-        assert!(pr.detail.contains("acme/web#2"), "{}", pr.detail);
+        assert!(pr
+            .check
+            .starts_with("Scoring did not finish after 8 tries."));
+        assert!(!pr.check.contains("GitHub App"), "{}", pr.check);
         let page = build(&i, now());
         assert_eq!(page["state"], "red");
         assert!(page["quiet"]
@@ -601,6 +741,18 @@ mod tests {
             .unwrap()
             .iter()
             .any(|q| q == "pr_outcomes"));
+
+        // Only a close GitHub's event never brought asks for the App.
+        let mut unheard = closed.clone();
+        unheard[1].retry.from_sweep = true;
+        let i = Inputs {
+            events: &events,
+            closed_prs: &unheard,
+            ..Default::default()
+        };
+        let pr = by_key(&loops(&i, now()), "pr_outcomes").clone();
+        assert_eq!(pr.state, State::Quiet);
+        assert!(pr.check.contains("GitHub App"), "{}", pr.check);
     }
 
     #[test]
@@ -761,6 +913,7 @@ mod tests {
                 pr,
                 closed_at: "2026-11-04T00:00:00Z".into(),
                 variant: "read_first".into(),
+                ..Default::default()
             })
             .collect();
         let arms = vec![
@@ -837,6 +990,7 @@ mod tests {
             pr: 18,
             closed_at: "2026-11-06T00:00:00Z".into(),
             variant: "read_first".into(),
+            ..Default::default()
         });
         let mut credited = ev(
             RewardKind::PrMergedUnchanged,
