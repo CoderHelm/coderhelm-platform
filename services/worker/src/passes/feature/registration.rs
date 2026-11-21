@@ -46,7 +46,7 @@
 //! noted in the pull request for a person to check. And a block never stops
 //! the run: it is an Open item on the pull request (see `feature::gate`).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use crate::clients::github::GitHubClient;
 use crate::passes::feature::reuse::name_words;
@@ -1061,7 +1061,7 @@ async fn generator_outputs(
     tree: &[String],
 ) -> Vec<String> {
     use crate::passes::generators;
-    let mut files = std::collections::HashMap::new();
+    let mut files = HashMap::new();
     for p in generators::candidate_files(tree).into_iter().take(40) {
         if let Ok(t) = github.read_file(owner, repo, &p, git_ref).await {
             files.insert(p, t);
@@ -1133,6 +1133,8 @@ pub async fn check(
     let mut checked = 0usize;
     // The repository's generator outputs, read once when a place is looked for.
     let mut outputs: Option<Vec<String>> = None;
+    // A place's history is read once per check, however many new items name it.
+    let mut read_histories: HashMap<String, History> = HashMap::new();
     for item in new_items(added, tree).into_iter().take(6) {
         let sibs = siblings(&item, tree, recorded_sibling);
         if sibs.is_empty() {
@@ -1225,7 +1227,11 @@ pub async fn check(
         let mut histories: Vec<(String, History)> = Vec::new();
         for (p, _, registry) in &places {
             if *registry {
-                histories.push((p.clone(), place_history(github, owner, repo, p).await));
+                if !read_histories.contains_key(p) {
+                    let h = place_history(github, owner, repo, p).await;
+                    read_histories.insert(p.clone(), h);
+                }
+                histories.push((p.clone(), read_histories[p].clone()));
             }
         }
         let (places, listed) = settle_places(places, &sibs, &|p: &str| {

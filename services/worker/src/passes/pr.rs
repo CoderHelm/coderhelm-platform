@@ -1000,11 +1000,6 @@ async fn notify_alert_pr(
     .await;
 }
 
-/// Reopen the branch's prior closed-unmerged PR, if any. A ticket-update
-/// re-run force-resets the branch to base, which makes GitHub auto-close the
-/// PR ("all commits removed"); once the fresh implementation has pushed new
-/// commits, reopening keeps the PR number and its review history instead of
-/// creating a new PR every re-run. Failures fall back to PR creation.
 /// The base a reused pull request (an open one of this branch, or a
 /// reopened one) moves to: the branch this run is built on, when that is
 /// another open pull request's branch of this repository (the run stacked
@@ -1068,6 +1063,11 @@ async fn retarget(github: &GitHubClient, msg: &TicketMessage, pr: &serde_json::V
     }
 }
 
+/// Reopen the branch's prior closed-unmerged PR, if any. A ticket-update
+/// re-run force-resets the branch to base, which makes GitHub auto-close the
+/// PR ("all commits removed"); once the fresh implementation has pushed new
+/// commits, reopening keeps the PR number and its review history instead of
+/// creating a new PR every re-run. Failures fall back to PR creation.
 async fn reopen_prior_pr(
     github: &GitHubClient,
     msg: &TicketMessage,
