@@ -123,6 +123,11 @@ pub enum WorkerMessage {
     /// to the default branch re-indexes only the changed files).
     #[serde(rename = "graph_index")]
     GraphIndex(GraphIndexMessage),
+    /// Build or bring up to date a team's app map from its repositories'
+    /// code graphs (`common::app_map`); a repository without a graph gets
+    /// its first build queued.
+    #[serde(rename = "app_map")]
+    AppMap(AppMapMessage),
     /// Read the test reports of a finished workflow run or an upload.
     #[serde(rename = "test_ingest")]
     TestIngest(crate::e2e::messages::TestIngest),
@@ -446,6 +451,7 @@ impl WorkerMessage {
             WorkerMessage::ReleaseNotes(_) | WorkerMessage::TagSweep(_) => f::RELEASE_NOTES,
             WorkerMessage::TestIngest(_) | WorkerMessage::TestAction(_) => f::TESTS,
             WorkerMessage::ToolProposals(_) => f::LIVE_SOURCES,
+            WorkerMessage::AppMap(_) => f::APP_MAP,
             WorkerMessage::KnowledgeSync(_) => f::EMBEDDING,
             WorkerMessage::BedrockSync(_) => f::OTHER,
             WorkerMessage::HiddenSuggest(_) => f::DATA_SOURCE,
@@ -521,6 +527,7 @@ impl WorkerMessage {
             | WorkerMessage::Restack(_)
             | WorkerMessage::ReleaseNotes(_)
             | WorkerMessage::GraphIndex(_)
+            | WorkerMessage::AppMap(_)
             | WorkerMessage::TestIngest(_)
             | WorkerMessage::TestAction(_)
             | WorkerMessage::SkillSync(_)
@@ -691,6 +698,14 @@ pub struct GraphIndexMessage {
     pub branch: String,
     #[serde(default)]
     pub changed_files: Option<Vec<String>>,
+}
+
+/// A team's app map: every repository (`repo` empty) or one.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct AppMapMessage {
+    pub team_id: String,
+    #[serde(default)]
+    pub repo: String,
 }
 
 /// A coalesced release-tag sweep. Carries only routing + the batch clock; the

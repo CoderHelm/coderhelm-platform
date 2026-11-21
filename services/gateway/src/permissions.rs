@@ -230,6 +230,8 @@ pub const CAPABILITIES: &[Capability] = &[
             "brain::delete_thread",
             "brain::delete_threads",
             "brain::rate_message",
+            // Ask the app map: Chat's agent with the map lookups.
+            "app_map::ask",
         ],
     },
     Capability {
@@ -509,6 +511,7 @@ pub const CAPABILITIES: &[Capability] = &[
             "api::regenerate_repo",
             "graph::update_config",
             "graph::rebuild",
+            "app_map::rebuild",
             "infrastructure::refresh_infrastructure",
             "infrastructure::refresh_repo_infrastructure",
             // A repository's preview access (see routes::preview_access).

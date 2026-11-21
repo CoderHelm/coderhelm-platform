@@ -418,7 +418,7 @@ fn github_caller(message: &models::WorkerMessage) -> &'static str {
         M::PluginSweep => who::SWEEP_PLUGINS,
         M::KnowledgeSyncSweep | M::KnowledgeSync(_) | M::BedrockSync(_) => who::SWEEP_KNOWLEDGE,
         M::LogAutofix => who::SWEEP_LOG_AUTOFIX,
-        M::GraphIndex(_) => who::SWEEP_GRAPH,
+        M::GraphIndex(_) | M::AppMap(_) => who::SWEEP_GRAPH,
         M::Lesson(_) | M::RewardOutcome(_) | M::ReviewLesson(_) => who::SWEEP_LEARNING,
         M::WeeklySummary | M::WeeklySummaryTest(_) => who::SWEEP_WEEKLY,
         M::DeployStatsBackfill(_) | M::DeployRun(_) => who::SWEEP_DEPLOYS,
@@ -966,6 +966,10 @@ async fn handle_message_inner(state: Arc<WorkerState>, message: models::WorkerMe
             if let Err(e) = passes::code_graph::run(&state, msg).await {
                 error!("Code-graph index failed: {e:?}");
             }
+        }
+        models::WorkerMessage::AppMap(msg) => {
+            info!(team_id = %msg.team_id, "App map build");
+            passes::app_map::run(&state, msg).await;
         }
         models::WorkerMessage::KnowledgeSyncSweep => {
             let queued = passes::knowledge_sync::sweep(&state).await;

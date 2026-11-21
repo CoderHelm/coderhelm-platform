@@ -6,6 +6,11 @@ pub mod agent_file;
 /// The agent log of a run: its file format, outcomes, order and redaction
 /// (worker writes it, gateway serves it).
 pub mod agent_log;
+/// The app map: a team's repositories as parts, the connections between
+/// them and the outside services they use, built from the code graph.
+pub mod app_map;
+/// What one file says about the app: endpoints, requests, screens, packages.
+pub mod app_surface;
 /// A repository's code map: sections stamped with the commit they describe,
 /// rebuilt only where a change touched them, given to the planner and coder.
 pub mod code_map;
