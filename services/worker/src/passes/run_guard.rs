@@ -24,8 +24,10 @@
 //!   not progress. Each of these only moves one way (or is capped elsewhere),
 //!   so a checker that keeps finding something can't keep resetting the count.
 //! - When the guard fires a run ends one way, always: a draft pull request
-//!   with what exists and its Open items, status `needs_input`, a plain reason
-//!   on the run page, one notification, and the reason recorded for analytics.
+//!   with what exists and its Open items, a plain reason on the run page, one
+//!   notification, and the reason recorded for analytics. A stop over planned
+//!   work (tasks done, or tasks stuck after the supervisor's ladder) ships and
+//!   is taken back once the work is on its pull request ([`ships_code`]).
 //!
 //! [`Ledger`] is the other half: the pull request the run opened, what each
 //! check found on which head, and how many fix rounds it took, kept across
@@ -119,11 +121,17 @@ const _: () = assert!(MAX_TRANSITIONS_WITHOUT_PROGRESS >= worst_normal_run());
 /// The stored code of a [`Trip::Converged`] stop.
 pub const CONVERGED: &str = "converged_with_open_items";
 
-/// Stop codes that ship the work instead of handing it back: the current one
-/// and the after-work cap it replaced (still on older runs' records).
+/// Stop codes that ship the work instead of handing it back: the run that
+/// converged, the run whose planned tasks stopped moving (its count of
+/// continuations is spent after the supervisor's ladder changed approach),
+/// and the after-work cap converging replaced (still on older runs'
+/// records). Spend, pass transitions and the run's ceilings stay hard stops.
 pub fn ships_code(code: &str) -> bool {
-    matches!(code, CONVERGED | "continuations_after_work")
+    matches!(code, CONVERGED | CONTINUATIONS | "continuations_after_work")
 }
+
+/// The stored code of a [`Trip::Continuations`] stop.
+pub const CONTINUATIONS: &str = "continuations";
 
 /// Why the guard ended a run. The stored code is what analytics counts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,7 +141,11 @@ pub enum Trip {
     /// Never a hand-back: CI and comments on the pull request still start
     /// rounds ([`Trip::ships`]).
     Converged,
-    /// Continuations without progress, tasks still open.
+    /// Continuations without progress, tasks still open. By then the
+    /// supervisor's ladder has changed approach on the stuck task (one task,
+    /// fresh context with edits in place, a re-split, the strongest model,
+    /// then the task deferred): the run ships what is done with the rest
+    /// deferred, never a hand-back ([`Trip::ships`]).
     Continuations,
     /// Pass transitions without progress.
     Transitions,
@@ -145,7 +157,7 @@ impl Trip {
     pub fn code(self) -> &'static str {
         match self {
             Trip::Converged => CONVERGED,
-            Trip::Continuations => "continuations",
+            Trip::Continuations => CONTINUATIONS,
             Trip::Transitions => "pass_transitions",
             Trip::Spend => "spend",
         }
@@ -155,7 +167,7 @@ impl Trip {
     /// done, so what is left is checks and fixes CoderHelm can still make,
     /// and new evidence (a red check with its error, a comment) starts them.
     pub fn ships(self) -> bool {
-        matches!(self, Trip::Converged)
+        matches!(self, Trip::Converged | Trip::Continuations)
     }
 
     /// What the run page says, in plain words.
@@ -176,13 +188,19 @@ impl Trip {
                  comment there starts another round."
             );
         }
-        let what = match self {
-            // Answered above: it ships, it is never handed back.
-            Trip::Converged => String::new(),
-            Trip::Continuations => format!(
-                "it continued {} times without finishing another task",
+        if self == Trip::Continuations {
+            return format!(
+                "CoderHelm shipped what is done on the pull request: {} continuation(s) in a row \
+                 finished no further planned task after it changed its approach on the stuck \
+                 one, so the tasks still open are deferred there with why. CoderHelm fixes what \
+                 CI reports on the pull request, and a push or a comment there starts another \
+                 round.",
                 g.continuations
-            ),
+            );
+        }
+        let what = match self {
+            // Answered above: they ship, they are never handed back.
+            Trip::Converged | Trip::Continuations => String::new(),
             Trip::Transitions => format!(
                 "it moved between steps {} times with no task finished, no fewer open findings \
                  and no green CI",
@@ -1792,7 +1810,12 @@ mod tests {
         assert!(why.contains("fixes what CI reports"), "{why}");
         assert!(!why.contains("handed it to you"), "{why}");
         let why = Trip::Continuations.reason(&GuardState::default());
-        assert!(why.contains("Push to the branch or comment"), "{why}");
+        assert!(why.contains("shipped what is done"), "{why}");
+        assert!(why.contains("a push or a comment"), "{why}");
+        assert!(!why.contains("handed it to you"), "{why}");
+        assert!(Trip::Transitions
+            .reason(&GuardState::default())
+            .contains("Push to the branch or comment"));
         let g = GuardState {
             spend_usd: 20.5,
             ..Default::default()

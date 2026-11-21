@@ -1,0 +1,5 @@
+# dj. `dj_new_run_ends_earlier_waits`
+
+**What happened:** A booking ticket's run asked a person which booking page to embed and waited. Ten minutes later a comment on the ticket answered it and started a fresh run, which built the pages and opened its pull request. The first run went on waiting, reminded once a day, though its question was long settled. An alarm did the same: each firing started a run beside the one still asking, and two of those were still waiting days after a third had finished the fix. A run waiting on a person was not counted as live, so a new trigger took the ticket over, and nothing ended the old wait.
+
+**The guarantee:** When a fresh run of a ticket takes its claim, every earlier run of that ticket in the same repository that is still waiting on a person stops waiting (`one_run::earlier_waits`, `passes::one_run::end_earlier_waits`). It becomes `retried`, points at the new run, and its page says where the work went. The write only applies while that run still waits. A run that ended any other way is left as it is, and a run of the same ticket in another repository is its own.

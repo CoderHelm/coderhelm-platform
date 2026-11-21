@@ -65,9 +65,40 @@ fn workflow_run_id(check: &Value) -> Option<u64> {
     })
 }
 
-/// The failing checks in a `check-runs` listing. Only the newest run of each
-/// check name counts, so a failure that a re-run fixed doesn't linger.
-pub fn failing_checks(checks: &[Value]) -> Failing {
+/// One failing check, as a `check-runs` listing names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailedCheck {
+    /// The check's own name (a job's name for a GitHub Actions check).
+    pub name: String,
+    /// The workflow run it belongs to, when it is a GitHub Actions job.
+    pub workflow_run_id: Option<u64>,
+    pub conclusion: String,
+}
+
+/// The failing checks in a `check-runs` listing, by name, newest run of
+/// each name only, in name order.
+pub fn failed_checks(checks: &[Value]) -> Vec<FailedCheck> {
+    let mut out: Vec<FailedCheck> = latest_by_name(checks)
+        .into_values()
+        .filter(|c| c["status"].as_str() == Some("completed"))
+        .filter_map(|c| {
+            let conclusion = c["conclusion"].as_str().unwrap_or("");
+            FAILED.contains(&conclusion).then(|| FailedCheck {
+                name: c["name"].as_str().unwrap_or("check").to_string(),
+                workflow_run_id: workflow_run_id(c),
+                conclusion: conclusion.to_string(),
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+/// The conclusions that mean a check failed.
+const FAILED: &[&str] = &["failure", "timed_out", "startup_failure", "action_required"];
+
+/// The newest run of each check name.
+fn latest_by_name(checks: &[Value]) -> HashMap<&str, &Value> {
     let mut latest: HashMap<&str, &Value> = HashMap::new();
     for c in checks {
         let name = c["name"].as_str().unwrap_or("check");
@@ -80,15 +111,19 @@ pub fn failing_checks(checks: &[Value]) -> Failing {
             latest.insert(name, c);
         }
     }
+    latest
+}
+
+/// The failing checks in a `check-runs` listing. Only the newest run of each
+/// check name counts, so a failure that a re-run fixed doesn't linger.
+pub fn failing_checks(checks: &[Value]) -> Failing {
+    let latest = latest_by_name(checks);
     let mut out = Failing::default();
     for c in latest.values() {
         if c["status"].as_str() != Some("completed") {
             continue;
         }
-        let failed = matches!(
-            c["conclusion"].as_str().unwrap_or(""),
-            "failure" | "timed_out" | "startup_failure" | "action_required"
-        );
+        let failed = FAILED.contains(&c["conclusion"].as_str().unwrap_or(""));
         if !failed {
             continue;
         }

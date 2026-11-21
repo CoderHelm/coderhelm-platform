@@ -1,0 +1,404 @@
+//! rg. Two new-feature runs drafted their pull requests and were blocked
+//! "new items aren't registered everywhere their siblings are", both for
+//! places that don't register anything:
+//!
+//! - a run added a validation helper beside a studio's document schemas.
+//!   The rule called it unregistered in the documents index, in the desk
+//!   structure, and in a one-off data migration that lists, once, the
+//!   document types it rewrote;
+//! - a run added a `heading` component beside the site's UI components. The
+//!   rule called it unregistered in the site's `package.json`, which names
+//!   `@radix-ui/react-accordion` and the like as dependencies.
+//!
+//! People closed both drafts. The rule took a file for a registry when it
+//! named most of a sample of eight siblings (the first eight by name), and
+//! told places apart by folder names: `migrations/`, `docs/`, `fixtures/`
+//! were never places, every other file could be. So a backfill kept in any
+//! other folder, or a generated types file, was a "registry"; and a real
+//! registry of migrations (an index every new migration is added to) was
+//! never one.
+//!
+//! Guarantee: a registry is told from a file that merely names the items by
+//! what the file is, never by its folder or a list of names. It lists the
+//! kind (more than half of all its existing siblings, by path or as whole
+//! strings); it is part of the program (not prose, a test or its fixtures,
+//! nor a file the repository's generators write or whose head says it is
+//! generated); and it grew with the kind (its history names fewer of the
+//! siblings when it was written than now). A file that lists them but never
+//! grew is noted for a person, and one whose history can't be read is not
+//! checked, so neither blocks. Only a checked registry blocks, and the coder
+//! is told to add the entry itself first.
+
+use super::fixture::*;
+use crate::passes::feature::registration::{self, History, Kind, NewItem};
+use crate::passes::generators;
+
+const OLD: &str = "isn't registered in `apps/studio/backfills";
+
+/// A studio's document schemas, by the name of their type.
+fn documents() -> Vec<String> {
+    [
+        "berth",
+        "boat",
+        "boat-index",
+        "captain",
+        "charter",
+        "charter-index",
+        "crew",
+        "dock",
+        "dock-index",
+        "ferry",
+        "fuel-dock",
+        "harbor-page",
+        "lesson",
+        "lesson-index",
+        "marina",
+        "mooring",
+        "pier",
+        "regatta",
+        "regatta-index",
+        "sail",
+        "slip",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+fn doc_path(name: &str) -> String {
+    format!("apps/studio/schemaTypes/documents/{name}.ts")
+}
+
+fn doc_schema(name: &str) -> String {
+    format!(
+        "import {{defineField, defineType}} from 'cms-kit'\n\nexport default defineType({{\n  \
+         name: '{name}',\n  type: 'document',\n  fields: [defineField({{name: 'title', type: 'string'}})],\n}})\n"
+    )
+}
+
+fn camel(name: &str) -> String {
+    let mut out = String::new();
+    let mut up = false;
+    for c in name.chars() {
+        if c == '-' {
+            up = true;
+        } else if up {
+            out.push(c.to_ascii_uppercase());
+            up = false;
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// The documents index, importing each schema's default export: `upto` of
+/// them (in name order).
+fn index_of(upto: usize) -> String {
+    let docs = documents();
+    let mut s = String::new();
+    for d in &docs[..upto] {
+        s.push_str(&format!("import {} from './{d}'\n", camel(d)));
+    }
+    let names: Vec<String> = docs[..upto].iter().map(|d| camel(d)).collect();
+    s.push_str(&format!(
+        "\nexport const documents = [{}]\n",
+        names.join(", ")
+    ));
+    s
+}
+
+/// The desk structure, listing every document type by name.
+fn structure() -> String {
+    let items: String = documents()
+        .iter()
+        .map(|d| format!("    S.documentTypeListItem('{d}'),\n"))
+        .collect();
+    format!("export const structure = (S) =>\n  S.list().items([\n{items}  ])\n")
+}
+
+/// A one-off backfill: the types it rewrote, once. Kept beside the studio,
+/// not in a folder called `migrations`.
+fn backfill() -> String {
+    "import {defineMigration} from 'cms-kit/migrate'\n\nexport default defineMigration({\n  \
+     title: 'Replace the slip url with a link object',\n  documentTypes: [\n    'berth',\n    \
+     'boat-index',\n    'captain',\n    'charter-index',\n    'dock',\n    'ferry',\n    'pier',\n    \
+     'regatta',\n  ],\n  migrate: {},\n})\n"
+        .to_string()
+}
+
+/// The site's generated types (the fixture's typegen writes them), naming
+/// every document type.
+fn generated_types() -> String {
+    let types: String = documents()
+        .iter()
+        .map(|d| format!("export type {} = {{ _type: \"{d}\" }}\n", camel(d)))
+        .collect();
+    format!(
+        "/**\n * This file has been generated by the CMS type generator.\n * Command: `typegen generate`\n */\n\n{types}"
+    )
+}
+
+fn tree() -> Vec<String> {
+    let mut t: Vec<String> = documents().iter().map(|d| doc_path(d)).collect();
+    t.extend(
+        [
+            "apps/studio/schemaTypes/documents/index.ts",
+            "apps/studio/structure.ts",
+            "apps/studio/backfills/replace-slip-url/index.ts",
+            TYPES,
+        ]
+        .iter()
+        .map(|s| s.to_string()),
+    );
+    t
+}
+
+/// The files code search finds for the siblings, as the default branch has
+/// them.
+fn found() -> Vec<(String, String)> {
+    vec![
+        (
+            "apps/studio/schemaTypes/documents/index.ts".to_string(),
+            index_of(documents().len()),
+        ),
+        ("apps/studio/structure.ts".to_string(), structure()),
+        (
+            "apps/studio/backfills/replace-slip-url/index.ts".to_string(),
+            backfill(),
+        ),
+        (TYPES.to_string(), generated_types()),
+    ]
+}
+
+/// Each place's history: the index and the structure gained a type with
+/// every new document; the backfill was written once.
+fn history(p: &str) -> History {
+    match p {
+        "apps/studio/schemaTypes/documents/index.ts" => History::Read {
+            commits: 18,
+            earliest: index_of(3),
+        },
+        "apps/studio/structure.ts" => History::Read {
+            commits: 14,
+            earliest: "export const structure = (S) =>\n  S.list().items([\n    S.documentTypeListItem('berth'),\n  ])\n".to_string(),
+        },
+        "apps/studio/backfills/replace-slip-url/index.ts" => History::Read {
+            commits: 1,
+            earliest: backfill(),
+        },
+        _ => History::Unknown,
+    }
+}
+
+fn item(path: &str) -> NewItem {
+    registration::new_items(&[path.to_string()], &tree())
+        .into_iter()
+        .next()
+        .expect("a new item")
+}
+
+/// The rule after its reads, as `registration::check` runs it, for a new
+/// file with `text` that the branch registers nowhere.
+fn replay(path: &str, text: &str) -> Vec<registration::Missing> {
+    let item = item(path);
+    let sibs = registration::siblings(&item, &tree(), None);
+    let files = registration::drop_generated(found(), &typegen_outputs());
+    let keep = registration::registration_places(&item, &sibs, &files);
+    let places: Vec<(String, String, bool)> = files
+        .into_iter()
+        .filter_map(|(p, t)| keep.iter().find(|(k, _)| *k == p).map(|(_, r)| (p, t, *r)))
+        .collect();
+    let registries: Vec<&str> = places
+        .iter()
+        .filter(|(_, _, r)| *r)
+        .map(|(_, t, _)| t.as_str())
+        .collect();
+    let sib_files: Vec<(String, String)> = sibs
+        .iter()
+        .take(3)
+        .map(|s| (doc_path(s), doc_schema(s)))
+        .collect();
+    let kind = registration::kind_of(Some((path, text)), &sib_files, &registries, &sibs);
+    if matches!(kind, Kind::Other(_)) {
+        return Vec::new();
+    }
+    let (places, listed) = registration::settle_places(places, &sibs, &history);
+    let base = found();
+    let unchanged = |p: &str| base.iter().find(|(q, _)| q == p).map(|(_, t)| t.clone());
+    let mut m = registration::judge(&item, &sibs, &kind, &places, &unchanged);
+    registration::mark_listed(&mut m, &listed);
+    m
+}
+
+/// What the fixture monorepo's typegen writes, from its own config.
+fn typegen_outputs() -> Vec<String> {
+    generators::detect(&monorepo())
+        .into_iter()
+        .flat_map(|g| g.outputs)
+        .map(|o| generators::normalize_path(&o))
+        .collect()
+}
+
+#[test]
+fn a_one_off_backfill_lists_the_types_it_never_registers_them() {
+    let item = item("apps/studio/schemaTypes/documents/promo.ts");
+    let sibs = registration::siblings(&item, &tree(), None);
+    assert_eq!(sibs.len(), documents().len(), "every sibling, not a sample");
+    // It names eight of twenty-one types: not the kind's list.
+    let places = registration::registration_places(
+        &item,
+        &sibs,
+        &[(
+            "apps/studio/backfills/replace-slip-url/index.ts".to_string(),
+            backfill(),
+        )],
+    );
+    assert!(places.is_empty(), "{places:?}");
+}
+
+#[test]
+fn a_generated_file_is_never_a_place() {
+    let item = item("apps/studio/schemaTypes/documents/promo.ts");
+    let sibs = registration::siblings(&item, &tree(), None);
+    let places =
+        registration::registration_places(&item, &sibs, &[(TYPES.to_string(), generated_types())]);
+    assert!(places.is_empty(), "{places:?}");
+    // And by the repository's own generator config, whatever the file says.
+    assert!(typegen_outputs()
+        .iter()
+        .any(|o| o == TYPES || o == SCHEMA_JSON));
+    let schema = documents()
+        .iter()
+        .map(|d| format!("{{\"name\": \"{d}\"}}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let kept = registration::drop_generated(
+        vec![(SCHEMA_JSON.to_string(), format!("[{schema}]"))],
+        &typegen_outputs(),
+    );
+    assert!(kept.is_empty());
+}
+
+#[test]
+fn a_registry_kept_under_a_migrations_folder_is_still_a_registry() {
+    // Migrations are a kind too: every new one is added to the index.
+    let t: Vec<String> = [
+        "db/migrations/0001-create-berths.ts",
+        "db/migrations/0002-add-slips.ts",
+        "db/migrations/0003-add-moorings.ts",
+        "db/migrations/0004-add-charters.ts",
+        "db/migrations/index.ts",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let item = &registration::new_items(&["db/migrations/0005-add-ferries.ts".to_string()], &t)[0];
+    let sibs = registration::siblings(item, &t, None);
+    assert_eq!(sibs.len(), 4);
+    let index = "import m1 from './0001-create-berths'\nimport m2 from './0002-add-slips'\n\
+                 import m3 from './0003-add-moorings'\nimport m4 from './0004-add-charters'\n\
+                 export const migrations = [m1, m2, m3, m4]\n";
+    let places = registration::registration_places(
+        item,
+        &sibs,
+        &[("db/migrations/index.ts".to_string(), index.to_string())],
+    );
+    assert_eq!(places, vec![("db/migrations/index.ts".to_string(), true)]);
+    let grew = History::Read {
+        commits: 4,
+        earliest: "import m1 from './0001-create-berths'\nexport const migrations = [m1]\n".into(),
+    };
+    assert!(registration::grew_with_kind(
+        "db/migrations/index.ts",
+        index,
+        &sibs,
+        &grew
+    ));
+}
+
+#[test]
+fn the_helper_and_a_real_new_document_end_as_they_should() {
+    // The run's helper: another kind, nothing to register.
+    let helper = "import type {ValidationContext} from 'cms-kit'\n\n\
+                  export function endsAfterStart(value: unknown, context: ValidationContext) {\n  \
+                  return true\n}\n";
+    assert!(replay(
+        "apps/studio/schemaTypes/documents/promo-validation.ts",
+        helper
+    )
+    .is_empty());
+
+    // A real new document the branch didn't register: blocked on the two
+    // registries only; the backfill and the generated types aren't places.
+    let m = replay(
+        "apps/studio/schemaTypes/documents/promo.ts",
+        &doc_schema("promo"),
+    );
+    let mut end = Ending::default();
+    for x in &m {
+        end.said(x.line());
+    }
+    let b = registration::blocking(&m);
+    let paths: Vec<&str> = b.iter().map(|x| x.path.as_str()).collect();
+    assert_eq!(
+        paths,
+        vec![
+            "apps/studio/schemaTypes/documents/index.ts",
+            "apps/studio/structure.ts"
+        ],
+        "{:?}",
+        end.words
+    );
+    end.never_says(OLD);
+    end.never_says(TYPES);
+    assert!(registration::feedback(&b).contains("Add the entry yourself"));
+}
+
+#[test]
+fn a_list_that_never_grew_or_an_unread_history_never_blocks() {
+    let item = item("apps/studio/schemaTypes/documents/promo.ts");
+    let sibs = registration::siblings(&item, &tree(), None);
+    let all: String = documents().iter().map(|d| format!("'{d}', ")).collect();
+    // A backfill over every type: it lists the kind, written once.
+    let every = format!("export default defineMigration({{ documentTypes: [{all}] }})\n");
+    let p = "apps/studio/backfills/touch-all/index.ts".to_string();
+    let places = vec![(p.clone(), every.clone(), true)];
+    let (settled, listed) =
+        registration::settle_places(places.clone(), &sibs, &|_| History::Read {
+            commits: 1,
+            earliest: every.clone(),
+        });
+    let mut m = registration::missing(&item, &sibs, &settled, &|_| Some(every.clone()));
+    registration::mark_listed(&mut m, &listed);
+    assert_eq!(m.len(), 1);
+    assert!(registration::blocking(&m).is_empty());
+    assert!(m[0].line().contains("check by hand"));
+    // History unread: noted, never blocked.
+    let (settled, listed) = registration::settle_places(places, &sibs, &|_| History::Unknown);
+    assert!(!settled[0].2);
+    assert!(listed[0].1.contains("couldn't be read"));
+}
+
+#[test]
+fn a_dependency_in_a_manifest_is_still_no_registration() {
+    let t: Vec<String> = [
+        "apps/web/src/components/ui/accordion.tsx",
+        "apps/web/src/components/ui/alert.tsx",
+        "apps/web/src/components/ui/card.tsx",
+        "apps/web/package.json",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let item =
+        &registration::new_items(&["apps/web/src/components/ui/heading.tsx".to_string()], &t)[0];
+    let sibs = registration::siblings(item, &t, None);
+    let pkg = r#"{"dependencies": {"@radix-ui/react-accordion": "1.2.11", "@radix-ui/react-alert-dialog": "1.1.11", "@radix-ui/react-hover-card": "1.1.11"}}"#;
+    assert!(registration::registration_places(
+        item,
+        &sibs,
+        &[("apps/web/package.json".to_string(), pkg.to_string())]
+    )
+    .is_empty());
+}

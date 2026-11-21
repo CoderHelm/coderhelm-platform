@@ -306,6 +306,95 @@ class WaitingOnAPerson(unittest.TestCase):
         self.assertEqual(out["waiting_defaulted"], 0)
         self.assertNotIn("deadline", [m["why"] for m in sent])
 
+    def _sweep_projected(self, runs):
+        """The sweep against a table that returns only the fields its scan
+        names, as DynamoDB does."""
+        updates, sent = [], []
+
+        class Table:
+            def scan(self, **kw):
+                names = kw.get("ExpressionAttributeNames", {})
+                fields = {names.get(f.strip(), f.strip()) for f in kw["ProjectionExpression"].split(",")}
+                return {"Items": [{k: v for k, v in r.items() if k in fields} for r in runs]}
+
+            def update_item(self, **kw):
+                updates.append(kw)
+
+        class Db:
+            class meta:
+                class client:
+                    class exceptions:
+                        ConditionalCheckFailedException = KeyError
+
+            def Table(self, _name):
+                return Table()
+
+        class Sqs:
+            def send_message(self, **kw):
+                sent.append(sweep.json.loads(kw["MessageBody"]))
+
+        sweep._dynamodb, sweep._sqs = Db(), Sqs()
+        old_url, sweep.TICKET_QUEUE_URL = sweep.TICKET_QUEUE_URL, "https://sqs/q"
+        try:
+            out = sweep.handler({}, None)
+        finally:
+            sweep._dynamodb, sweep._sqs, sweep.TICKET_QUEUE_URL = None, None, old_url
+        return out, updates, sent
+
+    def test_a_stated_default_is_taken_from_what_the_scan_reads(self):
+        # A run asked which page to embed, said what it would build if no one
+        # answered in a day, and kept the default and deadline on its record.
+        # The sweep's scan didn't read those fields, so the default was never
+        # taken and the run sat waiting, reminded, for days.
+        run = {
+            "team_id": "T",
+            "run_id": "R",
+            "status": "needs_input",
+            "created_at": "2026-11-14T15:30:06+00:00",
+            "updated_at": "2026-11-14T15:38:59+00:00",
+            "questions": '{"questions":[{"id":"q1","question":"Which booking page?"}],'
+            '"asked_at":"2026-11-14T15:38:59+00:00"}',
+            "ask_default": "Build with the live program page",
+            "ask_deadline": "2026-11-15T15:38:57.195130843+00:00",
+            "ask_question": "Which booking page?",
+        }
+        out, updates, sent = self._sweep_projected([run])
+        self.assertEqual(out["waiting_defaulted"], 1)
+        self.assertEqual(out["waiting_reminded"], 0)
+        self.assertEqual(sent, [{"type": "run_waiting", "team_id": "T", "run_id": "R", "why": "deadline"}])
+        # Taken once: a record that says so is reminded at most, never defaulted again.
+        out, _, sent = self._sweep_projected([dict(run, ask_default_taken_at=self.NOW.isoformat())])
+        self.assertEqual(out["waiting_defaulted"], 0)
+        self.assertNotIn("deadline", [m["why"] for m in sent])
+
+    def test_a_question_is_reminded_once_however_often_its_record_changes(self):
+        # A run asked before waits were recorded (questions, no waiting_on).
+        # Each reminder's note moved updated_at, the wait counted from
+        # updated_at, so the next day it was due again: 15 reminders in 15
+        # days, one every 24 hours and ten minutes.
+        run = {
+            "team_id": "T",
+            "run_id": "R",
+            "status": "needs_input",
+            "created_at": "2026-11-02T21:03:11+00:00",
+            "questions": '{"questions":[{"id":"q1","question":"Which branch?"}],'
+            '"asked_at":"2026-11-02T21:12:00+00:00"}',
+        }
+        first = sweep.datetime(2026, 11, 6, 16, 41, 19, tzinfo=sweep.timezone.utc)
+        self.assertTrue(sweep.reminder_due(dict(run, updated_at="2026-11-02T21:12:01+00:00"), first))
+        # The reminder is sent; its note moves updated_at a second later.
+        after = dict(
+            run,
+            wait_reminded_at="2026-11-06T16:41:18+00:00",
+            updated_at="2026-11-06T16:41:19+00:00",
+        )
+        for days in (1, 2, 14):
+            self.assertFalse(sweep.reminder_due(after, first + sweep.timedelta(days=days, minutes=10)))
+        self.assertEqual(sweep.wait_since(after).isoformat(), "2026-11-02T21:12:00+00:00")
+        out, updates, sent = self._sweep_projected([after])
+        self.assertEqual(out["waiting_reminded"], 0)
+        self.assertEqual(sent, [])
+
     def test_without_a_pull_request_it_waits_for_a_retry(self):
         wait = sweep.named_wait({"error_message": "stopped"}, "now")
         self.assertIn("Retry", wait["action"])

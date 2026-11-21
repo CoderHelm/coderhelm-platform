@@ -4113,7 +4113,11 @@ async fn github_read_file(
     path: &str,
     branch: &str,
 ) -> String {
-    let url = format!("https://api.github.com/repos/{owner}/{name}/contents/{path}?ref={branch}");
+    let url = format!(
+        "https://api.github.com/repos/{owner}/{name}/contents/{}?ref={}",
+        common::repo_read::path_url(path),
+        urlencoding::encode(branch)
+    );
     let resp = http
         .get(&url)
         .header("Authorization", format!("Bearer {token}"))
@@ -4152,9 +4156,16 @@ async fn github_list_directory(
     branch: &str,
 ) -> String {
     let url = if path.is_empty() {
-        format!("https://api.github.com/repos/{owner}/{name}/contents?ref={branch}")
+        format!(
+            "https://api.github.com/repos/{owner}/{name}/contents?ref={}",
+            urlencoding::encode(branch)
+        )
     } else {
-        format!("https://api.github.com/repos/{owner}/{name}/contents/{path}?ref={branch}")
+        format!(
+            "https://api.github.com/repos/{owner}/{name}/contents/{}?ref={}",
+            common::repo_read::path_url(path),
+            urlencoding::encode(branch)
+        )
     };
     let resp = http
         .get(&url)

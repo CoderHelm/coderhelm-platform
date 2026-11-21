@@ -641,6 +641,18 @@ pub async fn at_start(
         return None;
     }
     let c = copied(github, &owner, &repo, &msg.base_branch, branch).await?;
+    if built_on(&c) {
+        tracing::info!(
+            branch,
+            dep = c.dep.number,
+            "The branch is built on an open pull request's branch: stacked on it, nothing rebuilt"
+        );
+        msg.base_branch = c.dep.branch.clone();
+        return Some(Dependency {
+            why: built_on_why(&c),
+            ..c.dep
+        });
+    }
     tracing::info!(
         branch,
         dep = c.dep.number,
@@ -727,6 +739,13 @@ pub async fn before_pr(
     let Some(c) = copied(github, &owner, &repo, &msg.base_branch, branch).await else {
         return Ok(from_ticket.filter(|d| d.branch == msg.base_branch));
     };
+    if built_on(&c) {
+        msg.base_branch = c.dep.branch.clone();
+        return Ok(Some(Dependency {
+            why: built_on_why(&c),
+            ..c.dep
+        }));
+    }
     let mut merger = restack::ModelMerger {
         state,
         provider,
@@ -925,6 +944,9 @@ pub struct Copy {
     pub dep: Dependency,
     /// The branch's commits whose change is one of that pull request's.
     pub commits: Vec<String>,
+    /// Those of them that are that pull request's own commits, same hash:
+    /// the branch is built on its branch, they were never copied.
+    pub shared: Vec<String>,
     /// The messages of the branch's other commits (merge commits aside):
     /// its own work.
     pub own: Vec<String>,
@@ -940,6 +962,39 @@ pub fn matches(ours: &[(String, u64)], theirs: &[(String, u64)]) -> Vec<String> 
         .filter(|(_, i)| ids.contains(i))
         .map(|(s, _)| s.clone())
         .collect()
+}
+
+/// The branch's commits that are another pull request's own commits (the
+/// same hash, so the branch was built on its branch), from `ours` (the
+/// branch's commits matched by patch id) and `their_shas`.
+pub fn shared(matched: &[String], their_shas: &[String]) -> Vec<String> {
+    matched
+        .iter()
+        .filter(|s| their_shas.contains(s))
+        .cloned()
+        .collect()
+}
+
+/// Whether every commit the branch shares with the other pull request is
+/// that pull request's own commit: the branch is already built on its
+/// branch, nothing was copied, and nothing is to be rebuilt. The run only
+/// takes that branch as its base (its pull request then shows only its own
+/// change). A branch that started on the other pull request reads this way
+/// on every later attempt, whose base starts again from the default branch.
+pub fn built_on(c: &Copy) -> bool {
+    !c.commits.is_empty() && c.commits.iter().all(|s| c.shared.contains(s))
+}
+
+/// Why the run takes the other pull request's branch as its base, for the
+/// stack section.
+pub fn built_on_why(c: &Copy) -> String {
+    format!(
+        "This branch is built on #{n}'s branch `{b}` (it holds {k} of #{n}'s commits, the same \
+         commits), so it is stacked on #{n} and nothing was rebuilt.",
+        n = c.dep.number,
+        b = c.dep.branch,
+        k = c.shared.len(),
+    )
 }
 
 const MAX_PRS: usize = 40;
@@ -1036,6 +1091,7 @@ pub async fn copied(
                     ..Default::default()
                 },
                 own: own_messages(&listed, &m),
+                shared: shared(&m, &their_shas),
                 commits: m,
                 files: BTreeMap::new(),
             });
@@ -1391,6 +1447,7 @@ mod tests {
             },
             own: own_messages(&listed, &commits),
             commits,
+            shared: Vec::new(),
             files: BTreeMap::new(),
         }
     }
