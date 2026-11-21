@@ -18,7 +18,7 @@
 //! asks the real model and writes one JSON line per case:
 //!
 //! ```text
-//! CHAT_EVAL_API_KEY=... CHAT_EVAL_OUT=/path/replay.jsonl \
+//! CHAT_EVAL_API_KEY=... (or CHAT_EVAL_BEDROCK=1) CHAT_EVAL_OUT=/path/replay.jsonl \
 //!   cargo test -p gateway live_replay_eval -- --ignored --nocapture
 //! ```
 
@@ -530,13 +530,13 @@ pub fn judge_body(model_id: &str, case: &ReplayCase, answer: &str, reg: &Registr
                 s.id,
                 s.title,
                 s.kind,
-                common::truncate_str(&s.passage, 900)
+                common::truncate_str(&s.passage, 6000)
             )
         })
         .collect();
     json!({
         "model": model_id,
-        "max_tokens": 400,
+        "max_tokens": 2000,
         "system": JUDGE_SYSTEM,
         "messages": [{"role": "user", "content": [{"type": "text", "text": format!(
             "Thread before the question:\n{}\nQuestion:\n{}\n\nWhat the person wanted:\n{}\n\nWhat Chat read this turn:\n{}\nThe answer the person saw:\n{}",
@@ -559,6 +559,27 @@ pub fn read_verdict(reply: &str) -> Option<([bool; 5], String)> {
         out[i] = v[*k].as_bool()?;
     }
     Some((out, v["why"].as_str().unwrap_or("").to_string()))
+}
+
+#[cfg(test)]
+/// How the live eval reaches Claude: `CHAT_EVAL_API_KEY` for the Anthropic
+/// API, or `CHAT_EVAL_BEDROCK=1` for Bedrock with the shell's AWS
+/// credentials (the way a hosted install calls it). The key returned is
+/// empty on Bedrock.
+async fn eval_model_access() -> String {
+    if std::env::var("CHAT_EVAL_BEDROCK").is_ok_and(|v| v == "1") {
+        let aws = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+        common::model_provider::set_bedrock_client(aws_sdk_bedrockruntime::Client::new(&aws));
+        common::model_provider::set_current(
+            common::model_provider::Settings {
+                provider: common::model_provider::Provider::Bedrock,
+                ..Default::default()
+            },
+            common::model_provider::Source::Deploy,
+        );
+        return String::new();
+    }
+    std::env::var("CHAT_EVAL_API_KEY").expect("set CHAT_EVAL_API_KEY or CHAT_EVAL_BEDROCK=1")
 }
 
 #[cfg(test)]
@@ -788,10 +809,10 @@ mod tests {
 /// The replay set against the real model, judged once per case. Ignored
 /// unless asked for.
 #[tokio::test]
-#[ignore = "calls the real model: set CHAT_EVAL_API_KEY and run with --ignored"]
+#[ignore = "calls the real model: set CHAT_EVAL_API_KEY or CHAT_EVAL_BEDROCK=1 and run with --ignored"]
 async fn live_replay_eval() {
     use futures::StreamExt;
-    let key = std::env::var("CHAT_EVAL_API_KEY").expect("set CHAT_EVAL_API_KEY");
+    let key = eval_model_access().await;
     let model_id = std::env::var("CHAT_EVAL_MODEL").unwrap_or_else(|_| "claude-sonnet-5-5".into());
     let judge_id = std::env::var("CHAT_EVAL_JUDGE_MODEL").unwrap_or_else(|_| model_id.clone());
     let out_path = std::env::var("CHAT_EVAL_OUT").ok();
@@ -821,19 +842,33 @@ async fn live_replay_eval() {
             let judge_id = judge_id.clone();
             async move {
                 let (out, reg) = replay(model, host, repos, store, c).await;
-                let verdict = chat_agent::Model::ask(
-                    judge,
-                    judge_body(&judge_id, c, &out.fin.text, &reg),
-                )
-                .await
-                .and_then(|r| read_verdict(&r));
-                let (grades, why) = verdict.unwrap_or(([false; 5], "the judge's reply couldn't be read".into()));
+                // A judge that didn't answer, or answered off the form, is
+                // asked again; it never grades the answer as failed.
+                let mut verdict = None;
+                let mut last = String::from("no reply");
+                for attempt in 0..4u64 {
+                    if attempt > 0 {
+                        tokio::time::sleep(std::time::Duration::from_secs(2 * attempt)).await;
+                    }
+                    match chat_agent::Model::ask(judge, judge_body(&judge_id, c, &out.fin.text, &reg)).await {
+                        Some(r) => match read_verdict(&r) {
+                            Some(v) => {
+                                verdict = Some(v);
+                                break;
+                            }
+                            None => last = format!("off the form: {}", common::truncate_str(&r, 400)),
+                        },
+                        None => last = String::from("no reply"),
+                    }
+                }
+                let judged = verdict.is_some();
+                let (grades, why) = verdict.unwrap_or(([false; 5], format!("not judged ({last})")));
                 println!("\n=== {} ===\nQ: {}\ncalls: {:?}\nA: {}\ngrades: {grades:?} {why}", c.name, c.question, out.calls, out.fin.text);
                 json!({
                     "name": c.name, "origin": c.origin, "intent": c.intent,
                     "calls": out.calls, "rechecked": out.rechecked, "answer": out.fin.text,
                     "grades": CRITERIA.iter().zip(grades).map(|(k, g)| (k.to_string(), json!(g))).collect::<serde_json::Map<_, _>>(),
-                    "all": grades.iter().all(|g| *g), "why": why,
+                    "all": grades.iter().all(|g| *g), "why": why, "judged": judged,
                 })
             }
         })
