@@ -1203,8 +1203,9 @@ async fn person_claims(state: &AppState, a: &mcp_oauth::Authorized) -> Result<Cl
         mfa: a.grant.mfa,
         via: a.grant.via.clone(),
         okta_sub: a.grant.okta_sub.clone(),
+        break_glass: None,
     };
-    crate::routes::sign_in::check_session(state, &claims.team_id, &proof, None).await?;
+    crate::routes::sign_in::check_session(state, &claims, &proof, None, true).await?;
     Ok(claims)
 }
 
@@ -1538,12 +1539,10 @@ pub async fn post(
                             mfa: a.grant.mfa,
                             via: a.grant.via.clone(),
                             okta_sub: a.grant.okta_sub.clone(),
+                            break_glass: None,
                         };
                         if let Err(r) = crate::routes::sign_in::check_session(
-                            &state,
-                            &claims.team_id,
-                            &proof,
-                            None,
+                            &state, &claims, &proof, None, true,
                         )
                         .await
                         {

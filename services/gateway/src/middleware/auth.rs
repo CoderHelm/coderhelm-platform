@@ -79,6 +79,12 @@ pub async fn require_auth(
         let method = req.method().clone();
         let path = req.uri().path().to_string();
         if !support_access::is_exit(&method, &path) {
+            // The admin's own session first: their own team's Okta rule.
+            if let Err(refused) =
+                crate::routes::require_okta::check_claims(&state, &claims, &signed_in, false).await
+            {
+                return Ok(refused);
+            }
             let route = req
                 .uri()
                 .path_and_query()
@@ -143,7 +149,7 @@ pub async fn require_auth(
     if let Err(ended) = sign_in::check_member_session(&state, &claims).await {
         return Ok(ended);
     }
-    if let Err(held) = sign_in::check_session(&state, &claims.team_id, &proof, handler).await {
+    if let Err(held) = sign_in::check_session(&state, &claims, &proof, handler, false).await {
         return Ok(held);
     }
     if let Some(refused) = crate::routes::oidc_signin::held_refusal(&state, &claims, handler).await
@@ -232,8 +238,9 @@ async fn app_request(
         mfa: caller.grant.mfa,
         via: caller.grant.via.clone(),
         okta_sub: caller.grant.okta_sub.clone(),
+        break_glass: None,
     };
-    if let Err(held) = sign_in::check_session(state, &claims.team_id, &proof, handler).await {
+    if let Err(held) = sign_in::check_session(state, &claims, &proof, handler, true).await {
         return held;
     }
     if let Some(refused) = crate::routes::oidc_signin::held_refusal(state, &claims, handler).await {
@@ -571,6 +578,39 @@ async fn current_role(state: &AppState, claims: &crate::models::Claims) -> Optio
             .cloned()
             .unwrap_or_else(|| "member".to_string()),
     )
+}
+
+/// [`signed_in_as`], and the session still stands as every API request
+/// checks it: not ended (a removal, a reset, a role change) and allowed by
+/// its team's sign-in rules (an Okta session's link, Require Okta sign-in).
+/// Email links that answer something ask for this.
+pub async fn session_answers_as(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    team_id: &str,
+    email: &str,
+) -> bool {
+    let secret = &state.secrets.jwt_secret;
+    if !signed_in_as(headers, secret, team_id, email) {
+        return false;
+    }
+    let cookie_header = headers
+        .get("cookie")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let Some(token) = extract_cookie(cookie_header, "__Host-coderhelm_session") else {
+        return false;
+    };
+    let Ok(mut claims) = jwt::validate_token(token, secret) else {
+        return false;
+    };
+    let proof = jwt::read_proof(token, secret);
+    claims =
+        crate::routes::oidc_signin::mark_okta(claims, proof.via.as_deref(), proof.okta_sub.clone());
+    sign_in::check_member_session(state, &claims).await.is_ok()
+        && crate::routes::require_okta::check_claims(state, &claims, &proof, false)
+            .await
+            .is_ok()
 }
 
 /// Whether the request carries a valid session for `email` on `team_id`

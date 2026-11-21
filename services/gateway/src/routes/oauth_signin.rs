@@ -89,6 +89,10 @@ pub enum Reason {
     /// Okta signed in an identity no member has linked yet: they sign in
     /// another way first and link Okta in their own settings.
     OktaNotLinked,
+    /// The same while the team requires Okta sign-in, when no invite for
+    /// their email is waiting either: only an admin can let them in now
+    /// (routes::require_okta).
+    OktaAskAdmin,
 }
 
 impl Reason {
@@ -105,6 +109,7 @@ impl Reason {
             Reason::NotOnTeam => "not_on_team",
             Reason::TeamOnly => "okta_team_only",
             Reason::OktaNotLinked => "okta_not_linked",
+            Reason::OktaAskAdmin => "okta_ask_admin",
         }
     }
 }

@@ -134,6 +134,27 @@ pub struct Rule {
     /// Hosted only: the team moved to its own install, which it now signs
     /// in at (an https address). Its sessions on hosted are refused.
     pub moved_to: Option<String>,
+    /// Members sign in only through the team's (self-hosted: the
+    /// organization's) Okta (routes::require_okta).
+    pub require_okta: bool,
+    /// When that was last turned on (unix seconds): sessions from any other
+    /// way in issued before it are ended.
+    pub okta_since: u64,
+}
+
+/// A number attribute, or 0.
+fn num(item: &Item, key: &str) -> u64 {
+    item.get(key)
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0)
+}
+
+fn flag(item: &Item, key: &str) -> bool {
+    item.get(key)
+        .and_then(|v| v.as_bool().ok())
+        .copied()
+        .unwrap_or(false)
 }
 
 /// An install address a moved team is sent to: https with a host, nothing
@@ -160,6 +181,8 @@ impl Rule {
                 .filter(|v| !v.is_empty())
                 .map(str::to_string),
             moved_to: moved_url(s(item, "moved_to")),
+            require_okta: flag(item, "require_okta"),
+            okta_since: num(item, "require_okta_since"),
         }
     }
 }
@@ -176,6 +199,8 @@ pub async fn team_rule(state: &AppState, team_id: &str) -> Result<Rule, String> 
                 require_2fa: o.require_2fa,
                 since: o.require_2fa_since,
                 moved_to: None,
+                require_okta: o.require_okta,
+                okta_since: o.require_okta_since,
             })
             .unwrap_or_default());
     }
@@ -229,6 +254,10 @@ pub struct Org {
     /// before it (an invite copied from the hosted CoderHelm) was never
     /// sent from here.
     pub created_at: Option<String>,
+    /// Members sign in only through the organization's Okta, and since when
+    /// (unix seconds; routes::require_okta).
+    pub require_okta: bool,
+    pub require_okta_since: u64,
 }
 
 impl Org {
@@ -261,6 +290,8 @@ impl Org {
             created_at: Some(s(item, "created_at"))
                 .filter(|v| !v.is_empty())
                 .map(str::to_string),
+            require_okta: flag(item, "require_okta"),
+            require_okta_since: num(item, "require_okta_since"),
         })
     }
 }
@@ -898,30 +929,31 @@ pub fn team_moved(url: &str) -> Response {
         .into_response()
 }
 
-/// The middleware's check for one session request acting in `team_id`, on
-/// either deployment. The rule is read fresh each time; when it can't be
-/// read the request is refused (the safe answer). On hosted the rule is read
-/// even for a session with a second factor: a team that moved to its own
-/// install is refused whatever the session.
+/// The middleware's check for one session request acting in the claims'
+/// team, on either deployment (`app`: a connected app's call, from its
+/// grant). The rules are read fresh each time; when they can't be read the
+/// request is refused (the safe answer). They are read for every session,
+/// a second factor or not: a team that moved to its own install, and a team
+/// that requires Okta sign-in (routes::require_okta), refuse whatever the
+/// session's second factor.
 pub async fn check_session(
     state: &AppState,
-    team_id: &str,
+    claims: &Claims,
     proof: &SignInProof,
     handler: Option<&str>,
+    app: bool,
 ) -> Result<(), Response> {
-    if proof.mfa && applies() {
-        return Ok(());
-    }
-    let rule = match team_rule(state, team_id).await {
+    let rule = match team_rule(state, &claims.team_id).await {
         Ok(rule) => rule,
         Err(e) => {
-            error!(error = %e, "Two-factor rule not read; request refused");
+            error!(error = %e, "Sign-in rules not read; request refused");
             return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
         }
     };
     if let Some(url) = moved_refusal(&rule, handler) {
         return Err(team_moved(url));
     }
+    super::require_okta::check(state, &rule, claims, proof, app).await?;
     if gate(rule.require_2fa, proof, handler) {
         Ok(())
     } else {
@@ -2521,6 +2553,15 @@ pub async fn password_step(
     passed: bool,
 ) -> Result<Option<Response>, String> {
     match needed_for(state, &step, passed).await? {
+        // The owner's break-glass sign-in to a team that requires Okta: a
+        // second factor, with no exception (routes::require_okta).
+        StepNeeded::None if step.break_glass && !passed => Ok(Some(
+            super::require_okta::Refused {
+                team: String::new(),
+                code: super::require_okta::NEEDS_2FA,
+            }
+            .json(),
+        )),
         StepNeeded::None => Ok(None),
         StepNeeded::UsePassword => Ok(Some(
             fail_code(
@@ -2679,6 +2720,35 @@ pub async fn verify_second_step(
         ));
     }
     record_success(&state, &key).await;
+    // The team may have turned Require Okta sign-in on since the sign-in
+    // began: its last word, and a break-glass sign-in logged before its
+    // session.
+    let issue = match super::require_okta::issue_check(
+        &state,
+        &step.team_id,
+        &step.sub,
+        &step.via,
+        step.break_glass,
+    )
+    .await
+    .map_err(|e| internal("Okta sign-in rule not read", e))?
+    {
+        Ok(i) => i,
+        Err(r) => return Ok(with_cleared(r.json())),
+    };
+    let break_glass =
+        (issue == super::require_okta::Issue::BreakGlass).then_some(step.team_id.as_str());
+    if break_glass.is_some() {
+        super::require_okta::record_break_glass(
+            &state,
+            &step.team_id,
+            &step.sub,
+            &step.email,
+            "an authenticator app code",
+        )
+        .await
+        .map_err(|e| internal("Break-glass sign-in not logged", e))?;
+    }
     let session = jwt::create_session_token(
         &step.sub,
         &step.team_id,
@@ -2688,7 +2758,9 @@ pub async fn verify_second_step(
             r => r,
         },
         step.github_login.as_deref(),
-        &SignInProof::new(true, &step.via).with_okta_sub(step.okta_sub.clone()),
+        &SignInProof::new(true, &step.via)
+            .with_okta_sub(step.okta_sub.clone())
+            .with_break_glass(break_glass),
         &state.secrets.jwt_secret,
         SESSION_TTL_SECS,
     )
@@ -2781,6 +2853,19 @@ pub async fn get_settings(
     let items = team_members(&state, &claims.team_id)
         .await
         .map_err(|e| internal("Members not read", e))?;
+    // Require Okta sign-in: the live Okta setup, who linked it, and what
+    // turning the rule on still needs.
+    let signed_in = proof.map(|p| p.0).unwrap_or_default();
+    let live = super::oidc_signin::live_setup_of(&state, &claims.team_id)
+        .await
+        .map_err(|e| internal("Okta setup not read", e))?;
+    let issuer = live.as_ref().map(|l| l.issuer.as_str());
+    let okta = super::require_okta::readiness(&state, &claims, &signed_in, live.as_ref(), false)
+        .await
+        .map_err(|e| internal("Okta domains not read", e))?;
+    let break_glass = super::require_okta::break_glass_log(&state, &claims.team_id)
+        .await
+        .map_err(|e| internal("Break-glass sign-ins not read", e))?;
     let active: Vec<&Item> = items.iter().filter(|i| !is_invite(i)).collect();
     let factors = futures::future::join_all(active.iter().map(|i| member_factor(&state, i))).await;
     let people: Vec<Value> = active
@@ -2794,6 +2879,7 @@ pub async fn get_settings(
                 "github_login": s(i, "github_login"),
                 "role": s(i, "role"),
                 "two_factor": f,
+                "okta_linked": super::require_okta::okta_linked(i, issuer),
                 "is_self": s(i, "sk") == claims.sub,
             })
         })
@@ -2846,8 +2932,22 @@ pub async fn get_settings(
         "people": people,
         "without_2fa": without,
         "api_keys": keys,
-        "your_session_has_2fa": proof.is_some_and(|p| p.mfa),
+        "your_session_has_2fa": signed_in.mfa,
+        "require_okta": rule.require_okta,
+        "require_okta_since": okta_since_text(&rule),
+        "okta": okta.view(),
+        "can_require_okta": okta.ready(),
+        "unlinked": super::require_okta::unlinked(&items, issuer),
+        "break_glass": break_glass,
     })))
+}
+
+/// When Require Okta sign-in was turned on, for the page (none while off).
+fn okta_since_text(rule: &Rule) -> Option<String> {
+    rule.require_okta
+        .then(|| chrono::DateTime::from_timestamp(rule.okta_since as i64, 0))
+        .flatten()
+        .map(|t| t.to_rfc3339())
 }
 
 /// Was this key made before two-factor sign-in was required? A key never
@@ -2911,6 +3011,13 @@ pub async fn key_reviews(
 pub struct SettingsBody {
     pub domains: Option<Vec<String>>,
     pub require_2fa: Option<bool>,
+    /// Require Okta sign-in (routes::require_okta): the owner's alone.
+    #[serde(default)]
+    pub require_okta: Option<bool>,
+    /// The owner saw the members who haven't linked Okta and turns it on
+    /// anyway.
+    #[serde(default)]
+    pub acknowledge_unlinked: bool,
 }
 
 /// PUT /api/sign-in — change the two-factor rule (self-hosted: the
@@ -2952,6 +3059,11 @@ pub async fn update_settings(
         .await
         .map_err(|e| internal("Two-factor rule not read", e))?;
     let turning_on = body.require_2fa == Some(true) && !current.require_2fa;
+    let signed_in = proof.as_ref().map(|p| p.0.clone()).unwrap_or_default();
+    let okta_change = body.require_okta.filter(|v| *v != current.require_okta);
+    if let Some(on) = okta_change {
+        okta_rule_change(&state, &claims, &signed_in, on, body.acknowledge_unlinked).await?;
+    }
     if turning_on && !proof.as_ref().is_some_and(|p| p.mfa) {
         return Err(fail_code(
             StatusCode::CONFLICT,
@@ -2997,6 +3109,30 @@ pub async fn update_settings(
         values.insert(":r".into(), AttributeValue::Bool(r));
         if turning_on {
             sets.push("require_2fa_since = :now");
+        }
+    }
+    if let Some(on) = okta_change {
+        changes.push(if on {
+            format!(
+                "Okta sign-in required for {}",
+                if self_hosted {
+                    "everyone"
+                } else {
+                    "everyone on this team"
+                }
+            )
+        } else {
+            "Okta sign-in no longer required".to_string()
+        });
+        sets.push("require_okta = :ro");
+        values.insert(":ro".into(), AttributeValue::Bool(on));
+        if on {
+            // Every session from another way in issued before now ends.
+            sets.push("require_okta_since = :ros");
+            values.insert(
+                ":ros".into(),
+                AttributeValue::N(super::require_okta::since_now().to_string()),
+            );
         }
     }
     if !changes.is_empty() {
@@ -3061,12 +3197,67 @@ pub async fn update_settings(
         "domains": domains,
         "require_2fa": rule.require_2fa,
         "require_2fa_since": rule.since,
+        "require_okta": rule.require_okta,
+        "require_okta_since": okta_since_text(&rule),
         "notified": notified,
     })))
 }
 
+/// Turning Require Okta sign-in on or off: the owner only, from their own
+/// session. On needs Okta set up and on, (hosted) every domain proven in DNS
+/// now, and the owner's session from this team's Okta; with members who
+/// haven't linked Okta, the owner says they saw the list.
+async fn okta_rule_change(
+    state: &AppState,
+    claims: &Claims,
+    signed_in: &SignInProof,
+    on: bool,
+    acknowledged: bool,
+) -> Result<(), ApiError> {
+    let live = super::oidc_signin::live_setup_of(state, &claims.team_id)
+        .await
+        .map_err(|e| internal("Okta setup not read", e))?;
+    let ready = super::require_okta::readiness(state, claims, signed_in, live.as_ref(), on)
+        .await
+        .map_err(|e| internal("Okta domains not read", e))?;
+    if !ready.is_owner {
+        let (status, code, msg) = ready.first_missing().unwrap_or((
+            StatusCode::FORBIDDEN,
+            "owner_only",
+            "Only the owner can turn Require Okta sign-in on or off.",
+        ));
+        return Err(fail_code(status, msg, code));
+    }
+    if !on {
+        return Ok(());
+    }
+    if let Some((status, code, msg)) = ready.first_missing() {
+        return Err(fail_code(status, msg, code));
+    }
+    let members = team_members(state, &claims.team_id)
+        .await
+        .map_err(|e| internal("Members not read", e))?;
+    let unlinked =
+        super::require_okta::unlinked(&members, live.as_ref().map(|l| l.issuer.as_str()));
+    if !unlinked.is_empty() && !acknowledged {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": format!(
+                    "{} {} not linked Okta yet. Once Okta sign-in is required, they can't sign in until an admin re-invites them (they accept with Okta) or turns the rule off while they link.",
+                    unlinked.len(),
+                    if unlinked.len() == 1 { "member has" } else { "members have" }
+                ),
+                "code": "unlinked_members",
+                "unlinked": unlinked,
+            })),
+        ));
+    }
+    Ok(())
+}
+
 /// The team's name for an email (hosted), or "".
-async fn team_name(state: &AppState, team_id: &str) -> String {
+pub(crate) async fn team_name(state: &AppState, team_id: &str) -> String {
     state
         .dynamo
         .get_item()
@@ -3673,6 +3864,7 @@ mod tests {
             mfa: false,
             via: Some("google".into()),
             okta_sub: None,
+            break_glass: None,
         };
         let passed = SignInProof::new(true, "github");
         // Off: everyone goes on.
@@ -3875,12 +4067,12 @@ mod tests {
         assert!(f.contains("create_session_token") && f.contains("&proof"));
         // Read fresh each time: no cache in front of the rule.
         let check = body(include_str!("sign_in.rs"), "check_session");
-        assert!(check.contains("team_rule(state, team_id)"));
+        assert!(check.contains("team_rule(state, &claims.team_id)"));
         assert!(!check.to_lowercase().contains("cache"));
         // On every deployment: the acting team's rule (self-hosted: the
         // organization's), read with a consistent read.
         assert!(!f.contains("sign_in::applies()"));
-        assert!(f.contains("check_session(&state, &claims.team_id, &proof, handler)"));
+        assert!(f.contains("check_session(&state, &claims, &proof, handler, false)"));
         let rule = body(include_str!("sign_in.rs"), "team_rule");
         assert!(rule.contains("load_org(state)") && rule.contains("TEAM_RULE_SK"));
         assert!(rule.contains(".consistent_read(true)"));
@@ -4100,7 +4292,7 @@ mod tests {
             "sign_in::second_step",
             "SignInProof::new(false, \"github\")"
         ));
-        let issue = body(auth, "issue_session_from_cognito");
+        let issue = body(auth, "password_session");
         assert!(before(issue, "sign_in::password_step", "session_json("));
         assert!(issue.contains("proof.mfa"));
         // The step reads the member's factor, either kind, and fails closed.
@@ -4224,6 +4416,8 @@ mod tests {
                 require_2fa: true,
                 since: Some("2026-10-27T00:00:00Z".into()),
                 moved_to: None,
+                require_okta: false,
+                okta_since: 0,
             }
         );
         assert_eq!(Rule::from_item(&HashMap::new()), Rule::default());
@@ -4293,8 +4487,15 @@ mod tests {
         let src = include_str!("sign_in.rs");
         let body = &src[src.find("pub async fn check_session(").unwrap()..];
         let body = &body[..body.find("\n}\n").unwrap()];
-        assert!(body.contains("if proof.mfa && applies()"));
+        // No shortcut for a session with a second factor: the rules are read
+        // for every session, and the moved team and Require Okta sign-in
+        // refuse before the two-factor gate.
+        assert!(!body.contains("proof.mfa &&"));
         assert!(body.find("moved_refusal(").unwrap() < body.find("gate(rule.require_2fa").unwrap());
+        assert!(
+            body.find("require_okta::check(").unwrap()
+                < body.find("gate(rule.require_2fa").unwrap()
+        );
     }
 
     /// Hosted Google, GitHub and password sign-ins ask for the person's
@@ -4325,8 +4526,10 @@ mod tests {
         let tail = &issue[issue
             .find("Created new user + team on first login")
             .unwrap()..];
-        assert!(tail.contains("\n    if let Some(resp) = sign_in::password_step("));
-        assert!(before(tail, "sign_in::password_step", "session_json("));
+        assert!(tail.contains("password_session("));
+        let finish = body(auth, "password_session");
+        assert!(finish.contains("\n    if let Some(resp) = sign_in::password_step("));
+        assert!(before(finish, "sign_in::password_step", "session_json("));
         // The Cognito code passed on a hosted sign-in is recorded too.
         let mfa = body(auth, "mfa_verify");
         assert!(mfa.contains("sign_in::note_factor(&state, \"\", &sub, &email, Some(\"cognito\"))"));

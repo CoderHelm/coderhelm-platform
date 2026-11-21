@@ -794,6 +794,12 @@ pub async fn invite_user(
         ));
     }
 
+    // A team that requires Okta sign-in: always a pending invite, accepted
+    // only by signing in with the team's Okta (routes::require_okta).
+    let okta_only = crate::routes::sign_in::team_rule(&state, &claims.team_id)
+        .await
+        .map_err(|e| internal("Sign-in rules not read", e))?
+        .require_okta;
     // Check if this email already has a Cognito account
     let existing_sub = state
         .cognito
@@ -814,7 +820,7 @@ pub async fn invite_user(
         });
 
     let now = chrono::Utc::now().to_rfc3339();
-    let (sk, status) = match existing_sub {
+    let (sk, status) = match existing_sub.filter(|_| !okta_only) {
         // They already have an account — add them directly to the team.
         Some(sub) => (format!("USER#{sub}"), "active"),
         None => (format!("USER#invite_{}", ulid::Ulid::new()), "invited"),

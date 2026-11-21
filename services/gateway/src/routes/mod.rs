@@ -73,6 +73,9 @@ pub mod plugin_pkgs;
 pub mod plugins;
 pub mod preview_access;
 pub mod repo_setup;
+pub mod require_okta;
+#[cfg(test)]
+mod require_okta_flows;
 pub mod review_lessons;
 pub mod reviewer;
 pub mod roles;

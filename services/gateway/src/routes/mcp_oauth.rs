@@ -531,6 +531,18 @@ pub async fn decide_request(
         ));
     } else {
         let proof = proof.map(|p| p.0).unwrap_or_default();
+        // A team that requires Okta sign-in: apps are connected only from an
+        // Okta session (a grant from any other session would be refused at
+        // its first call anyway).
+        if !super::oidc_signin::signed_in_with_okta(proof.via.as_deref())
+            && super::sign_in::team_rule(&state, &claims.team_id)
+                .await
+                .map_err(|e| internal("Sign-in rules not read", e))?
+                .require_okta
+        {
+            let team = super::require_okta::team_words(&state, &claims.team_id).await;
+            return Err(super::require_okta::refused_json(&team));
+        }
         let who = oauth::Consent {
             team_id: claims.team_id.clone(),
             user_id: claims.sub.clone(),

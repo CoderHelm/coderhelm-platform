@@ -708,7 +708,7 @@ async fn microsoft_callback_inner(
     .map_err(|e| SignInFailure::new(P, Reason::Provider, "id_token", e))?;
     let person = microsoft_person(&claims)
         .map_err(|e| SignInFailure::new(P, Reason::NoVerifiedEmail, "email", e))?;
-    super::auth::finish_oidc(state, ip, P, &person, None).await
+    super::auth::finish_oidc(state, ip, P, &person, None, false).await
 }
 
 // ── Okta: the setup ─────────────────────────────────────────────────
@@ -1142,6 +1142,27 @@ async fn all_domains_proven(state: &AppState, setup: &OktaSetup) -> Result<bool,
     Ok(true)
 }
 
+/// Whether every domain of a hosted setup is proven by its team: read again
+/// in DNS now (`recheck`), else from the stored proofs (for showing).
+pub(crate) async fn domains_proven(
+    state: &AppState,
+    setup: &OktaSetup,
+    recheck: bool,
+) -> Result<bool, String> {
+    if recheck {
+        return all_domains_proven(state, setup).await;
+    }
+    if setup.domains.is_empty() {
+        return Ok(false);
+    }
+    for d in &setup.domains {
+        if domain_owner(state, d).await?.map(|(t, _)| t) != Some(setup.team_id.clone()) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// The live, turned-on Okta setup for `email`. Self-hosted: the
 /// organization's, when it covers the email. Hosted: the setup of the team
 /// that proved the email's domain in DNS, when it is on and lists that
@@ -1412,15 +1433,60 @@ async fn okta_callback_inner(
     let members = super::sign_in::team_members(state, &setup.team_id)
         .await
         .map_err(|e| SignInFailure::new(P, Reason::Server, "members", e))?;
-    let Some(record) = linked_record(&members, &setup.issuer, sub) else {
+    if let Some(record) = linked_record(&members, &setup.issuer, sub) {
+        return super::auth::finish_oidc(state, ip, P, &person, Some(record), false).await;
+    }
+    // No member linked this identity. While the team requires Okta sign-in,
+    // an admin's invite for exactly Okta's verified email is accepted here
+    // (routes::require_okta explains why that is safe); otherwise, and for
+    // anyone already on the team, nothing is linked by email.
+    let rule = super::sign_in::team_rule(state, &setup.team_id)
+        .await
+        .map_err(|e| SignInFailure::new(P, Reason::Server, "rule", e))?;
+    if !rule.require_okta {
         return Err(SignInFailure::new(
             P,
             Reason::OktaNotLinked,
             "link",
             "no member has linked this Okta identity",
         ));
+    }
+    let ask_admin = |d: &str| SignInFailure::new(P, Reason::OktaAskAdmin, "invite", d);
+    let invite = match super::require_okta::invite_for(&members, &person.email, chrono::Utc::now())
+    {
+        super::require_okta::InviteFor::Accept(i) => i,
+        super::require_okta::InviteFor::ExistingMember => {
+            return Err(ask_admin("a member has this email but never linked Okta"))
+        }
+        super::require_okta::InviteFor::None => {
+            return Err(ask_admin(
+                "no member linked this identity and no invite is waiting",
+            ))
+        }
     };
-    super::auth::finish_oidc(state, ip, P, &person, Some(record)).await
+    if sub.is_empty() {
+        return Err(SignInFailure::new(
+            P,
+            Reason::Provider,
+            "id_token",
+            "no sub",
+        ));
+    }
+    let record = super::require_okta::invited_member(
+        &invite,
+        &person.new_user_id,
+        &person.name,
+        &setup.issuer,
+        sub,
+        &chrono::Utc::now().to_rfc3339(),
+    );
+    if let Err(e) = super::require_okta::accept_invite(state, &record, &invite).await {
+        // Another record already has this id, or another member holds this
+        // identity, or the invite is gone: nothing was written.
+        return Err(ask_admin(&e));
+    }
+    info!(team_id = %setup.team_id, "Invite accepted through Okta sign-in");
+    super::auth::finish_oidc(state, ip, P, &person, Some(&record), true).await
 }
 
 // ── Okta: linking a member's own Okta identity ──────────────────────
@@ -1674,10 +1740,16 @@ async fn session_of(state: &AppState, headers: &HeaderMap) -> Option<(Claims, Op
         "__Host-coderhelm_session",
     )?;
     let mut claims = crate::auth::jwt::validate_token(tok, &state.secrets.jwt_secret).ok()?;
-    let via = crate::auth::jwt::read_proof(tok, &state.secrets.jwt_secret).via;
+    let proof = crate::auth::jwt::read_proof(tok, &state.secrets.jwt_secret);
+    let via = proof.via.clone();
     claims.via_okta = signed_in_with_okta(via.as_deref());
     claims.held = is_held(via.as_deref(), super::setup_checks::self_hosted());
+    claims.okta_sub = proof.okta_sub.clone();
     super::sign_in::check_member_session(state, &claims)
+        .await
+        .ok()?;
+    // A team that requires Okta sign-in: only the sessions it still allows.
+    super::require_okta::check_claims(state, &claims, &proof, false)
         .await
         .ok()?;
     Some((claims, via))
@@ -2449,6 +2521,19 @@ pub async fn okta_save(
     else {
         return Err(fail(StatusCode::NOT_FOUND, "There's nothing new to save."));
     };
+    let current = load_setup(&state, &team, OKTA_SK)
+        .await
+        .map_err(|e| internal("Okta setup not read", e))?;
+    if save_narrows(current.as_ref(), &draft, body.enabled) {
+        // Turning Okta off, moving it to another issuer (which drops every
+        // link) or dropping a domain while the team requires it would lock
+        // people out.
+        if let Some(refused) =
+            super::require_okta::setup_change_refused(&rule_of(&state, &team).await?)
+        {
+            return Err(refused);
+        }
+    }
     if !draft_matches(&draft, &body) {
         return Err(fail(
             StatusCode::CONFLICT,
@@ -2536,6 +2621,10 @@ pub async fn okta_toggle(
     };
     if body.enabled {
         owner_on_self_host(&claims, super::sign_in::applies())?;
+    } else if let Some(refused) =
+        super::require_okta::setup_change_refused(&rule_of(&state, &team).await?)
+    {
+        return Err(refused);
     }
     if body.enabled && live.tested_at.is_none() {
         return Err(fail(StatusCode::CONFLICT, "Run Test sign-in first."));
@@ -2573,6 +2662,23 @@ pub async fn okta_toggle(
             .map_err(|e| internal("Okta sessions not ended", e))?;
     }
     Ok(Json(okta_view(&state, &team).await?))
+}
+
+/// The team's sign-in rules (the Okta rule is checked before Okta changes).
+async fn rule_of(state: &AppState, team: &str) -> Result<super::sign_in::Rule, ApiError> {
+    super::sign_in::team_rule(state, team)
+        .await
+        .map_err(|e| internal("Sign-in rules not read", e))
+}
+
+/// Whether saving `draft` over the live setup takes sign-in away from
+/// anyone: Okta off, another issuer (every link is dropped), or a domain
+/// no longer listed. Pure.
+pub fn save_narrows(live: Option<&OktaSetup>, draft: &OktaSetup, enabled: bool) -> bool {
+    !enabled
+        || live.is_none_or(|l| {
+            l.issuer != draft.issuer || l.domains.iter().any(|d| !draft.domains.contains(d))
+        })
 }
 
 /// Hosted: Okta sign-in turns on only once every one of its email domains
@@ -2679,6 +2785,10 @@ pub async fn okta_release_domain(
 ) -> Result<Json<Value>, ApiError> {
     admin(&claims)?;
     let team = setup_team(&state, &claims).await?;
+    if let Some(refused) = super::require_okta::setup_change_refused(&rule_of(&state, &team).await?)
+    {
+        return Err(refused);
+    }
     let domain = domain.trim().to_lowercase();
     if domain_owner(&state, &domain)
         .await
@@ -2711,6 +2821,10 @@ pub async fn okta_delete(
 ) -> Result<Json<Value>, ApiError> {
     admin(&claims)?;
     let team = setup_team(&state, &claims).await?;
+    if let Some(refused) = super::require_okta::setup_change_refused(&rule_of(&state, &team).await?)
+    {
+        return Err(refused);
+    }
     audit(&state, &claims, "Okta sign-in removed".into()).await?;
     // The team's proven domains are released, so their owner can use them again.
     for sk in [OKTA_SK, OKTA_DRAFT_SK] {
@@ -3674,7 +3788,18 @@ mod tests {
         let cb = &cb[..cb.find("\n}\n").unwrap()];
         assert!(cb.contains("linked_record("));
         assert!(!cb.contains("records_by_email"));
-        assert!(cb.find("Reason::OktaNotLinked").unwrap() < cb.find("finish_oidc(").unwrap());
+        // Lands only on the link; without one, the not-linked refusal,
+        // unless the team requires Okta and an invite for exactly this email
+        // is accepted (and linked) first (routes::require_okta).
+        let first = cb.find("finish_oidc(").unwrap();
+        assert!(cb[..first].contains("if let Some(record) = linked_record("));
+        let no_link = cb.find("Reason::OktaNotLinked").unwrap();
+        let invite = cb.find("require_okta::accept_invite(").unwrap();
+        let second = cb.rfind("finish_oidc(").unwrap();
+        assert!(first < no_link && no_link < invite && invite < second);
+        assert!(cb.find("if !rule.require_okta").unwrap() < no_link);
+        // The hosted domain proof comes before any of it.
+        assert!(cb.find("fresh_domain_owner(").unwrap() < first);
     }
 
     fn claims_for(sub: &str, team: &str, role: &str) -> Claims {

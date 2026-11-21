@@ -106,7 +106,7 @@ Okta signs in only a member who linked their own Okta account. In **Settings, Se
 
 A session signed in with Okta ends at its next request when the member unlinks, when the Okta domain or issuer changes, or when Okta is turned off or removed. The member's sessions from other ways in are not affected. An Okta session is never a CoderHelm platform or install admin, on any install.
 
-New people join the usual way first (an invite, or an allowed email domain on a self-hosted install), then link Okta.
+New people join the usual way first (an invite, or an allowed email domain on a self-hosted install), then link Okta. While Okta sign-in is required (below), they accept their invite with Okta instead.
 
 ### 4. How people sign in
 
@@ -115,6 +115,34 @@ New people join the usual way first (an invite, or an allowed email domain on a 
 - **Hosted CoderHelm:** the Okta of the team that proved the email's domain in DNS, when its Okta sign-in is on. Which Okta it is depends only on the domain, never on whether the person is on a team.
 - **What an Okta session can do (hosted):** everything on that team, and nothing beyond it. It can't switch to the person's other teams, see them in the team list, change their password, change or turn off their second factor, link GitHub or Okta, end their other sessions, or act as a CoderHelm platform admin. Those need a sign-in with a password, Google, GitHub or Microsoft. Someone on no other team can still set up a second factor from an Okta session, so a team that requires two-factor sign-in never leaves them stuck; someone on other teams is told to sign in another way to set it up.
 - **A self-hosted install:** the organization's Okta. There is one organization, so an Okta session there isn't held to a team. It still can't act as an install admin: an install admin signs in another way for Settings, Setup and Settings, System.
+
+### 5. Require Okta sign-in (optional)
+
+In **Settings, Sign-in rules**, beside **Require two-factor sign-in**, the owner can turn on **Require Okta sign-in**. On a self-hosted install it is the organization's rule, saved on the organization record; on hosted CoderHelm it is each team's own.
+
+**Turning it on.** Only the owner can turn it on or off, and every change is in the team's audit log. It turns on only when:
+
+1. Okta sign-in is set up and turned on.
+2. On hosted CoderHelm, every email domain of the setup is proven in DNS. CoderHelm reads each TXT record again at that moment. A self-hosted install proves no domains: only its owner can set up the organization's Okta.
+3. The owner's own session came from this Okta. Sign out, choose **Continue with Okta**, then turn it on. That proves Okta sign-in works before everyone depends on it.
+
+The page lists the members who haven't linked Okta yet, and turning the rule on asks you to confirm that list.
+
+**While it is on:**
+
+- Members sign in only with Okta. Password, Google, GitHub and Microsoft sign-ins are refused with a message that names the team (on a self-hosted install, the organization) and links to Okta sign-in. Nothing is made instead: no personal team, no accepted invite, no join by email domain.
+- Sessions from any other way in end at their next request, including ones made before the rule. Switching into the team from another team's session is refused. Apps connected through CoderHelm's MCP server work only when they were connected from an Okta session.
+- On hosted CoderHelm only this team is held back. A person on other teams signs in to those as before, and their sessions there go on.
+- While the rule is on, Okta can't be turned off or removed, moved to another Okta domain or issuer, or lose an email domain. Turn the rule off first.
+- API keys and CI tokens are not sessions. They keep working as they are.
+
+**Break-glass.** If your Okta is down or misconfigured, the owner can still sign in with their password and their second factor: on the sign-in page, choose the small owner link under Okta. A second factor is required, with no exception; an owner without one can't use it, so set one up before you turn the rule on. Each such sign-in is written to the team's audit log before its session starts, and listed on the Sign-in rules page. Nobody else has this way in, and a session from it can't connect apps.
+
+**New members.** An admin invites them as usual. While the rule is on, every invite waits to be accepted (even for someone who already has a CoderHelm account). The person accepts it by signing in with Okta: when Okta's verified email is exactly the invited email (and, on hosted CoderHelm, its domain is one the team proved), CoderHelm makes their member record and links their Okta account in one step. It never links or takes over an existing member record, and an Okta account linked to one member can't accept another invite. Why this is safe: an admin named the exact email; Okta's email counts only when Okta marks it verified, from the team's own Okta; on hosted CoderHelm the email's domain is one the team proved it controls in DNS, and the session is held to that team like every Okta session.
+
+**Members who haven't linked Okta.** Their Okta sign-in works only through a link they made before the rule. Otherwise they are told to ask an admin. An admin can remove them and invite them again (they accept with Okta), or turn the rule off while they link. CoderHelm never matches an existing member by email.
+
+**Turning it off** brings every other way in back at once.
 
 ## On CoderHelm's hosted deployment
 

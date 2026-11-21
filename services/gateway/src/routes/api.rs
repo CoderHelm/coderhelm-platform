@@ -334,7 +334,12 @@ pub async fn list_teams(
                 .map(|r| r.items().to_vec())
                 .unwrap_or_default();
 
-            // Process any pending invites — convert them to real user records
+            // Process any pending invites — convert them to real user records.
+            // A team that requires Okta sign-in accepts its invites only
+            // through its Okta (routes::require_okta).
+            let gated = super::require_okta::gated_teams(&state, &all_items)
+                .await
+                .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
             let real_user_sk = format!("USER#{github_id}");
             let now = chrono::Utc::now().to_rfc3339();
             for item in &all_items {
@@ -350,6 +355,9 @@ pub async fn list_teams(
                     Some(t) => t.to_string(),
                     None => continue,
                 };
+                if gated.contains(&invite_tid) {
+                    continue;
+                }
                 let invite_role = item
                     .get("role")
                     .and_then(|v| v.as_s().ok())
@@ -463,6 +471,17 @@ pub async fn switch_team(
     // Okta organization vouches for its own team only.
     if target_team != claims.team_id && super::oidc_signin::team_only(&claims) {
         return Err(StatusCode::FORBIDDEN);
+    }
+    // A team that requires Okta sign-in is reached only by signing in with
+    // its Okta, never by switching from another team's session.
+    if target_team != claims.team_id
+        && super::sign_in::team_rule(&state, target_team)
+            .await
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+            .require_okta
+    {
+        let team = super::require_okta::team_words(&state, target_team).await;
+        return Ok(super::require_okta::refused_json(&team).into_response());
     }
 
     // Verify user exists in target team and get their role there

@@ -15,6 +15,8 @@ mod auth;
 mod bases;
 mod bedrock_setup;
 mod clients;
+#[cfg(test)]
+mod fake_aws;
 mod knowledge_keys;
 mod lookups;
 mod mcp_knowledge;
