@@ -82,7 +82,10 @@ fn a_stuck_task_changes_approach_before_the_guard_stops_the_run() {
         Rung::Escalate,
         Rung::Defer,
     ] {
-        assert!(rungs.contains(&r), "the ladder never reached {r:?}: {rungs:?}");
+        assert!(
+            rungs.contains(&r),
+            "the ladder never reached {r:?}: {rungs:?}"
+        );
     }
     // Never the same ask twice in a row after a step that changed nothing.
     for w in rungs.windows(2) {

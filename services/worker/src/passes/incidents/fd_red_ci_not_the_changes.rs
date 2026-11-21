@@ -77,7 +77,10 @@ fn an_event_written_without_a_webhook_names_the_failing_check() {
     assert_eq!(p["head_sha"], "7431ad7a11799811566ff89840fd7fc02067178c");
 
     let line = collect_ci_failure_info(&[event(p.clone())]);
-    assert!(line.contains("Deploy Preview") && line.contains("9100"), "{line}");
+    assert!(
+        line.contains("Deploy Preview") && line.contains("9100"),
+        "{line}"
+    );
     assert!(line.contains("E2E on preview"), "{line}");
 }
 
@@ -131,7 +134,11 @@ fn every_synthetic_event_reads_the_failing_checks_from_github() {
             call[..end].contains("Some((&github") || call[..end].contains("github\n")
         })
         .count();
-    assert_eq!(calls.len(), with_github, "a synthetic event written without its checks");
+    assert_eq!(
+        calls.len(),
+        with_github,
+        "a synthetic event written without its checks"
+    );
 }
 
 /// The deploy step's log, as the run's CI showed it.
@@ -142,7 +149,10 @@ const DEPLOY_LOG: &str = "2026-11-16T22:40:11.0Z Creating listener rule for pr-4
 #[test]
 fn the_cloud_accounts_limit_is_not_the_changes_failure() {
     let line = looks_account_limit(DEPLOY_LOG).expect("an account limit");
-    assert!(line.contains("TooManyUniqueTargetGroupsPerLoadBalancer"), "{line}");
+    assert!(
+        line.contains("TooManyUniqueTargetGroupsPerLoadBalancer"),
+        "{line}"
+    );
     // The infrastructure check that re-runs once never claimed it: a re-run
     // meets the same limit.
     assert_eq!(looks_infra(DEPLOY_LOG), None);
@@ -176,12 +186,18 @@ fn the_cloud_accounts_limit_is_not_the_changes_failure() {
     .map(|s| s.to_string())
     .collect();
     let cleanup = cleanup_workflows(&files);
-    assert_eq!(cleanup, vec![".github/workflows/cleanup-previews.yml".to_string()]);
+    assert_eq!(
+        cleanup,
+        vec![".github/workflows/cleanup-previews.yml".to_string()]
+    );
     let note = account_limit_note(&["Deploy Preview".into()], &line, &cleanup);
     assert!(note.contains("not on this change"), "{note}");
     assert!(note.contains("cleanup-previews.yml"), "{note}");
     assert!(note.contains("changed no code"), "{note}");
-    assert!(note.contains("took none of this change's work out"), "{note}");
+    assert!(
+        note.contains("took none of this change's work out"),
+        "{note}"
+    );
 }
 
 #[test]
@@ -194,7 +210,10 @@ fn no_fix_round_runs_for_the_accounts_limit() {
         .find("let mut ci_round = run_round::Round::start(")
         .expect("the CI fix round");
     let rerun = src.find("let rerun = try_rerun_once(").expect("the re-run");
-    assert!(limit < rerun && limit < round, "the limit is read after a fix or a re-run started");
+    assert!(
+        limit < rerun && limit < round,
+        "the limit is read after a fix or a re-run started"
+    );
     let block = &src[limit..limit + 3000];
     assert!(block.contains("mark_pr_ready("), "{block}");
     assert!(block.contains("\"completed\""), "{block}");

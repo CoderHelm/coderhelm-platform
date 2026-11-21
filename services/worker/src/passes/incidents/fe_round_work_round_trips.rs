@@ -55,9 +55,17 @@ fn a_path_with_special_characters_is_the_file_github_serves() {
         "data/100%.json",
         "plain/path.ts",
     ] {
-        for git_ref in ["coderhelm-wip/coderhelm/gh-41-card-block", "main", "a1b2c3d"] {
+        for git_ref in [
+            "coderhelm-wip/coderhelm/gh-41-card-block",
+            "main",
+            "a1b2c3d",
+        ] {
             let url = contents_url("acme", "site", path, Some(git_ref));
-            assert_eq!(served(&url), (path.to_string(), Some(git_ref.to_string())), "{url}");
+            assert_eq!(
+                served(&url),
+                (path.to_string(), Some(git_ref.to_string())),
+                "{url}"
+            );
         }
         let put = contents_url("acme", "site", path, None);
         assert_eq!(served(&put), (path.to_string(), None), "{put}");
@@ -69,7 +77,10 @@ fn a_file_github_wont_give_back_is_not_a_missing_branch() {
     // The run's own error, names invented.
     let file_404 = "`apps/web/src/app/%5Fmarkdown/[[...slug]]/route.ts` couldn't be read from the WIP branch (HTTP status client error (404 Not Found) for url (https://api.github.com/repos/acme/site/contents/apps/web/src/app/%5Fmarkdown/[[...slug]]/route.ts?ref=coderhelm-wip/coderhelm/gh-41-card-block))";
     assert_eq!(fault_of(file_404), Fault::Unreadable);
-    assert!(keeps_work(fault_of(file_404)), "the branch holding the work is kept");
+    assert!(
+        keeps_work(fault_of(file_404)),
+        "the branch holding the work is kept"
+    );
     // A branch that really isn't there still reads as one.
     let ref_404 = "HTTP status client error (404 Not Found) for url (https://api.github.com/repos/acme/site/git/ref/heads/coderhelm-wip/coderhelm/gh-41-card-block)";
     assert_eq!(fault_of(ref_404), Fault::WipMissing);
@@ -82,9 +93,14 @@ fn the_ci_fix_loop_keeps_the_branch_a_fault_left_whole() {
         .find("let fault_plan = super::round::plan_for_fault(")
         .expect("the CI fix loop's fault decision");
     let block = &src[at..at + 4000];
-    let clean = block.find("let clean = fault_plan.clean").expect("clean is decided");
+    let clean = block
+        .find("let clean = fault_plan.clean")
+        .expect("clean is decided");
     let delete = block.find(".delete_branch(").expect("the branch delete");
-    assert!(clean < delete, "the WIP branch is deleted before the fault is read");
+    assert!(
+        clean < delete,
+        "the WIP branch is deleted before the fault is read"
+    );
     assert!(block[clean..delete].contains("if clean"), "{block}");
 }
 

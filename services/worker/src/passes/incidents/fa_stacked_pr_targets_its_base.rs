@@ -100,9 +100,15 @@ fn a_branch_built_on_the_other_pull_request_is_stacked_without_a_rebuild() {
     let shared = stack::shared(&matched, &their);
     assert_eq!(shared, matched);
     let c = copy(&["a1a1a1a", "b2b2b2b"], &["a1a1a1a", "b2b2b2b"]);
-    assert!(stack::built_on(&c), "the other pull request's own commits read as copies");
+    assert!(
+        stack::built_on(&c),
+        "the other pull request's own commits read as copies"
+    );
     let why = stack::built_on_why(&c);
-    assert!(why.contains("built on #40's branch `coderhelm/harbor-40`"), "{why}");
+    assert!(
+        why.contains("built on #40's branch `coderhelm/harbor-40`"),
+        "{why}"
+    );
     assert!(!why.contains("under other hashes"));
     assert!(!why.contains("re-created"));
     // The kept branch of the incident: same changes under new hashes. These
@@ -119,7 +125,9 @@ fn a_branch_built_on_the_other_pull_request_is_stacked_without_a_rebuild() {
 fn the_pipeline_moves_reused_pull_requests_and_skips_needless_rebuilds() {
     let pr = include_str!("../pr.rs");
     let run = fn_src(pr, "pub async fn run(");
-    let reused = run.find("\"Using existing PR\"").expect("the existing pull request path");
+    let reused = run
+        .find("\"Using existing PR\"")
+        .expect("the existing pull request path");
     let reopened = run
         .find("\"Reopened prior PR for branch\"")
         .expect("the reopened pull request path");
@@ -132,8 +140,13 @@ fn the_pipeline_moves_reused_pull_requests_and_skips_needless_rebuilds() {
     let stack_src = include_str!("../stack.rs");
     for head in ["pub async fn at_start(", "pub async fn before_pr("] {
         let f = fn_src(stack_src, head);
-        let check = f.find("built_on(&c)").unwrap_or_else(|| panic!("{head} rebuilds a stacked branch"));
+        let check = f
+            .find("built_on(&c)")
+            .unwrap_or_else(|| panic!("{head} rebuilds a stacked branch"));
         let rebuild = f.find("rebuild_on(").unwrap();
-        assert!(check < rebuild, "{head} rebuilds before it asks whether the branch is built on it");
+        assert!(
+            check < rebuild,
+            "{head} rebuilds before it asks whether the branch is built on it"
+        );
     }
 }

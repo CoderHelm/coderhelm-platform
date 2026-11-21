@@ -23,7 +23,8 @@ const FRESH: &str = "01JRUNFRESH000000000000000";
 const LATER: &str = "01JRUNZLATER00000000000000";
 
 fn runs() -> Vec<(String, String, String)> {
-    let r = |id: &str, status: &str, repo: &str| (id.to_string(), status.to_string(), repo.to_string());
+    let r =
+        |id: &str, status: &str, repo: &str| (id.to_string(), status.to_string(), repo.to_string());
     vec![
         r(ASKED, NEEDS_INPUT, "harbor/booking"),
         r(ASKED_AGAIN, NEEDS_INPUT, "Harbor/Booking"),
@@ -37,12 +38,19 @@ fn runs() -> Vec<(String, String, String)> {
 fn a_fresh_run_ends_the_tickets_earlier_waits() {
     let runs = runs();
     let ended = one_run::earlier_waits(FRESH, "harbor/booking", &runs);
-    assert_eq!(ended, vec![ASKED, ASKED_AGAIN], "both waits on the ticket end");
+    assert_eq!(
+        ended,
+        vec![ASKED, ASKED_AGAIN],
+        "both waits on the ticket end"
+    );
     // Never itself, never a newer run, never a run in another repository,
     // never a run that ended some other way.
     assert!(one_run::earlier_waits(ASKED, "harbor/booking", &runs).is_empty());
     let note = one_run::ended_wait_note(FRESH);
-    assert!(note.contains(FRESH) && note.contains("no longer waits"), "{note}");
+    assert!(
+        note.contains(FRESH) && note.contains("no longer waits"),
+        "{note}"
+    );
 }
 
 #[test]
@@ -54,7 +62,8 @@ fn the_claim_ends_them_once_the_run_holds_the_ticket() {
         .expect("the claim taken");
     let after = &claim[held..];
     assert!(
-        after[..after.find("return Ok(());").unwrap()].contains("end_earlier_waits(state, msg, run_id)"),
+        after[..after.find("return Ok(());").unwrap()]
+            .contains("end_earlier_waits(state, msg, run_id)"),
         "taking the claim ends the earlier waits"
     );
     let f = &src[src.find("async fn end_earlier_waits(").unwrap()..];
