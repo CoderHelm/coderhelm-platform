@@ -214,7 +214,7 @@ const FIXED: &[&str] = &[
 ];
 const DISMISSED: &[&str] = &["dismissed", "withdrawn", "ignored", "aws_managed"];
 
-fn in_state(v: &Value, want: &str) -> bool {
+pub fn in_state(v: &Value, want: &str) -> bool {
     let st = status_of(v);
     match want {
         "open" => !FIXED.contains(&st.as_str()) && !DISMISSED.contains(&st.as_str()),

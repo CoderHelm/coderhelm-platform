@@ -363,6 +363,7 @@ pub async fn ask(
             question: case.question,
             limits: LIMITS,
             must_look: None,
+            uncited_ok: false,
         },
     )
     .await
@@ -473,6 +474,9 @@ pub struct WorkBox<'a> {
     pub team: String,
     pub readable: Vec<&'static str>,
     pub defs: Vec<Value>,
+    /// "What needs me" comes back in its list's shape (the question is
+    /// that one), as `chat_work::Ctx::needs_shape`.
+    pub needs_shape: bool,
 }
 
 impl<'a> WorkBox<'a> {
@@ -483,6 +487,7 @@ impl<'a> WorkBox<'a> {
             team: team.into(),
             readable,
             defs,
+            needs_shape: true,
         }
     }
 
@@ -621,7 +626,8 @@ impl WorkBox<'_> {
             budget: needs::SOURCE_BUDGET,
         };
         let report = needs::gather(&src, fx::me(), fx::now()).await;
-        let (text, summary) = needs::render(&report, reg, "2026-11-16 12:00 UTC");
+        let (text, summary) =
+            needs::render_for(&report, reg, "2026-11-16 12:00 UTC", self.needs_shape);
         Called::Done {
             text,
             label: work::label(work::NEEDS_ME, &json!({})),
@@ -796,11 +802,13 @@ pub async fn ask_work(
     case: &WorkCase,
 ) -> (Answered, Recorder) {
     let mut tb = WorkBox::new(store, TEAM, readable);
-    let hints = super::chat_hints::read(case.question);
-    work::put_first(&mut tb.defs, &hints);
+    // Read as production reads it (`brain::answer`).
+    let understood = super::chat_understand::read(case.question, &[]);
+    tb.needs_shape = understood.needs_shape();
+    understood.order(&mut tb.defs, case.question);
     let offered: Vec<&str> = tb.defs.iter().filter_map(|t| t["name"].as_str()).collect();
-    let notes = work::hint_note(&hints, &offered);
-    let must_look = work::must_look(&hints, &offered);
+    let notes = understood.notes(&offered);
+    let must_look = understood.must_look(&offered, case.question);
     let sink = Recorder::default();
     let mut reg = Registry::default();
     let (_, repos) = fixture();
@@ -816,6 +824,7 @@ pub async fn ask_work(
             question: case.question,
             limits: LIMITS,
             must_look,
+            uncited_ok: understood.uncited_ok(),
         },
     )
     .await
@@ -1166,6 +1175,7 @@ mod tests {
                 question: case.question,
                 limits: LIMITS,
                 must_look: None,
+                uncited_ok: false,
             },
         )
         .await
@@ -1175,7 +1185,10 @@ mod tests {
             why.iter().any(|w| w.contains("didn't call work_tickets")),
             "{why:?}"
         );
-        assert!(!before.rechecked);
+        // Even with no must-look check, an answer that cites nothing now
+        // looks once (`chat_agent::cite_something`); this script has no
+        // second answer, so the reported one still fails its case.
+        assert!(before.rechecked);
         // After: the same first answer is sent back in code (the model's
         // check isn't even asked), and the answer looks where it lives.
         let mut steps: Vec<Step> = vec![Box::new(move |_| say(reported))];

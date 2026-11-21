@@ -488,6 +488,108 @@ pub async fn find(state: &AppState, team_id: &str, ask: &RunAsk) -> Result<Vec<F
     Ok(out)
 }
 
+/// What Coderhelm's runs did for a team over a window: counted from the
+/// runs themselves, for "what does Coderhelm already do for us".
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Tally {
+    pub days: u32,
+    pub started: usize,
+    pub done: usize,
+    pub running: usize,
+    pub waiting: usize,
+    pub failed: usize,
+    pub stopped: usize,
+    /// Runs that opened a pull request.
+    pub with_pr: usize,
+    /// Repositories the runs worked in, most runs first.
+    pub repos: Vec<(String, usize)>,
+    /// When the newest run started.
+    pub latest: String,
+    /// More runs may lie past what was read.
+    pub capped: bool,
+}
+
+/// [`Tally`] from listed runs (newest first), counting those started on or
+/// after `since` (RFC 3339).
+pub fn tally_of(items: &[Item], since: &str, days: u32, capped: bool) -> Tally {
+    let mut t = Tally {
+        days,
+        capped,
+        ..Default::default()
+    };
+    let mut repos: HashMap<String, usize> = HashMap::new();
+    for i in items {
+        let status = st(i, "status");
+        let created = st(i, "created_at");
+        if status == common::run_status::ARCHIVED || created < since {
+            continue;
+        }
+        t.started += 1;
+        if t.latest.as_str() < created {
+            t.latest = created.to_string();
+        }
+        if Group::Done.holds(status) {
+            t.done += 1;
+        } else if Group::Running.holds(status) {
+            t.running += 1;
+        } else if Group::Waiting.holds(status) {
+            t.waiting += 1;
+        } else if Group::Failed.holds(status) {
+            t.failed += 1;
+        } else if Group::Stopped.holds(status) {
+            t.stopped += 1;
+        }
+        if !pr_numbers(i).is_empty() || !st(i, "pr_url").is_empty() {
+            t.with_pr += 1;
+        }
+        let repo = st(i, "repo");
+        if !repo.is_empty() {
+            *repos.entry(repo.to_string()).or_default() += 1;
+        }
+    }
+    let mut repos: Vec<(String, usize)> = repos.into_iter().collect();
+    repos.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    repos.truncate(8);
+    t.repos = repos;
+    t
+}
+
+/// The team's runs over the last `days`, counted. Only `team_id`'s
+/// partition is read, newest first, at most [`SCAN`] runs.
+pub async fn tally(state: &AppState, team_id: &str, days: u32) -> Result<Tally, String> {
+    let since = (chrono::Utc::now() - chrono::Duration::days(days as i64)).to_rfc3339();
+    let (projection, names) = projection();
+    let mut items: Vec<Item> = Vec::new();
+    let mut start: Option<Item> = None;
+    let mut capped = false;
+    loop {
+        let r = state
+            .dynamo
+            .query()
+            .table_name(&state.config.runs_table_name)
+            .key_condition_expression("team_id = :tid")
+            .expression_attribute_values(":tid", AttributeValue::S(team_id.to_string()))
+            .projection_expression(&projection)
+            .set_expression_attribute_names(Some(names.clone()))
+            .scan_index_forward(false)
+            .limit((SCAN - items.len()).min(200) as i32)
+            .set_exclusive_start_key(start.take())
+            .send()
+            .await
+            .map_err(|e| why("list the runs", e))?;
+        items.extend(r.items().iter().cloned());
+        match r.last_evaluated_key() {
+            Some(k) if !k.is_empty() && items.len() < SCAN => start = Some(k.clone()),
+            Some(k) if !k.is_empty() => {
+                capped = true;
+                break;
+            }
+            _ => break,
+        }
+    }
+    Ok(tally_of(&items, &since, days, capped))
+}
+
 /// The pull requests the matching runs opened, as `(owner/name, number)`,
 /// best match first: a title search finds its pull request through the run
 /// that opened it, whatever GitHub's search makes of the title.
@@ -543,6 +645,40 @@ pub(crate) mod tests {
 
     fn ask(v: Value) -> RunAsk {
         RunAsk::from_input(&v, chrono::Utc::now())
+    }
+
+    #[test]
+    fn the_tally_counts_the_window_by_where_each_run_stands() {
+        let mut with_pr = run("01AAAAAAAAAAAAAAAAAAAA", "merged", "A-1", "x", "acme/web");
+        with_pr.insert(
+            "pr_url".into(),
+            AttributeValue::S("https://github.com/acme/web/pull/3".into()),
+        );
+        let items = vec![
+            with_pr,
+            run("01AAAAAAAAAAAAAAAAAAAB", "running", "A-2", "y", "acme/web"),
+            run(
+                "01AAAAAAAAAAAAAAAAAAAC",
+                "needs_input",
+                "A-3",
+                "z",
+                "acme/api",
+            ),
+            run("01AAAAAAAAAAAAAAAAAAAD", "failed", "A-4", "w", "acme/api"),
+            run("01AAAAAAAAAAAAAAAAAAAE", "archived", "A-5", "v", "acme/api"),
+            // Started before the window.
+            run("01A", "merged", "A-6", "u", "acme/old"),
+        ];
+        let t = tally_of(&items, "2026-11-10T00:00:00Z", 30, false);
+        assert_eq!(
+            (t.started, t.done, t.running, t.waiting, t.failed, t.with_pr),
+            (4, 1, 1, 1, 1, 1)
+        );
+        assert_eq!(
+            t.repos,
+            [("acme/api".to_string(), 2), ("acme/web".to_string(), 2)]
+        );
+        assert!(!t.latest.is_empty() && !t.capped);
     }
 
     #[test]

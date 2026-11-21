@@ -1173,12 +1173,28 @@ fn read_words(r: &Read) -> String {
 /// How the answer is written.
 pub const ANSWER_SHAPE: &str = "Write the answer in exactly this shape. First the count line. Then each group in the order given (skip an empty one), with its heading, and one line per item, most urgent first: a markdown link to the item named by what it is, then exactly what they need to do, then since when, and its citation. Under a run's line, keep its questions with their possible answers as a short nested list. Then, for every source that couldn't be read or wasn't checked, one plain sentence that says so (for example \"GitHub couldn't be read, so your pull requests aren't listed\"), in that source's own words: never say a system isn't connected unless its line says exactly that. Don't add items that aren't listed here.";
 
+/// How the list is used when the question is something else (an
+/// orientation, a status, a judgement): only what answers it.
+pub const NOT_THE_LIST: &str = "The question isn't what's waiting on them, so don't write this list. Use only the items that answer the question asked, in a line each. If it helps, say in one line how many things wait on them and that \"What needs my answer?\" lists them. For a source that couldn't be read or wasn't checked, say so only when it matters to the answer, in that source's own words: never say a system isn't connected unless its line says exactly that.";
+
 /// Registers each item as a citable source and writes what the model reads.
 /// Returns the text and the step's summary.
+#[cfg(test)]
 pub fn render(
     report: &Report,
     reg: &mut common::knowledge::answer::Registry,
     stamp: &str,
+) -> (String, String) {
+    render_for(report, reg, stamp, true)
+}
+
+/// [`render`], with the list's fixed shape only when the question is what's
+/// waiting on them (`shaped`); otherwise [`NOT_THE_LIST`].
+pub fn render_for(
+    report: &Report,
+    reg: &mut common::knowledge::answer::Registry,
+    stamp: &str,
+    shaped: bool,
 ) -> (String, String) {
     use common::knowledge::answer::SourceRef;
     let mut text = format!(
@@ -1249,7 +1265,10 @@ pub fn render(
             report.skipped.join("; ")
         ));
     }
-    text.push_str(&format!("\n{ANSWER_SHAPE}\n\n"));
+    text.push_str(&format!(
+        "\n{}\n\n",
+        if shaped { ANSWER_SHAPE } else { NOT_THE_LIST }
+    ));
     text.push_str(&reg.render(&ids));
     let gaps = report
         .sources
