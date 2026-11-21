@@ -910,13 +910,25 @@ pub(crate) fn looks_infra(logs: &str) -> Option<String> {
 pub(crate) fn looks_account_limit(logs: &str) -> Option<String> {
     logs.lines().find_map(|l| {
         let low = l.to_lowercase();
-        let code = l.split(|c: char| !c.is_ascii_alphanumeric()).any(|w| {
+        // Only the cloud's own error codes count: the one in "An error
+        // occurred (Code) when calling ...", or an SDK's `...Exception`. The
+        // same words thrown by the code under test (a browser's
+        // `QuotaExceededError`, a client's `TooManyRedirects`) are the
+        // change's failures, never the account's.
+        let cli_code = low.find("an error occurred (").and_then(|i| {
+            let rest = &l[i + "an error occurred (".len()..];
+            rest.split(')').next()
+        });
+        let limit = |w: &str| {
             (w.starts_with("TooMany")
                 && !w.starts_with("TooManyRequests")
                 && w.len() > "TooMany".len())
                 || (w.contains("LimitExceeded") && !w.contains("Rate"))
                 || w.contains("QuotaExceeded")
-        });
+        };
+        let code = cli_code.is_some_and(limit)
+            || l.split(|c: char| !c.is_ascii_alphanumeric())
+                .any(|w| w.ends_with("Exception") && limit(w));
         (code
             || low.contains("you have reached the maximum number of")
             || low.contains("service quota exceeded"))
