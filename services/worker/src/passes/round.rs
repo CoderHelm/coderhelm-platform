@@ -350,6 +350,48 @@ pub(crate) async fn end_unfinished(
     true
 }
 
+/// Whether a leftover WIP branch is unlanded work on the pull request's
+/// head as it is now: from a compare of the pull request's branch with it,
+/// the WIP branch is that head plus commits, none missing. A round that
+/// ran out of its time budget leaves exactly that ("Resume continues from
+/// there"); a new round that reset the branch to the head threw those
+/// checkpoints away and did the same work again in the same budget.
+pub(crate) fn picks_up(compare: &serde_json::Value) -> bool {
+    compare["behind_by"].as_u64() == Some(0)
+        && compare["ahead_by"].as_u64().unwrap_or(0) > 0
+        && compare["status"].as_str() == Some("ahead")
+}
+
+/// The WIP branch a new round on `pr_branch` goes on from, when one is
+/// left there with unlanded work on the head ([`picks_up`]); "" for a
+/// fresh one. A head that moved since (a person's push, a landed round)
+/// starts fresh: that work was written on an older head.
+pub(crate) async fn carried(
+    github: &GitHubClient,
+    owner: &str,
+    repo: &str,
+    pr_branch: &str,
+) -> String {
+    let wip = run_round::wip_branch(pr_branch);
+    match github.get_diff(owner, repo, pr_branch, &wip).await {
+        Ok(c) if picks_up(&c) => {
+            info!(
+                wip,
+                ahead = c["ahead_by"].as_u64().unwrap_or(0),
+                "Going on from the unfinished round's WIP branch"
+            );
+            wip
+        }
+        _ => String::new(),
+    }
+}
+
+/// What a round that picks up an earlier one's work is told first.
+pub(crate) const CONTINUING: &str =
+    "## CONTINUING THIS ROUND\nAn earlier step of this round stopped before it \
+     finished; everything it wrote is already committed on this branch. Read the files you \
+     need first, then finish only what is left.";
+
 /// The round's WIP branch, ready to write to: the one it already has when
 /// it continues (`reuse`), else a fresh one at the pull request's head.
 /// Returns its name.
@@ -449,6 +491,11 @@ pub(crate) fn fault_of(error: &str) -> Fault {
     let has = |needles: &[&str]| needles.iter().any(|n| e.contains(n));
     if has(&["changed the same files meanwhile"]) {
         Fault::Clash
+    } else if has(&["/contents/", "couldn't be read from the wip branch"]) {
+        // One file of the round's that GitHub wouldn't give back: the
+        // branch is there and holds the work, so it is kept and read again,
+        // never deleted as a branch that "saved nothing".
+        Fault::Unreadable
     } else if has(&["no wip branch"])
         || (e.contains("404") && has(&["coderhelm-wip/", "wip branch", "/git/ref"]))
     {

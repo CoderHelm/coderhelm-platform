@@ -431,40 +431,145 @@ async fn current_branch_head(
 
 /// Record a synthetic `ci_failed` event so a follow-up resume routes the run into
 /// the fix path. Used when GitHub's aggregate says a check failed but no
-/// `ci_failed` webhook event is present yet — a missed webhook, or a straggler
-/// that failed after a `ci_passed` already landed. The empty payload carries no
-/// `workflow_run_id`, so the fix path falls back to check-run annotations for the
-/// failure detail (see the log-collection block in the fix path).
+/// `ci_failed` webhook event is present yet — a missed webhook, a straggler
+/// that failed after a `ci_passed` already landed, a check that no workflow
+/// webhook reports, or a round sent back to fixing. The failing checks are
+/// read from GitHub now and written the way a webhook writes them (each
+/// workflow's name, its run id, its conclusion: [`synthetic_payloads`]), so
+/// the fix round names the check, reads its job log, can re-run it and
+/// compares it against the base branch. An event that named nothing was
+/// described as "Workflow 'unknown' failed (run_id: 0)", and the round
+/// started with no check to compare, no log and nothing to re-run.
 async fn record_synthetic_ci_failed(
     state: &WorkerState,
     team_id: &str,
     run_id: &str,
     head_sha: Option<&str>,
+    github: Option<(&GitHubClient, &str, &str, &str)>,
 ) {
+    let head = head_sha.unwrap_or("");
+    let failing = match github {
+        Some((gh, owner, repo, branch)) => {
+            failing_now(
+                gh,
+                owner,
+                repo,
+                Some(head).filter(|h| !h.is_empty()).unwrap_or(branch),
+            )
+            .await
+        }
+        None => Vec::new(),
+    };
     let now = chrono::Utc::now();
-    let event_sk = format!("EVENT#{}#ci_failed", now.format("%Y%m%dT%H%M%S%.3fZ"));
-    let payload = serde_json::json!({ "head_sha": head_sha.unwrap_or("") });
-    if let Err(e) = common::run_events::put(
-        &state.dynamo,
-        &state.config.events_table_name,
-        team_id,
-        run_id,
-        &event_sk,
-    )
-    .item("event_type", attr_s("ci_failed"))
-    .item("payload", attr_s(&payload.to_string()))
-    .item("processed", AttributeValue::Bool(false))
-    .item("created_at", attr_s(&now.to_rfc3339()))
-    // The events table's TTL attribute (infra database-stack).
-    .item(
-        "expires_at",
-        attr_n((now.timestamp() as u64 + 30 * 86400).to_string()),
-    )
-    .send()
-    .await
-    {
-        warn!(run_id, error = %e, "Failed to write synthetic ci_failed event");
+    for (i, payload) in synthetic_payloads(head, &failing).iter().enumerate() {
+        let stamp = now.format("%Y%m%dT%H%M%S%.3fZ");
+        let event_sk = if i == 0 {
+            format!("EVENT#{stamp}#ci_failed")
+        } else {
+            format!("EVENT#{stamp}-{i}#ci_failed")
+        };
+        if let Err(e) = common::run_events::put(
+            &state.dynamo,
+            &state.config.events_table_name,
+            team_id,
+            run_id,
+            &event_sk,
+        )
+        .item("event_type", attr_s("ci_failed"))
+        .item("payload", attr_s(&payload.to_string()))
+        .item("processed", AttributeValue::Bool(false))
+        .item("created_at", attr_s(&now.to_rfc3339()))
+        // The events table's TTL attribute (infra database-stack).
+        .item(
+            "expires_at",
+            attr_n((now.timestamp() as u64 + 30 * 86400).to_string()),
+        )
+        .send()
+        .await
+        {
+            warn!(run_id, error = %e, "Failed to write synthetic ci_failed event");
+        }
     }
+}
+
+/// The checks failing on `git_ref` now, each with the name of the workflow
+/// its run belongs to when GitHub gives it. Empty when the checks can't be
+/// read.
+async fn failing_now(
+    github: &GitHubClient,
+    owner: &str,
+    repo: &str,
+    git_ref: &str,
+) -> Vec<(quarantine::FailedCheck, Option<String>)> {
+    let Ok(listing) = github.list_check_runs_for_ref(owner, repo, git_ref).await else {
+        return Vec::new();
+    };
+    let checks = listing["check_runs"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let mut names: std::collections::HashMap<u64, Option<String>> = Default::default();
+    let mut out = Vec::new();
+    for c in quarantine::failed_checks(&checks) {
+        let workflow = match c.workflow_run_id {
+            Some(id) => match names.get(&id) {
+                Some(n) => n.clone(),
+                None => {
+                    let n = github
+                        .get_workflow_run(owner, repo, id)
+                        .await
+                        .ok()
+                        .and_then(|r| r["name"].as_str().map(str::to_string))
+                        .filter(|n| !n.trim().is_empty());
+                    names.insert(id, n.clone());
+                    n
+                }
+            },
+            None => None,
+        };
+        out.push((c, workflow));
+    }
+    out
+}
+
+/// The `ci_failed` payloads for what fails on `head`, one per workflow run
+/// (its jobs are one workflow's) and one per failing check outside GitHub
+/// Actions, in the shape the webhook writes: `workflow_name` (the
+/// workflow's, else the check's own name), `workflow_run_id`, `conclusion`,
+/// and `check_names`. When nothing could be read, one payload naming the
+/// head alone.
+pub(crate) fn synthetic_payloads(
+    head: &str,
+    failing: &[(quarantine::FailedCheck, Option<String>)],
+) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::new();
+    for (c, workflow) in failing {
+        let same_run = c.workflow_run_id.and_then(|id| {
+            out.iter_mut()
+                .find(|p| p["workflow_run_id"].as_u64() == Some(id))
+        });
+        if let Some(p) = same_run {
+            if let Some(list) = p["check_names"].as_array_mut() {
+                list.push(Value::String(c.name.clone()));
+            }
+            continue;
+        }
+        let mut p = serde_json::json!({
+            "head_sha": head,
+            "workflow_name": workflow.clone().unwrap_or_else(|| c.name.clone()),
+            "conclusion": c.conclusion,
+            "check_names": [c.name],
+            "synthetic": true,
+        });
+        if let Some(id) = c.workflow_run_id {
+            p["workflow_run_id"] = Value::from(id);
+        }
+        out.push(p);
+    }
+    if out.is_empty() {
+        out.push(serde_json::json!({ "head_sha": head, "synthetic": true }));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -582,10 +687,10 @@ fn wall_clock_secs(
 }
 
 #[derive(Debug, Clone)]
-struct RunEvent {
-    sk: String,
-    event_type: String,
-    payload: Value,
+pub(crate) struct RunEvent {
+    pub(crate) sk: String,
+    pub(crate) event_type: String,
+    pub(crate) payload: Value,
 }
 
 /// Split CI events into (current, stale). A ci_failed/ci_passed event is stale
@@ -792,6 +897,83 @@ pub(crate) fn looks_infra(logs: &str) -> Option<String> {
             .any(|m| low.contains(m))
             .then(|| common::truncate_str(l.trim(), 300).to_string())
     })
+}
+
+/// The line a failure's logs show when a deploy step hit a limit of the
+/// team's cloud account, not anything in the code: AWS answers with an
+/// error code `TooMany…` (other than a rate limit's `TooManyRequests…`),
+/// `…LimitExceeded…` or `…QuotaExceeded…`, or says "You have reached the
+/// maximum number of". A re-run meets the same limit and no code change
+/// lifts it: someone frees what holds it (the repository's cleanup
+/// workflow, when it has one) or raises the limit. Fix rounds on the code
+/// were spent on it, and a run once took its own work out for it.
+pub(crate) fn looks_account_limit(logs: &str) -> Option<String> {
+    logs.lines().find_map(|l| {
+        let low = l.to_lowercase();
+        let code = l.split(|c: char| !c.is_ascii_alphanumeric()).any(|w| {
+            (w.starts_with("TooMany")
+                && !w.starts_with("TooManyRequests")
+                && w.len() > "TooMany".len())
+                || (w.contains("LimitExceeded") && !w.contains("Rate"))
+                || w.contains("QuotaExceeded")
+        });
+        (code
+            || low.contains("you have reached the maximum number of")
+            || low.contains("service quota exceeded"))
+        .then(|| common::truncate_str(l.trim(), 300).to_string())
+    })
+}
+
+/// The repository's workflows that free preview or test resources, by file
+/// name (`cleanup-previews.yml`, `teardown.yml`, `prune-stacks.yml`): what
+/// a person runs when a deploy hit the account's limit.
+pub(crate) fn cleanup_workflows(files: &[String]) -> Vec<String> {
+    const MARKS: &[&str] = &[
+        "cleanup",
+        "clean-up",
+        "clean_up",
+        "teardown",
+        "tear-down",
+        "prune",
+        "destroy",
+        "reap",
+    ];
+    files
+        .iter()
+        .filter(|f| f.ends_with(".yml") || f.ends_with(".yaml"))
+        .filter(|f| {
+            let low = f.rsplit('/').next().unwrap_or(f).to_lowercase();
+            MARKS.iter().any(|m| low.contains(m))
+        })
+        .cloned()
+        .collect()
+}
+
+/// What the pull request and the run page say when a check failed on the
+/// cloud account's limit (`line`): not this change's, nothing in the code
+/// changed for it, and what frees it.
+pub(crate) fn account_limit_note(checks: &[String], line: &str, cleanup: &[String]) -> String {
+    let which = if checks.is_empty() {
+        "A check".to_string()
+    } else {
+        format!("`{}`", checks.join("`, `"))
+    };
+    let free =
+        match cleanup {
+            [] => "Someone with access to the account frees what holds the limit (old preview \
+               environments, for one) or raises it, then re-runs the check."
+                .to_string(),
+            c => format!(
+            "The repository's cleanup workflow ({}) frees old preview resources; once it has run \
+             (or the limit is raised), re-run the check.",
+            c.iter().map(|w| format!("`{w}`")).collect::<Vec<_>>().join(", ")
+        ),
+        };
+    format!(
+        "{which} failed on a limit of the team's cloud account, not on this change: `{line}`. \
+         A re-run meets the same limit and no code change lifts it, so CoderHelm changed no code \
+         for it and took none of this change's work out. {free}"
+    )
 }
 
 /// How many fix attempts one CI failure gets, each with fresh evidence and,
@@ -1832,6 +2014,7 @@ pub async fn run(
                     &msg.team_id,
                     &msg.run_id,
                     branch_head.as_deref(),
+                    Some((&github, &repo_owner, &repo_name, &branch)),
                 )
                 .await;
                 send_delayed_resume(state, &msg, 0).await;
@@ -2335,8 +2518,61 @@ pub async fn run(
         // the pull request says so. When GitHub won't let CoderHelm re-run
         // it, the pull request says that too, and no code changes for a
         // check with a flaky record.
-        let infra = looks_infra(&logs);
         let failing_wf = failing_workflows(&events);
+        // A deploy step that hit the cloud account's limit: not the change's
+        // failure, and nothing a re-run or a code change gets past. The pull
+        // request says so, names what frees it, and moves on with its work
+        // whole; no fix round is spent on it.
+        if let Some(line) = looks_account_limit(&logs) {
+            let workflows: Vec<String> = github
+                .list_directory(&repo_owner, &repo_name, ".github/workflows", &branch)
+                .await
+                .map(|e| e.into_iter().map(|d| d.path).collect())
+                .unwrap_or_default();
+            let note = account_limit_note(&failing_wf, &line, &cleanup_workflows(&workflows));
+            info!(run_id = msg.run_id, checks = ?failing_wf, line = %line, "CI failed on the cloud account's limit — no fix round, the pull request says why");
+            super::flaky::note_on_pr(&github, &repo_owner, &repo_name, pr_number, note.clone())
+                .await;
+            super::add_progress_note(state, &msg.team_id, &msg.run_id, &note).await;
+            super::record_ci_outcome(
+                state,
+                &msg.team_id,
+                &msg.run_id,
+                super::CiOutcome::HandedOff(super::GaveUp::UnrelatedTest),
+            )
+            .await;
+            super::pr_watch::mark_ci_head(
+                state,
+                &msg.team_id,
+                &msg.run_id,
+                branch_head.as_deref().unwrap_or_default(),
+            )
+            .await;
+            mark_events_processed(state, &msg.run_id, &events).await;
+            mark_pr_ready(
+                state,
+                &msg.team_id,
+                &github,
+                &repo_owner,
+                &repo_name,
+                pr_number,
+            )
+            .await;
+            complete_run_with_status(
+                state,
+                &ticket_msg,
+                &msg.run_id,
+                "completed",
+                &pr_url,
+                pr_number,
+                &branch,
+                &usage,
+                wall_clock_secs(created_at, &start),
+            )
+            .await?;
+            return Ok(());
+        }
+        let infra = looks_infra(&logs);
         let (judgement, touch) = super::flaky::judge(
             state,
             &github,
@@ -2815,7 +3051,7 @@ pub async fn run(
             )
         };
 
-        let feedback = format!(
+        let mut feedback = format!(
             "CI workflow failed on PR #{pr_number} (branch: {branch}). Fix the failures.\n\n\
              Rules:\n\
              - Only fix what CI is complaining about. Don't refactor or add features.\n\
@@ -2840,6 +3076,13 @@ pub async fn run(
             Some(h) if !h.is_empty() => h.to_string(),
             _ => super::round::branch_head(&github, &repo_owner, &repo_name, &branch).await,
         };
+        // A round that didn't finish on this same head left its work on
+        // the WIP branch: this round goes on from it instead of resetting
+        // that branch to the head and doing the work again.
+        let carried = super::round::carried(&github, &repo_owner, &repo_name, &branch).await;
+        if !carried.is_empty() {
+            feedback = format!("{feedback}\n\n{}", super::round::CONTINUING);
+        }
         let mut ci_round = run_round::Round::start(
             run_round::Kind::CiFix,
             (cycle + 1).min(u32::MAX as usize) as u32,
@@ -2874,9 +3117,10 @@ pub async fn run(
         // request gets one commit when it's done.
         // (Each attempt below makes sure the branch is there before it
         // writes; one that can't be made here is that attempt's fault.)
-        ci_round.wip_branch = super::round::open_wip(&github, &repo_owner, &repo_name, &branch, "")
-            .await
-            .unwrap_or_default();
+        ci_round.wip_branch =
+            super::round::open_wip(&github, &repo_owner, &repo_name, &branch, &carried)
+                .await
+                .unwrap_or_default();
         super::round::record(state, &msg.team_id, &msg.run_id, &ci_round).await;
 
         // The tree before the fix: compared with the tree after it to tell a
@@ -2897,7 +3141,6 @@ pub async fn run(
             .next()
             .unwrap_or(&feedback)
             .to_string();
-        let mut feedback = feedback;
         'fix: loop {
             // Every attempt starts with its WIP branch there: an attempt
             // that changed nothing had it cleaned up when it landed, and the
@@ -3312,7 +3555,12 @@ pub async fn run(
                 ));
                 // A clean state for whatever runs next: the WIP branch goes,
                 // and the round starts from the pull request's head as it is.
-                if !ci_round.wip_branch.is_empty() && ci_round.wip_branch != branch {
+                // A fault that left the work whole (a file or a compare GitHub
+                // wouldn't give back, a refused push, GitHub busy) keeps the
+                // WIP branch and the round's starting point for the next try
+                // (`round::keeps_work`): deleting it threw the work away.
+                let clean = fault_plan.clean || next != super::round::AfterFault::RetryClean;
+                if clean && !ci_round.wip_branch.is_empty() && ci_round.wip_branch != branch {
                     let _ = github
                         .delete_branch(&repo_owner, &repo_name, &ci_round.wip_branch)
                         .await;
@@ -3320,9 +3568,15 @@ pub async fn run(
                 match next {
                     super::round::AfterFault::RetryClean => {
                         attempt += 1;
-                        ci_round.base_sha =
-                            super::round::branch_head(&github, &repo_owner, &repo_name, &branch)
-                                .await;
+                        if clean {
+                            ci_round.base_sha = super::round::branch_head(
+                                &github,
+                                &repo_owner,
+                                &repo_name,
+                                &branch,
+                            )
+                            .await;
+                        }
                         let fresh = ci_evidence(
                             &github,
                             &repo_owner,
@@ -3351,6 +3605,7 @@ pub async fn run(
                             &msg.team_id,
                             &msg.run_id,
                             branch_head.as_deref(),
+                            Some((&github, &repo_owner, &repo_name, &branch)),
                         )
                         .await;
                         if set_run_awaiting_ci(
@@ -3549,6 +3804,7 @@ pub async fn run(
                     &msg.team_id,
                     &msg.run_id,
                     branch_head.as_deref(),
+                    Some((&github, &repo_owner, &repo_name, &branch)),
                 )
                 .await;
                 let still_active = set_run_awaiting_ci(
@@ -3939,7 +4195,7 @@ pub async fn run(
             // never a failed run when it can't finish.
             let base_sha =
                 super::round::branch_head(&github, &repo_owner, &repo_name, &branch).await;
-            let fix_round = run_round::Round::start(
+            let mut fix_round = run_round::Round::start(
                 run_round::Kind::ReviewFix,
                 (cycle + 1).min(u32::MAX as usize) as u32,
                 &base_sha,
@@ -3950,6 +4206,11 @@ pub async fn run(
                 review_feedback.is_empty() && !own_scope.unscoped,
                 chrono::Utc::now(),
             );
+            // A round that didn't finish on this same head left its work on
+            // the WIP branch: this one goes on from it (`run_fix_round` reads
+            // it as a continuing round), never from a reset one.
+            fix_round.wip_branch =
+                super::round::carried(&github, &repo_owner, &repo_name, &branch).await;
             let mut ctx = FixContext {
                 ticket_msg,
                 provider,
@@ -4383,12 +4644,7 @@ async fn run_fix_round(
     super::round::record(state, &msg.team_id, &msg.run_id, &round).await;
     super::update_pass(state, &msg.team_id, &msg.run_id, "implement").await?;
     let feedback = if round.attempt > 1 || continuing {
-        format!(
-            "{}\n\n## CONTINUING THIS ROUND\nAn earlier step of this round stopped before it \
-             finished; everything it wrote is already committed on this branch. Read the files you \
-             need first, then finish only what is left.",
-            round.feedback
-        )
+        format!("{}\n\n{}", round.feedback, super::round::CONTINUING)
     } else {
         round.feedback.clone()
     };
@@ -5730,16 +5986,47 @@ async fn mark_events_processed(state: &WorkerState, run_id: &str, events: &[RunE
     }
 }
 
-fn collect_ci_failure_info(events: &[RunEvent]) -> String {
+/// One line per failed check the events name: the workflow, its run id and
+/// the jobs that failed when they are known. An event that names no check
+/// says what is known (the commit) instead of "Workflow 'unknown' failed
+/// (run_id: 0)", which read as a workflow of that name.
+pub(crate) fn collect_ci_failure_info(events: &[RunEvent]) -> String {
     events
         .iter()
         .filter(|e| e.event_type == "ci_failed")
         .map(|e| {
-            format!(
-                "Workflow '{}' failed (run_id: {})",
-                e.payload["workflow_name"].as_str().unwrap_or("unknown"),
-                e.payload["workflow_run_id"].as_u64().unwrap_or(0),
-            )
+            let p = &e.payload;
+            let name = p["workflow_name"].as_str().filter(|n| !n.trim().is_empty());
+            let run = p["workflow_run_id"].as_u64().filter(|id| *id > 0);
+            let jobs: Vec<&str> = p["check_names"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .filter(|j| Some(*j) != name)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let jobs = if jobs.is_empty() {
+                String::new()
+            } else {
+                format!(", failing: {}", jobs.join(", "))
+            };
+            match (name, run) {
+                (Some(n), Some(id)) => format!("Workflow '{n}' failed (run_id: {id}{jobs})"),
+                (Some(n), None) => format!("Check '{n}' failed (not a GitHub Actions run{jobs})"),
+                _ => {
+                    let head = p["head_sha"].as_str().unwrap_or("");
+                    let at = if head.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" on {}", &head[..head.len().min(7)])
+                    };
+                    format!(
+                        "A check failed{at}; GitHub's checks didn't say which when it was recorded"
+                    )
+                }
+            }
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -8130,7 +8417,24 @@ async fn redrive_red_ci(
         return Ok(false);
     }
     add_run_number(state, &msg.team_id, run_id, "red_redrives").await;
-    record_synthetic_ci_failed(state, &msg.team_id, run_id, None).await;
+    // The checks that are red now, by name, so the round reads them.
+    let github = GitHubClient::new(
+        &state.secrets.github_app_id,
+        &state.secrets.github_private_key,
+        msg.installation_id,
+        &state.http,
+    )
+    .ok();
+    record_synthetic_ci_failed(
+        state,
+        &msg.team_id,
+        run_id,
+        None,
+        github
+            .as_ref()
+            .map(|g| (g, msg.repo_owner.as_str(), msg.repo_name.as_str(), branch)),
+    )
+    .await;
     if !set_run_awaiting_ci(
         state, msg, run_id, pr_url, pr_number, branch, usage, duration,
     )
