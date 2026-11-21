@@ -9,16 +9,26 @@
 //! 1. its siblings are the existing items of the same kind: files with the
 //!    same extension in the same folder, or, for an item that is a new
 //!    folder (`blocks/Quote/index.tsx`), the other folders beside it;
-//! 2. the places that register them are the files that name most of the
-//!    siblings (a registry names all of them; a page that uses two of them
-//!    is not a registration), found by code search on the default branch.
-//!    Comments never count. Docs, migrations, fixtures and tests are never
-//!    places. A manifest (`package.json` and other data files) counts only
-//!    where it names the siblings as paths or keys (`"./accordion"`), never
-//!    inside other names such as a dependency (`@radix-ui/react-accordion`);
+//! 2. the places that register them are the files that list the kind: they
+//!    name more than half of all the existing siblings (a registry names all
+//!    of them; a page that uses two of them, or a one-off script that picks
+//!    the few it changes, is not a registration), found by code search on
+//!    the default branch. Comments never count. Prose (docs, notes), tests
+//!    and their fixtures are never places, and neither is a generated file:
+//!    one the repository's own generators write, or one whose head says it
+//!    is generated; it is regenerated, never edited by hand. A manifest
+//!    (`package.json` and other data files) counts only where it names the
+//!    siblings as paths or keys (`"./accordion"`), never inside other names
+//!    such as a dependency (`@radix-ui/react-accordion`);
 //! 3. a place is a registry when it names the siblings by path or as a
-//!    whole string (an import, an `exports` key, a list of ids); a code file
-//!    that only mentions them as words is a maybe;
+//!    whole string (an import, an `exports` key, a list of ids) and it grew
+//!    with the kind: its history shows it naming fewer of them when it was
+//!    written than it does now, so siblings added later were added to it.
+//!    A file that never changed as siblings were added (a data migration
+//!    that lists the types it rewrote, a snapshot) is a list of them, not
+//!    their registry, whatever folder it sits in; and one whose history
+//!    couldn't be read isn't checked, so it never blocks. A code file that
+//!    only mentions them as words is a maybe;
 //! 4. a new file is an item of the siblings' kind only when its structure
 //!    says so, never because of the folder it sits in ([`kind_of`]): it has
 //!    the export shape the siblings share (a default export, a call to the
@@ -41,8 +51,9 @@ use std::collections::BTreeSet;
 use crate::clients::github::GitHubClient;
 use crate::passes::feature::reuse::name_words;
 
-/// Most siblings sampled per item.
-const MAX_SIBLINGS: usize = 8;
+/// Most siblings read per item: a folder this large is the kind's whole
+/// list in practice; the cap only bounds the work.
+const MAX_SIBLINGS: usize = 400;
 /// Most candidate files read per item.
 const MAX_CANDIDATES: usize = 40;
 
@@ -238,12 +249,15 @@ pub fn variants(id: &str) -> Vec<String> {
     out
 }
 
-/// Whether `text` names `word` on its own (not inside a longer name).
+/// Whether `text` names `word` on its own (not inside a longer name: a
+/// kebab-case name such as `boat-index` is one name, so it doesn't name
+/// `boat`).
 fn names_word(text: &str, word: &str) -> bool {
     if word.is_empty() {
         return false;
     }
-    let ok = |c: Option<char>| c.is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_'));
+    let ok =
+        |c: Option<char>| c.is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'));
     let mut from = 0;
     while let Some(i) = text[from..].find(word) {
         let at = from + i;
@@ -264,20 +278,37 @@ pub fn names_item(text: &str, id: &str) -> bool {
 /// key, never by a word inside a longer name.
 const DATA_EXTS: &[&str] = &["json", "jsonc", "yaml", "yml", "toml"];
 
-/// Paths that are never registration places: docs, migrations, fixtures.
+/// Files that are never registration places by what they are: prose (docs,
+/// notes) and the test suite's own data (fixtures and mocks). Whether a file
+/// of the program registers the kind is read from the file itself
+/// ([`registration_places`]) and its history ([`grew_with_kind`]), never
+/// from the folder it sits in.
 fn never_a_place(p: &str) -> bool {
     let l = p.to_lowercase();
     let (_, f) = split_path(&l);
     let ext = f.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
-    matches!(ext, "md" | "mdx" | "rst" | "txt")
-        || l.starts_with("migrations/")
-        || l.contains("/migrations/")
-        || l.contains("/migration/")
+    matches!(ext, "md" | "mdx" | "rst" | "txt" | "adoc")
         || l.contains("/fixtures/")
+        || l.starts_with("fixtures/")
         || l.contains("/__fixtures__/")
         || l.contains("/__mocks__/")
-        || l.starts_with("docs/")
-        || l.contains("/docs/")
+}
+
+/// Whether a file says, in its head, that a tool writes it (`@generated`,
+/// "This file has been generated by ...", "Code generated ... DO NOT
+/// EDIT"): it is regenerated, never a place to register by hand.
+pub fn says_generated(text: &str) -> bool {
+    text.lines().take(15).any(|line| {
+        let l = line.to_lowercase();
+        l.contains("@generated")
+            || l.contains("auto-generated")
+            || l.contains("autogenerated")
+            || l.contains("do not edit")
+            || l.contains("generated by")
+            || l.contains("code generated")
+            || l.contains("has been generated")
+            || l.contains("is generated")
+    })
 }
 
 fn is_data_file(p: &str) -> bool {
@@ -370,14 +401,24 @@ fn quoted(text: &str) -> Vec<&str> {
 /// with a path segment that is the item (`"./accordion"`,
 /// `"@/components/ui/accordion"`, `"accordion"`, `"./Hero.tsx"`), not a
 /// longer name that contains it (`"@radix-ui/react-accordion"`).
+#[cfg(test)]
 pub fn names_as_path(text: &str, id: &str) -> bool {
-    let forms = variants(id);
-    quoted(text).into_iter().any(|q| {
-        q.split('/').any(|seg| {
-            let stem = seg.split('.').next().unwrap_or(seg);
-            !stem.is_empty() && forms.iter().any(|f| f == stem)
-        })
-    })
+    names_as_path_in(&path_stems(text), id)
+}
+
+/// The path segments (without extensions) of every quoted value in `text`:
+/// read once, then asked for each sibling ([`names_as_path_in`]).
+fn path_stems(text: &str) -> BTreeSet<&str> {
+    quoted(text)
+        .into_iter()
+        .flat_map(|q| q.split('/'))
+        .map(|seg| seg.split('.').next().unwrap_or(seg))
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+fn names_as_path_in(stems: &BTreeSet<&str>, id: &str) -> bool {
+    variants(id).iter().any(|f| stems.contains(f.as_str()))
 }
 
 /// The bare packages a file imports (`from 'sanity'`, `require("x")`), not
@@ -764,11 +805,32 @@ fn sibling_own(path: &str, item: &NewItem, sibs: &[String]) -> bool {
     })
 }
 
-/// The files that register items of this kind: those naming most sampled
-/// siblings (all of them when there are three or fewer; otherwise at least
-/// three and 60% of them), with comments left out. A place is a registry
-/// (`true`) when it names them as paths or whole strings, else a maybe
-/// (`false`, code files only). `files` are (path, default-branch text).
+/// How many of `n` siblings a file must name to list the kind: all of them
+/// when there are three or fewer, else more than half (and at least three).
+fn listing_need(n: usize) -> usize {
+    if n <= 3 {
+        n
+    } else {
+        3usize.max(n / 2 + 1)
+    }
+}
+
+/// How many of the siblings `text` names as paths or whole strings
+/// (comments left out).
+pub fn named_as_paths(path: &str, text: &str, sibs: &[String]) -> usize {
+    let text = without_comments(path, text);
+    let stems = path_stems(&text);
+    sibs.iter().filter(|s| names_as_path_in(&stems, s)).count()
+}
+
+/// The files that list items of this kind: those naming more than half of
+/// all its siblings (all of them when there are three or fewer), with
+/// comments left out. A place is a registry candidate (`true`) when it names
+/// them as paths or whole strings, else a maybe (`false`, code files only);
+/// a candidate is a registry only once its history shows it grew with the
+/// kind ([`grew_with_kind`]). Generated files are never places. `files` are
+/// (path, default-branch text); `sibs` are all the siblings, never a sample
+/// (a sample's majority is not the kind's).
 pub fn registration_places(
     item: &NewItem,
     sibs: &[String],
@@ -777,24 +839,22 @@ pub fn registration_places(
     if sibs.is_empty() {
         return Vec::new();
     }
-    let n = sibs.len();
-    let need = if n <= 3 {
-        n
-    } else {
-        3usize.max((n * 3).div_ceil(5))
-    };
+    let need = listing_need(sibs.len());
     files
         .iter()
-        .filter(|(p, _)| {
+        .filter(|(p, raw)| {
             !skipped(p)
                 && !is_test(p)
                 && !never_a_place(p)
+                && !is_generated_or_types(p)
+                && !says_generated(raw)
                 && !sibling_own(p, item, sibs)
                 && *p != item.path
         })
         .filter_map(|(p, raw)| {
             let text = without_comments(p, raw);
-            let as_paths = sibs.iter().filter(|s| names_as_path(&text, s)).count();
+            let stems = path_stems(&text);
+            let as_paths = sibs.iter().filter(|s| names_as_path_in(&stems, s)).count();
             if as_paths >= need {
                 return Some((p.clone(), true));
             }
@@ -805,6 +865,50 @@ pub fn registration_places(
             (as_words >= need).then(|| (p.clone(), false))
         })
         .collect()
+}
+
+/// What a place's history says about it: the commits that changed it on the
+/// default branch, and its text at the earliest of them that could be read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum History {
+    /// It changed in `commits` commits; `earliest` is its text then.
+    Read { commits: usize, earliest: String },
+    /// Its history couldn't be read.
+    Unknown,
+}
+
+/// Whether a place that lists the kind grew with it: when it was written it
+/// named fewer of today's siblings than it does now, so siblings added since
+/// were added to it. That is what a registry is (each new item of the kind
+/// is added there), whatever folder it sits in or whatever it is named; a
+/// file written once with the list it needed (a data migration over the
+/// types it rewrites, a one-off backfill, a snapshot) never grows, even when
+/// it was edited since. A file never changed after it was written has not
+/// grown.
+pub fn grew_with_kind(path: &str, now: &str, sibs: &[String], history: &History) -> bool {
+    match history {
+        History::Read { commits, earliest } => {
+            *commits > 1 && named_as_paths(path, earliest, sibs) < named_as_paths(path, now, sibs)
+        }
+        History::Unknown => false,
+    }
+}
+
+/// Why a candidate registry is only noted, when its history says it isn't
+/// one (`None`: it grew with the kind, a registry).
+pub fn not_a_registry(path: &str, now: &str, sibs: &[String], history: &History) -> Option<String> {
+    if grew_with_kind(path, now, sibs, history) {
+        return None;
+    }
+    Some(match history {
+        History::Unknown => "its history couldn't be read to tell whether new items are added to it".to_string(),
+        History::Read { commits: 1, .. } => {
+            "it hasn't changed since it was written, so items added since weren't added to it: it lists them, it doesn't register them".to_string()
+        }
+        History::Read { .. } => {
+            "items added since it was written weren't added to it: it lists them, it doesn't register them".to_string()
+        }
+    })
 }
 
 /// A place a new item is missing from.
@@ -820,6 +924,9 @@ pub struct Missing {
     /// Set when the structure couldn't tell whether the new file is the
     /// siblings' kind: why. Only noted.
     pub unsure: Option<String>,
+    /// Set when the place lists the siblings but its history says it isn't
+    /// their registry ([`not_a_registry`]): why. Only noted.
+    pub listed_only: Option<String>,
 }
 
 impl Missing {
@@ -835,6 +942,12 @@ impl Missing {
             return format!(
                 "`{}` may need registering in `{}` (it names {names}); couldn't tell whether it is \
                  the same kind of item ({why}); check by hand",
+                self.item, self.path
+            );
+        }
+        if let Some(why) = &self.listed_only {
+            return format!(
+                "`{}` may belong in `{}`: it names {names}, but {why}; check by hand",
                 self.item, self.path
             );
         }
@@ -878,10 +991,109 @@ pub fn missing(
                     .collect(),
                 registry: *registry,
                 unsure: None,
+                listed_only: None,
             });
         }
     }
     out
+}
+
+/// The candidate registries settled by their history (`history`: a place's
+/// [`History`] on the default branch): one that didn't grow with the kind
+/// stays a place, only noted, with why (`listed`: path and why).
+#[allow(clippy::type_complexity)]
+pub fn settle_places(
+    places: Vec<(String, String, bool)>,
+    sibs: &[String],
+    history: &dyn Fn(&str) -> History,
+) -> (Vec<(String, String, bool)>, Vec<(String, String)>) {
+    let mut listed = Vec::new();
+    let places = places
+        .into_iter()
+        .map(|(p, t, registry)| {
+            if !registry {
+                return (p, t, false);
+            }
+            match not_a_registry(&p, &t, sibs, &history(&p)) {
+                None => (p, t, true),
+                Some(why) => {
+                    listed.push((p.clone(), why));
+                    (p, t, false)
+                }
+            }
+        })
+        .collect();
+    (places, listed)
+}
+
+/// Marks what a place that only lists the siblings is missing as a note.
+pub fn mark_listed(missing: &mut [Missing], listed: &[(String, String)]) {
+    for m in missing.iter_mut() {
+        if let Some((_, why)) = listed.iter().find(|(p, _)| *p == m.path) {
+            m.registry = false;
+            if m.unsure.is_none() {
+                m.listed_only = Some(why.clone());
+            }
+        }
+    }
+}
+
+/// Files the repository's own generators write (`outputs`: their globs from
+/// the repository root, [`crate::passes::generators::Generator::outputs`]):
+/// regenerated, never a place to register by hand.
+pub fn drop_generated(files: Vec<(String, String)>, outputs: &[String]) -> Vec<(String, String)> {
+    files
+        .into_iter()
+        .filter(|(p, _)| {
+            !outputs
+                .iter()
+                .any(|g| crate::passes::generators::glob_match(g, p))
+        })
+        .collect()
+}
+
+/// The output globs of the generators the repository has at `git_ref`.
+async fn generator_outputs(
+    github: &GitHubClient,
+    owner: &str,
+    repo: &str,
+    git_ref: &str,
+    tree: &[String],
+) -> Vec<String> {
+    use crate::passes::generators;
+    let mut files = std::collections::HashMap::new();
+    for p in generators::candidate_files(tree).into_iter().take(40) {
+        if let Ok(t) = github.read_file(owner, repo, &p, git_ref).await {
+            files.insert(p, t);
+        }
+    }
+    let repo_files = generators::RepoFiles {
+        tree: tree.to_vec(),
+        files,
+    };
+    generators::detect(&repo_files)
+        .into_iter()
+        .flat_map(|g| g.outputs)
+        .map(|o| generators::normalize_path(&o))
+        .collect()
+}
+
+/// A place's history on the default branch: the commits that changed it
+/// (at most 100) and its text at the earliest of them.
+async fn place_history(github: &GitHubClient, owner: &str, repo: &str, path: &str) -> History {
+    let Ok(commits) = github.commits_for_path(owner, repo, path, None, 100).await else {
+        return History::Unknown;
+    };
+    let Some(sha) = commits.last().and_then(|c| c["sha"].as_str()) else {
+        return History::Unknown;
+    };
+    match github.read_file(owner, repo, path, sha).await {
+        Ok(earliest) => History::Read {
+            commits: commits.len(),
+            earliest,
+        },
+        Err(_) => History::Unknown,
+    }
 }
 
 /// Registries the item is missing from: these go back to the coder and block.
@@ -919,6 +1131,8 @@ pub async fn check(
 ) -> (Vec<Missing>, usize) {
     let mut out: Vec<Missing> = Vec::new();
     let mut checked = 0usize;
+    // The repository's generator outputs, read once when a place is looked for.
+    let mut outputs: Option<Vec<String>> = None;
     for item in new_items(added, tree).into_iter().take(6) {
         let sibs = siblings(&item, tree, recorded_sibling);
         if sibs.is_empty() {
@@ -979,6 +1193,10 @@ pub async fn check(
                 files.push((p, t));
             }
         }
+        if outputs.is_none() {
+            outputs = Some(generator_outputs(github, owner, repo, base, tree).await);
+        }
+        let files = drop_generated(files, outputs.as_deref().unwrap_or_default());
         let keep = registration_places(&item, &sibs, &files);
         let places: Vec<(String, String, bool)> = files
             .into_iter()
@@ -1003,6 +1221,23 @@ pub async fn check(
             tracing::info!(item = %item.path, why, "Not a new item of its siblings' kind");
             continue;
         }
+        // A candidate registry is one only when it grew with the kind.
+        let mut histories: Vec<(String, History)> = Vec::new();
+        for (p, _, registry) in &places {
+            if *registry {
+                histories.push((p.clone(), place_history(github, owner, repo, p).await));
+            }
+        }
+        let (places, listed) = settle_places(places, &sibs, &|p: &str| {
+            histories
+                .iter()
+                .find(|(q, _)| q == p)
+                .map(|(_, h)| h.clone())
+                .unwrap_or(History::Unknown)
+        });
+        for (p, why) in &listed {
+            tracing::info!(item = %item.path, place = %p, why, "Lists the siblings, not their registry");
+        }
         checked += places.len();
         let mut on_branch: Vec<(String, Option<String>)> = Vec::new();
         for (p, _, _) in &places {
@@ -1017,7 +1252,9 @@ pub async fn check(
                 .find(|(q, _)| q == p)
                 .and_then(|(_, t)| t.clone())
         };
-        for m in judge(&item, &sibs, &kind, &places, &lookup) {
+        let mut found = judge(&item, &sibs, &kind, &places, &lookup);
+        mark_listed(&mut found, &listed);
+        for m in found {
             if !out.iter().any(|x| x.item == m.item && x.path == m.path) {
                 out.push(m);
             }
@@ -1198,7 +1435,7 @@ mod tests {
     }
 
     #[test]
-    fn comments_docs_and_migrations_never_make_a_place() {
+    fn comments_and_docs_never_make_a_place_and_a_migration_only_lists() {
         let item = &new_items(
             &["apps/web/src/components/ui/heading.tsx".to_string()],
             &ui_tree(),
@@ -1214,12 +1451,114 @@ mod tests {
                 "docs/components.md".to_string(),
                 "`./accordion` `./alert` `./card`".to_string(),
             ),
-            (
-                "apps/web/migrations/rename-cards/index.ts".to_string(),
-                "const types = ['accordion', 'alert', 'card']".to_string(),
-            ),
         ];
         assert!(registration_places(item, &sibs, &files).is_empty());
+        // A migration that lists them is a candidate by its text; its
+        // history (written once, never grown) says it only lists them.
+        let migration = "const types = ['accordion', 'alert', 'card']".to_string();
+        let path = "apps/web/migrations/rename-cards/index.ts".to_string();
+        let places = registration_places(item, &sibs, &[(path.clone(), migration.clone())]);
+        assert_eq!(places, vec![(path.clone(), true)]);
+        let (settled, listed) = settle_places(
+            vec![(path.clone(), migration.clone(), true)],
+            &sibs,
+            &|_| History::Read {
+                commits: 1,
+                earliest: migration.clone(),
+            },
+        );
+        assert!(!settled[0].2);
+        assert_eq!(listed.len(), 1);
+        let mut m = missing(item, &sibs, &settled, &|_| Some(migration.clone()));
+        mark_listed(&mut m, &listed);
+        assert!(blocking(&m).is_empty());
+        assert!(m[0].line().contains("check by hand"), "{}", m[0].line());
+        assert!(m[0].line().contains("hasn't changed since it was written"));
+    }
+
+    #[test]
+    fn a_registry_is_the_list_that_grew_with_the_kind() {
+        let sibs: Vec<String> = ["alpha", "bravo", "charlie", "delta"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let now = "import alpha from './alpha'\nimport bravo from './bravo'\nimport charlie from './charlie'\nimport delta from './delta'\n";
+        let first = "import alpha from './alpha'\n";
+        let p = "src/kinds/index.ts";
+        let grew = History::Read {
+            commits: 4,
+            earliest: first.to_string(),
+        };
+        assert!(grew_with_kind(p, now, &sibs, &grew));
+        assert_eq!(not_a_registry(p, now, &sibs, &grew), None);
+        // Edited since, but never given a new item: it lists them.
+        let edited = History::Read {
+            commits: 3,
+            earliest: now.to_string(),
+        };
+        assert!(!grew_with_kind(p, now, &sibs, &edited));
+        assert!(not_a_registry(p, now, &sibs, &edited)
+            .unwrap()
+            .contains("weren't added to it"));
+        // Unread history is never a block.
+        assert!(not_a_registry(p, now, &sibs, &History::Unknown)
+            .unwrap()
+            .contains("couldn't be read"));
+    }
+
+    #[test]
+    fn a_list_of_the_kind_names_most_of_all_its_siblings_not_of_a_sample() {
+        // Forty siblings; a file that names the first eight alphabetically
+        // and nothing else names a fifth of the kind: not its list.
+        let sibs: Vec<String> = (0..40).map(|i| format!("kind-{i:02}")).collect();
+        let item = NewItem {
+            id: "kind-new".into(),
+            parent: "src/kinds".into(),
+            folder: false,
+            ext: "ts".into(),
+            path: "src/kinds/kind-new.ts".into(),
+        };
+        let some: String = sibs[..8].iter().map(|s| format!("'{s}', ")).collect();
+        let all: String = sibs.iter().map(|s| format!("'{s}', ")).collect();
+        let files = vec![
+            (
+                "src/backfill.ts".to_string(),
+                format!("const types = [{some}]"),
+            ),
+            (
+                "src/kinds/index.ts".to_string(),
+                format!("export const kinds = [{all}]"),
+            ),
+        ];
+        assert_eq!(
+            registration_places(&item, &sibs, &files),
+            vec![("src/kinds/index.ts".to_string(), true)]
+        );
+    }
+
+    #[test]
+    fn generated_files_are_never_places() {
+        let item = &new_items(
+            &["apps/web/src/components/ui/heading.tsx".to_string()],
+            &ui_tree(),
+        )[0];
+        let sibs = siblings(item, &ui_tree(), None);
+        let types = "/**\n * This file has been generated by the type generator.\n */\nexport type Accordion = { _type: 'accordion' }\nexport type Alert = { _type: 'alert' }\nexport type Card = { _type: 'card' }\n";
+        let schema = r#"[{"name": "accordion"}, {"name": "alert"}, {"name": "card"}]"#;
+        let files = vec![
+            ("apps/web/src/lib/types.ts".to_string(), types.to_string()),
+            ("apps/studio/schema.json".to_string(), schema.to_string()),
+        ];
+        // By what its head says.
+        let places = registration_places(item, &sibs, &files);
+        assert_eq!(places, vec![("apps/studio/schema.json".to_string(), true)]);
+        // By what the repository's generators write.
+        let kept = drop_generated(files, &["apps/studio/schema.json".to_string()]);
+        assert!(registration_places(item, &sibs, &kept).is_empty());
+        assert!(says_generated(
+            "// Code generated by protoc. DO NOT EDIT.\n"
+        ));
+        assert!(!says_generated("export const generatedAt = 1\n"));
     }
 
     #[test]
