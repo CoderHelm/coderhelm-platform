@@ -1,0 +1,386 @@
+{
+ "schema": "floorplan/graph@1",
+ "meta": {
+  "generatedAt": "2026-11-21T00:00:00.000Z",
+  "scanAt": "2026-11-21T00:00:00.000Z",
+  "rootName": "root",
+  "root": "/sandbox/root",
+  "audience": "everyone",
+  "agent": "none",
+  "repos": [
+   {
+    "path": "harbor-api",
+    "name": "harbor-api",
+    "branch": "main",
+    "head": "7aaca482d51f0be11791c2ff225fee17aaf59098",
+    "remote": null
+   },
+   {
+    "path": "harbor-web",
+    "name": "harbor-web",
+    "branch": "main",
+    "head": "735236bf718e158b957c5d377f71d2e05bd40c7c",
+    "remote": null
+   }
+  ],
+  "counts": {
+   "files": 5,
+   "loc": 27,
+   "unassigned": 0
+  }
+ },
+ "project": {
+  "name": "Harbor",
+  "summary": "A website where boaters book a slip, and the booking service that takes the booking and the payment."
+ },
+ "nodes": [
+  {
+   "id": "web",
+   "parent": null,
+   "label": "Harbor website",
+   "kind": "ui",
+   "summary": "Where boaters find a slip and book it.",
+   "details": "",
+   "tags": [],
+   "paths": [
+    "harbor-web"
+   ],
+   "packages": [],
+   "hosts": [],
+   "stats": {
+    "files": 2,
+    "loc": 8,
+    "langs": {
+     "typescript": 8
+    },
+    "repos": [
+     "harbor-web"
+    ]
+   }
+  },
+  {
+   "id": "api",
+   "parent": null,
+   "label": "Booking service",
+   "kind": "service",
+   "summary": "Takes bookings and charges for them.",
+   "details": "",
+   "tags": [],
+   "paths": [
+    "harbor-api"
+   ],
+   "packages": [],
+   "hosts": [],
+   "stats": {
+    "files": 3,
+    "loc": 19,
+    "langs": {
+     "javascript": 19
+    },
+    "repos": [
+     "harbor-api"
+    ]
+   }
+  },
+  {
+   "id": "stripe",
+   "parent": null,
+   "label": "Stripe",
+   "kind": "external",
+   "summary": "Card payments.",
+   "details": "",
+   "tags": [],
+   "paths": [],
+   "packages": [
+    "stripe"
+   ],
+   "hosts": [],
+   "stats": {
+    "files": 0,
+    "loc": 0,
+    "langs": {},
+    "repos": []
+   }
+  }
+ ],
+ "files": [
+  {
+   "p": "harbor-api/src/billing.js",
+   "n": "api",
+   "r": "harbor-api",
+   "l": "javascript",
+   "loc": 6,
+   "name": "Card charges",
+   "d": "Charges a boater's card through Stripe for a slip booking.",
+   "h": "fd5a61a79231",
+   "sig": "bf9c021a1595",
+   "s": [
+    [
+     "module.exports",
+     "default",
+     9,
+     1,
+     ""
+    ]
+   ]
+  },
+  {
+   "p": "harbor-api/src/bookings.js",
+   "n": "api",
+   "r": "harbor-api",
+   "l": "javascript",
+   "loc": 8,
+   "name": "Slip bookings",
+   "d": "Takes a booking for a slip and charges for it.",
+   "h": "9bdc67ac4d30",
+   "sig": "c38869c7d94e",
+   "s": [
+    [
+     "router",
+     "default",
+     10,
+     1,
+     ""
+    ]
+   ]
+  },
+  {
+   "p": "harbor-api/src/server.js",
+   "n": "api",
+   "r": "harbor-api",
+   "l": "javascript",
+   "loc": 5,
+   "name": "Booking service start",
+   "d": "Starts the booking service and sends slip requests to the bookings code.",
+   "h": "4fdcfdb48d18",
+   "sig": "04e9fed06a2f"
+  },
+  {
+   "p": "harbor-web/app/slips/[id]/page.tsx",
+   "n": "web",
+   "r": "harbor-web",
+   "l": "typescript",
+   "loc": 4,
+   "name": "Slip page",
+   "d": "Shows one slip with a button to book it.",
+   "h": "b7e0894ff4a4",
+   "sig": "7816c41cd764",
+   "s": [
+    [
+     "SlipPage",
+     "function",
+     3,
+     1,
+     ""
+    ]
+   ]
+  },
+  {
+   "p": "harbor-web/lib/slips.ts",
+   "n": "web",
+   "r": "harbor-web",
+   "l": "typescript",
+   "loc": 4,
+   "name": "Booking request",
+   "d": "Sends the booking for a slip to the booking service.",
+   "h": "28a5a30879a7",
+   "sig": "595abd0dce03",
+   "s": [
+    [
+     "bookSlip",
+     "function",
+     1,
+     0,
+     ""
+    ]
+   ]
+  }
+ ],
+ "routes": [
+  {
+   "f": "harbor-api/src/bookings.js",
+   "m": "POST",
+   "p": "/slips/:id/bookings",
+   "l": 5,
+   "h": "router",
+   "name": "Book a slip",
+   "d": "Books the slip and charges the boater's card."
+  }
+ ],
+ "links": [
+  {
+   "a": "f:harbor-api/src/bookings.js",
+   "b": "f:harbor-api/src/billing.js",
+   "k": "import",
+   "w": 1,
+   "names": [
+    "charge"
+   ]
+  },
+  {
+   "a": "f:harbor-api/src/server.js",
+   "b": "f:harbor-api/src/bookings.js",
+   "k": "import",
+   "w": 1,
+   "names": [
+    "default"
+   ]
+  },
+  {
+   "a": "f:harbor-web/app/slips/[id]/page.tsx",
+   "b": "f:harbor-web/lib/slips.ts",
+   "k": "import",
+   "w": 1,
+   "names": [
+    "bookSlip"
+   ]
+  },
+  {
+   "a": "f:harbor-web/lib/slips.ts",
+   "b": "f:harbor-api/src/bookings.js",
+   "k": "http",
+   "w": 1,
+   "labels": [
+    "POST /slips/:id/bookings"
+   ],
+   "inferred": true,
+   "calls": [
+    [
+     0,
+     2
+    ]
+   ]
+  },
+  {
+   "a": "f:harbor-api/src/billing.js",
+   "b": "n:stripe",
+   "k": "import",
+   "w": 1,
+   "names": [
+    "stripe"
+   ]
+  }
+ ],
+ "flows": [],
+ "tour": [
+  {
+   "ref": "n:web",
+   "title": "Start with the website",
+   "note": "Boaters pick a slip here and book it."
+  },
+  {
+   "ref": "n:api",
+   "title": "The booking service",
+   "note": "It takes the booking and charges the card."
+  },
+  {
+   "ref": "n:stripe",
+   "title": "Payments",
+   "note": "Card payments go through Stripe."
+  }
+ ],
+ "health": {
+  "summary": {
+   "high": 0,
+   "medium": 1,
+   "low": 0
+  },
+  "issues": [
+   {
+    "id": "no-auth:harbor-api",
+    "kind": "unprotected-endpoint",
+    "severity": "medium",
+    "title": "None of harbor-api’s endpoints check who is calling",
+    "detail": "1 endpoint answer anyone who knows the address, with no login check in the code. That's fine only if this server is private (for example behind a company network or a gateway that checks logins); otherwise anyone could read or change its data.",
+    "items": [
+     "r:0"
+    ],
+    "notes": {
+     "r:0": "Changes data, no login check"
+    },
+    "locations": [
+     {
+      "file": "harbor-api/src/bookings.js",
+      "line": 5
+     }
+    ],
+    "fix": "Review access control in harbor-api. None of these endpoints verify the caller in code:\n- POST /slips/:id/bookings — harbor-api/src/bookings.js:5\n\nFirst tell me in plain words whether this server is reachable from the internet and whether anything in front of it (gateway, network rules) checks logins. If it is public, propose the smallest safe way to require login for the data-changing endpoints (POST/PUT/PATCH/DELETE) first, show me the plan, and wait for my OK before changing code."
+   }
+  ],
+  "checked": [
+   {
+    "check": "endpoints",
+    "label": "Endpoint sign-in",
+    "checked": true,
+    "text": "checked 1 endpoint"
+   },
+   {
+    "check": "supabase",
+    "label": "Supabase table rules",
+    "checked": false,
+    "text": "no Supabase found"
+   },
+   {
+    "check": "firebase",
+    "label": "Firebase rules",
+    "checked": false,
+    "text": "no rules files found"
+   },
+   {
+    "check": "stripe",
+    "label": "Stripe webhooks",
+    "checked": false,
+    "text": "the app uses Stripe, but no code that receives its events was found"
+   },
+   {
+    "check": "secrets",
+    "label": "Secrets in code",
+    "checked": true,
+    "text": "read 7 files"
+   }
+  ]
+ },
+ "screens": [
+  {
+   "id": "screen:web:/slips/:id",
+   "url": "/slips/:id",
+   "file": "harbor-web/app/slips/[id]/page.tsx",
+   "app": "web",
+   "fw": "next-app",
+   "name": "Slip page",
+   "description": "Shows one slip with a button to book it.",
+   "behind": [
+    {
+     "id": "f:harbor-web/app/slips/[id]/page.tsx",
+     "note": "The screen itself",
+     "kind": "screen"
+    },
+    {
+     "id": "f:harbor-web/lib/slips.ts",
+     "note": "Talks to the server for this screen",
+     "kind": "part"
+    },
+    {
+     "id": "r:0",
+     "note": "Asks the server to book a slip",
+     "kind": "request"
+    },
+    {
+     "id": "f:harbor-api/src/bookings.js",
+     "note": "Server code that handles “Book a slip”",
+     "kind": "server"
+    },
+    {
+     "id": "f:harbor-api/src/billing.js",
+     "note": "Does the work behind “Book a slip”",
+     "kind": "server"
+    },
+    {
+     "id": "n:stripe",
+     "note": "Outside service, used by Card charges",
+     "kind": "outside"
+    }
+   ]
+  }
+ ]
+}

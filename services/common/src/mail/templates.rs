@@ -558,6 +558,78 @@ pub const TEMPLATES: &[Template] = &[
         install_may_send: true,
     },
     Template {
+        id: "okta_domain_failing",
+        subject: "an Okta email domain failed its DNS check",
+        subject_by: "",
+        subjects: &[],
+        // No team name: the install's own SES email carries it.
+        // No domain name: a name in an email reads as a link to it.
+        params: &[p("until", Kind::Line(40)), p("link", Kind::Link)],
+        body: &[
+            Part::Para("The DNS record that proves one of your team's Okta email domains is gone."),
+            Part::Para("Okta sign-in is required, so CoderHelm keeps the domain until {until} and people can still sign in. Add the TXT record back, then choose Verify domains in Settings, Sign-in rules. If it is still gone then, the domain is released."),
+            Part::Facts(&[("Kept until", "{until}")]),
+            Part::Button("Open Sign-in rules", "link"),
+        ],
+        install_may_send: true,
+    },
+    Template {
+        id: "okta_domain_released",
+        subject: "an Okta email domain was released",
+        subject_by: "",
+        subjects: &[],
+        params: &[p("reason", Kind::Line(240)), p("link", Kind::Link)],
+        body: &[
+            // Why: its record is gone, it stayed gone past the grace
+            // period, or another team proved the domain meanwhile.
+            Part::Para("{reason}"),
+            Part::Para("People at it can't sign in with Okta until you add the TXT record back and choose Verify domains in Settings, Sign-in rules."),
+            Part::Button("Open Sign-in rules", "link"),
+        ],
+        install_may_send: true,
+    },
+    Template {
+        id: "sso_recovered",
+        subject: "Require single sign-on was turned off",
+        subject_by: "",
+        subjects: &[],
+        // Who did it is fixed text: no parameter may claim to be support.
+        params: &[p("provider", Kind::Line(40)), p("link", Kind::Link)],
+        body: &[
+            Part::Para("Require single sign-on ({provider}) was turned off for your team from outside the product: by CoderHelm support after verifying an owner, or on a self-hosted install with its recovery script. Your audit log says who and why."),
+            Part::Para("People can sign in again the usual ways. When {provider} works again, an owner turns the rule back on in Settings, Sign-in rules. If nobody at your team asked for this, contact CoderHelm support now."),
+            Part::Button("Open Sign-in rules", "link"),
+        ],
+        install_may_send: true,
+    },
+    Template {
+        id: "sso_claim_issued",
+        subject: "a single sign-on claim link was issued",
+        subject_by: "",
+        subjects: &[],
+        // No member named: an address in an email reads as a link.
+        params: &[p("actor", Kind::Line(80)), p("provider", Kind::Line(40)), p("link", Kind::Link)],
+        body: &[
+            Part::Para("{actor} made a one-time link for a member of your team to link their {provider} account and sign in. It works once, for 72 hours."),
+            Part::Para("The audit log says who it is for. If you didn't expect this, revoke it in Settings, Sign-in rules."),
+            Part::Button("Open Sign-in rules", "link"),
+        ],
+        install_may_send: true,
+    },
+    Template {
+        id: "sso_claim_used",
+        subject: "a single sign-on claim link was used",
+        subject_by: "",
+        subjects: &[],
+        params: &[p("provider", Kind::Line(40)), p("link", Kind::Link)],
+        body: &[
+            Part::Para("A member of your team used their one-time link: their {provider} account is now linked and they signed in."),
+            Part::Para("The audit log says who. If you didn't expect this, check Settings, Team."),
+            Part::Button("Open Sign-in rules", "link"),
+        ],
+        install_may_send: true,
+    },
+    Template {
         id: "two_factor_reset",
         subject: "your two-factor sign-in was reset",
         subject_by: "",

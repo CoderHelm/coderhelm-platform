@@ -66,6 +66,18 @@ pub const BUILTIN: &[(&str, Risk)] = &[
     ("graph_definition", Risk::Read),
     ("graph_callers", Risk::Read),
     ("graph_impact", Risk::Read),
+    // The app map's lookups for Ask (gateway/src/routes/app_map.rs).
+    ("map_overview", Risk::Read),
+    ("map_find", Risk::Read),
+    ("map_part", Risk::Read),
+    ("map_screen", Risk::Read),
+    ("map_file", Risk::Read),
+    // The app map's model jobs (worker/src/passes/app_map.rs), as Floorplan's
+    // workflow names them: read-only lookups in the repositories and the
+    // answer itself.
+    ("list_files", Risk::Read),
+    ("grep", Risk::Read),
+    ("submit", Risk::Read),
     ("check_package", Risk::Read),
     ("check_url", Risk::Read),
     ("query_content", Risk::Read),

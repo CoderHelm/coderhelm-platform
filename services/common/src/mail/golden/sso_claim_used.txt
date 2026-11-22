@@ -1,0 +1,12 @@
+From: "Acme CoderHelm" <notifications@notify.coderhelm.com>
+Subject: Acme CoderHelm: a single sign-on claim link was used
+
+A member of your team used their one-time link: their Okta account is now linked and they signed in.
+
+The audit log says who. If you didn't expect this, check Settings, Team.
+
+Open Sign-in rules: https://helm.example.org/settings/sign-in/
+
+
+
+Sent through CoderHelm's mail service for the self-hosted CoderHelm install at helm.example.org. Links in this email go only to that install. Questions about it go to the install's admin, admin@example.org. CoderHelm never asks for your password or sign-in codes by email.

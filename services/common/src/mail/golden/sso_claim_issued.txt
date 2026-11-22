@@ -1,0 +1,12 @@
+From: "Acme CoderHelm" <notifications@notify.coderhelm.com>
+Subject: Acme CoderHelm: a single sign-on claim link was issued
+
+Pat Admin made a one-time link for a member of your team to link their Microsoft Entra account and sign in. It works once, for 72 hours.
+
+The audit log says who it is for. If you didn't expect this, revoke it in Settings, Sign-in rules.
+
+Open Sign-in rules: https://helm.example.org/settings/sign-in/
+
+
+
+Sent through CoderHelm's mail service for the self-hosted CoderHelm install at helm.example.org. Links in this email go only to that install. Questions about it go to the install's admin, admin@example.org. CoderHelm never asks for your password or sign-in codes by email.

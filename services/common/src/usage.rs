@@ -72,6 +72,8 @@ pub mod feature {
     pub const EMBEDDING: &str = "embedding";
     /// A plugin's run (the plugin itself is the call's tag, `plugin:<id>`).
     pub const PLUGIN: &str = "plugin";
+    /// The app map's part descriptions (only new or changed parts).
+    pub const APP_MAP: &str = "app_map";
     /// A call made outside any known scope (still counted in every total).
     pub const OTHER: &str = "other";
 }

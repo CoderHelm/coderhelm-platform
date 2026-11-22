@@ -230,6 +230,8 @@ pub const CAPABILITIES: &[Capability] = &[
             "brain::delete_thread",
             "brain::delete_threads",
             "brain::rate_message",
+            // Ask the app map: Chat's agent with the map lookups.
+            "app_map::ask",
         ],
     },
     Capability {
@@ -442,7 +444,7 @@ pub const CAPABILITIES: &[Capability] = &[
     },
     Capability {
         key: "sign_in",
-        label: "Require two-factor sign-in for the team, see who has it, reset a person's two-factor sign-in, set up Okta sign-in, and on a self-hosted install change who may join (allowed email domains)",
+        label: "Require two-factor sign-in for the team, see who has it, reset a person's two-factor sign-in, set up Okta or the team's Microsoft Entra tenant, require single sign-on, give an unlinked member a one-time claim link, and on a self-hosted install change who may join (allowed email domains)",
 
         short_label: "Set sign-in rules",
         min_role: "admin",
@@ -460,6 +462,13 @@ pub const CAPABILITIES: &[Capability] = &[
             "oidc_signin::okta_discard_draft",
             "oidc_signin::okta_verify_domains",
             "oidc_signin::okta_release_domain",
+            "entra_sso::get_setup",
+            "entra_sso::save_setup",
+            "entra_sso::test_link",
+            "entra_sso::set_enabled",
+            "entra_sso::delete_setup",
+            "sso_claim::issue",
+            "sso_claim::revoke",
         ],
     },
     Capability {
@@ -509,6 +518,7 @@ pub const CAPABILITIES: &[Capability] = &[
             "api::regenerate_repo",
             "graph::update_config",
             "graph::rebuild",
+            "app_map::rebuild",
             "infrastructure::refresh_infrastructure",
             "infrastructure::refresh_repo_infrastructure",
             // A repository's preview access (see routes::preview_access).

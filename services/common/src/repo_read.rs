@@ -147,8 +147,10 @@ pub struct GitHubHost<'a> {
     pub auth: String,
 }
 
-/// A path's segments percent-encoded for a URL.
-fn path_url(p: &str) -> String {
+/// A path's segments percent-encoded for a URL: a file whose name holds
+/// `%`, `#`, `?`, a space or brackets is the file GitHub serves, never one
+/// it decodes to another name (`%5Fmarkdown` read as `_markdown`).
+pub fn path_url(p: &str) -> String {
     p.split('/')
         .map(|s| enc(s).replace('+', "%20"))
         .collect::<Vec<_>>()

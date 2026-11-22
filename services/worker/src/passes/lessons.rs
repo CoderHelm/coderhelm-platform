@@ -11,7 +11,7 @@
 //! team's lessons on their own, ahead of other learnings.
 
 use crate::agent::provider::{self, ModelProvider};
-use crate::clients::github::GitHubClient;
+use crate::clients::github::{GitHubClient, GitHubPaused};
 use crate::memory::{AgentMemory, LearningOrigin};
 use crate::models::{LessonMessage, TokenUsage};
 use crate::passes::{attr_s, fix_location::FixDecision};
@@ -277,6 +277,7 @@ pub async fn check_comment(
             lesson: Some(lesson.to_string()),
             lesson_where: Some(j.where_.trim().to_string()).filter(|w| !w.is_empty()),
             attempts: 0,
+            ..Default::default()
         },
         0,
     )
@@ -346,6 +347,7 @@ pub async fn learn_from_ticket_comment(
                 lesson: Some(lesson),
                 lesson_where: Some(j.where_.trim().to_string()).filter(|w| !w.is_empty()),
                 attempts: 0,
+                ..Default::default()
             },
             0,
         )
@@ -450,20 +452,34 @@ pub async fn run(
                 msg.installation_id,
                 &state.http,
             )?;
+            // GitHub's budget held for runs (or its limit) is a wait for the
+            // whole job: what people said is read whole or not at all, and
+            // the job goes on after the reset (`learning_wait`).
+            if let Some((cause, secs)) = super::learning_wait::budget_wait(
+                state,
+                msg.installation_id,
+                super::learning_wait::LESSON_REQUESTS,
+            )
+            .await
+            {
+                return Err(Box::new(GitHubPaused::after(cause, secs)));
+            }
             let mut ctx = run_context(&item);
             ctx.closed_unmerged =
                 msg.trigger == TRIGGER_PR_CLOSED || msg.trigger == TRIGGER_CLOSE_REASON;
-            if let Ok(pr) = github
-                .get_pull_request(&msg.repo_owner, &msg.repo_name, msg.pr_number)
-                .await
-            {
+            if let Some(pr) = read(
+                github
+                    .get_pull_request(&msg.repo_owner, &msg.repo_name, msg.pr_number)
+                    .await,
+            )? {
                 ctx.pr_title = pr["title"].as_str().unwrap_or("").to_string();
                 ctx.pr_body = pr["body"].as_str().unwrap_or("").to_string();
             }
-            if let Ok(c) = github
-                .list_issue_comments(&msg.repo_owner, &msg.repo_name, msg.pr_number)
-                .await
-            {
+            if let Some(c) = read(
+                github
+                    .list_issue_comments(&msg.repo_owner, &msg.repo_name, msg.pr_number)
+                    .await,
+            )? {
                 ctx.comments = super::review_pr::human_comments(&c, 12);
             }
             // The GitHub issue the run came from, when it came from one.
@@ -473,10 +489,11 @@ pub async fn run(
                 .and_then(|n| n.parse::<u64>().ok())
                 .unwrap_or(0);
             if s(&item, "ticket_source") == "github" && issue_number > 0 {
-                if let Ok(c) = github
-                    .list_issue_comments(&msg.repo_owner, &msg.repo_name, issue_number)
-                    .await
-                {
+                if let Some(c) = read(
+                    github
+                        .list_issue_comments(&msg.repo_owner, &msg.repo_name, issue_number)
+                        .await,
+                )? {
                     ctx.comments
                         .extend(super::review_pr::human_comments(&c, 12));
                 }
@@ -492,8 +509,7 @@ pub async fn run(
             if msg.trigger == TRIGGER_PR_CLOSED && !has_reason(&ctx, &run_reason) {
                 // Nobody said why: that is a signal of its own, and CoderHelm
                 // asks once. The answer comes back as a close_reason lesson.
-                ask_close_reason(state, &github, &msg).await;
-                return Ok(());
+                return ask_close_reason(state, &github, &msg).await;
             }
             if msg.trigger == TRIGGER_CLOSE_REASON {
                 // The PR was scored when it closed; the reason joins that
@@ -565,9 +581,28 @@ pub async fn run(
     Ok(())
 }
 
+type Error = Box<dyn std::error::Error + Send + Sync>;
+
+/// A read the lesson uses: its value, None when GitHub had no answer for
+/// it, or the error when GitHub held or refused it for a while (then the
+/// job waits whole, `learning_wait`).
+fn read<T>(r: Result<T, Error>) -> Result<Option<T>, Error> {
+    match r {
+        Ok(v) => Ok(Some(v)),
+        Err(e) if crate::clients::github::outside_wait(&*e).is_some() => Err(e),
+        Err(_) => Ok(None),
+    }
+}
+
 /// Records "closed, no reason" on the run and the team's counters, and asks
-/// on the PR, once per run (a redelivered webhook asks nothing).
-async fn ask_close_reason(state: &WorkerState, github: &GitHubClient, msg: &LessonMessage) {
+/// on the PR, once per run (a redelivered webhook asks nothing). A question
+/// GitHub held or refused for a while is not asked yet: the run's mark is
+/// taken back and the wait returned, so the job asks after the reset.
+async fn ask_close_reason(
+    state: &WorkerState,
+    github: &GitHubClient,
+    msg: &LessonMessage,
+) -> Result<(), Error> {
     let now = chrono::Utc::now().to_rfc3339();
     let first = state
         .dynamo
@@ -583,8 +618,42 @@ async fn ask_close_reason(state: &WorkerState, github: &GitHubClient, msg: &Less
         .await
         .is_ok();
     if !first {
-        return;
+        return Ok(());
     }
+    info!(run_id = %msg.run_id, pr = msg.pr_number, "PR closed without a reason: asking once");
+    if let Err(e) = crate::passes::conversation::github(
+        github,
+        &msg.repo_owner,
+        &msg.repo_name,
+        msg.pr_number,
+        common::conversation::Say::status("closed-reason", close_reason_question()),
+    )
+    .await
+    {
+        if let Some((cause, secs)) = crate::clients::github::outside_wait(&*e) {
+            // Not asked: the mark this job took goes back, so the job
+            // asks once after the wait.
+            let _ = state
+                .dynamo
+                .update_item()
+                .table_name(&state.config.runs_table_name)
+                .key("team_id", attr_s(&msg.team_id))
+                .key("run_id", attr_s(&msg.run_id))
+                .update_expression("REMOVE close_signal, close_asked_at")
+                .condition_expression("close_asked_at = :t")
+                .expression_attribute_values(":t", attr_s(&now))
+                .send()
+                .await;
+            return Err(Box::new(GitHubPaused::after(cause, secs)));
+        }
+        warn!(run_id = %msg.run_id, error = %e, "Could not ask why the PR was closed");
+    }
+    count_closed_no_reason(state, msg).await;
+    Ok(())
+}
+
+/// The team's count of pull requests closed with no reason given.
+async fn count_closed_no_reason(state: &WorkerState, msg: &LessonMessage) {
     let month = chrono::Utc::now().format("%Y-%m").to_string();
     for period in [month.as_str(), "ALL_TIME"] {
         let _ = state
@@ -597,18 +666,6 @@ async fn ask_close_reason(state: &WorkerState, github: &GitHubClient, msg: &Less
             .expression_attribute_values(":one", crate::passes::attr_n(1))
             .send()
             .await;
-    }
-    info!(run_id = %msg.run_id, pr = msg.pr_number, "PR closed without a reason: asking once");
-    if let Err(e) = crate::passes::conversation::github(
-        github,
-        &msg.repo_owner,
-        &msg.repo_name,
-        msg.pr_number,
-        common::conversation::Say::status("closed-reason", close_reason_question()),
-    )
-    .await
-    {
-        warn!(run_id = %msg.run_id, error = %e, "Could not ask why the PR was closed");
     }
 }
 
@@ -762,6 +819,7 @@ mod tests {
             lesson: None,
             lesson_where: None,
             attempts: 0,
+            ..Default::default()
         };
         let mut v = serde_json::to_value(&m).unwrap();
         v["type"] = serde_json::json!("lesson");

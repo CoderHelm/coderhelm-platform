@@ -1,0 +1,12 @@
+From: "Acme CoderHelm" <notifications@notify.coderhelm.com>
+Subject: Acme CoderHelm: Require single sign-on was turned off
+
+Require single sign-on (Okta) was turned off for your team from outside the product: by CoderHelm support after verifying an owner, or on a self-hosted install with its recovery script. Your audit log says who and why.
+
+People can sign in again the usual ways. When Okta works again, an owner turns the rule back on in Settings, Sign-in rules. If nobody at your team asked for this, contact CoderHelm support now.
+
+Open Sign-in rules: https://helm.example.org/settings/sign-in/
+
+
+
+Sent through CoderHelm's mail service for the self-hosted CoderHelm install at helm.example.org. Links in this email go only to that install. Questions about it go to the install's admin, admin@example.org. CoderHelm never asks for your password or sign-in codes by email.

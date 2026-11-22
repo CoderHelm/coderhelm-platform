@@ -1,0 +1,12 @@
+From: "Acme CoderHelm" <notifications@notify.coderhelm.com>
+Subject: Acme CoderHelm: an Okta email domain was released
+
+Another team proved one of your team's Okta email domains with its own DNS record while yours was missing, so the domain is now theirs.
+
+People at it can't sign in with Okta until you add the TXT record back and choose Verify domains in Settings, Sign-in rules.
+
+Open Sign-in rules: https://helm.example.org/settings/sign-in/
+
+
+
+Sent through CoderHelm's mail service for the self-hosted CoderHelm install at helm.example.org. Links in this email go only to that install. Questions about it go to the install's admin, admin@example.org. CoderHelm never asks for your password or sign-in codes by email.

@@ -92,6 +92,8 @@ pub fn run_event_for(status: &str) -> Option<&'static str> {
 /// Emits a `run.*` event for a run, read back from its record so every run
 /// event carries the same fields. `status` is what the work just wrote.
 pub async fn emit_run(state: &WorkerState, team_id: &str, run_id: &str, status: &str) {
+    // The run's plan task follows its status (`common::plan_state`).
+    super::plan_sync::on_run(state, team_id, run_id).await;
     let Some(event_type) = run_event_for(status) else {
         return;
     };

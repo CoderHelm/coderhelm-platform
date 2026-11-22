@@ -1039,6 +1039,7 @@ async fn member_claims(
         held: false,
         via_okta: false,
         okta_sub: None,
+        entra: None,
     }))
 }
 
@@ -1098,6 +1099,29 @@ fn key_refused(r: crate::knowledge_keys::Refusal) -> Response {
     res
 }
 
+/// A knowledge key works only while its maker meets the team's single
+/// sign-on rule (routes::require_sso::key_maker_stands).
+async fn key_follows_maker(
+    state: &AppState,
+    k: crate::knowledge_keys::StoredKey,
+) -> Result<Caller, Response> {
+    match crate::routes::require_sso::key_maker_allowed(state, &k.team_id, &k.created_by).await {
+        Ok(true) => Ok(Caller::Key(k)),
+        Ok(false) => Err((
+            StatusCode::FORBIDDEN,
+            axum::Json(serde_json::json!({
+                "error": crate::routes::require_sso::KEY_SUSPENDED_WORDS,
+                "code": crate::routes::require_sso::KEY_SUSPENDED,
+            })),
+        )
+            .into_response()),
+        Err(e) => {
+            error!(error = %e, "Sign-in rules not read for a knowledge key");
+            Err(StatusCode::SERVICE_UNAVAILABLE.into_response())
+        }
+    }
+}
+
 /// Checks the request's credential: a knowledge key, a key's access token,
 /// or a person's access token, in that order.
 async fn authenticate(state: &AppState, token: &str) -> Result<Caller, Response> {
@@ -1106,7 +1130,7 @@ async fn authenticate(state: &AppState, token: &str) -> Result<Caller, Response>
     let now_secs = now.timestamp().max(0) as u64;
     if token.starts_with(keys::TOKEN_PREFIX) {
         return match keys::authenticate_secret(&keys::store(state), token, now).await {
-            Ok(Ok(k)) => Ok(Caller::Key(k)),
+            Ok(Ok(k)) => key_follows_maker(state, k).await,
             Ok(Err(r)) => Err(key_refused(r)),
             Err(e) => {
                 error!(error = %e, "Knowledge key not read");
@@ -1117,7 +1141,7 @@ async fn authenticate(state: &AppState, token: &str) -> Result<Caller, Response>
     if let Some(claims) = keys::read_access(token, &state.secrets.jwt_secret, now_secs) {
         let claims = claims.map_err(key_refused)?;
         return match keys::authenticate_access(&keys::store(state), &claims, now).await {
-            Ok(Ok(k)) => Ok(Caller::Key(k)),
+            Ok(Ok(k)) => key_follows_maker(state, k).await,
             Ok(Err(r)) => Err(key_refused(r)),
             Err(e) => {
                 error!(error = %e, "Knowledge key not read");
@@ -1193,18 +1217,10 @@ async fn person_claims(state: &AppState, a: &mcp_oauth::Authorized) -> Result<Cl
             return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
         }
     };
-    let claims = crate::routes::oidc_signin::mark_okta(
-        claims,
-        a.grant.via.as_deref(),
-        a.grant.okta_sub.clone(),
-    );
+    let claims = crate::routes::oidc_signin::mark_session(claims, &a.grant.proof());
     crate::routes::sign_in::check_member_session(state, &claims).await?;
-    let proof = crate::auth::jwt::SignInProof {
-        mfa: a.grant.mfa,
-        via: a.grant.via.clone(),
-        okta_sub: a.grant.okta_sub.clone(),
-    };
-    crate::routes::sign_in::check_session(state, &claims.team_id, &proof, None).await?;
+    let proof = a.grant.proof();
+    crate::routes::sign_in::check_session(state, &claims, &proof, None, true).await?;
     Ok(claims)
 }
 
@@ -1524,26 +1540,16 @@ pub async fn post(
                         };
                         // The same checks a session of theirs gets: no session
                         // ended since they connected, the team's two-factor rule.
-                        let claims = crate::routes::oidc_signin::mark_okta(
-                            claims,
-                            a.grant.via.as_deref(),
-                            a.grant.okta_sub.clone(),
-                        );
+                        let claims =
+                            crate::routes::oidc_signin::mark_session(claims, &a.grant.proof());
                         if let Err(r) =
                             crate::routes::sign_in::check_member_session(&state, &claims).await
                         {
                             return r;
                         }
-                        let proof = crate::auth::jwt::SignInProof {
-                            mfa: a.grant.mfa,
-                            via: a.grant.via.clone(),
-                            okta_sub: a.grant.okta_sub.clone(),
-                        };
+                        let proof = a.grant.proof();
                         if let Err(r) = crate::routes::sign_in::check_session(
-                            &state,
-                            &claims.team_id,
-                            &proof,
-                            None,
+                            &state, &claims, &proof, None, true,
                         )
                         .await
                         {
@@ -2080,6 +2086,8 @@ mod tests {
             mfa: false,
             via: None,
             okta_sub: None,
+            entra: None,
+            auth_time: None,
             refresh_hash: String::new(),
             prev_refresh_hash: None,
             refresh_expires_at: String::new(),

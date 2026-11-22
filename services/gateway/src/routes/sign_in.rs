@@ -134,6 +134,24 @@ pub struct Rule {
     /// Hosted only: the team moved to its own install, which it now signs
     /// in at (an https address). Its sessions on hosted are refused.
     pub moved_to: Option<String>,
+    /// Members sign in only through the team's (self-hosted: the
+    /// organization's) own identity provider (routes::require_sso).
+    pub require_sso: Option<super::require_sso::SsoProvider>,
+    /// When that was last turned on (unix seconds).
+    pub sso_since: u64,
+    /// The cut-off: when the rule was last turned on, and with which
+    /// provider. Turning the rule off never clears it, so a session or app
+    /// connection from before it, from any other way in, never comes back.
+    pub sso_cutoff: u64,
+    pub sso_cutoff_provider: Option<super::require_sso::SsoProvider>,
+}
+
+/// A number attribute, or 0.
+fn num(item: &Item, key: &str) -> u64 {
+    item.get(key)
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0)
 }
 
 /// An install address a moved team is sent to: https with a host, nothing
@@ -160,6 +178,16 @@ impl Rule {
                 .filter(|v| !v.is_empty())
                 .map(str::to_string),
             moved_to: moved_url(s(item, "moved_to")),
+            require_sso: super::require_sso::SsoProvider::stored(s(
+                item,
+                super::require_sso::RULE_ATTR,
+            )),
+            sso_since: num(item, super::require_sso::SINCE_ATTR),
+            sso_cutoff: num(item, super::require_sso::CUTOFF_ATTR),
+            sso_cutoff_provider: super::require_sso::SsoProvider::stored(s(
+                item,
+                super::require_sso::CUTOFF_PROVIDER_ATTR,
+            )),
         }
     }
 }
@@ -170,12 +198,23 @@ impl Rule {
 /// read that fails is an error, and callers refuse.
 pub async fn team_rule(state: &AppState, team_id: &str) -> Result<Rule, String> {
     if applies() {
-        return Ok(load_org(state)
-            .await?
+        let org = load_org(state).await?;
+        // The recovery script turned the rule off: the owners hear of it
+        // from the first request that reads it (routes::require_sso).
+        if let Some(o) = &org {
+            if let Some(n) = &o.recovery_notice {
+                super::require_sso::send_recovery_notice(state, &o.team_id, n).await;
+            }
+        }
+        return Ok(org
             .map(|o| Rule {
                 require_2fa: o.require_2fa,
                 since: o.require_2fa_since,
                 moved_to: None,
+                require_sso: o.require_sso,
+                sso_since: o.require_sso_since,
+                sso_cutoff: o.sso_cutoff,
+                sso_cutoff_provider: o.sso_cutoff_provider,
             })
             .unwrap_or_default());
     }
@@ -229,6 +268,15 @@ pub struct Org {
     /// before it (an invite copied from the hosted CoderHelm) was never
     /// sent from here.
     pub created_at: Option<String>,
+    /// Members sign in only through the organization's own identity
+    /// provider, and since when (unix seconds; routes::require_sso).
+    pub require_sso: Option<super::require_sso::SsoProvider>,
+    pub require_sso_since: u64,
+    pub sso_cutoff: u64,
+    pub sso_cutoff_provider: Option<super::require_sso::SsoProvider>,
+    /// Left by the recovery script (scripts/sso-recovery.py) until the
+    /// owners are emailed.
+    pub recovery_notice: Option<String>,
 }
 
 impl Org {
@@ -259,6 +307,19 @@ impl Org {
                 .filter(|v| !v.is_empty())
                 .map(str::to_string),
             created_at: Some(s(item, "created_at"))
+                .filter(|v| !v.is_empty())
+                .map(str::to_string),
+            require_sso: super::require_sso::SsoProvider::stored(s(
+                item,
+                super::require_sso::RULE_ATTR,
+            )),
+            require_sso_since: num(item, super::require_sso::SINCE_ATTR),
+            sso_cutoff: num(item, super::require_sso::CUTOFF_ATTR),
+            sso_cutoff_provider: super::require_sso::SsoProvider::stored(s(
+                item,
+                super::require_sso::CUTOFF_PROVIDER_ATTR,
+            )),
+            recovery_notice: Some(s(item, super::require_sso::RECOVERY_NOTICE))
                 .filter(|v| !v.is_empty())
                 .map(str::to_string),
         })
@@ -898,30 +959,31 @@ pub fn team_moved(url: &str) -> Response {
         .into_response()
 }
 
-/// The middleware's check for one session request acting in `team_id`, on
-/// either deployment. The rule is read fresh each time; when it can't be
-/// read the request is refused (the safe answer). On hosted the rule is read
-/// even for a session with a second factor: a team that moved to its own
-/// install is refused whatever the session.
+/// The middleware's check for one session request acting in the claims'
+/// team, on either deployment (`app`: a connected app's call, from its
+/// grant). The rules are read fresh each time; when they can't be read the
+/// request is refused (the safe answer). They are read for every session,
+/// a second factor or not: a team that moved to its own install, and a team
+/// that requires Okta sign-in (routes::require_okta), refuse whatever the
+/// session's second factor.
 pub async fn check_session(
     state: &AppState,
-    team_id: &str,
+    claims: &Claims,
     proof: &SignInProof,
     handler: Option<&str>,
+    _app: bool,
 ) -> Result<(), Response> {
-    if proof.mfa && applies() {
-        return Ok(());
-    }
-    let rule = match team_rule(state, team_id).await {
+    let rule = match team_rule(state, &claims.team_id).await {
         Ok(rule) => rule,
         Err(e) => {
-            error!(error = %e, "Two-factor rule not read; request refused");
+            error!(error = %e, "Sign-in rules not read; request refused");
             return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
         }
     };
     if let Some(url) = moved_refusal(&rule, handler) {
         return Err(team_moved(url));
     }
+    super::require_sso::check(state, &rule, claims, proof).await?;
     if gate(rule.require_2fa, proof, handler) {
         Ok(())
     } else {
@@ -1200,19 +1262,28 @@ fn session_cookie(token: &str) -> String {
     )
 }
 
-/// A fresh session for `claims` that passed a second factor just now.
+/// A fresh session for `claims` that passed a second factor just now. It
+/// keeps how the current session signed in (`current`): its way in, and its
+/// Okta subject or team tenant identity.
 pub fn session_with_second_factor(
     state: &AppState,
     claims: &Claims,
-    via: &str,
+    current: Option<&SignInProof>,
 ) -> Result<String, ApiError> {
+    let via = current
+        .and_then(|p| p.via.clone())
+        .unwrap_or_else(|| "password".to_string());
     let token = jwt::create_session_token(
         &claims.sub,
         &claims.team_id,
         &claims.email,
         claims.session_role(),
         claims.github_login.as_deref(),
-        &SignInProof::new(true, via).with_okta_sub(claims.okta_sub.clone()),
+        // The same sign-in, now with a second factor: its sign-in time too.
+        &SignInProof::new(true, &via)
+            .with_okta_sub(claims.okta_sub.clone())
+            .with_entra(current.and_then(|p| p.entra.clone()))
+            .with_auth_time(current.map(|p| p.signed_in_at(claims.iat))),
         &state.secrets.jwt_secret,
         SESSION_TTL_SECS,
     )
@@ -1341,8 +1412,7 @@ pub async fn app_verify(
         .await
         .map_err(|e| internal("Two-factor not turned on", e))?;
     info!(team_id = %claims.team_id, "Authenticator-app two-factor turned on");
-    let via = via_of(proof.as_ref());
-    let cookie = session_with_second_factor(&state, &claims, &via)?;
+    let cookie = session_with_second_factor(&state, &claims, proof.as_ref().map(|p| &p.0))?;
     Ok(with_cookie(json!({ "status": "enabled" }), &cookie))
 }
 
@@ -2229,7 +2299,9 @@ pub async fn check_member_session(state: &AppState, claims: &Claims) -> Result<(
         .table_name(&state.config.users_table_name)
         .key("pk", attr_s(&claims.team_id))
         .key("sk", attr_s(&claims.sub))
-        .projection_expression("pk, #st, #va, okta_issuer, okta_sub, okta_valid_after")
+        .projection_expression(
+            "pk, #st, #va, okta_issuer, okta_sub, okta_valid_after, ms_tid, ms_oid, ms_valid_after",
+        )
         .expression_attribute_names("#st", "status")
         .expression_attribute_names("#va", VALID_AFTER)
         .send()
@@ -2257,6 +2329,23 @@ pub async fn check_member_session(state: &AppState, claims: &Claims) -> Result<(
             live.as_ref(),
             claims.iat,
             claims.okta_sub.as_deref(),
+        )
+        .map_err(session_ended)?;
+    }
+    // The same for a session through the team's own Microsoft Entra tenant:
+    // only while the member's link is its identity under the live tenant.
+    if claims.entra.is_some() {
+        let live = super::entra_sso::load(state, &claims.team_id)
+            .await
+            .map_err(|e| {
+                error!(error = %e, "Microsoft setup not read; request refused");
+                StatusCode::SERVICE_UNAVAILABLE.into_response()
+            })?;
+        super::entra_sso::session_state(
+            item.as_ref(),
+            live.as_ref(),
+            claims.iat,
+            claims.entra.as_deref(),
         )
         .map_err(session_ended)?;
     }
@@ -2679,6 +2768,17 @@ pub async fn verify_second_step(
         ));
     }
     record_success(&state, &key).await;
+    // The team may have turned Require single sign-on on since the sign-in
+    // began: its last word.
+    let signed_in = SignInProof::new(true, &step.via)
+        .with_okta_sub(step.okta_sub.clone())
+        .with_entra(step.entra.clone());
+    if let Err(r) = super::require_sso::issue_check(&state, &step.team_id, &signed_in)
+        .await
+        .map_err(|e| internal("Single sign-on rule not read", e))?
+    {
+        return Ok(with_cleared(r.json()));
+    }
     let session = jwt::create_session_token(
         &step.sub,
         &step.team_id,
@@ -2688,7 +2788,7 @@ pub async fn verify_second_step(
             r => r,
         },
         step.github_login.as_deref(),
-        &SignInProof::new(true, &step.via).with_okta_sub(step.okta_sub.clone()),
+        &signed_in,
         &state.secrets.jwt_secret,
         SESSION_TTL_SECS,
     )
@@ -2781,6 +2881,31 @@ pub async fn get_settings(
     let items = team_members(&state, &claims.team_id)
         .await
         .map_err(|e| internal("Members not read", e))?;
+    // Require single sign-on: for each provider, its live setup, who linked
+    // it, and what turning the rule on with it still needs.
+    let signed_in = proof.map(|p| p.0).unwrap_or_default();
+    let mut options: Vec<Value> = Vec::new();
+    let mut lives = Vec::new();
+    for p in super::require_sso::SsoProvider::ALL {
+        let live = super::require_sso::live_setup(&state, &claims.team_id, p)
+            .await
+            .map_err(|e| internal("Single sign-on setup not read", e))?;
+        let ready =
+            super::require_sso::readiness(&state, &claims, &signed_in, p, live.as_ref(), false)
+                .await
+                .map_err(|e| internal("Domains not read", e))?;
+        let mut view = ready.view();
+        view["unlinked"] = json!(super::require_sso::unlinked(&items, live.as_ref()));
+        view["recovery"] = json!(super::require_sso::recovery_words(self_hosted, p));
+        options.push(view);
+        lives.push(live);
+    }
+    let claim_links: Vec<Value> = super::sso_claim::list(&state, &claims.team_id)
+        .await
+        .map_err(|e| internal("Claim links not read", e))?
+        .iter()
+        .map(|c| c.view())
+        .collect();
     let active: Vec<&Item> = items.iter().filter(|i| !is_invite(i)).collect();
     let factors = futures::future::join_all(active.iter().map(|i| member_factor(&state, i))).await;
     let people: Vec<Value> = active
@@ -2794,6 +2919,8 @@ pub async fn get_settings(
                 "github_login": s(i, "github_login"),
                 "role": s(i, "role"),
                 "two_factor": f,
+                "okta_linked": lives[0].as_ref().is_some_and(|l| l.linked(i)),
+                "microsoft_linked": lives[1].as_ref().is_some_and(|l| l.linked(i)),
                 "is_self": s(i, "sk") == claims.sub,
             })
         })
@@ -2835,6 +2962,73 @@ pub async fn get_settings(
             k
         })
         .collect();
+    // Keys follow their maker while single sign-on is required: for each
+    // provider, the live keys that would be (or are) suspended.
+    // A list that can't be read says so: never "no keys will be suspended".
+    let mut keys_unread = false;
+    let kb_keys = {
+        use crate::knowledge_keys::KeyStore;
+        crate::knowledge_keys::store(&state)
+            .list(&claims.team_id)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!(error = %e, "Knowledge keys not read for the sign-in page");
+                keys_unread = true;
+                Vec::new()
+            })
+    };
+    let api_makers: Vec<(String, String, String)> = {
+        use crate::api_keys::KeyStore;
+        crate::api_keys::store(&state)
+            .list(&claims.team_id)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!(error = %e, "API keys not read for the sign-in page");
+                keys_unread = true;
+                Vec::new()
+            })
+            .iter()
+            .filter(|k| k.is_live(now))
+            .map(|k| (k.name.clone(), k.created_by.clone(), "api".to_string()))
+            .collect()
+    };
+    let all_makers = api_makers.into_iter().chain(
+        kb_keys
+            .iter()
+            .filter(|k| k.revoked_at.is_none() && !k.is_expired(now))
+            .map(|k| {
+                (
+                    k.name.clone(),
+                    k.created_by.clone(),
+                    "knowledge".to_string(),
+                )
+            }),
+    );
+    let all_makers: Vec<(String, String, String)> = all_makers.collect();
+    for (view, (p, live)) in options.iter_mut().zip(
+        super::require_sso::SsoProvider::ALL
+            .iter()
+            .zip(lives.iter()),
+    ) {
+        let on = Rule {
+            require_sso: Some(*p),
+            ..Rule::default()
+        };
+        let suspended: Vec<Value> = all_makers
+            .iter()
+            .filter(|(_, maker, _)| {
+                let m = items.iter().find(|i| s(i, "sk") == maker.as_str());
+                !super::require_sso::key_maker_stands(&on, m, live.as_ref())
+            })
+            .map(|(name, _, kind)| json!({ "name": name, "kind": kind }))
+            .collect();
+        view["suspended_keys"] = if keys_unread {
+            Value::Null
+        } else {
+            json!(suspended)
+        };
+        view["keys_unread"] = json!(keys_unread);
+    }
     Ok(Json(json!({
         "self_hosted": self_hosted,
         // Hosted: the rule is the team's own, so this team is the unit.
@@ -2846,8 +3040,20 @@ pub async fn get_settings(
         "people": people,
         "without_2fa": without,
         "api_keys": keys,
-        "your_session_has_2fa": proof.is_some_and(|p| p.mfa),
+        "your_session_has_2fa": signed_in.mfa,
+        "team_id": claims.team_id,
+        "require_sso": rule.require_sso.map(|p| p.slug()),
+        "require_sso_since": sso_since_text(&rule),
+        "sso_options": options,
+        "claim_links": claim_links,
     })))
+}
+
+/// When Require single sign-on was turned on, for the page (none while off).
+fn sso_since_text(rule: &Rule) -> Option<String> {
+    rule.require_sso
+        .and_then(|_| chrono::DateTime::from_timestamp(rule.sso_since as i64, 0))
+        .map(|t| t.to_rfc3339())
 }
 
 /// Was this key made before two-factor sign-in was required? A key never
@@ -2911,6 +3117,14 @@ pub async fn key_reviews(
 pub struct SettingsBody {
     pub domains: Option<Vec<String>>,
     pub require_2fa: Option<bool>,
+    /// Require single sign-on (routes::require_sso): the owner's alone. The
+    /// provider's slug (`okta` or `microsoft`) turns it on; "" turns it off.
+    #[serde(default)]
+    pub require_sso: Option<String>,
+    /// The owner saw the members who haven't linked the provider and turns
+    /// it on anyway.
+    #[serde(default)]
+    pub acknowledge_unlinked: bool,
 }
 
 /// PUT /api/sign-in — change the two-factor rule (self-hosted: the
@@ -2952,6 +3166,59 @@ pub async fn update_settings(
         .await
         .map_err(|e| internal("Two-factor rule not read", e))?;
     let turning_on = body.require_2fa == Some(true) && !current.require_2fa;
+    let signed_in = proof.as_ref().map(|p| p.0.clone()).unwrap_or_default();
+    // The rule's change: `Some(Some(p))` on with `p`, `Some(None)` off.
+    let wanted = match body.require_sso.as_deref().map(str::trim) {
+        None => None,
+        Some("") => Some(None),
+        Some(v) => Some(Some(super::require_sso::SsoProvider::parse(v).ok_or_else(
+            || fail(StatusCode::BAD_REQUEST, "Choose Okta or Microsoft Entra."),
+        )?)),
+    };
+    let sso_change = wanted.filter(|w| *w != current.require_sso);
+    if let (Some(Some(_)), Some(_)) = (sso_change, current.require_sso) {
+        return Err(fail_code(
+            StatusCode::CONFLICT,
+            "Turn Require single sign-on off first, then on with the other provider.",
+            "sso_required_on",
+        ));
+    }
+    // Turning it on: the live setup it was checked against, which the write
+    // below requires to be unchanged.
+    let sso_on_with = match sso_change {
+        Some(to) => {
+            sso_rule_change(&state, &claims, &signed_in, to, body.acknowledge_unlinked).await?
+        }
+        None => None,
+    };
+    let okta_change = sso_change.map(|to| to.is_some());
+    // Self-hosted: an Okta setup with no domains of its own signs in the
+    // organization's allowed domains, so while the rule stays on none of
+    // them can be dropped (that would lock those people out).
+    let drops_org_domains = match (&domains, &org) {
+        (Some(d), Some(o)) => o.domains.iter().any(|x| !d.contains(x)),
+        _ => false,
+    };
+    let rule_stays_on =
+        (current.require_sso.is_some() && okta_change != Some(false)) || okta_change == Some(true);
+    let mut guard_domains = false;
+    if drops_org_domains && okta_change != Some(false) {
+        let relies = super::oidc_signin::live_setup_of(&state, &claims.team_id)
+            .await
+            .map_err(|e| internal("Okta setup not read", e))?
+            .is_none_or(|l| l.domains.is_empty());
+        if relies {
+            if rule_stays_on {
+                return Err(fail_code(
+                    StatusCode::CONFLICT,
+                    "Your Okta signs in people at these allowed domains, and single sign-on is required: turn off Require single sign-on first, or list the domains in the Okta setup.",
+                    "sso_required_on",
+                ));
+            }
+            // Off now: the write holds only while it stays off.
+            guard_domains = true;
+        }
+    }
     if turning_on && !proof.as_ref().is_some_and(|p| p.mfa) {
         return Err(fail_code(
             StatusCode::CONFLICT,
@@ -2999,19 +3266,61 @@ pub async fn update_settings(
             sets.push("require_2fa_since = :now");
         }
     }
-    if !changes.is_empty() {
-        // Nothing changes without its line in the log.
-        super::roles::record(
-            &state,
-            &claims,
-            super::roles::AuditEntry {
-                action: "sign_in_rules",
-                role_id: "",
-                role_name: "",
-                detail: changes.join(". "),
-            },
-        )
-        .await?;
+    let mut removes: Vec<&str> = Vec::new();
+    if let Some(to) = sso_change {
+        changes.push(match to {
+            Some(p) => format!(
+                "Single sign-on with {} required for {}",
+                p.name(),
+                if self_hosted {
+                    "everyone"
+                } else {
+                    "everyone on this team"
+                }
+            ),
+            None => "Single sign-on no longer required".to_string(),
+        });
+        match to {
+            Some(p) => {
+                // Every session from another way in ends at its next request,
+                // and stays ended: the cut-off outlives the rule.
+                sets.push("#rs = :rs");
+                sets.push("#rss = :rss");
+                sets.push("#rco = :rss");
+                sets.push("#rcp = :rs");
+                values.insert(":rs".into(), attr_s(p.slug()));
+                values.insert(
+                    ":rss".into(),
+                    AttributeValue::N(super::require_sso::since_now().to_string()),
+                );
+            }
+            None => {
+                removes.push("#rs");
+                removes.push("#rss");
+            }
+        }
+    }
+    let log = |detail: String| {
+        let (state, claims) = (&state, &claims);
+        async move {
+            super::roles::record(
+                state,
+                claims,
+                super::roles::AuditEntry {
+                    action: "sign_in_rules",
+                    role_id: "",
+                    role_name: "",
+                    detail,
+                },
+            )
+            .await
+        }
+    };
+    // Nothing changes without its line in the log: written first, except
+    // when Require single sign-on is turned on, whose transaction can still
+    // be cancelled (its line follows the outcome, a cancelled one as such).
+    if !changes.is_empty() && sso_on_with.is_none() {
+        log(changes.join(". ")).await?;
     }
     // Self-hosted: the organization record (it exists). Hosted: the team's
     // own rule record, made the first time.
@@ -3020,23 +3329,113 @@ pub async fn update_settings(
     } else {
         (claims.team_id.clone(), TEAM_RULE_SK)
     };
-    let up = state
-        .dynamo
-        .update_item()
-        .table_name(&state.config.settings_table_name)
-        .key("pk", attr_s(&pk))
-        .key("sk", attr_s(sk))
-        .update_expression(format!("SET {}", sets.join(", ")))
-        .set_expression_attribute_values(Some(values));
-    let up = if self_hosted {
-        up.condition_expression("attribute_exists(pk)")
+    let mut conditions: Vec<&str> = Vec::new();
+    let mut names: HashMap<String, String> = HashMap::new();
+    if self_hosted {
+        conditions.push("attribute_exists(pk)");
+    }
+    if sso_change.is_some() {
+        names.insert("#rs".into(), super::require_sso::RULE_ATTR.into());
+        names.insert("#rss".into(), super::require_sso::SINCE_ATTR.into());
+    }
+    if matches!(sso_change, Some(Some(_))) {
+        names.insert("#rco".into(), super::require_sso::CUTOFF_ATTR.into());
+        names.insert(
+            "#rcp".into(),
+            super::require_sso::CUTOFF_PROVIDER_ATTR.into(),
+        );
+    }
+    if guard_domains {
+        conditions.push("attribute_not_exists(#rs)");
+        names.insert("#rs".into(), super::require_sso::RULE_ATTR.into());
+    }
+    let update_expr = if removes.is_empty() {
+        format!("SET {}", sets.join(", "))
     } else {
-        up
+        format!("SET {} REMOVE {}", sets.join(", "), removes.join(", "))
     };
-    up.send()
-        .await
-        .map_err(|e| internal("Sign-in rules not saved", e))?;
+    let condition = (!conditions.is_empty()).then(|| conditions.join(" AND "));
+    let names = (!names.is_empty()).then_some(names);
+    match &sso_on_with {
+        // Turning Require single sign-on on: one transaction with the rule
+        // and a check that the provider's setup (and on hosted each proven
+        // domain) is exactly what was checked, so nothing that narrows it can
+        // land beside it.
+        Some(live) => {
+            use aws_sdk_dynamodb::types::{TransactWriteItem, Update};
+            let update = Update::builder()
+                .table_name(&state.config.settings_table_name)
+                .key("pk", attr_s(&pk))
+                .key("sk", attr_s(sk))
+                .update_expression(update_expr.clone())
+                .set_condition_expression(condition)
+                .set_expression_attribute_names(names)
+                .set_expression_attribute_values(Some(values))
+                .build()
+                .map_err(|e| internal("Sign-in rules not saved", e))?;
+            let mut items = vec![TransactWriteItem::builder().update(update).build()];
+            items.extend(
+                super::require_sso::setup_unchanged(&state, live)
+                    .map_err(|e| internal("Sign-in rules not saved", e))?,
+            );
+            if let Err(e) = state
+                .dynamo
+                .transact_write_items()
+                .set_transact_items(Some(items))
+                .send()
+                .await
+            {
+                let e = format!("{e:?}");
+                if e.contains("TransactionCanceled") {
+                    log(format!(
+                        "Cancelled, nothing changed: {} (the sign-in setup changed meanwhile)",
+                        changes.join(". ")
+                    ))
+                    .await?;
+                    return Err(fail_code(
+                        StatusCode::CONFLICT,
+                        "The sign-in setup changed while you turned this on. Check it again, then turn it on.",
+                        "sso_changed",
+                    ));
+                }
+                return Err(internal("Sign-in rules not saved", e));
+            }
+            log(changes.join(". ")).await?;
+        }
+        None => {
+            let up = state
+                .dynamo
+                .update_item()
+                .table_name(&state.config.settings_table_name)
+                .key("pk", attr_s(&pk))
+                .key("sk", attr_s(sk))
+                .update_expression(update_expr.clone())
+                .set_condition_expression(condition)
+                .set_expression_attribute_names(names)
+                .set_expression_attribute_values(Some(values));
+            if let Err(e) = up.send().await {
+                if guard_domains
+                    && e.as_service_error()
+                        .is_some_and(|se| se.is_conditional_check_failed_exception())
+                {
+                    return Err(fail_code(
+                        StatusCode::CONFLICT,
+                        "Require single sign-on was turned on meanwhile. Turn it off first to drop allowed domains.",
+                        "sso_required_on",
+                    ));
+                }
+                return Err(internal("Sign-in rules not saved", e));
+            }
+        }
+    }
     info!(changes = ?changes, "Sign-in rules changed");
+    // Turned on: app connections whose sign-in the rule refuses end now.
+    if let Some(Some(_)) = sso_change {
+        let rule = team_rule(&state, &claims.team_id)
+            .await
+            .map_err(|e| internal("Sign-in rules not read", e))?;
+        super::require_sso::end_refused_connections(&state, &claims.team_id, &rule).await;
+    }
     let rule = team_rule(&state, &claims.team_id)
         .await
         .map_err(|e| internal("Two-factor rule not read", e))?;
@@ -3061,12 +3460,75 @@ pub async fn update_settings(
         "domains": domains,
         "require_2fa": rule.require_2fa,
         "require_2fa_since": rule.since,
+        "require_sso": rule.require_sso.map(|p| p.slug()),
+        "require_sso_since": sso_since_text(&rule),
         "notified": notified,
     })))
 }
 
+/// Turning Require single sign-on on (`to`: the provider) or off: the owner
+/// only, from their own session. On needs the provider set up and on,
+/// (hosted) every domain proven in DNS now, and the owner's session from
+/// that provider; with members who haven't linked it, the owner says they
+/// saw the list.
+async fn sso_rule_change(
+    state: &AppState,
+    claims: &Claims,
+    signed_in: &SignInProof,
+    to: Option<super::require_sso::SsoProvider>,
+    acknowledged: bool,
+) -> Result<Option<super::require_sso::Live>, ApiError> {
+    let provider = to.unwrap_or(super::require_sso::SsoProvider::Okta);
+    let live = super::require_sso::live_setup(state, &claims.team_id, provider)
+        .await
+        .map_err(|e| internal("Single sign-on setup not read", e))?;
+    let ready = super::require_sso::readiness(
+        state,
+        claims,
+        signed_in,
+        provider,
+        live.as_ref(),
+        to.is_some(),
+    )
+    .await
+    .map_err(|e| internal("Domains not read", e))?;
+    if !ready.is_owner {
+        return Err(fail_code(
+            StatusCode::FORBIDDEN,
+            "Only the owner can turn Require single sign-on on or off.",
+            "owner_only",
+        ));
+    }
+    let Some(provider) = to else {
+        return Ok(None);
+    };
+    if let Some((status, code, msg)) = ready.first_missing() {
+        return Err(fail_code(status, &msg, code));
+    }
+    let members = team_members(state, &claims.team_id)
+        .await
+        .map_err(|e| internal("Members not read", e))?;
+    let unlinked = super::require_sso::unlinked(&members, live.as_ref());
+    if !unlinked.is_empty() && !acknowledged {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": format!(
+                    "{} {} not linked {} yet. Once single sign-on is required, they can't sign in until an admin gives them a one-time claim link.",
+                    unlinked.len(),
+                    if unlinked.len() == 1 { "member has" } else { "members have" },
+                    provider.name()
+                ),
+                "code": "unlinked_members",
+                "unlinked": unlinked,
+            })),
+        ));
+    }
+    Ok(live)
+}
+
 /// The team's name for an email (hosted), or "".
-async fn team_name(state: &AppState, team_id: &str) -> String {
+pub(crate) async fn team_name(state: &AppState, team_id: &str) -> String {
     state
         .dynamo
         .get_item()
@@ -3092,7 +3554,7 @@ pub fn required_by_words(self_hosted: bool, team: &str) -> String {
 
 /// One email through the install's or hosted deployment's sender, recorded
 /// in Deliveries. Whether it was sent.
-async fn send_mail(
+pub(crate) async fn send_mail(
     state: &AppState,
     team_id: &str,
     template: &'static str,
@@ -3673,6 +4135,8 @@ mod tests {
             mfa: false,
             via: Some("google".into()),
             okta_sub: None,
+            entra: None,
+            auth_time: None,
         };
         let passed = SignInProof::new(true, "github");
         // Off: everyone goes on.
@@ -3835,7 +4299,7 @@ mod tests {
         assert!(before(oidc, "selfhost_landing", "Ulid::new"));
         assert!(before(
             oidc,
-            "if let Some(record) = okta",
+            "if let Some(landing) = &sso",
             "selfhost_landing"
         ));
         assert!(before(oidc, "sign_in::second_step", "create_session_token"));
@@ -3843,7 +4307,8 @@ mod tests {
         // The code, not its tests (which make tokens to check them).
         let flows = &flows[..flows.find("#[cfg(test)]\nmod tests").unwrap()];
         assert!(body(flows, "microsoft_callback_inner").contains("finish_oidc("));
-        assert!(body(flows, "okta_callback_inner").contains("finish_oidc("));
+        assert!(body(flows, "okta_callback_inner").contains("okta_land("));
+        assert!(body(flows, "okta_land").contains("finish_oidc("));
         assert!(!flows.contains("create_session_token"));
         // The landing makes teams only through the organization's own rules.
         let landing = body(auth, "selfhost_landing");
@@ -3875,12 +4340,12 @@ mod tests {
         assert!(f.contains("create_session_token") && f.contains("&proof"));
         // Read fresh each time: no cache in front of the rule.
         let check = body(include_str!("sign_in.rs"), "check_session");
-        assert!(check.contains("team_rule(state, team_id)"));
+        assert!(check.contains("team_rule(state, &claims.team_id)"));
         assert!(!check.to_lowercase().contains("cache"));
         // On every deployment: the acting team's rule (self-hosted: the
         // organization's), read with a consistent read.
         assert!(!f.contains("sign_in::applies()"));
-        assert!(f.contains("check_session(&state, &claims.team_id, &proof, handler)"));
+        assert!(f.contains("check_session(&state, &claims, &proof, handler, false)"));
         let rule = body(include_str!("sign_in.rs"), "team_rule");
         assert!(rule.contains("load_org(state)") && rule.contains("TEAM_RULE_SK"));
         assert!(rule.contains(".consistent_read(true)"));
@@ -4100,7 +4565,7 @@ mod tests {
             "sign_in::second_step",
             "SignInProof::new(false, \"github\")"
         ));
-        let issue = body(auth, "issue_session_from_cognito");
+        let issue = body(auth, "password_session");
         assert!(before(issue, "sign_in::password_step", "session_json("));
         assert!(issue.contains("proof.mfa"));
         // The step reads the member's factor, either kind, and fails closed.
@@ -4224,6 +4689,10 @@ mod tests {
                 require_2fa: true,
                 since: Some("2026-10-27T00:00:00Z".into()),
                 moved_to: None,
+                require_sso: None,
+                sso_since: 0,
+                sso_cutoff: 0,
+                sso_cutoff_provider: None,
             }
         );
         assert_eq!(Rule::from_item(&HashMap::new()), Rule::default());
@@ -4293,8 +4762,14 @@ mod tests {
         let src = include_str!("sign_in.rs");
         let body = &src[src.find("pub async fn check_session(").unwrap()..];
         let body = &body[..body.find("\n}\n").unwrap()];
-        assert!(body.contains("if proof.mfa && applies()"));
+        // No shortcut for a session with a second factor: the rules are read
+        // for every session, and the moved team and Require Okta sign-in
+        // refuse before the two-factor gate.
+        assert!(!body.contains("proof.mfa &&"));
         assert!(body.find("moved_refusal(").unwrap() < body.find("gate(rule.require_2fa").unwrap());
+        assert!(
+            body.find("require_sso::check(").unwrap() < body.find("gate(rule.require_2fa").unwrap()
+        );
     }
 
     /// Hosted Google, GitHub and password sign-ins ask for the person's
@@ -4325,8 +4800,10 @@ mod tests {
         let tail = &issue[issue
             .find("Created new user + team on first login")
             .unwrap()..];
-        assert!(tail.contains("\n    if let Some(resp) = sign_in::password_step("));
-        assert!(before(tail, "sign_in::password_step", "session_json("));
+        assert!(tail.contains("password_session("));
+        let finish = body(auth, "password_session");
+        assert!(finish.contains("\n    if let Some(resp) = sign_in::password_step("));
+        assert!(before(finish, "sign_in::password_step", "session_json("));
         // The Cognito code passed on a hosted sign-in is recorded too.
         let mfa = body(auth, "mfa_verify");
         assert!(mfa.contains("sign_in::note_factor(&state, \"\", &sub, &email, Some(\"cognito\"))"));

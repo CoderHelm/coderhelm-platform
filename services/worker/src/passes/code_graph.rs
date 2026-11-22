@@ -646,9 +646,14 @@ pub async fn run(
         "",
     )
     .await;
+    let pushed = msg.changed_files.is_some();
     match index_pass(state, msg).await {
         Ok(()) => {
             cg::set_status(&state.dynamo, table, &team_id, &repo, BuildState::Ready, "").await;
+            // A push to a default branch: the team's app map follows it.
+            if pushed {
+                super::app_map::after_push(state, &team_id).await;
+            }
             Ok(())
         }
         Err(e) => {
@@ -1270,7 +1275,7 @@ pub async fn queue_full_index(
 }
 
 /// The team's GitHub App installation, for a build queued without one.
-async fn team_installation_id(state: &WorkerState, team_id: &str) -> Option<u64> {
+pub(crate) async fn team_installation_id(state: &WorkerState, team_id: &str) -> Option<u64> {
     let item = state
         .dynamo
         .get_item()

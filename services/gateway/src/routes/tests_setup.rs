@@ -139,7 +139,8 @@ impl Gh<'_> {
     async fn file(&self, repo: &str, path: &str, git_ref: &str) -> Result<Option<String>, String> {
         let (status, v) = self
             .get(&format!(
-                "/repos/{repo}/contents/{path}?ref={}",
+                "/repos/{repo}/contents/{}?ref={}",
+                common::repo_read::path_url(path),
                 urlencoding::encode(git_ref)
             ))
             .await?;

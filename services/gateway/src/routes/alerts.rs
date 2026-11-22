@@ -1526,14 +1526,16 @@ async fn start_run(
         return Ok(Outcome::DailyCap);
     }
 
-    let context_hash = common::ticket_context_hash(&alert.title, &alert.body, &[]);
+    // A firing is the alert opening again, never an edit of its ticket
+    // (`trigger_gate::alert_firing`).
+    let (content, reopened) = super::trigger_gate::alert_firing();
     match super::trigger_gate::gate_ticket_trigger(
         state,
         &route.team_id,
         tid,
-        Some(&context_hash),
+        content,
         false,
-        false,
+        reopened,
         None,
         false,
     )

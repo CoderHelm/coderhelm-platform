@@ -1258,6 +1258,8 @@ fn has_time_for_remediation(start: &Instant) -> bool {
 pub mod agent_file;
 pub mod agent_tools;
 pub mod alert_episodes;
+/// The team's app map: Floorplan (vendor/floorplan) run in the sandbox (`common::app_map`).
+pub mod app_map;
 pub mod await_merge;
 pub mod aws_permissions;
 pub mod base_images;
@@ -1323,6 +1325,7 @@ mod infra_repo;
 pub mod jira_comment;
 pub mod knowledge;
 pub mod knowledge_sync;
+pub mod learning_wait;
 pub mod lesson_cleanup;
 pub mod lessons;
 pub mod line_count;
@@ -1360,6 +1363,7 @@ pub mod plan_execute;
 mod plan_judge;
 pub(crate) mod plan_sections;
 mod plan_shape;
+pub mod plan_sync;
 /// Plugin runs, publishing, source sync and results.
 pub mod plugins;
 mod pr;
@@ -8903,10 +8907,13 @@ async fn create_run_record(
         _ => None,
     };
     if let Some(ticket) = plan_ticket {
-        if let Some((plan_id, title, by)) =
+        if let Some((plan_id, title, by, task_id)) =
             plan_execute::plan_of_ticket(state, &msg.team_id, &ticket).await
         {
             put = put.item("plan_id", attr_s(&plan_id));
+            if !task_id.is_empty() {
+                put = put.item("plan_task_id", attr_s(&task_id));
+            }
             if !title.is_empty() {
                 put = put.item("plan_title", attr_s(&title));
             }

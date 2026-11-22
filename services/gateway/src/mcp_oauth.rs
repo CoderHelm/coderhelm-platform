@@ -759,6 +759,10 @@ pub struct Consent {
     pub via: Option<String>,
     /// An Okta session's Okta subject (the connection ends with its link).
     pub okta_sub: Option<String>,
+    /// A team tenant session's `<tid>/<oid>` (routes::entra_sso).
+    pub entra: Option<String>,
+    /// When the consenting session signed in (its proof's sign-in time).
+    pub auth_time: Option<u64>,
     /// The person let the app start runs and ask for reviews.
     pub allow_write: bool,
     /// The person let the app search the knowledge bases they can read.
@@ -785,6 +789,15 @@ pub struct StoredCode {
     pub via: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub okta_sub: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entra: Option<String>,
+    /// When the consenting session signed in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_time: Option<u64>,
+    /// When the person said yes, in seconds: the connection's issue time,
+    /// never the later swap (0 on a code from before this was kept).
+    #[serde(default)]
+    pub consented_at: i64,
     /// Seconds since the epoch.
     pub expires_at: i64,
 }
@@ -801,6 +814,11 @@ fn secret() -> String {
 /// fast hash is the right one.
 pub fn hash(token: &str) -> String {
     hex::encode(Sha256::digest(token.as_bytes()))
+}
+
+/// Whether `token` is the connection's current refresh token.
+pub fn is_current_refresh(g: &StoredGrant, token: &str) -> bool {
+    hash_matches(token, &g.refresh_hash)
 }
 
 fn hash_matches(token: &str, stored: &str) -> bool {
@@ -890,6 +908,9 @@ pub fn approve(
         mfa: who.mfa,
         via: who.via.clone(),
         okta_sub: who.okta_sub.clone(),
+        entra: who.entra.clone(),
+        auth_time: who.auth_time,
+        consented_at: now.timestamp(),
         expires_at: now.timestamp() + CODE_TTL_SECS,
     };
     (code, stored)
@@ -919,6 +940,12 @@ pub struct StoredGrant {
     pub via: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub okta_sub: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entra: Option<String>,
+    /// When the consenting session signed in (none on a connection from
+    /// before this was kept: its consent time stands for it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_time: Option<u64>,
     #[serde(default)]
     pub refresh_hash: String,
     #[serde(default)]
@@ -934,6 +961,18 @@ pub struct StoredGrant {
 }
 
 impl StoredGrant {
+    /// How the session that made the grant signed in: the rules a session
+    /// meets are checked against it on every call.
+    pub fn proof(&self) -> crate::auth::jwt::SignInProof {
+        crate::auth::jwt::SignInProof {
+            mfa: self.mfa,
+            via: self.via.clone(),
+            okta_sub: self.okta_sub.clone(),
+            entra: self.entra.clone(),
+            auth_time: self.auth_time,
+        }
+    }
+
     pub fn scope_set(&self) -> BTreeSet<&'static str> {
         known_scopes(&self.scopes)
     }
@@ -1202,10 +1241,20 @@ async fn swap_code(
         redirect_host: redirect_host(&c.redirect_uri),
         scopes: c.scopes,
         created_at: now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-        created_at_secs: now.timestamp().max(0) as u64,
+        // Issued when the person said yes, not at the swap: whatever ended
+        // their sessions in between (a removal, a reset, the sign-on
+        // cut-off) ends this connection too.
+        created_at_secs: if c.consented_at > 0 {
+            c.consented_at
+        } else {
+            now.timestamp()
+        }
+        .max(0) as u64,
         mfa: c.mfa,
         via: c.via,
         okta_sub: c.okta_sub,
+        entra: c.entra,
+        auth_time: c.auth_time,
         refresh_hash: hash(&refresh_token),
         prev_refresh_hash: None,
         refresh_expires_at: refresh_expiry(now),
@@ -1866,6 +1915,8 @@ pub(crate) mod tests {
             mfa: false,
             via: Some("password".into()),
             okta_sub: None,
+            entra: None,
+            auth_time: None,
             allow_write: write,
             allow_knowledge: false,
             lookups: BTreeSet::new(),

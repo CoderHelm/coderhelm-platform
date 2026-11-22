@@ -157,6 +157,7 @@ pub async fn claim(state: &WorkerState, msg: &TicketMessage, run_id: &str) -> Re
         match write(state, &msg.team_id, &sk, run_id, from.as_deref()).await {
             Ok(true) => {
                 info!(run_id, ticket = %key, "The run holds its ticket");
+                end_earlier_waits(state, msg, run_id).await;
                 return Ok(());
             }
             Ok(false) => {}
@@ -184,6 +185,74 @@ pub async fn claim(state: &WorkerState, msg: &TicketMessage, run_id: &str) -> Re
     }
     warn!(run_id, ticket = %key, "Ticket claim kept changing hands: allowing the run");
     Ok(())
+}
+
+/// The ticket's earlier runs still waiting on a person stop waiting once
+/// fresh run `run_id` holds the ticket (`one_run::earlier_waits`): each
+/// becomes `retried`, replaced by this run, so one ticket has one current
+/// run and no old question goes on being reminded. Only while each still
+/// waits; best effort, like the claim.
+async fn end_earlier_waits(state: &WorkerState, msg: &TicketMessage, run_id: &str) {
+    let out = state
+        .dynamo
+        .query()
+        .table_name(&state.config.runs_table_name)
+        .index_name("ticket-index")
+        .key_condition_expression("team_id = :tid AND ticket_id = :ticket")
+        .projection_expression("run_id, #s, repo")
+        .expression_attribute_names("#s", "status")
+        .expression_attribute_values(":tid", s(&msg.team_id))
+        .expression_attribute_values(":ticket", s(&msg.ticket_id))
+        .send()
+        .await;
+    let items = match out {
+        Ok(o) => o.items.unwrap_or_default(),
+        Err(e) => {
+            warn!(run_id, ticket_id = %msg.ticket_id, error = %aws_sdk_dynamodb::error::DisplayErrorContext(&e), "Could not read the ticket's earlier runs");
+            return;
+        }
+    };
+    let get = |i: &std::collections::HashMap<String, AttributeValue>, k: &str| {
+        i.get(k)
+            .and_then(|v| v.as_s().ok())
+            .cloned()
+            .unwrap_or_default()
+    };
+    let runs: Vec<(String, String, String)> = items
+        .iter()
+        .map(|i| (get(i, "run_id"), get(i, "status"), get(i, "repo")))
+        .collect();
+    let repo = format!("{}/{}", msg.repo_owner, msg.repo_name);
+    let now = chrono::Utc::now().to_rfc3339();
+    for old in one_run::earlier_waits(run_id, &repo, &runs) {
+        let ended = state
+            .dynamo
+            .update_item()
+            .table_name(&state.config.runs_table_name)
+            .key("team_id", s(&msg.team_id))
+            .key("run_id", s(old))
+            .update_expression(
+                "SET #s = :r, status_run_id = :sri, retried_as = :n, updated_at = :t",
+            )
+            .condition_expression("#s = :ni")
+            .expression_attribute_names("#s", "status")
+            .expression_attribute_values(":r", s(common::run_status::RETRIED))
+            .expression_attribute_values(
+                ":sri",
+                s(&format!("{}#{old}", common::run_status::RETRIED)),
+            )
+            .expression_attribute_values(":n", s(run_id))
+            .expression_attribute_values(":t", s(&now))
+            .expression_attribute_values(":ni", s(common::run_status::NEEDS_INPUT))
+            .send()
+            .await
+            .is_ok();
+        if ended {
+            info!(run_id, old, ticket_id = %msg.ticket_id, "An earlier waiting run of the ticket no longer waits");
+            super::add_progress_note(state, &msg.team_id, old, &one_run::ended_wait_note(run_id))
+                .await;
+        }
+    }
 }
 
 /// The live run that holds the ticket named `key` (seen from `repo`), if any:

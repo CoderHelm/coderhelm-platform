@@ -1238,12 +1238,9 @@ pub async fn link_answer(
     };
     // The link names who it was sent to; only that person, signed in in this
     // browser, may answer with it.
-    if !crate::middleware::auth::signed_in_as(
-        &headers,
-        &state.secrets.jwt_secret,
-        &c.team_id,
-        &c.recipient,
-    ) {
+    if !crate::middleware::auth::session_answers_as(&state, &headers, &c.team_id, &c.recipient)
+        .await
+    {
         return page(
             StatusCode::FORBIDDEN,
             "Approval link",

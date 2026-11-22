@@ -1,0 +1,18 @@
+{
+  "floorplan/descriptions/api.json": {
+    "files": {
+      "harbor-api/src/billing.js": { "name": "Card charges", "description": "Charges a boater's card through Stripe for a slip booking." },
+      "harbor-api/src/bookings.js": { "name": "Slip bookings", "description": "Takes a booking for a slip and charges for it." },
+      "harbor-api/src/server.js": { "name": "Booking service start", "description": "Starts the booking service and sends slip requests to the bookings code." }
+    },
+    "routes": {
+      "POST /slips/:id/bookings": { "name": "Book a slip", "description": "Books the slip and charges the boater's card." }
+    }
+  },
+  "floorplan/descriptions/web.json": {
+    "files": {
+      "harbor-web/app/slips/[id]/page.tsx": { "name": "Slip page", "description": "Shows one slip with a button to book it." },
+      "harbor-web/lib/slips.ts": { "name": "Booking request", "description": "Sends the booking for a slip to the booking service." }
+    }
+  }
+}

@@ -1541,6 +1541,14 @@ async fn google_callback_inner(
 
     if sign_in::applies() {
         let dash = common::public_urls::app_url(&state.config.stage);
+        // The organization requires Okta sign-in: nothing is joined or made.
+        if let Err(r) =
+            super::require_sso::selfhost_pre_gate(state, &super::require_sso::way_in("google"))
+                .await
+                .map_err(|e| SignInFailure::new(P, Reason::Server, "okta_rule", e))?
+        {
+            return Ok(r.redirect(P, dash));
+        }
         let landed = selfhost_landing(
             state,
             &email,
@@ -1554,6 +1562,13 @@ async fn google_callback_inner(
             return Ok(Redirect::temporary(&not_invited_url(dash)).into_response());
         };
         let (team_id, user_id, role, github_login) = landing_parts(&record);
+        if let Err(r) =
+            super::require_sso::issue_check(state, &team_id, &super::require_sso::way_in("google"))
+                .await
+                .map_err(|e| SignInFailure::new(P, Reason::Server, "okta_rule", e))?
+        {
+            return Ok(r.redirect(P, dash));
+        }
         touch_last_login(state, &team_id, &user_id).await;
         let step = SecondStep {
             sub: user_id.clone(),
@@ -1564,6 +1579,7 @@ async fn google_callback_inner(
             via: "google".into(),
             jti: String::new(),
             okta_sub: None,
+            entra: None,
             aud: String::new(),
             iat: 0,
             exp: 0,
@@ -1595,6 +1611,14 @@ async fn google_callback_inner(
     }
     // An invite from a team that moved to its own install is never accepted here.
     let existing = super::open_signup::drop_moved_invites(state, existing).await;
+    // Teams that require Okta sign-in are held back: their records are not
+    // landed on and their invites are not accepted this way.
+    let gated =
+        super::require_sso::gated_teams(state, &existing, &super::require_sso::way_in("google"))
+            .await
+            .map_err(|e| SignInFailure::new(P, Reason::Server, "okta_rule", e))?;
+    let held = super::require_sso::filter(&existing, &gated);
+    let existing = held.kept;
 
     // Accept pending invites first: Google sign-ins never accepted them, so an
     // invited teammate got a personal team and the invite stayed pending.
@@ -1605,6 +1629,15 @@ async fn google_callback_inner(
     // Prefer a real team the user joined over their personal team (dropped the
     // .limit(1) above so all memberships are visible to the picker).
     let selected = select_session_team(&pool, cognito_sub);
+    if selected.is_none() {
+        if let Some(team) = &held.refused {
+            // Only teams that require Okta: no personal team is made instead.
+            let dash = common::public_urls::app_url(&state.config.stage);
+            return Ok(super::require_sso::refused_for(state, team)
+                .await
+                .redirect(P, dash));
+        }
+    }
     let (team_id, user_id, role) = if let Some(item) = selected {
         let tid = item
             .get("pk")
@@ -1668,6 +1701,13 @@ async fn google_callback_inner(
     // The person's second factor, whichever it is, comes before a session,
     // whether or not a team requires it.
     let dashboard_url = common::public_urls::app_url(&state.config.stage);
+    if let Err(r) =
+        super::require_sso::issue_check(state, &team_id, &super::require_sso::way_in("google"))
+            .await
+            .map_err(|e| SignInFailure::new(P, Reason::Server, "okta_rule", e))?
+    {
+        return Ok(r.redirect(P, dashboard_url));
+    }
     let step = SecondStep {
         sub: user_id.clone(),
         team_id: team_id.clone(),
@@ -1677,6 +1717,7 @@ async fn google_callback_inner(
         via: "google".into(),
         jti: String::new(),
         okta_sub: None,
+        entra: None,
         aud: String::new(),
         iat: 0,
         exp: 0,
@@ -1716,6 +1757,17 @@ pub(crate) fn okta_landing_matches(
     })
 }
 
+/// A sign-in through a team's own provider (its Okta, or its Microsoft
+/// Entra tenant) that found the member record: the record, whether it was
+/// made just now (an invite or a claim accepted, which needs no join check),
+/// and the identity the session carries.
+pub(crate) struct SsoLanding<'a> {
+    pub record: &'a HashMap<String, AttributeValue>,
+    pub joined_now: bool,
+    pub okta_sub: Option<String>,
+    pub entra: Option<String>,
+}
+
 /// The end of a Microsoft or Okta sign-in, once the provider's id_token and
 /// the email in it are checked: the same gates as Google and GitHub.
 ///
@@ -1735,30 +1787,36 @@ pub(crate) async fn finish_oidc(
     ip: &str,
     provider: Provider,
     person: &super::oidc_signin::Person,
-    okta: Option<&HashMap<String, AttributeValue>>,
+    sso: Option<SsoLanding<'_>>,
 ) -> Result<Response, SignInFailure> {
     let p = provider;
     let via = p.slug();
     let dash = common::public_urls::app_url(&state.config.stage);
-    // Okta: the member who linked this Okta identity, by their record's own
-    // email, never the token's.
-    let linked_email = okta
-        .and_then(|r| r.get("email"))
+    // A team's own provider: the member who linked this identity, by their
+    // record's own email, never the token's.
+    let linked_email = sso
+        .as_ref()
+        .and_then(|l| l.record.get("email"))
         .and_then(|v| v.as_s().ok())
         .cloned()
         .unwrap_or_default();
-    let email = if okta.is_some() {
+    let email = if sso.is_some() {
         linked_email.as_str()
     } else {
         person.email.as_str()
     };
+    let okta_sub = sso.as_ref().and_then(|l| l.okta_sub.clone());
+    let entra = sso.as_ref().and_then(|l| l.entra.clone());
+    // How this sign-in came in, as every rule reads it.
+    let way_in = super::require_sso::way_in(via)
+        .with_okta_sub(okta_sub.clone())
+        .with_entra(entra.clone());
 
-    let okta_sub = okta
-        .and_then(|r| r.get("okta_sub"))
-        .and_then(|v| v.as_s().ok())
-        .cloned();
-    let (team_id, user_id, role, github_login) = if let Some(record) = okta {
-        if sign_in::applies() {
+    let (team_id, user_id, role, github_login) = if let Some(landing) = &sso {
+        let record = landing.record;
+        // A record made just now from an invite or a claim accepted through
+        // the provider (routes::require_sso) needs no join check.
+        if sign_in::applies() && !landing.joined_now {
             // Self-hosted: the linked member still passes the organization's
             // join rules, and lands on exactly their own record.
             let (rec_team, rec_user, _, _) = landing_parts(record);
@@ -1771,6 +1829,13 @@ pub(crate) async fn finish_oidc(
         }
         landing_parts(record)
     } else if sign_in::applies() {
+        // The organization requires Okta sign-in: nothing is joined or made.
+        if let Err(r) = super::require_sso::selfhost_pre_gate(state, &way_in)
+            .await
+            .map_err(|e| SignInFailure::new(p, Reason::Server, "okta_rule", e))?
+        {
+            return Ok(r.redirect(p, dash));
+        }
         let landed = selfhost_landing(state, email, &person.new_user_id, &person.name, "")
             .await
             .map_err(|e| SignInFailure::new(p, Reason::Server, "join", e))?;
@@ -1786,11 +1851,23 @@ pub(crate) async fn finish_oidc(
             return Ok(Redirect::temporary(&format!("{dash}?error=signup_limit")).into_response());
         }
         let existing = super::open_signup::drop_moved_invites(state, existing).await;
+        // Teams that require Okta sign-in are held back (records and invites).
+        let gated = super::require_sso::gated_teams(state, &existing, &way_in)
+            .await
+            .map_err(|e| SignInFailure::new(p, Reason::Server, "okta_rule", e))?;
+        let held = super::require_sso::filter(&existing, &gated);
+        let existing = held.kept;
         let accepted = accept_pending_invites(state, &existing, &person.new_user_id, email).await;
         let pool = landing_records(&existing, accepted);
         let own_id = person.new_user_id.trim_start_matches("USER#");
         match select_session_team(&pool, own_id) {
             Some(item) => landing_parts(item),
+            None if held.refused.is_some() => {
+                let team = held.refused.unwrap_or_default();
+                return Ok(super::require_sso::refused_for(state, &team)
+                    .await
+                    .redirect(p, dash));
+            }
             None => {
                 let tid = format!("TEAM#{}", ulid::Ulid::new().to_string().to_lowercase());
                 super::open_signup::set_default_limits(state, &tid).await;
@@ -1831,6 +1908,14 @@ pub(crate) async fn finish_oidc(
             }
         }
     };
+    // The last word of a team that requires Okta sign-in (an Okta sign-in
+    // passes; Microsoft doesn't).
+    if let Err(r) = super::require_sso::issue_check(state, &team_id, &way_in)
+        .await
+        .map_err(|e| SignInFailure::new(p, Reason::Server, "okta_rule", e))?
+    {
+        return Ok(r.redirect(p, dash));
+    }
     touch_last_login(state, &team_id, &user_id).await;
     let step = SecondStep {
         sub: user_id.clone(),
@@ -1841,6 +1926,7 @@ pub(crate) async fn finish_oidc(
         via: via.into(),
         jti: String::new(),
         okta_sub: okta_sub.clone(),
+        entra: entra.clone(),
         aud: String::new(),
         iat: 0,
         exp: 0,
@@ -1863,7 +1949,7 @@ pub(crate) async fn finish_oidc(
         email,
         &role,
         github_login.as_deref(),
-        &SignInProof::new(false, via).with_okta_sub(okta_sub.clone()),
+        &way_in,
         &state.secrets.jwt_secret,
         SESSION_TTL_SECS,
     )
@@ -1885,6 +1971,19 @@ pub async fn methods(State(state): State<Arc<AppState>>) -> Response {
     let okta = super::oidc_signin::okta_available(&state).await;
     let m = oauth_signin::sign_in_methods(self_hosted, github, microsoft, okta);
     let mut v = serde_json::to_value(m).unwrap_or_default();
+    // A self-hosted organization that requires single sign-on: the sign-in
+    // page shows only its provider (`okta` or `microsoft`). Hosted rules are
+    // per team, so the page learns them from a refused sign-in.
+    let required = if self_hosted {
+        sign_in::team_rule(&state, "")
+            .await
+            .ok()
+            .and_then(|r| r.require_sso)
+            .map(|p| p.slug())
+    } else {
+        None
+    };
+    v["sso_required"] = serde_json::json!(required);
     if self_hosted {
         // Where the sign-in page's emails come from, so a person can ask IT to let them in.
         v["senders"] = senders(&state).await;
@@ -2227,8 +2326,7 @@ pub(crate) async fn github_sign_in_with_token(
     // A session from a team's Okta (hosted) links no other sign-in: a GitHub
     // account linked here would sign in later without the team hold.
     if existing_claims.is_some()
-        && super::oidc_signin::signed_in_with_okta(existing_proof.via.as_deref())
-        && !super::setup_checks::self_hosted()
+        && super::oidc_signin::is_held(&existing_proof, super::setup_checks::self_hosted())
     {
         return Err(SignInFailure::new(
             P,
@@ -2237,7 +2335,28 @@ pub(crate) async fn github_sign_in_with_token(
             "GitHub connect from a session a team's Okta signed in",
         ));
     }
-    if let Some(claims) = existing_claims {
+    if let Some(mut claims) = existing_claims {
+        // The session must still stand, the same checks every API request
+        // makes: not ended (a removal, a reset, a role change), and allowed
+        // by its team's Okta rule. A session that no longer counts links
+        // nothing and is not renewed here.
+        claims = super::oidc_signin::mark_session(claims, &existing_proof);
+        if sign_in::check_member_session(state, &claims).await.is_err() {
+            return Err(SignInFailure::new(
+                P,
+                Reason::Expired,
+                "connect",
+                "GitHub connect from a session that has ended",
+            ));
+        }
+        if super::require_sso::check_claims(state, &claims, &existing_proof)
+            .await
+            .is_err()
+        {
+            return Ok(super::require_sso::refused_for(state, &claims.team_id)
+                .await
+                .redirect(P, common::public_urls::app_url(&state.config.stage)));
+        }
         // User is already logged in — connect GitHub to their account
         // Update their user record with github_id and github_login
         let _ = state
@@ -2415,6 +2534,16 @@ pub(crate) async fn github_sign_in_with_token(
     let email = pick_github_email(&user, &emails);
     let email = email.as_str();
     let normalized_email = normalize_email(email);
+    let dash = common::public_urls::app_url(&state.config.stage);
+    // A self-hosted organization that requires Okta sign-in: nothing is
+    // joined or made, and no session.
+    if let Err(r) =
+        super::require_sso::selfhost_pre_gate(state, &super::require_sso::way_in("github"))
+            .await
+            .map_err(|e| SignInFailure::new(P, Reason::Server, "okta_rule", e))?
+    {
+        return Ok(r.redirect(P, dash));
+    }
 
     // The person's records by GitHub id (every team: GSI1) and by the GitHub
     // account's email (GSI2). All of them: one picked at random was how a
@@ -2431,6 +2560,23 @@ pub(crate) async fn github_sign_in_with_token(
         )
         .await
     };
+    // Teams that require Okta sign-in are held back (hosted; a self-hosted
+    // organization that requires it was refused above).
+    let gated = super::require_sso::gated_teams(
+        state,
+        &by_github
+            .iter()
+            .chain(&by_email)
+            .cloned()
+            .collect::<Vec<_>>(),
+        &super::require_sso::way_in("github"),
+    )
+    .await
+    .map_err(|e| SignInFailure::new(P, Reason::Server, "okta_rule", e))?;
+    let held_gh = super::require_sso::filter(&by_github, &gated);
+    let held_email = super::require_sso::filter(&by_email, &gated);
+    let okta_refused = held_gh.refused.clone().or(held_email.refused.clone());
+    let (by_github, by_email) = (held_gh.kept, held_email.kept);
     // A self-hosted install: only the organization's own records, or a join
     // its rules allow; never a new team.
     let org_team = if sign_in::applies() {
@@ -2476,6 +2622,14 @@ pub(crate) async fn github_sign_in_with_token(
     };
 
     let has_existing_record = existing_user.is_some();
+    if !has_existing_record {
+        if let Some(team) = &okta_refused {
+            // Only teams that require Okta: no team is made instead.
+            return Ok(super::require_sso::refused_for(state, team)
+                .await
+                .redirect(P, dash));
+        }
+    }
 
     // A first sign-in from the organization of a team that lets people
     // connect AI tools as readers: a reader of that team (no seat, no
@@ -2487,6 +2641,18 @@ pub(crate) async fn github_sign_in_with_token(
                 super::github_webhook::resolve_team_by_installation(state, *inst_id).await
             {
                 if may_join_as_reader(crate::bases::readers_enabled(state, &owner).await, true) {
+                    // A team that requires Okta sign-in takes no reader
+                    // through GitHub.
+                    if sign_in::team_rule(state, &owner)
+                        .await
+                        .map_err(|e| SignInFailure::new(P, Reason::Server, "okta_rule", e))?
+                        .require_sso
+                        .is_some()
+                    {
+                        return Ok(super::require_sso::refused_for(state, &owner)
+                            .await
+                            .redirect(P, dash));
+                    }
                     info!(
                         github_login,
                         org = org.as_str(),
@@ -2745,6 +2911,14 @@ pub(crate) async fn github_sign_in_with_token(
     if sign_in::applies() {
         touch_last_login(state, &team_id, &user_id).await;
     }
+    // The last word of a team that requires Okta sign-in.
+    if let Err(r) =
+        super::require_sso::issue_check(state, &team_id, &super::require_sso::way_in("github"))
+            .await
+            .map_err(|e| SignInFailure::new(P, Reason::Server, "okta_rule", e))?
+    {
+        return Ok(r.redirect(P, dash));
+    }
     // The person's second factor, whichever it is, comes before a session,
     // on every deployment and whether or not a team requires it.
     let step = SecondStep {
@@ -2756,11 +2930,11 @@ pub(crate) async fn github_sign_in_with_token(
         via: "github".into(),
         jti: String::new(),
         okta_sub: None,
+        entra: None,
         aud: String::new(),
         iat: 0,
         exp: 0,
     };
-    let dash = common::public_urls::app_url(&state.config.stage);
     if let Some(resp) = sign_in::second_step(state, step, dash)
         .await
         .map_err(|e| SignInFailure::new(P, Reason::Server, "second_step", e))?
@@ -3232,7 +3406,19 @@ async fn issue_session_from_cognito(
 
     let cognito_sub = user.username();
 
+    let unavailable = |e: String| {
+        error!("Single sign-on rule not read: {e}");
+        StatusCode::SERVICE_UNAVAILABLE
+    };
     if sign_in::applies() {
+        // The organization requires single sign-on: a password never signs
+        // in, nothing is joined or made.
+        if let Err(r) = super::require_sso::selfhost_pre_gate(state, proof)
+            .await
+            .map_err(unavailable)?
+        {
+            return Ok(r.json());
+        }
         let landed = selfhost_landing(state, email, &format!("USER#{cognito_sub}"), "", "")
             .await
             .map_err(|e| {
@@ -3243,39 +3429,18 @@ async fn issue_session_from_cognito(
             return Ok(not_invited_json().into_response());
         };
         let (team_id, user_id, role, github_login) = landing_parts(&record);
-        touch_last_login(state, &team_id, &user_id).await;
-        // The member's second factor, whichever it is, comes before a session.
-        let step = SecondStep {
-            sub: user_id.clone(),
-            team_id: team_id.clone(),
-            email: email.to_string(),
-            role: role.clone(),
-            github_login: github_login.clone(),
-            via: "password".into(),
-            jti: String::new(),
-            okta_sub: None,
-            aud: String::new(),
-            iat: 0,
-            exp: 0,
-        };
-        if let Some(resp) = sign_in::password_step(state, step, proof.mfa)
-            .await
-            .map_err(|e| {
-                error!("Second factor not read: {e}");
-                StatusCode::SERVICE_UNAVAILABLE
-            })?
-        {
-            return Ok(resp);
-        }
-        return session_json(
+        return password_session(
             state,
-            &team_id,
-            &user_id,
+            Landed {
+                team_id,
+                user_id,
+                role,
+                github_login,
+            },
             email,
-            &role,
-            github_login.as_deref(),
             proof,
-        );
+        )
+        .await;
     }
 
     // Look up user by email (GSI2) — includes personal team + any pending invites
@@ -3295,6 +3460,13 @@ async fn issue_session_from_cognito(
 
     // An invite from a team that moved to its own install is never accepted here.
     let items = super::open_signup::drop_moved_invites(state, existing.items().to_vec()).await;
+    // Teams that require single sign-on are held back (records and invites):
+    // a password never signs in to them, whoever's it is.
+    let gated = super::require_sso::gated_teams(state, &items, proof)
+        .await
+        .map_err(unavailable)?;
+    let held = super::require_sso::filter(&items, &gated);
+    let items = held.kept;
 
     // Accept pending invites FIRST, so a teammate's first sign-in lands on the
     // team that invited them instead of minting a personal team that then
@@ -3307,6 +3479,12 @@ async fn issue_session_from_cognito(
     // team (see select_session_team) — else an invited teammate lands on their
     // empty personal team and gets prompted for an Anthropic key.
     let active_item = select_session_team(&pool, cognito_sub);
+    if active_item.is_none() {
+        if let Some(team) = &held.refused {
+            // Only teams that require Okta: no personal team is made instead.
+            return Ok(super::require_sso::refused_for(state, team).await.json());
+        }
+    }
 
     let (team_id, user_id, role, github_login) = if let Some(item) = active_item {
         let tid = item
@@ -3381,6 +3559,52 @@ async fn issue_session_from_cognito(
         (tid, uid, "owner".to_string(), None)
     };
 
+    password_session(
+        state,
+        Landed {
+            team_id,
+            user_id,
+            role,
+            github_login,
+        },
+        email,
+        proof,
+    )
+    .await
+}
+
+/// The member record a password sign-in landed on.
+struct Landed {
+    team_id: String,
+    user_id: String,
+    role: String,
+    github_login: Option<String>,
+}
+
+/// The end of a password sign-in, on both deployments: the single sign-on
+/// rule's last word (refused while the team requires it, for everyone, the
+/// owner included), then the member's second factor, then the session.
+async fn password_session(
+    state: &Arc<AppState>,
+    landed: Landed,
+    email: &str,
+    proof: &SignInProof,
+) -> Result<Response, StatusCode> {
+    let Landed {
+        team_id,
+        user_id,
+        role,
+        github_login,
+    } = landed;
+    if let Err(r) = super::require_sso::issue_check(state, &team_id, proof)
+        .await
+        .map_err(|e| {
+            error!("Single sign-on rule not read: {e}");
+            StatusCode::SERVICE_UNAVAILABLE
+        })?
+    {
+        return Ok(r.json());
+    }
     touch_last_login(state, &team_id, &user_id).await;
     // The person's second factor, whichever it is, comes before a session,
     // whether or not a team requires it.
@@ -3393,6 +3617,7 @@ async fn issue_session_from_cognito(
         via: "password".into(),
         jti: String::new(),
         okta_sub: None,
+        entra: None,
         aud: String::new(),
         iat: 0,
         exp: 0,
@@ -3968,8 +4193,9 @@ mod first_sign_in_tests {
         let start = src.find("pub async fn login_carry_over_code").unwrap();
         let end = start + src[start..].find("\n}\n").unwrap();
         let body = &src[start..end];
+        // Never counted as the second factor.
         assert!(body.contains("finish_password_login(&state, &email, &auth_result, false)"));
-        assert!(!body.contains("auth_result, true)"));
+        assert!(!body.contains("auth_result, true"));
     }
 
     use super::*;

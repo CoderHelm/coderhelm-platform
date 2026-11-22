@@ -680,6 +680,7 @@ Return ONLY the markdown body text."#,
             .unwrap_or("")
             .to_string();
         info!(pr_number = number, pr_url = %url, "Using existing PR");
+        retarget(github, msg, &pr_data).await;
         // A re-run changed the code: the description is rewritten from this
         // diff, never left describing the earlier version.
         if let Err(e) = crate::passes::description::save(
@@ -716,6 +717,7 @@ Return ONLY the markdown body text."#,
             .unwrap_or("")
             .to_string();
         info!(pr_number = number, pr_url = %url, "Reopened prior PR for branch");
+        retarget(github, msg, &pr_data).await;
         (number, url, nid)
     } else {
         // Squash the run's many per-tool-call commits into one clean commit
@@ -996,6 +998,69 @@ async fn notify_alert_pr(
         &msg.team_id,
     )
     .await;
+}
+
+/// The base a reused pull request (an open one of this branch, or a
+/// reopened one) moves to: the branch this run is built on, when that is
+/// another open pull request's branch of this repository (the run stacked
+/// on it) and the pull request targets something else. A pull request
+/// opened before the run stacked kept its old base: its diff showed the
+/// other pull request's whole change beside this one, while its description
+/// said it was stacked and showed only this change. Any other base (one a
+/// person chose, a long-lived branch) is left alone.
+pub fn stack_base(
+    pr: &serde_json::Value,
+    run_base: &str,
+    open: &[serde_json::Value],
+    owner: &str,
+    repo: &str,
+) -> Option<String> {
+    let current = pr["base"]["ref"].as_str().unwrap_or("");
+    if current == run_base || run_base.is_empty() {
+        return None;
+    }
+    let full = format!("{owner}/{repo}");
+    let own_head = pr["head"]["ref"].as_str().unwrap_or("");
+    open.iter()
+        .any(|p| {
+            p["head"]["ref"].as_str() == Some(run_base)
+                && run_base != own_head
+                && p["head"]["repo"]["full_name"]
+                    .as_str()
+                    .is_some_and(|f| f.eq_ignore_ascii_case(&full))
+        })
+        .then(|| run_base.to_string())
+}
+
+/// Moves a reused pull request onto the run's stacked base ([`stack_base`]).
+async fn retarget(github: &GitHubClient, msg: &TicketMessage, pr: &serde_json::Value) {
+    if pr["base"]["ref"].as_str() == Some(msg.base_branch.as_str()) {
+        return;
+    }
+    let Ok(open) = github
+        .list_open_pulls(&msg.repo_owner, &msg.repo_name)
+        .await
+    else {
+        return;
+    };
+    let Some(open) = open.as_array() else {
+        return;
+    };
+    let Some(base) = stack_base(pr, &msg.base_branch, open, &msg.repo_owner, &msg.repo_name) else {
+        return;
+    };
+    let number = pr["number"].as_u64().unwrap_or(0);
+    match github
+        .set_pull_base(&msg.repo_owner, &msg.repo_name, number, &base)
+        .await
+    {
+        Ok(()) => {
+            info!(pr_number = number, base = %base, "Moved the pull request onto the branch it is stacked on")
+        }
+        Err(e) => {
+            warn!(pr_number = number, base = %base, error = %e, "Could not move the pull request onto the branch it is stacked on")
+        }
+    }
 }
 
 /// Reopen the branch's prior closed-unmerged PR, if any. A ticket-update

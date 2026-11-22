@@ -183,37 +183,15 @@ impl Store {
     /// when the same signal was already recorded (a redelivered webhook).
     /// Best-effort callers log the error and carry on.
     pub async fn record(&self, e: &RewardEvent) -> Result<bool, String> {
-        if e.team_id.is_empty() || e.kind.is_none() || e.at.is_empty() {
-            return Err("an event needs a team, a kind and a time".into());
+        if !EventLog::add_once(self, e).await? {
+            return Ok(false);
         }
-        // One marker per signal, whatever time the source gives it: a
-        // redelivered webhook or a second click is refused here.
-        let ttl = chrono::Utc::now().timestamp() + super::event::KEEP_DAYS * 86_400;
-        let claim = self
-            .dynamo
-            .put_item()
-            .table_name(&self.table)
-            .item("pk", s(&e.team_id))
-            .item("sk", s(&super::event::seen_sk(&e.dedup)))
-            .item("record_type", s("reward_seen"))
-            .item("ttl", n(ttl))
-            .condition_expression("attribute_not_exists(sk)")
-            .send()
-            .await;
-        if let Err(err) = claim {
-            let msg = DisplayErrorContext(&err).to_string();
-            if msg.contains("ConditionalCheckFailed") {
-                return Ok(false);
-            }
-            return Err(msg);
-        }
-        self.dynamo
-            .put_item()
-            .table_name(&self.table)
-            .set_item(Some(e.to_item()))
-            .send()
-            .await
-            .map_err(|err| DisplayErrorContext(err).to_string())?;
+        EventLog::after_added(self, e).await;
+        Ok(true)
+    }
+
+    /// The counters an event feeds, once it was added.
+    async fn count_added(&self, e: &RewardEvent) {
         let kind = e.kind.unwrap_or(RewardKind::RereviewRequested);
         if kind.is_finding() && !e.repo.is_empty() && !e.category.is_empty() {
             if let Err(err) = self.bump_category(e).await {
@@ -225,7 +203,6 @@ impl Store {
                 warn!(error = %err, "Could not count the variant's outcome");
             }
         }
-        Ok(true)
     }
 
     /// Records each event; returns how many were new.
@@ -1539,6 +1516,157 @@ pub fn outcome_lesson_item(team_id: &str, l: &Lesson) -> Item {
         ("evidence".to_string(), list(&l.evidence)),
         ("reverted".to_string(), AttributeValue::Bool(l.reverted)),
     ])
+}
+
+// ── Each signal once, never lost ───────────────────────────────────────
+
+/// Where events are kept, each signal once.
+///
+/// The once-only marker and the event are written together or not at all:
+/// a marker written without its event (the second write failing) made every
+/// later try of the same outcome read "already scored", and the score was
+/// gone for good.
+#[async_trait::async_trait]
+pub trait EventLog: Send + Sync {
+    /// Adds the event unless its signal was already added: true when it
+    /// was added now, false when it was there already.
+    async fn add_once(&self, e: &RewardEvent) -> Result<bool, String>;
+
+    /// What follows an event added now (the counters it feeds). Best
+    /// effort: the event is kept either way.
+    async fn after_added(&self, _e: &RewardEvent) {}
+}
+
+fn check_event(e: &RewardEvent) -> Result<(), String> {
+    if e.team_id.is_empty() || e.kind.is_none() || e.at.is_empty() {
+        return Err("an event needs a team, a kind and a time".into());
+    }
+    Ok(())
+}
+
+#[async_trait::async_trait]
+impl EventLog for Store {
+    async fn add_once(&self, e: &RewardEvent) -> Result<bool, String> {
+        use aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError;
+        use aws_sdk_dynamodb::types::{Put, TransactWriteItem};
+        check_event(e)?;
+        // One marker per signal, whatever time the source gives it: a
+        // redelivered webhook, a second click or a retried score is refused
+        // here.
+        let ttl = chrono::Utc::now().timestamp() + super::event::KEEP_DAYS * 86_400;
+        let marker = Put::builder()
+            .table_name(&self.table)
+            .item("pk", s(&e.team_id))
+            .item("sk", s(&super::event::seen_sk(&e.dedup)))
+            .item("record_type", s("reward_seen"))
+            .item("ttl", n(ttl))
+            .condition_expression("attribute_not_exists(sk)")
+            .build()
+            .map_err(|err| err.to_string())?;
+        let event = Put::builder()
+            .table_name(&self.table)
+            .set_item(Some(e.to_item()))
+            .build()
+            .map_err(|err| err.to_string())?;
+        // The marker goes first: its cancellation reason is at index 0.
+        let sent = self
+            .dynamo
+            .transact_write_items()
+            .transact_items(TransactWriteItem::builder().put(marker).build())
+            .transact_items(TransactWriteItem::builder().put(event).build())
+            .send()
+            .await;
+        match sent {
+            Ok(_) => Ok(true),
+            Err(err) => {
+                let already = matches!(
+                    err.as_service_error(),
+                    Some(TransactWriteItemsError::TransactionCanceledException(c))
+                        if c.cancellation_reasons().first().and_then(|r| r.code())
+                            == Some("ConditionalCheckFailed")
+                );
+                if already {
+                    Ok(false)
+                } else {
+                    Err(DisplayErrorContext(&err).to_string())
+                }
+            }
+        }
+    }
+
+    async fn after_added(&self, e: &RewardEvent) {
+        self.count_added(e).await;
+    }
+}
+
+/// Adds each event once: how many were new, or the first error once every
+/// event was tried. An error means some signal is not kept yet, and the
+/// caller must try the outcome again (what was added counts nothing twice).
+pub async fn add_all_once<L: EventLog + ?Sized>(
+    log: &L,
+    events: &[RewardEvent],
+) -> Result<usize, String> {
+    let mut fresh = 0;
+    let mut first_error = None;
+    for e in events {
+        match log.add_once(e).await {
+            Ok(true) => {
+                log.after_added(e).await;
+                fresh += 1
+            }
+            Ok(false) => {}
+            Err(err) => {
+                warn!(kind = ?e.kind, error = %err, "Could not record a reward event");
+                first_error.get_or_insert(err);
+            }
+        }
+    }
+    match first_error {
+        Some(err) => Err(err),
+        None => Ok(fresh),
+    }
+}
+
+/// An event log in memory, for tests and incident cases: the same
+/// once-only rule, and a write that can be made to fail.
+#[derive(Default)]
+pub struct MemoryLog {
+    seen: std::sync::Mutex<std::collections::BTreeSet<String>>,
+    events: std::sync::Mutex<Vec<RewardEvent>>,
+    /// Writes still to fail, like a write the table refused.
+    pub failing: std::sync::atomic::AtomicUsize,
+}
+
+impl MemoryLog {
+    /// Every event kept.
+    pub fn events(&self) -> Vec<RewardEvent> {
+        self.events.lock().map(|e| e.clone()).unwrap_or_default()
+    }
+}
+
+#[async_trait::async_trait]
+impl EventLog for MemoryLog {
+    async fn add_once(&self, e: &RewardEvent) -> Result<bool, String> {
+        use std::sync::atomic::Ordering;
+        check_event(e)?;
+        let fail = self
+            .failing
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok();
+        if fail {
+            // Nothing of it is kept: neither the marker nor the event.
+            return Err("the write was refused".into());
+        }
+        let mut seen = self.seen.lock().map_err(|e| e.to_string())?;
+        if !seen.insert(super::event::seen_sk(&e.dedup)) {
+            return Ok(false);
+        }
+        self.events
+            .lock()
+            .map_err(|e| e.to_string())?
+            .push(e.clone());
+        Ok(true)
+    }
 }
 
 #[cfg(test)]

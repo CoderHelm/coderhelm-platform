@@ -6,6 +6,9 @@ pub mod agent_file;
 /// The agent log of a run: its file format, outcomes, order and redaction
 /// (worker writes it, gateway serves it).
 pub mod agent_log;
+/// The app map: CoderHelm's adapter around the vendored Floorplan map
+/// (`vendor/floorplan`): storage, CoderHelm's overlays and lookups.
+pub mod app_map;
 /// What a Chat question asks for (an orientation, a status, a how-to, a
 /// correction of Chat itself, ...), read before the model answers.
 pub mod chat_intent;
@@ -213,6 +216,8 @@ pub mod paged;
 pub mod placeholders;
 /// Which waiting plan tasks a merged run releases.
 pub mod plan_dependents;
+pub mod plan_state;
+pub mod plan_sync;
 /// Every body CoderHelm sends GitHub fits GitHub's limit.
 pub mod pr_body;
 pub mod pr_body_fit;
