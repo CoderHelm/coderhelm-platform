@@ -307,6 +307,16 @@ pub async fn token(
     )
     .await
     {
+        // A code swap makes a connection only while the consenting
+        // session's sign-in still meets the team's rules (Require single
+        // sign-on and its cut-off): one the rule now refuses is ended before
+        // its tokens go out.
+        Ok(Ok(t))
+            if form.grant_type.as_deref() == Some("authorization_code")
+                && refused_connection(&state, &store, &t.refresh_token).await =>
+        {
+            oauth_error(StatusCode::BAD_REQUEST, "invalid_grant", REFUSED_GRANT)
+        }
         Ok(Ok(t)) => {
             let mut r = Json(t).into_response();
             r.headers_mut()
@@ -321,14 +331,21 @@ pub async fn token(
     }
 }
 
+/// The one answer every refused code swap or refresh gets: nothing in it
+/// says which check refused it.
+const REFUSED_GRANT: &str = "The grant isn't valid. Connect the app again.";
+
 /// The answer to a refresh whose connection the team's sign-in rules now
-/// refuse (the connection is revoked), or `None` to go on.
+/// refuse (the connection is revoked), or `None` to go on. Only a refresh
+/// token that is the connection's current one can end
+/// it: a made-up token naming a connection's id changes nothing.
 async fn refused_refresh(
     state: &AppState,
     store: &impl oauth::OAuthStore,
     token: Option<&str>,
 ) -> Option<Response> {
-    let gid = token.and_then(oauth::refresh_grant_id)?;
+    let token = token?;
+    let gid = oauth::refresh_grant_id(token)?;
     let g = match store.get_grant(gid).await {
         Ok(Some(g)) if g.revoked_at.is_none() => g,
         Ok(_) => return None,
@@ -337,25 +354,69 @@ async fn refused_refresh(
             return Some(unavailable());
         }
     };
-    let rule = match super::sign_in::team_rule(state, &g.team_id).await {
-        Ok(r) => r,
-        Err(e) => {
-            error!(error = %e, "Sign-in rules not read; refresh refused");
-            return Some(unavailable());
-        }
-    };
-    if super::require_sso::session_stands(&rule, g.created_at_secs, &g.proof()) {
+    // The swap's own checks answer a token that isn't the connection's
+    // current one (a replaced one coming back ends it there).
+    if !oauth::is_current_refresh(&g, token) {
         return None;
     }
+    match connection_stands(state, &g).await {
+        Ok(true) => None,
+        Ok(false) => {
+            end_connection(store, &g).await;
+            Some(oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_grant",
+                REFUSED_GRANT,
+            ))
+        }
+        Err(r) => Some(r),
+    }
+}
+
+/// Whether a connection's sign-in still meets its team's rules.
+async fn connection_stands(state: &AppState, g: &oauth::StoredGrant) -> Result<bool, Response> {
+    match super::sign_in::team_rule(state, &g.team_id).await {
+        Ok(rule) => Ok(super::require_sso::session_stands(
+            &rule,
+            g.created_at_secs,
+            &g.proof(),
+        )),
+        Err(e) => {
+            error!(error = %e, "Sign-in rules not read; connection refused");
+            Err(unavailable())
+        }
+    }
+}
+
+async fn end_connection(store: &impl oauth::OAuthStore, g: &oauth::StoredGrant) {
     let at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    let _ = store
+    if let Err(e) = store
         .revoke_grant(&g.team_id, &g.id, "single sign-on required", &at)
-        .await;
-    Some(oauth_error(
-        StatusCode::BAD_REQUEST,
-        "invalid_grant",
-        "This connection no longer meets the team's sign-in rules, so it was ended. Connect it again.",
-    ))
+        .await
+    {
+        error!(error = %e, "Refused MCP connection not revoked");
+    }
+}
+
+/// After a code swap: whether the new connection is refused by its team's
+/// rules (and so ended). Any failure to tell refuses it.
+async fn refused_connection(
+    state: &AppState,
+    store: &impl oauth::OAuthStore,
+    refresh_token: &str,
+) -> bool {
+    let g = match oauth::refresh_grant_id(refresh_token) {
+        Some(gid) => match store.get_grant(gid).await {
+            Ok(Some(g)) => g,
+            _ => return true,
+        },
+        None => return true,
+    };
+    if matches!(connection_stands(state, &g).await, Ok(true)) {
+        return false;
+    }
+    end_connection(store, &g).await;
+    true
 }
 
 /// `grant_type=client_credentials` for a knowledge key (`crate::knowledge_keys`).
@@ -582,7 +643,7 @@ pub async fn decide_request(
         let rule = super::sign_in::team_rule(&state, &claims.team_id)
             .await
             .map_err(|e| internal("Sign-in rules not read", e))?;
-        if !super::require_sso::allowed(&rule, &proof) {
+        if !super::require_sso::session_stands(&rule, claims.iat, &proof) {
             let refused =
                 super::require_sso::refused(&state, &claims.team_id, rule.require_sso).await;
             return Err(super::require_sso::refused_json(&refused));
@@ -595,6 +656,7 @@ pub async fn decide_request(
             via: proof.via.clone(),
             okta_sub: proof.okta_sub.clone(),
             entra: proof.entra.clone(),
+            auth_time: Some(proof.signed_in_at(claims.iat)),
             allow_write: body.allow_write,
             allow_knowledge: body.allow_knowledge,
             lookups: oauth::lookup_grant(body.allow_scopes.as_deref(), &req.scopes),

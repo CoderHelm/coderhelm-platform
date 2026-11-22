@@ -1219,12 +1219,7 @@ async fn person_claims(state: &AppState, a: &mcp_oauth::Authorized) -> Result<Cl
     };
     let claims = crate::routes::oidc_signin::mark_session(claims, &a.grant.proof());
     crate::routes::sign_in::check_member_session(state, &claims).await?;
-    let proof = crate::auth::jwt::SignInProof {
-        mfa: a.grant.mfa,
-        via: a.grant.via.clone(),
-        okta_sub: a.grant.okta_sub.clone(),
-        entra: a.grant.entra.clone(),
-    };
+    let proof = a.grant.proof();
     crate::routes::sign_in::check_session(state, &claims, &proof, None, true).await?;
     Ok(claims)
 }
@@ -1552,12 +1547,7 @@ pub async fn post(
                         {
                             return r;
                         }
-                        let proof = crate::auth::jwt::SignInProof {
-                            mfa: a.grant.mfa,
-                            via: a.grant.via.clone(),
-                            okta_sub: a.grant.okta_sub.clone(),
-                            entra: a.grant.entra.clone(),
-                        };
+                        let proof = a.grant.proof();
                         if let Err(r) = crate::routes::sign_in::check_session(
                             &state, &claims, &proof, None, true,
                         )
@@ -2097,6 +2087,7 @@ mod tests {
             via: None,
             okta_sub: None,
             entra: None,
+            auth_time: None,
             refresh_hash: String::new(),
             prev_refresh_hash: None,
             refresh_expires_at: String::new(),

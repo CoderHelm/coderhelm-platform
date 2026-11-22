@@ -66,6 +66,12 @@ impl Store {
             .push((table.to_string(), pk.to_string()));
     }
 
+    /// Makes a query of `pk` in `table` for sort keys beginning with
+    /// `prefix` fail (a server error); other reads of `pk` work.
+    pub fn fail_prefix_queries(&self, table: &str, pk: &str, prefix: &str) {
+        self.fail_reads(table, &format!("{pk}|{prefix}"));
+    }
+
     fn read_fails(&self, table: &str, pk: Option<&str>) -> bool {
         let pk = pk.unwrap_or("");
         self.failing
@@ -458,9 +464,11 @@ fn apply(rows: &mut Vec<Obj>, w: &Value, kind: &str) -> Obj {
             item
         }
         "Delete" => {
+            // The removed item, as `ReturnValues: ALL_OLD` gives it back.
             let key = w["Key"].as_object().cloned().unwrap_or_default();
+            let old = rows.iter().find(|r| same_key(r, &key)).cloned();
             rows.retain(|r| !same_key(r, &key));
-            Obj::new()
+            old.unwrap_or_default()
         }
         "Update" => {
             let key = w["Key"].as_object().cloned().unwrap_or_default();
@@ -656,6 +664,19 @@ fn dynamo(store: &Store, op: &str, req: &Value) -> Response {
                 .and_then(|v| v["S"].as_str().map(str::to_string));
             if req["IndexName"].is_null() && store.read_fails(&table, first_value.as_deref()) {
                 return internal_error();
+            }
+            let prefix = parts
+                .get(1)
+                .and_then(|p| p.trim().strip_prefix("begins_with("))
+                .and_then(|p| p.trim_end_matches(')').split_once(','))
+                .map(|(_, v)| c.value(v.trim()))
+                .and_then(|v| v["S"].as_str().map(str::to_string));
+            if let (Some(pk), Some(prefix)) = (first_value.as_deref(), prefix.as_deref()) {
+                if req["IndexName"].is_null()
+                    && store.read_fails(&table, Some(&format!("{pk}|{prefix}")))
+                {
+                    return internal_error();
+                }
             }
             let filter = req["FilterExpression"].as_str().map(str::to_string);
             let mut sort = "sk".to_string();

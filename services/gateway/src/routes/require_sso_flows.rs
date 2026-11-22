@@ -477,6 +477,7 @@ async fn turning_on_writes_a_cut_off_that_turning_off_keeps_and_ends_connections
         via: Some(via.into()),
         okta_sub: (via == "okta").then(|| "o".into()),
         entra: None,
+        auth_time: None,
         refresh_hash: String::new(),
         prev_refresh_hash: None,
         refresh_expires_at: (chrono::Utc::now() + chrono::Duration::days(30)).to_rfc3339(),
@@ -563,6 +564,7 @@ async fn a_refresh_is_refused_and_the_connection_ended_when_the_rule_refuses_it(
         via: Some("google".into()),
         okta_sub: None,
         entra: None,
+        auth_time: None,
         refresh_hash: crate::mcp_oauth::hash(&token),
         prev_refresh_hash: None,
         refresh_expires_at: (chrono::Utc::now() + chrono::Duration::days(30)).to_rfc3339(),
@@ -3522,5 +3524,265 @@ async fn the_recovery_scripts_notice_waits_for_an_email_that_went_out() {
             .unwrap()
             .require_sso,
         None
+    );
+}
+
+/// A code approved from `via`'s session at `consented`, ready to swap.
+async fn approved_code(
+    w: &World,
+    via: &str,
+    consented: chrono::DateTime<chrono::Utc>,
+) -> (String, crate::mcp_oauth::StoredClient) {
+    use crate::mcp_oauth::tests as t;
+    use crate::mcp_oauth::OAuthStore;
+    let store = crate::mcp_oauth::store(&w.state);
+    let c = t::client(&t::Mem::default(), "https://app.example.com/callback");
+    store.put_client(&c).await.unwrap();
+    let req = crate::mcp_oauth::check_authorize(
+        &t::params(&c, "runs:read"),
+        Some(&c),
+        &crate::mcp_oauth::resource_for(t::ISSUER),
+    )
+    .unwrap();
+    let mut who = t::consent(GATED, "USER#1", false);
+    who.via = Some(via.into());
+    who.auth_time = Some(consented.timestamp() as u64);
+    let (code, stored) = crate::mcp_oauth::approve(&req, &c, &who, consented);
+    store.put_code(&stored).await.unwrap();
+    (code, c)
+}
+
+async fn swap(w: &World, code: &str, c: &crate::mcp_oauth::StoredClient) -> (StatusCode, Value) {
+    let body = format!(
+        "grant_type=authorization_code&code={}&code_verifier={}&client_id={}&redirect_uri={}",
+        urlencoding::encode(code),
+        crate::mcp_oauth::tests::VERIFIER,
+        urlencoding::encode(&c.client_id),
+        urlencoding::encode(&c.redirect_uris[0]),
+    );
+    let req = Request::builder()
+        .method("POST")
+        .uri("/oauth/token")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(Body::from(body))
+        .unwrap();
+    let res = w.app.clone().oneshot(req).await.unwrap();
+    let status = res.status();
+    let body = serde_json::from_slice(
+        &axum::body::to_bytes(res.into_body(), 1 << 20)
+            .await
+            .unwrap(),
+    )
+    .unwrap_or(Value::Null);
+    (status, body)
+}
+
+async fn team_connections(w: &World) -> Vec<crate::mcp_oauth::StoredGrant> {
+    use crate::mcp_oauth::OAuthStore;
+    crate::mcp_oauth::store(&w.state)
+        .list_grants(GATED)
+        .await
+        .unwrap()
+}
+
+/// Review: a code swap makes no connection the rule refuses. A code
+/// approved from a Google session, swapped once the rule is on, is refused
+/// with the one generic answer and its connection ended.
+#[tokio::test]
+async fn a_code_swap_runs_the_rule_and_makes_no_refused_connection() {
+    let w = world().await;
+    w.member(GATED, "USER#1", "ann@example.com", "member", &[]);
+    let (code, c) = approved_code(&w, "google", chrono::Utc::now()).await;
+    w.rule(GATED, true);
+    let (status, body) = swap(&w, &code, &c).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "invalid_grant");
+    assert!(body.get("access_token").is_none());
+    let made = team_connections(&w).await;
+    assert_eq!(made.len(), 1);
+    assert!(
+        made[0].revoked_at.is_some(),
+        "the refused connection is ended"
+    );
+    // An Okta consent swaps fine under the same rule.
+    let (code, c) = approved_code(&w, "okta", chrono::Utc::now()).await;
+    let (status, body) = swap(&w, &code, &c).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// Review: a connection is issued when the person said yes, not at the swap.
+/// A Google consent from before the cut-off, swapped after it (rule since
+/// turned off), stays refused; the grant records the consent time.
+#[tokio::test]
+async fn a_connection_takes_its_consent_time_so_the_cut_off_holds_at_the_swap() {
+    let w = world().await;
+    w.member(GATED, "USER#1", "ann@example.com", "member", &[]);
+    let consented = chrono::Utc::now() - chrono::Duration::seconds(120);
+    let (code, c) = approved_code(&w, "google", consented).await;
+    let cut = chrono::Utc::now().timestamp() as u64 - 60;
+    w.f.store.put(
+        "settings",
+        &[
+            ("pk", json!(GATED)),
+            ("sk", json!(super::sign_in::TEAM_RULE_SK)),
+            ("sso_cutoff_at", json!(cut)),
+            ("sso_cutoff_provider", json!("okta")),
+        ],
+    );
+    let (status, body) = swap(&w, &code, &c).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let g = team_connections(&w).await.remove(0);
+    assert_eq!(g.created_at_secs, consented.timestamp() as u64);
+    assert_eq!(g.auth_time, Some(consented.timestamp() as u64));
+}
+
+/// Review: the cut-off is held against when the session signed in, never
+/// against a token minted later. A session signed in before the cut-off but
+/// re-issued after it (a sliding refresh or a scoped token racing turn-on)
+/// stays refused.
+#[tokio::test]
+async fn a_session_re_issued_after_the_cut_off_keeps_its_sign_in_time() {
+    let w = world().await;
+    w.member(GATED, "USER#1", "ann@example.com", "member", &[]);
+    let now = chrono::Utc::now().timestamp() as u64;
+    let early = SignInProof::new(true, "google").with_auth_time(Some(now - 100));
+    // Re-issued now (iat = now), signed in 100 s ago.
+    let c = w.cookie(GATED, "USER#1", "ann@example.com", "member", &early);
+    w.f.store.put(
+        "settings",
+        &[
+            ("pk", json!(GATED)),
+            ("sk", json!(super::sign_in::TEAM_RULE_SK)),
+            ("sso_cutoff_at", json!(now - 50)),
+            ("sso_cutoff_provider", json!("okta")),
+        ],
+    );
+    assert_eq!(
+        w.call("GET", STATUS, &c, None).await.status,
+        StatusCode::UNAUTHORIZED
+    );
+    // Signed in after the cut-off: stands.
+    let late = SignInProof::new(true, "google").with_auth_time(Some(now - 10));
+    let c = w.cookie(GATED, "USER#1", "ann@example.com", "member", &late);
+    assert_eq!(w.call("GET", STATUS, &c, None).await.status, StatusCode::OK);
+    // Every re-issue passes the proof it read (sign-in time included) or,
+    // for a second factor, carries it.
+    let sf = include_str!("sign_in.rs");
+    let at = sf.find("pub fn session_with_second_factor(").unwrap();
+    assert!(sf[at..at + 1200].contains(".with_auth_time(current.map("));
+}
+
+/// Review: a refresh token that isn't the connection's own ends nothing.
+#[tokio::test]
+async fn a_made_up_refresh_token_never_ends_a_connection() {
+    let w = world().await;
+    use crate::mcp_oauth::OAuthStore;
+    let store = crate::mcp_oauth::store(&w.state);
+    let (code, c) = approved_code(&w, "google", chrono::Utc::now()).await;
+    let (status, tokens) = swap(&w, &code, &c).await;
+    assert_eq!(status, StatusCode::OK, "{tokens}");
+    let real = tokens["refresh_token"].as_str().unwrap();
+    let gid = crate::mcp_oauth::refresh_grant_id(real)
+        .unwrap()
+        .to_string();
+    w.rule(GATED, true);
+    let forged = crate::mcp_oauth::new_refresh(&gid);
+    let refresh = |t: String| {
+        Request::builder()
+            .method("POST")
+            .uri("/oauth/token")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(format!(
+                "grant_type=refresh_token&refresh_token={t}&client_id={}",
+                c.client_id
+            )))
+            .unwrap()
+    };
+    let res = w.app.clone().oneshot(refresh(forged)).await.unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        store
+            .get_grant(&gid)
+            .await
+            .unwrap()
+            .unwrap()
+            .revoked_at
+            .is_none(),
+        "not ended by a made-up token"
+    );
+    // The real one is refused by the rule, with the same answer a refused swap gets.
+    let res = w
+        .app
+        .clone()
+        .oneshot(refresh(real.to_string()))
+        .await
+        .unwrap();
+    let b: Value = serde_json::from_slice(
+        &axum::body::to_bytes(res.into_body(), 1 << 20)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(b["error"], "invalid_grant");
+    assert_eq!(
+        b["error_description"],
+        "The grant isn't valid. Connect the app again."
+    );
+    assert!(store
+        .get_grant(&gid)
+        .await
+        .unwrap()
+        .unwrap()
+        .revoked_at
+        .is_some());
+}
+
+/// Review: keys that can't be read never read as "no keys will be suspended".
+#[tokio::test]
+async fn unread_keys_are_said_as_unread_on_the_sign_in_page() {
+    let w = world().await;
+    w.okta(GATED, true);
+    w.member(
+        GATED,
+        "USER#o",
+        "o@example.com",
+        "owner",
+        &[("okta_issuer", json!(ISSUER)), ("okta_sub", json!("o"))],
+    );
+    let c = w.cookie(GATED, "USER#o", "o@example.com", "owner", &okta_proof("o"));
+    w.f.store
+        .fail_prefix_queries("settings", GATED, crate::api_keys::TEAM_SK_PREFIX);
+    let a = w.call("GET", "/api/sign-in", &c, None).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    for o in a.body["sso_options"].as_array().unwrap() {
+        assert!(o["suspended_keys"].is_null(), "{o}");
+        assert_eq!(o["keys_unread"], true);
+    }
+}
+
+/// Review: self-hosted, a key in another team follows its maker's link under
+/// the organization's provider setup.
+#[tokio::test]
+async fn a_self_hosted_key_in_another_team_uses_the_orgs_setup() {
+    let _self_hosted = crate::routes::setup_checks::test_self_hosted::set(true);
+    let w = world().await;
+    let _owner = selfhost_org(&w, true);
+    w.member(
+        OTHER,
+        "USER#mk",
+        "mk@example.com",
+        "admin",
+        &[("okta_issuer", json!(ISSUER)), ("okta_sub", json!("mk"))],
+    );
+    w.member(OTHER, "USER#un", "un@example.com", "admin", &[]);
+    assert!(
+        super::require_sso::key_maker_allowed(&w.state, OTHER, "USER#mk")
+            .await
+            .unwrap()
+    );
+    assert!(
+        !super::require_sso::key_maker_allowed(&w.state, OTHER, "USER#un")
+            .await
+            .unwrap()
     );
 }

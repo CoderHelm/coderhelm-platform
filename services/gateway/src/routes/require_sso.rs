@@ -249,13 +249,15 @@ pub fn allowed(rule: &Rule, proof: &SignInProof) -> bool {
 }
 
 /// Whether a session, scoped token or app connection issued at `iat` with
-/// `proof` still stands: the rule allows it now, and if it was issued
-/// before (or at) the last cut-off, it came from the provider required then.
-/// Pure.
+/// `proof` still stands: the rule allows it now, and if its sign-in (the
+/// proof's sign-in time, which every re-issue carries; `iat` when it has
+/// none) was before (or at) the last cut-off, it came from the provider
+/// required then. Pure.
 pub fn session_stands(rule: &Rule, iat: u64, proof: &SignInProof) -> bool {
     if !allowed(rule, proof) {
         return false;
     }
+    let iat = proof.signed_in_at(iat);
     match rule.sso_cutoff_provider {
         // Inclusive: a session from the very second of the cut-off is from
         // before it.
@@ -385,8 +387,20 @@ pub async fn key_maker_allowed(
         .await
         .map_err(|e| format!("{e}"))?
         .item;
-    let live = live_setup(state, team_id, p).await?;
+    let live = live_setup(state, &setup_team(state, team_id).await?, p).await?;
     Ok(key_maker_stands(&rule, member.as_ref(), live.as_ref()))
+}
+
+/// The team whose provider setups apply to `team_id`: on hosted the team
+/// itself; self-hosted the organization's, which every team on the install
+/// signs in through.
+pub async fn setup_team(state: &AppState, team_id: &str) -> Result<String, String> {
+    if sign_in::applies() {
+        if let Some(o) = sign_in::load_org(state).await? {
+            return Ok(o.team_id);
+        }
+    }
+    Ok(team_id.to_string())
 }
 
 /// The refusal for a suspended key (its maker isn't linked).
@@ -2307,7 +2321,7 @@ mod tests {
         let d = body(code(include_str!("mcp_oauth.rs")), "decide_request");
         assert!(before(
             d,
-            "require_sso::allowed(&rule, &proof)",
+            "require_sso::session_stands(&rule, claims.iat, &proof)",
             "oauth::approve("
         ));
         // An invite made while the rule is on waits to be accepted with Okta.

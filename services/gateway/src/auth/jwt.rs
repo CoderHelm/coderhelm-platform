@@ -21,6 +21,13 @@ pub struct SignInProof {
     /// is still the member's linked identity under the live setup.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entra: Option<String>,
+    /// When the person signed in, in seconds. Every re-issue of the session
+    /// (sliding refresh, switching team, ending other sessions, a second
+    /// factor, connecting GitHub, stream tokens) carries it unchanged, so the
+    /// single sign-on cut-off is held against the sign-in, never against a
+    /// token minted later. A token from before this reads its `iat` here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_time: Option<u64>,
 }
 
 impl SignInProof {
@@ -30,7 +37,27 @@ impl SignInProof {
             via: Some(via.to_string()),
             okta_sub: None,
             entra: None,
+            auth_time: None,
         }
+    }
+
+    /// The same, carrying the sign-in time of the session it re-issues.
+    pub fn with_auth_time(mut self, auth_time: Option<u64>) -> Self {
+        self.auth_time = auth_time;
+        self
+    }
+
+    /// When the sign-in happened: its recorded time, else `iat` (the token
+    /// can't be older than that), never later than `iat`.
+    pub fn signed_in_at(&self, iat: u64) -> u64 {
+        self.auth_time.map_or(iat, |a| a.min(iat))
+    }
+
+    /// The same, signed in at `now` when it carries no sign-in time yet.
+    fn stamped(&self, now: u64) -> Self {
+        let mut p = self.clone();
+        p.auth_time.get_or_insert(now);
+        p
     }
 
     /// The same, recording the team tenant identity the sign-in was for.
@@ -114,7 +141,7 @@ pub fn create_session_token(
         &Header::default(),
         &SessionToken {
             claims: &claims,
-            proof,
+            proof: &proof.stamped(now),
         },
         &EncodingKey::from_secret(secret.as_bytes()),
     )
@@ -125,12 +152,32 @@ pub fn create_session_token(
 pub fn read_proof(token: &str, secret: &str) -> SignInProof {
     let mut validation = Validation::default();
     validation.set_audience(&["coderhelm-dashboard"]);
-    decode::<SignInProof>(
+    proof_of(token, secret, &validation)
+}
+
+/// A token's proof beside its `iat`: a token from before sign-in times were
+/// recorded reads its `iat` as its sign-in time.
+#[derive(Deserialize)]
+struct ProofAndIat {
+    #[serde(flatten)]
+    proof: SignInProof,
+    #[serde(default)]
+    iat: u64,
+}
+
+fn proof_of(token: &str, secret: &str, validation: &Validation) -> SignInProof {
+    decode::<ProofAndIat>(
         token,
         &DecodingKey::from_secret(secret.as_bytes()),
-        &validation,
+        validation,
     )
-    .map(|t| t.claims)
+    .map(|t| {
+        let ProofAndIat { mut proof, iat } = t.claims;
+        if iat > 0 {
+            proof.auth_time = Some(proof.signed_in_at(iat));
+        }
+        proof
+    })
     .unwrap_or_default()
 }
 
@@ -243,7 +290,7 @@ pub fn create_scoped_token(
         &Header::default(),
         &SessionToken {
             claims: &scoped,
-            proof,
+            proof: &proof.stamped(now),
         },
         &EncodingKey::from_secret(secret.as_bytes()),
     )
@@ -254,13 +301,7 @@ pub fn create_scoped_token(
 pub fn read_scoped_proof(token: &str, audience: &str, secret: &str) -> SignInProof {
     let mut validation = Validation::default();
     validation.set_audience(&[audience]);
-    decode::<SignInProof>(
-        token,
-        &DecodingKey::from_secret(secret.as_bytes()),
-        &validation,
-    )
-    .map(|t| t.claims)
-    .unwrap_or_default()
+    proof_of(token, secret, &validation)
 }
 
 /// A token minted by [`create_scoped_token`] for `audience`.
@@ -410,13 +451,55 @@ mod tests {
     }
 
     #[test]
+    fn every_re_issue_keeps_the_sign_in_time() {
+        let secret = "test-jwt-secret-at-least-32-chars!";
+        // A session from an hour ago, re-issued now (any re-mint passes the
+        // proof it read): the sign-in time stays an hour ago.
+        let hour_ago = chrono::Utc::now().timestamp() as u64 - 3_600;
+        let read = SignInProof::new(false, "google").with_auth_time(Some(hour_ago));
+        let t = create_session_token("u", "t", "e", "member", None, &read, secret, 300).unwrap();
+        let again = read_proof(&t, secret);
+        assert_eq!(again.auth_time, Some(hour_ago));
+        let claims = validate_token(&t, secret).unwrap();
+        assert!(claims.iat > hour_ago);
+        assert_eq!(again.signed_in_at(claims.iat), hour_ago);
+        let scoped = create_scoped_token(&claims, &again, BRAIN_AUDIENCE, secret, 60).unwrap();
+        assert_eq!(
+            read_scoped_proof(&scoped, BRAIN_AUDIENCE, secret).auth_time,
+            Some(hour_ago)
+        );
+        // A token with no sign-in time (from before it was recorded) reads
+        // its iat, so a re-issue never makes it look newer.
+        let old = create_token("u", "t", "e", "member", None, secret, 300).unwrap();
+        let old_iat = validate_token(&old, secret).unwrap().iat;
+        let mut bare: serde_json::Value = serde_json::from_slice(
+            &base64::Engine::decode(
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                old.split('.').nth(1).unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(bare.as_object_mut().unwrap().remove("auth_time").is_some());
+        let unstamped = encode(
+            &Header::default(),
+            &bare,
+            &EncodingKey::from_secret(secret.as_bytes()),
+        )
+        .unwrap();
+        assert_eq!(read_proof(&unstamped, secret).auth_time, Some(old_iat));
+    }
+
+    #[test]
     fn a_session_carries_its_sign_in_proof_and_old_tokens_have_none() {
         let secret = "test-jwt-secret-at-least-32-chars!";
         let proof = SignInProof::new(true, "google");
         let t =
             create_session_token("u", "t", "e@x.com", "member", None, &proof, secret, 300).unwrap();
         assert_eq!(validate_token(&t, secret).unwrap().sub, "u");
-        assert_eq!(read_proof(&t, secret), proof);
+        let read = read_proof(&t, secret);
+        assert_eq!(read.clone().with_auth_time(None), proof);
+        assert!(read.auth_time.is_some(), "stamped at the sign-in");
         let old = create_token("u", "t", "e@x.com", "member", None, secret, 300).unwrap();
         assert!(!read_proof(&old, secret).mfa);
         // A proof is read only from a token signed with the secret.

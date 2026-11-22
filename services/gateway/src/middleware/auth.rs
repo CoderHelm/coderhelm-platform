@@ -243,12 +243,7 @@ async fn app_request(
     if let Err(ended) = sign_in::check_member_session(state, &claims).await {
         return ended;
     }
-    let proof = jwt::SignInProof {
-        mfa: caller.grant.mfa,
-        via: caller.grant.via.clone(),
-        okta_sub: caller.grant.okta_sub.clone(),
-        entra: caller.grant.entra.clone(),
-    };
+    let proof = caller.grant.proof();
     if let Err(held) = sign_in::check_session(state, &claims, &proof, handler, true).await {
         return held;
     }

@@ -1279,9 +1279,11 @@ pub fn session_with_second_factor(
         &claims.email,
         claims.session_role(),
         claims.github_login.as_deref(),
+        // The same sign-in, now with a second factor: its sign-in time too.
         &SignInProof::new(true, &via)
             .with_okta_sub(claims.okta_sub.clone())
-            .with_entra(current.and_then(|p| p.entra.clone())),
+            .with_entra(current.and_then(|p| p.entra.clone()))
+            .with_auth_time(current.map(|p| p.signed_in_at(claims.iat))),
         &state.secrets.jwt_secret,
         SESSION_TTL_SECS,
     )
@@ -2962,19 +2964,29 @@ pub async fn get_settings(
         .collect();
     // Keys follow their maker while single sign-on is required: for each
     // provider, the live keys that would be (or are) suspended.
+    // A list that can't be read says so: never "no keys will be suspended".
+    let mut keys_unread = false;
     let kb_keys = {
         use crate::knowledge_keys::KeyStore;
         crate::knowledge_keys::store(&state)
             .list(&claims.team_id)
             .await
-            .unwrap_or_default()
+            .unwrap_or_else(|e| {
+                tracing::error!(error = %e, "Knowledge keys not read for the sign-in page");
+                keys_unread = true;
+                Vec::new()
+            })
     };
     let api_makers: Vec<(String, String, String)> = {
         use crate::api_keys::KeyStore;
         crate::api_keys::store(&state)
             .list(&claims.team_id)
             .await
-            .unwrap_or_default()
+            .unwrap_or_else(|e| {
+                tracing::error!(error = %e, "API keys not read for the sign-in page");
+                keys_unread = true;
+                Vec::new()
+            })
             .iter()
             .filter(|k| k.is_live(now))
             .map(|k| (k.name.clone(), k.created_by.clone(), "api".to_string()))
@@ -3010,7 +3022,12 @@ pub async fn get_settings(
             })
             .map(|(name, _, kind)| json!({ "name": name, "kind": kind }))
             .collect();
-        view["suspended_keys"] = json!(suspended);
+        view["suspended_keys"] = if keys_unread {
+            Value::Null
+        } else {
+            json!(suspended)
+        };
+        view["keys_unread"] = json!(keys_unread);
     }
     Ok(Json(json!({
         "self_hosted": self_hosted,
@@ -4119,6 +4136,7 @@ mod tests {
             via: Some("google".into()),
             okta_sub: None,
             entra: None,
+            auth_time: None,
         };
         let passed = SignInProof::new(true, "github");
         // Off: everyone goes on.
