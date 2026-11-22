@@ -833,7 +833,7 @@ pub async fn recent_costs(
         .filter(|i| {
             matches!(
                 s(i, "status").as_str(),
-                "completed" | "success" | "merged" | "failed" | "closed" | "retried"
+                "completed" | "success" | "no_change" | "merged" | "failed" | "closed" | "retried"
             )
         })
         .map(|i| (s(i, "ticket_id"), n_f64(i, "cost_usd")))

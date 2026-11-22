@@ -215,7 +215,7 @@ pub const TOOLS: &[Tool] = &[
         schema: || {
             obj(
                 json!({
-                    "status": { "type": "string", "description": "Only runs in these statuses, comma separated: pending, running, awaiting_ci, awaiting_setup, completed, failed, needs_input, needs_outside_change, covered_by_pr, cancelled, retried, closed." },
+                    "status": { "type": "string", "description": "Only runs in these statuses, comma separated: pending, running, awaiting_ci, awaiting_setup, completed, failed, needs_input, needs_outside_change, covered_by_pr, no_change, cancelled, retried, closed." },
                     "repo": { "type": "string", "description": "Only runs in this repository, owner/name." },
                     "since": { "type": "string", "description": "Only runs started at or after this time (RFC 3339, or a date like 2026-11-01)." },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 100, "description": "Most runs to return. Default 20." },

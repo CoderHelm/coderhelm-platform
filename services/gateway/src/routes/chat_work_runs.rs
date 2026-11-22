@@ -63,9 +63,14 @@ impl Group {
             Group::Waiting => waiting.contains(&status),
             Group::Active => rs::IN_FLIGHT.contains(&status) || waiting.contains(&status),
             Group::Failed => status == rs::FAILED,
-            Group::Done => {
-                [rs::COMPLETED, rs::SUCCESS, rs::MERGED, rs::COVERED_BY_PR].contains(&status)
-            }
+            Group::Done => [
+                rs::COMPLETED,
+                rs::SUCCESS,
+                rs::MERGED,
+                rs::COVERED_BY_PR,
+                rs::NO_CHANGE,
+            ]
+            .contains(&status),
             Group::Stopped => [rs::CANCELLED, rs::CLOSED, rs::RETRIED].contains(&status),
         }
     }
@@ -258,6 +263,7 @@ pub fn status_words(status: &str) -> &'static str {
         rs::NEEDS_INPUT => "waiting on an answer from the team",
         rs::NEEDS_OUTSIDE_CHANGE => "waiting on a change outside its repository",
         rs::COVERED_BY_PR => "a pull request already does the work",
+        rs::NO_CHANGE => "finished; the code already does it, so no change was needed",
         rs::COMPLETED | rs::SUCCESS => "finished; its pull request is open or done",
         rs::MERGED => "finished; its pull request was merged",
         rs::FAILED => "stopped with an error",
