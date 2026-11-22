@@ -258,6 +258,7 @@ pub fn kind_of_tool(name: &str) -> &'static str {
         "read_skill" | "read_skill_file" | "ask_team_agent" => "skills",
         common::plugins::brain::ASK_TOOL => common::plugins::brain::SOURCE_KEY,
         n if super::chat_work::is_work_tool(n) => super::chat_work::SOURCE_KEY,
+        super::chat_setup::SETUP => super::chat_work::SOURCE_KEY,
         n if n.starts_with("github__") || n.starts_with("graph_") => "code",
         n if n.contains("__") => "connections",
         _ => "data_sources",
@@ -1314,18 +1315,30 @@ fn user_folder(user_id: &str) -> String {
 
 // ── Asking ──────────────────────────────────────────────────────────────────
 
-const CHAT_SYSTEM: &str = r#"You are Chat, the assistant for a software team that uses Coderhelm. You answer questions about the team's work from the team's own sources: their code (which you read with your tools), passages from their knowledge bases, files attached to the question, and the results of tools for connected apps, past work, data sources and team skills.
+const CHAT_SYSTEM: &str = r#"You are Chat, the assistant for a software team that uses Coderhelm. You answer questions about the team's work from the team's own sources: their code (which you read with your tools), passages from their knowledge bases, files attached to the question, Coderhelm's own records of the team, and the results of tools for connected apps, past work, data sources and team skills.
+
+Understand the question first:
+- Before any lookup, work out what the person is asking for: an orientation (they are new, or ask what Coderhelm can do for them), whether you or Coderhelm can do something, what is waiting on them, where some work stands, how to do something, a specific fact, your judgement on something, small talk, or a correction of something you said. Work out who is asking (the role they say they hold, or that the question implies) and what they need from the answer. A note before the question says how it reads; check it against the question, and when the question asks something else, answer what it asks.
+- Answer the question that was asked, first, and size the answer to it: a yes-or-no question gets yes or no in the first sentence, a greeting gets a sentence, a fact gets the fact and then the detail that supports it. Related things come after, briefly, and only when they help. Never lead with something they didn't ask for.
+- A fixed answer shape (such as the "what's waiting on you" list) is only for the question it was made for. When a lookup returns more than the question needs, use only what answers it.
+- An orientation is a real answer about them: call coderhelm_setup, say what Coderhelm already does for their team from what it found, then a few things it can do for someone in their role, each with a question they could ask. Not their to-do list, and not one ticket's details, unless they asked.
+
+Check before you claim:
+- Every claim about what is connected, set up or allowed, about counts, or about where something stands rests on a lookup made in this answer, cited. Don't repeat such a claim from an earlier answer in the thread without checking it again now.
+- When a check fails, say exactly which check failed and what it said ("the ticket lookup returned an error"), never a broader claim it doesn't support ("Jira isn't connected"). A check that couldn't run says nothing about whether the thing is set up.
+- When the person says something you said is wrong, or asks what you meant, check that point again now with the tool that can, say plainly in your first sentence whether you were wrong and what is right, and then answer what they asked. Don't defend the earlier answer, and don't guess at causes you can't see.
 
 How to work:
-- Research before you answer. You can take many steps: look a repository over, list folders, read files, search the code, follow imports, read more. Keep going until you can answer from what you read. Most code questions need several reads.
+- Research before you answer a question about the team's code, docs or work. You can take many steps: look a repository over, list folders, read files, search the code, follow imports, read more. Keep going until you can answer from what you read. Most code questions need several reads. Small talk needs no lookups.
 - The team's repositories are listed below. When the question names one, by its full or short name however it is written, it means that repository. Open it with github__repo_overview; don't search the code or the code graph for the repository's own name.
 - "How is X put together?" (built, structured, organized): look it over, then read the entry points and the files that tie it together (app or server setup, routing, main modules, configuration). Explain the main parts, what each does, and how a request or a job moves through them.
 - "Where is X handled?": search the code for the words and the likely names, read the matching files to confirm, and name the file and the function.
 - "What does file Y do?": read it (in ranges when it is long) and the files it leans on when that matters.
 - Never hand work back. Don't ask the person to open, read, paste or attach a file, to say which repository or who owns it, or to look something up: your tools do that. When a tool fails, try another way (another path, a search, the file listing). Say something isn't there only after you looked, and say where you looked.
 - Ask the person only for what no tool can reach, such as a decision or a preference.
-- The team's own work lives in the work tools (work_needs_me, work_tickets, work_pull_requests, work_runs, work_findings, work_records), not in the code or the docs. "What's the latest on X", "where are we on", "status of", a ticket key, a pull request number, a run, "what's running", a CVE id or a package, a quoted title: look it up there first (the ticket, then its pull requests and Coderhelm's runs on it), then read code or docs only for context. Give a dated status: say when each record last changed. Never say there's nothing on it before you searched the tickets, pull requests and runs. Once a record gives you a ticket key or a pull request number, look the rest up by that key or number, not by the title again.
-- What is waiting on the person asking ("what needs my answer", "what needs me", "what's on my plate", "what should I work on", their reviews, their tickets, "am I blocking anyone"): call work_needs_me first, once. It finds who they are and reads Coderhelm's runs, approvals, Jira and GitHub for them. Answer in the shape its result gives: the count line, then the groups most urgent first, one line per item with its link and exactly what to do, a run's questions with their options, then a plain sentence for each source it couldn't read.
+- The team's own work lives in the work tools (work_needs_me, work_tickets, work_pull_requests, work_runs, work_findings, work_records), not in the code or the docs. "What's the latest on X", "where are we on", "status of", a ticket key, a pull request number or link, a run, "what's running", a CVE id or a package, a quoted title: look it up there first (the ticket, then its pull requests and Coderhelm's runs on it), then read code or docs only for context. Give a dated status: say when each record last changed. Never say there's nothing on it before you searched the tickets, pull requests and runs. Once a record gives you a ticket key or a pull request number, look the rest up by that key or number, not by the title again.
+- Only when the question asks what is waiting on the person asking ("what needs my answer", "what needs me", "what's on my plate", "what should I work on", their reviews, their tickets, "am I blocking anyone"): call work_needs_me first, once, and answer in the shape its result gives: the count line, then the groups most urgent first, one line per item with its link and exactly what to do, a run's questions with their options, then a plain sentence for each source it couldn't read.
+- What Coderhelm is set up to do for the team (connections, repositories, knowledge bases, how much it did lately, what you can read and what you can't do) is in coderhelm_setup.
 - When a lookup the answer needed couldn't be read and no other way found it, say so in one short sentence in the answer (which records, such as "Coderhelm's runs couldn't be read just now"), then answer from what you did read. Don't mention a failed lookup that another one made up for.
 - Don't guess a field, column, type or property name. Before you query a data source, a CMS or a database, read its schema (its describe, schema or mapping tool) and query with the names it lists.
 
@@ -1337,7 +1350,7 @@ Citations:
 How to write:
 - Lead with the answer in a sentence or two, then the details. Use a short list or a few short sections when it helps; no headings for a short answer.
 - Name real files and functions in backticks, like `src/app/page.tsx`. Quote code only when it helps: a short fenced block with its language and the file's path as its title, like ```ts title="src/app/page.tsx"
-- Write for the whole team, in plain words; explain a technical term in a few words the first time."#;
+- Write for the person asking, in plain words; explain a technical term in a few words the first time."#;
 
 /// The system prompt: how to work, and the repositories this question may
 /// read (with what each is for).
@@ -1451,6 +1464,13 @@ struct Run {
     /// The team's work (tickets, pull requests, runs, findings) as this
     /// asker may read it; `None` when the question doesn't read it.
     work: Option<super::chat_work::Ctx>,
+    /// What the question asks for, read with the thread before it.
+    understood: super::chat_understand::Understood,
+    /// The asker's Coderhelm role, and whether a GitHub account is linked.
+    role: String,
+    github_linked: bool,
+    /// The knowledge bases the asker may read, by name.
+    kb_names: Vec<String>,
 }
 
 impl Run {
@@ -1603,6 +1623,8 @@ fn tool_defs(run: &Run) -> Vec<Value> {
             w.github_token.is_some(),
         ));
     }
+    // What Coderhelm is set up to do for the team: every question may ask.
+    tools.push(super::chat_setup::def());
     tools.extend(
         run.worker
             .tools
@@ -1631,6 +1653,7 @@ fn tool_label(name: &str, input: &Value) -> String {
         MEMORY_TOOL => format!("Searched past work in {}", short_repo(&s("repo"))),
         common::plugins::brain::ASK_TOOL => format!("Asked the {} plugin", s("plugin")),
         n if super::chat_work::is_work_tool(n) => super::chat_work::label(n, input),
+        super::chat_setup::SETUP => "Checked Coderhelm's setup for the team".into(),
         n if n.starts_with("graph_") => chat_code::graph_label(n, input),
         n if n.contains("__") => {
             let (server, tool) = n.split_once("__").unwrap_or((n, ""));
@@ -1780,6 +1803,9 @@ async fn run_tool(
     input: &Value,
 ) -> (String, String, bool) {
     let kind = kind_of_tool(name);
+    if name == super::chat_setup::SETUP {
+        return setup(run, reg).await;
+    }
     if !run.picks.allows(kind) {
         return (
             "That source isn't part of this question.".into(),
@@ -1980,6 +2006,94 @@ async fn run_tool(
             (reg.render(&[id]), summarize_tool_result(&result), false)
         }
     }
+}
+
+/// The team's setup, checked now (`chat_setup`): each connection with the
+/// test the integrations page uses, the runs counted, the records counted
+/// as the asker may see them.
+async fn setup(run: &Run, reg: &mut Registry) -> (String, String, bool) {
+    use super::chat_setup as cs;
+    let state = &run.state;
+    let (installation, token, jira) = match &run.work {
+        Some(w) => (w.installation_id, w.github_token.is_some(), w.jira.clone()),
+        None => {
+            let (id, jira) = tokio::join!(
+                super::graph::installation_id(state, &run.team_id),
+                super::chat_work_tickets::load(state, &run.team_id),
+            );
+            let token = match id {
+                Some(_) => github_token(state, &run.team_id).await.is_some(),
+                None => false,
+            };
+            (id, token, jira)
+        }
+    };
+    let (runs, records) = match &run.work {
+        Some(w) => {
+            let runs = async {
+                if super::chat_work::may(&w.readable, "runs") {
+                    Some(
+                        Box::pin(super::chat_work_runs::tally(
+                            state,
+                            &run.team_id,
+                            cs::RUN_DAYS,
+                        ))
+                        .await,
+                    )
+                } else {
+                    None
+                }
+            };
+            tokio::join!(runs, cs::count_records(w))
+        }
+        None => (None, Vec::new()),
+    };
+    let mut servers: Vec<String> = run
+        .mcp_tools
+        .iter()
+        .filter_map(|t| {
+            t["name"]
+                .as_str()?
+                .split_once("__")
+                .map(|(s, _)| s.to_string())
+        })
+        .filter(|s| s != "github")
+        .collect();
+    servers.sort();
+    servers.dedup();
+    let mut connections = vec![
+        cs::Connection {
+            name: "GitHub".into(),
+            check: cs::github_check(installation, token, run.repos.len()),
+        },
+        cs::Connection {
+            name: "Jira".into(),
+            check: cs::jira_check(&jira),
+        },
+    ];
+    connections.extend(cs::app_checks(&servers, &run.missing));
+    let mut repos: Vec<String> = run.repos.keys().cloned().collect();
+    repos.sort();
+    let reads: Vec<String> = SOURCE_KINDS
+        .iter()
+        .filter(|k| run.picks.allows(k.key))
+        .filter(|k| k.key != "code" || run.github_token.is_some())
+        .map(|k| k.label.to_string())
+        .collect();
+    let found = cs::Setup {
+        checked_at: live_stamp(),
+        role: run.role.clone(),
+        can_change_integrations: run.is_admin,
+        github_linked: run.github_linked,
+        connections,
+        repos,
+        knowledge: run.kb_names.clone(),
+        runs,
+        records,
+        reads,
+    };
+    let (text, summary) = cs::render(&found, reg);
+    (text, summary, false)
 }
 
 /// Chat's tools behind the agent permission gate: every call is asked of
@@ -2373,18 +2487,19 @@ pub async fn brain_stream(
         crate::bases::decide_all(&who, &auds, None)
     };
     let base_open = |k: &str| open.get(k).is_some_and(crate::bases::Decision::is_open);
-    let readable: Vec<String> = if base_open(crate::lookups::TEAM) {
+    let readable_bases = if base_open(crate::lookups::TEAM) {
         super::knowledge::chat_readable(
             st.bases(&claims.team_id).await.unwrap_or_default(),
             &holder,
             &me,
         )
-        .into_iter()
-        .map(|b| b.id)
-        .collect()
     } else {
         Vec::new()
     };
+    let readable: Vec<String> = readable_bases.iter().map(|b| b.id.clone()).collect();
+    // What the question asks for, with the thread before it: it decides
+    // the answer's shape, where it must look, and the notes.
+    let understood = super::chat_understand::read(&question, &history);
     let all_repos = load_repos(&state, &claims.team_id).await;
     let repo_names: Vec<String> = all_repos.iter().map(|r| r.name.clone()).collect();
     let picks = resolve_picks(
@@ -2495,12 +2610,14 @@ pub async fn brain_stream(
             installation_id,
             jira,
             caller: common::github_budget::caller::CHAT,
+            needs_shape: understood.needs_shape(),
         })
     } else {
         None
     };
     // Code reads only when the question reads code.
     let github = github.filter(|_| picks.code && !code_repos.is_empty());
+    let picks_kbs = picks.knowledge.clone();
     let run = Run {
         state: state.clone(),
         team_id: claims.team_id.clone(),
@@ -2523,6 +2640,17 @@ pub async fn brain_stream(
         run_note: run_note(&state, &claims.team_id, &mentioned_runs(&body.mentions)).await,
         found: std::sync::Mutex::new(Vec::new()),
         work,
+        kb_names: readable_bases
+            .iter()
+            .filter(|b| picks_kbs.contains(&b.id))
+            .map(|b| b.name.clone())
+            .collect(),
+        understood,
+        role: claims.role.clone(),
+        github_linked: claims
+            .github_login
+            .as_deref()
+            .is_some_and(|l| !l.trim().is_empty()),
     };
 
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(256);
@@ -2790,9 +2918,10 @@ async fn answer(
     .await;
 
     let mut tools = tool_defs(run);
-    // What the question names puts the tool that holds the answer first.
-    let hints = super::chat_hints::read(question);
-    super::chat_work::put_first(&mut tools, &hints);
+    // What the question names and asks for puts the tool that holds the
+    // answer first.
+    let understood = &run.understood;
+    understood.order(&mut tools, question);
     // Agent permissions: a connection the asker can't use yet is offered as
     // a sign-in card, and every call is asked of the gate first.
     if let Some(t) = super::chat_policy::sign_in_tool(&run.missing) {
@@ -2817,10 +2946,11 @@ async fn answer(
 
     let mut notes = mention_note(&run.code_repos, question);
     let offered: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
-    notes.push_str(&super::chat_work::hint_note(&hints, &offered));
-    // A status question's answer is in the tickets, pull requests and runs:
-    // an answer that found nothing without looking there goes back once.
-    let must_look = super::chat_work::must_look(&hints, &offered);
+    notes.push_str(&understood.notes(&offered));
+    // A status question's answer is in the tickets, pull requests and runs,
+    // an orientation's in the team's setup, a correction's in a check made
+    // now: an answer that didn't look there goes back once.
+    let must_look = understood.must_look(&offered, question);
     notes.push_str(&run.run_note);
     if !problems.is_empty() {
         notes.push_str(&format!(
@@ -2864,7 +2994,9 @@ async fn answer(
         question,
         limits: chat_agent::LIMITS,
         must_look,
+        uncited_ok: understood.uncited_ok(),
     };
+    info!(team_id = %run.team_id, intent = understood.intent().key(), "Chat: the question reads");
     let out = chat_agent::run(&model, &mut toolbox, sink, &mut reg, ask)
         .await
         .ok()?;

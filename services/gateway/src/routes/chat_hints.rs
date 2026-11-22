@@ -21,6 +21,10 @@ static GHSA: LazyLock<Regex> =
 static PR_NUMBER: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)(?:\bpull request|\bPR|\bpull|\bmerge request|\bMR)\s*(?:number\s*)?#?\s*([0-9]{1,7})\b|(?:^|[\s(])#([0-9]{1,7})\b").unwrap()
 });
+/// A link to a pull request on GitHub, and to a comment on it.
+static PR_LINK: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)https?://github\.com/([a-z0-9_.-]+)/([a-z0-9_.-]+)/pull/([0-9]{1,7})(?:/[a-z]+)?(#(?:issuecomment|discussion_r|pullrequestreview)-?[0-9]+)?").unwrap()
+});
 static QUOTED: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new("\"([^\"]{4,200})\"|\u{201c}([^\u{201d}]{4,200})\u{201d}|\u{2018}([^\u{2019}]{4,200})\u{2019}|`([^`]{4,200})`")
         .unwrap()
@@ -136,6 +140,10 @@ pub struct Hints {
     /// CVE and GHSA ids, upper case.
     pub advisories: Vec<String>,
     pub quoted: Vec<String>,
+    /// Repositories a linked pull request is in (`owner/name`).
+    pub repos: Vec<String>,
+    /// It links to a comment or review on a pull request.
+    pub comment_link: bool,
     /// It asks where something stands.
     pub status: bool,
     /// It asks what is running now.
@@ -173,6 +181,13 @@ pub fn read(question: &str) -> Hints {
             continue;
         }
         push_unique(&mut h.tickets, key);
+    }
+    for c in PR_LINK.captures_iter(q) {
+        if let Ok(n) = c[3].parse::<u64>() {
+            push_unique(&mut h.prs, n);
+        }
+        push_unique(&mut h.repos, format!("{}/{}", &c[1], &c[2]));
+        h.comment_link |= c.get(4).is_some();
     }
     for c in PR_NUMBER.captures_iter(q) {
         if let Some(n) = c
@@ -298,6 +313,17 @@ mod tests {
         assert!(read("Do we decode UTF-8 and hash with SHA-256?")
             .tickets
             .is_empty());
+    }
+
+    #[test]
+    fn a_pull_request_link_names_its_number_repository_and_comment() {
+        let h = read("is this comment accurate https://github.com/acme/web/pull/1450#issuecomment-6450165666");
+        assert_eq!(h.prs, [1450]);
+        assert_eq!(h.repos, ["acme/web"]);
+        assert!(h.comment_link && h.about_work());
+        let h = read("look at https://github.com/acme/web/pull/7/files please");
+        assert_eq!(h.prs, [7]);
+        assert!(!h.comment_link);
     }
 
     #[test]

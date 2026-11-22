@@ -9,6 +9,9 @@ pub mod agent_log;
 /// The app map: CoderHelm's adapter around the vendored Floorplan map
 /// (`vendor/floorplan`): storage, CoderHelm's overlays and lookups.
 pub mod app_map;
+/// What a Chat question asks for (an orientation, a status, a how-to, a
+/// correction of Chat itself, ...), read before the model answers.
+pub mod chat_intent;
 /// A repository's code map: sections stamped with the commit they describe,
 /// rebuilt only where a change touched them, given to the planner and coder.
 pub mod code_map;

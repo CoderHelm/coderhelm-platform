@@ -996,6 +996,7 @@ async fn connect(
             installation_id,
             jira,
             caller: common::github_budget::caller::MCP,
+            needs_shape: true,
         },
         repos,
         repos_withheld,

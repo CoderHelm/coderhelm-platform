@@ -713,6 +713,8 @@ pub async fn ask(
             retries: 0,
         },
         must_look: None,
+        // A map answer always cites the map; it is never small talk.
+        uncited_ok: false,
     };
     let out = chat_agent::run(&model, &mut tools, &Quiet, &mut reg, ask)
         .await
