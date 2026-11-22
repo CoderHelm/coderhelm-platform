@@ -85,6 +85,12 @@ pub async fn list_plans(
         });
     let mut plans: Vec<Plan> = Vec::new();
     let mut next_cursor: Option<String> = None;
+    // Rows written before the derived state existed, or open work last
+    // derived a while ago, are derived again here: this is the backfill, a
+    // few plans per page so the list stays fast.
+    let now = chrono::Utc::now().to_rfc3339();
+    let store = plan_store(&state);
+    let mut refreshed = 0usize;
     'pages: loop {
         let result = state
             .dynamo
@@ -116,7 +122,21 @@ pub async fn list_plans(
                 break 'pages;
             }
             next_cursor = Some(sk.to_string());
-            plans.push(plan_of(item));
+            let mut plan = plan_of(item);
+            if refreshed < LIST_REFRESHES
+                && common::plan_sync::needs_refresh(item, &now, LIST_STALE_MINUTES)
+            {
+                refreshed += 1;
+                let id = plan.plan_id.clone().unwrap_or_default();
+                match common::plan_sync::refresh(&store, &claims.team_id, &id, &now).await {
+                    Ok(Some(r)) => apply_view(&mut plan, &r),
+                    Ok(None) => {}
+                    Err(e) => {
+                        warn!(plan_id = %id, error = %e, "Could not refresh the plan's state")
+                    }
+                }
+            }
+            plans.push(plan);
         }
         match result.last_evaluated_key() {
             Some(key) => start = Some(key.clone()),
@@ -133,6 +153,152 @@ pub async fn list_plans(
         next: next_cursor.clone(),
         next_cursor,
     }))
+}
+
+/// Plans the list derives again per page, at most.
+const LIST_REFRESHES: usize = 8;
+/// An open plan last derived this long ago is derived again by the list.
+const LIST_STALE_MINUTES: i64 = 10;
+
+/// Where plan state is read and written (`common::plan_sync`).
+pub(crate) fn plan_store(state: &AppState) -> common::plan_sync::Dynamo {
+    common::plan_sync::Dynamo {
+        dynamo: state.dynamo.clone(),
+        plans_table: state.config.plans_table_name.clone(),
+        runs_table: state.config.runs_table_name.clone(),
+        settings_table: state.config.settings_table_name.clone(),
+    }
+}
+
+/// Derives a plan's state again and writes it. Best effort.
+pub(crate) async fn refresh_plan(
+    state: &AppState,
+    team_id: &str,
+    plan_id: &str,
+) -> Option<common::plan_sync::Refreshed> {
+    let now = chrono::Utc::now().to_rfc3339();
+    match common::plan_sync::refresh(&plan_store(state), team_id, plan_id, &now).await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(plan_id, error = %e, "Could not refresh the plan's state");
+            None
+        }
+    }
+}
+
+/// A plan's numbers from a fresh derivation.
+fn apply_view(plan: &mut Plan, r: &common::plan_sync::Refreshed) {
+    let v = &r.plan;
+    plan.state = Some(v.state.code().to_string());
+    plan.status = Some(v.state.legacy_status().to_string());
+    plan.summary = Some(v.summary.clone());
+    plan.counts = Some(v.counts.clone());
+    plan.needs_count = v.needs.len() as u64;
+    plan.cost_usd = Some(round_cents(v.cost_usd));
+    plan.attempts = Some(v.attempts as u64);
+    plan.criteria_met = Some(r.criteria.iter().filter(|c| c.met).count() as u64);
+    plan.criteria_count = Some(r.criteria.len() as u64);
+    plan.last_activity_at = Some(v.last_activity.clone()).filter(|s| !s.is_empty());
+}
+
+fn round_cents(v: f64) -> f64 {
+    (v * 100.0).round() / 100.0
+}
+
+/// A GitHub pull request event moved a plan task's work: refresh its plan.
+/// Pull requests opened, reviewed, checked, merged and closed all land
+/// here (`github_webhook::dispatch`). Only runs that belong to a plan cost
+/// more than the one lookup.
+pub(crate) async fn on_pr_event(
+    state: &AppState,
+    team_id: &str,
+    event_type: &str,
+    payload: &Value,
+) {
+    let repo = payload["repository"]["full_name"].as_str().unwrap_or("");
+    let Some((owner, name)) = repo.split_once('/') else {
+        return;
+    };
+    let numbers: Vec<u64> = match event_type {
+        "pull_request" | "pull_request_review" => payload["pull_request"]["number"]
+            .as_u64()
+            .into_iter()
+            .collect(),
+        "check_suite" if payload["action"].as_str() == Some("completed") => payload["check_suite"]
+            ["pull_requests"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|p| p["number"].as_u64())
+                    .take(5)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    for number in numbers {
+        let Some(run) =
+            super::github_webhook::lookup_run_item_by_pr(state, team_id, owner, name, number).await
+        else {
+            continue;
+        };
+        let Some((plan_id, _)) = common::plan_sync::plan_of_run(&run) else {
+            continue;
+        };
+        let run_id = common::paged::run_id_of(&run).unwrap_or_default();
+        let facts = pr_event_facts(event_type, payload);
+        if !run_id.is_empty() && !facts.is_empty() {
+            let mut u = state
+                .dynamo
+                .update_item()
+                .table_name(&state.config.runs_table_name)
+                .key("team_id", attr_s(team_id))
+                .key("run_id", attr_s(&run_id))
+                .condition_expression("attribute_exists(run_id)");
+            let mut parts = Vec::new();
+            for (i, (k, v)) in facts.into_iter().enumerate() {
+                parts.push(format!("{k} = :f{i}"));
+                u = u.expression_attribute_values(format!(":f{i}"), v);
+            }
+            if let Err(e) = u
+                .update_expression(format!("SET {}", parts.join(", ")))
+                .send()
+                .await
+            {
+                warn!(run_id, error = %e, "Could not record the pull request's facts on the run");
+            }
+        }
+        refresh_plan(state, team_id, &plan_id).await;
+    }
+}
+
+/// What a pull request event tells about the pull request, as run fields:
+/// its size, and a person's review verdict.
+pub(crate) fn pr_event_facts(
+    event_type: &str,
+    payload: &Value,
+) -> Vec<(&'static str, aws_sdk_dynamodb::types::AttributeValue)> {
+    let mut out = Vec::new();
+    let pr = &payload["pull_request"];
+    if let (Some(a), Some(d)) = (pr["additions"].as_u64(), pr["deletions"].as_u64()) {
+        out.push(("pr_additions", attr_n(a)));
+        out.push(("pr_deletions", attr_n(d)));
+    }
+    if event_type == "pull_request_review" && payload["action"].as_str() == Some("submitted") {
+        let by_bot = payload["review"]["user"]["type"].as_str() == Some("Bot")
+            || payload["review"]["user"]["login"]
+                .as_str()
+                .is_some_and(|l| l.ends_with("[bot]") || l.contains("coderhelm"));
+        let verdict = match payload["review"]["state"].as_str().unwrap_or("") {
+            s if s.eq_ignore_ascii_case("approved") => Some("approved"),
+            s if s.eq_ignore_ascii_case("changes_requested") => Some("changes_requested"),
+            _ => None,
+        };
+        if let (false, Some(v)) = (by_bot, verdict) {
+            out.push(("pr_review", attr_s(v)));
+        }
+    }
+    out
 }
 
 /// A plan's own row, as opposed to one of its task rows.
@@ -174,6 +340,12 @@ pub struct CreatePlan {
     #[serde(default)]
     #[schema(example = json!([{"title": "Limit login attempts per IP", "description": "Allow 10 attempts per IP per 15 minutes; answer 429 after that.", "acceptance_criteria": "The 11th attempt within 15 minutes gets 429 and a Retry-After header."}]))]
     pub tasks: Option<Vec<NewPlanTask>>,
+    /// What done means for the whole plan: short checkable lines. Each task
+    /// names the ones it covers (`covers`); without a list, each task's
+    /// acceptance criteria are the plan's.
+    #[serde(default)]
+    #[schema(example = json!(["The 11th login attempt within 15 minutes gets 429", "The page says when to try again"]))]
+    pub success_criteria: Option<Vec<String>>,
     /// The plan chat it came from (dashboard only).
     #[serde(default)]
     #[schema(ignore)]
@@ -218,6 +390,11 @@ pub struct NewPlanTask {
     #[serde(default)]
     #[schema(example = "WEB")]
     pub jira_project: Option<String>,
+    /// The plan's success criteria this task covers, by id (`C1` is the
+    /// first of `success_criteria`).
+    #[serde(default)]
+    #[schema(example = json!(["C1"]))]
+    pub covers: Option<Vec<String>>,
 }
 
 /// The plan that was made.
@@ -291,6 +468,16 @@ pub async fn create_plan(
     if chat_id != "unsaved" {
         put = put.item("chat_id", attr_s(&chat_id));
     }
+    // Tasks a plan chat wrote are CoderHelm's; tasks sent another way are
+    // the sender's (the drift marks say who wrote what).
+    let author = if chat_id != "unsaved" {
+        "agent"
+    } else {
+        "person"
+    };
+    if let Some(list) = criteria_list(body.success_criteria.as_deref()) {
+        put = put.item("criteria", list);
+    }
 
     // Store which MCP servers were used during chat planning
     if let Some(servers) = &body.mcp_servers {
@@ -346,6 +533,10 @@ pub async fn create_plan(
             if let Some(jp) = task.jira_project.as_deref() {
                 put = put.item("jira_project", attr_s(jp));
             }
+            put = put.item("added_by_kind", attr_s(author));
+            if let Some(list) = criteria_list(task.covers.as_deref()) {
+                put = put.item("covers", list);
+            }
 
             put.send().await.map_err(|e| {
                 error!("Failed to create task: {e}");
@@ -396,6 +587,25 @@ pub struct PlanWithTasks {
     pub plan: Plan,
     /// The plan's tasks, in order.
     pub tasks: Vec<PlanTask>,
+    /// The success criteria, each with the tasks that cover it and the
+    /// evidence the work gave it: `{id, text, tasks, met, evidence: [{task_id,
+    /// run_id, state, words, by, tests}]}`. `state` is the criteria trace's
+    /// proof: `proven`, `not_the_ticket`, `failing`, `missing`, `unverified`
+    /// or `not_run`.
+    #[schema(value_type = Vec<Object>, example = json!([{"id": "C1", "text": "The 11th login attempt within 15 minutes gets 429", "tasks": ["01JB8V0P8Q2S4U6W8Y0A2C4E6G"], "met": true, "evidence": [{"task_id": "01JB8V0P8Q2S4U6W8Y0A2C4E6G", "run_id": "01JB8X6F4M2C9QZ3T7V5W1K0HA", "state": "proven", "words": "proven", "by": "tests with and without the change"}]}]))]
+    pub criteria: Vec<common::plan_state::Criterion>,
+    /// What waits on a person, in task order, each the exact ask:
+    /// `{task_id, kind, ask, detail, url, run_id, action}`. `kind` is
+    /// `answer`, `review`, `approval`, `checks`, `merge`, `failed`,
+    /// `closed_pr` or `approve_rest`.
+    #[schema(value_type = Vec<Object>, example = json!([{"task_id": "01JB8V0P8Q2S4U6W8Y0A2C4E6G", "kind": "approval", "ask": "Approve pull request #318", "detail": "This repo's auto-merge setting requires an approving review from a person.", "url": "https://github.com/acme/web/pull/318", "run_id": "01JB8X6F4M2C9QZ3T7V5W1K0HA", "action": "open_pr"}]))]
+    pub needs: Vec<common::plan_state::NeedsItem>,
+    /// What starting the draft tasks, or retrying one, is expected to take,
+    /// from the team's recent runs: `{tasks, runs_low, runs_high, cost_low,
+    /// cost_high, per_run_low, per_run_high, sample}`. Null when nothing is
+    /// left to start or retry.
+    #[schema(value_type = Option<StartEstimate>)]
+    pub estimate: Option<common::plan_sync::Estimate>,
 }
 
 /// GET /api/plans/:plan_id — get plan with all tasks.
@@ -460,11 +670,86 @@ pub async fn get_plan(
         }
     }
 
-    let plan = plan_data.ok_or(StatusCode::NOT_FOUND)?;
+    let mut plan = plan_data.ok_or(StatusCode::NOT_FOUND)?;
     // Sort tasks by order
     tasks.sort_by_key(|t| t.order);
 
-    Ok(Json(PlanWithTasks { plan, tasks }))
+    // Where each task stands, from its runs and pull requests now.
+    let mut criteria = Vec::new();
+    let mut needs = Vec::new();
+    if let Some(r) = refresh_plan(&state, &claims.team_id, &plan_id).await {
+        apply_view(&mut plan, &r);
+        for task in tasks.iter_mut() {
+            let id = task.task_id.clone().unwrap_or_default();
+            if let Some(d) = r.tasks.iter().find(|d| d.task_id == id) {
+                apply_task_view(task, d);
+            }
+        }
+        criteria = r.criteria;
+        needs = r.plan.needs;
+    }
+    let to_start = tasks
+        .iter()
+        .filter(|t| matches!(t.state.as_deref(), Some("draft")))
+        .count();
+    let to_retry = tasks
+        .iter()
+        .any(|t| matches!(t.state.as_deref(), Some("failed")));
+    let estimate = if to_start > 0 || to_retry {
+        let recent = common::plan_sync::recent_costs(
+            &state.dynamo,
+            &state.config.runs_table_name,
+            &claims.team_id,
+        )
+        .await;
+        Some(common::plan_sync::estimate(to_start, &recent))
+    } else {
+        None
+    };
+
+    Ok(Json(PlanWithTasks {
+        plan,
+        tasks,
+        criteria,
+        needs,
+        estimate,
+    }))
+}
+
+/// A task's state from a fresh derivation.
+fn apply_task_view(task: &mut PlanTask, d: &common::plan_sync::TaskDetail) {
+    let v = &d.view;
+    task.state = Some(v.state.code().to_string());
+    task.state_detail = Some(v.detail.clone());
+    task.state_reason = Some(v.reason.clone()).filter(|s| !s.is_empty());
+    task.attempts = Some(v.attempts as u64);
+    task.cost_usd = Some(round_cents(v.cost_usd));
+    task.runs = Some(v.runs.clone());
+    task.prs = Some(v.prs.clone());
+    task.needs = v.needs.clone();
+    task.drift = Some(v.drift.clone());
+    task.covers = Some(d.covers.clone());
+    task.ticket_filed = Some(v.ticket_filed);
+    task.last_activity_at = Some(v.last_activity.clone()).filter(|s| !s.is_empty());
+    if let Some(last) = v.runs.last() {
+        task.run_id = Some(last.run_id.clone());
+    }
+    if let Some(pr) = v.prs.first() {
+        task.pr_url = Some(pr.url.clone());
+    }
+}
+
+/// A list of short lines as a DynamoDB list, blank lines dropped; `None`
+/// when nothing is left.
+fn criteria_list(lines: Option<&[String]>) -> Option<aws_sdk_dynamodb::types::AttributeValue> {
+    let list: Vec<aws_sdk_dynamodb::types::AttributeValue> = lines?
+        .iter()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .take(50)
+        .map(|l| attr_s(common::truncate_str(l, 600)))
+        .collect();
+    (!list.is_empty()).then_some(aws_sdk_dynamodb::types::AttributeValue::L(list))
 }
 
 /// PUT /api/plans/:plan_id — update plan metadata.
@@ -501,6 +786,18 @@ pub async fn update_plan(
             update_parts.push("destination = :dest".to_string());
             expr_values.push((":dest".to_string(), attr_s(dest)));
         }
+    }
+    if let Some(list) = body["success_criteria"].as_array() {
+        let lines: Vec<String> = list
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        update_parts.push("criteria = :crit".to_string());
+        expr_values.push((
+            ":crit".to_string(),
+            criteria_list(Some(&lines))
+                .unwrap_or(aws_sdk_dynamodb::types::AttributeValue::L(Vec::new())),
+        ));
     }
 
     let update_expr = format!("SET {}", update_parts.join(", "));
@@ -655,10 +952,21 @@ pub async fn add_task(
         .item("acceptance_criteria", attr_s(acceptance_criteria))
         .item("status", attr_s("draft"))
         .item("task_order", attr_n(order))
-        .item("created_at", attr_s(&now));
+        .item("created_at", attr_s(&now))
+        .item("added_by_kind", attr_s("person"))
+        .item("added_by", attr_s(&claims.display_name()));
 
     if !task_repo.is_empty() {
         put = put.item("repo", attr_s(task_repo));
+    }
+    if let Some(list) = body["covers"].as_array() {
+        let ids: Vec<String> = list
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        if let Some(l) = criteria_list(Some(&ids)) {
+            put = put.item("covers", l);
+        }
     }
     if let Some(dest) = body["destination"].as_str() {
         put = put.item("destination", attr_s(dest));
@@ -756,8 +1064,42 @@ pub async fn update_task(
         }
     }
 
+    if let Some(list) = body["covers"].as_array() {
+        let ids: Vec<String> = list
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        update_parts.push("covers = :cov");
+        expr_values.push((
+            ":cov",
+            criteria_list(Some(&ids))
+                .unwrap_or(aws_sdk_dynamodb::types::AttributeValue::L(Vec::new())),
+        ));
+    }
+
     if update_parts.is_empty() {
         return Ok(StatusCode::OK);
+    }
+    // A change to what the task says is marked with who made it, so the
+    // plan page can show what moved after approval.
+    let what_changed = [
+        "title",
+        "description",
+        "acceptance_criteria",
+        "repo",
+        "depends_on",
+    ]
+    .iter()
+    .any(|k| body.get(*k).is_some_and(|v| v.is_string()));
+    let now = chrono::Utc::now().to_rfc3339();
+    let by = claims.display_name();
+    if what_changed {
+        update_parts.push("edited_at = :ea");
+        expr_values.push((":ea", attr_s(&now)));
+        update_parts.push("edited_by = :eb");
+        expr_values.push((":eb", attr_s(&by)));
+        update_parts.push("edited_by_kind = :ek");
+        expr_values.push((":ek", attr_s("person")));
     }
 
     let update_expr = format!("SET {}", update_parts.join(", "));
@@ -833,7 +1175,9 @@ pub async fn delete_task(
     Ok(StatusCode::OK)
 }
 
-/// POST /api/plans/:plan_id/tasks/:task_id/approve — approve a task and immediately dispatch it.
+/// POST /api/plans/:plan_id/tasks/:task_id/approve — approve a task and
+/// start it now. The plan runs with its approved tasks and stays open for
+/// the rest: approving one task never finishes the plan.
 pub async fn approve_task(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
@@ -844,11 +1188,19 @@ pub async fn approve_task(
     claims.require_role(1)?;
     validate_plan_id(&plan_id)?;
     validate_plan_id(&task_id)?;
+    // A task starts a paid run, like any other start.
+    if super::github_webhook::check_run_budget(&state, &claims.team_id)
+        .await
+        .is_some()
+    {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
 
     let task_sk = format!("PLAN#{plan_id}#TASK#{task_id}");
     let now = chrono::Utc::now().to_rfc3339();
 
-    // 1. Mark task as approved
+    // 1. Approve it and queue it, before the message that starts it: the
+    //    worker never finds a task it is filing still marked approved.
     let out = state
         .dynamo
         .update_item()
@@ -857,14 +1209,25 @@ pub async fn approve_task(
         .key("sk", attr_s(&task_sk))
         .update_expression("SET #st = :s, approved_at = :now, approved_by = :by")
         .expression_attribute_names("#st", "status")
-        .expression_attribute_values(":s", attr_s("approved"))
+        .expression_attribute_values(":s", attr_s("queued"))
         .expression_attribute_values(":now", attr_s(&now))
         .expression_attribute_values(":by", attr_s(&claims.display_name()))
-        .condition_expression("attribute_exists(pk)")
+        // Only a task that has not started: approving a filed task again
+        // would file a second ticket and start a second run.
+        .condition_expression("attribute_exists(pk) AND #st IN (:draft, :rejected, :approved)")
+        .expression_attribute_values(":draft", attr_s("draft"))
+        .expression_attribute_values(":rejected", attr_s("rejected"))
+        .expression_attribute_values(":approved", attr_s("approved"))
         .return_values(aws_sdk_dynamodb::types::ReturnValue::AllNew)
         .send()
         .await
         .map_err(|e| {
+            if aws_sdk_dynamodb::error::DisplayErrorContext(&e)
+                .to_string()
+                .contains("ConditionalCheckFailed")
+            {
+                return StatusCode::CONFLICT;
+            }
             error!("Failed to approve task: {e}");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
@@ -879,48 +1242,84 @@ pub async fn approve_task(
     )
     .await;
 
-    // 2. Mark plan as executing (idempotent — may already be executing)
-    let plan_sk = format!("PLAN#{plan_id}");
-    let _ = state
-        .dynamo
-        .update_item()
-        .table_name(&state.config.plans_table_name)
-        .key("pk", attr_s(&claims.team_id))
-        .key("sk", attr_s(&plan_sk))
-        .update_expression("SET #st = :s, executed_at = :now, executed_by = :by, updated_at = :now")
-        .expression_attribute_names("#st", "status")
-        .expression_attribute_values(":s", attr_s("executing"))
-        .expression_attribute_values(":now", attr_s(&now))
-        .expression_attribute_values(":by", attr_s(&claims.display_name()))
-        .send()
-        .await;
+    // 2. The plan is running; when it first ran is kept (drift counts from
+    //    it). Its state is derived from its tasks below, never set to done.
+    mark_plan_running(&state, &claims, &plan_id, &now).await;
 
-    // 3. Immediately dispatch this single task to the worker
+    // 3. Start this one task.
     let plan_msg = WorkerMessage::PlanExecute(PlanExecuteMessage {
         team_id: claims.team_id.clone(),
         plan_id: plan_id.clone(),
         triggered_by: claims.display_name(),
         tasks: vec![task_id.clone()],
     });
+    if let Err(code) = send_plan_message(&state, &plan_msg).await {
+        // Not started: back to approved, so Approve and start picks it up.
+        set_task_word(&state, &claims.team_id, &plan_id, &task_id, "approved").await;
+        return Err(code);
+    }
 
+    info!(plan_id, task_id, "Task approved and dispatched to worker");
+    refresh_plan(&state, &claims.team_id, &plan_id).await;
+
+    Ok(Json(json!({ "dispatched": true, "task_id": task_id })))
+}
+
+/// Marks a plan running; keeps when and by whom it first ran.
+async fn mark_plan_running(state: &AppState, claims: &Claims, plan_id: &str, now: &str) {
+    let _ = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.plans_table_name)
+        .key("pk", attr_s(&claims.team_id))
+        .key("sk", attr_s(&format!("PLAN#{plan_id}")))
+        .condition_expression("attribute_exists(sk)")
+        .update_expression(
+            "SET #st = :s, executed_at = if_not_exists(executed_at, :now), \
+             executed_by = if_not_exists(executed_by, :by), updated_at = :now",
+        )
+        .expression_attribute_names("#st", "status")
+        .expression_attribute_values(":s", attr_s("executing"))
+        .expression_attribute_values(":now", attr_s(now))
+        .expression_attribute_values(":by", attr_s(&claims.display_name()))
+        .send()
+        .await;
+}
+
+/// Sends a plan message to the worker's queue.
+async fn send_plan_message(state: &AppState, msg: &WorkerMessage) -> Result<(), StatusCode> {
+    let body = serde_json::to_string(msg).map_err(|e| {
+        error!("Failed to serialize plan message: {e}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
     state
         .sqs
         .send_message()
         .queue_url(&state.config.ticket_queue_url)
-        .message_body(serde_json::to_string(&plan_msg).map_err(|e| {
-            error!("Failed to serialize plan message: {e}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?)
+        .message_body(body)
         .send()
         .await
+        .map(|_| ())
         .map_err(|e| {
-            error!("Failed to send task to queue: {e}");
+            error!("Failed to send plan message: {e}");
             StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+        })
+}
 
-    info!(plan_id, task_id, "Task approved and dispatched to worker");
-
-    Ok(Json(json!({ "dispatched": true, "task_id": task_id })))
+/// Sets a task row's own word (`status`).
+async fn set_task_word(state: &AppState, team_id: &str, plan_id: &str, task_id: &str, word: &str) {
+    let _ = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.plans_table_name)
+        .key("pk", attr_s(team_id))
+        .key("sk", attr_s(&format!("PLAN#{plan_id}#TASK#{task_id}")))
+        .condition_expression("attribute_exists(sk)")
+        .update_expression("SET #st = :s")
+        .expression_attribute_names("#st", "status")
+        .expression_attribute_values(":s", attr_s(word))
+        .send()
+        .await;
 }
 
 /// A plan task approved or rejected, as a reward signal for the planner.
@@ -1030,6 +1429,12 @@ pub async fn approve_all_and_execute(
     // agent runs or delete the team's plans.
     claims.require_role(1)?;
     validate_plan_id(&plan_id)?;
+    if super::github_webhook::check_run_budget(&state, &claims.team_id)
+        .await
+        .is_some()
+    {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
 
     let result = state
         .dynamo
@@ -1101,49 +1506,10 @@ pub async fn approve_all_and_execute(
     }
 
     task_ids.sort_by_key(|t| t.1);
+    let ids: Vec<String> = task_ids.iter().map(|(tid, _)| tid.clone()).collect();
 
-    // Mark plan as executing
-    let plan_sk = format!("PLAN#{plan_id}");
-    state
-        .dynamo
-        .update_item()
-        .table_name(&state.config.plans_table_name)
-        .key("pk", attr_s(&claims.team_id))
-        .key("sk", attr_s(&plan_sk))
-        .update_expression("SET #st = :s, executed_at = :now, executed_by = :by, updated_at = :now")
-        .expression_attribute_names("#st", "status")
-        .expression_attribute_values(":s", attr_s("executing"))
-        .expression_attribute_values(":now", attr_s(&now))
-        .expression_attribute_values(":by", attr_s(&claims.display_name()))
-        .send()
-        .await
-        .map_err(|e| {
-            error!("Failed to update plan status: {e}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-    // Send SQS message
-    let plan_msg = WorkerMessage::PlanExecute(PlanExecuteMessage {
-        team_id: claims.team_id.clone(),
-        plan_id: plan_id.clone(),
-        triggered_by: claims.display_name(),
-        tasks: task_ids.iter().map(|(tid, _)| tid.clone()).collect(),
-    });
-
-    state
-        .sqs
-        .send_message()
-        .queue_url(&state.config.ticket_queue_url)
-        .message_body(serde_json::to_string(&plan_msg).map_err(|e| {
-            error!("Failed to serialize plan message: {e}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?)
-        .send()
-        .await
-        .map_err(|e| {
-            error!("Failed to send plan execute message: {e}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    mark_plan_running(&state, &claims, &plan_id, &now).await;
+    start_tasks(&state, &claims, &plan_id, &ids).await?;
 
     super::webhooks::emit_plan_approved(
         &state,
@@ -1153,23 +1519,7 @@ pub async fn approve_all_and_execute(
         task_ids.len(),
     )
     .await;
-
-    // Mark tasks as queued
-    for (task_id, _) in &task_ids {
-        let task_sk = format!("PLAN#{plan_id}#TASK#{task_id}");
-        state
-            .dynamo
-            .update_item()
-            .table_name(&state.config.plans_table_name)
-            .key("pk", attr_s(&claims.team_id))
-            .key("sk", attr_s(&task_sk))
-            .update_expression("SET #st = :s")
-            .expression_attribute_names("#st", "status")
-            .expression_attribute_values(":s", attr_s("queued"))
-            .send()
-            .await
-            .ok();
-    }
+    refresh_plan(&state, &claims.team_id, &plan_id).await;
 
     Ok(Json(PlanExecution {
         status: "executing".into(),
@@ -1188,6 +1538,12 @@ pub async fn force_run_task(
     claims.require_role(1)?;
     validate_plan_id(&plan_id)?;
     validate_plan_id(&task_id)?;
+    if super::github_webhook::check_run_budget(&state, &claims.team_id)
+        .await
+        .is_some()
+    {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
 
     // Verify task is in "waiting" status
     let task_sk = format!("PLAN#{plan_id}#TASK#{task_id}");
@@ -1223,7 +1579,7 @@ pub async fn force_run_task(
             .table_name(&state.config.plans_table_name)
             .key("pk", attr_s(&claims.team_id))
             .key("sk", attr_s(&task_sk))
-            .update_expression("SET #s = :s")
+            .update_expression("SET #s = :s REMOVE failure_reason")
             .expression_attribute_names("#s", "status")
             .expression_attribute_values(":s", attr_s("waiting"))
             .send()
@@ -1329,76 +1685,48 @@ pub async fn execute_plan(
 
     // Sort by order
     approved_task_ids.sort_by_key(|t| t.1);
-
-    // Mark plan as executing
-    let plan_sk = format!("PLAN#{plan_id}");
+    let ids: Vec<String> = approved_task_ids
+        .iter()
+        .map(|(tid, _)| tid.clone())
+        .collect();
     let now = chrono::Utc::now().to_rfc3339();
-
-    state
-        .dynamo
-        .update_item()
-        .table_name(&state.config.plans_table_name)
-        .key("pk", attr_s(&claims.team_id))
-        .key("sk", attr_s(&plan_sk))
-        .update_expression("SET #st = :s, executed_at = :now, executed_by = :by, updated_at = :now")
-        .expression_attribute_names("#st", "status")
-        .expression_attribute_values(":s", attr_s("executing"))
-        .expression_attribute_values(":now", attr_s(&now))
-        .expression_attribute_values(":by", attr_s(&claims.display_name()))
-        .send()
-        .await
-        .map_err(|e| {
-            error!("Failed to update plan status: {e}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-    // Send SQS message for plan execution (worker creates issues + queues runs)
-    let plan_msg = WorkerMessage::PlanExecute(PlanExecuteMessage {
-        team_id: claims.team_id.clone(),
-        plan_id: plan_id.clone(),
-        triggered_by: claims.display_name(),
-        tasks: approved_task_ids
-            .iter()
-            .map(|(tid, _)| tid.clone())
-            .collect(),
-    });
-
-    state
-        .sqs
-        .send_message()
-        .queue_url(&state.config.ticket_queue_url)
-        .message_body(serde_json::to_string(&plan_msg).map_err(|e| {
-            error!("Failed to serialize plan message: {e}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?)
-        .send()
-        .await
-        .map_err(|e| {
-            error!("Failed to send plan execute message: {e}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-    // Mark each approved task as "queued"
-    for (task_id, _) in &approved_task_ids {
-        let task_sk = format!("PLAN#{plan_id}#TASK#{task_id}");
-        state
-            .dynamo
-            .update_item()
-            .table_name(&state.config.plans_table_name)
-            .key("pk", attr_s(&claims.team_id))
-            .key("sk", attr_s(&task_sk))
-            .update_expression("SET #st = :s")
-            .expression_attribute_names("#st", "status")
-            .expression_attribute_values(":s", attr_s("queued"))
-            .send()
-            .await
-            .ok();
-    }
+    mark_plan_running(&state, &claims, &plan_id, &now).await;
+    start_tasks(&state, &claims, &plan_id, &ids).await?;
+    refresh_plan(&state, &claims.team_id, &plan_id).await;
 
     Ok(Json(json!({
         "status": "executing",
         "tasks_queued": approved_task_ids.len(),
     })))
+}
+
+/// Queues approved tasks, then sends the one message that starts them. The
+/// tasks are marked queued first: the worker files their tickets and moves
+/// them on, and a `queued` written after the message could land on a task
+/// the worker had already filed. When the message can't be sent, they go
+/// back to approved, so starting again finds them.
+async fn start_tasks(
+    state: &AppState,
+    claims: &Claims,
+    plan_id: &str,
+    ids: &[String],
+) -> Result<(), StatusCode> {
+    for id in ids {
+        set_task_word(state, &claims.team_id, plan_id, id, "queued").await;
+    }
+    let msg = WorkerMessage::PlanExecute(PlanExecuteMessage {
+        team_id: claims.team_id.clone(),
+        plan_id: plan_id.to_string(),
+        triggered_by: claims.display_name(),
+        tasks: ids.to_vec(),
+    });
+    if let Err(code) = send_plan_message(state, &msg).await {
+        for id in ids {
+            set_task_word(state, &claims.team_id, plan_id, id, "approved").await;
+        }
+        return Err(code);
+    }
+    Ok(())
 }
 
 /// A plan that started running.
@@ -1448,9 +1776,44 @@ pub struct Plan {
     /// The repository its tasks work in, `owner/name`.
     #[schema(example = "acme/web")]
     pub repo: Option<String>,
-    /// `draft`, `executing` or `completed`.
-    #[schema(example = "draft")]
+    /// The older status word, kept for older clients: `draft`, `executing`,
+    /// or `done` once every task merged or was dropped. Read `state`.
+    #[schema(example = "executing")]
     pub status: Option<String>,
+    /// Where the plan stands, from its tasks' work: `drafting` (nothing
+    /// approved yet), `running`, `needs_you` (a task asks a person
+    /// something, failed, or drafts remain once the rest finished), `done`
+    /// (every task merged or dropped) or `stalled` (open work and nothing
+    /// moved for 3 days).
+    #[schema(example = "running")]
+    pub state: Option<String>,
+    /// The count line: merged first, then the states with tasks in them.
+    #[schema(example = "2 of 5 merged, 1 needs you, 1 in review, 1 working")]
+    pub summary: Option<String>,
+    /// How many tasks are in each state.
+    #[schema(value_type = Option<TaskCounts>)]
+    pub counts: Option<common::plan_state::Counts>,
+    /// How many things wait on a person.
+    #[schema(example = 1)]
+    pub needs_count: u64,
+    /// What its tasks' runs cost so far, in US dollars, every attempt counted.
+    #[schema(example = 18.4)]
+    pub cost_usd: Option<f64>,
+    /// Runs its tasks took, every attempt counted.
+    #[schema(example = 6)]
+    pub attempts: Option<u64>,
+    /// Success criteria the work proved, of `criteria_count`.
+    #[schema(example = 3)]
+    pub criteria_met: Option<u64>,
+    /// How many success criteria it has.
+    #[schema(example = 5)]
+    pub criteria_count: Option<u64>,
+    /// When anything last happened on its tasks (RFC 3339).
+    #[schema(example = "2026-10-23T09:12:00+00:00")]
+    pub last_activity_at: Option<String>,
+    /// The plan's success criteria as written, when it has its own list.
+    #[schema(example = json!(["The 11th login attempt within 15 minutes gets 429"]))]
+    pub success_criteria: Option<Vec<String>>,
     /// How many tasks it has.
     #[schema(example = 3)]
     pub task_count: u64,
@@ -1483,6 +1846,99 @@ pub struct Plan {
     pub executed_by: Option<String>,
 }
 
+/// How many tasks are in each state (the shape of
+/// `common::plan_state::Counts`, for the API document).
+#[derive(utoipa::ToSchema)]
+#[allow(dead_code)]
+pub struct TaskCounts {
+    /// Not approved yet.
+    #[schema(example = 0)]
+    draft: u64,
+    /// Approved and waiting to start.
+    #[schema(example = 1)]
+    queued: u64,
+    /// Its run is working.
+    #[schema(example = 1)]
+    working: u64,
+    /// Its run asks a person for something.
+    #[schema(example = 1)]
+    needs_you: u64,
+    /// Failed, with a reason.
+    #[schema(example = 0)]
+    failed: u64,
+    /// A pull request is open.
+    #[schema(example = 1)]
+    in_review: u64,
+    /// A pull request merged.
+    #[schema(example = 2)]
+    merged: u64,
+    /// Dropped by a person.
+    #[schema(example = 0)]
+    dropped: u64,
+}
+
+/// Something a person has to do for the plan to go on (the shape of
+/// `common::plan_state::NeedsItem`, for the API document).
+#[derive(utoipa::ToSchema)]
+#[allow(dead_code)]
+pub struct NeedsYou {
+    /// The task it is about; empty for the plan's drafts.
+    #[schema(example = "01JB8V0P8Q2S4U6W8Y0A2C4E6G")]
+    task_id: String,
+    /// `answer`, `review`, `approval`, `checks`, `merge`, `failed`,
+    /// `closed_pr` or `approve_rest`.
+    #[schema(example = "approval")]
+    kind: String,
+    /// What to do, one line.
+    #[schema(example = "Approve pull request #318")]
+    ask: String,
+    /// Why, or what is open.
+    #[schema(
+        example = "This repo's auto-merge setting requires an approving review from a person."
+    )]
+    detail: Option<String>,
+    /// Where to do it.
+    #[schema(example = "https://github.com/acme/web/pull/318")]
+    url: Option<String>,
+    /// The run it comes from.
+    #[schema(example = "01JB8X6F4M2C9QZ3T7V5W1K0HA")]
+    run_id: Option<String>,
+    /// The button: `answer`, `open_pr`, `open_link`, `retry` or `approve`.
+    #[schema(example = "open_pr")]
+    action: String,
+}
+
+/// What starting tasks, or retrying one, is expected to take, from the
+/// team's recent finished runs (the shape of `common::plan_sync::Estimate`).
+#[derive(utoipa::ToSchema)]
+#[allow(dead_code)]
+pub struct StartEstimate {
+    /// Tasks it would start.
+    #[schema(example = 3)]
+    tasks: u64,
+    /// Runs expected: one per task.
+    #[schema(example = 3)]
+    runs_low: u64,
+    /// Runs expected with the attempts a ticket took lately.
+    #[schema(example = 4)]
+    runs_high: u64,
+    /// The low end of the cost, in US dollars.
+    #[schema(example = 6.3)]
+    cost_low: f64,
+    /// The high end of the cost, in US dollars.
+    #[schema(example = 19.8)]
+    cost_high: f64,
+    /// One run's typical cost, low end (a Retry or Start now).
+    #[schema(example = 2.1)]
+    per_run_low: f64,
+    /// One run's typical cost, high end.
+    #[schema(example = 4.95)]
+    per_run_high: f64,
+    /// Finished runs the numbers come from; 0 means no history yet.
+    #[schema(example = 40)]
+    sample: u64,
+}
+
 /// A task in a plan.
 #[derive(serde::Serialize, utoipa::ToSchema)]
 pub struct PlanTask {
@@ -1501,10 +1957,54 @@ pub struct PlanTask {
     /// How to tell it is done.
     #[schema(example = "The 11th attempt within 15 minutes gets 429 and a Retry-After header.")]
     pub acceptance_criteria: Option<String>,
-    /// `draft`, `approved`, `rejected`, `queued`, `waiting` (on a task it
-    /// depends on), `running`, `completed` or `failed`.
-    #[schema(example = "queued")]
+    /// The task row's own word: `draft`, `approved`, `rejected`, `queued`,
+    /// `waiting` (on a task it depends on), `running` (filing its ticket),
+    /// `filed` (older tasks say `done`) or `failed` (the ticket could not be
+    /// filed). Filing the ticket finishes nothing: read `state`.
+    #[schema(example = "filed")]
     pub status: Option<String>,
+    /// Where the task stands, from its runs and pull requests: `draft`,
+    /// `queued`, `working`, `needs_you`, `failed`, `in_review`, `merged` or
+    /// `dropped`.
+    #[schema(example = "in_review")]
+    pub state: Option<String>,
+    /// One line: what it is doing, what it waits on, or what blocks it.
+    #[schema(example = "Checks are running on pull request #318")]
+    pub state_detail: Option<String>,
+    /// Why it failed (`failed` only).
+    #[schema(example = json!(null))]
+    pub state_reason: Option<String>,
+    /// Runs it took, every attempt counted.
+    #[schema(example = 2)]
+    pub attempts: Option<u64>,
+    /// What its runs cost, in US dollars.
+    #[schema(example = 7.2)]
+    pub cost_usd: Option<f64>,
+    /// Every attempt, oldest first: `{run_id, status, created_at, cost_usd}`.
+    #[schema(value_type = Option<Vec<Object>>, example = json!([{"run_id": "01JB8X6F4M2C9QZ3T7V5W1K0HA", "status": "completed", "created_at": "2026-10-22T14:02:11+00:00", "cost_usd": 3.6}]))]
+    pub runs: Option<Vec<common::plan_state::RunLine>>,
+    /// Its pull requests, newest attempt first: `{number, url, repo, state,
+    /// checks, review, tone, additions, deletions, run_id}`. `tone` is the
+    /// colour: `ready`, `waiting`, `failing`, `merged` or `closed`.
+    #[schema(value_type = Option<Vec<Object>>, example = json!([{"number": 318, "url": "https://github.com/acme/web/pull/318", "repo": "acme/web", "state": "open", "checks": "running", "review": "none", "tone": "waiting", "additions": 120, "deletions": 8, "run_id": "01JB8X6F4M2C9QZ3T7V5W1K0HA"}]))]
+    pub prs: Option<Vec<common::plan_state::PrChip>>,
+    /// What it waits on a person for, when it does.
+    #[schema(value_type = Option<NeedsYou>)]
+    pub needs: Option<common::plan_state::NeedsItem>,
+    /// Changes after the plan was approved, and work outside its scope:
+    /// `{kind, detail, by, by_name, at}`, `kind` one of `added`, `changed`,
+    /// `dropped`, `scope`; `by` is `agent` or `person`.
+    #[schema(value_type = Option<Vec<Object>>, example = json!([{"kind": "added", "detail": "Added after the plan was approved", "by": "person", "by_name": "octocat", "at": "2026-10-22T15:00:00+00:00"}]))]
+    pub drift: Option<Vec<common::plan_state::Drift>>,
+    /// The plan's success criteria it covers (`C1`, ...).
+    #[schema(example = json!(["C1"]))]
+    pub covers: Option<Vec<String>>,
+    /// Its ticket was filed.
+    #[schema(example = true)]
+    pub ticket_filed: Option<bool>,
+    /// When anything last happened on it (RFC 3339).
+    #[schema(example = "2026-10-23T09:12:00+00:00")]
+    pub last_activity_at: Option<String>,
     /// Its repository, when not the plan's.
     #[schema(example = "acme/web")]
     pub repo: Option<String>,
@@ -1517,10 +2017,10 @@ pub struct PlanTask {
     /// That issue's address.
     #[schema(example = "https://github.com/acme/web/issues/412")]
     pub issue_url: Option<String>,
-    /// The run working on it.
+    /// Its newest run (every attempt is in `runs`).
     #[schema(example = "01JB8X6F4M2C9QZ3T7V5W1K0HA")]
     pub run_id: Option<String>,
-    /// The pull request that run opened.
+    /// The newest pull request (every one is in `prs`).
     #[schema(example = "https://github.com/acme/web/pull/318")]
     pub pr_url: Option<String>,
     /// When it was approved (RFC 3339).
@@ -1573,6 +2073,7 @@ fn plan_of(item: &PlanItem) -> Plan {
         .and_then(|v| v.as_l().ok())
         .map(|list| list.iter().filter_map(|v| v.as_s().ok().cloned()).collect())
         .unwrap_or_default();
+    let stored = common::plan_sync::stored(item);
     Plan {
         plan_id: item_str(item, "plan_id"),
         title: item_str(item, "title"),
@@ -1583,6 +2084,19 @@ fn plan_of(item: &PlanItem) -> Plan {
         tokens_in: item_u64(item, "total_tokens_in"),
         tokens_out: item_u64(item, "total_tokens_out"),
         destination: item_str(item, "destination"),
+        state: stored.state.map(|s| s.code().to_string()),
+        summary: Some(stored.summary.clone()).filter(|s| !s.is_empty()),
+        counts: stored.state.map(|_| stored.counts.clone()),
+        needs_count: stored.needs_count,
+        cost_usd: stored.state.map(|_| round_cents(stored.cost_usd)),
+        attempts: stored.state.map(|_| stored.attempts),
+        criteria_met: stored.state.map(|_| stored.criteria_met),
+        criteria_count: stored.state.map(|_| stored.criteria_count),
+        last_activity_at: Some(stored.last_activity_at.clone()).filter(|s| !s.is_empty()),
+        success_criteria: item
+            .get("criteria")
+            .and_then(|v| v.as_l().ok())
+            .map(|l| l.iter().filter_map(|v| v.as_s().ok().cloned()).collect()),
         mcp_servers: (!mcp_servers.is_empty()).then_some(mcp_servers),
         chat_id: item_str(item, "chat_id"),
         created_at: item_str(item, "created_at"),
@@ -1600,6 +2114,30 @@ fn task_of(item: &PlanItem) -> PlanTask {
         description: item_str(item, "description"),
         acceptance_criteria: item_str(item, "acceptance_criteria"),
         status: item_str(item, "status"),
+        state: item_str(item, "state"),
+        state_detail: item_str(item, "state_detail"),
+        state_reason: item_str(item, "state_reason")
+            .filter(|s| !s.is_empty())
+            .or_else(|| item_str(item, "failure_reason")),
+        attempts: item_u64(item, "attempts"),
+        cost_usd: item
+            .get("cost_usd")
+            .and_then(|v| v.as_n().ok())
+            .and_then(|n| n.parse::<f64>().ok())
+            .map(round_cents),
+        runs: None,
+        prs: item_str(item, "prs").and_then(|s| serde_json::from_str(&s).ok()),
+        needs: None,
+        drift: None,
+        covers: item
+            .get("covers")
+            .and_then(|v| v.as_l().ok())
+            .map(|l| l.iter().filter_map(|v| v.as_s().ok().cloned()).collect()),
+        ticket_filed: item
+            .get("ticket_filed")
+            .and_then(|v| v.as_bool().ok())
+            .copied(),
+        last_activity_at: None,
         repo: item_str(item, "repo"),
         order: item_u64(item, "task_order").unwrap_or(0),
         issue_number: item_u64(item, "issue_number"),
@@ -4260,5 +4798,94 @@ mod stream_block_tests {
             &mut raw,
         );
         assert_eq!(raw, "{\"a\":1}");
+    }
+}
+
+#[cfg(test)]
+mod start_tests {
+    /// The body of `pub async fn <name>` in this file.
+    fn body(name: &str) -> String {
+        let src = include_str!("plans.rs");
+        let start = src
+            .find(&format!("pub async fn {name}("))
+            .unwrap_or_else(|| panic!("{name} not found"));
+        let rest = &src[start..];
+        let end = rest[1..]
+            .find("\npub async fn ")
+            .map(|i| i + 1)
+            .unwrap_or(rest.len());
+        rest[..end].to_string()
+    }
+
+    /// Every route that starts a task's work.
+    const STARTS: [&str; 4] = [
+        "approve_task",
+        "approve_all_and_execute",
+        "execute_plan",
+        "force_run_task",
+    ];
+
+    #[test]
+    fn every_route_that_starts_work_checks_the_run_budget() {
+        for name in STARTS {
+            let b = body(name);
+            assert!(
+                b.contains("check_run_budget"),
+                "{name} starts paid runs without checking the team's run budget"
+            );
+            let check = b.find("check_run_budget").unwrap();
+            let send = ["start_tasks(", "send_plan_message(", ".send_message()"]
+                .iter()
+                .filter_map(|s| b.find(s))
+                .min()
+                .unwrap_or_else(|| panic!("{name} starts nothing"));
+            assert!(check < send, "{name} checks the budget after starting");
+        }
+    }
+
+    #[test]
+    fn tasks_are_queued_before_the_message_that_starts_them() {
+        // `queued` written after the message could land on a task the worker
+        // had already filed.
+        let helper = body("approve_task");
+        let queued = helper.find(r#"attr_s("queued")"#).expect("queued");
+        let sent = helper.find("send_plan_message(").expect("sent");
+        assert!(queued < sent);
+        let src = include_str!("plans.rs");
+        let start = src.find("async fn start_tasks(").unwrap();
+        let st = &src[start..start + src[start..].find("\n}\n").unwrap()];
+        assert!(st.find(r#""queued""#).unwrap() < st.find("send_plan_message(").unwrap());
+        for name in ["approve_all_and_execute", "execute_plan"] {
+            let b = body(name);
+            assert!(b.contains("start_tasks("), "{name}");
+            assert!(!b.contains(".send_message()"), "{name} sends on its own");
+        }
+    }
+
+    #[test]
+    fn approving_a_task_never_finishes_the_plan() {
+        for name in STARTS {
+            let b = body(name);
+            assert!(!b.contains(r#"attr_s("done")"#), "{name} writes done");
+        }
+        assert!(body("approve_task").contains("mark_plan_running("));
+    }
+
+    #[test]
+    fn a_review_or_size_on_a_pr_event_is_kept_on_the_run() {
+        let p = serde_json::json!({
+            "action": "submitted",
+            "pull_request": {"number": 4, "additions": 120, "deletions": 8},
+            "review": {"state": "approved", "user": {"login": "someone", "type": "User"}},
+        });
+        let f = super::pr_event_facts("pull_request_review", &p);
+        let keys: Vec<&str> = f.iter().map(|(k, _)| *k).collect();
+        assert_eq!(keys, ["pr_additions", "pr_deletions", "pr_review"]);
+        let bot = serde_json::json!({
+            "action": "submitted",
+            "pull_request": {"number": 4},
+            "review": {"state": "changes_requested", "user": {"login": "coderhelm[bot]", "type": "Bot"}},
+        });
+        assert!(super::pr_event_facts("pull_request_review", &bot).is_empty());
     }
 }

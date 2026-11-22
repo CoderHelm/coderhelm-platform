@@ -1360,6 +1360,7 @@ pub mod plan_execute;
 mod plan_judge;
 pub(crate) mod plan_sections;
 mod plan_shape;
+pub mod plan_sync;
 /// Plugin runs, publishing, source sync and results.
 pub mod plugins;
 mod pr;
@@ -8903,10 +8904,13 @@ async fn create_run_record(
         _ => None,
     };
     if let Some(ticket) = plan_ticket {
-        if let Some((plan_id, title, by)) =
+        if let Some((plan_id, title, by, task_id)) =
             plan_execute::plan_of_ticket(state, &msg.team_id, &ticket).await
         {
             put = put.item("plan_id", attr_s(&plan_id));
+            if !task_id.is_empty() {
+                put = put.item("plan_task_id", attr_s(&task_id));
+            }
             if !title.is_empty() {
                 put = put.item("plan_title", attr_s(&title));
             }

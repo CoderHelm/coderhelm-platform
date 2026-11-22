@@ -210,6 +210,8 @@ pub mod paged;
 pub mod placeholders;
 /// Which waiting plan tasks a merged run releases.
 pub mod plan_dependents;
+pub mod plan_state;
+pub mod plan_sync;
 /// Every body CoderHelm sends GitHub fits GitHub's limit.
 pub mod pr_body;
 pub mod pr_body_fit;

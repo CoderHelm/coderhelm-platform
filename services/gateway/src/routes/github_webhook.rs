@@ -471,6 +471,33 @@ async fn dispatch(
     // dismissal, a close over its change request) queues one judgment per PR.
     super::review_lessons::on_webhook(state, event_type, payload, installation_id, team_id).await;
 
+    let r = route_event(
+        state,
+        event_type,
+        payload,
+        installation_id,
+        team_id,
+        delivery_id,
+    )
+    .await;
+    // A plan task's pull request moved: its plan's state follows.
+    if matches!(
+        event_type,
+        "pull_request" | "pull_request_review" | "check_suite"
+    ) {
+        super::plans::on_pr_event(state, team_id, event_type, payload).await;
+    }
+    r
+}
+
+async fn route_event(
+    state: &AppState,
+    event_type: &str,
+    payload: &Value,
+    installation_id: u64,
+    team_id: &str,
+    delivery_id: &str,
+) -> Result<StatusCode, StatusCode> {
     match event_type {
         "issues" => handle_issue_event(state, payload, installation_id, team_id).await,
         "issue_comment" => handle_issue_comment(state, payload, installation_id, team_id).await,
@@ -4886,7 +4913,7 @@ async fn lookup_run_by_pr(
 /// repo-index GSI), else one of a multi-repo run's PRs, matched by
 /// repository AND number (`pr_keys`). A number alone matched a PR of the
 /// same number in an unrelated repository.
-async fn lookup_run_item_by_pr(
+pub(super) async fn lookup_run_item_by_pr(
     state: &AppState,
     team_id: &str,
     owner: &str,
