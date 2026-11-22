@@ -743,8 +743,10 @@ pub struct OktaSetup {
     /// When a Test sign-in of exactly these values last passed, and as whom.
     pub tested_at: Option<String>,
     pub tested_email: Option<String>,
-    /// The member who ran that Test sign-in.
+    /// The member who ran that Test sign-in, and the Okta subject it signed
+    /// in as.
     pub tested_by: Option<String>,
+    pub tested_sub: Option<String>,
     pub updated_at: Option<String>,
     pub updated_by: Option<String>,
 }
@@ -794,6 +796,7 @@ impl OktaSetup {
             tested_at: opt(item, "tested_at"),
             tested_email: opt(item, "tested_email"),
             tested_by: opt(item, "tested_by"),
+            tested_sub: opt(item, "tested_sub"),
             updated_at: opt(item, "updated_at"),
             updated_by: opt(item, "updated_by"),
         })
@@ -820,6 +823,7 @@ impl OktaSetup {
             ("tested_at", &self.tested_at),
             ("tested_email", &self.tested_email),
             ("tested_by", &self.tested_by),
+            ("tested_sub", &self.tested_sub),
             ("updated_at", &self.updated_at),
             ("updated_by", &self.updated_by),
         ] {
@@ -1056,6 +1060,21 @@ pub(crate) async fn domain_failing_since(
     Ok(out.item().and_then(|i| opt(i, "failing_at")))
 }
 
+/// A domain's proof record as stored.
+async fn raw_domain_record(state: &AppState, domain: &str) -> Result<Option<Item>, String> {
+    Ok(state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(&format!("{OKTA_DOMAIN_PREFIX}{domain}")))
+        .key("sk", attr_s(OKTA_DOMAIN_SK))
+        .consistent_read(true)
+        .send()
+        .await
+        .map_err(|e| format!("{e}"))?
+        .item)
+}
+
 /// The proof's team, `verified_at` and `checked_at`.
 async fn domain_record(
     state: &AppState,
@@ -1186,7 +1205,13 @@ async fn fresh_domain_owner(
                 .await
                 .is_ok();
             if released {
-                super::require_okta::domain_released(state, &team, domain).await;
+                super::require_okta::domain_released(
+                    state,
+                    &team,
+                    domain,
+                    super::require_okta::Released::GraceOver,
+                )
+                .await;
             }
             return Ok(None);
         }
@@ -1216,9 +1241,30 @@ async fn fresh_domain_owner(
         .await
         .is_err()
     {
-        return Ok(Some(team));
+        // Not released: the team keeps it only if it still holds it and
+        // turned the rule on meanwhile; any other failure gives no owner.
+        let holder = domain_record(state, domain).await?.map(|(t, _, _)| t);
+        let rule_on = super::sign_in::team_rule(state, &team).await?.require_okta;
+        return Ok(owner_after_failed_release(
+            holder.as_deref(),
+            &team,
+            rule_on,
+        ));
     }
+    super::require_okta::domain_released(state, &team, domain, super::require_okta::Released::Gone)
+        .await;
     Ok(None)
+}
+
+/// Who owns a domain after releasing a gone proof failed: the team, only if
+/// it still holds the record and its rule is on now (that is why the
+/// release was refused); otherwise nobody (fail closed). Pure.
+pub fn owner_after_failed_release(
+    holder: Option<&str>,
+    team: &str,
+    rule_on: bool,
+) -> Option<String> {
+    (holder == Some(team) && rule_on).then(|| team.to_string())
 }
 
 /// How long a proof whose TXT record is gone is kept while its team
@@ -2449,12 +2495,15 @@ async fn okta_test_return(
         .table_name(&state.config.settings_table_name)
         .key("pk", attr_s(&draft.team_id))
         .key("sk", attr_s(OKTA_DRAFT_SK))
-        .update_expression("SET tested_at = :t, tested_email = :e, tested_by = :b")
+        .update_expression(
+            "SET tested_at = :t, tested_email = :e, tested_by = :b, tested_sub = :ts",
+        )
         // Only the draft that was tested: one saved since then needs its own test.
         .condition_expression("issuer = :i AND client_id = :c AND client_secret_sealed = :s")
         .expression_attribute_values(":t", attr_s(&now))
         .expression_attribute_values(":e", attr_s(&email))
         .expression_attribute_values(":b", attr_s(&flow.by))
+        .expression_attribute_values(":ts", attr_s(claims["sub"].as_str().unwrap_or_default()))
         .expression_attribute_values(":i", attr_s(&draft.issuer))
         .expression_attribute_values(":c", attr_s(&draft.client_id))
         .expression_attribute_values(":s", attr_s(&draft.secret_sealed))
@@ -2728,6 +2777,7 @@ pub async fn okta_test(
         tested_at: None,
         tested_email: None,
         tested_by: None,
+        tested_sub: None,
         updated_at: Some(chrono::Utc::now().to_rfc3339()),
         updated_by: Some(claims.display_name()),
     };
@@ -2802,7 +2852,8 @@ pub async fn okta_save(
     let client_changes = current.as_ref().is_some_and(|l| client_changed(l, &draft));
     let rule_on_now = rule_of(&state, &team).await?.require_okta;
     if client_changes && rule_on_now {
-        if let Err(why) = may_change_client(&claims, &draft) {
+        let live = current.as_ref().unwrap_or(&draft);
+        if let Err(why) = may_change_client(&claims, &draft, live, chrono::Utc::now()) {
             return Err((
                 StatusCode::CONFLICT,
                 Json(json!({ "error": why, "code": "okta_client_change" })),
@@ -2978,10 +3029,19 @@ pub fn client_changed(live: &OktaSetup, draft: &OktaSetup) -> bool {
     live.client_id != draft.client_id || live.secret_sealed != draft.secret_sealed
 }
 
+/// How old the owner's Test sign-in of a new Okta app may be.
+pub const CLIENT_TEST_MAX_SECS: i64 = 3600;
+
 /// While the team requires Okta sign-in, who may save a new Okta app: the
-/// owner, from their own Okta session, after their own Test sign-in of it.
-/// Pure.
-pub fn may_change_client(claims: &Claims, draft: &OktaSetup) -> Result<(), &'static str> {
+/// owner, from their own Okta session, after their own Test sign-in of it
+/// within the last hour, signed in there as the Okta identity they linked
+/// (the same subject, on the live issuer). Pure.
+pub fn may_change_client(
+    claims: &Claims,
+    draft: &OktaSetup,
+    live: &OktaSetup,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(), &'static str> {
     if claims.role != "owner" || claims.support_view.is_some() {
         return Err("Okta sign-in is required, so only the owner can change the Okta app.");
     }
@@ -2994,6 +3054,24 @@ pub fn may_change_client(claims: &Claims, draft: &OktaSetup) -> Result<(), &'sta
         return Err(
             "Okta sign-in is required: run Test sign-in with the new Okta app yourself first.",
         );
+    }
+    // The test signed in as the owner's own linked Okta identity, on the
+    // issuer their link (and this session) is for.
+    if draft.issuer != live.issuer
+        || claims.okta_sub.is_none()
+        || draft.tested_sub != claims.okta_sub
+    {
+        return Err("Okta sign-in is required: run Test sign-in with the new Okta app as the Okta account you linked.");
+    }
+    let fresh = draft
+        .tested_at
+        .as_deref()
+        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+        .is_some_and(|t| {
+            (now - t.with_timezone(&chrono::Utc)).num_seconds() <= CLIENT_TEST_MAX_SECS
+        });
+    if !fresh {
+        return Err("Okta sign-in is required: run Test sign-in with the new Okta app again (the last one is over an hour old).");
     }
     Ok(())
 }
@@ -3067,36 +3145,49 @@ pub async fn okta_verify_domains(
         if !txt_proves(&records, &expected) {
             continue;
         }
-        // Held by another team: read their record again now, so a proof
-        // whose TXT record is gone doesn't block this domain's real owner.
-        if let Ok(Some((other, _))) = domain_owner(&state, d).await {
-            if other != team {
-                let _ = fresh_domain_owner(&state, d, true).await;
-                // This team shows the matching record and the holder's is
-                // definitely gone: the holder's proof (even one kept failing
-                // while its rule is on) gives way now.
-                if domain_owner(&state, d)
-                    .await
-                    .ok()
-                    .flatten()
-                    .is_some_and(|(t, _)| t == other)
-                    && contender_takes_over(txt_check(&state, &other, d).await)
-                {
-                    let released = state
-                        .dynamo
-                        .delete_item()
-                        .table_name(&state.config.settings_table_name)
-                        .key("pk", attr_s(&format!("{OKTA_DOMAIN_PREFIX}{d}")))
-                        .key("sk", attr_s(OKTA_DOMAIN_SK))
-                        .condition_expression("team_id = :t")
-                        .expression_attribute_values(":t", attr_s(&other))
-                        .send()
-                        .await
-                        .is_ok();
-                    if released {
-                        warn!(domain = %d, "Okta domain proven by another team; the holder's gone proof released");
-                        super::require_okta::domain_released(&state, &other, d).await;
+        // Held by another team whose own record is definitely gone: this
+        // team shows the matching one, so the holder's proof (even one kept
+        // failing while its rule is on) gives way now, in one step: released
+        // only if it is still exactly the proof read here, and its owners
+        // get one email saying why. A holder whose record is still there, or
+        // that DNS gave no clear answer for, keeps it.
+        if let Ok(Some(held)) = raw_domain_record(&state, d).await {
+            let other = s(&held, "team_id").to_string();
+            if !other.is_empty()
+                && other != team
+                && contender_takes_over(txt_check(&state, &other, d).await)
+            {
+                let mut del = state
+                    .dynamo
+                    .delete_item()
+                    .table_name(&state.config.settings_table_name)
+                    .key("pk", attr_s(&format!("{OKTA_DOMAIN_PREFIX}{d}")))
+                    .key("sk", attr_s(OKTA_DOMAIN_SK))
+                    .expression_attribute_values(":t", attr_s(&other));
+                let mut cond = vec!["team_id = :t".to_string()];
+                for (attr, v) in [("verified_at", ":v"), ("checked_at", ":c")] {
+                    match opt(&held, attr) {
+                        Some(x) => {
+                            cond.push(format!("{attr} = {v}"));
+                            del = del.expression_attribute_values(v, attr_s(&x));
+                        }
+                        None => cond.push(format!("attribute_not_exists({attr})")),
                     }
+                }
+                let released = del
+                    .condition_expression(cond.join(" AND "))
+                    .send()
+                    .await
+                    .is_ok();
+                if released {
+                    warn!(domain = %d, "Okta domain proven by another team; the holder's gone proof released");
+                    super::require_okta::domain_released(
+                        &state,
+                        &other,
+                        d,
+                        super::require_okta::Released::Contender,
+                    )
+                    .await;
                 }
             }
         }
@@ -4592,8 +4683,10 @@ mod tests {
         assert_eq!(released_by_draft(&old, None, None).len(), 3);
         assert!(body_src("pub async fn okta_discard_draft(").contains("released_by_draft("));
         assert!(body_src("pub async fn okta_test(").contains("released_by_draft("));
+        // Verify reads another team's record again (and releases it only
+        // when it is definitely gone).
         assert!(body_src("pub async fn okta_verify_domains(")
-            .contains("fresh_domain_owner(&state, d, true)"));
+            .contains("txt_check(&state, &other, d)"));
     }
 
     /// 7: the link and test pages check the session like every request, and

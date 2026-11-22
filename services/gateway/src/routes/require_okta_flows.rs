@@ -1926,7 +1926,7 @@ async fn a_new_okta_app_needs_the_owners_own_test_while_the_rule_is_on() {
     let _self_hosted = crate::routes::setup_checks::test_self_hosted::set(true);
     let w = world().await;
     let owner = selfhost_org(&w, true);
-    let draft = |tested_by: &str| {
+    let draft = |tested_by: &str, tested_sub: &str, tested_at: String| {
         w.f.store.put(
             "settings",
             &[
@@ -1937,26 +1937,39 @@ async fn a_new_okta_app_needs_the_owners_own_test_while_the_rule_is_on() {
                 ("client_secret_sealed", json!("new-sealed")),
                 ("domains", json!(["example.com"])),
                 ("enabled", json!(false)),
-                ("tested_at", json!("2026-11-20T00:00:00Z")),
+                ("tested_at", json!(tested_at)),
                 ("tested_by", json!(tested_by)),
+                ("tested_sub", json!(tested_sub)),
                 ("updated_at", json!("2026-11-20T00:00:00Z")),
             ],
         )
     };
+    let now = || chrono::Utc::now().to_rfc3339();
     let save = json!({ "enabled": true, "issuer": ISSUER, "client_id": "new-client", "updated_at": "2026-11-20T00:00:00Z" });
+    let refused = |a: &Answer| a.body["code"] == "okta_client_change";
     // Tested by someone else: refused, the live app unchanged.
-    draft("USER#adm");
+    draft("USER#adm", "o", now());
     let a = w
         .call("POST", "/api/sign-in/okta/save", &owner, Some(save.clone()))
         .await;
-    assert_eq!(a.body["code"], "okta_client_change", "{}", a.body);
-    assert_eq!(
-        w.f.store
-            .get("settings", GATED, super::oidc_signin::OKTA_SK)
-            .unwrap()["client_id"],
-        "client"
+    assert!(refused(&a), "{}", a.body);
+    // The owner ran it, but signed in to Okta as another identity.
+    draft("USER#o", "someone-else", now());
+    let a = w
+        .call("POST", "/api/sign-in/okta/save", &owner, Some(save.clone()))
+        .await;
+    assert!(refused(&a), "{}", a.body);
+    // The owner's own identity, but the test is over an hour old.
+    draft(
+        "USER#o",
+        "o",
+        (chrono::Utc::now() - chrono::Duration::minutes(61)).to_rfc3339(),
     );
-    // The owner from a password (break-glass) session: refused.
+    let a = w
+        .call("POST", "/api/sign-in/okta/save", &owner, Some(save.clone()))
+        .await;
+    assert!(refused(&a), "{}", a.body);
+    // From a password (break-glass) session: refused.
     let bg = w.cookie(
         GATED,
         "USER#o",
@@ -1964,12 +1977,18 @@ async fn a_new_okta_app_needs_the_owners_own_test_while_the_rule_is_on() {
         "owner",
         &SignInProof::new(true, "password").with_break_glass(Some(GATED)),
     );
-    draft("USER#o");
+    draft("USER#o", "o", now());
     let a = w
         .call("POST", "/api/sign-in/okta/save", &bg, Some(save.clone()))
         .await;
-    assert_eq!(a.body["code"], "okta_client_change", "{}", a.body);
-    // The owner, from Okta, after their own test: saved.
+    assert!(refused(&a), "{}", a.body);
+    assert_eq!(
+        w.f.store
+            .get("settings", GATED, super::oidc_signin::OKTA_SK)
+            .unwrap()["client_id"],
+        "client"
+    );
+    // The owner, from Okta, after their own fresh test as their own identity.
     let a = w
         .call("POST", "/api/sign-in/okta/save", &owner, Some(save))
         .await;

@@ -578,9 +578,11 @@ pub const TEMPLATES: &[Template] = &[
         subject: "an Okta email domain was released",
         subject_by: "",
         subjects: &[],
-        params: &[p("link", Kind::Link)],
+        params: &[p("reason", Kind::Line(240)), p("link", Kind::Link)],
         body: &[
-            Part::Para("The DNS record that proved one of your team's Okta email domains stayed gone, so CoderHelm released the domain."),
+            // Why: its record is gone, it stayed gone past the grace
+            // period, or another team proved the domain meanwhile.
+            Part::Para("{reason}"),
             Part::Para("People at it can't sign in with Okta until you add the TXT record back and choose Verify domains in Settings, Sign-in rules."),
             Part::Button("Open Sign-in rules", "link"),
         ],

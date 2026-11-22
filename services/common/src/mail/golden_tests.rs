@@ -112,7 +112,7 @@ fn cases() -> Vec<(&'static str, &'static str, Value, Option<&'static str>)> {
         (
             "okta_domain_released",
             "okta_domain_released",
-            json!({"link": format!("{APP}/settings/sign-in/")}),
+            json!({"reason": "Another team proved one of your team's Okta email domains with its own DNS record while yours was missing, so the domain is now theirs.", "link": format!("{APP}/settings/sign-in/")}),
             Some("Acme"),
         ),
         (

@@ -1060,7 +1060,7 @@ pub async fn domain_failing(state: &AppState, team_id: &str, domain: &str, first
         "okta_domain_failing",
         "An Okta email domain failed its DNS check",
         &words,
-        Some(&until),
+        &[("until", until.as_str())],
     )
     .await;
     audit_system(
@@ -1071,25 +1071,60 @@ pub async fn domain_failing(state: &AppState, team_id: &str, domain: &str, first
     .await;
 }
 
-/// A proof released after its grace period, or because another team proved
-/// the domain while its record here was gone: the owners are told.
-pub async fn domain_released(state: &AppState, team_id: &str, domain: &str) {
-    let words = released_words();
+/// Why a domain proof was released, for the owners' email and the log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Released {
+    /// Its TXT record is definitely gone, and the rule was off.
+    Gone,
+    /// It stayed gone for the whole grace period while the rule was on.
+    GraceOver,
+    /// Another team proved the domain with its own record while this
+    /// team's was gone.
+    Contender,
+}
+
+impl Released {
+    /// The email's first sentence (a domain name reads as a link in email,
+    /// so none is named).
+    pub fn sentence(self) -> String {
+        match self {
+            Released::Gone => "The DNS record that proved one of your team's Okta email domains is gone, so CoderHelm released the domain.".into(),
+            Released::GraceOver => format!(
+                "The DNS record that proved one of your team's Okta email domains stayed gone for {} days while Okta sign-in was required, so CoderHelm released the domain.",
+                super::oidc_signin::FAILING_GRACE_DAYS
+            ),
+            Released::Contender => "Another team proved one of your team's Okta email domains with its own DNS record while yours was missing, so the domain is now theirs.".into(),
+        }
+    }
+
+    pub fn log(self, domain: &str) -> String {
+        match self {
+            Released::Gone => format!("Okta email domain {domain} released: its DNS record is gone"),
+            Released::GraceOver => format!(
+                "Okta email domain {domain} released: its DNS record stayed gone past the grace period"
+            ),
+            Released::Contender => format!(
+                "Okta email domain {domain} released: another team proved it while this team's record was gone"
+            ),
+        }
+    }
+}
+
+/// A released proof: the owners get one email and the log one line, both
+/// saying why.
+pub async fn domain_released(state: &AppState, team_id: &str, domain: &str, why: Released) {
+    let sentence = why.sentence();
+    let words = released_words(&sentence);
     tell_owners(
         state,
         team_id,
         "okta_domain_released",
         "An Okta email domain was released",
         &words,
-        None,
+        &[("reason", sentence.as_str())],
     )
     .await;
-    audit_system(
-        state,
-        team_id,
-        format!("Okta email domain {domain} released: its DNS record stayed gone"),
-    )
-    .await;
+    audit_system(state, team_id, why.log(domain)).await;
 }
 
 /// The email's words for a failing proof (the same as its template: a
@@ -1100,8 +1135,8 @@ pub fn failing_words(until: &str) -> String {
     )
 }
 
-pub fn released_words() -> String {
-    "The DNS record that proved one of your team's Okta email domains stayed gone, so CoderHelm released the domain. People at it can't sign in with Okta until you add the TXT record back and choose Verify domains in Settings, Sign-in rules.".into()
+pub fn released_words(sentence: &str) -> String {
+    format!("{sentence} People at it can't sign in with Okta until you add the TXT record back and choose Verify domains in Settings, Sign-in rules.")
 }
 
 async fn tell_owners(
@@ -1110,7 +1145,7 @@ async fn tell_owners(
     template: &'static str,
     subject: &str,
     words: &str,
-    until: Option<&str>,
+    extra: &[(&str, &str)],
 ) {
     let link = format!(
         "{}/settings/sign-in/",
@@ -1129,8 +1164,8 @@ async fn tell_owners(
         }
         let mut params = serde_json::Map::new();
         params.insert("link".into(), Value::from(link.clone()));
-        if let Some(u) = until {
-            params.insert("until".into(), Value::from(u));
+        for (k, v) in extra {
+            params.insert((*k).into(), Value::from(*v));
         }
         sign_in::send_mail(
             state,
@@ -1892,5 +1927,54 @@ mod tests {
             "log(changes.join(\". \")).await?;\n        }\n        None"
         ));
         assert!(u.contains("Cancelled, nothing changed"));
+    }
+
+    #[test]
+    fn a_failed_release_gives_no_owner_unless_the_rule_kept_it() {
+        use super::super::oidc_signin::owner_after_failed_release as after;
+        // Refused because the team turned the rule on and still holds it.
+        assert_eq!(after(Some("TEAM#a"), "TEAM#a", true), Some("TEAM#a".into()));
+        // Any other failure fails closed: nobody owns it here.
+        assert_eq!(after(Some("TEAM#a"), "TEAM#a", false), None);
+        assert_eq!(after(Some("TEAM#b"), "TEAM#a", true), None);
+        assert_eq!(after(None, "TEAM#a", true), None);
+        let oidc = code(include_str!("oidc_signin.rs"));
+        let f = body(oidc, "fresh_domain_owner");
+        assert!(before(
+            f,
+            "release_domain_while_rule_off(",
+            "owner_after_failed_release("
+        ));
+        assert!(!f.contains(".is_err()\n    {\n        return Ok(Some(team));"));
+        // A release on the rule-off path tells the owners too.
+        assert!(f.contains("Released::Gone"));
+    }
+
+    #[test]
+    fn a_contender_release_is_one_step_with_the_right_words() {
+        let oidc = code(include_str!("oidc_signin.rs"));
+        let v = body(oidc, "okta_verify_domains");
+        // No "kept until" first: the holder's proof isn't rechecked through
+        // the grace path before a contender release.
+        assert!(!v.contains("fresh_domain_owner(&state, d, true)"));
+        assert!(before(v, "raw_domain_record(", "contender_takes_over("));
+        // The delete holds only for exactly the proof read (its team, when
+        // it was verified and last checked).
+        assert!(v.contains(r#"("verified_at", ":v"), ("checked_at", ":c")"#));
+        assert!(v.contains(r#"cond.push(format!("{attr} = {v}"))"#));
+        assert!(v.contains("Released::Contender"));
+        assert!(Released::Contender
+            .sentence()
+            .contains("Another team proved"));
+        assert!(Released::GraceOver
+            .sentence()
+            .contains("stayed gone for 7 days"));
+        assert!(Released::Gone.sentence().contains("is gone"));
+        assert!(Released::Contender
+            .log("example.com")
+            .contains("another team proved it"));
+        for r in [Released::Gone, Released::GraceOver, Released::Contender] {
+            assert!(!r.sentence().contains("example.com"));
+        }
     }
 }

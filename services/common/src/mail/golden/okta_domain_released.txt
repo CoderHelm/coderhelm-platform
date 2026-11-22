@@ -1,7 +1,7 @@
 From: "Acme CoderHelm" <notifications@notify.coderhelm.com>
 Subject: Acme CoderHelm: an Okta email domain was released
 
-The DNS record that proved one of your team's Okta email domains stayed gone, so CoderHelm released the domain.
+Another team proved one of your team's Okta email domains with its own DNS record while yours was missing, so the domain is now theirs.
 
 People at it can't sign in with Okta until you add the TXT record back and choose Verify domains in Settings, Sign-in rules.
 
