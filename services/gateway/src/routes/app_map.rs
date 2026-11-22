@@ -1,16 +1,16 @@
-//! Dashboard API for the APP MAP (`common::app_map`): how the team's app
-//! fits together across its repositories, read from what the worker keeps
-//! in the team's own partition (`AM#{team}`). Every read is the signed-in
-//! team's: a part, file or screen of another team is simply not found.
+//! Dashboard API for the APP MAP: the team's map as Floorplan (vendored at
+//! `vendor/floorplan`, MIT) built it in the worker (`common::app_map`), with
+//! CoderHelm's Recent work and Health put into the map's own fields when it
+//! is read, so Floorplan's viewer shows them natively. Every read is the
+//! signed-in team's own map: another team's part, file or screen is simply
+//! not found.
 //!
-//! - `GET /api/app-map`: the whole map and its build status (the first
-//!   visit queues the first build);
-//! - `GET /api/app-map/part?id=`, `/file?repo=&path=`, `/screen?id=`,
-//!   `/search?q=`: one part, one file, everything behind one screen, search;
-//! - `GET /api/app-map/overlays?days=`: CoderHelm's recent runs and its
-//!   security, infrastructure, log and alert findings placed on the map;
+//! - `GET /api/app-map?recent=1&health=1`: the build status and the map
+//!   (the first visit starts the first build);
+//! - `GET /api/app-map/part?id=`, `/file?path=`, `/screen?id=`, `/search?q=`:
+//!   lookups;
 //! - `POST /api/app-map/ask`: a question answered by Chat's agent with map
-//!   lookups, returned with the parts and lines involved and numbered steps;
+//!   lookups, with numbered steps and a small map of the parts involved;
 //! - `POST /api/app-map/rebuild`: an admin builds it again.
 
 use std::collections::BTreeSet;
@@ -19,7 +19,7 @@ use std::sync::Arc;
 use aws_sdk_dynamodb::types::AttributeValue;
 use axum::extract::{Query, State};
 use axum::{http::StatusCode, Extension, Json};
-use common::app_map::{self as am, HealthItem, RepoMap, TeamMap, WorkItem};
+use common::app_map::{self as am, HealthItem, WorkItem};
 use common::knowledge::answer::{Registry, SourceRef};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -29,16 +29,7 @@ use super::chat_agent;
 use crate::models::Claims;
 use crate::AppState;
 
-async fn team_maps(state: &AppState, team_id: &str) -> Result<Vec<RepoMap>, StatusCode> {
-    am::load_all(&state.dynamo, &state.config.settings_table_name, team_id)
-        .await
-        .map_err(|e| {
-            error!("app map: {e}");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })
-}
-
-/// Queues a whole-team build: once (`force` false) or again (an admin).
+/// Queues a build: once (`force` false) or again (an admin).
 async fn queue_build(state: &AppState, team_id: &str, force: bool) -> bool {
     let table = &state.config.settings_table_name;
     match am::mark_queued(&state.dynamo, table, team_id, force).await {
@@ -51,7 +42,7 @@ async fn queue_build(state: &AppState, team_id: &str, force: bool) -> bool {
     }
     let msg = crate::models::WorkerMessage::AppMap(crate::models::AppMapMessage {
         team_id: team_id.to_string(),
-        repo: String::new(),
+        ..Default::default()
     });
     let Ok(body) = serde_json::to_string(&msg) else {
         return false;
@@ -77,8 +68,8 @@ async fn queue_build(state: &AppState, team_id: &str, force: bool) -> bool {
                 &am::Status {
                     state: "failed".into(),
                     at: chrono::Utc::now().timestamp(),
+                    step: String::new(),
                     error: "The build could not be started. Try again in a moment.".into(),
-                    ..Default::default()
                 },
             )
             .await;
@@ -87,49 +78,18 @@ async fn queue_build(state: &AppState, team_id: &str, force: bool) -> bool {
     }
 }
 
-/// What the page shows about the build: `building` while there is nothing
-/// to show yet, else `ready` (with `updating` while a refresh runs).
+/// What the page shows about the build: `building` while there is no map
+/// yet, else `ready` (with `updating` while an update runs).
 pub fn shown_state(st: Option<&am::Status>, has_map: bool, now: i64) -> (&'static str, bool) {
     let running =
         st.is_some_and(|s| matches!(s.state.as_str(), "queued" | "building") && !s.is_stale(now));
     match (has_map, st) {
         (true, _) => ("ready", running),
+        (false, _) if running => ("building", true),
         (false, Some(s)) if s.state == "failed" => ("failed", false),
-        (false, Some(_)) if running => ("building", true),
         (false, Some(s)) if s.state == "ready" => ("empty", false),
         _ => ("not_built", false),
     }
-}
-
-/// GET /api/app-map — the whole map, or where its first build is.
-pub async fn get_map(
-    State(state): State<Arc<AppState>>,
-    Extension(claims): Extension<Claims>,
-) -> Result<Json<Value>, StatusCode> {
-    let table = &state.config.settings_table_name;
-    let (maps, st) = tokio::join!(
-        team_maps(&state, &claims.team_id),
-        am::status(&state.dynamo, table, &claims.team_id),
-    );
-    let maps = maps?;
-    let now = chrono::Utc::now().timestamp();
-    let (mut shown, mut updating) = shown_state(st.as_ref(), !maps.is_empty(), now);
-    if shown == "not_built" && queue_build(&state, &claims.team_id, false).await {
-        shown = "building";
-        updating = true;
-    }
-    let status = json!({
-        "state": shown,
-        "updating": updating,
-        "done": st.as_ref().map(|s| s.done).unwrap_or(0),
-        "total": st.as_ref().map(|s| s.total).unwrap_or(0),
-        "note": st.as_ref().map(|s| s.error.clone()).unwrap_or_default(),
-    });
-    if maps.is_empty() {
-        return Ok(Json(json!({ "status": status, "map": Value::Null })));
-    }
-    let map = am::assemble(&maps);
-    Ok(Json(json!({ "status": status, "map": am::overview(&map) })))
 }
 
 #[derive(Deserialize, Default)]
@@ -137,32 +97,86 @@ pub struct MapQuery {
     #[serde(default)]
     pub id: String,
     #[serde(default)]
-    pub repo: String,
-    #[serde(default)]
     pub path: String,
     #[serde(default)]
     pub q: String,
     #[serde(default)]
-    pub days: Option<u32>,
+    pub recent: Option<u8>,
+    #[serde(default)]
+    pub health: Option<u8>,
 }
 
-fn bounded(s: &str, max: usize) -> Result<String, StatusCode> {
+/// GET /api/app-map — the build status and the map, ready for the viewer.
+pub async fn get_map(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Query(q): Query<MapQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    let table = &state.config.settings_table_name;
+    let (graph, st) = tokio::join!(
+        am::load_graph(&state.s3, &state.config.bucket_name, &claims.team_id),
+        am::status(&state.dynamo, table, &claims.team_id),
+    );
+    let now = chrono::Utc::now().timestamp();
+    let (mut shown, mut updating) = shown_state(st.as_ref(), graph.is_some(), now);
+    if shown == "not_built" && queue_build(&state, &claims.team_id, false).await {
+        shown = "building";
+        updating = true;
+    }
+    let status = json!({
+        "state": shown,
+        "updating": updating,
+        "step": st.as_ref().map(|s| s.step.clone()).unwrap_or_default(),
+        "note": st.as_ref().map(|s| s.error.clone()).unwrap_or_default(),
+        "floorplan": am::FLOORPLAN_VERSION.trim(),
+    });
+    let Some(graph) = graph else {
+        return Ok(Json(json!({ "status": status, "graph": Value::Null })));
+    };
+    let days = 14;
+    let (runs, found) = tokio::join!(
+        async {
+            if q.recent == Some(1) {
+                Some(recent_runs(&state, &claims.team_id, days).await)
+            } else {
+                None
+            }
+        },
+        async {
+            if q.health == Some(1) {
+                Some(health(&state, &claims.team_id, days).await)
+            } else {
+                None
+            }
+        },
+    );
+    let mut runs = runs;
+    if let Some(runs) = runs.as_mut() {
+        for w in runs.iter_mut().take(25) {
+            w.why = plan_why(&state, &claims.team_id, &w.ticket, &w.repo).await;
+        }
+    }
+    let graph = am::with_overlays(graph, runs.as_deref(), found.as_deref());
+    let graph = am::for_viewer(graph, &chrono::Utc::now().to_rfc3339());
+    Ok(Json(json!({ "status": status, "graph": graph })))
+}
+
+fn bounded(s: &str, max: usize) -> Result<(), StatusCode> {
     let s = s.trim();
     if s.is_empty() || s.len() > max || s.contains('\0') {
         return Err(StatusCode::BAD_REQUEST);
     }
-    Ok(s.to_string())
+    Ok(())
 }
 
-/// One view of the signed-in team's map: `None` when what was asked for
+/// One lookup in the signed-in team's map: `None` when what was asked for
 /// isn't in it (another team's part, file or screen included).
-pub fn view(maps: &[RepoMap], kind: &str, q: &MapQuery) -> Option<Value> {
-    let map = am::assemble(maps);
+pub fn view(graph: &Value, kind: &str, q: &MapQuery) -> Option<Value> {
     match kind {
-        "part" => am::part_view(&map, maps, &q.id),
-        "file" => am::file_view(&map, maps, &q.repo, &q.path),
-        "screen" => am::screen_chain(&map, maps, &q.id),
-        "search" => Some(am::search(&map, maps, &q.q)),
+        "part" => am::part_view(graph, q.id.trim()),
+        "file" => am::file_view(graph, q.path.trim()),
+        "screen" => am::screen_view(graph, q.id.trim()),
+        "search" => Some(am::search(graph, &q.q)),
         _ => None,
     }
 }
@@ -173,39 +187,40 @@ async fn one(
     kind: &str,
     q: &MapQuery,
 ) -> Result<Json<Value>, StatusCode> {
-    let maps = team_maps(state, &claims.team_id).await?;
-    view(&maps, kind, q).map(Json).ok_or(StatusCode::NOT_FOUND)
+    let graph = am::load_graph(&state.s3, &state.config.bucket_name, &claims.team_id)
+        .await
+        .ok_or(StatusCode::NOT_FOUND)?;
+    view(&graph, kind, q).map(Json).ok_or(StatusCode::NOT_FOUND)
 }
 
-/// GET /api/app-map/part?id= — one part with its files, endpoints, screens,
-/// requests (and how each was matched) and lines.
+/// GET /api/app-map/part?id= — one part: files, endpoints, lines in and out.
 pub async fn part(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
     Query(q): Query<MapQuery>,
 ) -> Result<Json<Value>, StatusCode> {
-    bounded(&q.id, 400)?;
+    bounded(&q.id, 300)?;
     one(&state, &claims, "part", &q).await
 }
 
-/// GET /api/app-map/file?repo=&path= — one file.
+/// GET /api/app-map/file?path= — one file (`<repo folder>/<path>`).
 pub async fn file(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
     Query(q): Query<MapQuery>,
 ) -> Result<Json<Value>, StatusCode> {
-    bounded(&q.repo, 200)?;
-    bounded(&q.path, 400)?;
+    bounded(&q.path, 600)?;
     one(&state, &claims, "file", &q).await
 }
 
-/// GET /api/app-map/screen?id= — everything behind one screen.
+/// GET /api/app-map/screen?id= — everything behind one screen (its id or
+/// its address).
 pub async fn screen(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
     Query(q): Query<MapQuery>,
 ) -> Result<Json<Value>, StatusCode> {
-    bounded(&q.id, 800)?;
+    bounded(&q.id, 600)?;
     one(&state, &claims, "screen", &q).await
 }
 
@@ -219,8 +234,8 @@ pub async fn search(
     one(&state, &claims, "search", &q).await
 }
 
-/// POST /api/app-map/rebuild — admin. Builds the whole map again (parts
-/// that didn't change keep their descriptions).
+/// POST /api/app-map/rebuild — admin. Builds the map again (Floorplan's
+/// refresh carries every description that still fits).
 pub async fn rebuild(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
@@ -233,15 +248,14 @@ pub async fn rebuild(
     }
 }
 
-// ── Overlays ───────────────────────────────────────────────────────────────
+// ── Recent work and Health (CoderHelm's own records) ───────────────────────
 
 /// The `Why` of a plan's proposal: its first paragraph under a "Why"
 /// heading, or its first paragraph.
 pub fn why_of(proposal: &str) -> String {
-    let mut lines = proposal.lines().map(str::trim);
     let mut under_why = false;
     let mut out = Vec::new();
-    for l in lines.by_ref() {
+    for l in proposal.lines().map(str::trim) {
         if l.starts_with('#') {
             if under_why && !out.is_empty() {
                 break;
@@ -298,7 +312,7 @@ async fn plan_why(state: &AppState, team_id: &str, ticket: &str, repo: &str) -> 
     String::new()
 }
 
-/// Runs of the last `days` days, newest first, at most 60.
+/// Runs of the last `days` days that changed files, newest first, at most 60.
 async fn recent_runs(state: &AppState, team_id: &str, days: u32) -> Vec<WorkItem> {
     let cutoff = (chrono::Utc::now() - chrono::Duration::days(days as i64)).to_rfc3339();
     let mut out = Vec::new();
@@ -374,18 +388,17 @@ fn str_at<'a>(v: &'a Value, path: &[&str]) -> &'a str {
     cur.as_str().unwrap_or("")
 }
 
-/// A dependency finding, as the overlay places it: its manifest and the
-/// code lines its evidence names.
+/// A dependency finding: its manifest and the code lines its evidence names.
 pub fn security_item(f: &Value) -> HealthItem {
-    let mut files: Vec<String> = Vec::new();
+    let mut files: Vec<(String, u32)> = Vec::new();
     let manifest = str_at(f, &["manifest"]);
     if !manifest.is_empty() {
-        files.push(manifest.to_string());
+        files.push((manifest.to_string(), 0));
     }
     for l in f["evidence"]["lines"].as_array().into_iter().flatten() {
         let file = l["file"].as_str().unwrap_or("");
-        if !file.is_empty() && !files.iter().any(|x| x == file) {
-            files.push(file.to_string());
+        if !file.is_empty() {
+            files.push((file.to_string(), l["line"].as_u64().unwrap_or(0) as u32));
         }
     }
     let title = [str_at(f, &["advisory", "title"]), str_at(f, &["package"])]
@@ -397,7 +410,7 @@ pub fn security_item(f: &Value) -> HealthItem {
         kind: "security".into(),
         id: id.to_string(),
         title: title.to_string(),
-        severity: f["tier"].as_str().map(str::to_string).unwrap_or_default(),
+        severity: f["tier"].as_str().unwrap_or("").to_string(),
         repo: str_at(f, &["repo"]).to_string(),
         files,
         link: format!("/security/detail?id={}", urlencoding::encode(id)),
@@ -422,7 +435,7 @@ pub fn infra_item(r: &Value) -> Option<HealthItem> {
         files: if file.is_empty() {
             vec![]
         } else {
-            vec![file.to_string()]
+            vec![(file.to_string(), loc["line"].as_u64().unwrap_or(0) as u32)]
         },
         link: format!(
             "/security/infrastructure?finding={}",
@@ -446,10 +459,9 @@ async fn health(state: &AppState, team_id: &str, days: u32) -> Vec<HealthItem> {
     if let Ok(records) = super::infra_security::load_records(state, team_id).await {
         for r in records {
             let v = serde_json::to_value(&r).unwrap_or_default();
-            if matches!(str_at(&v, &["status"]), "fixed" | "dismissed" | "resolved") {
-                continue;
+            if !matches!(str_at(&v, &["status"]), "fixed" | "dismissed" | "resolved") {
+                out.extend(infra_item(&v));
             }
-            out.extend(infra_item(&v));
         }
     }
     if let Ok(found) = common::log_findings::list_findings(
@@ -503,7 +515,7 @@ async fn health(state: &AppState, team_id: &str, days: u32) -> Vec<HealthItem> {
                 kind: "alert".into(),
                 id: s("id"),
                 title: s("title"),
-                severity: s("kind"),
+                severity: "high".into(),
                 repo: s("repo"),
                 files: Vec::new(),
                 link: format!("/alerts/detail?id={}", urlencoding::encode(&s("id"))),
@@ -513,84 +525,49 @@ async fn health(state: &AppState, team_id: &str, days: u32) -> Vec<HealthItem> {
     out
 }
 
-/// GET /api/app-map/overlays?days=14 — Recent work and Health.
-pub async fn overlays(
-    State(state): State<Arc<AppState>>,
-    Extension(claims): Extension<Claims>,
-    Query(q): Query<MapQuery>,
-) -> Result<Json<Value>, StatusCode> {
-    let days = q.days.unwrap_or(14).clamp(1, 90);
-    let (maps, runs, found) = tokio::join!(
-        team_maps(&state, &claims.team_id),
-        recent_runs(&state, &claims.team_id, days),
-        health(&state, &claims.team_id, days),
-    );
-    let maps = maps?;
-    let mut work = am::place_work(&maps, runs);
-    // The plan's why, for the runs shown (bounded reads).
-    for w in work.iter_mut().take(25) {
-        w.item.why = plan_why(&state, &claims.team_id, &w.item.ticket, &w.item.repo).await;
-    }
-    let health = am::place_health(&maps, found);
-    Ok(Json(
-        json!({ "days": days, "work": work, "health": health }),
-    ))
-}
-
 // ── Ask the map ────────────────────────────────────────────────────────────
 
-/// The lookups the Ask agent has.
+/// The Ask agent's lookups.
 pub fn tool_defs() -> Vec<Value> {
     let obj = |props: Value, req: &[&str]| json!({"type": "object", "properties": props, "required": req});
     vec![
-        json!({"name": "map_overview", "description": "Every part of the team's app (id, plain name, kind, what it does) and the lines between them, with how sure each line is.", "input_schema": obj(json!({}), &[])}),
-        json!({"name": "map_find", "description": "Search the map: parts, screens, endpoints and files whose name or path contains the words.", "input_schema": obj(json!({"query": {"type": "string"}}), &["query"])}),
-        json!({"name": "map_part", "description": "One part by id: its files, endpoints, screens, the requests it makes and how each was matched, and its lines in and out.", "input_schema": obj(json!({"id": {"type": "string"}}), &["id"])}),
-        json!({"name": "map_screen", "description": "Everything behind one screen (by its id or its route, like /slips/:id): the files it reaches, the requests they make, the endpoints that answer them and the outside services behind them.", "input_schema": obj(json!({"screen": {"type": "string"}}), &["screen"])}),
-        json!({"name": "map_file", "description": "One file by repository and path: its part, endpoints, screens, packages, imports and who calls it.", "input_schema": obj(json!({"repo": {"type": "string"}, "path": {"type": "string"}}), &["repo", "path"])}),
+        json!({"name": "map_overview", "description": "The app map in short: every part (id, name, kind, what it does), the screens, the Health counts and the repositories.", "input_schema": obj(json!({}), &[])}),
+        json!({"name": "map_find", "description": "Search the map: parts, files, endpoints and screens whose names, descriptions or paths hold every word.", "input_schema": obj(json!({"query": {"type": "string"}}), &["query"])}),
+        json!({"name": "map_part", "description": "One part by id: its sub-parts, files, endpoints, and the lines in and out (imports, web requests matched to endpoints, outside services).", "input_schema": obj(json!({"id": {"type": "string"}}), &["id"])}),
+        json!({"name": "map_screen", "description": "Everything behind one screen, by its id or its address (like /slips/:id), step by step: the files it uses, the requests it makes, the server code that answers and the outside services behind it.", "input_schema": obj(json!({"screen": {"type": "string"}}), &["screen"])}),
+        json!({"name": "map_file", "description": "One file by its path on the map (repository folder first, like harbor-api/src/bookings.js): what it is, its endpoints and what it connects to.", "input_schema": obj(json!({"path": {"type": "string"}}), &["path"])}),
     ]
 }
 
-/// The Ask agent's toolbox over one team's map. Records the parts and lines
-/// its lookups touched, for the mini map.
+/// The Ask agent's toolbox over one team's map. Records the map ids its
+/// lookups returned, for the small map.
 pub struct MapBox {
-    pub maps: Vec<RepoMap>,
-    pub map: TeamMap,
+    pub graph: Value,
     pub defs: Vec<Value>,
-    pub parts: BTreeSet<String>,
-    pub outside: BTreeSet<String>,
+    pub ids: Vec<String>,
 }
 
 impl MapBox {
-    pub fn new(maps: Vec<RepoMap>) -> Self {
-        let map = am::assemble(&maps);
+    pub fn new(graph: Value) -> Self {
         Self {
-            maps,
-            map,
+            graph,
             defs: tool_defs(),
-            parts: BTreeSet::new(),
-            outside: BTreeSet::new(),
+            ids: Vec::new(),
         }
     }
 
-    fn note_parts(&mut self, v: &Value) {
+    fn note(&mut self, v: &Value) {
         let mut stack = vec![v];
         while let Some(x) = stack.pop() {
             match x {
                 Value::Object(o) => {
-                    for (k, val) in o {
-                        if let Some(s) = val.as_str() {
-                            if (k == "part" || k == "id" || k == "from" || k == "to")
-                                && self.map.parts.iter().any(|p| p.id == s)
-                            {
-                                self.parts.insert(s.to_string());
-                            }
-                            if let Some(o) = s.strip_prefix("outside:") {
-                                self.outside.insert(o.to_string());
-                            }
-                        }
-                        stack.push(val);
+                    if let Some(id) = o.get("id").and_then(|i| i.as_str()) {
+                        self.ids.push(id.to_string());
                     }
+                    if let Some(p) = o.get("path").and_then(|i| i.as_str()) {
+                        self.ids.push(format!("f:{p}"));
+                    }
+                    stack.extend(o.values());
                 }
                 Value::Array(a) => stack.extend(a.iter()),
                 _ => {}
@@ -598,47 +575,30 @@ impl MapBox {
         }
     }
 
-    /// Runs one lookup: (text for the model, label).
+    /// Runs one lookup: (what the model reads, label).
     pub fn lookup(&mut self, name: &str, input: &Value) -> (Value, String) {
         let s = |k: &str| input[k].as_str().unwrap_or("").trim().to_string();
-        match name {
-            "map_overview" => {
-                let mut v = am::overview(&self.map);
-                v["screens"] = json!(self.map.screens.iter().take(60).collect::<Vec<_>>());
-                (v, "Read the map".into())
-            }
-            "map_find" => (
-                am::search(&self.map, &self.maps, &s("query")),
-                format!("Searched the map for {}", s("query")),
+        let (v, label) = match name {
+            "map_overview" => (am::overview(&self.graph), "Read the map".to_string()),
+            "map_find" => (am::search(&self.graph, &s("query")), format!("Searched the map for {}", s("query"))),
+            "map_part" => (
+                am::part_view(&self.graph, &s("id")).unwrap_or_else(|| json!({"error": "No part has that id; use map_overview or map_find for ids."})),
+                "Opened a part".to_string(),
             ),
-            "map_part" => {
-                let v = am::part_view(&self.map, &self.maps, &s("id")).unwrap_or_else(|| json!({"error": "No part has that id; use map_overview or map_find for ids."}));
-                if v.get("part").is_some() {
-                    self.parts.insert(s("id"));
-                }
-                (v, "Opened a part".into())
-            }
-            "map_screen" => {
-                let want = s("screen");
-                let id = self
-                    .map
-                    .screens
-                    .iter()
-                    .find(|x| x.id == want || x.route == want)
-                    .map(|x| x.id.clone())
-                    .unwrap_or_default();
-                let v = am::screen_chain(&self.map, &self.maps, &id).unwrap_or_else(
-                    || json!({"error": "No screen has that id or route; use map_find."}),
-                );
-                (v, format!("Followed the screen {want}"))
-            }
-            "map_file" => {
-                let v = am::file_view(&self.map, &self.maps, &s("repo"), &s("path"))
-                    .unwrap_or_else(|| json!({"error": "That file isn't on the map."}));
-                (v, format!("Opened {}", s("path")))
-            }
+            "map_screen" => (
+                am::screen_view(&self.graph, &s("screen")).unwrap_or_else(|| json!({"error": "No screen has that id or address; use map_overview."})),
+                format!("Followed the screen {}", s("screen")),
+            ),
+            "map_file" => (
+                am::file_view(&self.graph, &s("path")).unwrap_or_else(|| json!({"error": "That file isn't on the map."})),
+                format!("Opened {}", s("path")),
+            ),
             _ => (json!({"error": "Unknown lookup."}), name.to_string()),
+        };
+        if v.get("error").is_none() && !matches!(name, "map_overview" | "map_find") {
+            self.note(&v);
         }
+        (v, label)
     }
 }
 
@@ -657,9 +617,6 @@ impl chat_agent::Toolbox for MapBox {
     ) -> chat_agent::Called {
         let (v, label) = self.lookup(name, input);
         let is_error = v.get("error").is_some();
-        if !is_error && name != "map_overview" && name != "map_find" {
-            self.note_parts(&v);
-        }
         let text = common::truncate_str(&v.to_string(), 30_000).to_string();
         let id = reg.add(SourceRef {
             kind: "app_map".into(),
@@ -686,11 +643,10 @@ impl chat_agent::Sink for Quiet {
     async fn send(&self, _kind: &str, _data: Value) {}
 }
 
-pub const ASK_SYSTEM: &str = "You answer questions about how a team's app fits together, from its app map. \
-Use the map lookups (start with map_overview or map_find, then open parts, screens and files) and answer only \
-from what they return. Write for someone who may not read code: plain words first, developer names in \
-parentheses. When the question is about how something happens, answer with numbered steps, one line each, \
-in the order it happens. Say plainly when a line on the map is a guess or a request isn't matched, and why. \
+pub const ASK_SYSTEM: &str = "You answer questions about how a team's app fits together, from its app map (made with Floorplan). \
+Use the map lookups (start with map_overview or map_find, then open parts, screens and files) and answer only from what they return. \
+Write for someone who may not read code: plain words first, file paths in parentheses. When the question is about how something happens, \
+answer with numbered steps, one line each, in the order it happens. Say plainly when a connection is inferred rather than certain. \
 Cite each lookup you rely on with its id in brackets, like [S1]. No arrows.";
 
 /// The numbered steps of an answer (`1. ...`).
@@ -705,45 +661,6 @@ pub fn steps_of(answer: &str) -> Vec<String> {
                 .filter(|r| !r.is_empty())
         })
         .collect()
-}
-
-/// The mini map: the parts the answer's lookups touched (and the parts its
-/// steps name), the lines among them, and their outside services.
-pub fn mini_map(
-    map: &TeamMap,
-    parts: &BTreeSet<String>,
-    outside: &BTreeSet<String>,
-    answer: &str,
-) -> Value {
-    let mut ids: BTreeSet<String> = parts.clone();
-    let low = answer.to_ascii_lowercase();
-    for p in &map.parts {
-        if low.contains(&p.name.to_ascii_lowercase())
-            || (p.dev_name.len() > 3 && low.contains(&p.dev_name.to_ascii_lowercase()))
-        {
-            ids.insert(p.id.clone());
-        }
-    }
-    let conns: Vec<&am::Connection> = map
-        .connections
-        .iter()
-        .filter(|c| {
-            ids.contains(&c.from)
-                && (ids.contains(&c.to)
-                    || c.to
-                        .strip_prefix("outside:")
-                        .is_some_and(|o| outside.contains(o)))
-        })
-        .collect();
-    let used_out: BTreeSet<&str> = conns
-        .iter()
-        .filter_map(|c| c.to.strip_prefix("outside:"))
-        .collect();
-    json!({
-        "parts": map.parts.iter().filter(|p| ids.contains(&p.id)).map(|p| json!({"id": p.id, "name": p.name, "kind": p.kind, "dev_name": p.dev_name, "repo": p.repo})).collect::<Vec<_>>(),
-        "connections": conns,
-        "outside": map.outside.iter().filter(|o| used_out.contains(o.id.as_str())).collect::<Vec<_>>(),
-    })
 }
 
 #[derive(Deserialize)]
@@ -769,15 +686,12 @@ pub async fn ask(
     if question.is_empty() {
         return Err(fail(StatusCode::BAD_REQUEST, "Ask a question."));
     }
-    let maps = team_maps(&state, &claims.team_id)
+    let graph = am::load_graph(&state.s3, &state.config.bucket_name, &claims.team_id)
         .await
-        .map_err(|c| fail(c, "The map couldn't be read."))?;
-    if maps.is_empty() {
-        return Err(fail(StatusCode::CONFLICT, "The map is still being built."));
-    }
+        .ok_or_else(|| fail(StatusCode::CONFLICT, "The map is still being built."))?;
     let (api_key, _heavy, check_model_id) =
         super::brain::load_provider(&state, &claims.team_id).await;
-    let mut tools = MapBox::new(maps);
+    let mut tools = MapBox::new(graph);
     let model = chat_agent::ApiModel {
         http: reqwest::Client::new(),
         api_key: api_key.unwrap_or_default(),
@@ -813,79 +727,62 @@ pub async fn ask(
         "answer": answer,
         "grounded": out.fin.grounded,
         "steps": steps_of(&answer),
-        "map": mini_map(&tools.map, &tools.parts, &tools.outside, &answer),
-        "lookups": out.used,
+        "graph": mini_map(&tools),
     })))
+}
+
+/// The parts the answer's lookups touched, as a map the same viewer draws;
+/// `null` when they touched none.
+pub fn mini_map(tools: &MapBox) -> Value {
+    let parts: BTreeSet<String> = am::parts_of(&tools.graph, &tools.ids);
+    if parts.is_empty() {
+        return Value::Null;
+    }
+    am::for_viewer(
+        am::sub_map(&tools.graph, &parts),
+        &chrono::Utc::now().to_rfc3339(),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use common::app_map::{build_parts, repo_map, RepoInput};
-    use common::app_surface::scan;
 
-    fn maps(repo: &str) -> Vec<RepoMap> {
-        let files = [
-            (
-                "package.json",
-                r#"{"name": "dock-api", "dependencies": {"express": "4"}}"#,
-            ),
-            (
-                "src/slips.ts",
-                "import express from 'express';\nrouter.get('/slips/:id', (req, res) => {});",
-            ),
-            (
-                "web/app/slips/page.tsx",
-                "export default () => fetch('/slips/1')",
-            ),
-        ];
-        let input = RepoInput {
-            repo: repo.into(),
-            commit: "c1".into(),
-            files: files.iter().map(|(p, _)| p.to_string()).collect(),
-            surfaces: files
-                .iter()
-                .map(|(p, s)| (p.to_string(), scan(p, s)))
-                .collect(),
-            imports: vec![],
-        };
-        vec![repo_map(&input, build_parts(&input), "now")]
+    fn harbor() -> Value {
+        let mut g: Value = serde_json::from_str(include_str!(
+            "../../../worker/floorplan/fixtures/harbor-graph.json"
+        ))
+        .unwrap();
+        am::stamp_repos(
+            &mut g,
+            &am::folders(&["harbor/harbor-web".into(), "harbor/harbor-api".into()]),
+        );
+        g
     }
 
     #[test]
     fn a_team_reads_only_its_own_map() {
-        let mine = maps("harbor/dock");
+        let mine = harbor();
         let q = |id: &str| MapQuery {
             id: id.into(),
             ..Default::default()
         };
-        assert!(view(&mine, "part", &q("harbor/dock#.")).is_some());
-        // Another team's part, file or screen: not found in this team's map.
-        assert!(view(&mine, "part", &q("other/marina#.")).is_none());
-        let f = MapQuery {
-            repo: "other/marina".into(),
-            path: "src/slips.ts".into(),
-            ..Default::default()
-        };
-        assert!(view(&mine, "file", &f).is_none());
+        assert!(view(&mine, "part", &q("api")).is_some());
+        // Another team's part, file or screen is not in this team's map.
+        assert!(view(&mine, "part", &q("marina-docks")).is_none());
         assert!(view(
             &mine,
-            "screen",
-            &q("other/marina#web/app/slips/page.tsx#/slips")
-        )
-        .is_none());
-        assert!(view(
-            &[],
-            "search",
+            "file",
             &MapQuery {
-                q: "slips".into(),
+                path: "marina/src/x.js".into(),
                 ..Default::default()
             }
         )
-        .unwrap()["parts"]
-            .as_array()
-            .unwrap()
-            .is_empty());
+        .is_none());
+        assert!(view(&mine, "screen", &q("screen:marina:/berths")).is_none());
+        assert!(view(&mine, "screen", &q("/slips/:id")).is_some());
+        // Each team's map has its own keys.
+        assert_ne!(am::graph_key("team-a"), am::graph_key("team-b"));
         assert_eq!(am::map_pk("team-a"), "AM#team-a");
     }
 
@@ -909,7 +806,6 @@ mod tests {
             shown_state(Some(&st("failed", 100)), false, 100),
             ("failed", false)
         );
-        // Stuck past the limit: built again on the next visit.
         assert_eq!(
             shown_state(Some(&st("queued", 0)), false, am::STALE_SECS + 1),
             ("not_built", false)
@@ -921,18 +817,25 @@ mod tests {
     }
 
     #[test]
-    fn the_ask_lookups_answer_from_the_map_and_record_what_they_touched() {
-        let mut b = MapBox::new(maps("harbor/dock"));
-        let (v, _) = b.lookup("map_part", &json!({"id": "harbor/dock#."}));
-        assert!(v["endpoints"].as_array().is_some_and(|e| !e.is_empty()));
-        assert!(b.parts.contains("harbor/dock#."));
+    fn the_ask_lookups_answer_from_the_map_and_draw_what_they_touched() {
+        let mut b = MapBox::new(harbor());
+        let (v, _) = b.lookup("map_screen", &json!({"screen": "/slips/:id"}));
+        assert_eq!(
+            v["behind"].as_array().unwrap().last().unwrap()["step"],
+            "outside"
+        );
         let (v, _) = b.lookup("map_part", &json!({"id": "nope"}));
         assert!(v.get("error").is_some());
-        let (v, _) = b.lookup("map_screen", &json!({"screen": "/slips"}));
-        assert!(
-            v["requests"].as_array().is_some_and(|r| !r.is_empty()),
-            "{v}"
-        );
+        let mini = mini_map(&b);
+        let parts: Vec<&str> = mini["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|n| n["id"].as_str())
+            .collect();
+        assert_eq!(parts, vec!["web", "api", "stripe"]);
+        assert_eq!(mini["meta"]["exported"]["by"], "Coderhelm");
+        assert!(mini_map(&MapBox::new(harbor())).is_null());
         let defs = tool_defs();
         let names: Vec<&str> = defs.iter().filter_map(|d| d["name"].as_str()).collect();
         assert_eq!(
@@ -948,38 +851,45 @@ mod tests {
     }
 
     #[test]
-    fn answers_give_numbered_steps_and_a_mini_map() {
-        let a = "Booking a slip:\n1. The slip screen asks the API [S1].\n2) The API reads the slip.\nNot a step.\n10. Done.";
+    fn answers_give_numbered_steps() {
+        let a = "Booking a slip:\n1. The slip page sends the booking [S1].\n2) The booking service charges the card.\nNot a step.\n10. Done.";
         assert_eq!(
             steps_of(a),
             vec![
-                "The slip screen asks the API [S1].",
-                "The API reads the slip.",
+                "The slip page sends the booking [S1].",
+                "The booking service charges the card.",
                 "Done."
             ]
         );
-        let m = maps("harbor/dock");
-        let map = am::assemble(&m);
-        let mini = mini_map(
-            &map,
-            &BTreeSet::from(["harbor/dock#.".to_string()]),
-            &BTreeSet::new(),
-            "x",
-        );
-        assert_eq!(mini["parts"].as_array().unwrap().len(), 1);
     }
 
     #[test]
-    fn overlay_items_read_findings_and_plans() {
-        let f = json!({"id": "f1", "repo": "harbor/dock", "manifest": "package.json", "tier": "P1",
-            "advisory": {"title": "Prototype pollution"}, "evidence": {"lines": [{"file": "src/slips.ts", "line": 3}]}});
+    fn findings_and_plans_read_into_overlay_items() {
+        let f = json!({"id": "f1", "repo": "harbor/harbor-api", "manifest": "package.json", "tier": "P1",
+            "advisory": {"title": "Prototype pollution"}, "evidence": {"lines": [{"file": "src/bookings.js", "line": 5}]}});
         let it = security_item(&f);
-        assert_eq!(it.files, vec!["package.json", "src/slips.ts"]);
+        assert_eq!(
+            it.files,
+            vec![
+                ("package.json".to_string(), 0),
+                ("src/bookings.js".to_string(), 5)
+            ]
+        );
         assert_eq!(it.link, "/security/detail?id=f1");
-        let r = json!({"id": "i1", "title": "Open bucket", "severity": "important", "fix": {"location": {"repo": "harbor/dock", "file": "infra/main.tf"}}});
-        assert_eq!(infra_item(&r).unwrap().files, vec!["infra/main.tf"]);
+        let r = json!({"id": "i1", "title": "Open bucket", "severity": "important", "fix": {"location": {"repo": "harbor/harbor-api", "file": "infra/main.tf"}}});
+        assert_eq!(
+            infra_item(&r).unwrap().files,
+            vec![("infra/main.tf".to_string(), 0)]
+        );
         assert!(infra_item(&json!({"id": "i2"})).is_none());
         assert_eq!(why_of("# Proposal\n\n## Why\nBoaters can't book a slip twice.\nIt double charges.\n\n## What\nx"), "Boaters can't book a slip twice. It double charges.");
-        assert_eq!(why_of("Fix the tide chart."), "Fix the tide chart.");
+        // Placed on the map, in Floorplan's own Health field.
+        let g = am::with_overlays(harbor(), None, Some(&[it]));
+        assert!(g["health"]["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["source"] == "coderhelm"
+                && i["items"] == json!(["f:harbor-api/src/bookings.js"])));
     }
 }

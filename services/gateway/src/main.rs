@@ -720,13 +720,13 @@ fn build_app(state: Arc<AppState>) -> Router {
             put(routes::graph::update_config),
         )
         .route("/graph/rebuild/:owner/:name", post(routes::graph::rebuild))
-        // App map: the team's app across its repositories (common::app_map).
+        // App map: the team's app across its repositories, made with Floorplan
+        // (vendor/floorplan) and read through common::app_map.
         .route("/app-map", get(routes::app_map::get_map))
         .route("/app-map/part", get(routes::app_map::part))
         .route("/app-map/file", get(routes::app_map::file))
         .route("/app-map/screen", get(routes::app_map::screen))
         .route("/app-map/search", get(routes::app_map::search))
-        .route("/app-map/overlays", get(routes::app_map::overlays))
         .route("/app-map/ask", post(routes::app_map::ask))
         .route("/app-map/rebuild", post(routes::app_map::rebuild))
         // GitHub App installation

@@ -1258,7 +1258,7 @@ fn has_time_for_remediation(start: &Instant) -> bool {
 pub mod agent_file;
 pub mod agent_tools;
 pub mod alert_episodes;
-/// The team's app map, kept current with its code graphs (`common::app_map`).
+/// The team's app map: Floorplan (vendor/floorplan) run in the sandbox (`common::app_map`).
 pub mod app_map;
 pub mod await_merge;
 pub mod aws_permissions;

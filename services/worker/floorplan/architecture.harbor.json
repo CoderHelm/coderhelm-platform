@@ -1,0 +1,14 @@
+{
+  "$schema": "floorplan/architecture@1",
+  "project": { "name": "Harbor", "summary": "A website where boaters book a slip, and the booking service that takes the booking and the payment." },
+  "nodes": [
+    { "id": "web", "label": "Harbor website", "kind": "ui", "summary": "Where boaters find a slip and book it.", "paths": ["harbor-web"] },
+    { "id": "api", "label": "Booking service", "kind": "service", "summary": "Takes bookings and charges for them.", "paths": ["harbor-api"] },
+    { "id": "stripe", "label": "Stripe", "kind": "external", "summary": "Card payments.", "packages": ["stripe"] }
+  ],
+  "tour": [
+    { "node": "web", "title": "Start with the website", "note": "Boaters pick a slip here and book it." },
+    { "node": "api", "title": "The booking service", "note": "It takes the booking and charges the card." },
+    { "node": "stripe", "title": "Payments", "note": "Card payments go through Stripe." }
+  ]
+}

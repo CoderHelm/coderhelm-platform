@@ -47,15 +47,6 @@ use super::{attr_n, attr_s};
 /// not dominate the graph or the write budget.
 const MAX_SYMBOLS_PER_FILE: usize = 400;
 const MAX_REFS_PER_FILE: usize = 800;
-/// The sort key prefix of a file's app facts (`common::app_surface`).
-pub const APP_FACTS_PREFIX: &str = "AF#";
-
-/// Whether the indexer reads `path`: a language it extracts symbols from,
-/// or a file the app map learns from (routes, manifests, templates).
-fn indexed(path: &str) -> bool {
-    language_for(path).is_some() || common::app_surface::wants(path)
-}
-
 /// Partition key for a repo's graph.
 fn graph_pk(team_id: &str, owner: &str, repo: &str) -> String {
     format!("CG#{team_id}#{owner}/{repo}")
@@ -291,11 +282,7 @@ fn import_specifier(text: &str) -> Option<String> {
 
 /// Resolve an import specifier to a repo file path, best-effort name matching
 /// against the known file set (`./util` → `src/util.ts`, `a.b.c` → `a/b/c.py`).
-pub(crate) fn resolve_import(
-    spec: &str,
-    from_file: &str,
-    files: &HashSet<String>,
-) -> Option<String> {
+fn resolve_import(spec: &str, from_file: &str, files: &HashSet<String>) -> Option<String> {
     let dir = from_file.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
     let mut candidates: Vec<String> = Vec::new();
     if let Some(rel) = spec.strip_prefix("./") {
@@ -502,7 +489,7 @@ fn del_req(pk: &str, sk: &str) -> WriteRequest {
 }
 
 /// Query every item in the partition with an sk prefix (paginated).
-pub(crate) async fn query_prefix(
+async fn query_prefix(
     state: &WorkerState,
     pk: &str,
     prefix: &str,
@@ -544,7 +531,7 @@ pub(crate) async fn query_prefix(
     items
 }
 
-pub(crate) fn item_s(item: &HashMap<String, AttributeValue>, k: &str) -> String {
+fn item_s(item: &HashMap<String, AttributeValue>, k: &str) -> String {
     item.get(k)
         .and_then(|v| v.as_s().ok())
         .cloned()
@@ -560,7 +547,6 @@ fn file_write_requests(
     facts: &FileFacts,
     resolved_imports: &[String],
     rank: f64,
-    surface: Option<&common::app_surface::Surface>,
 ) -> Vec<WriteRequest> {
     let mut reqs = Vec::new();
     let mut contributed: Vec<String> = Vec::new();
@@ -602,11 +588,6 @@ fn file_write_requests(
         contributed.push(rev.clone());
         reqs.push(put_req(pk, fwd, vec![]));
         reqs.push(put_req(pk, rev, vec![]));
-    }
-    if let Some(sf) = surface.filter(|s| !s.is_empty()) {
-        let sk = format!("{}{path}", APP_FACTS_PREFIX);
-        contributed.push(sk.clone());
-        reqs.push(put_req(pk, sk, vec![("s", attr_s(&sf.to_json()))]));
     }
     // Manifest last: list of contributed sks (bounded by the per-file caps).
     reqs.push(put_req(
@@ -665,12 +646,14 @@ pub async fn run(
         "",
     )
     .await;
+    let pushed = msg.changed_files.is_some();
     match index_pass(state, msg).await {
         Ok(()) => {
             cg::set_status(&state.dynamo, table, &team_id, &repo, BuildState::Ready, "").await;
-            // The app map follows the graph: only this repository's parts
-            // whose files changed are described again.
-            super::app_map::refresh_repo(state, &team_id, &repo).await;
+            // A push to a default branch: the team's app map follows it.
+            if pushed {
+                super::app_map::after_push(state, &team_id).await;
+            }
             Ok(())
         }
         Err(e) => {
@@ -716,8 +699,16 @@ async fn index_pass(
 
     // Which files to (re)extract this pass.
     let targets: Vec<String> = match &msg.changed_files {
-        Some(changed) => changed.iter().filter(|p| indexed(p)).cloned().collect(),
-        None => all_paths.iter().filter(|p| indexed(p)).cloned().collect(),
+        Some(changed) => changed
+            .iter()
+            .filter(|p| language_for(p).is_some())
+            .cloned()
+            .collect(),
+        None => all_paths
+            .iter()
+            .filter(|p| language_for(p).is_some())
+            .cloned()
+            .collect(),
     };
     info!(
         repo = %format!("{owner}/{repo}"),
@@ -748,22 +739,13 @@ async fn index_pass(
 
     // Extract.
     let mut extracted: Vec<(String, FileFacts, Vec<String>)> = Vec::new();
-    let mut surfaces: HashMap<String, common::app_surface::Surface> = HashMap::new();
     for path in &targets {
         let Some(source) = snapshot.read_file(path).await else {
             continue; // deleted or binary
         };
-        // What the file says about the app (endpoints, requests, screens,
-        // packages), kept beside its symbols for the app map.
-        let surface = common::app_surface::scan(path, &source);
-        let facts = match extract(path, &source) {
-            Some(f) => f,
-            None if !surface.is_empty() => FileFacts::default(),
-            None => continue,
+        let Some(facts) = extract(path, &source) else {
+            continue;
         };
-        if !surface.is_empty() {
-            surfaces.insert(path.clone(), surface);
-        }
         // Two specifiers (`./a` and `./a.ts`) can resolve to the same file.
         let mut resolved: Vec<String> = facts
             .imports
@@ -891,14 +873,7 @@ async fn index_pass(
     let mut reqs = Vec::new();
     for (path, facts, resolved) in &extracted {
         let rank = ranks.get(path).copied().unwrap_or(0.0);
-        reqs.extend(file_write_requests(
-            &pk,
-            path,
-            facts,
-            resolved,
-            rank,
-            surfaces.get(path),
-        ));
+        reqs.extend(file_write_requests(&pk, path, facts, resolved, rank));
     }
     let wrote = reqs.len();
     batch_write(state, reqs).await;
@@ -916,7 +891,6 @@ async fn index_pass(
         .item("files", attr_n(extracted.len() as u64))
         .item("symbols", attr_n(def_counts as u64))
         .item("names_referenced", attr_n(ref_counts as u64))
-        .item("surface", attr_n(common::app_surface::VERSION as u64))
         .item("updated_at", attr_s(&chrono::Utc::now().to_rfc3339()))
         .send()
         .await;
@@ -1301,7 +1275,7 @@ pub async fn queue_full_index(
 }
 
 /// The team's GitHub App installation, for a build queued without one.
-async fn team_installation_id(state: &WorkerState, team_id: &str) -> Option<u64> {
+pub(crate) async fn team_installation_id(state: &WorkerState, team_id: &str) -> Option<u64> {
     let item = state
         .dynamo
         .get_item()
@@ -1726,7 +1700,7 @@ class OrderService { run() { this.processAll(); } }
             imports: vec![],
         };
         let resolved = vec!["src/b.ts".to_string(), "src/b.ts".to_string()];
-        let reqs = file_write_requests("pk", "src/a.ts", &facts, &resolved, 0.1, None);
+        let reqs = file_write_requests("pk", "src/a.ts", &facts, &resolved, 0.1);
         let keys: Vec<(String, String)> = reqs.iter().filter_map(request_key).collect();
         let unique: HashSet<&(String, String)> = keys.iter().collect();
         assert_eq!(keys.len(), unique.len(), "no duplicate keys in one batch");
