@@ -1764,13 +1764,14 @@ pub async fn mfa_verify_setup(
         Some("cognito"),
     )
     .await;
-    // The re-issued session keeps how it signed in (an Okta session stays one).
-    let via = proof
-        .as_ref()
-        .and_then(|p| p.via.clone())
-        .unwrap_or_else(|| "password".to_string());
-    let cookie = crate::routes::sign_in::session_with_second_factor(&state, &claims, &via)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    // The re-issued session keeps how it signed in (an Okta session stays
+    // one, an owner's break-glass session stays one).
+    let cookie = crate::routes::sign_in::session_with_second_factor(
+        &state,
+        &claims,
+        proof.as_ref().map(|p| &p.0),
+    )
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let mut resp = Json(json!({ "status": "enabled" })).into_response();
     if let Ok(v) = axum::http::HeaderValue::from_str(&cookie) {
         resp.headers_mut().append(axum::http::header::SET_COOKIE, v);

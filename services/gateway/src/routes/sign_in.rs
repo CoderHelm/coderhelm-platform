@@ -1232,19 +1232,26 @@ fn session_cookie(token: &str) -> String {
     )
 }
 
-/// A fresh session for `claims` that passed a second factor just now.
+/// A fresh session for `claims` that passed a second factor just now. It
+/// keeps how the current session signed in (`current`): its way in, its Okta
+/// subject, and an owner's break-glass mark.
 pub fn session_with_second_factor(
     state: &AppState,
     claims: &Claims,
-    via: &str,
+    current: Option<&SignInProof>,
 ) -> Result<String, ApiError> {
+    let via = current
+        .and_then(|p| p.via.clone())
+        .unwrap_or_else(|| "password".to_string());
     let token = jwt::create_session_token(
         &claims.sub,
         &claims.team_id,
         &claims.email,
         claims.session_role(),
         claims.github_login.as_deref(),
-        &SignInProof::new(true, via).with_okta_sub(claims.okta_sub.clone()),
+        &SignInProof::new(true, &via)
+            .with_okta_sub(claims.okta_sub.clone())
+            .with_break_glass(current.and_then(|p| p.break_glass.as_deref())),
         &state.secrets.jwt_secret,
         SESSION_TTL_SECS,
     )
@@ -1373,8 +1380,7 @@ pub async fn app_verify(
         .await
         .map_err(|e| internal("Two-factor not turned on", e))?;
     info!(team_id = %claims.team_id, "Authenticator-app two-factor turned on");
-    let via = via_of(proof.as_ref());
-    let cookie = session_with_second_factor(&state, &claims, &via)?;
+    let cookie = session_with_second_factor(&state, &claims, proof.as_ref().map(|p| &p.0))?;
     Ok(with_cookie(json!({ "status": "enabled" }), &cookie))
 }
 
@@ -2558,6 +2564,7 @@ pub async fn password_step(
         StepNeeded::None if step.break_glass && !passed => Ok(Some(
             super::require_okta::Refused {
                 team: String::new(),
+                team_id: step.team_id.clone(),
                 code: super::require_okta::NEEDS_2FA,
             }
             .json(),
@@ -3061,8 +3068,40 @@ pub async fn update_settings(
     let turning_on = body.require_2fa == Some(true) && !current.require_2fa;
     let signed_in = proof.as_ref().map(|p| p.0.clone()).unwrap_or_default();
     let okta_change = body.require_okta.filter(|v| *v != current.require_okta);
-    if let Some(on) = okta_change {
-        okta_rule_change(&state, &claims, &signed_in, on, body.acknowledge_unlinked).await?;
+    // Turning it on: the live Okta setup it was checked against, which the
+    // write below requires to be unchanged.
+    let okta_on_with = match okta_change {
+        Some(on) => {
+            okta_rule_change(&state, &claims, &signed_in, on, body.acknowledge_unlinked).await?
+        }
+        None => None,
+    };
+    // Self-hosted: an Okta setup with no domains of its own signs in the
+    // organization's allowed domains, so while the rule stays on none of
+    // them can be dropped (that would lock those people out).
+    let drops_org_domains = match (&domains, &org) {
+        (Some(d), Some(o)) => o.domains.iter().any(|x| !d.contains(x)),
+        _ => false,
+    };
+    let rule_stays_on =
+        (current.require_okta && okta_change != Some(false)) || okta_change == Some(true);
+    let mut guard_domains = false;
+    if drops_org_domains && okta_change != Some(false) {
+        let relies = super::oidc_signin::live_setup_of(&state, &claims.team_id)
+            .await
+            .map_err(|e| internal("Okta setup not read", e))?
+            .is_none_or(|l| l.domains.is_empty());
+        if relies {
+            if rule_stays_on {
+                return Err(fail_code(
+                    StatusCode::CONFLICT,
+                    "Your Okta signs in people at these allowed domains, and Okta sign-in is required: turn off Require Okta sign-in first, or list the domains in the Okta setup.",
+                    "okta_required_on",
+                ));
+            }
+            // Off now: the write holds only while it stays off.
+            guard_domains = true;
+        }
     }
     if turning_on && !proof.as_ref().is_some_and(|p| p.mfa) {
         return Err(fail_code(
@@ -3156,22 +3195,84 @@ pub async fn update_settings(
     } else {
         (claims.team_id.clone(), TEAM_RULE_SK)
     };
-    let up = state
-        .dynamo
-        .update_item()
-        .table_name(&state.config.settings_table_name)
-        .key("pk", attr_s(&pk))
-        .key("sk", attr_s(sk))
-        .update_expression(format!("SET {}", sets.join(", ")))
-        .set_expression_attribute_values(Some(values));
-    let up = if self_hosted {
-        up.condition_expression("attribute_exists(pk)")
-    } else {
-        up
-    };
-    up.send()
-        .await
-        .map_err(|e| internal("Sign-in rules not saved", e))?;
+    let mut conditions: Vec<&str> = Vec::new();
+    let mut names: HashMap<String, String> = HashMap::new();
+    if self_hosted {
+        conditions.push("attribute_exists(pk)");
+    }
+    if guard_domains {
+        conditions.push("(attribute_not_exists(#ro) OR #ro <> :on)");
+        names.insert("#ro".into(), "require_okta".into());
+        values.insert(":on".into(), AttributeValue::Bool(true));
+    }
+    let condition = (!conditions.is_empty()).then(|| conditions.join(" AND "));
+    let names = (!names.is_empty()).then_some(names);
+    match &okta_on_with {
+        // Turning Require Okta sign-in on: one transaction with the rule and
+        // a check that the Okta setup (and on hosted each proven domain) is
+        // exactly what was checked, so nothing that narrows Okta can land
+        // beside it.
+        Some(live) => {
+            use aws_sdk_dynamodb::types::{TransactWriteItem, Update};
+            let update = Update::builder()
+                .table_name(&state.config.settings_table_name)
+                .key("pk", attr_s(&pk))
+                .key("sk", attr_s(sk))
+                .update_expression(format!("SET {}", sets.join(", ")))
+                .set_condition_expression(condition)
+                .set_expression_attribute_names(names)
+                .set_expression_attribute_values(Some(values))
+                .build()
+                .map_err(|e| internal("Sign-in rules not saved", e))?;
+            let mut items = vec![TransactWriteItem::builder().update(update).build()];
+            items.extend(
+                super::require_okta::setup_unchanged(&state, live)
+                    .map_err(|e| internal("Sign-in rules not saved", e))?,
+            );
+            if let Err(e) = state
+                .dynamo
+                .transact_write_items()
+                .set_transact_items(Some(items))
+                .send()
+                .await
+            {
+                let e = format!("{e:?}");
+                if e.contains("TransactionCanceled") {
+                    return Err(fail_code(
+                        StatusCode::CONFLICT,
+                        "The Okta setup changed while you turned this on. Check it again, then turn it on.",
+                        "okta_changed",
+                    ));
+                }
+                return Err(internal("Sign-in rules not saved", e));
+            }
+        }
+        None => {
+            let up = state
+                .dynamo
+                .update_item()
+                .table_name(&state.config.settings_table_name)
+                .key("pk", attr_s(&pk))
+                .key("sk", attr_s(sk))
+                .update_expression(format!("SET {}", sets.join(", ")))
+                .set_condition_expression(condition)
+                .set_expression_attribute_names(names)
+                .set_expression_attribute_values(Some(values));
+            if let Err(e) = up.send().await {
+                if guard_domains
+                    && e.as_service_error()
+                        .is_some_and(|se| se.is_conditional_check_failed_exception())
+                {
+                    return Err(fail_code(
+                        StatusCode::CONFLICT,
+                        "Require Okta sign-in was turned on meanwhile. Turn it off first to drop allowed domains.",
+                        "okta_required_on",
+                    ));
+                }
+                return Err(internal("Sign-in rules not saved", e));
+            }
+        }
+    }
     info!(changes = ?changes, "Sign-in rules changed");
     let rule = team_rule(&state, &claims.team_id)
         .await
@@ -3213,7 +3314,7 @@ async fn okta_rule_change(
     signed_in: &SignInProof,
     on: bool,
     acknowledged: bool,
-) -> Result<(), ApiError> {
+) -> Result<Option<super::oidc_signin::OktaSetup>, ApiError> {
     let live = super::oidc_signin::live_setup_of(state, &claims.team_id)
         .await
         .map_err(|e| internal("Okta setup not read", e))?;
@@ -3229,7 +3330,7 @@ async fn okta_rule_change(
         return Err(fail_code(status, msg, code));
     }
     if !on {
-        return Ok(());
+        return Ok(None);
     }
     if let Some((status, code, msg)) = ready.first_missing() {
         return Err(fail_code(status, msg, code));
@@ -3253,7 +3354,7 @@ async fn okta_rule_change(
             })),
         ));
     }
-    Ok(())
+    Ok(live)
 }
 
 /// The team's name for an email (hosted), or "".
@@ -3283,7 +3384,7 @@ pub fn required_by_words(self_hosted: bool, team: &str) -> String {
 
 /// One email through the install's or hosted deployment's sender, recorded
 /// in Deliveries. Whether it was sent.
-async fn send_mail(
+pub(crate) async fn send_mail(
     state: &AppState,
     team_id: &str,
     template: &'static str,
@@ -4035,7 +4136,8 @@ mod tests {
         // The code, not its tests (which make tokens to check them).
         let flows = &flows[..flows.find("#[cfg(test)]\nmod tests").unwrap()];
         assert!(body(flows, "microsoft_callback_inner").contains("finish_oidc("));
-        assert!(body(flows, "okta_callback_inner").contains("finish_oidc("));
+        assert!(body(flows, "okta_callback_inner").contains("okta_land("));
+        assert!(body(flows, "okta_land").contains("finish_oidc("));
         assert!(!flows.contains("create_session_token"));
         // The landing makes teams only through the organization's own rules.
         let landing = body(auth, "selfhost_landing");

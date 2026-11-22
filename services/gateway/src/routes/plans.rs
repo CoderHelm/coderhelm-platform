@@ -2370,6 +2370,7 @@ each task becomes a full engineering effort with its own spec and PR."#;
 pub async fn stream_token(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
+    proof: Option<Extension<crate::auth::jwt::SignInProof>>,
 ) -> Result<Json<Value>, StatusCode> {
     claims.require_role(1)?; // member+ (viewers are read-only)
                              // Mint a short-lived token (5 minutes) scoped for streaming
@@ -2379,6 +2380,7 @@ pub async fn stream_token(
                              // is never a stream token.
     let token = crate::auth::jwt::create_scoped_token(
         &claims,
+        &proof.map(|p| p.0).unwrap_or_default(),
         crate::auth::jwt::PLAN_CHAT_AUDIENCE,
         &state.secrets.jwt_secret,
         300, // 5 minutes
@@ -3570,6 +3572,16 @@ pub async fn plan_chat_stream(
         warn!("plan_chat_stream: JWT validation failed: {e}");
         StatusCode::UNAUTHORIZED
     })?;
+    // The session it was minted from must still stand, as on every request:
+    // a team that turned on Require Okta sign-in since ends it here too.
+    let minted_by = crate::auth::jwt::read_scoped_proof(
+        token,
+        crate::auth::jwt::PLAN_CHAT_AUDIENCE,
+        &state.secrets.jwt_secret,
+    );
+    super::require_okta::check_scoped(&state, &claims, &minted_by)
+        .await
+        .map_err(|r| r.status())?;
 
     let messages_input = body["messages"].as_array().ok_or_else(|| {
         warn!("plan_chat_stream: missing messages array in body");

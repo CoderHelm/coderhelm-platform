@@ -472,18 +472,6 @@ pub async fn switch_team(
     if target_team != claims.team_id && super::oidc_signin::team_only(&claims) {
         return Err(StatusCode::FORBIDDEN);
     }
-    // A team that requires Okta sign-in is reached only by signing in with
-    // its Okta, never by switching from another team's session.
-    if target_team != claims.team_id
-        && super::sign_in::team_rule(&state, target_team)
-            .await
-            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
-            .require_okta
-    {
-        let team = super::require_okta::team_words(&state, target_team).await;
-        return Ok(super::require_okta::refused_json(&team).into_response());
-    }
-
     // Verify user exists in target team and get their role there
     let target_item = state
         .dynamo
@@ -495,7 +483,26 @@ pub async fn switch_team(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .item
+        .filter(|i| {
+            i.get("status")
+                .and_then(|v| v.as_s().ok())
+                .map(String::as_str)
+                != Some("invited")
+        })
         .ok_or(StatusCode::FORBIDDEN)?;
+
+    // A team that requires Okta sign-in is reached only by signing in with
+    // its Okta, never by switching from another team's session. Asked only
+    // once they are on it: a non-member learns nothing about a team's rules.
+    if target_team != claims.team_id
+        && super::sign_in::team_rule(&state, target_team)
+            .await
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+            .require_okta
+    {
+        let refused = super::require_okta::refused(&state, target_team).await;
+        return Ok(super::require_okta::refused_json(&refused).into_response());
+    }
 
     let target_role = target_item
         .get("role")

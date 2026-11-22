@@ -964,7 +964,7 @@ pub async fn okta_available(state: &AppState) -> bool {
 /// table, `pk = OKTA_DOMAIN#<domain>`, `sk = OKTA`). Written only after the
 /// domain's DNS shows the team's TXT record.
 pub const OKTA_DOMAIN_PREFIX: &str = "OKTA_DOMAIN#";
-const OKTA_DOMAIN_SK: &str = "OKTA";
+pub const OKTA_DOMAIN_SK: &str = "OKTA";
 
 /// The TXT record's name: `_coderhelm-okta.<domain>`.
 pub fn domain_txt_name(domain: &str) -> String {
@@ -1015,6 +1015,25 @@ async fn domain_owner(state: &AppState, domain: &str) -> Result<Option<(String, 
     Ok(domain_record(state, domain)
         .await?
         .map(|(t, verified, _)| (t, verified)))
+}
+
+/// When a proof's TXT record was found gone while Okta sign-in is required
+/// (the proof is kept, marked failing), if it was.
+pub(crate) async fn domain_failing_since(
+    state: &AppState,
+    domain: &str,
+) -> Result<Option<String>, String> {
+    let out = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(&format!("{OKTA_DOMAIN_PREFIX}{domain}")))
+        .key("sk", attr_s(OKTA_DOMAIN_SK))
+        .consistent_read(true)
+        .send()
+        .await
+        .map_err(|e| format!("{e}"))?;
+    Ok(out.item().and_then(|i| opt(i, "failing_at")))
 }
 
 /// The proof's team, `verified_at` and `checked_at`.
@@ -1115,7 +1134,7 @@ async fn fresh_domain_owner(
             .table_name(&state.config.settings_table_name)
             .key("pk", attr_s(&format!("{OKTA_DOMAIN_PREFIX}{domain}")))
             .key("sk", attr_s(OKTA_DOMAIN_SK))
-            .update_expression("SET checked_at = :now")
+            .update_expression("SET checked_at = :now REMOVE failing_at")
             .condition_expression("team_id = :t")
             .expression_attribute_values(":now", attr_s(&chrono::Utc::now().to_rfc3339()))
             .expression_attribute_values(":t", attr_s(&team))
@@ -1123,9 +1142,72 @@ async fn fresh_domain_owner(
             .await;
         return Ok(Some(team));
     }
+    // While the team requires Okta sign-in, a record that is gone never
+    // releases the domain by itself (that would lock everyone out): the
+    // proof is kept and marked failing, and the owners are told.
+    if !release_when_gone(super::sign_in::team_rule(state, &team).await?.require_okta) {
+        let marked = state
+            .dynamo
+            .update_item()
+            .table_name(&state.config.settings_table_name)
+            .key("pk", attr_s(&format!("{OKTA_DOMAIN_PREFIX}{domain}")))
+            .key("sk", attr_s(OKTA_DOMAIN_SK))
+            .update_expression("SET failing_at = :now, checked_at = :now")
+            .condition_expression("team_id = :t AND attribute_not_exists(failing_at)")
+            .expression_attribute_values(":now", attr_s(&chrono::Utc::now().to_rfc3339()))
+            .expression_attribute_values(":t", attr_s(&team))
+            .send()
+            .await
+            .is_ok();
+        super::require_okta::domain_failing(state, &team, domain, marked).await;
+        return Ok(Some(team));
+    }
     warn!(%domain, "Okta domain proof gone from DNS; released");
     let _ = release_domain(state, &team, domain).await;
     Ok(None)
+}
+
+/// Whether a proof whose TXT record is definitely gone is released. Not
+/// while the team requires Okta sign-in: it is kept and marked failing, so a
+/// DNS mistake can't lock the team out. Pure.
+pub fn release_when_gone(rule_on: bool) -> bool {
+    !rule_on
+}
+
+/// Whether a fresh TXT read counts when Require Okta sign-in is turned on:
+/// only a definite match (a read with no clear answer doesn't). Pure.
+pub fn counts_at_turn_on(check: ProofCheck) -> bool {
+    check == ProofCheck::There
+}
+
+/// Whether every domain of a hosted setup is proven by its own team right
+/// now: its TXT record read again and matching (a DNS read with no clear
+/// answer doesn't count), and no proof marked failing. Turning Require Okta
+/// sign-in on needs this.
+async fn domains_proven_now(state: &AppState, setup: &OktaSetup) -> Result<bool, String> {
+    if setup.domains.is_empty() {
+        return Ok(false);
+    }
+    for d in &setup.domains {
+        let rec = state
+            .dynamo
+            .get_item()
+            .table_name(&state.config.settings_table_name)
+            .key("pk", attr_s(&format!("{OKTA_DOMAIN_PREFIX}{d}")))
+            .key("sk", attr_s(OKTA_DOMAIN_SK))
+            .consistent_read(true)
+            .send()
+            .await
+            .map_err(|e| format!("{e}"))?
+            .item;
+        let ours = rec
+            .as_ref()
+            .is_some_and(|i| s(i, "team_id") == setup.team_id && s(i, "failing_at").is_empty());
+        if !ours || !counts_at_turn_on(txt_check(state, &setup.team_id, d).await) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Whether every domain of a hosted setup is proven by its own team, each
@@ -1150,13 +1232,15 @@ pub(crate) async fn domains_proven(
     recheck: bool,
 ) -> Result<bool, String> {
     if recheck {
-        return all_domains_proven(state, setup).await;
+        return domains_proven_now(state, setup).await;
     }
     if setup.domains.is_empty() {
         return Ok(false);
     }
     for d in &setup.domains {
-        if domain_owner(state, d).await?.map(|(t, _)| t) != Some(setup.team_id.clone()) {
+        if domain_owner(state, d).await?.map(|(t, _)| t) != Some(setup.team_id.clone())
+            || domain_failing_since(state, d).await?.is_some()
+        {
             return Ok(false);
         }
     }
@@ -1386,7 +1470,21 @@ async fn okta_callback_inner(
             )
         })?;
     let claims = okta_claims(state, cookies, params, flow, &setup).await?;
-    let person = okta_person(&claims)
+    okta_land(state, ip, &setup, &claims).await
+}
+
+/// Where an Okta sign-in lands once Okta's id_token for `setup` is checked:
+/// the covered email, (hosted) its proven domain, then the linked member or,
+/// while the team requires Okta, an invite for exactly that email.
+pub(crate) async fn okta_land(
+    state: &Arc<AppState>,
+    ip: &str,
+    setup: &OktaSetup,
+    claims: &Value,
+) -> Result<Response, SignInFailure> {
+    const P: Provider = Provider::Okta;
+    let setup = setup.clone();
+    let person = okta_person(claims)
         .map_err(|e| SignInFailure::new(P, Reason::NoVerifiedEmail, "email", e))?;
     let org_domains = if super::sign_in::applies() {
         super::sign_in::load_org(state)
@@ -1860,6 +1958,17 @@ pub async fn link_remove(
         .map_err(|e| internal("Member not read", e))?
         .item
         .ok_or_else(|| fail(StatusCode::NOT_FOUND, "You aren't on this team."))?;
+    // While the team requires Okta sign-in, unlinking would leave the member
+    // no way to sign in again.
+    if rule_of(&state, &claims.team_id).await?.require_okta {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "Your team requires Okta sign-in, so you can't unlink Okta: you couldn't sign in again. Ask the owner to turn the rule off first.",
+                "code": "okta_required_on",
+            })),
+        ));
+    }
     unlink_member(&state, &claims.team_id, &me)
         .await
         .map_err(|e| internal("Okta link not removed", e))?;
@@ -2327,6 +2436,15 @@ async fn okta_view(state: &AppState, team: &str) -> Result<Value, ApiError> {
                 "txt_name": domain_txt_name(d),
                 "txt_value": domain_txt_value(&state.secrets.jwt_secret, team, d),
                 "verified_at": owner.filter(|_| ours).map(|(_, at)| at),
+                // Kept while Okta sign-in is required, but its TXT record
+                // is gone: add it back and verify again.
+                "failing_since": if ours {
+                    domain_failing_since(state, d)
+                        .await
+                        .map_err(|e| internal("Okta domain not read", e))?
+                } else {
+                    None
+                },
                 "other_team": theirs,
             }));
         }
@@ -2573,9 +2691,12 @@ pub async fn okta_save(
     let before = load_setup(&state, &team, OKTA_SK)
         .await
         .map_err(|e| internal("Okta setup not read", e))?;
-    put_setup(&state, &live, OKTA_SK)
-        .await
-        .map_err(|e| internal("Okta setup not saved", e))?;
+    save_live(
+        &state,
+        &live,
+        save_narrows(before.as_ref(), &live, live.enabled),
+    )
+    .await?;
     if let Some(old) = &before {
         // A new issuer: every member's link was to the old one.
         if old.issuer != live.issuer {
@@ -2650,9 +2771,7 @@ pub async fn okta_toggle(
         updated_by: Some(claims.display_name()),
         ..live
     };
-    put_setup(&state, &next, OKTA_SK)
-        .await
-        .map_err(|e| internal("Okta setup not saved", e))?;
+    save_live(&state, &next, !next.enabled).await?;
     set_marker(&state, &team, next.enabled)
         .await
         .map_err(|e| internal("Okta marker not saved", e))?;
@@ -2662,6 +2781,29 @@ pub async fn okta_toggle(
             .map_err(|e| internal("Okta sessions not ended", e))?;
     }
     Ok(Json(okta_view(&state, &team).await?))
+}
+
+/// Saves the live setup; a save that narrows Okta sign-in (`narrows`: off,
+/// another issuer, a domain dropped) lands only while the team doesn't
+/// require Okta sign-in, checked in the same write.
+async fn save_live(state: &AppState, setup: &OktaSetup, narrows: bool) -> Result<(), ApiError> {
+    if !narrows {
+        return put_setup(state, setup, OKTA_SK)
+            .await
+            .map_err(|e| internal("Okta setup not saved", e));
+    }
+    use aws_sdk_dynamodb::types::{Put, TransactWriteItem};
+    let put = Put::builder()
+        .table_name(&state.config.settings_table_name)
+        .set_item(Some(setup.to_item(OKTA_SK)))
+        .build()
+        .map_err(|e| internal("Okta setup not saved", e))?;
+    super::require_okta::while_rule_off(
+        state,
+        &setup.team_id,
+        vec![TransactWriteItem::builder().put(put).build()],
+    )
+    .await
 }
 
 /// The team's sign-in rules (the Okta rule is checked before Okta changes).
@@ -2807,9 +2949,25 @@ pub async fn okta_release_domain(
         format!("Okta email domain released: {domain}"),
     )
     .await?;
-    release_domain(&state, &team, &domain)
-        .await
-        .map_err(|e| internal("Okta domain not released", e))?;
+    // Released only while the team doesn't require Okta sign-in, in the
+    // same write that checks it.
+    {
+        use aws_sdk_dynamodb::types::{Delete, TransactWriteItem};
+        let delete = Delete::builder()
+            .table_name(&state.config.settings_table_name)
+            .key("pk", attr_s(&format!("{OKTA_DOMAIN_PREFIX}{domain}")))
+            .key("sk", attr_s(OKTA_DOMAIN_SK))
+            .condition_expression("team_id = :t")
+            .expression_attribute_values(":t", attr_s(&team))
+            .build()
+            .map_err(|e| internal("Okta domain not released", e))?;
+        super::require_okta::while_rule_off(
+            &state,
+            &team,
+            vec![TransactWriteItem::builder().delete(delete).build()],
+        )
+        .await?;
+    }
     Ok(Json(okta_view(&state, &team).await?))
 }
 
@@ -2826,6 +2984,31 @@ pub async fn okta_delete(
         return Err(refused);
     }
     audit(&state, &claims, "Okta sign-in removed".into()).await?;
+    // The live setup goes first, only while the team doesn't require Okta
+    // sign-in (checked in the same write); then everything that hung on it.
+    {
+        use aws_sdk_dynamodb::types::{Delete, TransactWriteItem};
+        let delete = Delete::builder()
+            .table_name(&state.config.settings_table_name)
+            .key("pk", attr_s(&team))
+            .key("sk", attr_s(OKTA_SK))
+            .build()
+            .map_err(|e| internal("Okta setup not removed", e))?;
+        let current = load_setup(&state, &team, OKTA_SK)
+            .await
+            .map_err(|e| internal("Okta setup not read", e))?;
+        super::require_okta::while_rule_off(
+            &state,
+            &team,
+            vec![TransactWriteItem::builder().delete(delete).build()],
+        )
+        .await?;
+        if let Some(live) = current {
+            for d in &live.domains {
+                let _ = release_domain(&state, &team, d).await;
+            }
+        }
+    }
     // The team's proven domains are released, so their owner can use them again.
     for sk in [OKTA_SK, OKTA_DRAFT_SK] {
         if let Ok(Some(setup)) = load_setup(&state, &team, sk).await {
@@ -3571,7 +3754,7 @@ mod tests {
         assert!(!body.contains("records_by_email"), "lookup by membership");
         assert!(body.contains("domain_owner("));
         // The callback checks the token's email domain is proven by this team.
-        let cb = &src[src.find("async fn okta_callback_inner(").unwrap()..];
+        let cb = &src[src.find("async fn okta_land(").unwrap()..];
         let cb = &cb[..cb.find("\n}\n").unwrap()];
         assert!(cb.find("domain_owner(").unwrap() < cb.find("finish_oidc(").unwrap());
         // Turning Okta on (save or switch) needs every domain proven.
@@ -3784,7 +3967,7 @@ mod tests {
         assert!(linked_record(&members, "", "00uANN").is_none());
         // The callback lands through the link, never through the email.
         let src = include_str!("oidc_signin.rs");
-        let cb = &src[src.find("async fn okta_callback_inner(").unwrap()..];
+        let cb = &src[src.find("async fn okta_land(").unwrap()..];
         let cb = &cb[..cb.find("\n}\n").unwrap()];
         assert!(cb.contains("linked_record("));
         assert!(!cb.contains("records_by_email"));
@@ -4106,7 +4289,14 @@ mod tests {
         let mfa = &users[users.find("pub async fn mfa_verify_setup(").unwrap()..];
         let mfa = &mfa[..mfa.find("\n}\n").unwrap()];
         assert!(!mfa.contains("session_with_second_factor(&state, &claims, \"password\")"));
-        assert!(mfa.contains("p.via.clone()"));
+        // The current session's whole proof goes on (its way in included).
+        assert!(
+            mfa.contains("session_with_second_factor(")
+                && mfa.contains("proof.as_ref().map(|p| &p.0)")
+        );
+        let si = include_str!("sign_in.rs");
+        let f = &si[si.find("pub fn session_with_second_factor(").unwrap()..];
+        assert!(f[..f.find("\n}\n").unwrap()].contains("p.via.clone()"));
     }
 
     /// 4: one member per Okta identity, enforced by a row written in the

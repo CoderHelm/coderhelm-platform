@@ -106,6 +106,7 @@ pub const ESSENTIAL: &[EssentialEmail] = &[
     EssentialEmail { id: "two_factor_lockout", label: "Two-factor lockout alerts", why: "Tells admins and owners when someone's two-factor sign-in was paused after too many wrong codes." },
     EssentialEmail { id: "two_factor_required", label: "Two-factor sign-in required", why: "Tells people without a second factor that an admin now requires one, before their next sign-in is held." },
     EssentialEmail { id: "two_factor_changed", label: "Authenticator app changed", why: "Tells a person their authenticator app was replaced, so a change they didn't make doesn't go unnoticed." },
+    EssentialEmail { id: "okta_domain_failing", label: "Okta domain check failing", why: "Tells a team's owners when the DNS record that proves an Okta email domain is gone while Okta sign-in is required." },
     EssentialEmail { id: "two_factor_reset", label: "Two-factor sign-in reset", why: "Tells a person an admin reset their second factor, so a reset they didn't ask for doesn't go unnoticed." },
     EssentialEmail { id: "update_notice", label: "Update notices", why: "Tells install admins when an update failed, rolled back or waits for their OK, about address changes, and (unless turned off) a weekly summary of new releases." },
     EssentialEmail { id: "test_email", label: "Test email", why: "Sent only when an admin presses Send test email in Setup." },

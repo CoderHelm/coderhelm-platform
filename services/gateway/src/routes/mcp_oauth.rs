@@ -540,8 +540,8 @@ pub async fn decide_request(
                 .map_err(|e| internal("Sign-in rules not read", e))?
                 .require_okta
         {
-            let team = super::require_okta::team_words(&state, &claims.team_id).await;
-            return Err(super::require_okta::refused_json(&team));
+            let refused = super::require_okta::refused(&state, &claims.team_id).await;
+            return Err(super::require_okta::refused_json(&refused));
         }
         let who = oauth::Consent {
             team_id: claims.team_id.clone(),

@@ -92,6 +92,10 @@ pub struct LoginRequest {
     /// sign-in (routes::require_okta).
     #[serde(default)]
     pub break_glass: bool,
+    /// The team a break-glass sign-in is for (an owner of several teams that
+    /// require Okta names the one they mean).
+    #[serde(default)]
+    pub break_glass_team: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -129,6 +133,8 @@ pub struct MfaChallengeRequest {
     /// Carried from the sign-in that asked for this code.
     #[serde(default)]
     pub break_glass: bool,
+    #[serde(default)]
+    pub break_glass_team: Option<String>,
 }
 
 // ── Signup ───────────────────────────────────────────────────────────
@@ -568,7 +574,15 @@ pub async fn login_email(
         }
     };
 
-    finish_password_login(&state, &email, &auth_result, false, body.break_glass).await
+    finish_password_login(
+        &state,
+        &email,
+        &auth_result,
+        false,
+        body.break_glass,
+        body.break_glass_team.clone(),
+    )
+    .await
 }
 
 /// Why Cognito refused a password sign-in, from its error (Debug form).
@@ -634,6 +648,7 @@ async fn finish_password_login(
     auth_result: &aws_sdk_cognitoidentityprovider::operation::initiate_auth::InitiateAuthOutput,
     second_factor_passed: bool,
     break_glass: bool,
+    break_glass_team: Option<String>,
 ) -> Result<Response, StatusCode> {
     // Check if MFA challenge is required
     if let Some(challenge) = auth_result.challenge_name() {
@@ -663,6 +678,7 @@ async fn finish_password_login(
         access_token,
         &SignInProof::new(second_factor_passed, "password"),
         break_glass,
+        break_glass_team,
     )
     .await
 }
@@ -777,7 +793,7 @@ pub async fn login_carry_over_code(
     // that it was checked, or that this sign-in carried an account over at
     // all), so the session goes through the same second-factor step as any
     // password sign-in: asked for its code, or held until one is set up.
-    finish_password_login(&state, &email, &auth_result, false, false).await
+    finish_password_login(&state, &email, &auth_result, false, false, None).await
 }
 
 // ── MFA verify ───────────────────────────────────────────────────────
@@ -859,6 +875,7 @@ pub async fn mfa_verify(
         access_token,
         &SignInProof::new(true, "password"),
         body.break_glass,
+        body.break_glass_team.clone(),
     )
     .await?;
     if resp.status().is_success() {
@@ -1625,7 +1642,7 @@ async fn google_callback_inner(
     let gated = super::require_okta::gated_teams(state, &existing)
         .await
         .map_err(|e| SignInFailure::new(P, Reason::Server, "okta_rule", e))?;
-    let held = super::require_okta::filter(&existing, &gated, false);
+    let held = super::require_okta::filter(&existing, &gated, None);
     let existing = held.kept;
 
     // Accept pending invites first: Google sign-ins never accepted them, so an
@@ -1848,7 +1865,7 @@ pub(crate) async fn finish_oidc(
         let gated = super::require_okta::gated_teams(state, &existing)
             .await
             .map_err(|e| SignInFailure::new(p, Reason::Server, "okta_rule", e))?;
-        let held = super::require_okta::filter(&existing, &gated, false);
+        let held = super::require_okta::filter(&existing, &gated, None);
         let existing = held.kept;
         let accepted = accept_pending_invites(state, &existing, &person.new_user_id, email).await;
         let pool = landing_records(&existing, accepted);
@@ -2344,12 +2361,9 @@ pub(crate) async fn github_sign_in_with_token(
             .await
             .is_err()
         {
-            let team = super::require_okta::team_words(state, &claims.team_id).await;
-            return Ok(super::require_okta::Refused {
-                team,
-                code: super::require_okta::CODE,
-            }
-            .redirect(P, common::public_urls::app_url(&state.config.stage)));
+            return Ok(super::require_okta::refused(state, &claims.team_id)
+                .await
+                .redirect(P, common::public_urls::app_url(&state.config.stage)));
         }
         // User is already logged in — connect GitHub to their account
         // Update their user record with github_id and github_login
@@ -2565,8 +2579,8 @@ pub(crate) async fn github_sign_in_with_token(
     )
     .await
     .map_err(|e| SignInFailure::new(P, Reason::Server, "okta_rule", e))?;
-    let held_gh = super::require_okta::filter(&by_github, &gated, false);
-    let held_email = super::require_okta::filter(&by_email, &gated, false);
+    let held_gh = super::require_okta::filter(&by_github, &gated, None);
+    let held_email = super::require_okta::filter(&by_email, &gated, None);
     let okta_refused = held_gh.refused.clone().or(held_email.refused.clone());
     let (by_github, by_email) = (held_gh.kept, held_email.kept);
     // A self-hosted install: only the organization's own records, or a join
@@ -3382,6 +3396,7 @@ async fn issue_session_from_cognito(
     access_token: &str,
     proof: &SignInProof,
     break_glass: bool,
+    break_glass_team: Option<String>,
 ) -> Result<Response, StatusCode> {
     // Get Cognito user info
     let user = state
@@ -3458,7 +3473,11 @@ async fn issue_session_from_cognito(
     let gated = super::require_okta::gated_teams(state, &items)
         .await
         .map_err(unavailable)?;
-    let held = super::require_okta::filter(&items, &gated, break_glass);
+    let held = super::require_okta::filter(
+        &items,
+        &gated,
+        break_glass.then_some(break_glass_team.as_deref().filter(|t| !t.is_empty())),
+    );
     let items = held.kept;
 
     // Accept pending invites FIRST, so a teammate's first sign-in lands on the
@@ -3641,6 +3660,7 @@ async fn password_session(
         if !proof.mfa {
             return Ok(super::require_okta::Refused {
                 team: String::new(),
+                team_id: team_id.clone(),
                 code: super::require_okta::NEEDS_2FA,
             }
             .json());
@@ -4224,7 +4244,8 @@ mod first_sign_in_tests {
         let end = start + src[start..].find("\n}\n").unwrap();
         let body = &src[start..end];
         // Never counted as the second factor, and never a break-glass sign-in.
-        assert!(body.contains("finish_password_login(&state, &email, &auth_result, false, false)"));
+        assert!(body
+            .contains("finish_password_login(&state, &email, &auth_result, false, false, None)"));
         assert!(!body.contains("auth_result, true"));
     }
 

@@ -209,9 +209,12 @@ pub const BRAIN_AUDIENCE: &str = "coderhelm-brain";
 /// `/api/plans/chat/stream`, never as a session or a brain token.
 pub const PLAN_CHAT_AUDIENCE: &str = "coderhelm-plan-chat";
 
-/// A short-lived token for `audience` carrying the member's stored role.
+/// A short-lived token for `audience` carrying the member's stored role,
+/// and how the session that minted it signed in (`proof`), so the rules a
+/// session meets are checked again when the token is used.
 pub fn create_scoped_token(
     claims: &Claims,
+    proof: &SignInProof,
     audience: &str,
     secret: &str,
     ttl_secs: u64,
@@ -237,9 +240,26 @@ pub fn create_scoped_token(
     };
     encode(
         &Header::default(),
-        &scoped,
+        &SessionToken {
+            claims: &scoped,
+            proof,
+        },
         &EncodingKey::from_secret(secret.as_bytes()),
     )
+}
+
+/// The sign-in proof a scoped token carries (none for one that can't be
+/// read for `audience`).
+pub fn read_scoped_proof(token: &str, audience: &str, secret: &str) -> SignInProof {
+    let mut validation = Validation::default();
+    validation.set_audience(&[audience]);
+    decode::<SignInProof>(
+        token,
+        &DecodingKey::from_secret(secret.as_bytes()),
+        &validation,
+    )
+    .map(|t| t.claims)
+    .unwrap_or_default()
 }
 
 /// A token minted by [`create_scoped_token`] for `audience`.
@@ -354,7 +374,14 @@ mod tests {
         let secret = "test-jwt-secret-at-least-32-chars!";
         let session = create_token("u", "t", "e@x.com", "member", None, secret, 300).unwrap();
         let claims = validate_token(&session, secret).unwrap();
-        let brain = create_scoped_token(&claims, BRAIN_AUDIENCE, secret, 300).unwrap();
+        let brain = create_scoped_token(
+            &claims,
+            &SignInProof::default(),
+            BRAIN_AUDIENCE,
+            secret,
+            300,
+        )
+        .unwrap();
         assert!(validate_token(&brain, secret).is_err());
         assert!(validate_scoped_token(&session, BRAIN_AUDIENCE, secret).is_err());
         let back = validate_scoped_token(&brain, BRAIN_AUDIENCE, secret).unwrap();
@@ -366,7 +393,14 @@ mod tests {
         let secret = "test-jwt-secret-at-least-32-chars!";
         let session = create_token("u", "TEAM#a", "e@x.com", "member", None, secret, 300).unwrap();
         let claims = validate_token(&session, secret).unwrap();
-        let plan = create_scoped_token(&claims, PLAN_CHAT_AUDIENCE, secret, 300).unwrap();
+        let plan = create_scoped_token(
+            &claims,
+            &SignInProof::default(),
+            PLAN_CHAT_AUDIENCE,
+            secret,
+            300,
+        )
+        .unwrap();
         assert!(validate_token(&plan, secret).is_err(), "never a session");
         assert!(validate_scoped_token(&plan, BRAIN_AUDIENCE, secret).is_err());
         assert!(validate_scoped_token(&session, PLAN_CHAT_AUDIENCE, secret).is_err());

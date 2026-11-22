@@ -8,7 +8,11 @@
 //! condition expressions those paths write (`SET`, `REMOVE`, `ADD`,
 //! `if_not_exists`, `attribute_exists`, `attribute_not_exists`, `=`, `<>`,
 //! `<`, `AND`, `OR`, brackets) and transactions that write nothing when any
-//! condition fails. Anything else answers an empty success.
+//! condition fails. Anything it doesn't understand (an operation, a
+//! condition, an expression) is recorded, answered with an error, and fails
+//! the test when the stand-in is dropped: a test can't pass on a fake laxer
+//! than DynamoDB. Reads of chosen keys can be made to fail
+//! ([`Store::fail_reads`]), to check that callers refuse.
 
 use axum::{
     body::Bytes,
@@ -38,13 +42,45 @@ pub struct User {
 pub struct Store {
     tables: Mutex<HashMap<String, Vec<Obj>>>,
     users: Mutex<Vec<User>>,
+    /// What a test asked the stand-in that it doesn't understand.
+    unsupported: Mutex<Vec<String>>,
+    /// `(table, pk)` whose reads answer a server error.
+    failing: Mutex<Vec<(String, String)>>,
 }
 
 impl Store {
+    /// Makes every read of `pk` in `table` fail (a server error).
+    pub fn fail_reads(&self, table: &str, pk: &str) {
+        self.failing
+            .lock()
+            .unwrap()
+            .push((table.to_string(), pk.to_string()));
+    }
+
+    fn read_fails(&self, table: &str, pk: Option<&str>) -> bool {
+        let pk = pk.unwrap_or("");
+        self.failing
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(t, p)| t == table && p == pk)
+    }
+
+    fn unsupported(&self, what: String) -> Response {
+        self.unsupported
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(what.clone());
+        error("UnsupportedByStandIn", &what)
+    }
+
     /// Puts an item (plain strings, numbers and booleans) into `table`.
     pub fn put(&self, table: &str, item: &[(&str, Value)]) {
         let obj: Obj = item.iter().map(|(k, v)| (k.to_string(), wire(v))).collect();
-        let mut t = self.tables.lock().unwrap();
+        let mut t = self
+            .tables
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let rows = t.entry(table.to_string()).or_default();
         rows.retain(|r| !same_key(r, &obj));
         rows.push(obj);
@@ -73,7 +109,10 @@ impl Store {
     }
 
     pub fn add_user(&self, u: User) {
-        self.users.lock().unwrap().push(u);
+        self.users
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(u);
     }
 
     fn user_by_email(&self, email: &str) -> Option<User> {
@@ -144,6 +183,20 @@ pub struct Fake {
     pub store: Arc<Store>,
 }
 
+impl Drop for Fake {
+    fn drop(&mut self) {
+        let asked = self
+            .store
+            .unsupported
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if !asked.is_empty() && !std::thread::panicking() {
+            panic!("the AWS stand-in was asked what it doesn't support: {asked:?}");
+        }
+    }
+}
+
 pub async fn start() -> Fake {
     let store = Arc::new(Store::default());
     let app = Router::new().fallback(handle).with_state(store.clone());
@@ -184,11 +237,25 @@ async fn handle(State(store): State<Arc<Store>>, headers: HeaderMap, body: Bytes
         .to_string();
     let req: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
     let (service, op) = target.split_once('.').unwrap_or(("", ""));
-    match service {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match service {
         "DynamoDB_20120810" => dynamo(&store, op, &req),
         "AWSCognitoIdentityProviderService" => cognito(&store, op, &req),
-        "TrentService" => kms(op, &req),
-        _ => ok(json!({})),
+        "TrentService" => kms(&store, op, &req),
+        // Services without a JSON target (SES's REST API: the emails a flow
+        // sends) are accepted and not checked.
+        "" => ok(json!({ "MessageId": "stand-in" })),
+        other => store.unsupported(format!("service {other}")),
+    }));
+    match result {
+        Ok(r) => r,
+        Err(p) => {
+            let what = p
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_else(|| "a panic".into());
+            store.unsupported(format!("{target}: {what}"))
+        }
     }
 }
 
@@ -272,6 +339,15 @@ fn holds(expr: &str, item: Option<&Obj>, c: &Ctx) -> bool {
     }
     for op in ["<>", "<", "="] {
         if let Some((l, r)) = e.split_once(op) {
+            let (l, r) = (l.trim(), r.trim());
+            let plain_name = |n: &str| {
+                !n.is_empty()
+                    && n.chars()
+                        .all(|ch| ch.is_alphanumeric() || ch == '_' || ch == '#')
+            };
+            if !plain_name(l) || !r.starts_with(':') || c.values.get(r).is_none() {
+                panic!("unsupported condition term {e:?}");
+            }
             let (have, want) = (attr(l), c.value(r));
             return match op {
                 "<>" => have.as_ref() != Some(&want),
@@ -280,7 +356,7 @@ fn holds(expr: &str, item: Option<&Obj>, c: &Ctx) -> bool {
             };
         }
     }
-    true
+    panic!("unsupported condition term {e:?}")
 }
 
 /// Applies an update expression to an item.
@@ -290,7 +366,7 @@ fn update(item: &mut Obj, expr: &str, c: &Ctx) {
     let kw = ["SET ", "REMOVE ", "ADD ", "DELETE "];
     while !rest.is_empty() {
         let Some(k) = kw.iter().find(|k| rest.starts_with(**k)) else {
-            break;
+            panic!("unsupported update expression {expr:?}");
         };
         let body = &rest[k.len()..];
         let next = kw
@@ -317,8 +393,10 @@ fn update(item: &mut Obj, expr: &str, c: &Ctx) {
                     {
                         let (a, b) = args.split_once(',').unwrap_or((args, ""));
                         item.get(&c.name(a)).cloned().unwrap_or_else(|| c.value(b))
-                    } else {
+                    } else if r.starts_with(':') && c.values.get(r).is_some() {
                         c.value(r)
+                    } else {
+                        panic!("unsupported update value {r:?}");
                     };
                     item.insert(name, v);
                 }
@@ -332,7 +410,7 @@ fn update(item: &mut Obj, expr: &str, c: &Ctx) {
                     let add = num(&c.value(r));
                     item.insert(name, json!({ "N": ((have + add) as i64).to_string() }));
                 }
-                _ => {}
+                other => panic!("unsupported update clause {other}"),
             }
         }
     }
@@ -346,7 +424,8 @@ fn find<'a>(rows: &'a mut [Obj], key: &Obj) -> Option<&'a mut Obj> {
 fn write_holds(rows: &[Obj], w: &Value, kind: &str) -> bool {
     let key: Obj = match kind {
         "Put" => w["Item"].as_object().cloned().unwrap_or_default(),
-        _ => w["Key"].as_object().cloned().unwrap_or_default(),
+        "Update" | "Delete" | "ConditionCheck" => w["Key"].as_object().cloned().unwrap_or_default(),
+        other => panic!("unsupported write {other}"),
     };
     let c = Ctx {
         names: &w["ExpressionAttributeNames"],
@@ -382,19 +461,46 @@ fn apply(rows: &mut Vec<Obj>, w: &Value, kind: &str) -> Obj {
             update(item, w["UpdateExpression"].as_str().unwrap_or(""), &c);
             item.clone()
         }
-        _ => Obj::new(),
+        "ConditionCheck" => Obj::new(),
+        other => panic!("unsupported write {other}"),
     }
+}
+
+/// Only the attributes a projection names (DynamoDB returns nothing else).
+fn project(item: &Obj, req: &Value) -> Obj {
+    let Some(p) = req["ProjectionExpression"].as_str() else {
+        return item.clone();
+    };
+    let c = Ctx {
+        names: &req["ExpressionAttributeNames"],
+        values: &Value::Null,
+    };
+    let keep: Vec<String> = p.split(',').map(|n| c.name(n)).collect();
+    item.iter()
+        .filter(|(k, _)| keep.contains(k))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
 }
 
 fn dynamo(store: &Store, op: &str, req: &Value) -> Response {
     let table = req["TableName"].as_str().unwrap_or("").to_string();
-    let mut tables = store.tables.lock().unwrap();
+    let mut tables = store
+        .tables
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     match op {
         "GetItem" => {
             let key = req["Key"].as_object().cloned().unwrap_or_default();
+            let pk = key
+                .get("pk")
+                .and_then(|v| v["S"].as_str())
+                .map(str::to_string);
+            if store.read_fails(&table, pk.as_deref()) {
+                return internal_error();
+            }
             let rows = tables.entry(table).or_default();
             match rows.iter().find(|r| same_key(r, &key)) {
-                Some(i) => ok(json!({ "Item": i })),
+                Some(i) => ok(json!({ "Item": project(i, req) })),
                 None => ok(json!({})),
             }
         }
@@ -429,6 +535,26 @@ fn dynamo(store: &Store, op: &str, req: &Value) -> Response {
                     ))
                 })
                 .collect();
+            // DynamoDB refuses a transaction that touches one item twice.
+            let mut seen: Vec<(String, Obj)> = Vec::new();
+            for (t, kind, w) in &writes {
+                let key: Obj = if kind == "Put" {
+                    let item = w["Item"].as_object().cloned().unwrap_or_default();
+                    key_names(&item)
+                        .iter()
+                        .filter_map(|k| item.get(*k).map(|v| (k.to_string(), v.clone())))
+                        .collect()
+                } else {
+                    w["Key"].as_object().cloned().unwrap_or_default()
+                };
+                if seen.iter().any(|(st, sk)| st == t && sk == &key) {
+                    return error(
+                        "com.amazonaws.dynamodb.v20120810#ValidationException",
+                        "Transaction request cannot include multiple operations on one item",
+                    );
+                }
+                seen.push((t.clone(), key));
+            }
             let failed = writes.iter().any(|(t, kind, w)| {
                 let rows = tables.get(t).cloned().unwrap_or_default();
                 !write_holds(&rows, w, kind)
@@ -451,6 +577,15 @@ fn dynamo(store: &Store, op: &str, req: &Value) -> Response {
             };
             let cond = req["KeyConditionExpression"].as_str().unwrap_or("");
             let parts = split_top(cond, " AND ");
+            let first_value = parts
+                .first()
+                .and_then(|p| p.split_once('='))
+                .map(|(_, v)| c.value(v))
+                .and_then(|v| v["S"].as_str().map(str::to_string));
+            if req["IndexName"].is_null() && store.read_fails(&table, first_value.as_deref()) {
+                return internal_error();
+            }
+            let filter = req["FilterExpression"].as_str().map(str::to_string);
             let mut sort = "sk".to_string();
             let mut rows: Vec<Obj> = tables
                 .entry(table)
@@ -470,9 +605,9 @@ fn dynamo(store: &Store, op: &str, req: &Value) -> Response {
                                 .is_some_and(|h| h.starts_with(want["S"].as_str().unwrap_or("")));
                         }
                         holds(p, Some(r), &c)
-                    })
+                    }) && filter.as_deref().is_none_or(|f| holds(f, Some(r), &c))
                 })
-                .cloned()
+                .map(|r| project(r, req))
                 .collect();
             if parts.len() > 1 {
                 let second = parts[1].trim();
@@ -500,13 +635,20 @@ fn dynamo(store: &Store, op: &str, req: &Value) -> Response {
             }
             ok(json!({ "Items": rows, "Count": rows.len(), "ScannedCount": rows.len() }))
         }
-        "BatchGetItem" => ok(json!({ "Responses": {} })),
-        "Scan" => {
-            let rows = tables.entry(table).or_default().clone();
-            ok(json!({ "Items": rows, "Count": rows.len(), "ScannedCount": rows.len() }))
+        other => {
+            drop(tables);
+            store.unsupported(format!("DynamoDB {other}"))
         }
-        _ => ok(json!({})),
     }
+}
+
+fn internal_error() -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        [("content-type", "application/x-amz-json-1.0")],
+        json!({ "__type": "com.amazonaws.dynamodb.v20120810#InternalServerError", "message": "stand-in read failure" }).to_string(),
+    )
+        .into_response()
 }
 
 // ── Cognito ─────────────────────────────────────────────────────────
@@ -598,7 +740,7 @@ fn cognito(store: &Store, op: &str, req: &Value) -> Response {
                 .collect();
             ok(json!({ "Users": users }))
         }
-        _ => ok(json!({})),
+        other => store.unsupported(format!("Cognito {other}")),
     }
 }
 
@@ -606,7 +748,7 @@ fn cognito(store: &Store, op: &str, req: &Value) -> Response {
 
 /// Data keys and blobs pass through as they are: enough for sealing and
 /// opening to round-trip in a test.
-fn kms(op: &str, req: &Value) -> Response {
+fn kms(store: &Store, op: &str, req: &Value) -> Response {
     let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
     match op {
         "GenerateDataKey" => {
@@ -615,7 +757,7 @@ fn kms(op: &str, req: &Value) -> Response {
         }
         "Decrypt" => ok(json!({ "KeyId": "fake", "Plaintext": req["CiphertextBlob"] })),
         "Encrypt" => ok(json!({ "KeyId": "fake", "CiphertextBlob": req["Plaintext"] })),
-        _ => ok(json!({})),
+        other => store.unsupported(format!("KMS {other}")),
     }
 }
 

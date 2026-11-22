@@ -558,6 +558,21 @@ pub const TEMPLATES: &[Template] = &[
         install_may_send: true,
     },
     Template {
+        id: "okta_domain_failing",
+        subject: "an Okta email domain failed its DNS check",
+        subject_by: "",
+        subjects: &[],
+        // No team name: the install's own SES email carries it.
+        // No domain name: a name in an email reads as a link to it.
+        params: &[p("link", Kind::Link)],
+        body: &[
+            Part::Para("The DNS record that proves one of your team's Okta email domains is gone."),
+            Part::Para("Okta sign-in is required, so CoderHelm kept the domain and people can still sign in. Add the TXT record back, then choose Verify domains in Settings, Sign-in rules. Until then the domain shows as failing there."),
+            Part::Button("Open Sign-in rules", "link"),
+        ],
+        install_may_send: true,
+    },
+    Template {
         id: "two_factor_reset",
         subject: "your two-factor sign-in was reset",
         subject_by: "",

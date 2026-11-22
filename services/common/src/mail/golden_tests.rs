@@ -104,6 +104,12 @@ fn cases() -> Vec<(&'static str, &'static str, Value, Option<&'static str>)> {
             Some("Acme"),
         ),
         (
+            "okta_domain_failing",
+            "okta_domain_failing",
+            json!({"link": format!("{APP}/settings/sign-in/")}),
+            Some("Acme"),
+        ),
+        (
             "two_factor_reset",
             "two_factor_reset",
             json!({"link": format!("{APP}/settings/security/")}),

@@ -2589,7 +2589,35 @@ pub fn closed_status_with(version: Value, after_signup: Vec<Value>) -> Value {
 
 /// Only on a self-hosted install (the hosted deployment answers 404).
 pub(crate) fn self_hosted() -> bool {
+    #[cfg(test)]
+    if let Some(on) = test_self_hosted::get() {
+        return on;
+    }
     std::env::var("SETUP_ENDPOINTS").is_ok_and(|v| v == "1") || super::system::has_updater()
+}
+
+/// Tests only: a self-hosted install for the current thread while the guard
+/// lives (`#[tokio::test]` runs a test on one thread), without touching the
+/// process environment other tests read.
+#[cfg(test)]
+pub(crate) mod test_self_hosted {
+    use std::cell::Cell;
+    thread_local! {
+        static ON: Cell<Option<bool>> = const { Cell::new(None) };
+    }
+    pub fn get() -> Option<bool> {
+        ON.with(|c| c.get())
+    }
+    pub struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            ON.with(|c| c.set(None));
+        }
+    }
+    pub fn set(on: bool) -> Guard {
+        ON.with(|c| c.set(Some(on)));
+        Guard
+    }
 }
 
 /// The setup window: open until the first person has an account. Once it

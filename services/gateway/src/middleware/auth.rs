@@ -79,7 +79,11 @@ pub async fn require_auth(
         let method = req.method().clone();
         let path = req.uri().path().to_string();
         if !support_access::is_exit(&method, &path) {
-            // The admin's own session first: their own team's Okta rule.
+            // The admin's own session first, as every request checks it: not
+            // ended, and allowed by their own team's sign-in rules.
+            if let Err(ended) = sign_in::check_member_session(&state, &claims).await {
+                return Ok(ended);
+            }
             if let Err(refused) =
                 crate::routes::require_okta::check_claims(&state, &claims, &signed_in, false).await
             {
@@ -104,6 +108,22 @@ pub async fn require_auth(
                     true,
                 ));
             };
+            // A team that requires Okta sign-in is viewed only from a session
+            // as strong: an Okta session is never a platform admin, so the
+            // admin's own session must have passed a second factor.
+            match sign_in::team_rule(&state, &sv.team_id).await {
+                Ok(rule) if crate::routes::require_okta::support_view_allowed(&rule, &signed_in) => {}
+                Ok(_) => {
+                    return Ok(support_access::refused(
+                        "This team requires Okta sign-in. Sign in with your second factor to open its support view.",
+                        true,
+                    ))
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "Viewed team's sign-in rules not read; support view refused");
+                    return Err(StatusCode::SERVICE_UNAVAILABLE);
+                }
+            }
             let now = chrono::Utc::now().timestamp().max(0) as u64;
             if let Some(why) = support_access::support_view_refusal(&method, &path) {
                 if let Err(e) =

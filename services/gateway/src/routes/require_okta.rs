@@ -166,31 +166,24 @@ pub async fn team_words(state: &AppState, team_id: &str) -> String {
     sign_in::team_name(state, team_id).await
 }
 
-/// Where a refused person goes to sign in with Okta.
-pub fn sign_in_url(app_url: &str, team: &str) -> String {
-    format!(
-        "{}/?signin_error={CODE}&team={}",
-        app_url.trim_end_matches('/'),
-        urlencoding::encode(team)
-    )
+/// Where a refused person goes to sign in with Okta. The URL carries the
+/// team's id only (so the owner's break-glass sign-in can ask for that
+/// team), never its name: the sign-in page shows no text from a URL.
+pub fn sign_in_url(app_url: &str, team_id: &str) -> String {
+    let base = format!("{}/?signin_error={CODE}", app_url.trim_end_matches('/'));
+    match team_id.trim() {
+        "" => base,
+        t => format!("{base}&team_id={}", urlencoding::encode(t)),
+    }
 }
 
 fn app_url() -> &'static str {
     common::public_urls::app_url_from_env()
 }
 
-fn body(team: &str) -> Value {
-    json!({
-        "error": refusal_message(sign_in::applies(), team),
-        "code": CODE,
-        "team": team,
-        "sign_in_url": sign_in_url(app_url(), team),
-    })
-}
-
 /// The answer to a session the rule ended: 401, and its cookie cleared.
-pub fn session_refused(team: &str) -> Response {
-    let mut resp = (StatusCode::UNAUTHORIZED, Json(body(team))).into_response();
+pub fn session_refused(r: &Refused) -> Response {
+    let mut resp = (StatusCode::UNAUTHORIZED, Json(r.body())).into_response();
     if let Ok(v) = HeaderValue::from_str(
         "__Host-coderhelm_session=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0",
     ) {
@@ -201,8 +194,8 @@ pub fn session_refused(team: &str) -> Response {
 
 /// The answer to a request the rule refuses from a session that stays (a
 /// switch into the team, a connection made from a break-glass session).
-pub fn refused_json(team: &str) -> ApiError {
-    (StatusCode::FORBIDDEN, Json(body(team)))
+pub fn refused_json(r: &Refused) -> ApiError {
+    (StatusCode::FORBIDDEN, Json(r.body()))
 }
 
 /// The member's role on their record now.
@@ -236,13 +229,13 @@ pub async fn check(
         Decision::Allow => Ok(()),
         Decision::BreakGlass => match member_role(state, &claims.team_id, &claims.sub).await {
             Ok(Some(r)) if r == "owner" => Ok(()),
-            Ok(_) => Err(session_refused(&team_words(state, &claims.team_id).await)),
+            Ok(_) => Err(session_refused(&refused(state, &claims.team_id).await)),
             Err(e) => {
                 error!(error = %e, "Member not read for a break-glass session; refused");
                 Err(StatusCode::SERVICE_UNAVAILABLE.into_response())
             }
         },
-        Decision::Refuse => Err(session_refused(&team_words(state, &claims.team_id).await)),
+        Decision::Refuse => Err(session_refused(&refused(state, &claims.team_id).await)),
     }
 }
 
@@ -264,16 +257,45 @@ pub async fn check_claims(
     check(state, &rule, claims, proof, app).await
 }
 
+/// A short-lived stream token (plan chat, brain) at its use: the session it
+/// was minted from must still stand (the member check, and the team's Okta
+/// rule), so ending a session ends its tokens at once.
+pub async fn check_scoped(
+    state: &AppState,
+    claims: &Claims,
+    minted_by: &SignInProof,
+) -> Result<(), Response> {
+    let claims = super::oidc_signin::mark_okta(
+        claims.clone(),
+        minted_by.via.as_deref(),
+        minted_by.okta_sub.clone(),
+    );
+    sign_in::check_member_session(state, &claims).await?;
+    check_claims(state, &claims, minted_by, false).await
+}
+
 // ── Sign-ins other than Okta ────────────────────────────────────────
 
 /// A sign-in the rule refuses: the team's words and the code.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Refused {
+    /// The team's name, for the server's own message ("" on self-hosted).
     pub team: String,
+    pub team_id: String,
     pub code: &'static str,
 }
 
 impl Refused {
+    fn body(&self) -> Value {
+        json!({
+            "error": self.message(),
+            "code": self.code,
+            "team": self.team,
+            "team_id": self.team_id,
+            "sign_in_url": sign_in_url(app_url(), &self.team_id),
+        })
+    }
+
     pub fn message(&self) -> String {
         if self.code == NEEDS_2FA {
             return "A break-glass sign-in needs your second factor. Set up two-factor sign-in on your account first, or sign in with Okta.".into();
@@ -291,7 +313,7 @@ impl Refused {
         );
         let url = format!(
             "{}&provider={}",
-            sign_in_url(app_url, &self.team),
+            sign_in_url(app_url, &self.team_id),
             provider.slug()
         );
         let mut resp = (StatusCode::FOUND, [(header::LOCATION, url)]).into_response();
@@ -305,21 +327,15 @@ impl Refused {
 
     /// For a password sign-in (JSON).
     pub fn json(&self) -> Response {
-        (
-            StatusCode::FORBIDDEN,
-            Json(json!({
-                "error": self.message(),
-                "code": self.code,
-                "team": self.team,
-            })),
-        )
-            .into_response()
+        (StatusCode::FORBIDDEN, Json(self.body())).into_response()
     }
 }
 
-async fn refused(state: &AppState, team_id: &str) -> Refused {
+/// The refusal for `team_id`, with its name for the server's message.
+pub async fn refused(state: &AppState, team_id: &str) -> Refused {
     Refused {
         team: team_words(state, team_id).await,
+        team_id: team_id.to_string(),
         code: CODE,
     }
 }
@@ -393,6 +409,7 @@ pub async fn selfhost_pre_gate(
     }
     let refuse = Refused {
         team: String::new(),
+        team_id: String::new(),
         code: CODE,
     };
     if via != "password" || !break_glass {
@@ -433,10 +450,15 @@ pub struct Filtered {
     pub break_glass: Option<Item>,
 }
 
-/// Holds back every record and invite of a team in `gated`. Pure. With
-/// `break_glass`, the person's owner record on such a team is the landing
-/// (never an invite, never another role).
-pub fn filter(items: &[Item], gated: &HashSet<String>, break_glass: bool) -> Filtered {
+/// A break-glass sign-in, asked for: the team it is for (`None`: the
+/// person's only owner record on a team that requires Okta).
+pub type BreakGlassAsk<'a> = Option<Option<&'a str>>;
+
+/// Holds back every record and invite of a team in `gated`. Pure. With a
+/// break-glass ask, the person's owner record on the team asked for (or,
+/// with none named, the first such team) is the landing (never an invite,
+/// never another role).
+pub fn filter(items: &[Item], gated: &HashSet<String>, break_glass: BreakGlassAsk) -> Filtered {
     let mut out = Filtered::default();
     for i in items {
         let team = s(i, "pk");
@@ -447,7 +469,12 @@ pub fn filter(items: &[Item], gated: &HashSet<String>, break_glass: bool) -> Fil
         let owner = s(i, "sk").starts_with("USER#")
             && s(i, "status") != "invited"
             && s(i, "role") == "owner";
-        if break_glass && owner && out.break_glass.is_none() {
+        let asked = match break_glass {
+            None => false,
+            Some(None) => true,
+            Some(Some(t)) => t == team,
+        };
+        if asked && owner && out.break_glass.is_none() {
             out.break_glass = Some(i.clone());
             continue;
         }
@@ -572,21 +599,36 @@ pub enum InviteFor {
     None,
 }
 
+/// An address as an invite and Okta's verified email are compared: trimmed
+/// and lowercase, nothing else. `+tag` addresses are other mailboxes here
+/// (`normalize_email` folds them, which is right for finding a person's
+/// records but never for handing one of them an invite).
+pub fn exact_address(email: &str) -> String {
+    email.trim().to_lowercase()
+}
+
 /// The pending invite an Okta sign-in may accept: the team's live invite
-/// for exactly `email` (Okta's verified email), when no member record on the
-/// team has that email. Pure.
+/// for exactly `email` (Okta's verified email, compared with
+/// [`exact_address`]), when no member record on the team has that email or
+/// one that folds to the same person. Pure.
 pub fn invite_for(members: &[Item], email: &str, now: chrono::DateTime<chrono::Utc>) -> InviteFor {
-    let want = super::auth::normalize_email(email);
+    let want = exact_address(email);
     if want.is_empty() || !want.contains('@') {
         return InviteFor::None;
     }
-    let same = |i: &&Item| super::auth::normalize_email(s(i, "email")) == want;
+    let folded = super::auth::normalize_email(email);
+    let same_person = |i: &&Item| super::auth::normalize_email(s(i, "email")) == folded;
     let users = || members.iter().filter(|i| s(i, "sk").starts_with("USER#"));
-    if users().filter(same).any(|i| s(i, "status") != "invited") {
+    // Never next to an existing member of the same person (folded), so a
+    // `+tag` address can't open a second record for someone on the team.
+    if users()
+        .filter(same_person)
+        .any(|i| s(i, "status") != "invited")
+    {
         return InviteFor::ExistingMember;
     }
     match users()
-        .filter(same)
+        .filter(|i| exact_address(s(i, "email")) == want)
         .find(|i| s(i, "status") == "invited" && !super::users::invite_expired(i, now))
     {
         Some(i) => InviteFor::Accept(i.clone()),
@@ -632,6 +674,40 @@ pub fn invited_member(
     ])
 }
 
+/// The condition that `invite` is still exactly the invite that was read:
+/// still an invite, for the same role, sent at the same time (an admin who
+/// changed or re-sent it meanwhile makes the acceptance fail).
+pub fn invite_unchanged(
+    invite: &Item,
+) -> (
+    String,
+    HashMap<String, String>,
+    HashMap<String, AttributeValue>,
+) {
+    let mut names = HashMap::from([
+        ("#st".to_string(), "status".to_string()),
+        ("#r".to_string(), "role".to_string()),
+    ]);
+    let mut values = HashMap::from([(":inv".to_string(), attr_s("invited"))]);
+    let mut parts = vec!["#st = :inv".to_string()];
+    match invite.get("role") {
+        Some(r) => {
+            parts.push("#r = :r".into());
+            values.insert(":r".into(), r.clone());
+        }
+        None => parts.push("attribute_not_exists(#r)".into()),
+    }
+    names.insert("#ia".into(), "invited_at".into());
+    match invite.get("invited_at") {
+        Some(t) => {
+            parts.push("#ia = :ia".into());
+            values.insert(":ia".into(), t.clone());
+        }
+        None => parts.push("attribute_not_exists(#ia)".into()),
+    }
+    (parts.join(" AND "), names, values)
+}
+
 /// Accepts `invite` through Okta in one transaction: the new member record
 /// (only if no record has its id), the identity's link row (only if no
 /// member holds it), and the invite removed (only while it is still one).
@@ -671,9 +747,9 @@ pub async fn accept_invite(state: &AppState, member: &Item, invite: &Item) -> Re
                     .table_name(&state.config.users_table_name)
                     .key("pk", attr_s(team))
                     .key("sk", attr_s(s(invite, "sk")))
-                    .condition_expression("#st = :inv")
-                    .expression_attribute_names("#st", "status")
-                    .expression_attribute_values(":inv", attr_s("invited"))
+                    .set_condition_expression(Some(invite_unchanged(invite).0))
+                    .set_expression_attribute_names(Some(invite_unchanged(invite).1))
+                    .set_expression_attribute_values(Some(invite_unchanged(invite).2))
                     .build()
                     .map_err(e)?,
             )
@@ -817,6 +893,216 @@ pub fn setup_change_refused(rule: &Rule) -> Option<ApiError> {
             })),
         )
     })
+}
+
+// ── Writes that would narrow Okta sign-in ───────────────────────────
+
+/// The record that holds a team's sign-in rules: the organization's on a
+/// self-hosted install, else the team's own.
+pub fn rule_key(team_id: &str) -> (String, String) {
+    if sign_in::applies() {
+        (sign_in::ORG_PK.to_string(), sign_in::ORG_SK.to_string())
+    } else {
+        (team_id.to_string(), sign_in::TEAM_RULE_SK.to_string())
+    }
+}
+
+/// A transaction part that holds only while the team's Okta rule is off.
+pub fn rule_off_check(
+    state: &AppState,
+    team_id: &str,
+) -> Result<aws_sdk_dynamodb::types::TransactWriteItem, String> {
+    use aws_sdk_dynamodb::types::{ConditionCheck, TransactWriteItem};
+    let (pk, sk) = rule_key(team_id);
+    Ok(TransactWriteItem::builder()
+        .condition_check(
+            ConditionCheck::builder()
+                .table_name(&state.config.settings_table_name)
+                .key("pk", attr_s(&pk))
+                .key("sk", attr_s(&sk))
+                .condition_expression("attribute_not_exists(#ro) OR #ro <> :on")
+                .expression_attribute_names("#ro", "require_okta")
+                .expression_attribute_values(":on", AttributeValue::Bool(true))
+                .build()
+                .map_err(|e| e.to_string())?,
+        )
+        .build())
+}
+
+/// Runs `writes` in one transaction that holds only while the team's Okta
+/// rule is off: a change that narrows Okta sign-in can never land beside
+/// turning the rule on. A failed condition answers `okta_required_on`.
+pub async fn while_rule_off(
+    state: &AppState,
+    team_id: &str,
+    mut writes: Vec<aws_sdk_dynamodb::types::TransactWriteItem>,
+) -> Result<(), ApiError> {
+    writes.push(rule_off_check(state, team_id).map_err(|e| internal("Write not built", e))?);
+    match state
+        .dynamo
+        .transact_write_items()
+        .set_transact_items(Some(writes))
+        .send()
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            let e = format!("{e:?}");
+            if e.contains("TransactionCanceled") || e.contains("ConditionalCheckFailed") {
+                Err(setup_change_refused(&Rule {
+                    require_okta: true,
+                    ..Rule::default()
+                })
+                .unwrap_or_else(|| internal("Write refused", "rule on")))
+            } else {
+                Err(internal("Okta change not saved", e))
+            }
+        }
+    }
+}
+
+/// Transaction parts that hold only while `live` is still the team's Okta
+/// setup as it was checked: on, the same issuer, unchanged since; on hosted,
+/// each of its domains still proven by this team and not failing.
+pub fn setup_unchanged(
+    state: &AppState,
+    live: &super::oidc_signin::OktaSetup,
+) -> Result<Vec<aws_sdk_dynamodb::types::TransactWriteItem>, String> {
+    use aws_sdk_dynamodb::types::{ConditionCheck, TransactWriteItem};
+    let e = |e: aws_sdk_dynamodb::error::BuildError| e.to_string();
+    let mut check = ConditionCheck::builder()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(&live.team_id))
+        .key("sk", attr_s(super::oidc_signin::OKTA_SK))
+        .expression_attribute_names("#en", "enabled")
+        .expression_attribute_names("#iss", "issuer")
+        .expression_attribute_names("#ua", "updated_at")
+        .expression_attribute_values(":t", AttributeValue::Bool(true))
+        .expression_attribute_values(":iss", attr_s(&live.issuer));
+    check = match &live.updated_at {
+        Some(at) => check
+            .condition_expression("#en = :t AND #iss = :iss AND #ua = :ua")
+            .expression_attribute_values(":ua", attr_s(at)),
+        None => {
+            check.condition_expression("#en = :t AND #iss = :iss AND attribute_not_exists(#ua)")
+        }
+    };
+    let mut out = vec![TransactWriteItem::builder()
+        .condition_check(check.build().map_err(e)?)
+        .build()];
+    if !sign_in::applies() {
+        for d in &live.domains {
+            out.push(
+                TransactWriteItem::builder()
+                    .condition_check(
+                        ConditionCheck::builder()
+                            .table_name(&state.config.settings_table_name)
+                            .key(
+                                "pk",
+                                attr_s(&format!("{}{d}", super::oidc_signin::OKTA_DOMAIN_PREFIX)),
+                            )
+                            .key("sk", attr_s(super::oidc_signin::OKTA_DOMAIN_SK))
+                            .condition_expression(
+                                "team_id = :t AND attribute_not_exists(failing_at)",
+                            )
+                            .expression_attribute_values(":t", attr_s(&live.team_id))
+                            .build()
+                            .map_err(e)?,
+                    )
+                    .build(),
+            );
+        }
+    }
+    Ok(out)
+}
+
+fn internal(context: &str, e: impl std::fmt::Display) -> ApiError {
+    error!("{context}: {e}");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({ "error": "Something went wrong on our side. Try again." })),
+    )
+}
+
+/// While a team requires Okta, a proven domain whose TXT record is gone is
+/// kept (people still sign in) and marked failing; the owners hear about it
+/// once, by email and in the audit log, and the page shows it.
+pub async fn domain_failing(state: &AppState, team_id: &str, domain: &str, first: bool) {
+    warn!(%domain, "Okta domain proof gone from DNS while Okta sign-in is required; kept");
+    if !first {
+        return;
+    }
+    let link = format!(
+        "{}/settings/sign-in/",
+        common::public_urls::app_url_from_env()
+    );
+    let members = sign_in::team_members(state, team_id)
+        .await
+        .unwrap_or_default();
+    for owner in members
+        .iter()
+        .filter(|m| s(m, "role") == "owner" && s(m, "status") != "invited")
+    {
+        let to = s(owner, "email");
+        if !to.contains('@') {
+            continue;
+        }
+        let mut params = serde_json::Map::new();
+        params.insert("link".into(), Value::from(link.clone()));
+        sign_in::send_mail(
+            state,
+            team_id,
+            "okta_domain_failing",
+            to,
+            params,
+            "An Okta email domain failed its DNS check",
+            format!(
+                "The DNS record that proves one of your team's Okta email domains ({domain}) is gone. Okta sign-in is required, so CoderHelm kept the domain and people can still sign in. Add the TXT record back, then choose Verify domains in Settings, Sign-in rules: {link}\n"
+            ),
+        )
+        .await;
+    }
+    let actor = system_actor(team_id);
+    let _ = super::roles::record(
+        state,
+        &actor,
+        super::roles::AuditEntry {
+            action: "sign_in_okta",
+            role_id: "",
+            role_name: "",
+            detail: format!(
+                "Okta email domain {domain} failed its DNS check; kept while Okta sign-in is required"
+            ),
+        },
+    )
+    .await;
+}
+
+fn system_actor(team_id: &str) -> Claims {
+    Claims {
+        sub: "SYSTEM#dns-check".into(),
+        team_id: team_id.to_string(),
+        email: "CoderHelm".into(),
+        role: "owner".into(),
+        github_login: None,
+        aud: "coderhelm-dashboard".into(),
+        exp: 0,
+        iat: 0,
+        support_view: None,
+        custom: None,
+        api_key: None,
+        held: false,
+        via_okta: false,
+        okta_sub: None,
+    }
+}
+
+/// The support view of a team that requires Okta sign-in: a platform admin
+/// is held to a bar as strong as the team's. An Okta session is never a
+/// platform admin, so that bar is the admin's own session having passed a
+/// second factor. Pure.
+pub fn support_view_allowed(target: &Rule, admin: &SignInProof) -> bool {
+    !target.require_okta || admin.mfa
 }
 
 /// The time the rule's sessions are measured from.
@@ -965,21 +1251,21 @@ mod tests {
         ]);
         let b = item(&[("pk", "TEAM#b"), ("sk", "USER#1"), ("role", "member")]);
         let gated: HashSet<String> = ["TEAM#a".to_string(), "TEAM#c".to_string()].into();
-        let f = filter(&[a.clone(), a_inv.clone(), b.clone()], &gated, false);
+        let f = filter(&[a.clone(), a_inv.clone(), b.clone()], &gated, None);
         assert_eq!(f.kept, vec![b.clone()]);
         assert_eq!(f.refused.as_deref(), Some("TEAM#a"));
         assert!(f.break_glass.is_none());
         // Only gated teams: nothing kept, so no personal team is made.
-        let f = filter(std::slice::from_ref(&a), &gated, false);
+        let f = filter(std::slice::from_ref(&a), &gated, None);
         assert!(f.kept.is_empty() && f.refused.is_some());
         // Break-glass lands on the owner's own record, never an invite.
-        let f = filter(&[a.clone(), a_inv.clone(), b.clone()], &gated, true);
+        let f = filter(&[a.clone(), a_inv.clone(), b.clone()], &gated, Some(None));
         assert_eq!(f.break_glass, Some(a.clone()));
         assert_eq!(f.refused.as_deref(), Some("TEAM#c"));
         let admin = item(&[("pk", "TEAM#a"), ("sk", "USER#1"), ("role", "admin")]);
-        assert!(filter(&[admin], &gated, true).break_glass.is_none());
+        assert!(filter(&[admin], &gated, Some(None)).break_glass.is_none());
         // No gated team: everything kept.
-        let f = filter(&[a.clone(), b.clone()], &HashSet::new(), false);
+        let f = filter(&[a.clone(), b.clone()], &HashSet::new(), None);
         assert_eq!(f.kept.len(), 2);
         assert!(f.refused.is_none());
     }
@@ -1153,10 +1439,14 @@ mod tests {
         assert!(refusal_message(false, " ").starts_with("This team requires"));
         assert!(refusal_message(true, "x").starts_with("Your organization requires"));
         assert_eq!(
-            sign_in_url("https://app.example.com/", "A & B"),
-            "https://app.example.com/?signin_error=okta_required&team=A%20%26%20B"
+            sign_in_url("https://app.example.com/", "TEAM#a b"),
+            "https://app.example.com/?signin_error=okta_required&team_id=TEAM%23a%20b"
         );
-        let r = session_refused("Acme");
+        let r = session_refused(&Refused {
+            team: "Acme".into(),
+            team_id: "TEAM#a".into(),
+            code: CODE,
+        });
         assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
         let cookies: Vec<_> = r.headers().get_all(header::SET_COOKIE).iter().collect();
         assert!(cookies
@@ -1366,5 +1656,114 @@ mod tests {
         // An invite made while the rule is on waits to be accepted with Okta.
         let inv = body(code(include_str!("users.rs")), "invite_user");
         assert!(inv.contains("existing_sub.filter(|_| !okta_only)"));
+    }
+
+    #[test]
+    fn a_support_view_of_a_gated_team_needs_a_second_factor() {
+        let on = rule(true, 1);
+        assert!(!support_view_allowed(
+            &on,
+            &SignInProof::new(false, "google")
+        ));
+        assert!(support_view_allowed(&on, &SignInProof::new(true, "google")));
+        assert!(support_view_allowed(
+            &rule(false, 1),
+            &SignInProof::default()
+        ));
+        let mw = code(include_str!("../middleware/auth.rs"));
+        let ra = body(mw, "require_auth");
+        // The admin's own session is checked like every request, then the
+        // viewed team's rule, before anything is read for them.
+        assert!(before(
+            ra,
+            "check_member_session(&state, &claims)",
+            "support_access::check_session("
+        ));
+        assert!(before(
+            ra,
+            "team_rule(&state, &sv.team_id)",
+            "support_access::record("
+        ));
+        assert!(ra.contains("support_view_allowed(&rule, &signed_in)"));
+    }
+
+    #[test]
+    fn dns_never_releases_a_proof_while_the_rule_is_on_and_turning_on_needs_a_match() {
+        use super::super::oidc_signin::{counts_at_turn_on, release_when_gone, ProofCheck};
+        assert!(release_when_gone(false));
+        assert!(!release_when_gone(true));
+        assert!(counts_at_turn_on(ProofCheck::There));
+        assert!(!counts_at_turn_on(ProofCheck::Unknown));
+        assert!(!counts_at_turn_on(ProofCheck::Gone));
+        let oidc = code(include_str!("oidc_signin.rs"));
+        let f = body(oidc, "fresh_domain_owner");
+        assert!(before(f, "release_when_gone(", "release_domain("));
+        assert!(f.contains("domain_failing("));
+        assert!(body(oidc, "domains_proven").contains("domains_proven_now("));
+        assert!(body(oidc, "domains_proven_now").contains("counts_at_turn_on("));
+    }
+
+    #[test]
+    fn break_glass_takes_the_owner_record_of_the_team_asked_for() {
+        let a = item(&[("pk", "TEAM#a"), ("sk", "USER#1"), ("role", "owner")]);
+        let b = item(&[("pk", "TEAM#b"), ("sk", "USER#1"), ("role", "owner")]);
+        let gated: HashSet<String> = ["TEAM#a".to_string(), "TEAM#b".to_string()].into();
+        let items = [a.clone(), b.clone()];
+        assert_eq!(
+            filter(&items, &gated, Some(Some("TEAM#b"))).break_glass,
+            Some(b)
+        );
+        assert_eq!(
+            filter(&items, &gated, Some(Some("TEAM#a"))).break_glass,
+            Some(a.clone())
+        );
+        assert_eq!(filter(&items, &gated, Some(None)).break_glass, Some(a));
+        assert!(filter(&items, &gated, Some(Some("TEAM#c")))
+            .break_glass
+            .is_none());
+        assert!(filter(&items, &gated, None).break_glass.is_none());
+    }
+
+    #[test]
+    fn invites_compare_exact_addresses() {
+        assert_eq!(
+            exact_address(" Alice+X@Example.com "),
+            "alice+x@example.com"
+        );
+        let now = chrono::Utc::now();
+        let fresh = now.to_rfc3339();
+        let inv = item(&[
+            ("pk", "T"),
+            ("sk", "USER#invite_1"),
+            ("status", "invited"),
+            ("email", "alice+contractor@corp.example"),
+            ("invited_at", &fresh),
+        ]);
+        assert_eq!(
+            invite_for(std::slice::from_ref(&inv), "alice@corp.example", now),
+            InviteFor::None
+        );
+        assert_eq!(
+            invite_for(
+                std::slice::from_ref(&inv),
+                "ALICE+contractor@corp.example",
+                now
+            ),
+            InviteFor::Accept(inv)
+        );
+    }
+
+    #[test]
+    fn short_lived_tokens_are_checked_when_used() {
+        for (src, f) in [
+            (include_str!("plans.rs"), "plan_chat_stream"),
+            (include_str!("brain.rs"), "brain_stream"),
+        ] {
+            let b = body(code(src), f);
+            assert!(
+                before(b, "validate_scoped_token(", "require_okta::check_scoped("),
+                "{f}"
+            );
+        }
     }
 }
