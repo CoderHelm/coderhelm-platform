@@ -160,6 +160,10 @@ pub struct Flow {
     /// Okta Test sign-in: the admin who started it (recorded as `tested_by`).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub by: String,
+    /// A claim link's member and secret hash (routes::sso_claim), checked
+    /// again at the callback.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub claim: String,
     /// The provider this flow is for, so one provider's cookie never
     /// finishes another's trip.
     pub aud: String,
@@ -175,6 +179,7 @@ impl Flow {
             test,
             link: String::new(),
             by: String::new(),
+            claim: String::new(),
             aud: format!("oidc_flow_{}", provider.slug()),
             exp: chrono::Utc::now().timestamp() as u64 + FLOW_SECS,
         }
@@ -500,7 +505,7 @@ pub async fn discover(http: &Idp, issuer: &str) -> Result<Discovery, String> {
     check_discovery(issuer, &doc)
 }
 
-async fn keys(http: &Idp, jwks_uri: &str) -> Result<JwkSet, String> {
+pub(crate) async fn keys(http: &Idp, jwks_uri: &str) -> Result<JwkSet, String> {
     serde_json::from_value(get_json(http, jwks_uri).await?).map_err(|e| format!("keys: {e}"))
 }
 
@@ -567,7 +572,7 @@ pub async fn exchange(
     }
 }
 
-fn authorize_url(endpoint: &str, params: &[(&str, &str)]) -> String {
+pub(crate) fn authorize_url(endpoint: &str, params: &[(&str, &str)]) -> String {
     let q: Vec<String> = params
         .iter()
         .map(|(k, v)| format!("{k}={}", urlencoding::encode(v)))
@@ -576,7 +581,7 @@ fn authorize_url(endpoint: &str, params: &[(&str, &str)]) -> String {
 }
 
 /// The redirect to the provider with both cookies set.
-fn to_provider(provider: Provider, url: &str, state: &str, flow: &str) -> Response {
+pub(crate) fn to_provider(provider: Provider, url: &str, state: &str, flow: &str) -> Response {
     let mut resp = (StatusCode::SEE_OTHER, [(header::LOCATION, url.to_string())]).into_response();
     for c in [
         oauth_signin::state_cookie(provider, state),
@@ -589,11 +594,11 @@ fn to_provider(provider: Provider, url: &str, state: &str, flow: &str) -> Respon
     resp
 }
 
-fn app(state: &AppState) -> &'static str {
+pub(crate) fn app(state: &AppState) -> &'static str {
     common::public_urls::app_url(&state.config.stage)
 }
 
-fn api(state: &AppState) -> &'static str {
+pub(crate) fn api(state: &AppState) -> &'static str {
     common::public_urls::api_url(&state.config.stage)
 }
 
@@ -607,7 +612,7 @@ pub fn microsoft_ready(client_id: Option<&str>, client_secret: Option<&str>) -> 
         && client_secret.is_some_and(|v| !v.trim().is_empty())
 }
 
-fn microsoft_client(state: &AppState) -> Option<(&str, &str)> {
+pub(crate) fn microsoft_client(state: &AppState) -> Option<(&str, &str)> {
     let id = state.secrets.microsoft_client_id.as_deref()?.trim();
     let secret = state.secrets.microsoft_client_secret.as_deref()?.trim();
     microsoft_ready(Some(id), Some(secret)).then_some((id, secret))
@@ -624,8 +629,16 @@ pub fn okta_redirect_uri(api_url: &str) -> String {
 /// GET /auth/microsoft: to Microsoft's sign-in (work, school and personal
 /// accounts), or back to the sign-in screen with `not_set_up` when this
 /// deployment has no app registration.
-pub async fn microsoft_login(State(state): State<Arc<AppState>>) -> Response {
+pub async fn microsoft_login(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<MicrosoftStart>,
+) -> Response {
     const P: Provider = Provider::Microsoft;
+    // A team's own tenant (routes::entra_sso): named by the sign-in page for
+    // a team that requires single sign-on, or the organization's.
+    if let Some(r) = super::entra_sso::sign_in_start(&state, q.team_id.as_deref()).await {
+        return r;
+    }
     let Some((client_id, _)) = microsoft_client(&state) else {
         return SignInFailure::new(
             P,
@@ -663,6 +676,12 @@ pub async fn microsoft_login(State(state): State<Arc<AppState>>) -> Response {
     to_provider(P, &url, &csrf, &cookie)
 }
 
+#[derive(Deserialize, Default)]
+pub struct MicrosoftStart {
+    #[serde(default)]
+    pub team_id: Option<String>,
+}
+
 /// GET /auth/microsoft/callback
 pub async fn microsoft_callback(
     State(state): State<Arc<AppState>>,
@@ -670,6 +689,14 @@ pub async fn microsoft_callback(
     headers: HeaderMap,
     Query(params): Query<CallbackQuery>,
 ) -> Response {
+    // A trip through a team's own tenant (a sign-in, a test, a link or a
+    // claim) names its team in the signed flow cookie.
+    let cookies = super::auth::cookie_header(&headers);
+    if let Some(flow) = read_flow(Provider::Microsoft, cookies, &state.secrets.jwt_secret)
+        .filter(|f| !f.team.is_empty())
+    {
+        return super::entra_sso::callback(&state, &ip.0, cookies, &params, &flow).await;
+    }
     match microsoft_callback_inner(&state, &ip.0, &headers, &params).await {
         Ok(r) => r,
         Err(f) => f.into_redirect(app(&state)),
@@ -724,7 +751,7 @@ async fn microsoft_callback_inner(
     .map_err(|e| SignInFailure::new(P, Reason::Provider, "id_token", e))?;
     let person = microsoft_person(&claims)
         .map_err(|e| SignInFailure::new(P, Reason::NoVerifiedEmail, "email", e))?;
-    super::auth::finish_oidc(state, ip, P, &person, None, false).await
+    super::auth::finish_oidc(state, ip, P, &person, None).await
 }
 
 // ── Okta: the setup ─────────────────────────────────────────────────
@@ -1185,7 +1212,10 @@ async fn fresh_domain_owner(
     // release the domain at once (that would lock everyone out): the proof is
     // kept and marked failing for a grace period, and the owners are told.
     // After it, the proof goes (the domain's real owner may be another team).
-    let rule_on = super::sign_in::team_rule(state, &team).await?.require_okta;
+    let rule_on = super::sign_in::team_rule(state, &team)
+        .await?
+        .require_sso
+        .is_some();
     let failing = domain_failing_since(state, domain).await?;
     match gone_outcome(rule_on, failing.as_deref(), chrono::Utc::now()) {
         GoneOutcome::Release => {}
@@ -1205,11 +1235,11 @@ async fn fresh_domain_owner(
                 .await
                 .is_ok();
             if released {
-                super::require_okta::domain_released(
+                super::require_sso::domain_released(
                     state,
                     &team,
                     domain,
-                    super::require_okta::Released::GraceOver,
+                    super::require_sso::Released::GraceOver,
                 )
                 .await;
             }
@@ -1231,7 +1261,7 @@ async fn fresh_domain_owner(
             .send()
             .await
             .is_ok();
-        super::require_okta::domain_failing(state, &team, domain, marked).await;
+        super::require_sso::domain_failing(state, &team, domain, marked).await;
         return Ok(Some(team));
     }
     warn!(%domain, "Okta domain proof gone from DNS; released");
@@ -1244,14 +1274,17 @@ async fn fresh_domain_owner(
         // Not released: the team keeps it only if it still holds it and
         // turned the rule on meanwhile; any other failure gives no owner.
         let holder = domain_record(state, domain).await?.map(|(t, _, _)| t);
-        let rule_on = super::sign_in::team_rule(state, &team).await?.require_okta;
+        let rule_on = super::sign_in::team_rule(state, &team)
+            .await?
+            .require_sso
+            .is_some();
         return Ok(owner_after_failed_release(
             holder.as_deref(),
             &team,
             rule_on,
         ));
     }
-    super::require_okta::domain_released(state, &team, domain, super::require_okta::Released::Gone)
+    super::require_sso::domain_released(state, &team, domain, super::require_sso::Released::Gone)
         .await;
     Ok(None)
 }
@@ -1334,12 +1367,30 @@ async fn release_domain_while_rule_off(
         .expression_attribute_values(":t", attr_s(team))
         .build()
         .map_err(|e| internal("Okta domain not released", e))?;
-    super::require_okta::while_rule_off(
+    super::require_sso::while_rule_off(
         state,
         team,
+        None,
         vec![TransactWriteItem::builder().delete(delete).build()],
     )
     .await
+}
+
+/// Whether the team's Microsoft Entra setup lists `domain` (its proof then
+/// stays when the Okta setup stops listing it).
+async fn microsoft_uses(state: &AppState, team: &str, domain: &str) -> bool {
+    super::entra_sso::load(state, team)
+        .await
+        .map(|s| s.is_some_and(|s| s.domains.iter().any(|d| d == domain)))
+        .unwrap_or(true)
+}
+
+/// A proof the Okta setup no longer lists is released, unless the team's
+/// Microsoft setup lists it (and only while no rule needs it).
+async fn release_if_unused(state: &AppState, team: &str, domain: &str) {
+    if !microsoft_uses(state, team, domain).await {
+        let _ = release_domain_while_rule_off(state, team, domain).await;
+    }
 }
 
 /// Whether a fresh TXT read counts when Require Okta sign-in is turned on:
@@ -1348,34 +1399,125 @@ pub fn counts_at_turn_on(check: ProofCheck) -> bool {
     check == ProofCheck::There
 }
 
-/// Whether every domain of a hosted setup is proven by its own team right
-/// now: its TXT record read again and matching (a DNS read with no clear
-/// answer doesn't count), and no proof marked failing. Turning Require Okta
-/// sign-in on needs this.
-async fn domains_proven_now(state: &AppState, setup: &OktaSetup) -> Result<bool, String> {
-    if setup.domains.is_empty() {
+/// Whether every one of `domains` is proven by `team` right now: its TXT
+/// record read again and matching (a DNS read with no clear answer doesn't
+/// count), and no proof marked failing. Turning Require single sign-on on
+/// needs this.
+async fn domains_proven_now(
+    state: &AppState,
+    team: &str,
+    domains: &[String],
+) -> Result<bool, String> {
+    if domains.is_empty() {
         return Ok(false);
     }
-    for d in &setup.domains {
-        let rec = state
-            .dynamo
-            .get_item()
-            .table_name(&state.config.settings_table_name)
-            .key("pk", attr_s(&format!("{OKTA_DOMAIN_PREFIX}{d}")))
-            .key("sk", attr_s(OKTA_DOMAIN_SK))
-            .consistent_read(true)
-            .send()
-            .await
-            .map_err(|e| format!("{e}"))?
-            .item;
+    for d in domains {
+        let rec = raw_domain_record(state, d).await?;
         let ours = rec
             .as_ref()
-            .is_some_and(|i| s(i, "team_id") == setup.team_id && s(i, "failing_at").is_empty());
-        if !ours || !counts_at_turn_on(txt_check(state, &setup.team_id, d).await) {
+            .is_some_and(|i| s(i, "team_id") == team && s(i, "failing_at").is_empty());
+        if !ours || !counts_at_turn_on(txt_check(state, team, d).await) {
             return Ok(false);
         }
     }
     Ok(true)
+}
+
+/// Whether `domain` is `team`'s proven domain, not failing (read again in
+/// DNS once the proof is a day old): an invite or a claim at it may be
+/// accepted through the team's provider.
+pub(crate) async fn domain_usable(
+    state: &AppState,
+    team: &str,
+    domain: &str,
+) -> Result<bool, String> {
+    if domain.is_empty() || fresh_domain_owner(state, domain, false).await?.as_deref() != Some(team)
+    {
+        return Ok(false);
+    }
+    Ok(domain_failing_since(state, domain).await?.is_none())
+}
+
+/// A transaction part that holds only while `domain` is still `team`'s
+/// proof and not failing.
+pub(crate) fn domain_still_usable(
+    state: &AppState,
+    team: &str,
+    domain: &str,
+) -> Result<aws_sdk_dynamodb::types::TransactWriteItem, String> {
+    use aws_sdk_dynamodb::types::{ConditionCheck, TransactWriteItem};
+    Ok(TransactWriteItem::builder()
+        .condition_check(
+            ConditionCheck::builder()
+                .table_name(&state.config.settings_table_name)
+                .key("pk", attr_s(&format!("{OKTA_DOMAIN_PREFIX}{domain}")))
+                .key("sk", attr_s(OKTA_DOMAIN_SK))
+                .condition_expression("team_id = :t AND attribute_not_exists(failing_at)")
+                .expression_attribute_values(":t", attr_s(team))
+                .build()
+                .map_err(|e| e.to_string())?,
+        )
+        .build())
+}
+
+/// Whether every one of `domains` is proven by `team`: read again in DNS now
+/// (`recheck`), else from the stored proofs (for showing).
+pub(crate) async fn domains_proven_list(
+    state: &AppState,
+    team: &str,
+    domains: &[String],
+    recheck: bool,
+) -> Result<bool, String> {
+    if recheck {
+        return domains_proven_now(state, team, domains).await;
+    }
+    if domains.is_empty() {
+        return Ok(false);
+    }
+    for d in domains {
+        if domain_owner(state, d).await?.map(|(t, _)| t).as_deref() != Some(team)
+            || domain_failing_since(state, d).await?.is_some()
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Each domain's proof as the page shows it: the TXT record to add, whether
+/// this team proved it, and whether it is failing.
+pub(crate) async fn domain_proofs(
+    state: &AppState,
+    team: &str,
+    domains: &[String],
+) -> Result<Vec<Value>, String> {
+    let mut proofs = Vec::new();
+    for d in domains {
+        let owner = domain_owner(state, d).await?;
+        let (ours, theirs) = match &owner {
+            Some((t, _)) if t == team => (true, false),
+            Some(_) => (false, true),
+            None => (false, false),
+        };
+        let failing = if ours {
+            domain_failing_since(state, d).await?
+        } else {
+            None
+        };
+        proofs.push(json!({
+            "domain": d,
+            "txt_name": domain_txt_name(d),
+            "txt_value": domain_txt_value(&state.secrets.jwt_secret, team, d),
+            "verified_at": owner.filter(|_| ours).map(|(_, at)| at),
+            // Kept while single sign-on is required, but its TXT record is
+            // gone: add it back and verify again.
+            "failing_since": failing.clone(),
+            // When a failing proof is released unless its record is back.
+            "release_after": failing.as_deref().and_then(grace_ends).map(|t| t.to_rfc3339()),
+            "other_team": theirs,
+        }));
+    }
+    Ok(proofs)
 }
 
 /// Whether every domain of a hosted setup is proven by its own team, each
@@ -1386,29 +1528,6 @@ async fn all_domains_proven(state: &AppState, setup: &OktaSetup) -> Result<bool,
     }
     for d in &setup.domains {
         if fresh_domain_owner(state, d, true).await? != Some(setup.team_id.clone()) {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
-/// Whether every domain of a hosted setup is proven by its team: read again
-/// in DNS now (`recheck`), else from the stored proofs (for showing).
-pub(crate) async fn domains_proven(
-    state: &AppState,
-    setup: &OktaSetup,
-    recheck: bool,
-) -> Result<bool, String> {
-    if recheck {
-        return domains_proven_now(state, setup).await;
-    }
-    if setup.domains.is_empty() {
-        return Ok(false);
-    }
-    for d in &setup.domains {
-        if domain_owner(state, d).await?.map(|(t, _)| t) != Some(setup.team_id.clone())
-            || domain_failing_since(state, d).await?.is_some()
-        {
             return Ok(false);
         }
     }
@@ -1486,6 +1605,8 @@ enum Mode<'a> {
     Test(&'a str),
     /// A member linking their own Okta identity (their member id).
     Link(&'a str),
+    /// A claim link (routes::sso_claim): the member and the secret's hash.
+    Claim(&'a str),
 }
 
 async fn start_okta(
@@ -1508,11 +1629,12 @@ async fn start_okta_flow(
     let d = discover(idp(), &setup.issuer)
         .await
         .map_err(|e| SignInFailure::new(P, Reason::Provider, "discovery", e))?;
-    let test = !matches!(mode, Mode::SignIn);
+    let test = !matches!(mode, Mode::SignIn | Mode::Claim(_));
     let mut flow = Flow::new(P, &setup.team_id, matches!(mode, Mode::Test(_)));
     match mode {
         Mode::Link(member) => flow.link = member.to_string(),
         Mode::Test(by) => flow.by = by.to_string(),
+        Mode::Claim(c) => flow.claim = c.to_string(),
         Mode::SignIn => {}
     }
     let cookie = flow_cookie(P, &flow, &state.secrets.jwt_secret)
@@ -1641,7 +1763,24 @@ async fn okta_callback_inner(
             )
         })?;
     let claims = okta_claims(state, cookies, params, flow, &setup).await?;
-    okta_land(state, ip, &setup, &claims).await
+    let claim = Some(flow.claim.as_str()).filter(|c| !c.is_empty());
+    okta_land(state, ip, &setup, &claims, claim).await
+}
+
+/// A claim link for a team that requires single sign-on with Okta.
+pub async fn start_claim(
+    state: &AppState,
+    team: &str,
+    carried: &str,
+) -> Result<Response, &'static str> {
+    let setup = load_setup(state, team, OKTA_SK)
+        .await
+        .map_err(|_| "server")?
+        .filter(|s| s.enabled)
+        .ok_or("rule_off")?;
+    start_okta_flow(state, &setup, Mode::Claim(carried), None)
+        .await
+        .map_err(|_| "provider")
 }
 
 /// Where an Okta sign-in lands once Okta's id_token for `setup` is checked:
@@ -1652,6 +1791,7 @@ pub(crate) async fn okta_land(
     ip: &str,
     setup: &OktaSetup,
     claims: &Value,
+    claim: Option<&str>,
 ) -> Result<Response, SignInFailure> {
     const P: Provider = Provider::Okta;
     let setup = setup.clone();
@@ -1702,8 +1842,15 @@ pub(crate) async fn okta_land(
     let members = super::sign_in::team_members(state, &setup.team_id)
         .await
         .map_err(|e| SignInFailure::new(P, Reason::Server, "members", e))?;
+    let okta_sub = Some(sub.to_string()).filter(|v| !v.is_empty());
     if let Some(record) = linked_record(&members, &setup.issuer, sub) {
-        return super::auth::finish_oidc(state, ip, P, &person, Some(record), false).await;
+        let landing = super::auth::SsoLanding {
+            record,
+            joined_now: false,
+            okta_sub,
+            entra: None,
+        };
+        return super::auth::finish_oidc(state, ip, P, &person, Some(landing)).await;
     }
     // No member linked this identity. While the team requires Okta sign-in,
     // an admin's invite for exactly Okta's verified email is accepted here
@@ -1712,7 +1859,7 @@ pub(crate) async fn okta_land(
     let rule = super::sign_in::team_rule(state, &setup.team_id)
         .await
         .map_err(|e| SignInFailure::new(P, Reason::Server, "rule", e))?;
-    if !rule.require_okta {
+    if rule.require_sso != Some(super::require_sso::SsoProvider::Okta) {
         return Err(SignInFailure::new(
             P,
             Reason::OktaNotLinked,
@@ -1720,7 +1867,39 @@ pub(crate) async fn okta_land(
             "no member has linked this Okta identity",
         ));
     }
-    let ask_admin = |d: &str| SignInFailure::new(P, Reason::OktaAskAdmin, "invite", d);
+    let ask_admin = |d: &str| SignInFailure::new(P, Reason::SsoAskAdmin, "invite", d);
+    if sub.is_empty() {
+        return Err(SignInFailure::new(
+            P,
+            Reason::Provider,
+            "id_token",
+            "no sub",
+        ));
+    }
+    let link = super::require_sso::Link::Okta {
+        issuer: setup.issuer.clone(),
+        sub: sub.to_string(),
+    };
+    // A claim link an admin gave this member (routes::sso_claim).
+    if let Some(c) = claim {
+        let record = super::sso_claim::redeem(
+            state,
+            &setup.team_id,
+            c,
+            super::require_sso::SsoProvider::Okta,
+            &link,
+            &person.email,
+        )
+        .await
+        .map_err(|why| ask_admin(&format!("claim not accepted: {why}")))?;
+        let landing = super::auth::SsoLanding {
+            record: &record,
+            joined_now: true,
+            okta_sub,
+            entra: None,
+        };
+        return super::auth::finish_oidc(state, ip, P, &person, Some(landing)).await;
+    }
     // Hosted: a proof kept failing (its TXT record is gone) still signs in
     // members who linked before, but accepts no new member.
     if !super::sign_in::applies() {
@@ -1735,41 +1914,37 @@ pub(crate) async fn okta_land(
             ));
         }
     }
-    let invite = match super::require_okta::invite_for(&members, &person.email, chrono::Utc::now())
-    {
-        super::require_okta::InviteFor::Accept(i) => i,
-        super::require_okta::InviteFor::ExistingMember => {
+    let invite = match super::require_sso::invite_for(&members, &person.email, chrono::Utc::now()) {
+        super::require_sso::InviteFor::Accept(i) => i,
+        super::require_sso::InviteFor::ExistingMember => {
             return Err(ask_admin("a member has this email but never linked Okta"))
         }
-        super::require_okta::InviteFor::None => {
+        super::require_sso::InviteFor::None => {
             return Err(ask_admin(
                 "no member linked this identity and no invite is waiting",
             ))
         }
     };
-    if sub.is_empty() {
-        return Err(SignInFailure::new(
-            P,
-            Reason::Provider,
-            "id_token",
-            "no sub",
-        ));
-    }
-    let record = super::require_okta::invited_member(
+    let record = super::require_sso::invited_member(
         &invite,
         &person.new_user_id,
         &person.name,
-        &setup.issuer,
-        sub,
+        &link,
         &chrono::Utc::now().to_rfc3339(),
     );
-    if let Err(e) = super::require_okta::accept_invite(state, &record, &invite).await {
+    if let Err(e) = super::require_sso::accept_invite(state, &record, &invite, &link).await {
         // Another record already has this id, or another member holds this
         // identity, or the invite is gone: nothing was written.
         return Err(ask_admin(&e));
     }
     info!(team_id = %setup.team_id, "Invite accepted through Okta sign-in");
-    super::auth::finish_oidc(state, ip, P, &person, Some(&record), true).await
+    let landing = super::auth::SsoLanding {
+        record: &record,
+        joined_now: true,
+        okta_sub,
+        entra: None,
+    };
+    super::auth::finish_oidc(state, ip, P, &person, Some(landing)).await
 }
 
 // ── Okta: linking a member's own Okta identity ──────────────────────
@@ -1811,12 +1986,17 @@ pub fn okta_session_state(
     Ok(())
 }
 
-/// Marks claims made from an MCP connection the way the middleware marks a
-/// session: how it signed in, and the Okta subject.
-pub fn mark_okta(mut claims: Claims, via: Option<&str>, okta_sub: Option<String>) -> Claims {
-    claims.via_okta = signed_in_with_okta(via);
-    claims.held = is_held(via, super::setup_checks::self_hosted());
-    claims.okta_sub = okta_sub;
+/// Marks claims the way the middleware marks a session (and an MCP
+/// connection, a stream token, an email answer link): how it signed in, the
+/// Okta subject or team tenant identity, and whether it is held to its team.
+pub fn mark_session(mut claims: Claims, proof: &crate::auth::jwt::SignInProof) -> Claims {
+    claims.via_okta = signed_in_with_okta(proof.via.as_deref());
+    claims.okta_sub = proof.okta_sub.clone();
+    claims.entra = proof
+        .entra
+        .clone()
+        .filter(|_| proof.via.as_deref() == Some("microsoft"));
+    claims.held = is_held(proof, super::setup_checks::self_hosted());
     claims
 }
 
@@ -1960,7 +2140,12 @@ fn link_ticket(team: &str, by: &str, secret: &str) -> Result<String, String> {
     signed_ticket(team, by, LINK_AUD, secret)
 }
 
-fn signed_ticket(team: &str, by: &str, aud: &str, secret: &str) -> Result<String, String> {
+pub(crate) fn signed_ticket(
+    team: &str,
+    by: &str,
+    aud: &str,
+    secret: &str,
+) -> Result<String, String> {
     jsonwebtoken::encode(
         &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
         &TestTicket {
@@ -1974,7 +2159,7 @@ fn signed_ticket(team: &str, by: &str, aud: &str, secret: &str) -> Result<String
     .map_err(|e| e.to_string())
 }
 
-fn read_signed_ticket(token: &str, aud: &str, secret: &str) -> Option<TestTicket> {
+pub(crate) fn read_signed_ticket(token: &str, aud: &str, secret: &str) -> Option<TestTicket> {
     let mut v = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
     v.set_audience(&[aud]);
     v.set_required_spec_claims(&["exp", "aud"]);
@@ -2017,22 +2202,23 @@ fn link_redirect(state: &AppState, outcome: Result<(), &str>) -> Response {
 /// The session a request carries, with how it signed in, only while it
 /// still stands against the member's record (the same check every API
 /// request makes).
-async fn session_of(state: &AppState, headers: &HeaderMap) -> Option<(Claims, Option<String>)> {
+pub(crate) async fn session_of(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Option<(Claims, Option<String>)> {
     let tok = oauth_signin::cookie_value(
         super::auth::cookie_header(headers),
         "__Host-coderhelm_session",
     )?;
-    let mut claims = crate::auth::jwt::validate_token(tok, &state.secrets.jwt_secret).ok()?;
+    let claims = crate::auth::jwt::validate_token(tok, &state.secrets.jwt_secret).ok()?;
     let proof = crate::auth::jwt::read_proof(tok, &state.secrets.jwt_secret);
     let via = proof.via.clone();
-    claims.via_okta = signed_in_with_okta(via.as_deref());
-    claims.held = is_held(via.as_deref(), super::setup_checks::self_hosted());
-    claims.okta_sub = proof.okta_sub.clone();
+    let claims = mark_session(claims, &proof);
     super::sign_in::check_member_session(state, &claims)
         .await
         .ok()?;
     // A team that requires Okta sign-in: only the sessions it still allows.
-    super::require_okta::check_claims(state, &claims, &proof, false)
+    super::require_sso::check_claims(state, &claims, &proof)
         .await
         .ok()?;
     Some((claims, via))
@@ -2145,12 +2331,14 @@ pub async fn link_remove(
         .ok_or_else(|| fail(StatusCode::NOT_FOUND, "You aren't on this team."))?;
     // While the team requires Okta sign-in, unlinking would leave the member
     // no way to sign in again.
-    if rule_of(&state, &claims.team_id).await?.require_okta {
+    if rule_of(&state, &claims.team_id).await?.require_sso
+        == Some(super::require_sso::SsoProvider::Okta)
+    {
         return Err((
             StatusCode::CONFLICT,
             Json(json!({
-                "error": "Your team requires Okta sign-in, so you can't unlink Okta: you couldn't sign in again. Ask the owner to turn the rule off first.",
-                "code": "okta_required_on",
+                "error": "Your team requires single sign-on with Okta, so you can't unlink Okta: you couldn't sign in again. Ask the owner to turn the rule off first.",
+                "code": "sso_required_on",
             })),
         ));
     }
@@ -2364,6 +2552,16 @@ pub struct TestTicket {
     exp: u64,
 }
 
+impl TestTicket {
+    pub fn team(&self) -> &str {
+        &self.team
+    }
+
+    pub fn by(&self) -> &str {
+        &self.by
+    }
+}
+
 const TEST_AUD: &str = "okta_test";
 
 fn test_ticket(team: &str, by: &str, secret: &str) -> Result<String, String> {
@@ -2375,7 +2573,7 @@ fn read_ticket(token: &str, secret: &str) -> Option<TestTicket> {
 }
 
 /// A Test sign-in link is used by the admin who made it, in their team.
-fn ticket_is_theirs(t: &TestTicket, session: Option<&Claims>) -> bool {
+pub(crate) fn ticket_is_theirs(t: &TestTicket, session: Option<&Claims>) -> bool {
     session.is_some_and(|c| c.sub == t.by && c.team_id == t.team)
 }
 
@@ -2609,38 +2807,13 @@ async fn okta_view(state: &AppState, team: &str) -> Result<Value, ApiError> {
             domains.push(d.clone());
         }
     }
-    let mut proofs = Vec::new();
-    if !super::sign_in::applies() {
-        for d in &domains {
-            let owner = domain_owner(state, d)
-                .await
-                .map_err(|e| internal("Okta domain not read", e))?;
-            let (ours, theirs) = match &owner {
-                Some((t, _)) if t == team => (true, false),
-                Some(_) => (false, true),
-                None => (false, false),
-            };
-            let failing = if ours {
-                domain_failing_since(state, d)
-                    .await
-                    .map_err(|e| internal("Okta domain not read", e))?
-            } else {
-                None
-            };
-            proofs.push(json!({
-                "domain": d,
-                "txt_name": domain_txt_name(d),
-                "txt_value": domain_txt_value(&state.secrets.jwt_secret, team, d),
-                "verified_at": owner.filter(|_| ours).map(|(_, at)| at),
-                // Kept while Okta sign-in is required, but its TXT record
-                // is gone: add it back and verify again.
-                "failing_since": failing.clone(),
-                // When a failing proof is released unless its record is back.
-                "release_after": failing.as_deref().and_then(grace_ends).map(|t| t.to_rfc3339()),
-                "other_team": theirs,
-            }));
-        }
-    }
+    let proofs = if super::sign_in::applies() {
+        Vec::new()
+    } else {
+        domain_proofs(state, team, &domains)
+            .await
+            .map_err(|e| internal("Okta domain not read", e))?
+    };
     Ok(json!({
         "callback_url": okta_redirect_uri(api(state)),
         "sign_in_redirect_uri": okta_redirect_uri(api(state)),
@@ -2785,7 +2958,7 @@ pub async fn okta_test(
     if let Ok(Some(old)) = load_setup(&state, &team, OKTA_DRAFT_SK).await {
         let live = load_setup(&state, &team, OKTA_SK).await.ok().flatten();
         for d in released_by_draft(&old, Some(&draft), live.as_ref()) {
-            let _ = release_domain_while_rule_off(&state, &team, &d).await;
+            release_if_unused(&state, &team, &d).await;
         }
     }
     put_setup(&state, &draft, OKTA_DRAFT_SK)
@@ -2840,9 +3013,10 @@ pub async fn okta_save(
         // Turning Okta off, moving it to another issuer (which drops every
         // link) or dropping a domain while the team requires it would lock
         // people out.
-        if let Some(refused) =
-            super::require_okta::setup_change_refused(&rule_of(&state, &team).await?)
-        {
+        if let Some(refused) = super::require_sso::setup_change_refused(
+            &rule_of(&state, &team).await?,
+            super::require_sso::SsoProvider::Okta,
+        ) {
             return Err(refused);
         }
     }
@@ -2850,7 +3024,8 @@ pub async fn okta_save(
     // sign-in: the owner only, from their own Okta session, and only after
     // they ran Test sign-in with it themselves.
     let client_changes = current.as_ref().is_some_and(|l| client_changed(l, &draft));
-    let rule_on_now = rule_of(&state, &team).await?.require_okta;
+    let rule_on_now =
+        rule_of(&state, &team).await?.require_sso == Some(super::require_sso::SsoProvider::Okta);
     if client_changes && rule_on_now {
         let live = current.as_ref().unwrap_or(&draft);
         if let Err(why) = may_change_client(&claims, &draft, live, chrono::Utc::now()) {
@@ -2916,7 +3091,7 @@ pub async fn okta_save(
         }
         // Domains no longer listed are released (only while the rule is off).
         for d in old.domains.iter().filter(|d| !live.domains.contains(d)) {
-            let _ = release_domain_while_rule_off(&state, &team, d).await;
+            release_if_unused(&state, &team, d).await;
         }
     }
     set_marker(&state, &team, live.enabled)
@@ -2952,9 +3127,10 @@ pub async fn okta_toggle(
     };
     if body.enabled {
         owner_on_self_host(&claims, super::sign_in::applies())?;
-    } else if let Some(refused) =
-        super::require_okta::setup_change_refused(&rule_of(&state, &team).await?)
-    {
+    } else if let Some(refused) = super::require_sso::setup_change_refused(
+        &rule_of(&state, &team).await?,
+        super::require_sso::SsoProvider::Okta,
+    ) {
         return Err(refused);
     }
     if body.enabled && live.tested_at.is_none() {
@@ -3008,9 +3184,10 @@ async fn save_live(state: &AppState, setup: &OktaSetup, narrows: bool) -> Result
         .set_item(Some(setup.to_item(OKTA_SK)))
         .build()
         .map_err(|e| internal("Okta setup not saved", e))?;
-    super::require_okta::while_rule_off(
+    super::require_sso::while_rule_off(
         state,
         &setup.team_id,
+        Some(super::require_sso::SsoProvider::Okta),
         vec![TransactWriteItem::builder().put(put).build()],
     )
     .await
@@ -3135,6 +3312,17 @@ pub async fn okta_verify_domains(
             }
         }
     }
+    // The team's Microsoft Entra setup proves its domains the same way.
+    if let Some(m) = super::entra_sso::load(&state, &team)
+        .await
+        .map_err(|e| internal("Microsoft setup not read", e))?
+    {
+        for d in m.domains {
+            if !domains.contains(&d) {
+                domains.push(d);
+            }
+        }
+    }
     let now = chrono::Utc::now().to_rfc3339();
     let mut proven = Vec::new();
     for d in &domains {
@@ -3181,11 +3369,11 @@ pub async fn okta_verify_domains(
                     .is_ok();
                 if released {
                     warn!(domain = %d, "Okta domain proven by another team; the holder's gone proof released");
-                    super::require_okta::domain_released(
+                    super::require_sso::domain_released(
                         &state,
                         &other,
                         d,
-                        super::require_okta::Released::Contender,
+                        super::require_sso::Released::Contender,
                     )
                     .await;
                 }
@@ -3229,8 +3417,10 @@ pub async fn okta_release_domain(
 ) -> Result<Json<Value>, ApiError> {
     admin(&claims)?;
     let team = setup_team(&state, &claims).await?;
-    if let Some(refused) = super::require_okta::setup_change_refused(&rule_of(&state, &team).await?)
-    {
+    if let Some(refused) = super::require_sso::setup_change_refused(
+        &rule_of(&state, &team).await?,
+        super::require_sso::SsoProvider::Okta,
+    ) {
         return Err(refused);
     }
     let domain = domain.trim().to_lowercase();
@@ -3263,9 +3453,10 @@ pub async fn okta_release_domain(
             .expression_attribute_values(":t", attr_s(&team))
             .build()
             .map_err(|e| internal("Okta domain not released", e))?;
-        super::require_okta::while_rule_off(
+        super::require_sso::while_rule_off(
             &state,
             &team,
+            None,
             vec![TransactWriteItem::builder().delete(delete).build()],
         )
         .await?;
@@ -3281,8 +3472,10 @@ pub async fn okta_delete(
 ) -> Result<Json<Value>, ApiError> {
     admin(&claims)?;
     let team = setup_team(&state, &claims).await?;
-    if let Some(refused) = super::require_okta::setup_change_refused(&rule_of(&state, &team).await?)
-    {
+    if let Some(refused) = super::require_sso::setup_change_refused(
+        &rule_of(&state, &team).await?,
+        super::require_sso::SsoProvider::Okta,
+    ) {
         return Err(refused);
     }
     audit(&state, &claims, "Okta sign-in removed".into()).await?;
@@ -3299,15 +3492,18 @@ pub async fn okta_delete(
         let current = load_setup(&state, &team, OKTA_SK)
             .await
             .map_err(|e| internal("Okta setup not read", e))?;
-        super::require_okta::while_rule_off(
+        super::require_sso::while_rule_off(
             &state,
             &team,
+            Some(super::require_sso::SsoProvider::Okta),
             vec![TransactWriteItem::builder().delete(delete).build()],
         )
         .await?;
         if let Some(live) = current {
             for d in &live.domains {
-                let _ = release_domain(&state, &team, d).await;
+                if !microsoft_uses(&state, &team, d).await {
+                    let _ = release_domain(&state, &team, d).await;
+                }
             }
         }
     }
@@ -3315,7 +3511,9 @@ pub async fn okta_delete(
     for sk in [OKTA_SK, OKTA_DRAFT_SK] {
         if let Ok(Some(setup)) = load_setup(&state, &team, sk).await {
             for d in &setup.domains {
-                let _ = release_domain(&state, &team, d).await;
+                if !microsoft_uses(&state, &team, d).await {
+                    let _ = release_domain(&state, &team, d).await;
+                }
             }
         }
     }
@@ -3344,7 +3542,7 @@ pub async fn okta_discard_draft(
     if let Ok(Some(old)) = load_setup(&state, &team, OKTA_DRAFT_SK).await {
         let live = load_setup(&state, &team, OKTA_SK).await.ok().flatten();
         for d in released_by_draft(&old, None, live.as_ref()) {
-            let _ = release_domain_while_rule_off(&state, &team, &d).await;
+            release_if_unused(&state, &team, &d).await;
         }
     }
     delete_setup(&state, &team, OKTA_DRAFT_SK)
@@ -3358,11 +3556,14 @@ pub fn signed_in_with_okta(via: Option<&str>) -> bool {
     via == Some("okta")
 }
 
-/// Whether a session is held to its team: one a team's Okta signed in, on
-/// the hosted deployment only (a self-hosted install has one organization,
-/// so there is nothing beyond it to hold it from).
-pub fn is_held(via: Option<&str>, self_hosted: bool) -> bool {
-    signed_in_with_okta(via) && !self_hosted
+/// Whether a session is held to its team: one a team's own provider signed
+/// in (its Okta, or a trip through its Microsoft Entra tenant), on the
+/// hosted deployment only (a self-hosted install has one organization, so
+/// there is nothing beyond it to hold it from).
+pub fn is_held(proof: &crate::auth::jwt::SignInProof, self_hosted: bool) -> bool {
+    (signed_in_with_okta(proof.via.as_deref())
+        || super::require_sso::SsoProvider::Microsoft.signed_in(proof))
+        && !self_hosted
 }
 
 /// Setting up a second factor is person-wide, but someone on no other team
@@ -4027,6 +4228,7 @@ mod tests {
             held: false,
             via_okta: false,
             okta_sub: None,
+            entra: None,
         };
         assert!(crate::routes::api::is_platform_admin(&c));
         c.held = true;
@@ -4216,6 +4418,7 @@ mod tests {
             held: false,
             via_okta: false,
             okta_sub: None,
+            entra: None,
         };
         assert!(ticket_is_theirs(&t, Some(&c)));
         assert!(!ticket_is_theirs(&t, None));
@@ -4293,10 +4496,14 @@ mod tests {
         let first = cb.find("finish_oidc(").unwrap();
         assert!(cb[..first].contains("if let Some(record) = linked_record("));
         let no_link = cb.find("Reason::OktaNotLinked").unwrap();
-        let invite = cb.find("require_okta::accept_invite(").unwrap();
+        let invite = cb.find("require_sso::accept_invite(").unwrap();
         let second = cb.rfind("finish_oidc(").unwrap();
         assert!(first < no_link && no_link < invite && invite < second);
-        assert!(cb.find("if !rule.require_okta").unwrap() < no_link);
+        assert!(
+            cb.find("if rule.require_sso != Some(super::require_sso::SsoProvider::Okta)")
+                .unwrap()
+                < no_link
+        );
         // The hosted domain proof comes before any of it.
         assert!(cb.find("fresh_domain_owner(").unwrap() < first);
     }
@@ -4317,6 +4524,7 @@ mod tests {
             held: false,
             via_okta: false,
             okta_sub: None,
+            entra: None,
         }
     }
 
@@ -4435,7 +4643,7 @@ mod tests {
             proven[..proven.find("\n}\n").unwrap()].contains("fresh_domain_owner(state, d, true)")
         );
         let save = &src[src.find("pub async fn okta_save(").unwrap()..];
-        assert!(save[..save.find("\n}\n").unwrap()].contains("release_domain_while_rule_off("));
+        assert!(save[..save.find("\n}\n").unwrap()].contains("release_if_unused("));
         assert!(src.contains("pub async fn okta_release_domain("));
     }
 
@@ -4456,17 +4664,32 @@ mod tests {
             assert!(held_refuses(h, false), "{h}");
         }
         assert!(!held_refuses("api::me", true));
-        assert!(is_held(Some("okta"), false));
+        let okta = crate::auth::jwt::SignInProof::new(false, "okta");
+        assert!(is_held(&okta, false));
         assert!(
-            !is_held(Some("okta"), true),
+            !is_held(&okta, true),
             "self-hosted: one organization, no hold"
         );
-        assert!(!is_held(Some("google"), false));
+        assert!(!is_held(
+            &crate::auth::jwt::SignInProof::new(false, "google"),
+            false
+        ));
+        // A trip through the team's own Microsoft tenant is held too; a
+        // plain Microsoft sign-in is not.
+        let tenant =
+            crate::auth::jwt::SignInProof::new(false, "microsoft").with_entra(Some("t/o".into()));
+        assert!(is_held(&tenant, false));
+        assert!(!is_held(&tenant, true));
+        assert!(!is_held(
+            &crate::auth::jwt::SignInProof::new(false, "microsoft"),
+            false
+        ));
         let mw = include_str!("../middleware/auth.rs");
         assert!(
-            mw.find("claims.held =").unwrap() < mw.find("support_access::check_session").unwrap()
+            mw.find("mark_session(claims, &signed_in)").unwrap()
+                < mw.find("support_access::check_session").unwrap()
         );
-        assert!(mw.contains("oidc_signin::is_held("));
+        assert!(mw.contains("oidc_signin::mark_session("));
         assert!(mw.contains("held_refusal(&state, &claims, handler)"));
         let auth = include_str!("auth.rs");
         let gh = &auth[auth.find("async fn github_callback_inner(").unwrap()..];
@@ -4685,8 +4908,9 @@ mod tests {
         assert!(body_src("pub async fn okta_test(").contains("released_by_draft("));
         // Verify reads another team's record again (and releases it only
         // when it is definitely gone).
-        assert!(body_src("pub async fn okta_verify_domains(")
-            .contains("txt_check(&state, &other, d)"));
+        assert!(
+            body_src("pub async fn okta_verify_domains(").contains("txt_check(&state, &other, d)")
+        );
     }
 
     /// 7: the link and test pages check the session like every request, and
@@ -4790,7 +5014,7 @@ mod tests {
         assert!(!okta_landing_matches(None, "TEAM#org", "USER#ann"));
         let auth = include_str!("auth.rs");
         let fin = &auth[auth.find("pub(crate) async fn finish_oidc(").unwrap()..];
-        let okta_branch = &fin[fin.find("if let Some(record) = okta").unwrap()..];
+        let okta_branch = &fin[fin.find("if let Some(landing) = &sso").unwrap()..];
         assert!(
             okta_branch.find("selfhost_landing(").unwrap()
                 < okta_branch.find("} else if sign_in::applies()").unwrap()

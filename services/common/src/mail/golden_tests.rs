@@ -116,6 +116,24 @@ fn cases() -> Vec<(&'static str, &'static str, Value, Option<&'static str>)> {
             Some("Acme"),
         ),
         (
+            "sso_recovered",
+            "sso_recovered",
+            json!({"provider": "Okta", "link": format!("{APP}/settings/sign-in/")}),
+            Some("Acme"),
+        ),
+        (
+            "sso_claim_issued",
+            "sso_claim_issued",
+            json!({"actor": "Pat Admin", "provider": "Microsoft Entra", "link": format!("{APP}/settings/sign-in/")}),
+            Some("Acme"),
+        ),
+        (
+            "sso_claim_used",
+            "sso_claim_used",
+            json!({"provider": "Okta", "link": format!("{APP}/settings/sign-in/")}),
+            Some("Acme"),
+        ),
+        (
             "two_factor_reset",
             "two_factor_reset",
             json!({"link": format!("{APP}/settings/security/")}),

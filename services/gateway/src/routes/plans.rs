@@ -3579,7 +3579,7 @@ pub async fn plan_chat_stream(
         crate::auth::jwt::PLAN_CHAT_AUDIENCE,
         &state.secrets.jwt_secret,
     );
-    super::require_okta::check_scoped(&state, &claims, &minted_by)
+    super::require_sso::check_scoped(&state, &claims, &minted_by)
         .await
         .map_err(|r| r.status())?;
 

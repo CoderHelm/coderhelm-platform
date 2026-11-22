@@ -2292,7 +2292,7 @@ pub async fn brain_stream(
         crate::auth::jwt::BRAIN_AUDIENCE,
         &state.secrets.jwt_secret,
     );
-    if let Err(r) = super::require_okta::check_scoped(&state, &claims, &minted_by).await {
+    if let Err(r) = super::require_sso::check_scoped(&state, &claims, &minted_by).await {
         return Err((
             r.status(),
             Json(json!({ "error": "Your session ended. Sign in again.", "code": "session_ended" })),

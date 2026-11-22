@@ -759,6 +759,8 @@ pub struct Consent {
     pub via: Option<String>,
     /// An Okta session's Okta subject (the connection ends with its link).
     pub okta_sub: Option<String>,
+    /// A team tenant session's `<tid>/<oid>` (routes::entra_sso).
+    pub entra: Option<String>,
     /// The person let the app start runs and ask for reviews.
     pub allow_write: bool,
     /// The person let the app search the knowledge bases they can read.
@@ -785,6 +787,8 @@ pub struct StoredCode {
     pub via: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub okta_sub: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entra: Option<String>,
     /// Seconds since the epoch.
     pub expires_at: i64,
 }
@@ -890,6 +894,7 @@ pub fn approve(
         mfa: who.mfa,
         via: who.via.clone(),
         okta_sub: who.okta_sub.clone(),
+        entra: who.entra.clone(),
         expires_at: now.timestamp() + CODE_TTL_SECS,
     };
     (code, stored)
@@ -919,6 +924,8 @@ pub struct StoredGrant {
     pub via: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub okta_sub: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entra: Option<String>,
     #[serde(default)]
     pub refresh_hash: String,
     #[serde(default)]
@@ -934,6 +941,17 @@ pub struct StoredGrant {
 }
 
 impl StoredGrant {
+    /// How the session that made the grant signed in: the rules a session
+    /// meets are checked against it on every call.
+    pub fn proof(&self) -> crate::auth::jwt::SignInProof {
+        crate::auth::jwt::SignInProof {
+            mfa: self.mfa,
+            via: self.via.clone(),
+            okta_sub: self.okta_sub.clone(),
+            entra: self.entra.clone(),
+        }
+    }
+
     pub fn scope_set(&self) -> BTreeSet<&'static str> {
         known_scopes(&self.scopes)
     }
@@ -1206,6 +1224,7 @@ async fn swap_code(
         mfa: c.mfa,
         via: c.via,
         okta_sub: c.okta_sub,
+        entra: c.entra,
         refresh_hash: hash(&refresh_token),
         prev_refresh_hash: None,
         refresh_expires_at: refresh_expiry(now),
@@ -1866,6 +1885,7 @@ pub(crate) mod tests {
             mfa: false,
             via: Some("password".into()),
             okta_sub: None,
+            entra: None,
             allow_write: write,
             allow_knowledge: false,
             lookups: BTreeSet::new(),

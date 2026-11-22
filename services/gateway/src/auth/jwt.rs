@@ -16,12 +16,11 @@ pub struct SignInProof {
     /// while that is still the member's linked subject.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub okta_sub: Option<String>,
-    /// The owner's break-glass sign-in (password and second factor) to a
-    /// team that requires Okta sign-in: that team. Written only by the
-    /// sign-in that logged it (routes::require_okta), and good on that team
-    /// only.
+    /// A sign-in through a team's own Microsoft Entra tenant
+    /// (routes::entra_sso): `<tid>/<oid>`. A session lasts only while that
+    /// is still the member's linked identity under the live setup.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub break_glass: Option<String>,
+    pub entra: Option<String>,
 }
 
 impl SignInProof {
@@ -30,13 +29,13 @@ impl SignInProof {
             mfa,
             via: Some(via.to_string()),
             okta_sub: None,
-            break_glass: None,
+            entra: None,
         }
     }
 
-    /// The same, as the owner's logged break-glass sign-in to `team_id`.
-    pub fn with_break_glass(mut self, team_id: Option<&str>) -> Self {
-        self.break_glass = team_id.filter(|t| !t.is_empty()).map(str::to_string);
+    /// The same, recording the team tenant identity the sign-in was for.
+    pub fn with_entra(mut self, entra: Option<String>) -> Self {
+        self.entra = entra.filter(|s| !s.is_empty());
         self
     }
 
@@ -109,6 +108,7 @@ pub fn create_session_token(
         held: false,
         via_okta: false,
         okta_sub: None,
+        entra: None,
     };
     encode(
         &Header::default(),
@@ -151,10 +151,10 @@ pub struct SecondStep {
     /// An Okta sign-in: the Okta subject, kept for the session it becomes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub okta_sub: Option<String>,
-    /// The owner's break-glass sign-in to a team that requires Okta: the
-    /// session it becomes is logged and marked as one (routes::require_okta).
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub break_glass: bool,
+    /// A sign-in through a team's own Microsoft Entra tenant: its
+    /// `<tid>/<oid>`, kept for the session it becomes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entra: Option<String>,
     /// This token's id: its wrong codes are counted, and it dies after five.
     #[serde(default)]
     pub jti: String,
@@ -237,6 +237,7 @@ pub fn create_scoped_token(
         held: false,
         via_okta: false,
         okta_sub: None,
+        entra: None,
     };
     encode(
         &Header::default(),
@@ -434,7 +435,7 @@ mod tests {
             via: "github".into(),
             jti: String::new(),
             okta_sub: None,
-            break_glass: false,
+            entra: None,
             aud: String::new(),
             iat: 0,
             exp: 0,

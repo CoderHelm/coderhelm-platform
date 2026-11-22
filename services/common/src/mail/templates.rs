@@ -589,6 +589,47 @@ pub const TEMPLATES: &[Template] = &[
         install_may_send: true,
     },
     Template {
+        id: "sso_recovered",
+        subject: "Require single sign-on was turned off",
+        subject_by: "",
+        subjects: &[],
+        // Who did it is fixed text: no parameter may claim to be support.
+        params: &[p("provider", Kind::Line(40)), p("link", Kind::Link)],
+        body: &[
+            Part::Para("Require single sign-on ({provider}) was turned off for your team from outside the product: by CoderHelm support after verifying an owner, or on a self-hosted install with its recovery script. Your audit log says who and why."),
+            Part::Para("People can sign in again the usual ways. When {provider} works again, an owner turns the rule back on in Settings, Sign-in rules. If nobody at your team asked for this, contact CoderHelm support now."),
+            Part::Button("Open Sign-in rules", "link"),
+        ],
+        install_may_send: true,
+    },
+    Template {
+        id: "sso_claim_issued",
+        subject: "a single sign-on claim link was issued",
+        subject_by: "",
+        subjects: &[],
+        // No member named: an address in an email reads as a link.
+        params: &[p("actor", Kind::Line(80)), p("provider", Kind::Line(40)), p("link", Kind::Link)],
+        body: &[
+            Part::Para("{actor} made a one-time link for a member of your team to link their {provider} account and sign in. It works once, for 72 hours."),
+            Part::Para("The audit log says who it is for. If you didn't expect this, revoke it in Settings, Sign-in rules."),
+            Part::Button("Open Sign-in rules", "link"),
+        ],
+        install_may_send: true,
+    },
+    Template {
+        id: "sso_claim_used",
+        subject: "a single sign-on claim link was used",
+        subject_by: "",
+        subjects: &[],
+        params: &[p("provider", Kind::Line(40)), p("link", Kind::Link)],
+        body: &[
+            Part::Para("A member of your team used their one-time link: their {provider} account is now linked and they signed in."),
+            Part::Para("The audit log says who. If you didn't expect this, check Settings, Team."),
+            Part::Button("Open Sign-in rules", "link"),
+        ],
+        install_may_send: true,
+    },
+    Template {
         id: "two_factor_reset",
         subject: "your two-factor sign-in was reset",
         subject_by: "",

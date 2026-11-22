@@ -135,11 +135,10 @@ pub struct Rule {
     /// in at (an https address). Its sessions on hosted are refused.
     pub moved_to: Option<String>,
     /// Members sign in only through the team's (self-hosted: the
-    /// organization's) Okta (routes::require_okta).
-    pub require_okta: bool,
-    /// When that was last turned on (unix seconds): sessions from any other
-    /// way in issued before it are ended.
-    pub okta_since: u64,
+    /// organization's) own identity provider (routes::require_sso).
+    pub require_sso: Option<super::require_sso::SsoProvider>,
+    /// When that was last turned on (unix seconds).
+    pub sso_since: u64,
 }
 
 /// A number attribute, or 0.
@@ -148,13 +147,6 @@ fn num(item: &Item, key: &str) -> u64 {
         .and_then(|v| v.as_n().ok())
         .and_then(|n| n.parse().ok())
         .unwrap_or(0)
-}
-
-fn flag(item: &Item, key: &str) -> bool {
-    item.get(key)
-        .and_then(|v| v.as_bool().ok())
-        .copied()
-        .unwrap_or(false)
 }
 
 /// An install address a moved team is sent to: https with a host, nothing
@@ -181,8 +173,11 @@ impl Rule {
                 .filter(|v| !v.is_empty())
                 .map(str::to_string),
             moved_to: moved_url(s(item, "moved_to")),
-            require_okta: flag(item, "require_okta"),
-            okta_since: num(item, "require_okta_since"),
+            require_sso: super::require_sso::SsoProvider::stored(s(
+                item,
+                super::require_sso::RULE_ATTR,
+            )),
+            sso_since: num(item, super::require_sso::SINCE_ATTR),
         }
     }
 }
@@ -193,14 +188,21 @@ impl Rule {
 /// read that fails is an error, and callers refuse.
 pub async fn team_rule(state: &AppState, team_id: &str) -> Result<Rule, String> {
     if applies() {
-        return Ok(load_org(state)
-            .await?
+        let org = load_org(state).await?;
+        // The recovery script turned the rule off: the owners hear of it
+        // from the first request that reads it (routes::require_sso).
+        if let Some(o) = &org {
+            if let Some(n) = &o.recovery_notice {
+                super::require_sso::send_recovery_notice(state, &o.team_id, n).await;
+            }
+        }
+        return Ok(org
             .map(|o| Rule {
                 require_2fa: o.require_2fa,
                 since: o.require_2fa_since,
                 moved_to: None,
-                require_okta: o.require_okta,
-                okta_since: o.require_okta_since,
+                require_sso: o.require_sso,
+                sso_since: o.require_sso_since,
             })
             .unwrap_or_default());
     }
@@ -254,10 +256,13 @@ pub struct Org {
     /// before it (an invite copied from the hosted CoderHelm) was never
     /// sent from here.
     pub created_at: Option<String>,
-    /// Members sign in only through the organization's Okta, and since when
-    /// (unix seconds; routes::require_okta).
-    pub require_okta: bool,
-    pub require_okta_since: u64,
+    /// Members sign in only through the organization's own identity
+    /// provider, and since when (unix seconds; routes::require_sso).
+    pub require_sso: Option<super::require_sso::SsoProvider>,
+    pub require_sso_since: u64,
+    /// Left by the recovery script (scripts/sso-recovery.py) until the
+    /// owners are emailed.
+    pub recovery_notice: Option<String>,
 }
 
 impl Org {
@@ -290,8 +295,14 @@ impl Org {
             created_at: Some(s(item, "created_at"))
                 .filter(|v| !v.is_empty())
                 .map(str::to_string),
-            require_okta: flag(item, "require_okta"),
-            require_okta_since: num(item, "require_okta_since"),
+            require_sso: super::require_sso::SsoProvider::stored(s(
+                item,
+                super::require_sso::RULE_ATTR,
+            )),
+            require_sso_since: num(item, super::require_sso::SINCE_ATTR),
+            recovery_notice: Some(s(item, super::require_sso::RECOVERY_NOTICE))
+                .filter(|v| !v.is_empty())
+                .map(str::to_string),
         })
     }
 }
@@ -941,7 +952,7 @@ pub async fn check_session(
     claims: &Claims,
     proof: &SignInProof,
     handler: Option<&str>,
-    app: bool,
+    _app: bool,
 ) -> Result<(), Response> {
     let rule = match team_rule(state, &claims.team_id).await {
         Ok(rule) => rule,
@@ -953,7 +964,7 @@ pub async fn check_session(
     if let Some(url) = moved_refusal(&rule, handler) {
         return Err(team_moved(url));
     }
-    super::require_okta::check(state, &rule, claims, proof, app).await?;
+    super::require_sso::check(state, &rule, claims, proof).await?;
     if gate(rule.require_2fa, proof, handler) {
         Ok(())
     } else {
@@ -1233,8 +1244,8 @@ fn session_cookie(token: &str) -> String {
 }
 
 /// A fresh session for `claims` that passed a second factor just now. It
-/// keeps how the current session signed in (`current`): its way in, its Okta
-/// subject, and an owner's break-glass mark.
+/// keeps how the current session signed in (`current`): its way in, and its
+/// Okta subject or team tenant identity.
 pub fn session_with_second_factor(
     state: &AppState,
     claims: &Claims,
@@ -1251,7 +1262,7 @@ pub fn session_with_second_factor(
         claims.github_login.as_deref(),
         &SignInProof::new(true, &via)
             .with_okta_sub(claims.okta_sub.clone())
-            .with_break_glass(current.and_then(|p| p.break_glass.as_deref())),
+            .with_entra(current.and_then(|p| p.entra.clone())),
         &state.secrets.jwt_secret,
         SESSION_TTL_SECS,
     )
@@ -2267,7 +2278,9 @@ pub async fn check_member_session(state: &AppState, claims: &Claims) -> Result<(
         .table_name(&state.config.users_table_name)
         .key("pk", attr_s(&claims.team_id))
         .key("sk", attr_s(&claims.sub))
-        .projection_expression("pk, #st, #va, okta_issuer, okta_sub, okta_valid_after")
+        .projection_expression(
+            "pk, #st, #va, okta_issuer, okta_sub, okta_valid_after, ms_tid, ms_oid, ms_valid_after",
+        )
         .expression_attribute_names("#st", "status")
         .expression_attribute_names("#va", VALID_AFTER)
         .send()
@@ -2295,6 +2308,23 @@ pub async fn check_member_session(state: &AppState, claims: &Claims) -> Result<(
             live.as_ref(),
             claims.iat,
             claims.okta_sub.as_deref(),
+        )
+        .map_err(session_ended)?;
+    }
+    // The same for a session through the team's own Microsoft Entra tenant:
+    // only while the member's link is its identity under the live tenant.
+    if claims.entra.is_some() {
+        let live = super::entra_sso::load(state, &claims.team_id)
+            .await
+            .map_err(|e| {
+                error!(error = %e, "Microsoft setup not read; request refused");
+                StatusCode::SERVICE_UNAVAILABLE.into_response()
+            })?;
+        super::entra_sso::session_state(
+            item.as_ref(),
+            live.as_ref(),
+            claims.iat,
+            claims.entra.as_deref(),
         )
         .map_err(session_ended)?;
     }
@@ -2559,16 +2589,6 @@ pub async fn password_step(
     passed: bool,
 ) -> Result<Option<Response>, String> {
     match needed_for(state, &step, passed).await? {
-        // The owner's break-glass sign-in to a team that requires Okta: a
-        // second factor, with no exception (routes::require_okta).
-        StepNeeded::None if step.break_glass && !passed => Ok(Some(
-            super::require_okta::Refused {
-                team: String::new(),
-                team_id: step.team_id.clone(),
-                code: super::require_okta::NEEDS_2FA,
-            }
-            .json(),
-        )),
         StepNeeded::None => Ok(None),
         StepNeeded::UsePassword => Ok(Some(
             fail_code(
@@ -2727,34 +2747,16 @@ pub async fn verify_second_step(
         ));
     }
     record_success(&state, &key).await;
-    // The team may have turned Require Okta sign-in on since the sign-in
-    // began: its last word, and a break-glass sign-in logged before its
-    // session.
-    let issue = match super::require_okta::issue_check(
-        &state,
-        &step.team_id,
-        &step.sub,
-        &step.via,
-        step.break_glass,
-    )
-    .await
-    .map_err(|e| internal("Okta sign-in rule not read", e))?
-    {
-        Ok(i) => i,
-        Err(r) => return Ok(with_cleared(r.json())),
-    };
-    let break_glass =
-        (issue == super::require_okta::Issue::BreakGlass).then_some(step.team_id.as_str());
-    if break_glass.is_some() {
-        super::require_okta::record_break_glass(
-            &state,
-            &step.team_id,
-            &step.sub,
-            &step.email,
-            "an authenticator app code",
-        )
+    // The team may have turned Require single sign-on on since the sign-in
+    // began: its last word.
+    let signed_in = SignInProof::new(true, &step.via)
+        .with_okta_sub(step.okta_sub.clone())
+        .with_entra(step.entra.clone());
+    if let Err(r) = super::require_sso::issue_check(&state, &step.team_id, &signed_in)
         .await
-        .map_err(|e| internal("Break-glass sign-in not logged", e))?;
+        .map_err(|e| internal("Single sign-on rule not read", e))?
+    {
+        return Ok(with_cleared(r.json()));
     }
     let session = jwt::create_session_token(
         &step.sub,
@@ -2765,9 +2767,7 @@ pub async fn verify_second_step(
             r => r,
         },
         step.github_login.as_deref(),
-        &SignInProof::new(true, &step.via)
-            .with_okta_sub(step.okta_sub.clone())
-            .with_break_glass(break_glass),
+        &signed_in,
         &state.secrets.jwt_secret,
         SESSION_TTL_SECS,
     )
@@ -2860,19 +2860,31 @@ pub async fn get_settings(
     let items = team_members(&state, &claims.team_id)
         .await
         .map_err(|e| internal("Members not read", e))?;
-    // Require Okta sign-in: the live Okta setup, who linked it, and what
-    // turning the rule on still needs.
+    // Require single sign-on: for each provider, its live setup, who linked
+    // it, and what turning the rule on with it still needs.
     let signed_in = proof.map(|p| p.0).unwrap_or_default();
-    let live = super::oidc_signin::live_setup_of(&state, &claims.team_id)
+    let mut options = Vec::new();
+    let mut lives = Vec::new();
+    for p in super::require_sso::SsoProvider::ALL {
+        let live = super::require_sso::live_setup(&state, &claims.team_id, p)
+            .await
+            .map_err(|e| internal("Single sign-on setup not read", e))?;
+        let ready =
+            super::require_sso::readiness(&state, &claims, &signed_in, p, live.as_ref(), false)
+                .await
+                .map_err(|e| internal("Domains not read", e))?;
+        let mut view = ready.view();
+        view["unlinked"] = json!(super::require_sso::unlinked(&items, live.as_ref()));
+        view["recovery"] = json!(super::require_sso::recovery_words(self_hosted, p));
+        options.push(view);
+        lives.push(live);
+    }
+    let claim_links: Vec<Value> = super::sso_claim::list(&state, &claims.team_id)
         .await
-        .map_err(|e| internal("Okta setup not read", e))?;
-    let issuer = live.as_ref().map(|l| l.issuer.as_str());
-    let okta = super::require_okta::readiness(&state, &claims, &signed_in, live.as_ref(), false)
-        .await
-        .map_err(|e| internal("Okta domains not read", e))?;
-    let break_glass = super::require_okta::break_glass_log(&state, &claims.team_id)
-        .await
-        .map_err(|e| internal("Break-glass sign-ins not read", e))?;
+        .map_err(|e| internal("Claim links not read", e))?
+        .iter()
+        .map(|c| c.view())
+        .collect();
     let active: Vec<&Item> = items.iter().filter(|i| !is_invite(i)).collect();
     let factors = futures::future::join_all(active.iter().map(|i| member_factor(&state, i))).await;
     let people: Vec<Value> = active
@@ -2886,7 +2898,8 @@ pub async fn get_settings(
                 "github_login": s(i, "github_login"),
                 "role": s(i, "role"),
                 "two_factor": f,
-                "okta_linked": super::require_okta::okta_linked(i, issuer),
+                "okta_linked": lives[0].as_ref().is_some_and(|l| l.linked(i)),
+                "microsoft_linked": lives[1].as_ref().is_some_and(|l| l.linked(i)),
                 "is_self": s(i, "sk") == claims.sub,
             })
         })
@@ -2940,20 +2953,17 @@ pub async fn get_settings(
         "without_2fa": without,
         "api_keys": keys,
         "your_session_has_2fa": signed_in.mfa,
-        "require_okta": rule.require_okta,
-        "require_okta_since": okta_since_text(&rule),
-        "okta": okta.view(),
-        "can_require_okta": okta.ready(),
-        "unlinked": super::require_okta::unlinked(&items, issuer),
-        "break_glass": break_glass,
+        "require_sso": rule.require_sso.map(|p| p.slug()),
+        "require_sso_since": sso_since_text(&rule),
+        "sso_options": options,
+        "claim_links": claim_links,
     })))
 }
 
-/// When Require Okta sign-in was turned on, for the page (none while off).
-fn okta_since_text(rule: &Rule) -> Option<String> {
-    rule.require_okta
-        .then(|| chrono::DateTime::from_timestamp(rule.okta_since as i64, 0))
-        .flatten()
+/// When Require single sign-on was turned on, for the page (none while off).
+fn sso_since_text(rule: &Rule) -> Option<String> {
+    rule.require_sso
+        .and_then(|_| chrono::DateTime::from_timestamp(rule.sso_since as i64, 0))
         .map(|t| t.to_rfc3339())
 }
 
@@ -3018,11 +3028,12 @@ pub async fn key_reviews(
 pub struct SettingsBody {
     pub domains: Option<Vec<String>>,
     pub require_2fa: Option<bool>,
-    /// Require Okta sign-in (routes::require_okta): the owner's alone.
+    /// Require single sign-on (routes::require_sso): the owner's alone. The
+    /// provider's slug (`okta` or `microsoft`) turns it on; "" turns it off.
     #[serde(default)]
-    pub require_okta: Option<bool>,
-    /// The owner saw the members who haven't linked Okta and turns it on
-    /// anyway.
+    pub require_sso: Option<String>,
+    /// The owner saw the members who haven't linked the provider and turns
+    /// it on anyway.
     #[serde(default)]
     pub acknowledge_unlinked: bool,
 }
@@ -3067,15 +3078,31 @@ pub async fn update_settings(
         .map_err(|e| internal("Two-factor rule not read", e))?;
     let turning_on = body.require_2fa == Some(true) && !current.require_2fa;
     let signed_in = proof.as_ref().map(|p| p.0.clone()).unwrap_or_default();
-    let okta_change = body.require_okta.filter(|v| *v != current.require_okta);
-    // Turning it on: the live Okta setup it was checked against, which the
-    // write below requires to be unchanged.
-    let okta_on_with = match okta_change {
-        Some(on) => {
-            okta_rule_change(&state, &claims, &signed_in, on, body.acknowledge_unlinked).await?
+    // The rule's change: `Some(Some(p))` on with `p`, `Some(None)` off.
+    let wanted = match body.require_sso.as_deref().map(str::trim) {
+        None => None,
+        Some("") => Some(None),
+        Some(v) => Some(Some(super::require_sso::SsoProvider::parse(v).ok_or_else(
+            || fail(StatusCode::BAD_REQUEST, "Choose Okta or Microsoft Entra."),
+        )?)),
+    };
+    let sso_change = wanted.filter(|w| *w != current.require_sso);
+    if let (Some(Some(_)), Some(_)) = (sso_change, current.require_sso) {
+        return Err(fail_code(
+            StatusCode::CONFLICT,
+            "Turn Require single sign-on off first, then on with the other provider.",
+            "sso_required_on",
+        ));
+    }
+    // Turning it on: the live setup it was checked against, which the write
+    // below requires to be unchanged.
+    let sso_on_with = match sso_change {
+        Some(to) => {
+            sso_rule_change(&state, &claims, &signed_in, to, body.acknowledge_unlinked).await?
         }
         None => None,
     };
+    let okta_change = sso_change.map(|to| to.is_some());
     // Self-hosted: an Okta setup with no domains of its own signs in the
     // organization's allowed domains, so while the rule stays on none of
     // them can be dropped (that would lock those people out).
@@ -3084,7 +3111,7 @@ pub async fn update_settings(
         _ => false,
     };
     let rule_stays_on =
-        (current.require_okta && okta_change != Some(false)) || okta_change == Some(true);
+        (current.require_sso.is_some() && okta_change != Some(false)) || okta_change == Some(true);
     let mut guard_domains = false;
     if drops_org_domains && okta_change != Some(false) {
         let relies = super::oidc_signin::live_setup_of(&state, &claims.team_id)
@@ -3095,8 +3122,8 @@ pub async fn update_settings(
             if rule_stays_on {
                 return Err(fail_code(
                     StatusCode::CONFLICT,
-                    "Your Okta signs in people at these allowed domains, and Okta sign-in is required: turn off Require Okta sign-in first, or list the domains in the Okta setup.",
-                    "okta_required_on",
+                    "Your Okta signs in people at these allowed domains, and single sign-on is required: turn off Require single sign-on first, or list the domains in the Okta setup.",
+                    "sso_required_on",
                 ));
             }
             // Off now: the write holds only while it stays off.
@@ -3150,28 +3177,35 @@ pub async fn update_settings(
             sets.push("require_2fa_since = :now");
         }
     }
-    if let Some(on) = okta_change {
-        changes.push(if on {
-            format!(
-                "Okta sign-in required for {}",
+    let mut removes: Vec<&str> = Vec::new();
+    if let Some(to) = sso_change {
+        changes.push(match to {
+            Some(p) => format!(
+                "Single sign-on with {} required for {}",
+                p.name(),
                 if self_hosted {
                     "everyone"
                 } else {
                     "everyone on this team"
                 }
-            )
-        } else {
-            "Okta sign-in no longer required".to_string()
+            ),
+            None => "Single sign-on no longer required".to_string(),
         });
-        sets.push("require_okta = :ro");
-        values.insert(":ro".into(), AttributeValue::Bool(on));
-        if on {
-            // Every session from another way in issued before now ends.
-            sets.push("require_okta_since = :ros");
-            values.insert(
-                ":ros".into(),
-                AttributeValue::N(super::require_okta::since_now().to_string()),
-            );
+        match to {
+            Some(p) => {
+                // Every session from another way in ends at its next request.
+                sets.push("#rs = :rs");
+                sets.push("#rss = :rss");
+                values.insert(":rs".into(), attr_s(p.slug()));
+                values.insert(
+                    ":rss".into(),
+                    AttributeValue::N(super::require_sso::since_now().to_string()),
+                );
+            }
+            None => {
+                removes.push("#rs");
+                removes.push("#rss");
+            }
         }
     }
     let log = |detail: String| {
@@ -3191,9 +3225,9 @@ pub async fn update_settings(
         }
     };
     // Nothing changes without its line in the log: written first, except
-    // when Require Okta sign-in is turned on, whose transaction can still be
-    // cancelled (its line follows the outcome, a cancelled one as cancelled).
-    if !changes.is_empty() && okta_on_with.is_none() {
+    // when Require single sign-on is turned on, whose transaction can still
+    // be cancelled (its line follows the outcome, a cancelled one as such).
+    if !changes.is_empty() && sso_on_with.is_none() {
         log(changes.join(". ")).await?;
     }
     // Self-hosted: the organization record (it exists). Hosted: the team's
@@ -3208,25 +3242,33 @@ pub async fn update_settings(
     if self_hosted {
         conditions.push("attribute_exists(pk)");
     }
-    if guard_domains {
-        conditions.push("(attribute_not_exists(#ro) OR #ro <> :on)");
-        names.insert("#ro".into(), "require_okta".into());
-        values.insert(":on".into(), AttributeValue::Bool(true));
+    if sso_change.is_some() {
+        names.insert("#rs".into(), super::require_sso::RULE_ATTR.into());
+        names.insert("#rss".into(), super::require_sso::SINCE_ATTR.into());
     }
+    if guard_domains {
+        conditions.push("attribute_not_exists(#rs)");
+        names.insert("#rs".into(), super::require_sso::RULE_ATTR.into());
+    }
+    let update_expr = if removes.is_empty() {
+        format!("SET {}", sets.join(", "))
+    } else {
+        format!("SET {} REMOVE {}", sets.join(", "), removes.join(", "))
+    };
     let condition = (!conditions.is_empty()).then(|| conditions.join(" AND "));
     let names = (!names.is_empty()).then_some(names);
-    match &okta_on_with {
-        // Turning Require Okta sign-in on: one transaction with the rule and
-        // a check that the Okta setup (and on hosted each proven domain) is
-        // exactly what was checked, so nothing that narrows Okta can land
-        // beside it.
+    match &sso_on_with {
+        // Turning Require single sign-on on: one transaction with the rule
+        // and a check that the provider's setup (and on hosted each proven
+        // domain) is exactly what was checked, so nothing that narrows it can
+        // land beside it.
         Some(live) => {
             use aws_sdk_dynamodb::types::{TransactWriteItem, Update};
             let update = Update::builder()
                 .table_name(&state.config.settings_table_name)
                 .key("pk", attr_s(&pk))
                 .key("sk", attr_s(sk))
-                .update_expression(format!("SET {}", sets.join(", ")))
+                .update_expression(update_expr.clone())
                 .set_condition_expression(condition)
                 .set_expression_attribute_names(names)
                 .set_expression_attribute_values(Some(values))
@@ -3234,7 +3276,7 @@ pub async fn update_settings(
                 .map_err(|e| internal("Sign-in rules not saved", e))?;
             let mut items = vec![TransactWriteItem::builder().update(update).build()];
             items.extend(
-                super::require_okta::setup_unchanged(&state, live)
+                super::require_sso::setup_unchanged(&state, live)
                     .map_err(|e| internal("Sign-in rules not saved", e))?,
             );
             if let Err(e) = state
@@ -3247,14 +3289,14 @@ pub async fn update_settings(
                 let e = format!("{e:?}");
                 if e.contains("TransactionCanceled") {
                     log(format!(
-                        "Cancelled, nothing changed: {} (the Okta setup changed meanwhile)",
+                        "Cancelled, nothing changed: {} (the sign-in setup changed meanwhile)",
                         changes.join(". ")
                     ))
                     .await?;
                     return Err(fail_code(
                         StatusCode::CONFLICT,
-                        "The Okta setup changed while you turned this on. Check it again, then turn it on.",
-                        "okta_changed",
+                        "The sign-in setup changed while you turned this on. Check it again, then turn it on.",
+                        "sso_changed",
                     ));
                 }
                 return Err(internal("Sign-in rules not saved", e));
@@ -3268,7 +3310,7 @@ pub async fn update_settings(
                 .table_name(&state.config.settings_table_name)
                 .key("pk", attr_s(&pk))
                 .key("sk", attr_s(sk))
-                .update_expression(format!("SET {}", sets.join(", ")))
+                .update_expression(update_expr.clone())
                 .set_condition_expression(condition)
                 .set_expression_attribute_names(names)
                 .set_expression_attribute_values(Some(values));
@@ -3279,8 +3321,8 @@ pub async fn update_settings(
                 {
                     return Err(fail_code(
                         StatusCode::CONFLICT,
-                        "Require Okta sign-in was turned on meanwhile. Turn it off first to drop allowed domains.",
-                        "okta_required_on",
+                        "Require single sign-on was turned on meanwhile. Turn it off first to drop allowed domains.",
+                        "sso_required_on",
                     ));
                 }
                 return Err(internal("Sign-in rules not saved", e));
@@ -3312,56 +3354,64 @@ pub async fn update_settings(
         "domains": domains,
         "require_2fa": rule.require_2fa,
         "require_2fa_since": rule.since,
-        "require_okta": rule.require_okta,
-        "require_okta_since": okta_since_text(&rule),
+        "require_sso": rule.require_sso.map(|p| p.slug()),
+        "require_sso_since": sso_since_text(&rule),
         "notified": notified,
     })))
 }
 
-/// Turning Require Okta sign-in on or off: the owner only, from their own
-/// session. On needs Okta set up and on, (hosted) every domain proven in DNS
-/// now, and the owner's session from this team's Okta; with members who
-/// haven't linked Okta, the owner says they saw the list.
-async fn okta_rule_change(
+/// Turning Require single sign-on on (`to`: the provider) or off: the owner
+/// only, from their own session. On needs the provider set up and on,
+/// (hosted) every domain proven in DNS now, and the owner's session from
+/// that provider; with members who haven't linked it, the owner says they
+/// saw the list.
+async fn sso_rule_change(
     state: &AppState,
     claims: &Claims,
     signed_in: &SignInProof,
-    on: bool,
+    to: Option<super::require_sso::SsoProvider>,
     acknowledged: bool,
-) -> Result<Option<super::oidc_signin::OktaSetup>, ApiError> {
-    let live = super::oidc_signin::live_setup_of(state, &claims.team_id)
+) -> Result<Option<super::require_sso::Live>, ApiError> {
+    let provider = to.unwrap_or(super::require_sso::SsoProvider::Okta);
+    let live = super::require_sso::live_setup(state, &claims.team_id, provider)
         .await
-        .map_err(|e| internal("Okta setup not read", e))?;
-    let ready = super::require_okta::readiness(state, claims, signed_in, live.as_ref(), on)
-        .await
-        .map_err(|e| internal("Okta domains not read", e))?;
+        .map_err(|e| internal("Single sign-on setup not read", e))?;
+    let ready = super::require_sso::readiness(
+        state,
+        claims,
+        signed_in,
+        provider,
+        live.as_ref(),
+        to.is_some(),
+    )
+    .await
+    .map_err(|e| internal("Domains not read", e))?;
     if !ready.is_owner {
-        let (status, code, msg) = ready.first_missing().unwrap_or((
+        return Err(fail_code(
             StatusCode::FORBIDDEN,
+            "Only the owner can turn Require single sign-on on or off.",
             "owner_only",
-            "Only the owner can turn Require Okta sign-in on or off.",
         ));
-        return Err(fail_code(status, msg, code));
     }
-    if !on {
+    let Some(provider) = to else {
         return Ok(None);
-    }
+    };
     if let Some((status, code, msg)) = ready.first_missing() {
-        return Err(fail_code(status, msg, code));
+        return Err(fail_code(status, &msg, code));
     }
     let members = team_members(state, &claims.team_id)
         .await
         .map_err(|e| internal("Members not read", e))?;
-    let unlinked =
-        super::require_okta::unlinked(&members, live.as_ref().map(|l| l.issuer.as_str()));
+    let unlinked = super::require_sso::unlinked(&members, live.as_ref());
     if !unlinked.is_empty() && !acknowledged {
         return Err((
             StatusCode::CONFLICT,
             Json(json!({
                 "error": format!(
-                    "{} {} not linked Okta yet. Once Okta sign-in is required, they can't sign in until an admin re-invites them (they accept with Okta) or turns the rule off while they link.",
+                    "{} {} not linked {} yet. Once single sign-on is required, they can't sign in until an admin gives them a one-time claim link.",
                     unlinked.len(),
-                    if unlinked.len() == 1 { "member has" } else { "members have" }
+                    if unlinked.len() == 1 { "member has" } else { "members have" },
+                    provider.name()
                 ),
                 "code": "unlinked_members",
                 "unlinked": unlinked,
@@ -3979,7 +4029,7 @@ mod tests {
             mfa: false,
             via: Some("google".into()),
             okta_sub: None,
-            break_glass: None,
+            entra: None,
         };
         let passed = SignInProof::new(true, "github");
         // Off: everyone goes on.
@@ -4142,7 +4192,7 @@ mod tests {
         assert!(before(oidc, "selfhost_landing", "Ulid::new"));
         assert!(before(
             oidc,
-            "if let Some(record) = okta",
+            "if let Some(landing) = &sso",
             "selfhost_landing"
         ));
         assert!(before(oidc, "sign_in::second_step", "create_session_token"));
@@ -4532,8 +4582,8 @@ mod tests {
                 require_2fa: true,
                 since: Some("2026-10-27T00:00:00Z".into()),
                 moved_to: None,
-                require_okta: false,
-                okta_since: 0,
+                require_sso: None,
+                sso_since: 0,
             }
         );
         assert_eq!(Rule::from_item(&HashMap::new()), Rule::default());
@@ -4609,8 +4659,7 @@ mod tests {
         assert!(!body.contains("proof.mfa &&"));
         assert!(body.find("moved_refusal(").unwrap() < body.find("gate(rule.require_2fa").unwrap());
         assert!(
-            body.find("require_okta::check(").unwrap()
-                < body.find("gate(rule.require_2fa").unwrap()
+            body.find("require_sso::check(").unwrap() < body.find("gate(rule.require_2fa").unwrap()
         );
     }
 

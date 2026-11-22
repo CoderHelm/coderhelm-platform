@@ -799,7 +799,8 @@ pub async fn invite_user(
     let okta_only = crate::routes::sign_in::team_rule(&state, &claims.team_id)
         .await
         .map_err(|e| internal("Sign-in rules not read", e))?
-        .require_okta;
+        .require_sso
+        .is_some();
     // Check if this email already has a Cognito account
     let existing_sub = state
         .cognito
@@ -2324,6 +2325,7 @@ mod tests {
             held: false,
             via_okta: false,
             okta_sub: None,
+            entra: None,
         }
     }
 

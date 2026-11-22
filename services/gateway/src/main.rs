@@ -178,6 +178,12 @@ fn build_app(state: Arc<AppState>) -> Router {
                 .delete(routes::api::remove_from_allowlist),
         )
         .route("/admin/teams", get(routes::admin::admin_teams))
+        // CoderHelm support turns a team's Require single sign-on off after
+        // verifying an owner out of band (routes::require_sso::recover).
+        .route(
+            "/admin/teams/:team_id/sso-recovery",
+            post(routes::require_sso::recover),
+        )
         // The install's version and updates (self-hosted installs).
         .route("/system/version", get(routes::system::version))
         .route("/system/auto-update", put(routes::system::set_auto_update))
@@ -894,6 +900,34 @@ fn build_app(state: Arc<AppState>) -> Router {
         .route(
             "/sign-in/okta/draft",
             delete(routes::oidc_signin::okta_discard_draft),
+        )
+        // The team's own Microsoft Entra tenant (routes::entra_sso).
+        .route(
+            "/sign-in/microsoft",
+            get(routes::entra_sso::get_setup)
+                .put(routes::entra_sso::save_setup)
+                .delete(routes::entra_sso::delete_setup),
+        )
+        .route(
+            "/sign-in/microsoft/test",
+            post(routes::entra_sso::test_link),
+        )
+        .route(
+            "/sign-in/microsoft/enabled",
+            put(routes::entra_sso::set_enabled),
+        )
+        .route(
+            "/users/microsoft/link",
+            get(routes::entra_sso::link_status)
+                .post(routes::entra_sso::link_start)
+                .delete(routes::entra_sso::link_remove),
+        )
+        // One-time claim links for members not linked to the required
+        // provider (routes::sso_claim).
+        .route("/sign-in/claims", post(routes::sso_claim::issue))
+        .route(
+            "/sign-in/claims/:user_id",
+            delete(routes::sso_claim::revoke),
         )
         .route(
             "/sign-in",
@@ -1677,6 +1711,9 @@ fn build_app(state: Arc<AppState>) -> Router {
         .route("/okta/callback", get(routes::oidc_signin::okta_callback))
         .route("/okta/test", get(routes::oidc_signin::okta_test_start))
         .route("/okta/link", get(routes::oidc_signin::link_begin))
+        .route("/microsoft/test", get(routes::entra_sso::test_begin))
+        .route("/microsoft/link", get(routes::entra_sso::link_begin))
+        .route("/sso/claim", get(routes::sso_claim::start))
         // An install's GitHub sign-in through CoderHelm's GitHub App comes
         // back here (routes::github_hybrid).
         .route(

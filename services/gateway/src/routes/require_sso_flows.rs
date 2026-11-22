@@ -1,4 +1,4 @@
-//! Require Okta sign-in through the real handlers and the real middleware,
+//! Require single sign-on through the real handlers and the real middleware,
 //! against the AWS stand-in (`crate::fake_aws`): one test per way a session
 //! is made or used. Each one makes a session or a sign-in that main lets
 //! through and checks that the rule refuses it (and that it works again
@@ -38,16 +38,22 @@ async fn world() -> World {
 }
 
 impl World {
+    /// The team's rule: on with Okta, or off.
     fn rule(&self, team: &str, on: bool) {
-        self.f.store.put(
-            "settings",
-            &[
-                ("pk", json!(team)),
-                ("sk", json!(super::sign_in::TEAM_RULE_SK)),
-                ("require_okta", json!(on)),
-                ("require_okta_since", json!(RULE_SINCE)),
-            ],
-        );
+        self.rule_with(team, on.then_some("okta"));
+    }
+
+    /// The team's rule with a provider's slug, or off.
+    fn rule_with(&self, team: &str, provider: Option<&str>) {
+        let mut item = vec![
+            ("pk", json!(team)),
+            ("sk", json!(super::sign_in::TEAM_RULE_SK)),
+        ];
+        if let Some(p) = provider {
+            item.push(("require_sso", json!(p)));
+            item.push(("require_sso_since", json!(RULE_SINCE)));
+        }
+        self.f.store.put("settings", &item);
     }
 
     fn okta(&self, team: &str, enabled: bool) {
@@ -196,6 +202,20 @@ fn okta_id(sub: &str) -> String {
     super::oidc_signin::okta_user_id(ISSUER, sub)
 }
 
+fn okta_link(sub: &str) -> super::require_sso::Link {
+    super::require_sso::Link::Okta {
+        issuer: ISSUER.into(),
+        sub: sub.into(),
+    }
+}
+
+/// The Okta link an invite-made record carries.
+fn link_of(
+    rec: &std::collections::HashMap<String, aws_sdk_dynamodb::types::AttributeValue>,
+) -> super::require_sso::Link {
+    okta_link(rec["okta_sub"].as_s().unwrap())
+}
+
 fn okta_proof(sub: &str) -> SignInProof {
     SignInProof::new(false, "okta").with_okta_sub(Some(sub.into()))
 }
@@ -231,11 +251,11 @@ async fn every_session_from_another_way_in_ends_while_the_team_requires_okta() {
         w.rule(GATED, true);
         let a = w.call("GET", STATUS, &c, None).await;
         assert_eq!(a.status, StatusCode::UNAUTHORIZED, "{via}");
-        assert_eq!(a.body["code"], "okta_required", "{via}");
+        assert_eq!(a.body["code"], "sso_required", "{via}");
         assert!(a.body["sign_in_url"]
             .as_str()
             .unwrap()
-            .contains("signin_error=okta_required"));
+            .contains("signin_error=sso_required"));
         assert!(a.ends_session(), "{via}: the cookie is cleared");
     }
     // A token from before sign-in proofs existed.
@@ -282,39 +302,36 @@ async fn an_okta_session_of_the_team_stands() {
     assert_eq!(w.call("GET", STATUS, &c, None).await.status, StatusCode::OK);
 }
 
+/// Item 1: there is no break-glass. The owner's own sessions from every
+/// other way in end like anyone's, a second factor or not.
 #[tokio::test]
-async fn a_break_glass_session_stands_only_for_the_owner_with_a_second_factor() {
+async fn the_owners_sessions_from_any_other_way_in_end_like_anyones() {
     let w = world().await;
     w.rule(GATED, true);
+    w.okta(GATED, true);
     w.member(GATED, "USER#o", "owner@example.com", "owner", &[]);
-    let bg = |mfa: bool| SignInProof::new(mfa, "password").with_break_glass(Some(GATED));
-    let c = w.cookie(GATED, "USER#o", "owner@example.com", "owner", &bg(true));
-    assert_eq!(w.call("GET", STATUS, &c, None).await.status, StatusCode::OK);
-    // Without its second factor: refused.
-    let c = w.cookie(GATED, "USER#o", "owner@example.com", "owner", &bg(false));
-    assert_eq!(
-        w.call("GET", STATUS, &c, None).await.status,
-        StatusCode::UNAUTHORIZED
-    );
-    // Marked for another team: refused here.
-    let c = w.cookie(
-        GATED,
-        "USER#o",
-        "owner@example.com",
-        "owner",
-        &SignInProof::new(true, "password").with_break_glass(Some(OTHER)),
-    );
-    assert_eq!(
-        w.call("GET", STATUS, &c, None).await.status,
-        StatusCode::UNAUTHORIZED
-    );
-    // No longer the owner on their record: refused, whatever the token says.
-    w.member(GATED, "USER#o", "owner@example.com", "admin", &[]);
-    let c = w.cookie(GATED, "USER#o", "owner@example.com", "owner", &bg(true));
-    assert_eq!(
-        w.call("GET", STATUS, &c, None).await.status,
-        StatusCode::UNAUTHORIZED
-    );
+    let other_tenant = SignInProof::new(true, "microsoft")
+        .with_entra(Some(format!("{}/o1", super::entra_sso::CONSUMER_TENANT)));
+    for proof in [
+        SignInProof::new(true, "password"),
+        SignInProof::new(false, "password"),
+        SignInProof::new(true, "google"),
+        SignInProof::new(true, "github"),
+        SignInProof::new(true, "microsoft"),
+        other_tenant,
+    ] {
+        let c = w.cookie(GATED, "USER#o", "owner@example.com", "owner", &proof);
+        let a = w.call("GET", STATUS, &c, None).await;
+        assert_eq!(a.status, StatusCode::UNAUTHORIZED, "{proof:?}");
+        // Another tenant's identity is no link of theirs: the member check
+        // ends it before the rule is even asked.
+        let code = a.body["code"].as_str().unwrap_or_default();
+        assert!(
+            code == "sso_required" || code == "session_ended",
+            "{proof:?} {code}"
+        );
+        assert!(a.ends_session());
+    }
 }
 
 #[tokio::test]
@@ -348,7 +365,7 @@ async fn a_connected_app_works_only_from_an_okta_sessions_grant() {
         &[("okta_issuer", json!(ISSUER)), ("okta_sub", json!("sub-1"))],
     );
     let claims = |via: &str| {
-        crate::routes::oidc_signin::mark_okta(
+        crate::routes::oidc_signin::mark_session(
             jwt::validate_token(
                 w.cookie(
                     GATED,
@@ -361,15 +378,14 @@ async fn a_connected_app_works_only_from_an_okta_sessions_grant() {
                 &w.state.secrets.jwt_secret,
             )
             .unwrap(),
-            Some(via),
-            Some("sub-1".into()),
+            &SignInProof::new(true, via).with_okta_sub(Some("sub-1".into())),
         )
     };
     // The check every MCP call makes (mcp_server, middleware app_request).
     let pw = super::sign_in::check_session(
         &w.state,
         &claims("password"),
-        &SignInProof::new(true, "password").with_break_glass(Some(GATED)),
+        &SignInProof::new(true, "password"),
         None,
         true,
     )
@@ -469,8 +485,8 @@ fn password_user(w: &World, email: &str, mfa: bool) {
     });
 }
 
-fn login(email: &str, break_glass: bool) -> Value {
-    json!({ "email": email, "password": "pw-correct-horse", "break_glass": break_glass })
+fn login(email: &str) -> Value {
+    json!({ "email": email, "password": "pw-correct-horse" })
 }
 
 #[tokio::test]
@@ -486,27 +502,17 @@ async fn a_password_sign_in_to_a_team_that_requires_okta_is_refused_and_makes_no
     );
     w.rule(GATED, false);
     let a = w
-        .call(
-            "POST",
-            "/auth/login",
-            "",
-            Some(login("ann@example.com", false)),
-        )
+        .call("POST", "/auth/login", "", Some(login("ann@example.com")))
         .await;
     assert_eq!(a.status, StatusCode::OK);
     assert_eq!(w.session_proof(&a).unwrap().0.team_id, GATED);
 
     w.rule(GATED, true);
     let a = w
-        .call(
-            "POST",
-            "/auth/login",
-            "",
-            Some(login("ann@example.com", false)),
-        )
+        .call("POST", "/auth/login", "", Some(login("ann@example.com")))
         .await;
     assert_eq!(a.status, StatusCode::FORBIDDEN);
-    assert_eq!(a.body["code"], "okta_required");
+    assert_eq!(a.body["code"], "sso_required");
     assert!(w.session_proof(&a).is_none());
     // No personal team was made instead.
     assert!(w
@@ -514,16 +520,6 @@ async fn a_password_sign_in_to_a_team_that_requires_okta_is_refused_and_makes_no
         .store
         .items("users", "TEAM#sub-ann@example.com")
         .is_empty());
-    // Asking for break-glass doesn't help a member who isn't the owner.
-    let a = w
-        .call(
-            "POST",
-            "/auth/login",
-            "",
-            Some(login("ann@example.com", true)),
-        )
-        .await;
-    assert_eq!(a.body["code"], "okta_required");
 }
 
 #[tokio::test]
@@ -540,12 +536,7 @@ async fn a_password_sign_in_lands_on_the_persons_other_team_and_leaves_the_invit
         &[],
     );
     let a = w
-        .call(
-            "POST",
-            "/auth/login",
-            "",
-            Some(login("ann@example.com", false)),
-        )
+        .call("POST", "/auth/login", "", Some(login("ann@example.com")))
         .await;
     assert_eq!(a.status, StatusCode::OK);
     assert_eq!(w.session_proof(&a).unwrap().0.team_id, OTHER);
@@ -556,8 +547,10 @@ async fn a_password_sign_in_lands_on_the_persons_other_team_and_leaves_the_invit
     );
 }
 
+/// Item 1: the owner's password and Cognito's code make no session while
+/// the rule is on, and nothing is written as if they had.
 #[tokio::test]
-async fn break_glass_is_the_owners_with_a_second_factor_and_is_logged() {
+async fn the_owners_password_and_second_factor_sign_in_is_refused() {
     let w = world().await;
     password_user(&w, "owner@example.com", true);
     w.rule(GATED, true);
@@ -568,103 +561,36 @@ async fn break_glass_is_the_owners_with_a_second_factor_and_is_logged() {
         "owner",
         &[],
     );
-    // Without asking for break-glass: refused like everyone else.
-    let a = w
-        .call(
-            "POST",
-            "/auth/login",
-            "",
-            Some(login("owner@example.com", false)),
-        )
-        .await;
-    assert_eq!(a.body["status"], "mfa_required");
-    let a = w
-        .call(
-            "POST",
-            "/auth/mfa/verify",
-            "",
-            Some(json!({
-                "email": "owner@example.com",
-                "session": a.body["session"],
-                "code": "123456",
-            })),
-        )
-        .await;
-    assert_eq!(a.body["code"], "okta_required");
-    assert!(w.session_proof(&a).is_none());
-    // Asking: Cognito's own code first.
-    let a = w
-        .call(
-            "POST",
-            "/auth/login",
-            "",
-            Some(login("owner@example.com", true)),
-        )
-        .await;
-    assert_eq!(a.body["status"], "mfa_required");
-    let a = w
-        .call(
-            "POST",
-            "/auth/mfa/verify",
-            "",
-            Some(json!({
-                "email": "owner@example.com",
-                "session": a.body["session"],
-                "code": "123456",
-                "break_glass": true,
-            })),
-        )
-        .await;
-    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
-    let (claims, proof) = w.session_proof(&a).unwrap();
-    assert_eq!(claims.team_id, GATED);
-    assert_eq!(proof.break_glass.as_deref(), Some(GATED));
-    assert!(proof.mfa);
-    // Logged before the session: the page's list and the audit log.
-    let settings = w.f.store.items("settings", GATED);
-    assert!(settings
-        .iter()
-        .any(|i| i["sk"].as_str().unwrap().starts_with("BREAK_GLASS#")
-            && i["email"] == "owner@example.com"));
-    assert!(settings
-        .iter()
-        .any(|i| i["action"] == "sign_in_break_glass"));
-    // And the session works.
-    let c = a
-        .cookies
-        .iter()
-        .find(|c| c.starts_with("__Host-coderhelm_session="))
-        .unwrap()
-        .split(';')
-        .next()
-        .unwrap()
-        .to_string();
-    assert_eq!(w.call("GET", STATUS, &c, None).await.status, StatusCode::OK);
-}
-
-#[tokio::test]
-async fn break_glass_without_any_second_factor_is_refused() {
-    let w = world().await;
-    password_user(&w, "owner@example.com", false);
-    w.rule(GATED, true);
-    w.member(
-        GATED,
-        "USER#sub-owner@example.com",
-        "owner@example.com",
-        "owner",
-        &[],
-    );
-    let a = w
-        .call(
-            "POST",
-            "/auth/login",
-            "",
-            Some(login("owner@example.com", true)),
-        )
-        .await;
-    assert_eq!(a.status, StatusCode::FORBIDDEN);
-    assert_eq!(a.body["code"], "break_glass_needs_2fa");
-    assert!(w.session_proof(&a).is_none());
+    // An old dashboard still sending the retired fields gets nothing more.
+    for body in [
+        login("owner@example.com"),
+        json!({ "email": "owner@example.com", "password": "pw-correct-horse", "break_glass": true, "break_glass_team": GATED }),
+    ] {
+        let a = w.call("POST", "/auth/login", "", Some(body)).await;
+        assert_eq!(a.body["status"], "mfa_required");
+        let a = w
+            .call(
+                "POST",
+                "/auth/mfa/verify",
+                "",
+                Some(json!({
+                    "email": "owner@example.com",
+                    "session": a.body["session"],
+                    "code": "123456",
+                    "break_glass": true,
+                })),
+            )
+            .await;
+        assert_eq!(a.status, StatusCode::FORBIDDEN, "{}", a.body);
+        assert_eq!(a.body["code"], "sso_required");
+        assert!(w.session_proof(&a).is_none());
+    }
+    // No personal team instead, and nothing logged as a way in.
+    assert!(w
+        .f
+        .store
+        .items("users", "TEAM#sub-owner@example.com")
+        .is_empty());
     assert!(!w
         .f
         .store
@@ -674,10 +600,11 @@ async fn break_glass_without_any_second_factor_is_refused() {
 }
 
 /// The authenticator-app step (after a password, Google, GitHub or
-/// Microsoft): break-glass with the app's code is logged; any other sign-in
-/// to a team that turned the rule on meanwhile is refused at the code.
+/// Microsoft): the owner's password and app code make no session while the
+/// rule is on, and a sign-in that reached the code before the rule was
+/// turned on is refused at the code.
 #[tokio::test]
-async fn the_second_step_obeys_the_rule_and_logs_break_glass() {
+async fn the_second_step_obeys_the_rule_with_no_way_around_it() {
     let w = world().await;
     password_user(&w, "owner@example.com", false);
     w.member(
@@ -717,16 +644,20 @@ async fn the_second_step_obeys_the_rule_and_logs_break_glass() {
     );
     let code = |step: u64| super::sign_in::totp_at(secret, step);
     let now_step = chrono::Utc::now().timestamp() as u64 / 30;
+    // With the rule on, the owner's password is refused before any step.
     w.rule(GATED, true);
     let a = w
-        .call(
-            "POST",
-            "/auth/login",
-            "",
-            Some(login("owner@example.com", true)),
-        )
+        .call("POST", "/auth/login", "", Some(login("owner@example.com")))
+        .await;
+    assert_eq!(a.body["code"], "sso_required", "{}", a.body);
+    // A password sign-in that reached the code before the rule went on: the
+    // owner's own app code makes no session.
+    w.rule(GATED, false);
+    let a = w
+        .call("POST", "/auth/login", "", Some(login("owner@example.com")))
         .await;
     assert_eq!(a.body["status"], "second_step", "{}", a.body);
+    w.rule(GATED, true);
     let step_cookie = a
         .cookies
         .iter()
@@ -744,17 +675,9 @@ async fn the_second_step_obeys_the_rule_and_logs_break_glass() {
             Some(json!({ "code": code(now_step) })),
         )
         .await;
-    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
-    assert_eq!(
-        w.session_proof(&a).unwrap().1.break_glass.as_deref(),
-        Some(GATED)
-    );
-    assert!(w
-        .f
-        .store
-        .items("settings", GATED)
-        .iter()
-        .any(|i| i["sk"].as_str().unwrap().starts_with("BREAK_GLASS#")));
+    assert_eq!(a.status, StatusCode::FORBIDDEN, "{}", a.body);
+    assert_eq!(a.body["code"], "sso_required");
+    assert!(w.session_proof(&a).is_none());
 
     // A Google sign-in that reached the code step before the rule: refused.
     let step = jwt::SecondStep {
@@ -765,7 +688,7 @@ async fn the_second_step_obeys_the_rule_and_logs_break_glass() {
         github_login: None,
         via: "google".into(),
         okta_sub: None,
-        break_glass: false,
+        entra: None,
         jti: String::new(),
         aud: String::new(),
         iat: 0,
@@ -781,7 +704,7 @@ async fn the_second_step_obeys_the_rule_and_logs_break_glass() {
         )
         .await;
     assert_eq!(a.status, StatusCode::FORBIDDEN, "{}", a.body);
-    assert_eq!(a.body["code"], "okta_required");
+    assert_eq!(a.body["code"], "sso_required");
     assert!(w.session_proof(&a).is_none());
 }
 
@@ -802,7 +725,6 @@ async fn a_microsoft_sign_in_is_refused_for_the_team_and_lands_elsewhere() {
             super::oauth_signin::Provider::Microsoft,
             &person,
             None,
-            false,
         )
     };
     w.rule(GATED, false);
@@ -814,7 +736,7 @@ async fn a_microsoft_sign_in_is_refused_for_the_team_and_lands_elsewhere() {
     w.rule(GATED, true);
     let r = finish().await.unwrap();
     let to = r.headers()[header::LOCATION].to_str().unwrap().to_string();
-    assert!(to.contains("signin_error=okta_required"), "{to}");
+    assert!(to.contains("signin_error=sso_required"), "{to}");
     assert!(to.contains("provider=microsoft"), "{to}");
     assert!(!r.headers().get_all(header::SET_COOKIE).iter().any(|c| c
         .to_str()
@@ -854,7 +776,7 @@ async fn switching_into_a_team_that_requires_okta_is_refused() {
     w.rule(GATED, true);
     let a = w.call("POST", "/api/teams/switch", &c, Some(switch)).await;
     assert_eq!(a.status, StatusCode::FORBIDDEN);
-    assert_eq!(a.body["code"], "okta_required");
+    assert_eq!(a.body["code"], "sso_required");
     assert!(w.session_proof(&a).is_none());
 }
 
@@ -892,8 +814,8 @@ async fn an_invite_accepted_through_okta_is_one_transaction_and_never_a_second_l
     let invite = as_item(&w.f.store.get("users", GATED, "USER#invite_1").unwrap());
     let now = chrono::Utc::now().to_rfc3339();
     let rec =
-        super::require_okta::invited_member(&invite, "USER#okta_s1", "New", ISSUER, "s1", &now);
-    super::require_okta::accept_invite(&w.state, &rec, &invite)
+        super::require_sso::invited_member(&invite, "USER#okta_s1", "New", &okta_link("s1"), &now);
+    super::require_sso::accept_invite(&w.state, &rec, &invite, &link_of(&rec))
         .await
         .unwrap();
     let m = w.f.store.get("users", GATED, "USER#okta_s1").unwrap();
@@ -918,19 +840,24 @@ async fn an_invite_accepted_through_okta_is_one_transaction_and_never_a_second_l
     );
     let second = as_item(&w.f.store.get("users", GATED, "USER#invite_2").unwrap());
     let rec2 =
-        super::require_okta::invited_member(&second, "USER#okta_s1b", "", ISSUER, "s1", &now);
-    assert!(super::require_okta::accept_invite(&w.state, &rec2, &second)
-        .await
-        .is_err());
+        super::require_sso::invited_member(&second, "USER#okta_s1b", "", &okta_link("s1"), &now);
+    assert!(
+        super::require_sso::accept_invite(&w.state, &rec2, &second, &link_of(&rec2))
+            .await
+            .is_err()
+    );
     assert!(w.f.store.get("users", GATED, "USER#okta_s1b").is_none());
     assert!(w.f.store.get("users", GATED, "USER#invite_2").is_some());
 
     // An existing record with that id is never taken over.
     w.member(GATED, "USER#okta_s2", "x@example.com", "admin", &[]);
-    let rec3 = super::require_okta::invited_member(&second, "USER#okta_s2", "", ISSUER, "s2", &now);
-    assert!(super::require_okta::accept_invite(&w.state, &rec3, &second)
-        .await
-        .is_err());
+    let rec3 =
+        super::require_sso::invited_member(&second, "USER#okta_s2", "", &okta_link("s2"), &now);
+    assert!(
+        super::require_sso::accept_invite(&w.state, &rec3, &second, &link_of(&rec3))
+            .await
+            .is_err()
+    );
     assert_eq!(
         w.f.store.get("users", GATED, "USER#okta_s2").unwrap()["role"],
         "admin"
@@ -1000,7 +927,7 @@ async fn turning_the_rule_on_or_off_is_the_owners_and_on_needs_okta_set_up() {
         "owner",
         &SignInProof::new(true, "password"),
     );
-    let on = json!({ "require_okta": true });
+    let on = json!({ "require_sso": "okta" });
     let a = w
         .call("PUT", "/api/sign-in", &admin, Some(on.clone()))
         .await;
@@ -1013,7 +940,7 @@ async fn turning_the_rule_on_or_off_is_the_owners_and_on_needs_okta_set_up() {
         .await;
     assert_eq!(
         (a.status, a.body["code"].as_str()),
-        (StatusCode::CONFLICT, Some("okta_not_on"))
+        (StatusCode::CONFLICT, Some("sso_not_on"))
     );
     // Set up and on, but its domain was never proven.
     w.okta(GATED, true);
@@ -1039,7 +966,7 @@ async fn turning_the_rule_on_or_off_is_the_owners_and_on_needs_okta_set_up() {
         &[("okta_issuer", json!(ISSUER)), ("okta_sub", json!("o"))],
     );
     let owner_okta = w.cookie(GATED, "USER#o", "o@example.com", "owner", &okta_proof("o"));
-    let off = json!({ "require_okta": false });
+    let off = json!({ "require_sso": "" });
     w.member(
         GATED,
         "USER#adm",
@@ -1060,7 +987,7 @@ async fn turning_the_rule_on_or_off_is_the_owners_and_on_needs_okta_set_up() {
     assert_eq!(a.body["code"], "owner_only");
     let a = w.call("PUT", "/api/sign-in", &owner_okta, Some(off)).await;
     assert_eq!(a.status, StatusCode::OK, "{}", a.body);
-    assert_eq!(a.body["require_okta"], false);
+    assert_eq!(a.body["require_sso"], Value::Null);
     assert!(w
         .f
         .store
@@ -1070,11 +997,11 @@ async fn turning_the_rule_on_or_off_is_the_owners_and_on_needs_okta_set_up() {
             && i["detail"]
                 .as_str()
                 .unwrap()
-                .contains("Okta sign-in no longer required")));
+                .contains("Single sign-on no longer required")));
 }
 
 #[tokio::test]
-async fn the_page_lists_unlinked_members_break_glass_and_what_turning_on_needs() {
+async fn the_page_lists_unlinked_members_claims_and_what_turning_on_needs() {
     let w = world().await;
     w.rule(GATED, true);
     w.okta(GATED, true);
@@ -1089,23 +1016,35 @@ async fn the_page_lists_unlinked_members_break_glass_and_what_turning_on_needs()
     w.f.store.put(
         "settings",
         &[
-            ("pk", json!(GATED)),
-            ("sk", json!("BREAK_GLASS#2026-11-20T00:00:00.000Z#1")),
-            ("at", json!("2026-11-20T00:00:00.000Z")),
-            ("email", json!("o@example.com")),
+            ("pk", json!(format!("SSO_CLAIM#{GATED}"))),
+            ("sk", json!("USER#2")),
+            ("email", json!("b@example.com")),
+            ("role", json!("member")),
+            ("provider", json!("okta")),
+            ("token_hash", json!("h")),
+            ("expires_at", json!(4_000_000_000u64)),
+            ("used", json!(false)),
         ],
     );
     let c = w.cookie(GATED, "USER#o", "o@example.com", "owner", &okta_proof("o"));
     let a = w.call("GET", "/api/sign-in", &c, None).await;
     assert_eq!(a.status, StatusCode::OK, "{}", a.body);
-    assert_eq!(a.body["require_okta"], true);
-    assert_eq!(a.body["unlinked"][0]["email"], "b@example.com");
-    assert_eq!(a.body["unlinked"].as_array().unwrap().len(), 1);
-    assert_eq!(a.body["break_glass"][0]["email"], "o@example.com");
-    assert_eq!(a.body["okta"]["session_is_okta"], true);
-    assert_eq!(a.body["okta"]["is_owner"], true);
-    assert_eq!(a.body["okta"]["domains_verified"], false);
-    assert_eq!(a.body["can_require_okta"], false);
+    assert_eq!(a.body["require_sso"], "okta");
+    let okta = &a.body["sso_options"][0];
+    assert_eq!(okta["provider"], "okta");
+    assert_eq!(okta["unlinked"][0]["email"], "b@example.com");
+    assert_eq!(okta["unlinked"].as_array().unwrap().len(), 1);
+    assert_eq!(okta["session_from_provider"], true);
+    assert_eq!(okta["is_owner"], true);
+    assert_eq!(okta["domains_verified"], false);
+    assert_eq!(okta["ready"], false);
+    assert!(okta["recovery"].as_str().unwrap().contains("support"));
+    assert_eq!(a.body["sso_options"][1]["provider"], "microsoft");
+    assert_eq!(a.body["sso_options"][1]["set_up"], false);
+    assert_eq!(a.body["claim_links"][0]["email"], "b@example.com");
+    assert_eq!(a.body["claim_links"][0]["used"], false);
+    assert!(a.body["claim_links"][0].get("token_hash").is_none());
+    assert!(a.body.get("break_glass").is_none());
     let people = a.body["people"].as_array().unwrap();
     assert!(people
         .iter()
@@ -1133,13 +1072,13 @@ async fn okta_cant_be_turned_off_or_removed_while_it_is_required() {
             Some(json!({ "enabled": false })),
         )
         .await;
-    assert_eq!(a.body["code"], "okta_required_on");
+    assert_eq!(a.body["code"], "sso_required_on");
     let a = w.call("DELETE", "/api/sign-in/okta", &c, None).await;
-    assert_eq!(a.body["code"], "okta_required_on");
+    assert_eq!(a.body["code"], "sso_required_on");
     let a = w
         .call("DELETE", "/api/sign-in/okta/domains/example.com", &c, None)
         .await;
-    assert_eq!(a.body["code"], "okta_required_on");
+    assert_eq!(a.body["code"], "sso_required_on");
     // Still on.
     let live =
         w.f.store
@@ -1203,9 +1142,15 @@ impl World {
         email: &str,
     ) -> Result<axum::response::Response, String> {
         let claims = json!({ "iss": ISSUER, "sub": sub, "email": email, "email_verified": true, "name": "Someone" });
-        super::oidc_signin::okta_land(&self.state, "127.0.0.1", &self.live_setup(team), &claims)
-            .await
-            .map_err(|f| f.reason.code().to_string())
+        super::oidc_signin::okta_land(
+            &self.state,
+            "127.0.0.1",
+            &self.live_setup(team),
+            &claims,
+            None,
+        )
+        .await
+        .map_err(|f| f.reason.code().to_string())
     }
 }
 
@@ -1237,7 +1182,7 @@ async fn an_okta_sign_in_accepts_only_the_invite_for_exactly_its_address() {
         w.okta_lands(GATED, "s-alice", "alice@example.com")
             .await
             .unwrap_err(),
-        "okta_ask_admin"
+        "sso_ask_admin"
     );
     assert_eq!(
         w.f.store.get("users", GATED, "USER#invite_c").unwrap()["status"],
@@ -1262,7 +1207,7 @@ async fn an_okta_sign_in_accepts_only_the_invite_for_exactly_its_address() {
         w.okta_lands(GATED, "s-bob-x", "bob+x@example.com")
             .await
             .unwrap_err(),
-        "okta_ask_admin"
+        "sso_ask_admin"
     );
     assert_eq!(
         w.f.store.get("users", GATED, "USER#invite_p").unwrap()["status"],
@@ -1301,7 +1246,7 @@ async fn an_okta_invite_needs_the_proven_domain_and_no_existing_member() {
         w.okta_lands(GATED, "s-dana", "dana+2@example.com")
             .await
             .unwrap_err(),
-        "okta_ask_admin"
+        "sso_ask_admin"
     );
     assert!(w.f.store.get("users", GATED, "USER#invite_d").is_some());
     // The plain case works.
@@ -1322,10 +1267,12 @@ async fn an_invite_changed_after_it_was_read_is_not_accepted() {
     // An admin changes the role meanwhile.
     w.invite_to(GATED, "USER#invite_1", "new@example.com", "viewer");
     let now = chrono::Utc::now().to_rfc3339();
-    let rec = super::require_okta::invited_member(&invite, "USER#okta_n", "", ISSUER, "n", &now);
-    assert!(super::require_okta::accept_invite(&w.state, &rec, &invite)
-        .await
-        .is_err());
+    let rec = super::require_sso::invited_member(&invite, "USER#okta_n", "", &okta_link("n"), &now);
+    assert!(
+        super::require_sso::accept_invite(&w.state, &rec, &invite, &link_of(&rec))
+            .await
+            .is_err()
+    );
     assert!(w.f.store.get("users", GATED, "USER#okta_n").is_none());
     assert_eq!(
         w.f.store.get("users", GATED, "USER#invite_1").unwrap()["role"],
@@ -1364,8 +1311,8 @@ async fn narrowing_okta_and_turning_the_rule_on_never_both_land() {
     };
     // The rule went on first: the narrowing write is refused, nothing changes.
     w.rule(GATED, true);
-    let r = super::require_okta::while_rule_off(&w.state, GATED, vec![delete()]).await;
-    assert_eq!(r.unwrap_err().1 .0["code"], "okta_required_on");
+    let r = super::require_sso::while_rule_off(&w.state, GATED, None, vec![delete()]).await;
+    assert_eq!(r.unwrap_err().1 .0["code"], "sso_required_on");
     assert!(w
         .f
         .store
@@ -1388,7 +1335,11 @@ async fn narrowing_okta_and_turning_the_rule_on_never_both_land() {
             ("updated_at", json!("2026-11-21T00:00:00Z")),
         ],
     );
-    let parts = super::require_okta::setup_unchanged(&w.state, &checked).unwrap();
+    let parts = super::require_sso::setup_unchanged(
+        &w.state,
+        &super::require_sso::Live::Okta(checked.clone()),
+    )
+    .unwrap();
     assert!(w
         .state
         .dynamo
@@ -1403,7 +1354,11 @@ async fn narrowing_okta_and_turning_the_rule_on_never_both_land() {
         .await
         .unwrap()
         .unwrap();
-    let parts = super::require_okta::setup_unchanged(&w.state, &checked).unwrap();
+    let parts = super::require_sso::setup_unchanged(
+        &w.state,
+        &super::require_sso::Live::Okta(checked.clone()),
+    )
+    .unwrap();
     assert!(w
         .state
         .dynamo
@@ -1422,7 +1377,11 @@ async fn narrowing_okta_and_turning_the_rule_on_never_both_land() {
             ("failing_at", json!("2026-11-21T00:00:00Z")),
         ],
     );
-    let parts = super::require_okta::setup_unchanged(&w.state, &checked).unwrap();
+    let parts = super::require_sso::setup_unchanged(
+        &w.state,
+        &super::require_sso::Live::Okta(checked.clone()),
+    )
+    .unwrap();
     assert!(w
         .state
         .dynamo
@@ -1460,7 +1419,7 @@ async fn the_okta_setup_handlers_refuse_narrowing_while_the_rule_is_on() {
     ] {
         assert_eq!(
             w.call(m, path, &c, body).await.body["code"],
-            "okta_required_on",
+            "sso_required_on",
             "{m} {path}"
         );
     }
@@ -1491,8 +1450,8 @@ async fn a_self_hosted_org_cant_drop_the_domains_its_okta_relies_on() {
                 ("sk", json!("META")),
                 ("team_id", json!(GATED)),
                 ("domains", json!(domains)),
-                ("require_okta", json!(on)),
-                ("require_okta_since", json!(RULE_SINCE)),
+                ("require_sso", json!(if on { "okta" } else { "" })),
+                ("require_sso_since", json!(RULE_SINCE)),
                 ("created_at", json!("2026-01-01T00:00:00Z")),
             ],
         )
@@ -1533,7 +1492,7 @@ async fn a_self_hosted_org_cant_drop_the_domains_its_okta_relies_on() {
         )
         .await;
     assert_eq!(a.status, StatusCode::CONFLICT, "{}", a.body);
-    assert_eq!(a.body["code"], "okta_required_on");
+    assert_eq!(a.body["code"], "sso_required_on");
     assert_eq!(
         w.f.store.get("settings", "ORG", "META").unwrap()["domains"],
         json!(["example.com", "example.org"])
@@ -1551,14 +1510,9 @@ async fn a_self_hosted_org_cant_drop_the_domains_its_okta_relies_on() {
     // And a password sign-in to the organization is refused there too.
     password_user(&w, "adm@example.com", false);
     let a = w
-        .call(
-            "POST",
-            "/auth/login",
-            "",
-            Some(login("adm@example.com", false)),
-        )
+        .call("POST", "/auth/login", "", Some(login("adm@example.com")))
         .await;
-    assert_eq!(a.body["code"], "okta_required");
+    assert_eq!(a.body["code"], "sso_required");
 }
 
 /// Finding 5: a non-member learns nothing about a team's rules from a switch.
@@ -1620,11 +1574,11 @@ async fn a_stream_token_from_a_non_okta_session_ends_with_the_rule() {
     let proof = jwt::read_scoped_proof(&minted, jwt::BRAIN_AUDIENCE, &w.state.secrets.jwt_secret);
     assert_eq!(proof.via.as_deref(), Some("google"));
     w.rule(GATED, false);
-    assert!(super::require_okta::check_scoped(&w.state, &back, &proof)
+    assert!(super::require_sso::check_scoped(&w.state, &back, &proof)
         .await
         .is_ok());
     w.rule(GATED, true);
-    let r = super::require_okta::check_scoped(&w.state, &back, &proof)
+    let r = super::require_sso::check_scoped(&w.state, &back, &proof)
         .await
         .unwrap_err();
     assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
@@ -1663,74 +1617,51 @@ async fn unlinking_okta_is_refused_while_the_rule_is_on() {
         &okta_proof("s1"),
     );
     let a = w.call("DELETE", "/api/users/okta/link", &c, None).await;
-    assert_eq!(a.body["code"], "okta_required_on");
+    assert_eq!(a.body["code"], "sso_required_on");
     assert_eq!(
         w.f.store.get("users", GATED, "USER#1").unwrap()["okta_sub"],
         "s1"
     );
 }
 
-/// The suspicion about break-glass: an owner of two teams that require Okta
-/// gets the one they asked for.
+/// Setting up a second factor re-mints the session: a session from the
+/// team's tenant stays one (its identity is kept), and nothing else is
+/// added to it.
 #[tokio::test]
-async fn break_glass_lands_on_the_team_asked_for() {
+async fn a_re_minted_session_keeps_its_tenant_identity_and_nothing_more() {
     let w = world().await;
-    password_user(&w, "owner@example.com", true);
-    let second = "TEAM#gated2";
-    for t in [GATED, second] {
-        w.rule(t, true);
-        w.member(
-            t,
-            "USER#sub-owner@example.com",
-            "owner@example.com",
-            "owner",
-            &[],
-        );
-    }
-    for want in [second, GATED] {
-        let a = w
-            .call(
-                "POST",
-                "/auth/login",
-                "",
-                Some(json!({ "email": "owner@example.com", "password": "pw-correct-horse", "break_glass": true, "break_glass_team": want })),
-            )
-            .await;
-        let a = w
-            .call(
-                "POST",
-                "/auth/mfa/verify",
-                "",
-                Some(json!({ "email": "owner@example.com", "session": a.body["session"], "code": "123456", "break_glass": true, "break_glass_team": want })),
-            )
-            .await;
-        let (claims, proof) = w.session_proof(&a).unwrap();
-        assert_eq!(claims.team_id, want);
-        assert_eq!(proof.break_glass.as_deref(), Some(want));
-    }
-}
-
-/// The suspicion about re-minting: setting up a factor from a break-glass
-/// session keeps it one.
-#[tokio::test]
-async fn a_re_minted_session_keeps_its_break_glass_mark() {
-    let w = world().await;
-    let bg = SignInProof::new(true, "password").with_break_glass(Some(GATED));
-    let claims = jwt::validate_token(
-        w.cookie(GATED, "USER#o", "o@example.com", "owner", &bg)
+    let tenant = SignInProof::new(false, "microsoft").with_entra(Some("t/o1".into()));
+    let mut claims = jwt::validate_token(
+        w.cookie(GATED, "USER#o", "o@example.com", "owner", &tenant)
             .trim_start_matches("__Host-coderhelm_session="),
         &w.state.secrets.jwt_secret,
     )
     .unwrap();
-    let cookie = super::sign_in::session_with_second_factor(&w.state, &claims, Some(&bg)).unwrap();
+    claims = super::oidc_signin::mark_session(claims, &tenant);
+    let cookie =
+        super::sign_in::session_with_second_factor(&w.state, &claims, Some(&tenant)).unwrap();
     let token = cookie
         .trim_start_matches("__Host-coderhelm_session=")
         .split(';')
         .next()
         .unwrap();
     let proof = jwt::read_proof(token, &w.state.secrets.jwt_secret);
-    assert_eq!(proof.break_glass.as_deref(), Some(GATED));
-    assert_eq!(proof.via.as_deref(), Some("password"));
+    assert_eq!(proof.entra.as_deref(), Some("t/o1"));
+    assert_eq!(proof.via.as_deref(), Some("microsoft"));
+    assert!(proof.mfa);
+    let pw = SignInProof::new(false, "password");
+    let cookie = super::sign_in::session_with_second_factor(&w.state, &claims, Some(&pw)).unwrap();
+    let token = cookie
+        .trim_start_matches("__Host-coderhelm_session=")
+        .split(';')
+        .next()
+        .unwrap();
+    assert_eq!(
+        jwt::read_proof(token, &w.state.secrets.jwt_secret)
+            .via
+            .as_deref(),
+        Some("password")
+    );
 }
 
 /// Reads that fail refuse: the rule, the member's role, the sign-in check.
@@ -1760,28 +1691,17 @@ async fn a_read_that_fails_refuses() {
         &[],
     );
     let a = w
-        .call(
-            "POST",
-            "/auth/login",
-            "",
-            Some(login("ann@example.com", false)),
-        )
+        .call("POST", "/auth/login", "", Some(login("ann@example.com")))
         .await;
     assert_eq!(a.status, StatusCode::SERVICE_UNAVAILABLE);
     assert!(w.session_proof(&a).is_none());
-    // A break-glass session whose member record can't be read.
+    // A session whose member record can't be read.
     let w2 = world().await;
     w2.rule(GATED, true);
-    let bg = w2.cookie(
-        GATED,
-        "USER#o",
-        "o@example.com",
-        "owner",
-        &SignInProof::new(true, "password").with_break_glass(Some(GATED)),
-    );
+    let ok = w2.cookie(GATED, "USER#o", "o@example.com", "owner", &okta_proof("o"));
     w2.f.store.fail_reads("users", GATED);
     assert_eq!(
-        w2.call("GET", STATUS, &bg, None).await.status,
+        w2.call("GET", STATUS, &ok, None).await.status,
         StatusCode::SERVICE_UNAVAILABLE
     );
 }
@@ -1844,8 +1764,8 @@ fn selfhost_org(w: &World, rule_on: bool) -> String {
             ("sk", json!("META")),
             ("team_id", json!(GATED)),
             ("domains", json!(["example.com"])),
-            ("require_okta", json!(rule_on)),
-            ("require_okta_since", json!(RULE_SINCE)),
+            ("require_sso", json!(if rule_on { "okta" } else { "" })),
+            ("require_sso_since", json!(RULE_SINCE)),
             ("created_at", json!("2026-01-01T00:00:00Z")),
         ],
     );
@@ -1889,10 +1809,10 @@ async fn turning_the_rule_on_is_logged_by_its_outcome() {
     let _self_hosted = crate::routes::setup_checks::test_self_hosted::set(true);
     let w = world().await;
     let c = selfhost_org(&w, false);
-    let on = json!({ "require_okta": true, "acknowledge_unlinked": true });
+    let on = json!({ "require_sso": "okta", "acknowledge_unlinked": true });
     w.f.store.cancel_transactions();
     let a = w.call("PUT", "/api/sign-in", &c, Some(on.clone())).await;
-    assert_eq!(a.body["code"], "okta_changed", "{}", a.body);
+    assert_eq!(a.body["code"], "sso_changed", "{}", a.body);
     let lines = audit_lines(&w, GATED);
     assert_eq!(lines.len(), 1, "{lines:?}");
     assert!(
@@ -1900,8 +1820,8 @@ async fn turning_the_rule_on_is_logged_by_its_outcome() {
         "{lines:?}"
     );
     assert_eq!(
-        w.f.store.get("settings", "ORG", "META").unwrap()["require_okta"],
-        false
+        w.f.store.get("settings", "ORG", "META").unwrap()["require_sso"],
+        ""
     );
 
     let w = world().await;
@@ -1909,13 +1829,13 @@ async fn turning_the_rule_on_is_logged_by_its_outcome() {
     let a = w.call("PUT", "/api/sign-in", &c, Some(on)).await;
     assert_eq!(a.status, StatusCode::OK, "{}", a.body);
     assert_eq!(
-        w.f.store.get("settings", "ORG", "META").unwrap()["require_okta"],
-        true
+        w.f.store.get("settings", "ORG", "META").unwrap()["require_sso"],
+        "okta"
     );
     let lines = audit_lines(&w, GATED);
     assert_eq!(
         lines,
-        vec!["Okta sign-in required for everyone".to_string()]
+        vec!["Single sign-on with Okta required for everyone".to_string()]
     );
 }
 
@@ -1946,7 +1866,9 @@ async fn a_new_okta_app_needs_the_owners_own_test_while_the_rule_is_on() {
     };
     let now = || chrono::Utc::now().to_rfc3339();
     let save = json!({ "enabled": true, "issuer": ISSUER, "client_id": "new-client", "updated_at": "2026-11-20T00:00:00Z" });
-    let refused = |a: &Answer| a.body["code"] == "okta_client_change";
+    // Refused as a client change, or (a session from another way in) ended.
+    let refused =
+        |a: &Answer| a.body["code"] == "okta_client_change" || a.body["code"] == "sso_required";
     // Tested by someone else: refused, the live app unchanged.
     draft("USER#adm", "o", now());
     let a = w
@@ -1969,13 +1891,14 @@ async fn a_new_okta_app_needs_the_owners_own_test_while_the_rule_is_on() {
         .call("POST", "/api/sign-in/okta/save", &owner, Some(save.clone()))
         .await;
     assert!(refused(&a), "{}", a.body);
-    // From a password (break-glass) session: refused.
+    // From a password session with a second factor: refused (it ends at
+    // once, the rule being on).
     let bg = w.cookie(
         GATED,
         "USER#o",
         "o@example.com",
         "owner",
-        &SignInProof::new(true, "password").with_break_glass(Some(GATED)),
+        &SignInProof::new(true, "password"),
     );
     draft("USER#o", "o", now());
     let a = w
@@ -2025,7 +1948,7 @@ async fn a_failing_domain_accepts_no_invite_but_linked_members_still_sign_in() {
         w.okta_lands(GATED, "s-new", "new@example.com")
             .await
             .unwrap_err(),
-        "okta_ask_admin"
+        "sso_ask_admin"
     );
     assert_eq!(
         w.f.store.get("users", GATED, "USER#invite_n").unwrap()["status"],
@@ -2166,7 +2089,7 @@ async fn a_guarded_write_refused_for_another_reason_says_so() {
                 .unwrap(),
         )
         .build();
-    let e = super::require_okta::while_rule_off(&w.state, GATED, vec![delete])
+    let e = super::require_sso::while_rule_off(&w.state, GATED, None, vec![delete])
         .await
         .unwrap_err();
     assert_eq!(e.1 .0["code"], "changed");

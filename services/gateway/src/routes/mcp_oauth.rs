@@ -534,14 +534,13 @@ pub async fn decide_request(
         // A team that requires Okta sign-in: apps are connected only from an
         // Okta session (a grant from any other session would be refused at
         // its first call anyway).
-        if !super::oidc_signin::signed_in_with_okta(proof.via.as_deref())
-            && super::sign_in::team_rule(&state, &claims.team_id)
-                .await
-                .map_err(|e| internal("Sign-in rules not read", e))?
-                .require_okta
-        {
-            let refused = super::require_okta::refused(&state, &claims.team_id).await;
-            return Err(super::require_okta::refused_json(&refused));
+        let rule = super::sign_in::team_rule(&state, &claims.team_id)
+            .await
+            .map_err(|e| internal("Sign-in rules not read", e))?;
+        if !super::require_sso::allowed(&rule, &proof) {
+            let refused =
+                super::require_sso::refused(&state, &claims.team_id, rule.require_sso).await;
+            return Err(super::require_sso::refused_json(&refused));
         }
         let who = oauth::Consent {
             team_id: claims.team_id.clone(),
@@ -550,6 +549,7 @@ pub async fn decide_request(
             mfa: proof.mfa,
             via: proof.via.clone(),
             okta_sub: proof.okta_sub.clone(),
+            entra: proof.entra.clone(),
             allow_write: body.allow_write,
             allow_knowledge: body.allow_knowledge,
             lookups: oauth::lookup_grant(body.allow_scopes.as_deref(), &req.scopes),
@@ -778,6 +778,7 @@ mod tests {
             held: false,
             via_okta: false,
             okta_sub: None,
+            entra: None,
         }
     }
 

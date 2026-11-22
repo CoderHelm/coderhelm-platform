@@ -337,9 +337,13 @@ pub async fn list_teams(
             // Process any pending invites — convert them to real user records.
             // A team that requires Okta sign-in accepts its invites only
             // through its Okta (routes::require_okta).
-            let gated = super::require_okta::gated_teams(&state, &all_items)
-                .await
-                .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+            let gated = super::require_sso::gated_teams(
+                &state,
+                &all_items,
+                &crate::auth::jwt::SignInProof::default(),
+            )
+            .await
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
             let real_user_sk = format!("USER#{github_id}");
             let now = chrono::Utc::now().to_rfc3339();
             for item in &all_items {
@@ -498,10 +502,11 @@ pub async fn switch_team(
         && super::sign_in::team_rule(&state, target_team)
             .await
             .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
-            .require_okta
+            .require_sso
+            .is_some()
     {
-        let refused = super::require_okta::refused(&state, target_team).await;
-        return Ok(super::require_okta::refused_json(&refused).into_response());
+        let refused = super::require_sso::refused_for(&state, target_team).await;
+        return Ok(super::require_sso::refused_json(&refused).into_response());
     }
 
     let target_role = target_item
