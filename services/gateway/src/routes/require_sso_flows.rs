@@ -138,6 +138,11 @@ impl World {
         .unwrap();
         let res = self.app.clone().oneshot(req).await.unwrap();
         let status = res.status();
+        let location = res
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
         let cookies: Vec<String> = res
             .headers()
             .get_all(header::SET_COOKIE)
@@ -151,6 +156,7 @@ impl World {
             status,
             body: serde_json::from_slice(&bytes).unwrap_or(Value::Null),
             cookies,
+            location,
         }
     }
 
@@ -172,6 +178,7 @@ struct Answer {
     status: StatusCode,
     body: Value,
     cookies: Vec<String>,
+    location: Option<String>,
 }
 
 impl Answer {
@@ -2117,4 +2124,992 @@ async fn the_stand_in_refuses_unused_expression_values() {
         .expression_attribute_names("#unused", "sk")
         .send()
         .await;
+}
+
+// ── Microsoft Entra: the team's own tenant (item 4) ─────────────────
+
+const TID: &str = "11111111-2222-3333-4444-555555555555";
+const OTHER_TID: &str = "99999999-2222-3333-4444-555555555555";
+
+impl World {
+    fn entra(&self, team: &str, enabled: bool) {
+        self.f.store.put(
+            "settings",
+            &[
+                ("pk", json!(team)),
+                ("sk", json!(super::entra_sso::SETUP_SK)),
+                ("tid", json!(TID)),
+                ("domains", json!(["example.com"])),
+                ("enabled", json!(enabled)),
+                ("updated_at", json!("2026-11-01T00:00:00Z")),
+            ],
+        );
+    }
+
+    fn entra_setup(&self, team: &str) -> super::entra_sso::EntraSetup {
+        super::entra_sso::EntraSetup {
+            team_id: team.into(),
+            tid: TID.into(),
+            domains: vec!["example.com".into()],
+            enabled: true,
+            updated_at: Some("2026-11-01T00:00:00Z".into()),
+            ..Default::default()
+        }
+    }
+
+    /// A sign-in through the team's tenant whose id_token was checked.
+    async fn entra_lands(
+        &self,
+        team: &str,
+        tid: &str,
+        oid: &str,
+        email: &str,
+        claim: Option<&str>,
+    ) -> Result<axum::response::Response, String> {
+        let claims = json!({
+            "iss": format!("https://login.microsoftonline.com/{tid}/v2.0"),
+            "tid": tid, "oid": oid, "sub": "pairwise", "email": email,
+            "xms_edov": true, "name": "Someone",
+        });
+        super::entra_sso::entra_land(
+            &self.state,
+            "127.0.0.1",
+            &self.entra_setup(team),
+            &claims,
+            claim,
+        )
+        .await
+        .map_err(|f| f.reason.code().to_string())
+    }
+}
+
+fn entra_proof(tid: &str, oid: &str) -> SignInProof {
+    SignInProof::new(false, "microsoft").with_entra(Some(super::entra_sso::entra_id(tid, oid)))
+}
+
+fn session_of_response(w: &World, r: &axum::response::Response) -> Option<SignInProof> {
+    r.headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .find_map(|c| {
+            let c = c.to_str().ok()?;
+            let t = c
+                .strip_prefix("__Host-coderhelm_session=")?
+                .split(';')
+                .next()?;
+            (!t.is_empty()).then(|| jwt::read_proof(t, &w.state.secrets.jwt_secret))
+        })
+}
+
+/// Only a session from the team's own tenant, linked to the member, stands
+/// while the team requires single sign-on with Microsoft: never a plain
+/// Microsoft sign-in, another tenant, personal accounts, Okta, or a session
+/// whose link or setup changed.
+#[tokio::test]
+async fn with_microsoft_required_only_the_teams_tenant_linked_to_the_member_stands() {
+    let w = world().await;
+    w.rule_with(GATED, Some("microsoft"));
+    w.entra(GATED, true);
+    w.okta(GATED, true);
+    w.member(
+        GATED,
+        "USER#1",
+        "ann@example.com",
+        "member",
+        &[
+            ("ms_tid", json!(TID)),
+            ("ms_oid", json!("o1")),
+            ("okta_issuer", json!(ISSUER)),
+            ("okta_sub", json!("s1")),
+        ],
+    );
+    let ok = w.cookie(
+        GATED,
+        "USER#1",
+        "ann@example.com",
+        "member",
+        &entra_proof(TID, "o1"),
+    );
+    assert_eq!(
+        w.call("GET", STATUS, &ok, None).await.status,
+        StatusCode::OK
+    );
+    for proof in [
+        SignInProof::new(true, "microsoft"),
+        entra_proof(OTHER_TID, "o1"),
+        entra_proof(super::entra_sso::CONSUMER_TENANT, "o1"),
+        entra_proof(TID, "someone-else"),
+        okta_proof("s1"),
+        SignInProof::new(true, "password"),
+        SignInProof::new(true, "google"),
+    ] {
+        let c = w.cookie(GATED, "USER#1", "ann@example.com", "member", &proof);
+        let a = w.call("GET", STATUS, &c, None).await;
+        assert_eq!(a.status, StatusCode::UNAUTHORIZED, "{proof:?}");
+        assert!(a.ends_session(), "{proof:?}");
+    }
+    // Turning the tenant off, or a new link, ends the session.
+    w.entra(GATED, false);
+    assert_eq!(
+        w.call("GET", STATUS, &ok, None).await.status,
+        StatusCode::UNAUTHORIZED
+    );
+    w.entra(GATED, true);
+    w.member(
+        GATED,
+        "USER#1",
+        "ann@example.com",
+        "member",
+        &[("ms_tid", json!(TID)), ("ms_oid", json!("o2"))],
+    );
+    assert_eq!(
+        w.call("GET", STATUS, &ok, None).await.status,
+        StatusCode::UNAUTHORIZED
+    );
+    // With the rule off, a tenant session still needs its link.
+    w.rule_with(GATED, None);
+    assert_eq!(
+        w.call("GET", STATUS, &ok, None).await.status,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+/// A sign-in through the team's tenant lands on the member who linked
+/// exactly that tenant and object id, never by email; the session is held
+/// to the team and is never a platform admin.
+#[tokio::test]
+async fn a_tenant_sign_in_lands_only_on_the_linked_member() {
+    let w = world().await;
+    w.rule_with(GATED, Some("microsoft"));
+    w.entra(GATED, true);
+    w.member(
+        GATED,
+        "USER#1",
+        "ann@example.com",
+        "member",
+        &[("ms_tid", json!(TID)), ("ms_oid", json!("o1"))],
+    );
+    w.member(GATED, "USER#2", "bo@example.com", "member", &[]);
+    let r = w
+        .entra_lands(GATED, TID, "o1", "someone-else@example.com", None)
+        .await
+        .unwrap();
+    let proof = session_of_response(&w, &r).expect("a session");
+    assert_eq!(proof.entra.as_deref(), Some(format!("{TID}/o1").as_str()));
+    assert_eq!(proof.via.as_deref(), Some("microsoft"));
+    assert!(super::oidc_signin::is_held(&proof, false));
+    // Bo never linked: Microsoft's email matching his record links nothing.
+    assert_eq!(
+        w.entra_lands(GATED, TID, "o9", "bo@example.com", None)
+            .await
+            .unwrap_err(),
+        "sso_ask_admin"
+    );
+    assert!(w.f.store.get("users", GATED, "USER#2").unwrap()["ms_oid"].is_null());
+    // Another tenant's token never reaches the team.
+    assert_eq!(
+        w.entra_lands(GATED, OTHER_TID, "o1", "ann@example.com", None)
+            .await
+            .unwrap_err(),
+        "not_on_team"
+    );
+    // With the rule off, an unlinked account is told to link first.
+    w.rule_with(GATED, None);
+    assert_eq!(
+        w.entra_lands(GATED, TID, "o9", "bo@example.com", None)
+            .await
+            .unwrap_err(),
+        "sso_not_linked"
+    );
+}
+
+/// An invite is accepted through the tenant only for exactly Microsoft's
+/// verified email at a domain the team proved, in one transaction.
+#[tokio::test]
+async fn a_tenant_sign_in_accepts_only_the_exact_invite_at_a_proven_domain() {
+    let w = world().await;
+    w.rule_with(GATED, Some("microsoft"));
+    w.entra(GATED, true);
+    w.invite(GATED, "new@example.com");
+    // Not proven yet: refused.
+    assert_eq!(
+        w.entra_lands(GATED, TID, "n1", "new@example.com", None)
+            .await
+            .unwrap_err(),
+        "sso_ask_admin"
+    );
+    w.proven(GATED, "example.com");
+    assert_eq!(
+        w.entra_lands(GATED, TID, "n1", "new+x@example.com", None)
+            .await
+            .unwrap_err(),
+        "sso_ask_admin"
+    );
+    let r = w
+        .entra_lands(GATED, TID, "n1", "new@example.com", None)
+        .await
+        .unwrap();
+    assert!(sets_session(&r));
+    let id = super::entra_sso::ms_user_id(TID, "n1");
+    let m = w.f.store.get("users", GATED, &id).unwrap();
+    assert_eq!(
+        (m["ms_tid"].as_str(), m["ms_oid"].as_str()),
+        (Some(TID), Some("n1"))
+    );
+    assert!(w.f.store.get("users", GATED, "USER#invite_1").is_none());
+    assert!(w
+        .f
+        .store
+        .get(
+            "settings",
+            &format!("ENTRA_LINK#{GATED}"),
+            &format!("{TID}#n1")
+        )
+        .is_some());
+}
+
+/// Turning the rule on with Microsoft needs the tenant on and the owner's
+/// own linked tenant session; switching providers needs it off first.
+#[tokio::test]
+async fn turning_microsoft_on_needs_the_owners_own_tenant_session() {
+    let _self_hosted = crate::routes::setup_checks::test_self_hosted::set(true);
+    let w = world().await;
+    let okta_cookie = selfhost_org(&w, false);
+    w.entra(GATED, true);
+    w.member(
+        GATED,
+        "USER#o",
+        "o@example.com",
+        "owner",
+        &[
+            ("ms_tid", json!(TID)),
+            ("ms_oid", json!("oo")),
+            ("okta_issuer", json!(ISSUER)),
+            ("okta_sub", json!("o")),
+        ],
+    );
+    let on = json!({ "require_sso": "microsoft", "acknowledge_unlinked": true });
+    let a = w
+        .call("PUT", "/api/sign-in", &okta_cookie, Some(on.clone()))
+        .await;
+    assert_eq!(a.body["code"], "sign_in_with_provider_first", "{}", a.body);
+    let ms = w.cookie(
+        GATED,
+        "USER#o",
+        "o@example.com",
+        "owner",
+        &entra_proof(TID, "oo"),
+    );
+    let a = w.call("PUT", "/api/sign-in", &ms, Some(on.clone())).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    assert_eq!(a.body["require_sso"], "microsoft");
+    // The owner's own session stands; an Okta one ends.
+    assert_eq!(
+        w.call("GET", STATUS, &ms, None).await.status,
+        StatusCode::OK
+    );
+    assert_eq!(
+        w.call("GET", STATUS, &okta_cookie, None).await.status,
+        StatusCode::UNAUTHORIZED
+    );
+    // Switching straight to Okta is refused.
+    let a = w
+        .call(
+            "PUT",
+            "/api/sign-in",
+            &ms,
+            Some(json!({ "require_sso": "okta" })),
+        )
+        .await;
+    assert_eq!(a.body["code"], "sso_required_on");
+}
+
+/// While the rule names Microsoft, its setup and links are locked; Okta's
+/// aren't (the lock follows the provider in use).
+#[tokio::test]
+async fn the_microsoft_setup_is_locked_while_the_rule_needs_it() {
+    let _self_hosted = crate::routes::setup_checks::test_self_hosted::set(true);
+    let w = world().await;
+    selfhost_org(&w, false);
+    w.rule_with("", None);
+    w.f.store.put(
+        "settings",
+        &[
+            ("pk", json!("ORG")),
+            ("sk", json!("META")),
+            ("team_id", json!(GATED)),
+            ("require_sso", json!("microsoft")),
+            ("require_sso_since", json!(RULE_SINCE)),
+        ],
+    );
+    w.entra(GATED, true);
+    w.member(
+        GATED,
+        "USER#o",
+        "o@example.com",
+        "owner",
+        &[("ms_tid", json!(TID)), ("ms_oid", json!("oo"))],
+    );
+    let c = w.cookie(
+        GATED,
+        "USER#o",
+        "o@example.com",
+        "owner",
+        &entra_proof(TID, "oo"),
+    );
+    for (m, path, body) in [
+        (
+            "PUT",
+            "/api/sign-in/microsoft",
+            Some(json!({ "tenant_id": OTHER_TID })),
+        ),
+        (
+            "PUT",
+            "/api/sign-in/microsoft/enabled",
+            Some(json!({ "enabled": false })),
+        ),
+        ("DELETE", "/api/sign-in/microsoft", None),
+        ("DELETE", "/api/users/microsoft/link", None),
+    ] {
+        let a = w.call(m, path, &c, body).await;
+        assert_eq!(a.body["code"], "sso_required_on", "{m} {path}: {}", a.body);
+    }
+    let s =
+        w.f.store
+            .get("settings", GATED, super::entra_sso::SETUP_SK)
+            .unwrap();
+    assert_eq!(
+        (s["tid"].as_str(), s["enabled"].as_bool()),
+        (Some(TID), Some(true))
+    );
+    // Okta's setup isn't the one in use: turning it off goes through.
+    let a = w
+        .call(
+            "PUT",
+            "/api/sign-in/okta",
+            &c,
+            Some(json!({ "enabled": false })),
+        )
+        .await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+}
+
+/// The tenant turns on only after the owner's own Test sign-in within the
+/// hour; a new tenant is saved off and untested, and drops the links.
+#[tokio::test]
+async fn the_tenant_turns_on_only_after_the_owners_own_fresh_test() {
+    let _self_hosted = crate::routes::setup_checks::test_self_hosted::set(true);
+    let w = world().await;
+    let c = selfhost_org(&w, false);
+    let a = w
+        .call(
+            "PUT",
+            "/api/sign-in/microsoft",
+            &c,
+            Some(json!({ "tenant_id": TID })),
+        )
+        .await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    assert_eq!(a.body["setup"]["enabled"], false);
+    let on = Some(json!({ "enabled": true }));
+    let a = w
+        .call("PUT", "/api/sign-in/microsoft/enabled", &c, on.clone())
+        .await;
+    assert_eq!(a.body["code"], "test_first");
+    let updated =
+        w.f.store
+            .get("settings", GATED, super::entra_sso::SETUP_SK)
+            .unwrap()["updated_at"]
+            .clone();
+    let tested = |by: &str, at: String| {
+        w.f.store.put(
+            "settings",
+            &[
+                ("pk", json!(GATED)),
+                ("sk", json!(super::entra_sso::SETUP_SK)),
+                ("tid", json!(TID)),
+                ("domains", json!([])),
+                ("enabled", json!(false)),
+                ("updated_at", updated.clone()),
+                ("tested_by", json!(by)),
+                ("tested_oid", json!("oo")),
+                ("tested_at", json!(at)),
+            ],
+        )
+    };
+    tested("USER#someone-else", chrono::Utc::now().to_rfc3339());
+    let a = w
+        .call("PUT", "/api/sign-in/microsoft/enabled", &c, on.clone())
+        .await;
+    assert_eq!(a.body["code"], "test_first");
+    tested(
+        "USER#o",
+        (chrono::Utc::now() - chrono::Duration::minutes(61)).to_rfc3339(),
+    );
+    let a = w
+        .call("PUT", "/api/sign-in/microsoft/enabled", &c, on.clone())
+        .await;
+    assert_eq!(a.body["code"], "test_first");
+    tested("USER#o", chrono::Utc::now().to_rfc3339());
+    let a = w
+        .call("PUT", "/api/sign-in/microsoft/enabled", &c, on.clone())
+        .await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    assert_eq!(a.body["setup"]["enabled"], true);
+    // An admin can't change it at all.
+    let admin = w.cookie(GATED, "USER#a", "a@example.com", "admin", &okta_proof("a"));
+    w.member(
+        GATED,
+        "USER#a",
+        "a@example.com",
+        "admin",
+        &[("okta_issuer", json!(ISSUER)), ("okta_sub", json!("a"))],
+    );
+    let a = w
+        .call(
+            "PUT",
+            "/api/sign-in/microsoft",
+            &admin,
+            Some(json!({ "tenant_id": OTHER_TID })),
+        )
+        .await;
+    assert_eq!(a.status, StatusCode::FORBIDDEN, "{}", a.body);
+    // A new tenant drops every link.
+    w.member(
+        GATED,
+        "USER#m",
+        "m@example.com",
+        "member",
+        &[("ms_tid", json!(TID)), ("ms_oid", json!("om"))],
+    );
+    let a = w
+        .call(
+            "PUT",
+            "/api/sign-in/microsoft",
+            &c,
+            Some(json!({ "tenant_id": OTHER_TID })),
+        )
+        .await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    assert!(w.f.store.get("users", GATED, "USER#m").unwrap()["ms_oid"].is_null());
+    // Personal accounts' tenant is never a team's.
+    let a = w
+        .call(
+            "PUT",
+            "/api/sign-in/microsoft",
+            &c,
+            Some(json!({ "tenant_id": super::entra_sso::CONSUMER_TENANT })),
+        )
+        .await;
+    assert_eq!(a.status, StatusCode::BAD_REQUEST);
+}
+
+/// `/auth/microsoft?team_id=` signs in through the team's tenant only.
+#[tokio::test]
+async fn the_teams_microsoft_sign_in_goes_to_its_tenant_only() {
+    let w = world().await;
+    w.entra(GATED, true);
+    let a = w
+        .call(
+            "GET",
+            &format!("/auth/microsoft?team_id={}", urlencoding::encode(GATED)),
+            "",
+            None,
+        )
+        .await;
+    assert_eq!(a.status, StatusCode::SEE_OTHER);
+    let to = a.location.clone().unwrap_or_default();
+    assert!(
+        to.starts_with(&format!(
+            "https://login.microsoftonline.com/{TID}/oauth2/v2.0/authorize"
+        )),
+        "{to}"
+    );
+    // A team without a tenant on gets the sign-in screen, not Microsoft.
+    let a = w
+        .call(
+            "GET",
+            &format!("/auth/microsoft?team_id={}", urlencoding::encode(OTHER)),
+            "",
+            None,
+        )
+        .await;
+    assert_eq!(a.status, StatusCode::FOUND);
+}
+
+// ── Claim links (item 3) ────────────────────────────────────────────
+
+/// The admin's link: (url, the flow value its start carries).
+async fn issue_claim(w: &World, admin: &str, user: &str) -> Answer {
+    w.call(
+        "POST",
+        "/api/sign-in/claims",
+        admin,
+        Some(json!({ "user_id": user })),
+    )
+    .await
+}
+
+fn token_of(url: &str) -> String {
+    url.split("token=").nth(1).unwrap().to_string()
+}
+
+/// The flow value a claim link's start puts in the signed cookie.
+fn carried(token: &str) -> String {
+    let (_, member, secret) = super::sso_claim::parse_token(token).unwrap();
+    super::sso_claim::flow_value(&member, &super::sso_claim::token_hash(&secret))
+}
+
+/// An admin gives one unlinked member a one-time link; the provider's
+/// sign-in uses it once, for exactly that member, in one transaction, and
+/// a plain unlinked sign-in still has to ask an admin.
+#[tokio::test]
+async fn a_claim_link_links_exactly_its_member_once() {
+    let w = world().await;
+    w.rule_with(GATED, Some("microsoft"));
+    w.entra(GATED, true);
+    w.proven(GATED, "example.com");
+    w.member(
+        GATED,
+        "USER#adm",
+        "adm@example.com",
+        "admin",
+        &[("ms_tid", json!(TID)), ("ms_oid", json!("oa"))],
+    );
+    w.member(GATED, "USER#own", "own@example.com", "owner", &[]);
+    w.member(GATED, "USER#pat", "Pat@Example.com", "member", &[]);
+    let admin = w.cookie(
+        GATED,
+        "USER#adm",
+        "adm@example.com",
+        "admin",
+        &entra_proof(TID, "oa"),
+    );
+    // A plain unlinked sign-in: ask an admin, nothing linked by email.
+    assert_eq!(
+        w.entra_lands(GATED, TID, "op", "pat@example.com", None)
+            .await
+            .unwrap_err(),
+        "sso_ask_admin"
+    );
+    // Never for the owner; never for someone already linked.
+    assert_eq!(issue_claim(&w, &admin, "own").await.body["code"], "owner");
+    assert_eq!(
+        issue_claim(&w, &admin, "adm").await.body["code"],
+        "already_linked"
+    );
+    let a = issue_claim(&w, &admin, "pat").await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    let url = a.body["url"].as_str().unwrap().to_string();
+    let token = token_of(&url);
+    let row =
+        w.f.store
+            .get("settings", &format!("SSO_CLAIM#{GATED}"), "USER#pat")
+            .unwrap();
+    // Only the secret's hash is stored, with the member's email and role.
+    assert!(!row
+        .to_string()
+        .contains(&super::sso_claim::parse_token(&token).unwrap().2));
+    assert_eq!(
+        (
+            row["email"].as_str(),
+            row["role"].as_str(),
+            row["used"].as_bool()
+        ),
+        (Some("Pat@Example.com"), Some("member"), Some(false))
+    );
+    assert!(audit_lines(&w, GATED)
+        .iter()
+        .any(|l| l.contains("claim link issued for Pat@Example.com")));
+    // The public start goes to the team's tenant, carrying the claim.
+    let a = w
+        .call("GET", &format!("/auth/sso/claim?token={token}"), "", None)
+        .await;
+    assert_eq!(a.status, StatusCode::SEE_OTHER, "{:?}", a.location);
+    assert!(a
+        .location
+        .as_deref()
+        .unwrap()
+        .starts_with(&format!("https://login.microsoftonline.com/{TID}/")));
+    let flow = a
+        .cookies
+        .iter()
+        .find(|c| c.starts_with("__Host-oauth_flow_ms="))
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let f = super::oidc_signin::read_flow(
+        super::oauth_signin::Provider::Microsoft,
+        &flow,
+        &w.state.secrets.jwt_secret,
+    )
+    .unwrap();
+    assert_eq!(f.claim, carried(&token));
+    assert_eq!(f.team, GATED);
+    // Another email (even the same person's +tag) can't use it.
+    assert_eq!(
+        w.entra_lands(GATED, TID, "op", "pat+x@example.com", Some(&f.claim))
+            .await
+            .unwrap_err(),
+        "sso_ask_admin"
+    );
+    // Exactly the member's address (trimmed, lowercase): linked and in.
+    let r = w
+        .entra_lands(GATED, TID, "op", "pat@example.com", Some(&f.claim))
+        .await
+        .unwrap();
+    assert!(sets_session(&r));
+    let m = w.f.store.get("users", GATED, "USER#pat").unwrap();
+    assert_eq!(
+        (m["ms_tid"].as_str(), m["ms_oid"].as_str()),
+        (Some(TID), Some("op"))
+    );
+    let row =
+        w.f.store
+            .get("settings", &format!("SSO_CLAIM#{GATED}"), "USER#pat")
+            .unwrap();
+    assert_eq!(row["used"], true);
+    assert!(audit_lines(&w, GATED)
+        .iter()
+        .any(|l| l.contains("claim link used")));
+    // Once only: used, and its link can't be started or revoked again.
+    w.member(GATED, "USER#pat", "Pat@Example.com", "member", &[]);
+    assert_eq!(
+        w.entra_lands(GATED, TID, "op2", "pat@example.com", Some(&f.claim))
+            .await
+            .unwrap_err(),
+        "sso_ask_admin"
+    );
+    let a = w
+        .call("GET", &format!("/auth/sso/claim?token={token}"), "", None)
+        .await;
+    assert!(a
+        .location
+        .unwrap()
+        .contains("signin_error=sso_claim_invalid&reason=used"));
+    let a = w
+        .call("DELETE", "/api/sign-in/claims/pat", &admin, None)
+        .await;
+    assert_eq!(a.body["code"], "no_unused_claim");
+}
+
+/// Every condition the transaction holds: unexpired, the member unchanged
+/// (role, email, still unlinked), the identity linked to nobody, and on
+/// hosted a proven, non-failing domain. A revoked link is gone.
+#[tokio::test]
+async fn a_claim_is_refused_when_anything_changed() {
+    let w = world().await;
+    w.rule_with(GATED, Some("microsoft"));
+    w.entra(GATED, true);
+    w.proven(GATED, "example.com");
+    w.member(
+        GATED,
+        "USER#adm",
+        "adm@example.com",
+        "admin",
+        &[("ms_tid", json!(TID)), ("ms_oid", json!("oa"))],
+    );
+    let admin = w.cookie(
+        GATED,
+        "USER#adm",
+        "adm@example.com",
+        "admin",
+        &entra_proof(TID, "oa"),
+    );
+    let fresh = |w: &World| w.member(GATED, "USER#pat", "pat@example.com", "member", &[]);
+    // Expired.
+    fresh(&w);
+    let c = new_claim(&w, &admin).await;
+    let key = format!("SSO_CLAIM#{GATED}");
+    let mut row = w.f.store.get("settings", &key, "USER#pat").unwrap();
+    row["expires_at"] = json!(1);
+    w.f.store.put(
+        "settings",
+        &row.as_object()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.clone()))
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(pat_lands(&w, &c, "p1").await.unwrap_err(), "sso_ask_admin");
+    // The member's role changed since.
+    fresh(&w);
+    let c = new_claim(&w, &admin).await;
+    w.member(GATED, "USER#pat", "pat@example.com", "admin", &[]);
+    assert_eq!(pat_lands(&w, &c, "p1").await.unwrap_err(), "sso_ask_admin");
+    // The identity is already another member's.
+    fresh(&w);
+    let c = new_claim(&w, &admin).await;
+    w.f.store.put(
+        "settings",
+        &[
+            ("pk", json!(format!("ENTRA_LINK#{GATED}"))),
+            ("sk", json!(format!("{TID}#taken"))),
+            ("member", json!("USER#adm")),
+        ],
+    );
+    assert_eq!(
+        pat_lands(&w, &c, "taken").await.unwrap_err(),
+        "sso_ask_admin"
+    );
+    assert!(w.f.store.get("users", GATED, "USER#pat").unwrap()["ms_oid"].is_null());
+    // The domain's proof is failing: no claim is accepted at it.
+    let mut d =
+        w.f.store
+            .get("settings", "OKTA_DOMAIN#example.com", "OKTA")
+            .unwrap();
+    d["failing_at"] = json!(chrono::Utc::now().to_rfc3339());
+    w.f.store.put(
+        "settings",
+        &d.as_object()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.clone()))
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(pat_lands(&w, &c, "p2").await.unwrap_err(), "sso_ask_admin");
+    w.proven(GATED, "example.com");
+    // Revoked: nothing to use.
+    let a = w
+        .call("DELETE", "/api/sign-in/claims/pat", &admin, None)
+        .await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    assert!(w.f.store.get("settings", &key, "USER#pat").is_none());
+    assert_eq!(pat_lands(&w, &c, "p3").await.unwrap_err(), "sso_ask_admin");
+    // Only admins issue them, and only while the rule is on.
+    w.member(
+        GATED,
+        "USER#mem",
+        "mem@example.com",
+        "member",
+        &[("ms_tid", json!(TID)), ("ms_oid", json!("om"))],
+    );
+    let member = w.cookie(
+        GATED,
+        "USER#mem",
+        "mem@example.com",
+        "member",
+        &entra_proof(TID, "om"),
+    );
+    assert_eq!(
+        issue_claim(&w, &member, "pat").await.status,
+        StatusCode::FORBIDDEN
+    );
+    w.rule_with(GATED, None);
+    let admin2 = w.cookie(
+        GATED,
+        "USER#adm",
+        "adm@example.com",
+        "admin",
+        &entra_proof(TID, "oa"),
+    );
+    assert_eq!(
+        issue_claim(&w, &admin2, "pat").await.body["code"],
+        "sso_not_required"
+    );
+}
+
+async fn new_claim(w: &World, admin: &str) -> String {
+    let a = issue_claim(w, admin, "pat").await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    carried(&token_of(a.body["url"].as_str().unwrap()))
+}
+
+async fn pat_lands(w: &World, c: &str, oid: &str) -> Result<axum::response::Response, String> {
+    w.entra_lands(GATED, TID, oid, "pat@example.com", Some(c))
+        .await
+}
+
+/// An Okta claim works the same way through okta_land.
+#[tokio::test]
+async fn an_okta_claim_links_the_okta_identity() {
+    let w = world().await;
+    w.rule(GATED, true);
+    w.okta(GATED, true);
+    w.proven(GATED, "example.com");
+    w.member(
+        GATED,
+        "USER#adm",
+        "adm@example.com",
+        "admin",
+        &[("okta_issuer", json!(ISSUER)), ("okta_sub", json!("a"))],
+    );
+    w.member(GATED, "USER#pat", "pat@example.com", "member", &[]);
+    let admin = w.cookie(
+        GATED,
+        "USER#adm",
+        "adm@example.com",
+        "admin",
+        &okta_proof("a"),
+    );
+    let a = issue_claim(&w, &admin, "pat").await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    let c = carried(&token_of(a.body["url"].as_str().unwrap()));
+    let claims =
+        json!({ "iss": ISSUER, "sub": "p", "email": "pat@example.com", "email_verified": true });
+    let r = super::oidc_signin::okta_land(
+        &w.state,
+        "127.0.0.1",
+        &w.live_setup(GATED),
+        &claims,
+        Some(&c),
+    )
+    .await
+    .unwrap();
+    assert!(sets_session(&r));
+    let m = w.f.store.get("users", GATED, "USER#pat").unwrap();
+    assert_eq!(
+        (m["okta_issuer"].as_str(), m["okta_sub"].as_str()),
+        (Some(ISSUER), Some("p"))
+    );
+    // Unverified email: no claim.
+    w.member(GATED, "USER#q", "q@example.com", "member", &[]);
+    let a = issue_claim(&w, &admin, "q").await;
+    let c = carried(&token_of(a.body["url"].as_str().unwrap()));
+    let claims =
+        json!({ "iss": ISSUER, "sub": "q", "email": "q@example.com", "email_verified": false });
+    assert!(super::oidc_signin::okta_land(
+        &w.state,
+        "127.0.0.1",
+        &w.live_setup(GATED),
+        &claims,
+        Some(&c)
+    )
+    .await
+    .is_err());
+    assert!(w.f.store.get("users", GATED, "USER#q").unwrap()["okta_sub"].is_null());
+}
+
+// ── Recovery (item 2) ───────────────────────────────────────────────
+
+/// Hosted: CoderHelm support turns the rule off only with a verification
+/// note, from its own session with a second factor; the team's log has it,
+/// and no session is made for anyone.
+#[tokio::test]
+async fn support_recovery_turns_only_the_rule_off_and_makes_no_session() {
+    let w = world().await;
+    w.rule(GATED, true);
+    w.member(GATED, "USER#own", "own@example.com", "owner", &[]);
+    w.member(
+        "TEAM#coderhelm",
+        "USER#staff",
+        "admin@coderhelm.com",
+        "owner",
+        &[],
+    );
+    let path = format!(
+        "/api/admin/teams/{}/sso-recovery",
+        urlencoding::encode(GATED)
+    );
+    let note = json!({ "verification": "Video call with the owner, ID checked against the signed contract." });
+    let staff = |mfa: bool| {
+        w.cookie(
+            "TEAM#coderhelm",
+            "USER#staff",
+            "admin@coderhelm.com",
+            "owner",
+            &SignInProof::new(mfa, "google"),
+        )
+    };
+    // Not a platform admin: refused.
+    let owner = w.cookie(
+        GATED,
+        "USER#own",
+        "own@example.com",
+        "owner",
+        &okta_proof("x"),
+    );
+    assert_eq!(
+        w.call("POST", &path, &owner, Some(note.clone()))
+            .await
+            .status,
+        StatusCode::UNAUTHORIZED
+    );
+    // No second factor, or no real note: refused.
+    let a = w
+        .call("POST", &path, &staff(false), Some(note.clone()))
+        .await;
+    assert_eq!(a.body["code"], "second_factor", "{}", a.body);
+    let a = w
+        .call(
+            "POST",
+            &path,
+            &staff(true),
+            Some(json!({ "verification": "ok" })),
+        )
+        .await;
+    assert_eq!(a.body["code"], "verification_needed");
+    assert_eq!(
+        super::sign_in::team_rule(&w.state, GATED)
+            .await
+            .unwrap()
+            .require_sso,
+        Some(super::require_sso::SsoProvider::Okta)
+    );
+    // Done right: the rule is off, logged with the note, no cookie set.
+    let a = w.call("POST", &path, &staff(true), Some(note)).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    assert!(a
+        .cookies
+        .iter()
+        .all(|c| !c.starts_with("__Host-coderhelm_session=ey")));
+    assert_eq!(
+        super::sign_in::team_rule(&w.state, GATED)
+            .await
+            .unwrap()
+            .require_sso,
+        None
+    );
+    let lines = audit_lines(&w, GATED);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("turned off by CoderHelm support")
+                && l.contains("Video call with the owner")),
+        "{lines:?}"
+    );
+    // Not on again: nothing to recover.
+    let a = w
+        .call(
+            "POST",
+            &path,
+            &staff(true),
+            Some(json!({ "verification": "Video call with the owner, ID checked again." })),
+        )
+        .await;
+    assert_eq!(a.body["code"], "sso_not_required");
+}
+
+/// Self-hosted: the recovery script's notice is taken by the first request
+/// that reads the rule, exactly once.
+#[tokio::test]
+async fn the_recovery_scripts_notice_is_taken_once() {
+    let _self_hosted = crate::routes::setup_checks::test_self_hosted::set(true);
+    let w = world().await;
+    let c = selfhost_org(&w, false);
+    let mut org = w.f.store.get("settings", "ORG", "META").unwrap();
+    org.as_object_mut().unwrap().remove("require_sso");
+    org["sso_recovery_notice"] = json!("okta|Ops person|2026-11-21T12:00:00.000Z");
+    w.f.store.put(
+        "settings",
+        &org.as_object()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.clone()))
+            .collect::<Vec<_>>(),
+    );
+    // Any request that reads the rule (here a member's own page).
+    assert_eq!(w.call("GET", STATUS, &c, None).await.status, StatusCode::OK);
+    assert!(w.f.store.get("settings", "ORG", "META").unwrap()["sso_recovery_notice"].is_null());
+    // Taken once: a second request finds nothing to send.
+    assert_eq!(w.call("GET", STATUS, &c, None).await.status, StatusCode::OK);
+    assert_eq!(
+        super::sign_in::team_rule(&w.state, "")
+            .await
+            .unwrap()
+            .require_sso,
+        None
+    );
 }

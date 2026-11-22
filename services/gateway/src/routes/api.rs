@@ -589,6 +589,8 @@ pub(crate) fn is_platform_admin(claims: &Claims) -> bool {
     claims.support_view.is_none()
         && !claims.held
         && !claims.via_okta
+        // Nor can a team's own Microsoft tenant.
+        && claims.entra.is_none()
         && !claims.sub.starts_with("USER#okta_")
         && verified_identity(&claims.sub)
         && platform_admin_listed(&admins, &claims.email)

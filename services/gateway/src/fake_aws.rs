@@ -7,7 +7,7 @@
 //! queries on a key (and `begins_with` on the sort key), the update and
 //! condition expressions those paths write (`SET`, `REMOVE`, `ADD`,
 //! `if_not_exists`, `attribute_exists`, `attribute_not_exists`, `=`, `<>`,
-//! `<`, `AND`, `OR`, brackets) and transactions that write nothing when any
+//! `<`, `>`, `AND`, `OR`, brackets) and transactions that write nothing when any
 //! condition fails. Anything it doesn't understand (an operation, a
 //! condition, an expression) is recorded, answered with an error, and fails
 //! the test when the stand-in is dropped: a test can't pass on a fake laxer
@@ -346,7 +346,7 @@ fn holds(expr: &str, item: Option<&Obj>, c: &Ctx) -> bool {
     {
         return attr(n).is_none();
     }
-    for op in ["<>", "<", "="] {
+    for op in ["<>", ">", "<", "="] {
         if let Some((l, r)) = e.split_once(op) {
             let (l, r) = (l.trim(), r.trim());
             let plain_name = |n: &str| {
@@ -361,6 +361,7 @@ fn holds(expr: &str, item: Option<&Obj>, c: &Ctx) -> bool {
             return match op {
                 "<>" => have.as_ref() != Some(&want),
                 "<" => have.is_some_and(|h| num(&h) < num(&want)),
+                ">" => have.is_some_and(|h| num(&h) > num(&want)),
                 _ => have.as_ref() == Some(&want),
             };
         }
@@ -843,9 +844,14 @@ pub fn state(url: &str) -> Arc<crate::AppState> {
             "AKIDTEST", "secret", None, None, "test",
         )))
         .build();
-    let secrets: crate::models::Secrets =
-        serde_json::from_value(json!({ "jwt_secret": "test-jwt-secret-for-the-okta-rule" }))
-            .unwrap();
+    let secrets: crate::models::Secrets = serde_json::from_value(json!({
+        "jwt_secret": "test-jwt-secret-for-the-okta-rule",
+        // The deployment's own Entra app (no request reaches Microsoft:
+        // the tests stop at the redirect or start after the token).
+        "microsoft_client_id": "ms-client",
+        "microsoft_client_secret": "ms-secret",
+    }))
+    .unwrap();
     Arc::new(crate::AppState {
         dynamo: aws_sdk_dynamodb::Client::new(&aws),
         sqs: aws_sdk_sqs::Client::new(&aws),

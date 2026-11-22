@@ -1897,6 +1897,9 @@ mod tests {
             ("api.rs", include_str!("api.rs"), 1),
             ("sign_in.rs", include_str!("sign_in.rs"), 3),
             ("oidc_signin.rs", include_str!("oidc_signin.rs"), 0),
+            ("entra_sso.rs", include_str!("entra_sso.rs"), 0),
+            ("sso_claim.rs", include_str!("sso_claim.rs"), 0),
+            ("require_sso.rs", include_str!("require_sso.rs"), 0),
             ("users.rs", include_str!("users.rs"), 0),
             ("mcp_oauth.rs", include_str!("mcp_oauth.rs"), 0),
             ("github_hybrid.rs", include_str!("github_hybrid.rs"), 0),
@@ -1966,6 +1969,28 @@ mod tests {
             "require_sso::issue_check(",
             "sign_in::second_step("
         ));
+        // The team's own tenant and claim links end in finish_oidc too: the
+        // linked member, a claim accepted in its transaction, or an invite.
+        let entra = code(include_str!("entra_sso.rs"));
+        let land = body(entra, "entra_land");
+        assert!(before(
+            land,
+            "tenant_of(claims, &setup.tid)",
+            "finish_oidc("
+        ));
+        assert!(before(
+            land,
+            "linked_record(&members, &tid, &oid)",
+            "finish_oidc("
+        ));
+        assert!(before(land, "sso_claim::redeem(", "invite_for("));
+        assert_eq!(land.matches("finish_oidc(").count(), 3);
+        assert!(!land.contains("records_by_email"));
+        let claim = code(include_str!("sso_claim.rs"));
+        let redeem = body(claim, "redeem");
+        assert!(before(redeem, "redeemable(", ".transact_write_items()"));
+        assert!(redeem.contains("domain_still_usable("));
+        assert!(!claim.contains("create_session_token"));
         // Microsoft and Okta's shared ending.
         let o = body(auth, "finish_oidc");
         assert!(before(
