@@ -31,6 +31,11 @@ pub const NEEDS_OUTSIDE_CHANGE: &str = "needs_outside_change";
 /// An open pull request (anyone's) already does the work: the run linked it
 /// and built no second fix (see `stop_rules::existing_work`).
 pub const COVERED_BY_PR: &str = "covered_by_pr";
+/// The plan found that the code already does what the ticket (or alert)
+/// asks: no branch, no pull request, the reason on the run (`no_change`)
+/// and wherever the run came from. A finished run, not a failure and not a
+/// delivered pull request.
+pub const NO_CHANGE: &str = "no_change";
 pub const COMPLETED: &str = "completed";
 /// Older runs finished with this word before `completed`.
 pub const SUCCESS: &str = "success";
@@ -45,7 +50,7 @@ pub const RETRIED: &str = "retried";
 pub const ARCHIVED: &str = "archived";
 
 /// Every status a run record carries.
-pub const ALL: [&str; 16] = [
+pub const ALL: [&str; 17] = [
     PENDING,
     QUEUED,
     RUNNING,
@@ -54,6 +59,7 @@ pub const ALL: [&str; 16] = [
     NEEDS_INPUT,
     NEEDS_OUTSIDE_CHANGE,
     COVERED_BY_PR,
+    NO_CHANGE,
     COMPLETED,
     SUCCESS,
     MERGED,
@@ -229,6 +235,7 @@ mod tests {
             NEEDS_INPUT,
             NEEDS_OUTSIDE_CHANGE,
             COVERED_BY_PR,
+            NO_CHANGE,
             COMPLETED,
             SUCCESS,
             FAILED,
@@ -257,6 +264,7 @@ mod tests {
         assert_eq!(reopen_status(FAILED), FAILED);
         assert_eq!(reopen_status(NEEDS_OUTSIDE_CHANGE), NEEDS_OUTSIDE_CHANGE);
         assert_eq!(reopen_status(COVERED_BY_PR), COVERED_BY_PR);
+        assert_eq!(reopen_status(NO_CHANGE), NO_CHANGE);
         assert_eq!(reopen_status(NEEDS_INPUT), NEEDS_INPUT);
         // A reopened run waiting for the role's reads waits again: the
         // daily role check still finds it.

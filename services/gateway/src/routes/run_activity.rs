@@ -475,6 +475,10 @@ pub fn status_line(status: &str, error: &str) -> Option<(String, Tone)> {
             "The fix is a change outside the code; handed to people".to_string(),
             Tone::Neutral,
         ),
+        st::NO_CHANGE => (
+            "No change needed: the code already does what was asked".to_string(),
+            Tone::Neutral,
+        ),
         st::COVERED_BY_PR => (
             "An open pull request already covers this ticket".to_string(),
             Tone::Neutral,

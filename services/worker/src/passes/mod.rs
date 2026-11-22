@@ -1344,6 +1344,7 @@ pub mod minimal_change;
 pub mod model_check;
 #[cfg(test)]
 mod model_route_eval;
+pub mod no_change;
 pub mod onboard;
 pub mod one_run;
 pub mod open_pr_choice;
@@ -3803,110 +3804,27 @@ async fn run_passes(
     }
 
     // --- Check: already done? ---
-    if plan_result.tasks.starts_with("NO_CHANGES_NEEDED:") {
-        let reason = plan_result
-            .tasks
-            .strip_prefix("NO_CHANGES_NEEDED:")
-            .unwrap_or("")
-            .trim();
-        info!(run_id, reason, "Plan determined no changes needed");
-
-        let raw_github = format!(
-            "No changes needed: {reason}\n\nThe code already does what this issue asks for."
-        );
-        let github_comment =
-            formatter::format_with_voice(state, &voice, &raw_github, &provider, usage).await;
-        let raw_jira =
-            format!("{reason}\n\nThe codebase already satisfies what this issue asks for.");
-        let mut jira_comment =
-            formatter::format_with_voice(state, &voice, &raw_jira, &provider, usage).await;
-        let mut github_comment = github_comment;
-        // When Coderhelm picked the repo itself, say which one it looked at and
-        // why, so a wrong-repo pick is visible instead of reading as "done".
-        // Appended after voice formatting so it can't be reworded away.
-        if let Some((repo, why)) = auto_pick.as_ref() {
-            let note = repo_pick::no_changes_repo_note(repo, why);
-            add_progress_note(state, &msg.team_id, run_id, &note).await;
-            github_comment = format!("{github_comment}\n\n{note}");
-            jira_comment = format!("{jira_comment}\n\n{note}");
-        }
-
-        // The run's model reads the thread first: people who wrote since
-        // CoderHelm last spoke are answered in reply to their comment.
-        let judge = conversation::ModelJudge::new(&provider, usage);
-        if matches!(msg.source, TicketSource::Github) && msg.issue_number > 0 {
-            let _ = conversation::github_judged(
-                &github,
-                &msg.repo_owner,
-                &msg.repo_name,
-                msg.issue_number,
-                common::conversation::Say::status("run", &github_comment),
-                Some(&judge),
-            )
-            .await;
-        } else if matches!(msg.source, TicketSource::Jira) && !msg.ticket_id.is_empty() {
-            let _ = conversation::jira_judged(
+    // The code already does what was asked: its own visible outcome, with
+    // the plan's reason on the run page, the open pull request this run was
+    // continuing decided, and the alert or ticket answered (`no_change`).
+    if plan_result.tasks.starts_with(no_change::SENTINEL) {
+        no_change::finish(
+            no_change::Run {
                 state,
-                &msg.team_id,
-                &msg.ticket_id,
-                common::conversation::Say::status("run", &jira_comment),
-                "no_changes",
-                "No changes needed",
-                Some(&judge),
-            )
-            .await;
-        }
-
-        // Complete the run with no PR
-        let duration = start.elapsed().as_secs();
-        let delta = usage.unrecorded();
-        let now = chrono::Utc::now().to_rfc3339();
-        let usage_res = state
-            .dynamo
-            .update_item()
-            .table_name(&state.config.runs_table_name)
-            .key("team_id", attr_s(&msg.team_id))
-            .key("run_id", attr_s(run_id))
-            .update_expression(
-                "SET #status = :s, tokens_in = if_not_exists(tokens_in, :uzero) + :ti, tokens_out = if_not_exists(tokens_out, :uzero) + :to, \
-             cache_read_tokens = if_not_exists(cache_read_tokens, :uzero) + :crt, cache_write_tokens = if_not_exists(cache_write_tokens, :uzero) + :cwt, \
-             cost_usd = if_not_exists(cost_usd, :uzero) + :c, \
-                 duration_s = :d, updated_at = :t, current_pass = :cp, \
-                 status_run_id = :sri, mcp_servers = :mcp",
-            )
-            .expression_attribute_names("#status", "status")
-            .expression_attribute_values(":s", attr_s("completed"))
-            .usage_values(&delta)
-            .expression_attribute_values(":d", attr_n(duration))
-            .expression_attribute_values(":t", attr_s(&now))
-            .expression_attribute_values(":cp", attr_s("done"))
-            .expression_attribute_values(":sri", attr_s(&format!("completed#{run_id}")))
-            .expression_attribute_values(
-                ":mcp",
-                AttributeValue::L(used_mcp_ids.iter().map(|s| attr_s(s)).collect()),
-            )
-            .send()
-            .await;
-        if usage_res.is_ok() {
-            usage.mark_recorded(&delta);
-        }
-        self::webhooks::emit_run(state, &msg.team_id, run_id, "completed").await;
-
-        // Update analytics counters
-        let analytics_month = chrono::Utc::now().format("%Y-%m").to_string();
-        for period in &[analytics_month.as_str(), "ALL_TIME"] {
-            let _ = state
-                .dynamo
-                .update_item()
-                .table_name(&state.config.analytics_table_name)
-                .key("team_id", attr_s(&msg.team_id))
-                .key("period", attr_s(period))
-                .update_expression("ADD completed :one")
-                .expression_attribute_values(":one", attr_n(1))
-                .send()
-                .await;
-        }
-
+                msg,
+                run_id,
+                github: &github,
+                provider: &provider,
+                voice: &voice,
+                history: &history,
+                auto_pick: auto_pick.as_ref(),
+                start,
+                mcp_ids: &used_mcp_ids,
+            },
+            &plan_result,
+            usage,
+        )
+        .await;
         close_memory(state, agent_memory.take()).await;
         return Ok(());
     }

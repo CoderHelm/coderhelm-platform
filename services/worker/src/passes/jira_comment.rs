@@ -126,6 +126,10 @@ pub fn prompt(msg: &JiraCommentMessage) -> String {
         "needs_outside_change" => {
             "CoderHelm reported that the fix is a change outside the code and opened no PR."
         }
+        "no_change" => {
+            "CoderHelm found that the code already does what the ticket asks, said why, and \
+             opened no PR."
+        }
         "covered_by_pr" => {
             "CoderHelm found an open pull request that already does this work, linked it, and \
              built no second fix."

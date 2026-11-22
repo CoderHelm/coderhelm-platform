@@ -748,8 +748,8 @@ pub struct RunSummary {
     #[schema(example = "01JB8X6F4M2C9QZ3T7V5W1K0HA")]
     pub run_id: Option<String>,
     /// Where the run is: `pending`, `running`, `awaiting_ci`, `completed`,
-    /// `failed`, `needs_input`, `needs_outside_change`, `covered_by_pr`, `cancelled`,
-    /// `retried` or `closed`. Treat a value you don't know as in progress.
+    /// `failed`, `needs_input`, `needs_outside_change`, `covered_by_pr`, `no_change`,
+    /// `cancelled`, `retried` or `closed`. Treat a value you don't know as in progress.
     #[schema(example = "completed")]
     pub status: Option<String>,
     /// What started it, such as `github`, `jira` or `alert`.
@@ -1295,8 +1295,8 @@ pub struct Run {
     #[schema(example = "01JB8X6F4M2C9QZ3T7V5W1K0HA")]
     pub run_id: String,
     /// Where the run is: `pending`, `running`, `awaiting_ci`, `completed`,
-    /// `failed`, `needs_input`, `needs_outside_change`, `covered_by_pr`, `cancelled`,
-    /// `retried` or `closed`. Treat a value you don't know as in progress.
+    /// `failed`, `needs_input`, `needs_outside_change`, `covered_by_pr`, `no_change`,
+    /// `cancelled`, `retried` or `closed`. Treat a value you don't know as in progress.
     #[schema(example = "completed")]
     pub status: Option<String>,
     /// What started it, such as `github`, `jira` or `alert`.
@@ -1405,6 +1405,10 @@ pub struct Run {
     /// For a `covered_by_pr` run: the open pull request that already does the
     /// work, and why.
     pub covered_by: Option<RunCoveredBy>,
+    /// For a `no_change` run: why the plan found the code already does what
+    /// was asked, what it checked, and what it decided about an open pull
+    /// request it was continuing.
+    pub no_change: Option<RunNoChange>,
     /// Each acceptance criterion of the ticket (or of the plan's criteria
     /// map) traced to the files and definitions changed for it, the tests
     /// that cover it, and what proves it on the pull request's head. A row
@@ -1706,6 +1710,60 @@ pub struct RunCoderExploration {
     #[serde(default)]
     #[schema(example = "c0ffee1234567890c0ffee1234567890c0ffee12")]
     pub map_commit: Option<String>,
+}
+
+/// Why a run changed nothing: the plan found the code already does what was
+/// asked.
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct RunNoChange {
+    /// The plan's reason, in full, with its evidence.
+    #[serde(default)]
+    #[schema(example = "The rate limit is already 100 requests a minute in config/limits.yml.")]
+    pub reason: String,
+    /// What the plan checked to reach it, one line each.
+    #[serde(default)]
+    #[schema(example = json!(["config/limits.yml: export limit is 100 a minute"]))]
+    pub checks: Vec<String>,
+    /// The ticket's open pull request (CoderHelm's own, from an earlier run)
+    /// this run was continuing, and what the run decided about it.
+    #[serde(default)]
+    pub open_pr: Option<RunNoChangePr>,
+}
+
+/// What a no-change run decided about the open pull request it was
+/// continuing.
+#[derive(serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct RunNoChangePr {
+    /// Its repository, `owner/name`.
+    #[schema(example = "acme/web")]
+    pub repo: String,
+    /// Its number.
+    #[schema(example = 41)]
+    pub number: u64,
+    /// Its address on GitHub.
+    #[serde(default)]
+    #[schema(example = "https://github.com/acme/web/pull/41")]
+    pub url: String,
+    /// Its title.
+    #[serde(default)]
+    #[schema(example = "Raise the export rate limit")]
+    pub title: String,
+    /// `keep` (still needed: it stays open) or `not_needed`.
+    #[schema(example = "keep")]
+    pub verdict: String,
+    /// Why, in one or two sentences.
+    #[serde(default)]
+    #[schema(example = "Its change is not in the code yet and the ticket still needs it.")]
+    pub why: String,
+    /// CoderHelm closed it (only when not needed; its branch is kept).
+    #[serde(default)]
+    #[schema(example = false)]
+    pub closed: bool,
+    /// The decision in one plain sentence, as the run page and the pull
+    /// request say it.
+    #[serde(default)]
+    #[schema(example = "Pull request #41 stays open: its change is not in the code yet.")]
+    pub line: String,
 }
 
 /// The open pull request that already does a run's work.
@@ -2158,6 +2216,7 @@ fn run_of(
         stop_kind: st("stop_kind").filter(|s| !s.is_empty()),
         tooling_failure: st("tooling_failure").and_then(|s| serde_json::from_str(&s).ok()),
         covered_by: st("covered_by").and_then(|s| serde_json::from_str(&s).ok()),
+        no_change: st("no_change").and_then(|s| serde_json::from_str(&s).ok()),
         traceability: st(common::trace::FIELD).and_then(|s| serde_json::from_str(&s).ok()),
         exploration: {
             let code_map: Option<RunCodeMapRefresh> =
@@ -2569,7 +2628,8 @@ pub struct RunActionResult {
     operation_id = "retryRun",
     summary = "Retry a run",
     description = "Starts the run's ticket again as a new run. Only a run that is `failed`, \
-        `needs_input`, `needs_outside_change`, `covered_by_pr`, `cancelled` or `closed` can be \
+        `needs_input`, `needs_outside_change`, `covered_by_pr`, `no_change`, `cancelled` or \
+        `closed` can be \
         retried; the old run \
         becomes `retried`, so retrying it twice is refused with `400`. Find the new run with \
         `GET /api/runs?q=<ticket id>`.\n\n\
@@ -2648,6 +2708,7 @@ pub async fn retry_run(
             | "needs_input"
             | "needs_outside_change"
             | "covered_by_pr"
+            | "no_change"
             | "cancelled"
             | "closed"
     ) {

@@ -3,7 +3,8 @@
 //! A team sets one alert channel (Teams, Slack or both) that every alert route
 //! notifies; a route can instead use its own channels or notify nowhere. Each
 //! alert posts a message, and when CoderHelm opens a pull request for an alert
-//! a follow-up message links it. Webhooks can't edit a posted message, so the
+//! a follow-up message links it (or, when the run finds that no code change
+//! is needed, says why: [`no_change_message`]). Webhooks can't edit a posted message, so the
 //! follow-up is a new message that names the alert. Messages are built here as
 //! [`Message`]s and rendered per channel by [`crate::notify`].
 
@@ -362,6 +363,62 @@ pub fn fix_message(
                 spacing: Spacing::Default,
             },
         ],
+        buttons,
+        full_width: true,
+    }
+}
+
+/// Pure: the follow-up message when the run an alert started finds that no
+/// code change is needed: why, in one paragraph, and what it decided about
+/// an open pull request it was continuing (`pr_line`, empty when none).
+pub fn no_change_message(
+    alert_title: &str,
+    repo: &str,
+    reason: &str,
+    pr_line: &str,
+    run_url: &str,
+    alert_url: &str,
+) -> Message {
+    let mut buttons = Vec::new();
+    if !run_url.is_empty() {
+        buttons.push(Button::new("View run", run_url));
+    }
+    if !alert_url.is_empty() {
+        buttons.push(Button::new("View alert", alert_url));
+    }
+    let title = "✅ No change needed";
+    let mut blocks = vec![
+        banner(Tone::Good, title),
+        Block::Text(
+            Text::new(format!(
+                "For alert: {}",
+                crate::truncate_str(alert_title, 200)
+            ))
+            .subtle()
+            .spacing(Spacing::Small),
+        ),
+        Block::Text(
+            Text::new(crate::truncate_str(reason.trim(), MAX_SUMMARY)).spacing(Spacing::Medium),
+        ),
+    ];
+    if !pr_line.trim().is_empty() {
+        blocks.push(Block::Text(
+            Text::new(crate::truncate_str(pr_line.trim(), 400)).spacing(Spacing::Small),
+        ));
+    }
+    blocks.push(Block::Facts {
+        facts: vec![
+            ("Repository".into(), repo.into()),
+            (
+                "Status".into(),
+                "No pull request: the code already handles this alert".into(),
+            ),
+        ],
+        spacing: Spacing::Default,
+    });
+    Message {
+        summary: format!("{title}: {}", crate::truncate_str(alert_title, 200)),
+        blocks,
         buttons,
         full_width: true,
     }
