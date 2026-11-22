@@ -7,7 +7,10 @@
 //!   "metadata"}`, each as `structuredContent` and as one JSON text item.
 //! - `list_bases`, and the typed lookups: `find_tickets`,
 //!   `find_pull_requests`, `find_runs`, `find_findings`, `code_search`,
-//!   `read_file`, `code_symbol`, `history`.
+//!   `read_file`, `code_symbol`, `history`, and the app map's lookups
+//!   (`map_overview`, `map_find`, `map_part`, `map_screen`, `map_file`), the
+//!   same ones Chat uses (`common::app_map::Lookups`), over the signed-in
+//!   team's own map.
 //!
 //! Every read goes through the shared layer (`lookups`), as the person who
 //! connected the app: the connection must hold the read's scope
@@ -55,6 +58,13 @@ pub const READ_FILE: &str = "read_file";
 pub const CODE_SYMBOL: &str = "code_symbol";
 pub const HISTORY: &str = "history";
 pub const INFRA_RESOURCES: &str = "infra_resources";
+pub const MAP_OVERVIEW: &str = "map_overview";
+pub const MAP_FIND: &str = "map_find";
+pub const MAP_PART: &str = "map_part";
+pub const MAP_SCREEN: &str = "map_screen";
+pub const MAP_FILE: &str = "map_file";
+/// The dashboard route whose check decides a map read: the App map page.
+pub const MAP_ROUTE: &str = "app_map::get_map";
 
 /// The knowledge search, as a lookup name (Chat's own is `search_knowledge`).
 pub const KNOWLEDGE: &str = "knowledge";
@@ -300,6 +310,46 @@ pub const TOOLS: &[Tool] = &[
         }), &["repo", "kind"]),
         output: None,
     },
+    Tool {
+        name: MAP_OVERVIEW,
+        title: "Read the app map",
+        description: "The team's app map in short, as CoderHelm drew it from every repository: each part of the app (its id, name, kind and what it does in plain words), the screens, the repositories and the open problems on it. Start here for how the app fits together.",
+        scopes: &[CODE_SCOPE],
+        schema: || obj(json!({}), &[]),
+        output: None,
+    },
+    Tool {
+        name: MAP_FIND,
+        title: "Search the app map",
+        description: "Searches the team's app map for parts, files, endpoints and screens whose names, descriptions or paths hold every word, with their ids for map_part, map_screen and map_file.",
+        scopes: &[CODE_SCOPE],
+        schema: || obj(json!({ "query": { "type": "string", "description": "A few words, like booking slip." } }), &["query"]),
+        output: None,
+    },
+    Tool {
+        name: MAP_PART,
+        title: "Open a part of the app map",
+        description: "One part of the team's app by its id on the map: what it does, its sub-parts, files and endpoints, and what it connects to (the code it imports, the web requests it makes and answers, and the outside services it uses).",
+        scopes: &[CODE_SCOPE],
+        schema: || obj(json!({ "id": { "type": "string", "description": "A part's id, from map_overview or map_find." } }), &["id"]),
+        output: None,
+    },
+    Tool {
+        name: MAP_SCREEN,
+        title: "Follow a screen on the app map",
+        description: "Everything behind one screen of the app, step by step: the files it uses, the requests it makes, the server code that answers them and the outside services behind it. Give the screen's id or its address, like /slips/:id.",
+        scopes: &[CODE_SCOPE],
+        schema: || obj(json!({ "screen": { "type": "string", "description": "A screen's id or address, from map_overview." } }), &["screen"]),
+        output: None,
+    },
+    Tool {
+        name: MAP_FILE,
+        title: "Open a file on the app map",
+        description: "One file on the team's app map by its path (the repository's folder first, like harbor-api/src/bookings.js): what it is, its endpoints and what it connects to. Read the file's lines with read_file.",
+        scopes: &[CODE_SCOPE],
+        schema: || obj(json!({ "path": { "type": "string", "description": "The file's path on the map." } }), &["path"]),
+        output: None,
+    },
 ];
 
 pub fn find(name: &str) -> Option<&'static Tool> {
@@ -385,6 +435,7 @@ pub fn needs(lookup: &str, input: &Value) -> Option<(&'static str, &'static str,
             Some((CODE_SCOPE, CHAT_ROUTE, "code"))
         }
         l if GRAPH_TOOLS.contains(&l) => Some((CODE_SCOPE, CHAT_ROUTE, "code")),
+        l if common::app_map::is_tool(l) => Some((CODE_SCOPE, MAP_ROUTE, "app_map")),
         KNOWLEDGE => Some((KNOWLEDGE_SCOPE, CHAT_ROUTE, "knowledge")),
         _ => None,
     }
@@ -542,6 +593,20 @@ pub fn read_of(tool: &str, args: &Value) -> Result<Read, String> {
             ]
             .to_vec();
             Read::new(GITHUB_HISTORY, take(args, &keys))
+        }
+        MAP_OVERVIEW => Read::new(MAP_OVERVIEW, json!({})),
+        MAP_FIND | MAP_PART | MAP_SCREEN | MAP_FILE => {
+            let key = match tool {
+                MAP_FIND => "query",
+                MAP_PART => "id",
+                MAP_SCREEN => "screen",
+                _ => "path",
+            };
+            let r = take(args, &[key]);
+            if r.as_object().is_some_and(|o| o.is_empty()) {
+                return Err(format!("Give {key}."));
+            }
+            Read::new(tool, r)
         }
         _ => return Err(format!("{tool} isn't a lookup.")),
     })
@@ -1138,8 +1203,36 @@ async fn run_read(
             Ok((text, Withheld::default()))
         }
         KNOWLEDGE => Box::pin(knowledge_read(env, reg, read)).await,
+        l if common::app_map::is_tool(l) => {
+            // The signed-in team's own map: another team's is never read.
+            let graph = common::app_map::load_graph(
+                &env.state.s3,
+                &env.state.config.bucket_name,
+                &env.claims.team_id,
+            )
+            .await;
+            map_read(graph, reg, read)
+        }
         _ => Err("That isn't a lookup apps may make.".into()),
     }
+}
+
+/// A map lookup over the team's map (`None`: the team has none yet), the
+/// same lookup Chat makes, registered as a source.
+pub fn map_read(
+    graph: Option<Value>,
+    reg: &mut Registry,
+    read: &Read,
+) -> Result<(String, Withheld), String> {
+    let graph =
+        graph.ok_or("This team has no app map yet. It is built on CoderHelm's App map page.")?;
+    let (text, _, failed) =
+        common::app_map::Lookups::new(graph).cite(reg, &read.lookup, &read.input);
+    if failed {
+        let v: Value = serde_json::from_str(&text).unwrap_or_default();
+        return Err(v["error"].as_str().unwrap_or("Not on the map.").to_string());
+    }
+    Ok((text, Withheld::default()))
 }
 
 /// The knowledge search: the bases the person reads in Chat. Passages from
@@ -1691,6 +1784,11 @@ mod tests {
                 json!({ "repo": "acme/web", "want": "callers", "name": "pay" }),
             ),
             (HISTORY, json!({ "repo": "acme/web", "kind": "commits" })),
+            (MAP_OVERVIEW, json!({})),
+            (MAP_FIND, json!({ "query": "booking" })),
+            (MAP_PART, json!({ "id": "api" })),
+            (MAP_SCREEN, json!({ "screen": "/slips/:id" })),
+            (MAP_FILE, json!({ "path": "harbor-api/src/bookings.js" })),
         ];
         for k in FINDING_KINDS {
             v.push((FIND_FINDINGS, json!({ "kind": k })));
@@ -1717,7 +1815,12 @@ mod tests {
                 CODE_SEARCH,
                 READ_FILE,
                 CODE_SYMBOL,
-                HISTORY
+                HISTORY,
+                MAP_OVERVIEW,
+                MAP_FIND,
+                MAP_PART,
+                MAP_SCREEN,
+                MAP_FILE
             ]
         );
         for t in &tools {
@@ -1756,9 +1859,11 @@ mod tests {
             true,
         );
         let code = chat_code::defs(&[RepoInfo::new("acme/web", "main")]);
+        let map = common::app_map::tool_defs();
         let chat_props = |lookup: &str| -> Option<Value> {
             work.iter()
                 .chain(code.iter())
+                .chain(map.iter())
                 .find(|d| d["name"] == lookup)
                 .map(|d| d["input_schema"]["properties"].clone())
         };
@@ -1925,9 +2030,15 @@ mod tests {
                 CODE_SEARCH,
                 READ_FILE,
                 CODE_SYMBOL,
-                HISTORY
+                HISTORY,
+                MAP_OVERVIEW,
+                MAP_FIND,
+                MAP_PART,
+                MAP_SCREEN,
+                MAP_FILE
             ]
         );
+        assert!(!names(BTreeSet::from([READ_SCOPE, WORK_SCOPE])).contains(&MAP_PART.to_string()));
         assert!(names(BTreeSet::from([SECURITY_SCOPE])).contains(&FIND_FINDINGS.to_string()));
         assert!(names(BTreeSet::from([INFRA_SCOPE])).contains(&INFRA_RESOURCES.to_string()));
         assert!(!names(BTreeSet::from([LOGS_SCOPE])).contains(&INFRA_RESOURCES.to_string()));
@@ -1936,6 +2047,86 @@ mod tests {
         assert_eq!(two.len(), 2);
         assert_eq!(two[0]["name"], SEARCH);
         assert_eq!(two[1]["name"], FETCH);
+    }
+
+    fn harbor(owner: &str) -> Value {
+        let mut g: Value = serde_json::from_str(include_str!(
+            "../../worker/floorplan/fixtures/harbor-graph.json"
+        ))
+        .unwrap();
+        common::app_map::stamp_repos(
+            &mut g,
+            &common::app_map::folders(&[
+                format!("{owner}/harbor-web"),
+                format!("{owner}/harbor-api"),
+            ]),
+        );
+        g
+    }
+
+    /// The map lookups on /mcp: listed under code:read, decided like the App
+    /// map page, answered from the signed-in team's map with Chat's own
+    /// lookups, cited back to the page; no map, no answer.
+    #[test]
+    fn the_map_lookups_answer_from_the_signed_in_teams_map_only() {
+        let member = Holder::builtin("member");
+        let read = read_of(MAP_SCREEN, &json!({ "screen": "/slips/:id" })).unwrap();
+        assert_eq!(scope_needed(MAP_SCREEN, &json!({})), None);
+        assert_eq!(
+            scope_needed(MAP_SCREEN, &json!({ "screen": "/slips/:id" })),
+            Some(CODE_SCOPE)
+        );
+        assert!(decide(&BTreeSet::from([READ_SCOPE, CODE_SCOPE]), &member, &read).is_ok());
+        assert_eq!(
+            decide(&BTreeSet::from([READ_SCOPE, WORK_SCOPE]), &member, &read),
+            Err(Refusal::Scope(CODE_SCOPE))
+        );
+        assert_eq!(base_of_read(&read).unwrap().key, lookups::CODE);
+        // A closed code base closes the map too.
+        let mut open = all_open();
+        open.insert(lookups::CODE, Decision::Role);
+        assert!(decide_open(&all_scopes(), &member, &open, &read).is_err());
+        assert!(decide_open(&all_scopes(), &member, &all_open(), &read).is_ok());
+        // Answered from the team's own map, with Chat's lookup, as one source.
+        let mut reg = Registry::default();
+        let (text, _) = map_read(Some(harbor("harbor")), &mut reg, &read).unwrap();
+        assert!(
+            text.starts_with("[S1] ") && text.contains("outside"),
+            "{text}"
+        );
+        let found = items(&reg, &read, "https://app.example");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].base.key, lookups::CODE);
+        assert_eq!(found[0].kind, "app_map");
+        assert_eq!(
+            found[0].url,
+            "https://app.example/app-map?focus=api,stripe,web"
+        );
+        assert_eq!(
+            found[0].title,
+            "Followed the screen /slips/:id on the app map"
+        );
+        // Its id reads the same lookup again.
+        let t = decode_id(&found[0].id).unwrap();
+        assert_eq!(t.read, read);
+        // Another team's part or screen isn't in this team's map, and a team
+        // with no map gets a plain answer.
+        let theirs = read_of(MAP_PART, &json!({ "id": "marina-docks" })).unwrap();
+        assert!(map_read(Some(harbor("harbor")), &mut Registry::default(), &theirs).is_err());
+        let err = map_read(None, &mut Registry::default(), &read).unwrap_err();
+        assert!(err.contains("no app map yet"), "{err}");
+        assert_ne!(
+            common::app_map::graph_key("team-a"),
+            common::app_map::graph_key("team-b")
+        );
+        // The read loads the signed-in team's own map.
+        let src = include_str!("mcp_lookups.rs");
+        let body = &src[src.find("l if common::app_map::is_tool(l) => {").unwrap()..];
+        assert!(body[..400].contains("&env.claims.team_id"));
+        assert!(
+            audit_detail(MAP_FILE, &json!({ "path": "harbor-api/src/x.js" }))
+                .contains("Code / app_map")
+        );
     }
 
     #[test]

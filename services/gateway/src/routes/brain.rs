@@ -260,6 +260,8 @@ pub fn kind_of_tool(name: &str) -> &'static str {
         n if super::chat_work::is_work_tool(n) => super::chat_work::SOURCE_KEY,
         super::chat_setup::SETUP => super::chat_work::SOURCE_KEY,
         n if n.starts_with("github__") || n.starts_with("graph_") => "code",
+        // The app map is drawn from the code: it reads as code.
+        n if common::app_map::is_tool(n) => "code",
         n if n.contains("__") => "connections",
         _ => "data_sources",
     }
@@ -294,8 +296,10 @@ pub struct Thread {
     pub origin: String,
 }
 
-/// The one place besides Chat a thread can start: a knowledge base page.
+/// Places besides Chat a thread can start: a knowledge base page.
 pub const ORIGIN_KB_PAGE: &str = "kb_page";
+/// And the App map page's Ask box: the map's lookups go first.
+pub const ORIGIN_APP_MAP: &str = "app_map";
 
 /// One message of a thread.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -325,6 +329,23 @@ pub struct Message {
     /// The asker's rating of an answer: `up` or `down`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub feedback: Option<String>,
+    /// An answer that used the app map: the parts it involves (`parts`)
+    /// and, when it fits, the mini map of them (`graph`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub map: Option<Value>,
+}
+
+/// Largest mini map kept with a message (a message is one stored record);
+/// a larger one keeps only its parts, for the App map link.
+pub const MAX_KEPT_MAP_BYTES: usize = 200_000;
+
+/// The mini map as kept with its message.
+pub fn kept_map(map: Option<Value>) -> Option<Value> {
+    let m = map?;
+    if m.to_string().len() <= MAX_KEPT_MAP_BYTES {
+        return Some(m);
+    }
+    Some(json!({ "parts": m["parts"] }))
 }
 
 fn yes() -> bool {
@@ -1397,7 +1418,8 @@ pub struct AskBody {
     #[serde(default)]
     pub attachments: Vec<AttachmentRef>,
     /// `kb_page`: asked from a knowledge base page (counted against the
-    /// page's hourly limit, and marked on a new thread).
+    /// page's hourly limit, and marked on a new thread). `app_map`: asked
+    /// from the App map page (the map's lookups go first).
     #[serde(default)]
     pub origin: Option<String>,
 }
@@ -1471,6 +1493,9 @@ struct Run {
     github_linked: bool,
     /// The knowledge bases the asker may read, by name.
     kb_names: Vec<String>,
+    /// The team has a built app map this question may read (read at the
+    /// first map lookup).
+    has_map: bool,
 }
 
 impl Run {
@@ -1581,6 +1606,10 @@ fn tool_defs(run: &Run) -> Vec<Value> {
     if run.picks.code && run.github_token.is_some() {
         tools.extend(chat_code::defs(&run.code_repos));
     }
+    // The app map, when the team has one: how the app fits together.
+    if run.has_map {
+        tools.extend(common::app_map::tool_defs());
+    }
     if !run.kb_ids.is_empty() {
         tools.push(json!({
             "name": KNOWLEDGE_TOOL,
@@ -1655,6 +1684,7 @@ fn tool_label(name: &str, input: &Value) -> String {
         n if super::chat_work::is_work_tool(n) => super::chat_work::label(n, input),
         super::chat_setup::SETUP => "Checked Coderhelm's setup for the team".into(),
         n if n.starts_with("graph_") => chat_code::graph_label(n, input),
+        n if common::app_map::is_tool(n) => common::app_map::label(n, input),
         n if n.contains("__") => {
             let (server, tool) = n.split_once("__").unwrap_or((n, ""));
             format!("{server}: {}", tool.replace('_', " "))
@@ -2107,6 +2137,44 @@ struct BrainTools<'a> {
     used: Used,
     /// Tools called so far, for the schema-first check.
     called: Vec<String>,
+    /// The team's app map, read at the first map lookup.
+    map: Option<common::app_map::Lookups>,
+}
+
+impl BrainTools<'_> {
+    /// One map lookup, the map read the first time.
+    async fn map_lookup(
+        &mut self,
+        reg: &mut Registry,
+        name: &str,
+        input: &Value,
+    ) -> (String, String, bool) {
+        if self.map.is_none() && self.run.has_map {
+            let s = &self.run.state;
+            self.map = common::app_map::load_graph(&s.s3, &s.config.bucket_name, &self.run.team_id)
+                .await
+                .map(common::app_map::Lookups::new);
+        }
+        match self.map.as_mut() {
+            Some(m) => {
+                let (text, _, failed) = m.cite(reg, name, input);
+                (
+                    text,
+                    if failed {
+                        "Not on the map".into()
+                    } else {
+                        "Read".into()
+                    },
+                    failed,
+                )
+            }
+            None => (
+                "Error: the app map couldn't be read just now.".into(),
+                "Couldn't read".into(),
+                true,
+            ),
+        }
+    }
 }
 
 /// A query tool and the tool that reads its source's schema: a query before
@@ -2181,6 +2249,17 @@ impl Toolbox for BrainTools<'_> {
                         "Couldn't read".into(),
                         true,
                     ),
+                }
+            }
+            super::chat_policy::Checked::Run if common::app_map::is_tool(name) => {
+                if self.run.picks.allows("code") {
+                    self.map_lookup(reg, name, input).await
+                } else {
+                    (
+                        "That source isn't part of this question.".into(),
+                        "Not allowed".into(),
+                        true,
+                    )
                 }
             }
             super::chat_policy::Checked::Run => {
@@ -2432,6 +2511,7 @@ pub async fn brain_stream(
     }
 
     let from_page = body.origin.as_deref() == Some(ORIGIN_KB_PAGE);
+    let from_map = body.origin.as_deref() == Some(ORIGIN_APP_MAP);
     if from_page {
         super::knowledge_ask::count_ask(&state, &claims.team_id, &claims.email).await?;
     }
@@ -2463,6 +2543,8 @@ pub async fn brain_stream(
                 messages: 0,
                 origin: if from_page {
                     ORIGIN_KB_PAGE.to_string()
+                } else if from_map {
+                    ORIGIN_APP_MAP.to_string()
                 } else {
                     String::new()
                 },
@@ -2499,7 +2581,8 @@ pub async fn brain_stream(
     let readable: Vec<String> = readable_bases.iter().map(|b| b.id.clone()).collect();
     // What the question asks for, with the thread before it: it decides
     // the answer's shape, where it must look, and the notes.
-    let understood = super::chat_understand::read(&question, &history);
+    let mut understood = super::chat_understand::read(&question, &history);
+    understood.from_map = from_map;
     let all_repos = load_repos(&state, &claims.team_id).await;
     let repo_names: Vec<String> = all_repos.iter().map(|r| r.name.clone()).collect();
     let picks = resolve_picks(
@@ -2617,6 +2700,11 @@ pub async fn brain_stream(
     };
     // Code reads only when the question reads code.
     let github = github.filter(|_| picks.code && !code_repos.is_empty());
+    // The app map is drawn from the code: offered when code may be read and
+    // the team has a built map.
+    let has_map = picks.code
+        && base_open(crate::lookups::CODE)
+        && common::app_map::has_graph(&state.s3, &state.config.bucket_name, &claims.team_id).await;
     let picks_kbs = picks.knowledge.clone();
     let run = Run {
         state: state.clone(),
@@ -2651,6 +2739,7 @@ pub async fn brain_stream(
             .github_login
             .as_deref()
             .is_some_and(|l| !l.trim().is_empty()),
+        has_map,
     };
 
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(256);
@@ -2676,7 +2765,7 @@ pub async fn brain_stream(
             sink.send("done", json!({})).await;
             return;
         }
-        let Some((fin, used)) =
+        let Some((fin, used, map)) =
             answer(&run, &sink, &user_id, &question, &history, &attachments).await
         else {
             // The model couldn't be reached: the error was sent, nothing is kept.
@@ -2685,7 +2774,7 @@ pub async fn brain_stream(
         };
         sink.send(
             "answer",
-            json!({ "text": fin.text, "citations": fin.citations, "grounded": fin.grounded }),
+            json!({ "text": fin.text, "citations": fin.citations, "grounded": fin.grounded, "map": map }),
         )
         .await;
         // Keep the exchange.
@@ -2713,6 +2802,7 @@ pub async fn brain_stream(
             grounded: fin.grounded,
             used,
             at: now(),
+            map: kept_map(map),
             ..Default::default()
         };
         thread.messages = seq + 2;
@@ -2856,8 +2946,9 @@ pub fn mention_note(repos: &[RepoInfo], question: &str) -> String {
     )
 }
 
-/// Retrieves, runs the answer loop and finalizes the answer. None when the
-/// model couldn't be reached (the error was already sent).
+/// Retrieves, runs the answer loop and finalizes the answer, with the mini
+/// map of the parts its map lookups touched. None when the model couldn't be
+/// reached (the error was already sent).
 async fn answer(
     run: &Run,
     sink: &chat_agent::ChannelSink,
@@ -2865,7 +2956,7 @@ async fn answer(
     question: &str,
     history: &[Message],
     attachments: &[AttachmentRef],
-) -> Option<(Final, Vec<Value>)> {
+) -> Option<(Final, Vec<Value>, Option<Value>)> {
     let mut reg = Registry::default();
     let state = &run.state;
 
@@ -2941,7 +3032,7 @@ async fn answer(
         .await;
     // Nothing found and nothing to look up: say so without a model call.
     if reg.is_empty() && tools.is_empty() {
-        return Some((finalize("", &reg), Vec::new()));
+        return Some((finalize("", &reg), Vec::new(), None));
     }
 
     let mut notes = mention_note(&run.code_repos, question);
@@ -2979,6 +3070,7 @@ async fn answer(
         defs: tools,
         used: Used::default(),
         called: Vec::new(),
+        map: None,
     };
     let model = chat_agent::ApiModel {
         http: reqwest::Client::new(),
@@ -3008,7 +3100,11 @@ async fn answer(
         cited = out.fin.citations.len(),
         "Chat answered"
     );
-    Some((out.fin, out.used))
+    let map = toolbox
+        .map
+        .as_ref()
+        .and_then(|m| m.mini_map(&chrono::Utc::now().to_rfc3339()));
+    Some((out.fin, out.used, map))
 }
 
 #[cfg(test)]

@@ -119,6 +119,10 @@ pub struct Reading {
     pub newcomer: bool,
     /// The sentences of Chat's last answer the person questions.
     pub disputed: Vec<String>,
+    /// It asks how the app fits together: how something works, what
+    /// happens when, what calls what, what is behind a screen, which
+    /// service, where a request goes. The app map answers it first.
+    pub about_app: bool,
 }
 
 fn has(text: &str, words: &[&str]) -> bool {
@@ -317,6 +321,57 @@ const CORRECTION: &[&str] = &[
     "why did you say",
     "why do you say",
 ];
+
+/// How the app fits together: the app map's questions.
+const ABOUT_APP: &[&str] = &[
+    "what happens when",
+    "what happens if",
+    "what happens after",
+    "what calls",
+    "who calls",
+    "what uses",
+    "what's behind",
+    "what is behind",
+    "behind the",
+    "which service",
+    "what service",
+    "which part",
+    "fit together",
+    "fits together",
+    "talks to",
+    "connected to",
+    "connects to",
+    "flow of",
+    "end to end",
+];
+
+/// Words that end "how does X work": how something works, gets somewhere
+/// or is handled.
+const WORKS: &[&str] = &[
+    "work", "works", "get", "gets", "go", "goes", "flow", "flows", "handled", "wired",
+];
+
+/// "How does X work", "how do refunds get to Stripe", "where does the
+/// booking request go": "how" or "where", then does, do, is or are, then a
+/// working word within a few words.
+fn how_it_works(q: &str) -> bool {
+    let words: Vec<&str> = q
+        .split(|c: char| !c.is_alphanumeric() && c != '\'')
+        .filter(|w| !w.is_empty())
+        .collect();
+    words.windows(2).enumerate().any(|(i, w)| {
+        matches!(w[0], "how" | "where")
+            && matches!(w[1], "does" | "do" | "is" | "are")
+            && !matches!(words.get(i + 2).copied(), Some("i" | "we" | "you" | "one"))
+            && words.iter().skip(i + 3).take(8).any(|x| WORKS.contains(x))
+    })
+}
+
+/// The question asks how the app fits together.
+pub fn about_app(question: &str) -> bool {
+    let q = plain(question);
+    has(&q, ABOUT_APP) || how_it_works(&q)
+}
 
 /// Words of a greeting, a thanks or an acknowledgement.
 const SMALL: &[&str] = &[
@@ -528,6 +583,7 @@ pub fn read(question: &str, last_answer: Option<&str>, s: Signals) -> Reading {
         } else {
             Vec::new()
         },
+        about_app: matches!(intent, Intent::Lookup | Intent::HowTo) && about_app(question),
     }
 }
 
@@ -695,6 +751,34 @@ mod tests {
         assert!(Intent::NeedsMe.fixed_shape());
         assert!(Intent::SmallTalk.uncited_ok());
         assert!(!Intent::Orientation.uncited_ok() && !Intent::Correction.uncited_ok());
+    }
+
+    #[test]
+    fn how_the_app_fits_together_reads_as_a_map_question() {
+        for q in [
+            "What happens when someone books a slip?",
+            "how does booking a slip work",
+            "How do refunds get to Stripe?",
+            "what calls the bookings endpoint",
+            "What's behind the /slips/:id screen?",
+            "which service charges the card",
+            "where does the booking request go",
+            "how is the harbor website connected to the booking service",
+        ] {
+            let r = read(q, None, Signals::default());
+            assert!(r.about_app, "{q}");
+            assert!(matches!(r.intent, Intent::Lookup | Intent::HowTo), "{q}");
+        }
+        for q in [
+            "what can you do?",
+            "how do I add a knowledge base",
+            "where are we on the portal?",
+            "thanks!",
+            "what caused the enospc error?",
+            "should we roll back the last deploy?",
+        ] {
+            assert!(!read(q, None, Signals::default()).about_app, "{q}");
+        }
     }
 
     #[test]

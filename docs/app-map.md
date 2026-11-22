@@ -15,7 +15,8 @@ The App map shows how a team's app fits together across all its repositories. It
 
 - Recent work and Health, put into the map's own `recent` and `health.issues` fields when the gateway serves it, so Floorplan's viewer shows them natively. CoderHelm's findings are marked `source: "coderhelm"` and link to their pages; Floorplan's own checks are marked `Floorplan check`, and one at the same file and line as a CoderHelm finding is dropped.
 - The page's copy: read-only (Floorplan's exported mode), with the sandbox's folder left out.
-- Lookups for the read API and Ask (`/api/app-map/part`, `file`, `screen`, `search`, and `POST /api/app-map/ask`, which runs Chat's agent with those lookups).
+- Lookups for the read API (`/api/app-map/part`, `file`, `screen`, `search`).
+- The map lookups Chat and `/mcp` share (`common::app_map::Lookups`: `map_overview`, `map_find`, `map_part`, `map_screen`, `map_file`). Chat offers them when the team has a built map and reads the map at the first lookup; a question about how the app fits together gets them first (`chat_understand`). Each lookup is a citable source linking to the App map page focused on its parts, and an answer that used them carries a mini map of those parts (`map` on the answer and its saved message). The App map page's Ask box asks Chat (origin `app_map`), so its questions are kept in the person's chats. On `/mcp` the same lookups are read-only tools under `code:read`.
 
 ## Bumping Floorplan
 

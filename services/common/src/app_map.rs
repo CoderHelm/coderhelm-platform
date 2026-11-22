@@ -216,6 +216,17 @@ pub async fn load_graph(s3: &aws_sdk_s3::Client, bucket: &str, team_id: &str) ->
     (v["schema"] == GRAPH_SCHEMA).then_some(v)
 }
 
+/// Whether the team has a built map, without reading it (Chat offers the
+/// map lookups only then, and reads the map at its first lookup).
+pub async fn has_graph(s3: &aws_sdk_s3::Client, bucket: &str, team_id: &str) -> bool {
+    s3.head_object()
+        .bucket(bucket)
+        .key(graph_key(team_id))
+        .send()
+        .await
+        .is_ok()
+}
+
 // ── Repositories in the map ────────────────────────────────────────────────
 
 /// The folder each repository gets in the map: its name, or `owner-name`
@@ -790,6 +801,169 @@ pub fn sub_map(graph: &Value, parts: &BTreeSet<String>) -> Value {
     out
 }
 
+// ── The map lookups (Chat and /mcp) ────────────────────────────────────────
+
+/// The map lookups, in the order they are offered.
+pub const TOOLS: [&str; 5] = [
+    "map_overview",
+    "map_find",
+    "map_part",
+    "map_screen",
+    "map_file",
+];
+
+pub fn is_tool(name: &str) -> bool {
+    TOOLS.contains(&name)
+}
+
+/// The map lookups, as Chat's model reads them (`input_schema`).
+pub fn tool_defs() -> Vec<Value> {
+    let obj = |props: Value, req: &[&str]| json!({"type": "object", "properties": props, "required": req});
+    vec![
+        json!({"name": TOOLS[0], "description": "The app map in short: every part (id, name, kind, what it does), the screens, the Health counts and the repositories. Start here for how the app fits together.", "input_schema": obj(json!({}), &[])}),
+        json!({"name": TOOLS[1], "description": "Search the app map: parts, files, endpoints and screens whose names, descriptions or paths hold every word.", "input_schema": obj(json!({"query": {"type": "string"}}), &["query"])}),
+        json!({"name": TOOLS[2], "description": "One part of the app map by id: its sub-parts, files, endpoints, and the lines in and out (imports, web requests matched to endpoints, outside services).", "input_schema": obj(json!({"id": {"type": "string"}}), &["id"])}),
+        json!({"name": TOOLS[3], "description": "Everything behind one screen, by its id or its address (like /slips/:id), step by step: the files it uses, the requests it makes, the server code that answers and the outside services behind it.", "input_schema": obj(json!({"screen": {"type": "string"}}), &["screen"])}),
+        json!({"name": TOOLS[4], "description": "One file by its path on the app map (repository folder first, like harbor-api/src/bookings.js): what it is, its endpoints and what it connects to.", "input_schema": obj(json!({"path": {"type": "string"}}), &["path"])}),
+    ]
+}
+
+/// The map lookups over one team's map. Records the map ids its lookups
+/// returned, for the mini map of the parts an answer involves.
+#[derive(Debug, Clone)]
+pub struct Lookups {
+    pub graph: Value,
+    pub ids: Vec<String>,
+}
+
+impl Lookups {
+    pub fn new(graph: Value) -> Self {
+        Self {
+            graph,
+            ids: Vec::new(),
+        }
+    }
+
+    fn note(&mut self, v: &Value) {
+        let mut stack = vec![v];
+        while let Some(x) = stack.pop() {
+            match x {
+                Value::Object(o) => {
+                    if let Some(id) = o.get("id").and_then(|i| i.as_str()) {
+                        self.ids.push(id.to_string());
+                    }
+                    if let Some(p) = o.get("path").and_then(|i| i.as_str()) {
+                        self.ids.push(format!("f:{p}"));
+                    }
+                    stack.extend(o.values());
+                }
+                Value::Array(a) => stack.extend(a.iter()),
+                _ => {}
+            }
+        }
+    }
+
+    /// Runs one lookup: (what it found, its label). What it found holds an
+    /// `error` when the map has no such thing.
+    pub fn lookup(&mut self, name: &str, input: &Value) -> (Value, String) {
+        let s = |k: &str| input[k].as_str().unwrap_or("").trim().to_string();
+        let v = match name {
+            "map_overview" => overview(&self.graph),
+            "map_find" => search(&self.graph, &s("query")),
+            "map_part" => part_view(&self.graph, &s("id")).unwrap_or_else(
+                || json!({"error": "No part has that id; use map_overview or map_find for ids."}),
+            ),
+            "map_screen" => screen_view(&self.graph, &s("screen")).unwrap_or_else(
+                || json!({"error": "No screen has that id or address; use map_overview."}),
+            ),
+            "map_file" => file_view(&self.graph, &s("path"))
+                .unwrap_or_else(|| json!({"error": "That file isn't on the map."})),
+            _ => json!({"error": "Unknown lookup."}),
+        };
+        let label = label(name, input);
+        if v.get("error").is_none() && !matches!(name, "map_overview" | "map_find") {
+            self.note(&v);
+        }
+        (v, label)
+    }
+
+    /// Runs one lookup and registers what it found as a citable source.
+    /// Returns (what the model reads, the label, failed).
+    pub fn cite(
+        &mut self,
+        reg: &mut crate::knowledge::answer::Registry,
+        name: &str,
+        input: &Value,
+    ) -> (String, String, bool) {
+        let (v, label) = self.lookup(name, input);
+        let failed = v.get("error").is_some();
+        let text = crate::truncate_str(&v.to_string(), 30_000).to_string();
+        if failed {
+            return (text, label, true);
+        }
+        let id = reg.add(crate::knowledge::answer::SourceRef {
+            kind: SOURCE_KIND.into(),
+            title: label.clone(),
+            loc: "App map".into(),
+            passage: crate::truncate_str(&text, 1_200).to_string(),
+            href: Some(page_link(&self.parts())),
+            ..Default::default()
+        });
+        (format!("[{id}] {text}"), label, false)
+    }
+
+    /// The top-level parts the lookups so far touched.
+    pub fn parts(&self) -> Vec<String> {
+        parts_of(&self.graph, &self.ids).into_iter().collect()
+    }
+
+    /// The parts the lookups touched, as a smaller map the same viewer
+    /// draws, with their ids; `None` when they touched none.
+    pub fn mini_map(&self, now: &str) -> Option<Value> {
+        let parts: BTreeSet<String> = parts_of(&self.graph, &self.ids);
+        if parts.is_empty() {
+            return None;
+        }
+        Some(json!({
+            "graph": for_viewer(sub_map(&self.graph, &parts), now),
+            "parts": parts.into_iter().collect::<Vec<_>>(),
+        }))
+    }
+}
+
+/// What a lookup is shown as: "Searched the app map for slip".
+pub fn label(name: &str, input: &Value) -> String {
+    let s = |k: &str| crate::truncate_str(input[k].as_str().unwrap_or("").trim(), 80).to_string();
+    match name {
+        "map_overview" => "Read the app map".into(),
+        "map_find" => format!("Searched the app map for {}", s("query")),
+        "map_part" => format!("Opened the part {} on the app map", s("id")),
+        "map_screen" => format!("Followed the screen {} on the app map", s("screen")),
+        "map_file" => format!("Opened {} on the app map", s("path")),
+        _ => name.to_string(),
+    }
+}
+
+/// The source kind of a map lookup.
+pub const SOURCE_KIND: &str = "app_map";
+
+/// The App map page, focused on `parts` when there are any.
+pub fn page_link(parts: &[String]) -> String {
+    if parts.is_empty() {
+        return "/app-map".into();
+    }
+    let ids: Vec<String> = parts
+        .iter()
+        .take(10)
+        .map(|p| {
+            p.chars()
+                .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
+                .collect()
+        })
+        .collect();
+    format!("/app-map?focus={}", ids.join(","))
+}
+
 // ── Model answers ──────────────────────────────────────────────────────────
 
 /// Problems with `v` against `schema`, for the JSON Schema subset Floorplan's
@@ -1048,6 +1222,57 @@ mod tests {
             .unwrap()
             .iter()
             .all(|l| l["a"].as_str().unwrap().starts_with("f:harbor-api")));
+    }
+
+    /// The lookups Chat and /mcp share: they answer from the map, register
+    /// each answer as a source that links to the page focused on its parts,
+    /// and draw the parts they touched.
+    #[test]
+    fn the_lookups_answer_from_the_map_cite_it_and_draw_what_they_touched() {
+        let mut b = Lookups::new(harbor());
+        let mut reg = crate::knowledge::answer::Registry::default();
+        let (text, label, failed) =
+            b.cite(&mut reg, "map_screen", &json!({"screen": "/slips/:id"}));
+        assert!(!failed && text.starts_with("[S1] "), "{text}");
+        assert_eq!(label, "Followed the screen /slips/:id on the app map");
+        let s = reg.get("S1").unwrap();
+        assert_eq!(s.kind, SOURCE_KIND);
+        assert_eq!(s.href.as_deref(), Some("/app-map?focus=api,stripe,web"));
+        let (v, _) = b.lookup("map_screen", &json!({"screen": "/slips/:id"}));
+        assert_eq!(
+            v["behind"].as_array().unwrap().last().unwrap()["step"],
+            "outside"
+        );
+        // Nothing found is no source.
+        let (_, _, failed) = b.cite(&mut reg, "map_part", &json!({"id": "nope"}));
+        assert!(failed);
+        assert_eq!(reg.len(), 1);
+        let mini = b.mini_map("2026-11-21T00:00:00Z").unwrap();
+        let parts: Vec<&str> = mini["graph"]["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|n| n["id"].as_str())
+            .collect();
+        assert_eq!(parts, vec!["web", "api", "stripe"]);
+        assert_eq!(mini["parts"], json!(["api", "stripe", "web"]));
+        assert_eq!(mini["graph"]["meta"]["exported"]["by"], "Coderhelm");
+        // The overview and a search touch no part: no mini map.
+        let mut b = Lookups::new(harbor());
+        b.lookup("map_overview", &json!({}));
+        b.lookup("map_find", &json!({"query": "slip"}));
+        assert!(b.mini_map("now").is_none());
+        let names: Vec<String> = tool_defs()
+            .iter()
+            .filter_map(|d| d["name"].as_str().map(str::to_string))
+            .collect();
+        assert_eq!(names, TOOLS);
+        assert!(is_tool("map_part") && !is_tool("search_code"));
+        assert_eq!(page_link(&[]), "/app-map");
+        assert_eq!(
+            page_link(&["a b".into(), "c".into()]),
+            "/app-map?focus=ab,c"
+        );
     }
 
     #[test]

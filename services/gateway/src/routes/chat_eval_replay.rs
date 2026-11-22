@@ -109,6 +109,21 @@ pub fn replay_fixture() -> (MemHost, Vec<RepoInfo>) {
     (host, repos)
 }
 
+/// The team's app map: the made-up harbor app Floorplan's fixture draws
+/// (the website, the booking service and Stripe), over the team's two
+/// repositories.
+pub fn harbor_map() -> Value {
+    let mut g: Value = serde_json::from_str(include_str!(
+        "../../../worker/floorplan/fixtures/harbor-graph.json"
+    ))
+    .expect("harbor-graph.json");
+    common::app_map::stamp_repos(
+        &mut g,
+        &common::app_map::folders(&[super::chat_eval::WEB.into(), super::chat_eval::API.into()]),
+    );
+    g
+}
+
 /// The team's knowledge passages: `(file, page, text)`.
 pub const KNOWLEDGE: &[(&str, &str, &str)] = &[
     (
@@ -261,21 +276,33 @@ pub fn team_setup(store: &WorkStore) -> super::chat_setup::Setup {
     }
 }
 
-/// Every tool the team's Chat has: code, work, knowledge, logs, skills,
-/// and the side's own tools ([`side_tools`]).
+/// Every tool the team's Chat has: code, the app map, work, knowledge,
+/// logs, skills, and the side's own tools ([`side_tools`]).
 pub struct ReplayBox<'a> {
     pub code: CodeBox<'a>,
     pub work: WorkBox<'a>,
     pub defs: Vec<Value>,
     pub store: &'a WorkStore,
+    /// The team's app map, as `brain::BrainTools` reads it.
+    pub map: Option<common::app_map::Lookups>,
 }
 
 impl<'a> ReplayBox<'a> {
-    pub fn new(host: &'a MemHost, repos: &[RepoInfo], store: &'a WorkStore) -> Self {
+    /// The team with its app map (`None`: not built yet).
+    pub fn with_map(
+        host: &'a MemHost,
+        repos: &[RepoInfo],
+        store: &'a WorkStore,
+        map: Option<Value>,
+    ) -> Self {
         let code = CodeBox::new(host, repos.to_vec());
         let all: Vec<&'static str> = work::KINDS.iter().map(|k| k.key).collect();
         let work = WorkBox::new(store, TEAM, all);
         let mut defs = code.defs.clone();
+        // As `brain::tool_defs`: the map after the code, when it is built.
+        if map.is_some() {
+            defs.extend(common::app_map::tool_defs());
+        }
         defs.push(json!({
             "name": KNOWLEDGE_TOOL,
             "description": "Search the team's knowledge bases again with different words. Returns passages as <source> blocks you can cite.",
@@ -300,6 +327,7 @@ impl<'a> ReplayBox<'a> {
             work,
             defs,
             store,
+            map: map.map(common::app_map::Lookups::new),
         }
     }
 }
@@ -337,6 +365,19 @@ impl Toolbox for ReplayBox<'_> {
         match name {
             n if super::chat_code::is_code_tool(n) => self.code.call(reg, sink, name, input).await,
             n if work::is_work_tool(n) => self.work.call(reg, sink, name, input).await,
+            n if common::app_map::is_tool(n) => match self.map.as_mut() {
+                Some(m) => {
+                    let (text, label, is_error) = m.cite(reg, name, input);
+                    Called::Done {
+                        text,
+                        label,
+                        summary: String::new(),
+                        is_error,
+                        kind: "code".into(),
+                    }
+                }
+                None => done(format!("Unknown tool: {name}"), name, "Unknown", ""),
+            },
             KNOWLEDGE_TOOL => {
                 let found = search_knowledge(input["query"].as_str().unwrap_or(""));
                 if found.is_empty() {
@@ -467,8 +508,22 @@ pub async fn replay(
     store: &WorkStore,
     case: &ReplayCase,
 ) -> (Answered, Registry) {
+    let (out, reg, _) = replay_with(model, host, repos, store, case, Some(harbor_map())).await;
+    (out, reg)
+}
+
+/// [`replay`] with the team's app map (`None`: not built yet). Also gives
+/// the mini map the answer carries, as `brain::answer` does.
+pub async fn replay_with(
+    model: &dyn chat_agent::Model,
+    host: &MemHost,
+    repos: &[RepoInfo],
+    store: &WorkStore,
+    case: &ReplayCase,
+    map: Option<Value>,
+) -> (Answered, Registry, Option<Value>) {
     let history = history_of(case);
-    let mut tb = ReplayBox::new(host, repos, store);
+    let mut tb = ReplayBox::with_map(host, repos, store, map);
     let mut reg = Registry::default();
     // Knowledge first, in code, as production retrieves it.
     let first = add_passages(
@@ -494,7 +549,11 @@ pub async fn replay(
     )
     .await
     .unwrap_or_else(|_| panic!("{}: the model couldn't be reached", case.name));
-    (out, reg)
+    let mini = tb
+        .map
+        .as_ref()
+        .and_then(|m| m.mini_map("2026-11-21T00:00:00Z"));
+    (out, reg, mini)
 }
 
 // ── The judge ───────────────────────────────────────────────────────────────
@@ -592,6 +651,13 @@ mod tests {
     #[test]
     fn every_case_reads_as_the_kind_of_question_it_is() {
         let all = cases();
+        // The map questions read as questions about how the app fits together.
+        let map: Vec<&ReplayCase> = all.iter().filter(|c| c.name.starts_with("map: ")).collect();
+        assert!(map.len() >= 3, "{}", map.len());
+        for c in &map {
+            let u = super::super::chat_understand::read(&c.question, &history_of(c));
+            assert!(u.about_app(), "{}", c.name);
+        }
         assert!(all.len() >= 40, "{}", all.len());
         assert!(all.iter().filter(|c| c.origin == "real").count() >= 8);
         let mut wrong = Vec::new();
@@ -784,6 +850,75 @@ mod tests {
         let (out, _) = replay(&model, &host, &repos, &store, &logs).await;
         assert!(out.rechecked && out.fin.grounded);
         assert!(out.fin.text.starts_with("Yes: an AWS account is connected"));
+    }
+
+    /// A question about how the app fits together, on the harbor team with
+    /// its map built: the map lookups come first, the model is told to start
+    /// there, the answer cites the map, and it carries the mini map of the
+    /// parts it involves.
+    #[tokio::test]
+    async fn offline_what_happens_when_someone_books_a_slip_reads_the_map_first() {
+        let c = case("map: what happens when someone books a slip");
+        let (host, repos) = replay_fixture();
+        let store = work_store();
+        let steps: Vec<Step> = vec![
+            Box::new(|b| {
+                // The map's lookups are offered first, and the note says why.
+                assert_eq!(b["tools"][0]["name"], "map_overview", "{}", b["tools"]);
+                let first = b["messages"].to_string();
+                assert!(first.contains("start from the app map"), "{first}");
+                calls("m", "map_screen", json!({"screen": "/slips/:id"}))
+            }),
+            Box::new(|b| {
+                let r = super::super::chat_agent::testing::last_result(b);
+                assert!(r.contains("[S1]") && r.contains("Stripe"), "{r}");
+                say("Booking a slip:\n1. The slip page on the Harbor website sends the booking to the booking service [S1].\n2. The booking service saves it and charges the card through Stripe [S1].")
+            }),
+        ];
+        let model = Scripted::new(steps, vec![r#"{"hands_back": false}"#]);
+        let (out, reg, mini) =
+            replay_with(&model, &host, &repos, &store, &c, Some(harbor_map())).await;
+        assert_eq!(out.calls, ["map_screen"]);
+        assert!(out.fin.grounded);
+        let cited = &out.fin.citations[0];
+        assert_eq!(cited.kind, common::app_map::SOURCE_KIND);
+        assert_eq!(cited.title, "Followed the screen /slips/:id on the app map");
+        assert_eq!(cited.href.as_deref(), Some("/app-map?focus=api,stripe,web"));
+        assert_eq!(reg.len(), 1);
+        let mini = mini.expect("a mini map");
+        assert_eq!(mini["parts"], json!(["api", "stripe", "web"]));
+        assert_eq!(mini["graph"]["schema"], "floorplan/graph@1");
+    }
+
+    /// The same question with no map built: no map lookups are offered, and
+    /// the answer is told to say so in one line and read the code.
+    #[tokio::test]
+    async fn offline_no_map_means_no_map_lookups_and_a_one_line_note() {
+        let c = case("map: what happens when someone books a slip");
+        let (host, repos) = replay_fixture();
+        let store = work_store();
+        let steps: Vec<Step> = vec![
+            Box::new(|b| {
+                let names: Vec<&str> = b["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|t| t["name"].as_str())
+                    .collect();
+                assert!(!names.iter().any(|n| n.starts_with("map_")), "{names:?}");
+                let first = b["messages"].to_string();
+                assert!(first.contains("the team has no app map yet"), "{first}");
+                calls("c", "github__search_code", json!({"query": "bookings"}))
+            }),
+            Box::new(|_| {
+                say("There's no app map yet; it can be built on the App map page. From the code: the booking service takes the booking [S1].")
+            }),
+        ];
+        let model = Scripted::new(steps, vec![r#"{"hands_back": false}"#]);
+        let (out, _, mini) = replay_with(&model, &host, &repos, &store, &c, None).await;
+        assert_eq!(out.calls, ["github__search_code"]);
+        assert!(out.fin.text.starts_with("There's no app map yet"));
+        assert!(mini.is_none());
     }
 
     #[test]
