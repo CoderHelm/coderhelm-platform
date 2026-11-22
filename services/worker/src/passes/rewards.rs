@@ -98,16 +98,17 @@ const MAX_PATCH_COMMITS: usize = 5;
 
 /// What people changed on top of CoderHelm's work: their own non-merge
 /// commits, each measured by its own stats. `None` when GitHub couldn't say
-/// for any of them (then no merged-after-edits event is guessed).
+/// for any of them (then no merged-after-edits event is guessed). GitHub
+/// holding or refusing a read for a while is a wait for the whole score.
 async fn people_edits(
     github: &GitHubClient,
     owner: &str,
     name: &str,
     commits: &[serde_json::Value],
-) -> Option<mapping::PeopleEdits> {
+) -> Result<Option<mapping::PeopleEdits>, OutcomeError> {
     let mine = common::pr_outcome::human_edit_commits(commits);
     if mine.is_empty() {
-        return Some(mapping::PeopleEdits::default());
+        return Ok(Some(mapping::PeopleEdits::default()));
     }
     let mut lines = 0u64;
     let mut read = 0usize;
@@ -118,7 +119,7 @@ async fn people_edits(
         let Some(sha) = c["sha"].as_str() else {
             continue;
         };
-        if let Ok((n, files)) = github.commit_stats(owner, name, sha).await {
+        if let Some((n, files)) = needed(github.commit_stats(owner, name, sha).await)? {
             read += 1;
             lines += n;
             for f in files {
@@ -128,7 +129,7 @@ async fn people_edits(
         // What they changed, for the lesson: their first few commits' own
         // patches (a later one overrides an earlier one on the same file).
         if i < MAX_PATCH_COMMITS {
-            if let Ok(files) = github.commit_changes(owner, name, sha).await {
+            if let Some(files) = needed(github.commit_changes(owner, name, sha).await)? {
                 for f in files {
                     patches.retain(|(p, _)| p != &f.path);
                     patches.push((f.path, f.patch));
@@ -141,17 +142,17 @@ async fn people_edits(
         }
     }
     if read == 0 {
-        return None;
+        return Ok(None);
     }
     let mut files: Vec<(String, usize)> = touched.into_iter().collect();
     files.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-    Some(mapping::PeopleEdits {
+    Ok(Some(mapping::PeopleEdits {
         commits: mine.len() as u64,
         lines,
         files: files.into_iter().map(|(f, _)| f).collect(),
         subjects,
         diff: mapping::diff_excerpts(&patches),
-    })
+    }))
 }
 
 /// Why people closed a run's PR, when they said: the reason picked when the
@@ -242,7 +243,68 @@ async fn add_example(state: &WorkerState, team_id: &str, mut ex: Exemplar, score
 
 // ── Outcomes of a closed pull request ─────────────────────────────────
 
-pub async fn score_outcome(state: &WorkerState, msg: RewardOutcomeMessage) -> Result<(), String> {
+/// Why scoring a closed pull request didn't finish.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutcomeError {
+    /// GitHub held or refused the scoring's requests for a while (its
+    /// budget kept for runs, its rate limit, a moment it failed): nothing
+    /// was recorded, and the outcome is scored again after `secs`.
+    Wait {
+        cause: common::github_wait::Cause,
+        secs: u64,
+    },
+    /// Anything else. Nothing was recorded that can't be recorded again;
+    /// the sweep tries it again a bounded number of times.
+    Failed(String),
+}
+
+impl std::fmt::Display for OutcomeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OutcomeError::Wait { cause, secs } => {
+                let until = chrono::Utc::now().timestamp().max(0) as u64 + secs;
+                f.write_str(&common::github_wait::waiting_text(*cause, until))
+            }
+            OutcomeError::Failed(e) => f.write_str(e),
+        }
+    }
+}
+
+/// A GitHub error as an outcome error: a wait when GitHub held or refused
+/// the request for a while, else a failure.
+pub fn outcome_error(e: &(dyn std::error::Error + 'static)) -> OutcomeError {
+    match crate::clients::github::outside_wait(e) {
+        Some((cause, secs)) => OutcomeError::Wait { cause, secs },
+        None => OutcomeError::Failed(e.to_string()),
+    }
+}
+
+/// A read the score depends on: its value, None when GitHub had no answer
+/// for it, or the wait when GitHub held or refused it (then nothing is
+/// recorded, and the outcome is scored whole after the wait).
+fn needed<T>(
+    r: Result<T, Box<dyn std::error::Error + Send + Sync>>,
+) -> Result<Option<T>, OutcomeError> {
+    match r {
+        Ok(v) => Ok(Some(v)),
+        Err(e) => match outcome_error(&*e) {
+            w @ OutcomeError::Wait { .. } => Err(w),
+            OutcomeError::Failed(_) => Ok(None),
+        },
+    }
+}
+
+/// GitHub requests one scoring makes at most (the pull request, its
+/// commits and people's commits, the compare, the review threads and what
+/// the lesson reads): it starts only when the learning share of the
+/// installation's budget has that many left, so a scoring isn't cut off
+/// halfway by the budget.
+pub const SCORING_REQUESTS: u64 = 12;
+
+pub async fn score_outcome(
+    state: &WorkerState,
+    msg: RewardOutcomeMessage,
+) -> Result<(), OutcomeError> {
     let repo = format!("{}/{}", msg.repo_owner, msg.repo_name);
     let github = GitHubClient::new(
         &state.secrets.github_app_id,
@@ -250,7 +312,12 @@ pub async fn score_outcome(state: &WorkerState, msg: RewardOutcomeMessage) -> Re
         msg.installation_id,
         &state.http,
     )
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| OutcomeError::Failed(e.to_string()))?;
+    if let Some((cause, secs)) =
+        super::learning_wait::budget_wait(state, msg.installation_id, SCORING_REQUESTS).await
+    {
+        return Err(OutcomeError::Wait { cause, secs });
+    }
     match msg.trigger.as_str() {
         common::rewards::TRIGGER_REVERTED => return learn_from_revert(state, &github, &msg).await,
         common::rewards::TRIGGER_GUIDE_CLOSED => {
@@ -263,13 +330,14 @@ pub async fn score_outcome(state: &WorkerState, msg: RewardOutcomeMessage) -> Re
                 msg.pr_number,
             )
             .await
+            .map_err(OutcomeError::Failed)
         }
         _ => {}
     }
     let pr = github
         .get_pull_request(&msg.repo_owner, &msg.repo_name, msg.pr_number)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| outcome_error(&*e))?;
     let closed_at = pr["closed_at"].as_str().unwrap_or("").to_string();
     let merged = pr["merged_at"].as_str().is_some_and(|m| !m.is_empty());
     let coder = !msg.review_only && !msg.run_id.is_empty();
@@ -282,10 +350,11 @@ pub async fn score_outcome(state: &WorkerState, msg: RewardOutcomeMessage) -> Re
         let run = load_run(state, &msg.team_id, &msg.run_id)
             .await
             .unwrap_or_default();
-        let commits = github
-            .list_pr_commits(&msg.repo_owner, &msg.repo_name, msg.pr_number)
-            .await
-            .ok();
+        let commits = needed(
+            github
+                .list_pr_commits(&msg.repo_owner, &msg.repo_name, msg.pr_number)
+                .await,
+        )?;
         let human = commits
             .as_deref()
             .map(common::pr_outcome::human_commit_count);
@@ -293,17 +362,19 @@ pub async fn score_outcome(state: &WorkerState, msg: RewardOutcomeMessage) -> Re
         // merge of the base branch brings other work and is not an edit).
         let edits = match (human, commits.as_deref()) {
             (Some(n), Some(c)) if n > 0 => {
-                people_edits(&github, &msg.repo_owner, &msg.repo_name, c).await
+                people_edits(&github, &msg.repo_owner, &msg.repo_name, c).await?
             }
             _ => None,
         };
         let head = pr["head"]["sha"].as_str().unwrap_or("").to_string();
         let base = pr["base"]["sha"].as_str().unwrap_or("").to_string();
         let paths = if !base.is_empty() && !head.is_empty() {
-            github
-                .compare_changed_files(&msg.repo_owner, &msg.repo_name, &base, &head)
-                .await
-                .unwrap_or_default()
+            needed(
+                github
+                    .compare_changed_files(&msg.repo_owner, &msg.repo_name, &base, &head)
+                    .await,
+            )?
+            .unwrap_or_default()
         } else {
             vec![]
         };
@@ -357,10 +428,11 @@ pub async fn score_outcome(state: &WorkerState, msg: RewardOutcomeMessage) -> Re
     // What became of each of CoderHelm's review comments, notes (Nit,
     // Suggestion) as much as blockers, on its own PRs and on people's.
     if !closed_at.is_empty() {
-        if let Ok(threads) = github
-            .list_bot_review_threads(&msg.repo_owner, &msg.repo_name, msg.pr_number)
-            .await
-        {
+        if let Some(threads) = needed(
+            github
+                .list_bot_review_threads(&msg.repo_owner, &msg.repo_name, msg.pr_number)
+                .await,
+        )? {
             let review = latest_review(state, &msg.team_id, &repo, msg.pr_number).await;
             events.extend(thread_events(
                 &msg.team_id,
@@ -375,7 +447,11 @@ pub async fn score_outcome(state: &WorkerState, msg: RewardOutcomeMessage) -> Re
     }
 
     let st = store(state);
-    let fresh = st.record_all(&events).await;
+    // Each signal once, kept whole or not at all: a retry of an outcome
+    // already scored adds nothing, and one not kept yet is tried again.
+    let fresh = common::rewards::store::add_all_once(&st, &events)
+        .await
+        .map_err(OutcomeError::Failed)?;
     let findings = events
         .iter()
         .filter(|e| e.kind.is_some_and(RewardKind::is_finding))
@@ -558,16 +634,18 @@ async fn learn_from_revert(
     state: &WorkerState,
     github: &GitHubClient,
     msg: &RewardOutcomeMessage,
-) -> Result<(), String> {
+) -> Result<(), OutcomeError> {
     let repo = format!("{}/{}", msg.repo_owner, msg.repo_name);
     let run = load_run(state, &msg.team_id, &msg.run_id)
         .await
         .unwrap_or_default();
-    learn_from_setbacks(state, &msg.team_id, &repo, &gs(&run, "reward_area")).await;
+    // The pull request first: a wait for GitHub comes before anything is
+    // learned, so the retry learns it once.
     let pr = github
         .get_pull_request(&msg.repo_owner, &msg.repo_name, msg.pr_number)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| outcome_error(&*e))?;
+    learn_from_setbacks(state, &msg.team_id, &repo, &gs(&run, "reward_area")).await;
     let outcome = super::outcome_learning::Outcome {
         repo,
         pr: msg.pr_number,
@@ -1256,6 +1334,7 @@ mod tests {
             pr: 7,
             closed_at: "2026-11-05T10:00:00Z".into(),
             variant: "standard".into(),
+            ..Default::default()
         }];
         let arms = vec![health::ArmPull {
             agent: rev::AGENT_CODER.into(),

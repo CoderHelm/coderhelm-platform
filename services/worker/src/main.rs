@@ -515,17 +515,17 @@ async fn handle_message_inner(state: Arc<WorkerState>, message: models::WorkerMe
         }
         models::WorkerMessage::Lesson(msg) => {
             info!(team_id = %msg.team_id, run_id = %msg.run_id, trigger = %msg.trigger, "Lesson on where the fix belongs");
-            if let Err(e) = passes::lessons::run(&state, msg).await {
-                error!("Lesson failed: {e:?}");
-            }
+            // GitHub holding the lesson's requests is a wait: the job goes
+            // on after the reset (`learning_wait`).
+            passes::learning_wait::on_lesson(&state, msg).await;
         }
         models::WorkerMessage::RewardOutcome(msg) => {
             info!(team_id = %msg.team_id, run_id = %msg.run_id, pr = msg.pr_number, "Scoring a closed pull request");
             let (team_id, run_id) = (msg.team_id.clone(), msg.run_id.clone());
-            let follow = !run_id.is_empty() && !msg.review_only;
-            if let Err(e) = passes::rewards::score_outcome(&state, msg).await {
-                error!("Reward outcome failed: {e}");
-            }
+            let follow = !run_id.is_empty() && !msg.review_only && !msg.rescore;
+            // A scoring GitHub held waits and goes on; one that failed is
+            // noted for the sweep. Never consumed silently.
+            passes::learning_wait::on_outcome(&state, msg).await;
             // The same pull request's merge is followed now, whoever merged
             // it: its deploys and its release (`pr_watch`).
             if follow {
@@ -713,6 +713,9 @@ async fn handle_message_inner(state: Arc<WorkerState>, message: models::WorkerMe
             {
                 error!("Merged PR backfill failed: {e:?}");
             }
+            // Closed pull requests with no score yet, by the learning
+            // page's own rule: their scoring is sent again, a few a tick.
+            as_sweep(who::SWEEP_LEARNING, passes::learning_wait::sweep(&state)).await;
             // Lessons kept from before placeholders were refused when
             // learned: removed once per install.
             passes::lesson_cleanup::run_once(&state).await;
