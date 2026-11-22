@@ -325,6 +325,22 @@
               "null"
             ]
           },
+          "success_criteria": {
+            "description": "What done means for the whole plan: short checkable lines. Each task\nnames the ones it covers (`covers`); without a list, each task's\nacceptance criteria are the plan's.",
+            "examples": [
+              [
+                "The 11th login attempt within 15 minutes gets 429",
+                "The page says when to try again"
+              ]
+            ],
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
           "tasks": {
             "description": "The plan's tasks, in order. Each starts as `draft`.",
             "examples": [
@@ -1737,6 +1753,76 @@
         ],
         "type": "object"
       },
+      "NeedsYou": {
+        "description": "Something a person has to do for the plan to go on (the shape of\n`common::plan_state::NeedsItem`, for the API document).",
+        "properties": {
+          "action": {
+            "description": "The button: `answer`, `open_pr`, `open_link`, `retry` or `approve`.",
+            "examples": [
+              "open_pr"
+            ],
+            "type": "string"
+          },
+          "ask": {
+            "description": "What to do, one line.",
+            "examples": [
+              "Approve pull request #318"
+            ],
+            "type": "string"
+          },
+          "detail": {
+            "description": "Why, or what is open.",
+            "examples": [
+              "This repo's auto-merge setting requires an approving review from a person."
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "kind": {
+            "description": "`answer`, `review`, `approval`, `checks`, `merge`, `failed`,\n`closed_pr` or `approve_rest`.",
+            "examples": [
+              "approval"
+            ],
+            "type": "string"
+          },
+          "run_id": {
+            "description": "The run it comes from.",
+            "examples": [
+              "01JB8X6F4M2C9QZ3T7V5W1K0HA"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "task_id": {
+            "description": "The task it is about; empty for the plan's drafts.",
+            "examples": [
+              "01JB8V0P8Q2S4U6W8Y0A2C4E6G"
+            ],
+            "type": "string"
+          },
+          "url": {
+            "description": "Where to do it.",
+            "examples": [
+              "https://github.com/acme/web/pull/318"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "task_id",
+          "kind",
+          "ask",
+          "action"
+        ],
+        "type": "object"
+      },
       "NewPlanTask": {
         "description": "A task in a new plan.",
         "properties": {
@@ -1747,6 +1833,21 @@
             ],
             "type": [
               "string",
+              "null"
+            ]
+          },
+          "covers": {
+            "description": "The plan's success criteria this task covers, by id (`C1` is the\nfirst of `success_criteria`).",
+            "examples": [
+              [
+                "C1"
+              ]
+            ],
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
               "null"
             ]
           },
@@ -1831,6 +1932,18 @@
       "Plan": {
         "description": "A plan.",
         "properties": {
+          "attempts": {
+            "description": "Runs its tasks took, every attempt counted.",
+            "examples": [
+              6
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "chat_id": {
             "description": "The plan chat it came from.",
             "examples": [
@@ -1841,6 +1954,28 @@
               "null"
             ]
           },
+          "cost_usd": {
+            "description": "What its tasks' runs cost so far, in US dollars, every attempt counted.",
+            "examples": [
+              18.4
+            ],
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "counts": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TaskCounts",
+                "description": "How many tasks are in each state."
+              }
+            ]
+          },
           "created_at": {
             "description": "When it was made (RFC 3339).",
             "examples": [
@@ -1848,6 +1983,30 @@
             ],
             "type": [
               "string",
+              "null"
+            ]
+          },
+          "criteria_count": {
+            "description": "How many success criteria it has.",
+            "examples": [
+              5
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "criteria_met": {
+            "description": "Success criteria the work proved, of `criteria_count`.",
+            "examples": [
+              3
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
               "null"
             ]
           },
@@ -1891,6 +2050,16 @@
               "null"
             ]
           },
+          "last_activity_at": {
+            "description": "When anything last happened on its tasks (RFC 3339).",
+            "examples": [
+              "2026-10-23T09:12:00+00:00"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "mcp_servers": {
             "description": "MCP servers used while planning.",
             "examples": [
@@ -1905,6 +2074,15 @@
               "array",
               "null"
             ]
+          },
+          "needs_count": {
+            "description": "How many things wait on a person.",
+            "examples": [
+              1
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
           },
           "plan_id": {
             "description": "The plan's id.",
@@ -1926,10 +2104,45 @@
               "null"
             ]
           },
-          "status": {
-            "description": "`draft`, `executing` or `completed`.",
+          "state": {
+            "description": "Where the plan stands, from its tasks' work: `drafting` (nothing\napproved yet), `running`, `needs_you` (a task asks a person\nsomething, failed, or drafts remain once the rest finished), `done`\n(every task merged or dropped) or `stalled` (open work and nothing\nmoved for 3 days).",
             "examples": [
-              "draft"
+              "running"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "description": "The older status word, kept for older clients: `draft`, `executing`,\nor `done` once every task merged or was dropped. Read `state`.",
+            "examples": [
+              "executing"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "success_criteria": {
+            "description": "The plan's success criteria as written, when it has its own list.",
+            "examples": [
+              [
+                "The 11th login attempt within 15 minutes gets 429"
+              ]
+            ],
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "summary": {
+            "description": "The count line: merged first, then the states with tasks in them.",
+            "examples": [
+              "2 of 5 merged, 1 needs you, 1 in review, 1 working"
             ],
             "type": [
               "string",
@@ -1991,6 +2204,7 @@
           }
         },
         "required": [
+          "needs_count",
           "task_count"
         ],
         "type": "object"
@@ -2061,6 +2275,44 @@
               "null"
             ]
           },
+          "attempts": {
+            "description": "Runs it took, every attempt counted.",
+            "examples": [
+              2
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "cost_usd": {
+            "description": "What its runs cost, in US dollars.",
+            "examples": [
+              7.2
+            ],
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "covers": {
+            "description": "The plan's success criteria it covers (`C1`, ...).",
+            "examples": [
+              [
+                "C1"
+              ]
+            ],
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
           "created_at": {
             "description": "When it was made (RFC 3339).",
             "examples": [
@@ -2098,6 +2350,27 @@
             ],
             "type": [
               "string",
+              "null"
+            ]
+          },
+          "drift": {
+            "description": "Changes after the plan was approved, and work outside its scope:\n`{kind, detail, by, by_name, at}`, `kind` one of `added`, `changed`,\n`dropped`, `scope`; `by` is `agent` or `person`.",
+            "examples": [
+              [
+                {
+                  "at": "2026-10-22T15:00:00+00:00",
+                  "by": "person",
+                  "by_name": "octocat",
+                  "detail": "Added after the plan was approved",
+                  "kind": "added"
+                }
+              ]
+            ],
+            "items": {
+              "type": "object"
+            },
+            "type": [
+              "array",
               "null"
             ]
           },
@@ -2153,6 +2426,27 @@
               "null"
             ]
           },
+          "last_activity_at": {
+            "description": "When anything last happened on it (RFC 3339).",
+            "examples": [
+              "2026-10-23T09:12:00+00:00"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "needs": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/NeedsYou",
+                "description": "What it waits on a person for, when it does."
+              }
+            ]
+          },
           "order": {
             "description": "Its place in the plan, from 0.",
             "examples": [
@@ -2173,12 +2467,38 @@
             ]
           },
           "pr_url": {
-            "description": "The pull request that run opened.",
+            "description": "The newest pull request (every one is in `prs`).",
             "examples": [
               "https://github.com/acme/web/pull/318"
             ],
             "type": [
               "string",
+              "null"
+            ]
+          },
+          "prs": {
+            "description": "Its pull requests, newest attempt first: `{number, url, repo, state,\nchecks, review, tone, additions, deletions, run_id}`. `tone` is the\ncolour: `ready`, `waiting`, `failing`, `merged` or `closed`.",
+            "examples": [
+              [
+                {
+                  "additions": 120,
+                  "checks": "running",
+                  "deletions": 8,
+                  "number": 318,
+                  "repo": "acme/web",
+                  "review": "none",
+                  "run_id": "01JB8X6F4M2C9QZ3T7V5W1K0HA",
+                  "state": "open",
+                  "tone": "waiting",
+                  "url": "https://github.com/acme/web/pull/318"
+                }
+              ]
+            ],
+            "items": {
+              "type": "object"
+            },
+            "type": [
+              "array",
               "null"
             ]
           },
@@ -2213,7 +2533,7 @@
             ]
           },
           "run_id": {
-            "description": "The run working on it.",
+            "description": "Its newest run (every attempt is in `runs`).",
             "examples": [
               "01JB8X6F4M2C9QZ3T7V5W1K0HA"
             ],
@@ -2222,10 +2542,60 @@
               "null"
             ]
           },
-          "status": {
-            "description": "`draft`, `approved`, `rejected`, `queued`, `waiting` (on a task it\ndepends on), `running`, `completed` or `failed`.",
+          "runs": {
+            "description": "Every attempt, oldest first: `{run_id, status, created_at, cost_usd}`.",
             "examples": [
-              "queued"
+              [
+                {
+                  "cost_usd": 3.6,
+                  "created_at": "2026-10-22T14:02:11+00:00",
+                  "run_id": "01JB8X6F4M2C9QZ3T7V5W1K0HA",
+                  "status": "completed"
+                }
+              ]
+            ],
+            "items": {
+              "type": "object"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "state": {
+            "description": "Where the task stands, from its runs and pull requests: `draft`,\n`queued`, `working`, `needs_you`, `failed`, `in_review`, `merged` or\n`dropped`.",
+            "examples": [
+              "in_review"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state_detail": {
+            "description": "One line: what it is doing, what it waits on, or what blocks it.",
+            "examples": [
+              "Checks are running on pull request #318"
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state_reason": {
+            "description": "Why it failed (`failed` only).",
+            "examples": [
+              null
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "description": "The task row's own word: `draft`, `approved`, `rejected`, `queued`,\n`waiting` (on a task it depends on), `running` (filing its ticket),\n`filed` (older tasks say `done`) or `failed` (the ticket could not be\nfiled). Filing the ticket finishes nothing: read `state`.",
+            "examples": [
+              "filed"
             ],
             "type": [
               "string",
@@ -2239,6 +2609,16 @@
             ],
             "type": [
               "string",
+              "null"
+            ]
+          },
+          "ticket_filed": {
+            "description": "Its ticket was filed.",
+            "examples": [
+              true
+            ],
+            "type": [
+              "boolean",
               "null"
             ]
           },
@@ -2265,6 +2645,65 @@
           },
           {
             "properties": {
+              "criteria": {
+                "description": "The success criteria, each with the tasks that cover it and the\nevidence the work gave it: `{id, text, tasks, met, evidence: [{task_id,\nrun_id, state, words, by, tests}]}`. `state` is the criteria trace's\nproof: `proven`, `not_the_ticket`, `failing`, `missing`, `unverified`\nor `not_run`.",
+                "examples": [
+                  [
+                    {
+                      "evidence": [
+                        {
+                          "by": "tests with and without the change",
+                          "run_id": "01JB8X6F4M2C9QZ3T7V5W1K0HA",
+                          "state": "proven",
+                          "task_id": "01JB8V0P8Q2S4U6W8Y0A2C4E6G",
+                          "words": "proven"
+                        }
+                      ],
+                      "id": "C1",
+                      "met": true,
+                      "tasks": [
+                        "01JB8V0P8Q2S4U6W8Y0A2C4E6G"
+                      ],
+                      "text": "The 11th login attempt within 15 minutes gets 429"
+                    }
+                  ]
+                ],
+                "items": {
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "estimate": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/StartEstimate",
+                    "description": "What starting the draft tasks, or retrying one, is expected to take,\nfrom the team's recent runs: `{tasks, runs_low, runs_high, cost_low,\ncost_high, per_run_low, per_run_high, sample}`. Null when nothing is\nleft to start or retry."
+                  }
+                ]
+              },
+              "needs": {
+                "description": "What waits on a person, in task order, each the exact ask:\n`{task_id, kind, ask, detail, url, run_id, action}`. `kind` is\n`answer`, `review`, `approval`, `checks`, `merge`, `failed`,\n`closed_pr` or `approve_rest`.",
+                "examples": [
+                  [
+                    {
+                      "action": "open_pr",
+                      "ask": "Approve pull request #318",
+                      "detail": "This repo's auto-merge setting requires an approving review from a person.",
+                      "kind": "approval",
+                      "run_id": "01JB8X6F4M2C9QZ3T7V5W1K0HA",
+                      "task_id": "01JB8V0P8Q2S4U6W8Y0A2C4E6G",
+                      "url": "https://github.com/acme/web/pull/318"
+                    }
+                  ]
+                ],
+                "items": {
+                  "type": "object"
+                },
+                "type": "array"
+              },
               "tasks": {
                 "description": "The plan's tasks, in order.",
                 "items": {
@@ -2274,7 +2713,9 @@
               }
             },
             "required": [
-              "tasks"
+              "tasks",
+              "criteria",
+              "needs"
             ],
             "type": "object"
           }
@@ -6027,6 +6468,178 @@
           "series",
           "failed_series",
           "previous_deliveries"
+        ],
+        "type": "object"
+      },
+      "StartEstimate": {
+        "description": "What starting tasks, or retrying one, is expected to take, from the\nteam's recent finished runs (the shape of `common::plan_sync::Estimate`).",
+        "properties": {
+          "cost_high": {
+            "description": "The high end of the cost, in US dollars.",
+            "examples": [
+              19.8
+            ],
+            "format": "double",
+            "type": "number"
+          },
+          "cost_low": {
+            "description": "The low end of the cost, in US dollars.",
+            "examples": [
+              6.3
+            ],
+            "format": "double",
+            "type": "number"
+          },
+          "per_run_high": {
+            "description": "One run's typical cost, high end.",
+            "examples": [
+              4.95
+            ],
+            "format": "double",
+            "type": "number"
+          },
+          "per_run_low": {
+            "description": "One run's typical cost, low end (a Retry or Start now).",
+            "examples": [
+              2.1
+            ],
+            "format": "double",
+            "type": "number"
+          },
+          "runs_high": {
+            "description": "Runs expected with the attempts a ticket took lately.",
+            "examples": [
+              4
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "runs_low": {
+            "description": "Runs expected: one per task.",
+            "examples": [
+              3
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "sample": {
+            "description": "Finished runs the numbers come from; 0 means no history yet.",
+            "examples": [
+              40
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "tasks": {
+            "description": "Tasks it would start.",
+            "examples": [
+              3
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "tasks",
+          "runs_low",
+          "runs_high",
+          "cost_low",
+          "cost_high",
+          "per_run_low",
+          "per_run_high",
+          "sample"
+        ],
+        "type": "object"
+      },
+      "TaskCounts": {
+        "description": "How many tasks are in each state (the shape of\n`common::plan_state::Counts`, for the API document).",
+        "properties": {
+          "draft": {
+            "description": "Not approved yet.",
+            "examples": [
+              0
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "dropped": {
+            "description": "Dropped by a person.",
+            "examples": [
+              0
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "failed": {
+            "description": "Failed, with a reason.",
+            "examples": [
+              0
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "in_review": {
+            "description": "A pull request is open.",
+            "examples": [
+              1
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "merged": {
+            "description": "A pull request merged.",
+            "examples": [
+              2
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "needs_you": {
+            "description": "Its run asks a person for something.",
+            "examples": [
+              1
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "queued": {
+            "description": "Approved and waiting to start.",
+            "examples": [
+              1
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "working": {
+            "description": "Its run is working.",
+            "examples": [
+              1
+            ],
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "draft",
+          "queued",
+          "working",
+          "needs_you",
+          "failed",
+          "in_review",
+          "merged",
+          "dropped"
         ],
         "type": "object"
       },
