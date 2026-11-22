@@ -3,7 +3,9 @@ Subject: Acme CoderHelm: an Okta email domain failed its DNS check
 
 The DNS record that proves one of your team's Okta email domains is gone.
 
-Okta sign-in is required, so CoderHelm kept the domain and people can still sign in. Add the TXT record back, then choose Verify domains in Settings, Sign-in rules. Until then the domain shows as failing there.
+Okta sign-in is required, so CoderHelm keeps the domain until November 28, 2026 and people can still sign in. Add the TXT record back, then choose Verify domains in Settings, Sign-in rules. If it is still gone then, the domain is released.
+
+Kept until: November 28, 2026
 
 Open Sign-in rules: https://helm.example.org/settings/sign-in/
 

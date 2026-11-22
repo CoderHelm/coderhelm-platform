@@ -948,15 +948,30 @@ pub async fn while_rule_off(
         Ok(_) => Ok(()),
         Err(e) => {
             let e = format!("{e:?}");
-            if e.contains("TransactionCanceled") || e.contains("ConditionalCheckFailed") {
-                Err(setup_change_refused(&Rule {
+            if !(e.contains("TransactionCanceled") || e.contains("ConditionalCheckFailed")) {
+                return Err(internal("Okta change not saved", e));
+            }
+            // Say what really stopped it: the rule, or the record itself
+            // (it changed, or belongs to another team).
+            let rule_on = sign_in::team_rule(state, team_id)
+                .await
+                .map(|r| r.require_okta)
+                .unwrap_or(true);
+            Err(if rule_on {
+                setup_change_refused(&Rule {
                     require_okta: true,
                     ..Rule::default()
                 })
-                .unwrap_or_else(|| internal("Write refused", "rule on")))
+                .unwrap_or_else(|| internal("Write refused", "rule on"))
             } else {
-                Err(internal("Okta change not saved", e))
-            }
+                (
+                    StatusCode::CONFLICT,
+                    Json(json!({
+                        "error": "That changed meanwhile (for example, the domain now belongs to another team). Reload the page and try again.",
+                        "code": "changed",
+                    })),
+                )
+            })
         }
     }
 }
@@ -1025,13 +1040,78 @@ fn internal(context: &str, e: impl std::fmt::Display) -> ApiError {
 }
 
 /// While a team requires Okta, a proven domain whose TXT record is gone is
-/// kept (people still sign in) and marked failing; the owners hear about it
-/// once, by email and in the audit log, and the page shows it.
+/// kept (people still sign in) and marked failing for
+/// [`super::oidc_signin::FAILING_GRACE_DAYS`] days; the owners hear about it
+/// once, by email and in the audit log, with the date it will be released,
+/// and the page shows it.
 pub async fn domain_failing(state: &AppState, team_id: &str, domain: &str, first: bool) {
     warn!(%domain, "Okta domain proof gone from DNS while Okta sign-in is required; kept");
     if !first {
         return;
     }
+    let until = (chrono::Utc::now()
+        + chrono::Duration::days(super::oidc_signin::FAILING_GRACE_DAYS))
+    .format("%B %-d, %Y")
+    .to_string();
+    let words = failing_words(&until);
+    tell_owners(
+        state,
+        team_id,
+        "okta_domain_failing",
+        "An Okta email domain failed its DNS check",
+        &words,
+        Some(&until),
+    )
+    .await;
+    audit_system(
+        state,
+        team_id,
+        format!("Okta email domain {domain} failed its DNS check; kept until {until} while Okta sign-in is required"),
+    )
+    .await;
+}
+
+/// A proof released after its grace period, or because another team proved
+/// the domain while its record here was gone: the owners are told.
+pub async fn domain_released(state: &AppState, team_id: &str, domain: &str) {
+    let words = released_words();
+    tell_owners(
+        state,
+        team_id,
+        "okta_domain_released",
+        "An Okta email domain was released",
+        &words,
+        None,
+    )
+    .await;
+    audit_system(
+        state,
+        team_id,
+        format!("Okta email domain {domain} released: its DNS record stayed gone"),
+    )
+    .await;
+}
+
+/// The email's words for a failing proof (the same as its template: a
+/// domain name in an email reads as a link, so none is named).
+pub fn failing_words(until: &str) -> String {
+    format!(
+        "The DNS record that proves one of your team's Okta email domains is gone. Okta sign-in is required, so CoderHelm keeps the domain until {until} and people can still sign in. Add the TXT record back, then choose Verify domains in Settings, Sign-in rules. If it is still gone then, the domain is released."
+    )
+}
+
+pub fn released_words() -> String {
+    "The DNS record that proved one of your team's Okta email domains stayed gone, so CoderHelm released the domain. People at it can't sign in with Okta until you add the TXT record back and choose Verify domains in Settings, Sign-in rules.".into()
+}
+
+async fn tell_owners(
+    state: &AppState,
+    team_id: &str,
+    template: &'static str,
+    subject: &str,
+    words: &str,
+    until: Option<&str>,
+) {
     let link = format!(
         "{}/settings/sign-in/",
         common::public_urls::app_url_from_env()
@@ -1049,30 +1129,31 @@ pub async fn domain_failing(state: &AppState, team_id: &str, domain: &str, first
         }
         let mut params = serde_json::Map::new();
         params.insert("link".into(), Value::from(link.clone()));
+        if let Some(u) = until {
+            params.insert("until".into(), Value::from(u));
+        }
         sign_in::send_mail(
             state,
             team_id,
-            "okta_domain_failing",
+            template,
             to,
             params,
-            "An Okta email domain failed its DNS check",
-            format!(
-                "The DNS record that proves one of your team's Okta email domains ({domain}) is gone. Okta sign-in is required, so CoderHelm kept the domain and people can still sign in. Add the TXT record back, then choose Verify domains in Settings, Sign-in rules: {link}\n"
-            ),
+            subject,
+            format!("{words}\n\n{link}\n"),
         )
         .await;
     }
-    let actor = system_actor(team_id);
+}
+
+async fn audit_system(state: &AppState, team_id: &str, detail: String) {
     let _ = super::roles::record(
         state,
-        &actor,
+        &system_actor(team_id),
         super::roles::AuditEntry {
             action: "sign_in_okta",
             role_id: "",
             role_name: "",
-            detail: format!(
-                "Okta email domain {domain} failed its DNS check; kept while Okta sign-in is required"
-            ),
+            detail,
         },
     )
     .await;
@@ -1097,10 +1178,12 @@ fn system_actor(team_id: &str) -> Claims {
     }
 }
 
-/// The support view of a team that requires Okta sign-in: a platform admin
-/// is held to a bar as strong as the team's. An Okta session is never a
-/// platform admin, so that bar is the admin's own session having passed a
-/// second factor. Pure.
+/// The support view of a team that requires Okta sign-in. The policy: a
+/// CoderHelm platform admin may view such a team only with the team's own
+/// support grant (as for every team) AND from a session of their own that
+/// passed a second factor; every read is written to the team's audit log.
+/// An Okta session is never a platform admin, so a second factor is the bar
+/// as strong as the team's own. Pure.
 pub fn support_view_allowed(target: &Rule, admin: &SignInProof) -> bool {
     !target.require_okta || admin.mfa
 }
@@ -1689,15 +1772,36 @@ mod tests {
 
     #[test]
     fn dns_never_releases_a_proof_while_the_rule_is_on_and_turning_on_needs_a_match() {
-        use super::super::oidc_signin::{counts_at_turn_on, release_when_gone, ProofCheck};
-        assert!(release_when_gone(false));
-        assert!(!release_when_gone(true));
+        use super::super::oidc_signin::{
+            contender_takes_over, counts_at_turn_on, gone_outcome, GoneOutcome, ProofCheck,
+            FAILING_GRACE_DAYS,
+        };
+        let now = chrono::Utc::now();
+        let ago = |d: i64| (now - chrono::Duration::days(d)).to_rfc3339();
+        assert_eq!(gone_outcome(false, None, now), GoneOutcome::Release);
+        assert_eq!(gone_outcome(true, None, now), GoneOutcome::MarkFailing);
+        assert_eq!(gone_outcome(true, Some(&ago(1)), now), GoneOutcome::Keep);
+        // Never kept forever: released once the grace period is over.
+        assert_eq!(
+            gone_outcome(true, Some(&ago(FAILING_GRACE_DAYS)), now),
+            GoneOutcome::GraceOver
+        );
+        assert_eq!(
+            gone_outcome(true, Some("not a time"), now),
+            GoneOutcome::GraceOver
+        );
+        assert_eq!(FAILING_GRACE_DAYS, 7);
+        // Another team takes over only when the holder's record is surely gone.
+        assert!(contender_takes_over(ProofCheck::Gone));
+        assert!(!contender_takes_over(ProofCheck::Unknown));
+        assert!(!contender_takes_over(ProofCheck::There));
         assert!(counts_at_turn_on(ProofCheck::There));
         assert!(!counts_at_turn_on(ProofCheck::Unknown));
         assert!(!counts_at_turn_on(ProofCheck::Gone));
         let oidc = code(include_str!("oidc_signin.rs"));
         let f = body(oidc, "fresh_domain_owner");
-        assert!(before(f, "release_when_gone(", "release_domain("));
+        assert!(before(f, "gone_outcome(", "release_domain_while_rule_off("));
+        assert!(f.contains("domain_released("));
         assert!(f.contains("domain_failing("));
         assert!(body(oidc, "domains_proven").contains("domains_proven_now("));
         assert!(body(oidc, "domains_proven_now").contains("counts_at_turn_on("));
@@ -1765,5 +1869,28 @@ mod tests {
                 "{f}"
             );
         }
+    }
+
+    #[test]
+    fn releases_and_client_changes_go_through_their_guards() {
+        let oidc = code(include_str!("oidc_signin.rs"));
+        for f in ["okta_test", "okta_discard_draft", "okta_save"] {
+            assert!(!body(oidc, f).contains("release_domain(&state"), "{f}");
+        }
+        assert!(body(oidc, "okta_discard_draft").contains("release_domain_while_rule_off("));
+        assert!(body(oidc, "okta_test").contains("release_domain_while_rule_off("));
+        let v = body(oidc, "okta_verify_domains");
+        assert!(before(v, "contender_takes_over(", "domain_released("));
+        let save = body(oidc, "okta_save");
+        assert!(before(save, "may_change_client(", "save_live("));
+        // The turn-on line follows the transaction's outcome.
+        let si = code(include_str!("sign_in.rs"));
+        let u = body(si, "update_settings");
+        assert!(before(
+            u,
+            ".transact_write_items()",
+            "log(changes.join(\". \")).await?;\n        }\n        None"
+        ));
+        assert!(u.contains("Cancelled, nothing changed"));
     }
 }

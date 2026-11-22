@@ -192,6 +192,10 @@ fn as_item(
         .collect()
 }
 
+fn okta_id(sub: &str) -> String {
+    super::oidc_signin::okta_user_id(ISSUER, sub)
+}
+
 fn okta_proof(sub: &str) -> SignInProof {
     SignInProof::new(false, "okta").with_okta_sub(Some(sub.into()))
 }
@@ -1198,8 +1202,7 @@ impl World {
         sub: &str,
         email: &str,
     ) -> Result<axum::response::Response, String> {
-        let claims =
-            json!({ "sub": sub, "email": email, "email_verified": true, "name": "Someone" });
+        let claims = json!({ "iss": ISSUER, "sub": sub, "email": email, "email_verified": true, "name": "Someone" });
         super::oidc_signin::okta_land(&self.state, "127.0.0.1", &self.live_setup(team), &claims)
             .await
             .map_err(|f| f.reason.code().to_string())
@@ -1240,14 +1243,14 @@ async fn an_okta_sign_in_accepts_only_the_invite_for_exactly_its_address() {
         w.f.store.get("users", GATED, "USER#invite_c").unwrap()["status"],
         "invited"
     );
-    assert!(w.f.store.get("users", GATED, "USER#okta_s-alice").is_none());
+    assert!(w.f.store.get("users", GATED, &okta_id("s-alice")).is_none());
     // The invited address itself: accepted, linked, signed in.
     let r = w
         .okta_lands(GATED, "s-c", "Alice+Contractor@example.com")
         .await
         .unwrap();
     assert!(sets_session(&r));
-    let m = w.f.store.get("users", GATED, "USER#okta_s-c").unwrap();
+    let m = w.f.store.get("users", GATED, &okta_id("s-c")).unwrap();
     assert_eq!(m["email"], "alice+contractor@example.com");
     assert_eq!(m["okta_sub"], "s-c");
     assert!(w.f.store.get("users", GATED, "USER#invite_c").is_none());
@@ -1828,4 +1831,348 @@ async fn the_stand_in_refuses_a_transaction_that_touches_one_item_twice() {
         .await
         .is_err());
     assert!(w.f.store.get("settings", "x", "y").is_none());
+}
+
+// ── Third review ────────────────────────────────────────────────────
+
+/// A self-hosted organization with its Okta on and an owner who linked it.
+fn selfhost_org(w: &World, rule_on: bool) -> String {
+    w.f.store.put(
+        "settings",
+        &[
+            ("pk", json!("ORG")),
+            ("sk", json!("META")),
+            ("team_id", json!(GATED)),
+            ("domains", json!(["example.com"])),
+            ("require_okta", json!(rule_on)),
+            ("require_okta_since", json!(RULE_SINCE)),
+            ("created_at", json!("2026-01-01T00:00:00Z")),
+        ],
+    );
+    w.f.store.put(
+        "settings",
+        &[
+            ("pk", json!(GATED)),
+            ("sk", json!(super::oidc_signin::OKTA_SK)),
+            ("issuer", json!(ISSUER)),
+            ("client_id", json!("client")),
+            ("client_secret_sealed", json!("sealed")),
+            ("domains", json!(["example.com"])),
+            ("enabled", json!(true)),
+            ("tested_at", json!("2026-11-01T00:00:00Z")),
+            ("updated_at", json!("2026-11-01T00:00:00Z")),
+        ],
+    );
+    w.member(
+        GATED,
+        "USER#o",
+        "o@example.com",
+        "owner",
+        &[("okta_issuer", json!(ISSUER)), ("okta_sub", json!("o"))],
+    );
+    w.cookie(GATED, "USER#o", "o@example.com", "owner", &okta_proof("o"))
+}
+
+fn audit_lines(w: &World, team: &str) -> Vec<String> {
+    w.f.store
+        .items("settings", team)
+        .into_iter()
+        .filter(|i| i["action"] == "sign_in_rules")
+        .map(|i| i["detail"].as_str().unwrap_or("").to_string())
+        .collect()
+}
+
+/// N4: turning the rule on is logged after its transaction lands; a
+/// cancelled attempt is logged as cancelled, and nothing changed.
+#[tokio::test]
+async fn turning_the_rule_on_is_logged_by_its_outcome() {
+    let _self_hosted = crate::routes::setup_checks::test_self_hosted::set(true);
+    let w = world().await;
+    let c = selfhost_org(&w, false);
+    let on = json!({ "require_okta": true, "acknowledge_unlinked": true });
+    w.f.store.cancel_transactions();
+    let a = w.call("PUT", "/api/sign-in", &c, Some(on.clone())).await;
+    assert_eq!(a.body["code"], "okta_changed", "{}", a.body);
+    let lines = audit_lines(&w, GATED);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(
+        lines[0].starts_with("Cancelled, nothing changed"),
+        "{lines:?}"
+    );
+    assert_eq!(
+        w.f.store.get("settings", "ORG", "META").unwrap()["require_okta"],
+        false
+    );
+
+    let w = world().await;
+    let c = selfhost_org(&w, false);
+    let a = w.call("PUT", "/api/sign-in", &c, Some(on)).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    assert_eq!(
+        w.f.store.get("settings", "ORG", "META").unwrap()["require_okta"],
+        true
+    );
+    let lines = audit_lines(&w, GATED);
+    assert_eq!(
+        lines,
+        vec!["Okta sign-in required for everyone".to_string()]
+    );
+}
+
+/// N3: while the rule is on, a new Okta app is saved only by the owner,
+/// from their own Okta session, after their own Test sign-in of it.
+#[tokio::test]
+async fn a_new_okta_app_needs_the_owners_own_test_while_the_rule_is_on() {
+    let _self_hosted = crate::routes::setup_checks::test_self_hosted::set(true);
+    let w = world().await;
+    let owner = selfhost_org(&w, true);
+    let draft = |tested_by: &str| {
+        w.f.store.put(
+            "settings",
+            &[
+                ("pk", json!(GATED)),
+                ("sk", json!(super::oidc_signin::OKTA_DRAFT_SK)),
+                ("issuer", json!(ISSUER)),
+                ("client_id", json!("new-client")),
+                ("client_secret_sealed", json!("new-sealed")),
+                ("domains", json!(["example.com"])),
+                ("enabled", json!(false)),
+                ("tested_at", json!("2026-11-20T00:00:00Z")),
+                ("tested_by", json!(tested_by)),
+                ("updated_at", json!("2026-11-20T00:00:00Z")),
+            ],
+        )
+    };
+    let save = json!({ "enabled": true, "issuer": ISSUER, "client_id": "new-client", "updated_at": "2026-11-20T00:00:00Z" });
+    // Tested by someone else: refused, the live app unchanged.
+    draft("USER#adm");
+    let a = w
+        .call("POST", "/api/sign-in/okta/save", &owner, Some(save.clone()))
+        .await;
+    assert_eq!(a.body["code"], "okta_client_change", "{}", a.body);
+    assert_eq!(
+        w.f.store
+            .get("settings", GATED, super::oidc_signin::OKTA_SK)
+            .unwrap()["client_id"],
+        "client"
+    );
+    // The owner from a password (break-glass) session: refused.
+    let bg = w.cookie(
+        GATED,
+        "USER#o",
+        "o@example.com",
+        "owner",
+        &SignInProof::new(true, "password").with_break_glass(Some(GATED)),
+    );
+    draft("USER#o");
+    let a = w
+        .call("POST", "/api/sign-in/okta/save", &bg, Some(save.clone()))
+        .await;
+    assert_eq!(a.body["code"], "okta_client_change", "{}", a.body);
+    // The owner, from Okta, after their own test: saved.
+    let a = w
+        .call("POST", "/api/sign-in/okta/save", &owner, Some(save))
+        .await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    assert_eq!(
+        w.f.store
+            .get("settings", GATED, super::oidc_signin::OKTA_SK)
+            .unwrap()["client_id"],
+        "new-client"
+    );
+}
+
+/// N1: a domain whose proof is failing accepts no new member through Okta,
+/// while members who linked before keep signing in.
+#[tokio::test]
+async fn a_failing_domain_accepts_no_invite_but_linked_members_still_sign_in() {
+    let w = world().await;
+    w.rule(GATED, true);
+    w.okta(GATED, true);
+    w.proven(GATED, "example.com");
+    w.f.store.put(
+        "settings",
+        &[
+            ("pk", json!("OKTA_DOMAIN#example.com")),
+            ("sk", json!("OKTA")),
+            ("team_id", json!(GATED)),
+            ("verified_at", json!(chrono::Utc::now().to_rfc3339())),
+            ("checked_at", json!(chrono::Utc::now().to_rfc3339())),
+            ("failing_at", json!(chrono::Utc::now().to_rfc3339())),
+        ],
+    );
+    w.invite_to(GATED, "USER#invite_n", "new@example.com", "member");
+    assert_eq!(
+        w.okta_lands(GATED, "s-new", "new@example.com")
+            .await
+            .unwrap_err(),
+        "okta_ask_admin"
+    );
+    assert_eq!(
+        w.f.store.get("users", GATED, "USER#invite_n").unwrap()["status"],
+        "invited"
+    );
+    w.member(
+        GATED,
+        "USER#linked",
+        "ann@example.com",
+        "member",
+        &[("okta_issuer", json!(ISSUER)), ("okta_sub", json!("s-ann"))],
+    );
+    assert!(sets_session(
+        &w.okta_lands(GATED, "s-ann", "ann@example.com")
+            .await
+            .unwrap()
+    ));
+}
+
+/// N1: the page shows when a failing proof will be released.
+#[tokio::test]
+async fn the_page_shows_when_a_failing_proof_is_released() {
+    let w = world().await;
+    w.rule(GATED, true);
+    w.okta(GATED, true);
+    let since = "2026-11-20T00:00:00+00:00";
+    w.f.store.put(
+        "settings",
+        &[
+            ("pk", json!("OKTA_DOMAIN#example.com")),
+            ("sk", json!("OKTA")),
+            ("team_id", json!(GATED)),
+            ("verified_at", json!(since)),
+            ("failing_at", json!(since)),
+        ],
+    );
+    w.member(
+        GATED,
+        "USER#adm",
+        "adm@example.com",
+        "admin",
+        &[("okta_issuer", json!(ISSUER)), ("okta_sub", json!("adm"))],
+    );
+    let c = w.cookie(
+        GATED,
+        "USER#adm",
+        "adm@example.com",
+        "admin",
+        &okta_proof("adm"),
+    );
+    let a = w.call("GET", "/api/sign-in/okta", &c, None).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    assert_eq!(a.body["domains"][0]["failing_since"], since);
+    assert_eq!(
+        a.body["domains"][0]["release_after"],
+        "2026-11-27T00:00:00+00:00"
+    );
+}
+
+/// N2: releasing a draft's domains happens only while the rule is off,
+/// checked in the same write.
+#[tokio::test]
+async fn a_discarded_drafts_domains_are_kept_while_the_rule_is_on() {
+    let w = world().await;
+    w.rule(GATED, true);
+    w.okta(GATED, true);
+    w.proven(GATED, "draft.example");
+    w.f.store.put(
+        "settings",
+        &[
+            ("pk", json!(GATED)),
+            ("sk", json!(super::oidc_signin::OKTA_DRAFT_SK)),
+            ("issuer", json!(ISSUER)),
+            ("client_id", json!("client")),
+            ("domains", json!(["example.com", "draft.example"])),
+            ("enabled", json!(false)),
+        ],
+    );
+    w.member(
+        GATED,
+        "USER#adm",
+        "adm@example.com",
+        "admin",
+        &[("okta_issuer", json!(ISSUER)), ("okta_sub", json!("adm"))],
+    );
+    let c = w.cookie(
+        GATED,
+        "USER#adm",
+        "adm@example.com",
+        "admin",
+        &okta_proof("adm"),
+    );
+    let a = w.call("DELETE", "/api/sign-in/okta/draft", &c, None).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    assert!(w
+        .f
+        .store
+        .get("settings", "OKTA_DOMAIN#draft.example", "OKTA")
+        .is_some());
+    // With the rule off it is released.
+    w.rule(GATED, false);
+    w.f.store.put(
+        "settings",
+        &[
+            ("pk", json!(GATED)),
+            ("sk", json!(super::oidc_signin::OKTA_DRAFT_SK)),
+            ("issuer", json!(ISSUER)),
+            ("client_id", json!("client")),
+            ("domains", json!(["draft.example"])),
+            ("enabled", json!(false)),
+        ],
+    );
+    let a = w.call("DELETE", "/api/sign-in/okta/draft", &c, None).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    assert!(w
+        .f
+        .store
+        .get("settings", "OKTA_DOMAIN#draft.example", "OKTA")
+        .is_none());
+}
+
+/// Info: a guarded write that fails for another reason than the rule says
+/// so (here the domain belongs to another team).
+#[tokio::test]
+async fn a_guarded_write_refused_for_another_reason_says_so() {
+    use aws_sdk_dynamodb::types::{AttributeValue as A, Delete, TransactWriteItem};
+    let w = world().await;
+    w.proven(OTHER, "example.com");
+    let delete = TransactWriteItem::builder()
+        .delete(
+            Delete::builder()
+                .table_name("settings")
+                .key("pk", A::S("OKTA_DOMAIN#example.com".into()))
+                .key("sk", A::S("OKTA".into()))
+                .condition_expression("team_id = :t")
+                .expression_attribute_values(":t", A::S(GATED.into()))
+                .build()
+                .unwrap(),
+        )
+        .build();
+    let e = super::require_okta::while_rule_off(&w.state, GATED, vec![delete])
+        .await
+        .unwrap_err();
+    assert_eq!(e.1 .0["code"], "changed");
+    assert!(w
+        .f
+        .store
+        .get("settings", "OKTA_DOMAIN#example.com", "OKTA")
+        .is_some());
+}
+
+/// Info: the stand-in refuses an expression value no expression uses, as
+/// DynamoDB does.
+#[tokio::test]
+#[should_panic(expected = "doesn't support")]
+async fn the_stand_in_refuses_unused_expression_values() {
+    let w = world().await;
+    let _ = w
+        .state
+        .dynamo
+        .get_item()
+        .table_name("settings")
+        .key("pk", aws_sdk_dynamodb::types::AttributeValue::S("x".into()))
+        .key("sk", aws_sdk_dynamodb::types::AttributeValue::S("y".into()))
+        .projection_expression("pk")
+        .expression_attribute_names("#unused", "sk")
+        .send()
+        .await;
 }

@@ -3174,19 +3174,27 @@ pub async fn update_settings(
             );
         }
     }
-    if !changes.is_empty() {
-        // Nothing changes without its line in the log.
-        super::roles::record(
-            &state,
-            &claims,
-            super::roles::AuditEntry {
-                action: "sign_in_rules",
-                role_id: "",
-                role_name: "",
-                detail: changes.join(". "),
-            },
-        )
-        .await?;
+    let log = |detail: String| {
+        let (state, claims) = (&state, &claims);
+        async move {
+            super::roles::record(
+                state,
+                claims,
+                super::roles::AuditEntry {
+                    action: "sign_in_rules",
+                    role_id: "",
+                    role_name: "",
+                    detail,
+                },
+            )
+            .await
+        }
+    };
+    // Nothing changes without its line in the log: written first, except
+    // when Require Okta sign-in is turned on, whose transaction can still be
+    // cancelled (its line follows the outcome, a cancelled one as cancelled).
+    if !changes.is_empty() && okta_on_with.is_none() {
+        log(changes.join(". ")).await?;
     }
     // Self-hosted: the organization record (it exists). Hosted: the team's
     // own rule record, made the first time.
@@ -3238,6 +3246,11 @@ pub async fn update_settings(
             {
                 let e = format!("{e:?}");
                 if e.contains("TransactionCanceled") {
+                    log(format!(
+                        "Cancelled, nothing changed: {} (the Okta setup changed meanwhile)",
+                        changes.join(". ")
+                    ))
+                    .await?;
                     return Err(fail_code(
                         StatusCode::CONFLICT,
                         "The Okta setup changed while you turned this on. Check it again, then turn it on.",
@@ -3246,6 +3259,7 @@ pub async fn update_settings(
                 }
                 return Err(internal("Sign-in rules not saved", e));
             }
+            log(changes.join(". ")).await?;
         }
         None => {
             let up = state

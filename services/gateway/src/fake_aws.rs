@@ -46,9 +46,18 @@ pub struct Store {
     unsupported: Mutex<Vec<String>>,
     /// `(table, pk)` whose reads answer a server error.
     failing: Mutex<Vec<(String, String)>>,
+    /// Every transaction is cancelled (as when another write changed an
+    /// item it checks in between).
+    cancel_transactions: std::sync::atomic::AtomicBool,
 }
 
 impl Store {
+    /// Cancels every transaction from now on.
+    pub fn cancel_transactions(&self) {
+        self.cancel_transactions
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// Makes every read of `pk` in `table` fail (a server error).
     pub fn fail_reads(&self, table: &str, pk: &str) {
         self.failing
@@ -482,8 +491,67 @@ fn project(item: &Obj, req: &Value) -> Obj {
         .collect()
 }
 
+/// DynamoDB refuses an expression that uses a `#name` or `:value` it wasn't
+/// given, and a request that gives one no expression uses: so does this.
+fn placeholders_match(w: &Value) {
+    let mut used_names = std::collections::BTreeSet::new();
+    let mut used_values = std::collections::BTreeSet::new();
+    for key in [
+        "ConditionExpression",
+        "UpdateExpression",
+        "KeyConditionExpression",
+        "FilterExpression",
+        "ProjectionExpression",
+    ] {
+        let Some(e) = w[key].as_str() else { continue };
+        let b = e.as_bytes();
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == b'#' || b[i] == b':' {
+                let start = i;
+                i += 1;
+                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                    i += 1;
+                }
+                let tok = e[start..i].to_string();
+                if b[start] == b'#' {
+                    used_names.insert(tok);
+                } else {
+                    used_values.insert(tok);
+                }
+                continue;
+            }
+            i += 1;
+        }
+    }
+    let given = |k: &str| -> std::collections::BTreeSet<String> {
+        w[k].as_object()
+            .map(|o| o.keys().cloned().collect())
+            .unwrap_or_default()
+    };
+    let (names, values) = (
+        given("ExpressionAttributeNames"),
+        given("ExpressionAttributeValues"),
+    );
+    if names != used_names {
+        panic!("expression names don't match: given {names:?}, used {used_names:?}");
+    }
+    if values != used_values {
+        panic!("expression values don't match: given {values:?}, used {used_values:?}");
+    }
+}
+
 fn dynamo(store: &Store, op: &str, req: &Value) -> Response {
     let table = req["TableName"].as_str().unwrap_or("").to_string();
+    if op == "TransactWriteItems" {
+        for t in req["TransactItems"].as_array().into_iter().flatten() {
+            if let Some((_, w)) = t.as_object().and_then(|o| o.iter().next()) {
+                placeholders_match(w);
+            }
+        }
+    } else {
+        placeholders_match(req);
+    }
     let mut tables = store
         .tables
         .lock()
@@ -555,10 +623,13 @@ fn dynamo(store: &Store, op: &str, req: &Value) -> Response {
                 }
                 seen.push((t.clone(), key));
             }
-            let failed = writes.iter().any(|(t, kind, w)| {
-                let rows = tables.get(t).cloned().unwrap_or_default();
-                !write_holds(&rows, w, kind)
-            });
+            let failed = store
+                .cancel_transactions
+                .load(std::sync::atomic::Ordering::SeqCst)
+                || writes.iter().any(|(t, kind, w)| {
+                    let rows = tables.get(t).cloned().unwrap_or_default();
+                    !write_holds(&rows, w, kind)
+                });
             if failed {
                 return error(
                     "com.amazonaws.dynamodb.v20120810#TransactionCanceledException",

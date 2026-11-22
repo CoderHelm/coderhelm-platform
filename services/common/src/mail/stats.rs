@@ -66,6 +66,7 @@ pub fn kind_of(template: &str) -> &'static str {
         | "webhook_disabled"
         | "relay_paused"
         | "okta_domain_failing"
+        | "okta_domain_released"
         | "alert" => "alerts",
         t if t.starts_with("two_factor") => "alerts",
         "run_complete" | "run_failed" | "review" | "review_complete" | "plugin_approval"

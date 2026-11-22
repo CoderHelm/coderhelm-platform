@@ -564,10 +564,24 @@ pub const TEMPLATES: &[Template] = &[
         subjects: &[],
         // No team name: the install's own SES email carries it.
         // No domain name: a name in an email reads as a link to it.
-        params: &[p("link", Kind::Link)],
+        params: &[p("until", Kind::Line(40)), p("link", Kind::Link)],
         body: &[
             Part::Para("The DNS record that proves one of your team's Okta email domains is gone."),
-            Part::Para("Okta sign-in is required, so CoderHelm kept the domain and people can still sign in. Add the TXT record back, then choose Verify domains in Settings, Sign-in rules. Until then the domain shows as failing there."),
+            Part::Para("Okta sign-in is required, so CoderHelm keeps the domain until {until} and people can still sign in. Add the TXT record back, then choose Verify domains in Settings, Sign-in rules. If it is still gone then, the domain is released."),
+            Part::Facts(&[("Kept until", "{until}")]),
+            Part::Button("Open Sign-in rules", "link"),
+        ],
+        install_may_send: true,
+    },
+    Template {
+        id: "okta_domain_released",
+        subject: "an Okta email domain was released",
+        subject_by: "",
+        subjects: &[],
+        params: &[p("link", Kind::Link)],
+        body: &[
+            Part::Para("The DNS record that proved one of your team's Okta email domains stayed gone, so CoderHelm released the domain."),
+            Part::Para("People at it can't sign in with Okta until you add the TXT record back and choose Verify domains in Settings, Sign-in rules."),
             Part::Button("Open Sign-in rules", "link"),
         ],
         install_may_send: true,
