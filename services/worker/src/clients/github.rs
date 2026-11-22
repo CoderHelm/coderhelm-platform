@@ -11,6 +11,22 @@ use super::repo_snapshot::RepoSnapshot;
 
 const API_BASE: &str = "https://api.github.com";
 
+/// The contents API's URL for `path`, at `git_ref` when one is given. Each
+/// segment of the path and the ref are percent-encoded: a repository's file
+/// can be named `%5Fmarkdown` (Next.js spells a route folder that starts
+/// with `_` that way), and sent as it is GitHub decodes it to `_markdown`
+/// and answers 404 for a file that is there.
+pub(crate) fn contents_url(owner: &str, repo: &str, path: &str, git_ref: Option<&str>) -> String {
+    let path = common::repo_read::path_url(path.trim_start_matches('/'));
+    match git_ref {
+        Some(r) => format!(
+            "{API_BASE}/repos/{owner}/{repo}/contents/{path}?ref={}",
+            common::knowledge::sources::connector::enc(r)
+        ),
+        None => format!("{API_BASE}/repos/{owner}/{repo}/contents/{path}"),
+    }
+}
+
 /// Tarballs larger than this are not snapshotted (Lambda memory guard);
 /// search falls back to the GitHub Code Search API for such repos.
 const MAX_TARBALL_BYTES: usize = 150 * 1024 * 1024;
@@ -1992,7 +2008,7 @@ impl GitHubClient {
         path: &str,
         git_ref: &str,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        let url = format!("{API_BASE}/repos/{owner}/{repo}/contents/{path}?ref={git_ref}");
+        let url = contents_url(owner, repo, path, Some(git_ref));
         let data = self.get(&url).await?;
         match contents_body(path, &data)? {
             ContentsBody::Text(text) => Ok(text),
@@ -2014,7 +2030,7 @@ impl GitHubClient {
         path: &str,
         git_ref: &str,
     ) -> Result<Option<u64>, Box<dyn std::error::Error + Send + Sync>> {
-        let url = format!("{API_BASE}/repos/{owner}/{repo}/contents/{path}?ref={git_ref}");
+        let url = contents_url(owner, repo, path, Some(git_ref));
         match self.get(&url).await {
             Ok(data) => Ok(Some(data.get("size").and_then(|s| s.as_u64()).unwrap_or(0))),
             Err(e) if is_not_found(&*e) => Ok(None),
@@ -2075,7 +2091,7 @@ impl GitHubClient {
         path: &str,
         git_ref: &str,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        let url = format!("{API_BASE}/repos/{owner}/{repo}/contents/{path}?ref={git_ref}");
+        let url = contents_url(owner, repo, path, Some(git_ref));
         let data = self.get(&url).await?;
         data.get("sha")
             .and_then(|s| s.as_str())
@@ -2270,7 +2286,7 @@ impl GitHubClient {
                     .collect());
             }
         }
-        let url = format!("{API_BASE}/repos/{owner}/{repo}/contents/{path}?ref={git_ref}");
+        let url = contents_url(owner, repo, path, Some(git_ref));
         let data = self.get(&url).await?;
         let entries: Vec<DirEntry> = serde_json::from_value(data)?;
         Ok(entries)
@@ -3491,7 +3507,7 @@ impl GitHubClient {
         };
         self.guard_empty_overwrite(owner, repo, path, branch, content)
             .await?;
-        let url = format!("{API_BASE}/repos/{owner}/{repo}/contents/{path}");
+        let url = contents_url(owner, repo, path, None);
         let encoded = B64.encode(content.as_bytes());
         // FRESHNESS CONTRACT (same as batch_write): if the branch tip moved
         // past what this pass's snapshot reflects AND this file is among the
@@ -5416,6 +5432,19 @@ impl GitHubClient {
         let url = format!("{API_BASE}/repos/{owner}/{repo}/pulls/{pr_number}");
         let body = common::description_lint::clean(&crate::passes::outcome::guard_body(body));
         self.patch(&url, &serde_json::json!({"body": body})).await?;
+        Ok(())
+    }
+
+    /// Move an open pull request onto another base branch.
+    pub async fn set_pull_base(
+        &self,
+        owner: &str,
+        repo: &str,
+        pr_number: u64,
+        base: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!("{API_BASE}/repos/{owner}/{repo}/pulls/{pr_number}");
+        self.patch(&url, &serde_json::json!({"base": base})).await?;
         Ok(())
     }
 

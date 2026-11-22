@@ -66,6 +66,11 @@ WAITING_ON_FIELD = "waiting_on"
 REMINDED_FIELD = "wait_reminded_at"
 WAIT_REMIND_AFTER_HOURS = 24
 QUESTIONS_FIELD = "questions"
+# A judged question's default and deadline (worker stop_judge::keep_ask_deadline)
+# and the sweep's claim on it: settle_waiting reads them, so the scan must too.
+# The scan once left them out, every deadline read as absent, and no default
+# was ever taken.
+WAIT_FIELDS = ("ask_default", "ask_deadline", "ask_default_taken_at")
 # The worker's queue: the reminder and the notice for a named wait go out as
 # a `run_waiting` message (services/common/contract/worker_messages.json).
 TICKET_QUEUE_URL = os.environ.get("TICKET_QUEUE_URL", "")
@@ -250,10 +255,15 @@ def said_nothing(run):
 
 
 def wait_since(run):
-    """When the current wait started: its waiting_on, else the last update."""
+    """When the current wait started: its waiting_on's `since`, else when its
+    questions were asked, else when the run was created. Never the last
+    update: every note moves updated_at, the reminder's own note included,
+    so a wait counted from it was due its "one" reminder again every day."""
     wait = _json(run.get(WAITING_ON_FIELD)) or {}
     since = _parse_time(wait.get("since")) if isinstance(wait, dict) else None
-    return since or _parse_time(run.get("updated_at") or run.get("created_at"))
+    asked = _json(run.get(QUESTIONS_FIELD)) or {}
+    asked_at = _parse_time(asked.get("asked_at")) if isinstance(asked, dict) else None
+    return since or asked_at or _parse_time(run.get("created_at") or run.get("updated_at"))
 
 
 def reminder_due(run, now):
@@ -672,7 +682,8 @@ def handler(event, context):
         "ProjectionExpression": (
             "team_id, run_id, created_at, updated_at, title, current_pass, pass_history, #s, "
             "step_queued_at, ceil_passes, ceil_continuations, ceil_worked_secs, ceil_spend_usd, "
-            "#round, pr_number, pr_url, error_message, #q, #w, #r, #oc, #notes"
+            "#round, pr_number, pr_url, error_message, #q, #w, #r, #oc, #notes, "
+            + ", ".join(WAIT_FIELDS)
         ),
     }
     scan_kwargs["ExpressionAttributeNames"]["#round"] = ROUND_FIELD

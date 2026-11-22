@@ -169,6 +169,38 @@ pub fn held_note(ticket_id: &str, source: &TicketSource) -> String {
     )
 }
 
+/// The ticket's earlier runs that still wait on a person (`needs_input`)
+/// when fresh run `me` of it starts in `repo` (`owner/name`): `runs` is the
+/// ticket's runs as `(run_id, status, repo)`. A waiting run is not live, so a
+/// new trigger (a ticket edit, the alert firing again, a hand-queued ticket)
+/// starts a fresh run beside it, and the old one went on waiting and being
+/// reminded for days, its question already moot. Only runs older than `me`
+/// (run ids sort by creation) in the same repository: a ticket worked in two
+/// repositories has a run in each.
+pub fn earlier_waits<'a>(
+    me: &str,
+    repo: &str,
+    runs: &'a [(String, String, String)],
+) -> Vec<&'a str> {
+    runs.iter()
+        .filter(|(id, status, r)| {
+            id.as_str() < me
+                && status == crate::run_status::NEEDS_INPUT
+                && r.eq_ignore_ascii_case(repo)
+        })
+        .map(|(id, _, _)| id.as_str())
+        .collect()
+}
+
+/// The note on an earlier waiting run when a fresh run of its ticket ends
+/// its wait.
+pub fn ended_wait_note(new_run: &str) -> String {
+    format!(
+        "A newer run of this ticket started ({new_run}): this run no longer waits, and the \
+         ticket's work goes on there."
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

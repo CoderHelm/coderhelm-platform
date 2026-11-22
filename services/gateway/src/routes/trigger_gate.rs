@@ -50,6 +50,11 @@
 //!   one: on GitHub adding the trigger label or assigning CoderHelm, on
 //!   Jira re-adding the trigger label or re-assigning to CoderHelm. Retry,
 //!   commands and those gestures are never blocked by the cap
+//! - an alert firing again is the alert reopening, never an edit
+//!   ([`alert_firing`]): while its run waits on a person, reports a change
+//!   outside the code or has its PR open, it starts nothing. Each firing's
+//!   own values (the datapoint, the time) used to read as a changed ticket,
+//!   and every firing started a run beside the one already asking
 //! - explicit human triggers (slash commands, comment retries) skip the
 //!   content check but still respect in-flight blocking
 
@@ -186,6 +191,22 @@ fn decide(latest: &LatestRun, new_hash: Option<&str>, reopened: bool) -> Decisio
     } else {
         Decision::Skip("handled and unchanged")
     }
+}
+
+/// What an alert's firing gives the gate: no content hash, and `reopened`.
+///
+/// An alert has no edits. Each firing carries its own values (the datapoint,
+/// the time the alarm changed), and the gate hashed the alert's text while the
+/// run keeps the hash of the ticket text the worker reads, so the two never
+/// matched: every firing past the alert's repeat window read as an edited
+/// ticket and started a new run beside the one already waiting on a person
+/// for the same alarm. A firing is the alert opening again. While its run
+/// waits on a person, reports a change outside the code, or has its pull
+/// request open, it starts nothing; after its fix merged, or a person closed
+/// the run, it starts one (the fix didn't hold); a failed run is tried again
+/// up to [`MAX_FAILED_RUNS_IN_A_ROW`].
+pub fn alert_firing() -> (Option<&'static str>, bool) {
+    (None, true)
 }
 
 /// A person's retry gesture on a GitHub issue: adding the `coderhelm` label,
@@ -640,9 +661,9 @@ pub fn expected_attachment_keys(
 #[cfg(test)]
 mod tests {
     use super::{
-        decide, edit_note, failed_in_a_row, field, github_retry_gesture, handled, is_trigger_label,
-        jira_reopened, jira_retry_gesture, latest_ended_on_merge, latest_run, own_runs, retry_note,
-        Decision, Item, LatestRun, OpenPr, MAX_FAILED_RUNS_IN_A_ROW,
+        alert_firing, decide, edit_note, failed_in_a_row, field, github_retry_gesture, handled,
+        is_trigger_label, jira_reopened, jira_retry_gesture, latest_ended_on_merge, latest_run,
+        own_runs, retry_note, Decision, Item, LatestRun, OpenPr, MAX_FAILED_RUNS_IN_A_ROW,
     };
     use aws_sdk_dynamodb::types::AttributeValue;
 
@@ -1042,6 +1063,66 @@ mod tests {
         assert!(n.contains("Description now:\nTotals are wrong on the invoice page."));
         assert!(n.contains("Description before:\nTotals are wrong."));
         assert!(!n.contains("Title before"), "{n}");
+    }
+
+    /// One alarm on a made-up marina's slip sensors fired four times in a
+    /// day. Each firing past the alert's repeat window started a new run
+    /// beside the one already waiting on a person's answer, and each asked
+    /// the same question again: the gate read every firing as an edited
+    /// ticket. A firing is the alert opening again, never an edit.
+    #[test]
+    fn an_alert_firing_again_while_its_run_waits_starts_nothing() {
+        let firing = |value: &str, at: &str| {
+            let msg = serde_json::json!({
+                "AlarmName": "harbor-slip-sensor-drift",
+                "AlarmArn": "arn:aws:cloudwatch:us-east-1:111122223333:alarm:harbor-slip-sensor-drift",
+                "NewStateValue": "ALARM",
+                "OldStateValue": "OK",
+                "NewStateReason": format!(
+                    "Threshold Crossed: 1 datapoint [{value}] was greater than the threshold (500.0)."
+                ),
+                "StateChangeTime": at,
+                "Region": "US East (N. Virginia)",
+            });
+            crate::routes::alerts::normalize(None, &msg.to_string())
+        };
+        let first = firing("510.0", "2026-11-17T02:29:20.977+0000");
+        let again = firing("511.0", "2026-11-17T09:19:20.980+0000");
+        assert_eq!(first.fingerprint, again.fingerprint);
+        // What the run keeps as its ticket's hash: the text the worker reads.
+        let kept = common::ticket_context_hash(
+            &first.title,
+            &crate::routes::alerts::ticket_body("arn:aws:sns:us-east-1:1:harbor", &first, ""),
+            &[],
+        );
+        let (hash, reopened) = alert_firing();
+        for waiting in [
+            run("needs_input", 0, "", &kept),
+            run("needs_outside_change", 0, "", &kept),
+            run("completed", 0, "", &kept),
+            run("completed", 7, "", &kept),
+        ] {
+            assert!(
+                matches!(decide(&waiting, hash, reopened), Decision::Skip(_)),
+                "{} started a second run",
+                waiting.status
+            );
+        }
+        // After its fix merged, the alarm firing again is news: the fix didn't hold.
+        assert_eq!(
+            decide(&run("merged", 7, "merged", &kept), hash, reopened),
+            Decision::Enqueue
+        );
+        // A failed run is tried again, up to the cap.
+        assert_eq!(
+            decide(&run("failed", 0, "", &kept), hash, reopened),
+            Decision::Enqueue
+        );
+        let capped = LatestRun {
+            failed_in_a_row: MAX_FAILED_RUNS_IN_A_ROW,
+            ..run("failed", 0, "", &kept)
+        };
+        assert!(matches!(decide(&capped, hash, reopened), Decision::Skip(_)));
     }
 
     #[test]
