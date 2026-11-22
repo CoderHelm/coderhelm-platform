@@ -30,6 +30,12 @@ import * as ssm from "aws-cdk-lib/aws-ssm";
 import { Construct } from "constructs";
 import { ResolvedConfig } from "./config";
 import { releaseStamp } from "./release";
+
+/** The App map's frame page: Floorplan's viewer, framed by the App map page. */
+export const APP_MAP_FRAME_PATH = "/app-map/frame.html";
+/** Its policy: its own scripts and the layout worker, no network at all, framed by this install only. */
+export const APP_MAP_FRAME_CSP =
+  "default-src 'none'; script-src 'self' 'unsafe-inline' blob:; worker-src blob:; style-src 'unsafe-inline'; font-src data:; img-src data: blob:; connect-src 'none'; form-action 'none'; base-uri 'none'; object-src 'none'; frame-ancestors 'self'";
 import { logAccessTo, logBucketOf } from "./storage-stack";
 
 /**
@@ -236,6 +242,20 @@ export class WebStack extends cdk.Stack {
       },
     });
 
+    // The App map's frame (Floorplan's map viewer, which the App map page
+    // shows in a sandboxed iframe): framed by this install only, and no
+    // network at all.
+    const appMapFrameHeaders = new cloudfront.ResponseHeadersPolicy(this, "AppMapFrameHeaders", {
+      responseHeadersPolicyName: `${prefix}-web-app-map-frame`,
+      securityHeadersBehavior: {
+        strictTransportSecurity: { accessControlMaxAge: cdk.Duration.days(365), includeSubdomains: false, override: true },
+        contentTypeOptions: { override: true },
+        frameOptions: { frameOption: cloudfront.HeadersFrameOption.SAMEORIGIN, override: true },
+        referrerPolicy: { referrerPolicy: cloudfront.HeadersReferrerPolicy.NO_REFERRER, override: true },
+        contentSecurityPolicy: { contentSecurityPolicy: APP_MAP_FRAME_CSP, override: true },
+      },
+    });
+
     const staticPaths = new cloudfront.Function(this, "StaticPaths", {
       functionName: `${prefix}-web-paths`,
       code: cloudfront.FunctionCode.fromInline(STATIC_PATHS_FUNCTION),
@@ -251,6 +271,16 @@ export class WebStack extends cdk.Stack {
       additionalBehaviors[p] = { origin: apiOrigin, ...passThrough };
     }
 
+    const siteOrigin = origins.S3BucketOrigin.withOriginAccessControl(bucket, {
+      originAccessLevels: [cloudfront.AccessLevel.READ, cloudfront.AccessLevel.LIST],
+    });
+    additionalBehaviors[APP_MAP_FRAME_PATH] = {
+      origin: siteOrigin,
+      viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+      cachePolicy: cloudfront.CachePolicy.CACHING_OPTIMIZED,
+      responseHeadersPolicy: appMapFrameHeaders,
+    };
+
     this.distribution = new cloudfront.Distribution(this, "Distribution", {
       comment: `${prefix} dashboard and API`,
       ...(domain && certificate ? { domainNames: [domain.hostname], certificate } : {}),
@@ -260,9 +290,7 @@ export class WebStack extends cdk.Stack {
       defaultBehavior: {
         // List too, so a file that isn't there is a 404 (not S3's 403),
         // which the error response below turns into the install's own page.
-        origin: origins.S3BucketOrigin.withOriginAccessControl(bucket, {
-          originAccessLevels: [cloudfront.AccessLevel.READ, cloudfront.AccessLevel.LIST],
-        }),
+        origin: siteOrigin,
         viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
         cachePolicy: cloudfront.CachePolicy.CACHING_OPTIMIZED,
         responseHeadersPolicy: securityHeaders,
