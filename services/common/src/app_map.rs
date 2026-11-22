@@ -83,103 +83,298 @@ pub fn job_key(team_id: &str) -> String {
 pub const STATUS_SK: &str = "STATUS";
 /// A build queued or running this long is treated as stuck.
 pub const STALE_SECS: i64 = 45 * 60;
+/// A turn the worker took this long ago without a word since is taken to
+/// have died with its worker (a Lambda runs at most 15 minutes), so the same
+/// message, delivered again, may take it again.
+pub const LEASE_SECS: i64 = 16 * 60;
+
+/// The build's steps in order, by key; the page words each one. `done` is
+/// the map written.
+pub const STAGES: [&str; 4] = ["reading", "parts", "describing", "done"];
 
 /// Where the team's map build is.
+///
+/// One build at a time: a build has an id (`build`), and each message of it
+/// takes its numbered turn (`turn`), so a second press of "Build the map
+/// again", or a message delivered twice, finds the build already running and
+/// does nothing ([`queue_next`], [`take_turn`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Status {
     /// `queued`, `building`, `ready` or `failed`.
     pub state: String,
+    /// When the status last changed (a running build's last sign of life).
     pub at: i64,
     /// What the build is doing now, in plain words.
     #[serde(default)]
     pub step: String,
     #[serde(default)]
     pub error: String,
+    /// The build this status is about.
+    #[serde(default)]
+    pub build: String,
+    /// Turns of the build taken so far.
+    #[serde(default)]
+    pub turn: u32,
+    /// When the build was asked for.
+    #[serde(default)]
+    pub started: i64,
+    /// One of [`STAGES`].
+    #[serde(default)]
+    pub stage: String,
+    /// Repositories this build reads.
+    #[serde(default)]
+    pub repos: u32,
+    /// When the map that is there now was finished (0: not known).
+    #[serde(default)]
+    pub built: i64,
+    /// Repositories that map was made from.
+    #[serde(default)]
+    pub built_repos: u32,
 }
 
 impl Status {
     pub fn is_stale(&self, now: i64) -> bool {
         matches!(self.state.as_str(), "queued" | "building") && now - self.at > STALE_SECS
     }
+
+    /// A build is queued or running (and not stuck).
+    pub fn is_running(&self, now: i64) -> bool {
+        matches!(self.state.as_str(), "queued" | "building") && !self.is_stale(now)
+    }
+}
+
+/// A new build, unless one is already queued or running: `None` then, and
+/// the running build stands. What is known about the last map is kept.
+pub fn queue_next(cur: Option<&Status>, now: i64, build: &str) -> Option<Status> {
+    if cur.is_some_and(|s| s.is_running(now)) {
+        return None;
+    }
+    let prev = cur.cloned().unwrap_or_default();
+    Some(Status {
+        state: "queued".into(),
+        at: now,
+        step: "Waiting to start".into(),
+        error: String::new(),
+        build: build.to_string(),
+        turn: 0,
+        started: now,
+        stage: STAGES[0].into(),
+        repos: if prev.repos > 0 {
+            prev.repos
+        } else {
+            prev.built_repos
+        },
+        built: prev.built,
+        built_repos: prev.built_repos,
+    })
+}
+
+/// The worker taking turn `turn` of build `build` (one message of it):
+/// `None` when the message is not the build's next one (a second message for
+/// a build already running, a message delivered twice, a build replaced by a
+/// newer one), and the worker does nothing with it. A message from before
+/// builds had ids (`build` empty) carries on a build that has none.
+pub fn take_turn(cur: Option<&Status>, build: &str, turn: u32, now: i64) -> Option<Status> {
+    let s = cur?;
+    if s.build != build {
+        return None;
+    }
+    let expected = if turn == 0 { "queued" } else { "building" };
+    let next = s.turn == turn && s.state == expected;
+    // The same message again, after the worker that took it died.
+    let again = s.turn == turn + 1 && s.state == "building" && now - s.at > LEASE_SECS;
+    if !next && !again {
+        return None;
+    }
+    let mut out = s.clone();
+    out.state = "building".into();
+    out.turn = turn + 1;
+    out.at = now;
+    out.error.clear();
+    Some(out)
+}
+
+/// The running build's progress: `None` when `build` is no longer the one
+/// running.
+pub fn progress(
+    cur: Option<&Status>,
+    build: &str,
+    stage: Option<&str>,
+    step: &str,
+    now: i64,
+) -> Option<Status> {
+    let s = cur.filter(|s| s.build == build && s.state == "building")?;
+    let mut out = s.clone();
+    if let Some(st) = stage {
+        out.stage = st.into();
+    }
+    out.step = step.into();
+    out.at = now;
+    Some(out)
+}
+
+/// The build finished: `repos` is how many repositories the map covers (0
+/// with a note when there was nothing to map).
+pub fn finished(
+    cur: Option<&Status>,
+    build: &str,
+    repos: u32,
+    note: &str,
+    now: i64,
+) -> Option<Status> {
+    let s =
+        cur.filter(|s| s.build == build && matches!(s.state.as_str(), "queued" | "building"))?;
+    let mut out = s.clone();
+    out.state = "ready".into();
+    out.stage = STAGES[3].into();
+    out.step.clear();
+    out.error = note.into();
+    out.at = now;
+    if repos > 0 {
+        out.repos = repos;
+        out.built = now;
+        out.built_repos = repos;
+    }
+    Some(out)
+}
+
+/// The build stopped, and why in plain words.
+pub fn failed(cur: Option<&Status>, build: &str, why: &str, now: i64) -> Option<Status> {
+    let s =
+        cur.filter(|s| s.build == build && matches!(s.state.as_str(), "queued" | "building"))?;
+    let mut out = s.clone();
+    out.state = "failed".into();
+    out.error = why.into();
+    out.at = now;
+    Some(out)
+}
+
+/// How long a build usually takes for this many repositories, in seconds
+/// (low and high): the sandbox reads and builds the map two or three times,
+/// and the model works out the parts and describes each one.
+pub fn estimate_secs(repos: u32) -> (i64, i64) {
+    let r = repos.max(1) as i64;
+    let low = (3 + r) * 60;
+    let high = ((6 + 2 * r) * 60).min(STALE_SECS);
+    (low.min(high), high)
 }
 
 type Dynamo = aws_sdk_dynamodb::Client;
 use aws_sdk_dynamodb::types::AttributeValue as A;
 
-pub async fn status(dynamo: &Dynamo, table: &str, team_id: &str) -> Option<Status> {
+/// The status and its version (0: an item from before versions, or none).
+async fn read_status(
+    dynamo: &Dynamo,
+    table: &str,
+    team_id: &str,
+) -> Result<(Option<Status>, Option<i64>), String> {
     let out = dynamo
         .get_item()
         .table_name(table)
         .key("pk", A::S(map_pk(team_id)))
         .key("sk", A::S(STATUS_SK.into()))
+        .consistent_read(true)
         .send()
         .await
-        .ok()?;
-    serde_json::from_str(out.item()?.get("json")?.as_s().ok()?).ok()
+        .map_err(|e| format!("{}", aws_sdk_dynamodb::error::DisplayErrorContext(e)))?;
+    let Some(item) = out.item() else {
+        return Ok((None, None));
+    };
+    let st = item
+        .get("json")
+        .and_then(|v| v.as_s().ok())
+        .and_then(|j| serde_json::from_str(j).ok());
+    let v = item
+        .get("v")
+        .and_then(|v| v.as_n().ok())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0);
+    Ok((st, Some(v)))
 }
 
-pub async fn set_status(dynamo: &Dynamo, table: &str, team_id: &str, st: &Status) {
-    let _ = dynamo
-        .put_item()
-        .table_name(table)
-        .item("pk", A::S(map_pk(team_id)))
-        .item("sk", A::S(STATUS_SK.into()))
-        .item("json", A::S(serde_json::to_string(st).unwrap_or_default()))
-        .item("state", A::S(st.state.clone()))
-        .item("at", A::N(st.at.to_string()))
-        .send()
-        .await;
+pub async fn status(dynamo: &Dynamo, table: &str, team_id: &str) -> Option<Status> {
+    read_status(dynamo, table, team_id).await.ok()?.0
 }
 
-/// Marks a build queued: once (a build queued or running is not queued
-/// again unless stuck), or always with `force`. `Ok(true)`: send the message.
-pub async fn mark_queued(
+/// What [`update_status`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Updated {
+    /// The new status was written.
+    Written(Status),
+    /// The change didn't apply to the status as it is, which is kept.
+    Kept(Option<Status>),
+}
+
+/// Changes the status with `change` (given the status as it is, it returns
+/// the new one, or `None` to leave it), written only if nobody wrote it in
+/// between: each write carries the next version, conditioned on the one it
+/// read, and a write that lost the race reads again and asks `change` again.
+pub async fn update_status(
     dynamo: &Dynamo,
     table: &str,
     team_id: &str,
-    force: bool,
-) -> Result<bool, String> {
-    let now = chrono::Utc::now().timestamp();
-    let st = Status {
-        state: "queued".into(),
-        at: now,
-        step: "Waiting to start".into(),
-        error: String::new(),
-    };
-    let mut put = dynamo
-        .put_item()
-        .table_name(table)
-        .item("pk", A::S(map_pk(team_id)))
-        .item("sk", A::S(STATUS_SK.into()))
-        .item("json", A::S(serde_json::to_string(&st).unwrap_or_default()))
-        .item("state", A::S("queued".into()))
-        .item("at", A::N(now.to_string()));
-    if !force {
-        put = put
-            .condition_expression(
-                "attribute_not_exists(sk) OR NOT (#st IN (:q, :b)) OR #at < :cutoff",
+    change: impl Fn(Option<&Status>) -> Option<Status>,
+) -> Result<Updated, String> {
+    for _ in 0..5 {
+        let (cur, version) = read_status(dynamo, table, team_id).await?;
+        let Some(next) = change(cur.as_ref()) else {
+            return Ok(Updated::Kept(cur));
+        };
+        let v = version.unwrap_or(0);
+        let mut put = dynamo
+            .put_item()
+            .table_name(table)
+            .item("pk", A::S(map_pk(team_id)))
+            .item("sk", A::S(STATUS_SK.into()))
+            .item(
+                "json",
+                A::S(serde_json::to_string(&next).unwrap_or_default()),
             )
-            .expression_attribute_names("#st", "state")
-            .expression_attribute_names("#at", "at")
-            .expression_attribute_values(":q", A::S("queued".into()))
-            .expression_attribute_values(":b", A::S("building".into()))
-            .expression_attribute_values(":cutoff", A::N((now - STALE_SECS).to_string()));
-    }
-    match put.send().await {
-        Ok(_) => Ok(true),
-        Err(e) => {
-            if e.as_service_error()
-                .map(|se| se.is_conditional_check_failed_exception())
-                .unwrap_or(false)
+            .item("state", A::S(next.state.clone()))
+            .item("at", A::N(next.at.to_string()))
+            .item("v", A::N((v + 1).to_string()));
+        put = match version {
+            None => put.condition_expression("attribute_not_exists(pk)"),
+            Some(0) => put
+                .condition_expression("attribute_not_exists(#v)")
+                .expression_attribute_names("#v", "v"),
+            Some(v) => put
+                .condition_expression("#v = :v")
+                .expression_attribute_names("#v", "v")
+                .expression_attribute_values(":v", A::N(v.to_string())),
+        };
+        match put.send().await {
+            Ok(_) => return Ok(Updated::Written(next)),
+            Err(e)
+                if e.as_service_error()
+                    .is_some_and(|se| se.is_conditional_check_failed_exception()) =>
             {
-                Ok(false)
-            } else {
-                Err(format!(
+                continue
+            }
+            Err(e) => {
+                return Err(format!(
                     "{}",
                     aws_sdk_dynamodb::error::DisplayErrorContext(e)
                 ))
             }
         }
+    }
+    Err("the map's build status kept changing; try again".into())
+}
+
+/// Asks for a build: `Ok(Ok(new))` when it is queued (send its message),
+/// `Ok(Err(running))` when a build is already queued or running for the
+/// team, which stands.
+pub async fn queue_build(
+    dynamo: &Dynamo,
+    table: &str,
+    team_id: &str,
+) -> Result<Result<Status, Option<Status>>, String> {
+    let now = chrono::Utc::now().timestamp();
+    let build = format!("{:032x}", rand::random::<u128>());
+    match update_status(dynamo, table, team_id, |cur| queue_next(cur, now, &build)).await? {
+        Updated::Written(s) => Ok(Ok(s)),
+        Updated::Kept(cur) => Ok(Err(cur)),
     }
 }
 
@@ -203,6 +398,15 @@ pub fn gunzip(bytes: &[u8], max: usize) -> Option<Vec<u8>> {
 
 /// The team's map as built, if any. Only ever the team's own key.
 pub async fn load_graph(s3: &aws_sdk_s3::Client, bucket: &str, team_id: &str) -> Option<Value> {
+    load_graph_dated(s3, bucket, team_id).await.map(|(g, _)| g)
+}
+
+/// The team's map and when it was written (unix seconds, 0 if not known).
+pub async fn load_graph_dated(
+    s3: &aws_sdk_s3::Client,
+    bucket: &str,
+    team_id: &str,
+) -> Option<(Value, i64)> {
     let obj = s3
         .get_object()
         .bucket(bucket)
@@ -210,10 +414,32 @@ pub async fn load_graph(s3: &aws_sdk_s3::Client, bucket: &str, team_id: &str) ->
         .send()
         .await
         .ok()?;
+    let at = obj.last_modified().map(|t| t.secs()).unwrap_or(0);
     let bytes = obj.body.collect().await.ok()?.into_bytes();
     let json = gunzip(&bytes, MAX_GRAPH_BYTES)?;
     let v: Value = serde_json::from_slice(&json).ok()?;
-    (v["schema"] == GRAPH_SCHEMA).then_some(v)
+    (v["schema"] == GRAPH_SCHEMA).then_some((v, at))
+}
+
+/// When the team's map was written (unix seconds, 0 if not known), without
+/// reading it; `None` when there is no map.
+pub async fn graph_written_at(s3: &aws_sdk_s3::Client, bucket: &str, team_id: &str) -> Option<i64> {
+    let head = s3
+        .head_object()
+        .bucket(bucket)
+        .key(graph_key(team_id))
+        .send()
+        .await
+        .ok()?;
+    Some(head.last_modified().map(|t| t.secs()).unwrap_or(0))
+}
+
+/// How many repositories a built map covers.
+pub fn repo_count(graph: &Value) -> u32 {
+    graph["coderhelm"]["repos"]
+        .as_object()
+        .map(|m| m.len() as u32)
+        .unwrap_or(0)
 }
 
 /// Whether the team has a built map, without reading it (Chat offers the
@@ -1045,6 +1271,90 @@ fn check_at(schema: &Value, v: &Value, at: &str, out: &mut Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_build_at_a_time() {
+        let now = 10_000;
+        let first = queue_next(None, now, "b1").unwrap();
+        assert_eq!(
+            (first.state.as_str(), first.build.as_str()),
+            ("queued", "b1")
+        );
+        // A second ask while it is queued, then while it runs: refused.
+        assert!(queue_next(Some(&first), now + 3, "b2").is_none());
+        let running = take_turn(Some(&first), "b1", 0, now + 5).unwrap();
+        assert!(queue_next(Some(&running), now + 8, "b3").is_none());
+        // Stuck past STALE_SECS: a new build may replace it.
+        assert!(queue_next(Some(&running), now + 5 + STALE_SECS + 1, "b4").is_some());
+        // Finished or failed: a new build, keeping when the last map was made.
+        let done = finished(Some(&running), "b1", 12, "", now + 300).unwrap();
+        assert_eq!((done.built, done.built_repos), (now + 300, 12));
+        let again = queue_next(Some(&done), now + 400, "b5").unwrap();
+        assert_eq!(
+            (again.built, again.built_repos, again.repos),
+            (now + 300, 12, 12)
+        );
+        let f = failed(Some(&again), "b5", "GitHub didn't answer", now + 401).unwrap();
+        assert!(queue_next(Some(&f), now + 402, "b6").is_some());
+    }
+
+    #[test]
+    fn each_message_takes_its_own_turn_once() {
+        let now = 10_000;
+        let q = queue_next(None, now, "b1").unwrap();
+        // Another build's message, or a turn out of order: nothing.
+        assert!(take_turn(Some(&q), "other", 0, now).is_none());
+        assert!(take_turn(Some(&q), "b1", 1, now).is_none());
+        let t1 = take_turn(Some(&q), "b1", 0, now).unwrap();
+        assert_eq!((t1.state.as_str(), t1.turn), ("building", 1));
+        // The same start message delivered again: skipped.
+        assert!(take_turn(Some(&t1), "b1", 0, now + 2).is_none());
+        let t2 = take_turn(Some(&t1), "b1", 1, now + 60).unwrap();
+        assert_eq!(t2.turn, 2);
+        assert!(take_turn(Some(&t2), "b1", 1, now + 61).is_none());
+        // Delivered again after its worker went quiet past the lease: taken again.
+        assert!(take_turn(Some(&t2), "b1", 1, now + 60 + LEASE_SECS + 1).is_some());
+        // A message from before build ids carries on a build without one.
+        let legacy = Status {
+            state: "building".into(),
+            at: now,
+            turn: 0,
+            ..Default::default()
+        };
+        assert!(take_turn(Some(&legacy), "", 0, now).is_none());
+        assert!(take_turn(
+            Some(&Status {
+                state: "queued".into(),
+                ..legacy.clone()
+            }),
+            "",
+            0,
+            now
+        )
+        .is_some());
+        // Progress and the end only for the build that is running.
+        assert!(progress(Some(&t2), "other", Some("parts"), "x", now).is_none());
+        assert_eq!(
+            progress(Some(&t2), "b1", Some("parts"), "x", now)
+                .unwrap()
+                .stage,
+            "parts"
+        );
+        assert_eq!(
+            progress(Some(&t2), "b1", None, "y", now).unwrap().stage,
+            "reading"
+        );
+        assert!(finished(Some(&t2), "other", 3, "", now).is_none());
+    }
+
+    #[test]
+    fn the_estimate_grows_with_the_repositories() {
+        assert_eq!(estimate_secs(0), estimate_secs(1));
+        assert_eq!(estimate_secs(1), (4 * 60, 8 * 60));
+        assert_eq!(estimate_secs(12), (15 * 60, 30 * 60));
+        let (low, high) = estimate_secs(200);
+        assert!(low <= high && high <= STALE_SECS);
+    }
 
     /// The map Floorplan builds for the made-up harbor app (a web app and an
     /// API in two repositories), written by

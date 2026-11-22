@@ -575,27 +575,64 @@ async fn s3_put(state: &WorkerState, key: &str, body: Vec<u8>) -> Result<(), Str
         .map_err(|e| format!("app map: could not keep {key}: {e}"))
 }
 
-async fn set(state: &WorkerState, team_id: &str, st: &str, step: &str, error: &str) {
-    am::set_status(
+/// Changes the running build's status; `Err` when `build` is no longer the
+/// build running (a newer one replaced it), and this one stops.
+async fn change(
+    state: &WorkerState,
+    team_id: &str,
+    f: impl Fn(Option<&am::Status>, i64) -> Option<am::Status>,
+) -> Result<(), String> {
+    let now = chrono::Utc::now().timestamp();
+    match am::update_status(
         &state.dynamo,
         &state.config.settings_table_name,
         team_id,
-        &am::Status {
-            state: st.into(),
-            at: chrono::Utc::now().timestamp(),
-            step: step.into(),
-            error: error.into(),
-        },
+        |cur| f(cur, now),
     )
-    .await;
+    .await?
+    {
+        am::Updated::Written(_) => Ok(()),
+        am::Updated::Kept(_) => Err("this build is no longer the one running".into()),
+    }
 }
 
-/// Queues the next step (or a whole new build with `step` empty).
-pub async fn queue(state: &WorkerState, team_id: &str, step: &str, delay_secs: i32) -> bool {
+/// The build's step, in plain words (and its stage, one of `am::STAGES`).
+async fn progress(
+    state: &WorkerState,
+    team_id: &str,
+    build: &str,
+    stage: Option<&str>,
+    step: &str,
+) -> Result<(), String> {
+    change(state, team_id, |cur, now| {
+        am::progress(cur, build, stage, step, now)
+    })
+    .await
+}
+
+/// The message's turn of the build, if it is the build's next one: `None`
+/// for a second message about a build already running, a message delivered
+/// twice, or a build a newer one replaced, which the worker skips.
+pub fn turn_to_take(msg: &AppMapMessage, cur: Option<&am::Status>, now: i64) -> Option<am::Status> {
+    am::take_turn(cur, &msg.build, msg.turn, now)
+}
+
+/// Queues the next step of a build (or a whole new build with `step` empty
+/// and `turn` 0).
+pub async fn queue(
+    state: &WorkerState,
+    team_id: &str,
+    step: &str,
+    build: &str,
+    turn: u32,
+    delay_secs: i32,
+) -> bool {
     let msg = crate::models::WorkerMessage::AppMap(AppMapMessage {
         team_id: team_id.to_string(),
         repo: String::new(),
         step: step.to_string(),
+        build: build.to_string(),
+        turn,
     });
     let Ok(body) = serde_json::to_string(&msg) else {
         return false;
@@ -617,41 +654,69 @@ pub async fn after_push(state: &WorkerState, team_id: &str) {
     if s3_get(state, &am::state_key(team_id)).await.is_none() {
         return;
     }
-    if let Ok(true) = am::mark_queued(
-        &state.dynamo,
-        &state.config.settings_table_name,
-        team_id,
-        false,
-    )
-    .await
+    // A build already queued or running covers this push.
+    if let Ok(Ok(st)) =
+        am::queue_build(&state.dynamo, &state.config.settings_table_name, team_id).await
     {
-        queue(state, team_id, "", 120).await;
+        queue(state, team_id, "", &st.build, 0, 120).await;
     }
 }
 
-/// One step of a team's map.
+/// One step of a team's map: the message's turn of its build, taken once.
 pub async fn run(state: &WorkerState, msg: AppMapMessage) {
     let team_id = msg.team_id.clone();
-    let call = step(state, msg);
+    let now = chrono::Utc::now().timestamp();
+    let taken = am::update_status(
+        &state.dynamo,
+        &state.config.settings_table_name,
+        &team_id,
+        |cur| turn_to_take(&msg, cur, now),
+    )
+    .await;
+    let st = match taken {
+        Ok(am::Updated::Written(st)) => st,
+        Ok(am::Updated::Kept(cur)) => {
+            info!(
+                team_id,
+                build = %msg.build,
+                turn = msg.turn,
+                running = %cur.map(|c| c.build).unwrap_or_default(),
+                "App map: not the build's next turn (a duplicate, or a build already running), skipped"
+            );
+            return;
+        }
+        Err(e) => {
+            warn!(team_id, error = %e, "App map: the build status couldn't be read");
+            return;
+        }
+    };
+    let build = st.build.clone();
+    let call = step(state, msg, &build, st.turn);
     if let Err(e) = common::usage::with_feature(common::usage::feature::APP_MAP, call).await {
         warn!(team_id, error = %e, "App map: the step failed");
-        set(state, &team_id, "failed", "", &e).await;
+        let _ = change(state, &team_id, |cur, now| am::failed(cur, &build, &e, now)).await;
     }
 }
 
-async fn step(state: &WorkerState, msg: AppMapMessage) -> Result<(), String> {
+async fn step(
+    state: &WorkerState,
+    msg: AppMapMessage,
+    build: &str,
+    turn: u32,
+) -> Result<(), String> {
     let team_id = msg.team_id.as_str();
     let repos = super::plan::fetch_team_repos(state, team_id).await;
     if repos.is_empty() {
-        set(
-            state,
-            team_id,
-            "ready",
-            "",
-            "No repositories are turned on for this team.",
-        )
+        return change(state, team_id, |cur, now| {
+            am::finished(
+                cur,
+                build,
+                0,
+                "No repositories are turned on for this team.",
+                now,
+            )
+        })
         .await;
-        return Ok(());
     }
     let installation = super::code_graph::team_installation_id(state, team_id)
         .await
@@ -686,9 +751,11 @@ async fn step(state: &WorkerState, msg: AppMapMessage) -> Result<(), String> {
         }
         let have_map = s3_get(state, &am::graph_key(team_id)).await.is_some();
         if have_map && heads == job.built {
-            set(state, team_id, "ready", "", "").await;
             info!(team_id, "App map: no default branch moved, nothing to redo");
-            return Ok(());
+            return change(state, team_id, |cur, now| {
+                am::finished(cur, build, 0, "", now)
+            })
+            .await;
         }
         let built = std::mem::take(&mut job.built);
         job = Job {
@@ -698,18 +765,27 @@ async fn step(state: &WorkerState, msg: AppMapMessage) -> Result<(), String> {
             ..Default::default()
         };
     }
-    set(
-        state,
-        team_id,
-        "building",
-        if msg.step.is_empty() {
-            "Reading the repositories"
-        } else {
-            "Building the map"
-        },
-        "",
-    )
-    .await;
+    if msg.step.is_empty() {
+        let n = job.heads.len() as u32;
+        change(state, team_id, |cur, now| {
+            am::progress(
+                cur,
+                build,
+                Some(am::STAGES[0]),
+                "Reading the repositories",
+                now,
+            )
+            .map(|mut s| {
+                s.repos = n;
+                s
+            })
+        })
+        .await?;
+    } else {
+        // The stage stays: putting the map together is part of the one
+        // before it.
+        progress(state, team_id, build, None, "Putting the map together").await?;
+    }
 
     // The snapshot: every repository at its head, and the last map's files.
     let mut budget = MAX_SNAPSHOT_BYTES;
@@ -816,14 +892,14 @@ async fn step(state: &WorkerState, msg: AppMapMessage) -> Result<(), String> {
     match decide(&result, &job) {
         Next::Architecture { job: name, item } => {
             job.arch_attempts += 1;
-            set(
+            progress(
                 state,
                 team_id,
-                "building",
-                "Working out the app's parts",
-                "",
+                build,
+                Some(am::STAGES[1]),
+                "Finding the parts and how they connect",
             )
-            .await;
+            .await?;
             // What CoderHelm already knows about each repository (its code
             // map) helps where Floorplan's scan summary is thin.
             let mut known = String::new();
@@ -886,18 +962,18 @@ async fn step(state: &WorkerState, msg: AppMapMessage) -> Result<(), String> {
             .ok_or("the map's parts couldn't be worked out this time")?;
             job.answers
                 .insert("floorplan/architecture.json".into(), answer);
-            next_step(state, team_id, &job).await
+            next_step(state, team_id, &job, build, turn).await
         }
         Next::Describe(keys) => {
             job.desc_attempts += 1;
-            set(
+            progress(
                 state,
                 team_id,
-                "building",
-                "Describing files and endpoints",
-                "",
+                build,
+                Some(am::STAGES[2]),
+                "Describing each part, file and endpoint",
             )
-            .await;
+            .await?;
             let style = result["describe"]["style"]
                 .as_str()
                 .unwrap_or("")
@@ -950,7 +1026,7 @@ async fn step(state: &WorkerState, msg: AppMapMessage) -> Result<(), String> {
                     }
                 }
             }
-            next_step(state, team_id, &job).await
+            next_step(state, team_id, &job, build, turn).await
         }
         Next::Stop(why) => {
             s3_put(
@@ -990,7 +1066,11 @@ async fn step(state: &WorkerState, msg: AppMapMessage) -> Result<(), String> {
                 serde_json::to_vec(&job).unwrap_or_default(),
             )
             .await?;
-            set(state, team_id, "ready", "", "").await;
+            let n = job.heads.len() as u32;
+            change(state, team_id, |cur, now| {
+                am::finished(cur, build, n, "", now)
+            })
+            .await?;
             info!(
                 team_id,
                 files = g["files"].as_array().map(|a| a.len()).unwrap_or(0),
@@ -1001,14 +1081,20 @@ async fn step(state: &WorkerState, msg: AppMapMessage) -> Result<(), String> {
     }
 }
 
-async fn next_step(state: &WorkerState, team_id: &str, job: &Job) -> Result<(), String> {
+async fn next_step(
+    state: &WorkerState,
+    team_id: &str,
+    job: &Job,
+    build: &str,
+    turn: u32,
+) -> Result<(), String> {
     s3_put(
         state,
         &am::job_key(team_id),
         serde_json::to_vec(job).unwrap_or_default(),
     )
     .await?;
-    if queue(state, team_id, "build", 0).await {
+    if queue(state, team_id, "build", build, turn, 0).await {
         Ok(())
     } else {
         Err("the next step couldn't be queued".into())
@@ -1018,6 +1104,41 @@ async fn next_step(state: &WorkerState, team_id: &str, job: &Job) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_duplicate_message_for_a_build_already_running_is_skipped() {
+        let now = 10_000;
+        let msg = |build: &str, step: &str, turn: u32| AppMapMessage {
+            team_id: "TEAM#harbor".into(),
+            step: step.into(),
+            build: build.into(),
+            turn,
+            ..Default::default()
+        };
+        let queued = am::queue_next(None, now, "b1").unwrap();
+        // The build's start message runs once.
+        let running = turn_to_take(&msg("b1", "", 0), Some(&queued), now).unwrap();
+        assert_eq!((running.state.as_str(), running.turn), ("building", 1));
+        // The same start message again, or a start for another build while
+        // this one runs: skipped.
+        assert_eq!(
+            turn_to_take(&msg("b1", "", 0), Some(&running), now + 3),
+            None
+        );
+        assert_eq!(
+            turn_to_take(&msg("b2", "", 0), Some(&running), now + 3),
+            None
+        );
+        // The build's next step runs once, too.
+        let next = turn_to_take(&msg("b1", "build", 1), Some(&running), now + 60).unwrap();
+        assert_eq!(next.turn, 2);
+        assert_eq!(
+            turn_to_take(&msg("b1", "build", 1), Some(&next), now + 61),
+            None
+        );
+        // No status at all (nothing asked for a build): nothing runs.
+        assert_eq!(turn_to_take(&msg("b1", "", 0), None, now), None);
+    }
 
     #[test]
     fn the_steps_follow_floorplans_workflow() {

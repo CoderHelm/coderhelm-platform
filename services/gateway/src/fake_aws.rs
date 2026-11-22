@@ -1,5 +1,6 @@
 //! A small in-process stand-in for the AWS services sign-in calls (DynamoDB,
-//! Cognito and KMS), so tests run the real handlers end to end against
+//! Cognito and KMS) and the App map's (SQS messages it records, and S3 with
+//! no objects), so tests run the real handlers end to end against
 //! records they set up. It speaks the services' JSON protocols on a local
 //! port; the SDK clients are pointed at it with an endpoint override.
 //!
@@ -17,7 +18,7 @@
 use axum::{
     body::Bytes,
     extract::State,
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, Method, StatusCode, Uri},
     response::{IntoResponse, Response},
     Router,
 };
@@ -49,9 +50,21 @@ pub struct Store {
     /// Every transaction is cancelled (as when another write changed an
     /// item it checks in between).
     cancel_transactions: std::sync::atomic::AtomicBool,
+    /// SQS messages sent: `(queue url, body)`.
+    sent: Mutex<Vec<(String, String)>>,
 }
 
 impl Store {
+    /// The bodies of the SQS messages sent so far.
+    pub fn sent(&self) -> Vec<String> {
+        self.sent
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, b)| b.clone())
+            .collect()
+    }
+
     /// Cancels every transaction from now on.
     pub fn cancel_transactions(&self) {
         self.cancel_transactions
@@ -244,18 +257,48 @@ fn ok(v: Value) -> Response {
         .into_response()
 }
 
-async fn handle(State(store): State<Arc<Store>>, headers: HeaderMap, body: Bytes) -> Response {
+async fn handle(
+    State(store): State<Arc<Store>>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
     let target = headers
         .get("x-amz-target")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
+    // S3 holds no objects: a read of one is not found.
+    if target.is_empty() && matches!(method, Method::GET | Method::HEAD) {
+        return (
+            StatusCode::NOT_FOUND,
+            [("content-type", "application/xml")],
+            format!(
+                "<Error><Code>NoSuchKey</Code><Message>no {}</Message></Error>",
+                uri.path()
+            ),
+        )
+            .into_response();
+    }
     let req: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
     let (service, op) = target.split_once('.').unwrap_or(("", ""));
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match service {
         "DynamoDB_20120810" => dynamo(&store, op, &req),
         "AWSCognitoIdentityProviderService" => cognito(&store, op, &req),
         "TrentService" => kms(&store, op, &req),
+        "AmazonSQS" if op == "SendMessage" => {
+            let mut sent = store.sent.lock().unwrap();
+            sent.push((
+                req["QueueUrl"].as_str().unwrap_or("").to_string(),
+                req["MessageBody"].as_str().unwrap_or("").to_string(),
+            ));
+            let body = req["MessageBody"].as_str().unwrap_or("");
+            ok(json!({
+                "MessageId": format!("m-{}", sent.len()),
+                "MD5OfMessageBody": format!("{:x}", md5::compute(body.as_bytes())),
+            }))
+        }
         // Services without a JSON target (SES's REST API: the emails a flow
         // sends) are accepted and not checked.
         "" => ok(json!({ "MessageId": "stand-in" })),
@@ -892,6 +935,8 @@ pub fn state(url: &str) -> Arc<crate::AppState> {
             users_table_name: "users".into(),
             settings_table_name: "settings".into(),
             repos_table_name: "repos".into(),
+            bucket_name: "bucket".into(),
+            ticket_queue_url: format!("{url}/queue/tickets"),
             cognito_user_pool_id: "pool".into(),
             cognito_client_id: "client".into(),
             secrets_key_id: "key".into(),

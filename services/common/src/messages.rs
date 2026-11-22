@@ -717,6 +717,14 @@ pub struct AppMapMessage {
     pub repo: String,
     #[serde(default)]
     pub step: String,
+    /// The build this message belongs to (`common::app_map::Status::build`);
+    /// empty on a message from before builds had ids.
+    #[serde(default)]
+    pub build: String,
+    /// Which turn of the build this message is: the worker takes it once
+    /// (`common::app_map::take_turn`), so a duplicate does nothing.
+    #[serde(default)]
+    pub turn: u32,
 }
 
 /// A coalesced release-tag sweep. Carries only routing + the batch clock; the
