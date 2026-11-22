@@ -1,1 +1,1 @@
-{"name":"harbor-web","private":true,"dependencies":{"next":"15.0.0","react":"19.0.0"}}
+{"name":"harbor-web","private":true,"dependencies":{"next":"15.5.29","react":"19.0.0"}}
