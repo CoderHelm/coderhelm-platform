@@ -127,7 +127,7 @@ Sign in with Microsoft is one app for the whole deployment and finds people by e
 1. In **Settings, Sign-in rules, Microsoft Entra**, the owner enters the tenant ID (Microsoft Entra admin center, Overview: a GUID) and, on hosted CoderHelm, the email domains the tenant signs people in for. The personal-accounts tenant is never accepted. Each domain is proven with the same DNS TXT record as an Okta domain (**Verify domains**).
 2. The owner chooses **Test sign-in**. Microsoft asks them to sign in through that tenant only (`login.microsoftonline.com/<tenant id>`), every check a real sign-in makes runs, and the token's issuer must be exactly the tenant's. Microsoft's email counts only with `xms_edov` true, as for every Microsoft sign-in.
 3. The owner turns it on. That needs their own Test sign-in within the last hour and, on hosted CoderHelm, every domain proven in DNS at that moment. Saving another tenant turns it off, needs a new test, and drops every member's link.
-4. Each member links their own account in **Settings, Security, Microsoft**, from a session of theirs: a trip through the tenant that stores the tenant ID and the account's object ID on their member record. One account links to one member of a team. A sign-in through the team's tenant (the sign-in page starts it for a team that requires it) lands only on the member who linked exactly that tenant and object ID, never by email. Its session is held to the team on hosted CoderHelm, as an Okta session is, and is never a platform admin. It ends when the link changes or the tenant is turned off.
+4. Guests in the tenant (accounts another directory signs in, B2B) never count: a token whose `idp` names another directory, or with `acct` = 1, is refused. Each member links their own account in **Settings, Security, Microsoft**, from a session of theirs: a trip through the tenant that stores the tenant ID and the account's object ID on their member record. One account links to one member of a team. A sign-in through the team's tenant (the sign-in page starts it for a team that requires it) lands only on the member who linked exactly that tenant and object ID, never by email. Its session is held to the team on hosted CoderHelm, as an Okta session is, and is never a platform admin. It ends when the link changes or the tenant is turned off.
 
 ### Turning it on
 
@@ -142,7 +142,7 @@ The page lists the members who haven't linked the provider yet, and turning the 
 ### While it is on
 
 - **There is no way around it.** Members sign in only with the team's provider. Password, Google, GitHub, plain Microsoft (a personal account or another company's tenant) and the other provider are refused, for everyone, the owner included, with or without a second factor. The refusal names the team (on a self-hosted install, the organization) and the provider. Nothing is made instead: no personal team, no accepted invite, no join by email domain.
-- Sessions from any other way in end at their next request, including ones made before the rule. Switching into the team from another team's session is refused. Apps connected through CoderHelm's MCP server work only when they were connected from a session of the provider.
+- Sessions from any other way in end at their next request, including ones made before the rule, and they stay ended: turning the rule on records a cut-off (when, and with which provider) that turning it off never clears, so a session, stream token or app connection from before it, from any other way in, never comes back. Switching into the team from another team's session is refused. Apps connected through CoderHelm's MCP server work only when they were connected from a session of the provider: turning the rule on revokes the others, and a refresh of one the rule refuses ends it.
 - On hosted CoderHelm only this team is held back. A person on other teams signs in to those as before, and their sessions there go on.
 - While the rule is on, the provider it names can't be turned off or removed, moved to another Okta domain, issuer or tenant, or lose an email domain, and members can't unlink it. Turn the rule off first. Each of those writes checks the rule in the same database transaction, and turning the rule on checks that the setup (and each proven domain) is unchanged, so the two can never both land. The other provider's setup is not locked.
 - When the organization's Okta lists no email domains of its own, it signs in the organization's allowed domains: while the rule is on with Okta, none of those can be removed.
@@ -152,13 +152,13 @@ The page lists the members who haven't linked the provider yet, and turning the 
 - The short-lived tokens the plan chat and the brain stream use carry how their session signed in, and are checked against the rule when used.
 - The support view: a CoderHelm platform admin may view a team that requires single sign-on only with that team's own support grant (as for every team) and only from a session of their own that passed a second factor; it is read-only and every read is written to the team's audit log. It is never a session in the team.
 - A member record made through the provider has an id that carries a short hash of the Okta issuer or the tenant (`USER#okta_<hash>_<sub>`, `USER#microsoft_<hash>_<oid>`). The rule's stored names (`require_sso`, `require_sso_since`) are new: the feature was never released under another name, so nothing needs moving.
-- API keys and CI tokens are not sessions. They keep working as they are.
+- **Keys follow their maker.** An API key or a knowledge key works only while the member who made it is still on the team and linked to the required provider. A key of a maker who isn't linked is suspended (nothing is deleted: it works again once they link), and the turn-on confirm lists the keys that would be. Keys are not sessions and never sign in.
 
 ### If the provider is down or misconfigured
 
 Nobody can sign in until it's fixed. There is no bypass inside CoderHelm. The way back is outside it, and it only turns the rule off: it never makes a session for anyone.
 
-- **Self-hosted:** someone with the install's own AWS credentials runs the recovery script from the CoderHelm platform repository. It reads the organization record, and with `--apply` turns the rule off and writes the audit log line in one DynamoDB transaction; the install emails every owner at its next request (open the sign-in page once).
+- **Self-hosted:** someone with the install's own AWS credentials runs the recovery script from the CoderHelm platform repository. It reads the organization record, and with `--apply` turns the rule off and writes the audit log line in one DynamoDB transaction; the install emails every owner at its next request (open the sign-in page once), and tries again every 10 minutes until an email goes out.
 
   ```bash
   # SETTINGS_TABLE_NAME: the install's API function, Configuration, Environment variables
@@ -169,7 +169,7 @@ Nobody can sign in until it's fixed. There is no bypass inside CoderHelm. The wa
   ```
 
   Run it with the install account's credentials and region (`AWS_PROFILE`, `AWS_REGION`). It needs boto3. Then sign in the usual way; an owner turns the rule back on once the provider works.
-- **Hosted CoderHelm:** an owner contacts CoderHelm support from outside the product. Support verifies them out of band (for example a call, or a request from the company's own domain) and turns only this rule off, writing who they verified and how. That goes in the team's audit log and every owner is emailed. Support never gets a session in the team from it.
+- **Hosted CoderHelm:** an owner contacts CoderHelm support from outside the product. Support verifies them out of band (for example a call, or a request from the company's own domain) and turns only this rule off, writing who they verified and how. The rule goes off and that line goes in the team's audit log in one write: never one without the other. Every owner is emailed. Support never gets a session in the team from it.
 
 ### New members
 

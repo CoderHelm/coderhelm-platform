@@ -290,6 +290,14 @@ pub async fn token(
         return knowledge_key_token(&state, &headers, &form).await;
     }
     let store = oauth::store(&state);
+    // A refresh renews a connection only while its sign-in still meets the
+    // team's rules (Require single sign-on, and its cut-off); one that no
+    // longer does is ended here, refresh token and all.
+    if form.grant_type.as_deref() == Some("refresh_token") {
+        if let Some(r) = refused_refresh(&state, &store, form.refresh_token.as_deref()).await {
+            return r;
+        }
+    }
     match oauth::token(
         &store,
         &form,
@@ -311,6 +319,43 @@ pub async fn token(
             unavailable()
         }
     }
+}
+
+/// The answer to a refresh whose connection the team's sign-in rules now
+/// refuse (the connection is revoked), or `None` to go on.
+async fn refused_refresh(
+    state: &AppState,
+    store: &impl oauth::OAuthStore,
+    token: Option<&str>,
+) -> Option<Response> {
+    let gid = token.and_then(oauth::refresh_grant_id)?;
+    let g = match store.get_grant(gid).await {
+        Ok(Some(g)) if g.revoked_at.is_none() => g,
+        Ok(_) => return None,
+        Err(e) => {
+            error!(error = %e, "MCP connection not read");
+            return Some(unavailable());
+        }
+    };
+    let rule = match super::sign_in::team_rule(state, &g.team_id).await {
+        Ok(r) => r,
+        Err(e) => {
+            error!(error = %e, "Sign-in rules not read; refresh refused");
+            return Some(unavailable());
+        }
+    };
+    if super::require_sso::session_stands(&rule, g.created_at_secs, &g.proof()) {
+        return None;
+    }
+    let at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let _ = store
+        .revoke_grant(&g.team_id, &g.id, "single sign-on required", &at)
+        .await;
+    Some(oauth_error(
+        StatusCode::BAD_REQUEST,
+        "invalid_grant",
+        "This connection no longer meets the team's sign-in rules, so it was ended. Connect it again.",
+    ))
 }
 
 /// `grant_type=client_credentials` for a knowledge key (`crate::knowledge_keys`).

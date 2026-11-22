@@ -157,7 +157,7 @@ def run(dynamo, table, operator, note, apply, out=print, t=None):
     dynamo.transact_write_items(TransactItems=items)
     out(
         "Turned off. The audit log has the line, and every owner is emailed "
-        "at the install's next request (open the sign-in page once)."
+        "at the install's next request (open the sign-in page once); a mail failure is tried again every 10 minutes."
     )
     out("Sign in the usual way; an owner turns the rule back on once the provider works.")
     return 0

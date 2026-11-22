@@ -404,8 +404,11 @@ async fn a_connected_app_works_only_from_an_okta_sessions_grant() {
     assert!(okta.is_ok());
 }
 
+/// F1: a session from before the rule, from another way in, stays ended
+/// once the rule goes off: the cut-off outlives it. A sign-in after the
+/// cut-off works again.
 #[tokio::test]
-async fn turning_the_rule_off_lets_every_way_in_back() {
+async fn a_session_from_before_the_rule_stays_ended_after_it_goes_off() {
     let w = world().await;
     w.member(GATED, "USER#1", "ann@example.com", "member", &[]);
     let c = w.cookie(
@@ -415,13 +418,407 @@ async fn turning_the_rule_off_lets_every_way_in_back() {
         "member",
         &SignInProof::new(false, "google"),
     );
-    w.rule(GATED, true);
+    let now = chrono::Utc::now().timestamp() as u64;
+    let rule = |on: bool, cutoff: u64| {
+        let mut item = vec![
+            ("pk", json!(GATED)),
+            ("sk", json!(super::sign_in::TEAM_RULE_SK)),
+            ("sso_cutoff_at", json!(cutoff)),
+            ("sso_cutoff_provider", json!("okta")),
+        ];
+        if on {
+            item.push(("require_sso", json!("okta")));
+        }
+        w.f.store.put("settings", &item);
+    };
+    rule(true, now + 5);
     assert_eq!(
         w.call("GET", STATUS, &c, None).await.status,
         StatusCode::UNAUTHORIZED
     );
-    w.rule(GATED, false);
+    rule(false, now + 5);
+    let a = w.call("GET", STATUS, &c, None).await;
+    assert_eq!(a.status, StatusCode::UNAUTHORIZED, "never revived");
+    assert!(a.ends_session());
+    // A sign-in after the cut-off, with the rule off: as before.
+    rule(false, now.saturating_sub(5));
     assert_eq!(w.call("GET", STATUS, &c, None).await.status, StatusCode::OK);
+}
+
+/// F1: turning the rule on writes the cut-off; turning it off keeps it, and
+/// app connections the rule refuses are revoked at turn-on.
+#[tokio::test]
+async fn turning_on_writes_a_cut_off_that_turning_off_keeps_and_ends_connections() {
+    let _self_hosted = crate::routes::setup_checks::test_self_hosted::set(true);
+    let w = world().await;
+    let owner = selfhost_org(&w, false);
+    w.member(GATED, "USER#1", "ann@example.com", "member", &[]);
+    let google = w.cookie(
+        GATED,
+        "USER#1",
+        "ann@example.com",
+        "member",
+        &SignInProof::new(true, "google"),
+    );
+    use crate::mcp_oauth::OAuthStore;
+    let store = crate::mcp_oauth::store(&w.state);
+    let grant = |id: &str, via: &str| crate::mcp_oauth::StoredGrant {
+        id: id.into(),
+        team_id: GATED.into(),
+        user_id: "USER#1".into(),
+        email: "ann@example.com".into(),
+        client_id: "mcpc_1".into(),
+        client_name: "App".into(),
+        redirect_host: "app.example.com".into(),
+        scopes: vec![crate::mcp_oauth::READ_SCOPE.into()],
+        created_at: chrono::Utc::now().to_rfc3339(),
+        created_at_secs: chrono::Utc::now().timestamp() as u64,
+        mfa: true,
+        via: Some(via.into()),
+        okta_sub: (via == "okta").then(|| "o".into()),
+        entra: None,
+        refresh_hash: String::new(),
+        prev_refresh_hash: None,
+        refresh_expires_at: (chrono::Utc::now() + chrono::Duration::days(30)).to_rfc3339(),
+        last_used_at: None,
+        revoked_at: None,
+        revoked_by: None,
+    };
+    store
+        .create_grant(&grant("01jbgrantgoogle00000000001", "google"))
+        .await
+        .unwrap();
+    store
+        .create_grant(&grant("01jbgrantokta0000000000001", "okta"))
+        .await
+        .unwrap();
+    let a = w
+        .call(
+            "PUT",
+            "/api/sign-in",
+            &owner,
+            Some(json!({ "require_sso": "okta", "acknowledge_unlinked": true })),
+        )
+        .await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    let org = w.f.store.get("settings", "ORG", "META").unwrap();
+    assert_eq!(org["sso_cutoff_provider"], "okta");
+    assert!(org["sso_cutoff_at"].as_u64().unwrap() > 0);
+    let g = store
+        .get_grant("01jbgrantgoogle00000000001")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        g.revoked_at.is_some(),
+        "a connection the rule refuses ends at turn-on"
+    );
+    let g = store
+        .get_grant("01jbgrantokta0000000000001")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(g.revoked_at.is_none());
+    // Off again: the cut-off stays, and the Google session stays ended.
+    let a = w
+        .call(
+            "PUT",
+            "/api/sign-in",
+            &owner,
+            Some(json!({ "require_sso": "" })),
+        )
+        .await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    let org = w.f.store.get("settings", "ORG", "META").unwrap();
+    assert!(org["require_sso"].is_null());
+    assert_eq!(org["sso_cutoff_provider"], "okta");
+    assert_eq!(
+        w.call("GET", STATUS, &google, None).await.status,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+/// F1: a refresh renews a connection only while its sign-in meets the rule;
+/// one that doesn't is ended.
+#[tokio::test]
+async fn a_refresh_is_refused_and_the_connection_ended_when_the_rule_refuses_it() {
+    let w = world().await;
+    w.rule(GATED, true);
+    use crate::mcp_oauth::OAuthStore;
+    let store = crate::mcp_oauth::store(&w.state);
+    let id = "01jbgrantgoogle00000000002";
+    let token = crate::mcp_oauth::new_refresh(id);
+    let g = crate::mcp_oauth::StoredGrant {
+        id: id.into(),
+        team_id: GATED.into(),
+        user_id: "USER#1".into(),
+        email: "ann@example.com".into(),
+        client_id: "mcpc_1".into(),
+        client_name: "App".into(),
+        redirect_host: "app.example.com".into(),
+        scopes: vec![crate::mcp_oauth::READ_SCOPE.into()],
+        created_at: chrono::Utc::now().to_rfc3339(),
+        created_at_secs: 10,
+        mfa: true,
+        via: Some("google".into()),
+        okta_sub: None,
+        entra: None,
+        refresh_hash: crate::mcp_oauth::hash(&token),
+        prev_refresh_hash: None,
+        refresh_expires_at: (chrono::Utc::now() + chrono::Duration::days(30)).to_rfc3339(),
+        last_used_at: None,
+        revoked_at: None,
+        revoked_by: None,
+    };
+    store.create_grant(&g).await.unwrap();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/oauth/token")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(Body::from(format!(
+            "grant_type=refresh_token&refresh_token={token}&client_id=mcpc_1"
+        )))
+        .unwrap();
+    let res = w.app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(res.into_body(), 1 << 20)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["error"], "invalid_grant", "{body}");
+    assert!(store
+        .get_grant(id)
+        .await
+        .unwrap()
+        .unwrap()
+        .revoked_at
+        .is_some());
+}
+
+/// F2: support recovery is one transaction with its audit line: when it
+/// can't land, the rule stays and nothing is written.
+#[tokio::test]
+async fn support_recovery_changes_nothing_when_its_audit_line_cant_land() {
+    std::env::set_var("PLATFORM_ADMIN_EMAILS", "admin@coderhelm.example");
+    let w = world().await;
+    w.rule(GATED, true);
+    w.member(
+        "TEAM#coderhelm",
+        "USER#staff",
+        "admin@coderhelm.example",
+        "owner",
+        &[],
+    );
+    let staff = w.cookie(
+        "TEAM#coderhelm",
+        "USER#staff",
+        "admin@coderhelm.example",
+        "owner",
+        &SignInProof::new(true, "google"),
+    );
+    w.f.store.cancel_transactions();
+    let path = format!(
+        "/api/admin/teams/{}/sso-recovery",
+        urlencoding::encode(GATED)
+    );
+    let a = w
+        .call("POST", &path, &staff, Some(json!({ "verification": "Video call with the owner, ID checked against the contract." })))
+        .await;
+    assert_eq!(a.status, StatusCode::CONFLICT, "{}", a.body);
+    assert_eq!(
+        super::sign_in::team_rule(&w.state, GATED)
+            .await
+            .unwrap()
+            .require_sso,
+        Some(super::require_sso::SsoProvider::Okta)
+    );
+    assert!(audit_lines(&w, GATED).is_empty());
+}
+
+/// F4: an invite accepted through the provider on hosted holds the domain
+/// proof in its own transaction: a proof that started failing meanwhile
+/// accepts nothing.
+#[tokio::test]
+async fn an_invite_acceptance_holds_the_domain_proof_in_its_transaction() {
+    let w = world().await;
+    w.invite(GATED, "new@example.com");
+    let invite = as_item(&w.f.store.get("users", GATED, "USER#invite_1").unwrap());
+    let now = chrono::Utc::now().to_rfc3339();
+    let rec =
+        super::require_sso::invited_member(&invite, "USER#okta_n1", "", &okta_link("n1"), &now);
+    // Proven, then found failing between the check and the write.
+    w.proven(GATED, "example.com");
+    let mut d =
+        w.f.store
+            .get("settings", "OKTA_DOMAIN#example.com", "OKTA")
+            .unwrap();
+    d["failing_at"] = json!(now);
+    w.f.store.put(
+        "settings",
+        &d.as_object()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.clone()))
+            .collect::<Vec<_>>(),
+    );
+    assert!(super::require_sso::accept_invite(
+        &w.state,
+        &rec,
+        &invite,
+        &link_of(&rec),
+        Some("example.com")
+    )
+    .await
+    .is_err());
+    assert!(w.f.store.get("users", GATED, "USER#okta_n1").is_none());
+    // Both callers pass the domain on hosted.
+    for (src, f) in [
+        (include_str!("oidc_signin.rs"), "okta_land"),
+        (include_str!("entra_sso.rs"), "entra_land"),
+    ] {
+        let start = src.find(&format!("fn {f}(")).unwrap();
+        let body = &src[start..start + src[start..].find("\n}\n").unwrap()];
+        assert!(body.contains("invite_domain.as_deref()"), "{f}");
+    }
+}
+
+/// F5: a Microsoft link write holds only while the member's link is still
+/// the one read.
+#[tokio::test]
+async fn a_microsoft_link_never_overwrites_a_link_made_meanwhile() {
+    let w = world().await;
+    w.member(
+        GATED,
+        "USER#1",
+        "ann@example.com",
+        "member",
+        &[("ms_tid", json!(TID)), ("ms_oid", json!("new-one"))],
+    );
+    // Read as unlinked, but linked meanwhile: refused.
+    assert!(
+        super::entra_sso::link_transaction(&w.state, GATED, "USER#1", TID, "o2", None)
+            .await
+            .is_err()
+    );
+    // Read with an older link: refused too.
+    assert!(super::entra_sso::link_transaction(
+        &w.state,
+        GATED,
+        "USER#1",
+        TID,
+        "o2",
+        Some((TID.into(), "old-one".into()))
+    )
+    .await
+    .is_err());
+    assert_eq!(
+        w.f.store.get("users", GATED, "USER#1").unwrap()["ms_oid"],
+        "new-one"
+    );
+    // The link as read: replaced.
+    assert!(super::entra_sso::link_transaction(
+        &w.state,
+        GATED,
+        "USER#1",
+        TID,
+        "o2",
+        Some((TID.into(), "new-one".into()))
+    )
+    .await
+    .is_ok());
+    assert_eq!(
+        w.f.store.get("users", GATED, "USER#1").unwrap()["ms_oid"],
+        "o2"
+    );
+}
+
+/// P1: an API key works while its maker is linked to the required provider;
+/// one whose maker isn't is suspended, and works again once they link.
+#[tokio::test]
+async fn an_api_key_follows_its_maker() {
+    let w = world().await;
+    w.rule(GATED, true);
+    w.okta(GATED, true);
+    w.member(GATED, "USER#mk", "mk@example.com", "admin", &[]);
+    use crate::api_keys::KeyStore;
+    let t = crate::api_keys::generate();
+    crate::api_keys::store(&w.state)
+        .create(&crate::api_keys::StoredKey {
+            id: t.id.clone(),
+            team_id: GATED.into(),
+            name: "ci".into(),
+            hash: t.hash.clone(),
+            scopes: vec!["runs".into()],
+            created_by: "USER#mk".into(),
+            created_by_name: "Maker".into(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            expires_at: None,
+            revoked_at: None,
+            revoked_by: None,
+            last_used_at: None,
+            rate_limit_per_minute: 60,
+            hint: "chk_…".into(),
+        })
+        .await
+        .unwrap();
+    let req = || {
+        Request::builder()
+            .method("GET")
+            .uri("/api/runs")
+            .header(header::AUTHORIZATION, format!("Bearer {}", t.token))
+            .body(Body::empty())
+            .unwrap()
+    };
+    let res = w.app.clone().oneshot(req()).await.unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    let body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(res.into_body(), 1 << 20)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["code"], "key_suspended", "{body}");
+    assert!(w
+        .f
+        .store
+        .get("settings", GATED, &format!("API_KEY#{}", t.id))
+        .is_none_or(|k| k["revoked_at"].is_null()));
+    // Linked: the key's maker stands again.
+    w.member(
+        GATED,
+        "USER#mk",
+        "mk@example.com",
+        "admin",
+        &[("okta_issuer", json!(ISSUER)), ("okta_sub", json!("mk"))],
+    );
+    assert!(
+        super::require_sso::key_maker_allowed(&w.state, GATED, "USER#mk")
+            .await
+            .unwrap()
+    );
+    // The page lists keys that would be suspended per provider.
+    w.member(
+        GATED,
+        "USER#o",
+        "o@example.com",
+        "owner",
+        &[("okta_issuer", json!(ISSUER)), ("okta_sub", json!("o"))],
+    );
+    let c = w.cookie(GATED, "USER#o", "o@example.com", "owner", &okta_proof("o"));
+    let a = w.call("GET", "/api/sign-in", &c, None).await;
+    assert_eq!(
+        a.body["sso_options"][0]["suspended_keys"],
+        json!([]),
+        "{}",
+        a.body
+    );
+    assert_eq!(
+        a.body["sso_options"][1]["suspended_keys"][0]["name"], "ci",
+        "{}",
+        a.body
+    );
 }
 
 #[tokio::test]
@@ -822,7 +1219,7 @@ async fn an_invite_accepted_through_okta_is_one_transaction_and_never_a_second_l
     let now = chrono::Utc::now().to_rfc3339();
     let rec =
         super::require_sso::invited_member(&invite, "USER#okta_s1", "New", &okta_link("s1"), &now);
-    super::require_sso::accept_invite(&w.state, &rec, &invite, &link_of(&rec))
+    super::require_sso::accept_invite(&w.state, &rec, &invite, &link_of(&rec), None)
         .await
         .unwrap();
     let m = w.f.store.get("users", GATED, "USER#okta_s1").unwrap();
@@ -849,7 +1246,7 @@ async fn an_invite_accepted_through_okta_is_one_transaction_and_never_a_second_l
     let rec2 =
         super::require_sso::invited_member(&second, "USER#okta_s1b", "", &okta_link("s1"), &now);
     assert!(
-        super::require_sso::accept_invite(&w.state, &rec2, &second, &link_of(&rec2))
+        super::require_sso::accept_invite(&w.state, &rec2, &second, &link_of(&rec2), None)
             .await
             .is_err()
     );
@@ -861,7 +1258,7 @@ async fn an_invite_accepted_through_okta_is_one_transaction_and_never_a_second_l
     let rec3 =
         super::require_sso::invited_member(&second, "USER#okta_s2", "", &okta_link("s2"), &now);
     assert!(
-        super::require_sso::accept_invite(&w.state, &rec3, &second, &link_of(&rec3))
+        super::require_sso::accept_invite(&w.state, &rec3, &second, &link_of(&rec3), None)
             .await
             .is_err()
     );
@@ -1277,7 +1674,7 @@ async fn an_invite_changed_after_it_was_read_is_not_accepted() {
     let now = chrono::Utc::now().to_rfc3339();
     let rec = super::require_sso::invited_member(&invite, "USER#okta_n", "", &okta_link("n"), &now);
     assert!(
-        super::require_sso::accept_invite(&w.state, &rec, &invite, &link_of(&rec))
+        super::require_sso::accept_invite(&w.state, &rec, &invite, &link_of(&rec), None)
             .await
             .is_err()
     );
@@ -3089,7 +3486,7 @@ async fn support_recovery_turns_only_the_rule_off_and_makes_no_session() {
 /// Self-hosted: the recovery script's notice is taken by the first request
 /// that reads the rule, exactly once.
 #[tokio::test]
-async fn the_recovery_scripts_notice_is_taken_once() {
+async fn the_recovery_scripts_notice_waits_for_an_email_that_went_out() {
     let _self_hosted = crate::routes::setup_checks::test_self_hosted::set(true);
     let w = world().await;
     let c = selfhost_org(&w, false);
@@ -3104,11 +3501,21 @@ async fn the_recovery_scripts_notice_is_taken_once() {
             .map(|(k, v)| (k.as_str(), v.clone()))
             .collect::<Vec<_>>(),
     );
-    // Any request that reads the rule (here a member's own page).
+    // A request that reads the rule takes a turn; no owner email can go out
+    // here (the stand-in has no mail), so the notice stays, with its try.
     assert_eq!(w.call("GET", STATUS, &c, None).await.status, StatusCode::OK);
-    assert!(w.f.store.get("settings", "ORG", "META").unwrap()["sso_recovery_notice"].is_null());
-    // Taken once: a second request finds nothing to send.
+    let org = w.f.store.get("settings", "ORG", "META").unwrap();
+    assert!(
+        org["sso_recovery_notice"].is_string(),
+        "kept until an email goes out"
+    );
+    let tried = org["sso_recovery_notice_tried"].as_u64().unwrap();
+    // The next read within the retry window doesn't try again.
     assert_eq!(w.call("GET", STATUS, &c, None).await.status, StatusCode::OK);
+    let org = w.f.store.get("settings", "ORG", "META").unwrap();
+    assert_eq!(org["sso_recovery_notice_tried"].as_u64(), Some(tried));
+    assert!(super::require_sso::notice_done(1));
+    assert!(!super::require_sso::notice_done(0));
     assert_eq!(
         super::sign_in::team_rule(&w.state, "")
             .await

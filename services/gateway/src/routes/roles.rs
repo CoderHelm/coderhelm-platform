@@ -419,31 +419,45 @@ pub struct AuditEntry<'a> {
 /// Writes one entry. A role change is refused when its entry can't be
 /// written first, so nothing changes without a record of it.
 pub async fn record(state: &AppState, claims: &Claims, e: AuditEntry<'_>) -> Result<(), ApiError> {
-    let now = chrono::Utc::now();
-    let at = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    let ttl = (now + chrono::Duration::days(AUDIT_DAYS)).timestamp();
     state
         .dynamo
         .put_item()
         .table_name(&state.config.settings_table_name)
-        .item("pk", attr_s(&claims.team_id))
-        .item(
-            "sk",
-            attr_s(&format!("{AUDIT_PREFIX}{at}#{}", ulid::Ulid::new())),
-        )
-        .item("record_type", attr_s("role_audit"))
-        .item("at", attr_s(&at))
-        .item("actor", attr_s(&claims.display_name()))
-        .item("actor_id", attr_s(&claims.sub))
-        .item("action", attr_s(e.action))
-        .item("role_id", attr_s(e.role_id))
-        .item("role_name", attr_s(e.role_name))
-        .item("detail", attr_s(common::truncate_str(&e.detail, 1000)))
-        .item("ttl", AttributeValue::N(ttl.to_string()))
+        .set_item(Some(audit_item(claims, e)))
         .send()
         .await
         .map(|_| ())
         .map_err(|err| internal("Role change log not written", err))
+}
+
+/// One audit log row, for a write that must land in the same transaction
+/// as the change it records.
+pub fn audit_item(
+    claims: &Claims,
+    e: AuditEntry<'_>,
+) -> std::collections::HashMap<String, AttributeValue> {
+    let now = chrono::Utc::now();
+    let at = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let ttl = (now + chrono::Duration::days(AUDIT_DAYS)).timestamp();
+    std::collections::HashMap::from([
+        ("pk".to_string(), attr_s(&claims.team_id)),
+        (
+            "sk".to_string(),
+            attr_s(&format!("{AUDIT_PREFIX}{at}#{}", ulid::Ulid::new())),
+        ),
+        ("record_type".to_string(), attr_s("role_audit")),
+        ("at".to_string(), attr_s(&at)),
+        ("actor".to_string(), attr_s(&claims.display_name())),
+        ("actor_id".to_string(), attr_s(&claims.sub)),
+        ("action".to_string(), attr_s(e.action)),
+        ("role_id".to_string(), attr_s(e.role_id)),
+        ("role_name".to_string(), attr_s(e.role_name)),
+        (
+            "detail".to_string(),
+            attr_s(common::truncate_str(&e.detail, 1000)),
+        ),
+        ("ttl".to_string(), AttributeValue::N(ttl.to_string())),
+    ])
 }
 
 /// The labels of capability keys, for a log line.

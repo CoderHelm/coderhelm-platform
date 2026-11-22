@@ -90,6 +90,14 @@ pub const RULE_ATTR: &str = "require_sso";
 pub const SINCE_ATTR: &str = "require_sso_since";
 /// Set by the self-hosted recovery script: the owners are emailed once.
 pub const RECOVERY_NOTICE: &str = "sso_recovery_notice";
+/// When an email for that notice was last tried (unix seconds).
+pub const RECOVERY_TRIED: &str = "sso_recovery_notice_tried";
+/// How long to wait before trying the owners' email again.
+pub const RECOVERY_RETRY_SECS: u64 = 600;
+/// The cut-off: when the rule was last turned on and with which provider.
+/// Never cleared, so turning the rule off revives nothing from before it.
+pub const CUTOFF_ATTR: &str = "sso_cutoff_at";
+pub const CUTOFF_PROVIDER_ATTR: &str = "sso_cutoff_provider";
 
 fn attr_s(v: &str) -> AttributeValue {
     AttributeValue::S(v.to_string())
@@ -240,6 +248,22 @@ pub fn allowed(rule: &Rule, proof: &SignInProof) -> bool {
     }
 }
 
+/// Whether a session, scoped token or app connection issued at `iat` with
+/// `proof` still stands: the rule allows it now, and if it was issued
+/// before (or at) the last cut-off, it came from the provider required then.
+/// Pure.
+pub fn session_stands(rule: &Rule, iat: u64, proof: &SignInProof) -> bool {
+    if !allowed(rule, proof) {
+        return false;
+    }
+    match rule.sso_cutoff_provider {
+        // Inclusive: a session from the very second of the cut-off is from
+        // before it.
+        Some(p) if rule.sso_cutoff > 0 && iat <= rule.sso_cutoff => p.signed_in(proof),
+        _ => true,
+    }
+}
+
 /// The words a refused person reads.
 pub fn refusal_message(self_hosted: bool, team: &str, provider: SsoProvider) -> String {
     let p = provider.name();
@@ -312,12 +336,93 @@ pub async fn check(
     claims: &Claims,
     proof: &SignInProof,
 ) -> Result<(), Response> {
-    if allowed(rule, proof) {
+    if session_stands(rule, claims.iat, proof) {
         return Ok(());
+    }
+    if rule.require_sso.is_none() {
+        // The rule is off now, but this session is from before its cut-off
+        // and from another way in: it stays ended.
+        return Err(sign_in::session_ended(sign_in::Ended::Revoked));
     }
     Err(session_refused(
         &refused(state, &claims.team_id, rule.require_sso).await,
     ))
+}
+
+/// Keys follow their maker: while the team requires single sign-on, an API
+/// key or a knowledge key works only while the member who made it is still
+/// on the team and linked to the required provider. A key of an unlinked
+/// maker is suspended (nothing is deleted) and works again once they link.
+/// Pure: the maker's record (none: not on the team) and the live setup.
+pub fn key_maker_stands(rule: &Rule, maker: Option<&Item>, live: Option<&Live>) -> bool {
+    if rule.require_sso.is_none() {
+        return true;
+    }
+    match maker.filter(|m| s(m, "status") != "invited") {
+        Some(m) => live.is_some_and(|l| l.enabled() && l.linked(m)),
+        None => false,
+    }
+}
+
+/// [`key_maker_stands`] read now for `maker` on `team_id`.
+pub async fn key_maker_allowed(
+    state: &AppState,
+    team_id: &str,
+    maker: &str,
+) -> Result<bool, String> {
+    let rule = sign_in::team_rule(state, team_id).await?;
+    let Some(p) = rule.require_sso else {
+        return Ok(true);
+    };
+    let member = state
+        .dynamo
+        .get_item()
+        .table_name(&state.config.users_table_name)
+        .key("pk", attr_s(team_id))
+        .key("sk", attr_s(maker))
+        .consistent_read(true)
+        .send()
+        .await
+        .map_err(|e| format!("{e}"))?
+        .item;
+    let live = live_setup(state, team_id, p).await?;
+    Ok(key_maker_stands(&rule, member.as_ref(), live.as_ref()))
+}
+
+/// The refusal for a suspended key (its maker isn't linked).
+pub const KEY_SUSPENDED: &str = "key_suspended";
+pub const KEY_SUSPENDED_WORDS: &str = "This key is suspended: the team requires single sign-on and the member who made it isn't linked to it. It works again once they link their account in Settings, Security.";
+
+/// Ends every app connection (MCP grant) of the team that the rule as it is
+/// now refuses: turning the rule on revokes them, refresh tokens included.
+pub async fn end_refused_connections(state: &AppState, team_id: &str, rule: &Rule) -> usize {
+    use crate::mcp_oauth::OAuthStore;
+    let store = crate::mcp_oauth::store(state);
+    let grants = match store.list_grants(team_id).await {
+        Ok(g) => g,
+        Err(e) => {
+            error!(error = %e, "App connections not read; none ended");
+            return 0;
+        }
+    };
+    let at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let mut n = 0;
+    for g in grants.iter().filter(|g| g.revoked_at.is_none()) {
+        if !session_stands(rule, g.created_at_secs, &g.proof())
+            && store
+                .revoke_grant(&g.team_id, &g.id, "single sign-on required", &at)
+                .await
+                .is_ok()
+        {
+            n += 1;
+        }
+    }
+    info!(
+        team_id,
+        ended = n,
+        "App connections the single sign-on rule refuses ended"
+    );
+    n
 }
 
 /// [`check`] with the rule read here, for the places that take a session
@@ -630,19 +735,21 @@ pub fn invite_unchanged(
 /// Accepts `invite` through the provider in one transaction: the new member
 /// record (only if no record has its id), the identity's link row (only if
 /// no member holds it), and the invite removed (only while it is still
-/// one). Any of them failing leaves everything as it was.
+/// one), and on hosted the email's domain still this team's live proof.
+/// Any of them failing leaves everything as it was.
 pub async fn accept_invite(
     state: &AppState,
     member: &Item,
     invite: &Item,
     link: &Link,
+    domain: Option<&str>,
 ) -> Result<(), String> {
     use aws_sdk_dynamodb::types::{Delete, Put, TransactWriteItem};
     let e = |e: aws_sdk_dynamodb::error::BuildError| e.to_string();
     let team = s(member, "pk");
     let (row_pk, row_sk) = link.row(team);
     let (cond, names, values) = invite_unchanged(invite);
-    let items = vec![
+    let mut items = vec![
         TransactWriteItem::builder()
             .put(
                 Put::builder()
@@ -679,6 +786,11 @@ pub async fn accept_invite(
             )
             .build(),
     ];
+    // Hosted: the email's domain is still this team's proof, not failing,
+    // held in the same transaction.
+    if let Some(d) = domain {
+        items.push(super::oidc_signin::domain_still_usable(state, team, d)?);
+    }
     state
         .dynamo
         .transact_write_items()
@@ -1368,47 +1480,69 @@ pub async fn recover(
         ));
     };
     let note: String = note.chars().take(600).collect();
-    state
-        .dynamo
-        .update_item()
-        .table_name(&state.config.settings_table_name)
-        .key("pk", attr_s(&team))
-        .key("sk", attr_s(sign_in::TEAM_RULE_SK))
-        .update_expression("REMOVE #rs, #since SET updated_at = :now, updated_by = :by")
-        .condition_expression("#rs = :p")
-        .expression_attribute_names("#rs", RULE_ATTR)
-        .expression_attribute_names("#since", SINCE_ATTR)
-        .expression_attribute_values(":p", attr_s(provider.slug()))
-        .expression_attribute_values(":now", attr_s(&chrono::Utc::now().to_rfc3339()))
-        .expression_attribute_values(":by", attr_s("CoderHelm support"))
-        .send()
-        .await
-        .map_err(|e| {
-            if format!("{e:?}").contains("ConditionalCheckFailed") {
-                (
-                    StatusCode::CONFLICT,
-                    Json(json!({ "error": "The team's rule changed meanwhile. Reload and check.", "code": "changed" })),
-                )
-            } else {
-                internal("Sign-in rules not saved", e)
-            }
-        })?;
     let detail = format!(
         "Require single sign-on ({}) turned off by CoderHelm support ({}) after verifying the owner out of band: {note}",
         provider.name(),
         claims.display_name()
     );
-    let _ = super::roles::record(
-        &state,
-        &system_actor(&team, "SYSTEM#support-recovery", "CoderHelm support"),
-        super::roles::AuditEntry {
-            action: "sign_in_rules",
-            role_id: "",
-            role_name: "",
-            detail,
-        },
-    )
-    .await;
+    // The rule goes off and its audit line is written in one transaction:
+    // never one without the other.
+    use aws_sdk_dynamodb::types::{Put, TransactWriteItem, Update};
+    let b = |e: aws_sdk_dynamodb::error::BuildError| internal("Recovery not built", e);
+    let items = vec![
+        TransactWriteItem::builder()
+            .update(
+                Update::builder()
+                    .table_name(&state.config.settings_table_name)
+                    .key("pk", attr_s(&team))
+                    .key("sk", attr_s(sign_in::TEAM_RULE_SK))
+                    .update_expression("REMOVE #rs, #since SET updated_at = :now, updated_by = :by")
+                    .condition_expression("#rs = :p")
+                    .expression_attribute_names("#rs", RULE_ATTR)
+                    .expression_attribute_names("#since", SINCE_ATTR)
+                    .expression_attribute_values(":p", attr_s(provider.slug()))
+                    .expression_attribute_values(":now", attr_s(&chrono::Utc::now().to_rfc3339()))
+                    .expression_attribute_values(":by", attr_s("CoderHelm support"))
+                    .build()
+                    .map_err(b)?,
+            )
+            .build(),
+        TransactWriteItem::builder()
+            .put(
+                Put::builder()
+                    .table_name(&state.config.settings_table_name)
+                    .set_item(Some(super::roles::audit_item(
+                        &system_actor(&team, "SYSTEM#support-recovery", "CoderHelm support"),
+                        super::roles::AuditEntry {
+                            action: "sign_in_rules",
+                            role_id: "",
+                            role_name: "",
+                            detail,
+                        },
+                    )))
+                    .condition_expression("attribute_not_exists(pk)")
+                    .build()
+                    .map_err(b)?,
+            )
+            .build(),
+    ];
+    state
+        .dynamo
+        .transact_write_items()
+        .set_transact_items(Some(items))
+        .send()
+        .await
+        .map_err(|e| {
+            let e = format!("{e:?}");
+            if e.contains("TransactionCanceled") || e.contains("ConditionalCheckFailed") {
+                (
+                    StatusCode::CONFLICT,
+                    Json(json!({ "error": "Nothing changed: the team's rule changed meanwhile, or the audit line couldn't be written. Reload and check.", "code": "changed" })),
+                )
+            } else {
+                internal("Sign-in rules not saved", e)
+            }
+        })?;
     let emailed = tell_owners(
         &state,
         &team,
@@ -1431,25 +1565,41 @@ pub fn recovered_words(provider: SsoProvider) -> String {
     )
 }
 
+/// What to do with the recovery script's notice once its emails were
+/// tried: removed only when at least one owner was emailed; otherwise kept
+/// and tried again later. Pure.
+pub fn notice_done(sent: usize) -> bool {
+    sent > 0
+}
+
 /// Self-hosted: the recovery script turned the rule off and left a notice
-/// on the organization record. The first request that reads it takes it
-/// (a conditional remove, so exactly once) and emails every owner.
+/// on the organization record. A request that reads it takes a turn (a
+/// conditional write, at most once every [`RECOVERY_RETRY_SECS`]) and emails
+/// every owner; the notice goes only once an email went out, so a mail
+/// failure is retried on a later read, and logged.
 pub async fn send_recovery_notice(state: &AppState, org_team: &str, notice: &str) {
     let (pk, sk) = (sign_in::ORG_PK, sign_in::ORG_SK);
-    let taken = state
+    let now = now_secs();
+    let turn = state
         .dynamo
         .update_item()
         .table_name(&state.config.settings_table_name)
         .key("pk", attr_s(pk))
         .key("sk", attr_s(sk))
-        .update_expression("REMOVE #n")
-        .condition_expression("#n = :v")
+        .update_expression("SET #t = :now")
+        .condition_expression("#n = :v AND (attribute_not_exists(#t) OR #t < :before)")
         .expression_attribute_names("#n", RECOVERY_NOTICE)
+        .expression_attribute_names("#t", RECOVERY_TRIED)
         .expression_attribute_values(":v", attr_s(notice))
+        .expression_attribute_values(":now", AttributeValue::N(now.to_string()))
+        .expression_attribute_values(
+            ":before",
+            AttributeValue::N(now.saturating_sub(RECOVERY_RETRY_SECS).to_string()),
+        )
         .send()
         .await
         .is_ok();
-    if !taken {
+    if !turn {
         return;
     }
     let mut parts = notice.splitn(3, '|');
@@ -1474,6 +1624,23 @@ pub async fn send_recovery_notice(state: &AppState, org_team: &str, notice: &str
         &[("provider", provider.name())],
     )
     .await;
+    if !notice_done(sent) {
+        warn!("No owner could be emailed about the single sign-on recovery; tried again later");
+        return;
+    }
+    let _ = state
+        .dynamo
+        .update_item()
+        .table_name(&state.config.settings_table_name)
+        .key("pk", attr_s(pk))
+        .key("sk", attr_s(sk))
+        .update_expression("REMOVE #n, #t")
+        .condition_expression("#n = :v")
+        .expression_attribute_names("#n", RECOVERY_NOTICE)
+        .expression_attribute_names("#t", RECOVERY_TRIED)
+        .expression_attribute_values(":v", attr_s(notice))
+        .send()
+        .await;
     info!(sent, "Owners emailed about the single sign-on recovery");
 }
 
@@ -1833,6 +2000,70 @@ mod tests {
     }
 
     #[test]
+    fn a_cut_off_keeps_ending_what_came_before_it_after_the_rule_goes_off() {
+        let okta = SignInProof::new(false, "okta");
+        let google = SignInProof::new(true, "google");
+        let mut r = rule(Some(SsoProvider::Okta));
+        r.sso_cutoff = 2_000;
+        r.sso_cutoff_provider = Some(SsoProvider::Okta);
+        assert!(!session_stands(&r, 1_999, &google));
+        assert!(session_stands(&r, 1_999, &okta));
+        // The rule is off now; the cut-off stays.
+        r.require_sso = None;
+        assert!(!session_stands(&r, 1_999, &google), "never revived");
+        assert!(
+            !session_stands(&r, 2_000, &google),
+            "the same second counts as before"
+        );
+        assert!(session_stands(&r, 2_001, &google), "a sign-in after it");
+        assert!(session_stands(&r, 1_999, &okta));
+        assert!(session_stands(&rule(None), 1, &google));
+        // The script and the owner remove the rule, never the cut-off.
+        let script = include_str!("../../../../scripts/sso-recovery.py");
+        assert!(!script.contains(CUTOFF_ATTR));
+        let si = code(include_str!("sign_in.rs"));
+        let u = body(si, "update_settings");
+        assert!(u.contains("removes.push(\"#rs\")"));
+        assert!(!u.contains("removes.push(\"#rco\")"));
+        assert!(u.contains("end_refused_connections("));
+    }
+
+    #[test]
+    fn keys_follow_their_maker_while_the_rule_is_on() {
+        let on = rule(Some(SsoProvider::Okta));
+        let live = Live::Okta(super::super::oidc_signin::OktaSetup {
+            team_id: "T".into(),
+            issuer: "https://idp.example.com".into(),
+            enabled: true,
+            ..Default::default()
+        });
+        let linked = item(&[
+            ("sk", "USER#1"),
+            ("okta_issuer", "https://idp.example.com"),
+            ("okta_sub", "s"),
+        ]);
+        let unlinked = item(&[("sk", "USER#2")]);
+        let invited = item(&[("sk", "USER#3"), ("status", "invited")]);
+        assert!(key_maker_stands(&on, Some(&linked), Some(&live)));
+        assert!(!key_maker_stands(&on, Some(&unlinked), Some(&live)));
+        assert!(!key_maker_stands(&on, Some(&invited), Some(&live)));
+        assert!(!key_maker_stands(&on, None, Some(&live)), "maker left");
+        assert!(!key_maker_stands(&on, Some(&linked), None));
+        assert!(
+            key_maker_stands(&rule(None), None, None),
+            "rule off: as before"
+        );
+        let mw = code(include_str!("../middleware/auth.rs"));
+        assert!(before(
+            body(mw, "api_key_request"),
+            "key_maker_allowed(",
+            "resolve_access("
+        ));
+        let mcp = code(include_str!("../mcp_server.rs"));
+        assert_eq!(mcp.matches("key_follows_maker(state, k)").count(), 2);
+    }
+
+    #[test]
     fn recovery_is_outside_the_product_and_said_plainly() {
         for p in SsoProvider::ALL {
             let hosted = recovery_words(false, p);
@@ -1853,7 +2084,9 @@ mod tests {
         assert!(f.contains("MIN_VERIFICATION"));
         assert!(f.contains("REMOVE #rs, #since"));
         assert!(f.contains("tell_owners("));
-        assert!(f.contains("roles::record("));
+        // The rule goes off with its audit line, in one transaction.
+        assert!(before(f, "roles::audit_item(", ".transact_write_items()"));
+        assert!(!f.contains("roles::record("));
         assert!(!f.contains("create_session_token"));
         assert!(!f.contains("SET_COOKIE"));
         // The script and the gateway agree on the names.

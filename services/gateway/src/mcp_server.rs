@@ -1099,6 +1099,29 @@ fn key_refused(r: crate::knowledge_keys::Refusal) -> Response {
     res
 }
 
+/// A knowledge key works only while its maker meets the team's single
+/// sign-on rule (routes::require_sso::key_maker_stands).
+async fn key_follows_maker(
+    state: &AppState,
+    k: crate::knowledge_keys::StoredKey,
+) -> Result<Caller, Response> {
+    match crate::routes::require_sso::key_maker_allowed(state, &k.team_id, &k.created_by).await {
+        Ok(true) => Ok(Caller::Key(k)),
+        Ok(false) => Err((
+            StatusCode::FORBIDDEN,
+            axum::Json(serde_json::json!({
+                "error": crate::routes::require_sso::KEY_SUSPENDED_WORDS,
+                "code": crate::routes::require_sso::KEY_SUSPENDED,
+            })),
+        )
+            .into_response()),
+        Err(e) => {
+            error!(error = %e, "Sign-in rules not read for a knowledge key");
+            Err(StatusCode::SERVICE_UNAVAILABLE.into_response())
+        }
+    }
+}
+
 /// Checks the request's credential: a knowledge key, a key's access token,
 /// or a person's access token, in that order.
 async fn authenticate(state: &AppState, token: &str) -> Result<Caller, Response> {
@@ -1107,7 +1130,7 @@ async fn authenticate(state: &AppState, token: &str) -> Result<Caller, Response>
     let now_secs = now.timestamp().max(0) as u64;
     if token.starts_with(keys::TOKEN_PREFIX) {
         return match keys::authenticate_secret(&keys::store(state), token, now).await {
-            Ok(Ok(k)) => Ok(Caller::Key(k)),
+            Ok(Ok(k)) => key_follows_maker(state, k).await,
             Ok(Err(r)) => Err(key_refused(r)),
             Err(e) => {
                 error!(error = %e, "Knowledge key not read");
@@ -1118,7 +1141,7 @@ async fn authenticate(state: &AppState, token: &str) -> Result<Caller, Response>
     if let Some(claims) = keys::read_access(token, &state.secrets.jwt_secret, now_secs) {
         let claims = claims.map_err(key_refused)?;
         return match keys::authenticate_access(&keys::store(state), &claims, now).await {
-            Ok(Ok(k)) => Ok(Caller::Key(k)),
+            Ok(Ok(k)) => key_follows_maker(state, k).await,
             Ok(Err(r)) => Err(key_refused(r)),
             Err(e) => {
                 error!(error = %e, "Knowledge key not read");

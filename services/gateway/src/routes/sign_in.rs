@@ -139,6 +139,11 @@ pub struct Rule {
     pub require_sso: Option<super::require_sso::SsoProvider>,
     /// When that was last turned on (unix seconds).
     pub sso_since: u64,
+    /// The cut-off: when the rule was last turned on, and with which
+    /// provider. Turning the rule off never clears it, so a session or app
+    /// connection from before it, from any other way in, never comes back.
+    pub sso_cutoff: u64,
+    pub sso_cutoff_provider: Option<super::require_sso::SsoProvider>,
 }
 
 /// A number attribute, or 0.
@@ -178,6 +183,11 @@ impl Rule {
                 super::require_sso::RULE_ATTR,
             )),
             sso_since: num(item, super::require_sso::SINCE_ATTR),
+            sso_cutoff: num(item, super::require_sso::CUTOFF_ATTR),
+            sso_cutoff_provider: super::require_sso::SsoProvider::stored(s(
+                item,
+                super::require_sso::CUTOFF_PROVIDER_ATTR,
+            )),
         }
     }
 }
@@ -203,6 +213,8 @@ pub async fn team_rule(state: &AppState, team_id: &str) -> Result<Rule, String> 
                 moved_to: None,
                 require_sso: o.require_sso,
                 sso_since: o.require_sso_since,
+                sso_cutoff: o.sso_cutoff,
+                sso_cutoff_provider: o.sso_cutoff_provider,
             })
             .unwrap_or_default());
     }
@@ -260,6 +272,8 @@ pub struct Org {
     /// provider, and since when (unix seconds; routes::require_sso).
     pub require_sso: Option<super::require_sso::SsoProvider>,
     pub require_sso_since: u64,
+    pub sso_cutoff: u64,
+    pub sso_cutoff_provider: Option<super::require_sso::SsoProvider>,
     /// Left by the recovery script (scripts/sso-recovery.py) until the
     /// owners are emailed.
     pub recovery_notice: Option<String>,
@@ -300,6 +314,11 @@ impl Org {
                 super::require_sso::RULE_ATTR,
             )),
             require_sso_since: num(item, super::require_sso::SINCE_ATTR),
+            sso_cutoff: num(item, super::require_sso::CUTOFF_ATTR),
+            sso_cutoff_provider: super::require_sso::SsoProvider::stored(s(
+                item,
+                super::require_sso::CUTOFF_PROVIDER_ATTR,
+            )),
             recovery_notice: Some(s(item, super::require_sso::RECOVERY_NOTICE))
                 .filter(|v| !v.is_empty())
                 .map(str::to_string),
@@ -2863,7 +2882,7 @@ pub async fn get_settings(
     // Require single sign-on: for each provider, its live setup, who linked
     // it, and what turning the rule on with it still needs.
     let signed_in = proof.map(|p| p.0).unwrap_or_default();
-    let mut options = Vec::new();
+    let mut options: Vec<Value> = Vec::new();
     let mut lives = Vec::new();
     for p in super::require_sso::SsoProvider::ALL {
         let live = super::require_sso::live_setup(&state, &claims.team_id, p)
@@ -2941,6 +2960,58 @@ pub async fn get_settings(
             k
         })
         .collect();
+    // Keys follow their maker while single sign-on is required: for each
+    // provider, the live keys that would be (or are) suspended.
+    let kb_keys = {
+        use crate::knowledge_keys::KeyStore;
+        crate::knowledge_keys::store(&state)
+            .list(&claims.team_id)
+            .await
+            .unwrap_or_default()
+    };
+    let api_makers: Vec<(String, String, String)> = {
+        use crate::api_keys::KeyStore;
+        crate::api_keys::store(&state)
+            .list(&claims.team_id)
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|k| k.is_live(now))
+            .map(|k| (k.name.clone(), k.created_by.clone(), "api".to_string()))
+            .collect()
+    };
+    let all_makers = api_makers.into_iter().chain(
+        kb_keys
+            .iter()
+            .filter(|k| k.revoked_at.is_none() && !k.is_expired(now))
+            .map(|k| {
+                (
+                    k.name.clone(),
+                    k.created_by.clone(),
+                    "knowledge".to_string(),
+                )
+            }),
+    );
+    let all_makers: Vec<(String, String, String)> = all_makers.collect();
+    for (view, (p, live)) in options.iter_mut().zip(
+        super::require_sso::SsoProvider::ALL
+            .iter()
+            .zip(lives.iter()),
+    ) {
+        let on = Rule {
+            require_sso: Some(*p),
+            ..Rule::default()
+        };
+        let suspended: Vec<Value> = all_makers
+            .iter()
+            .filter(|(_, maker, _)| {
+                let m = items.iter().find(|i| s(i, "sk") == maker.as_str());
+                !super::require_sso::key_maker_stands(&on, m, live.as_ref())
+            })
+            .map(|(name, _, kind)| json!({ "name": name, "kind": kind }))
+            .collect();
+        view["suspended_keys"] = json!(suspended);
+    }
     Ok(Json(json!({
         "self_hosted": self_hosted,
         // Hosted: the rule is the team's own, so this team is the unit.
@@ -3194,9 +3265,12 @@ pub async fn update_settings(
         });
         match to {
             Some(p) => {
-                // Every session from another way in ends at its next request.
+                // Every session from another way in ends at its next request,
+                // and stays ended: the cut-off outlives the rule.
                 sets.push("#rs = :rs");
                 sets.push("#rss = :rss");
+                sets.push("#rco = :rss");
+                sets.push("#rcp = :rs");
                 values.insert(":rs".into(), attr_s(p.slug()));
                 values.insert(
                     ":rss".into(),
@@ -3246,6 +3320,13 @@ pub async fn update_settings(
     if sso_change.is_some() {
         names.insert("#rs".into(), super::require_sso::RULE_ATTR.into());
         names.insert("#rss".into(), super::require_sso::SINCE_ATTR.into());
+    }
+    if matches!(sso_change, Some(Some(_))) {
+        names.insert("#rco".into(), super::require_sso::CUTOFF_ATTR.into());
+        names.insert(
+            "#rcp".into(),
+            super::require_sso::CUTOFF_PROVIDER_ATTR.into(),
+        );
     }
     if guard_domains {
         conditions.push("attribute_not_exists(#rs)");
@@ -3331,6 +3412,13 @@ pub async fn update_settings(
         }
     }
     info!(changes = ?changes, "Sign-in rules changed");
+    // Turned on: app connections whose sign-in the rule refuses end now.
+    if let Some(Some(_)) = sso_change {
+        let rule = team_rule(&state, &claims.team_id)
+            .await
+            .map_err(|e| internal("Sign-in rules not read", e))?;
+        super::require_sso::end_refused_connections(&state, &claims.team_id, &rule).await;
+    }
     let rule = team_rule(&state, &claims.team_id)
         .await
         .map_err(|e| internal("Two-factor rule not read", e))?;
@@ -4585,6 +4673,8 @@ mod tests {
                 moved_to: None,
                 require_sso: None,
                 sso_since: 0,
+                sso_cutoff: 0,
+                sso_cutoff_provider: None,
             }
         );
         assert_eq!(Rule::from_item(&HashMap::new()), Rule::default());

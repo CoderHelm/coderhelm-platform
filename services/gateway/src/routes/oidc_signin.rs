@@ -1914,6 +1914,11 @@ pub(crate) async fn okta_land(
             ));
         }
     }
+    // Hosted: the domain proof checked above is held in the acceptance's
+    // own transaction too.
+    let invite_domain = (!super::sign_in::applies())
+        .then(|| super::sign_in::email_domain(&person.email))
+        .flatten();
     let invite = match super::require_sso::invite_for(&members, &person.email, chrono::Utc::now()) {
         super::require_sso::InviteFor::Accept(i) => i,
         super::require_sso::InviteFor::ExistingMember => {
@@ -1932,7 +1937,10 @@ pub(crate) async fn okta_land(
         &link,
         &chrono::Utc::now().to_rfc3339(),
     );
-    if let Err(e) = super::require_sso::accept_invite(state, &record, &invite, &link).await {
+    if let Err(e) =
+        super::require_sso::accept_invite(state, &record, &invite, &link, invite_domain.as_deref())
+            .await
+    {
         // Another record already has this id, or another member holds this
         // identity, or the invite is gone: nothing was written.
         return Err(ask_admin(&e));

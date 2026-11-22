@@ -315,6 +315,31 @@ async fn api_key_request(
         }
     };
     let (key, maker, rate) = (accepted.key, accepted.maker, accepted.rate);
+    // While the team requires single sign-on, a key follows its maker.
+    match crate::routes::require_sso::key_maker_allowed(state, &key.team_id, &key.created_by).await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            return with_rate_headers(
+                key_error(
+                    StatusCode::FORBIDDEN,
+                    crate::routes::require_sso::KEY_SUSPENDED,
+                    crate::routes::require_sso::KEY_SUSPENDED_WORDS,
+                    None,
+                ),
+                &rate,
+            )
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Sign-in rules not read for an API key");
+            return key_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "unavailable",
+                "CoderHelm couldn't check this API key just now. Try again shortly.",
+                None,
+            );
+        }
+    }
 
     let method = req.method().as_str().to_ascii_uppercase();
     let handler = req

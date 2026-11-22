@@ -1766,7 +1766,7 @@ pub async fn mfa_verify_setup(
     )
     .await;
     // The re-issued session keeps how it signed in (an Okta session stays
-    // one, an owner's break-glass session stays one).
+    // one, and so does a team tenant session).
     let cookie = crate::routes::sign_in::session_with_second_factor(
         &state,
         &claims,

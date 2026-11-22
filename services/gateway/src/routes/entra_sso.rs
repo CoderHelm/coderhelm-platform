@@ -542,7 +542,30 @@ pub fn tenant_of(claims: &Value, tid: &str) -> Result<(String, String), SignInFa
             "no oid",
         ));
     }
+    if is_guest(claims, &t) {
+        return Err(SignInFailure::new(
+            P,
+            Reason::NotOnTeam,
+            "tenant",
+            "a guest in the team's tenant, signed in by another directory",
+        ));
+    }
     Ok((t, oid))
+}
+
+/// Whether the token is a guest's in `tid` (B2B): an `idp` claim naming a
+/// directory other than the tenant itself (its v2 or v1 issuer), or
+/// `acct` = 1. Only the tenant's own members count. Pure.
+pub fn is_guest(claims: &Value, tid: &str) -> bool {
+    let own = [
+        tenant_issuer(tid),
+        format!("https://sts.windows.net/{tid}/"),
+    ];
+    let foreign_idp = claims["idp"]
+        .as_str()
+        .is_some_and(|idp| !own.iter().any(|o| o.eq_ignore_ascii_case(idp)));
+    let guest_acct = claims["acct"].as_u64() == Some(1) || claims["acct"].as_str() == Some("1");
+    foreign_idp || guest_acct
 }
 
 /// The Microsoft callback for a trip that named a team (`flow.team`): a
@@ -677,6 +700,9 @@ pub(crate) async fn entra_land(
             ));
         }
     }
+    let invite_domain = (!super::sign_in::applies())
+        .then(|| super::sign_in::email_domain(&email))
+        .flatten();
     let invite = match require_sso::invite_for(&members, &email, chrono::Utc::now()) {
         require_sso::InviteFor::Accept(i) => i,
         require_sso::InviteFor::ExistingMember => {
@@ -697,7 +723,9 @@ pub(crate) async fn entra_land(
         &link,
         &chrono::Utc::now().to_rfc3339(),
     );
-    if let Err(e) = require_sso::accept_invite(state, &record, &invite, &link).await {
+    if let Err(e) =
+        require_sso::accept_invite(state, &record, &invite, &link, invite_domain.as_deref()).await
+    {
         return Err(ask_admin(&e));
     }
     info!(team_id = %setup.team_id, "Invite accepted through the team's Microsoft tenant");
@@ -1336,7 +1364,7 @@ async fn link_return(
 /// One transaction: the uniqueness row (only if nobody holds it), the
 /// member's own active record, and a previous link's row removed (which
 /// also ends the previous account's sessions).
-async fn link_transaction(
+pub(crate) async fn link_transaction(
     state: &AppState,
     team: &str,
     member: &str,
@@ -1355,16 +1383,24 @@ async fn link_transaction(
         } else {
             "SET ms_tid = :t, ms_oid = :o, ms_linked_at = :at"
         })
-        .condition_expression("attribute_exists(pk) AND (attribute_not_exists(#st) OR #st <> :inv)")
         .expression_attribute_names("#st", "status")
         .expression_attribute_values(":t", attr_s(tid))
         .expression_attribute_values(":o", attr_s(oid))
         .expression_attribute_values(":at", attr_s(&chrono::Utc::now().to_rfc3339()))
         .expression_attribute_values(":inv", attr_s("invited"));
-    if previous.is_some() {
-        update =
-            update.expression_attribute_values(":n", AttributeValue::N(now_secs().to_string()));
-    }
+    // The member's link is still the one read: a link made meanwhile (in
+    // another tab) is never overwritten without its row being removed.
+    update = match &previous {
+        Some((_, prev_oid)) => update
+            .condition_expression(
+                "attribute_exists(pk) AND (attribute_not_exists(#st) OR #st <> :inv) AND ms_oid = :prev",
+            )
+            .expression_attribute_values(":prev", attr_s(prev_oid))
+            .expression_attribute_values(":n", AttributeValue::N(now_secs().to_string())),
+        None => update.condition_expression(
+            "attribute_exists(pk) AND (attribute_not_exists(#st) OR #st <> :inv) AND attribute_not_exists(ms_oid)",
+        ),
+    };
     let mut items = vec![
         TransactWriteItem::builder()
             .put(
@@ -1460,6 +1496,25 @@ mod tests {
             tenant_issuer(TID),
             format!("https://login.microsoftonline.com/{TID}/v2.0")
         );
+    }
+
+    #[test]
+    fn guests_in_the_tenant_never_count() {
+        let member = json!({ "tid": TID, "oid": "o1" });
+        assert!(!is_guest(&member, TID));
+        let own_idp =
+            json!({ "tid": TID, "oid": "o1", "idp": format!("https://sts.windows.net/{TID}/") });
+        assert!(!is_guest(&own_idp, TID));
+        for g in [
+            json!({ "tid": TID, "oid": "o1", "idp": "https://sts.windows.net/99999999-2222-3333-4444-555555555555/" }),
+            json!({ "tid": TID, "oid": "o1", "idp": "live.com" }),
+            json!({ "tid": TID, "oid": "o1", "acct": 1 }),
+            json!({ "tid": TID, "oid": "o1", "acct": "1" }),
+        ] {
+            assert!(is_guest(&g, TID), "{g}");
+            assert!(tenant_of(&g, TID).is_err(), "{g}");
+        }
+        assert!(tenant_of(&json!({ "tid": TID, "oid": "o1", "acct": 0 }), TID).is_ok());
     }
 
     #[test]
