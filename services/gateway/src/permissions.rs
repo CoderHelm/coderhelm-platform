@@ -230,8 +230,6 @@ pub const CAPABILITIES: &[Capability] = &[
             "brain::delete_thread",
             "brain::delete_threads",
             "brain::rate_message",
-            // Ask the app map: Chat's agent with the map lookups.
-            "app_map::ask",
         ],
     },
     Capability {

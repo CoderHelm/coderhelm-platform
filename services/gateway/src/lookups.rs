@@ -180,7 +180,7 @@ pub fn base(key: &str) -> Option<&'static Base> {
 /// source's kind: `code`, `knowledge`, `ticket`, `pull_request`, `run`).
 pub fn base_of(kind: &str) -> &'static Base {
     let key = match kind {
-        "code" | "memory" => CODE,
+        "code" | "memory" | "app_map" => CODE,
         "security" | "tests" => SECURITY,
         "infra" | "resources" => INFRA,
         "alerts" | "log_findings" => LOGS,

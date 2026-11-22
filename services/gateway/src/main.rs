@@ -735,7 +735,6 @@ fn build_app(state: Arc<AppState>) -> Router {
         .route("/app-map/file", get(routes::app_map::file))
         .route("/app-map/screen", get(routes::app_map::screen))
         .route("/app-map/search", get(routes::app_map::search))
-        .route("/app-map/ask", post(routes::app_map::ask))
         .route("/app-map/rebuild", post(routes::app_map::rebuild))
         // GitHub App installation
         .route(

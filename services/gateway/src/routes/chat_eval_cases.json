@@ -377,5 +377,33 @@
     "intent": "small_talk",
     "question": "good morning!",
     "wants": "A short greeting, optionally one offer of help."
+  },
+  {
+    "name": "map: what happens when someone books a slip",
+    "origin": "variant",
+    "intent": "lookup",
+    "question": "What happens when someone books a slip?",
+    "wants": "Numbered steps in the order they happen, from the slip page on the Harbor website to the booking service and the card payment through Stripe, in plain words, citing the app map; file paths only where they help."
+  },
+  {
+    "name": "map: what is behind the slip screen",
+    "origin": "variant",
+    "intent": "lookup",
+    "question": "What's behind the /slips/:id screen?",
+    "wants": "What the slip screen uses, the request it sends, the booking service code that answers and the outside service behind it, from the app map, cited."
+  },
+  {
+    "name": "map: which service charges the card",
+    "origin": "variant",
+    "intent": "lookup",
+    "question": "Which service charges the card when a boater books?",
+    "wants": "The booking service (harbor-api) charges the card through Stripe, said first, cited from the app map, then where in the code if it helps."
+  },
+  {
+    "name": "map: how do refunds get to stripe",
+    "origin": "variant",
+    "intent": "lookup",
+    "question": "How do refunds get to Stripe?",
+    "wants": "How a refund travels from the app to Stripe as the app map shows it, and plainly what the map doesn't show; the code for exact lines only if needed."
   }
 ]

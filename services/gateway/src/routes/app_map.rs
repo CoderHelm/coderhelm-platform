@@ -9,23 +9,20 @@
 //!   (the first visit starts the first build);
 //! - `GET /api/app-map/part?id=`, `/file?path=`, `/screen?id=`, `/search?q=`:
 //!   lookups;
-//! - `POST /api/app-map/ask`: a question answered by Chat's agent with map
-//!   lookups, with numbered steps and a small map of the parts involved;
+//! - questions about the map are Chat's: Chat offers the map lookups
+//!   (`common::app_map::tool_defs`), and the page's Ask box asks Chat;
 //! - `POST /api/app-map/rebuild`: an admin builds it again.
 
-use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use aws_sdk_dynamodb::types::AttributeValue;
 use axum::extract::{Query, State};
 use axum::{http::StatusCode, Extension, Json};
 use common::app_map::{self as am, HealthItem, WorkItem};
-use common::knowledge::answer::{Registry, SourceRef};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tracing::{error, info};
 
-use super::chat_agent;
 use crate::models::Claims;
 use crate::AppState;
 
@@ -525,227 +522,6 @@ async fn health(state: &AppState, team_id: &str, days: u32) -> Vec<HealthItem> {
     out
 }
 
-// ── Ask the map ────────────────────────────────────────────────────────────
-
-/// The Ask agent's lookups.
-pub fn tool_defs() -> Vec<Value> {
-    let obj = |props: Value, req: &[&str]| json!({"type": "object", "properties": props, "required": req});
-    vec![
-        json!({"name": "map_overview", "description": "The app map in short: every part (id, name, kind, what it does), the screens, the Health counts and the repositories.", "input_schema": obj(json!({}), &[])}),
-        json!({"name": "map_find", "description": "Search the map: parts, files, endpoints and screens whose names, descriptions or paths hold every word.", "input_schema": obj(json!({"query": {"type": "string"}}), &["query"])}),
-        json!({"name": "map_part", "description": "One part by id: its sub-parts, files, endpoints, and the lines in and out (imports, web requests matched to endpoints, outside services).", "input_schema": obj(json!({"id": {"type": "string"}}), &["id"])}),
-        json!({"name": "map_screen", "description": "Everything behind one screen, by its id or its address (like /slips/:id), step by step: the files it uses, the requests it makes, the server code that answers and the outside services behind it.", "input_schema": obj(json!({"screen": {"type": "string"}}), &["screen"])}),
-        json!({"name": "map_file", "description": "One file by its path on the map (repository folder first, like harbor-api/src/bookings.js): what it is, its endpoints and what it connects to.", "input_schema": obj(json!({"path": {"type": "string"}}), &["path"])}),
-    ]
-}
-
-/// The Ask agent's toolbox over one team's map. Records the map ids its
-/// lookups returned, for the small map.
-pub struct MapBox {
-    pub graph: Value,
-    pub defs: Vec<Value>,
-    pub ids: Vec<String>,
-}
-
-impl MapBox {
-    pub fn new(graph: Value) -> Self {
-        Self {
-            graph,
-            defs: tool_defs(),
-            ids: Vec::new(),
-        }
-    }
-
-    fn note(&mut self, v: &Value) {
-        let mut stack = vec![v];
-        while let Some(x) = stack.pop() {
-            match x {
-                Value::Object(o) => {
-                    if let Some(id) = o.get("id").and_then(|i| i.as_str()) {
-                        self.ids.push(id.to_string());
-                    }
-                    if let Some(p) = o.get("path").and_then(|i| i.as_str()) {
-                        self.ids.push(format!("f:{p}"));
-                    }
-                    stack.extend(o.values());
-                }
-                Value::Array(a) => stack.extend(a.iter()),
-                _ => {}
-            }
-        }
-    }
-
-    /// Runs one lookup: (what the model reads, label).
-    pub fn lookup(&mut self, name: &str, input: &Value) -> (Value, String) {
-        let s = |k: &str| input[k].as_str().unwrap_or("").trim().to_string();
-        let (v, label) = match name {
-            "map_overview" => (am::overview(&self.graph), "Read the map".to_string()),
-            "map_find" => (am::search(&self.graph, &s("query")), format!("Searched the map for {}", s("query"))),
-            "map_part" => (
-                am::part_view(&self.graph, &s("id")).unwrap_or_else(|| json!({"error": "No part has that id; use map_overview or map_find for ids."})),
-                "Opened a part".to_string(),
-            ),
-            "map_screen" => (
-                am::screen_view(&self.graph, &s("screen")).unwrap_or_else(|| json!({"error": "No screen has that id or address; use map_overview."})),
-                format!("Followed the screen {}", s("screen")),
-            ),
-            "map_file" => (
-                am::file_view(&self.graph, &s("path")).unwrap_or_else(|| json!({"error": "That file isn't on the map."})),
-                format!("Opened {}", s("path")),
-            ),
-            _ => (json!({"error": "Unknown lookup."}), name.to_string()),
-        };
-        if v.get("error").is_none() && !matches!(name, "map_overview" | "map_find") {
-            self.note(&v);
-        }
-        (v, label)
-    }
-}
-
-#[async_trait::async_trait]
-impl chat_agent::Toolbox for MapBox {
-    fn defs(&self) -> &[Value] {
-        &self.defs
-    }
-
-    async fn call(
-        &mut self,
-        reg: &mut Registry,
-        _sink: &dyn chat_agent::Sink,
-        name: &str,
-        input: &Value,
-    ) -> chat_agent::Called {
-        let (v, label) = self.lookup(name, input);
-        let is_error = v.get("error").is_some();
-        let text = common::truncate_str(&v.to_string(), 30_000).to_string();
-        let id = reg.add(SourceRef {
-            kind: "app_map".into(),
-            title: label.clone(),
-            loc: input.to_string(),
-            passage: common::truncate_str(&text, 1_200).to_string(),
-            href: Some("/app-map".into()),
-            ..Default::default()
-        });
-        chat_agent::Called::Done {
-            text: format!("[{id}] {text}"),
-            label,
-            summary: String::new(),
-            is_error,
-            kind: "app_map".into(),
-        }
-    }
-}
-
-struct Quiet;
-
-#[async_trait::async_trait]
-impl chat_agent::Sink for Quiet {
-    async fn send(&self, _kind: &str, _data: Value) {}
-}
-
-pub const ASK_SYSTEM: &str = "You answer questions about how a team's app fits together, from its app map (made with Floorplan). \
-Use the map lookups (start with map_overview or map_find, then open parts, screens and files) and answer only from what they return. \
-Write for someone who may not read code: plain words first, file paths in parentheses. When the question is about how something happens, \
-answer with numbered steps, one line each, in the order it happens. Say plainly when a connection is inferred rather than certain. \
-Cite each lookup you rely on with its id in brackets, like [S1]. No arrows.";
-
-/// The numbered steps of an answer (`1. ...`).
-pub fn steps_of(answer: &str) -> Vec<String> {
-    answer
-        .lines()
-        .filter_map(|l| {
-            let t = l.trim();
-            let (n, rest) = t.split_once(['.', ')'])?;
-            (!n.is_empty() && n.len() <= 2 && n.chars().all(|c| c.is_ascii_digit()))
-                .then(|| rest.trim().to_string())
-                .filter(|r| !r.is_empty())
-        })
-        .collect()
-}
-
-#[derive(Deserialize)]
-pub struct AskBody {
-    pub question: String,
-}
-
-/// POST /api/app-map/ask — {question}. Chat's agent with the map lookups.
-pub async fn ask(
-    State(state): State<Arc<AppState>>,
-    Extension(claims): Extension<Claims>,
-    Json(body): Json<AskBody>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let fail = |code: StatusCode, msg: &str| (code, Json(json!({ "error": msg })));
-    // Members and up, as Chat (the `brain_ask` capability).
-    if claims.require_role(1).is_err() {
-        return Err(fail(
-            StatusCode::FORBIDDEN,
-            "Asking the map needs a member's role.",
-        ));
-    }
-    let question: String = body.question.trim().chars().take(1_000).collect();
-    if question.is_empty() {
-        return Err(fail(StatusCode::BAD_REQUEST, "Ask a question."));
-    }
-    let graph = am::load_graph(&state.s3, &state.config.bucket_name, &claims.team_id)
-        .await
-        .ok_or_else(|| fail(StatusCode::CONFLICT, "The map is still being built."))?;
-    let (api_key, _heavy, check_model_id) =
-        super::brain::load_provider(&state, &claims.team_id).await;
-    let mut tools = MapBox::new(graph);
-    let model = chat_agent::ApiModel {
-        http: reqwest::Client::new(),
-        api_key: api_key.unwrap_or_default(),
-        meter: crate::model_call::chat_meter(&state, &claims.team_id),
-        // The team's everyday model: a map question needs lookups, not depth,
-        // and the person is waiting.
-        model_id: check_model_id.clone(),
-        check_model_id,
-        kind_of: |_| "app_map",
-    };
-    let mut reg = Registry::default();
-    let ask = chat_agent::Ask {
-        system: ASK_SYSTEM.to_string(),
-        messages: vec![json!({"role": "user", "content": [{"type": "text", "text": question}]})],
-        question: &question,
-        limits: chat_agent::Limits {
-            turns: 6,
-            tool_calls: 10,
-            retries: 0,
-        },
-        must_look: None,
-        // A map answer always cites the map; it is never small talk.
-        uncited_ok: false,
-    };
-    let out = chat_agent::run(&model, &mut tools, &Quiet, &mut reg, ask)
-        .await
-        .map_err(|_| {
-            fail(
-                StatusCode::BAD_GATEWAY,
-                "The model couldn't be reached. Try again in a moment.",
-            )
-        })?;
-    let answer = out.fin.text.clone();
-    Ok(Json(json!({
-        "answer": answer,
-        "grounded": out.fin.grounded,
-        "steps": steps_of(&answer),
-        "graph": mini_map(&tools),
-    })))
-}
-
-/// The parts the answer's lookups touched, as a map the same viewer draws;
-/// `null` when they touched none.
-pub fn mini_map(tools: &MapBox) -> Value {
-    let parts: BTreeSet<String> = am::parts_of(&tools.graph, &tools.ids);
-    if parts.is_empty() {
-        return Value::Null;
-    }
-    am::for_viewer(
-        am::sub_map(&tools.graph, &parts),
-        &chrono::Utc::now().to_rfc3339(),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -815,53 +591,6 @@ mod tests {
         assert_eq!(
             shown_state(Some(&st("ready", 100)), false, 100),
             ("empty", false)
-        );
-    }
-
-    #[test]
-    fn the_ask_lookups_answer_from_the_map_and_draw_what_they_touched() {
-        let mut b = MapBox::new(harbor());
-        let (v, _) = b.lookup("map_screen", &json!({"screen": "/slips/:id"}));
-        assert_eq!(
-            v["behind"].as_array().unwrap().last().unwrap()["step"],
-            "outside"
-        );
-        let (v, _) = b.lookup("map_part", &json!({"id": "nope"}));
-        assert!(v.get("error").is_some());
-        let mini = mini_map(&b);
-        let parts: Vec<&str> = mini["nodes"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|n| n["id"].as_str())
-            .collect();
-        assert_eq!(parts, vec!["web", "api", "stripe"]);
-        assert_eq!(mini["meta"]["exported"]["by"], "Coderhelm");
-        assert!(mini_map(&MapBox::new(harbor())).is_null());
-        let defs = tool_defs();
-        let names: Vec<&str> = defs.iter().filter_map(|d| d["name"].as_str()).collect();
-        assert_eq!(
-            names,
-            vec![
-                "map_overview",
-                "map_find",
-                "map_part",
-                "map_screen",
-                "map_file"
-            ]
-        );
-    }
-
-    #[test]
-    fn answers_give_numbered_steps() {
-        let a = "Booking a slip:\n1. The slip page sends the booking [S1].\n2) The booking service charges the card.\nNot a step.\n10. Done.";
-        assert_eq!(
-            steps_of(a),
-            vec![
-                "The slip page sends the booking [S1].",
-                "The booking service charges the card.",
-                "Done."
-            ]
         );
     }
 
