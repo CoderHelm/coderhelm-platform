@@ -2953,6 +2953,7 @@ pub async fn get_settings(
         "without_2fa": without,
         "api_keys": keys,
         "your_session_has_2fa": signed_in.mfa,
+        "team_id": claims.team_id,
         "require_sso": rule.require_sso.map(|p| p.slug()),
         "require_sso_since": sso_since_text(&rule),
         "sso_options": options,

@@ -1037,6 +1037,7 @@ async fn the_page_lists_unlinked_members_claims_and_what_turning_on_needs() {
     let a = w.call("GET", "/api/sign-in", &c, None).await;
     assert_eq!(a.status, StatusCode::OK, "{}", a.body);
     assert_eq!(a.body["require_sso"], "okta");
+    assert_eq!(a.body["team_id"], GATED);
     let okta = &a.body["sso_options"][0];
     assert_eq!(okta["provider"], "okta");
     assert_eq!(okta["unlinked"][0]["email"], "b@example.com");
@@ -2989,13 +2990,16 @@ async fn an_okta_claim_links_the_okta_identity() {
 /// and no session is made for anyone.
 #[tokio::test]
 async fn support_recovery_turns_only_the_rule_off_and_makes_no_session() {
+    // The same platform admin list the other tests set (the variable is
+    // process-wide).
+    std::env::set_var("PLATFORM_ADMIN_EMAILS", "admin@coderhelm.example");
     let w = world().await;
     w.rule(GATED, true);
     w.member(GATED, "USER#own", "own@example.com", "owner", &[]);
     w.member(
         "TEAM#coderhelm",
         "USER#staff",
-        "admin@coderhelm.com",
+        "admin@coderhelm.example",
         "owner",
         &[],
     );
@@ -3008,7 +3012,7 @@ async fn support_recovery_turns_only_the_rule_off_and_makes_no_session() {
         w.cookie(
             "TEAM#coderhelm",
             "USER#staff",
-            "admin@coderhelm.com",
+            "admin@coderhelm.example",
             "owner",
             &SignInProof::new(mfa, "google"),
         )
