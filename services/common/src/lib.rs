@@ -6,6 +6,9 @@ pub mod agent_file;
 /// The agent log of a run: its file format, outcomes, order and redaction
 /// (worker writes it, gateway serves it).
 pub mod agent_log;
+/// The app map: CoderHelm's adapter around the vendored Floorplan map
+/// (`vendor/floorplan`): storage, CoderHelm's overlays and lookups.
+pub mod app_map;
 /// A repository's code map: sections stamped with the commit they describe,
 /// rebuilt only where a change touched them, given to the planner and coder.
 pub mod code_map;

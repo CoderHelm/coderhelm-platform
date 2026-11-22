@@ -123,6 +123,10 @@ pub enum WorkerMessage {
     /// to the default branch re-indexes only the changed files).
     #[serde(rename = "graph_index")]
     GraphIndex(GraphIndexMessage),
+    /// One step of a team's app map: Floorplan run in the sandbox, its model
+    /// jobs on the team's model (`worker::passes::app_map`).
+    #[serde(rename = "app_map")]
+    AppMap(AppMapMessage),
     /// Read the test reports of a finished workflow run or an upload.
     #[serde(rename = "test_ingest")]
     TestIngest(crate::e2e::messages::TestIngest),
@@ -453,6 +457,7 @@ impl WorkerMessage {
             WorkerMessage::ReleaseNotes(_) | WorkerMessage::TagSweep(_) => f::RELEASE_NOTES,
             WorkerMessage::TestIngest(_) | WorkerMessage::TestAction(_) => f::TESTS,
             WorkerMessage::ToolProposals(_) => f::LIVE_SOURCES,
+            WorkerMessage::AppMap(_) => f::APP_MAP,
             WorkerMessage::KnowledgeSync(_) => f::EMBEDDING,
             WorkerMessage::BedrockSync(_) => f::OTHER,
             WorkerMessage::HiddenSuggest(_) => f::DATA_SOURCE,
@@ -528,6 +533,7 @@ impl WorkerMessage {
             | WorkerMessage::Restack(_)
             | WorkerMessage::ReleaseNotes(_)
             | WorkerMessage::GraphIndex(_)
+            | WorkerMessage::AppMap(_)
             | WorkerMessage::TestIngest(_)
             | WorkerMessage::TestAction(_)
             | WorkerMessage::SkillSync(_)
@@ -698,6 +704,19 @@ pub struct GraphIndexMessage {
     pub branch: String,
     #[serde(default)]
     pub changed_files: Option<Vec<String>>,
+}
+
+/// One step of a team's app map (`worker::passes::app_map`): `step` empty
+/// starts a build (or an update), `build` builds with the model jobs'
+/// answers.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct AppMapMessage {
+    pub team_id: String,
+    /// Unused: the map covers every repository of the team.
+    #[serde(default)]
+    pub repo: String,
+    #[serde(default)]
+    pub step: String,
 }
 
 /// A coalesced release-tag sweep. Carries only routing + the batch clock; the

@@ -16,7 +16,7 @@ import * as cdk from "aws-cdk-lib";
 import { Match, Template } from "aws-cdk-lib/assertions";
 import { buildApp } from "../lib/app";
 import { CoderhelmConfig, loadConfigFile, resolveConfig, ResolvedConfig } from "../lib/config";
-import { API_PATHS, BRAIN_STREAM_PATH, DASHBOARD_URL_PLACEHOLDER, STREAM_PATH, runtimeConfigScript } from "../lib/web-stack";
+import { API_PATHS, APP_MAP_FRAME_CSP, APP_MAP_FRAME_PATH, BRAIN_STREAM_PATH, DASHBOARD_URL_PLACEHOLDER, STREAM_PATH, runtimeConfigScript } from "../lib/web-stack";
 import { releaseCheckBuildSpec, updateBuildSpec } from "../lib/updates-stack";
 import { CHECK_VERSION, checkTagCommands, COSIGN_LINUX_AMD64_SHA256, CURL, FETCH_TRIES, fetchTagCommands, VERIFY_SUMS, verifyTagCommands } from "../lib/release-verify";
 import { accessNames, deployPolicy } from "../lib/access";
@@ -151,10 +151,21 @@ test("fresh self-host config without a domain: nothing hosted-specific, one Clou
   t["coderhelm-prod-web"].hasResourceProperties("AWS::SSM::Parameter", { Name: "/coderhelm-prod/public-url" });
 
   // One distribution: the streams first (Chat's answers outlast the HTTP API's
-  // 30 seconds), then the API paths, then the dashboard.
+  // 30 seconds), then the API paths, the App map's frame, then the dashboard.
   const dist = Object.values(t["coderhelm-prod-web"].findResources("AWS::CloudFront::Distribution"))[0] as any;
   const paths = dist.Properties.DistributionConfig.CacheBehaviors.map((b: any) => b.PathPattern);
-  assert.deepEqual(paths, [STREAM_PATH, BRAIN_STREAM_PATH, ...API_PATHS]);
+  assert.deepEqual(paths, [STREAM_PATH, BRAIN_STREAM_PATH, ...API_PATHS, APP_MAP_FRAME_PATH]);
+  // The App map's frame (Floorplan's viewer in a sandboxed iframe) may be
+  // framed by the install only, and reaches no network; every other page
+  // keeps the headers that deny framing.
+  const policies = t["coderhelm-prod-web"].findResources("AWS::CloudFront::ResponseHeadersPolicy") as Record<string, any>;
+  const frameBehavior = dist.Properties.DistributionConfig.CacheBehaviors.find((b: any) => b.PathPattern === APP_MAP_FRAME_PATH);
+  const framePolicy = policies[frameBehavior.ResponseHeadersPolicyId.Ref].Properties.ResponseHeadersPolicyConfig.SecurityHeadersConfig;
+  assert.equal(framePolicy.FrameOptions.FrameOption, "SAMEORIGIN");
+  assert.equal(framePolicy.ContentSecurityPolicy.ContentSecurityPolicy, APP_MAP_FRAME_CSP);
+  assert.match(APP_MAP_FRAME_CSP, /connect-src 'none'/);
+  const defaultPolicy = policies[dist.Properties.DistributionConfig.DefaultCacheBehavior.ResponseHeadersPolicyId.Ref].Properties.ResponseHeadersPolicyConfig.SecurityHeadersConfig;
+  assert.equal(defaultPolicy.FrameOptions.FrameOption, "DENY");
   assert.equal(dist.Properties.DistributionConfig.Aliases, undefined);
 
   // No Google sign-in, no OAuth client, Cognito's own email.
@@ -770,7 +781,7 @@ test("CORS: the gateway answers browsers, not API Gateway; the docs origin never
   assert.equal(envOf(t["coderhelm-prod-api"], "coderhelm-prod-gateway").CORS_ORIGINS, undefined);
   const dist = Object.values(t["coderhelm-prod-web"].findResources("AWS::CloudFront::Distribution"))[0] as any;
   for (const b of dist.Properties.DistributionConfig.CacheBehaviors) {
-    if (b.PathPattern === STREAM_PATH || b.PathPattern === BRAIN_STREAM_PATH) continue;
+    if (b.PathPattern === STREAM_PATH || b.PathPattern === BRAIN_STREAM_PATH || b.PathPattern === APP_MAP_FRAME_PATH) continue;
     assert.equal(b.ResponseHeadersPolicyId, undefined, `${b.PathPattern} rewrites the API's headers`);
   }
   assert.ok(API_PATHS.includes("/api/*"), "the setup routes go through the API behavior");

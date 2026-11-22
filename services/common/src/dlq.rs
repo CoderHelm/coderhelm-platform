@@ -54,6 +54,7 @@ pub const WORKER_MESSAGE_TYPES: &[&str] = &[
     "restack",
     "release_notes",
     "graph_index",
+    "app_map",
     "test_ingest",
     "test_action",
     "skill_sync",
