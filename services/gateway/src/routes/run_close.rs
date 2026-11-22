@@ -1145,6 +1145,7 @@ mod tests {
             held: false,
             via_okta: false,
             okta_sub: None,
+            entra: None,
         }
     }
 

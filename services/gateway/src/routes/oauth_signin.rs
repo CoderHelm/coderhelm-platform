@@ -89,6 +89,14 @@ pub enum Reason {
     /// Okta signed in an identity no member has linked yet: they sign in
     /// another way first and link Okta in their own settings.
     OktaNotLinked,
+    /// A sign-in through a team's own Microsoft Entra tenant of an account
+    /// no member has linked yet (routes::entra_sso): they sign in another
+    /// way first and link it in their own settings.
+    SsoNotLinked,
+    /// The same while the team requires single sign-on, when no claim link
+    /// or invite for their email works either: only an admin can let them in
+    /// now (routes::require_sso, routes::sso_claim).
+    SsoAskAdmin,
 }
 
 impl Reason {
@@ -105,6 +113,8 @@ impl Reason {
             Reason::NotOnTeam => "not_on_team",
             Reason::TeamOnly => "okta_team_only",
             Reason::OktaNotLinked => "okta_not_linked",
+            Reason::SsoNotLinked => "sso_not_linked",
+            Reason::SsoAskAdmin => "sso_ask_admin",
         }
     }
 }

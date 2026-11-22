@@ -6,8 +6,26 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-/// The query for `name`'s TXT records (recursion desired), with `id`.
+/// The UDP payload size the query offers (EDNS0): an answer with many TXT
+/// values fits instead of coming back cut.
+pub const EDNS_UDP_SIZE: u16 = 4096;
+
+/// The query for `name`'s TXT records (recursion desired), with `id`, and an
+/// EDNS0 OPT record offering [`EDNS_UDP_SIZE`] bytes.
 pub fn query(id: u16, name: &str) -> Option<Vec<u8>> {
+    let mut q = question(id, name)?;
+    // ARCOUNT = 1, then OPT: root name, type 41, class = UDP size, TTL 0
+    // (extended rcode, version 0, no flags), no data.
+    q[11] = 1;
+    q.push(0);
+    q.extend_from_slice(&41u16.to_be_bytes());
+    q.extend_from_slice(&EDNS_UDP_SIZE.to_be_bytes());
+    q.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+    Some(q)
+}
+
+/// The header and question alone (what an answer repeats).
+fn question(id: u16, name: &str) -> Option<Vec<u8>> {
     let mut q = Vec::with_capacity(32 + name.len());
     q.extend_from_slice(&id.to_be_bytes());
     q.extend_from_slice(&[0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0]);
@@ -58,7 +76,8 @@ fn skip_name(b: &[u8], mut i: usize) -> Option<usize> {
 }
 
 /// The TXT strings in an answer to query `id` (each record's strings
-/// joined). None for an answer that isn't one, or a server failure; an
+/// joined). None for an answer that isn't one, a server failure, or a cut
+/// answer (the TC flag: records may be missing, so it says nothing); an
 /// empty list for a name with no TXT record.
 pub fn parse(id: u16, b: &[u8]) -> Option<Vec<String>> {
     parse_for(id, b, None)
@@ -68,6 +87,10 @@ pub fn parse(id: u16, b: &[u8]) -> Option<Vec<String>> {
 /// insensitive): a TXT record at another name never counts for this one.
 pub fn parse_for(id: u16, b: &[u8], name: Option<&str>) -> Option<Vec<String>> {
     if b.len() < 12 || u16::from_be_bytes([b[0], b[1]]) != id || b[2] & 0x80 == 0 {
+        return None;
+    }
+    // Truncated: not a definite answer (a missing record may just be cut).
+    if b[2] & 0x02 != 0 {
         return None;
     }
     let rcode = b[3] & 0x0F;
@@ -188,7 +211,7 @@ mod tests {
     /// An answer to `query(7, "_dmarc.example.com")` with one TXT record of
     /// two strings, its name compressed to the question.
     fn answer(rcode: u8, strings: &[&str]) -> Vec<u8> {
-        let mut b = query(7, "_dmarc.example.com").unwrap();
+        let mut b = question(7, "_dmarc.example.com").unwrap();
         b[2] = 0x81;
         b[3] = 0x80 | rcode;
         let n = if strings.is_empty() { 0 } else { 1 };
@@ -210,8 +233,13 @@ mod tests {
     fn a_query_names_each_label() {
         let q = query(1, "_dmarc.example.com.").unwrap();
         assert_eq!(&q[12..19], b"\x06_dmarc");
-        assert_eq!(&q[q.len() - 4..], &[0, 16, 0, 1]);
+        let qn = question(1, "_dmarc.example.com").unwrap();
+        assert_eq!(&qn[qn.len() - 4..], &[0, 16, 0, 1]);
         assert!(query(1, "a..b").is_none());
+        // One additional record: EDNS0 OPT offering a 4096-byte answer.
+        assert_eq!(&q[10..12], &[0, 1]);
+        assert_eq!(&q[..qn.len()][..10], &qn[..10]);
+        assert_eq!(&q[qn.len()..], &[0, 0, 41, 0x10, 0x00, 0, 0, 0, 0, 0, 0]);
     }
 
     #[test]
@@ -247,7 +275,7 @@ mod tests {
     /// An answer to `query(9, asked)` whose one TXT record is owned by
     /// `owner`, written out in full (no compression).
     fn answer_owned_by(asked: &str, owner: &str, txt: &str) -> Vec<u8> {
-        let mut b = query(9, asked).unwrap();
+        let mut b = question(9, asked).unwrap();
         b[2] = 0x81;
         b[3] = 0x80;
         b[7] = 1;
@@ -288,7 +316,7 @@ mod tests {
     fn a_cname_chain_in_the_answer_is_followed() {
         // _coderhelm-okta.acme.example CNAME proofs.dns.example, whose TXT counts.
         let asked = "_coderhelm-okta.acme.example";
-        let mut b = query(9, asked).unwrap();
+        let mut b = question(9, asked).unwrap();
         b[2] = 0x81;
         b[3] = 0x80;
         b[7] = 3;
@@ -315,5 +343,22 @@ mod tests {
         assert!(parse_for(9, &b, Some("_coderhelm-okta.evil.example"))
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn a_cut_answer_is_no_answer() {
+        // One of two TXT values came back and the server set TC: reading it
+        // as "the record is gone" would release a domain.
+        let mut b = answer(0, &["v=DMARC1; p=reject"]);
+        b[2] |= 0x02;
+        assert_eq!(parse(7, &b), None);
+        assert_eq!(parse_for(7, &b, Some("_dmarc.example.com")), None);
+        // And a cut answer with no records at all says nothing either.
+        let mut empty = answer(0, &[]);
+        empty[2] |= 0x02;
+        assert_eq!(parse(7, &empty), None);
+        // Not cut: read as before.
+        let ok = answer(0, &["v=DMARC1; p=reject"]);
+        assert_eq!(parse(7, &ok).unwrap().len(), 1);
     }
 }

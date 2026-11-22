@@ -1524,12 +1524,7 @@ pub async fn email_approve(
     };
     let team = link.team_id.as_str();
     // Only the approver the link names, signed in in this browser, may answer.
-    if !crate::middleware::auth::signed_in_as(
-        &headers,
-        &state.secrets.jwt_secret,
-        team,
-        &link.email,
-    ) {
+    if !crate::middleware::auth::session_answers_as(&state, &headers, team, &link.email).await {
         return (
             StatusCode::FORBIDDEN,
             page(

@@ -290,6 +290,13 @@ pub struct Claims {
     /// It must still be the member's linked subject.
     #[serde(skip)]
     pub okta_sub: Option<String>,
+    /// Set by the auth middleware, never read from or written to a token:
+    /// the `<tid>/<oid>` a session from a team's own Microsoft Entra tenant
+    /// signed in as (routes::entra_sso). It must still be the member's
+    /// linked identity; such a session is held to its team on hosted and is
+    /// never a platform admin.
+    #[serde(skip)]
+    pub entra: Option<String>,
 }
 
 /// The API key a request was made with.
@@ -495,6 +502,7 @@ mod tests {
             held: false,
             via_okta: false,
             okta_sub: None,
+            entra: None,
         };
         let json = serde_json::to_string(&c).unwrap();
         let parsed: Claims = serde_json::from_str(&json).unwrap();

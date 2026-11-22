@@ -433,6 +433,7 @@ pub fn view_claims(sv: &SupportView) -> Claims {
         held: false,
         via_okta: false,
         okta_sub: None,
+        entra: None,
     }
 }
 

@@ -1252,6 +1252,7 @@ pub async fn rate_message(
 pub async fn stream_token(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
+    proof: Option<Extension<crate::auth::jwt::SignInProof>>,
 ) -> Reply {
     if claims.require_role(1).is_err() {
         return Err(fail(
@@ -1261,6 +1262,7 @@ pub async fn stream_token(
     }
     let token = crate::auth::jwt::create_scoped_token(
         &claims,
+        &proof.map(|p| p.0).unwrap_or_default(),
         crate::auth::jwt::BRAIN_AUDIENCE,
         &state.secrets.jwt_secret,
         300,
@@ -2283,6 +2285,19 @@ pub async fn brain_stream(
         &state.secrets.jwt_secret,
     )
     .map_err(|_| fail(StatusCode::UNAUTHORIZED, "Sign in again."))?;
+    // The session it was minted from must still stand, as on every request:
+    // a team that turned on Require Okta sign-in since ends it here too.
+    let minted_by = crate::auth::jwt::read_scoped_proof(
+        token,
+        crate::auth::jwt::BRAIN_AUDIENCE,
+        &state.secrets.jwt_secret,
+    );
+    if let Err(r) = super::require_sso::check_scoped(&state, &claims, &minted_by).await {
+        return Err((
+            r.status(),
+            Json(json!({ "error": "Your session ended. Sign in again.", "code": "session_ended" })),
+        ));
+    }
     // The token carries the member's stored role; what it holds is read now,
     // so a role changed since the token was minted is honored.
     let holder = super::roles::holder_for(&state, &claims).await;

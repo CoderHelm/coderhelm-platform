@@ -61,13 +61,7 @@ pub async fn require_auth(
     // A team's Okta vouches for that team only (routes::oidc_signin): set
     // before anything (the support view included) asks who this is.
     let signed_in = jwt::read_proof(token, &state.secrets.jwt_secret);
-    let signed_in_via = signed_in.via.clone();
-    claims.okta_sub = signed_in.okta_sub.clone();
-    claims.via_okta = crate::routes::oidc_signin::signed_in_with_okta(signed_in_via.as_deref());
-    claims.held = crate::routes::oidc_signin::is_held(
-        signed_in_via.as_deref(),
-        crate::routes::setup_checks::self_hosted(),
-    );
+    claims = crate::routes::oidc_signin::mark_session(claims, &signed_in);
 
     // A support view: the platform admin's own session plus a support-view
     // cookie. Enforced here for every route: reads only, every request
@@ -79,6 +73,16 @@ pub async fn require_auth(
         let method = req.method().clone();
         let path = req.uri().path().to_string();
         if !support_access::is_exit(&method, &path) {
+            // The admin's own session first, as every request checks it: not
+            // ended, and allowed by their own team's sign-in rules.
+            if let Err(ended) = sign_in::check_member_session(&state, &claims).await {
+                return Ok(ended);
+            }
+            if let Err(refused) =
+                crate::routes::require_sso::check_claims(&state, &claims, &signed_in).await
+            {
+                return Ok(refused);
+            }
             let route = req
                 .uri()
                 .path_and_query()
@@ -98,6 +102,22 @@ pub async fn require_auth(
                     true,
                 ));
             };
+            // A team that requires Okta sign-in is viewed only from a session
+            // as strong: an Okta session is never a platform admin, so the
+            // admin's own session must have passed a second factor.
+            match sign_in::team_rule(&state, &sv.team_id).await {
+                Ok(rule) if crate::routes::require_sso::support_view_allowed(&rule, &signed_in) => {}
+                Ok(_) => {
+                    return Ok(support_access::refused(
+                        "This team requires Okta sign-in. Sign in with your second factor to open its support view.",
+                        true,
+                    ))
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "Viewed team's sign-in rules not read; support view refused");
+                    return Err(StatusCode::SERVICE_UNAVAILABLE);
+                }
+            }
             let now = chrono::Utc::now().timestamp().max(0) as u64;
             if let Some(why) = support_access::support_view_refusal(&method, &path) {
                 if let Err(e) =
@@ -143,7 +163,7 @@ pub async fn require_auth(
     if let Err(ended) = sign_in::check_member_session(&state, &claims).await {
         return Ok(ended);
     }
-    if let Err(held) = sign_in::check_session(&state, &claims.team_id, &proof, handler).await {
+    if let Err(held) = sign_in::check_session(&state, &claims, &proof, handler, false).await {
         return Ok(held);
     }
     if let Some(refused) = crate::routes::oidc_signin::held_refusal(&state, &claims, handler).await
@@ -219,21 +239,12 @@ async fn app_request(
     let mut claims = caller.claims.clone();
     claims.support_view = None;
     claims.api_key = None;
-    claims.via_okta = crate::routes::oidc_signin::signed_in_with_okta(caller.grant.via.as_deref());
-    claims.okta_sub = caller.grant.okta_sub.clone();
-    claims.held = crate::routes::oidc_signin::is_held(
-        caller.grant.via.as_deref(),
-        crate::routes::setup_checks::self_hosted(),
-    );
+    claims = crate::routes::oidc_signin::mark_session(claims, &caller.grant.proof());
     if let Err(ended) = sign_in::check_member_session(state, &claims).await {
         return ended;
     }
-    let proof = jwt::SignInProof {
-        mfa: caller.grant.mfa,
-        via: caller.grant.via.clone(),
-        okta_sub: caller.grant.okta_sub.clone(),
-    };
-    if let Err(held) = sign_in::check_session(state, &claims.team_id, &proof, handler).await {
+    let proof = caller.grant.proof();
+    if let Err(held) = sign_in::check_session(state, &claims, &proof, handler, true).await {
         return held;
     }
     if let Some(refused) = crate::routes::oidc_signin::held_refusal(state, &claims, handler).await {
@@ -299,6 +310,31 @@ async fn api_key_request(
         }
     };
     let (key, maker, rate) = (accepted.key, accepted.maker, accepted.rate);
+    // While the team requires single sign-on, a key follows its maker.
+    match crate::routes::require_sso::key_maker_allowed(state, &key.team_id, &key.created_by).await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            return with_rate_headers(
+                key_error(
+                    StatusCode::FORBIDDEN,
+                    crate::routes::require_sso::KEY_SUSPENDED,
+                    crate::routes::require_sso::KEY_SUSPENDED_WORDS,
+                    None,
+                ),
+                &rate,
+            )
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Sign-in rules not read for an API key");
+            return key_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "unavailable",
+                "CoderHelm couldn't check this API key just now. Try again shortly.",
+                None,
+            );
+        }
+    }
 
     let method = req.method().as_str().to_ascii_uppercase();
     let handler = req
@@ -333,6 +369,7 @@ async fn api_key_request(
         held: false,
         via_okta: false,
         okta_sub: None,
+        entra: None,
     };
     let maker_holder = roles::holder_for(state, &maker_claims).await;
     let holder = api_keys::key_holder(&key, &maker_holder);
@@ -376,6 +413,7 @@ async fn api_key_request(
         held: false,
         via_okta: false,
         okta_sub: None,
+        entra: None,
     };
     req.extensions_mut().insert(claims);
     let response = next.run(req).await;
@@ -571,6 +609,38 @@ async fn current_role(state: &AppState, claims: &crate::models::Claims) -> Optio
             .cloned()
             .unwrap_or_else(|| "member".to_string()),
     )
+}
+
+/// [`signed_in_as`], and the session still stands as every API request
+/// checks it: not ended (a removal, a reset, a role change) and allowed by
+/// its team's sign-in rules (an Okta session's link, Require Okta sign-in).
+/// Email links that answer something ask for this.
+pub async fn session_answers_as(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    team_id: &str,
+    email: &str,
+) -> bool {
+    let secret = &state.secrets.jwt_secret;
+    if !signed_in_as(headers, secret, team_id, email) {
+        return false;
+    }
+    let cookie_header = headers
+        .get("cookie")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let Some(token) = extract_cookie(cookie_header, "__Host-coderhelm_session") else {
+        return false;
+    };
+    let Ok(mut claims) = jwt::validate_token(token, secret) else {
+        return false;
+    };
+    let proof = jwt::read_proof(token, secret);
+    claims = crate::routes::oidc_signin::mark_session(claims, &proof);
+    sign_in::check_member_session(state, &claims).await.is_ok()
+        && crate::routes::require_sso::check_claims(state, &claims, &proof)
+            .await
+            .is_ok()
 }
 
 /// Whether the request carries a valid session for `email` on `team_id`

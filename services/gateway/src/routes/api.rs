@@ -334,7 +334,16 @@ pub async fn list_teams(
                 .map(|r| r.items().to_vec())
                 .unwrap_or_default();
 
-            // Process any pending invites — convert them to real user records
+            // Process any pending invites — convert them to real user records.
+            // A team that requires Okta sign-in accepts its invites only
+            // through its Okta (routes::require_okta).
+            let gated = super::require_sso::gated_teams(
+                &state,
+                &all_items,
+                &crate::auth::jwt::SignInProof::default(),
+            )
+            .await
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
             let real_user_sk = format!("USER#{github_id}");
             let now = chrono::Utc::now().to_rfc3339();
             for item in &all_items {
@@ -350,6 +359,9 @@ pub async fn list_teams(
                     Some(t) => t.to_string(),
                     None => continue,
                 };
+                if gated.contains(&invite_tid) {
+                    continue;
+                }
                 let invite_role = item
                     .get("role")
                     .and_then(|v| v.as_s().ok())
@@ -464,7 +476,6 @@ pub async fn switch_team(
     if target_team != claims.team_id && super::oidc_signin::team_only(&claims) {
         return Err(StatusCode::FORBIDDEN);
     }
-
     // Verify user exists in target team and get their role there
     let target_item = state
         .dynamo
@@ -476,7 +487,27 @@ pub async fn switch_team(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .item
+        .filter(|i| {
+            i.get("status")
+                .and_then(|v| v.as_s().ok())
+                .map(String::as_str)
+                != Some("invited")
+        })
         .ok_or(StatusCode::FORBIDDEN)?;
+
+    // A team that requires Okta sign-in is reached only by signing in with
+    // its Okta, never by switching from another team's session. Asked only
+    // once they are on it: a non-member learns nothing about a team's rules.
+    if target_team != claims.team_id
+        && super::sign_in::team_rule(&state, target_team)
+            .await
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+            .require_sso
+            .is_some()
+    {
+        let refused = super::require_sso::refused_for(&state, target_team).await;
+        return Ok(super::require_sso::refused_json(&refused).into_response());
+    }
 
     let target_role = target_item
         .get("role")
@@ -558,6 +589,8 @@ pub(crate) fn is_platform_admin(claims: &Claims) -> bool {
     claims.support_view.is_none()
         && !claims.held
         && !claims.via_okta
+        // Nor can a team's own Microsoft tenant.
+        && claims.entra.is_none()
         && !claims.sub.starts_with("USER#okta_")
         && verified_identity(&claims.sub)
         && platform_admin_listed(&admins, &claims.email)
