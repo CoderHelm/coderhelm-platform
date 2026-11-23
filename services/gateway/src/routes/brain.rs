@@ -2457,6 +2457,26 @@ async fn connection_tools(state: &AppState, team_id: &str, user_email: &str) -> 
 /// Authorized by the short-lived token from `/api/brain/token` (its own
 /// audience); what the asker holds is read again here, so the stream is
 /// decided by capability like every other route.
+/// The answer when the stream token's session check refuses. A check that
+/// couldn't run (a record that couldn't be read: a server error) is ours to
+/// fix, and the person is told to try again; only a session that really
+/// ended, or one the team's sign-in rule refuses, says `session_ended`.
+pub fn scoped_refusal(status: StatusCode) -> (StatusCode, Json<Value>) {
+    if status.is_server_error() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "Chat couldn't check your sign-in right now. Try again.",
+                "code": "sign_in_check_failed",
+            })),
+        );
+    }
+    (
+        status,
+        Json(json!({ "error": "Your session ended. Sign in again.", "code": "session_ended" })),
+    )
+}
+
 #[allow(clippy::type_complexity)]
 pub async fn brain_stream(
     State(state): State<Arc<AppState>>,
@@ -2486,10 +2506,7 @@ pub async fn brain_stream(
         &state.secrets.jwt_secret,
     );
     if let Err(r) = super::require_sso::check_scoped(&state, &claims, &minted_by).await {
-        return Err((
-            r.status(),
-            Json(json!({ "error": "Your session ended. Sign in again.", "code": "session_ended" })),
-        ));
+        return Err(scoped_refusal(r.status()));
     }
     // The token carries the member's stored role; what it holds is read now,
     // so a role changed since the token was minted is honored.

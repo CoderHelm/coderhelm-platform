@@ -104,6 +104,8 @@ pub mod sns;
 pub mod sso_claim;
 pub mod staging_cms;
 pub mod stale_prs;
+#[cfg(test)]
+mod stream_access;
 pub mod support;
 pub mod support_access;
 pub mod system;
