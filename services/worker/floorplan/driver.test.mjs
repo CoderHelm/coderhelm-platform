@@ -111,9 +111,10 @@ test("answers can only become the map's own files", () => {
 test('journeys kept from the last map are re-checked and drawn on it', () => {
   const first = workdir(harborAnswers(), 'start');
   const { result, graph } = drive(first);
-  // Nothing on harbor's one screen says sign in, sign up, booking or the
-  // like by name, so there is nothing for the model to write.
-  assert.equal(result.flows.todo, null, JSON.stringify(result.flows));
+  // The mobile app's sign-in screen (from the detectors) starts a journey:
+  // the model is asked about it, with the candidates around it.
+  assert.deepEqual(result.flows.todo.entries.map((e) => e.key), ['screen:mobile:/(Stack)/SignIn'], JSON.stringify(result.flows.report));
+  assert.match(result.flows.todo.list, /request POST \/slips\/:p\/bookings/);
   assert.ok(result.flows.report.candidates >= 3);
   // A journey as the worker's model step would have stored it.
   const c = flows.candidates(graph, flows.reader(path.join(first, 'root')));
@@ -134,7 +135,8 @@ test('journeys kept from the last map are re-checked and drawn on it', () => {
   assert.ok(fs.readdirSync(path.join(second, 'out')).includes('graph.b64.000'));
   const drawn = again.graph.flows.find((f) => f.id === 'book-a-slip');
   assert.deepEqual(drawn.steps.map((s) => s.ref), ['f:harbor-web/app/slips/[id]/page.tsx', 'r:0', 'n:stripe']);
-  assert.equal(drawn.steps[1].evidence[0].file, 'harbor-web/lib/slips.ts');
+  // The request cites a call site and the handler that answers it.
+  assert.equal(drawn.steps[1].evidence[1].file, 'harbor-api/src/bookings.js');
   assert.equal(again.result.flows.kept.length, 1);
   // Hidden (the default): kept and re-checked, not drawn.
   const third = workdir({}, 'refresh');

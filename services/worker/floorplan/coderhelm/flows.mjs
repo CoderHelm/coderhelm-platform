@@ -65,7 +65,19 @@ export function reader(root) {
     }
     return cache.get(p);
   };
-  return { text, lines: (p) => text(p)?.split('\n') ?? null };
+  const split = new Map();
+  const lines = (p) => {
+    if (!split.has(p)) split.set(p, text(p)?.split('\n') ?? null);
+    return split.get(p);
+  };
+  // Per-file results of the scans below, each file read once.
+  const memo = new Map();
+  const once = (kind, p, f) => {
+    const k = kind + '\0' + p;
+    if (!memo.has(k)) memo.set(k, f());
+    return memo.get(k);
+  };
+  return { text, lines, once };
 }
 
 /** The line (1-based) holding `token` nearest to `line`: within 3 lines,
@@ -151,7 +163,11 @@ function ranges(ix, r, file) {
 function slice(r, file, names, ix) {
   const t = r.text(file) || '';
   if (!names) return t;
-  const lines = t.split('\n');
+  return r.once('slice:' + [...names].sort().join(','), file, () => sliceOf(r, file, names, ix, t));
+}
+
+function sliceOf(r, file, names, ix, t) {
+  const lines = r.lines(file) || t.split('\n');
   const rg = ranges(ix, r, file);
   const parts = [];
   for (const n of names) {
@@ -198,6 +214,10 @@ function resolveSpec(ix, from, spec) {
 /** Imports the map has no link for: constructor injection (Nest and
  * similar) and `import()` / `require()` with a literal. */
 export function hiddenImports(ix, r, classes, file) {
+  return r.once('hidden', file, () => hiddenImportsOf(ix, r, classes, file));
+}
+
+function hiddenImportsOf(ix, r, classes, file) {
   const t = r.text(file);
   if (!t) return [];
   const out = [];
@@ -382,7 +402,7 @@ export function pageSteps(text) {
   if (!text) return out;
   const at = (i) => text.slice(0, i).split('\n').length;
   const pats = [
-    /(\w+(?:\.\w+)?)\s*===\s*((?:\w+\.)?\w+|['"][\w-]+['"])\s*(?:&&|\?)\s*\(?\s*<([A-Z]\w+)/g,
+    /(\w+(?:\.\w+)?)[ \t]*===\s*((?:\w+\.)?\w+|['"][\w-]+['"])\s*(?:&&|\?)\s*\(?\s*<([A-Z]\w+)/g,
     /\[\s*((?:\w+\.)?\w+)\s*\]\s*:\s*\(?\s*<([A-Z]\w+)/g,
   ];
   for (const re of pats) {
@@ -634,7 +654,7 @@ export function candidates(graph, read) {
         if (!inUse(ix, r, f, v.names, e.line)) continue;
         link(c, asyncEvent(consts.get(e.name) || e.name), 'its handler emits the event');
       }
-      for (const h of outgoingHooks(r.text(f))) {
+      for (const h of r.once('hooks', f, () => outgoingHooks(r.text(f)))) {
         if (!inUse(ix, r, f, v.names, h.line)) continue;
         const ev = cite(r, f, h.line, [h.token]);
         link(c, ev && add({ kind: 'async', key: `out:${f}#${h.token}`, view: 'f:' + f, label: `${h.token} (webhooks sent out)`, evidence: [ev] }), 'its handler sends webhooks');
@@ -701,7 +721,7 @@ export function candidates(graph, read) {
       if (v.d > 1) continue;
       const t = r.text(f);
       // Steps inside the page.
-      const steps = pageSteps(t);
+      const steps = r.once('steps', f, () => pageSteps(t));
       const names = new Map((ix.imports.get(f) || []).flatMap((e) => (e.names || []).map((n) => [n, e.to])));
       // The page's own requests (its code and what it uses, the step
       // components left out) belong to each of its steps.
@@ -754,7 +774,7 @@ export function candidates(graph, read) {
     // Navigation written in the screen's own files.
     for (const [f, v] of files) {
       if (v.d > 1) continue;
-      for (const n of navSites(r.text(f))) {
+      for (const n of r.once('nav', f, () => navSites(r.text(f)))) {
         const t = screens.find((x) => x !== s && !x.part && (n.kind === 'name' ? x.name === n.target || segs(x.url || '').pop() === n.target : x.url && urlMatch(n.target, x.url)));
         if (t) link(s, t, 'goes to this screen');
       }
@@ -798,7 +818,7 @@ export function subgraph(c, entry) {
   for (let hop = 0; hop < 2; hop++) {
     const next = [];
     for (const id of ring) for (const [b] of c.edges.get(id) || []) {
-      const x = c.list.find((y) => y.id === b);
+      const x = byIdOf(c).get(b);
       if (x?.kind === 'screen' && !keep.has(b)) { keep.add(b); next.push(b); }
     }
     ring = next;
@@ -807,7 +827,7 @@ export function subgraph(c, entry) {
   while (grow.length) {
     const id = grow.pop();
     for (const [b] of c.edges.get(id) || []) {
-      const x = c.list.find((y) => y.id === b);
+      const x = byIdOf(c).get(b);
       if (x && x.kind !== 'screen' && !keep.has(b)) { keep.add(b); grow.push(b); }
     }
   }
@@ -817,7 +837,7 @@ export function subgraph(c, entry) {
 /** What a journey stands on, without line numbers: a moved line costs
  * nothing, a changed call or a new step does. */
 export function hashOf(c, ids) {
-  const byId = new Map(c.list.map((x) => [x.id, x]));
+  const byId = byIdOf(c);
   const keys = [...ids].map((id) => byId.get(id)).filter(Boolean).map((x) => `${x.key}|${x.evidence.map((e) => e.file + '#' + e.token).join(',')}`).sort();
   const out = [];
   for (const id of ids) for (const [b] of c.edges.get(id) || []) if (ids.has(b)) out.push(`${byId.get(id)?.key}>${byId.get(b)?.key}`);
@@ -826,9 +846,15 @@ export function hashOf(c, ids) {
 
 // ── The list the model reads ──────────────────────────────────────────────
 
+const BYID = new WeakMap();
+function byIdOf(c) {
+  if (!BYID.has(c)) BYID.set(c, new Map(c.list.map((x) => [x.id, x])));
+  return BYID.get(c);
+}
+
 /** One line per candidate, ids first: what the model picks from. */
 export function listText(c, ids) {
-  const byId = new Map(c.list.map((x) => [x.id, x]));
+  const byId = byIdOf(c);
   const order = { screen: 0, request: 1, outside: 2, async: 3 };
   const shown = [...ids].map((id) => byId.get(id)).filter(Boolean).sort((a, b) => order[a.kind] - order[b.kind] || Number(a.id.slice(1)) - Number(b.id.slice(1)));
   const lines = [];
@@ -846,14 +872,22 @@ export function listText(c, ids) {
   return lines.join('\n');
 }
 
-/** The ids shown to the model for these entries, within MAX_LIST. */
+/** The ids shown to the model for these entries, within MAX_LIST (each
+ * candidate's line measured once, with all its edges: a bound). */
 export function shownFor(c, entryList) {
   const ids = new Set();
+  const size = new Map();
+  const cost = (id) => {
+    if (!size.has(id)) size.set(id, listText(c, new Set([id, ...(c.edges.get(id)?.keys() || [])])).split('\n').find((l) => l.startsWith(id + ' '))?.length + 1 || 0);
+    return size.get(id);
+  };
+  let total = 0;
   for (const e of entryList) {
-    const sub = subgraph(c, e);
-    const next = new Set([...ids, ...sub]);
-    if (ids.size && listText(c, next).length > MAX_LIST) break;
-    for (const id of sub) ids.add(id);
+    const add = [...subgraph(c, e)].filter((id) => !ids.has(id));
+    const more = add.reduce((n, id) => n + cost(id), 0);
+    if (ids.size && total + more > MAX_LIST) break;
+    for (const id of add) ids.add(id);
+    total += more;
   }
   return ids;
 }
