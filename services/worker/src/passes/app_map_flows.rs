@@ -57,10 +57,12 @@ One line per candidate; the first word is its id. Each cites file:line.
 - `A..` async callback: a webhook endpoint an outside service calls, an event and its listener, or webhooks the app sends out.
 
 ## Task
-1. Name the user journeys this app has. Always look for: sign in, sign up (or the app's replacement for it), password reset, booking, checkout or purchase. Add any other end-to-end journey that is clearly present, such as cancel a booking or update a payment method. Write 3 to 12 journeys, and cover every entry the user message asks for when the candidates support it.
-2. For each journey, pick and order steps the way a person lives them: the screen, the request it makes, the outside service behind it, any callback, then the next screen. Start at a screen. Use 3 to 15 steps.
-3. Every step cites one candidate id in `ref`, from the list only. Prefer candidates connected to the steps before them through next, requests, outside or async; a step with no such connection must be the obvious next screen.
-4. `note` is one short sentence in plain words (under 15 words): what the person or the system does at that step. No arrows or symbols in place of words.
+1. Write the user journeys this app has: at least one for every family of entries the user message lists (sign in, sign up, password reset, booking, checkout and the like). The same family in two apps (a website and a mobile app) is two journeys. Add any other end-to-end journey that is clearly present, such as cancel a booking or update a payment method. Write up to 16 journeys.
+2. For each journey, pick and order steps the way a person lives them: the screen, each request it makes for this journey, the outside service behind each request, any callback that follows, then the next screen or the next step of the same form, and so on to where the journey ends. Start at a screen. Use 3 to 15 steps; prefer a complete journey to a short one.
+3. After each request, add the outside service its `outside[...]` names (the same service may appear again after a later request), and after a sign-in or sign-up, the request that loads the person's details and the screen they land on, when listed.
+4. Order requests by when the code makes them: `requests[...]` lists a screen's requests roughly in the order its code makes them. A payment or sign-up often ends with a callback (an `A..` webhook or event) after the outside service; put it after that service.
+5. Every step cites one candidate id in `ref`, from the list only. Prefer candidates connected to the steps before them through next, requests, outside or async; a step with no such connection must be the obvious next screen.
+6. `note` is one short sentence in plain words (under 15 words): what the person or the system does at that step. No arrows or symbols in place of words.
 
 ## Output
 Only JSON, no prose:
@@ -76,7 +78,8 @@ pub fn user_prompt(todo: &Value) -> String {
         .filter_map(|e| {
             let id = e["id"].as_str()?;
             let label = todo["table"][id]["label"].as_str().unwrap_or("");
-            Some(format!("- {id} {label}"))
+            let family = e["family"].as_str().unwrap_or("other");
+            Some(format!("- {family}: {id} {label}"))
         })
         .collect();
     let keep: Vec<String> = todo["keep"]
@@ -87,7 +90,9 @@ pub fn user_prompt(todo: &Value) -> String {
         .collect();
     let mut out = String::new();
     if !entries.is_empty() {
-        out.push_str("## Screens a journey may start at (new or changed since the last map)\n");
+        out.push_str(
+            "## Screens a journey may start at, by family (new or changed since the last map)\n",
+        );
         out.push_str(&entries.join("\n"));
         out.push_str("\n\n");
     }
@@ -560,7 +565,7 @@ mod tests {
     #[test]
     fn the_prompt_lists_the_entries_the_kept_journeys_and_the_candidates() {
         let p = user_prompt(&todo());
-        assert!(p.contains("- S1 web /login"));
+        assert!(p.contains("- other: S1 web /login"));
         assert!(p.contains("- Book a slip"));
         assert!(p.contains("R1 request POST /api/session"));
         assert!(!SYSTEM.contains('\u{2192}'));
