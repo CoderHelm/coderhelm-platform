@@ -84,6 +84,10 @@ pub async fn decide(
     if picture.memories.is_empty() {
         picture.memories = repo_memories(state, team_id, subject, &picture).await;
     }
+    // What the run already reaches: never asked of a person.
+    if picture.connected.is_empty() {
+        picture.connected = super::followups::reaches(state, team_id).await;
+    }
     let picture = picture.with_ids();
     let judged = judge::judge(&model, picture.clone()).await;
     if let Ok(u) = model.usage.lock() {

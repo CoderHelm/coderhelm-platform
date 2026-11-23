@@ -739,9 +739,11 @@ Then the ```fix_location.json block described above."#,
     ));
     // Instructions written for a person's machine, and the steps the plan
     // writes for after the pull request: one rule for every step.
+    // The team's ticket tracker is among them: a step on Jira (filing the
+    // follow-up tickets an audit drafts) is CoderHelm's, never "connect Jira".
     full_system.push_str(&common::host_steps::section(
         &PLANNER_READERS,
-        &super::skill_run::standard_caps(),
+        &super::followups::planner_caps(state, msg, github).await,
     ));
     // How it releases: each environment's deploy trigger, the migration
     // workflow, each environment's dataset, expand and contract.
