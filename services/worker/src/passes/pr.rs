@@ -931,8 +931,79 @@ async fn notify_alert_pr(
     title: &str,
     url: &str,
 ) {
+    let Some(target) = alert_target(state, msg).await else {
+        return;
+    };
+    let card = common::alert_notify::fix_message(
+        &target.title,
+        &format!("{}/{}", msg.repo_owner, msg.repo_name),
+        number,
+        title,
+        url,
+        &target.alert_url,
+    );
+    target.deliver(state, msg, &card, "alert_pr").await;
+}
+
+/// For a run started by an alert that found no code change is needed: a
+/// follow-up card on the alert's channels with the reason in one paragraph
+/// and what the run decided about an open pull request it was continuing.
+/// Best effort, like [`notify_alert_pr`].
+pub(crate) async fn notify_alert_no_change(
+    state: &WorkerState,
+    msg: &TicketMessage,
+    run_id: &str,
+    reason: &str,
+    pr_line: &str,
+) {
+    let Some(target) = alert_target(state, msg).await else {
+        return;
+    };
+    let base = super::skills::app_url(&state.config.stage);
+    let card = common::alert_notify::no_change_message(
+        &target.title,
+        &format!("{}/{}", msg.repo_owner, msg.repo_name),
+        reason,
+        pr_line,
+        &format!("{base}/runs/detail?id={run_id}"),
+        &target.alert_url,
+    );
+    target.deliver(state, msg, &card, "alert_no_change").await;
+}
+
+/// Where an alert's follow-ups go: its channels, its title and its page.
+struct AlertTarget {
+    channels: common::notify::Channels,
+    title: String,
+    alert_url: String,
+}
+
+impl AlertTarget {
+    async fn deliver(
+        &self,
+        state: &WorkerState,
+        msg: &TicketMessage,
+        card: &common::notify::Message,
+        kind: &str,
+    ) {
+        common::notify::deliver_recorded(
+            &common::notify::Http(&state.http),
+            &self.channels,
+            card,
+            kind,
+            &state.dynamo,
+            &state.config.settings_table_name,
+            &msg.team_id,
+        )
+        .await;
+    }
+}
+
+/// The alert behind this run's ticket (`ALERT_TICKET#`) and the channels it
+/// notifies; `None` when it has none.
+async fn alert_target(state: &WorkerState, msg: &TicketMessage) -> Option<AlertTarget> {
     let table = &state.config.settings_table_name;
-    let Some(ticket) = state
+    let ticket = state
         .dynamo
         .get_item()
         .table_name(table)
@@ -944,10 +1015,7 @@ async fn notify_alert_pr(
         .send()
         .await
         .ok()
-        .and_then(|o| o.item().cloned())
-    else {
-        return;
-    };
+        .and_then(|o| o.item().cloned())?;
     let s = |k: &str| {
         ticket
             .get(k)
@@ -968,7 +1036,7 @@ async fn notify_alert_pr(
     )
     .await;
     if channels.is_empty() {
-        return;
+        return None;
     }
     let base = super::skills::app_url(&state.config.stage);
     let alert_id = s("alert_id");
@@ -977,27 +1045,14 @@ async fn notify_alert_pr(
     } else {
         format!("{base}/alerts/detail?id={alert_id}")
     };
-    let alert_title = Some(s("title"))
+    let title = Some(s("title"))
         .filter(|t| !t.is_empty())
         .unwrap_or_else(|| msg.title.clone());
-    let card = common::alert_notify::fix_message(
-        &alert_title,
-        &format!("{}/{}", msg.repo_owner, msg.repo_name),
-        number,
+    Some(AlertTarget {
+        channels,
         title,
-        url,
-        &alert_url,
-    );
-    common::notify::deliver_recorded(
-        &common::notify::Http(&state.http),
-        &channels,
-        &card,
-        "alert_pr",
-        &state.dynamo,
-        &state.config.settings_table_name,
-        &msg.team_id,
-    )
-    .await;
+        alert_url,
+    })
 }
 
 /// The base a reused pull request (an open one of this branch, or a

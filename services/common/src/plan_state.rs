@@ -682,6 +682,13 @@ pub fn task_view(task: &TaskFacts, runs: &[RunFacts], waits_on: Option<&str>) ->
             v.needs = Some(needs("review", ask, error, url, "open_pr"));
         }
         // Finished its work: the pull request decides.
+        // The plan found the code already does it: nothing to build, and
+        // not a failure. The run page carries the reason.
+        crate::run_status::NO_CHANGE => set(
+            &mut v,
+            TaskState::Dropped,
+            "No change needed: the code already does what the task asks".into(),
+        ),
         "completed" | "success" => match (&open, r.closed_pr()) {
             (Some(pr), _) => match r.standing.as_ref().filter(|s| s.needs_person) {
                 Some(s) => {

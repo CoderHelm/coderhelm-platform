@@ -79,6 +79,7 @@ pub const RUN_STATUSES: &[&str] = &[
     "needs_input",
     "needs_outside_change",
     "covered_by_pr",
+    "no_change",
     "completed",
     "merged",
     "failed",

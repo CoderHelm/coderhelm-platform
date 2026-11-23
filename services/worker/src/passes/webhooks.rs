@@ -81,7 +81,7 @@ pub fn run_data(item: &HashMap<String, AttributeValue>, status: &str, app: &str)
 /// The `run.*` event a status write means, if any.
 pub fn run_event_for(status: &str) -> Option<&'static str> {
     match status {
-        "completed" | "success" => Some("run.completed"),
+        "completed" | "success" | "no_change" => Some("run.completed"),
         "failed" => Some("run.failed"),
         "needs_input" => Some("run.needs_input"),
         "running" => Some("run.created"),

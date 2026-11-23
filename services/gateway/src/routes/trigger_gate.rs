@@ -590,7 +590,8 @@ const SEEN_HASH_FIELD: &str = "seen_context_hash";
 /// The latest run left the ticket handled: only a change to the ticket's
 /// content starts another run. "covered_by_pr": a pull request (open, or
 /// already merged) already does the work; a ticket edit asking for a
-/// separate change starts one.
+/// separate change starts one. "no_change": the code already does what the
+/// ticket asks; a ticket edit asking for something more starts one.
 /// "needs_outside_change": the fix is a change in
 /// another system. "needs_input": CoderHelm asked; people answer by comment
 /// or by editing the ticket. "cancelled": a person stopped it, or closed its
@@ -605,6 +606,7 @@ fn handled(status: &str) -> bool {
             | "merged"
             | "needs_outside_change"
             | "covered_by_pr"
+            | "no_change"
             | "needs_input"
             | "cancelled"
             | "closed"
@@ -1132,6 +1134,7 @@ mod tests {
         assert!(handled("cancelled"));
         assert!(handled("needs_outside_change"));
         assert!(handled("covered_by_pr"));
+        assert!(handled("no_change"));
         assert!(handled("needs_input"));
         assert!(handled("completed"));
         assert!(!handled("failed"));
