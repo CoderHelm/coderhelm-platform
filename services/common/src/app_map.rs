@@ -39,6 +39,13 @@ pub const FLOORPLAN_VERSION: &str = include_str!("../../../vendor/floorplan/VERS
 /// Floorplan's job file: the model jobs, their instructions and schemas.
 pub const WORKFLOW_JSON: &str =
     include_str!("../../../vendor/floorplan/skills/floorplan/workflow.json");
+/// The version of what extracts the map: a hash of the sandbox's driver,
+/// CoderHelm's detectors and the vendored Floorplan's release (`build.rs`).
+/// Each map carries the version that made it (the job, the status and
+/// `graph.coderhelm.extractor`); a map made by another version is built
+/// again in full, once ([`queue_for_extractor`]), so a release that finds
+/// more shows it without anyone pressing "Build the map again".
+pub const EXTRACTOR_VERSION: &str = env!("CODERHELM_APP_MAP_EXTRACTOR");
 /// The map format this adapter reads.
 pub const GRAPH_SCHEMA: &str = "floorplan/graph@1";
 /// Largest map served to the page (bytes of JSON).
@@ -161,6 +168,15 @@ pub struct Status {
     /// so the page can say which.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cut: Vec<String>,
+    /// The extractor ([`EXTRACTOR_VERSION`]) the map there now was made by
+    /// (empty: a map from before maps carried it).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub extractor: String,
+    /// The extractor a build was last asked for because the map was made by
+    /// another one, so each release asks once: a build for it that fails is
+    /// not asked for again on every visit.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub asked_extractor: String,
 }
 
 impl Status {
@@ -199,7 +215,40 @@ pub fn queue_next(cur: Option<&Status>, now: i64, build: &str) -> Option<Status>
         built_repos: prev.built_repos,
         // The map that is there now still left these out.
         cut: prev.cut,
+        extractor: prev.extractor,
+        asked_extractor: prev.asked_extractor,
     })
+}
+
+/// Whether the map there now was made by another extractor than `running`
+/// and no build has been asked for `running` yet.
+pub fn made_by_another_extractor(cur: Option<&Status>, has_map: bool, running: &str) -> bool {
+    has_map && cur.is_none_or(|s| s.extractor != running && s.asked_extractor != running)
+}
+
+/// A new build because the map there now was made by another extractor
+/// than `running`, marked as asked for it: `None` when the map is the
+/// running extractor's, a build was already asked for it, or a build is
+/// queued or running (which builds with the running extractor anyway).
+pub fn queue_for_extractor(
+    cur: Option<&Status>,
+    now: i64,
+    build: &str,
+    running: &str,
+) -> Option<Status> {
+    if !made_by_another_extractor(cur, true, running) {
+        return None;
+    }
+    let mut s = queue_next(cur, now, build)?;
+    s.asked_extractor = running.to_string();
+    Some(s)
+}
+
+/// Whether the running build was asked for because the map was made by
+/// another extractor (the page says it is being rebuilt with the release's
+/// improvements).
+pub fn rebuilding_for_release(s: &Status, now: i64) -> bool {
+    s.is_running(now) && s.asked_extractor == EXTRACTOR_VERSION && s.extractor != EXTRACTOR_VERSION
 }
 
 /// The worker taking turn `turn` of build `build` (one message of it):
@@ -348,51 +397,84 @@ pub async fn update_status(
     team_id: &str,
     change: impl Fn(Option<&Status>) -> Option<Status>,
 ) -> Result<Updated, String> {
+    update_versioned(
+        || read_status(dynamo, table, team_id),
+        |next: Status, version: Option<i64>| put_status(dynamo, table, team_id, next, version),
+        change,
+    )
+    .await
+}
+
+/// [`update_status`]'s loop over any versioned store: `read` gives the
+/// status and its version, `put` writes the next one conditioned on that
+/// version (`Ok(false)` when another write came first).
+async fn update_versioned<R, RF, P, PF>(
+    read: R,
+    put: P,
+    change: impl Fn(Option<&Status>) -> Option<Status>,
+) -> Result<Updated, String>
+where
+    R: Fn() -> RF,
+    RF: std::future::Future<Output = Result<(Option<Status>, Option<i64>), String>>,
+    P: Fn(Status, Option<i64>) -> PF,
+    PF: std::future::Future<Output = Result<bool, String>>,
+{
     for _ in 0..5 {
-        let (cur, version) = read_status(dynamo, table, team_id).await?;
+        let (cur, version) = read().await?;
         let Some(next) = change(cur.as_ref()) else {
             return Ok(Updated::Kept(cur));
         };
-        let v = version.unwrap_or(0);
-        let mut put = dynamo
-            .put_item()
-            .table_name(table)
-            .item("pk", A::S(map_pk(team_id)))
-            .item("sk", A::S(STATUS_SK.into()))
-            .item(
-                "json",
-                A::S(serde_json::to_string(&next).unwrap_or_default()),
-            )
-            .item("state", A::S(next.state.clone()))
-            .item("at", A::N(next.at.to_string()))
-            .item("v", A::N((v + 1).to_string()));
-        put = match version {
-            None => put.condition_expression("attribute_not_exists(pk)"),
-            Some(0) => put
-                .condition_expression("attribute_not_exists(#v)")
-                .expression_attribute_names("#v", "v"),
-            Some(v) => put
-                .condition_expression("#v = :v")
-                .expression_attribute_names("#v", "v")
-                .expression_attribute_values(":v", A::N(v.to_string())),
-        };
-        match put.send().await {
-            Ok(_) => return Ok(Updated::Written(next)),
-            Err(e)
-                if e.as_service_error()
-                    .is_some_and(|se| se.is_conditional_check_failed_exception()) =>
-            {
-                continue
-            }
-            Err(e) => {
-                return Err(format!(
-                    "{}",
-                    aws_sdk_dynamodb::error::DisplayErrorContext(e)
-                ))
-            }
+        if put(next.clone(), version).await? {
+            return Ok(Updated::Written(next));
         }
     }
     Err("the map's build status kept changing; try again".into())
+}
+
+/// Writes `next` if the status is still at `version` (`Ok(false)` if not).
+async fn put_status(
+    dynamo: &Dynamo,
+    table: &str,
+    team_id: &str,
+    next: Status,
+    version: Option<i64>,
+) -> Result<bool, String> {
+    let v = version.unwrap_or(0);
+    let mut put = dynamo
+        .put_item()
+        .table_name(table)
+        .item("pk", A::S(map_pk(team_id)))
+        .item("sk", A::S(STATUS_SK.into()))
+        .item(
+            "json",
+            A::S(serde_json::to_string(&next).unwrap_or_default()),
+        )
+        .item("state", A::S(next.state.clone()))
+        .item("at", A::N(next.at.to_string()))
+        .item("v", A::N((v + 1).to_string()));
+    put = match version {
+        None => put.condition_expression("attribute_not_exists(pk)"),
+        Some(0) => put
+            .condition_expression("attribute_not_exists(#v)")
+            .expression_attribute_names("#v", "v"),
+        Some(v) => put
+            .condition_expression("#v = :v")
+            .expression_attribute_names("#v", "v")
+            .expression_attribute_values(":v", A::N(v.to_string())),
+    };
+    match put.send().await {
+        Ok(_) => Ok(true),
+        Err(e)
+            if e.as_service_error()
+                .is_some_and(|se| se.is_conditional_check_failed_exception()) =>
+        {
+            Ok(false)
+        }
+        Err(e) => Err(format!(
+            "{}",
+            aws_sdk_dynamodb::error::DisplayErrorContext(e)
+        )),
+    }
 }
 
 /// Asks for a build: `Ok(Ok(new))` when it is queued (send its message),
@@ -408,6 +490,28 @@ pub async fn queue_build(
     match update_status(dynamo, table, team_id, |cur| queue_next(cur, now, &build)).await? {
         Updated::Written(s) => Ok(Ok(s)),
         Updated::Kept(cur) => Ok(Err(cur)),
+    }
+}
+
+/// Asks for a build because the team's map was made by another extractor
+/// than this release's ([`queue_for_extractor`]): `Ok(Some(new))` when it is
+/// queued (send its message), `Ok(None)` when no build is needed or one is
+/// already asked for, queued or running. The same conditional write as
+/// [`queue_build`], so two readers at once queue one build.
+pub async fn queue_release_build(
+    dynamo: &Dynamo,
+    table: &str,
+    team_id: &str,
+) -> Result<Option<Status>, String> {
+    let now = chrono::Utc::now().timestamp();
+    let build = format!("{:032x}", rand::random::<u128>());
+    match update_status(dynamo, table, team_id, |cur| {
+        queue_for_extractor(cur, now, &build, EXTRACTOR_VERSION)
+    })
+    .await?
+    {
+        Updated::Written(s) => Ok(Some(s)),
+        Updated::Kept(_) => Ok(None),
     }
 }
 
@@ -544,7 +648,11 @@ pub fn stamp_repos(graph: &mut Value, folders: &BTreeMap<String, String>) {
         .iter()
         .map(|(repo, folder)| (folder.clone(), json!(repo)))
         .collect();
-    graph["coderhelm"] = json!({ "repos": m, "floorplan": FLOORPLAN_VERSION.trim() });
+    graph["coderhelm"] = json!({
+        "repos": m,
+        "floorplan": FLOORPLAN_VERSION.trim(),
+        "extractor": EXTRACTOR_VERSION,
+    });
 }
 
 /// Records on the map the repositories its snapshot left out, whole or in
@@ -1730,6 +1838,126 @@ mod tests {
         );
         let f = failed(Some(&again), "b5", "GitHub didn't answer", now + 401).unwrap();
         assert!(queue_next(Some(&f), now + 402, "b6").is_some());
+    }
+
+    #[test]
+    fn a_map_from_another_extractor_queues_one_build() {
+        let now = 10_000;
+        let old = Status {
+            state: "ready".into(),
+            at: now,
+            built: now - 86_400,
+            built_repos: 3,
+            extractor: "older".into(),
+            ..Default::default()
+        };
+        // Made by another extractor: one build, marked as asked for this one.
+        let q = queue_for_extractor(Some(&old), now, "b1", "new").unwrap();
+        assert_eq!(
+            (q.state.as_str(), q.asked_extractor.as_str()),
+            ("queued", "new")
+        );
+        assert_eq!((q.extractor.as_str(), q.built_repos), ("older", 3));
+        // Asked again while it is queued, while it runs, and after it failed:
+        // nothing more is queued.
+        assert!(queue_for_extractor(Some(&q), now + 1, "b2", "new").is_none());
+        let running = take_turn(Some(&q), "b1", 0, now + 2).unwrap();
+        assert!(queue_for_extractor(Some(&running), now + 3, "b3", "new").is_none());
+        let f = failed(Some(&running), "b1", "GitHub didn't answer", now + 4).unwrap();
+        assert!(queue_for_extractor(Some(&f), now + 5, "b4", "new").is_none());
+        // A map from before maps carried the version counts as another's.
+        let unstamped = Status {
+            extractor: String::new(),
+            ..old.clone()
+        };
+        assert!(queue_for_extractor(Some(&unstamped), now, "b5", "new").is_some());
+        // The next release asks once more.
+        assert!(queue_for_extractor(Some(&f), now + 5, "b6", "newer").is_some());
+    }
+
+    #[test]
+    fn a_map_from_this_extractor_queues_none() {
+        let now = 10_000;
+        let same = Status {
+            state: "ready".into(),
+            at: now,
+            extractor: "new".into(),
+            ..Default::default()
+        };
+        assert!(queue_for_extractor(Some(&same), now, "b1", "new").is_none());
+        assert!(!made_by_another_extractor(Some(&same), true, "new"));
+        // No map at all: the first build is the first visit's, not this.
+        assert!(!made_by_another_extractor(None, false, "new"));
+        // A push's build already running builds with this extractor.
+        let pushed = queue_next(
+            Some(&Status {
+                extractor: "older".into(),
+                ..same.clone()
+            }),
+            now,
+            "p1",
+        )
+        .unwrap();
+        assert!(queue_for_extractor(Some(&pushed), now + 1, "b2", "new").is_none());
+    }
+
+    #[tokio::test]
+    async fn two_readers_at_once_queue_one_build() {
+        use std::sync::{Arc, Mutex};
+        let old = Status {
+            state: "ready".into(),
+            at: 10_000,
+            extractor: "older".into(),
+            ..Default::default()
+        };
+        // The status table: the status and its version.
+        let store = Arc::new(Mutex::new((Some(old), 1_i64)));
+        // Both readers read the old status before either writes.
+        let both_read = Arc::new(tokio::sync::Barrier::new(2));
+        let ask = |build: &'static str| {
+            let store = store.clone();
+            let both_read = both_read.clone();
+            let first = Arc::new(Mutex::new(true));
+            async move {
+                update_versioned(
+                    || {
+                        let (store, both_read, first) =
+                            (store.clone(), both_read.clone(), first.clone());
+                        async move {
+                            let seen = store.lock().unwrap().clone();
+                            let wait = std::mem::replace(&mut *first.lock().unwrap(), false);
+                            if wait {
+                                both_read.wait().await;
+                            }
+                            Ok((seen.0, Some(seen.1)))
+                        }
+                    },
+                    |next: Status, version: Option<i64>| {
+                        let store = store.clone();
+                        async move {
+                            let mut s = store.lock().unwrap();
+                            if Some(s.1) != version {
+                                return Ok(false);
+                            }
+                            *s = (Some(next), s.1 + 1);
+                            Ok(true)
+                        }
+                    },
+                    |cur| queue_for_extractor(cur, 10_100, build, "new"),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let (a, b) = tokio::join!(ask("b1"), ask("b2"));
+        let written = [&a, &b]
+            .iter()
+            .filter(|u| matches!(u, Updated::Written(_)))
+            .count();
+        assert_eq!(written, 1, "{a:?} {b:?}");
+        let (st, v) = store.lock().unwrap().clone();
+        assert_eq!(v, 2);
+        assert_eq!(st.unwrap().asked_extractor, "new");
     }
 
     #[test]

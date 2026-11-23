@@ -15,8 +15,12 @@
 //!   light model;
 //! - updates are Floorplan's own refresh: it compares each file's
 //!   fingerprints with the last map, carries descriptions over, and lists
-//!   only what is new or changed to describe. A map is redone only when a
-//!   repository's default branch moved.
+//!   only what is new or changed to describe. A map is redone when a
+//!   repository's default branch moved, or when it was made by another
+//!   extractor than this release's (`am::EXTRACTOR_VERSION`): then the
+//!   snapshot is scanned again in full (the driver's `scan` mode), so new
+//!   detectors run on every file, while the architecture and the
+//!   descriptions that still fit are kept.
 //!
 //! One step per message (`AppMapMessage.step`): `start` reads the heads and
 //! runs the scan or the refresh; `build` writes the model jobs' answers and
@@ -83,6 +87,41 @@ pub struct Job {
     /// next step continues them (`describe_key`) before building.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending: Vec<String>,
+    /// The extractor (`am::EXTRACTOR_VERSION`) the last finished map was
+    /// made by (empty: a map from before maps carried it).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub extractor: String,
+}
+
+/// Whether the map there now is current: made from these heads by this
+/// extractor. Pure.
+pub fn up_to_date(have_map: bool, heads: &BTreeMap<String, String>, job: &Job) -> bool {
+    have_map && *heads == job.built && job.extractor == am::EXTRACTOR_VERSION
+}
+
+/// The driver's mode for a build's first step: Floorplan's refresh for a
+/// map this extractor made, a full scan when another one made it (a refresh
+/// would carry the old scan's results over), the first map's start
+/// otherwise. Pure.
+pub fn start_mode(have_state: bool, job: &Job) -> &'static str {
+    match (have_state, job.extractor == am::EXTRACTOR_VERSION) {
+        (false, _) => "start",
+        (true, true) => "refresh",
+        (true, false) => "scan",
+    }
+}
+
+/// The status after a build that left a map made by this extractor.
+fn finished_current(
+    cur: Option<&am::Status>,
+    build: &str,
+    repos: u32,
+    now: i64,
+) -> Option<am::Status> {
+    am::finished(cur, build, repos, "", now).map(|mut s| {
+        s.extractor = am::EXTRACTOR_VERSION.to_string();
+        s
+    })
 }
 
 /// What to do after a sandbox step, from what Floorplan said.
@@ -852,18 +891,28 @@ async fn step(
             }
         }
         let have_map = s3_get(state, &am::graph_key(team_id)).await.is_some();
-        if have_map && heads == job.built {
+        if up_to_date(have_map, &heads, &job) {
             info!(team_id, "App map: no default branch moved, nothing to redo");
             return change(state, team_id, |cur, now| {
-                am::finished(cur, build, 0, "", now)
+                finished_current(cur, build, 0, now)
             })
             .await;
         }
+        if job.extractor != am::EXTRACTOR_VERSION {
+            info!(
+                team_id,
+                was = %job.extractor,
+                now = am::EXTRACTOR_VERSION,
+                "App map: made by another extractor, scanned again in full"
+            );
+        }
         let built = std::mem::take(&mut job.built);
+        let extractor = std::mem::take(&mut job.extractor);
         job = Job {
             heads,
             branches,
             built,
+            extractor,
             ..Default::default()
         };
     }
@@ -969,11 +1018,10 @@ async fn step(
         .await;
     }
     let mode = if msg.step.is_empty() {
-        if prev.iter().any(|(p, _)| p == "root/floorplan/graph.json") {
-            "refresh"
-        } else {
-            "start"
-        }
+        start_mode(
+            prev.iter().any(|(p, _)| p == "root/floorplan/graph.json"),
+            &job,
+        )
     } else {
         "build"
     };
@@ -1166,6 +1214,7 @@ async fn step(
             // with, so a page view never reads the whole map.
             am::store_derived(&state.s3, &state.config.bucket_name, team_id, &g).await?;
             job.built = job.heads.clone();
+            job.extractor = am::EXTRACTOR_VERSION.to_string();
             job.arch_attempts = 0;
             job.desc_attempts = 0;
             s3_put(
@@ -1176,7 +1225,7 @@ async fn step(
             .await?;
             let n = job.heads.len() as u32;
             change(state, team_id, |cur, now| {
-                am::finished(cur, build, n, "", now)
+                finished_current(cur, build, n, now)
             })
             .await?;
             if result["coderhelm"]["ok"] == json!(false) {
@@ -1504,6 +1553,47 @@ mod tests {
         );
         let same = json!({"architecture": {}, "refresh": {"next": [{"code": "recent_work"}]}, "build": {"ok": true, "files": {"unassignedPercent": 0.0}, "descriptions": {"complete": true}}});
         assert_eq!(decide(&same, &job), Next::Done);
+    }
+
+    #[test]
+    fn a_map_from_another_extractor_is_scanned_again_in_full() {
+        let heads: BTreeMap<String, String> = [("acme/web".to_string(), "abc".to_string())].into();
+        let current = Job {
+            heads: heads.clone(),
+            built: heads.clone(),
+            extractor: am::EXTRACTOR_VERSION.into(),
+            ..Default::default()
+        };
+        // Same heads, same extractor: nothing to redo; a refresh after a push.
+        assert!(up_to_date(true, &heads, &current));
+        assert_eq!(start_mode(true, &current), "refresh");
+        // Same heads, another extractor (or a map from before the version
+        // was kept): built again, from a full scan.
+        for was in ["0123456789abcdef", ""] {
+            let older = Job {
+                extractor: was.into(),
+                ..current.clone()
+            };
+            assert!(!up_to_date(true, &heads, &older));
+            assert_eq!(start_mode(true, &older), "scan");
+        }
+        // No map yet: the first map's start.
+        assert!(!up_to_date(false, &heads, &current));
+        assert_eq!(start_mode(false, &Job::default()), "start");
+        // The version is kept with the job, and a job from before reads.
+        let back: Job = serde_json::from_str(&serde_json::to_string(&current).unwrap()).unwrap();
+        assert_eq!(back.extractor, am::EXTRACTOR_VERSION);
+        let before: Job = serde_json::from_str(r#"{"heads": {}}"#).unwrap();
+        assert!(before.extractor.is_empty());
+        // The status after the build names the extractor.
+        let q = am::queue_next(None, 1, "b1").unwrap();
+        let running = am::take_turn(Some(&q), "b1", 0, 2).unwrap();
+        assert_eq!(
+            finished_current(Some(&running), "b1", 1, 3)
+                .unwrap()
+                .extractor,
+            am::EXTRACTOR_VERSION
+        );
     }
 
     #[test]

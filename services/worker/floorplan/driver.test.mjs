@@ -4,7 +4,8 @@
 //   model jobs would send, builds clean;
 // - the screen leads to the endpoint in the other repository and the outside
 //   service behind it (Floorplan's own request matching and screens);
-// - a refresh with nothing changed carries every description over;
+// - a refresh with nothing changed carries every description over, and a
+//   full scan of a map made by another extractor keeps them too;
 // - CoderHelm's detectors (coderhelm/) add mobile screens, outside services,
 //   calls, infra, webhooks and data links, each with its evidence;
 // - journeys kept from the last map are re-checked and drawn, and a large
@@ -100,6 +101,24 @@ test('a refresh with nothing changed carries every description over', () => {
   assert.equal(result.refresh.ok, true, JSON.stringify(result.refresh.errors));
   assert.equal(result.build.descriptions.complete, true);
   assert.equal(graph.routes[0].name, 'Book a slip');
+});
+
+test("a map made by another extractor is scanned again in full, keeping the parts and descriptions", () => {
+  const first = workdir(harborAnswers(), 'start');
+  drive(first);
+  // The worker's `scan` mode, from the state the last map handed back: a
+  // whole new scan (not Floorplan's refresh), and nothing for the model.
+  const again = workdir({}, 'scan');
+  fs.writeFileSync(path.join(again, 'state.tgz'), Buffer.from(fs.readFileSync(path.join(first, 'out', 'state.b64'), 'utf8'), 'base64'));
+  assert.equal(spawnSync('tar', ['xzf', 'state.tgz', '-C', 'root'], { cwd: again }).status, 0);
+  const { result, graph } = drive(again);
+  assert.equal(result.refresh, undefined);
+  assert.equal(result.scan.ok, true, JSON.stringify(result.scan.errors));
+  assert.equal(result.build.ok, true, JSON.stringify(result.build.errors));
+  assert.equal(result.build.descriptions.complete, true);
+  assert.equal(result.coderhelm.ok, true, result.coderhelm.error);
+  assert.equal(graph.routes[0].name, 'Book a slip');
+  assert.ok(graph.screens.some((s) => s.app === 'mobile'));
 });
 
 test("answers can only become the map's own files", () => {
