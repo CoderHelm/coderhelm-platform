@@ -443,8 +443,20 @@ pub async fn list(
         .collect())
 }
 
+/// When a check ran, in milliseconds since the epoch (`None` when its
+/// time can't be read).
+pub fn checked_ms(c: &super::permissions::PermissionCheck) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(&c.checked_at)
+        .ok()
+        .map(|t| t.timestamp_millis())
+}
+
 /// Saves a permissions check on the account, only while it is still
-/// connected.
+/// connected and only when no newer check is saved: the daily sweep and a
+/// page's live check can run at the same time, and every reader of the
+/// account (the AWS page, Infrastructure vulnerabilities' warning) shows
+/// the saved check, so the newest one is kept. A check that lost either
+/// way is not an error.
 pub async fn save_permissions(
     dynamo: &aws_sdk_dynamodb::Client,
     table: &str,
@@ -452,18 +464,33 @@ pub async fn save_permissions(
     c: &super::permissions::PermissionCheck,
 ) -> Result<(), String> {
     let j = serde_json::to_string(c).map_err(|e| e.to_string())?;
-    dynamo
+    let req = dynamo
         .update_item()
         .table_name(table)
         .key("pk", av_s(team_id))
         .key("sk", av_s(&format!("{PREFIX}{}", c.account)))
-        .condition_expression("attribute_exists(pk)")
-        .update_expression("SET permissions_check = :j")
-        .expression_attribute_values(":j", av_s(&j))
-        .send()
-        .await
-        .map(|_| ())
-        .map_err(|e| format!("save aws permissions: {e}"))
+        .expression_attribute_values(":j", av_s(&j));
+    let req = match checked_ms(c) {
+        Some(ms) => req
+            .condition_expression(
+                "attribute_exists(pk) AND (attribute_not_exists(permissions_checked_ms) OR permissions_checked_ms <= :ms)",
+            )
+            .update_expression("SET permissions_check = :j, permissions_checked_ms = :ms")
+            .expression_attribute_values(":ms", AttributeValue::N(ms.to_string())),
+        None => req
+            .condition_expression("attribute_exists(pk)")
+            .update_expression("SET permissions_check = :j"),
+    };
+    match req.send().await {
+        Ok(_) => Ok(()),
+        Err(e)
+            if e.as_service_error()
+                .is_some_and(|se| se.is_conditional_check_failed_exception()) =>
+        {
+            Ok(())
+        }
+        Err(e) => Err(format!("save aws permissions: {e}")),
+    }
 }
 
 /// Pure: the WAF log group's settings after a WAF alarm run in the
@@ -557,6 +584,20 @@ pub async fn save_abilities(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_check_is_ordered_by_when_it_ran() {
+        let at = |t: &str| super::super::permissions::PermissionCheck::new(&account().target(), t);
+        let older = checked_ms(&at("2026-11-23T09:00:00+00:00")).unwrap();
+        let newer = checked_ms(&at("2026-11-23T09:00:00.250+00:00")).unwrap();
+        assert!(older < newer);
+        assert_eq!(
+            checked_ms(&at("2026-11-23T10:00:00+01:00")),
+            Some(older),
+            "the same moment in another zone"
+        );
+        assert_eq!(checked_ms(&at("")), None);
+    }
 
     fn account() -> AwsAccount {
         AwsAccount {
