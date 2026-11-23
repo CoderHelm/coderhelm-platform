@@ -30,6 +30,8 @@ export const SCHEMA = 'coderhelm/flows@1';
 export const MAX_STEPS = 15;
 /** The candidate list the model reads, at most (characters). */
 export const MAX_LIST = 90_000;
+/** The candidate list of one journey family in one app, at most. */
+export const MAX_GROUP_LIST = 40_000;
 
 /** Words that make a screen the start of a journey. */
 export const WORDS = {
@@ -359,6 +361,105 @@ export function routeHops(text) {
   return out.filter((x) => lines[x.line - 1]?.includes(x.raw));
 }
 
+// ── Calls the map has no link for ─────────────────────────────────────────
+
+const HTTP_FN = String.raw`(?:fetch|axios(?:\.\w+)?|\w*[Hh]ttp(?:Client)?\.\w+|\w*[Cc]lient\.(?:get|post|put|patch|delete)|\w*(?:[Gg]et|[Pp]ost|[Pp]ut|[Pp]atch|[Dd]elete|[Rr]equest)|\$fetch)`;
+const METHOD_NEAR = /\b(?:method:\s*['"](\w+)['"]|\.(get|post|put|patch|delete)\s*[<(]|(?:api|http|mapi)?(Get|Post|Put|Patch|Delete)\s*[<(])/i;
+
+/** Calls written in one file: `fetch('/x')`, `apiPost(`${base}/x`)`,
+ * `const URL = '/x'` then `fetch(URL)`, and next-auth's `signIn('p')`.
+ * Each with its path, line, the literal on that line and a method guess. */
+export function clientCalls(text) {
+  const out = [];
+  if (!text) return out;
+  const at = (i) => text.slice(0, i).split('\n').length;
+  const method = (i) => {
+    const w = text.slice(Math.max(0, i - 120), i + 300);
+    const m = METHOD_NEAR.exec(w);
+    return m ? (m[1] || m[2] || m[3]).toUpperCase() : null;
+  };
+  const push = (raw, i, how) => {
+    const p = raw.replace(/\?.*$/, '');
+    if (!/^(\$\{[^}]+\})?\/[A-Za-z]/.test(p) || /^\/(_next|static|images?|fonts?|assets)\//.test(p)) return;
+    out.push({ raw, path: normPath(p), line: at(i), token: raw, how, method: method(i) });
+  };
+  for (const m of text.matchAll(new RegExp(HTTP_FN + String.raw`\s*(?:<[^>()]*>)?\(\s*(['"\`])((?:\$\{[^}]+\})?\/[^'"\`]*)\1`, 'g'))) push(m[2], m.index + m[0].indexOf(m[2]), 'direct');
+  for (const m of text.matchAll(/(?:const|let)\s+(\w+)\s*=\s*(['"`])((?:\$\{[^}]+\})?\/[\w\-./:${}]+)\2/g)) {
+    if (new RegExp(HTTP_FN + String.raw`\s*(?:<[^>()]*>)?\(\s*` + esc(m[1]) + String.raw`\b`).test(text)) push(m[3], m.index + m[0].indexOf(m[3]), 'const');
+  }
+  for (const m of text.matchAll(/\bsignIn(?:<[^>]*>)?\(\s*['"](\w+)['"]/g)) {
+    out.push({ raw: `/api/auth/callback/${m[1]}`, path: `/api/auth/callback/${m[1]}`, line: at(m.index), token: m[0], how: 'next-auth', method: 'POST' });
+  }
+  return out;
+}
+
+/** Objects of paths (`const URLS = { login: '/auth/login', ... }`): name to
+ * entries `{ key: { path, line, token } }`, for maps of two or more. */
+export function urlMaps(text) {
+  const out = new Map();
+  if (!text) return out;
+  const at = (i) => text.slice(0, i).split('\n').length;
+  for (const m of text.matchAll(/(?:export\s+)?const\s+(\w+)\s*(?::[^=]+)?=\s*\{/g)) {
+    let depth = 1;
+    let i = m.index + m[0].length;
+    const start = i;
+    while (i < text.length && depth) { const ch = text[i]; if (ch === '{') depth++; else if (ch === '}') depth--; i++; }
+    const body = text.slice(start, i);
+    const ent = {};
+    for (const e of body.matchAll(/(\w+)\s*:\s*(['"`])(\/[\w\-./:${}]+)\2/g)) ent[e[1]] = { path: normPath(e[3]), line: at(start + e.index), token: e[3] };
+    if (Object.keys(ent).length >= 2) out.set(m[1], ent);
+  }
+  return out;
+}
+
+/** Calls through an API client or SDK rather than a URL: XRPC-style
+ * `client.call(com.example.server.createSession, ...)`, and static SDK
+ * methods on a class imported from a package (`PasswordSession.login(`).
+ * Each with its id (`xrpc:<method>` or `sdk:<Class>.<method>`), line, token
+ * and the package it comes from when known. */
+export function sdkCalls(text) {
+  const out = [];
+  if (!text) return out;
+  const at = (i) => text.slice(0, i).split('\n').length;
+  const pkgOf = new Map();
+  for (const m of text.matchAll(/import\s+(?:type\s+)?\{([^}]*)\}\s+from\s+['"]([^'".][^'"]*)['"]/g)) {
+    for (const n of m[1].split(',')) {
+      const name = n.replace(/^\s*type\s+/, '').split(/\s+as\s+/).pop().trim();
+      if (name) pkgOf.set(name, m[2]);
+    }
+  }
+  for (const m of text.matchAll(/import\s+(\w+)\s+from\s+['"]([^'".][^'"]*)['"]/g)) pkgOf.set(m[1], m[2]);
+  const imported = (name) => pkgOf.get(name) || null;
+  for (const m of text.matchAll(/\.call\(\s*['"]?((?:com|app|chat|tools)\.[a-z]+\.[a-z]+\.[a-zA-Z]+)/g)) {
+    out.push({ id: `xrpc:${m[1]}`, line: at(m.index), token: m[1], pkg: imported(m[1].split('.')[0]) });
+  }
+  for (const m of text.matchAll(/\b([A-Z]\w*(?:Session|Client|Agent|Api|API|Sdk|SDK|Auth))\.([a-z]\w*)\(/g)) {
+    const pkg = imported(m[1]);
+    if (!pkg) continue;
+    out.push({ id: `sdk:${m[1]}.${m[2]}`, line: at(m.index), token: `${m[1]}.${m[2]}`, pkg });
+  }
+  return out;
+}
+
+/** Calls into an integration helper a handler leans on: a manager object
+ * (`eventManager.create(`), or a function that pays, mails, messages or
+ * checks out (`handlePayment(`, `sendEmailVerification(`). Declarations
+ * are not calls. */
+export function helperCalls(text) {
+  const out = [];
+  if (!text) return out;
+  const at = (i) => text.slice(0, i).split('\n').length;
+  const decl = (i) => /(function\s*|import\s*\{[^}]*|export\s*\{[^}]*|\bas\s*)$/.test(text.slice(Math.max(0, i - 60), i));
+  for (const m of text.matchAll(/\b([a-z]\w*Manager)\.(\w+)\(/g)) {
+    out.push({ name: `${m[1].charAt(0).toUpperCase()}${m[1].slice(1)}.${m[2]}`, line: at(m.index), token: `${m[1]}.${m[2]}` });
+  }
+  for (const m of text.matchAll(/\b((?:handle|send|charge|create|process)\w*(?:Payment|Email|Sms|Mail|Notification|Checkout|Subscription|Invoice)\w*)\s*\(/g)) {
+    if (decl(m.index)) continue;
+    out.push({ name: m[1], line: at(m.index), token: m[1] });
+  }
+  return out;
+}
+
 const isRouteHandlerFile = (f) => /\/route\.(m?[jt]s)$/.test(f) || /\/pages\/api\//.test(f);
 
 // ── Gap closer: async callbacks ───────────────────────────────────────────
@@ -484,16 +585,33 @@ export function candidates(graph, read) {
     byKey.set(c.key, c);
     return c;
   };
-  const link = (a, b, why) => {
+  // An edge, with where the code makes it (closure depth, then line), so
+  // a journey's steps can be put in the order the code runs them.
+  let seq = 0;
+  const link = (a, b, why, rank = null) => {
     if (!a || !b || a === b) return;
     if (!edges.has(a.id)) edges.set(a.id, new Map());
-    if (!edges.get(a.id).has(b.id)) edges.get(a.id).set(b.id, why);
+    if (!edges.get(a.id).has(b.id)) edges.get(a.id).set(b.id, { why, rank, i: seq++ });
   };
 
   // Outside services, one candidate per node.
   const outside = (nodeId, viaFile, viaLink) => {
     const n = ix.externals.get(nodeId);
     if (!n) return null;
+    // One service behind several APIs (`EXAMPLE_API`, `EXAMPLE_MOBILE_API`):
+    // the step names the one this code reads, cited where it reads it.
+    const envs = (n.env || []).filter((e) => /^[A-Z][A-Z0-9_]{2,}$/.test(e));
+    if (envs.length > 1 && viaFile) {
+      const lines = r.lines(viaFile) || [];
+      const hit = envs.map((e) => [e, lines.findIndex((t) => new RegExp('\\b' + e + '\\b').test(t))]).filter(([, i]) => i >= 0);
+      if (hit.length === 1) {
+        const [env, i] = hit[0];
+        const key = `n:${nodeId}#${env}`;
+        if (byKey.has(key)) return byKey.get(key);
+        const ev = cite(r, viaFile, i + 1, [env]);
+        if (ev) return add({ kind: 'outside', key, view: 'n:' + nodeId, label: `${n.label || nodeId} (${env})`, evidence: [ev] });
+      }
+    }
     const key = 'n:' + nodeId;
     if (byKey.has(key)) return byKey.get(key);
     const hints = [...(n.packages || []), n.vendor, n.label, nodeId, ...(n.hosts || [])].filter(Boolean);
@@ -531,7 +649,7 @@ export function candidates(graph, read) {
         if (h.how === 'di' && props.has(h.prop)) for (const [f, v] of closure(ix, r, classes, h.to, { depth: 3, cap: 40 })) if (!files.has(f)) files.set(f, v);
       }
     } else {
-      files = closure(ix, r, classes, start, { depth: 4, cap: 60 });
+      files = closure(ix, r, classes, start, { depth: 5, cap: 150 });
     }
     serverFiles.set(ri, files);
     return files;
@@ -539,18 +657,36 @@ export function candidates(graph, read) {
 
   // Requests: Floorplan's matched calls and the detectors' http links.
   const callsByFile = new Map();
+  // Where a route's handler is: a Next route file's exported method or a
+  // pages/api handler (a route on line 1 is the file, not the code), else
+  // the route's own line with its path or name on it.
+  const handlerAt = (ri) => {
+    const rt = routes[ri];
+    const lines = r.lines(rt.f);
+    if (!lines) return null;
+    const method = (rt.m || 'ANY').toUpperCase();
+    if (isRouteHandlerFile(rt.f)) {
+      const pats = [`export async function ${method}`, `export function ${method}`, `export const ${method}`, `${method}:`, 'async function handler', 'function handler', 'export default'];
+      for (const p of pats) {
+        const l = lines.findIndex((t) => t.includes(p) && (!p.endsWith(':') || /^\s*(export\s+)?(const\s+)?\{?\s*\w*\s*[A-Z]+:/.test(t)));
+        if (l >= 0) return cite(r, rt.f, l + 1, [p]);
+      }
+    }
+    const tail = segs(rt.p).filter((s) => !/^[:*[]/.test(s)).pop();
+    return cite(r, rt.f, rt.l || 1, [tail && `'${tail}'`, tail && `"${tail}"`, tail, rt.h && rt.h !== 'router' ? rt.h : null, method !== 'ANY' ? method : null].filter(Boolean));
+  };
   const request = (ri, site, how) => {
     const rt = routes[ri];
     if (!rt || isTest(rt.f) || isTest(site.file)) return null;
     const lines = r.lines(site.file);
-    const lit = callPath(lines, site.line, rt);
+    // A call whose path is not written on its line (`signIn('credentials')`)
+    // says it itself.
+    const lit = site.path ? { raw: site.path, at: site.line, token: site.token } : callPath(lines, site.line, rt);
     const p = lit ? normPath(lit.raw) : rt.p;
     const method = (rt.m || 'ANY').toUpperCase();
     const key = `req:${method} ${p}`;
-    const callEv = lit ? { file: site.file, line: lit.at, token: lit.raw } : cite(r, site.file, site.line, [rt.p, ...segs(rt.p).reverse()]);
-    const tail = segs(rt.p).filter((s) => !/^[:*[]/.test(s)).pop();
-    const handEv = cite(r, rt.f, rt.l || 1, [tail && `'${tail}'`, tail && `"${tail}"`, tail, rt.h && rt.h !== 'router' ? rt.h : null, method !== 'ANY' ? method : null].filter(Boolean))
-      || cite(r, rt.f, findToken(r.lines(rt.f), rt.l || 1, `export async function ${method}`) || findToken(r.lines(rt.f), rt.l || 1, `export const ${method}`) || rt.l || 1, [method]);
+    const callEv = lit ? { file: site.file, line: lit.at, token: lit.token || lit.raw } : cite(r, site.file, site.line, [rt.p, ...segs(rt.p).reverse()]);
+    const handEv = handlerAt(ri);
     const c = add({ kind: 'request', key, view: `r:${ri}`, route: ri, path: p, method, label: `${method} ${p}${rt.name ? ' (' + rt.name + ')' : ''}`, evidence: [callEv, handEv], how });
     if (!c) return null;
     if (!callsByFile.has(site.file)) callsByFile.set(site.file, []);
@@ -575,6 +711,67 @@ export function candidates(graph, read) {
           callsByFile.get(a).push({ c, line: null });
         }
       }
+    }
+  }
+
+  // Calls the map has no link for, in the app's own code: written in the
+  // file, or taken from an object of paths another file defines.
+  const routeFiles = new Set(routes.map((rt) => rt.f));
+  const codeFiles = [...ix.files].filter((f) => CODE.test(f) && !isTest(f) && !routeFiles.has(f) && !/(^|\/)node_modules\//.test(f));
+  const maps = new Map();
+  for (const f of codeFiles) {
+    const t = r.text(f);
+    if (!t || !/:\s*['"`]\//.test(t)) continue;
+    for (const [name, ent] of r.once('maps', f, () => urlMaps(t))) if (!maps.has(name)) maps.set(name, { file: f, ent });
+  }
+  const httpCall = new RegExp(HTTP_FN + String.raw`\s*(?:<[^>()]*>)?\(`);
+  for (const f of codeFiles) {
+    const t = r.text(f);
+    if (!t) continue;
+    for (const k of r.once('calls', f, () => clientCalls(t))) {
+      const ri = matchRoute(routes, k.path, k.method);
+      if (ri != null) request(ri, k.how === 'next-auth' ? { file: f, line: k.line, path: k.path, token: k.token } : { file: f, line: k.line }, k.how);
+    }
+    if (!maps.size || !httpCall.test(t)) continue;
+    for (const m of t.matchAll(/\b(\w+)\.(\w+)\b/g)) {
+      const mp = maps.get(m[1]);
+      const e = mp?.ent[m[2]];
+      if (!e) continue;
+      const ri = matchRoute(routes, e.path, METHOD_NEAR.exec(t.slice(m.index - 80, m.index + 200))?.slice(1).find(Boolean)?.toUpperCase());
+      if (ri == null) continue;
+      const c = request(ri, { file: mp.file, line: e.line }, 'url-map');
+      if (c && mp.file !== f) {
+        if (!callsByFile.has(f)) callsByFile.set(f, []);
+        callsByFile.get(f).push({ c, line: t.slice(0, m.index).split('\n').length });
+      }
+    }
+  }
+
+  // Calls through an API client or SDK: requests with no endpoint of ours,
+  // to the package's outside service.
+  const pkgNode = new Map();
+  for (const [id, n] of ix.externals) for (const p of n.packages || []) pkgNode.set(p, id);
+  const pkgOutside = (pkg, file) => {
+    const id = pkgNode.get(pkg) || [...pkgNode.entries()].find(([p]) => pkg.startsWith(p + '/'))?.[1];
+    if (id) return outside(id, file, null);
+    const key = 'pkg:' + pkg;
+    if (byKey.has(key)) return byKey.get(key);
+    const line = findToken(r.lines(file), 1, `'${pkg}'`) || findToken(r.lines(file), 1, `"${pkg}"`);
+    const ev = line && cite(r, file, line, [pkg]);
+    return ev ? add({ kind: 'outside', key, view: 'f:' + file, label: `${pkg} (the service this package talks to)`, evidence: [ev] }) : null;
+  };
+  for (const f of codeFiles) {
+    const t = r.text(f);
+    if (!t || !(/\.call\(/.test(t) || /[A-Z]\w*(?:Session|Client|Agent|Api|API|Sdk|SDK|Auth)\.[a-z]/.test(t))) continue;
+    for (const k of r.once('sdk', f, () => sdkCalls(t))) {
+      const ev = cite(r, f, k.line, [k.token]);
+      if (!ev) continue;
+      const kind = k.id.startsWith('xrpc:') ? 'XRPC' : 'SDK';
+      const c = add({ kind: 'request', key: `req:${kind} ${k.id}`, view: 'f:' + f, path: k.id, method: kind, label: `${k.id.replace(/^\w+:/, '')} (${kind === 'XRPC' ? 'an XRPC call' : 'an SDK call'})`, evidence: [ev], how: kind.toLowerCase() });
+      if (!c) continue;
+      if (!callsByFile.has(f)) callsByFile.set(f, []);
+      callsByFile.get(f).push({ c, line: ev.line });
+      if (k.pkg) link(c, pkgOutside(k.pkg, f), 'it goes to the service behind this package');
     }
   }
 
@@ -647,17 +844,22 @@ export function candidates(graph, read) {
       for (const x of ix.ext.get(f) || []) {
         const o = outside(x.node, f, x.link);
         if (!o) continue;
-        link(c, o, 'its handler uses it');
+        link(c, o, 'its handler uses it', [v.d, x.link?.evidence?.[0]?.line || 0]);
         for (const hi of hooksFor.get(x.node) || []) link(o, asyncRoute(hi), 'calls back');
       }
       for (const e of emitters.get(f) || []) {
         if (!inUse(ix, r, f, v.names, e.line)) continue;
-        link(c, asyncEvent(consts.get(e.name) || e.name), 'its handler emits the event');
+        link(c, asyncEvent(consts.get(e.name) || e.name), 'its handler emits the event', [v.d, e.line]);
+      }
+      for (const h of r.once('helpers', f, () => helperCalls(r.text(f)))) {
+        if (!inUse(ix, r, f, v.names, h.line)) continue;
+        const ev = cite(r, f, h.line, [h.token]);
+        link(c, ev && add({ kind: 'outside', key: `helper:${f}#${h.name}`, view: 'f:' + f, label: `${h.name} (an integration its handler calls)`, evidence: [ev] }), 'its handler calls it', [v.d, h.line]);
       }
       for (const h of r.once('hooks', f, () => outgoingHooks(r.text(f)))) {
         if (!inUse(ix, r, f, v.names, h.line)) continue;
         const ev = cite(r, f, h.line, [h.token]);
-        link(c, ev && add({ kind: 'async', key: `out:${f}#${h.token}`, view: 'f:' + f, label: `${h.token} (webhooks sent out)`, evidence: [ev] }), 'its handler sends webhooks');
+        link(c, ev && add({ kind: 'async', key: `out:${f}#${h.token}`, view: 'f:' + f, label: `${h.token} (webhooks sent out)`, evidence: [ev] }), 'its handler sends webhooks', [v.d, h.line]);
       }
     }
   }
@@ -713,12 +915,13 @@ export function candidates(graph, read) {
     done.add(s.id);
     const files = closure(ix, r, classes, s.file);
     for (const [f, v] of files) {
-      for (const x of callsByFile.get(f) || []) if (x.line == null || inUse(ix, r, f, v.names, x.line)) link(s, x.c, 'the screen makes this request');
+      for (const x of callsByFile.get(f) || []) if (x.line == null || inUse(ix, r, f, v.names, x.line)) link(s, x.c, 'the screen makes this request', [v.d, x.line || 0]);
       for (const x of ix.ext.get(f) || []) {
         if (routes.some((rt) => rt.f === f)) continue;
-        link(s, outside(x.node, f, x.link), 'the screen uses it');
+        link(s, outside(x.node, f, x.link), 'the screen uses it', [v.d, x.link?.evidence?.[0]?.line || 0]);
       }
-      if (v.d > 1) continue;
+      // Step machines sit a few files down (page, then layout, then drawer).
+      if (v.d > 3) continue;
       const t = r.text(f);
       // Steps inside the page.
       const steps = r.once('steps', f, () => pageSteps(t));
@@ -731,7 +934,7 @@ export function candidates(graph, read) {
         const stepFiles = new Set(steps.map((x) => names.get(x.comp)).filter(Boolean));
         own = [];
         for (const [g, w] of closure(ix, r, classes, f, { skip: stepFiles })) {
-          for (const x of callsByFile.get(g) || []) if (x.line == null || inUse(ix, r, g, w.names, x.line)) own.push(x.c);
+          for (const x of callsByFile.get(g) || []) if (x.line == null || inUse(ix, r, g, w.names, x.line)) own.push({ c: x.c, rank: [w.d, x.line || 0] });
         }
         return own;
       };
@@ -746,15 +949,18 @@ export function candidates(graph, read) {
         // component from a package).
         const to = names.get(st.comp);
         if (!to) continue;
-        const ev = cite(r, f, st.line, [st.token]);
+        // The step is cited where its component is declared; where the page
+        // renders it is the fallback.
+        const decl = (ix.syms.get(to) || []).find((x) => x.name === st.comp);
+        const ev = (decl && cite(r, to, decl.line, [st.comp])) || cite(r, f, st.line, [st.token]);
         if (!ev) continue;
         const c = partScreen(to, st.comp, ev, s, st.step);
         if (!c) continue;
         stepScreens.set(c.id, { c, step: st.step, parentFile: f });
-        link(s, c, 'a step inside the page');
+        link(s, c, 'a step inside the page', [v.d, st.line]);
         if (prev) link(prev, c, 'the next step');
         prev = c;
-        for (const q of ownRequests()) link(c, q, 'the page makes this request for the step');
+        for (const q of ownRequests()) link(c, q.c, 'the page makes this request for the step', q.rank);
         visit(c);
       }
       // Forms the screen renders that no router registers.
@@ -781,6 +987,26 @@ export function candidates(graph, read) {
     }
   };
   for (const s of [...screens]) visit(s);
+
+  // A component that switches between journey forms (a sign-up drawer, a
+  // checkout sheet) mounted from a layout or provider no page imports: it
+  // is a screen of its own.
+  const seenFiles = new Set(screens.map((x) => x.file));
+  for (const f of ix.files) {
+    if (!/\.(tsx|jsx)$/.test(f) || isTest(f) || seenFiles.has(f)) continue;
+    const t = r.text(f);
+    if (!t || !/<[A-Z]/.test(t) || !/(===|case\s)/.test(t)) continue;
+    const steps = r.once('steps', f, () => pageSteps(t)).filter((x) => x.comp);
+    const names = new Map((ix.imports.get(f) || []).flatMap((e) => (e.names || []).map((n) => [n, e.to])));
+    const forms = steps.filter((x) => names.has(x.comp) && Object.values(WORDS).some((w) => w.test(x.comp) || w.test(x.step)));
+    if (forms.length < 2) continue;
+    const sy = (ix.syms.get(f) || []).find((x) => /^[A-Z]/.test(x.name) && (x.kind === 'default' || x.kind === 'function' || x.kind === 'const'));
+    const name = sy?.name || path.posix.basename(f).replace(/\.\w+$/, '');
+    const ev = sy && cite(r, f, sy.line, [name]);
+    if (!ev) continue;
+    const host = partScreen(f, name, ev, null, null);
+    if (host) visit(host);
+  }
 
   // Navigation the detectors found.
   const screenRef = (ref) => {
@@ -810,12 +1036,27 @@ export function entries(c) {
   return c.list.filter((x) => x.kind === 'screen' && family(`${x.name} ${x.url || ''} ${path.posix.basename(x.file || '')}`));
 }
 
+/** Entries in turn across families (sign in, sign up, ...), routed screens
+ * before forms within each. */
+export function fairOrder(list) {
+  const fam = new Map();
+  for (const e of list) {
+    const f = family(`${e.name} ${e.url || ''} ${path.posix.basename(e.file || '')}`) || '?';
+    if (!fam.has(f)) fam.set(f, []);
+    fam.get(f).push(e);
+  }
+  for (const l of fam.values()) l.sort((a, b) => Number(!!a.part) - Number(!!b.part));
+  const out = [];
+  for (let i = 0; out.length < list.length; i++) for (const l of fam.values()) if (l[i]) out.push(l[i]);
+  return out;
+}
+
 /** The candidates around an entry: screens within 2 navigation hops and
  * everything their requests reach. */
-export function subgraph(c, entry) {
+export function subgraph(c, entry, hops = 2) {
   const keep = new Set([entry.id]);
   let ring = [entry.id];
-  for (let hop = 0; hop < 2; hop++) {
+  for (let hop = 0; hop < hops; hop++) {
     const next = [];
     for (const id of ring) for (const [b] of c.edges.get(id) || []) {
       const x = byIdOf(c).get(b);
@@ -861,7 +1102,8 @@ export function listText(c, ids) {
   for (const x of shown) {
     const to = [...(c.edges.get(x.id) || [])].filter(([b]) => ids.has(b));
     const grp = (k) => to.filter(([b]) => byId.get(b)?.kind === k).map(([b]) => b);
-    const ev = x.evidence.map((e) => `${e.file}:${e.line}`).join(' then ');
+    // Where it is, briefly (the checker holds the exact lines).
+    const ev = [...new Set(x.evidence.map((e) => e.file.split('/').slice(-2).join('/')))].join(' then ');
     let l = `${x.id} ${x.kind} ${x.label} @ ${ev}`;
     if (grp('screen').length) l += ` next[${grp('screen').join(',')}]`;
     if (grp('request').length) l += ` requests[${grp('request').join(',')}]`;
@@ -874,7 +1116,7 @@ export function listText(c, ids) {
 
 /** The ids shown to the model for these entries, within MAX_LIST (each
  * candidate's line measured once, with all its edges: a bound). */
-export function shownFor(c, entryList) {
+export function shownFor(c, entryList, max = MAX_LIST, hops = 2) {
   const ids = new Set();
   const size = new Map();
   const cost = (id) => {
@@ -883,9 +1125,9 @@ export function shownFor(c, entryList) {
   };
   let total = 0;
   for (const e of entryList) {
-    const add = [...subgraph(c, e)].filter((id) => !ids.has(id));
+    const add = [...subgraph(c, e, hops)].filter((id) => !ids.has(id));
     const more = add.reduce((n, id) => n + cost(id), 0);
-    if (ids.size && total + more > MAX_LIST) break;
+    if (ids.size && total + more > max) break;
     for (const id of add) ids.add(id);
     total += more;
   }
@@ -966,7 +1208,12 @@ export function table(c, ids, read) {
         const lines = read.lines(e.file) || [];
         return { ...e, window: lines.slice(Math.max(0, e.line - 4), e.line + 3).map((t) => t.slice(0, 400)), from: Math.max(1, e.line - 3) };
       }),
-      next: [...(c.edges.get(x.id) || []).keys()].filter((b) => ids.has(b)),
+      // In the order the code makes them: by rank (depth, line), then the
+      // order they were found.
+      next: [...(c.edges.get(x.id) || [])].filter(([b]) => ids.has(b)).sort(([, a], [, b]) => (a.rank && b.rank ? a.rank[0] - b.rank[0] || a.rank[1] - b.rank[1] : 0) || a.i - b.i).map(([b]) => b),
+      // Requests a step has only because its page makes them: they don't
+      // place the request under this step.
+      weak: [...(c.edges.get(x.id) || [])].filter(([b, e]) => ids.has(b) && e.why === 'the page makes this request for the step').map(([b]) => b),
     };
   }
   return out;
@@ -987,14 +1234,35 @@ export function prepare(root, graph, prev) {
   const redo = new Set(changed);
   for (const d of dropped) if (hashes.has(d.entry)) redo.add(d.entry);
   for (const e of ent) if (asked[e.key] !== hashes.get(e.key)) redo.add(e.key);
-  const todoEntries = ent.filter((e) => redo.has(e.key));
+  // Every kind of journey gets its share of the list: entries taken in
+  // turn across families, routed screens before forms.
+  const todoEntries = fairOrder(ent.filter((e) => redo.has(e.key)));
   let todo = null;
   if (todoEntries.length) {
-    const ids = shownFor(c, todoEntries);
+    // One model call per journey family per app, each with only the
+    // candidates around that family's entries (and its own list cap).
+    const fam = (e) => family(`${e.name} ${e.url || ''} ${path.posix.basename(e.file || '')}`) || 'other';
+    const appOf = (e) => e.app || (e.file || '').split('/')[0];
+    const groups = new Map();
+    for (const e of todoEntries) {
+      const k = `${fam(e)}\0${appOf(e)}`;
+      if (!groups.has(k)) groups.set(k, { family: fam(e), app: appOf(e), entries: [] });
+      groups.get(k).entries.push(e);
+    }
+    const all = new Set();
+    const out = [];
+    for (const g of groups.values()) {
+      // One journey family: the screens one hop away are enough (a form's
+      // steps and where it lands), which keeps each call small.
+      const ids = shownFor(c, g.entries, MAX_GROUP_LIST, 1);
+      if (!ids.size) continue;
+      for (const id of ids) all.add(id);
+      out.push({ family: g.family, app: g.app, list: listText(c, ids), entries: g.entries.filter((e) => ids.has(e.id)).map((e) => e.id) });
+    }
     todo = {
-      list: listText(c, ids),
-      table: table(c, ids, read),
-      entries: todoEntries.filter((e) => ids.has(e.id)).map((e) => ({ id: e.id, key: e.key, hash: hashes.get(e.key) })),
+      groups: out,
+      table: table(c, all, read),
+      entries: todoEntries.filter((e) => all.has(e.id)).map((e) => ({ id: e.id, key: e.key, hash: hashes.get(e.key), family: fam(e), app: appOf(e) })),
       keep: kept.filter((f) => !redo.has(f.entry)).map((f) => ({ id: f.id, title: f.title })),
     };
   }

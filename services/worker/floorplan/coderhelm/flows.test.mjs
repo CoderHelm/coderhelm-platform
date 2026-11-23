@@ -268,7 +268,7 @@ test('a rebuild that changed nothing a journey stands on asks the model for noth
   const first = F.prepare(dir, GRAPH, null);
   assert.ok(first.todo, 'a first map asks for every entry');
   assert.ok(first.todo.entries.some((e) => e.key === 'screen:web:/login'));
-  assert.ok(first.todo.list.length > 0 && Object.keys(first.todo.table).length > 0);
+  assert.ok(first.todo.groups.length > 0 && first.todo.groups.every((g) => g.list.length > 0 && g.entries.length > 0) && Object.keys(first.todo.table).length > 0);
   // The cited lines go with the table, so the worker's checker needs no code.
   const t = Object.values(first.todo.table)[0];
   assert.ok(t.evidence[0].window.some((l) => l.includes(t.evidence[0].token)));
@@ -318,4 +318,137 @@ test('steps whose code is gone are dropped, and a journey is dropped by the rule
   const three = F.prepare(dir, g4, store);
   assert.equal(three.store.flows.length, 0);
   assert.equal(three.report.dropped[0].why, 'its first screen is gone');
+});
+
+// The second round of gap closers, on a made-up marina app: an outside
+// service behind two APIs, calls written directly or through an object of
+// paths, a call through an SDK, a Next route cited at its exported method,
+// and a join drawer mounted from a layout no page imports.
+const MARINA = {
+  'marina-web/app/api/dock/route.ts': `import { dock } from '../../../lib/dock';
+
+export async function POST(req) {
+  return Response.json(await dock(req));
+}
+`,
+  'marina-web/lib/dock.ts': `export async function dock(req) {
+  return fetch('/api/dock', { method: 'POST' });
+}
+`,
+  'marina-mobile/src/api/urls.ts': `export const URLS = {
+  book: '/slips/:id/bookings',
+  cancel: '/slips/:id/cancel',
+};
+`,
+  'marina-mobile/src/screens/SlipScreen.tsx': `import { URLS } from '../api/urls';
+import { apiPost } from '../api/client';
+
+export default function SlipScreen() {
+  const book = () => apiPost(URLS.book, {});
+  return <Button onPress={book} />;
+}
+`,
+  'marina-mobile/src/api/client.ts': `export function apiPost(url, body) {
+  return fetch(url, { method: 'POST', body });
+}
+`,
+  'marina-mobile/src/state/session.ts': `import { HarborSession } from '@marina/session-sdk';
+
+export async function signIn(email, password) {
+  return HarborSession.login({ email, password });
+}
+`,
+  'marina-api/src/bookings.controller.ts': `import { Controller, Post } from '@nestjs/common';
+import { TidesService } from './tides.service';
+
+@Controller('slips')
+export class BookingsController {
+  constructor(private readonly tides: TidesService) {}
+
+  @Post(':id/bookings')
+  book() {
+    return this.tides.check();
+  }
+}
+`,
+  'marina-api/src/tides.service.ts': `export class TidesService {
+  check() {
+    return fetch(process.env.TIDEWATCH_API_URL + '/now');
+  }
+}
+`,
+  'marina-web/components/JoinDrawer.tsx': `import { SignupForm } from './SignupForm';
+import { PaymentForm } from './PaymentForm';
+
+export function JoinDrawer({ step }) {
+  switch (step) {
+    case 'signup':
+      return <SignupForm />;
+    case 'payment':
+      return <PaymentForm />;
+  }
+}
+`,
+  'marina-web/components/SignupForm.tsx': `export function SignupForm() {
+  return <form />;
+}
+`,
+  'marina-web/components/PaymentForm.tsx': `export function PaymentForm() {
+  return <form />;
+}
+`,
+};
+const MARINA_GRAPH = {
+  schema: 'floorplan/graph@1',
+  nodes: [{ id: 'ext-tidewatch', kind: 'external', label: 'Tidewatch', env: ['TIDEWATCH_API_URL', 'TIDEWATCH_MOBILE_API_URL'], evidence: [{ file: 'marina-api/src/tides.service.ts', line: 3 }] }],
+  files: Object.keys(MARINA).map((p) => ({ p, s: [] })).map((f) => ({ ...f, s: {
+    'marina-mobile/src/screens/SlipScreen.tsx': [sym('SlipScreen', 'default', 4)],
+    'marina-api/src/bookings.controller.ts': [sym('BookingsController', 'class', 5)],
+    'marina-api/src/tides.service.ts': [sym('TidesService', 'class', 1)],
+    'marina-web/components/JoinDrawer.tsx': [sym('JoinDrawer', 'function', 4)],
+    'marina-web/components/SignupForm.tsx': [sym('SignupForm', 'function', 1)],
+    'marina-web/components/PaymentForm.tsx': [sym('PaymentForm', 'function', 1)],
+  }[f.p] || [] })),
+  routes: [
+    { f: 'marina-web/app/api/dock/route.ts', m: 'POST', p: '/api/dock', l: 1, h: 'POST' },
+    { f: 'marina-api/src/bookings.controller.ts', m: 'POST', p: '/slips/:id/bookings', l: 8, h: 'book' },
+  ],
+  links: [
+    { a: 'f:marina-mobile/src/screens/SlipScreen.tsx', b: 'f:marina-mobile/src/api/urls.ts', k: 'import', names: ['URLS'] },
+    { a: 'f:marina-mobile/src/screens/SlipScreen.tsx', b: 'f:marina-mobile/src/api/client.ts', k: 'import', names: ['apiPost'] },
+    { a: 'f:marina-api/src/bookings.controller.ts', b: 'f:marina-api/src/tides.service.ts', k: 'import', names: ['TidesService'] },
+    { a: 'f:marina-api/src/tides.service.ts', b: 'n:ext-tidewatch', k: 'http', labels: ['TIDEWATCH_API_URL'] },
+    { a: 'f:marina-web/components/JoinDrawer.tsx', b: 'f:marina-web/components/SignupForm.tsx', k: 'import', names: ['SignupForm'] },
+    { a: 'f:marina-web/components/JoinDrawer.tsx', b: 'f:marina-web/components/PaymentForm.tsx', k: 'import', names: ['PaymentForm'] },
+  ],
+  screens: [{ id: 'screen:mobile:/(Stack)/Slip', url: '/(Stack)/Slip', file: 'marina-mobile/src/screens/SlipScreen.tsx', app: 'mobile', name: 'Slip' }],
+};
+
+test('second-round closers: split services, direct and URL-map calls, SDK calls, route methods, drawers', () => {
+  const dir = root(MARINA);
+  const read = F.reader(dir);
+  const c = F.candidates(MARINA_GRAPH, read);
+  // The service is named by the API its code reads, cited there.
+  const tide = by(c, 'n:ext-tidewatch#TIDEWATCH_API_URL');
+  assert.ok(tide, JSON.stringify(c.list.map((x) => x.key)));
+  assert.equal(tide.view, 'n:ext-tidewatch');
+  assert.deepEqual(tide.evidence[0], { file: 'marina-api/src/tides.service.ts', line: 3, token: 'TIDEWATCH_API_URL' });
+  // A call through an object of paths: cited at the path, used by the screen.
+  const book = by(c, 'req:POST /slips/:p/bookings');
+  assert.equal(book.evidence[0].file, 'marina-mobile/src/api/urls.ts');
+  assert.ok(leads(c, by(c, 'screen:mobile:/(Stack)/Slip'), book));
+  assert.ok(leads(c, book, tide));
+  // A direct fetch to a Next route, whose handler is its exported method.
+  const dock = by(c, 'req:POST /api/dock');
+  assert.deepEqual(dock.evidence[1], { file: 'marina-web/app/api/dock/route.ts', line: 3, token: 'export async function POST' });
+  // A call through an SDK, to the service behind its package.
+  const login = by(c, 'req:SDK sdk:HarborSession.login');
+  assert.ok(login && leads(c, login, by(c, 'pkg:@marina/session-sdk')));
+  // A drawer no page imports is a screen, with its forms as steps cited
+  // where they are declared.
+  const drawer = by(c, 'part:marina-web/components/JoinDrawer.tsx#JoinDrawer');
+  const signup = by(c, 'part:marina-web/components/SignupForm.tsx#SignupForm');
+  assert.ok(drawer && signup && leads(c, drawer, signup));
+  assert.deepEqual(signup.evidence[0], { file: 'marina-web/components/SignupForm.tsx', line: 1, token: 'SignupForm' });
+  for (const x of c.list) for (const e of x.evidence) assert.ok(read.lines(e.file)[e.line - 1].includes(e.token), `${x.key}: ${e.file}:${e.line}`);
 });
