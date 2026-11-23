@@ -1,0 +1,1008 @@
+// Journeys (flows) for CoderHelm's app map, in the run sandbox after
+// Floorplan's build and CoderHelm's detectors. Deterministic, no model:
+//
+// - `candidates` reads the built map (screens, requests matched to
+//   endpoints, outside services, navigation) and the code, and lists every
+//   step a journey could take, each citing file:line and a token that is on
+//   that line. Five things the map alone misses are closed here, as code:
+//   async callbacks (webhook endpoints, events and their listeners, outgoing
+//   webhooks), steps inside one page (a form that switches between step
+//   components), React context (a hook whose work happens in its provider),
+//   the Next route-handler hop (a route that calls the backend), and
+//   services reached through dependency injection or a dynamic import.
+// - `revalidate` re-checks every stored journey against the code of this
+//   build: a step whose token moved is re-lined, a step whose token is gone
+//   is dropped, and a journey whose entry is gone, that lost 30% or more of
+//   its steps, or has fewer than 3 left is dropped.
+// - `prepare` does both for the driver and says which entries the model
+//   must (re)write, with the candidates it may choose from. A rebuild where
+//   nothing a journey stands on changed asks for nothing.
+//
+// The model (in the worker, passes/app_map_flows.rs) only names journeys
+// and picks and orders candidate ids; it never writes a citation.
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
+
+export const STORE = 'floorplan/coderhelm/flows.json';
+export const SCHEMA = 'coderhelm/flows@1';
+/** Steps in one journey, at most. */
+export const MAX_STEPS = 15;
+/** The candidate list the model reads, at most (characters). */
+export const MAX_LIST = 90_000;
+
+/** Words that make a screen the start of a journey. */
+export const WORDS = {
+  'sign-in': /(log[-_ ]?in(?!g)|sign[-_ ]?in|authenticat)/i,
+  'sign-up': /(sign[-_ ]?up|register|create[-_ ]?account|request[-_ ]?membership|join|onboard)/i,
+  'password-reset': /(forgot|reset[-_ ]?password|recover|password[-_ ]?update|new[-_ ]?password|set[-_ ]?password)/i,
+  booking: /(book(ing)?(?!mark)|reserv|class[-_ ]?detail|schedul|appointment)/i,
+  checkout: /(checkout|purchase|payment|basket|cart|buy|subscri|billing|clipcard|credits?\b)/i,
+};
+
+const TEST = /(\.test\.|\.spec\.|__tests__|\/tests?\/|\/e2e\/|\.stories\.|\/mocks?\/|\/__mocks__\/|\/fixtures?\/|playwright|cypress|\.d\.ts$)/;
+const NOISE_DIR = /\/(ui|icons?|styles?|theme|themes|i18n|locales?|assets|lang|translations)\//i;
+const CODE = /\.(m?[jt]sx?|cjs)$/;
+
+export const isTest = (p) => TEST.test(p);
+const sha = (s) => crypto.createHash('sha256').update(s).digest('hex').slice(0, 16);
+const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+// ── Reading the code ──────────────────────────────────────────────────────
+
+/** A cached line reader over the map's root. */
+export function reader(root) {
+  const cache = new Map();
+  const text = (p) => {
+    if (!cache.has(p)) {
+      let t = null;
+      try {
+        const full = path.join(root, p);
+        if (!path.resolve(full).startsWith(path.resolve(root) + path.sep)) t = null;
+        else t = fs.readFileSync(full, 'utf8');
+      } catch { t = null; }
+      cache.set(p, t);
+    }
+    return cache.get(p);
+  };
+  const split = new Map();
+  const lines = (p) => {
+    if (!split.has(p)) split.set(p, text(p)?.split('\n') ?? null);
+    return split.get(p);
+  };
+  // Per-file results of the scans below, each file read once.
+  const memo = new Map();
+  const once = (kind, p, f) => {
+    const k = kind + '\0' + p;
+    if (!memo.has(k)) memo.set(k, f());
+    return memo.get(k);
+  };
+  return { text, lines, once };
+}
+
+/** The line (1-based) holding `token` nearest to `line`: within 3 lines,
+ * else anywhere in the file (it moved), else null (it's gone). */
+export function findToken(lines, line, token) {
+  if (!lines || !token) return null;
+  for (let d = 0; d <= 3; d++) {
+    for (const l of d ? [line - d, line + d] : [line]) {
+      if (l >= 1 && l <= lines.length && lines[l - 1].includes(token)) return l;
+    }
+  }
+  let best = null;
+  lines.forEach((t, i) => {
+    if (t.includes(token) && (best == null || Math.abs(i + 1 - line) < Math.abs(best - line))) best = i + 1;
+  });
+  return best;
+}
+
+/** A token on `line` to cite: the first hint found on it, else its longest
+ * quoted string or identifier. */
+export function pickToken(lines, line, hints = []) {
+  const t = lines?.[line - 1];
+  if (t == null) return null;
+  for (const h of hints) if (h && h.length >= 3 && t.includes(h)) return h;
+  const quoted = [...t.matchAll(/(['"`])([^'"`\n]{3,80})\1/g)].map((m) => m[2]);
+  const words = [...t.matchAll(/[A-Za-z_$@][\w$.@-]{3,60}/g)].map((m) => m[0]);
+  const all = [...quoted, ...words].filter((w) => !/^(const|return|export|import|function|async|await|default|from)$/.test(w));
+  all.sort((a, b) => b.length - a.length);
+  return all[0] || null;
+}
+
+/** Evidence on a line, or null when nothing on it can be cited. */
+function cite(r, file, line, hints) {
+  const lines = r.lines(file);
+  if (!lines) return null;
+  let at = Math.max(1, Math.min(line || 1, lines.length));
+  for (const h of hints) {
+    const l = h && findToken(lines, at, h);
+    if (l && Math.abs(l - at) <= 3) { at = l; break; }
+  }
+  const token = pickToken(lines, at, hints);
+  return token ? { file, line: at, token } : null;
+}
+
+// ── The map, indexed ──────────────────────────────────────────────────────
+
+const strip = (ref) => (typeof ref === 'string' && ref.startsWith('f:') ? ref.slice(2) : null);
+
+function index(graph) {
+  const files = new Set((graph.files || []).map((f) => f.p));
+  const syms = new Map((graph.files || []).map((f) => [f.p, (f.s || []).map(([name, kind, line]) => ({ name, kind, line })).sort((a, b) => a.line - b.line)]));
+  const imports = new Map();
+  const ext = new Map();
+  const externals = new Map((graph.nodes || []).filter((n) => n.kind === 'external').map((n) => [n.id, n]));
+  for (const l of graph.links || []) {
+    const a = strip(l.a);
+    if (!a || isTest(a)) continue;
+    const b = strip(l.b);
+    if (l.k === 'import' && b) {
+      if (!imports.has(a)) imports.set(a, []);
+      imports.get(a).push({ to: b, names: l.names || null });
+    }
+    if (typeof l.b === 'string' && l.b.startsWith('n:') && externals.has(l.b.slice(2))) {
+      if (!ext.has(a)) ext.set(a, []);
+      ext.get(a).push({ node: l.b.slice(2), link: l });
+    }
+  }
+  return { files, syms, imports, ext, externals };
+}
+
+/** Line ranges of a file's top-level symbols, by name. */
+function ranges(ix, r, file) {
+  const s = ix.syms.get(file) || [];
+  const n = r.lines(file)?.length || 0;
+  const out = new Map();
+  s.forEach((x, i) => {
+    const end = i + 1 < s.length ? s[i + 1].line - 1 : n;
+    out.set(x.name, [x.line, Math.max(x.line, end)]);
+  });
+  return out;
+}
+
+function slice(r, file, names, ix) {
+  const t = r.text(file) || '';
+  if (!names) return t;
+  return r.once('slice:' + [...names].sort().join(','), file, () => sliceOf(r, file, names, ix, t));
+}
+
+function sliceOf(r, file, names, ix, t) {
+  const lines = r.lines(file) || t.split('\n');
+  const rg = ranges(ix, r, file);
+  const parts = [];
+  for (const n of names) {
+    const x = rg.get(n);
+    if (x) parts.push(lines.slice(x[0] - 1, x[1]).join('\n'));
+  }
+  return parts.length ? parts.join('\n') : t;
+}
+
+// ── Gap closer: dependency injection and dynamic imports ──────────────────
+
+function classIndex(ix, r) {
+  const out = new Map();
+  for (const [p, s] of ix.syms) {
+    if (isTest(p)) continue;
+    for (const x of s) if (x.kind === 'class' && !out.has(x.name)) out.set(x.name, p);
+  }
+  // Floorplan lists exported symbols; a class it missed is found by name.
+  return { get: (name) => out.get(name) || null, all: out };
+}
+
+/** Resolve an import specifier to a file on the map. */
+function resolveSpec(ix, from, spec) {
+  const tries = [];
+  if (spec.startsWith('.')) tries.push(path.posix.normalize(path.posix.join(path.posix.dirname(from), spec)));
+  else {
+    // An alias (`@/x`, `~/x`, `@scope/pkg/x`, `#/x`): match by the tail.
+    const tail = spec.replace(/^(@[\w-]+\/[\w-]+\/|[@~#]\/|src\/)/, '');
+    tries.push(tail);
+  }
+  const exts = ['', '.ts', '.tsx', '.js', '.jsx', '.mjs', '/index.ts', '/index.tsx', '/index.js'];
+  for (const t of tries) {
+    for (const e of exts) if (ix.files.has(t + e)) return t + e;
+    if (!spec.startsWith('.')) {
+      for (const e of exts) {
+        const want = '/' + t + e;
+        for (const f of ix.files) if (f.endsWith(want)) return f;
+      }
+    }
+  }
+  return null;
+}
+
+/** Imports the map has no link for: constructor injection (Nest and
+ * similar) and `import()` / `require()` with a literal. */
+export function hiddenImports(ix, r, classes, file) {
+  return r.once('hidden', file, () => hiddenImportsOf(ix, r, classes, file));
+}
+
+function hiddenImportsOf(ix, r, classes, file) {
+  const t = r.text(file);
+  if (!t) return [];
+  const out = [];
+  for (const m of t.matchAll(/(?:private|public|protected|readonly)\s+(?:readonly\s+)?(\w+)\s*:\s*([A-Z]\w+)/g)) {
+    const f = classes.get(m[2]);
+    if (f && f !== file) out.push({ to: f, names: null, how: 'di', prop: m[1] });
+  }
+  for (const m of t.matchAll(/(?:\bimport|\brequire)\(\s*['"]([^'"]+)['"]\s*\)/g)) {
+    const f = resolveSpec(ix, file, m[1]);
+    if (f && f !== file) out.push({ to: f, names: null, how: 'dynamic' });
+  }
+  return out;
+}
+
+// ── Gap closer: React context ─────────────────────────────────────────────
+
+/** Whether `name` in `file` is a hook that reads a context: then the work
+ * it hands back happens in the provider, so the whole module counts. */
+function readsContext(ix, r, file, name) {
+  if (!/^use[A-Z]/.test(name)) return false;
+  const body = slice(r, file, [name], ix);
+  return /\buse(Context)?\(\s*\w*Context\b|\buseContext\(/.test(body);
+}
+
+// ── Closures ──────────────────────────────────────────────────────────────
+
+/** The files a start file reaches, symbol-aware: file to the names used
+ * from it (null: all of it). */
+export function closure(ix, r, classes, start, { depth = 5, cap = 120, skip = null } = {}) {
+  const seen = new Map([[start, { d: 0, names: null }]]);
+  const queue = [start];
+  while (queue.length) {
+    const f = queue.shift();
+    const { d, names } = seen.get(f);
+    if (d >= depth) continue;
+    const body = slice(r, f, names && [...names], ix);
+    const edges = [...(ix.imports.get(f) || []), ...hiddenImports(ix, r, classes, f)];
+    for (const e of edges) {
+      if (isTest(e.to) || NOISE_DIR.test('/' + e.to) || skip?.has(e.to)) continue;
+      let use = null;
+      if (e.names && e.names.length && !e.names.includes('default') && !e.names.includes('*')) {
+        const used = e.names.filter((n) => new RegExp('\\b' + esc(n) + '\\b').test(body));
+        if (!used.length) continue;
+        const component = /\.(tsx|jsx)$/.test(e.to) && used.some((n) => /^[A-Z]/.test(n));
+        const ctx = used.some((n) => readsContext(ix, r, e.to, n));
+        use = component || ctx ? null : new Set(used);
+      } else if (e.prop && !new RegExp('\\bthis\\.' + esc(e.prop) + '\\b').test(body) && names) continue;
+      const had = seen.get(e.to);
+      if (had) {
+        if (had.names && (!use || [...use].some((n) => !had.names.has(n)))) {
+          had.names = use ? new Set([...had.names, ...use]) : null;
+          queue.push(e.to);
+        }
+        continue;
+      }
+      if (seen.size >= cap) continue;
+      seen.set(e.to, { d: d + 1, names: use });
+      queue.push(e.to);
+    }
+  }
+  return seen;
+}
+
+function inUse(ix, r, file, names, line) {
+  if (!names) return true;
+  const rg = ranges(ix, r, file);
+  for (const n of names) {
+    const x = rg.get(n);
+    if (x && line >= x[0] && line <= x[1]) return true;
+  }
+  return false;
+}
+
+// ── Requests ──────────────────────────────────────────────────────────────
+
+const segs = (p) => p.split('/').filter(Boolean);
+
+/** The route a path reaches: exact segments beat parameters; `*` ends a
+ * catch-all. */
+export function matchRoute(routes, p, method) {
+  let best = null;
+  let score = -1;
+  const ps = segs(p.replace(/\?.*$/, ''));
+  routes.forEach((r, i) => {
+    if (!r.p || isTest(r.f)) return;
+    const rs = segs(r.p);
+    let sc = 0;
+    let ok = true;
+    for (let k = 0; k < rs.length; k++) {
+      const s = rs[k];
+      if (s === '*' || /^\*|^\[\.\.\./.test(s)) { sc += 1; break; }
+      if (k >= ps.length) { ok = false; break; }
+      if (s === ps[k]) sc += 3;
+      else if (s.startsWith(':') || /^\[.+\]$/.test(s) || ps[k].startsWith(':') || ps[k].startsWith('${')) sc += 1;
+      else { ok = false; break; }
+      if (k === rs.length - 1 && rs.length !== ps.length) ok = false;
+    }
+    if (!rs.length && ps.length) ok = false;
+    if (!ok) return;
+    if (method && r.m && r.m.toUpperCase() === method.toUpperCase()) sc += 2;
+    if (sc > score) { best = i; score = sc; }
+  });
+  return best;
+}
+
+/** The path literal on a call's line, nearest to the route it reached. */
+function callPath(lines, line, route) {
+  for (let d = 0; d <= 2; d++) {
+    for (const l of d ? [line - d, line + d] : [line]) {
+      const t = lines?.[l - 1];
+      if (!t) continue;
+      const lits = [...t.matchAll(/(['"`])((?:\$\{[^}]+\})?\/[^'"`\s]*)\1/g)].map((m) => ({ raw: m[2], at: l }));
+      if (!lits.length) continue;
+      const tail = segs(route?.p || '').filter((s) => !/^[:*[]/.test(s)).pop();
+      const pick = lits.find((x) => tail && x.raw.includes(tail)) || lits[0];
+      return pick;
+    }
+  }
+  return null;
+}
+
+const normPath = (p) => '/' + segs(p.replace(/\?.*$/, '').replace(/^\$\{[^}]+\}/, '').replace(/\$\{[^}]+\}/g, ':p').replace(/\/:\w+/g, '/:p')).join('/');
+
+// ── Gap closer: the Next route-handler hop ────────────────────────────────
+
+/** Requests a Next route handler (or a pages/api handler) makes to another
+ * service: `fetch(`${base}/x`)`, `fetch(url)` with `const url = `${base}/x``. */
+export function routeHops(text) {
+  const out = [];
+  if (!text) return out;
+  const lines = text.split('\n');
+  const at = (i) => text.slice(0, i).split('\n').length;
+  for (const m of text.matchAll(/\b(?:fetch|axios(?:\.\w+)?|\w*[Cc]lient\.(?:get|post|put|patch|delete))\s*(?:<[^>()]*>)?\(\s*(['"`])((?:\$\{[^}]+\})\/[^'"`]*)\1/g)) {
+    out.push({ raw: m[2], line: at(m.index + m[0].indexOf(m[2])) });
+  }
+  for (const m of text.matchAll(/(?:const|let)\s+(\w+)\s*=\s*`(\$\{[^}]+\}\/[^`]*)`/g)) {
+    if (new RegExp('\\bfetch\\(\\s*' + esc(m[1]) + '\\b').test(text)) out.push({ raw: m[2], line: at(m.index + m[0].indexOf(m[2])) });
+  }
+  return out.filter((x) => lines[x.line - 1]?.includes(x.raw));
+}
+
+const isRouteHandlerFile = (f) => /\/route\.(m?[jt]s)$/.test(f) || /\/pages\/api\//.test(f);
+
+// ── Gap closer: async callbacks ───────────────────────────────────────────
+
+const WEBHOOK_PATH = /(web-?hooks?|callbacks?|notifications?|\bipn\b|\/events?$)/i;
+
+/** Event names with their emit and listen sites in one file. */
+export function eventSites(text) {
+  const out = { emits: [], listens: [] };
+  if (!text) return out;
+  const at = (i) => text.slice(0, i).split('\n').length;
+  const name = (s) => s.replace(/^['"`]|['"`]$/g, '');
+  for (const m of text.matchAll(/\.emit(?:Async)?\(\s*([A-Z][A-Z0-9_]+(?:\.[A-Z0-9_]+)?|['"`][\w.:-]+['"`])/g)) {
+    out.emits.push({ name: name(m[1]), line: at(m.index), token: m[1].replace(/^['"`]|['"`]$/g, '') });
+  }
+  for (const m of text.matchAll(/(?:@OnEvent|\.on|\.once|\.addListener|\.subscribe)\(\s*([A-Z][A-Z0-9_]+(?:\.[A-Z0-9_]+)?|['"`][\w.:-]+['"`])/g)) {
+    out.listens.push({ name: name(m[1]), line: at(m.index), token: m[1].replace(/^['"`]|['"`]$/g, '') });
+  }
+  return out;
+}
+
+/** Outgoing webhooks and scheduled callbacks a server function starts. */
+export function outgoingHooks(text) {
+  const out = [];
+  if (!text) return out;
+  const at = (i) => text.slice(0, i).split('\n').length;
+  for (const m of text.matchAll(/\b((?:handle|send|trigger|schedule|fire|dispatch)\w*Webhooks?\w*)\s*\(/g)) {
+    if (/function\s*$|^\s*(async\s+)?$/.test(text.slice(Math.max(0, m.index - 12), m.index))) continue;
+    out.push({ line: at(m.index), token: m[1] });
+  }
+  return out;
+}
+
+// ── Gap closer: steps inside one page ─────────────────────────────────────
+
+/** Step components a page switches between (`step === 'x' && <StepX`,
+ * `case Forms.Login: return <LoginForm`, `{[Step.A]: <A/>}`), in source
+ * order, each with the component name, its line and the step's name. */
+export function pageSteps(text) {
+  const out = [];
+  if (!text) return out;
+  const at = (i) => text.slice(0, i).split('\n').length;
+  const pats = [
+    /(\w+(?:\.\w+)?)[ \t]*===\s*((?:\w+\.)?\w+|['"][\w-]+['"])\s*(?:&&|\?)\s*\(?\s*<([A-Z]\w+)/g,
+    /\[\s*((?:\w+\.)?\w+)\s*\]\s*:\s*\(?\s*<([A-Z]\w+)/g,
+  ];
+  for (const re of pats) {
+    for (const m of text.matchAll(re)) {
+      const comp = m[m.length - 1];
+      const step = (m.length === 4 ? m[2] : m[1]).replace(/^['"]|['"]$/g, '').split('.').pop();
+      const i = m.index + m[0].lastIndexOf('<' + comp);
+      out.push({ step, comp, line: at(i), token: '<' + comp });
+    }
+  }
+  // `case Forms.Login:` then the first component its branch renders
+  // (`return <LoginForm` or `content = (<LoginForm`), before the next case.
+  const cases = [...text.matchAll(/\bcase\s+((?:\w+\.)?\w+|['"][\w-]+['"])\s*:/g)];
+  cases.forEach((m, k) => {
+    const end = Math.min(k + 1 < cases.length ? cases[k + 1].index : text.length, m.index + 1500);
+    const body = text.slice(m.index, end);
+    const d = body.search(/\bdefault\s*:/);
+    const r = /<([A-Z]\w+)/.exec(d >= 0 ? body.slice(0, d) : body);
+    if (!r) return;
+    const step = m[1].replace(/^['"]|['"]$/g, '').split('.').pop();
+    out.push({ step, comp: r[1], line: at(m.index + r.index), token: '<' + r[1] });
+  });
+  // The last branch of a chain of step ternaries: `) : (<StepCaptcha />)`.
+  if (out.length) {
+    for (const m of text.matchAll(/===\s*(?:\w+\.)?\w+\s*\?\s*\(\s*<[A-Z]\w+[\s\S]{0,800}?\)\s*:\s*\(\s*<([A-Z]\w+)/g)) {
+      const i = m.index + m[0].lastIndexOf('<' + m[1]);
+      if (!out.some((x) => x.comp === m[1])) out.push({ step: m[1], comp: m[1], line: at(i), token: '<' + m[1] });
+    }
+  }
+  // Forms reached by a call (`gotoForm(Forms.ForgotPassword)`) name a step
+  // even when the render is elsewhere.
+  for (const m of text.matchAll(/\b(?:gotoForm|setCurrentForm|setForm|setStep|goToStep|setScreenState|setProgress)\(\s*((?:\w+\.)?\w+|['"][\w-]+['"])/g)) {
+    out.push({ step: m[1].replace(/^['"]|['"]$/g, '').split('.').pop(), comp: null, line: at(m.index), token: m[0], goto: true });
+  }
+  // `?progress=x` / `?step=x` in links and router pushes.
+  for (const m of text.matchAll(/[?&](progress|step)=([\w-]+)/g)) {
+    out.push({ step: m[2], comp: null, line: at(m.index), token: m[0].slice(1), goto: true });
+  }
+  out.sort((a, b) => a.line - b.line);
+  return out;
+}
+
+// ── Navigation in code (used when the map has no nav links) ───────────────
+
+export function navSites(text) {
+  const out = [];
+  if (!text) return out;
+  const at = (i) => text.slice(0, i).split('\n').length;
+  for (const m of text.matchAll(/\b(?:navigate|push|replace|popToScreen|reset)\(\s*['"]([A-Z]\w+)['"]/g)) out.push({ kind: 'name', target: m[1], line: at(m.index), token: m[1] });
+  for (const m of text.matchAll(/\bname:\s*['"]([A-Z]\w+)['"]/g)) out.push({ kind: 'name', target: m[1], line: at(m.index), token: m[1] });
+  for (const m of text.matchAll(/(?:router\.(?:push|replace)|redirect|navigate|href=)\s*\(?\s*\{?\s*(['"`])(\/[^'"`?#\s]*)/g)) out.push({ kind: 'url', target: m[2].replace(/\$\{[^}]+\}/g, ':p'), line: at(m.index), token: m[2].slice(0, 40) });
+  return out;
+}
+
+const urlMatch = (u, pat) => {
+  const a = segs(u);
+  const b = segs(pat);
+  return a.length === b.length && a.every((x, i) => x === b[i] || /^[:[]/.test(b[i]) || x.startsWith(':'));
+};
+
+// ── Candidates ────────────────────────────────────────────────────────────
+
+/** Every step a journey on this map could take, and how they connect.
+ * `read` is a `reader(root)`. */
+export function candidates(graph, read) {
+  const r = read;
+  const ix = index(graph);
+  const classes = classIndex(ix, r);
+  const routes = graph.routes || [];
+  const byKey = new Map();
+  const list = [];
+  const edges = new Map();
+  const add = (c) => {
+    if (byKey.has(c.key)) return byKey.get(c.key);
+    if (!c.evidence.length || c.evidence.some((e) => !e)) return null;
+    const prefix = { screen: 'S', request: 'R', outside: 'X', async: 'A' }[c.kind];
+    c.id = prefix + (list.filter((x) => x.kind === c.kind).length + 1);
+    list.push(c);
+    byKey.set(c.key, c);
+    return c;
+  };
+  const link = (a, b, why) => {
+    if (!a || !b || a === b) return;
+    if (!edges.has(a.id)) edges.set(a.id, new Map());
+    if (!edges.get(a.id).has(b.id)) edges.get(a.id).set(b.id, why);
+  };
+
+  // Outside services, one candidate per node.
+  const outside = (nodeId, viaFile, viaLink) => {
+    const n = ix.externals.get(nodeId);
+    if (!n) return null;
+    const key = 'n:' + nodeId;
+    if (byKey.has(key)) return byKey.get(key);
+    const hints = [...(n.packages || []), n.vendor, n.label, nodeId, ...(n.hosts || [])].filter(Boolean);
+    let ev = null;
+    for (const e of [...(n.evidence || []), ...(viaLink?.evidence || [])]) {
+      if (e?.file && !isTest(e.file)) { ev = cite(r, e.file, e.line, [e.token, ...hints]); if (ev) break; }
+    }
+    if (!ev && viaFile) {
+      const lines = r.lines(viaFile) || [];
+      const i = lines.findIndex((t) => hints.some((h) => h && t.includes(h)));
+      if (i >= 0) ev = cite(r, viaFile, i + 1, hints);
+    }
+    if (!ev) return null;
+    return add({ kind: 'outside', key, view: key, label: n.label || nodeId, evidence: [ev] });
+  };
+
+  // Server work behind a route: the files its handler reaches, with
+  // constructor injection narrowed to the services the method uses.
+  const serverFiles = new Map();
+  const behindRoute = (ri) => {
+    if (serverFiles.has(ri)) return serverFiles.get(ri);
+    const rt = routes[ri];
+    const lines = r.lines(rt.f) || [];
+    const text = lines.join('\n');
+    let start = rt.f;
+    let files;
+    if (/@Controller\(/.test(text) && rt.l > 1) {
+      const a = rt.l - 1;
+      let b = lines.length;
+      for (let i = a + 1; i < lines.length; i++) if (/^\s*@(Get|Post|Put|Patch|Delete|All|Head|Options)\(/.test(lines[i])) { b = i; break; }
+      const body = lines.slice(a, b).join('\n');
+      const props = new Set([...body.matchAll(/this\.(\w+)\./g)].map((m) => m[1]));
+      files = new Map([[start, { d: 0, names: null }]]);
+      for (const h of hiddenImports(ix, r, classes, rt.f)) {
+        if (h.how === 'di' && props.has(h.prop)) for (const [f, v] of closure(ix, r, classes, h.to, { depth: 3, cap: 40 })) if (!files.has(f)) files.set(f, v);
+      }
+    } else {
+      files = closure(ix, r, classes, start, { depth: 4, cap: 60 });
+    }
+    serverFiles.set(ri, files);
+    return files;
+  };
+
+  // Requests: Floorplan's matched calls and the detectors' http links.
+  const callsByFile = new Map();
+  const request = (ri, site, how) => {
+    const rt = routes[ri];
+    if (!rt || isTest(rt.f) || isTest(site.file)) return null;
+    const lines = r.lines(site.file);
+    const lit = callPath(lines, site.line, rt);
+    const p = lit ? normPath(lit.raw) : rt.p;
+    const method = (rt.m || 'ANY').toUpperCase();
+    const key = `req:${method} ${p}`;
+    const callEv = lit ? { file: site.file, line: lit.at, token: lit.raw } : cite(r, site.file, site.line, [rt.p, ...segs(rt.p).reverse()]);
+    const tail = segs(rt.p).filter((s) => !/^[:*[]/.test(s)).pop();
+    const handEv = cite(r, rt.f, rt.l || 1, [tail && `'${tail}'`, tail && `"${tail}"`, tail, rt.h && rt.h !== 'router' ? rt.h : null, method !== 'ANY' ? method : null].filter(Boolean))
+      || cite(r, rt.f, findToken(r.lines(rt.f), rt.l || 1, `export async function ${method}`) || findToken(r.lines(rt.f), rt.l || 1, `export const ${method}`) || rt.l || 1, [method]);
+    const c = add({ kind: 'request', key, view: `r:${ri}`, route: ri, path: p, method, label: `${method} ${p}${rt.name ? ' (' + rt.name + ')' : ''}`, evidence: [callEv, handEv], how });
+    if (!c) return null;
+    if (!callsByFile.has(site.file)) callsByFile.set(site.file, []);
+    callsByFile.get(site.file).push({ c, line: callEv?.line || site.line });
+    return c;
+  };
+  for (const l of graph.links || []) {
+    if (l.k !== 'http') continue;
+    const a = strip(l.a);
+    if (!a || isTest(a)) continue;
+    for (const [ri, line] of l.calls || []) request(ri, { file: a, line }, 'matched');
+    for (const e of l.evidence || []) {
+      if (!e?.file || isTest(e.file)) continue;
+      const label = (l.labels || [])[0] || '';
+      const [m, p] = label.split(' ');
+      const ri = p ? matchRoute(routes, p, m) : routes.findIndex((rt) => 'f:' + rt.f === l.b);
+      if (ri != null && ri >= 0) {
+        const c = request(ri, { file: e.file, line: e.line }, e.how || 'code');
+        // A call cited where a wrapper or URL map spells it, used from `a`.
+        if (c && e.file !== a) {
+          if (!callsByFile.has(a)) callsByFile.set(a, []);
+          callsByFile.get(a).push({ c, line: null });
+        }
+      }
+    }
+  }
+
+  // The Next route-handler hop: a route that calls another service.
+  for (const [ri, rt] of routes.entries()) {
+    if (!isRouteHandlerFile(rt.f) || isTest(rt.f)) continue;
+    const from = [...callsByFile.values()].flat().find((x) => x.c.route === ri)?.c
+      || request(ri, { file: rt.f, line: rt.l || 1 }, 'route');
+    for (const f of closure(ix, r, classes, rt.f, { depth: 1, cap: 10 }).keys()) {
+      for (const h of routeHops(r.text(f))) {
+        const p = normPath(h.raw);
+        const ti = matchRoute(routes, p, null);
+        if (ti == null || ti === ri) continue;
+        const to = request(ti, { file: f, line: h.line }, 'route-hop');
+        if (from && to) link(from, to, 'the route handler calls it');
+      }
+    }
+  }
+
+  // Requests to outside services, async callbacks behind them.
+  const emitters = new Map();
+  const consts = new Map();
+  for (const f of ix.files) {
+    if (!CODE.test(f) || isTest(f)) continue;
+    const t = r.text(f);
+    if (!t || !/\.(emit|on|subscribe)\(|@OnEvent|=\s*['"][\w.:-]+['"]/.test(t)) continue;
+    for (const m of t.matchAll(/export\s+const\s+([A-Z][A-Z0-9_]+)\s*=\s*['"]([\w.:-]+)['"]/g)) consts.set(m[1], m[2]);
+    const ev = eventSites(t);
+    for (const e of ev.emits) {
+      if (!emitters.has(f)) emitters.set(f, []);
+      emitters.get(f).push(e);
+    }
+  }
+  const listeners = new Map();
+  for (const f of ix.files) {
+    if (!CODE.test(f) || isTest(f)) continue;
+    const t = r.text(f);
+    if (!t || !/@OnEvent|\.on\(|\.subscribe\(|\.addListener\(/.test(t)) continue;
+    for (const e of eventSites(t).listens) {
+      const name = consts.get(e.name) || e.name;
+      if (!listeners.has(name)) listeners.set(name, []);
+      listeners.get(name).push({ file: f, ...e });
+    }
+  }
+  const asyncEvent = (name) => {
+    const at = (listeners.get(name) || [])[0];
+    if (!at) return null;
+    const ev = cite(r, at.file, at.line, [at.token]);
+    return ev && add({ kind: 'async', key: `event:${name}`, view: 'f:' + at.file, label: `event ${name}, handled by ${path.posix.basename(at.file)}`, evidence: [ev] });
+  };
+  const webhookRoutes = [];
+  routes.forEach((rt, i) => { if (!isTest(rt.f) && (WEBHOOK_PATH.test(rt.p || '') || /webhook/i.test(rt.f))) webhookRoutes.push(i); });
+  const asyncRoute = (ri) => {
+    const rt = routes[ri];
+    const tail = segs(rt.p).filter((s) => !/^[:*[]/.test(s)).pop();
+    const ev = cite(r, rt.f, rt.l || 1, [tail && `'${tail}'`, tail && `'/${segs(rt.p).slice(-2).join('/')}'`, tail, rt.m]);
+    return ev && add({ kind: 'async', key: `hook:${(rt.m || 'ANY').toUpperCase()} ${rt.p}`, view: `r:${ri}`, label: `${(rt.m || '').toUpperCase()} ${rt.p} (called back by an outside service)`, evidence: [ev] });
+  };
+  const vendorWords = (n) => [n.vendor, n.id, n.label, ...(n.packages || [])].filter(Boolean).map((w) => String(w).toLowerCase().replace(/^@/, '').split(/[/\s_-]/)[0]).filter((w) => w.length >= 3);
+  const hooksFor = new Map();
+  for (const [id, n] of ix.externals) {
+    const words = vendorWords(n);
+    hooksFor.set(id, webhookRoutes.filter((ri) => words.some((w) => (routes[ri].p + ' ' + routes[ri].f).toLowerCase().includes(w))));
+  }
+
+  for (const c of [...list]) {
+    if (c.kind !== 'request' || c.route == null) continue;
+    const files = behindRoute(c.route);
+    for (const [f, v] of files) {
+      for (const x of ix.ext.get(f) || []) {
+        const o = outside(x.node, f, x.link);
+        if (!o) continue;
+        link(c, o, 'its handler uses it');
+        for (const hi of hooksFor.get(x.node) || []) link(o, asyncRoute(hi), 'calls back');
+      }
+      for (const e of emitters.get(f) || []) {
+        if (!inUse(ix, r, f, v.names, e.line)) continue;
+        link(c, asyncEvent(consts.get(e.name) || e.name), 'its handler emits the event');
+      }
+      for (const h of r.once('hooks', f, () => outgoingHooks(r.text(f)))) {
+        if (!inUse(ix, r, f, v.names, h.line)) continue;
+        const ev = cite(r, f, h.line, [h.token]);
+        link(c, ev && add({ kind: 'async', key: `out:${f}#${h.token}`, view: 'f:' + f, label: `${h.token} (webhooks sent out)`, evidence: [ev] }), 'its handler sends webhooks');
+      }
+    }
+  }
+  // A webhook endpoint whose handler works with a service: that service
+  // calls it back.
+  for (const ri of webhookRoutes) {
+    const a = asyncRoute(ri);
+    if (!a) continue;
+    for (const [f] of behindRoute(ri)) for (const x of ix.ext.get(f) || []) link(outside(x.node, f, x.link), a, 'calls back');
+  }
+
+  // Screens: the map's own, then steps inside a page and form components
+  // no router registers.
+  const screens = [];
+  const screenOf = new Map();
+  const screenAt = (s) => {
+    const file = s.file;
+    if (!file || isTest(file)) return null;
+    let ev = null;
+    const navEv = s.nav?.evidence?.[0] || s.nav?.evidence;
+    const name = s.nav?.name || s.name || segs(s.url || '').pop() || '';
+    if (navEv?.file) ev = cite(r, navEv.file, navEv.line, [navEv.token, `"${segs(s.url || '').pop()}"`, `'${segs(s.url || '').pop()}'`, segs(s.url || '').pop()].filter(Boolean));
+    if (!ev) {
+      const sy = (ix.syms.get(file) || []).find((x) => x.kind === 'default') || (ix.syms.get(file) || []).find((x) => /^[A-Z]/.test(x.name));
+      if (sy) ev = cite(r, file, sy.line, [sy.name !== 'default' ? sy.name : null, 'export default'].filter(Boolean));
+    }
+    if (!ev) {
+      const l = findToken(r.lines(file), 1, 'export default');
+      if (l) ev = cite(r, file, l, ['export default']);
+    }
+    if (!ev) return null;
+    const gate = s.nav?.gate ? `, ${s.nav.gate.replace('_', ' ')}` : '';
+    const where = s.nav?.navigator ? `, ${s.nav.navigator}` : '';
+    const c = add({ kind: 'screen', key: s.id, view: 'f:' + file, file, app: s.app, name, url: s.url, label: `${s.app ? s.app + ' ' : ''}${s.url || name}${where}${gate}`, evidence: [ev] });
+    if (c) { screens.push(c); if (!screenOf.has(file)) screenOf.set(file, []); screenOf.get(file).push(c); }
+    return c;
+  };
+  for (const s of graph.screens || []) screenAt(s);
+
+  const stepScreens = new Map();
+  const partScreen = (file, comp, ev, parent, step) => {
+    const key = `part:${file}#${comp}`;
+    if (byKey.has(key)) return byKey.get(key);
+    const c = add({ kind: 'screen', key, view: 'f:' + file, file, app: parent?.app, name: comp, label: `${comp}${parent ? ' (step ' + (step || '') + ' of ' + (parent.url || parent.name) + ')' : ' (a form no router registers)'}`, evidence: [ev], part: true });
+    if (c) { screens.push(c); if (!screenOf.has(file)) screenOf.set(file, []); screenOf.get(file).push(c); }
+    return c;
+  };
+
+  // Per-screen closures, with the steps inside each page.
+  const done = new Set();
+  const visit = (s) => {
+    if (done.has(s.id)) return;
+    done.add(s.id);
+    const files = closure(ix, r, classes, s.file);
+    for (const [f, v] of files) {
+      for (const x of callsByFile.get(f) || []) if (x.line == null || inUse(ix, r, f, v.names, x.line)) link(s, x.c, 'the screen makes this request');
+      for (const x of ix.ext.get(f) || []) {
+        if (routes.some((rt) => rt.f === f)) continue;
+        link(s, outside(x.node, f, x.link), 'the screen uses it');
+      }
+      if (v.d > 1) continue;
+      const t = r.text(f);
+      // Steps inside the page.
+      const steps = r.once('steps', f, () => pageSteps(t));
+      const names = new Map((ix.imports.get(f) || []).flatMap((e) => (e.names || []).map((n) => [n, e.to])));
+      // The page's own requests (its code and what it uses, the step
+      // components left out) belong to each of its steps.
+      let own = null;
+      const ownRequests = () => {
+        if (own) return own;
+        const stepFiles = new Set(steps.map((x) => names.get(x.comp)).filter(Boolean));
+        own = [];
+        for (const [g, w] of closure(ix, r, classes, f, { skip: stepFiles })) {
+          for (const x of callsByFile.get(g) || []) if (x.line == null || inUse(ix, r, g, w.names, x.line)) own.push(x.c);
+        }
+        return own;
+      };
+      let prev = null;
+      for (const st of steps) {
+        if (!st.comp) {
+          const target = [...stepScreens.values()].find((x) => x.step === st.step && x.parentFile === f);
+          if (target) link(prev || s, target.c, 'goes to this step');
+          continue;
+        }
+        // A step is a component of the app's own (not a text or layout
+        // component from a package).
+        const to = names.get(st.comp);
+        if (!to) continue;
+        const ev = cite(r, f, st.line, [st.token]);
+        if (!ev) continue;
+        const c = partScreen(to, st.comp, ev, s, st.step);
+        if (!c) continue;
+        stepScreens.set(c.id, { c, step: st.step, parentFile: f });
+        link(s, c, 'a step inside the page');
+        if (prev) link(prev, c, 'the next step');
+        prev = c;
+        for (const q of ownRequests()) link(c, q, 'the page makes this request for the step');
+        visit(c);
+      }
+      // Forms the screen renders that no router registers.
+      for (const e of ix.imports.get(f) || []) {
+        if (!/\.(tsx|jsx)$/.test(e.to) || isTest(e.to) || screenOf.has(e.to)) continue;
+        const base = path.posix.basename(e.to).replace(/\.\w+$/, '');
+        const comp = (e.names || []).find((n) => /^[A-Z]/.test(n)) || base;
+        if (!/(Form|Step\w*|Modal|Drawer|Sheet|Page|View|Screen)$/.test(comp) && !/(form|step)/i.test(base)) continue;
+        if (!Object.values(WORDS).some((w) => w.test(comp) || w.test(base))) continue;
+        const sy = (ix.syms.get(e.to) || []).find((x) => x.name === comp) || (ix.syms.get(e.to) || [])[0];
+        const ev = sy && cite(r, e.to, sy.line, [comp]);
+        if (!ev) continue;
+        const c = partScreen(e.to, comp, ev, null, null);
+        if (c) { link(s, c, 'the screen shows this form'); visit(c); }
+      }
+    }
+    // Navigation written in the screen's own files.
+    for (const [f, v] of files) {
+      if (v.d > 1) continue;
+      for (const n of r.once('nav', f, () => navSites(r.text(f)))) {
+        const t = screens.find((x) => x !== s && !x.part && (n.kind === 'name' ? x.name === n.target || segs(x.url || '').pop() === n.target : x.url && urlMatch(n.target, x.url)));
+        if (t) link(s, t, 'goes to this screen');
+      }
+    }
+  };
+  for (const s of [...screens]) visit(s);
+
+  // Navigation the detectors found.
+  const screenRef = (ref) => {
+    if (typeof ref !== 'string') return [];
+    if (ref.startsWith('screen:')) return byKey.has(ref) ? [byKey.get(ref)] : [];
+    const f = strip(ref);
+    return f ? screenOf.get(f) || [] : [];
+  };
+  for (const l of graph.links || []) {
+    if (l.k !== 'nav') continue;
+    for (const a of screenRef(l.a)) for (const b of screenRef(l.b)) link(a, b, 'goes to this screen');
+  }
+  return { list, edges, byKey };
+}
+
+// ── Journeys: entries, subgraphs and their hashes ─────────────────────────
+
+/** The family a name belongs to (sign-in, ...), or null. */
+export function family(text) {
+  for (const [f, re] of Object.entries(WORDS)) if (re.test(text || '')) return f;
+  return null;
+}
+
+/** Screens a journey can start at: a screen whose name or address says
+ * what the journey is. */
+export function entries(c) {
+  return c.list.filter((x) => x.kind === 'screen' && family(`${x.name} ${x.url || ''} ${path.posix.basename(x.file || '')}`));
+}
+
+/** The candidates around an entry: screens within 2 navigation hops and
+ * everything their requests reach. */
+export function subgraph(c, entry) {
+  const keep = new Set([entry.id]);
+  let ring = [entry.id];
+  for (let hop = 0; hop < 2; hop++) {
+    const next = [];
+    for (const id of ring) for (const [b] of c.edges.get(id) || []) {
+      const x = byIdOf(c).get(b);
+      if (x?.kind === 'screen' && !keep.has(b)) { keep.add(b); next.push(b); }
+    }
+    ring = next;
+  }
+  const grow = [...keep];
+  while (grow.length) {
+    const id = grow.pop();
+    for (const [b] of c.edges.get(id) || []) {
+      const x = byIdOf(c).get(b);
+      if (x && x.kind !== 'screen' && !keep.has(b)) { keep.add(b); grow.push(b); }
+    }
+  }
+  return keep;
+}
+
+/** What a journey stands on, without line numbers: a moved line costs
+ * nothing, a changed call or a new step does. */
+export function hashOf(c, ids) {
+  const byId = byIdOf(c);
+  const keys = [...ids].map((id) => byId.get(id)).filter(Boolean).map((x) => `${x.key}|${x.evidence.map((e) => e.file + '#' + e.token).join(',')}`).sort();
+  const out = [];
+  for (const id of ids) for (const [b] of c.edges.get(id) || []) if (ids.has(b)) out.push(`${byId.get(id)?.key}>${byId.get(b)?.key}`);
+  return sha(keys.join('\n') + '\n--\n' + out.sort().join('\n'));
+}
+
+// ── The list the model reads ──────────────────────────────────────────────
+
+const BYID = new WeakMap();
+function byIdOf(c) {
+  if (!BYID.has(c)) BYID.set(c, new Map(c.list.map((x) => [x.id, x])));
+  return BYID.get(c);
+}
+
+/** One line per candidate, ids first: what the model picks from. */
+export function listText(c, ids) {
+  const byId = byIdOf(c);
+  const order = { screen: 0, request: 1, outside: 2, async: 3 };
+  const shown = [...ids].map((id) => byId.get(id)).filter(Boolean).sort((a, b) => order[a.kind] - order[b.kind] || Number(a.id.slice(1)) - Number(b.id.slice(1)));
+  const lines = [];
+  for (const x of shown) {
+    const to = [...(c.edges.get(x.id) || [])].filter(([b]) => ids.has(b));
+    const grp = (k) => to.filter(([b]) => byId.get(b)?.kind === k).map(([b]) => b);
+    const ev = x.evidence.map((e) => `${e.file}:${e.line}`).join(' then ');
+    let l = `${x.id} ${x.kind} ${x.label} @ ${ev}`;
+    if (grp('screen').length) l += ` next[${grp('screen').join(',')}]`;
+    if (grp('request').length) l += ` requests[${grp('request').join(',')}]`;
+    if (grp('outside').length) l += ` outside[${grp('outside').join(',')}]`;
+    if (grp('async').length) l += ` async[${grp('async').join(',')}]`;
+    lines.push(l);
+  }
+  return lines.join('\n');
+}
+
+/** The ids shown to the model for these entries, within MAX_LIST (each
+ * candidate's line measured once, with all its edges: a bound). */
+export function shownFor(c, entryList) {
+  const ids = new Set();
+  const size = new Map();
+  const cost = (id) => {
+    if (!size.has(id)) size.set(id, listText(c, new Set([id, ...(c.edges.get(id)?.keys() || [])])).split('\n').find((l) => l.startsWith(id + ' '))?.length + 1 || 0);
+    return size.get(id);
+  };
+  let total = 0;
+  for (const e of entryList) {
+    const add = [...subgraph(c, e)].filter((id) => !ids.has(id));
+    const more = add.reduce((n, id) => n + cost(id), 0);
+    if (ids.size && total + more > MAX_LIST) break;
+    for (const id of add) ids.add(id);
+    total += more;
+  }
+  return ids;
+}
+
+// ── Stored journeys, re-checked on every build ────────────────────────────
+
+/** Re-checks stored journeys against this build's code and candidates.
+ * Returns the journeys kept (re-lined), the ones dropped with why, and the
+ * entries whose subgraph changed. */
+export function revalidate(store, c, read) {
+  const kept = [];
+  const dropped = [];
+  const changed = [];
+  for (const fl of store?.flows || []) {
+    const steps = [];
+    let gone = 0;
+    for (const st of fl.steps || []) {
+      const ev = [];
+      let ok = true;
+      for (const e of st.evidence || []) {
+        const l = findToken(read.lines(e.file), e.line, e.token);
+        if (!l) { ok = false; break; }
+        ev.push({ ...e, line: l });
+      }
+      const cand = c.byKey.get(st.key);
+      if (!ok || !ev.length || !cand) { gone += 1; continue; }
+      steps.push({ ...st, evidence: ev, view: cand.view });
+    }
+    const total = (fl.steps || []).length || 1;
+    const entryOk = c.byKey.has(fl.entry) && steps[0]?.key === fl.entry;
+    let why = null;
+    if (!entryOk) why = 'its first screen is gone';
+    else if (gone / total >= 0.3) why = `${gone} of ${total} steps are gone`;
+    else if (steps.length < 3) why = 'fewer than 3 steps are left';
+    if (why) { dropped.push({ id: fl.id, title: fl.title, entry: fl.entry, why }); continue; }
+    const entry = c.byKey.get(fl.entry);
+    const hash = hashOf(c, subgraph(c, entry));
+    if (hash !== fl.hash) changed.push(fl.entry);
+    kept.push({ ...fl, steps });
+  }
+  return { kept, dropped, changed };
+}
+
+/** A stored journey as the viewer draws it (`graph.flows`). */
+export function forViewer(fl) {
+  const steps = [];
+  const linked = [];
+  for (const s of fl.steps) {
+    if (!s.view) continue;
+    const evidence = (s.evidence || []).map((e) => ({ file: e.file, line: e.line }));
+    if (steps.length && steps[steps.length - 1].ref === s.view) {
+      const last = steps[steps.length - 1];
+      last.note += ` Then ${s.note.charAt(0).toLowerCase()}${s.note.slice(1)}`;
+      last.evidence.push(...evidence);
+      continue;
+    }
+    steps.push({ ref: s.view, note: s.note, evidence });
+    linked.push(s.linked !== false);
+  }
+  return { id: fl.id, title: fl.title, description: fl.description || '', steps, custom: true, coderhelm: { entry: fl.entry, linked } };
+}
+
+/** The candidate table the worker's checker reads: per id, the step it
+ * becomes, and the cited lines as they are now (each line plus or minus
+ * 3), so the check doesn't need the code again. */
+export function table(c, ids, read) {
+  const out = {};
+  for (const x of c.list) {
+    if (!ids.has(x.id)) continue;
+    out[x.id] = {
+      key: x.key,
+      kind: x.kind,
+      view: x.view,
+      label: x.label,
+      evidence: x.evidence.map((e) => {
+        const lines = read.lines(e.file) || [];
+        return { ...e, window: lines.slice(Math.max(0, e.line - 4), e.line + 3).map((t) => t.slice(0, 400)), from: Math.max(1, e.line - 3) };
+      }),
+      next: [...(c.edges.get(x.id) || []).keys()].filter((b) => ids.has(b)),
+    };
+  }
+  return out;
+}
+
+/** The driver's step: re-check what is stored, list the candidates, and
+ * say what the model must write. Returns { store, flows (for the graph),
+ * todo (null when the model need not run), report }. */
+export function prepare(root, graph, prev) {
+  const read = reader(root);
+  const c = candidates(graph, read);
+  const { kept, dropped, changed } = revalidate(prev, c, read);
+  const asked = { ...(prev?.asked || {}) };
+  const ent = entries(c);
+  const hashes = new Map(ent.map((e) => [e.key, hashOf(c, subgraph(c, e))]));
+  // Entries the model has not seen in this shape: new ones, ones whose
+  // subgraph changed, and the entries of dropped journeys.
+  const redo = new Set(changed);
+  for (const d of dropped) if (hashes.has(d.entry)) redo.add(d.entry);
+  for (const e of ent) if (asked[e.key] !== hashes.get(e.key)) redo.add(e.key);
+  const todoEntries = ent.filter((e) => redo.has(e.key));
+  let todo = null;
+  if (todoEntries.length) {
+    const ids = shownFor(c, todoEntries);
+    todo = {
+      list: listText(c, ids),
+      table: table(c, ids, read),
+      entries: todoEntries.filter((e) => ids.has(e.id)).map((e) => ({ id: e.id, key: e.key, hash: hashes.get(e.key) })),
+      keep: kept.filter((f) => !redo.has(f.entry)).map((f) => ({ id: f.id, title: f.title })),
+    };
+  }
+  const store = { schema: SCHEMA, flows: kept, asked: Object.fromEntries([...Object.entries(asked)].filter(([k]) => hashes.has(k))) };
+  return {
+    store,
+    flows: kept.map(forViewer),
+    todo,
+    report: { candidates: c.list.length, entries: ent.length, kept: kept.length, dropped, redo: todoEntries.length },
+  };
+}

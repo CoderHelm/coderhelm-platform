@@ -72,6 +72,7 @@ pub const BUILTIN: &[(&str, Risk)] = &[
     ("map_part", Risk::Read),
     ("map_screen", Risk::Read),
     ("map_file", Risk::Read),
+    ("map_flow", Risk::Read),
     // The app map's model jobs (worker/src/passes/app_map.rs), as Floorplan's
     // workflow names them: read-only lookups in the repositories and the
     // answer itself.

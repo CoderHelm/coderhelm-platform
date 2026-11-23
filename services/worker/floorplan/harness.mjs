@@ -18,27 +18,36 @@ export const read = (f) => JSON.parse(fs.readFileSync(path.join(HERE, f), 'utf8'
 /** The answers the worker's model jobs would send for the harbor fixture. */
 export const harborAnswers = () => ({ 'floorplan/architecture.json': read('architecture.harbor.json'), ...read('descriptions.harbor.json') });
 
-export function workdir(answers, mode) {
+export function workdir(answers, mode, extra = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'app-map-'));
   fs.cpSync(path.join(HERE, 'fixtures', 'harbor'), path.join(dir, 'root'), { recursive: true });
   fs.cpSync(VENDOR, path.join(dir, 'fp'), { recursive: true });
   fs.copyFileSync(path.join(HERE, 'driver.mjs'), path.join(dir, 'driver.mjs'));
-  fs.cpSync(path.join(HERE, 'coderhelm'), path.join(dir, 'coderhelm'), { recursive: true });
-  fs.writeFileSync(path.join(dir, 'job.json'), JSON.stringify({ mode, answers, heads: { 'harbor-web': 'a1', 'harbor-api': 'b2' } }));
+  fs.cpSync(path.join(HERE, 'coderhelm'), path.join(dir, 'coderhelm'), { recursive: true, filter: (p) => !/\.test\.mjs$/.test(p) });
+  fs.writeFileSync(path.join(dir, 'job.json'), JSON.stringify({ mode, answers, heads: { 'harbor-web': 'a1', 'harbor-api': 'b2' }, ...extra }));
   return dir;
 }
 
-export function run(dir) {
-  return spawnSync(process.execPath, ['driver.mjs'], { cwd: dir, encoding: 'utf8', env: { ...process.env, CODERHELM_OUT: path.join(dir, 'out') } });
+export function run(dir, env = {}) {
+  return spawnSync(process.execPath, ['driver.mjs'], { cwd: dir, encoding: 'utf8', env: { ...process.env, CODERHELM_OUT: path.join(dir, 'out'), ...env } });
 }
 
-export function drive(dir) {
-  const r = run(dir);
+export function drive(dir, env = {}) {
+  const r = run(dir, env);
   assert.equal(r.status, 0, r.stderr);
-  const result = JSON.parse(zlib.gunzipSync(Buffer.from(fs.readFileSync(path.join(dir, 'out', 'result.b64'), 'utf8'), 'base64')));
-  const g = path.join(dir, 'out', 'graph.b64');
-  const graph = fs.existsSync(g) ? JSON.parse(zlib.gunzipSync(Buffer.from(fs.readFileSync(g, 'utf8'), 'base64'))) : null;
+  const result = JSON.parse(zlib.gunzipSync(output(dir, 'result.b64')));
+  const g = output(dir, 'graph.b64');
+  const graph = g ? JSON.parse(zlib.gunzipSync(g)) : null;
   return { result, graph };
+}
+
+/** One of the driver's outputs, its parts joined the way the worker joins
+ * them; null when it wrote none. */
+export function output(dir, name) {
+  const out = path.join(dir, 'out');
+  const parts = fs.readdirSync(out).filter((f) => f === name || f.startsWith(name + '.')).sort();
+  if (!parts.length) return null;
+  return Buffer.from(parts.map((f) => fs.readFileSync(path.join(out, f), 'utf8')).join(''), 'base64');
 }
 
 /** A map as committed for the Rust adapter's tests: nothing that changes run to run. */

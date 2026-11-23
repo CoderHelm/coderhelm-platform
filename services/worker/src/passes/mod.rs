@@ -1260,6 +1260,8 @@ pub mod agent_tools;
 pub mod alert_episodes;
 /// The team's app map: Floorplan (vendor/floorplan) run in the sandbox (`common::app_map`).
 pub mod app_map;
+/// The app map's journeys: the light model picks and orders the sandbox's candidates, a checker keeps only cited steps.
+pub mod app_map_flows;
 pub mod await_merge;
 pub mod aws_permissions;
 pub mod base_images;

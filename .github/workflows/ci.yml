@@ -211,7 +211,7 @@ jobs:
       # The app map's Floorplan driver on the vendored release: a bump that
       # changes what CoderHelm's adapter relies on fails here. CoderHelm's
       # own detectors (screens, services, calls, infra) are tested beside it.
-      - run: node --test services/worker/floorplan/driver.test.mjs services/worker/floorplan/coderhelm.test.mjs
+      - run: node --test services/worker/floorplan/driver.test.mjs services/worker/floorplan/coderhelm.test.mjs services/worker/floorplan/coderhelm/flows.test.mjs
 
   mcp-proxy:
     name: MCP Proxy (Node)

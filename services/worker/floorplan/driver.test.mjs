@@ -7,6 +7,8 @@
 // - a refresh with nothing changed carries every description over;
 // - CoderHelm's detectors (coderhelm/) add mobile screens, outside services,
 //   calls, infra, webhooks and data links, each with its evidence;
+// - journeys kept from the last map are re-checked and drawn, and a large
+//   output comes back in parts the worker joins;
 // - fixtures/harbor-graph.json (what the Rust adapter's tests read) still has
 //   the shape this release writes, so a bump that changes the format fails
 //   here (regenerate with make-fixture.mjs, then fix the adapter).
@@ -17,7 +19,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { drive, harborAnswers, read, run, shape, workdir } from './harness.mjs';
+import { drive, harborAnswers, output, read, run, shape, workdir } from './harness.mjs';
+import * as flows from './coderhelm/flows.mjs';
 
 test('a first map builds, and the screen reaches the endpoint and the service behind it', () => {
   const dir = workdir(harborAnswers(), 'start');
@@ -103,4 +106,43 @@ test("answers can only become the map's own files", () => {
   const r = run(workdir({ '../driver.mjs': {} }, 'start'));
   assert.notEqual(r.status, 0);
   assert.match(r.stderr, /refusing to write/);
+});
+
+test('journeys kept from the last map are re-checked and drawn on it', () => {
+  const first = workdir(harborAnswers(), 'start');
+  const { result, graph } = drive(first);
+  // The mobile app's sign-in screen (from the detectors) starts a journey:
+  // the model is asked about it, with the candidates around it.
+  assert.deepEqual(result.flows.todo.entries.map((e) => e.key), ['screen:mobile:/(Stack)/SignIn'], JSON.stringify(result.flows.report));
+  assert.match(result.flows.todo.list, /request POST \/slips\/:p\/bookings/);
+  assert.ok(result.flows.report.candidates >= 3);
+  // A journey as the worker's model step would have stored it.
+  const c = flows.candidates(graph, flows.reader(path.join(first, 'root')));
+  const step = (key, note) => { const x = c.list.find((y) => y.key === key); assert.ok(x, key); return { key, kind: x.kind, view: x.view, note, evidence: x.evidence, linked: true }; };
+  const request = c.list.find((x) => x.kind === 'request');
+  const store = { schema: flows.SCHEMA, asked: {}, flows: [{ id: 'book-a-slip', title: 'Book a slip', entry: 'screen:web:/slips/:id', origin: 'model', steps: [
+    step('screen:web:/slips/:id', 'The boater opens a slip.'),
+    step(request.key, 'The page asks the API to book it.'),
+    step('n:stripe', 'Stripe charges the card.'),
+  ] }] };
+  const second = workdir({}, 'refresh', { flows: 'visible' });
+  fs.writeFileSync(path.join(second, 'state.tgz'), output(first, 'state.b64'));
+  assert.equal(spawnSync('tar', ['xzf', 'state.tgz', '-C', 'root'], { cwd: second }).status, 0);
+  fs.mkdirSync(path.join(second, 'root', 'floorplan', 'coderhelm'), { recursive: true });
+  fs.writeFileSync(path.join(second, 'root', flows.STORE), JSON.stringify(store));
+  // Parts: every output larger than 2,000 characters comes back split.
+  const again = drive(second, { CODERHELM_OUT_PART: '2000' });
+  assert.ok(fs.readdirSync(path.join(second, 'out')).includes('graph.b64.000'));
+  const drawn = again.graph.flows.find((f) => f.id === 'book-a-slip');
+  assert.deepEqual(drawn.steps.map((s) => s.ref), ['f:harbor-web/app/slips/[id]/page.tsx', 'r:0', 'n:stripe']);
+  // The request cites a call site and the handler that answers it.
+  assert.equal(drawn.steps[1].evidence[1].file, 'harbor-api/src/bookings.js');
+  assert.equal(again.result.flows.kept.length, 1);
+  // Hidden (the default): kept and re-checked, not drawn.
+  const third = workdir({}, 'refresh');
+  fs.writeFileSync(path.join(third, 'state.tgz'), output(second, 'state.b64'));
+  assert.equal(spawnSync('tar', ['xzf', 'state.tgz', '-C', 'root'], { cwd: third }).status, 0);
+  const hidden = drive(third);
+  assert.equal(hidden.result.flows.kept.length, 1);
+  assert.ok(!(hidden.graph.flows || []).some((f) => f.coderhelm));
 });
